@@ -123,6 +123,18 @@ echo "解释一下 Makefile 里的 deploy 目标" | yi-agent run
 原生窗口，对话、工具调用卡片、审批弹窗、子 agent 都在图形界面里。安装与开发方式见
 [desktop/README.md](desktop/README.md)。
 
+## 远程连接（实验性）
+
+`app-server` 支持通过 WebSocket 提供服务，供网络客户端连接：
+
+```bash
+yi-agent app-server --listen ws://127.0.0.1:8790
+```
+
+**当前版本无认证，只应绑定回环地址。** 这是手机端远程访问的地基；多设备同时连接、
+扫码配对、设备撤销，以及 iOS App 与自建中继，见
+[手机远程访问设计](docs/superpowers/specs/2026-10-02-mobile-remote-access-design.md)（Tier 1）。
+
 ## 配置放在哪
 
 按优先级从低到高：

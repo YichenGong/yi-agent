@@ -33,7 +33,7 @@ use yi_agent_subagent::binding::RuntimeBinding;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
 /// 权限审批等待客户端响应的默认超时;超时按 Deny 处理。
-const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// driver task → 主循环的完成事件。
 enum TurnEvent {
@@ -46,7 +46,7 @@ enum TurnEvent {
 /// (见 `wrap_for_delegation`),所以这里只带出重建必须沿用的那些部件:重建 provider
 /// 会重读凭据并多一个 client,重建决定通道会打断正在等待审批的 turn。被替换掉的
 /// 工具集与权限检查器留在 `RuntimeTooling` 里,正是因为它俩不该出现在这张单子上。
-struct BuiltAgent {
+pub(crate) struct BuiltAgent {
     agent: yi_agent_core::Agent,
     provider: Arc<dyn yi_agent_core::Provider>,
     config: yi_agent_core::AgentConfig,
@@ -88,18 +88,18 @@ type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 ///
 /// 两者成对传递,调用点无法只更新一半——只换了 daemon 映射、忘了 root 映射,
 /// 正是「每个会话应当有自己的 root」这条不变量最危险的破坏方式。
-struct RuntimeAttachments {
-    runtimes: ProjectRuntimes,
-    thread_roots: ThreadRoots,
+pub(crate) struct RuntimeAttachments {
+    pub(crate) runtimes: ProjectRuntimes,
+    pub(crate) thread_roots: ThreadRoots,
     /// Where the board registry lives. Injectable for the same reason
     /// `WorkspaceIndex` is: the `board/*` RPCs must be testable without
     /// touching the developer's real `~/.yi-agent`.
-    board_dir: PathBuf,
+    pub(crate) board_dir: PathBuf,
     /// How `board/create` starts a project's daemon. Injectable for the same
     /// reason `board_dir` is: a test must not spawn a real detached process,
     /// and the app's production launcher is what an integration test would
     /// otherwise have to reproduce.
-    launcher: BoardLauncher,
+    pub(crate) launcher: BoardLauncher,
 }
 
 /// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
@@ -223,8 +223,9 @@ fn attach_delegation(
 ///
 /// Distinct from an unattached conversation, which exists and answers with an
 /// empty result: a thread id that was never started is a caller error.
-async fn require_known_thread<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &MessageWriter<W>,
+async fn require_known_thread(
+    hub: &crate::broadcast::Broadcaster,
+    client: &crate::broadcast::ClientId,
     threads: &HashMap<String, ThreadSession>,
     thread_id: &str,
     id: RequestId,
@@ -233,7 +234,8 @@ async fn require_known_thread<W: tokio::io::AsyncWrite + Unpin>(
         return Ok(true);
     }
     write_response(
-        writer,
+        hub,
+        client,
         err_response(id, RpcError::unknown_thread(thread_id)),
     )
     .await?;
@@ -392,8 +394,8 @@ fn forward_to_daemon(
 /// synchronously, so pushing it again would be a duplicate. Every later
 /// difference is pushed whole, because the list is small and a client that
 /// applies it wholesale cannot drift out of order.
-async fn watch_children<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
-    writer: Arc<MessageWriter<W>>,
+async fn watch_children(
+    hub: Arc<crate::broadcast::Broadcaster>,
     thread_id: String,
     socket: PathBuf,
     initial: Vec<crate::protocol::AgentChild>,
@@ -422,7 +424,7 @@ async fn watch_children<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
             thread_id: thread_id.clone(),
             children: current,
         };
-        if write_notification(&writer, &notification).await.is_err() {
+        if write_notification(&hub, &notification).await.is_err() {
             return;
         }
     }
@@ -432,14 +434,12 @@ async fn watch_children<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
 ///
 /// 只在状态变化时推送(`Output` 丢弃):高频输出走 `process/read` 按需拉取。
 /// 关闭 thread 时由调用方 abort。
-async fn watch_processes<W>(
-    writer: Arc<MessageWriter<W>>,
+async fn watch_processes(
+    hub: Arc<crate::broadcast::Broadcaster>,
     thread_id: String,
     manager: Arc<yi_agent_tools::ProcessManager>,
     mut rx: tokio::sync::broadcast::Receiver<yi_agent_tools::ProcessEvent>,
-) where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+) {
     use yi_agent_tools::ProcessEvent;
     loop {
         match rx.recv().await {
@@ -454,7 +454,7 @@ async fn watch_processes<W>(
                 };
                 let _ = manager.list(); // 保证条目仍在(仅作存在性自检,结果丢弃)
                 let _ = write_notification(
-                    &writer,
+                    &hub,
                     &Notification::ProcessUpdated {
                         thread_id: thread_id.clone(),
                         process_id,
@@ -474,8 +474,8 @@ async fn watch_processes<W>(
 /// The subscription is non-blocking so the task yields between polls; it ends on
 /// its own when the daemon closes the stream, and is aborted when the client
 /// unwatches, watches another task, or closes the thread.
-async fn stream_trace<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
-    writer: Arc<MessageWriter<W>>,
+async fn stream_trace(
+    hub: Arc<crate::broadcast::Broadcaster>,
     thread_id: String,
     task_id: String,
     socket: PathBuf,
@@ -506,7 +506,7 @@ async fn stream_trace<W: tokio::io::AsyncWrite + Unpin + Send + 'static>(
                     task_id: task_id.clone(),
                     row: agent_trace_row(row),
                 };
-                if write_notification(&writer, &notification).await.is_err() {
+                if write_notification(&hub, &notification).await.is_err() {
                     return;
                 }
             }
@@ -866,7 +866,6 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let cfg_for_factory = cfg.clone();
     let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
     let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
@@ -875,10 +874,10 @@ where
     // register into a directory nobody lists from, which is the same as having
     // no board — better than losing every unrelated RPC.
     let board_dir = yi_agent_boards::global_dir().unwrap_or_default();
-    run_with(
+    serve_stdio(
         reader,
         writer,
-        cfg,
+        cfg.clone(),
         PERMISSION_TIMEOUT,
         workspaces,
         RuntimeAttachments {
@@ -887,38 +886,51 @@ where
             board_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
         },
-        move |session, cwd, mode| {
-            let mut thread_cfg = cfg_for_factory.clone();
-            thread_cfg.workdir = cwd.to_path_buf();
-            thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
-            let built = yi_agent_runtime::bootstrap::bootstrap_agent(
-                &thread_cfg,
-                yi_agent_runtime::bootstrap::PermissionMode::Interactive,
-            )?;
-            // The provider stays the single object the bootstrap built; a second
-            // one would re-read the credential and duplicate the client.
-            let config = built.agent.config().clone();
-            Ok(BuiltAgent {
-                agent: apply_session(built.agent, session),
-                provider: built.provider,
-                config,
-                decision_tx: built.decision_tx,
-                decision_rx: built.decision_rx,
-                catalog: built.catalog,
-                yolo: built.yolo,
-                process_manager: built.process_manager,
-            })
-        },
+        production_factory(cfg),
     )
     .await
 }
 
-/// 主循环的可测核心:agent 工厂由调用方注入(测试用 mock provider)。
+/// 生产环境的 agent 工厂:按 thread 的 cwd 覆盖 workdir 与 yolo 后引导一个 agent。
+pub(crate) fn production_factory(
+    cfg: RuntimeConfig,
+) -> impl Fn(
+    Option<yi_agent_core::Session>,
+    &Path,
+    crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent>
++ Send
++ 'static {
+    move |session, cwd, mode| {
+        let mut thread_cfg = cfg.clone();
+        thread_cfg.workdir = cwd.to_path_buf();
+        thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
+        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
+            &thread_cfg,
+            yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+        )?;
+        // The provider stays the single object the bootstrap built; a second
+        // one would re-read the credential and duplicate the client.
+        let config = built.agent.config().clone();
+        Ok(BuiltAgent {
+            agent: apply_session(built.agent, session),
+            provider: built.provider,
+            config,
+            decision_tx: built.decision_tx,
+            decision_rx: built.decision_rx,
+            catalog: built.catalog,
+            yolo: built.yolo,
+            process_manager: built.process_manager,
+        })
+    }
+}
+
+/// stdio 传输的接线:注册唯一 `local` 客户端,起读写泵,再进传输无关的 `serve`。
 ///
-/// **取消安全**:`MessageReader::next_line` 基于 `read_line`,不是 cancel-safe,
-/// 因此这里不直接在 `select!` 上轮询它;而是 spawn 一个独占 reader 的读取任务,
-/// 把完整行转发到 channel,主循环只 select 两个 `recv`(均 cancel-safe)。
-async fn run_with<R, W, F>(
+/// 主循环不再持有 reader/writer;`read_lines` 与 `pump_stdout` 各自独占一条流,
+/// 只与主循环交换 channel 消息(均 cancel-safe)。退出前摘除 `local` 客户端并
+/// 等待出口泵排空,保证最后一个响应总能写出。
+pub(crate) async fn serve_stdio<R, W, F>(
     reader: R,
     writer: W,
     cfg: RuntimeConfig,
@@ -938,36 +950,124 @@ where
         + Send
         + 'static,
 {
+    let hub = Arc::new(crate::broadcast::Broadcaster::new());
+    let local = crate::broadcast::ClientId::local();
+    let outbound = hub.register(local.clone());
+    // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
+    // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
+    let (inbound_tx, inbound_rx) =
+        mpsc::channel::<(crate::broadcast::ClientId, anyhow::Result<String>)>(64);
+    let pump = tokio::spawn(pump_stdout(
+        outbound,
+        writer,
+        Arc::clone(&hub),
+        local.clone(),
+    ));
+    tokio::spawn(read_lines(reader, local.clone(), inbound_tx));
+    let result = serve(
+        inbound_rx,
+        Arc::clone(&hub),
+        cfg,
+        permission_timeout,
+        workspaces,
+        attachments,
+        build_agent,
+    )
+    .await;
+    // `serve` 返回(EOF 或传输错误)后主循环不再产出帧。摘除 `local` 客户端会
+    // 关闭它的出站 channel;出口泵先把队列里已入队的帧全部写出、再因 channel
+    // 关闭退出,故必须 `await` 它——否则 EOF 前刚入队的最后一个响应会随进程
+    // 退出而丢失(与改造前「写完才结束」的 stdio 语义不符)。
+    hub.unregister(&local);
+    let _ = pump.await;
+    result
+}
+
+/// 从一条 `AsyncRead` 逐行读取并送入主循环。
+///
+/// `MessageReader::next_line` 基于 `read_line`,不是 cancel-safe,因此由本任务
+/// 独占 reader,主循环只 select cancel-safe 的 channel `recv`。
+async fn read_lines<R>(
+    reader: R,
+    client: crate::broadcast::ClientId,
+    tx: mpsc::Sender<(crate::broadcast::ClientId, anyhow::Result<String>)>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut reader = MessageReader::new(reader);
+    loop {
+        match reader.next_line().await {
+            Ok(Some(line)) => {
+                if tx.send((client.clone(), Ok(line))).await.is_err() {
+                    break;
+                }
+            }
+            Ok(None) => break, // EOF → 丢弃 tx → 主循环优雅退出
+            Err(e) => {
+                tracing::error!("app-server read error: {e}");
+                let _ = tx.send((client.clone(), Err(e))).await;
+                break;
+            }
+        }
+    }
+}
+
+/// 把该客户端的出站帧写到一条 `AsyncWrite`(stdio 场景即 stdout)。
+///
+/// 写失败(对端已消失)时把该客户端从 hub 摘除:主循环之后经 `hub.reply` 定向写
+/// 响应会拿到 `Closed`,按**改造前**的语义以错误退出——`write_response(..)?` 曾把
+/// 写失败直接变成会话错误,这条路径必须保留。
+///
+/// **不持有入站 channel 的 sender**:否则读端 EOF 后 channel 仍有一只存活 sender,
+/// 主循环的 `recv` 永不返回 `None`,优雅退出被拖住。入站的存活只由 `read_lines`
+/// 决定(它 EOF 即丢弃自己的 sender)。
+async fn pump_stdout<W>(
+    mut outbound: mpsc::Receiver<serde_json::Value>,
+    writer: W,
+    hub: Arc<crate::broadcast::Broadcaster>,
+    client: crate::broadcast::ClientId,
+) where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let writer = MessageWriter::new(writer);
+    while let Some(frame) = outbound.recv().await {
+        if let Err(e) = writer.write_value(&frame).await {
+            tracing::error!("app-server stdout write failed: {e}");
+            hub.unregister(&client);
+            break;
+        }
+    }
+}
+
+/// 主循环的传输无关核心:agent 工厂由调用方注入(测试用 mock provider)。
+///
+/// **取消安全**:入站读取由传输层任务负责(`read_lines` / WS 读循环),主循环只在
+/// 一个 channel 上 `recv`。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve<F>(
+    mut inbound: mpsc::Receiver<(crate::broadcast::ClientId, anyhow::Result<String>)>,
+    hub: Arc<crate::broadcast::Broadcaster>,
+    cfg: RuntimeConfig,
+    permission_timeout: Duration,
+    workspaces: Arc<WorkspaceIndex>,
+    attachments: RuntimeAttachments,
+    build_agent: F,
+) -> anyhow::Result<()>
+where
+    F: Fn(
+            Option<yi_agent_core::Session>,
+            &Path,
+            crate::thread_store::ThreadMode,
+        ) -> anyhow::Result<BuiltAgent>
+        + Send
+        + 'static,
+{
     let RuntimeAttachments {
         runtimes,
         thread_roots,
         board_dir,
         launcher: board_launcher,
     } = attachments;
-    // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
-    // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
-    let (req_tx, mut req_rx) = mpsc::channel::<anyhow::Result<String>>(64);
-    tokio::spawn(async move {
-        let mut reader = MessageReader::new(reader);
-        loop {
-            match reader.next_line().await {
-                Ok(Some(line)) => {
-                    if req_tx.send(Ok(line)).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break, // EOF → 丢弃 req_tx → 主循环优雅退出
-                Err(e) => {
-                    tracing::error!("app-server read error: {e}");
-                    let _ = req_tx.send(Err(e)).await;
-                    break;
-                }
-            }
-        }
-        // 丢弃 req_tx → 主循环的 req_rx.recv() 返回 None,触发优雅退出。
-    });
-
-    let writer = Arc::new(MessageWriter::new(writer));
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
@@ -994,22 +1094,29 @@ where
 
     loop {
         tokio::select! {
-            line = req_rx.recv() => {
-                let Some(item) = line else { break }; // EOF → graceful exit
+            line = inbound.recv() => {
+                let Some((client, item)) = line else { break }; // EOF → graceful exit
                 let line = match item {
                     Ok(l) => l,
                     Err(e) => {
-                        // 尽力告知客户端我们为何退出,再把失败向上抛出,
-                        // 避免传输错误被伪装成干净退出。
+                        // 尽力告知客户端我们为何退出。
                         let _ = write_response(
-                            &writer,
+                            &hub, &client,
                             err_response(
                                 RequestId::Num(0),
                                 RpcError::invalid_request(format!("transport error: {e}")),
                             ),
                         )
                         .await;
-                        return Err(e);
+                        // stdio 只有 `local` 一个客户端,其读端出错即整个会话结束:
+                        // 把失败向上抛出,避免被伪装成干净退出(`oversized_frame_returns_err`)。
+                        // WS 传输是**多客户端共享**一条主循环,单个连接的传输错误只
+                        // 能摘除该 ClientId(spec §6),连接与服务器都必须存活。
+                        if client == crate::broadcast::ClientId::local() {
+                            return Err(e);
+                        }
+                        hub.unregister(&client);
+                        continue;
                     }
                 };
                 if line.trim().is_empty() {
@@ -1023,7 +1130,7 @@ where
                         // 的 id 为 `null`,但 `RequestId` 目前没有 Null 变体,
                         // 故暂以 id 0 代替(见 docs/bug-list.md)。
                         write_response(
-                            &writer,
+                            &hub, &client,
                             err_response(RequestId::Num(0), RpcError::parse_error(e.to_string())),
                         )
                         .await?;
@@ -1041,7 +1148,7 @@ where
                             }
                             _ => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         RequestId::Num(0),
                                         RpcError::parse_error("malformed frame"),
@@ -1058,7 +1165,7 @@ where
 
                 // 未 initialize 前,除 `initialize` 外的请求一律拒绝。
                 if !initialized && method != "initialize" {
-                    write_response(&writer, err_response(id, RpcError::not_initialized())).await?;
+                    write_response(&hub, &client, err_response(id, RpcError::not_initialized())).await?;
                     continue;
                 }
 
@@ -1066,7 +1173,7 @@ where
                     "initialize" => {
                         initialized = true;
                         write_response(
-                            &writer,
+                            &hub, &client,
                             ok_response(
                                 id,
                                 json!({
@@ -1082,7 +1189,7 @@ where
                         .await?;
                     }
                     "config/read" => {
-                        write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
+                        write_response(&hub, &client, ok_response(id, cfg.redacted_view())).await?;
                     }
                     "plugin/query" => {
                         // `project` names the project being queried, not the
@@ -1090,7 +1197,7 @@ where
                         // a board that lives under another project's daemon.
                         let Some(project) = project_arg(&req.params) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing or empty project")),
                             )
                             .await?;
@@ -1112,10 +1219,12 @@ where
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
                         match plugin_query(&project, &board_dir, method, plugin, params) {
-                            Ok(value) => write_response(&writer, ok_response(id, value)).await?,
+                            Ok(value) => {
+                                write_response(&hub, &client, ok_response(id, value)).await?
+                            }
                             Err(error) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id,
                                         RpcError::board_query(error.code, error.message),
@@ -1128,7 +1237,7 @@ where
                     "board/create" => {
                         let Some(project) = project_arg(&req.params) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing or empty project")),
                             )
                             .await?;
@@ -1141,10 +1250,10 @@ where
                             &mut launcher,
                         ) {
                             Ok(status) => {
-                                write_response(&writer, ok_response(id, to_json(&status))).await?
+                                write_response(&hub, &client, ok_response(id, to_json(&status))).await?
                             }
                             Err(message) => {
-                                write_response(&writer, err_response(id, RpcError::internal(message)))
+                                write_response(&hub, &client, err_response(id, RpcError::internal(message)))
                                     .await?
                             }
                         }
@@ -1152,16 +1261,16 @@ where
                     "board/remove" => {
                         let Some(project) = project_arg(&req.params) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing or empty project")),
                             )
                             .await?;
                             continue;
                         };
                         match yi_agent_boards::lifecycle::remove_in(&project, &board_dir) {
-                            Ok(()) => write_response(&writer, ok_response(id, json!({}))).await?,
+                            Ok(()) => write_response(&hub, &client, ok_response(id, json!({}))).await?,
                             Err(message) => {
-                                write_response(&writer, err_response(id, RpcError::internal(message)))
+                                write_response(&hub, &client, err_response(id, RpcError::internal(message)))
                                     .await?
                             }
                         }
@@ -1186,11 +1295,11 @@ where
                                         })
                                     })
                                     .collect();
-                                write_response(&writer, ok_response(id, json!({ "boards": boards })))
+                                write_response(&hub, &client, ok_response(id, json!({ "boards": boards })))
                                     .await?
                             }
                             Err(message) => {
-                                write_response(&writer, err_response(id, RpcError::internal(message.to_string())))
+                                write_response(&hub, &client, err_response(id, RpcError::internal(message.to_string())))
                                     .await?
                             }
                         }
@@ -1201,7 +1310,7 @@ where
                             .into_iter()
                             .map(|p| json!({ "path": p, "exists": Path::new(&p).is_dir() }))
                             .collect();
-                        write_response(&writer, ok_response(id, json!({ "workspaces": list })))
+                        write_response(&hub, &client, ok_response(id, json!({ "workspaces": list })))
                             .await?;
                     }
                     "workspace/add" => {
@@ -1211,12 +1320,12 @@ where
                                 let value = p.to_string_lossy().to_string();
                                 match workspaces.add(&p) {
                                     Ok(()) => {
-                                        write_response(&writer, ok_response(id, json!({ "path": value })))
+                                        write_response(&hub, &client, ok_response(id, json!({ "path": value })))
                                             .await?
                                     }
                                     Err(e) => {
                                         write_response(
-                                            &writer,
+                                            &hub, &client,
                                             err_response(id, RpcError::internal(e.to_string())),
                                         )
                                         .await?
@@ -1225,7 +1334,7 @@ where
                             }
                             _ => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id,
                                         RpcError::invalid_params("path is not a directory"),
@@ -1242,10 +1351,10 @@ where
                         // canonicalize 失败(路径已不存在)时回退原始串,保持幂等。
                         let key = std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
                         match workspaces.remove(&key) {
-                            Ok(()) => write_response(&writer, ok_response(id, json!({}))).await?,
+                            Ok(()) => write_response(&hub, &client, ok_response(id, json!({}))).await?,
                             Err(e) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::internal(e.to_string())),
                                 )
                                 .await?
@@ -1264,11 +1373,11 @@ where
                                 .into_iter()
                                 .map(|m| thread_summary_json(&m, &threads))
                                 .collect();
-                            write_response(&writer, ok_response(id, json!({ "threads": threads })))
+                            write_response(&hub, &client, ok_response(id, json!({ "threads": threads })))
                                 .await?;
                         }
                         Err(e) => {
-                            write_response(&writer, err_response(id, RpcError::internal(e.to_string())))
+                            write_response(&hub, &client, err_response(id, RpcError::internal(e.to_string())))
                                 .await?;
                         }
                         }
@@ -1311,7 +1420,7 @@ where
                             .map(|m| thread_summary_json(m, &threads))
                             .collect();
                         write_response(
-                            &writer,
+                            &hub, &client,
                             ok_response(id, json!({ "groups": groups, "pinned": pinned })),
                         )
                         .await?;
@@ -1320,7 +1429,7 @@ where
                         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
 
                         // 目录决定 agent / store / 权限 / 沙箱 / skills 的根。
-                        let cwd = match resolve_thread_cwd(&req.params, &cfg, &writer, id.clone()).await? {
+                        let cwd = match resolve_thread_cwd(&req.params, &cfg, &hub, &client, id.clone()).await? {
                             Some(c) => c,
                             None => continue,
                         };
@@ -1334,7 +1443,7 @@ where
                         let built = match build_agent(None, Path::new(&cwd), mode) {
                             Ok(a) => a,
                             Err(e) => {
-                                write_response(&writer, err_response(id, RpcError::internal(e.to_string()))).await?;
+                                write_response(&hub, &client, err_response(id, RpcError::internal(e.to_string()))).await?;
                                 continue;
                             }
                         };
@@ -1429,7 +1538,7 @@ where
                         }
                         let rx = process_manager.subscribe();
                         let handle = tokio::spawn(watch_processes(
-                            Arc::clone(&writer),
+                            Arc::clone(&hub),
                             thread_id.clone(),
                             Arc::clone(&process_manager),
                             rx,
@@ -1438,7 +1547,8 @@ where
 
                         // 每个 thread 一个 driver task:独占 agent 与两个 receiver,
                         // 串行驱动 turn。
-                        let driver_writer = Arc::clone(&writer);
+                        let driver_hub = Arc::clone(&hub);
+                        let driver_client = client.clone();
                         let driver_turn_tx = turn_tx.clone();
                         let driver_thread_id = thread_id.clone();
                         tokio::spawn(run_thread_driver(
@@ -1448,7 +1558,8 @@ where
                             interrupt_rx,
                             interject_rx,
                             session_rx,
-                            driver_writer,
+                            driver_hub,
+                            driver_client,
                             driver_turn_tx,
                             decision_tx,
                             Arc::clone(&pending),
@@ -1461,9 +1572,7 @@ where
                             config,
                         ));
 
-                        write_notification(
-                            &writer,
-                            &Notification::ThreadStarted {
+                        write_notification(&hub, &Notification::ThreadStarted {
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
                                 model: model.clone(),
@@ -1471,7 +1580,7 @@ where
                         )
                         .await?;
                         write_response(
-                            &writer,
+                            &hub, &client,
                             ok_response(
                                 id,
                                 json!({
@@ -1485,7 +1594,7 @@ where
                     }
                     "thread/resume" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
@@ -1497,7 +1606,7 @@ where
                         if let Some(session) = threads.get(&thread_id) {
                             if !Path::new(&session.cwd).is_dir() {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id.clone(),
                                         RpcError::invalid_params(format!(
@@ -1522,7 +1631,7 @@ where
                             Ok(Some(l)) => l,
                             Ok(None) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::unknown_thread(&thread_id)),
                                 )
                                 .await?;
@@ -1530,7 +1639,7 @@ where
                             }
                             Err(e) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::internal(e.to_string())),
                                 )
                                 .await?;
@@ -1570,7 +1679,7 @@ where
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::internal(e.to_string())),
                                 )
                                 .await?;
@@ -1634,14 +1743,15 @@ where
                         }
                         let rx = process_manager.subscribe();
                         let handle = tokio::spawn(watch_processes(
-                            Arc::clone(&writer),
+                            Arc::clone(&hub),
                             thread_id.clone(),
                             Arc::clone(&process_manager),
                             rx,
                         ));
                         process_watches.insert(thread_id.clone(), ProcessWatch { task: handle });
 
-                        let driver_writer = Arc::clone(&writer);
+                        let driver_hub = Arc::clone(&hub);
+                        let driver_client = client.clone();
                         let driver_turn_tx = turn_tx.clone();
                         let driver_thread_id = thread_id.clone();
                         tokio::spawn(run_thread_driver(
@@ -1651,7 +1761,8 @@ where
                             interrupt_rx,
                             interject_rx,
                             session_rx,
-                            driver_writer,
+                            driver_hub,
+                            driver_client,
                             driver_turn_tx,
                             decision_tx,
                             Arc::clone(&pending),
@@ -1665,9 +1776,7 @@ where
                         ));
 
                         // 回放:thread/started → 每条历史 item/completed → 最近用量 → 响应。
-                        write_notification(
-                            &writer,
-                            &Notification::ThreadStarted {
+                        write_notification(&hub, &Notification::ThreadStarted {
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
                                 model: model.clone(),
@@ -1675,9 +1784,7 @@ where
                         )
                         .await?;
                         for item in loaded.items {
-                            write_notification(
-                                &writer,
-                                &Notification::ItemCompleted {
+                            write_notification(&hub, &Notification::ItemCompleted {
                                     thread_id: thread_id.clone(),
                                     item,
                                 },
@@ -1685,9 +1792,7 @@ where
                             .await?;
                         }
                         if let Some(u) = loaded.usage {
-                            write_notification(
-                                &writer,
-                                &Notification::TokenUsage {
+                            write_notification(&hub, &Notification::TokenUsage {
                                     thread_id: thread_id.clone(),
                                     model: u.model,
                                     input_tokens: u.input_tokens,
@@ -1699,7 +1804,7 @@ where
                             .await?;
                         }
                         write_response(
-                            &writer,
+                            &hub, &client,
                             ok_response(
                                 id,
                                 json!({
@@ -1713,7 +1818,7 @@ where
                     }
                     "thread/rename" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
@@ -1726,7 +1831,7 @@ where
                             .to_string();
                         if title.is_empty() {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("title must not be empty")),
                             )
                             .await?;
@@ -1736,18 +1841,18 @@ where
                             .rename(&thread_id, &title)
                         {
                             Ok(true) => {
-                                write_response(&writer, ok_response(id, json!({}))).await?;
+                                write_response(&hub, &client, ok_response(id, json!({}))).await?;
                             }
                             Ok(false) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::unknown_thread(&thread_id)),
                                 )
                                 .await?;
                             }
                             Err(e) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::internal(e.to_string())),
                                 )
                                 .await?;
@@ -1756,7 +1861,7 @@ where
                     }
                     "thread/setPermissionMode" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
@@ -1767,7 +1872,7 @@ where
                             Some("yolo") => crate::thread_store::ThreadMode::Yolo,
                             _ => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id,
                                         RpcError::invalid_params(
@@ -1784,7 +1889,7 @@ where
                         // switch 可翻转(其持久化模式在 resume 时被读取),故此处不为其落盘。
                         let Some(session) = threads.get(&thread_id) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::unknown_thread(&thread_id)),
                             )
                             .await?;
@@ -1803,11 +1908,11 @@ where
                                 "[app-server] failed to persist permission_mode for {thread_id}: {e}"
                             ),
                         }
-                        write_response(&writer, ok_response(id, json!({}))).await?;
+                        write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "thread/setPinned" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
@@ -1815,7 +1920,7 @@ where
                         let Some(pinned) = req.params.get("pinned").and_then(|v| v.as_bool())
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(
                                     id,
                                     RpcError::invalid_params("pinned must be a boolean"),
@@ -1834,18 +1939,18 @@ where
                             .set_pin_seq(&thread_id, seq)
                         {
                             Ok(true) => {
-                                write_response(&writer, ok_response(id, json!({}))).await?;
+                                write_response(&hub, &client, ok_response(id, json!({}))).await?;
                             }
                             Ok(false) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::unknown_thread(&thread_id)),
                                 )
                                 .await?;
                             }
                             Err(e) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::internal(e.to_string())),
                                 )
                                 .await?;
@@ -1857,7 +1962,7 @@ where
                             Some(a) => a,
                             None => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id,
                                         RpcError::invalid_params(
@@ -1878,7 +1983,7 @@ where
                             Some(v) => v,
                             None => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id,
                                         RpcError::invalid_params(
@@ -1901,7 +2006,7 @@ where
                             && ids.iter().all(|i| current.contains(i.as_str()));
                         if !valid {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(
                                     id,
                                     RpcError::invalid_params(
@@ -1935,16 +2040,16 @@ where
                         }
                         match err {
                             None => {
-                                write_response(&writer, ok_response(id, json!({}))).await?;
+                                write_response(&hub, &client, ok_response(id, json!({}))).await?;
                             }
                             Some(e) => {
-                                write_response(&writer, err_response(id, e)).await?;
+                                write_response(&hub, &client, err_response(id, e)).await?;
                             }
                         }
                     }
                     "thread/delete" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
@@ -1956,7 +2061,7 @@ where
                         let on_disk = thread_store.exists(&thread_id);
                         if !in_memory && !on_disk {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::unknown_thread(&thread_id)),
                             )
                             .await?;
@@ -2011,17 +2116,17 @@ where
                         if let Err(e) = thread_store.delete(&thread_id) {
                             eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
                         }
-                        write_response(&writer, ok_response(id, json!({}))).await?;
+                        write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "thread/clear" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
                         let Some(session) = threads.get(&thread_id) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::unknown_thread(&thread_id)),
                             )
                             .await?;
@@ -2030,7 +2135,7 @@ where
                         // 清空跑在半个 turn 上会产出不自洽的历史，直接拒绝。
                         if session.active_turn_id.is_some() {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::turn_in_progress(&thread_id)),
                             )
                             .await?;
@@ -2044,7 +2149,7 @@ where
                             .is_err()
                         {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::internal("thread driver is gone")),
                             )
                             .await?;
@@ -2052,15 +2157,15 @@ where
                         }
                         match reply_rx.await {
                             Ok(Ok(())) => {
-                                write_response(&writer, ok_response(id, json!({}))).await?
+                                write_response(&hub, &client, ok_response(id, json!({}))).await?
                             }
                             Ok(Err(message)) => write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::internal(message)),
                             )
                             .await?,
                             Err(_) => write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::internal("thread driver dropped")),
                             )
                             .await?,
@@ -2068,13 +2173,13 @@ where
                     }
                     "thread/compact" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
                         let Some(session) = threads.get(&thread_id) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::unknown_thread(&thread_id)),
                             )
                             .await?;
@@ -2083,7 +2188,7 @@ where
                         // 压缩会重写整段历史,turn 进行中不接受。
                         if session.active_turn_id.is_some() {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::turn_in_progress(&thread_id)),
                             )
                             .await?;
@@ -2097,7 +2202,7 @@ where
                             .is_err()
                         {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::internal("thread driver is gone")),
                             )
                             .await?;
@@ -2112,12 +2217,12 @@ where
                             }
                             Err(_) => json!({"status": "failed", "error": "thread driver dropped"}),
                         };
-                        write_response(&writer, ok_response(id, result)).await?;
+                        write_response(&hub, &client, ok_response(id, result)).await?;
                     }
                     "turn/start" => {
                         // `id` 后续响应仍需使用,故传 clone。
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
@@ -2125,7 +2230,7 @@ where
                             Some(p) => p,
                             None => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id,
                                         RpcError::invalid_params("missing or empty input text"),
@@ -2142,7 +2247,7 @@ where
                         let (prompt_tx, status_handle) = {
                             let Some(session) = threads.get_mut(&thread_id) else {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::unknown_thread(&thread_id)),
                                 )
                                 .await?;
@@ -2150,7 +2255,7 @@ where
                             };
                             if session.active_turn_id.is_some() {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::turn_in_progress(&thread_id)),
                                 )
                                 .await?;
@@ -2162,18 +2267,16 @@ where
 
                         // 顺序确定:先 turn/started 通知,再推 Running 状态,再响应,
                         // 最后投递 prompt。
-                        write_notification(
-                            &writer,
-                            &Notification::TurnStarted {
+                        write_notification(&hub, &Notification::TurnStarted {
                                 thread_id: thread_id.clone(),
                                 turn_id: turn_id.clone(),
                             },
                         )
                         .await?;
-                        update_status(&writer, &status_handle, &thread_id, ThreadStatus::Running)
+                        update_status(&hub, &status_handle, &thread_id, ThreadStatus::Running)
                             .await?;
                         write_response(
-                            &writer,
+                            &hub, &client,
                             ok_response(id, json!({ "turn_id": turn_id.clone() })),
                         )
                         .await?;
@@ -2200,13 +2303,13 @@ where
                     }
                     "turn/interrupt" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
                         let Some(session) = threads.get(&thread_id) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::unknown_thread(&thread_id)),
                             )
                             .await?;
@@ -2216,11 +2319,11 @@ where
                             // 幂等 level 信号:用 try_send 避免主循环在满队列上阻塞。
                             let _ = session.interrupt_tx.try_send(turn_id);
                         }
-                        write_response(&writer, ok_response(id, json!({}))).await?;
+                        write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "turn/interject" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
@@ -2228,7 +2331,7 @@ where
                             Some(p) => p,
                             None => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id,
                                         RpcError::invalid_params("missing or empty input text"),
@@ -2243,7 +2346,7 @@ where
                         let (tx, turn_id) = {
                             let Some(session) = threads.get(&thread_id) else {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::unknown_thread(&thread_id)),
                                 )
                                 .await?;
@@ -2253,7 +2356,7 @@ where
                                 Some(turn_id) => (session.interject_tx.clone(), turn_id),
                                 None => {
                                     write_response(
-                                        &writer,
+                                        &hub, &client,
                                         err_response(id, RpcError::not_running()),
                                     )
                                     .await?;
@@ -2273,12 +2376,12 @@ where
                             .is_err()
                         {
                             // driver 已退出:没有接收方,按"没有活跃 turn"报。
-                            write_response(&writer, err_response(id, RpcError::not_running()))
+                            write_response(&hub, &client, err_response(id, RpcError::not_running()))
                                 .await?;
                             continue;
                         }
                         write_response(
-                            &writer,
+                            &hub, &client,
                             ok_response(
                                 id,
                                 json!({
@@ -2291,11 +2394,11 @@ where
                     }
                     "agent/children/list" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
-                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
                             continue;
                         }
                         // 列表是尽力而为的只读视图:attach 未就绪或 daemon 不可达时返回空表,
@@ -2308,7 +2411,7 @@ where
                         if !children_watches.contains_key(&thread_id) {
                             if let Some(socket) = socket_for_thread(&runtimes, &threads, &thread_id) {
                                 let task = tokio::spawn(watch_children(
-                                    Arc::clone(&writer),
+                                    Arc::clone(&hub),
                                     thread_id.clone(),
                                     socket,
                                     children.clone(),
@@ -2316,23 +2419,23 @@ where
                                 children_watches.insert(thread_id.clone(), ChildrenWatch { task });
                             }
                         }
-                        write_response(&writer, ok_response(id, json!({ "children": children })))
+                        write_response(&hub, &client, ok_response(id, json!({ "children": children })))
                             .await?;
                     }
                     "agent/trace/read" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
-                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
                             continue;
                         }
                         let Some(task_id) =
                             req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing taskId")),
                             )
                             .await?;
@@ -2341,7 +2444,7 @@ where
                         match read_task_trace(&runtimes, &threads, &thread_id, &task_id) {
                             Ok((rows, high_water_id)) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     ok_response(
                                         id,
                                         json!({ "rows": rows, "highWaterId": high_water_id }),
@@ -2350,24 +2453,24 @@ where
                                 .await?;
                             }
                             Err(error) => {
-                                write_response(&writer, err_response(id, error)).await?;
+                                write_response(&hub, &client, err_response(id, error)).await?;
                             }
                         }
                     }
                     "agent/trace/watch" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
-                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
                             continue;
                         }
                         let Some(task_id) =
                             req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing taskId")),
                             )
                             .await?;
@@ -2381,7 +2484,7 @@ where
                         match snapshot_for_watch(&runtimes, &threads, &thread_id, &task_id) {
                             Ok((rows, high_water_id)) => {
                                 let handle = tokio::spawn(stream_trace(
-                                    Arc::clone(&writer),
+                                    Arc::clone(&hub),
                                     thread_id.clone(),
                                     task_id.clone(),
                                     socket_for_thread(&runtimes, &threads, &thread_id)
@@ -2390,23 +2493,23 @@ where
                                 ));
                                 trace_watches.insert(thread_id.clone(), TraceWatch { task: handle });
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     ok_response(id, json!({ "rows": rows, "highWaterId": high_water_id })),
                                 )
                                 .await?;
                             }
                             Err(error) => {
-                                write_response(&writer, err_response(id, error)).await?;
+                                write_response(&hub, &client, err_response(id, error)).await?;
                             }
                         }
                     }
                     "agent/message" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
-                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
                             continue;
                         }
                         let task_id =
@@ -2415,7 +2518,7 @@ where
                             req.params.get("message").and_then(|v| v.as_str()).map(str::to_string);
                         let (Some(task_id), Some(message)) = (task_id, message) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing taskId or message")),
                             )
                             .await?;
@@ -2431,28 +2534,28 @@ where
                             },
                         ) {
                             Ok(_) => {
-                                write_response(&writer, ok_response(id, json!({ "queued": true })))
+                                write_response(&hub, &client, ok_response(id, json!({ "queued": true })))
                                     .await?;
                             }
                             Err(error) => {
-                                write_response(&writer, err_response(id, error)).await?;
+                                write_response(&hub, &client, err_response(id, error)).await?;
                             }
                         }
                     }
                     "agent/cancel/preview" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
-                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
                             continue;
                         }
                         let Some(task_id) =
                             req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing taskId")),
                             )
                             .await?;
@@ -2476,7 +2579,7 @@ where
                                 ..
                             }) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     ok_response(
                                         id,
                                         json!({
@@ -2490,7 +2593,7 @@ where
                             }
                             Ok(other) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(
                                         id,
                                         RpcError::internal(format!(
@@ -2501,17 +2604,17 @@ where
                                 .await?;
                             }
                             Err(error) => {
-                                write_response(&writer, err_response(id, error)).await?;
+                                write_response(&hub, &client, err_response(id, error)).await?;
                             }
                         }
                     }
                     "agent/cancel" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
-                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
                             continue;
                         }
                         let task_id =
@@ -2525,7 +2628,7 @@ where
                             (task_id, confirmation_token)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(
                                     id,
                                     RpcError::invalid_params(
@@ -2547,21 +2650,21 @@ where
                             },
                         ) {
                             Ok(_) => {
-                                write_response(&writer, ok_response(id, json!({ "cancelled": true })))
+                                write_response(&hub, &client, ok_response(id, json!({ "cancelled": true })))
                                     .await?;
                             }
                             Err(error) => {
-                                write_response(&writer, err_response(id, error)).await?;
+                                write_response(&hub, &client, err_response(id, error)).await?;
                             }
                         }
                     }
                     "agent/trace/unwatch" => {
                         let Some(thread_id) =
-                            require_thread_id(&writer, &req.params, id.clone()).await?
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
                             continue;
                         };
-                        if !require_known_thread(&writer, &threads, &thread_id, id.clone()).await? {
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
                             continue;
                         }
                         if let Some(watch) = trace_watches.remove(&thread_id) {
@@ -2573,14 +2676,14 @@ where
                         if let Some(watch) = process_watches.remove(&thread_id) {
                             watch.stop().await;
                         }
-                        write_response(&writer, ok_response(id, json!({ "stopped": true }))).await?;
+                        write_response(&hub, &client, ok_response(id, json!({ "stopped": true }))).await?;
                     }
                     "process/list" => {
                         let Some(thread_id) =
                             req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing thread_id")),
                             )
                             .await?;
@@ -2592,7 +2695,7 @@ where
                             .get(&thread_id)
                             .map(|s| s.process_manager.list())
                             .unwrap_or_default();
-                        write_response(&writer, ok_response(id, json!({ "processes": processes })))
+                        write_response(&hub, &client, ok_response(id, json!({ "processes": processes })))
                             .await?;
                     }
                     "process/read" => {
@@ -2600,7 +2703,7 @@ where
                             req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing thread_id")),
                             )
                             .await?;
@@ -2613,7 +2716,7 @@ where
                             .map(str::to_string)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing process_id")),
                             )
                             .await?;
@@ -2621,7 +2724,7 @@ where
                         };
                         let Some(session) = threads.get(&thread_id) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::unknown_thread(&thread_id)),
                             )
                             .await?;
@@ -2640,7 +2743,7 @@ where
                         {
                             Ok(result) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     ok_response(
                                         id,
                                         serde_json::to_value(result)
@@ -2651,7 +2754,7 @@ where
                             }
                             Err(message) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::invalid_params(message)),
                                 )
                                 .await?
@@ -2663,7 +2766,7 @@ where
                             req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing thread_id")),
                             )
                             .await?;
@@ -2676,7 +2779,7 @@ where
                             .map(str::to_string)
                         else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::invalid_params("missing process_id")),
                             )
                             .await?;
@@ -2684,7 +2787,7 @@ where
                         };
         let Some(session) = threads.get(&thread_id) else {
                             write_response(
-                                &writer,
+                                &hub, &client,
                                 err_response(id, RpcError::unknown_thread(&thread_id)),
                             )
                             .await?;
@@ -2696,12 +2799,12 @@ where
                             .await
                         {
                             Ok(()) => {
-                                write_response(&writer, ok_response(id, json!({ "ok": true })))
+                                write_response(&hub, &client, ok_response(id, json!({ "ok": true })))
                                     .await?
                             }
                             Err(message) => {
                                 write_response(
-                                    &writer,
+                                    &hub, &client,
                                     err_response(id, RpcError::invalid_params(message)),
                                 )
                                 .await?
@@ -2709,7 +2812,7 @@ where
                         }
                     }
                     _ => {
-                        write_response(&writer, err_response(id, RpcError::method_not_found(&method)))
+                        write_response(&hub, &client, err_response(id, RpcError::method_not_found(&method)))
                             .await?;
                     }
                 }
@@ -2765,18 +2868,30 @@ fn err_response(id: RequestId, error: RpcError) -> ResponseEnvelope {
     }
 }
 
-async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &MessageWriter<W>,
+async fn write_response(
+    hub: &crate::broadcast::Broadcaster,
+    client: &crate::broadcast::ClientId,
     resp: ResponseEnvelope,
 ) -> anyhow::Result<()> {
-    writer.write_value(&resp).await
+    let frame = serde_json::to_value(&resp)
+        .map_err(|e| anyhow::anyhow!("failed to serialize response: {e}"))?;
+    // 定向回复:`reply` 会 await 到入队成功,保留 stdio 改造前
+    // 「写阻塞直到对端读」的语义。
+    hub.reply(client, frame)
+        .await
+        .map_err(|_| anyhow::anyhow!("client {} disconnected", client.as_str()))
 }
 
-async fn write_notification<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &MessageWriter<W>,
+async fn write_notification(
+    hub: &crate::broadcast::Broadcaster,
     n: &Notification,
 ) -> anyhow::Result<()> {
-    writer.write_value(&NotificationEnvelope::new(n)).await
+    let frame = serde_json::to_value(NotificationEnvelope::new(n))
+        .map_err(|e| anyhow::anyhow!("failed to serialize notification: {e}"))?;
+    // 广播给所有客户端:fan-out 是 Tier 1 的能力,但 Tier 0 立刻走同一条路径,
+    // 避免以后再改一次接线。单客户端下等价于写那一条流。
+    hub.broadcast(frame);
+    Ok(())
 }
 
 /// 更新共享状态句柄并推送 `thread/status/updated`。
@@ -2784,15 +2899,15 @@ async fn write_notification<W: tokio::io::AsyncWrite + Unpin>(
 /// 加锁是同步的、不跨 `.await`；锁在写通知前即释放。锁中毒时沿用
 /// `workspace_index.rs` 的恢复约定：取回内部值而非 panic(状态只是 UI 提示,
 /// 不应因一次 panic 永久失效)。
-async fn update_status<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &MessageWriter<W>,
+async fn update_status(
+    hub: &crate::broadcast::Broadcaster,
     handle: &std::sync::Mutex<ThreadStatus>,
     thread_id: &str,
     next: ThreadStatus,
 ) -> anyhow::Result<()> {
     *handle.lock().unwrap_or_else(|p| p.into_inner()) = next;
     write_notification(
-        writer,
+        hub,
         &Notification::ThreadStatusUpdated {
             thread_id: thread_id.to_string(),
             status: next,
@@ -2943,7 +3058,7 @@ async fn interrupt_and_wait_for_persist(
 /// 旧日志），`/compact` 要把压缩结果写回 `.jsonl`。此时**没有 turn 在收尾**，
 /// 传 `turn_id = None`：不发 `TurnEvent::Finished`，也不 touch meta。
 #[allow(clippy::too_many_arguments)]
-async fn persist_and_finish_turn<W>(
+async fn persist_and_finish_turn(
     thread_id: &str,
     turn_id: Option<&str>,
     user_prompt: Option<&str>,
@@ -2951,12 +3066,10 @@ async fn persist_and_finish_turn<W>(
     completed_items: Vec<crate::protocol::Item>,
     last_usage: Option<crate::thread_store::TurnUsage>,
     store: &crate::thread_store::ThreadStore,
-    writer: &MessageWriter<W>,
+    hub: &crate::broadcast::Broadcaster,
     turn_tx: &mpsc::Sender<TurnEvent>,
     status: &Arc<std::sync::Mutex<ThreadStatus>>,
-) where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+) {
     let mut items = Vec::with_capacity(completed_items.len() + 1);
     if let Some(prompt) = user_prompt {
         // 基线 server 不 emit userMessage，必须在落盘时补齐，否则 resume 会丢用户提问。
@@ -2981,7 +3094,7 @@ async fn persist_and_finish_turn<W>(
         }
     }
 
-    let _ = update_status(writer, status, thread_id, ThreadStatus::Idle).await;
+    let _ = update_status(hub, status, thread_id, ThreadStatus::Idle).await;
     if let Some(turn_id) = turn_id {
         let _ = turn_tx.send(finished_event(thread_id, turn_id)).await;
     }
@@ -2992,20 +3105,17 @@ async fn persist_and_finish_turn<W>(
 /// 按值传入/返回是刻意的：`Agent::with_session` 消费 self，而 `Agent` 既不是
 /// `Clone` 也没有便宜的占位值，所以无法用 `&mut Agent` 调用它。
 #[allow(clippy::too_many_arguments)]
-async fn apply_session_command<W>(
+async fn apply_session_command(
     mut agent: yi_agent_core::Agent,
     command: SessionCommand,
     provider: &Arc<dyn yi_agent_core::Provider>,
     config: &yi_agent_core::AgentConfig,
     store: &crate::thread_store::ThreadStore,
     thread_id: &str,
-    writer: &MessageWriter<W>,
+    hub: &crate::broadcast::Broadcaster,
     turn_tx: &mpsc::Sender<TurnEvent>,
     status: &Arc<std::sync::Mutex<ThreadStatus>>,
-) -> yi_agent_core::Agent
-where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+) -> yi_agent_core::Agent {
     match command {
         SessionCommand::Clear { reply } => {
             agent = agent.with_session(yi_agent_core::Session::new());
@@ -3022,7 +3132,7 @@ where
                 Vec::new(),
                 None,
                 store,
-                writer,
+                hub,
                 turn_tx,
                 status,
             )
@@ -3048,7 +3158,7 @@ where
                 Vec::new(),
                 None,
                 store,
-                writer,
+                hub,
                 turn_tx,
                 status,
             )
@@ -3069,14 +3179,15 @@ where
 /// 请求 `item/toolCall/requestApproval`(id 取自进程级 `perm_seq`)并等待客户端
 /// 经 `pending` 登记表回传的决定;超时或中断按 `Deny` 处理。
 #[allow(clippy::too_many_arguments)]
-async fn run_thread_driver<W>(
+async fn run_thread_driver(
     thread_id: String,
     mut agent: yi_agent_core::Agent,
     mut prompt_rx: mpsc::Receiver<TurnPrompt>,
     mut interrupt_rx: mpsc::Receiver<String>,
     mut interject_rx: mpsc::Receiver<InterjectionRequest>,
     mut session_rx: mpsc::Receiver<SessionCommand>,
-    writer: Arc<MessageWriter<W>>,
+    hub: Arc<crate::broadcast::Broadcaster>,
+    client: crate::broadcast::ClientId,
     turn_tx: mpsc::Sender<TurnEvent>,
     decision_tx: Option<mpsc::Sender<(u64, Decision)>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
@@ -3090,9 +3201,7 @@ async fn run_thread_driver<W>(
     // clear / compact 需要它们：compact 要调 provider 生成摘要，两者都要重建 agent。
     provider: Arc<dyn yi_agent_core::Provider>,
     config: yi_agent_core::AgentConfig,
-) where
-    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-{
+) {
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
     let mut translator = Translator::new(thread_id.clone());
@@ -3111,7 +3220,7 @@ async fn run_thread_driver<W>(
         let turn_prompt = tokio::select! {
             Some(command) = session_rx.recv() => {
                 agent = apply_session_command(
-                    agent, command, &provider, &config, &store, &thread_id, &writer, &turn_tx,
+                    agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx,
                     &status,
                 )
                 .await;
@@ -3174,11 +3283,11 @@ async fn run_thread_driver<W>(
             Err(e) => {
                 // run() 本身失败:翻译成 Error → turn/completed(failed)。
                 for n in translator.on_event(yi_agent_core::AgentEvent::Error(e)) {
-                    let _ = write_notification(&writer, &n).await;
+                    let _ = write_notification(&hub, &n).await;
                 }
                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                 // run() 失败即本轮结束:thread 立刻回 Idle(失败是事件不是状态)。
-                let _ = update_status(&writer, &status, &thread_id, ThreadStatus::Idle).await;
+                let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
                 continue;
             }
         };
@@ -3214,14 +3323,34 @@ async fn run_thread_driver<W>(
                                     "kind": kind,
                                 }),
                             };
-                            if writer.write_value(&reverse).await.is_err() {
+                            let frame = match serde_json::to_value(&reverse) {
+                                Ok(frame) => frame,
+                                Err(e) => {
+                                    tracing::error!("failed to serialize reverse request: {e}");
+                                    pending.lock().await.remove(&perm_id);
+                                    let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                    return;
+                                }
+                            };
+                            // 反向请求定向发给发起本次 turn 的客户端,不用 broadcast。
+                            //
+                            // 偏差记录(spec §4.4 表格写的是 `hub.broadcast(…)` + 先到先得):
+                            // Tier 0 只有一个客户端,两者投递等价;但 `broadcast` 是
+                            // `try_send`(队列满即静默丢帧),会丢掉这里 `is_err()`「客户端
+                            // 已断开即收尾本轮」的语义——`driver_reports_finished_when_writer_fails`
+                            // 依赖它。更关键的是:审批是**一对一问答**且响应经 `pending` 表按
+                            // `perm_id` 路由,向未发起方广播会诱发先到先得下的错误路由,
+                            // 这正是 Tier 1 才需连同 `approvalResolved` 一起处理的问题。
+                            // 故 Tier 0 保留 `reply`,Tier 1 再改 broadcast。
+                            if hub.reply(&client, frame).await.is_err() {
+                                // 客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);
                                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                                 return;
                             }
                             // 反向请求已写出:进入等待审批状态。
                             let _ = update_status(
-                                &writer,
+                                &hub,
                                 &status,
                                 &thread_id,
                                 ThreadStatus::AwaitingApproval,
@@ -3253,7 +3382,7 @@ async fn run_thread_driver<W>(
 
                             // 决定已到(或超时/中断按 Deny):恢复为 Running,
                             // 继续消费本轮 stream。
-                            let _ = update_status(&writer, &status, &thread_id, ThreadStatus::Running)
+                            let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Running)
                                 .await;
 
                             if let Some(tx) = &decision_tx {
@@ -3283,7 +3412,7 @@ async fn run_thread_driver<W>(
                                         cache_read_input_tokens: *cache_read_input_tokens,
                                     });
                                 }
-                                if write_notification(&writer, &n).await.is_err() {
+                                if write_notification(&hub, &n).await.is_err() {
                                     // 客户端可能已断开;先上报 Finished,
                                     // 避免 active_turn_id 永久卡住。
                                     let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
@@ -3326,7 +3455,7 @@ async fn run_thread_driver<W>(
                                 }],
                             },
                         ) {
-                            let _ = write_notification(&writer, &n).await;
+                            let _ = write_notification(&hub, &n).await;
                         }
                     }
                 }
@@ -3355,12 +3484,12 @@ async fn run_thread_driver<W>(
         // 再为刚结束的 turn 收尾。
         if let Some(command) = pending_session_command.take() {
             agent = apply_session_command(
-                agent, command, &provider, &config, &store, &thread_id, &writer, &turn_tx, &status,
+                agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx, &status,
             )
             .await;
             // 命令路径已 append 过最终状态;这里只需为这个 turn 发 Finished 让主循环清
             // active_turn_id,且**不要**再 append 一次(否则会用 turn 前的 session 覆盖)。
-            let _ = update_status(&writer, &status, &thread_id, ThreadStatus::Idle).await;
+            let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
             let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
             continue;
         }
@@ -3374,7 +3503,7 @@ async fn run_thread_driver<W>(
             std::mem::take(&mut completed_items),
             last_usage.take(),
             &store,
-            &writer,
+            &hub,
             &turn_tx,
             &status,
         )
@@ -3420,10 +3549,11 @@ fn store_lookup(
 /// 显式 `cwd` canonicalize + 校验是目录;失败写 `-32602` 并返回 `Ok(None)`
 /// (调用方 continue)。缺省时沿用 `cfg.workdir` 原样,不 canonicalize:保持旧的
 /// 单目录行为,避免 macOS `/var` → `/private/var` 之类改写破坏既有路径语义。
-async fn resolve_thread_cwd<W: tokio::io::AsyncWrite + Unpin>(
+async fn resolve_thread_cwd(
     params: &serde_json::Value,
     cfg: &RuntimeConfig,
-    writer: &MessageWriter<W>,
+    hub: &crate::broadcast::Broadcaster,
+    client: &crate::broadcast::ClientId,
     id: RequestId,
 ) -> anyhow::Result<Option<String>> {
     match params.get("cwd").and_then(|v| v.as_str()) {
@@ -3431,7 +3561,8 @@ async fn resolve_thread_cwd<W: tokio::io::AsyncWrite + Unpin>(
             Ok(p) if p.is_dir() => Ok(Some(p.to_string_lossy().to_string())),
             _ => {
                 write_response(
-                    writer,
+                    hub,
+                    client,
                     err_response(id, RpcError::invalid_params("cwd is not a valid directory")),
                 )
                 .await?;
@@ -3443,8 +3574,9 @@ async fn resolve_thread_cwd<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 /// 从 params 提取 `threadId`;缺失时写 `-32602` 并返回 `Ok(None)`。
-async fn require_thread_id<W: tokio::io::AsyncWrite + Unpin>(
-    writer: &MessageWriter<W>,
+async fn require_thread_id(
+    hub: &crate::broadcast::Broadcaster,
+    client: &crate::broadcast::ClientId,
     params: &serde_json::Value,
     id: RequestId,
 ) -> anyhow::Result<Option<String>> {
@@ -3452,7 +3584,8 @@ async fn require_thread_id<W: tokio::io::AsyncWrite + Unpin>(
         Some(s) => Ok(Some(s.to_string())),
         None => {
             write_response(
-                writer,
+                hub,
+                client,
                 err_response(id, RpcError::invalid_params("missing threadId")),
             )
             .await?;
@@ -3806,6 +3939,38 @@ mod plugin_query_tests {
         assert_eq!(value["error"]["data"]["code"], "board_not_created", "{value}");
         assert_eq!(value["error"]["code"], -32020, "{value}");
         h.shutdown().await;
+    }
+}
+
+/// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。
+///
+/// 放在 `mod tests` 之外，因为 `#[cfg(test)]` 的 `mod tests` 对其它文件不可见；
+/// 这里同样只在 test 构建下存在，避免生产构建出现 dead_code。
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use yi_agent_runtime::config::RuntimeConfig;
+
+    /// 一份无凭据、无网络的测试配置；provider 只是占位字符串。
+    pub(crate) fn test_config() -> RuntimeConfig {
+        RuntimeConfig {
+            provider: "anthropic".to_string(),
+            api_url: "https://api.anthropic.com".to_string(),
+            api_key: String::new(),
+            model: "test-model".to_string(),
+            max_turns: 20,
+            max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
+            workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::default(),
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: false,
+        }
     }
 }
 
@@ -4292,6 +4457,28 @@ mod tests {
         }
     }
 
+    /// 测试用的单客户端 hub:注册 `local` 并起 `pump_stdout`,与生产的 stdio 接线同款。
+    fn test_hub<W>(
+        writer: W,
+    ) -> (
+        Arc<crate::broadcast::Broadcaster>,
+        crate::broadcast::ClientId,
+    )
+    where
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        let client = crate::broadcast::ClientId::local();
+        let outbound = hub.register(client.clone());
+        tokio::spawn(pump_stdout(
+            outbound,
+            writer,
+            Arc::clone(&hub),
+            client.clone(),
+        ));
+        (hub, client)
+    }
+
     fn build_test_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
@@ -4371,25 +4558,7 @@ mod tests {
     }
 
     fn test_config() -> RuntimeConfig {
-        RuntimeConfig {
-            provider: "anthropic".to_string(),
-            api_url: "https://api.anthropic.com".to_string(),
-            api_key: String::new(),
-            model: "test-model".to_string(),
-            max_turns: 20,
-            max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
-            workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
-            system_prompt: None,
-            compact_threshold: 160_000,
-            compact_user_budget_tokens: 20_000,
-            compact_tool_budget_tokens: 12_000,
-            yolo: false,
-            sandbox_promotable: true,
-            sandbox: yi_agent_tools::SandboxMode::default(),
-            sandbox_writable_roots: Vec::new(),
-            skills_catalog_budget: 8192,
-            skills_catalog_budget_explicit: false,
-        }
+        super::tests_support::test_config()
     }
 
     /// 用两条 `duplex` 管道把 server 与测试客户端对接。
@@ -4440,7 +4609,7 @@ mod tests {
             let workspaces = Arc::new(WorkspaceIndex::new(
                 index_dir.path().join("workspaces.json"),
             ));
-            let handle = tokio::spawn(run_with(
+            let handle = tokio::spawn(serve_stdio(
                 server_r,
                 server_w,
                 cfg,
@@ -4491,7 +4660,7 @@ mod tests {
                 .await
                 .expect("server must shut down within the timeout")
                 .expect("server task must not panic");
-            assert!(res.is_ok(), "run_with should return Ok on EOF: {res:?}");
+            assert!(res.is_ok(), "serve_stdio should return Ok on EOF: {res:?}");
         }
     }
 
@@ -5028,7 +5197,7 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
-        let handle = tokio::spawn(run_with(
+        let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
@@ -5051,7 +5220,7 @@ mod tests {
             .expect("server task must not panic");
         assert!(
             result.is_ok(),
-            "run_with should return Ok on EOF: {result:?}"
+            "serve_stdio should return Ok on EOF: {result:?}"
         );
     }
 
@@ -5087,7 +5256,7 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
-        let handle = tokio::spawn(run_with(
+        let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
@@ -5139,7 +5308,7 @@ mod tests {
             .await
             .expect("server must shut down within the timeout")
             .expect("server task must not panic");
-        assert!(res.is_ok(), "run_with should return Ok on EOF: {res:?}");
+        assert!(res.is_ok(), "serve_stdio should return Ok on EOF: {res:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -5150,7 +5319,7 @@ mod tests {
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
-        let handle = tokio::spawn(run_with(
+        let handle = tokio::spawn(serve_stdio(
             server_r,
             server_w,
             test_config(),
@@ -5410,7 +5579,7 @@ mod tests {
         let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-        let writer = Arc::new(MessageWriter::new(server_w));
+        let (hub, client) = test_hub(server_w);
 
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
@@ -5429,7 +5598,8 @@ mod tests {
             interrupt_rx,
             interject_rx,
             session_rx,
-            writer,
+            hub,
+            client,
             turn_tx,
             None,
             Arc::new(Mutex::new(HashMap::new())),
@@ -5494,7 +5664,7 @@ mod tests {
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         drop(client_r); // 断开读端 → 写通知失败
-        let writer = Arc::new(MessageWriter::new(server_w));
+        let (hub, client) = test_hub(server_w);
 
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
@@ -5513,7 +5683,8 @@ mod tests {
             interrupt_rx,
             interject_rx,
             session_rx,
-            writer,
+            hub,
+            client,
             turn_tx,
             None,
             Arc::new(Mutex::new(HashMap::new())),
@@ -5556,7 +5727,7 @@ mod tests {
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         drop(client_r); // 本测试不看 writer 输出
-        let writer = Arc::new(MessageWriter::new(server_w));
+        let (hub, client) = test_hub(server_w);
 
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
@@ -5582,7 +5753,8 @@ mod tests {
             interrupt_rx,
             interject_rx,
             session_rx,
-            writer,
+            hub,
+            client,
             turn_tx,
             None,
             Arc::new(Mutex::new(HashMap::new())),
@@ -5632,7 +5804,7 @@ mod tests {
         let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-        let writer = Arc::new(MessageWriter::new(server_w));
+        let (hub, client) = test_hub(server_w);
 
         let store_dir = tempfile::TempDir::new().unwrap();
         let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
@@ -5651,7 +5823,8 @@ mod tests {
             interrupt_rx,
             interject_rx,
             session_rx,
-            writer,
+            hub,
+            client,
             turn_tx,
             None,
             Arc::new(Mutex::new(HashMap::new())),
@@ -6003,7 +6176,7 @@ mod tests {
         let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
         let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
-        let writer = Arc::new(MessageWriter::new(server_w));
+        let (hub, client) = test_hub(server_w);
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let perm_seq = Arc::new(AtomicU64::new(1));
 
@@ -6024,7 +6197,8 @@ mod tests {
             interrupt_rx,
             interject_rx,
             session_rx,
-            writer,
+            hub,
+            client,
             turn_tx,
             built.decision_tx,
             Arc::clone(&pending),
@@ -7797,10 +7971,12 @@ mod tests {
         let bad = h.read_value().await;
         assert_eq!(bad["id"], 3);
         assert!(bad["result"].is_null(), "{bad}");
-        assert!(bad["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("process not found"));
+        assert!(
+            bad["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("process not found")
+        );
 
         h.shutdown().await;
     }
@@ -7862,7 +8038,10 @@ mod tests {
             .iter()
             .filter_map(|p| p["name"].as_str())
             .collect();
-        assert!(names.contains(&"t4-probe"), "thread must see the held manager: {listed}");
+        assert!(
+            names.contains(&"t4-probe"),
+            "thread must see the held manager: {listed}"
+        );
 
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":4,"method":"process/read","params":{{"thread_id":"{thread_id}","process_id":"{}"}}}}"#,
@@ -7872,7 +8051,10 @@ mod tests {
         let first = read_response(&mut h, 4).await;
         assert!(first["error"].is_null(), "{first}");
         assert!(
-            first["result"]["stdout"].as_str().unwrap().contains("alpha"),
+            first["result"]["stdout"]
+                .as_str()
+                .unwrap()
+                .contains("alpha"),
             "{first}"
         );
         let cursor = first["result"]["next_cursor"].as_u64().unwrap();
@@ -8027,7 +8209,11 @@ mod tests {
         ))
         .await;
         let resumed = read_response(&mut h, 3).await;
-        assert_eq!(resumed["result"]["thread_id"], thread_id.as_str(), "{resumed}");
+        assert_eq!(
+            resumed["result"]["thread_id"],
+            thread_id.as_str(),
+            "{resumed}"
+        );
 
         //resume 之后该 thread 生效的 manager 就是工厂第二次产出的那一份。
         let managers = seen.lock().unwrap().clone();
@@ -8062,7 +8248,8 @@ mod tests {
                 )
             });
         assert_eq!(
-            note["params"]["process_id"], started.process_id.as_str(),
+            note["params"]["process_id"],
+            started.process_id.as_str(),
             "{note}"
         );
         assert_eq!(note["params"]["thread_id"], thread_id.as_str(), "{note}");

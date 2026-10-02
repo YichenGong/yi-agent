@@ -87,7 +87,7 @@
 
 - [ ] MCP 集成 — 后端 `yi-agent-mcp` 已完成（配置/懒连接/调用/`/mcp` 开关，见 [yi-agent-mcp](./yi-agent-mcp.md)）；判据：GUI 可查看 / 启停 MCP server
 
-- [ ] Unix socket / websocket 传输 — 当前仅 stdio（其它一律拒绝，`yi-agent-rs/crates/yi-agent/src/main.rs:74`）；判据：`--listen` 支持 socket/ws 且 GUI 可连
+- [ ] WebSocket 传输（app-server 侧已支持 `--listen ws://`，见 [yi-agent-app-server](./yi-agent-app-server.md)；桌面端 GUI 仍走 stdio，尚未接入 ws）
 - [ ] 多窗口共享 daemon — 判据：多个 GUI 窗口连同一 daemon
 - [ ] Linux 打包验证 — 判据：产出并启动 Linux 包
 

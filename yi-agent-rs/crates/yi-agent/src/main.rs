@@ -78,13 +78,25 @@ fn main() -> Result<()> {
     }
 }
 
-/// Validate the app-server listen transport. Only the stdio transport is
-/// implemented; anything else is rejected before the runtime is assembled.
-fn ensure_stdio_listen(listen: &str) -> Result<()> {
-    if listen != "stdio://" {
-        anyhow::bail!("unsupported app-server transport `{listen}`: only `stdio://` is supported");
+/// 解析 `--listen`。只支持 stdio 与 ws 两种传输。
+enum Listen {
+    Stdio,
+    Ws(std::net::SocketAddr),
+}
+
+fn parse_listen(listen: &str) -> Result<Listen> {
+    if listen == "stdio://" {
+        return Ok(Listen::Stdio);
     }
-    Ok(())
+    if let Some(rest) = listen.strip_prefix("ws://") {
+        let addr: std::net::SocketAddr = rest
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid ws address `{rest}`: {e}"))?;
+        return Ok(Listen::Ws(addr));
+    }
+    anyhow::bail!(
+        "unsupported app-server transport `{listen}`: expected `stdio://` or `ws://host:port`"
+    )
 }
 
 /// Emit a clap-generated shell completion script for `shell` on stdout.
@@ -97,19 +109,37 @@ fn print_completion(shell: clap_complete::Shell) -> Result<()> {
     Ok(())
 }
 
-/// Run the JSON-RPC 2.0 app-server over stdio for the desktop GUI sidecar.
+/// Run the JSON-RPC 2.0 app-server over stdio for the desktop GUI sidecar, or
+/// over `ws://` for network clients.
 ///
-/// stdout is the protocol channel and must stay free of log lines; tracing
-/// writes to a file (and to stderr only when `YI_LOG` is set).
+/// For stdio, stdout is the protocol channel and must stay free of log lines;
+/// tracing writes to a file (and to stderr only when `YI_LOG` is set).
 fn run_app_server(cli: Cli, listen: &str) -> Result<()> {
-    ensure_stdio_listen(listen)?;
+    let listen = parse_listen(listen)?;
     let config = config::load(&cli)?;
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(yi_agent_app_server::run(
-        tokio::io::stdin(),
-        tokio::io::stdout(),
-        config,
-    ))
+    match listen {
+        Listen::Stdio => rt.block_on(yi_agent_app_server::run(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+            config,
+        )),
+        Listen::Ws(addr) => rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            let bound = listener.local_addr()?;
+            if !bound.ip().is_loopback() {
+                eprintln!(
+                    "warning: ws app-server is bound to {bound} and has NO authentication; \
+                     expose it only over a trusted tunnel"
+                );
+            }
+            let workspaces =
+                std::sync::Arc::new(yi_agent_app_server::workspace_index::WorkspaceIndex::new(
+                    yi_agent_app_server::workspace_index::default_path(),
+                ));
+            yi_agent_app_server::ws::serve_ws(listener, config, workspaces).await
+        }),
+    }
 }
 
 fn control_agents(cli: &Cli, project: Option<std::path::PathBuf>, all: bool) -> Result<()> {
@@ -1880,8 +1910,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ensure_stdio_listen_accepts_stdio() {
-        assert!(ensure_stdio_listen("stdio://").is_ok());
+    fn parse_listen_accepts_stdio() {
+        assert!(matches!(parse_listen("stdio://").unwrap(), Listen::Stdio));
     }
 
     #[test]
@@ -1935,8 +1965,17 @@ mod tests {
     }
 
     #[test]
-    fn ensure_stdio_listen_rejects_other_transports() {
-        assert!(ensure_stdio_listen("tcp://127.0.0.1:9000").is_err());
+    fn parse_listen_accepts_ws_with_an_address() {
+        match parse_listen("ws://127.0.0.1:8790").unwrap() {
+            Listen::Ws(addr) => assert_eq!(addr.port(), 8790),
+            _ => panic!("ws:// must parse to a Ws listener"),
+        }
+    }
+
+    #[test]
+    fn parse_listen_rejects_other_transports() {
+        assert!(parse_listen("tcp://127.0.0.1:9000").is_err());
+        assert!(parse_listen("ws://not-an-address").is_err());
     }
 
     #[test]
