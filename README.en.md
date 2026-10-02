@@ -172,6 +172,13 @@ cold thread the client catches it up with the read-only
 would interrupt the in-flight turn. The desktop (stdio) client never subscribes
 and so always receives everything.
 
+Pairing supports **QR codes**: the desktop's "Remote access" settings page shows a QR
+code beside the pairing code once a relay URL is entered, and
+`yi-agent pair code --relay <url>` prints one in the terminal; the iOS pairing
+screen's "Scan" button reads it and pairs automatically. The payload is
+`yiagent://pair?v=1&relay=<url>&code=<code>` — it carries the relay URL and the
+one-time pairing code, **never a token**. Manual text entry still works.
+
 > **Experimental**: the pairing flow is now **wired end-to-end** — a
 > `pair/create` code is **persisted** to `~/.yi-agent/pairing.json`, so a code
 > minted by the desktop stdio process can be redeemed by the separate
