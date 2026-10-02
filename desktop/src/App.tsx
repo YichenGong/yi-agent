@@ -619,73 +619,109 @@ export default function App() {
   useEffect(() => {
     if (inited.current) return; // guard against React StrictMode double-invoke
     inited.current = true;
-    const client = new RpcClient(transportFactory());
-    clientRef.current = client;
-    client.onNotification((n) => {
-      // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
-      if (n.method === "agent/children/updated") {
-        railStore.applyNotification(n.params.threadId, n.params.children);
+    let disposed = false;
+    let restartTimer: number | null = null;
+
+    // 注册每个客户端的通知/审批/状态回调。sidecar 重启后会换一个新客户端,
+    // 这些回调必须随新客户端重新登记(旧客户端的 transport 已随管道断开)。
+    const wireClient = (client: RpcClient) => {
+      client.onNotification((n) => {
+        // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
+        if (n.method === "agent/children/updated") {
+          railStore.applyNotification(n.params.threadId, n.params.children);
+          force((v) => v + 1);
+          return;
+        }
+        if (n.method === "ui/settings/updated") {
+          // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
+          // 的首屏 read 用旧值把它覆盖回去。
+          themeTouchedRef.current = true;
+          setTheme(parseTheme(n.params.theme));
+          return;
+        }
+        if (n.method === "agent/trace/event") {
+          // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
+          // 把两个任务的轨迹拼在一起安全。
+          setTraceRows((prev) =>
+            n.params.taskId === openTaskId.current ? [...prev, n.params.row] : prev,
+          );
+          return;
+        }
+        // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
+        store.applyNotification(n);
         force((v) => v + 1);
-        return;
+        if (n.method === "turn/completed") void refreshThreads();
+      });
+      client.onApproval((r) => {
+        store.setApproval(r);
+        force((v) => v + 1);
+      });
+      client.onStatus((s) => {
+        setStatus(s.state);
+        // sidecar 退出后宿主会自动重启它(bridge 的监管循环)。重连不能依赖用户
+        // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
+        // warm 缓存,免得切回旧对话时跳过 resume(新进程并不记得任何会话)。
+        if (s.state === "exited" && !disposed) {
+          warm.current.clear();
+          if (restartTimer === null) {
+            restartTimer = window.setTimeout(() => {
+              restartTimer = null;
+              if (disposed) return;
+              const next = connect();
+              void handshake(next);
+            }, 500);
+          }
+        }
+      });
+    };
+
+    // 一次完整握手:任何一次重连都要重放它,因为新进程的记忆是空的。
+    const handshake = async (client: RpcClient) => {
+      try {
+        await client.request("initialize", {});
+        const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
+        // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
+        // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
+        if (!themeTouchedRef.current) setTheme(parseTheme(settings.theme));
+        await refreshWorkspaces();
+        const list = await client.request<{
+          groups: WorkspaceGroup[];
+          pinned?: ThreadSummary[];
+        }>("thread/listAll", {});
+        setGroups(list.groups);
+        setPinned(list.pinned ?? []);
+        store.seed(list.groups.flatMap((g) => g.threads));
+        // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
+        const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
+        if (first) await selectThread(first.thread_id);
+        // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
+        setStatus("connected");
+        // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
+        // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
+        // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
+        await refreshBoards();
+      } catch (e) {
+        const msg = formatError(e);
+        setCurrentError(msg);
+        setStatus(`error: ${msg}`);
       }
-      if (n.method === "ui/settings/updated") {
-        // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
-        // 的首屏 read 用旧值把它覆盖回去。
-        themeTouchedRef.current = true;
-        setTheme(parseTheme(n.params.theme));
-        return;
-      }
-      if (n.method === "agent/trace/event") {
-        // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
-        // 把两个任务的轨迹拼在一起安全。
-        setTraceRows((prev) =>
-          n.params.taskId === openTaskId.current ? [...prev, n.params.row] : prev,
-        );
-        return;
-      }
-      // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
-      store.applyNotification(n);
-      force((v) => v + 1);
-      if (n.method === "turn/completed") void refreshThreads();
-    });
-    client.onApproval((r) => {
-      store.setApproval(r);
-      force((v) => v + 1);
-    });
-    client.onStatus((s) => setStatus(s.state));
-    (async () => {
-      await client.request("initialize", {});
-      const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
-      // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
-      // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
-      if (!themeTouchedRef.current) setTheme(parseTheme(settings.theme));
-      await refreshWorkspaces();
-      const list = await client.request<{ groups: WorkspaceGroup[]; pinned?: ThreadSummary[] }>(
-        "thread/listAll",
-        {},
-      );
-      setGroups(list.groups);
-      setPinned(list.pinned ?? []);
-      store.seed(list.groups.flatMap((g) => g.threads));
-      // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
-      const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
-      if (first) {
-        await selectThread(first.thread_id);
-      }
-      // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
-      setStatus("connected");
-      // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
-      // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
-      // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
-      await refreshBoards();
-    })().catch((e) => {
-      const msg = formatError(e);
-      setCurrentError(msg);
-      setStatus(`error: ${msg}`);
-    });
+    };
+
+    const connect = (): RpcClient => {
+      const client = new RpcClient(transportFactory());
+      clientRef.current = client;
+      wireClient(client);
+      return client;
+    };
+
+    void handshake(connect());
     // 看板内容由 boardTick 每 2 秒刷新选中项目，读失败绝不影响主流程。
     const boardTimer = window.setInterval(() => boardTick.current(), 2000);
-    return () => window.clearInterval(boardTimer);
+    return () => {
+      disposed = true;
+      if (restartTimer !== null) window.clearTimeout(restartTimer);
+      window.clearInterval(boardTimer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

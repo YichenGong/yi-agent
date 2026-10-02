@@ -21,6 +21,9 @@ const { clients, state } = vi.hoisted(() => ({
     threads: null as ThreadSeed[] | null,
     notifHandlers: [] as Array<(n: unknown) => void>,
     approvalHandlers: [] as Array<(r: unknown) => void>,
+    // Status callbacks the App registers on each client; a test fires an
+    // "exited" status to simulate a sidecar crash + host restart.
+    statusHandlers: [] as Array<(s: unknown) => void>,
     // Method -> error code. Any method can be forced to reject, so a test can
     // force the `-32013` / `-32012` disagreement the server can report — or a
     // `thread/clear` rejection (`-32012`, the accepted post-turn window).
@@ -76,7 +79,8 @@ vi.mock("./lib/rpc", () => ({
       state.approvalHandlers.push(cb);
       return () => {};
     }
-    onStatus() {
+    onStatus(cb: (s: unknown) => void) {
+      state.statusHandlers.push(cb);
       return () => {};
     }
     async request(method: string, params: unknown) {
@@ -175,6 +179,7 @@ beforeEach(() => {
   state.threads = null;
   state.notifHandlers.length = 0;
   state.approvalHandlers.length = 0;
+  state.statusHandlers.length = 0;
   state.rejectCode = {};
   state.listStatus = "idle";
   state.pinnedIds = [];
@@ -1157,5 +1162,26 @@ describe("App settings & theme wiring", () => {
     );
     // 写失败：UI 必须回退到之前的值，不能停在服务端并未接受的浅色上。
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+  });
+
+  it("re-handshakes on a fresh client after the sidecar exits and the host restarts it", async () => {
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(clients.length).toBe(1));
+    expect(clients[0].requests.some((r) => r.method === "thread/listAll")).toBe(true);
+
+    // 宿主报告 sidecar 退出(bridge 会随即自动重启它)。App 必须建一个新客户端
+    // 并重放握手,而不是让用户去重启 App。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 });
+    });
+    await waitFor(() => expect(clients.length).toBe(2));
+
+    await waitFor(() =>
+      expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    await waitFor(() =>
+      expect(clients[1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
+    );
   });
 });
