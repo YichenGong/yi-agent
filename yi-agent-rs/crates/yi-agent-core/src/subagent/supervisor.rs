@@ -23,6 +23,7 @@ use super::worker::{
     WorkerWatchdogEvent,
 };
 use crate::agent::ProviderTurnGate;
+use crate::message::Message;
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
@@ -89,6 +90,11 @@ pub struct AgentSupervisor {
     objectives: HashMap<TaskId, String>,
     workspace_modes: HashMap<TaskId, ChildWriteMode>,
     inherited_sandboxes: HashMap<TaskId, InheritedSandbox>,
+    /// The caller's conversation a forked child should start from, keyed by the
+    /// child task. Written after a spawn resolves its fork token and read when
+    /// the worker starts. A `Mutex` (rather than a plain map) keeps the field
+    /// settable while the supervisor is held behind `Arc<Mutex<..>>`.
+    fork_messages: Mutex<HashMap<TaskId, Vec<Message>>>,
     workdirs: HashMap<TaskId, Option<PathBuf>>,
     models: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
@@ -131,6 +137,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            fork_messages: Mutex::new(HashMap::new()),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -170,6 +177,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            fork_messages: Mutex::new(HashMap::new()),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -224,6 +232,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            fork_messages: Mutex::new(HashMap::new()),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -368,6 +377,24 @@ impl AgentSupervisor {
 
     pub fn inherited_sandbox(&self, task_id: &TaskId) -> Option<InheritedSandbox> {
         self.inherited_sandboxes.get(task_id).copied()
+    }
+
+    /// Records the caller's conversation a forked child should start from.
+    pub fn set_fork_messages(&mut self, task_id: &TaskId, messages: Vec<Message>) {
+        self.fork_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(task_id.clone(), messages);
+    }
+
+    /// The forked conversation prefix recorded for a task, if any. Read when
+    /// the task's worker starts so the worker can seed its session.
+    pub fn fork_messages(&self, task_id: &TaskId) -> Option<Vec<Message>> {
+        self.fork_messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(task_id)
+            .cloned()
     }
 
     /// Binds a directory to a task. A root has no workdir by default, so this is
@@ -618,7 +645,8 @@ impl AgentSupervisor {
                     body: body.clone(),
                 })
                 .collect(),
-        );
+        )
+        .maybe_with_fork_messages(self.fork_messages(task_id));
         let start = if let Some(workspace) = task.workspace.clone() {
             start.with_workspace_lease(workspace)
         } else {
@@ -2358,5 +2386,29 @@ mod tests {
             .set_workdir(&unknown, PathBuf::from("/tmp/example-worktree"))
             .unwrap_err();
         assert_eq!(error, "task does not exist");
+    }
+
+    #[test]
+    fn supervisor_remembers_fork_messages_per_task() {
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = supervisor
+            .spawn_with_objective(
+                supervisor.root_task_id().clone(),
+                crate::subagent::worker::SpawnRequest::new(
+                    "child".into(),
+                    ChildWriteMode::ReadOnly,
+                    None,
+                ),
+            )
+            .unwrap();
+
+        supervisor.set_fork_messages(&child, vec![Message::user("inherited")]);
+        assert_eq!(supervisor.fork_messages(&child).unwrap().len(), 1);
+        assert!(
+            supervisor
+                .fork_messages(&supervisor.root_task_id().clone())
+                .is_none()
+        );
     }
 }
