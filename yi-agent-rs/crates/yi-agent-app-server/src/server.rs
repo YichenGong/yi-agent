@@ -3455,6 +3455,48 @@ async fn write_notification(
     Ok(())
 }
 
+/// 逐字流合并器：按 thread 攒 `(item_id, text)`。跨 item_id 不合并（顺序优先）。
+#[derive(Default)]
+struct DeltaCoalescer {
+    /// thread → 当前正在累加的 (item_id, text)。
+    pending: std::collections::HashMap<String, (String, String)>,
+}
+
+impl DeltaCoalescer {
+    const FLUSH_BYTES: usize = 4096;
+
+    /// 追加一段 delta，返回**此刻应当立即发出去的**若干条（跨 item 或超限时）。
+    fn push(&mut self, thread: &str, item_id: &str, delta: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        match self.pending.get_mut(thread) {
+            Some((pid, text)) if pid == item_id => text.push_str(delta),
+            _ => {
+                if let Some(prev) = self.pending.remove(thread) {
+                    out.push(prev);
+                }
+                self.pending
+                    .insert(thread.to_string(), (item_id.to_string(), delta.to_string()));
+            }
+        }
+        if self.pending.get(thread).map(|(_, t)| t.len()).unwrap_or(0) >= Self::FLUSH_BYTES {
+            if let Some(p) = self.pending.remove(thread) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// 取出并清空该 thread 的待发（屏障/tick 调用）。
+    fn take(&mut self, thread: &str) -> Option<(String, String)> {
+        self.pending.remove(thread)
+    }
+
+    /// 取出全部待发（tick 用）。
+    fn take_all(&mut self) -> Vec<(String, (String, String))> {
+        self.pending.drain().collect()
+    }
+}
+
 /// 更新共享状态句柄并推送 `thread/status/updated`。
 ///
 /// 加锁是同步的、不跨 `.await`；锁在写通知前即释放。锁中毒时沿用
@@ -3882,6 +3924,12 @@ async fn run_thread_driver(
         // 同一次 run 的投递句柄;run() 结束即失效,下一轮重新取。
         let inbox = agent.inbox_handle();
         let mut cancel_sent = false;
+        // 逐字流合并器（仅在本轮驱动内有效）。当存在订阅者时，`item/delta`
+        // 先按 thread 攒批，再由 100ms tick 或非 delta 屏障刷出；无订阅者时
+        // 走原来的直发路径，字节不变。
+        let mut coalescer = DeltaCoalescer::default();
+        let mut delta_tick = tokio::time::interval(Duration::from_millis(100));
+        delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -4002,15 +4050,75 @@ async fn run_thread_driver(
                                         cache_read_input_tokens: *cache_read_input_tokens,
                                     });
                                 }
-                                if write_notification(&hub, &n).await.is_err() {
-                                    // 客户端可能已断开;先上报 Finished,
-                                    // 避免 active_turn_id 永久卡住。
-                                    let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
-                                    return;
+                                // 逐字流：仅当存在订阅者时合并；否则走原来的直发。
+                                // 非 delta 通知前先刷该 thread 的待发，保证顺序。
+                                let mut to_send: Vec<Notification> = Vec::new();
+                                match &n {
+                                    Notification::ItemDelta { thread_id: t, item_id, delta }
+                                        if hub.has_subscribed_clients() =>
+                                    {
+                                        for (pid, text) in coalescer.push(t, item_id, delta) {
+                                            to_send.push(Notification::ItemDelta {
+                                                thread_id: t.clone(),
+                                                item_id: pid,
+                                                delta: text,
+                                            });
+                                        }
+                                    }
+                                    _ => {
+                                        if let Notification::ItemDelta { thread_id: t, .. } = &n {
+                                            if let Some((pid, text)) = coalescer.take(t) {
+                                                to_send.push(Notification::ItemDelta {
+                                                    thread_id: t.clone(),
+                                                    item_id: pid,
+                                                    delta: text,
+                                                });
+                                            }
+                                        }
+                                        to_send.push(n.clone());
+                                    }
+                                }
+                                for out in to_send {
+                                    if write_notification(&hub, &out).await.is_err() {
+                                        // 客户端可能已断开;先上报 Finished,
+                                        // 避免 active_turn_id 永久卡住。
+                                        let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                        return;
+                                    }
                                 }
                             }
                         }
-                        None => break,
+                        None => {
+                            // 流结束：把该 thread 攒下的逐字流刷出，避免丢尾
+                            // （最后一个 tick 之后、流结束之前可能仍有待发 delta）。
+                            if let Some((pid, text)) = coalescer.take(&thread_id) {
+                                let _ = write_notification(
+                                    &hub,
+                                    &Notification::ItemDelta {
+                                        thread_id: thread_id.clone(),
+                                        item_id: pid,
+                                        delta: text,
+                                    },
+                                )
+                                .await;
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = delta_tick.tick() => {
+                    // 100ms 兜底刷出：即便没有后续非 delta 通知，攒下的逐字流
+                    // 也必须按时送达。
+                    for (t, (pid, text)) in coalescer.take_all() {
+                        let _ = write_notification(
+                            &hub,
+                            &Notification::ItemDelta {
+                                thread_id: t,
+                                item_id: pid,
+                                delta: text,
+                            },
+                        )
+                        .await;
                     }
                 }
                 Some(target) = interrupt_rx.recv(), if !cancel_sent => {
@@ -9386,6 +9494,32 @@ pub(crate) mod tests {
             .thread_key(),
             None
         );
+    }
+
+    /// 合并器：同一 item_id 的相邻 delta 拼接；跨 item_id 先刷旧的。
+    #[test]
+    fn delta_coalescer_concat_within_an_item_and_flush_across_items() {
+        let mut c = DeltaCoalescer::default();
+        // 同一 item 连续追加不立即发。
+        assert!(c.push("t1", "i1", "Hel").is_empty());
+        assert!(c.push("t1", "i1", "lo").is_empty());
+        // 取出即 "Hello"。
+        assert_eq!(c.take("t1"), Some(("i1".to_string(), "Hello".to_string())));
+        assert_eq!(c.take("t1"), None, "取走后为空");
+
+        // 跨 item_id：追新的之前先把旧的返回（顺序优先）。
+        assert!(c.push("t1", "i1", "a").is_empty());
+        assert_eq!(
+            c.push("t1", "i2", "b"),
+            vec![("i1".to_string(), "a".to_string())]
+        );
+        assert_eq!(c.take("t1"), Some(("i2".to_string(), "b".to_string())));
+
+        // 超过 4KB 自动刷出。
+        let big = "x".repeat(DeltaCoalescer::FLUSH_BYTES);
+        let flushed = c.push("t1", "i3", &big);
+        assert_eq!(flushed.len(), 1, "超上限必须立即返回: {flushed:?}");
+        assert_eq!(c.take("t1"), None);
     }
 
     /// Approval is one-question/one-answer even with many clients: the first
