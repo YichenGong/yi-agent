@@ -105,6 +105,25 @@ impl RpcError {
     pub fn not_running() -> Self {
         Self::new(-32013, "no turn is running".to_string())
     }
+    /// A board query that reached no answer.
+    ///
+    /// The numeric code is only a coarse fallback for clients that read nothing
+    /// else; `data.code` carries the stable vocabulary
+    /// (`board_not_created` / `daemon_unavailable` / `plugin_unavailable`) the
+    /// UI branches on, so a new reason can be added without renumbering.
+    pub fn board_query(code: &'static str, message: impl Into<String>) -> Self {
+        let numeric = match code {
+            "board_not_created" => -32020,
+            "daemon_unavailable" => -32021,
+            "plugin_unavailable" => -32022,
+            _ => -32603,
+        };
+        Self {
+            code: numeric,
+            message: message.into(),
+            data: Some(serde_json::json!({ "code": code })),
+        }
+    }
 }
 
 /// 服务端 → 客户端通知(无 id)。

@@ -674,21 +674,72 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
     }
 }
 
+/// Why a board query produced no answer.
+///
+/// `code` is the stable string the UI branches on: "there is no board here" is
+/// a different remedy from "the daemon is down" and from "the plugin is not
+/// installed", and a bare message collapsed all three into one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoardQueryError {
+    code: &'static str,
+    message: String,
+}
+
+impl BoardQueryError {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for BoardQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
+}
+
 /// Ask a supervised plugin a question and return its answer verbatim.
 ///
 /// The host attaches no meaning to `method` or `params`, and unwraps no board
 /// shape here: this is a generic channel, so the UI (not the server) owns what a
-/// card or a switch field means. A plugin the daemon does not supervise, or one
-/// that refuses, surfaces as an RPC error the client can show.
-fn plugin_query(workdir: &Path, method: &str, plugin: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+/// card or a switch field means.
+///
+/// The question goes to **`project`'s** daemon, resolved from `project`'s own
+/// runtime socket. Using the app's cwd instead made every query for another
+/// project hit the wrong socket (or none) — the "clicked and nothing happened"
+/// bug. `global` is the board registry that says whether `project` has a board
+/// at all; a project without one has no daemon worth dialing.
+fn plugin_query(
+    project: &Path,
+    global: &Path,
+    method: &str,
+    plugin: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, BoardQueryError> {
     if plugin.is_empty() {
-        return Err("plugin/query needs a `plugin` name".to_string());
+        return Err(BoardQueryError::new(
+            "invalid_params",
+            "plugin/query needs a `plugin` name",
+        ));
     }
-    // The board RPCs used to read `<workdir>/.yi-agent/...` directly. The daemon
-    // that runs the plugin lives at the same project root, so that is where the
-    // question has to go.
-    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(workdir);
-    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| error.to_string())?;
+    match yi_agent_boards::registry::contains(global, project) {
+        Ok(true) => {}
+        // An unreadable registry reads as "no board": `contains` already
+        // degrades a corrupt file to empty, so this arm is the same absence.
+        Ok(false) | Err(_) => {
+            return Err(BoardQueryError::new(
+                "board_not_created",
+                "this project has no board",
+            ))
+        }
+    }
+    // The daemon that runs the plugin lives at the project root, which is also
+    // what `yi_agent_boards::lifecycle` and `board_daemon` dial.
+    let runtime_dir = project.join(".yi-agent").join("runtime");
+    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir)
+        .map_err(|error| BoardQueryError::new("daemon_unavailable", format!("daemon is unavailable: {error}")))?;
     let response = yi_agent_store::ipc::send_request(
         &socket,
         yi_agent_store::ipc::IpcRequest::PluginQuery {
@@ -697,14 +748,25 @@ fn plugin_query(workdir: &Path, method: &str, plugin: &str, params: serde_json::
             params,
         },
     )
-    .map_err(|error| format!("daemon is unavailable: {error}"))?;
+    .map_err(|error| BoardQueryError::new("daemon_unavailable", format!("daemon is unavailable: {error}")))?;
     match response {
         yi_agent_store::ipc::IpcResponse::PluginResult { value } => Ok(value),
-        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
-            "the plugin rejected the query: {code:?} {}",
-            message.unwrap_or_default()
+        // A daemon that is up but has no answer for this plugin is the plugin's
+        // absence, not the daemon's: the wording keeps the shape the desktop's
+        // `pluginIsUnavailable` matches on.
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => {
+            Err(BoardQueryError::new(
+                "plugin_unavailable",
+                format!(
+                    "the plugin rejected the query: {code:?} {}",
+                    message.unwrap_or_default()
+                ),
+            ))
+        }
+        other => Err(BoardQueryError::new(
+            "plugin_unavailable",
+            format!("daemon returned an unexpected response: {other:?}"),
         )),
-        other => Err(format!("daemon returned an unexpected response: {other:?}")),
     }
 }
 
@@ -955,6 +1017,17 @@ where
                         write_response(&writer, ok_response(id, cfg.redacted_view())).await?;
                     }
                     "plugin/query" => {
+                        // `project` names the project being queried, not the
+                        // server's cwd: the whole point of the RPC is to reach
+                        // a board that lives under another project's daemon.
+                        let Some(project) = project_arg(&req.params) else {
+                            write_response(
+                                &writer,
+                                err_response(id, RpcError::invalid_params("missing or empty project")),
+                            )
+                            .await?;
+                            continue;
+                        };
                         let plugin = req
                             .params
                             .get("plugin")
@@ -970,11 +1043,17 @@ where
                             .get("params")
                             .cloned()
                             .unwrap_or(serde_json::Value::Null);
-                        match plugin_query(&cfg.workdir, method, plugin, params) {
+                        match plugin_query(&project, &board_dir, method, plugin, params) {
                             Ok(value) => write_response(&writer, ok_response(id, value)).await?,
-                            Err(message) => {
-                                write_response(&writer, err_response(id, RpcError::internal(message)))
-                                    .await?
+                            Err(error) => {
+                                write_response(
+                                    &writer,
+                                    err_response(
+                                        id,
+                                        RpcError::board_query(error.code, error.message),
+                                    ),
+                                )
+                                .await?
                             }
                         }
                     }
@@ -3126,13 +3205,17 @@ mod plugin_query_tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
 
-    /// A fake daemon that records the request it received and replies with one
-    /// frame, so the test can prove the host forwards the plugin name, method
-    /// and params verbatim without interpreting any of them.
+    /// A fake daemon bound to `dir`'s runtime socket that records the request it
+    /// received and replies with one frame carrying `result`, so the test can
+    /// prove the host forwards the plugin name, method and params verbatim
+    /// without interpreting any of them.
     fn fake_daemon(
         dir: &Path,
+        result: serde_json::Value,
     ) -> (PathBuf, Arc<StdMutex<serde_json::Value>>, std::thread::JoinHandle<()>) {
-        let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(dir);
+        // The exact path `plugin_query` dials: a fake daemon bound anywhere else
+        // would let a wrong-path implementation pass.
+        let runtime_dir = dir.join(".yi-agent").join("runtime");
         std::fs::create_dir_all(&runtime_dir).unwrap();
         let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).unwrap();
         let seen = Arc::new(StdMutex::new(serde_json::Value::Null));
@@ -3151,7 +3234,7 @@ mod plugin_query_tests {
                 let reply = json!({
                     "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
                     "request_id": request["request_id"],
-                    "result": { "type": "PluginResult", "value": { "cards": [] } },
+                    "result": result,
                 });
                 let mut stream = stream;
                 let _ = stream.write_all(reply.to_string().as_bytes());
@@ -3161,13 +3244,27 @@ mod plugin_query_tests {
         (socket, seen, handle)
     }
 
+    /// A project directory plus the registry it is (or is not) registered in.
+    fn project_and_registry(dir: &Path, register: bool) -> (PathBuf, PathBuf) {
+        let project = dir.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let global = dir.join("global");
+        if register {
+            yi_agent_boards::registry::register(&global, &project).unwrap();
+        }
+        (project, global)
+    }
+
     #[test]
     fn a_query_reaches_the_daemon_with_the_plugin_and_method_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let (_socket, seen, handle) = fake_daemon(dir.path());
+        let (project, global) = project_and_registry(dir.path(), true);
+        let (_socket, seen, handle) =
+            fake_daemon(&project, json!({ "type": "PluginResult", "value": { "cards": [] } }));
 
         plugin_query(
-            dir.path(),
+            &project,
+            &global,
             "list",
             "superpowers-kanban",
             json!({ "verbose": true }),
@@ -3185,15 +3282,108 @@ mod plugin_query_tests {
     #[test]
     fn a_missing_plugin_name_is_refused_before_touching_the_daemon() {
         let dir = tempfile::tempdir().unwrap();
-        let error = plugin_query(dir.path(), "list", "", json!({})).unwrap_err();
-        assert!(error.contains("plugin"), "{error}");
+        let (project, global) = project_and_registry(dir.path(), true);
+        let error = plugin_query(&project, &global, "list", "", json!({})).unwrap_err();
+        assert!(error.message.contains("plugin"), "{error}");
+        assert_eq!(
+            error.code, "invalid_params",
+            "空 plugin 名与「没有看板」是两回事:{error}"
+        );
     }
 
     #[test]
     fn an_unreachable_daemon_reports_that_the_plugin_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let error = plugin_query(dir.path(), "list", "superpowers-kanban", json!({})).unwrap_err();
-        assert!(error.contains("daemon is unavailable"), "{error}");
+        let (project, global) = project_and_registry(dir.path(), true);
+        let error =
+            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
+        assert!(error.message.contains("daemon is unavailable"), "{error}");
+        assert_eq!(error.code, "daemon_unavailable", "{error}");
+    }
+
+    #[test]
+    fn a_query_without_a_registered_board_is_refused_with_its_own_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, global) = project_and_registry(dir.path(), false);
+
+        let error = plugin_query(&project, &global, "list", "superpowers-kanban", json!({}))
+            .unwrap_err();
+        assert_eq!(error.code, "board_not_created", "{error}");
+    }
+
+    #[test]
+    fn a_registered_board_without_a_daemon_reports_daemon_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, global) = project_and_registry(dir.path(), true);
+
+        let error = plugin_query(&project, &global, "list", "superpowers-kanban", json!({}))
+            .unwrap_err();
+        assert_eq!(
+            error.code, "daemon_unavailable",
+            "不能让 UI 误以为是「插件没装」:{error}"
+        );
+    }
+
+    /// The daemon owns the plugin table, so a plugin it does not supervise is
+    /// its answer to give. The wording has to stay matchable by the desktop's
+    /// `pluginIsUnavailable`, which looks for `is not available`.
+    #[test]
+    fn a_daemon_that_does_not_supervise_the_plugin_reports_plugin_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (project, global) = project_and_registry(dir.path(), true);
+        let (_socket, _seen, handle) = fake_daemon(
+            &project,
+            json!({
+                "type": "Error",
+                "code": "not_found",
+                "message": "plugin superpowers-kanban is not available",
+            }),
+        );
+
+        let error =
+            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
+        handle.join().unwrap();
+
+        assert_eq!(error.code, "plugin_unavailable", "{error}");
+        assert!(error.message.contains("is not available"), "{error}");
+        assert!(error.message.contains("plugin"), "既有措辞形状必须保留:{error}");
+    }
+
+    /// The dispatch mapping the UI actually reads. The numeric code is the
+    /// coarse fallback; `data.code` is the stable string, so both have to reach
+    /// the wire together.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_rpc_maps_a_missing_board_to_its_own_code_in_data() {
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        let project = h.board_dir.path().join("unregistered");
+        std::fs::create_dir_all(&project).unwrap();
+
+        h.send(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "plugin/query",
+                "params": {
+                    "project": project.to_string_lossy(),
+                    "plugin": "superpowers-kanban",
+                    "method": "list",
+                    "params": {},
+                },
+            })
+            .to_string(),
+        )
+        .await;
+
+        let value = loop {
+            let value = h.read_value().await;
+            if value.get("id") == Some(&json!(2)) {
+                break value;
+            }
+        };
+        assert_eq!(value["error"]["data"]["code"], "board_not_created", "{value}");
+        assert_eq!(value["error"]["code"], -32020, "{value}");
+        h.shutdown().await;
     }
 }
 
