@@ -200,4 +200,57 @@ mod tests {
         }
         handle.abort();
     }
+
+    /// 单个连接的传输错误(超大帧)只应摘除该 ClientId 并关闭该连接,
+    /// 不得掀翻共享的服务器/主循环(spec §6):随后一个全新连接仍能完成
+    /// `initialize`。回归 `serve` 的 inbound `Err` 分支曾无条件 `return Err`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn oversized_frame_closes_only_the_offending_connection() {
+        let (addr, handle) = spawn_ws(crate::server::tests_support::test_config()).await;
+
+        // 第一个连接:推一个超过 MAX_FRAME_BYTES 的帧。
+        let (mut first, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("first connect");
+        first
+            .send(ClientMessage::Text(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let _ = first.next().await; // 等它注册完成
+
+        let big = "x".repeat(MAX_FRAME_BYTES + 16);
+        let _ = first.send(ClientMessage::Text(big.into())).await;
+
+        // 服务端读到超限帧即 break 并摘除该客户端,连接随之关闭。
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), first.next()).await;
+        assert!(
+            matches!(
+                closed,
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(ClientMessage::Close(_))))
+            ),
+            "the offending connection must be closed, got {closed:?}"
+        );
+
+        // 服务器必须仍然存活:一个全新连接仍能完成 initialize。
+        let (mut second, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .expect("server must still accept connections after a peer transport error");
+        second
+            .send(ClientMessage::Text(
+                r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#.into(),
+            ))
+            .await
+            .unwrap();
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), second.next())
+            .await
+            .expect("server must still answer after a peer transport error")
+            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_str(msg.to_text().unwrap()).unwrap();
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["serverInfo"]["name"], "yi-agent-app-server");
+        handle.abort();
+    }
 }

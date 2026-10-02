@@ -828,7 +828,8 @@ pub(crate) fn production_factory(
 /// stdio 传输的接线:注册唯一 `local` 客户端,起读写泵,再进传输无关的 `serve`。
 ///
 /// 主循环不再持有 reader/writer;`read_lines` 与 `pump_stdout` 各自独占一条流,
-/// 只与主循环交换 channel 消息(均 cancel-safe)。
+/// 只与主循环交换 channel 消息(均 cancel-safe)。退出前摘除 `local` 客户端并
+/// 等待出口泵排空,保证最后一个响应总能写出。
 pub(crate) async fn serve_stdio<R, W, F>(
     reader: R,
     writer: W,
@@ -856,23 +857,30 @@ where
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
     let (inbound_tx, inbound_rx) =
         mpsc::channel::<(crate::broadcast::ClientId, anyhow::Result<String>)>(64);
-    tokio::spawn(pump_stdout(
+    let pump = tokio::spawn(pump_stdout(
         outbound,
         writer,
         Arc::clone(&hub),
         local.clone(),
     ));
-    tokio::spawn(read_lines(reader, local, inbound_tx));
-    serve(
+    tokio::spawn(read_lines(reader, local.clone(), inbound_tx));
+    let result = serve(
         inbound_rx,
-        hub,
+        Arc::clone(&hub),
         cfg,
         permission_timeout,
         workspaces,
         attachments,
         build_agent,
     )
-    .await
+    .await;
+    // `serve` 返回(EOF 或传输错误)后主循环不再产出帧。摘除 `local` 客户端会
+    // 关闭它的出站 channel;出口泵先把队列里已入队的帧全部写出、再因 channel
+    // 关闭退出,故必须 `await` 它——否则 EOF 前刚入队的最后一个响应会随进程
+    // 退出而丢失(与改造前「写完才结束」的 stdio 语义不符)。
+    hub.unregister(&local);
+    let _ = pump.await;
+    result
 }
 
 /// 从一条 `AsyncRead` 逐行读取并送入主循环。
@@ -989,8 +997,7 @@ where
                 let line = match item {
                     Ok(l) => l,
                     Err(e) => {
-                        // 尽力告知客户端我们为何退出,再把失败向上抛出,
-                        // 避免传输错误被伪装成干净退出。
+                        // 尽力告知客户端我们为何退出。
                         let _ = write_response(
                             &hub, &client,
                             err_response(
@@ -999,7 +1006,15 @@ where
                             ),
                         )
                         .await;
-                        return Err(e);
+                        // stdio 只有 `local` 一个客户端,其读端出错即整个会话结束:
+                        // 把失败向上抛出,避免被伪装成干净退出(`oversized_frame_returns_err`)。
+                        // WS 传输是**多客户端共享**一条主循环,单个连接的传输错误只
+                        // 能摘除该 ClientId(spec §6),连接与服务器都必须存活。
+                        if client == crate::broadcast::ClientId::local() {
+                            return Err(e);
+                        }
+                        hub.unregister(&client);
+                        continue;
                     }
                 };
                 if line.trim().is_empty() {
@@ -3126,6 +3141,16 @@ async fn run_thread_driver(
                                     return;
                                 }
                             };
+                            // 反向请求定向发给发起本次 turn 的客户端,不用 broadcast。
+                            //
+                            // 偏差记录(spec §4.4 表格写的是 `hub.broadcast(…)` + 先到先得):
+                            // Tier 0 只有一个客户端,两者投递等价;但 `broadcast` 是
+                            // `try_send`(队列满即静默丢帧),会丢掉这里 `is_err()`「客户端
+                            // 已断开即收尾本轮」的语义——`driver_reports_finished_when_writer_fails`
+                            // 依赖它。更关键的是:审批是**一对一问答**且响应经 `pending` 表按
+                            // `perm_id` 路由,向未发起方广播会诱发先到先得下的错误路由,
+                            // 这正是 Tier 1 才需连同 `approvalResolved` 一起处理的问题。
+                            // 故 Tier 0 保留 `reply`,Tier 1 再改 broadcast。
                             if hub.reply(&client, frame).await.is_err() {
                                 // 客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);

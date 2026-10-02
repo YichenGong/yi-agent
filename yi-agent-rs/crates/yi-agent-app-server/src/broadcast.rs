@@ -94,9 +94,11 @@ impl Broadcaster {
 
     /// 只发给指定客户端。
     ///
-    /// 与 `broadcast` 不同,这里 `await` 到入队成功为止:stdio 传输依赖它保留
-    /// “写阻塞直到对端读”(改造前 `write_all(...).await` 的语义)。客户端已
-    /// 注销或队列关闭时返回 `Err(Closed)`,调用方据此终止会话。
+    /// 与 `broadcast` 不同,这里 `await` 到**入队**成功为止——即等到帧进入该
+    /// 客户端的 mpsc 出站 channel,而不是等到对端从 socket 读走;真正的写由该
+    /// 客户端的出口泵任务(`pump_stdout` / ws 出口泵)完成。队列有界,故入队
+    /// 仍提供背压。客户端已注销或队列关闭时返回 `Err(Closed)`,调用方据此终止
+    /// 会话。
     pub async fn reply(&self, id: &ClientId, frame: Value) -> Result<(), Closed> {
         let tx = self
             .clients
