@@ -658,7 +658,12 @@ git commit -m "feat(desktop): render the board in the main area and surface writ
 
 ---
 
-### Task 8: 全局并发租约（Python 侧）
+### Task 8: 全局并发租约（Python 侧）—— **本轮不做（人类裁决）**
+
+> **状态：延后。** 人类裁示「先做核心 9 个任务，额度留到有第二个看板时再上」。
+> 理由：全局租约是跨进程协调，只有在**同时跑多个看板**时才有意义；本轮单看板场景下
+> 各 daemon 按日历上限（限流 3 / 不限流 10）各自为政已够用。这是有意延后，不是遗漏
+> （见 spec §6 非目标、§7 已知缺口 1）。下面的步骤保留作下一轮的起点。
 
 **Files:**
 - Create: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/lease.rs`
@@ -726,39 +731,54 @@ git commit -m "feat(kanban-plugin): global concurrency lease shared across proje
 
 ### Task 9: TUI 命令入口
 
+**命令名与语义（人类裁决，覆盖下文字面）**：规范名是 `/superpowers-kanban`
+（`/kanban` 仅保留过渡别名）。子命令：
+- `on` / `off` —— **插件开关**（保持现状，写 `switch.write`）。
+- `create` / `remove` / `status` —— 看板**生命周期**，作用于当前会话目录，走
+  `yi_agent_boards::lifecycle::{create_in, remove_in, status_with}`。
+- `run` / `add <spec> <plan>` / 无参 —— 保持现状（走插件通道）。
+
+（计划原文写的 `/kanban on|off` 去建/删看板是错的：`on|off` 已被开关占用。）
+
 **Files:**
-- Modify: `yi-agent-rs/crates/yi-agent/src/tui/`（斜杠命令表与处理）
-- Modify: `plugins/superpowers-kanban/skills/superpowers-kanban/SKILL.md`（若命令名需同步）
+- Create: `yi-agent-rs/crates/yi-agent/src/tui/board.rs`
+- Modify: `yi-agent-rs/crates/yi-agent/src/tui/superpowers_kanban.rs`（本目录未登记看板时给指引）
+- Modify: `yi-agent-rs/crates/yi-agent/src/tui/app.rs`（Kanban 分支按子命令分发）
+- Modify: `yi-agent-rs/crates/yi-agent/src/tui/slash.rs`（usage/description）
+- Modify: `yi-agent-rs/crates/yi-agent/src/tui/mod.rs`
+- Modify: `yi-agent-rs/crates/yi-agent/Cargo.toml`（加 `yi-agent-boards` 依赖）
 
 **Interfaces:**
-- Consumes: Task 3（lifecycle）。
-- Produces: `/kanban on` / `/kanban off` / `/kanban status`，作用于**当前会话目录**。
+- Consumes: Task 3（`lifecycle::{create_in, remove_in, status_with}`）。
+- Produces: `/superpowers-kanban create|remove|status`，作用于**当前会话目录**。
 
 - [ ] **Step 1: 写失败测试**（沿用 TUI 现有命令测试的写法）
 
 ```rust
 #[test]
-fn kanban_on_creates_a_board_for_the_sessions_directory() {
+fn create_reports_a_created_board_for_this_directory() {
     let dir = tempfile::tempdir().unwrap();
-    let lines = run_command("/kanban on", dir.path());
-    assert!(lines.iter().any(|l| l.contains("看板已创建")), "{lines:?}");
+    let out = handle_board(dir.path(), &dir.path().join("global"), "create");
+    assert!(out.lines.iter().any(|l| l.contains("看板已创建")), "{:?}", out.lines);
 }
 
 #[test]
-fn kanban_status_reports_whether_this_directory_has_one() {
+fn status_reports_whether_this_directory_has_one() {
     let dir = tempfile::tempdir().unwrap();
-    let lines = run_command("/kanban status", dir.path());
-    assert!(lines.iter().any(|l| l.contains("未创建")), "{lines:?}");
+    let out = handle_board(dir.path(), &dir.path().join("global"), "status");
+    assert!(out.lines.iter().any(|l| l.contains("未创建")), "{:?}", out.lines);
 }
 ```
 
 - [ ] **Step 2: 运行确认失败** → FAIL
-- [ ] **Step 3: 实现**（命令注册 + 调用 lifecycle；输出用 notice，与既有命令一致）
+- [ ] **Step 3: 实现**；`tui/board.rs::handle_board(project, global, subcommand)` 调 lifecycle；
+  `app.rs` 的 `SlashCommand::Kanban` 分支按子命令分发（`create|remove|status` 走 board，
+  其余沿用 `superpowers_kanban::handle_kanban`）；输出用 notice，与既有命令一致
 - [ ] **Step 4: 运行确认通过** → PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git commit -m "feat(tui): /kanban command to create, remove and inspect a board"
+git commit -m "feat(tui): /superpowers-kanban create, remove and status for this directory"
 ```
 
 ---
