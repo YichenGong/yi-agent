@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - **默认传输不变**：`--listen` 缺省仍是 `stdio://`；未显式传 `ws://` 时，桌面端 sidecar 行为与今天完全一致。
-- **stdio 零回归**：现有 182 个 `cargo test -p yi-agent-app-server` 测试必须全绿，这是每个任务的门禁。
+- **stdio 零回归**：现有 `cargo test -p yi-agent-app-server` 测试必须全绿，这是每个任务的门禁（Task 1 后为 211；本计划完成时为 213）。
 - **Tier 0 的 WS 无认证**：`ws://` 只绑定 `127.0.0.1`；绑定其它地址需显式 `--listen ws://0.0.0.0:PORT`，且 CLI help 必须写明"Tier 0 无认证，请勿暴露公网"。
 - **协议纯增量**：Tier 0 不新增任何 RPC 方法；只换传输。
 - **Tier 0 单客户端**：`ws://` 同时只接受一个连接；第二个连接被拒绝（close）。
@@ -116,9 +116,9 @@ mod tests {
         hub.unregister(&id);
         assert_eq!(hub.client_count(), 0);
         hub.broadcast(serde_json::json!({"method": "ping"}));
-        assert!(tokio::time::timeout(Duration::from_millis(50), rx.recv())
-            .await
-            .is_err());
+        // 注销即把 sender 移出注册表并丢弃,该客户端的出站队列随之关闭:
+        // broadcast 无法再投递,recv 立即返回 None 而非阻塞。
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
@@ -127,14 +127,20 @@ mod tests {
         let slow_id = ClientId::ws(uuid::Uuid::nil());
         let _slow = hub.register(slow_id.clone()); // 从不 recv
         let mut fast = hub.register(ClientId::local());
+        // 慢消费者永不 recv,每帧都堆进它的队列;其余消费者必须保持被排空。
         // 灌满并超过慢消费者的队列容量。
         for i in 0..(CLIENT_QUEUE + 8) {
             hub.broadcast(serde_json::json!({ "n": i }));
+            // 除最后一帧外,fast 边收边丢,模拟它的写任务持续抽干队列——否则
+            // 它自己也会因队列写满而被当作慢消费者摘除。
+            if i + 1 < CLIENT_QUEUE + 8 {
+                let _ = fast.try_recv();
+            }
         }
-        // 慢消费者被摘除,快消费者仍能收到最后一帧。
+        // 慢消费者被摘除,快消费者仍注册着。
         assert_eq!(hub.client_count(), 1);
-        let last = fast.recv().await.unwrap();
-        assert_eq!(last["n"], CLIENT_QUEUE + 7);
+        // 最后一帧已成功入队且发送从未阻塞,fast 取到的就是它。
+        assert_eq!(fast.try_recv().unwrap()["n"], CLIENT_QUEUE + 7);
     }
 }
 ```
@@ -283,12 +289,12 @@ git commit -m "feat(app-server): add Broadcaster fan-out centre"
   - `async fn serve<F>(inbound: mpsc::Receiver<(ClientId, anyhow::Result<String>)>, hub: Arc<Broadcaster>, cfg: RuntimeConfig, permission_timeout: Duration, workspaces: Arc<WorkspaceIndex>, attachments: RuntimeAttachments, build_agent: F) -> anyhow::Result<()>`
   - `fn production_factory(cfg: RuntimeConfig) -> impl Fn(Option<yi_agent_core::Session>, &Path, crate::thread_store::ThreadMode) -> anyhow::Result<BuiltAgent> + Send + 'static`
   - `async fn read_lines<R: AsyncRead + Unpin>(reader: R, client: ClientId, tx: mpsc::Sender<(ClientId, anyhow::Result<String>)>)`
-  - `async fn pump_stdout<W: AsyncWrite + Unpin>(outbound: mpsc::Receiver<Value>, writer: W, tx: mpsc::Sender<(ClientId, anyhow::Result<String>)>, client: ClientId)`
+  - `async fn pump_stdout<W: AsyncWrite + Unpin>(outbound: mpsc::Receiver<Value>, writer: W, hub: Arc<Broadcaster>, client: ClientId)`
 
 - [ ] **Step 1: 建立基线（现有套件必须已全绿）**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server`
-Expected: PASS（182 个测试，0 failed）。记录这个数字；重构后必须仍是 182 且全绿。
+Expected: PASS（211 个测试，0 failed）。记录这个数字；重构后必须仍是 211 且全绿。
 
 - [ ] **Step 2: 从 `run()` 抽出 `production_factory`**
 
@@ -343,18 +349,26 @@ where
     let local = crate::broadcast::ClientId::local();
     let outbound = hub.register(local.clone());
     let (inbound_tx, inbound_rx) = mpsc::channel::<(crate::broadcast::ClientId, anyhow::Result<String>)>(64);
-    tokio::spawn(pump_stdout(outbound, writer, inbound_tx.clone(), local.clone()));
-    tokio::spawn(read_lines(reader, local, inbound_tx));
-    serve(
+    // 注意:出口泵**不能**持有 inbound_tx 的克隆。若持有,reader EOF 后 channel
+    // 仍开着,serve 的 inbound.recv() 永不返回 None,优雅退出会挂住。
+    // inbound_tx 的唯一持有者是 read_lines。
+    let pump = tokio::spawn(pump_stdout(outbound, writer, Arc::clone(&hub), local.clone()));
+    tokio::spawn(read_lines(reader, local.clone(), inbound_tx));
+    let result = serve(
         inbound_rx,
-        hub,
+        Arc::clone(&hub),
         cfg.clone(),
         PERMISSION_TIMEOUT,
         workspaces,
         RuntimeAttachments { runtimes, thread_roots },
         production_factory(cfg),
     )
-    .await
+    .await;
+    // serve 返回后摘除 local 客户端 → 关闭其出站 channel → 出口泵先排空队列再退出;
+    // await 它,保证 EOF 前刚入队的最后一个响应也写出后才返回。
+    hub.unregister(&local);
+    let _ = pump.await;
+    result
 }
 ```
 
@@ -397,7 +411,7 @@ async fn read_lines<R>(
 async fn pump_stdout<W>(
     mut outbound: mpsc::Receiver<serde_json::Value>,
     writer: W,
-    tx: mpsc::Sender<(crate::broadcast::ClientId, anyhow::Result<String>)>,
+    hub: Arc<crate::broadcast::Broadcaster>,
     client: crate::broadcast::ClientId,
 ) where
     W: tokio::io::AsyncWrite + Unpin,
@@ -405,9 +419,11 @@ async fn pump_stdout<W>(
     let mut writer = MessageWriter::new(writer);
     while let Some(frame) = outbound.recv().await {
         if let Err(e) = writer.write_value(&frame).await {
-            let _ = tx
-                .send((client.clone(), Err(anyhow::anyhow!("stdout write failed: {e}"))))
-                .await;
+            tracing::error!("stdout write failed: {e}");
+            // 摘除该客户端:此后任何 write_response 都会得到 `Err(Closed)`,
+            // 主循环据此终止会话——等价于改造前 `write_response(..)?` 的语义,
+            // 且不必把 `Err` 塞进 inbound channel(那会与 EOF 语义混淆)。
+            hub.unregister(&client);
             break;
         }
     }
@@ -503,7 +519,7 @@ async fn write_notification(
 - [ ] **Step 7: 运行套件确认零回归**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server`
-Expected: PASS，测试数仍为 182，0 failed。
+Expected: PASS，测试数仍为 211，0 failed。
 
 若 `eof_exits_gracefully`、`oversized_frame_returns_err`、`agent_factory_failure_returns_internal_error` 失败，检查：`pump_stdout` 的写失败是否回送了 `Err`（Step 3）、`read_lines` 的 EOF 是否正确丢弃 sender。
 
@@ -871,7 +887,7 @@ fn run_app_server(cli: Cli, listen: &str) -> Result<()> {
 - [ ] **Step 7: 运行全部相关测试**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server && cargo test -p yi-agent --bin yi-agent listen`
-Expected: app-server 全绿（182 + 2 ws + 5 broadcast = 189）；`parse_listen` 三例 PASS。
+Expected: app-server 全绿（211 + 2 ws = 213；`broadcast::` 5 例已计入 211 基线）；`parse_listen` 三例 PASS。
 
 - [ ] **Step 8: 手动冒烟（真实进程 + 真 ws）**
 
@@ -969,6 +985,6 @@ git commit -m "docs: record app-server WebSocket transport"
 **类型一致性**：`ClientId`（`local`/`ws`/`as_str`）、`Broadcaster`（`register`/`unregister`/`client_count`/`broadcast`/`reply`）、`serve`/`production_factory`/`read_lines`/`pump_stdout`/`serve_ws`/`handle_ws`、`Listen`/`parse_listen` 在 Task 1→4 中命名与签名一致。`write_response` 新签名 `(&Broadcaster, &ClientId, ResponseEnvelope)`、`write_notification` 新签名 `(&Broadcaster, &Notification)` 在 Task 2 定义、Task 2 内消费。
 
 **已知风险（实现者注意）**
-1. `pump_stdout` 必须保留"写失败 → 主循环 Err"的语义，否则 `oversized_frame_returns_err` 会红。
+1. `pump_stdout` 必须保留"写失败即终止会话"的语义（本计划以「写失败 → `hub.unregister` → 后续 `write_response` 得 `Err(Closed)`」实现），否则 `oversized_frame_returns_err` 会红。注意出口泵**不得**持有 `inbound_tx` 克隆，否则 EOF 无法触发优雅退出。
 2. `axum` 的 `ws` feature 与 `tokio-tungstenite` 版本需对齐（Task 3 Step 1）。
 3. `Message::Text` 在 axum 0.8 使用 `Utf8Bytes`；如编译器要求 `.into()`，按报错加。
