@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import type { Theme } from "../lib/theme";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
 import { SettingsRemoteTab, type RemoteCall } from "./SettingsRemoteTab";
@@ -10,6 +11,10 @@ const TABS = [
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
+
+/** Tab 与面板的 id 约定：`aria-controls`/`aria-labelledby` 靠它俩对上。 */
+const tabId = (id: TabId) => `settings-tab-${id}`;
+const panelId = (id: TabId) => `settings-panel-${id}`;
 
 export function SettingsDialog({
   open,
@@ -29,10 +34,27 @@ export function SettingsDialog({
   relayUrl?: string;
 }) {
   const [active, setActive] = useState<TabId>("general");
+  // roving tabIndex：只有选中的 Tab 是 Tab 停靠点，↑↓←→ 在表内移动。
+  const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
+  // 打开前的焦点归处，关闭时原样还给它（通常是那个「设置」触发按钮）。
+  const restoreRef = useRef<HTMLElement | null>(null);
+  // 打开瞬间要落焦的 Tab：只认「本次打开」的选区，避免选区一变就重跑打开副作用。
+  const activeAtOpen = useRef<TabId>("general");
+  activeAtOpen.current = active;
 
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
+    restoreRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    // 落焦在选中的 Tab 上：键盘用户一进来就在 tablist 里，箭头键随即可用。
+    tabRefs.current[activeAtOpen.current]?.focus();
+    // 关闭（open 转 false）或卸载时把焦点还给来处。
+    return () => restoreRef.current?.focus();
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: globalThis.KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     document.addEventListener("keydown", onKey);
@@ -40,6 +62,22 @@ export function SettingsDialog({
   }, [open, onClose]);
 
   if (!open) return null;
+
+  /** 表内箭头/Home/End 导航：移动选区并同步把焦点带过去。 */
+  const onTablistKeyDown = (e: KeyboardEvent) => {
+    const i = TABS.findIndex((t) => t.id === active);
+    // aria-orientation="vertical"，但左右键同样惯例可用。
+    let next = i;
+    if (e.key === "ArrowDown" || e.key === "ArrowRight") next = (i + 1) % TABS.length;
+    else if (e.key === "ArrowUp" || e.key === "ArrowLeft") next = (i - 1 + TABS.length) % TABS.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = TABS.length - 1;
+    else return;
+    e.preventDefault();
+    const id = TABS[next].id;
+    setActive(id);
+    tabRefs.current[id]?.focus();
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -57,13 +95,20 @@ export function SettingsDialog({
         <nav
           role="tablist"
           aria-orientation="vertical"
+          onKeyDown={onTablistKeyDown}
           className="flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
         >
           {TABS.map((t) => (
             <button
               key={t.id}
+              id={tabId(t.id)}
+              ref={(el) => {
+                tabRefs.current[t.id] = el;
+              }}
               role="tab"
               aria-selected={t.id === active}
+              aria-controls={panelId(t.id)}
+              tabIndex={t.id === active ? 0 : -1}
               onClick={() => setActive(t.id)}
               className="rounded px-3 py-1.5 text-left text-sm text-fg-muted hover:bg-raised/50 aria-selected:text-fg"
             >
@@ -83,7 +128,13 @@ export function SettingsDialog({
               ×
             </button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          {/* 一次只渲染选中的面板；id/aria-labelledby 与上面的 Tab 成对。 */}
+          <div
+            role="tabpanel"
+            id={panelId(active)}
+            aria-labelledby={tabId(active)}
+            className="min-h-0 flex-1 overflow-y-auto"
+          >
             {active === "general" ? (
               <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
             ) : (
