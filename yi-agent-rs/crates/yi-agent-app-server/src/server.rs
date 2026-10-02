@@ -947,6 +947,7 @@ pub(crate) fn production_factory(
 /// 等待出口泵排空,保证最后一个响应总能写出。
 ///
 /// stdio 就是桌面:注册为 `local` + `Scope::Admin`,保留全部能力。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_stdio<R, W, F>(
     reader: R,
     writer: W,
@@ -8763,6 +8764,30 @@ mod tests {
         assert!(
             v["result"].is_object(),
             "admin client must be allowed to delete: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// The deliberately-extended admin gate: minting a pairing code
+    /// (`pair/create`) or kicking a device (`device/revoke`) is desktop-privileged,
+    /// so a `Control` phone must be rejected from both too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_client_cannot_pair_or_revoke() {
+        let mut h = Harness::with_scope(Scope::Control).await;
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"pair/create","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "pair/create from a control client: {v}"
+        );
+        h.send(r#"{"jsonrpc":"2.0","id":10,"method":"device/revoke","params":{"device_id":"d1"}}"#)
+            .await;
+        let v = read_response(&mut h, 10).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "device/revoke from a control client: {v}"
         );
         h.shutdown().await;
     }
