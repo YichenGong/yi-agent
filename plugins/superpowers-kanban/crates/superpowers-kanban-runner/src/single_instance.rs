@@ -90,7 +90,7 @@ mod tests {
 
     /// 被 `SIGKILL` 的持有者留下的锁必须能被回收。
     ///
-    /// 持有者是这个测试二进制自身，带 `PLUGIN_LOCK_HOLD_DIR` 重起，只跑
+    /// 持有者是这个测试二进制自身，带 `LEASE_HOLD_DIR` 重起，只跑
     /// [`lock_holder_child`]：它取锁然后睡。用 `-9` 杀掉它跳过了任何 unwinding，
     /// 所以唯一能释放锁的就是内核在进程退出时丢掉 `flock`——这正是「孤儿不会
     /// 把推进权占死」所依赖的性质。
@@ -103,7 +103,7 @@ mod tests {
                 "single_instance::tests::lock_holder_child",
                 "--nocapture",
             ])
-            .env("PLUGIN_LOCK_HOLD_DIR", dir.path())
+            .env("LEASE_HOLD_DIR", dir.path())
             .spawn()
             .expect("re-invoke the test binary as a lock holder");
 
@@ -143,10 +143,10 @@ mod tests {
         );
     }
 
-    /// 仅在以 `PLUGIN_LOCK_HOLD_DIR` 重起时生效的持有者；正常测试运行立即返回。
+    /// 仅在以 `LEASE_HOLD_DIR` 重起时生效的持有者；正常测试运行立即返回。
     #[test]
     fn lock_holder_child() {
-        let Ok(dir) = std::env::var("PLUGIN_LOCK_HOLD_DIR") else {
+        let Ok(dir) = std::env::var("LEASE_HOLD_DIR") else {
             return;
         };
         let _lock = acquire(Path::new(&dir)).expect("holder must take the lock");
