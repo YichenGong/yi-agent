@@ -3369,6 +3369,57 @@ where
                         )
                         .await?;
                     }
+                    "thread/readItems" => {
+                        // 只读补齐：读已落盘的 items，**不 resume、不重建 agent、
+                        // 不中断正在跑的回合**（这正是它相对 thread/resume 的意义）。
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        let after = req
+                            .params
+                            .get("afterItemId")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        let store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
+                        let loaded = match store.load(&thread_id) {
+                            Ok(Some(l)) => l,
+                            Ok(None) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        let items: Vec<crate::protocol::Item> = match after {
+                            Some(aid) => match loaded
+                                .items
+                                .iter()
+                                .position(|it| item_id(it) == Some(aid.as_str()))
+                            {
+                                // 找到锚点：只给它之后的部分。
+                                Some(i) => loaded.items.into_iter().skip(i + 1).collect(),
+                                // 锚点缺失（可能被 compact 丢弃）：返回全部，由客户端按 id 去重。
+                                None => loaded.items,
+                            },
+                            None => loaded.items,
+                        };
+                        write_response(&hub, &client, ok_response(id, json!({ "items": items })))
+                            .await?;
+                    }
                     _ => {
                         write_response(&hub, &client, err_response(id, RpcError::method_not_found(&method)))
                             .await?;
@@ -4302,6 +4353,16 @@ fn store_lookup(
     match threads.get(thread_id) {
         Some(s) => Arc::clone(&s.store),
         None => store_for(workspaces, cfg, thread_id),
+    }
+}
+
+/// 一条 `Item` 的稳定 id（用于 `thread/readItems` 的 `afterItemId` 切片与前端去重）。
+fn item_id(item: &crate::protocol::Item) -> Option<&str> {
+    match item {
+        crate::protocol::Item::UserMessage { id, .. }
+        | crate::protocol::Item::AgentMessage { id, .. }
+        | crate::protocol::Item::ToolCall { id, .. }
+        | crate::protocol::Item::UserInterjection { id, .. } => Some(id),
     }
 }
 
@@ -9877,6 +9938,115 @@ pub(crate) mod tests {
             rebuilt.agent.decision_rx().is_some(),
             "the rebuilt agent must keep the decision receiver"
         );
+    }
+
+    /// `thread/readItems` 返回已落盘的 items；`afterItemId` 只返回其后的部分。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_items_returns_persisted_items_and_slices_after_id() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        // 跑完一轮，产生至少一条已落盘的 item（user + agent 消息）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        // 读到 turn/completed 为止，确认落盘完成。
+        for _ in 0..16 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/readItems","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 4).await;
+        let items = v["result"]["items"].as_array().expect("items array");
+        assert!(!items.is_empty(), "readItems 必须返回已落盘的 items: {v}");
+        let first_id = items[0]["id"].as_str().unwrap().to_string();
+
+        // afterItemId = 第一条 → 不包含第一条。
+        let req = serde_json::json!({
+            "jsonrpc":"2.0","id":5,"method":"thread/readItems",
+            "params":{"threadId": tid, "afterItemId": first_id}
+        });
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 5).await;
+        let after = v["result"]["items"].as_array().unwrap();
+        assert!(
+            after
+                .iter()
+                .all(|i| i["id"].as_str() != Some(first_id.as_str())),
+            "afterItemId 之后不该再含该 id: {v}"
+        );
+
+        // 未知 thread → unknown_thread(-32011)。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":6,"method":"thread/readItems","params":{"threadId":"nope"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 6).await;
+        assert_eq!(v["error"]["code"], -32011, "未知 thread 必须报错: {v}");
+        h.shutdown().await;
+    }
+
+    /// `thread/readItems` 对**正在跑**的会话是只读的：调用它**不得**中断回合。
+    ///
+    /// 这正是它相对 `thread/resume` 的关键差异（resume 会先 interrupt 在跑的 turn）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_items_does_not_interrupt_a_running_turn() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        // 等回合真正开始。
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/started") {
+                break;
+            }
+        }
+        // 只读补齐：slow provider 期间会持续推 item/delta，按 id 找响应本身。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/readItems","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..12 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let v = resp.expect("thread/readItems must respond");
+        assert!(v.get("error").is_none(), "readItems 不应出错: {v}");
+        // SlowProvider 每 5ms 推一段 item/delta、且永不结束。若 readItems 打断了
+        // 回合，此后就再不会有任何 delta；反之则必有。故"响应之后还收得到 delta"
+        // 是"回合仍在跑"的确定性判据。
+        let mut deltas_after = 0usize;
+        for _ in 0..20 {
+            let n = h.read_value().await;
+            match n.get("method").and_then(|m| m.as_str()) {
+                Some("item/delta") => {
+                    deltas_after += 1;
+                    if deltas_after >= 2 {
+                        break;
+                    }
+                }
+                Some("turn/completed") => break,
+                _ => {}
+            }
+        }
+        assert!(
+            deltas_after >= 2,
+            "readItems 之后回合必须仍在跑（仍持续产生 item/delta），实际 {deltas_after} 段"
+        );
+        h.shutdown().await;
     }
 }
 
