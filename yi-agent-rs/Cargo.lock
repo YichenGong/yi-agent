@@ -4175,6 +4175,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "yi-agent-boards",
  "yi-agent-core",
