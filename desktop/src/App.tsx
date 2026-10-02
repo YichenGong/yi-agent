@@ -1071,6 +1071,11 @@ export default function App() {
         theme={theme}
         onThemeChange={changeTheme}
         onClose={() => setSettingsOpen(false)}
+        // 远程访问 Tab 走**当前 transport**（桌面 stdio = Admin），所以能调
+        // pair/create、device/revoke；网络客户端会拿到 -32014，Tab 会提示权限。
+        remoteCall={(method, params) =>
+          (clientRef.current as RpcClient).request(method, params)
+        }
       />
     </>
   );

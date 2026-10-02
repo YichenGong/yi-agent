@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { type PairedDevice, redeemPairCode } from "../pairing";
+import { type PairedDevice, defaultRedeem } from "../pairing";
 import {
   type StorageLike,
   type RemoteConfig,
@@ -48,7 +48,7 @@ export interface PairingScreenProps {
   initialUrl?: string;
   /** 持久化接缝；默认 `localStorage`。 */
   storage?: StorageLike;
-  /** 兑换接缝；默认 `redeemPairCode`。 */
+  /** 兑换接缝；默认 `defaultRedeem`（中继 URL 走帧，直连走 `?pair=`）。 */
   redeem?: (url: string, code: string, deviceName: string) => Promise<PairedDevice>;
   /** 凭据落盘后回调——宿主据此把 transport 重算成 ws。 */
   onPaired?: () => void;
@@ -101,7 +101,7 @@ export function PairingScreen({
       if (onSubmit) {
         await onSubmit(trimmedUrl, trimmedCode, name);
       } else {
-        const device = await (redeem ?? redeemPairCode)(trimmedUrl, trimmedCode, name);
+        const device = await (redeem ?? defaultRedeem)(trimmedUrl, trimmedCode, name);
         const config: RemoteConfig = { url: trimmedUrl, token: device.token };
         saveRemoteConfig(storage ?? defaultStorage(), config);
       }
