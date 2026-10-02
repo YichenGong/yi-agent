@@ -1,2 +1,73 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
+
+/* 语义色 token。组件只引用这些语义名，不写字面色阶，切 data-theme 即整体换肤。 */
+:root {
+  --surface: #0a0a0a;
+  --panel: #171717;
+  --raised: #262626;
+  --line: #262626;
+  --line-strong: #404040;
+  --fg: #f5f5f5;
+  --fg-muted: #a3a3a3;
+  --fg-subtle: #737373;
+  --fg-faint: #525252;
+}
+
+[data-theme="light"] {
+  --surface: #ffffff;
+  --panel: #f5f5f5;
+  --raised: #e5e5e5;
+  --line: #e5e5e5;
+  --line-strong: #d4d4d4;
+  --fg: #171717;
+  --fg-muted: #525252;
+  --fg-subtle: #737373;
+  --fg-faint: #a3a3a3;
+}
+
+/* 把 token 暴露成 Tailwind 颜色工具类：bg-surface / text-fg / border-line … */
+@theme inline {
+  --color-surface: var(--surface);
+  --color-panel: var(--panel);
+  --color-raised: var(--raised);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-fg-faint: var(--fg-faint);
+}
+
+/*
+ * 浅色主题下的 markdown 排版。
+ *
+ * `MarkdownText` 的包裹层带着 `prose prose-invert`；`prose-invert` 会把每个
+ * `--tw-prose-*` 变量【无条件】重指到 invert（浅字）值，浅色底下正文因此是
+ * 近白字压白底。这里用 `[data-theme="light"] .prose` 把变量重新指回浅色值：
+ * 选择器特异度 (0,2,0) > `.prose-invert` 的 (0,1,0)，所以无论打包顺序如何都获胜。
+ * 深色（默认）不匹配该选择器，观感逐字节不变。
+ *
+ * `--tw-prose-pre-code` 必须一起翻，否则围栏代码仍是浅字压在 `bg-panel` 上。
+ * （pre 的背景由 `prose-pre:bg-panel`（--panel）承担，两种主题下都已正确。）
+ */
+[data-theme="light"] .prose {
+  --tw-prose-body: var(--fg);
+  --tw-prose-headings: var(--fg);
+  --tw-prose-lead: var(--fg-muted);
+  --tw-prose-links: var(--fg);
+  --tw-prose-bold: var(--fg);
+  --tw-prose-counters: var(--fg-subtle);
+  --tw-prose-bullets: var(--fg-faint);
+  --tw-prose-hr: var(--line-strong);
+  --tw-prose-quotes: var(--fg);
+  --tw-prose-quote-borders: var(--line-strong);
+  --tw-prose-captions: var(--fg-subtle);
+  --tw-prose-kbd: var(--fg);
+  --tw-prose-kbd-shadows: color-mix(in oklab, var(--fg) 10%, transparent);
+  --tw-prose-code: var(--fg);
+  --tw-prose-pre-code: var(--fg);
+  --tw-prose-pre-bg: var(--surface);
+  --tw-prose-th-borders: var(--line-strong);
+  --tw-prose-td-borders: var(--line);
+}

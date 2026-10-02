@@ -30,7 +30,7 @@ function ChatItem({ item }: { item: Item | NoticeItem }) {
   switch (item.type) {
     case "notice":
       return (
-        <div className="my-1 self-center rounded-md bg-neutral-800/60 px-3 py-1 text-xs text-neutral-400">
+        <div className="my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted">
           {item.text}
         </div>
       );
@@ -49,7 +49,7 @@ function ChatItem({ item }: { item: Item | NoticeItem }) {
       // about. Surface it rather than silently dropping the item.
       const unknown = item as { type?: string };
       return (
-        <div className="my-1 font-mono text-xs text-neutral-500">
+        <div className="my-1 font-mono text-xs text-fg-subtle">
           [unsupported item type: {unknown.type ?? "unknown"}]
         </div>
       );

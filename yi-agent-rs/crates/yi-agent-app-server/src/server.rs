@@ -102,6 +102,9 @@ pub(crate) struct RuntimeAttachments {
     /// and the app's production launcher is what an integration test would
     /// otherwise have to reproduce.
     pub(crate) launcher: BoardLauncher,
+    /// 桌面主题句柄：`ui/settings/read|write` 维护它，每个 thread 的
+    /// `set_theme` 工具也持同一实例，故任一路径改主题都会落盘 + 广播。
+    pub(crate) theme: crate::theme_tool::ThemeHandle,
 }
 
 /// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
@@ -154,6 +157,7 @@ struct Activation {
 /// 调用方必须已拿到 `build_agent` 的产物,且**不得**在 `threads` 的可变借用内调用:
 /// 本函数只经 `runtimes` 的 `Mutex` 访问,不触碰 `threads`,所以先调用、再
 /// `threads.insert(..)` 是安全的。
+#[allow(clippy::too_many_arguments)]
 fn attach_delegation(
     runtimes: &ProjectRuntimes,
     thread_roots: &ThreadRoots,
@@ -161,6 +165,7 @@ fn attach_delegation(
     cfg: &RuntimeConfig,
     cwd: &str,
     thread_id: &str,
+    theme: &crate::theme_tool::ThemeHandle,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -201,7 +206,13 @@ fn attach_delegation(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(thread_id.to_string(), Arc::clone(&root));
-    match build_runtime_tooling(&thread_cfg, &root, thread_id, built.yolo.clone()) {
+    match build_runtime_tooling(
+        &thread_cfg,
+        &root,
+        thread_id,
+        built.yolo.clone(),
+        theme.clone(),
+    ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
             runtime: Some(root),
@@ -671,6 +682,7 @@ fn build_runtime_tooling(
     root: &Arc<ThreadRoot>,
     thread_id: &str,
     yolo: yi_agent_core::autonomy::YoloSwitch,
+    theme: crate::theme_tool::ThemeHandle,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
@@ -700,11 +712,83 @@ fn build_runtime_tooling(
     let permission =
         yi_agent_runtime::bootstrap::load_permission_checker_with_switch(&workspace_root, yolo)
             .map_err(|error| error.to_string())?;
+    register_theme_tool(&mut registry, theme);
     Ok(RuntimeTooling {
         registry: Arc::new(registry),
         permission,
         process_manager,
     })
+}
+
+/// 把主题工具注册进一个 thread 的工具集。
+///
+/// 委派可用时走 [`build_runtime_tooling`] 的 registry,不可用时走工厂里用
+/// bootstrap `tools` 克隆出来的 registry——两条路径都必须注册,否则非 git
+/// 目录下自然语言切主题会静默失效。
+fn register_theme_tool(
+    registry: &mut yi_agent_core::ToolRegistry,
+    theme: crate::theme_tool::ThemeHandle,
+) {
+    registry.register(Arc::new(crate::theme_tool::SetThemeTool::new(theme)));
+}
+
+/// 克隆一份 bootstrap 工具集并补上主题工具。
+///
+/// 非委派路径(`Agent::new` + bootstrap 克隆)与委派路径共用同一段注册逻辑,
+/// 避免两条路径漂移出「一边有 tool、一边没有」的缺口。
+fn registry_with_theme_tool(
+    tools: &Arc<yi_agent_core::ToolRegistry>,
+    theme: crate::theme_tool::ThemeHandle,
+) -> yi_agent_core::ToolRegistry {
+    let mut registry = (**tools).clone();
+    register_theme_tool(&mut registry, theme);
+    registry
+}
+
+/// 用带主题工具的工具集重建 thread agent,并保留原 agent 的审批路径。
+///
+/// `Agent::new` 从零开始、不含权限检查器与决定接收端,所以重建后必须用
+/// [`Agent::permission_checker`] / [`Agent::decision_rx`] 取回并重新装上——
+/// 否则非 git 目录下的 thread 会退化成不弹审批。两个取回器都为 `None`
+/// (AutoAllow)时保持不装,与原 agent 一致。
+///
+/// provider 沿用 bootstrap 的同一个实例:再建一个会重读凭据、多一个 client。
+fn rebuild_thread_agent_with_theme(
+    built: yi_agent_runtime::bootstrap::AgentBootstrap,
+    session: Option<yi_agent_core::Session>,
+    theme: crate::theme_tool::ThemeHandle,
+) -> BuiltAgent {
+    let yi_agent_runtime::bootstrap::AgentBootstrap {
+        agent,
+        provider,
+        tools,
+        decision_tx,
+        decision_rx,
+        catalog,
+        yolo,
+        process_manager,
+        ..
+    } = built;
+    let config = agent.config().clone();
+    let permission = agent.permission_checker();
+    let decision = agent.decision_rx();
+    let registry = registry_with_theme_tool(&tools, theme);
+    let mut rebuilt =
+        yi_agent_core::Agent::new(provider.clone(), Arc::new(registry), config.clone())
+            .with_session(agent.session());
+    if let (Some(checker), Some(rx)) = (permission, decision) {
+        rebuilt = rebuilt.with_permission(checker, rx);
+    }
+    BuiltAgent {
+        agent: apply_session(rebuilt, session),
+        provider,
+        config,
+        decision_tx,
+        decision_rx,
+        catalog,
+        yolo,
+        process_manager,
+    }
 }
 
 /// 把 thread 的工具集与权限根换成 attached runtime 的,其余部件沿用。
@@ -889,6 +973,10 @@ where
     // register into a directory nobody lists from, which is the same as having
     // no board — better than losing every unrelated RPC.
     let board_dir = yi_agent_boards::global_dir().unwrap_or_default();
+    // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用。
+    // 工厂闭包 `'static`,拿不到主循环里的 `theme`;先克隆一份专供工厂。
+    let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
+    let theme_for_factory = theme.clone();
     serve_stdio(
         reader,
         writer,
@@ -901,8 +989,9 @@ where
             thread_roots,
             board_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
+            theme,
         },
-        production_factory(cfg),
+        production_factory(cfg, theme_for_factory),
     )
     .await
 }
@@ -910,6 +999,7 @@ where
 /// 生产环境的 agent 工厂:按 thread 的 cwd 覆盖 workdir 与 yolo 后引导一个 agent。
 pub(crate) fn production_factory(
     cfg: RuntimeConfig,
+    theme: crate::theme_tool::ThemeHandle,
 ) -> impl Fn(
     Option<yi_agent_core::Session>,
     &Path,
@@ -925,19 +1015,15 @@ pub(crate) fn production_factory(
             &thread_cfg,
             yi_agent_runtime::bootstrap::PermissionMode::Interactive,
         )?;
-        // The provider stays the single object the bootstrap built; a second
-        // one would re-read the credential and duplicate the client.
-        let config = built.agent.config().clone();
-        Ok(BuiltAgent {
-            agent: apply_session(built.agent, session),
-            provider: built.provider,
-            config,
-            decision_tx: built.decision_tx,
-            decision_rx: built.decision_rx,
-            catalog: built.catalog,
-            yolo: built.yolo,
-            process_manager: built.process_manager,
-        })
+        // 主题工具必须进每个 thread 的工具集;委派随后可能用
+        // `wrap_for_delegation` 换掉 registry,那条路径([`build_runtime_tooling`])
+        // 同样注册。`Agent::new` 会顺带清掉权限检查器,故重建后必须重新装上
+        // (见 [`rebuild_thread_agent_with_theme`],否则非 git 目录会退化成不弹审批)。
+        Ok(rebuild_thread_agent_with_theme(
+            built,
+            session,
+            theme.clone(),
+        ))
     }
 }
 
@@ -1170,6 +1256,7 @@ where
         thread_roots,
         board_dir,
         launcher: board_launcher,
+        theme,
     } = attachments;
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
@@ -1202,6 +1289,25 @@ where
     let mut children_watches: HashMap<String, ChildrenWatch> = HashMap::new();
     // 每个 thread 一个进程状态守望者,建立 thread 时拉起。
     let mut process_watches: HashMap<String, ProcessWatch> = HashMap::new();
+
+    // 主题变化 → ui/settings/updated(全局一条流,与 thread 无关)。经 hub 广播:
+    // stdio 的 `local` 与任意 ws 设备都能收到并切 `data-theme`。
+    {
+        let hub = Arc::clone(&hub);
+        let mut rx = theme.subscribe();
+        tokio::spawn(async move {
+            while let Ok(theme) = rx.recv().await {
+                let n = Notification::UiSettingsUpdated {
+                    theme: theme.as_str().to_string(),
+                };
+                if write_notification(&hub, &n).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    // 写路径仍需 theme 句柄;`set` 会落盘 + 广播,由上面的 watcher 推通知。
+    let theme_handle = theme.clone();
 
     loop {
         tokio::select! {
@@ -1366,6 +1472,45 @@ where
                     }
                     "config/read" => {
                         write_response(&hub, &client, ok_response(id, cfg.redacted_view())).await?;
+                    }
+                    "ui/settings/read" => {
+                        // 以共享句柄的当前值为权威（与 `set_theme` 工具同一实例）;
+                        // 句柄在构造时已从磁盘载入，故首次读即反映持久化值。
+                        let theme = theme_handle.current();
+                        write_response(
+                            &hub,
+                            &client,
+                            ok_response(id, json!({ "theme": theme.as_str() })),
+                        )
+                        .await?;
+                    }
+                    "ui/settings/write" => {
+                        let requested = req
+                            .params
+                            .get("theme")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let theme = match requested.trim().to_ascii_lowercase().as_str() {
+                            "dark" => crate::settings_store::Theme::Dark,
+                            "light" => crate::settings_store::Theme::Light,
+                            other => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!(
+                                            "unsupported theme '{other}': expected 'dark' or 'light'"
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        theme_handle.set(theme);
+                        write_response(&hub, &client, ok_response(id, json!({ "ok": true })))
+                            .await?;
                     }
                     "plugin/query" => {
                         // `project` names the project being queried, not the
@@ -1634,6 +1779,7 @@ where
                             &cfg,
                             &cwd,
                             &thread_id,
+                            &theme,
                             built,
                         );
                         let BuiltAgent {
@@ -1871,6 +2017,7 @@ where
                             &cfg,
                             &cwd,
                             &thread_id,
+                            &theme,
                             built,
                         );
                         let BuiltAgent {
@@ -4418,6 +4565,7 @@ pub(crate) mod tests {
             &root,
             "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
         )
         .expect("tooling");
         let names = tooling.registry.names();
@@ -4488,7 +4636,8 @@ pub(crate) mod tests {
         let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
         let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
         let tooling =
-            build_runtime_tooling(&cfg, &root, "thread-test", switch.clone()).expect("tooling");
+            build_runtime_tooling(&cfg, &root, "thread-test", switch.clone(), test_theme())
+                .expect("tooling");
         let bash = tooling.registry.get("bash").expect("bash is registered");
         assert_eq!(
             bash.sandbox_mode(),
@@ -4533,6 +4682,7 @@ pub(crate) mod tests {
             &root,
             "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
         )
         .expect("tooling")
         .registry
@@ -4657,6 +4807,7 @@ pub(crate) mod tests {
             &cfg,
             &cwd,
             "thread-a",
+            &test_theme(),
             build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
         let second = attach_delegation(
@@ -4666,6 +4817,7 @@ pub(crate) mod tests {
             &cfg,
             &cwd,
             "thread-b",
+            &test_theme(),
             build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
 
@@ -4943,6 +5095,11 @@ pub(crate) mod tests {
         })
     }
 
+    /// 测试用的主题句柄：不落盘的临时 workdir，也不可被生产路径读到。
+    fn test_theme() -> crate::theme_tool::ThemeHandle {
+        crate::theme_tool::ThemeHandle::new(std::env::temp_dir())
+    }
+
     fn test_config() -> RuntimeConfig {
         super::tests_support::test_config()
     }
@@ -5032,6 +5189,9 @@ pub(crate) mod tests {
             let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
                 index_dir.path().join("devices.json"),
             )));
+            // 主题句柄与 `cfg.workdir` 一致：`ui/settings/read` 从 `cfg.workdir`
+            // 读、`write` 经句柄落盘，两者不同则会各看各的。
+            let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
             let handle = tokio::spawn(serve_scoped(
                 server_r,
                 server_w,
@@ -5046,6 +5206,7 @@ pub(crate) mod tests {
                     // 测试里不起真进程:`board/create` 走注入的启动器,
                     // 与 board_dir 注入同一个理由。
                     launcher: Arc::new(|_project: &Path| Ok(true)),
+                    theme,
                 },
                 build,
                 scope,
@@ -5644,6 +5805,7 @@ pub(crate) mod tests {
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
+                theme: test_theme(),
             },
             build_test_agent,
         ));
@@ -5707,6 +5869,7 @@ pub(crate) mod tests {
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
+                theme: test_theme(),
             },
             |_s: Option<yi_agent_core::Session>,
              _cwd: &std::path::Path,
@@ -5774,6 +5937,7 @@ pub(crate) mod tests {
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
+                theme: test_theme(),
             },
             build_test_agent,
         ));
@@ -6480,7 +6644,16 @@ pub(crate) mod tests {
         workspaces: Arc<WorkspaceIndex>,
         pairing: Arc<PairingState>,
     ) -> anyhow::Result<()> {
-        crate::ws::serve_ws_inner(listener, cfg, workspaces, pairing, build_permission_agent).await
+        let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
+        crate::ws::serve_ws_inner(
+            listener,
+            cfg,
+            workspaces,
+            pairing,
+            theme,
+            build_permission_agent,
+        )
+        .await
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9078,5 +9251,196 @@ pub(crate) mod tests {
         );
         // 未知设备(或连接已摘除)返回 None,`device/revoke` 于是只改设备表。
         assert!(ws_client_for_device("dev-missing").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_read_and_write_round_trip() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["result"]["theme"], "dark", "default before any write");
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"theme":"light"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["result"]["ok"], true);
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        assert_eq!(v["result"]["theme"], "light");
+
+        // 落盘可被另一个进程读回
+        assert_eq!(
+            crate::settings_store::load(dir.path()),
+            crate::settings_store::Theme::Light
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_rejects_an_unknown_theme() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"theme":"sepia"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 2).await;
+        assert!(
+            v.get("error").is_some(),
+            "unsupported theme must be rejected"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_notifies_subscribers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"theme":"light"}}"#,
+        )
+        .await;
+        // 响应(主循环写)与通知(watcher 任务写)共用一路流,到达顺序不定;
+        // 逐帧收敛,两者都必须见到。
+        let mut responded = false;
+        let mut notified = None;
+        for _ in 0..16 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                assert_eq!(v["result"]["ok"], true);
+                responded = true;
+            } else if v.get("method").and_then(|m| m.as_str()) == Some("ui/settings/updated") {
+                notified = Some(v);
+            }
+            if responded && notified.is_some() {
+                break;
+            }
+        }
+        assert!(responded, "ui/settings/write must respond");
+        let n = notified.expect("theme change must push ui/settings/updated");
+        assert_eq!(n["params"]["theme"], "light");
+        h.shutdown().await;
+    }
+
+    /// 每个 thread 的工具集都必须带主题工具——这是「对话切主题」的落点。
+    #[test]
+    fn the_theme_tool_is_registered_into_a_thread_registry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let handle = crate::theme_tool::ThemeHandle::new(dir.path().to_path_buf());
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        register_theme_tool(&mut registry, handle);
+        assert!(
+            registry.get("set_theme").is_some(),
+            "a thread registry must carry the theme tool"
+        );
+    }
+
+    /// 委派可用时,`build_runtime_tooling` 造出的 registry 也必须带主题工具
+    /// (否则每个 git 项目里的 thread 都说不了「切主题」)。
+    #[test]
+    fn delegation_tooling_carries_the_theme_tool() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+
+        let attached = Arc::new(
+            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
+                .expect("a clean git repo must attach"),
+        );
+        let binding =
+            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+        let tooling = build_runtime_tooling(
+            &cfg,
+            &root,
+            "thread-test",
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+        )
+        .expect("tooling");
+        assert!(
+            tooling.registry.get("set_theme").is_some(),
+            "the delegation registry must carry the theme tool, got {:?}",
+            tooling.registry.names()
+        );
+    }
+
+    /// 非委派路径(非 git 目录)用的是 bootstrap 工具集的克隆。那一步必须既
+    /// 补上主题工具、又保留原有工具——用真实的 bootstrap 工具集断言,而不是
+    /// 自搭一个空注册表。
+    #[test]
+    fn the_non_delegation_registry_carries_the_theme_tool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
+            &cfg,
+            yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+        )
+        .expect("a default config bootstraps without network");
+        assert!(
+            built.tools.get("bash").is_some(),
+            "precondition: the bootstrap carries real tools"
+        );
+
+        let registry = registry_with_theme_tool(&built.tools, test_theme());
+        assert!(
+            registry.get("set_theme").is_some(),
+            "the non-delegation registry must carry the theme tool, got {:?}",
+            registry.names()
+        );
+        assert!(
+            registry.get("bash").is_some(),
+            "cloning the bootstrap registry must keep its original tools"
+        );
+    }
+
+    /// 重建 agent 会经过 `Agent::new`,它从零开始、**没有**权限检查器。
+    /// 非委派路径既然要重建,就必须把审批路径装回去,否则非 git 目录静默失去审批。
+    #[test]
+    fn rebuilding_the_thread_agent_keeps_the_approval_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let built = yi_agent_runtime::bootstrap::bootstrap_agent(
+            &cfg,
+            yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+        )
+        .expect("a default config bootstraps without network");
+        assert!(
+            built.agent.permission_checker().is_some(),
+            "precondition: the bootstrap attaches the checker"
+        );
+
+        let rebuilt = rebuild_thread_agent_with_theme(built, None, test_theme());
+        assert!(
+            rebuilt.agent.permission_checker().is_some(),
+            "the rebuilt agent must keep the permission checker"
+        );
+        assert!(
+            rebuilt.agent.decision_rx().is_some(),
+            "the rebuilt agent must keep the decision receiver"
+        );
     }
 }

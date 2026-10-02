@@ -21,6 +21,7 @@ yi-agent-tools = { workspace = true }
 yi-agent-boards = { path = "../yi-agent-boards" }
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
+async-trait = "0.1"
 futures.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
@@ -30,6 +31,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-async-trait = "0.1"
 tempfile = "3"
 tokio-tungstenite = "0.29"

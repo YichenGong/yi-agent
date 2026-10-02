@@ -15,7 +15,7 @@ describe("TitleBar", () => {
     const { container } = render(<TitleBar />);
     const bar = container.querySelector<HTMLElement>("[data-tauri-drag-region]")!;
     expect(bar).not.toBeNull();
-    expect(bar.className).toContain("bg-neutral-900");
+    expect(bar.className).toContain("bg-panel");
     expect(bar.className).toContain("border-b");
   });
 });

@@ -16,18 +16,18 @@ export function ToolCallCard({ item }: { item: ToolCallItem }) {
   const summary = toolCallSummary(item.name, item.input);
 
   return (
-    <div className="my-2 rounded-md border border-neutral-800 bg-neutral-900/60">
+    <div className="my-2 rounded-md border border-line bg-panel/60">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
         aria-controls={regionId}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-neutral-800/50"
+        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-raised/50"
       >
-        <span className="text-neutral-500">{open ? "▾" : "▸"}</span>
-        <span className="font-mono font-medium text-neutral-200">{item.name}</span>
+        <span className="text-fg-subtle">{open ? "▾" : "▸"}</span>
+        <span className="font-mono font-medium text-fg">{item.name}</span>
         {summary && (
-          <span className="min-w-0 truncate font-mono text-neutral-400" title={summary}>
+          <span className="min-w-0 truncate font-mono text-fg-muted" title={summary}>
             {summary}
           </span>
         )}
@@ -37,17 +37,17 @@ export function ToolCallCard({ item }: { item: ToolCallItem }) {
           {item.status}
         </span>
       </button>
-      <div id={regionId} hidden={!open} className="space-y-2 border-t border-neutral-800 px-3 py-2">
+      <div id={regionId} hidden={!open} className="space-y-2 border-t border-line px-3 py-2">
         <div>
-          <div className="mb-1 text-xs uppercase tracking-wide text-neutral-500">Input</div>
-          <pre className="overflow-x-auto rounded bg-neutral-950 p-2 font-mono text-xs whitespace-pre-wrap text-neutral-300">
+          <div className="mb-1 text-xs uppercase tracking-wide text-fg-subtle">Input</div>
+          <pre className="overflow-x-auto rounded bg-surface p-2 font-mono text-xs whitespace-pre-wrap text-fg-muted">
             {JSON.stringify(item.input, null, 2)}
           </pre>
         </div>
         {item.result !== undefined && (
           <div>
-            <div className="mb-1 text-xs uppercase tracking-wide text-neutral-500">Result</div>
-            <pre className="max-h-64 overflow-y-auto rounded bg-neutral-950 p-2 font-mono text-xs whitespace-pre-wrap text-neutral-300">
+            <div className="mb-1 text-xs uppercase tracking-wide text-fg-subtle">Result</div>
+            <pre className="max-h-64 overflow-y-auto rounded bg-surface p-2 font-mono text-xs whitespace-pre-wrap text-fg-muted">
               {item.result}
             </pre>
           </div>

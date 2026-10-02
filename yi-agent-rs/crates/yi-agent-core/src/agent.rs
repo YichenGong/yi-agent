@@ -528,6 +528,18 @@ impl Agent {
         self.session.lock().unwrap().clone()
     }
 
+    /// 当前持有的权限检查器(若有)。给必须**重建** agent(例如换工具集)的调用方
+    /// 取回它,好把同一条审批路径重新装上,而不是静默丢掉。
+    pub fn permission_checker(&self) -> Option<Arc<crate::permission::PermissionChecker>> {
+        self.permission_checker.clone()
+    }
+
+    /// 当前持有的权限决定接收端(若有)。与 [`Agent::permission_checker`] 成对使用:
+    /// 重建 agent 后两者必须一起装回,否则审批会退化成无人接收。
+    pub fn decision_rx(&self) -> Option<DecisionRx> {
+        self.decision_rx.clone()
+    }
+
     /// Trigger cancellation. The run loop will exit at the nearest check point.
     pub fn cancel(&self) {
         self.cancel_token.cancel();

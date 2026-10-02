@@ -5,6 +5,7 @@ import rehypeHighlight from "rehype-highlight";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { isRemoteClient, openExternalLink } from "../lib/platform";
 import "highlight.js/styles/github-dark.css";
+import "../lib/highlight-light.css";
 
 /**
  * 外链在系统浏览器打开,避免 webview 被导航走。
@@ -41,7 +42,7 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
 export const MarkdownText = memo(
   function MarkdownText({ text }: { text: string }) {
     return (
-      <div className="prose prose-invert max-w-none prose-pre:bg-neutral-900">
+      <div className="prose prose-invert max-w-none prose-pre:bg-panel">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           rehypePlugins={[rehypeHighlight]}

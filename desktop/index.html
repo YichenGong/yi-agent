@@ -5,6 +5,15 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Yi-Agent</title>
+    <script>
+      // 首帧前应用缓存主题，避免闪一下深色。缓存缺失/损坏时保持默认深色。
+      try {
+        var t = localStorage.getItem("app.theme");
+        if (typeof t === "string" && t.trim().toLowerCase() === "light") {
+          document.documentElement.dataset.theme = "light";
+        }
+      } catch (e) {}
+    </script>
   </head>
 
   <body>

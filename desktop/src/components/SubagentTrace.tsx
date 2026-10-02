@@ -29,19 +29,19 @@ const TraceRowView = memo(function TraceRowView({
   isError: boolean;
 }) {
   if (kind === "assistant_text") {
-    return <p className="my-1 whitespace-pre-wrap text-sm text-neutral-200">{text}</p>;
+    return <p className="my-1 whitespace-pre-wrap text-sm text-fg">{text}</p>;
   }
   if (kind === "tool_call") {
     return <p className="my-1 font-mono text-xs text-sky-300">{text}</p>;
   }
   if (kind === "tool_result") {
     return (
-      <p className={`my-1 font-mono text-xs ${isError ? "text-red-300" : "text-neutral-500"}`}>
+      <p className={`my-1 font-mono text-xs ${isError ? "text-red-300" : "text-fg-subtle"}`}>
         {text}
       </p>
     );
   }
-  return <p className="my-1 text-xs text-neutral-500">{text}</p>;
+  return <p className="my-1 text-xs text-fg-subtle">{text}</p>;
 });
 
 export function SubagentTrace({
@@ -90,20 +90,20 @@ export function SubagentTrace({
   return (
     <section
       aria-label={`子 agent 详情 ${taskId}`}
-      className="flex min-h-0 flex-1 flex-col border-t border-neutral-800 bg-neutral-950"
+      className="flex min-h-0 flex-1 flex-col border-t border-line bg-surface"
     >
       <div className="flex items-center justify-between px-3 py-2">
         <div className="flex items-center gap-2">
-          <span className="text-xs text-neutral-400">[{row?.state ?? "unknown"}]</span>
-          <span className="truncate text-sm text-neutral-200">
+          <span className="text-xs text-fg-muted">[{row?.state ?? "unknown"}]</span>
+          <span className="truncate text-sm text-fg">
             {row?.objective ?? taskId}
           </span>
-          <span className="text-xs text-neutral-600">{taskId}</span>
+          <span className="text-xs text-fg-faint">{taskId}</span>
         </div>
         <div className="flex items-center gap-2">
           <button
             type="button"
-            className="text-xs text-neutral-400 hover:text-neutral-200"
+            className="text-xs text-fg-muted hover:text-fg"
             aria-expanded={expanded}
             onClick={() => setExpanded((v) => !v)}
           >
@@ -112,7 +112,7 @@ export function SubagentTrace({
           <button
             type="button"
             aria-label="关闭详情"
-            className="text-xs text-neutral-500 hover:text-neutral-300"
+            className="text-xs text-fg-subtle hover:text-fg-muted"
             onClick={onClose}
           >
             关闭
@@ -122,14 +122,14 @@ export function SubagentTrace({
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-2">
         {!expanded ? (
-          <div className="text-sm text-neutral-400">
+          <div className="text-sm text-fg-muted">
             <p>最近步骤：{row?.finished ? "已结束" : (row?.lastStep ?? "工作中")}</p>
-            <p className="mt-1 text-xs text-neutral-600">
+            <p className="mt-1 text-xs text-fg-faint">
               轨迹 {rows.length} 行（展开查看完整轨迹）
             </p>
           </div>
         ) : blocks.length === 0 ? (
-          <p className="text-sm text-neutral-500">该任务暂无轨迹</p>
+          <p className="text-sm text-fg-subtle">该任务暂无轨迹</p>
         ) : (
           blocks.map((block) => (
             <TraceRowView key={block.key} kind={block.kind} text={block.text} isError={block.isError} />
@@ -138,15 +138,15 @@ export function SubagentTrace({
       </div>
 
       {children.length > 0 && (
-        <div className="border-t border-neutral-800 px-3 py-2">
-          <p className="text-xs text-neutral-500">子任务</p>
+        <div className="border-t border-line px-3 py-2">
+          <p className="text-xs text-fg-subtle">子任务</p>
           <ul className="mt-1 flex flex-wrap gap-2">
             {children.map((child) => (
               <li key={child.taskId}>
                 <button
                   type="button"
                   aria-label={`进入子任务 ${child.taskId}`}
-                  className="rounded border border-neutral-800 px-2 py-1 text-xs text-neutral-300 hover:border-neutral-600"
+                  className="rounded border border-line px-2 py-1 text-xs text-fg-muted hover:border-line-strong"
                   onClick={() => onDrill(child.taskId)}
                 >
                   {child.objective ?? child.taskId}
@@ -157,7 +157,7 @@ export function SubagentTrace({
         </div>
       )}
 
-      <div className="border-t border-neutral-800 px-3 py-2">
+      <div className="border-t border-line px-3 py-2">
         {status && <p className="mb-1 text-xs text-amber-300">{status}</p>}
         {pendingCancel ? (
           <div className="flex items-center gap-2">
@@ -180,7 +180,7 @@ export function SubagentTrace({
             </button>
             <button
               type="button"
-              className="text-xs text-neutral-400 hover:text-neutral-200"
+              className="text-xs text-fg-muted hover:text-fg"
               onClick={() => setPendingCancel(null)}
             >
               放弃
@@ -205,7 +205,7 @@ export function SubagentTrace({
           >
             <input
               aria-label="发给子 agent 的消息"
-              className="min-w-0 flex-1 rounded border border-neutral-800 bg-neutral-900 px-2 py-1 text-sm text-neutral-100"
+              className="min-w-0 flex-1 rounded border border-line bg-panel px-2 py-1 text-sm text-fg"
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
             />
@@ -214,7 +214,7 @@ export function SubagentTrace({
             </button>
             <button
               type="button"
-              className="text-xs text-neutral-400 hover:text-neutral-200"
+              className="text-xs text-fg-muted hover:text-fg"
               onClick={() => {
                 setDraft("");
                 setComposing(false);

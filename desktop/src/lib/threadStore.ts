@@ -100,8 +100,13 @@ export class ThreadStore {
   /** 按 `thread_id` 路由一条通知。 */
   applyNotification(n: Notification): void {
     // agent/* notifications belong to a conversation's附属视图 (the subagent
-    // rail), not to its transcript, so they are not folded into a Session.
-    if (n.method === "agent/children/updated" || n.method === "agent/trace/event") {
+    // rail), not to its transcript; `ui/settings/updated` is app chrome (theme)
+    // handled by App's own notification branch. None is folded into a Session.
+    if (
+      n.method === "agent/children/updated" ||
+      n.method === "agent/trace/event" ||
+      n.method === "ui/settings/updated"
+    ) {
       return;
     }
     if (n.method === "thread/status/updated") {

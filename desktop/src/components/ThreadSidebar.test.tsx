@@ -59,6 +59,7 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onCreateBoard: vi.fn(),
     onRemoveBoard: vi.fn(),
     onOpenBoard: vi.fn(),
+    onOpenSettings: vi.fn(),
     ...overrides,
   };
   return props;
@@ -387,7 +388,7 @@ describe("ThreadSidebar status", () => {
       currentId: null,
     });
     expect(interrupted.container.querySelector('[aria-label="Unread"]')!.className).toContain(
-      "bg-neutral-400",
+      "bg-fg-muted",
     );
   });
 
@@ -630,5 +631,12 @@ describe("ThreadSidebar pinned section", () => {
       (r) => r.getAttribute("draggable") !== "true",
     );
     expect(notDraggable).toBe(true);
+  });
+
+  it("offers a settings button in the footer", () => {
+    const onOpenSettings = vi.fn();
+    renderSidebar({ onOpenSettings });
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
   });
 });

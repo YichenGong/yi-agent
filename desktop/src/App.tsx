@@ -47,6 +47,8 @@ import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
+import { applyTheme, parseTheme, readCachedTheme, type Theme } from "./lib/theme";
+import { SettingsDialog } from "./components/SettingsDialog";
 
 /**
  * 看板失败的四种说法。
@@ -147,6 +149,12 @@ export default function App() {
   const boardTick = useRef<() => void>(() => {});
   /** 看板读取的序号，用来丢掉换项目后落地的过期响应。 */
   const boardSeq = useRef(0);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  // 首屏先用缓存渲染，连上后以 ui/settings/read 的权威值为准。
+  const [theme, setTheme] = useState<Theme>(() => readCachedTheme() ?? "dark");
+  // 挂载后主题是否已被更新的选择触碰过（ui/settings/updated 通知或用户
+  // changeTheme）。首屏 read 在途时若被触碰，read 返回的旧值不得覆盖它。
+  const themeTouchedRef = useRef(false);
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -620,6 +628,13 @@ export default function App() {
         force((v) => v + 1);
         return;
       }
+      if (n.method === "ui/settings/updated") {
+        // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
+        // 的首屏 read 用旧值把它覆盖回去。
+        themeTouchedRef.current = true;
+        setTheme(parseTheme(n.params.theme));
+        return;
+      }
       if (n.method === "agent/trace/event") {
         // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
         // 把两个任务的轨迹拼在一起安全。
@@ -640,6 +655,10 @@ export default function App() {
     client.onStatus((s) => setStatus(s.state));
     (async () => {
       await client.request("initialize", {});
+      const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
+      // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
+      // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
+      if (!themeTouchedRef.current) setTheme(parseTheme(settings.theme));
       await refreshWorkspaces();
       const list = await client.request<{ groups: WorkspaceGroup[]; pinned?: ThreadSummary[] }>(
         "thread/listAll",
@@ -794,6 +813,20 @@ export default function App() {
     });
   };
 
+  const changeTheme = (next: Theme) => {
+    // 立即生效，再落盘。
+    const prev = theme;
+    themeTouchedRef.current = true;
+    setTheme(next);
+    clientRef.current?.request("ui/settings/write", { theme: next }).catch((e) => {
+      // 写失败：回退乐观更新，让 UI 与服务端持久化的权威值保持一致，同时照旧
+      // 报错（无打开的 thread 时 setCurrentError 是 no-op，回退就是唯一的反馈）。
+      setTheme(prev);
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+    });
+  };
+
   // Sidebar badges: server-authoritative status per thread + unread marker for
   // threads that finished a turn while the user was looking elsewhere.
   const statuses = new Map<string, ThreadStatus>();
@@ -812,9 +845,13 @@ export default function App() {
     .pendingApprovalsElsewhere()
     .filter((r) => !dismissedApprovals.current.has(r.id));
 
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
+
   return (
     <>
-      <div className="flex h-screen flex-col bg-neutral-950 text-neutral-100">
+      <div className="flex h-screen flex-col bg-surface text-fg">
         <TitleBar />
         <div className="flex min-h-0 flex-1 flex-row">
         <ThreadSidebar
@@ -838,6 +875,7 @@ export default function App() {
           onCreateBoard={(path) => void onCreateBoard(path)}
           onRemoveBoard={(path) => void onRemoveBoard(path)}
           onOpenBoard={onOpenBoard}
+          onOpenSettings={() => setSettingsOpen(true)}
         />
         <div className="relative flex min-w-0 flex-1 flex-col">
           {/* 看板是主区域的一个视图，不是一个常驻列：选中才出现，且问的是
@@ -967,6 +1005,12 @@ export default function App() {
         )}
         </div>
       </div>
+      <SettingsDialog
+        open={settingsOpen}
+        theme={theme}
+        onThemeChange={changeTheme}
+        onClose={() => setSettingsOpen(false)}
+      />
     </>
   );
 }

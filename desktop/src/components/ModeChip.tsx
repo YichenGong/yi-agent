@@ -119,7 +119,7 @@ export function ModeChip({
         className={`rounded-full border px-2 py-0.5 text-xs font-medium disabled:opacity-50 ${
           isYolo
             ? "border-red-600 bg-red-600 text-white hover:bg-red-500"
-            : "border-neutral-700 text-neutral-400 hover:bg-neutral-800"
+            : "border-line-strong text-fg-muted hover:bg-raised"
         }`}
       >
         {label}
@@ -131,7 +131,7 @@ export function ModeChip({
           <div
             role="menu"
             onKeyDown={onMenuKeyDown}
-            className="absolute bottom-full left-0 z-20 mb-1 rounded-md border border-neutral-700 bg-neutral-800 py-1 shadow-xl"
+            className="absolute bottom-full left-0 z-20 mb-1 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
           >
             {OPTIONS.map((m, i) => (
               <button
@@ -143,9 +143,9 @@ export function ModeChip({
                 role="menuitemradio"
                 aria-checked={m === mode}
                 onClick={() => choose(m)}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
               >
-                <span className="w-3 text-neutral-400">{m === mode ? "✓" : ""}</span>
+                <span className="w-3 text-fg-muted">{m === mode ? "✓" : ""}</span>
                 {LABEL[m]}
               </button>
             ))}
@@ -159,12 +159,12 @@ export function ModeChip({
             role="dialog"
             aria-modal="true"
             aria-labelledby={headingId}
-            className="w-full max-w-md rounded-lg border border-neutral-700 bg-neutral-900 p-4 shadow-xl"
+            className="w-full max-w-md rounded-lg border border-line-strong bg-panel p-4 shadow-xl"
           >
-            <h2 id={headingId} className="mb-2 text-sm font-semibold text-neutral-100">
+            <h2 id={headingId} className="mb-2 text-sm font-semibold text-fg">
               Enable YOLO mode?
             </h2>
-            <ul className="mb-4 list-disc space-y-1 pl-5 text-xs text-neutral-400">
+            <ul className="mb-4 list-disc space-y-1 pl-5 text-xs text-fg-muted">
               <li>Skips tool-approval prompts.</li>
               <li>Relaxes the OS sandbox to full access.</li>
               <li>Blacklisted commands are still hard-denied.</li>
@@ -174,7 +174,7 @@ export function ModeChip({
                 ref={cancelRef}
                 type="button"
                 onClick={close}
-                className="rounded-md border border-neutral-600 px-3 py-1.5 text-sm text-neutral-200 hover:bg-neutral-800"
+                className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised"
               >
                 Cancel
               </button>

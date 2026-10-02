@@ -48,11 +48,11 @@ export function SuperpowersKanbanEnqueue({
         aria-label="加入看板"
         disabled={busy}
         onClick={() => void onEnqueue()}
-        className="w-full rounded border border-neutral-700 px-2 py-1 text-xs text-neutral-300 hover:text-neutral-100 disabled:opacity-50"
+        className="w-full rounded border border-line-strong px-2 py-1 text-xs text-fg-muted hover:text-fg disabled:opacity-50"
       >
         加入看板
       </button>
-      {notice ? <p className="mt-2 text-xs text-neutral-400">{notice}</p> : null}
+      {notice ? <p className="mt-2 text-xs text-fg-muted">{notice}</p> : null}
       {error ? <p className="mt-2 text-xs text-red-400">{error}</p> : null}
     </div>
   );

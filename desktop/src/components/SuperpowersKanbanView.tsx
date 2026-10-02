@@ -21,32 +21,32 @@ export function SuperpowersKanbanView({
 }) {
   if (pluginMissing) {
     return (
-      <div className="p-4 text-sm text-neutral-400">
+      <div className="p-4 text-sm text-fg-muted">
         Superpowers 看板插件未安装。插件负责回答看板的所有问题，装上它这里才会显示卡片。
       </div>
     );
   }
   if (!switchOn) {
     return (
-      <div className="p-4 text-sm text-neutral-400">
+      <div className="p-4 text-sm text-fg-muted">
         Superpowers 看板 is disabled ({source}). Enable it in settings.
       </div>
     );
   }
   if (cards.length === 0) {
-    return <div className="p-4 text-sm text-neutral-400">Superpowers 看板 is empty.</div>;
+    return <div className="p-4 text-sm text-fg-muted">Superpowers 看板 is empty.</div>;
   }
   return (
-    <ul className="divide-y divide-neutral-800">
+    <ul className="divide-y divide-line">
       {cards.map((card) => (
         <li key={card.id} className="flex items-center gap-3 p-3 text-sm">
-          <span className="font-mono text-neutral-300">{card.id}</span>
-          <span className="text-neutral-400">{card.state}</span>
+          <span className="font-mono text-fg-muted">{card.id}</span>
+          <span className="text-fg-muted">{card.state}</span>
           {card.progress ? (
-            <span className="text-neutral-500">({card.progress})</span>
+            <span className="text-fg-subtle">({card.progress})</span>
           ) : null}
           {card.detail ? (
-            <span className="truncate text-neutral-500">{card.detail}</span>
+            <span className="truncate text-fg-subtle">{card.detail}</span>
           ) : null}
         </li>
       ))}
