@@ -127,6 +127,25 @@ describe("MessageInput", () => {
     expect(onSend).toHaveBeenCalledWith("hi");
   });
 
+  it("gives the composer a visible, theme-aware focus affordance", () => {
+    renderInput();
+    const textarea = screen.getByRole("textbox");
+    // jsdom 不编译 Tailwind，没有可断言的 CSS，因此这里只断类名契约：
+    // 基色 token 与焦点色 token 必须不同，且焦点色取自语义 token（随 data-theme 换肤）。
+    const classes = textarea.className.split(/\s+/);
+    const baseBorder = classes.find((c) =>
+      /^border-(line|line-strong|fg|fg-muted|fg-subtle|fg-faint|surface|panel|raised)$/.test(c),
+    );
+    const focusBorder = classes.find((c) => c.startsWith("focus:border-"));
+    expect(baseBorder).toBe("border-line-strong");
+    expect(focusBorder).toBeTruthy();
+    // 焦点态等于基色就等于没有焦点指示（本断言先跑红）。
+    expect(focusBorder).not.toBe(`focus:${baseBorder}`);
+    expect(focusBorder).toMatch(/^focus:border-(line|line-strong|fg|fg-muted|fg-subtle|fg-faint)$/);
+    // 不写字面色阶，否则两套主题里必有一套观感错。
+    expect(textarea.className).not.toMatch(/focus:border-neutral-/);
+  });
+
   describe("slash commands", () => {
     it("opens the popup on a leading slash and filters as you type", () => {
       renderInput();

@@ -71,3 +71,68 @@ describe("SettingsDialog", () => {
     expect(screen.queryByRole("button", { name: "深色" })).toBeNull();
   });
 });
+
+describe("SettingsDialog focus management & tab wiring", () => {
+  it("moves focus into the dialog on open", () => {
+    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.contains(document.activeElement)).toBe(true);
+  });
+
+  it("restores focus to the previously focused element on close", () => {
+    const trigger = document.createElement("button");
+    trigger.textContent = "打开设置";
+    document.body.appendChild(trigger);
+    // 打开前的焦点落在触发按钮上——关闭后必须还给它。
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+
+    const { rerender } = render(
+      <SettingsDialog open={false} theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    rerender(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+    expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
+
+    rerender(
+      <SettingsDialog open={false} theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    expect(document.activeElement).toBe(trigger);
+
+    trigger.remove();
+  });
+
+  it("wires each tab to its panel with aria-controls / role=tabpanel / aria-labelledby", () => {
+    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+
+    const generalTab = screen.getByRole("tab", { name: "通用" });
+    const panel = screen.getByRole("tabpanel");
+    const panelId = panel.getAttribute("id");
+    expect(panelId).toBeTruthy();
+    expect(generalTab.getAttribute("aria-controls")).toBe(panelId);
+    expect(panel.getAttribute("aria-labelledby")).toBe(generalTab.getAttribute("id"));
+
+    // 选中「远程访问」后接线跟着走，且同一时刻只有一个面板。
+    fireEvent.click(screen.getByRole("tab", { name: "远程访问" }));
+    const remoteTab = screen.getByRole("tab", { name: "远程访问" });
+    const remotePanel = screen.getByRole("tabpanel");
+    expect(remoteTab.getAttribute("aria-controls")).toBe(remotePanel.getAttribute("id"));
+    expect(remotePanel.getAttribute("aria-labelledby")).toBe(remoteTab.getAttribute("id"));
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  });
+
+  it("moves selection with ArrowRight and keeps roving tabIndex", () => {
+    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+    const generalTab = screen.getByRole("tab", { name: "通用" });
+    const remoteTab = screen.getByRole("tab", { name: "远程访问" });
+    // tablist 只占一个 Tab 停靠点：选中的是 0，其余是 -1。
+    expect(generalTab.getAttribute("tabindex")).toBe("0");
+    expect(remoteTab.getAttribute("tabindex")).toBe("-1");
+
+    fireEvent.keyDown(generalTab, { key: "ArrowRight" });
+    expect(remoteTab.getAttribute("aria-selected")).toBe("true");
+    expect(remoteTab.getAttribute("tabindex")).toBe("0");
+    expect(generalTab.getAttribute("tabindex")).toBe("-1");
+    // 焦点跟着选区走，键盘用户才看得到。
+    expect(document.activeElement).toBe(remoteTab);
+  });
+});
