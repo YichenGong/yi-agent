@@ -341,9 +341,10 @@ fn create_scaffolds_registers_and_is_idempotent() {
             let bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
             listener = Some(bound.try_clone().unwrap());
             daemon = Some(std::thread::spawn(move || {
-                // 两次 create 各探一次 Status，收两条连接后结束。
+                // create #1 的探测发生在 socket 出现之前（那时 is_running 为假、
+                // 不建连）；只有 create #2 会真正连上来探一次 Status。
                 let mut served = 0usize;
-                for _ in 0..2 {
+                for _ in 0..1 {
                     let (stream, _) = bound.accept().unwrap();
                     let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                     let mut line = String::new();
