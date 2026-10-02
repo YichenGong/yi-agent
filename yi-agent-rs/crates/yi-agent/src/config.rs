@@ -183,6 +183,20 @@ pub enum Command {
         #[command(subcommand)]
         action: PairAction,
     },
+    /// 常驻值守：保证登记在册的项目各自有一个活着的 daemon。
+    Boards {
+        #[command(subcommand)]
+        action: BoardsAction,
+    },
+}
+
+#[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum BoardsAction {
+    /// 值守循环：按登记表确保各项目 daemon 存活（由 launchd 常驻托管）。
+    Watch {
+        #[arg(long, default_value_t = 30)]
+        interval_secs: u64,
+    },
 }
 
 #[derive(clap::Subcommand, Debug)]
