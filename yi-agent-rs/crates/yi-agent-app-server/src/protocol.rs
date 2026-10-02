@@ -290,6 +290,32 @@ impl Notification {
     }
 }
 
+/// 该通知的投递层级（S2）：决定 `write_notification` 用哪个广播键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delivery {
+    /// 全局帧：主题/错误/审批已处理。恒推。
+    Global,
+    /// 列表层：会话存在与状态。**恒推**（列表要实时，与订阅无关）。
+    List,
+    /// 内容层：会话正文流。按 `thread_key()` 过滤。
+    Content,
+}
+
+impl Notification {
+    /// 该通知的投递层级。见 [`Delivery`]。
+    pub(crate) fn delivery(&self) -> Delivery {
+        match self {
+            Notification::ThreadStarted { .. } | Notification::ThreadStatusUpdated { .. } => {
+                Delivery::List
+            }
+            Notification::UiSettingsUpdated { .. }
+            | Notification::Error { .. }
+            | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,
+            _ => Delivery::Content,
+        }
+    }
+}
+
 /// 一条子 agent 的列表项。字段沿用 JSON-RPC 的 camelCase。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
