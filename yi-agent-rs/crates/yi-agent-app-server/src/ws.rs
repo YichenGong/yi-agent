@@ -50,8 +50,13 @@ pub async fn serve_ws(
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
 ) -> anyhow::Result<()> {
-    let build_agent = production_factory(cfg.clone());
-    serve_ws_inner(listener, cfg, workspaces, pairing, build_agent).await
+    // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用,
+    // 与 stdio 路径同构——工厂闭包是 `'static`,拿不到 `serve_ws_inner` 里的
+    // `theme`,故先克隆一份专供工厂。
+    let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
+    let theme_for_factory = theme.clone();
+    let build_agent = production_factory(cfg.clone(), theme_for_factory);
+    serve_ws_inner(listener, cfg, workspaces, pairing, theme, build_agent).await
 }
 
 /// [`serve_ws`] 的可注入 agent 工厂版本:测试用 mock provider(如审批 E2E)。
@@ -60,6 +65,7 @@ pub(crate) async fn serve_ws_inner<F>(
     cfg: RuntimeConfig,
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
+    theme: crate::theme_tool::ThemeHandle,
     build_agent: F,
 ) -> anyhow::Result<()>
 where
@@ -106,6 +112,7 @@ where
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: yi_agent_boards::global_dir().unwrap_or_default(),
                 launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
+                theme,
             },
             build_agent,
             serve_scopes,
