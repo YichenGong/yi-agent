@@ -10,7 +10,7 @@
     "--project-root",
     "{workdir}",
     "--interval-secs",
-    "60"
+    "10"
   ],
   "switch_key": "superpowers_kanban",
   "stop_when_disabled": false,

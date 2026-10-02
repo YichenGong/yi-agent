@@ -21,6 +21,11 @@ const SWITCH_KEY: &str = "superpowers_kanban";
 /// the board UI talks to: stopping it on switch-off would take away the only
 /// way to read the switch and turn it back on. The plugin gates its own work on
 /// the switch instead (see `run_daemon`), so off still means "stop advancing".
+///
+/// `--interval-secs 10` matches the plugin's own default: the daemon-liveness
+/// probe reuses this interval, so a small value bounds how long an orphaned
+/// plugin can hold the single-instance lock before it notices the daemon is
+/// gone (threshold 3 × 10s ≈ 30s).
 const MANIFEST_TEMPLATE: &str = r#"{
   "name": "superpowers-kanban",
   "command": "{command}",
@@ -33,7 +38,7 @@ const MANIFEST_TEMPLATE: &str = r#"{
     "--project-root",
     "{workdir}",
     "--interval-secs",
-    "60"
+    "10"
   ],
   "switch_key": "superpowers_kanban",
   "stop_when_disabled": false,
@@ -187,7 +192,7 @@ mod tests {
                 "--project-root",
                 "{workdir}",
                 "--interval-secs",
-                "60"
+                "10"
             ])
         );
         assert_eq!(value["restart_backoff_ms"], 1000);
