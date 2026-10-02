@@ -2317,12 +2317,10 @@ fn execute_slash_command(
         | SlashCommand::Deny
         | SlashCommand::Budget
         | SlashCommand::Priority => {
+            let reason = cmd.unavailable_reason().unwrap_or("暂不支持");
             history.push(
                 HistoryCell::Separator {
-                    label: Some(format!(
-                        "/{} 将由本地 daemon runtime 执行 (控制客户端接入中)",
-                        cmd.name()
-                    )),
+                    label: Some(format!("/{} 暂不支持：{}", cmd.name(), reason)),
                 },
                 width,
             );
@@ -5611,6 +5609,48 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn hidden_commands_explain_themselves_instead_of_unknown() {
+        for (command, needle) in [
+            (SlashCommand::Approve, "暂不支持"),
+            (SlashCommand::Deny, "暂不支持"),
+            (SlashCommand::Budget, "暂不支持"),
+            (SlashCommand::Priority, "暂不支持"),
+        ] {
+            let mut history = HistoryState::new();
+            let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+            let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+            let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+            let (control_tx, _control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(1);
+            let mut queued = crate::tui::queued::DeliveredInterjections::new();
+            let _ = execute_slash_command(
+                command,
+                None,
+                None,
+                &mut history,
+                80,
+                &CostTracker::default(),
+                &input_tx,
+                &interrupt_tx,
+                &kill_tx,
+                &control_tx,
+                &std::env::temp_dir(),
+                &mut queued,
+                &yi_agent_mcp::McpManager::empty(),
+                &snapshot_for_tests(),
+                "test-model",
+            );
+            let labels = separator_labels(&history);
+            assert!(
+                labels
+                    .iter()
+                    .any(|l| l.contains(needle) && l.contains(command.name())),
+                "{} must explain itself, got {labels:?}",
+                command.name()
+            );
+        }
     }
 
     #[test]
