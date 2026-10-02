@@ -893,34 +893,29 @@ git commit -m "feat(app-server): serve JSON-RPC over WebSocket (single client)"
 
 ---
 
-## Task 4: 文档、Tailscale 直连指引、路线图状态
+## Task 4: 文档与路线图状态
 
 **Files:**
-- Modify: `README.md`（三种用法 → 增加"远程/手机"小节与 `ws://` 说明）
+- Modify: `README.md`（三种用法 → 增加"远程连接（实验性）"小节与 `ws://` 说明）
 - Modify: `docs/project-management/yi-agent-app-server.md`（范围 + Features 增加 ws 传输条目）
 - Modify: `docs/project-management/desktop.md`（P3 的"Unix socket / websocket 传输"标记为部分完成）
 
-- [ ] **Step 1: README 增加远程访问小节**
+- [ ] **Step 1: README 增加远程连接小节**
 
 在"三种用法"之后、`## 配置放在哪` 之前插入：
 
 ```markdown
-## 从手机/其它设备远程连（实验性）
+## 远程连接（实验性）
 
-`app-server` 支持通过 WebSocket 提供服务，供网络客户端（Tier 0 尚未带认证）：
+`app-server` 支持通过 WebSocket 提供服务，供网络客户端连接：
 
 ```bash
 yi-agent app-server --listen ws://127.0.0.1:8790
 ```
 
-**Tier 0 无认证，只应绑定回环地址。** 要在外网连回家里/公司的电脑，推荐先用
-[Tailscale](https://tailscale.com/)（基于 WireGuard 的零配置组网，无需公网 IP）：
-
-1. 电脑与手机安装 Tailscale 并登录同一账号；
-2. 电脑上 `yi-agent app-server --listen ws://$(tailscale ip -4):8790`；
-3. 手机浏览器打开 `http://<电脑的 tailscale IP>:8790/`（移动端 UI 见 Tier 1 计划）。
-
-多设备同时连接、扫码配对与设备撤销属于 Tier 1，尚未实现。
+**当前版本无认证，只应绑定回环地址。** 这是手机端远程访问的地基；多设备同时连接、
+扫码配对、设备撤销，以及 iOS App 与自建中继，见
+[手机远程访问设计](docs/superpowers/specs/2026-10-02-mobile-remote-access-design.md)（Tier 1）。
 ```
 
 - [ ] **Step 2: app-server 模块文档增加 ws 条目**
@@ -951,7 +946,7 @@ yi-agent app-server --listen ws://127.0.0.1:8790
 
 ```bash
 git add README.md docs/project-management/yi-agent-app-server.md docs/project-management/desktop.md
-git commit -m "docs: record app-server WebSocket transport and Tailscale quickstart"
+git commit -m "docs: record app-server WebSocket transport"
 ```
 
 ---
@@ -966,7 +961,8 @@ git commit -m "docs: record app-server WebSocket transport and Tailscale quickst
 - §6 错误处理（写失败终止 stdio 会话、单客户端准入、畸形帧只回该客户端）→ Task 2/3
 - §8 迁移兼容（默认 stdio、协议纯增量）→ Task 2/3/4
 - §9 Tier 0 → 本计划整体
-- **不在本计划**：§4.3 配对/设备、§4.4 多客户端扇出与 per-client initialized、§4.5 `pair/*`/`device/*`/`approvalResolved`/`-32014`、§5 安全、§7 移动 UI —— 均属 **Tier 1**，另立计划。
+- **不在本计划**：§4.3 配对/设备、§4.4 多客户端扇出与 per-client initialized、§4.5 `pair/*`/`device/*`/`approvalResolved`/`-32014`、§5 安全、§11 中继、iOS App —— 均属 **Tier 1**，见
+  `docs/superpowers/plans/2026-10-02-ios-remote-app-tier1.md`。
 
 **占位符扫描**：无 TBD/TODO；每个代码步骤都给了可编译的实体代码或明确的编译器驱动清单。
 

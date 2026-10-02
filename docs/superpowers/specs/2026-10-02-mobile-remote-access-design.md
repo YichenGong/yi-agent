@@ -70,17 +70,59 @@ Claude Code Remote Control 与 OpenAI Codex 手机端**清一色**采用：
 - app-server 新增 **WebSocket 传输**（`--listen ws://host:port`；`stdio://` 仍是默认，行为不变）
 - **多客户端扇出**（Broadcaster）：通知广播、响应定向、审批先到先得
 - **配对与设备管理**：一次性配对码扫码 → 持久化设备表 → 短期设备 token → 撤销
-- **移动 Web / PWA 界面**：复用现有线协议与状态机
-- **打通 v1**：Tailscale 直连（文档化操作步骤）
+- **iOS 原生 App**：用 **Tauri 2** 复用现有 React 前端（见 §2.4）；App 是**纯远程客户端**，
+  不跑 agent、不执行 shell、不读本地文件
+- **打通 v1**：**自建反向 WSS 中继**（见 §11）——手机与电脑都只发出站连接
 
 ### 2.2 不做什么（非目标，YAGNI）
 
-- 原生 App（iOS/Android）、推送通知、IM 机器人（各自独立项目，v2）
+- Android App（v2；Tauri 2 共享代码，届时成本低于 iOS）
+- IM 机器人（独立项目，v2）
 - 多用户 / 多租户协作：仍是"一台电脑一个人"，只是同一个人多设备
-- 自建反向 WS 中继（v1.1；本设计的传输抽象与 Broadcaster 已为它预留）
 - 按 thread 订阅过滤（v1 广播全部通知）
-- 中继端到端加密（自建中继时才需要）
+- 中继端到端加密（v1.1；先把功能跑通）
 - thread_store 多写者（持久化仍由 app-server 单点负责）
+- 手机端直接读写宿主文件系统（**设计上的安全边界**，非缺陷）
+
+### 2.4 形态与端到端拓扑（已决策）
+
+**App 形态：Tauri 2 iOS 原生 App，复用现有 React 前端。** 依据：
+
+- 前端的 Tauri 耦合极小——只有 `tauriTransport.ts`（44 行）、`App.tsx` 的 `plugin-dialog`
+  动态导入、`MarkdownText.tsx` 的 `plugin-opener` 三处；`protocol.ts` / `rpc.ts` /
+  `session.ts` / `threadStore.ts` 是纯 TS，可零改动复用。
+- `rpc.ts` 已定义 `Transport` 接口，`tauriTransport()` 只是其一个实现；iOS 只需新增
+  `wsTransport()`。
+- 定位为**纯远程客户端**（不跑 agent、不执行 shell、不读本地文件），因此
+  **不触碰 App Store 的"下载并执行代码"红线**，审核风险远低于"手机上跑 coding agent"。
+
+**打通：自建反向 WSS 中继**（不用 Tailscale）。依据：
+
+- iOS 同一时刻只允许一个 VPN，要求用户开 Tailscale 会与其代理/VPN 冲突；
+- 国内 App Store 装不到 Tailscale（需外区 Apple ID），"为用你的 App 先装另一个 App 并注册账号"
+  在产品上不可接受；
+- 反向 WSS 中继让用户**只装一个 App、扫码即用**，与 Codex 的 secure relay 同构。
+
+拓扑：
+
+```
+┌───────────────────────┐
+│ iOS App (Tauri)        │
+│  React UI + wsTransport│
+└───────────┬───────────┘
+            │ WSS 出站
+┌───────────▼───────────┐
+│ 自建反向 WSS 中继        │  只按会话路由/转发 JSON-RPC 帧,
+│ (VPS + 域名 + TLS)      │  不解析、不落库明文;同时承担 APNs 推送
+└───────────▲───────────┘
+            │ WSS 出站
+┌───────────┴───────────┐
+│ 电脑 app-server         │  ← 不开放入站端口
+└───────────────────────┘
+```
+
+**边界**：电脑侧不开放入站端口；App 只连中继、不直连电脑；中继在 v1 只做转发
+（端到端加密列 v1.1）。
 
 ---
 
@@ -90,13 +132,18 @@ Claude Code Remote Control 与 OpenAI Codex 手机端**清一色**采用：
 
 ```
 ┌──────────────┐   ┌──────────────┐
-│ 手机 PWA      │   │ 桌面端 (现有)  │
-│ 聊天/列表/审批 │   │ Tauri          │
+│ iOS App       │   │ 桌面端 (现有)  │
+│ (Tauri 2)     │   │ Tauri          │
+│ 聊天/列表/审批 │   │                │
 └──────┬───────┘   └──────┬─────────┘
-       │ WSS (JSON-RPC)   │ stdio (JSON-RPC)
-       └────────┬─────────┘
-        ┌───────▼──────────────┐
-        │ app-server            │
+       │ WSS (经中继)       │ stdio (本机)
+       │                   │
+   ┌───▼───────────────────┼──────────┐
+   │ 反向 WSS 中继 (VPS)     │          │
+   └───┬───────────────────┘          │
+       │ WSS 出站                       │
+        ┌───────▼──────────────┐       │
+        │ app-server            │◀──────┘
         │  ├ Transport (stdio)  │ ← 现有，行为不变
         │  ├ Transport (ws)     │ ← 新增
         │  └ Broadcaster        │ ← 新增：扇出/订阅
@@ -214,7 +261,7 @@ device/revoke → 撤销某设备（立即断开其 ws 并使其 token 失效）
 ### 5.1 流程 A：首次配对（扫码）
 
 ```
-电脑端（桌面/PWA-local）             手机（外网）
+电脑端（桌面/local）              iOS App（外网）
    │ 1. RPC: pair/create             │
    │    → { code:"7F3K-9Q2M",         │
    │        ws_url:"wss://host/ws",   │
@@ -318,24 +365,72 @@ cd desktop && npx vitest run && npx tsc --noEmit
 - `--listen` **默认仍是 `stdio://`**，桌面端行为与今天完全一致；`ws://` 是显式 opt-in。
 - 协议**纯增量**：复用全部既有方法，仅新增 `pair/*`、`device/*` 与 `approvalResolved`。
 - `PROTOCOL_VERSION`（`protocol.rs:6`，当前 1）通过 `initialize` 的 capabilities 暴露新增能力。
-- Tailscale 接入：文档给"绑定 100.x 接口 + 手机扫码直连"的操作步骤。
+- 中继接入：电脑端以"出站 WSS 客户端"模式连中继（`--relay wss://...`），
+  不开放入站端口；详见 §11。
 
 ---
 
 ## 9. 分阶段交付
 
-- **Tier 0（验证）**：仅加 `--listen ws://`，**单客户端**跑通（浏览器能连、能看流式输出）。
-  证明换传输可行，不动多客户端逻辑。
-- **Tier 1（可用）**：Broadcaster 多客户端 + 移动 Web UI + 配对/设备 + Tailscale 打通。
+- **Tier 0（已计划）**：仅加 `--listen ws://`，**单客户端**跑通（浏览器能连、能看流式输出）。
+  证明换传输可行，不动多客户端逻辑。计划见
+  `docs/superpowers/plans/2026-10-02-app-server-websocket-transport.md`。
+- **Tier 1（可用）**：Broadcaster 多客户端 + 配对/设备 + 反向 WSS 中继 + iOS App（Tauri 2）。
   达到"手机与电脑同屏一致、手机能审批/发消息/打断"。
-- **Tier 1.1**：自建反向 WS 中继、按 thread 订阅过滤。
-- **Tier 2+（另立项）**：原生 App、推送、IM 机器人、多用户协作。
+- **Tier 1.1**：APNs 推送、中继端到端加密、按 thread 订阅过滤。
+- **Tier 2+（另立项）**：Android App、IM 机器人、多用户协作。
 
 ---
 
 ## 10. 待决策 / 开放问题
 
-1. 移动 Web UI 与桌面端共享 `protocol.ts` 的抽包方式（npm workspace / 目录共享 / 复制）——
-   留实现计划定。
-2. Tailscale 是否作为"官方推荐路径"写进 README，还是仅文档提示。
-3. 设备 token 的签名算法选型（HMAC vs Ed25519）——留实现计划定。
+1. iOS App 与桌面端共享前端代码的方式（Tauri 2 单仓 `desktop/` 加 iOS target，
+   vs 抽出 `shared/` 前端包）——留实现计划定。
+2. 设备 token 的签名算法选型（HMAC vs Ed25519）——留实现计划定。
+3. 中继的部署形态（独立 crate `yi-agent-relay` vs 直接复用 `yi-agent-web` 扩展）——留实现计划定。
+
+---
+
+## 11. 反向 WSS 中继与推送（v1 新增章节）
+
+### 11.1 中继职责
+
+中继是一个**极薄的转发服务**，不做业务：
+
+| 做 | 不做 |
+| --- | --- |
+| 按配对会话把 App 与电脑的帧互相转发 | 不解析 JSON-RPC 方法语义 |
+| 维护"电脑在线"注册表（哪台电脑、哪个 relay session） | 不落库明文会话内容 |
+| TLS 终止（wss） / 设备认证 / 速率限制 | 不执行任何 agent 逻辑 |
+| 承担 APNs 推送（v1.1） | 不代理文件系统访问 |
+
+方向：**两端都出站**。电脑侧跑一个 relay 客户端（把 app-server 的 ws 连接桥到中继），
+App 侧直接连中继。中继只关心"会话 A 的消息转给会话 B 的对端"。
+
+### 11.2 配对与凭证（跨中继）
+
+沿用 §5 的配对流程，新增两段：
+
+- `pair/create` 现在产出 `{ code, relay_url }`（不再是局域网 `ws_url`）；
+- 中继侧也校验同一配对码：App 用 code 连中继时，中继向电脑侧要"这个 code 是否有效"，
+  或由电脑侧在创建时把 code 的哈希注册到中继（两者取一，留实现计划定）。
+
+### 11.3 推送（APNs）
+
+- **必须由服务端签发**：笔记本上的 app-server 发不了 APNs，因此由**中继**承担。
+- 触发点：`thread/status/updated → awaiting_approval`、`turn/completed`。
+- 电脑侧把这些事件以最小 payload 送给中继（含 device push token 关联），中继走 APNs。
+- **隐私边界**：payload 只含"哪个会话在等你"，**不含命令内容**；详情在 App 打开后经
+  WSS 拉取。
+- 需要：Apple Developer 账号（$99/年）、APNs 密钥（.p8）、App 端 `UNUserNotificationCenter` 注册。
+
+### 11.4 中继相关风险
+
+| 风险 | 缓解 |
+| --- | --- |
+| 中继成为单点故障 | 中继无状态（会话注册表可重建）；电脑侧断线重连 + App 侧 `thread/resume` 增量回放 |
+| 中继运维成本 | v1 单实例起步；接口极薄，可水平扩展 |
+| 明文经过中继 | v1.1 加端到端加密（中继只见密文）；v1 靠 TLS |
+| 域名/证书 | `wss://` 需要有效证书，用 Let's Encrypt 自动签发 |
+| 电脑侧要常驻 | 用户需保持 app-server（或 relay 客户端）运行；可选登录项自启 |
+
