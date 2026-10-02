@@ -39,12 +39,20 @@ impl ClientId {
     }
 }
 
+/// 一个客户端在 hub 里的登记项。
+struct Client {
+    tx: mpsc::Sender<Value>,
+    /// 可靠客户端(仅 stdio 的 `local`):它的出站队列**永不**因背压被摘除。
+    /// 见 [`Broadcaster::broadcast`]。
+    reliable: bool,
+}
+
 /// 服务端 → 客户端的扇出中心。
 ///
 /// 锁只在插入/摘除/取 sender 时短暂持有,绝不跨 `.await`,因此 `broadcast`
 /// 与 `reply` 可以并发调用。
 pub struct Broadcaster {
-    clients: StdMutex<HashMap<ClientId, mpsc::Sender<Value>>>,
+    clients: StdMutex<HashMap<ClientId, Client>>,
 }
 
 impl Default for Broadcaster {
@@ -61,12 +69,31 @@ impl Broadcaster {
     }
 
     /// 注册一个客户端,返回它专属的出站接收端。
+    ///
+    /// 普通客户端:队列写满即被判定为慢消费者,`broadcast` 会摘除它(适合可
+    /// 容忍断连的 ws 连接)。
     pub fn register(&self, id: ClientId) -> mpsc::Receiver<Value> {
+        self.register_inner(id, false)
+    }
+
+    /// 注册一个**可靠**客户端(仅 stdio 的 `local` 使用)。
+    ///
+    /// 与 [`Broadcaster::register`] 唯一的不同在 [`Broadcaster::broadcast`]:它的
+    /// 队列写满时**保留登记、丢弃当前帧**,而不是把客户端摘除。stdio 只有这一条
+    /// 出站流,把它当慢消费者摘除会让主循环随即写响应失败、整个 sidecar 以错误
+    /// 退出——桌面 host 一旦来不及读 stdout(WebKit/Tauri 事件循环繁忙)就会
+    /// 触发。可靠客户端的真正断连只由它的出口泵(`pump_stdout`)在**写失败**时
+    /// 摘除,即"对端确实没了",而不是"暂时读得慢"。
+    pub fn register_reliable(&self, id: ClientId) -> mpsc::Receiver<Value> {
+        self.register_inner(id, true)
+    }
+
+    fn register_inner(&self, id: ClientId, reliable: bool) -> mpsc::Receiver<Value> {
         let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
         self.clients
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(id, tx);
+            .insert(id, Client { tx, reliable });
         rx
     }
 
@@ -103,11 +130,22 @@ impl Broadcaster {
 
     /// 广播给所有客户端。
     ///
-    /// 失效或队列已满(慢消费者)的订阅者会被立即摘除——这是**背压**而非无限
-    /// 缓冲:一个连不上的手机不能让主循环卡住。
+    /// 失效或队列已满(慢消费者)的**普通**订阅者会被立即摘除——这是**背压**
+    /// 而非无限缓冲:一个连不上的手机不能让主循环卡住。**可靠**客户端(stdio 的
+    /// `local`)例外:它队列写满时只丢弃当前帧、保留登记,因为摘除它等于结束
+    /// 整个 stdio 会话(见 [`Broadcaster::register_reliable`])。
     pub fn broadcast(&self, frame: Value) {
         let mut guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
-        guard.retain(|_, tx| tx.try_send(frame.clone()).is_ok());
+        guard.retain(|_, client| {
+            if client.reliable {
+                // 丢弃满队列的当前帧(背压),但保留登记;通道已关闭也保留,
+                // 由出口泵在写失败时摘除——那才是对端真正消失。
+                let _ = client.tx.try_send(frame.clone());
+                true
+            } else {
+                client.tx.try_send(frame.clone()).is_ok()
+            }
+        });
     }
 
     /// 只发给指定客户端。
@@ -123,7 +161,7 @@ impl Broadcaster {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(id)
-            .cloned();
+            .map(|client| client.tx.clone());
         match tx {
             Some(tx) => tx.send(frame).await.map_err(|_| Closed),
             None => Err(Closed),
@@ -207,6 +245,47 @@ mod tests {
         assert_eq!(hub.client_count(), 1);
         // 最后一帧已成功入队且发送从未阻塞,fast 取到的就是它。
         assert_eq!(fast.try_recv().unwrap()["n"], CLIENT_QUEUE + 7);
+    }
+
+    /// 回归:可靠客户端(stdio 的 `local`)的队列被灌满时**不得**被摘除。
+    ///
+    /// 摘除它会让主循环随后写响应得到 `Closed`、整个 sidecar 以错误退出——桌面
+    /// host 一旦来不及读 stdout(`try_send` 在满队列上失败)就会触发。可靠客户端
+    /// 只会被丢弃当前帧(背压),登记必须保留。
+    #[tokio::test]
+    async fn a_reliable_client_keeps_its_registration_when_its_queue_is_full() {
+        let hub = Broadcaster::new();
+        let local = ClientId::local();
+        let mut rx = hub.register_reliable(local.clone()); // 从不 recv → 队列必满
+        for i in 0..(CLIENT_QUEUE + 8) {
+            hub.broadcast(serde_json::json!({ "n": i }));
+        }
+        assert!(
+            hub.is_connected(&local),
+            "the stdio local client must survive a full outbound queue"
+        );
+        // 队列里保留的是最早入队的那批帧(满后新帧被丢弃),而不是被清空。
+        assert_eq!(rx.try_recv().unwrap()["n"], 0);
+    }
+
+    /// 可靠客户端的**出口泵**若真的停了(接收端被丢弃),`broadcast` 也不摘除它;
+    /// 断连只由 [`Broadcaster::unregister`] 显式完成(pump_stdout 写失败时调用)。
+    ///
+    /// 这条钉死「满队列 ≠ 断连」与「接收端丢失 ≠ 断连」两个判据分离,避免再次
+    /// 把「读得慢」误判成「对端没了」。
+    #[tokio::test]
+    async fn a_reliable_client_is_only_unregistered_explicitly() {
+        let hub = Broadcaster::new();
+        let local = ClientId::local();
+        let rx = hub.register_reliable(local.clone());
+        drop(rx); // 出口泵停了:接收端不复存在
+        hub.broadcast(serde_json::json!({"method": "ping"}));
+        assert!(
+            hub.is_connected(&local),
+            "a dropped receiver must not silently drop the local registration"
+        );
+        hub.unregister(&local);
+        assert!(!hub.is_connected(&local));
     }
 
     #[tokio::test]

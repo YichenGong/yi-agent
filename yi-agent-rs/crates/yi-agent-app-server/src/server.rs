@@ -1101,7 +1101,11 @@ where
 {
     let hub = Arc::new(crate::broadcast::Broadcaster::new());
     let local = crate::broadcast::ClientId::local();
-    let outbound = hub.register(local.clone());
+    // 可靠登记:stdio 只有这一条出站流,广播的背压**不得**摘除它。桌面 host
+    // 一旦来不及读 stdout,旧的 lossy `broadcast` 会把它当慢消费者摘掉,主循环
+    // 随即写响应失败、sidecar 以错误退出——用户看到的就是「打开很多页面后
+    // broken pipe (os error 32)」。真正断连由 `pump_stdout` 写失败时显式摘除。
+    let outbound = hub.register_reliable(local.clone());
     // channel 里携带 `Result`,区分「读到一行」「EOF(channel 关闭)」与
     // 「读/传输错误」。若不区分,超大帧或 broken pipe 会被误当成干净 EOF。
     let (inbound_tx, inbound_rx) =
@@ -1189,6 +1193,10 @@ async fn pump_stdout<W>(
     while let Some(frame) = outbound.recv().await {
         if let Err(e) = writer.write_value(&frame).await {
             tracing::error!("app-server stdout write failed: {e}");
+            // 出口泵写失败 = 对端真的没了(stdout 管道断裂)。这是 stdio 会话的
+            // **唯一**断连判据:可靠登记不会被背压摘除,故此处必须显式摘除,
+            // 让主循环随后的 `reply`/`write_response` 拿到 `Closed` 并按既有
+            // 致命语义结束会话(`driver_reports_finished_when_writer_fails`)。
             hub.unregister(&client);
             break;
         }
@@ -3136,7 +3144,7 @@ where
                     }
                     "pair/create" => {
                         // 铸一枚一次性配对码,交桌面端渲染二维码。设备注册属于
-                        // `pair/redeem` 的接线(Task 5),这里只铸码。
+                        // `pair/redeem`(见下),这里只铸码。
                         let code = pairing.create_code();
                         write_response(
                             &hub,
@@ -3147,6 +3155,63 @@ where
                             ),
                         )
                         .await?;
+                    }
+                    "pair/redeem" => {
+                        // 帧级兑换:一次性配对码换设备 token。与 ws 升级时的
+                        // `?pair=<code>` 等价,但走**帧**——这是**经中继**配对的唯一
+                        // 通路:中继只转发 ws 帧、不改写升级查询串,所以手机的
+                        // `?pair=` 到不了本机 app-server;而手机连上中继后发的这条
+                        // RPC 会被中继桥原样转发过来,本机据此铸设备。
+                        //
+                        // **不在 `ADMIN_METHODS` 内**:调用者(含中继桥)无需 admin——
+                        // 凭证是那枚一次性码本身(只有桌面能铸),无码即无效。
+                        let Some(code) = req
+                            .params
+                            .get("code")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        else {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::invalid_params("missing code")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let name = req
+                            .params
+                            .get("device_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("remote device")
+                            .to_string();
+                        match pairing.redeem(&code, &name) {
+                            Ok((device, token)) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    ok_response(
+                                        id,
+                                        json!({
+                                            "device_id": device.id,
+                                            "token": token,
+                                            "scope": device.scope,
+                                        }),
+                                    ),
+                                )
+                                .await?;
+                            }
+                            Err(_) => {
+                                // 码不存在/已用/已过期:与"无 token"一致的说法,
+                                // 不泄露码是否存在。
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::invalid_pairing_code()),
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     "device/list" => {
                         let devices: Vec<serde_json::Value> = pairing
@@ -5007,7 +5072,8 @@ pub(crate) mod tests {
     {
         let hub = Arc::new(crate::broadcast::Broadcaster::new());
         let client = crate::broadcast::ClientId::local();
-        let outbound = hub.register(client.clone());
+        // 与生产的 stdio 接线同款:可靠登记,背压不摘除(见 `serve_scoped`)。
+        let outbound = hub.register_reliable(client.clone());
         tokio::spawn(pump_stdout(
             outbound,
             writer,
@@ -9147,6 +9213,35 @@ pub(crate) mod tests {
             v["error"]["code"], -32014,
             "device/revoke from a control client: {v}"
         );
+        h.shutdown().await;
+    }
+
+    /// Frame-level pairing (`pair/redeem`) is the path that works *through the
+    /// relay*: the relay forwards ws frames but never the upgrade query string,
+    /// so a phone's `?pair=` cannot reach the local app-server. A code minted
+    /// here must redeem over a normal (non-admin) initialized connection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_client_can_redeem_a_code_with_pair_redeem() {
+        let mut h = Harness::with_scope(Scope::Control).await;
+        initialize(&mut h).await;
+        // Desktop mints the code (same PairingState as the serving loop here).
+        let code = h.pairing().create_code().code;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"pair/redeem","params":{{"code":"{code}","device_name":"iPhone"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        let token = v["result"]["token"]
+            .as_str()
+            .expect("redeem must return a token");
+        assert!(token.starts_with("yia_"), "unexpected token: {token}");
+        assert_eq!(v["result"]["scope"], "control");
+
+        // A bad code is refused with the pairing-code error, not a crash.
+        h.send(r#"{"jsonrpc":"2.0","id":10,"method":"pair/redeem","params":{"code":"NOPE-0000"}}"#)
+            .await;
+        let v = read_response(&mut h, 10).await;
+        assert_eq!(v["error"]["code"], -32001, "bad code must be refused: {v}");
         h.shutdown().await;
     }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { redeemPairCode } from "./pairing";
+import { defaultRedeem, redeemPairCode } from "./pairing";
 
 /** See `wsTransport.test.ts` for the shape of this fake; kept local to avoid a shared test helper. */
 class FakeWebSocket {
@@ -101,5 +101,93 @@ describe("redeemPairCode", () => {
     fake.receive("not json");
     fake.close(1000);
     await expect(promise).rejects.toThrow();
+  });
+});
+
+describe("defaultRedeem", () => {
+  it("uses the frame path for a relay URL (?session=)", async () => {
+    const fake = new FakeWebSocket("");
+    const sent: Array<{ id: number; method: string; params: unknown }> = [];
+    fake.send = ((raw: string) => {
+      sent.push(JSON.parse(raw));
+    }) as unknown as () => void;
+
+    const promise = defaultRedeem(
+      "wss://relay.test/ws?session=abc",
+      "CODE-123",
+      "iPhone",
+      () => fake as unknown as WebSocket,
+    );
+    // The relay URL is opened verbatim — no ?pair= query is appended.
+    fake.open();
+    // initialize goes out first, then pair/redeem once initialize answers.
+    expect(sent[0].method).toBe("initialize");
+    fake.receive(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }));
+    expect(sent[1].method).toBe("pair/redeem");
+    expect((sent[1].params as { code: string }).code).toBe("CODE-123");
+    fake.receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        result: { device_id: "dev-9", token: "yia_x", scope: "control" },
+      }),
+    );
+    await expect(promise).resolves.toEqual({
+      device_id: "dev-9",
+      token: "yia_x",
+      scope: "control",
+    });
+  });
+
+  it("rejects with the JSON-RPC code when the relay refuses the code", async () => {
+    const fake = new FakeWebSocket("");
+    fake.send = (() => {}) as unknown as () => void;
+    const promise = defaultRedeem(
+      "wss://relay.test/ws?session=abc",
+      "BAD-0000",
+      "iPhone",
+      () => fake as unknown as WebSocket,
+    );
+    fake.open();
+    fake.receive(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }));
+    fake.receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        error: { code: -32001, message: "invalid or expired pairing code" },
+      }),
+    );
+    await expect(promise).rejects.toMatchObject({ code: -32001 });
+  });
+
+  it("rejects on the relay's id-less no-agent error instead of hanging", async () => {
+    const fake = new FakeWebSocket("");
+    fake.send = (() => {}) as unknown as () => void;
+    const promise = defaultRedeem(
+      "wss://relay.test/ws?session=abc",
+      "CODE-123",
+      "iPhone",
+      () => fake as unknown as WebSocket,
+    );
+    fake.open();
+    fake.receive(JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }));
+    // The relay sends this with no `id` when no computer is connected.
+    fake.receive(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "no computer connected for this session" },
+      }),
+    );
+    await expect(promise).rejects.toMatchObject({ code: -32000 });
+  });
+
+  it("uses the ?pair= query path for a direct app-server URL", () => {
+    let captured = "";
+    const fake = new FakeWebSocket("");
+    void defaultRedeem("ws://127.0.0.1:8790/ws", "CODE-123", "iPhone", (u) => {
+      captured = u;
+      return fake as unknown as WebSocket;
+    }).catch(() => {});
+    expect(new URL(captured).searchParams.get("pair")).toBe("CODE-123");
   });
 });

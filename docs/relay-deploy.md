@@ -3,10 +3,11 @@
 本文覆盖 Tier 1 的 iOS 远程控制：自建反向 WSS 中继的部署、电脑侧连接、iOS App
 构建与配对、故障排查与安全须知。
 
-> **状态：实验性（Tier 1）。** 协议、配对、多客户端 ws、撤销、审批广播、中继与
-> 两端桥接都已落地并通过各自的单测；但**跨中继的扫码配对链路尚未打通**，iOS 的
-> **首次配对界面也尚未实现**，且本机产不出 iOS 构建产物。见
-> [范围与已知限制](#六范围与已知限制)，不要按"开箱即用"理解本文。
+> **状态：实验性（Tier 1，配对端到端已打通）。** 协议、配对、多客户端 ws、撤销、
+> 审批广播、中继与两端桥接都已落地并通过各自的单测；配对码已**落盘**，桌面铸码 →
+> 手机输码兑换（含经中继的帧级 `pair/redeem`）→ 同屏控制这条链路（文本码）已可用。
+> 仍有：**无二维码扫描**（手输码），且本机产不出 iOS 构建产物。
+> 见 [范围与已知限制](#六范围与已知限制)，不要按"开箱即用"理解本文。
 
 ---
 
@@ -199,12 +200,15 @@ App 启动时由 `desktop/src/transportFactory.ts` 决定：若 `localStorage` �
 `saveRemoteConfig`（`desktop/src/lib/remoteConfig.ts`）写入，因此"有它 = 是远端
 客户端"。
 
-### 4.4 配对流程（协议已就绪，界面待建）
+### 4.4 配对流程（端到端已打通）
 
 配对协议本身已落地（`crates/yi-agent-app-server/src/ws.rs`）：
 
 1. **电脑/桌面**调 RPC `pair/create`（admin-only）→
-   `{"code":"XXXX-XXXX","expires_in":300}`，一次性、5 分钟过期。
+   `{"code":"XXXX-XXXX","expires_in":300}`，一次性、5 分钟过期。**码落盘**到
+   `~/.yi-agent/pairing.json`（epoch 秒过期），因此**同一台机器上的任意 app-server
+   进程**都能读到并兑现它——桌面 stdio 进程铸码、`--relay`/`ws://` 进程兑换这条
+   跨进程链路因此成立。
 2. **手机**连 `ws(s)://host/ws?pair=<code>&device_name=<name>`；
 3. 服务端回**一帧** Text：
 
@@ -223,22 +227,24 @@ App 启动时由 `desktop/src/transportFactory.ts` 决定：若 `localStorage` �
 把 token 放到 `?token=`（浏览器 WebSocket / iOS WKWebView 无法设置握手请求头，故
 只能用查询串形式；服务端也接受 `Authorization: Bearer <token>`）。
 
-> **两个必须知道的限制：**
+入口：**iOS 首启配对表单**（`desktop/src/components/PairingScreen.tsx`，填中继地址 +
+配对码 + 设备名）；**桌面设置「远程访问」页**（`SettingsRemoteTab.tsx`，铸码/列设备/
+撤销）；无 GUI 时用 CLI `yi-agent pair code | list | revoke <id>`。
+
+> **仍有的限制：**
 >
-> 1. **首次配对界面尚未实现。** `pairing.ts`/`remoteConfig.ts` 是接缝，但**调用它们
->    的那个屏幕还没建**。当前远端客户端若没有持久化配置会退回 `tauriTransport()`。
->    在此之前，需要手工把 `{url, token}` 写进 App 的
->    `localStorage["yi-agent.remote"]`，或等后续任务补齐配对界面。
-> 2. **经中继目前无法完成配对兑换。** 兑现发生在 app-server 的 ws **升级请求**上
->    （`?pair=<code>`），而中继只转发 ws **帧**、不改写升级查询串，其手机侧端点是
->    `/ws?session=<id>`（无 `pair`）。因此手机要拿 token，需要一次能直接到达
->    app-server `/ws` 的连接（例如 `ws://<电脑>:<port>/ws?pair=<code>`）。跨中继的
->    配对是后续工作，不在 Tier 1。
->
-> 另：`pair/create` 铸出的码**只存在该进程的内存里**（未持久化到 `devices.json`），
-> 而桌面 GUI 的 sidecar 是 `yi-agent app-server --listen stdio://`、`--relay` 模式是
-> **另一个进程**。要配对，须让**同一个** app-server 实例既铸码又接受兑现——两个进程
-> 不共享待兑现的码。
+> 1. **无二维码扫描。** 目前是**文本码**：桌面显示 `XXXX-XXXX`，手机手输（相机扫码留
+>    后续）。
+> 2. 跨进程**同时**铸码存在极小丢失窗口（读-改-写非跨进程加锁），重试即可。
+
+**经中继的兑换**（WAN 主路径）：中继只转发 ws **帧**、不改写升级查询串，所以手机的
+`?pair=<code>` 到不了本机 app-server。为此服务端提供**帧级** `pair/redeem`
+（`{code, device_name}` → `{device_id, token, scope}`，错误 `-32001`）：手机对中继开一条
+ws，`initialize` 后直接发这条 RPC，中继桥把它原样转发到本机 app-server，据此铸设备。
+`pair/redeem` **不在 admin 门禁内**——凭证就是那枚一次性码本身（只有桌面能铸）。
+前端 `defaultRedeem` 会按 URL 自动选择：中继 URL（带 `session`）走帧级
+`pair/redeem`，直连 app-server URL 走 `?pair=` 升级查询（因直连对无 token 连接
+先回 4401、帧发不进去）。
 
 ---
 
@@ -296,12 +302,17 @@ control < admin`，新设备默认 `control`，admin 类 RPC 返回 `-32014`）�
 审批广播 + `approvalResolved`；反向 WSS 中继；电脑侧 `--relay` 出站桥接；iOS target 与
 前端传输接缝。
 
-**尚未端到端打通（生产不可组合）：**
+**Tier 1.5 已打通端到端：** 配对码**落盘**到 `~/.yi-agent/pairing.json`（epoch 秒过期），
+故桌面 stdio 进程铸的码可被 `--relay`/`ws://` 进程兑换。**经中继的 WAN 路径**用**帧级**
+`pair/redeem`（中继只转发帧、不改写升级查询串，故手机对中继开 ws 后直接发这条 RPC，
+桥原样转发到本机 app-server）。附带：`yi-agent pair {code,list,revoke}` CLI、iOS 首启配对
+表单（`PairingScreen`）、桌面设置「远程访问」页。直连 app-server 时仍走 `?pair=` 升级
+查询（直连对无 token 连接先回 4401，帧发不进去），`defaultRedeem` 按 URL 自动选择。
 
-- **扫码配对**：配对码只存于**创建它的进程内存**，从不落盘；`pair/create` 由桌面
-  stdio 边车进程服务，而跨中继/跨进程的 `?pair=` 兑换发生在**另一个进程**（`--relay`/
-  `ws://`），二者 `PairingState` 不共享内存，故生产环境无法用桌面生成的码完成兑换。
-  单测通过是因为在**同一进程内** create + serve_ws（见 §4.4）。
+**仍不在 Tier 1.5（后续）：**
+
+- **二维码扫描**——目前是文本码手输（配对本身已可用，含经中继的帧级兑换）。
+- **可安装的 iOS 产物**（见 §4.2）——受 Xcode 运行时/签名阻塞。
 
 **不在 Tier 1（后续）：**
 
@@ -309,8 +320,6 @@ control < admin`，新设备默认 `control`，admin 类 RPC 返回 `-32014`）�
 - **端到端加密**——v1 只靠 TLS，中继能看到明文帧；v1.1 再叠 E2E。
 - **按 thread 订阅过滤**——目前所有客户端收同一份扇出。
 - **Android**——本期只做 iOS。
-- **iOS 首启配对界面**与**可安装的 iOS 产物**（见 §4.2、§4.4）。
-- **跨中继配对兑换**（见 §4.4）。
 
 ---
 

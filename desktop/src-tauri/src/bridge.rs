@@ -1,5 +1,6 @@
 use serde_json::Value;
 use std::sync::Mutex;
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
@@ -78,8 +79,76 @@ pub fn rpc_respond(
     )
 }
 
-/// Spawn the sidecar and forward its stdout frames as Tauri events.
+/// How long to wait before respawning a sidecar that exited, given how many
+/// times in a row it has already exited.
+///
+/// The first failure restarts promptly — one editor `save` can take the daemon
+/// down and the user should not notice. Repeated exits back off exponentially
+/// (capped) so a sidecar that cannot even start does not spin the CPU; the app
+/// keeps retrying forever because a transient cause (a still-closing socket, a
+/// temporary disk issue) resolves on its own and a permanent one should surface
+/// as a visible, retried error rather than a dead app.
+fn next_restart_delay(consecutive_restarts: u32) -> Duration {
+    const BASE_MS: u64 = 200;
+    const CAP_MS: u64 = 5_000;
+    let shift = consecutive_restarts.min(5); // 200ms * 2^5 = 6.4s, then cap
+    let ms = (BASE_MS << shift).min(CAP_MS);
+    Duration::from_millis(ms)
+}
+
+/// Spawn the sidecar, forward its stdout frames as Tauri events, and respawn it
+/// whenever it exits.
+///
+/// The desktop app is only useful while its sidecar is alive: without a live
+/// `yi-agent app-server` every RPC fails (the frontend surfaces `broken pipe`
+/// when writing to the dead process's stdin). So the sidecar is supervised here
+/// rather than spawned once — an unexpected exit is restarted with backoff and
+/// announced on `app-server://status` so the UI can reconnect.
 pub fn spawn(app: &AppHandle) -> Result<(), String> {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut consecutive_restarts: u32 = 0;
+        loop {
+            match spawn_once(&app) {
+                Ok(mut rx) => {
+                    // A successful launch resets the backoff: the previous exit
+                    // was a one-off, not a start-up loop.
+                    consecutive_restarts = 0;
+                    while let Some(event) = rx.recv().await {
+                        match event {
+                            CommandEvent::Stdout(bytes) => forward_stdout(&app, &bytes),
+                            CommandEvent::Stderr(bytes) => {
+                                eprintln!("[sidecar] {}", String::from_utf8_lossy(&bytes));
+                            }
+                            CommandEvent::Terminated(payload) => {
+                                let _ = app.emit(
+                                    "app-server://status",
+                                    serde_json::json!({"state":"exited","code":payload.code}),
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    // The event stream closed: the process is gone. Drop the
+                    // stale handle so `rpc` reports "sidecar not running" rather
+                    // than writing into a dead pipe while we restart.
+                    clear_child(&app);
+                    eprintln!("[sidecar] exited; restarting");
+                }
+                Err(e) => {
+                    eprintln!("[sidecar] spawn failed: {e}");
+                }
+            }
+            let delay = next_restart_delay(consecutive_restarts);
+            consecutive_restarts = consecutive_restarts.saturating_add(1);
+            tokio::time::sleep(delay).await;
+        }
+    });
+    Ok(())
+}
+
+/// Launch one `yi-agent app-server` and return its event stream.
+fn spawn_once(app: &AppHandle) -> Result<tauri::async_runtime::Receiver<CommandEvent>, String> {
     let mut cmd = app
         .shell()
         .sidecar("yi-agent")
@@ -95,7 +164,7 @@ pub fn spawn(app: &AppHandle) -> Result<(), String> {
         Err(e) => eprintln!("[sidecar] home_dir unavailable, using inherited cwd: {e}"),
     }
 
-    let (mut rx, child) = cmd
+    let (rx, child) = cmd
         .spawn()
         .map_err(|e| format!("sidecar spawn failed: {e}"))?;
 
@@ -105,25 +174,14 @@ pub fn spawn(app: &AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .replace(child);
 
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                CommandEvent::Stdout(bytes) => forward_stdout(&app, &bytes),
-                CommandEvent::Stderr(bytes) => {
-                    eprintln!("[sidecar] {}", String::from_utf8_lossy(&bytes));
-                }
-                CommandEvent::Terminated(payload) => {
-                    let _ = app.emit(
-                        "app-server://status",
-                        serde_json::json!({"state":"exited","code":payload.code}),
-                    );
-                }
-                _ => {}
-            }
-        }
-    });
-    Ok(())
+    Ok(rx)
+}
+
+/// Forget the current child handle (called once its event stream ended).
+fn clear_child(app: &AppHandle) {
+    if let Ok(mut guard) = app.state::<Sidecar>().child.lock() {
+        *guard = None;
+    }
 }
 
 fn forward_stdout(app: &AppHandle, bytes: &[u8]) {
@@ -176,5 +234,27 @@ mod tests {
     #[test]
     fn garbage_is_dropped() {
         assert_eq!(classify(&json!({"hello":"world"})), Frame::Garbage);
+    }
+
+    #[test]
+    fn first_restart_is_prompt() {
+        assert_eq!(next_restart_delay(0), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn repeated_restarts_back_off_exponentially() {
+        assert_eq!(next_restart_delay(1), Duration::from_millis(400));
+        assert_eq!(next_restart_delay(2), Duration::from_millis(800));
+        assert_eq!(next_restart_delay(3), Duration::from_millis(1600));
+    }
+
+    #[test]
+    fn restart_backoff_is_capped() {
+        // The doubling must stop well before it overflows a u64 shift and must
+        // never exceed the cap, so a sidecar stuck in a start-up loop cannot
+        // wedge the app with an absurd sleep.
+        assert_eq!(next_restart_delay(5), Duration::from_millis(5_000));
+        assert_eq!(next_restart_delay(50), Duration::from_millis(5_000));
+        assert_eq!(next_restart_delay(u32::MAX), Duration::from_millis(5_000));
     }
 }

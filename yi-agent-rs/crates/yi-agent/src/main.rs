@@ -21,7 +21,7 @@ use yi_agent_core::Provider;
 // 字面量构造仍然成立。
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
-use crate::config::{AgentAction, Cli, Command, DaemonAction, ScheduleAction};
+use crate::config::{AgentAction, Cli, Command, DaemonAction, PairAction, ScheduleAction};
 
 fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
     match message {
@@ -78,6 +78,7 @@ fn main() -> Result<()> {
             run_app_server(cli, &listen, relay.as_deref())
         }
         Some(Command::Completions { shell }) => print_completion(shell),
+        Some(Command::Pair { ref action }) => run_pair(action),
         None => run_agent(cli),
     }
 }
@@ -162,6 +163,61 @@ fn print_completion(shell: clap_complete::Shell) -> Result<()> {
     let mut command = <Cli as clap::CommandFactory>::command();
     clap_complete::generate(shell, &mut command, "yi-agent", &mut std::io::stdout());
     Ok(())
+}
+
+/// Pairing helpers, sharing the same `pairing.json` + `devices.json` as the
+/// app-server. A code minted here is redeemable by a `--relay`/`ws://`
+/// app-server on the same machine (both read the same files).
+fn run_pair(action: &PairAction) -> Result<()> {
+    use yi_agent_app_server::device_store::{DeviceStore, default_path as devices_path};
+    use yi_agent_app_server::pairing::PairingState;
+
+    let pairing = PairingState::new(DeviceStore::new(devices_path()));
+    match action {
+        PairAction::Code => {
+            let code = pairing.create_code();
+            println!("{}", format_pair_code(&code.code, code.expires_in));
+        }
+        PairAction::List => {
+            let devices = pairing.store().list();
+            print!("{}", format_device_list(&devices));
+        }
+        PairAction::Revoke { device_id } => {
+            let removed = pairing
+                .revoke(device_id)
+                .map_err(|e| anyhow::anyhow!("failed to revoke device: {e:?}"))?;
+            println!("{}", format_revoke_result(device_id, removed));
+        }
+    }
+    Ok(())
+}
+
+/// `ABCD-EFGH` + `(valid 300s)` — pure so it can be unit-tested.
+fn format_pair_code(code: &str, expires_in: u64) -> String {
+    format!("{code} (valid {expires_in}s)")
+}
+
+/// One device per line: `id  name  scope  created`. Pure for testing.
+fn format_device_list(devices: &[yi_agent_app_server::device_store::Device]) -> String {
+    if devices.is_empty() {
+        return "no paired devices\n".to_string();
+    }
+    let mut out = String::new();
+    for d in devices {
+        out.push_str(&format!(
+            "{}  {}  {:?}  {}\n",
+            d.id, d.name, d.scope, d.created_at
+        ));
+    }
+    out
+}
+
+fn format_revoke_result(device_id: &str, removed: bool) -> String {
+    if removed {
+        format!("revoked {device_id}")
+    } else {
+        format!("no such device: {device_id}")
+    }
 }
 
 /// Run the JSON-RPC 2.0 app-server over stdio for the desktop GUI sidecar, or
@@ -2233,6 +2289,68 @@ mod tests {
     #[test]
     fn relay_parts_requires_a_session() {
         assert!(relay_parts("wss://relay.example/connect").is_err());
+    }
+
+    #[test]
+    fn format_pair_code_includes_code_and_validity() {
+        assert_eq!(format_pair_code("ABCD-EFGH", 300), "ABCD-EFGH (valid 300s)");
+    }
+
+    #[test]
+    fn format_device_list_renders_rows_and_an_empty_notice() {
+        use yi_agent_app_server::device_store::Device;
+        use yi_agent_app_server::protocol::Scope;
+
+        assert_eq!(format_device_list(&[]), "no paired devices\n");
+
+        let devices = vec![Device {
+            id: "dev-1".into(),
+            name: "iPhone".into(),
+            scope: Scope::Control,
+            token_hash: "h".into(),
+            created_at: 42,
+            last_seen_at: 42,
+        }];
+        let rendered = format_device_list(&devices);
+        assert!(rendered.contains("dev-1"));
+        assert!(rendered.contains("iPhone"));
+        assert!(rendered.contains("Control"));
+    }
+
+    #[test]
+    fn format_revoke_result_distinguishes_hit_and_miss() {
+        assert_eq!(format_revoke_result("dev-1", true), "revoked dev-1");
+        assert_eq!(
+            format_revoke_result("dev-9", false),
+            "no such device: dev-9"
+        );
+    }
+
+    /// `pair <sub>` 子命令可被 clap 解析。
+    #[test]
+    fn pair_subcommand_parses_code_list_and_revoke() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["yi-agent", "pair", "code"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Pair {
+                action: PairAction::Code
+            })
+        ));
+        let cli = Cli::try_parse_from(["yi-agent", "pair", "list"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Pair {
+                action: PairAction::List
+            })
+        ));
+        let cli = Cli::try_parse_from(["yi-agent", "pair", "revoke", "dev-1"]).unwrap();
+        match cli.command {
+            Some(Command::Pair {
+                action: PairAction::Revoke { device_id },
+            }) => assert_eq!(device_id, "dev-1"),
+            other => panic!("expected pair revoke, got {other:?}"),
+        }
     }
 
     #[test]

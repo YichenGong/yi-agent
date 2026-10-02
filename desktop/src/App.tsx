@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { isRemoteClient } from "./lib/platform";
+import { isIos, isRemoteClient } from "./lib/platform";
 import { RpcClient } from "./lib/rpc";
+import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
@@ -50,6 +51,7 @@ import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
 import { applyTheme, parseTheme, readCachedTheme, type Theme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
+import { PairingScreen, needsPairing } from "./components/PairingScreen";
 
 /**
  * 看板失败的四种说法。
@@ -150,6 +152,10 @@ export default function App() {
   const boardTick = useRef<() => void>(() => {});
   /** 看板读取的序号，用来丢掉换项目后落地的过期响应。 */
   const boardSeq = useRef(0);
+  // iOS 首启：没有远端配置时先配对。版本号是「让 transport 重算」的触发器——
+  // 配对落盘后加一，下面那个 effect 才第一次真正建客户端（此前被
+  // `needsPairing` 挡住），这一次读到的是 ws 配置。
+  const [pairingVersion, setPairingVersion] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // 首屏先用缓存渲染，连上后以 ui/settings/read 的权威值为准。
   const [theme, setTheme] = useState<Theme>(() => readCachedTheme() ?? "dark");
@@ -627,77 +633,117 @@ export default function App() {
   };
 
   useEffect(() => {
+    // iOS 首启还没配对：这一步不能建客户端。`transportFactory` 此时只可能落到
+    // `tauriTransport()`，而 iOS 上根本没有 Tauri IPC——那正是要避开的死路。
+    // 配对把配置落盘并 bump 版本号后本 effect 重跑，这一次才真的去连 ws。
+    if (needsPairing(isIos())) return;
     if (inited.current) return; // guard against React StrictMode double-invoke
     inited.current = true;
-    const client = new RpcClient(transportFactory());
-    clientRef.current = client;
-    client.onNotification((n) => {
-      // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
-      if (n.method === "agent/children/updated") {
-        railStore.applyNotification(n.params.threadId, n.params.children);
+    let disposed = false;
+    let restartTimer: number | null = null;
+
+    // 注册每个客户端的通知/审批/状态回调。sidecar 重启后会换一个新客户端,
+    // 这些回调必须随新客户端重新登记(旧客户端的 transport 已随管道断开)。
+    const wireClient = (client: RpcClient) => {
+      client.onNotification((n) => {
+        // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
+        if (n.method === "agent/children/updated") {
+          railStore.applyNotification(n.params.threadId, n.params.children);
+          force((v) => v + 1);
+          return;
+        }
+        if (n.method === "ui/settings/updated") {
+          // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
+          // 的首屏 read 用旧值把它覆盖回去。
+          themeTouchedRef.current = true;
+          setTheme(parseTheme(n.params.theme));
+          return;
+        }
+        if (n.method === "agent/trace/event") {
+          // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
+          // 把两个任务的轨迹拼在一起安全。
+          setTraceRows((prev) =>
+            n.params.taskId === openTaskId.current ? [...prev, n.params.row] : prev,
+          );
+          return;
+        }
+        // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
+        store.applyNotification(n);
         force((v) => v + 1);
-        return;
+        if (n.method === "turn/completed") void refreshThreads();
+      });
+      client.onApproval((r) => {
+        store.setApproval(r);
+        force((v) => v + 1);
+      });
+      client.onStatus((s) => {
+        setStatus(s.state);
+        // sidecar 退出后宿主会自动重启它(bridge 的监管循环)。重连不能依赖用户
+        // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
+        // warm 缓存,免得切回旧对话时跳过 resume(新进程并不记得任何会话)。
+        if (s.state === "exited" && !disposed) {
+          warm.current.clear();
+          if (restartTimer === null) {
+            restartTimer = window.setTimeout(() => {
+              restartTimer = null;
+              if (disposed) return;
+              const next = connect();
+              void handshake(next);
+            }, 500);
+          }
+        }
+      });
+    };
+
+    // 一次完整握手:任何一次重连都要重放它,因为新进程的记忆是空的。
+    const handshake = async (client: RpcClient) => {
+      try {
+        await client.request("initialize", {});
+        const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
+        // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
+        // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
+        if (!themeTouchedRef.current) setTheme(parseTheme(settings.theme));
+        await refreshWorkspaces();
+        const list = await client.request<{
+          groups: WorkspaceGroup[];
+          pinned?: ThreadSummary[];
+        }>("thread/listAll", {});
+        setGroups(list.groups);
+        setPinned(list.pinned ?? []);
+        store.seed(list.groups.flatMap((g) => g.threads));
+        // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
+        const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
+        if (first) await selectThread(first.thread_id);
+        // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
+        setStatus("connected");
+        // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
+        // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
+        // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
+        await refreshBoards();
+      } catch (e) {
+        const msg = formatError(e);
+        setCurrentError(msg);
+        setStatus(`error: ${msg}`);
       }
-      if (n.method === "ui/settings/updated") {
-        // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
-        // 的首屏 read 用旧值把它覆盖回去。
-        themeTouchedRef.current = true;
-        setTheme(parseTheme(n.params.theme));
-        return;
-      }
-      if (n.method === "agent/trace/event") {
-        // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
-        // 把两个任务的轨迹拼在一起安全。
-        setTraceRows((prev) =>
-          n.params.taskId === openTaskId.current ? [...prev, n.params.row] : prev,
-        );
-        return;
-      }
-      // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
-      store.applyNotification(n);
-      force((v) => v + 1);
-      if (n.method === "turn/completed") void refreshThreads();
-    });
-    client.onApproval((r) => {
-      store.setApproval(r);
-      force((v) => v + 1);
-    });
-    client.onStatus((s) => setStatus(s.state));
-    (async () => {
-      await client.request("initialize", {});
-      const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
-      // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
-      // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
-      if (!themeTouchedRef.current) setTheme(parseTheme(settings.theme));
-      await refreshWorkspaces();
-      const list = await client.request<{ groups: WorkspaceGroup[]; pinned?: ThreadSummary[] }>(
-        "thread/listAll",
-        {},
-      );
-      setGroups(list.groups);
-      setPinned(list.pinned ?? []);
-      store.seed(list.groups.flatMap((g) => g.threads));
-      // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
-      const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
-      if (first) {
-        await selectThread(first.thread_id);
-      }
-      // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
-      setStatus("connected");
-      // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
-      // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
-      // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
-      await refreshBoards();
-    })().catch((e) => {
-      const msg = formatError(e);
-      setCurrentError(msg);
-      setStatus(`error: ${msg}`);
-    });
+    };
+
+    const connect = (): RpcClient => {
+      const client = new RpcClient(transportFactory());
+      clientRef.current = client;
+      wireClient(client);
+      return client;
+    };
+
+    void handshake(connect());
     // 看板内容由 boardTick 每 2 秒刷新选中项目，读失败绝不影响主流程。
     const boardTimer = window.setInterval(() => boardTick.current(), 2000);
-    return () => window.clearInterval(boardTimer);
+    return () => {
+      disposed = true;
+      if (restartTimer !== null) window.clearTimeout(restartTimer);
+      window.clearInterval(boardTimer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [pairingVersion]);
 
   /**
    * Run a slash command. Commands never reach the agent: their output is a
@@ -858,6 +904,21 @@ export default function App() {
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  // 首启的 iOS 没有远端配置时先配对：此时 transportFactory 会退回
+  // tauriTransport()，而 iOS 上根本没有 Tauri IPC——继续往下渲染就是死路。
+  // 桌面永远不会进这个分支（isIos 为 false）。
+  if (needsPairing(isIos())) {
+    return (
+      <PairingScreen
+        // PairingScreen 保证这个回调发生在 saveRemoteConfig 之后，所以此刻
+        // 存储里已经有 {url, token}；版本号让上面的 effect 重跑，这一次
+        // transportFactory 选中的是 ws。
+        onPaired={() => setPairingVersion((v) => v + 1)}
+        redeem={defaultRedeem}
+      />
+    );
+  }
 
   return (
     <>
@@ -1027,6 +1088,11 @@ export default function App() {
         theme={theme}
         onThemeChange={changeTheme}
         onClose={() => setSettingsOpen(false)}
+        // 远程访问 Tab 走**当前 transport**（桌面 stdio = Admin），所以能调
+        // pair/create、device/revoke；网络客户端会拿到 -32014，Tab 会提示权限。
+        remoteCall={(method, params) =>
+          (clientRef.current as RpcClient).request(method, params)
+        }
       />
     </>
   );

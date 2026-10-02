@@ -102,6 +102,11 @@ impl RpcError {
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::new(-32603, msg)
     }
+    /// 一次性配对码无效(不存在/已用/已过期),用于帧级 `pair/redeem`。与「无
+    /// token」的说法一致,不泄露码是否存在。
+    pub fn invalid_pairing_code() -> Self {
+        Self::new(-32001, "invalid or expired pairing code")
+    }
     pub fn not_initialized() -> Self {
         Self::new(-32010, "server not initialized")
     }

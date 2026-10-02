@@ -773,6 +773,62 @@ mod tests {
         handle.abort();
     }
 
+    /// Tier 1.5 关键证明(跨进程拓扑):桌面 stdio 进程铸码,`--relay`/`ws://`
+    /// 进程兑换——两个进程、两个 `PairingState` 实例,只共享 `devices.json` 与
+    /// `pairing.json`。这里让 ws server 的 `PairingState` 与"桌面"的实例使用**同一
+    /// 组文件**,但实例不同:桌面实例铸码,ws 侧必须能兑换。
+    ///
+    /// 回归:码未落盘时(仅进程内 `HashMap`),ws 侧读不到该码,兑换恒 4401。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pair_code_minted_by_another_instance_redeems_over_the_ws() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let devices = dir.path().join("devices.json");
+
+        // "桌面 stdio 进程":自己的 PairingState 实例,铸码。
+        let desktop = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            devices.clone(),
+        )));
+        let code = desktop.create_code();
+
+        // "relay/ws 进程":另一个实例,同一组文件。
+        let workspaces = Arc::new(WorkspaceIndex::new(dir.path().join("workspaces.json")));
+        let mut cfg = crate::server::tests_support::test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        // 这个进程的 PairingState 与桌面实例共享同一组文件,但实例不同。
+        // 本测试只走 `?pair=`,不需要本机凭据。
+        let relay = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+            devices.clone(),
+        )));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(serve_ws(listener, cfg, workspaces, Arc::clone(&relay)));
+
+        // 手机用桌面铸出的码连接 ws 兑换,必须成功拿到 token。
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/ws?pair={}&device_name=iPhone%2015",
+            code.code
+        ))
+        .await
+        .expect("pairing ws connect");
+        let v = recv_json(&mut ws).await;
+        assert_eq!(
+            v["method"], "pair/redeemed",
+            "a code from another process must redeem over the ws: {v}"
+        );
+        let token = v["params"]["token"].as_str().expect("token").to_string();
+        assert_closed_after_delivery(&mut ws).await;
+
+        // token 落在共享设备表上:两个实例都能认证。
+        assert!(relay.authenticate(&token).is_some());
+        assert!(
+            desktop.authenticate(&token).is_some(),
+            "the minting process must also authenticate the token"
+        );
+        let mut authed = connect_authed(addr, &token).await;
+        initialize(&mut authed).await;
+        handle.abort();
+    }
+
     /// 断言一条已送出兑现 token 的连接会被服务端以 4403 关闭(或直接 EOF)。
     async fn assert_closed_after_delivery<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>)
     where

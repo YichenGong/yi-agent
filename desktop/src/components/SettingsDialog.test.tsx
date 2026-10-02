@@ -51,4 +51,23 @@ describe("SettingsDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "关闭设置" }));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
+
+  it("starts on the 通用 tab", () => {
+    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+    expect(screen.getByRole("tab", { name: "通用" }).getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("tab", { name: "远程访问" }).getAttribute("aria-selected")).toBe("false");
+  });
+
+  it("switches to the 远程访问 tab and shows its panel", () => {
+    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+
+    const tab = screen.getByRole("tab", { name: "远程访问" });
+    fireEvent.click(tab);
+
+    expect(tab.getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("button", { name: "生成配对码" })).toBeTruthy();
+    expect(screen.getByLabelText("中继地址")).toBeTruthy();
+    // 面板互斥：离开「通用」后它的主题按钮不再渲染。
+    expect(screen.queryByRole("button", { name: "深色" })).toBeNull();
+  });
 });
