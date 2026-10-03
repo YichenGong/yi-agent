@@ -2713,6 +2713,17 @@ where
                         // 末尾若是崩溃残留的未收尾 turn，补一条 interrupted 标记，
                         // 让客户端把它显示为"这一轮被中断"，而不是当成正常轮次。
                         if loaded.pending_turn {
+                            // 采纳的 partial 必须在这一刻**升格**进主 jsonl：它是这一轮
+                            // 唯一的持久副本，若不 append 就返回，用户下一条消息的 turn-start
+                            // checkpoint 会原子覆盖同一文件，该轮 items 就此永久丢失（而
+                            // session 上下文仍"记得"它们，item 与上下文就此不一致）。
+                            // 失败只记 stderr：恢复出不完整好过让整个 resume 报错；
+                            // 判据与 load 共用，重复调用不会重复 append。
+                            if let Err(e) = thread_store.promote_partial(&thread_id) {
+                                eprintln!(
+                                    "[app-server] failed to promote recovered turn ({thread_id}): {e}"
+                                );
+                            }
                             write_notification(
                                 &hub,
                                 &Notification::TurnCompleted {
@@ -10160,6 +10171,155 @@ pub(crate) mod tests {
         }
         assert!(saw_half, "the crashed turn's finished items must be replayed");
         assert!(interrupted, "a crashed partial turn must be flagged interrupted");
+        h.shutdown().await;
+    }
+
+    /// C1 回归：resume 采纳的崩溃轮必须被**升格**（append）进主 jsonl。否则该 partial
+    /// 是这一轮唯一的持久副本，用户下一条消息的 turn-start checkpoint 会原子覆盖它，
+    /// 崩溃轮的 items 永久丢失——而 session 上下文仍"记得"它们，造成 item/上下文不一致。
+    ///
+    /// 走完整链路：崩溃（一轮 jsonl + 一段 partial）→ resume（回放 + interrupted，
+    /// 且必须已升格）→ 第二个 turn 正常收尾 → store 冷 load：崩溃轮 items 仍在、
+    /// 只一份、不重复。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        let tid = "thread-promote";
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: dir.path().to_string_lossy().to_string(),
+                model: "m".into(),
+                created_at: 1,
+                updated_at: 1,
+                title: None,
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+            })
+            .unwrap();
+        // 一轮正常收尾过的历史。
+        store
+            .append_turn(
+                tid,
+                &crate::thread_store::TurnLine::Turn {
+                    items: vec![crate::protocol::Item::UserMessage {
+                        id: "user-t1".into(),
+                        text: "first".into(),
+                    }],
+                    usage: None,
+                    messages: vec![],
+                },
+            )
+            .unwrap();
+        // 崩溃残留：这一轮只有 partial，jsonl 里没有它的首 item id。
+        store
+            .write_partial(
+                tid,
+                &crate::thread_store::PartialTurn {
+                    turn_id: "turn-t2".into(),
+                    items: vec![
+                        crate::protocol::Item::UserMessage {
+                            id: "user-turn-t2".into(),
+                            text: "second".into(),
+                        },
+                        crate::protocol::Item::AgentMessage {
+                            id: "item-turn-t2-1".into(),
+                            text: "half".into(),
+                        },
+                    ],
+                    messages: vec![],
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        initialize(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        // resume 必须回放崩溃轮的 items 并标注 interrupted，随后响应。
+        let mut saw_half = false;
+        let mut interrupted = false;
+        let mut resumed = false;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
+                && v["params"]["item"]["text"] == "half"
+            {
+                saw_half = true;
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed")
+                && v["params"]["status"] == "interrupted"
+            {
+                interrupted = true;
+            }
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                resumed = true;
+                break;
+            }
+        }
+        assert!(saw_half, "the crashed turn's finished items must be replayed");
+        assert!(interrupted, "a crashed partial turn must be flagged interrupted");
+        assert!(resumed, "resume must respond");
+
+        // 第二个 turn：正常走完。它的 turn-start checkpoint 会覆盖盘上的 partial
+        // 文件——若 resume 没有先升格，这一步就是崩溃轮数据的丢失点。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"third"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                assert_eq!(v["params"]["status"], "completed", "second turn: {v}");
+                break;
+            }
+        }
+
+        // 落盘是尽力而为且发生在 driver 收尾之后（见既有持久化测试），故轮询等待。
+        let log = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.jsonl"));
+        let mut text = String::new();
+        for _ in 0..100 {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("item-turn-t2-1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            text.contains("item-turn-t2-1") && text.contains("half"),
+            "the recovered crashed turn must survive a later turn on disk; \
+             log now contains {} turn(s): {text}",
+            text.lines().filter(|l| !l.trim().is_empty()).count()
+        );
+
+        // 冷 load：崩溃轮的内容仍在，且只一份。
+        let loaded = store.load(tid).unwrap().unwrap();
+        let ids: Vec<String> = loaded
+            .items
+            .iter()
+            .map(|i| crate::server::item_id(i).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            &ids[..3],
+            &["user-t1", "user-turn-t2", "item-turn-t2-1"],
+            "the crashed turn must be first and intact: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|i| *i == "item-turn-t2-1").count(),
+            1,
+            "the crashed turn must not be double-counted: {ids:?}"
+        );
+        assert!(!loaded.pending_turn, "promotion must clear the pending flag");
         h.shutdown().await;
     }
 

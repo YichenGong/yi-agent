@@ -140,20 +140,13 @@ impl ThreadStore {
         f.write_all(line.as_bytes())
     }
 
-    pub fn load(&self, id: &str) -> io::Result<Option<LoadedThread>> {
-        if !valid_id(id) {
-            return Err(invalid_id(id));
-        }
-        let log = self.log_path(id);
-        let meta_path = self.meta_path(id);
-        if !log.exists() && !meta_path.exists() {
-            return Ok(None);
-        }
-
+    /// 读并拼接主 jsonl：返回 `(items, 最近一条 messages, 最近一条 usage)`。
+    /// 文件缺失视为空；损坏行跳过并记 stderr（绝不因此报错）。
+    fn read_log(&self, id: &str) -> (Vec<Item>, Vec<Message>, Option<TurnUsage>) {
         let mut items: Vec<Item> = Vec::new();
         let mut messages: Vec<Message> = Vec::new();
         let mut usage: Option<TurnUsage> = None;
-        match std::fs::read_to_string(&log) {
+        match std::fs::read_to_string(self.log_path(id)) {
             Ok(text) => {
                 for line in text.lines() {
                     if line.trim().is_empty() {
@@ -182,6 +175,40 @@ impl ThreadStore {
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => eprintln!("[app-server] failed to read thread log ({id}): {e}"),
         }
+        (items, messages, usage)
+    }
+
+    /// 已落盘 jsonl 的 items 里是否已含某 item id。`None` 视为不匹配。
+    fn log_contains_item_id(items: &[Item], first: Option<&str>) -> bool {
+        match first {
+            Some(first) => items
+                .iter()
+                .any(|it| crate::server::item_id(it) == Some(first)),
+            None => false,
+        }
+    }
+
+    /// 该 partial 是否"已被收尾"：取 partial 的**首个 item id** 与已落盘 items 比对。
+    /// `true` = 该轮已成功 append 进主 jsonl（只是 delete partial 失败）。
+    ///
+    /// 这是 `load` 与 `promote_partial` **共用**的唯一判据：传给本函数的 `log_items`
+    /// 必须是主 jsonl（不含 partial 合流）的 items，两个调用点才一致。
+    fn partial_is_committed(partial: &PartialTurn, log_items: &[Item]) -> bool {
+        let first = partial.items.first().and_then(crate::server::item_id);
+        Self::log_contains_item_id(log_items, first)
+    }
+
+    pub fn load(&self, id: &str) -> io::Result<Option<LoadedThread>> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let log = self.log_path(id);
+        let meta_path = self.meta_path(id);
+        if !log.exists() && !meta_path.exists() {
+            return Ok(None);
+        }
+
+        let (mut items, mut messages, mut usage) = self.read_log(id);
 
         let meta = std::fs::read_to_string(&meta_path)
             .ok()
@@ -193,12 +220,7 @@ impl ThreadStore {
         // 全局唯一，足以判断"这轮是否已 append"。
         let mut pending_turn = false;
         if let Some(partial) = self.read_partial(id) {
-            let committed = partial
-                .items
-                .first()
-                .and_then(crate::server::item_id)
-                .is_some_and(|first| items.iter().any(|it| crate::server::item_id(it) == Some(first)));
-            if !committed {
+            if !Self::partial_is_committed(&partial, &items) {
                 for item in partial.items {
                     // 防御性去重：正常不与已落盘 items 重叠。
                     if !items
@@ -399,6 +421,49 @@ impl ThreadStore {
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    /// 把"崩溃残留、尚未收尾"的 partial **升格**为权威日志的一条 turn，并清掉
+    /// partial。`thread/resume` 采纳 partial 后必须调用它：否则该 partial 是这一轮
+    /// 唯一的持久副本，用户下一条消息的 turn-start checkpoint 会**整体原子覆盖**
+    /// 同一文件，该轮的 items 就此永久丢失（而 session 上下文仍"记得"它们，
+    /// 造成 item 与上下文不一致）。
+    ///
+    /// 返回 `Ok(true)` = 确实 append 了一轮（调用方恢复了真实内容）；
+    /// `Ok(false)` = 无需 append：partial 不存在，或该轮已收尾（首个 item id 已在
+    /// 主 jsonl 里）、或 partial 为空/损坏无法采纳。
+    ///
+    /// 判据与 `load` 共用 [`Self::partial_is_committed`]，故 promote 与 load 对
+    /// "这轮是否已收尾"永远一致：已收尾只清 partial，绝不重复 append。清 partial
+    /// 失败只记 stderr——重复调用时判据会再次命中"已收尾"而幂等跳过 append。
+    /// 写入格式仍是既有 `TurnLine::Turn`，不改 `.jsonl` 结构、不碰 `.meta.json`。
+    pub fn promote_partial(&self, id: &str) -> io::Result<bool> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let Some(partial) = self.read_partial(id) else {
+            return Ok(false);
+        };
+        // 空 items（无 id）足以判定"未收尾"，但采纳它没有意义，只清残留。
+        if partial.items.is_empty() {
+            self.clear_partial(id)?;
+            return Ok(false);
+        }
+        let (log_items, _, _) = self.read_log(id);
+        if Self::partial_is_committed(&partial, &log_items) {
+            self.clear_partial(id)?;
+            return Ok(false);
+        }
+        self.append_turn(
+            id,
+            &TurnLine::Turn {
+                items: partial.items,
+                usage: partial.usage,
+                messages: partial.messages,
+            },
+        )?;
+        self.clear_partial(id)?;
+        Ok(true)
     }
 
     /// 读 checkpoint；缺失或损坏返回 `None`（损坏记 stderr，绝不向上报错）。
@@ -1303,6 +1368,115 @@ mod tests {
         let loaded = store.load("thread-a").unwrap().unwrap();
         assert_eq!(loaded.items.len(), 1, "must not duplicate the committed turn");
         assert!(!loaded.pending_turn);
+    }
+
+    #[test]
+    fn promote_partial_appends_the_recovered_turn_and_clears_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-a")).unwrap();
+        store
+            .append_turn(
+                "thread-a",
+                &TurnLine::Turn {
+                    items: vec![user_item("user-t1", "first")],
+                    usage: None,
+                    messages: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .write_partial(
+                "thread-a",
+                &PartialTurn {
+                    turn_id: "turn-t2".into(),
+                    items: vec![
+                        user_item("user-turn-t2", "second"),
+                        crate::protocol::Item::AgentMessage {
+                            id: "item-turn-t2-1".into(),
+                            text: "half".into(),
+                        },
+                    ],
+                    messages: vec![yi_agent_core::Message::user("carried")],
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        // 采纳：追加成主 jsonl 的一轮，并清掉 partial。
+        assert!(store.promote_partial("thread-a").unwrap());
+        assert!(!dir
+            .path()
+            .join(".yi-agent/threads/thread-a.partial.json")
+            .exists());
+
+        // 冷 load：崩溃轮的内容在、只一份、上下文仍是崩溃轮的。
+        let loaded = store.load("thread-a").unwrap().unwrap();
+        let ids: Vec<String> = loaded
+            .items
+            .iter()
+            .map(|i| crate::server::item_id(i).unwrap().to_string())
+            .collect();
+        assert_eq!(ids, vec!["user-t1", "user-turn-t2", "item-turn-t2-1"]);
+        assert!(!loaded.pending_turn);
+        assert_eq!(loaded.messages, vec![yi_agent_core::Message::user("carried")]);
+
+        // 幂等：partial 已清，再 promote 是 no-op，绝不重复 append。
+        assert!(!store.promote_partial("thread-a").unwrap());
+        assert_eq!(
+            store.load("thread-a").unwrap().unwrap().items.len(),
+            3,
+            "must not double-append"
+        );
+    }
+
+    #[test]
+    fn promote_partial_clears_without_appending_when_already_committed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-a")).unwrap();
+        // 收尾成功（提问已进 jsonl），但 delete partial 失败。
+        store
+            .append_turn(
+                "thread-a",
+                &TurnLine::Turn {
+                    items: vec![user_item("user-turn-t2", "second")],
+                    usage: None,
+                    messages: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .write_partial(
+                "thread-a",
+                &PartialTurn {
+                    turn_id: "turn-t2".into(),
+                    items: vec![user_item("user-turn-t2", "second")],
+                    messages: vec![],
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        // 判据与 load 一致：首 item id 已在 jsonl ⇒ 不重复 append，只清残留。
+        assert!(!store.promote_partial("thread-a").unwrap());
+        assert!(!dir
+            .path()
+            .join(".yi-agent/threads/thread-a.partial.json")
+            .exists());
+        assert_eq!(
+            store.load("thread-a").unwrap().unwrap().items.len(),
+            1,
+            "must not duplicate the committed turn"
+        );
+    }
+
+    #[test]
+    fn promote_partial_without_a_partial_is_a_noop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-a")).unwrap();
+        assert!(!store.promote_partial("thread-a").unwrap());
     }
 
     #[test]

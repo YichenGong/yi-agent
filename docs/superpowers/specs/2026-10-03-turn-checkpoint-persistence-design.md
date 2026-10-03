@@ -91,6 +91,18 @@ driver 侧：
    - 采纳 partial 的 `messages` 作为续聊上下文、`usage` 作为用量；
    - `LoadedThread` 增加一个标志（如 `pending_turn: bool`）告知调用方"最后一段是崩溃残留"。
 
+**升格（promotion）**：`thread/resume` 在 `pending_turn` 为真、回放这段残轮之后，**必须**
+调 `ThreadStore::promote_partial` 把它升格为权威日志的一轮：以 `TurnLine::Turn { items,
+usage, messages }` append 进主 jsonl（复用 `append_turn`，`.jsonl` 格式与 `.meta.json`
+均不变），随后 `clear_partial` 删除 partial。判据（`partial_is_committed`）与第 2 步
+**共用**：首个 item id 已在 jsonl ⇒ 视为已收尾，只清 partial、不重复 append（因此重复
+调用幂等）；partial 缺失/为空/损坏 ⇒ no-op。升格失败只记 stderr，**不阻断 resume**。
+
+不升格的后果：采纳的 partial 是这一轮**唯一**的持久副本，用户下一条消息的 turn-start
+checkpoint 会**整体原子覆盖**同一文件（`write_partial` → `write_atomic`），该轮 items
+永久丢失——而 session 上下文仍"记得"它们，item 与上下文就此不一致。升格把这一轮在
+partial 被覆盖之前钉进权威日志，重复 load 也不会重复计数。
+
 **中断标记的落地机制**：`resume` 在回放完 items 之后，若 `pending_turn` 为真，额外发一条
 `turn/completed{status: Interrupted}`（复用现有 `Notification`，客户端 `Session.apply` 已在
 `threadStore`/`session.ts` 处理该通知，会把它显示为"这一轮被中断"）。不用新造 Item 类型，
@@ -122,6 +134,8 @@ partial 必须在以下路径一并处理，否则会残留/复活：
 - 写入 partial 后 load：items = jsonl items + partial items，上下文取 partial messages。
 - turn 收尾后 partial 被删：load 只回 jsonl，语义与今天逐字节一致。
 - partial 的 turn 已落盘（收尾成功、delete 失败）：load 忽略 partial，不重复 items。
+- `promote_partial`：未收尾的 partial 被 append 成主 jsonl 的一轮并清掉；已收尾的只清
+  partial、不重复 append（幂等）；缺失/为空 no-op。
 - 损坏的 partial：load 退回 jsonl 内容，不报错。
 - `delete` / `truncate` 对 partial 的处理。
 
