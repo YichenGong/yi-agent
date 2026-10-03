@@ -78,6 +78,10 @@ struct RuntimeTooling {
     permission: Arc<yi_agent_core::permission::PermissionChecker>,
     /// 这一份注册表对应的 manager(与 registry 同源)。
     process_manager: Arc<yi_agent_tools::ProcessManager>,
+    /// The live caller transcript shared with this registry's delegation tools.
+    /// `build_runtime_tooling` hands a clone to the tools and keeps this one, so
+    /// binding it here (see [`wrap_for_delegation`]) is visible to those tools.
+    caller: yi_agent_subagent::CallerContext,
 }
 
 /// 每 cwd 的已 attach runtime。app-server 是长驻多 cwd 进程,而 runtime 是按项目
@@ -798,6 +802,10 @@ fn build_runtime_tooling(
     .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
     let process_manager = Arc::clone(&setup.process_manager);
+    // One caller handle, shared with the delegation tools: the host binds it to
+    // the thread's live session right after building the Agent, and the tools
+    // re-read that session on every call.
+    let caller = yi_agent_subagent::CallerContext::unbound();
     // The conversation marker is bound here, not inferred later: the model that
     // calls `spawn_agent` never sees a thread id, so each thread's tools carry
     // their own so every child they spawn is tagged with this conversation.
@@ -806,6 +814,7 @@ fn build_runtime_tooling(
         Arc::clone(root),
         controller,
         Some(thread_id.to_string()),
+        caller.clone(),
     );
     let permission =
         yi_agent_runtime::bootstrap::load_permission_checker_with_switch(&workspace_root, yolo)
@@ -815,6 +824,7 @@ fn build_runtime_tooling(
         registry: Arc::new(registry),
         permission,
         process_manager,
+        caller,
     })
 }
 
@@ -870,15 +880,20 @@ fn rebuild_thread_agent_with_theme(
     let config = agent.config().clone();
     let permission = agent.permission_checker();
     let decision = agent.decision_rx();
+    // Reuse the original session `Arc`, not a deep clone: a `CallerContext`
+    // bound to this thread's live conversation must keep seeing the same
+    // session across the rebuild.
+    let session_handle = agent.session_handle();
     let registry = registry_with_theme_tool(&tools, theme);
     let mut rebuilt =
         yi_agent_core::Agent::new(provider.clone(), Arc::new(registry), config.clone())
-            .with_session(agent.session());
+            .with_session_arc(session_handle);
     if let (Some(checker), Some(rx)) = (permission, decision) {
         rebuilt = rebuilt.with_permission(checker, rx);
     }
+    apply_session(&mut rebuilt, session);
     BuiltAgent {
-        agent: apply_session(rebuilt, session),
+        agent: rebuilt,
         provider,
         config,
         decision_tx,
@@ -901,13 +916,20 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
         yolo,
         ..
     } = built;
-    let session = agent.session();
+    // Reuse the live session `Arc` so the delegation tools' `CallerContext`,
+    // bound just below, survives the rebuild and keeps reading the thread's
+    // current transcript rather than a snapshot taken here.
+    let session_handle = agent.session_handle();
     let mut rebuilt =
         yi_agent_core::Agent::new(provider.clone(), tooling.registry.clone(), config.clone())
-            .with_session(session);
+            .with_session_arc(session_handle.clone());
     if let Some(rx) = decision_rx.clone() {
         rebuilt = rebuilt.with_permission(tooling.permission.clone(), rx);
     }
+    // Bind the caller to the rebuilt agent's *live* session handle. `tooling`'s
+    // `caller` and the registry's tool instances share one inner slot, so this
+    // bind is what makes `fork: true` read this conversation.
+    tooling.caller.bind(session_handle);
     BuiltAgent {
         agent: rebuilt,
         provider,
@@ -3579,13 +3601,22 @@ where
 }
 
 /// 恢复会话:`Some` 时用载入的历史覆盖 agent 的 session,`None` 时保持新建的空 session。
-fn apply_session(
-    agent: yi_agent_core::Agent,
-    session: Option<yi_agent_core::Session>,
-) -> yi_agent_core::Agent {
-    match session {
-        Some(s) => agent.with_session(s),
-        None => agent,
+///
+/// 用 `set_session_messages` 就地替换内容而不是 `with_session` 换成新 `Arc`:会话
+/// 句柄可能已被委派工具的 `CallerContext` 绑定(见 [`wrap_for_delegation`]),
+/// 换 `Arc` 会让那枚句柄指向被丢弃的旧会话,`fork` 便再也看不到这位调用者的记录。
+fn apply_session(agent: &mut yi_agent_core::Agent, session: Option<yi_agent_core::Session>) {
+    if let Some(s) = session {
+        agent.set_session_messages(s.messages().to_vec());
+        // `set_session_messages` 只搬运消息,若不在此补写,resume 载入的
+        // `last_input_tokens` 会在live 句柄上归零,使上面的注释承诺的
+        // 「resume 后首轮 auto-compact 即生效」落空(`maybe_auto_compact`
+        // 读到 `None` 直接短路)。句柄仍是同一个 Arc,只是补一个字段。
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .set_last_input_tokens(s.last_input_tokens());
     }
 }
 
@@ -3970,8 +4001,10 @@ async fn persist_and_finish_turn(
 
 /// 在**没有 turn 在跑**的时刻执行一条会话命令，返回（可能被重建过的）agent。
 ///
-/// 按值传入/返回是刻意的：`Agent::with_session` 消费 self，而 `Agent` 既不是
-/// `Clone` 也没有便宜的占位值，所以无法用 `&mut Agent` 调用它。
+/// 清空与压缩都**就地**替换会话内容(`set_session_messages`),不换 `Arc`:同一
+/// 会话句柄可能已被委派工具的 `CallerContext` 绑定,换句柄会让 `fork` 读到被丢弃
+/// 的旧记录。按值传入/返回保留原样——将来若某个命令确实需要换掉 `Agent` 本体,
+/// 这条签名就不必再改。
 #[allow(clippy::too_many_arguments)]
 async fn apply_session_command(
     mut agent: yi_agent_core::Agent,
@@ -3986,7 +4019,16 @@ async fn apply_session_command(
 ) -> yi_agent_core::Agent {
     match command {
         SessionCommand::Clear { reply } => {
-            agent = agent.with_session(yi_agent_core::Session::new());
+            agent.set_session_messages(Vec::new());
+            // `set_session_messages` 只换消息,不碰 `last_input_tokens`;若不在此清零,
+            // 清空后仍留着一个陈旧的(可能很大的)计数,`maybe_auto_compact` 会在下一轮
+            // 立刻误触发一次压缩。旧实现换的是全新 `Session`(计数为 `None`),这里补回
+            // 那个语义——与 CLI 的 `/clear` 路径一致。
+            agent
+                .session_handle()
+                .lock()
+                .unwrap()
+                .set_last_input_tokens(None);
             let truncate = store.truncate(thread_id);
             if let Err(e) = &truncate {
                 eprintln!("[app-server] failed to truncate thread log {thread_id}: {e}");
@@ -4012,7 +4054,18 @@ async fn apply_session_command(
             let session = agent.session();
             let outcome = match yi_agent_core::compact_session(provider, config, &session).await {
                 Ok(Some(compacted)) => {
-                    agent = agent.with_session(compacted);
+                    // Replace the contents in place so the session `Arc` — and
+                    // any `CallerContext` bound to it — stays valid.
+                    agent.set_session_messages(compacted.messages().to_vec());
+                    // The replaced session used to be brand new, so its token
+                    // count meant "no measurement yet". Keep that: a stale
+                    // pre-compaction count would re-trigger auto-compaction on
+                    // the very next turn.
+                    agent
+                        .session_handle()
+                        .lock()
+                        .unwrap()
+                        .set_last_input_tokens(None);
                     CompactOutcome::Compacted
                 }
                 Ok(None) => CompactOutcome::NotReduced,
@@ -6330,6 +6383,7 @@ pub(crate) mod tests {
                 workdir: None,
                 thread_id: None,
                 sandbox: None,
+                fork_token: None,
             },
         )
         .expect("the runtime socket must answer");
@@ -6455,6 +6509,7 @@ pub(crate) mod tests {
                 workdir: None,
                 thread_id: None,
                 sandbox: None,
+                fork_token: None,
             },
         )
         .expect("the runtime socket answers even when it refuses");
@@ -6757,15 +6812,14 @@ pub(crate) mod tests {
     ) -> anyhow::Result<BuiltAgent> {
         let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
         let config = yi_agent_core::AgentConfig::default();
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(&mut agent, session);
         Ok(BuiltAgent {
-            agent: apply_session(
-                yi_agent_core::Agent::new(
-                    provider.clone(),
-                    Arc::new(yi_agent_core::ToolRegistry::new()),
-                    config.clone(),
-                ),
-                session,
-            ),
+            agent,
             provider,
             config,
             decision_tx: None,
@@ -6783,15 +6837,14 @@ pub(crate) mod tests {
     ) -> anyhow::Result<BuiltAgent> {
         let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(SlowProvider);
         let config = yi_agent_core::AgentConfig::default();
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(&mut agent, session);
         Ok(BuiltAgent {
-            agent: apply_session(
-                yi_agent_core::Agent::new(
-                    provider.clone(),
-                    Arc::new(yi_agent_core::ToolRegistry::new()),
-                    config.clone(),
-                ),
-                session,
-            ),
+            agent,
             provider,
             config,
             decision_tx: None,
@@ -6809,15 +6862,14 @@ pub(crate) mod tests {
     ) -> anyhow::Result<BuiltAgent> {
         let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(DelayedProvider);
         let config = yi_agent_core::AgentConfig::default();
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(&mut agent, session);
         Ok(BuiltAgent {
-            agent: apply_session(
-                yi_agent_core::Agent::new(
-                    provider.clone(),
-                    Arc::new(yi_agent_core::ToolRegistry::new()),
-                    config.clone(),
-                ),
-                session,
-            ),
+            agent,
             provider,
             config,
             decision_tx: None,
@@ -8485,11 +8537,10 @@ pub(crate) mod tests {
         ));
         let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
         let rx_arc = Arc::new(Mutex::new(decision_rx));
-        let agent = apply_session(
+        let mut agent =
             yi_agent_core::Agent::new(provider.clone(), Arc::new(registry), config.clone())
-                .with_permission(checker.clone(), rx_arc.clone()),
-            session,
-        );
+                .with_permission(checker.clone(), rx_arc.clone());
+        apply_session(&mut agent, session);
         Ok(BuiltAgent {
             agent,
             provider,
@@ -9321,15 +9372,14 @@ pub(crate) mod tests {
                 seen: Arc::clone(&seen_factory),
             });
             let config = yi_agent_core::AgentConfig::default();
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            apply_session(&mut agent, session);
             Ok(BuiltAgent {
-                agent: apply_session(
-                    yi_agent_core::Agent::new(
-                        provider.clone(),
-                        Arc::new(yi_agent_core::ToolRegistry::new()),
-                        config.clone(),
-                    ),
-                    session,
-                ),
+                agent,
                 provider,
                 config,
                 decision_tx: None,
@@ -11635,6 +11685,303 @@ pub(crate) mod tests {
         );
         h.shutdown().await;
     }
+
+    /// Rebuilding a thread agent must reuse the *same* session `Arc`.
+    ///
+    /// The delegation tools read the caller's live transcript through a
+    /// `CallerContext` bound to that `Arc` (see [`wrap_for_delegation`]). If a
+    /// rebuild swapped in a fresh `Arc` (as `with_session` does), the bound
+    /// handle would point at the discarded session and `fork: true` would
+    /// silently upload nothing. This drives every rebuild path.
+    #[test]
+    fn rebuilding_a_thread_agent_keeps_one_session_handle() {
+        // 1. Delegation path: `wrap_for_delegation` swaps the tool registry and
+        //    binds the caller in one step.
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+
+        let attached = Arc::new(
+            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
+                .expect("a clean git repo must attach"),
+        );
+        let binding =
+            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+        let tooling = build_runtime_tooling(
+            &cfg,
+            &root,
+            "thread-handle",
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+        )
+        .expect("tooling");
+        // Taken *before* the rebuild: a clone shares the caller slot the tools
+        // hold, so it observes whatever `wrap_for_delegation` binds.
+        let caller = tooling.caller.clone();
+
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(
+            &mut agent,
+            Some(yi_agent_core::Session::from_messages(vec![
+                yi_agent_core::Message::user("first"),
+            ])),
+        );
+        let handle_a = agent.session_handle();
+        handle_a
+            .lock()
+            .unwrap()
+            .push(yi_agent_core::Message::assistant(vec![
+                yi_agent_core::ContentBlock::Text("reply".into()),
+            ]));
+
+        let built = BuiltAgent {
+            agent,
+            provider: provider.clone(),
+            config: config.clone(),
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        };
+        let rebuilt = wrap_for_delegation(built, tooling);
+        assert!(
+            Arc::ptr_eq(&handle_a, &rebuilt.agent.session_handle()),
+            "wrap_for_delegation must reuse the thread's session Arc"
+        );
+        let seen = caller
+            .snapshot()
+            .expect("wrap_for_delegation must bind the caller to the live session");
+        assert_eq!(
+            seen,
+            handle_a.lock().unwrap().messages().to_vec(),
+            "the bound caller must read the rebuilt agent's live transcript"
+        );
+
+        // 2. Theme rebuild path (no resume): `rebuild_thread_agent_with_theme`.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let bootstrapped = yi_agent_runtime::bootstrap::bootstrap_agent(
+            &cfg,
+            yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+        )
+        .expect("a default config bootstraps without network");
+        let handle_b = bootstrapped.agent.session_handle();
+        handle_b
+            .lock()
+            .unwrap()
+            .push(yi_agent_core::Message::user("in-flight"));
+        let rebuilt_theme = rebuild_thread_agent_with_theme(bootstrapped, None, test_theme());
+        assert!(
+            Arc::ptr_eq(&handle_b, &rebuilt_theme.agent.session_handle()),
+            "rebuild_thread_agent_with_theme must reuse the session Arc"
+        );
+        assert_eq!(
+            rebuilt_theme.agent.session().messages().len(),
+            1,
+            "the rebuilt agent must still see the in-flight message"
+        );
+
+        // 3. Resume path: `apply_session(Some(..))` applies contents in place,
+        //    so the loaded history lands on the same Arc.
+        let bootstrapped = yi_agent_runtime::bootstrap::bootstrap_agent(
+            &cfg,
+            yi_agent_runtime::bootstrap::PermissionMode::Interactive,
+        )
+        .expect("a default config bootstraps without network");
+        let handle_c = bootstrapped.agent.session_handle();
+        let mut loaded = yi_agent_core::Session::from_messages(vec![
+            yi_agent_core::Message::user("loaded-one"),
+            yi_agent_core::Message::user("loaded-two"),
+        ]);
+        // A resumed session carries the previous turn's usage; the rebuild must
+        // land it on the live handle, or the first post-resume turn's
+        // auto-compact check reads `None` and short-circuits.
+        loaded.set_last_input_tokens(Some(1234));
+        let rebuilt_loaded =
+            rebuild_thread_agent_with_theme(bootstrapped, Some(loaded), test_theme());
+        assert!(
+            Arc::ptr_eq(&handle_c, &rebuilt_loaded.agent.session_handle()),
+            "apply_session must keep the session Arc, not swap in a new one"
+        );
+        assert_eq!(
+            rebuilt_loaded.agent.session().messages().len(),
+            2,
+            "apply_session must still apply the resumed history"
+        );
+        assert_eq!(
+            rebuilt_loaded.agent.session().last_input_tokens(),
+            Some(1234),
+            "apply_session must carry the resumed input-token count onto the live handle"
+        );
+    }
+
+    /// Compaction replaces the messages in place and keeps the session `Arc`.
+    ///
+    /// `with_session(compacted)` would drop the old handle, so a `CallerContext`
+    /// taken before the compact would keep reading the pre-compaction
+    /// transcript.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_replaces_messages_without_changing_the_handle() {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let session = yi_agent_core::Session::from_messages(vec![
+            yi_agent_core::Message::user("first"),
+            yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                "reply".into(),
+            )]),
+            yi_agent_core::Message::user("second"),
+        ]);
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(&mut agent, Some(session));
+
+        let handle = agent.session_handle();
+        // The host binds this handle once; it must observe the compacted text.
+        let caller = yi_agent_subagent::CallerContext::new(handle.clone());
+
+        let snapshot = agent.session();
+        let compacted = yi_agent_core::compact_session(&provider, agent.config(), &snapshot)
+            .await
+            .expect("compaction must run")
+            .expect("the three-message history must reduce");
+        let expected = compacted.messages().to_vec();
+        agent.set_session_messages(compacted.messages().to_vec());
+
+        assert!(
+            Arc::ptr_eq(&handle, &agent.session_handle()),
+            "compaction must not change the session Arc"
+        );
+        assert_eq!(
+            agent.session().messages(),
+            expected.as_slice(),
+            "compaction must install the compacted messages"
+        );
+        assert_eq!(
+            caller.snapshot().expect("the caller stays bound"),
+            expected,
+            "a caller bound before the compact must see the compacted transcript"
+        );
+    }
+
+    /// `/clear` 与 `/compact` 都必须把陈旧的 `last_input_tokens` 清零。
+    ///
+    /// Task 8 把 `with_session(Session::new())` 换成 `set_session_messages(...)`
+    /// 以保住 session `Arc`,但后者只换消息、不碰 token 计数:上一轮留下的(很大的)
+    /// `last_input_tokens` 会存活到 `maybe_auto_compact`,让下一轮立刻误触发一次
+    /// 无谓的自动压缩。本测试驱动**生产函数** `apply_session_command`,断言计数归零、
+    /// 而 `Arc` 未变。
+    #[tokio::test]
+    async fn session_commands_clear_the_stale_input_tokens_without_changing_the_handle() {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r); // 本测试不看 writer 输出
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        // Clear 会 truncate 日志,故线程 id 必须合法。
+        let cases = [
+            ("/clear", "thread-tokens-clear"),
+            ("/compact", "thread-tokens-compact"),
+        ];
+        for (label, thread_id) in cases {
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            let handle = agent.session_handle();
+            let caller = yi_agent_subagent::CallerContext::new(handle.clone());
+            // 可压缩的历史(两个 user 轮次)+ 上一轮留下的大计数,正是 finding 描述的
+            // 陈旧状态。
+            handle.lock().unwrap().replace_messages(vec![
+                yi_agent_core::Message::user("first"),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "reply".into(),
+                )]),
+                yi_agent_core::Message::user("second"),
+            ]);
+            handle.lock().unwrap().set_last_input_tokens(Some(150_000));
+
+            let status = ThreadSession::new_status();
+            if label == "/clear" {
+                let (reply, answer) = oneshot::channel();
+                agent = apply_session_command(
+                    agent,
+                    SessionCommand::Clear { reply },
+                    &provider,
+                    &config,
+                    &store,
+                    thread_id,
+                    &hub,
+                    &turn_tx,
+                    &status,
+                )
+                .await;
+                answer
+                    .await
+                    .expect("the clear reply channel must be fulfilled")
+                    .expect("truncating a never-written log must succeed");
+            } else {
+                let (reply, answer) = oneshot::channel();
+                agent = apply_session_command(
+                    agent,
+                    SessionCommand::Compact { reply },
+                    &provider,
+                    &config,
+                    &store,
+                    thread_id,
+                    &hub,
+                    &turn_tx,
+                    &status,
+                )
+                .await;
+                assert_eq!(
+                    answer
+                        .await
+                        .expect("the compact reply channel must be fulfilled"),
+                    CompactOutcome::Compacted,
+                    "{label} must compact the two-user-turn history"
+                );
+            }
+
+            assert_eq!(
+                agent.session().last_input_tokens(),
+                None,
+                "{label} must clear the stale input-token count"
+            );
+            assert!(
+                Arc::ptr_eq(&handle, &agent.session_handle()),
+                "{label} must keep the session Arc"
+            );
+            assert_eq!(
+                caller.snapshot().expect("the caller stays bound"),
+                agent.session().messages().to_vec(),
+                "{label} must land its outcome on the handle the caller holds"
+            );
+        }
+
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a session command with no turn must not report a turn as finished"
+        );
+    }
 }
 
 /// 主题守望者的回归测试。
@@ -11672,7 +12019,10 @@ mod theme_watcher_tests {
         let local = crate::broadcast::ClientId::local();
         let mut out = hub.register_reliable(local);
         let theme = crate::theme_tool::ThemeHandle::new(std::env::temp_dir());
-        let pump = tokio::spawn(pump_theme_notifications(theme.subscribe(), Arc::clone(&hub)));
+        let pump = tokio::spawn(pump_theme_notifications(
+            theme.subscribe(),
+            Arc::clone(&hub),
+        ));
 
         lag_the_subscriber(&theme).await;
 

@@ -175,7 +175,7 @@ pub struct ResponseEnvelope {
     pub result: IpcResponse,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(deny_unknown_fields)]
 pub enum IpcRequest {
@@ -217,6 +217,11 @@ pub enum IpcRequest {
         workdir: Option<String>,
         #[serde(default)]
         sandbox: Option<String>,
+        /// A completed fork upload to seed the child with. Additive and
+        /// optional: an older client omits it, which reads as `None` and
+        /// spawns exactly as before.
+        #[serde(default)]
+        fork_token: Option<String>,
     },
     SpawnApplicationChild {
         session_id: String,
@@ -236,6 +241,32 @@ pub enum IpcRequest {
         thread_id: Option<String>,
         #[serde(default)]
         sandbox: Option<String>,
+        /// A completed fork upload to seed the child with. Additive and
+        /// optional, like `thread_id`: omitting it spawns an unforked child.
+        #[serde(default)]
+        fork_token: Option<String>,
+    },
+    /// Opens a fork-payload upload for an authorized application root. The
+    /// caller then pushes the payload as base64 chunks and names the token on a
+    /// spawn request. Kept separate from the spawn so a payload larger than one
+    /// frame still fits the 1 MiB frame cap: each chunk travels on its own.
+    BeginForkUpload {
+        session_id: String,
+        caller_task_id: String,
+        capability: String,
+        total_bytes: u64,
+    },
+    /// Appends one base64 chunk to an open upload. `seq` is strict, so a gap,
+    /// a replay, or a chunk past the declared length is rejected rather than
+    /// silently corrupting the payload.
+    AppendForkChunk {
+        fork_token: String,
+        seq: u64,
+        data: String,
+    },
+    /// Drops an open upload. The token is invalid afterwards.
+    AbortForkUpload {
+        fork_token: String,
     },
     StartWorker {
         session_id: String,
@@ -471,6 +502,15 @@ pub enum IpcResponse {
     TaskSpawned {
         task_id: String,
     },
+    /// An upload is open and can accept chunks under `fork_token`.
+    ForkUploadStarted {
+        fork_token: String,
+    },
+    /// A chunk was accepted; `received` is the cumulative decoded byte count.
+    ForkChunkAccepted {
+        received: u64,
+    },
+    ForkUploadAborted,
     TaskStarted,
     TaskCancelled,
     /// The children a conversation-scoped cancellation actually cancelled.
@@ -931,6 +971,14 @@ impl Daemon {
                             error = %error,
                             "terminal trace pruning failed; retrying next minute"
                         ),
+                    }
+                    // Abandoned fork uploads are the other per-minute leak: a
+                    // client that dies mid-upload leaves state a later client
+                    // may never claim. Reaping is pure in-memory bookkeeping,
+                    // so it shares the trace sweep's non-wedging shape.
+                    let expired_uploads = coordinator.prune_expired_fork_uploads(Instant::now());
+                    if expired_uploads > 0 {
+                        tracing::debug!(expired_uploads, "pruned expired fork uploads");
                     }
                     last_schedule_minute = minute;
                 }
@@ -2854,6 +2902,13 @@ fn ipc_error_message(error: &IpcError) -> Option<String> {
         IpcError::Runtime(RuntimeCoordinatorError::Spawn(
             yi_agent_core::subagent::supervisor::SpawnError::DirectChildLimitReached,
         )) => Some("an agent may have at most four direct children".into()),
+        // A fork rejection is the caller's mistake (unknown, incomplete, or
+        // mismatched token), so the reason is safe to hand back verbatim rather
+        // than leaving the client with only a bare code.
+        IpcError::Runtime(RuntimeCoordinatorError::ForkUpload(reason)) => Some(reason.clone()),
+        IpcError::Runtime(RuntimeCoordinatorError::ForkTooLarge { total, max }) => Some(format!(
+            "fork payload of {total} bytes exceeds the {max}-byte limit"
+        )),
         _ => None,
     }
 }
@@ -2877,6 +2932,10 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         IpcError::Runtime(RuntimeCoordinatorError::AuthorityDenied(_)) => {
             IpcErrorCode::AuthorityDenied
         }
+        // A bad fork token or an oversized payload is the caller's error, not a
+        // daemon fault: surface it as validation so the client can react.
+        IpcError::Runtime(RuntimeCoordinatorError::ForkTooLarge { .. })
+        | IpcError::Runtime(RuntimeCoordinatorError::ForkUpload(_)) => IpcErrorCode::Validation,
         IpcError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
             IpcErrorCode::Validation
         }
@@ -3117,7 +3176,7 @@ fn forward_plugin_query(
             return Err(IpcError::PluginTimeout {
                 plugin: plugin.to_string(),
                 seconds: PLUGIN_QUERY_TIMEOUT.as_secs(),
-            })
+            });
         }
         Err(error) => return Err(error.into()),
     };
@@ -3130,7 +3189,10 @@ fn forward_plugin_query(
     let reply: serde_json::Value = serde_json::from_str(&line)?;
     match reply.get("type").and_then(|value| value.as_str()) {
         Some("plugin.result") => Ok(IpcResponse::PluginResult {
-            value: reply.get("value").cloned().unwrap_or(serde_json::Value::Null),
+            value: reply
+                .get("value")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
         }),
         // The plugin refused the query (bad method, invalid paths, ...). Surface
         // it through the standard error path rather than inventing a second
@@ -3268,6 +3330,7 @@ fn respond(
             model,
             workdir,
             sandbox,
+            fork_token,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
@@ -3288,6 +3351,7 @@ fn respond(
                 // still inherits its parent's marker inside the coordinator.
                 None,
                 inherited_sandbox,
+                fork_token,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
@@ -3303,6 +3367,7 @@ fn respond(
             workdir,
             thread_id,
             sandbox,
+            fork_token,
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let parent_task_id = parse_id::<TaskId>(&parent_task_id)?;
@@ -3322,10 +3387,45 @@ fn respond(
                 workdir,
                 thread_id,
                 inherited_sandbox,
+                fork_token,
             ))?;
             Ok(IpcResponse::TaskSpawned {
                 task_id: task_id.to_string(),
             })
+        }
+        IpcRequest::BeginForkUpload {
+            session_id,
+            caller_task_id,
+            capability,
+            total_bytes,
+        } => {
+            let session_id = parse_id::<RootSessionId>(&session_id)?;
+            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
+            // Authorization reaches the supervisor (root capability, or the
+            // caller's own worker capability when a subagent forks itself), so
+            // it must run on a runtime the same way the spawn arms do.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let fork_token = runtime.block_on(coordinator.begin_fork_upload(
+                &session_id,
+                &caller_task_id,
+                &capability,
+                total_bytes,
+            ))?;
+            Ok(IpcResponse::ForkUploadStarted { fork_token })
+        }
+        IpcRequest::AppendForkChunk {
+            fork_token,
+            seq,
+            data,
+        } => {
+            let received = coordinator.append_fork_chunk(&fork_token, seq, &data)?;
+            Ok(IpcResponse::ForkChunkAccepted { received })
+        }
+        IpcRequest::AbortForkUpload { fork_token } => {
+            coordinator.abort_fork_upload(&fork_token)?;
+            Ok(IpcResponse::ForkUploadAborted)
         }
         IpcRequest::StartWorker {
             session_id,
@@ -4275,7 +4375,9 @@ mod plugin_query_tests {
     static TABLE: Mutex<()> = Mutex::new(());
 
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        TABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TABLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// A one-shot fake plugin: answers the first line with `reply`.
@@ -4316,8 +4418,7 @@ mod plugin_query_tests {
 
         // The daemon adds no interpretation: whatever the plugin put in `value`
         // comes back verbatim, including nested objects it knows nothing about.
-        let response =
-            forward_plugin_query("demo", "list", serde_json::json!({"x": 1})).unwrap();
+        let response = forward_plugin_query("demo", "list", serde_json::json!({"x": 1})).unwrap();
         match response {
             IpcResponse::PluginResult { value } => {
                 assert_eq!(value["cards"][0]["id"], "a");
@@ -4418,5 +4519,38 @@ mod plugin_query_tests {
         assert_eq!(plugin_socket("b"), Some(PathBuf::from("/tmp/b.sock")));
         assert_eq!(plugin_socket("c"), None);
         clear_plugin_sockets();
+    }
+}
+
+#[cfg(test)]
+mod fork_wire_tests {
+    use super::*;
+
+    #[test]
+    fn fork_upload_requests_round_trip_over_the_wire() {
+        let request = IpcRequest::AppendForkChunk {
+            fork_token: "t".into(),
+            seq: 0,
+            data: "aGk=".into(),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn an_older_spawn_request_without_fork_token_still_deserializes() {
+        let json = r#"{"type":"SpawnApplicationChild","session_id":"s","parent_task_id":"p",
+        "capability":"c","objective":"o"}"#;
+        let parsed: IpcRequest = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            parsed,
+            IpcRequest::SpawnApplicationChild {
+                fork_token: None,
+                ..
+            }
+        ));
     }
 }

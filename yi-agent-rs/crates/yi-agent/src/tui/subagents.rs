@@ -27,7 +27,7 @@ pub enum RuntimeStartupIntent {
 
 pub use yi_agent_subagent::binding::{RuntimeBinding, RuntimeHandle};
 pub use yi_agent_subagent::thread_root::ThreadRoot;
-pub use yi_agent_subagent::{AttachedRoot, register_attached_root_tools};
+pub use yi_agent_subagent::{AttachedRoot, CallerContext, register_attached_root_tools};
 
 /// A root handle for a runtime this process owns for the whole session.
 ///
@@ -106,6 +106,8 @@ pub fn current_attached_root() -> Option<AttachedRoot> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use yi_agent_core::ToolRegistry;
     use yi_agent_core::subagent::task::WorkspaceLeaseId;
     use yi_agent_core::subagent::worker::WorkerWorkspace;
@@ -147,7 +149,7 @@ mod tests {
         let root = attached_root();
         let binding = root_binding("/tmp/runtime.sock".into(), &root);
         let mut registry = ToolRegistry::new();
-        register_attached_root_tools(&mut registry, binding, controller);
+        register_attached_root_tools(&mut registry, binding, controller, CallerContext::unbound());
         assert!(registry.names().contains(&"spawn_agent".to_string()));
     }
 
@@ -164,6 +166,7 @@ mod tests {
                 yi_agent_tools::SandboxMode::WorkspaceWrite,
                 false,
             ),
+            CallerContext::unbound(),
         );
         let names = registry
             .schemas()
@@ -178,6 +181,88 @@ mod tests {
             !SlashCommand::all()
                 .iter()
                 .any(|command| command.name() == "delegate")
+        );
+    }
+
+    /// The host binds exactly one `CallerContext` and hands it to
+    /// `register_attached_root_tools`; binding that same handle later must be
+    /// visible to the tools that were registered with it, or a `fork:true`
+    /// spawn in the TUI would read no caller transcript at all.
+    ///
+    /// The binding is deliberately done **after** registration, mirroring the
+    /// driver (registration happens while assembling the runtime-attached
+    /// registry; the bind happens once the owning Agent exists). That only
+    /// works because `CallerContext::clone` shares the inner slot.
+    #[test]
+    fn tui_registers_delegation_tools_bound_to_a_caller_context() {
+        let caller = CallerContext::unbound();
+        assert!(caller.snapshot().is_none(), "a fresh caller starts unbound");
+
+        let root = attached_root();
+        let binding = root_binding("/tmp/runtime.sock".into(), &root);
+        let mut registry = ToolRegistry::new();
+        register_attached_root_tools(
+            &mut registry,
+            binding,
+            yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                false,
+            ),
+            caller.clone(),
+        );
+
+        let session = Arc::new(std::sync::Mutex::new(
+            yi_agent_core::Session::from_messages(vec![yi_agent_core::Message::user("hello")]),
+        ));
+        caller.bind(Arc::clone(&session));
+
+        let snapshot = caller
+            .snapshot()
+            .expect("binding the registered caller must make its transcript visible");
+        assert_eq!(snapshot.len(), 1);
+    }
+
+    /// Proves the clone taken *by the registered tool* is the same handle, not
+    /// just that the host's own `CallerContext` works.
+    ///
+    /// `spawn_agent` is invoked with `fork:true`; it first resolves its root
+    /// (always fine for a fixed binding), then reads its captured caller. An
+    /// unbound clone fails with "no caller context available" before touching
+    /// the daemon, so the failure text distinguishes a dead shared slot from a
+    /// merely unreachable socket -- without needing a live daemon.
+    #[tokio::test]
+    async fn the_registered_spawn_tool_shares_the_hosts_caller_slot() {
+        let caller = CallerContext::unbound();
+        let root = attached_root();
+        let binding = root_binding("/tmp/runtime.sock".into(), &root);
+        let mut registry = ToolRegistry::new();
+        register_attached_root_tools(
+            &mut registry,
+            binding,
+            yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                false,
+            ),
+            caller.clone(),
+        );
+
+        let session = Arc::new(std::sync::Mutex::new(
+            yi_agent_core::Session::from_messages(vec![yi_agent_core::Message::user("hello")]),
+        ));
+        caller.bind(session);
+
+        let spawn = registry
+            .get("spawn_agent")
+            .expect("delegation tool registered");
+        let result = spawn
+            .call(serde_json::json!({ "task": "child objective", "fork": true }))
+            .await;
+        let output = format!("{:?}", result.content);
+        assert!(
+            !output.contains("no caller context available"),
+            "the tool's captured caller is a different (unbound) handle: {output}"
         );
     }
 }

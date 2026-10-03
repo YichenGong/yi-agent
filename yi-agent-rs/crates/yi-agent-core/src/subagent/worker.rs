@@ -11,6 +11,7 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::ProviderTurnGate;
+use crate::message::Message;
 
 use super::task::{
     AttemptId, ChildWriteMode, DeliveryReport, InheritedSandbox, MessageId, RootSessionId, TaskId,
@@ -86,6 +87,9 @@ pub struct WorkerStart {
     pub initial_user_messages: Vec<WorkerMessage>,
     /// Narrow task instruction supplied by the parent supervisor.
     pub objective: String,
+    /// The caller's conversation, when the parent asked for a fork. The worker
+    /// seeds its session with these messages before adding `objective`.
+    pub fork_messages: Option<Vec<Message>>,
     /// Per-child model override; empty means inherit the parent's model.
     pub model: String,
 }
@@ -145,6 +149,7 @@ impl WorkerStart {
             message_capability: String::new(),
             initial_user_messages: Vec::new(),
             objective: String::new(),
+            fork_messages: None,
             model: String::new(),
         }
     }
@@ -194,6 +199,16 @@ impl WorkerStart {
         self.initial_user_messages = messages;
         self
     }
+
+    pub fn with_fork_messages(mut self, messages: Vec<Message>) -> Self {
+        self.fork_messages = Some(messages);
+        self
+    }
+
+    pub fn maybe_with_fork_messages(mut self, messages: Option<Vec<Message>>) -> Self {
+        self.fork_messages = messages;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -236,6 +251,16 @@ mod tests {
         let coding = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_workspace_mode(ChildWriteMode::Coding);
         assert_eq!(coding.workspace_mode, ChildWriteMode::Coding);
+    }
+
+    #[test]
+    fn worker_start_carries_fork_messages_and_defaults_to_none() {
+        let default = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new());
+        assert!(default.fork_messages.is_none(), "fork is opt-in");
+
+        let forked = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_fork_messages(vec![Message::user("parent said")]);
+        assert_eq!(forked.fork_messages.unwrap().len(), 1);
     }
 }
 
