@@ -53,6 +53,14 @@ pub const DEFAULT_FORK_MAX_BYTES: u64 = 32 * 1024 * 1024;
 /// Overrides `DEFAULT_FORK_MAX_BYTES` for one daemon process.
 const FORK_MAX_BYTES_ENV: &str = "YI_AGENT_FORK_MAX_BYTES";
 
+/// How long an in-flight fork upload may wait before the daemon's sweep
+/// reclaims it. A client that crashes between `BeginForkUpload` and its final
+/// chunk would otherwise pin the upload's memory until the daemon restarts;
+/// `AbortForkUpload` only helps a client that is still alive to send it.
+/// Mirrors `REVIEW_CONFIRMATION_TTL`: a minute is far longer than the seconds
+/// a real upload takes, yet short enough that an abandoned one is not a leak.
+pub const FORK_UPLOAD_TTL: Duration = Duration::from_secs(60);
+
 /// A root session created to run a single objective autonomously in its own
 /// worktree. Generic on purpose: nothing here knows what the objective is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -173,6 +181,10 @@ struct ForkUpload {
     expected_bytes: u64,
     next_seq: u64,
     received: Vec<u8>,
+    /// When the minute-tick sweep may reclaim this upload. Set once at
+    /// `begin_fork_upload`; an upload that is abandoned (its client never
+    /// finishes or aborts) is dropped by `prune_expired_fork_uploads`.
+    deadline: Instant,
 }
 
 /// Owns all supervisor instances and their worker handles for one daemon.
@@ -1094,6 +1106,7 @@ impl RuntimeCoordinator {
                     expected_bytes: total_bytes,
                     next_seq: 0,
                     received: Vec::new(),
+                    deadline: Instant::now() + FORK_UPLOAD_TTL,
                 },
             );
         Ok(token)
@@ -1359,6 +1372,25 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime repository mutex poisoned")
             .prune_terminal_traces(now)?)
+    }
+
+    /// Drops every fork upload whose deadline has passed and returns how many
+    /// were reclaimed. Non-blocking, like `prune_terminal_traces`: it only
+    /// walks the in-memory map, so the daemon's sweep can call it every minute
+    /// without touching the database.
+    ///
+    /// An expired upload is simply gone, so a late `AppendForkChunk` or
+    /// `take_fork_messages` against its token fails with the ordinary "fork
+    /// upload token is unknown" error. That is the intended treatment: an
+    /// expired token is unknown, never a resurrected upload.
+    pub fn prune_expired_fork_uploads(&self, now: Instant) -> usize {
+        let mut uploads = self
+            .fork_uploads
+            .lock()
+            .expect("runtime fork upload mutex poisoned");
+        let before = uploads.len();
+        uploads.retain(|_, upload| upload.deadline > now);
+        before - uploads.len()
     }
 
     /// Fires all schedules due at `now` into newly isolated root sessions.

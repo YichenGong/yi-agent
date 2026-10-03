@@ -391,6 +391,18 @@ impl AgentSupervisor {
         self.fork_messages.get(task_id).cloned()
     }
 
+    /// Removes and returns the forked conversation prefix recorded for a task.
+    ///
+    /// The prefix is a one-shot seed. Once the worker's `WorkerStart` carries a
+    /// clone of these messages the supervisor has no further use for its own
+    /// copy, so it must not pin a forked child's full transcript for the
+    /// daemon's lifetime. Resuming does not re-seed from here -- a restarted
+    /// worker recovers from its own checkpoint and the prefix is dropped with
+    /// the process anyway -- so taking it cannot strand a resume.
+    pub fn take_fork_messages(&mut self, task_id: &TaskId) -> Option<Vec<Message>> {
+        self.fork_messages.remove(task_id)
+    }
+
     /// Binds a directory to a task. A root has no workdir by default, so this is
     /// how an autonomous session is told to run in an isolated worktree instead of
     /// in the project directory. The directory must already exist: the runtime
@@ -615,33 +627,44 @@ impl AgentSupervisor {
             .ok_or_else(|| "task does not exist".to_string())?;
         let objective = self
             .objective(task_id)
-            .ok_or_else(|| "task objective does not exist".to_string())?;
+            .ok_or_else(|| "task objective does not exist".to_string())?
+            .to_string();
         let initial_user_messages = self
             .mailboxes
             .get(task_id)
             .expect("task mailbox is created with task")
             .pending_worker_inputs();
-        let start = WorkerStart::new(
-            task.id.clone(),
-            task.active_attempt_id().clone(),
-            task.root_session_id.clone(),
-        )
-        .with_objective(objective)
-        .with_workspace_mode(self.workspace_mode(task_id))
-        .maybe_with_inherited_sandbox(self.inherited_sandbox(task_id))
-        .with_model(self.model(task_id).unwrap_or_default().to_string())
-        .with_message_capability(Uuid::new_v4().to_string())
-        .with_initial_user_messages(
-            initial_user_messages
-                .iter()
-                .map(|(id, body)| WorkerMessage {
-                    id: id.clone(),
-                    body: body.clone(),
-                })
-                .collect(),
-        )
-        .maybe_with_fork_messages(self.fork_messages(task_id));
-        let start = if let Some(workspace) = task.workspace.clone() {
+        // Everything the `WorkerStart` needs from the task map is captured here
+        // so the immutable borrow of `self.tasks` ends before the one-shot fork
+        // prefix is taken (which needs `&mut self`).
+        let task_id_value = task.id.clone();
+        let attempt_id = task.active_attempt_id().clone();
+        let root_session_id = task.root_session_id.clone();
+        let workspace_lease = task.workspace.clone();
+        // The fork prefix is a one-shot seed: take it as the `WorkerStart` is
+        // assembled, so the supervisor does not retain a forked child's whole
+        // transcript for the daemon's life.
+        let fork_messages = self.take_fork_messages(task_id);
+        let workspace_mode = self.workspace_mode(task_id);
+        let inherited_sandbox = self.inherited_sandbox(task_id);
+        let model = self.model(task_id).unwrap_or_default().to_string();
+        let start = WorkerStart::new(task_id_value, attempt_id, root_session_id)
+            .with_objective(objective)
+            .with_workspace_mode(workspace_mode)
+            .maybe_with_inherited_sandbox(inherited_sandbox)
+            .with_model(model)
+            .with_message_capability(Uuid::new_v4().to_string())
+            .with_initial_user_messages(
+                initial_user_messages
+                    .iter()
+                    .map(|(id, body)| WorkerMessage {
+                        id: id.clone(),
+                        body: body.clone(),
+                    })
+                    .collect(),
+            )
+            .maybe_with_fork_messages(fork_messages);
+        let start = if let Some(workspace) = workspace_lease {
             start.with_workspace_lease(workspace)
         } else {
             start
@@ -2459,6 +2482,25 @@ mod tests {
             request.fork_messages,
             Some(vec![Message::user("parent said")])
         );
+        assert!(
+            supervisor.fork_messages(&child).is_none(),
+            "the one-shot prefix must not be retained once the worker start carries it"
+        );
+    }
+
+    #[test]
+    fn supervisor_takes_fork_messages_exactly_once() {
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = spawn_child(&mut supervisor);
+        supervisor.set_fork_messages(&child, vec![Message::user("inherited")]);
+
+        assert_eq!(
+            supervisor.take_fork_messages(&child),
+            Some(vec![Message::user("inherited")])
+        );
+        assert!(supervisor.take_fork_messages(&child).is_none());
+        assert!(supervisor.fork_messages(&child).is_none());
     }
 
     #[tokio::test]

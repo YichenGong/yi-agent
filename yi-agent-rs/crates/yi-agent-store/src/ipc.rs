@@ -958,6 +958,14 @@ impl Daemon {
                             "terminal trace pruning failed; retrying next minute"
                         ),
                     }
+                    // Abandoned fork uploads are the other per-minute leak: a
+                    // client that dies mid-upload leaves state a later client
+                    // may never claim. Reaping is pure in-memory bookkeeping,
+                    // so it shares the trace sweep's non-wedging shape.
+                    let expired_uploads = coordinator.prune_expired_fork_uploads(Instant::now());
+                    if expired_uploads > 0 {
+                        tracing::debug!(expired_uploads, "pruned expired fork uploads");
+                    }
                     last_schedule_minute = minute;
                 }
                 match listener.accept() {

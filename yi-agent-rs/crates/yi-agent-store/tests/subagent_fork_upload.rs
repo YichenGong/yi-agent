@@ -4,6 +4,7 @@
 //! coordinator, with an attached application root as the authorized caller.
 
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -16,7 +17,7 @@ use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider,
 };
-use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeCoordinatorError};
+use yi_agent_store::runtime::{FORK_UPLOAD_TTL, RuntimeCoordinator, RuntimeCoordinatorError};
 
 /// The upload machine never starts a worker for the root; the factory only has
 /// to resolve the read-only application-root workspace that attaching the root
@@ -418,6 +419,83 @@ async fn an_aborted_upload_has_no_live_token() {
         fixture.coordinator.abort_fork_upload(&token).is_err(),
         "aborting an unknown token fails explicitly"
     );
+}
+
+/// The spec's `ForkUpload { .., deadline }` reaper. A client that dies between
+/// `BeginForkUpload` and its last chunk must not pin the upload forever: the
+/// minute-tick sweep drops it, and the token is then unknown to both a late
+/// chunk and a take. Freshness is probed with an *injected* instant so the test
+/// never sleeps.
+#[tokio::test]
+async fn an_expired_upload_is_pruned_and_its_token_becomes_unknown() {
+    let fixture = attached_root(None).await;
+    let (encoded, total) = encoded_history(&[Message::user("parent")]);
+    let stale = fixture
+        .coordinator
+        .begin_fork_upload(
+            &fixture.session,
+            &fixture.caller,
+            &fixture.capability,
+            total,
+        )
+        .await
+        .unwrap();
+
+    // An instant one second past the deadline reclaims the abandoned upload.
+    let after_deadline = Instant::now() + FORK_UPLOAD_TTL + Duration::from_secs(1);
+    assert_eq!(
+        fixture
+            .coordinator
+            .prune_expired_fork_uploads(after_deadline),
+        1
+    );
+
+    assert!(
+        fixture
+            .coordinator
+            .append_fork_chunk(&stale, 0, &encoded)
+            .is_err(),
+        "an expired token is unknown to a late chunk"
+    );
+    assert!(
+        fixture
+            .coordinator
+            .take_fork_messages(&stale, &fixture.session, &fixture.caller)
+            .is_err(),
+        "an expired token is unknown to a take"
+    );
+
+    // A fresh upload has a deadline ~a minute out, so a sweep "now" leaves it
+    // alone, and it still completes normally.
+    let fresh = fixture
+        .coordinator
+        .begin_fork_upload(
+            &fixture.session,
+            &fixture.caller,
+            &fixture.capability,
+            total,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .coordinator
+            .prune_expired_fork_uploads(Instant::now()),
+        0,
+        "a fresh upload survives the sweep"
+    );
+    assert_eq!(
+        fixture
+            .coordinator
+            .append_fork_chunk(&fresh, 0, &encoded)
+            .unwrap(),
+        total
+    );
+    let messages = fixture
+        .coordinator
+        .take_fork_messages(&fresh, &fixture.session, &fixture.caller)
+        .unwrap();
+    assert_eq!(messages, vec![Message::user("parent")]);
 }
 
 #[tokio::test]
