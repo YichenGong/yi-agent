@@ -10148,11 +10148,11 @@ pub(crate) mod tests {
             {
                 saw_half = true;
             }
-            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
-                if v["params"]["status"] == "interrupted" {
-                    interrupted = true;
-                    break;
-                }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed")
+                && v["params"]["status"] == "interrupted"
+            {
+                interrupted = true;
+                break;
             }
             if v.get("id") == Some(&serde_json::json!(5)) && interrupted {
                 break;
