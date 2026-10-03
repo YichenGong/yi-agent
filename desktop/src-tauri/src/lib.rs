@@ -14,7 +14,11 @@ pub fn run() {
     let builder = builder
         .plugin(tauri_plugin_shell::init())
         .manage(bridge::Sidecar::new())
-        .invoke_handler(tauri::generate_handler![bridge::rpc, bridge::rpc_respond])
+        .invoke_handler(tauri::generate_handler![
+            bridge::rpc,
+            bridge::rpc_respond,
+            bridge::set_relay_url
+        ])
         .setup(|app| {
             bridge::spawn(app.handle())?;
             Ok(())

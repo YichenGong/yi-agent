@@ -27,6 +27,15 @@ tauri-plugin-dialog = "2"
 # The sidecar supervisor sleeps between respawn attempts; `tauri::async_runtime`
 # has no timer, so depend on tokio's time driver directly.
 tokio = { version = "1", features = ["time"] }
+# `bridge::home_dir` must resolve the same directory as the app (whose
+# `app.path().home_dir()` drives the sidecar's cwd) without an `AppHandle`:
+# `set_relay_url` has the handle, but the pure `configured_relay_in` used by
+# tests does not. `dirs` reads `$HOME`, which is what Tauri returns on macOS.
+dirs = "6"
+
+[dev-dependencies]
+# Bridge tests write/read `preferences.json` in a throwaway home.
+tempfile = "3"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
