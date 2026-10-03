@@ -147,13 +147,42 @@ pub fn spawn(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// The sidecar argv. Pure: no I/O, so it is directly unit-testable.
+///
+/// The base is a plain stdio app-server (today's behavior). When a relay URL is
+/// configured we append `--relay <url>`, which makes the CLI serve stdio *and*
+/// the relay in one `serve()` — so the desktop GUI and the phone share a single
+/// app-server/session.
+fn sidecar_args(relay: Option<&str>) -> Vec<String> {
+    let mut args = vec!["app-server".into(), "--listen".into(), "stdio://".into()];
+    if let Some(url) = relay {
+        args.push("--relay".into());
+        args.push(url.into());
+    }
+    args
+}
+
+/// The relay URL the sidecar should advertise, from the `YI_AGENT_RELAY`
+/// environment variable.
+///
+/// There is deliberately no desktop settings field for this yet: the env var
+/// keeps this task small (and it composes with dev/launch scripts). A
+/// settings-page field plus a pairing hand-off is a future enhancement. Unset
+/// or blank → `None`, which reproduces the original stdio-only spawn exactly.
+fn configured_relay() -> Option<String> {
+    std::env::var("YI_AGENT_RELAY")
+        .ok()
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())
+}
+
 /// Launch one `yi-agent app-server` and return its event stream.
 fn spawn_once(app: &AppHandle) -> Result<tauri::async_runtime::Receiver<CommandEvent>, String> {
     let mut cmd = app
         .shell()
         .sidecar("yi-agent")
         .map_err(|e| format!("sidecar not found: {e}"))?
-        .args(["app-server", "--listen", "stdio://"]);
+        .args(sidecar_args(configured_relay().as_deref()));
 
     // A bundled app launched from Finder inherits `/` as its cwd, which would
     // make the agent's workdir (and its runtime directory) the filesystem root.
@@ -234,6 +263,62 @@ mod tests {
     #[test]
     fn garbage_is_dropped() {
         assert_eq!(classify(&json!({"hello":"world"})), Frame::Garbage);
+    }
+
+    #[test]
+    fn sidecar_args_add_relay_only_when_configured() {
+        assert_eq!(sidecar_args(None), ["app-server", "--listen", "stdio://"]);
+        assert_eq!(
+            sidecar_args(Some("wss://r/connect?session=x")),
+            [
+                "app-server",
+                "--listen",
+                "stdio://",
+                "--relay",
+                "wss://r/connect?session=x"
+            ]
+        );
+    }
+
+    // `configured_relay` reads a process-global env var. Cargo runs tests in
+    // parallel threads of one process, so any test that mutates `YI_AGENT_RELAY`
+    // must hold this lock and restore the previous value; otherwise a sibling
+    // test could read a value it never set.
+    static RELAY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn restore_relay_env(previous: Option<String>) {
+        match previous {
+            Some(value) => std::env::set_var("YI_AGENT_RELAY", value),
+            None => std::env::remove_var("YI_AGENT_RELAY"),
+        }
+    }
+
+    #[test]
+    fn configured_relay_is_none_when_unset_or_blank() {
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("YI_AGENT_RELAY").ok();
+
+        std::env::remove_var("YI_AGENT_RELAY");
+        assert_eq!(configured_relay(), None, "unset must mean no relay");
+
+        std::env::set_var("YI_AGENT_RELAY", "   ");
+        assert_eq!(configured_relay(), None, "blank must mean no relay");
+
+        restore_relay_env(previous);
+    }
+
+    #[test]
+    fn configured_relay_trims_a_set_url() {
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("YI_AGENT_RELAY").ok();
+
+        std::env::set_var("YI_AGENT_RELAY", "  wss://r/connect?session=x  ");
+        assert_eq!(
+            configured_relay().as_deref(),
+            Some("wss://r/connect?session=x")
+        );
+
+        restore_relay_env(previous);
     }
 
     #[test]
