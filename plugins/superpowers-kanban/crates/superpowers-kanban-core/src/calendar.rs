@@ -193,6 +193,12 @@ impl ConcurrencyCalendar {
         if default_max_tasks < 1 {
             return Err(SettingsError("default_max_tasks must be >= 1".into()));
         }
+        let default_max_tasks = u16::try_from(default_max_tasks).map_err(|_| {
+            SettingsError(format!(
+                "default_max_tasks must be <= {}, got {default_max_tasks}",
+                u16::MAX
+            ))
+        })?;
         let interval_secs = value
             .get("interval_secs")
             .and_then(serde_json::Value::as_u64)
@@ -214,7 +220,7 @@ impl ConcurrencyCalendar {
             );
         }
         Ok(Self {
-            default_max_tasks: default_max_tasks as u16,
+            default_max_tasks,
             interval_secs,
             windows,
         })
@@ -389,6 +395,15 @@ fn decode_window(value: &serde_json::Value) -> Result<ConcurrencyWindow, String>
         .get("all_day")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    let max_tasks = value
+        .get("max_tasks")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "max_tasks must be a positive integer".to_string())?;
+    if max_tasks < 1 {
+        return Err("max_tasks must be >= 1".into());
+    }
+    let max_tasks = u16::try_from(max_tasks)
+        .map_err(|_| format!("max_tasks must be <= {}, got {max_tasks}", u16::MAX))?;
     let raw = RawWindow {
         days: value
             .get("days")
@@ -403,15 +418,8 @@ fn decode_window(value: &serde_json::Value) -> Result<ConcurrencyWindow, String>
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         all_day,
-        max_tasks: value
-            .get("max_tasks")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| "max_tasks must be a positive integer".to_string())?
-            as u16,
+        max_tasks,
     };
-    if raw.max_tasks < 1 {
-        return Err("max_tasks must be >= 1".into());
-    }
     let window = raw.into_window().map_err(|error| error.to_string())?;
     // `NaiveTime::MIN` 是 "24:00" 的归一形式（当日末尾），恒晚于任何 start。
     if !window.all_day && window.end != NaiveTime::MIN && window.end <= window.start {
@@ -683,6 +691,52 @@ max_tasks = 99
             ]
         });
         assert!(ConcurrencyCalendar::from_settings_json(&json).is_err());
+    }
+
+    #[test]
+    fn from_settings_json_rejects_max_tasks_above_u16() {
+        // 65536 truncates to 0 in u16；必须在写入前拒绝，否则落盘结果与载荷矛盾。
+        let too_big_default = serde_json::json!({
+            "default_max_tasks": 65536,
+            "interval_secs": 10,
+            "windows": []
+        });
+        let error = ConcurrencyCalendar::from_settings_json(&too_big_default).unwrap_err();
+        assert!(error.to_string().contains("default_max_tasks"), "{error}");
+
+        let too_big_window = serde_json::json!({
+            "default_max_tasks": 3,
+            "interval_secs": 10,
+            "windows": [
+                { "days": "Mon", "all_day": true, "max_tasks": 65536 }
+            ]
+        });
+        let error = ConcurrencyCalendar::from_settings_json(&too_big_window).unwrap_err();
+        assert!(error.to_string().contains("max_tasks"), "{error}");
+
+        // 65537 若被截断成 1 会静默通过校验——正是必须堵住的路径。
+        let truncating_window = serde_json::json!({
+            "default_max_tasks": 3,
+            "interval_secs": 10,
+            "windows": [
+                { "days": "Mon", "all_day": true, "max_tasks": 65537 }
+            ]
+        });
+        assert!(ConcurrencyCalendar::from_settings_json(&truncating_window).is_err());
+    }
+
+    #[test]
+    fn from_settings_json_accepts_the_u16_maximum_without_truncating() {
+        let json = serde_json::json!({
+            "default_max_tasks": 65535,
+            "interval_secs": 10,
+            "windows": [
+                { "days": "Mon", "all_day": true, "max_tasks": 65535 }
+            ]
+        });
+        let calendar = ConcurrencyCalendar::from_settings_json(&json).unwrap();
+        assert_eq!(calendar.default_max_tasks, u16::MAX);
+        assert_eq!(calendar.windows[0].max_tasks, u16::MAX);
     }
 
     #[test]
