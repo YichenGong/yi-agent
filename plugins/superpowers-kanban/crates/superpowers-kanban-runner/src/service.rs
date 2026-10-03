@@ -190,13 +190,24 @@ impl BoardService {
     }
 
     /// 会话已起来：卡片进入 `Running`（从此由 `Running` 记账占槽），并记下 thread id。
+    ///
+    /// **幂等**：一张已 `Running` 的卡再次被上报（同一会话或追问后的续跑）不算
+    /// 非法迁移，仅刷新 thread id。对账新增的 `awaiting_merge`/`needs_you → running`
+    /// 回流正靠这里落地（见 2026-10-03 看板状态误判）。
     pub fn mark_running(&self, card_id: &str, thread_id: &str) -> Result<(), String> {
         let mut inner = self.lock();
         let id = CardId::new(card_id);
-        inner
+        let already_running = inner
             .board
-            .transition(&id, CardState::Running)
-            .map_err(|error| error.to_string())?;
+            .get(&id)
+            .map(|card| card.state == CardState::Running)
+            .unwrap_or(false);
+        if !already_running {
+            inner
+                .board
+                .transition(&id, CardState::Running)
+                .map_err(|error| error.to_string())?;
+        }
         inner
             .board
             .set_thread_id(&id, thread_id.to_string())
@@ -629,6 +640,22 @@ mod tests {
         assert_eq!(card["thread_id"], "thread-1");
         // 名额已释放：再放一张排队卡即可启动（此处队空，验证 free_slots 间接由 next_launch None 体现）。
         assert!(service.next_launch(1, at()).unwrap().is_none());
+    }
+
+    #[test]
+    fn mark_running_is_idempotent_and_revives_a_reconciled_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        service
+            .mark_terminal(&claim.card_id, "awaiting_merge", None)
+            .unwrap();
+        // 会话续跑（追问）：卡片必须能翻回 running，且不因重复上报报错。
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        assert_eq!(service.list()["cards"][0]["state"], "running");
     }
 
     #[test]

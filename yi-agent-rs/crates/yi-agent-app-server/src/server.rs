@@ -6724,7 +6724,7 @@ mod card_scheduling_tests {
 
     /// 看板调度器端到端:一张 `next_launch` 交出的卡被起成可见会话 → 插件收到
     /// `board.mark_running(thread_id)`;会话收尾后,宿主把它对账成
-    /// `board.mark_terminal(awaiting_merge)` 并从跟踪表移除。
+    /// `board.mark_terminal(awaiting_merge)`,但**仍保留跟踪**——它的会话可能追问续跑。
     ///
     /// 走**真 `run_once` + 真 `ServeLauncher` + 真 socket 转发**,是 6c
     /// 「接线」的最小完整闭环。
@@ -6871,9 +6871,10 @@ mod card_scheduling_tests {
             terminal[0]["params"]["outcome"], "awaiting_merge",
             "failed/needs_you have no production source yet, so awaiting_merge is the only outcome"
         );
-        assert!(
-            tracked.is_empty(),
-            "the reconciled card stops being tracked"
+        assert_eq!(
+            tracked.get("card-1").map(|t| t.state),
+            Some(crate::card_scheduler::TrackState::AwaitingMerge),
+            "the reconciled card stays tracked so a later turn can revive it"
         );
     }
 

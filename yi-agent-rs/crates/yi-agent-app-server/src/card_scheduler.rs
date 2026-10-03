@@ -14,9 +14,13 @@ use crate::server::{BoardCard, board_cards, board_query};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
+    /// The session's turn finished: the card is ready for review.
     AwaitingMerge,
     NeedsYou,
     Failed,
+    /// The card is (again) running: a follow-up turn started after the card had
+    /// already been reported `awaiting_merge`/`needs_you`.
+    Running,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,14 +32,33 @@ pub(crate) enum CardAction {
     },
 }
 
+/// What the host last told the plugin about a tracked card. A card we reported
+/// `awaiting_merge`/`needs_you` is still tracked, so a later turn can revive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrackState {
+    Running,
+    AwaitingMerge,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct TrackedThread {
     pub thread_id: String,
+    pub state: TrackState,
+    /// The thread has no in-flight turn right now.
     pub idle: bool,
     pub failed: bool,
     pub needs_you: bool,
 }
 
+/// Decide what to tell the plugin about each tracked card.
+///
+/// A lone idle snapshot is **not** proof that a card is done: a follow-up turn
+/// (or automatic continuation) can start seconds later. So a tracked card is
+/// only reported `awaiting_merge` when its still-`Running` entry goes idle, and
+/// an entry we already reported as `awaiting_merge` is flipped back to
+/// `Running` as soon as its thread is busy again. Cards the host does not track
+/// (foreign cards, or `running` cards whose session this process cannot see)
+/// are left untouched.
 pub(crate) fn plan(
     cards: &[BoardCard],
     tracked: &HashMap<String, TrackedThread>,
@@ -43,26 +66,44 @@ pub(crate) fn plan(
     cards
         .iter()
         .filter_map(|card| {
-            if card.state != "running" {
+            // Terminal cards can never come back; leave them alone.
+            if matches!(card.state.as_str(), "done" | "failed" | "cancelled") {
                 return None;
             }
-            let thread_id = card.thread_id.clone()?;
             let t = tracked.get(&card.id)?;
-            if !t.idle {
-                return None;
+            let thread_id = card
+                .thread_id
+                .clone()
+                .unwrap_or_else(|| t.thread_id.clone());
+            match t.state {
+                TrackState::Running => {
+                    if !t.idle {
+                        return None;
+                    }
+                    let outcome = if t.failed {
+                        Outcome::Failed
+                    } else if t.needs_you {
+                        Outcome::NeedsYou
+                    } else {
+                        Outcome::AwaitingMerge
+                    };
+                    Some(CardAction::Reconcile {
+                        card_id: card.id.clone(),
+                        thread_id,
+                        outcome,
+                    })
+                }
+                TrackState::AwaitingMerge => {
+                    if t.idle {
+                        return None;
+                    }
+                    Some(CardAction::Reconcile {
+                        card_id: card.id.clone(),
+                        thread_id,
+                        outcome: Outcome::Running,
+                    })
+                }
             }
-            let outcome = if t.failed {
-                Outcome::Failed
-            } else if t.needs_you {
-                Outcome::NeedsYou
-            } else {
-                Outcome::AwaitingMerge
-            };
-            Some(CardAction::Reconcile {
-                card_id: card.id.clone(),
-                thread_id,
-                outcome,
-            })
         })
         .collect()
 }
@@ -113,6 +154,7 @@ fn outcome_name(outcome: &Outcome) -> &'static str {
         Outcome::AwaitingMerge => "awaiting_merge",
         Outcome::NeedsYou => "needs_you",
         Outcome::Failed => "failed",
+        Outcome::Running => "running",
     }
 }
 
@@ -122,7 +164,12 @@ fn outcome_name(outcome: &Outcome) -> &'static str {
 /// 1. **启动**:反复 `board.next_launch` 直到 null;每张卡起会话成功后
 ///    `board.mark_running` 并登记 `tracked`,失败则 `board.release`。
 /// 2. **对账**:先用注入的 `flags` 刷新 `tracked.idle`,再 `board_cards` +
-///    `plan`,把每个 Reconcile 回写 `board.mark_terminal` 并从 `tracked` 移除。
+///    `plan`,把每个 Reconcile 回写插件。对账**保留 tracked**(不摘除):
+///    - 仍在跑的卡空闲 → `board.mark_terminal(awaiting_merge|needs_you|failed)`,
+///      记为 `AwaitingMerge`并继续跟踪(会话可能追问续跑);
+///    - 已判 `awaiting_merge` 的卡所在会话又忙起来 → `board.mark_running`,
+///      让卡片状态跟着会话走;
+///    - `failed` 摘除跟踪。
 ///
 /// 所有插件访问都走 `board_query` / `board_cards`(绝不直接读 board.json),
 /// 且**不向任何客户端发帧**——起会话的帧副作用被隔离在 `CardLauncher` 之后。
@@ -193,6 +240,7 @@ pub(crate) async fn run_once<L: CardLauncher>(
                     card_id,
                     TrackedThread {
                         thread_id,
+                        state: TrackState::Running,
                         idle: false,
                         failed: false,
                         needs_you: false,
@@ -224,15 +272,39 @@ pub(crate) async fn run_once<L: CardLauncher>(
     };
     for action in plan(&cards, tracked) {
         let CardAction::Reconcile {
-            card_id, outcome, ..
+            card_id,
+            thread_id,
+            outcome,
         } = action;
-        let _ = board_query(
-            project,
-            board_dir,
-            "board.mark_terminal",
-            json!({ "card_id": card_id, "outcome": outcome_name(&outcome) }),
-        );
-        tracked.remove(&card_id);
+        let (method, params) = match &outcome {
+            Outcome::Running => (
+                "board.mark_running",
+                json!({ "card_id": card_id, "thread_id": thread_id }),
+            ),
+            _ => (
+                "board.mark_terminal",
+                json!({ "card_id": card_id, "outcome": outcome_name(&outcome) }),
+            ),
+        };
+        let _ = board_query(project, board_dir, method, params);
+        match &outcome {
+            // Terminal: stop tracking; the card will not come back.
+            Outcome::Failed => {
+                tracked.remove(&card_id);
+            }
+            // A follow-up turn revived the card: track it as running again.
+            Outcome::Running => {
+                if let Some(entry) = tracked.get_mut(&card_id) {
+                    entry.state = TrackState::Running;
+                }
+            }
+            // Ready for review, but keep tracking so a later turn can revive it.
+            Outcome::AwaitingMerge | Outcome::NeedsYou => {
+                if let Some(entry) = tracked.get_mut(&card_id) {
+                    entry.state = TrackState::AwaitingMerge;
+                }
+            }
+        }
     }
 }
 
@@ -259,6 +331,21 @@ mod tests {
         }
     }
 
+    pub(crate) fn tt(
+        thread_id: &str,
+        state: TrackState,
+        idle: bool,
+        needs_you: bool,
+    ) -> TrackedThread {
+        TrackedThread {
+            thread_id: thread_id.into(),
+            state,
+            idle,
+            failed: false,
+            needs_you,
+        }
+    }
+
     #[test]
     fn a_queued_card_is_not_launched_by_plan_because_the_plugin_owns_slots() {
         // plan() 只负责「对账已 tracked 的卡片」；启动由 next_launch 驱动，不在 plan 里。
@@ -269,32 +356,23 @@ mod tests {
     #[test]
     fn a_tracked_card_whose_thread_finished_with_changes_awaits_merge() {
         let mut tracked = HashMap::new();
-        tracked.insert(
-            "a".to_string(),
-            TrackedThread {
-                thread_id: "t1".into(),
-                idle: true,
-                failed: false,
-                needs_you: false,
-            },
-        );
+        tracked.insert("a".to_string(), tt("t1", TrackState::Running, true, false));
         let actions = plan(&[card("a", "running")], &tracked);
         assert!(matches!(actions.as_slice(),
             [CardAction::Reconcile { card_id, outcome: Outcome::AwaitingMerge, .. }] if card_id == "a"));
     }
 
     #[test]
+    fn a_busy_tracked_card_is_left_alone() {
+        let mut tracked = HashMap::new();
+        tracked.insert("a".to_string(), tt("t1", TrackState::Running, false, false));
+        assert!(plan(&[card("a", "running")], &tracked).is_empty());
+    }
+
+    #[test]
     fn an_idle_thread_without_changes_needs_you() {
         let mut tracked = HashMap::new();
-        tracked.insert(
-            "a".to_string(),
-            TrackedThread {
-                thread_id: "t1".into(),
-                idle: true,
-                failed: false,
-                needs_you: true,
-            },
-        );
+        tracked.insert("a".to_string(), tt("t1", TrackState::Running, true, true));
         let actions = plan(&[card("a", "running")], &tracked);
         assert!(matches!(
             &actions[0],
@@ -304,11 +382,54 @@ mod tests {
             }
         ));
     }
+
+    /// 一条空闲快照把卡判成 `awaiting_merge` 后，其会话再忙起来必须把卡翻回
+    /// `running`——否则卡片会停在错误的终态（本 bug 的核心）。
+    #[test]
+    fn a_card_awaiting_review_is_revived_when_its_thread_runs_again() {
+        let mut tracked = HashMap::new();
+        tracked.insert(
+            "a".to_string(),
+            tt("t1", TrackState::AwaitingMerge, false, false),
+        );
+        let actions = plan(&[card("a", "awaiting_merge")], &tracked);
+        assert!(matches!(actions.as_slice(),
+            [CardAction::Reconcile { card_id, outcome: Outcome::Running, .. }] if card_id == "a"));
+    }
+
+    #[test]
+    fn an_idle_awaiting_review_card_stays_awaiting_review() {
+        let mut tracked = HashMap::new();
+        tracked.insert(
+            "a".to_string(),
+            tt("t1", TrackState::AwaitingMerge, true, false),
+        );
+        assert!(plan(&[card("a", "awaiting_merge")], &tracked).is_empty());
+    }
+
+    #[test]
+    fn a_card_the_host_does_not_track_is_left_alone() {
+        // 别的进程起的会话，或本进程看不到的 running 卡，都不该被误判。
+        assert!(plan(&[card("a", "running")], &Default::default()).is_empty());
+    }
+
+    #[test]
+    fn a_terminal_card_is_never_revived() {
+        let mut tracked = HashMap::new();
+        tracked.insert(
+            "a".to_string(),
+            tt("t1", TrackState::AwaitingMerge, false, false),
+        );
+        for state in ["done", "failed", "cancelled"] {
+            assert!(plan(&[card("a", state)], &tracked).is_empty(), "{state}");
+        }
+    }
 }
 
 #[cfg(test)]
 mod scheduler_tests {
     use super::*;
+    use crate::card_scheduler::tests::tt;
     use std::collections::VecDeque;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -508,9 +629,10 @@ mod scheduler_tests {
         assert_eq!(tracked_thread.thread_id, "thread-1");
     }
 
-    /// 一个已 tracked 且已 idle 的 running 卡,对账后被回写终态并停止跟踪。
+    /// 一个已 tracked 且已 idle 的 running 卡,对账后被回写 `awaiting_merge`,但
+    /// **仍被跟踪**——它的会话稍后可能追问续跑。
     #[tokio::test]
-    async fn an_idle_tracked_thread_is_reconciled_to_a_terminal_card() {
+    async fn an_idle_tracked_thread_is_reconciled_to_awaiting_merge() {
         let board = FakeBoard::new(
             Vec::new(),
             serde_json::json!({"cards": [
@@ -521,12 +643,7 @@ mod scheduler_tests {
         let mut tracked = HashMap::new();
         tracked.insert(
             "c1".to_string(),
-            TrackedThread {
-                thread_id: "thread-1".to_string(),
-                idle: false,
-                failed: false,
-                needs_you: false,
-            },
+            tt("thread-1", TrackState::Running, false, false),
         );
         let mut launcher = FakeLauncher::default();
 
@@ -540,11 +657,56 @@ mod scheduler_tests {
         .await;
 
         assert!(launcher.seen.is_empty(), "nothing to launch");
-        assert!(!tracked.contains_key("c1"), "the card is handed back");
+        assert!(
+            board.calls_to("board.mark_running").is_empty(),
+            "a first-turn idle snapshot must not be reported as running"
+        );
         let terminal = board.calls_to("board.mark_terminal");
         assert_eq!(terminal.len(), 1, "{:?}", board.calls.lock().unwrap());
         assert_eq!(terminal[0]["params"]["card_id"], "c1");
         assert_eq!(terminal[0]["params"]["outcome"], "awaiting_merge");
+        assert_eq!(
+            tracked.get("c1").map(|t| t.state),
+            Some(TrackState::AwaitingMerge),
+            "the card stays tracked so a later turn can revive it"
+        );
+    }
+
+    /// 已判 `awaiting_merge` 的卡，其会话又开始跑（追问/自动续跑）→ 卡片翻回
+    /// `running`。这正是本 bug 的修复点：误判后的卡必须能被纠正回来。
+    #[tokio::test]
+    async fn a_card_awaiting_review_is_revived_when_its_thread_runs_again() {
+        let board = FakeBoard::new(
+            Vec::new(),
+            serde_json::json!({"cards": [
+                {"id": "c1", "state": "awaiting_merge", "thread_id": "thread-1",
+                 "spec_path": "s", "plan_path": "p"}
+            ]}),
+        );
+        let mut tracked = HashMap::new();
+        tracked.insert(
+            "c1".to_string(),
+            tt("thread-1", TrackState::AwaitingMerge, true, false),
+        );
+        let mut launcher = FakeLauncher::default();
+
+        run_once(
+            &board.project,
+            &board.board_dir,
+            &mut tracked,
+            &mut launcher,
+            &thread_flags(|_| false),
+        )
+        .await;
+
+        let running = board.calls_to("board.mark_running");
+        assert_eq!(running.len(), 1, "{:?}", board.calls.lock().unwrap());
+        assert_eq!(running[0]["params"]["card_id"], "c1");
+        assert_eq!(running[0]["params"]["thread_id"], "thread-1");
+        assert_eq!(
+            tracked.get("c1").map(|t| t.state),
+            Some(TrackState::Running)
+        );
     }
 
     /// launch 失败时释放名额,绝不能谎报 running。
