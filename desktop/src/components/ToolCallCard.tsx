@@ -25,7 +25,9 @@ export function ToolCallCard({ item }: { item: ToolCallItem }) {
         className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-raised/50"
       >
         <span className="text-fg-subtle">{open ? "▾" : "▸"}</span>
-        <span className="font-mono font-medium text-fg">{item.name}</span>
+        <span className="font-mono font-medium text-fg">
+          {item.name || "(unknown tool)"}
+        </span>
         {summary && (
           <span className="min-w-0 truncate font-mono text-fg-muted" title={summary}>
             {summary}
