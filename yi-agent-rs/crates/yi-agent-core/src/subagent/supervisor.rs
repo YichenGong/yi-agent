@@ -2790,6 +2790,74 @@ mod tests {
     }
 
     #[test]
+    fn a_cascade_victim_child_can_be_retried_back_to_queued() {
+        // The settled-parent cascade cancels a live child into `Cancelled`.
+        // That is a terminal state, and `RetryRequested` accepts any terminal
+        // state, so the victim is recoverable rather than a dead end. Pin it:
+        // a future terminal-state allowlist on `RetryRequested` would strand
+        // every cascade victim with no in-band way back.
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let parent = supervisor.root_task_id().clone();
+        let child = supervisor.spawn(parent.clone()).unwrap();
+        supervisor.start_task(&child).unwrap();
+
+        supervisor
+            .record_recovery_conflict(&parent, "git head moved")
+            .unwrap();
+
+        let victim_state = supervisor.task(&child).unwrap().state().clone();
+        assert!(
+            matches!(victim_state, TaskState::Cancelled(_)),
+            "a live descendant of a settled parent is cancelled, got {victim_state:?}"
+        );
+        assert!(
+            victim_state.is_terminal(),
+            "the cascade victim must be terminal"
+        );
+
+        let successor = supervisor.retry_task(&child).unwrap();
+
+        assert_eq!(
+            supervisor.task(&child).unwrap().state(),
+            &TaskState::Queued,
+            "a cascade victim must be retryable back to `queued`, not a dead end"
+        );
+        assert_eq!(successor.number, 2);
+        assert_eq!(
+            supervisor.task(&child).unwrap().active_attempt_id(),
+            &successor.id
+        );
+    }
+
+    #[test]
+    fn a_blocked_task_can_be_retried_back_to_queued() {
+        // `Blocked` (here, a recovery conflict) is a settled terminal the
+        // reducer reaches from `Running`. It must stay reachable by
+        // `RetryRequested`; if it ever became a state with no way back, a
+        // blocked parent could never resume.
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let task = supervisor.root_task_id().clone();
+        supervisor.start_task(&task).unwrap();
+
+        supervisor
+            .record_recovery_conflict(&task, "git head moved")
+            .unwrap();
+        assert!(
+            matches!(supervisor.task(&task).unwrap().state(), TaskState::Blocked(_)),
+            "a recovery conflict settles the task in `Blocked`"
+        );
+
+        let successor = supervisor.retry_task(&task).unwrap();
+
+        assert_eq!(
+            supervisor.task(&task).unwrap().state(),
+            &TaskState::Queued,
+            "a blocked task must be retryable back to `queued`"
+        );
+        assert_eq!(successor.number, 2);
+    }
+
+    #[test]
     fn supervisor_remembers_fork_messages_per_task() {
         let mut supervisor =
             AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
