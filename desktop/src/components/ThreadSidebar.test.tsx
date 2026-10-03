@@ -521,6 +521,51 @@ describe("ThreadSidebar 看板", () => {
     // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-neutral-800/50 被当选中态。
     expect(idleClasses).not.toContain("bg-neutral-800");
   });
+
+  it("把卡片会话收进默认折叠的「看板会话」小节，展开后可见", () => {
+    const withCard: WorkspaceGroup[] = [
+      {
+        workspace: "/proj",
+        exists: true,
+        threads: [
+          thread("t-plain", "plain-thread", "/proj"),
+          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
+
+    // 小节存在，但默认折叠 → 卡片行不可见，普通行仍在。
+    expect(screen.getByLabelText("看板会话")).toBeTruthy();
+    expect(container.textContent).not.toContain("看板 · card-1");
+    expect(container.textContent).toContain("plain-thread");
+
+    fireEvent.click(screen.getByLabelText("看板会话"));
+    expect(container.textContent).toContain("看板 · card-1");
+  });
+
+  it("没有卡片会话时不渲染「看板会话」小节", () => {
+    const { container } = renderSidebar({ groups: boardGroups, boards: ["/proj"] });
+    expect(container.querySelector('[aria-label="看板会话"]')).toBeNull();
+    expect(container.textContent).toContain("board-thread");
+  });
+
+  it("看板被移除后卡片会话仍留在小节里（不整批消失）", () => {
+    const withCard: WorkspaceGroup[] = [
+      {
+        workspace: "/proj",
+        exists: true,
+        threads: [
+          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+        ],
+      },
+    ];
+    // boards 为空 = 该项目的看板已被移除。
+    const { container } = renderSidebar({ groups: withCard, boards: [] });
+    expect(screen.getByLabelText("看板会话")).toBeTruthy();
+    fireEvent.click(screen.getByLabelText("看板会话"));
+    expect(container.textContent).toContain("看板 · card-1");
+  });
 });
 
 describe("ThreadSidebar pinned section", () => {
