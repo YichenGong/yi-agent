@@ -12,6 +12,9 @@ export function MessageInput({
   mode,
   onModeChange,
   onSlashCommand,
+  value,
+  onDraftChange,
+  disabled = false,
 }: {
   turnActive: boolean;
   onSend: (text: string) => Promise<boolean>;
@@ -19,8 +22,21 @@ export function MessageInput({
   mode: ThreadMode | null;
   onModeChange: (mode: ThreadMode) => void;
   onSlashCommand: (name: string, args: string | null) => void;
+  /**
+   * 文本框内容，由父级按 session 提供（不是本组件的内部状态）。
+   *
+   * 草稿属于「那个会话」，不属于「这个输入框」：受控后切换 session 时父级直接
+   * 换掉 value，上一处的文字留在原 session 的 `draft` 里，不会跟着跑到新会话。
+   */
+  value: string;
+  /** 用户每次改动文本框；父级把它写进当前 session 的 `draft`。 */
+  onDraftChange: (text: string) => void;
+  /**
+   * 没有当前 session 时置灰整个输入区（App 不会无会话渲染它，这一层是护栏）：
+   * 否则会留下一个能敲字、却因无处存放草稿而静默丢字的文本框。
+   */
+  disabled?: boolean;
 }) {
-  const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   // Latch: whether the popup should currently be offered. Escape clears it to
   // dismiss; typing re-arms it from the text's own shape (see onChange).
@@ -31,6 +47,7 @@ export function MessageInput({
   // `isImeCompositionKey` for why keyCode 229 is the load-bearing check here.
   const ime = useImeGuard();
 
+  const text = value;
   const parsed = parseSlashInput(text);
   // Command names contain no spaces (the catalog has no argument-bearing
   // names), so a space means the caret left the name for the argument list and
@@ -52,7 +69,7 @@ export function MessageInput({
       const ok = await onSend(text);
       // Only discard the draft once the send was actually accepted; otherwise
       // the user's text would be lost on a rejected turn/start.
-      if (ok) setText("");
+      if (ok) onDraftChange("");
     } finally {
       setSending(false);
     }
@@ -61,7 +78,7 @@ export function MessageInput({
   /** Run the slash command the input currently names (or report it unknown). */
   const runSlash = (name: string, args: string | null) => {
     onSlashCommand(name, args);
-    setText("");
+    onDraftChange("");
     setPopupOpen(false);
   };
 
@@ -73,7 +90,7 @@ export function MessageInput({
         value={text}
         onChange={(e) => {
           const next = e.target.value;
-          setText(next);
+          onDraftChange(next);
           // Re-arm the popup whenever the text still looks like a command name.
           setPopupOpen(/^\/[^\s/]*$/.test(next.trim()));
         }}
@@ -96,7 +113,7 @@ export function MessageInput({
             if (e.key === "Tab") {
               e.preventDefault();
               const picked = options[Math.min(selected, options.length - 1)];
-              setText(`/${picked.name} `);
+              onDraftChange(`/${picked.name} `);
               setPopupOpen(false);
               inputRef.current?.focus();
               return;
@@ -153,7 +170,7 @@ export function MessageInput({
             void handleSend();
           }
         }}
-        disabled={sending || turnActive}
+        disabled={disabled || sending || turnActive}
         rows={3}
         placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
         className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50"
@@ -162,7 +179,7 @@ export function MessageInput({
       <button
         type="button"
         onClick={turnActive ? onInterrupt : () => void handleSend()}
-        disabled={sending}
+        disabled={disabled || sending}
         className={
           turnActive
             ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"

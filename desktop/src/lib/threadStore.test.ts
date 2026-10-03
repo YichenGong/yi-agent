@@ -155,4 +155,23 @@ describe("ThreadStore", () => {
     expect(s.currentId).toBeNull();
     expect(s.peek("a")).toBeUndefined();
   });
+
+  it("keeps an unsent draft per thread and returns it on switch-back", () => {
+    const s = new ThreadStore();
+    s.select("a");
+    s.setDraft("a", "half-typed");
+    // Switching to another thread must not expose a's draft there.
+    s.select("b");
+    expect(s.view("b").draft).toBe("");
+    // Switching back restores exactly what a was left holding.
+    s.select("a");
+    expect(s.view("a").draft).toBe("half-typed");
+  });
+
+  it("drops a thread's draft together with the thread", () => {
+    const s = new ThreadStore();
+    s.setDraft("a", "half-typed");
+    s.drop("a");
+    expect(s.peek("a")).toBeUndefined();
+  });
 });

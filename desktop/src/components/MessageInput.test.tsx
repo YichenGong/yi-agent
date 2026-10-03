@@ -1,7 +1,8 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
+import { useState } from "react";
 import { MessageInput } from "./MessageInput";
 
 afterEach(cleanup);
@@ -14,9 +15,27 @@ function renderInput(overrides: Partial<ComponentProps<typeof MessageInput>> = {
     mode: "normal",
     onModeChange: vi.fn(),
     onSlashCommand: vi.fn(),
+    value: "",
+    onDraftChange: vi.fn(),
     ...overrides,
   };
-  return { ...render(<MessageInput {...props} />), props };
+  // The composer is controlled: mirror `onDraftChange` back into `value` exactly
+  // as App does (against the current session's draft), so typing behaves like the
+  // real app instead of a frozen value.
+  function Harness() {
+    const [value, setValue] = useState(props.value);
+    return (
+      <MessageInput
+        {...props}
+        value={value}
+        onDraftChange={(next) => {
+          props.onDraftChange(next);
+          setValue(next);
+        }}
+      />
+    );
+  }
+  return { ...render(<Harness />), props };
 }
 
 const modeTrigger = () => screen.getByRole("button", { name: /mode/i });
@@ -144,6 +163,40 @@ describe("MessageInput", () => {
     expect(focusBorder).toMatch(/^focus:border-(line|line-strong|fg|fg-muted|fg-subtle|fg-faint)$/);
     // 不写字面色阶，否则两套主题里必有一套观感错。
     expect(textarea.className).not.toMatch(/focus:border-neutral-/);
+  });
+
+  it("does not keep a draft of its own: the value prop owns the text", () => {
+    const onDraftChange = vi.fn();
+    renderInput({ value: "from-thread-a", onDraftChange });
+    // Controlled: what the parent hands down is exactly what the box shows,
+    // regardless of any earlier text this instance may have carried.
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("from-thread-a");
+  });
+
+  it("discards the draft through onDraftChange once a send is accepted", async () => {
+    const onSend = vi.fn(async () => true);
+    const onDraftChange = vi.fn();
+    renderInput({ onSend, onDraftChange });
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+    expect(onSend).toHaveBeenCalledWith("hello");
+    await waitFor(() => expect((textarea as HTMLTextAreaElement).value).toBe(""));
+    expect(onDraftChange).toHaveBeenLastCalledWith("");
+  });
+
+  it("keeps the draft when a send is rejected", async () => {
+    const onSend = vi.fn(async () => false);
+    renderInput({ onSend });
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "doomed" } });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+    expect(onSend).toHaveBeenCalledWith("doomed");
+    expect((textarea as HTMLTextAreaElement).value).toBe("doomed");
   });
 
   describe("slash commands", () => {

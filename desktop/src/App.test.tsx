@@ -501,6 +501,39 @@ describe("App parallel threads", () => {
     expect(clients[0].requests.map((r) => r.method)).not.toContain("turn/interject");
   });
 
+  it("keeps each thread's unsent draft out of the others", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    // Auto-resumes t1; wait until the composer belongs to it.
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const box = () => screen.getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(box(), { target: { value: "for one" } });
+    expect(box().value).toBe("for one");
+
+    // Switch to t2: the box must start empty, not carry t1's draft over.
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2),
+    );
+    expect(box().value).toBe("");
+
+    // t2 gets its own draft.
+    fireEvent.change(box(), { target: { value: "for two" } });
+
+    // Back to t1 (warm): its draft is restored; t2's stayed in t2.
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() => expect(box().value).toBe("for one"));
+
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(box().value).toBe("for two"));
+  });
+
   it("does not lose a background thread's timeline when switching", async () => {
     state.threads = [
       { thread_id: "t1", title: "one", permission_mode: "normal" },
