@@ -160,12 +160,14 @@ pub enum Command {
         /// token (unauthenticated clients are closed with ws code 4401).
         #[arg(long, default_value = "stdio://")]
         listen: String,
-        /// Bridge to a reverse WSS relay instead of opening an inbound port.
+        /// Compose stdio with a reverse WSS relay: one session, both clients.
         ///
         /// Takes the relay's computer-side endpoint, e.g.
-        /// `wss://relay.example/connect?session=<id>`. Equivalent to
-        /// `--listen relay://<same url>`. In this mode the app-server binds a
-        /// loopback ws server on 127.0.0.1:0 and dials the relay outbound.
+        /// `wss://relay.example/connect?session=<id>`. The app-server keeps
+        /// serving the stdio client (the desktop GUI) and *also* dials the relay
+        /// outbound from a loopback ws server on 127.0.0.1:0, so the phone joins
+        /// the very same session (same `serve()` and hub). For the pure-relay
+        /// form, with no stdio client, use `--listen relay://<same url>` instead.
         #[arg(long)]
         relay: Option<String>,
     },
