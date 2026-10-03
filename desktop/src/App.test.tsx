@@ -1802,3 +1802,34 @@ describe("App mobile layout (phone client)", () => {
     expect(screen.queryByLabelText("会话列表")).toBeNull();
   });
 });
+
+// 包裹会话栏的 div 必须自带高度约束（flex + min-h-0）。它无条件存在，桌面端只是
+// 没有手机类名；一旦退回块级容器，`aside` 会按内容取高并溢出这一行，把文档整体
+// 撑高——内层 `flex-1 overflow-y-auto` 因此永不滚动，整页却能上下滑动（回归）。
+describe("App sidebar wrapper constrains height", () => {
+  const wrapperOf = (root: HTMLElement) =>
+    root.querySelector('[aria-label="Resize sidebar"]')!.closest("aside")!.parentElement!;
+
+  it("gives the desktop sidebar wrapper a flex height constraint", async () => {
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const wrapper = wrapperOf(container);
+    expect(wrapper.className).toContain("flex");
+    expect(wrapper.className).toContain("min-h-0");
+  });
+
+  it("keeps the height constraint on the phone drawer wrapper too", async () => {
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("会话列表")).toBeTruthy());
+    const wrapper = wrapperOf(container);
+    expect(wrapper.className).toContain("app-sidebar");
+    expect(wrapper.className).toContain("flex");
+    expect(wrapper.className).toContain("min-h-0");
+  });
+});
