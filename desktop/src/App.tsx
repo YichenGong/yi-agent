@@ -145,6 +145,9 @@ export default function App() {
   const [detailStack, setDetailStack] = useState<string[]>([]);
   const [traceRows, setTraceRows] = useState<AgentTraceSnapshotResult["rows"]>([]);
   const openSubagent = detailStack.length > 0 ? detailStack[detailStack.length - 1] : null;
+  // 当前对话的子 agent 行。状态栏入口（数量徽标、是否有内容）与右侧面板共用同一份，
+  // 故在此派生一次，不在 JSX 里重复取。
+  const railRows = currentId ? railStore.get(currentId) : [];
   // 通知回调在 effect 里注册一次,读不到最新的 state,所以当前打开的任务放在 ref。
   const openTaskId = useRef<string | null>(null);
   useEffect(() => {
@@ -1305,6 +1308,36 @@ export default function App() {
             model={current?.info?.model ?? null}
             status={status}
             usage={current?.session.usage ?? null}
+            /*
+             * 子 agent 栏的**常驻**入口。入口必须待在收起动作够不着的地方：
+             * 它若跟着面板一起消失（面板自己的「收起」曾是这个开关的唯一去处），
+             * 用户就再也无法把它打开——收起变成单向操作。这里改用状态栏右侧的
+             * 一个「拓展」图标，收起时它仍在，故收起/展开可逆。
+             * 手机端子 agent 栏是抽屉，入口不适用（与侧栏一致）。
+             * 标签用「子 agent 面板」而非「收起/展开子 agent」，以免与面板内
+             * 那颗同名按钮的无障碍名撞车（两个同名控件会让人/测试都选不准）。
+             */
+            actions={
+              currentId && !isMobile ? (
+                <button
+                  type="button"
+                  aria-label="子 agent 面板"
+                  aria-expanded={!railCollapsed}
+                  title={railCollapsed ? "展开子 agent 栏" : "收拢子 agent 栏"}
+                  onClick={() => setRailCollapsed((v) => !v)}
+                  className={`flex items-center gap-1 rounded p-1 hover:bg-raised/50 hover:text-fg ${
+                    railRows.length > 0 ? "text-fg-muted" : "text-fg-subtle"
+                  } ${railCollapsed ? "" : "bg-raised/40"}`}
+                >
+                  <svg viewBox="0 0 16 16" className="size-4" fill="currentColor" aria-hidden="true">
+                    <path d="M1.5 3.5h5.2v9H1.5v-9Zm1.2 1.2v6.6h2.8V4.7H2.7Z" />
+                    <path d="M9.1 5.8 11.3 8 9.1 10.2V5.8Z" />
+                    <path d="M12.2 5.8 14.4 8l-2.2 2.2V5.8Z" />
+                  </svg>
+                  {railRows.length > 0 && <span className="text-xs">{railRows.length}</span>}
+                </button>
+              ) : null
+            }
           />
           <ChatView
             items={current?.session.items ?? []}
