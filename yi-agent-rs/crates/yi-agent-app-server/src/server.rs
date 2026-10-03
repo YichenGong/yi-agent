@@ -4595,6 +4595,12 @@ async fn run_thread_driver(
                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                 // run() 失败即本轮结束:thread 立刻回 Idle(失败是事件不是状态)。
                 let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
+                // 本轮已结束（失败）：turn 开始写的 checkpoint 必须清掉，否则盘上会
+                // 留一条已结束 turn 的残留，重启后被 resume 当成待恢复 turn。
+                // 与其它 clear 站点同款：尽力删，失败只记 stderr，绝不影响 turn 收尾。
+                if let Err(e) = store.clear_partial(&thread_id) {
+                    eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                }
                 continue;
             }
         };
@@ -7760,10 +7766,15 @@ pub(crate) mod tests {
         ))
         .await;
 
-        // 等到 agent 的 item/completed（助手文本块）出现 —— 说明已 finalize 过。
+        // 等到**助手 item** 的 item/completed 出现 —— 说明这一块文本已 finalize、
+        // checkpoint 已被标脏。注意不能只等第一个 item/completed：turn 开启时发
+        // 的用户 item 也是 item/completed，只等"第一个"会在助手文本 finalize 之前
+        // 就 break，断言便退化成只校验 turn-start 那次写入（那时 flush 分支从未跑过）。
         loop {
             let v = h.read_value().await;
-            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed") {
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
+                && v["params"]["item"]["type"] == serde_json::json!("agentMessage")
+            {
                 break;
             }
         }
@@ -7772,16 +7783,50 @@ pub(crate) mod tests {
             .path()
             .join(".yi-agent/threads")
             .join(format!("{tid}.partial.json"));
-        // checkpoint 是去抖写的，轮询等待。
-        let mut text = String::new();
+        // checkpoint 是去抖写的，轮询等待。这里只接受"已 finalize 的助手 item 也
+        // 在盘上"的版本：turn-start 那次写入只有用户 item（items 长度 1），
+        // 助手 item 只能由 500ms tick 的 flush 分支落盘。
+        let mut saved: Option<serde_json::Value> = None;
         for _ in 0..100 {
-            match std::fs::read_to_string(&partial) {
-                Ok(t) if t.contains("do work") => { text = t; break; }
-                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            if let Ok(t) = std::fs::read_to_string(&partial) {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["items"].as_array().map(|a| a.len() >= 2).unwrap_or(false) {
+                    saved = Some(v);
+                    break;
+                }
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(text.contains("do work"), "checkpoint must carry the prompt: {text:?}");
-        assert!(text.contains("user-"), "checkpoint must carry the opening user item: {text:?}");
+        let saved = saved.expect(
+            "checkpoint must carry the finalized assistant item; only the debounced flush can write it",
+        );
+        let items = saved["items"].as_array().unwrap();
+        // turn-start 那次写入只有用户 item（长度 1）；助手 item 只能由 flush 落盘。
+        assert!(
+            items.len() >= 2,
+            "checkpoint must carry the finalized assistant item (turn-start write has only the user item): {items:?}"
+        );
+        assert_eq!(
+            items[0]["type"],
+            serde_json::json!("userMessage"),
+            "checkpoint must carry the opening user item: {items:?}"
+        );
+        assert_eq!(
+            items[0]["text"],
+            serde_json::json!("do work"),
+            "checkpoint must carry the prompt: {items:?}"
+        );
+        let assistant = items
+            .iter()
+            .find(|i| i["type"] == serde_json::json!("agentMessage"))
+            .unwrap_or_else(|| {
+                panic!("checkpoint must carry the finalized assistant item; only the debounced flush can write it: {items:?}")
+            });
+        assert_eq!(
+            assistant["text"],
+            serde_json::json!("a"),
+            "checkpoint must carry the finalized assistant text: {items:?}"
+        );
 
         h.shutdown().await;
     }
