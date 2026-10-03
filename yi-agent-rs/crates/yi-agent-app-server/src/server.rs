@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
+use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
 use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
@@ -28,7 +29,6 @@ use crate::protocol::{
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
 };
-use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
@@ -2473,6 +2473,8 @@ where
                             &perm_seq,
                             &theme,
                             &workspaces,
+                            None,
+                            None,
                         )
                         .await?;
 
@@ -4183,6 +4185,8 @@ fn thread_summary_json(
         "title": m.title,
         "permission_mode": m.permission_mode,
         "pinned": m.pin_seq.is_some(),
+        "board_project": m.board_project,
+        "card_id": m.card_id,
         "status": thread_status(threads, &m.thread_id),
     })
 }
@@ -4976,14 +4980,8 @@ async fn card_scheduler_tick<F>(
             workspaces,
             build_agent,
         };
-        crate::card_scheduler::run_once(
-            &board.project,
-            board_dir,
-            tracked,
-            &mut launcher,
-            &flags,
-        )
-        .await;
+        crate::card_scheduler::run_once(&board.project, board_dir, tracked, &mut launcher, &flags)
+            .await;
     }
 }
 
@@ -5072,6 +5070,8 @@ where
             self.perm_seq,
             self.theme,
             self.workspaces,
+            Some(&request.board_project),
+            Some(&request.card_id),
         )
         .await?;
 
@@ -5081,9 +5081,7 @@ where
         if !request.title.is_empty() {
             if let Some(session) = self.threads.get(&thread_id) {
                 if let Err(error) = session.store.rename(&thread_id, &request.title) {
-                    eprintln!(
-                        "[app-server] could not title board thread {thread_id}: {error}"
-                    );
+                    eprintln!("[app-server] could not title board thread {thread_id}: {error}");
                 }
             }
         }
@@ -5228,6 +5226,8 @@ async fn start_thread_core(
     perm_seq: &Arc<AtomicU64>,
     theme: &crate::theme_tool::ThemeHandle,
     workspaces: &WorkspaceIndex,
+    board_project: Option<&str>,
+    card_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -5273,6 +5273,8 @@ async fn start_thread_core(
         title: None,
         permission_mode: mode,
         pin_seq: None,
+        board_project: board_project.map(str::to_string),
+        card_id: card_id.map(str::to_string),
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -6144,8 +6146,8 @@ mod card_scheduling_tests {
     impl FakeDaemon {
         fn bind(
             on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
-                + Send
-                + 'static,
+            + Send
+            + 'static,
         ) -> Self {
             let dir = tempfile::TempDir::new().unwrap();
             let project = dir.path().join("project");
@@ -6333,7 +6335,10 @@ mod card_scheduling_tests {
                     return self.is_idle(thread_id);
                 }
                 match tokio::time::timeout(remaining, self.turn_rx.recv()).await {
-                    Ok(Some(TurnEvent::Finished { thread_id: id, turn_id })) => {
+                    Ok(Some(TurnEvent::Finished {
+                        thread_id: id,
+                        turn_id,
+                    })) => {
                         if let Some(session) = self.threads.get_mut(&id) {
                             if session.active_turn_id.as_deref() == Some(turn_id.as_str()) {
                                 session.active_turn_id = None;
@@ -6364,6 +6369,7 @@ mod card_scheduling_tests {
     fn request(card_id: &str, workdir: &str) -> LaunchRequest {
         LaunchRequest {
             card_id: card_id.to_string(),
+            board_project: "/test/project".to_string(),
             workdir: workdir.to_string(),
             title: format!("看板 · {card_id}"),
             objective: format!("Implement the plan for {card_id}"),
@@ -6399,7 +6405,10 @@ mod card_scheduling_tests {
         };
 
         assert_eq!(host.threads.len(), 1, "the board thread is registered");
-        let session = host.threads.get(&thread_id).expect("the session is visible");
+        let session = host
+            .threads
+            .get(&thread_id)
+            .expect("the session is visible");
         assert_eq!(session.cwd, workdir.to_string_lossy());
         assert!(
             session.active_turn_id.is_some(),
@@ -6561,7 +6570,11 @@ mod card_scheduling_tests {
                     ) && session.active_turn_id.is_none();
                     table.insert(
                         id.clone(),
-                        ThreadFlags { idle, failed: false, needs_you: false },
+                        ThreadFlags {
+                            idle,
+                            failed: false,
+                            needs_you: false,
+                        },
                     );
                 }
             }
@@ -6589,7 +6602,10 @@ mod card_scheduling_tests {
             terminal[0]["params"]["outcome"], "awaiting_merge",
             "failed/needs_you have no production source yet, so awaiting_merge is the only outcome"
         );
-        assert!(tracked.is_empty(), "the reconciled card stops being tracked");
+        assert!(
+            tracked.is_empty(),
+            "the reconciled card stops being tracked"
+        );
     }
 
     /// 孤儿恢复:插件报 `running` 但**没有 thread_id**(本进程无法接手)的卡被
@@ -6658,6 +6674,69 @@ mod card_scheduling_tests {
         assert_eq!(running[0]["params"]["card_id"], "card-1");
 
         h.shutdown().await;
+    }
+
+    /// 一张卡被起成会话后：它落盘的 meta 与 `thread/listAll` 的条目都必须带
+    /// `board_project`(项目根) 与 `card_id`——这是侧栏归组的唯一依据。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_launched_card_records_its_board_origin() {
+        let workdir_dir = tempfile::TempDir::new().unwrap();
+        let workdir = workdir_dir.path().canonicalize().unwrap();
+        let handed = Arc::new(AtomicBool::new(false));
+        let work_path = workdir.to_string_lossy().to_string();
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "board.next_launch" => {
+                if handed.swap(true, Ordering::SeqCst) {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Ok(json!({
+                        "card_id": "card-1",
+                        "workdir": work_path,
+                        "title": "看板 · card-1"
+                    }))
+                }
+            }
+            "list" => Ok(json!({ "cards": [{
+                "id": "card-1", "state": "running",
+                "spec_path": "card-1.spec.md", "plan_path": "card-1.plan.md"
+            }] })),
+            _ => Ok(json!({ "ok": true })),
+        });
+
+        let mut host = Host::new();
+        let board_dir = tempfile::TempDir::new().unwrap();
+        yi_agent_boards::registry::register(board_dir.path(), &daemon.project).unwrap();
+        let flags = Arc::new(StdMutex::new(HashMap::<String, ThreadFlags>::new()));
+        let mut tracked: HashMap<String, TrackedThread> = HashMap::new();
+        {
+            let snapshot = Arc::clone(&flags);
+            let flags_fn = move |id: &str| snapshot.lock().unwrap().get(id).copied();
+            let mut launcher = host.launcher(&build_test_agent);
+            crate::card_scheduler::run_once(
+                &daemon.project,
+                board_dir.path(),
+                &mut tracked,
+                &mut launcher,
+                &flags_fn,
+            )
+            .await;
+        }
+
+        // meta 落盘：归属写进了卡片会话自己的 meta.json。
+        let metas = crate::thread_store::ThreadStore::new(&workdir)
+            .list()
+            .unwrap();
+        assert_eq!(metas.len(), 1, "the card session persists exactly one meta");
+        let expected_project = std::fs::canonicalize(&daemon.project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            metas[0].board_project.as_deref(),
+            Some(expected_project.as_str()),
+            "meta must carry the project root"
+        );
+        assert_eq!(metas[0].card_id.as_deref(), Some("card-1"));
     }
 }
 
@@ -11832,7 +11911,10 @@ pub(crate) mod tests {
             .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["relay_url"], json!(null), "{v}");
-        assert!(v["result"].get("relay_url").is_some(), "key must be present: {v}");
+        assert!(
+            v["result"].get("relay_url").is_some(),
+            "key must be present: {v}"
+        );
         h.shutdown().await;
     }
 
@@ -11918,10 +12000,8 @@ pub(crate) mod tests {
         let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
         initialize(&mut h).await;
 
-        h.send(
-            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":5}}"#,
-        )
-        .await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":5}}"#)
+            .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["ok"], true, "{v}");
         assert_eq!(
