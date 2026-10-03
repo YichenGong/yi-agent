@@ -8,11 +8,13 @@ export function boardJsonPath(stateDir: string): string {
  * Maps the plugin's `list` result — the `board.json` cards the runner owns under
  * `<project>/.yi-agent/superpowers-kanban/` — onto the card rows the board panel
  * renders: a non-object root or non-array `cards` yields no cards, each card is
- * validated individually (a card missing id / plan_path / state is skipped, the
- * rest are kept), `state` is lowercased, `detail` falls back from workdir to the
- * plan path (including when workdir is an empty string), and cards are sorted by
- * `order` ascending with ties keeping file order. Corrupt or unexpected input
- * yields no cards rather than throwing.
+ * validated individually (only a card missing id / state is skipped, the rest are
+ * kept — a missing `plan_path` is no longer a reason to drop a card, since merge
+ * cards have none), `state` is lowercased, `detail` falls back from workdir to the
+ * plan path (including when workdir is an empty string) and, for a merge card, to
+ * its `source → base` refs, and cards are sorted by `order` ascending with ties
+ * keeping file order. Corrupt or unexpected input yields no cards rather than
+ * throwing.
  *
  * The runner's own `dispatch` builds this shape for `list` and deliberately does
  * not forward `order` (the queue's order is the file's), so the sort below is a
@@ -37,18 +39,28 @@ export function parseBoard(json: string): BoardCard[] {
     const planPath = typeof record.plan_path === "string" ? record.plan_path : "";
     const state = typeof record.state === "string" ? record.state : "";
     const workdir = typeof record.workdir === "string" ? record.workdir : "";
+    const kind = typeof record.kind === "string" ? record.kind : "implementation";
+    const source = typeof record.source === "string" ? record.source : "";
+    const base = typeof record.base === "string" ? record.base : "";
     const order = typeof record.order === "number" ? record.order : 0;
     const threadId =
       typeof record.thread_id === "string" && record.thread_id !== ""
         ? record.thread_id
         : null;
-    if (id === "" || planPath === "" || state === "") continue;
+    // 合并卡没有 plan_path，不能再按 plan_path 丢弃；只按 id / state 校验。
+    if (id === "" || state === "") continue;
+    const detail =
+      workdir !== ""
+        ? workdir
+        : kind === "merge"
+          ? `${source} → ${base}`
+          : planPath;
     mapped.push({
       card: {
         id,
         state: state.toLowerCase(),
         progress: null,
-        detail: workdir !== "" ? workdir : planPath,
+        detail,
         threadId,
       },
       order,

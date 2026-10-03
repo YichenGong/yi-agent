@@ -66,13 +66,41 @@ describe("parseBoard", () => {
       JSON.stringify({
         cards: [
           { id: "good", plan_path: "g.plan.md", state: "Queued", order: 0 },
+          { id: "", plan_path: "e.plan.md", state: "Queued", order: 1 },
+          { id: "no-state", plan_path: "n.plan.md", state: "", order: 2 },
+        ],
+        next_order: 3,
+      }),
+    );
+    expect(cards.map((card) => card.id)).toEqual(["good"]);
+  });
+
+  it("keeps a card whose only missing field is plan_path", () => {
+    // 合并卡没有 plan_path，因此缺 plan_path 不再是丢弃理由。
+    const cards = parseBoard(
+      JSON.stringify({
+        cards: [
+          { id: "good", plan_path: "g.plan.md", state: "Queued", order: 0 },
           { id: "missing-plan", state: "Queued", order: 1 },
           { id: "", plan_path: "e.plan.md", state: "Queued", order: 2 },
         ],
         next_order: 3,
       }),
     );
-    expect(cards.map((card) => card.id)).toEqual(["good"]);
+    expect(cards.map((card) => card.id)).toEqual(["good", "missing-plan"]);
+  });
+
+  it("keeps a merge card that has no plan_path and shows its refs", () => {
+    const cards = parseBoard(
+      JSON.stringify({
+        cards: [
+          { id: "m1", state: "queued", kind: "merge", source: "kanban/a", base: "main", order: 0 },
+        ],
+      }),
+    );
+    expect(cards).toHaveLength(1);
+    expect(cards[0].id).toBe("m1");
+    expect(cards[0].detail).toBe("kanban/a → main");
   });
 
   it("falls back to the plan path when the workdir is an empty string", () => {
