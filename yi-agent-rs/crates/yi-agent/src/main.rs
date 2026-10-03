@@ -69,14 +69,7 @@ fn main() -> Result<()> {
         Some(Command::Agents { ref project, all }) => control_agents(&cli, project.clone(), all),
         Some(Command::Agent { ref action }) => control_agent(&cli, action.clone()),
         Some(Command::Schedule { ref action }) => control_schedule(&cli, action),
-        Some(Command::AppServer {
-            ref listen,
-            ref relay,
-        }) => {
-            let listen = listen.clone();
-            let relay = relay.clone();
-            run_app_server(cli, &listen, relay.as_deref())
-        }
+        Some(Command::AppServer { .. }) => run_app_server(cli),
         Some(Command::Completions { shell }) => print_completion(shell),
         Some(Command::Pair { ref action }) => run_pair(action),
         None => run_agent(cli),
@@ -116,6 +109,72 @@ fn parse_listen(listen: &str) -> Result<Listen> {
         "unsupported app-server transport `{listen}`: expected `stdio://`, \
          `ws://host:port`, or `relay://wss://host/connect?session=<id>`"
     )
+}
+
+/// `app-server` 的实际传输形态。由 [`app_server_mode`] 从 `--listen`/`--relay`
+/// 两个参数**纯粹地**推导出来,便于单测——不需要真的起 server 或建运行时。
+#[derive(Debug)]
+enum AppServerMode {
+    /// 仅 stdio(桌面 GUI 侧车,今日默认)。
+    Stdio,
+    /// 仅直连 ws(监听 `host:port`,入站需配对 token)。
+    Ws(std::net::SocketAddr),
+    /// 仅中继:本地回环 ws + 出站中继客户端,没有 stdio 客户端。
+    /// 来自 `--listen relay://<url>`(旧 `--relay` 的语义)。
+    PureRelay(String),
+    /// stdio 与中继**合一**:同一 `serve()` 同时服务桌面 stdio 与经中继接入的手机。
+    /// 来自 `--relay <url>`(spec §6 的行为变更)。
+    StdioWithRelay(String),
+}
+
+/// 把 `--listen` / `--relay` 映射到 [`AppServerMode`]。纯函数,无副作用。
+///
+/// 规则(spec §6):
+/// - `--relay <url>` 且 `--listen` 缺省或为 `stdio://` → `StdioWithRelay`。
+///   **这是行为变更**:改动前 `--relay` 独自出现表示「纯中继」。
+/// - `--listen relay://<url>` → `PureRelay`(纯中继的现存写法,行为不变);
+///   此时若同时给了 `--relay`,仍按改动前「`--relay` 优先」处理。
+/// - `--relay <url>` 与 `--listen ws://…` 同时给出:该组合在改动前即「`--relay`
+///   优先、走纯中继」,故**保留**原行为,不发明新语义。
+/// - `--listen ws://host:port`(无 `--relay`)→ `Ws`。
+/// - `--listen stdio://`(无 `--relay`)→ `Stdio`。
+fn app_server_mode(cli: &Cli) -> Result<AppServerMode> {
+    let Some(Command::AppServer { listen, relay }) = cli.command.as_ref() else {
+        anyhow::bail!("internal: app_server_mode is only defined for `app-server`");
+    };
+    match relay.as_deref() {
+        // `--relay` 的值必须与 `--listen relay://<url>` 里的 url 同形(ws/wss
+        // 前缀、非空);改动前 `--relay` 也是经 `parse_listen` 校验的,这里保持
+        // 同样的「启动即拒」而不是把错误推迟到连接时。
+        Some(url) => {
+            let url = relay_endpoint(url)?;
+            match parse_listen(listen)? {
+                // stdio(缺省或显式 `stdio://`):两路合一。
+                Listen::Stdio => Ok(AppServerMode::StdioWithRelay(url)),
+                // `--relay` 优先,与改动前一致:`--listen` 是 ws 还是 relay:// 都
+                // 落回纯中继。relay:// 分支不额外用 listen 里的 url——`--relay` 赢。
+                Listen::Ws(_) | Listen::Relay(_) => Ok(AppServerMode::PureRelay(url)),
+            }
+        }
+        None => match parse_listen(listen)? {
+            Listen::Stdio => Ok(AppServerMode::Stdio),
+            Listen::Ws(addr) => Ok(AppServerMode::Ws(addr)),
+            Listen::Relay(url) => Ok(AppServerMode::PureRelay(url)),
+        },
+    }
+}
+
+/// 校验 `--relay <url>` 的值并返回裸的中继端点。
+///
+/// 复用 `parse_listen` 的 `relay://` 校验,使 `--relay` 与 `--listen relay://`
+/// 接受完全相同的形状(ws/wss 前缀、非空)。
+fn relay_endpoint(url: &str) -> Result<String> {
+    match parse_listen(&format!("relay://{url}"))? {
+        Listen::Relay(endpoint) => Ok(endpoint),
+        Listen::Stdio | Listen::Ws(_) => {
+            unreachable!("a `relay://` prefix can only parse to Listen::Relay")
+        }
+    }
 }
 
 /// 把中继端点拆成「去掉 `session` 的 URL」+「session id」。
@@ -240,27 +299,25 @@ fn format_revoke_result(device_id: &str, removed: bool) -> String {
     }
 }
 
-/// Run the JSON-RPC 2.0 app-server over stdio for the desktop GUI sidecar, or
-/// over `ws://` for network clients.
+/// Run the JSON-RPC 2.0 app-server over stdio for the desktop GUI sidecar, over
+/// `ws://` for network clients, or as a merged stdio + relay session.
+///
+/// Which of these happens is decided by [`app_server_mode`], a pure function of
+/// `--listen`/`--relay`, so the dispatch is unit-testable without a live server.
 ///
 /// For stdio, stdout is the protocol channel and must stay free of log lines;
 /// tracing writes to a file (and to stderr only when `YI_LOG` is set).
-fn run_app_server(cli: Cli, listen: &str, relay: Option<&str>) -> Result<()> {
-    // `--relay <url>` 是 `--listen relay://<url>` 的等价写法;两者都给时以 `--relay` 为准。
-    let requested = match relay {
-        Some(url) => format!("relay://{url}"),
-        None => listen.to_string(),
-    };
-    let listen = parse_listen(&requested)?;
+fn run_app_server(cli: Cli) -> Result<()> {
+    let mode = app_server_mode(&cli)?;
     let config = config::load(&cli)?;
     let rt = tokio::runtime::Runtime::new()?;
-    match listen {
-        Listen::Stdio => rt.block_on(yi_agent_app_server::run(
+    match mode {
+        AppServerMode::Stdio => rt.block_on(yi_agent_app_server::run(
             tokio::io::stdin(),
             tokio::io::stdout(),
             config,
         )),
-        Listen::Ws(addr) => rt.block_on(async move {
+        AppServerMode::Ws(addr) => rt.block_on(async move {
             let listener = tokio::net::TcpListener::bind(addr).await?;
             let bound = listener.local_addr()?;
             if !bound.ip().is_loopback() {
@@ -283,7 +340,16 @@ fn run_app_server(cli: Cli, listen: &str, relay: Option<&str>) -> Result<()> {
             ));
             yi_agent_app_server::ws::serve_ws(listener, config, workspaces, pairing).await
         }),
-        Listen::Relay(url) => rt.block_on(run_relay_mode(config, url)),
+        AppServerMode::PureRelay(url) => rt.block_on(run_relay_mode(config, url)),
+        // stdio 与中继共用一个 serve():桌面 stdout/stdin 照旧,手机经中继接入。
+        AppServerMode::StdioWithRelay(url) => {
+            rt.block_on(yi_agent_app_server::serve_stdio_with_relay(
+                tokio::io::stdin(),
+                tokio::io::stdout(),
+                config,
+                url,
+            ))
+        }
     }
 }
 
@@ -2296,6 +2362,103 @@ mod tests {
     fn parse_listen_rejects_a_malformed_relay_url() {
         assert!(parse_listen("relay://").is_err());
         assert!(parse_listen("relay://http://relay.example").is_err());
+    }
+
+    /// 行为变更(spec §6):`--relay` 不给 `--listen` 时**不再是**纯中继,而是
+    /// 「stdio + 中继合一」,即桌面 GUI 的 stdio 与手机的中继共用一个 `serve()`。
+    #[test]
+    fn app_server_relay_without_listen_is_merged() {
+        use clap::Parser;
+        let cli = Cli::parse_from([
+            "yi-agent",
+            "app-server",
+            "--relay",
+            "wss://r/connect?session=x",
+        ]);
+        match app_server_mode(&cli).unwrap() {
+            AppServerMode::StdioWithRelay(url) => {
+                assert_eq!(url, "wss://r/connect?session=x");
+            }
+            other => panic!("--relay alone must be stdio+relay, got {other:?}"),
+        }
+    }
+
+    /// 显式写 `--listen stdio://` 与默认值等价,同样是「stdio + 中继」。
+    #[test]
+    fn app_server_relay_with_explicit_stdio_listen_is_merged() {
+        use clap::Parser;
+        let cli = Cli::parse_from([
+            "yi-agent",
+            "app-server",
+            "--listen",
+            "stdio://",
+            "--relay",
+            "wss://r/connect?session=x",
+        ]);
+        assert!(matches!(
+            app_server_mode(&cli).unwrap(),
+            AppServerMode::StdioWithRelay(url) if url == "wss://r/connect?session=x"
+        ));
+    }
+
+    /// 纯中继的**唯一**形态:`--listen relay://<url>`(旧的 `--relay` 语义),
+    /// 仍然走 `run_relay_mode`。
+    #[test]
+    fn app_server_listen_relay_is_pure_relay() {
+        use clap::Parser;
+        let cli = Cli::parse_from([
+            "yi-agent",
+            "app-server",
+            "--listen",
+            "relay://wss://r/connect?session=x",
+        ]);
+        match app_server_mode(&cli).unwrap() {
+            AppServerMode::PureRelay(url) => {
+                assert_eq!(url, "wss://r/connect?session=x");
+            }
+            other => panic!("--listen relay:// must stay pure relay, got {other:?}"),
+        }
+    }
+
+    /// 不带 `--relay`:`--listen ws://` 仍是直连 ws。
+    #[test]
+    fn app_server_ws_listen_without_relay_is_ws() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "app-server", "--listen", "ws://127.0.0.1:8790"]);
+        match app_server_mode(&cli).unwrap() {
+            AppServerMode::Ws(addr) => assert_eq!(addr.port(), 8790),
+            other => panic!("ws:// without --relay must be Ws, got {other:?}"),
+        }
+    }
+
+    /// 不带 `--relay`:`--listen stdio://`(默认)仍是纯 stdio。
+    #[test]
+    fn app_server_stdio_listen_without_relay_is_stdio() {
+        use clap::Parser;
+        let cli = Cli::parse_from(["yi-agent", "app-server"]);
+        assert!(matches!(
+            app_server_mode(&cli).unwrap(),
+            AppServerMode::Stdio
+        ));
+    }
+
+    /// `--relay` 与 `--listen ws://` 同时给出:这一组合在改动前就是「`--relay`
+    /// 优先、走纯中继」,故按「不发明未提及的新语义」保留原行为。
+    #[test]
+    fn app_server_relay_with_ws_listen_keeps_pre_existing_pure_relay() {
+        use clap::Parser;
+        let cli = Cli::parse_from([
+            "yi-agent",
+            "app-server",
+            "--listen",
+            "ws://127.0.0.1:8790",
+            "--relay",
+            "wss://r/connect?session=x",
+        ]);
+        assert!(matches!(
+            app_server_mode(&cli).unwrap(),
+            AppServerMode::PureRelay(url) if url == "wss://r/connect?session=x"
+        ));
     }
 
     /// 从中继端点里拆出 `session` 参数:返回「去掉 session 的 URL」+「session id」,
