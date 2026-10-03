@@ -159,6 +159,23 @@ describe("wsTransport", () => {
     expect(seen).toHaveLength(0);
   });
 
+  it("dispose stops delivery, closes the socket, and does not report an exit", () => {
+    const { fake, transport } = make();
+    const messages: unknown[] = [];
+    const statuses: unknown[] = [];
+    transport.onMessage((m) => messages.push(m));
+    transport.onStatus((s) => statuses.push(s));
+    fake.open();
+
+    transport.dispose();
+    // A deliberately closed socket must not look like a server disconnect
+    // (that would make the App schedule another reconnect for its own teardown).
+    expect(statuses).toHaveLength(0);
+    // Frames arriving after dispose (a race with the close) reach nobody.
+    fake.receive(JSON.stringify({ jsonrpc: "2.0", method: "item/delta", params: { delta: "x" } }));
+    expect(messages).toHaveLength(0);
+  });
+
   it("ignores a non-JSON frame without throwing", () => {
     const { fake, transport } = make();
     const seen: unknown[] = [];

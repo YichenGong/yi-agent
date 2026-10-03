@@ -7,6 +7,17 @@ export interface Transport {
   onMessage(cb: (message: unknown) => void): () => void;
   onRequest(cb: (request: ApprovalRequest) => void): () => void;
   onStatus(cb: (status: { state: string; code?: number | null }) => void): () => void;
+  /**
+   * Drop every event subscription this transport registered.
+   *
+   * The App builds a **new** transport on each reconnect, but a Tauri event
+   * listener (unlike a closed WebSocket) keeps firing if it is never
+   * unlistened. Without this the disposed client's transport would keep
+   * delivering every frame, so an append-only `item/delta` would be applied once
+   * per live client — the streamed text duplicates until `item/completed`
+   * replaces the item wholesale ("显示重复内容，再收敛").
+   */
+  dispose(): void;
 }
 
 interface Pending {
@@ -31,9 +42,37 @@ export class RpcClient {
   private pending = new Map<RequestId, Pending>();
   private buffered = new Map<RequestId, { result?: unknown; error?: RpcError }>();
   private notificationHandlers = new Set<(n: Notification) => void>();
+  /**
+   * The transport-level message subscription. Held so {@link dispose} can drop
+   * it: a disconnected Tauri listener keeps firing, and a client replaced on
+   * reconnect must stop feeding the UI from the old transport.
+   */
+  private unsubscribeTransport: () => void;
+  private disposed = false;
 
   constructor(private transport: Transport) {
-    transport.onMessage((raw) => this.onMessage(raw));
+    this.unsubscribeTransport = transport.onMessage((raw) => this.onMessage(raw));
+  }
+
+  /**
+   * Detach from the transport and stop delivering frames to subscribers.
+   *
+   * Call this before replacing a client on reconnect. Pending requests are
+   * rejected so no caller is left awaiting a response from a transport that is
+   * about to be abandoned. Idempotent: both the `exited` handler and `connect`
+   * may dispose the same client.
+   */
+  dispose(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.unsubscribeTransport();
+    this.notificationHandlers.clear();
+    for (const [, pending] of this.pending) {
+      pending.reject(new Error("rpc client disposed"));
+    }
+    this.pending.clear();
+    this.buffered.clear();
+    this.transport.dispose();
   }
 
   onNotification(handler: (n: Notification) => void): () => void {

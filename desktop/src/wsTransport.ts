@@ -53,6 +53,10 @@ export function wsTransport(
   let opened = false;
   let closed = false;
   let closeCode: number | null = null;
+  // Set when we close the socket on purpose (reconnect): the resulting onclose
+  // is not a server disconnect and must not be reported as `exited`, or the App
+  // would treat its own teardown as a crash and schedule yet another reconnect.
+  let disposed = false;
   const waiters: Array<{ resolve: () => void; reject: (e: Error) => void }> = [];
 
   const ready = (): Promise<void> => {
@@ -93,6 +97,8 @@ export function wsTransport(
     closed = true;
     closeCode = e.code ?? null;
     settle((w) => w.reject(new Error(`websocket closed (${closeCode ?? "unknown"})`)));
+    // A close we initiated (dispose on reconnect) is not a server-side exit.
+    if (disposed) return;
     for (const h of statusHandlers) h({ state: "exited", code: closeCode });
   };
 
@@ -110,6 +116,17 @@ export function wsTransport(
     onStatus: (cb) => {
       statusHandlers.add(cb);
       return () => statusHandlers.delete(cb);
+    },
+    dispose: () => {
+      disposed = true;
+      messageHandlers.clear();
+      requestHandlers.clear();
+      statusHandlers.clear();
+      try {
+        socket.close(1000);
+      } catch {
+        // Closing an already-closed/closing socket is not an error we care about.
+      }
     },
   };
 }

@@ -72,20 +72,35 @@ vi.mock("./lib/rpc", () => ({
   RpcClient: class {
     requests: { method: string; params: unknown }[] = [];
     listCalls = 0;
+    // Callbacks this instance registered, so `dispose` can remove exactly them —
+    // mirroring the real client tearing down its transport subscription.
+    private registered: Array<{ list: unknown[]; cb: unknown }> = [];
     constructor() {
       clients.push(this);
     }
+    private track(list: unknown[], cb: unknown) {
+      this.registered.push({ list, cb });
+      list.push(cb);
+      return () => {
+        const i = list.indexOf(cb);
+        if (i >= 0) list.splice(i, 1);
+      };
+    }
     onNotification(cb: (n: unknown) => void) {
-      state.notifHandlers.push(cb);
-      return () => {};
+      return this.track(state.notifHandlers, cb);
     }
     onApproval(cb: (r: unknown) => void) {
-      state.approvalHandlers.push(cb);
-      return () => {};
+      return this.track(state.approvalHandlers, cb);
     }
     onStatus(cb: (s: unknown) => void) {
-      state.statusHandlers.push(cb);
-      return () => {};
+      return this.track(state.statusHandlers, cb);
+    }
+    dispose() {
+      for (const { list, cb } of this.registered) {
+        const i = list.indexOf(cb);
+        if (i >= 0) list.splice(i, 1);
+      }
+      this.registered.length = 0;
     }
     async request(method: string, params: unknown) {
       this.requests.push({ method, params });
@@ -1390,6 +1405,51 @@ describe("App reconnect resilience", () => {
     expect(clients.length).toBe(2);
     await flush();
     expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true);
+  });
+
+  it("does not double-apply notifications after a foreground reconnect", async () => {
+    render(<App />);
+    await waitMounted();
+    await flush();
+    expect(state.notifHandlers.length).toBe(1);
+
+    // 切后台再回前台:App 重建客户端(新 transport + 新监听)。真实环境里旧
+    // transport 在未 dispose 时会继续投递同一帧,于是逐字流被应用两次——文本
+    // 重复,直到 item/completed 按 id 整条替换才"收敛"。
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    await flush();
+    expect(clients.length).toBe(2);
+    // 旧监听必须已被注销,否则每条通知都会被应用两遍。
+    expect(state.notifHandlers.length).toBe(1);
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "item/delta", params: { thread_id: "t1", item_id: "a1", delta: "hello" } });
+      }
+    });
+    await flush();
+    expect(screen.getByText("hello")).toBeTruthy();
+  });
+
+  it("unlistens the dead client as soon as its transport exits", async () => {
+    render(<App />);
+    await waitMounted();
+    await flush();
+    expect(state.notifHandlers.length).toBe(1);
+
+    // 断开(侧车退出)。在退避定时器到点之前,死客户端的监听就该已被摘掉:
+    // 宿主随即拉起的新侧车会继续向同一事件名投递帧。
+    exit();
+    expect(state.notifHandlers.length).toBe(0);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    expect(clients.length).toBe(2);
+    expect(state.notifHandlers.length).toBe(1);
   });
 
   it("keeps retrying with increasing delays when attempts keep failing", async () => {

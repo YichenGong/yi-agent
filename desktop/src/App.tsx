@@ -836,6 +836,11 @@ export default function App() {
         // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
         // warm 缓存,免得切回旧对话时跳过 resume(新进程并不记得任何会话)。
         if (s.state === "exited" && !disposed) {
+          // 这个客户端已经死了：立刻注销它的 transport 监听。Tauri 的
+          // `app-server://message` 是全局事件名，宿主拉起新侧车后，陈旧监听照样
+          // 会收到新进程的帧——不摘掉就会与重连后的新客户端各应用一遍（逐字流
+          // 重复，直到 item/completed 按 id 整条替换才"收敛"）。
+          client.dispose();
           // 这次握手已经废了:重新从 base 起算退避(handshake 成功时本就会归零,
           // 这里针对的是"连上后立刻断"——attempt 不能被永久抬到高位)。
           warm.current.clear();
@@ -900,6 +905,12 @@ export default function App() {
     };
 
     const connect = (): RpcClient => {
+      // Tear down the previous client before building the new one. A Tauri (or
+      // ws) transport keeps delivering frames until it is explicitly disposed,
+      // so leaving the old client subscribed would apply every notification
+      // twice: an append-only `item/delta` duplicates the streamed text, and it
+      // only "converges" because `item/completed` replaces the whole item by id.
+      clientRef.current?.dispose();
       const client = new RpcClient(transportFactory());
       clientRef.current = client;
       wireClient(client);

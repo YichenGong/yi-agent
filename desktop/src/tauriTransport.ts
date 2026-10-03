@@ -29,6 +29,18 @@ function subscribe<T>(event: string, cb: (payload: T) => void): () => void {
  * event; `send`/`respond` invoke the two commands the Rust side exposes.
  */
 export function tauriTransport(): Transport {
+  // Every subscription must be unlistened on `dispose`. A Tauri event listener
+  // (unlike a closed WebSocket) keeps firing forever if it is never removed, so
+  // a client replaced on reconnect would otherwise keep applying every frame
+  // alongside its successor.
+  const unsubscribers = new Set<() => void>();
+  const track = (off: () => void): (() => void) => {
+    unsubscribers.add(off);
+    return () => {
+      unsubscribers.delete(off);
+      off();
+    };
+  };
   return {
     send: async (message) => {
       await invoke("rpc", message);
@@ -36,9 +48,13 @@ export function tauriTransport(): Transport {
     respond: async (id, result) => {
       await invoke("rpc_respond", { id, result });
     },
-    onMessage: (cb) => subscribe<unknown>("app-server://message", cb),
-    onRequest: (cb) => subscribe<ApprovalRequest>("app-server://request", cb),
+    onMessage: (cb) => track(subscribe<unknown>("app-server://message", cb)),
+    onRequest: (cb) => track(subscribe<ApprovalRequest>("app-server://request", cb)),
     onStatus: (cb) =>
-      subscribe<{ state: string; code?: number | null }>("app-server://status", cb),
+      track(subscribe<{ state: string; code?: number | null }>("app-server://status", cb)),
+    dispose: () => {
+      for (const off of [...unsubscribers]) off();
+      unsubscribers.clear();
+    },
   };
 }
