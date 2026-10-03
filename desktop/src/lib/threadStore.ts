@@ -12,6 +12,12 @@ export interface ThreadView {
   info: { cwd: string; model: string } | null;
   /** 服务端权威权限模式；null = 未知,勿当作 normal。 */
   mode: ThreadMode | null;
+  /**
+   * 输入框中尚未发送的草稿。**按 thread 隔离**：切走时留下、切回时原样出现，
+   * 否则一处未发出的文字会跟着用户跑到另一个会话里（那不是它要发去的地方）。
+   * 纯客户端、纯 UI：不上协议，服务端不知道它的存在。
+   */
+  draft: string;
 }
 
 /**
@@ -40,6 +46,7 @@ export class ThreadStore {
       approval: null,
       info: null,
       mode: null,
+      draft: "",
     };
   }
 
@@ -132,6 +139,18 @@ export class ThreadStore {
 
   setApproval(r: ApprovalRequest): void {
     this.view(r.params.thread_id).approval = r;
+  }
+
+  /**
+   * 记下某 thread 输入框里未发送的草稿。
+   *
+   * 每次击键都写：这是「切走时草稿留在原处」的唯一真相来源，而不是在切走那一刻
+   * 去猜上一屏的文本（此刻输入框已换成新 thread 的 value）。写入方随后自行触发
+   * 重渲染（沿用 App 的 `force` 模式）；文本框本身由视图的 `draft` 驱动，所以
+   * 这里不必额外 setState。
+   */
+  setDraft(id: string, draft: string): void {
+    this.view(id).draft = draft;
   }
 
   clearApproval(threadId: string): void {

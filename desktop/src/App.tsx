@@ -1056,6 +1056,24 @@ export default function App() {
   };
 
   /**
+   * 把当前会话输入框里的草稿写回该会话。
+   *
+   * 草稿属于「那个会话」而不是「那个输入框」：每次击键都落到 store 的
+   * `view(id).draft`（切走时留在原处、切回时原样出现），受控的文本框再从
+   * `current.draft` 取值。store 是可变实例，改动必须经 `force` 才能抵达视图——
+   * 代价与流式期间每个 delta 同量级，而昂贵的历史消息已由 `AgentMessage` /
+   * `ToolCallCard` 的 memo 挡住，故无需为击键另建一套状态。
+   *
+   * 没有当前会话时无处可放，直接忽略（此时输入框由 `disabled` 置灰）。
+   */
+  const changeDraft = (text: string) => {
+    const id = store.currentId;
+    if (!id) return;
+    store.setDraft(id, text);
+    force((v) => v + 1);
+  };
+
+  /**
    * 切换宿主级「后台值守」。不做乐观更新：值以宿主返回的为准，安装/卸载失败
    * 的告知（warning）原样摆到面板上——静默会让用户以为已经生效。
    */
@@ -1278,6 +1296,9 @@ export default function App() {
             mode={current?.mode ?? null}
             onModeChange={setThreadMode}
             onSlashCommand={(name, args) => void onSlashCommand(name, args)}
+            value={current?.draft ?? ""}
+            onDraftChange={changeDraft}
+            disabled={current === null}
           />
           {currentId && openSubagent && (
             <SubagentTrace
