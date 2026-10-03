@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { useIsMobile } from "./lib/useIsMobile";
-import { RpcClient } from "./lib/rpc";
+import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
 import { transportFactory } from "./transportFactory";
@@ -107,6 +107,11 @@ export default function App() {
   const store = storeRef.current;
   const [, force] = useState(0);
   const clientRef = useRef<RpcClient | null>(null);
+  // Set once the effect wires up; `RpcClient` calls it to re-handshake the current
+  // client after the relay bridge restarts (see `RpcClient.request`). A ref, not
+  // a closure over `clientRef`, so the client created inside the effect captures
+  // the latest one.
+  const recoveryRef = useRef<((raw: RequestFn) => Promise<void>) | null>(null);
   const inited = useRef(false);
   // Threads whose history has already been replayed (resumed) this session;
   // switching back to them must not replay again.
@@ -904,6 +909,23 @@ export default function App() {
       }
     };
 
+    // 经中继时的自愈钩子：服务端把本连接判为「未初始化」时，`RpcClient` 会调用
+    // 它重新建立会话，再自动重发那条被拒的请求。
+    //
+    // 为什么需要它：全 session 只有**一条**电脑侧桥接连接被所有手机共享，
+    // app-server 换进程后桥接重连会换成新 `ws-<uuid>`（未握手），而手机的
+    // socket 挂在中继上从未断开、不会自己重发 `initialize`。切 session 因此
+    // 撞上 `-32010`（详见 `RpcClient.request`）。
+    //
+    // 新进程的记忆是空的，所以要重放的不只是 `initialize`：服务端只在订阅过的
+    // 会话上推送内容，不重放 `thread/subscribe` 会让后台会话静默停更。`raw` 是
+    // 不触发自动恢复的裸请求，重放过程中再被拒就直接失败，不会自等待。
+    recoveryRef.current = async (raw) => {
+      await raw("initialize", {});
+      const win = subWindow.current.current();
+      if (win.length > 0) await raw("thread/subscribe", { threadIds: win });
+    };
+
     const connect = (): RpcClient => {
       // Tear down the previous client before building the new one. A Tauri (or
       // ws) transport keeps delivering frames until it is explicitly disposed,
@@ -911,7 +933,7 @@ export default function App() {
       // twice: an append-only `item/delta` duplicates the streamed text, and it
       // only "converges" because `item/completed` replaces the whole item by id.
       clientRef.current?.dispose();
-      const client = new RpcClient(transportFactory());
+      const client = new RpcClient(transportFactory(), (raw) => recoveryRef.current!(raw));
       clientRef.current = client;
       wireClient(client);
       return client;
