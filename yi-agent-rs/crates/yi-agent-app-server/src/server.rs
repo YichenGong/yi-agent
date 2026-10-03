@@ -3427,6 +3427,15 @@ where
 fn apply_session(agent: &mut yi_agent_core::Agent, session: Option<yi_agent_core::Session>) {
     if let Some(s) = session {
         agent.set_session_messages(s.messages().to_vec());
+        // `set_session_messages` 只搬运消息,若不在此补写,resume 载入的
+        // `last_input_tokens` 会在live 句柄上归零,使上面的注释承诺的
+        // 「resume 后首轮 auto-compact 即生效」落空(`maybe_auto_compact`
+        // 读到 `None` 直接短路)。句柄仍是同一个 Arc,只是补一个字段。
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .set_last_input_tokens(s.last_input_tokens());
     }
 }
 
@@ -10012,10 +10021,14 @@ pub(crate) mod tests {
         )
         .expect("a default config bootstraps without network");
         let handle_c = bootstrapped.agent.session_handle();
-        let loaded = yi_agent_core::Session::from_messages(vec![
+        let mut loaded = yi_agent_core::Session::from_messages(vec![
             yi_agent_core::Message::user("loaded-one"),
             yi_agent_core::Message::user("loaded-two"),
         ]);
+        // A resumed session carries the previous turn's usage; the rebuild must
+        // land it on the live handle, or the first post-resume turn's
+        // auto-compact check reads `None` and short-circuits.
+        loaded.set_last_input_tokens(Some(1234));
         let rebuilt_loaded =
             rebuild_thread_agent_with_theme(bootstrapped, Some(loaded), test_theme());
         assert!(
@@ -10026,6 +10039,11 @@ pub(crate) mod tests {
             rebuilt_loaded.agent.session().messages().len(),
             2,
             "apply_session must still apply the resumed history"
+        );
+        assert_eq!(
+            rebuilt_loaded.agent.session().last_input_tokens(),
+            Some(1234),
+            "apply_session must carry the resumed input-token count onto the live handle"
         );
     }
 
