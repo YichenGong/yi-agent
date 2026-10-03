@@ -27,15 +27,26 @@ daemon 常驻（`yi-agent daemon start`）。daemon 会按清单与开关拉起 
 三种入口，写的是同一个投递目录：
 
 - 命令行：`superpowers-kanban add <spec> <plan>`（可选 `--state-dir <dir>`）
+- 命令行：`superpowers-kanban add-merge <source> [--base <ref>]`（可选 `--state-dir <dir>`）
 - TUI：`/superpowers-kanban add <spec> <plan>`
 - 桌面端：看板面板的入队动作
 
 `add` 会先校验两份文件存在且互不相同，失败立刻以非零退出码报错。
 投递写进 `<项目>/.yi-agent/superpowers-kanban/inbox/`，插件每 tick 消费并入队。
 
+`add-merge` 投递一张合并卡：把 `source` 分支合进 `base`（缺省取
+`origin/HEAD` 指向的默认分支）。它会先确认 `source` 分支真实存在，否则立刻报错
+而不投递。
+
+```
+superpowers-kanban add-merge kanban/2026-10-03-a-feature
+superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop
+```
+
 ## 命令行
-`superpowers-kanban <run|add|list|on|off|workdir>`——`run` 是 daemon 守护的推进循环，
+`superpowers-kanban <run|add|add-merge|list|on|off|workdir>`——`run` 是 daemon 守护的推进循环，
 其余是一次性查询/写入。`workdir` 报告状态目录对应的项目根。
+`run` 每 tick 除消费看板投递外，还会认领一张待合并卡并执行合并（本项目同一时刻只有一张）。
 
 ## 开关
 `superpowers-kanban on|off` 写**项目层**（`<项目>/.yi-agent/preferences.json`）。

@@ -249,6 +249,9 @@ mod tests {
         BoardCard {
             id: id.into(),
             state: state.into(),
+            kind: "implementation".into(),
+            source: None,
+            base: None,
             thread_id: Some(format!("t-{id}")),
             workdir: None,
             spec_path: format!("{id}.spec.md"),

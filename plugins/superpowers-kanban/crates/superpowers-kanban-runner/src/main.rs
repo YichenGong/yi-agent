@@ -3,6 +3,7 @@
 //! 用法：
 //! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs 10]`
 //! - `superpowers-kanban add <spec> <plan> [--state-dir <d>]`——把一对 spec/plan 投进 `inbox`
+//! - `superpowers-kanban add-merge <source> [--base <ref>] [--state-dir <d>]`——投递一张合并卡
 //! - `superpowers-kanban list [--state-dir <d>]`——打印队列与待消费的投递
 //! - `superpowers-kanban on|off [--state-dir <d>]`——写项目层开关
 //! - `superpowers-kanban workdir [--state-dir <d>]`——打印该状态目录对应的项目根（skill 用）
@@ -16,8 +17,10 @@ use std::time::Duration;
 
 use superpowers_kanban_core::calendar::ConcurrencyCalendar;
 use superpowers_kanban_core::card_id::card_id_for;
+use superpowers_kanban_core::layout::{
+    global_preferences_path, project_preferences_path, project_root,
+};
 use superpowers_kanban_core::promotion::validate_promotion;
-use superpowers_kanban_core::layout::{global_preferences_path, project_preferences_path, project_root};
 use superpowers_kanban_core::switch::{BoardSwitch, SwitchValue, read_layer, resolve, write_layer};
 use superpowers_kanban_runner::client::BoardDaemon;
 use superpowers_kanban_runner::service::BoardService;
@@ -57,6 +60,11 @@ enum Subcommand {
     List {
         state_dir: PathBuf,
     },
+    AddMerge {
+        state_dir: PathBuf,
+        source: String,
+        base: Option<String>,
+    },
     Workdir {
         state_dir: PathBuf,
     },
@@ -66,12 +74,13 @@ enum Subcommand {
     },
 }
 
-const USAGE: &str = "usage: superpowers-kanban <run|add|list|on|off|workdir> [...]
-  run     --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
-  add     <spec> <plan> [--state-dir <d>]
-  list    [--state-dir <d>]
-  on|off  [--state-dir <d>]
-  workdir [--state-dir <d>]";
+const USAGE: &str = "usage: superpowers-kanban <run|add|add-merge|list|on|off|workdir> [...]
+  run       --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
+  add       <spec> <plan> [--state-dir <d>]
+  add-merge <source> [--base <ref>] [--state-dir <d>]
+  list      [--state-dir <d>]
+  on|off    [--state-dir <d>]
+  workdir   [--state-dir <d>]";
 
 /// Parsed from an explicit iterator so tests can drive it without a process.
 ///
@@ -87,15 +96,44 @@ where
         Some("add") => {
             let (state_dir, rest) = parse_state_dir(args)?;
             let mut rest = rest.into_iter();
-            let spec = rest.next().ok_or_else(|| format!("add needs a spec path\n{USAGE}"))?;
-            let plan = rest.next().ok_or_else(|| format!("add needs a plan path\n{USAGE}"))?;
+            let spec = rest
+                .next()
+                .ok_or_else(|| format!("add needs a spec path\n{USAGE}"))?;
+            let plan = rest
+                .next()
+                .ok_or_else(|| format!("add needs a plan path\n{USAGE}"))?;
             if let Some(extra) = rest.next() {
-                return Err(format!("add takes exactly two paths, got an extra: {extra}"));
+                return Err(format!(
+                    "add takes exactly two paths, got an extra: {extra}"
+                ));
             }
             Ok(Subcommand::Add {
                 state_dir,
                 spec,
                 plan,
+            })
+        }
+        Some("add-merge") => {
+            let (state_dir, rest) = parse_state_dir(args)?;
+            let mut rest = rest.into_iter();
+            let source = rest
+                .next()
+                .ok_or_else(|| format!("add-merge needs a source branch\n{USAGE}"))?;
+            let mut base = None;
+            while let Some(token) = rest.next() {
+                if token == "--base" {
+                    base = Some(
+                        rest.next()
+                            .ok_or_else(|| "--base needs a value".to_string())?,
+                    );
+                } else {
+                    return Err(format!("unexpected argument: {token}"));
+                }
+            }
+            Ok(Subcommand::AddMerge {
+                state_dir,
+                source,
+                base,
             })
         }
         Some("list") => {
@@ -212,7 +250,37 @@ fn command_add(state_dir: &std::path::Path, spec: &str, plan: &str) -> Result<St
     let id = card_id_for(spec, plan);
     superpowers_kanban_core::inbox::deliver_card(state_dir, &id, spec, plan)
         .map_err(|error| format!("could not deliver the card: {error}"))?;
-    Ok(format!("delivered {id} to {}\n{spec}\n{plan}", superpowers_kanban_core::inbox::inbox_dir(state_dir).display()))
+    Ok(format!(
+        "delivered {id} to {}\n{spec}\n{plan}",
+        superpowers_kanban_core::inbox::inbox_dir(state_dir).display()
+    ))
+}
+
+/// `add-merge`：先校验 refs 与 source 分支存在，再投递一张合并卡。
+fn command_add_merge(
+    state_dir: &std::path::Path,
+    source: &str,
+    base: Option<&str>,
+    project_root: &std::path::Path,
+) -> Result<String, String> {
+    let base = match base {
+        Some(base) => base.to_string(),
+        None => superpowers_kanban_runner::merge::default_branch(project_root),
+    };
+    superpowers_kanban_core::promotion::validate_merge_refs(source, &base)
+        .map_err(|error| error.to_string())?;
+    if !superpowers_kanban_runner::merge::source_branch_exists(project_root, source) {
+        return Err(format!("source branch does not exist: {source}"));
+    }
+    // 与已有卡撞名时用 next_free_merge_id 派生唯一 id。
+    let board = superpowers_kanban_runner::persist::load_board(&state_dir.join("board.json"));
+    let id = board.next_free_merge_id(source, &base).0;
+    superpowers_kanban_core::inbox::deliver_merge_card(state_dir, &id, source, &base, None)
+        .map_err(|error| format!("could not deliver the card: {error}"))?;
+    Ok(format!(
+        "delivered {id} to {}\n{source} -> {base}",
+        superpowers_kanban_core::inbox::inbox_dir(state_dir).display()
+    ))
 }
 
 /// `list`：先落盘的队列，再列出尚未被 runner 消费的投递。
@@ -265,13 +333,18 @@ fn command_list(state_dir: &std::path::Path) -> Result<String, String> {
 /// `on`/`off`：只写项目层。全局层留给人显式设置，避免 CLI 悄悄改全局偏好。
 fn command_set_switch(state_dir: &std::path::Path, value: SwitchValue) -> Result<String, String> {
     let path = project_preferences_path(state_dir);
-    write_layer(&path, value).map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    write_layer(&path, value)
+        .map_err(|error| format!("could not write {}: {error}", path.display()))?;
     let now = board_switch(state_dir);
     Ok(format!(
         "superpowers_kanban = {}\nwrote {}\nnow {}",
         matches!(value, SwitchValue::Enabled),
         path.display(),
-        if now.is_enabled() { "enabled" } else { "disabled" }
+        if now.is_enabled() {
+            "enabled"
+        } else {
+            "disabled"
+        }
     ))
 }
 
@@ -294,6 +367,14 @@ fn main() {
             spec,
             plan,
         } => command_add(&state_dir, &spec, &plan),
+        Subcommand::AddMerge {
+            state_dir,
+            source,
+            base,
+        } => {
+            let project_root = superpowers_kanban_core::layout::project_root(&state_dir);
+            command_add_merge(&state_dir, &source, base.as_deref(), &project_root)
+        }
         Subcommand::List { state_dir } => command_list(&state_dir),
         Subcommand::Workdir { state_dir } => Ok(project_root(&state_dir).display().to_string()),
         Subcommand::Switch { state_dir, value } => command_set_switch(&state_dir, value),
@@ -322,10 +403,12 @@ struct QueryDispatch {
 }
 
 impl superpowers_kanban_ipc::server::Dispatch for QueryDispatch {
-    fn dispatch(&self, method: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let global = global_preferences_path()
-            .as_deref()
-            .and_then(read_layer);
+    fn dispatch(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let global = global_preferences_path().as_deref().and_then(read_layer);
         superpowers_kanban_runner::dispatch::dispatch_with_service(
             self.service.as_ref(),
             &self.state_dir,
@@ -355,11 +438,9 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
     });
     let keep_going = Arc::clone(&stop);
     std::thread::spawn(move || {
-        if let Err(error) = superpowers_kanban_ipc::server::serve_with(
-            &socket,
-            dispatch,
-            || !keep_going.load(Ordering::SeqCst),
-        ) {
+        if let Err(error) = superpowers_kanban_ipc::server::serve_with(&socket, dispatch, || {
+            !keep_going.load(Ordering::SeqCst)
+        }) {
             eprintln!(
                 "superpowers-kanban: query server stopped: {error} (queries will be refused)"
             );
@@ -438,13 +519,26 @@ fn run_daemon(args: Args) {
             }
         }
 
+        // 合并与实现共用一个 tick：消费投递后，若本项目没有合并在跑，就做一张。
+        match service.merge_next() {
+            Ok(Some(claim)) => eprintln!(
+                "superpowers-kanban: merged {} ({:?})",
+                claim.card_id, claim.outcome
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!("superpowers-kanban: merge failed: {error}"),
+        }
+
         std::thread::sleep(args.interval);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Subcommand, command_add, command_list, command_set_switch, parse_subcommand};
+    use super::{
+        Subcommand, command_add, command_add_merge, command_list, command_set_switch,
+        parse_subcommand,
+    };
     use superpowers_kanban_core::switch::SwitchValue;
 
     fn parse(tokens: &[&str]) -> Result<Subcommand, String> {
@@ -482,14 +576,21 @@ mod tests {
 
     #[test]
     fn add_requires_exactly_two_paths() {
-        assert!(parse(&["add", "a.spec.md"]).is_err(), "one path is not enough");
+        assert!(
+            parse(&["add", "a.spec.md"]).is_err(),
+            "one path is not enough"
+        );
         assert!(parse(&["add"]).is_err(), "no path is not enough");
         assert!(
             parse(&["add", "a.spec.md", "a.plan.md", "extra"]).is_err(),
             "a third path must be refused rather than silently dropped"
         );
         match parse(&["add", "a.spec.md", "a.plan.md", "--state-dir", "/s"]) {
-            Ok(Subcommand::Add { state_dir, spec, plan }) => {
+            Ok(Subcommand::Add {
+                state_dir,
+                spec,
+                plan,
+            }) => {
                 assert_eq!(state_dir.to_string_lossy(), "/s");
                 assert_eq!(spec, "a.spec.md");
                 assert_eq!(plan, "a.plan.md");
@@ -501,14 +602,23 @@ mod tests {
     #[test]
     fn list_on_and_off_take_no_positional_arguments() {
         assert!(matches!(parse(&["list"]), Ok(Subcommand::List { .. })));
-        assert!(matches!(parse(&["workdir"]), Ok(Subcommand::Workdir { .. })));
+        assert!(matches!(
+            parse(&["workdir"]),
+            Ok(Subcommand::Workdir { .. })
+        ));
         assert!(matches!(
             parse(&["on"]),
-            Ok(Subcommand::Switch { value: SwitchValue::Enabled, .. })
+            Ok(Subcommand::Switch {
+                value: SwitchValue::Enabled,
+                ..
+            })
         ));
         assert!(matches!(
             parse(&["off"]),
-            Ok(Subcommand::Switch { value: SwitchValue::Disabled, .. })
+            Ok(Subcommand::Switch {
+                value: SwitchValue::Disabled,
+                ..
+            })
         ));
         assert!(parse(&["on", "extra"]).is_err());
         assert!(parse(&["list", "extra"]).is_err());
@@ -523,7 +633,10 @@ mod tests {
 
         let error = command_add(dir.path(), &spec.to_string_lossy(), &plan.to_string_lossy())
             .expect_err("a missing spec must be refused here, not by the runner later");
-        assert!(error.contains("a.spec.md"), "the error must name the file: {error}");
+        assert!(
+            error.contains("a.spec.md"),
+            "the error must name the file: {error}"
+        );
         assert!(
             !dir.path().join("inbox").exists(),
             "nothing may be delivered when validation fails"
@@ -568,6 +681,56 @@ mod tests {
         assert_eq!(
             superpowers_kanban_core::switch::read_layer(&path),
             Some(SwitchValue::Disabled)
+        );
+    }
+
+    #[test]
+    fn add_merge_requires_a_source() {
+        assert!(parse(&["add-merge"]).is_err());
+    }
+
+    #[test]
+    fn add_merge_parses_the_base_flag() {
+        match parse(&[
+            "add-merge",
+            "kanban/a",
+            "--base",
+            "develop",
+            "--state-dir",
+            "/s",
+        ]) {
+            Ok(Subcommand::AddMerge {
+                state_dir,
+                source,
+                base,
+            }) => {
+                assert_eq!(source, "kanban/a");
+                assert_eq!(base.as_deref(), Some("develop"));
+                assert_eq!(state_dir.to_string_lossy(), "/s");
+            }
+            other => panic!("expected add-merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_merge_refuses_an_unknown_source_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        // 初始化一个真实仓库，且没有 feat/x 分支。
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let error = command_add_merge(dir.path(), "feat/x", Some("main"), dir.path())
+            .expect_err("a missing source branch must be refused");
+        assert!(error.contains("feat/x"), "{error}");
+        assert!(
+            !dir.path().join("inbox").exists(),
+            "nothing delivered on failure"
         );
     }
 

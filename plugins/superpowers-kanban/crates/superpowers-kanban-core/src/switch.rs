@@ -78,6 +78,31 @@ pub fn write_layer(path: &Path, value: SwitchValue) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// 读任意布尔偏好键（如 `board_auto_merge`）。缺失/损坏/类型不符一律 `None`。
+pub fn read_bool(path: &Path, key: &str) -> Option<bool> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get(key)?.as_bool()
+}
+
+/// 写任意布尔偏好键（读-改-写，保留其他键；temp + rename 原子替换）。
+pub fn write_bool(path: &Path, key: &str, value: bool) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut object = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    object.insert(key.to_string(), serde_json::Value::Bool(value));
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +242,14 @@ mod tests {
     fn read_layer_reports_none_for_a_missing_file() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_layer(&dir.path().join("nope.json")), None);
+    }
+
+    #[test]
+    fn reads_an_arbitrary_boolean_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(&path, r#"{"board_auto_merge":true}"#).unwrap();
+        assert_eq!(read_bool(&path, "board_auto_merge"), Some(true));
+        assert_eq!(read_bool(&path, "missing"), None);
     }
 }

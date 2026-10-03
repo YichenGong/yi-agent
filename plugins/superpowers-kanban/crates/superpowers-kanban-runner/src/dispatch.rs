@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 use superpowers_kanban_core::card_id::card_id_for;
-use superpowers_kanban_core::inbox::deliver_card;
+use superpowers_kanban_core::inbox::{deliver_card, deliver_merge_card};
 use superpowers_kanban_core::layout::project_preferences_path;
 use superpowers_kanban_core::promotion::validate_promotion;
 use superpowers_kanban_core::switch::{SwitchValue, read_layer, resolve, write_layer};
@@ -76,6 +76,27 @@ pub fn dispatch_with_service(
                 .map_err(|error| error.to_string())?;
             let id = card_id_for(spec, plan);
             deliver_card(state_dir, &id, spec, plan)
+                .map_err(|error| format!("could not deliver the card: {error}"))?;
+            Ok(json!({ "id": id }))
+        }
+        "enqueue_merge" => {
+            let source = params
+                .get("source")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "enqueue_merge needs a `source`".to_string())?;
+            let project_root = superpowers_kanban_core::layout::project_root(state_dir);
+            let base = match params.get("base").and_then(Value::as_str) {
+                Some(base) => base.to_string(),
+                None => crate::merge::default_branch(&project_root),
+            };
+            // 校验先做：被拒的投递必须一个字节都不落盘（与 `enqueue` 同理）。
+            superpowers_kanban_core::promotion::validate_merge_refs(source, &base)
+                .map_err(|error| error.to_string())?;
+            if !crate::merge::source_branch_exists(&project_root, source) {
+                return Err(format!("source branch does not exist: {source}"));
+            }
+            let id = service.next_free_merge_id(source, &base);
+            deliver_merge_card(state_dir, &id, source, &base, None)
                 .map_err(|error| format!("could not deliver the card: {error}"))?;
             Ok(json!({ "id": id }))
         }
@@ -364,5 +385,59 @@ mod tests {
             !Arc::ptr_eq(&service_for(&a), &service_for(&b)),
             "distinct state dirs must not share leases"
         );
+    }
+
+    #[test]
+    fn enqueue_merge_refuses_a_missing_source_branch_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(["init", "-q", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let state = dir.path().join(".yi-agent/superpowers-kanban");
+        let error = dispatch_with_global(
+            &state,
+            None,
+            "enqueue_merge",
+            &json!({"source": "feat/x", "base": "main"}),
+        )
+        .unwrap_err();
+        assert!(error.contains("feat/x"), "{error}");
+        assert!(!superpowers_kanban_core::inbox::inbox_dir(&state).exists());
+    }
+
+    #[test]
+    fn list_reports_the_merge_payload_and_nulls_for_implementation_cards() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue(
+            superpowers_kanban_core::card::CardId::new("impl"),
+            spec.into(),
+            plan.into(),
+            chrono::Local::now(),
+        );
+        board.enqueue_merge(
+            superpowers_kanban_core::card::CardId::new("m1"),
+            "kanban/a".into(),
+            "main".into(),
+            Some(superpowers_kanban_core::card::CardId::new("impl")),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
+        let value = dispatch_with_global(dir.path(), None, "list", &json!({})).unwrap();
+        let cards = value["cards"].as_array().unwrap();
+        let merge = cards.iter().find(|c| c["id"] == "m1").unwrap();
+        assert_eq!(merge["kind"], "merge");
+        assert_eq!(merge["source"], "kanban/a");
+        assert_eq!(merge["origin_card"], "impl");
+        let impl_card = cards.iter().find(|c| c["id"] == "impl").unwrap();
+        assert_eq!(impl_card["kind"], "implementation");
+        assert!(impl_card["source"].is_null());
     }
 }

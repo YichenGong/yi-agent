@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
-use crate::card::{Card, CardId, CardState};
+use crate::card::{Card, CardId, CardKind, CardState};
 
 /// 状态迁移被拒绝的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +61,41 @@ impl Board {
             task_id: None,
             thread_id: None,
             base_commit: None,
+            kind: CardKind::Implementation,
+            source_ref: None,
+            base_ref: None,
+            origin_card: None,
+        });
+        &self.cards[index]
+    }
+
+    /// 排入一张合并卡。载荷是 `source`/`base` 两个分支名；`origin` 仅自动派生时非空。
+    pub fn enqueue_merge(
+        &mut self,
+        id: CardId,
+        source: String,
+        base: String,
+        origin: Option<CardId>,
+        now: DateTime<Local>,
+    ) -> &Card {
+        let order = self.next_order;
+        self.next_order += 1;
+        let index = self.cards.len();
+        self.cards.push(Card {
+            id,
+            spec_path: PathBuf::new(),
+            plan_path: PathBuf::new(),
+            state: CardState::Queued,
+            enqueued_at: now,
+            order,
+            workdir: None,
+            task_id: None,
+            thread_id: None,
+            base_commit: None,
+            kind: CardKind::Merge,
+            source_ref: Some(source),
+            base_ref: Some(base),
+            origin_card: origin,
         });
         &self.cards[index]
     }
@@ -143,8 +178,7 @@ impl Board {
         Ok(())
     }
 
-    /// 队首排队卡迁移到 `Launching` 并返回其 id；无名额或队空返回 `None`。
-    /// 名额判断与迁移在同一把 `&mut self` 里完成，调用方据此占槽，天然原子。
+    /// 只认领实现卡的会话通路：合并卡另有 `claim_next_merge`，绝不能经这里启动。
     pub fn claim_next_launch(&mut self, limit: u16) -> Option<CardId> {
         if self.free_slots(limit) == 0 {
             return None;
@@ -156,13 +190,50 @@ impl Board {
         Some(next)
     }
 
-    /// 队首（`order` 最小）的排队卡片。
+    /// 队首（`order` 最小）可启动的实现卡。合并卡不走会话通路，故排除。
     pub fn next_startable(&self) -> Option<CardId> {
         self.cards
             .iter()
-            .filter(|card| card.state == CardState::Queued)
+            .filter(|card| card.state == CardState::Queued && card.kind == CardKind::Implementation)
             .min_by_key(|card| card.order)
             .map(|card| card.id.clone())
+    }
+
+    /// 队首可做合并的卡：`merge_busy` 为真（本项目已有合并在跑）时不出手。
+    pub fn claim_next_merge(&mut self, merge_busy: bool) -> Option<CardId> {
+        if merge_busy {
+            return None;
+        }
+        let next = self
+            .cards
+            .iter()
+            .filter(|card| card.state == CardState::Queued && card.kind == CardKind::Merge)
+            .min_by_key(|card| card.order)
+            .map(|card| card.id.clone())?;
+        if let Some(card) = self.cards.iter_mut().find(|c| c.id == next) {
+            card.state = CardState::Merging;
+        }
+        Some(next)
+    }
+
+    /// 看板上是否已有该 id（含终态），用于合并卡 id 去重。
+    pub fn contains(&self, id: &str) -> bool {
+        self.cards.iter().any(|card| card.id.0 == id)
+    }
+
+    /// 未被占用的合并卡 id：与已有卡撞名时追加 `-2`、`-3`…。
+    pub fn next_free_merge_id(&self, source: &str, base: &str) -> CardId {
+        let base_id = crate::card_id::merge_card_id_for(source, base);
+        if !self.contains(&base_id) {
+            return CardId::new(base_id);
+        }
+        for n in 2u32.. {
+            let candidate = format!("{base_id}-{n}");
+            if !self.contains(&candidate) {
+                return CardId::new(candidate);
+            }
+        }
+        unreachable!("u32 suffix space exhausted")
     }
 
     /// All queued cards in start order, without mutating the board.
@@ -377,6 +448,82 @@ mod tests {
             Some(PathBuf::from("/w/a"))
         );
         assert_eq!(restored.running_count(), 1);
+    }
+
+    #[test]
+    fn the_session_path_never_claims_a_merge_card() {
+        let mut board = Board::new();
+        board.enqueue_merge(
+            CardId::new("m1"),
+            "kanban/a".into(),
+            "main".into(),
+            None,
+            at(1, 0),
+        );
+        board.enqueue(
+            CardId::new("a"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            at(1, 1),
+        );
+        // 即使合并卡 order 更小、名额充足，会话通路也只能拿到实现卡。
+        assert_eq!(board.claim_next_launch(3), Some(CardId::new("a")));
+        assert_eq!(board.claim_next_launch(3), None);
+    }
+
+    #[test]
+    fn a_busy_merge_gate_yields_nothing() {
+        let mut board = Board::new();
+        board.enqueue_merge(CardId::new("m1"), "s".into(), "main".into(), None, at(1, 0));
+        assert_eq!(board.claim_next_merge(true), None);
+        assert_eq!(board.claim_next_merge(false), Some(CardId::new("m1")));
+        assert_eq!(
+            board.get(&CardId::new("m1")).unwrap().state,
+            CardState::Merging
+        );
+    }
+
+    #[test]
+    fn merge_cards_are_claimed_in_fifo_order_and_only_once() {
+        let mut board = Board::new();
+        // FIFO 是看板的排序键 `order`：m1 先入队（order 更小）、m2 后入队。
+        board.enqueue_merge(
+            CardId::new("m1"),
+            "s1".into(),
+            "main".into(),
+            None,
+            at(1, 1),
+        );
+        board.enqueue_merge(
+            CardId::new("m2"),
+            "s2".into(),
+            "main".into(),
+            None,
+            at(1, 2),
+        );
+        assert_eq!(board.claim_next_merge(false), Some(CardId::new("m1")));
+        assert_eq!(board.claim_next_merge(false), Some(CardId::new("m2")));
+        assert_eq!(board.claim_next_merge(false), None);
+    }
+
+    #[test]
+    fn a_used_merge_id_gets_a_numeric_suffix() {
+        let mut board = Board::new();
+        board.enqueue_merge(
+            CardId::new("merge-a-into-main"),
+            "a".into(),
+            "main".into(),
+            None,
+            at(1, 0),
+        );
+        assert_eq!(
+            board.next_free_merge_id("a", "main"),
+            CardId::new("merge-a-into-main-2")
+        );
+        assert_eq!(
+            board.next_free_merge_id("b", "main"),
+            CardId::new("merge-b-into-main")
+        );
     }
 
     #[test]

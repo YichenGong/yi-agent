@@ -1075,6 +1075,12 @@ pub(crate) fn board_query(
 pub(crate) struct BoardCard {
     pub id: String,
     pub state: String,
+    /// 卡片种类；旧/缺省卡片视为实现卡。
+    pub kind: String,
+    /// 合并卡的源分支。
+    pub source: Option<String>,
+    /// 合并卡的目标分支。
+    pub base: Option<String>,
     pub thread_id: Option<String>,
     pub workdir: Option<PathBuf>,
     pub spec_path: String,
@@ -1083,27 +1089,35 @@ pub(crate) struct BoardCard {
     pub plan_path: String,
 }
 
-/// Every card on the board, dropped to the fields the desktop works with.
+/// Parse a `list` payload into the cards the host works with.
 ///
-/// A malformed entry (one with no `id` or `state`) is skipped rather than
-/// failing the whole call: a single bad card must not blank the board. A
-/// missing `cards` key reads as an empty board.
-pub(crate) fn board_cards(
-    project: &Path,
-    board_dir: &Path,
-) -> Result<Vec<BoardCard>, BoardQueryError> {
-    let value = board_query(project, board_dir, "list", json!({}))?;
+/// Split out of `board_cards` so the mapping (including the `kind` default for
+/// old cards that carry no `kind`) is testable without a live daemon.
+pub(crate) fn parse_board_cards(value: &serde_json::Value) -> Vec<BoardCard> {
     let cards = value
         .get("cards")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    Ok(cards
+    cards
         .into_iter()
         .filter_map(|card| {
             Some(BoardCard {
                 id: card.get("id")?.as_str()?.to_string(),
                 state: card.get("state")?.as_str()?.to_string(),
+                kind: card
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("implementation")
+                    .to_string(),
+                source: card
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                base: card
+                    .get("base")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 thread_id: card
                     .get("thread_id")
                     .and_then(serde_json::Value::as_str)
@@ -1124,7 +1138,20 @@ pub(crate) fn board_cards(
                     .to_string(),
             })
         })
-        .collect())
+        .collect()
+}
+
+/// Every card on the board, dropped to the fields the desktop works with.
+///
+/// A malformed entry (one with no `id` or `state`) is skipped rather than
+/// failing the whole call: a single bad card must not blank the board. A
+/// missing `cards` key reads as an empty board.
+pub(crate) fn board_cards(
+    project: &Path,
+    board_dir: &Path,
+) -> Result<Vec<BoardCard>, BoardQueryError> {
+    let value = board_query(project, board_dir, "list", json!({}))?;
+    Ok(parse_board_cards(&value))
 }
 
 /// The project a `board/*` request names, canonicalized when the directory
@@ -6807,6 +6834,20 @@ mod card_scheduling_tests {
         );
         assert_eq!(terminal[0]["params"]["card_id"], "orphan");
         assert_eq!(terminal[0]["params"]["outcome"], "needs_you");
+    }
+
+    #[test]
+    fn board_cards_parses_a_merge_card_and_defaults_the_kind() {
+        // 直接喂一个假 `list` 结果给解析逻辑（与现有 board_cards 测试同款做法）。
+        let cards = serde_json::json!({ "cards": [
+            { "id": "m1", "state": "queued", "kind": "merge", "source": "kanban/a", "base": "main" },
+            { "id": "impl", "state": "queued", "spec_path": "i.spec.md", "plan_path": "i.plan.md" }
+        ]});
+        let parsed = parse_board_cards(&cards);
+        assert_eq!(parsed[0].kind, "merge");
+        assert_eq!(parsed[0].source.as_deref(), Some("kanban/a"));
+        assert_eq!(parsed[1].kind, "implementation");
+        assert_eq!(parsed[1].source, None);
     }
 
     /// 真主循环接线:启动 `serve` 后,3s tick(首个立即触发)把看板卡起成会话

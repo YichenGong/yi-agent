@@ -11,6 +11,7 @@ description: "Use when the user wants to add work to the Superpowers kanban queu
 ## 你的职责边界
 
 **只入队。** 这个 skill 的唯一动作是调用 `superpowers-kanban` 二进制。
+合并卡同样**只入队**：你只负责投递，执行与串行由插件进程负责。
 
 - **不要**生成、修改或"顺手补全" spec 或 plan。
 - **不要**替用户决定两条需求该不该合并成一张卡。合并与否由用户在界面上决定；
@@ -71,6 +72,23 @@ superpowers-kanban add <spec> <plan> --state-dir <dir>
 
 `add` **立刻**校验两份文件；校验失败会打印原因并以非零退出码结束。
 把这条错误原样转述给用户，不要重试、不要自我修正路径。
+
+### 2b. 合并入队
+
+用户说「把 <分支> 合进 <base>」「合并这个分支」「把这个分支 merge 了」时，投递一张**合并卡**：
+
+```bash
+superpowers-kanban add-merge <source> [--base <ref>] [--state-dir <dir>]
+```
+
+- `--base` 缺省取仓库默认分支（`origin/HEAD`，退化到 `main`）。
+- 命令**立刻**校验：refs 非空且不同、`<source>` 分支在仓库里存在；失败原样转述错误，
+  **不要**猜分支名、不要重试。
+- 成功打印 `delivered <card-id> ...`，据此跟用户复述「第几张卡」。
+
+合并卡与实现卡共用同一张看板队列、**不占**并发名额，且**同一项目同时只有一个合并**在执行
+（其余排队）。它只做本地 `git merge --no-ff`，不消耗模型调用。冲突时卡停在 `NeedsYou`
+等人处理，绝不自动解冲突。
 
 ### 3. 必要时确认状态
 
