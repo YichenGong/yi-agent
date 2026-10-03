@@ -8,9 +8,7 @@
     "--state-dir",
     "{state_dir}",
     "--project-root",
-    "{workdir}",
-    "--interval-secs",
-    "10"
+    "{workdir}"
   ],
   "switch_key": "superpowers_kanban",
   "stop_when_disabled": false,
