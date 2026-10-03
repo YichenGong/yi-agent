@@ -4884,7 +4884,7 @@ fn store_lookup(
 }
 
 /// 一条 `Item` 的稳定 id（用于 `thread/readItems` 的 `afterItemId` 切片与前端去重）。
-fn item_id(item: &crate::protocol::Item) -> Option<&str> {
+pub(crate) fn item_id(item: &crate::protocol::Item) -> Option<&str> {
     match item {
         crate::protocol::Item::UserMessage { id, .. }
         | crate::protocol::Item::AgentMessage { id, .. }
