@@ -4294,6 +4294,37 @@ async fn interrupt_and_wait_for_persist(
     }
 }
 
+/// 组装当前 turn 的 checkpoint：已 finalize 的 item（含开头的用户提问）+ 当前
+/// 上下文快照。进行中的流式文本不在 `completed_items` 里，故天然不入内。
+fn build_partial(
+    turn_id: &str,
+    user_prompt: &str,
+    completed_items: &[crate::protocol::Item],
+    messages: Vec<yi_agent_core::Message>,
+    usage: Option<crate::thread_store::TurnUsage>,
+) -> crate::thread_store::PartialTurn {
+    let mut items = Vec::with_capacity(completed_items.len() + 1);
+    items.push(opening_user_item(turn_id, user_prompt));
+    items.extend(completed_items.iter().cloned());
+    crate::thread_store::PartialTurn {
+        turn_id: turn_id.to_string(),
+        items,
+        messages,
+        usage,
+    }
+}
+
+/// 尽力写一次 checkpoint：失败只记 stderr，绝不打断 turn。
+fn checkpoint(
+    store: &crate::thread_store::ThreadStore,
+    thread_id: &str,
+    partial: crate::thread_store::PartialTurn,
+) {
+    if let Err(e) = store.write_partial(thread_id, &partial) {
+        eprintln!("[app-server] failed to write turn checkpoint ({thread_id}): {e}");
+    }
+}
+
 /// 一个 turn 结束后（或被 clear / compact 改动后）的收尾：把当前 session 快照
 /// 落盘、置 Idle，并在 `turn_id` 为 `Some` 时上报 Finished。
 ///
@@ -4538,6 +4569,14 @@ async fn run_thread_driver(
         let user_prompt = prompt.clone();
         translator.set_turn(turn_id.clone());
 
+        // turn 开始就把提问落进 checkpoint：即使这一轮随后立刻崩溃，
+        // 至少提问不会丢。
+        checkpoint(
+            &store,
+            &thread_id,
+            build_partial(&turn_id, &user_prompt, &[], agent.session().messages().to_vec(), None),
+        );
+
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
         // system prompt(catalog 未变时输出逐字节相同,不破坏 prompt cache)。
         if let Some(handle) = &catalog {
@@ -4571,6 +4610,11 @@ async fn run_thread_driver(
         let mut coalescer = DeltaCoalescer::default();
         let mut delta_tick = tokio::time::interval(Duration::from_millis(100));
         delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // checkpoint 去抖：item finalize 只标脏，由 500ms tick 合并成一次写盘，
+        // 避免长 turn 里每个 item 都同步写一次。
+        let mut checkpoint_tick = tokio::time::interval(Duration::from_millis(500));
+        checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut checkpoint_dirty = false;
 
         loop {
             tokio::select! {
@@ -4672,6 +4716,7 @@ async fn run_thread_driver(
                             for n in translator.on_event(e) {
                                 if let crate::protocol::Notification::ItemCompleted { item, .. } = &n {
                                     completed_items.push(item.clone());
+                                    checkpoint_dirty = true;
                                 }
                                 // 用量通知携带本轮累积快照(见 Translator::on_event),最后一条即落盘用的完整用量。
                                 if let crate::protocol::Notification::TokenUsage {
@@ -4762,6 +4807,20 @@ async fn run_thread_driver(
                         .await;
                     }
                 }
+                _ = checkpoint_tick.tick(), if checkpoint_dirty => {
+                    checkpoint(
+                        &store,
+                        &thread_id,
+                        build_partial(
+                            &turn_id,
+                            &user_prompt,
+                            &completed_items,
+                            agent.session().messages().to_vec(),
+                            last_usage.clone(),
+                        ),
+                    );
+                    checkpoint_dirty = false;
+                }
                 Some(target) = interrupt_rx.recv(), if !cancel_sent => {
                     // 只接受针对当前 turn 的中断;忽略上一轮残留的信号。
                     if target == turn_id {
@@ -4830,6 +4889,11 @@ async fn run_thread_driver(
             // active_turn_id,且**不要**再 append 一次(否则会用 turn 前的 session 覆盖)。
             let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
             let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+            // 这条路径不走常规收尾；本轮 checkpoint 同样必须清掉，否则会在盘上
+            // 留一条已结束 turn 的残留，重启后被 resume 当成待恢复 turn。
+            if let Err(e) = store.clear_partial(&thread_id) {
+                eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+            }
             continue;
         }
 
@@ -4847,6 +4911,11 @@ async fn run_thread_driver(
             &status,
         )
         .await;
+
+        // 收尾已把整轮 append 进主 jsonl；checkpoint 的使命结束。
+        if let Err(e) = store.clear_partial(&thread_id) {
+            eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+        }
     }
 }
 
@@ -7219,6 +7288,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// 第一次调用产出一段助手文本 + 一个工具调用后正常结束（core 会进入 ACT、
+    /// 向 driver 发 `ToolCall`，translator 借此把累积文本 finalize 成一个 item）；
+    /// 之后的调用**永不产出**，于是 turn 一直停在"已 finalize 一块文本、但还没
+    /// persist"的窗口——正是 checkpoint 该已落盘的窗口。
+    struct CheckpointProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for CheckpointProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            use yi_agent_core::provider::ProviderEvent as E;
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // 工具入参必须是合法 JSON（`{}`），否则 accumulate 会因解析失败报错。
+                let head = futures::stream::iter(vec![
+                    E::TextDelta("a".into()),
+                    E::ToolUseStart { id: "t1".into(), name: "noop".into() },
+                    E::ToolUseDelta { id: "t1".into(), partial_json: "{}".into() },
+                    E::ToolUseEnd { id: "t1".into() },
+                    E::Stop { reason: yi_agent_core::provider::StopReason::EndTurn },
+                ]);
+                Ok(head.boxed())
+            } else {
+                // 永不产出的尾部：保证 turn 不收尾（否则会被正常 persist）。
+                Ok(futures::stream::pending::<E>().boxed())
+            }
+        }
+    }
+
     /// 测试用的单客户端 hub:注册 `local` 并起 `pump_stdout`,与生产的 stdio 接线同款。
     fn test_hub<W>(
         writer: W,
@@ -7298,6 +7403,32 @@ pub(crate) mod tests {
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(DelayedProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(&mut agent, session);
+        Ok(BuiltAgent {
+            agent,
+            provider,
+            config,
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        })
+    }
+
+    fn build_checkpoint_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> =
+            Arc::new(CheckpointProvider { calls: AtomicUsize::new(0) });
         let config = yi_agent_core::AgentConfig::default();
         let mut agent = yi_agent_core::Agent::new(
             provider.clone(),
@@ -7615,6 +7746,73 @@ pub(crate) mod tests {
             }
         }
         panic!("no thread/start response");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_flight_turn_leaves_a_checkpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_checkpoint_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"do work"}}]}}}}"#
+        ))
+        .await;
+
+        // 等到 agent 的 item/completed（助手文本块）出现 —— 说明已 finalize 过。
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed") {
+                break;
+            }
+        }
+
+        let partial = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.partial.json"));
+        // checkpoint 是去抖写的，轮询等待。
+        let mut text = String::new();
+        for _ in 0..100 {
+            match std::fs::read_to_string(&partial) {
+                Ok(t) if t.contains("do work") => { text = t; break; }
+                _ => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        assert!(text.contains("do work"), "checkpoint must carry the prompt: {text:?}");
+        assert!(text.contains("user-"), "checkpoint must carry the opening user item: {text:?}");
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completed_turn_removes_its_checkpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+        let partial = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.partial.json"));
+        for _ in 0..100 {
+            if !partial.exists() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!partial.exists(), "a finished turn must not leave a checkpoint");
+        h.shutdown().await;
     }
 
     /// 读到 id 匹配的那一帧响应,丢弃中间穿插的通知(如 `process/updated`)。
