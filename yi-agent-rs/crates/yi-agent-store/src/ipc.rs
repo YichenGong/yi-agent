@@ -997,10 +997,20 @@ impl Daemon {
                                 &confirmations,
                             );
                         });
-                        listener_handlers
+                        let mut handlers = listener_handlers
                             .lock()
-                            .expect("client handler list mutex poisoned")
-                            .push(handler);
+                            .expect("client handler list mutex poisoned");
+                        // Reap finished handlers before recording this one. A
+                        // finished thread's stack stays resident for as long as
+                        // its `JoinHandle` is alive, and the app-server polls
+                        // over fresh short-lived connections; keeping every
+                        // handle forever therefore leaked one stack per
+                        // connection for the daemon's whole lifetime (hundreds
+                        // of megabytes over hours, with only a handful of live
+                        // threads). Dropping a finished handle releases its
+                        // stack; live handles stay so shutdown can still join.
+                        handlers.retain(|handle| !handle.is_finished());
+                        handlers.push(handler);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(10));
