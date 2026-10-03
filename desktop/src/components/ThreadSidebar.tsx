@@ -140,6 +140,10 @@ export function ThreadSidebar({
   // an outside click; the two are mutually exclusive.
   const [newMenuOpen, setNewMenuOpen] = useState(false);
   const [contextWs, setContextWs] = useState<string | null>(null);
+  // 顶部 “+ New thread” 按钮的点击涟漪：按下时按指针位置生成一圈扩散，
+  // `animationend` 后移除，避免节点堆积。键盘激活没有坐标，退化为居中涟漪。
+  const [ripples, setRipples] = useState<{ id: number; x: number; y: number; size: number }[]>([]);
+  const rippleSeq = useRef(0);
   const [width, setWidth] = useState(loadSidebarWidth);
   const widthRef = useRef(width);
   const cleanupDrag = useRef<(() => void) | null>(null);
@@ -197,6 +201,64 @@ export function ThreadSidebar({
     setNewMenuOpen(false);
     setContextWs(null);
   }, []);
+
+  // Reduced-motion users get no ripple at all (rather than a fast one): the
+  // decoration is pure feedback and the click itself is unaffected.
+  const reduceMotion = useCallback(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return false;
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }, []);
+
+  // `rippleSeq` only ever grows, so ids are unique per mount.
+  const addRipple = useCallback(
+    (x: number, y: number, size: number) => {
+      const id = rippleSeq.current++;
+      setRipples((prev) => [...prev, { id, x, y, size }]);
+    },
+    [],
+  );
+
+  const removeRipple = useCallback((id: number) => {
+    setRipples((prev) => prev.filter((r) => r.id !== id));
+  }, []);
+
+  /** Radius that reaches the button's farthest corner from the press point. */
+  const rippleSizeFor = (rect: DOMRect, x: number, y: number) => {
+    const dx = Math.max(x, rect.width - x);
+    const dy = Math.max(y, rect.height - y);
+    return Math.hypot(dx, dy) * 2;
+  };
+
+  const onNewThreadPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+    if (reduceMotion()) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    addRipple(x, y, rippleSizeFor(rect, x, y));
+  };
+
+  // Keyboard activation has no pointer coordinates, so it gets a centred ripple.
+  // Handling it on keydown (rather than guessing from `click`) keeps the pointer
+  // and keyboard paths independent: a real Enter/Space fires keydown *and* the
+  // browser's synthesized click, so reacting in `click` would double-fire.
+  const onNewThreadKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.repeat || reduceMotion()) return;
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = rect.width / 2;
+    const y = rect.height / 2;
+    addRipple(x, y, rippleSizeFor(rect, x, y));
+  };
+
+  const onNewThreadClick = () => {
+    // No recent dirs to offer: go straight to the native picker.
+    if (workspaces.length === 0) {
+      onBrowse();
+      return;
+    }
+    setContextWs(null);
+    setNewMenuOpen((v) => !v);
+  };
 
   // Escape closes whichever menu is open, regardless of what inside it (or the
   // trigger) currently has focus.
@@ -451,18 +513,22 @@ export function ThreadSidebar({
           type="button"
           aria-haspopup="menu"
           aria-expanded={newMenuOpen}
-          onClick={() => {
-            // No recent dirs to offer: go straight to the native picker.
-            if (workspaces.length === 0) {
-              onBrowse();
-              return;
-            }
-            setContextWs(null);
-            setNewMenuOpen((v) => !v);
-          }}
-          className="w-full rounded-md bg-raised px-3 py-2 text-left text-sm text-fg hover:bg-raised"
+          onPointerDown={onNewThreadPointerDown}
+          onKeyDown={onNewThreadKeyDown}
+          onClick={onNewThreadClick}
+          className="relative w-full overflow-hidden rounded-md bg-raised px-3 py-2 text-left text-sm text-fg hover:bg-raised"
         >
-          + New thread
+          {ripples.map((r) => (
+            <span
+              key={r.id}
+              data-ripple
+              aria-hidden="true"
+              onAnimationEnd={() => removeRipple(r.id)}
+              className="thread-ripple"
+              style={{ left: r.x, top: r.y, width: r.size, height: r.size }}
+            />
+          ))}
+          <span className="relative">+ New thread</span>
         </button>
         {newMenuOpen && (
           <>
