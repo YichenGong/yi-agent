@@ -19,6 +19,16 @@ impl std::fmt::Display for CardId {
     }
 }
 
+/// 卡片种类。缺省（含旧状态文件）为实现卡。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardKind {
+    #[default]
+    Implementation,
+    /// 只做分支合并，不跑会话、不写代码。
+    Merge,
+}
+
 /// 卡片状态。`Running` 是唯一占用并发槽位的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +113,18 @@ pub struct Card {
     /// 启动时 worktree 的 HEAD，供对账判断「有无新提交」。
     #[serde(default)]
     pub base_commit: Option<String>,
+    /// 卡片种类；旧状态文件没有此字段 → 实现卡。
+    #[serde(default)]
+    pub kind: CardKind,
+    /// 合并卡的源分支。
+    #[serde(default)]
+    pub source_ref: Option<String>,
+    /// 合并卡的目标分支。
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    /// 自动派生时指向配对的实现卡。
+    #[serde(default)]
+    pub origin_card: Option<CardId>,
 }
 
 #[cfg(test)]
@@ -175,6 +197,24 @@ mod tests {
     #[test]
     fn a_running_card_cannot_be_started_twice() {
         assert!(!CardState::Running.can_transition_to(CardState::Running));
+    }
+
+    #[test]
+    fn a_card_defaults_to_an_implementation_kind() {
+        assert_eq!(CardKind::default(), CardKind::Implementation);
+    }
+
+    #[test]
+    fn a_board_json_without_a_kind_reads_back_as_implementation() {
+        // 旧 board.json 没有 kind/source_ref/base_ref/origin_card 字段。
+        let json = r#"{"cards":[{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md",
+            "state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}],
+            "next_order":1}"#;
+        let board: crate::board::Board = serde_json::from_str(json).unwrap();
+        let card = board.get(&CardId::new("a")).unwrap();
+        assert_eq!(card.kind, CardKind::Implementation);
+        assert_eq!(card.source_ref, None);
+        assert_eq!(card.origin_card, None);
     }
 
     #[test]

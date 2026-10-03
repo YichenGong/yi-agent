@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
-use crate::card::{Card, CardId, CardState};
+use crate::card::{Card, CardId, CardKind, CardState};
 
 /// 状态迁移被拒绝的原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +61,41 @@ impl Board {
             task_id: None,
             thread_id: None,
             base_commit: None,
+            kind: CardKind::Implementation,
+            source_ref: None,
+            base_ref: None,
+            origin_card: None,
+        });
+        &self.cards[index]
+    }
+
+    /// 排入一张合并卡。载荷是 `source`/`base` 两个分支名；`origin` 仅自动派生时非空。
+    pub fn enqueue_merge(
+        &mut self,
+        id: CardId,
+        source: String,
+        base: String,
+        origin: Option<CardId>,
+        now: DateTime<Local>,
+    ) -> &Card {
+        let order = self.next_order;
+        self.next_order += 1;
+        let index = self.cards.len();
+        self.cards.push(Card {
+            id,
+            spec_path: PathBuf::new(),
+            plan_path: PathBuf::new(),
+            state: CardState::Queued,
+            enqueued_at: now,
+            order,
+            workdir: None,
+            task_id: None,
+            thread_id: None,
+            base_commit: None,
+            kind: CardKind::Merge,
+            source_ref: Some(source),
+            base_ref: Some(base),
+            origin_card: origin,
         });
         &self.cards[index]
     }
