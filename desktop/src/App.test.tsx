@@ -184,6 +184,7 @@ vi.mock("./lib/platform", async (importOriginal) => {
 });
 
 import App from "./App";
+import { nextReconnectDelay } from "./lib/reconnect";
 
 beforeEach(() => {
   clients.length = 0;
@@ -1341,6 +1342,152 @@ describe("App settings & theme wiring", () => {
     await waitFor(() =>
       expect(clients[1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
     );
+  });
+});
+
+// 断线韧性:后端重启/网络闪断时 iOS 端不能只试一次就永远卡在 connecting。
+// 每个用例都开假定时器,免得真的等 8s/10s 的退避。
+describe("App reconnect resilience", () => {
+  /** 断线(宿主报告 sidecar 退出)。 */
+  const exit = () =>
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 });
+    });
+
+  /** 冲掉在途的微任务/React 更新,好让 `clients` 数组稳定下来。 */
+  const flush = async () => {
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    }
+  };
+
+  /** 等首连接把 initialize 发出去(等价旧 suite 里的 settle)。 */
+  const waitMounted = async () => {
+    await flush();
+    expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true);
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("schedules a reconnect after a disconnect (single shot is not enough)", async () => {
+    render(<App />);
+    await waitMounted();
+    expect(clients.length).toBe(1);
+
+    exit();
+    // 退避尚未到点:不立刻重连(restartTimer 还没烧完)。
+    expect(clients.length).toBe(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    expect(clients.length).toBe(2);
+    await flush();
+    expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true);
+  });
+
+  it("keeps retrying with increasing delays when attempts keep failing", async () => {
+    // 卡住 initialize:每个新客户端都建得起来,却永远握不上手,等价于"后端
+    // 还没起来"。这样每次重连都会在退避链上再排一轮,而不是止步于一次。
+    state.dataSources["initialize"] = () => new Promise(() => {});
+    render(<App />);
+    await flush();
+    expect(clients.length).toBe(1);
+    expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true);
+
+    exit(); // attempt 0 → 500ms
+    // 499ms 还不到,必须仍然只有一个客户端。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0) - 1);
+    });
+    expect(clients.length).toBe(1);
+    // 到点:第 2 个客户端出现,但它的握手仍卡着(initialize 未 resolve),
+    // 于是它达不到 connected。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(clients.length).toBe(2);
+
+    // 第 2 次尝试同样失败:第 2 个客户端也报 exited。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 });
+    });
+    // 下一次必须按 1000ms(而不是又一次 500ms)排队。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    expect(clients.length).toBe(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(1) - nextReconnectDelay(0));
+    });
+    expect(clients.length).toBe(3);
+
+    // 第 3 次也一样:2000ms 后才轮到第 4 个客户端。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(2) - 1);
+    });
+    expect(clients.length).toBe(3);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(clients.length).toBe(4);
+  });
+
+  it("resets the backoff after a successful handshake", async () => {
+    render(<App />);
+    await waitMounted(); // 第一趟握手走通:connected,attempt 归零
+    expect(clients.length).toBe(1);
+
+    // 一次断开 → 一次重连 → 再握手成功:回来后 attempt 又是 0。
+    exit();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    expect(clients.length).toBe(2);
+    await flush();
+    expect(clients[1].requests.some((r) => r.method === "thread/listAll")).toBe(true);
+    expect(screen.getByText("connected")).toBeTruthy();
+
+    // 成功之后的这一次断开,必须从 base(而不是被抬高过的档位)重新起算。
+    exit();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0) - 1);
+    });
+    expect(clients.length).toBe(2);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(clients.length).toBe(3);
+  });
+
+  it("reconnects immediately when the app returns to the foreground", async () => {
+    render(<App />);
+    await waitMounted();
+    expect(clients.length).toBe(1);
+
+    // 切到后台再回前台,而 socket 已死(状态 exited)。
+    exit();
+    expect(clients.length).toBe(1); // 退避还没到点
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    // 前台唤醒 = 立刻重连,不等退避。
+    expect(clients.length).toBe(2);
+    await flush();
+    expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true);
   });
 });
 
