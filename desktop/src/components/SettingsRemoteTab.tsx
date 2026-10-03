@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
-import { buildPairUri } from "../lib/pairUri";
+import { buildPairUri, phoneRelayUrl } from "../lib/pairUri";
 
 /**
  * 桌面「远程访问」设置页。
@@ -20,6 +20,11 @@ export interface SettingsRemoteTabProps {
   call?: RemoteCall;
   /** 中继地址预填（宿主从已持久化的远端配置里读），用户仍可改。 */
   initialRelayUrl?: string;
+  /**
+   * 保存「本机侧车要连的中继地址」的接缝（桌面宿主接到 Tauri 的 `set_relay_url`）。
+   * 空串按其语义传 `null`（清除配置 → 侧车回到纯 stdio）。缺省时保存按钮不可用。
+   */
+  saveRelayUrl?: (value: string | null) => Promise<void>;
 }
 
 /** 一条 `pair/create` 结果。 */
@@ -60,7 +65,11 @@ function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-export function SettingsRemoteTab({ call, initialRelayUrl }: SettingsRemoteTabProps) {
+export function SettingsRemoteTab({
+  call,
+  initialRelayUrl,
+  saveRelayUrl,
+}: SettingsRemoteTabProps) {
   const [relayUrl, setRelayUrl] = useState(initialRelayUrl ?? "");
   const [code, setCode] = useState<string | null>(null);
   const [remaining, setRemaining] = useState(0);
@@ -69,6 +78,8 @@ export function SettingsRemoteTab({ call, initialRelayUrl }: SettingsRemoteTabPr
   const [codeError, setCodeError] = useState<string | null>(null);
   const [minting, setMinting] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
+  // 保存状态：null 未保存过、true「已保存，正在重连」、字符串为失败原因。
+  const [saveState, setSaveState] = useState<null | true | string>(null);
 
   // 倒计时句柄。每次铸新码都先清旧的，卸载时也必须清——否则测试会看到悬挂的定时器。
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -97,6 +108,8 @@ export function SettingsRemoteTab({ call, initialRelayUrl }: SettingsRemoteTabPr
   }, []);
 
   // 配对码旁的二维码：码与中继地址都就绪才渲染。地址为空时退回纯文本码（降级）。
+  // 二维码要装的是**手机侧**端点：字段里填的是电脑侧 `/connect`，手机得连 `/ws`，
+  // 故派生后再编码（两路由不同，原样塞会让手机注册成 agent）。派生失败则退回原值。
   const [qrSvg, setQrSvg] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -104,7 +117,8 @@ export function SettingsRemoteTab({ call, initialRelayUrl }: SettingsRemoteTabPr
       setQrSvg(null);
       return;
     }
-    QRCode.toString(buildPairUri(relayUrl.trim(), code), { type: "svg", margin: 1 })
+    const phone = phoneRelayUrl(relayUrl.trim()) ?? relayUrl.trim();
+    QRCode.toString(buildPairUri(phone, code), { type: "svg", margin: 1 })
       .then((svg) => {
         if (!cancelled) setQrSvg(svg);
       })
@@ -158,11 +172,30 @@ export function SettingsRemoteTab({ call, initialRelayUrl }: SettingsRemoteTabPr
     }
   };
 
+  /**
+   * 保存本机侧车要连的中继地址。空白 → `null`（清除配置，侧车回到纯 stdio）。
+   *
+   * 宿主在落盘后会杀掉侧车让监管循环用新值重启，故成功提示是「已保存，正在重连」。
+   */
+  const save = async () => {
+    if (!saveRelayUrl) return;
+    setSaveState(null);
+    const value = relayUrl.trim();
+    try {
+      await saveRelayUrl(value.length === 0 ? null : value);
+      setSaveState(true);
+    } catch (e) {
+      setSaveState(errorText(e));
+    }
+  };
+
   return (
     <section className="p-5">
       <h2 className="text-sm font-medium text-fg">远程访问</h2>
       <p className="mt-2 text-xs text-fg-subtle">
-        在手机上打开 Yi-Agent，把下面的中继地址与配对码填进配对表单即可连接本机。
+        扫下面的二维码即可让手机按<strong>手机侧端点</strong>（<code>…/ws?session=…</code>）配对；
+        也可手填配对码与手机侧地址。下面输入框填的是中继的<strong>电脑侧端点</strong>
+        （<code>…/connect?session=…</code>），保存后由本机侧车使用。
       </p>
 
       <div className="mt-4">
@@ -210,12 +243,38 @@ export function SettingsRemoteTab({ call, initialRelayUrl }: SettingsRemoteTabPr
           autoCapitalize="none"
           autoCorrect="off"
           spellCheck={false}
-          placeholder="wss://relay.example.com/ws?session=..."
+          placeholder="wss://relay.example.com/connect?session=..."
           value={relayUrl}
           onChange={(e) => setRelayUrl(e.target.value)}
           className="mt-1 w-full rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none"
         />
       </label>
+
+      <p className="mt-1 text-xs text-fg-subtle">
+        填中继的电脑侧端点（<code>…/connect?session=…</code>），保存后本机侧车会用新地址
+        重连。手机自己要填的是另一个地址：<code>…/ws?session=…</code>。
+      </p>
+
+      <div className="mt-2 flex items-center gap-3">
+        <button
+          type="button"
+          onClick={() => void save()}
+          disabled={!saveRelayUrl}
+          className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg-muted hover:text-fg disabled:opacity-50"
+        >
+          保存
+        </button>
+        {saveState === true && (
+          <span role="status" className="text-xs text-fg-muted">
+            已保存，正在重连
+          </span>
+        )}
+        {typeof saveState === "string" && (
+          <span role="alert" className="text-xs text-red-400">
+            {saveState}
+          </span>
+        )}
+      </div>
 
       <div className="mt-5">
         <h3 className="text-sm font-medium text-fg">已配对设备</h3>

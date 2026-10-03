@@ -2074,6 +2074,10 @@ where
                         let workdir = theme_handle.workdir();
                         let watchman_enabled =
                             crate::settings_store::load_watchman_enabled(workdir);
+                        // 侧车中继地址（桌面设置页写入）：与 theme/值守同处一个
+                        // preferences.json，故一并从同一个 workdir 读。未配置即
+                        // `null`，桌面首屏据此回填空串。
+                        let relay_url = crate::settings_store::load_relay_url(workdir);
                         write_response(
                             &hub,
                             &client,
@@ -2082,6 +2086,7 @@ where
                                 json!({
                                     "theme": theme.as_str(),
                                     "board_watchman_enabled": watchman_enabled,
+                                    "relay_url": relay_url,
                                 }),
                             ),
                         )
@@ -2127,30 +2132,58 @@ where
                             .await?;
                             continue;
                         }
-                        let requested = req
-                            .params
-                            .get("theme")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let theme = match requested.trim().to_ascii_lowercase().as_str() {
-                            "dark" => crate::settings_store::Theme::Dark,
-                            "light" => crate::settings_store::Theme::Light,
-                            other => {
-                                write_response(
-                                    &hub,
-                                    &client,
-                                    err_response(
-                                        id,
-                                        RpcError::invalid_params(format!(
-                                            "unsupported theme '{other}': expected 'dark' or 'light'"
-                                        )),
-                                    ),
-                                )
-                                .await?;
-                                continue;
+                        // theme 只在请求里显式带上时才校验/应用：只写 relay_url
+                        // 的请求不该因为「没有 theme」而被拒绝。先校验再落盘，
+                        // 免得非法 theme 把一个有效的 relay_url 写了一半。
+                        let requested_theme = if req.params.get("theme").is_some() {
+                            let requested =
+                                req.params.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+                            match requested.trim().to_ascii_lowercase().as_str() {
+                                "dark" => Some(crate::settings_store::Theme::Dark),
+                                "light" => Some(crate::settings_store::Theme::Light),
+                                other => {
+                                    write_response(
+                                        &hub,
+                                        &client,
+                                        err_response(
+                                            id,
+                                            RpcError::invalid_params(format!(
+                                                "unsupported theme '{other}': expected 'dark' or 'light'"
+                                            )),
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
                             }
+                        } else {
+                            None
                         };
-                        theme_handle.set(theme);
+
+                        // `relay_url`（桌面设置页）：与 theme 各写各的键，共处一个
+                        // 文件，故两条路径都走 settings_store 的读-改-写。
+                        // `null` / 空 / 空白 → 清除该键。非串非 null（客户端写错
+                        // 类型）不改动既有配置——静默清除是破坏性的。
+                        if let Some(value) = req.params.get("relay_url") {
+                            if value.is_null() || value.is_string() {
+                                let workdir = theme_handle.workdir();
+                                if let Err(error) =
+                                    crate::settings_store::save_relay_url(workdir, value.as_str())
+                                {
+                                    write_response(
+                                        &hub,
+                                        &client,
+                                        err_response(id, RpcError::internal(error.to_string())),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if let Some(theme) = requested_theme {
+                            theme_handle.set(theme);
+                        }
                         write_response(&hub, &client, ok_response(id, json!({ "ok": true })))
                             .await?;
                     }
@@ -11645,6 +11678,171 @@ pub(crate) mod tests {
             crate::settings_store::load(dir.path()),
             crate::settings_store::Theme::Light
         );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_read_reports_the_stored_relay_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        crate::settings_store::save_relay_url(
+            dir.path(),
+            Some("wss://relay.example.com/connect?session=x"),
+        )
+        .unwrap();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(
+            v["result"]["relay_url"], "wss://relay.example.com/connect?session=x",
+            "{v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 未配置时 `relay_url` 是显式的 `null`（不是缺键）：桌面设置页据此回填空串，
+    /// 缺键与 `null` 在 JSON 里对前端是两码事。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_read_reports_null_when_no_relay_url_is_stored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["result"]["relay_url"], json!(null), "{v}");
+        assert!(v["result"].get("relay_url").is_some(), "key must be present: {v}");
+        h.shutdown().await;
+    }
+
+    /// 写 `relay_url` 后读回一致，且落盘可被另一个进程（如侧车）读回。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_then_read_round_trips_the_relay_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":"wss://relay.example.com/connect?session=x"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["result"]["ok"], true, "{v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(
+            v["result"]["relay_url"], "wss://relay.example.com/connect?session=x",
+            "{v}"
+        );
+        assert_eq!(
+            crate::settings_store::load_relay_url(dir.path()).as_deref(),
+            Some("wss://relay.example.com/connect?session=x")
+        );
+        h.shutdown().await;
+    }
+
+    /// `null` / 空串 → 清除；清除后 read 报 `null`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_clears_the_relay_url() {
+        for clear in [json!(null), json!(""), json!("   ")] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut cfg = test_config();
+            cfg.workdir = dir.path().to_path_buf();
+            crate::settings_store::save_relay_url(
+                dir.path(),
+                Some("wss://relay.example.com/connect?session=x"),
+            )
+            .unwrap();
+            let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+            initialize(&mut h).await;
+
+            h.send(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "ui/settings/write",
+                    "params": { "relay_url": clear },
+                })
+                .to_string(),
+            )
+            .await;
+            let v = read_response(&mut h, 2).await;
+            assert_eq!(v["result"]["ok"], true, "clear={clear}: {v}");
+
+            h.send(r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/read","params":{}}"#)
+                .await;
+            let v = read_response(&mut h, 3).await;
+            assert_eq!(v["result"]["relay_url"], json!(null), "clear={clear}: {v}");
+            assert_eq!(
+                crate::settings_store::load_relay_url(dir.path()),
+                None,
+                "clear={clear}"
+            );
+            h.shutdown().await;
+        }
+    }
+
+    /// 写错类型（非串非 null）不改动既有配置：静默清除是破坏性的。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_ignores_a_mistyped_relay_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        crate::settings_store::save_relay_url(dir.path(), Some("wss://r/connect?session=x"))
+            .unwrap();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":5}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["result"]["ok"], true, "{v}");
+        assert_eq!(
+            crate::settings_store::load_relay_url(dir.path()).as_deref(),
+            Some("wss://r/connect?session=x"),
+            "a mistyped field must not wipe the stored url"
+        );
+        h.shutdown().await;
+    }
+
+    /// 只有 `relay_url` 的写不能影响 theme：两者共处一个文件。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn writing_the_relay_url_keeps_the_theme() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"theme":"light"}}"#,
+        )
+        .await;
+        let _ = read_response(&mut h, 2).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"relay_url":"wss://r/connect?session=x"}}"#,
+        )
+        .await;
+        let _ = read_response(&mut h, 3).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        assert_eq!(v["result"]["theme"], "light", "{v}");
+        assert_eq!(v["result"]["relay_url"], "wss://r/connect?session=x", "{v}");
         h.shutdown().await;
     }
 

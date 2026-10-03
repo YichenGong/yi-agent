@@ -111,11 +111,54 @@ pub fn save_watchman_enabled(workdir: &Path, enabled: bool) -> std::io::Result<(
     )
 }
 
-/// 读 `<workdir>/.yi-agent/preferences.json` 的顶层对象、插入一个键、原子替换。
+/// `preferences.json` 里侧车中继地址的键名。
 ///
-/// [`save`] 与 [`save_watchman_enabled`] 的唯一实现：两者共处同一文件，若各写
-/// 各的读-改-写，后写的会把先写的键整个抹掉。
-fn set_object_value(workdir: &Path, key: &str, value: serde_json::Value) -> std::io::Result<()> {
+/// 桌面壳（`desktop/src-tauri/src/bridge.rs`）直接读写同一个文件，故这里把键名
+/// 公开出去，避免两边各写一串字面量。
+pub const RELAY_URL_KEY: &str = "relay_url";
+
+/// 读侧车要连的中继地址（桌面设置页写入）。
+///
+/// 缺文件 / 坏文件 / 缺键 / 非字符串 / 纯空白一律回退 `None`——坏偏好绝不阻断
+/// 侧车启动，`None` 即今日的纯 stdio 行为。
+pub fn load_relay_url(workdir: &Path) -> Option<String> {
+    let path = preferences_path(workdir);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get(RELAY_URL_KEY)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string)
+        })
+}
+
+/// 写侧车中继地址。`None` / 空白 → **删除**该键（回到纯 stdio），而不是留一个
+/// 空串——否则「未配置」与「配置成空」在文件里长得一样。
+///
+/// 与 [`save`] 同一约定：读-改-写、保留无关键、原子替换。
+pub fn save_relay_url(workdir: &Path, url: Option<&str>) -> std::io::Result<()> {
+    let value = url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| serde_json::Value::String(url.to_string()));
+    read_write_key(workdir, RELAY_URL_KEY, value)
+}
+
+/// 读 `<workdir>/.yi-agent/preferences.json` 的顶层对象、设置（或删除）一个键、
+/// 原子替换。
+///
+/// [`save`]、[`save_watchman_enabled`] 与 [`save_relay_url`] 的唯一实现：三者
+/// 共处同一文件，若各写各的读-改-写，后写的会把先写的键整个抹掉。`value` 为
+/// `None` 表示删除该键（清理偏好用）。
+fn read_write_key(
+    workdir: &Path,
+    key: &str,
+    value: Option<serde_json::Value>,
+) -> std::io::Result<()> {
     let dir = workdir.join(".yi-agent");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("preferences.json");
@@ -126,7 +169,14 @@ fn set_object_value(workdir: &Path, key: &str, value: serde_json::Value) -> std:
             .unwrap_or_default(),
         Err(_) => serde_json::Map::new(),
     };
-    object.insert(key.to_string(), value);
+    match value {
+        Some(value) => {
+            object.insert(key.to_string(), value);
+        }
+        None => {
+            object.remove(key);
+        }
+    }
     let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
         .map_err(std::io::Error::other)?;
     // 临时名逐次唯一:同一目录可能有并发写者(runtime_prefs、kanban 的 scaffold
@@ -135,6 +185,11 @@ fn set_object_value(workdir: &Path, key: &str, value: serde_json::Value) -> std:
     let tmp_path = temp_path_for(&dir, seq);
     std::fs::write(&tmp_path, &text)?;
     std::fs::rename(&tmp_path, &path)
+}
+
+/// 写入一个顶层键（保留其余键），[`read_write_key`] 的薄封装。
+fn set_object_value(workdir: &Path, key: &str, value: serde_json::Value) -> std::io::Result<()> {
+    read_write_key(workdir, key, Some(value))
 }
 
 /// 进程内递增序号,给每次写入的临时文件一个不同的后缀。
@@ -152,6 +207,131 @@ fn temp_path_for(dir: &Path, seq: u64) -> PathBuf {
         std::process::id(),
         seq
     ))
+}
+
+/// 中继地址偏好（`relay_url`）的读写测试。
+///
+/// 该键是桌面设置页与侧车之间的唯一落点：侧车启动时经 `load_relay_url` 读它。
+/// 与 `theme`/`board_watchman_enabled` 同处一个文件，故同样断言写不覆盖无关键。
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_file_has_no_relay_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(load_relay_url(dir.path()), None);
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+        assert_eq!(
+            load_relay_url(dir.path()).as_deref(),
+            Some("wss://relay.example.com/connect?session=x")
+        );
+    }
+
+    /// 落盘前 trim：用户从浏览器地址栏复制过来的地址常带空白。
+    #[test]
+    fn a_stored_url_is_trimmed_on_save_and_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save_relay_url(dir.path(), Some("  wss://relay.example.com/connect?session=x  ")).unwrap();
+        assert_eq!(
+            load_relay_url(dir.path()).as_deref(),
+            Some("wss://relay.example.com/connect?session=x")
+        );
+        // 直接写带空白的值进文件，读出来同样 trim。
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(preferences_path(dir.path()), r#"{"relay_url":"  wss://r/x  "}"#).unwrap();
+        assert_eq!(load_relay_url(dir.path()).as_deref(), Some("wss://r/x"));
+    }
+
+    /// 空串 / 纯空白等价于未设置：清除该键，而不是留一个空值（空值仍会出现在
+    /// `ui/settings/read` 里，让「未配置」长得像「配置成空」）。
+    #[test]
+    fn saving_an_empty_or_blank_url_clears_the_key() {
+        for blank in ["", "   "] {
+            let dir = tempfile::TempDir::new().unwrap();
+            save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+            save_relay_url(dir.path(), Some(blank)).unwrap();
+            assert_eq!(load_relay_url(dir.path()), None, "blank: {blank:?}");
+
+            let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                value.get("relay_url").is_none(),
+                "a cleared key must be removed, not left empty: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_none_clears_the_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+        save_relay_url(dir.path(), None).unwrap();
+        assert_eq!(load_relay_url(dir.path()), None);
+    }
+
+    /// 与 `theme`/`board_watchman_enabled` 同处一个文件：三方写路径不得互相覆盖。
+    #[test]
+    fn saving_the_relay_url_preserves_unrelated_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            r#"{"theme":"light","board_watchman_enabled":false,"subagent_runtime":"never"}"#,
+        )
+        .unwrap();
+        save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+
+        let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["relay_url"], "wss://relay.example.com/connect?session=x");
+        assert_eq!(value["theme"], "light");
+        assert_eq!(value["board_watchman_enabled"], false);
+        assert_eq!(value["subagent_runtime"], "never");
+
+        // 反向：theme 的写不得抹掉 relay_url。
+        save(dir.path(), Theme::Dark).unwrap();
+        assert_eq!(
+            load_relay_url(dir.path()).as_deref(),
+            Some("wss://relay.example.com/connect?session=x")
+        );
+    }
+
+    /// 坏文件一律回退「未设置」——坏偏好绝不阻断侧车启动。
+    #[test]
+    fn a_broken_file_falls_back_to_none() {
+        for body in [
+            "not json",
+            r#"{"relay_url":5}"#,
+            r#"{"relay_url":""}"#,
+            r#"{"relay_url":"   "}"#,
+            "[]",
+            "{}",
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+            std::fs::write(preferences_path(dir.path()), body).unwrap();
+            assert_eq!(load_relay_url(dir.path()), None, "body: {body}");
+        }
+    }
+
+    /// 保存同样不留临时文件（走的是同一个原子落盘辅助）。
+    #[test]
+    fn saving_the_relay_url_leaves_no_temp_file_behind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+        let stray: Vec<String> = std::fs::read_dir(dir.path().join(".yi-agent"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "preferences.json")
+            .collect();
+        assert!(stray.is_empty(), "no temp file may survive a save: {stray:?}");
+    }
 }
 
 #[cfg(test)]

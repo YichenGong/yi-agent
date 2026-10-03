@@ -1,9 +1,14 @@
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
 use tauri_plugin_shell::ShellExt;
+
+/// `preferences.json` key the sidecar reads its relay URL from. Mirrors
+/// `yi_agent_app_server::settings_store::RELAY_URL_KEY`.
+const RELAY_URL_KEY: &str = "relay_url";
 
 /// Classification of one line received on the sidecar's stdout.
 #[derive(Debug, PartialEq, Eq)]
@@ -162,18 +167,142 @@ fn sidecar_args(relay: Option<&str>) -> Vec<String> {
     args
 }
 
-/// The relay URL the sidecar should advertise, from the `YI_AGENT_RELAY`
-/// environment variable.
+/// The relay URL the sidecar should advertise.
 ///
-/// There is deliberately no desktop settings field for this yet: the env var
-/// keeps this task small (and it composes with dev/launch scripts). A
-/// settings-page field plus a pairing hand-off is a future enhancement. Unset
-/// or blank → `None`, which reproduces the original stdio-only spawn exactly.
+/// Two sources, in priority order: the `YI_AGENT_RELAY` environment variable
+/// (explicit override for dev/launch scripts) and the `relay_url` key in
+/// `<home>/.yi-agent/preferences.json` (what the desktop Settings page writes).
+///
+/// The pure part is [`resolve_relay`], so the priority rules are unit-tested
+/// without touching the process env or the filesystem. Unset or blank in both
+/// places → `None`, which reproduces the original stdio-only spawn exactly.
 fn configured_relay() -> Option<String> {
-    std::env::var("YI_AGENT_RELAY")
-        .ok()
-        .map(|url| url.trim().to_string())
+    let home = home_dir();
+    configured_relay_in(home.as_deref())
+}
+
+/// [`configured_relay`] with an injectable home directory, so tests never read
+/// (or, in `set_relay_url`, never write) the developer's real `~`.
+fn configured_relay_in(home: Option<&Path>) -> Option<String> {
+    let stored = home.and_then(load_relay_url);
+    resolve_relay(
+        std::env::var("YI_AGENT_RELAY").ok().as_deref(),
+        stored.as_deref(),
+    )
+}
+
+/// Pure resolution of the two relay sources. Each is trimmed; a non-blank env
+/// value wins (explicit override), otherwise a non-blank stored value is used.
+fn resolve_relay(env: Option<&str>, stored: Option<&str>) -> Option<String> {
+    let clean = |value: Option<&str>| {
+        value
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
+    };
+    clean(env).or_else(|| clean(stored))
+}
+
+/// The home directory, or `None` when the platform cannot report one.
+fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+/// `<home>/.yi-agent/preferences.json` — the file the sidecar reads/writes when
+/// its workdir is the user home (`spawn_once` anchors the sidecar there).
+///
+/// Mirror of `yi_agent_app_server::settings_store::preferences_path`; the
+/// desktop shell intentionally does not depend on the app-server crate.
+fn preferences_path(home: &Path) -> PathBuf {
+    home.join(".yi-agent").join("preferences.json")
+}
+
+/// Read `relay_url` from the home preferences file. Missing/broken file, a
+/// missing key, a non-string or a blank value all read as `None` — a bad
+/// preference must never keep the sidecar from starting.
+fn load_relay_url(home: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(preferences_path(home)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get(RELAY_URL_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+/// Write (or, for `None`/blank, remove) `relay_url` in the home preferences
+/// file: read-modify-write so `theme` / `board_watchman_enabled` /
+/// `subagent_runtime` survive, temp-file + rename so the replace is atomic.
+fn save_relay_url(home: &Path, url: Option<&str>) -> std::io::Result<()> {
+    let dir = home.join(".yi-agent");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("preferences.json");
+    let mut object = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    match url.map(str::trim).filter(|url| !url.is_empty()) {
+        Some(url) => {
+            object.insert(
+                RELAY_URL_KEY.to_string(),
+                serde_json::Value::String(url.to_string()),
+            );
+        }
+        None => {
+            object.remove(RELAY_URL_KEY);
+        }
+    }
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .map_err(std::io::Error::other)?;
+    // 唯一临时名 + rename:与 app-server 的 settings_store 同一约定,避免并发
+    // 写者(runtime_prefs/kanban)互相截断。
+    let tmp = dir.join(format!(
+        "preferences.json.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, &text)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// Per-write suffix so concurrent writers never share a temp name.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Settings page → host: persist the sidecar's relay URL and restart the
+/// sidecar so the new setting takes effect without restarting the app.
+///
+/// The write happens **before** the kill: the supervisor's respawn reads the
+/// resolved relay, so killing first would restart the sidecar on the old value
+/// and the setting would not take effect until the next exit.
+#[tauri::command]
+pub fn set_relay_url(app: AppHandle, url: Option<String>) -> Result<(), String> {
+    let home = home_dir().ok_or_else(|| "home directory is unavailable".to_string())?;
+    save_relay_url(&home, url.as_deref()).map_err(|error| error.to_string())?;
+    // 不把 URL 打进日志(设计 §5.5):只说是否已配置。
+    let configured = url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| !url.is_empty());
+    eprintln!("[sidecar] relay setting saved (configured: {configured}); restarting");
+    restart_sidecar(&app);
+    Ok(())
+}
+
+/// Kill the current sidecar child so the supervisor loop respawns it with the
+/// freshly persisted settings. An already-dead child is fine (its kill error is
+/// ignored): the supervisor is about to restart it either way.
+fn restart_sidecar(app: &AppHandle) {
+    let taken = app
+        .state::<Sidecar>()
+        .child
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take());
+    if let Some(child) = taken {
+        let _ = child.kill();
+    }
 }
 
 /// Launch one `yi-agent app-server` and return its event stream.
@@ -280,6 +409,137 @@ mod tests {
         );
     }
 
+    /// env 是显式覆盖:非空即赢,落盘值被忽略。
+    #[test]
+    fn resolve_relay_prefers_a_non_blank_env_value() {
+        assert_eq!(
+            resolve_relay(Some("wss://env/connect?session=e"), Some("wss://stored/connect?session=s"))
+                .as_deref(),
+            Some("wss://env/connect?session=e")
+        );
+        // 两侧都 trim:env 里的空白被剥掉后仍是非空,照样优先。
+        assert_eq!(
+            resolve_relay(Some("  wss://env  "), Some("wss://stored")).as_deref(),
+            Some("wss://env")
+        );
+        // env 为空白等于未设置,让位给落盘值。
+        assert_eq!(
+            resolve_relay(Some("   "), Some("wss://stored  ")).as_deref(),
+            Some("wss://stored")
+        );
+    }
+
+    /// 无 env 时用落盘值;空白落盘值等于未设置。
+    #[test]
+    fn resolve_relay_uses_the_stored_value_when_env_is_unset() {
+        assert_eq!(
+            resolve_relay(None, Some("  wss://stored/connect?session=s  ")).as_deref(),
+            Some("wss://stored/connect?session=s")
+        );
+        assert_eq!(resolve_relay(Some(""), Some("")), None);
+        assert_eq!(resolve_relay(None, Some("  ")), None);
+    }
+
+    /// 两个来源都空 → None,即今日的纯 stdio 行为。
+    #[test]
+    fn resolve_relay_is_none_when_both_sources_are_empty() {
+        assert_eq!(resolve_relay(None, None), None);
+    }
+
+    /// `resolve_relay` 只读入参,不碰进程 env——三分支因此可并行测。
+    #[test]
+    fn resolve_relay_reads_only_its_arguments() {
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("YI_AGENT_RELAY").ok();
+        std::env::set_var("YI_AGENT_RELAY", "wss://env/connect?session=e");
+        assert_eq!(
+            resolve_relay(None, Some("wss://stored")).as_deref(),
+            Some("wss://stored"),
+            "the env var must not leak into the pure resolver"
+        );
+        restore_relay_env(previous);
+    }
+
+    /// 落盘往返:save 后 load 读回同一个值,写入的是 `<home>/.yi-agent/preferences.json`。
+    #[test]
+    fn saving_the_relay_url_round_trips_through_the_preferences_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
+        assert!(dir.path().join(".yi-agent").join("preferences.json").is_file());
+        assert_eq!(
+            load_relay_url(dir.path()).as_deref(),
+            Some("wss://r/connect?session=x")
+        );
+    }
+
+    /// `None` / 空白 → 删除键,而不是留空串。清除即回到纯 stdio。
+    #[test]
+    fn saving_an_empty_relay_url_removes_the_key() {
+        for clear in [None, Some(""), Some("   ")] {
+            let dir = tempfile::TempDir::new().unwrap();
+            save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
+            save_relay_url(dir.path(), clear).unwrap();
+            assert_eq!(load_relay_url(dir.path()), None, "clear: {clear:?}");
+            let text =
+                std::fs::read_to_string(dir.path().join(".yi-agent").join("preferences.json"))
+                    .unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(
+                value.get("relay_url").is_none(),
+                "a cleared key must be removed: {text}"
+            );
+        }
+    }
+
+    /// 读-改-写:侧车偏好文件里的 theme/值守/subagent_runtime 必须原样保留。
+    #[test]
+    fn saving_the_relay_url_preserves_unrelated_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            dir.path().join(".yi-agent").join("preferences.json"),
+            r#"{"theme":"light","board_watchman_enabled":false,"subagent_runtime":"never"}"#,
+        )
+        .unwrap();
+        save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
+
+        let text =
+            std::fs::read_to_string(dir.path().join(".yi-agent").join("preferences.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["relay_url"], "wss://r/connect?session=x");
+        assert_eq!(value["theme"], "light");
+        assert_eq!(value["board_watchman_enabled"], false);
+        assert_eq!(value["subagent_runtime"], "never");
+    }
+
+    /// 坏文件回退「未设置」,且覆盖写会把它修好,绝不阻断侧车启动。
+    #[test]
+    fn a_broken_preferences_file_reads_as_no_relay() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(dir.path().join(".yi-agent").join("preferences.json"), "not json").unwrap();
+        assert_eq!(load_relay_url(dir.path()), None);
+
+        save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
+        assert_eq!(
+            load_relay_url(dir.path()).as_deref(),
+            Some("wss://r/connect?session=x")
+        );
+    }
+
+    /// 落盘不留临时文件(临时文件 + rename 原子替换的既有约定)。
+    #[test]
+    fn saving_the_relay_url_leaves_no_temp_file_behind() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
+        let stray: Vec<String> = std::fs::read_dir(dir.path().join(".yi-agent"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "preferences.json")
+            .collect();
+        assert!(stray.is_empty(), "no temp file may survive a save: {stray:?}");
+    }
+
     // `configured_relay` reads a process-global env var. Cargo runs tests in
     // parallel threads of one process, so any test that mutates `YI_AGENT_RELAY`
     // must hold this lock and restore the previous value; otherwise a sibling
@@ -293,16 +553,27 @@ mod tests {
         }
     }
 
+    /// `configured_relay` 读 env 与 home 的偏好文件。测试传入一个空的临时 home,
+    /// 免得读到开发者机器上真实的 `~/.yi-agent/preferences.json`。
     #[test]
     fn configured_relay_is_none_when_unset_or_blank() {
         let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("YI_AGENT_RELAY").ok();
+        let home = tempfile::TempDir::new().unwrap();
 
         std::env::remove_var("YI_AGENT_RELAY");
-        assert_eq!(configured_relay(), None, "unset must mean no relay");
+        assert_eq!(
+            configured_relay_in(Some(home.path())),
+            None,
+            "unset and nothing stored must mean no relay"
+        );
 
         std::env::set_var("YI_AGENT_RELAY", "   ");
-        assert_eq!(configured_relay(), None, "blank must mean no relay");
+        assert_eq!(
+            configured_relay_in(Some(home.path())),
+            None,
+            "blank must mean no relay"
+        );
 
         restore_relay_env(previous);
     }
@@ -311,11 +582,29 @@ mod tests {
     fn configured_relay_trims_a_set_url() {
         let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = std::env::var("YI_AGENT_RELAY").ok();
+        let home = tempfile::TempDir::new().unwrap();
 
         std::env::set_var("YI_AGENT_RELAY", "  wss://r/connect?session=x  ");
         assert_eq!(
-            configured_relay().as_deref(),
+            configured_relay_in(Some(home.path())).as_deref(),
             Some("wss://r/connect?session=x")
+        );
+
+        restore_relay_env(previous);
+    }
+
+    /// 无 env 时 `configured_relay` 用偏好文件里的值 —— 这正是本次修复的落点。
+    #[test]
+    fn configured_relay_falls_back_to_the_home_preferences_file() {
+        let _guard = RELAY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var("YI_AGENT_RELAY").ok();
+        let home = tempfile::TempDir::new().unwrap();
+
+        std::env::remove_var("YI_AGENT_RELAY");
+        save_relay_url(home.path(), Some("wss://stored/connect?session=s")).unwrap();
+        assert_eq!(
+            configured_relay_in(Some(home.path())).as_deref(),
+            Some("wss://stored/connect?session=s")
         );
 
         restore_relay_env(previous);

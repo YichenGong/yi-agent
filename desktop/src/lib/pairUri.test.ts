@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildPairUri, parsePairUri } from "./pairUri";
+import { buildPairUri, parsePairUri, phoneRelayUrl } from "./pairUri";
 
 // 与 Rust 侧 `pair_uri.rs` 的用例**逐字节**共用同一组 fixture。
 describe("pairUri", () => {
@@ -32,5 +32,38 @@ describe("pairUri", () => {
     expect(parsePairUri("yiagent://pair?v=1&code=C")).toBeNull();
     expect(parsePairUri("yiagent://pair?v=1&relay=http%3A%2F%2Fr&code=C")).toBeNull();
     expect(parsePairUri("yiagent://pair?v=1&relay=&code=C")).toBeNull();
+  });
+});
+
+// 手机侧中继端点由桌面侧端点派生：中继的两个出站路由是不同的（`/connect` 归电脑，
+// `/ws` 归手机），把桌面地址原样塞进二维码会让手机注册成 agent。此处只换末段路径。
+describe("phoneRelayUrl", () => {
+  it("swaps only the trailing connect segment for ws", () => {
+    expect(phoneRelayUrl("wss://relay.example.com/connect?session=x")).toBe(
+      "wss://relay.example.com/ws?session=x",
+    );
+    // scheme/host/port/query 全保留
+    expect(phoneRelayUrl("ws://192.168.1.5:8080/connect?session=abc&t=1")).toBe(
+      "ws://192.168.1.5:8080/ws?session=abc&t=1",
+    );
+  });
+
+  it("handles a path with extra segments by swapping only the last one", () => {
+    expect(phoneRelayUrl("wss://relay.example.com/a/connect?session=x")).toBe(
+      "wss://relay.example.com/a/ws?session=x",
+    );
+  });
+
+  it("returns null for a path that is not connect (caller falls back)", () => {
+    expect(phoneRelayUrl("wss://relay.example.com/ws?session=x")).toBeNull();
+    expect(phoneRelayUrl("wss://relay.example.com/a/connect/x?session=x")).toBeNull();
+    expect(phoneRelayUrl("wss://relay.example.com/connect/x")).toBeNull();
+    expect(phoneRelayUrl("wss://relay.example.com/")).toBeNull();
+  });
+
+  it("returns null for unparseable input", () => {
+    expect(phoneRelayUrl("not a url")).toBeNull();
+    expect(phoneRelayUrl("")).toBeNull();
+    expect(phoneRelayUrl("wss://")).toBeNull();
   });
 });

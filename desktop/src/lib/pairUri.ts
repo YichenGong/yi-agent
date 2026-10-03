@@ -37,3 +37,24 @@ export function parsePairUri(text: string): { relay: string; code: string } | nu
   if (!(relay.startsWith("ws://") || relay.startsWith("wss://"))) return null;
   return { relay, code };
 }
+
+/**
+ * The phone-side relay endpoint derived from the desktop-side one.
+ * `/connect` → `/ws` (same scheme/host/port/query). Returns null when the input
+ * cannot be parsed or its path does not end in `connect` (caller then falls back).
+ */
+export function phoneRelayUrl(desktopUrl: string): string | null {
+  let u: URL;
+  try {
+    u = new URL(desktopUrl);
+  } catch {
+    return null;
+  }
+  // 中继的两个出站路由是**不同**的：电脑连 `/connect`，手机连 `/ws`。
+  // 只替换末段路径，scheme/host/port/query 原样保留。
+  const segments = u.pathname.split("/");
+  if (segments[segments.length - 1] !== "connect") return null;
+  segments[segments.length - 1] = "ws";
+  u.pathname = segments.join("/");
+  return u.toString();
+}
