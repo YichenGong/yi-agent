@@ -2765,7 +2765,7 @@ where
                             config,
                         ));
 
-                        // 回放:thread/started → 每条历史 item/completed → 最近用量 → 响应。
+                        // 回放:thread/started → 若干批量 items/completed → 最近用量 → 响应。
                         write_notification(&hub, &Notification::ThreadStarted {
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
@@ -2773,13 +2773,24 @@ where
                             },
                         )
                         .await?;
-                        for item in loaded.items {
-                            write_notification(&hub, &Notification::ItemCompleted {
+                        // 回放：分块批量下发（每块一条 `items/completed`），经带背压的
+                        // 投递——本地 reliable 客户端队列满时等待而非丢帧。旧实现逐条
+                        // try_send,超过 256 格队列即静默丢帧,长会话尾部就此消失。
+                        for chunk in chunk_items_for_replay(loaded.items) {
+                            if let Err(e) = write_notification_await(
+                                &hub,
+                                &Notification::ItemsCompleted {
                                     thread_id: thread_id.clone(),
-                                    item,
+                                    items: chunk,
                                 },
                             )
-                            .await?;
+                            .await
+                            {
+                                eprintln!(
+                                    "[app-server] replay aborted for {thread_id}: {e}"
+                                );
+                                break;
+                            }
                         }
                         if let Some(u) = loaded.usage {
                             write_notification(&hub, &Notification::TokenUsage {
@@ -4180,6 +4191,25 @@ async fn write_notification(
         crate::protocol::Delivery::List | crate::protocol::Delivery::Global => None,
     };
     hub.broadcast_for(key, frame);
+    Ok(())
+}
+
+/// 与 [`write_notification`] 同款序列化与投递键，但走**带背压**的
+/// [`crate::broadcast::Broadcaster::broadcast_await`]：本地 reliable 客户端队列
+/// 满时等待而非丢帧。用于历史回放这类「必须完整送达」的批量下发。
+async fn write_notification_await(
+    hub: &crate::broadcast::Broadcaster,
+    n: &Notification,
+) -> anyhow::Result<()> {
+    let frame = serde_json::to_value(NotificationEnvelope::new(n))
+        .map_err(|e| anyhow::anyhow!("failed to serialize notification: {e}"))?;
+    let key = match n.delivery() {
+        crate::protocol::Delivery::Content => n.thread_key(),
+        crate::protocol::Delivery::List | crate::protocol::Delivery::Global => None,
+    };
+    hub.broadcast_await(key, frame)
+        .await
+        .map_err(|_| anyhow::anyhow!("replay client closed"))?;
     Ok(())
 }
 
@@ -8145,6 +8175,38 @@ pub(crate) mod tests {
         panic!("no response with id {want}");
     }
 
+    /// 把一帧回放通知展平为其携带的 items：**兼容**逐条 `item/completed` 与批量
+    /// `items/completed`；非 item 帧返回空 vec。既有 resume 测试都用它改造。
+    fn replayed_items_of(v: &serde_json::Value) -> Vec<crate::protocol::Item> {
+        match v.get("method").and_then(|m| m.as_str()) {
+            Some("item/completed") => {
+                vec![serde_json::from_value(v["params"]["item"].clone()).unwrap()]
+            }
+            Some("items/completed") => v["params"]["items"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|it| serde_json::from_value(it.clone()).unwrap())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// 读到 id==want 的响应为止,收集期间所有回放 item（经 `replayed_items_of`）。
+    async fn collect_replayed_items(h: &mut Harness, want: u64) -> Vec<crate::protocol::Item> {
+        let mut out = Vec::new();
+        for _ in 0..4096 {
+            let v = h.read_value().await;
+            out.extend(replayed_items_of(&v));
+            if v.get("id") == Some(&serde_json::json!(want)) {
+                break;
+            }
+        }
+        out
+    }
+
     /// 带总时限地读到「指定 method 的通知」,丢弃中间帧(其它通知、请求响应)。
     ///
     /// `process/updated` 由守望者异步推来,不由任何请求直接触发,故不能靠「读下一帧」;
@@ -10548,9 +10610,9 @@ pub(crate) mod tests {
         let mut interrupted = false;
         for _ in 0..40 {
             let v = h.read_value().await;
-            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
-                && v["params"]["item"]["text"] == "half"
-            {
+            if replayed_items_of(&v).iter().any(
+                |it| matches!(it, crate::protocol::Item::AgentMessage { text, .. } if text == "half"),
+            ) {
                 saw_half = true;
             }
             if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed")
@@ -10651,9 +10713,9 @@ pub(crate) mod tests {
         let mut resumed = false;
         for _ in 0..40 {
             let v = h.read_value().await;
-            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
-                && v["params"]["item"]["text"] == "half"
-            {
+            if replayed_items_of(&v).iter().any(
+                |it| matches!(it, crate::protocol::Item::AgentMessage { text, .. } if text == "half"),
+            ) {
                 saw_half = true;
             }
             if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed")
@@ -10875,13 +10937,14 @@ pub(crate) mod tests {
         let mut resumed = false;
         for _ in 0..12 {
             let v = h.read_value().await;
-            match v.get("method").and_then(|m| m.as_str()) {
-                Some("thread/started") => {}
-                Some("item/completed") => {
-                    replayed.push(v["params"]["item"]["type"].as_str().unwrap().to_string());
-                    item_ids.push(v["params"]["item"]["id"].as_str().unwrap().to_string());
-                }
-                _ => {}
+            for it in replayed_items_of(&v) {
+                replayed.push(
+                    serde_json::to_value(&it).unwrap()["type"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                );
+                item_ids.push(item_id(&it).unwrap().to_string());
             }
             if v.get("id") == Some(&serde_json::json!(4)) {
                 assert_eq!(v["result"]["thread_id"], tid);
@@ -10933,6 +10996,64 @@ pub(crate) mod tests {
         );
 
         h.shutdown().await;
+    }
+
+    /// 长 thread 的 resume 必须回放**全部** items：这是「重启后长会话丢尾部」的
+    /// 回归测试。旧实现逐条 try_send,超过 256 格队列即静默丢帧,本测试必失败。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_replays_every_item_for_long_threads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // 直接向 store 落一轮含 600 个 item 的历史(远超 CLIENT_QUEUE=256)。
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        let total = 600usize;
+        let items: Vec<crate::protocol::Item> = (0..total)
+            .map(|i| crate::protocol::Item::AgentMessage {
+                id: format!("item-{i}"),
+                text: format!("m{i}"),
+            })
+            .collect();
+        store
+            .append_turn(
+                &tid,
+                &crate::thread_store::TurnLine::Turn {
+                    items: items.clone(),
+                    usage: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        let replayed = collect_replayed_items(&mut h, 4).await;
+        let replayed_ids: std::collections::HashSet<&str> =
+            replayed.iter().filter_map(|it| item_id(it)).collect();
+        let expected_ids: std::collections::HashSet<String> =
+            items.iter().filter_map(item_id_owned).collect();
+        let mut missing: Vec<&String> = expected_ids
+            .iter()
+            .filter(|id| !replayed_ids.contains(id.as_str()))
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "resume must replay every item; {} missing (e.g. {:?})",
+            missing.len(),
+            &missing.iter().take(5).collect::<Vec<_>>()
+        );
+        h.shutdown().await;
+    }
+
+    fn item_id_owned(it: &crate::protocol::Item) -> Option<String> {
+        item_id(it).map(|s| s.to_string())
     }
 
     /// 发 thread/clear，被 `-32012` 拒时重试。
@@ -11013,13 +11134,12 @@ pub(crate) mod tests {
         let mut replayed = Vec::new();
         for _ in 0..8 {
             let v = h.read_value().await;
-            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed") {
-                replayed.push(
-                    v["params"]["item"]["text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string(),
-                );
+            for it in replayed_items_of(&v) {
+                if let crate::protocol::Item::UserMessage { text, .. }
+                | crate::protocol::Item::AgentMessage { text, .. } = it
+                {
+                    replayed.push(text);
+                }
             }
             if v.get("id") == Some(&serde_json::json!(5)) {
                 assert!(v.get("error").is_none(), "resume must still work: {v}");
