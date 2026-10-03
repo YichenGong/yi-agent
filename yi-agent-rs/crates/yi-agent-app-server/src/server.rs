@@ -4679,6 +4679,13 @@ async fn run_thread_driver(
                                     tracing::error!("failed to serialize reverse request: {e}");
                                     pending.lock().await.remove(&perm_id);
                                     let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                    // 本轮就此结束：turn-start 写的 checkpoint 必须清掉，
+                                    // 否则盘上留一条已结束 turn 的残留，重启后 resume 会
+                                    // 把最后这一轮误标为 interrupted。与其它 clear 站点同款：
+                                    // 尽力删，失败只记 stderr，绝不影响收尾。
+                                    if let Err(e) = store.clear_partial(&thread_id) {
+                                        eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                                    }
                                     return;
                                 }
                             };
@@ -4701,6 +4708,11 @@ async fn run_thread_driver(
                                 // 发起客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);
                                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                // 本轮就此结束（客户端断连，不是崩溃）：清掉 checkpoint，
+                                // 否则重启后会把这一轮误报为 interrupted。与其它站点同款。
+                                if let Err(e) = store.clear_partial(&thread_id) {
+                                    eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                                }
                                 return;
                             }
                             // 反向请求已写出:进入等待审批状态。
@@ -4801,6 +4813,11 @@ async fn run_thread_driver(
                                         // 客户端可能已断开;先上报 Finished,
                                         // 避免 active_turn_id 永久卡住。
                                         let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                        // 本轮就此结束（写失败，不是崩溃）：清掉 checkpoint，
+                                        // 否则重启后会把这一轮误报为 interrupted。与其它站点同款。
+                                        if let Err(e) = store.clear_partial(&thread_id) {
+                                            eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                                        }
                                         return;
                                     }
                                 }
@@ -10321,6 +10338,91 @@ pub(crate) mod tests {
         );
         assert!(!loaded.pending_turn, "promotion must clear the pending flag");
         h.shutdown().await;
+    }
+
+    /// I1 回归：等待审批期间**发起客户端断连**（真实的重连场景，不是崩溃）时，
+    /// driver 就此收尾并 `return`，必须清掉 checkpoint；否则盘上留一条已结束 turn
+    /// 的残留，重启后 resume 会把最后这一轮误报为 interrupted。
+    ///
+    /// 直接以「发起方已在 hub 上注销」接线 `is_connected` 判据；生产里发起方是
+    /// stdio 的 `local`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_approval() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(dir.path()));
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
+        let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+        let _keep_session_tx = session_tx;
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        // 发起方：注册后立刻摘除 = 断连。
+        let initiator = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+        let _init_rx = hub.register(initiator.clone());
+        hub.unregister(&initiator);
+
+        let built = build_permission_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-disconnect".into(),
+            built.agent,
+            prompt_rx,
+            interrupt_rx,
+            interject_rx,
+            session_rx,
+            hub,
+            initiator,
+            turn_tx,
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Duration::from_secs(60),
+            Arc::new(AtomicU64::new(1)),
+            None,
+            Arc::clone(&store),
+            ThreadSession::new_status(),
+            built.provider,
+            built.config,
+        ));
+
+        prompt_tx
+            .send(TurnPrompt {
+                turn_id: "turn-1".into(),
+                prompt: "hi".into(),
+                activate: None,
+            })
+            .await
+            .unwrap();
+
+        // 审批请求命中"发起方已断连"分支 → 收尾并 return。
+        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+            .await
+            .expect("driver must report Finished when the initiator is gone")
+            .expect("turn channel must stay open");
+        assert!(matches!(ev, TurnEvent::Finished { ref turn_id, .. } if turn_id == "turn-1"));
+
+        // clear_partial 发生在 Finished 之后；轮询等待（文件可能已被删除）。
+        let partial = dir
+            .path()
+            .join(".yi-agent/threads/thread-disconnect.partial.json");
+        for _ in 0..100 {
+            if !partial.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !partial.exists(),
+            "a disconnect during approval must clear the turn checkpoint"
+        );
+
+        drop(prompt_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

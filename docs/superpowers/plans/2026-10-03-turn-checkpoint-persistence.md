@@ -914,6 +914,61 @@ git commit -m "docs(app-server): record in-flight turn checkpoint persistence"
 
 ---
 
+### Task 6: 修复终审两项（升格崩溃残轮 + 断连清 checkpoint）
+
+> 来源：最终全分支评审（`1a4ef80..fe07253`）的 C1（Critical）/ I1（Important）。C1 的根因
+> 是**设计遗漏**——spec 的"读时机（恢复）"只写了合流，没写升格——故本任务同时回改了 spec。
+
+**Files:**
+- Modify: `yi-agent-rs/crates/yi-agent-app-server/src/thread_store.rs`（新增 `promote_partial`
+  + 抽出 `read_log` / `partial_is_committed`，`load` 复用同一判据）
+- Modify: `yi-agent-rs/crates/yi-agent-app-server/src/server.rs`（`thread/resume` 调
+  `promote_partial`；driver 三个 `return` 站点前 `clear_partial`）
+- Test: `thread_store.rs` / `server.rs` 的 `mod tests`
+- Docs: `docs/superpowers/specs/2026-10-03-turn-checkpoint-persistence-design.md`（读时机
+  补"升格"段 + 测试清单）
+
+- [x] **Step 1: C1 失败回归测试**
+
+`resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it`：崩溃（一轮 jsonl +
+一段 partial）→ resume（断言回放 recovered item + `turn/completed{interrupted}`）→ 同一
+thread 起**第二个** turn 并正常收尾 → store 冷 `load`：崩溃轮 items 仍在、只一份、不重复
+计数、`pending_turn == false`。另有 `promote_partial_*` 三个单元测试。
+Expected（修复前）：FAIL——第二个 turn 的 turn-start checkpoint 覆盖 partial，冷 load 里
+`item-turn-t2-1` 消失。
+
+- [x] **Step 2: 实现升格**
+
+`ThreadStore::promote_partial(id) -> io::Result<bool>`：读 partial（缺失 → `Ok(false)`）；
+首 item id 已在主 jsonl → 只 `clear_partial`、`Ok(false)`；否则 `append_turn(TurnLine::Turn
+{items, usage, messages})` 后 `clear_partial`、`Ok(true)`。判据 `partial_is_committed` 与
+`load` 共用；`.jsonl` / `.meta.json` 格式不变。`thread/resume` 在 `pending_turn` 时、发
+interrupted 之前调用；失败只记 stderr，不阻断 resume。
+
+- [x] **Step 3: C1 通过**
+
+Run: `cargo test -p yi-agent-app-server --lib -- resume_promotes_the_crashed_turn promote_partial`
+Expected: PASS（4 个用例）。
+
+- [x] **Step 4: I1 — 三个 early-return 站点前清 checkpoint**
+
+`server.rs` 的 (a) 反向请求序列化失败、(b) 等待审批期间发起客户端断连、(c) 写通知失败
+三处 `return` 前，均加：
+```rust
+if let Err(e) = store.clear_partial(&thread_id) {
+    eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+}
+```
+配套测试 `driver_clears_the_checkpoint_when_the_initiator_disconnects_during_approval`：
+以“发起方已从 hub 摘除”接线 `is_connected` 判据，断言 Finished 后 partial 文件被清。
+
+- [x] **Step 5: 全量回归**
+
+Run: `cargo test -p yi-agent-app-server --lib`
+Expected: PASS。
+
+---
+
 ## Self-Review
 
 **Spec coverage:**
