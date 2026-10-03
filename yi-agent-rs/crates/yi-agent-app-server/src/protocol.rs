@@ -178,6 +178,10 @@ pub enum Notification {
     },
     #[serde(rename = "item/completed")]
     ItemCompleted { thread_id: String, item: Item },
+    /// 回放期批量下发历史 item：一次一帧，替代逐条 `item/completed`。
+    /// 仅在 `thread/resume` 的历史回放期使用；实时流不带此方法。
+    #[serde(rename = "items/completed")]
+    ItemsCompleted { thread_id: String, items: Vec<Item> },
     #[serde(rename = "turn/completed")]
     TurnCompleted {
         thread_id: String,
@@ -276,6 +280,7 @@ impl Notification {
             | Notification::ItemStarted { thread_id, .. }
             | Notification::ItemDelta { thread_id, .. }
             | Notification::ItemCompleted { thread_id, .. }
+            | Notification::ItemsCompleted { thread_id, .. }
             | Notification::TurnCompleted { thread_id, .. }
             | Notification::InterjectionsReturned { thread_id, .. }
             | Notification::TurnRetry { thread_id, .. }
@@ -596,5 +601,24 @@ mod tests {
         let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
         assert_eq!(v["method"], "ui/settings/updated");
         assert_eq!(v["params"]["theme"], "light");
+    }
+
+    #[test]
+    fn items_completed_serializes_with_method_and_params() {
+        let n = Notification::ItemsCompleted {
+            thread_id: "t1".to_string(),
+            items: vec![Item::UserMessage {
+                id: "user-1".to_string(),
+                text: "hi".to_string(),
+            }],
+        };
+        let v = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], serde_json::json!("items/completed"));
+        assert_eq!(v["params"]["thread_id"], serde_json::json!("t1"));
+        assert_eq!(
+            v["params"]["items"][0]["type"],
+            serde_json::json!("userMessage")
+        );
+        assert_eq!(n.thread_key(), Some("t1"));
     }
 }

@@ -219,6 +219,12 @@ export class Session {
         this.lastServerItemId = item.id;
         break;
       }
+      case "items/completed": {
+        // 回放期的批量帧：交给 upsertItems（按 id 去重/就地替换/保持顺序/
+        // 推进 lastServerItemId），与逐条 item/completed 等价且幂等。
+        this.upsertItems(notification.params.items);
+        break;
+      }
       case "item/delta": {
         // Text resumed: the retry succeeded, so the notice has served its purpose.
         this.retrying = null;
