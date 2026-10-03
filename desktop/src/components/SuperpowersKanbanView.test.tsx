@@ -1,33 +1,27 @@
 /** @vitest-environment jsdom */
 import { describe, expect, it, afterEach, vi } from "vitest";
 import { render, cleanup, screen, fireEvent } from "@testing-library/react";
+import type { BoardCard } from "../lib/superpowersKanbanState";
 import { SuperpowersKanbanView } from "./SuperpowersKanbanView";
 
-afterEach(() => {
-  cleanup();
-});
+afterEach(() => cleanup());
+
+function card(id: string, state: string, extra: Partial<BoardCard> = {}): BoardCard {
+  return { id, state, progress: null, detail: "", threadId: null, title: id, ...extra };
+}
 
 describe("SuperpowersKanbanView", () => {
-  it("renders a card with its state, progress and detail", () => {
+  it("renders a card with its title, id and state", () => {
     render(
       <SuperpowersKanbanView
         switchOn
         source="project"
-        cards={[
-          {
-            id: "card-1",
-            state: "running",
-            progress: "3/7 tasks",
-            detail: "kanban/card-1-foo",
-          },
-        ]}
+        cards={[card("card-1", "running", { title: "do the thing" })]}
       />,
     );
-    // `card-1` also appears inside the detail string, so match element text
-    // exactly rather than as a substring across the row.
+    expect(screen.getByText("do the thing")).toBeTruthy();
+    expect(screen.getByText("running")).toBeTruthy();
     expect(screen.getByText("card-1")).toBeTruthy();
-    expect(screen.getByText(/3\/7 tasks/)).toBeTruthy();
-    expect(screen.getByText("kanban/card-1-foo")).toBeTruthy();
   });
 
   it("explains itself instead of looking empty when disabled", () => {
@@ -41,24 +35,18 @@ describe("SuperpowersKanbanView", () => {
   });
 
   it("names the missing plugin instead of showing an empty board", () => {
-    // The plugin answers every board question, so an unanswered query means it
-    // is not installed. That is a different state than "installed, no cards".
-    render(
-      <SuperpowersKanbanView switchOn source="project" cards={[]} pluginMissing />,
-    );
+    render(<SuperpowersKanbanView switchOn source="project" cards={[]} pluginMissing />);
     expect(screen.getByText(/插件未安装/)).toBeTruthy();
     expect(screen.queryByText(/empty/i)).toBeNull();
   });
 
-  it("shows a card's linked thread and opens it on click", () => {
+  it("opens a card's linked thread on click", () => {
     const onOpenThread = vi.fn();
     render(
       <SuperpowersKanbanView
         switchOn
         source="project"
-        cards={[
-          { id: "c1", state: "awaiting_merge", progress: null, detail: "", threadId: "thread-1" },
-        ]}
+        cards={[card("c1", "awaiting_merge", { threadId: "thread-1" })]}
         onOpenThread={onOpenThread}
       />,
     );
@@ -72,12 +60,31 @@ describe("SuperpowersKanbanView", () => {
       <SuperpowersKanbanView
         switchOn
         source="project"
-        cards={[{ id: "c1", state: "queued", progress: null, detail: "" }]}
+        cards={[card("c1", "queued")]}
         onOpenThread={onOpenThread}
       />,
     );
-    // No thread link exists, so nothing can be clicked to open a phantom thread.
     expect(screen.queryByRole("button")).toBeNull();
     expect(onOpenThread).not.toHaveBeenCalled();
+  });
+
+  it("collapses a long done column and forwards the toggle", () => {
+    const onToggleDone = vi.fn();
+    // 完成时刻倒序：最新 d6..d0。折叠默认显示最近 5 张（d6..d2）。
+    // 标题与 id 取不同文本：卡片同时渲染标题与 id，同文本会让 getByText 命中两处。
+    const done = Array.from({ length: 7 }, (_, i) =>
+      card(`d${i}`, "done", { title: `done-${i}`, terminalAt: `2026-10-0${i + 1}T00:00:00+08:00` }),
+    );
+    const { rerender } = render(
+      <SuperpowersKanbanView switchOn source="project" cards={done} onToggleDone={onToggleDone} />,
+    );
+    expect(screen.queryByText("done-0")).toBeNull();
+    expect(screen.getByText("done-6")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /展开|收起/ }));
+    expect(onToggleDone).toHaveBeenCalled();
+    rerender(
+      <SuperpowersKanbanView switchOn source="project" cards={done} expandedDone onToggleDone={onToggleDone} />,
+    );
+    expect(screen.getByText("done-0")).toBeTruthy();
   });
 });

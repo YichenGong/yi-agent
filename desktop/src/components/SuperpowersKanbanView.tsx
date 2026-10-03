@@ -1,19 +1,17 @@
 import type { SwitchSource } from "../lib/superpowersKanbanSwitch";
+import type { BoardCard } from "../lib/superpowersKanbanState";
+import { SuperpowersKanbanBoard } from "./SuperpowersKanbanBoard";
 
-export interface BoardCard {
-  id: string;
-  state: string;
-  progress: string | null;
-  detail: string;
-  /** 该卡关联的会话；可为空（插件还没起会话）。 */
-  threadId?: string | null;
-}
+// 兼容旧 import 路径：卡片数据形状已迁到 lib，旧代码可从 View 继续拿到类型。
+export type { BoardCard };
 
 export function SuperpowersKanbanView({
   switchOn,
   source,
   cards,
   pluginMissing = false,
+  expandedDone = false,
+  onToggleDone,
   onOpenThread,
 }: {
   switchOn: boolean;
@@ -21,6 +19,8 @@ export function SuperpowersKanbanView({
   cards: BoardCard[];
   /** The plugin never answered, so there is no board to render at all. */
   pluginMissing?: boolean;
+  expandedDone?: boolean;
+  onToggleDone?: () => void;
   /** 打开某张卡关联的会话；上层接到既有的 thread/resume 入口。 */
   onOpenThread?: (threadId: string) => void;
 }) {
@@ -42,28 +42,11 @@ export function SuperpowersKanbanView({
     return <div className="p-4 text-sm text-fg-muted">Superpowers 看板 is empty.</div>;
   }
   return (
-    <ul className="divide-y divide-line">
-      {cards.map((card) => (
-        <li key={card.id} className="flex items-center gap-3 p-3 text-sm">
-          <span className="font-mono text-fg-muted">{card.id}</span>
-          <span className="text-fg-muted">{card.state}</span>
-          {card.progress ? (
-            <span className="text-fg-subtle">({card.progress})</span>
-          ) : null}
-          {card.detail ? (
-            <span className="truncate text-fg-subtle">{card.detail}</span>
-          ) : null}
-          {card.threadId ? (
-            <button
-              type="button"
-              onClick={() => onOpenThread?.(card.threadId as string)}
-              className="ml-auto shrink-0 cursor-pointer font-mono text-fg-muted hover:text-fg hover:underline"
-            >
-              {card.threadId}
-            </button>
-          ) : null}
-        </li>
-      ))}
-    </ul>
+    <SuperpowersKanbanBoard
+      cards={cards}
+      expandedDone={expandedDone}
+      onToggleDone={onToggleDone}
+      onOpenThread={onOpenThread}
+    />
   );
 }
