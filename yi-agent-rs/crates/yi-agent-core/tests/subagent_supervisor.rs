@@ -1413,3 +1413,61 @@ fn a_recovery_required_parent_does_not_cascade() {
         supervisor.task(&child).unwrap().state()
     );
 }
+
+/// The design names this risk explicitly (spec §5): a child parked in
+/// `AwaitingParentReview` is *not* terminal, so a parent that settles afterwards
+/// must cascade it. Otherwise a review waiter with no living reviewer holds its
+/// worktree lease and concurrency slot forever, and its delivery has no remaining
+/// audience. Drive the exact order the risk describes — the child parks first,
+/// the parent settles second — rather than the reverse (`Delivered` arriving
+/// after the parent is already terminal, covered separately).
+#[tokio::test]
+async fn a_parent_that_settles_cascades_a_child_already_awaiting_review() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
+    let workspace = supervisor
+        .task(&child)
+        .unwrap()
+        .workspace
+        .clone()
+        .expect("spawned child owns a workspace");
+
+    // The child parks in `AwaitingParentReview` first.
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p child");
+    handle.report_delivery(delivery);
+    supervisor.reconcile_worker_events().unwrap();
+    assert!(
+        matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::AwaitingParentReview(_)
+        ),
+        "fixture requires a child parked in review, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+
+    // The parent settles second.
+    supervisor.start_task(&root).unwrap();
+    let affected = supervisor.fail_task(&root, "the root crashed").unwrap();
+
+    assert!(
+        affected.contains(&child),
+        "a child awaiting review under a settling parent must be reported as a victim, got {affected:?}"
+    );
+    assert!(
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "a review waiter must not outlive a settled parent, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+    assert!(
+        matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::Cancelled(_)
+        ),
+        "the cascade must cancel the waiter, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+}
