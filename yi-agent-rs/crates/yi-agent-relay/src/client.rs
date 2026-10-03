@@ -27,7 +27,7 @@ use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
 use url::Url;
 
-use crate::backoff::{backoff_start, next_delay};
+use crate::backoff::ReconnectSchedule;
 
 /// 中继连接上的保活 ping 间隔。要显著小于常见 NAT 的空闲超时(通常 60s+)。
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -52,14 +52,13 @@ pub async fn run_client(
     let relay = with_query(relay_url, "session", &session_id);
     let local = with_query(app_server_ws, "token", &local_token);
 
-    let mut delay = backoff_start();
+    let mut schedule = ReconnectSchedule::new();
     loop {
-        match bridge_once(&relay, &local).await {
+        match bridge_once(&relay, &local, &mut schedule).await {
             Ok(()) => tracing::info!("relay bridge closed; reconnecting"),
             Err(e) => tracing::warn!(error = %e, "relay bridge error; reconnecting"),
         }
-        tokio::time::sleep(delay).await;
-        delay = next_delay(delay);
+        tokio::time::sleep(schedule.next_wait()).await;
     }
 }
 
@@ -70,7 +69,10 @@ fn with_query(mut url: Url, key: &str, value: &str) -> Url {
 }
 
 /// 一次桥接:两端都连上后双向转发,任一方向结束即收尾。
-async fn bridge_once(relay: &Url, local: &Url) -> Result<()> {
+///
+/// 两端**都**连上即调用 [`ReconnectSchedule::on_connected`]——本函数是它唯一
+/// 的调用点,所以「成功后重置」不可能被绕过。
+async fn bridge_once(relay: &Url, local: &Url, schedule: &mut ReconnectSchedule) -> Result<()> {
     let (relay_ws, _) = tokio_tungstenite::connect_async(relay.as_str())
         .await
         .context("connect relay")?;
@@ -78,6 +80,9 @@ async fn bridge_once(relay: &Url, local: &Url) -> Result<()> {
         .await
         .context("connect local app-server")?;
     tracing::info!(relay = %relay, "relay bridge up");
+    // 连上了:退避打回最短。否则一串瞬时断开会把下次重连推到 60s 上限,即使
+    // 故障早已恢复也要等满——这正是手机长时间连不上的成因。
+    schedule.on_connected();
 
     let (mut relay_tx, mut relay_rx) = relay_ws.split();
     let (mut local_tx, mut local_rx) = local_ws.split();
