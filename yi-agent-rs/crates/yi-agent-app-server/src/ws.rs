@@ -18,7 +18,7 @@ use crate::broadcast::{Broadcaster, ClientId};
 use crate::pairing::PairingState;
 use crate::protocol::MAX_FRAME_BYTES;
 use crate::server::{
-    ClientInitialized, ClientScopes, PERMISSION_TIMEOUT, RuntimeAttachments,
+    ClientInitialized, ClientScopes, PERMISSION_TIMEOUT, RuntimeAttachments, WsDeviceRegistry,
     install_device_registry, production_factory, serve,
 };
 use crate::workspace_index::WorkspaceIndex;
@@ -94,7 +94,7 @@ where
     let device_clients = install_device_registry(Arc::new(std::sync::Mutex::new(HashMap::new())));
 
     let serve_hub = Arc::clone(&hub);
-    // 先克隆出主循环要用的 config,再把 cfg 丢给下面的 router 闭包。
+    // 主循环用克隆出的 config(抽取后 router 不再需要 cfg)。
     let serve_cfg = cfg.clone();
     let serve_scopes = Arc::clone(&client_scopes);
     let serve_initialized = Arc::clone(&client_initialized);
@@ -122,19 +122,49 @@ where
         .await
     });
 
-    let router_hub = Arc::clone(&hub);
-    let router_scopes = Arc::clone(&client_scopes);
-    let router_initialized = Arc::clone(&client_initialized);
-    let router_devices = Arc::clone(&device_clients);
+    // ws 前端跑在自己的任务里;主任务在此等待它,与抽取前内联
+    // `axum::serve(...).await?` 同形(仅在服务失败时返回 `Err`)。
+    attach_ws_frontend(
+        listener,
+        hub,
+        inbound_tx,
+        client_scopes,
+        client_initialized,
+        device_clients,
+        pairing,
+    )
+    .await??;
+    serve_task.abort();
+    Ok(())
+}
+
+/// 把一个 ws 前端挂到一个**已构建**的 hub / 入站 channel / scope 表上。
+///
+/// 抽取自 [`serve_ws_inner`],负责:构造 axum `Router` 的 `/ws` 路由(握手准入
+/// ——配对码兑现、token 认证、升级后登记 scope/设备并交给 [`handle_ws`])并用
+/// `axum::serve` 服务该 listener。主循环 `serve(...)` 不在此函数内:调用方用
+/// 同一个 `inbound_rx` 驱动它,故本函数可复用来给已有主循环再挂一个前端。
+///
+/// 返回 axum 服务任务的 `JoinHandle`:调用方等待它即可在服务失败时拿到 `Err`
+/// (语义同抽取前内联的 `axum::serve(...).await?`)。
+pub(crate) fn attach_ws_frontend(
+    listener: tokio::net::TcpListener,
+    hub: Arc<Broadcaster>,
+    inbound_tx: mpsc::Sender<(ClientId, anyhow::Result<String>)>,
+    client_scopes: ClientScopes,
+    client_initialized: ClientInitialized,
+    device_clients: WsDeviceRegistry,
+    pairing: Arc<PairingState>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let app = Router::new().route(
         "/ws",
         get(
             move |headers: HeaderMap, uri: Uri, upgrade: WebSocketUpgrade| {
-                let hub = Arc::clone(&router_hub);
+                let hub = Arc::clone(&hub);
                 let tx = inbound_tx.clone();
-                let scopes = Arc::clone(&router_scopes);
-                let initialized = Arc::clone(&router_initialized);
-                let devices = Arc::clone(&router_devices);
+                let scopes = Arc::clone(&client_scopes);
+                let initialized = Arc::clone(&client_initialized);
+                let devices = Arc::clone(&device_clients);
                 let pairing = Arc::clone(&pairing);
                 async move {
                     // Flow A(spec §5.1/§4.3):手机扫到二维码里的是一次性配对码,
@@ -177,10 +207,11 @@ where
         ),
     );
 
-    tracing::info!(addr = %listener.local_addr()?, "app-server ws listening");
-    axum::serve(listener, app).await?;
-    serve_task.abort();
-    Ok(())
+    tokio::spawn(async move {
+        tracing::info!(addr = %listener.local_addr()?, "app-server ws listening");
+        axum::serve(listener, app).await?;
+        Ok(())
+    })
 }
 
 /// 拒绝一条未认证的升级:发一帧 4401 关闭帧。
