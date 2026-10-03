@@ -17,10 +17,10 @@ describe("SuperpowersKanbanBoard", () => {
         cards={[card("q", "queued"), card("r", "running"), card("n", "needs_you"), card("d", "done")]}
       />,
     );
-    expect(screen.getByText(/queued/i)).toBeTruthy();
-    expect(screen.getByText(/doing/i)).toBeTruthy();
-    expect(screen.getByText(/need decision/i)).toBeTruthy();
-    expect(screen.getByText(/done/i)).toBeTruthy();
+    expect(screen.getByText("QUEUED · 1")).toBeTruthy();
+    expect(screen.getByText("DOING · 1")).toBeTruthy();
+    expect(screen.getByText("NEED DECISION · 1")).toBeTruthy();
+    expect(screen.getByText("DONE · 1")).toBeTruthy();
   });
 
   it("shows a card's title and marks need-decision cards", () => {
