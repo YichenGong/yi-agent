@@ -34,6 +34,27 @@ pub fn deliver_card(state_dir: &Path, id: &str, spec: &str, plan: &str) -> std::
     std::fs::rename(&tmp, &path)
 }
 
+/// 投递一张合并卡：`{"id","kind":"merge","source","base"[,"origin_card"]}`。
+pub fn deliver_merge_card(
+    state_dir: &Path,
+    id: &str,
+    source: &str,
+    base: &str,
+    origin: Option<&str>,
+) -> std::io::Result<()> {
+    let dir = inbox_dir(state_dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = enqueue_path(state_dir, id);
+    let mut body = serde_json::json!({ "id": id, "kind": "merge", "source": source, "base": base });
+    if let Some(origin) = origin {
+        body["origin_card"] = serde_json::Value::String(origin.to_string());
+    }
+    let text = serde_json::to_string_pretty(&body).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, &path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +95,26 @@ mod tests {
         assert!(!dir.path().join("inbox").exists());
         deliver_card(dir.path(), "card-1", "a", "b").unwrap();
         assert!(dir.path().join("inbox").is_dir());
+    }
+
+    #[test]
+    fn delivers_a_merge_card_with_its_kind_and_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        deliver_merge_card(dir.path(), "merge-a-into-main", "kanban/a", "main", None).unwrap();
+        let text =
+            std::fs::read_to_string(dir.path().join("inbox/merge-a-into-main.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"], "merge");
+        assert_eq!(value["source"], "kanban/a");
+        assert_eq!(value["base"], "main");
+    }
+
+    #[test]
+    fn a_merge_card_carries_its_origin_when_given() {
+        let dir = tempfile::tempdir().unwrap();
+        deliver_merge_card(dir.path(), "merge-a", "kanban/a", "main", Some("card-1")).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/merge-a.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["origin_card"], "card-1");
     }
 }

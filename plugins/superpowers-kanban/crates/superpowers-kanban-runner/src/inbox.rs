@@ -16,8 +16,18 @@ pub struct InboxOutcome {
 #[derive(serde::Deserialize)]
 struct RawDelivery {
     id: String,
-    spec_path: String,
-    plan_path: String,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    spec_path: Option<String>,
+    #[serde(default)]
+    plan_path: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    origin_card: Option<String>,
 }
 
 /// 消费 `<state_dir>/inbox` 下的全部投递：校验成对 → 入队 → 删除；
@@ -70,10 +80,33 @@ pub fn consume(state_dir: &Path, board: &mut Board, now: DateTime<Local>) -> Vec
             });
             continue;
         }
-        if let Err(error) = validate_promotion(
-            Path::new(&delivery.spec_path),
-            Path::new(&delivery.plan_path),
-        ) {
+        if delivery.kind.as_deref() == Some("merge") {
+            let (source, base) = (
+                delivery.source.clone().unwrap_or_default(),
+                delivery.base.clone().unwrap_or_default(),
+            );
+            if let Err(error) =
+                superpowers_kanban_core::promotion::validate_merge_refs(&source, &base)
+            {
+                reject(&inbox, &path, &delivery.id);
+                outcomes.push(InboxOutcome {
+                    id: delivery.id,
+                    result: Err(error.to_string()),
+                });
+                continue;
+            }
+            let origin = delivery.origin_card.as_deref().map(CardId::new);
+            board.enqueue_merge(id, source, base, origin, now);
+            let _ = std::fs::remove_file(&path);
+            outcomes.push(InboxOutcome {
+                id: delivery.id,
+                result: Ok(()),
+            });
+            continue;
+        }
+        let spec = delivery.spec_path.clone().unwrap_or_default();
+        let plan = delivery.plan_path.clone().unwrap_or_default();
+        if let Err(error) = validate_promotion(Path::new(&spec), Path::new(&plan)) {
             reject(&inbox, &path, &delivery.id);
             outcomes.push(InboxOutcome {
                 id: delivery.id,
@@ -81,12 +114,7 @@ pub fn consume(state_dir: &Path, board: &mut Board, now: DateTime<Local>) -> Vec
             });
             continue;
         }
-        board.enqueue(
-            id,
-            delivery.spec_path.into(),
-            delivery.plan_path.into(),
-            now,
-        );
+        board.enqueue(id, spec.into(), plan.into(), now);
         let _ = std::fs::remove_file(&path);
         outcomes.push(InboxOutcome {
             id: delivery.id,
@@ -216,5 +244,39 @@ mod tests {
             "a corrupt delivery is archived, not lost"
         );
         assert!(!outcomes.is_empty());
+    }
+
+    #[test]
+    fn a_merge_delivery_is_queued_as_a_merge_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(
+            inbox.join("m1.json"),
+            r#"{"id":"m1","kind":"merge","source":"kanban/a","base":"main"}"#,
+        )
+        .unwrap();
+        let mut board = Board::new();
+        let outcomes = consume(dir.path(), &mut board, at());
+        assert!(outcomes[0].result.is_ok(), "{:?}", outcomes[0]);
+        let card = board.get(&CardId::new("m1")).unwrap();
+        assert_eq!(card.kind, superpowers_kanban_core::card::CardKind::Merge);
+        assert_eq!(card.source_ref.as_deref(), Some("kanban/a"));
+    }
+
+    #[test]
+    fn a_merge_delivery_with_empty_refs_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = dir.path().join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::write(
+            inbox.join("bad.json"),
+            r#"{"id":"bad","kind":"merge","source":"","base":"main"}"#,
+        )
+        .unwrap();
+        let mut board = Board::new();
+        let outcomes = consume(dir.path(), &mut board, at());
+        assert!(outcomes[0].result.is_err());
+        assert!(dir.path().join("inbox/rejected/bad.json").exists());
     }
 }
