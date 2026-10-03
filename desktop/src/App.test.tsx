@@ -148,7 +148,7 @@ vi.mock("./lib/rpc", () => ({
         const id = `new-${this.requests.length}`;
         return { thread_id: id, cwd: "/w", model: "m" };
       }
-      if (method === "ui/settings/read") return { theme: "dark" };
+      if (method === "ui/settings/read") return { theme: "dark", board_watchman_enabled: true };
       if (method === "ui/settings/write") return { ok: true };
       if (method === "thread/setPermissionMode") {
         if (state.failSet) throw { code: -32011, message: "unknown thread" };
@@ -746,7 +746,7 @@ describe("App 主区域看板", () => {
     // 看板只在选中时才进主区域；没点之前一个都不该有。
     expect(screen.queryByText("Superpowers 看板")).toBeNull();
     expect(screen.queryByLabelText("收起看板")).toBeNull();
-    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByLabelText("Superpowers 看板开关")).toBeNull();
   });
 
   it("看板列表读不到时明说「无法读取」，而不是留空", async () => {
@@ -785,14 +785,14 @@ describe("App 主区域看板", () => {
     fireEvent.click(screen.getByLabelText("收起看板"));
 
     // 收起后：面板与开关都让位给一条横条，且横条仍记得是哪个项目。
-    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(screen.queryByLabelText("Superpowers 看板开关")).toBeNull();
     expect(screen.queryByLabelText("收起看板")).toBeNull();
     const expand = screen.getByLabelText("展开看板");
     expect(expand).toBeTruthy();
 
     fireEvent.click(expand);
     expect(await screen.findByLabelText("收起看板")).toBeTruthy();
-    expect(screen.getByRole("checkbox")).toBeTruthy();
+    expect(screen.getByLabelText("Superpowers 看板开关")).toBeTruthy();
   });
 
   it("看板的所有读写都带上该项目的 project", async () => {
@@ -828,7 +828,7 @@ describe("App 主区域看板", () => {
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
     await openBoardFor("/proj");
 
-    fireEvent.click(await screen.findByRole("checkbox"));
+    fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
 
     expect(await screen.findByText(/该项目尚未创建看板/)).toBeTruthy();
   });
@@ -844,7 +844,7 @@ describe("App 主区域看板", () => {
     const first = render(<App />);
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
     await openBoardFor("/proj");
-    fireEvent.click(await screen.findByRole("checkbox"));
+    fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
 
     expect(await screen.findByText(/看板进程不可达/)).toBeTruthy();
     // 「连不上」绝不能被说成「插件没装」：那会让用户去装一个已经装好的插件。
@@ -859,7 +859,7 @@ describe("App 主区域看板", () => {
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
     await openBoardFor("/proj");
-    fireEvent.click(await screen.findByRole("checkbox"));
+    fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
 
     expect(await screen.findByText(/插件未安装/)).toBeTruthy();
   });
@@ -875,7 +875,7 @@ describe("App 主区域看板", () => {
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
     await openBoardFor("/proj");
-    fireEvent.click(await screen.findByRole("checkbox"));
+    fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
     await screen.findByText(/该项目尚未创建看板/);
 
     fireEvent.click(screen.getByRole("button", { name: "创建看板" }));
@@ -1147,14 +1147,15 @@ describe("App settings & theme wiring", () => {
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
   });
 
-  /** Defer `ui/settings/read` so a test can interleave a newer theme choice. */
+  /** Defer `ui/settings/read` so a test can interleave a newer choice (theme 或值守). */
   function deferRead() {
-    let resolveRead: (v: { theme?: unknown }) => void = () => {};
+    type ReadValue = { theme?: unknown; board_watchman_enabled?: unknown };
+    let resolveRead: (v: ReadValue) => void = () => {};
     state.dataSources["ui/settings/read"] = () =>
       new Promise((resolve) => {
         resolveRead = resolve;
       });
-    return async (value: { theme?: unknown }) => {
+    return async (value: ReadValue) => {
       await act(async () => resolveRead(value));
     };
   }
@@ -1226,6 +1227,99 @@ describe("App settings & theme wiring", () => {
     await act(async () => deferred[1].reject({ code: -32000, message: "second failed" }));
 
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+  });
+
+  it("reads board_watchman_enabled and writes it back when the panel toggles it", async () => {
+    // 值守是宿主级设置，与主题同走 ui/settings/*（而不是带 project 的
+    // plugin/query）：这里只是把这趟 read 的值 stub 成 false；默认口径其实是开
+    // （配置里没这个键也当开），点一下要写回 true。
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", board_watchman_enabled: false });
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+
+    const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    fireEvent.click(box);
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { board_watchman_enabled: true },
+      }),
+    );
+  });
+
+  it("surfaces the watchman warning ui/settings/write returns", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", board_watchman_enabled: true });
+    // 写入落盘了，但宿主没能装上登录项：它把原因放在 warning 里，面板必须原样
+    // 摆出来，而不是静默让人以为已经生效。
+    state.dataSources["ui/settings/write"] = (params: unknown) =>
+      (params as { board_watchman_enabled?: boolean }).board_watchman_enabled === false
+        ? { warning: "未能在登录项中安装值守" }
+        : {};
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+
+    const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+
+    expect(await screen.findByText("未能在登录项中安装值守")).toBeTruthy();
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { board_watchman_enabled: false },
+      }),
+    );
+  });
+
+  it("does not let an in-flight re-handshake read clobber a fresh watchman toggle", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    // 两趟 read 都返回 true：迟到的旧值一旦被采纳，开关会弹回 true，断言即红。
+    const resolveRead = deferRead();
+    render(<App />);
+    await settle();
+    // 首屏 read 在途，面板还没法开——先把 handshake 放过去把面板拿到屏上。
+    await resolveRead({ theme: "dark", board_watchman_enabled: true });
+    await openBoardFor("/proj");
+    const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+
+    // 新一轮 read 在途（这正是重启后重放握手发的那趟），此时面板已在屏上。
+    const resolveStale = deferRead();
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 });
+    });
+    await waitFor(() => expect(clients.length).toBe(2));
+    await waitFor(() =>
+      expect(clients[1].requests.some((r) => r.method === "ui/settings/read")).toBe(true),
+    );
+
+    // read 在途：用户把值守关掉（写入返回成功，界面随之变为关）。
+    fireEvent.click(screen.getByLabelText("后台值守（开机自启）开关"));
+    await waitFor(() =>
+      expect(clients[1].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { board_watchman_enabled: false },
+      }),
+    );
+    await waitFor(() =>
+      expect((screen.getByLabelText("后台值守（开机自启）开关") as HTMLInputElement).checked).toBe(
+        false,
+      ),
+    );
+
+    // 迟到的权威 read 带回旧值 true，必须被忽略：用户的选择才是当前选择。
+    await resolveStale({ theme: "dark", board_watchman_enabled: true });
+    expect((screen.getByLabelText("后台值守（开机自启）开关") as HTMLInputElement).checked).toBe(
+      false,
+    );
   });
 
   it("re-handshakes on a fresh client after the sidecar exits and the host restarts it", async () => {

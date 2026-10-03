@@ -47,8 +47,8 @@ pub fn save_board(path: &Path, board: &Board) -> Result<(), PersistError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use superpowers_kanban_core::card::CardId;
     use chrono::{Local, TimeZone};
+    use superpowers_kanban_core::card::CardId;
 
     fn seeded() -> Board {
         let mut board = Board::new();

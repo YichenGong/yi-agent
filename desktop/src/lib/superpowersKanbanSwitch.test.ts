@@ -5,8 +5,10 @@ import {
   formatSwitch,
   pluginIsUnavailable,
   readBoardSwitch,
+  readBoardWatchman,
   resolveSwitch,
   setBoardSwitch,
+  writeBoardWatchman,
 } from "./superpowersKanbanSwitch";
 
 describe("resolveSwitch", () => {
@@ -123,6 +125,38 @@ describe("queryPlugin", () => {
     const rpc = async <T,>(m: string, p: unknown) => { calls.push([m, p]); return {} as T; };
     await readBoardSwitch(rpc, "/proj");
     expect(calls[0]).toEqual(["plugin/query", { plugin: "superpowers-kanban", project: "/proj", method: "switch.read", params: {} }]);
+  });
+});
+
+describe("background watchman settings", () => {
+  type Rpc = Parameters<typeof readBoardWatchman>[0];
+  const asRpc = (fn: unknown) => fn as unknown as Rpc;
+
+  it("reads through the host channel, with no project and no plugin", async () => {
+    // 宿主级设置：直接走 ui/settings/read。若误走 plugin/query，就会带上 project
+    // 去问某个项目的插件——那是另一个问题。
+    const inner = vi.fn(async () => ({ board_watchman_enabled: true }));
+    const on = await readBoardWatchman(asRpc(inner));
+    expect(inner).toHaveBeenCalledWith("ui/settings/read", {});
+    expect(on).toBe(true);
+  });
+
+  it("defaults to on when the key is unset or not a boolean", async () => {
+    // 老配置没有这个键：缺省为开，否则会把用户本来一直在跑的值守悄悄关掉。
+    expect(await readBoardWatchman(asRpc(vi.fn(async () => ({}))))).toBe(true);
+    expect(
+      await readBoardWatchman(asRpc(vi.fn(async () => ({ board_watchman_enabled: "yes" })))),
+    ).toBe(true);
+    expect(
+      await readBoardWatchman(asRpc(vi.fn(async () => ({ board_watchman_enabled: false })))),
+    ).toBe(false);
+  });
+
+  it("writes the requested value to ui/settings/write and passes the warning back", async () => {
+    const inner = vi.fn(async () => ({ warning: "未能在登录项中安装值守" }));
+    const result = await writeBoardWatchman(asRpc(inner), false);
+    expect(inner).toHaveBeenCalledWith("ui/settings/write", { board_watchman_enabled: false });
+    expect(result.warning).toBe("未能在登录项中安装值守");
   });
 });
 

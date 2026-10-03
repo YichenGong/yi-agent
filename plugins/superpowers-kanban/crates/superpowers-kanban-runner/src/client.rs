@@ -19,6 +19,11 @@ impl BoardDaemon {
         Self { socket }
     }
 
+    /// daemon 是否还在应答。最便宜的一次读：拿到任何应答即算活着。
+    pub fn is_alive(&self) -> bool {
+        client::send(&self.socket, Command::Status).is_ok()
+    }
+
     /// Asks the daemon for a new autonomous session in `workdir`.
     pub fn create_session(
         &self,

@@ -3,7 +3,7 @@
 //! 前端才是主题的最终渲染方，agent 够不到它；工具只写共享偏好并广播，
 //! 由 app-server 的 `ui/settings/updated` 通知把新值推回桌面端。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -35,6 +35,15 @@ impl ThemeHandle {
 
     pub fn current(&self) -> Theme {
         *self.theme.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 该句柄落盘所在的目录（构造时传入的 workdir）。
+    ///
+    /// `ui/settings/read|write` 用它读写与 `theme` 同处
+    /// `<workdir>/.yi-agent/preferences.json` 的其它宿主级偏好（如
+    /// `board_watchman_enabled`）——两处若各取各的目录，就会各写一个文件。
+    pub fn workdir(&self) -> &Path {
+        &self.workdir
     }
 
     /// 更新内存值、落盘、广播。落盘失败只记日志：UI 已切了主题，不该因为

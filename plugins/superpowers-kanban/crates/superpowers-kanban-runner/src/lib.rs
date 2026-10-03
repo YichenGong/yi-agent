@@ -8,5 +8,6 @@ pub mod tick;
 
 pub mod persist;
 pub mod service;
+pub mod single_instance;
 pub mod worktree;
 pub mod dispatch;

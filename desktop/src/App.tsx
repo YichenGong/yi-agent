@@ -36,9 +36,11 @@ import {
   type SwitchSource,
   enqueueBoardCard,
   fetchBoard,
+  parseBoardWatchman,
   pluginIsUnavailable,
   readBoardSwitch,
   setBoardSwitch,
+  writeBoardWatchman,
 } from "./lib/superpowersKanbanSwitch";
 import {
   type BoardErrorKind,
@@ -148,6 +150,12 @@ export default function App() {
   // 只有下一次写入成功或换了项目才清掉——轮询成功不算，那会让一条刚报出的
   // 失败在 2 秒内自己消失。
   const [boardError, setBoardError] = useState<BoardErrorKind | null>(null);
+  // 宿主级「后台值守」：默认开（老配置没有这个键时也当作开，否则会把用户本来
+  // 一直在跑的值守悄悄关掉）。值守管的是宿主的 daemon，与选中的项目无关。
+  const [watchmanEnabled, setWatchmanEnabled] = useState(true);
+  // 上一次值守写入携带的告知（安装/卸载失败原因）。每次写入都以返回值整体覆盖，
+  // 成功时清空——不做乐观更新，那是宿主的状态，得听宿主怎么说。
+  const [watchmanWarning, setWatchmanWarning] = useState<string | null>(null);
 
   /**
    * 一行看板状态，2 秒刷新一次。
@@ -173,6 +181,10 @@ export default function App() {
   // 用 ref 而非 state：写失败的回调读到的是最新基线，而不是某次调用时刻的
   // 陈旧闭包值——否则并发写会退回到中间态（见 changeTheme）。
   const confirmedThemeRef = useRef<Theme>(readCachedTheme() ?? "dark");
+  // 值守同理：一旦用户拨过开关（onToggleWatchman 会写回宿主），后续任何一趟
+  // 在途的 read——尤其是重启后的重放握手——都不得用旧值把它覆盖回去。与主题
+  // 不同，值守没有 ui/settings/updated 通知，所以触碰后只认写入的返回值。
+  const watchmanTouchedRef = useRef(false);
 
   /** 经 app-server 调 board RPC；未连接时直接失败。 */
   const boardRpc = useCallback(
@@ -774,13 +786,23 @@ export default function App() {
     const handshake = async (client: RpcClient) => {
       try {
         await client.request("initialize", {});
-        const settings = await client.request<{ theme?: unknown }>("ui/settings/read", {});
+        const settings = await client.request<{
+          theme?: unknown;
+          board_watchman_enabled?: unknown;
+        }>("ui/settings/read", {});
         // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
         // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
         if (!themeTouchedRef.current) {
           const authoritative = parseTheme(settings.theme);
           confirmedThemeRef.current = authoritative;
           setTheme(authoritative);
+        }
+        // 值守：直接读这份 settings（同一趟请求里就有），不再多发一次
+        // `ui/settings/read`。缺省口径由 parseBoardWatchman 与 readBoardWatchman 共享。
+        // 同样只在用户还没拨过开关时采纳：重启重放握手时面板已在屏上，read 在途
+        // 期间拨下的开关不能被这趟迟到的旧值悄悄覆盖回原样。
+        if (!watchmanTouchedRef.current) {
+          setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
         }
         await refreshWorkspaces();
         const list = await client.request<{
@@ -948,6 +970,23 @@ export default function App() {
     });
   };
 
+  /**
+   * 切换宿主级「后台值守」。不做乐观更新：值以宿主返回的为准，安装/卸载失败
+   * 的告知（warning）原样摆到面板上——静默会让用户以为已经生效。
+   */
+  const onToggleWatchman = async (next: boolean) => {
+    // 先标记已触碰，再发写入（与 changeTheme 对 theme 的做法一致）：此刻若还有
+    // 一趟 ui/settings/read 在途（如重启重放的握手），它回来时必须让位。
+    watchmanTouchedRef.current = true;
+    try {
+      const result = await writeBoardWatchman(boardRpc, next);
+      setWatchmanEnabled(next);
+      setWatchmanWarning(result?.warning ?? null);
+    } catch (error) {
+      setWatchmanWarning(formatError(error));
+    }
+  };
+
   const changeTheme = (next: Theme) => {
     // 立即生效，再落盘。
     themeTouchedRef.current = true;
@@ -1051,6 +1090,9 @@ export default function App() {
                 source={boardSource}
                 onToggle={(next) => void onToggleBoardSwitch(next)}
                 onCollapse={() => setBoardCollapsed(true)}
+                watchmanEnabled={watchmanEnabled}
+                onToggleWatchman={(next) => void onToggleWatchman(next)}
+                watchmanWarning={watchmanWarning}
               />
               {boardError !== null && (
                 <div className="flex items-center gap-3 px-4 pb-3 text-xs text-red-400">

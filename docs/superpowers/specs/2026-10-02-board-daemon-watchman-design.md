@@ -1,0 +1,196 @@
+# 看板 daemon 的持续值守（watchman）— Design
+
+状态：已实施并通过验收（2026-10-03；端到端验证见 §5 各条证据）。
+上游决策：本文回答 spec §7 已知缺口 2「daemon 崩溃无人重启」。
+
+## 1. 问题
+
+看板插件由 `daemon serve` 进程监督重启（`yi-agent-supervisors`），但**没有任何东西监督
+daemon 本身**。于是：
+
+1. `daemon serve` 一崩（半夜崩溃、被 OOM 杀掉、误杀），该项目的 daemon 不再回来，
+   插件的监督者也没了。重启桌面 app 也没用——`board/list` 只读登记表，从不拉起 daemon。
+2. 崩溃时插件会变成**孤儿进程**继续空转（插件无 daemon 存活探测，监督器也未给插件
+   `setsid`，单个 pid 被 `kill -9` 不会连带杀子进程）。
+3. 当新 daemon 起来，它会再拉一个插件 —— 于是**两个插件同时跑同一块看板，同一张卡被
+   重复启动**。这对「限流下单一队列推进」的目的是致命的。
+
+目标：让排队中的看板任务能在无人盯着的情况下**持续自动推进**，包括 app 关闭期间与
+系统重启之后；且任何时刻同一项目**只有一个插件在推进队列**。
+
+## 2. 设计原则
+
+- **watchman 只关心 daemon，不关心看板。** 它读一个**通用**的「常驻 daemon 登记」，
+  不知道「看板」是什么。看板是外部插件，它只是把自己的需要写进那份通用登记。
+- **一份保证逻辑，两个宿主。** `ensure_daemons(projects)`（探测 `is_running`，不在就
+  `launch_if_absent`）同时喂给常驻 watchman 与 app 内循环。
+- **唯一事实来源是登记，不是进程树。** 谁该有 daemon 由登记声明；daemon 是否有由 socket
+  探测决定（`is_running`）。
+- **幂等、无协调信号。** 两个守护者重复探测无害；daemon 自身的独占 flock 保证不会双起。
+
+## 3. 架构与数据流
+
+```
+看板 create/remove ──> 通用常驻登记 ~/.yi-agent/resident-daemons.json
+                              │
+              ┌───────────────┴───────────────┐
+              ▼                               ▼
+  watchman（launchd 托管，常驻）      app-server 内循环（app 打开时）
+     每 ~30s ensure_daemons              每 ~30s ensure_daemons
+              └────────────> 各项目 daemon（独占 flock）─> 插件监督循环
+                                     └─> 插件（单实例锁 + daemon 失联即退）
+```
+
+- **A（持久）**：launchd 的 `KeepAlive` 托管 watchman；watchman 保证各项目 daemon 存活。
+- **B（会话期）**：app-server 跑同一 `ensure_daemons`。
+- 两条腿都幂等；daemon 启动拿独占锁（`InstanceLock`），第二个以 `AlreadyRunning` 干净
+  退出，**不会双起 daemon**。
+
+## 4. 组件
+
+### 4.1 通用常驻登记（宿主，非看板专属）
+
+- 新文件：`~/.yi-agent/resident-daemons.json`
+- 形状：
+  ```json
+  { "projects": [ { "project": "/abs/path", "required_by": ["superpowers-kanban"] } ] }
+  ```
+- API 落在 **`yi-agent-store::resident`**（宿主的通用存储层，非看板 crate），以保持登记本身
+  与看板解耦；写它的是 `yi-agent-boards`（看板生命周期），读它的是 watchman 与 app-server：
+  - `require(global, project, requester)`——合并登记（幂等，追加 requester）。
+  - `release(global, project, requester)`——摘除 requester；`required_by` 空则删该项目项。
+  - `list(global) -> Vec<PathBuf>`——watchman 与 app 循环的输入。
+  - 损坏文件按「拒绝覆盖 + 当作空」处理，与 `boards.json` 的既有约定一致（不静默丢数据）。
+- **不含任何 board 语义**：字段是 `project` + `required_by`，将来别的常驻插件可复用。
+
+### 4.2 watchman：`yi-agent boards watch`
+
+- 宿主侧子命令。循环：`list()` → 逐个 `ensure_daemons`（`is_running` 否则
+  `launch_if_absent`）→ sleep ~30s。
+- 不读 `boards.json`，不 spawn 看板专属逻辑；daemon 起来后插件由 daemon 自己监督（现成）。
+- 非 macOS / 无 launchd 时，可当作普通脱离进程运行（与 daemon 同样的 `setsid` 手法）。
+
+### 4.3 `ensure_daemons` 胶水
+
+- 位置：`yi-agent-boards`（已有 `launch_if_absent` 与 `is_running`）。
+- `pub fn ensure_daemons(projects: &[PathBuf])`：对每个项目 `launch_if_absent`（内部先
+  `is_running` 再 spawn），失败只记日志不中断其余项目。
+- **B 与 A 共用它**，不重复实现。
+
+### 4.4 LaunchAgent 安装 / 卸载 / 开关（I2）
+
+- 首次**创建看板**时自动安装 LaunchAgent（`~/Library/LaunchAgents/`），
+  `RunAtLoad` + `KeepAlive`，`ProgramArguments = [<yi-agent abs path>, "boards", "watch"]`。
+- 安装后**界面上明确告知**：「看板将在后台持续运行，已设置开机自启」。
+- 设置界面给一个开关「后台值守 / 开机自启」：
+  - 关 → `launchctl bootout` + 删 plist。
+  - 开 → 重装 plist + `bootstrap`。
+- 该开关是**宿主级**设置（`~/.yi-agent/preferences.json`，键 `board_watchman_enabled`，
+  默认 `true`）；app-server 在首次安装时写入 `true`。
+- **失败不静默、不打扰**：plist 写入或 `launchctl` 加载失败时**不**弹阻塞式错误，但也不
+  假装成功——记一条警告日志，并在设置项旁显示内联提示（「后台值守未启用」）。
+- **最后一块看板移除** → 自动卸载（并 `release` 登记）。
+- plist 写死 `yi-agent` 绝对路径；若检测到路径与当前可执行文件不符，重装（安装路径稳定，
+  可接受）。
+
+### 4.5 app 侧自愈（B）
+
+- `app-server` 加轻量周期任务（~30s）：`resident::list()` → `ensure_daemons`。
+- 与 watchman 重叠无害（幂等）。app 关掉后由 watchman 接管。
+- TUI 可选同做（非本轮必需，记为可选）。
+
+### 4.6 插件侧：单实例锁 + daemon 失联即退（防双跑、防空转）
+
+- **单实例锁**：插件启动即对 `<state_dir>/plugin.lock` 取 `flock(LOCK_EX|LOCK_NB)`；拿不到
+  则说明已有插件在跑，本进程等待（轮询）或退出——保证同一时刻**只有一个插件推进队列**。
+  复用与本仓库一致的 flock 约定。
+- **daemon 失联即退**：推进循环每轮（或在独立线程按 ~5s）探一次 daemon `Status`；连续失败
+  到一个阈值（例如 3 次）即 `exit(0)`，不再空转。
+- 时序：daemon 崩 → 孤儿插件数秒内自退并释放锁 → 新 daemon 拉新插件 → 新插件立刻拿锁
+  开工。窗口极小，且**绝不两个插件同时推进**。
+- 备选（更复杂，本轮不做）：kqueue 监听 parent 退出即时感知；新插件阻塞等锁而非退出。
+
+### 4.7 重启后的卡片对账（复用 Task 8 对账）
+
+- 任务状态持久化（`tasks` 表），新 daemon 会 rehydrate。`reconcile_running` 据
+  `task_state` 把「跑完的」迁 `AwaitingMerge`、「需人处理」（`recovery_required` 等）迁
+  `NeedsYou`——**都会释放全局名额**，队列继续。
+- 这是既有机制的复用，不新增对账逻辑；只补测试覆盖「daemon 重启后停在 Running 的卡能被
+  对账移走并释放名额」。
+
+## 5. 验收
+
+1. **持久守护（A）**：杀掉某项目 daemon，~30s 内被自动拉回并应答 `Status`；插件的排队
+   任务继续推进（实测：临时 HOME + 真 daemon/插件）。
+2. **会话期自愈（B）**：app-server 运行时杀掉 daemon，~30s 内被拉回。
+3. **不双起**：两个守护者同时跑、或两次 ensure，任何时候每项目只有一个 daemon
+   （`AlreadyRunning` 干净退出）。
+4. **不双跑插件**：daemon 崩后孤儿插件在有界时间内退出；新 daemon 的新插件拿锁成功；
+   断言期间同一项目只有一个插件在推进队列（无重复启动同一张卡）。
+5. **登记耦合**：看板 create 写通用登记（`required_by` 含 `superpowers-kanban`）、remove
+   摘除；watchman 只读通用登记、不读 `boards.json`。
+6. **开关**：关「后台值守」→ LaunchAgent 卸载、plist 删除；开 → 重装；行为与界面告知一致。
+7. **重启恢复**：杀死带运行中卡片的 daemon 后重启，卡片被对账移出 `Running`、名额释放、
+   队列继续。
+8. **回归**：宿主、插件、桌面全绿。
+
+### 5.1 验收证据（2026-10-03）
+
+环境：`PATH=<rustup stable>`、`TMPDIR=/Users/gongyichen/.yi-agent-tmp`、cargo 一律
+`--offline`；全部在临时 `HOME` + 真二进制下运行，绝不触碰真实 `$HOME`/launchd。
+
+| 条目 | 证据（命令 → 观察） |
+|---|---|
+| 1、3、4 | `YI_AGENT_BOARD_E2E=1 cargo test --offline -p yi-agent --test board_watchman_e2e` → **2 passed**。`killing_a_board_daemon_is_healed_by_the_watchman`：真 `board/create` 拉起真 daemon，SIGKILL 它，跑 watchman 循环体（`yi-agent boards watch --interval-secs 1`，即 `watch::once` + `ensure_daemons`），在有界轮询内 daemon 重新应答 `Status` 且是新 pid；随后**再** SIGKILL 已恢复的 daemon，并**轮询到 watchman 确实又 tick 了一次**（第三个 daemon 起来）——不依赖固定 sleep 的时长。两次都断言 `runtime.lock` 恰有一个持有者（不双起、多次 tick 不叠加）。`an_orphan_plugin_exits_after_the_daemon_dies`：第二个 `plugin run` 保持存活、但始终**不出现在** `plugin.lock` 持有者中（这是**活性/身份核对，不是进程内 flock 争用证明**；`flock` 拒绝的进程内证明见插件单测 `a_second_instance_cannot_take_the_lock`）；SIGKILL daemon 后孤儿在有界轮询（~3s，3×1s 阈值）内自行退出并释放锁（`lsof` 该锁持有者归零）；重启 daemon 后新插件拿锁，锁持有者恰为 1。两个测试收尾都清扫并**断言** `runtime.lock`/`plugin.lock` 持有者归零（泄漏即失败，而非「尽力而为」）。 |
+| 2 | 同一 e2e 的第一个测试用**同一份** `watch::once`/`ensure_daemons`（B 与 A 共用），证明登记在有 daemon 死掉时会被重新确保；app-server 会话期循环有独立单测：`cargo test -p yi-agent-app-server app_side_loop` → `the_app_side_loop_ensures_every_registered_project ... ok`（crate 全量 281 passed / 0 failed）。真实 launchd 未驱动，见「未竟驱动项」。 |
+| 3 | 由 §4.1 daemon 的独占 `runtime.lock`（`flock`）担保：e2e 断言锁持有者数恒为 1；watchman 多轮 tick 后仍为 1。 |
+| 5 | `cargo test -p yi-agent-boards watchman::` → **4 passed**（plist 内容/装/卸/路径不符判未装）。create/remove 的登记写入/摘除由 lifecycle 单测覆盖（`creating_a_board_registers_a_resident_daemon_need` / `removing_a_board_releases_the_resident_daemon_need`）；e2e 直接断言 `resident::list` 含该项目。watchman 只经 `watch::once` 读 `resident-daemons.json`，代码路径不触及 `boards.json`。 |
+| 6 | `cargo test -p yi-agent-app-server` → **281 passed / 0 failed**，含 `creating_a_board_ensures_the_watchman_is_installed`、`creating_a_board_leaves_the_watchman_alone_when_the_switch_is_off`、`a_failing_watchman_install_does_not_fail_board_creation`、`writing_the_watchman_setting_installs_or_uninstalls_it`。桌面：`npx tsc --noEmit` 干净、`npx vitest run` → 45 files / **449 tests passed**（含 Task 9 的 watchman 开关与竞态守卫测试）。 |
+| 7 | 复用既有 `reconcile_running`；插件单测覆盖对账（`a_card_whose_task_finished_leaves_running_and_frees_its_slot`、`a_failed_task_also_leaves_running`），`cargo test -p superpowers-kanban` → **137 passed / 0 failed**（core 63 + ipc 27 + runner 39 + bin 8）。 |
+| 8 | 宿主：`cargo test --workspace --no-fail-fast` → **2137 passed / 1 failed**；唯一失败是既有、与本计划无关的易抖测试 `yi-agent-supervisors::tests::supervisor::a_switch_on_spawns_the_child`（见下）。插件 137 passed；桌面 tsc 干净 + 449 passed。 |
+
+**未竟驱动项（诚实声明）：**
+
+- **「同一时刻只有一个插件在推进队列 / 无重复启动同一张卡」为推断，而非本 e2e 直接观测。**
+  e2e 观测到的是：同一项目**至多一个插件持有推进锁**（`plugin.lock` 的持有者集合恒为单个），
+  且孤儿插件在有界时间内退位。它**从不启动任何卡片**，所以「同一张卡不会被重复启动」是由
+  「单实例锁 + 孤儿让位」**加**插件自身的排队启动单测推断而来（`starts_the_oldest_queued_card_first`、
+  `never_exceeds_the_slot_limit`、`a_terminal_card_is_never_started_again`、
+  `a_successful_launch_moves_the_card_to_running`），不是端到端驱动出来的。要直接观测需要真模型调用
+  启动一张真卡，属本轮非目标。
+- e2e 的两个测试都**不驱动真实 launchd**。`app-server` 以 `YI_AGENT_DISABLE_WATCHMAN=1`
+  启动（Task 6 的生产 kill-switch），故 `board/create` 的安装退化为 no-op；watchman 由
+  「跑其循环体」而非真实 LaunchAgent 触发。理由：本条验收要的是「daemon 会回来」，
+  而这正是 `watch::once` + `ensure_daemons` 的职责；launchd 本身（plist 内容、装/卸、
+  `RunAtLoad`/`KeepAlive`）由 `yi-agent-boards::watchman` 的 4 个单测覆盖。launchd 对
+  watchman **自身**的重启属 Task 5/6 范畴，不在 e2e 断言内。
+- 第二个 `plugin run` 的断言是**活性/身份核对**（它保持存活、且不在锁持有者集合里），
+  不是进程内 `flock` 争用证明。锁层面的进程内证明在插件单测
+  `single_instance::tests::a_second_instance_cannot_take_the_lock`。
+- 孤儿感知是**有界退出**（阈值 3×探测间隔），非 kqueue 即时感知（非目标，§4.6/§6）。
+  e2e 把间隔设为 1s 使窗口约 3s；断言的是「有界内让位」这一充分不变量。
+- 「重启后停在 `Running` 的卡被对账移走」由插件单测覆盖（对账逻辑不因重启而变），
+  e2e 未造真实运行中卡片（需要真模型调用），故列为单测覆盖而非 e2e。
+- 已知与本计划无关的易抖测试：`yi-agent-supervisors` 的 `tests/supervisor.rs` 里
+  进程起停类测试（先见 `a_switch_on_spawns_the_child`，复跑又见 `stop_all_reaps_every_child`）。
+  该文件在本计划内**零改动**（`git diff <base> HEAD -- yi-agent-supervisors/` 为空），
+  单独复跑 3 次中 2 次全绿、1 次复现；全并行下受机器负载影响。任务简述里点名的
+  `yi-agent-core::agent::tests::cancel_returns_unconsumed_interjections_before_cancelled`
+  在本轮全量运行中**通过**。
+
+## 6. 非目标（本轮）
+
+- 用户可见的「开机自启项」完整管理 UI（本轮只给一个开关 + 一次安装告知）。
+- Linux/Windows 的等价自启机制（先做 macOS launchd；watchman 逻辑本身跨平台）。
+- TUI 侧的 B（会话期自愈）非必需，记为可选。
+- 「一个总管进程统管所有项目」的其它形态。
+
+## 7. 风险
+
+| 风险 | 处置 |
+|---|---|
+| 孤儿插件与新插件双跑推进同一队列 | 插件单实例锁 + daemon 失联即退（4.6）；集成测试覆盖 |
+| 两个守护者同时 ensure 抢拉 daemon | daemon 独占 flock，第二个 AlreadyRunning 干净退出；测试覆盖 |
+| LaunchAgent 写死的 yi-agent 路径失效 | 检测路径不符则重装；安装路径稳定 |
+| 通用登记损坏 | 拒绝覆盖 + 当作空，与 `boards.json` 既有约定一致，不静默丢数据 |
+| 阈值/间隔不当导致误退或响应慢 | 间隔 ~5s、阈值 3 次；可调常量集中一处 |

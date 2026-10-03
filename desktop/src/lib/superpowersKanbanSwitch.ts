@@ -32,7 +32,7 @@ export interface BoardCardDto {
   thread_id?: string | null;
 }
 
-type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
+export type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
 
 /**
  * The plugin the kanban panel talks to. The host only forwards the query; no
@@ -122,5 +122,45 @@ export async function enqueueBoardCard(
   await queryPlugin(rpc, project, "enqueue", {
     spec_path: specPath,
     plan_path: planPath,
+  });
+}
+
+/**
+ * 归一化 `ui/settings/read` 里的 `board_watchman_enabled`。非布尔一律当开：
+ * 老配置文件里没有这个键时，用户此前的行为是「一直在跑」，不能因为读不到就
+ * 把它关掉。App 直接在握手时套用（那趟 read 已经拿到了整个 settings），
+ * `readBoardWatchman` 也用它，保证桌面端只有一处缺省口径。
+ */
+export function parseBoardWatchman(value: unknown): boolean {
+  return typeof value === "boolean" ? value : true;
+}
+
+/**
+ * 读「后台值守」开关。
+ *
+ * 这是**宿主级**设置，不是某个项目的看板设置：值守盯的是宿主上的看板
+ * daemon（随宿主起停），因此直接走 `ui/settings/*`，与主题同一条通道，
+ * 不经 `plugin/query`——那条通道带 `project`，答的是「这个项目的队列」，
+ * 与「宿主上有没有一个值守进程」是两码事。
+ *
+ * 也是给需要专门读一次开关的调用方用的公开读入口；App 握手时已从同一趟
+ * `ui/settings/read` 里拿到 settings，直接套用 `parseBoardWatchman`，不再
+ * 多发这一趟。
+ */
+export async function readBoardWatchman(rpc: BoardRpc): Promise<boolean> {
+  const settings = await rpc<{ board_watchman_enabled?: unknown }>("ui/settings/read", {});
+  return parseBoardWatchman(settings.board_watchman_enabled);
+}
+
+/**
+ * 写「后台值守」开关。宿主在安装/卸载失败时把原因放在返回的 `warning` 里
+ * （写入本身已落盘），调用方负责把它摆到面板上；成功时为 `null`/缺省。
+ */
+export async function writeBoardWatchman(
+  rpc: BoardRpc,
+  enabled: boolean,
+): Promise<{ warning?: string | null }> {
+  return rpc<{ warning?: string | null }>("ui/settings/write", {
+    board_watchman_enabled: enabled,
   });
 }

@@ -27,9 +27,9 @@ mod tests {
     use super::*;
     // Kept from the brief: the limit is currently supplied by the caller, so the
     // calendar import is not yet exercised by these tests.
+    use chrono::{Local, TimeZone};
     #[allow(unused_imports)]
     use superpowers_kanban_core::calendar::ConcurrencyCalendar;
-    use chrono::{Local, TimeZone};
 
     fn at(hour: u32) -> chrono::DateTime<Local> {
         Local

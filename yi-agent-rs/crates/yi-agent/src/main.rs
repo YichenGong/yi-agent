@@ -21,7 +21,9 @@ use yi_agent_core::Provider;
 // 字面量构造仍然成立。
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
-use crate::config::{AgentAction, Cli, Command, DaemonAction, PairAction, ScheduleAction};
+use crate::config::{
+    AgentAction, BoardsAction, Cli, Command, DaemonAction, PairAction, ScheduleAction,
+};
 
 fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
     match message {
@@ -79,6 +81,13 @@ fn main() -> Result<()> {
         }
         Some(Command::Completions { shell }) => print_completion(shell),
         Some(Command::Pair { ref action }) => run_pair(action),
+        Some(Command::Boards { ref action }) => match action {
+            // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
+            BoardsAction::Watch { interval_secs } => {
+                run_boards_watch(*interval_secs);
+                Ok(())
+            }
+        },
         None => run_agent(cli),
     }
 }
@@ -193,6 +202,21 @@ fn run_pair(action: &PairAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 常驻值守循环。由 launchd 托管，KeepAlive 负责它自己的存活。
+fn run_boards_watch(interval_secs: u64) {
+    let Some(resident_dir) = yi_agent_store::resident::default_dir() else {
+        eprintln!("yi-agent: cannot watch boards: HOME is not set");
+        std::process::exit(1);
+    };
+    let interval = std::time::Duration::from_secs(interval_secs);
+    loop {
+        yi_agent_boards::watch::once(&resident_dir, &mut |projects| {
+            yi_agent_boards::watch::ensure_daemons(projects);
+        });
+        std::thread::sleep(interval);
+    }
 }
 
 /// `ABCD-EFGH` + `(valid 300s)` — pure so it can be unit-tested.
@@ -3414,5 +3438,32 @@ mod tests {
             "a restarted runtime must delegate again, got {response:?}"
         );
         drop(daemon);
+    }
+
+    #[test]
+    fn boards_watch_parses_with_a_default_interval() {
+        let cli = Cli::try_parse_from(["yi-agent", "boards", "watch"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Boards {
+                action: BoardsAction::Watch { interval_secs: 30 }
+            })
+        ));
+    }
+
+    #[test]
+    fn boards_watch_once_ensures_every_registered_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
+        yi_agent_store::resident::require(dir.path(), &b, "superpowers-kanban").unwrap();
+
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let count = yi_agent_boards::watch::once(dir.path(), &mut |projects: &[PathBuf]| {
+            seen.extend_from_slice(projects)
+        });
+        assert_eq!(count, 2);
+        assert_eq!(seen, vec![a, b]);
     }
 }

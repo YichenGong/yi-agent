@@ -11,9 +11,15 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use yi_agent_store::resident;
+
 use crate::board_daemon;
 use crate::registry;
 use crate::scaffold;
+
+/// 看板在通用常驻登记里的请求者名。写进 `resident-daemons.json` 的
+/// `required_by`，值守者据此知道这条需要是看板提出的（而不是别的组件）。
+pub const REQUESTER: &str = "superpowers-kanban";
 
 /// How long [`create`] waits for a freshly spawned daemon to answer before
 /// giving up on it. Generous enough for a cold plugin load, short enough that a
@@ -60,9 +66,18 @@ pub fn create(project: &Path) -> Result<BoardStatus, String> {
 /// Separate from [`create_with_project`] so a caller that already resolved the
 /// global directory (the app-server, which keeps it alongside its other
 /// injectable paths) registers in the *same* place it lists from.
+///
+/// The *resident* registry is resolved here rather than injected: `global` is
+/// the board registry, a different directory, and the app-server's injected
+/// board path exists only so tests never touch the real `~/.yi-agent`. A test
+/// that calls this production wrapper instead of [`create_with_project`] would
+/// therefore still write the real resident registry, so tests must use the
+/// `_with_project`/`_with` variants with a temp dir (see the tests below).
 pub fn create_in(project: &Path, global: &Path) -> Result<BoardStatus, String> {
+    let resident_dir = resident::default_dir()
+        .ok_or_else(|| "cannot locate the resident registry: HOME is not set".to_string())?;
     let mut launcher = |project: &Path| launch_if_absent(project);
-    create_with_project(project, global, &mut launcher)
+    create_with_project(project, global, &resident_dir, &mut launcher)
 }
 
 /// Remove `project`'s board from the default global registry. See [`remove_in`].
@@ -73,16 +88,21 @@ pub fn create_in(project: &Path, global: &Path) -> Result<BoardStatus, String> {
 /// the queue, so the config is what makes a re-create cheap).
 pub fn remove(project: &Path) -> Result<(), String> {
     let global = crate::global_dir().map_err(|error| error.to_string())?;
-    remove_in(project, &global)
+    let resident_dir = resident::default_dir()
+        .ok_or_else(|| "cannot locate the resident registry: HOME is not set".to_string())?;
+    remove_in(project, &global, &resident_dir)
 }
 
 /// Remove `project`'s board from `global`, using the real daemon lifecycle.
 ///
 /// The stopper can block for up to the daemon's shutdown timeout; that is
 /// acceptable here because removal is a user-triggered RPC, not a poll.
-pub fn remove_in(project: &Path, global: &Path) -> Result<(), String> {
+///
+/// `resident_dir` is threaded through like in [`create_in`]: the app-server
+/// injects its own so a test's board/remove never writes the real `~/.yi-agent`.
+pub fn remove_in(project: &Path, global: &Path, resident_dir: &Path) -> Result<(), String> {
     let mut stopper = |project: &Path| board_daemon::stop(project);
-    remove_with(project, global, &mut stopper)
+    remove_with(project, global, resident_dir, &mut stopper)
 }
 
 /// `project`'s board as it is right now. Never fails: a status query that blew
@@ -128,6 +148,7 @@ pub fn launch_if_absent(project: &Path) -> Result<bool, String> {
 pub fn create_with_project(
     project: &Path,
     global: &Path,
+    resident_dir: &Path,
     launcher: &mut dyn FnMut(&Path) -> Result<bool, String>,
 ) -> Result<BoardStatus, String> {
     // Only a real directory can be a project. Accepting a path that does not
@@ -151,6 +172,12 @@ pub fn create_with_project(
 
     registry::register(global, project).map_err(|error| error.to_string())?;
 
+    // Declare the generic "this project needs a resident daemon" need only
+    // after the board really exists: recording it before a failure would leave
+    // a watchman believing in a board that was never created.
+    resident::require(resident_dir, project, REQUESTER)
+        .map_err(|error| format!("could not record the resident daemon need: {error}"))?;
+
     Ok(BoardStatus {
         registered: true,
         daemon_running,
@@ -163,6 +190,7 @@ pub fn create_with_project(
 pub fn remove_with(
     project: &Path,
     global: &Path,
+    resident_dir: &Path,
     stopper: &mut dyn FnMut(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     stopper(project)?;
@@ -178,7 +206,11 @@ pub fn remove_with(
             ))
         }
     }
-    registry::unregister(global, project).map_err(|error| error.to_string())
+    registry::unregister(global, project).map_err(|error| error.to_string())?;
+    // Symmetric with create: drop only this board's claim. A project another
+    // component also needs stays in the registry with its other requester.
+    resident::release(resident_dir, project, REQUESTER)
+        .map_err(|error| format!("could not release the resident daemon need: {error}"))
 }
 
 /// Report on a project's board using an explicit global directory.
@@ -253,6 +285,7 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
 
         // 注入的「启动器」按真实启动器的语义工作：第一次调用时绑定项目的
         // runtime socket 并派一个线程在那里回答 Status（之后复用同一个
@@ -308,7 +341,7 @@ mod tests {
             Ok(true)
         };
 
-        let first = create_with_project(&project, &global, &mut launcher).unwrap();
+        let first = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
         assert!(first.registered);
         assert_eq!(launched.get(), 1);
         // 清单与开关就位
@@ -324,7 +357,7 @@ mod tests {
         assert_eq!(prefs["superpowers_kanban"], true);
 
         // 再创建一次：不重复起进程
-        let second = create_with_project(&project, &global, &mut launcher).unwrap();
+        let second = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
         assert!(second.registered);
         assert_eq!(launched.get(), 1, "重复创建不该再起一个 daemon");
 
@@ -346,6 +379,7 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
         crate::registry::register(&global, &project).unwrap();
         assert!(
             crate::registry::contains(&global, &project).unwrap(),
@@ -358,7 +392,7 @@ mod tests {
             Ok(true)
         };
 
-        let created = create_with_project(&project, &global, &mut launcher).unwrap();
+        let created = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
         assert_eq!(
             launched.get(),
             1,
@@ -376,9 +410,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("missing"); // 故意不创建
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
 
-        let error = create_with_project(&project, &global, &mut launcher).unwrap_err();
+        let error = create_with_project(&project, &global, &resident, &mut launcher).unwrap_err();
         assert!(error.contains("not a directory"), "{error}");
         assert!(
             !global.join("boards.json").exists(),
@@ -399,15 +434,16 @@ mod tests {
         std::fs::create_dir_all(project.join(".yi-agent/superpowers-kanban")).unwrap();
         std::fs::write(project.join(".yi-agent/superpowers-kanban/board.json"), "{}").unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
-        create_with_project(&project, &global, &mut launcher).unwrap();
+        create_with_project(&project, &global, &resident, &mut launcher).unwrap();
 
         let mut stopped = 0;
         let mut stopper = |_p: &Path| {
             stopped += 1;
             Ok(())
         };
-        remove_with(&project, &global, &mut stopper).unwrap();
+        remove_with(&project, &global, &resident, &mut stopper).unwrap();
 
         assert_eq!(stopped, 1);
         assert!(
@@ -440,9 +476,10 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
 
-        let created = create_with_project(&project, &global, &mut launcher).unwrap();
+        let created = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
         assert!(created.registered);
 
         let reported = status_with(&project, &global);
@@ -555,6 +592,7 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
 
         let socket = runtime_socket(&project).unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
@@ -589,7 +627,7 @@ mod tests {
         });
 
         let mut launcher = |_p: &Path| panic!("已有 daemon 在跑时不得再起一个");
-        let created = create_with_project(&project, &global, &mut launcher).unwrap();
+        let created = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
         handle.join().unwrap();
 
         assert!(created.registered, "{created:?}");
@@ -602,9 +640,10 @@ mod tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
 
-        let created = create_with_project(&project, &global, &mut launcher).unwrap();
+        let created = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
         assert_eq!(
             serde_json::to_value(&created).unwrap(),
             serde_json::json!({
@@ -613,6 +652,40 @@ mod tests {
                 "queued": 0,
                 "running": 0,
             })
+        );
+    }
+
+    #[test]
+    fn creating_a_board_registers_a_resident_daemon_need() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut launcher = |_project: &Path| Ok(true);
+
+        create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        assert_eq!(
+            yi_agent_store::resident::list(&resident),
+            vec![project.clone()],
+            "a created board must declare its need for a resident daemon"
+        );
+    }
+
+    #[test]
+    fn removing_a_board_releases_the_resident_daemon_need() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let resident = dir.path().join("resident");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut launcher = |_project: &Path| Ok(true);
+        create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+
+        remove_with(&project, &global, &resident, &mut |_project: &Path| Ok(())).unwrap();
+        assert!(
+            yi_agent_store::resident::list(&resident).is_empty(),
+            "removing the last board drops the resident need"
         );
     }
 }

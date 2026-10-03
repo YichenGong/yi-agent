@@ -1,7 +1,7 @@
 //! Superpowers 看板插件进程入口。
 //!
 //! 用法：
-//! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs 60]`
+//! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs 10]`
 //! - `superpowers-kanban add <spec> <plan> [--state-dir <d>]`——把一对 spec/plan 投进 `inbox`
 //! - `superpowers-kanban list [--state-dir <d>]`——打印队列与待消费的投递
 //! - `superpowers-kanban on|off [--state-dir <d>]`——写项目层开关
@@ -19,6 +19,7 @@ use superpowers_kanban_core::card_id::card_id_for;
 use superpowers_kanban_core::promotion::validate_promotion;
 use superpowers_kanban_core::layout::{global_preferences_path, project_preferences_path, project_root};
 use superpowers_kanban_core::switch::{BoardSwitch, SwitchValue, read_layer, resolve, write_layer};
+use superpowers_kanban_runner::client::BoardDaemon;
 use superpowers_kanban_runner::service::BoardService;
 
 #[derive(Debug)]
@@ -162,7 +163,7 @@ where
     let mut runtime_dir = None;
     let mut state_dir = None;
     let mut project_root = None;
-    let mut interval_secs = 60_u64;
+    let mut interval_secs = 10_u64;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -372,6 +373,27 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 /// 这里**不再创建会话**：认领（`board.next_launch`）、起会话、回写终态都由宿主
 /// 调度器负责（plan Task 5/6）。插件只负责消费 inbox 把卡排进队列，并落盘。
 fn run_daemon(args: Args) {
+    // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到就等旧实例让位——
+    // 旧实例要么正常退出，要么靠 daemon 失联探测自行退出。用轮询避免忙等。
+    // 锁必须在函数存活期间一直持有：`_lock` 绑在这里，函数结束才 drop。
+    let _lock = loop {
+        if let Some(lock) = superpowers_kanban_runner::single_instance::acquire(&args.state_dir) {
+            break lock;
+        }
+        eprintln!(
+            "superpowers-kanban: another instance holds the lock at {}; waiting",
+            args.state_dir.join("plugin.lock").display()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+
+    // daemon 存活探测的地址。取不到（runtime 目录不可用）就没有可探的目标，此后
+    // 的探测一律当作「已失联」——孤儿必须能有界退出。
+    let daemon = superpowers_kanban_ipc::client::socket_path(&args.runtime_dir)
+        .ok()
+        .map(BoardDaemon::new)
+        .map(Arc::new);
+
     let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
     // 推进循环与查询服务共享同一实例，槽位租约与看板状态因此只有一份真相。
     let service = Arc::new(BoardService::new(
@@ -389,7 +411,18 @@ fn run_daemon(args: Args) {
     // 查询通道与推进循环互不阻塞：宿主问状态时队列照常在动。
     let _query_server = start_query_server(Arc::clone(&service), &args.state_dir);
 
+    let mut liveness = superpowers_kanban_runner::single_instance::Liveness::default();
     loop {
+        // 先探 daemon，且必须在开关判断之前：开关关闭的孤儿走 `continue` 分支，
+        // 若把探测放在其后，它永远发现不了 daemon 已死，会一直占着单实例锁。
+        // 阈值 3 × 10s ≈ 30s 让位窗口。
+        let alive = daemon.as_ref().is_some_and(|daemon| daemon.is_alive());
+        if liveness.observe(alive, 3) {
+            eprintln!(
+                "superpowers-kanban: daemon is gone; exiting so a fresh instance can take over"
+            );
+            std::process::exit(0);
+        }
         if !board_switch(&args.state_dir).is_enabled() {
             // 关掉开关只停止推进，绝不取消已在跑的会话。
             std::thread::sleep(args.interval);

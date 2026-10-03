@@ -216,7 +216,8 @@ mod tests {
         let deep_temp = long_state_dir().join(".yi-agent/.yi-agent/.yi-agent");
         let direct = long_query_socket();
         assert!(
-            deep_temp.join("plugin-0000000000000000.sock")
+            deep_temp
+                .join("plugin-0000000000000000.sock")
                 .as_os_str()
                 .len()
                 > MAX_SOCKET_PATH_BYTES,
@@ -224,13 +225,23 @@ mod tests {
         );
 
         assert!(
-            resolve(&direct, direct.as_os_str().as_encoded_bytes(), "plugin-", &deep_temp)
-                .is_err(),
+            resolve(
+                &direct,
+                direct.as_os_str().as_encoded_bytes(),
+                "plugin-",
+                &deep_temp
+            )
+            .is_err(),
             "回退后仍超长必须报错，不能静默返回一条 bind 不上的路径"
         );
         assert!(
-            resolve(&direct, direct.as_os_str().as_encoded_bytes(), "plugin-", &std::env::temp_dir())
-                .is_ok(),
+            resolve(
+                &direct,
+                direct.as_os_str().as_encoded_bytes(),
+                "plugin-",
+                &std::env::temp_dir()
+            )
+            .is_ok(),
             "正常 temp dir 必须成功"
         );
     }
