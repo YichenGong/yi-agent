@@ -200,6 +200,43 @@ impl Broadcaster {
         });
     }
 
+    /// 按 thread 键**带背压**扇出：reliable 客户端 `await` 入队（队列满即等，
+    /// 不丢帧）；非 reliable 客户端维持 `try_send`，满则从注册表移除（ws 既有语义）。
+    ///
+    /// 只用于历史回放等「必须完整送达本地客户端」的批量下发；实时流仍用
+    /// [`Self::broadcast_for`]。
+    ///
+    /// 返回 `Err(Closed)` 表示有 reliable 客户端的出站队列已关闭（对端真死）；
+    /// 已投递的帧不受影响。持锁阶段只克隆 `(id, reliable, tx)`，不跨 `.await`。
+    pub async fn broadcast_await(&self, key: Option<&str>, frame: Value) -> Result<(), Closed> {
+        let targets: Vec<(ClientId, bool, mpsc::Sender<Value>)> = {
+            let guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+            guard
+                .iter()
+                .filter(|(_, c)| c.feed.accepts(key))
+                .map(|(id, c)| (id.clone(), c.reliable, c.tx.clone()))
+                .collect()
+        };
+        let mut closed = false;
+        let mut to_remove: Vec<ClientId> = Vec::new();
+        for (id, reliable, tx) in targets {
+            if reliable {
+                if tx.send(frame.clone()).await.is_err() {
+                    closed = true;
+                }
+            } else if tx.try_send(frame.clone()).is_err() {
+                to_remove.push(id);
+            }
+        }
+        if !to_remove.is_empty() {
+            let mut guard = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+            for id in to_remove {
+                guard.remove(&id);
+            }
+        }
+        if closed { Err(Closed) } else { Ok(()) }
+    }
+
     /// 只发给指定客户端。
     ///
     /// 与 `broadcast` 不同,这里 `await` 到**入队**成功为止——即等到帧进入该
@@ -224,6 +261,7 @@ impl Broadcaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]
@@ -419,5 +457,32 @@ mod tests {
         hub.broadcast_for(None, serde_json::json!({"n": 2}));
         assert_eq!(rx.recv().await.unwrap()["n"], 2);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn broadcast_await_does_not_drop_frames_for_a_reliable_client() {
+        let hub = Broadcaster::new();
+        let id = ClientId::local();
+        // reliable:队列满时必须背压等待,而不是丢帧。
+        let mut rx = hub.register_reliable(id);
+        let total = CLIENT_QUEUE + 32;
+        let hub2 = Arc::new(hub);
+        let h = Arc::clone(&hub2);
+        // 边发边收另一路:把发送放到任务里,主测线程持续收,模拟 pump 抽干队列。
+        let sender = tokio::spawn(async move {
+            for i in 0..total {
+                h.broadcast_await(None, serde_json::json!({ "n": i }))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut got = Vec::new();
+        for _ in 0..total {
+            got.push(rx.recv().await.unwrap()["n"].as_u64().unwrap());
+        }
+        sender.await.unwrap();
+        assert_eq!(got.len(), total, "reliable client must receive every frame");
+        assert_eq!(got[0], 0);
+        assert_eq!(*got.last().unwrap(), (total - 1) as u64);
     }
 }
