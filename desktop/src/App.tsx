@@ -28,6 +28,7 @@ import type {
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
+import { nextReconnectDelay } from "./lib/reconnect";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanCollapsedBar } from "./components/SuperpowersKanbanCollapsedBar";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
@@ -729,6 +730,52 @@ export default function App() {
     inited.current = true;
     let disposed = false;
     let restartTimer: number | null = null;
+    // 连续失败次数：第一次断开排 500ms,此后按 1s/2s/4s/8s 翻倍(封顶 10s)。
+    // 握手成功即清零,所以偶尔一次闪断不会让下一次重连背负更大的延迟。
+    let attempt = 0;
+
+    // 断开后的重连入口：清掉可能已在途的定时器,立刻建客户端重试。前台唤醒
+    // 用它做即时重连,exited 处理则用 scheduleReconnect 排队。
+    const reconnectNow = () => {
+      if (disposed) return;
+      if (restartTimer !== null) {
+        window.clearTimeout(restartTimer);
+        restartTimer = null;
+      }
+      let next: RpcClient;
+      try {
+        next = connect();
+      } catch (e) {
+        // 建 transport 本身也可能同步抛(落盘 URL 格式坏掉时 `withToken` 里的
+        // `new URL` 就会):这同样是"连不上",必须继续退避,否则循环就此死掉。
+        setStatus(`error: ${formatError(e)}`);
+        scheduleReconnect();
+        return;
+      }
+      void handshake(next);
+    };
+
+    // 退避排队：只要组件还挂着就绝不停下重试,后端没起来也不会一直卡在 connecting。
+    const scheduleReconnect = () => {
+      if (disposed || restartTimer !== null) return;
+      restartTimer = window.setTimeout(() => {
+        restartTimer = null;
+        reconnectNow();
+      }, nextReconnectDelay(attempt));
+      attempt += 1;
+    };
+
+    // iOS 从后台切回前台时 socket 常已被系统静默掐断,状态不会自己回来。
+    // 前台唤醒一律重建客户端重连:延迟在这条路径上毫无价值。这里故意不看
+    // `connected`——被后台掐断的 socket 可能没有 close/exited 事件,于是那个
+    // 标志会陈旧地停在 true(半开连接),信它就会把恰恰要修的场景漏过去。
+    // 只在可见性事件上触发,正常会话不受影响;reconnectNow 先清在途定时器,
+    // 再替换当前客户端,因此不会并发两条连接。
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== "visible" || disposed) return;
+      attempt = 0;
+      reconnectNow();
+    };
 
     // 注册每个客户端的通知/审批/状态回调。sidecar 重启后会换一个新客户端,
     // 这些回调必须随新客户端重新登记(旧客户端的 transport 已随管道断开)。
@@ -772,18 +819,13 @@ export default function App() {
         // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
         // warm 缓存,免得切回旧对话时跳过 resume(新进程并不记得任何会话)。
         if (s.state === "exited" && !disposed) {
+          // 这次握手已经废了:重新从 base 起算退避(handshake 成功时本就会归零,
+          // 这里针对的是"连上后立刻断"——attempt 不能被永久抬到高位)。
           warm.current.clear();
           // 同样的理由:新进程不记得任何订阅,窗口必须清空,否则重连后
           // 返回"看起来还 warm"的会话时不会再发 subscribe,内容通知被静默过滤。
           subWindow.current = new SubscriptionWindow();
-          if (restartTimer === null) {
-            restartTimer = window.setTimeout(() => {
-              restartTimer = null;
-              if (disposed) return;
-              const next = connect();
-              void handshake(next);
-            }, 500);
-          }
+          scheduleReconnect();
         }
       });
     };
@@ -822,6 +864,8 @@ export default function App() {
         const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
         if (first) await selectThread(first.thread_id);
         // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
+        // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
+        attempt = 0;
         setStatus("connected");
         // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
         // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
@@ -842,11 +886,14 @@ export default function App() {
     };
 
     void handshake(connect());
+    // 手机/iPad 切回前台时 socket 多半已被系统掐断,而状态不会自己回来。
+    document.addEventListener("visibilitychange", onVisibilityChange);
     // 看板内容由 boardTick 每 2 秒刷新选中项目，读失败绝不影响主流程。
     const boardTimer = window.setInterval(() => boardTick.current(), 2000);
     return () => {
       disposed = true;
       if (restartTimer !== null) window.clearTimeout(restartTimer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       window.clearInterval(boardTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
