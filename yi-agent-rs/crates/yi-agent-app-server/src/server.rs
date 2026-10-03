@@ -2162,19 +2162,22 @@ where
 
                         // `relay_url`（桌面设置页）：与 theme 各写各的键，共处一个
                         // 文件，故两条路径都走 settings_store 的读-改-写。
-                        // `null` / 空 / 空白 → 清除该键。
+                        // `null` / 空 / 空白 → 清除该键。非串非 null（客户端写错
+                        // 类型）不改动既有配置——静默清除是破坏性的。
                         if let Some(value) = req.params.get("relay_url") {
-                            let workdir = theme_handle.workdir();
-                            if let Err(error) =
-                                crate::settings_store::save_relay_url(workdir, value.as_str())
-                            {
-                                write_response(
-                                    &hub,
-                                    &client,
-                                    err_response(id, RpcError::internal(error.to_string())),
-                                )
-                                .await?;
-                                continue;
+                            if value.is_null() || value.is_string() {
+                                let workdir = theme_handle.workdir();
+                                if let Err(error) =
+                                    crate::settings_store::save_relay_url(workdir, value.as_str())
+                                {
+                                    write_response(
+                                        &hub,
+                                        &client,
+                                        err_response(id, RpcError::internal(error.to_string())),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
                             }
                         }
 
@@ -11788,6 +11791,31 @@ pub(crate) mod tests {
             );
             h.shutdown().await;
         }
+    }
+
+    /// 写错类型（非串非 null）不改动既有配置：静默清除是破坏性的。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_ignores_a_mistyped_relay_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        crate::settings_store::save_relay_url(dir.path(), Some("wss://r/connect?session=x"))
+            .unwrap();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":5}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["result"]["ok"], true, "{v}");
+        assert_eq!(
+            crate::settings_store::load_relay_url(dir.path()).as_deref(),
+            Some("wss://r/connect?session=x"),
+            "a mistyped field must not wipe the stored url"
+        );
+        h.shutdown().await;
     }
 
     /// 只有 `relay_url` 的写不能影响 theme：两者共处一个文件。
