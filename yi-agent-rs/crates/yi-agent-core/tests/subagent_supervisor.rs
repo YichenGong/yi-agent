@@ -4,13 +4,14 @@ use futures::future::BoxFuture;
 use std::time::Duration;
 
 use serde_json::json;
+use tracing_subscriber::layer::SubscriberExt as _;
 use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind};
 use yi_agent_core::subagent::supervisor::{
-    AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools,
+    AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools, WorkerStartError,
 };
 use yi_agent_core::subagent::task::{
     DeliveryReport, InheritedSandbox, IntegrationValidation, PauseReason, PermissionRequestId,
-    RootSessionId, TaskDepth, TaskId, TaskState,
+    RecoveryEvidence, RootSessionId, TaskDepth, TaskId, TaskEvent, TaskState,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, SpawnRequest, WorkerError, WorkerHandle, WorkerStart,
@@ -65,10 +66,14 @@ async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
 /// A coding child delivers a commit to its parent over the mailbox. If that
 /// parent is already terminal (a recovered root is parked in
 /// `recovery_required`, which is terminal), the notification can never be
-/// accepted — but that is not the child's fault and must not throw away the
-/// child's completion fact. Before the fix this `Delivered` event failed, the
-/// error aborted the whole reconciliation pass, and the child stayed `running`
-/// forever with no completion event.
+/// accepted. Under the cascade design a settled parent must not keep running
+/// children at all — any live child is cancelled, and a delivery that has no
+/// remaining audience is not kept around. So this test no longer asserts the
+/// child parks in `AwaitingParentReview`; what it still guards is the weaker
+/// but essential invariant that reconciliation never wedges, whether or not the
+/// delivery happens to be accepted before the cascade lands. Before the fix this
+/// `Delivered` event failed, the error aborted the whole reconciliation pass,
+/// and the child stayed `running` forever with no completion event.
 #[tokio::test]
 async fn a_coding_delivery_to_a_terminal_parent_does_not_wedge_reconciliation() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
@@ -103,11 +108,8 @@ async fn a_coding_delivery_to_a_terminal_parent_does_not_wedge_reconciliation() 
         "a delivery to a terminal parent must not wedge reconciliation, got {reconciled:?}"
     );
     assert!(
-        matches!(
-            supervisor.task(&child).unwrap().state(),
-            TaskState::AwaitingParentReview(_)
-        ),
-        "the child's delivery must still be recorded, got {:?}",
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "a child of a settled parent must not keep running, got {:?}",
         supervisor.task(&child).unwrap().state()
     );
 }
@@ -809,6 +811,61 @@ async fn worker_startup_failure_is_recorded_after_admission_without_a_handle() {
     ));
 }
 
+/// A factory start failure on a task with live descendants must hand the
+/// cascade victims to the caller. The descendants have already had their
+/// workers removed, so no reconcile event can ever report them again: a caller
+/// that discards the list strands them mid-flight.
+#[tokio::test]
+async fn a_factory_start_failure_reports_the_cascaded_descendants_it_cancelled() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCollectingWorkerFactory::default();
+    supervisor.start_worker(&factory, &root).await.unwrap();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+
+    // Pause the root, deliver the acknowledgement, then resume: pausing is not
+    // terminal, so the live child survives and the root re-enters the factory.
+    supervisor
+        .pause_task(&root, PauseReason("paused for the test".into()))
+        .unwrap();
+    factory.handle_for(&root).unwrap().report_paused();
+    supervisor.reconcile_worker_events().unwrap();
+    assert!(matches!(
+        supervisor.task(&root).unwrap().state(),
+        TaskState::Paused(_)
+    ));
+    assert!(
+        !supervisor.task(&child).unwrap().state().is_terminal(),
+        "the fixture needs a live descendant when the parent re-enters the factory"
+    );
+
+    supervisor.resume_task(&root).unwrap();
+    let outcome = supervisor.start_worker(&FailingWorkerFactory, &root).await;
+    let affected = match outcome {
+        Err(WorkerStartError::Factory { affected, .. }) => affected,
+        other => panic!("expected a factory failure carrying its cascade, got {other:?}"),
+    };
+    assert_eq!(affected.first(), Some(&root));
+    assert!(
+        affected.contains(&child),
+        "the factory failure must report the cascaded child so the caller persists it, got {affected:?}"
+    );
+    assert!(
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "the child was cancelled in memory"
+    );
+    // Even if the cancelled child's worker reports an event, `reconcile` skips it
+    // because its in-memory state is already terminal. Nothing downstream will
+    // ever report this row again, so the caller must consume `affected` itself.
+    factory.handle_for(&child).unwrap().report_cancelled();
+    let reconciled = supervisor.reconcile_worker_events().unwrap();
+    assert!(
+        !reconciled.contains(&child),
+        "reconcile must not be expected to report the cascaded child, got {reconciled:?}"
+    );
+}
+
 #[tokio::test]
 async fn supervisor_reduces_worker_failure_events_and_releases_the_handle() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
@@ -1178,5 +1235,181 @@ fn worker_start_carries_inherited_sandbox_from_supervisor() {
     assert_eq!(
         supervisor.inherited_sandbox(&child),
         Some(InheritedSandbox::DangerFullAccess)
+    );
+}
+
+#[test]
+fn failing_a_parent_cascades_its_live_child_to_terminal() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    supervisor.start_task(&root).unwrap();
+    supervisor.start_task(&child).unwrap();
+
+    let affected = supervisor.fail_task(&root, "worker crashed").unwrap();
+    assert_eq!(
+        affected.first(),
+        Some(&root),
+        "the failed task itself is always the first affected id"
+    );
+    assert!(
+        affected.contains(&child),
+        "the returned id list must carry the cascaded child, got {affected:?}"
+    );
+
+    assert!(
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "the live child must be cascaded to terminal, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+    assert!(
+        matches!(
+            supervisor.task(&child).unwrap().state(),
+            TaskState::Cancelled(_)
+        ),
+        "cascade must cancel the child, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+}
+
+#[test]
+fn non_recursive_cancel_still_reports_descendants_cascaded_in_memory() {
+    // Regression lock for the cascade choke point: cancelling a task with a
+    // live grandchild via `cancel_task_tree(&id, /*recursive=*/ false)` reduces
+    // only the target, but that reduction settles the target and therefore
+    // cascades to its live descendants in memory. Those victims must appear in
+    // the returned id list, otherwise the coordinator silently drops them: it
+    // only persists and releases leases for ids it is told about.
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let grandchild = supervisor.spawn(child.clone()).unwrap();
+    supervisor.start_task(&root).unwrap();
+    supervisor.start_task(&child).unwrap();
+    supervisor.start_task(&grandchild).unwrap();
+
+    let affected = supervisor.cancel_task_tree(&root, false).unwrap();
+
+    assert!(
+        affected.contains(&root),
+        "the cancelled target must be reported, got {affected:?}"
+    );
+    assert!(
+        affected.contains(&child),
+        "a descendant cascaded in memory must be reported, got {affected:?}"
+    );
+    assert!(
+        affected.contains(&grandchild),
+        "a grandchild cascaded in memory must be reported, got {affected:?}"
+    );
+    assert!(
+        matches!(
+            supervisor.task(&grandchild).unwrap().state(),
+            TaskState::Cancelled(_)
+        ),
+        "the grandchild must actually be cancelled, got {:?}",
+        supervisor.task(&grandchild).unwrap().state()
+    );
+}
+
+/// Test-time capture of WARN-level log messages emitted while the test's
+/// default subscriber is installed. Used to lock the cascade warning behavior.
+#[derive(Clone, Default)]
+struct CaptureWarns(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureWarns {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        struct V(String);
+        impl tracing::field::Visit for V {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut v = V(String::new());
+        event.record(&mut v);
+        self.0.lock().unwrap().push(v.0);
+    }
+}
+
+#[tokio::test]
+async fn a_completed_parent_with_a_live_child_warns_and_cascades() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    let factory = HandleCapturingWorkerFactory::default();
+    supervisor.start_worker(&factory, &child).await.unwrap();
+
+    let captured = CaptureWarns::default();
+    let subscriber = tracing_subscriber::registry().with(captured.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // The root completes normally while the child is still running.
+    supervisor.start_task(&root).unwrap();
+    supervisor
+        .reduce_task(
+            &root,
+            TaskEvent::WorkerCompletedNoChanges {
+                attempt_id: supervisor.task(&root).unwrap().active_attempt_id().clone(),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        supervisor.task(&child).unwrap().state().is_terminal(),
+        "the live child must be cascaded, got {:?}",
+        supervisor.task(&child).unwrap().state()
+    );
+    assert!(
+        captured
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| m.contains("live descendants")),
+        "a successful terminal with a live child must warn, got {:?}",
+        captured.0.lock().unwrap()
+    );
+}
+
+#[test]
+fn a_recovery_required_parent_does_not_cascade() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let root = supervisor.root_task_id().clone();
+    let child = supervisor.spawn(root.clone()).unwrap();
+    supervisor.start_task(&root).unwrap();
+    supervisor.start_task(&child).unwrap();
+
+    let attempt_id = supervisor.task(&root).unwrap().active_attempt_id().clone();
+    supervisor
+        .reduce_task(
+            &root,
+            TaskEvent::RuntimeInterrupted {
+                attempt_id,
+                evidence: RecoveryEvidence("safe checkpoint grace deadline elapsed".into()),
+            },
+        )
+        .unwrap();
+
+    assert!(
+        matches!(
+            supervisor.task(&root).unwrap().state(),
+            TaskState::RecoveryRequired(_)
+        ),
+        "fixture requires a recovery-required root, got {:?}",
+        supervisor.task(&root).unwrap().state()
+    );
+    assert!(
+        !supervisor.task(&child).unwrap().state().is_terminal(),
+        "recovery-required must not cascade, got {:?}",
+        supervisor.task(&child).unwrap().state()
     );
 }
