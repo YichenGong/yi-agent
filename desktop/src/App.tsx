@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
+import { useIsMobile } from "./lib/useIsMobile";
 import { RpcClient } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
@@ -128,6 +129,9 @@ export default function App() {
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
   const [railCollapsed, setRailCollapsed] = useState(false);
+  // 手机端：会话侧栏与子 agent 栏是抽屉，不是常驻列，否则聊天区被挤到看不清。
+  const isMobile = useIsMobile();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   // 打开的详情:进入栈 + 该栈顶任务的轨迹行。栈让"子任务再进入"可退回,
   // 与 TUI 页签同一语义。
   const [detailStack, setDetailStack] = useState<string[]>([]);
@@ -368,6 +372,8 @@ export default function App() {
   const selectThread = async (id: string) => {
     store.select(id);
     setCurrentId(id);
+    // 手机端选中会话即收起抽屉，把宽度让回聊天区。
+    if (isMobile) setSidebarOpen(false);
     force((v) => v + 1);
     // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
     void refreshSubagents(id);
@@ -1009,6 +1015,26 @@ export default function App() {
       <div className="flex h-screen flex-col bg-surface text-fg">
         <TitleBar />
         <div className="flex min-h-0 flex-1 flex-row">
+        {isMobile && (
+          <button
+            type="button"
+            aria-label="会话列表"
+            onClick={() => setSidebarOpen(true)}
+            className="app-mobile-toggle flex w-8 shrink-0 items-start justify-center border-r border-line bg-panel pt-2 text-fg-muted hover:text-fg"
+          >
+            <svg viewBox="0 0 16 16" className="size-4" fill="currentColor" aria-hidden="true">
+              <path d="M2 4h12v1.5H2V4Zm0 3.25h12v1.5H2v-1.5ZM2 10.5h12V12H2v-1.5Z" />
+            </svg>
+          </button>
+        )}
+        {isMobile && sidebarOpen && (
+          <div
+            className="app-sidebar-backdrop"
+            aria-hidden="true"
+            onClick={() => setSidebarOpen(false)}
+          />
+        )}
+        <div className={isMobile ? `app-sidebar${sidebarOpen ? " sidebar-open" : ""}` : undefined}>
         <ThreadSidebar
           groups={groups}
           workspaces={workspaces}
@@ -1032,6 +1058,7 @@ export default function App() {
           onOpenBoard={onOpenBoard}
           onOpenSettings={() => setSettingsOpen(true)}
         />
+        </div>
         <div className="relative flex min-w-0 flex-1 flex-col">
           {/* 看板是主区域的一个视图，不是一个常驻列：选中才出现，且问的是
               被选中那个项目。没有选中时主区域还是原来的对话。 */}
@@ -1164,7 +1191,7 @@ export default function App() {
             />
           )}
         </div>
-        {currentId && !railCollapsed && (
+        {currentId && !railCollapsed && !isMobile && (
           <SubagentRail
             rows={railStore.get(currentId)}
             selectedTaskId={openSubagent}

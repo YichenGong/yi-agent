@@ -71,3 +71,38 @@
   --tw-prose-th-borders: var(--line-strong);
   --tw-prose-td-borders: var(--line);
 }
+
+/*
+ * 手机端（配对后的 iPhone 客户端）布局。
+ *
+ * 桌面是两列常驻：会话侧栏固定 256px、子 agent 栏 288px，390pt 的屏幕上聊天区
+ * 只剩百来像素。`<html data-mobile="true">` 时把会话侧栏变成左侧抽屉：
+ * `position: fixed` 让它脱离文档流（不再挤占聊天区宽度），默认 `translateX(-100%)`
+ * 移出屏幕，`.sidebar-open` 才滑入。节点始终留在 DOM 里，桌面的宽度拖拽与既有
+ * 测试不受影响；桌面不匹配该选择器，布局逐字节不变。
+ */
+[data-mobile="true"] .app-sidebar {
+  position: fixed;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 30;
+  transform: translateX(-100%);
+  transition: transform 0.2s ease;
+}
+[data-mobile="true"] .app-sidebar.sidebar-open {
+  transform: translateX(0);
+}
+
+/* 抽屉展开时的背板，点它收起；只在手机端抽屉打开时渲染，故无需前缀。 */
+.app-sidebar-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  background: rgb(0 0 0 / 0.5);
+}
+
+/* 手机端的抽屉开关按钮；桌面端不渲染该节点，这里只处理安全区留白。 */
+.app-mobile-toggle {
+  padding-top: env(safe-area-inset-top, 0px);
+}
