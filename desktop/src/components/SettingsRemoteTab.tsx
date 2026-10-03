@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import QRCode from "qrcode";
-import { buildPairUri } from "../lib/pairUri";
+import { buildPairUri, phoneRelayUrl } from "../lib/pairUri";
 
 /**
  * 桌面「远程访问」设置页。
@@ -108,6 +108,8 @@ export function SettingsRemoteTab({
   }, []);
 
   // 配对码旁的二维码：码与中继地址都就绪才渲染。地址为空时退回纯文本码（降级）。
+  // 二维码要装的是**手机侧**端点：字段里填的是电脑侧 `/connect`，手机得连 `/ws`，
+  // 故派生后再编码（两路由不同，原样塞会让手机注册成 agent）。派生失败则退回原值。
   const [qrSvg, setQrSvg] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
@@ -115,7 +117,8 @@ export function SettingsRemoteTab({
       setQrSvg(null);
       return;
     }
-    QRCode.toString(buildPairUri(relayUrl.trim(), code), { type: "svg", margin: 1 })
+    const phone = phoneRelayUrl(relayUrl.trim()) ?? relayUrl.trim();
+    QRCode.toString(buildPairUri(phone, code), { type: "svg", margin: 1 })
       .then((svg) => {
         if (!cancelled) setQrSvg(svg);
       })
@@ -190,8 +193,9 @@ export function SettingsRemoteTab({
     <section className="p-5">
       <h2 className="text-sm font-medium text-fg">远程访问</h2>
       <p className="mt-2 text-xs text-fg-subtle">
-        把下面的中继地址与配对码填进手机端的配对表单即可连接本机。中继地址填中继的
-        <strong>电脑侧端点</strong>（<code>…/connect?session=…</code>），保存后由本机侧车使用。
+        扫下面的二维码即可让手机按<strong>手机侧端点</strong>（<code>…/ws?session=…</code>）配对；
+        也可手填配对码与手机侧地址。下面输入框填的是中继的<strong>电脑侧端点</strong>
+        （<code>…/connect?session=…</code>），保存后由本机侧车使用。
       </p>
 
       <div className="mt-4">
