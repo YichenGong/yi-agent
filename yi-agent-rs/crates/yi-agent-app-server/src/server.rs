@@ -1049,6 +1049,30 @@ fn plugin_query(
     }
 }
 
+/// 已装插件的一行。宿主不解释任何插件语义：`name`/`switch_key` 原样来自清单，
+/// `queryable` 只是「该清单声明了 query_socket」。
+pub(crate) struct PluginSummary {
+    pub name: String,
+    pub queryable: bool,
+    pub switch_key: String,
+}
+
+/// 列出 `<workdir>/.yi-agent/supervisors/` 下的插件清单。
+///
+/// 纯文件读取：daemon 没起也能列。目录缺失或清单损坏都只是「少一个插件」，
+/// 不是错误——一个坏清单不该让整个设置页打不开。
+pub(crate) fn list_installed_plugins(workdir: &Path) -> Vec<PluginSummary> {
+    let dir = workdir.join(".yi-agent").join("supervisors");
+    yi_agent_supervisors::manifest::load_manifests(&dir)
+        .into_iter()
+        .map(|manifest| PluginSummary {
+            name: manifest.name,
+            queryable: manifest.query_socket.is_some(),
+            switch_key: manifest.switch_key,
+        })
+        .collect()
+}
+
 /// The supervised plugin that owns the board.
 const KANBAN_PLUGIN: &str = "superpowers-kanban";
 
@@ -2257,6 +2281,21 @@ where
                                 .await?
                             }
                         }
+                    }
+                    "plugins/list" => {
+                        let workdir = theme_handle.workdir();
+                        let plugins: Vec<serde_json::Value> = list_installed_plugins(workdir)
+                            .into_iter()
+                            .map(|plugin| {
+                                json!({
+                                    "name": plugin.name,
+                                    "queryable": plugin.queryable,
+                                    "switch_key": plugin.switch_key,
+                                })
+                            })
+                            .collect();
+                        write_response(&hub, &client, ok_response(id, json!({ "plugins": plugins })))
+                            .await?;
                     }
                     "board/create" => {
                         let Some(project) = project_arg(&req.params) else {
@@ -6305,6 +6344,42 @@ mod plugin_query_tests {
         );
         assert_eq!(value["error"]["code"], -32020, "{value}");
         h.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod plugins_tests {
+    use super::list_installed_plugins;
+
+    #[test]
+    fn an_absent_supervisors_directory_lists_no_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(list_installed_plugins(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_manifest_with_a_query_socket_is_queryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = dir.path().join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("superpowers-kanban.json"),
+            r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban","query_socket":"{state_dir}/superpowers-kanban.sock"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            sup.join("plain.json"),
+            r#"{"name":"plain","command":"y","switch_key":"plain_on"}"#,
+        )
+        .unwrap();
+        let mut plugins = list_installed_plugins(dir.path());
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        assert_eq!(plugins.len(), 2);
+        assert_eq!(plugins[0].name, "plain");
+        assert!(!plugins[0].queryable);
+        assert_eq!(plugins[1].name, "superpowers-kanban");
+        assert!(plugins[1].queryable);
+        assert_eq!(plugins[1].switch_key, "superpowers_kanban");
     }
 }
 
