@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
+use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
 use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
@@ -28,7 +29,6 @@ use crate::protocol::{
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
 };
-use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
@@ -1074,6 +1074,12 @@ pub(crate) fn board_query(
 pub(crate) struct BoardCard {
     pub id: String,
     pub state: String,
+    /// 卡片种类；旧/缺省卡片视为实现卡。
+    pub kind: String,
+    /// 合并卡的源分支。
+    pub source: Option<String>,
+    /// 合并卡的目标分支。
+    pub base: Option<String>,
     pub thread_id: Option<String>,
     pub workdir: Option<PathBuf>,
     pub spec_path: String,
@@ -1082,27 +1088,35 @@ pub(crate) struct BoardCard {
     pub plan_path: String,
 }
 
-/// Every card on the board, dropped to the fields the desktop works with.
+/// Parse a `list` payload into the cards the host works with.
 ///
-/// A malformed entry (one with no `id` or `state`) is skipped rather than
-/// failing the whole call: a single bad card must not blank the board. A
-/// missing `cards` key reads as an empty board.
-pub(crate) fn board_cards(
-    project: &Path,
-    board_dir: &Path,
-) -> Result<Vec<BoardCard>, BoardQueryError> {
-    let value = board_query(project, board_dir, "list", json!({}))?;
+/// Split out of `board_cards` so the mapping (including the `kind` default for
+/// old cards that carry no `kind`) is testable without a live daemon.
+pub(crate) fn parse_board_cards(value: &serde_json::Value) -> Vec<BoardCard> {
     let cards = value
         .get("cards")
         .and_then(serde_json::Value::as_array)
         .cloned()
         .unwrap_or_default();
-    Ok(cards
+    cards
         .into_iter()
         .filter_map(|card| {
             Some(BoardCard {
                 id: card.get("id")?.as_str()?.to_string(),
                 state: card.get("state")?.as_str()?.to_string(),
+                kind: card
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("implementation")
+                    .to_string(),
+                source: card
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                base: card
+                    .get("base")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
                 thread_id: card
                     .get("thread_id")
                     .and_then(serde_json::Value::as_str)
@@ -1123,7 +1137,20 @@ pub(crate) fn board_cards(
                     .to_string(),
             })
         })
-        .collect())
+        .collect()
+}
+
+/// Every card on the board, dropped to the fields the desktop works with.
+///
+/// A malformed entry (one with no `id` or `state`) is skipped rather than
+/// failing the whole call: a single bad card must not blank the board. A
+/// missing `cards` key reads as an empty board.
+pub(crate) fn board_cards(
+    project: &Path,
+    board_dir: &Path,
+) -> Result<Vec<BoardCard>, BoardQueryError> {
+    let value = board_query(project, board_dir, "list", json!({}))?;
+    Ok(parse_board_cards(&value))
 }
 
 /// The project a `board/*` request names, canonicalized when the directory
@@ -4976,14 +5003,8 @@ async fn card_scheduler_tick<F>(
             workspaces,
             build_agent,
         };
-        crate::card_scheduler::run_once(
-            &board.project,
-            board_dir,
-            tracked,
-            &mut launcher,
-            &flags,
-        )
-        .await;
+        crate::card_scheduler::run_once(&board.project, board_dir, tracked, &mut launcher, &flags)
+            .await;
     }
 }
 
@@ -5081,9 +5102,7 @@ where
         if !request.title.is_empty() {
             if let Some(session) = self.threads.get(&thread_id) {
                 if let Err(error) = session.store.rename(&thread_id, &request.title) {
-                    eprintln!(
-                        "[app-server] could not title board thread {thread_id}: {error}"
-                    );
+                    eprintln!("[app-server] could not title board thread {thread_id}: {error}");
                 }
             }
         }
@@ -6144,8 +6163,8 @@ mod card_scheduling_tests {
     impl FakeDaemon {
         fn bind(
             on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
-                + Send
-                + 'static,
+            + Send
+            + 'static,
         ) -> Self {
             let dir = tempfile::TempDir::new().unwrap();
             let project = dir.path().join("project");
@@ -6333,7 +6352,10 @@ mod card_scheduling_tests {
                     return self.is_idle(thread_id);
                 }
                 match tokio::time::timeout(remaining, self.turn_rx.recv()).await {
-                    Ok(Some(TurnEvent::Finished { thread_id: id, turn_id })) => {
+                    Ok(Some(TurnEvent::Finished {
+                        thread_id: id,
+                        turn_id,
+                    })) => {
                         if let Some(session) = self.threads.get_mut(&id) {
                             if session.active_turn_id.as_deref() == Some(turn_id.as_str()) {
                                 session.active_turn_id = None;
@@ -6399,7 +6421,10 @@ mod card_scheduling_tests {
         };
 
         assert_eq!(host.threads.len(), 1, "the board thread is registered");
-        let session = host.threads.get(&thread_id).expect("the session is visible");
+        let session = host
+            .threads
+            .get(&thread_id)
+            .expect("the session is visible");
         assert_eq!(session.cwd, workdir.to_string_lossy());
         assert!(
             session.active_turn_id.is_some(),
@@ -6561,7 +6586,11 @@ mod card_scheduling_tests {
                     ) && session.active_turn_id.is_none();
                     table.insert(
                         id.clone(),
-                        ThreadFlags { idle, failed: false, needs_you: false },
+                        ThreadFlags {
+                            idle,
+                            failed: false,
+                            needs_you: false,
+                        },
                     );
                 }
             }
@@ -6589,7 +6618,10 @@ mod card_scheduling_tests {
             terminal[0]["params"]["outcome"], "awaiting_merge",
             "failed/needs_you have no production source yet, so awaiting_merge is the only outcome"
         );
-        assert!(tracked.is_empty(), "the reconciled card stops being tracked");
+        assert!(
+            tracked.is_empty(),
+            "the reconciled card stops being tracked"
+        );
     }
 
     /// 孤儿恢复:插件报 `running` 但**没有 thread_id**(本进程无法接手)的卡被
@@ -6619,6 +6651,20 @@ mod card_scheduling_tests {
         );
         assert_eq!(terminal[0]["params"]["card_id"], "orphan");
         assert_eq!(terminal[0]["params"]["outcome"], "needs_you");
+    }
+
+    #[test]
+    fn board_cards_parses_a_merge_card_and_defaults_the_kind() {
+        // 直接喂一个假 `list` 结果给解析逻辑（与现有 board_cards 测试同款做法）。
+        let cards = serde_json::json!({ "cards": [
+            { "id": "m1", "state": "queued", "kind": "merge", "source": "kanban/a", "base": "main" },
+            { "id": "impl", "state": "queued", "spec_path": "i.spec.md", "plan_path": "i.plan.md" }
+        ]});
+        let parsed = parse_board_cards(&cards);
+        assert_eq!(parsed[0].kind, "merge");
+        assert_eq!(parsed[0].source.as_deref(), Some("kanban/a"));
+        assert_eq!(parsed[1].kind, "implementation");
+        assert_eq!(parsed[1].source, None);
     }
 
     /// 真主循环接线:启动 `serve` 后,3s tick(首个立即触发)把看板卡起成会话
@@ -11832,7 +11878,10 @@ pub(crate) mod tests {
             .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["relay_url"], json!(null), "{v}");
-        assert!(v["result"].get("relay_url").is_some(), "key must be present: {v}");
+        assert!(
+            v["result"].get("relay_url").is_some(),
+            "key must be present: {v}"
+        );
         h.shutdown().await;
     }
 
@@ -11918,10 +11967,8 @@ pub(crate) mod tests {
         let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
         initialize(&mut h).await;
 
-        h.send(
-            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":5}}"#,
-        )
-        .await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":5}}"#)
+            .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["ok"], true, "{v}");
         assert_eq!(
