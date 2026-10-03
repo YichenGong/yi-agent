@@ -24,6 +24,7 @@ use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
     RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, ThreadStatus,
+    TurnStatus,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
@@ -2705,6 +2706,20 @@ where
                                     output_tokens: u.output_tokens,
                                     cache_creation_input_tokens: u.cache_creation_input_tokens,
                                     cache_read_input_tokens: u.cache_read_input_tokens,
+                                },
+                            )
+                            .await?;
+                        }
+                        // 末尾若是崩溃残留的未收尾 turn，补一条 interrupted 标记，
+                        // 让客户端把它显示为"这一轮被中断"，而不是当成正常轮次。
+                        if loaded.pending_turn {
+                            write_notification(
+                                &hub,
+                                &Notification::TurnCompleted {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: "crashed".to_string(),
+                                    status: TurnStatus::Interrupted,
+                                    error: None,
                                 },
                             )
                             .await?;
@@ -10056,6 +10071,95 @@ pub(crate) mod tests {
             "missing core message: {text}"
         );
 
+        h.shutdown().await;
+    }
+
+    /// 崩溃残留：主 jsonl 有一轮，另有未收尾的 partial。resume 必须回放两轮的
+    /// items，并以一条 interrupted 的 turn/completed 收尾。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        // `Harness::new()` 的 workdir 是 test_config() 的默认路径，与下面 store
+        // 用的 tempdir 不一致会让 resume 找不到该 thread，故必须走 with_config。
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        // 直接用 store 造盘面：一轮已落盘 + 一段 partial 残留。
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        let tid = "thread-crash";
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: dir.path().to_string_lossy().to_string(),
+                model: "m".into(),
+                created_at: 1,
+                updated_at: 1,
+                title: None,
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+            })
+            .unwrap();
+        store
+            .append_turn(
+                tid,
+                &crate::thread_store::TurnLine::Turn {
+                    items: vec![crate::protocol::Item::UserMessage {
+                        id: "user-t1".into(),
+                        text: "first".into(),
+                    }],
+                    usage: None,
+                    messages: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .write_partial(
+                tid,
+                &crate::thread_store::PartialTurn {
+                    turn_id: "turn-t2".into(),
+                    items: vec![
+                        crate::protocol::Item::UserMessage {
+                            id: "user-turn-t2".into(),
+                            text: "second".into(),
+                        },
+                        crate::protocol::Item::AgentMessage {
+                            id: "item-turn-t2-1".into(),
+                            text: "half".into(),
+                        },
+                    ],
+                    messages: vec![],
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        initialize(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        let mut saw_half = false;
+        let mut interrupted = false;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
+                && v["params"]["item"]["text"] == "half"
+            {
+                saw_half = true;
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                if v["params"]["status"] == "interrupted" {
+                    interrupted = true;
+                    break;
+                }
+            }
+            if v.get("id") == Some(&serde_json::json!(5)) && interrupted {
+                break;
+            }
+        }
+        assert!(saw_half, "the crashed turn's finished items must be replayed");
+        assert!(interrupted, "a crashed partial turn must be flagged interrupted");
         h.shutdown().await;
     }
 
