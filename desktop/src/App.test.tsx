@@ -1489,6 +1489,30 @@ describe("App reconnect resilience", () => {
     await flush();
     expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true);
   });
+
+  it("forces a fresh connect+handshake on foreground while the stale flag still says connected", async () => {
+    render(<App />);
+    await waitMounted();
+    // 首连接握手成功:`connected` 已是 true(状态栏也这么说)。
+    expect(clients.length).toBe(1);
+    expect(screen.getByText("connected")).toBeTruthy();
+
+    // iOS 场景:切后台期间 socket 被系统静默掐断,却没有 close/exited 事件,
+    // 于是 `connected` 一直停在 true。回到前台时不能信这个陈旧标志,必须重建
+    // 客户端重新握手——这正是本特性存在的理由。
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => "visible",
+    });
+    act(() => {
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+
+    // 新客户端立刻出现(不等任何退避),并对它重放一整趟握手。
+    expect(clients.length).toBe(2);
+    await flush();
+    expect(clients[1].requests.filter((r) => r.method === "initialize").length).toBe(1);
+  });
 });
 
 describe("App iOS first-launch pairing", () => {

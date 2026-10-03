@@ -733,9 +733,6 @@ export default function App() {
     // 连续失败次数：第一次断开排 500ms,此后按 1s/2s/4s/8s 翻倍(封顶 10s)。
     // 握手成功即清零,所以偶尔一次闪断不会让下一次重连背负更大的延迟。
     let attempt = 0;
-    // 当前连接是否已握手成功。断线时的延迟由它区分:exited/error 是"没连上",
-    // 下一次按退避递增;一次成功握手之后再断,则从 base 重新起算。
-    let connected = false;
 
     // 断开后的重连入口：清掉可能已在途的定时器,立刻建客户端重试。前台唤醒
     // 用它做即时重连,exited 处理则用 scheduleReconnect 排队。
@@ -769,9 +766,13 @@ export default function App() {
     };
 
     // iOS 从后台切回前台时 socket 常已被系统静默掐断,状态不会自己回来。
-    // 前台且未连接就立刻重连:延迟在这条路径上毫无价值。
+    // 前台唤醒一律重建客户端重连:延迟在这条路径上毫无价值。这里故意不看
+    // `connected`——被后台掐断的 socket 可能没有 close/exited 事件,于是那个
+    // 标志会陈旧地停在 true(半开连接),信它就会把恰恰要修的场景漏过去。
+    // 只在可见性事件上触发,正常会话不受影响;reconnectNow 先清在途定时器,
+    // 再替换当前客户端,因此不会并发两条连接。
     const onVisibilityChange = () => {
-      if (document.visibilityState !== "visible" || disposed || connected) return;
+      if (document.visibilityState !== "visible" || disposed) return;
       attempt = 0;
       reconnectNow();
     };
@@ -818,9 +819,8 @@ export default function App() {
         // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
         // warm 缓存,免得切回旧对话时跳过 resume(新进程并不记得任何会话)。
         if (s.state === "exited" && !disposed) {
-          // 这次握手已经废了:下一次退避必须从 base 重新起算,否则一次
-          // 「连上后立刻断」会把 attempt 永久抬到高位、把重连拖成 10s 慢。
-          connected = false;
+          // 这次握手已经废了:重新从 base 起算退避(handshake 成功时本就会归零,
+          // 这里针对的是"连上后立刻断"——attempt 不能被永久抬到高位)。
           warm.current.clear();
           // 同样的理由:新进程不记得任何订阅,窗口必须清空,否则重连后
           // 返回"看起来还 warm"的会话时不会再发 subscribe,内容通知被静默过滤。
@@ -865,7 +865,6 @@ export default function App() {
         if (first) await selectThread(first.thread_id);
         // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
-        connected = true;
         attempt = 0;
         setStatus("connected");
         // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
