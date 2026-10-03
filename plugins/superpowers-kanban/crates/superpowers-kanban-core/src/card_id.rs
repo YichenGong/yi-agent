@@ -4,6 +4,31 @@
 //! 派生出同一个 id，否则「桌面上看到的卡」与「CLI 入队的卡」会是两张。
 //! 因此这里刻意抄写同一套 slug 规则，并由一致性测试锁住。
 
+/// 路径/分支名 → 文件名友好的 slug：只留 ASCII 字母数字，其余折叠为一个 `-`。
+pub fn slug(text: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// 合并卡 id：`merge-<slug(source)>-into-<slug(base)>`。
+pub fn merge_card_id_for(source: &str, base: &str) -> String {
+    let source = slug(source);
+    let base = slug(base);
+    let source = if source.is_empty() { "source" } else { &source };
+    let base = if base.is_empty() { "base" } else { &base };
+    format!("merge-{source}-into-{base}")
+}
+
 /// 由一对路径派生卡片 id：两个文件 stem 各自 slug 化后拼接。
 pub fn card_id_for(spec: &str, plan: &str) -> String {
     let stem = |path: &str| {
@@ -11,20 +36,6 @@ pub fn card_id_for(spec: &str, plan: &str) -> String {
             .file_stem()
             .map(|stem| stem.to_string_lossy().to_string())
             .unwrap_or_default()
-    };
-    let slug = |text: &str| {
-        let mut out = String::new();
-        let mut last_dash = false;
-        for ch in text.chars() {
-            if ch.is_ascii_alphanumeric() {
-                out.push(ch.to_ascii_lowercase());
-                last_dash = false;
-            } else if !last_dash {
-                out.push('-');
-                last_dash = true;
-            }
-        }
-        out.trim_matches('-').to_string()
     };
     let id = format!("{}-{}", slug(&stem(spec)), slug(&stem(plan)));
     if id == "-" || id.is_empty() {
@@ -73,5 +84,17 @@ mod tests {
     #[test]
     fn falls_back_to_card_when_nothing_usable_remains() {
         assert_eq!(card_id_for("", ""), "card");
+    }
+
+    #[test]
+    fn builds_a_merge_id_from_source_and_base() {
+        assert_eq!(
+            super::merge_card_id_for("kanban/card-1", "main"),
+            "merge-kanban-card-1-into-main"
+        );
+        assert_eq!(
+            super::merge_card_id_for("Feature/X", "release-2"),
+            "merge-feature-x-into-release-2"
+        );
     }
 }

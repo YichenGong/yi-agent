@@ -6,6 +6,8 @@ pub enum PromotionError {
     MissingSpec(PathBuf),
     MissingPlan(PathBuf),
     SameFile(PathBuf),
+    EmptyRef(String),
+    SameRef(String),
 }
 
 impl std::fmt::Display for PromotionError {
@@ -24,6 +26,8 @@ impl std::fmt::Display for PromotionError {
                     path.display()
                 )
             }
+            PromotionError::EmptyRef(which) => write!(f, "{which} must not be empty"),
+            PromotionError::SameRef(ref_) => write!(f, "source and base must differ: {ref_}"),
         }
     }
 }
@@ -40,6 +44,21 @@ pub fn validate_promotion(spec: &Path, plan: &Path) -> Result<(), PromotionError
     }
     if spec == plan {
         return Err(PromotionError::SameFile(spec.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// 合并卡载荷的**纯**校验：两个 ref 非空且互不相同。
+/// 「source 分支是否存在」需要 git I/O，归 runner（`merge::source_branch_exists`）。
+pub fn validate_merge_refs(source: &str, base: &str) -> Result<(), PromotionError> {
+    if source.trim().is_empty() {
+        return Err(PromotionError::EmptyRef("source".into()));
+    }
+    if base.trim().is_empty() {
+        return Err(PromotionError::EmptyRef("base".into()));
+    }
+    if source == base {
+        return Err(PromotionError::SameRef(source.to_string()));
     }
     Ok(())
 }
@@ -103,6 +122,19 @@ mod tests {
         assert_eq!(
             validate_promotion(&spec_dir, &plan),
             Err(PromotionError::MissingSpec(spec_dir.clone()))
+        );
+    }
+
+    #[test]
+    fn merge_refs_must_be_non_empty_and_different() {
+        assert_eq!(validate_merge_refs("kanban/a", "main"), Ok(()));
+        assert_eq!(
+            validate_merge_refs("", "main"),
+            Err(PromotionError::EmptyRef("source".into()))
+        );
+        assert_eq!(
+            validate_merge_refs("main", "main"),
+            Err(PromotionError::SameRef("main".into()))
         );
     }
 }

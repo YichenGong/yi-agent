@@ -221,6 +221,21 @@ impl Board {
         self.cards.iter().any(|card| card.id.0 == id)
     }
 
+    /// 未被占用的合并卡 id：与已有卡撞名时追加 `-2`、`-3`…。
+    pub fn next_free_merge_id(&self, source: &str, base: &str) -> CardId {
+        let base_id = crate::card_id::merge_card_id_for(source, base);
+        if !self.contains(&base_id) {
+            return CardId::new(base_id);
+        }
+        for n in 2u32.. {
+            let candidate = format!("{base_id}-{n}");
+            if !self.contains(&candidate) {
+                return CardId::new(candidate);
+            }
+        }
+        unreachable!("u32 suffix space exhausted")
+    }
+
     /// All queued cards in start order, without mutating the board.
     pub fn queued_in_order(&self) -> Vec<CardId> {
         let mut queued: Vec<&Card> = self
@@ -489,6 +504,26 @@ mod tests {
         assert_eq!(board.claim_next_merge(false), Some(CardId::new("m1")));
         assert_eq!(board.claim_next_merge(false), Some(CardId::new("m2")));
         assert_eq!(board.claim_next_merge(false), None);
+    }
+
+    #[test]
+    fn a_used_merge_id_gets_a_numeric_suffix() {
+        let mut board = Board::new();
+        board.enqueue_merge(
+            CardId::new("merge-a-into-main"),
+            "a".into(),
+            "main".into(),
+            None,
+            at(1, 0),
+        );
+        assert_eq!(
+            board.next_free_merge_id("a", "main"),
+            CardId::new("merge-a-into-main-2")
+        );
+        assert_eq!(
+            board.next_free_merge_id("b", "main"),
+            CardId::new("merge-b-into-main")
+        );
     }
 
     #[test]
