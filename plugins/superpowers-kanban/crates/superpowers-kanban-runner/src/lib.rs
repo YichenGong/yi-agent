@@ -3,6 +3,7 @@
 pub mod client;
 pub mod inbox;
 pub mod lease;
+pub mod merge_lock;
 pub mod runner;
 pub mod tick;
 
