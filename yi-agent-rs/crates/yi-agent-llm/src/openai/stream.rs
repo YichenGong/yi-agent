@@ -72,12 +72,27 @@ impl SseLineParser {
     }
 }
 
+/// A tool call being assembled from streamed deltas.
+///
+/// The provider may split a single tool call across chunks and may send its
+/// `id`/`name` in a later chunk than its `arguments` (or never send them at
+/// all). We buffer everything by `index` and only emit `ToolUseStart` once both
+/// a non-empty `id` and a non-empty `name` are known, so an unnamed/empty-id
+/// fragment can never become a tool call.
+#[derive(Default)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    args: String,
+    started: bool,
+}
+
 pub struct OpenaiStream<S> {
     line_parser: SseLineParser,
     inner: S,
     pending_frames: VecDeque<SseFrame>,
     pending_events: VecDeque<ProviderEvent>,
-    tool_calls: HashMap<usize, (String, String)>,
+    pending_tool_calls: HashMap<usize, PendingToolCall>,
     /// Whether a Stop event has already been emitted (from finish_reason or [DONE]).
     stopped: bool,
 }
@@ -92,8 +107,96 @@ where
             inner,
             pending_frames: VecDeque::new(),
             pending_events: VecDeque::new(),
-            tool_calls: HashMap::new(),
+            pending_tool_calls: HashMap::new(),
             stopped: false,
+        }
+    }
+
+    /// Absorb one streamed `tool_calls` delta for `index`.
+    ///
+    /// Emits `ToolUseStart` only once the call has both a non-empty id and a
+    /// non-empty name. Arguments seen before the start are buffered and flushed
+    /// (as a `ToolUseDelta`) immediately after the start; arguments seen after
+    /// the start are forwarded straight through.
+    fn absorb_tool_call_delta(
+        &mut self,
+        index: usize,
+        tc: &Value,
+        events: &mut Vec<ProviderEvent>,
+    ) {
+        let pending = self.pending_tool_calls.entry(index).or_default();
+
+        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+            if !id.is_empty() {
+                pending.id = id.to_string();
+            }
+        }
+        if let Some(name) = tc
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+        {
+            if !name.is_empty() {
+                pending.name = name.to_string();
+            }
+        }
+        if let Some(args) = tc
+            .get("function")
+            .and_then(|f| f.get("arguments"))
+            .and_then(Value::as_str)
+        {
+            if !args.is_empty() {
+                if pending.started {
+                    events.push(ProviderEvent::ToolUseDelta {
+                        id: pending.id.clone(),
+                        partial_json: args.to_string(),
+                    });
+                } else {
+                    pending.args.push_str(args);
+                }
+            }
+        }
+
+        if !pending.started && !pending.id.is_empty() && !pending.name.is_empty() {
+            pending.started = true;
+            events.push(ProviderEvent::ToolUseStart {
+                id: pending.id.clone(),
+                name: pending.name.clone(),
+            });
+            if !pending.args.is_empty() {
+                let args = std::mem::take(&mut pending.args);
+                events.push(ProviderEvent::ToolUseDelta {
+                    id: pending.id.clone(),
+                    partial_json: args,
+                });
+            }
+        }
+    }
+
+    /// Close out every pending tool call at `finish_reason == "tool_calls"`.
+    ///
+    /// Started calls emit `ToolUseEnd`. Fragments that never received both an id
+    /// and a name are dropped as tool calls; any arguments they carried are
+    /// downgraded to text so nothing is silently lost.
+    fn finish_tool_calls(&mut self, events: &mut Vec<ProviderEvent>) {
+        let mut indices: Vec<usize> = self.pending_tool_calls.keys().copied().collect();
+        indices.sort();
+        for idx in indices {
+            let Some(pending) = self.pending_tool_calls.remove(&idx) else {
+                continue;
+            };
+            if pending.started {
+                events.push(ProviderEvent::ToolUseEnd { id: pending.id });
+            } else {
+                tracing::warn!(
+                    provider = "openai",
+                    index = idx,
+                    "discarding tool call with empty id/name"
+                );
+                if !pending.args.is_empty() {
+                    events.push(ProviderEvent::TextDelta(pending.args));
+                }
+            }
         }
     }
 
@@ -182,36 +285,7 @@ where
                             for tc in tool_calls {
                                 let index =
                                     tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-
-                                if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                                    let name = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("name"))
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string();
-                                    self.tool_calls
-                                        .insert(index, (id.to_string(), name.clone()));
-                                    events.push(ProviderEvent::ToolUseStart {
-                                        id: id.to_string(),
-                                        name,
-                                    });
-                                }
-
-                                if let Some(args) = tc
-                                    .get("function")
-                                    .and_then(|f| f.get("arguments"))
-                                    .and_then(Value::as_str)
-                                {
-                                    if !args.is_empty() {
-                                        if let Some((id, _)) = self.tool_calls.get(&index) {
-                                            events.push(ProviderEvent::ToolUseDelta {
-                                                id: id.clone(),
-                                                partial_json: args.to_string(),
-                                            });
-                                        }
-                                    }
-                                }
+                                self.absorb_tool_call_delta(index, tc, &mut events);
                             }
                         }
                     }
@@ -236,13 +310,7 @@ where
                         }
                         "tool_calls" => {
                             self.stopped = true;
-                            let mut indices: Vec<usize> = self.tool_calls.keys().copied().collect();
-                            indices.sort();
-                            for idx in indices {
-                                if let Some((id, _)) = self.tool_calls.remove(&idx) {
-                                    events.push(ProviderEvent::ToolUseEnd { id });
-                                }
-                            }
+                            self.finish_tool_calls(&mut events);
                             events.push(ProviderEvent::Stop {
                                 reason: StopReason::EndTurn,
                             });
@@ -635,5 +703,70 @@ mod tests {
         let events = collect_events(vec![bytes.as_slice()]).await;
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], Err(ProviderError::Stream(_))));
+    }
+
+    #[tokio::test]
+    async fn defers_tool_use_start_until_name_present() {
+        // id arrives before name: no ToolUseStart until the name shows up.
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\"}]}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"\"}}]}}]}\n\n\
+             data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n\
+             data: [DONE]\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(events.len(), 3, "events: {:?}", events);
+        assert!(
+            matches!(&events[0], ProviderEvent::ToolUseStart { id, name } if id == "call_x" && name == "read")
+        );
+        assert!(matches!(&events[1], ProviderEvent::ToolUseEnd { id } if id == "call_x"));
+    }
+
+    #[tokio::test]
+    async fn buffers_arguments_arriving_before_name() {
+        // Arguments that arrive before the name must not be lost; they are
+        // re-emitted as a ToolUseDelta right after the deferred ToolUseStart.
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_x\",\"function\":{\"arguments\":\"{\\\"p\\\":\"}}]}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"read\"}}]}}]}\n\n\
+             data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n\
+             data: [DONE]\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(events.len(), 4, "events: {:?}", events);
+        assert!(
+            matches!(&events[0], ProviderEvent::ToolUseStart { id, name } if id == "call_x" && name == "read")
+        );
+        assert!(
+            matches!(&events[1], ProviderEvent::ToolUseDelta { id, partial_json } if id == "call_x" && partial_json == "{\"p\":")
+        );
+        assert!(matches!(&events[2], ProviderEvent::ToolUseEnd { id } if id == "call_x"));
+    }
+
+    #[tokio::test]
+    async fn discards_tool_call_that_never_gets_a_name() {
+        // An id with no name must never become a tool call. Its arguments are
+        // downgraded to text so the model's intent is not silently lost.
+        let body = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_y\",\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n\
+             data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n\
+             data: [DONE]\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events = collect_events(vec![bytes.as_slice()]).await;
+        let events: Vec<ProviderEvent> = events.into_iter().filter_map(|r| r.ok()).collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolUseStart { .. })),
+            "no ToolUseStart may be emitted: {:?}",
+            events
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "{}")),
+            "arguments must be downgraded to text: {:?}",
+            events
+        );
+        assert!(matches!(events.last(), Some(ProviderEvent::Stop { .. })));
     }
 }
