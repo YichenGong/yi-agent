@@ -36,6 +36,8 @@ pub enum CardState {
     Queued,
     Launching,
     Running,
+    /// 合并卡执行合并时的状态；不占用会话槽位。
+    Merging,
     NeedsYou,
     AwaitingMerge,
     Failed,
@@ -73,6 +75,10 @@ impl CardState {
         }
         match (self, next) {
             (Queued, Running) => true,
+            (Queued, Merging) => true,
+            (Merging, Done) => true,
+            (Merging, NeedsYou) => true,
+            (Merging, Failed) => true,
             (Queued, Launching) => true,
             (Launching, Running) => true,
             (Launching, Failed) => true,
@@ -229,5 +235,23 @@ mod tests {
         assert!(Launching.can_transition_to(Running));
         assert!(Launching.can_transition_to(Failed));
         assert!(!Launching.can_transition_to(AwaitingMerge));
+    }
+
+    #[test]
+    fn merging_does_not_occupy_a_provider_slot() {
+        assert!(!CardState::Merging.occupies_slot());
+    }
+
+    #[test]
+    fn a_merging_card_can_finish_or_stop() {
+        use CardState::*;
+        assert!(Queued.can_transition_to(Merging));
+        assert!(Merging.can_transition_to(Done));
+        assert!(Merging.can_transition_to(NeedsYou));
+        assert!(Merging.can_transition_to(Failed));
+        assert!(Merging.can_transition_to(Cancelled));
+        // 合并卡绝不能回到会话通路。
+        assert!(!Merging.can_transition_to(Running));
+        assert!(!Merging.can_transition_to(Launching));
     }
 }
