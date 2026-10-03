@@ -123,6 +123,20 @@
   height: 100%;
 }
 
+/*
+ * 禁止双指缩放。WKWebView 默认允许缩放，放大后页面不再贴合屏幕，之后每次滑动
+ * 都变成两轴平移——正是「缩放之后就需要拖拽」。
+ *
+ * 两道保险，缺一不可：
+ * - `viewport` 的 `maximum-scale=1, user-scalable=no` 是规范开关，由 `lockZoom()`
+ *   在手机端补写（`index.html` 是共享产物，桌面端不该被改）；
+ * - `touch-action: pan-x pan-y` 让 WebKit 在合成阶段就拒绝 pinch 手势。注意它
+ *   只禁缩放、不禁滚动，抽屉与 `overflow-x-auto` 的表格照常可滑。
+ */
+html[data-mobile="true"] {
+  touch-action: pan-x pan-y;
+}
+
 /* iOS 上没有红绿灯按钮，这条 32px 的空标题栏只白占高度。 */
 [data-mobile="true"] .app-titlebar {
   display: none;

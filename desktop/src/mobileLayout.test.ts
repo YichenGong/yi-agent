@@ -64,4 +64,11 @@ describe("phone layout CSS", () => {
     const src = readFileSync(`${dir}/components/MarkdownText.tsx`, "utf8");
     expect(src).toContain("prose-img:max-w-full");
   });
+
+  it("refuses pinch-zoom, without also refusing scrolling", () => {
+    // WKWebView 默认允许双指缩放；放大后页面不再贴合屏幕，之后每次滑动都变成
+    // 两轴平移（用户报的「缩放之后就需要拖拽」）。`pan-x pan-y` 只禁缩放：
+    // 抽屉列表与 `overflow-x-auto` 的表格仍可滑动。
+    expect(css()).toMatch(/html\[data-mobile="true"\]\s*\{[^}]*touch-action:\s*pan-x pan-y/);
+  });
 });
