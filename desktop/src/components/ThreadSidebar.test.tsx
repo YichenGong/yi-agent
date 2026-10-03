@@ -684,4 +684,44 @@ describe("ThreadSidebar pinned section", () => {
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     expect(onOpenSettings).toHaveBeenCalledTimes(1);
   });
+
+  it("spawns a ripple at the pointer position on the New-thread button", () => {
+    const { container } = renderSidebar({
+      workspaces: [{ path: "/a/alpha", exists: true }],
+    });
+    const button = newThreadTrigger(container);
+
+    // jsdom 的 getBoundingClientRect 恒为 0，因此换算后的相对坐标就等于 clientX/Y。
+    fireEvent.pointerDown(button, { clientX: 12, clientY: 7 });
+
+    const ripples = button.querySelectorAll("[data-ripple]");
+    expect(ripples).toHaveLength(1);
+    const ripple = ripples[0] as HTMLElement;
+    expect(ripple.style.left).toBe("12px");
+    expect(ripple.style.top).toBe("7px");
+  });
+
+  it("removes a ripple after its animation ends", () => {
+    const { container } = renderSidebar({
+      workspaces: [{ path: "/a/alpha", exists: true }],
+    });
+    const button = newThreadTrigger(container);
+    fireEvent.pointerDown(button, { clientX: 4, clientY: 4 });
+
+    const ripple = button.querySelector("[data-ripple]")!;
+    fireEvent.animationEnd(ripple);
+    expect(button.querySelector("[data-ripple]")).toBeNull();
+  });
+
+  it("keeps the click behaviour intact alongside the ripple", () => {
+    const onBrowse = vi.fn();
+    const { container } = renderSidebar({ workspaces: [], onBrowse });
+    const button = newThreadTrigger(container);
+
+    // 无最近目录：点击仍然直接走原生选择器，涟漪不改变这条路径。
+    fireEvent.pointerDown(button, { clientX: 2, clientY: 2 });
+    fireEvent.click(button);
+    expect(onBrowse).toHaveBeenCalledTimes(1);
+    expect(button.querySelectorAll("[data-ripple]")).toHaveLength(1);
+  });
 });
