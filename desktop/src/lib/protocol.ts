@@ -55,6 +55,7 @@ export type Notification =
   | { method: "item/started"; params: { thread_id: string; item: Item } }
   | { method: "item/delta"; params: { thread_id: string; item_id: string; delta: string } }
   | { method: "item/completed"; params: { thread_id: string; item: Item } }
+  | { method: "items/completed"; params: { thread_id: string; items: Item[] } }
   | {
       method: "turn/completed";
       params: { thread_id: string; turn_id: string; status: TurnStatus; error?: string };

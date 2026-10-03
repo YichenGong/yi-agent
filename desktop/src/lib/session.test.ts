@@ -374,6 +374,43 @@ describe("Session", () => {
     });
   });
 
+  describe("batched items/completed replay", () => {
+    it("merges a batched items/completed replay", () => {
+      const s = new Session();
+      s.apply({
+        method: "items/completed",
+        params: {
+          thread_id: "t1",
+          items: [
+            { type: "userMessage", id: "user-1", text: "hi" },
+            { type: "agentMessage", id: "item-1", text: "hello" },
+          ],
+        },
+      } as never);
+      expect(s.items.map((i) => i.id)).toEqual(["user-1", "item-1"]);
+    });
+
+    it("batched replay does not duplicate an already-seen item", () => {
+      const s = new Session();
+      s.apply({
+        method: "item/completed",
+        params: { thread_id: "t1", item: { type: "agentMessage", id: "item-1", text: "a" } },
+      } as never);
+      s.apply({
+        method: "items/completed",
+        params: {
+          thread_id: "t1",
+          items: [
+            { type: "agentMessage", id: "item-1", text: "a" },
+            { type: "agentMessage", id: "item-2", text: "b" },
+          ],
+        },
+      } as never);
+      expect(s.items.filter((i) => i.id === "item-1")).toHaveLength(1);
+      expect(s.items.map((i) => i.id)).toEqual(["item-1", "item-2"]);
+    });
+  });
+
   describe("opening user item ordering", () => {
     it("keeps the opening user item ahead of agent items on a cold-open replay", () => {
       const s = new Session();
