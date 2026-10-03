@@ -477,7 +477,8 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_token_does_not_authenticate() {        let dir = tempfile::TempDir::new().unwrap();
+    fn an_unknown_token_does_not_authenticate() {
+        let dir = tempfile::TempDir::new().unwrap();
         let pairing = PairingState::new(DeviceStore::new(dir.path().join("devices.json")));
         assert!(pairing.authenticate("nope").is_none());
     }
