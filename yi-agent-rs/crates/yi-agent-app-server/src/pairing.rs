@@ -47,8 +47,35 @@ pub struct PairingState {
     /// 兑换(桌面 stdio 进程铸码、`--relay`/`ws://` 进程兑换)——否则各自进程内的
     /// `HashMap` 互不相见,跨进程兑换恒 4401。
     codes_path: PathBuf,
+    /// 本机桥凭据(`seed_local_device`)的「名字 → 凭据」表,见 [`LocalDeviceIndex`]。
+    /// 与 `codes_path` 同目录(`<devices.json 同目录>/local-device.json`)。
+    local_device_path: PathBuf,
     /// 进程内串行化 `codes_path` 的读-改-写。跨进程并发不在这把锁的范围内。
     codes_lock: Mutex<()>,
+    /// 进程内串行化 `local_device_path` 的读-改-写(同 `codes_lock` 的粒度约定)。
+    local_lock: Mutex<()>,
+}
+
+/// 「名字 → 本机凭据」映射,只服务 [`PairingState::seed_local_device`]。
+///
+/// 为什么需要一张**明文**表:`devices.json` 只存 `token_hash`(见 `device_store`
+/// 的「绝不落明文」),而「同名幂等地复用同一枚凭据」必须能取回明文 token。故这
+/// 张表只装 `seed_local_device` 铸出的**本机**凭据:单用户、同一台机器,落在与
+/// `devices.json` 同一私有目录(`~/.yi-agent`,0700)下的 `local-device.json`,
+/// 不扩大暴露面。**幂等身份由这张表定义**——不是 `devices.json` 里的某条记录。
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct LocalDeviceIndex {
+    #[serde(default)]
+    devices: Vec<LocalDevice>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalDevice {
+    name: String,
+    device_id: String,
+    /// 明文 token:仅本机桥凭据,故可落盘(devices.json 仍只存哈希)。
+    token: String,
+    created_at: i64,
 }
 
 fn now_epoch_secs() -> i64 {
@@ -75,10 +102,22 @@ impl PairingState {
 
     /// 显式注入配对码文件路径(测试用;也让调用方在需要时换目录)。
     pub fn with_codes_path(store: DeviceStore, codes_path: PathBuf) -> Self {
+        let local_device_path = store.path().with_file_name("local-device.json");
+        Self::with_local_device_path(store, codes_path, local_device_path)
+    }
+
+    /// 三个落盘位置都能显式注入(测试用;生产经 `new`)。
+    pub(crate) fn with_local_device_path(
+        store: DeviceStore,
+        codes_path: PathBuf,
+        local_device_path: PathBuf,
+    ) -> Self {
         Self {
             store,
             codes_path,
+            local_device_path,
             codes_lock: Mutex::new(()),
+            local_lock: Mutex::new(()),
         }
     }
 
@@ -117,6 +156,35 @@ impl PairingState {
         ));
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, &self.codes_path)
+    }
+
+    fn read_local_devices(&self) -> LocalDeviceIndex {
+        std::fs::read_to_string(&self.local_device_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_local_devices(&self, file: &LocalDeviceIndex) -> io::Result<()> {
+        if let Some(parent) = self.local_device_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let body = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
+        // 与 codes 文件同样的唯一临时名:两个进程并发写也不共用临时路径。
+        let tmp = self.local_device_path.with_extension(format!(
+            "json.{}.{}.tmp",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(&tmp, body)?;
+        // 只保留本机用户可读写。同目录的 `devices.json` 只存哈希、无此顾虑;这张
+        // 表例外地装明文 token,故收紧到 0600(umask 之外)。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &self.local_device_path)
     }
 
     /// 铸一枚一次性配对码。桌面端拿到后渲染二维码/明文。
@@ -195,14 +263,40 @@ impl PairingState {
         (device, token)
     }
 
-    /// 铸一枚**本机**设备凭据(scope = `Control`),返回明文 token。
+    /// 取一枚**本机**设备凭据(scope = `Control`),返回明文 token。
     ///
     /// `--relay` 模式下,本机中继桥要作为 ws 客户端连**本机**的环回 app-server,
     /// 而该 server 仍是「无 token 即 4401」。用本方法在启动时取一枚本地 token,
     /// 好过把环回 ws 改成免认证(那会削弱「准入即认证」的网络路径不变量)。
     /// 与 spec §5.4「新配对设备默认 control」一致。
+    ///
+    /// **按名字幂等**:同名已铸过即复用同一台设备与同一枚 token,绝不重复落表。
+    /// 否则每次 `--relay` 启动都会在设备表里多留一条永久 Control 凭据,随重启
+    /// 无界增长。明文 token 记在 [`LocalDeviceIndex`] 里正是为了能原样复取。
     pub fn seed_local_device(&self, name: &str) -> String {
-        self.mint(name, Scope::Control).1
+        let _guard = self.local_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut index = self.read_local_devices();
+
+        // 已铸过:确认设备表里那台设备还在(未被 revoke),在则复用其 token。
+        if let Some(existing) = index.devices.iter().find(|d| d.name == name) {
+            if self.store.get(&existing.device_id).is_some() {
+                return existing.token.clone();
+            }
+        }
+
+        // 未铸过(或设备已被 revoke 而失效):铸一台新的,并更新「名字 → 凭据」表。
+        let (device, token) = self.mint(name, Scope::Control);
+        index.devices.retain(|d| d.name != name);
+        index.devices.push(LocalDevice {
+            name: name.to_string(),
+            device_id: device.id,
+            token: token.clone(),
+            created_at: device.created_at,
+        });
+        if let Err(e) = self.write_local_devices(&index) {
+            tracing::warn!(error = %e, "failed to persist local device index; a restart may mint a new bridge token");
+        }
+        token
     }
 
     /// 仅供测试:直接铸一台设备并返回其 id 与明文 token。
@@ -269,6 +363,93 @@ fn short_code_secret() -> String {
 mod tests {
     use super::*;
 
+    /// 本期重要修复:本机桥凭据按名字**幂等**。此前 `seed_local_device` 每次都
+    /// `mint` 一台新 Control 设备落表,每次 `--relay` 启动都多留一条永久凭据。
+    ///
+    /// 这里断言真实行为:同名铸两次后设备表**恰有一条**、token 相同且仍能认证。
+    /// 三个都查真存储(设备表落盘 + `authenticate`),不使用任何 mock。
+    #[test]
+    fn seeding_the_same_local_device_twice_is_idempotent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let devices = dir.path().join("devices.json");
+        let pairing = PairingState::new(DeviceStore::new(devices.clone()));
+
+        let first = pairing.seed_local_device("relay-bridge");
+        let second = pairing.seed_local_device("relay-bridge");
+
+        assert_eq!(first, second, "同名铸两次必须复用同一枚 token");
+        let listed = pairing.store().list();
+        assert_eq!(
+            listed.len(),
+            1,
+            "同名铸两次只应留下 ONE 条 device 记录,实得 {}",
+            listed.len()
+        );
+        assert_eq!(listed[0].name, "relay-bridge");
+        assert_eq!(listed[0].scope, Scope::Control);
+        assert!(
+            pairing.authenticate(&second).is_some(),
+            "复用回来的 token 仍必须能认证"
+        );
+    }
+
+    /// 跨实例(两个 `PairingState`、同一份 devices.json,即两次 `--relay` 启动)
+    /// 也必须幂等:第二个实例复用第一个留下的凭据,不得新增记录。
+    #[test]
+    fn seeding_across_instances_reuses_the_persisted_bridge_token() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let devices = dir.path().join("devices.json");
+
+        let first = PairingState::new(DeviceStore::new(devices.clone()));
+        let token = first.seed_local_device("relay-bridge");
+
+        // 模拟第二次 `--relay` 启动:全新实例,只共享 devices.json。
+        let second = PairingState::new(DeviceStore::new(devices.clone()));
+        let again = second.seed_local_device("relay-bridge");
+
+        assert_eq!(token, again, "重启须复用持久化的同一枚 token");
+        assert_eq!(
+            second.store().list().len(),
+            1,
+            "两次启动只应有一条 relay-bridge 设备"
+        );
+        assert!(second.authenticate(&again).is_some());
+    }
+
+    /// 不同名字仍是各自独立的凭据(幂等只按名字,不误合并)。
+    #[test]
+    fn distinct_local_device_names_get_distinct_tokens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pairing = PairingState::new(DeviceStore::new(dir.path().join("devices.json")));
+
+        let a = pairing.seed_local_device("relay-bridge");
+        let b = pairing.seed_local_device("other-bridge");
+
+        assert_ne!(a, b);
+        assert_eq!(pairing.store().list().len(), 2);
+    }
+
+    /// 已 revoke 的桥设备不得被当作可用凭据复用:重新铸一台新设备(仍至多一条
+    /// 同名设备,不无界增长),且新 token 可认证、旧 token 已失效。
+    #[test]
+    fn reseeding_after_revoke_mints_a_fresh_token() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pairing = PairingState::new(DeviceStore::new(dir.path().join("devices.json")));
+
+        let old = pairing.seed_local_device("relay-bridge");
+        let device = pairing.store().list().into_iter().next().expect("device");
+        pairing.revoke(&device.id).unwrap();
+
+        let fresh = pairing.seed_local_device("relay-bridge");
+        assert_ne!(old, fresh, "被 revoke 后重铸必须换新 token");
+        assert!(
+            pairing.authenticate(&old).is_none(),
+            "旧 token 撤销后不得再认证"
+        );
+        assert!(pairing.authenticate(&fresh).is_some());
+        assert_eq!(pairing.store().list().len(), 1, "重铸后仍只有一条记录");
+    }
+
     #[test]
     fn a_code_redeems_once_and_yields_a_usable_token() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -296,8 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_token_does_not_authenticate() {
-        let dir = tempfile::TempDir::new().unwrap();
+    fn an_unknown_token_does_not_authenticate() {        let dir = tempfile::TempDir::new().unwrap();
         let pairing = PairingState::new(DeviceStore::new(dir.path().join("devices.json")));
         assert!(pairing.authenticate("nope").is_none());
     }

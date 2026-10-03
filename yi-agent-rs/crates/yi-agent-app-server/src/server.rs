@@ -1111,8 +1111,9 @@ where
 ///   任一侧的 turn 事件、审批请求、状态通知都扇出到双方(spec §2.1)。
 ///
 /// 环回 listener 绑 `127.0.0.1:0`,中继客户端是**出站**连接,故网络路径上没有
-/// 新增暴露面;环回 ws 仍需 token(本函数用共享 `pairing` 现铸一枚
-/// `seed_local_device("relay-bridge")` 交中继客户端)。stdio EOF(桌面退出)⇒
+/// 新增暴露面;环回 ws 仍需 token(本函数用共享 `pairing` 取一枚
+/// `seed_local_device("relay-bridge")` 凭据交中继客户端;该取法按名字**幂等**,
+/// 重启不会重复落表)。stdio EOF(桌面退出)⇒
 /// `serve()` 返回 ⇒ 整个合并会话优雅退出(spec §3.2 不变量 4)。
 pub async fn serve_stdio_with_relay<R, W>(
     reader: R,
@@ -1485,9 +1486,10 @@ where
                 .map_err(|e| anyhow::anyhow!("invalid relay url `{relay_base}`: {e}"))?;
             let app_server_ws =
                 url::Url::parse(&format!("ws://{addr}/ws")).expect("loopback ws url");
-            // 本机中继桥的凭据:与桌面共用同一个 `pairing`,现铸一枚 Control 设备
+            // 本机中继桥的凭据:与桌面共用同一个 `pairing`,取一枚 Control 设备
             // (等价于本机走一次正常配对),交中继客户端带进 `?token=`。**不**把环回
-            // ws 改成免认证——那会削弱「准入即认证」。
+            // ws 改成免认证——那会削弱「准入即认证」。该取法按名字幂等:同名已铸过
+            // 即复用同一台设备,故每次 `--relay` 启动不会新增永久凭据。
             let local_token = pairing.seed_local_device("relay-bridge");
             relay_task = Some(tokio::spawn(async move {
                 yi_agent_relay::run_client(relay, app_server_ws, session, local_token).await
@@ -11526,7 +11528,7 @@ pub(crate) mod tests {
                 Some(listener),
                 relay_url,
             ));
-            // 手机侧凭据:与主循环**共享**的 `pairing` 现铸,故 ws 前端认得。
+            // 手机侧凭据:与主循环**共享**的 `pairing` 取一枚(按名字幂等),故 ws 前端认得。
             let token = pairing.seed_local_device("relay-bridge");
             Self {
                 client_w,

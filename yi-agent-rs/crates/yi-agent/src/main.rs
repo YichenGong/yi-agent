@@ -293,9 +293,9 @@ fn run_app_server(cli: Cli, listen: &str, relay: Option<&str>) -> Result<()> {
 /// 中继客户端作为 ws 客户端出站连它,因此网络路径上没有新增暴露面。
 ///
 /// 本地 app-server 仍是「无 token 即 4401」:这里用与它**共享**的 `PairingState`
-/// 现铸一枚本机设备 token(等价于本机走一次正常配对,`seed_local_device`),交给
+/// 取一枚本机设备 token(等价于本机走一次正常配对,`seed_local_device`),交给
 /// 中继客户端连接本地 ws。**不**把本地 ws 改成免认证——那会削弱「准入即认证」
-/// 的不变量,而这枚 token 的成本只是一个函数调用。
+/// 的不变量。`seed_local_device` 按名字幂等,故重启复用同一台设备、不重复落表。
 async fn run_relay_mode(
     config: yi_agent_runtime::config::RuntimeConfig,
     url: String,
@@ -313,8 +313,9 @@ async fn run_relay_mode(
             yi_agent_app_server::device_store::default_path(),
         ),
     ));
-    // 本机中继桥的凭据:直接铸一台 Control 设备(与 spec §5.4「新配对设备默认
-    // control」一致),i.e. 桌面为「中继桥」这个本机客户端发的一张设备卡。
+    // 本机中继桥的凭据:取一台 Control 设备(与 spec §5.4「新配对设备默认
+    // control」一致),i.e. 桌面为「中继桥」这个本机客户端发的一张设备卡。按名字
+    // 幂等:同名已铸过即复用同一张卡,不会被每次启动重复发放。
     let local_token = pairing.seed_local_device("relay-bridge");
 
     let serve_pairing = std::sync::Arc::clone(&pairing);
