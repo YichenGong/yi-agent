@@ -23,6 +23,7 @@ export function SettingsDialog({
   onClose,
   remoteCall,
   relayUrl,
+  saveRelayUrl,
 }: {
   open: boolean;
   theme: Theme;
@@ -32,6 +33,11 @@ export function SettingsDialog({
   remoteCall?: RemoteCall;
   /** 中继地址预填。 */
   relayUrl?: string;
+  /**
+   * 「远程访问」Tab 保存侧车中继地址的接缝（桌面宿主接到 Tauri 的
+   * `set_relay_url`）。缺省时保存按钮不可用（iOS 构建没有该 Tauri 命令）。
+   */
+  saveRelayUrl?: (value: string | null) => Promise<void>;
 }) {
   const [active, setActive] = useState<TabId>("general");
   // roving tabIndex：只有选中的 Tab 是 Tab 停靠点，↑↓←→ 在表内移动。
@@ -138,7 +144,11 @@ export function SettingsDialog({
             {active === "general" ? (
               <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
             ) : (
-              <SettingsRemoteTab call={remoteCall} initialRelayUrl={relayUrl} />
+              <SettingsRemoteTab
+                call={remoteCall}
+                initialRelayUrl={relayUrl}
+                saveRelayUrl={saveRelayUrl}
+              />
             )}
           </div>
         </div>

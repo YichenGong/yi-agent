@@ -146,6 +146,61 @@ describe("SettingsRemoteTab", () => {
     expect(field.value).toBe("wss://other.example.com/ws");
   });
 
+  it("saves the typed relay url through the seam", async () => {
+    const saveRelayUrl = vi.fn(async () => {});
+    const call = rpcStub({ "device/list": () => ({ devices: [] }) });
+    render(
+      <SettingsRemoteTab call={call} saveRelayUrl={saveRelayUrl} initialRelayUrl="wss://old" />,
+    );
+
+    const field = screen.getByLabelText("中继地址") as HTMLInputElement;
+    fireEvent.change(field, {
+      target: { value: "wss://relay.example.com/connect?session=x" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(saveRelayUrl).toHaveBeenCalledWith("wss://relay.example.com/connect?session=x"),
+    );
+  });
+
+  it("saves null when the field is cleared", async () => {
+    const saveRelayUrl = vi.fn(async () => {});
+    const call = rpcStub({ "device/list": () => ({ devices: [] }) });
+    render(
+      <SettingsRemoteTab call={call} saveRelayUrl={saveRelayUrl} initialRelayUrl="wss://old" />,
+    );
+
+    fireEvent.change(screen.getByLabelText("中继地址"), { target: { value: "   " } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(saveRelayUrl).toHaveBeenCalledWith(null));
+  });
+
+  it("shows the reconnecting state after a successful save", async () => {
+    const saveRelayUrl = vi.fn(async () => {});
+    const call = rpcStub({ "device/list": () => ({ devices: [] }) });
+    render(<SettingsRemoteTab call={call} saveRelayUrl={saveRelayUrl} />);
+
+    fireEvent.change(screen.getByLabelText("中继地址"), { target: { value: "wss://r/connect?session=x" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByText(/已保存/)).toBeTruthy();
+  });
+
+  it("reports a failed save instead of the reconnecting state", async () => {
+    const saveRelayUrl = vi.fn(async () => {
+      throw new Error("disk full");
+    });
+    const call = rpcStub({ "device/list": () => ({ devices: [] }) });
+    render(<SettingsRemoteTab call={call} saveRelayUrl={saveRelayUrl} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByText("disk full")).toBeTruthy();
+    expect(screen.queryByText(/已保存/)).toBeNull();
+  });
+
   it("degrades gracefully without an RPC seam", async () => {
     render(<SettingsRemoteTab />);
 

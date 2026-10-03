@@ -176,6 +176,9 @@ export default function App() {
   // `needsPairing` 挡住），这一次读到的是 ws 配置。
   const [pairingVersion, setPairingVersion] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // 「本机侧车要连的中继地址」：首屏由 ui/settings/read 回填，用户在设置页改后
+  // 经 Tauri `set_relay_url` 落盘并触发侧车重启。
+  const [relayUrl, setRelayUrl] = useState("");
   // 首屏先用缓存渲染，连上后以 ui/settings/read 的权威值为准。
   const [theme, setTheme] = useState<Theme>(() => readCachedTheme() ?? "dark");
   // 挂载后主题是否已被更新的选择触碰过（ui/settings/updated 通知或用户
@@ -571,6 +574,20 @@ export default function App() {
     return typeof picked === "string" ? picked : null;
   };
 
+  /**
+   * 保存侧车的中继地址（设置页「远程访问」的保存按钮调用）。
+   *
+   * 只有桌面构建有侧车与这条 Tauri 命令；iOS 是纯 ws 客户端，接缝传 undefined
+   * 让保存按钮不可用（与 `pickDirectory` 的守卫同一口径）。落盘由宿主完成，并会
+   * 杀掉侧车让监管循环用新值重启；成功后本地状态跟上，失败原样抛出由组件内联提示。
+   */
+  const saveRelayUrl = async (value: string | null): Promise<void> => {
+    if (isRemoteClient()) throw new Error("远程客户端不支持配置本机侧车");
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("set_relay_url", { url: value });
+    setRelayUrl(value ?? "");
+  };
+
   const addWorkspace = async (path: string): Promise<boolean> => {
     try {
       await clientRef.current?.request("workspace/add", { path });
@@ -795,7 +812,11 @@ export default function App() {
         const settings = await client.request<{
           theme?: unknown;
           board_watchman_enabled?: unknown;
+          relay_url?: unknown;
         }>("ui/settings/read", {});
+        // 中继地址没有「用户正在改」的触碰标记：设置页是模态的，首屏 read 回来
+        // 时用户还没法编辑它，直接采纳权威值即可。未配置（null）→ 空串。
+        setRelayUrl(typeof settings.relay_url === "string" ? settings.relay_url : "");
         // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
         // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
         if (!themeTouchedRef.current) {
@@ -1253,6 +1274,9 @@ export default function App() {
         remoteCall={(method, params) =>
           (clientRef.current as RpcClient).request(method, params)
         }
+        relayUrl={relayUrl}
+        // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
+        saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}
       />
     </>
   );
