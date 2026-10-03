@@ -118,6 +118,8 @@ where
             build_agent,
             serve_scopes,
             serve_initialized,
+            // 纯 ws 路径无 stdio 读端,故无 EOF 观察者。
+            None,
         )
         .await
     });

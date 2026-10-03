@@ -1099,6 +1099,65 @@ where
     .await
 }
 
+/// 合并入口:`app-server --listen stdio:// --relay <url>` 用。
+///
+/// 与 [`run`] 同构(自建 workspaces/pairing/attachments/factory —— `RuntimeAttachments`
+/// 与 `production_factory` 是 crate 私有的,故本函数**自包含**,供二进制 crate
+/// 直接调用),差别只在多接一条环回 ws 前端 + 中继客户端:
+///
+/// - stdio 客户端仍是 `ClientId = local`、`Scope::Admin`(桌面 GUI,全权);
+/// - 经环回 ws 接入的手机是 `ws-<uuid>`、`Control`(与直连 ws 时行为一致);
+/// - 二者**共用同一个** `serve()` 与同一套 hub / `threads` / `client_scopes`,故
+///   任一侧的 turn 事件、审批请求、状态通知都扇出到双方(spec §2.1)。
+///
+/// 环回 listener 绑 `127.0.0.1:0`,中继客户端是**出站**连接,故网络路径上没有
+/// 新增暴露面;环回 ws 仍需 token(本函数用共享 `pairing` 现铸一枚
+/// `seed_local_device("relay-bridge")` 交中继客户端)。stdio EOF(桌面退出)⇒
+/// `serve()` 返回 ⇒ 整个合并会话优雅退出(spec §3.2 不变量 4)。
+pub async fn serve_stdio_with_relay<R, W>(
+    reader: R,
+    writer: W,
+    cfg: RuntimeConfig,
+    relay_url: String,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let workspaces = Arc::new(WorkspaceIndex::new(crate::workspace_index::default_path()));
+    let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+        crate::device_store::default_path(),
+    )));
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+    let board_dir = yi_agent_boards::global_dir().unwrap_or_default();
+    let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
+    let theme_for_factory = theme.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    serve_scoped_core(
+        reader,
+        writer,
+        cfg.clone(),
+        PERMISSION_TIMEOUT,
+        workspaces,
+        pairing,
+        Arc::new(crate::broadcast::Broadcaster::new()),
+        RuntimeAttachments {
+            runtimes,
+            thread_roots,
+            board_dir,
+            launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
+            theme,
+        },
+        production_factory(cfg, theme_for_factory),
+        // 桌面 = Admin(与 `run`/`serve_stdio` 的 stdio 注册完全一致)。
+        Scope::Admin,
+        Some(listener),
+        Some(relay_url),
+    )
+    .await
+}
+
 /// 生产环境的 agent 工厂:按 thread 的 cwd 覆盖 workdir 与 yolo 后引导一个 agent。
 pub(crate) fn production_factory(
     cfg: RuntimeConfig,
@@ -1178,6 +1237,44 @@ where
     .await
 }
 
+/// 把中继端点拆成「去掉 `session` 的 URL」+「session id」。
+///
+/// 与二进制 crate 的 `relay_parts` 同义(此处复制一份,app-server 不得反向依赖
+/// 二进制):`yi_agent_relay::run_client` 会自己补 `?session=<id>`,故 base 里必须
+/// 先摘掉,否则 URL 上会出现两个 `session`。只做本场景够用的查询串切分,不引
+/// `url` crate 的解析——输入来自 CLI,格式由调用方保证。
+fn parse_relay_url(relay_url: &str) -> anyhow::Result<(String, String)> {
+    let (base, query) = match relay_url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (relay_url, None),
+    };
+    let session = query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "session")
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "relay endpoint `{relay_url}` is missing `?session=<id>`: \
+                 the phone and the computer must agree on the same session id"
+            )
+        })?;
+
+    let kept: Vec<&str> = query
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("session="))
+        .collect();
+    let url = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    Ok((url, session))
+}
+
 /// 与 [`serve_stdio`] 逐字节相同,只多一个 `client_scope`。
 ///
 /// 存在的唯一理由是让"低权客户端的门禁"可测:测试经 `Harness::with_scope`
@@ -1208,6 +1305,110 @@ where
         + Sync
         + 'static,
 {
+    // `None` = 纯 stdio:不挂 ws 前端、不起中继,行为与改造前**逐字节一致**。
+    serve_scoped_core(
+        reader,
+        writer,
+        cfg,
+        permission_timeout,
+        workspaces,
+        pairing,
+        hub,
+        attachments,
+        build_agent,
+        client_scope,
+        None,
+        None,
+    )
+    .await
+}
+
+/// [`serve_scoped`] 的合并模式入口:额外把一条环回 ws 前端(以及可选的中继
+/// 客户端)接到**同一个** `serve()` 上。
+///
+/// `client_scope` 恒为 stdio 侧的 `Admin`;ws 侧每连接注册为 `Control`。单测直接
+/// 传一个已绑定的 `listener` 并令 `relay_url = None`——不引入对真中继的依赖,手机
+/// 用共享 `pairing` 铸出的 token 直接连环回监听。
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn serve_scoped_with_loopback<R, W, F>(
+    reader: R,
+    writer: W,
+    cfg: RuntimeConfig,
+    permission_timeout: Duration,
+    workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
+    hub: Arc<crate::broadcast::Broadcaster>,
+    attachments: RuntimeAttachments,
+    build_agent: F,
+    client_scope: Scope,
+    listener: Option<tokio::net::TcpListener>,
+    relay_url: Option<String>,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Fn(
+            Option<yi_agent_core::Session>,
+            &Path,
+            crate::thread_store::ThreadMode,
+        ) -> anyhow::Result<BuiltAgent>
+        + Send
+        + Sync
+        + 'static,
+{
+    serve_scoped_core(
+        reader,
+        writer,
+        cfg,
+        permission_timeout,
+        workspaces,
+        pairing,
+        hub,
+        attachments,
+        build_agent,
+        client_scope,
+        listener,
+        relay_url,
+    )
+    .await
+}
+
+/// stdio(+ 可选环回 ws / 中继)的共享实现。
+///
+/// `listener` 为 `None` 时就是纯 stdio([`serve_scoped`] / [`serve_stdio`]),此时
+/// 不建任何 ws/中继接线,行为与改造前逐字节一致;为 `Some` 时,stdio 的 `local`
+/// 与每条环回 ws 连接**共用同一个** `serve()`、同一套 hub/scopes/threads。
+///
+/// 本节点的唯一不变量:**恰好一个 `serve(...)` 调用**。两条前端都只是往同一个
+/// `inbound_tx` 灌帧、把出站登记进同一个 hub。
+#[allow(clippy::too_many_arguments)]
+async fn serve_scoped_core<R, W, F>(
+    reader: R,
+    writer: W,
+    cfg: RuntimeConfig,
+    permission_timeout: Duration,
+    workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
+    hub: Arc<crate::broadcast::Broadcaster>,
+    attachments: RuntimeAttachments,
+    build_agent: F,
+    client_scope: Scope,
+    listener: Option<tokio::net::TcpListener>,
+    relay_url: Option<String>,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Fn(
+            Option<yi_agent_core::Session>,
+            &Path,
+            crate::thread_store::ThreadMode,
+        ) -> anyhow::Result<BuiltAgent>
+        + Send
+        + Sync
+        + 'static,
+{
     let local = crate::broadcast::ClientId::local();
     // 可靠登记:stdio 只有这一条出站流,广播的背压**不得**摘除它。桌面 host
     // 一旦来不及读 stdout,旧的 lossy `broadcast` 会把它当慢消费者摘掉,主循环
@@ -1224,11 +1425,81 @@ where
         Arc::clone(&hub),
         local.clone(),
     ));
-    tokio::spawn(read_lines(reader, local.clone(), inbound_tx));
+    // stdio EOF 的观察者(仅合并模式需要,理由见下方 oneshot 的注释)。
+    let merged = listener.is_some();
+    let (stdio_eof_tx, stdio_eof_rx) = tokio::sync::oneshot::channel::<()>();
+    // `read_lines` 独占 reader,并把 stdio 读端「结束」经 oneshot 转成主循环可
+    // `select!` 的事件(纯 stdio 下传 `None`,行为与改造前一致)。
+    tokio::spawn(read_lines(
+        reader,
+        local.clone(),
+        inbound_tx.clone(),
+        if merged { Some(stdio_eof_tx) } else { None },
+    ));
     // scope 随连接登记一次;主循环按 `client` id 查它。stdio 会话只此一条,故
     // 传入的表就是一张只装 `local` 的注册表(与 ws 的动态注册同型,便于共享)。
-    let client_scopes = Arc::new(Mutex::new(HashMap::from([(local.clone(), client_scope)])));
+    let client_scopes: ClientScopes =
+        Arc::new(Mutex::new(HashMap::from([(local.clone(), client_scope)])));
     let client_initialized: ClientInitialized = Arc::new(Mutex::new(HashMap::new()));
+
+    // ---------- 合并模式:把一条环回 ws 前端(与可选的中继客户端)接到同一个
+    // `serve()` 上。`listener` 为 `None` 时以下整块都跳过,纯 stdio 因此与改造前
+    // 一致。 ----------
+    //
+    // stdio EOF 的观察者:合并后入站 channel 至少还有 ws 前端一只 sender,单靠
+    // `recv() == None` 已无法感知 stdio 读端关闭。桌面关闭(EOF)必须整进程退出
+    // ——spec §3.2 不变量 4「桌面关了,手机没东西可控」。故 `read_lines` 结束时
+    // 经 oneshot 通知主循环,后者据此 `break`;`serve` 返回后 `inbound_rx` 被丢弃,
+    // 仍在灌帧的前端(ws / 中继)随之收尾。纯 stdio 下 `stdio_eof_rx` 为 `None`,
+    // `select!` 该分支 `pending`,EOF 仍由 channel 关闭感知(与改造前一致)。
+    let mut stdio_eof_rx = if merged {
+        Some(Box::pin(stdio_eof_rx))
+    } else {
+        None
+    };
+    let mut frontend: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+    let mut relay_task: Option<tokio::task::JoinHandle<anyhow::Result<()>>> = None;
+    if let Some(listener) = listener {
+        // 环回监听地址:中继客户端要用它拼本地 ws URL。listener 随后被 move 进
+        // 前端,故先取地址。
+        let addr = listener.local_addr()?;
+        // 每进程一张「设备 id → ws ClientId」表。本进程只会有一条 ws 前端(stdio
+        // 或纯 ws 二选一),故与 `serve_ws_inner` 一样经进程级句柄安装即可。
+        let device_clients = install_device_registry(Arc::new(StdMutex::new(HashMap::new())));
+        // axum 前端:握手鉴权、升级后把每条连接登记为 `ws-<uuid>`/Control,并把
+        // 帧灌进**同一个** `inbound_tx`、把出站登记进**同一个** hub。
+        frontend = Some(crate::ws::attach_ws_frontend(
+            listener,
+            Arc::clone(&hub),
+            inbound_tx.clone(),
+            Arc::clone(&client_scopes),
+            Arc::clone(&client_initialized),
+            device_clients,
+            Arc::clone(&pairing),
+        ));
+        // 中继客户端是 **outbound** 连接,不新增入站端口。仅在给了 `relay_url` 时
+        // 才起(生产路径);单测传 `None`,自己用共享 `pairing` 铸出的 token 连前端。
+        if let Some(relay_url) = relay_url.as_deref() {
+            let (relay_base, session) = parse_relay_url(relay_url)?;
+            let relay = url::Url::parse(&relay_base)
+                .map_err(|e| anyhow::anyhow!("invalid relay url `{relay_base}`: {e}"))?;
+            let app_server_ws =
+                url::Url::parse(&format!("ws://{addr}/ws")).expect("loopback ws url");
+            // 本机中继桥的凭据:与桌面共用同一个 `pairing`,现铸一枚 Control 设备
+            // (等价于本机走一次正常配对),交中继客户端带进 `?token=`。**不**把环回
+            // ws 改成免认证——那会削弱「准入即认证」。
+            let local_token = pairing.seed_local_device("relay-bridge");
+            relay_task = Some(tokio::spawn(async move {
+                yi_agent_relay::run_client(relay, app_server_ws, session, local_token).await
+            }));
+        }
+    }
+
+    // 原 `inbound_tx` 在这里就必须丢弃:此后入站 channel 的 sender 只剩
+    // `read_lines`(及合并模式下的 ws 前端)。否则它一直被本函数持有,stdio EOF
+    // 后 channel 永不关闭,主循环的 `recv()` 拿不到 `None`,优雅退出被拖住。
+    drop(inbound_tx);
+
     let result = serve(
         inbound_rx,
         Arc::clone(&hub),
@@ -1240,6 +1511,7 @@ where
         build_agent,
         client_scopes,
         client_initialized,
+        stdio_eof_rx.take(),
     )
     .await;
     // `serve` 返回(EOF 或传输错误)后主循环不再产出帧。摘除 `local` 客户端会
@@ -1248,6 +1520,15 @@ where
     // 退出而丢失(与改造前「写完才结束」的 stdio 语义不符)。
     hub.unregister(&local);
     let _ = pump.await;
+    // 合并模式收尾:stdio EOF(桌面退出)或前端出错后,前端监听任务与中继客户端
+    // 都必须停——二者都是 spawn 出的**独立**任务(tokio 在 JoinHandle drop 时不
+    // 取消),不显式 abort 就会继续 accept/重连。
+    if let Some(frontend) = frontend {
+        frontend.abort();
+    }
+    if let Some(relay_task) = relay_task {
+        relay_task.abort();
+    }
     result
 }
 
@@ -1259,6 +1540,10 @@ async fn read_lines<R>(
     reader: R,
     client: crate::broadcast::ClientId,
     tx: mpsc::Sender<(crate::broadcast::ClientId, anyhow::Result<String>)>,
+    // 合并模式下,stdio 读端「结束」要在主循环里被 `select!` 看到。纯 stdio 传
+    // `None`:此时 EOF 直接体现为入站 channel 关闭(`tx` 随本任务结束而 drop),
+    // 与改造前一致。
+    eof_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -1277,6 +1562,10 @@ async fn read_lines<R>(
                 break;
             }
         }
+    }
+    // 通知主循环「stdio 读端结束了」。纯 stdio 下 `eof_tx` 为 `None`,no-op。
+    if let Some(eof_tx) = eof_tx {
+        let _ = eof_tx.send(());
     }
 }
 
@@ -1387,6 +1676,9 @@ pub(crate) async fn serve<F>(
     // 每客户端 `initialize` 状态的共享表(见 [`ClientInitialized`]):放在主循环
     // 之外,传输层断连时才摘得掉键。主循环在此处插入/读取,不自己拥有它。
     client_initialized: ClientInitialized,
+    // 合并模式下 stdio 读端关闭的信号(见 `serve_scoped_core` 里 `read_lines` 的
+    // oneshot);纯 stdio / 纯 ws 传 `None`,该 `select!` 分支 `pending`。
+    mut stdio_eof: Option<std::pin::Pin<Box<tokio::sync::oneshot::Receiver<()>>>>,
 ) -> anyhow::Result<()>
 where
     F: Fn(
@@ -1464,6 +1756,15 @@ where
 
     loop {
         tokio::select! {
+            // 合并模式:stdio 读端 EOF → 结束整个循环(并丢弃 `inbound`),故
+            // 桌面关闭即整进程优雅退出(spec §3.2 不变量 4)。纯 stdio / 纯 ws
+            // 下该 future 为 `pending`(或 `None` 分支永不就绪)。
+            _ = async {
+                match stdio_eof.as_mut() {
+                    Some(rx) => { let _ = rx.await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => break,
             line = inbound.recv() => {
                 let Some((client, item)) = line else { break }; // EOF → graceful exit
                 // 早退守卫:某客户端(如被 `device/revoke` 踢掉、或被广播背压
@@ -11153,6 +11454,285 @@ pub(crate) mod tests {
         assert!(
             deltas_after >= 2,
             "readItems 之后回合必须仍在跑（仍持续产生 item/delta），实际 {deltas_after} 段"
+        );
+        h.shutdown().await;
+    }
+
+    // ---------- merged stdio + loopback ws (serve_stdio_with_relay) ----------
+
+    /// 合并模式接线:stdio 的 `reader`/`writer` + 一条已绑定的环回 ws listener,
+    /// 共用**一个** `serve()` 与同一套 hub/表。
+    ///
+    /// 与 [`Harness`] 不同,这里同时驱动两条前端(stdio 的 `local` 与 ws 的
+    /// `ws-<uuid>`),测试因此能证明两者共享同一张 `threads`。测试**不**起真中继:
+    /// ws 客户端直接用注入 `pairing` 铸出的 token 连环回 listener。
+    struct MergedHarness {
+        client_w: tokio::io::DuplexStream,
+        client_r: tokio::io::BufReader<tokio::io::DuplexStream>,
+        addr: std::net::SocketAddr,
+        token: String,
+        #[allow(dead_code)]
+        hub: Arc<crate::broadcast::Broadcaster>,
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+        /// 隔离的全局索引;持有它保证 tempdir 活到 harness 结束。
+        _index_dir: tempfile::TempDir,
+        /// 隔离的看板登记表目录,理由同 [`Harness::board_dir`]。
+        _board_dir: tempfile::TempDir,
+    }
+
+    impl MergedHarness {
+        async fn new() -> Self {
+            // 单测不起真中继。
+            Self::new_with_relay(None).await
+        }
+
+        /// [`MergedHarness::new`] 但可注入 `relay_url`:传 `Some` 时走生产路径
+        /// ——起中继客户端(可指向一个不可达端点,它只会退避重连)。用来验证
+        /// 中继接线不打断合并主循环、且 stdio EOF 时收尾仍返回。
+        async fn new_with_relay(relay_url: Option<String>) -> Self {
+            let cfg = test_config();
+            let (client_w, server_r) = tokio::io::duplex(64 * 1024);
+            let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+            let index_dir = tempfile::TempDir::new().unwrap();
+            let board_dir = tempfile::TempDir::new().unwrap();
+            let workspaces = Arc::new(WorkspaceIndex::new(
+                index_dir.path().join("workspaces.json"),
+            ));
+            let pairing = Arc::new(PairingState::new(crate::device_store::DeviceStore::new(
+                index_dir.path().join("devices.json"),
+            )));
+            let hub = Arc::new(crate::broadcast::Broadcaster::new());
+            let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            // stdin 侧本地客户端仍是生产 stdio 的 Admin。
+            let handle = tokio::spawn(serve_scoped_with_loopback(
+                server_r,
+                server_w,
+                cfg,
+                PERMISSION_TIMEOUT,
+                workspaces,
+                Arc::clone(&pairing),
+                Arc::clone(&hub),
+                RuntimeAttachments {
+                    runtimes: Arc::new(StdMutex::new(HashMap::new())),
+                    thread_roots: Arc::new(StdMutex::new(HashMap::new())),
+                    board_dir: board_dir.path().to_path_buf(),
+                    launcher: Arc::new(|_project: &Path| Ok(true)),
+                    theme,
+                },
+                build_test_agent,
+                Scope::Admin,
+                Some(listener),
+                relay_url,
+            ));
+            // 手机侧凭据:与主循环**共享**的 `pairing` 现铸,故 ws 前端认得。
+            let token = pairing.seed_local_device("relay-bridge");
+            Self {
+                client_w,
+                client_r: tokio::io::BufReader::new(client_r),
+                addr,
+                token,
+                hub,
+                handle,
+                _index_dir: index_dir,
+                _board_dir: board_dir,
+            }
+        }
+
+        async fn send(&mut self, line: &str) {
+            use tokio::io::AsyncWriteExt;
+            self.client_w.write_all(line.as_bytes()).await.unwrap();
+            self.client_w.write_all(b"\n").await.unwrap();
+            self.client_w.flush().await.unwrap();
+        }
+
+        async fn read_value(&mut self) -> serde_json::Value {
+            use tokio::io::AsyncBufReadExt;
+            let mut buf = String::new();
+            let n = tokio::time::timeout(Duration::from_secs(5), self.client_r.read_line(&mut buf))
+                .await
+                .expect("timed out waiting for a message")
+                .expect("read_line failed");
+            assert!(n > 0, "unexpected EOF while waiting for a message");
+            serde_json::from_str(buf.trim()).expect("server wrote invalid JSON")
+        }
+
+        async fn shutdown(self) {
+            let MergedHarness {
+                client_w, handle, ..
+            } = self;
+            drop(client_w);
+            let res = tokio::time::timeout(Duration::from_secs(5), handle)
+                .await
+                .expect("server must shut down within the timeout")
+                .expect("server task must not panic");
+            assert!(
+                res.is_ok(),
+                "merged server should return Ok on stdio EOF: {res:?}"
+            );
+        }
+
+        async fn connect_ws(
+            &self,
+        ) -> tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        > {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let uri: axum::http::Uri = format!("ws://{}/ws", self.addr).parse().unwrap();
+            let request = tokio_tungstenite::tungstenite::ClientRequestBuilder::new(uri)
+                .with_header("Authorization", format!("Bearer {}", self.token))
+                .into_client_request()
+                .unwrap();
+            let (ws, _) = tokio_tungstenite::connect_async(request)
+                .await
+                .expect("ws client must authenticate with the seeded token");
+            ws
+        }
+    }
+
+    async fn ws_send_json<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>, line: &str)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use futures::SinkExt as _;
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(line.into()))
+            .await
+            .unwrap();
+    }
+
+    async fn ws_recv_json<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> serde_json::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timed out waiting for a ws frame")
+            .expect("ws stream ended before a frame arrived")
+            .expect("ws transport error");
+        serde_json::from_str(msg.to_text().expect("server sent a non-text frame"))
+            .expect("server sent invalid JSON")
+    }
+
+    /// 读到 id 匹配的 ws 响应,丢弃中间穿插的通知/其它响应。
+    async fn ws_read_response<S>(
+        ws: &mut tokio_tungstenite::WebSocketStream<S>,
+        want: u64,
+    ) -> serde_json::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        for _ in 0..16 {
+            let v = ws_recv_json(ws).await;
+            if v.get("id") == Some(&serde_json::json!(want)) {
+                return v;
+            }
+        }
+        panic!("no ws response with id {want}");
+    }
+
+    /// 读到指定 method 的 ws 通知,丢弃中间帧;超时即失败。
+    async fn ws_await_notification<S>(
+        ws: &mut tokio_tungstenite::WebSocketStream<S>,
+        method: &str,
+    ) -> serde_json::Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        for _ in 0..16 {
+            let v = ws_recv_json(ws).await;
+            if v.get("method").and_then(|m| m.as_str()) == Some(method) {
+                return v;
+            }
+        }
+        panic!("no ws notification `{method}`");
+    }
+
+    /// 合并模式的扇出证明:stdio 的 `local` 与经环回 ws 的手机跑在**同一个**
+    /// `serve()` 上——stdio `thread/start` 后,ws 客户端既收到 `thread/started`
+    /// 通知,`thread/listAll` 也看到同一个 thread id。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merged_loop_fans_out_stdio_notifications_to_ws_client() {
+        let mut h = MergedHarness::new().await;
+        let mut ws = h.connect_ws().await;
+        crate::server::tests_support::initialize(&mut ws).await;
+
+        // stdio:initialize + thread/start。
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 1);
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let mut thread_id = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                thread_id = Some(v["result"]["thread_id"].as_str().unwrap().to_string());
+                break;
+            }
+        }
+        let thread_id = thread_id.expect("thread/start response");
+
+        // ws:同一个 thread 的通知必须扇出到这里。
+        let notif = ws_await_notification(&mut ws, "thread/started").await;
+        assert_eq!(
+            notif["params"]["thread_id"].as_str(),
+            Some(thread_id.as_str()),
+            "ws 客户端必须收到 stdio thread/start 触发的 thread/started"
+        );
+
+        // ws:thread/listAll 读到与 stdio 同一个 thread id(同一张表 + 同一工作区)。
+        ws_send_json(
+            &mut ws,
+            r#"{"jsonrpc":"2.0","id":2,"method":"thread/listAll","params":{}}"#,
+        )
+        .await;
+        let v = ws_read_response(&mut ws, 2).await;
+        let found = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap())
+            .any(|t| t["thread_id"].as_str() == Some(thread_id.as_str()));
+        assert!(
+            found,
+            "ws thread/listAll must see the stdio-started thread {thread_id}: {v}"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// 生产路径(带 `relay_url`)也要收敛:中继端点不可达时 `run_client` 只退避
+    /// 重连、不返回;stdio EOF 仍必须结束整个合并会话并返回 `Ok(())`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merged_loop_returns_ok_on_stdio_eof_with_relay_configured() {
+        // 未监听端口 = 中继不可达:客户端会失败并退避重连,永不阻塞启动。
+        let h = MergedHarness::new_with_relay(Some(
+            "ws://127.0.0.1:1/connect?session=unit".to_string(),
+        ))
+        .await;
+        // 手机仍能经环回前端握手(relay 只影响出站桥,不影响本地前端)。
+        let mut ws = h.connect_ws().await;
+        crate::server::tests_support::initialize(&mut ws).await;
+        h.shutdown().await;
+    }
+
+    /// 合并模式里手机仍是 `Control`:Admin-only 的 `pair/create` 必须被拒。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merged_loop_control_client_is_denied_admin_rpc() {
+        let h = MergedHarness::new().await;
+        let mut ws = h.connect_ws().await;
+        crate::server::tests_support::initialize(&mut ws).await;
+        ws_send_json(
+            &mut ws,
+            r#"{"jsonrpc":"2.0","id":2,"method":"pair/create","params":{}}"#,
+        )
+        .await;
+        let v = ws_read_response(&mut ws, 2).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "control client must be denied admin rpc: {v}"
         );
         h.shutdown().await;
     }

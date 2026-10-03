@@ -4191,6 +4191,7 @@ dependencies = [
  "uuid",
  "yi-agent-boards",
  "yi-agent-core",
+ "yi-agent-relay",
  "yi-agent-runtime",
  "yi-agent-store",
  "yi-agent-subagent",
