@@ -1052,19 +1052,25 @@ impl RuntimeCoordinator {
         Ok(())
     }
 
-    /// Opens a fork upload for an authorized application root. The payload's
-    /// size is declared up front: an oversized upload is rejected here, before
-    /// any bytes move, rather than being silently truncated later. A zero-byte
-    /// declaration is refused too: an empty fork payload is never legitimate,
-    /// and failing here beats failing later at JSON decode.
-    pub fn begin_fork_upload(
+    /// Opens a fork upload for an authorized caller. A caller is either the
+    /// application root or a subagent forking its own conversation, so the
+    /// capability check is the same one every other child-scoped operation uses
+    /// (`authorize_child_access`): the application root capability, or the
+    /// caller's own worker capability. A foreign or forged capability is still
+    /// refused. The payload's size is declared up front: an oversized upload is
+    /// rejected here, before any bytes move, rather than being silently
+    /// truncated later. A zero-byte declaration is refused too: an empty fork
+    /// payload is never legitimate, and failing here beats failing later at JSON
+    /// decode.
+    pub async fn begin_fork_upload(
         &self,
         session: &RootSessionId,
         caller: &TaskId,
         capability: &str,
         total_bytes: u64,
     ) -> Result<String, RuntimeCoordinatorError> {
-        self.authorize_application_root(session, caller, capability)?;
+        self.authorize_child_access(session, caller, capability)
+            .await?;
         if total_bytes == 0 {
             return Err(RuntimeCoordinatorError::ForkUpload(
                 "fork upload declares zero bytes".into(),

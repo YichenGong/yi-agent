@@ -3355,12 +3355,18 @@ fn respond(
         } => {
             let session_id = parse_id::<RootSessionId>(&session_id)?;
             let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
-            let fork_token = coordinator.begin_fork_upload(
+            // Authorization reaches the supervisor (root capability, or the
+            // caller's own worker capability when a subagent forks itself), so
+            // it must run on a runtime the same way the spawn arms do.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let fork_token = runtime.block_on(coordinator.begin_fork_upload(
                 &session_id,
                 &caller_task_id,
                 &capability,
                 total_bytes,
-            )?;
+            ))?;
             Ok(IpcResponse::ForkUploadStarted { fork_token })
         }
         IpcRequest::AppendForkChunk {

@@ -417,3 +417,120 @@ fn a_spawn_without_a_token_spawns_unforked() {
         "omitting the token keeps the old behavior: no fork"
     );
 }
+
+/// Spawns an ordinary (unforked) child and returns its task id.
+fn spawn_child(socket: &std::path::Path, session: &str, parent: &str, objective: &str) -> String {
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        socket,
+        IpcRequest::SpawnChild {
+            session_id: session.into(),
+            parent_task_id: parent.into(),
+            objective: objective.into(),
+            mode: None,
+            model: None,
+            workdir: None,
+            sandbox: None,
+            fork_token: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child");
+    };
+    task_id
+}
+
+/// The worker capability the daemon minted for `task`, read from the recorded
+/// worker start: this is the handle a subagent holds for its own conversation.
+fn child_capability(starts: &Arc<Mutex<Vec<WorkerStart>>>, task: &str) -> String {
+    let starts = starts.lock().unwrap();
+    let start = starts
+        .iter()
+        .find(|start| start.task_id.to_string() == task)
+        .expect("the child's worker started");
+    let capability = start.message_capability.clone();
+    assert!(
+        !capability.is_empty(),
+        "the daemon minted a worker capability for the child"
+    );
+    capability
+}
+
+/// The Critical, end to end over the socket: a child subagent forks its own
+/// conversation. Its caller task and worker capability - not the application
+/// root's - open the upload, and the token seeds a forked grandchild.
+#[test]
+fn a_child_caller_forks_its_own_child_over_the_socket() {
+    let (fixture, session, root, _root_capability) = forked_daemon();
+    let child = spawn_child(fixture.daemon.socket_path(), &session, &root, "child");
+    let capability = child_capability(&fixture.starts, &child);
+
+    let history = vec![Message::user("the child's own history")];
+    let token = upload_history(
+        fixture.daemon.socket_path(),
+        &session,
+        &child,
+        &capability,
+        &history,
+    );
+
+    let grandchild = {
+        let IpcResponse::TaskSpawned { task_id } = send_request(
+            fixture.daemon.socket_path(),
+            IpcRequest::SpawnChild {
+                session_id: session.clone(),
+                parent_task_id: child.clone(),
+                objective: "grandchild".into(),
+                mode: None,
+                model: None,
+                workdir: None,
+                sandbox: None,
+                fork_token: Some(token),
+            },
+        )
+        .unwrap() else {
+            panic!("a child's fork token must spawn its own child");
+        };
+        task_id
+    };
+
+    let starts = fixture.starts.lock().unwrap();
+    let start = starts
+        .iter()
+        .find(|start| start.task_id.to_string() == grandchild)
+        .expect("the forked grandchild's worker started");
+    assert_eq!(
+        start.fork_messages.as_deref(),
+        Some(history.as_slice()),
+        "the child's uploaded history reaches the forked grandchild worker"
+    );
+}
+
+/// The widening is not a free pass: a child caller (or any caller) presenting a
+/// capability that is not its own is still refused, and no token is created.
+#[test]
+fn a_child_presenting_a_foreign_capability_is_denied() {
+    let (fixture, session, root, root_capability) = forked_daemon();
+    let child = spawn_child(fixture.daemon.socket_path(), &session, &root, "child");
+
+    let response = send_request(
+        fixture.daemon.socket_path(),
+        IpcRequest::BeginForkUpload {
+            session_id: session.clone(),
+            caller_task_id: child,
+            capability: root_capability,
+            total_bytes: 4,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            response,
+            IpcResponse::Error {
+                code: IpcErrorCode::AuthorityDenied,
+                ..
+            }
+        ),
+        "the root capability named for a child caller cannot open an upload, got {response:?}"
+    );
+}

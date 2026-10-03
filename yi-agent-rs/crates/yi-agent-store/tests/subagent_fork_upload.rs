@@ -3,7 +3,7 @@
 //! has arrived. These tests exercise the in-memory state machine through the
 //! coordinator, with an attached application root as the authorized caller.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -18,10 +18,14 @@ use yi_agent_core::subagent::worker::{
 };
 use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeCoordinatorError};
 
-/// The upload machine never starts a worker; the factory only has to resolve the
-/// read-only application-root workspace that attaching the root requires.
+/// The upload machine never starts a worker for the root; the factory only has
+/// to resolve the read-only application-root workspace that attaching the root
+/// requires. It still records every `WorkerStart` so a test can read the worker
+/// capability the supervisor minted for a child and act as that child caller.
 #[derive(Default)]
-struct StaticWorkspaceFactory;
+struct StaticWorkspaceFactory {
+    starts: Arc<Mutex<Vec<WorkerStart>>>,
+}
 
 fn workspace(root: &RootSessionId, task: &TaskId) -> WorkerWorkspace {
     WorkerWorkspace {
@@ -63,7 +67,9 @@ impl WorkerWorkspaceProvider for StaticWorkspaceFactory {
 
 impl AgentWorkerFactory for StaticWorkspaceFactory {
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
-        Some(Arc::new(StaticWorkspaceFactory))
+        Some(Arc::new(StaticWorkspaceFactory {
+            starts: Arc::clone(&self.starts),
+        }))
     }
 
     fn recovery_context(&self) -> WorkerRecoveryContext {
@@ -76,7 +82,9 @@ impl AgentWorkerFactory for StaticWorkspaceFactory {
     }
 
     fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
-        Box::pin(async move { Ok(WorkerHandle::new(request.cancellation)) })
+        let handle = WorkerHandle::new(request.cancellation.clone());
+        self.starts.lock().unwrap().push(request);
+        Box::pin(async move { Ok(handle) })
     }
 }
 
@@ -86,6 +94,20 @@ struct ForkFixture {
     session: RootSessionId,
     caller: TaskId,
     capability: String,
+    /// Every worker start the factory observed, so a test can recover the worker
+    /// capability the supervisor minted for a spawned child.
+    starts: Arc<Mutex<Vec<WorkerStart>>>,
+}
+
+/// The worker start the factory recorded for `task`, if any.
+fn worker_start_for(starts: &Arc<Mutex<Vec<WorkerStart>>>, task: &TaskId) -> WorkerStart {
+    starts
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|start| &start.task_id == task)
+        .cloned()
+        .expect("the task's worker started")
 }
 
 /// Attaches a real application root so the fork upload has a capability-bearing
@@ -93,8 +115,14 @@ struct ForkFixture {
 async fn attached_root(fork_max_bytes: Option<u64>) -> ForkFixture {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
-    let coordinator =
-        RuntimeCoordinator::open(&database, Arc::new(StaticWorkspaceFactory)).unwrap();
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let coordinator = RuntimeCoordinator::open(
+        &database,
+        Arc::new(StaticWorkspaceFactory {
+            starts: Arc::clone(&starts),
+        }),
+    )
+    .unwrap();
     let coordinator = match fork_max_bytes {
         Some(bytes) => coordinator.with_fork_max_bytes(bytes),
         None => coordinator,
@@ -109,6 +137,7 @@ async fn attached_root(fork_max_bytes: Option<u64>) -> ForkFixture {
         session: attached.session_id,
         caller: attached.root_task_id,
         capability: attached.message_capability,
+        starts,
     }
 }
 
@@ -131,6 +160,7 @@ async fn a_complete_upload_is_accepted_and_consumed_once() {
             &fixture.capability,
             total,
         )
+        .await
         .unwrap();
     let received = fixture
         .coordinator
@@ -169,6 +199,7 @@ async fn an_incomplete_upload_is_rejected() {
             &fixture.capability,
             declared,
         )
+        .await
         .unwrap();
     let received = fixture
         .coordinator
@@ -200,6 +231,7 @@ async fn a_duplicate_or_out_of_order_seq_is_rejected() {
             &fixture.capability,
             total,
         )
+        .await
         .unwrap();
 
     assert!(
@@ -239,6 +271,7 @@ async fn a_total_over_the_cap_is_rejected_at_begin() {
     let error = fixture
         .coordinator
         .begin_fork_upload(&fixture.session, &fixture.caller, &fixture.capability, 5)
+        .await
         .unwrap_err();
     assert!(
         matches!(
@@ -257,6 +290,7 @@ async fn the_cap_boundary_is_inclusive_at_begin() {
         fixture
             .coordinator
             .begin_fork_upload(&fixture.session, &fixture.caller, &fixture.capability, 8)
+            .await
             .is_ok(),
         "a declaration of exactly the cap is accepted"
     );
@@ -264,6 +298,7 @@ async fn the_cap_boundary_is_inclusive_at_begin() {
     let error = fixture
         .coordinator
         .begin_fork_upload(&fixture.session, &fixture.caller, &fixture.capability, 9)
+        .await
         .unwrap_err();
     assert!(
         matches!(
@@ -293,6 +328,7 @@ async fn a_payload_that_exactly_fills_the_cap_is_accepted_and_a_further_chunk_is
             &fixture.capability,
             total,
         )
+        .await
         .unwrap();
 
     let received = fixture
@@ -323,6 +359,7 @@ async fn a_zero_byte_declaration_is_rejected_at_begin() {
     let error = fixture
         .coordinator
         .begin_fork_upload(&fixture.session, &fixture.caller, &fixture.capability, 0)
+        .await
         .unwrap_err();
     assert!(
         matches!(error, RuntimeCoordinatorError::ForkUpload(_)),
@@ -342,6 +379,7 @@ async fn a_chunk_that_overflows_the_expected_length_is_rejected() {
             &fixture.capability,
             total - 1,
         )
+        .await
         .unwrap();
 
     assert!(
@@ -359,6 +397,7 @@ async fn an_aborted_upload_has_no_live_token() {
     let token = fixture
         .coordinator
         .begin_fork_upload(&fixture.session, &fixture.caller, &fixture.capability, 4)
+        .await
         .unwrap();
 
     fixture.coordinator.abort_fork_upload(&token).unwrap();
@@ -393,6 +432,7 @@ async fn a_take_from_a_mismatched_tenant_is_rejected() {
             &fixture.capability,
             total,
         )
+        .await
         .unwrap();
     fixture
         .coordinator
@@ -434,9 +474,134 @@ async fn begin_rejects_an_unauthorized_caller() {
     let error = fixture
         .coordinator
         .begin_fork_upload(&fixture.session, &fixture.caller, "app-root-forged", 4)
+        .await
         .unwrap_err();
     assert!(
         matches!(error, RuntimeCoordinatorError::AuthorityDenied(_)),
         "a forged capability cannot open an upload, got {error:?}"
     );
+}
+
+/// The Critical this test closes: a subagent forks its own conversation, so the
+/// fork-upload authority cannot be application-root-only. A child authenticates
+/// with the worker capability the supervisor minted for its own task, opens an
+/// upload, and the token seeds a forked grandchild.
+#[tokio::test]
+async fn a_child_caller_opens_a_fork_upload_and_forks_its_own_child() {
+    let fixture = attached_root(None).await;
+    // The root spawns a child through the child-capability-bearing path. The
+    // child's worker start carries the capability that authenticates it.
+    let child = fixture
+        .coordinator
+        .spawn_child_and_admit(
+            &fixture.session,
+            &fixture.caller,
+            "child objective".into(),
+            yi_agent_core::ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let child_start = worker_start_for(&fixture.starts, &child);
+    let child_capability = child_start.message_capability.clone();
+    assert!(
+        !child_capability.is_empty(),
+        "the supervisor minted a worker capability for the child"
+    );
+
+    let history = vec![Message::user("child saw this"), Message::user("and this")];
+    let (encoded, total) = encoded_history(&history);
+    let token = fixture
+        .coordinator
+        .begin_fork_upload(&fixture.session, &child, &child_capability, total)
+        .await
+        .expect("a child can open a fork upload with its own worker capability");
+    fixture
+        .coordinator
+        .append_fork_chunk(&token, 0, &encoded)
+        .unwrap();
+
+    // The grandchild's fork must be taken for the child caller and the child's
+    // parent, exactly as the child's own spawn would name them.
+    let grandchild = fixture
+        .coordinator
+        .spawn_child_and_admit(
+            &fixture.session,
+            &child,
+            "grandchild objective".into(),
+            yi_agent_core::ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            Some(token.clone()),
+        )
+        .await
+        .unwrap();
+    let grandchild_start = worker_start_for(&fixture.starts, &grandchild);
+    assert_eq!(
+        grandchild_start.fork_messages.as_deref(),
+        Some(history.as_slice()),
+        "the child's uploaded history reaches the forked grandchild worker"
+    );
+}
+
+/// The root capability is per-attachment, and a worker capability is per-task:
+/// a capability valid for neither the attachment nor the caller is refused, and
+/// no upload state is created. This is the "still rejects a foreign caller"
+/// guard that keeps widening `begin_fork_upload` honest.
+#[tokio::test]
+async fn a_wrong_capability_creates_no_upload() {
+    let fixture = attached_root(None).await;
+    let child = fixture
+        .coordinator
+        .spawn_child_and_admit(
+            &fixture.session,
+            &fixture.caller,
+            "child objective".into(),
+            yi_agent_core::ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let other_child = fixture
+        .coordinator
+        .spawn_child_and_admit(
+            &fixture.session,
+            &fixture.caller,
+            "second child".into(),
+            yi_agent_core::ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let other_capability = worker_start_for(&fixture.starts, &other_child)
+        .message_capability
+        .clone();
+
+    // A root capability named for a child caller, and another child's worker
+    // capability, are both invalid: neither authenticates this caller.
+    for capability in [fixture.capability.clone(), other_capability] {
+        let error = fixture
+            .coordinator
+            .begin_fork_upload(&fixture.session, &child, &capability, 4)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RuntimeCoordinatorError::AuthorityDenied(_)),
+            "a capability that is not the caller's own is refused, got {error:?}"
+        );
+    }
 }
