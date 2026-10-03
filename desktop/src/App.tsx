@@ -1126,10 +1126,13 @@ export default function App() {
           <button
             type="button"
             aria-label="会话列表"
+            aria-expanded={sidebarOpen}
             onClick={() => setSidebarOpen(true)}
-            className="app-mobile-toggle flex w-8 shrink-0 items-start justify-center border-r border-line bg-panel pt-2 text-fg-muted hover:text-fg"
+            // 手机上的唯一会话入口：32px 的细条在触屏上既难点到也不好发现，放宽到
+            // 44px（Apple HIG 的最小触控目标）并放大图标。
+            className="app-mobile-toggle flex w-11 shrink-0 items-start justify-center border-r border-line bg-panel pt-2 text-fg-muted hover:text-fg"
           >
-            <svg viewBox="0 0 16 16" className="size-4" fill="currentColor" aria-hidden="true">
+            <svg viewBox="0 0 16 16" className="size-5" fill="currentColor" aria-hidden="true">
               <path d="M2 4h12v1.5H2V4Zm0 3.25h12v1.5H2v-1.5ZM2 10.5h12V12H2v-1.5Z" />
             </svg>
           </button>

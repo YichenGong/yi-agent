@@ -95,17 +95,22 @@
 }
 
 /*
- * 手机端首页的高度/宽度修正（桌面端不匹配这些选择器，逐字节不变）。
+ * 手机端（配对后的 iPhone 客户端）的贴合修正。
  *
+ * 全部规则都限定在 `[data-mobile="true"]` 下（由 `useIsMobile` 设在
+ * `<html>` 上），因此桌面端不匹配任何一条，布局与行为逐字节不变。
+ */
+
+/*
  * 高度：`.app-shell` 的 `100vh` 在 iOS 上不贴合可视高度——Safari 工具栏、以及被
  * `viewport-fit=cover` 放开的刘海/圆角区都不算进 `100vh`，底部输入框因此被顶出画面。
- * 这里让 `body` 自己成为 `100dvh` 的盒子（`box-sizing: border-box` 来自 preflight），
+ * 这里让 `body` 自己成为动态可视高度的盒子（`box-sizing: border-box` 来自 preflight），
  * 上下各让出安全区，`#root` 与 `.app-shell` 只填满这剩下的内容盒，三者不叠加计算。
- *
- * 宽度：`.app-sidebar` 是 `fixed` 抽屉，脱离文档流后安全区要自己补；宽度改为按视口
- * 收口（原先是桌面记忆的 256px 固定值），390pt 上不再只剩一条缝。
  */
 [data-mobile="true"] body {
+  /* 先给旧 webview 一个 `100vh` 回退，再让支持 `dvh` 的用动态可视高度覆盖：只写
+   * `100dvh` 时，Safari < 15.4 会因不认识该单位而落到 `height: auto`，比原来更糟。 */
+  height: 100vh;
   height: 100dvh;
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
@@ -117,14 +122,30 @@
 [data-mobile="true"] .app-shell {
   height: 100%;
 }
+
+/* iOS 上没有红绿灯按钮，这条 32px 的空标题栏只白占高度。 */
 [data-mobile="true"] .app-titlebar {
   display: none;
 }
+
+/*
+ * 宽度：`.app-sidebar` 是 `fixed` 的包裹层（见上方抽屉规则），父级内边距管不到它，
+ * 所以安全区要自己补；宽度改为按视口收口，替换掉桌面记忆下来的 256px 固定值——
+ * 390pt 的屏幕上那个宽度打开后几乎只剩一条缝。
+ */
 [data-mobile="true"] .app-sidebar {
   width: min(82vw, 340px);
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
   overscroll-behavior: contain;
+}
+/*
+ * 安全区落在真正会滚动的元素（`ThreadSidebar` 的 `aside`）上：列表滚动到底时，
+ * 最后一行才不会被 Home Indicator 压住。
+ */
+[data-mobile="true"] .app-sidebar aside {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
 /* 抽屉展开时的背板，点它收起；只在手机端抽屉打开时渲染，故无需前缀。 */

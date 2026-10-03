@@ -26,15 +26,20 @@ describe("phone viewport metadata", () => {
 });
 
 describe("phone layout CSS", () => {
-  it("fits the shell to the dynamic viewport instead of the iOS 100vh", () => {
+  it("fits the shell to the dynamic viewport, with a vh fallback", () => {
     // `100vh` 在 iOS 上大于可视高度（Safari 工具栏 + 刘海区都不计入），底部输入框
-    // 因此被顶出画面。`100dvh` 跟的是动态可视高度。
-    expect(css()).toMatch(/\[data-mobile="true"\]\s+body\s*\{[^}]*height:\s*100dvh/);
+    // 因此被顶出画面。`100dvh` 跟的是动态可视高度；但 Safari < 15.4 不认识 `dvh`，
+    // 必须先给 `100vh` 回退，否则会落到 `height: auto`（比不修更糟）。
+    const rule = /\[data-mobile="true"\]\s+body\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(rule).toMatch(/height:\s*100vh/);
+    expect(rule).toMatch(/height:\s*100dvh/);
+    // 覆盖必须晚于回退（后者写在前、前者写在后）。
+    expect(rule.indexOf("100vh")).toBeLessThan(rule.indexOf("100dvh"));
   });
 
   it("boxes the safe areas into that height so they are not added on top", () => {
-    // body 的上下安全区内边距必须与 `100dvh` 同处一个 `border-box` 高度的盒子里，
-    // 否则两条留白会把内容整体撑高，抵消 `100dvh` 的修正。
+    // body 的上下安全区内边距必须与动态视口高度同处一个 `border-box` 高度的盒子里，
+    // 否则两条留白会把内容整体撑高，抵消高度修正。
     expect(css()).toMatch(
       /\[data-mobile="true"\]\s+body\s*\{[^}]*padding-top:\s*env\(safe-area-inset-top[^}]*padding-bottom:\s*env\(safe-area-inset-bottom/,
     );
@@ -45,11 +50,18 @@ describe("phone layout CSS", () => {
     expect(css()).toMatch(/\[data-mobile="true"\]\s+\.app-titlebar\s*\{[^}]*display:\s*none/);
   });
 
-  it("gives the fixed drawer its own safe-area insets", () => {
-    // 抽屉是 `position: fixed`，脱离文档流，父级的内边距管不到它——刘海会盖住
-    // 「New thread」。
+  it("gives the drawer's scrolling element its own safe-area insets", () => {
+    // 抽屉是 `position: fixed`，脱离文档流，父级的内边距管不到它。安全区要落在
+    // 真正会滚动的 `aside` 上，滚动到底时最后一行才不被 Home Indicator 压住。
     expect(css()).toMatch(
-      /\[data-mobile="true"\]\s+\.app-sidebar\s*\{[^}]*safe-area-inset-top[^}]*safe-area-inset-bottom/,
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+aside\s*\{[^}]*safe-area-inset-top[^}]*safe-area-inset-bottom/,
     );
+  });
+
+  it("constrains free-standing images so overflow-x-hidden cannot clip them", () => {
+    // typography 基准里 `img` 只有上下外边距、没有 `max-width`；会话列一旦
+    // `overflow-x-hidden`，超宽图片被裁掉的部分将永久不可达。
+    const src = readFileSync(`${dir}/components/MarkdownText.tsx`, "utf8");
+    expect(src).toContain("prose-img:max-w-full");
   });
 });

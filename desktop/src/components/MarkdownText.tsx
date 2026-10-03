@@ -1,4 +1,4 @@
-import { memo, type ComponentProps, type ReactNode } from "react";
+import { memo, type ComponentPropsWithoutRef, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -39,12 +39,25 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
  *
  * 不启用 rehype-raw —— react-markdown 默认丢弃原始 HTML,天然防 XSS。
  *
- * `table` 与 `pre` 都要在**自己的框内**横向滚动，而不是把整列撑宽（见 `TableBlock`
- * 与容器上的 `prose-pre:overflow-x-auto`）：手机端 markdown 表格实测 615px，是
- * 390pt 视口的 1.6 倍，不收口就会把会话列撑破、整页可横向拖动。
+ * 三个宽度收口点（手机窄屏上 agent 常输出长表格/长命令行）：
+ * - `TableBlock`：把 `table` 包进 `overflow-x-auto` 的盒子，让表格**在自己的框内**
+ *   横向滚动。原先没有这层，表格（实测 615px，视口仅 390pt）会把 markdown 容器
+ *   一路撑宽到整个会话列，`ChatView` 因此可横向拖动、左移后右侧全是空白。
+ * - `prose-img:max-w-full`：typography 基准里 `img` 只有上下外边距（无 `max-width`），
+ *   宽图会顶破气泡；`overflow-x-hidden` 一旦生效，超出的部分将**永久不可达**。
+ * - `break-words`：长 URL、无空格哈希这类不可断词的 inline 内容就地折行。
+ *
+ * `pre` 不必再加 `overflow-x-auto`：typography 基准已给 `pre { overflow-x: auto }`，
+ * 代码块本来就是自己的滚动容器。
  */
-const TableBlock = ({ children, ...props }: ComponentProps<"table">) => (
-  // 外层只负责收口滚动；`table` 自身的样式（含 prose 的 `min-width`）不受影响。
+const TableBlock = ({
+  children,
+  node: _node,
+  ...props
+}: ComponentPropsWithoutRef<"table"> & { node?: unknown }) => (
+  // `node` 是 react-markdown 注入的 AST 节点，不能落到 DOM 上（会渲染成
+  // `node="[object Object]"`）；解构剔除后其余属性照常透传。
+  // 外层只负责收口滚动；`table` 自身的样式（含 prose 的 `width`）不受影响。
   <div className="overflow-x-auto">
     <table {...props}>{children}</table>
   </div>
@@ -53,7 +66,7 @@ const TableBlock = ({ children, ...props }: ComponentProps<"table">) => (
 export const MarkdownText = memo(
   function MarkdownText({ text }: { text: string }) {
     return (
-      <div className="prose prose-invert max-w-none break-words prose-pre:overflow-x-auto prose-pre:bg-panel">
+      <div className="prose prose-invert max-w-none break-words prose-img:max-w-full prose-pre:bg-panel">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           rehypePlugins={[rehypeHighlight]}
