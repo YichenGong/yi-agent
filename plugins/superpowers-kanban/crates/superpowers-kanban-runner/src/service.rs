@@ -405,8 +405,18 @@ impl BoardService {
                 "plan_path": card.plan_path,
                 "workdir": card.workdir,
                 "thread_id": card.thread_id,
+                "kind": card.kind,
+                "source": card.source_ref,
+                "base": card.base_ref,
+                "origin_card": card.origin_card.as_ref().map(|id| id.0.clone()),
             })).collect::<Vec<_>>(),
         })
+    }
+
+    /// 看板上未被占用的合并卡 id（供 dispatch / CLI 共用）。
+    pub fn next_free_merge_id(&self, source: &str, base: &str) -> String {
+        let inner = self.lock();
+        inner.board.next_free_merge_id(source, base).0
     }
 
     /// 仅测试用：把某张卡片的 `thread_id` 清成 `None`，模拟旧数据。
