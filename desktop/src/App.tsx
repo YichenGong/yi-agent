@@ -1141,7 +1141,21 @@ export default function App() {
             onClick={() => setSidebarOpen(false)}
           />
         )}
-        <div className={isMobile ? `app-sidebar${sidebarOpen ? " sidebar-open" : ""}` : undefined}>
+        {/*
+         * 包裹层必须自己也是 flex 容器并带 `min-h-0`。它无条件存在（桌面端只是
+         * 没有手机类名），而 `ThreadSidebar` 的 `aside` 是 flex item：若包裹层是
+         * 块级容器，`aside` 会按内容取高并溢出这一行，行内随之长高、撑大整个文档，
+         * 于是内层 `flex-1 overflow-y-auto` 永远不溢出（不滚动），页面本身却能上下
+         * 滑动。`shrink-0` 锁住既有宽度（原先 `flex-basis:auto` 也不收缩），故桌面
+         * 与手机布局逐像素不变，仅去掉溢出。
+         */}
+        <div
+          className={
+            isMobile
+              ? `app-sidebar flex min-h-0 shrink-0${sidebarOpen ? " sidebar-open" : ""}`
+              : "flex min-h-0 shrink-0"
+          }
+        >
         <ThreadSidebar
           groups={groups}
           workspaces={workspaces}
