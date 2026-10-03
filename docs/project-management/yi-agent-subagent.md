@@ -62,6 +62,22 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
 - [x] 端到端装配契约 — `tests/attach_delegation.rs`：干净 git 项目 attach → 激活两次
   （证明幂等）→ 注册的委派工具存在 → `SpawnApplicationChild` 被 daemon 接纳并返回
   child task id → detach；这是 TUI 与 app-server 共用的那条链路的可执行说明
+- [x] `spawn_agent` 的 `fork` 参数与调用者上下文 fork — 两个 spawn 工具新增 `fork`
+  （`boolean`，`default:false`，`required` 仍只有 `task`，显式非布尔值报错而非忽略）；
+  `CallerContext`（`src/lib.rs:1296`）持调用者会话的**活 `Arc<Mutex<Session>>`**，
+  每次调用经 `snapshot()` 读取「此刻」的 `forkable_messages`（协议有效性裁剪，末位悬空
+  `tool_use` 丢弃），故 Agent 重建/compact 不会让工具读到陈旧转录；`fork:true` 时
+  `upload_forked_context`（`src/lib.rs:1564`）把 JSON 历史按 256 KiB 原始切片（`FORK_CHUNK_BYTES`）
+  base64 后逐块 `BeginForkUpload`/`AppendForkChunk`，返回的 `fork_token` 填进
+  `SpawnApplicationChild`；`fork:false`（或省略）逐字节走原路径、不建上传。任何
+  begin 之后的失败都 `abort_fork_upload` 回收 token（避免 daemon 进程内泄漏载荷）；
+  无绑定 caller 却要 fork 时显式报错 `fork requested but no caller context available`，
+  绝不静默回退。worker 侧 `start_with_provider_turn_gate`（`src/lib.rs:658`）在
+  `with_session(Session::from_messages(fork))` **之后** `worker_caller.bind(session_handle())`，
+  把子 worker 自己的委派工具绑到其实时会话（顺带支持子 agent fork 自己）。验证：
+  `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent --test subagent_fork_e2e`
+  （后者经**真实注册工具 + 真实 daemon + 真实 worker 工厂**，断言子 worker 首个 provider
+  请求含父历史且 objective 居后，省略 `fork` 时只含 objective）— [设计](../superpowers/specs/2026-10-02-subagent-context-fork-design.md)
 
 **边界（两端口一致，故记在这里）：** attach 与工具注册**不看**项目是不是 git 仓库（非
 git 目录原地成 root，`workspace_root == project_root`），真正需要仓库的是后续 `spawn_agent`
