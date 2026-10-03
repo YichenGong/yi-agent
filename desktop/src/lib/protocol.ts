@@ -175,6 +175,10 @@ export interface ThreadSummary {
   status?: ThreadStatus;
   /** 是否置于侧栏顶部的 Pinned 分区。旧服务端缺省视为 false。 */
   pinned?: boolean;
+  /** 由看板创建时，该会话所属的项目根（绝对路径）。旧服务端缺省视为普通会话。 */
+  board_project?: string;
+  /** 由看板创建时，该会话对应的卡 id。旧服务端缺省视为普通会话。 */
+  card_id?: string;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */

@@ -122,6 +122,16 @@ export function ThreadSidebar({
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // 置顶分区自身的折叠状态（与工作区分组的折叠互不影响）。
   const [pinnedCollapsed, setPinnedCollapsed] = useState(false);
+  // 「看板会话」小节的折叠状态：独立于项目组的 `collapsed`，键为 workspace。
+  const [boardCollapsed, setBoardCollapsed] = useState<Set<string>>(new Set());
+  const toggleBoardCollapse = (ws: string) => {
+    setBoardCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(ws)) next.delete(ws);
+      else next.add(ws);
+      return next;
+    });
+  };
   // 置顶分区内的拖拽：拖动中的 thread_id + 当前悬停的行下标。
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
@@ -403,6 +413,34 @@ export function ThreadSidebar({
     );
   };
 
+  /**
+   * 项目组内的「看板会话」小节：只收 `card_id` 非空的会话，默认折叠。
+   * 折叠状态独立于项目组（键 `board:${workspace}`），互不牵连。
+   *
+   * 刻意不依赖看板是否仍登记：看板被移除后（spec §5），卡片会话仍须留在这个
+   * 小节里可见，绝不能因为 `kanbanItemFor` 变 null 就整批消失。
+   */
+  const renderBoardThreads = (g: WorkspaceGroup) => {
+    const cards = g.threads.filter((t) => !t.pinned && t.card_id);
+    if (cards.length === 0) return null;
+    const isBoardCollapsed = !boardCollapsed.has(g.workspace);
+    return (
+      <div key={`board-threads:${g.workspace}`}>
+        <button
+          type="button"
+          aria-label="看板会话"
+          aria-expanded={!isBoardCollapsed}
+          onClick={() => toggleBoardCollapse(g.workspace)}
+          className="flex w-full items-center gap-1 px-2 py-1 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
+        >
+          <span className="shrink-0 px-0.5">{isBoardCollapsed ? "▸" : "▾"}</span>
+          <span className="min-w-0 flex-1 truncate text-left">看板会话 ({cards.length})</span>
+        </button>
+        {!isBoardCollapsed && cards.map((t) => renderThread(t, { rowAttr: "group" }))}
+      </div>
+    );
+  };
+
   return (
     <aside
       className="relative flex shrink-0 flex-col border-r border-line bg-panel"
@@ -582,9 +620,10 @@ export function ThreadSidebar({
                 </>
               )}
               {!isCollapsed && kanbanItemFor(g.workspace, boards) && renderBoardEntry(g.workspace)}
+              {!isCollapsed && renderBoardThreads(g)}
               {!isCollapsed &&
                 g.threads
-                  .filter((t) => !t.pinned)
+                  .filter((t) => !t.pinned && !t.card_id)
                   .map((t) => renderThread(t, { rowAttr: "group" }))}
             </div>
           );

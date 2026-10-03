@@ -39,6 +39,12 @@ pub struct ThreadMeta {
     /// 旧 meta 缺字段时默认 `None`。
     #[serde(default)]
     pub pin_seq: Option<i64>,
+    /// 该会话由看板创建时，它所属的项目根（绝对路径，canonical）。None = 普通会话。
+    #[serde(default)]
+    pub board_project: Option<String>,
+    /// 该会话对应的看板卡 id。None = 普通会话。
+    #[serde(default)]
+    pub card_id: Option<String>,
 }
 
 /// 一次 turn 的 token 用量。
@@ -637,6 +643,8 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         title: first_user_text(messages),
         permission_mode: ThreadMode::Normal,
         pin_seq: None,
+        board_project: None,
+        card_id: None,
     }
 }
 
@@ -661,6 +669,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
+            board_project: None,
+            card_id: None,
         }
     }
 
@@ -1262,6 +1272,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
+            board_project: None,
+            card_id: None,
         }
     }
 
@@ -1543,5 +1555,32 @@ mod tests {
         store.write_partial("thread-a", &PartialTurn::default()).unwrap();
         store.truncate("thread-a").unwrap();
         assert!(!dir.path().join(".yi-agent/threads/thread-a.partial.json").exists());
+    }
+    #[test]
+    fn a_meta_without_board_fields_defaults_to_none() {
+        let json = r#"{"thread_id":"t1","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
+        let meta: ThreadMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.board_project, None, "旧 meta 缺字段必须回 None");
+        assert_eq!(meta.card_id, None);
+    }
+
+    #[test]
+    fn board_fields_round_trip() {
+        let meta = ThreadMeta {
+            thread_id: "t1".into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            created_at: 1,
+            updated_at: 2,
+            title: None,
+            permission_mode: ThreadMode::Normal,
+            pin_seq: None,
+            board_project: Some("/proj".into()),
+            card_id: Some("c1".into()),
+        };
+        let text = serde_json::to_string(&meta).unwrap();
+        let back: ThreadMeta = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.board_project.as_deref(), Some("/proj"));
+        assert_eq!(back.card_id.as_deref(), Some("c1"));
     }
 }

@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
+use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
 use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
@@ -29,7 +30,6 @@ use crate::protocol::{
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
 };
-use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
@@ -2389,38 +2389,92 @@ where
                         }
                     }
                     "thread/listAll" => {
-                        // 跨目录汇总:按索引顺序(最近的在前)遍历每个 workspace,
-                        // 组内是该目录 store 的 thread(updated_at 降序)。
-                        // 失效目录先 stat 跳过,不做深扫,但仍报表该组(exists:false),
-                        // 供侧栏置灰展示。
-                        let mut groups: Vec<serde_json::Value> = Vec::new();
-                        for dir in workspaces.list() {
-                            let path = Path::new(&dir);
-                            let exists = path.is_dir();
-                            let threads: Vec<serde_json::Value> = if exists {
-                                // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
-                                // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
-                                match crate::thread_store::ThreadStore::new(path).list() {
-                                    Ok(metas) => metas
-                                        .into_iter()
-                                        .map(|m| thread_summary_json(&m, &threads))
-                                        .collect(),
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[app-server] thread/listAll failed to list {dir}: {e}"
-                                        );
-                                        Vec::new()
-                                    }
+                        // 分组两段式,与抽取前逐字等价,只多一层「归属优先」的折拢:
+                        // ① 按索引顺序(最近在前)为**每个**目录建组——含失效目录
+                        //   (exists:false、threads 空,不深扫),普通会话留在本目录组;
+                        // ② 带 `board_project` 的卡片会话折进它所属的项目组(项目可不在
+                        //   索引里,则合成一组);只含卡片会话的目录(卡片 worktree)
+                        //   第一段被抑制,不再顶层成组。
+                        // **不动索引**:目录仍留在 workspaces 里,冷会话定位靠它。
+                        let dirs = workspaces.list();
+                        // 组顺序:先索引目录(保持最近在前),再追加索引外的新项目组。
+                        let mut order: Vec<String> = Vec::new();
+                        let mut seen: HashSet<String> = HashSet::new();
+                        let mut exists_of: HashMap<String, bool> = HashMap::new();
+                        let mut plain: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+                        let mut cards: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+                        for dir in &dirs {
+                            if seen.insert(dir.clone()) {
+                                order.push(dir.clone());
+                                exists_of.insert(dir.clone(), Path::new(dir).is_dir());
+                            }
+                            // 失效目录:不深扫,组照留(threads 空),与抽取前一致。
+                            let path = Path::new(dir);
+                            if !path.is_dir() {
+                                continue;
+                            }
+                            // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
+                            // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
+                            let metas = match crate::thread_store::ThreadStore::new(path).list() {
+                                Ok(metas) => metas,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[app-server] thread/listAll failed to list {dir}: {e}"
+                                    );
+                                    Vec::new()
+                                }
+                            };
+                            let own: Vec<_> = metas
+                                .iter()
+                                .filter(|m| m.board_project.is_none())
+                                .collect();
+                            // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
+                            // 否则它只是卡片 worktree,归拢后被抑制。
+                            if !own.is_empty() || metas.is_empty() {
+                                for m in own {
+                                    plain.entry(dir.clone())
+                                        .or_default()
+                                        .push(thread_summary_json(m, &threads));
                                 }
                             } else {
-                                Vec::new()
-                            };
-                            groups.push(json!({
-                                "workspace": dir,
-                                "exists": exists,
-                                "threads": threads,
-                            }));
+                                // 只含卡片会话:抑制顶层空组(稍后不产出)。
+                                seen.remove(dir);
+                                order.retain(|d| d != dir);
+                            }
+                            // 卡片会话:归入 board_project 指定的组(可为索引外的项目)。
+                            for m in metas.iter().filter(|m| m.board_project.is_some()) {
+                                let target = m.board_project.clone().unwrap();
+                                if seen.insert(target.clone()) {
+                                    order.push(target.clone());
+                                    exists_of.insert(
+                                        target.clone(),
+                                        Path::new(&target).is_dir(),
+                                    );
+                                }
+                                exists_of
+                                    .entry(target.clone())
+                                    .or_insert_with(|| Path::new(&target).is_dir());
+                                cards
+                                    .entry(target)
+                                    .or_default()
+                                    .push(thread_summary_json(m, &threads));
+                            }
                         }
+                        let groups: Vec<serde_json::Value> = order
+                            .iter()
+                            .map(|ws| {
+                                let mut merged =
+                                    plain.remove(ws).unwrap_or_default();
+                                if let Some(mut folded) = cards.remove(ws) {
+                                    merged.append(&mut folded);
+                                }
+                                json!({
+                                    "workspace": ws,
+                                    "exists": exists_of.get(ws).copied().unwrap_or(false),
+                                    "threads": merged,
+                                })
+                            })
+                            .collect();
                         let pinned: Vec<serde_json::Value> = collect_pinned(&workspaces)
                             .iter()
                             .map(|m| thread_summary_json(m, &threads))
@@ -2474,6 +2528,8 @@ where
                             &perm_seq,
                             &theme,
                             &workspaces,
+                            None,
+                            None,
                         )
                         .await?;
 
@@ -4209,6 +4265,8 @@ fn thread_summary_json(
         "title": m.title,
         "permission_mode": m.permission_mode,
         "pinned": m.pin_seq.is_some(),
+        "board_project": m.board_project,
+        "card_id": m.card_id,
         "status": thread_status(threads, &m.thread_id),
     })
 }
@@ -5094,14 +5152,8 @@ async fn card_scheduler_tick<F>(
             workspaces,
             build_agent,
         };
-        crate::card_scheduler::run_once(
-            &board.project,
-            board_dir,
-            tracked,
-            &mut launcher,
-            &flags,
-        )
-        .await;
+        crate::card_scheduler::run_once(&board.project, board_dir, tracked, &mut launcher, &flags)
+            .await;
     }
 }
 
@@ -5190,6 +5242,8 @@ where
             self.perm_seq,
             self.theme,
             self.workspaces,
+            Some(&request.board_project),
+            Some(&request.card_id),
         )
         .await?;
 
@@ -5199,9 +5253,7 @@ where
         if !request.title.is_empty() {
             if let Some(session) = self.threads.get(&thread_id) {
                 if let Err(error) = session.store.rename(&thread_id, &request.title) {
-                    eprintln!(
-                        "[app-server] could not title board thread {thread_id}: {error}"
-                    );
+                    eprintln!("[app-server] could not title board thread {thread_id}: {error}");
                 }
             }
         }
@@ -5346,6 +5398,8 @@ async fn start_thread_core(
     perm_seq: &Arc<AtomicU64>,
     theme: &crate::theme_tool::ThemeHandle,
     workspaces: &WorkspaceIndex,
+    board_project: Option<&str>,
+    card_id: Option<&str>,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -5391,6 +5445,8 @@ async fn start_thread_core(
         title: None,
         permission_mode: mode,
         pin_seq: None,
+        board_project: board_project.map(str::to_string),
+        card_id: card_id.map(str::to_string),
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -6262,8 +6318,8 @@ mod card_scheduling_tests {
     impl FakeDaemon {
         fn bind(
             on_query: impl Fn(&Path, &str, &serde_json::Value) -> Result<serde_json::Value, String>
-                + Send
-                + 'static,
+            + Send
+            + 'static,
         ) -> Self {
             let dir = tempfile::TempDir::new().unwrap();
             let project = dir.path().join("project");
@@ -6451,7 +6507,10 @@ mod card_scheduling_tests {
                     return self.is_idle(thread_id);
                 }
                 match tokio::time::timeout(remaining, self.turn_rx.recv()).await {
-                    Ok(Some(TurnEvent::Finished { thread_id: id, turn_id })) => {
+                    Ok(Some(TurnEvent::Finished {
+                        thread_id: id,
+                        turn_id,
+                    })) => {
                         if let Some(session) = self.threads.get_mut(&id) {
                             if session.active_turn_id.as_deref() == Some(turn_id.as_str()) {
                                 session.active_turn_id = None;
@@ -6482,6 +6541,7 @@ mod card_scheduling_tests {
     fn request(card_id: &str, workdir: &str) -> LaunchRequest {
         LaunchRequest {
             card_id: card_id.to_string(),
+            board_project: "/test/project".to_string(),
             workdir: workdir.to_string(),
             title: format!("看板 · {card_id}"),
             objective: format!("Implement the plan for {card_id}"),
@@ -6517,7 +6577,10 @@ mod card_scheduling_tests {
         };
 
         assert_eq!(host.threads.len(), 1, "the board thread is registered");
-        let session = host.threads.get(&thread_id).expect("the session is visible");
+        let session = host
+            .threads
+            .get(&thread_id)
+            .expect("the session is visible");
         assert_eq!(session.cwd, workdir.to_string_lossy());
         assert!(
             session.active_turn_id.is_some(),
@@ -6679,7 +6742,11 @@ mod card_scheduling_tests {
                     ) && session.active_turn_id.is_none();
                     table.insert(
                         id.clone(),
-                        ThreadFlags { idle, failed: false, needs_you: false },
+                        ThreadFlags {
+                            idle,
+                            failed: false,
+                            needs_you: false,
+                        },
                     );
                 }
             }
@@ -6707,7 +6774,10 @@ mod card_scheduling_tests {
             terminal[0]["params"]["outcome"], "awaiting_merge",
             "failed/needs_you have no production source yet, so awaiting_merge is the only outcome"
         );
-        assert!(tracked.is_empty(), "the reconciled card stops being tracked");
+        assert!(
+            tracked.is_empty(),
+            "the reconciled card stops being tracked"
+        );
     }
 
     /// 孤儿恢复:插件报 `running` 但**没有 thread_id**(本进程无法接手)的卡被
@@ -6776,6 +6846,69 @@ mod card_scheduling_tests {
         assert_eq!(running[0]["params"]["card_id"], "card-1");
 
         h.shutdown().await;
+    }
+
+    /// 一张卡被起成会话后：它落盘的 meta 与 `thread/listAll` 的条目都必须带
+    /// `board_project`(项目根) 与 `card_id`——这是侧栏归组的唯一依据。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_launched_card_records_its_board_origin() {
+        let workdir_dir = tempfile::TempDir::new().unwrap();
+        let workdir = workdir_dir.path().canonicalize().unwrap();
+        let handed = Arc::new(AtomicBool::new(false));
+        let work_path = workdir.to_string_lossy().to_string();
+        let daemon = FakeDaemon::bind(move |_project, method, _params| match method {
+            "board.next_launch" => {
+                if handed.swap(true, Ordering::SeqCst) {
+                    Ok(serde_json::Value::Null)
+                } else {
+                    Ok(json!({
+                        "card_id": "card-1",
+                        "workdir": work_path,
+                        "title": "看板 · card-1"
+                    }))
+                }
+            }
+            "list" => Ok(json!({ "cards": [{
+                "id": "card-1", "state": "running",
+                "spec_path": "card-1.spec.md", "plan_path": "card-1.plan.md"
+            }] })),
+            _ => Ok(json!({ "ok": true })),
+        });
+
+        let mut host = Host::new();
+        let board_dir = tempfile::TempDir::new().unwrap();
+        yi_agent_boards::registry::register(board_dir.path(), &daemon.project).unwrap();
+        let flags = Arc::new(StdMutex::new(HashMap::<String, ThreadFlags>::new()));
+        let mut tracked: HashMap<String, TrackedThread> = HashMap::new();
+        {
+            let snapshot = Arc::clone(&flags);
+            let flags_fn = move |id: &str| snapshot.lock().unwrap().get(id).copied();
+            let mut launcher = host.launcher(&build_test_agent);
+            crate::card_scheduler::run_once(
+                &daemon.project,
+                board_dir.path(),
+                &mut tracked,
+                &mut launcher,
+                &flags_fn,
+            )
+            .await;
+        }
+
+        // meta 落盘：归属写进了卡片会话自己的 meta.json。
+        let metas = crate::thread_store::ThreadStore::new(&workdir)
+            .list()
+            .unwrap();
+        assert_eq!(metas.len(), 1, "the card session persists exactly one meta");
+        let expected_project = std::fs::canonicalize(&daemon.project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            metas[0].board_project.as_deref(),
+            Some(expected_project.as_str()),
+            "meta must carry the project root"
+        );
+        assert_eq!(metas[0].card_id.as_deref(), Some("card-1"));
     }
 }
 
@@ -10044,6 +10177,153 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    async fn list_all(h: &mut Harness) -> serde_json::Value {
+        h.send(r#"{"jsonrpc":"2.0","id":901,"method":"thread/listAll","params":{}}"#)
+            .await;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(901)) {
+                return v;
+            }
+        }
+        panic!("thread/listAll must respond");
+    }
+
+    async fn add_workspace(h: &mut Harness, id: u64, path: &str) {
+        h.send(
+            &serde_json::json!({"jsonrpc":"2.0","id":id,"method":"workspace/add",
+            "params":{"path": path}})
+            .to_string(),
+        )
+        .await;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(id)) {
+                return;
+            }
+        }
+        panic!("workspace/add must respond");
+    }
+
+    fn write_meta(
+        dir: &Path,
+        id: &str,
+        title: &str,
+        board_project: Option<&str>,
+        card_id: Option<&str>,
+    ) {
+        let meta = crate::thread_store::ThreadMeta {
+            thread_id: id.into(),
+            cwd: dir.to_string_lossy().into(),
+            model: "m".into(),
+            created_at: 0,
+            updated_at: 0,
+            title: Some(title.into()),
+            permission_mode: crate::thread_store::ThreadMode::Normal,
+            pin_seq: None,
+            board_project: board_project.map(str::to_string),
+            card_id: card_id.map(str::to_string),
+        };
+        crate::thread_store::ThreadStore::new(dir)
+            .create(&meta)
+            .unwrap();
+    }
+
+    /// 卡片会话(在 worktree、board_project=项目) 折进项目组；worktree 不再顶层成组。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_board_thread_folds_into_its_project_group() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let worktree_dir = tempfile::TempDir::new().unwrap();
+        let project = project_dir.path().canonicalize().unwrap();
+        let worktree = worktree_dir.path().canonicalize().unwrap();
+        let p = project.to_string_lossy().to_string();
+        let w = worktree.to_string_lossy().to_string();
+
+        write_meta(&project, "t-plain", "plain", None, None);
+        write_meta(
+            &worktree,
+            "t-card",
+            "看板 · card-1",
+            Some(&p),
+            Some("card-1"),
+        );
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 11, &w).await; // worktree 进索引(=卡片会话落盘后的样子)
+        add_workspace(&mut h, 12, &p).await;
+
+        let v = list_all(&mut h).await;
+        let groups = v["result"]["groups"].as_array().unwrap();
+        let ws: Vec<&str> = groups
+            .iter()
+            .map(|g| g["workspace"].as_str().unwrap())
+            .collect();
+        assert!(
+            ws.contains(&p.as_str()),
+            "the project group must exist: {ws:?}"
+        );
+        assert!(
+            !ws.contains(&w.as_str()),
+            "the worktree must not be a top-level group: {ws:?}"
+        );
+
+        let project_group = groups
+            .iter()
+            .find(|g| g["workspace"] == p.as_str())
+            .unwrap();
+        let ids: Vec<&str> = project_group["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["thread_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"t-plain"), "own thread stays: {ids:?}");
+        assert!(ids.contains(&"t-card"), "card thread folds in: {ids:?}");
+        let card = project_group["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["thread_id"] == "t-card")
+            .unwrap();
+        assert_eq!(card["card_id"], "card-1", "wire must expose card_id");
+        assert_eq!(card["board_project"], p.as_str());
+        h.shutdown().await;
+    }
+
+    /// 零回归:一个普通目录的会话仍按目录成组,顺序/存在性与今天一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_workspaces_still_group_by_directory() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let a = dir_a
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let b = dir_b
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        write_meta(Path::new(&a), "t-a", "a", None, None);
+        write_meta(Path::new(&b), "t-b", "b", None, None);
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 21, &a).await;
+        add_workspace(&mut h, 22, &b).await;
+
+        let v = list_all(&mut h).await;
+        let groups = v["result"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "two plain dirs → two groups: {v}");
+        assert_eq!(groups[0]["workspace"], b.as_str(), "most-recent first");
+        assert_eq!(groups[1]["workspace"], a.as_str());
+        h.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn turn_completion_persists_items_and_messages() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -10125,6 +10405,8 @@ pub(crate) mod tests {
                 title: None,
                 permission_mode: crate::thread_store::ThreadMode::Normal,
                 pin_seq: None,
+                board_project: None,
+                card_id: None,
             })
             .unwrap();
         store
@@ -10216,6 +10498,8 @@ pub(crate) mod tests {
                 title: None,
                 permission_mode: crate::thread_store::ThreadMode::Normal,
                 pin_seq: None,
+                board_project: None,
+                card_id: None,
             })
             .unwrap();
         // 一轮正常收尾过的历史。
@@ -12441,7 +12725,10 @@ pub(crate) mod tests {
             .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["relay_url"], json!(null), "{v}");
-        assert!(v["result"].get("relay_url").is_some(), "key must be present: {v}");
+        assert!(
+            v["result"].get("relay_url").is_some(),
+            "key must be present: {v}"
+        );
         h.shutdown().await;
     }
 
@@ -12527,10 +12814,8 @@ pub(crate) mod tests {
         let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
         initialize(&mut h).await;
 
-        h.send(
-            r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":5}}"#,
-        )
-        .await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"relay_url":5}}"#)
+            .await;
         let v = read_response(&mut h, 2).await;
         assert_eq!(v["result"]["ok"], true, "{v}");
         assert_eq!(

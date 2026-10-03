@@ -10,14 +10,22 @@ use std::path::Path;
 
 use serde_json::json;
 
-use crate::server::{board_cards, board_query, BoardCard};
+use crate::server::{BoardCard, board_cards, board_query};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Outcome { AwaitingMerge, NeedsYou, Failed }
+pub(crate) enum Outcome {
+    AwaitingMerge,
+    NeedsYou,
+    Failed,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CardAction {
-    Reconcile { card_id: String, thread_id: String, outcome: Outcome },
+    Reconcile {
+        card_id: String,
+        thread_id: String,
+        outcome: Outcome,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -28,17 +36,35 @@ pub(crate) struct TrackedThread {
     pub needs_you: bool,
 }
 
-pub(crate) fn plan(cards: &[BoardCard], tracked: &HashMap<String, TrackedThread>) -> Vec<CardAction> {
-    cards.iter().filter_map(|card| {
-        if card.state != "running" { return None; }
-        let thread_id = card.thread_id.clone()?;
-        let t = tracked.get(&card.id)?;
-        if !t.idle { return None; }
-        let outcome = if t.failed { Outcome::Failed }
-            else if t.needs_you { Outcome::NeedsYou }
-            else { Outcome::AwaitingMerge };
-        Some(CardAction::Reconcile { card_id: card.id.clone(), thread_id, outcome })
-    }).collect()
+pub(crate) fn plan(
+    cards: &[BoardCard],
+    tracked: &HashMap<String, TrackedThread>,
+) -> Vec<CardAction> {
+    cards
+        .iter()
+        .filter_map(|card| {
+            if card.state != "running" {
+                return None;
+            }
+            let thread_id = card.thread_id.clone()?;
+            let t = tracked.get(&card.id)?;
+            if !t.idle {
+                return None;
+            }
+            let outcome = if t.failed {
+                Outcome::Failed
+            } else if t.needs_you {
+                Outcome::NeedsYou
+            } else {
+                Outcome::AwaitingMerge
+            };
+            Some(CardAction::Reconcile {
+                card_id: card.id.clone(),
+                thread_id,
+                outcome,
+            })
+        })
+        .collect()
 }
 
 /// 宿主侧读到的 thread 标志位。由注入的「状态快照」函数产出;调度器自身不接触
@@ -54,6 +80,8 @@ pub(crate) struct ThreadFlags {
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchRequest {
     pub card_id: String,
+    /// 发起这张卡的项目根（canonical 绝对路径）。落进卡片会话的 meta。
+    pub board_project: String,
     pub workdir: String,
     pub title: String,
     pub objective: String,
@@ -144,6 +172,10 @@ pub(crate) async fn run_once<L: CardLauncher>(
         };
         let request = LaunchRequest {
             card_id: card_id.clone(),
+            board_project: std::fs::canonicalize(project)
+                .unwrap_or_else(|_| project.to_path_buf())
+                .to_string_lossy()
+                .into_owned(),
             workdir,
             title,
             objective,
@@ -234,7 +266,15 @@ mod tests {
     #[test]
     fn a_tracked_card_whose_thread_finished_with_changes_awaits_merge() {
         let mut tracked = HashMap::new();
-        tracked.insert("a".to_string(), TrackedThread { thread_id: "t1".into(), idle: true, failed: false, needs_you: false });
+        tracked.insert(
+            "a".to_string(),
+            TrackedThread {
+                thread_id: "t1".into(),
+                idle: true,
+                failed: false,
+                needs_you: false,
+            },
+        );
         let actions = plan(&[card("a", "running")], &tracked);
         assert!(matches!(actions.as_slice(),
             [CardAction::Reconcile { card_id, outcome: Outcome::AwaitingMerge, .. }] if card_id == "a"));
@@ -243,9 +283,23 @@ mod tests {
     #[test]
     fn an_idle_thread_without_changes_needs_you() {
         let mut tracked = HashMap::new();
-        tracked.insert("a".to_string(), TrackedThread { thread_id: "t1".into(), idle: true, failed: false, needs_you: true });
+        tracked.insert(
+            "a".to_string(),
+            TrackedThread {
+                thread_id: "t1".into(),
+                idle: true,
+                failed: false,
+                needs_you: true,
+            },
+        );
         let actions = plan(&[card("a", "running")], &tracked);
-        assert!(matches!(&actions[0], CardAction::Reconcile { outcome: Outcome::NeedsYou, .. }));
+        assert!(matches!(
+            &actions[0],
+            CardAction::Reconcile {
+                outcome: Outcome::NeedsYou,
+                ..
+            }
+        ));
     }
 }
 
@@ -429,9 +483,21 @@ mod scheduler_tests {
             "objective must carry the card's plan and spec: {}",
             request.objective
         );
+        let expected_project = std::fs::canonicalize(&board.project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            request.board_project, expected_project,
+            "the launch must carry the project root for grouping"
+        );
 
         let running = board.calls_to("board.mark_running");
-        assert_eq!(running.len(), 1, "the plugin must learn the card is running");
+        assert_eq!(
+            running.len(),
+            1,
+            "the plugin must learn the card is running"
+        );
         assert_eq!(running[0]["params"]["card_id"], "c1");
         assert_eq!(running[0]["params"]["thread_id"], "thread-1");
 
