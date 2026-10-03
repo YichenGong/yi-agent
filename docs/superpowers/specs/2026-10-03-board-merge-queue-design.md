@@ -161,12 +161,19 @@ pub enum CardKind {
 理由与 `plugin.lock` 相同：内核在进程退出时释放（含 `SIGKILL`），不会占死闸门；
 且锁在 `drop` 时**不 unlink** 文件。
 
-### 7.2 基座 worktree
+### 7.2 执行合并的 worktree
 
-- 路径 `<project>/.worktrees/kanban-merge/<base-slug>`，幂等创建
-  （`git worktree add <path> <base>`）。
-- 启动迁移时若发现遗留的 `Merging` 僵尸，best-effort 在该 worktree 里
-  `git merge --abort` 复原后再重试。
+**在 base 被检出的那个 worktree 里执行**（若 base 正是项目主检出的分支，就在主检出里合）：
+这与 CLAUDE.md「回 `main` 做 `git merge --no-ff`」的人工约定一致，也让主检出保持干净。
+
+- base 已被某个 worktree（通常是主检出）检出时，复用它，在该 worktree 里 `git merge --no-ff`。
+- base 未被任何 worktree 检出时，才新建专用 worktree
+  `<project>/.worktrees/kanban-merge/<base-slug>`（幂等），用完 `worktree remove`。
+- **不可**在别处合并后 `git update-ref` 前移已检出的分支：实测能让 index/worktree 变脏
+  （出现虚假的已暂存改动），故不采用。
+
+前置条件：base worktree 必须是**干净**的（`git status --porcelain` 为空），否则不做合并、
+把卡置 `NeedsYou`——免得把别人的未提交改动卷进来。
 
 ### 7.3 合并与分类（`runner/merge.rs`）
 
