@@ -6,7 +6,14 @@ type Mode = "normal" | "yolo";
 type ThreadSeed = { thread_id: string; title: string | null; permission_mode: Mode };
 
 const { clients, state } = vi.hoisted(() => ({
-  clients: [] as Array<{ requests: { method: string; params: unknown }[] }>,
+  clients: [] as Array<{
+    requests: { method: string; params: unknown }[];
+    // The recovery hook the App injects as `RpcClient`'s 2nd constructor arg.
+    // A test invokes it to prove the wiring: after a relay bridge restart the
+    // App re-handshakes the *current* client (see the "relay handshake
+    // recovery" suite). Its arg is the raw request fn the real client passes.
+    recover?: ((raw: (m: string, a: unknown) => Promise<unknown>) => Promise<void>) | null;
+  }>,
   state: {
     mode: "normal" as Mode,
     failSet: false,
@@ -72,11 +79,18 @@ vi.mock("./lib/rpc", () => ({
   RpcClient: class {
     requests: { method: string; params: unknown }[] = [];
     listCalls = 0;
+    // The recovery hook the App passes as the 2nd ctor arg (see the
+    // "relay handshake recovery wiring" suite).
+    recover: ((raw: (m: string, a: unknown) => Promise<unknown>) => Promise<void>) | null = null;
     // Callbacks this instance registered, so `dispose` can remove exactly them —
     // mirroring the real client tearing down its transport subscription.
     private registered: Array<{ list: unknown[]; cb: unknown }> = [];
-    constructor() {
+    constructor(
+      _transport?: unknown,
+      recover?: (raw: (m: string, a: unknown) => Promise<unknown>) => Promise<void>,
+    ) {
       clients.push(this);
+      if (recover) this.recover = recover;
     }
     private track(list: unknown[], cb: unknown) {
       this.registered.push({ list, cb });
@@ -1924,5 +1938,81 @@ describe("App sidebar wrapper constrains height", () => {
     expect(wrapper.className).toContain("app-sidebar");
     expect(wrapper.className).toContain("flex");
     expect(wrapper.className).toContain("min-h-0");
+  });
+});
+
+// 中继路径的关键接缝：全 session 只有**一条**电脑侧桥接连接被所有手机共享。
+// app-server 换进程后桥接重连会换成新 `ws-<uuid>`（`initialized=false`），而
+// 手机的 socket 挂在中继上从未断开、不会自己重发 `initialize`，于是切 session
+// 撞上 `-32010`。修法落在 `RpcClient.request`（收到 `-32010` 先重新握手再重发），
+// 本套用例钉死 App 侧把「重新握手」正确注入了**当前**客户端。
+describe("relay handshake recovery wiring", () => {
+  /** A raw (no-auto-recovery) request fn that records what the hook replays. */
+  const recorder = () => {
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const raw = async (method: string, params: unknown) => {
+      calls.push({ method, params });
+      return {};
+    };
+    return { calls, raw };
+  };
+
+  it("injects a recovery hook that re-handshakes the current client", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    // 未注入该钩子，`RpcClient` 就无从在桥接重启后重新握手。
+    expect(typeof clients[0].recover).toBe("function");
+
+    const { calls, raw } = recorder();
+    await act(async () => {
+      await clients[0].recover!(raw);
+    });
+    expect(calls.some((c) => c.method === "initialize")).toBe(true);
+  });
+
+  it("targets the current client, not a disposed one, after a reconnect", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 });
+    });
+    await waitFor(() => expect(clients.length).toBe(2));
+    await waitFor(() =>
+      expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+
+    // 钩子在调用时解析**当前**客户端：外层 lambda 必须把恢复交给 clientRef
+    // 当时的那一个。第 2 个客户端调它时，不能打回已 dispose 的第 1 个。
+    const { calls, raw } = recorder();
+    await act(async () => {
+      await clients[1].recover!(raw);
+    });
+    expect(calls.some((c) => c.method === "initialize")).toBe(true);
+  });
+
+  it("replays the subscription window so background threads keep streaming", async () => {
+    // 经中继时新进程不记得任何订阅；只重发 initialize 会让后台会话静默停更。
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+    render(<App />);
+    // 远端首屏会选中第一个会话并订阅它。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(true),
+    );
+
+    const { calls, raw } = recorder();
+    await act(async () => {
+      await clients[0].recover!(raw);
+    });
+    // 先握手，再重放订阅——顺序不能反（订阅在 initialize 前会被 -32010 拒）。
+    expect(calls.map((c) => c.method)).toEqual(["initialize", "thread/subscribe"]);
+    expect((calls[1].params as { threadIds: string[] }).threadIds).toContain("t1");
   });
 });

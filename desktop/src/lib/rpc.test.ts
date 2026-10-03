@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { RpcClient, type Transport } from "./rpc";
 
 function fakeTransport(opts: { failSend?: boolean } = {}) {
@@ -127,4 +127,117 @@ describe("RpcClient", () => {
     const buffered = (client as unknown as { buffered: Map<unknown, unknown> }).buffered;
     expect(buffered.size).toBe(1);
   });
+  // --- 中继桥接重启后的自动恢复 ---------------------------------------------
+  // 经中继时，全 session 只有**一条**电脑侧桥接连接被所有手机共享。app-server
+  // 换新进程后桥接重连，服务端为这条新连接铸一个新的 `ws-<uuid>`，其
+  // `initialized=false`；而手机的 socket 挂在中继上从未断开，也就不会重发
+  // `initialize`。于是手机在切 session 时发的 `thread/subscribe`/`thread/resume`
+  // 会被拒为 `-32010 server not initialized`（实测复现）。修法：RpcClient 收到
+  // `-32010` 时先重新握手，再把该请求**自动重发一次**——覆盖所有调用点，不依赖
+  // 用户切前后台。
+
+  it("re-handshakes and retries once when refused with -32010", async () => {
+    const { transport, sent, emit } = fakeTransport();
+    const recover = vi.fn(async () => {});
+    const client = new RpcClient(transport, recover);
+    const p = client.request("thread/subscribe", { threadIds: ["t1"] });
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32010, message: "server not initialized" } });
+    await vi.waitFor(() => expect(sent).toHaveLength(2));
+    expect(recover).toHaveBeenCalledTimes(1);
+    // 重发的必须是**同一个**请求，而非别的东西。
+    expect(sent[1].method).toBe("thread/subscribe");
+    expect(sent[1].params).toEqual({ threadIds: ["t1"] });
+    emit({ jsonrpc: "2.0", id: 2, result: { ok: true } });
+    await expect(p).resolves.toEqual({ ok: true });
+  });
+
+  it("never auto-recovers `initialize` itself, so recovery cannot recurse", async () => {
+    const { transport, emit } = fakeTransport();
+    const recover = vi.fn(async () => {});
+    const client = new RpcClient(transport, recover);
+    const p = client.request("initialize", {});
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32010, message: "server not initialized" } });
+    await expect(p).rejects.toMatchObject({ code: -32010 });
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("retries only once: a second -32010 after recovery is fatal", async () => {
+    const { transport, sent, emit } = fakeTransport();
+    const recover = vi.fn(async () => {});
+    const client = new RpcClient(transport, recover);
+    const p = client.request("thread/resume", { threadId: "t1" });
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32010, message: "server not initialized" } });
+    await vi.waitFor(() => expect(sent).toHaveLength(2));
+    emit({ jsonrpc: "2.0", id: 2, error: { code: -32010, message: "server not initialized" } });
+    await expect(p).rejects.toMatchObject({ code: -32010 });
+    expect(recover).toHaveBeenCalledTimes(1);
+    expect(sent).toHaveLength(2); // 不得第三次重发（防死循环）
+  });
+
+  it("shares one recovery across concurrent -32010 refusals", async () => {
+    const { transport, sent, emit } = fakeTransport();
+    let release!: () => void;
+    const recover = vi.fn(() => new Promise<void>((r) => { release = r; }));
+    const client = new RpcClient(transport, recover);
+    const a = client.request("thread/subscribe", { threadIds: ["a"] });
+    const b = client.request("thread/resume", { threadId: "b" });
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32010, message: "server not initialized" } });
+    emit({ jsonrpc: "2.0", id: 2, error: { code: -32010, message: "server not initialized" } });
+    // 两个拒绝同时到达：只允许跑一次握手（否则是握手风暴）。
+    await vi.waitFor(() => expect(recover).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(recover).toHaveBeenCalledTimes(1);
+    release();
+    await vi.waitFor(() => expect(sent).toHaveLength(4));
+    emit({ jsonrpc: "2.0", id: 3, result: 1 });
+    emit({ jsonrpc: "2.0", id: 4, result: 2 });
+    await expect(a).resolves.toBe(1);
+    await expect(b).resolves.toBe(2);
+  });
+
+  it("hands the recovery hook a raw request fn so its own requests cannot re-enter recovery", async () => {
+    // 恢复钩子会重放订阅（`thread/subscribe`）。若那些请求走的是会自动恢复的
+    // `request`，而它们恰好又被拒为 -32010，就会去 await 自己正在跑的那次恢复
+    // ——死锁。钩子拿到的必须是**裸**请求：被拒就直接失败，不再触发恢复。
+    const { transport, sent, emit } = fakeTransport();
+    let innerRefused = false;
+    const recover = vi.fn(async (raw: (m: string, a: unknown) => Promise<unknown>) => {
+      const p = raw("thread/subscribe", { threadIds: ["t1"] });
+      await vi.waitFor(() => expect(sent.length).toBeGreaterThan(0));
+      const last = sent[sent.length - 1].id;
+      emit({ jsonrpc: "2.0", id: last, error: { code: -32010, message: "server not initialized" } });
+      // 裸请求直接抛出 -32010，不触发第二次恢复。
+      await expect(p).rejects.toMatchObject({ code: -32010 });
+      innerRefused = true;
+    });
+    const client = new RpcClient(transport, recover);
+    const outer = client.request("thread/resume", { threadId: "t1" });
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32010, message: "server not initialized" } });
+    await vi.waitFor(() => expect(innerRefused).toBe(true));
+    // 恢复钩子只跑了一次（内部请求没有再触发一次恢复）。
+    expect(recover).toHaveBeenCalledTimes(1);
+    // 外层请求重发；这里让它成功收尾。
+    const resent = sent[sent.length - 1].id;
+    emit({ jsonrpc: "2.0", id: resent, result: { ok: 1 } });
+    await expect(outer).resolves.toEqual({ ok: 1 });
+  });
+
+  it("passes non-32010 errors straight through without recovering", async () => {
+    const { transport, emit } = fakeTransport();
+    const recover = vi.fn(async () => {});
+    const client = new RpcClient(transport, recover);
+    const p = client.request("thread/resume", { threadId: "t1" });
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32011, message: "unknown thread: t1" } });
+    await expect(p).rejects.toMatchObject({ code: -32011 });
+    expect(recover).not.toHaveBeenCalled();
+  });
+
+  it("leaves -32010 untouched when no recovery hook is configured", async () => {
+    const { transport, emit } = fakeTransport();
+    const client = new RpcClient(transport);
+    const p = client.request("thread/listAll", {});
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32010, message: "server not initialized" } });
+    await expect(p).rejects.toMatchObject({ code: -32010 });
+  });
+
 });
