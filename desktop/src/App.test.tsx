@@ -2016,3 +2016,33 @@ describe("relay handshake recovery wiring", () => {
     expect((calls[1].params as { threadIds: string[] }).threadIds).toContain("t1");
   });
 });
+
+// 子 agent 栏的收起必须**可逆**。回归背景：入口曾只在面板内部（面板自己的「收起」
+// 是唯一开关），收起后开关随面板一起消失，于是再也打不开。入口改为状态栏右侧的
+// 常驻图标后，收起只隐藏面板本身，入口仍在。
+describe("App 子 agent 栏的收起与展开", () => {
+  it("收起后仍能从状态栏入口把它重新打开", async () => {
+    render(<App />);
+    // 首个会话（t1）自动选中后，子 agent 栏随之出现。
+    fireEvent.click(await screen.findByLabelText("收起子 agent"));
+    expect(screen.queryByLabelText("子 agent")).toBeNull();
+    expect(screen.queryByLabelText("收起子 agent")).toBeNull();
+
+    // 关键断言：入口没有被一起收走，且它能把面板打开。
+    const toggle = screen.getByLabelText("子 agent 面板");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    expect(await screen.findByLabelText("子 agent")).toBeTruthy();
+    expect(screen.getByLabelText("收起子 agent")).toBeTruthy();
+  });
+
+  it("手机端不渲染该入口（那里子 agent 栏是抽屉）", async () => {
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("会话列表")).toBeTruthy());
+    expect(screen.queryByLabelText("子 agent 面板")).toBeNull();
+  });
+});
