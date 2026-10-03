@@ -2388,38 +2388,92 @@ where
                         }
                     }
                     "thread/listAll" => {
-                        // 跨目录汇总:按索引顺序(最近的在前)遍历每个 workspace,
-                        // 组内是该目录 store 的 thread(updated_at 降序)。
-                        // 失效目录先 stat 跳过,不做深扫,但仍报表该组(exists:false),
-                        // 供侧栏置灰展示。
-                        let mut groups: Vec<serde_json::Value> = Vec::new();
-                        for dir in workspaces.list() {
-                            let path = Path::new(&dir);
-                            let exists = path.is_dir();
-                            let threads: Vec<serde_json::Value> = if exists {
-                                // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
-                                // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
-                                match crate::thread_store::ThreadStore::new(path).list() {
-                                    Ok(metas) => metas
-                                        .into_iter()
-                                        .map(|m| thread_summary_json(&m, &threads))
-                                        .collect(),
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[app-server] thread/listAll failed to list {dir}: {e}"
-                                        );
-                                        Vec::new()
-                                    }
+                        // 分组两段式,与抽取前逐字等价,只多一层「归属优先」的折拢:
+                        // ① 按索引顺序(最近在前)为**每个**目录建组——含失效目录
+                        //   (exists:false、threads 空,不深扫),普通会话留在本目录组;
+                        // ② 带 `board_project` 的卡片会话折进它所属的项目组(项目可不在
+                        //   索引里,则合成一组);只含卡片会话的目录(卡片 worktree)
+                        //   第一段被抑制,不再顶层成组。
+                        // **不动索引**:目录仍留在 workspaces 里,冷会话定位靠它。
+                        let dirs = workspaces.list();
+                        // 组顺序:先索引目录(保持最近在前),再追加索引外的新项目组。
+                        let mut order: Vec<String> = Vec::new();
+                        let mut seen: HashSet<String> = HashSet::new();
+                        let mut exists_of: HashMap<String, bool> = HashMap::new();
+                        let mut plain: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+                        let mut cards: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+                        for dir in &dirs {
+                            if seen.insert(dir.clone()) {
+                                order.push(dir.clone());
+                                exists_of.insert(dir.clone(), Path::new(dir).is_dir());
+                            }
+                            // 失效目录:不深扫,组照留(threads 空),与抽取前一致。
+                            let path = Path::new(dir);
+                            if !path.is_dir() {
+                                continue;
+                            }
+                            // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
+                            // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
+                            let metas = match crate::thread_store::ThreadStore::new(path).list() {
+                                Ok(metas) => metas,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[app-server] thread/listAll failed to list {dir}: {e}"
+                                    );
+                                    Vec::new()
+                                }
+                            };
+                            let own: Vec<_> = metas
+                                .iter()
+                                .filter(|m| m.board_project.is_none())
+                                .collect();
+                            // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
+                            // 否则它只是卡片 worktree,归拢后被抑制。
+                            if !own.is_empty() || metas.is_empty() {
+                                for m in own {
+                                    plain.entry(dir.clone())
+                                        .or_default()
+                                        .push(thread_summary_json(m, &threads));
                                 }
                             } else {
-                                Vec::new()
-                            };
-                            groups.push(json!({
-                                "workspace": dir,
-                                "exists": exists,
-                                "threads": threads,
-                            }));
+                                // 只含卡片会话:抑制顶层空组(稍后不产出)。
+                                seen.remove(dir);
+                                order.retain(|d| d != dir);
+                            }
+                            // 卡片会话:归入 board_project 指定的组(可为索引外的项目)。
+                            for m in metas.iter().filter(|m| m.board_project.is_some()) {
+                                let target = m.board_project.clone().unwrap();
+                                if seen.insert(target.clone()) {
+                                    order.push(target.clone());
+                                    exists_of.insert(
+                                        target.clone(),
+                                        Path::new(&target).is_dir(),
+                                    );
+                                }
+                                exists_of
+                                    .entry(target.clone())
+                                    .or_insert_with(|| Path::new(&target).is_dir());
+                                cards
+                                    .entry(target)
+                                    .or_default()
+                                    .push(thread_summary_json(m, &threads));
+                            }
                         }
+                        let groups: Vec<serde_json::Value> = order
+                            .iter()
+                            .map(|ws| {
+                                let mut merged =
+                                    plain.remove(ws).unwrap_or_default();
+                                if let Some(mut folded) = cards.remove(ws) {
+                                    merged.append(&mut folded);
+                                }
+                                json!({
+                                    "workspace": ws,
+                                    "exists": exists_of.get(ws).copied().unwrap_or(false),
+                                    "threads": merged,
+                                })
+                            })
+                            .collect();
                         let pinned: Vec<serde_json::Value> = collect_pinned(&workspaces)
                             .iter()
                             .map(|m| thread_summary_json(m, &threads))
@@ -9834,6 +9888,153 @@ pub(crate) mod tests {
             0,
             "失效目录不深扫,threads 必须为空: {g}"
         );
+        h.shutdown().await;
+    }
+
+    async fn list_all(h: &mut Harness) -> serde_json::Value {
+        h.send(r#"{"jsonrpc":"2.0","id":901,"method":"thread/listAll","params":{}}"#)
+            .await;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(901)) {
+                return v;
+            }
+        }
+        panic!("thread/listAll must respond");
+    }
+
+    async fn add_workspace(h: &mut Harness, id: u64, path: &str) {
+        h.send(
+            &serde_json::json!({"jsonrpc":"2.0","id":id,"method":"workspace/add",
+            "params":{"path": path}})
+            .to_string(),
+        )
+        .await;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(id)) {
+                return;
+            }
+        }
+        panic!("workspace/add must respond");
+    }
+
+    fn write_meta(
+        dir: &Path,
+        id: &str,
+        title: &str,
+        board_project: Option<&str>,
+        card_id: Option<&str>,
+    ) {
+        let meta = crate::thread_store::ThreadMeta {
+            thread_id: id.into(),
+            cwd: dir.to_string_lossy().into(),
+            model: "m".into(),
+            created_at: 0,
+            updated_at: 0,
+            title: Some(title.into()),
+            permission_mode: crate::thread_store::ThreadMode::Normal,
+            pin_seq: None,
+            board_project: board_project.map(str::to_string),
+            card_id: card_id.map(str::to_string),
+        };
+        crate::thread_store::ThreadStore::new(dir)
+            .create(&meta)
+            .unwrap();
+    }
+
+    /// 卡片会话(在 worktree、board_project=项目) 折进项目组；worktree 不再顶层成组。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_board_thread_folds_into_its_project_group() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let worktree_dir = tempfile::TempDir::new().unwrap();
+        let project = project_dir.path().canonicalize().unwrap();
+        let worktree = worktree_dir.path().canonicalize().unwrap();
+        let p = project.to_string_lossy().to_string();
+        let w = worktree.to_string_lossy().to_string();
+
+        write_meta(&project, "t-plain", "plain", None, None);
+        write_meta(
+            &worktree,
+            "t-card",
+            "看板 · card-1",
+            Some(&p),
+            Some("card-1"),
+        );
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 11, &w).await; // worktree 进索引(=卡片会话落盘后的样子)
+        add_workspace(&mut h, 12, &p).await;
+
+        let v = list_all(&mut h).await;
+        let groups = v["result"]["groups"].as_array().unwrap();
+        let ws: Vec<&str> = groups
+            .iter()
+            .map(|g| g["workspace"].as_str().unwrap())
+            .collect();
+        assert!(
+            ws.contains(&p.as_str()),
+            "the project group must exist: {ws:?}"
+        );
+        assert!(
+            !ws.contains(&w.as_str()),
+            "the worktree must not be a top-level group: {ws:?}"
+        );
+
+        let project_group = groups
+            .iter()
+            .find(|g| g["workspace"] == p.as_str())
+            .unwrap();
+        let ids: Vec<&str> = project_group["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["thread_id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"t-plain"), "own thread stays: {ids:?}");
+        assert!(ids.contains(&"t-card"), "card thread folds in: {ids:?}");
+        let card = project_group["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["thread_id"] == "t-card")
+            .unwrap();
+        assert_eq!(card["card_id"], "card-1", "wire must expose card_id");
+        assert_eq!(card["board_project"], p.as_str());
+        h.shutdown().await;
+    }
+
+    /// 零回归:一个普通目录的会话仍按目录成组,顺序/存在性与今天一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plain_workspaces_still_group_by_directory() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let a = dir_a
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let b = dir_b
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        write_meta(Path::new(&a), "t-a", "a", None, None);
+        write_meta(Path::new(&b), "t-b", "b", None, None);
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 21, &a).await;
+        add_workspace(&mut h, 22, &b).await;
+
+        let v = list_all(&mut h).await;
+        let groups = v["result"]["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "two plain dirs → two groups: {v}");
+        assert_eq!(groups[0]["workspace"], b.as_str(), "most-recent first");
+        assert_eq!(groups[1]["workspace"], a.as_str());
         h.shutdown().await;
     }
 
