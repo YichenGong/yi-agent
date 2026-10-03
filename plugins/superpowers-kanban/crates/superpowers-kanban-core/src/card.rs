@@ -87,6 +87,12 @@ impl CardState {
             (Running, NeedsYou) => true,
             (Running, Failed) => true,
             (Running, Paused) => true,
+            // 卡片会话被「追问」或自动继续：等待验收的卡重新跑起来。
+            // 调度器对账只能看到某一条空闲快照，会话稍后继续时，卡片必须先
+            // 从 `AwaitingMerge`/`NeedsYou` 回到 `Running`，否则看板会长期
+            // 停留在错误的终态（见 2026-10-03 看板状态误判）。
+            (AwaitingMerge, Running) => true,
+            (NeedsYou, Running) => true,
             (Paused, Queued) => true,
             (NeedsYou, Queued) => true,
             (AwaitingMerge, Done) => true,
@@ -177,6 +183,19 @@ mod tests {
     fn needs_you_never_holds_a_slot_so_it_can_return_to_the_queue() {
         assert!(!CardState::NeedsYou.occupies_slot());
         assert!(CardState::NeedsYou.can_transition_to(CardState::Queued));
+    }
+
+    #[test]
+    fn a_reviewed_card_can_resume_running_so_follow_up_turns_stay_visible() {
+        use CardState::*;
+        // 对账在一条空闲快照上把卡判成 `AwaitingMerge`（或 `NeedsYou`）后，
+        // 会话继续（追问/自动续跑）必须能把卡翻回 `Running`，否则看板会显示
+        // 错误的终态。
+        assert!(AwaitingMerge.can_transition_to(Running));
+        assert!(NeedsYou.can_transition_to(Running));
+        // 终态仍然不能复活。
+        assert!(!Done.can_transition_to(Running));
+        assert!(!Failed.can_transition_to(Running));
     }
 
     #[test]
