@@ -1,6 +1,7 @@
 //! yi-agent GUI app-server:JSON-RPC 2.0 over stdio。
 
 pub mod broadcast;
+pub(crate) mod card_scheduler;
 pub mod device_store;
 pub mod pair_uri;
 pub mod pairing;

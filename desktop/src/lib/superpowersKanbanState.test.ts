@@ -84,4 +84,18 @@ describe("parseBoard", () => {
     );
     expect(cards[0].detail).toBe("c.plan.md");
   });
+
+  it("keeps a card's thread id and nulls it when absent or empty", () => {
+    const cards = parseBoard(
+      JSON.stringify({
+        cards: [
+          { id: "linked", plan_path: "l.plan.md", state: "Awaiting_Merge", order: 0, thread_id: "t-1" },
+          { id: "unlinked", plan_path: "u.plan.md", state: "Queued", order: 1, thread_id: null },
+          { id: "blank", plan_path: "b.plan.md", state: "Queued", order: 2, thread_id: "" },
+        ],
+        next_order: 3,
+      }),
+    );
+    expect(cards.map((card) => card.threadId)).toEqual(["t-1", null, null]);
+  });
 });

@@ -1075,8 +1075,15 @@ export default function App() {
               <SuperpowersKanbanView
                 switchOn={boardOn}
                 source={boardSource}
-                cards={boardCards}
+                cards={boardCards.map((card) => ({
+                  id: card.id,
+                  state: card.state,
+                  progress: card.progress,
+                  detail: card.detail,
+                  threadId: card.thread_id ?? null,
+                }))}
                 pluginMissing={boardPluginMissing}
+                onOpenThread={(id) => void selectThread(id)}
               />
             </section>
           )}

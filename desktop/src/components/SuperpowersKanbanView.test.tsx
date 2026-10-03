@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
-import { describe, expect, it, afterEach } from "vitest";
-import { render, cleanup, screen } from "@testing-library/react";
+import { describe, expect, it, afterEach, vi } from "vitest";
+import { render, cleanup, screen, fireEvent } from "@testing-library/react";
 import { SuperpowersKanbanView } from "./SuperpowersKanbanView";
 
 afterEach(() => {
@@ -48,5 +48,36 @@ describe("SuperpowersKanbanView", () => {
     );
     expect(screen.getByText(/插件未安装/)).toBeTruthy();
     expect(screen.queryByText(/empty/i)).toBeNull();
+  });
+
+  it("shows a card's linked thread and opens it on click", () => {
+    const onOpenThread = vi.fn();
+    render(
+      <SuperpowersKanbanView
+        switchOn
+        source="project"
+        cards={[
+          { id: "c1", state: "awaiting_merge", progress: null, detail: "", threadId: "thread-1" },
+        ]}
+        onOpenThread={onOpenThread}
+      />,
+    );
+    fireEvent.click(screen.getByText("thread-1"));
+    expect(onOpenThread).toHaveBeenCalledWith("thread-1");
+  });
+
+  it("renders no clickable thread link for a card without a thread", () => {
+    const onOpenThread = vi.fn();
+    render(
+      <SuperpowersKanbanView
+        switchOn
+        source="project"
+        cards={[{ id: "c1", state: "queued", progress: null, detail: "" }]}
+        onOpenThread={onOpenThread}
+      />,
+    );
+    // No thread link exists, so nothing can be clicked to open a phantom thread.
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(onOpenThread).not.toHaveBeenCalled();
   });
 });

@@ -59,6 +59,8 @@ impl Board {
             order,
             workdir: None,
             task_id: None,
+            thread_id: None,
+            base_commit: None,
         });
         &self.cards[index]
     }
@@ -113,6 +115,45 @@ impl Board {
             .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
         card.task_id = Some(task_id);
         Ok(())
+    }
+
+    /// 记下某张卡片会话在 app-server 里的 thread id。
+    pub fn set_thread_id(&mut self, id: &CardId, thread_id: String) -> Result<(), TransitionError> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|c| &c.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        card.thread_id = Some(thread_id);
+        Ok(())
+    }
+
+    /// 记下某张卡片启动时 worktree 的 HEAD，供对账判断「有无新提交」。
+    pub fn set_base_commit(
+        &mut self,
+        id: &CardId,
+        base_commit: String,
+    ) -> Result<(), TransitionError> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|c| &c.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        card.base_commit = Some(base_commit);
+        Ok(())
+    }
+
+    /// 队首排队卡迁移到 `Launching` 并返回其 id；无名额或队空返回 `None`。
+    /// 名额判断与迁移在同一把 `&mut self` 里完成，调用方据此占槽，天然原子。
+    pub fn claim_next_launch(&mut self, limit: u16) -> Option<CardId> {
+        if self.free_slots(limit) == 0 {
+            return None;
+        }
+        let next = self.next_startable()?;
+        if let Some(card) = self.cards.iter_mut().find(|c| c.id == next) {
+            card.state = CardState::Launching;
+        }
+        Some(next)
     }
 
     /// 队首（`order` 最小）的排队卡片。

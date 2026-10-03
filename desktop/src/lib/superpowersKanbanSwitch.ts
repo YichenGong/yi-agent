@@ -28,6 +28,8 @@ export interface BoardCardDto {
   state: string;
   progress: string | null;
   detail: string;
+  /** 该卡关联的会话；插件可能尚未起会话，故可为 null/缺省。 */
+  thread_id?: string | null;
 }
 
 type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
