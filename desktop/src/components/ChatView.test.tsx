@@ -90,4 +90,16 @@ describe("ChatView streaming", () => {
     rerender(<ChatView items={list} />);
     expect(container.textContent).toContain("hello world");
   });
+
+  it("clips horizontal overflow so wide content cannot pan the transcript", () => {
+    const { container } = render(<ChatView items={items()} />);
+    const scroller = container.firstElementChild as HTMLElement;
+    // 只写 `overflow-y-auto` 时，CSS 会把 `overflow-x: visible` 求值成 `auto`：
+    // 一旦内容（宽表格/代码块）超出容器，整个会话区就能横向拖动，左移后右边留下
+    // 大片空白。显式 `overflow-x-hidden` 才是「内容不得横向溢出」的本意。
+    expect(scroller.className).toContain("overflow-y-auto");
+    expect(scroller.className).toContain("overflow-x-hidden");
+    // 作为 flex 子项，缺 `min-w-0` 时它的最小宽度是内容宽度，同样会撑破布局。
+    expect(scroller.className).toContain("min-w-0");
+  });
 });

@@ -81,7 +81,7 @@ export function ChatView({
   }, [items.length, lastText, error]);
 
   return (
-    <div className="flex flex-1 flex-col overflow-y-auto px-4 py-3">
+    <div className="flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-3">
       {items.map((item, index) => (
         // `index` is only a fallback key for defensive unknown-type items; every
         // known item carries a stable protocol `id`.

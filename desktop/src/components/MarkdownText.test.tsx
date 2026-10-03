@@ -27,6 +27,38 @@ describe("MarkdownText", () => {
     expect(container.querySelector("table")).not.toBeNull();
   });
 
+  it("lets wide fenced code scroll inside the bubble instead of widening it", () => {
+    // 长命令/长 URL 的代码块宽达数百像素（实测 579px vs 390pt 视口）。收口靠两层：
+    // typography 基准自带的 `pre { overflow-x: auto }`（代码块自己滚动），以及
+    // `ChatView` 容器上的 `overflow-x-hidden`（见 ChatView.test.tsx）。这里断言
+    // markdown 容器不允许内容把它撑破。
+    const { container } = render(<MarkdownText text={"```bash\n" + "x".repeat(400) + "\n```"} />);
+    const wrap = container.querySelector(".prose") as HTMLElement;
+    expect(wrap.className).toContain("break-words");
+    // 宽图必须被约束：容器是 `overflow-x-hidden`，不设 max-width 的图片会被永久裁掉。
+    expect(wrap.className).toContain("prose-img:max-w-full");
+  });
+
+  it("scrolls a wide table inside its own box instead of widening the column", () => {
+    // markdown 表格实测 615px（视口 390pt）。表格必须在自己的框内横向滚动，
+    // 否则会把会话列撑宽——手机端整页可横向拖动、右移后右侧全是空白。
+    const wide = "| a | b |\n| - | - |\n| " + "x".repeat(300) + " | 2 |";
+    const { container } = render(<MarkdownText text={wide} />);
+    const table = container.querySelector("table")!;
+    expect(table).not.toBeNull();
+    const box = table.parentElement as HTMLElement;
+    expect(box.className).toContain("overflow-x-auto");
+  });
+
+  it("does not leak react-markdown's AST node onto the table element", () => {
+    // `{...props}` 会把 react-markdown 注入的 `node`（passNode: true）展开到 DOM 上，
+    // 渲染成 `node="[object Object]"`。TableBlock 必须把它剔除。
+    const { container } = render(<MarkdownText text={"| a |\n| - |\n| 1 |"} />);
+    const table = container.querySelector("table")!;
+    expect(table.hasAttribute("node")).toBe(false);
+    expect(table.outerHTML).not.toContain("[object Object]");
+  });
+
   it("does not render raw HTML (XSS guard)", () => {
     const { container } = render(
       <MarkdownText text={"before <script>window.__x = 1</script> after"} />,

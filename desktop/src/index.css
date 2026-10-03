@@ -94,6 +94,74 @@
   transform: translateX(0);
 }
 
+/*
+ * 手机端（配对后的 iPhone 客户端）的贴合修正。
+ *
+ * 全部规则都限定在 `[data-mobile="true"]` 下（由 `useIsMobile` 设在
+ * `<html>` 上），因此桌面端不匹配任何一条，布局与行为逐字节不变。
+ */
+
+/*
+ * 高度：`.app-shell` 的 `100vh` 在 iOS 上不贴合可视高度——Safari 工具栏、以及被
+ * `viewport-fit=cover` 放开的刘海/圆角区都不算进 `100vh`，底部输入框因此被顶出画面。
+ * 这里让 `body` 自己成为动态可视高度的盒子（`box-sizing: border-box` 来自 preflight），
+ * 上下各让出安全区，`#root` 与 `.app-shell` 只填满这剩下的内容盒，三者不叠加计算。
+ */
+[data-mobile="true"] body {
+  /* 先给旧 webview 一个 `100vh` 回退，再让支持 `dvh` 的用动态可视高度覆盖：只写
+   * `100dvh` 时，Safari < 15.4 会因不认识该单位而落到 `height: auto`，比原来更糟。 */
+  height: 100vh;
+  height: 100dvh;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  overflow: hidden;
+}
+[data-mobile="true"] #root {
+  height: 100%;
+}
+[data-mobile="true"] .app-shell {
+  height: 100%;
+}
+
+/*
+ * 禁止双指缩放。WKWebView 默认允许缩放，放大后页面不再贴合屏幕，之后每次滑动
+ * 都变成两轴平移——正是「缩放之后就需要拖拽」。
+ *
+ * 两道保险，缺一不可：
+ * - `viewport` 的 `maximum-scale=1, user-scalable=no` 是规范开关，由 `lockZoom()`
+ *   在手机端补写（`index.html` 是共享产物，桌面端不该被改）；
+ * - `touch-action: pan-x pan-y` 让 WebKit 在合成阶段就拒绝 pinch 手势。注意它
+ *   只禁缩放、不禁滚动，抽屉与 `overflow-x-auto` 的表格照常可滑。
+ */
+html[data-mobile="true"] {
+  touch-action: pan-x pan-y;
+}
+
+/* iOS 上没有红绿灯按钮，这条 32px 的空标题栏只白占高度。 */
+[data-mobile="true"] .app-titlebar {
+  display: none;
+}
+
+/*
+ * 宽度：`.app-sidebar` 是 `fixed` 的包裹层（见上方抽屉规则），父级内边距管不到它，
+ * 所以安全区要自己补；宽度改为按视口收口，替换掉桌面记忆下来的 256px 固定值——
+ * 390pt 的屏幕上那个宽度打开后几乎只剩一条缝。
+ */
+[data-mobile="true"] .app-sidebar {
+  width: min(82vw, 340px);
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  overscroll-behavior: contain;
+}
+/*
+ * 安全区落在真正会滚动的元素（`ThreadSidebar` 的 `aside`）上：列表滚动到底时，
+ * 最后一行才不会被 Home Indicator 压住。
+ */
+[data-mobile="true"] .app-sidebar aside {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
 /* 抽屉展开时的背板，点它收起；只在手机端抽屉打开时渲染，故无需前缀。 */
 .app-sidebar-backdrop {
   position: fixed;
