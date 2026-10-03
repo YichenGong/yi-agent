@@ -1119,7 +1119,7 @@ export default function App() {
 
   return (
     <>
-      <div className="flex h-screen flex-col bg-surface text-fg">
+      <div className="app-shell flex h-screen flex-col bg-surface text-fg">
         <TitleBar />
         <div className="flex min-h-0 flex-1 flex-row">
         {isMobile && (

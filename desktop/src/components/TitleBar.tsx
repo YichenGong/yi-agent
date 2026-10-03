@@ -11,7 +11,7 @@ export function TitleBar() {
   return (
     <div
       data-tauri-drag-region
-      className="h-8 shrink-0 border-b border-line bg-panel"
+      className="app-titlebar h-8 shrink-0 border-b border-line bg-panel"
     />
   );
 }

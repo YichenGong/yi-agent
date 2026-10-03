@@ -27,6 +27,27 @@ describe("MarkdownText", () => {
     expect(container.querySelector("table")).not.toBeNull();
   });
 
+  it("lets wide fenced code scroll inside the bubble instead of widening it", () => {
+    // 长命令/长 URL 的代码块宽达数百像素（实测 579px vs 390pt 视口）。没有
+    // `overflow-x-auto` 兜底时它会把 markdown 容器（进而是整个会话列）撑宽，
+    // 手机端于是能横向拖动、右侧留白。
+    const { container } = render(<MarkdownText text={"```bash\n" + "x".repeat(400) + "\n```"} />);
+    const wrap = container.querySelector(".prose") as HTMLElement;
+    expect(wrap.className).toContain("prose-pre:overflow-x-auto");
+    expect(wrap.className).toContain("break-words");
+  });
+
+  it("scrolls a wide table inside its own box instead of widening the column", () => {
+    // markdown 表格实测 615px（视口 390pt）。表格必须在自己的框内横向滚动，
+    // 否则会把会话列撑宽——手机端整页可横向拖动、右移后右侧全是空白。
+    const wide = "| a | b |\n| - | - |\n| " + "x".repeat(300) + " | 2 |";
+    const { container } = render(<MarkdownText text={wide} />);
+    const table = container.querySelector("table")!;
+    expect(table).not.toBeNull();
+    const box = table.parentElement as HTMLElement;
+    expect(box.className).toContain("overflow-x-auto");
+  });
+
   it("does not render raw HTML (XSS guard)", () => {
     const { container } = render(
       <MarkdownText text={"before <script>window.__x = 1</script> after"} />,

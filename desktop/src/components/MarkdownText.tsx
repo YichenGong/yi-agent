@@ -1,4 +1,4 @@
-import { memo, type ReactNode } from "react";
+import { memo, type ComponentProps, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
@@ -38,15 +38,26 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
  * 重解析,历史消息命中 memo 不重渲染。
  *
  * 不启用 rehype-raw —— react-markdown 默认丢弃原始 HTML,天然防 XSS。
+ *
+ * `table` 与 `pre` 都要在**自己的框内**横向滚动，而不是把整列撑宽（见 `TableBlock`
+ * 与容器上的 `prose-pre:overflow-x-auto`）：手机端 markdown 表格实测 615px，是
+ * 390pt 视口的 1.6 倍，不收口就会把会话列撑破、整页可横向拖动。
  */
+const TableBlock = ({ children, ...props }: ComponentProps<"table">) => (
+  // 外层只负责收口滚动；`table` 自身的样式（含 prose 的 `min-width`）不受影响。
+  <div className="overflow-x-auto">
+    <table {...props}>{children}</table>
+  </div>
+);
+
 export const MarkdownText = memo(
   function MarkdownText({ text }: { text: string }) {
     return (
-      <div className="prose prose-invert max-w-none prose-pre:bg-panel">
+      <div className="prose prose-invert max-w-none break-words prose-pre:overflow-x-auto prose-pre:bg-panel">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
           rehypePlugins={[rehypeHighlight]}
-          components={{ a: ExternalLink }}
+          components={{ a: ExternalLink, table: TableBlock }}
         >
           {text}
         </ReactMarkdown>

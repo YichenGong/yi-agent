@@ -94,6 +94,39 @@
   transform: translateX(0);
 }
 
+/*
+ * 手机端首页的高度/宽度修正（桌面端不匹配这些选择器，逐字节不变）。
+ *
+ * 高度：`.app-shell` 的 `100vh` 在 iOS 上不贴合可视高度——Safari 工具栏、以及被
+ * `viewport-fit=cover` 放开的刘海/圆角区都不算进 `100vh`，底部输入框因此被顶出画面。
+ * 这里让 `body` 自己成为 `100dvh` 的盒子（`box-sizing: border-box` 来自 preflight），
+ * 上下各让出安全区，`#root` 与 `.app-shell` 只填满这剩下的内容盒，三者不叠加计算。
+ *
+ * 宽度：`.app-sidebar` 是 `fixed` 抽屉，脱离文档流后安全区要自己补；宽度改为按视口
+ * 收口（原先是桌面记忆的 256px 固定值），390pt 上不再只剩一条缝。
+ */
+[data-mobile="true"] body {
+  height: 100dvh;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  overflow: hidden;
+}
+[data-mobile="true"] #root {
+  height: 100%;
+}
+[data-mobile="true"] .app-shell {
+  height: 100%;
+}
+[data-mobile="true"] .app-titlebar {
+  display: none;
+}
+[data-mobile="true"] .app-sidebar {
+  width: min(82vw, 340px);
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  overscroll-behavior: contain;
+}
+
 /* 抽屉展开时的背板，点它收起；只在手机端抽屉打开时渲染，故无需前缀。 */
 .app-sidebar-backdrop {
   position: fixed;
