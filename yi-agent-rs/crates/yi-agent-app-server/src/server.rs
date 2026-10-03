@@ -24,6 +24,7 @@ use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
     RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, ThreadStatus,
+    TurnStatus,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
@@ -2709,6 +2710,31 @@ where
                             )
                             .await?;
                         }
+                        // 末尾若是崩溃残留的未收尾 turn，补一条 interrupted 标记，
+                        // 让客户端把它显示为"这一轮被中断"，而不是当成正常轮次。
+                        if loaded.pending_turn {
+                            // 采纳的 partial 必须在这一刻**升格**进主 jsonl：它是这一轮
+                            // 唯一的持久副本，若不 append 就返回，用户下一条消息的 turn-start
+                            // checkpoint 会原子覆盖同一文件，该轮 items 就此永久丢失（而
+                            // session 上下文仍"记得"它们，item 与上下文就此不一致）。
+                            // 失败只记 stderr：恢复出不完整好过让整个 resume 报错；
+                            // 判据与 load 共用，重复调用不会重复 append。
+                            if let Err(e) = thread_store.promote_partial(&thread_id) {
+                                eprintln!(
+                                    "[app-server] failed to promote recovered turn ({thread_id}): {e}"
+                                );
+                            }
+                            write_notification(
+                                &hub,
+                                &Notification::TurnCompleted {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: "crashed".to_string(),
+                                    status: TurnStatus::Interrupted,
+                                    error: None,
+                                },
+                            )
+                            .await?;
+                        }
                         write_response(
                             &hub, &client,
                             ok_response(
@@ -4294,6 +4320,37 @@ async fn interrupt_and_wait_for_persist(
     }
 }
 
+/// 组装当前 turn 的 checkpoint：已 finalize 的 item（含开头的用户提问）+ 当前
+/// 上下文快照。进行中的流式文本不在 `completed_items` 里，故天然不入内。
+fn build_partial(
+    turn_id: &str,
+    user_prompt: &str,
+    completed_items: &[crate::protocol::Item],
+    messages: Vec<yi_agent_core::Message>,
+    usage: Option<crate::thread_store::TurnUsage>,
+) -> crate::thread_store::PartialTurn {
+    let mut items = Vec::with_capacity(completed_items.len() + 1);
+    items.push(opening_user_item(turn_id, user_prompt));
+    items.extend(completed_items.iter().cloned());
+    crate::thread_store::PartialTurn {
+        turn_id: turn_id.to_string(),
+        items,
+        messages,
+        usage,
+    }
+}
+
+/// 尽力写一次 checkpoint：失败只记 stderr，绝不打断 turn。
+fn checkpoint(
+    store: &crate::thread_store::ThreadStore,
+    thread_id: &str,
+    partial: crate::thread_store::PartialTurn,
+) {
+    if let Err(e) = store.write_partial(thread_id, &partial) {
+        eprintln!("[app-server] failed to write turn checkpoint ({thread_id}): {e}");
+    }
+}
+
 /// 一个 turn 结束后（或被 clear / compact 改动后）的收尾：把当前 session 快照
 /// 落盘、置 Idle，并在 `turn_id` 为 `Some` 时上报 Finished。
 ///
@@ -4538,6 +4595,14 @@ async fn run_thread_driver(
         let user_prompt = prompt.clone();
         translator.set_turn(turn_id.clone());
 
+        // turn 开始就把提问落进 checkpoint：即使这一轮随后立刻崩溃，
+        // 至少提问不会丢。
+        checkpoint(
+            &store,
+            &thread_id,
+            build_partial(&turn_id, &user_prompt, &[], agent.session().messages().to_vec(), None),
+        );
+
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
         // system prompt(catalog 未变时输出逐字节相同,不破坏 prompt cache)。
         if let Some(handle) = &catalog {
@@ -4556,6 +4621,12 @@ async fn run_thread_driver(
                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
                 // run() 失败即本轮结束:thread 立刻回 Idle(失败是事件不是状态)。
                 let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
+                // 本轮已结束（失败）：turn 开始写的 checkpoint 必须清掉，否则盘上会
+                // 留一条已结束 turn 的残留，重启后被 resume 当成待恢复 turn。
+                // 与其它 clear 站点同款：尽力删，失败只记 stderr，绝不影响 turn 收尾。
+                if let Err(e) = store.clear_partial(&thread_id) {
+                    eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                }
                 continue;
             }
         };
@@ -4571,6 +4642,11 @@ async fn run_thread_driver(
         let mut coalescer = DeltaCoalescer::default();
         let mut delta_tick = tokio::time::interval(Duration::from_millis(100));
         delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // checkpoint 去抖：item finalize 只标脏，由 500ms tick 合并成一次写盘，
+        // 避免长 turn 里每个 item 都同步写一次。
+        let mut checkpoint_tick = tokio::time::interval(Duration::from_millis(500));
+        checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut checkpoint_dirty = false;
 
         loop {
             tokio::select! {
@@ -4603,6 +4679,13 @@ async fn run_thread_driver(
                                     tracing::error!("failed to serialize reverse request: {e}");
                                     pending.lock().await.remove(&perm_id);
                                     let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                    // 本轮就此结束：turn-start 写的 checkpoint 必须清掉，
+                                    // 否则盘上留一条已结束 turn 的残留，重启后 resume 会
+                                    // 把最后这一轮误标为 interrupted。与其它 clear 站点同款：
+                                    // 尽力删，失败只记 stderr，绝不影响收尾。
+                                    if let Err(e) = store.clear_partial(&thread_id) {
+                                        eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                                    }
                                     return;
                                 }
                             };
@@ -4625,6 +4708,11 @@ async fn run_thread_driver(
                                 // 发起客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);
                                 let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                // 本轮就此结束（客户端断连，不是崩溃）：清掉 checkpoint，
+                                // 否则重启后会把这一轮误报为 interrupted。与其它站点同款。
+                                if let Err(e) = store.clear_partial(&thread_id) {
+                                    eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                                }
                                 return;
                             }
                             // 反向请求已写出:进入等待审批状态。
@@ -4672,6 +4760,7 @@ async fn run_thread_driver(
                             for n in translator.on_event(e) {
                                 if let crate::protocol::Notification::ItemCompleted { item, .. } = &n {
                                     completed_items.push(item.clone());
+                                    checkpoint_dirty = true;
                                 }
                                 // 用量通知携带本轮累积快照(见 Translator::on_event),最后一条即落盘用的完整用量。
                                 if let crate::protocol::Notification::TokenUsage {
@@ -4724,6 +4813,11 @@ async fn run_thread_driver(
                                         // 客户端可能已断开;先上报 Finished,
                                         // 避免 active_turn_id 永久卡住。
                                         let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                        // 本轮就此结束（写失败，不是崩溃）：清掉 checkpoint，
+                                        // 否则重启后会把这一轮误报为 interrupted。与其它站点同款。
+                                        if let Err(e) = store.clear_partial(&thread_id) {
+                                            eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+                                        }
                                         return;
                                     }
                                 }
@@ -4761,6 +4855,20 @@ async fn run_thread_driver(
                         )
                         .await;
                     }
+                }
+                _ = checkpoint_tick.tick(), if checkpoint_dirty => {
+                    checkpoint(
+                        &store,
+                        &thread_id,
+                        build_partial(
+                            &turn_id,
+                            &user_prompt,
+                            &completed_items,
+                            agent.session().messages().to_vec(),
+                            last_usage.clone(),
+                        ),
+                    );
+                    checkpoint_dirty = false;
                 }
                 Some(target) = interrupt_rx.recv(), if !cancel_sent => {
                     // 只接受针对当前 turn 的中断;忽略上一轮残留的信号。
@@ -4830,6 +4938,11 @@ async fn run_thread_driver(
             // active_turn_id,且**不要**再 append 一次(否则会用 turn 前的 session 覆盖)。
             let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
             let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+            // 这条路径不走常规收尾；本轮 checkpoint 同样必须清掉，否则会在盘上
+            // 留一条已结束 turn 的残留，重启后被 resume 当成待恢复 turn。
+            if let Err(e) = store.clear_partial(&thread_id) {
+                eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+            }
             continue;
         }
 
@@ -4847,6 +4960,11 @@ async fn run_thread_driver(
             &status,
         )
         .await;
+
+        // 收尾已把整轮 append 进主 jsonl；checkpoint 的使命结束。
+        if let Err(e) = store.clear_partial(&thread_id) {
+            eprintln!("[app-server] failed to clear turn checkpoint ({thread_id}): {e}");
+        }
     }
 }
 
@@ -4884,7 +5002,7 @@ fn store_lookup(
 }
 
 /// 一条 `Item` 的稳定 id（用于 `thread/readItems` 的 `afterItemId` 切片与前端去重）。
-fn item_id(item: &crate::protocol::Item) -> Option<&str> {
+pub(crate) fn item_id(item: &crate::protocol::Item) -> Option<&str> {
     match item {
         crate::protocol::Item::UserMessage { id, .. }
         | crate::protocol::Item::AgentMessage { id, .. }
@@ -7219,6 +7337,42 @@ pub(crate) mod tests {
         }
     }
 
+    /// 第一次调用产出一段助手文本 + 一个工具调用后正常结束（core 会进入 ACT、
+    /// 向 driver 发 `ToolCall`，translator 借此把累积文本 finalize 成一个 item）；
+    /// 之后的调用**永不产出**，于是 turn 一直停在"已 finalize 一块文本、但还没
+    /// persist"的窗口——正是 checkpoint 该已落盘的窗口。
+    struct CheckpointProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for CheckpointProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            use yi_agent_core::provider::ProviderEvent as E;
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // 工具入参必须是合法 JSON（`{}`），否则 accumulate 会因解析失败报错。
+                let head = futures::stream::iter(vec![
+                    E::TextDelta("a".into()),
+                    E::ToolUseStart { id: "t1".into(), name: "noop".into() },
+                    E::ToolUseDelta { id: "t1".into(), partial_json: "{}".into() },
+                    E::ToolUseEnd { id: "t1".into() },
+                    E::Stop { reason: yi_agent_core::provider::StopReason::EndTurn },
+                ]);
+                Ok(head.boxed())
+            } else {
+                // 永不产出的尾部：保证 turn 不收尾（否则会被正常 persist）。
+                Ok(futures::stream::pending::<E>().boxed())
+            }
+        }
+    }
+
     /// 测试用的单客户端 hub:注册 `local` 并起 `pump_stdout`,与生产的 stdio 接线同款。
     fn test_hub<W>(
         writer: W,
@@ -7298,6 +7452,32 @@ pub(crate) mod tests {
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(DelayedProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(&mut agent, session);
+        Ok(BuiltAgent {
+            agent,
+            provider,
+            config,
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        })
+    }
+
+    fn build_checkpoint_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> =
+            Arc::new(CheckpointProvider { calls: AtomicUsize::new(0) });
         let config = yi_agent_core::AgentConfig::default();
         let mut agent = yi_agent_core::Agent::new(
             provider.clone(),
@@ -7615,6 +7795,112 @@ pub(crate) mod tests {
             }
         }
         panic!("no thread/start response");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_in_flight_turn_leaves_a_checkpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_checkpoint_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"do work"}}]}}}}"#
+        ))
+        .await;
+
+        // 等到**助手 item** 的 item/completed 出现 —— 说明这一块文本已 finalize、
+        // checkpoint 已被标脏。注意不能只等第一个 item/completed：turn 开启时发
+        // 的用户 item 也是 item/completed，只等"第一个"会在助手文本 finalize 之前
+        // 就 break，断言便退化成只校验 turn-start 那次写入（那时 flush 分支从未跑过）。
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
+                && v["params"]["item"]["type"] == serde_json::json!("agentMessage")
+            {
+                break;
+            }
+        }
+
+        let partial = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.partial.json"));
+        // checkpoint 是去抖写的，轮询等待。这里只接受"已 finalize 的助手 item 也
+        // 在盘上"的版本：turn-start 那次写入只有用户 item（items 长度 1），
+        // 助手 item 只能由 500ms tick 的 flush 分支落盘。
+        let mut saved: Option<serde_json::Value> = None;
+        for _ in 0..100 {
+            if let Ok(t) = std::fs::read_to_string(&partial) {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["items"].as_array().map(|a| a.len() >= 2).unwrap_or(false) {
+                    saved = Some(v);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let saved = saved.expect(
+            "checkpoint must carry the finalized assistant item; only the debounced flush can write it",
+        );
+        let items = saved["items"].as_array().unwrap();
+        // turn-start 那次写入只有用户 item（长度 1）；助手 item 只能由 flush 落盘。
+        assert!(
+            items.len() >= 2,
+            "checkpoint must carry the finalized assistant item (turn-start write has only the user item): {items:?}"
+        );
+        assert_eq!(
+            items[0]["type"],
+            serde_json::json!("userMessage"),
+            "checkpoint must carry the opening user item: {items:?}"
+        );
+        assert_eq!(
+            items[0]["text"],
+            serde_json::json!("do work"),
+            "checkpoint must carry the prompt: {items:?}"
+        );
+        let assistant = items
+            .iter()
+            .find(|i| i["type"] == serde_json::json!("agentMessage"))
+            .unwrap_or_else(|| {
+                panic!("checkpoint must carry the finalized assistant item; only the debounced flush can write it: {items:?}")
+            });
+        assert_eq!(
+            assistant["text"],
+            serde_json::json!("a"),
+            "checkpoint must carry the finalized assistant text: {items:?}"
+        );
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completed_turn_removes_its_checkpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hello"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+        let partial = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.partial.json"));
+        for _ in 0..100 {
+            if !partial.exists() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!partial.exists(), "a finished turn must not leave a checkpoint");
+        h.shutdown().await;
     }
 
     /// 读到 id 匹配的那一帧响应,丢弃中间穿插的通知(如 `process/updated`)。
@@ -9814,6 +10100,329 @@ pub(crate) mod tests {
         );
 
         h.shutdown().await;
+    }
+
+    /// 崩溃残留：主 jsonl 有一轮，另有未收尾的 partial。resume 必须回放两轮的
+    /// items，并以一条 interrupted 的 turn/completed 收尾。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        // `Harness::new()` 的 workdir 是 test_config() 的默认路径，与下面 store
+        // 用的 tempdir 不一致会让 resume 找不到该 thread，故必须走 with_config。
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        // 直接用 store 造盘面：一轮已落盘 + 一段 partial 残留。
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        let tid = "thread-crash";
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: dir.path().to_string_lossy().to_string(),
+                model: "m".into(),
+                created_at: 1,
+                updated_at: 1,
+                title: None,
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+            })
+            .unwrap();
+        store
+            .append_turn(
+                tid,
+                &crate::thread_store::TurnLine::Turn {
+                    items: vec![crate::protocol::Item::UserMessage {
+                        id: "user-t1".into(),
+                        text: "first".into(),
+                    }],
+                    usage: None,
+                    messages: vec![],
+                },
+            )
+            .unwrap();
+        store
+            .write_partial(
+                tid,
+                &crate::thread_store::PartialTurn {
+                    turn_id: "turn-t2".into(),
+                    items: vec![
+                        crate::protocol::Item::UserMessage {
+                            id: "user-turn-t2".into(),
+                            text: "second".into(),
+                        },
+                        crate::protocol::Item::AgentMessage {
+                            id: "item-turn-t2-1".into(),
+                            text: "half".into(),
+                        },
+                    ],
+                    messages: vec![],
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        initialize(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        let mut saw_half = false;
+        let mut interrupted = false;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
+                && v["params"]["item"]["text"] == "half"
+            {
+                saw_half = true;
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed")
+                && v["params"]["status"] == "interrupted"
+            {
+                interrupted = true;
+                break;
+            }
+            if v.get("id") == Some(&serde_json::json!(5)) && interrupted {
+                break;
+            }
+        }
+        assert!(saw_half, "the crashed turn's finished items must be replayed");
+        assert!(interrupted, "a crashed partial turn must be flagged interrupted");
+        h.shutdown().await;
+    }
+
+    /// C1 回归：resume 采纳的崩溃轮必须被**升格**（append）进主 jsonl。否则该 partial
+    /// 是这一轮唯一的持久副本，用户下一条消息的 turn-start checkpoint 会原子覆盖它，
+    /// 崩溃轮的 items 永久丢失——而 session 上下文仍"记得"它们，造成 item/上下文不一致。
+    ///
+    /// 走完整链路：崩溃（一轮 jsonl + 一段 partial）→ resume（回放 + interrupted，
+    /// 且必须已升格）→ 第二个 turn 正常收尾 → store 冷 load：崩溃轮 items 仍在、
+    /// 只一份、不重复。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        let tid = "thread-promote";
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: dir.path().to_string_lossy().to_string(),
+                model: "m".into(),
+                created_at: 1,
+                updated_at: 1,
+                title: None,
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+            })
+            .unwrap();
+        // 一轮正常收尾过的历史。
+        store
+            .append_turn(
+                tid,
+                &crate::thread_store::TurnLine::Turn {
+                    items: vec![crate::protocol::Item::UserMessage {
+                        id: "user-t1".into(),
+                        text: "first".into(),
+                    }],
+                    usage: None,
+                    messages: vec![],
+                },
+            )
+            .unwrap();
+        // 崩溃残留：这一轮只有 partial，jsonl 里没有它的首 item id。
+        store
+            .write_partial(
+                tid,
+                &crate::thread_store::PartialTurn {
+                    turn_id: "turn-t2".into(),
+                    items: vec![
+                        crate::protocol::Item::UserMessage {
+                            id: "user-turn-t2".into(),
+                            text: "second".into(),
+                        },
+                        crate::protocol::Item::AgentMessage {
+                            id: "item-turn-t2-1".into(),
+                            text: "half".into(),
+                        },
+                    ],
+                    messages: vec![],
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        initialize(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        // resume 必须回放崩溃轮的 items 并标注 interrupted，随后响应。
+        let mut saw_half = false;
+        let mut interrupted = false;
+        let mut resumed = false;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
+                && v["params"]["item"]["text"] == "half"
+            {
+                saw_half = true;
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed")
+                && v["params"]["status"] == "interrupted"
+            {
+                interrupted = true;
+            }
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                resumed = true;
+                break;
+            }
+        }
+        assert!(saw_half, "the crashed turn's finished items must be replayed");
+        assert!(interrupted, "a crashed partial turn must be flagged interrupted");
+        assert!(resumed, "resume must respond");
+
+        // 第二个 turn：正常走完。它的 turn-start checkpoint 会覆盖盘上的 partial
+        // 文件——若 resume 没有先升格，这一步就是崩溃轮数据的丢失点。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":6,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"third"}}]}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                assert_eq!(v["params"]["status"], "completed", "second turn: {v}");
+                break;
+            }
+        }
+
+        // 落盘是尽力而为且发生在 driver 收尾之后（见既有持久化测试），故轮询等待。
+        let log = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.jsonl"));
+        let mut text = String::new();
+        for _ in 0..100 {
+            text = std::fs::read_to_string(&log).unwrap_or_default();
+            if text.contains("item-turn-t2-1") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            text.contains("item-turn-t2-1") && text.contains("half"),
+            "the recovered crashed turn must survive a later turn on disk; \
+             log now contains {} turn(s): {text}",
+            text.lines().filter(|l| !l.trim().is_empty()).count()
+        );
+
+        // 冷 load：崩溃轮的内容仍在，且只一份。
+        let loaded = store.load(tid).unwrap().unwrap();
+        let ids: Vec<String> = loaded
+            .items
+            .iter()
+            .map(|i| crate::server::item_id(i).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            &ids[..3],
+            &["user-t1", "user-turn-t2", "item-turn-t2-1"],
+            "the crashed turn must be first and intact: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|i| *i == "item-turn-t2-1").count(),
+            1,
+            "the crashed turn must not be double-counted: {ids:?}"
+        );
+        assert!(!loaded.pending_turn, "promotion must clear the pending flag");
+        h.shutdown().await;
+    }
+
+    /// I1 回归：等待审批期间**发起客户端断连**（真实的重连场景，不是崩溃）时，
+    /// driver 就此收尾并 `return`，必须清掉 checkpoint；否则盘上留一条已结束 turn
+    /// 的残留，重启后 resume 会把最后这一轮误报为 interrupted。
+    ///
+    /// 直接以「发起方已在 hub 上注销」接线 `is_connected` 判据；生产里发起方是
+    /// stdio 的 `local`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_approval() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(dir.path()));
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
+        let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+        let _keep_session_tx = session_tx;
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        // 发起方：注册后立刻摘除 = 断连。
+        let initiator = crate::broadcast::ClientId::ws(uuid::Uuid::new_v4());
+        let _init_rx = hub.register(initiator.clone());
+        hub.unregister(&initiator);
+
+        let built = build_permission_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-disconnect".into(),
+            built.agent,
+            prompt_rx,
+            interrupt_rx,
+            interject_rx,
+            session_rx,
+            hub,
+            initiator,
+            turn_tx,
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Duration::from_secs(60),
+            Arc::new(AtomicU64::new(1)),
+            None,
+            Arc::clone(&store),
+            ThreadSession::new_status(),
+            built.provider,
+            built.config,
+        ));
+
+        prompt_tx
+            .send(TurnPrompt {
+                turn_id: "turn-1".into(),
+                prompt: "hi".into(),
+                activate: None,
+            })
+            .await
+            .unwrap();
+
+        // 审批请求命中"发起方已断连"分支 → 收尾并 return。
+        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+            .await
+            .expect("driver must report Finished when the initiator is gone")
+            .expect("turn channel must stay open");
+        assert!(matches!(ev, TurnEvent::Finished { ref turn_id, .. } if turn_id == "turn-1"));
+
+        // clear_partial 发生在 Finished 之后；轮询等待（文件可能已被删除）。
+        let partial = dir
+            .path()
+            .join(".yi-agent/threads/thread-disconnect.partial.json");
+        for _ in 0..100 {
+            if !partial.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !partial.exists(),
+            "a disconnect during approval must clear the turn checkpoint"
+        );
+
+        drop(prompt_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
