@@ -1,7 +1,7 @@
 //! Superpowers 看板插件进程入口。
 //!
 //! 用法：
-//! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs 10]`
+//! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]`
 //! - `superpowers-kanban add <spec> <plan> [--state-dir <d>]`——把一对 spec/plan 投进 `inbox`
 //! - `superpowers-kanban add-merge <source> [--base <ref>] [--state-dir <d>]`——投递一张合并卡
 //! - `superpowers-kanban list [--state-dir <d>]`——打印队列与待消费的投递
