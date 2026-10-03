@@ -816,6 +816,7 @@ fn build_headless_root_tools(
     config: &config::Config,
     runtime_socket: std::path::PathBuf,
     attached_root: &crate::tui::subagents::AttachedRoot,
+    caller: crate::tui::subagents::CallerContext,
 ) -> Result<HeadlessSetup> {
     let setup =
         build_headless_setup_for_workspace(config, false, attached_root.workspace.path.clone())?;
@@ -830,7 +831,7 @@ fn build_headless_root_tools(
         &mut registry,
         binding,
         delegation_controller,
-        crate::tui::subagents::CallerContext::unbound(),
+        caller,
     );
     Ok(HeadlessSetup {
         tools: Arc::new(registry),
@@ -925,6 +926,7 @@ fn build_tui_root_tools(
     config: &config::Config,
     runtime_socket: std::path::PathBuf,
     attached_root: &crate::tui::subagents::AttachedRoot,
+    caller: crate::tui::subagents::CallerContext,
 ) -> yi_agent_core::ToolRegistry {
     let mut registry = base_registry.clone();
     yi_agent_tools::register_builtin_tools_with_sandbox(
@@ -943,7 +945,7 @@ fn build_tui_root_tools(
         &mut registry,
         binding,
         delegation_controller,
-        crate::tui::subagents::CallerContext::unbound(),
+        caller,
     );
     registry
 }
@@ -1544,9 +1546,21 @@ fn run_headless(
 
     let provider = yi_agent_runtime::bootstrap::build_provider(&config)?;
 
+    let mut runtime_caller: Option<crate::tui::subagents::CallerContext> = None;
     let setup = match &headless_runtime {
         Some(runtime) => {
-            build_headless_root_tools(&config, runtime.socket_path.clone(), &runtime.attached_root)?
+            // One caller for this run, bound to the agent's live session right
+            // after the agent is built below. A `fork:true` spawn in `run` mode
+            // reads this handle at call time.
+            let caller = crate::tui::subagents::CallerContext::unbound();
+            let setup = build_headless_root_tools(
+                &config,
+                runtime.socket_path.clone(),
+                &runtime.attached_root,
+                caller.clone(),
+            )?;
+            runtime_caller = Some(caller);
+            setup
         }
         None => build_headless_setup(&config, naked)?,
     };
@@ -1561,6 +1575,12 @@ fn run_headless(
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
         let mut agent = yi_agent_core::Agent::new(provider, tools, agent_config)
             .with_permission(checker, decision_rx);
+        // The delegation tools were assembled with `runtime_caller`; binding it to
+        // this agent's live session makes a `fork:true` spawn read the caller's
+        // transcript at call time.
+        if let Some(caller) = &runtime_caller {
+            caller.bind(agent.session_handle());
+        }
 
         let stream = match agent.run(prompt_text).await {
             Ok(s) => s,
@@ -1590,6 +1610,30 @@ fn run_headless(
     }
     drop(headless_runtime);
     std::process::exit(exit_code);
+}
+
+/// Rebuild the driver's agent around an existing session `Arc`.
+///
+/// Every `/clear`, `/compact`, `/model`, MCP-refresh and runtime-attach in the
+/// TUI driver goes through here for one reason: the session `Arc` must survive
+/// the rebuild. The delegation tools' [`crate::tui::subagents::CallerContext`]
+/// is bound to that `Arc` after the runtime attaches, and `spawn_agent{fork}`
+/// re-reads it live on each call. Swapping in a fresh session would leave the
+/// bound handle pointing at a discarded transcript, so a later `fork:true` would
+/// silently see the wrong conversation (or none).
+fn rebuild_driver_agent(
+    provider: Arc<dyn Provider>,
+    tools: Arc<yi_agent_core::ToolRegistry>,
+    config: yi_agent_core::AgentConfig,
+    checker: Arc<yi_agent_core::permission::PermissionChecker>,
+    decision_rx: Arc<
+        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>>,
+    >,
+    session: Arc<std::sync::Mutex<yi_agent_core::Session>>,
+) -> yi_agent_core::Agent {
+    yi_agent_core::Agent::new(provider, tools, config)
+        .with_session_arc(session)
+        .with_permission(checker, decision_rx)
 }
 
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
@@ -1664,6 +1708,15 @@ fn run_tui_agent(
         let mcp_for_driver = Arc::clone(&mcp);
         let mcp_for_teardown = Arc::clone(&mcp);
 
+        // One caller for the whole TUI session. It is handed to
+        // `build_tui_root_tools` while assembling the runtime-attached registry
+        // and bound to the driver's live session once the runtime is attached,
+        // so the delegation tools read the current transcript at call time.
+        // The binding is refreshed on every rebuild below: each rebuild reuses
+        // the same session `Arc`, so the handle never goes stale.
+        let caller = crate::tui::subagents::CallerContext::unbound();
+        let caller_for_attach = caller.clone();
+
         // `workdir` is moved into the driver closure below, and `config` is moved
         // into it too, so both the snapshot and the TUI call site need values built
         // before the closure and a cloned workdir.
@@ -1710,20 +1763,28 @@ fn run_tui_agent(
                 if let DriverInput::Control(Some(cmd)) = input {
                     match cmd {
                         ControlCommand::Clear => {
-                            // Rebuild agent with empty session.
-                            agent = yi_agent_core::Agent::new(
+                            // Rebuild agent with empty session. The session Arc is
+                            // reused (not replaced) so the `CallerContext` bound to
+                            // it stays live; the contents are emptied in place, and
+                            // `last_input_tokens` is dropped like a fresh session.
+                            let handle = agent.session_handle();
+                            agent = rebuild_driver_agent(
                                 Arc::clone(&rebuild_provider),
                                 Arc::clone(&current_tools),
                                 rebuild_config.clone(),
-                            )
-                            .with_session(yi_agent_core::Session::new())
-                            .with_permission(
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
+                                Arc::clone(&handle),
                             );
+                            handle.lock().unwrap().replace_messages(Vec::new());
+                            handle.lock().unwrap().set_last_input_tokens(None);
                             tracing::info!("agent session cleared via /clear");
                         }
                         ControlCommand::Compact => {
+                            // Keep the session Arc: compaction replaces the
+                            // contents in place, so the bound caller handle is
+                            // not left pointing at a discarded session.
+                            let handle = agent.session_handle();
                             let session = agent.session();
                             let old_msg_count = session.messages().len();
                             match yi_agent_core::compact_session(
@@ -1735,16 +1796,23 @@ fn run_tui_agent(
                             {
                                 Ok(Some(new_session)) => {
                                     let new_msg_count = new_session.messages().len();
-                                    agent = yi_agent_core::Agent::new(
+                                    agent = rebuild_driver_agent(
                                         Arc::clone(&rebuild_provider),
                                         Arc::clone(&current_tools),
                                         rebuild_config.clone(),
-                                    )
-                                    .with_session(new_session)
-                                    .with_permission(
                                         Arc::clone(&current_checker),
                                         Arc::clone(&rebuild_decision_rx),
+                                        Arc::clone(&handle),
                                     );
+                                    handle.lock().unwrap().replace_messages(
+                                        new_session.messages().to_vec(),
+                                    );
+                                    // The replaced session used to be brand new,
+                                    // so its token count meant "no measurement
+                                    // yet". Keep that: a stale pre-compaction
+                                    // count would re-trigger auto-compaction on
+                                    // the very next turn.
+                                    handle.lock().unwrap().set_last_input_tokens(None);
                                     tracing::info!("agent session compacted via /compact");
                                     let _ = agent_tx
                                         .send(manual_compaction_outcome_event(
@@ -1777,30 +1845,30 @@ fn run_tui_agent(
                             let mut refreshed = (*current_tools).clone();
                             mcp_for_driver.refresh_registry(&mut refreshed);
                             current_tools = Arc::new(refreshed);
-                            agent = yi_agent_core::Agent::new(
+                            // Reuse the session Arc: a fresh one would orphan the
+                            // handle the delegation caller is bound to.
+                            let handle = agent.session_handle();
+                            agent = rebuild_driver_agent(
                                 Arc::clone(&rebuild_provider),
                                 Arc::clone(&current_tools),
                                 rebuild_config.clone(),
-                            )
-                            .with_session(agent.session())
-                            .with_permission(
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
+                                handle,
                             );
                             tracing::info!("MCP tool registry refreshed");
                         }
                         ControlCommand::SetModel(new_model) => {
                             let mut next_config = rebuild_config.clone();
                             next_config.model = new_model.clone();
-                            agent = yi_agent_core::Agent::new(
+                            let handle = agent.session_handle();
+                            agent = rebuild_driver_agent(
                                 Arc::clone(&rebuild_provider),
                                 Arc::clone(&current_tools),
                                 next_config,
-                            )
-                            .with_session(agent.session())
-                            .with_permission(
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
+                                handle,
                             );
                             tracing::info!(model = %new_model, "agent model switched via /model");
                             let _ = agent_tx
@@ -1868,24 +1936,28 @@ fn run_tui_agent(
                                         &config,
                                         socket_path.clone(),
                                         &attached_root,
+                                        caller_for_attach.clone(),
                                     );
                                     mcp_for_driver.refresh_registry(&mut next_registry);
                                     let next_tools = Arc::new(next_registry);
                                     match load_permission_checker_for_workdir_async(runtime_workdir, &config).await {
                                         Ok(next_checker) => {
-                                            let session = agent.session();
+                                            // Reuse the session Arc across the
+                                            // rebuild, then bind the caller to it,
+                                            // so `spawn_agent{fork}` reads this
+                                            // conversation live.
+                                            let handle = agent.session_handle();
                                             current_tools = next_tools;
                                             current_checker = next_checker;
-                                            agent = yi_agent_core::Agent::new(
+                                            agent = rebuild_driver_agent(
                                                 Arc::clone(&rebuild_provider),
                                                 Arc::clone(&current_tools),
                                                 rebuild_config.clone(),
-                                            )
-                                            .with_session(session)
-                                            .with_permission(
                                                 Arc::clone(&current_checker),
                                                 Arc::clone(&rebuild_decision_rx),
+                                                Arc::clone(&handle),
                                             );
+                                            caller_for_attach.bind(handle);
                                             current_runtime =
                                                 Some(TuiRuntimeSession::Attached(Box::new(
                                                     AttachedTuiRuntime {
@@ -2433,8 +2505,13 @@ mod tests {
         assert!(ordinary.get("spawn_agent").is_none());
 
         let root = attached_root_for_main_tests();
-        let registry = build_headless_root_tools(&config, "/tmp/runtime.sock".into(), &root)
-            .expect("attached headless setup");
+        let registry = build_headless_root_tools(
+            &config,
+            "/tmp/runtime.sock".into(),
+            &root,
+            crate::tui::subagents::CallerContext::unbound(),
+        )
+        .expect("attached headless setup");
         let names = registry
             .tools
             .schemas()
@@ -2513,6 +2590,7 @@ mod tests {
             &config,
             "/tmp/runtime.sock".into(),
             &root,
+            crate::tui::subagents::CallerContext::unbound(),
         );
         let names = registry
             .schemas()
@@ -2524,6 +2602,169 @@ mod tests {
         assert!(names.contains(&"send_message".to_string()));
         assert!(names.contains(&"wait_agent".to_string()));
         assert!(names.contains(&"bash".to_string()));
+    }
+
+    /// A provider that is never called: the rebuild tests only exercise the
+    /// session handle, not a turn.
+    struct NeverCalledProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for NeverCalledProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::ProviderRequest,
+        ) -> Result<BoxStream<'static, yi_agent_core::ProviderEvent>, yi_agent_core::ProviderError>
+        {
+            Ok(futures::stream::iter(Vec::new()).boxed())
+        }
+    }
+
+    /// The driver's agent is rebuilt on `/clear`, `/compact`, `/model`,
+    /// MCP-refresh and runtime attach. Every one of those must keep the SAME
+    /// session `Arc`, or the `CallerContext` bound for `spawn_agent{fork}` goes
+    /// stale and a later fork reads a discarded transcript.
+    #[test]
+    fn every_driver_rebuild_keeps_the_callers_session_handle() {
+        let caller = crate::tui::subagents::CallerContext::unbound();
+
+        let mut agent = yi_agent_core::Agent::new(
+            Arc::new(NeverCalledProvider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+        );
+        let session = agent.session_handle();
+        session
+            .lock()
+            .unwrap()
+            .push(yi_agent_core::Message::user("before the rebuilds"));
+        caller.bind(Arc::clone(&session));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checker = yi_agent_runtime::bootstrap::load_permission_checker(dir.path(), true)
+            .expect("checker");
+        let (decision_tx, decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(1);
+        drop(decision_tx);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        for _ in 0..2 {
+            agent = rebuild_driver_agent(
+                Arc::new(NeverCalledProvider),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                yi_agent_core::AgentConfig::default(),
+                Arc::clone(&checker),
+                Arc::clone(&decision_rx),
+                Arc::clone(&session),
+            );
+            assert!(
+                Arc::ptr_eq(&session, &agent.session_handle()),
+                "a rebuild replaced the session Arc"
+            );
+        }
+        assert_eq!(
+            caller.snapshot().map(|messages| messages.len()),
+            Some(1),
+            "the caller bound before the rebuilds must still see the live session"
+        );
+    }
+
+    /// `/compact` replaces the session's contents in place (same `Arc`) and
+    /// drops the stale token count -- exactly what the old `Session::new()`
+    /// replacement did. A leftover pre-compaction count would re-trigger
+    /// auto-compaction on the very next turn.
+    #[test]
+    fn compact_reuses_the_session_handle_and_drops_the_stale_token_count() {
+        struct SummaryProvider;
+
+        #[async_trait::async_trait]
+        impl Provider for SummaryProvider {
+            async fn call_stream(
+                &self,
+                _req: yi_agent_core::ProviderRequest,
+            ) -> Result<
+                BoxStream<'static, yi_agent_core::ProviderEvent>,
+                yi_agent_core::ProviderError,
+            > {
+                Ok(
+                    futures::stream::iter(vec![yi_agent_core::ProviderEvent::TextDelta(
+                        "checkpoint".into(),
+                    )])
+                    .boxed(),
+                )
+            }
+        }
+
+        let mut session = yi_agent_core::Session::new();
+        session.push(yi_agent_core::Message::user("fix it"));
+        session.push(yi_agent_core::Message::assistant(vec![
+            yi_agent_core::ContentBlock::ToolUse {
+                id: "old".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            },
+        ]));
+        session.push(yi_agent_core::Message::tool_results(vec![
+            yi_agent_core::ContentBlock::ToolResult {
+                tool_use_id: "old".into(),
+                content: vec![yi_agent_core::ContentBlock::Text("x".repeat(60_000))],
+                is_error: false,
+            },
+        ]));
+        session.push(yi_agent_core::Message::assistant(vec![
+            yi_agent_core::ContentBlock::ToolUse {
+                id: "new".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            },
+        ]));
+        session.push(yi_agent_core::Message::tool_results(vec![
+            yi_agent_core::ContentBlock::ToolResult {
+                tool_use_id: "new".into(),
+                content: vec![yi_agent_core::ContentBlock::Text("new result".into())],
+                is_error: false,
+            },
+        ]));
+
+        let handle = Arc::new(std::sync::Mutex::new(session));
+        handle.lock().unwrap().set_last_input_tokens(Some(123));
+        let caller = crate::tui::subagents::CallerContext::new(Arc::clone(&handle));
+        assert_eq!(
+            caller.snapshot().map(|messages| messages.len()),
+            Some(5),
+            "the caller starts bound to the full transcript"
+        );
+
+        let provider: Arc<dyn Provider> = Arc::new(SummaryProvider);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let compacted = rt
+            .block_on(yi_agent_core::compact_session(
+                &provider,
+                &yi_agent_core::AgentConfig::default(),
+                &handle.lock().unwrap(),
+            ))
+            .expect("compaction must not fail")
+            .expect("the transcript must compact");
+
+        // What the `/compact` arm does: in place, on the same Arc.
+        handle
+            .lock()
+            .unwrap()
+            .replace_messages(compacted.messages().to_vec());
+        handle.lock().unwrap().set_last_input_tokens(None);
+
+        assert_eq!(
+            caller.snapshot().map(|messages| messages.len()),
+            Some(compacted.len()),
+            "the caller bound before compaction must see the compacted transcript"
+        );
+        assert_eq!(
+            handle.lock().unwrap().last_input_tokens(),
+            None,
+            "a stale token count would re-trigger auto-compaction"
+        );
     }
 
     #[test]
