@@ -1028,9 +1028,9 @@ export default function App() {
     }
     session.lastError = formatError(lastError);
     // Roll back the optimistic bubble so a rejected send does not leave a
-    // phantom user message.
-    const last = session.items[session.items.length - 1];
-    if (last && last.type === "userMessage" && last.text === text) session.items.pop();
+    // phantom user message. (The server echoes the opening item on success, so
+    // this only ever removes *our* pending copy.)
+    session.dropLocalUserMessage(text);
     force((v) => v + 1);
     return false;
   };

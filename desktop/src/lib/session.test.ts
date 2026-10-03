@@ -373,4 +373,88 @@ describe("Session", () => {
       expect(s.lastServerItemId).toBe("a1");
     });
   });
+
+  describe("opening user item ordering", () => {
+    it("keeps the opening user item ahead of agent items on a cold-open replay", () => {
+      const s = new Session();
+      // A cold thread the user typed into while it was actually running: only the
+      // local echo exists until the full replay lands.
+      s.addUserMessage("Implement the plan");
+      // The replay is in server order: opener first, then the agent's output.
+      s.upsertItems([
+        { type: "userMessage", id: "user-t1", text: "Implement the plan" },
+        { type: "agentMessage", id: "a1", text: "working" },
+      ]);
+      expect(s.items.map((i) => i.id)).toEqual(["user-t1", "a1"]);
+    });
+
+    it("appends the opener and following items in server order on an empty view", () => {
+      const s = new Session();
+      s.upsertItems([
+        { type: "userMessage", id: "user-t1", text: "Implement the plan" },
+        { type: "agentMessage", id: "a1", text: "working" },
+      ]);
+      expect(s.items.map((i) => i.id)).toEqual(["user-t1", "a1"]);
+    });
+
+    it("reconciles the local echo with the replayed opening item instead of duplicating it", () => {
+      const s = new Session();
+      s.addUserMessage("hello");
+      s.upsertItems([{ type: "userMessage", id: "user-t1", text: "hello" }]);
+      expect(s.items).toHaveLength(1);
+      expect(s.items[0]).toMatchObject({ type: "userMessage", id: "user-t1", text: "hello" });
+    });
+
+    it("reconciles the local echo when the opening item arrives live", () => {
+      const s = new Session();
+      s.addUserMessage("hello");
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "userMessage", id: "user-t1", text: "hello" } },
+      });
+      expect(s.items).toHaveLength(1);
+      expect(s.items[0].id).toBe("user-t1");
+    });
+
+    it("keeps agent text after the opening user item when both arrive live", () => {
+      const s = new Session();
+      s.addUserMessage("hello");
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "userMessage", id: "user-t1", text: "hello" } },
+      });
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+      });
+      s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "hi" } });
+      expect(s.items.map((i) => i.id)).toEqual(["user-t1", "a1"]);
+    });
+
+    it("drops a duplicate local echo once the server item is present", () => {
+      const s = new Session();
+      s.addUserMessage("dup");
+      s.addUserMessage("dup");
+      s.upsertItems([{ type: "userMessage", id: "user-t1", text: "dup" }]);
+      expect(s.items).toHaveLength(1);
+      expect(s.items[0].id).toBe("user-t1");
+    });
+  });
+
+  describe("dropLocalUserMessage", () => {
+    it("removes the matching local echo", () => {
+      const s = new Session();
+      s.addUserMessage("hi");
+      s.dropLocalUserMessage("hi");
+      expect(s.items).toHaveLength(0);
+    });
+
+    it("never removes a server item", () => {
+      const s = new Session();
+      s.upsertItems([{ type: "userMessage", id: "user-t1", text: "hi" }]);
+      s.dropLocalUserMessage("hi");
+      expect(s.items).toHaveLength(1);
+      expect(s.items[0].id).toBe("user-t1");
+    });
+  });
 });

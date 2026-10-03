@@ -66,9 +66,55 @@ export class Session {
     this.items.push({ type: "userMessage", id: nextLocalId(), text });
   }
 
+  /**
+   * Whether an item id was minted locally (`local-*`) rather than by the server.
+   * Locally-synthesised bubbles (the optimistic echo `send` pushes before the
+   * server replies, and `/`-command notices) must never anchor server items:
+   * the server transcript is the authority on order.
+   */
+  private static isLocalId(id: string | undefined): boolean {
+    return typeof id === "string" && id.startsWith("local-");
+  }
+
+  /**
+   * Insert a server item right after the last server item already held.
+   *
+   * Appending to the array end was wrong whenever a locally-minted bubble sat
+   * there: the first server item of a turn (the opening user message) would land
+   * *after* the local echo that preceded it, or — for a thread opened while a
+   * turn was already running — after agent text that arrived first, which is
+   * exactly how the opening prompt ended up at the bottom of the transcript.
+   * Anchoring to the last server item keeps reload-on-open order.
+   */
+  private insertAfterLastServerItem(item: Item): void {
+    let last = -1;
+    for (let i = this.items.length - 1; i >= 0; i -= 1) {
+      if (!Session.isLocalId(this.items[i].id)) {
+        last = i;
+        break;
+      }
+    }
+    if (last < 0) this.items.push(item);
+    else this.items.splice(last + 1, 0, item);
+  }
+
   /** Append a command-output line (never sent to the agent). */
   notice(text: string): void {
     this.items.push({ type: "notice", id: nextLocalId(), text });
+  }
+
+  /**
+   * Remove the local optimistic echo for `text` (a rejected `send`).
+   *
+   * Matched by id-prefix + text rather than "the last item": once the server's
+   * opening item for a turn exists, the local echo is no longer necessarily the
+   * array tail, and popping blindly could delete the wrong bubble.
+   */
+  dropLocalUserMessage(text: string): void {
+    const index = this.items.findIndex(
+      (i) => Session.isLocalId(i.id) && i.type === "userMessage" && i.text === text,
+    );
+    if (index >= 0) this.items.splice(index, 1);
   }
 
   /**
@@ -80,6 +126,7 @@ export class Session {
    * monotonic with what the transcript now holds.
    */
   upsertItems(items: Item[]): void {
+    let reconciledLocalEcho = false;
     for (const item of items) {
       // Same normalisation as `apply`: a mid-turn interjection renders as a user
       // bubble, so a cold replay must not introduce a second shape.
@@ -88,9 +135,51 @@ export class Session {
           ? { type: "userMessage", id: item.id, text: item.text }
           : item;
       const index = this.items.findIndex((i) => i.id === normalized.id);
-      if (index >= 0) this.items[index] = normalized;
-      else this.items.push(normalized);
+      if (index >= 0) {
+        this.items[index] = normalized;
+      } else if (normalized.type === "userMessage") {
+        // 回放里还没有这条用户气泡:先把本地乐观回声就地换成服务端项,再去重。
+        // 否则「本地用户气泡 + 服务端同一条」会被渲染两次。
+        const local = this.items.findIndex(
+          (i) => Session.isLocalId(i.id) && i.type === "userMessage" && i.text === normalized.text,
+        );
+        if (local >= 0) {
+          this.items[local] = normalized;
+          reconciledLocalEcho = true;
+        } else {
+          this.insertAfterLastServerItem(normalized);
+        }
+      } else {
+        this.insertAfterLastServerItem(normalized);
+      }
       this.lastServerItemId = normalized.id;
+    }
+    // 之后仍有多余的本地回声(同一 prompt 的其它乐观气泡)是无主副本,丢弃。
+    if (reconciledLocalEcho) {
+      this.dropDanglingLocalEchoes();
+    }
+  }
+
+  /**
+   * Drop local user bubbles that duplicate a server user message in the replay.
+   *
+   * `send` pushes a local echo before the server replies; once the server's own
+   * opening item for that turn arrives (live or on replay), the local copy is a
+   * stray duplicate. Matching on text is safe here because a *reconciled* local
+   * copy was already replaced in place by the server item, so what remains are
+   * only the extras.
+   */
+  private dropDanglingLocalEchoes(): void {
+    const serverTexts = new Set(
+      this.items
+        .filter((i) => i.type === "userMessage" && !Session.isLocalId(i.id))
+        .map((i) => (i as { text: string }).text),
+    );
+    for (let i = this.items.length - 1; i >= 0; i -= 1) {
+      const item = this.items[i];
+      if (Session.isLocalId(item.id) && item.type === "userMessage" && serverTexts.has(item.text)) {
+        this.items.splice(i, 1);
+      }
     }
   }
 
@@ -108,8 +197,25 @@ export class Session {
             ? { type: "userMessage", id: incoming.id, text: incoming.text }
             : incoming;
         const index = this.items.findIndex((i) => i.id === item.id);
-        if (index >= 0) this.items[index] = item;
-        else this.items.push(item);
+        if (index >= 0) {
+          this.items[index] = item;
+        } else if (
+          item.type === "userMessage" &&
+          this.items.some((i) => Session.isLocalId(i.id))
+        ) {
+          // 服务端发来的本轮开启项:先认领对应的本地乐观回声(就地替换),再去重。
+          const local = this.items.findIndex(
+            (i) => Session.isLocalId(i.id) && i.type === "userMessage" && i.text === item.text,
+          );
+          if (local >= 0) this.items[local] = item;
+          else this.insertAfterLastServerItem(item);
+        } else if (item.type === "agentMessage") {
+          // agent 文本是**续写**:锚定在最后一个服务端项之后,不落在本地回声之后
+          // (否则同一轮的 agent 回复会排到用户气泡前面)。
+          this.insertAfterLastServerItem(item);
+        } else {
+          this.items.push(item);
+        }
         this.lastServerItemId = item.id;
         break;
       }
@@ -120,7 +226,7 @@ export class Session {
         this.lastServerItemId = item_id;
         const index = this.items.findIndex((i) => i.id === item_id);
         if (index < 0) {
-          this.items.push({ type: "agentMessage", id: item_id, text: delta });
+          this.insertAfterLastServerItem({ type: "agentMessage", id: item_id, text: delta });
         } else if (this.items[index].type === "agentMessage") {
           const item = this.items[index] as { type: "agentMessage"; id: string; text: string };
           item.text += delta;

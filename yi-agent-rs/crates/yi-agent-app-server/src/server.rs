@@ -5121,6 +5121,16 @@ where
             ThreadStatus::Running,
         )
         .await;
+        // 照 $18 发本轮的开启项(用户提问=卡片 objective),再投递 prompt。
+        // 这不是「向客户端发 RPC 帧」——它是 thread-keyed 的 content 通知,与
+        // RPC 客户端收到的同一条流;少了它,卡片会话点开后 objective 会像修复前
+        // 那样被迟到追到最底部(见 `opening_user_item`)。
+        emit_item(
+            &hub,
+            &prepared.thread_id,
+            opening_user_item(&prepared.turn_id, &prepared.prompt),
+        )
+        .await?;
         if prepared
             .prompt_tx
             .send(TurnPrompt {
@@ -5423,6 +5433,51 @@ fn turn_prepare_rpc_error(error: TurnPrepareError) -> RpcError {
     }
 }
 
+/// The item that opens a turn: the user's own message.
+///
+/// The baseline server emitted this **only at persist time**
+/// (`persist_and_finish_turn`), so a client watching a turn live saw the agent's
+/// items stream in first and the prompt appended last — a viewer opening the
+/// thread later found the opening prompt at the very bottom of the transcript.
+/// Emitting it as the turn's *first* item, from the one helper both the RPC path
+/// (`start_turn_core`) and the board path (`ServeLauncher`) call, fixes the order
+/// at the source and keeps the id identical to the persisted one (`user-<turn_id>`),
+/// so the desktop merges the live bubble with the replayed one by id.
+fn opening_user_item(turn_id: &str, text: &str) -> crate::protocol::Item {
+    crate::protocol::Item::UserMessage {
+        id: format!("user-{turn_id}"),
+        text: text.to_string(),
+    }
+}
+
+/// Emit one item as both `item/started` and `item/completed`.
+///
+/// Content-layer notifications carry no response frame, so both the RPC path and
+/// the board launcher may (and must, to stay identical) call this. Failures are
+/// propagated: a broken hub is a real fault, not something to swallow.
+async fn emit_item(
+    hub: &Arc<crate::broadcast::Broadcaster>,
+    thread_id: &str,
+    item: crate::protocol::Item,
+) -> anyhow::Result<()> {
+    write_notification(
+        hub,
+        &Notification::ItemStarted {
+            thread_id: thread_id.to_string(),
+            item: item.clone(),
+        },
+    )
+    .await?;
+    write_notification(
+        hub,
+        &Notification::ItemCompleted {
+            thread_id: thread_id.to_string(),
+            item,
+        },
+    )
+    .await
+}
+
 /// 起一个 turn 的 RPC 包装:调 `prepare_turn_core` → 发 `turn/started` →
 /// 推 Running 状态 → 写响应 → 投递 prompt。
 ///
@@ -5445,14 +5500,21 @@ async fn start_turn_core(
         }
     };
 
-    // 顺序确定:先 turn/started 通知,再推 Running 状态,再响应,
-    // 最后投递 prompt。
+    // 顺序确定:先 turn/started 通知,再发本轮开启项(用户提问),再推 Running
+    // 状态,再响应,最后投递 prompt。开启项排在 agent 任何 item 之前,实时观看与
+    // 事后回放的顺序才一致(见 `opening_user_item`)。
     write_notification(
         hub,
         &Notification::TurnStarted {
             thread_id: prepared.thread_id.clone(),
             turn_id: prepared.turn_id.clone(),
         },
+    )
+    .await?;
+    emit_item(
+        hub,
+        &prepared.thread_id,
+        opening_user_item(&prepared.turn_id, &prepared.prompt),
     )
     .await?;
     update_status(
@@ -6413,6 +6475,11 @@ mod card_scheduling_tests {
         });
 
         let mut host = Host::new();
+        // 监听宿主 hub:卡片会话是 thread-keyed 的 content 通知,注册一个客户端
+        // 就能看到调度器起会话时到底发了什么、按什么顺序。
+        let mut frames = host
+            .hub
+            .register(crate::broadcast::ClientId::ws(uuid::Uuid::new_v4()));
         let board_dir = tempfile::TempDir::new().unwrap();
         yi_agent_boards::registry::register(board_dir.path(), &daemon.project).unwrap();
 
@@ -6449,6 +6516,32 @@ mod card_scheduling_tests {
         assert_eq!(host.threads.len(), 1, "exactly one visible session");
         assert!(host.threads.contains_key(&launched));
         assert!(tracked.contains_key("card-1"), "the card is tracked");
+
+        // 卡片会话对客户端「可见」的前提是 hub 里有它的 item;其中最关键的
+        // 是**本轮开启项**(用户提问=卡片 objective)必须排在 agent 任何 item
+        // 之前——修复前它只在落盘时补发,点开会话会在最底部才看到开场白。
+        let mut seen: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        while let Ok(v) = frames.try_recv() {
+            let method = v["method"].as_str().unwrap_or_default().to_string();
+            let item = &v["params"]["item"];
+            let itype = item["type"].as_str().map(str::to_string);
+            let itext = item["text"].as_str().map(str::to_string);
+            seen.push((method, itype, itext));
+        }
+        let first_content = seen
+            .iter()
+            .find(|(_, t, _)| t.is_some())
+            .expect("the launch must emit at least one item frame");
+        assert_eq!(
+            first_content.1.as_deref(),
+            Some("userMessage"),
+            "the card session's first content item must be the opening objective, \
+             not an agent item: {seen:?}"
+        );
+        assert_eq!(
+            first_content.0, "item/started",
+            "the opening item starts the transcript: {seen:?}"
+        );
 
         // 等 driver 跑完首轮(主循环语义:收 Finished → 清占位)→ 下一轮对账
         // 应回写终态。
@@ -8235,12 +8328,17 @@ pub(crate) mod tests {
         let mut resp_turn_id: Option<String> = None;
         let mut completed: Option<serde_json::Value> = None;
         let mut running_status: Option<String> = None;
-        for _ in 0..12 {
+        // 本轮开启项(用户提问)的 item/started 形状。
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..14 {
             let v = h.read_value().await;
             if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
                 methods.push(m.to_string());
                 if m == "thread/status/updated" {
                     running_status = v["params"]["status"].as_str().map(|s| s.to_string());
+                }
+                if m == "item/started" && opener.is_none() {
+                    opener = Some(v["params"]["item"].clone());
                 }
                 if m == "turn/completed" {
                     completed = Some(v);
@@ -8255,6 +8353,10 @@ pub(crate) mod tests {
             methods,
             vec![
                 "turn/started",
+                // 本轮开启项:用户提问(用户气泡)必须排在 agent 任何 item 之前,
+                // 否则实时观看与事后回放的顺序不一致(点开时开场白跑到最底部)。
+                "item/started",
+                "item/completed",
                 // turn/start 在 turn/started 之后立刻推 Running 状态,先于 turn 正文。
                 "thread/status/updated",
                 "item/started",
@@ -8265,6 +8367,18 @@ pub(crate) mod tests {
                 "turn/completed"
             ],
             "unexpected notification sequence"
+        );
+        let opener = opener.expect("the turn must open with an item");
+        assert_eq!(
+            opener["type"], "userMessage",
+            "the first item of a turn must be the user's own message: {opener}"
+        );
+        assert_eq!(opener["text"], "hi");
+        assert_eq!(
+            opener["id"],
+            format!("user-{}", resp_turn_id.as_deref().unwrap_or_default()),
+            "the opener id must match the wire id, so the persisted turn and a \
+             live client agree on identity: {opener}"
         );
         assert_eq!(
             running_status.as_deref(),
