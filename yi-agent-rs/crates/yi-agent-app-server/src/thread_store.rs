@@ -366,8 +366,9 @@ impl ThreadStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let meta = self.meta_path(id);
         let log = self.log_path(id);
-        let existed = meta.exists() || log.exists();
-        for p in [meta, log] {
+        let partial = self.partial_path(id);
+        let existed = meta.exists() || log.exists() || partial.exists();
+        for p in [meta, log, partial] {
             match std::fs::remove_file(&p) {
                 Ok(()) => {}
                 Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -432,6 +433,11 @@ impl ThreadStore {
             Ok(()) => {}
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+        // `/clear` 语义：连进行中的 checkpoint 一起丢弃，否则重启后它会
+        // 把已清空的上下文又拼回来。
+        if let Err(e) = self.clear_partial(id) {
+            eprintln!("[app-server] failed to clear partial turn ({id}): {e}");
         }
         Ok(existed)
     }
@@ -1337,5 +1343,31 @@ mod tests {
             .exists());
         // 幂等：再删一次仍成功。
         store.clear_partial("thread-a").unwrap();
+    }
+
+    #[test]
+    fn delete_removes_the_partial_checkpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-a")).unwrap();
+        store.write_partial("thread-a", &PartialTurn::default()).unwrap();
+        assert!(store.delete("thread-a").unwrap());
+        assert!(!dir.path().join(".yi-agent/threads/thread-a.partial.json").exists());
+    }
+
+    #[test]
+    fn truncate_removes_the_partial_checkpoint() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-a")).unwrap();
+        store
+            .append_turn(
+                "thread-a",
+                &TurnLine::Turn { items: vec![user_item("user-t1", "hi")], usage: None, messages: vec![] },
+            )
+            .unwrap();
+        store.write_partial("thread-a", &PartialTurn::default()).unwrap();
+        store.truncate("thread-a").unwrap();
+        assert!(!dir.path().join(".yi-agent/threads/thread-a.partial.json").exists());
     }
 }
