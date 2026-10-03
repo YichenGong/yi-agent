@@ -1586,3 +1586,48 @@ describe("App remote subscription wiring (S2)", () => {
     expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
   });
 });
+
+// 手机端布局：桌面是两列常驻，390pt 的屏幕上聊天区会被挤到看不清。手机把会话
+// 侧栏改成抽屉（默认收起、选中即收），并隐藏子 agent 栏；桌面 build 完全不变。
+describe("App mobile layout (phone client)", () => {
+  /** 持久化 relay 绑定 —— 这正是 `isRemoteClient()` 为真的信号。 */
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+
+  it("keeps the session drawer closed until the toggle opens it", async () => {
+    asRemote();
+    const { container } = render(<App />);
+    // 首次渲染即带抽屉按钮（auto-select 尚未跑完时也已经能开抽屉）。
+    await waitFor(() => expect(screen.getByLabelText("会话列表")).toBeTruthy());
+    const sidebar = container.querySelector(".app-sidebar")!;
+    expect(sidebar).not.toBeNull();
+    expect(sidebar.className).not.toContain("sidebar-open");
+
+    fireEvent.click(screen.getByLabelText("会话列表"));
+    expect(container.querySelector(".app-sidebar")!.className).toContain("sidebar-open");
+
+    // 点背板收起。
+    fireEvent.click(container.querySelector(".app-sidebar-backdrop")!);
+    expect(container.querySelector(".app-sidebar")!.className).not.toContain("sidebar-open");
+  });
+
+  it("closes the drawer once a thread is selected", async () => {
+    asRemote();
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("会话列表")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("会话列表"));
+    expect(container.querySelector(".app-sidebar")!.className).toContain("sidebar-open");
+
+    fireEvent.click(await screen.findByText("one")); // 选中 t1
+    expect(container.querySelector(".app-sidebar")!.className).not.toContain("sidebar-open");
+  });
+
+  it("leaves the desktop layout untouched", async () => {
+    render(<App />); // 无持久化配置 → 桌面
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
+    expect(screen.queryByLabelText("会话列表")).toBeNull();
+  });
+});
