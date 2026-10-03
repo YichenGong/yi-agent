@@ -182,6 +182,28 @@ pub fn dispatch_with_service(
             service.release(card_id, detail)?;
             Ok(json!({"ok": true}))
         }
+        "settings.read" => {
+            let calendar =
+                superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
+                    state_dir,
+                );
+            Ok(json!({ "settings": calendar.settings_json() }))
+        }
+        "settings.write" => {
+            let settings = params
+                .get("settings")
+                .ok_or_else(|| "settings.write needs a `settings` object".to_string())?;
+            // 先校验后落盘：非法输入必须一个字节都不写。
+            let calendar =
+                superpowers_kanban_core::calendar::ConcurrencyCalendar::from_settings_json(
+                    settings,
+                )
+                .map_err(|error| error.to_string())?;
+            calendar
+                .save(state_dir)
+                .map_err(|error| format!("could not save settings: {error}"))?;
+            Ok(json!({ "ok": true }))
+        }
         other => Err(format!("unknown method: {other}")),
     }
 }
@@ -336,6 +358,61 @@ mod tests {
         assert!(
             path.starts_with(workdir.path()),
             "the project layer must stay inside the workdir: {path:?}"
+        );
+    }
+
+    #[test]
+    fn settings_read_returns_the_calendar_settings() {
+        let workdir = tempfile::tempdir().unwrap();
+        let state = state_dir(workdir.path());
+        let value = dispatch_with_global(&state, None, "settings.read", &json!({})).unwrap();
+        assert_eq!(value["settings"]["default_max_tasks"], 3);
+        assert_eq!(value["settings"]["interval_secs"], 10);
+        assert!(value["settings"]["windows"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn settings_write_then_read_round_trips() {
+        let workdir = tempfile::tempdir().unwrap();
+        let state = state_dir(workdir.path());
+        let payload = json!({
+            "default_max_tasks": 5,
+            "interval_secs": 25,
+            "windows": [
+                { "days": "Mon-Fri", "start": "09:00", "end": "24:00", "max_tasks": 3 }
+            ]
+        });
+        dispatch_with_global(
+            &state,
+            None,
+            "settings.write",
+            &json!({ "settings": payload }),
+        )
+        .unwrap();
+        // 文件确实落在新名下。
+        assert!(state.join("superpowers-kanban.toml").is_file());
+        let value = dispatch_with_global(&state, None, "settings.read", &json!({})).unwrap();
+        assert_eq!(value["settings"]["default_max_tasks"], 5);
+        assert_eq!(value["settings"]["interval_secs"], 25);
+        assert_eq!(value["settings"]["windows"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_invalid_settings_write_leaves_no_file() {
+        let workdir = tempfile::tempdir().unwrap();
+        let state = state_dir(workdir.path());
+        let bad = json!({
+            "default_max_tasks": 3,
+            "interval_secs": 0,
+            "windows": []
+        });
+        let error =
+            dispatch_with_global(&state, None, "settings.write", &json!({ "settings": bad }))
+                .unwrap_err();
+        assert!(error.contains("interval_secs"), "{error}");
+        assert!(
+            !state.join("superpowers-kanban.toml").exists(),
+            "a rejected write must not leave the settings file behind"
         );
     }
 
