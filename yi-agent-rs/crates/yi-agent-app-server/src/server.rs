@@ -4183,6 +4183,40 @@ async fn write_notification(
     Ok(())
 }
 
+/// 回放分块的字节软预算（256 KiB）。单帧序列化后须**远小于**
+/// `MAX_FRAME_BYTES = 1 MiB`,故留足余量。
+const REPLAY_CHUNK_BYTES: usize = 256 * 1024;
+/// 回放分块的条数上限，兜住「海量极小 item」把帧数压不下来的极端。
+const REPLAY_CHUNK_MAX_ITEMS: usize = 200;
+
+/// 把历史 items 切成回放帧的块：顺序保持；累计序列化字节超过
+/// [`REPLAY_CHUNK_BYTES`] 或条数达到 [`REPLAY_CHUNK_MAX_ITEMS`] 即切块。
+/// 单条自身超预算时它单独成块（容积为 1），不在此函数内再切分。
+fn chunk_items_for_replay(items: Vec<crate::protocol::Item>) -> Vec<Vec<crate::protocol::Item>> {
+    let mut chunks: Vec<Vec<crate::protocol::Item>> = Vec::new();
+    let mut cur: Vec<crate::protocol::Item> = Vec::new();
+    let mut cur_bytes = 0usize;
+    for item in items {
+        let approx = serde_json::to_vec(&item).map(|v| v.len()).unwrap_or(64);
+        // 字节预算：当前块非空且再加一条会超预算 → 先结块。
+        if !cur.is_empty() && cur_bytes + approx > REPLAY_CHUNK_BYTES {
+            chunks.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+        }
+        cur.push(item);
+        cur_bytes += approx;
+        // 条数上限：达到上限即结块（与字节预算互为兜底）。
+        if cur.len() >= REPLAY_CHUNK_MAX_ITEMS {
+            chunks.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
 /// 逐字流合并器：按 thread 攒 `(item_id, text)`。跨 item_id 不合并（顺序优先）。
 #[derive(Default)]
 struct DeltaCoalescer {
@@ -4685,7 +4719,13 @@ async fn run_thread_driver(
         checkpoint(
             &store,
             &thread_id,
-            build_partial(&turn_id, &user_prompt, &[], agent.session().messages().to_vec(), None),
+            build_partial(
+                &turn_id,
+                &user_prompt,
+                &[],
+                agent.session().messages().to_vec(),
+                None,
+            ),
         );
 
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
@@ -7534,10 +7574,18 @@ pub(crate) mod tests {
                 // 工具入参必须是合法 JSON（`{}`），否则 accumulate 会因解析失败报错。
                 let head = futures::stream::iter(vec![
                     E::TextDelta("a".into()),
-                    E::ToolUseStart { id: "t1".into(), name: "noop".into() },
-                    E::ToolUseDelta { id: "t1".into(), partial_json: "{}".into() },
+                    E::ToolUseStart {
+                        id: "t1".into(),
+                        name: "noop".into(),
+                    },
+                    E::ToolUseDelta {
+                        id: "t1".into(),
+                        partial_json: "{}".into(),
+                    },
                     E::ToolUseEnd { id: "t1".into() },
-                    E::Stop { reason: yi_agent_core::provider::StopReason::EndTurn },
+                    E::Stop {
+                        reason: yi_agent_core::provider::StopReason::EndTurn,
+                    },
                 ]);
                 Ok(head.boxed())
             } else {
@@ -7650,8 +7698,9 @@ pub(crate) mod tests {
         _cwd: &std::path::Path,
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
-        let provider: Arc<dyn yi_agent_core::Provider> =
-            Arc::new(CheckpointProvider { calls: AtomicUsize::new(0) });
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CheckpointProvider {
+            calls: AtomicUsize::new(0),
+        });
         let config = yi_agent_core::AgentConfig::default();
         let mut agent = yi_agent_core::Agent::new(
             provider.clone(),
@@ -8070,10 +8119,15 @@ pub(crate) mod tests {
             .join(".yi-agent/threads")
             .join(format!("{tid}.partial.json"));
         for _ in 0..100 {
-            if !partial.exists() { break; }
+            if !partial.exists() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(!partial.exists(), "a finished turn must not leave a checkpoint");
+        assert!(
+            !partial.exists(),
+            "a finished turn must not leave a checkpoint"
+        );
         h.shutdown().await;
     }
 
@@ -10509,8 +10563,14 @@ pub(crate) mod tests {
                 break;
             }
         }
-        assert!(saw_half, "the crashed turn's finished items must be replayed");
-        assert!(interrupted, "a crashed partial turn must be flagged interrupted");
+        assert!(
+            saw_half,
+            "the crashed turn's finished items must be replayed"
+        );
+        assert!(
+            interrupted,
+            "a crashed partial turn must be flagged interrupted"
+        );
         h.shutdown().await;
     }
 
@@ -10606,8 +10666,14 @@ pub(crate) mod tests {
                 break;
             }
         }
-        assert!(saw_half, "the crashed turn's finished items must be replayed");
-        assert!(interrupted, "a crashed partial turn must be flagged interrupted");
+        assert!(
+            saw_half,
+            "the crashed turn's finished items must be replayed"
+        );
+        assert!(
+            interrupted,
+            "a crashed partial turn must be flagged interrupted"
+        );
         assert!(resumed, "resume must respond");
 
         // 第二个 turn：正常走完。它的 turn-start checkpoint 会覆盖盘上的 partial
@@ -10661,7 +10727,10 @@ pub(crate) mod tests {
             1,
             "the crashed turn must not be double-counted: {ids:?}"
         );
-        assert!(!loaded.pending_turn, "promotion must clear the pending flag");
+        assert!(
+            !loaded.pending_turn,
+            "promotion must clear the pending flag"
+        );
         h.shutdown().await;
     }
 
@@ -12590,6 +12659,57 @@ pub(crate) mod tests {
         let flushed = c.push("t1", "i3", &big);
         assert_eq!(flushed.len(), 1, "超上限必须立即返回: {flushed:?}");
         assert_eq!(c.take("t1"), None);
+    }
+
+    #[test]
+    fn chunk_items_for_replay_preserves_order_and_splits_by_count() {
+        use crate::protocol::Item;
+        let items: Vec<Item> = (0..(REPLAY_CHUNK_MAX_ITEMS * 2 + 5))
+            .map(|i| Item::AgentMessage {
+                id: format!("i-{i}"),
+                text: "x".to_string(),
+            })
+            .collect();
+        let chunks = chunk_items_for_replay(items);
+        assert_eq!(chunks.len(), 3, "200*2+5 must split into 3 chunks");
+        assert_eq!(chunks[0].len(), REPLAY_CHUNK_MAX_ITEMS);
+        assert_eq!(chunks[1].len(), REPLAY_CHUNK_MAX_ITEMS);
+        assert_eq!(chunks[2].len(), 5);
+        // 顺序保持：展平后 id 与原始一致。
+        let flat: Vec<String> = chunks
+            .iter()
+            .flatten()
+            .map(|it| match it {
+                Item::AgentMessage { id, .. } => id.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        for (i, id) in flat.iter().enumerate() {
+            assert_eq!(id, &format!("i-{i}"));
+        }
+    }
+
+    #[test]
+    fn chunk_items_for_replay_splits_by_bytes() {
+        use crate::protocol::Item;
+        // 每条 ~64KiB 文本;预算 256KiB → 每块约 4 条。
+        let big = "y".repeat(64 * 1024);
+        let items: Vec<Item> = (0..10)
+            .map(|i| Item::AgentMessage {
+                id: format!("b-{i}"),
+                text: big.clone(),
+            })
+            .collect();
+        let chunks = chunk_items_for_replay(items);
+        assert!(chunks.len() >= 3, "byte budget must force multiple chunks");
+        for c in &chunks {
+            let bytes: usize = c
+                .iter()
+                .map(|it| serde_json::to_vec(it).unwrap().len())
+                .sum();
+            // 允许「最后一条超预算」的余量,但每块仍须远小于 1MiB 硬上限。
+            assert!(bytes < 900 * 1024, "chunk must stay under the frame limit");
+        }
     }
 
     /// Approval is one-question/one-answer even with many clients: the first
