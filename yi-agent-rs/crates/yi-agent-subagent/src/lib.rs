@@ -10,12 +10,13 @@ pub mod binding;
 pub mod thread_root;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures::StreamExt;
 use serde_json::{Value, json};
 use yi_agent_core::subagent::task::DeliveryReport;
@@ -29,8 +30,8 @@ use yi_agent_core::subagent::worker::{
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
 use yi_agent_core::{
-    Agent, AgentConfig, AgentError, AgentEvent, ContentBlock, Provider, ProviderError,
-    ProviderTurnGate, Tool, ToolRegistry, ToolResult,
+    Agent, AgentConfig, AgentError, AgentEvent, ContentBlock, Message, Provider, ProviderError,
+    ProviderTurnGate, Session, Tool, ToolRegistry, ToolResult,
 };
 use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
 
@@ -576,6 +577,13 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         let cancellation = request.cancellation.clone();
         let objective = request.objective;
         let initial_user_messages = request.initial_user_messages;
+        // The caller's transcript to seed the worker's session with, when the
+        // caller asked for a fork. Moved into the spawned thread below.
+        let fork_messages = request.fork_messages;
+        // The worker's own live transcript, handed to its delegation tools just
+        // before the runtime starts so a child forking *this* worker reads the
+        // worker's real conversation.
+        let worker_caller = CallerContext::unbound();
         let workspace_service = self.workspace_service.clone();
         let workspace_for_delivery = workspace.clone();
 
@@ -615,6 +623,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                 Arc::new(DaemonSpawnAgentTool {
                     root: Arc::clone(&worker_root),
                     sandbox: effective_sandbox,
+                    // Bound to the worker's own live session below, once the
+                    // Agent (and any forked session) exists.
+                    caller: worker_caller.clone(),
                 }) as Arc<dyn Tool>,
                 Arc::new(DaemonSendMessageTool {
                     root: Arc::clone(&worker_root),
@@ -644,6 +655,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                     };
                     runtime.block_on(async move {
                         let mut agent = Agent::new(provider, worker_tools, config);
+                        if let Some(fork) = fork_messages {
+                            agent = agent.with_session(yi_agent_core::Session::from_messages(fork));
+                        }
+                        // Ordering matters: bind *after* `with_session`, or the
+                        // tool handle would point at the replaced session Arc.
+                        worker_caller.bind(agent.session_handle());
                         if let Some(gate) = provider_turn_gate {
                             agent = agent.with_provider_turn_gate(gate);
                         }
@@ -1270,6 +1287,40 @@ impl Tool for DaemonSendMessageTool {
     }
 }
 
+/// The live conversation of whoever is calling a delegation tool.
+///
+/// Held by the tools and re-resolved on every call, so a rebuilt Agent (new
+/// tool registry, post-compaction session) never leaves a tool reading a stale
+/// transcript. `bind` is called by the host right after it builds the Agent.
+#[derive(Clone, Default)]
+pub struct CallerContext {
+    session: Arc<Mutex<Option<Arc<Mutex<Session>>>>>,
+}
+
+impl CallerContext {
+    pub fn unbound() -> Self {
+        Self::default()
+    }
+
+    pub fn new(session: Arc<Mutex<Session>>) -> Self {
+        Self {
+            session: Arc::new(Mutex::new(Some(session))),
+        }
+    }
+
+    pub fn bind(&self, session: Arc<Mutex<Session>>) {
+        *self.session.lock().unwrap() = Some(session);
+    }
+
+    /// The caller's provider-valid transcript, or `None` when unbound.
+    pub fn snapshot(&self) -> Option<Vec<Message>> {
+        let guard = self.session.lock().unwrap();
+        guard
+            .as_ref()
+            .map(|session| yi_agent_core::forkable_messages(&session.lock().unwrap()))
+    }
+}
+
 /// The application root a client attached to, plus what it takes to reach it.
 ///
 /// A root is per project: it names the session, the task the daemon schedules
@@ -1287,8 +1338,9 @@ pub fn register_attached_root_tools(
     registry: &mut ToolRegistry,
     root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
+    caller: CallerContext,
 ) {
-    register_attached_root_tools_in_thread(registry, root, controller, None);
+    register_attached_root_tools_in_thread(registry, root, controller, None, caller);
 }
 
 /// Register the delegation tools with a conversation marker.
@@ -1303,16 +1355,18 @@ pub fn register_attached_root_tools_in_thread(
     root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
     thread_id: Option<String>,
+    caller: CallerContext,
 ) {
-    register_application_subagent_tools_in_thread(registry, root, controller, thread_id);
+    register_application_subagent_tools_in_thread(registry, root, controller, thread_id, caller);
 }
 
 pub fn register_application_subagent_tools(
     registry: &mut ToolRegistry,
     root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
+    caller: CallerContext,
 ) {
-    register_application_subagent_tools_in_thread(registry, root, controller, None);
+    register_application_subagent_tools_in_thread(registry, root, controller, None, caller);
 }
 
 pub fn register_application_subagent_tools_in_thread(
@@ -1320,11 +1374,13 @@ pub fn register_application_subagent_tools_in_thread(
     root: Arc<crate::thread_root::ThreadRoot>,
     controller: yi_agent_tools::SandboxController,
     thread_id: Option<String>,
+    caller: CallerContext,
 ) {
     registry.register(Arc::new(DaemonApplicationSpawnAgentTool {
         root: Arc::clone(&root),
         controller,
         thread_id,
+        caller,
     }));
     registry.register(Arc::new(DaemonApplicationSendMessageTool {
         root: Arc::clone(&root),
@@ -1410,9 +1466,165 @@ fn spawn_sandbox(
     }
 }
 
+/// The raw bytes of forked context carried by each `AppendForkChunk`. Chosen
+/// well under the IPC frame cap so a base64-encoded chunk still fits one frame.
+const FORK_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Resolves the optional `fork` argument for a daemon `spawn_agent` call. Off by
+/// default; an explicit non-boolean value is rejected rather than ignored.
+fn spawn_fork(args: &Value) -> Result<bool, ToolResult> {
+    match args.get("fork") {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ToolResult::error("fork must be a boolean")),
+    }
+}
+
+/// How a fork upload talks to the daemon: one request in, one response or a
+/// transport error out.
+///
+/// A seam rather than a socket, so the failure handling can be unit tested
+/// without a live daemon.
+type ForkTransport<'a> = dyn FnMut(
+        yi_agent_store::ipc::IpcRequest,
+    ) -> Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>
+    + 'a;
+
+/// Drops a half-received upload. Best effort and silent: this runs on a path
+/// that is already failing, and aborting an unknown or already-consumed token
+/// is itself an error.
+fn abort_fork_upload(transport: &mut ForkTransport<'_>, token: &str) {
+    let _ = transport(yi_agent_store::ipc::IpcRequest::AbortForkUpload {
+        fork_token: token.to_string(),
+    });
+}
+
+/// Opens an upload, pushes `payload` as base64 chunks, and returns the token the
+/// spawn request names.
+///
+/// Every failure after `BeginForkUpload` succeeds aborts the upload before
+/// returning. A chunk rejected by the daemon arrives as
+/// `Ok(IpcResponse::Error { .. })` -- `send_request` hands back whatever frame
+/// the daemon sent and only transport faults become `Err` -- so the `Ok(other)`
+/// arm is the normal rejection channel (bad base64, a seq gap, an over-length
+/// chunk, an unknown token), not an exotic one. The store keeps abandoned
+/// uploads until process exit with no TTL and no eviction, so a token dropped
+/// here would leak its payload for the daemon's lifetime. The
+/// `BeginForkUpload` request itself is the one failure with no token to abort.
+fn drive_fork_upload(
+    transport: &mut ForkTransport<'_>,
+    session_id: String,
+    caller_task_id: String,
+    capability: String,
+    payload: Vec<u8>,
+) -> Result<String, ToolResult> {
+    let token = match transport(yi_agent_store::ipc::IpcRequest::BeginForkUpload {
+        session_id,
+        caller_task_id,
+        capability,
+        total_bytes: payload.len() as u64,
+    }) {
+        Ok(yi_agent_store::ipc::IpcResponse::ForkUploadStarted { fork_token }) => fork_token,
+        Ok(other) => {
+            return Err(ToolResult::error(format_ipc_rejection(
+                "fork upload",
+                &other,
+            )));
+        }
+        Err(error) => return Err(ToolResult::error(format!("daemon is unavailable: {error}"))),
+    };
+    for (seq, chunk) in payload.chunks(FORK_CHUNK_BYTES).enumerate() {
+        let data = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let response = transport(yi_agent_store::ipc::IpcRequest::AppendForkChunk {
+            fork_token: token.clone(),
+            seq: seq as u64,
+            data,
+        });
+        match response {
+            Ok(yi_agent_store::ipc::IpcResponse::ForkChunkAccepted { .. }) => {}
+            Ok(other) => {
+                abort_fork_upload(transport, &token);
+                return Err(ToolResult::error(format_ipc_rejection(
+                    "fork chunk",
+                    &other,
+                )));
+            }
+            Err(error) => {
+                abort_fork_upload(transport, &token);
+                return Err(ToolResult::error(format!("daemon is unavailable: {error}")));
+            }
+        }
+    }
+    Ok(token)
+}
+
+/// Uploads the caller's current transcript as a forked-context payload and
+/// returns the token the spawn request names.
+///
+/// The snapshot is taken here, at call time, so the child inherits the caller's
+/// history as of this delegation rather than at tool-assembly time. An unbound
+/// caller is an explicit error: a caller that asked for `fork:true` must never
+/// silently receive a contextless child.
+fn upload_forked_context(
+    socket: &Path,
+    handle: &crate::binding::RuntimeHandle,
+    caller: &CallerContext,
+) -> Result<String, ToolResult> {
+    let Some(messages) = caller.snapshot() else {
+        return Err(ToolResult::error(
+            "fork requested but no caller context available",
+        ));
+    };
+    let payload = serde_json::to_vec(&messages)
+        .map_err(|error| ToolResult::error(format!("could not encode forked context: {error}")))?;
+    let mut transport = |request| yi_agent_store::ipc::send_request(socket, request);
+    drive_fork_upload(
+        &mut transport,
+        handle.session_id.clone(),
+        handle.task_id.clone(),
+        handle.capability.clone(),
+        payload,
+    )
+}
+
+/// Aborts a forked-context upload whose token a spawn request was meant to
+/// consume but did not.
+///
+/// Reaching the failure arms of a spawn means no child was created, so nothing
+/// will ever take the token: the store would retain the payload until process
+/// exit. Best effort, like `abort_fork_upload`: a token already consumed by a
+/// spawn that failed later is simply no longer there to abort. A `None` token
+/// means the call did not fork, and there is nothing to clean up.
+fn abort_unconsumed_fork(socket: &Path, fork_token: &Option<String>) {
+    if let Some(token) = fork_token {
+        let _ = yi_agent_store::ipc::send_request(
+            socket,
+            yi_agent_store::ipc::IpcRequest::AbortForkUpload {
+                fork_token: token.clone(),
+            },
+        );
+    }
+}
+
+/// Resolves the `fork_token` a spawn request should carry: uploading the
+/// caller's transcript when `fork` is set, and `None` otherwise.
+fn spawn_fork_token(
+    args: &Value,
+    handle: &crate::binding::RuntimeHandle,
+    caller: &CallerContext,
+) -> Result<Option<String>, ToolResult> {
+    if !spawn_fork(args)? {
+        return Ok(None);
+    }
+    upload_forked_context(&handle.socket_path, handle, caller).map(Some)
+}
+
 struct DaemonSpawnAgentTool {
     root: Arc<crate::thread_root::ThreadRoot>,
     sandbox: yi_agent_tools::SandboxMode,
+    /// The live conversation that owns this tool, so a `fork:true` spawn can
+    /// upload the caller's transcript at call time rather than at assembly.
+    caller: CallerContext,
 }
 
 struct DaemonApplicationSpawnAgentTool {
@@ -1423,6 +1635,9 @@ struct DaemonApplicationSpawnAgentTool {
     /// conversation that asked for them. An older caller leaves it `None` and
     /// the daemon inherits the parent task's marker instead.
     thread_id: Option<String>,
+    /// The live conversation that owns this tool, so a `fork:true` spawn can
+    /// upload the caller's transcript at call time rather than at assembly.
+    caller: CallerContext,
 }
 
 /// Extract the child's text report from its stored terminal payload, using the
@@ -1474,6 +1689,11 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 "workdir": {
                     "type": "string",
                     "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
+                },
+                "fork": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Fork the caller's current conversation into the child so it inherits context. Off by default: pass true only when the child genuinely needs the history."
                 }
             },
             "required": ["task"],
@@ -1510,6 +1730,10 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Ok(handle) => handle,
             Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
         };
+        let fork_token = match spawn_fork_token(&args, &handle, &self.caller) {
+            Ok(fork_token) => fork_token,
+            Err(error) => return error,
+        };
         let thread_id = self.thread_id.clone();
         let response = yi_agent_store::ipc::send_request(
             &handle.socket_path,
@@ -1523,14 +1747,21 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 workdir: workdir.clone(),
                 thread_id: thread_id.clone(),
                 sandbox: sandbox.clone(),
+                fork_token: fork_token.clone(),
             },
         );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
             ),
-            Ok(other) => ToolResult::error(format_ipc_rejection("spawn request", &other)),
-            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+            Ok(other) => {
+                abort_unconsumed_fork(&handle.socket_path, &fork_token);
+                ToolResult::error(format_ipc_rejection("spawn request", &other))
+            }
+            Err(error) => {
+                abort_unconsumed_fork(&handle.socket_path, &fork_token);
+                ToolResult::error(format!("daemon is unavailable: {error}"))
+            }
         }
     }
 }
@@ -1833,6 +2064,11 @@ impl Tool for DaemonSpawnAgentTool {
                 "workdir": {
                     "type": "string",
                     "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
+                },
+                "fork": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Fork the caller's current conversation into the child so it inherits context. Off by default: pass true only when the child genuinely needs the history."
                 }
             },
             "required": ["task"],
@@ -1869,6 +2105,10 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(handle) => handle,
             Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
         };
+        let fork_token = match spawn_fork_token(&args, &handle, &self.caller) {
+            Ok(fork_token) => fork_token,
+            Err(error) => return error,
+        };
         let response = yi_agent_store::ipc::send_request(
             &handle.socket_path,
             yi_agent_store::ipc::IpcRequest::SpawnChild {
@@ -1879,14 +2119,21 @@ impl Tool for DaemonSpawnAgentTool {
                 model: model.clone(),
                 workdir: workdir.clone(),
                 sandbox: sandbox.clone(),
+                fork_token: fork_token.clone(),
             },
         );
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
                 json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
             ),
-            Ok(other) => ToolResult::error(format_ipc_rejection("spawn request", &other)),
-            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
+            Ok(other) => {
+                abort_unconsumed_fork(&handle.socket_path, &fork_token);
+                ToolResult::error(format_ipc_rejection("spawn request", &other))
+            }
+            Err(error) => {
+                abort_unconsumed_fork(&handle.socket_path, &fork_token);
+                ToolResult::error(format!("daemon is unavailable: {error}"))
+            }
         }
     }
 }
@@ -1912,6 +2159,7 @@ mod tests {
                 yi_agent_tools::SandboxMode::WorkspaceWrite,
                 false,
             ),
+            CallerContext::unbound(),
         );
         for name in [
             "spawn_agent",
@@ -1923,6 +2171,230 @@ mod tests {
         ] {
             assert!(registry.get(name).is_some(), "{name} must be registered");
         }
+    }
+
+    #[test]
+    fn a_bound_caller_context_snapshots_the_live_session() {
+        let session = Arc::new(Mutex::new(Session::new()));
+        let caller = CallerContext::new(Arc::clone(&session));
+        session
+            .lock()
+            .unwrap()
+            .push(Message::user("parent history"));
+
+        let snapshot = caller.snapshot().expect("bound context yields a snapshot");
+        assert_eq!(snapshot.len(), 1);
+
+        // 活句柄：绑定后新增的消息，下一次 snapshot 必须看得到
+        session.lock().unwrap().push(Message::user("later"));
+        assert_eq!(caller.snapshot().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_unbound_caller_context_has_no_snapshot() {
+        assert!(CallerContext::unbound().snapshot().is_none());
+    }
+
+    /// The application spawn tool's schema, so the `fork` contract is asserted
+    /// against the same tool a client actually registers.
+    fn application_spawn_schema() -> Value {
+        DaemonApplicationSpawnAgentTool {
+            root: test_root(
+                PathBuf::from("/tmp/unused.sock"),
+                "s".into(),
+                "t".into(),
+                "c".into(),
+            ),
+            controller: yi_agent_tools::SandboxController::new(
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                yi_agent_tools::SandboxMode::WorkspaceWrite,
+                false,
+            ),
+            thread_id: None,
+            caller: CallerContext::unbound(),
+        }
+        .schema()
+    }
+
+    /// The core spawn tool's schema: a daemon worker's own delegation surface.
+    fn core_spawn_schema() -> Value {
+        DaemonSpawnAgentTool {
+            root: test_root(
+                PathBuf::from("/tmp/unused.sock"),
+                "s".into(),
+                "t".into(),
+                "c".into(),
+            ),
+            sandbox: yi_agent_tools::SandboxMode::ReadOnly,
+            caller: CallerContext::unbound(),
+        }
+        .schema()
+    }
+
+    #[test]
+    fn both_spawn_schemas_offer_fork_and_default_to_false() {
+        for schema in [application_spawn_schema(), core_spawn_schema()] {
+            assert_eq!(schema["properties"]["fork"]["type"], "boolean");
+            assert_eq!(schema["properties"]["fork"]["default"], false);
+            assert_eq!(
+                schema["required"],
+                json!(["task"]),
+                "fork must stay optional"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_requested_without_a_bound_caller_fails_explicitly() {
+        let tool = DaemonSpawnAgentTool {
+            root: test_root(
+                PathBuf::from("/tmp/unused.sock"),
+                "s".into(),
+                "t".into(),
+                "c".into(),
+            ),
+            sandbox: yi_agent_tools::SandboxMode::ReadOnly,
+            caller: CallerContext::unbound(),
+        };
+
+        let result = tool.call(json!({ "task": "do it", "fork": true })).await;
+
+        assert!(result.is_error);
+        assert!(matches!(
+            result.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("fork requested but no caller context available")
+        ));
+    }
+
+    /// A daemon-side chunk rejection arrives as `Ok(IpcResponse::Error { .. })`:
+    /// `send_request` only turns transport faults into `Err`. That arm is the
+    /// normal rejection channel, and it must abort the upload rather than leave
+    /// the store holding a payload it has no TTL or eviction for.
+    #[test]
+    fn a_rejected_chunk_aborts_the_fork_upload_instead_of_leaking_it() {
+        let mut requests = Vec::new();
+        let mut transport = |request: yi_agent_store::ipc::IpcRequest| -> Result<
+            yi_agent_store::ipc::IpcResponse,
+            yi_agent_store::ipc::IpcError,
+        > {
+            let response = match &request {
+                yi_agent_store::ipc::IpcRequest::BeginForkUpload { total_bytes, .. } => {
+                    assert_eq!(*total_bytes, 4, "the declared length is the payload's");
+                    Ok(yi_agent_store::ipc::IpcResponse::ForkUploadStarted {
+                        fork_token: "tok".into(),
+                    })
+                }
+                yi_agent_store::ipc::IpcRequest::AppendForkChunk { .. } => {
+                    Ok(yi_agent_store::ipc::IpcResponse::Error {
+                        code: yi_agent_store::ipc::IpcErrorCode::Validation,
+                        message: Some("chunk is not valid base64".into()),
+                    })
+                }
+                yi_agent_store::ipc::IpcRequest::AbortForkUpload { .. } => {
+                    Ok(yi_agent_store::ipc::IpcResponse::ForkUploadAborted)
+                }
+                other => panic!("unexpected request after the rejection: {other:?}"),
+            };
+            requests.push(request);
+            response
+        };
+
+        let result = drive_fork_upload(
+            &mut transport,
+            "session".into(),
+            "caller".into(),
+            "capability".into(),
+            vec![1, 2, 3, 4],
+        );
+
+        let error = result.expect_err("a rejected chunk must fail the upload");
+        assert!(error.is_error);
+        assert!(
+            matches!(
+                error.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(text)]
+                    if text.contains("daemon rejected fork chunk")
+                        && text.contains("chunk is not valid base64")
+            ),
+            "the daemon's rejection must surface: {:?}",
+            error.content
+        );
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [
+                    yi_agent_store::ipc::IpcRequest::BeginForkUpload { .. },
+                    yi_agent_store::ipc::IpcRequest::AppendForkChunk { .. },
+                    yi_agent_store::ipc::IpcRequest::AbortForkUpload { fork_token },
+                ] if fork_token == "tok"
+            ),
+            "the rejected upload must be aborted, got {requests:?}"
+        );
+    }
+
+    /// The transport-fault arm keeps aborting the upload, and must do so without
+    /// the abort's own reply being mistaken for a chunk acknowledgement.
+    #[test]
+    fn a_transport_fault_on_a_chunk_still_aborts_the_fork_upload() {
+        let mut requests = Vec::new();
+        let mut transport = |request: yi_agent_store::ipc::IpcRequest| -> Result<
+            yi_agent_store::ipc::IpcResponse,
+            yi_agent_store::ipc::IpcError,
+        > {
+            let response = match &request {
+                yi_agent_store::ipc::IpcRequest::BeginForkUpload { .. } => {
+                    Ok(yi_agent_store::ipc::IpcResponse::ForkUploadStarted {
+                        fork_token: "tok".into(),
+                    })
+                }
+                yi_agent_store::ipc::IpcRequest::AppendForkChunk { .. } => {
+                    Err(yi_agent_store::ipc::IpcError::Json(serde_json::Error::io(
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "simulated transport failure",
+                        ),
+                    )))
+                }
+                yi_agent_store::ipc::IpcRequest::AbortForkUpload { .. } => {
+                    Ok(yi_agent_store::ipc::IpcResponse::ForkUploadAborted)
+                }
+                other => panic!("unexpected request after the fault: {other:?}"),
+            };
+            requests.push(request);
+            response
+        };
+
+        let result = drive_fork_upload(
+            &mut transport,
+            "session".into(),
+            "caller".into(),
+            "capability".into(),
+            vec![1, 2, 3, 4],
+        );
+
+        let error = result.expect_err("a transport fault must fail the upload");
+        assert!(error.is_error);
+        assert!(
+            matches!(
+                error.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(text)]
+                    if text.contains("daemon is unavailable")
+            ),
+            "the transport fault must surface: {:?}",
+            error.content
+        );
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [
+                    yi_agent_store::ipc::IpcRequest::BeginForkUpload { .. },
+                    yi_agent_store::ipc::IpcRequest::AppendForkChunk { .. },
+                    yi_agent_store::ipc::IpcRequest::AbortForkUpload { fork_token },
+                ] if fork_token == "tok"
+            ),
+            "the faulted upload must be aborted, got {requests:?}"
+        );
     }
 
     /// A fixed binding over literals, for tools exercised without a live daemon.
@@ -3260,6 +3732,92 @@ mod tests {
         assert_eq!(report, "sub-agent 正常完成，结果可读");
     }
 
+    /// A fork is only worth requesting if the child actually starts from the
+    /// parent's transcript: the very first provider request must carry the
+    /// parent's history ahead of the objective, in that order.
+    #[tokio::test]
+    async fn a_forked_worker_seeds_its_first_request_with_the_parent_history() {
+        let directory = TempDir::new().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("now continue the task")
+            .with_workspace(worker_workspace(directory.path()))
+            .with_workspace_mode(ChildWriteMode::ReadOnly)
+            .with_fork_messages(vec![yi_agent_core::Message::user(
+                "earlier the user asked for X",
+            )]);
+        let handle = factory.start(request).await.unwrap();
+        wait_until(
+            || !provider.requests.lock().unwrap().is_empty(),
+            "the forked worker to call the provider",
+        )
+        .await;
+
+        let requests = provider.requests.lock().unwrap();
+        let texts: Vec<&str> = requests[0]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                yi_agent_core::ContentBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        let history = texts
+            .iter()
+            .position(|t| t.contains("earlier the user asked for X"))
+            .expect("parent history must be seeded");
+        let objective = texts
+            .iter()
+            .position(|t| t.contains("now continue the task"))
+            .expect("objective must follow");
+        assert!(
+            history < objective,
+            "parent history must be a prefix of the objective: {texts:?}"
+        );
+        handle.cancel();
+    }
+
+    /// The fork is opt-in: without `fork_messages` the child's first request is
+    /// exactly the objective and nothing inherited.
+    #[tokio::test]
+    async fn an_unforked_worker_sends_only_its_objective_first() {
+        let directory = TempDir::new().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            directory.path().join("runtime.sock"),
+        )
+        .with_workspace(directory.path().to_path_buf());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("standalone objective")
+            .with_workspace(worker_workspace(directory.path()))
+            .with_workspace_mode(ChildWriteMode::ReadOnly);
+        let handle = factory.start(request).await.unwrap();
+        wait_until(
+            || !provider.requests.lock().unwrap().is_empty(),
+            "the worker to call the provider",
+        )
+        .await;
+
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].messages.len(),
+            1,
+            "an unforked worker must send only its objective"
+        );
+        handle.cancel();
+    }
+
     #[tokio::test]
     async fn daemon_read_only_worker_reports_text_completion() {
         let directory = TempDir::new().unwrap();
@@ -3380,6 +3938,7 @@ mod tests {
                 model: None,
 
                 sandbox: None,
+                fork_token: None,
             },
         )
         .unwrap()
@@ -3433,6 +3992,7 @@ mod tests {
                 model: None,
 
                 sandbox: None,
+                fork_token: None,
             },
         )
         .unwrap()

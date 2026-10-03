@@ -23,6 +23,7 @@ use super::worker::{
     WorkerWatchdogEvent,
 };
 use crate::agent::ProviderTurnGate;
+use crate::message::Message;
 use crate::tool::{Tool, ToolRegistry, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
@@ -117,6 +118,12 @@ pub struct AgentSupervisor {
     objectives: HashMap<TaskId, String>,
     workspace_modes: HashMap<TaskId, ChildWriteMode>,
     inherited_sandboxes: HashMap<TaskId, InheritedSandbox>,
+    /// The caller's conversation a forked child should start from, keyed by the
+    /// child task. Written after a spawn resolves its fork token and read when
+    /// the worker starts. Mirrors the sibling `inherited_sandboxes` field: a
+    /// plain map is enough because the whole supervisor is held behind
+    /// `Arc<Mutex<..>>`.
+    fork_messages: HashMap<TaskId, Vec<Message>>,
     workdirs: HashMap<TaskId, Option<PathBuf>>,
     models: HashMap<TaskId, String>,
     children: HashMap<TaskId, Vec<TaskId>>,
@@ -159,6 +166,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -198,6 +206,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -252,6 +261,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
             children: HashMap::new(),
@@ -396,6 +406,29 @@ impl AgentSupervisor {
 
     pub fn inherited_sandbox(&self, task_id: &TaskId) -> Option<InheritedSandbox> {
         self.inherited_sandboxes.get(task_id).copied()
+    }
+
+    /// Records the caller's conversation a forked child should start from.
+    pub fn set_fork_messages(&mut self, task_id: &TaskId, messages: Vec<Message>) {
+        self.fork_messages.insert(task_id.clone(), messages);
+    }
+
+    /// The forked conversation prefix recorded for a task, if any. Read when
+    /// the task's worker starts so the worker can seed its session.
+    pub fn fork_messages(&self, task_id: &TaskId) -> Option<Vec<Message>> {
+        self.fork_messages.get(task_id).cloned()
+    }
+
+    /// Removes and returns the forked conversation prefix recorded for a task.
+    ///
+    /// The prefix is a one-shot seed. Once the worker's `WorkerStart` carries a
+    /// clone of these messages the supervisor has no further use for its own
+    /// copy, so it must not pin a forked child's full transcript for the
+    /// daemon's lifetime. Resuming does not re-seed from here -- a restarted
+    /// worker recovers from its own checkpoint and the prefix is dropped with
+    /// the process anyway -- so taking it cannot strand a resume.
+    pub fn take_fork_messages(&mut self, task_id: &TaskId) -> Option<Vec<Message>> {
+        self.fork_messages.remove(task_id)
     }
 
     /// Binds a directory to a task. A root has no workdir by default, so this is
@@ -625,32 +658,44 @@ impl AgentSupervisor {
             .ok_or_else(|| WorkerStartError::Catalogue("task does not exist".into()))?;
         let objective = self
             .objective(task_id)
-            .ok_or_else(|| WorkerStartError::Catalogue("task objective does not exist".into()))?;
+            .ok_or_else(|| WorkerStartError::Catalogue("task objective does not exist".into()))?
+            .to_string();
         let initial_user_messages = self
             .mailboxes
             .get(task_id)
             .expect("task mailbox is created with task")
             .pending_worker_inputs();
-        let start = WorkerStart::new(
-            task.id.clone(),
-            task.active_attempt_id().clone(),
-            task.root_session_id.clone(),
-        )
-        .with_objective(objective)
-        .with_workspace_mode(self.workspace_mode(task_id))
-        .maybe_with_inherited_sandbox(self.inherited_sandbox(task_id))
-        .with_model(self.model(task_id).unwrap_or_default().to_string())
-        .with_message_capability(Uuid::new_v4().to_string())
-        .with_initial_user_messages(
-            initial_user_messages
-                .iter()
-                .map(|(id, body)| WorkerMessage {
-                    id: id.clone(),
-                    body: body.clone(),
-                })
-                .collect(),
-        );
-        let start = if let Some(workspace) = task.workspace.clone() {
+        // Everything the `WorkerStart` needs from the task map is captured here
+        // so the immutable borrow of `self.tasks` ends before the one-shot fork
+        // prefix is taken (which needs `&mut self`).
+        let task_id_value = task.id.clone();
+        let attempt_id = task.active_attempt_id().clone();
+        let root_session_id = task.root_session_id.clone();
+        let workspace_lease = task.workspace.clone();
+        // The fork prefix is a one-shot seed: take it as the `WorkerStart` is
+        // assembled, so the supervisor does not retain a forked child's whole
+        // transcript for the daemon's life.
+        let fork_messages = self.take_fork_messages(task_id);
+        let workspace_mode = self.workspace_mode(task_id);
+        let inherited_sandbox = self.inherited_sandbox(task_id);
+        let model = self.model(task_id).unwrap_or_default().to_string();
+        let start = WorkerStart::new(task_id_value, attempt_id, root_session_id)
+            .with_objective(objective)
+            .with_workspace_mode(workspace_mode)
+            .maybe_with_inherited_sandbox(inherited_sandbox)
+            .with_model(model)
+            .with_message_capability(Uuid::new_v4().to_string())
+            .with_initial_user_messages(
+                initial_user_messages
+                    .iter()
+                    .map(|(id, body)| WorkerMessage {
+                        id: id.clone(),
+                        body: body.clone(),
+                    })
+                    .collect(),
+            )
+            .maybe_with_fork_messages(fork_messages);
+        let start = if let Some(workspace) = workspace_lease {
             start.with_workspace_lease(workspace)
         } else {
             start
@@ -2742,5 +2787,123 @@ mod tests {
             "the successor reported by retry_task must be the installed active attempt"
         );
         assert_eq!(supervisor.task(&task).unwrap().state(), &TaskState::Queued);
+    }
+
+    #[test]
+    fn supervisor_remembers_fork_messages_per_task() {
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = supervisor
+            .spawn_with_objective(
+                supervisor.root_task_id().clone(),
+                crate::subagent::worker::SpawnRequest::new(
+                    "child".into(),
+                    ChildWriteMode::ReadOnly,
+                    None,
+                ),
+            )
+            .unwrap();
+
+        supervisor.set_fork_messages(&child, vec![Message::user("inherited")]);
+        assert_eq!(supervisor.fork_messages(&child).unwrap().len(), 1);
+        assert!(
+            supervisor
+                .fork_messages(&supervisor.root_task_id().clone())
+                .is_none()
+        );
+    }
+
+    struct CapturingWorkerFactory {
+        start: Arc<Mutex<Option<WorkerStart>>>,
+    }
+
+    impl AgentWorkerFactory for CapturingWorkerFactory {
+        fn start(
+            &self,
+            request: WorkerStart,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<WorkerHandle, crate::subagent::worker::WorkerError>,
+        > {
+            let handle = WorkerHandle::new(request.cancellation.clone());
+            *self.start.lock().unwrap() = Some(request);
+            Box::pin(async move { Ok(handle) })
+        }
+    }
+
+    fn spawn_child(supervisor: &mut AgentSupervisor) -> TaskId {
+        supervisor
+            .spawn_with_objective(
+                supervisor.root_task_id().clone(),
+                crate::subagent::worker::SpawnRequest::new(
+                    "child".into(),
+                    ChildWriteMode::ReadOnly,
+                    None,
+                ),
+            )
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn supervisor_forwards_recorded_fork_messages_to_the_worker() {
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = spawn_child(&mut supervisor);
+        supervisor.set_fork_messages(&child, vec![Message::user("parent said")]);
+
+        let captured = Arc::new(Mutex::new(None));
+        let factory = CapturingWorkerFactory {
+            start: captured.clone(),
+        };
+        supervisor.start_worker(&factory, &child).await.unwrap();
+
+        let request = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the factory received a WorkerStart");
+        assert_eq!(
+            request.fork_messages,
+            Some(vec![Message::user("parent said")])
+        );
+        assert!(
+            supervisor.fork_messages(&child).is_none(),
+            "the one-shot prefix must not be retained once the worker start carries it"
+        );
+    }
+
+    #[test]
+    fn supervisor_takes_fork_messages_exactly_once() {
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = spawn_child(&mut supervisor);
+        supervisor.set_fork_messages(&child, vec![Message::user("inherited")]);
+
+        assert_eq!(
+            supervisor.take_fork_messages(&child),
+            Some(vec![Message::user("inherited")])
+        );
+        assert!(supervisor.take_fork_messages(&child).is_none());
+        assert!(supervisor.fork_messages(&child).is_none());
+    }
+
+    #[tokio::test]
+    async fn supervisor_forwards_no_fork_messages_by_default() {
+        let mut supervisor =
+            AgentSupervisor::new_with_objective(RootSessionId::new(), "obj".into());
+        let child = spawn_child(&mut supervisor);
+
+        let captured = Arc::new(Mutex::new(None));
+        let factory = CapturingWorkerFactory {
+            start: captured.clone(),
+        };
+        supervisor.start_worker(&factory, &child).await.unwrap();
+
+        let request = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the factory received a WorkerStart");
+        assert!(request.fork_messages.is_none(), "fork is opt-in");
     }
 }
