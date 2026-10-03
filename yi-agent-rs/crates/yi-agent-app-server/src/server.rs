@@ -3835,6 +3835,15 @@ async fn apply_session_command(
     match command {
         SessionCommand::Clear { reply } => {
             agent.set_session_messages(Vec::new());
+            // `set_session_messages` 只换消息,不碰 `last_input_tokens`;若不在此清零,
+            // 清空后仍留着一个陈旧的(可能很大的)计数,`maybe_auto_compact` 会在下一轮
+            // 立刻误触发一次压缩。旧实现换的是全新 `Session`(计数为 `None`),这里补回
+            // 那个语义——与 CLI 的 `/clear` 路径一致。
+            agent
+                .session_handle()
+                .lock()
+                .unwrap()
+                .set_last_input_tokens(None);
             let truncate = store.truncate(thread_id);
             if let Err(e) = &truncate {
                 eprintln!("[app-server] failed to truncate thread log {thread_id}: {e}");
@@ -3863,6 +3872,15 @@ async fn apply_session_command(
                     // Replace the contents in place so the session `Arc` — and
                     // any `CallerContext` bound to it — stays valid.
                     agent.set_session_messages(compacted.messages().to_vec());
+                    // The replaced session used to be brand new, so its token
+                    // count meant "no measurement yet". Keep that: a stale
+                    // pre-compaction count would re-trigger auto-compaction on
+                    // the very next turn.
+                    agent
+                        .session_handle()
+                        .lock()
+                        .unwrap()
+                        .set_last_input_tokens(None);
                     CompactOutcome::Compacted
                 }
                 Ok(None) => CompactOutcome::NotReduced,
@@ -10095,6 +10113,112 @@ pub(crate) mod tests {
             caller.snapshot().expect("the caller stays bound"),
             expected,
             "a caller bound before the compact must see the compacted transcript"
+        );
+    }
+
+    /// `/clear` 与 `/compact` 都必须把陈旧的 `last_input_tokens` 清零。
+    ///
+    /// Task 8 把 `with_session(Session::new())` 换成 `set_session_messages(...)`
+    /// 以保住 session `Arc`,但后者只换消息、不碰 token 计数:上一轮留下的(很大的)
+    /// `last_input_tokens` 会存活到 `maybe_auto_compact`,让下一轮立刻误触发一次
+    /// 无谓的自动压缩。本测试驱动**生产函数** `apply_session_command`,断言计数归零、
+    /// 而 `Arc` 未变。
+    #[tokio::test]
+    async fn session_commands_clear_the_stale_input_tokens_without_changing_the_handle() {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r); // 本测试不看 writer 输出
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        // Clear 会 truncate 日志,故线程 id 必须合法。
+        let cases = [
+            ("/clear", "thread-tokens-clear"),
+            ("/compact", "thread-tokens-compact"),
+        ];
+        for (label, thread_id) in cases {
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            let handle = agent.session_handle();
+            let caller = yi_agent_subagent::CallerContext::new(handle.clone());
+            // 可压缩的历史(两个 user 轮次)+ 上一轮留下的大计数,正是 finding 描述的
+            // 陈旧状态。
+            handle.lock().unwrap().replace_messages(vec![
+                yi_agent_core::Message::user("first"),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "reply".into(),
+                )]),
+                yi_agent_core::Message::user("second"),
+            ]);
+            handle.lock().unwrap().set_last_input_tokens(Some(150_000));
+
+            let status = ThreadSession::new_status();
+            if label == "/clear" {
+                let (reply, answer) = oneshot::channel();
+                agent = apply_session_command(
+                    agent,
+                    SessionCommand::Clear { reply },
+                    &provider,
+                    &config,
+                    &store,
+                    thread_id,
+                    &hub,
+                    &turn_tx,
+                    &status,
+                )
+                .await;
+                answer
+                    .await
+                    .expect("the clear reply channel must be fulfilled")
+                    .expect("truncating a never-written log must succeed");
+            } else {
+                let (reply, answer) = oneshot::channel();
+                agent = apply_session_command(
+                    agent,
+                    SessionCommand::Compact { reply },
+                    &provider,
+                    &config,
+                    &store,
+                    thread_id,
+                    &hub,
+                    &turn_tx,
+                    &status,
+                )
+                .await;
+                assert_eq!(
+                    answer
+                        .await
+                        .expect("the compact reply channel must be fulfilled"),
+                    CompactOutcome::Compacted,
+                    "{label} must compact the two-user-turn history"
+                );
+            }
+
+            assert_eq!(
+                agent.session().last_input_tokens(),
+                None,
+                "{label} must clear the stale input-token count"
+            );
+            assert!(
+                Arc::ptr_eq(&handle, &agent.session_handle()),
+                "{label} must keep the session Arc"
+            );
+            assert_eq!(
+                caller.snapshot().expect("the caller stays bound"),
+                agent.session().messages().to_vec(),
+                "{label} must land its outcome on the handle the caller holds"
+            );
+        }
+
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a session command with no turn must not report a turn as finished"
         );
     }
 }
