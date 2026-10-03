@@ -21,7 +21,7 @@ use yi_agent_core::subagent::scheduler::{
 };
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, CompletedChildReport, ReviewPersistenceError, SpawnError, WaitMode,
-    WaitOutcome,
+    WaitOutcome, WorkerStartError,
 };
 use yi_agent_core::subagent::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
@@ -315,6 +315,56 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime resident task mutex poisoned")
             .remove(task);
+    }
+
+    /// Persists every parent-terminal cascade victim in one repository
+    /// transaction and releases each victim's resident lease.
+    ///
+    /// Holding the repository lock across the batch keeps the task rows and the
+    /// release stop in step. Attempt ids are re-read through
+    /// `RuntimeRepository::active_attempt_id` at commit time rather than
+    /// captured before the write, so a retry that swapped the victim's active
+    /// attempt after the supervisor lock was dropped can no longer make the
+    /// guarded update fail and strand a victim with an active lease. A victim
+    /// that has since moved on is skipped rather than mis-persisted, and is
+    /// still released because the cascade has already ended it in memory
+    /// (release is idempotent for a task that never held a lease).
+    fn persist_cascaded_tasks(&self, victims: Vec<TaskId>) -> Result<(), RuntimeCoordinatorError> {
+        if victims.is_empty() {
+            return Ok(());
+        }
+        let mut repository = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned");
+        let mut releases = Vec::with_capacity(victims.len());
+        for victim in victims {
+            let attempt = match repository.active_attempt_id(&victim) {
+                Ok(attempt) => attempt,
+                Err(RepositoryError::TaskNotFound { .. }) => {
+                    releases.push(victim);
+                    continue;
+                }
+                Err(error) => return Err(RuntimeCoordinatorError::Repository(error)),
+            };
+            match repository.transition_task_and_attempt(
+                &victim,
+                &attempt,
+                "cancelled",
+                RuntimeEvent::TaskCancelled,
+            ) {
+                Ok(_) => releases.push(victim),
+                Err(RepositoryError::TaskNotFound { .. }) => {
+                    releases.push(victim);
+                }
+                Err(error) => return Err(RuntimeCoordinatorError::Repository(error)),
+            }
+        }
+        drop(repository);
+        for victim in releases {
+            self.release_resident_lease(&victim);
+        }
+        Ok(())
     }
 
     pub fn resident_admission_cursor(&self) -> AdmissionCursor {
@@ -1503,7 +1553,21 @@ impl RuntimeCoordinator {
                         RuntimeEvent::TaskFailed,
                         &evidence,
                     )?;
-                let _ = supervisor.fail_task(task, error.to_string());
+                // The failed row was written above, but the in-memory task is
+                // still non-terminal: this reduce is what fails it, and it is
+                // exactly that transition which can fire the parent-terminal
+                // cascade. The returned ids therefore matter — a live
+                // descendant is cancelled in memory here and no reconcile event
+                // will ever report it again, so it must be persisted below or
+                // it stays `running` while holding its leases. A reduce error
+                // is not actionable (the task is already durably failed above)
+                // and must not mask the real provisioning error.
+                let cascaded = supervisor
+                    .fail_task(task, error.to_string())
+                    .unwrap_or_default();
+                let victims = cascaded.into_iter().filter(|id| *id != *task).collect();
+                drop(supervisor);
+                self.persist_cascaded_tasks(victims)?;
                 return Err(RuntimeCoordinatorError::Supervisor(error.to_string()));
             }
         };
@@ -1596,7 +1660,7 @@ impl RuntimeCoordinator {
                         .remove(task);
                 }
                 WorkerRecoveryPreflightResult::Conflict(reason) => {
-                    supervisor
+                    let affected = supervisor
                         .record_recovery_conflict(task, reason.clone())
                         .map_err(RuntimeCoordinatorError::Supervisor)?;
                     let evidence = serde_json::to_string(&serde_json::json!({
@@ -1614,6 +1678,17 @@ impl RuntimeCoordinator {
                             RuntimeEvent::TaskBlocked,
                             &evidence,
                         )?;
+                    // The durable row above covers `task` itself. Reducing the
+                    // conflict also settled the task in memory (`Blocked` is a
+                    // settled terminal), which cascaded its live descendants.
+                    // `reconcile` skips tasks it already finds terminal, so
+                    // these victims would otherwise stay `running` while
+                    // holding leases. Persist and release them while the
+                    // supervisor guard is still held, mirroring the watchdog
+                    // path, so no concurrent retry can swap a victim's active
+                    // attempt and defeat the guarded write.
+                    let victims = affected.into_iter().filter(|id| id != task).collect();
+                    self.persist_cascaded_tasks(victims)?;
                     self.recovery_contexts
                         .lock()
                         .expect("runtime recovery context mutex poisoned")
@@ -1694,13 +1769,17 @@ impl RuntimeCoordinator {
             .as_ref()
             .map(|factory| factory as &dyn AgentWorkerFactory)
             .unwrap_or_else(|| self.factory.as_ref());
-        if let Err(error) = supervisor
+        let start_outcome = supervisor
             .start_worker_with_provider_turn_gate(worker_factory, task, provider_turn_gate)
-            .await
-        {
+            .await;
+        if let Err(error) = start_outcome {
+            let (message, affected) = match error {
+                WorkerStartError::Factory { message, affected } => (message, affected),
+                WorkerStartError::Catalogue(message) => (message, Vec::new()),
+            };
             let terminal = serde_json::to_string(&serde_json::json!({
                 "reason": "worker_start_failed",
-                "error": error.as_str(),
+                "error": message,
             }))
             .expect("worker start failure payload is serializable");
             self.repository
@@ -1713,10 +1792,16 @@ impl RuntimeCoordinator {
                     RuntimeEvent::TaskFailed,
                     &terminal,
                 )?;
+            // The factory failure cascaded every live descendant of `task` in
+            // memory. `reconcile` skips tasks already terminal, so no event will
+            // ever report them again: persist each victim from the id list the
+            // supervisor returned, or it stays `running` while holding leases.
+            let victims = affected.into_iter().filter(|id| id != task).collect();
+            self.persist_cascaded_tasks(victims)?;
             if is_subagent {
                 self.release_resident_lease(task);
             }
-            return Err(RuntimeCoordinatorError::Supervisor(error));
+            return Err(RuntimeCoordinatorError::Supervisor(message));
         }
         let acknowledgement = self
             .repository
@@ -1964,7 +2049,13 @@ impl RuntimeCoordinator {
             return Ok(false);
         }
 
-        match terminal {
+        // The repository transaction above durably recorded the watchdog
+        // terminal for `task` itself; this reduction additionally settles the
+        // parent-terminal cascade in memory. Its tail (the cascade victims) has
+        // never been persisted, so collect the victims while the supervisor
+        // borrow is live and persist + release each one below. `affected` always
+        // contains `task` first, which the transaction above already handled.
+        let affected = match terminal {
             WatchdogTerminal::Stalled => supervisor.stall_task(
                 task,
                 CoreWatchdogEvidence {
@@ -1980,6 +2071,16 @@ impl RuntimeCoordinator {
             WatchdogTerminal::BudgetExhausted(kind) => supervisor.exhaust_task_budget(task, kind),
         }
         .map_err(RuntimeCoordinatorError::Supervisor)?;
+        // Drop the guard only after the victims are persisted. A concurrent
+        // `retry_task` / `resume_task` for a victim needs the same supervisor,
+        // so it cannot install a successor attempt in the window between the
+        // reduction above and the guarded writes below. Releasing the guard
+        // first would let the retry rewrite the victim's active attempt before
+        // the write, failing its `active_attempt_id = ?` guard and stranding the
+        // victim `running` with an active lease — the same shape `cancel_task`
+        // avoids by holding its guard until the writes are done.
+        let victims = affected.into_iter().filter(|id| id != task).collect();
+        self.persist_cascaded_tasks(victims)?;
         drop(supervisor);
         self.release_resident_lease(task);
         Ok(true)
@@ -2308,31 +2409,62 @@ impl RuntimeCoordinator {
             ));
         }
         let staged_integration = integration.clone();
-        supervisor
-            .stage_review_with_persistence(
-                |supervisor| {
-                    supervisor.accept_review(
+        // The staging closure writes the reducer's cascade victims into this
+        // side channel as it runs. `stage_review_with_persistence` restores its
+        // in-memory snapshot before returning a persist failure, which would
+        // otherwise discard the id list along with the rolled-back state.
+        let mut stage_victims: Vec<TaskId> = Vec::new();
+        let staged = supervisor.stage_review_with_persistence(
+            |supervisor| {
+                let (_, victims) =
+                    supervisor.accept_review(task, &parent, delivery.id.clone(), staged_integration)?;
+                stage_victims = victims.clone();
+                Ok(victims)
+            },
+            |_| {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .accept_delivery_review(
                         task,
+                        &delivery.id,
                         &parent,
-                        delivery.id.clone(),
-                        staged_integration,
-                    )?;
-                    Ok(())
-                },
-                |_| {
-                    self.repository
-                        .lock()
-                        .expect("runtime repository mutex poisoned")
-                        .accept_delivery_review(
-                            task,
-                            &delivery.id,
-                            &parent,
-                            &integration,
-                            &actor_json,
-                        )
-                },
-            )
-            .map_err(review_persistence_error)?;
+                        &integration,
+                        &actor_json,
+                    )
+            },
+        );
+        let (victims, _) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                // The staging closure may have reduced the review to its
+                // settled `Completed` state and cascaded live descendants in
+                // memory before the repository write failed. Restoring the
+                // snapshot then resurrects those children (with their leases)
+                // while their workers stay cancelled, so no reconcile event can
+                // ever report them again. Persist the cascade durably anyway: a
+                // rolled-back in-memory child must not become a durable orphan.
+                if matches!(error, ReviewPersistenceError::Persistence(_)) {
+                    let message = review_persistence_error(error);
+                    drop(supervisor);
+                    let victims = stage_victims
+                        .into_iter()
+                        .filter(|id| id != task)
+                        .collect();
+                    self.persist_cascaded_tasks(victims)?;
+                    return Err(message);
+                }
+                return Err(review_persistence_error(error));
+            }
+        };
+        // Persist the cascade victims while the supervisor guard is still held,
+        // exactly like the watchdog path: a concurrent retry of a victim needs
+        // the same supervisor, so it cannot swap the victim's active attempt and
+        // defeat the guarded write below. `affected` always lists `task` first,
+        // and the reviewed task's own lease is released at the end of this
+        // function, so it must not be released twice here.
+        let victims = victims.into_iter().filter(|id| id != task).collect();
+        self.persist_cascaded_tasks(victims)?;
         drop(supervisor);
         self.release_resident_lease(task);
         Ok(())
@@ -2646,40 +2778,70 @@ impl RuntimeCoordinator {
             .map_err(|error| RuntimeCoordinatorError::Supervisor(error.to_string()))?;
         let reason_message = MessageId::new();
         let parent_notification = MessageId::new();
-        supervisor
-            .stage_review_with_persistence(
-                |supervisor| {
-                    supervisor.reject_review(
+        // Side channel for the reducer's cascade victims, because a persist
+        // failure restores the in-memory snapshot before returning.
+        let mut stage_victims: Vec<TaskId> = Vec::new();
+        let staged = supervisor.stage_review_with_persistence(
+            |supervisor| {
+                let (_, victims) = supervisor.reject_review(
+                    task,
+                    &parent,
+                    delivery.id.clone(),
+                    reason_message.clone(),
+                )?;
+                stage_victims = victims.clone();
+                supervisor
+                    .stage_persisted_message(MailboxMessageDraft::user_override_with_id(
+                        parent_notification.clone(),
+                        parent.clone(),
+                        review_parent_notification("rejected", task, &delivery.id),
+                    ))
+                    .map_err(|error| error.to_string())?;
+                Ok(victims)
+            },
+            |_| {
+                self.repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .reject_delivery_review(
                         task,
+                        &delivery.id,
                         &parent,
-                        delivery.id.clone(),
-                        reason_message.clone(),
-                    )?;
-                    supervisor
-                        .stage_persisted_message(MailboxMessageDraft::user_override_with_id(
-                            parent_notification.clone(),
-                            parent.clone(),
-                            review_parent_notification("rejected", task, &delivery.id),
-                        ))
-                        .map_err(|error| error.to_string())?;
-                    Ok(())
-                },
-                |_| {
-                    self.repository
-                        .lock()
-                        .expect("runtime repository mutex poisoned")
-                        .reject_delivery_review(
-                            task,
-                            &delivery.id,
-                            &parent,
-                            reason,
-                            &reason_message,
-                            &actor_json,
-                            &parent_notification,
-                        )
-                },
-            )
-            .map_err(review_persistence_error)?;
+                        reason,
+                        &reason_message,
+                        &actor_json,
+                        &parent_notification,
+                    )
+            },
+        );
+        let (victims, _) = match staged {
+            Ok(staged) => staged,
+            Err(error) => {
+                // A rejection is a settled terminal state, so the staged reduce
+                // may already have cascaded live descendants whose workers were
+                // cancelled. The failed staging restores the snapshot and
+                // resurrects those children in memory, so persist the cascade
+                // from the captured ids anyway rather than stranding durable
+                // orphans with live leases.
+                if matches!(error, ReviewPersistenceError::Persistence(_)) {
+                    let message = review_persistence_error(error);
+                    drop(supervisor);
+                    let victims = stage_victims
+                        .into_iter()
+                        .filter(|id| id != task)
+                        .collect();
+                    self.persist_cascaded_tasks(victims)?;
+                    return Err(message);
+                }
+                return Err(review_persistence_error(error));
+            }
+        };
+        // Persist the cascade victims before releasing the guard, mirroring the
+        // watchdog path, so no concurrent retry can swap a victim's attempt
+        // between the reduce and the guarded write. `task` is excluded: it is
+        // released explicitly at the end of this function.
+        let victims = victims.into_iter().filter(|id| id != task).collect();
+        self.persist_cascaded_tasks(victims)?;
         supervisor
             .deliver_committed_user_instruction(&parent, &parent_notification)
             .map_err(RuntimeCoordinatorError::Supervisor)?;
@@ -4376,6 +4538,57 @@ mod provider_turn_admission_tests {
             Some(128),
             "the configured capacity must reach the coordinator, not just the constant"
         );
+    }
+
+    /// The cascade write resolves each victim's attempt at commit time, so a
+    /// retry that swapped the victim's active attempt after the supervisor lock
+    /// was dropped cannot make the guarded update fail. Releasing the guard
+    /// before the writes (the bug) captured the stale attempt id and left the
+    /// victim `running` with an active lease; re-reading it here cancels the
+    /// successor attempt's row instead.
+    #[test]
+    fn a_cascade_write_re_reads_the_victims_active_attempt_at_commit_time() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let coordinator =
+            RuntimeCoordinator::open(&database, Arc::new(CapacityFactory { units: 8 })).unwrap();
+        let root = RootSessionId::new();
+        let victim = TaskId::new();
+        let stale_attempt = AttemptId::new();
+        let successor_attempt = AttemptId::new();
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .create_task_with_attempt(&victim, &root, &stale_attempt, 1, "running")
+                .unwrap();
+            // A concurrent retry replaced the victim's active attempt while the
+            // supervisor guard was dropped in the buggy ordering.
+            repository
+                .activate_successor_attempt(
+                    &victim,
+                    &successor_attempt,
+                    2,
+                    "queued",
+                    RuntimeEvent::TaskQueued,
+                )
+                .unwrap();
+        }
+
+        coordinator
+            .persist_cascaded_tasks(vec![victim.clone()])
+            .unwrap();
+
+        let repository = RuntimeRepository::open(&database).unwrap();
+        assert_eq!(
+            repository.task_state(&victim).unwrap(),
+            "cancelled",
+            "the successor attempt's row must be ended, not left queued"
+        );
+        assert_eq!(
+            repository.active_attempt_id(&victim).unwrap(),
+            successor_attempt
+        );
+        assert_ne!(repository.active_attempt_id(&victim).unwrap(), stale_attempt);
     }
 
     #[test]

@@ -83,6 +83,51 @@ impl AgentWorkerFactory for FailingFactory {
     }
 }
 
+/// Fails `start_with_provider_turn_gate` only for tasks named in `failing`, so a
+/// test can start a parent and its child successfully (each claiming a resident
+/// lease) and then drive a later start of the parent into the factory-failure
+/// branch with a live descendant still present.
+#[derive(Clone, Default)]
+struct ScopedStartupErrorFactory {
+    failing: Arc<Mutex<Vec<TaskId>>>,
+    handles: Arc<Mutex<Vec<WorkerHandle>>>,
+}
+
+impl ScopedStartupErrorFactory {
+    fn fail_for(&self, task: &TaskId) {
+        self.failing.lock().unwrap().push(task.clone());
+    }
+
+    fn tracks(&self, task: &TaskId) -> bool {
+        self.failing.lock().unwrap().contains(task)
+    }
+}
+
+impl AgentWorkerFactory for ScopedStartupErrorFactory {
+    fn recovery_context(&self) -> WorkerRecoveryContext {
+        durable_context()
+    }
+
+    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        let handle = WorkerHandle::new(request.cancellation);
+        self.handles.lock().unwrap().push(handle.clone());
+        Box::pin(async move { Ok(handle) })
+    }
+
+    fn start_with_provider_turn_gate(
+        &self,
+        request: WorkerStart,
+        _gate: Option<Arc<dyn ProviderTurnGate>>,
+    ) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
+        if self.tracks(&request.task_id) {
+            return Box::pin(async {
+                Err(WorkerError::Startup("provider bootstrap failed".into()))
+            });
+        }
+        self.start(request)
+    }
+}
+
 #[derive(Clone, Default)]
 struct MessageRecordingFactory {
     starts: Arc<Mutex<Vec<WorkerStart>>>,
@@ -2339,6 +2384,74 @@ async fn recovery_conflict_is_durable_without_factory_start() {
     assert!(terminal["evidence"].as_str().unwrap().contains("Git HEAD"));
 }
 
+/// A recovery conflict settles its parent (`Blocked`), which cascades any live
+/// descendant in memory. The reconciler skips tasks it already finds terminal,
+/// so without wiring `record_recovery_conflict`'s id list the child would stay
+/// `running` in SQLite while its lease was already released in memory.
+#[tokio::test]
+async fn a_recovery_conflicted_parent_cascades_and_releases_its_live_child() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let parent = TaskId::new();
+    let parent_attempt = AttemptId::new();
+
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&parent, &session, &parent_attempt, 1, "running")
+        .unwrap();
+    // Seed the recovery gate so the restarted daemon routes the parent through
+    // `preflight_recovery` (which this factory answers with `Conflict`).
+    repository
+        .record_recovery_context(
+            &parent,
+            &parent_attempt,
+            "workspace:test-parent",
+            "worktree:test-parent",
+            "{}",
+            "{}",
+        )
+        .unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+
+    let factory = Arc::new(ConflictReportingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    // A live child under the (recovery-gated) parent. It is started so it holds
+    // a workspace lease, exactly like a normal running subagent.
+    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "fixture requires the child to hold an active lease before the conflict"
+    );
+
+    coordinator.resume_task(&session, &parent).await.unwrap();
+    assert_eq!(
+        *factory.starts.lock().unwrap(),
+        1,
+        "only the child's worker started; the conflicted parent never starts"
+    );
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_state(&parent).unwrap(), "blocked");
+    assert_eq!(
+        repository.task_state(&child).unwrap(),
+        "cancelled",
+        "the live child of a recovery-conflicted parent must be durably cancelled, not left running"
+    );
+    assert!(
+        !repository
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "the cascaded child must release its workspace lease"
+    );
+}
+
 #[tokio::test]
 async fn recovery_required_task_rejects_direct_start_without_factory_action() {
     let directory = TempDir::new().unwrap();
@@ -3237,6 +3350,200 @@ async fn runtime_watchdog_can_timeout_a_queued_resource_wait() {
             .unwrap()
     );
     assert_eq!(coordinator.task_state(&task).unwrap(), "timed_out");
+}
+
+#[tokio::test]
+async fn a_watchdog_timed_out_parent_cascades_and_releases_its_childs_lease() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let parent = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    // The coding child claims its workspace lease while running.
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    // The brief's skeleton asserted on a coordinator-level `has_active_lease_prefix`,
+    // which does not exist; this file's fixtures read leases from a
+    // `RuntimeRepository` handle instead.
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "fixture requires the child to hold a workspace lease"
+    );
+
+    let timestamp = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert!(
+        coordinator
+            .record_watchdog_terminal(
+                &session,
+                &parent,
+                WatchdogTerminal::TimedOut(TimeoutKind::WallClock),
+                WatchdogEvidence {
+                    last_meaningful_event_id: None,
+                    last_meaningful_at: timestamp,
+                    elapsed_secs: 301,
+                    current_wait: None,
+                },
+            )
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(coordinator.task_state(&parent).unwrap(), "timed_out");
+    assert_eq!(coordinator.task_state(&child).unwrap(), "cancelled");
+    assert!(
+        !RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "the cascaded child must release its workspace lease"
+    );
+}
+
+/// Accepting a review is a settled terminal transition, so it cascades the
+/// reviewed task's own live descendants.
+///
+/// The reviewed child here is itself the parent of a running grandchild. When
+/// the review is accepted the reviewed child completes, the reducer cancels the
+/// live grandchild in memory (and cancels its worker), and the returned victim
+/// list is the only report that grandchild will ever produce — `reconcile`
+/// skips tasks it already finds terminal. The coordinator must persist the
+/// grandchild as `cancelled` and release its lease instead of discarding the
+/// list.
+#[tokio::test]
+async fn an_accepted_review_cascades_and_releases_its_childs_lease() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    let reviewed = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator.start_worker(&session, &reviewed).await.unwrap();
+    let workspace = factory.starts.lock().unwrap()[0]
+        .workspace_lease_id
+        .clone()
+        .unwrap();
+    let grandchild = coordinator.spawn_child(&session, &reviewed).await.unwrap();
+    coordinator
+        .start_worker(&session, &grandchild)
+        .await
+        .unwrap();
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&grandchild, "workspace:")
+            .unwrap(),
+        "fixture requires the grandchild to hold a workspace lease"
+    );
+
+    // The reviewed child delivers a commit and waits for its parent's review.
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p reviewed");
+    factory
+        .handles
+        .lock()
+        .unwrap()
+        .first()
+        .unwrap()
+        .report_delivery(delivery.clone());
+    coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&reviewed)
+            .unwrap(),
+        "awaiting_parent_review"
+    );
+
+    // Accepting that review completes the reviewed task, which must cascade the
+    // still-live grandchild.
+    coordinator
+        .accept_review(
+            &reviewed,
+            IntegrationValidation::passed("cargo test -p root"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&reviewed)
+            .unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        coordinator.task_state(&grandchild).unwrap(),
+        "cancelled",
+        "the cascaded grandchild must be durably cancelled, not left running"
+    );
+    assert!(
+        !RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&grandchild, "workspace:")
+            .unwrap(),
+        "the cascaded grandchild must release its workspace lease"
+    );
+}
+
+/// A later start of a non-terminal parent must not strand a live descendant.
+///
+/// The parent is paused (pausing never cascades) and then resumed, which sends
+/// it back through `start_worker`. When that provider start fails, the
+/// supervisor fails the parent and cascades the still-live child; the child's
+/// worker is gone, so no reconcile event can ever report it again. The
+/// coordinator must persist the child as `cancelled` and release its lease from
+/// the id list the supervisor returns, not discard it.
+#[tokio::test]
+async fn a_factory_start_failure_on_a_resumed_parent_persists_and_releases_its_cascade() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let factory = Arc::new(ScopedStartupErrorFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let parent = coordinator.root_task_id(&session).unwrap();
+    let child = coordinator.spawn_child(&session, &parent).await.unwrap();
+    // Both start successfully, so the coding child claims its workspace lease.
+    coordinator.start_worker(&session, &parent).await.unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "fixture requires the child to hold a workspace lease"
+    );
+
+    // Pausing is not a terminal transition, so the live child survives it.
+    coordinator.pause_task(&session, &parent).await.unwrap();
+    factory.handles.lock().unwrap()[0].report_paused();
+    coordinator.reconcile_worker_events().await.unwrap();
+    assert_eq!(coordinator.task_state(&parent).unwrap(), "paused");
+    assert_eq!(coordinator.task_state(&child).unwrap(), "running");
+
+    // The resumed parent re-enters the factory, which now fails for it.
+    factory.fail_for(&parent);
+    assert!(coordinator.resume_task(&session, &parent).await.is_err());
+
+    assert_eq!(coordinator.task_state(&parent).unwrap(), "failed");
+    assert_eq!(
+        coordinator.task_state(&child).unwrap(),
+        "cancelled",
+        "the cascaded child must be durably cancelled, not left running"
+    );
+    assert!(
+        !RuntimeRepository::open(&database)
+            .unwrap()
+            .has_active_lease_prefix(&child, "workspace:")
+            .unwrap(),
+        "the cascaded child must release its workspace lease"
+    );
 }
 
 #[test]
