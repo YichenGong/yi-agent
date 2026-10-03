@@ -124,7 +124,13 @@ where
 
     // ws 前端跑在自己的任务里;主任务在此等待它,与抽取前内联
     // `axum::serve(...).await?` 同形(仅在服务失败时返回 `Err`)。
-    attach_ws_frontend(
+    //
+    // 为什么在这里等、而不是把 `JoinHandle` 直接返回给调用方:本函数一返回,外层
+    // `serve_ws` 任务就当场结束——`a_client_leaving_does_not_kill_the_shared_loop`
+    // (见本文件测试模块,约 ws.rs:952)用 `!handle.is_finished()`(约 ws.rs:977-980)
+    // 断言共享主循环在客户端离开后仍存活,直接返回会打破该断言,同时丢掉「前端失败
+    // → `Err`」的传播。
+    let frontend = attach_ws_frontend(
         listener,
         hub,
         inbound_tx,
@@ -132,10 +138,36 @@ where
         client_initialized,
         device_clients,
         pairing,
-    )
-    .await??;
+    );
+    // 守卫必须在 await **之前**取:本函数唯一的 `?` 就在下面的 `frontend.await??`,
+    // 它一旦传播就直接 return,走不到末尾的 `serve_task.abort()`(生产上 `axum::serve`
+    // 内部是 `pending()`,永不返回,故 `Ok(())` 分支不可达)——也就是说那句 abort 在
+    // **唯一可达**路径上是死代码。把前端的取消柄交给 `AbortOnDrop`,才能在「`?` 传播」
+    // 与「本任务被 abort 拍掉」两条真实可达的离开路径上,都同步停掉 spawn 出的前端
+    // 监听任务(否则它会脱离外层任务、继续 accept 连接)。
+    let _frontend_abort = AbortOnDrop(frontend.abort_handle());
+    frontend.await??;
+    // 以下两句只在不可达的 `Ok(())` 分支上有机会执行,保留以对抽取前的内联形态
+    // 逐字一致;teardown 已由上面的 `AbortOnDrop` 守卫覆盖。
     serve_task.abort();
     Ok(())
+}
+
+/// `Drop` 即 [`tokio::task::AbortHandle::abort`]:把 [`attach_ws_frontend`] spawn 出的
+/// 监听任务绑到持有者(此处 [`serve_ws_inner`])的生命周期上。
+///
+/// 需要的理由:tokio 的 `JoinHandle` 在 drop 时**不会**取消任务,而 `serve_ws_inner`
+/// 里的 `serve_task.abort()` 处在唯一可达路径之外(`frontend.await??` 的 `?` 会先
+/// 传播,且 `axum::serve` 的 `Ok(())` 分支不可达)。裸等 `?` 传播、或外层任务被 abort
+/// 时,若不额外持有取消句柄,`attach_ws_frontend` spawn 出的前端会脱离外层任务、继续
+/// 接受连接——正是抽取后新出现的那条「abort 不停前端」路径。这个守卫在**所有**离开
+/// 作用域的路径(drop)上 abort 它,把 teardown 钉回可达路径。
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// 把一个 ws 前端挂到一个**已构建**的 hub / 入站 channel / scope 表上。
@@ -145,8 +177,18 @@ where
 /// `axum::serve` 服务该 listener。主循环 `serve(...)` 不在此函数内:调用方用
 /// 同一个 `inbound_rx` 驱动它,故本函数可复用来给已有主循环再挂一个前端。
 ///
-/// 返回 axum 服务任务的 `JoinHandle`:调用方等待它即可在服务失败时拿到 `Err`
-/// (语义同抽取前内联的 `axum::serve(...).await?`)。
+/// 返回值与生命周期契约(**重要**,与抽取前内联 `axum::serve(...).await?` 的语义
+/// 有一处真实差异):
+/// - 返回的 `JoinHandle<anyhow::Result<()>>` 已 spawn 在**独立任务**上。监听错误
+///   (如 `listener.local_addr()` 失败)落在 `JoinHandle` 的 `Result` 里,**不会**
+///   自动冒泡:调用方必须 `await` 并展平(如 `handle.await??`)才能观测到它;
+///   不 await 就完全丢弃该错误。
+/// - 该任务**脱离调用方的生命周期**:tokio 在 `JoinHandle` 被 drop 时**不取消**
+///   任务。因此调用方被 abort 或提前返回,并**不会**停掉已 spawn 的前端——它会
+///   继续 accept 连接。
+/// - 要停掉前端,调用方必须持有取消柄并 abort:直接用返回的 `JoinHandle::abort()`,
+///   或先 `let h = handle.abort_handle();`(再用 `handle.await??` 观测错误)后 abort
+///   `h`。若只是 `await` 到结束,则只在监听器自身出错(罕见)时才收尾。
 pub(crate) fn attach_ws_frontend(
     listener: tokio::net::TcpListener,
     hub: Arc<Broadcaster>,
