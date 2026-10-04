@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { boardJsonPath, parseBoard } from "./superpowersKanbanState";
+import { boardJsonPath, normalizeCard, parseBoard } from "./superpowersKanbanState";
 
 describe("boardJsonPath", () => {
   it("points at board.json inside the state directory", () => {
@@ -125,5 +125,61 @@ describe("parseBoard", () => {
       }),
     );
     expect(cards.map((card) => card.threadId)).toEqual(["t-1", null, null]);
+  });
+});
+
+describe("normalizeCard", () => {
+  it("derives a title from the spec file name", () => {
+    const card = normalizeCard({
+      id: "2026-10-03-board-smoke-spec-2026-10-03-board-smoke-plan",
+      state: "Awaiting_Merge",
+      spec_path: "/p/docs/superpowers/smoke/2026-10-03-board-smoke.spec.md",
+      plan_path: "/p/docs/superpowers/smoke/2026-10-03-board-smoke.plan.md",
+      thread_id: "thread-1",
+      kind: "implementation",
+      order: 2,
+    });
+    expect(card).not.toBeNull();
+    expect(card!.state).toBe("awaiting_merge");
+    expect(card!.title).toBe("2026-10-03-board-smoke");
+    expect(card!.specPath).toBe("/p/docs/superpowers/smoke/2026-10-03-board-smoke.spec.md");
+    expect(card!.threadId).toBe("thread-1");
+    expect(card!.order).toBe(2);
+  });
+
+  it("falls back to the id when there is no spec path", () => {
+    const card = normalizeCard({ id: "bare-id", state: "queued" });
+    expect(card!.title).toBe("bare-id");
+    expect(card!.detail).toBe("");
+  });
+
+  it("prefers spec_path over plan_path for detail", () => {
+    const card = normalizeCard({
+      id: "c", state: "queued", spec_path: "c.spec.md", plan_path: "c.plan.md",
+    });
+    expect(card!.detail).toBe("c.spec.md");
+  });
+
+  it("keeps the merge-card detail fallback (source → base)", () => {
+    const card = normalizeCard({
+      id: "m", state: "merging", kind: "merge", source: "kanban/a", base: "main",
+    });
+    expect(card!.detail).toBe("kanban/a → main");
+  });
+
+  it("carries terminal_at and enqueued_at when the plugin sends them", () => {
+    const card = normalizeCard({
+      id: "c", state: "done", enqueued_at: "2026-10-01T00:00:00+08:00",
+      terminal_at: "2026-10-03T00:00:00+08:00",
+    });
+    expect(card!.enqueuedAt).toBe("2026-10-01T00:00:00+08:00");
+    expect(card!.terminalAt).toBe("2026-10-03T00:00:00+08:00");
+  });
+
+  it("returns null only when id or state is missing", () => {
+    expect(normalizeCard({ state: "queued" })).toBeNull();
+    expect(normalizeCard({ id: "c" })).toBeNull();
+    expect(normalizeCard(null)).toBeNull();
+    expect(normalizeCard("nope")).toBeNull();
   });
 });

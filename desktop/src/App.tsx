@@ -33,8 +33,8 @@ import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanCollapsedBar } from "./components/SuperpowersKanbanCollapsedBar";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
+import { normalizeCard, type BoardCard } from "./lib/superpowersKanbanState";
 import {
-  type BoardCardDto,
   type SwitchSource,
   enqueueBoardCard,
   fetchBoard,
@@ -155,7 +155,7 @@ export default function App() {
   }, [openSubagent]);
   const [boardOn, setBoardOn] = useState(false);
   const [boardSource, setBoardSource] = useState<SwitchSource>("default");
-  const [boardCards, setBoardCards] = useState<BoardCardDto[]>([]);
+  const [boardCards, setBoardCards] = useState<BoardCard[]>([]);
   // The plugin answers every board question, so an unanswered query means it is
   // not installed. Distinct from "installed and empty".
   const [boardPluginMissing, setBoardPluginMissing] = useState(false);
@@ -218,6 +218,8 @@ export default function App() {
   // 看板可以「收起」而不「关闭」：收起后轮询与状态照旧，只是不画面板，
   // 并在原处留一条可展开的横条。收起是纯 UI 选择，不进 store。
   const [boardCollapsed, setBoardCollapsed] = useState(false);
+  // done 列是否展开。纯界面状态：每次打开/切换看板都重置为折叠。
+  const [doneExpanded, setDoneExpanded] = useState(false);
   // 登记了看板的项目（侧栏据此画条目 + 决定右键菜单给创建还是移除）。
   const [boards, setBoards] = useState<string[]>([]);
   // 项目路径 → 摘要。挂在侧栏条目上，扫一眼就知道各项目积压多少。
@@ -275,7 +277,7 @@ export default function App() {
       if (seq !== boardSeq.current) return;
       setBoardOn(sw.on);
       setBoardSource(sw.source);
-      setBoardCards(cards);
+      setBoardCards(cards.map(normalizeCard).filter((c): c is BoardCard => c !== null));
       setBoardPluginMissing(false);
     } catch (error) {
       if (seq !== boardSeq.current) return;
@@ -544,6 +546,7 @@ export default function App() {
     // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
     setBoardError(null);
     setBoardCards([]);
+    setDoneExpanded(false); // 换项目 → 新看板从折叠开始
     setSelectedBoard(path);
     setBoardCollapsed(false);
   };
@@ -1246,11 +1249,17 @@ export default function App() {
               onExpand={() => setBoardCollapsed(false)}
             />
           )}
-          {selectedBoard !== null && !boardCollapsed && (
+          {selectedBoard !== null && !boardCollapsed ? (
             <section
               aria-label="Superpowers 看板"
-              className="flex max-h-[60%] shrink-0 flex-col overflow-y-auto border-b border-neutral-800 bg-neutral-925"
+              className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-neutral-800 bg-neutral-925"
             >
+              {/* 顶栏：项目路径 + 开关/收起/值守 + 入队 + 错误行 */}
+              <div className="flex items-center gap-3 px-4 pt-3">
+                <span className="truncate font-mono text-xs text-fg-muted" title={selectedBoard}>
+                  {selectedBoard}
+                </span>
+              </div>
               <SuperpowersKanbanSettings
                 switchOn={boardOn}
                 source={boardSource}
@@ -1283,17 +1292,37 @@ export default function App() {
               <SuperpowersKanbanView
                 switchOn={boardOn}
                 source={boardSource}
-                cards={boardCards.map((card) => ({
-                  id: card.id,
-                  state: card.state,
-                  progress: card.progress,
-                  detail: card.detail,
-                  threadId: card.thread_id ?? null,
-                }))}
+                cards={boardCards}
                 pluginMissing={boardPluginMissing}
-                onOpenThread={(id) => void selectThread(id)}
+                expandedDone={doneExpanded}
+                onToggleDone={() => setDoneExpanded((v) => !v)}
+                onOpenThread={(id) => {
+                  // 点卡片上的会话链接 = 切到那个会话、离开看板（spec §4.7）：
+                  // 看板是对话的兄弟视图，回去走侧栏，不再盖在会话上。
+                  setSelectedBoard(null);
+                  void selectThread(id);
+                }}
               />
             </section>
+          ) : (
+            <>
+              <ChatView
+                items={current?.session.items ?? []}
+                error={current?.session.lastError ?? null}
+                retrying={current?.session.retrying ?? null}
+              />
+              <MessageInput
+                turnActive={current?.session.turnActive ?? false}
+                onSend={send}
+                onInterrupt={interrupt}
+                mode={current?.mode ?? null}
+                onModeChange={setThreadMode}
+                onSlashCommand={(name, args) => void onSlashCommand(name, args)}
+                value={current?.draft ?? ""}
+                onDraftChange={changeDraft}
+                disabled={current === null}
+              />
+            </>
           )}
           <ApprovalBanner
             items={bannerItems}
@@ -1303,6 +1332,7 @@ export default function App() {
               force((v) => v + 1);
             }}
           />
+          {/* StatusBar 保持无条件渲染：看板只覆盖会话区，状态栏是窗口级的。 */}
           <StatusBar
             cwd={current?.info?.cwd ?? null}
             model={current?.info?.model ?? null}
@@ -1338,22 +1368,6 @@ export default function App() {
                 </button>
               ) : null
             }
-          />
-          <ChatView
-            items={current?.session.items ?? []}
-            error={current?.session.lastError ?? null}
-            retrying={current?.session.retrying ?? null}
-          />
-          <MessageInput
-            turnActive={current?.session.turnActive ?? false}
-            onSend={send}
-            onInterrupt={interrupt}
-            mode={current?.mode ?? null}
-            onModeChange={setThreadMode}
-            onSlashCommand={(name, args) => void onSlashCommand(name, args)}
-            value={current?.draft ?? ""}
-            onDraftChange={changeDraft}
-            disabled={current === null}
           />
           {currentId && openSubagent && (
             <SubagentTrace

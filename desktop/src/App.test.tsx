@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor, cleanup, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
 
 type Mode = "normal" | "yolo";
 type ThreadSeed = { thread_id: string; title: string | null; permission_mode: Mode };
@@ -984,6 +984,33 @@ describe("App 主区域看板", () => {
       const queries = clients[0].requests.filter((r) => r.method === "plugin/query");
       expect(queries.some((r) => (r.params as { project?: string }).project === "/other")).toBe(true);
     });
+  });
+
+  it("点卡片上的会话链接 = 切到那个会话、离开看板（spec §4.7）", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.cards = [{ id: "card-1", state: "queued", progress: null, detail: "/w", thread_id: "t1" }];
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    await screen.findByText("Superpowers 看板");
+
+    // 卡片组件用 thread id 作为按钮文字；点它 = 去看那条会话。
+    fireEvent.click(
+      within(screen.getByLabelText("Superpowers 看板")).getByRole("button", { name: "t1" }),
+    );
+
+    // 看板是会话的兄弟视图：离开看板，回到对话，而不是把看板盖在会话上。
+    await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
+    expect(screen.queryByLabelText("收起看板")).toBeNull();
+    // 会话确实切过去了。
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/resume",
+        params: { threadId: "t1" },
+      }),
+    );
   });
 });
 
