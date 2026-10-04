@@ -23,6 +23,10 @@ daemon 常驻（`yi-agent daemon start`）。daemon 会按清单与开关拉起 
 `superpowers-kanban.toml` 放在 `<项目>/.yi-agent/superpowers-kanban/superpowers-kanban.toml`
 （示例见本目录）。旧名 `kanban.toml` 仍会被读取（迁移期兼容），但**只读不改**。
 
+并发与时间设置也可在桌面「设置 → 插件 → superpowers-kanban」里改：默认并发上限、
+时段窗口（星期/起止/上限）、推进间隔秒数。保存即写入同一个
+`superpowers-kanban.toml`；推进间隔下一个 tick 生效，无需重启插件。
+
 ## 加入看板
 三种入口，写的是同一个投递目录：
 
