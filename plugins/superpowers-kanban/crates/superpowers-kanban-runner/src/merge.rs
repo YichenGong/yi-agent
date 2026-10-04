@@ -42,6 +42,17 @@ pub fn default_branch(project_root: &Path) -> String {
     "main".to_string()
 }
 
+/// `source` 是否已并入 `base`（即 base 是 source 的祖先，或两者相等）。
+pub fn branch_merged_into(project_root: &Path, source: &str, base: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["merge-base", "--is-ancestor", source, base])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub fn source_branch_exists(project_root: &Path, source: &str) -> bool {
     Command::new("git")
         .arg("-C")

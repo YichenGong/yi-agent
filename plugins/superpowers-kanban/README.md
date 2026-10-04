@@ -48,9 +48,17 @@ superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop
 ```
 
 ## 命令行
-`superpowers-kanban <run|add|add-merge|list|on|off|workdir>`——`run` 是 daemon 守护的推进循环，
+`superpowers-kanban <run|add|add-merge|done|archive|purge|list|on|off|workdir>`——`run` 是 daemon 守护的推进循环，
 其余是一次性查询/写入。`workdir` 报告状态目录对应的项目根。
 `run` 每 tick 除消费看板投递外，还会认领一张待合并卡并执行合并（本项目同一时刻只有一张）。
+
+`done <card-id>` 把一张 `awaiting_merge` 的卡结算为 `done`（人工合并后的登记通路，会核对
+推导出的 `kanban/<slug>` 分支是否已并入默认分支并如实打印 `verified` / `branch-missing` /
+`not-merged`，但不据此阻断）；`archive <card-id>|--all-terminal` 归档（隐藏但保留）；
+`purge <card-id>|--all-archived` 真删（**仅限已归档**）。`list` 默认不显示归档卡，`list --all` 显示。
+
+进入真终止态（`done`/`failed`/`cancelled`）的卡超过宽限期（`archive_grace_hours`，默认 24h，
+`0` = 立即）会自动归档；`awaiting_merge`/`needs_you` 永不自动归档。
 
 ## 开关
 `superpowers-kanban on|off` 写**项目层**（`<项目>/.yi-agent/preferences.json`）。
