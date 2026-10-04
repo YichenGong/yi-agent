@@ -25,6 +25,8 @@ export function SettingsDialog({
   onClose,
   remoteCall,
   pluginCall,
+  pluginProjects,
+  pluginDefaultProject,
   relayUrl,
   saveRelayUrl,
 }: {
@@ -36,6 +38,10 @@ export function SettingsDialog({
   remoteCall?: RemoteCall;
   /** 「插件」Tab 的宿主 RPC 接缝（plugins/list、plugin/settings/*）。 */
   pluginCall?: (method: string, params: unknown) => Promise<unknown>;
+  /** 「插件」Tab 可选的配置项目（绝对路径）。 */
+  pluginProjects?: string[];
+  /** 「插件」Tab 首选项目（当前对话的工作目录）。 */
+  pluginDefaultProject?: string;
   /** 中继地址预填。 */
   relayUrl?: string;
   /**
@@ -155,7 +161,11 @@ export function SettingsDialog({
                 saveRelayUrl={saveRelayUrl}
               />
             ) : (
-              <SettingsPluginsTab call={pluginCall} />
+              <SettingsPluginsTab
+                call={pluginCall}
+                projects={pluginProjects ?? []}
+                defaultProject={pluginDefaultProject}
+              />
             )}
           </div>
         </div>

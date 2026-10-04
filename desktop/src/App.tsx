@@ -51,6 +51,7 @@ import {
   summarize,
 } from "./lib/boardIndex";
 import { createBoard, listBoards, removeBoard } from "./lib/superpowersKanbanBoards";
+import { pluginProjectPaths } from "./lib/pluginSettings";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
@@ -1457,6 +1458,11 @@ export default function App() {
         // plugins/list 与 plugin/settings/*。用稳定的 `pluginCall`（见上），
         // 别在这里内联箭头——否则每次 App 渲染都会换新身份，重跑面板的读取。
         pluginCall={pluginCall}
+        // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
+        // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
+        // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。
+        pluginProjects={pluginProjectPaths(workspaces, boards)}
+        pluginDefaultProject={current?.info?.cwd}
         relayUrl={relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
         saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}

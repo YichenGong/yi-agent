@@ -976,11 +976,13 @@ impl std::fmt::Display for BoardQueryError {
 /// shape here: this is a generic channel, so the UI (not the server) owns what a
 /// card or a switch field means.
 ///
-/// The question goes to **`project`'s** daemon, resolved from `project`'s own
-/// runtime socket. Using the app's cwd instead made every query for another
-/// project hit the wrong socket (or none) — the "clicked and nothing happened"
-/// bug. `global` is the board registry that says whether `project` has a board
-/// at all; a project without one has no daemon worth dialing.
+/// `project` is both where the plugin is installed and where its daemon runs:
+/// the manifest lives at `<project>/.yi-agent/supervisors/`, the socket at
+/// `<project>/.yi-agent/runtime/`, and the daemon is the project's own. Using the
+/// app's cwd instead made every query for another project hit the wrong socket
+/// (or none) — the "clicked and nothing happened" bug. `global` is the board
+/// registry that says whether `project` has a board at all; a project without
+/// one has no daemon worth dialing.
 fn plugin_query(
     project: &Path,
     global: &Path,
@@ -1049,13 +1051,18 @@ fn plugin_query(
     }
 }
 
-/// 向本宿主 workdir 的插件问话。
+/// 向插件问一条通用问题（当前是 `plugin/settings/*`）。
 ///
-/// 与 `plugin_query` 的区别：作用域是 app-server 自己的 workdir，不带 `project`，
-/// 也不受看板登记表门控——这是一条通用插件通道，任何插件都能走。宿主只转发
+/// 与 `plugin_query` 的区别：不受看板登记表门控——任何插件都能走；宿主只转发
 /// `method`/`params`，不解释应答。
+///
+/// `scope` 是**要配置的那个项目**（`<项目>/.yi-agent/supervisors/` 放清单、
+/// `<项目>/.yi-agent/runtime/` 放它自己的 daemon socket）。看板按项目安装、由项目
+/// 自己的 daemon 监管，桌面侧车 app-server 的 workdir 却是用户 home：固定用 workdir
+/// 会既找不到清单（读成 `plugin_not_installed`）、又拨不到 socket（读成
+/// `plugin_unavailable`）——这正是「看板跑着、设置页却空着」的根因。
 fn plugin_query_self(
-    workdir: &Path,
+    scope: &Path,
     plugin: &str,
     method: &str,
     params: serde_json::Value,
@@ -1066,7 +1073,7 @@ fn plugin_query_self(
             "plugin/settings needs a `plugin` name",
         ));
     }
-    let summary = list_installed_plugins(workdir)
+    let summary = list_installed_plugins(scope)
         .into_iter()
         .find(|summary| summary.name == plugin);
     let Some(summary) = summary else {
@@ -1081,7 +1088,7 @@ fn plugin_query_self(
             format!("plugin {plugin} does not declare a query socket"),
         ));
     }
-    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(workdir);
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(scope);
     let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| {
         BoardQueryError::new(
             "plugin_unavailable",
@@ -1131,12 +1138,18 @@ pub(crate) struct PluginSummary {
     pub switch_key: String,
 }
 
-/// 列出 `<workdir>/.yi-agent/supervisors/` 下的插件清单。
+/// 列出 `<scope>/.yi-agent/supervisors/` 下的插件清单。
 ///
 /// 纯文件读取：daemon 没起也能列。目录缺失或清单损坏都只是「少一个插件」，
 /// 不是错误——一个坏清单不该让整个设置页打不开。
-pub(crate) fn list_installed_plugins(workdir: &Path) -> Vec<PluginSummary> {
-    let dir = workdir.join(".yi-agent").join("supervisors");
+///
+/// `scope` 由调用方给出：看板插件是**按项目**安装的（清单落在
+/// `<项目>/.yi-agent/supervisors/`），而桌面侧车 app-server 的 workdir 是用户
+/// home。若固定读 workdir，桌面端在 home 下一个插件也看不到——这正是看板跑着、
+/// 设置页却空着的根因。`plugins/list` 因此在调用方给了 `project` 时枚举该项目，
+/// 否则回落到宿主自身 workdir（TUI 与未带 project 的调用保持原语义）。
+pub(crate) fn list_installed_plugins(scope: &Path) -> Vec<PluginSummary> {
+    let dir = scope.join(".yi-agent").join("supervisors");
     yi_agent_supervisors::manifest::load_manifests(&dir)
         .into_iter()
         .map(|manifest| PluginSummary {
@@ -1266,6 +1279,22 @@ fn project_arg(params: &serde_json::Value) -> Option<PathBuf> {
         return None;
     }
     Some(std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw)))
+}
+
+/// 通用插件通道（`plugins/list` / `plugin/settings/*`）的作用域。
+///
+/// 调用方给了非空 `project` 就用它，否则回落到宿主自身 workdir。插件按项目
+/// 安装、由项目自己的 daemon 监管，而桌面侧车的 workdir 是 home，所以设置页
+/// 必须能把作用域指到它要配置的那个项目（清单与 socket 都在它下面）；不传
+/// `project` 的调用方（TUI、旧客户端）保持「宿主 workdir」的原语义。
+fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBuf {
+    params
+        .get("project")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workdir.to_path_buf())
 }
 
 /// Serialize a board value for the wire. A value that cannot serialize is the
@@ -2358,7 +2387,10 @@ where
                     }
                     "plugins/list" => {
                         let workdir = theme_handle.workdir();
-                        let plugins: Vec<serde_json::Value> = list_installed_plugins(workdir)
+                        // 清单按项目安装，故作用域可由调用方的 `project` 指定；
+                        // 缺省回落到宿主 workdir（TUI 与旧客户端）。
+                        let scope = plugin_scope(workdir, &req.params);
+                        let plugins: Vec<serde_json::Value> = list_installed_plugins(&scope)
                             .into_iter()
                             .map(|plugin| {
                                 json!({
@@ -2373,13 +2405,14 @@ where
                     }
                     "plugin/settings/read" => {
                         let workdir = theme_handle.workdir().to_path_buf();
+                        let scope = plugin_scope(&workdir, &req.params);
                         let plugin = req
                             .params
                             .get("plugin")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        match plugin_query_self(&workdir, &plugin, "settings.read", json!({})) {
+                        match plugin_query_self(&scope, &plugin, "settings.read", json!({})) {
                             Ok(value) => write_response(&hub, &client, ok_response(id, value)).await?,
                             Err(error) => {
                                 write_response(
@@ -2393,6 +2426,7 @@ where
                     }
                     "plugin/settings/write" => {
                         let workdir = theme_handle.workdir().to_path_buf();
+                        let scope = plugin_scope(&workdir, &req.params);
                         let plugin = req
                             .params
                             .get("plugin")
@@ -2401,7 +2435,7 @@ where
                             .to_string();
                         let settings = req.params.get("settings").cloned().unwrap_or(json!({}));
                         match plugin_query_self(
-                            &workdir,
+                            &scope,
                             &plugin,
                             "settings.write",
                             json!({ "settings": settings }),
@@ -6324,7 +6358,7 @@ mod plugin_query_tests {
     /// received and replies with one frame carrying `result`, so the test can
     /// prove the host forwards the plugin name, method and params verbatim
     /// without interpreting any of them.
-    fn fake_daemon(
+    pub(super) fn fake_daemon(
         dir: &Path,
         result: serde_json::Value,
     ) -> (
@@ -6578,12 +6612,165 @@ mod plugin_query_tests {
 
 #[cfg(test)]
 mod plugins_tests {
-    use super::list_installed_plugins;
+    use super::{list_installed_plugins, plugin_scope};
+    use serde_json::json;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn an_absent_supervisors_directory_lists_no_plugins() {
         let dir = tempfile::tempdir().unwrap();
         assert!(list_installed_plugins(dir.path()).is_empty());
+    }
+
+    /// 通用插件通道的作用域：给了非空 `project` 就用它，否则回落宿主 workdir。
+    /// 看板按项目安装，桌面侧车 workdir 是 home，这一条是「看板跑着、设置页却
+    /// 空着」能修好的前提。
+    #[test]
+    fn the_plugin_scope_follows_an_explicit_project_and_defaults_to_the_workdir() {
+        let workdir = Path::new("/tmp/yi-agent-host-workdir");
+        assert_eq!(
+            plugin_scope(workdir, &serde_json::json!({})),
+            workdir.to_path_buf()
+        );
+        assert_eq!(
+            plugin_scope(workdir, &serde_json::json!({ "project": "/p/proj" })),
+            PathBuf::from("/p/proj")
+        );
+        // 空/全空白都不算「指定了项目」，回落到 workdir。
+        assert_eq!(
+            plugin_scope(workdir, &serde_json::json!({ "project": "" })),
+            workdir.to_path_buf()
+        );
+        assert_eq!(
+            plugin_scope(workdir, &serde_json::json!({ "project": "   " })),
+            workdir.to_path_buf()
+        );
+    }
+
+    /// 端到端复现并锁死根因：宿主 workdir（= 桌面侧车的 home）下没有清单，所以
+    /// 不带 `project` 的 `plugins/list` 必须为空；带上项目后才能看到该项目里装的
+    /// 看板。修复前第二段断言为空——正是用户看到的现象。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_scoped_plugins_list_finds_a_project_installed_plugin() {
+        use super::tests::{Harness, initialize, test_config};
+
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = home.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+
+        let project = tempfile::tempdir().unwrap();
+        let sup = project.path().join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("superpowers-kanban.json"),
+            r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban","query_socket":"{state_dir}/superpowers-kanban.sock"}"#,
+        )
+        .unwrap();
+
+        // 不带 project：读的是宿主 workdir，这里没有清单。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"plugins/list","params":{}}"#)
+            .await;
+        let bare = read_response(&mut h, 2).await;
+        assert_eq!(
+            bare["result"]["plugins"].as_array().unwrap().len(),
+            0,
+            "宿主 workdir 下不该凭空冒出插件：{bare}"
+        );
+
+        // 带 project：枚举该项目自己的清单，看到看板。
+        h.send(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "plugins/list",
+                "params": { "project": project.path().to_string_lossy() },
+            })
+            .to_string(),
+        )
+        .await;
+        let scoped = read_response(&mut h, 3).await;
+        let plugins = scoped["result"]["plugins"].as_array().unwrap();
+        assert_eq!(plugins.len(), 1, "按项目作用域应看到看板：{scoped}");
+        assert_eq!(plugins[0]["name"], "superpowers-kanban");
+        assert_eq!(plugins[0]["queryable"], true);
+        h.shutdown().await;
+    }
+
+    /// 与 `plugins/list` 同源的根因回归：`plugin/settings/read` 也必须按项目
+    /// 作用域。不带 `project` 时，宿主在 home 下找不到清单，读成
+    /// `plugin_not_installed`（正是用户看到「设置页里没有看板」的那一步）；带上
+    /// 项目后才会拨该项目 daemon 的 socket 并拿回设置。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn project_scoped_settings_read_reaches_the_project_daemon() {
+        use super::plugin_query_tests::fake_daemon;
+        use super::tests::{Harness, initialize, test_config};
+
+        let home = tempfile::tempdir().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = home.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+
+        let project = tempfile::tempdir().unwrap();
+        let sup = project.path().join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("superpowers-kanban.json"),
+            r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban","query_socket":"{state_dir}/superpowers-kanban.sock"}"#,
+        )
+        .unwrap();
+        let (_socket, _seen, handle) = fake_daemon(
+            project.path(),
+            json!({
+                "type": "PluginResult",
+                "value": { "settings": { "default_max_tasks": 3, "interval_secs": 10, "windows": [] } },
+            }),
+        );
+
+        // 不带 project：宿主 workdir（= home）下没有清单 → 读成没装。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"plugin/settings/read","params":{"plugin":"superpowers-kanban"}}"#,
+        )
+        .await;
+        let bare = read_response(&mut h, 2).await;
+        assert_eq!(
+            bare["error"]["data"]["code"], "plugin_not_installed",
+            "home 作用域下不该声称看板已装：{bare}"
+        );
+
+        // 带 project：拨该项目的 daemon，拿回它自己的设置。
+        h.send(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "plugin/settings/read",
+                "params": {
+                    "plugin": "superpowers-kanban",
+                    "project": project.path().to_string_lossy(),
+                },
+            })
+            .to_string(),
+        )
+        .await;
+        let scoped = read_response(&mut h, 3).await;
+        assert_eq!(
+            scoped["result"]["settings"]["interval_secs"], 10,
+            "按项目作用域应读到设置：{scoped}"
+        );
+        handle.join().unwrap();
+        h.shutdown().await;
+    }
+
+    /// 读到 id 匹配的响应，跳过中间的通知帧。
+    async fn read_response(h: &mut super::tests::Harness, id: i64) -> serde_json::Value {
+        loop {
+            let value = h.read_value().await;
+            if value.get("id") == Some(&serde_json::json!(id)) {
+                return value;
+            }
+        }
     }
 
     #[test]
