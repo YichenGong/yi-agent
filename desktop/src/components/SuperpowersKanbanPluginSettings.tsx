@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { formatError } from "../lib/errorMessage";
 import {
   readKanbanSettings,
   writeKanbanSettings,
@@ -15,6 +16,14 @@ const EMPTY_WINDOW: KanbanWindow = {
   all_day: false,
   max_tasks: 3,
 };
+
+/** 数字输入的守卫：清空输入会让 `Number("")` 变成 0，其它乱输入变成 `NaN`。
+ * 两种都不写进 state（保留上一个值），避免保存时送 `NaN`/`0` 出去。 */
+function numericInput(raw: string): number | null {
+  if (raw.trim() === "") return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 /** superpowers-kanban 的插件设置面板：并发窗口 + 推进间隔。 */
 export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
@@ -67,11 +76,25 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
     setBusy(true);
     setError(null);
     try {
-      await writeKanbanSettings(rpc, settings);
+      await writeKanbanSettings(rpcRef.current, settings);
     } catch (e) {
-      setError(pluginErrorKind(e) === "other" ? "保存失败" : "插件未运行，保存失败");
+      // 插件自己拒绝时把它给的理由原样展示；只有「插件真的没在跑」才用
+      // 那句笼统文案。用户输入一概不动（没有乐观更新）。
+      setError(
+        pluginErrorKind(e) === "not_running" ? "插件未运行，保存失败" : formatError(e),
+      );
+      return;
     } finally {
       setBusy(false);
+    }
+    // 写成功后以前端重读的结果为准（规范 §7.3）：插件会规范化（星期压缩、
+    // 时段渲染），不重读显示值会和磁盘分叉。重读失败只报错，绝不用空/旧值
+    // 盖掉用户输入。
+    try {
+      const loaded = await readKanbanSettings(rpcRef.current);
+      setSettings(loaded);
+    } catch (e) {
+      setError(formatError(e));
     }
   };
 
@@ -84,7 +107,10 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
           type="number"
           min={1}
           value={settings.default_max_tasks}
-          onChange={(e) => patch({ default_max_tasks: Number(e.target.value) })}
+          onChange={(e) => {
+            const value = numericInput(e.target.value);
+            if (value !== null) patch({ default_max_tasks: value });
+          }}
         />
       </label>
       <label className="mt-3 flex items-center gap-3 text-sm">
@@ -95,7 +121,10 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
           min={1}
           max={3600}
           value={settings.interval_secs}
-          onChange={(e) => patch({ interval_secs: Number(e.target.value) })}
+          onChange={(e) => {
+            const value = numericInput(e.target.value);
+            if (value !== null) patch({ interval_secs: value });
+          }}
         />
       </label>
 
@@ -142,7 +171,10 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
                   type="number"
                   min={1}
                   value={w.max_tasks}
-                  onChange={(e) => patchWindow(index, { max_tasks: Number(e.target.value) })}
+                  onChange={(e) => {
+                    const value = numericInput(e.target.value);
+                    if (value !== null) patchWindow(index, { max_tasks: value });
+                  }}
                 />
               </td>
               <td>

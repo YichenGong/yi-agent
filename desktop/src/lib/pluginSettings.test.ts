@@ -53,4 +53,12 @@ describe("pluginSettings", () => {
     expect(pluginErrorKind({ data: { code: "plugin_unavailable" } })).toBe("not_running");
     expect(pluginErrorKind(new Error("boom"))).toBe("other");
   });
+
+  it("gives the plugin's own rejection its own kind", () => {
+    expect(pluginErrorKind({ data: { code: "plugin_rejected" } })).toBe("plugin_rejected");
+    // 文本退路也要认出来，免得结构化码缺失时又退回 "other"。
+    expect(
+      pluginErrorKind(new Error("the plugin rejected the query: validation")),
+    ).toBe("plugin_rejected");
+  });
 });

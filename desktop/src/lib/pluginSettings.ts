@@ -54,8 +54,12 @@ export async function writeKanbanSettings(
   await rpc("plugin/settings/write", { plugin: KANBAN_PLUGIN, settings });
 }
 
-/** 插件设置的三种失败，UI 各给一句话。 */
-export type PluginErrorKind = "not_installed" | "not_running" | "other";
+/** 插件设置的四种失败，UI 各给一句话。 */
+export type PluginErrorKind =
+  | "not_installed"
+  | "not_running"
+  | "plugin_rejected"
+  | "other";
 
 /**
  * 读 `data.code`（结构化优先），退路是 message 文本——宿主在补上码之前
@@ -66,6 +70,9 @@ export function pluginErrorKind(error: unknown): PluginErrorKind {
   const code = typeof record?.data?.code === "string" ? record.data.code : "";
   if (code === "plugin_not_installed") return "not_installed";
   if (code === "plugin_unavailable") return "not_running";
+  // 插件自己拒绝（例如设置载荷非法）不等于插件没运行：分开一档，
+  // 面板好把插件给的理由原样展示。
+  if (code === "plugin_rejected") return "plugin_rejected";
   const text =
     typeof record?.message === "string"
       ? record.message
@@ -77,6 +84,9 @@ export function pluginErrorKind(error: unknown): PluginErrorKind {
   }
   if (text.includes("plugin_unavailable") || text.includes("is not available")) {
     return "not_running";
+  }
+  if (text.includes("plugin_rejected") || text.includes("rejected")) {
+    return "plugin_rejected";
   }
   return "other";
 }
