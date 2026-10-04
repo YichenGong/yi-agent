@@ -1271,7 +1271,12 @@ export default function App() {
                 pluginMissing={boardPluginMissing}
                 expandedDone={doneExpanded}
                 onToggleDone={() => setDoneExpanded((v) => !v)}
-                onOpenThread={(id) => void selectThread(id)}
+                onOpenThread={(id) => {
+                  // 点卡片上的会话链接 = 切到那个会话、离开看板（spec §4.7）：
+                  // 看板是对话的兄弟视图，回去走侧栏，不再盖在会话上。
+                  setSelectedBoard(null);
+                  void selectThread(id);
+                }}
               />
             </section>
           ) : (
