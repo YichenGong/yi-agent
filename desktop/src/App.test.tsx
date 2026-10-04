@@ -986,6 +986,53 @@ describe("App 主区域看板", () => {
     });
   });
 
+  it("看板打开时点侧栏另一条会话 → 跳到该会话页，看板消失（无需点收起）", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    render(<App />);
+    // 启动自动选第一条会话（t1），再看板页。
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    await screen.findByText("Superpowers 看板");
+
+    // 点侧栏另一条会话：应当直接跳过去，看板退场。
+    fireEvent.click(screen.getByText("two"));
+
+    await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/resume",
+        params: { threadId: "t2" },
+      }),
+    );
+  });
+
+  it("看板打开时新建会话 → 落到会话页，看板消失", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    // 「+ New thread」在有最近目录时弹菜单，点其中一项即 onNew(path)。
+    state.dataSources["workspace/list"] = () => ({
+      workspaces: [{ path: "/proj", exists: true }],
+    });
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    await screen.findByText("Superpowers 看板");
+
+    fireEvent.click(screen.getByText("+ New thread"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "proj" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(true),
+    );
+    await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
+  });
+
   it("点卡片上的会话链接 = 切到那个会话、离开看板（spec §4.7）", async () => {
     state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
     state.boards = [{ project: "/proj" }];

@@ -409,9 +409,15 @@ export default function App() {
    * resumed once; per-thread isolation means the base session list/sidebar can
    * keep serving other threads in parallel.
    */
-  const selectThread = async (id: string) => {
+  const selectThread = async (id: string, opts?: { leaveBoard?: boolean }) => {
     store.select(id);
     setCurrentId(id);
+    // 会话页成为当前页：离开看板（若正在看）。这样点侧栏任意会话即「跳转」
+    // 过去，不必再点一次「收起看板」。setSelectedBoard 幂等，不在看板时无害。
+    // 仅当这是「用户切到会话」时才是离场：重连后重放选中的那条会话不代表用户
+    // 换了页，此时必须留在看板上（opts.leaveBoard === false），否则一次 sidecar
+    // 重启就会把人从看板踢回会话。
+    if (opts?.leaveBoard !== false) setSelectedBoard(null);
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) setSidebarOpen(false);
     force((v) => v + 1);
@@ -493,6 +499,8 @@ export default function App() {
       store.view(t.thread_id).mode = "normal";
       store.select(t.thread_id);
       setCurrentId(t.thread_id);
+      // 新建会话同样把焦点带回会话页：与点会话一致。
+      setSelectedBoard(null);
       force((v) => v + 1);
       // Remote-only (S2): register the fresh thread in the subscription window
       // *now*. It picks a new id (not previously warm) and gets `warm` below, so
@@ -912,8 +920,9 @@ export default function App() {
         setPinned(list.pinned ?? []);
         store.seed(list.groups.flatMap((g) => g.threads));
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
+        // 重连重放时（新进程记忆为空）不离开看板：这不是用户切换页面的动作。
         const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
-        if (first) await selectThread(first.thread_id);
+        if (first) await selectThread(first.thread_id, { leaveBoard: false });
         // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         attempt = 0;
