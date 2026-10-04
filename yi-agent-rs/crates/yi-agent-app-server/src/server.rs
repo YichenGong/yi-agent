@@ -1104,8 +1104,13 @@ fn plugin_query_self(
     })?;
     match response {
         yi_agent_store::ipc::IpcResponse::PluginResult { value } => Ok(value),
+        // The plugin received the request and answered with its own rejection
+        // (e.g. an invalid settings payload). That is the plugin talking, not
+        // the plugin being gone: `plugin_rejected` keeps the reason apart from
+        // the two genuine unavailability arms above, so the desktop can show
+        // the plugin's message instead of "插件未运行".
         yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(BoardQueryError::new(
-            "plugin_unavailable",
+            "plugin_rejected",
             format!(
                 "the plugin rejected the query: {code:?} {}",
                 message.unwrap_or_default()
@@ -4839,7 +4844,13 @@ async fn run_thread_driver(
         checkpoint(
             &store,
             &thread_id,
-            build_partial(&turn_id, &user_prompt, &[], agent.session().messages().to_vec(), None),
+            build_partial(
+                &turn_id,
+                &user_prompt,
+                &[],
+                agent.session().messages().to_vec(),
+                None,
+            ),
         );
 
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
@@ -6421,6 +6432,45 @@ mod plugin_query_tests {
         );
     }
 
+    /// A daemon that reached the plugin and relayed the plugin's OWN rejection
+    /// (an invalid settings payload, say) is the plugin talking, not the plugin
+    /// being gone. Reporting `plugin_unavailable` here makes the desktop say
+    /// "插件未运行" and discards the plugin's reason; the code must be
+    /// `plugin_rejected`. This is the app-server's own-workdir channel
+    /// (`plugin_query_self`), which is what `plugin/settings/*` dispatch uses.
+    #[test]
+    fn a_plugin_side_rejection_is_not_reported_as_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = dir.path().join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("bad.json"),
+            r#"{"name":"bad","command":"x","switch_key":"bad_on","query_socket":"{state_dir}/bad.sock"}"#,
+        )
+        .unwrap();
+        let (_socket, _seen, handle) = fake_daemon(
+            dir.path(),
+            json!({
+                "type": "Error",
+                "code": "validation",
+                "message": "interval_secs must be in [1, 3600], got 0",
+            }),
+        );
+
+        let error = plugin_query_self(dir.path(), "bad", "settings.write", json!({})).unwrap_err();
+        handle.join().unwrap();
+
+        assert_eq!(error.code, "plugin_rejected", "{error}");
+        assert_ne!(
+            error.code, "plugin_unavailable",
+            "别把拒绝说成没运行:{error}"
+        );
+        assert!(
+            error.message.contains("interval_secs"),
+            "插件的具体理由要带出来:{error}"
+        );
+    }
+
     /// The dispatch mapping the UI actually reads. The numeric code is the
     /// coarse fallback; `data.code` is the stable string, so both have to reach
     /// the wire together.
@@ -7749,10 +7799,18 @@ pub(crate) mod tests {
                 // 工具入参必须是合法 JSON（`{}`），否则 accumulate 会因解析失败报错。
                 let head = futures::stream::iter(vec![
                     E::TextDelta("a".into()),
-                    E::ToolUseStart { id: "t1".into(), name: "noop".into() },
-                    E::ToolUseDelta { id: "t1".into(), partial_json: "{}".into() },
+                    E::ToolUseStart {
+                        id: "t1".into(),
+                        name: "noop".into(),
+                    },
+                    E::ToolUseDelta {
+                        id: "t1".into(),
+                        partial_json: "{}".into(),
+                    },
                     E::ToolUseEnd { id: "t1".into() },
-                    E::Stop { reason: yi_agent_core::provider::StopReason::EndTurn },
+                    E::Stop {
+                        reason: yi_agent_core::provider::StopReason::EndTurn,
+                    },
                 ]);
                 Ok(head.boxed())
             } else {
@@ -7865,8 +7923,9 @@ pub(crate) mod tests {
         _cwd: &std::path::Path,
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
-        let provider: Arc<dyn yi_agent_core::Provider> =
-            Arc::new(CheckpointProvider { calls: AtomicUsize::new(0) });
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CheckpointProvider {
+            calls: AtomicUsize::new(0),
+        });
         let config = yi_agent_core::AgentConfig::default();
         let mut agent = yi_agent_core::Agent::new(
             provider.clone(),
@@ -8285,10 +8344,15 @@ pub(crate) mod tests {
             .join(".yi-agent/threads")
             .join(format!("{tid}.partial.json"));
         for _ in 0..100 {
-            if !partial.exists() { break; }
+            if !partial.exists() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(!partial.exists(), "a finished turn must not leave a checkpoint");
+        assert!(
+            !partial.exists(),
+            "a finished turn must not leave a checkpoint"
+        );
         h.shutdown().await;
     }
 
@@ -10724,8 +10788,14 @@ pub(crate) mod tests {
                 break;
             }
         }
-        assert!(saw_half, "the crashed turn's finished items must be replayed");
-        assert!(interrupted, "a crashed partial turn must be flagged interrupted");
+        assert!(
+            saw_half,
+            "the crashed turn's finished items must be replayed"
+        );
+        assert!(
+            interrupted,
+            "a crashed partial turn must be flagged interrupted"
+        );
         h.shutdown().await;
     }
 
@@ -10821,8 +10891,14 @@ pub(crate) mod tests {
                 break;
             }
         }
-        assert!(saw_half, "the crashed turn's finished items must be replayed");
-        assert!(interrupted, "a crashed partial turn must be flagged interrupted");
+        assert!(
+            saw_half,
+            "the crashed turn's finished items must be replayed"
+        );
+        assert!(
+            interrupted,
+            "a crashed partial turn must be flagged interrupted"
+        );
         assert!(resumed, "resume must respond");
 
         // 第二个 turn：正常走完。它的 turn-start checkpoint 会覆盖盘上的 partial
@@ -10876,7 +10952,10 @@ pub(crate) mod tests {
             1,
             "the crashed turn must not be double-counted: {ids:?}"
         );
-        assert!(!loaded.pending_turn, "promotion must clear the pending flag");
+        assert!(
+            !loaded.pending_turn,
+            "promotion must clear the pending flag"
+        );
         h.shutdown().await;
     }
 
