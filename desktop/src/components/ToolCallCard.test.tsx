@@ -44,4 +44,9 @@ describe("ToolCallCard", () => {
     render(<ToolCallCard item={bash({ command: "ls -la" })} />);
     expect(screen.getByTitle("ls -la")).toBeTruthy();
   });
+
+  it("shows a placeholder when the tool name is empty", () => {
+    render(<ToolCallCard item={bash({ command: "ls -la" }, { name: "" })} />);
+    expect(screen.getByText("(unknown tool)")).toBeTruthy();
+  });
 });

@@ -167,8 +167,21 @@ where
                 on_event(ProviderEvent::TextDelta(s));
             }
             ProviderEvent::ToolUseStart { id, name } => {
+                // Flush any buffered text either way, preserving prior behavior.
                 if !current_text.is_empty() {
                     content.push(ContentBlock::Text(std::mem::take(&mut current_text)));
+                }
+                // A provider may stream an id-less / name-less tool-call
+                // fragment (and never complete it). Such a fragment must never
+                // become a tool call: an empty name resolves to no tool and
+                // would surface as `tool not found: ` with a blank card.
+                if id.is_empty() || name.is_empty() {
+                    tracing::warn!(
+                        ?id,
+                        ?name,
+                        "accumulate_stream: ignoring tool use with empty id or name"
+                    );
+                    continue;
                 }
                 tool_uses.insert(id, (name, String::new()));
             }
@@ -890,5 +903,64 @@ mod tests {
         assert_eq!(u.cache_creation_input_tokens, Some(20));
         assert_eq!(u.cache_read_input_tokens, Some(10));
         assert_eq!(u.input_tokens + u.output_tokens, 150);
+    }
+
+    #[tokio::test]
+    async fn ignores_tool_use_with_empty_name() {
+        let events = vec![
+            ProviderEvent::ToolUseStart {
+                id: String::new(),
+                name: String::new(),
+            },
+            ProviderEvent::ToolUseDelta {
+                id: String::new(),
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ToolUseEnd { id: String::new() },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let stream = futures::stream::iter(events).boxed();
+        let mut seen: Vec<ProviderEvent> = Vec::new();
+        let (content, _end, _usage) =
+            accumulate_stream(stream, |ev| seen.push(ev), None).await.unwrap();
+        assert!(
+            content.iter().all(|b| !matches!(b, ContentBlock::ToolUse { .. })),
+            "empty-name tool use must not enter content: {content:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolUseStart { .. })),
+            "empty-name tool use must not be forwarded: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_tool_use_with_empty_id() {
+        let events = vec![
+            ProviderEvent::ToolUseStart {
+                id: String::new(),
+                name: "read".into(),
+            },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ];
+        let stream = futures::stream::iter(events).boxed();
+        let mut seen: Vec<ProviderEvent> = Vec::new();
+        let (content, _end, _usage) =
+            accumulate_stream(stream, |ev| seen.push(ev), None).await.unwrap();
+        assert!(
+            content.iter().all(|b| !matches!(b, ContentBlock::ToolUse { .. })),
+            "empty-id tool use must not enter content: {content:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|e| matches!(e, ProviderEvent::ToolUseStart { .. })),
+            "empty-id tool use must not be forwarded: {seen:?}"
+        );
     }
 }
