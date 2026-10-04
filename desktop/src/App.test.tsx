@@ -832,30 +832,9 @@ describe("App 主区域看板", () => {
     await openBoardFor("/proj");
 
     expect(await screen.findByText("Superpowers 看板")).toBeTruthy();
-    // 看板展开时提供收起按钮（收起 = 不画面板但保留看板本身）。
-    expect(screen.getByLabelText("收起看板")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "加入看板" })).toBeTruthy();
-  });
-
-  it("看板可收起、并可从收起横条再展开", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    await screen.findByText("Superpowers 看板");
-
-    fireEvent.click(screen.getByLabelText("收起看板"));
-
-    // 收起后：面板与开关都让位给一条横条，且横条仍记得是哪个项目。
-    expect(screen.queryByLabelText("Superpowers 看板开关")).toBeNull();
+    // 收起已删除：离开看板走「点会话」，不再有「收起看板」按钮。
     expect(screen.queryByLabelText("收起看板")).toBeNull();
-    const expand = screen.getByLabelText("展开看板");
-    expect(expand).toBeTruthy();
-
-    fireEvent.click(expand);
-    expect(await screen.findByLabelText("收起看板")).toBeTruthy();
-    expect(screen.getByLabelText("Superpowers 看板开关")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "加入看板" })).toBeTruthy();
   });
 
   it("看板的所有读写都带上该项目的 project", async () => {
@@ -1031,6 +1010,27 @@ describe("App 主区域看板", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/start")).toBe(true),
     );
     await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
+  });
+
+  it("切到会话后点侧栏看板条目 → 看板重新出现", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+    await screen.findByText("Superpowers 看板");
+
+    // 切到另一条会话：离开看板。
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(screen.queryByLabelText("Superpowers 看板")).toBeNull());
+
+    // 再点侧栏的看板条目：看板重新出现。收起已删除，回到看板只有这条入口。
+    fireEvent.click(screen.getByLabelText("看板"));
+    expect(await screen.findByText("Superpowers 看板")).toBeTruthy();
   });
 
   it("点卡片上的会话链接 = 切到那个会话、离开看板（spec §4.7）", async () => {

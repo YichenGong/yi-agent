@@ -30,7 +30,6 @@ import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
 import { nextReconnectDelay } from "./lib/reconnect";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
-import { SuperpowersKanbanCollapsedBar } from "./components/SuperpowersKanbanCollapsedBar";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
 import { normalizeCard, type BoardCard } from "./lib/superpowersKanbanState";
@@ -229,9 +228,6 @@ export default function App() {
   // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
   // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
   const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
-  // 看板可以「收起」而不「关闭」：收起后轮询与状态照旧，只是不画面板，
-  // 并在原处留一条可展开的横条。收起是纯 UI 选择，不进 store。
-  const [boardCollapsed, setBoardCollapsed] = useState(false);
   // done 列是否展开。纯界面状态：每次打开/切换看板都重置为折叠。
   const [doneExpanded, setDoneExpanded] = useState(false);
   // 登记了看板的项目（侧栏据此画条目 + 决定右键菜单给创建还是移除）。
@@ -557,20 +553,20 @@ export default function App() {
     await refreshBoards();
   };
 
-  /** 打开看板只改 selectedBoard，不动 currentId。 */
+  /**
+   * 打开看板只改 selectedBoard，不动 currentId。
+   *
+   * 主区域只有「会话页 / 看板页」两态（见 spec 2026-10-04）：「收起」已被删除，
+   * 离开看板统一走「切到某条会话」（selectThread/newThread 清 selectedBoard）。
+   */
   const onOpenBoard = (path: string) => {
-    // 打开（或重新打开）一个看板一定展开它：从收起横条点进来、或换项目，都是
-    // 「我现在要看这个看板」的意图，不该还停在收起的横条上。
-    if (path === selectedBoard) {
-      setBoardCollapsed(false);
-      return;
-    }
+    // 已经在该看板页：纯 no-op，不重读、不清屏。
+    if (path === selectedBoard) return;
     // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
     setBoardError(null);
     setBoardCards([]);
     setDoneExpanded(false); // 换项目 → 新看板从折叠开始
     setSelectedBoard(path);
-    setBoardCollapsed(false);
   };
 
   /**
@@ -1264,15 +1260,10 @@ export default function App() {
         />
         </div>
         <div className="relative flex min-w-0 flex-1 flex-col">
-          {/* 看板是主区域的一个视图，不是一个常驻列：选中才出现，且问的是
-              被选中那个项目。没有选中时主区域还是原来的对话。 */}
-          {selectedBoard !== null && boardCollapsed && (
-            <SuperpowersKanbanCollapsedBar
-              board={selectedBoard}
-              onExpand={() => setBoardCollapsed(false)}
-            />
-          )}
-          {selectedBoard !== null && !boardCollapsed ? (
+          {/* 看板是主区域的一个平级页面：选中才出现，问的是被选中那个项目。
+              离开看板走「点某条会话」（selectThread/newThread 清 selectedBoard）；
+              没有选中时主区域就是原来的对话。 */}
+          {selectedBoard !== null ? (
             <section
               aria-label="Superpowers 看板"
               className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-neutral-800 bg-neutral-925"
@@ -1287,7 +1278,6 @@ export default function App() {
                 switchOn={boardOn}
                 source={boardSource}
                 onToggle={(next) => void onToggleBoardSwitch(next)}
-                onCollapse={() => setBoardCollapsed(true)}
                 watchmanEnabled={watchmanEnabled}
                 onToggleWatchman={(next) => void onToggleWatchman(next)}
                 watchmanWarning={watchmanWarning}
