@@ -209,6 +209,20 @@ export default function App() {
     [],
   );
 
+  /**
+   * 插件 Tab 的宿主接缝。必须稳定：它只闭合 `clientRef`（一个 ref），所以
+   * 空依赖即可。若每次渲染都换新函数身份，插件面板的加载 effect 会跟着重跑，
+   * 看板的 2 秒轮询就把用户没保存的输入冲掉。
+   */
+  const pluginCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
   // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
   // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
   const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
@@ -1393,10 +1407,9 @@ export default function App() {
           (clientRef.current as RpcClient).request(method, params)
         }
         // 插件 Tab 同样走当前 transport（桌面 stdio = Admin），能调
-        // plugins/list 与 plugin/settings/*。
-        pluginCall={(method, params) =>
-          (clientRef.current as RpcClient).request(method, params)
-        }
+        // plugins/list 与 plugin/settings/*。用稳定的 `pluginCall`（见上），
+        // 别在这里内联箭头——否则每次 App 渲染都会换新身份，重跑面板的读取。
+        pluginCall={pluginCall}
         relayUrl={relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
         saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}

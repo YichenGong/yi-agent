@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   readKanbanSettings,
   writeKanbanSettings,
@@ -22,11 +22,17 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // 接缝进 ref，加载只在挂载时跑一次。宿主每次渲染可能换新的函数身份
+  // （看板 2 秒轮询就在驱动宿主重渲染），若把它写进依赖，读取会反复重跑并用
+  // 服务端值盖掉用户没保存的输入。
+  const rpcRef = useRef(rpc);
+  rpcRef.current = rpc;
+
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const loaded = await readKanbanSettings(rpc);
+        const loaded = await readKanbanSettings(rpcRef.current);
         if (!cancelled) setSettings(loaded);
       } catch (e) {
         if (!cancelled) {
@@ -41,7 +47,8 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
     return () => {
       cancelled = true;
     };
-  }, [rpc]);
+    // 只在挂载时读一次：编辑态不许被外来的重渲染重置。
+  }, []);
 
   if (error && settings === null) {
     return <p role="alert" className="p-4 text-xs text-amber-500">{error}</p>;

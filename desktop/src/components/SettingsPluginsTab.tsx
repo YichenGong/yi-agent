@@ -23,13 +23,15 @@ export function SettingsPluginsTab({ call }: { call?: PluginsCall }) {
   const [plugins, setPlugins] = useState<PluginSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // 接缝在运行时就是 PluginRpc 的形状；这里一次性补回调用方自选返回类型的
+  // 泛型能力，供下面的加载器与面板共用——模块里只保留这一处断言。
+  const rpc = call as PluginRpc;
+
   useEffect(() => {
-    if (!call) {
+    if (!rpc) {
       setPlugins([]);
       return;
     }
-    // 接缝在运行时就是 PluginRpc 的形状；这里补回调用方自选返回类型的泛型能力。
-    const rpc = call as PluginRpc;
     let cancelled = false;
     void (async () => {
       try {
@@ -42,7 +44,7 @@ export function SettingsPluginsTab({ call }: { call?: PluginsCall }) {
     return () => {
       cancelled = true;
     };
-  }, [call]);
+  }, [rpc]);
 
   if (error) {
     return <p role="alert" className="p-4 text-xs text-amber-500">{error}</p>;
@@ -62,7 +64,7 @@ export function SettingsPluginsTab({ call }: { call?: PluginsCall }) {
           <section key={plugin.name} className="p-4">
             <h2 className="text-sm font-medium text-fg">{plugin.name}</h2>
             {Panel ? (
-              <Panel rpc={call as PluginRpc} />
+              <Panel rpc={rpc as PluginRpc} />
             ) : (
               <p className="mt-2 text-xs text-fg-subtle">该插件暂无可配置项</p>
             )}
