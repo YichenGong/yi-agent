@@ -2,6 +2,9 @@
 
 日期：2026-10-03
 状态：设计已定稿，待用户 review 后进入 writing-plans。
+注：§4.7 中「侧栏点任意会话回对话」当时只落地了卡片链接路径，侧栏路径遗漏；「收起看板仍走
+现有 `SuperpowersKanbanCollapsedBar`」一句已作废。二者均由
+`2026-10-04-kanban-board-as-thread-page-design.md` 修正/取代。
 范围：桌面端（`desktop/`）纯前端。不动插件、不动宿主 RPC、不改调度/状态机。
 
 ## 1. 目标与问题
