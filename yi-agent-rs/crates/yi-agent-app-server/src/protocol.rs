@@ -134,13 +134,15 @@ impl RpcError {
     ///
     /// The numeric code is only a coarse fallback for clients that read nothing
     /// else; `data.code` carries the stable vocabulary
-    /// (`board_not_created` / `daemon_unavailable` / `plugin_unavailable`) the
-    /// UI branches on, so a new reason can be added without renumbering.
+    /// (`board_not_created` / `daemon_unavailable` / `plugin_unavailable` /
+    /// `plugin_not_installed`) the UI branches on, so a new reason can be added
+    /// without renumbering.
     pub fn board_query(code: &'static str, message: impl Into<String>) -> Self {
         let numeric = match code {
             "board_not_created" => -32020,
             "daemon_unavailable" => -32021,
             "plugin_unavailable" => -32022,
+            "plugin_not_installed" => -32023,
             _ => -32603,
         };
         Self {

@@ -1049,6 +1049,75 @@ fn plugin_query(
     }
 }
 
+/// 向本宿主 workdir 的插件问话。
+///
+/// 与 `plugin_query` 的区别：作用域是 app-server 自己的 workdir，不带 `project`，
+/// 也不受看板登记表门控——这是一条通用插件通道，任何插件都能走。宿主只转发
+/// `method`/`params`，不解释应答。
+fn plugin_query_self(
+    workdir: &Path,
+    plugin: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, BoardQueryError> {
+    if plugin.is_empty() {
+        return Err(BoardQueryError::new(
+            "invalid_params",
+            "plugin/settings needs a `plugin` name",
+        ));
+    }
+    let summary = list_installed_plugins(workdir)
+        .into_iter()
+        .find(|summary| summary.name == plugin);
+    let Some(summary) = summary else {
+        return Err(BoardQueryError::new(
+            "plugin_not_installed",
+            format!("plugin {plugin} is not installed"),
+        ));
+    };
+    if !summary.queryable {
+        return Err(BoardQueryError::new(
+            "plugin_unavailable",
+            format!("plugin {plugin} does not declare a query socket"),
+        ));
+    }
+    let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(workdir);
+    let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| {
+        BoardQueryError::new(
+            "plugin_unavailable",
+            format!("daemon is unavailable: {error}"),
+        )
+    })?;
+    let response = yi_agent_store::ipc::send_request(
+        &socket,
+        yi_agent_store::ipc::IpcRequest::PluginQuery {
+            plugin: plugin.to_string(),
+            method: method.to_string(),
+            params,
+        },
+    )
+    .map_err(|error| {
+        BoardQueryError::new(
+            "plugin_unavailable",
+            format!("daemon is unavailable: {error}"),
+        )
+    })?;
+    match response {
+        yi_agent_store::ipc::IpcResponse::PluginResult { value } => Ok(value),
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(BoardQueryError::new(
+            "plugin_unavailable",
+            format!(
+                "the plugin rejected the query: {code:?} {}",
+                message.unwrap_or_default()
+            ),
+        )),
+        other => Err(BoardQueryError::new(
+            "plugin_unavailable",
+            format!("daemon returned an unexpected response: {other:?}"),
+        )),
+    }
+}
+
 /// 已装插件的一行。宿主不解释任何插件语义：`name`/`switch_key` 原样来自清单，
 /// `queryable` 只是「该清单声明了 query_socket」。
 pub(crate) struct PluginSummary {
@@ -2296,6 +2365,52 @@ where
                             .collect();
                         write_response(&hub, &client, ok_response(id, json!({ "plugins": plugins })))
                             .await?;
+                    }
+                    "plugin/settings/read" => {
+                        let workdir = theme_handle.workdir().to_path_buf();
+                        let plugin = req
+                            .params
+                            .get("plugin")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        match plugin_query_self(&workdir, &plugin, "settings.read", json!({})) {
+                            Ok(value) => write_response(&hub, &client, ok_response(id, value)).await?,
+                            Err(error) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::board_query(error.code, error.message)),
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                    "plugin/settings/write" => {
+                        let workdir = theme_handle.workdir().to_path_buf();
+                        let plugin = req
+                            .params
+                            .get("plugin")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let settings = req.params.get("settings").cloned().unwrap_or(json!({}));
+                        match plugin_query_self(
+                            &workdir,
+                            &plugin,
+                            "settings.write",
+                            json!({ "settings": settings }),
+                        ) {
+                            Ok(value) => write_response(&hub, &client, ok_response(id, value)).await?,
+                            Err(error) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::board_query(error.code, error.message)),
+                                )
+                                .await?
+                            }
+                        }
                     }
                     "board/create" => {
                         let Some(project) = project_arg(&req.params) else {
@@ -6380,6 +6495,31 @@ mod plugins_tests {
         assert_eq!(plugins[1].name, "superpowers-kanban");
         assert!(plugins[1].queryable);
         assert_eq!(plugins[1].switch_key, "superpowers_kanban");
+    }
+
+    #[test]
+    fn a_plugin_not_in_the_manifests_is_not_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let error =
+            super::plugin_query_self(dir.path(), "ghost", "settings.read", serde_json::json!({}))
+                .unwrap_err();
+        assert_eq!(error.code, "plugin_not_installed", "{error}");
+    }
+
+    #[test]
+    fn an_installed_plugin_without_a_query_socket_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = dir.path().join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("quiet.json"),
+            r#"{"name":"quiet","command":"y","switch_key":"quiet_on"}"#,
+        )
+        .unwrap();
+        let error =
+            super::plugin_query_self(dir.path(), "quiet", "settings.read", serde_json::json!({}))
+                .unwrap_err();
+        assert_eq!(error.code, "plugin_unavailable", "{error}");
     }
 }
 
