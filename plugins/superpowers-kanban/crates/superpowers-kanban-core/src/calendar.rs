@@ -10,6 +10,9 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 10;
 /// interval_secs 的合法上界：一小时。
 const MAX_INTERVAL_SECS: u64 = 3600;
 
+/// 终态卡片的默认归档宽限期（小时）。
+pub const DEFAULT_ARCHIVE_GRACE_HOURS: u32 = 24;
+
 /// 读路径把 `interval_secs` 归一到 `[1, MAX_INTERVAL_SECS]`。
 ///
 /// 写路径（`from_settings_json`）对越界是拒绝；读路径不同——文件可能是手改
@@ -85,6 +88,8 @@ impl ConcurrencyWindow {
 pub struct ConcurrencyCalendar {
     pub default_max_tasks: u16,
     pub interval_secs: u64,
+    /// 真终止态卡片的归档宽限期（小时）。`0` = 立即归档。
+    pub archive_grace_hours: u32,
     pub windows: Vec<ConcurrencyWindow>,
 }
 
@@ -93,6 +98,7 @@ impl Default for ConcurrencyCalendar {
         Self {
             default_max_tasks: DEFAULT_MAX_TASKS,
             interval_secs: DEFAULT_INTERVAL_SECS,
+            archive_grace_hours: DEFAULT_ARCHIVE_GRACE_HOURS,
             windows: Vec::new(),
         }
     }
@@ -120,6 +126,9 @@ impl ConcurrencyCalendar {
         Ok(Self {
             default_max_tasks: file.default_max_tasks.unwrap_or(DEFAULT_MAX_TASKS),
             interval_secs: clamp_interval_secs(file.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS)),
+            archive_grace_hours: file
+                .archive_grace_hours
+                .unwrap_or(DEFAULT_ARCHIVE_GRACE_HOURS),
             windows,
         })
     }
@@ -155,8 +164,8 @@ impl ConcurrencyCalendar {
     /// 语义等价的往返才是目标，不追求与原文件逐字节相同。
     pub fn to_toml(&self) -> String {
         let mut out = format!(
-            "default_max_tasks = {}\ninterval_secs = {}\n",
-            self.default_max_tasks, self.interval_secs
+            "default_max_tasks = {}\ninterval_secs = {}\narchive_grace_hours = {}\n",
+            self.default_max_tasks, self.interval_secs, self.archive_grace_hours
         );
         for window in &self.windows {
             out.push_str("\n[[window]]\n");
@@ -190,6 +199,7 @@ impl ConcurrencyCalendar {
         serde_json::json!({
             "default_max_tasks": self.default_max_tasks,
             "interval_secs": self.interval_secs,
+            "archive_grace_hours": self.archive_grace_hours,
             "windows": windows,
         })
     }
@@ -218,6 +228,14 @@ impl ConcurrencyCalendar {
                 "interval_secs must be in [1, {MAX_INTERVAL_SECS}], got {interval_secs}"
             )));
         }
+        // 归档宽限期：缺省 24h；给了就必须是 u32（越界一律拒绝，与写路径同款）。
+        let archive_grace_hours = match value.get("archive_grace_hours") {
+            None | Some(serde_json::Value::Null) => DEFAULT_ARCHIVE_GRACE_HOURS,
+            Some(raw) => u32::try_from(raw.as_u64().ok_or_else(|| {
+                SettingsError("archive_grace_hours must be a non-negative integer".into())
+            })?)
+            .map_err(|_| SettingsError("archive_grace_hours must fit in u32".into()))?,
+        };
         let raw_windows = value
             .get("windows")
             .and_then(serde_json::Value::as_array)
@@ -232,6 +250,7 @@ impl ConcurrencyCalendar {
         Ok(Self {
             default_max_tasks,
             interval_secs,
+            archive_grace_hours,
             windows,
         })
     }
@@ -260,6 +279,7 @@ fn tracing_fallback(error: &CalendarError, path: &std::path::Path) {
 struct CalendarFile {
     default_max_tasks: Option<u16>,
     interval_secs: Option<u64>,
+    archive_grace_hours: Option<u32>,
     #[serde(default)]
     window: Vec<RawWindow>,
 }
@@ -647,6 +667,17 @@ max_tasks = 99
 
         let huge = ConcurrencyCalendar::from_toml("interval_secs = 99999").unwrap();
         assert_eq!(huge.interval_secs, MAX_INTERVAL_SECS, "超过上界夹到 3600");
+    }
+
+    #[test]
+    fn archive_grace_defaults_to_24_and_can_be_overridden() {
+        assert_eq!(
+            ConcurrencyCalendar::default().archive_grace_hours,
+            DEFAULT_ARCHIVE_GRACE_HOURS
+        );
+        let c = ConcurrencyCalendar::from_toml("default_max_tasks = 3\narchive_grace_hours = 0\n")
+            .unwrap();
+        assert_eq!(c.archive_grace_hours, 0, "0 = 立即归档");
     }
 
     #[test]

@@ -137,11 +137,25 @@ pub struct Card {
     /// 自动派生时指向配对的实现卡。
     #[serde(default)]
     pub origin_card: Option<CardId>,
+    /// 已归档：隐藏但仍保留在 board.json 里。旧状态文件缺字段 → false。
+    #[serde(default)]
+    pub archived: bool,
+    /// 进入终态（done/failed/cancelled）的时刻；供宽限期自动归档判断。
+    #[serde(default)]
+    pub terminal_at: Option<DateTime<Local>>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_card_without_archive_fields_defaults_to_visible_and_no_terminal_time() {
+        let json = r#"{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}"#;
+        let card: Card = serde_json::from_str(json).unwrap();
+        assert!(!card.archived, "旧 board.json 缺字段必须回 false");
+        assert_eq!(card.terminal_at, None);
+    }
 
     #[test]
     fn only_running_occupies_a_slot() {
