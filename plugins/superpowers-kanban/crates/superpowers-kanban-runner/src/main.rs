@@ -1,7 +1,7 @@
 //! Superpowers 看板插件进程入口。
 //!
 //! 用法：
-//! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs 10]`
+//! - `superpowers-kanban run --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]`
 //! - `superpowers-kanban add <spec> <plan> [--state-dir <d>]`——把一对 spec/plan 投进 `inbox`
 //! - `superpowers-kanban add-merge <source> [--base <ref>] [--state-dir <d>]`——投递一张合并卡
 //! - `superpowers-kanban list [--state-dir <d>]`——打印队列与待消费的投递
@@ -34,7 +34,21 @@ struct Args {
     state_dir: PathBuf,
     /// 预建 worktree 的落点。缺省为进程当前目录。
     project_root: PathBuf,
-    interval: Duration,
+    /// 显式 `--interval-secs`。`None` 表示未指定，此时每个 tick 从插件设置读取
+    /// `interval_secs`；只有显式给了才用这里的值覆盖配置。
+    interval: Option<Duration>,
+}
+
+/// 当前 tick 的睡眠周期：显式 CLI > 插件配置 > 默认 10 秒。
+///
+/// 每 tick 重新调用，因此设置界面改了 `interval_secs` 后下一个 tick 即生效，
+/// 无需重启插件进程。
+fn effective_interval(cli: Option<Duration>, state_dir: &std::path::Path) -> Duration {
+    if let Some(cli) = cli {
+        return cli;
+    }
+    let secs = ConcurrencyCalendar::load_preferring_new(state_dir).interval_secs;
+    Duration::from_secs(secs)
 }
 
 /// 默认状态目录：`<cwd>/.yi-agent/superpowers-kanban`，与 supervisor 清单里
@@ -201,7 +215,7 @@ where
     let mut runtime_dir = None;
     let mut state_dir = None;
     let mut project_root = None;
-    let mut interval_secs = 10_u64;
+    let mut interval: Option<Duration> = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -212,9 +226,10 @@ where
                 let value = args
                     .next()
                     .ok_or_else(|| "--interval-secs needs a value".to_string())?;
-                interval_secs = value
+                let secs = value
                     .parse()
                     .map_err(|error| format!("invalid --interval-secs: {error}"))?;
+                interval = Some(Duration::from_secs(secs));
             }
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -227,7 +242,7 @@ where
             None => std::env::current_dir()
                 .map_err(|error| format!("could not read the current directory: {error}"))?,
         },
-        interval: Duration::from_secs(interval_secs),
+        interval,
     })
 }
 
@@ -496,7 +511,7 @@ fn run_daemon(args: Args) {
     loop {
         // 先探 daemon，且必须在开关判断之前：开关关闭的孤儿走 `continue` 分支，
         // 若把探测放在其后，它永远发现不了 daemon 已死，会一直占着单实例锁。
-        // 阈值 3 × 10s ≈ 30s 让位窗口。
+        // 阈值 3 × interval ≈ 让位窗口。
         let alive = daemon.as_ref().is_some_and(|daemon| daemon.is_alive());
         if liveness.observe(alive, 3) {
             eprintln!(
@@ -506,7 +521,7 @@ fn run_daemon(args: Args) {
         }
         if !board_switch(&args.state_dir).is_enabled() {
             // 关掉开关只停止推进，绝不取消已在跑的会话。
-            std::thread::sleep(args.interval);
+            std::thread::sleep(effective_interval(args.interval, &args.state_dir));
             continue;
         }
 
@@ -529,15 +544,15 @@ fn run_daemon(args: Args) {
             Err(error) => eprintln!("superpowers-kanban: merge failed: {error}"),
         }
 
-        std::thread::sleep(args.interval);
+        std::thread::sleep(effective_interval(args.interval, &args.state_dir));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Subcommand, command_add, command_add_merge, command_list, command_set_switch,
-        parse_subcommand,
+        Duration, Subcommand, command_add, command_add_merge, command_list, command_set_switch,
+        effective_interval, parse_subcommand,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -747,5 +762,44 @@ mod tests {
         assert_eq!(calendar.limit_at(at(2026, 10, 1, 3)), 10, "周四凌晨 = 10");
         assert_eq!(calendar.limit_at(at(2026, 10, 3, 12)), 10, "周六全天 = 10");
         assert_eq!(calendar.limit_at(at(2026, 10, 4, 12)), 10, "周日全天 = 10");
+    }
+
+    #[test]
+    fn the_configured_interval_wins_over_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("superpowers-kanban.toml"),
+            "interval_secs = 42\n",
+        )
+        .unwrap();
+        assert_eq!(
+            effective_interval(None, dir.path()),
+            Duration::from_secs(42),
+            "the settings file drives the tick interval"
+        );
+    }
+
+    #[test]
+    fn an_explicit_cli_interval_wins_over_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("superpowers-kanban.toml"),
+            "interval_secs = 42\n",
+        )
+        .unwrap();
+        assert_eq!(
+            effective_interval(Some(Duration::from_secs(5)), dir.path()),
+            Duration::from_secs(5),
+            "an explicit CLI flag is an override"
+        );
+    }
+
+    #[test]
+    fn a_missing_config_falls_back_to_ten() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            effective_interval(None, dir.path()),
+            Duration::from_secs(10)
+        );
     }
 }

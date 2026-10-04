@@ -134,13 +134,16 @@ impl RpcError {
     ///
     /// The numeric code is only a coarse fallback for clients that read nothing
     /// else; `data.code` carries the stable vocabulary
-    /// (`board_not_created` / `daemon_unavailable` / `plugin_unavailable`) the
-    /// UI branches on, so a new reason can be added without renumbering.
+    /// (`board_not_created` / `daemon_unavailable` / `plugin_unavailable` /
+    /// `plugin_not_installed` / `plugin_rejected`) the UI branches on, so a new
+    /// reason can be added without renumbering.
     pub fn board_query(code: &'static str, message: impl Into<String>) -> Self {
         let numeric = match code {
             "board_not_created" => -32020,
             "daemon_unavailable" => -32021,
             "plugin_unavailable" => -32022,
+            "plugin_not_installed" => -32023,
+            "plugin_rejected" => -32024,
             _ => -32603,
         };
         Self {
@@ -432,6 +435,32 @@ mod tests {
         let req: RequestEnvelope = serde_json::from_str(raw).unwrap();
         assert_eq!(req.method, "initialize");
         assert!(matches!(req.id, RequestId::Num(1)));
+    }
+
+    /// `plugin_rejected` is a new reason alongside `plugin_not_installed`; it
+    /// gets its own numeric fallback while every existing mapping stays put.
+    #[test]
+    fn board_query_numbers_each_reason_without_renumbering() {
+        assert_eq!(RpcError::board_query("plugin_rejected", "no").code, -32024);
+        assert_eq!(
+            RpcError::board_query("plugin_not_installed", "no").code,
+            -32023
+        );
+        assert_eq!(
+            RpcError::board_query("plugin_unavailable", "no").code,
+            -32022
+        );
+        assert_eq!(
+            RpcError::board_query("daemon_unavailable", "no").code,
+            -32021
+        );
+        assert_eq!(
+            RpcError::board_query("board_not_created", "no").code,
+            -32020
+        );
+        let unknown = RpcError::board_query("something_else", "no");
+        assert_eq!(unknown.code, -32603);
+        assert_eq!(unknown.data.unwrap()["code"], "something_else");
     }
 
     #[test]

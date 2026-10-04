@@ -22,10 +22,11 @@ const SWITCH_KEY: &str = "superpowers_kanban";
 /// way to read the switch and turn it back on. The plugin gates its own work on
 /// the switch instead (see `run_daemon`), so off still means "stop advancing".
 ///
-/// `--interval-secs 10` matches the plugin's own default: the daemon-liveness
-/// probe reuses this interval, so a small value bounds how long an orphaned
+/// The manifest does not pass `--interval-secs`: the plugin reads its tick
+/// interval from the plugin settings each tick, so a config change takes effect
+/// without a restart, and the plugin's own default bounds how long an orphaned
 /// plugin can hold the single-instance lock before it notices the daemon is
-/// gone (threshold 3 × 10s ≈ 30s).
+/// gone (threshold 3 × interval ≈ 30s at the default).
 const MANIFEST_TEMPLATE: &str = r#"{
   "name": "superpowers-kanban",
   "command": "{command}",
@@ -36,9 +37,7 @@ const MANIFEST_TEMPLATE: &str = r#"{
     "--state-dir",
     "{state_dir}",
     "--project-root",
-    "{workdir}",
-    "--interval-secs",
-    "10"
+    "{workdir}"
   ],
   "switch_key": "superpowers_kanban",
   "stop_when_disabled": false,
@@ -145,7 +144,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         install_manifest(dir.path()).unwrap();
         install_manifest(dir.path()).unwrap();
-        let path = dir.path().join(".yi-agent/supervisors/superpowers-kanban.json");
+        let path = dir
+            .path()
+            .join(".yi-agent/supervisors/superpowers-kanban.json");
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(value["name"], "superpowers-kanban");
@@ -159,7 +160,10 @@ mod tests {
         assert_eq!(value["query_socket"], "{state_dir}/superpowers-kanban.sock");
         let command = value["command"].as_str().unwrap();
         assert!(command.ends_with("superpowers-kanban"), "got {command}");
-        assert!(Path::new(command).is_absolute(), "命令必须绝对路径：{command}");
+        assert!(
+            Path::new(command).is_absolute(),
+            "命令必须绝对路径：{command}"
+        );
     }
 
     #[test]
@@ -178,7 +182,9 @@ mod tests {
     fn the_installed_manifest_expands_to_the_plugin_arguments() {
         let dir = tempfile::tempdir().unwrap();
         install_manifest(dir.path()).unwrap();
-        let path = dir.path().join(".yi-agent/supervisors/superpowers-kanban.json");
+        let path = dir
+            .path()
+            .join(".yi-agent/supervisors/superpowers-kanban.json");
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(
@@ -190,9 +196,7 @@ mod tests {
                 "--state-dir",
                 "{state_dir}",
                 "--project-root",
-                "{workdir}",
-                "--interval-secs",
-                "10"
+                "{workdir}"
             ])
         );
         assert_eq!(value["restart_backoff_ms"], 1000);

@@ -37,6 +37,7 @@ pub enum SlashCommand {
     Mcp,
     Runtime,
     Kanban,
+    Plugins,
 }
 
 impl SlashCommand {
@@ -70,7 +71,8 @@ impl SlashCommand {
             | Self::Compact
             | Self::Config
             | Self::Runtime
-            | Self::Kanban => {
+            | Self::Kanban
+            | Self::Plugins => {
                 return None;
             }
         };
@@ -112,6 +114,7 @@ impl SlashCommand {
             SlashCommand::Mcp => "mcp",
             SlashCommand::Runtime => "runtime",
             SlashCommand::Kanban => "superpowers-kanban",
+            SlashCommand::Plugins => "plugins",
         }
     }
 
@@ -150,6 +153,7 @@ impl SlashCommand {
             SlashCommand::Mcp => "管理 MCP server 开关",
             SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
             SlashCommand::Kanban => "Superpowers 看板：查看 / 开关 / 创建 / 移除本目录的看板",
+            SlashCommand::Plugins => "列出已安装插件 / 查看与设置插件配置",
         }
     }
 
@@ -169,6 +173,7 @@ impl SlashCommand {
             SlashCommand::Priority => Some("<task-id> <level>"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
             SlashCommand::Kanban => Some("[on|off|create|remove|status|run|add <spec> <plan>]"),
+            SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
             SlashCommand::Approve => Some("<request-id> [once|task]"),
             SlashCommand::Deny => Some("<request-id>"),
             SlashCommand::Review => Some("<task-id>"),
@@ -217,6 +222,7 @@ impl SlashCommand {
             SlashCommand::Mcp,
             SlashCommand::Runtime,
             SlashCommand::Kanban,
+            SlashCommand::Plugins,
         ]
     }
 
@@ -258,6 +264,9 @@ impl SlashCommand {
         // `/kanban` 是过渡别名：老名字仍可解析，但规范名是 `/superpowers-kanban`。
         if name == "kanban" {
             return Some(Self::Kanban);
+        }
+        if name == "plugins" {
+            return Some(Self::Plugins);
         }
         Self::all().iter().copied().find(|cmd| cmd.name() == name)
     }
@@ -998,6 +1007,16 @@ mod tests {
             command.description()
         );
         assert!(SlashCommand::all().contains(&SlashCommand::Kanban));
+    }
+
+    #[test]
+    fn plugins_is_a_known_command() {
+        assert_eq!(
+            SlashCommand::from_name("plugins"),
+            Some(SlashCommand::Plugins)
+        );
+        assert!(SlashCommand::all().contains(&SlashCommand::Plugins));
+        assert_eq!(SlashCommand::Plugins.name(), "plugins");
     }
 
     #[test]

@@ -2401,14 +2401,19 @@ fn execute_slash_command(
             let lines = match lifecycle_word {
                 Some(word @ ("create" | "remove" | "status")) => {
                     match yi_agent_boards::global_dir() {
-                        Ok(global) => {
-                            crate::tui::board::handle_board(workdir, &global, word).lines
-                        }
+                        Ok(global) => crate::tui::board::handle_board(workdir, &global, word).lines,
                         Err(error) => vec![format!("无法定位看板登记目录: {error}")],
                     }
                 }
                 _ => crate::tui::superpowers_kanban::handle_kanban(workdir, args).lines,
             };
+            for line in lines {
+                history.push(HistoryCell::Separator { label: Some(line) }, width);
+            }
+            KeyOutcome::None
+        }
+        SlashCommand::Plugins => {
+            let lines = crate::tui::plugins::handle_plugins(workdir, args.as_deref().unwrap_or(""));
             for line in lines {
                 history.push(HistoryCell::Separator { label: Some(line) }, width);
             }

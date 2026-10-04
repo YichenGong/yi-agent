@@ -204,7 +204,7 @@ superpowers-kanban list
 ```
 
 预期：刚投递的卡先显示 `pending (waiting for the next tick)`，
-下一次 tick（默认 60 秒）后变成排队中的卡。
+下一次 tick（默认 10 秒；可在桌面「设置 → 插件 → superpowers-kanban」里改 `推进间隔秒数`）后变成排队中的卡。
 **刚 add 完看到 `pending` 是正常的，不是失败。**
 
 ### 6.4 失败也要能被看见

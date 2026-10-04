@@ -70,6 +70,21 @@ describe("SettingsDialog", () => {
     // 面板互斥：离开「通用」后它的主题按钮不再渲染。
     expect(screen.queryByRole("button", { name: "深色" })).toBeNull();
   });
+
+  it("shows a 插件 tab that reports the empty state", async () => {
+    const pluginCall = async () => ({ plugins: [] });
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        pluginCall={pluginCall}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "插件" }));
+    expect(await screen.findByText("未安装任何插件")).toBeTruthy();
+  });
 });
 
 describe("SettingsDialog focus management & tab wiring", () => {
