@@ -65,6 +65,8 @@ impl Board {
             source_ref: None,
             base_ref: None,
             origin_card: None,
+            archived: false,
+            terminal_at: None,
         });
         &self.cards[index]
     }
@@ -96,6 +98,8 @@ impl Board {
             source_ref: Some(source),
             base_ref: Some(base),
             origin_card: origin,
+            archived: false,
+            terminal_at: None,
         });
         &self.cards[index]
     }
@@ -278,6 +282,9 @@ impl Board {
             });
         }
         card.state = next;
+        if next.is_terminal() && card.terminal_at.is_none() {
+            card.terminal_at = Some(Local::now());
+        }
         Ok(())
     }
 
@@ -298,12 +305,170 @@ impl Board {
         card.order = min_order.saturating_sub(1);
         Ok(())
     }
+
+    /// 归档：隐藏但不删除。拒绝仍在活跃工作的卡（隐藏在跑的卡会打乱对账）。
+    pub fn archive(&mut self, id: &CardId) -> Result<(), TransitionError> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|card| &card.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        if matches!(
+            card.state,
+            CardState::Queued | CardState::Launching | CardState::Running | CardState::Merging
+        ) {
+            return Err(TransitionError::Illegal {
+                from: card.state,
+                to: card.state,
+            });
+        }
+        card.archived = true;
+        Ok(())
+    }
+
+    /// 清除：仅接受已归档的卡；未归档一律拒绝（不可逆，多一道闸）。
+    pub fn purge(&mut self, id: &CardId) -> Result<(), TransitionError> {
+        let index = self
+            .cards
+            .iter()
+            .position(|card| &card.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        if !self.cards[index].archived {
+            return Err(TransitionError::Illegal {
+                from: self.cards[index].state,
+                to: self.cards[index].state,
+            });
+        }
+        self.cards.remove(index);
+        Ok(())
+    }
+
+    /// 清除所有已归档卡，返回数量。
+    pub fn purge_archived(&mut self) -> usize {
+        let before = self.cards.len();
+        self.cards.retain(|card| !card.archived);
+        before - self.cards.len()
+    }
+
+    /// 归档「已到终态且超过宽限期」的卡；返回被归档的 id。非终态永不触碰。
+    pub fn archive_due(&mut self, now: DateTime<Local>, grace: chrono::Duration) -> Vec<CardId> {
+        let mut swept = Vec::new();
+        for card in self.cards.iter_mut() {
+            if card.archived || !card.state.is_terminal() {
+                continue;
+            }
+            let due = card
+                .terminal_at
+                .map(|at| now.signed_duration_since(at) > grace)
+                .unwrap_or(false);
+            if due {
+                card.archived = true;
+                swept.push(card.id.clone());
+            }
+        }
+        swept
+    }
+
+    /// 未归档的卡（`list` 与宿主默认只看这些）。
+    pub fn visible(&self) -> impl Iterator<Item = &Card> {
+        self.cards.iter().filter(|card| !card.archived)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    /// 取到终态的板子（`queued -> running -> awaiting_merge -> done`）。
+    fn terminal_board(ids: &[&str]) -> Board {
+        let mut board = board_with(ids);
+        for id in ids {
+            let card = CardId::new(*id);
+            board.transition(&card, CardState::Running).unwrap();
+            board.transition(&card, CardState::AwaitingMerge).unwrap();
+            board.transition(&card, CardState::Done).unwrap();
+        }
+        board
+    }
+
+    /// 测试用：直接改某卡的 `terminal_at`。
+    fn set_terminal_at(board: &mut Board, id: &CardId, at: chrono::DateTime<Local>) {
+        board
+            .cards
+            .iter_mut()
+            .find(|c| &c.id == id)
+            .unwrap()
+            .terminal_at = Some(at);
+    }
+
+    #[test]
+    fn entering_a_terminal_state_records_terminal_at() {
+        let mut board = board_with(&["a"]);
+        let a = CardId::new("a");
+        board.transition(&a, CardState::Running).unwrap();
+        assert!(
+            board.get(&a).unwrap().terminal_at.is_none(),
+            "running 不是终态"
+        );
+        board.transition(&a, CardState::Cancelled).unwrap();
+        assert!(board.get(&a).unwrap().terminal_at.is_some(), "终态要记时刻");
+    }
+
+    #[test]
+    fn archive_hides_without_removing_and_refuses_active_cards() {
+        let mut board = board_with(&["a", "b"]);
+        let a = CardId::new("a");
+        let b = CardId::new("b");
+        // a 在队列中(活跃) → 拒绝归档
+        assert!(board.archive(&a).is_err(), "queued 卡不该被归档");
+        board.transition(&b, CardState::Running).unwrap();
+        assert!(board.archive(&b).is_err(), "running 卡不该被归档");
+        // b 到终态后可归档，且记录仍在
+        board.transition(&b, CardState::Cancelled).unwrap();
+        board.archive(&b).unwrap();
+        assert!(board.get(&b).unwrap().archived);
+        assert_eq!(board.visible().count(), 1, "归档卡不计入可见");
+    }
+
+    #[test]
+    fn purge_only_accepts_archived_cards() {
+        let mut board = terminal_board(&["a"]);
+        let a = CardId::new("a");
+        assert!(board.purge(&a).is_err(), "未归档不得 purge");
+        board.archive(&a).unwrap();
+        board.purge(&a).unwrap();
+        assert!(board.get(&a).is_none(), "purge 后记录消失");
+    }
+
+    #[test]
+    fn purge_archived_removes_only_archived() {
+        let mut board = terminal_board(&["a", "b"]);
+        board.archive(&CardId::new("a")).unwrap();
+        assert_eq!(board.purge_archived(), 1);
+        assert!(board.get(&CardId::new("a")).is_none());
+        assert!(board.get(&CardId::new("b")).is_some(), "未归档卡保留");
+    }
+
+    #[test]
+    fn archive_due_only_takes_terminal_cards_past_the_grace() {
+        let mut board = board_with(&["a", "b"]);
+        let a = CardId::new("a");
+        let b = CardId::new("b");
+        board.transition(&a, CardState::Running).unwrap();
+        board.transition(&a, CardState::AwaitingMerge).unwrap(); // 非终态，需人决策
+        board.transition(&b, CardState::Running).unwrap();
+        board.transition(&b, CardState::Cancelled).unwrap();
+        set_terminal_at(&mut board, &b, Local::now() - chrono::Duration::days(2));
+
+        let swept = board.archive_due(Local::now(), chrono::Duration::hours(24));
+        assert_eq!(swept, vec![b.clone()], "只有超期终态被归档");
+        assert!(board.get(&b).unwrap().archived);
+        assert!(
+            !board.get(&a).unwrap().archived,
+            "awaiting_merge 永不自动归档"
+        );
+    }
 
     fn at(day: u32, hour: u32) -> chrono::DateTime<Local> {
         Local

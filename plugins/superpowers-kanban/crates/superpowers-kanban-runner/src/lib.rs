@@ -8,8 +8,8 @@ pub mod merge_lock;
 pub mod runner;
 pub mod tick;
 
+pub mod dispatch;
 pub mod persist;
 pub mod service;
 pub mod single_instance;
 pub mod worktree;
-pub mod dispatch;

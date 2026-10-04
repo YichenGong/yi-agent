@@ -118,7 +118,20 @@ superpowers-kanban off     # 停止推进（已在跑的会话不会被取消）
 `on`/`off` 只写**项目层**（`<项目根>/.yi-agent/preferences.json`）。
 想改全局开关请让用户自己改 `~/.yi-agent/preferences.json`，不要代劳。
 
-### 5. 找项目根
+### 5. 确认合并（更新看板进度）
+
+用户说「我合并了这张卡 / 确认合并 / 更新看板进度 / 这张卡可以收了」时：
+
+1. 先确认这张卡确实在 `awaiting_merge`（`superpowers-kanban list`）。
+2. 调 `superpowers-kanban done <card-id>`，把打印的核对结果**原样转述**：
+   - `verified`：推导出的 `kanban/<slug>` 分支存在且已并入默认分支；
+   - `branch-missing`：分支已不存在（多半已合并后删除），按人工确认放行；
+   - `not-merged`：分支存在但**尚未**并入 —— 醒目提示用户再确认。
+3. 说明「卡片已放行，24h 后自动归档；要立刻隐藏可 `superpowers-kanban archive <card-id>`」。
+
+**不要**代替用户执行 `git merge`——合并权归人，这里只登记「已合并」这一事实。
+
+### 6. 找项目根
 
 不确定 `--state-dir` 对应哪个项目根时：
 

@@ -104,6 +104,25 @@ impl BoardService {
         let _ = persist::save_board(&self.board_path(), &inner.board);
     }
 
+    /// 自动归档「已到终态且超过宽限期」的卡；返回被归档的 id。
+    ///
+    /// 宽限期取自项目自己的日历（`archive_grace_hours`，默认 24）。每次 tick 读一次，
+    /// 不缓存进 `Inner`——`Inner` 只放看板与租约，多一个字段要多一处同步。
+    /// **永不**归档 `awaiting_merge`/`needs_you`/`running`/`queued`（`is_terminal` 已排除）。
+    pub fn archive_due(&self, now: DateTime<Local>) -> Vec<CardId> {
+        let hours = superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
+            &self.state_dir,
+        )
+        .archive_grace_hours;
+        let grace = chrono::Duration::hours(hours.min(24 * 30) as i64);
+        let mut inner = self.lock();
+        let swept = inner.board.archive_due(now, grace);
+        if !swept.is_empty() {
+            self.save(&inner);
+        }
+        swept
+    }
+
     /// 认领下一张排队卡：先拿全局槽位租约，再判名额、建 worktree、置 `Launching`。
     ///
     /// 全程在同一把锁内，且认领与持租约是同一件事的两面，所以同一个
@@ -429,7 +448,7 @@ impl BoardService {
     pub fn list(&self) -> Value {
         let inner = self.lock();
         json!({
-            "cards": inner.board.cards().iter().map(|card| json!({
+            "cards": inner.board.visible().map(|card| json!({
                 "id": card.id.0,
                 "state": card.state,
                 "spec_path": card.spec_path,
@@ -589,6 +608,38 @@ mod tests {
         persist::save_board(&state_dir.join("board.json"), &board).unwrap();
         // home 指到临时目录，让 lease 落在隔离目录，不污染真实 HOME。
         BoardService::new(state_dir, dir.to_path_buf(), Some(dir.join("home")))
+    }
+
+    #[test]
+    fn list_hides_archived_cards_but_archive_due_sweeps_terminal_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        let id = superpowers_kanban_core::card::CardId::new("c1");
+        board.enqueue(
+            id.clone(),
+            "c.spec.md".into(),
+            "c.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board
+            .transition(&id, superpowers_kanban_core::card::CardState::Running)
+            .unwrap();
+        board
+            .transition(&id, superpowers_kanban_core::card::CardState::Cancelled)
+            .unwrap();
+        crate::persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+
+        let service = BoardService::new(state_dir.clone(), dir.path().to_path_buf(), None);
+        // 默认宽限 24h；把「现在」推到 3 天后即超期。
+        let swept = service.archive_due(chrono::Local::now() + chrono::Duration::days(3));
+        assert_eq!(swept, vec![id], "超期终态卡被自动归档");
+        assert_eq!(
+            service.list()["cards"].as_array().unwrap().len(),
+            0,
+            "归档卡不出现在 list（宿主/桌面随之不显示）"
+        );
     }
 
     #[test]

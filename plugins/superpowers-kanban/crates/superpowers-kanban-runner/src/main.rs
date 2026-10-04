@@ -73,6 +73,7 @@ enum Subcommand {
     },
     List {
         state_dir: PathBuf,
+        all: bool,
     },
     AddMerge {
         state_dir: PathBuf,
@@ -86,13 +87,31 @@ enum Subcommand {
         state_dir: PathBuf,
         value: SwitchValue,
     },
+    Done {
+        state_dir: PathBuf,
+        card_id: String,
+    },
+    Archive {
+        state_dir: PathBuf,
+        card_id: Option<String>,
+        all_terminal: bool,
+    },
+    Purge {
+        state_dir: PathBuf,
+        card_id: Option<String>,
+        all_archived: bool,
+    },
 }
 
-const USAGE: &str = "usage: superpowers-kanban <run|add|add-merge|list|on|off|workdir> [...]
+const USAGE: &str =
+    "usage: superpowers-kanban <run|add|add-merge|done|archive|purge|list|on|off|workdir> [...]
   run       --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
   add       <spec> <plan> [--state-dir <d>]
   add-merge <source> [--base <ref>] [--state-dir <d>]
-  list      [--state-dir <d>]
+  done      <card-id> [--state-dir <d>]
+  archive   <card-id>|--all-terminal [--state-dir <d>]
+  purge     <card-id>|--all-archived [--state-dir <d>]
+  list      [--all] [--state-dir <d>]
   on|off    [--state-dir <d>]
   workdir   [--state-dir <d>]";
 
@@ -152,8 +171,40 @@ where
         }
         Some("list") => {
             let (state_dir, rest) = parse_state_dir(args)?;
-            ensure_no_leftovers(&rest)?;
-            Ok(Subcommand::List { state_dir })
+            let all = match rest.as_slice() {
+                [] => false,
+                [flag] if flag == "--all" => true,
+                [extra] => return Err(format!("unexpected argument: {extra}")),
+                _ => return Err(format!("list takes at most one --all\n{USAGE}")),
+            };
+            Ok(Subcommand::List { state_dir, all })
+        }
+        Some("done") => {
+            let (state_dir, rest) = parse_state_dir(args)?;
+            let mut rest = rest.into_iter();
+            let card_id = rest
+                .next()
+                .ok_or_else(|| format!("done needs a card id\n{USAGE}"))?;
+            if let Some(extra) = rest.next() {
+                return Err(format!("done takes one card id, got an extra: {extra}"));
+            }
+            Ok(Subcommand::Done { state_dir, card_id })
+        }
+        Some("archive") => {
+            let (state_dir, card_id, all_terminal) = parse_single_or_all(args, "--all-terminal")?;
+            Ok(Subcommand::Archive {
+                state_dir,
+                card_id,
+                all_terminal,
+            })
+        }
+        Some("purge") => {
+            let (state_dir, card_id, all_archived) = parse_single_or_all(args, "--all-archived")?;
+            Ok(Subcommand::Purge {
+                state_dir,
+                card_id,
+                all_archived,
+            })
         }
         Some("workdir") => {
             let (state_dir, rest) = parse_state_dir(args)?;
@@ -199,6 +250,37 @@ where
         Some(dir) => Ok((dir, rest)),
         None => Ok((default_state_dir()?, rest)),
     }
+}
+
+/// `archive`/`purge` 共用：要么一个 card id，要么那个 `--all-*` 开关，互斥。
+fn parse_single_or_all<I>(
+    tokens: I,
+    all_flag: &str,
+) -> Result<(PathBuf, Option<String>, bool), String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let (state_dir, rest) = parse_state_dir(tokens)?;
+    let mut card_id = None;
+    let mut all = false;
+    for token in rest {
+        if token == all_flag {
+            all = true;
+        } else if token.starts_with("--") {
+            return Err(format!("unexpected argument: {token}"));
+        } else if card_id.is_some() {
+            return Err(format!("unexpected argument: {token}"));
+        } else {
+            card_id = Some(token);
+        }
+    }
+    if card_id.is_some() && all {
+        return Err(format!("take either a card id or {all_flag}, not both"));
+    }
+    if card_id.is_none() && !all {
+        return Err(format!("needs a card id or {all_flag}\n{USAGE}"));
+    }
+    Ok((state_dir, card_id, all))
 }
 
 fn ensure_no_leftovers(rest: &[String]) -> Result<(), String> {
@@ -300,21 +382,31 @@ fn command_add_merge(
 
 /// `list`：先落盘的队列，再列出尚未被 runner 消费的投递。
 /// 刚 `add` 完立刻 `list` 必须能看见东西，否则调用方会以为入队失败。
-fn command_list(state_dir: &std::path::Path) -> Result<String, String> {
+fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String> {
     let board = superpowers_kanban_runner::persist::load_board(&state_dir.join("board.json"));
     let mut lines = Vec::new();
-    let queued = board.queued_in_order();
-    if queued.is_empty() && board.is_empty() {
+    // 默认只列未归档卡；`--all` 连归档卡一起列（行尾标 `[archived]`）。
+    let visible: Vec<_> = if all {
+        board.cards().iter().collect()
+    } else {
+        board.visible().collect()
+    };
+    let queued: Vec<_> = visible
+        .iter()
+        .filter(|card| card.state == superpowers_kanban_core::card::CardState::Queued)
+        .map(|card| card.id.clone())
+        .collect();
+    if visible.is_empty() {
         lines.push("no cards on the board".to_string());
     }
     for (position, id) in queued.iter().enumerate() {
         lines.push(format!("{}. {} queued", position + 1, id.0));
     }
     // 非 queued 的卡片（running / done / failed）也列出来，按 id 排序保证稳定。
-    let mut others: Vec<_> = board
-        .cards()
+    let mut others: Vec<_> = visible
         .iter()
         .filter(|card| card.state != superpowers_kanban_core::card::CardState::Queued)
+        .copied()
         .collect();
     others.sort_by(|a, b| a.id.0.cmp(&b.id.0));
     for card in others {
@@ -323,7 +415,11 @@ fn command_list(state_dir: &std::path::Path) -> Result<String, String> {
             .as_ref()
             .map(|path| format!(" @ {}", path.display()))
             .unwrap_or_default();
-        lines.push(format!("{} {:?}{}", card.id.0, card.state, where_));
+        let archived = if card.archived { " [archived]" } else { "" };
+        lines.push(format!(
+            "{} {:?}{}{}",
+            card.id.0, card.state, where_, archived
+        ));
     }
     // 待消费投递。
     let inbox = superpowers_kanban_core::inbox::inbox_dir(state_dir);
@@ -343,6 +439,101 @@ fn command_list(state_dir: &std::path::Path) -> Result<String, String> {
         }
     }
     Ok(lines.join("\n"))
+}
+
+/// `done`：把一张 `awaiting_merge` 的卡结算为 `done`。分支核对结果如实打印，
+/// 但**不**据此阻断——合并权归人，这里只登记「已合并」这一事实。
+fn command_done(
+    state_dir: &std::path::Path,
+    card_id: &str,
+    project_root: &std::path::Path,
+) -> Result<String, String> {
+    use superpowers_kanban_core::card::{CardId, CardState};
+    let path = state_dir.join("board.json");
+    let mut board = superpowers_kanban_runner::persist::load_board(&path);
+    let id = CardId::new(card_id);
+    match board.get(&id) {
+        None => return Err(format!("unknown card: {card_id}")),
+        Some(card) if card.state != CardState::AwaitingMerge => {
+            return Err(format!(
+                "card {card_id} is {:?}, not awaiting_merge",
+                card.state
+            ));
+        }
+        Some(_) => {}
+    }
+    // 核对：推导分支并判是否已并入 base（分支可能已被删除——那时只能采信人工确认）。
+    let source = format!(
+        "kanban/{}",
+        superpowers_kanban_runner::worktree::slugify(&id)
+    );
+    let base = superpowers_kanban_runner::merge::default_branch(project_root);
+    let verdict = if !superpowers_kanban_runner::merge::source_branch_exists(project_root, &source)
+    {
+        "branch-missing"
+    } else if superpowers_kanban_runner::merge::branch_merged_into(project_root, &source, &base) {
+        "verified"
+    } else {
+        "not-merged"
+    };
+    board
+        .transition(&id, CardState::Done)
+        .map_err(|e| e.to_string())?;
+    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "card {card_id} -> done ({verdict}); auto-archives in 24h — \
+         `superpowers-kanban archive {card_id}` to hide it now"
+    ))
+}
+
+/// `archive`：按 id 或 `--all-terminal` 归档（隐藏但保留）。
+fn command_archive(
+    state_dir: &std::path::Path,
+    card_id: Option<&str>,
+    all_terminal: bool,
+) -> Result<String, String> {
+    use superpowers_kanban_core::card::CardId;
+    let path = state_dir.join("board.json");
+    let mut board = superpowers_kanban_runner::persist::load_board(&path);
+    let archived = if all_terminal {
+        let due: Vec<CardId> = board
+            .cards()
+            .iter()
+            .filter(|card| card.state.is_terminal() && !card.archived)
+            .map(|card| card.id.clone())
+            .collect();
+        let count = due.len();
+        for id in due {
+            board.archive(&id).map_err(|e| e.to_string())?;
+        }
+        count
+    } else {
+        let id = CardId::new(card_id.expect("parse guarantees an id or --all-terminal"));
+        board.archive(&id).map_err(|e| e.to_string())?;
+        1
+    };
+    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    Ok(format!("archived {archived} card(s)"))
+}
+
+/// `purge`：按 id 或 `--all-archived` 真删（仅限已归档，不可逆）。
+fn command_purge(
+    state_dir: &std::path::Path,
+    card_id: Option<&str>,
+    all_archived: bool,
+) -> Result<String, String> {
+    use superpowers_kanban_core::card::CardId;
+    let path = state_dir.join("board.json");
+    let mut board = superpowers_kanban_runner::persist::load_board(&path);
+    let removed = if all_archived {
+        board.purge_archived()
+    } else {
+        let id = CardId::new(card_id.expect("parse guarantees an id or --all-archived"));
+        board.purge(&id).map_err(|e| e.to_string())?;
+        1
+    };
+    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    Ok(format!("purged {removed} card(s)"))
 }
 
 /// `on`/`off`：只写项目层。全局层留给人显式设置，避免 CLI 悄悄改全局偏好。
@@ -390,9 +581,23 @@ fn main() {
             let project_root = superpowers_kanban_core::layout::project_root(&state_dir);
             command_add_merge(&state_dir, &source, base.as_deref(), &project_root)
         }
-        Subcommand::List { state_dir } => command_list(&state_dir),
+        Subcommand::List { state_dir, all } => command_list(&state_dir, all),
         Subcommand::Workdir { state_dir } => Ok(project_root(&state_dir).display().to_string()),
         Subcommand::Switch { state_dir, value } => command_set_switch(&state_dir, value),
+        Subcommand::Done { state_dir, card_id } => {
+            let project_root = superpowers_kanban_core::layout::project_root(&state_dir);
+            command_done(&state_dir, &card_id, &project_root)
+        }
+        Subcommand::Archive {
+            state_dir,
+            card_id,
+            all_terminal,
+        } => command_archive(&state_dir, card_id.as_deref(), all_terminal),
+        Subcommand::Purge {
+            state_dir,
+            card_id,
+            all_archived,
+        } => command_purge(&state_dir, card_id.as_deref(), all_archived),
     };
     match outcome {
         Ok(message) => {
@@ -544,6 +749,15 @@ fn run_daemon(args: Args) {
             Err(error) => eprintln!("superpowers-kanban: merge failed: {error}"),
         }
 
+        // 归档：真终止态过宽限期自动隐藏；awaiting_merge/needs_you 永不自动。
+        let swept = service.archive_due(chrono::Local::now());
+        if !swept.is_empty() {
+            eprintln!(
+                "superpowers-kanban: archived {} finished card(s)",
+                swept.len()
+            );
+        }
+
         std::thread::sleep(effective_interval(args.interval, &args.state_dir));
     }
 }
@@ -551,8 +765,8 @@ fn run_daemon(args: Args) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Duration, Subcommand, command_add, command_add_merge, command_list, command_set_switch,
-        effective_interval, parse_subcommand,
+        Duration, Subcommand, command_add, command_add_merge, command_archive, command_done,
+        command_list, command_purge, command_set_switch, effective_interval, parse_subcommand,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -616,7 +830,52 @@ mod tests {
 
     #[test]
     fn list_on_and_off_take_no_positional_arguments() {
-        assert!(matches!(parse(&["list"]), Ok(Subcommand::List { .. })));
+        assert!(matches!(
+            parse(&["list"]),
+            Ok(Subcommand::List { all: false, .. })
+        ));
+        assert!(matches!(
+            parse(&["list", "--all"]),
+            Ok(Subcommand::List { all: true, .. })
+        ));
+
+        // done/archive/purge：id 与 --all-* 互斥，缺参报错。
+        assert!(matches!(
+            parse(&["done", "card-1", "--state-dir", "/s"]),
+            Ok(Subcommand::Done { .. })
+        ));
+        assert!(matches!(
+            parse(&["archive", "card-1"]),
+            Ok(Subcommand::Archive {
+                all_terminal: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["archive", "--all-terminal"]),
+            Ok(Subcommand::Archive {
+                all_terminal: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&["purge", "card-1"]),
+            Ok(Subcommand::Purge { .. })
+        ));
+        assert!(matches!(
+            parse(&["purge", "--all-archived"]),
+            Ok(Subcommand::Purge {
+                all_archived: true,
+                ..
+            })
+        ));
+        assert!(parse(&["done"]).is_err(), "done 缺 id");
+        assert!(parse(&["archive"]).is_err(), "archive 缺 id/开关");
+        assert!(parse(&["archive", "a", "b"]).is_err(), "archive 多参数");
+        assert!(
+            parse(&["purge", "--all-archived", "card-1"]).is_err(),
+            "id 与 --all-archived 互斥"
+        );
         assert!(matches!(
             parse(&["workdir"]),
             Ok(Subcommand::Workdir { .. })
@@ -658,6 +917,155 @@ mod tests {
         );
     }
 
+    /// 真 git 仓库 + 一张处于 `AwaitingMerge` 的实现卡；用于 `done` 的三种核对。
+    fn repo_with_awaiting_card(
+        card_id: &str,
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::{CardId, CardState};
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(project.join("f.txt"), "hi").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+        run(&["branch", "-M", "main"]);
+
+        // 状态目录放在仓库之外：测试里的 `git add -A` 不该把 board.json 提交进去。
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = Board::new();
+        let id = CardId::new(card_id);
+        board.enqueue(
+            id.clone(),
+            "c.spec.md".into(),
+            "c.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board.transition(&id, CardState::Running).unwrap();
+        board.transition(&id, CardState::AwaitingMerge).unwrap();
+        superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
+            .unwrap();
+        (dir, project, state_dir)
+    }
+
+    fn card_state(state_dir: &std::path::Path, card_id: &str) -> String {
+        let board = superpowers_kanban_runner::persist::load_board(&state_dir.join("board.json"));
+        let id = superpowers_kanban_core::card::CardId::new(card_id);
+        let card = board.get(&id).unwrap();
+        format!("{:?}", card.state).to_lowercase()
+    }
+
+    #[test]
+    fn done_settles_an_awaiting_card_and_reports_the_branch_verdict() {
+        let (dir, project, state_dir) = repo_with_awaiting_card("card-1");
+        // 没有推导出的 kanban/<slug> 分支 → branch-missing，但仍放行为 done。
+        let out = command_done(&state_dir, "card-1", &project).unwrap();
+        assert!(out.contains("branch-missing"), "{out}");
+        assert_eq!(card_state(&state_dir, "card-1"), "done");
+        drop(dir);
+    }
+
+    #[test]
+    fn done_verifies_a_branch_that_is_already_merged() {
+        let (dir, project, state_dir) = repo_with_awaiting_card("card-1");
+        // 分支名按 slug 推导；把它建出来并合进 main → verified。
+        let slug = superpowers_kanban_runner::worktree::slugify(
+            &superpowers_kanban_core::card::CardId::new("card-1"),
+        );
+        let branch = format!("kanban/{slug}");
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        run(&["branch", &branch]);
+        let out = command_done(&state_dir, "card-1", &project).unwrap();
+        assert!(out.contains("verified"), "{out}");
+        drop(dir);
+    }
+
+    #[test]
+    fn done_flags_a_branch_that_exists_but_is_not_merged() {
+        let (dir, project, state_dir) = repo_with_awaiting_card("card-1");
+        let slug = superpowers_kanban_runner::worktree::slugify(
+            &superpowers_kanban_core::card::CardId::new("card-1"),
+        );
+        let branch = format!("kanban/{slug}");
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        // 分支上多一个未进 main 的提交 → not-merged（仍放行）。
+        run(&["checkout", "-q", "-b", &branch]);
+        std::fs::write(project.join("g.txt"), "work").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "work"]);
+        run(&["checkout", "-q", "main"]);
+        let out = command_done(&state_dir, "card-1", &project).unwrap();
+        assert!(out.contains("not-merged"), "{out}");
+        drop(dir);
+    }
+
+    #[test]
+    fn done_refuses_a_card_that_is_not_awaiting_merge() {
+        let (dir, project, state_dir) = repo_with_awaiting_card("card-1");
+        command_done(&state_dir, "card-1", &project).unwrap();
+        // 已 done → 再 done 报错，且状态不变。
+        let err = command_done(&state_dir, "card-1", &project).unwrap_err();
+        assert!(err.contains("not awaiting_merge"), "{err}");
+        assert_eq!(card_state(&state_dir, "card-1"), "done");
+        drop(dir);
+    }
+
+    #[test]
+    fn archive_hides_a_terminal_card_and_purge_requires_archiving_first() {
+        let (dir, project, state_dir) = repo_with_awaiting_card("card-1");
+        command_done(&state_dir, "card-1", &project).unwrap();
+        // 未归档不得 purge。
+        assert!(command_purge(&state_dir, Some("card-1"), false).is_err());
+        command_archive(&state_dir, Some("card-1"), false).unwrap();
+        let listing = command_list(&state_dir, false).unwrap();
+        assert!(
+            !listing.contains("card-1"),
+            "归档卡不出现在 list: {listing}"
+        );
+        assert!(
+            command_list(&state_dir, true)
+                .unwrap()
+                .contains("[archived]"),
+            "--all 显示归档标记"
+        );
+        command_purge(&state_dir, Some("card-1"), false).unwrap();
+        assert!(!command_list(&state_dir, true).unwrap().contains("card-1"));
+        drop(dir);
+    }
+
     #[test]
     fn add_delivers_into_the_inbox_and_list_shows_it_as_pending() {
         let dir = tempfile::tempdir().unwrap();
@@ -671,7 +1079,7 @@ mod tests {
         assert!(message.contains("delivered"), "{message}");
 
         // 刚投递、尚未 tick：list 必须报告 pending，否则调用方会以为入队失败。
-        let listing = command_list(dir.path()).unwrap();
+        let listing = command_list(dir.path(), false).unwrap();
         assert!(
             listing.contains("pending"),
             "an unconsumed delivery must be visible immediately: {listing}"
