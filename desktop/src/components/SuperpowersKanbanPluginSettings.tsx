@@ -25,13 +25,24 @@ function numericInput(raw: string): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-/** superpowers-kanban 的插件设置面板：并发窗口 + 推进间隔。 */
-export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
+/** superpowers-kanban 的插件设置面板：并发窗口 + 推进间隔。
+ *
+ * `project` 是这些设置所属的项目（清单与 daemon socket 都在它下面）。切换项目
+ * 必须重新加载；而宿主每次重渲染可能换新的 `rpc` 函数身份（看板 2 秒轮询就在
+ * 驱动宿主重渲染），那是**同一个项目**的刷新，绝不能把用户没保存的输入冲掉。
+ * 两种「重跑」因此分开处理：只以 `project` 为依赖。 */
+export function SuperpowersKanbanPluginSettings({
+  rpc,
+  project,
+}: {
+  rpc: PluginRpc;
+  project?: string;
+}) {
   const [settings, setSettings] = useState<KanbanSettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // 接缝进 ref，加载只在挂载时跑一次。宿主每次渲染可能换新的函数身份
+  // 接缝进 ref，加载只在 `project` 变化时跑。宿主每次渲染可能换新的函数身份
   // （看板 2 秒轮询就在驱动宿主重渲染），若把它写进依赖，读取会反复重跑并用
   // 服务端值盖掉用户没保存的输入。
   const rpcRef = useRef(rpc);
@@ -39,9 +50,11 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
 
   useEffect(() => {
     let cancelled = false;
+    setSettings(null);
+    setError(null);
     void (async () => {
       try {
-        const loaded = await readKanbanSettings(rpcRef.current);
+        const loaded = await readKanbanSettings(rpcRef.current, project);
         if (!cancelled) setSettings(loaded);
       } catch (e) {
         if (!cancelled) {
@@ -56,8 +69,8 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
     return () => {
       cancelled = true;
     };
-    // 只在挂载时读一次：编辑态不许被外来的重渲染重置。
-  }, []);
+    // 只在挂载与切项目时读一次：同项目的重渲染不许重置编辑态。
+  }, [project]);
 
   if (error && settings === null) {
     return <p role="alert" className="p-4 text-xs text-amber-500">{error}</p>;
@@ -76,7 +89,7 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
     setBusy(true);
     setError(null);
     try {
-      await writeKanbanSettings(rpcRef.current, settings);
+      await writeKanbanSettings(rpcRef.current, settings, project);
     } catch (e) {
       // 插件自己拒绝时把它给的理由原样展示；只有「插件真的没在跑」才用
       // 那句笼统文案。用户输入一概不动（没有乐观更新）。
@@ -91,7 +104,7 @@ export function SuperpowersKanbanPluginSettings({ rpc }: { rpc: PluginRpc }) {
     // 时段渲染），不重读显示值会和磁盘分叉。重读失败只报错，绝不用空/旧值
     // 盖掉用户输入。
     try {
-      const loaded = await readKanbanSettings(rpcRef.current);
+      const loaded = await readKanbanSettings(rpcRef.current, project);
       setSettings(loaded);
     } catch (e) {
       setError(formatError(e));
