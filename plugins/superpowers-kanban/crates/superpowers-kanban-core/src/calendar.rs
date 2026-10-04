@@ -10,6 +10,16 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 10;
 /// interval_secs 的合法上界：一小时。
 const MAX_INTERVAL_SECS: u64 = 3600;
 
+/// 读路径把 `interval_secs` 归一到 `[1, MAX_INTERVAL_SECS]`。
+///
+/// 写路径（`from_settings_json`）对越界是拒绝；读路径不同——文件可能是手改
+/// 或旧版写的，`load_preferring_new` 的契约是「绝不 panic，损坏就回退默认」，
+/// 不是「整份作废」。夹进合法区间既守住上界，也避免 `interval_secs = 0` 让
+/// runner 以 `Duration::from_secs(0)` 忙转烧 CPU。
+fn clamp_interval_secs(secs: u64) -> u64 {
+    secs.clamp(1, MAX_INTERVAL_SECS)
+}
+
 /// 设置写路径的校验失败原因。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingsError(String);
@@ -109,7 +119,7 @@ impl ConcurrencyCalendar {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             default_max_tasks: file.default_max_tasks.unwrap_or(DEFAULT_MAX_TASKS),
-            interval_secs: file.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS),
+            interval_secs: clamp_interval_secs(file.interval_secs.unwrap_or(DEFAULT_INTERVAL_SECS)),
             windows,
         })
     }
@@ -625,6 +635,18 @@ max_tasks = 99
     fn a_calendar_without_interval_secs_defaults_to_ten() {
         let calendar = ConcurrencyCalendar::from_toml("default_max_tasks = 3").unwrap();
         assert_eq!(calendar.interval_secs, DEFAULT_INTERVAL_SECS);
+    }
+
+    /// 读路径（runner 每 tick 重读的文件）必须把越界的 `interval_secs` 归一，
+    /// 否则手改的 `0` 会让 runner 以 0 秒睡眠忙转、`> 3600` 被静默接受。
+    /// 写路径仍拒绝越界，见 `from_settings_json_rejects_an_out_of_range_interval`。
+    #[test]
+    fn from_toml_clamps_an_out_of_range_interval() {
+        let zero = ConcurrencyCalendar::from_toml("interval_secs = 0").unwrap();
+        assert_eq!(zero.interval_secs, 1, "0 会忙转，夹到下界");
+
+        let huge = ConcurrencyCalendar::from_toml("interval_secs = 99999").unwrap();
+        assert_eq!(huge.interval_secs, MAX_INTERVAL_SECS, "超过上界夹到 3600");
     }
 
     #[test]
