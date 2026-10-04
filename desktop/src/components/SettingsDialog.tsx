@@ -3,11 +3,13 @@ import type { KeyboardEvent } from "react";
 import type { Theme } from "../lib/theme";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
 import { SettingsRemoteTab, type RemoteCall } from "./SettingsRemoteTab";
+import { SettingsPluginsTab } from "./SettingsPluginsTab";
 
 /** 左侧 Tab 栏。加一个 Tab 只需往这张表里加项，再在下面渲染它的面板。 */
 const TABS = [
   { id: "general", label: "通用" },
   { id: "remote", label: "远程访问" },
+  { id: "plugins", label: "插件" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -22,6 +24,7 @@ export function SettingsDialog({
   onThemeChange,
   onClose,
   remoteCall,
+  pluginCall,
   relayUrl,
   saveRelayUrl,
 }: {
@@ -31,6 +34,8 @@ export function SettingsDialog({
   onClose: () => void;
   /** 「远程访问」Tab 的 RPC 接缝，由宿主注入；缺省时该 Tab 只读。 */
   remoteCall?: RemoteCall;
+  /** 「插件」Tab 的宿主 RPC 接缝（plugins/list、plugin/settings/*）。 */
+  pluginCall?: (method: string, params: unknown) => Promise<unknown>;
   /** 中继地址预填。 */
   relayUrl?: string;
   /**
@@ -143,12 +148,14 @@ export function SettingsDialog({
           >
             {active === "general" ? (
               <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
-            ) : (
+            ) : active === "remote" ? (
               <SettingsRemoteTab
                 call={remoteCall}
                 initialRelayUrl={relayUrl}
                 saveRelayUrl={saveRelayUrl}
               />
+            ) : (
+              <SettingsPluginsTab call={pluginCall} />
             )}
           </div>
         </div>

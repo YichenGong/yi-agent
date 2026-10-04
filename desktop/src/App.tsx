@@ -1392,6 +1392,11 @@ export default function App() {
         remoteCall={(method, params) =>
           (clientRef.current as RpcClient).request(method, params)
         }
+        // 插件 Tab 同样走当前 transport（桌面 stdio = Admin），能调
+        // plugins/list 与 plugin/settings/*。
+        pluginCall={(method, params) =>
+          (clientRef.current as RpcClient).request(method, params)
+        }
         relayUrl={relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
         saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}
