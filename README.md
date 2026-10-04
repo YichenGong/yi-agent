@@ -239,7 +239,7 @@ yi-agent --provider openai --model gpt-4o
 | yi-agent-store | 5 / 6 | [详情](docs/project-management/yi-agent-store.md) |
 | yi-agent-runtime | 11 / 11 | [详情](docs/project-management/yi-agent-runtime.md) |
 | yi-agent-subagent | 6 / 6 | [详情](docs/project-management/yi-agent-subagent.md) |
-| yi-agent-app-server | 29 / 29 | [详情](docs/project-management/yi-agent-app-server.md) |
+| yi-agent-app-server | 30 / 30 | [详情](docs/project-management/yi-agent-app-server.md) |
 | subagent-runtime | 42 / 49 | [详情](docs/project-management/subagent-runtime.md) |
 | desktop | 33 / 46 | [详情](docs/project-management/desktop.md) |
 
