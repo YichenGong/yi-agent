@@ -226,7 +226,7 @@ export default function App() {
   );
 
   // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
-  // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
+  // 展示看板的项目；看板不切换会话，但点某条会话会离开看板（见 selectThread）。
   const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
   // done 列是否展开。纯界面状态：每次打开/切换看板都重置为折叠。
   const [doneExpanded, setDoneExpanded] = useState(false);
@@ -1268,7 +1268,7 @@ export default function App() {
               aria-label="Superpowers 看板"
               className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-neutral-800 bg-neutral-925"
             >
-              {/* 顶栏：项目路径 + 开关/收起/值守 + 入队 + 错误行 */}
+              {/* 顶栏：项目路径 + 开关/值守 + 入队 + 错误行 */}
               <div className="flex items-center gap-3 px-4 pt-3">
                 <span className="truncate font-mono text-xs text-fg-muted" title={selectedBoard}>
                   {selectedBoard}
