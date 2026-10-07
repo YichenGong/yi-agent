@@ -3635,6 +3635,46 @@ where
                             }
                         }
                     }
+                    "thread/diff/read" => {
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone())
+                            .await?
+                        {
+                            continue;
+                        }
+                        // cwd 是 diff 的唯一来源：thread 的 cwd，缺省兜底 cfg.workdir。
+                        let cwd = threads
+                            .get(&thread_id)
+                            .map(|t| t.cwd.clone())
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or_else(|| cfg.workdir.display().to_string());
+                        let repo = Path::new(&cwd);
+                        let base = req.params.get("base").and_then(|v| v.as_str());
+                        let result =
+                            if let Some(commit) = req.params.get("commit").and_then(|v| v.as_str()) {
+                                let (unified_diff, truncated) =
+                                    crate::git_diff::commit_diff(repo, commit);
+                                json!({ "unifiedDiff": unified_diff, "truncated": truncated })
+                            } else if let Some(path) =
+                                req.params.get("path").and_then(|v| v.as_str())
+                            {
+                                let d = crate::git_diff::thread_diff(repo, base);
+                                let (unified_diff, truncated) = crate::git_diff::file_diff(
+                                    repo,
+                                    d.merge_base.as_deref(),
+                                    path,
+                                );
+                                json!({ "unifiedDiff": unified_diff, "truncated": truncated })
+                            } else {
+                                serde_json::to_value(crate::git_diff::thread_diff(repo, base))
+                                    .unwrap_or(json!(null))
+                            };
+                        write_response(&hub, &client, ok_response(id, result)).await?;
+                    }
                     "agent/trace/watch" => {
                         let Some(thread_id) =
                             require_thread_id(&hub, &client, &req.params, id.clone()).await?
@@ -8865,6 +8905,59 @@ pub(crate) mod tests {
         let v = h.read_value().await;
         assert_eq!(v["id"], 9);
         assert_eq!(v["error"]["code"], -32602, "no token, no cancel: {v}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_diff_read_reports_base_and_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_git_repo(dir.path());
+        // init_git_repo 只建空提交；补一个文件再改它，制造「已提交 + 未提交」两段改动。
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-q", "-m", "add a"]] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(dir.path().join("a.txt"), "x\ny\n").unwrap(); // 未提交改动
+
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"thread/diff/read","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        // thread/start 之后流里可能还夹着通知（如 process/updated），故读到 id 7 为止。
+        let mut v = h.read_value().await;
+        while v.get("id") != Some(&serde_json::json!(7)) {
+            v = h.read_value().await;
+        }
+        assert_eq!(v["result"]["files"][0]["path"], "a.txt");
+        assert!(v["result"]["unifiedDiff"].as_str().unwrap().contains("+y"));
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_diff_read_rejects_unknown_thread() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":8,"method":"thread/diff/read","params":{"threadId":"thread-nope"}}"#)
+            .await;
+        let mut v = h.read_value().await;
+        while v.get("id") != Some(&serde_json::json!(8)) {
+            v = h.read_value().await;
+        }
+        assert_eq!(
+            v["error"]["code"], -32011,
+            "unknown thread uses the shared code"
+        );
         h.shutdown().await;
     }
 
