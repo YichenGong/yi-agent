@@ -287,6 +287,15 @@ impl Translator {
             AgentEvent::ToolTimeout { id } => {
                 self.complete_tool(&id, ToolStatus::Failed, None, &mut out);
             }
+            AgentEvent::ModelChanged { model } => {
+                // Design §5.3 step 4: the driver rebuilt the agent around a new
+                // model; surface the authoritative "now using this model" string
+                // so clients can update without polling.
+                out.push(Notification::ModelChanged {
+                    thread_id: self.thread_id.clone(),
+                    model,
+                });
+            }
             AgentEvent::Usage { model, usage } => {
                 self.usage.merge(&model, &usage);
                 out.push(Notification::TokenUsage {
@@ -389,7 +398,6 @@ impl Translator {
             | AgentEvent::AutoCompacting { .. }
             | AgentEvent::ManualCompacted { .. }
             | AgentEvent::ManualCompactFailed { .. }
-            | AgentEvent::ModelChanged { .. }
             | AgentEvent::DecodeDelta(_)
             | AgentEvent::PermissionRequest { .. }
             | AgentEvent::PermissionResolved { .. } => {}

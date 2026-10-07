@@ -195,6 +195,12 @@ pub enum Notification {
         thread_id: String,
         status: ThreadStatus,
     },
+    /// 该会话的生效模型已切换:driver 重建成功后发出。
+    ///
+    /// `model` 是**解析后的生效串**(清单条目的 `model` 字段),而非用户选中的
+    /// 显示名(`model_ref`)——客户端据此显示"当前跑在哪个真实模型上"。
+    #[serde(rename = "thread/modelChanged")]
+    ModelChanged { thread_id: String, model: String },
     #[serde(rename = "item/started")]
     ItemStarted { thread_id: String, item: Item },
     #[serde(rename = "item/delta")]
@@ -304,6 +310,7 @@ impl Notification {
             Notification::ThreadStarted { thread_id, .. }
             | Notification::TurnStarted { thread_id, .. }
             | Notification::ThreadStatusUpdated { thread_id, .. }
+            | Notification::ModelChanged { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
             | Notification::ItemDelta { thread_id, .. }
             | Notification::ItemCompleted { thread_id, .. }
@@ -337,9 +344,9 @@ impl Notification {
     /// 该通知的投递层级。见 [`Delivery`]。
     pub(crate) fn delivery(&self) -> Delivery {
         match self {
-            Notification::ThreadStarted { .. } | Notification::ThreadStatusUpdated { .. } => {
-                Delivery::List
-            }
+            Notification::ThreadStarted { .. }
+            | Notification::ThreadStatusUpdated { .. }
+            | Notification::ModelChanged { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
             | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,
@@ -617,6 +624,18 @@ mod tests {
         assert_eq!(v["params"]["output_tokens"], 3);
         assert_eq!(v["params"]["cache_creation_input_tokens"], 100);
         assert_eq!(v["params"]["cache_read_input_tokens"], 200);
+    }
+
+    #[test]
+    fn model_changed_notification_carries_the_method_and_model() {
+        let n = Notification::ModelChanged {
+            thread_id: "t1".into(),
+            model: "model-b".into(),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/modelChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["model"], "model-b");
     }
 
     #[test]

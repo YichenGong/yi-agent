@@ -376,6 +376,26 @@ impl ThreadStore {
         }
     }
 
+    /// 一次原子写同时落盘会话覆盖(`model_ref`)与**生效串**(`model`)。
+    ///
+    /// 切模型必须让这两个字段同进同出:分两次 `update_meta` 会给并发 `touch` /
+    /// `rename` 留出「ref 已换、生效串还是旧的」的窗口,`thread/list` 便会读到
+    /// 自相矛盾的组合。与 [`set_model_ref`] 共用同一把读-改-写锁与原子写路径;
+    /// 有意保留两份方法(而非让 `set_model_ref` 委托),因为只改 ref 的旧调用
+    /// 语义是「不动生效串」,委托会多读一次 meta 并隐式改写它。
+    /// 返回 `Err(NotFound)` 表示 thread 不存在或 meta 不可读。
+    pub fn set_model(&self, id: &str, model_ref: Option<&str>, model: &str) -> io::Result<()> {
+        let updated = self.update_meta(id, |meta| {
+            meta.model_ref = model_ref.map(str::to_string);
+            meta.model = model.to_string();
+            meta.updated_at = now_millis();
+        })?;
+        match updated {
+            Some(_) => Ok(()),
+            None => Err(io::Error::new(io::ErrorKind::NotFound, "unknown thread")),
+        }
+    }
+
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
     /// `title_hint`(本轮 prompt)填充。thread 不存在或 meta 不可读时静默返回。
     pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<()> {

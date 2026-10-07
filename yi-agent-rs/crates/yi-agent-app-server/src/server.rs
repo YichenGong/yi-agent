@@ -2808,10 +2808,19 @@ where
                         // 抽成局部量避免两处字面量漂移。
                         let mode = crate::thread_store::ThreadMode::Normal;
 
-                        // 本次会话的 `model_ref` 经 thread-local 交给工厂解析。
-                        // Task 7 落地 `thread/start` 的可选请求参数与 meta 持久化;
-                        // 此处先以 `None` 走同一条解析路径(命中清单默认 / 回退 cfg)。
-                        let built = match with_session_model_ref(None, || {
+                        // 可选的会话级模型覆盖(清单显示名)。wire 用 camelCase
+                        // `modelRef`,兼容 snake_case `model_ref`;二者都缺省即
+                        // `None`(跟随清单全局默认,再回退 cfg)。
+                        let model_ref = req
+                            .params
+                            .get("modelRef")
+                            .or_else(|| req.params.get("model_ref"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+
+                        // 本次会话的 `model_ref` 经 thread-local 交给工厂解析 provider /
+                        // api_url / api_key / model(命中清单默认则用条目,否则回退 cfg)。
+                        let built = match with_session_model_ref(model_ref.clone(), || {
                             build_agent(None, Path::new(&cwd), mode)
                         }) {
                             Ok(a) => a,
@@ -2820,6 +2829,16 @@ where
                                 continue;
                             }
                         };
+
+                        // 落盘/上报的生效串用**进程清单**解析,与工厂同一优先级
+                        // (会话覆盖 → 清单全局默认 → cfg),故 reported model 与实际
+                        // 建出的 agent 一致。
+                        let model = yi_agent_runtime::models::resolve_effective(
+                            &cfg,
+                            &yi_agent_runtime::models::load_catalog(),
+                            model_ref.as_deref(),
+                        )
+                        .model;
 
                         // 内核负责「attach_delegation → 建 driver 通道 → insert 到
                         // `threads` → spawn 守望者与 driver」;RPC 层的通知与响应仍在
@@ -2843,12 +2862,13 @@ where
                             &perm_seq,
                             &theme,
                             &workspaces,
+                            model.clone(),
+                            model_ref.clone(),
                             None,
                             None,
                         )
                         .await?;
 
-                        let model = cfg.model.clone();
                         write_notification(&hub, &Notification::ThreadStarted {
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
@@ -2933,11 +2953,15 @@ where
                         } else {
                             loaded.meta.cwd.clone()
                         };
-                        let model = if loaded.meta.model.is_empty() {
-                            cfg.model.clone()
-                        } else {
-                            loaded.meta.model.clone()
-                        };
+                        // 上报的生效串与 `thread/start` 同口径:按该 thread 的 `model_ref`
+                        // 用进程清单解析(会话覆盖 → 清单全局默认 → cfg)。不直接照抄
+                        // meta.model,免得旧库/异常库留下一个与当前清单不一致的陈旧串。
+                        let model = yi_agent_runtime::models::resolve_effective(
+                            &cfg,
+                            &yi_agent_runtime::models::load_catalog(),
+                            loaded.meta.model_ref.as_deref(),
+                        )
+                        .model;
 
                         let mut session = yi_agent_core::Session::new();
                         // 恢复上次用量,使 auto-compact 在 resume 后的首轮即生效。
@@ -3174,6 +3198,102 @@ where
                                 .await?;
                             }
                         }
+                    }
+                    "thread/setModel" => {
+                        // 与 `model/*` 写路径同档:切模型会改 provider/凭据,需 `Control`。
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // `name: null`(或缺失)= 清覆盖;字符串 = 选显示名。非字符串/非
+                        // null 一律 `-32602`,不静默当作清覆盖。
+                        let name = match req.params.get("name") {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(serde_json::Value::String(n)) => Some(n.clone()),
+                            Some(_) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params("name must be a string or null"),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 会话覆盖必须命中清单条目,否则 `model_not_found` 且零副作用。
+                        // 读清单路径走注入的 `models_path`(与 `model/*` 同一份),
+                        // 故 upsert 刚落盘的条目立刻可见。
+                        let catalog = yi_agent_runtime::models::load_catalog_from(&models_path);
+                        if let Some(n) = &name {
+                            if !catalog.models.iter().any(|m| &m.name == n) {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::model_not_found(n)),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                        // 生效串按 清单条目 → 全局默认 → cfg 解析;校验通过后再落盘。
+                        let effective =
+                            yi_agent_runtime::models::resolve_effective(&cfg, &catalog, name.as_deref());
+                        let store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
+                        // 一次原子写把 `model_ref` 与生效 `model` 同进同出,避免
+                        // 并发 `touch` 读到自相矛盾的组合。
+                        if let Err(e) = store.set_model(&thread_id, name.as_deref(), &effective.model) {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            } else {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                            continue;
+                        }
+                        // 交给 driver 在两轮之间用新覆盖重建 agent。冷 thread(不在内存)
+                        // 没有 driver 可发,仅落盘即可——resume 时会按 meta.model_ref 重建。
+                        if let Some(session) = threads.get(&thread_id) {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            if session
+                                .session_tx
+                                .send(SessionCommand::SetModel {
+                                    effective: Box::new(effective.clone()),
+                                    model_ref: name.clone(),
+                                    reply: reply_tx,
+                                })
+                                .await
+                                .is_ok()
+                            {
+                                let _ = reply_rx.await;
+                            }
+                        }
+                        // `thread/list` 读内存里的 `ThreadSession.model`,必须同步刷新,
+                        // 否则列表会继续显示旧模型直到下次 resume。
+                        if let Some(session) = threads.get_mut(&thread_id) {
+                            session.model = effective.model.clone();
+                        }
+                        write_response(
+                            &hub, &client,
+                            ok_response(id, json!({ "ok": true, "model": effective.model })),
+                        )
+                        .await?;
                     }
                     "thread/setPermissionMode" => {
                         let Some(thread_id) =
@@ -4958,6 +5078,22 @@ async fn apply_session_command(
                 rebuilt = rebuilt.with_permission(checker, rx);
             }
             tracing::info!(model = %effective.model, ?model_ref, "session model switched");
+            // Design §5.3 step 4:重建成功后广播本会话的生效模型,让所有订阅该
+            // thread 的客户端(桌面 + 手机)立刻刷新,无需轮询。
+            //
+            // 在此直接广播、而非让 driver 经事件流走 Translator:`SetModel` 只在
+            // **没有 turn 在跑**时经本函数执行,此刻不存在 `agent.run()` 的事件流
+            // 来承载 `AgentEvent::ModelChanged`(translator 仅在本轮 stream 上被
+            // 驱动)。直接广播与「重建完成」同一时刻发生;Translator 侧那条臂保留,
+            // 供将来事件流真的承载该事件时复用。
+            let _ = write_notification(
+                hub,
+                &Notification::ModelChanged {
+                    thread_id: thread_id.to_string(),
+                    model: effective.model.clone(),
+                },
+            )
+            .await;
             let _ = reply.send(Ok(()));
             agent = rebuilt;
         }
@@ -5667,6 +5803,15 @@ where
             self.perm_seq,
             self.theme,
             self.workspaces,
+            // 看板会话不带 model_ref(与工厂的 None 槽位一致):生效串按进程清单
+            // 解析,与 `thread/start` 同口径。
+            yi_agent_runtime::models::resolve_effective(
+                self.cfg,
+                &yi_agent_runtime::models::load_catalog(),
+                None,
+            )
+            .model,
+            None,
             Some(&request.board_project),
             Some(&request.card_id),
         )
@@ -5823,6 +5968,10 @@ async fn start_thread_core(
     perm_seq: &Arc<AtomicU64>,
     theme: &crate::theme_tool::ThemeHandle,
     workspaces: &WorkspaceIndex,
+    // 该会话的生效模型串与覆盖名(由调用方按清单解析后传入),落进 ThreadMeta
+    // 并写进 ThreadSession,与 `thread/start`/`thread/resume` 同一来源。
+    model: String,
+    model_ref: Option<String>,
     board_project: Option<&str>,
     card_id: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -5858,8 +6007,6 @@ async fn start_thread_core(
     let (interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
     let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
 
-    let model = cfg.model.clone();
-
     let now = crate::thread_store::now_millis();
     let meta = crate::thread_store::ThreadMeta {
         thread_id: thread_id.clone(),
@@ -5872,7 +6019,7 @@ async fn start_thread_core(
         pin_seq: None,
         board_project: board_project.map(str::to_string),
         card_id: card_id.map(str::to_string),
-        model_ref: None,
+        model_ref,
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -13541,6 +13688,161 @@ pub(crate) mod tests {
         assert_eq!(
             v["error"]["code"], -32014,
             "writes require Control, Observe must be refused: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 经真实 `model/upsert` 分发把一条模型写进 harness 的隔离清单,返回其响应。
+    async fn upsert_model(
+        h: &mut Harness,
+        id: u64,
+        name: &str,
+        provider: &str,
+        model: &str,
+    ) -> serde_json::Value {
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"model/upsert","params":{{"name":"{name}","provider":"{provider}","api_url":"https://{name}.example","model":"{model}","api_key":"key-{name}"}}}}"#
+        ))
+        .await;
+        read_response(h, id).await
+    }
+
+    /// `thread/setModel` 必须落盘 `model_ref` 与解析出的生效串,并在响应里回生效串;
+    /// 之后 `thread/resume` 从盘上读回的 meta 与之一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_set_model_persists_and_reports_the_effective_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+        assert_eq!(
+            upsert_model(&mut h, 10, "A", "anthropic", "model-a").await["result"]["ok"],
+            true
+        );
+        assert_eq!(
+            upsert_model(&mut h, 11, "B", "openai", "model-b").await["result"]["ok"],
+            true
+        );
+        h.send(r#"{"jsonrpc":"2.0","id":12,"method":"model/setDefault","params":{"name":"A"}}"#)
+            .await;
+        assert_eq!(read_response(&mut h, 12).await["result"]["ok"], true);
+
+        let tid = start_thread(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setModel","params":{{"threadId":"{tid}","name":"B"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 20).await;
+        assert_eq!(v["result"]["ok"], true, "setModel must succeed: {v}");
+        assert_eq!(
+            v["result"]["model"], "model-b",
+            "the response must report the resolved effective model string: {v}"
+        );
+
+        // resume 从盘上回放:meta 必须已带 ref 与生效串。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let _ = read_response(&mut h, 21).await;
+
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("setModel must persist meta");
+        assert_eq!(loaded.meta.model_ref.as_deref(), Some("B"));
+        assert_eq!(loaded.meta.model, "model-b");
+        h.shutdown().await;
+    }
+
+    /// `thread/setModel` 的 `name: null` 清除覆盖:meta 的 `model_ref` 归 `None`,
+    /// 生效串回落到清单全局默认(A)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_set_model_to_null_clears_the_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+        upsert_model(&mut h, 10, "A", "anthropic", "model-a").await;
+        upsert_model(&mut h, 11, "B", "openai", "model-b").await;
+        h.send(r#"{"jsonrpc":"2.0","id":12,"method":"model/setDefault","params":{"name":"A"}}"#)
+            .await;
+        read_response(&mut h, 12).await;
+
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setModel","params":{{"threadId":"{tid}","name":"B"}}}}"#
+        ))
+        .await;
+        assert_eq!(
+            read_response(&mut h, 20).await["result"]["model"],
+            "model-b"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"thread/setModel","params":{{"threadId":"{tid}","name":null}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 21).await;
+        assert_eq!(v["result"]["ok"], true, "clearing must succeed: {v}");
+        assert_eq!(v["result"]["model"], "model-a");
+
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .unwrap()
+            .expect("thread persists");
+        assert_eq!(loaded.meta.model_ref, None, "the override must be cleared");
+        assert_eq!(loaded.meta.model, "model-a");
+        h.shutdown().await;
+    }
+
+    /// 未知的显示名必须回 `model_not_found`,且**零副作用**:meta 不变、会话不中断
+    /// (随后一次合法的 setModel 仍能成功)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_set_model_to_unknown_name_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+        upsert_model(&mut h, 10, "A", "anthropic", "model-a").await;
+        h.send(r#"{"jsonrpc":"2.0","id":11,"method":"model/setDefault","params":{"name":"A"}}"#)
+            .await;
+        read_response(&mut h, 11).await;
+
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setModel","params":{{"threadId":"{tid}","name":"nope"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 20).await;
+        assert_eq!(
+            v["error"]["code"], -32025,
+            "unknown name → model_not_found: {v}"
+        );
+        assert_eq!(v["error"]["data"]["code"], "model_not_found");
+
+        // 零副作用:meta 原样(仍无覆盖、生效串仍是 cfg 兜底)。
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .unwrap()
+            .expect("thread persists");
+        assert_eq!(loaded.meta.model_ref, None);
+        assert_eq!(loaded.meta.model, "test-model");
+
+        // 会话未被拒绝的请求打断:随后一次合法 setModel 仍成功。
+        upsert_model(&mut h, 21, "B", "openai", "model-b").await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":22,"method":"thread/setModel","params":{{"threadId":"{tid}","name":"B"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 22).await;
+        assert_eq!(
+            v["result"]["model"], "model-b",
+            "the session must stay usable: {v}"
         );
         h.shutdown().await;
     }
