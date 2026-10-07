@@ -4,6 +4,7 @@ pub mod broadcast;
 pub(crate) mod card_scheduler;
 pub mod device_store;
 pub(crate) mod git_diff;
+pub mod git_diff_tool;
 pub mod pair_uri;
 pub mod pairing;
 pub mod protocol;
