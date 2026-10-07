@@ -126,7 +126,7 @@ impl SlashCommand {
         match self {
             SlashCommand::Quit => "退出程序",
             SlashCommand::Clear => "清空对话上下文",
-            SlashCommand::Model => "切换模型 (需要参数)",
+            SlashCommand::Model => "查看模型清单 / 切换模型",
             SlashCommand::Cost => "显示 token 使用量",
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
@@ -164,7 +164,7 @@ impl SlashCommand {
         }
         match self {
             SlashCommand::Agents => Some("[--all|--active]"),
-            SlashCommand::Model => Some("<model-name>"),
+            SlashCommand::Model => Some("[<name>|default]"),
             SlashCommand::Agent => Some("<task-id>"),
             SlashCommand::Events | SlashCommand::Diff | SlashCommand::Mailbox => Some("<task-id>"),
             SlashCommand::Message => Some("<task-id> <text>"),
@@ -834,7 +834,7 @@ mod tests {
             (SlashCommand::Agent, "<task-id>"),
             (SlashCommand::Message, "<task-id> <text>"),
             (SlashCommand::Cancel, "<task-id> [--recursive]"),
-            (SlashCommand::Model, "<model-name>"),
+            (SlashCommand::Model, "[<name>|default]"),
         ] {
             assert_eq!(command.argument_usage(), Some(usage));
             assert!(command.needs_arg());
