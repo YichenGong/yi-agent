@@ -2830,15 +2830,12 @@ where
                             }
                         };
 
-                        // 落盘/上报的生效串用**进程清单**解析,与工厂同一优先级
-                        // (会话覆盖 → 清单全局默认 → cfg),故 reported model 与实际
-                        // 建出的 agent 一致。
-                        let model = yi_agent_runtime::models::resolve_effective(
-                            &cfg,
-                            &yi_agent_runtime::models::load_catalog(),
-                            model_ref.as_deref(),
-                        )
-                        .model;
+                        // 落盘/上报的生效串取自**实际建出的 agent**,而非另按清单解析一次。
+                        // `production_factory` 只在进程启动时快照一次清单,运行期经
+                        // `model/upsert` 新增的条目不在其快照内;此处若再读一次磁盘,就可能
+                        // 上报一个工厂实际未采用的模型(任务 7 评审 Finding 1)。用
+                        // `agent.config().model` 才能保证「上报 == 实际运行」。
+                        let model = built.agent.config().model.clone();
 
                         // 内核负责「attach_delegation → 建 driver 通道 → insert 到
                         // `threads` → spawn 守望者与 driver」;RPC 层的通知与响应仍在
@@ -2953,15 +2950,6 @@ where
                         } else {
                             loaded.meta.cwd.clone()
                         };
-                        // 上报的生效串与 `thread/start` 同口径:按该 thread 的 `model_ref`
-                        // 用进程清单解析(会话覆盖 → 清单全局默认 → cfg)。不直接照抄
-                        // meta.model,免得旧库/异常库留下一个与当前清单不一致的陈旧串。
-                        let model = yi_agent_runtime::models::resolve_effective(
-                            &cfg,
-                            &yi_agent_runtime::models::load_catalog(),
-                            loaded.meta.model_ref.as_deref(),
-                        )
-                        .model;
 
                         let mut session = yi_agent_core::Session::new();
                         // 恢复上次用量,使 auto-compact 在 resume 后的首轮即生效。
@@ -2989,6 +2977,12 @@ where
                                 continue;
                             }
                         };
+                        // 与 `thread/start` 同款:上报/落盘的生效串取自**实际建出的 agent**
+                        // (`agent.config().model`),而非按清单再解析一次。工厂持有的是启动时
+                        // 快照,运行期新增的条目会让「另解析一次」与实际运行不一致
+                        // (任务 7 评审 Finding 1);不照抄 meta.model 也是为了让旧库/异常库里
+                        // 一个与当前清单不符的陈旧串被本次实际生效值取代。
+                        let model = built.agent.config().model.clone();
                         let runtime_dir =
                             yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
                         let activation = attach_delegation(
@@ -3248,9 +3242,54 @@ where
                         // 生效串按 清单条目 → 全局默认 → cfg 解析;校验通过后再落盘。
                         let effective =
                             yi_agent_runtime::models::resolve_effective(&cfg, &catalog, name.as_deref());
+                        // 先让在场 driver 用新覆盖重建 agent,成功后再落盘。铁律
+                        // 「上报/落盘 == 实际运行」:若 provider 重建失败(build_provider
+                        // 抛错),agent 仍跑旧模型,此时若已落盘就会让磁盘与响应谎报新模型
+                        // (任务 7 评审 Finding 3)。故先重建、后落盘;失败即回错误且零磁盘
+                        // 副作用,由客户端重试。
+                        //
+                        // 冷 thread(不在内存)没有 driver 可发:只能先落盘,resume 时会按
+                        // meta.model_ref 重建,故跳过本段。
+                        if threads.contains_key(&thread_id) {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            // 借用只活在下面这个块内(send 的 future 借 `session`),
+                            // 出块即释放,后续 `threads.get_mut` 才不被占用。
+                            let send_result = {
+                                let session = threads
+                                    .get(&thread_id)
+                                    .expect("contains_key was just checked");
+                                session
+                                    .session_tx
+                                    .send(SessionCommand::SetModel {
+                                        effective: Box::new(effective.clone()),
+                                        model_ref: name.clone(),
+                                        reply: reply_tx,
+                                    })
+                                    .await
+                            };
+                            // reply 为 `Ok(Err(_))` 表示 driver 重建失败;发送失败(通道关闭)
+                            // 同样意味着无法保证生效,一并按失败处理。
+                            let switched =
+                                send_result.is_ok() && matches!(reply_rx.await, Ok(Ok(())));
+                            if !switched {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::internal(
+                                            "the live session could not switch to the requested \
+                                             model; it is still running the previous one"
+                                                .to_string(),
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                        // 重建成功后(冷 thread 则直接)落盘:一次原子写把 `model_ref` 与
+                        // 生效 `model` 同进同出,避免并发 `touch` 读到自相矛盾的组合。
                         let store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
-                        // 一次原子写把 `model_ref` 与生效 `model` 同进同出,避免
-                        // 并发 `touch` 读到自相矛盾的组合。
                         if let Err(e) = store.set_model(&thread_id, name.as_deref(), &effective.model) {
                             if e.kind() == std::io::ErrorKind::NotFound {
                                 write_response(
@@ -3267,25 +3306,11 @@ where
                             }
                             continue;
                         }
-                        // 交给 driver 在两轮之间用新覆盖重建 agent。冷 thread(不在内存)
-                        // 没有 driver 可发,仅落盘即可——resume 时会按 meta.model_ref 重建。
-                        if let Some(session) = threads.get(&thread_id) {
-                            let (reply_tx, reply_rx) = oneshot::channel();
-                            if session
-                                .session_tx
-                                .send(SessionCommand::SetModel {
-                                    effective: Box::new(effective.clone()),
-                                    model_ref: name.clone(),
-                                    reply: reply_tx,
-                                })
-                                .await
-                                .is_ok()
-                            {
-                                let _ = reply_rx.await;
-                            }
-                        }
-                        // `thread/list` 读内存里的 `ThreadSession.model`,必须同步刷新,
-                        // 否则列表会继续显示旧模型直到下次 resume。
+                        // 让内存里的 `ThreadSession.model` 与实际生效值保持一致。注意:
+                        // `thread/list(All)` 目前是从**盘上 meta**(`thread_summary_json`)
+                        // 渲染 model 的,`ThreadSession.model` 在当前 crate 内尚无读取方;
+                        // 这里仍同步刷新,是为了让内存视图与刚落盘的 meta 同源、不残留旧串
+                        // (供将来的读取方或排查时使用),而不是因为 list 会读它。
                         if let Some(session) = threads.get_mut(&thread_id) {
                             session.model = effective.model.clone();
                         }
@@ -5781,6 +5806,9 @@ where
             Path::new(&request.workdir),
             crate::thread_store::ThreadMode::Yolo,
         )?;
+        // 生效串取自实际建出的 agent,与 `thread/start`/`thread/resume` 同口径,避免
+        // 工厂快照与另读磁盘不一致而上报一个未真正采用的模型。
+        let model = built.agent.config().model.clone();
 
         let hub = Arc::clone(self.hub);
         let client = crate::broadcast::ClientId::local();
@@ -5803,14 +5831,9 @@ where
             self.perm_seq,
             self.theme,
             self.workspaces,
-            // 看板会话不带 model_ref(与工厂的 None 槽位一致):生效串按进程清单
-            // 解析,与 `thread/start` 同口径。
-            yi_agent_runtime::models::resolve_effective(
-                self.cfg,
-                &yi_agent_runtime::models::load_catalog(),
-                None,
-            )
-            .model,
+            // 看板会话不带 model_ref;生效串取自上面实际建出的 agent,与
+            // `thread/start`/`thread/resume` 同口径。
+            model,
             None,
             Some(&request.board_project),
             Some(&request.card_id),
@@ -7764,6 +7787,12 @@ pub(crate) mod tests_support {
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use yi_agent_runtime::config::RuntimeConfig;
 
+    /// 测试夹具的占位模型名。`test_config()` 用它作 `cfg.model`,`mod tests` 的
+    /// mock 工厂也用它作 `agent.config().model`,二者必须同值——`thread/start`/
+    /// `thread/resume` 以上报 agent 实际模型为准(任务 7 评审 Finding 1),夹具若
+    /// 不一致会凭空造出「上报 != 运行」的假象。
+    pub(crate) const TEST_MODEL: &str = "test-model";
+
     /// 对一条已连接的 ws 发 `initialize` 并读回响应。
     ///
     /// 跨传输复用(`ws.rs` 的多客户端 E2E 与若干准入测试都要先握手),故放在
@@ -7788,7 +7817,7 @@ pub(crate) mod tests_support {
             provider: "anthropic".to_string(),
             api_url: "https://api.anthropic.com".to_string(),
             api_key: String::new(),
-            model: "test-model".to_string(),
+            model: super::tests_support::TEST_MODEL.to_string(),
             max_turns: 20,
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
@@ -8384,7 +8413,15 @@ pub(crate) mod tests {
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
-        let config = yi_agent_core::AgentConfig::default();
+        // 让本 mock 如实汇报「它实际会跑的模型」:与 `tests_support::test_config()`
+        // 的 `cfg.model` 同源(`TEST_MODEL`)。`thread/start`/`thread/resume` 现在以
+        // `agent.config().model` 为上报来源(任务 7 评审 Finding 1),若这里沿用
+        // `AgentConfig::default()` 的默认串,就会让夹具与生产语义(会话按 cfg 的模型
+        // 起跑)脱节。
+        let config = yi_agent_core::AgentConfig {
+            model: super::tests_support::TEST_MODEL.to_string(),
+            ..yi_agent_core::AgentConfig::default()
+        };
         let mut agent = yi_agent_core::Agent::new(
             provider.clone(),
             Arc::new(yi_agent_core::ToolRegistry::new()),
@@ -13843,6 +13880,68 @@ pub(crate) mod tests {
         assert_eq!(
             v["result"]["model"], "model-b",
             "the session must stay usable: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 回归任务 7 评审 Finding 1:上报/落盘的 `model` 必须等于工厂**实际建出**的
+    /// agent 的 `agent.config().model`,而不是另按清单再解析一次的结果。二者在
+    /// 「工厂持有启动时快照、另解析却重读磁盘」时会分歧(运行期 `model/upsert`
+    /// 新增条目即触发)。这里用注入了清单的 `production_factory` 把工厂一侧钉死,
+    /// 断言 `thread/start` / `thread/resume` 上报的模型正是该工厂解析出的条目模型。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_and_resume_report_the_built_agents_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        cfg.provider = "openai".to_string();
+        cfg.api_key = "k".to_string();
+        // 注入清单且**无全局默认**:只有显式的 modelRef 才命中条目。生产工厂按
+        // "B" 解析 ⇒ agent 实际跑 "model-b"。若实现改用「另读一次磁盘清单」来上报,
+        // 在该清单里 B 不存在,就会报出别的模型,断言即失败。
+        let factory = production_factory(cfg.clone(), test_theme(), test_catalog_without_default());
+        let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"modelRef":"B"}}"#)
+            .await;
+        let mut started = None;
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("thread/started") {
+                started = Some(v);
+            } else if v.get("id") == Some(&serde_json::json!(2)) {
+                resp = Some(v);
+            }
+            if started.is_some() && resp.is_some() {
+                break;
+            }
+        }
+        let resp = resp.expect("thread/start must respond");
+        let tid = resp["result"]["thread_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            resp["result"]["model"], "model-b",
+            "start must report the model the agent actually runs: {resp}"
+        );
+        assert_eq!(started.unwrap()["params"]["model"], "model-b");
+
+        // resume 与 start 同口径:仍按 meta.model_ref=B 由工厂解析。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resumed = None;
+        for _ in 0..24 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resumed = Some(v);
+                break;
+            }
+        }
+        let resumed = resumed.expect("thread/resume must respond");
+        assert_eq!(
+            resumed["result"]["model"], "model-b",
+            "resume must report the same model the agent runs: {resumed}"
         );
         h.shutdown().await;
     }
