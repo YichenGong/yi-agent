@@ -126,6 +126,14 @@ export class ThreadStore {
       if (n.params.status !== "awaiting_approval") v.approval = null;
       return;
     }
+    if (n.method === "thread/modelChanged") {
+      // 跨客户端同步通道：另一个客户端（如手机）改了某会话的生效模型，服务端广播
+      // 到这里。只更新 `model`——通知带的是解析后的**生效模型**，不含引用名；引用
+      // （`model_ref`）由本客户端的下拉写入成功后自行落笔，这里不能替它猜。
+      const v = this.view(n.params.thread_id);
+      if (v.info) v.info = { ...v.info, model: n.params.model };
+      return;
+    }
     if (n.method === "error") {
       // 无 thread 归属的全局错误归当前 thread。
       this.current()?.session.apply(n);

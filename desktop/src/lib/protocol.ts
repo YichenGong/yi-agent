@@ -54,6 +54,7 @@ export type Notification =
       params: { thread_id: string; cwd: string; model: string; model_ref?: string | null };
     }
   | { method: "thread/status/updated"; params: { thread_id: string; status: ThreadStatus } }
+  | { method: "thread/modelChanged"; params: { thread_id: string; model: string } }
   | { method: "turn/started"; params: { thread_id: string; turn_id: string } }
   | { method: "item/started"; params: { thread_id: string; item: Item } }
   | { method: "item/delta"; params: { thread_id: string; item_id: string; delta: string } }

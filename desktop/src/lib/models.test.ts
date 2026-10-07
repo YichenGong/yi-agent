@@ -97,16 +97,21 @@ describe("deleteModel / setDefaultModel / setSubagentModel", () => {
 });
 
 describe("setThreadModel", () => {
-  it("scopes the override to the thread", async () => {
-    const rpc = vi.fn().mockResolvedValue({ ok: true });
-    await setThreadModel(rpc, "t1", "A");
+  it("scopes the override to the thread and returns the server's effective model", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true, model: "model-a" });
+    await expect(setThreadModel(rpc, "t1", "A")).resolves.toEqual({ model: "model-a" });
     expect(rpc).toHaveBeenCalledWith("thread/setModel", { threadId: "t1", name: "A" });
   });
 
-  it("clears the override with an explicit null name", async () => {
-    const rpc = vi.fn().mockResolvedValue({ ok: true });
-    await setThreadModel(rpc, "t1", null);
+  it("clears the override with an explicit null name and still returns the effective model", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true, model: "model-default" });
+    await expect(setThreadModel(rpc, "t1", null)).resolves.toEqual({ model: "model-default" });
     expect(rpc).toHaveBeenCalledWith("thread/setModel", { threadId: "t1", name: null });
+  });
+
+  it("falls back to an empty model when the server omits it", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true });
+    await expect(setThreadModel(rpc, "t1", "A")).resolves.toEqual({ model: "" });
   });
 });
 

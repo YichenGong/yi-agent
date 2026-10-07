@@ -1372,7 +1372,7 @@ export default function App() {
                       threadId={currentId}
                       currentRef={current.info?.model_ref ?? null}
                       currentModel={current.info?.model ?? null}
-                      onChanged={(ref, model) => changeThreadModel(currentId, ref, model)}
+                      onChanged={(id, ref, model) => changeThreadModel(id, ref, model)}
                     />
                   ) : null
                 }

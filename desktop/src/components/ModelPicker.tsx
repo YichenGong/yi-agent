@@ -32,8 +32,10 @@ function saveErrorText(error: unknown): string {
  * 只改**当前会话**的覆盖：跟随全局默认即清掉覆盖（`name: null`），与设置页的全局
  * 默认分开——用户在一条会话里试模型，不该顺手改掉其它会话。
  *
- * 写入不做乐观更新：写成功后把宿主解析出的模型名通过 `onChanged` 交回父级，由父级
- * 更新该会话的 `info.model_ref` / `info.model`；写失败则内联报错、保持原状。
+ * 写入不做乐观更新：写成功后把**服务端返回**的生效模型名通过 `onChanged` 交回父级，
+ * 由父级更新该会话的 `info.model_ref` / `info.model`；写失败则内联报错、保持原状。
+ * `threadId` 是本次渲染对应的会话，写入与回调都锁定它，切换会话的瞬间也不会把结果
+ * 落到别的会话头上。
  */
 export function ModelPicker({
   call,
@@ -50,10 +52,15 @@ export function ModelPicker({
   /** 会话当前实际生效的模型标识（宿主解析后）；未知为 `null`。 */
   currentModel: string | null;
   /**
-   * 写给成功后回调：`ref` 是新的会话引用（`null` = 跟随默认），`model` 是该会话
-   * 生效的模型标识。父级据此更新 `info.model_ref` / `info.model`。
+   * 写给成功后回调：`threadId` 是本次渲染对应的会话，`ref` 是新的会话引用
+   * （`null` = 跟随默认），`model` 是服务端返回的生效模型标识。父级据此更新
+   * 该会话的 `info.model_ref` / `info.model`。
+   *
+   * 会话 id 由回调方（本组件）指名，而不是让父级读它自己的 `currentId`：写入在途
+   * 时用户可能已切到别的会话，父级的 `currentId` 已指向新会话，结果就会落到别人
+   * 头上。以本组件渲染时的 `threadId` 为准，切换也不会错位。
    */
-  onChanged: (ref: string | null, model: string | null) => void;
+  onChanged: (threadId: string, ref: string | null, model: string | null) => void;
 }) {
   // 接缝在运行时就是 ModelRpc 的形状；一次性补回调用方自选返回类型的泛型能力。
   const rpc = call as ModelRpc | undefined;
@@ -109,11 +116,11 @@ export function ModelPicker({
     setBusy(true);
     setError(null);
     try {
-      await setThreadModel(rpc, threadId, value);
-      // 成功后由父级记录该会话的引用与生效模型名（不在这里猜解析结果）。
-      const model =
-        value === null ? modelFor(catalog, catalog.default_model) : modelFor(catalog, value);
-      onChanged(value, model);
+      // 以服务端返回的**生效模型**为准，而不是拿挂载时那份清单在本地解析：清单可能
+      // 已被别的客户端改过，本地猜出的名字会和真正生效的模型对不上。同一会话的路径
+      // 走这个回包；跨客户端改的走 `thread/modelChanged` 通知。
+      const { model } = await setThreadModel(rpc, threadId, value);
+      onChanged(threadId, value, model.length > 0 ? model : null);
     } catch (e) {
       setError(saveErrorText(e));
     } finally {
@@ -167,10 +174,4 @@ export function ModelPicker({
       )}
     </div>
   );
-}
-
-/** 某清单条目对应的模型标识；找不到则 `null`。 */
-function modelFor(catalog: ModelList, name: string | null): string | null {
-  if (name === null) return null;
-  return catalog.models.find((m) => m.name === name)?.model ?? null;
 }

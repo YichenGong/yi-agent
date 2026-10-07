@@ -87,13 +87,19 @@ export async function setSubagentModel(rpc: ModelRpc, name: string | null): Prom
  *
  * 覆盖只作用于该 thread，与全局默认分开：用户常在一条会话里试模型，不该
  * 顺手改掉其它会话。
+ *
+ * 回包带回**解析后的生效模型串**（清单条目的 `model`，不是用户选中的显示名）。
+ * 调用方据此回显"现在跑的是哪个真实模型"，而不是拿本地那份可能已被别的客户端
+ * 改过的清单去猜——猜出来的名字会和真正生效的模型对不上。缺字段时回空串：
+ * 视图只需一个可显示的值，不必让调用方处理 `undefined`。
  */
 export async function setThreadModel(
   rpc: ModelRpc,
   threadId: string,
   name: string | null,
-): Promise<void> {
-  await rpc("thread/setModel", { threadId, name });
+): Promise<{ model: string }> {
+  const result = await rpc<{ model?: unknown }>("thread/setModel", { threadId, name });
+  return { model: typeof result?.model === "string" ? result.model : "" };
 }
 
 /**

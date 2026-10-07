@@ -29,15 +29,20 @@ const catalog: ModelList = {
   subagent_model: null,
 };
 
-/** 注入接缝：`model/list` 回清单，`thread/setModel` 记录写入（可选失败）。 */
-function seam({ fail = false }: { fail?: boolean } = {}) {
+/**
+ * 注入接缝：`model/list` 回清单，`thread/setModel` 回**服务端的生效模型**。
+ *
+ * `effective` 可覆盖，测试用它证明 UI 取的是服务端返回值，而不是拿挂载时的
+ * 清单在本地推断出的名字。
+ */
+function seam({ fail = false, effective = "model-b" }: { fail?: boolean; effective?: string } = {}) {
   const calls: { method: string; params: unknown }[] = [];
   const call = vi.fn(async (method: string, params: unknown) => {
     calls.push({ method, params });
     if (method === "model/list") return catalog;
     if (method === "thread/setModel") {
       if (fail) throw { code: -32025, message: "model_not_found" };
-      return {};
+      return { ok: true, model: effective };
     }
     return {};
   });
@@ -54,8 +59,8 @@ describe("ModelPicker", () => {
     expect(trigger.textContent).toContain("model-a");
   });
 
-  it("sends thread/setModel with the picked entry and reports the resolved model", async () => {
-    const { call, calls } = seam();
+  it("sends thread/setModel with the picked entry and reports the server's model for that thread", async () => {
+    const { call, calls } = seam({ effective: "model-b" });
     const onChanged = vi.fn();
     render(
       <ModelPicker call={call} threadId="t1" currentRef={null} currentModel="model-a" onChanged={onChanged} />,
@@ -69,11 +74,26 @@ describe("ModelPicker", () => {
         params: { threadId: "t1", name: "B" },
       }),
     );
-    expect(onChanged).toHaveBeenCalledWith("B", "model-b");
+    // 回调带上本次渲染的会话 id，结果不会落到切换后的别的会话头上。
+    expect(onChanged).toHaveBeenCalledWith("t1", "B", "model-b");
+  });
+
+  it("uses the server-returned model, not the mount-time catalog's guess", async () => {
+    // 服务端说 B 生效为 "renamed"：清单里的 "model-b" 已被别的客户端改过，
+    // 本地推断会得到过时的名字。
+    const { call } = seam({ effective: "renamed" });
+    const onChanged = vi.fn();
+    render(
+      <ModelPicker call={call} threadId="t1" currentRef={null} currentModel="model-a" onChanged={onChanged} />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /模型/ }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "B" }));
+
+    await waitFor(() => expect(onChanged).toHaveBeenCalledWith("t1", "B", "renamed"));
   });
 
   it("clears the override (name=null) when following the global default", async () => {
-    const { call, calls } = seam();
+    const { call, calls } = seam({ effective: "model-a" });
     const onChanged = vi.fn();
     render(
       <ModelPicker call={call} threadId="t1" currentRef="B" currentModel="model-b" onChanged={onChanged} />,
@@ -87,8 +107,8 @@ describe("ModelPicker", () => {
         params: { threadId: "t1", name: null },
       }),
     );
-    // 跟随默认后，会话生效的模型回到全局默认条目（A）解析出的 model-a。
-    expect(onChanged).toHaveBeenCalledWith(null, "model-a");
+    // 跟随默认后，会话生效的模型由服务端解析给出（A → model-a）。
+    expect(onChanged).toHaveBeenCalledWith("t1", null, "model-a");
   });
 
   it("keeps the current selection and surfaces an error when the write rejects", async () => {

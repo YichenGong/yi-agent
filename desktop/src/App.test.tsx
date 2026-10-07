@@ -1237,6 +1237,17 @@ describe("App settings & theme wiring", () => {
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
   });
 
+  it("reflects a thread/modelChanged from another client in that thread's picker", async () => {
+    render(<App />);
+    await settle();
+    // t1 自动选中（跟随全局默认），初始生效模型来自 seed 的 "m"。
+    const trigger = () => screen.getByRole("button", { name: /模型/ });
+    await waitFor(() => expect(trigger().textContent).toContain("m"));
+    // 另一个客户端（如手机）改了 t1 的生效模型：桌面端必须跟着更新。
+    notify("thread/modelChanged", { thread_id: "t1", model: "model-from-phone" });
+    await waitFor(() => expect(trigger().textContent).toContain("model-from-phone"));
+  });
+
   /** Defer `ui/settings/read` so a test can interleave a newer choice (theme 或值守). */
   function deferRead() {
     type ReadValue = { theme?: unknown; board_watchman_enabled?: unknown };
