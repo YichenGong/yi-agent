@@ -2091,32 +2091,152 @@ describe("relay handshake recovery wiring", () => {
   });
 });
 
-// 子 agent 栏的收起必须**可逆**。回归背景：入口曾只在面板内部（面板自己的「收起」
-// 是唯一开关），收起后开关随面板一起消失，于是再也打不开。入口改为状态栏右侧的
-// 常驻图标后，收起只隐藏面板本身，入口仍在。
-describe("App 子 agent 栏的收起与展开", () => {
-  it("收起后仍能从状态栏入口把它重新打开", async () => {
+// 状态栏图标现在管的是**会话详情面板**（轨迹 + Git Diff）的开合；子 agent 栏的
+// 收起则由栏自己的「收起」按钮负责。两条路径都必须可逆：
+//  - 面板：状态栏图标开，面板页眉的「关闭」关；
+//  - 子 agent 栏：栏内「收起」关，栏收起后由**面板页眉**的「展开子 agent 栏」开
+//    （回归背景：入口曾只在被它关掉的那块 UI 里，收起后开关随面板一起消失，
+//    于是再也打不开——状态栏图标改管面板后，这条退路必须显式补上）。
+describe("App 会话详情面板与子 agent 栏的开合", () => {
+  it("状态栏图标开合详情面板，页眉可关闭", async () => {
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    // 面板初始不渲染：没有会话详情的 section。
+    expect(screen.queryByLabelText("会话详情")).toBeNull();
+
+    const toggle = await screen.findByLabelText("会话详情面板");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    expect(await screen.findByLabelText("会话详情")).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "轨迹" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Git Diff" })).toBeTruthy();
+    expect(screen.getByLabelText("会话详情面板").getAttribute("aria-expanded")).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭详情" }));
+    expect(screen.queryByLabelText("会话详情")).toBeNull();
+  });
+
+  it("子 agent 栏收起后，仍能从面板页眉把它重新展开", async () => {
     render(<App />);
     // 首个会话（t1）自动选中后，子 agent 栏随之出现。
     fireEvent.click(await screen.findByLabelText("收起子 agent"));
     expect(screen.queryByLabelText("子 agent")).toBeNull();
     expect(screen.queryByLabelText("收起子 agent")).toBeNull();
 
-    // 关键断言：入口没有被一起收走，且它能把面板打开。
-    const toggle = screen.getByLabelText("子 agent 面板");
-    expect(toggle.getAttribute("aria-expanded")).toBe("false");
-    fireEvent.click(toggle);
+    // 栏没了，但退路还在：打开面板 → 页眉给出「展开子 agent 栏」。
+    fireEvent.click(screen.getByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("button", { name: "展开子 agent 栏" }));
     expect(await screen.findByLabelText("子 agent")).toBeTruthy();
     expect(screen.getByLabelText("收起子 agent")).toBeTruthy();
   });
 
-  it("手机端不渲染该入口（那里子 agent 栏是抽屉）", async () => {
+  it("手机端不渲染场景入口（那里栏与面板都是抽屉）", async () => {
     localStorage.setItem(
       "yi-agent.remote",
       JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
     );
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("会话列表")).toBeTruthy());
-    expect(screen.queryByLabelText("子 agent 面板")).toBeNull();
+    expect(screen.queryByLabelText("会话详情面板")).toBeNull();
+  });
+
+  it("ui/gitDiff/focus 打开面板并切到 Git Diff，读出该会话的 diff", async () => {
+    state.dataSources["thread/diff/read"] = () => ({
+      base: "origin/main",
+      baseKind: "origin-default",
+      mergeBase: "abc1234",
+      commits: [{ sha: "c1", short: "c1", subject: "add feature", author: "T", timestamp: 0 }],
+      files: [{ path: "a.txt", status: "M", additions: 1, deletions: 1, binary: false }],
+      unifiedDiff: "diff --git a/a.txt b/a.txt\n",
+      truncated: false,
+    });
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", base: null, note: "看这里" } });
+      }
+    });
+
+    // 面板自己出现（不必先点图标），且停在 diff Tab。
+    expect(await screen.findByLabelText("会话详情")).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Git Diff" }).getAttribute("aria-selected")).toBe("true");
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/diff/read",
+        params: { threadId: "t1" },
+      }),
+    );
+    // 推送里带来的提示语渲染在 diff 视图里。
+    expect(await screen.findByText("看这里")).toBeTruthy();
+  });
+
+  it("点子 agent 卡片回到轨迹 Tab 并打开面板", async () => {
+    state.dataSources["agent/children/list"] = () => ({
+      children: [{ taskId: "task-1", objective: "整理日志", state: "running", lastStep: "读文件" }],
+    });
+    state.dataSources["thread/diff/read"] = () => ({
+      base: null,
+      baseKind: "none",
+      mergeBase: null,
+      commits: [],
+      files: [],
+      unifiedDiff: "",
+      truncated: false,
+    });
+    state.dataSources["agent/trace/read"] = () => ({
+      rows: [
+        {
+          eventId: 1,
+          taskId: "task-1",
+          kind: "assistant_text",
+          payloadJson: JSON.stringify({ type: "assistant_text", text: "开始工作" }),
+        },
+      ],
+      highWaterId: 1,
+    });
+    render(<App />);
+    // 面板先停在 Git Diff，再点卡片：必须被拨回「轨迹」，否则下钻总是落空。
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("tab", { name: "Git Diff" }));
+    fireEvent.click(await screen.findByRole("button", { name: "查看子 agent task-1" }));
+
+    expect(await screen.findByRole("tab", { name: "轨迹" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "轨迹" }).getAttribute("aria-selected")).toBe("true");
+    expect(await screen.findByText("task-1")).toBeTruthy();
+    expect(clients[0].requests).toContainEqual({
+      method: "agent/trace/read",
+      params: { threadId: "t1", taskId: "task-1" },
+    });
+  });
+
+  it("threadId 为 null 的 focus 落在当前会话上", async () => {
+    state.dataSources["thread/diff/read"] = () => ({
+      base: null,
+      baseKind: "none",
+      mergeBase: null,
+      commits: [],
+      files: [],
+      unifiedDiff: "",
+      truncated: false,
+    });
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: null, base: null, note: null } });
+      }
+    });
+
+    // 没有 threadId 时按 ref 回退到当前选中的 t1，而不是静默丢弃这次聚焦。
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/diff/read",
+        params: { threadId: "t1" },
+      }),
+    );
   });
 });

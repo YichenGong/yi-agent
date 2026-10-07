@@ -44,12 +44,16 @@ const TraceRowView = memo(function TraceRowView({
   return <p className="my-1 text-xs text-fg-subtle">{text}</p>;
 });
 
+/**
+ * 本组件不自带外框与关闭：`ThreadDetailPanel` 提供 `<section>` 与页眉的「关闭」
+ * （面板要把它和 Git Diff 摆进同一排 Tab，框架只能由面板统一出）。这里只渲染
+ * 轨迹主体，故根节点是一个 Fragment，直接落进面板的 flex 列里。
+ */
 export function SubagentTrace({
   taskId,
   row,
   children,
   rows,
-  onClose,
   onDrill,
   onMessage,
   onCancel,
@@ -62,7 +66,6 @@ export function SubagentTrace({
   children: SubagentRow[];
   /** The task's trace rows, backfilled then appended live by the caller. */
   rows: AgentTraceSnapshotResult["rows"];
-  onClose: () => void;
   onDrill: (taskId: string) => void;
   onMessage: (taskId: string, message: string) => Promise<void>;
   /** Two steps by contract: preview returns a token, confirm carries it. */
@@ -88,10 +91,7 @@ export function SubagentTrace({
   const blocks = foldTraceRows(rows);
 
   return (
-    <section
-      aria-label={`子 agent 详情 ${taskId}`}
-      className="flex min-h-0 flex-1 flex-col border-t border-line bg-surface"
-    >
+    <>
       <div className="flex items-center justify-between px-3 py-2">
         <div className="flex items-center gap-2">
           <span className="text-xs text-fg-muted">[{row?.state ?? "unknown"}]</span>
@@ -108,14 +108,6 @@ export function SubagentTrace({
             onClick={() => setExpanded((v) => !v)}
           >
             {expanded ? "收起轨迹" : "展开轨迹"}
-          </button>
-          <button
-            type="button"
-            aria-label="关闭详情"
-            className="text-xs text-fg-subtle hover:text-fg-muted"
-            onClick={onClose}
-          >
-            关闭
           </button>
         </div>
       </div>
@@ -249,6 +241,6 @@ export function SubagentTrace({
           </div>
         )}
       </div>
-    </section>
+    </>
   );
 }

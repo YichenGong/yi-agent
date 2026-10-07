@@ -12,7 +12,7 @@ import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ApprovalBanner } from "./components/ApprovalBanner";
 import { ThreadSidebar } from "./components/ThreadSidebar";
 import { SubagentRail } from "./components/SubagentRail";
-import { SubagentTrace } from "./components/SubagentTrace";
+import { ThreadDetailPanel } from "./components/ThreadDetailPanel";
 import { TitleBar } from "./components/TitleBar";
 import type {
   AgentCancelPreviewResult,
@@ -22,6 +22,8 @@ import type {
   ThreadStatus,
   ThreadSummary,
   TurnStatus,
+  ThreadDiffResult,
+  DiffTextResult,
   Workspace,
   WorkspaceGroup,
 } from "./lib/protocol";
@@ -153,6 +155,24 @@ export default function App() {
   useEffect(() => {
     openTaskId.current = openSubagent;
   }, [openSubagent]);
+  // 通知回调在 `wireClient` 的闭包里只注册一次，读不到渲染期最新的 currentId；
+  // `ui/gitDiff/focus` 允许 threadId 为 null（"聚焦当前会话"），此时必须知道此刻
+  // 选中的是谁，故与 openTaskId 一样放进 ref。
+  const currentIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    currentIdRef.current = currentId;
+  }, [currentId]);
+  // 常驻详情面板的开合与当前 Tab。面板由状态栏那颗图标开合；Tab 还受两条外部
+  // 路径驱动——点卡片（回到轨迹）与模型推送的 `ui/gitDiff/focus`（切到 diff）。
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [detailTab, setDetailTab] = useState<"trace" | "diff">("trace");
+  // 会话级 diff 快照与它的加载态/提交下钻态，全部由面板消费。
+  const [threadDiff, setThreadDiff] = useState<ThreadDiffResult | null>(null);
+  const [diffLoading, setDiffLoading] = useState(false);
+  const [diffError, setDiffError] = useState<string | null>(null);
+  const [diffBase, setDiffBase] = useState<string | null>(null);
+  const [diffNote, setDiffNote] = useState<string | null>(null);
+  const [activeCommit, setActiveCommit] = useState<{ sha: string; text: string } | null>(null);
   const [boardOn, setBoardOn] = useState(false);
   const [boardSource, setBoardSource] = useState<SwitchSource>("default");
   const [boardCards, setBoardCards] = useState<BoardCard[]>([]);
@@ -347,6 +367,48 @@ export default function App() {
   };
 
   /**
+   * 读取当前会话的 Git Diff 快照（工作区 + 与默认分支的差异）。
+   *
+   * 失败即把错误放进面板自己的错误槽，不写会话的 `lastError`：diff 是附属视图，
+   * 读不到不该在对话里留一条红字。`base` 有值即带基准（模型推送时可指定）。
+   */
+  const loadThreadDiff = async (threadId: string, base?: string | null) => {
+    const c = clientRef.current;
+    if (!c) return;
+    setDiffLoading(true);
+    setDiffError(null);
+    setActiveCommit(null);
+    try {
+      const r = await c.request<ThreadDiffResult>("thread/diff/read", {
+        threadId,
+        ...(base ? { base } : {}),
+      });
+      setThreadDiff(r);
+    } catch (e) {
+      setDiffError(formatError(e));
+    } finally {
+      setDiffLoading(false);
+    }
+  };
+
+  /**
+   * 下钻到单个 commit：复用 `thread/diff/read` 的 `commit` 分支拿它的 unified diff。
+   *
+   * 与 `loadThreadDiff` 分开：这里不清空 diff（返回按钮要能退回全部改动），也不动
+   * loading（面板已有内容，闪一下"正在计算"反而跳）。
+   */
+  const openCommit = async (threadId: string, sha: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      const r = await c.request<DiffTextResult>("thread/diff/read", { threadId, commit: sha });
+      setActiveCommit({ sha, text: r.unifiedDiff });
+    } catch (e) {
+      setDiffError(formatError(e));
+    }
+  };
+
+  /**
    * 打开某任务的详情:回灌历史,然后开一条流。
    *
    * 关闭(或换任务)时先 unwatch 再开新的,任何时刻只有一路流:否则换任务后
@@ -355,6 +417,9 @@ export default function App() {
   const openDetail = async (threadId: string, taskId: string) => {
     const c = clientRef.current;
     if (!c) return;
+    // 点卡片即回到会话详情：打开面板并把 Tab 拨回轨迹（它可能正停在 Git Diff）。
+    setPanelOpen(true);
+    setDetailTab("trace");
     setDetailStack([taskId]);
     setTraceRows([]);
     try {
@@ -417,6 +482,14 @@ export default function App() {
     if (opts?.leaveBoard !== false) setSelectedBoard(null);
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) setSidebarOpen(false);
+    // diff 是会话级的：换会话必须丢掉上一个会话的快照与下钻态，否则新会话会先
+    // 闪一眼旧 diff，直到它的读取回来。基准/提示也一并清，它们属于那次推送。
+    setPanelOpen(false);
+    setThreadDiff(null);
+    setActiveCommit(null);
+    setDiffError(null);
+    setDiffBase(null);
+    setDiffNote(null);
     force((v) => v + 1);
     // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
     void refreshSubagents(id);
@@ -841,6 +914,19 @@ export default function App() {
           const next = parseTheme(n.params.theme);
           confirmedThemeRef.current = next;
           setTheme(next);
+          return;
+        }
+        if (n.method === "ui/gitDiff/focus") {
+          // 模型通过 `show_git_diff` 工具要求聚焦某会话的 diff：`threadId` 可为
+          // null（=当前会话），闭包里读不到最新 state，故回退到 ref。
+          const target = n.params.threadId ?? currentIdRef.current;
+          if (target) {
+            setDetailTab("diff");
+            setPanelOpen(true);
+            setDiffNote(n.params.note ?? null);
+            setDiffBase(n.params.base ?? null);
+            void loadThreadDiff(target, n.params.base);
+          }
           return;
         }
         if (n.method === "agent/trace/event") {
@@ -1353,25 +1439,30 @@ export default function App() {
             status={status}
             usage={current?.session.usage ?? null}
             /*
-             * 子 agent 栏的**常驻**入口。入口必须待在收起动作够不着的地方：
-             * 它若跟着面板一起消失（面板自己的「收起」曾是这个开关的唯一去处），
-             * 用户就再也无法把它打开——收起变成单向操作。这里改用状态栏右侧的
-             * 一个「拓展」图标，收起时它仍在，故收起/展开可逆。
-             * 手机端子 agent 栏是抽屉，入口不适用（与侧栏一致）。
-             * 标签用「子 agent 面板」而非「收起/展开子 agent」，以免与面板内
-             * 那颗同名按钮的无障碍名撞车（两个同名控件会让人/测试都选不准）。
+             * 会话详情面板（轨迹 + Git Diff）的**常驻**入口：收起动作够不着的
+             * 地方必须留一条回去的路，否则收起就成了单向操作。常驻图标在收起后
+             * 仍在，故面板的开合可逆。
+             * 子 agent 栏另有归属，别把它挂在这颗图标上：栏收起后，退路是面板
+             * 页眉的「展开子 agent 栏」（栏自己的「收起」按钮只有关，没有开）。
+             * 手机端面板不渲染（窄屏上会挤没聊天区），入口也就不适用（与侧栏一致）。
+             * 标签用「会话详情面板」而非「收起/展开…」，以免与控件内文案的
+             * 无障碍名撞车（两个同名控件会让人/测试都选不准）。
              */
             actions={
               currentId && !isMobile ? (
                 <button
                   type="button"
-                  aria-label="子 agent 面板"
-                  aria-expanded={!railCollapsed}
-                  title={railCollapsed ? "展开子 agent 栏" : "收拢子 agent 栏"}
-                  onClick={() => setRailCollapsed((v) => !v)}
+                  aria-label="会话详情面板"
+                  aria-expanded={panelOpen}
+                  title={panelOpen ? "收起会话详情" : "展开会话详情"}
+                  onClick={() => {
+                    setPanelOpen((v) => !v);
+                    // 每次打开都拿一份当前 diff：面板可能开着很久，快照会过期。
+                    if (!panelOpen) void loadThreadDiff(currentId, diffBase);
+                  }}
                   className={`flex items-center gap-1 rounded p-1 hover:bg-raised/50 hover:text-fg ${
                     railRows.length > 0 ? "text-fg-muted" : "text-fg-subtle"
-                  } ${railCollapsed ? "" : "bg-raised/40"}`}
+                  } ${panelOpen ? "bg-raised/40" : ""}`}
                 >
                   <svg viewBox="0 0 16 16" className="size-4" fill="currentColor" aria-hidden="true">
                     <path d="M1.5 3.5h5.2v9H1.5v-9Zm1.2 1.2v6.6h2.8V4.7H2.7Z" />
@@ -1383,36 +1474,70 @@ export default function App() {
               ) : null
             }
           />
-          {currentId && openSubagent && (
-            <SubagentTrace
-              taskId={openSubagent}
-              row={
-                railStore.get(currentId).find((r) => r.taskId === openSubagent) ?? null
-              }
-              children={childrenOf(railStore.get(currentId), openSubagent)}
-              rows={traceRows}
-              onClose={() => void closeDetail(currentId)}
-              onDrill={(taskId) => void openDetail(currentId, taskId)}
-              onMessage={async (taskId, message) => {
-                await clientRef.current?.request("agent/message", {
-                  threadId: currentId,
-                  taskId,
-                  message,
-                });
+          {/*
+            常驻详情面板：轨迹与 Git Diff 两个 Tab。它取代了过去直接渲染的
+            `<SubagentTrace>`——轨迹不再是"选中才出现"的浮层，而是面板的一个 Tab
+            （diff 与会话绑定、与选了谁无关，故两者同处一框）。
+
+            面板可见性由状态栏图标管（`panelOpen`）；子 agent 栏的收起/展开另有
+            归属（栏自己的按钮 + 面板页眉的「展开子 agent 栏」），两者互不代管。
+            手机端不渲染：窄屏上它会把聊天区挤没（与子 agent 栏同一理由）。
+          */}
+          {currentId && panelOpen && !isMobile && (
+            <ThreadDetailPanel
+              tab={detailTab}
+              onTabChange={(t) => {
+                setDetailTab(t);
+                // 切到 diff 就取一份当前快照；轨迹侧的行由 openDetail/watch 维护。
+                if (t === "diff") void loadThreadDiff(currentId, diffBase);
               }}
-              onCancel={async (taskId) =>
-                await clientRef.current!.request<AgentCancelPreviewResult>(
-                  "agent/cancel/preview",
-                  { threadId: currentId, taskId },
-                )
-              }
-              onConfirmCancel={async (taskId, token) => {
-                await clientRef.current?.request("agent/cancel", {
-                  threadId: currentId,
-                  taskId,
-                  confirmationToken: token,
-                });
+              onClose={() => {
+                setPanelOpen(false);
+                void closeDetail(currentId);
               }}
+              traceProps={
+                openSubagent
+                  ? {
+                      taskId: openSubagent,
+                      row: railStore.get(currentId).find((r) => r.taskId === openSubagent) ?? null,
+                      children: childrenOf(railStore.get(currentId), openSubagent),
+                      rows: traceRows,
+                      onDrill: (taskId) => void openDetail(currentId, taskId),
+                      onMessage: async (taskId, message) => {
+                        await clientRef.current?.request("agent/message", {
+                          threadId: currentId,
+                          taskId,
+                          message,
+                        });
+                      },
+                      onCancel: async (taskId) =>
+                        await clientRef.current!.request<AgentCancelPreviewResult>(
+                          "agent/cancel/preview",
+                          { threadId: currentId, taskId },
+                        ),
+                      onConfirmCancel: async (taskId, token) => {
+                        await clientRef.current?.request("agent/cancel", {
+                          threadId: currentId,
+                          taskId,
+                          confirmationToken: token,
+                        });
+                      },
+                    }
+                  : null
+              }
+              diffProps={{
+                diff: threadDiff,
+                loading: diffLoading,
+                error: diffError,
+                activeCommit,
+                note: diffNote,
+                onRefresh: () => void loadThreadDiff(currentId, diffBase),
+                onOpenCommit: (sha) => void openCommit(currentId, sha),
+                onCloseCommit: () => setActiveCommit(null),
+              }}
+              // 面板页眉的「展开子 agent 栏」只在栏收起时出现，保证收起可逆。
+              railCollapsed={railCollapsed}
+              onExpandRail={() => setRailCollapsed(false)}
             />
           )}
           {approval && (
