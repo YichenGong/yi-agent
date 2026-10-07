@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::RuntimeConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelProvider {
@@ -202,6 +204,47 @@ pub fn mask_key(key: &str) -> String {
     format!("••••{tail}")
 }
 
+/// 会话覆盖 → 全局默认 → 原 cfg 三级解析，返回改写了 provider/api_url/api_key/model
+/// 四个字段的 cfg 克隆，其余字段保持原值。
+pub fn resolve_effective(
+    cfg: &RuntimeConfig,
+    catalog: &ModelCatalog,
+    session_override: Option<&str>,
+) -> RuntimeConfig {
+    match effective_entry(catalog, session_override) {
+        Some(entry) => {
+            let mut out = cfg.clone();
+            out.provider = entry.provider.as_str().to_string();
+            out.api_url = entry.api_url.clone();
+            out.api_key = entry.api_key.clone();
+            out.model = entry.model.clone();
+            out
+        }
+        None => cfg.clone(),
+    }
+}
+
+/// 会话覆盖命中则用它；否则全局默认；都命中不了返回 None（调用方回退 cfg）。
+pub fn effective_entry<'a>(
+    catalog: &'a ModelCatalog,
+    session_override: Option<&str>,
+) -> Option<&'a ModelEntry> {
+    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
+    session_override
+        .and_then(by_name)
+        .or_else(|| catalog.default_model.as_deref().and_then(by_name))
+}
+
+/// 子 agent 条目：`subagent_model` → 全局默认 → None（调用方回退 cfg）。
+pub fn subagent_entry(catalog: &ModelCatalog) -> Option<&ModelEntry> {
+    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
+    catalog
+        .subagent_model
+        .as_deref()
+        .and_then(by_name)
+        .or_else(|| catalog.default_model.as_deref().and_then(by_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +355,101 @@ mod tests {
         assert_eq!(mask_key("sk-secret-1234"), "••••1234");
         assert_eq!(mask_key("ab"), "••••");
         assert_eq!(mask_key(""), "••••");
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+    use crate::config::RuntimeConfig;
+
+    /// `config.rs` exposes no reusable test constructor, so build a complete
+    /// literal here. The four fields the resolver rewrites are deliberately set
+    /// to recognizable "base" values so the tests can tell them apart.
+    fn cfg() -> RuntimeConfig {
+        RuntimeConfig {
+            provider: "anthropic".into(),
+            api_url: "https://base".into(),
+            api_key: "base-key".into(),
+            model: "base-model".into(),
+            max_turns: 200,
+            max_resident_subagents: 64,
+            workdir: std::path::PathBuf::from("."),
+            system_prompt: None,
+            compact_threshold: 1000,
+            compact_user_budget_tokens: 100,
+            compact_tool_budget_tokens: 100,
+            yolo: false,
+            sandbox_promotable: false,
+            sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 0,
+            skills_catalog_budget_explicit: false,
+        }
+    }
+
+    fn catalog() -> ModelCatalog {
+        ModelCatalog {
+            models: vec![
+                ModelEntry {
+                    name: "A".into(),
+                    provider: ModelProvider::Anthropic,
+                    api_url: "https://a".into(),
+                    model: "model-a".into(),
+                    api_key: "key-a".into(),
+                },
+                ModelEntry {
+                    name: "B".into(),
+                    provider: ModelProvider::Openai,
+                    api_url: "https://b".into(),
+                    model: "model-b".into(),
+                    api_key: "key-b".into(),
+                },
+            ],
+            default_model: Some("A".into()),
+            subagent_model: None,
+        }
+    }
+
+    #[test]
+    fn a_session_override_wins() {
+        let out = resolve_effective(&cfg(), &catalog(), Some("B"));
+        assert_eq!(out.provider, "openai");
+        assert_eq!(out.api_url, "https://b");
+        assert_eq!(out.model, "model-b");
+        assert_eq!(out.api_key, "key-b");
+    }
+
+    #[test]
+    fn a_dangling_override_falls_back_to_the_default() {
+        let out = resolve_effective(&cfg(), &catalog(), Some("gone"));
+        assert_eq!(out.model, "model-a");
+    }
+
+    #[test]
+    fn no_default_falls_back_to_cfg() {
+        let base = cfg();
+        let empty = ModelCatalog::default();
+        let out = resolve_effective(&base, &empty, None);
+        assert_eq!(out.model, base.model);
+        assert_eq!(out.api_url, base.api_url);
+    }
+
+    #[test]
+    fn only_the_four_fields_change() {
+        let base = cfg();
+        let out = resolve_effective(&base, &catalog(), Some("B"));
+        assert_eq!(out.workdir, base.workdir);
+        assert_eq!(out.sandbox, base.sandbox);
+        assert_eq!(out.max_turns, base.max_turns);
+    }
+
+    #[test]
+    fn subagent_falls_back_to_default_then_cfg() {
+        let cat = catalog();
+        assert_eq!(subagent_entry(&cat).map(|e| e.name.as_str()), Some("A"));
+        let mut cat2 = cat.clone();
+        cat2.subagent_model = Some("B".into());
+        assert_eq!(subagent_entry(&cat2).map(|e| e.name.as_str()), Some("B"));
     }
 }
