@@ -88,6 +88,7 @@
 - [ ] diff 视图 — 需先在协议层新增 `turn/diff/updated` 通知（当前不存在，`grep -rn "turn/diff" yi-agent-rs/crates/yi-agent-app-server/src/` 无结果）；判据：agent 改文件后 GUI 逐 turn 显示 diff
 - [ ] compact 手动控制 — 判据：GUI 提供手动触发上下文压缩的入口
 - [ ] 图片附件输入 — 判据：输入框可附加图片并随 prompt 发送
+- [ ] 文档附件输入（PDF / DOCX 等，L1 只读）— 用户经文件选择器或路径附加本地文档，agent 按需读取并回答；附件复制进 `<cwd>/.yi-agent/attachments/<thread_id>/`（复用既有 `.yi-agent/` 约定），随 `thread/delete` 清理；`thread/clear` 保留。判据：`turn/start` 带 `attachment` block 后复制发生、`Item` 携带 `attachments`、`read_document` 可读 PDF 文本层与 DOCX（保留标题/表格）— [设计](../superpowers/specs/2026-10-07-document-attachments-design.md)
 - [x] 多 thread 标签页 — 可同时运行多个 thread 并在 Sidebar 间自由切换（切换已打开的 warm thread 只换视图、不再 `thread/resume`，`desktop/src/App.tsx:103` `selectThread` + `warm` 集合 `desktop/src/App.tsx:50`；全局 `busy` 门禁已移除，`turnActive` 期间仍可切换/删除）；判据：起两个 turn 后两 thread 状态徽标同时为 running。
 
 **P3 路线图：**
