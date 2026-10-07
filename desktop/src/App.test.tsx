@@ -2230,10 +2230,13 @@ describe("App 附件接线", () => {
       expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
     );
     // 乐观气泡回滚：失败的发送不能留下一条幻觉用户消息。
-    // 只看用户气泡 div——输入框(textarea)的文本内容也叫"总结一下"，别误判。
+    // 只看用户气泡本身——不能扫 div 的 textContent（输入框也叫"总结一下"），
+    // 也不能靠文本相等（带附件的气泡含 chip 子元素，textContent 不再等于纯文本）。
     const bubbles = () =>
-      Array.from(container.querySelectorAll("div")).filter(
-        (d) => d.textContent === "总结一下",
+      Array.from(container.querySelectorAll("div.self-end")).filter((d) =>
+        Array.from(d.childNodes).some(
+          (n) => n.nodeType === Node.TEXT_NODE && n.textContent === "总结一下",
+        ),
       );
     await waitFor(() => expect(bubbles()).toHaveLength(0));
     // 但附件**留着**：用户的文件必须能直接重试，而不是重新挑一遍。
