@@ -115,6 +115,15 @@ impl ThreadStore {
         }
     }
 
+    /// 存储根(`<cwd>/.yi-agent/threads`)。
+    ///
+    /// 供调用方从 root 反推会话工作区——`thread/delete` 分支拿不到 cwd(`server.rs`
+    /// 的 `detach_unused_runtimes` 注释明确警告不要为此改 `store_lookup` 签名),
+    /// 附件清理需要它(见设计 §6(d))。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn meta_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.meta.json"))
     }

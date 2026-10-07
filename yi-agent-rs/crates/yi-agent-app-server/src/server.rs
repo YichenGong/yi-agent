@@ -3358,6 +3358,15 @@ where
                         if let Err(e) = thread_store.delete(&thread_id) {
                             eprintln!("[app-server] failed to delete thread files for {thread_id}: {e}");
                         }
+                        // 收走该会话的附件:与 thread 文件同一生命周期。放在 delete
+                        // 之后(driver 已结束落盘),避免竞态——工作区被挪走时
+                        // `remove_attachments` 尽力而为,不让删除失败。这里拿不到
+                        // cwd(见 `detach_unused_runtimes` 的注释:不为它改
+                        // `store_lookup` 签名),故由 store 的 root
+                        // (`<cwd>/.yi-agent/threads`)上溯两级得到工作区。
+                        if let Some(cwd) = thread_store.root().parent().and_then(|p| p.parent()) {
+                            crate::attachments::remove_attachments(cwd, &thread_id);
+                        }
                         write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "thread/clear" => {
@@ -9632,6 +9641,113 @@ pub(crate) mod tests {
             methods_before_response.is_empty(),
             "no turn may start on a bad attachment: {methods_before_response:?}"
         );
+        h.shutdown().await;
+    }
+
+    /// Task 7:`thread/delete` 要连带收走该会话的附件目录——附件与 thread 文件同一
+    /// 生命周期（设计 §6(d)）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_thread_removes_its_attachments() {
+        // 自带 workdir:默认目录跨次运行会残留同名附件,「盘上存在」的断言会被旧
+        // 文件蒙混过关。
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        // 源文件放在工作区外,模拟「从 Downloads 选文件」。
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("报告.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"attachment","path":"{}"}},{{"type":"text","text":"hi"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+        // 起带附件的 turn,读到 `turn/completed` 说明准备期已过(附件在发帧之前
+        // 复制)、且 turn 已结束,删除不会落在半途。
+        let mut saw_response = false;
+        let mut completed = false;
+        while !(saw_response && completed) {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                assert!(v.get("error").is_none(), "turn/start must succeed: {v}");
+                saw_response = true;
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                completed = true;
+            }
+        }
+
+        let att_dir = workdir.path().join(".yi-agent/attachments").join(&tid);
+        assert!(
+            att_dir.is_dir(),
+            "attachment dir should exist before delete"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                assert!(v.get("error").is_none(), "delete must succeed: {v}");
+                break;
+            }
+        }
+
+        assert!(
+            !att_dir.exists(),
+            "attachments must be reclaimed with the thread"
+        );
+        h.shutdown().await;
+    }
+
+    /// Task 7:`/clear` 只截断历史,会话还在(clear 之后照样能继续),附件不清——
+    /// 这是与 `thread/delete` 的关键区别(设计 §6(e))。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clearing_a_thread_keeps_its_attachments() {
+        // 设计 §6(e):/clear 截断历史但会话还在,附件不清。
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("报告.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"attachment","path":"{}"}},{{"type":"text","text":"hi"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+        // 等 turn 跑完:`thread/clear` 在 turn 进行中会被拒(turn_in_progress)。
+        let mut saw_response = false;
+        let mut completed = false;
+        while !(saw_response && completed) {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                assert!(v.get("error").is_none(), "turn/start must succeed: {v}");
+                saw_response = true;
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                completed = true;
+            }
+        }
+
+        let att_dir = workdir.path().join(".yi-agent/attachments").join(&tid);
+        assert!(att_dir.is_dir(), "attachment dir should exist before clear");
+
+        // 主循环要等 `TurnEvent::Finished` 才清 `active_turn_id`,刚跑完一轮立刻
+        // clear 可能撞上 -32012(turn 进行中)的收尾窗口——用现成的重试 helper,
+        // 与其它 clear 测试同一口径。
+        let resp = clear_thread_retrying(&mut h, &tid).await;
+        assert!(resp.get("error").is_none(), "clear must succeed: {resp}");
+
+        assert!(att_dir.is_dir(), "thread/clear must not remove attachments");
         h.shutdown().await;
     }
 
