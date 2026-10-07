@@ -119,7 +119,7 @@ pub struct Attachment { name: String, path: String, mime: Option<String>, size: 
 - **签名**：`read_document(path, pages?)`；`pages` 形如 `"3"` 或 `"1-5"`，
   缺省整篇。
 - **分派**：
-  - `.pdf` → 纯 Rust PDF 文本抽取；
+  - `.pdf` → 纯 Rust 文本抽取（`pdf-extract`；按页用 `lopdf`）,**抽出的文本必须经字符修复**：`NFKC` + UCD `EquivalentUnifiedIdeograph` 映射，否则中文会落在部首码位（`⻓` U+2ED3 而非 `长` U+957F）导致检索/引用系统性失效（见 [spike](../research/2026-10-07-pdf-text-extraction-spike.md)）；该 UCD 表（410 行，Unicode 许可）随仓库 vendor；
   - `.docx` → zip + XML 抽取，**保留标题层级、表格、列表**并输出为 markdown
     （不压成一坨纯文本，否则表格会退化成无列的一串词）；
   - `.rtf` / `.html` / `.txt` / `.md` / `.csv` → 文本抽取。
@@ -190,14 +190,22 @@ pub struct Attachment { name: String, path: String, mime: Option<String>, size: 
   `view_image` 的 `YI_AGENT_VIEW_IMAGE_MAX_BASE64_BYTES` 命名风格，
   `view_image.rs:18`）。
 
-## 9. 风险与前置 spike
+## 9. 风险与前置 spike（已完成，风险解除）
 
-**最大风险**：中文 PDF 普遍使用 CID-keyed 字体 + ToUnicode CMap，纯 Rust 抽取
-器常出乱码或丢字。英文 PDF 把握明显更大。
+**最大风险已 spike 验证通过**：真实中文 PDF（Chrome 生成、含表格、2 页）抽取可用，
+裸抽取器的中文系统性错误**已定位并修复**。详见
+[spike 报告](../research/2026-10-07-pdf-text-extraction-spike.md)。
 
-**故在写实现计划前先做一个 spike**：取一份真实中文 PDF（带表格）跑候选 crate，
-确认可用后再定案。若 spike 失败，退回 §2.4 的备选——PDF 文本层不承诺、靠用户
-自装 `pdftotext` 或 MCP 工具。
+- 候选：`pdf-extract 0.12.1` + `unicode-normalization 0.1.25`；按页用 `lopdf 0.45`。
+- **必须做的字符修复**（见 §5）：裸抽取会把 25 个中文丢到 Unicode 部首码位
+  （`⻓` U+2ED3 而非 `长` U+957F 等），导致 `收入构成`/`风险提示` 等检索全 `false`。
+  源头是 PDF 自带 ToUnicode CMap 就映到部首码位（非抽取器 bug，已解 CMap 证实）。
+- `NFKC + UCD EquivalentUnifiedIdeograph 映射`修复后残余归零，全部短语命中。
+- 按页隔离实测干净（第 1 页 215 字符 / 第 2 页 58 字符）。
+- 依赖符合「不打包渲染引擎」：无 mupdf/pdfium；`zip` 须收紧为
+  `default-features = false, features = ["deflate"]` 以避开 `zstd-sys`。
+
+故**不退回** §2.4 的备选，PDF 文本层按承诺可读。
 
 ## 10. 测试判据
 
@@ -210,9 +218,15 @@ pub struct Attachment { name: String, path: String, mime: Option<String>, size: 
 - **前端**：chip 增删、blocks 组装、attachments 渲染。
 - **回归**：`cargo test -p yi-agent-app-server -p yi-agent-tools` +
   `cd desktop && npx vitest run && npx tsc --noEmit && npm run build`。
-- **依赖**：`zip` + `quick-xml`（DOCX）+ 一个纯 Rust PDF 文本抽取 crate，进
-  `yi-agent-tools/Cargo.toml`。复制/哈希逻辑落在 app-server，`sha2 = "0.10"`
-  **已在该 crate 的依赖里**（`yi-agent-app-server/Cargo.toml:34`），无需新增。
+- **依赖**（已由 spike 定案，进 `yi-agent-tools/Cargo.toml`）：`pdf-extract 0.12`、
+  `lopdf 0.45`、`unicode-normalization 0.1`、`zip 8`（**`default-features = false,
+  features = ["deflate"]`**，否则会拉 `zstd-sys` C 代码）、`quick-xml 0.38`。
+  复制/哈希逻辑落在 app-server，`sha2 = "0.10"` **已在该 crate 的依赖里**
+  （`yi-agent-app-server/Cargo.toml:34`），无需新增。
+- **实测陷阱**（务必写进实现）：quick-xml 0.38 用 `.xml_content()` 而非
+  `.unescape()`；`<w:pStyle .../>` 是自闭合标签、发 `Event::Empty`，只处理
+  `Event::Start` 会静默丢掉全部标题层级；无文本层 PDF 抽取**不报错**、返回空，
+  必须显式判定。详见 spike 报告 §4。
 
 ## 11. 已知限制
 
