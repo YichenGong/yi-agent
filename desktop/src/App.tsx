@@ -227,6 +227,20 @@ export default function App() {
     [],
   );
 
+  /**
+   * 模型 Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖即稳定；
+   * 若每次渲染换新身份，「模型」面板的读取 effect 会跟着重跑，把用户没保存的
+   * 编辑冲掉。
+   */
+  const modelCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
   // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
   // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
   const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
@@ -1458,6 +1472,9 @@ export default function App() {
         // plugins/list 与 plugin/settings/*。用稳定的 `pluginCall`（见上），
         // 别在这里内联箭头——否则每次 App 渲染都会换新身份，重跑面板的读取。
         pluginCall={pluginCall}
+        // 模型 Tab 同样走当前 transport（桌面 stdio = Admin），能调 model/*。
+        // 用稳定的 `modelCall`（见上），别在这里内联箭头。
+        modelCall={modelCall}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。
