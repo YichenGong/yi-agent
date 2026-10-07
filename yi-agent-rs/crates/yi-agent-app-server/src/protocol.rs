@@ -152,6 +152,30 @@ impl RpcError {
             data: Some(serde_json::json!({ "code": code })),
         }
     }
+
+    /// A `model/*` write named a model the catalog does not contain.
+    ///
+    /// Same shape as [`RpcError::board_query`]: the numeric code is a coarse
+    /// fallback, `data.code = "model_not_found"` is the stable vocabulary the
+    /// UI branches on (`desktop/src/lib/models.ts`).
+    pub fn model_not_found(name: &str) -> Self {
+        Self {
+            code: -32025,
+            message: format!("model not found: {name}"),
+            data: Some(serde_json::json!({ "code": "model_not_found" })),
+        }
+    }
+
+    /// A `model/upsert` payload failed validation (empty name, unknown provider,
+    /// empty url/model). Numeric code stays in the `invalid_params` family;
+    /// `data.code` gives the caller a stable reason.
+    pub fn invalid_model(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+            data: Some(serde_json::json!({ "code": "invalid_model" })),
+        }
+    }
 }
 
 /// 服务端 → 客户端通知(无 id)。
@@ -461,6 +485,21 @@ mod tests {
         let unknown = RpcError::board_query("something_else", "no");
         assert_eq!(unknown.code, -32603);
         assert_eq!(unknown.data.unwrap()["code"], "something_else");
+    }
+
+    /// `model_not_found` gets its own numeric code without renumbering the
+    /// board/plugin vocabulary; the UI only reads `data.code`.
+    #[test]
+    fn model_not_found_has_a_stable_numeric_code_and_reason() {
+        let error = RpcError::model_not_found("A");
+        assert_eq!(error.code, -32025);
+        assert_eq!(error.data.unwrap()["code"], "model_not_found");
+        // The reason string is what a caller prints, but it never leaks a key.
+        assert!(error.message.contains("A"));
+
+        let invalid = RpcError::invalid_model("provider must be anthropic or openai");
+        assert_eq!(invalid.code, -32602);
+        assert_eq!(invalid.data.unwrap()["code"], "invalid_model");
     }
 
     #[test]

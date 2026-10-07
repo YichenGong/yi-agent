@@ -110,6 +110,10 @@ pub(crate) struct RuntimeAttachments {
     /// `WorkspaceIndex` is: the `board/*` RPCs must be testable without
     /// touching the developer's real `~/.yi-agent`.
     pub(crate) board_dir: PathBuf,
+    /// Where `models.json` lives. Injectable for the same reason `board_dir`
+    /// is: `model/*` must be testable without writing the developer's real
+    /// machine-level catalog (and its API keys).
+    pub(crate) models_path: PathBuf,
     /// Where the generic resident-daemon registry lives (`$HOME/.yi-agent`).
     /// Injectable for the same reason `board_dir` is: `board/create` must be
     /// testable without writing the developer's real resident registry.
@@ -1368,6 +1372,7 @@ where
             runtimes,
             thread_roots,
             board_dir,
+            models_path: yi_agent_runtime::models::models_path(),
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
@@ -1434,6 +1439,7 @@ where
             runtimes,
             thread_roots,
             board_dir,
+            models_path: yi_agent_runtime::models::models_path(),
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
@@ -2026,6 +2032,7 @@ where
         runtimes,
         thread_roots,
         board_dir,
+        models_path,
         resident_dir,
         launcher: board_launcher,
         theme,
@@ -2491,6 +2498,46 @@ where
                                     err_response(id, RpcError::board_query(error.code, error.message)),
                                 )
                                 .await?
+                            }
+                        }
+                    }
+                    // 机器级模型清单（`~/.yi-agent/models.json`），不带 project：
+                    // 与 `ui/settings/*` 同类。`model/list` 只需 `Observe`（回掩码，
+                    // 永不含明文 key）；写操作与既有写路径同档，需 `Control`。
+                    "model/list" => {
+                        match crate::model_rpc::handle_model_request_at(
+                            &models_path,
+                            method.as_str(),
+                            &req.params,
+                        ) {
+                            Ok(value) => {
+                                write_response(&hub, &client, ok_response(id, value)).await?
+                            }
+                            Err(error) => {
+                                write_response(&hub, &client, err_response(id, error)).await?
+                            }
+                        }
+                    }
+                    "model/upsert" | "model/delete" | "model/setDefault" | "model/setSubagent" => {
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        match crate::model_rpc::handle_model_request_at(
+                            &models_path,
+                            method.as_str(),
+                            &req.params,
+                        ) {
+                            Ok(value) => {
+                                write_response(&hub, &client, ok_response(id, value)).await?
+                            }
+                            Err(error) => {
+                                write_response(&hub, &client, err_response(id, error)).await?
                             }
                         }
                     }
@@ -8309,6 +8356,9 @@ pub(crate) mod tests {
         _index_dir: tempfile::TempDir,
         /// 隔离的看板登记表目录,理由同上:board/* RPC 不得写真的 `~/.yi-agent`。
         pub(crate) board_dir: tempfile::TempDir,
+        /// 隔离的模型清单目录,理由同 `board_dir`:`model/*` RPC 不得写开发者
+        /// 真实的 `~/.yi-agent/models.json`。字段仅用于持有 tempdir。
+        pub(crate) _models_dir: tempfile::TempDir,
         /// 隔离的常驻登记目录,理由同 `board_dir`:board/create|remove 不得写
         /// 真的 `$HOME/.yi-agent`。字段仅用于持有 tempdir。
         _resident_dir: tempfile::TempDir,
@@ -8484,6 +8534,9 @@ pub(crate) mod tests {
             // 值守的 home 也落在隔离目录里:安装/卸载经调用方注入的闭包,绝不
             // 触碰真实的 `~/Library/LaunchAgents`。
             let watchman_home = tempfile::TempDir::new().unwrap();
+            // 模型清单也落在隔离目录里:`model/*` 不得写开发者真实的
+            // `~/.yi-agent/models.json`(里面是明文密钥)。
+            let models_dir = tempfile::TempDir::new().unwrap();
             let handle = tokio::spawn(serve_scoped(
                 server_r,
                 server_w,
@@ -8496,6 +8549,7 @@ pub(crate) mod tests {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                     board_dir: board_dir.path().to_path_buf(),
+                    models_path: models_dir.path().join("models.json"),
                     // 测试里不起真进程:`board/create` 走注入的启动器,
                     // 与 board_dir 注入同一个理由。
                     resident_dir: resident_dir.path().to_path_buf(),
@@ -8514,6 +8568,7 @@ pub(crate) mod tests {
                 handle,
                 _index_dir: index_dir,
                 board_dir,
+                _models_dir: models_dir,
                 _resident_dir: resident_dir,
                 pairing,
                 hub,
@@ -9255,6 +9310,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                models_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -9325,6 +9381,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                models_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -9399,6 +9456,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                models_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -13427,6 +13485,66 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// `model/list` 走宿主 dispatch 时也不回传明文 key:证明接线用的是注入的
+    /// 隔离清单路径,而非开发者真实的 `~/.yi-agent/models.json`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_list_over_dispatch_masks_the_key() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":9,"method":"model/upsert","params":{"name":"A","provider":"anthropic","api_url":"https://a","model":"m","api_key":"sk-secret-1234"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(v["result"]["ok"], true, "upsert must land: {v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":10,"method":"model/list","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 10).await;
+        let text = v.to_string();
+        assert!(
+            !text.contains("sk-secret-1234"),
+            "the raw key must never cross the wire: {text}"
+        );
+        assert_eq!(v["result"]["models"][0]["has_key"], true);
+        assert_eq!(v["result"]["models"][0]["api_key_masked"], "••••1234");
+
+        // An unknown default is the structured `model_not_found`, over the wire too.
+        h.send(r#"{"jsonrpc":"2.0","id":11,"method":"model/setDefault","params":{"name":"nope"}}"#)
+            .await;
+        let v = read_response(&mut h, 11).await;
+        assert_eq!(v["error"]["code"], -32025);
+        assert_eq!(v["error"]["data"]["code"], "model_not_found");
+        h.shutdown().await;
+    }
+
+    /// An `Observe`-only client may read the (masked) catalog but must be refused
+    /// every write. Production stdio is `Admin`; a paired phone defaults to
+    /// `Control`, which is *allowed* to write, so this uses the lowest tier.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observe_client_may_list_but_not_write_models() {
+        let mut h = Harness::with_scope(Scope::Observe).await;
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"model/list","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 9).await;
+        assert!(
+            v["result"]["models"].is_array(),
+            "Observe may read the masked catalog: {v}"
+        );
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":10,"method":"model/upsert","params":{"name":"A","provider":"anthropic","api_url":"https://a","model":"m","api_key":"k"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 10).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "writes require Control, Observe must be refused: {v}"
+        );
+        h.shutdown().await;
+    }
+
     /// The deliberately-extended admin gate: minting a pairing code
     /// (`pair/create`) or kicking a device (`device/revoke`) is desktop-privileged,
     /// so a `Control` phone must be rejected from both too.
@@ -14746,6 +14864,7 @@ pub(crate) mod tests {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                     board_dir: board_dir.path().to_path_buf(),
+                    models_path: PathBuf::new(),
                     resident_dir: PathBuf::new(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
