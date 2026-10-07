@@ -2293,7 +2293,8 @@ describe("App 附件接线", () => {
       expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
     );
     // 发送成功：chip 行清空，不会把同一个文件重复带去下一轮。
-    await waitFor(() => expect(screen.queryByText("报告.pdf")).toBeNull());
+    // 名字此时仍在 transcript 的用户气泡上（Task 11），所以断言要限定在待发 chip 行。
+    await waitFor(() => expect(screen.queryByTestId("attachment-chips")).toBeNull());
   });
 
   it("keeps each thread's pending attachments out of the others", async () => {
