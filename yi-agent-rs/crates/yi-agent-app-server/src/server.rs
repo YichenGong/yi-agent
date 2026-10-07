@@ -4879,6 +4879,41 @@ async fn apply_session_command(
             .await;
             let _ = reply.send(outcome);
         }
+        SessionCommand::SetModel {
+            effective,
+            model_ref,
+            reply,
+        } => {
+            // provider 构造放在最前：失败就在这里短路，`agent` 尚未被消费，原样返回。
+            // 这是「绝不半重建」的关键——绝不在换了 config/句柄之后才发现造不出 provider。
+            let provider = match yi_agent_runtime::bootstrap::build_provider(&effective) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    tracing::warn!(%error, ?model_ref, "session model switch failed; keeping the old agent");
+                    let _ = reply.send(Err(error.to_string()));
+                    return agent;
+                }
+            };
+            // 新 cfg 只覆盖 model（provider/api_url/api_key 已烤进新 provider；其余
+            // budget/system_prompt 等沿用原 config，避免切模型顺带重置别的设置）。
+            let mut next_config = agent.config().clone();
+            next_config.model = effective.model.clone();
+            // 三样必须原样保留：session `Arc`（否则委派 caller 读不到本会话）、
+            // 工具注册表、审批路径（checker + decision_rx）。与
+            // [`rebuild_thread_agent_with_theme`] 的语义一致。
+            let session_handle = agent.session_handle();
+            let tools = agent.tools();
+            let permission = agent.permission_checker();
+            let decision = agent.decision_rx();
+            let mut rebuilt = yi_agent_core::Agent::new(provider, tools, next_config)
+                .with_session_arc(session_handle);
+            if let (Some(checker), Some(rx)) = (permission, decision) {
+                rebuilt = rebuilt.with_permission(checker, rx);
+            }
+            tracing::info!(model = %effective.model, ?model_ref, "session model switched");
+            let _ = reply.send(Ok(()));
+            agent = rebuilt;
+        }
     }
     agent
 }
@@ -5316,6 +5351,9 @@ async fn run_thread_driver(
                                 let _ = reply.send(CompactOutcome::Failed(
                                     "另有一个会话命令待执行".into(),
                                 ));
+                            }
+                            SessionCommand::SetModel { reply, .. } => {
+                                let _ = reply.send(Err("另有一个会话命令待执行".into()));
                             }
                         }
                     } else {
@@ -9886,6 +9924,270 @@ pub(crate) mod tests {
         handle.abort();
 
         // turn_rx 里的 Finished 是可选的:本路径 turn_id 为 None,不该发 Finished。
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a command with no turn must not report a turn as finished"
+        );
+    }
+
+    /// 切模型 = 在两轮之间**重建** agent:provider 与 config 换新,而 session `Arc`
+    /// (以及绑定其上的委派 caller)、工具注册表、审批路径三样必须原样保留。
+    ///
+    /// 直接驱动**生产函数** `apply_session_command`(与 clear/compact 的测试同款),
+    /// 才能拿到重建后的 agent 逐一断言这四项保留语义。
+    #[tokio::test]
+    async fn set_model_command_rebuilds_with_the_new_model() {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r); // 本测试不看 writer 输出
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        // 带工具注册表与审批路径的 agent,模拟真实 thread:重建时都不该被丢。
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        registry.register(Arc::new(FakeBash));
+        let tools: Arc<yi_agent_core::ToolRegistry> = Arc::new(registry);
+        let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+            yi_agent_core::permission::PermissionsConfig::default(),
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
+            Arc::new(|_cmd: &str| None),
+        ));
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
+        let rx_arc = Arc::new(Mutex::new(decision_rx));
+        let mut agent = yi_agent_core::Agent::new(provider.clone(), tools.clone(), config.clone())
+            .with_permission(checker.clone(), rx_arc.clone());
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .replace_messages(vec![
+                yi_agent_core::Message::user("first"),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "reply".into(),
+                )]),
+            ]);
+        let original_handle = agent.session_handle();
+        // 宿主把委派 caller 绑到这个 session `Arc`;换成新 Arc 会让 fork 读到被丢弃的记录。
+        let caller = yi_agent_subagent::CallerContext::new(original_handle.clone());
+        let _keep_decision_tx = decision_tx;
+
+        // 新条目解析出的 cfg:仍是有效的 anthropic 配置,只是 model 换了。
+        let mut effective = tests_support::test_config();
+        effective.model = "switched-model".into();
+
+        let (reply, answer) = oneshot::channel();
+        agent = apply_session_command(
+            agent,
+            SessionCommand::SetModel {
+                effective: Box::new(effective.clone()),
+                model_ref: Some("B".into()),
+                reply,
+            },
+            &provider,
+            &config,
+            &store,
+            "thread-set-model-1",
+            &hub,
+            &turn_tx,
+            &ThreadSession::new_status(),
+        )
+        .await;
+        answer
+            .await
+            .expect("the set-model reply channel must be fulfilled")
+            .expect("rebuilding against a valid cfg must succeed");
+
+        assert_eq!(
+            agent.config().model,
+            "switched-model",
+            "the rebuilt agent must run the newly selected model"
+        );
+        assert!(
+            Arc::ptr_eq(&original_handle, &agent.session_handle()),
+            "the rebuild must reuse the session Arc, not swap in a new one"
+        );
+        assert_eq!(
+            agent.session().messages().len(),
+            2,
+            "the rebuild must preserve the session history"
+        );
+        assert_eq!(
+            caller.snapshot().expect("the caller stays bound"),
+            agent.session().messages().to_vec(),
+            "the bound caller must still read the rebuilt agent's live transcript"
+        );
+        let kept_tools = agent.tools();
+        assert!(
+            Arc::ptr_eq(&kept_tools, &tools),
+            "the rebuild must keep the very same tool registry"
+        );
+        assert!(
+            kept_tools.names().iter().any(|name| name == "bash"),
+            "the preserved registry must still hold its tools"
+        );
+        let kept_checker = agent
+            .permission_checker()
+            .expect("the rebuild must re-attach the permission checker");
+        assert!(
+            Arc::ptr_eq(&kept_checker, &checker),
+            "the rebuild must keep the approval checker"
+        );
+        let kept_rx = agent
+            .decision_rx()
+            .expect("the rebuild must re-attach the decision channel");
+        assert!(
+            Arc::ptr_eq(&kept_rx, &rx_arc),
+            "the rebuild must keep the decision channel"
+        );
+
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a session command with no turn must not report a turn as finished"
+        );
+    }
+
+    /// provider 构造失败时(如未授权的 provider 名):回执 `Err`,且**原 agent 原样保留**,
+    /// 绝不留下半重建状态(沿用既有重建的原子性)。
+    #[tokio::test]
+    async fn set_model_command_keeps_the_agent_when_the_provider_fails() {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r);
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .push(yi_agent_core::Message::user("keep-me"));
+        let original_handle = agent.session_handle();
+
+        let mut broken = tests_support::test_config();
+        broken.provider = "not-a-provider".into();
+        broken.model = "switched-model".into();
+
+        let (reply, answer) = oneshot::channel();
+        agent = apply_session_command(
+            agent,
+            SessionCommand::SetModel {
+                effective: Box::new(broken),
+                model_ref: Some("B".into()),
+                reply,
+            },
+            &provider,
+            &config,
+            &store,
+            "thread-set-model-fail",
+            &hub,
+            &turn_tx,
+            &ThreadSession::new_status(),
+        )
+        .await;
+        let error = answer
+            .await
+            .expect("the set-model reply channel must be fulfilled")
+            .expect_err("an unknown provider must fail the rebuild");
+        assert!(
+            error.contains("not-a-provider"),
+            "the error must name the offending provider: {error}"
+        );
+        assert_eq!(
+            agent.config().model,
+            config.model,
+            "a failed switch must leave the old model in place"
+        );
+        assert!(
+            Arc::ptr_eq(&original_handle, &agent.session_handle()),
+            "a failed switch must leave the session Arc untouched"
+        );
+        assert_eq!(
+            agent.session().messages().len(),
+            1,
+            "a failed switch must not disturb the session history"
+        );
+    }
+
+    /// 空闲 driver(没有 turn 在跑)也必须在有限时间内响应 `SetModel`,且不把它弄停、
+    /// 不为无 turn 的命令发 Finished——与既有 clear/compact 空闲命令路径同款。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_driver_serves_a_set_model_command_without_a_new_turn() {
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r);
+        let (hub, client) = test_hub(server_w);
+
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(8);
+        let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+        // prompt_tx 保住不 drop:driver 应停在 idle,而不是因 prompt_rx 关闭退出。
+        let _keep_prompt_tx = prompt_tx;
+
+        let built = build_test_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-idle-setmodel".into(),
+            built.agent,
+            prompt_rx,
+            interrupt_rx,
+            interject_rx,
+            session_rx,
+            hub,
+            client,
+            turn_tx,
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Duration::from_secs(5),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            store,
+            ThreadSession::new_status(),
+            built.provider,
+            built.config,
+        ));
+
+        let mut effective = tests_support::test_config();
+        effective.model = "switched-model".into();
+        let (reply, answer) = oneshot::channel();
+        session_tx
+            .send(SessionCommand::SetModel {
+                effective: Box::new(effective),
+                model_ref: Some("B".into()),
+                reply,
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("an idle driver must service SetModel without a new turn")
+            .expect("the reply channel must be fulfilled");
+        assert_eq!(result, Ok(()), "a valid cfg must rebuild successfully");
+
+        // driver 仍在运行(命令不该把它弄停)。
+        assert!(!handle.is_finished());
+        handle.abort();
         assert!(
             turn_rx.try_recv().is_err(),
             "a command with no turn must not report a turn as finished"
