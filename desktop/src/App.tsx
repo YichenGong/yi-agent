@@ -28,6 +28,12 @@ import type {
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
+import {
+  ATTACHMENT_EXTENSIONS,
+  attachmentProblem,
+  fileNameOf,
+  type PendingAttachment,
+} from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
@@ -127,6 +133,9 @@ export default function App() {
   // Approvals the user has dismissed from the banner; keyed by approval id.
   const dismissedApprovals = useRef(new Set<string>());
   const [currentId, setCurrentId] = useState<string | null>(null);
+  // 每个会话待发送的附件。按会话隔离，与草稿同理：切走时留在原会话、切回时
+  // 原样出现，绝不会把 A 的附件发到 B 上。
+  const [pending, setPending] = useState<Record<string, PendingAttachment[]>>({});
   const [status, setStatus] = useState<string>("connecting");
   const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
   // 服务端排好序的全部置顶会话（从顶到底）。置顶项仍留在各自的分组内，侧栏
@@ -1058,26 +1067,50 @@ export default function App() {
     const id = store.currentId;
     const c = clientRef.current;
     if (!id || !c) return false;
+    // 这个会话待发送的附件。发送前先取快照：成功要清空它，失败要**留着**重试。
+    const files = pending[id] ?? [];
+    // 附件本身即消息：纯附件(文本框为空)也允许发送。
+    if (!text.trim() && files.length === 0) return false;
+
     const session = store.view(id).session;
-    session.addUserMessage(text);
+    session.addUserMessage(
+      text,
+      files.map((f) => ({ name: f.name, path: f.path, size: f.size })),
+    );
     force((v) => v + 1);
     // The cached status can be stale: `turn/completed` reaches us before the
     // server flips the thread back to idle, and a listing read inside that
     // window keeps the old value. Send the method the cache implies, then let
     // the server's error code say where it disagreed and switch to the other
     // one. Each direction is tried once, so two mismatches cannot ping-pong.
-    const params = { threadId: id, input: [{ type: "text", text }] };
+    //
+    // 附件 block 必须排在文本 block **之前**：服务端按顺序读，附件先入场，
+    // 文本里只留问题本身，不放任何附件清单。
+    const params = {
+      threadId: id,
+      input: [
+        ...files.map((f) => ({ type: "attachment" as const, path: f.path })),
+        { type: "text" as const, text },
+      ],
+    };
+    // `turn/interject` 的入参只认文本——附件会被服务端静默丢掉——所以带附件时
+    // 只能走 `turn/start`，纯文本才沿用上面那次方法自愈。
+    const hasFiles = files.length > 0;
     let method: "turn/interject" | "turn/start" =
-      store.peek(id)?.status === "running" ? "turn/interject" : "turn/start";
+      !hasFiles && store.peek(id)?.status === "running" ? "turn/interject" : "turn/start";
     let lastError: unknown = null;
     for (let hop = 0; hop < 2; hop += 1) {
       try {
         await c.request(method, params);
+        // 成功才清空该会话的待发附件（本地路径），服务端已把它们落库。
+        setPending((prev) => ({ ...prev, [id]: [] }));
         return true;
       } catch (e) {
         lastError = e;
         const code = sendMethodMismatchCode(e);
-        if (code === null) break;
+        // 带附件时没有可换的方法：换到 turn/interject 只会丢掉附件。就地失败，
+        // 把错误交给用户，附件留着重试。纯文本才做那一次方法互换。
+        if (hasFiles || code === null) break;
         // Adopt the server's view so the next send (and the button) is right.
         method = method === "turn/interject" ? "turn/start" : "turn/interject";
         session.turnActive = method === "turn/interject";
@@ -1088,10 +1121,63 @@ export default function App() {
     session.lastError = formatError(lastError);
     // Roll back the optimistic bubble so a rejected send does not leave a
     // phantom user message. (The server echoes the opening item on success, so
-    // this only ever removes *our* pending copy.)
+    // this only ever removes *our* pending copy.) The attachments stay pending:
+    // the user's files must survive a failed send for a retry.
     session.dropLocalUserMessage(text);
     force((v) => v + 1);
     return false;
+  };
+
+  /**
+   * 打开原生多选文件对话框，把选中的文档加入当前会话的待发附件。
+   *
+   * 逐个本地预检：不合格的就地报错(写进会话错误)并丢弃，合格的才进待发列表。
+   * 报错与加入互不影响——一次多选里混着好坏文件是常态，不能因为一个坏文件
+   * 把整次选择作废。
+   */
+  const pickFilesToAttach = async (): Promise<void> => {
+    const id = store.currentId;
+    if (!id) return;
+    // iOS/远端没有原生选择器：桌面端能力，在别处不假装有。
+    if (isRemoteClient()) return;
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({
+      directory: false,
+      multiple: true,
+      filters: [{ name: "文档", extensions: [...ATTACHMENT_EXTENSIONS] }],
+    });
+    // 多选回数组；单选/取消回字符串或 null。统一成数组再处理。
+    const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
+    if (paths.length === 0) return;
+
+    const problems: string[] = [];
+    const accepted: PendingAttachment[] = [];
+    for (const p of paths) {
+      const name = fileNameOf(p);
+      // 桌面端拿不到 file size（dialog 只给路径）：大小交给服务端权威校验，
+      // 这里只做扩展名预检——`attachmentProblem(p, 0)` 的 size=0 意为"未知"，
+      // 不会误判为超限，避免把注定被拒的类型发出去。
+      const problem = attachmentProblem(p, 0);
+      if (problem) {
+        problems.push(`${name}：${problem}`);
+        continue;
+      }
+      accepted.push({ path: p, name, size: 0 });
+    }
+    if (accepted.length > 0) {
+      setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
+    }
+    if (problems.length > 0) {
+      store.view(id).session.lastError = problems.join("；");
+      force((v) => v + 1);
+    }
+  };
+
+  /** 从当前会话的待发列表里移除一个附件（用户点了 chip 上的叉）。 */
+  const removePendingAttachment = (path: string): void => {
+    const id = store.currentId;
+    if (!id) return;
+    setPending((prev) => ({ ...prev, [id]: (prev[id] ?? []).filter((a) => a.path !== path) }));
   };
 
   const interrupt = () => {
@@ -1334,11 +1420,10 @@ export default function App() {
                 onSlashCommand={(name, args) => void onSlashCommand(name, args)}
                 value={current?.draft ?? ""}
                 onDraftChange={changeDraft}
-                // Task 9 的附件 UI 需要这三个 prop；Task 10 会把它们接到真实的
-                // 选择器与每会话附件列表上，这里先给惰性默认值让类型通过。
-                attachments={[]}
-                onPickFiles={() => {}}
-                onRemoveAttachment={() => {}}
+                // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
+                attachments={currentId ? (pending[currentId] ?? []) : []}
+                onPickFiles={() => void pickFilesToAttach()}
+                onRemoveAttachment={removePendingAttachment}
                 disabled={current === null}
               />
             </>

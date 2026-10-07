@@ -7,6 +7,21 @@ describe("Session", () => {
     s.addUserMessage("hi");
     expect(s.items).toHaveLength(1);
     expect(s.items[0]).toMatchObject({ type: "userMessage", text: "hi" });
+    // 没有附件时不得凭空多一个 `attachments` 字段：服务端项是权威，本地回声
+    // 的字段形状必须与它一致，否则同一条消息会有两种渲染。
+    expect((s.items[0] as { attachments?: unknown }).attachments).toBeUndefined();
+  });
+
+  it("keeps attachments on the optimistic user bubble", () => {
+    const s = new Session();
+    s.addUserMessage("总结一下", [
+      { name: "报告.pdf", path: ".yi-agent/attachments/t1/a1b2-报告.pdf", size: 10 },
+    ]);
+    expect(s.items[0]).toMatchObject({
+      type: "userMessage",
+      text: "总结一下",
+      attachments: [{ name: "报告.pdf" }],
+    });
   });
 
   it("appends streamed agent text into one item", () => {

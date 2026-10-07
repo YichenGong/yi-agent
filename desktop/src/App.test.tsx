@@ -41,8 +41,10 @@ const { clients, state } = vi.hoisted(() => ({
     // 同时留在它自己的分组内（带 pinned:true）并在这个顶层数组里重复一份。
     pinnedIds: [] as string[],
     // Paths the native file picker hands back, in order. `null` = cancelled.
-    // Tests push what they need; an empty queue resolves to `null`.
-    picks: [] as (string | null)[],
+    // Tests push what they need; an empty queue resolves to `null`. An entry
+    // that is itself an array models a **multi-select** `open()` (the document
+    // picker in Task 10), which returns every chosen path in one call.
+    picks: [] as (string | string[] | null)[],
     // Per-project 看板 (Task 7): what `board/list` reports as registered, and
     // what the plugin's `list` answers with.
     boards: [] as unknown,
@@ -2118,5 +2120,238 @@ describe("App 子 agent 栏的收起与展开", () => {
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("会话列表")).toBeTruthy());
     expect(screen.queryByLabelText("子 agent 面板")).toBeNull();
+  });
+});
+
+describe("App 附件接线", () => {
+  const paperclip = () => screen.getByRole("button", { name: "附加文件" });
+  const sendButton = () => screen.getByRole("button", { name: /^send$/i });
+
+  /** 点回形针触发原生多选，并等界面吸收结果（chips 或错误横幅）。 */
+  async function pickFiles(picked: string | string[] | null) {
+    state.picks = [picked];
+    await act(async () => {
+      fireEvent.click(paperclip());
+    });
+  }
+
+  it("sends attachments as input blocks before the text block", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickFiles(["/tmp/报告.pdf"]);
+    // 多选回传一个数组：chip 是"确实进了待发列表"的可见证据。
+    expect(screen.getByText("报告.pdf")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "总结一下" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    const call = clients[0].requests.find((r) => r.method === "turn/start");
+    // 顺序是契约：所有附件 block 必须在文本 block **之前**。
+    expect(call?.params).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "attachment", path: "/tmp/报告.pdf" },
+        { type: "text", text: "总结一下" },
+      ],
+    });
+  });
+
+  it("surfaces a local pre-check failure instead of sending", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // `.mov` 不在 `ATTACHMENT_EXTENSIONS` 里，本地预检必须就地拒绝。
+    await pickFiles(["/tmp/演示.mov"]);
+
+    // 拒绝原因写进会话错误（渲染成错误横幅），没有变成 chip。
+    await waitFor(() => expect(screen.getByText(/不支持的文件类型/)).toBeTruthy());
+    expect(screen.queryByText("演示.mov")).toBeNull();
+
+    // 仅凭失效的附件不能发送：附件没进待发列表，文本框为空则 Send 禁用。
+    expect((sendButton() as HTMLButtonElement).disabled).toBe(true);
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("sends with attachments alone and no text", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickFiles(["/tmp/报告.pdf"]);
+    await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
+
+    // 附件本身即消息：文本框留空，Send 也必须可用。
+    expect((sendButton() as HTMLButtonElement).disabled).toBe(false);
+    await act(async () => {
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    const call = clients[0].requests.find((r) => r.method === "turn/start");
+    expect(call?.params).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "attachment", path: "/tmp/报告.pdf" },
+        { type: "text", text: "" },
+      ],
+    });
+  });
+
+  it("keeps the attachments for retry when the send fails, and rolls back the bubble", async () => {
+    // 非 -32012/-32013 的失败：不会自愈重试，直接走失败路径。
+    state.rejectCode = { "turn/start": -1 };
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickFiles(["/tmp/报告.pdf"]);
+    await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "总结一下" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    // 乐观气泡回滚：失败的发送不能留下一条幻觉用户消息。
+    // 只看用户气泡 div——输入框(textarea)的文本内容也叫"总结一下"，别误判。
+    const bubbles = () =>
+      Array.from(container.querySelectorAll("div")).filter(
+        (d) => d.textContent === "总结一下",
+      );
+    await waitFor(() => expect(bubbles()).toHaveLength(0));
+    // 但附件**留着**：用户的文件必须能直接重试，而不是重新挑一遍。
+    expect(screen.getByText("报告.pdf")).toBeTruthy();
+  });
+
+  it("never routes an attachment send through turn/interject", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // 服务端说这一轮在跑：纯文本本来会走 turn/interject。
+    state.notifHandlers[0]({
+      method: "thread/status/updated",
+      params: { thread_id: "t1", status: "running" },
+    });
+
+    await pickFiles(["/tmp/报告.pdf"]);
+    await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "总结一下" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    // turn/interject 的入参只认文本，附件会被静默丢掉；带附件必须改走 turn/start。
+    expect(clients[0].requests.map((r) => r.method)).not.toContain("turn/interject");
+    expect(
+      clients[0].requests.find((r) => r.method === "turn/start")?.params,
+    ).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "attachment", path: "/tmp/报告.pdf" },
+        { type: "text", text: "总结一下" },
+      ],
+    });
+  });
+
+  it("clears the pending attachments only after a successful send", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickFiles(["/tmp/报告.pdf"]);
+    await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "总结一下" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    // 发送成功：chip 行清空，不会把同一个文件重复带去下一轮。
+    await waitFor(() => expect(screen.queryByText("报告.pdf")).toBeNull());
+  });
+
+  it("keeps each thread's pending attachments out of the others", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickFiles(["/tmp/报告.pdf"]);
+    await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
+
+    // 切到 t2：t1 的附件不跟过来。
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(2),
+    );
+    expect(screen.queryByText("报告.pdf")).toBeNull();
+
+    // 切回 t1（warm）：附件还在原处，等着被发送。
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
+  });
+
+  it("removes a single chip without disturbing the others", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickFiles(["/tmp/a.pdf", "/tmp/b.md"]);
+    await waitFor(() => expect(screen.getByText("a.pdf")).toBeTruthy());
+    expect(screen.getByText("b.md")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "移除 a.pdf" }));
+
+    expect(screen.queryByText("a.pdf")).toBeNull();
+    expect(screen.getByText("b.md")).toBeTruthy();
+
+    // 只有剩下的那个会进发送参数，且仍在文本 block 之前。
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "b のみ" } });
+      fireEvent.click(sendButton());
+    });
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    expect(
+      clients[0].requests.find((r) => r.method === "turn/start")?.params,
+    ).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "attachment", path: "/tmp/b.md" },
+        { type: "text", text: "b のみ" },
+      ],
+    });
   });
 });

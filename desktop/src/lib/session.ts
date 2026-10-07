@@ -1,4 +1,4 @@
-import type { Item, Notification, RetryCause, TurnStatus, Usage } from "./protocol";
+import type { Attachment, Item, Notification, RetryCause, TurnStatus, Usage } from "./protocol";
 
 let localSeq = 0;
 const nextLocalId = () => `local-${++localSeq}`;
@@ -62,8 +62,21 @@ export class Session {
     this.lastServerItemId = null;
   }
 
-  addUserMessage(text: string): void {
-    this.items.push({ type: "userMessage", id: nextLocalId(), text });
+  /**
+   * 本地乐观回声：用户刚发出的那条消息。
+   *
+   * `attachments` 是**发送时**的本地附件（名称/路径/大小），只用于立刻渲染出
+   * 带附件的用户气泡。服务端项是权威——它一到，这条本地回声就被就地替换（见
+   * `apply` / `upsertItems`），那时展示的才是服务端的元数据。没有附件时字段不
+   * 出现（`...(…)` 展开），以免凭空造出一个空数组字段与服务端形状不符。
+   */
+  addUserMessage(text: string, attachments: Attachment[] = []): void {
+    this.items.push({
+      type: "userMessage",
+      id: nextLocalId(),
+      text,
+      ...(attachments.length > 0 ? { attachments } : {}),
+    });
   }
 
   /**
