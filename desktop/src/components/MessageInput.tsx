@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
+import { AttachmentChips } from "./AttachmentChips";
 import { ModeChip } from "./ModeChip";
 import { SlashPopup } from "./SlashPopup";
 import { filterCommands, parseSlashInput } from "../lib/slash";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import type { ThreadMode } from "../lib/threadPermissionMode";
+import type { PendingAttachment } from "../lib/attachmentLimits";
 
 export function MessageInput({
   turnActive,
@@ -14,6 +16,9 @@ export function MessageInput({
   onSlashCommand,
   value,
   onDraftChange,
+  attachments,
+  onPickFiles,
+  onRemoveAttachment,
   disabled = false,
 }: {
   turnActive: boolean;
@@ -31,6 +36,17 @@ export function MessageInput({
   value: string;
   /** 用户每次改动文本框；父级把它写进当前 session 的 `draft`。 */
   onDraftChange: (text: string) => void;
+  /**
+   * 当前会话待发送的附件，父级按 session 保管（与 `value` 同理：附件属于会话）。
+   *
+   * 移除与「发送成功后清空」都由父级做：前者是父级的状态，后者是父级才知道的
+   * 知识（`onSend` 返回 true 才代表服务端收下了这一轮）。
+   */
+  attachments: PendingAttachment[];
+  /** 用户点了回形针：打开文件选择器是父级的事（Tauri dialog 在 App 里）。 */
+  onPickFiles: () => void;
+  /** 用户移除了某个 chip；参数是附件的本地路径。 */
+  onRemoveAttachment: (path: string) => void;
   /**
    * 没有当前 session 时置灰整个输入区（App 不会无会话渲染它，这一层是护栏）：
    * 否则会留下一个能敲字、却因无处存放草稿而静默丢字的文本框。
@@ -63,7 +79,9 @@ export function MessageInput({
   }, [text]);
 
   const handleSend = async () => {
-    if (!text.trim() || sending) return;
+    // 附件本身就是一条消息：只要有文字**或**至少一个附件就可以发；两者都空时
+    // 才拦住（空 turn 没有意义）。
+    if ((!text.trim() && attachments.length === 0) || sending) return;
     setSending(true);
     try {
       const ok = await onSend(text);
@@ -82,112 +100,137 @@ export function MessageInput({
     setPopupOpen(false);
   };
 
+  // 「没什么可发」时按钮就该是灰的，而不是点了没反应：文字与附件都是空时才算空；
+  // 附件已在路上时按钮要亮着，否则「只发文件」这条路径在 UI 上根本走不通。
+  // Stop 态不用额外分支：那时 `turnActive` 为真，本式已退化成 `disabled || sending`
+  // ——打断的意义与有没有内容无关。
+  const sendDisabled =
+    disabled || sending || (!turnActive && !text.trim() && attachments.length === 0);
+
   return (
-    <div className="relative flex items-end gap-2 border-t border-line bg-panel p-3">
+    <div className="relative border-t border-line bg-panel p-3">
       {showPopup && <SlashPopup commands={options} selected={selected} />}
-      <textarea
-        ref={inputRef}
-        value={text}
-        onChange={(e) => {
-          const next = e.target.value;
-          onDraftChange(next);
-          // Re-arm the popup whenever the text still looks like a command name.
-          setPopupOpen(/^\/[^\s/]*$/.test(next.trim()));
-        }}
-        onCompositionStart={ime.onCompositionStart}
-        onCompositionEnd={ime.onCompositionEnd}
-        onBlur={ime.resetComposition}
-        onKeyDown={(e) => {
-          if (isImeEnter(e, ime.composing.current)) return;
-          if (showPopup && options.length > 0) {
-            if (e.key === "ArrowDown") {
-              e.preventDefault();
-              setSelected((i) => (i + 1) % options.length);
-              return;
+      <AttachmentChips attachments={attachments} onRemove={onRemoveAttachment} />
+      <div className="flex items-end gap-2">
+        <textarea
+          ref={inputRef}
+          value={text}
+          onChange={(e) => {
+            const next = e.target.value;
+            onDraftChange(next);
+            // Re-arm the popup whenever the text still looks like a command name.
+            setPopupOpen(/^\/[^\s/]*$/.test(next.trim()));
+          }}
+          onCompositionStart={ime.onCompositionStart}
+          onCompositionEnd={ime.onCompositionEnd}
+          onBlur={ime.resetComposition}
+          onKeyDown={(e) => {
+            if (isImeEnter(e, ime.composing.current)) return;
+            if (showPopup && options.length > 0) {
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setSelected((i) => (i + 1) % options.length);
+                return;
+              }
+              if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setSelected((i) => (i - 1 + options.length) % options.length);
+                return;
+              }
+              if (e.key === "Tab") {
+                e.preventDefault();
+                const picked = options[Math.min(selected, options.length - 1)];
+                onDraftChange(`/${picked.name} `);
+                setPopupOpen(false);
+                inputRef.current?.focus();
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                setPopupOpen(false);
+                return;
+              }
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                // A bare "/" names no command (`parseSlashInput("/")` is
+                // `{ kind: "none" }`), yet the popup is offered for it and its
+                // DEFAULT highlight is index 0 — the destructive `/clear`. A stray
+                // Enter on that untouched default would erase the transcript, so it
+                // is inert until the user either types a name character (kind turns
+                // "command", as for "/cos") or moves the highlight with ↑/↓ (an
+                // explicit choice, which the line below honours). Tab still
+                // completes.
+                if (parsed.kind !== "command" && selected === 0) return;
+                // A space closes the popup (name-mode only), so no arguments can
+                // be pending here: accepting the highlighted row is exactly what
+                // "complete and run" means (`/cos` -> `/cost`). Fully typed
+                // commands — arguments and unknowns included — reach the
+                // no-popup branch below with `parsed` intact.
+                const picked = options[Math.min(selected, options.length - 1)];
+                runSlash(picked.name, null);
+                return;
+              }
+              return; // 弹窗开启时吞掉其余按键,不作文本处理
             }
-            if (e.key === "ArrowUp") {
-              e.preventDefault();
-              setSelected((i) => (i - 1 + options.length) % options.length);
-              return;
-            }
-            if (e.key === "Tab") {
-              e.preventDefault();
-              const picked = options[Math.min(selected, options.length - 1)];
-              onDraftChange(`/${picked.name} `);
-              setPopupOpen(false);
-              inputRef.current?.focus();
-              return;
-            }
-            if (e.key === "Escape") {
+            if (e.key === "Escape" && popupOpen) {
               e.preventDefault();
               setPopupOpen(false);
               return;
             }
             if (e.key === "Enter" && !e.shiftKey) {
+              // Confirming a candidate with Enter is the IME's key, not the user's:
+              // let the composition land in the box and wait for the next Enter.
               e.preventDefault();
-              // A bare "/" names no command (`parseSlashInput("/")` is
-              // `{ kind: "none" }`), yet the popup is offered for it and its
-              // DEFAULT highlight is index 0 — the destructive `/clear`. A stray
-              // Enter on that untouched default would erase the transcript, so it
-              // is inert until the user either types a name character (kind turns
-              // "command", as for "/cos") or moves the highlight with ↑/↓ (an
-              // explicit choice, which the line below honours). Tab still
-              // completes.
-              if (parsed.kind !== "command" && selected === 0) return;
-              // A space closes the popup (name-mode only), so no arguments can
-              // be pending here: accepting the highlighted row is exactly what
-              // "complete and run" means (`/cos` -> `/cost`). Fully typed
-              // commands — arguments and unknowns included — reach the
-              // no-popup branch below with `parsed` intact.
-              const picked = options[Math.min(selected, options.length - 1)];
-              runSlash(picked.name, null);
-              return;
+              if (parsed.kind === "command") {
+                // This branch is reached when the popup matched nothing: unknown
+                // commands and matched commands alike belong to the command
+                // layer, never to the agent (`/nope` reports, it does not send).
+                runSlash(parsed.name, parsed.args);
+                return;
+              }
+              if (parsed.kind === "path") {
+                // Two-slash first token is a path (TUI parity) — falls through.
+              } else if (turnActive) {
+                onInterrupt();
+                return;
+              }
+              void handleSend();
             }
-            return; // 弹窗开启时吞掉其余按键,不作文本处理
-          }
-          if (e.key === "Escape" && popupOpen) {
-            e.preventDefault();
-            setPopupOpen(false);
-            return;
-          }
-          if (e.key === "Enter" && !e.shiftKey) {
-            // Confirming a candidate with Enter is the IME's key, not the user's:
-            // let the composition land in the box and wait for the next Enter.
-            e.preventDefault();
-            if (parsed.kind === "command") {
-              // This branch is reached when the popup matched nothing: unknown
-              // commands and matched commands alike belong to the command
-              // layer, never to the agent (`/nope` reports, it does not send).
-              runSlash(parsed.name, parsed.args);
-              return;
+          }}
+          disabled={disabled || sending || turnActive}
+          rows={3}
+          placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+          className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50"
+        />
+        <div className="flex flex-col items-end gap-2">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              // 纯文本标签（仓库不用 emoji）；`aria-label` 与可见文字一致，是测试锚点。
+              aria-label="附加文件"
+              title="附加文件"
+              className="rounded-md border border-line-strong px-2 py-0.5 text-xs text-fg-muted hover:bg-raised hover:text-fg disabled:opacity-50"
+              onClick={onPickFiles}
+              disabled={disabled}
+            >
+              附加文件
+            </button>
+            <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
+          </div>
+          <button
+            type="button"
+            onClick={turnActive ? onInterrupt : () => void handleSend()}
+            disabled={sendDisabled}
+            className={
+              turnActive
+                ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
+                : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50"
             }
-            if (parsed.kind === "path") {
-              // Two-slash first token is a path (TUI parity) — falls through.
-            } else if (turnActive) {
-              onInterrupt();
-              return;
-            }
-            void handleSend();
-          }
-        }}
-        disabled={disabled || sending || turnActive}
-        rows={3}
-        placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-        className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50"
-      />
-      <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
-      <button
-        type="button"
-        onClick={turnActive ? onInterrupt : () => void handleSend()}
-        disabled={disabled || sending}
-        className={
-          turnActive
-            ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
-            : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50"
-        }
-      >
-        {turnActive ? "Stop" : "Send"}
-      </button>
+          >
+            {turnActive ? "Stop" : "Send"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

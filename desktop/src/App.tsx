@@ -1334,6 +1334,11 @@ export default function App() {
                 onSlashCommand={(name, args) => void onSlashCommand(name, args)}
                 value={current?.draft ?? ""}
                 onDraftChange={changeDraft}
+                // Task 9 的附件 UI 需要这三个 prop；Task 10 会把它们接到真实的
+                // 选择器与每会话附件列表上，这里先给惰性默认值让类型通过。
+                attachments={[]}
+                onPickFiles={() => {}}
+                onRemoveAttachment={() => {}}
                 disabled={current === null}
               />
             </>

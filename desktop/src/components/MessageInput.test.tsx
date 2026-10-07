@@ -17,6 +17,9 @@ function renderInput(overrides: Partial<ComponentProps<typeof MessageInput>> = {
     onSlashCommand: vi.fn(),
     value: "",
     onDraftChange: vi.fn(),
+    attachments: [],
+    onPickFiles: vi.fn(),
+    onRemoveAttachment: vi.fn(),
     ...overrides,
   };
   // The composer is controlled: mirror `onDraftChange` back into `value` exactly
@@ -197,6 +200,88 @@ describe("MessageInput", () => {
 
     expect(onSend).toHaveBeenCalledWith("doomed");
     expect((textarea as HTMLTextAreaElement).value).toBe("doomed");
+  });
+
+  describe("attachments", () => {
+    const paperclip = () => screen.getByRole("button", { name: "附加文件" });
+
+    it("sends when only files are attached and the text box is empty", async () => {
+      const onSend = vi.fn(async () => true);
+      renderInput({
+        onSend,
+        value: "",
+        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10 }],
+      });
+
+      // An empty text box alone must not block the send: the attachment is the
+      // message. (The chip row is the visible evidence that a file is pending.)
+      expect(screen.getByText("report.pdf")).toBeTruthy();
+      fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+      expect(onSend).toHaveBeenCalledWith("");
+    });
+
+    it("keeps the send button disabled with neither text nor files", () => {
+      renderInput({ value: "", attachments: [] });
+      // No jest-dom here: read the DOM property, as the rest of this suite does.
+      const send = screen.getByRole("button", { name: /send/i }) as HTMLButtonElement;
+      expect(send.disabled).toBe(true);
+    });
+
+    it("sends an attachment-only message on Enter too", () => {
+      const onSend = vi.fn(async () => true);
+      renderInput({
+        onSend,
+        value: "",
+        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10 }],
+      });
+      // Enter and the Send button must take the same branch.
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(onSend).toHaveBeenCalledWith("");
+    });
+
+    it("keeps Stop enabled even with an empty composer", () => {
+      // 「没内容就灰」是 Send 的规则，不能传染给 Stop：打断与有没有内容无关。
+      const onInterrupt = vi.fn();
+      renderInput({ value: "", attachments: [], turnActive: true, onInterrupt });
+      const stop = screen.getByRole("button", { name: /stop/i }) as HTMLButtonElement;
+      expect(stop.disabled).toBe(false);
+      fireEvent.click(stop);
+      expect(onInterrupt).toHaveBeenCalled();
+    });
+
+    it("asks the parent to pick files from the paperclip button", () => {
+      const onPickFiles = vi.fn();
+      const { unmount } = renderInput({ onPickFiles, value: "hi" });
+      fireEvent.click(paperclip());
+      expect(onPickFiles).toHaveBeenCalledTimes(1);
+      unmount();
+
+      // A composer with no session is inert everywhere, the picker included.
+      renderInput({ onPickFiles, value: "hi", disabled: true });
+      expect((paperclip() as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it("reports the removed attachment path and only clears the text on a send", async () => {
+      const onSend = vi.fn(async () => true);
+      const onRemoveAttachment = vi.fn();
+      renderInput({
+        onSend,
+        value: "look at this",
+        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10 }],
+        onRemoveAttachment,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "移除 report.pdf" }));
+      expect(onRemoveAttachment).toHaveBeenCalledWith("/tmp/report.pdf");
+
+      // Attachment removal is the parent's call; this component must not invent
+      // a draft edit for it.
+      fireEvent.click(screen.getByRole("button", { name: /send/i }));
+      expect(onSend).toHaveBeenCalledWith("look at this");
+      await waitFor(() =>
+        expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe(""),
+      );
+    });
   });
 
   describe("slash commands", () => {
