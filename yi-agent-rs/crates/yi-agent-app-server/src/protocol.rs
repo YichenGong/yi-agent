@@ -187,6 +187,10 @@ pub enum Notification {
         thread_id: String,
         cwd: String,
         model: String,
+        /// 该会话选中的清单条目显示名(`None`＝跟随全局默认)。`model` 是解析后的
+        /// 生效串,`model_ref` 是用户在清单里选中的那一条,客户端据此回显。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_ref: Option<String>,
     },
     #[serde(rename = "turn/started")]
     TurnStarted { thread_id: String, turn_id: String },

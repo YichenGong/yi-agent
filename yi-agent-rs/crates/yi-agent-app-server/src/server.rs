@@ -2870,6 +2870,7 @@ where
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
                                 model: model.clone(),
+                                model_ref: model_ref.clone(),
                             },
                         )
                         .await?;
@@ -2881,6 +2882,7 @@ where
                                     "thread_id": thread_id,
                                     "cwd": cwd,
                                     "model": model,
+                                    "model_ref": model_ref,
                                 }),
                             ),
                         )
@@ -3078,6 +3080,7 @@ where
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
                                 model: model.clone(),
+                                model_ref: loaded.meta.model_ref.clone(),
                             },
                         )
                         .await?;
@@ -3145,6 +3148,7 @@ where
                                     "thread_id": thread_id,
                                     "cwd": cwd,
                                     "model": model,
+                                    "model_ref": loaded.meta.model_ref,
                                 }),
                             ),
                         )
@@ -4786,6 +4790,7 @@ fn thread_summary_json(
         "thread_id": m.thread_id,
         "cwd": m.cwd,
         "model": m.model,
+        "model_ref": m.model_ref,
         "created_at": m.created_at,
         "updated_at": m.updated_at,
         "title": m.title,
@@ -13923,7 +13928,16 @@ pub(crate) mod tests {
             resp["result"]["model"], "model-b",
             "start must report the model the agent actually runs: {resp}"
         );
-        assert_eq!(started.unwrap()["params"]["model"], "model-b");
+        assert_eq!(
+            resp["result"]["model_ref"], "B",
+            "start must echo the selected catalog entry's display name: {resp}"
+        );
+        let started = started.expect("thread/started must be delivered");
+        assert_eq!(started["params"]["model"], "model-b");
+        assert_eq!(
+            started["params"]["model_ref"], "B",
+            "the thread/started notification must carry the selected ref: {started}"
+        );
 
         // resume 与 start 同口径:仍按 meta.model_ref=B 由工厂解析。
         h.send(&format!(
@@ -13942,6 +13956,59 @@ pub(crate) mod tests {
         assert_eq!(
             resumed["result"]["model"], "model-b",
             "resume must report the same model the agent runs: {resumed}"
+        );
+        assert_eq!(
+            resumed["result"]["model_ref"], "B",
+            "resume must report the loaded meta's model_ref: {resumed}"
+        );
+        h.shutdown().await;
+    }
+
+    /// Design §11: `thread/list` 必须暴露会话选中的清单条目显示名(`model_ref`),
+    /// 供客户端回显;无覆盖的会话该字段为 `null`(跟随全局默认)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_exposes_model_ref_override_and_null() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let factory = production_factory(cfg.clone(), test_theme(), test_catalog());
+        let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        // 一个带覆盖(B)、一个无覆盖(null＝跟随清单全局默认 A)。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"modelRef":"B"}}"#)
+            .await;
+        let tid_override = read_thread_start_response(&mut h, 2).await;
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_default = read_thread_start_response(&mut h, 3).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/list","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("thread/list must respond");
+        let threads = v["result"]["threads"].as_array().unwrap();
+        let find = |id: &str| {
+            threads
+                .iter()
+                .find(|t| t["thread_id"].as_str() == Some(id))
+                .unwrap_or_else(|| panic!("thread {id} must be listed: {v}"))
+        };
+        assert_eq!(
+            find(&tid_override)["model_ref"],
+            "B",
+            "an overridden session must expose its selected display name: {v}"
+        );
+        assert!(
+            find(&tid_default)["model_ref"].is_null(),
+            "a session without an override must expose null: {v}"
         );
         h.shutdown().await;
     }
@@ -15586,7 +15653,8 @@ mod theme_watcher_tests {
             Notification::ThreadStarted {
                 thread_id: "t2".into(),
                 cwd: "/w".into(),
-                model: "m".into()
+                model: "m".into(),
+                model_ref: None
             }
             .delivery(),
             Delivery::List
