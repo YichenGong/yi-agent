@@ -7742,6 +7742,44 @@ pub(crate) mod tests {
         assert!(!task_id.is_empty(), "the child must get an id to wait on");
     }
 
+    /// 会话的工具集里必须有 `show_git_diff`：模型没有它就无法把 diff 推到用户眼前。
+    ///
+    /// 与 `a_git_project_gets_the_delegation_tools` 走同一条 setup，故两者一起失败时
+    /// 说明是共享接线断了，而不是单点回归。
+    #[test]
+    fn a_git_project_gets_the_show_git_diff_tool() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+
+        let attached = Arc::new(
+            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
+                .expect("a clean git repo must attach"),
+        );
+        let binding =
+            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+        let names = build_runtime_tooling(
+            &cfg,
+            &root,
+            "thread-test",
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+        )
+        .expect("tooling")
+        .registry
+        .names();
+
+        assert!(
+            names.contains(&"show_git_diff".to_string()),
+            "an attached root must expose show_git_diff, got {names:?}"
+        );
+    }
+
     /// One live controller backs both the root's builtin tools and the
     /// subagent spawn tools: flipping the thread's YOLO switch must move the
     /// root's `bash` sandbox, proving there is no second, static copy.
