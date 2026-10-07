@@ -30,7 +30,6 @@ import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
 import { nextReconnectDelay } from "./lib/reconnect";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
-import { SuperpowersKanbanCollapsedBar } from "./components/SuperpowersKanbanCollapsedBar";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
 import { normalizeCard, type BoardCard } from "./lib/superpowersKanbanState";
@@ -228,11 +227,8 @@ export default function App() {
   );
 
   // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
-  // 展示看板的项目；与 currentId 相互独立——看会话不动看板，看板也不动会话。
+  // 展示看板的项目；看板不切换会话，但点某条会话会离开看板（见 selectThread）。
   const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
-  // 看板可以「收起」而不「关闭」：收起后轮询与状态照旧，只是不画面板，
-  // 并在原处留一条可展开的横条。收起是纯 UI 选择，不进 store。
-  const [boardCollapsed, setBoardCollapsed] = useState(false);
   // done 列是否展开。纯界面状态：每次打开/切换看板都重置为折叠。
   const [doneExpanded, setDoneExpanded] = useState(false);
   // 登记了看板的项目（侧栏据此画条目 + 决定右键菜单给创建还是移除）。
@@ -410,9 +406,15 @@ export default function App() {
    * resumed once; per-thread isolation means the base session list/sidebar can
    * keep serving other threads in parallel.
    */
-  const selectThread = async (id: string) => {
+  const selectThread = async (id: string, opts?: { leaveBoard?: boolean }) => {
     store.select(id);
     setCurrentId(id);
+    // 会话页成为当前页：离开看板（若正在看）。这样点侧栏任意会话即「跳转」
+    // 过去，不必再点一次「收起看板」。setSelectedBoard 幂等，不在看板时无害。
+    // 仅当这是「用户切到会话」时才是离场：重连后重放选中的那条会话不代表用户
+    // 换了页，此时必须留在看板上（opts.leaveBoard === false），否则一次 sidecar
+    // 重启就会把人从看板踢回会话。
+    if (opts?.leaveBoard !== false) setSelectedBoard(null);
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) setSidebarOpen(false);
     force((v) => v + 1);
@@ -494,6 +496,8 @@ export default function App() {
       store.view(t.thread_id).mode = "normal";
       store.select(t.thread_id);
       setCurrentId(t.thread_id);
+      // 新建会话同样把焦点带回会话页：与点会话一致。
+      setSelectedBoard(null);
       force((v) => v + 1);
       // Remote-only (S2): register the fresh thread in the subscription window
       // *now*. It picks a new id (not previously warm) and gets `warm` below, so
@@ -550,20 +554,20 @@ export default function App() {
     await refreshBoards();
   };
 
-  /** 打开看板只改 selectedBoard，不动 currentId。 */
+  /**
+   * 打开看板只改 selectedBoard，不动 currentId。
+   *
+   * 主区域只有「会话页 / 看板页」两态（见 spec 2026-10-04）：「收起」已被删除，
+   * 离开看板统一走「切到某条会话」（selectThread/newThread 清 selectedBoard）。
+   */
   const onOpenBoard = (path: string) => {
-    // 打开（或重新打开）一个看板一定展开它：从收起横条点进来、或换项目，都是
-    // 「我现在要看这个看板」的意图，不该还停在收起的横条上。
-    if (path === selectedBoard) {
-      setBoardCollapsed(false);
-      return;
-    }
+    // 已经在该看板页：纯 no-op，不重读、不清屏。
+    if (path === selectedBoard) return;
     // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
     setBoardError(null);
     setBoardCards([]);
     setDoneExpanded(false); // 换项目 → 新看板从折叠开始
     setSelectedBoard(path);
-    setBoardCollapsed(false);
   };
 
   /**
@@ -913,8 +917,9 @@ export default function App() {
         setPinned(list.pinned ?? []);
         store.seed(list.groups.flatMap((g) => g.threads));
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
+        // 重连重放时（新进程记忆为空）不离开看板：这不是用户切换页面的动作。
         const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
-        if (first) await selectThread(first.thread_id);
+        if (first) await selectThread(first.thread_id, { leaveBoard: false });
         // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         attempt = 0;
@@ -1256,20 +1261,15 @@ export default function App() {
         />
         </div>
         <div className="relative flex min-w-0 flex-1 flex-col">
-          {/* 看板是主区域的一个视图，不是一个常驻列：选中才出现，且问的是
-              被选中那个项目。没有选中时主区域还是原来的对话。 */}
-          {selectedBoard !== null && boardCollapsed && (
-            <SuperpowersKanbanCollapsedBar
-              board={selectedBoard}
-              onExpand={() => setBoardCollapsed(false)}
-            />
-          )}
-          {selectedBoard !== null && !boardCollapsed ? (
+          {/* 看板是主区域的一个平级页面：选中才出现，问的是被选中那个项目。
+              离开看板走「点某条会话」（selectThread/newThread 清 selectedBoard）；
+              没有选中时主区域就是原来的对话。 */}
+          {selectedBoard !== null ? (
             <section
               aria-label="Superpowers 看板"
               className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-neutral-800 bg-neutral-925"
             >
-              {/* 顶栏：项目路径 + 开关/收起/值守 + 入队 + 错误行 */}
+              {/* 顶栏：项目路径 + 开关/值守 + 入队 + 错误行 */}
               <div className="flex items-center gap-3 px-4 pt-3">
                 <span className="truncate font-mono text-xs text-fg-muted" title={selectedBoard}>
                   {selectedBoard}
@@ -1279,7 +1279,6 @@ export default function App() {
                 switchOn={boardOn}
                 source={boardSource}
                 onToggle={(next) => void onToggleBoardSwitch(next)}
-                onCollapse={() => setBoardCollapsed(true)}
                 watchmanEnabled={watchmanEnabled}
                 onToggleWatchman={(next) => void onToggleWatchman(next)}
                 watchmanWarning={watchmanWarning}

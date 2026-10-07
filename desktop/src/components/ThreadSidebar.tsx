@@ -110,7 +110,7 @@ export function ThreadSidebar({
   boards: string[];
   /** 项目路径 → 卡片摘要（如 "2 排队 · 1 运行中"）。 */
   boardSummaries: Record<string, string>;
-  /** 当前在主区域展示看板的项目；与 currentId 相互独立。 */
+  /** 当前在主区域展示看板的项目（点会话会离开看板）。 */
   selectedBoard: string | null;
   onCreateBoard: (path: string) => void;
   onRemoveBoard: (path: string) => void;

@@ -4,7 +4,6 @@ export function SuperpowersKanbanSettings({
   switchOn,
   source,
   onToggle,
-  onCollapse,
   watchmanEnabled,
   onToggleWatchman,
   watchmanWarning,
@@ -12,8 +11,6 @@ export function SuperpowersKanbanSettings({
   switchOn: boolean;
   source: SwitchSource;
   onToggle: (next: boolean) => void;
-  /** Supplied by a host that can collapse the panel; omitted, no button shows. */
-  onCollapse?: () => void;
   /**
    * 宿主级「后台值守」。默认开，且属于宿主本身而非某个项目，因此与上面的
    * 项目开关分开一行：两者管的不是同一件事。
@@ -36,16 +33,6 @@ export function SuperpowersKanbanSettings({
           <span>Superpowers 看板</span>
           <span className="text-fg-subtle">({source})</span>
         </label>
-        {onCollapse && (
-          <button
-            type="button"
-            aria-label="收起看板"
-            className="text-xs text-fg-subtle hover:text-fg-muted"
-            onClick={onCollapse}
-          >
-            收起
-          </button>
-        )}
       </div>
       <p className="mt-2 text-xs text-fg-subtle">
         Off by default. Turning it off stops the plugin from advancing the queue; it
