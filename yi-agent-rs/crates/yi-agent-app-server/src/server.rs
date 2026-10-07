@@ -1354,6 +1354,8 @@ where
     // 工厂闭包 `'static`,拿不到主循环里的 `theme`;先克隆一份专供工厂。
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
+    // 清单在启动时读一次;`production_factory` 的闭包持有它,逐会话按 `model_ref` 解析。
+    let catalog = Arc::new(yi_agent_runtime::models::load_catalog());
     serve_stdio(
         reader,
         writer,
@@ -1373,7 +1375,7 @@ where
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
         },
-        production_factory(cfg, theme_for_factory),
+        production_factory(cfg, theme_for_factory, catalog),
     )
     .await
 }
@@ -1417,6 +1419,8 @@ where
     spawn_board_watchman_loop(resident_dir.clone());
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
+    // 与 `run` 一致:清单启动读一次,工厂逐会话解析。
+    let catalog = Arc::new(yi_agent_runtime::models::load_catalog());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     serve_scoped_core(
         reader,
@@ -1437,7 +1441,7 @@ where
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
         },
-        production_factory(cfg, theme_for_factory),
+        production_factory(cfg, theme_for_factory, catalog),
         // 桌面 = Admin(与 `run`/`serve_stdio` 的 stdio 注册完全一致)。
         Scope::Admin,
         Some(listener),
@@ -1446,10 +1450,42 @@ where
     .await
 }
 
+thread_local! {
+    /// 本次 `build_agent` 调用所属会话的 `model_ref`(清单显示名)。工厂闭包是
+    /// `Fn` 且被 `'static` 持有,签名里带不进这个逐会话参数,故用 thread-local
+    /// 传入。`build_agent` 同步执行、期间无 `await`,故槽位不会被跨任务污染。
+    static SESSION_MODEL_REF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 在调用工厂(`build_agent`)前设定本次会话的模型覆盖(清单显示名),供工厂解析。
+///
+/// 调用返回后恢复调用前的值,故嵌套调用(如 `thread/start` 内再建其它 agent)不会
+/// 泄漏覆盖。`thread/start` 取请求参数、`thread/resume` 取 `loaded.meta.model_ref`。
+pub(crate) fn with_session_model_ref<T>(model_ref: Option<String>, f: impl FnOnce() -> T) -> T {
+    SESSION_MODEL_REF.with(|slot| {
+        let prev = slot.replace(model_ref);
+        let out = f();
+        slot.replace(prev);
+        out
+    })
+}
+
+/// 工厂内部读取当前会话的 `model_ref`;不在 [`with_session_model_ref`] 内时为空。
+fn current_session_model_ref() -> Option<String> {
+    SESSION_MODEL_REF.with(|slot| slot.borrow().clone())
+}
+
 /// 生产环境的 agent 工厂:按 thread 的 cwd 覆盖 workdir 与 yolo 后引导一个 agent。
+///
+/// `catalog` 在进程启动时经 `load_catalog()` 读入一次并共享;每次调用再按本次会话
+/// 的 `model_ref`(由 [`with_session_model_ref`] 设定)解析 provider/api_url/
+/// api_key/model 四个字段,使**整条会话**跑在清单条目的 url/key/model 上,而非
+/// 全局 `cfg`(解析不中则原样回退 `cfg`)。
 pub(crate) fn production_factory(
     cfg: RuntimeConfig,
     theme: crate::theme_tool::ThemeHandle,
+    catalog: Arc<yi_agent_runtime::models::ModelCatalog>,
 ) -> impl Fn(
     Option<yi_agent_core::Session>,
     &Path,
@@ -1462,6 +1498,13 @@ pub(crate) fn production_factory(
         let mut thread_cfg = cfg.clone();
         thread_cfg.workdir = cwd.to_path_buf();
         thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
+        let model_ref = current_session_model_ref();
+        // 按本次会话解析 provider/api_url/api_key/model;不中则原样回退 cfg。
+        let thread_cfg = yi_agent_runtime::models::resolve_effective(
+            &thread_cfg,
+            &catalog,
+            model_ref.as_deref(),
+        );
         let built = yi_agent_runtime::bootstrap::bootstrap_agent(
             &thread_cfg,
             yi_agent_runtime::bootstrap::PermissionMode::Interactive,
@@ -2718,7 +2761,12 @@ where
                         // 抽成局部量避免两处字面量漂移。
                         let mode = crate::thread_store::ThreadMode::Normal;
 
-                        let built = match build_agent(None, Path::new(&cwd), mode) {
+                        // 本次会话的 `model_ref` 经 thread-local 交给工厂解析。
+                        // Task 7 落地 `thread/start` 的可选请求参数与 meta 持久化;
+                        // 此处先以 `None` 走同一条解析路径(命中清单默认 / 回退 cfg)。
+                        let built = match with_session_model_ref(None, || {
+                            build_agent(None, Path::new(&cwd), mode)
+                        }) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(&hub, &client, err_response(id, RpcError::internal(e.to_string()))).await?;
@@ -2857,7 +2905,9 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
-                        let built = match build_agent(Some(session), Path::new(&cwd), mode) {
+                        let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
+                            build_agent(Some(session), Path::new(&cwd), mode)
+                        }) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(
@@ -13823,6 +13873,109 @@ pub(crate) mod tests {
         assert!(
             rebuilt.agent.decision_rx().is_some(),
             "the rebuilt agent must keep the decision receiver"
+        );
+    }
+
+    /// 注入式清单:两条不同 provider 的条目,免动进程级 `HOME`。
+    fn test_catalog() -> Arc<yi_agent_runtime::models::ModelCatalog> {
+        Arc::new(model_catalog_entries(Some("A")))
+    }
+
+    /// 同 [`test_catalog`] 但没有全局默认,用于断言「无默认时回退 cfg」。
+    fn test_catalog_without_default() -> Arc<yi_agent_runtime::models::ModelCatalog> {
+        Arc::new(model_catalog_entries(None))
+    }
+
+    fn model_catalog_entries(
+        default_model: Option<&str>,
+    ) -> yi_agent_runtime::models::ModelCatalog {
+        use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
+        ModelCatalog {
+            models: vec![
+                ModelEntry {
+                    name: "A".into(),
+                    provider: ModelProvider::Anthropic,
+                    api_url: "https://a.example".into(),
+                    model: "model-a".into(),
+                    api_key: "key-a".into(),
+                },
+                ModelEntry {
+                    name: "B".into(),
+                    provider: ModelProvider::Openai,
+                    api_url: "https://b.example".into(),
+                    model: "model-b".into(),
+                    api_key: "key-b".into(),
+                },
+            ],
+            default_model: default_model.map(str::to_string),
+            subagent_model: None,
+        }
+    }
+
+    /// 工厂必须按会话的 `model_ref` 从清单条目解析 provider/api_url/api_key/model,
+    /// 而不是照抄全局 `cfg`(此处 cfg.model 为占位的 `test-model`)。
+    #[test]
+    fn a_session_model_ref_selects_the_catalog_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config();
+        assert_ne!(cfg.model, "model-b", "precondition: cfg differs from entry");
+        let factory = production_factory(cfg, test_theme(), test_catalog());
+
+        let built = with_session_model_ref(Some("B".to_string()), || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .expect("an injected catalog must bootstrap without network");
+
+        assert_eq!(built.agent.config().model, "model-b");
+    }
+
+    /// 覆盖名不在清单里时退回清单的全局默认(Task 2 已定优先级),而非 cfg。
+    #[test]
+    fn an_unknown_model_ref_falls_back_to_the_catalog_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory = production_factory(test_config(), test_theme(), test_catalog());
+
+        let built = with_session_model_ref(Some("nope".to_string()), || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .expect("bootstrap");
+
+        assert_eq!(built.agent.config().model, "model-a");
+    }
+
+    /// 既无会话覆盖、清单又无全局默认时才回退 `cfg`(空清单即今天的旧行为)。
+    #[test]
+    fn no_override_and_no_default_falls_back_to_the_global_cfg() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory =
+            production_factory(test_config(), test_theme(), test_catalog_without_default());
+
+        let built = with_session_model_ref(None, || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .expect("bootstrap");
+
+        assert_eq!(built.agent.config().model, "test-model");
+    }
+
+    /// `thread/resume` 重建 agent 时必须只认该 thread 的 `model_ref`;
+    /// 读到别的会话(无覆盖)时退回默认,不得沿用上一次的覆盖。
+    #[test]
+    fn the_session_model_ref_does_not_leak_across_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory = production_factory(test_config(), test_theme(), test_catalog());
+
+        let built = with_session_model_ref(Some("B".to_string()), || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .unwrap();
+        assert_eq!(built.agent.config().model, "model-b");
+
+        let built = factory(None, dir.path(), crate::thread_store::ThreadMode::Normal).unwrap();
+        assert_eq!(
+            built.agent.config().model,
+            "model-a",
+            "the override must not leak past with_session_model_ref"
         );
     }
 

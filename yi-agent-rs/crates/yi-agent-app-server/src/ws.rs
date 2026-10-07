@@ -55,7 +55,9 @@ pub async fn serve_ws(
     // `theme`,故先克隆一份专供工厂。
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
-    let build_agent = production_factory(cfg.clone(), theme_for_factory);
+    // 清单启动读一次;工厂闭包持有它,逐会话按 `model_ref` 解析 provider。
+    let catalog = Arc::new(yi_agent_runtime::models::load_catalog());
+    let build_agent = production_factory(cfg.clone(), theme_for_factory, catalog);
     serve_ws_inner(listener, cfg, workspaces, pairing, theme, build_agent).await
 }
 
