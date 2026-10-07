@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
+import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem } from "../lib/session";
 import { AgentMessage } from "./MarkdownText";
 import { ToolCallCard } from "./ToolCallCard";
@@ -37,6 +38,20 @@ function ChatItem({ item }: { item: Item | NoticeItem }) {
     case "userMessage":
       return (
         <div className="my-1 max-w-[80%] self-end rounded-lg bg-blue-600 px-3 py-2 text-sm whitespace-pre-wrap text-white">
+          {item.attachments && item.attachments.length > 0 && (
+            <div className="mb-1 flex flex-wrap gap-1">
+              {item.attachments.map((a) => (
+                <span
+                  key={a.path}
+                  className="rounded bg-blue-700/60 px-1.5 py-0.5 text-xs text-blue-50"
+                  title={a.path}
+                  data-testid="bubble-attachment"
+                >
+                  {a.name || fileNameOf(a.path)}
+                </span>
+              ))}
+            </div>
+          )}
           {item.text}
         </div>
       );
