@@ -142,14 +142,15 @@ fn untracked_paths(repo: &Path) -> Vec<String> {
 /// 两来源互斥：numstat 覆盖的是已跟踪文件（含已暂存的新增），未跟踪走
 /// `ls-files --others`，故**不会重复计入**同一个路径。
 ///
-/// `merge_base` 为 `None`（无默认分支，退化为「仅工作区改动」）时改用无 rev 的
-/// `git diff --numstat`，照样能把已跟踪文件的暂存/未暂存改动算进来。
-/// 未跟踪文件的内容相对仓库根 `root` 读取，与其根相对路径对应。
+/// `merge_base` 为 `None`（无默认分支，退化为「仅工作区改动」）时改用 `git diff
+/// --numstat HEAD`：裸 `git diff` 比的是「工作区 vs 索引」，看不见**已暂存**
+/// （`git add` 过）的改动，而 `HEAD` 同时覆盖已暂存与未暂存。未跟踪文件的内容相对
+/// 仓库根 `root` 读取，与其根相对路径对应。
 fn files(repo: &Path, root: &Path, merge_base: Option<&str>) -> Vec<FileStat> {
     let mut out: Vec<FileStat> = Vec::new();
     let numstat = match merge_base {
         Some(mb) => git_ok(repo, &["diff", "--numstat", "-z", mb]),
-        None => git_ok(repo, &["diff", "--numstat", "-z"]),
+        None => git_ok(repo, &["diff", "--numstat", "-z", "HEAD"]),
     };
     if let Some(raw) = numstat {
         out.extend(parse_numstat(&raw));
@@ -238,11 +239,12 @@ pub fn thread_diff(repo: &Path, explicit_base: Option<&str>) -> ThreadDiff {
     let commits = mb.as_deref().map(|m| commits(repo, m)).unwrap_or_default();
     let files = files(repo, &root, mb.as_deref());
 
-    // 无基准时同样要报「仅工作区改动」：无 rev 的 `git diff` 覆盖已跟踪文件的
-    // 暂存 + 未暂存改动，与 `files` 的 `None` 分支同源。
+    // 无基准时同样要报「仅工作区改动」：`git diff HEAD` 覆盖已跟踪文件的
+    // 已暂存 + 未暂存改动（裸 `git diff` 只看工作区 vs 索引，会漏掉已暂存部分），
+    // 与 `files` 的 `None` 分支同源。
     let tracked = match mb.as_deref() {
         Some(mb) => git_ok(repo, &["diff", "--no-color", mb]),
-        None => git_ok(repo, &["diff", "--no-color"]),
+        None => git_ok(repo, &["diff", "--no-color", "HEAD"]),
     };
     let mut diff = tracked.unwrap_or_default();
     // 未跟踪不在 `git diff` 的输出里，单独合成并入；它们不在 numstat 中，
@@ -267,9 +269,11 @@ pub fn commit_diff(repo: &Path, sha: &str) -> (String, bool) {
 }
 
 pub fn file_diff(repo: &Path, merge_base: Option<&str>, path: &str) -> (String, bool) {
+    // `None` 分支与 `files` / `thread_diff` 保持一致：`HEAD` 覆盖已暂存 + 未暂存，
+    // 裸 `git diff` 会漏掉已暂存的改动。
     let raw = match merge_base {
         Some(mb) => git_ok(repo, &["diff", "--no-color", mb, "--", path]).unwrap_or_default(),
-        None => git_ok(repo, &["diff", "--no-color", "--", path]).unwrap_or_default(),
+        None => git_ok(repo, &["diff", "--no-color", "HEAD", "--", path]).unwrap_or_default(),
     };
     truncate(raw)
 }
@@ -358,6 +362,91 @@ mod tests {
         let a = d.files.iter().find(|f| f.path == "a.txt").unwrap();
         assert_eq!((a.additions, a.deletions), (1, 0), "numstat must be read: {a:?}");
         assert!(d.unified_diff.contains("+two"), "tracked edit must be in the diff: {}", d.unified_diff);
+    }
+
+    /// 回归 #1b：`worktree-only` 下**已暂存**（`git add` 过）的改动同样要报出来。
+    ///
+    /// 裸 `git diff` 比的是「工作区 vs 索引」，`git add` 之后两者相同，于是已暂存
+    /// 的改动在 `files` 与 `unified_diff` 里双双消失；`git diff HEAD` 才同时覆盖
+    /// 已暂存与未暂存改动。
+    #[test]
+    fn worktree_only_includes_staged_only_edits() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        // 只暂存、不再改动：裸 `git diff` 在这里输出为空。
+        let d = thread_diff(dir.path(), None);
+        assert_eq!(d.base_kind, "worktree-only");
+        let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"a.txt"), "staged-only edit must appear: {paths:?}");
+        let a = d.files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert_eq!((a.additions, a.deletions), (1, 0), "numstat must be read: {a:?}");
+        assert!(d.unified_diff.contains("+two"), "staged-only edit must be in the diff: {}", d.unified_diff);
+    }
+
+    /// 回归 #1c：已暂存的**新文件**不能被漏掉。
+    ///
+    /// 它已在索引里，故 `ls-files --others` 不会报它；又因「索引 == 工作区」，
+    /// 裸 `git diff` 也不会报它——`git diff HEAD` 是唯一能看见它的范围。
+    #[test]
+    fn worktree_only_includes_staged_new_files() {
+        let dir = repo();
+        std::fs::write(dir.path().join("n.txt"), "brand new\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "n.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let d = thread_diff(dir.path(), None);
+        assert_eq!(d.base_kind, "worktree-only");
+        let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["n.txt"], "staged new file must appear exactly once: {paths:?}");
+        assert!(
+            d.unified_diff.contains("+brand new"),
+            "staged new file content must be in the diff: {}",
+            d.unified_diff
+        );
+    }
+
+    /// 回归 #1d：已暂存 + 未暂存的混合改动必须**完整**报出（两段增量都要有）。
+    #[test]
+    fn worktree_only_reports_staged_and_unstaged_deltas_together() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap(); // 暂存后再改
+        let d = thread_diff(dir.path(), None);
+        let a = d.files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert_eq!((a.additions, a.deletions), (2, 0), "both deltas must be counted: {a:?}");
+        assert!(d.unified_diff.contains("+two"), "staged delta missing: {}", d.unified_diff);
+        assert!(d.unified_diff.contains("+three"), "unstaged delta missing: {}", d.unified_diff);
+    }
+
+    /// 回归 #1e：`file_diff` 的 `None` 分支与 `thread_diff` 同源，同样必须看见已暂存改动。
+    #[test]
+    fn file_diff_without_base_includes_staged_only_edits() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "a.txt"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success());
+        let (diff, truncated) = file_diff(dir.path(), None, "a.txt");
+        assert!(!truncated);
+        assert!(diff.contains("+two"), "staged-only edit must be in file_diff: {diff}");
     }
 
     /// 回归 #2：`repo` 是工作树子目录时，所有路径必须统一为仓库根相对。
