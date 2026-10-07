@@ -4718,6 +4718,7 @@ async fn persist_and_finish_turn(
         items.push(crate::protocol::Item::UserMessage {
             id: format!("user-{}", turn_id.unwrap_or("session-command")),
             text: prompt.to_string(),
+            attachments: Vec::new(),
         });
     }
     items.extend(completed_items);
@@ -5911,6 +5912,7 @@ fn opening_user_item(turn_id: &str, text: &str) -> crate::protocol::Item {
     crate::protocol::Item::UserMessage {
         id: format!("user-{turn_id}"),
         text: text.to_string(),
+        attachments: Vec::new(),
     }
 }
 
@@ -11020,6 +11022,7 @@ pub(crate) mod tests {
                     items: vec![crate::protocol::Item::UserMessage {
                         id: "user-t1".into(),
                         text: "first".into(),
+                        attachments: Vec::new(),
                     }],
                     usage: None,
                     messages: vec![],
@@ -11035,6 +11038,7 @@ pub(crate) mod tests {
                         crate::protocol::Item::UserMessage {
                             id: "user-turn-t2".into(),
                             text: "second".into(),
+                            attachments: Vec::new(),
                         },
                         crate::protocol::Item::AgentMessage {
                             id: "item-turn-t2-1".into(),
@@ -11120,6 +11124,7 @@ pub(crate) mod tests {
                     items: vec![crate::protocol::Item::UserMessage {
                         id: "user-t1".into(),
                         text: "first".into(),
+                        attachments: Vec::new(),
                     }],
                     usage: None,
                     messages: vec![],
@@ -11136,6 +11141,7 @@ pub(crate) mod tests {
                         crate::protocol::Item::UserMessage {
                             id: "user-turn-t2".into(),
                             text: "second".into(),
+                            attachments: Vec::new(),
                         },
                         crate::protocol::Item::AgentMessage {
                             id: "item-turn-t2-1".into(),

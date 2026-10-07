@@ -389,12 +389,27 @@ pub enum ThreadStatus {
     AwaitingApproval,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 一条消息附带的文档（只带元数据与 in-root 路径，**不带内容**）。
+///
+/// `path` 相对工作区根，形如 `.yi-agent/attachments/<thread_id>/<hash>-<name>`；
+/// 服务端在起 turn 前把用户选中的文件复制到该位置，工具据此读取。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub name: String,
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Item {
     UserMessage {
         id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     AgentMessage {
         id: String,
@@ -414,10 +429,12 @@ pub enum Item {
     UserInterjection {
         id: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
     Running,
@@ -527,6 +544,7 @@ mod tests {
         let item = Item::UserMessage {
             id: "i1".into(),
             text: "hi".into(),
+            attachments: Vec::new(),
         };
         let v: Value = serde_json::to_value(&item).unwrap();
         assert_eq!(v["type"], "userMessage");
@@ -633,12 +651,50 @@ mod tests {
     }
 
     #[test]
+    fn user_message_attachments_round_trip() {
+        let item = Item::UserMessage {
+            id: "user-1".into(),
+            text: "总结这份文件".into(),
+            attachments: vec![Attachment {
+                name: "报告.pdf".into(),
+                path: ".yi-agent/attachments/t1/a1b2c3d4-报告.pdf".into(),
+                mime: Some("application/pdf".into()),
+                size: 1234,
+            }],
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["attachments"][0]["name"], "报告.pdf");
+        assert_eq!(json["attachments"][0]["size"], 1234);
+        assert_eq!(serde_json::from_value::<Item>(json).unwrap(), item);
+    }
+
+    #[test]
+    fn empty_attachments_are_omitted_on_the_wire() {
+        // 旧前端/旧服务端兼容：没有附件时不得多出一个 null 字段。
+        let item = Item::UserMessage {
+            id: "u".into(),
+            text: "hi".into(),
+            attachments: Vec::new(),
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert!(json.get("attachments").is_none(), "got: {json}");
+        // 旧线协议（缺字段）必须仍能反序列化。
+        let legacy: Item =
+            serde_json::from_str(r#"{"type":"userMessage","id":"u","text":"hi"}"#).unwrap();
+        assert_eq!(
+            legacy, item,
+            "legacy wire data without `attachments` must deserialize to an empty vec"
+        );
+    }
+
+    #[test]
     fn items_completed_serializes_with_method_and_params() {
         let n = Notification::ItemsCompleted {
             thread_id: "t1".to_string(),
             items: vec![Item::UserMessage {
                 id: "user-1".to_string(),
                 text: "hi".to_string(),
+                attachments: Vec::new(),
             }],
         };
         let v = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();

@@ -313,7 +313,11 @@ impl Translator {
                 // back to the item namespace when a caller supplied none (the
                 // TUI does not need cross-process matching).
                 let id = tag.unwrap_or_else(|| self.alloc_item_id());
-                let item = crate::protocol::Item::UserInterjection { id, text };
+                let item = crate::protocol::Item::UserInterjection {
+                    id,
+                    text,
+                    attachments: Vec::new(),
+                };
                 out.push(Notification::ItemStarted {
                     thread_id: self.thread_id.clone(),
                     item: item.clone(),
@@ -1075,11 +1079,11 @@ mod tests {
         for n in &out {
             match n {
                 Notification::ItemStarted {
-                    item: Item::UserInterjection { id, text },
+                    item: Item::UserInterjection { id, text, .. },
                     ..
                 }
                 | Notification::ItemCompleted {
-                    item: Item::UserInterjection { id, text },
+                    item: Item::UserInterjection { id, text, .. },
                     ..
                 } => {
                     // The id must be the caller's tag, not a freshly allocated
