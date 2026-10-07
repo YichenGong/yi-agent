@@ -118,9 +118,21 @@ fn commits(repo: &Path, merge_base: &str) -> Vec<CommitInfo> {
         .collect()
 }
 
-/// 未跟踪文件的路径集合（相对仓库根）。
+/// `repo`（thread 的 cwd）可能只是工作树的一个子目录。所有 git 输出（numstat、
+/// 合成头）都以仓库根为基准，故先解析根，再让文件内容也相对根读取，避免同一个
+/// 结果里混入 cwd 相对路径。`rev-parse` 失败时退回 `repo`（原行为）。
+fn repo_root(repo: &Path) -> std::path::PathBuf {
+    git_ok(repo, &["rev-parse", "--show-toplevel"])
+        .map(|s| std::path::PathBuf::from(s.trim()))
+        .unwrap_or_else(|| repo.to_path_buf())
+}
+
+/// 未跟踪文件的路径集合（仓库根相对）。
+///
+/// `--full-name` 保证即使 cwd 是子目录，输出仍是仓库根相对——与 `diff --numstat`
+/// 的基准一致；cwd 本就是仓库根时该选项不改变输出。
 fn untracked_paths(repo: &Path) -> Vec<String> {
-    git_ok(repo, &["ls-files", "--others", "--exclude-standard", "-z"])
+    git_ok(repo, &["ls-files", "--others", "--exclude-standard", "--full-name", "-z"])
         .map(|raw| raw.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect())
         .unwrap_or_default()
 }
@@ -129,18 +141,24 @@ fn untracked_paths(repo: &Path) -> Vec<String> {
 ///
 /// 两来源互斥：numstat 覆盖的是已跟踪文件（含已暂存的新增），未跟踪走
 /// `ls-files --others`，故**不会重复计入**同一个路径。
-fn files(repo: &Path, merge_base: Option<&str>) -> Vec<FileStat> {
+///
+/// `merge_base` 为 `None`（无默认分支，退化为「仅工作区改动」）时改用无 rev 的
+/// `git diff --numstat`，照样能把已跟踪文件的暂存/未暂存改动算进来。
+/// 未跟踪文件的内容相对仓库根 `root` 读取，与其根相对路径对应。
+fn files(repo: &Path, root: &Path, merge_base: Option<&str>) -> Vec<FileStat> {
     let mut out: Vec<FileStat> = Vec::new();
-    if let Some(mb) = merge_base {
-        if let Some(raw) = git_ok(repo, &["diff", "--numstat", "-z", mb]) {
-            out.extend(parse_numstat(&raw));
-        }
+    let numstat = match merge_base {
+        Some(mb) => git_ok(repo, &["diff", "--numstat", "-z", mb]),
+        None => git_ok(repo, &["diff", "--numstat", "-z"]),
+    };
+    if let Some(raw) = numstat {
+        out.extend(parse_numstat(&raw));
     }
     for path in untracked_paths(repo) {
-        let additions = std::fs::read(repo.join(&path))
-            .map(|b| b.iter().filter(|&&c| c == b'\n').count() as u64)
-            .unwrap_or(0);
-        let binary = is_binary(&repo.join(&path));
+        let full = root.join(&path);
+        let additions =
+            std::fs::read(&full).map(|b| b.iter().filter(|&&c| c == b'\n').count() as u64).unwrap_or(0);
+        let binary = is_binary(&full);
         out.push(FileStat { path, status: "A".into(), additions, deletions: 0, binary });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -181,10 +199,13 @@ fn is_binary(path: &Path) -> bool {
 }
 
 /// 未跟踪文件合成一份「整文件新增」的 unified diff（避免触碰用户索引）。
-fn untracked_diff(repo: &Path, paths: &[String]) -> String {
+///
+/// `paths` 与 `root` 都是仓库根相对，故合成头 `diff --git a/.. b/..` 与 git 自己
+/// 产出的头共用同一基准。
+fn untracked_diff(root: &Path, paths: &[String]) -> String {
     let mut out = String::new();
     for path in paths {
-        let Ok(content) = std::fs::read_to_string(repo.join(path)) else { continue };
+        let Ok(content) = std::fs::read_to_string(root.join(path)) else { continue };
         let lines: Vec<&str> = content.lines().collect();
         out.push_str(&format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"));
         out.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
@@ -211,20 +232,22 @@ fn truncate(diff: String) -> (String, bool) {
 }
 
 pub fn thread_diff(repo: &Path, explicit_base: Option<&str>) -> ThreadDiff {
+    let root = repo_root(repo);
     let (base, base_kind) = resolve_base(repo, explicit_base);
     let mb = base.as_deref().and_then(|b| merge_base(repo, b));
     let commits = mb.as_deref().map(|m| commits(repo, m)).unwrap_or_default();
-    let files = files(repo, mb.as_deref());
+    let files = files(repo, &root, mb.as_deref());
 
-    let mut diff = String::new();
-    if let Some(mb) = mb.as_deref() {
-        if let Some(raw) = git_ok(repo, &["diff", "--no-color", mb]) {
-            diff.push_str(&raw);
-        }
-    }
-    // 未跟踪不在 `git diff <mb>` 的输出里，单独合成并入；它们不在 numstat 中，
+    // 无基准时同样要报「仅工作区改动」：无 rev 的 `git diff` 覆盖已跟踪文件的
+    // 暂存 + 未暂存改动，与 `files` 的 `None` 分支同源。
+    let tracked = match mb.as_deref() {
+        Some(mb) => git_ok(repo, &["diff", "--no-color", mb]),
+        None => git_ok(repo, &["diff", "--no-color"]),
+    };
+    let mut diff = tracked.unwrap_or_default();
+    // 未跟踪不在 `git diff` 的输出里，单独合成并入；它们不在 numstat 中，
     // 故不会与已跟踪改动重复。
-    diff.push_str(&untracked_diff(repo, &untracked_paths(repo)));
+    diff.push_str(&untracked_diff(&root, &untracked_paths(repo)));
     let (unified_diff, truncated) = truncate(diff);
 
     ThreadDiff {
@@ -317,6 +340,59 @@ mod tests {
         assert!(paths.contains(&"new.txt"), "untracked file must appear: {paths:?}");
         assert!(d.unified_diff.contains("+two"), "diff: {}", d.unified_diff);
         assert!(d.unified_diff.contains("+hello"), "diff: {}", d.unified_diff);
+    }
+
+    /// 回归 #1：无默认分支（`worktree-only`）时也必须报出已跟踪文件的未提交改动。
+    ///
+    /// 修复前 `files` / `unified_diff` 都只在 `Some(mb)` 分支里跑 git diff，
+    /// 于是 `worktree-only` 只剩未跟踪文件，已跟踪文件的未提交编辑整体丢失。
+    #[test]
+    fn worktree_only_includes_tracked_uncommitted_edits() {
+        let dir = repo(); // 分支 `trunk`，无 remote ⇒ resolve_base 给出 worktree-only
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap(); // 已跟踪文件的未提交改动
+        let d = thread_diff(dir.path(), None);
+        assert_eq!(d.base_kind, "worktree-only");
+        assert_eq!(d.base, None);
+        let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"a.txt"), "tracked uncommitted edit must appear: {paths:?}");
+        let a = d.files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert_eq!((a.additions, a.deletions), (1, 0), "numstat must be read: {a:?}");
+        assert!(d.unified_diff.contains("+two"), "tracked edit must be in the diff: {}", d.unified_diff);
+    }
+
+    /// 回归 #2：`repo` 是工作树子目录时，所有路径必须统一为仓库根相对。
+    ///
+    /// 修复前 `ls-files --others` 给的是 cwd 相对路径（`u.txt`），而
+    /// `diff --numstat` 给的是仓库根相对路径（`sub/t.txt`），同一次结果里
+    /// 混了两套基准；合成的 `diff --git a/.. b/..` 头也跟着错。
+    #[test]
+    fn subdirectory_cwd_reports_root_relative_paths() {
+        let dir = repo();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("t.txt"), "t\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-q", "-m", "add sub"]] {
+            assert!(std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        std::fs::write(sub.join("t.txt"), "t\nedit\n").unwrap(); // 已提交文件的未提交改动
+        std::fs::write(sub.join("u.txt"), "hello\n").unwrap(); // 子目录里的未跟踪文件
+
+        let d = thread_diff(&sub, None); // thread 的 cwd 是子目录（Task 2 的调用方式）
+        let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"sub/t.txt"), "tracked edit must be root-relative: {paths:?}");
+        assert!(paths.contains(&"sub/u.txt"), "untracked must be root-relative: {paths:?}");
+        assert!(!paths.contains(&"u.txt") && !paths.contains(&"t.txt"), "no cwd-relative paths: {paths:?}");
+        assert!(
+            d.unified_diff.contains("diff --git a/sub/u.txt b/sub/u.txt"),
+            "synthesized header must be root-relative: {}",
+            d.unified_diff
+        );
+        assert!(d.unified_diff.contains("+hello"), "untracked content must be in the diff: {}", d.unified_diff);
     }
 
     #[test]
