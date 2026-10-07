@@ -621,6 +621,10 @@ mod tests {
             text.contains("| --- | --- | --- |"),
             "table rule lost: {text}"
         );
+        assert!(
+            text.contains("| 华东 | 3280 | 15.2% |"),
+            "table row lost: {text}"
+        );
     }
 
     #[tokio::test]
@@ -683,5 +687,16 @@ mod tests {
         assert!(meta.read_only);
         assert!(!meta.requires_confirmation);
         assert_eq!(meta.source, ToolSource::Builtin);
+    }
+
+    #[test]
+    fn builtin_registration_includes_read_document() {
+        let tmp = TempDir::new().unwrap();
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        crate::register_builtin_tools(&mut registry, tmp.path().to_path_buf());
+        assert!(
+            registry.get("read_document").is_some(),
+            "read_document must be registered for every builtin tool set"
+        );
     }
 }
