@@ -25,13 +25,22 @@ export interface RpcError {
 
 export type ToolStatus = "running" | "completed" | "failed";
 
+/** 一条消息附带的文档元数据（内容不进协议，agent 用 read_document 读）。 */
+export interface Attachment {
+  name: string;
+  /** 相对工作区根的路径，形如 `.yi-agent/attachments/<thread_id>/<hash>-<name>`。 */
+  path: string;
+  mime?: string;
+  size: number;
+}
+
 export type Item =
-  | { type: "userMessage"; id: string; text: string }
+  | { type: "userMessage"; id: string; text: string; attachments?: Attachment[] }
   /**
    * 中途追加的用户消息：属于当前 turn，但作为独立 item 渲染，避免与开启该
    * turn 的那条消息混为一谈。`id` 是服务端在 RPC 入口铸的 `interjection_id`。
    */
-  | { type: "user_interjection"; id: string; text: string }
+  | { type: "user_interjection"; id: string; text: string; attachments?: Attachment[] }
   | { type: "agentMessage"; id: string; text: string }
   | {
       type: "toolCall";
