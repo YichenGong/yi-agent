@@ -110,4 +110,14 @@ mod tests {
         install_system_skills(&target).unwrap();
         assert!(target.join("skill-creator/SKILL.md").is_file());
     }
+
+    #[test]
+    fn installs_the_git_diff_review_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_system_skills(tmp.path()).unwrap();
+        let path = tmp.path().join("git-diff-review/SKILL.md");
+        assert!(path.is_file());
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(body.contains("show_git_diff"), "skill must name the tool");
+    }
 }
