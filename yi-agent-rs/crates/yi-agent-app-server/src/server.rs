@@ -8067,6 +8067,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// 捕获每次调用里最后一条 user 文本:证明送进**模型**的确实是带清单的
+    /// prompt(而不是气泡上的原话)。清单是注入给模型的,气泡只放用户原话。
+    struct CapturingProvider {
+        prompts: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for CapturingProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            use yi_agent_core::message::{ContentBlock, Role};
+            if let Some(last_user) = req.messages.iter().rev().find(|m| m.role == Role::User) {
+                let text = last_user
+                    .content
+                    .iter()
+                    .find_map(|b| match b {
+                        ContentBlock::Text(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                self.prompts.lock().unwrap().push(text);
+            }
+            let events = vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("ok".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
     /// 永不自行结束的 provider:每 5ms 吐一个 delta,turn 会一直活跃,
     /// 直到被 `turn/interrupt` 取消。
     struct SlowProvider;
@@ -9567,6 +9604,92 @@ pub(crate) mod tests {
             "attachment was not copied: {rel}"
         );
         // 气泡正文是用户原话，不含注入的清单。
+        assert_eq!(item["text"], "总结一下", "{item}");
+        h.shutdown().await;
+    }
+
+    /// 反向断言：清单必须真的送进**模型**。只断言 `Item.text` 不含清单一事
+    /// 无法防住「将来把 `display_text` 传给 `agent.run`」这类静默回归。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_prompt_reaching_the_model_contains_the_attachment_manifest() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+
+        let prompts: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prompts_factory = Arc::clone(&prompts);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          _cwd: &std::path::Path,
+                          _mode: crate::thread_store::ThreadMode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CapturingProvider {
+                prompts: Arc::clone(&prompts_factory),
+            });
+            let config = yi_agent_core::AgentConfig::default();
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            apply_session(&mut agent, session);
+            Ok(BuiltAgent {
+                agent,
+                provider,
+                config,
+                decision_tx: None,
+                decision_rx: None,
+                catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("报告.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"attachment","path":"{}"}},{{"type":"text","text":"总结一下"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        // 等到 turn 收尾，确保 provider 至少被调用过一次。
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if opener.is_none()
+                && v.get("method").and_then(|m| m.as_str()) == Some("item/started")
+                && v["params"]["item"]["type"] == "userMessage"
+            {
+                opener = Some(v["params"]["item"].clone());
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        // 送给模型的那条 user 文本必须带清单（安全化 + 加引号后的形态）。
+        let seen = prompts.lock().unwrap().clone();
+        let sent = seen
+            .last()
+            .expect("the provider must have been called at least once");
+        assert!(
+            sent.contains("Attached files (read them with read_document):"),
+            "the manifest header never reached the model: {sent:?}"
+        );
+        assert!(
+            sent.contains("- \"报告.pdf\" (application/pdf, 13 bytes) -> .yi-agent/attachments/"),
+            "the sanitized, quoted manifest line is missing from the model prompt: {sent:?}"
+        );
+        assert!(
+            sent.starts_with("总结一下"),
+            "the model prompt must still lead with the user's words: {sent:?}"
+        );
+
+        // 气泡/Item.text 仍只是用户原话——清单不进 UI 文本。
+        let item = opener.expect("the turn must open with a user item");
         assert_eq!(item["text"], "总结一下", "{item}");
         h.shutdown().await;
     }
