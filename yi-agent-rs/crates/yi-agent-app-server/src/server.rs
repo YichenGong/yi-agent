@@ -5737,6 +5737,7 @@ async fn start_thread_core(
         pin_seq: None,
         board_project: board_project.map(str::to_string),
         card_id: card_id.map(str::to_string),
+        model_ref: None,
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -10827,6 +10828,7 @@ pub(crate) mod tests {
             pin_seq: None,
             board_project: board_project.map(str::to_string),
             card_id: card_id.map(str::to_string),
+            model_ref: None,
         };
         crate::thread_store::ThreadStore::new(dir)
             .create(&meta)
@@ -11011,6 +11013,7 @@ pub(crate) mod tests {
                 pin_seq: None,
                 board_project: None,
                 card_id: None,
+                model_ref: None,
             })
             .unwrap();
         store
@@ -11110,6 +11113,7 @@ pub(crate) mod tests {
                 pin_seq: None,
                 board_project: None,
                 card_id: None,
+                model_ref: None,
             })
             .unwrap();
         // 一轮正常收尾过的历史。
