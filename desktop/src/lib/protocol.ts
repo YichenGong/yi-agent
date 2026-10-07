@@ -95,6 +95,10 @@ export type Notification =
       params: { threadId: string; taskId: string; row: AgentTraceRow };
     }
   | { method: "ui/settings/updated"; params: { theme: string } }
+  | {
+      method: "ui/gitDiff/focus";
+      params: { threadId: string | null; base: string | null; note: string | null };
+    }
   | { method: "error"; params: { message: string } };
 
 /**
@@ -225,4 +229,37 @@ export interface ThreadCompactParams {
 export interface ThreadCompactResult {
   status: "compacted" | "not_reduced" | "failed";
   error?: string;
+}
+
+export interface CommitInfo {
+  sha: string;
+  short: string;
+  subject: string;
+  author: string;
+  timestamp: number;
+}
+
+export interface FileStat {
+  path: string;
+  status: string;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+}
+
+/** `thread/diff/read` 的默认响应。 */
+export interface ThreadDiffResult {
+  base: string | null;
+  baseKind: string;
+  mergeBase: string | null;
+  commits: CommitInfo[];
+  files: FileStat[];
+  unifiedDiff: string;
+  truncated: boolean;
+}
+
+/** `thread/diff/read` 的 `commit` / `path` 分支响应。 */
+export interface DiffTextResult {
+  unifiedDiff: string;
+  truncated: boolean;
 }
