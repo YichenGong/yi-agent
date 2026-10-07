@@ -90,7 +90,7 @@ describe("ThreadStore", () => {
     s.seed([summary("a", "running"), summary("b")]);
     expect(s.view("a").status).toBe("running");
     expect(s.view("b").status).toBe("idle");
-    expect(s.view("a").info).toEqual({ cwd: "/w", model: "m" });
+    expect(s.view("a").info).toEqual({ cwd: "/w", model: "m", model_ref: null });
   });
 
   it("does not let a stale listing snapshot roll back a live status", () => {
