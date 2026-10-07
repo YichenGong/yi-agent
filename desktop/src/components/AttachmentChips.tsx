@@ -40,7 +40,9 @@ export function AttachmentChips({
             <span className="max-w-[16rem] truncate" title={a.path}>
               {label}
             </span>
-            <span className="text-fg-subtle">{formatSize(a.size)}</span>
+            {/* `size: 0` 意为「未知」（桌面端 dialog 只给路径），不是 0 字节：
+                此时整段省略，绝不渲染成 "0 B" 假装知道大小。 */}
+            {a.size > 0 ? <span className="text-fg-subtle">{formatSize(a.size)}</span> : null}
             <button
               type="button"
               // 逐附件定位：多个 chip 时必须说清移除的是哪一个。

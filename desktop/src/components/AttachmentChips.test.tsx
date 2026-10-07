@@ -48,6 +48,20 @@ describe("AttachmentChips", () => {
     expect(container.firstChild).toBeNull();
   });
 
+  // 生产形态：桌面端文件选择器只给路径，`App.tsx` 一律以 `size: 0` 入列。
+  // 0 意为「未知」，chip 不能把它渲染成 "0 B"（假装知道大小）。
+  it("omits the size when it is unknown (size: 0), keeping the label and remove button", () => {
+    render(
+      <AttachmentChips
+        attachments={[{ path: "/tmp/picked.pdf", name: "picked.pdf", size: 0 }]}
+        onRemove={() => {}}
+      />,
+    );
+    expect(screen.getByText("picked.pdf")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "移除 picked.pdf" })).toBeTruthy();
+    expect(screen.queryByText("0 B")).toBeNull();
+  });
+
   it("falls back to the path's last segment when the name is empty", () => {
     render(
       <AttachmentChips
