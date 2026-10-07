@@ -22,7 +22,7 @@ use yi_agent_core::ToolRegistry;
 
 pub use context::ToolsContext;
 pub use error::ToolsError;
-pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, ViewImageTool, WriteTool};
+pub use fs::{EditTool, GlobTool, GrepTool, ReadDocumentTool, ReadTool, ViewImageTool, WriteTool};
 pub use process::{
     ManagedProcessSnapshot, OnExitPolicy, ProcessEvent, ProcessKillTool, ProcessListTool,
     ProcessManager, ProcessReadResult, ProcessReadTool, ProcessSelector, ProcessStartOptions,

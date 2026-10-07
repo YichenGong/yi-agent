@@ -39,6 +39,19 @@ base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 html2md = "0.1"
 
+# 文档读取（read_document）
+# PDF 文本层抽取（纯 Rust，无渲染引擎）。
+pdf-extract = "0.12"
+# 按页切片：复制对象 + 新建单页 Catalog/Pages。
+lopdf = "0.45"
+# NFKC。注意：NFKC 不折叠 CJK 部首补充区（U+2E80–U+2EFF），
+# 还需 UCD EquivalentUnifiedIdeograph 表（见 src/fs/unicode/）。
+unicode-normalization = "0.1"
+# DOCX 只是 zip + DEFLATE。必须收紧默认特性：
+# 默认会拉 zstd-sys（C 代码，经 cc）。
+zip = { version = "8", default-features = false, features = ["deflate"] }
+quick-xml = "0.38"
+
 # tracing
 tracing = "0.1"
 

@@ -56,6 +56,12 @@ pub enum ToolsError {
 
     #[error("image decode failed: {0}")]
     ImageDecode(String),
+
+    #[error("document parse failed: {0}")]
+    DocumentParse(String),
+
+    #[error("document too large: {size} bytes (max {max})")]
+    DocumentTooLarge { size: u64, max: u64 },
 }
 
 impl From<ToolsError> for ToolResult {
