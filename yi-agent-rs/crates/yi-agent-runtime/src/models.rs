@@ -19,7 +19,7 @@ pub enum ModelProvider {
 }
 
 impl ModelProvider {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             ModelProvider::Anthropic => "anthropic",
             ModelProvider::Openai => "openai",
@@ -132,11 +132,26 @@ pub fn save_catalog(catalog: &ModelCatalog) -> std::io::Result<()> {
     save_catalog_to(&models_path(), catalog)
 }
 
+/// 写清单：读-改-写，保留 `models.json` 里无关的顶层键，最后原子替换。
 pub fn save_catalog_to(path: &Path, catalog: &ModelCatalog) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let text = serde_json::to_string_pretty(catalog).map_err(std::io::Error::other)?;
+    // 读-改-写：以既有对象为底，仅覆盖本模块拥有的三个键，其余顶层键原样保留。
+    // 文件缺失 / 损坏 / 非对象时从空对象起步（与 `load_catalog_from` 的容错一致）。
+    let mut object = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    let catalog_value = serde_json::to_value(catalog).map_err(std::io::Error::other)?;
+    if let serde_json::Value::Object(fields) = catalog_value {
+        for (key, value) in fields {
+            object.insert(key, value);
+        }
+    }
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .map_err(std::io::Error::other)?;
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!("models.json.{}.{}.tmp", std::process::id(), seq));
@@ -272,6 +287,24 @@ mod tests {
             stray.is_empty(),
             "no temp file may survive a save: {stray:?}"
         );
+    }
+
+    #[test]
+    fn saving_preserves_unrelated_top_level_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"models":[],"future_key":42}"#).unwrap();
+        let catalog = ModelCatalog {
+            models: vec![entry("a")],
+            default_model: Some("a".into()),
+            subagent_model: None,
+        };
+        save_catalog_to(&path, &catalog).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw.get("future_key"), Some(&serde_json::json!(42)));
+        assert_eq!(load_catalog_from(&path), catalog);
     }
 
     #[test]
