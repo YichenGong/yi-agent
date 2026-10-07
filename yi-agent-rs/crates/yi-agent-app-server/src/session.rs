@@ -21,6 +21,8 @@ pub struct TurnPrompt {
     /// objective 会被写进 root 任务。带上 root 而非某个快照,这样激活前能先探活、
     /// 必要时重建 runtime 并重挂本会话的 root。
     pub activate: Option<Arc<yi_agent_subagent::thread_root::ThreadRoot>>,
+    /// 本轮用户附加的文档；落盘时写进开启的 `userMessage` item 供回放渲染。
+    pub attachments: Vec<crate::protocol::Attachment>,
 }
 
 /// 一条中途追加的用户消息,投递给该 thread 的 driver。

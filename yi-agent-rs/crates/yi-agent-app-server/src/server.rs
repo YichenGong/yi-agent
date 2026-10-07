@@ -4900,6 +4900,7 @@ async fn run_thread_driver(
             turn_id,
             prompt,
             activate,
+            attachments: turn_attachments,
         }) = turn_prompt
         else {
             break; // prompt_rx 关闭:driver 收尾退出
@@ -4936,6 +4937,8 @@ async fn run_thread_driver(
         let mut completed_items: Vec<crate::protocol::Item> = Vec::new();
         let mut last_usage: Option<crate::thread_store::TurnUsage> = None;
         let user_prompt = prompt.clone();
+        // 本轮附件暂存:落盘时写进开启的 userMessage item(接线在下一任务完成)。
+        let _user_attachments = turn_attachments.clone();
         translator.set_turn(turn_id.clone());
 
         // turn 开始就把提问落进 checkpoint：即使这一轮随后立刻崩溃，
@@ -5598,6 +5601,7 @@ where
                 turn_id: prepared.turn_id,
                 prompt: prepared.prompt,
                 activate: prepared.activate,
+                attachments: Vec::new(),
             })
             .await
             .is_err()
@@ -6003,6 +6007,7 @@ async fn start_turn_core(
             turn_id: prepared.turn_id,
             prompt: prepared.prompt,
             activate: prepared.activate,
+            attachments: Vec::new(),
         })
         .await
         .is_err()
@@ -9629,6 +9634,7 @@ pub(crate) mod tests {
                 turn_id: "turn-1".into(),
                 prompt: "hi".into(),
                 activate: None,
+                attachments: Vec::new(),
             })
             .await
             .unwrap();
@@ -9750,6 +9756,7 @@ pub(crate) mod tests {
                 turn_id: "turn-1".into(),
                 prompt: "hi".into(),
                 activate: None,
+                attachments: Vec::new(),
             })
             .await
             .unwrap();
@@ -9894,6 +9901,7 @@ pub(crate) mod tests {
                     turn_id: turn.into(),
                     prompt: "hi".into(),
                     activate: None,
+                    attachments: Vec::new(),
                 })
                 .await
                 .unwrap();
@@ -10284,6 +10292,7 @@ pub(crate) mod tests {
                 turn_id: "turn-1".into(),
                 prompt: "hi".into(),
                 activate: None,
+                attachments: Vec::new(),
             })
             .await
             .unwrap();
@@ -11304,6 +11313,7 @@ pub(crate) mod tests {
                 turn_id: "turn-1".into(),
                 prompt: "hi".into(),
                 activate: None,
+                attachments: Vec::new(),
             })
             .await
             .unwrap();
