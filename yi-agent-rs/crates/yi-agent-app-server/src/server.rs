@@ -4667,12 +4667,17 @@ async fn interrupt_and_wait_for_persist(
 fn build_partial(
     turn_id: &str,
     user_prompt: &str,
+    user_attachments: &[crate::protocol::Attachment],
     completed_items: &[crate::protocol::Item],
     messages: Vec<yi_agent_core::Message>,
     usage: Option<crate::thread_store::TurnUsage>,
 ) -> crate::thread_store::PartialTurn {
     let mut items = Vec::with_capacity(completed_items.len() + 1);
-    items.push(opening_user_item(turn_id, user_prompt));
+    items.push(opening_user_item(
+        turn_id,
+        user_prompt,
+        user_attachments.to_vec(),
+    ));
     items.extend(completed_items.iter().cloned());
     crate::thread_store::PartialTurn {
         turn_id: turn_id.to_string(),
@@ -4704,6 +4709,7 @@ async fn persist_and_finish_turn(
     thread_id: &str,
     turn_id: Option<&str>,
     user_prompt: Option<&str>,
+    user_attachments: &[crate::protocol::Attachment],
     agent: &yi_agent_core::Agent,
     completed_items: Vec<crate::protocol::Item>,
     last_usage: Option<crate::thread_store::TurnUsage>,
@@ -4718,7 +4724,7 @@ async fn persist_and_finish_turn(
         items.push(crate::protocol::Item::UserMessage {
             id: format!("user-{}", turn_id.unwrap_or("session-command")),
             text: prompt.to_string(),
-            attachments: Vec::new(),
+            attachments: user_attachments.to_vec(),
         });
     }
     items.extend(completed_items);
@@ -4782,6 +4788,7 @@ async fn apply_session_command(
                 thread_id,
                 None,
                 None,
+                &[],
                 &agent,
                 Vec::new(),
                 None,
@@ -4819,6 +4826,7 @@ async fn apply_session_command(
                 thread_id,
                 None,
                 None,
+                &[],
                 &agent,
                 Vec::new(),
                 None,
@@ -4901,6 +4909,7 @@ async fn run_thread_driver(
             prompt,
             activate,
             attachments: turn_attachments,
+            display_text,
         }) = turn_prompt
         else {
             break; // prompt_rx 关闭:driver 收尾退出
@@ -4936,9 +4945,10 @@ async fn run_thread_driver(
         // (input 来自 `message_start`、output 来自 `message_delta`,由 Translator 合并)。
         let mut completed_items: Vec<crate::protocol::Item> = Vec::new();
         let mut last_usage: Option<crate::thread_store::TurnUsage> = None;
-        let user_prompt = prompt.clone();
-        // 本轮附件暂存:落盘时写进开启的 userMessage item(接线在下一任务完成)。
-        let _user_attachments = turn_attachments.clone();
+        // 气泡正文=用户原话(不含注入的清单);`prompt`(带清单)只送模型。
+        let user_prompt = display_text;
+        // 本轮附件暂存:落盘时写进开启的 userMessage item。
+        let user_attachments = turn_attachments;
         translator.set_turn(turn_id.clone());
 
         // turn 开始就把提问落进 checkpoint：即使这一轮随后立刻崩溃，
@@ -4949,6 +4959,7 @@ async fn run_thread_driver(
             build_partial(
                 &turn_id,
                 &user_prompt,
+                &user_attachments,
                 &[],
                 agent.session().messages().to_vec(),
                 None,
@@ -5215,6 +5226,7 @@ async fn run_thread_driver(
                         build_partial(
                             &turn_id,
                             &user_prompt,
+                            &user_attachments,
                             &completed_items,
                             agent.session().messages().to_vec(),
                             last_usage.clone(),
@@ -5303,6 +5315,7 @@ async fn run_thread_driver(
             &thread_id,
             Some(&turn_id),
             Some(&user_prompt),
+            &user_attachments,
             &agent,
             std::mem::take(&mut completed_items),
             last_usage.take(),
@@ -5592,7 +5605,11 @@ where
         emit_item(
             &hub,
             &prepared.thread_id,
-            opening_user_item(&prepared.turn_id, &prepared.prompt),
+            opening_user_item(
+                &prepared.turn_id,
+                &prepared.display_text,
+                prepared.attachments.clone(),
+            ),
         )
         .await?;
         if prepared
@@ -5601,7 +5618,8 @@ where
                 turn_id: prepared.turn_id,
                 prompt: prepared.prompt,
                 activate: prepared.activate,
-                attachments: Vec::new(),
+                attachments: prepared.attachments,
+                display_text: prepared.display_text,
             })
             .await
             .is_err()
@@ -5834,6 +5852,8 @@ enum TurnPrepareError {
     EmptyInput,
     UnknownThread(String),
     TurnInProgress(String),
+    /// 附件不可读 / 超出上限 / 不是文件。
+    InvalidAttachment(String),
 }
 
 /// 一个已经「占位」好的 turn,但**尚未向任何客户端发帧**。
@@ -5845,7 +5865,12 @@ pub(crate) struct PreparedTurn {
     pub(crate) thread_id: String,
     pub(crate) turn_id: String,
     pub(crate) prompt_tx: mpsc::Sender<TurnPrompt>,
+    /// 送给模型的 prompt（含附件清单注入）。
     pub(crate) prompt: String,
+    /// 气泡正文:用户原话，**不含**注入的清单。
+    pub(crate) display_text: String,
+    /// 本轮附件元数据；回显在开启项上，并随 `TurnPrompt` 交给 driver 落盘。
+    pub(crate) attachments: Vec<crate::protocol::Attachment>,
     pub(crate) activate: Option<Arc<ThreadRoot>>,
     pub(crate) status_handle: Arc<std::sync::Mutex<ThreadStatus>>,
 }
@@ -5866,11 +5891,66 @@ async fn prepare_turn_core(
         .and_then(|v| v.as_str())
         .ok_or(TurnPrepareError::MissingThreadId)?
         .to_string();
-    let prompt = extract_prompt(params).ok_or(TurnPrepareError::EmptyInput)?;
+    // 一次性拆出「文本 + 附件源路径」:文本为空但有附件时仍然放行(附件-only)。
+    let (text, source_paths) = crate::attachments::parse_input(params);
+    let text_opt = if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    };
+    if text_opt.is_none() && source_paths.is_empty() {
+        return Err(TurnPrepareError::EmptyInput);
+    }
 
     let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
-    // 内层作用域:让 `&mut threads` 的借用先结束。
-    let (prompt_tx, status_handle) = {
+    // 内层作用域:让 `&mut threads` 的借用先结束(下面复制附件还要再借一次)。
+    let (prompt_tx, status_handle, cwd) = {
+        let Some(session) = threads.get_mut(&thread_id) else {
+            return Err(TurnPrepareError::UnknownThread(thread_id));
+        };
+        if session.active_turn_id.is_some() {
+            return Err(TurnPrepareError::TurnInProgress(thread_id));
+        }
+        (
+            session.prompt_tx.clone(),
+            Arc::clone(&session.status),
+            session.cwd.clone(),
+        )
+    };
+
+    // 复制附件进工作区。放在占 `active_turn_id` **之前**:失败要能干净地拒绝,
+    // 不留一个「已占用但起不来」的 turn。
+    let max_bytes = crate::attachments::resolve_max_bytes();
+    let mut attachments = Vec::with_capacity(source_paths.len());
+    for source in &source_paths {
+        match crate::attachments::store_attachment(
+            Path::new(&cwd),
+            &thread_id,
+            Path::new(source),
+            max_bytes,
+        ) {
+            Ok(attachment) => attachments.push(attachment),
+            Err(crate::attachments::AttachmentError::TooLarge { size, max }) => {
+                return Err(TurnPrepareError::InvalidAttachment(format!(
+                    "attachment {source} is {size} bytes, over the {max} byte limit"
+                )));
+            }
+            Err(crate::attachments::AttachmentError::NotAFile(path)) => {
+                return Err(TurnPrepareError::InvalidAttachment(format!(
+                    "attachment {} is not a regular file",
+                    path.display()
+                )));
+            }
+            Err(crate::attachments::AttachmentError::Io(e)) => {
+                return Err(TurnPrepareError::InvalidAttachment(format!(
+                    "could not read attachment {source}: {e}"
+                )));
+            }
+        }
+    }
+
+    // 占位(复制成功之后)。
+    {
         let Some(session) = threads.get_mut(&thread_id) else {
             return Err(TurnPrepareError::UnknownThread(thread_id));
         };
@@ -5878,15 +5958,21 @@ async fn prepare_turn_core(
             return Err(TurnPrepareError::TurnInProgress(thread_id));
         }
         session.active_turn_id = Some(turn_id.clone());
-        (session.prompt_tx.clone(), Arc::clone(&session.status))
-    };
+    }
 
     let activate = pending_activation.get(&thread_id).cloned().flatten();
+    // prompt 送进模型时带上附件清单;气泡文本仍是原话(见 `display_text`)。
+    let prompt = crate::attachments::prompt_with_attachments(
+        text_opt.as_deref().unwrap_or(""),
+        &attachments,
+    );
     Ok(PreparedTurn {
         thread_id,
         turn_id,
         prompt_tx,
         prompt,
+        display_text: text_opt.unwrap_or_default(),
+        attachments,
         activate,
         status_handle,
     })
@@ -5899,6 +5985,7 @@ fn turn_prepare_rpc_error(error: TurnPrepareError) -> RpcError {
         TurnPrepareError::EmptyInput => RpcError::invalid_params("missing or empty input text"),
         TurnPrepareError::UnknownThread(thread_id) => RpcError::unknown_thread(&thread_id),
         TurnPrepareError::TurnInProgress(thread_id) => RpcError::turn_in_progress(&thread_id),
+        TurnPrepareError::InvalidAttachment(msg) => RpcError::invalid_params(msg),
     }
 }
 
@@ -5912,11 +5999,15 @@ fn turn_prepare_rpc_error(error: TurnPrepareError) -> RpcError {
 /// (`start_turn_core`) and the board path (`ServeLauncher`) call, fixes the order
 /// at the source and keeps the id identical to the persisted one (`user-<turn_id>`),
 /// so the desktop merges the live bubble with the replayed one by id.
-fn opening_user_item(turn_id: &str, text: &str) -> crate::protocol::Item {
+fn opening_user_item(
+    turn_id: &str,
+    text: &str,
+    attachments: Vec<crate::protocol::Attachment>,
+) -> crate::protocol::Item {
     crate::protocol::Item::UserMessage {
         id: format!("user-{turn_id}"),
         text: text.to_string(),
-        attachments: Vec::new(),
+        attachments,
     }
 }
 
@@ -5984,7 +6075,11 @@ async fn start_turn_core(
     emit_item(
         hub,
         &prepared.thread_id,
-        opening_user_item(&prepared.turn_id, &prepared.prompt),
+        opening_user_item(
+            &prepared.turn_id,
+            &prepared.display_text,
+            prepared.attachments.clone(),
+        ),
     )
     .await?;
     update_status(
@@ -6007,7 +6102,8 @@ async fn start_turn_core(
             turn_id: prepared.turn_id,
             prompt: prepared.prompt,
             activate: prepared.activate,
-            attachments: Vec::new(),
+            attachments: prepared.attachments,
+            display_text: prepared.display_text,
         })
         .await
         .is_err()
@@ -6072,17 +6168,12 @@ async fn require_thread_id(
 }
 
 /// 从 `turn/start` 的 params 提取用户文本:`input:[{type:"text",text}]` 拼接。
+///
+/// 非 text 的 block（含 attachment）由 `crate::attachments::parse_input` 另行处理；
+/// 这里只看文本，空文本返回 `None`。**注意**：附件-only 的消息在这里是 `None`，
+/// 是否放行由调用方结合附件列表决定（见 `prepare_turn_core`）。
 fn extract_prompt(params: &serde_json::Value) -> Option<String> {
-    let input = params.get("input")?.as_array()?;
-    let mut text = String::new();
-    for block in input {
-        if block.get("type").and_then(|t| t.as_str()) != Some("text") {
-            continue;
-        }
-        if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
-            text.push_str(t);
-        }
-    }
+    let (text, _paths) = crate::attachments::parse_input(params);
     if text.trim().is_empty() {
         None
     } else {
@@ -9423,6 +9514,127 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 用户从工作区外选中的文件必须被**复制**进 thread 的 cwd，元数据回显在开启项
+    /// 上；气泡正文仍是用户原话，注入的清单只出现在送给模型的 prompt 里。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_copies_attachments_and_echoes_them_on_the_item() {
+        // 用自带 workdir 的 harness：默认 `/tmp` 目录会跨次运行残留同名附件，
+        // 那样「盘上存在」就可能被旧文件蒙混过关。
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        // 源文件放在工作区外，模拟「从 Downloads 选文件」。
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("报告.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"attachment","path":"{}"}},{{"type":"text","text":"总结一下"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        // 本轮第一条 item/started 就是开启项:用户消息(附 attachment 元数据)。
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") {
+                opener = Some(v["params"]["item"].clone());
+                break;
+            }
+        }
+        let item = opener.expect("the turn must open with an item");
+        assert_eq!(item["type"], "userMessage", "{item}");
+        assert_eq!(item["attachments"][0]["name"], "报告.pdf", "{item}");
+        let rel = item["attachments"][0]["path"]
+            .as_str()
+            .expect("an attachment path must be a string");
+        assert!(rel.starts_with(".yi-agent/attachments/"), "{rel}");
+        // 磁盘上确实复制成功（相对 thread 的 cwd = 该 harness 的 workdir）。
+        assert!(
+            workdir.path().join(rel).is_file(),
+            "attachment was not copied: {rel}"
+        );
+        // 气泡正文是用户原话，不含注入的清单。
+        assert_eq!(item["text"], "总结一下", "{item}");
+        h.shutdown().await;
+    }
+
+    /// 只发附件、不打字也必须能起 turn（空 input 校验放宽到「既无文本又无附件」）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_accepts_an_attachment_only_message() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("only.pdf");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"attachment","path":"{}"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        let mut resp: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        assert!(
+            resp.get("error").is_none(),
+            "attachment-only start must succeed: {resp:?}"
+        );
+        assert!(
+            resp["result"]["turn_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "an attachment-only turn must still return a turn_id: {resp:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 读不到的附件路径必须就地拒绝（错误提到 attachment），且一个 turn 都不起。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_rejects_an_unreadable_attachment() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":10,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"attachment","path":"/definitely/not/here.pdf"}},{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        // 应答之前不得有任何通知:准备失败要发生在发帧之前。
+        let mut methods_before_response: Vec<String> = Vec::new();
+        let mut resp: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(10)) {
+                resp = Some(v);
+                break;
+            }
+            if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
+                methods_before_response.push(m.to_string());
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        let err = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(err.contains("attachment"), "got: {resp}");
+        assert!(
+            methods_before_response.is_empty(),
+            "no turn may start on a bad attachment: {methods_before_response:?}"
+        );
+        h.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn turn_start_unknown_thread_returns_unknown_thread() {
         let mut h = Harness::new();
@@ -9635,6 +9847,7 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                display_text: "hi".into(),
             })
             .await
             .unwrap();
@@ -9757,6 +9970,7 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                display_text: "hi".into(),
             })
             .await
             .unwrap();
@@ -9902,6 +10116,7 @@ pub(crate) mod tests {
                     prompt: "hi".into(),
                     activate: None,
                     attachments: Vec::new(),
+                    display_text: "hi".into(),
                 })
                 .await
                 .unwrap();
@@ -10293,6 +10508,7 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                display_text: "hi".into(),
             })
             .await
             .unwrap();
@@ -11314,6 +11530,7 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                display_text: "hi".into(),
             })
             .await
             .unwrap();
