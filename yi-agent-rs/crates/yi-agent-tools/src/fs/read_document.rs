@@ -57,7 +57,18 @@ fn resolve_max_chars() -> usize {
     }
 }
 
-/// 解析 UCD `EquivalentUnifiedIdeograph.txt` 的 `SRC ; DST  # comment` 行。
+/// 解析一个十六进制码位（UCD 表里的 token）。
+fn parse_hex(token: &str) -> Option<u32> {
+    u32::from_str_radix(token.trim(), 16).ok()
+}
+
+/// 解析 UCD `EquivalentUnifiedIdeograph.txt` 的行：`SRC ; DST  # comment`，源码位可为
+/// 区间形式 `SRC..SRC2`。
+///
+/// **区间行必须展开**：表里有 5 条（`2E8C..2E8D ; 5C0F` 等），
+/// `u32::from_str_radix("2E8C..2E8D", 16)` 是 `Err`，只处理单码位形式会静默丢弃整段
+/// 映射；而这些码位 NFKC 并不折叠（各自 fold 到自身），缺陷会原样进入 agent 输出，
+/// 与 `⻓` U+2ED3 属同一类问题。
 fn equivalence_table() -> &'static HashMap<char, char> {
     use std::sync::OnceLock;
     static TABLE: OnceLock<HashMap<char, char>> = OnceLock::new();
@@ -70,10 +81,26 @@ fn equivalence_table() -> &'static HashMap<char, char> {
             }
             let main = line.split('#').next().unwrap_or("");
             let mut parts = main.split(';').map(str::trim);
-            if let (Some(a), Some(b)) = (parts.next(), parts.next()) {
-                if let (Ok(src), Ok(dst)) = (u32::from_str_radix(a, 16), u32::from_str_radix(b, 16))
-                {
-                    if let (Some(src), Some(dst)) = (char::from_u32(src), char::from_u32(dst)) {
+            let (Some(src), Some(dst)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            let Some(dst) = parse_hex(dst).and_then(char::from_u32) else {
+                continue;
+            };
+            match src.split_once("..") {
+                // 区间行：`src` 到 `src2` 的每个码位都映射到同一个目标码位。
+                Some((a, b)) => {
+                    let (Some(a), Some(b)) = (parse_hex(a), parse_hex(b)) else {
+                        continue;
+                    };
+                    for code in a..=b {
+                        if let Some(src) = char::from_u32(code) {
+                            m.insert(src, dst);
+                        }
+                    }
+                }
+                None => {
+                    if let Some(src) = parse_hex(src).and_then(char::from_u32) {
                         m.insert(src, dst);
                     }
                 }
@@ -456,6 +483,23 @@ mod tests {
         assert_eq!(repair_cjk("增⻓"), "增长"); // U+2ED3 -> U+957F
         assert_eq!(repair_cjk("第⼆⻚"), "第二页"); // U+2F02/U+2EDA -> U+4E8C/U+9875
         assert_eq!(repair_cjk("⻛险"), "风险"); // U+2EDB -> U+98CE
+    }
+
+    /// UCD 表的区间行（`SRC..SRC2 ; DST`）必须展开成逐个码位；这些码位 NFKC 不折叠，
+    /// 漏掉就会原样进入 agent 输出（与 `⻓` U+2ED3 同一缺陷类）。
+    #[test]
+    fn repair_expands_ucd_range_lines() {
+        // 下面是 5 条区间行各自的端点。
+        assert_eq!(repair_cjk("\u{2E8C}"), "\u{5C0F}"); // 2E8C..2E8D ; 5C0F
+        assert_eq!(repair_cjk("\u{2E8D}"), "\u{5C0F}");
+        assert_eq!(repair_cjk("\u{2EA4}"), "\u{722B}"); // 2EA4..2EA5 ; 722B
+        assert_eq!(repair_cjk("\u{2EA5}"), "\u{722B}");
+        assert_eq!(repair_cjk("\u{2EBE}"), "\u{8279}"); // 2EBE..2EC0 ; 8279
+        assert_eq!(repair_cjk("\u{2EC0}"), "\u{8279}");
+        assert_eq!(repair_cjk("\u{2ECC}"), "\u{8FB6}"); // 2ECC..2ECE ; 8FB6
+        assert_eq!(repair_cjk("\u{2ECE}"), "\u{8FB6}");
+        assert_eq!(repair_cjk("\u{31D2}"), "\u{4E3F}"); // 31D2..31D3 ; 4E3F
+        assert_eq!(repair_cjk("\u{31D3}"), "\u{4E3F}");
     }
 
     #[test]
