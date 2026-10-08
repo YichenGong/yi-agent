@@ -30,6 +30,9 @@ pub(crate) enum CardAction {
         thread_id: String,
         outcome: Outcome,
     },
+    /// 卡处于 `merging` 且其会话已空闲：宿主代调 `merge_finish` 收尾。
+    /// 复核以 git 为准，故这个动作幂等。
+    RequestMerge { card_id: String, thread_id: String },
 }
 
 /// What the host last told the plugin about a tracked card. A card we reported
@@ -75,6 +78,17 @@ pub(crate) fn plan(
                 .thread_id
                 .clone()
                 .unwrap_or_else(|| t.thread_id.clone());
+            // 合并轮：卡在 merging 时，会话空闲即收纳尾（会话正在跑则等它）。
+            if card.state == "merging" {
+                return if t.idle {
+                    Some(CardAction::RequestMerge {
+                        card_id: card.id.clone(),
+                        thread_id,
+                    })
+                } else {
+                    None
+                };
+            }
             match t.state {
                 TrackState::Running => {
                     if !t.idle {
@@ -271,11 +285,27 @@ pub(crate) async fn run_once<L: CardLauncher>(
         Err(_) => return,
     };
     for action in plan(&cards, tracked) {
-        let CardAction::Reconcile {
-            card_id,
-            thread_id,
-            outcome,
-        } = action;
+        let (card_id, thread_id, outcome) = match action {
+            CardAction::Reconcile {
+                card_id,
+                thread_id,
+                outcome,
+            } => (card_id, thread_id, Some(outcome)),
+            CardAction::RequestMerge { card_id, .. } => {
+                // 合并轮的 git 动作发生在会话内；宿主只在会话空闲时触发复核收尾
+                // （幂等，以 git 复核为准）。
+                let _ = board_query(
+                    project,
+                    board_dir,
+                    "merge_finish",
+                    json!({ "card_id": card_id }),
+                );
+                // 复核后卡会落 done/needs_you：不再由本进程跟踪（终态不会再回来）。
+                tracked.remove(&card_id);
+                continue;
+            }
+        };
+        let outcome = outcome.expect("Reconcile carries an outcome");
         let (method, params) = match &outcome {
             Outcome::Running => (
                 "board.mark_running",
@@ -423,6 +453,30 @@ mod tests {
         for state in ["done", "failed", "cancelled"] {
             assert!(plan(&[card("a", state)], &tracked).is_empty(), "{state}");
         }
+    }
+
+    #[test]
+    fn an_idle_merging_card_is_finished_by_the_host() {
+        let mut tracked = HashMap::new();
+        tracked.insert("a".to_string(), tt("t1", TrackState::Running, true, false));
+        let actions = plan(&[card("a", "merging")], &tracked);
+        assert!(matches!(
+            actions.as_slice(),
+            [CardAction::RequestMerge { card_id, .. }] if card_id == "a"
+        ));
+    }
+
+    #[test]
+    fn a_merging_card_still_running_is_left_alone() {
+        let mut tracked = HashMap::new();
+        tracked.insert("a".to_string(), tt("t1", TrackState::Running, false, false));
+        assert!(plan(&[card("a", "merging")], &tracked).is_empty());
+    }
+
+    #[test]
+    fn an_untracked_merging_card_is_left_alone() {
+        // 别的进程起的合并会话：本进程无法判断它跑完没有，不动。
+        assert!(plan(&[card("a", "merging")], &Default::default()).is_empty());
     }
 }
 
