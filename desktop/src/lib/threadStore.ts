@@ -108,12 +108,13 @@ export class ThreadStore {
   /** 按 `thread_id` 路由一条通知。 */
   applyNotification(n: Notification): void {
     // agent/* notifications belong to a conversation's附属视图 (the subagent
-    // rail), not to its transcript; `ui/settings/updated` is app chrome (theme)
+    // rail), not to its transcript; `ui/*` is app chrome (theme, git-diff focus)
     // handled by App's own notification branch. None is folded into a Session.
     if (
       n.method === "agent/children/updated" ||
       n.method === "agent/trace/event" ||
-      n.method === "ui/settings/updated"
+      n.method === "ui/settings/updated" ||
+      n.method === "ui/gitDiff/focus"
     ) {
       return;
     }

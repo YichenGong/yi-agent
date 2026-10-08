@@ -126,6 +126,9 @@ pub(crate) struct RuntimeAttachments {
     /// 桌面主题句柄：`ui/settings/read|write` 维护它，每个 thread 的
     /// `set_theme` 工具也持同一实例，故任一路径改主题都会落盘 + 广播。
     pub(crate) theme: crate::theme_tool::ThemeHandle,
+    /// Git Diff 焦点句柄：`show_git_diff` 工具持它广播，watcher 翻译成
+    /// `ui/gitDiff/focus` 通知。每个 thread 的工具与 watcher 共用同一实例。
+    pub(crate) git_diff: crate::git_diff_tool::GitDiffHandle,
     /// 安装常驻值守（macOS LaunchAgent）。可注入的理由同 `launcher`：测试里
     /// 绝不能真的调 `launchctl`，也绝不能碰用户真实的 `~/Library/LaunchAgents`。
     pub(crate) watchman_install: WatchmanInstall,
@@ -257,6 +260,7 @@ fn attach_delegation(
     cwd: &str,
     thread_id: &str,
     theme: &crate::theme_tool::ThemeHandle,
+    git_diff: &crate::git_diff_tool::GitDiffHandle,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -303,6 +307,7 @@ fn attach_delegation(
         thread_id,
         built.yolo.clone(),
         theme.clone(),
+        git_diff.clone(),
     ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
@@ -790,6 +795,7 @@ fn build_runtime_tooling(
     thread_id: &str,
     yolo: yi_agent_core::autonomy::YoloSwitch,
     theme: crate::theme_tool::ThemeHandle,
+    git_diff: crate::git_diff_tool::GitDiffHandle,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
@@ -825,6 +831,10 @@ fn build_runtime_tooling(
         yi_agent_runtime::bootstrap::load_permission_checker_with_switch(&workspace_root, yolo)
             .map_err(|error| error.to_string())?;
     register_theme_tool(&mut registry, theme);
+    registry.register(Arc::new(crate::git_diff_tool::ShowGitDiffTool::new(
+        git_diff,
+        Some(thread_id.to_string()),
+    )));
     Ok(RuntimeTooling {
         registry: Arc::new(registry),
         permission,
@@ -1376,6 +1386,7 @@ where
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
+            git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
@@ -1443,6 +1454,7 @@ where
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
+            git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
@@ -1983,6 +1995,35 @@ async fn pump_theme_notifications(
     }
 }
 
+/// Git Diff 焦点守望者：把 [`crate::git_diff_tool::GitDiffHandle`] 的广播翻译成
+/// `ui/gitDiff/focus` 通知扇出。
+///
+/// 与 [`pump_theme_notifications`] 同构，`Lagged` 同样当作**继续**：它只是订阅者
+/// 一时落后，`recv()` 仍可继续调用；只有 `Closed`（所有发送端都没了）才结束。
+async fn pump_git_diff_notifications(
+    mut rx: tokio::sync::broadcast::Receiver<crate::git_diff_tool::GitDiffFocus>,
+    hub: Arc<crate::broadcast::Broadcaster>,
+) {
+    loop {
+        let focus = match rx.recv().await {
+            Ok(focus) => focus,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::warn!(missed, "git diff watcher lagged; continuing");
+                continue;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        };
+        let n = Notification::UiGitDiffFocus {
+            thread_id: focus.thread_id,
+            base: focus.base,
+            note: focus.note,
+        };
+        if write_notification(&hub, &n).await.is_err() {
+            return;
+        }
+    }
+}
+
 /// 主循环的传输无关核心:agent 工厂由调用方注入(测试用 mock provider)。
 ///
 /// **取消安全**:入站读取由传输层任务负责(`read_lines` / WS 读循环),主循环只在
@@ -2036,6 +2077,7 @@ where
         resident_dir,
         launcher: board_launcher,
         theme,
+        git_diff,
         watchman_install,
         watchman_uninstall,
         watchman_home,
@@ -2096,6 +2138,14 @@ where
     ));
     // 写路径仍需 theme 句柄;`set` 会落盘 + 广播,由上面的 watcher 推通知。
     let theme_handle = theme.clone();
+    // Git Diff 焦点 → ui/gitDiff/focus。与主题守望者同构：Lagged 继续，
+    // 只有 Closed 才结束。
+    tokio::spawn(pump_git_diff_notifications(
+        git_diff.subscribe(),
+        Arc::clone(&hub),
+    ));
+    // 建 thread 的工具仍需该句柄(与 watcher 同一实例,故通知不落空)。
+    let git_diff_handle = git_diff.clone();
 
     loop {
         tokio::select! {
@@ -2858,6 +2908,7 @@ where
                             permission_timeout,
                             &perm_seq,
                             &theme,
+                            &git_diff_handle,
                             &workspaces,
                             model.clone(),
                             model_ref.clone(),
@@ -2995,6 +3046,7 @@ where
                             &cwd,
                             &thread_id,
                             &theme,
+                            &git_diff_handle,
                             built,
                         );
                         let BuiltAgent {
@@ -3881,6 +3933,46 @@ where
                             }
                         }
                     }
+                    "thread/diff/read" => {
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone())
+                            .await?
+                        {
+                            continue;
+                        }
+                        // cwd 是 diff 的唯一来源：thread 的 cwd，缺省兜底 cfg.workdir。
+                        let cwd = threads
+                            .get(&thread_id)
+                            .map(|t| t.cwd.clone())
+                            .filter(|c| !c.is_empty())
+                            .unwrap_or_else(|| cfg.workdir.display().to_string());
+                        let repo = Path::new(&cwd);
+                        let base = req.params.get("base").and_then(|v| v.as_str());
+                        let result =
+                            if let Some(commit) = req.params.get("commit").and_then(|v| v.as_str()) {
+                                let (unified_diff, truncated) =
+                                    crate::git_diff::commit_diff(repo, commit);
+                                json!({ "unifiedDiff": unified_diff, "truncated": truncated })
+                            } else if let Some(path) =
+                                req.params.get("path").and_then(|v| v.as_str())
+                            {
+                                let d = crate::git_diff::thread_diff(repo, base);
+                                let (unified_diff, truncated) = crate::git_diff::file_diff(
+                                    repo,
+                                    d.merge_base.as_deref(),
+                                    path,
+                                );
+                                json!({ "unifiedDiff": unified_diff, "truncated": truncated })
+                            } else {
+                                serde_json::to_value(crate::git_diff::thread_diff(repo, base))
+                                    .unwrap_or(json!(null))
+                            };
+                        write_response(&hub, &client, ok_response(id, result)).await?;
+                    }
                     "agent/trace/watch" => {
                         let Some(thread_id) =
                             require_thread_id(&hub, &client, &req.params, id.clone()).await?
@@ -4487,6 +4579,7 @@ where
                     permission_timeout,
                     &perm_seq,
                     &theme,
+                    &git_diff_handle,
                     &workspaces,
                     &build_agent,
                 )
@@ -5688,6 +5781,7 @@ async fn card_scheduler_tick<F>(
     permission_timeout: Duration,
     perm_seq: &Arc<AtomicU64>,
     theme: &crate::theme_tool::ThemeHandle,
+    git_diff: &crate::git_diff_tool::GitDiffHandle,
     workspaces: &WorkspaceIndex,
     build_agent: &F,
 ) where
@@ -5740,6 +5834,7 @@ async fn card_scheduler_tick<F>(
             permission_timeout,
             perm_seq,
             theme,
+            git_diff,
             workspaces,
             build_agent,
         };
@@ -5770,6 +5865,7 @@ struct ServeLauncher<'a, F> {
     permission_timeout: Duration,
     perm_seq: &'a Arc<AtomicU64>,
     theme: &'a crate::theme_tool::ThemeHandle,
+    git_diff: &'a crate::git_diff_tool::GitDiffHandle,
     workspaces: &'a WorkspaceIndex,
     build_agent: &'a F,
 }
@@ -5835,6 +5931,7 @@ where
             self.permission_timeout,
             self.perm_seq,
             self.theme,
+            self.git_diff,
             self.workspaces,
             // 看板会话不带 model_ref;生效串取自上面实际建出的 agent,与
             // `thread/start`/`thread/resume` 同口径。
@@ -5995,6 +6092,7 @@ async fn start_thread_core(
     permission_timeout: Duration,
     perm_seq: &Arc<AtomicU64>,
     theme: &crate::theme_tool::ThemeHandle,
+    git_diff: &crate::git_diff_tool::GitDiffHandle,
     workspaces: &WorkspaceIndex,
     // 该会话的生效模型串与覆盖名(由调用方按清单解析后传入),落进 ThreadMeta
     // 并写进 ThreadSession,与 `thread/start`/`thread/resume` 同一来源。
@@ -6016,6 +6114,7 @@ async fn start_thread_core(
         cwd,
         &thread_id,
         theme,
+        git_diff,
         built,
     );
     let BuiltAgent {
@@ -7287,6 +7386,7 @@ mod card_scheduling_tests {
         pending: Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
         perm_seq: Arc<AtomicU64>,
         theme: crate::theme_tool::ThemeHandle,
+        git_diff: crate::git_diff_tool::GitDiffHandle,
         workspaces: WorkspaceIndex,
         workdir: PathBuf,
         _workdir_dir: tempfile::TempDir,
@@ -7314,6 +7414,7 @@ mod card_scheduling_tests {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 perm_seq: Arc::new(AtomicU64::new(1)),
                 theme: crate::theme_tool::ThemeHandle::new(theme_dir.path().to_path_buf()),
+                git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 workspaces: WorkspaceIndex::new(workspace_dir.path().join("workspaces.json")),
                 workdir,
                 _workdir_dir: workdir_dir,
@@ -7343,6 +7444,7 @@ mod card_scheduling_tests {
                 permission_timeout: PERMISSION_TIMEOUT,
                 perm_seq: &self.perm_seq,
                 theme: &self.theme,
+                git_diff: &self.git_diff,
                 workspaces: &self.workspaces,
                 build_agent,
             }
@@ -7914,6 +8016,7 @@ pub(crate) mod tests {
             "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
         )
         .expect("tooling");
         let names = tooling.registry.names();
@@ -7956,6 +8059,44 @@ pub(crate) mod tests {
         assert!(!task_id.is_empty(), "the child must get an id to wait on");
     }
 
+    /// 会话的工具集里必须有 `show_git_diff`：模型没有它就无法把 diff 推到用户眼前。
+    ///
+    /// 与 `a_git_project_gets_the_delegation_tools` 走同一条 setup，故两者一起失败时
+    /// 说明是共享接线断了，而不是单点回归。
+    #[test]
+    fn a_git_project_gets_the_show_git_diff_tool() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+
+        let attached = Arc::new(
+            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
+                .expect("a clean git repo must attach"),
+        );
+        let binding =
+            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+        let names = build_runtime_tooling(
+            &cfg,
+            &root,
+            "thread-test",
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+        )
+        .expect("tooling")
+        .registry
+        .names();
+
+        assert!(
+            names.contains(&"show_git_diff".to_string()),
+            "an attached root must expose show_git_diff, got {names:?}"
+        );
+    }
+
     /// One live controller backs both the root's builtin tools and the
     /// subagent spawn tools: flipping the thread's YOLO switch must move the
     /// root's `bash` sandbox, proving there is no second, static copy.
@@ -7984,9 +8125,15 @@ pub(crate) mod tests {
         );
         let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
         let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
-        let tooling =
-            build_runtime_tooling(&cfg, &root, "thread-test", switch.clone(), test_theme())
-                .expect("tooling");
+        let tooling = build_runtime_tooling(
+            &cfg,
+            &root,
+            "thread-test",
+            switch.clone(),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+        )
+        .expect("tooling");
         let bash = tooling.registry.get("bash").expect("bash is registered");
         assert_eq!(
             bash.sandbox_mode(),
@@ -8032,6 +8179,7 @@ pub(crate) mod tests {
             "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
         )
         .expect("tooling")
         .registry
@@ -8158,6 +8306,7 @@ pub(crate) mod tests {
             &cwd,
             "thread-a",
             &test_theme(),
+            &crate::git_diff_tool::GitDiffHandle::new(),
             build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
         let second = attach_delegation(
@@ -8168,6 +8317,7 @@ pub(crate) mod tests {
             &cwd,
             "thread-b",
             &test_theme(),
+            &crate::git_diff_tool::GitDiffHandle::new(),
             build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
 
@@ -8744,6 +8894,7 @@ pub(crate) mod tests {
                     resident_dir: resident_dir.path().to_path_buf(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
+                    git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                     watchman_install: install,
                     watchman_uninstall: uninstall,
                     watchman_home: watchman_home.path().to_path_buf(),
@@ -9201,6 +9352,59 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_diff_read_reports_base_and_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        init_git_repo(dir.path());
+        // init_git_repo 只建空提交；补一个文件再改它，制造「已提交 + 未提交」两段改动。
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        for args in [vec!["add", "."], vec!["commit", "-q", "-m", "add a"]] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(dir.path().join("a.txt"), "x\ny\n").unwrap(); // 未提交改动
+
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":7,"method":"thread/diff/read","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        // thread/start 之后流里可能还夹着通知（如 process/updated），故读到 id 7 为止。
+        let mut v = h.read_value().await;
+        while v.get("id") != Some(&serde_json::json!(7)) {
+            v = h.read_value().await;
+        }
+        assert_eq!(v["result"]["files"][0]["path"], "a.txt");
+        assert!(v["result"]["unifiedDiff"].as_str().unwrap().contains("+y"));
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_diff_read_rejects_unknown_thread() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":8,"method":"thread/diff/read","params":{"threadId":"thread-nope"}}"#)
+            .await;
+        let mut v = h.read_value().await;
+        while v.get("id") != Some(&serde_json::json!(8)) {
+            v = h.read_value().await;
+        }
+        assert_eq!(
+            v["error"]["code"], -32011,
+            "unknown thread uses the shared code"
+        );
+        h.shutdown().await;
+    }
+
     /// A message to an unattached conversation fails loudly rather than
     /// pretending to queue: there is no daemon to queue it on.
     #[tokio::test(flavor = "multi_thread")]
@@ -9503,6 +9707,7 @@ pub(crate) mod tests {
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
+                git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 // 测试注入:只记录调用,不碰真实 launchd / home。
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -9574,6 +9779,7 @@ pub(crate) mod tests {
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
+                git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 // 测试注入:只记录调用,不碰真实 launchd / home。
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -9649,6 +9855,7 @@ pub(crate) mod tests {
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
+                git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 // 测试注入:只记录调用,不碰真实 launchd / home。
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -14697,6 +14904,7 @@ pub(crate) mod tests {
             "thread-test",
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
         )
         .expect("tooling");
         assert!(
@@ -15006,6 +15214,7 @@ pub(crate) mod tests {
             "thread-handle",
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
         )
         .expect("tooling");
         // Taken *before* the rebuild: a clone shares the caller slot the tools
@@ -15336,6 +15545,7 @@ pub(crate) mod tests {
                     resident_dir: PathBuf::new(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
+                    git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                     // 测试注入:只记账,不碰真实 launchd / home。
                     watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                     watchman_uninstall: Arc::new(|_home: &Path| Ok(())),

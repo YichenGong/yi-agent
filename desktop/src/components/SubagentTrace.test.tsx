@@ -22,7 +22,6 @@ const baseProps = {
   row: child("task-1", "running", "running tests"),
   children: [] as ReturnType<typeof child>[],
   rows: [] as AgentTraceRow[],
-  onClose: () => {},
   onDrill: () => {},
   onMessage: async () => {},
   onCancel: async () => ({ confirmationToken: "tok", taskIds: ["task-1"], expiresInSecs: 30 }),
@@ -131,6 +130,13 @@ describe("SubagentTrace", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: /进入子任务 task-child/ }));
     expect(onDrill).toHaveBeenCalledWith("task-child");
+  });
+
+  it("leaves the frame and the close button to the panel that hosts it", () => {
+    // 外框与「关闭」搬到了 ThreadDetailPanel：轨迹要能和 Git Diff 挤进同一排
+    // Tab 之下，框架只能由面板统一出。这里守住「本组件不再自带关闭」这一点。
+    render(<SubagentTrace {...baseProps} />);
+    expect(screen.queryByRole("button", { name: "关闭详情" })).toBeNull();
   });
 
   it("says the trace is empty instead of rendering nothing", () => {

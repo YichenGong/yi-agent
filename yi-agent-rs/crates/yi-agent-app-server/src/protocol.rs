@@ -303,6 +303,13 @@ pub enum Notification {
     /// 只由 `ThemeHandle` 的广播触发；客户端收到即把 `data-theme` 换成新值。
     #[serde(rename = "ui/settings/updated")]
     UiSettingsUpdated { theme: String },
+    /// 模型（`show_git_diff` 工具）请求桌面端聚焦 Git Diff 视图。
+    #[serde(rename = "ui/gitDiff/focus", rename_all = "camelCase")]
+    UiGitDiffFocus {
+        thread_id: Option<String>,
+        base: Option<String>,
+        note: Option<String>,
+    },
     #[serde(rename = "error")]
     Error { message: String },
 }
@@ -326,6 +333,7 @@ impl Notification {
             | Notification::AgentTraceEvent { thread_id, .. }
             | Notification::AgentChildrenUpdated { thread_id, .. }
             | Notification::ProcessUpdated { thread_id, .. } => Some(thread_id),
+            Notification::UiGitDiffFocus { thread_id, .. } => thread_id.as_deref(),
             Notification::ToolCallApprovalResolved { .. }
             | Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. } => None,
