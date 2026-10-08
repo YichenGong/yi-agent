@@ -28,20 +28,30 @@ export function kanbanItemFor(workspace: string, boards: string[]): boolean {
 /**
  * 侧栏条目上的摘要。
  *
- * 排队与运行分开数：两者混成一个数字就看不出「卡住了」还是「在跑」，
- * 而这正是用户扫一眼侧栏想知道的。其它状态（完成/失败）不进摘要——它们
- * 是历史，不是待办。
+ * 分批数，且**只数还没落地的卡**：排队（含刚认领）、运行中（含正在合并的一轮）、
+ * 待合并（等用户发话）、待处理（要用户回话）。合并卡曾整类落在计数之外——五张卡
+ * 卡住时摘要仍显示「0 排队 · 0 运行中」，侧栏看起来什么都没发生。完成/失败/取消
+ * 是历史，不进摘要。没有待办时明说「无待办」，而不是显示一排 0。
  */
 export function summarize(cards: { state: string }[]): string {
   if (cards.length === 0) return "空";
   let queued = 0;
-  let running = 0;
+  let active = 0;
+  let awaitingMerge = 0;
+  let needsYou = 0;
   for (const card of cards) {
     const state = card.state.toLowerCase();
-    if (state === "queued") queued += 1;
-    else if (state === "running") running += 1;
+    if (state === "queued" || state === "launching") queued += 1;
+    else if (state === "running" || state === "merging") active += 1;
+    else if (state === "awaiting_merge") awaitingMerge += 1;
+    else if (state === "needs_you") needsYou += 1;
   }
-  return `${queued} 排队 · ${running} 运行中`;
+  const parts: string[] = [];
+  if (queued > 0) parts.push(`${queued} 排队`);
+  if (active > 0) parts.push(`${active} 运行中`);
+  if (awaitingMerge > 0) parts.push(`${awaitingMerge} 待合并`);
+  if (needsYou > 0) parts.push(`${needsYou} 待处理`);
+  return parts.length > 0 ? parts.join(" · ") : "无待办";
 }
 
 /** 看板读写失败后 UI 能采取的三条路，外加「说不清」。 */

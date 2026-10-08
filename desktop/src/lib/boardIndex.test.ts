@@ -28,8 +28,33 @@ describe("boardIndex membership", () => {
 });
 
 describe("summarize", () => {
-  it("只数排队与运行，其它状态不进摘要", () => {
-    expect(summarize([{ state: "completed" }, { state: "failed" }])).toBe("0 排队 · 0 运行中");
+  it("数出还在队列里的每一类，包括合并卡", () => {
+    const cards = [
+      { state: "queued" },
+      { state: "queued" },
+      { state: "running" },
+      { state: "merging" },
+      { state: "awaiting_merge" },
+      { state: "needs_you" },
+    ];
+    expect(summarize(cards)).toBe("2 排队 · 2 运行中 · 1 待合并 · 1 待处理");
+  });
+
+  it("合并卡不再被算成 0", () => {
+    // 用户报的原始 case：3 张等待合并 + 2 张待处理，旧口径显示「0 排队 · 0 运行中」，
+    // 于是卡住的两张合并卡在侧栏完全隐形。
+    const cards = [
+      { state: "awaiting_merge" },
+      { state: "awaiting_merge" },
+      { state: "awaiting_merge" },
+      { state: "needs_you" },
+      { state: "needs_you" },
+    ];
+    expect(summarize(cards)).toBe("3 待合并 · 2 待处理");
+  });
+
+  it("没有待办时明说，不留空", () => {
+    expect(summarize([{ state: "done" }, { state: "failed" }])).toBe("无待办");
   });
 
   it("大小写不敏感（服务端可能回大写）", () => {
