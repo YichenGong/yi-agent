@@ -311,13 +311,23 @@ export function ThreadSidebar({
 
   const renderThread = (
     t: ThreadSummary,
-    opts: { rowAttr?: "group" | "pinned"; dragIndex?: number } = {},
+    opts: {
+      rowAttr?: "group" | "pinned";
+      dragIndex?: number;
+      /** 行相对项目组的缩进档位：0=普通会话行（项目组直属），1=看板会话行（嵌在
+       * 「看板会话」小节里）。默认 0，保持既有渲染逐像素不变。 */
+      indentLevel?: 0 | 1;
+    } = {},
   ) => {
     const active = t.thread_id === currentId;
     const st = statuses.get(t.thread_id) ?? "idle";
     const un = unread.get(t.thread_id);
     const isPinned = t.pinned ?? false;
     const dragging = opts.rowAttr === "pinned";
+    // 看板会话行多缩进一档（pl-7 vs pl-3）：折叠小节头是 ▸ 视觉起点，其下的
+    // 会话若与直属行同一起点，就分不清谁属于谁。缩进让「小节头 → 卡片会话」的
+    // 从属关系一眼可读。仅改左内边距，不影响拖拽/点击。
+    const indent = opts.indentLevel === 1 ? "pl-7" : "pl-3";
     const dataAttr =
       opts.rowAttr === "pinned" ? { "data-pinned-row": "" } : { "data-group-row": "" };
     return (
@@ -360,7 +370,7 @@ export function ThreadSidebar({
           if (e.detail > 1) return;
           onSelect(t.thread_id);
         }}
-        className={`group relative flex items-center justify-between gap-1 px-3 py-2 text-sm ${
+        className={`group relative flex items-center justify-between gap-1 ${indent} py-2 text-sm ${
           dragId === t.thread_id ? "opacity-50" : ""
         } ${active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"} cursor-pointer`}
       >
@@ -498,7 +508,7 @@ export function ThreadSidebar({
           <span className="shrink-0 px-0.5">{isBoardCollapsed ? "▸" : "▾"}</span>
           <span className="min-w-0 flex-1 truncate text-left">看板会话 ({cards.length})</span>
         </button>
-        {!isBoardCollapsed && cards.map((t) => renderThread(t, { rowAttr: "group" }))}
+        {!isBoardCollapsed && cards.map((t) => renderThread(t, { rowAttr: "group", indentLevel: 1 }))}
       </div>
     );
   };

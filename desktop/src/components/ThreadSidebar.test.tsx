@@ -544,6 +544,28 @@ describe("ThreadSidebar 看板", () => {
     expect(container.textContent).toContain("看板 · card-1");
   });
 
+  it("看板会话行比项目组直属会话行多缩进一档", () => {
+    const withCard: WorkspaceGroup[] = [
+      {
+        workspace: "/proj",
+        exists: true,
+        threads: [
+          thread("t-plain", "plain-thread", "/proj"),
+          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
+    fireEvent.click(screen.getByLabelText("看板会话"));
+
+    const rows = Array.from(container.querySelectorAll("[data-group-row]"));
+    const plain = rows.find((r) => r.textContent!.includes("plain-thread"))!;
+    const card = rows.find((r) => r.textContent!.includes("看板 · card-1"))!;
+    // 直属行 pl-3；卡片会话 pl-7，缩进一档让层级可读。
+    expect(plain.className).toContain("pl-3");
+    expect(card.className).toContain("pl-7");
+  });
+
   it("没有卡片会话时不渲染「看板会话」小节", () => {
     const { container } = renderSidebar({ groups: boardGroups, boards: ["/proj"] });
     expect(container.querySelector('[aria-label="看板会话"]')).toBeNull();
