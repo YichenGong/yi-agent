@@ -18,6 +18,7 @@ pub mod thread_store;
 pub mod translate;
 pub mod transport;
 pub mod workspace_index;
+pub(crate) mod worktree_reclaim;
 pub mod ws;
 
 pub use server::run;

@@ -845,27 +845,57 @@ export default function App() {
   const deleteThread = async (id: string) => {
     const c = clientRef.current;
     if (!c) return;
+    // 删除成功后若 worktree 回收失败，会话本身已经没了、无法在应用内再删一次；
+    // 若不在这里弹给用户，残留在磁盘上的那个目录就成了他永远看不见的孤儿。
+    // 于是把「删除失败」的成功响应记下来，等确认流程走完再统一告知。
+    let failed: { path: string; reason: string } | null = null;
     try {
-      // 删除是不可逆的，而这个会话可能还有子代理在跑。服务端在未 force 时
-      // 只回答「还有几个」，不动任何东西；据此问一句，用户同意后才带 force
-      // 重发。子代理活在项目 daemon 里，直接删文件会让它们在无人可见的地方
-      // 继续跑。
+      // 删除是不可逆的，而这个会话可能还有子代理在跑、或挂着一张卡片 worktree。
+      // 服务端在未 force 时只回答「还有几个子代理 / worktree 将删还是留」，不动
+      // 任何东西；据此问一句，用户同意后才带 force 重发。子代理活在项目 daemon
+      // 里，worktree 是不可逆的磁盘目录，都不能不问自删。
       const first = await c.request<{
         status?: string;
         active_children?: number;
+        worktree?: { path: string; action: "remove" | "keep"; reason: string; removed?: boolean };
       }>("thread/delete", { threadId: id });
+      if (first?.worktree?.removed === false) {
+        failed = { path: first.worktree.path, reason: first.worktree.reason };
+      }
       if (first?.status === "needs_confirmation") {
         const count = first.active_children ?? 0;
-        const ok = window.confirm(
-          `这个会话还有 ${count} 个子代理正在运行，删除会一并终止它们。继续？`,
-        );
+        const lines: string[] = [];
+        if (count > 0) {
+          lines.push(`这个会话还有 ${count} 个子代理正在运行，删除会一并终止它们。`);
+        }
+        if (first.worktree) {
+          lines.push(
+            first.worktree.action === "remove"
+              ? `将一并删除卡片 worktree：${first.worktree.path}（${first.worktree.reason}）`
+              : `卡片 worktree 将保留：${first.worktree.reason}`,
+          );
+        }
+        // 兜底：后端返回了需要确认、却没给出任何可读原因时，绝不弹空框。
+        if (lines.length === 0) lines.push("删除不可逆。");
+        lines.push("继续？");
+        const ok = window.confirm(lines.join("\n"));
         if (!ok) return;
-        await c.request("thread/delete", { threadId: id, force: true });
+        const forced = await c.request<{
+          worktree?: { path: string; action: "remove" | "keep"; reason: string; removed?: boolean };
+        }>("thread/delete", { threadId: id, force: true });
+        if (forced?.worktree?.removed === false) {
+          failed = { path: forced.worktree.path, reason: forced.worktree.reason };
+        }
       }
     } catch (e) {
       setCurrentError(formatError(e));
       force((v) => v + 1);
       return;
+    }
+    if (failed) {
+      // 会话已删除，应用内无法重删；这里把残留的 worktree 路径与 git 报错原样
+      // 告诉用户，让他能自己去处理，而不是让目录无声地留在磁盘上。
+      window.alert(`卡片 worktree 未能删除，仍保留在：${failed.path}\n原因：${failed.reason}`);
     }
     // dismissedApprovals 以 approval id 为键;删除 thread 前先摘掉它名下那条
     // 审批,否则按 thread id delete 是 no-op 且会留下永不过期的条目。

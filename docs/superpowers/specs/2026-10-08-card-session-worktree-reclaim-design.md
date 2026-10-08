@@ -102,15 +102,28 @@
 2. 既有：中断并等待落盘、从内存摘除、停止各类 watch。
 3. 既有：删会话文件（`thread_store.delete`）、回收附件。
 4. 新增：按 §5 判据删/留 worktree。
-5. 响应既有成功形状 `ok_response(id, json!({}))`——**空对象**，与今天一致（不新增成功字段）。
+5. 响应默认沿用既有成功形状 `ok_response(id, json!({}))`——**空对象**：删除成功、普通会话、`Keep` 一律如此。
+   **例外（授权偏离，见本节末尾「实现修正」注）**：worktree 判定为 `Delete`/`DestructiveDelete`（即已承诺会删）、
+   而 `git worktree remove` 实际失败时，成功体带
+   `{ "worktree": { "action": "remove", "removed": false, "path": "<worktree 绝对路径>", "reason": "<git 错误>" } }`。
 
 **顺序理由**：该会话的 cwd 就是这块 worktree。步骤 1–3 先做完（取消子代理、等 driver 落盘收尾、摘除内存会话、停 watch），才能保证**没有任何进程还持有或写入**该 worktree，随后步骤 4 的 `git worktree remove` 才安全、才有意义。反过来若先删 worktree，driver 可能仍在其上落盘。注意步骤 3 删的是 `<cwd>/.yi-agent/threads/*` 这类 **gitignored** 文件，不影响步骤 4 对"干净"的判定。
+
+> **实现修正 / 2026-10-08**：本步原写"成功体恒为空对象、**不新增成功字段**"（§4.5 亦原称静默删除路径"永不回报失败"）。
+> 经人类伙伴明确拍板，实现改为：**仅当 worktree 该删却没删成**时，成功体带上上面的 `worktree` 字段（`removed:false` + `reason`）；
+> 删除成功、普通会话、`Keep` 仍是 `{}`。理由是失败必须可见：此刻会话文件已摘除、应用内无法再删一次，按 D10 卡片 `thread_id`
+> 也已悬空——若还把失败吞掉，用户再无任何信号，worktree 只会无声滞留。此后**请勿**"修回"纯空成功体：
+> 这个非空回报是授权的设计行为，不是 bug。
 
 ### 4.5 不带 force 且无需确认时的行为
 
 若没有活跃子代理，且 worktree 处置为「**可直接删**」（§5.2：干净且已并入 base），则**无需确认**：
-本次调用直接走 §4.4 的 1–4 步（删会话 + 删 worktree），响应 `ok_response(id, json!({}))`。
+本次调用直接走 §4.4 的 1–4 步（删会话 + 删 worktree），**删除成功**时响应 `ok_response(id, json!({}))`。
 这是唯一"删 worktree 却不打扰用户"的情形——被删的 worktree 内容已完整存在于已并入的分支里，删除不丢任何东西。
+
+**但"不打扰"不等于"失败也不作声"**（见 §4.4 的实现修正注）：这条静默路径若 `git worktree remove` 失败，
+同样带 `worktree: { action:"remove", removed:false, path, reason }` 回报——该删没删成必须让用户看见，
+与是否经确认无关；会话删除本身照常完成（D9）。
 
 `needs_confirmation` 因此在两种情况出现：
 1. 有活跃子代理；或
@@ -132,8 +145,17 @@
 |---|---|---|
 | 干净 worktree 且 `kanban/<slug>` 已并入 base | **无需确认**：直接删（§4.5） | 删 |
 | 有未提交改动，或 `kanban/<slug>` 未并入 base | `needs_confirmation`，`action:"remove"` + 破坏性 `reason` | 删（`--force`，永久丢弃） |
-| 路径不是本仓库的看板 worktree（D6） | `needs_confirmation`，`action:"keep"` + 原因（让用户知道工作被保留、为何） | **保留**（硬拒绝，force 也不删） |
+| 路径不是本仓库的看板 worktree（D6） | `needs_confirmation`，`action:"keep"` + 原因（让用户知道工作被保留、为何） | **保留**（硬拒绝：`Keep` 是判定层的永不删除，force 也不删） |
 | 分支不存在（无法判定并入） | `needs_confirmation`，`action:"remove"` + `reason`「分支缺失，无法确认已并入」 | 删（用户已确认接受风险） |
+
+**D6 与 D9 的分工（防混淆）**：上表末列"删"指**判定层的意图**。两种情形结果截然不同，别把二者混为一谈：
+
+- **D6 硬拒绝（第三行）**：路径根本不是本仓库的看板 worktree → `Keep`，**永不尝试删除**，force 也一样。
+- **D9（`Delete`/`DestructiveDelete` 的删除失败）**：判定为可删、也真的去执行了 `git worktree remove`，只是 git 拒绝
+  （如 worktree 被 lock、有残留文件）→ **不是静默**：按 §4.4 的实现修正注如实回报
+  `worktree: { action:"remove", removed:false, path, reason }`，会话删除照常完成。
+
+一句话：`Keep` = 拒绝删；删除**失败** = 尝试过但没删成，且必须让用户看见。
 
 **D6 的判据细化**：仅"`cwd` 出现在 `<board_project>` 的 `git worktree list` 里且非主检出"**不足以**证明它是卡片 worktree——同一个项目里可能有多个卡片会话，各自 cwd 不同；也可能有别的来源的 linked worktree。故本设计**同时**要求 `card_id` 非空（D1/D7）**且** `cwd` 落在 `<board_project>/.worktrees/kanban/` 之下**且**该路径出现在 `worktree list` 中。三者皆真才允许删除；否则一律 `keep`（硬拒绝的泛化：宁可不删，不可错删）。
 
@@ -150,7 +172,7 @@ git -C <board_project> worktree remove [--force] <path>
 ```
 
 - 未 force 且判定为"可直接删"（§5.2 第一行：干净且已并入）时，走 §4.5 无需确认，用不带 `--force` 的删除；
-  git 若仍拒绝（例如残留文件），按 D9 记日志、保留并如实回报，**不**自动升级为 `--force`。
+  git 若仍拒绝（例如残留文件），按 D9 记日志、保留并如实回报（即 §4.4 的 `worktree{removed:false,...}` 体，**非**静默），**不**自动升级为 `--force`。
 - force 且判定为"确认后删"（§5.2 第二、四行）时，用 `--force`（用户已确认接受销毁）。
 
 ## 6. 职责切分

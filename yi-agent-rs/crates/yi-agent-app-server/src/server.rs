@@ -3593,32 +3593,67 @@ where
                             .get("force")
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false);
-                        match cancel_thread_children(&runtimes, &threads, &thread_id, force) {
-                            Ok(ThreadCancelOutcome::NeedsConfirmation(count)) => {
-                                write_response(
-                                    &hub,
-                                    &client,
-                                    ok_response(
-                                        id,
-                                        json!({
-                                            "status": "needs_confirmation",
-                                            "active_children": count,
-                                        }),
-                                    ),
+                        // 卡片会话的 worktree 判定：只读会话自带 meta，不碰插件。
+                        // 顺手把 board_project 拷到局部变量：会话文件随后即被删除，
+                        // 到执行删除时再 load 只会失败，故必须在此刻留下。
+                        let mut board_project: Option<String> = None;
+                        let reclaim = match thread_store.load(&thread_id) {
+                            Ok(Some(loaded)) => {
+                                board_project = loaded.meta.board_project.clone();
+                                crate::worktree_reclaim::decide(
+                                    loaded.meta.card_id.as_deref(),
+                                    loaded.meta.board_project.as_deref(),
+                                    Path::new(&loaded.meta.cwd),
                                 )
-                                .await?;
-                                continue;
                             }
-                            Ok(ThreadCancelOutcome::Cancelled(cancelled)) => {
-                                if cancelled > 0 {
+                            _ => crate::worktree_reclaim::WorktreeReclaim::None,
+                        };
+                        // 「需确认」= 有活跃子代理（既有）或 worktree 处置为破坏性/硬保留（新）。
+                        let children = if force {
+                            None
+                        } else {
+                            match cancel_thread_children(&runtimes, &threads, &thread_id, false) {
+                                Ok(ThreadCancelOutcome::NeedsConfirmation(count)) => Some(count),
+                                // 无事可取消时按 0 处理，交给 worktree 判定决定是否确认。
+                                Ok(ThreadCancelOutcome::Cancelled(_)) => Some(0),
+                                // 查询失败（如会话不在内存）按 0 处理，但照旧记日志——与既有行为一致。
+                                Err(cause) => {
+                                    eprintln!(
+                                        "[app-server] could not cancel subagents for {thread_id}: {cause}"
+                                    );
+                                    Some(0)
+                                }
+                            }
+                        };
+                        let worktree_needs_confirm = matches!(
+                            reclaim,
+                            crate::worktree_reclaim::WorktreeReclaim::DestructiveDelete { .. }
+                                | crate::worktree_reclaim::WorktreeReclaim::Keep { .. }
+                        );
+                        if !force && (children.unwrap_or(0) > 0 || worktree_needs_confirm) {
+                            let mut payload = json!({
+                                "status": "needs_confirmation",
+                                "active_children": children.unwrap_or(0),
+                            });
+                            if let Some(worktree) = worktree_json(&reclaim) {
+                                payload["worktree"] = worktree;
+                            }
+                            write_response(&hub, &client, ok_response(id, payload)).await?;
+                            continue;
+                        }
+                        if force {
+                            // force 下真的回收子代理（既有语义）。
+                            match cancel_thread_children(&runtimes, &threads, &thread_id, true) {
+                                Ok(ThreadCancelOutcome::Cancelled(cancelled)) if cancelled > 0 => {
                                     eprintln!(
                                         "[app-server] cancelled {cancelled} subagent task(s) for {thread_id}"
                                     );
                                 }
+                                Err(cause) => eprintln!(
+                                    "[app-server] could not cancel subagents for {thread_id}: {cause}"
+                                ),
+                                _ => {}
                             }
-                            Err(cause) => eprintln!(
-                                "[app-server] could not cancel subagents for {thread_id}: {cause}"
-                            ),
                         }
                         // 活跃 thread:先中断,再等 driver 落盘完成才删文件。若像旧
                         // 实现那样在 driver 落盘前就删文件,driver 的 `append_turn`
@@ -3665,7 +3700,46 @@ where
                         if let Some(cwd) = thread_store.root().parent().and_then(|p| p.parent()) {
                             crate::attachments::remove_attachments(cwd, &thread_id);
                         }
-                        write_response(&hub, &client, ok_response(id, json!({}))).await?;
+                        // 会话文件已摘除：按判定处置 worktree。删除失败只记日志，不阻断会话删除（D9）。
+                        // board_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
+                        // 但失败这件事本身必须回报：用户刚被告知该 worktree 会被删掉，此刻会话
+                        // 已摘除、应用内再也删不掉它，又按 D10 让卡片上的 thread_id 悬空——
+                        // 若默默失败，worktree 就无声滞留、用户永远看不见。故除宿主日志外，
+                        // 把这一次"该删却没删成"如实回给客户端（失败才现身，成功仍为空）。
+                        let mut worktree_failure: Option<serde_json::Value> = None;
+                        match (&reclaim, board_project.as_deref()) {
+                            (
+                                crate::worktree_reclaim::WorktreeReclaim::Delete { path }
+                                | crate::worktree_reclaim::WorktreeReclaim::DestructiveDelete {
+                                    path, ..
+                                },
+                                Some(project),
+                            ) => {
+                                if let Err(error) = crate::worktree_reclaim::remove(
+                                    path,
+                                    Path::new(project),
+                                    force,
+                                ) {
+                                    eprintln!(
+                                        "[app-server] could not remove the worktree for {thread_id}: {error}"
+                                    );
+                                    worktree_failure = Some(json!({
+                                        "action": "remove",
+                                        "removed": false,
+                                        "path": path.to_string_lossy(),
+                                        "reason": error,
+                                    }));
+                                }
+                            }
+                            _ => {}
+                        }
+                        // 只有"被承诺会删、且确实没删成"才带字段；普通会话（reclaim=None）、
+                        // Keep、以及删除成功一律仍是空成功体，既有形状零变化。
+                        let body = match worktree_failure {
+                            Some(worktree) => json!({ "worktree": worktree }),
+                            None => json!({}),
+                        };
+                        write_response(&hub, &client, ok_response(id, body)).await?;
                     }
                     "thread/clear" => {
                         let Some(thread_id) =
@@ -4881,6 +4955,32 @@ fn collect_pinned(workspaces: &WorkspaceIndex) -> Vec<crate::thread_store::Threa
             .then_with(|| a.thread_id.cmp(&b.thread_id))
     });
     out
+}
+
+/// 把 worktree 判定渲染成 `thread/delete` 的 `needs_confirmation.worktree` 字段。
+///
+/// `None` 表示"不适用/无需呈现"（普通会话、或不回收）——此时响应不带该字段，
+/// 普通会话的既有响应因此零变化。
+fn worktree_json(reclaim: &crate::worktree_reclaim::WorktreeReclaim) -> Option<serde_json::Value> {
+    use crate::worktree_reclaim::WorktreeReclaim;
+    match reclaim {
+        WorktreeReclaim::None => None,
+        WorktreeReclaim::Delete { path } => Some(json!({
+            "path": path.to_string_lossy(),
+            "action": "remove",
+            "reason": "干净且源分支已并入，删除不会丢失工作",
+        })),
+        WorktreeReclaim::DestructiveDelete { path, reason } => Some(json!({
+            "path": path.to_string_lossy(),
+            "action": "remove",
+            "reason": reason,
+        })),
+        WorktreeReclaim::Keep { path, reason } => Some(json!({
+            "path": path.to_string_lossy(),
+            "action": "keep",
+            "reason": reason,
+        })),
+    }
 }
 
 /// 把 thread meta 渲染成 wire 上的 ThreadSummary（含 `pinned`）。
@@ -12105,6 +12205,219 @@ pub(crate) mod tests {
         crate::thread_store::ThreadStore::new(dir)
             .create(&meta)
             .unwrap();
+    }
+
+    /// 建一个真 git 仓库（main 分支 + 一次提交），返回 canonical 路径。
+    fn git_project(dir: &Path) -> PathBuf {
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        std::fs::create_dir_all(dir).unwrap();
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        // 复刻真实项目的 .gitignore：宿主运行态 `.yi-agent/` 本就被忽略（见仓库根
+        // .gitignore）。少了它，`write_meta` 写下的 `<cwd>/.yi-agent/…` 在 worktree
+        // 内是 untracked——git 会判"脏"，`worktree remove` 也会被拒。这不是测试造作，
+        // 而是生产里同样被忽略：不补它，"干净且已并入 → 静默删"那条根本走不到。
+        std::fs::write(dir.join(".gitignore"), ".yi-agent/\n.worktrees/\n").unwrap();
+        std::fs::write(dir.join("f.txt"), "hi").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "init"]);
+        dir.canonicalize().unwrap()
+    }
+
+    /// 在 `<project>/.worktrees/kanban/<slug>` 建真 worktree，返回其 canonical 路径。
+    fn git_kanban_worktree(project: &Path, card_id: &str) -> PathBuf {
+        let slug = crate::worktree_reclaim::slugify(card_id);
+        let path = project.join(".worktrees/kanban").join(&slug);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(project)
+                .args(["worktree", "add", "-q"])
+                .arg(&path)
+                .args(["-b", &format!("kanban/{slug}")])
+                .status()
+                .unwrap()
+                .success()
+        );
+        path.canonicalize().unwrap()
+    }
+
+    /// 卡片会话（cwd 在 worktree、board_project=项目）删除：干净且已并入 → 会话与 worktree 一并消失。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_card_session_also_removes_its_worktree() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let project = git_project(&project_dir.path().join("proj"));
+        let wt = git_kanban_worktree(&project, "card-1");
+        write_meta(&wt, "t-card", "看板 · card-1",
+            Some(&project.to_string_lossy()), Some("card-1"));
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 11, &wt.to_string_lossy()).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        assert!(v.get("error").is_none(), "delete must succeed: {v}");
+        // 空成功体是契约：无损静默删除不新增任何成功字段（spec §4.4 实现修正注里
+        // 唯一的例外是"该删没删成"，此用例是真删成功，故必须恰好为空）。
+        assert_eq!(v["result"], serde_json::json!({}), "{v}");
+        assert!(!wt.join(".yi-agent/threads/t-card.meta.json").exists(), "session gone");
+        assert!(!wt.exists(), "clean+merged worktree must be removed");
+        h.shutdown().await;
+    }
+
+    /// 脏 worktree：未 force 返回 needs_confirmation 且 worktree.action="remove"；会话仍在。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_card_session_with_dirty_worktree_needs_confirmation() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let project = git_project(&project_dir.path().join("proj"));
+        let wt = git_kanban_worktree(&project, "card-1");
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+        write_meta(&wt, "t-card", "看板 · card-1",
+            Some(&project.to_string_lossy()), Some("card-1"));
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 11, &wt.to_string_lossy()).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        assert_eq!(v["result"]["status"], "needs_confirmation", "{v}");
+        assert_eq!(v["result"]["worktree"]["action"], "remove", "{v}");
+        assert!(
+            v["result"]["worktree"]["reason"].as_str().unwrap().contains("未提交"),
+            "{v}"
+        );
+        assert!(wt.join(".yi-agent/threads/t-card.meta.json").exists(), "session untouched");
+
+        // force 重发 → 一并删除。
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/delete","params":{"threadId":"t-card","force":true}}"#)
+            .await;
+        let v = read_response(&mut h, 6).await;
+        assert!(v.get("error").is_none(), "forced delete succeeds: {v}");
+        assert!(!wt.exists(), "worktree destroyed after confirmation");
+        h.shutdown().await;
+    }
+
+    /// 普通会话：响应不含 worktree 字段，cwd 目录原样存在（D7 的钉子）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_plain_session_leaves_its_directory_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().canonicalize().unwrap();
+        write_meta(&cwd, "t-plain", "plain", None, None);
+        let marker = cwd.join("keep-me.txt");
+        std::fs::write(&marker, "x").unwrap();
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 11, &cwd.to_string_lossy()).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-plain"}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        assert!(v.get("error").is_none(), "{v}");
+        assert!(v["result"].get("worktree").is_none(), "no worktree field for plain sessions: {v}");
+        // 比"无 worktree 字段"更强：普通会话的成功体必须**恰好**是空对象。
+        assert_eq!(v["result"], serde_json::json!({}), "{v}");
+        assert!(marker.exists(), "the user's own directory must be untouched");
+        h.shutdown().await;
+    }
+
+    /// 防呆：cwd 在项目根而非看板 worktree 路径 → 即便带 card_id 也硬保留。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_card_session_outside_the_kanban_dir_keeps_the_directory() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let project = git_project(&project_dir.path().join("proj"));
+        // cwd = 项目根（不是 .worktrees/kanban/... 下的 worktree）。
+        write_meta(&project, "t-card", "看板 · odd", Some(&project.to_string_lossy()), Some("card-1"));
+        let marker = project.join("keep-me.txt");
+        std::fs::write(&marker, "x").unwrap();
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 11, &project.to_string_lossy()).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        assert_eq!(v["result"]["worktree"]["action"], "keep", "{v}");
+        // force 也不删。
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/delete","params":{"threadId":"t-card","force":true}}"#)
+            .await;
+        let _ = read_response(&mut h, 6).await;
+        assert!(marker.exists() && project.join("f.txt").exists(), "hard-refused: dir intact");
+        h.shutdown().await;
+    }
+
+    /// 契约（D9 两半）：worktree 删除失败必须如实回报，且不得阻断会话删除。
+    ///
+    /// 用户刚被告知 worktree 会被删掉；此刻会话文件已摘除、在应用内无法再删一次，
+    /// 而按 D10 卡片上的 thread_id 也已悬空——若删除默默失败，worktree 就无声滞留、
+    /// 用户永远看不见。故 force 路径下"该删却没删成"必须在响应里现身
+    /// （action=remove、removed=false、非空 reason/path），同时会话删除本身照常完成。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_card_session_reports_a_failed_worktree_removal() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let project = git_project(&project_dir.path().join("proj"));
+        let wt = git_kanban_worktree(&project, "card-1");
+        // 未提交文件 → 判定为 DestructiveDelete，必须 force 才走到真删。
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+        // 锁定 worktree：即便 `--force` 也删不掉（git 报
+        // "cannot remove a locked working tree"），从而确定性复现"删除失败"这条路径，
+        // 无需借助权限/IO 造错。
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(["worktree", "lock"])
+                .arg(&wt)
+                .status()
+                .unwrap()
+                .success(),
+            "git worktree lock must succeed"
+        );
+        write_meta(&wt, "t-card", "看板 · card-1",
+            Some(&project.to_string_lossy()), Some("card-1"));
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 11, &wt.to_string_lossy()).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card","force":true}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        assert!(v.get("error").is_none(), "delete must still succeed: {v}");
+        assert_eq!(v["result"]["worktree"]["action"], "remove", "{v}");
+        assert_eq!(v["result"]["worktree"]["removed"], false, "{v}");
+        assert!(
+            !v["result"]["worktree"]["reason"].as_str().unwrap().is_empty(),
+            "the failure reason must be visible: {v}"
+        );
+        assert!(
+            !v["result"]["worktree"]["path"].as_str().unwrap().is_empty(),
+            "the stranded worktree path must be named: {v}"
+        );
+        assert!(wt.exists(), "a locked worktree survives the failed removal");
+        assert!(
+            !wt.join(".yi-agent/threads/t-card.meta.json").exists(),
+            "session deletion must complete despite the worktree failure"
+        );
+        h.shutdown().await;
     }
 
     /// 卡片会话(在 worktree、board_project=项目) 折进项目组；worktree 不再顶层成组。
