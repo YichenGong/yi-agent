@@ -111,3 +111,10 @@ describe("collapseDone", () => {
     expect(collapseDone(many.slice(0, 2), false)).toHaveLength(2);
   });
 });
+
+describe("columnForState merging", () => {
+  it("合并中的卡落 DOING", () => {
+    // 合并是一轮进行中的工作，放 needDecision 会让人以为要自己动手。
+    expect(columnForState("merging")).toBe("doing");
+  });
+});
