@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, cleanup } from "@testing-library/react";
+import { render, cleanup, screen } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
 
 // Count how often the settled tool card's component body runs. A streamed delta
@@ -101,5 +101,62 @@ describe("ChatView streaming", () => {
     expect(scroller.className).toContain("overflow-x-hidden");
     // 作为 flex 子项，缺 `min-w-0` 时它的最小宽度是内容宽度，同样会撑破布局。
     expect(scroller.className).toContain("min-w-0");
+  });
+});
+
+describe("ChatView user attachments", () => {
+  it("lists the attachments on a user bubble", () => {
+    const { getAllByTestId } = render(
+      <ChatView
+        items={[
+          {
+            type: "userMessage",
+            id: "u1",
+            text: "总结一下",
+            attachments: [
+              { name: "报告.pdf", path: ".yi-agent/attachments/t1/x-报告.pdf", size: 10 },
+              { name: "预算.xlsx", path: ".yi-agent/attachments/t1/y-预算.xlsx", size: 20 },
+            ],
+          },
+        ]}
+      />,
+    );
+    expect(screen.getByText("总结一下")).toBeTruthy();
+    const chips = getAllByTestId("bubble-attachment");
+    expect(chips.map((c) => c.textContent)).toEqual(["报告.pdf", "预算.xlsx"]);
+    // 完整路径只作为悬停提示，不进气泡正文。
+    expect(chips[0].getAttribute("title")).toBe(".yi-agent/attachments/t1/x-报告.pdf");
+  });
+
+  it("renders a user bubble without attachments unchanged", () => {
+    const { getByText, queryAllByTestId } = render(
+      <ChatView items={[{ type: "userMessage", id: "u2", text: "hi" }]} />,
+    );
+    expect(getByText("hi")).toBeTruthy();
+    expect(queryAllByTestId("bubble-attachment")).toHaveLength(0);
+    // 无附件的用户气泡必须与改动前逐字一致。
+    const bubble = getByText("hi");
+    expect(bubble.className).toBe(
+      "my-1 max-w-[80%] self-end rounded-lg bg-blue-600 px-3 py-2 text-sm whitespace-pre-wrap text-white",
+    );
+    expect(bubble.textContent).toBe("hi");
+  });
+
+  it("falls back to the file name when an attachment has no name", () => {
+    const { getAllByTestId } = render(
+      <ChatView
+        items={[
+          {
+            type: "userMessage",
+            id: "u3",
+            text: "看看",
+            attachments: [{ name: "", path: ".yi-agent/attachments/t1/abc-预算.xlsx", size: 3 }],
+          },
+        ]}
+      />,
+    );
+    // 不能留一个没有标题的空白 chip：退回路径最后一段。
+    const chips = getAllByTestId("bubble-attachment");
+    expect(chips.map((c) => c.textContent)).toEqual(["abc-预算.xlsx"]);
   });
 });

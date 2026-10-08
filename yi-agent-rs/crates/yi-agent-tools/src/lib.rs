@@ -22,7 +22,7 @@ use yi_agent_core::ToolRegistry;
 
 pub use context::ToolsContext;
 pub use error::ToolsError;
-pub use fs::{EditTool, GlobTool, GrepTool, ReadTool, ViewImageTool, WriteTool};
+pub use fs::{EditTool, GlobTool, GrepTool, ReadDocumentTool, ReadTool, ViewImageTool, WriteTool};
 pub use process::{
     ManagedProcessSnapshot, OnExitPolicy, ProcessEvent, ProcessKillTool, ProcessListTool,
     ProcessManager, ProcessReadResult, ProcessReadTool, ProcessSelector, ProcessStartOptions,
@@ -86,6 +86,8 @@ pub fn register_builtin_tools_with_controller(
     registry.register(Arc::new(ReadTool::new(ctx.clone())));
     // Image viewing is read-only, so it stays available in read-only sessions.
     registry.register(Arc::new(ViewImageTool::new(ctx.clone())));
+    // Document reading is read-only, so it stays available in read-only sessions too.
+    registry.register(Arc::new(ReadDocumentTool::new(ctx.clone())));
     if sandbox.allows_writes() {
         registry.register(Arc::new(WriteTool::new(ctx.clone())));
         registry.register(Arc::new(EditTool::new(ctx.clone())));

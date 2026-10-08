@@ -120,6 +120,15 @@ impl ThreadStore {
         }
     }
 
+    /// 存储根(`<cwd>/.yi-agent/threads`)。
+    ///
+    /// 供调用方从 root 反推会话工作区——`thread/delete` 分支拿不到 cwd(`server.rs`
+    /// 的 `detach_unused_runtimes` 注释明确警告不要为此改 `store_lookup` 签名),
+    /// 附件清理需要它(见设计 §6(d))。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     fn meta_path(&self, id: &str) -> PathBuf {
         self.root.join(format!("{id}.meta.json"))
     }
@@ -743,6 +752,7 @@ mod tests {
         let items = vec![Item::UserMessage {
             id: "user-turn-1".into(),
             text: "hi".into(),
+            attachments: Vec::new(),
         }];
         let messages = vec![Message::user("hi")];
         s.append_turn("thread-a", &turn(items, messages.clone()))
@@ -763,6 +773,7 @@ mod tests {
                 vec![Item::UserMessage {
                     id: "user-turn-1".into(),
                     text: "hi".into(),
+                    attachments: Vec::new(),
                 }],
                 vec![Message::user("hi")],
             ),
@@ -803,6 +814,7 @@ mod tests {
                 vec![Item::UserMessage {
                     id: "user-turn-1".into(),
                     text: "one".into(),
+                    attachments: Vec::new(),
                 }],
                 vec![Message::user("one")],
             ),
@@ -818,6 +830,7 @@ mod tests {
                 vec![Item::UserMessage {
                     id: "user-turn-2".into(),
                     text: "two".into(),
+                    attachments: Vec::new(),
                 }],
                 last_messages.clone(),
             ),
@@ -1020,6 +1033,7 @@ mod tests {
                 vec![Item::UserMessage {
                     id: "u1".into(),
                     text: "ok".into(),
+                    attachments: Vec::new(),
                 }],
                 vec![Message::user("ok")],
             ),
@@ -1040,6 +1054,7 @@ mod tests {
                 vec![Item::UserMessage {
                     id: "u2".into(),
                     text: "still here".into(),
+                    attachments: Vec::new(),
                 }],
                 vec![Message::user("still here")],
             ),
@@ -1094,6 +1109,7 @@ mod tests {
                 vec![Item::UserMessage {
                     id: "u1".into(),
                     text: "ok".into(),
+                    attachments: Vec::new(),
                 }],
                 vec![Message::user("ok")],
             ),
@@ -1325,6 +1341,7 @@ mod tests {
         crate::protocol::Item::UserMessage {
             id: id.into(),
             text: text.into(),
+            attachments: Vec::new(),
         }
     }
 
@@ -1422,7 +1439,11 @@ mod tests {
             .unwrap();
 
         let loaded = store.load("thread-a").unwrap().unwrap();
-        assert_eq!(loaded.items.len(), 1, "must not duplicate the committed turn");
+        assert_eq!(
+            loaded.items.len(),
+            1,
+            "must not duplicate the committed turn"
+        );
         assert!(!loaded.pending_turn);
     }
 
@@ -1461,10 +1482,11 @@ mod tests {
 
         // 采纳：追加成主 jsonl 的一轮，并清掉 partial。
         assert!(store.promote_partial("thread-a").unwrap());
-        assert!(!dir
-            .path()
-            .join(".yi-agent/threads/thread-a.partial.json")
-            .exists());
+        assert!(
+            !dir.path()
+                .join(".yi-agent/threads/thread-a.partial.json")
+                .exists()
+        );
 
         // 冷 load：崩溃轮的内容在、只一份、上下文仍是崩溃轮的。
         let loaded = store.load("thread-a").unwrap().unwrap();
@@ -1475,7 +1497,10 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["user-t1", "user-turn-t2", "item-turn-t2-1"]);
         assert!(!loaded.pending_turn);
-        assert_eq!(loaded.messages, vec![yi_agent_core::Message::user("carried")]);
+        assert_eq!(
+            loaded.messages,
+            vec![yi_agent_core::Message::user("carried")]
+        );
 
         // 幂等：partial 已清，再 promote 是 no-op，绝不重复 append。
         assert!(!store.promote_partial("thread-a").unwrap());
@@ -1516,10 +1541,11 @@ mod tests {
 
         // 判据与 load 一致：首 item id 已在 jsonl ⇒ 不重复 append，只清残留。
         assert!(!store.promote_partial("thread-a").unwrap());
-        assert!(!dir
-            .path()
-            .join(".yi-agent/threads/thread-a.partial.json")
-            .exists());
+        assert!(
+            !dir.path()
+                .join(".yi-agent/threads/thread-a.partial.json")
+                .exists()
+        );
         assert_eq!(
             store.load("thread-a").unwrap().unwrap().items.len(),
             1,
@@ -1567,10 +1593,11 @@ mod tests {
             .write_partial("thread-a", &PartialTurn::default())
             .unwrap();
         store.clear_partial("thread-a").unwrap();
-        assert!(!dir
-            .path()
-            .join(".yi-agent/threads/thread-a.partial.json")
-            .exists());
+        assert!(
+            !dir.path()
+                .join(".yi-agent/threads/thread-a.partial.json")
+                .exists()
+        );
         // 幂等：再删一次仍成功。
         store.clear_partial("thread-a").unwrap();
     }
@@ -1580,9 +1607,15 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let store = ThreadStore::new(dir.path());
         store.create(&sample_meta("thread-a")).unwrap();
-        store.write_partial("thread-a", &PartialTurn::default()).unwrap();
+        store
+            .write_partial("thread-a", &PartialTurn::default())
+            .unwrap();
         assert!(store.delete("thread-a").unwrap());
-        assert!(!dir.path().join(".yi-agent/threads/thread-a.partial.json").exists());
+        assert!(
+            !dir.path()
+                .join(".yi-agent/threads/thread-a.partial.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -1593,12 +1626,22 @@ mod tests {
         store
             .append_turn(
                 "thread-a",
-                &TurnLine::Turn { items: vec![user_item("user-t1", "hi")], usage: None, messages: vec![] },
+                &TurnLine::Turn {
+                    items: vec![user_item("user-t1", "hi")],
+                    usage: None,
+                    messages: vec![],
+                },
             )
             .unwrap();
-        store.write_partial("thread-a", &PartialTurn::default()).unwrap();
+        store
+            .write_partial("thread-a", &PartialTurn::default())
+            .unwrap();
         store.truncate("thread-a").unwrap();
-        assert!(!dir.path().join(".yi-agent/threads/thread-a.partial.json").exists());
+        assert!(
+            !dir.path()
+                .join(".yi-agent/threads/thread-a.partial.json")
+                .exists()
+        );
     }
     #[test]
     fn a_meta_without_board_fields_defaults_to_none() {
