@@ -7,6 +7,7 @@ import { ThreadStore } from "./lib/threadStore";
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
 import { MessageInput } from "./components/MessageInput";
+import { ModelPicker } from "./components/ModelPicker";
 import { StatusBar } from "./components/StatusBar";
 import { ApprovalDialog } from "./components/ApprovalDialog";
 import { ApprovalBanner } from "./components/ApprovalBanner";
@@ -218,6 +219,20 @@ export default function App() {
    * 看板的 2 秒轮询就把用户没保存的输入冲掉。
    */
   const pluginCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
+   * 模型 Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖即稳定；
+   * 若每次渲染换新身份，「模型」面板的读取 effect 会跟着重跑，把用户没保存的
+   * 编辑冲掉。
+   */
+  const modelCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
       if (!c) return Promise.reject(new Error("not connected"));
@@ -491,7 +506,7 @@ export default function App() {
         threadStartParams(cwd),
       );
       warm.current.add(t.thread_id);
-      store.view(t.thread_id).info = { cwd: t.cwd, model: t.model };
+      store.view(t.thread_id).info = { cwd: t.cwd, model: t.model, model_ref: null };
       // 新对话默认 normal;仍从 listAll 回读以与服务端保持一致。
       store.view(t.thread_id).mode = "normal";
       store.select(t.thread_id);
@@ -1122,6 +1137,20 @@ export default function App() {
   };
 
   /**
+   * 记下某会话下拉写入成功后的模型结果。
+   *
+   * 只更新**那个**会话的 `info.model_ref` / `info.model`：写的是哪个会话，就更新
+   * 哪个——切换会话的瞬间下拉可能已不指向当前会话，按 id 落笔才不会把结果写到
+   * 别人头上。写入方（ModelPicker）已确认 RPC 成功，这里不做乐观更新。
+   */
+  const changeThreadModel = (id: string, ref: string | null, model: string | null) => {
+    const view = store.peek(id);
+    if (!view) return;
+    if (view.info) view.info = { ...view.info, model_ref: ref, model: model ?? view.info.model };
+    force((v) => v + 1);
+  };
+
+  /**
    * 切换宿主级「后台值守」。不做乐观更新：值以宿主返回的为准，安装/卸载失败
    * 的告知（warning）原样摆到面板上——静默会让用户以为已经生效。
    */
@@ -1335,6 +1364,17 @@ export default function App() {
                 value={current?.draft ?? ""}
                 onDraftChange={changeDraft}
                 disabled={current === null}
+                modelPicker={
+                  current !== null && currentId !== null ? (
+                    <ModelPicker
+                      call={modelCall}
+                      threadId={currentId}
+                      currentRef={current.info?.model_ref ?? null}
+                      currentModel={current.info?.model ?? null}
+                      onChanged={(id, ref, model) => changeThreadModel(id, ref, model)}
+                    />
+                  ) : null
+                }
               />
             </>
           )}
@@ -1349,7 +1389,6 @@ export default function App() {
           {/* StatusBar 保持无条件渲染：看板只覆盖会话区，状态栏是窗口级的。 */}
           <StatusBar
             cwd={current?.info?.cwd ?? null}
-            model={current?.info?.model ?? null}
             status={status}
             usage={current?.session.usage ?? null}
             /*
@@ -1457,6 +1496,9 @@ export default function App() {
         // plugins/list 与 plugin/settings/*。用稳定的 `pluginCall`（见上），
         // 别在这里内联箭头——否则每次 App 渲染都会换新身份，重跑面板的读取。
         pluginCall={pluginCall}
+        // 模型 Tab 同样走当前 transport（桌面 stdio = Admin），能调 model/*。
+        // 用稳定的 `modelCall`（见上），别在这里内联箭头。
+        modelCall={modelCall}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。

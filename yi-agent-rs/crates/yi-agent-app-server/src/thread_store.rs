@@ -45,6 +45,11 @@ pub struct ThreadMeta {
     /// 该会话对应的看板卡 id。None = 普通会话。
     #[serde(default)]
     pub card_id: Option<String>,
+    /// 会话模型覆盖：清单里的显示名。None = 跟随全局默认模型。
+    /// 与 `model` 的区别：`model` 是**当前生效的 model 串**（显示用），
+    /// `model_ref` 是用户在清单里选中的**显示名**（选择用）。
+    #[serde(default)]
+    pub model_ref: Option<String>,
 }
 
 /// 一次 turn 的 token 用量。
@@ -355,6 +360,42 @@ impl ThreadStore {
         Ok(self.update_meta(id, |meta| meta.pin_seq = seq)?.is_some())
     }
 
+    /// 更新该 thread 的模型覆盖选择（清单里的显示名），保留其余 meta 字段。
+    ///
+    /// 走与 `rename` / `set_permission_mode` 相同的 `update_meta` 读-改-写锁与
+    /// 原子写路径，避免与并发 `touch` / `rename` 互相覆盖。
+    /// 返回 `Err(NotFound)` 表示 thread 不存在或 meta 不可读。
+    pub fn set_model_ref(&self, id: &str, model_ref: Option<&str>) -> io::Result<()> {
+        let updated = self.update_meta(id, |meta| {
+            meta.model_ref = model_ref.map(str::to_string);
+            meta.updated_at = now_millis();
+        })?;
+        match updated {
+            Some(_) => Ok(()),
+            None => Err(io::Error::new(io::ErrorKind::NotFound, "unknown thread")),
+        }
+    }
+
+    /// 一次原子写同时落盘会话覆盖(`model_ref`)与**生效串**(`model`)。
+    ///
+    /// 切模型必须让这两个字段同进同出:分两次 `update_meta` 会给并发 `touch` /
+    /// `rename` 留出「ref 已换、生效串还是旧的」的窗口,`thread/list` 便会读到
+    /// 自相矛盾的组合。与 [`set_model_ref`] 共用同一把读-改-写锁与原子写路径;
+    /// 有意保留两份方法(而非让 `set_model_ref` 委托),因为只改 ref 的旧调用
+    /// 语义是「不动生效串」,委托会多读一次 meta 并隐式改写它。
+    /// 返回 `Err(NotFound)` 表示 thread 不存在或 meta 不可读。
+    pub fn set_model(&self, id: &str, model_ref: Option<&str>, model: &str) -> io::Result<()> {
+        let updated = self.update_meta(id, |meta| {
+            meta.model_ref = model_ref.map(str::to_string);
+            meta.model = model.to_string();
+            meta.updated_at = now_millis();
+        })?;
+        match updated {
+            Some(_) => Ok(()),
+            None => Err(io::Error::new(io::ErrorKind::NotFound, "unknown thread")),
+        }
+    }
+
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
     /// `title_hint`(本轮 prompt)填充。thread 不存在或 meta 不可读时静默返回。
     pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<()> {
@@ -645,6 +686,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         pin_seq: None,
         board_project: None,
         card_id: None,
+        model_ref: None,
     }
 }
 
@@ -671,6 +713,7 @@ mod tests {
             pin_seq: None,
             board_project: None,
             card_id: None,
+            model_ref: None,
         }
     }
 
@@ -1274,6 +1317,7 @@ mod tests {
             pin_seq: None,
             board_project: None,
             card_id: None,
+            model_ref: None,
         }
     }
 
@@ -1577,10 +1621,50 @@ mod tests {
             pin_seq: None,
             board_project: Some("/proj".into()),
             card_id: Some("c1".into()),
+            model_ref: None,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
         assert_eq!(back.board_project.as_deref(), Some("/proj"));
         assert_eq!(back.card_id.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn a_legacy_meta_without_model_ref_loads_as_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        std::fs::create_dir_all(dir.path().join(".yi-agent").join("threads")).unwrap();
+        // 沿用既有测试里写 meta 的方式；这里断言缺字段反序列化为 None。
+        let json = r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
+        let meta: ThreadMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(meta.model_ref, None);
+        let _ = store;
+    }
+
+    #[test]
+    fn set_model_ref_round_trips() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let now = now_millis();
+        let meta = ThreadMeta {
+            thread_id: "t".into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            created_at: now,
+            updated_at: now,
+            title: None,
+            permission_mode: ThreadMode::Normal,
+            pin_seq: None,
+            board_project: None,
+            card_id: None,
+            model_ref: None,
+        };
+        store.create(&meta).unwrap();
+        store.set_model_ref("t", Some("B")).unwrap();
+        let loaded = store.load("t").unwrap().unwrap();
+        assert_eq!(loaded.meta.model_ref.as_deref(), Some("B"));
+        store.set_model_ref("t", None).unwrap();
+        let loaded = store.load("t").unwrap().unwrap();
+        assert_eq!(loaded.meta.model_ref, None);
     }
 }

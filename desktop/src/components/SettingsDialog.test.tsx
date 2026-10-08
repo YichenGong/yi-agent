@@ -85,6 +85,22 @@ describe("SettingsDialog", () => {
     fireEvent.click(screen.getByRole("tab", { name: "插件" }));
     expect(await screen.findByText("未安装任何插件")).toBeTruthy();
   });
+
+  it("shows a 模型 tab backed by the injected modelCall", async () => {
+    const modelCall = async (method: string) =>
+      method === "model/list" ? { models: [], default_model: null, subagent_model: null } : { ok: true };
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        modelCall={modelCall}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "模型" }));
+    expect(await screen.findByText("还没有配置任何模型")).toBeTruthy();
+  });
 });
 
 describe("SettingsDialog focus management & tab wiring", () => {

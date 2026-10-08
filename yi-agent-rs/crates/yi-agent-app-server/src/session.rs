@@ -33,7 +33,7 @@ pub struct InterjectionRequest {
     pub text: String,
 }
 
-/// 发给 driver 的会话级命令（清空 / 压缩）。
+/// 发给 driver 的会话级命令（清空 / 压缩 / 切模型）。
 ///
 /// 必须走 driver 而不是主循环：`Agent::session()` 只返回 `Session` 的 clone，
 /// 修改 session 的可变访问权只存在于持有 agent 的 driver 内部。
@@ -45,6 +45,17 @@ pub enum SessionCommand {
     /// 压缩该 thread 的上下文。
     Compact {
         reply: oneshot::Sender<CompactOutcome>,
+    },
+    /// 切换该 thread 的会话模型：写路径已完成 meta 更新，这里只负责重建 agent。
+    ///
+    /// 携带**该会话解析出的完整 cfg**，而不只是 model 串：换模型可能同时换
+    /// provider / api_url / api_key，driver 需要它才能构造新 provider。
+    SetModel {
+        /// 新解析出的 cfg（含 provider/api_url/api_key/model）。
+        effective: Box<yi_agent_runtime::config::RuntimeConfig>,
+        /// 新选中的显示名（仅用于日志与回执）。
+        model_ref: Option<String>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
 }
 
@@ -106,6 +117,7 @@ mod tests {
         match command {
             SessionCommand::Clear { reply } => reply.send(Ok(())).unwrap(),
             SessionCommand::Compact { .. } => panic!("expected Clear"),
+            SessionCommand::SetModel { .. } => panic!("expected Clear"),
         }
         assert_eq!(answer.await.unwrap(), Ok(()));
     }

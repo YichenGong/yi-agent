@@ -228,7 +228,7 @@ yi-agent --provider openai --model gpt-4o
 | yi-agent-llm | 6 / 9 | [详情](docs/project-management/yi-agent-llm.md) |
 | yi-agent-tools | 14 / 14 | [详情](docs/project-management/yi-agent-tools.md) |
 | yi-agent-skills | 8 / 8 | [详情](docs/project-management/yi-agent-skills.md) |
-| yi-agent-tui | 30 / 32 | [详情](docs/project-management/yi-agent-tui.md) |
+| yi-agent-tui | 32 / 34 | [详情](docs/project-management/yi-agent-tui.md) |
 | yi-agent-run | 10 / 10 | [详情](docs/project-management/yi-agent-run.md) |
 | yi-agent-cli | 1 / 1 | [详情](docs/project-management/yi-agent-cli.md) |
 | yi-agent-web | 6 / 6 | [详情](docs/project-management/yi-agent-web.md) |
@@ -237,11 +237,11 @@ yi-agent --provider openai --model gpt-4o
 | tooling | 3 / 3 | [详情](docs/project-management/tooling.md) |
 | yi-agent-mcp | 1 / 1 | [详情](docs/project-management/yi-agent-mcp.md) |
 | yi-agent-store | 5 / 6 | [详情](docs/project-management/yi-agent-store.md) |
-| yi-agent-runtime | 11 / 11 | [详情](docs/project-management/yi-agent-runtime.md) |
-| yi-agent-subagent | 6 / 6 | [详情](docs/project-management/yi-agent-subagent.md) |
-| yi-agent-app-server | 30 / 30 | [详情](docs/project-management/yi-agent-app-server.md) |
+| yi-agent-runtime | 12 / 12 | [详情](docs/project-management/yi-agent-runtime.md) |
+| yi-agent-subagent | 7 / 7 | [详情](docs/project-management/yi-agent-subagent.md) |
+| yi-agent-app-server | 32 / 32 | [详情](docs/project-management/yi-agent-app-server.md) |
 | subagent-runtime | 42 / 49 | [详情](docs/project-management/subagent-runtime.md) |
-| desktop | 33 / 46 | [详情](docs/project-management/desktop.md) |
+| desktop | 34 / 47 | [详情](docs/project-management/desktop.md) |
 
 </details>
 

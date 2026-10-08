@@ -81,38 +81,81 @@ pub fn ignore_project_local_runtime_state(workdir: &Path) {
 
 /// Builds the daemon-side worker factory for `cfg` (provider, skills-only
 /// registry, sandbox, project workspace).
+///
+/// The child's model and credentials come from the machine catalog's
+/// `subagent_model` entry, falling back to the global default, and finally to
+/// `cfg` itself when neither is configured (see [`build_worker_factory`]).
 pub fn worker_factory(
     cfg: &RuntimeConfig,
     runtime_socket: PathBuf,
 ) -> anyhow::Result<std::sync::Arc<dyn AgentWorkerFactory>> {
+    Ok(std::sync::Arc::new(build_worker_factory(
+        cfg,
+        runtime_socket,
+        &yi_agent_runtime::models::load_catalog(),
+    )?))
+}
+
+/// Builds the factory from an already-loaded catalog.
+///
+/// The catalog is a parameter, never re-read from `HOME` here, so a test (or a
+/// caller that already holds one) resolves the same way the process does without
+/// mutating process-wide environment state.
+fn build_worker_factory(
+    cfg: &RuntimeConfig,
+    runtime_socket: PathBuf,
+    catalog: &yi_agent_runtime::models::ModelCatalog,
+) -> anyhow::Result<crate::DaemonAgentWorkerFactory> {
     use std::sync::Arc;
 
-    let provider = yi_agent_runtime::bootstrap::build_provider(cfg)?;
+    // The child runs on the catalog's `subagent_model` entry (falling back to the
+    // global default); with no entry at all the process cfg is used unchanged.
+    let effective = yi_agent_runtime::models::resolve_effective(
+        cfg,
+        catalog,
+        catalog.subagent_model.as_deref(),
+    );
+    let effective = &effective;
+    let provider = yi_agent_runtime::bootstrap::build_provider(effective)?;
     // Skills-only registry: the worker's deliberate contract is to NOT register
     // builtin/process tools here (the recovery path adds its own workspace-rooted
     // set, and the worker start call adds its own).
-    let prompt = yi_agent_runtime::bootstrap::build_prompt_setup(cfg)?;
+    let prompt = yi_agent_runtime::bootstrap::build_prompt_setup(effective)?;
     let catalog = prompt.catalog;
     let mut registry = yi_agent_core::ToolRegistry::new();
     if let Some(skills) = &prompt.skills {
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
     }
-    let agent_config = yi_agent_runtime::bootstrap::build_agent_config(cfg, prompt.system_prompt);
-    Ok(Arc::new(
-        crate::DaemonAgentWorkerFactory::new(
-            provider,
-            Arc::new(registry),
-            agent_config,
-            runtime_socket,
-        )
-        .with_catalog(catalog)
-        // Recovery must inspect the same worktree ordinary builtin tools use.
-        .with_sandbox(cfg.sandbox, cfg.sandbox_writable_roots.clone())
-        .with_workspace(cfg.workdir.clone())
-        // The configured capacity must reach the coordinator; without this the
-        // factory reports the trait default and the env var is inert.
-        .with_max_resident_subagents(cfg.max_resident_subagents),
-    ))
+    let agent_config =
+        yi_agent_runtime::bootstrap::build_agent_config(effective, prompt.system_prompt);
+    Ok(crate::DaemonAgentWorkerFactory::new(
+        provider,
+        Arc::new(registry),
+        agent_config,
+        runtime_socket,
+    )
+    .with_catalog(catalog)
+    // Recovery must inspect the same worktree ordinary builtin tools use.
+    .with_sandbox(effective.sandbox, effective.sandbox_writable_roots.clone())
+    .with_workspace(effective.workdir.clone())
+    // The configured capacity must reach the coordinator; without this the
+    // factory reports the trait default and the env var is inert.
+    .with_max_resident_subagents(effective.max_resident_subagents))
+}
+
+/// Test-only seam: load a catalog from an explicit path instead of `HOME`, so a
+/// test can inject one without mutating process-wide environment state.
+#[cfg(test)]
+fn worker_factory_with_catalog(
+    cfg: &RuntimeConfig,
+    runtime_socket: PathBuf,
+    catalog_path: &Path,
+) -> anyhow::Result<crate::DaemonAgentWorkerFactory> {
+    build_worker_factory(
+        cfg,
+        runtime_socket,
+        &yi_agent_runtime::models::load_catalog_from(catalog_path),
+    )
 }
 
 /// Starts (or joins) the project daemon and attaches an application root.
@@ -187,10 +230,7 @@ pub fn attach_project_runtime(
             workspace,
         },
         embedded_daemon,
-        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
-            &cfg.workdir,
-            owns_daemon,
-        ),
+        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(&cfg.workdir, owns_daemon),
     })
 }
 
@@ -371,6 +411,117 @@ pub fn retire_if_wedged(socket_path: &std::path::Path) -> bool {
 mod tests {
     use super::{RuntimeProbe, probe_runtime, project_runtime_directory, worker_factory};
     use yi_agent_store::ipc::Daemon;
+
+    /// A fully-populated config for the factory tests. Every field the resolved
+    /// catalog entry could clobber is set to a recognizable "base" value so a
+    /// test can tell the entry's value from the process cfg's.
+    fn base_config(workdir: &std::path::Path) -> yi_agent_runtime::config::RuntimeConfig {
+        yi_agent_runtime::config::RuntimeConfig {
+            provider: "anthropic".into(),
+            api_url: "https://api.anthropic.com".into(),
+            api_key: String::new(),
+            model: "base-model".into(),
+            max_turns: 4,
+            max_resident_subagents: 8,
+            workdir: workdir.to_path_buf(),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::default(),
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: true,
+        }
+    }
+
+    /// Writes a models.json into a per-test temp dir and returns its path. The
+    /// catalog is injected by path, so no test mutates the process `HOME`.
+    fn catalog_file(dir: &std::path::Path, json: &str) -> std::path::PathBuf {
+        let path = dir.join("models.json");
+        std::fs::write(&path, json).unwrap();
+        path
+    }
+
+    /// The factory must land the child on the catalog's `subagent_model` entry,
+    /// not the process cfg's model: a worker running the global default model
+    /// would ignore the user's dedicated (often cheaper) subagent choice.
+    #[test]
+    fn the_worker_uses_the_subagent_model_entry() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let catalog_path = catalog_file(
+            directory.path(),
+            r#"{"models":[
+                {"name":"A","provider":"anthropic","api_url":"https://a","model":"model-a","api_key":"key-a"},
+                {"name":"S","provider":"openai","api_url":"https://s","model":"model-s","api_key":"key-s"}
+            ],"default_model":"A","subagent_model":"S"}"#,
+        );
+        let cfg = base_config(directory.path());
+
+        let factory = super::worker_factory_with_catalog(
+            &cfg,
+            directory.path().join("runtime.sock"),
+            &catalog_path,
+        )
+        .expect("factory");
+
+        assert_eq!(
+            factory.worker_config_model("ignored"),
+            "model-s",
+            "the worker must run on the subagent_model entry, not the global default"
+        );
+    }
+
+    /// With no `subagent_model`, the global default is the truthful choice, so
+    /// the worker falls back to it rather than the process cfg.
+    #[test]
+    fn the_worker_falls_back_to_the_global_default() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let catalog_path = catalog_file(
+            directory.path(),
+            r#"{"models":[
+                {"name":"A","provider":"anthropic","api_url":"https://a","model":"model-a","api_key":"key-a"}
+            ],"default_model":"A"}"#,
+        );
+        let cfg = base_config(directory.path());
+
+        let factory = super::worker_factory_with_catalog(
+            &cfg,
+            directory.path().join("runtime.sock"),
+            &catalog_path,
+        )
+        .expect("factory");
+
+        assert_eq!(
+            factory.worker_config_model("ignored"),
+            "model-a",
+            "without a subagent_model the global default must be used"
+        );
+    }
+
+    /// An empty catalog (no default, no subagent) leaves the process cfg intact,
+    /// which is the pre-catalog behavior every existing deployment relies on.
+    #[test]
+    fn the_worker_falls_back_to_the_process_cfg_without_a_catalog() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let catalog_path = directory.path().join("missing-models.json");
+        let cfg = base_config(directory.path());
+
+        let factory = super::worker_factory_with_catalog(
+            &cfg,
+            directory.path().join("runtime.sock"),
+            &catalog_path,
+        )
+        .expect("factory");
+
+        assert_eq!(
+            factory.worker_config_model("ignored"),
+            "base-model",
+            "no catalog entry must leave the process cfg's model in place"
+        );
+    }
 
     /// The configured capacity must survive the trip through the factory: this
     /// is what makes `YI_AGENT_MAX_RESIDENT_SUBAGENTS` effective in the daemon

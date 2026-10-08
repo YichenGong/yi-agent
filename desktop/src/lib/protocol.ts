@@ -49,8 +49,12 @@ export type TurnStatus = "completed" | "interrupted" | "failed";
 export type ThreadStatus = "idle" | "running" | "awaiting_approval";
 
 export type Notification =
-  | { method: "thread/started"; params: { thread_id: string; cwd: string; model: string } }
+  | {
+      method: "thread/started";
+      params: { thread_id: string; cwd: string; model: string; model_ref?: string | null };
+    }
   | { method: "thread/status/updated"; params: { thread_id: string; status: ThreadStatus } }
+  | { method: "thread/modelChanged"; params: { thread_id: string; model: string } }
   | { method: "turn/started"; params: { thread_id: string; turn_id: string } }
   | { method: "item/started"; params: { thread_id: string; item: Item } }
   | { method: "item/delta"; params: { thread_id: string; item_id: string; delta: string } }
@@ -180,6 +184,11 @@ export interface ThreadSummary {
   board_project?: string;
   /** 由看板创建时，该会话对应的卡 id。旧服务端缺省视为普通会话。 */
   card_id?: string;
+  /**
+   * 该会话的模型引用（模型清单里的 `name`）。缺省/`null` = 跟随全局默认。
+   * 旧服务端不发送此字段，读取时按 `null` 处理。
+   */
+  model_ref?: string | null;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */

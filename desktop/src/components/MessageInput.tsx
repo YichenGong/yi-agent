@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { ModeChip } from "./ModeChip";
 import { SlashPopup } from "./SlashPopup";
 import { filterCommands, parseSlashInput } from "../lib/slash";
@@ -15,6 +15,7 @@ export function MessageInput({
   value,
   onDraftChange,
   disabled = false,
+  modelPicker,
 }: {
   turnActive: boolean;
   onSend: (text: string) => Promise<boolean>;
@@ -36,6 +37,11 @@ export function MessageInput({
    * 否则会留下一个能敲字、却因无处存放草稿而静默丢字的文本框。
    */
   disabled?: boolean;
+  /**
+   * 追加在右下角的控件（与 ModeChip / 发送按钮同一行，居最右）。当前由 App 传入
+   * 会话级模型下拉；`MessageInput` 不关心它是什么，只负责给它一个位置。
+   */
+  modelPicker?: ReactNode;
 }) {
   const [sending, setSending] = useState(false);
   // Latch: whether the popup should currently be offered. Escape clears it to
@@ -188,6 +194,7 @@ export function MessageInput({
       >
         {turnActive ? "Stop" : "Send"}
       </button>
+      {modelPicker}
     </div>
   );
 }

@@ -1969,22 +1969,58 @@ fn run_tui_agent(
                             );
                             tracing::info!("MCP tool registry refreshed");
                         }
-                        ControlCommand::SetModel(new_model) => {
-                            let mut next_config = rebuild_config.clone();
-                            next_config.model = new_model.clone();
-                            let handle = agent.session_handle();
-                            agent = rebuild_driver_agent(
-                                Arc::clone(&rebuild_provider),
-                                Arc::clone(&current_tools),
-                                next_config,
-                                Arc::clone(&current_checker),
-                                Arc::clone(&rebuild_decision_rx),
-                                handle,
+                        ControlCommand::SetModel(display_name) => {
+                            // display name → 清单条目 → provider/api_url/api_key/model。
+                            // 载入清单在闭包里,不在 TUI 线程:切换只在控制命令这一刻读盘。
+                            let model_catalog = yi_agent_runtime::models::load_catalog();
+                            let effective = yi_agent_runtime::models::resolve_effective(
+                                &config,
+                                &model_catalog,
+                                display_name.as_deref(),
                             );
-                            tracing::info!(model = %new_model, "agent model switched via /model");
-                            let _ = agent_tx
-                                .send(yi_agent_core::AgentEvent::ModelChanged { model: new_model })
-                                .await;
+                            // provider 构造放在最前:失败就短路,`agent` 尚未被消费,
+                            // 旧 agent 原样保留(绝不半重建)。
+                            match yi_agent_runtime::bootstrap::build_provider(&effective) {
+                                Ok(provider) => {
+                                    let mut next_config = rebuild_config.clone();
+                                    next_config.model = effective.model.clone();
+                                    let handle = agent.session_handle();
+                                    agent = rebuild_driver_agent(
+                                        provider,
+                                        Arc::clone(&current_tools),
+                                        next_config,
+                                        Arc::clone(&current_checker),
+                                        Arc::clone(&rebuild_decision_rx),
+                                        handle,
+                                    );
+                                    tracing::info!(
+                                        model = %effective.model,
+                                        ?display_name,
+                                        "agent model switched via /model"
+                                    );
+                                    let _ = agent_tx
+                                        .send(yi_agent_core::AgentEvent::ModelChanged {
+                                            model: effective.model,
+                                        })
+                                        .await;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        ?display_name,
+                                        "model switch failed; keeping the old agent"
+                                    );
+                                    let _ = agent_tx
+                                        .send(yi_agent_core::AgentEvent::Error(
+                                            yi_agent_core::AgentError::Provider(
+                                                yi_agent_core::ProviderError::InvalidRequest(
+                                                    format!("/model 切换失败: {error}"),
+                                                ),
+                                            ),
+                                        ))
+                                        .await;
+                                }
+                            }
                         }
                     }
                     continue;
@@ -2269,6 +2305,9 @@ fn run_tui_agent(
                 workdir.clone(),
                 mcp,
                 tui_config,
+                // 读一次模型清单供 TUI 的 `/model` 显示（机器级全局文件）；
+                // 无文件即空清单，行为与今天一致。
+                yi_agent_runtime::models::load_catalog(),
             )
         });
 
@@ -2316,8 +2355,16 @@ pub(crate) enum ControlCommand {
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
     Compact,
-    /// Rebuild the agent with a new model, preserving the session.
-    SetModel(String),
+    /// Rebuild the agent from a machine-level catalog entry, preserving the
+    /// session. `Some(name)` selects that display name; `None` clears the
+    /// session override and falls back to the catalog's `default_model`.
+    ///
+    /// Carries the display name rather than the model string: the driver
+    /// re-reads `~/.yi-agent/models.json` and emits the entry's provider /
+    /// api_url / api_key / model together, so a switch can move across
+    /// providers. Sending only a model string would keep the old (possibly
+    /// mismatched) key/url and silently fail at the first request.
+    SetModel(Option<String>),
     /// Rebuild the agent so its tool registry matches the MCP switches the TUI
     /// already applied directly to the shared `McpManager`.
     McpRefresh,
@@ -2355,14 +2402,13 @@ mod tests {
         // Guards against a `PartialEq` that ignores the payload (e.g. compares only
         // the discriminant): two different models must not compare equal, and
         // `SetModel` must not compare equal to a payload-less variant.
-        let a = ControlCommand::SetModel("claude-opus-4-1".into());
-        let b = ControlCommand::SetModel("claude-sonnet-4-5".into());
+        let a = ControlCommand::SetModel(Some("claude-opus-4-1".into()));
+        let b = ControlCommand::SetModel(Some("claude-sonnet-4-5".into()));
         assert_ne!(a, b);
         assert_ne!(a, ControlCommand::McpRefresh);
-        assert_eq!(
-            ControlCommand::SetModel("claude-opus-4-1".into()),
-            ControlCommand::SetModel("claude-opus-4-1".into()),
-        );
+        // `None` clears the override and must not compare equal to a named switch.
+        assert_ne!(ControlCommand::SetModel(None), a);
+        assert_eq!(ControlCommand::SetModel(Some("claude-opus-4-1".into())), a,);
     }
 
     #[test]

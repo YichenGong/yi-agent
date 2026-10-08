@@ -110,6 +110,10 @@ pub(crate) struct RuntimeAttachments {
     /// `WorkspaceIndex` is: the `board/*` RPCs must be testable without
     /// touching the developer's real `~/.yi-agent`.
     pub(crate) board_dir: PathBuf,
+    /// Where `models.json` lives. Injectable for the same reason `board_dir`
+    /// is: `model/*` must be testable without writing the developer's real
+    /// machine-level catalog (and its API keys).
+    pub(crate) models_path: PathBuf,
     /// Where the generic resident-daemon registry lives (`$HOME/.yi-agent`).
     /// Injectable for the same reason `board_dir` is: `board/create` must be
     /// testable without writing the developer's real resident registry.
@@ -1354,6 +1358,8 @@ where
     // 工厂闭包 `'static`,拿不到主循环里的 `theme`;先克隆一份专供工厂。
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
+    // 清单在启动时读一次;`production_factory` 的闭包持有它,逐会话按 `model_ref` 解析。
+    let catalog = Arc::new(yi_agent_runtime::models::load_catalog());
     serve_stdio(
         reader,
         writer,
@@ -1366,6 +1372,7 @@ where
             runtimes,
             thread_roots,
             board_dir,
+            models_path: yi_agent_runtime::models::models_path(),
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
@@ -1373,7 +1380,7 @@ where
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
         },
-        production_factory(cfg, theme_for_factory),
+        production_factory(cfg, theme_for_factory, catalog),
     )
     .await
 }
@@ -1417,6 +1424,8 @@ where
     spawn_board_watchman_loop(resident_dir.clone());
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
+    // 与 `run` 一致:清单启动读一次,工厂逐会话解析。
+    let catalog = Arc::new(yi_agent_runtime::models::load_catalog());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     serve_scoped_core(
         reader,
@@ -1430,6 +1439,7 @@ where
             runtimes,
             thread_roots,
             board_dir,
+            models_path: yi_agent_runtime::models::models_path(),
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
@@ -1437,7 +1447,7 @@ where
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
         },
-        production_factory(cfg, theme_for_factory),
+        production_factory(cfg, theme_for_factory, catalog),
         // 桌面 = Admin(与 `run`/`serve_stdio` 的 stdio 注册完全一致)。
         Scope::Admin,
         Some(listener),
@@ -1446,10 +1456,42 @@ where
     .await
 }
 
+thread_local! {
+    /// 本次 `build_agent` 调用所属会话的 `model_ref`(清单显示名)。工厂闭包是
+    /// `Fn` 且被 `'static` 持有,签名里带不进这个逐会话参数,故用 thread-local
+    /// 传入。`build_agent` 同步执行、期间无 `await`,故槽位不会被跨任务污染。
+    static SESSION_MODEL_REF: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 在调用工厂(`build_agent`)前设定本次会话的模型覆盖(清单显示名),供工厂解析。
+///
+/// 调用返回后恢复调用前的值,故嵌套调用(如 `thread/start` 内再建其它 agent)不会
+/// 泄漏覆盖。`thread/start` 取请求参数、`thread/resume` 取 `loaded.meta.model_ref`。
+pub(crate) fn with_session_model_ref<T>(model_ref: Option<String>, f: impl FnOnce() -> T) -> T {
+    SESSION_MODEL_REF.with(|slot| {
+        let prev = slot.replace(model_ref);
+        let out = f();
+        slot.replace(prev);
+        out
+    })
+}
+
+/// 工厂内部读取当前会话的 `model_ref`;不在 [`with_session_model_ref`] 内时为空。
+fn current_session_model_ref() -> Option<String> {
+    SESSION_MODEL_REF.with(|slot| slot.borrow().clone())
+}
+
 /// 生产环境的 agent 工厂:按 thread 的 cwd 覆盖 workdir 与 yolo 后引导一个 agent。
+///
+/// `catalog` 在进程启动时经 `load_catalog()` 读入一次并共享;每次调用再按本次会话
+/// 的 `model_ref`(由 [`with_session_model_ref`] 设定)解析 provider/api_url/
+/// api_key/model 四个字段,使**整条会话**跑在清单条目的 url/key/model 上,而非
+/// 全局 `cfg`(解析不中则原样回退 `cfg`)。
 pub(crate) fn production_factory(
     cfg: RuntimeConfig,
     theme: crate::theme_tool::ThemeHandle,
+    catalog: Arc<yi_agent_runtime::models::ModelCatalog>,
 ) -> impl Fn(
     Option<yi_agent_core::Session>,
     &Path,
@@ -1462,6 +1504,13 @@ pub(crate) fn production_factory(
         let mut thread_cfg = cfg.clone();
         thread_cfg.workdir = cwd.to_path_buf();
         thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
+        let model_ref = current_session_model_ref();
+        // 按本次会话解析 provider/api_url/api_key/model;不中则原样回退 cfg。
+        let thread_cfg = yi_agent_runtime::models::resolve_effective(
+            &thread_cfg,
+            &catalog,
+            model_ref.as_deref(),
+        );
         let built = yi_agent_runtime::bootstrap::bootstrap_agent(
             &thread_cfg,
             yi_agent_runtime::bootstrap::PermissionMode::Interactive,
@@ -1983,6 +2032,7 @@ where
         runtimes,
         thread_roots,
         board_dir,
+        models_path,
         resident_dir,
         launcher: board_launcher,
         theme,
@@ -2451,6 +2501,46 @@ where
                             }
                         }
                     }
+                    // 机器级模型清单（`~/.yi-agent/models.json`），不带 project：
+                    // 与 `ui/settings/*` 同类。`model/list` 只需 `Observe`（回掩码，
+                    // 永不含明文 key）；写操作与既有写路径同档，需 `Control`。
+                    "model/list" => {
+                        match crate::model_rpc::handle_model_request_at(
+                            &models_path,
+                            method.as_str(),
+                            &req.params,
+                        ) {
+                            Ok(value) => {
+                                write_response(&hub, &client, ok_response(id, value)).await?
+                            }
+                            Err(error) => {
+                                write_response(&hub, &client, err_response(id, error)).await?
+                            }
+                        }
+                    }
+                    "model/upsert" | "model/delete" | "model/setDefault" | "model/setSubagent" => {
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        match crate::model_rpc::handle_model_request_at(
+                            &models_path,
+                            method.as_str(),
+                            &req.params,
+                        ) {
+                            Ok(value) => {
+                                write_response(&hub, &client, ok_response(id, value)).await?
+                            }
+                            Err(error) => {
+                                write_response(&hub, &client, err_response(id, error)).await?
+                            }
+                        }
+                    }
                     "board/create" => {
                         let Some(project) = project_arg(&req.params) else {
                             write_response(
@@ -2718,13 +2808,34 @@ where
                         // 抽成局部量避免两处字面量漂移。
                         let mode = crate::thread_store::ThreadMode::Normal;
 
-                        let built = match build_agent(None, Path::new(&cwd), mode) {
+                        // 可选的会话级模型覆盖(清单显示名)。wire 用 camelCase
+                        // `modelRef`,兼容 snake_case `model_ref`;二者都缺省即
+                        // `None`(跟随清单全局默认,再回退 cfg)。
+                        let model_ref = req
+                            .params
+                            .get("modelRef")
+                            .or_else(|| req.params.get("model_ref"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+
+                        // 本次会话的 `model_ref` 经 thread-local 交给工厂解析 provider /
+                        // api_url / api_key / model(命中清单默认则用条目,否则回退 cfg)。
+                        let built = match with_session_model_ref(model_ref.clone(), || {
+                            build_agent(None, Path::new(&cwd), mode)
+                        }) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(&hub, &client, err_response(id, RpcError::internal(e.to_string()))).await?;
                                 continue;
                             }
                         };
+
+                        // 落盘/上报的生效串取自**实际建出的 agent**,而非另按清单解析一次。
+                        // `production_factory` 只在进程启动时快照一次清单,运行期经
+                        // `model/upsert` 新增的条目不在其快照内;此处若再读一次磁盘,就可能
+                        // 上报一个工厂实际未采用的模型(任务 7 评审 Finding 1)。用
+                        // `agent.config().model` 才能保证「上报 == 实际运行」。
+                        let model = built.agent.config().model.clone();
 
                         // 内核负责「attach_delegation → 建 driver 通道 → insert 到
                         // `threads` → spawn 守望者与 driver」;RPC 层的通知与响应仍在
@@ -2748,16 +2859,18 @@ where
                             &perm_seq,
                             &theme,
                             &workspaces,
+                            model.clone(),
+                            model_ref.clone(),
                             None,
                             None,
                         )
                         .await?;
 
-                        let model = cfg.model.clone();
                         write_notification(&hub, &Notification::ThreadStarted {
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
                                 model: model.clone(),
+                                model_ref: model_ref.clone(),
                             },
                         )
                         .await?;
@@ -2769,6 +2882,7 @@ where
                                     "thread_id": thread_id,
                                     "cwd": cwd,
                                     "model": model,
+                                    "model_ref": model_ref,
                                 }),
                             ),
                         )
@@ -2838,11 +2952,6 @@ where
                         } else {
                             loaded.meta.cwd.clone()
                         };
-                        let model = if loaded.meta.model.is_empty() {
-                            cfg.model.clone()
-                        } else {
-                            loaded.meta.model.clone()
-                        };
 
                         let mut session = yi_agent_core::Session::new();
                         // 恢复上次用量,使 auto-compact 在 resume 后的首轮即生效。
@@ -2857,7 +2966,9 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
-                        let built = match build_agent(Some(session), Path::new(&cwd), mode) {
+                        let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
+                            build_agent(Some(session), Path::new(&cwd), mode)
+                        }) {
                             Ok(a) => a,
                             Err(e) => {
                                 write_response(
@@ -2868,6 +2979,12 @@ where
                                 continue;
                             }
                         };
+                        // 与 `thread/start` 同款:上报/落盘的生效串取自**实际建出的 agent**
+                        // (`agent.config().model`),而非按清单再解析一次。工厂持有的是启动时
+                        // 快照,运行期新增的条目会让「另解析一次」与实际运行不一致
+                        // (任务 7 评审 Finding 1);不照抄 meta.model 也是为了让旧库/异常库里
+                        // 一个与当前清单不符的陈旧串被本次实际生效值取代。
+                        let model = built.agent.config().model.clone();
                         let runtime_dir =
                             yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
                         let activation = attach_delegation(
@@ -2963,6 +3080,7 @@ where
                                 thread_id: thread_id.clone(),
                                 cwd: cwd.clone(),
                                 model: model.clone(),
+                                model_ref: loaded.meta.model_ref.clone(),
                             },
                         )
                         .await?;
@@ -3030,6 +3148,7 @@ where
                                     "thread_id": thread_id,
                                     "cwd": cwd,
                                     "model": model,
+                                    "model_ref": loaded.meta.model_ref,
                                 }),
                             ),
                         )
@@ -3077,6 +3196,133 @@ where
                                 .await?;
                             }
                         }
+                    }
+                    "thread/setModel" => {
+                        // 与 `model/*` 写路径同档:切模型会改 provider/凭据,需 `Control`。
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // `name: null`(或缺失)= 清覆盖;字符串 = 选显示名。非字符串/非
+                        // null 一律 `-32602`,不静默当作清覆盖。
+                        let name = match req.params.get("name") {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(serde_json::Value::String(n)) => Some(n.clone()),
+                            Some(_) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params("name must be a string or null"),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 会话覆盖必须命中清单条目,否则 `model_not_found` 且零副作用。
+                        // 读清单路径走注入的 `models_path`(与 `model/*` 同一份),
+                        // 故 upsert 刚落盘的条目立刻可见。
+                        let catalog = yi_agent_runtime::models::load_catalog_from(&models_path);
+                        if let Some(n) = &name {
+                            if !catalog.models.iter().any(|m| &m.name == n) {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::model_not_found(n)),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                        // 生效串按 清单条目 → 全局默认 → cfg 解析;校验通过后再落盘。
+                        let effective =
+                            yi_agent_runtime::models::resolve_effective(&cfg, &catalog, name.as_deref());
+                        // 先让在场 driver 用新覆盖重建 agent,成功后再落盘。铁律
+                        // 「上报/落盘 == 实际运行」:若 provider 重建失败(build_provider
+                        // 抛错),agent 仍跑旧模型,此时若已落盘就会让磁盘与响应谎报新模型
+                        // (任务 7 评审 Finding 3)。故先重建、后落盘;失败即回错误且零磁盘
+                        // 副作用,由客户端重试。
+                        //
+                        // 冷 thread(不在内存)没有 driver 可发:只能先落盘,resume 时会按
+                        // meta.model_ref 重建,故跳过本段。
+                        if threads.contains_key(&thread_id) {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            // 借用只活在下面这个块内(send 的 future 借 `session`),
+                            // 出块即释放,后续 `threads.get_mut` 才不被占用。
+                            let send_result = {
+                                let session = threads
+                                    .get(&thread_id)
+                                    .expect("contains_key was just checked");
+                                session
+                                    .session_tx
+                                    .send(SessionCommand::SetModel {
+                                        effective: Box::new(effective.clone()),
+                                        model_ref: name.clone(),
+                                        reply: reply_tx,
+                                    })
+                                    .await
+                            };
+                            // reply 为 `Ok(Err(_))` 表示 driver 重建失败;发送失败(通道关闭)
+                            // 同样意味着无法保证生效,一并按失败处理。
+                            let switched =
+                                send_result.is_ok() && matches!(reply_rx.await, Ok(Ok(())));
+                            if !switched {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::internal(
+                                            "the live session could not switch to the requested \
+                                             model; it is still running the previous one"
+                                                .to_string(),
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                        // 重建成功后(冷 thread 则直接)落盘:一次原子写把 `model_ref` 与
+                        // 生效 `model` 同进同出,避免并发 `touch` 读到自相矛盾的组合。
+                        let store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
+                        if let Err(e) = store.set_model(&thread_id, name.as_deref(), &effective.model) {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            } else {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                            continue;
+                        }
+                        // 让内存里的 `ThreadSession.model` 与实际生效值保持一致。注意:
+                        // `thread/list(All)` 目前是从**盘上 meta**(`thread_summary_json`)
+                        // 渲染 model 的,`ThreadSession.model` 在当前 crate 内尚无读取方;
+                        // 这里仍同步刷新,是为了让内存视图与刚落盘的 meta 同源、不残留旧串
+                        // (供将来的读取方或排查时使用),而不是因为 list 会读它。
+                        if let Some(session) = threads.get_mut(&thread_id) {
+                            session.model = effective.model.clone();
+                        }
+                        write_response(
+                            &hub, &client,
+                            ok_response(id, json!({ "ok": true, "model": effective.model })),
+                        )
+                        .await?;
                     }
                     "thread/setPermissionMode" => {
                         let Some(thread_id) =
@@ -4544,6 +4790,7 @@ fn thread_summary_json(
         "thread_id": m.thread_id,
         "cwd": m.cwd,
         "model": m.model,
+        "model_ref": m.model_ref,
         "created_at": m.created_at,
         "updated_at": m.updated_at,
         "title": m.title,
@@ -4828,6 +5075,57 @@ async fn apply_session_command(
             )
             .await;
             let _ = reply.send(outcome);
+        }
+        SessionCommand::SetModel {
+            effective,
+            model_ref,
+            reply,
+        } => {
+            // provider 构造放在最前：失败就在这里短路，`agent` 尚未被消费，原样返回。
+            // 这是「绝不半重建」的关键——绝不在换了 config/句柄之后才发现造不出 provider。
+            let provider = match yi_agent_runtime::bootstrap::build_provider(&effective) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    tracing::warn!(%error, ?model_ref, "session model switch failed; keeping the old agent");
+                    let _ = reply.send(Err(error.to_string()));
+                    return agent;
+                }
+            };
+            // 新 cfg 只覆盖 model（provider/api_url/api_key 已烤进新 provider；其余
+            // budget/system_prompt 等沿用原 config，避免切模型顺带重置别的设置）。
+            let mut next_config = agent.config().clone();
+            next_config.model = effective.model.clone();
+            // 三样必须原样保留：session `Arc`（否则委派 caller 读不到本会话）、
+            // 工具注册表、审批路径（checker + decision_rx）。与
+            // [`rebuild_thread_agent_with_theme`] 的语义一致。
+            let session_handle = agent.session_handle();
+            let tools = agent.tools();
+            let permission = agent.permission_checker();
+            let decision = agent.decision_rx();
+            let mut rebuilt = yi_agent_core::Agent::new(provider, tools, next_config)
+                .with_session_arc(session_handle);
+            if let (Some(checker), Some(rx)) = (permission, decision) {
+                rebuilt = rebuilt.with_permission(checker, rx);
+            }
+            tracing::info!(model = %effective.model, ?model_ref, "session model switched");
+            // Design §5.3 step 4:重建成功后广播本会话的生效模型,让所有订阅该
+            // thread 的客户端(桌面 + 手机)立刻刷新,无需轮询。
+            //
+            // 在此直接广播、而非让 driver 经事件流走 Translator:`SetModel` 只在
+            // **没有 turn 在跑**时经本函数执行,此刻不存在 `agent.run()` 的事件流
+            // 来承载 `AgentEvent::ModelChanged`(translator 仅在本轮 stream 上被
+            // 驱动)。直接广播与「重建完成」同一时刻发生;Translator 侧那条臂保留,
+            // 供将来事件流真的承载该事件时复用。
+            let _ = write_notification(
+                hub,
+                &Notification::ModelChanged {
+                    thread_id: thread_id.to_string(),
+                    model: effective.model.clone(),
+                },
+            )
+            .await;
+            let _ = reply.send(Ok(()));
+            agent = rebuilt;
         }
     }
     agent
@@ -5267,6 +5565,9 @@ async fn run_thread_driver(
                                     "另有一个会话命令待执行".into(),
                                 ));
                             }
+                            SessionCommand::SetModel { reply, .. } => {
+                                let _ = reply.send(Err("另有一个会话命令待执行".into()));
+                            }
                         }
                     } else {
                         pending_session_command = Some(command);
@@ -5510,6 +5811,9 @@ where
             Path::new(&request.workdir),
             crate::thread_store::ThreadMode::Yolo,
         )?;
+        // 生效串取自实际建出的 agent,与 `thread/start`/`thread/resume` 同口径,避免
+        // 工厂快照与另读磁盘不一致而上报一个未真正采用的模型。
+        let model = built.agent.config().model.clone();
 
         let hub = Arc::clone(self.hub);
         let client = crate::broadcast::ClientId::local();
@@ -5532,6 +5836,10 @@ where
             self.perm_seq,
             self.theme,
             self.workspaces,
+            // 看板会话不带 model_ref;生效串取自上面实际建出的 agent,与
+            // `thread/start`/`thread/resume` 同口径。
+            model,
+            None,
             Some(&request.board_project),
             Some(&request.card_id),
         )
@@ -5688,6 +5996,10 @@ async fn start_thread_core(
     perm_seq: &Arc<AtomicU64>,
     theme: &crate::theme_tool::ThemeHandle,
     workspaces: &WorkspaceIndex,
+    // 该会话的生效模型串与覆盖名(由调用方按清单解析后传入),落进 ThreadMeta
+    // 并写进 ThreadSession,与 `thread/start`/`thread/resume` 同一来源。
+    model: String,
+    model_ref: Option<String>,
     board_project: Option<&str>,
     card_id: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -5723,8 +6035,6 @@ async fn start_thread_core(
     let (interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(16);
     let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
 
-    let model = cfg.model.clone();
-
     let now = crate::thread_store::now_millis();
     let meta = crate::thread_store::ThreadMeta {
         thread_id: thread_id.clone(),
@@ -5737,6 +6047,7 @@ async fn start_thread_core(
         pin_seq: None,
         board_project: board_project.map(str::to_string),
         card_id: card_id.map(str::to_string),
+        model_ref,
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -7481,6 +7792,12 @@ pub(crate) mod tests_support {
     use tokio_tungstenite::tungstenite::Message as ClientMessage;
     use yi_agent_runtime::config::RuntimeConfig;
 
+    /// 测试夹具的占位模型名。`test_config()` 用它作 `cfg.model`,`mod tests` 的
+    /// mock 工厂也用它作 `agent.config().model`,二者必须同值——`thread/start`/
+    /// `thread/resume` 以上报 agent 实际模型为准(任务 7 评审 Finding 1),夹具若
+    /// 不一致会凭空造出「上报 != 运行」的假象。
+    pub(crate) const TEST_MODEL: &str = "test-model";
+
     /// 对一条已连接的 ws 发 `initialize` 并读回响应。
     ///
     /// 跨传输复用(`ws.rs` 的多客户端 E2E 与若干准入测试都要先握手),故放在
@@ -7505,7 +7822,7 @@ pub(crate) mod tests_support {
             provider: "anthropic".to_string(),
             api_url: "https://api.anthropic.com".to_string(),
             api_key: String::new(),
-            model: "test-model".to_string(),
+            model: super::tests_support::TEST_MODEL.to_string(),
             max_turns: 20,
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
@@ -8101,7 +8418,15 @@ pub(crate) mod tests {
         _mode: crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent> {
         let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
-        let config = yi_agent_core::AgentConfig::default();
+        // 让本 mock 如实汇报「它实际会跑的模型」:与 `tests_support::test_config()`
+        // 的 `cfg.model` 同源(`TEST_MODEL`)。`thread/start`/`thread/resume` 现在以
+        // `agent.config().model` 为上报来源(任务 7 评审 Finding 1),若这里沿用
+        // `AgentConfig::default()` 的默认串,就会让夹具与生产语义(会话按 cfg 的模型
+        // 起跑)脱节。
+        let config = yi_agent_core::AgentConfig {
+            model: super::tests_support::TEST_MODEL.to_string(),
+            ..yi_agent_core::AgentConfig::default()
+        };
         let mut agent = yi_agent_core::Agent::new(
             provider.clone(),
             Arc::new(yi_agent_core::ToolRegistry::new()),
@@ -8220,6 +8545,9 @@ pub(crate) mod tests {
         _index_dir: tempfile::TempDir,
         /// 隔离的看板登记表目录,理由同上:board/* RPC 不得写真的 `~/.yi-agent`。
         pub(crate) board_dir: tempfile::TempDir,
+        /// 隔离的模型清单目录,理由同 `board_dir`:`model/*` RPC 不得写开发者
+        /// 真实的 `~/.yi-agent/models.json`。字段仅用于持有 tempdir。
+        pub(crate) _models_dir: tempfile::TempDir,
         /// 隔离的常驻登记目录,理由同 `board_dir`:board/create|remove 不得写
         /// 真的 `$HOME/.yi-agent`。字段仅用于持有 tempdir。
         _resident_dir: tempfile::TempDir,
@@ -8395,6 +8723,9 @@ pub(crate) mod tests {
             // 值守的 home 也落在隔离目录里:安装/卸载经调用方注入的闭包,绝不
             // 触碰真实的 `~/Library/LaunchAgents`。
             let watchman_home = tempfile::TempDir::new().unwrap();
+            // 模型清单也落在隔离目录里:`model/*` 不得写开发者真实的
+            // `~/.yi-agent/models.json`(里面是明文密钥)。
+            let models_dir = tempfile::TempDir::new().unwrap();
             let handle = tokio::spawn(serve_scoped(
                 server_r,
                 server_w,
@@ -8407,6 +8738,7 @@ pub(crate) mod tests {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                     board_dir: board_dir.path().to_path_buf(),
+                    models_path: models_dir.path().join("models.json"),
                     // 测试里不起真进程:`board/create` 走注入的启动器,
                     // 与 board_dir 注入同一个理由。
                     resident_dir: resident_dir.path().to_path_buf(),
@@ -8425,6 +8757,7 @@ pub(crate) mod tests {
                 handle,
                 _index_dir: index_dir,
                 board_dir,
+                _models_dir: models_dir,
                 _resident_dir: resident_dir,
                 pairing,
                 hub,
@@ -9166,6 +9499,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                models_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -9236,6 +9570,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                models_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -9310,6 +9645,7 @@ pub(crate) mod tests {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
+                models_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -9835,6 +10171,270 @@ pub(crate) mod tests {
         handle.abort();
 
         // turn_rx 里的 Finished 是可选的:本路径 turn_id 为 None,不该发 Finished。
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a command with no turn must not report a turn as finished"
+        );
+    }
+
+    /// 切模型 = 在两轮之间**重建** agent:provider 与 config 换新,而 session `Arc`
+    /// (以及绑定其上的委派 caller)、工具注册表、审批路径三样必须原样保留。
+    ///
+    /// 直接驱动**生产函数** `apply_session_command`(与 clear/compact 的测试同款),
+    /// 才能拿到重建后的 agent 逐一断言这四项保留语义。
+    #[tokio::test]
+    async fn set_model_command_rebuilds_with_the_new_model() {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r); // 本测试不看 writer 输出
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        // 带工具注册表与审批路径的 agent,模拟真实 thread:重建时都不该被丢。
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        registry.register(Arc::new(FakeBash));
+        let tools: Arc<yi_agent_core::ToolRegistry> = Arc::new(registry);
+        let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+            yi_agent_core::permission::PermissionsConfig::default(),
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
+            Arc::new(|_cmd: &str| None),
+        ));
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
+        let rx_arc = Arc::new(Mutex::new(decision_rx));
+        let mut agent = yi_agent_core::Agent::new(provider.clone(), tools.clone(), config.clone())
+            .with_permission(checker.clone(), rx_arc.clone());
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .replace_messages(vec![
+                yi_agent_core::Message::user("first"),
+                yi_agent_core::Message::assistant(vec![yi_agent_core::ContentBlock::Text(
+                    "reply".into(),
+                )]),
+            ]);
+        let original_handle = agent.session_handle();
+        // 宿主把委派 caller 绑到这个 session `Arc`;换成新 Arc 会让 fork 读到被丢弃的记录。
+        let caller = yi_agent_subagent::CallerContext::new(original_handle.clone());
+        let _keep_decision_tx = decision_tx;
+
+        // 新条目解析出的 cfg:仍是有效的 anthropic 配置,只是 model 换了。
+        let mut effective = tests_support::test_config();
+        effective.model = "switched-model".into();
+
+        let (reply, answer) = oneshot::channel();
+        agent = apply_session_command(
+            agent,
+            SessionCommand::SetModel {
+                effective: Box::new(effective.clone()),
+                model_ref: Some("B".into()),
+                reply,
+            },
+            &provider,
+            &config,
+            &store,
+            "thread-set-model-1",
+            &hub,
+            &turn_tx,
+            &ThreadSession::new_status(),
+        )
+        .await;
+        answer
+            .await
+            .expect("the set-model reply channel must be fulfilled")
+            .expect("rebuilding against a valid cfg must succeed");
+
+        assert_eq!(
+            agent.config().model,
+            "switched-model",
+            "the rebuilt agent must run the newly selected model"
+        );
+        assert!(
+            Arc::ptr_eq(&original_handle, &agent.session_handle()),
+            "the rebuild must reuse the session Arc, not swap in a new one"
+        );
+        assert_eq!(
+            agent.session().messages().len(),
+            2,
+            "the rebuild must preserve the session history"
+        );
+        assert_eq!(
+            caller.snapshot().expect("the caller stays bound"),
+            agent.session().messages().to_vec(),
+            "the bound caller must still read the rebuilt agent's live transcript"
+        );
+        let kept_tools = agent.tools();
+        assert!(
+            Arc::ptr_eq(&kept_tools, &tools),
+            "the rebuild must keep the very same tool registry"
+        );
+        assert!(
+            kept_tools.names().iter().any(|name| name == "bash"),
+            "the preserved registry must still hold its tools"
+        );
+        let kept_checker = agent
+            .permission_checker()
+            .expect("the rebuild must re-attach the permission checker");
+        assert!(
+            Arc::ptr_eq(&kept_checker, &checker),
+            "the rebuild must keep the approval checker"
+        );
+        let kept_rx = agent
+            .decision_rx()
+            .expect("the rebuild must re-attach the decision channel");
+        assert!(
+            Arc::ptr_eq(&kept_rx, &rx_arc),
+            "the rebuild must keep the decision channel"
+        );
+
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a session command with no turn must not report a turn as finished"
+        );
+    }
+
+    /// provider 构造失败时(如未授权的 provider 名):回执 `Err`,且**原 agent 原样保留**,
+    /// 绝不留下半重建状态(沿用既有重建的原子性)。
+    #[tokio::test]
+    async fn set_model_command_keeps_the_agent_when_the_provider_fails() {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r);
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .push(yi_agent_core::Message::user("keep-me"));
+        let original_handle = agent.session_handle();
+
+        let mut broken = tests_support::test_config();
+        broken.provider = "not-a-provider".into();
+        broken.model = "switched-model".into();
+
+        let (reply, answer) = oneshot::channel();
+        agent = apply_session_command(
+            agent,
+            SessionCommand::SetModel {
+                effective: Box::new(broken),
+                model_ref: Some("B".into()),
+                reply,
+            },
+            &provider,
+            &config,
+            &store,
+            "thread-set-model-fail",
+            &hub,
+            &turn_tx,
+            &ThreadSession::new_status(),
+        )
+        .await;
+        let error = answer
+            .await
+            .expect("the set-model reply channel must be fulfilled")
+            .expect_err("an unknown provider must fail the rebuild");
+        assert!(
+            error.contains("not-a-provider"),
+            "the error must name the offending provider: {error}"
+        );
+        assert_eq!(
+            agent.config().model,
+            config.model,
+            "a failed switch must leave the old model in place"
+        );
+        assert!(
+            Arc::ptr_eq(&original_handle, &agent.session_handle()),
+            "a failed switch must leave the session Arc untouched"
+        );
+        assert_eq!(
+            agent.session().messages().len(),
+            1,
+            "a failed switch must not disturb the session history"
+        );
+    }
+
+    /// 空闲 driver(没有 turn 在跑)也必须在有限时间内响应 `SetModel`,且不把它弄停、
+    /// 不为无 turn 的命令发 Finished——与既有 clear/compact 空闲命令路径同款。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn idle_driver_serves_a_set_model_command_without_a_new_turn() {
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r);
+        let (hub, client) = test_hub(server_w);
+
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(crate::thread_store::ThreadStore::new(store_dir.path()));
+
+        let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
+        let (_interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
+        let (_interject_tx, interject_rx) = mpsc::channel::<InterjectionRequest>(8);
+        let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
+        // prompt_tx 保住不 drop:driver 应停在 idle,而不是因 prompt_rx 关闭退出。
+        let _keep_prompt_tx = prompt_tx;
+
+        let built = build_test_agent(
+            None,
+            std::path::Path::new("/tmp"),
+            crate::thread_store::ThreadMode::Normal,
+        )
+        .unwrap();
+
+        let handle = tokio::spawn(run_thread_driver(
+            "thread-idle-setmodel".into(),
+            built.agent,
+            prompt_rx,
+            interrupt_rx,
+            interject_rx,
+            session_rx,
+            hub,
+            client,
+            turn_tx,
+            None,
+            Arc::new(Mutex::new(HashMap::new())),
+            Duration::from_secs(5),
+            Arc::new(AtomicU64::new(0)),
+            None,
+            store,
+            ThreadSession::new_status(),
+            built.provider,
+            built.config,
+        ));
+
+        let mut effective = tests_support::test_config();
+        effective.model = "switched-model".into();
+        let (reply, answer) = oneshot::channel();
+        session_tx
+            .send(SessionCommand::SetModel {
+                effective: Box::new(effective),
+                model_ref: Some("B".into()),
+                reply,
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("an idle driver must service SetModel without a new turn")
+            .expect("the reply channel must be fulfilled");
+        assert_eq!(result, Ok(()), "a valid cfg must rebuild successfully");
+
+        // driver 仍在运行(命令不该把它弄停)。
+        assert!(!handle.is_finished());
+        handle.abort();
         assert!(
             turn_rx.try_recv().is_err(),
             "a command with no turn must not report a turn as finished"
@@ -10827,6 +11427,7 @@ pub(crate) mod tests {
             pin_seq: None,
             board_project: board_project.map(str::to_string),
             card_id: card_id.map(str::to_string),
+            model_ref: None,
         };
         crate::thread_store::ThreadStore::new(dir)
             .create(&meta)
@@ -11011,6 +11612,7 @@ pub(crate) mod tests {
                 pin_seq: None,
                 board_project: None,
                 card_id: None,
+                model_ref: None,
             })
             .unwrap();
         store
@@ -11110,6 +11712,7 @@ pub(crate) mod tests {
                 pin_seq: None,
                 board_project: None,
                 card_id: None,
+                model_ref: None,
             })
             .unwrap();
         // 一轮正常收尾过的历史。
@@ -13071,6 +13674,345 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// `model/list` 走宿主 dispatch 时也不回传明文 key:证明接线用的是注入的
+    /// 隔离清单路径,而非开发者真实的 `~/.yi-agent/models.json`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn model_list_over_dispatch_masks_the_key() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":9,"method":"model/upsert","params":{"name":"A","provider":"anthropic","api_url":"https://a","model":"m","api_key":"sk-secret-1234"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(v["result"]["ok"], true, "upsert must land: {v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":10,"method":"model/list","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 10).await;
+        let text = v.to_string();
+        assert!(
+            !text.contains("sk-secret-1234"),
+            "the raw key must never cross the wire: {text}"
+        );
+        assert_eq!(v["result"]["models"][0]["has_key"], true);
+        assert_eq!(v["result"]["models"][0]["api_key_masked"], "••••1234");
+
+        // An unknown default is the structured `model_not_found`, over the wire too.
+        h.send(r#"{"jsonrpc":"2.0","id":11,"method":"model/setDefault","params":{"name":"nope"}}"#)
+            .await;
+        let v = read_response(&mut h, 11).await;
+        assert_eq!(v["error"]["code"], -32025);
+        assert_eq!(v["error"]["data"]["code"], "model_not_found");
+        h.shutdown().await;
+    }
+
+    /// An `Observe`-only client may read the (masked) catalog but must be refused
+    /// every write. Production stdio is `Admin`; a paired phone defaults to
+    /// `Control`, which is *allowed* to write, so this uses the lowest tier.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observe_client_may_list_but_not_write_models() {
+        let mut h = Harness::with_scope(Scope::Observe).await;
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"model/list","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 9).await;
+        assert!(
+            v["result"]["models"].is_array(),
+            "Observe may read the masked catalog: {v}"
+        );
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":10,"method":"model/upsert","params":{"name":"A","provider":"anthropic","api_url":"https://a","model":"m","api_key":"k"}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 10).await;
+        assert_eq!(
+            v["error"]["code"], -32014,
+            "writes require Control, Observe must be refused: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 经真实 `model/upsert` 分发把一条模型写进 harness 的隔离清单,返回其响应。
+    async fn upsert_model(
+        h: &mut Harness,
+        id: u64,
+        name: &str,
+        provider: &str,
+        model: &str,
+    ) -> serde_json::Value {
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"model/upsert","params":{{"name":"{name}","provider":"{provider}","api_url":"https://{name}.example","model":"{model}","api_key":"key-{name}"}}}}"#
+        ))
+        .await;
+        read_response(h, id).await
+    }
+
+    /// `thread/setModel` 必须落盘 `model_ref` 与解析出的生效串,并在响应里回生效串;
+    /// 之后 `thread/resume` 从盘上读回的 meta 与之一致。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_set_model_persists_and_reports_the_effective_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+        assert_eq!(
+            upsert_model(&mut h, 10, "A", "anthropic", "model-a").await["result"]["ok"],
+            true
+        );
+        assert_eq!(
+            upsert_model(&mut h, 11, "B", "openai", "model-b").await["result"]["ok"],
+            true
+        );
+        h.send(r#"{"jsonrpc":"2.0","id":12,"method":"model/setDefault","params":{"name":"A"}}"#)
+            .await;
+        assert_eq!(read_response(&mut h, 12).await["result"]["ok"], true);
+
+        let tid = start_thread(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setModel","params":{{"threadId":"{tid}","name":"B"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 20).await;
+        assert_eq!(v["result"]["ok"], true, "setModel must succeed: {v}");
+        assert_eq!(
+            v["result"]["model"], "model-b",
+            "the response must report the resolved effective model string: {v}"
+        );
+
+        // resume 从盘上回放:meta 必须已带 ref 与生效串。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let _ = read_response(&mut h, 21).await;
+
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("setModel must persist meta");
+        assert_eq!(loaded.meta.model_ref.as_deref(), Some("B"));
+        assert_eq!(loaded.meta.model, "model-b");
+        h.shutdown().await;
+    }
+
+    /// `thread/setModel` 的 `name: null` 清除覆盖:meta 的 `model_ref` 归 `None`,
+    /// 生效串回落到清单全局默认(A)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_set_model_to_null_clears_the_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+        upsert_model(&mut h, 10, "A", "anthropic", "model-a").await;
+        upsert_model(&mut h, 11, "B", "openai", "model-b").await;
+        h.send(r#"{"jsonrpc":"2.0","id":12,"method":"model/setDefault","params":{"name":"A"}}"#)
+            .await;
+        read_response(&mut h, 12).await;
+
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setModel","params":{{"threadId":"{tid}","name":"B"}}}}"#
+        ))
+        .await;
+        assert_eq!(
+            read_response(&mut h, 20).await["result"]["model"],
+            "model-b"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":21,"method":"thread/setModel","params":{{"threadId":"{tid}","name":null}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 21).await;
+        assert_eq!(v["result"]["ok"], true, "clearing must succeed: {v}");
+        assert_eq!(v["result"]["model"], "model-a");
+
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .unwrap()
+            .expect("thread persists");
+        assert_eq!(loaded.meta.model_ref, None, "the override must be cleared");
+        assert_eq!(loaded.meta.model, "model-a");
+        h.shutdown().await;
+    }
+
+    /// 未知的显示名必须回 `model_not_found`,且**零副作用**:meta 不变、会话不中断
+    /// (随后一次合法的 setModel 仍能成功)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_set_model_to_unknown_name_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+        upsert_model(&mut h, 10, "A", "anthropic", "model-a").await;
+        h.send(r#"{"jsonrpc":"2.0","id":11,"method":"model/setDefault","params":{"name":"A"}}"#)
+            .await;
+        read_response(&mut h, 11).await;
+
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setModel","params":{{"threadId":"{tid}","name":"nope"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 20).await;
+        assert_eq!(
+            v["error"]["code"], -32025,
+            "unknown name → model_not_found: {v}"
+        );
+        assert_eq!(v["error"]["data"]["code"], "model_not_found");
+
+        // 零副作用:meta 原样(仍无覆盖、生效串仍是 cfg 兜底)。
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .unwrap()
+            .expect("thread persists");
+        assert_eq!(loaded.meta.model_ref, None);
+        assert_eq!(loaded.meta.model, "test-model");
+
+        // 会话未被拒绝的请求打断:随后一次合法 setModel 仍成功。
+        upsert_model(&mut h, 21, "B", "openai", "model-b").await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":22,"method":"thread/setModel","params":{{"threadId":"{tid}","name":"B"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 22).await;
+        assert_eq!(
+            v["result"]["model"], "model-b",
+            "the session must stay usable: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 回归任务 7 评审 Finding 1:上报/落盘的 `model` 必须等于工厂**实际建出**的
+    /// agent 的 `agent.config().model`,而不是另按清单再解析一次的结果。二者在
+    /// 「工厂持有启动时快照、另解析却重读磁盘」时会分歧(运行期 `model/upsert`
+    /// 新增条目即触发)。这里用注入了清单的 `production_factory` 把工厂一侧钉死,
+    /// 断言 `thread/start` / `thread/resume` 上报的模型正是该工厂解析出的条目模型。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_and_resume_report_the_built_agents_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        cfg.provider = "openai".to_string();
+        cfg.api_key = "k".to_string();
+        // 注入清单且**无全局默认**:只有显式的 modelRef 才命中条目。生产工厂按
+        // "B" 解析 ⇒ agent 实际跑 "model-b"。若实现改用「另读一次磁盘清单」来上报,
+        // 在该清单里 B 不存在,就会报出别的模型,断言即失败。
+        let factory = production_factory(cfg.clone(), test_theme(), test_catalog_without_default());
+        let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"modelRef":"B"}}"#)
+            .await;
+        let mut started = None;
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("thread/started") {
+                started = Some(v);
+            } else if v.get("id") == Some(&serde_json::json!(2)) {
+                resp = Some(v);
+            }
+            if started.is_some() && resp.is_some() {
+                break;
+            }
+        }
+        let resp = resp.expect("thread/start must respond");
+        let tid = resp["result"]["thread_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            resp["result"]["model"], "model-b",
+            "start must report the model the agent actually runs: {resp}"
+        );
+        assert_eq!(
+            resp["result"]["model_ref"], "B",
+            "start must echo the selected catalog entry's display name: {resp}"
+        );
+        let started = started.expect("thread/started must be delivered");
+        assert_eq!(started["params"]["model"], "model-b");
+        assert_eq!(
+            started["params"]["model_ref"], "B",
+            "the thread/started notification must carry the selected ref: {started}"
+        );
+
+        // resume 与 start 同口径:仍按 meta.model_ref=B 由工厂解析。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resumed = None;
+        for _ in 0..24 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                resumed = Some(v);
+                break;
+            }
+        }
+        let resumed = resumed.expect("thread/resume must respond");
+        assert_eq!(
+            resumed["result"]["model"], "model-b",
+            "resume must report the same model the agent runs: {resumed}"
+        );
+        assert_eq!(
+            resumed["result"]["model_ref"], "B",
+            "resume must report the loaded meta's model_ref: {resumed}"
+        );
+        h.shutdown().await;
+    }
+
+    /// Design §11: `thread/list` 必须暴露会话选中的清单条目显示名(`model_ref`),
+    /// 供客户端回显;无覆盖的会话该字段为 `null`(跟随全局默认)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_list_exposes_model_ref_override_and_null() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let factory = production_factory(cfg.clone(), test_theme(), test_catalog());
+        let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        // 一个带覆盖(B)、一个无覆盖(null＝跟随清单全局默认 A)。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"modelRef":"B"}}"#)
+            .await;
+        let tid_override = read_thread_start_response(&mut h, 2).await;
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid_default = read_thread_start_response(&mut h, 3).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/list","params":{}}"#)
+            .await;
+        let mut listed = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                listed = Some(v);
+                break;
+            }
+        }
+        let v = listed.expect("thread/list must respond");
+        let threads = v["result"]["threads"].as_array().unwrap();
+        let find = |id: &str| {
+            threads
+                .iter()
+                .find(|t| t["thread_id"].as_str() == Some(id))
+                .unwrap_or_else(|| panic!("thread {id} must be listed: {v}"))
+        };
+        assert_eq!(
+            find(&tid_override)["model_ref"],
+            "B",
+            "an overridden session must expose its selected display name: {v}"
+        );
+        assert!(
+            find(&tid_default)["model_ref"].is_null(),
+            "a session without an override must expose null: {v}"
+        );
+        h.shutdown().await;
+    }
+
     /// The deliberately-extended admin gate: minting a pairing code
     /// (`pair/create`) or kicking a device (`device/revoke`) is desktop-privileged,
     /// so a `Control` phone must be rejected from both too.
@@ -13822,6 +14764,109 @@ pub(crate) mod tests {
         );
     }
 
+    /// 注入式清单:两条不同 provider 的条目,免动进程级 `HOME`。
+    fn test_catalog() -> Arc<yi_agent_runtime::models::ModelCatalog> {
+        Arc::new(model_catalog_entries(Some("A")))
+    }
+
+    /// 同 [`test_catalog`] 但没有全局默认,用于断言「无默认时回退 cfg」。
+    fn test_catalog_without_default() -> Arc<yi_agent_runtime::models::ModelCatalog> {
+        Arc::new(model_catalog_entries(None))
+    }
+
+    fn model_catalog_entries(
+        default_model: Option<&str>,
+    ) -> yi_agent_runtime::models::ModelCatalog {
+        use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
+        ModelCatalog {
+            models: vec![
+                ModelEntry {
+                    name: "A".into(),
+                    provider: ModelProvider::Anthropic,
+                    api_url: "https://a.example".into(),
+                    model: "model-a".into(),
+                    api_key: "key-a".into(),
+                },
+                ModelEntry {
+                    name: "B".into(),
+                    provider: ModelProvider::Openai,
+                    api_url: "https://b.example".into(),
+                    model: "model-b".into(),
+                    api_key: "key-b".into(),
+                },
+            ],
+            default_model: default_model.map(str::to_string),
+            subagent_model: None,
+        }
+    }
+
+    /// 工厂必须按会话的 `model_ref` 从清单条目解析 provider/api_url/api_key/model,
+    /// 而不是照抄全局 `cfg`(此处 cfg.model 为占位的 `test-model`)。
+    #[test]
+    fn a_session_model_ref_selects_the_catalog_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = test_config();
+        assert_ne!(cfg.model, "model-b", "precondition: cfg differs from entry");
+        let factory = production_factory(cfg, test_theme(), test_catalog());
+
+        let built = with_session_model_ref(Some("B".to_string()), || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .expect("an injected catalog must bootstrap without network");
+
+        assert_eq!(built.agent.config().model, "model-b");
+    }
+
+    /// 覆盖名不在清单里时退回清单的全局默认(Task 2 已定优先级),而非 cfg。
+    #[test]
+    fn an_unknown_model_ref_falls_back_to_the_catalog_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory = production_factory(test_config(), test_theme(), test_catalog());
+
+        let built = with_session_model_ref(Some("nope".to_string()), || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .expect("bootstrap");
+
+        assert_eq!(built.agent.config().model, "model-a");
+    }
+
+    /// 既无会话覆盖、清单又无全局默认时才回退 `cfg`(空清单即今天的旧行为)。
+    #[test]
+    fn no_override_and_no_default_falls_back_to_the_global_cfg() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory =
+            production_factory(test_config(), test_theme(), test_catalog_without_default());
+
+        let built = with_session_model_ref(None, || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .expect("bootstrap");
+
+        assert_eq!(built.agent.config().model, "test-model");
+    }
+
+    /// `thread/resume` 重建 agent 时必须只认该 thread 的 `model_ref`;
+    /// 读到别的会话(无覆盖)时退回默认,不得沿用上一次的覆盖。
+    #[test]
+    fn the_session_model_ref_does_not_leak_across_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory = production_factory(test_config(), test_theme(), test_catalog());
+
+        let built = with_session_model_ref(Some("B".to_string()), || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .unwrap();
+        assert_eq!(built.agent.config().model, "model-b");
+
+        let built = factory(None, dir.path(), crate::thread_store::ThreadMode::Normal).unwrap();
+        assert_eq!(
+            built.agent.config().model,
+            "model-a",
+            "the override must not leak past with_session_model_ref"
+        );
+    }
+
     /// `thread/readItems` 返回已落盘的 items；`afterItemId` 只返回其后的部分。
     #[tokio::test(flavor = "multi_thread")]
     async fn read_items_returns_persisted_items_and_slices_after_id() {
@@ -14287,6 +15332,7 @@ pub(crate) mod tests {
                     runtimes: Arc::new(StdMutex::new(HashMap::new())),
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                     board_dir: board_dir.path().to_path_buf(),
+                    models_path: PathBuf::new(),
                     resident_dir: PathBuf::new(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
@@ -14607,7 +15653,8 @@ mod theme_watcher_tests {
             Notification::ThreadStarted {
                 thread_id: "t2".into(),
                 cwd: "/w".into(),
-                model: "m".into()
+                model: "m".into(),
+                model_ref: None
             }
             .delivery(),
             Delivery::List

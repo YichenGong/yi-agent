@@ -126,7 +126,7 @@ impl SlashCommand {
         match self {
             SlashCommand::Quit => "退出程序",
             SlashCommand::Clear => "清空对话上下文",
-            SlashCommand::Model => "切换模型 (需要参数)",
+            SlashCommand::Model => "查看模型清单 / 切换模型",
             SlashCommand::Cost => "显示 token 使用量",
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
@@ -164,7 +164,10 @@ impl SlashCommand {
         }
         match self {
             SlashCommand::Agents => Some("[--all|--active]"),
-            SlashCommand::Model => Some("<model-name>"),
+            // `default` 是保留字（清空会话覆盖、回落清单 default_model），因此
+            // 清单里同名的条目永远无法通过 `/model` 选中（见
+            // `handle_model_command` 与未知名提示文案）。
+            SlashCommand::Model => Some("[<name>|default]"),
             SlashCommand::Agent => Some("<task-id>"),
             SlashCommand::Events | SlashCommand::Diff | SlashCommand::Mailbox => Some("<task-id>"),
             SlashCommand::Message => Some("<task-id> <text>"),
@@ -834,7 +837,8 @@ mod tests {
             (SlashCommand::Agent, "<task-id>"),
             (SlashCommand::Message, "<task-id> <text>"),
             (SlashCommand::Cancel, "<task-id> [--recursive]"),
-            (SlashCommand::Model, "<model-name>"),
+            // `default` 是保留字:清单里同名的条目无法被选中,用法文案据此列出。
+            (SlashCommand::Model, "[<name>|default]"),
         ] {
             assert_eq!(command.argument_usage(), Some(usage));
             assert!(command.needs_arg());

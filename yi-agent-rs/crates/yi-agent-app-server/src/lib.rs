@@ -3,6 +3,7 @@
 pub mod broadcast;
 pub(crate) mod card_scheduler;
 pub mod device_store;
+pub mod model_rpc;
 pub mod pair_uri;
 pub mod pairing;
 pub mod protocol;

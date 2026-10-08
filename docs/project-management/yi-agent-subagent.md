@@ -78,6 +78,7 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
   `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent --test subagent_fork_e2e`
   （后者经**真实注册工具 + 真实 daemon + 真实 worker 工厂**，断言子 worker 首个 provider
   请求含父历史且 objective 居后，省略 `fork` 时只含 objective）— [设计](../superpowers/specs/2026-10-02-subagent-context-fork-design.md)
+- [x] worker 工厂按 `subagent_model` 解析 provider/model — `worker_factory`（`src/attach.rs:88`）从机器级清单取 `subagent_entry`（缺省回退全局默认、再无则回退进程 cfg），经 `resolve_effective`（`src/attach.rs:113`）得到该条目的 provider/api_url/api_key/model 去 `build_provider`；改完 `subagent_model` 下次项目 daemon 重启生效。验证 `cargo test -p yi-agent-subagent --lib the_worker_uses_the_subagent_model_entry`、`cargo test -p yi-agent-subagent --lib the_worker_falls_back_to_the_global_default`
 
 **边界（两端口一致，故记在这里）：** attach 与工具注册**不看**项目是不是 git 仓库（非
 git 目录原地成 root，`workspace_root == project_root`），真正需要仓库的是后续 `spawn_agent`

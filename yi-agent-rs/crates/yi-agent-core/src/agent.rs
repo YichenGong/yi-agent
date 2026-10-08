@@ -556,6 +556,16 @@ impl Agent {
         &self.config
     }
 
+    /// The tool registry this agent was built with.
+    ///
+    /// Callers that rebuild the agent around a different provider (for example a
+    /// mid-conversation model switch) reuse this handle instead of trying to
+    /// re-derive the tool set, so tools attached at bootstrap cannot silently
+    /// disappear on the rebuild.
+    pub fn tools(&self) -> Arc<ToolRegistry> {
+        Arc::clone(&self.tools)
+    }
+
     pub fn session(&self) -> Session {
         self.session.lock().unwrap().clone()
     }

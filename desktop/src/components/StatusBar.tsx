@@ -4,13 +4,11 @@ import { UsagePanel } from "./UsagePanel";
 
 export function StatusBar({
   cwd,
-  model,
   status,
   usage,
   actions,
 }: {
   cwd: string | null;
-  model: string | null;
   status: string;
   usage: Usage | null;
   /**
@@ -29,7 +27,6 @@ export function StatusBar({
       />
       <span className="text-fg-muted">{status}</span>
       {cwd && <span className="truncate font-mono">{cwd}</span>}
-      {model && <span className="truncate font-mono">{model}</span>}
       <div className="ml-auto flex items-center gap-3">
         {usage && (
           <button

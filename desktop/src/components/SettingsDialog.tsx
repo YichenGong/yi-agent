@@ -4,12 +4,14 @@ import type { Theme } from "../lib/theme";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
 import { SettingsRemoteTab, type RemoteCall } from "./SettingsRemoteTab";
 import { SettingsPluginsTab } from "./SettingsPluginsTab";
+import { SettingsModelsTab } from "./SettingsModelsTab";
 
 /** 左侧 Tab 栏。加一个 Tab 只需往这张表里加项，再在下面渲染它的面板。 */
 const TABS = [
   { id: "general", label: "通用" },
   { id: "remote", label: "远程访问" },
   { id: "plugins", label: "插件" },
+  { id: "models", label: "模型" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -25,6 +27,7 @@ export function SettingsDialog({
   onClose,
   remoteCall,
   pluginCall,
+  modelCall,
   pluginProjects,
   pluginDefaultProject,
   relayUrl,
@@ -38,6 +41,8 @@ export function SettingsDialog({
   remoteCall?: RemoteCall;
   /** 「插件」Tab 的宿主 RPC 接缝（plugins/list、plugin/settings/*）。 */
   pluginCall?: (method: string, params: unknown) => Promise<unknown>;
+  /** 「模型」Tab 的宿主 RPC 接缝（model/list、model/upsert、...）。 */
+  modelCall?: (method: string, params: unknown) => Promise<unknown>;
   /** 「插件」Tab 可选的配置项目（绝对路径）。 */
   pluginProjects?: string[];
   /** 「插件」Tab 首选项目（当前对话的工作目录）。 */
@@ -160,12 +165,14 @@ export function SettingsDialog({
                 initialRelayUrl={relayUrl}
                 saveRelayUrl={saveRelayUrl}
               />
-            ) : (
+            ) : active === "plugins" ? (
               <SettingsPluginsTab
                 call={pluginCall}
                 projects={pluginProjects ?? []}
                 defaultProject={pluginDefaultProject}
               />
+            ) : (
+              <SettingsModelsTab call={modelCall} />
             )}
           </div>
         </div>

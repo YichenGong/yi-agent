@@ -90,7 +90,7 @@ describe("ThreadStore", () => {
     s.seed([summary("a", "running"), summary("b")]);
     expect(s.view("a").status).toBe("running");
     expect(s.view("b").status).toBe("idle");
-    expect(s.view("a").info).toEqual({ cwd: "/w", model: "m" });
+    expect(s.view("a").info).toEqual({ cwd: "/w", model: "m", model_ref: null });
   });
 
   it("does not let a stale listing snapshot roll back a live status", () => {
@@ -173,5 +173,41 @@ describe("ThreadStore", () => {
     s.setDraft("a", "half-typed");
     s.drop("a");
     expect(s.peek("a")).toBeUndefined();
+  });
+
+  it("updates the target thread's effective model on thread/modelChanged, keyed by thread_id", () => {
+    const s = new ThreadStore();
+    s.seed([summary("a"), summary("b")]);
+    s.applyNotification({
+      method: "thread/modelChanged",
+      params: { thread_id: "b", model: "model-b" },
+    });
+    // 只动被点名的那个 thread。
+    expect(s.view("b").info?.model).toBe("model-b");
+    expect(s.view("a").info?.model).toBe("m");
+  });
+
+  it("leaves model_ref untouched on thread/modelChanged (the notification carries no ref)", () => {
+    const s = new ThreadStore();
+    // 会话当前有覆盖：ref A，生效 model-a。
+    s.seed([{ ...summary("a"), model: "model-a", model_ref: "A" }]);
+    expect(s.view("a").info?.model_ref).toBe("A");
+    s.applyNotification({
+      method: "thread/modelChanged",
+      params: { thread_id: "a", model: "model-b" },
+    });
+    // 生效模型跟随通知，引用由下拉写入方自己落笔，通知不越俎代庖。
+    expect(s.view("a").info?.model).toBe("model-b");
+    expect(s.view("a").info?.model_ref).toBe("A");
+  });
+
+  it("ignores thread/modelChanged for a thread with no info yet", () => {
+    const s = new ThreadStore();
+    // 只有会话内容、还没拿到身份信息：不能凭空造一个 info。
+    s.applyNotification({
+      method: "thread/modelChanged",
+      params: { thread_id: "a", model: "model-b" },
+    });
+    expect(s.view("a").info).toBeNull();
   });
 });

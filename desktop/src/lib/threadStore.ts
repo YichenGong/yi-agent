@@ -9,7 +9,8 @@ export interface ThreadView {
   /** 未被查看时收到过 turn/completed → true；打开即清除。 */
   unread: boolean;
   approval: ApprovalRequest | null;
-  info: { cwd: string; model: string } | null;
+  /** 会话身份信息；`model_ref` 为会话的模型引用（null = 跟随全局默认）。 */
+  info: { cwd: string; model: string; model_ref: string | null } | null;
   /** 服务端权威权限模式；null = 未知,勿当作 normal。 */
   mode: ThreadMode | null;
   /**
@@ -100,7 +101,7 @@ export class ThreadStore {
         v.status = t.status ?? "idle";
         this.statusSource.set(t.thread_id, "snapshot");
       }
-      v.info = { cwd: t.cwd, model: t.model };
+      v.info = { cwd: t.cwd, model: t.model, model_ref: t.model_ref ?? null };
     }
   }
 
@@ -125,6 +126,14 @@ export class ThreadStore {
       if (n.params.status !== "awaiting_approval") v.approval = null;
       return;
     }
+    if (n.method === "thread/modelChanged") {
+      // 跨客户端同步通道：另一个客户端（如手机）改了某会话的生效模型，服务端广播
+      // 到这里。只更新 `model`——通知带的是解析后的**生效模型**，不含引用名；引用
+      // （`model_ref`）由本客户端的下拉写入成功后自行落笔，这里不能替它猜。
+      const v = this.view(n.params.thread_id);
+      if (v.info) v.info = { ...v.info, model: n.params.model };
+      return;
+    }
     if (n.method === "error") {
       // 无 thread 归属的全局错误归当前 thread。
       this.current()?.session.apply(n);
@@ -133,7 +142,8 @@ export class ThreadStore {
     const id = n.params.thread_id;
     const v = this.view(id);
     v.session.apply(n);
-    if (n.method === "thread/started") v.info = { cwd: n.params.cwd, model: n.params.model };
+    if (n.method === "thread/started")
+      v.info = { cwd: n.params.cwd, model: n.params.model, model_ref: n.params.model_ref ?? null };
     if (n.method === "turn/completed" && id !== this.currentId) v.unread = true;
   }
 

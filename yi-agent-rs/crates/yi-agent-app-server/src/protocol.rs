@@ -152,6 +152,30 @@ impl RpcError {
             data: Some(serde_json::json!({ "code": code })),
         }
     }
+
+    /// A `model/*` write named a model the catalog does not contain.
+    ///
+    /// Same shape as [`RpcError::board_query`]: the numeric code is a coarse
+    /// fallback, `data.code = "model_not_found"` is the stable vocabulary the
+    /// UI branches on (`desktop/src/lib/models.ts`).
+    pub fn model_not_found(name: &str) -> Self {
+        Self {
+            code: -32025,
+            message: format!("model not found: {name}"),
+            data: Some(serde_json::json!({ "code": "model_not_found" })),
+        }
+    }
+
+    /// A `model/upsert` payload failed validation (empty name, unknown provider,
+    /// empty url/model). Numeric code stays in the `invalid_params` family;
+    /// `data.code` gives the caller a stable reason.
+    pub fn invalid_model(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+            data: Some(serde_json::json!({ "code": "invalid_model" })),
+        }
+    }
 }
 
 /// 服务端 → 客户端通知(无 id)。
@@ -163,6 +187,10 @@ pub enum Notification {
         thread_id: String,
         cwd: String,
         model: String,
+        /// 该会话选中的清单条目显示名(`None`＝跟随全局默认)。`model` 是解析后的
+        /// 生效串,`model_ref` 是用户在清单里选中的那一条,客户端据此回显。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_ref: Option<String>,
     },
     #[serde(rename = "turn/started")]
     TurnStarted { thread_id: String, turn_id: String },
@@ -171,6 +199,12 @@ pub enum Notification {
         thread_id: String,
         status: ThreadStatus,
     },
+    /// 该会话的生效模型已切换:driver 重建成功后发出。
+    ///
+    /// `model` 是**解析后的生效串**(清单条目的 `model` 字段),而非用户选中的
+    /// 显示名(`model_ref`)——客户端据此显示"当前跑在哪个真实模型上"。
+    #[serde(rename = "thread/modelChanged")]
+    ModelChanged { thread_id: String, model: String },
     #[serde(rename = "item/started")]
     ItemStarted { thread_id: String, item: Item },
     #[serde(rename = "item/delta")]
@@ -280,6 +314,7 @@ impl Notification {
             Notification::ThreadStarted { thread_id, .. }
             | Notification::TurnStarted { thread_id, .. }
             | Notification::ThreadStatusUpdated { thread_id, .. }
+            | Notification::ModelChanged { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
             | Notification::ItemDelta { thread_id, .. }
             | Notification::ItemCompleted { thread_id, .. }
@@ -313,9 +348,9 @@ impl Notification {
     /// 该通知的投递层级。见 [`Delivery`]。
     pub(crate) fn delivery(&self) -> Delivery {
         match self {
-            Notification::ThreadStarted { .. } | Notification::ThreadStatusUpdated { .. } => {
-                Delivery::List
-            }
+            Notification::ThreadStarted { .. }
+            | Notification::ThreadStatusUpdated { .. }
+            | Notification::ModelChanged { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
             | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,
@@ -463,6 +498,21 @@ mod tests {
         assert_eq!(unknown.data.unwrap()["code"], "something_else");
     }
 
+    /// `model_not_found` gets its own numeric code without renumbering the
+    /// board/plugin vocabulary; the UI only reads `data.code`.
+    #[test]
+    fn model_not_found_has_a_stable_numeric_code_and_reason() {
+        let error = RpcError::model_not_found("A");
+        assert_eq!(error.code, -32025);
+        assert_eq!(error.data.unwrap()["code"], "model_not_found");
+        // The reason string is what a caller prints, but it never leaks a key.
+        assert!(error.message.contains("A"));
+
+        let invalid = RpcError::invalid_model("provider must be anthropic or openai");
+        assert_eq!(invalid.code, -32602);
+        assert_eq!(invalid.data.unwrap()["code"], "invalid_model");
+    }
+
     #[test]
     fn request_envelope_parses_string_id() {
         let raw = r#"{"jsonrpc":"2.0","id":"perm-3","method":"x","params":{}}"#;
@@ -578,6 +628,18 @@ mod tests {
         assert_eq!(v["params"]["output_tokens"], 3);
         assert_eq!(v["params"]["cache_creation_input_tokens"], 100);
         assert_eq!(v["params"]["cache_read_input_tokens"], 200);
+    }
+
+    #[test]
+    fn model_changed_notification_carries_the_method_and_model() {
+        let n = Notification::ModelChanged {
+            thread_id: "t1".into(),
+            model: "model-b".into(),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/modelChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["model"], "model-b");
     }
 
     #[test]
