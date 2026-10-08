@@ -374,6 +374,7 @@ mod resolve_tests {
             model: "base-model".into(),
             max_turns: 200,
             max_resident_subagents: 64,
+            max_direct_children: crate::config::DIRECT_CHILDREN_DEFAULT,
             workdir: std::path::PathBuf::from("."),
             system_prompt: None,
             compact_threshold: 1000,

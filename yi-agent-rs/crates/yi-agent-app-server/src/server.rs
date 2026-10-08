@@ -8034,6 +8034,7 @@ pub(crate) mod tests_support {
             model: super::tests_support::TEST_MODEL.to_string(),
             max_turns: 20,
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
+            max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
             workdir: std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
             system_prompt: None,
             compact_threshold: 160_000,
