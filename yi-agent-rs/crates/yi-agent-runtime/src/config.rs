@@ -1405,9 +1405,19 @@ mod tests {
         };
         let config = RuntimeConfig::load(&overrides).expect("config loads");
         assert_eq!(config.max_direct_children, DIRECT_CHILDREN_DEFAULT);
+        assert_eq!(DIRECT_CHILDREN_DEFAULT, 4);
 
         env.set("YI_AGENT_MAX_DIRECT_CHILDREN", "8");
         let config = RuntimeConfig::load(&overrides).expect("config loads");
         assert_eq!(config.max_direct_children, 8);
+    }
+
+    #[test]
+    fn the_config_default_matches_the_core_direct_child_default() {
+        assert_eq!(
+            DIRECT_CHILDREN_DEFAULT,
+            yi_agent_core::subagent::supervisor::MAX_DIRECT_CHILDREN as u16,
+            "the runtime config default and the core supervisor default must not diverge"
+        );
     }
 }

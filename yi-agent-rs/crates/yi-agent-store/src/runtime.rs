@@ -794,6 +794,12 @@ impl RuntimeCoordinator {
         self.fork_max_bytes
     }
 
+    /// How many non-terminal direct children each agent this coordinator creates
+    /// may own, inherited from the worker factory at `open`.
+    pub fn max_direct_children(&self) -> usize {
+        self.max_direct_children
+    }
+
     pub fn create_session(&self) -> Result<RootSessionId, RuntimeCoordinatorError> {
         self.create_session_with_objective("Root session objective not specified.".into())
     }
@@ -4765,6 +4771,7 @@ mod provider_turn_admission_tests {
     /// prove the value survives the trip into the coordinator.
     struct CapacityFactory {
         units: u16,
+        direct_children: usize,
     }
 
     impl AgentWorkerFactory for CapacityFactory {
@@ -4773,6 +4780,9 @@ mod provider_turn_admission_tests {
         }
         fn max_resident_subagents(&self) -> u16 {
             self.units
+        }
+        fn max_direct_children(&self) -> usize {
+            self.direct_children
         }
         fn start(
             &self,
@@ -4793,12 +4803,37 @@ mod provider_turn_admission_tests {
     fn the_factorys_resident_capacity_reaches_the_coordinator() {
         let directory = tempfile::TempDir::new().unwrap();
         let database = directory.path().join("runtime.sqlite");
-        let coordinator =
-            RuntimeCoordinator::open(&database, Arc::new(CapacityFactory { units: 128 })).unwrap();
+        let coordinator = RuntimeCoordinator::open(
+            &database,
+            Arc::new(CapacityFactory {
+                units: 128,
+                direct_children: 4,
+            }),
+        )
+        .unwrap();
         assert_eq!(
             coordinator.resident_capacity(),
             Some(128),
             "the configured capacity must reach the coordinator, not just the constant"
+        );
+    }
+
+    #[test]
+    fn the_factorys_direct_child_limit_reaches_the_coordinator() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let coordinator = RuntimeCoordinator::open(
+            &database,
+            Arc::new(CapacityFactory {
+                units: 128,
+                direct_children: 3,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            coordinator.max_direct_children(),
+            3,
+            "the configured limit must reach the coordinator, not the default"
         );
     }
 
@@ -4812,8 +4847,14 @@ mod provider_turn_admission_tests {
     fn a_cascade_write_re_reads_the_victims_active_attempt_at_commit_time() {
         let directory = tempfile::TempDir::new().unwrap();
         let database = directory.path().join("runtime.sqlite");
-        let coordinator =
-            RuntimeCoordinator::open(&database, Arc::new(CapacityFactory { units: 8 })).unwrap();
+        let coordinator = RuntimeCoordinator::open(
+            &database,
+            Arc::new(CapacityFactory {
+                units: 8,
+                direct_children: 4,
+            }),
+        )
+        .unwrap();
         let root = RootSessionId::new();
         let victim = TaskId::new();
         let stale_attempt = AttemptId::new();
