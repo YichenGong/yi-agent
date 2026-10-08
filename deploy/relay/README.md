@@ -25,23 +25,45 @@
 
 > 为什么必须域名：中继自身不做 TLS（设计如此），必须放在 TLS 反代后，两端用 `wss://`。
 
-## 1. 上传
+## 1. 取得二进制并上传
 
-在**本机**（Mac）执行，把部署目录传到 VPS：
+`yi-agent-relay` 的 Linux 二进制**不进仓库**（本项目约定：源码进仓库、产物走 Release，
+见 `.github/workflows/release.yml`）。两种取得方式：
+
+**方式 A（推荐，本机交叉编译）**——在有 Rust 的本机（Mac）产出静态二进制：
+
+```bash
+cd yi-agent-rs
+cargo zigbuild --release -p yi-agent-relay --target x86_64-unknown-linux-musl
+# 产物：target/x86_64-unknown-linux-musl/release/yi-agent-relay（静态、零依赖）
+```
+
+需要 `cargo-zigbuild` 与 `zig`（`cargo install cargo-zigbuild`、`brew install zig`）。
+把产物按下面的名字放好，再上传：
+
+```bash
+cp target/x86_64-unknown-linux-musl/release/yi-agent-relay \
+   ../deploy/relay/yi-agent-relay-linux-amd64
+```
+
+**方式 B（在 VPS 上直接编译）**——VPS 上装 Rust 后：
+
+```bash
+cargo build --release -p yi-agent-relay
+# 产物：target/release/yi-agent-relay
+```
+
+（代价：VPS 要装 Rust 工具链，几分钟、几百 MB。）
+
+**上传到 VPS**（在**本机**执行）：
 
 ```bash
 cd <本仓库>/deploy/relay
-scp -r ./* root@<VPS_IP>:/root/relay-deploy/
+scp yi-agent-relay-linux-amd64 install.sh README.md root@<VPS_IP>:/root/relay-deploy/
 ```
 
-或只传三个文件：
-
-```bash
-scp yi-agent-relay-linux-amd64 install.sh README.md root@<VPS_IP>:/root/
-```
-
-> 二进制是**静态链接**的 musl 构建（`ELF 64-bit, statically linked`），
-> 任何 x86_64 Linux 直接跑，不需要装任何库。
+> 二进制是**静态链接**（`ELF 64-bit, statically linked`），任何 x86_64 Linux 直接跑，
+> 不需要装任何库。
 
 ## 2. 部署（在 VPS 上）
 

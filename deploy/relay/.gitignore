@@ -1,2 +1,6 @@
+# 部署用的二进制：不进仓库（本项目约定：源码进仓库，产物走 Release）。
+# 部署时按 README「如何取得二进制」在本机构建后上传。
+yi-agent-relay-linux-amd64
+
 # 中继部署的本地真实值（含凭据）——不得提交
 .relay-local.md
