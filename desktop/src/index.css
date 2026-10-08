@@ -115,12 +115,33 @@
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
   overflow: hidden;
+  /* 上下两条安全区留白由 `body` 自己铺色，而不是露出透明的空洞：iPhone 上
+   * 那 59pt / 34pt 才会呈现为与底部面板同色的连续区域，而不是"两条黑边"。
+   * `background-color` 默认铺满整个 border-box（含 padding 区），`--panel`
+   * 与 `MessageInput` / `StatusBar` 的底色一致，接缝因此不可见。 */
+  background: var(--panel);
 }
 [data-mobile="true"] #root {
   height: 100%;
 }
 [data-mobile="true"] .app-shell {
   height: 100%;
+}
+
+/*
+ * 底部留白收窄：Home Indicator 那条横杠只需要约 12pt 的净空，整段
+ * `safe-area-inset-bottom`（iPhone 14 Pro 上 34pt）全留会把输入区顶得过高，
+ * 看起来就是"底边太长"。减去一个固定的 12pt 余量后，横杠下沿仍有净空
+ * （`max(..., 0)` 兜住没有安全区的设备）。
+ *
+ * 阈值与 `MessageInput` 的 `max-md:` 变体一致（Tailwind v4 的 `max-md` 即
+ * `width < 48rem`）：手机上输入区改成纵向排列，底部留白同时收窄，两者同进同退；
+ * 横屏（视口 > 768px）时安全区在左右两侧，这条不生效，仍是整段留白。
+ */
+@media (max-width: 767.98px) {
+  [data-mobile="true"] body {
+    padding-bottom: max(env(safe-area-inset-bottom, 0px) - 12px, 0px);
+  }
 }
 
 /*
