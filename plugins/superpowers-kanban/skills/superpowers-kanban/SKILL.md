@@ -73,22 +73,62 @@ superpowers-kanban add <spec> <plan> --state-dir <dir>
 `add` **立刻**校验两份文件；校验失败会打印原因并以非零退出码结束。
 把这条错误原样转述给用户，不要重试、不要自我修正路径。
 
-### 2b. 合并入队
+### 2b. 把一张实现卡合并进主线（主路径）
 
-用户说「把 <分支> 合进 <base>」「合并这个分支」「把这个分支 merge 了」时，投递一张**合并卡**：
+用户在同一张卡片的**原会话**里说「合并 / 把这条合进 main / 这张卡可以合了」时，
+你**不再**自己直接 `git merge`，而是走名额：
+
+1. **申请名额**：
+
+   ```bash
+   superpowers-kanban merge-request <card-id>
+   ```
+
+   - 打印 `granted`：记下它给的 `workdir`，继续第 2 步。
+   - 打印 `busy: another merge is running in this project`：本项目已有合并在跑。
+     **如实告诉用户「排队中」**，停下来等用户稍后再说一次。不要轮询重试。
+   - 报 `denied: …`：把原因原样转述（多半是卡不在 `awaiting_merge`，或 source 分支不存在）。
+     不要猜、不要绕。
+
+2. **在名额给的 worktree 里合并**：
+
+   ```bash
+   git -C <workdir> merge --no-ff <source> -m "merge <source> into <base> (kanban)"
+   ```
+
+   `granted` 输出里的 `merge <source> into <base> in that worktree` 一句就是这条命令的参数来源。
+   **必须在 `<workdir>` 里执行**——它是 base 分支被检出的地方（base 就是 main 时即主检出）。
+   这会话的 cwd 是当初实现卡的工作区，**不是** `<workdir>`，所以不加 `-C` 会合错地方。
+
+   - 干净合并：继续第 3 步。
+   - 有冲突：就地解决（这是你被叫来的原因）。解决后 `git -C <workdir> add` 冲突文件并
+     `git -C <workdir> commit --no-edit` 收尾合并提交。
+   - 解决不了：**不要** `git merge --abort` 后就完事——照第 3 步如实回执，
+     让卡停在待处理，并在回复里说清卡在哪些文件。
+
+3. **回执让插件复核**：
+
+   ```bash
+   superpowers-kanban merge-finish <card-id>
+   ```
+
+   - `done`：git 复核确认 `source` 已并入 `base`。告诉用户已合并。
+   - `needs_you`：复核不通过（合并没真正落地）。**如实说**，并把卡的现状回报。
+   - `cleared`：卡已不在合并中（多半已被别处推进）。不要自行改状态。
+
+**绝不绕过名额直接 `git merge`。** 名额（每项目一把 `merge.lock`）保证同一项目同一时刻
+只有一个合并，绕过去会让两条分支同时改主检出。
+
+### 2c. 投递一张独立的合并卡（旧路径，保留）
+
+需要为一个**没有实现卡**的分支（例如手工建的分支）单独立卡时：
 
 ```bash
 superpowers-kanban add-merge <source> [--base <ref>] [--state-dir <dir>]
 ```
 
-- `--base` 缺省取仓库默认分支（`origin/HEAD`，退化到 `main`）。
-- 命令**立刻**校验：refs 非空且不同、`<source>` 分支在仓库里存在；失败原样转述错误，
-  **不要**猜分支名、不要重试。
-- 成功打印 `delivered <card-id> ...`，据此跟用户复述「第几张卡」。
-
-合并卡与实现卡共用同一张看板队列、**不占**并发名额，且**同一项目同时只有一个合并**在执行
-（其余排队）。它只做本地 `git merge --no-ff`，不消耗模型调用。冲突时卡停在 `NeedsYou`
-等人处理，绝不自动解冲突。
+`--base` 缺省取仓库默认分支（`origin/HEAD`，退化到 `main`）。命令**立刻**校验 refs 与
+source 分支存在；失败原样转述，不要猜分支名、不要重试。
 
 ### 3. 必要时确认状态
 
@@ -119,6 +159,9 @@ superpowers-kanban off     # 停止推进（已在跑的会话不会被取消）
 想改全局开关请让用户自己改 `~/.yi-agent/preferences.json`，不要代劳。
 
 ### 5. 确认合并（更新看板进度）
+
+**优先走 `### 2b`**（会话内申请名额并实际执行合并）。本节只用于「用户已在别处
+手工合并完、只想让看板收尾」的情形。
 
 用户说「我合并了这张卡 / 确认合并 / 更新看板进度 / 这张卡可以收了」时：
 
