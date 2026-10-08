@@ -193,6 +193,8 @@ yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
 | 自定义 API 地址 | `MODEL_API_URL` | `--api-url` |
 | 指定工作目录 | `YI_AGENT_WORKDIR` | `--workdir` |
 | 单轮最大步数 | `YI_AGENT_MAX_TURNS`（默认 200） | `--max-turns` |
+| 每个 agent 的直接子任务上限 | `YI_AGENT_MAX_DIRECT_CHILDREN`（默认 4） | —— |
+| 子 agent 常驻总容量 | `YI_AGENT_MAX_RESIDENT_SUBAGENTS`（默认 64） | —— |
 | 压缩触发阈值 | `YI_AGENT_COMPACT_RATIO`（默认 80，按上下文百分比） | `--compact-ratio` |
 | 联网搜索 | `BOCHA_API_KEY` | —— |
 
