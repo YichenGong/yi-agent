@@ -817,18 +817,33 @@ describe("ThreadSidebar 手机长按", () => {
     expect(onTogglePin).toHaveBeenCalledWith("9", false);
   });
 
-  it("长按会话行后确认「删除」才调 onDelete", async () => {
+  it("长按会话行的「删除」调用 onDelete", async () => {
+    // 组件的「删除」菜单项直调 onDelete；「删前确认」在 App.tsx 的 deleteThread 里
+    // （服务端答 needs_confirmation 时才 window.confirm），由 App.test.tsx 覆盖。
     vi.useFakeTimers();
     const onDelete = vi.fn();
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     renderSidebar({ isMobile: true, onDelete });
 
     await longPress(screen.getByText("alpha-thread"));
     fireEvent.click(screen.getByText("删除"));
 
-    expect(confirmSpy).toHaveBeenCalled();
     expect(onDelete).toHaveBeenCalledWith("1");
-    confirmSpy.mockRestore();
+  });
+
+  it("点 backdrop 关闭会话菜单且不选中会话", async () => {
+    vi.useFakeTimers();
+    const onSelect = vi.fn();
+    const { container } = renderSidebar({ isMobile: true, onSelect });
+
+    await longPress(screen.getByText("alpha-thread"));
+    expect(container.querySelector('[data-thread-menu=""]')).not.toBeNull();
+
+    // 用标记选择 backdrop：它同时锁住「backdrop 存在该标记」这条契约。
+    // 缺了标记，行上的吞 click 会把这次点击一起吞掉，菜单关不掉。
+    fireEvent.click(container.querySelector("[data-thread-menu-overlay]")!);
+
+    expect(container.querySelector('[data-thread-menu=""]')).toBeNull();
+    expect(onSelect).not.toHaveBeenCalled();
   });
 
   it("长按组头打开工作区菜单", async () => {
