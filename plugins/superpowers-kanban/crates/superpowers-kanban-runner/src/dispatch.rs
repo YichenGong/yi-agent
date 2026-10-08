@@ -589,13 +589,9 @@ mod tests {
         assert_eq!(value["status"], "cleared");
 
         // 卡根本不存在 → 明确报错，而不是静默 cleared。
-        let error = dispatch_with_global(
-            &state,
-            None,
-            "merge_finish",
-            &json!({ "card_id": "nope" }),
-        )
-        .unwrap_err();
+        let error =
+            dispatch_with_global(&state, None, "merge_finish", &json!({ "card_id": "nope" }))
+                .unwrap_err();
         assert!(error.contains("unknown card"), "{error}");
     }
 }
