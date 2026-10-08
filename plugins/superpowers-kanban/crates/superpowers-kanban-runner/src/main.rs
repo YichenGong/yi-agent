@@ -91,6 +91,14 @@ enum Subcommand {
         state_dir: PathBuf,
         card_id: String,
     },
+    MergeRequest {
+        state_dir: PathBuf,
+        card_id: String,
+    },
+    MergeFinish {
+        state_dir: PathBuf,
+        card_id: String,
+    },
     Archive {
         state_dir: PathBuf,
         card_id: Option<String>,
@@ -104,16 +112,18 @@ enum Subcommand {
 }
 
 const USAGE: &str =
-    "usage: superpowers-kanban <run|add|add-merge|done|archive|purge|list|on|off|workdir> [...]
-  run       --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
-  add       <spec> <plan> [--state-dir <d>]
-  add-merge <source> [--base <ref>] [--state-dir <d>]
-  done      <card-id> [--state-dir <d>]
-  archive   <card-id>|--all-terminal [--state-dir <d>]
-  purge     <card-id>|--all-archived [--state-dir <d>]
-  list      [--all] [--state-dir <d>]
-  on|off    [--state-dir <d>]
-  workdir   [--state-dir <d>]";
+    "usage: superpowers-kanban <run|add|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir> [...]
+  run           --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
+  add           <spec> <plan> [--state-dir <d>]
+  add-merge     <source> [--base <ref>] [--state-dir <d>]
+  merge-request <card-id> [--state-dir <d>]
+  merge-finish  <card-id> [--state-dir <d>]
+  done          <card-id> [--state-dir <d>]
+  archive       <card-id>|--all-terminal [--state-dir <d>]
+  purge         <card-id>|--all-archived [--state-dir <d>]
+  list          [--all] [--state-dir <d>]
+  on|off        [--state-dir <d>]
+  workdir       [--state-dir <d>]";
 
 /// Parsed from an explicit iterator so tests can drive it without a process.
 ///
@@ -189,6 +199,21 @@ where
                 return Err(format!("done takes one card id, got an extra: {extra}"));
             }
             Ok(Subcommand::Done { state_dir, card_id })
+        }
+        Some(verb @ ("merge-request" | "merge-finish")) => {
+            let (state_dir, rest) = parse_state_dir(args)?;
+            let mut rest = rest.into_iter();
+            let card_id = rest
+                .next()
+                .ok_or_else(|| format!("{verb} needs a card id\n{USAGE}"))?;
+            if let Some(extra) = rest.next() {
+                return Err(format!("{verb} takes one card id, got an extra: {extra}"));
+            }
+            Ok(if verb == "merge-request" {
+                Subcommand::MergeRequest { state_dir, card_id }
+            } else {
+                Subcommand::MergeFinish { state_dir, card_id }
+            })
         }
         Some("archive") => {
             let (state_dir, card_id, all_terminal) = parse_single_or_all(args, "--all-terminal")?;
@@ -441,6 +466,63 @@ fn command_list(state_dir: &std::path::Path, all: bool) -> Result<String, String
     Ok(lines.join("\n"))
 }
 
+/// `merge-request`：申请一次合并名额，把结果如实打印。
+///
+/// `granted` 打印执行合并的 base worktree 与 source→base；调用方（会话里的 agent）
+/// 据此前去执行 `git merge --no-ff`，完成后必须回 `merge-finish`。
+fn command_merge_request(state_dir: &std::path::Path, card_id: &str) -> Result<String, String> {
+    let value = superpowers_kanban_runner::dispatch::dispatch(
+        state_dir,
+        "merge_request",
+        &serde_json::json!({ "card_id": card_id }),
+    )
+    .map_err(|error| error.to_string())?;
+    match value.get("status").and_then(serde_json::Value::as_str) {
+        Some("granted") => {
+            let workdir = value
+                .get("workdir")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let source = value
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let base = value
+                .get("base")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            Ok(format!(
+                "granted\nworkdir: {workdir}\nmerge {source} into {base} in that worktree, then run `superpowers-kanban merge-finish {card_id}`"
+            ))
+        }
+        Some("busy") => {
+            Ok("busy: another merge is running in this project; wait for it to finish".to_string())
+        }
+        Some("denied") => Err(format!(
+            "denied: {}",
+            value
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("card cannot be merged")
+        )),
+        other => Err(format!("unexpected merge_request result: {other:?}")),
+    }
+}
+
+/// `merge-finish`：让插件以 git 复核收尾。
+fn command_merge_finish(state_dir: &std::path::Path, card_id: &str) -> Result<String, String> {
+    let value = superpowers_kanban_runner::dispatch::dispatch(
+        state_dir,
+        "merge_finish",
+        &serde_json::json!({ "card_id": card_id }),
+    )
+    .map_err(|error| error.to_string())?;
+    match value.get("status").and_then(serde_json::Value::as_str) {
+        Some(status @ ("done" | "needs_you" | "cleared")) => Ok(status.to_string()),
+        other => Err(format!("unexpected merge_finish result: {other:?}")),
+    }
+}
+
 /// `done`：把一张 `awaiting_merge` 的卡结算为 `done`。分支核对结果如实打印，
 /// 但**不**据此阻断——合并权归人，这里只登记「已合并」这一事实。
 fn command_done(
@@ -587,6 +669,12 @@ fn main() {
         Subcommand::Done { state_dir, card_id } => {
             let project_root = superpowers_kanban_core::layout::project_root(&state_dir);
             command_done(&state_dir, &card_id, &project_root)
+        }
+        Subcommand::MergeRequest { state_dir, card_id } => {
+            command_merge_request(&state_dir, &card_id)
+        }
+        Subcommand::MergeFinish { state_dir, card_id } => {
+            command_merge_finish(&state_dir, &card_id)
         }
         Subcommand::Archive {
             state_dir,
@@ -766,7 +854,8 @@ fn run_daemon(args: Args) {
 mod tests {
     use super::{
         Duration, Subcommand, command_add, command_add_merge, command_archive, command_done,
-        command_list, command_purge, command_set_switch, effective_interval, parse_subcommand,
+        command_list, command_merge_finish, command_merge_request, command_purge,
+        command_set_switch, effective_interval, parse_subcommand,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -1110,6 +1199,28 @@ mod tests {
     #[test]
     fn add_merge_requires_a_source() {
         assert!(parse(&["add-merge"]).is_err());
+    }
+
+    #[test]
+    fn merge_request_and_finish_parse_one_card_id() {
+        assert!(matches!(
+            parse(&["merge-request", "card-1", "--state-dir", "/s"]),
+            Ok(Subcommand::MergeRequest { .. })
+        ));
+        assert!(matches!(
+            parse(&["merge-finish", "card-1", "--state-dir", "/s"]),
+            Ok(Subcommand::MergeFinish { .. })
+        ));
+        assert!(parse(&["merge-request"]).is_err(), "缺 card id");
+        assert!(parse(&["merge-finish"]).is_err(), "缺 card id");
+        assert!(parse(&["merge-request", "a", "b"]).is_err(), "多参数");
+    }
+
+    #[test]
+    fn merge_request_prints_denied_and_exits_nonzero_on_a_bad_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = command_merge_request(dir.path(), "nope").unwrap_err();
+        assert!(err.contains("denied"), "{err}");
     }
 
     #[test]
