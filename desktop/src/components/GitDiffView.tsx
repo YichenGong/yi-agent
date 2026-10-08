@@ -10,12 +10,13 @@ import { parseUnifiedDiff, type FileDiff } from "../lib/gitDiff";
 
 const DEFAULT_EXPANDED = 3;
 
+/** 文件状态字母的配色，复用 diff 的增删语义色，切主题时一起换。 */
 function statusBadge(status: string): string {
   switch (status) {
     case "A":
-      return "text-emerald-400";
+      return "text-diff-add-fg";
     case "D":
-      return "text-red-400";
+      return "text-diff-del-fg";
     case "R":
       return "text-amber-400";
     default:
@@ -37,22 +38,27 @@ const FileBlock = memo(function FileBlock({ file, open }: { file: FileDiff; open
       {open &&
         file.hunks.map((hunk, hi) => (
           <div key={hi} className="font-mono text-xs">
-            <div className="bg-panel px-2 py-0.5 text-fg-faint">{hunk.header}</div>
+            {/*
+             * hunk 头用 `raised` 底 + `fg-subtle` 字：`bg-panel` 与行底色太接近，
+             * 头尾分不开；`fg-subtle` 比 `fg-faint` 亮一档，在两种主题下都读得出。
+             */}
+            <div className="bg-raised px-2 py-0.5 text-fg-subtle">{hunk.header}</div>
             {hunk.lines.map((line, li) => (
               <div
                 key={li}
                 className={
                   line.kind === "add"
-                    ? "bg-emerald-950/40 text-emerald-200"
+                    ? "bg-diff-add-bg text-diff-add-fg"
                     : line.kind === "del"
-                      ? "bg-red-950/40 text-red-200"
+                      ? "bg-diff-del-bg text-diff-del-fg"
                       : "text-fg-subtle"
                 }
               >
-                <span className="inline-block w-10 select-none pr-2 text-right text-fg-faint">
+                {/* 行号：`fg-subtle` 而非 `fg-faint`——后者在深底上几乎融进背景。 */}
+                <span className="inline-block w-10 select-none pr-2 text-right text-fg-subtle/70">
                   {line.oldNo ?? ""}
                 </span>
-                <span className="inline-block w-10 select-none pr-2 text-right text-fg-faint">
+                <span className="inline-block w-10 select-none pr-2 text-right text-fg-subtle/70">
                   {line.newNo ?? ""}
                 </span>
                 <span>{line.kind === "add" ? "+" : line.kind === "del" ? "-" : " "}</span>
@@ -182,8 +188,8 @@ export function GitDiffView({
                     {f.status}
                   </span>
                   <span className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{f.path}</span>
-                  <span className="text-xs text-emerald-400">+{f.additions}</span>
-                  <span className="text-xs text-red-400">-{f.deletions}</span>
+                  <span className="text-xs text-diff-add-fg">+{f.additions}</span>
+                  <span className="text-xs text-diff-del-fg">-{f.deletions}</span>
                 </button>
                 {f.binary ? (
                   <p className="px-1 pb-1 text-xs text-fg-faint">二进制文件，不显示内容</p>

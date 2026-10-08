@@ -12,6 +12,20 @@
   --fg-muted: #a3a3a3;
   --fg-subtle: #737373;
   --fg-faint: #525252;
+  /*
+   * diff 行。
+   *
+   * 底色是**半透明叠加**：同一套 bg 叠在深色 surface 上得到深绿/深红，叠在浅色
+   * surface 上得到淡绿/淡红——两种主题各自成立，故 bg 不分主题。真正需要分主题的
+   * 只有**前景**：浅色阶（300）在深底上清楚，深色阶（700）在浅底上清楚。
+   *
+   * 这里刻意不用 `bg-emerald-950/40` 那种字面色阶：950 是「几乎黑」的深色，
+   * 叠在白底上会变成一层灰绿的脏块，行号与正文双双失读。
+   */
+  --diff-add-bg: rgb(16 185 129 / 0.15);
+  --diff-add-fg: #6ee7b7;
+  --diff-del-bg: rgb(239 68 68 / 0.15);
+  --diff-del-fg: #fca5a5;
 }
 
 [data-theme="light"] {
@@ -24,6 +38,9 @@
   --fg-muted: #525252;
   --fg-subtle: #737373;
   --fg-faint: #a3a3a3;
+  /* 只有前景换深色阶；底色沿用上方那套半透明叠加。 */
+  --diff-add-fg: #047857;
+  --diff-del-fg: #b91c1c;
 }
 
 /* 把 token 暴露成 Tailwind 颜色工具类：bg-surface / text-fg / border-line … */
@@ -37,6 +54,10 @@
   --color-fg-muted: var(--fg-muted);
   --color-fg-subtle: var(--fg-subtle);
   --color-fg-faint: var(--fg-faint);
+  --color-diff-add-bg: var(--diff-add-bg);
+  --color-diff-add-fg: var(--diff-add-fg);
+  --color-diff-del-bg: var(--diff-del-bg);
+  --color-diff-del-fg: var(--diff-del-fg);
 }
 
 /*
