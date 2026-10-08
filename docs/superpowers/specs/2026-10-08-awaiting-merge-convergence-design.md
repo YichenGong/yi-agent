@@ -71,6 +71,7 @@
 | D7 | 复核主渠道 | 现有 `merge::branch_merged_into`（`git merge-base --is-ancestor`，`merge.rs:46-55`） |
 | D8 | 自动派生合并卡 | **移除**：`mark_terminal` 里的 `board_auto_merge` 派生块退役（被 `spec 2026-10-08` D2/D3 取代） |
 | D9 | 日志去向 | `eprintln!`（后台 daemon stderr），与 `main.rs:825/832/843` 同渠道 |
+| D10 | 分支缺失提示去重 | 同一张卡的 `MissingBranch` 提示**只在本 daemon 生命周期内首次出现时打印**；去重集是**内存**状态（不写 `board.json`） |
 
 ## 4. 收敛扫描
 
@@ -95,22 +96,29 @@
    - `merged == true` → `Converge::Done`；
    - `merged == false && exists == true` → `Converge::Wait`；
    - `exists == false` → `Converge::MissingBranch`。
-3. 落状态：
-   - `Done` → `transition(id, Done)`，打印
-     `superpowers-kanban: card <id> auto-converged to done (<source> is merged into <base>)`；
-   - `Wait` → 不动（不打印，避免每 tick 刷屏）；
-   - `MissingBranch` → 不动，打印
-     `superpowers-kanban: card <id> is awaiting_merge but <source> is gone; run `superpowers-kanban done <id>` to confirm (worktree: <workdir>)`。
+3. 归并成**只含「该冒出水面」之事**的结构化报告（`reconcile_merged()` 自己拥有去重与状态迁移，
+   **不打印**；tick 只负责把报告逐条打印）。纯判据的三态在此被收敛为两类报告项：
+   - `Converge::Done` → `transition(id, Done)`，报告 `Converged { id, source, base }`；
+   - `Converge::MissingBranch` 且该卡**首次**出现 → 报告 `MissingBranch { id, source, workdir }`；
+     非首次 → **不报告**（去重，见 §4.5）；
+   - `Converge::Wait` → **不报告**（无状态变化、无告警，无需每 tick 复述）。
+
+   tick 接线处对两类报告各打印一行：
+   - `Converged`：`superpowers-kanban: card <id> auto-converged to done (<source> is merged into <base>)`
+   - `MissingBranch`：`superpowers-kanban: card <id> is awaiting_merge but <source> is gone; run `superpowers-kanban done <id>` to confirm (worktree: <workdir>)`
 
 ### 4.3 职责切分（保持 core 无 I/O）
 
 - **core**（`superpowers-kanban-core`，无 I/O，可纯单测）：
-  - `Board` 上的筛选 helper：返回待收敛的实现卡 id；
-  - 纯判据：`(exists, merged) -> Converge`（`Converge::{Done, Wait, MissingBranch}`）。
+  - 新增 `core/src/converge.rs`：筛选 helper（返回待收敛的实现卡 id）+ 纯判据
+    `(exists, merged) -> Converge`（`Converge::{Done, Wait, MissingBranch}`）。
 - **runner**：
   - 新增 `reconcile.rs`，只做 git I/O（`source_branch_exists` / `branch_merged_into`）与
-    把判据结果翻成 `transition` + 日志；
-  - `BoardService::reconcile_merged()` 暴露给 tick 循环。
+    按 §4.2 第 3 条归并报告。
+  - `BoardService::reconcile_merged(&mut self) -> Vec<Reconcile>`：**拥有**状态迁移与去重，
+    返回应打印的报告项（`Converged` / 首次的 `MissingBranch`）。
+  - 去重集 `notified_missing_branch: HashSet<CardId>` 挂在 `Inner` 上（与 `board`/`leases` 同锁），
+    由 `reconcile_merged` 读写。
 
 ### 4.4 竞态（D3 的显式后果）
 
@@ -121,6 +129,23 @@
   `let _ = board_query(...)` 吞错，故**静默失败**，卡保持 `done`。
 - 这是**有意接受**的：分支已并入 base 后「完成」是事实状态；追问续跑的本意是「合并前再改改」，
   一旦合并落地，后续改动应开新卡。
+
+### 4.5 分支缺失提示的去重（D10）
+
+`MissingBranch` 的卡不会被状态改动（它永远停在 `awaiting_merge`），所以「每 tick 重打」会让一行
+相同告警无限刷屏。去重规则：
+
+- 去重集 `notified_missing_branch: HashSet<CardId>`，挂在 `BoardService::Inner` 上（与 `board`、
+  `leases` 同锁），**纯内存**，不写 `board.json`（卡片 schema 不变）。
+- **由 `reconcile_merged()` 读写**（它已持锁）：对判定为 `MissingBranch` 的卡，仅当 `insert(id)`
+  返回 `true`（首次）才把它放进报告；非首次不入报告，tick 自然不会打印。同一 daemon 生命周期内
+  每张卡至多一条提示。
+- **插入即视为已提示**：插入与「放进报告」在同一处，不存在「打印失败才插入」的分支。
+- **重启语义**：daemon 重启后去重集清空，同一张卡会**再提示一次**。这是可接受的——该提示要求人工
+  动作，重发一次比漏发安全；也避免为「只提示一次」给卡片 schema 加持久字段（那要改序列化契约、
+  每卡多一次落盘，收益不成比例）。
+- 卡一旦离开 `awaiting_merge`（例如被手工 `done`），即使仍在去重集里也无害：它不再入选候选集，
+  集合条目成为惰性垃圾，daemon 重启即回收。
 
 ## 5. 顺带修正：退役自动派生合并卡（D8）
 
@@ -166,8 +191,10 @@
 
 - 卡停在 `awaiting_merge`，其 `kanban/<slug>` 已并入 `main` → `reconcile_merged()` 后卡为 `done`。
 - 分支存在但**未**并入 → 卡仍为 `awaiting_merge`。
-- 分支被删（但 `93d1c6e3` 类合并提交仍在 main）→ 卡仍为 `awaiting_merge`，且返回/打印的提示
-  含 `superpowers-kanban done <id>`。
+- 分支被删（但 `93d1c6e3` 类合并提交仍在 main）→ 卡仍为 `awaiting_merge`，报告的
+  `MissingBranch` 条目含该卡 id 与 workdir。
+- **去重**：同一卡连续调 `reconcile_merged()` 两次，第二次的报告中 `MissingBranch` **不再出现**
+  （首次已记入去重集）；另一张不同的缺分支卡仍会出现。
 - `kind=merge` 的卡与 `needs_you` 的卡：调 `reconcile_merged()` 前后状态不变。
 - 移除派生：`board_auto_merge=true` 时 `mark_terminal(awaiting_merge)` **不**新增合并卡
   （替换 `service.rs:1040` 的原断言）。
@@ -178,15 +205,18 @@
    （分支已删）保持 `awaiting_merge` 并打印 `done <id>` 提示，手跑一次 `done` 后归位。
 2. `superpowers-kanban list` 在收敛后不再显示这三张为 `awaiting_merge`。
 3. 反向：把一张未合并的实现卡置 `awaiting_merge`，停留多个 tick 状态不变。
+4. 缺分支的提示只出现一次：board-as-thread-page 那张（分支已删）在 daemon 存活期间只打印一条
+   `run 'superpowers-kanban done <id>'` 提示，后续 tick 不重复。
 
 ## 8. 涉及文件
 
 - `plugins/superpowers-kanban/crates/superpowers-kanban-core/src/converge.rs`（新增：纯判据 `Converge`
   + 候选卡筛选，无 I/O）
 - `plugins/superpowers-kanban/crates/superpowers-kanban-core/src/lib.rs`（导出 `converge` 模块）
-- `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/reconcile.rs`（新增：git I/O + 落状态 + 日志）
+- `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/reconcile.rs`（新增：git I/O + 归并报告）
 - `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/service.rs`
-  （`reconcile_merged()`；删 `mark_terminal` 派生块；改 `service.rs:1040` 用例）
+  （`reconcile_merged()`；`Inner` 加 `notified_missing_branch`；删 `mark_terminal` 派生块；
+  改 `service.rs:1040` 用例）
 - `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/main.rs`（tick 接线 + 日志）
 - `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/lib.rs`（若 `reconcile` 需导出）
 
@@ -198,4 +228,4 @@
 | 收敛撞上追问复活 | 明确接受（D3）；代价是那一轮续跑静默失败、卡已 `done`。 |
 | 移除自动派生造成既有行为回归 | 以反向断言锁住（§7）；`spec 2026-10-08` §5.5 的「存量合并卡不迁移」不受影响。 |
 | tick 频率下 git 调用开销 | 候选集通常为空（无 `awaiting_merge` 实现卡时零 git 调用）；存在候选时才 `git`，且每 tick 至多每卡一次。 |
-| 日志刷屏 | `Wait` 不打印；`MissingBranch` 每 tick 会重打——题设可接受（该状态需人工处理），如实际扰民再降级为「状态变化时才打印」。 |
+| `MissingBranch` 提示刷屏 | 去重（D10）：每 daemon 生命周期内每卡至多一条；重启后重发一次，可接受。 |
