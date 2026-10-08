@@ -1684,7 +1684,7 @@ fn application_root_rejects_more_than_four_direct_children() {
         panic!("expected direct child limit error, got {response:?}");
     };
     assert_eq!(code, yi_agent_store::ipc::IpcErrorCode::InvalidState);
-    assert!(message.unwrap().contains("at most four direct children"));
+    assert!(message.unwrap().contains("at most 4 direct children"));
 }
 
 #[test]

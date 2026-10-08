@@ -657,6 +657,13 @@ pub trait AgentWorkerFactory: Send + Sync {
         64
     }
 
+    /// How many non-terminal direct children one task may own. Mirrors
+    /// `crate::subagent::supervisor::MAX_DIRECT_CHILDREN`; a factory that does
+    /// not override it inherits that default.
+    fn max_direct_children(&self) -> usize {
+        crate::subagent::supervisor::MAX_DIRECT_CHILDREN
+    }
+
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         None
     }

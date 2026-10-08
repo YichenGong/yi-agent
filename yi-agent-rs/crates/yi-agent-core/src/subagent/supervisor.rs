@@ -39,8 +39,8 @@ pub enum SpawnError {
     ParentNotFound,
     #[error("leaf tasks cannot spawn descendants")]
     MaximumDepthReached,
-    #[error("an agent may have at most four direct children")]
-    DirectChildLimitReached,
+    #[error("an agent may have at most {limit} direct children")]
+    DirectChildLimitReached { limit: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -114,6 +114,7 @@ pub struct CompletedChildReport {
 
 pub struct AgentSupervisor {
     root_task_id: TaskId,
+    max_direct_children: usize,
     tasks: HashMap<TaskId, AgentTask>,
     objectives: HashMap<TaskId, String>,
     workspace_modes: HashMap<TaskId, ChildWriteMode>,
@@ -162,6 +163,7 @@ impl AgentSupervisor {
         let (updates, _) = watch::channel(0_u64);
         Self {
             root_task_id,
+            max_direct_children: MAX_DIRECT_CHILDREN,
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
@@ -178,6 +180,12 @@ impl AgentSupervisor {
             events: Vec::new(),
             updates,
         }
+    }
+
+    /// Overrides how many non-terminal direct children one task may own.
+    pub fn with_max_direct_children(mut self, max_direct_children: usize) -> Self {
+        self.max_direct_children = max_direct_children;
+        self
     }
 
     pub fn from_recovered_root(
@@ -202,6 +210,7 @@ impl AgentSupervisor {
         let (updates, _) = watch::channel(0_u64);
         Self {
             root_task_id,
+            max_direct_children: MAX_DIRECT_CHILDREN,
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
@@ -257,6 +266,7 @@ impl AgentSupervisor {
         let (updates, _) = watch::channel(0_u64);
         Self {
             root_task_id,
+            max_direct_children: MAX_DIRECT_CHILDREN,
             tasks,
             objectives,
             workspace_modes: HashMap::new(),
@@ -1266,8 +1276,10 @@ impl AgentSupervisor {
                     .is_some_and(|task| !task.state().is_terminal())
             })
             .count();
-        if active_direct_children >= MAX_DIRECT_CHILDREN {
-            return Err(SpawnError::DirectChildLimitReached);
+        if active_direct_children >= self.max_direct_children {
+            return Err(SpawnError::DirectChildLimitReached {
+                limit: self.max_direct_children,
+            });
         }
 
         let mut child = AgentTask::new_child(parent.root_session_id.clone(), parent_id.clone())

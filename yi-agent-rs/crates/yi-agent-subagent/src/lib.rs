@@ -2479,12 +2479,12 @@ mod tests {
     fn ipc_rejection_formatter_includes_error_message() {
         let response = IpcResponse::Error {
             code: yi_agent_store::ipc::IpcErrorCode::InvalidState,
-            message: Some("an agent may have at most four direct children".into()),
+            message: Some("an agent may have at most 4 direct children".into()),
         };
 
         assert_eq!(
             format_ipc_rejection("spawn request", &response),
-            "daemon rejected spawn request: invalid_state: an agent may have at most four direct children"
+            "daemon rejected spawn request: invalid_state: an agent may have at most 4 direct children"
         );
     }
 

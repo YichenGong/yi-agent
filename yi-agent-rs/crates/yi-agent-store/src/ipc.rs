@@ -2910,8 +2910,8 @@ fn ipc_error_message(error: &IpcError) -> Option<String> {
             Some(format!("plugin {plugin} timed out after {seconds}s"))
         }
         IpcError::Runtime(RuntimeCoordinatorError::Spawn(
-            yi_agent_core::subagent::supervisor::SpawnError::DirectChildLimitReached,
-        )) => Some("an agent may have at most four direct children".into()),
+            yi_agent_core::subagent::supervisor::SpawnError::DirectChildLimitReached { limit },
+        )) => Some(format!("an agent may have at most {limit} direct children")),
         // A fork rejection is the caller's mistake (unknown, incomplete, or
         // mismatched token), so the reason is safe to hand back verbatim rather
         // than leaving the client with only a bare code.
