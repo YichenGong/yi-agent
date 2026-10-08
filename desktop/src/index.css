@@ -179,6 +179,16 @@ html[data-mobile="true"] {
   -webkit-user-select: text;
   user-select: text;
 }
+/*
+ * 组头（文件夹那行）同样是长按目标，且它的文本默认可选中——iOS 上按住它也会先弹
+ * 文字选择/放大镜 callout，把长按抢走。与行同理，一并关掉；与行规则一样只作用于手机。
+ * 组头里没有输入框，故无需豁免。
+ */
+[data-mobile="true"] .app-sidebar [data-ws-header] {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
 
 /* 抽屉展开时的背板，点它收起；只在手机端抽屉打开时渲染，故无需前缀。 */
 .app-sidebar-backdrop {

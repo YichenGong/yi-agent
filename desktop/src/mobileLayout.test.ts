@@ -82,6 +82,14 @@ describe("phone layout CSS", () => {
     expect(rule).toMatch(/-webkit-touch-callout:\s*none/);
     expect(rule).toMatch(/-webkit-user-select:\s*none/);
     expect(rule).toMatch(/user-select:\s*none/);
+    // 组头也是长按目标，同样必须关掉原生 callout，否则组头菜单在 iOS 上按不出来。
+    const headerRule =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+\[data-ws-header\]\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(headerRule).toMatch(/-webkit-touch-callout:\s*none/);
+    expect(headerRule).toMatch(/-webkit-user-select:\s*none/);
+    expect(headerRule).toMatch(/user-select:\s*none/);
   });
 
   it("keeps the rename field's text selectable on the phone", () => {
@@ -90,6 +98,7 @@ describe("phone layout CSS", () => {
       /\[data-mobile="true"\]\s+\.app-sidebar\s+\[data-thread-row\]\s+input\s*\{([^}]*)\}/.exec(
         css(),
       )?.[1] ?? "";
+    expect(rule).toMatch(/-webkit-user-select:\s*text/);
     expect(rule).toMatch(/user-select:\s*text/);
   });
 });
