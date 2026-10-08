@@ -84,6 +84,10 @@ impl CardState {
             (Launching, Failed) => true,
             (Launching, Cancelled) => true, // 由上面的 `next == Cancelled` 兜底也行，显式更清楚
             (Running, AwaitingMerge) => true,
+            // 合并阶段：实现卡停在 awaiting_merge/needs_you，用户发话后进 merging。
+            // 合并轮由卡片原会话里的一轮 turn 执行，故这一步是「人已发话」的记录。
+            (AwaitingMerge, Merging) => true,
+            (NeedsYou, Merging) => true,
             (Running, NeedsYou) => true,
             (Running, Failed) => true,
             (Running, Paused) => true,
@@ -286,5 +290,20 @@ mod tests {
         // 合并卡绝不能回到会话通路。
         assert!(!Merging.can_transition_to(Running));
         assert!(!Merging.can_transition_to(Launching));
+    }
+
+    #[test]
+    fn a_card_may_enter_and_leave_the_merge_stage() {
+        use CardState::*;
+        // 实现卡停在 awaiting_merge，用户发话后进 merging；失败退回 needs_you 再来。
+        assert!(AwaitingMerge.can_transition_to(Merging));
+        assert!(NeedsYou.can_transition_to(Merging));
+        assert!(Merging.can_transition_to(Done));
+        assert!(Merging.can_transition_to(NeedsYou));
+        // 合并阶段不占会话槽位（口径不变）。
+        assert!(!Merging.occupies_slot());
+        // 未到 awaiting_merge/needs_you 的卡不得直接进 merging。
+        assert!(!Running.can_transition_to(Merging));
+        assert!(!Paused.can_transition_to(Merging));
     }
 }
