@@ -54,45 +54,13 @@ to skip.
 
 ## Configuration Schema And Effective Policy
 
-User runtime configuration is TOML; project configuration may only narrow it.
-
-```toml
-[runtime]
-max_resident_subagents = 16
-max_queued_subagents = 64
-max_depth = 2
-max_direct_children_per_agent = 4
-
-[resources]
-max_llm_requests_per_provider_key = 8
-reserved_coordination_llm_requests = 1
-max_coding_agents = 6
-max_host_build_jobs = 2
-
-[attempt_defaults]
-max_turns = 100
-max_wall_time_secs = 2700
-max_idle_time_secs = 300
-max_provider_retries = 3
-max_tool_retries = 2
-max_rework_cycles = 2
-
-[schedule_defaults]
-max_resident_subagents = 4
-max_turns = 30
-max_wall_time_secs = 900
-priority = "background"
-read_only = true
-overlap_policy = "skip"
-missed_run_policy = "skip"
-```
-
-The resolver computes limits with `min(user, project, root, parent, child)` and
-capabilities with set intersection. Project configuration can declare a named
-resource constraint, for example `cargo:<canonical-workspace-root> = exclusive
-1`; it cannot create extra host build or provider permits. Reducing a limit
-affects future admissions immediately. Increasing it requires a user-level
-configuration change and never automatically retries a terminal task.
+These knobs are currently supplied as environment variables
+(`YI_AGENT_MAX_RESIDENT_SUBAGENTS`, `YI_AGENT_MAX_DIRECT_CHILDREN`). The
+multi-layer TOML narrowing model (`RuntimePolicyLayer` /
+`EffectiveRuntimePolicy`) was parsed but never wired to a loader; it was
+removed on 2026-10-08 rather than left as a knob that looked effective but was
+not. Limits still compose by minimum and capabilities by intersection when the
+layered model is reintroduced.
 
 ## Resource Keys And Lease Lifecycle
 
