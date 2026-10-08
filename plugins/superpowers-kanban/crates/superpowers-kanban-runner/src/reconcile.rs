@@ -63,10 +63,18 @@ pub enum Reconcile {
 ///
 /// `Converge::Wait` 不产出任何报告。分支不存在时不调用 `branch_merged`
 /// （省一次 git 调用，且语义上无意义）。
+///
+/// 先筛候选集、空则**不碰 git**（连 `default_branch` 也不调）：收敛扫描每个 tick
+/// 都跑，而候选集通常为空（无 `awaiting_merge` 实现卡）。早退回 `Vec::new()`
+/// 才能兑现「无候选卡时零 git 调用」的开销承诺（spec §9）。
 pub fn plan<G: GitFacts>(board: &Board, git: &G) -> Vec<Reconcile> {
+    let ids = converge::candidates(board);
+    if ids.is_empty() {
+        return Vec::new();
+    }
     let base = git.default_branch();
     let mut reports = Vec::new();
-    for id in converge::candidates(board) {
+    for id in ids {
         let source = source_for(&id);
         let existing = git.branch_exists(&source);
         let merged = existing && git.branch_merged(&source, &base);
@@ -174,6 +182,22 @@ mod tests {
         }
     }
 
+    /// 探针：任何 git 事实被问及即 panic。用来把「空候选集零 git 调用」钉死——
+    /// 若 `plan` 又在候选循环之前先取 `default_branch`，本测试立刻炸。
+    struct ForbiddenGit;
+
+    impl GitFacts for ForbiddenGit {
+        fn default_branch(&self) -> String {
+            panic!("no candidates -> default_branch must not be called")
+        }
+        fn branch_exists(&self, _source: &str) -> bool {
+            panic!("no candidates -> branch_exists must not be called")
+        }
+        fn branch_merged(&self, _source: &str, _base: &str) -> bool {
+            panic!("no candidates -> branch_merged must not be called")
+        }
+    }
+
     #[test]
     fn a_merged_branch_produces_a_converged_report() {
         let board = board_with_awaiting("card-1");
@@ -218,6 +242,27 @@ mod tests {
         );
     }
 
+    /// 候选集为空时必须零 git 调用（spec §9 的开销承诺）：收敛扫描每 tick 都跑，
+    /// 而绝大多数 tick 没有 `awaiting_merge` 实现卡。空板 + 爆炸探针 = 早退生效。
+    #[test]
+    fn an_empty_candidate_set_never_touches_git() {
+        let board = Board::new();
+        assert!(plan(&board, &ForbiddenGit).is_empty());
+    }
+
+    /// 只有非候选（此处置一张 `needs_you` 卡）时同样不碰 git。
+    #[test]
+    fn a_board_without_candidates_never_touches_git() {
+        let mut board = board_with_awaiting("card-1");
+        board
+            .transition(&CardId::new("card-1"), CardState::Running)
+            .unwrap();
+        board
+            .transition(&CardId::new("card-1"), CardState::NeedsYou)
+            .unwrap();
+        assert!(plan(&board, &ForbiddenGit).is_empty());
+    }
+
     #[test]
     fn report_lines_are_actionable() {
         let converged = report_line(&Reconcile::Converged {
@@ -238,5 +283,17 @@ mod tests {
             "{missing}"
         );
         assert!(missing.contains("/w/card-1"), "workdir 要带上：{missing}");
+    }
+
+    /// 无 workdir 的缺分支卡（例如迁移来的旧卡）：文案退化到 `unknown`，
+    /// 不能让提示行少掉 worktree 段。
+    #[test]
+    fn a_missing_branch_without_a_workdir_says_unknown() {
+        let line = report_line(&Reconcile::MissingBranch {
+            id: CardId::new("card-1"),
+            source: "kanban/card-1".into(),
+            workdir: None,
+        });
+        assert!(line.contains("unknown"), "{line}");
     }
 }

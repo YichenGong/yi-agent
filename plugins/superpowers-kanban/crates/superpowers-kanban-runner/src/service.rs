@@ -586,15 +586,18 @@ impl BoardService {
                 other => reports.push(other),
             }
         }
-        // 3) 落地 `done`（此时文档里只剩该上报的报告）。
+        // 3) 落地 `done`；报告随之裁剪——只有真正迁移成功的卡才留报告。
+        //    否则 tick 会为一张没动的卡打印「auto-converged to done」。
         let mut changed = false;
-        for report in &reports {
-            if let Reconcile::Converged { id, .. } = report {
-                if inner.board.transition(id, CardState::Done).is_ok() {
-                    changed = true;
-                }
+        reports.retain(|report| match report {
+            Reconcile::Converged { id, .. } => {
+                let moved = inner.board.transition(id, CardState::Done).is_ok();
+                changed = changed || moved;
+                moved
             }
-        }
+            // 缺分支提示不动状态，恒留。
+            Reconcile::MissingBranch { .. } => true,
+        });
         if changed {
             self.save(&inner);
         }
