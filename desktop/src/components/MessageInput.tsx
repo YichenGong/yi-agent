@@ -117,7 +117,14 @@ export function MessageInput({
     <div className="relative border-t border-line bg-panel p-3">
       {showPopup && <SlashPopup commands={options} selected={selected} />}
       <AttachmentChips attachments={attachments} onRemove={onRemoveAttachment} />
-      <div className="flex items-end gap-2">
+      {/*
+       * Phone breakpoint: the desktop row is 输入框 + 一列右对齐控件（附附加文件 /
+       * Mode / 模型 / Send）。在 393pt 宽的 iPhone 上，那一列相互竞争的控件把输入框
+       * 挤到只剩几十像素宽（真机实测 55pt，桌面是 334pt）。`max-md` 让手机改成纵向：
+       * 输入框独占整行 100%，控件行落到它下面。桌面（>768px，含可缩到 720px 的窗口）
+       * 不匹配该变体，逐像素不变。
+       */}
+      <div className="flex items-end gap-2 max-md:flex-col max-md:items-stretch">
         <textarea
           ref={inputRef}
           value={text}
@@ -206,9 +213,9 @@ export function MessageInput({
           disabled={disabled || sending || turnActive}
           rows={3}
           placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-          className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50"
+          className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50 max-md:w-full max-md:flex-none"
         />
-        <div className="flex flex-col items-end gap-2">
+        <div className="flex flex-col items-end gap-2 max-md:w-full max-md:flex-row max-md:flex-wrap max-md:items-center max-md:justify-end">
           <div className="flex items-center gap-2">
             <button
               type="button"

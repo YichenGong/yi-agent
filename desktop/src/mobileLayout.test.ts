@@ -50,6 +50,24 @@ describe("phone layout CSS", () => {
     expect(css()).toMatch(/\[data-mobile="true"\]\s+\.app-titlebar\s*\{[^}]*display:\s*none/);
   });
 
+  it("tints the safe-area bands so they read as panel, not as a void", () => {
+    // 上下两条安全区留白必须由 `body` 自己铺色。不铺色时它们是**没有背景**的区域，
+    // 深色主题下就是两条很长的黑边——正是用户报的「上下黑边太长」。`--panel` 与
+    // 底部 `MessageInput` / `StatusBar` 同色，留白与面板接成一片，看不出边界。
+    expect(css()).toMatch(/\[data-mobile="true"\]\s+body\s*\{[^}]*background:\s*var\(--panel\)/);
+  });
+
+  it("trims the bottom inset to the clearance the home indicator needs", () => {
+    // 整段 `safe-area-inset-bottom`（iPhone 14 Pro 上 34pt）全留，输入区被顶得过高，
+    // 底边因此显得空。收窄到一个固定的 12pt 净空后，Home Indicator 仍有净空而不浪费
+    // 高度；`max(..., 0)` 让没有底部安全区的设备回到 0。
+    const src = css();
+    expect(src).toMatch(/@media\s*\(max-width:\s*767\.98px\)/);
+    expect(src).toMatch(
+      /padding-bottom:\s*max\(env\(safe-area-inset-bottom,\s*0px\)\s*-\s*12px,\s*0px\)/,
+    );
+  });
+
   it("gives the drawer's scrolling element its own safe-area insets", () => {
     // 抽屉是 `position: fixed`，脱离文档流，父级的内边距管不到它。安全区要落在
     // 真正会滚动的 `aside` 上，滚动到底时最后一行才不被 Home Indicator 压住。

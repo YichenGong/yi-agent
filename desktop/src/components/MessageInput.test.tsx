@@ -164,8 +164,27 @@ describe("MessageInput", () => {
     // 焦点态等于基色就等于没有焦点指示（本断言先跑红）。
     expect(focusBorder).not.toBe(`focus:${baseBorder}`);
     expect(focusBorder).toMatch(/^focus:border-(line|line-strong|fg|fg-muted|fg-subtle|fg-faint)$/);
-    // 不写字面色阶，否则两套主题里必有一套观感错。
+    // 不写字面色阶，否则两套主题里必有一有一观感错。
     expect(textarea.className).not.toMatch(/focus:border-neutral-/);
+  });
+
+  it("stacks the composer at the phone breakpoint so the input keeps its width", () => {
+    renderInput();
+    const textarea = screen.getByRole("textbox");
+    // 桌面那一行是"输入框 + 一列右对齐控件"，它在 393pt 的 iPhone 上把输入框挤到只剩
+    // 几十像素宽（真机实测 55pt）。`max-md` 变体让手机改成纵向：输入框独占整行，
+    // 控件行落到下面。jsdom 不编译 Tailwind，故只断类名契约。
+    const row = textarea.parentElement!;
+    expect(row.className).toContain("max-md:flex-col");
+    expect(row.className).toContain("max-md:items-stretch");
+    // 输入框在手机上必须是"占满整行"而不是"可伸缩的 flex 项"，否则 100% 宽仍会被
+    // 同排的控件挤走。
+    expect(textarea.className).toContain("max-md:w-full");
+    expect(textarea.className).toContain("max-md:flex-none");
+    // 控件列同样在手机上撑满整行并横向换行排列（模型选择器可能很长）。
+    const controls = textarea.nextElementSibling as HTMLElement;
+    expect(controls.className).toContain("max-md:flex-row");
+    expect(controls.className).toContain("max-md:flex-wrap");
   });
 
   it("does not keep a draft of its own: the value prop owns the text", () => {
