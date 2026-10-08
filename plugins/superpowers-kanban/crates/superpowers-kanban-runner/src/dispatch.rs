@@ -182,6 +182,40 @@ pub fn dispatch_with_service(
             service.release(card_id, detail)?;
             Ok(json!({"ok": true}))
         }
+        "merge_request" => {
+            let card_id = params
+                .get("card_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "merge_request needs a card_id".to_string())?;
+            match service.merge_request(card_id)? {
+                crate::service::MergeRequest::Granted {
+                    workdir,
+                    source,
+                    base,
+                } => Ok(json!({
+                    "status": "granted",
+                    "workdir": workdir.to_string_lossy(),
+                    "source": source,
+                    "base": base,
+                })),
+                crate::service::MergeRequest::Busy => Ok(json!({ "status": "busy" })),
+                crate::service::MergeRequest::Denied(reason) => {
+                    Ok(json!({ "status": "denied", "reason": reason }))
+                }
+            }
+        }
+        "merge_finish" => {
+            let card_id = params
+                .get("card_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "merge_finish needs a card_id".to_string())?;
+            let status = match service.merge_finish(card_id)? {
+                crate::service::MergeFinish::Done => "done",
+                crate::service::MergeFinish::NeedsYou => "needs_you",
+                crate::service::MergeFinish::Cleared => "cleared",
+            };
+            Ok(json!({ "status": status }))
+        }
         "settings.read" => {
             let calendar =
                 superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
@@ -516,5 +550,52 @@ mod tests {
         let impl_card = cards.iter().find(|c| c["id"] == "impl").unwrap();
         assert_eq!(impl_card["kind"], "implementation");
         assert!(impl_card["source"].is_null());
+    }
+
+    #[test]
+    fn merge_request_reports_denied_for_an_unknown_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_dir(dir.path());
+        let value =
+            dispatch_with_global(&state, None, "merge_request", &json!({ "card_id": "nope" }))
+                .unwrap();
+        assert_eq!(value["status"], "denied");
+        assert!(value["reason"].as_str().unwrap().contains("nope"));
+    }
+
+    #[test]
+    fn merge_finish_errors_on_an_unknown_card_and_reports_cleared_otherwise() {
+        let workdir = tempfile::tempdir().unwrap();
+        let state = state_dir(workdir.path());
+        // 先落盘一张排队卡：BoardService 是进程单例，构造时读一次 board.json，
+        // 之后再写文件不会被它看见（生产路径经 dispatch 改内存板）。
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue(
+            superpowers_kanban_core::card::CardId::new("card-1"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&state.join("board.json"), &board).unwrap();
+
+        // 卡不在 merging → cleared。
+        let value = dispatch_with_global(
+            &state,
+            None,
+            "merge_finish",
+            &json!({ "card_id": "card-1" }),
+        )
+        .unwrap();
+        assert_eq!(value["status"], "cleared");
+
+        // 卡根本不存在 → 明确报错，而不是静默 cleared。
+        let error = dispatch_with_global(
+            &state,
+            None,
+            "merge_finish",
+            &json!({ "card_id": "nope" }),
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown card"), "{error}");
     }
 }
