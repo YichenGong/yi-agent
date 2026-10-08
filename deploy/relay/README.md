@@ -3,6 +3,17 @@
 把 `yi-agent-relay` 部署到一台有公网 IP 的 Linux VPS，让**手机在任何网络**（4G/5G/异地）
 都能连上你电脑上的会话。两端都出站，VPS 只做按 `session` 配对的转发。
 
+> **安全提醒**：中继按 `session` 配对转发，**不鉴权**——`session_id` 本身就是凭据。
+> 请把地址与 `session_id` **按秘密保管**（见 `docs/relay-deploy.md` §2.6），
+> 不要提交进公开仓库。本机真实值记在 `deploy/relay/.relay-local.md`（已 gitignore）。
+
+## 本机当前部署（真实值）
+
+本机在跑的这套部署的真实域名/IP/session 记在 **`deploy/relay/.relay-local.md`**
+（该文件已进 `.gitignore`，不会随仓库公开）。丢了就照下方步骤重新部署。
+
+## 快速开始
+
 ## 0. 你需要准备
 
 | 项 | 说明 |

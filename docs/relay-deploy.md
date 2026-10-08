@@ -185,6 +185,60 @@ openssl rand -hex 16     # 例如 3f7a...c1
 
 后面电脑侧、手机侧都用同一个值。
 
+### 2.6 实际部署记录
+
+> **本地记录，值脱敏。** 真实域名/IP/session **不写进本文件**（本仓库有公开的 GitHub
+> 镜像）。真实值写在 `deploy/relay/.relay-local.md`（该文件已进 `.gitignore`，仅本机可见）
+> 或你自己的密码管理器里。下面是**结构**与**踩坑**，可公开。
+
+| 项 | 说明 |
+| --- | --- |
+| 中继域名 | `<子域>.<你的域名>`（例：`relay.example.com`） |
+| VPS 公网 IP | 你的 VPS 公网 IPv4 |
+| VPS 地域 / 系统 | 海外地域（免备案）/ Ubuntu 22.04+ |
+| 中继监听 | `127.0.0.1:8080`（**只回环**，公网只走 443） |
+| TLS | Caddy（静态二进制）反代，Let's Encrypt 自动签发/续期 |
+| session id | `openssl rand -hex 16` 生成，**两端一致** |
+| 手机接入地址 | `wss://<域名>/ws?session=<session_id>` |
+| 电脑接入地址 | `wss://<域名>/connect?session=<session_id>` |
+| 电脑侧配置 | `~/.yi-agent/preferences.json` → `relay_url`（上面那行） |
+| 部署产物 | `deploy/relay/`（静态二进制 + `install.sh` + `README.md`） |
+
+> **安全提醒（重要）**：中继按 `session` 配对转发，**不鉴权**。因此
+> **`session_id` 本身就是凭据**——知道它的人（在任何网络）就能连上你电脑的会话。
+> 务必将 `session_id` 与地址**按秘密保管**，不要提交进公开仓库、不要贴在公开渠道。
+> 泄露即换：改电脑侧 `relay_url` 与新 session，重启 Mac app 即可。
+
+**服务自检**：
+
+```bash
+systemctl is-active yi-agent-relay caddy      # 都应为 active
+journalctl -u yi-agent-relay -f               # 两端接入会打印 agent/app connected
+curl -sI https://<域名>/                       # HTTP/2 200，server: Caddy
+```
+
+**本次部署踩过的坑（供复现参考）：**
+
+1. **Caddy 用非 root 用户跑，绑 443 报 `bind: permission denied`。**
+   修法：systemd 单元加
+   `AmbientCapabilities=CAP_NET_BIND_SERVICE` 与 `CapabilityBoundingSet=CAP_NET_BIND_SERVICE`。
+2. **`install.sh` 里 apt 拉 Caddy 源会卡住（`dl.cloudsmith.io` 首次握手慢）。**
+   改为直接下载 Caddy 静态二进制：
+   `curl -fsSL -o caddy.tar.gz https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz`
+   再 `tar xzf caddy.tar.gz caddy && install -m 0755 caddy /usr/local/bin/caddy`。
+3. **8080 被残留进程占用**（早先手动测试遗留）导致 relay `Address in use (os error 98)`。
+   排查：`ss -ltnp | grep 8080`，清掉占用者再 `systemctl restart yi-agent-relay`。
+4. **域名刚注册时 TLD 委派未传播**（`dig @<tld 权威> <域名> NS` → NXDOMAIN），
+   但**注册商权威可能已生效**（`dig @<注册商 NS> <子域> A` → 正确 IP）。
+   Caddy 会周期性重试签证书，传播到位后自动成功，无需干预。
+
+**为什么必须用域名（不能纯 IP）**：中继自身不做 TLS（见 §2.3），必须靠反向代理 +
+域名申请受信 CA 证书，两端才能 `wss://`；纯 IP 无法签发证书，iOS 会拒绝明文连接。
+
+**验证结论（2026-10-08）**：公网端到端已跑通——手机（外网）→ `wss://` 海外中继 →
+电脑 app-server，`initialize` OK、`pair/redeem` 成功、可列出电脑上真实的会话；
+Mac 侧车经 `--relay` 出站连上中继（无任何入站端口）。
+
 ---
 
 ## 三、电脑侧：经中继连接
@@ -541,4 +595,13 @@ iOS 配对页「扫码」按钮用相机扫后自动配对（文本手输路径�
   token；**经中继的手机不适用**——中继只是透传，app-server 侧只看到桥接的单一身份
   （见 §4.4、§七）。
 - **`~/.yi-agent/devices.json` 只存 token 哈希，但请按敏感文件保护**（撤销即删记录）。
+- **中继不鉴权：`session_id` 本身就是凭据（重要）。** 中继只按 `session` 配对转发，
+  不校验任何 token（设计如此，见 §11.1）。实测（2026-10-08）：知道 `session_id` 的人，
+  **无需 token、无需配对**即可连上 `wss://<域名>/ws?session=<id>` 并发起
+  `initialize` → `thread/list` / `device/list`（拿到会话与设备清单）。因此：
+  - 把 `wss://` 地址与 `session_id` 当**秘密**保管，勿提交公开仓库、勿贴公开渠道
+    （本仓库有公开的 GitHub 镜像，务必用占位符）；
+  - `session_id` 用 `openssl rand -hex 16` 生成，别用可猜的名字（如 `dev1`）；
+  - 泄露即轮换：改电脑侧 `relay_url` 为新 session、重启 Mac app、手机重填；
+  - 想更严：给中继叠加一层共享密钥校验，或上端到端加密（见 §七"仍缺"）。
 - **背压是 fail-safe 的**：慢消费者被摘除、被撤销设备的帧被丢弃，不静默丢单帧。
