@@ -34,6 +34,7 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
         model: "test-model".into(),
         max_turns: 4,
         max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
+        max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
         workdir: repo.to_path_buf(),
         system_prompt: None,
         compact_threshold: 160_000,
