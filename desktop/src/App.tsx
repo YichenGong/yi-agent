@@ -51,6 +51,7 @@ import {
   summarize,
 } from "./lib/boardIndex";
 import { createBoard, listBoards, removeBoard } from "./lib/superpowersKanbanBoards";
+import { makeBoardTick } from "./lib/boardRefresh";
 import { pluginProjectPaths } from "./lib/pluginSettings";
 import { threadStartParams } from "./lib/threadStart";
 import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
@@ -315,10 +316,12 @@ export default function App() {
   useEffect(() => {
     // 计时器只建一次，每次响都走「当前项目」的读法：重建计时器会漏掉切换
     // 瞬间在途的那一拍。
-    boardTick.current = () => void refreshSelectedBoard();
+    // 一拍要同时刷选中看板与侧栏摘要：摘要若只在握手时读一次，侧栏会一直
+    // 停在旧值，看起来像「什么都没在跑」。
+    boardTick.current = makeBoardTick(refreshSelectedBoard, refreshBoards);
     // 选中项目一落地就读一次，不等下一拍轮询：否则点开看板会有最多 2 秒的空面板。
     void refreshSelectedBoard();
-  }, [refreshSelectedBoard]);
+  }, [refreshSelectedBoard, refreshBoards]);
 
   const current = currentId ? store.view(currentId) : null;
 
