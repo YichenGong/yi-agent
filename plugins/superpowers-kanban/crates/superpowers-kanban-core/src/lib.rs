@@ -7,6 +7,7 @@ pub mod board;
 pub mod calendar;
 pub mod card;
 pub mod card_id;
+pub mod converge;
 pub mod inbox;
 pub mod layout;
 pub mod promotion;

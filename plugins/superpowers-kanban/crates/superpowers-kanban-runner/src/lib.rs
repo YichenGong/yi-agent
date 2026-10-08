@@ -5,6 +5,7 @@ pub mod inbox;
 pub mod lease;
 pub mod merge;
 pub mod merge_lock;
+pub mod reconcile;
 pub mod runner;
 pub mod tick;
 
