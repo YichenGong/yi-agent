@@ -38,6 +38,35 @@ pub struct MergeClaim {
     pub outcome: crate::merge::MergeOutcome,
 }
 
+/// 一次名额申请的结果。
+///
+/// `Granted` 是**授权**而不是「已经合并」：调用方（会话里的 agent）据 `workdir`
+/// 去执行 `git merge --no-ff`，完成后必须回 `merge_finish` 让插件复核。
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeRequest {
+    Granted {
+        /// 执行合并的 base worktree（base 已被检出的那个，通常是主检出）。
+        workdir: PathBuf,
+        source: String,
+        base: String,
+    },
+    /// 本项目已有合并在跑：卡不动，排队。
+    Busy,
+    /// 卡不在可合并状态（或 refs 不全）。
+    Denied(String),
+}
+
+/// 一次合并轮收尾的复核结果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum MergeFinish {
+    /// git 复核确认 source 已并入 base。
+    Done,
+    /// git 复核不通过：卡退回 `needs_you` 等用户发话。
+    NeedsYou,
+    /// 卡不在 `Merging`：不落状态，交由调用方决定。
+    Cleared,
+}
+
 struct Inner {
     board: Board,
     /// 已认领卡片持有的槽位租约。`Running` 卡片也仍在这里，直到终态释放。
@@ -442,6 +471,110 @@ impl BoardService {
             card_id: card_id.0,
             outcome,
         }))
+    }
+
+    /// 申请一次合并名额。
+    ///
+    /// 名额的两个来源：`merge.lock`（flock）挡住**同一进程/跨进程同时申请**，
+    /// 卡片的 `Merging` 状态挡住**整轮合并期间**的第二次申请。二者缺一不可：
+    /// 合并轮跨会话、持续数分钟，锁的 fd 无法跨轮保活，所以持久载体是卡片状态；
+    /// 而状态检查本身有 TOCTOU 窗口，锁保证它原子。
+    ///
+    /// 拿不到锁即 `Busy`（本项目已有合并在跑），**不排队等待**。
+    pub fn merge_request(&self, card_id: &str) -> Result<MergeRequest, String> {
+        let Some(gate) = crate::merge_lock::acquire(&self.state_dir) else {
+            return Ok(MergeRequest::Busy);
+        };
+        let result = self.merge_request_locked(card_id);
+        drop(gate);
+        result
+    }
+
+    /// `merge_request` 的临界区（调用方已持名颏锁）。
+    fn merge_request_locked(&self, card_id: &str) -> Result<MergeRequest, String> {
+        let mut inner = self.lock();
+        let id = CardId::new(card_id);
+        let Some(card) = inner.board.get(&id).cloned() else {
+            return Ok(MergeRequest::Denied(format!("unknown card: {card_id}")));
+        };
+        if !matches!(card.state, CardState::AwaitingMerge | CardState::NeedsYou) {
+            return Ok(MergeRequest::Denied(format!(
+                "card {card_id} is {:?}, not awaiting_merge/needs_you",
+                card.state
+            )));
+        }
+        // refs：合并卡自带；实现卡按 id 推导 source、按项目默认分支取 base。
+        let (source, base) = match (card.source_ref.clone(), card.base_ref.clone()) {
+            (Some(source), Some(base)) => (source, base),
+            _ => {
+                if card.kind != CardKind::Implementation {
+                    return Ok(MergeRequest::Denied(format!(
+                        "card {card_id} has no source/base to merge"
+                    )));
+                }
+                (
+                    format!("kanban/{}", crate::worktree::slugify(&card.id)),
+                    crate::merge::default_branch(&self.project_root),
+                )
+            }
+        };
+        if !merge::source_branch_exists(&self.project_root, &source) {
+            return Ok(MergeRequest::Denied(format!(
+                "source branch '{source}' does not exist"
+            )));
+        }
+        // 定位执行合并的 base worktree：base 已被检出就复用它（通常是主检出）——
+        // git 不允许同一分支被两个 worktree 同时检出。仅当 base 无人检出时才新建。
+        let workdir = match merge::prepare(&self.project_root, &base) {
+            Ok(wt) => wt.path,
+            Err(error) => return Ok(MergeRequest::Denied(error)),
+        };
+        inner
+            .board
+            .transition(&id, CardState::Merging)
+            .map_err(|error| error.to_string())?;
+        self.save(&inner);
+        Ok(MergeRequest::Granted {
+            workdir,
+            source,
+            base,
+        })
+    }
+
+    /// 收尾一次合并轮：一律以 git 事实裁定，不看模型自述。
+    ///
+    /// `source` 已并入 `base` → `done`；否则退回 `needs_you` 等用户发话。
+    /// 卡不在 `Merging`（例如已被别处推进）→ `Cleared`，不落状态。
+    pub fn merge_finish(&self, card_id: &str) -> Result<MergeFinish, String> {
+        let mut inner = self.lock();
+        let id = CardId::new(card_id);
+        let Some(card) = inner.board.get(&id).cloned() else {
+            return Err(format!("unknown card: {card_id}"));
+        };
+        if card.state != CardState::Merging {
+            return Ok(MergeFinish::Cleared);
+        }
+        let (source, base) = match (card.source_ref.clone(), card.base_ref.clone()) {
+            (Some(source), Some(base)) => (source, base),
+            _ => (
+                format!("kanban/{}", crate::worktree::slugify(&card.id)),
+                merge::default_branch(&self.project_root),
+            ),
+        };
+        let merged = merge::source_branch_exists(&self.project_root, &source)
+            && merge::branch_merged_into(&self.project_root, &source, &base);
+        let (next, state) = if merged {
+            (MergeFinish::Done, CardState::Done)
+        } else {
+            (MergeFinish::NeedsYou, CardState::NeedsYou)
+        };
+        inner
+            .board
+            .transition(&id, state)
+            .map_err(|error| error.to_string())?;
+        inner.leases.remove(&id);
+        self.save(&inner);
+        Ok(next)
     }
 
     /// 看板快照。控制面读的就是这个形状。
@@ -936,5 +1069,187 @@ mod tests {
                 .any(|c| c["kind"] == "merge" && c["origin_card"] == "card-2"),
             "a merge card must be derived for card-2: {cards:?}"
         );
+    }
+
+    /// 一张停在 `AwaitingMerge` 的实现卡，source 分支按 `kanban/<slug>` 推导。
+    /// 走真实生产路径：Queued → Running → AwaitingMerge。
+    fn service_with_awaiting_card(project: &std::path::Path) -> (BoardService, String) {
+        let service = service_with_card(project);
+        service.mark_running("card-1", "thread-1").unwrap();
+        service
+            .mark_terminal("card-1", "awaiting_merge", None)
+            .unwrap();
+        let slug = crate::worktree::slugify(&CardId::new("card-1"));
+        (service, format!("kanban/{slug}"))
+    }
+
+    fn git_run(project: &std::path::Path, args: &[&str]) {
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(project)
+                .args(args)
+                .status()
+                .unwrap()
+                .success(),
+            "git {args:?}"
+        );
+    }
+
+    #[test]
+    fn merge_request_denies_a_card_that_is_not_waiting_to_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        // 一张仍排队的实现卡：没到 awaiting_merge/needs_you。
+        let service = service_with_card(&project);
+        match service.merge_request("card-1").unwrap() {
+            MergeRequest::Denied(reason) => {
+                assert!(reason.contains("not awaiting_merge"), "{reason}")
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_request_is_busy_while_the_gate_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        // 模拟「另一处正持着 merge.lock」。
+        let held = crate::merge_lock::acquire(&service.state_dir).expect("hold the gate");
+        match service.merge_request("card-1").unwrap() {
+            MergeRequest::Busy => {}
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        drop(held);
+    }
+
+    #[test]
+    fn merge_request_grants_and_marks_the_card_merging() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+
+        match service.merge_request("card-1").unwrap() {
+            MergeRequest::Granted {
+                workdir,
+                source: s,
+                base,
+            } => {
+                assert_eq!(s, source);
+                assert_eq!(base, "main");
+                // base=main 由主检出占用 → 复用主检出，不新建 worktree。
+                assert_eq!(workdir, std::fs::canonicalize(&project).unwrap());
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        assert_eq!(service.list()["cards"][0]["state"], "merging");
+        // 已在 merging：第二次申请被拒（名额的持久载体是卡片状态）。
+        match service.merge_request("card-1").unwrap() {
+            MergeRequest::Denied(reason) => {
+                assert!(reason.contains("not awaiting_merge"), "{reason}")
+            }
+            other => panic!("expected Denied on second request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_request_denies_when_the_source_branch_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_awaiting_card(&project);
+        // 不建分支 → refuse。
+        match service.merge_request("card-1").unwrap() {
+            MergeRequest::Denied(reason) => assert!(reason.contains("does not exist"), "{reason}"),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_finish_verifies_with_git_and_settles_the_card_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        // 造分支、加提交、合进 main。
+        git_run(&project, &["checkout", "-q", "-b", &source]);
+        std::fs::write(project.join("x.txt"), "x\n").unwrap();
+        git_run(&project, &["add", "x.txt"]);
+        git_run(&project, &["commit", "-qm", "feat"]);
+        git_run(&project, &["checkout", "-q", "main"]);
+        git_run(&project, &["merge", "--no-ff", "-m", "merge", &source]);
+
+        assert!(matches!(
+            service.merge_request("card-1").unwrap(),
+            MergeRequest::Granted { .. }
+        ));
+        assert_eq!(service.merge_finish("card-1").unwrap(), MergeFinish::Done);
+        assert_eq!(service.list()["cards"][0]["state"], "done");
+    }
+
+    #[test]
+    fn merge_finish_sends_an_unmerged_card_back_to_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        // 分支存在但**没**合进 main。
+        git_run(&project, &["checkout", "-q", "-b", &source]);
+        std::fs::write(project.join("x.txt"), "x\n").unwrap();
+        git_run(&project, &["add", "x.txt"]);
+        git_run(&project, &["commit", "-qm", "feat"]);
+        git_run(&project, &["checkout", "-q", "main"]);
+
+        assert!(matches!(
+            service.merge_request("card-1").unwrap(),
+            MergeRequest::Granted { .. }
+        ));
+        assert_eq!(
+            service.merge_finish("card-1").unwrap(),
+            MergeFinish::NeedsYou
+        );
+        assert_eq!(service.list()["cards"][0]["state"], "needs_you");
+    }
+
+    #[test]
+    fn merge_finish_reports_cleared_when_the_card_is_not_merging() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // 排队中的卡不在 merging → Cleared，且状态不动。
+        assert_eq!(
+            service.merge_finish("card-1").unwrap(),
+            MergeFinish::Cleared
+        );
+        assert_eq!(service.list()["cards"][0]["state"], "queued");
+    }
+
+    #[test]
+    fn merge_finish_rejects_an_unknown_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        assert!(
+            service
+                .merge_finish("nope")
+                .unwrap_err()
+                .contains("unknown card")
+        );
+    }
+
+    #[test]
+    fn a_merging_card_does_not_consume_a_session_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        assert!(matches!(
+            service.merge_request("card-1").unwrap(),
+            MergeRequest::Granted { .. }
+        ));
+        // 合并中不占会话名额：全文唯一占槽判定仍是 Running。
+        let board = persist::load_board(&service.state_dir.join("board.json"));
+        let card = board.get(&CardId::new("card-1")).unwrap();
+        assert!(!card.state.occupies_slot());
     }
 }
