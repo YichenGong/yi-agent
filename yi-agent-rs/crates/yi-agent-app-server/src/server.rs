@@ -12272,6 +12272,9 @@ pub(crate) mod tests {
             .await;
         let v = read_response(&mut h, 5).await;
         assert!(v.get("error").is_none(), "delete must succeed: {v}");
+        // 空成功体是契约：无损静默删除不新增任何成功字段（spec §4.4 实现修正注里
+        // 唯一的例外是"该删没删成"，此用例是真删成功，故必须恰好为空）。
+        assert_eq!(v["result"], serde_json::json!({}), "{v}");
         assert!(!wt.join(".yi-agent/threads/t-card.meta.json").exists(), "session gone");
         assert!(!wt.exists(), "clean+merged worktree must be removed");
         h.shutdown().await;
@@ -12329,6 +12332,8 @@ pub(crate) mod tests {
         let v = read_response(&mut h, 5).await;
         assert!(v.get("error").is_none(), "{v}");
         assert!(v["result"].get("worktree").is_none(), "no worktree field for plain sessions: {v}");
+        // 比"无 worktree 字段"更强：普通会话的成功体必须**恰好**是空对象。
+        assert_eq!(v["result"], serde_json::json!({}), "{v}");
         assert!(marker.exists(), "the user's own directory must be untouched");
         h.shutdown().await;
     }
