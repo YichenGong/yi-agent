@@ -1892,6 +1892,157 @@ describe("deleting a thread that still runs subagents", () => {
       confirm.mockRestore();
     }
   });
+
+  it("把 worktree 将被删除写进确认框（即便没有子代理）", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    // active_children 为 0：这一回要求确认的是 worktree，而非子代理。
+    state.dataSources["thread/delete"] = () => ({
+      status: "needs_confirmation",
+      active_children: 0,
+      worktree: {
+        path: "/proj/.worktrees/kanban/card-1",
+        action: "remove",
+        reason: "worktree 有未提交改动，确认后将永久丢弃",
+      },
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    try {
+      await clickDelete();
+
+      await waitFor(() => expect(confirm).toHaveBeenCalled());
+      const message = String(confirm.mock.calls[0][0]);
+      // 用户必须看见：删的是哪个目录、为什么、以及不可逆。
+      expect(message).toContain("/proj/.worktrees/kanban/card-1");
+      expect(message).toContain("永久丢弃");
+      expect(message).toContain("继续？");
+
+      // 同意后照旧以 force 重发。
+      await waitFor(() =>
+        expect(clients[0].requests).toContainEqual({
+          method: "thread/delete",
+          params: { threadId: "t1", force: true },
+        }),
+      );
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("worktree 将被保留时如实告知，且不谎称删除", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.dataSources["thread/delete"] = () => ({
+      status: "needs_confirmation",
+      active_children: 0,
+      worktree: {
+        path: "/proj/not-a-worktree",
+        action: "keep",
+        reason: "cwd 不是本项目登记在册的看板 worktree，拒绝删除",
+      },
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    try {
+      await clickDelete();
+
+      await waitFor(() => expect(confirm).toHaveBeenCalled());
+      const message = String(confirm.mock.calls[0][0]);
+      // 必须说"保留"，且绝不能反过来说"将一并删除"。
+      expect(message).toContain("将保留");
+      expect(message).not.toContain("将一并删除");
+      expect(message).toContain("继续？");
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
+  it("同意后 worktree 删除失败时弹窗告知，不让目录无声成为孤儿", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.dataSources["thread/delete"] = (p: any) =>
+      p?.force
+        ? {
+            worktree: {
+              action: "remove",
+              removed: false,
+              path: "/proj/.worktrees/kanban/card-1",
+              reason: "fatal: cannot remove a locked working tree",
+            },
+          }
+        : {
+            status: "needs_confirmation",
+            active_children: 0,
+            worktree: {
+              path: "/proj/.worktrees/kanban/card-1",
+              action: "remove",
+              reason: "worktree 有未提交改动，确认后将永久丢弃",
+            },
+          };
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const alert = vi.spyOn(window, "alert").mockImplementation(() => {});
+    try {
+      await clickDelete();
+
+      await waitFor(() => expect(alert).toHaveBeenCalled());
+      const message = String(alert.mock.calls[0][0]);
+      // 会话已被删除、无法在应用内重删，必须当场把残留路径与原因讲清楚。
+      expect(message).toContain("/proj/.worktrees/kanban/card-1");
+      expect(message).toContain("fatal: cannot remove a locked working tree");
+
+      // 确认后照旧以 force 重发。
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/delete",
+        params: { threadId: "t1", force: true },
+      });
+    } finally {
+      alert.mockRestore();
+      confirm.mockRestore();
+    }
+  });
+
+  it("无需确认的静默删除若 worktree 删除失败，也弹窗告知", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.dataSources["thread/delete"] = () => ({
+      worktree: {
+        action: "remove",
+        removed: false,
+        path: "/proj/.worktrees/kanban/card-1",
+        reason: "boom",
+      },
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const alert = vi.spyOn(window, "alert").mockImplementation(() => {});
+    try {
+      await clickDelete();
+
+      await waitFor(() => expect(alert).toHaveBeenCalled());
+      expect(String(alert.mock.calls[0][0])).toContain("/proj/.worktrees/kanban/card-1");
+      // 后端没要求确认，就不该多问一句。
+      expect(confirm).not.toHaveBeenCalled();
+    } finally {
+      alert.mockRestore();
+      confirm.mockRestore();
+    }
+  });
+
+  it("worktree 正常删除时不弹多余提示", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.dataSources["thread/delete"] = (p: any) =>
+      p?.force ? {} : { status: "needs_confirmation", active_children: 1 };
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const alert = vi.spyOn(window, "alert").mockImplementation(() => {});
+    try {
+      await clickDelete();
+
+      await waitFor(() =>
+        expect(clients[0].requests).toContainEqual({
+          method: "thread/delete",
+          params: { threadId: "t1", force: true },
+        }),
+      );
+      expect(alert).not.toHaveBeenCalled();
+    } finally {
+      alert.mockRestore();
+      confirm.mockRestore();
+    }
+  });
 });
 
 describe("App remote subscription wiring (S2)", () => {
