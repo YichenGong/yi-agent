@@ -827,6 +827,15 @@ fn run_daemon(args: Args) {
             }
         }
 
+        // 收敛：分支已并入 base 的 awaiting_merge 卡落 done；分支缺失则提示一次。
+        // 放在归档之前——刚 done 的卡 terminal_at 才写下，不会被同拍归档。
+        for report in service.reconcile_merged() {
+            eprintln!(
+                "superpowers-kanban: {}",
+                superpowers_kanban_runner::reconcile::report_line(&report)
+            );
+        }
+
         // 合并与实现共用一个 tick：消费投递后，若本项目没有合并在跑，就做一张。
         match service.merge_next() {
             Ok(Some(claim)) => eprintln!(
