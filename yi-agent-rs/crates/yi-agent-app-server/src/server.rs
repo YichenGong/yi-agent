@@ -3702,6 +3702,11 @@ where
                         }
                         // 会话文件已摘除：按判定处置 worktree。删除失败只记日志，不阻断会话删除（D9）。
                         // board_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
+                        // 但失败这件事本身必须回报：用户刚被告知该 worktree 会被删掉，此刻会话
+                        // 已摘除、应用内再也删不掉它，又按 D10 让卡片上的 thread_id 悬空——
+                        // 若默默失败，worktree 就无声滞留、用户永远看不见。故除宿主日志外，
+                        // 把这一次"该删却没删成"如实回给客户端（失败才现身，成功仍为空）。
+                        let mut worktree_failure: Option<serde_json::Value> = None;
                         match (&reclaim, board_project.as_deref()) {
                             (
                                 crate::worktree_reclaim::WorktreeReclaim::Delete { path }
@@ -3718,11 +3723,23 @@ where
                                     eprintln!(
                                         "[app-server] could not remove the worktree for {thread_id}: {error}"
                                     );
+                                    worktree_failure = Some(json!({
+                                        "action": "remove",
+                                        "removed": false,
+                                        "path": path.to_string_lossy(),
+                                        "reason": error,
+                                    }));
                                 }
                             }
                             _ => {}
                         }
-                        write_response(&hub, &client, ok_response(id, json!({}))).await?;
+                        // 只有"被承诺会删、且确实没删成"才带字段；普通会话（reclaim=None）、
+                        // Keep、以及删除成功一律仍是空成功体，既有形状零变化。
+                        let body = match worktree_failure {
+                            Some(worktree) => json!({ "worktree": worktree }),
+                            None => json!({}),
+                        };
+                        write_response(&hub, &client, ok_response(id, body)).await?;
                     }
                     "thread/clear" => {
                         let Some(thread_id) =
@@ -12339,6 +12356,62 @@ pub(crate) mod tests {
             .await;
         let _ = read_response(&mut h, 6).await;
         assert!(marker.exists() && project.join("f.txt").exists(), "hard-refused: dir intact");
+        h.shutdown().await;
+    }
+
+    /// 契约（D9 两半）：worktree 删除失败必须如实回报，且不得阻断会话删除。
+    ///
+    /// 用户刚被告知 worktree 会被删掉；此刻会话文件已摘除、在应用内无法再删一次，
+    /// 而按 D10 卡片上的 thread_id 也已悬空——若删除默默失败，worktree 就无声滞留、
+    /// 用户永远看不见。故 force 路径下"该删却没删成"必须在响应里现身
+    /// （action=remove、removed=false、非空 reason/path），同时会话删除本身照常完成。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_card_session_reports_a_failed_worktree_removal() {
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let project = git_project(&project_dir.path().join("proj"));
+        let wt = git_kanban_worktree(&project, "card-1");
+        // 未提交文件 → 判定为 DestructiveDelete，必须 force 才走到真删。
+        std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
+        // 锁定 worktree：即便 `--force` 也删不掉（git 报
+        // "cannot remove a locked working tree"），从而确定性复现"删除失败"这条路径，
+        // 无需借助权限/IO 造错。
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(["worktree", "lock"])
+                .arg(&wt)
+                .status()
+                .unwrap()
+                .success(),
+            "git worktree lock must succeed"
+        );
+        write_meta(&wt, "t-card", "看板 · card-1",
+            Some(&project.to_string_lossy()), Some("card-1"));
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        add_workspace(&mut h, 11, &wt.to_string_lossy()).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card","force":true}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        assert!(v.get("error").is_none(), "delete must still succeed: {v}");
+        assert_eq!(v["result"]["worktree"]["action"], "remove", "{v}");
+        assert_eq!(v["result"]["worktree"]["removed"], false, "{v}");
+        assert!(
+            !v["result"]["worktree"]["reason"].as_str().unwrap().is_empty(),
+            "the failure reason must be visible: {v}"
+        );
+        assert!(
+            !v["result"]["worktree"]["path"].as_str().unwrap().is_empty(),
+            "the stranded worktree path must be named: {v}"
+        );
+        assert!(wt.exists(), "a locked worktree survives the failed removal");
+        assert!(
+            !wt.join(".yi-agent/threads/t-card.meta.json").exists(),
+            "session deletion must complete despite the worktree failure"
+        );
         h.shutdown().await;
     }
 
