@@ -528,6 +528,39 @@ initialize、pair、以及两端同 store 的一致性。
   踢），而不是在 JSON-RPC 流中间静默丢帧。恢复路径是**重连后 `thread/resume` 增量
   回放**。若频繁触发，多为网络抖动或手机长时间后台。
 
+### 中继"假死"（进程活着，但连不上）
+
+**已观察到的现象**（旧版本地中继，`0.0.0.0:18080`，发生过不止一次）：
+
+- 中继进程**没死**、`ss` 显示仍在 `LISTEN`、CPU 0%、内存正常；
+- 但新连接**连不上**：TCP 能建立，WebSocket 立刻以 **1006** 异常关闭；
+- **重启中继即恢复**（`systemctl restart yi-agent-relay`），秒级好。
+
+**可疑成因**（读 `yi-agent-relay` 源码推断，**根因未定**）：
+
+1. **服务端无心跳、无空闲超时。** `server.rs` 的 `split_bridge` 只在 socket 真报错/
+   `Close` 时退出；它**从不发 Ping、不检测死连接**（仅电脑侧 `client.rs` 每 30s 发
+   ping）。于是**半开连接**（对端已消失但 TCP 未收 FIN/RST：NAT 超时、睡眠唤醒、切网）
+   会让读循环**永久挂住**，注册表里的死槽位迟迟不摘。
+2. `attach_agent` 的下行 `await tx.send(frame)` **无超时**；下游卡住即从中继积压。
+3. 全局 `std::sync::Mutex`（锁内只做短操作，正常无碍，但无防护）。
+
+**复现情况**：短压测（300 次快速 connect/close、100 并发连接）**未复现**；像是
+**长跑 + 特定网络事件**触发（数小时），短测抓不到。旧进程日志为空（当时未启日志），
+**无现场证据**。
+
+**当前处置（2026-10-08 决定）：先不放修，靠日志观察。**
+
+- VPS 版已开日志（`RUST_LOG=yi_agent_relay=info`，systemd 常驻），`journalctl -u
+  yi-agent-relay` 可查；且**只服务单用户（1 电脑 + 1 手机）**，连接数极少，"假死"更可能
+  由长时间空闲连接触发而非负载。
+- **下次复现先抓现场**：`journalctl -u yi-agent-relay --since "2 hours ago"`，再决定修法。
+- **即时恢复**：`ssh <vps> 'systemctl restart yi-agent-relay'`（不影响 Caddy，443 不中断）。
+
+**拟定修法（另开 worktree，TDD）**：① 服务端周期性 Ping、N 秒无 Pong 即 `break` 并摘除
+（治最可疑的半开连接）；② 电脑侧 `agent` 下行写加超时/有界；③ 连接建立/关闭/ping 超时/
+队列满全部打日志；④ 先写"半开连接导致无法恢复"的复现测试把修法钉住。
+
 ---
 
 ## 七、范围与已知限制
