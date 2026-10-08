@@ -140,10 +140,12 @@ yi-agent app-server --listen ws://127.0.0.1:8790   # 绑定非回环时会打印
 已订阅时逐字输出会合并降频（每 100ms 或 4KB 一刷，跨 item 不合并、顺序不变），减少外网
 手机的流量与噪音。见 [按会话订阅过滤设计](docs/superpowers/specs/2026-10-02-thread-subscription-filtering-design.md)。
 
-投递按 IM 式分三层：**List 层**（`thread/started`、`thread/status/updated`）与 **Global 层**
-（`ui/settings/updated`、`error` 等）**永远投给所有客户端**，所以侧栏的会话列表与运行状态
-在任何设备上都是实时的；**Content 层**（`item/*`、`turn/*` 等正文）才按 `thread/subscribe`
-过滤。远程（iOS）客户端因此只保一个最多 8 条会话的 LRU 热窗口随选择滚动订阅，窗口外的
+投递按 IM 式分三层：**List 层**（`thread/started`、`thread/status/updated`、`turn/completed`）
+与 **Global 层**（`ui/settings/updated`、`error` 等）**永远投给所有客户端**，所以侧栏的会话列表、
+运行状态与**未读蓝点**在任何设备上都是实时的；**Content 层**（`item/*`、`turn/started`、`turn/retry`
+等正文流）才按 `thread/subscribe` 过滤。`turn/completed` 之所以归 List 层：它是未读蓝点
+**唯一**的驱动，而落库的会话摘要（`ThreadSummary`）并不带未读位，`thread/listAll` 无从补齐——
+若按内容层过滤，窗口外跑完的会话就永远不亮蓝点，用户会以为「还没跑完」。远程（iOS）客户端因此只保一个最多 8 条会话的 LRU 热窗口随选择滚动订阅，窗口外的
 冷会话保持安静；当用户切回一个**正在跑**的冷会话时，客户端用只读的
 `thread/readItems {threadId, afterItemId?}` 补齐既有内容，而**不用 `thread/resume`**——
 后者会打断进行中的回合。桌面（stdio）端从不订阅，天然全收。
