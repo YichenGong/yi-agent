@@ -74,6 +74,9 @@ struct Inner {
     /// `None` 表示拿不到全局租约目录：`next_launch` 必须报错而不是私自
     /// 造一个目录，否则会和别的进程用两个互不相干的池子、悄悄超配额。
     leases_dir: Option<PathBuf>,
+    /// 已提示过「分支缺失」的卡：同一 daemon 生命周期内每卡至多提示一次。
+    /// 纯内存、不落盘——重启后重发一次是可接受的（该提示要求人工动作）。
+    notified_missing_branch: std::collections::HashSet<CardId>,
 }
 
 pub struct BoardService {
@@ -113,6 +116,7 @@ impl BoardService {
                 board,
                 leases: Default::default(),
                 leases_dir,
+                notified_missing_branch: Default::default(),
             }),
         }
     }
@@ -575,6 +579,46 @@ impl BoardService {
         inner.leases.remove(&id);
         self.save(&inner);
         Ok(next)
+    }
+
+    /// 收敛扫描：把 `awaiting_merge` 的实现卡按 git 事实落地。
+    ///
+    /// 分支已并入 base → `done`；分支缺失 → 记入去重集（每 daemon 至多提示一次）。
+    /// 返回**该打印的报告行**；本方法不打印（打印在 tick 循环），故报告可直接单测。
+    /// 不占任何并发名额——收敛是簿记，`occupies_slot()` 仍只认 `Running`。
+    pub fn reconcile_merged(&self) -> Vec<crate::reconcile::Reconcile> {
+        use crate::reconcile::{self, RealGit, Reconcile};
+        let mut inner = self.lock();
+        let git = RealGit {
+            project_root: &self.project_root,
+        };
+        // 1) 在共享借用 `inner.board` 内算候选报告；此步不碰去重集（借用规则）。
+        let candidates = reconcile::plan(&inner.board, &git);
+        // 2) 去重缺分支提示：命中即视为已提示，不再上报。
+        let mut reports: Vec<Reconcile> = Vec::new();
+        for report in candidates {
+            match report {
+                Reconcile::MissingBranch { ref id, .. } => {
+                    if inner.notified_missing_branch.insert(id.clone()) {
+                        reports.push(report);
+                    }
+                }
+                other => reports.push(other),
+            }
+        }
+        // 3) 落地 `done`（此时文档里只剩该上报的报告）。
+        let mut changed = false;
+        for report in &reports {
+            if let Reconcile::Converged { id, .. } = report {
+                if inner.board.transition(id, CardState::Done).is_ok() {
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.save(&inner);
+        }
+        reports
     }
 
     /// 看板快照。控制面读的就是这个形状。
@@ -1094,6 +1138,94 @@ mod tests {
                 .success(),
             "git {args:?}"
         );
+    }
+
+    /// 读一张卡的当前状态字符串（经 `list`，与桌面/宿主同口径）。
+    fn state_of(service: &BoardService, id: &str) -> String {
+        service.list()["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == id)
+            .map(|card| card["state"].as_str().unwrap().to_string())
+            .unwrap_or_else(|| panic!("card {id} not on the board"))
+    }
+
+    /// 分支已并入 base（分支指向与 main 同一提交）→ 卡落 `done`。
+    #[test]
+    fn reconcile_converges_a_merged_card_to_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+
+        let reports = service.reconcile_merged();
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert!(
+            matches!(reports[0], crate::reconcile::Reconcile::Converged { .. }),
+            "{reports:?}"
+        );
+        assert_eq!(state_of(&service, "card-1"), "done");
+    }
+
+    /// 分支存在但未并入 → 卡保持 `awaiting_merge`，不产报告。
+    #[test]
+    fn reconcile_waits_on_an_existing_unmerged_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        // 分支上多一个未进 main 的提交。
+        git_run(&project, &["checkout", "-q", "-b", &source]);
+        std::fs::write(project.join("more.txt"), "wip").unwrap();
+        git_run(&project, &["add", "-A"]);
+        git_run(&project, &["commit", "-q", "-m", "wip"]);
+        git_run(&project, &["checkout", "-q", "main"]);
+
+        assert!(service.reconcile_merged().is_empty());
+        assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
+    }
+
+    /// 分支缺失 → 卡保持 `awaiting_merge`，且只提示一次。
+    #[test]
+    fn reconcile_reports_a_missing_branch_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_awaiting_card(&project);
+        // 不建分支 → 缺分支。
+
+        let first = service.reconcile_merged();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert!(
+            matches!(first[0], crate::reconcile::Reconcile::MissingBranch { .. }),
+            "{first:?}"
+        );
+        assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
+        // 去重：第二次不再报告。
+        assert!(service.reconcile_merged().is_empty());
+    }
+
+    /// `needs_you` 的卡不是候选：无论如何都不动。
+    #[test]
+    fn reconcile_leaves_a_needs_you_card_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        service.mark_running("card-1", "thread-2").unwrap();
+        service.mark_terminal("card-1", "needs_you", None).unwrap();
+        git_run(&project, &["branch", &source]); // 即使分支已并入
+        assert!(service.reconcile_merged().is_empty());
+        assert_eq!(state_of(&service, "card-1"), "needs_you");
+    }
+
+    /// 合并卡不是候选：收敛扫描绝不碰它。
+    #[test]
+    fn reconcile_leaves_merge_cards_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_merge_card_for_test("m1", "kanban/card-1", "main", None);
+        assert!(service.reconcile_merged().is_empty());
+        assert_eq!(state_of(&service, "m1"), "queued");
     }
 
     #[test]
