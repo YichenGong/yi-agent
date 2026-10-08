@@ -32,6 +32,11 @@ export function SuperpowersKanbanCard({
         </span>
         <span className="text-fg-muted">{card.state}</span>
       </div>
+      {card.kind === "merge" && card.detail ? (
+        <div className="mt-1 truncate font-mono text-xs text-fg-subtle" title={card.detail}>
+          {card.detail}
+        </div>
+      ) : null}
       {card.threadId ? (
         <button
           type="button"
