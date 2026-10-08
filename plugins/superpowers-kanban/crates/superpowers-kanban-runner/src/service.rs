@@ -288,26 +288,6 @@ impl BoardService {
             .transition(&id, next)
             .map_err(|error| error.to_string())?;
         inner.leases.remove(&id); // 释放槽位：drop 掉 flock
-        // 自动派生：实现卡到达 AwaitingMerge 且偏好开启时，就地排一张配对的合并卡。
-        if next == CardState::AwaitingMerge {
-            let pref = superpowers_kanban_core::layout::project_preferences_path(&self.state_dir);
-            if superpowers_kanban_core::switch::read_bool(&pref, "board_auto_merge") == Some(true) {
-                if let Some(card) = inner.board.get(&id).cloned() {
-                    if card.kind == CardKind::Implementation {
-                        let source = format!("kanban/{}", crate::worktree::slugify(&card.id));
-                        let base = crate::merge::default_branch(&self.project_root);
-                        let merge_id = inner.board.next_free_merge_id(&source, &base);
-                        inner.board.enqueue_merge(
-                            merge_id,
-                            source,
-                            base,
-                            Some(id.clone()),
-                            chrono::Local::now(),
-                        );
-                    }
-                }
-            }
-        }
         self.save(&inner);
         Ok(())
     }
@@ -669,22 +649,6 @@ impl BoardService {
         if let Ok(board) = serde_json::from_value::<Board>(value) {
             inner.board = board;
         }
-        self.save(&inner);
-    }
-
-    /// 仅测试用：往内存 board 排一张真正的实现卡（带 spec/plan 路径）并落盘。
-    ///
-    /// 用 `Board::enqueue` 而不是手搓 `Card`，卡片与生产通路同形；派生逻辑只看
-    /// `kind`/`id`，但状态通路（Queued → Launching/Running）要求它是真的实现卡。
-    #[cfg(test)]
-    pub(crate) fn enqueue_impl_card_for_test(&self, id: &str) {
-        let mut inner = self.lock();
-        inner.board.enqueue(
-            CardId::new(id),
-            PathBuf::from(format!("{id}.spec.md")),
-            PathBuf::from(format!("{id}.plan.md")),
-            chrono::Local::now(),
-        );
         self.save(&inner);
     }
 
@@ -1080,39 +1044,26 @@ mod tests {
         );
     }
 
+    /// `board_auto_merge` 打开也不再派生合并卡：合并已改为会话驱动（手动），
+    /// 自动派生会让同一目标出现第二条无人发话就能改 main 的路径。
     #[test]
-    fn awaiting_merge_derives_a_merge_card_only_when_the_preference_is_on() {
+    fn awaiting_merge_never_derives_a_merge_card_even_with_the_preference_on() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
         let service = service_with_card(&project);
+        // 打开开关：旧行为会在这里派生一张合并卡。
+        let pref = superpowers_kanban_core::layout::project_preferences_path(&service.state_dir);
+        superpowers_kanban_core::switch::write_bool(&pref, "board_auto_merge", true).unwrap();
+
         let claim = service.next_launch(1, at()).unwrap().unwrap();
         service.mark_running(&claim.card_id, "thread-1").unwrap();
-        // 默认关：不派生。
         service
             .mark_terminal(&claim.card_id, "awaiting_merge", None)
             .unwrap();
-        assert_eq!(service.list()["cards"].as_array().unwrap().len(), 1);
 
-        // 打开开关：再收一张卡时会派生合并卡。
-        let pref = superpowers_kanban_core::layout::project_preferences_path(&service.state_dir);
-        superpowers_kanban_core::switch::write_bool(&pref, "board_auto_merge", true).unwrap();
-        service.enqueue_impl_card_for_test("card-2");
-        // 状态机不允许 `Queued -> AwaitingMerge`（唯一的合法通路是
-        // Queued → Launching → Running → AwaitingMerge），所以这里按生产路径把
-        // card-2 真正启动一次，再收尾；被验证的是 `mark_terminal` 的派生逻辑。
-        let claim = service.next_launch(1, at()).unwrap().unwrap();
-        assert_eq!(claim.card_id, "card-2");
-        service.mark_running(&claim.card_id, "thread-2").unwrap();
-        service
-            .mark_terminal("card-2", "awaiting_merge", None)
-            .unwrap();
         let cards = service.list()["cards"].as_array().unwrap().clone();
-        assert!(
-            cards
-                .iter()
-                .any(|c| c["kind"] == "merge" && c["origin_card"] == "card-2"),
-            "a merge card must be derived for card-2: {cards:?}"
-        );
+        assert_eq!(cards.len(), 1, "只该有那张实现卡：{cards:?}");
+        assert_eq!(cards[0]["kind"], "implementation");
     }
 
     /// 一张停在 `AwaitingMerge` 的实现卡，source 分支按 `kanban/<slug>` 推导。
