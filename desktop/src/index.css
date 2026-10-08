@@ -203,6 +203,34 @@ html[data-mobile="true"] {
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
+/*
+ * 手机端长按（= 右键）的前提：按住会话行时，iOS 会先弹文字选择 / 放大镜 callout，
+ * 把长按手势整个抢走——`useLongPress` 便永远等不到那 500ms。这三条把原生手势关掉，
+ * 长按才是「打开菜单」而不是「选中文字」。
+ *
+ * 只作用于手机（选择器带 `[data-mobile="true"]`，由 `useIsMobile` 设在 `<html>` 上），
+ * 桌面端不匹配，布局与行为逐字节不变。
+ */
+[data-mobile="true"] .app-sidebar [data-thread-row] {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+/* 行内唯一需要选字的地方是重命名输入框，单独豁免，否则改名时选不中字。 */
+[data-mobile="true"] .app-sidebar [data-thread-row] input {
+  -webkit-user-select: text;
+  user-select: text;
+}
+/*
+ * 组头（文件夹那行）同样是长按目标，且它的文本默认可选中——iOS 上按住它也会先弹
+ * 文字选择/放大镜 callout，把长按抢走。与行同理，一并关掉；与行规则一样只作用于手机。
+ * 组头里没有输入框，故无需豁免。
+ */
+[data-mobile="true"] .app-sidebar [data-ws-header] {
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
 
 /* 抽屉展开时的背板，点它收起；只在手机端抽屉打开时渲染，故无需前缀。 */
 .app-sidebar-backdrop {

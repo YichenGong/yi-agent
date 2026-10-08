@@ -89,4 +89,34 @@ describe("phone layout CSS", () => {
     // 抽屉列表与 `overflow-x-auto` 的表格仍可滑动。
     expect(css()).toMatch(/html\[data-mobile="true"\]\s*\{[^}]*touch-action:\s*pan-x pan-y/);
   });
+
+  it("suppresses the native long-press callout on sidebar thread rows", () => {
+    // 按住会话行时 iOS 会先弹文字选择/放大镜 callout，把长按抢走——长按=右键就
+    // 永远触发不了。这三条都必须限定在 [data-mobile="true"] 下，桌面端逐字节不变。
+    const rule =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+\[data-thread-row\]\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(rule).toMatch(/-webkit-touch-callout:\s*none/);
+    expect(rule).toMatch(/-webkit-user-select:\s*none/);
+    expect(rule).toMatch(/user-select:\s*none/);
+    // 组头也是长按目标，同样必须关掉原生 callout，否则组头菜单在 iOS 上按不出来。
+    const headerRule =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+\[data-ws-header\]\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(headerRule).toMatch(/-webkit-touch-callout:\s*none/);
+    expect(headerRule).toMatch(/-webkit-user-select:\s*none/);
+    expect(headerRule).toMatch(/user-select:\s*none/);
+  });
+
+  it("keeps the rename field's text selectable on the phone", () => {
+    // 关掉 user-select 后，重命名输入框里选不中字——那是同一段 CSS 的必须豁免。
+    const rule =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+\[data-thread-row\]\s+input\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(rule).toMatch(/-webkit-user-select:\s*text/);
+    expect(rule).toMatch(/user-select:\s*text/);
+  });
 });

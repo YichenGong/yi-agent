@@ -1560,6 +1560,7 @@ export default function App() {
           onCreateBoard={(path) => void onCreateBoard(path)}
           onRemoveBoard={(path) => void onRemoveBoard(path)}
           onOpenBoard={onOpenBoard}
+          isMobile={isMobile}
           onOpenSettings={() => setSettingsOpen(true)}
         />
         </div>
