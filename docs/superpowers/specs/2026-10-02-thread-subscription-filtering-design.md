@@ -63,6 +63,12 @@ enum Feed {
   | 带 `thread_id` 的**内容**通知（started/delta/completed/status/tokenUsage/agent trace/process/…） | `Some(thread_id)` | 按订阅过滤；`All` 放行，`Only` 命中放行 |
   | **全局**帧：`ui/settings/updated`、`error`、`item/toolCall/approvalResolved` | `None` | **永远放行** |
   | **审批请求** `item/toolCall/requestApproval`（广播） | `Some(params.thread_id)` | 命中才推（见 §3.3） |
+  | **列表**帧：`thread/started`、`thread/status/updated`、`thread/modelChanged`、**`turn/completed`** | `None` | **永远放行**（列表要实时，与订阅无关） |
+
+  > `turn/completed` 归**列表层**：它是未读蓝点**唯一**的驱动（前端只在 `turn/completed`
+  > 且非当前会话时置位 `unread`），而落库的 `ThreadSummary` 不带未读位、`thread/listAll`
+  > 无从补齐。远程客户端只订阅最多 8 条暖会话，若把它按内容层过滤，窗口外跑完的会话就
+  > 永远不亮蓝点。它只带状态/错误、不带正文，恒推不违背「内容按需订阅」。
 
 - **关键不变量**：`Feed::All` 且**当前没有已订阅客户端连接**时，客户端收到的字节流与今天
   **逐字节相同**。桌面走 stdio 实例（永无订阅者），故桌面**始终**不受影响；仅在同时存在

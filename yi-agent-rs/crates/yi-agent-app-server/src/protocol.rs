@@ -346,7 +346,13 @@ impl Notification {
 pub(crate) enum Delivery {
     /// 全局帧：主题/错误/审批已处理。恒推。
     Global,
-    /// 列表层：会话存在与状态。**恒推**（列表要实时，与订阅无关）。
+    /// 列表层：会话存在与状态，外加**回合结束**。**恒推**（列表要实时，与订阅无关）。
+    ///
+    /// `TurnCompleted` 刻意留在列表层：它是未读蓝点**唯一**的驱动（前端
+    /// `ThreadView.unread` 只在 `turn/completed` 且非当前会话时置位），而落库的
+    /// `ThreadSummary` 并不带未读位，`thread/listAll` 无从补齐。远程客户端只订阅
+    /// 寥寥几条暖会话，若把它当内容层过滤，窗口外跑完的会话就永远不亮蓝点——用户
+    /// 以为「还没跑完」。它只带状态/错误、不带正文，故恒推不违背「内容按需订阅」。
     List,
     /// 内容层：会话正文流。按 `thread_key()` 过滤。
     Content,
@@ -358,7 +364,8 @@ impl Notification {
         match self {
             Notification::ThreadStarted { .. }
             | Notification::ThreadStatusUpdated { .. }
-            | Notification::ModelChanged { .. } => Delivery::List,
+            | Notification::ModelChanged { .. }
+            | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
             | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,

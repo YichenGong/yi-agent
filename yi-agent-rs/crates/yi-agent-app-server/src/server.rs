@@ -17004,6 +17004,19 @@ mod theme_watcher_tests {
             .delivery(),
             Delivery::Content
         );
+        // 回合结束是一桩**列表层/注意力**事实，不是会话正文：未读蓝点唯一的
+        // 驱动。远程客户端只订阅寥寥几条会话，若把它按内容层过滤，窗口外跑完的
+        // 会话就永远不亮蓝点——用户以为「没跑完」。
+        assert_eq!(
+            Notification::TurnCompleted {
+                thread_id: "t2".into(),
+                turn_id: "u".into(),
+                status: crate::protocol::TurnStatus::Completed,
+                error: None
+            }
+            .delivery(),
+            Delivery::List
+        );
         assert_eq!(
             Notification::UiSettingsUpdated {
                 theme: "dark".into()
@@ -17049,6 +17062,26 @@ mod theme_watcher_tests {
         .await
         .unwrap();
         assert_eq!(rx.recv().await.unwrap()["params"]["thread_id"], "t2");
+
+        // 列表层：未订阅的 t2 的**回合结束**同样必须到达——它是未读蓝点唯一的
+        // 驱动，被过滤掉就再没有第二次机会（内容层被挡下，客户端无从得知跑完了）。
+        // 用 `try_recv` 而非 `recv().await`：投递是同步 `try_send`，帧已在该分支
+        // 入队或丢弃；`await` 在 RED 下会挂死而不是快速失败。
+        write_notification(
+            &hub,
+            &Notification::TurnCompleted {
+                thread_id: "t2".into(),
+                turn_id: "u1".into(),
+                status: crate::protocol::TurnStatus::Completed,
+                error: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rx.try_recv().expect("未订阅的 t2 的回合结束帧也必须到达")["method"],
+            "turn/completed"
+        );
 
         // 内容层：未订阅的 t2 的 delta 必须被挡下。
         write_notification(
