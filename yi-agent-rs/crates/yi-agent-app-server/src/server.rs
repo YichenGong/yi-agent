@@ -10681,6 +10681,215 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 复现报告：运行中把模式从 normal 切到 yolo 后，Stop（turn/interrupt）必须
+    /// 仍然能取消这一轮。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_interrupt_still_cancels_after_switching_to_yolo_mid_turn() {
+        let mut h = Harness::with_factory(build_slow_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        // 起一个永不结束的 turn。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        let _ = read_until_method(&mut h, "turn/started").await;
+
+        // 运行中切到 yolo。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+
+        // 等到 setPermissionMode 的响应（或先到的 turn/completed：那就是 bug 本身）。
+        let mut saw_completed_early = false;
+        loop {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                saw_completed_early = true;
+                break;
+            }
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                break;
+            }
+        }
+        assert!(
+            !saw_completed_early,
+            "switching to yolo must not end the running turn on its own"
+        );
+
+        // 现在点 Stop。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/interrupt","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        let mut completed: Option<serde_json::Value> = None;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                completed = Some(v);
+                break;
+            }
+        }
+        let completed =
+            completed.expect("turn/interrupt must still end the turn after a mode switch");
+        assert_eq!(completed["params"]["status"], "interrupted");
+        h.shutdown().await;
+    }
+
+    /// 同一报告的第二个分支：切到 yolo 时正好有一个**待审批**的工具调用挂起，
+    /// 随后 Stop 必须仍能取消（审批等待期间的中断路径）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_interrupt_cancels_after_yolo_while_approval_is_pending() {
+        let mut h = Harness::with_factory(build_permission_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        // 等审批请求（此时 turn 卡在等待决定）。
+        let _approval_id = read_until_approval(&mut h).await;
+
+        // 审批挂起期间切到 yolo。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                break;
+            }
+        }
+
+        // 现在点 Stop。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/interrupt","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        let mut completed: Option<serde_json::Value> = None;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                completed = Some(v);
+                break;
+            }
+        }
+        let completed =
+            completed.expect("turn/interrupt must cancel even while an approval is pending");
+        assert_eq!(completed["params"]["status"], "interrupted");
+        h.shutdown().await;
+    }
+
+    /// 报告的第三个分支：切到 yolo（沙箱放开）后，模型已经发起一个**长时间运行的
+    /// bash 命令**。此时 Stop 必须能真正杀掉那个命令并结束 turn，而不是卡住。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_interrupt_kills_a_running_tool_after_yolo() {
+        let mut h = Harness::with_factory(build_long_tool_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"run sleep"}}]}}}}"#
+        ))
+        .await;
+
+        // 等工具真正开始执行（toolCall item 已开始）。
+        let _ = read_until_method(&mut h, "item/started").await;
+
+        // 工具执行中切到 yolo。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                break;
+            }
+        }
+
+        // 点 Stop：必须真的结束这一轮。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/interrupt","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        let mut completed: Option<serde_json::Value> = None;
+        for _ in 0..60 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                completed = Some(v);
+                break;
+            }
+        }
+        let completed =
+            completed.expect("turn/interrupt must kill the running tool and end the turn");
+        assert_eq!(completed["params"]["status"], "interrupted");
+        h.shutdown().await;
+    }
+
+    /// 报告的第四个分支：`call_stream` 本身还在等待（请求已发出、响应头未回），
+    /// 期间切到 yolo 再 Stop。Stop 必须也生效——这是「THINK 阶段在 call_stream
+    /// 之内」被中断的窗口。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_interrupt_works_while_provider_call_is_blocking() {
+        let mut h = Harness::with_factory(build_slow_call_agent, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        let _ = read_until_method(&mut h, "turn/started").await;
+
+        // 精确等到 provider 已经进入 call_stream（请求在途、响应头未回）再打断，
+        // 否则 Stop 会落在它之前的 Check 1，测不出这个窗口。
+        for _ in 0..500 {
+            if SLOW_CALL_ENTERED.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            SLOW_CALL_ENTERED.load(Ordering::SeqCst),
+            "provider must have entered call_stream before we interrupt"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                break;
+            }
+        }
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"turn/interrupt","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+
+        let started = std::time::Instant::now();
+        let mut completed: Option<serde_json::Value> = None;
+        for _ in 0..60 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                completed = Some(v);
+                break;
+            }
+        }
+        let completed =
+            completed.expect("turn/interrupt must end the turn even while call_stream blocks");
+        assert_eq!(completed["params"]["status"], "interrupted");
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "the still-blocking call_stream must not delay the cancel: took {:?}",
+            started.elapsed()
+        );
+        h.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn driver_ignores_interrupt_tagged_with_other_turn() {
         let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
@@ -11367,6 +11576,138 @@ pub(crate) mod tests {
         async fn call(&self, _args: serde_json::Value) -> yi_agent_core::ToolResult {
             yi_agent_core::ToolResult::text("ran")
         }
+    }
+
+    /// 一个 provider：`call_stream` 先挂起很久（模拟"请求已发出、响应头还没回来"
+    /// 的窗口），然后才返回一个只会输出文本的流。用来测试「THINK 阶段在
+    /// `call_stream` 之内被中断」是否会被观察到。
+    struct SlowCallProvider;
+
+    /// 置位表示 `SlowCallProvider::call_stream` 已经进入（即请求已在途、尚未
+    /// 返回流）。测试据此把 Stop 精确地打进这个窗口，而不是打在它之前的
+    /// Check 1。
+    static SLOW_CALL_ENTERED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[async_trait]
+    impl yi_agent_core::Provider for SlowCallProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            SLOW_CALL_ENTERED.store(true, Ordering::SeqCst);
+            // 请求发出后、响应头到达前的等待：真实 provider 在这里等 HTTP。
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            use yi_agent_core::provider::{ProviderEvent, StopReason};
+            let events = vec![
+                ProviderEvent::TextDelta("late".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ];
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    fn build_slow_call_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(SlowCallProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(&mut agent, session);
+        Ok(BuiltAgent {
+            agent,
+            provider,
+            config,
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        })
+    }
+
+    /// 一个会跑很久的真实 `bash` 工具调用（`sleep 60`），用于在 ACT 阶段测试
+    /// 「切到 yolo 后 Stop 仍能杀掉正在执行的命令」。provider 只发一次工具调用，
+    /// 之后永不收尾，于是 turn 一直停在工具执行中。
+    struct LongToolProvider;
+    #[async_trait]
+    impl yi_agent_core::Provider for LongToolProvider {
+        async fn call_stream(
+            &self,
+            _req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            use yi_agent_core::provider::{ProviderEvent, StopReason};
+            let events = vec![
+                ProviderEvent::ToolUseStart {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "c1".into(),
+                    partial_json: r#"{"command":"sleep 60"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "c1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ];
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    /// 真 bash + yolo 时沙箱放开；工具调用会真的执行 `sleep 60`。
+    fn build_long_tool_agent(
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent> {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(LongToolProvider);
+        // 权限层直接放行（yolo 打开），不必走审批，直接进入 ACT。
+        let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+            yi_agent_core::permission::PermissionsConfig::default(),
+            yi_agent_core::autonomy::YoloSwitch::new(true),
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(|_cmd: &str| None),
+        ));
+        let registry = yi_agent_runtime::bootstrap::build_tool_setup(
+            &super::tests_support::test_config(),
+            false,
+        )
+        .unwrap();
+        let config = yi_agent_core::AgentConfig::default();
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
+        let rx_arc = Arc::new(Mutex::new(decision_rx));
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::clone(&registry.tools),
+            config.clone(),
+        )
+        .with_permission(checker.clone(), rx_arc.clone());
+        apply_session(&mut agent, session);
+        Ok(BuiltAgent {
+            agent,
+            provider,
+            config,
+            decision_tx: Some(decision_tx),
+            decision_rx: Some(rx_arc),
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(true),
+            process_manager: Arc::clone(&registry.process_manager),
+        })
     }
 
     /// 构造一个会触发 bash 审批的 agent,并把决定通道交给 driver。

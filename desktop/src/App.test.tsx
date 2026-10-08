@@ -330,6 +330,38 @@ describe("App YOLO wiring", () => {
     );
   });
 
+  it("still stops the running turn after switching to YOLO mid-turn", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // A turn is running: the button reads "Stop".
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({ method: "turn/started", params: { thread_id: "t1", turn_id: "u1" } });
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: /stop/i })).toBeTruthy());
+
+    // Switch to YOLO while it runs.
+    enableYolo();
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/setPermissionMode",
+        params: { threadId: "t1", mode: "yolo" },
+      }),
+    );
+
+    // Stop must still interrupt the running turn.
+    fireEvent.click(screen.getByRole("button", { name: /stop/i }));
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "turn/interrupt",
+        params: { threadId: "t1" },
+      }),
+    );
+  });
+
   it("does not falsely claim Normal when thread/listAll fails", async () => {
     state.failList = true;
     render(<App />);

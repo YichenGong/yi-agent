@@ -942,23 +942,40 @@ async fn run_loop(
                 None => None,
             };
 
-            let stream = match provider.call_stream(req.clone()).await {
-                Ok(s) => {
-                    tracing::info!(
-                        turn,
-                        "provider call_stream returned Ok, entering accumulate"
-                    );
-                    s
-                }
-                Err(e) => {
-                    warn!(turn, error = %e, "provider call failed");
-                    if tx
-                        .send(AgentEvent::Error(AgentError::Provider(e)))
-                        .await
-                        .is_err()
-                    {
-                        return; // Receiver dropped, stop the loop
+            let stream = tokio::select! {
+                result = provider.call_stream(req.clone()) => match result {
+                    Ok(s) => {
+                        tracing::info!(
+                            turn,
+                            "provider call_stream returned Ok, entering accumulate"
+                        );
+                        s
                     }
+                    Err(e) => {
+                        warn!(turn, error = %e, "provider call failed");
+                        if tx
+                            .send(AgentEvent::Error(AgentError::Provider(e)))
+                            .await
+                            .is_err()
+                        {
+                            return; // Receiver dropped, stop the loop
+                        }
+                        return;
+                    }
+                },
+                _ = cancel_token.cancelled() => {
+                    // Cancel while the provider request is still in flight (the
+                    // HTTP response headers have not arrived yet). Real providers
+                    // await the network here for up to `DEFAULT_TIMEOUT_SECS`
+                    // (300s), so without this arm a Stop would be swallowed
+                    // until the call returned. No assistant reply exists yet,
+                    // so keep the run's user prompt and completed round-trips —
+                    // same policy as a cancel during THINK.
+                    info!(turn, "agent loop cancelled during provider call");
+                    let keep = safe_cancel_truncate_len(&session.lock().unwrap());
+                    session.lock().unwrap().truncate(keep);
+                    flush_unconsumed(&tx, &inbox).await;
+                    let _ = tx.send(AgentEvent::Cancelled).await;
                     return;
                 }
             };
@@ -2752,6 +2769,31 @@ mod tests {
         }
     }
 
+    /// Blocks inside `call_stream` for a long time before returning the stream —
+    /// simulates a real provider awaiting HTTP response headers. Paired with
+    /// [`BLOCKING_CALL_ENTERED`] so a test can cancel precisely while the call
+    /// is in flight.
+    struct BlockingCallProvider;
+
+    static BLOCKING_CALL_ENTERED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[async_trait]
+    impl Provider for BlockingCallProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            BLOCKING_CALL_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+            // Request is in flight; the response headers have not arrived.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let stream = futures::stream::iter(vec![ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            }]);
+            Ok(stream.boxed())
+        }
+    }
+
     /// Provider that emits one TextDelta then stalls forever (no Stop, no None).
     /// Simulates a real-world stall where the server sends partial text then
     /// the connection goes silent without a proper terminal event.
@@ -2894,6 +2936,57 @@ mod tests {
             "THINK cancel must keep the run's user prompt: {:?}",
             agent.session().messages()
         );
+        assert_eq!(agent.session().messages()[0].role, Role::User);
+    }
+
+    /// A cancel that arrives while `call_stream` is still awaiting the network
+    /// must be observed promptly — the loop must not wait for the call to
+    /// return. Regression for "Stop does nothing when the request is in flight".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_while_provider_call_is_blocking() {
+        BLOCKING_CALL_ENTERED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let provider = Arc::new(BlockingCallProvider);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let cancel_token = agent.cancel_token();
+
+        // Wait until the provider has actually entered call_stream, so the
+        // cancel lands inside that await (not the Check 1 before it).
+        for _ in 0..500 {
+            if BLOCKING_CALL_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            BLOCKING_CALL_ENTERED.load(std::sync::atomic::Ordering::SeqCst),
+            "provider must have entered call_stream before we cancel"
+        );
+
+        let cancel_token_clone = cancel_token.clone();
+        tokio::spawn(async move {
+            cancel_token_clone.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let events = collect_events(stream);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "cancel while call_stream blocks must be observed promptly, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "should have Cancelled event"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
+            "should NOT have Done event"
+        );
+        // No assistant reply exists yet, so the run's user prompt is kept.
+        assert_eq!(agent.session().len(), 1);
         assert_eq!(agent.session().messages()[0].role, Role::User);
     }
 

@@ -24,6 +24,7 @@ yi-agent 的核心库，定义消息模型、工具系统、Provider 抽象和 A
 - [x] Agent loop、Session、AgentEvent（并行工具执行）— `crates/yi-agent-core/src/agent.rs` 实现 think-act-observe 循环 — [实现](../plans/2026-07-18-yi-agent-core-impl.md)
 - [x] ProviderRequest / AgentConfig 加 model 字段 — `provider.rs::ProviderRequest.model` + `agent.rs::AgentConfig.model` 可在请求级覆盖
 - [x] 流式输出与中断处理 — `agent.rs` 用 `CancellationToken`，`run()` 后捕获 token 可取消 — [设计](../plans/2026-07-24-yi-agent-core-streaming-cancel-token-design.md)
+- [x] THINK 首步 `provider.call_stream` 也参与取消竞速 — `run_loop` 里该 await 原先唯一未与 `cancel_token.cancelled()` 竞速；真实 provider 在此等 HTTP 响应头（reqwest 默认 300s），期间 Stop 被吞到调用返回。改为 `tokio::select!`，取消分支沿用既有收尾（truncate session / flush / 发 `Cancelled`）；验证：`cargo test -p yi-agent-core --lib agent::tests::agent_cancel_while_provider_call_is_blocking`、`cargo test -p yi-agent-app-server --lib turn_interrupt_works_while_provider_call_is_blocking`
 - [x] Token 计数 — `AgentEvent::Usage` + `ProviderEvent::Usage` 携带 `TokenUsage` — [设计](../plans/2026-07-24-yi-agent-core-streaming-cancel-token-design.md)
 - [x] 权限管理集成 — `agent.rs::request_permission()` 发送 `AgentEvent::PermissionRequest`/`PermissionResolved` — [设计](../plans/2026-07-25-permission-management-design.md) · [gaps 修复](../plans/2026-07-25-permission-gaps-impl.md)
 - [x] 批量工具调用引导 — `agent.rs::default_system_prompt()` 内嵌"并行调用 / 串行 && "指引 — [设计](../plans/2026-07-25-batch-tool-call-prompt-design.md)
