@@ -57,7 +57,7 @@ method=list）返回全部 5 张卡（3 张 `awaiting_merge` + 2 张合并卡 `n
 | D2 | 合并的载体 | **原卡片的一个阶段**（不新增看板行）；无原会话才新建会话 |
 | D3 | 触发方式 | **手动**：卡停 `awaiting_merge`；用户会话内说人话经 skill 申请名额 |
 | D4 | 名额作用域 | **每项目一个**（`merge.lock`）；合并轮不占全局名额 |
-| D5 | 合并 git 落点 | **专用合并 worktree** `<项目>/.worktrees/kanban-merge/<slug>`，不碰主检出 |
+| D5 | 合并 git 落点 | 复用 base 已被检出的 worktree（base=main 时即主检出）；仅当 base 无任何检出时才新建 `<项目>/.worktrees/kanban-merge/<slug>` |
 | D6 | 失败去向 | 一律 `needs_you`（**无** `merging → failed` 自动边），等用户回会话续 |
 | D7 | 成功判定 | **git 复核**：`git merge-base --is-ancestor <source> <base>` 为真才 `done` |
 | D8 | 名额释放 | 该轮结束（无论成败）立即释放 `merge.lock` |
@@ -96,7 +96,7 @@ awaiting_merge ──► merging ──► done
 2. 会话里的 agent 经 skill 调 `superpowers-kanban merge-request <card_id>`。
 3. 插件：校验卡处于 `awaiting_merge`/`needs_you` → 试拿 `merge.lock`
    - 拿不到 → 返回 `busy`（卡不动，排队；由会话里的 agent 如实转述「本项目已有合并在跑」）
-   - 拿到 → 卡 `→ merging`，`merge::prepare()` 建好专用 worktree，
+   - 拿到 → 卡 `→ merging`，`merge::prepare()` 定位/准备好 base worktree，
      返回 `granted` + 合并 worktree 路径 + `source`/`base` + 指令
 4. agent 在该 worktree 里 `git merge --no-ff <source>`，冲突就地解决。
 5. 该轮结束 → agent 调 `superpowers-kanban merge-finish <card_id>`（或由宿主对账代调）。
@@ -143,8 +143,10 @@ awaiting_merge ──► merging ──► done
 
 ### 6.1 修三处硬伤
 
-- `boardIndex.ts::summarize()`：改为统计 `running`、`needs_you`、`awaiting_merge`+`merging`
-  三类，输出形如 `"3 运行中 · 2 待合并 · 1 待处理"`（空看板仍为 `"空"`）。
+- `boardIndex.ts::summarize()`：改为分批统计未落地状态——排队（`queued`/`launching`）、
+  运行中（`running`/`merging`）、待合并（`awaiting_merge`）、待处理（`needs_you`）；
+  仅列出非零桶，输出形如 `"2 排队 · 2 运行中 · 3 待合并 · 2 待处理"`；
+  空看板为 `"空"`，全无待办为 `"无待办"`。
 - `App.tsx`：把 `refreshBoards()` 并入 2 秒轮询，使侧栏摘要随看板变化刷新。
 - `SuperpowersKanbanCard.tsx`：`kind === "merge"` 时渲染 `source → base`（用已有 `detail`）。
 
