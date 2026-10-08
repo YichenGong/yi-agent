@@ -1,8 +1,9 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, fireEvent, cleanup, screen } from "@testing-library/react";
+import { render, fireEvent, cleanup, screen, act } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
+import { LONG_PRESS_MS } from "../lib/useLongPress";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import {
   DEFAULT_SIDEBAR_WIDTH,
@@ -745,5 +746,122 @@ describe("ThreadSidebar pinned section", () => {
     fireEvent.click(button);
     expect(onBrowse).toHaveBeenCalledTimes(1);
     expect(button.querySelectorAll("[data-ripple]")).toHaveLength(1);
+  });
+});
+
+/**
+ * 手机端长按（= 右键）。落点由 hook 委托判定，故这里直接对行/组头做 pointerdown，
+ * 再用 fake timers 推过阈值。
+ *
+ * 推进必须用 `act(async () => await vi.advanceTimersByTimeAsync(...))`：同步的
+ * `advanceTimersByTime` 不 flush React 更新，会看到菜单还没渲染。
+ */
+async function longPress(el: Element) {
+  await act(async () => {
+    fireEvent.pointerDown(el, { clientX: 5, clientY: 5, button: 0 });
+    await vi.advanceTimersByTimeAsync(LONG_PRESS_MS);
+  });
+}
+
+describe("ThreadSidebar 手机长按", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("长按会话行打开会话菜单且不选中会话", async () => {
+    vi.useFakeTimers();
+    const onSelect = vi.fn();
+    const { container } = renderSidebar({ isMobile: true, onSelect });
+
+    await longPress(screen.getByText("alpha-thread"));
+
+    expect(container.querySelector('[data-thread-menu=""]')).not.toBeNull();
+    expect(screen.getByText("重命名")).toBeTruthy();
+    expect(screen.getByText("删除")).toBeTruthy();
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("长按会话行的「重命名」进入编辑态", async () => {
+    vi.useFakeTimers();
+    const { container } = renderSidebar({ isMobile: true });
+
+    await longPress(screen.getByText("alpha-thread"));
+    fireEvent.click(screen.getByText("重命名"));
+
+    expect(container.querySelector("input")).not.toBeNull();
+    expect(container.querySelector('[data-thread-menu=""]')).toBeNull();
+  });
+
+  it("长按会话行的「置顶」切换置顶，且不选中会话", async () => {
+    vi.useFakeTimers();
+    const onTogglePin = vi.fn();
+    const onSelect = vi.fn();
+    renderSidebar({ isMobile: true, onTogglePin, onSelect });
+
+    await longPress(screen.getByText("alpha-thread"));
+    fireEvent.click(screen.getByText("置顶"));
+
+    expect(onTogglePin).toHaveBeenCalledWith("1", true);
+    // 菜单渲染在行 div 内部，而行 div 自己 onClick=onSelect；点菜单项不能连带选中。
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("已置顶的行菜单显示「取消置顶」", async () => {
+    vi.useFakeTimers();
+    const onTogglePin = vi.fn();
+    renderSidebar({ isMobile: true, pinned: [pinnedThread("9", "pin-a")], onTogglePin });
+
+    await longPress(screen.getByText("pin-a"));
+    fireEvent.click(screen.getByText("取消置顶"));
+
+    expect(onTogglePin).toHaveBeenCalledWith("9", false);
+  });
+
+  it("长按会话行后确认「删除」才调 onDelete", async () => {
+    vi.useFakeTimers();
+    const onDelete = vi.fn();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderSidebar({ isMobile: true, onDelete });
+
+    await longPress(screen.getByText("alpha-thread"));
+    fireEvent.click(screen.getByText("删除"));
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(onDelete).toHaveBeenCalledWith("1");
+    confirmSpy.mockRestore();
+  });
+
+  it("长按组头打开工作区菜单", async () => {
+    vi.useFakeTimers();
+    const { container } = renderSidebar({ isMobile: true });
+
+    const header = container.querySelector<HTMLElement>("[data-ws-header]")!;
+    await longPress(header);
+
+    const menu = container.querySelector('[role="menu"]');
+    expect(menu).not.toBeNull();
+    expect(menu!.textContent).toContain("New thread here");
+    expect(menu!.textContent).toContain("Remove from list");
+  });
+
+  it("Escape 关闭会话菜单", async () => {
+    vi.useFakeTimers();
+    const { container } = renderSidebar({ isMobile: true });
+
+    await longPress(screen.getByText("alpha-thread"));
+    expect(container.querySelector('[data-thread-menu=""]')).not.toBeNull();
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(container.querySelector('[data-thread-menu=""]')).toBeNull();
+  });
+
+  it("桌面端（未传 isMobile）长按不开任何菜单", async () => {
+    vi.useFakeTimers();
+    const { container } = renderSidebar();
+
+    await longPress(screen.getByText("alpha-thread"));
+
+    expect(container.querySelector('[data-thread-menu=""]')).toBeNull();
+    expect(container.querySelector('[role="menu"]')).toBeNull();
   });
 });

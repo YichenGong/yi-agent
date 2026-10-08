@@ -4,6 +4,8 @@ import { basename, groupCount } from "../lib/workspaceGroups";
 import { kanbanItemFor } from "../lib/boardIndex";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
+import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
+import { resolveSidebarPressTarget } from "../lib/sidebarPress";
 
 /** Compact relative time, e.g. "3m", "2h", "5d". */
 function relativeTime(ms: number): string {
@@ -85,6 +87,7 @@ export function ThreadSidebar({
   onRemoveBoard,
   onOpenBoard,
   onOpenSettings,
+  isMobile = false,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -116,6 +119,8 @@ export function ThreadSidebar({
   onRemoveBoard: (path: string) => void;
   onOpenBoard: (path: string) => void;
   onOpenSettings: () => void;
+  /** 手机端才挂长按（= 右键）；桌面端保持现状，不装监听、不渲染会话菜单。 */
+  isMobile?: boolean;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -139,7 +144,12 @@ export function ThreadSidebar({
   // menu. A fixed transparent backdrop (rendered with each menu) closes them on
   // an outside click; the two are mutually exclusive.
   const [newMenuOpen, setNewMenuOpen] = useState(false);
-  const [contextWs, setContextWs] = useState<string | null>(null);
+  // 侧栏自绘菜单：新建下拉（newMenuOpen）与长按/右键菜单（menu）三者互斥。
+  // menu 用联合类型：`group` 是桌面右键那份工作区菜单，`thread` 是手机长按新增的
+  // 会话菜单——同一个槽位保证两种菜单不会同时开着。
+  const [menu, setMenu] = useState<
+    { kind: "group"; ws: string } | { kind: "thread"; id: string } | null
+  >(null);
   // 顶部 “+ New thread” 按钮的点击涟漪：按下时按指针位置生成一圈扩散，
   // `animationend` 后移除，避免节点堆积。键盘激活没有坐标，退化为居中涟漪。
   const [ripples, setRipples] = useState<{ id: number; x: number; y: number; size: number }[]>([]);
@@ -199,8 +209,30 @@ export function ThreadSidebar({
 
   const closeMenus = useCallback(() => {
     setNewMenuOpen(false);
-    setContextWs(null);
+    setMenu(null);
   }, []);
+
+  // 长按 → 打开对应菜单。落点判定复用 sidebarPress 的标记属性；桌面端 enabled=false
+  // 时 hook 不装任何监听。
+  const longPress = useLongPress({
+    enabled: isMobile,
+    resolveTarget: (e): LongPressTarget | null => {
+      const el = resolveSidebarPressTarget(e.target as Element);
+      if (!el) return null;
+      // 编辑态的行不弹菜单（否则长按会打断正在输入的标题）。
+      if (el.dataset.threadRow !== undefined) {
+        if (editingId === el.dataset.threadRow) return null;
+        return { kind: "thread", id: el.dataset.threadRow, el };
+      }
+      return { kind: "group", ws: el.dataset.wsHeader ?? "", el };
+    },
+    onLongPress: (t) => {
+      setNewMenuOpen(false);
+      setMenu(
+        t.kind === "thread" ? { kind: "thread", id: t.id } : { kind: "group", ws: t.ws },
+      );
+    },
+  });
 
   // Reduced-motion users get no ripple at all (rather than a fast one): the
   // decoration is pure feedback and the click itself is unaffected.
@@ -256,20 +288,20 @@ export function ThreadSidebar({
       onBrowse();
       return;
     }
-    setContextWs(null);
+    setMenu(null);
     setNewMenuOpen((v) => !v);
   };
 
   // Escape closes whichever menu is open, regardless of what inside it (or the
   // trigger) currently has focus.
   useEffect(() => {
-    if (!newMenuOpen && contextWs === null) return;
+    if (!newMenuOpen && menu === null) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") closeMenus();
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [newMenuOpen, contextWs, closeMenus]);
+  }, [newMenuOpen, menu, closeMenus]);
 
   const commit = (id: string) => {
     const title = draft.trim();
@@ -334,6 +366,7 @@ export function ThreadSidebar({
       <div
         key={t.thread_id}
         {...dataAttr}
+        data-thread-row={t.thread_id}
         // 只有置顶分区的行可拖拽；编辑标题态不可拖（否则拖动会打断输入）。
         draggable={dragging && editingId !== t.thread_id}
         onDragStart={dragging ? () => setDragId(t.thread_id) : undefined}
@@ -457,6 +490,59 @@ export function ThreadSidebar({
             </button>
           </>
         )}
+        {menu?.kind === "thread" && menu.id === t.thread_id && (
+          <>
+            <div
+              data-thread-menu-overlay=""
+              className="fixed inset-0 z-10"
+              onClick={(e) => {
+                e.stopPropagation();
+                closeMenus();
+              }}
+            />
+            <div
+              role="menu"
+              data-thread-menu=""
+              onClick={(e) => e.stopPropagation()}
+              className="absolute top-full left-3 z-20 mt-0.5 min-w-32 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+            >
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  closeMenus();
+                  setEditingId(t.thread_id);
+                  setDraft(t.title ?? "");
+                }}
+                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+              >
+                重命名
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  closeMenus();
+                  onTogglePin(t.thread_id, !isPinned);
+                }}
+                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+              >
+                {isPinned ? "取消置顶" : "置顶"}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  closeMenus();
+                  onDelete(t.thread_id);
+                }}
+                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+              >
+                删除
+              </button>
+            </div>
+          </>
+        )}
       </div>
     );
   };
@@ -515,6 +601,7 @@ export function ThreadSidebar({
 
   return (
     <aside
+      {...(isMobile ? { ...longPress, "data-sidebar-longpress": "" } : {})}
       className="relative flex shrink-0 flex-col border-r border-line bg-panel"
       style={{ width }}
     >
@@ -610,12 +697,13 @@ export function ThreadSidebar({
             <div key={g.workspace} className="relative">
               <div
                 tabIndex={0}
+                data-ws-header={g.workspace}
                 aria-haspopup="menu"
-                aria-expanded={contextWs === g.workspace}
+                aria-expanded={menu?.kind === "group" && menu.ws === g.workspace}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   setNewMenuOpen(false);
-                  setContextWs(g.workspace);
+                  setMenu({ kind: "group", ws: g.workspace });
                 }}
                 onKeyDown={(e) => {
                   // 键盘等价于右键:Enter/Space 打开(或关闭)该组的菜单。
@@ -626,7 +714,11 @@ export function ThreadSidebar({
                   if (e.key !== "Enter" && e.key !== " ") return;
                   e.preventDefault();
                   setNewMenuOpen(false);
-                  setContextWs((cur) => (cur === g.workspace ? null : g.workspace));
+                  setMenu((cur) =>
+                    cur?.kind === "group" && cur.ws === g.workspace
+                      ? null
+                      : { kind: "group", ws: g.workspace },
+                  );
                 }}
                 className="flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
               >
@@ -649,7 +741,7 @@ export function ThreadSidebar({
                   {!g.exists && " (missing)"}
                 </div>
               </div>
-              {contextWs === g.workspace && (
+              {menu?.kind === "group" && menu.ws === g.workspace && (
                 <>
                   <div className="fixed inset-0 z-10" onClick={closeMenus} />
                   <div
