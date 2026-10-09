@@ -36,7 +36,6 @@ import {
   fileNameOf,
   imageAttachmentProblem,
   IMAGE_EXTENSIONS,
-  pendingKindFromPath,
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
@@ -1367,7 +1366,11 @@ export default function App() {
   };
 
   /**
-   * 打开原生多选文件对话框，把选中的文档或图片加入当前会话的待发附件。
+   * 打开原生多选文件对话框，把选中的**文档**加入当前会话的待发附件。
+   *
+   * 图片走自己的按钮（`pickImagesToAttach`）：两个白名单互不重叠，各自的对象存储形态
+   * 也不同，分开入口，用户才不会挑错之后才被告知。
+   *
    *
    * 逐个本地预检：不合格的就地报错(写进会话错误)并丢弃，合格的才进待发列表。
    * 报错与加入互不影响——一次多选里混着好坏文件是常态，不能因为一个坏文件
@@ -1382,11 +1385,7 @@ export default function App() {
     const picked = await open({
       directory: false,
       multiple: true,
-      // 同一个选择器既收文档也收图片（两个白名单不重叠，按扩展名就能分类），
-      // 用户不必先想清楚"这是文档还是图片"再去点不同的按钮。
-      filters: [
-        { name: "文档或图片", extensions: [...ATTACHMENT_EXTENSIONS, ...IMAGE_EXTENSIONS] },
-      ],
+      filters: [{ name: "文档", extensions: [...ATTACHMENT_EXTENSIONS] }],
     });
     // 多选回数组；单选/取消回字符串或 null。统一成数组再处理。
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
@@ -1396,17 +1395,56 @@ export default function App() {
     const accepted: PendingAttachment[] = [];
     for (const p of paths) {
       const name = fileNameOf(p);
-      const kind = pendingKindFromPath(p);
-      const isImage = kind === "image";
       // 桌面端拿不到 file size（dialog 只给路径）：大小交给服务端权威校验，
       // 这里只做扩展名预检——传 size=0 意为"未知"，不会误判为超限，避免把
-      // 注定被拒的类型发出去。图片与文档各用各的白名单与上限。
-      const problem = isImage ? imageAttachmentProblem(p, 0) : attachmentProblem(p, 0);
+      // 注定被拒的类型发出去。
+      const problem = attachmentProblem(p, 0);
       if (problem) {
         problems.push(`${name}：${problem}`);
         continue;
       }
-      accepted.push({ path: p, name, size: 0, kind });
+      accepted.push({ path: p, name, size: 0, kind: "document" });
+    }
+    if (accepted.length > 0) {
+      setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
+    }
+    if (problems.length > 0) {
+      store.view(id).session.lastError = problems.join("；");
+      force((v) => v + 1);
+    }
+  };
+
+  /**
+   * 打开原生多选图片对话框，把选中的图片加入当前会话的待发附件。
+   *
+   * 与 `pickFilesToAttach` 同形，但用图片自己的白名单与上限：图片不进
+   * `read_document` 清单，走的是内容块，服务端会把它摄取成模型直接可见的图片。
+   * 远端客户端的图片上传走另一条路（尚未接线），这里先不假装有。
+   */
+  const pickImagesToAttach = async (): Promise<void> => {
+    const id = store.currentId;
+    if (!id) return;
+    if (isRemoteClient()) return;
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({
+      directory: false,
+      multiple: true,
+      filters: [{ name: "图片", extensions: [...IMAGE_EXTENSIONS] }],
+    });
+    const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
+    if (paths.length === 0) return;
+
+    const problems: string[] = [];
+    const accepted: PendingAttachment[] = [];
+    for (const p of paths) {
+      const name = fileNameOf(p);
+      // 同 `pickFilesToAttach`：dialog 不给大小，`size: 0` 意为"未知"，只预检扩展名。
+      const problem = imageAttachmentProblem(p, 0);
+      if (problem) {
+        problems.push(`${name}：${problem}`);
+        continue;
+      }
+      accepted.push({ path: p, name, size: 0, kind: "image" });
     }
     if (accepted.length > 0) {
       setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
@@ -1686,7 +1724,12 @@ export default function App() {
                 // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
                 attachments={currentId ? (pending[currentId] ?? []) : []}
                 onPickFiles={() => void pickFilesToAttach()}
+                onPickImages={() => void pickImagesToAttach()}
                 onRemoveAttachment={removePendingAttachment}
+                threadId={currentId}
+                // 稳定的 `imageCall`（见上）：待发图片 chip 的缩略图也经它读取，
+                // 内联箭头会让每张缩略图每次渲染都重拉。
+                call={imageCall}
                 disabled={current === null}
                 modelPicker={
                   current !== null && currentId !== null ? (

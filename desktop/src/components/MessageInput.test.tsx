@@ -19,6 +19,7 @@ function renderInput(overrides: Partial<ComponentProps<typeof MessageInput>> = {
     onDraftChange: vi.fn(),
     attachments: [],
     onPickFiles: vi.fn(),
+    onPickImages: vi.fn(),
     onRemoveAttachment: vi.fn(),
     ...overrides,
   };
@@ -279,6 +280,33 @@ describe("MessageInput", () => {
       // A composer with no session is inert everywhere, the picker included.
       renderInput({ onPickFiles, value: "hi", disabled: true });
       expect((paperclip() as HTMLButtonElement).disabled).toBe(true);
+    });
+
+    it("keeps documents and images on distinct buttons", () => {
+      const onPickFiles = vi.fn();
+      const onPickImages = vi.fn();
+      renderInput({ onPickFiles, onPickImages });
+
+      // 两个按钮各接各的 handler：回形针只挑文档，图片走它自己的按钮（不同的
+      // 白名单与上限，不能共用一个入口）。
+      const imageButton = screen.getByRole("button", { name: "附加图片" });
+      expect(imageButton).not.toBe(paperclip());
+
+      fireEvent.click(imageButton);
+      expect(onPickImages).toHaveBeenCalledTimes(1);
+      expect(onPickFiles).not.toHaveBeenCalled();
+
+      fireEvent.click(paperclip());
+      expect(onPickFiles).toHaveBeenCalledTimes(1);
+      expect(onPickImages).toHaveBeenCalledTimes(1);
+    });
+
+    it("disables the image picker with the rest of the composer", () => {
+      // 无会话时 composer 处处 inert，图片按钮不能例外。
+      renderInput({ value: "hi", disabled: true });
+      expect((screen.getByRole("button", { name: "附加图片" }) as HTMLButtonElement).disabled).toBe(
+        true,
+      );
     });
 
     it("reports the removed attachment path and only clears the text on a send", async () => {
