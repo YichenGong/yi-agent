@@ -2569,7 +2569,8 @@ where
                             }
                         }
                     }
-                    "model/upsert" | "model/delete" | "model/setDefault" | "model/setSubagent" => {
+                    "model/upsert" | "model/delete" | "model/setDefault" | "model/setSubagent"
+                    | "model/importEnv" => {
                         if client_scope < Scope::Control {
                             write_response(
                                 &hub,

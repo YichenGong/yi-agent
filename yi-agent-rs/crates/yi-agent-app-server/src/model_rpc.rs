@@ -49,6 +49,7 @@ pub fn handle_model_request_at(
         "model/delete" => delete(path, params),
         "model/setDefault" => set_reference(path, params, Reference::Default),
         "model/setSubagent" => set_reference(path, params, Reference::Subagent),
+        "model/importEnv" => import_env(path, fallback),
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -185,6 +186,46 @@ fn set_reference(path: &Path, params: &Value, which: Reference) -> Result<Value,
     }
     save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
     Ok(json!({ "ok": true }))
+}
+
+/// `model/importEnv`：把兜底层 `cfg`（`.env`）当前的 provider/api_url/api_key/model
+/// 原子地落成清单里的一条，并把它设为 `default_model`。
+///
+/// 一次性完成而不是前端两步（upsert + setDefault）：只有服务端握有明文 key，
+/// 且两步之间可能半途失败留下「条目落了、默认没设」的中间态。
+fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
+    if cfg.api_url.trim().is_empty() {
+        return Err(RpcError::invalid_model("api_url must not be empty"));
+    }
+    if cfg.model.trim().is_empty() {
+        return Err(RpcError::invalid_model("model must not be empty"));
+    }
+    let Some(provider) = ModelProvider::parse(&cfg.provider) else {
+        return Err(RpcError::invalid_model(format!(
+            "unknown provider: {}",
+            cfg.provider
+        )));
+    };
+
+    let mut catalog = load_catalog_from(path);
+    let base = cfg.model.trim().to_string();
+    // 重名自动加后缀，静默成功（收边是「零摩擦固化」，不该被重名卡住）。
+    let mut name = base.clone();
+    let mut n = 2u32;
+    while catalog.models.iter().any(|m| m.name == name) {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    catalog.models.push(ModelEntry {
+        name: name.clone(),
+        provider,
+        api_url: cfg.api_url.clone(),
+        model: cfg.model.clone(),
+        api_key: cfg.api_key.clone(),
+    });
+    catalog.default_model = Some(name.clone());
+    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
+    Ok(json!({ "ok": true, "name": name, "default_model": name }))
 }
 
 /// `api_key` 入参的三种形态；见 [`upsert`] 的语义注释。
@@ -492,5 +533,61 @@ mod tests {
         let out = call(&path, "model/list", json!({})).unwrap();
         assert_eq!(out["effective"]["source"], "env");
         assert!(out["effective"]["model_ref"].is_null());
+    }
+
+    #[test]
+    fn import_env_lands_the_fallback_and_makes_it_the_default() {
+        let (_dir, path) = catalog_path();
+        let out = call(&path, "model/importEnv", json!({})).unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["name"], "env-model");
+        assert_eq!(out["default_model"], "env-model");
+
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(list["models"].as_array().unwrap().len(), 1);
+        assert_eq!(list["models"][0]["name"], "env-model");
+        assert_eq!(list["models"][0]["api_url"], "https://env.example");
+        assert_eq!(list["models"][0]["model"], "env-model");
+        assert_eq!(list["models"][0]["api_key_masked"], "••••9999");
+        // 导入后生效来源翻成清单，且明文不外泄。
+        assert_eq!(list["effective"]["source"], "catalog");
+        assert_eq!(list["effective"]["model_ref"], "env-model");
+        assert!(!list.to_string().contains("env-secret-9999"));
+    }
+
+    #[test]
+    fn import_env_dedupes_a_name_that_already_exists() {
+        let (_dir, path) = catalog_path();
+        // 清单里先有一条同名 "env-model"。
+        call(
+            &path,
+            "model/upsert",
+            json!({ "name": "env-model", "provider": "anthropic",
+                    "api_url": "https://x", "model": "mx" }),
+        )
+        .unwrap();
+        let out = call(&path, "model/importEnv", json!({})).unwrap();
+        assert_eq!(out["name"], "env-model-2");
+        let list = call(&path, "model/list", json!({})).unwrap();
+        let names: Vec<&str> = list["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"env-model"));
+        assert!(names.contains(&"env-model-2"));
+        // 不覆盖既有条目，且默认指向新条目。
+        assert_eq!(list["default_model"], "env-model-2");
+    }
+
+    #[test]
+    fn import_env_rejects_an_invalid_fallback_without_writing() {
+        let (_dir, path) = catalog_path();
+        let mut cfg = fallback_cfg();
+        cfg.api_url = String::new(); // 非法：url 为空
+        let err = handle_model_request_at(&path, "model/importEnv", &json!({}), &cfg).unwrap_err();
+        assert_eq!(err.data.unwrap()["code"], "invalid_model");
+        assert!(!path.exists(), "a rejected import must not write a catalog");
     }
 }
