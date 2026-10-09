@@ -79,6 +79,53 @@ describe("SuperpowersKanbanPluginSettings", () => {
     expect(writes).toBe(1);
   });
 
+  it("renders each window as a wrap-capable row (no overflow-clipped table)", async () => {
+    // 根因回归：靠 table 布局时 5 列总宽超过面板，小窗口下右侧「上限/删除」被整列
+    // 裁掉、且面板只 overflow-y-auto 无法横向滚动，用户看不到删除按钮。改为
+    // flex-wrap 的行布局后宽度交给容器，这些标签在任何宽度下都在视野内。
+    const rpc = scriptedRpc([
+      {
+        settings: {
+          default_max_tasks: 3,
+          interval_secs: 10,
+          windows: [{ days: "Mon", start: "09:00", end: "17:00", all_day: false, max_tasks: 5 }],
+        },
+      },
+    ]);
+    const { container } = render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
+
+    await screen.findByLabelText("窗口 0 星期");
+    expect(container.querySelector("table")).toBeNull();
+    expect(screen.getByLabelText("窗口 0 上限")).toBeTruthy();
+    expect(screen.getByLabelText("窗口 0 开始")).toBeTruthy();
+    expect(screen.getByLabelText("窗口 0 结束")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "删除窗口 0" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "添加窗口" })).toBeTruthy();
+  });
+
+  it("removes the row when its 删除 button is clicked", async () => {
+    const rpc = scriptedRpc([
+      {
+        settings: {
+          default_max_tasks: 3,
+          interval_secs: 10,
+          windows: [
+            { days: "Mon", start: "09:00", end: "17:00", all_day: false, max_tasks: 5 },
+            { days: "Sat", start: "10:00", end: "12:00", all_day: false, max_tasks: 2 },
+          ],
+        },
+      },
+    ]);
+    render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
+
+    await screen.findByLabelText("窗口 1 星期");
+    // 删第一行：剩下的「Sat」应当挪到索引 0。
+    fireEvent.click(screen.getByRole("button", { name: "删除窗口 0" }));
+
+    expect((screen.getByLabelText("窗口 0 星期") as HTMLInputElement).value).toBe("Sat");
+    await waitFor(() => expect(screen.queryByLabelText("窗口 1 星期")).toBeNull());
+  });
+
   it("surfaces the plugin's rejection message instead of 插件未运行", async () => {
     const rpc = (async (method: string): Promise<unknown> => {
       if (method === "plugin/settings/read") return { settings: EMPTY_SETTINGS };

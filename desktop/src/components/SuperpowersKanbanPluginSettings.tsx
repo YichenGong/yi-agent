@@ -142,70 +142,76 @@ export function SuperpowersKanbanPluginSettings({
       </label>
 
       <h3 className="mt-4 text-sm font-medium text-fg">时段并发窗口</h3>
-      <table className="mt-2 w-full text-xs">
-        <thead>
-          <tr>
-            <th>星期</th>
-            <th>开始</th>
-            <th>结束</th>
-            <th>上限</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {settings.windows.map((w, index) => (
-            <tr key={index}>
-              <td>
-                <input
-                  aria-label={`窗口 ${index} 星期`}
-                  value={w.days}
-                  onChange={(e) => patchWindow(index, { days: e.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  aria-label={`窗口 ${index} 开始`}
-                  value={w.start}
-                  disabled={w.all_day}
-                  onChange={(e) => patchWindow(index, { start: e.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  aria-label={`窗口 ${index} 结束`}
-                  value={w.end}
-                  disabled={w.all_day}
-                  onChange={(e) => patchWindow(index, { end: e.target.value })}
-                />
-              </td>
-              <td>
-                <input
-                  aria-label={`窗口 ${index} 上限`}
-                  type="number"
-                  min={1}
-                  value={w.max_tasks}
-                  onChange={(e) => {
-                    const value = numericInput(e.target.value);
-                    if (value !== null) patchWindow(index, { max_tasks: value });
-                  }}
-                />
-              </td>
-              <td>
-                <button
-                  type="button"
-                  aria-label={`删除窗口 ${index}`}
-                  onClick={() => patch({ windows: settings.windows.filter((_, i) => i !== index) })}
-                >
-                  删除
-                </button>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      {/*
+       * 一行一个窗口，字段用 flex-wrap 排布。原先的 5 列表格在小窗口下总宽超过
+       * 面板（固定 about:blank 的 70vw 弹窗里只有 ~300px），右侧的「上限」与
+       * 「删除」两列被整列裁掉——面板只 `overflow-y-auto`，横向溢出既看不见也
+       * 滚不到，用户因此找不到每行的删除按钮。换行布局把宽度交给容器，任何宽度
+       * 下所有控件都在视野内；ARIA 标签（`窗口 N 星期` 等）保持不变。
+       */}
+      <div className="mt-2 divide-y divide-line rounded border border-line">
+        {settings.windows.map((w, index) => (
+          <div key={index} className="flex flex-wrap items-center gap-2 p-2 text-xs">
+            <label className="flex items-center gap-1">
+              <span className="text-fg-subtle">星期</span>
+              <input
+                aria-label={`窗口 ${index} 星期`}
+                className="w-24 rounded border border-line bg-surface px-2 py-0.5"
+                value={w.days}
+                onChange={(e) => patchWindow(index, { days: e.target.value })}
+              />
+            </label>
+            <label className="flex items-center gap-1">
+              <span className="text-fg-subtle">开始</span>
+              <input
+                aria-label={`窗口 ${index} 开始`}
+                className="w-20 rounded border border-line bg-surface px-2 py-0.5"
+                value={w.start}
+                disabled={w.all_day}
+                onChange={(e) => patchWindow(index, { start: e.target.value })}
+              />
+            </label>
+            <label className="flex items-center gap-1">
+              <span className="text-fg-subtle">结束</span>
+              <input
+                aria-label={`窗口 ${index} 结束`}
+                className="w-20 rounded border border-line bg-surface px-2 py-0.5"
+                value={w.end}
+                disabled={w.all_day}
+                onChange={(e) => patchWindow(index, { end: e.target.value })}
+              />
+            </label>
+            <label className="flex items-center gap-1">
+              <span className="text-fg-subtle">上限</span>
+              <input
+                aria-label={`窗口 ${index} 上限`}
+                className="w-16 rounded border border-line bg-surface px-2 py-0.5"
+                type="number"
+                min={1}
+                value={w.max_tasks}
+                onChange={(e) => {
+                  const value = numericInput(e.target.value);
+                  if (value !== null) patchWindow(index, { max_tasks: value });
+                }}
+              />
+            </label>
+            <button
+              type="button"
+              aria-label={`删除窗口 ${index}`}
+              className="shrink-0 rounded border border-line px-2 py-0.5 text-fg-muted hover:text-fg"
+              onClick={() => patch({ windows: settings.windows.filter((_, i) => i !== index) })}
+            >
+              删除
+            </button>
+          </div>
+        ))}
+        {settings.windows.length === 0 && (
+          <p className="p-2 text-xs text-fg-subtle">未设置时段窗口</p>
+        )}
+      </div>
       <button
         type="button"
-        className="mt-2 text-xs"
+        className="mt-2 rounded border border-line px-2 py-0.5 text-xs"
         onClick={() => patch({ windows: [...settings.windows, { ...EMPTY_WINDOW }] })}
       >
         添加窗口
