@@ -627,12 +627,21 @@ impl Agent {
         }
     }
 
-    /// Run the agent loop, returning a stream of events.
+    /// Run the agent loop with a plain-text user prompt.
     pub async fn run(
         &mut self,
         user_prompt: String,
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
-        self.start_run(Some(user_prompt)).await
+        self.run_blocks(vec![ContentBlock::Text(user_prompt)]).await
+    }
+
+    /// Run the agent loop with a set of content blocks, so a single user turn
+    /// can carry multimodal input (text plus images) rather than text alone.
+    pub async fn run_blocks(
+        &mut self,
+        blocks: Vec<ContentBlock>,
+    ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
+        self.start_run(Some(blocks)).await
     }
 
     /// Restarts execution from the current session after a transient provider
@@ -645,7 +654,7 @@ impl Agent {
 
     async fn start_run(
         &mut self,
-        user_prompt: Option<String>,
+        blocks: Option<Vec<ContentBlock>>,
     ) -> Result<BoxStream<'static, AgentEvent>, AgentError> {
         // Every run uses a fresh cancel token.
         self.cancel_token = CancellationToken::new();
@@ -655,11 +664,11 @@ impl Agent {
         // Each run gets a fresh inbox: a handle from the previous run must not
         // feed the next one.
         self.inbox = Some(InboxHandle::new());
-        if let Some(user_prompt) = user_prompt {
-            self.session
-                .lock()
-                .unwrap()
-                .push(Message::user(user_prompt));
+        if let Some(blocks) = blocks {
+            self.session.lock().unwrap().push(Message {
+                role: Role::User,
+                content: blocks,
+            });
         }
 
         let provider = self.provider.clone();
@@ -3741,6 +3750,48 @@ mod tests {
         assert_eq!(session.messages()[1].role, Role::Assistant);
         assert_eq!(session.messages()[2].role, Role::Tool);
         assert_eq!(session.messages()[3].role, Role::Assistant);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_blocks_pushes_a_multimodal_user_message() {
+        use crate::message::{ImageDetail, ImageSource};
+
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::TextDelta("ok".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let blocks = vec![
+            ContentBlock::Text("看看这张图".into()),
+            ContentBlock::Image {
+                source: ImageSource::Base64 {
+                    media_type: "image/png".into(),
+                    data: "AAAA".into(),
+                },
+                detail: ImageDetail::High,
+                path: Some(".yi-agent/attachments/t1/x.png".into()),
+            },
+        ];
+        let stream = agent.run_blocks(blocks).await.unwrap();
+        let events = collect_events(stream);
+        assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
+
+        let session = agent.session();
+        let first = session
+            .messages()
+            .first()
+            .expect("the user message must be in the session");
+        assert_eq!(first.role, Role::User);
+        assert!(matches!(first.content[0], ContentBlock::Text(_)));
+        assert!(
+            matches!(&first.content[1], ContentBlock::Image { path: Some(p), .. } if p == ".yi-agent/attachments/t1/x.png"),
+            "the image block must land in the session with its path, got {:?}",
+            first.content
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
