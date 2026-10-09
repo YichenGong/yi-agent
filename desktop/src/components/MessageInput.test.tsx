@@ -1,13 +1,18 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
-import type { ComponentProps } from "react";
+import type { ComponentProps, ReactNode } from "react";
 import { useState } from "react";
 import { MessageInput } from "./MessageInput";
 
 afterEach(cleanup);
 
-function renderInput(overrides: Partial<ComponentProps<typeof MessageInput>> = {}) {
+function renderInput(
+  overrides: Partial<ComponentProps<typeof MessageInput>> & { modelPicker?: ReactNode } = {},
+) {
+  // 单独摘出 modelPicker：它不属于 MessageInput 的 props 类型，若跟着 `{...props}`
+  // 展开会被当成未知 DOM 属性跑到 <div> 上。
+  const { modelPicker, ...rest } = overrides;
   const props: ComponentProps<typeof MessageInput> = {
     turnActive: false,
     onSend: vi.fn(async () => true),
@@ -20,7 +25,7 @@ function renderInput(overrides: Partial<ComponentProps<typeof MessageInput>> = {
     attachments: [],
     onPickFiles: vi.fn(),
     onRemoveAttachment: vi.fn(),
-    ...overrides,
+    ...rest,
   };
   // The composer is controlled: mirror `onDraftChange` back into `value` exactly
   // as App does (against the current session's draft), so typing behaves like the
@@ -30,6 +35,7 @@ function renderInput(overrides: Partial<ComponentProps<typeof MessageInput>> = {
     return (
       <MessageInput
         {...props}
+        modelPicker={modelPicker}
         value={value}
         onDraftChange={(next) => {
           props.onDraftChange(next);
@@ -152,39 +158,73 @@ describe("MessageInput", () => {
   it("gives the composer a visible, theme-aware focus affordance", () => {
     renderInput();
     const textarea = screen.getByRole("textbox");
+    const card = screen.getByTestId("composer-card");
     // jsdom 不编译 Tailwind，没有可断言的 CSS，因此这里只断类名契约：
-    // 基色 token 与焦点色 token 必须不同，且焦点色取自语义 token（随 data-theme 换肤）。
-    const classes = textarea.className.split(/\s+/);
+    // 焦点指示落在**卡片**上（`focus-within` 让卡内任意控件获得焦点时整卡高亮，
+    // 包括底部工具栏的按钮），基色 token 与焦点色 token 必须不同。
+    const classes = card.className.split(/\s+/);
     const baseBorder = classes.find((c) =>
       /^border-(line|line-strong|fg|fg-muted|fg-subtle|fg-faint|surface|panel|raised)$/.test(c),
     );
-    const focusBorder = classes.find((c) => c.startsWith("focus:border-"));
+    const focusBorder = classes.find((c) => c === "focus-within:border-fg-subtle");
     expect(baseBorder).toBe("border-line-strong");
-    expect(focusBorder).toBeTruthy();
-    // 焦点态等于基色就等于没有焦点指示（本断言先跑红）。
-    expect(focusBorder).not.toBe(`focus:${baseBorder}`);
-    expect(focusBorder).toMatch(/^focus:border-(line|line-strong|fg|fg-muted|fg-subtle|fg-faint)$/);
+    expect(focusBorder).toBe("focus-within:border-fg-subtle");
+    // 焦点态等于基色就等于没有焦点指示。
+    expect(focusBorder).not.toBe(`focus-within:${baseBorder}`);
     // 不写字面色阶，否则两套主题里必有一有一观感错。
-    expect(textarea.className).not.toMatch(/focus:border-neutral-/);
+    expect(card.className).not.toMatch(/focus-within:border-neutral-/);
+    // 边框只有一处：textarea 不该再自画一个边框，否则卡内会出现"框里套框"。
+    expect(textarea.className).not.toMatch(/(^|\s)focus:border-/);
+  });
+
+  it("draws one card around the composer, with a borderless textarea", () => {
+    renderInput();
+    const textarea = screen.getByRole("textbox");
+    const card = screen.getByTestId("composer-card");
+    // 边框搬到卡片上：整卡就是「输入框」的视觉边界，聚焦时整卡高亮。
+    expect(card.className).toContain("rounded-lg");
+    expect(card.className).toContain("border-line-strong");
+    expect(card.className).toContain("bg-surface");
+    expect(card.className).toContain("focus-within:border-fg-subtle");
+    // textarea 自身不再是那个「带边框的盒子」。
+    expect(textarea.className).not.toContain("border-line-strong");
+  });
+
+  it("puts the attachment chips inside the card", () => {
+    renderInput({
+      attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10 }],
+    });
+    const card = screen.getByTestId("composer-card");
+    const chips = screen.getByTestId("attachment-chips");
+    // 卡内：chip 行的祖先链里有卡片元素。
+    expect(card.contains(chips)).toBe(true);
+  });
+
+  it("moves the model picker into the toolbar row inside the card", () => {
+    renderInput({ modelPicker: <span data-testid="picker">picker</span> });
+    // 工具栏是 textarea 的兄弟；"那一行"是它的父节点（与移动端用例同一锚点）。
+    const row = screen.getByRole("textbox").parentElement as HTMLElement;
+    const toolbar = row.querySelector('[data-composer-toolbar]') as HTMLElement;
+    expect(toolbar.contains(screen.getByTestId("picker"))).toBe(true);
+    // 主操作（Send/Stop）和模型选择器同处一行。
+    expect(toolbar.contains(screen.getByRole("button", { name: /send/i }))).toBe(true);
   });
 
   it("stacks the composer at the phone breakpoint so the input keeps its width", () => {
     renderInput();
     const textarea = screen.getByRole("textbox");
-    // 桌面那一行是"输入框 + 一列右对齐控件"，它在 393pt 的 iPhone 上把输入框挤到只剩
-    // 几十像素宽（真机实测 55pt）。`max-md` 变体让手机改成纵向：输入框独占整行，
-    // 控件行落到下面。jsdom 不编译 Tailwind，故只断类名契约。
+    // 桌面那一行是"输入框 + 右侧控件"；手机上 `max-md` 变体让它纵向堆叠，输入框独占整行。
+    // jsdom 不编译 Tailwind，故只断类名契约。
     const row = textarea.parentElement!;
     expect(row.className).toContain("max-md:flex-col");
     expect(row.className).toContain("max-md:items-stretch");
-    // 输入框在手机上必须是"占满整行"而不是"可伸缩的 flex 项"，否则 100% 宽仍会被
-    // 同排的控件挤走。
+    // 输入框在手机上必须"占满整行"而不是"可伸缩的 flex 项"。
     expect(textarea.className).toContain("max-md:w-full");
     expect(textarea.className).toContain("max-md:flex-none");
-    // 控件列同样在手机上撑满整行并横向换行排列（模型选择器可能很长）。
-    const controls = textarea.nextElementSibling as HTMLElement;
-    expect(controls.className).toContain("max-md:flex-row");
-    expect(controls.className).toContain("max-md:flex-wrap");
+    // 工具栏在手机上撑满整行并横向换行（模型选择器可能很长），换行后仍贴右。
+    const toolbar = row.querySelector('[data-composer-toolbar]') as HTMLElement;
+    expect(toolbar.className).toContain("max-md:flex-wrap");
+    expect(toolbar.className).toContain("max-md:justify-end");
   });
 
   it("does not keep a draft of its own: the value prop owns the text", () => {
