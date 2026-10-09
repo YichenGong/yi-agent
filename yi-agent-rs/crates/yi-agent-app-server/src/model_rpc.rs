@@ -283,6 +283,7 @@ mod tests {
             model: "env-model".to_string(),
             max_turns: 20,
             max_resident_subagents: 8,
+            max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
             workdir: std::path::PathBuf::from("/tmp/import-env-test"),
             system_prompt: None,
             compact_threshold: 160_000,
