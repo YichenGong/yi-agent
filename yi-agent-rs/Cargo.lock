@@ -4780,6 +4780,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "wiremock",
  "yi-agent-core",
  "yi-agent-llm",
  "yi-agent-mcp",

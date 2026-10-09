@@ -288,6 +288,91 @@ pub fn save_dismissed(preferences_path: &Path, value: bool) -> std::io::Result<(
     Ok(())
 }
 
+/// 一次连接测试的结论。`reason` 是给人看的中文；成功时为 `None`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionOutcome {
+    pub ok: bool,
+    pub reason: Option<String>,
+}
+
+/// 用一份临时 provider 发一次最小请求，验证 key/url/model 是否可用。
+///
+/// **只探测，不写任何文件**。明文 key 只在此处进请求头，绝不进日志或返回值。
+pub async fn test_connection(settings: &ModelSettings) -> ConnectionOutcome {
+    use yi_agent_core::{GenParams, Message, Provider, ProviderRequest};
+
+    let provider: std::sync::Arc<dyn Provider> = match settings.provider.as_str() {
+        "openai" => match yi_agent_llm::OpenaiProvider::new(yi_agent_llm::OpenaiProviderOpts {
+            base_url: Some(settings.api_url.clone()),
+            api_key: Some(settings.api_key.clone()),
+            ..Default::default()
+        }) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(error) => return failure(error),
+        },
+        _ => match yi_agent_llm::AnthropicProvider::new(yi_agent_llm::AnthropicProviderOpts {
+            base_url: Some(settings.api_url.clone()),
+            api_key: Some(settings.api_key.clone()),
+            ..Default::default()
+        }) {
+            Ok(p) => std::sync::Arc::new(p),
+            Err(error) => return failure(error),
+        },
+    };
+
+    let request = ProviderRequest {
+        model: settings.model.clone(),
+        system: None,
+        messages: vec![Message::user("ping")],
+        tools: Vec::new(),
+        params: GenParams {
+            max_tokens: Some(1),
+            ..Default::default()
+        },
+    };
+
+    match provider.call(request).await {
+        Ok(_) => ConnectionOutcome {
+            ok: true,
+            reason: None,
+        },
+        Err(error) => failure(error),
+    }
+}
+
+/// 把 provider 错误翻成一句可读中文。明文响应体只用于「其它」分支的粗粒度提示，
+/// 且经过截断——绝不外泄给界面之外。
+fn failure(error: yi_agent_core::ProviderError) -> ConnectionOutcome {
+    use yi_agent_core::ProviderError;
+    let reason = match error {
+        ProviderError::Auth(_) => "API 密钥无效或无权限".to_string(),
+        ProviderError::InvalidRequest(_) => "模型标识不被该地址接受".to_string(),
+        ProviderError::RateLimited => "请求过于频繁，请稍后重试".to_string(),
+        ProviderError::Network(message) => {
+            let lower = message.to_ascii_lowercase();
+            if lower.contains("timed out") || lower.contains("timeout") {
+                "连接超时".to_string()
+            } else {
+                "无法连接 API 地址".to_string()
+            }
+        }
+        ProviderError::Server(message) | ProviderError::Stream(message) => {
+            format!("服务端错误：{}", truncate(&message, 120))
+        }
+    };
+    ConnectionOutcome {
+        ok: false,
+        reason: Some(reason),
+    }
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    text.chars().take(max).collect::<String>() + "…"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +666,68 @@ mod tests {
         );
         save_dismissed(&path, false).unwrap();
         assert!(!load_dismissed(&path));
+    }
+
+    use wiremock::matchers::{method as wm_method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Anthropic 的成功响应走 SSE 流。一段只有 `message_start` / `message_stop`
+    /// 的最小事件流足以让 `provider.call()` 正常收流；用 JSON body 会因缺少终止
+    /// 事件而撞上空闲超时。
+    const SSE_OK: &str = "\
+event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n";
+
+    #[tokio::test]
+    async fn a_working_endpoint_reports_ok() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(SSE_OK),
+            )
+            .mount(&server)
+            .await;
+        let outcome = test_connection(&settings("anthropic", "m", &server.uri(), "sk-x")).await;
+        assert!(outcome.ok, "reason: {:?}", outcome.reason);
+    }
+
+    #[tokio::test]
+    async fn a_401_reads_as_an_invalid_key() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&server)
+            .await;
+        let outcome = test_connection(&settings("anthropic", "m", &server.uri(), "bad")).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.reason.as_deref(), Some("API 密钥无效或无权限"));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_endpoint_reads_as_cannot_connect() {
+        // 端口 1 上必然连不上。
+        let outcome =
+            test_connection(&settings("anthropic", "m", "http://127.0.0.1:1", "sk-x")).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.reason.as_deref(), Some("无法连接 API 地址"));
+    }
+
+    #[tokio::test]
+    async fn a_400_reads_as_a_rejected_model() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad model"))
+            .mount(&server)
+            .await;
+        let outcome = test_connection(&settings("anthropic", "nope", &server.uri(), "sk-x")).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.reason.as_deref(), Some("模型标识不被该地址接受"));
     }
 }
