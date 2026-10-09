@@ -2833,3 +2833,61 @@ describe("App 附件接线", () => {
     });
   });
 });
+
+describe("App first-run onboarding gate", () => {
+  it("shows the onboarding wizard when the host reports needed", async () => {
+    state.dataSources["onboarding/status"] = () => ({
+      needed: true,
+      dismissed: false,
+      reasons: ["api_key"],
+    });
+    render(<App />);
+    // 握手完成后向导应盖住主界面。
+    expect(await screen.findByText("欢迎使用 Yi-Agent")).toBeTruthy();
+  });
+
+  it("skips the wizard when the host reports ready", async () => {
+    state.dataSources["onboarding/status"] = () => ({
+      needed: false,
+      dismissed: false,
+      reasons: [],
+    });
+    render(<App />);
+    // 等到握手真正走完（resume 已发出），向导仍不出现。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull();
+  });
+
+  it("leaves a dismissible notice when the apply is a partial success", async () => {
+    state.dataSources["onboarding/status"] = () => ({
+      needed: true,
+      dismissed: false,
+      reasons: ["api_key"],
+    });
+    // `.env` 写成功但清单收边失败：宿主回 ok:true + imported:false + 原因。
+    state.dataSources["onboarding/apply"] = () => ({
+      ok: true,
+      env_written: true,
+      imported: false,
+      import_error: "disk",
+    });
+    render(<App />);
+    // 走完向导：欢迎 → 选格式 → 保存。
+    fireEvent.click(await screen.findByRole("button", { name: /开始/ }));
+    fireEvent.click(screen.getByRole("button", { name: "openai" }));
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    fireEvent.change(await screen.findByLabelText("API 密钥"), { target: { value: "sk-x" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+
+    // 部分成功：向导退场，主界面顶部留一条可关闭提示，并带上原因。
+    const notice = await screen.findByText(/未纳入模型清单/);
+    expect(notice.textContent).toContain("disk");
+    expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull();
+
+    // 关闭即清空。
+    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    expect(screen.queryByText(/未纳入模型清单/)).toBeNull();
+  });
+});

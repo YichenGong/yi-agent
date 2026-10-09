@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 /// Default resident subagent capacity, mirrored by
 /// `AgentWorkerFactory::max_resident_subagents`'s default so a factory that does
@@ -187,6 +187,18 @@ impl RuntimeConfig {
     /// .env 加载:显式指定 workdir 时只加载指定目录,fallback 模式合并全局兜底。
     /// fallback 模式下只读取已存在的 `.yi-agent/.env`,不主动创建目录。
     pub fn load(overrides: &ConfigOverrides) -> Result<Self> {
+        Self::load_inner(overrides, false)
+    }
+
+    /// 与 [`load`] 相同，但**允许 API key 缺失**（回空串）。
+    ///
+    /// 桌面侧车在新机器上必须能起来才能提供引导 RPC；缺 key 时按空 key 加载，
+    /// 由调用方先跑引导再真正发起对话。
+    pub fn load_lenient(overrides: &ConfigOverrides) -> Result<Self> {
+        Self::load_inner(overrides, true)
+    }
+
+    fn load_inner(overrides: &ConfigOverrides, allow_missing_key: bool) -> Result<Self> {
         let local_env_path = resolve_env_path(overrides);
         let global_env_path = if is_workdir_explicit(overrides) {
             None
@@ -201,14 +213,16 @@ impl RuntimeConfig {
             .or_else(|| std::env::var("YI_AGENT_PROVIDER").ok())
             .unwrap_or_else(|| "anthropic".to_string());
 
-        let api_key = overrides
+        let api_key = match overrides
             .api_key
             .clone()
             .or_else(|| std::env::var("MODEL_API_KEY").ok())
-            .context("API key required: set MODEL_API_KEY or use --api-key")?;
-        if api_key.is_empty() {
-            bail!("API key is empty: set MODEL_API_KEY or use --api-key");
-        }
+        {
+            Some(key) if !key.is_empty() => key,
+            _ if allow_missing_key => String::new(),
+            Some(_) => bail!("API key is empty: set MODEL_API_KEY or use --api-key"),
+            None => bail!("API key required: set MODEL_API_KEY or use --api-key"),
+        };
 
         let default_api_url = match provider.as_str() {
             "openai" => "https://api.openai.com",
@@ -656,6 +670,35 @@ mod tests {
             msg.contains("API key"),
             "error should mention API key, got: {msg}"
         );
+    }
+
+    #[test]
+    fn load_lenient_allows_a_missing_api_key() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let overrides = ConfigOverrides {
+            workdir: Some(temp.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        };
+        let config = RuntimeConfig::load_lenient(&overrides).expect("lenient load must succeed");
+        assert_eq!(config.api_key, "");
+    }
+
+    #[test]
+    fn load_still_requires_a_key() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let overrides = ConfigOverrides {
+            workdir: Some(temp.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        };
+        assert!(RuntimeConfig::load(&overrides).is_err());
     }
 
     #[test]

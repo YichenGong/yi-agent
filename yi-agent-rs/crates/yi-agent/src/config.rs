@@ -384,6 +384,11 @@ pub fn load(cli: &Cli) -> Result<Config> {
     yi_agent_runtime::config::RuntimeConfig::load(&cli.into())
 }
 
+/// 与 [`load`] 相同，但允许 API key 缺失（桌面侧车首启场景）。
+pub fn load_lenient(cli: &Cli) -> Result<Config> {
+    yi_agent_runtime::config::RuntimeConfig::load_lenient(&cli.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

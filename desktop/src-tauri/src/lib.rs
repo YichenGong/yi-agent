@@ -17,7 +17,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             bridge::rpc,
             bridge::rpc_respond,
-            bridge::set_relay_url
+            bridge::set_relay_url,
+            bridge::restart_sidecar
         ])
         .setup(|app| {
             bridge::spawn(app.handle())?;

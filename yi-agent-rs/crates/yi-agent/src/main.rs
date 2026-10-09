@@ -3,6 +3,7 @@
 mod config;
 mod control_commands;
 mod llm_prefix;
+mod onboarding_prompt;
 mod schedule_intent;
 mod tracing_init;
 mod tui;
@@ -333,7 +334,7 @@ fn format_revoke_result(device_id: &str, removed: bool) -> String {
 /// tracing writes to a file (and to stderr only when `YI_LOG` is set).
 fn run_app_server(cli: Cli) -> Result<()> {
     let mode = app_server_mode(&cli)?;
-    let config = config::load(&cli)?;
+    let config = config::load_lenient(&cli)?;
     let rt = tokio::runtime::Runtime::new()?;
     match mode {
         AppServerMode::Stdio => rt.block_on(yi_agent_app_server::run(
@@ -1296,6 +1297,18 @@ async fn load_permission_checker_for_workdir_async(
 }
 
 fn run_agent(cli: Cli) -> Result<()> {
+    // 首启引导发生在 `config::load` 之前：此时还没有配置，加载器会直接报错。
+    // 落点是全局 `~/.yi-agent/.env`——与桌面 / app-server(`resolve_global_env_path`)
+    // 一致；只有在没有 HOME 时才退回到 workdir 内的本地路径。
+    let env_path =
+        config::resolve_global_env_path().unwrap_or_else(|| config::resolve_env_path(&cli));
+    let prefs_path = env_path.with_file_name("preferences.json");
+    if onboarding_prompt::should_offer(&env_path, &prefs_path) {
+        if let Err(error) = onboarding_prompt::run_onboarding_prompt(&env_path, &prefs_path) {
+            eprintln!("引导未完成：{error}");
+        }
+    }
+
     let config = config::load(&cli)?;
 
     let agent_workdir = config.workdir.clone();
@@ -1598,6 +1611,22 @@ fn build_headless_setup_for_workspace(
     yi_agent_runtime::bootstrap::build_tool_setup_in(config, naked, &workspace)
 }
 
+/// 未配置模型时给 `yi-agent run` 的一句可读指引；就绪则 `None`。
+///
+/// 判定基于 `run` 实际加载出的配置（含全局 `.env`、进程环境变量与 CLI 覆盖），
+/// 避免「桌面/环境变量已配好却被拦下」的误判。
+pub(crate) fn unconfigured_guidance(configured: bool) -> Option<String> {
+    if configured {
+        None
+    } else {
+        Some(
+            "尚未配置模型：请运行 `yi-agent` 完成初始化，或设置 `MODEL_API_KEY` \
+             （如 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`）或使用 `--api-key`。"
+                .to_string(),
+        )
+    }
+}
+
 /// Run agent non-interactively: drain AgentEvent stream to stdout/stderr.
 /// Used for headless CLI usage and end-to-end real-LLM testing.
 fn run_headless(
@@ -1608,7 +1637,11 @@ fn run_headless(
     naked: bool,
     subagents: bool,
 ) -> Result<()> {
-    let config = config::load(&cli)?;
+    let config = config::load_lenient(&cli)?;
+    if let Some(line) = unconfigured_guidance(!config.api_key.trim().is_empty()) {
+        eprintln!("{line}");
+        std::process::exit(1);
+    }
 
     // Resolve prompt: explicit stdin flag > no prompt arg > prompt arg
     let prompt_text = match (from_stdin, prompt) {
@@ -2395,6 +2428,56 @@ mod tests {
     #[test]
     fn parse_listen_accepts_stdio() {
         assert!(matches!(parse_listen("stdio://").unwrap(), Listen::Stdio));
+    }
+
+    #[test]
+    fn run_agent_offers_onboarding_before_loading_config() {
+        // 新机器上 config::load 会因为缺 key 直接失败，引导必须抢在它前面；
+        // 且落点是全局 `.env`（与桌面 / app-server 一致），不是 workdir 内的本地路径。
+        // Needles built from fragments so this test's own source cannot satisfy them.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn run_agent(")
+            .nth(1)
+            .expect("run_agent must exist");
+        let offer = ["onboarding_prompt::should_offer(", "&env_path"].concat();
+        let global = ["config::resolve_global", "_env_path()"].concat();
+        let load = ["config::load(&cli)"].concat();
+        let offer_at = body.find(&offer).expect("run_agent must offer onboarding");
+        let load_at = body.find(&load).expect("run_agent must load config");
+        assert!(
+            offer_at < load_at,
+            "the onboarding prompt must run before config::load"
+        );
+        assert!(
+            body.contains(&global),
+            "onboarding must target the global env path"
+        );
+    }
+
+    #[test]
+    fn app_server_mode_uses_a_lenient_config_load() {
+        // 生产入口缺 key 也必须能起来，否则新机器上引导 RPC 不可达。
+        // Needle built from fragments: a literal here would match the test's own
+        // source line and make this guard vacuously pass.
+        let needle = ["config::load_lenient", "(&cli)"].concat();
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains(&needle),
+            "run_app_server must use the lenient loader"
+        );
+    }
+
+    #[test]
+    fn guidance_is_returned_when_the_env_has_no_model() {
+        let line = unconfigured_guidance(false).expect("must report an unconfigured machine");
+        assert!(line.contains("尚未配置模型"), "got {line}");
+        assert!(line.contains("ANTHROPIC_API_KEY"), "got {line}");
+    }
+
+    #[test]
+    fn no_guidance_when_the_env_is_complete() {
+        assert!(unconfigured_guidance(true).is_none());
     }
 
     #[test]

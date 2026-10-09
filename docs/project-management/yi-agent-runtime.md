@@ -39,4 +39,6 @@
 
 - [x] 机器级模型清单 + 会话级模型解析 — 新增 `src/models.rs`：`ModelProvider`（`src/models.rs:18`，枚举 anthropic|openai）、`ModelEntry`（`:41`）、`ModelCatalog`（`:61`）读写 `~/.yi-agent/models.json`——`models_path`（`:71`）按 `$HOME` 定位、`load_catalog_from`（`:86`）/ `save_catalog_to`（`:138`）读-改-写、临时名逐次唯一、`rename` 原子替换、文件收紧 `0600`，坏条目/整文件不可解析则跳过回退空清单，同名条目拒绝；纯函数 `resolve_effective(cfg, session_override)`（`:209`）按「会话覆盖 > 全局默认 > 原样 cfg」改写 provider/api_url/api_key/model 四字段，`effective_entry`（`:228`）与 `subagent_entry`（`:239`）分别取默认条目与 `subagent_model`；`mask_key`（`:198`）只留尾 4 位；未配置时行为与 `.env`/cfg 完全一致。验证 `cargo test -p yi-agent-runtime --lib models::`（13 例：落盘往返 / 0600 / 不留临时文件 / 坏文件回退 + resolve_effective 三条路径与「只改四字段」）
 
+- [x] 首次安装引导共享逻辑（就绪判定 / 行级保留式 `.env` 写入 / 连接测试 / 结束标记 / 宽松加载）— 新增 `src/onboarding.rs`：`assess`（按 `.env` 字段 + 可选清单判定 `Ready`/`Needed`，纯函数）、`read_env_fields` / `write_model_settings`（行级保留 + 原子写，新建文件收紧 `0600`）、`test_connection`（临时 provider 发一条最小请求，把 `ProviderError` 映射成中文原因；成功 `{ok:true, reason:None}`）、`load_dismissed` / `save_dismissed`（`preferences.json` 结束标记）；`RuntimeConfig::load_lenient`（`src/config.rs`，与 `load` 共用 `load_inner`，允许缺 key 启动供桌面侧车首启）。验证 `cargo test -p yi-agent-runtime --lib onboarding` 与 `cargo test -p yi-agent-runtime --lib config` — [设计](../superpowers/specs/2026-10-09-first-run-onboarding-design.md)
+
 **验证命令：** `cargo test -p yi-agent-runtime`（64 个测试）

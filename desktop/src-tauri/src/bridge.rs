@@ -286,14 +286,25 @@ pub fn set_relay_url(app: AppHandle, url: Option<String>) -> Result<(), String> 
         .map(str::trim)
         .is_some_and(|url| !url.is_empty());
     eprintln!("[sidecar] relay setting saved (configured: {configured}); restarting");
-    restart_sidecar(&app);
+    kill_sidecar(&app);
+    Ok(())
+}
+
+/// 前端引导完成后调用：杀掉当前侧车，让监督循环用刚写入的 `.env` 重新拉起。
+///
+/// 侧车在启动时把 `cfg` 与清单读进内存，所以新写的 `.env` 只有换一个进程才
+/// 生效。这里只杀不拉：监管循环（`spawn`）会自动补上，前端经既有的
+/// `exited → 重新握手` 路径刷回主界面。
+#[tauri::command]
+pub fn restart_sidecar(app: AppHandle) -> Result<(), String> {
+    kill_sidecar(&app);
     Ok(())
 }
 
 /// Kill the current sidecar child so the supervisor loop respawns it with the
 /// freshly persisted settings. An already-dead child is fine (its kill error is
 /// ignored): the supervisor is about to restart it either way.
-fn restart_sidecar(app: &AppHandle) {
+fn kill_sidecar(app: &AppHandle) {
     let taken = app
         .state::<Sidecar>()
         .child

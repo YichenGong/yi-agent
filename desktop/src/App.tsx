@@ -71,6 +71,8 @@ import { estimateCost, formatCost } from "./lib/pricing";
 import { applyTheme, parseTheme, readCachedTheme, type Theme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
+import { OnboardingWizard, type OnboardingOutcome } from "./components/OnboardingWizard";
+import { onboardingStatus } from "./lib/onboarding";
 
 /**
  * 看板失败的四种说法。
@@ -113,6 +115,21 @@ function sendMethodMismatchCode(e: unknown): number | null {
   return code === -32013 || code === -32012 ? code : null;
 }
 
+/**
+ * 引导写盘后重启侧车，让新 `.env` 生效（侧车启动时把 `cfg`/清单读进内存）。
+ * 远端/网页客户端没有 Tauri 也没有侧车，直接跳过；重启失败也不阻塞——配置
+ * 已在磁盘上，宿主重启后自然生效。
+ */
+async function restartSidecar() {
+  if (isRemoteClient()) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("restart_sidecar");
+  } catch {
+    // 见上：失败不阻塞。
+  }
+}
+
 export default function App() {
   // Per-thread state lives in a mutable store; the `force` tick is how React
   // learns that a view changed (the views are mutated in place, not setState'd).
@@ -140,6 +157,15 @@ export default function App() {
   // Approvals the user has dismissed from the banner; keyed by approval id.
   const dismissedApprovals = useRef(new Set<string>());
   const [currentId, setCurrentId] = useState<string | null>(null);
+  // 首启引导：`needed && !dismissed` 时用向导盖住主界面。读失败一律按「不需要」
+  // 处理，绝不因为一个读失败挡住主界面（见 handshake）。
+  const [onboarding, setOnboarding] = useState<{ needed: boolean; reasons: string[] }>({
+    needed: false,
+    reasons: [],
+  });
+  // 部分成功提示（spec §4.7）：`.env` 写成功、但清单未收边时在主界面顶部留一条
+  // 可关闭横幅。`null` = 无提示；关闭即清空。完整成功不设此项。
+  const [onboardingNotice, setOnboardingNotice] = useState<string | null>(null);
   // 每个会话待发送的附件。按会话隔离，与草稿同理：切走时留在原会话、切回时
   // 原样出现，绝不会把 A 的附件发到 B 上。
   const [pending, setPending] = useState<Record<string, PendingAttachment[]>>({});
@@ -1132,6 +1158,16 @@ export default function App() {
         if (!watchmanTouchedRef.current) {
           setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
         }
+        // 首启引导：读不到状态(宿主老、RPC 报错、字段缺失)一律按「不需要」处理，
+        // 绝不因为一个读失败弹向导、更不挡住主界面。
+        try {
+          const status = await onboardingStatus((m, p) =>
+            (clientRef.current as RpcClient).request(m, p),
+          );
+          setOnboarding({ needed: status.needed && !status.dismissed, reasons: status.reasons });
+        } catch {
+          setOnboarding({ needed: false, reasons: [] });
+        }
         await refreshWorkspaces();
         const list = await client.request<{
           groups: WorkspaceGroup[];
@@ -1511,8 +1547,48 @@ export default function App() {
 
   return (
     <>
+      {onboarding.needed && (
+        <OnboardingWizard
+          reasons={onboarding.reasons}
+          call={(m, p) => (clientRef.current as RpcClient).request(m, p)}
+          onDone={(result?: OnboardingOutcome) => {
+            setOnboarding({ needed: false, reasons: [] });
+            // `.env` 已写、清单没收边（部分成功）：主界面顶部留一条可关闭提示，
+            // 别让用户在「已保存」与「模型仍不可用」之间一头雾水。
+            if (result && !result.imported) {
+              setOnboardingNotice(
+                "已保存到 .env，但未纳入模型清单（可稍后在设置里点「导入当前配置」）" +
+                  (result.importError ? `：${result.importError}` : ""),
+              );
+            }
+            // 新配置要重启侧车才生效（cfg/清单在启动时读入）。宿主重启后会经
+            // 既有 exited → 重新握手路径刷回来；顺带尽力刷一次模型清单。
+            void restartSidecar();
+            void modelCall("model/list", {}).catch(() => {});
+          }}
+        />
+      )}
       <div className="app-shell flex h-screen flex-col bg-surface text-fg">
         <TitleBar />
+        {/* 引导部分成功的提示（spec §4.7）：可关闭的顶部横幅，样式与 ApprovalBanner
+            一致；关闭即清空状态，不再出现。 */}
+        {onboardingNotice !== null && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex flex-wrap items-center gap-3 border-b border-amber-900/60 bg-amber-950/60 px-3 py-2 text-xs text-amber-100"
+          >
+            <span className="min-w-0">{onboardingNotice}</span>
+            <button
+              type="button"
+              onClick={() => setOnboardingNotice(null)}
+              aria-label="关闭提示"
+              className="ml-auto rounded px-1 text-amber-300 hover:text-amber-100"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <div className="flex min-h-0 flex-1 flex-row">
         {isMobile && (
           <button
