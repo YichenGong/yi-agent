@@ -2555,24 +2555,34 @@ If a restart command already exists, use it. If only `set_relay_url` triggers a 
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to `desktop/src/App.test.tsx` (follow the existing harness in that file for constructing `App` and a fake transport/RPC):
+Add to `desktop/src/App.test.tsx`, next to the other `it(...)` cases. The harness in that file provides `state.dataSources` (per-method response override, via the mocked `RpcClient`) and `clients[0].requests` for assertions:
 
 ```tsx
   it("shows the onboarding wizard when the host reports needed", async () => {
-    // 让 onboarding/status 回 needed=true，断言向导出现（例如欢迎标题）。
-    // 具体接线按本文件既有的假 transport/RPC 模式写。
-    // ...arrange: rpc 对 onboarding/status 回 {needed:true,dismissed:false,reasons:[]}
-    // ...act: 渲染 App 并等握手完成
-    // ...assert: await screen.findByText("欢迎使用 Yi-Agent")
+    state.dataSources["onboarding/status"] = () => ({
+      needed: true,
+      dismissed: false,
+      reasons: ["api_key"],
+    });
+    render(<App />);
+    // 握手完成后向导应盖住主界面。
+    expect(await screen.findByText("欢迎使用 Yi-Agent")).toBeTruthy();
   });
 
   it("skips the wizard when the host reports ready", async () => {
-    // onboarding/status 回 {needed:false,...}，断言向导不出现、主界面可见。
-    // ...assert: expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull()
+    state.dataSources["onboarding/status"] = () => ({
+      needed: false,
+      dismissed: false,
+      reasons: [],
+    });
+    render(<App />);
+    // 等到握手真正走完（resume 已发出），向导仍不出现。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull();
   });
 ```
-
-Fill these in against the file's existing patterns (do not invent a new harness).
 
 - [ ] **Step 2: Run to verify it fails**
 
