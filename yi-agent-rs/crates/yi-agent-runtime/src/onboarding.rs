@@ -305,7 +305,10 @@ pub async fn test_connection(settings: &ModelSettings) -> ConnectionOutcome {
         "openai" => match yi_agent_llm::OpenaiProvider::new(yi_agent_llm::OpenaiProviderOpts {
             base_url: Some(settings.api_url.clone()),
             api_key: Some(settings.api_key.clone()),
-            ..Default::default()
+            // 探测只等一小会儿（spec §5 建议 ~15s）：默认 300s 会让「地址写错」
+            // 看起来像界面卡死。三个字段至此全部指定，`..Default::default()`
+            // 会成为无效果的 struct update（clippy::needless_update），故去掉。
+            timeout: Some(std::time::Duration::from_secs(15)),
         }) {
             Ok(p) => std::sync::Arc::new(p),
             Err(error) => return failure(error),
@@ -313,6 +316,8 @@ pub async fn test_connection(settings: &ModelSettings) -> ConnectionOutcome {
         _ => match yi_agent_llm::AnthropicProvider::new(yi_agent_llm::AnthropicProviderOpts {
             base_url: Some(settings.api_url.clone()),
             api_key: Some(settings.api_key.clone()),
+            // 同 openai 分支：探测的等待上限同为 15s。
+            timeout: Some(std::time::Duration::from_secs(15)),
             ..Default::default()
         }) {
             Ok(p) => std::sync::Arc::new(p),

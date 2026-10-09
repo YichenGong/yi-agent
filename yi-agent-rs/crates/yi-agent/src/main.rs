@@ -1620,8 +1620,8 @@ pub(crate) fn unconfigured_guidance(configured: bool) -> Option<String> {
         None
     } else {
         Some(
-            "尚未配置模型：请运行 `yi-agent` 完成初始化，或设置环境变量 \
-             ANTHROPIC_API_KEY（或 OPENAI_API_KEY）。"
+            "尚未配置模型：请运行 `yi-agent` 完成初始化，或设置 `MODEL_API_KEY` \
+             （如 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`）或使用 `--api-key`。"
                 .to_string(),
         )
     }
