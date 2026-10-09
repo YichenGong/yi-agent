@@ -2833,3 +2833,30 @@ describe("App 附件接线", () => {
     });
   });
 });
+
+describe("App first-run onboarding gate", () => {
+  it("shows the onboarding wizard when the host reports needed", async () => {
+    state.dataSources["onboarding/status"] = () => ({
+      needed: true,
+      dismissed: false,
+      reasons: ["api_key"],
+    });
+    render(<App />);
+    // 握手完成后向导应盖住主界面。
+    expect(await screen.findByText("欢迎使用 Yi-Agent")).toBeTruthy();
+  });
+
+  it("skips the wizard when the host reports ready", async () => {
+    state.dataSources["onboarding/status"] = () => ({
+      needed: false,
+      dismissed: false,
+      reasons: [],
+    });
+    render(<App />);
+    // 等到握手真正走完（resume 已发出），向导仍不出现。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull();
+  });
+});
