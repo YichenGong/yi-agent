@@ -1613,17 +1613,17 @@ fn build_headless_setup_for_workspace(
 
 /// 未配置模型时给 `yi-agent run` 的一句可读指引；就绪则 `None`。
 ///
-/// 非交互入口不能弹问答，但也不该甩 provider 内部错误。
-pub(crate) fn unconfigured_guidance(env_path: &std::path::Path) -> Option<String> {
-    use yi_agent_runtime::onboarding::{Assessment, assess, read_env_fields};
-    let env = read_env_fields(env_path).unwrap_or_default();
-    match assess(&env, None) {
-        Assessment::Ready { .. } => None,
-        Assessment::Needed { .. } => Some(
+/// 判定基于 `run` 实际加载出的配置（含全局 `.env`、进程环境变量与 CLI 覆盖），
+/// 避免「桌面/环境变量已配好却被拦下」的误判。
+pub(crate) fn unconfigured_guidance(configured: bool) -> Option<String> {
+    if configured {
+        None
+    } else {
+        Some(
             "尚未配置模型：请运行 `yi-agent` 完成初始化，或设置环境变量 \
              ANTHROPIC_API_KEY（或 OPENAI_API_KEY）。"
                 .to_string(),
-        ),
+        )
     }
 }
 
@@ -1637,13 +1637,11 @@ fn run_headless(
     naked: bool,
     subagents: bool,
 ) -> Result<()> {
-    let env_path = config::resolve_env_path(&cli);
-    if let Some(line) = unconfigured_guidance(&env_path) {
+    let config = config::load_lenient(&cli)?;
+    if let Some(line) = unconfigured_guidance(!config.api_key.trim().is_empty()) {
         eprintln!("{line}");
         std::process::exit(1);
     }
-
-    let config = config::load(&cli)?;
 
     // Resolve prompt: explicit stdin flag > no prompt arg > prompt arg
     let prompt_text = match (from_stdin, prompt) {
@@ -2472,23 +2470,14 @@ mod tests {
 
     #[test]
     fn guidance_is_returned_when_the_env_has_no_model() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let env = dir.path().join(".env");
-        let line = unconfigured_guidance(&env).expect("must report an unconfigured machine");
+        let line = unconfigured_guidance(false).expect("must report an unconfigured machine");
         assert!(line.contains("尚未配置模型"), "got {line}");
         assert!(line.contains("ANTHROPIC_API_KEY"), "got {line}");
     }
 
     #[test]
     fn no_guidance_when_the_env_is_complete() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let env = dir.path().join(".env");
-        std::fs::write(
-            &env,
-            "YI_AGENT_PROVIDER=openai\nYI_AGENT_MODEL=gpt-4o\nMODEL_API_KEY=sk-x\n",
-        )
-        .unwrap();
-        assert!(unconfigured_guidance(&env).is_none());
+        assert!(unconfigured_guidance(true).is_none());
     }
 
     #[test]
