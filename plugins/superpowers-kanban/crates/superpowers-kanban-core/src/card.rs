@@ -88,6 +88,11 @@ impl CardState {
             // 合并轮由卡片原会话里的一轮 turn 执行，故这一步是「人已发话」的记录。
             (AwaitingMerge, Merging) => true,
             (NeedsYou, Merging) => true,
+            // 用户在一张**正在跑**的实现卡上发话要求合并：宿主对账可能已先
+            // 把 awaiting_merge 的卡翻回 running（见 2026-10-03 看板状态误判），
+            // 不放行这条边则合并名额永远申请不到。反向的 merging → running
+            // 仍不合法（见下方 `_ => false`）：合并阶段不回流会话通路。
+            (Running, Merging) => true,
             (Running, NeedsYou) => true,
             (Running, Failed) => true,
             (Running, Paused) => true,
@@ -302,8 +307,21 @@ mod tests {
         assert!(Merging.can_transition_to(NeedsYou));
         // 合并阶段不占会话槽位（口径不变）。
         assert!(!Merging.occupies_slot());
-        // 未到 awaiting_merge/needs_you 的卡不得直接进 merging。
-        assert!(!Running.can_transition_to(Merging));
+        // 未到「等待验收/等人决定/正在跑」的卡不得直接进 merging。
         assert!(!Paused.can_transition_to(Merging));
+        // 正在跑的卡**可以**进 merging（用户发话触发合并轮，见
+        // `a_running_card_may_enter_the_merge_stage_when_the_user_asks`）。
+        assert!(Running.can_transition_to(Merging));
+    }
+
+    #[test]
+    fn a_running_card_may_enter_the_merge_stage_when_the_user_asks() {
+        use CardState::*;
+        // 用户在一张正在跑的实现卡上发话要求合并：宿主对账可能已先把
+        // awaiting_merge 的卡翻回 running，此时仍必须能进 merging，
+        // 否则合并名额永远申请不到（本 bug 的核心）。
+        assert!(Running.can_transition_to(Merging));
+        // 合并阶段绝不回流会话通路。
+        assert!(!Merging.can_transition_to(Running));
     }
 }

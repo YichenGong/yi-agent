@@ -481,9 +481,18 @@ impl BoardService {
         let Some(card) = inner.board.get(&id).cloned() else {
             return Ok(MergeRequest::Denied(format!("unknown card: {card_id}")));
         };
-        if !matches!(card.state, CardState::AwaitingMerge | CardState::NeedsYou) {
+        // 准入：等待验收、需要用户决定、以及**正在跑**的卡都可以申请名额。
+        // 正在跑也要接受，是因为合并已改为「原会话里发话触发」——用户发话本身
+        // 会让会话变忙，宿主对账随即把卡翻回 running；若这里仍拒绝 running，
+        // 合并就永远申请不到名额（本 bug）。真正的闸是「用户显式发话」
+        // （只有 CLI/skill 会调 merge_request，宿主从不自动调）、source 分支存在、
+        // 以及每项目一把 merge.lock。
+        if !matches!(
+            card.state,
+            CardState::AwaitingMerge | CardState::NeedsYou | CardState::Running
+        ) {
             return Ok(MergeRequest::Denied(format!(
-                "card {card_id} is {:?}, not awaiting_merge/needs_you",
+                "card {card_id} is {:?}, not awaiting_merge/needs_you/running",
                 card.state
             )));
         }
@@ -1239,6 +1248,47 @@ mod tests {
             }
             other => panic!("expected Denied on second request, got {other:?}"),
         }
+    }
+
+    /// 一张正在跑的实现卡（宿主对账已把它翻回 running）：用户发话要求合并
+    /// 仍应拿到名额。这是本 bug 的回归锁。
+    #[test]
+    fn merge_request_grants_for_a_running_card_whose_session_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // 走生产路径：启动 → awaiting_merge → 会话又忙（对账翻回 running）。
+        service.mark_running("card-1", "thread-1").unwrap();
+        service
+            .mark_terminal("card-1", "awaiting_merge", None)
+            .unwrap();
+        service.mark_running("card-1", "thread-1").unwrap();
+        assert_eq!(state_of(&service, "card-1"), "running");
+
+        let slug = crate::worktree::slugify(&CardId::new("card-1"));
+        let source = format!("kanban/{slug}");
+        git_run(&project, &["branch", &source]);
+
+        match service.merge_request("card-1").unwrap() {
+            MergeRequest::Granted {
+                source: s, base, ..
+            } => {
+                assert_eq!(s, source);
+                assert_eq!(base, "main");
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        assert_eq!(state_of(&service, "card-1"), "merging");
+        // 已在 merging 的卡绝不能回流会话通路：宿主对账即便把卡报成 running，
+        // 这条迁移也会被状态机拒绝。额度已由卡片状态钉住（第二次申请会因卡不在
+        // 准入集而被拒），此处不再补一次 `merge_request`——那会依赖 flock 释放的
+        // 时序（macOS 上 drop 后释放有延迟，既有 `lease.rs` 用例亦因此偶发），
+        // 把本用例变成 flaky。
+        assert!(
+            !superpowers_kanban_core::card::CardState::Merging
+                .can_transition_to(superpowers_kanban_core::card::CardState::Running),
+            "merging → running 必须非法，否则合并中会被对账翻回会话"
+        );
     }
 
     #[test]
