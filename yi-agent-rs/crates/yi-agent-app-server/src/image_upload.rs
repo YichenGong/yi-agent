@@ -247,9 +247,31 @@ impl UploadRegistry {
     }
 
     /// `turn/start` 的反查入口：已 commit 的返回其附件，否则 `None`。
+    ///
+    /// **只认 id、不认归属**，故不能用于 `turn/start`：`uploadId` 是不透明句柄，
+    /// 仅凭它就能取到附件会让任何知道/猜到该 id 的客户端把别的 thread 的图塞进
+    /// 自己的 thread（跨 thread 取数）。生产路径一律走 [`Self::resolve_for`]；
+    /// 本方法保留给「与归属无关」的测试断言（如 TTL 清理后记录确实消失）。
     pub fn resolve(&self, upload_id: &str) -> Option<Attachment> {
         match self.sessions.get(upload_id).map(|s| &s.state) {
             Some(UploadState::Committed(attachment)) => Some(attachment.clone()),
+            _ => None,
+        }
+    }
+
+    /// `turn/start` 的反查入口（带归属）：只有当会话属于 `thread_id` 且已 commit
+    /// 时返回其附件，否则 `None`。
+    ///
+    /// 归属检查与 `commit` 同源（`session.thread_id != thread_id` 即拒），是
+    /// **跨 thread 取数**的闸：`uploadId` 由客户端持有，若反查不看归属，客户端就能
+    /// 把别条 thread 的已上传图片摄进自己起的 turn。
+    pub fn resolve_for(&self, upload_id: &str, thread_id: &str) -> Option<Attachment> {
+        let session = self.sessions.get(upload_id)?;
+        if session.thread_id != thread_id {
+            return None;
+        }
+        match &session.state {
+            UploadState::Committed(attachment) => Some(attachment.clone()),
             _ => None,
         }
     }
@@ -272,6 +294,27 @@ impl UploadRegistry {
                     );
                 }
             }
+        }
+    }
+
+    /// `thread/delete` 的收尾：摘掉属于该 thread 的**全部**会话（含已 commit、
+    /// 尚在 TTL 内的记录），未 commit 的顺带删掉其 staging 文件——与 [`Self::abort`]
+    /// 同一条规则，**不动**已落盘的附件（它随 `remove_attachments` 与 thread 同一
+    /// 生命周期收走）。
+    ///
+    /// 不 prune 的话：一条 `Committed` 记录会活到 10 分钟 TTL，让被删 thread 的
+    /// `uploadId` 仍能反查到一份已被删掉的工作区路径（随后 `prepare_image_file`
+    /// 读一个不存在的文件而失败）；未 commit 的 staging 槽与进程级会话名额也会被
+    /// 死 thread 白占。只需内存状态与记录里已存的 staging 路径，故不必拿到 cwd。
+    pub fn drop_thread(&mut self, thread_id: &str) {
+        let doomed: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.thread_id == thread_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in doomed {
+            self.abort(&id);
         }
     }
 
@@ -515,6 +558,72 @@ mod tests {
         assert_eq!(reg.len(), 0);
         assert!(reg.resolve(&id).is_none());
         assert!(reg.append(&id, 0, b"x").is_err());
+    }
+
+    /// `resolve_for` 是 `turn/start` 的入口：归属不符一律 `None`（跨 thread 取数的闸），
+    /// 归属相符且已 commit 才给附件。
+    #[test]
+    fn resolve_for_refuses_another_threads_upload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut reg = UploadRegistry::new();
+        let bytes = png_bytes(8, 8);
+        let id = reg
+            .begin(tmp.path(), "t1", "shot.png", bytes.len() as u64)
+            .unwrap();
+        // 未 commit：即便归属相符也解析不到。
+        assert!(reg.resolve_for(&id, "t1").is_none());
+        reg.append(&id, 0, &bytes).unwrap();
+        let att = reg.commit(tmp.path(), "t1", &id).unwrap();
+
+        assert_eq!(reg.resolve_for(&id, "t1").as_ref(), Some(&att));
+        assert!(
+            reg.resolve_for(&id, "t2").is_none(),
+            "another thread must not resolve this upload"
+        );
+        assert!(
+            reg.resolve(&id).is_some(),
+            "resolve (ownership-blind) is only for tests"
+        );
+    }
+
+    /// `drop_thread` 摘掉该 thread 的全部会话（未 commit 的连 staging 一起删），
+    /// 且**不动**已落盘的附件；别条 thread 的会话原封不动。
+    #[test]
+    fn drop_thread_prunes_only_that_threads_sessions_and_their_staging() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut reg = UploadRegistry::new();
+        // t1：一条收了一半的 + 一条已 commit 的。
+        let half = reg.begin(tmp.path(), "t1", "half.png", 6).unwrap();
+        reg.append(&half, 0, b"abc").unwrap();
+        let bytes = png_bytes(8, 8);
+        let done = reg
+            .begin(tmp.path(), "t1", "shot.png", bytes.len() as u64)
+            .unwrap();
+        reg.append(&done, 0, &bytes).unwrap();
+        let att = reg.commit(tmp.path(), "t1", &done).unwrap();
+        // 另一条 thread 的会话必须在 prune 后存活。
+        let other = reg.begin(tmp.path(), "t2", "y.png", 4).unwrap();
+
+        reg.drop_thread("t1");
+
+        assert!(
+            reg.resolve(&half).is_none(),
+            "receiving record must be gone"
+        );
+        assert!(
+            reg.resolve(&done).is_none(),
+            "committed record must be gone"
+        );
+        assert!(
+            !staging_of(tmp.path(), "t1", &half).exists(),
+            "the uncommitted session's staging file must be removed"
+        );
+        assert!(
+            tmp.path().join(&att.path).is_file(),
+            "the already-stored attachment must survive (same rule as abort)"
+        );
+        assert_eq!(reg.len(), 1, "only t2's session may remain");
+        reg.append(&other, 0, b"abcd").unwrap();
     }
 
     #[test]

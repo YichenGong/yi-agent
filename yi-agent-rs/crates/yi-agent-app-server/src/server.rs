@@ -4127,6 +4127,13 @@ where
                         if let Some(cwd) = thread_store.root().parent().and_then(|p| p.parent()) {
                             crate::attachments::remove_attachments(cwd, &thread_id);
                         }
+                        // 上传登记表也随 thread 一起 prune：否则一条 `Committed`
+                        // 记录会活到 10 分钟 TTL，让被删 thread 的 `uploadId` 仍能
+                        // 反查到已被删掉的附件路径（随后 `prepare_image_file` 读空），
+                        // 未 commit 的 staging 槽与进程级会话名额也被死 thread 白占。
+                        // `drop_thread` 只需内存与每条会话已记的 staging 路径，故这里
+                        // 拿不到 cwd 也无妨（已落盘的附件由上面 `remove_attachments` 收）。
+                        uploads.drop_thread(&thread_id);
                         // 会话文件已摘除：按判定处置 worktree。删除失败只记日志，不阻断会话删除（D9）。
                         // board_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
                         // 但失败这件事本身必须回报：用户刚被告知该 worktree 会被删掉，此刻会话
@@ -7020,7 +7027,11 @@ async fn prepare_turn_core(
             }
             crate::attachments::ImageInput::Upload(upload_id) => {
                 // 未 commit / 未知 / 已过期都落到这里，报同一条「无法解析」。
-                match uploads.resolve(upload_id) {
+                //
+                // 反查必须带 `thread_id`：`uploadId` 是客户端手里的不透明句柄，
+                // 只看 id 不看归属，就能把别条 thread 的图摄进本 turn（跨 thread
+                // 取数）。归属不符与「未知」报同一条错，不向调用方区分两者。
+                match uploads.resolve_for(upload_id, &thread_id) {
                     Some(attachment) => (upload_id.clone(), attachment),
                     None => {
                         return Err(TurnPrepareError::InvalidAttachment(format!(
@@ -11536,6 +11547,115 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 跨会话守卫:为 thread A 上传并 commit 的图,**不能**凭一个 `uploadId` 被摄进
+    /// thread B。`uploadId` 只是不透明的句柄,若反查只认 id 不认归属,任何知道/猜到
+    /// 该 id 的客户端就能把别人的会话里的图塞进自己的会话(跨会话取数)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uploaded_image_cannot_be_ingested_into_another_thread() {
+        use base64::Engine as _;
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid_a = start_thread(&mut h).await;
+        let tid_b = start_thread(&mut h).await;
+
+        let bytes = write_a_re_encodable_png_into_memory();
+        let total = bytes.len() as u64;
+        let begin = rpc(
+            &mut h,
+            20,
+            "image/upload/begin",
+            serde_json::json!({
+                "threadId": tid_a, "name": "shot.png", "mime": "image/png", "size": total
+            }),
+        )
+        .await;
+        let upload_id = begin["result"]["uploadId"]
+            .as_str()
+            .expect("begin must return an uploadId")
+            .to_string();
+        let step = bytes.len().div_ceil(3);
+        for (i, part) in bytes.chunks(step).enumerate() {
+            let data = base64::engine::general_purpose::STANDARD.encode(part);
+            let resp = rpc(
+                &mut h,
+                21 + i as u64,
+                "image/upload/chunk",
+                serde_json::json!({ "uploadId": upload_id, "index": i, "data": data }),
+            )
+            .await;
+            assert!(resp.get("error").is_none(), "chunk {i}: {resp}");
+        }
+        let commit = rpc(
+            &mut h,
+            30,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": upload_id }),
+        )
+        .await;
+        assert!(commit.get("error").is_none(), "{commit}");
+
+        // thread B 用 A 的 uploadId 起 turn:必须被拒,且一个 turn 都不起。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"turn/start","params":{{"threadId":"{tid_b}","input":[{{"type":"uploaded_image","uploadId":"{upload_id}"}},{{"type":"text","text":"steal"}}]}}}}"#
+        ))
+        .await;
+        let mut methods_before: Vec<String> = Vec::new();
+        let mut resp: Option<serde_json::Value> = None;
+        for _ in 0..16 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(31)) {
+                resp = Some(v);
+                break;
+            }
+            if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
+                methods_before.push(m.to_string());
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        assert!(
+            resp.get("error").is_some(),
+            "another thread's upload must be refused: {resp}"
+        );
+        assert!(
+            methods_before.is_empty(),
+            "no turn may start: {methods_before:?}"
+        );
+        assert!(
+            !workdir
+                .path()
+                .join(".yi-agent/attachments")
+                .join(&tid_b)
+                .exists(),
+            "thread B must not receive thread A's image"
+        );
+
+        // 正控:A 自己仍能正常摄取这张图。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":32,"method":"turn/start","params":{{"threadId":"{tid_a}","input":[{{"type":"uploaded_image","uploadId":"{upload_id}"}},{{"type":"text","text":"mine"}}]}}}}"#
+        ))
+        .await;
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..16 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") {
+                opener = Some(v["params"]["item"].clone());
+                break;
+            }
+        }
+        let item = opener.expect("thread A must open with an item");
+        assert_eq!(item["type"], "userMessage", "{item}");
+        assert_eq!(
+            item["images"][0]["path"]
+                .as_str()
+                .map(|p| p.starts_with(&format!(".yi-agent/attachments/{tid_a}/"))),
+            Some(true),
+            "thread A must ingest its own upload: {item}"
+        );
+        h.shutdown().await;
+    }
+
     /// 上传的边界:乱序块、越界块、超 20 MiB 的声明都要被拒(错误响应,不 panic)。
     #[tokio::test(flavor = "multi_thread")]
     async fn image_upload_refuses_out_of_order_oversized_and_too_large_uploads() {
@@ -11706,6 +11826,114 @@ pub(crate) mod tests {
         )
         .await;
         assert!(commit.get("error").is_some(), "{commit}");
+        h.shutdown().await;
+    }
+
+    /// `thread/delete` 必须连带prune 该 thread 的上传登记。否则一条 `Receiving`
+    /// 记录会带着它的 staging 槽一直活到 10 分钟 TTL,进程级会话名额被死 thread
+    /// 占着;该 `uploadId` 也仍被当成「这个 thread 的未完成上传」而非「未知」。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_thread_prunes_its_image_upload_sessions() {
+        use base64::Engine as _;
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 一条收了一半的会话(有 staging 文件、未 commit)……
+        let begin = rpc(
+            &mut h,
+            80,
+            "image/upload/begin",
+            serde_json::json!({ "threadId": tid, "name": "half.png", "size": 6 }),
+        )
+        .await;
+        let half_id = begin["result"]["uploadId"].as_str().unwrap().to_string();
+        rpc(
+            &mut h,
+            81,
+            "image/upload/chunk",
+            serde_json::json!({
+                "uploadId": half_id, "index": 0,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"abc"),
+            }),
+        )
+        .await;
+        // ……和一条已 commit 的会话(记录仍在,`turn/start` 靠它反查)。
+        let bytes = write_a_re_encodable_png_into_memory();
+        let begin = rpc(
+            &mut h,
+            82,
+            "image/upload/begin",
+            serde_json::json!({
+                "threadId": tid, "name": "shot.png", "mime": "image/png", "size": bytes.len(),
+            }),
+        )
+        .await;
+        let done_id = begin["result"]["uploadId"].as_str().unwrap().to_string();
+        rpc(
+            &mut h,
+            83,
+            "image/upload/chunk",
+            serde_json::json!({
+                "uploadId": done_id, "index": 0,
+                "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }),
+        )
+        .await;
+        let commit = rpc(
+            &mut h,
+            84,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": done_id }),
+        )
+        .await;
+        assert!(commit.get("error").is_none(), "{commit}");
+
+        let staging = |id: &str| {
+            workdir
+                .path()
+                .join(".yi-agent/attachments")
+                .join(&tid)
+                .join(".tmp")
+                .join(id)
+        };
+        assert!(
+            staging(&half_id).is_file(),
+            "staging must exist before delete"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":90,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(90)) {
+                assert!(v.get("error").is_none(), "delete must succeed: {v}");
+                break;
+            }
+        }
+
+        // 收了一半的会话必须已被 prune:此刻该 id 是**未知**上传(记录已随 thread
+        // 一起消失),而不是「这条 thread 的未完成上传」——后者说明记录还活着。
+        let after = rpc(
+            &mut h,
+            91,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": half_id }),
+        )
+        .await;
+        let err = after["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("upload"),
+            "the deleted thread's upload must be unknown, got: {after}"
+        );
+        assert!(
+            !staging(&half_id).exists(),
+            "staging must be gone after delete"
+        );
         h.shutdown().await;
     }
 
