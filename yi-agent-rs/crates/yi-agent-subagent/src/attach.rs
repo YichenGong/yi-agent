@@ -140,7 +140,10 @@ fn build_worker_factory(
     .with_workspace(effective.workdir.clone())
     // The configured capacity must reach the coordinator; without this the
     // factory reports the trait default and the env var is inert.
-    .with_max_resident_subagents(effective.max_resident_subagents))
+    .with_max_resident_subagents(effective.max_resident_subagents)
+    // Same reasoning for the direct-child limit: skipping this silently yields
+    // the trait default and makes YI_AGENT_MAX_DIRECT_CHILDREN inert.
+    .with_max_direct_children(usize::from(effective.max_direct_children)))
 }
 
 /// Test-only seam: load a catalog from an explicit path instead of `HOME`, so a
@@ -423,6 +426,7 @@ mod tests {
             model: "base-model".into(),
             max_turns: 4,
             max_resident_subagents: 8,
+            max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
             workdir: workdir.to_path_buf(),
             system_prompt: None,
             compact_threshold: 160_000,
@@ -537,6 +541,7 @@ mod tests {
             model: "test-model".into(),
             max_turns: 4,
             max_resident_subagents: 8,
+            max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
             workdir: directory.path().to_path_buf(),
             system_prompt: None,
             compact_threshold: 160_000,
@@ -557,6 +562,45 @@ mod tests {
             factory.max_resident_subagents(),
             8,
             "the configured capacity must reach the factory, not the trait default"
+        );
+    }
+
+    /// The configured direct-child limit must survive the trip through the
+    /// factory: this is what makes `YI_AGENT_MAX_DIRECT_CHILDREN` effective in
+    /// the daemon instead of inert. A regression that drops the
+    /// `with_max_direct_children` chain in `worker_factory` fails this with 4
+    /// against 3.
+    #[test]
+    fn the_configured_direct_child_limit_reaches_the_worker_factory() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let cfg = yi_agent_runtime::config::RuntimeConfig {
+            provider: "anthropic".into(),
+            api_url: "https://api.anthropic.com".into(),
+            api_key: String::new(),
+            model: "test-model".into(),
+            max_turns: 4,
+            max_resident_subagents: 8,
+            max_direct_children: 3,
+            workdir: directory.path().to_path_buf(),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::default(),
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: true,
+        };
+        let socket = directory.path().join("runtime.sock");
+
+        let factory = worker_factory(&cfg, socket).expect("factory");
+
+        assert_eq!(
+            factory.max_direct_children(),
+            3,
+            "the configured limit must reach the factory, not the trait default"
         );
     }
 

@@ -64,6 +64,9 @@ pub struct DaemonAgentWorkerFactory {
     /// consume it. Defaults to [`yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT`]
     /// so a construction path that omits the builder is unchanged.
     max_resident_subagents: u16,
+    /// Direct-child limit passed to each supervisor this daemon creates.
+    /// Defaults to [`yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT`].
+    max_direct_children: usize,
 }
 
 impl DaemonAgentWorkerFactory {
@@ -85,6 +88,7 @@ impl DaemonAgentWorkerFactory {
             recovery_workspace: None,
             catalog: None,
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
+            max_direct_children: usize::from(yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT),
         }
     }
 
@@ -130,6 +134,14 @@ impl DaemonAgentWorkerFactory {
     /// trait default. Roots do not consume it.
     pub fn with_max_resident_subagents(mut self, max_resident_subagents: u16) -> Self {
         self.max_resident_subagents = max_resident_subagents;
+        self
+    }
+
+    /// Configures how many non-terminal direct children one agent may own, so
+    /// the configured value reaches the coordinator rather than the trait
+    /// default.
+    pub fn with_max_direct_children(mut self, max_direct_children: usize) -> Self {
+        self.max_direct_children = max_direct_children;
         self
     }
 
@@ -470,6 +482,10 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
 
     fn max_resident_subagents(&self) -> u16 {
         self.max_resident_subagents
+    }
+
+    fn max_direct_children(&self) -> usize {
+        self.max_direct_children
     }
 
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
@@ -2474,12 +2490,12 @@ mod tests {
     fn ipc_rejection_formatter_includes_error_message() {
         let response = IpcResponse::Error {
             code: yi_agent_store::ipc::IpcErrorCode::InvalidState,
-            message: Some("an agent may have at most four direct children".into()),
+            message: Some("an agent may have at most 4 direct children".into()),
         };
 
         assert_eq!(
             format_ipc_rejection("spawn request", &response),
-            "daemon rejected spawn request: invalid_state: an agent may have at most four direct children"
+            "daemon rejected spawn request: invalid_state: an agent may have at most 4 direct children"
         );
     }
 

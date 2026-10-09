@@ -13,6 +13,11 @@ use anyhow::{Context, Result, bail};
 /// not override it and a config that does not set it agree.
 pub const RESIDENT_SUBAGENTS_DEFAULT: u16 = 64;
 
+/// Default direct-child limit, mirrored by
+/// `AgentWorkerFactory::max_direct_children`'s default so a factory that does
+/// not override it and a config that does not set it agree.
+pub const DIRECT_CHILDREN_DEFAULT: u16 = 4;
+
 /// 运行时配置,由调用方覆盖项和环境变量合并而来。
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -24,6 +29,9 @@ pub struct RuntimeConfig {
     /// Resident subagent capacity for the daemon this config starts. Roots do not
     /// consume it. Defaults to [`RESIDENT_SUBAGENTS_DEFAULT`].
     pub max_resident_subagents: u16,
+    /// How many non-terminal direct children one agent may own. Defaults to
+    /// [`DIRECT_CHILDREN_DEFAULT`].
+    pub max_direct_children: u16,
     pub workdir: PathBuf,
     pub system_prompt: Option<String>,
     pub compact_threshold: u32, // computed: context_length * ratio / 100
@@ -237,6 +245,11 @@ impl RuntimeConfig {
             .and_then(|value| value.parse().ok())
             .unwrap_or(RESIDENT_SUBAGENTS_DEFAULT);
 
+        let max_direct_children = std::env::var("YI_AGENT_MAX_DIRECT_CHILDREN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DIRECT_CHILDREN_DEFAULT);
+
         let workdir = resolve_workdir(overrides)?;
 
         let system_prompt = overrides
@@ -336,6 +349,7 @@ impl RuntimeConfig {
             model,
             max_turns,
             max_resident_subagents,
+            max_direct_children,
             workdir,
             system_prompt,
             compact_threshold,
@@ -359,6 +373,7 @@ impl RuntimeConfig {
             "model": self.model,
             "max_turns": self.max_turns,
             "max_resident_subagents": self.max_resident_subagents,
+            "max_direct_children": self.max_direct_children,
             "workdir": self.workdir.display().to_string(),
             "sandbox": format!("{:?}", self.sandbox),
             "sandbox_promotable": self.sandbox_promotable,
@@ -381,6 +396,7 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         model: "test-model".to_string(),
         max_turns: 20,
         max_resident_subagents: RESIDENT_SUBAGENTS_DEFAULT,
+        max_direct_children: DIRECT_CHILDREN_DEFAULT,
         workdir: PathBuf::from("/tmp/test-workdir"),
         system_prompt: None,
         compact_threshold: 160_000,
@@ -467,6 +483,7 @@ mod tests {
             "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
             "YI_AGENT_MAX_RESIDENT_SUBAGENTS",
+            "YI_AGENT_MAX_DIRECT_CHILDREN",
         ]);
         for key in [
             "MODEL_API_KEY",
@@ -485,6 +502,7 @@ mod tests {
             "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
             "YI_AGENT_SKILLS_CATALOG_BUDGET",
             "YI_AGENT_MAX_RESIDENT_SUBAGENTS",
+            "YI_AGENT_MAX_DIRECT_CHILDREN",
         ] {
             env.remove(key);
         }
@@ -1371,5 +1389,35 @@ mod tests {
         };
         let config = RuntimeConfig::load(&overrides).expect("config loads");
         assert_eq!(config.max_resident_subagents, 8);
+    }
+
+    #[test]
+    fn max_direct_children_defaults_to_four_and_reads_the_env() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = isolated_config_env();
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let overrides = ConfigOverrides {
+            api_key: Some("sk-test".into()),
+            workdir: Some(temp.path().to_path_buf()),
+            ..ConfigOverrides::default()
+        };
+        let config = RuntimeConfig::load(&overrides).expect("config loads");
+        assert_eq!(config.max_direct_children, DIRECT_CHILDREN_DEFAULT);
+        assert_eq!(DIRECT_CHILDREN_DEFAULT, 4);
+
+        env.set("YI_AGENT_MAX_DIRECT_CHILDREN", "8");
+        let config = RuntimeConfig::load(&overrides).expect("config loads");
+        assert_eq!(config.max_direct_children, 8);
+    }
+
+    #[test]
+    fn the_config_default_matches_the_core_direct_child_default() {
+        assert_eq!(
+            DIRECT_CHILDREN_DEFAULT,
+            yi_agent_core::subagent::supervisor::MAX_DIRECT_CHILDREN as u16,
+            "the runtime config default and the core supervisor default must not diverge"
+        );
     }
 }

@@ -215,6 +215,8 @@ pub struct RuntimeCoordinator {
     /// durable owns them: an abandoned upload simply vanishes with the process.
     fork_uploads: Mutex<HashMap<String, ForkUpload>>,
     fork_max_bytes: u64,
+    /// Direct-child limit inherited by every supervisor this coordinator creates.
+    max_direct_children: usize,
     draining: AtomicBool,
 }
 
@@ -439,6 +441,10 @@ impl RuntimeCoordinator {
                 },
             );
         }
+        // `open` is an associated constructor with no `self`, and the
+        // recovery loops below build supervisors before `Self` exists, so the
+        // limit is read off the factory here and threaded through as a local.
+        let max_direct_children = factory.max_direct_children();
         let recovered_tasks = repository.recovered_tasks()?;
         let review_tasks = repository.review_hydration_tasks()?;
         let mut supervisors: HashMap<RootSessionId, Arc<AsyncMutex<AgentSupervisor>>> =
@@ -491,9 +497,11 @@ impl RuntimeCoordinator {
                             supervisors.insert(
                                 ancestor.session_id.clone(),
                                 Arc::new(AsyncMutex::new({
-                                    let mut supervisor = AgentSupervisor::from_hydrated_review_root(
-                                        hydrated, objective,
-                                    );
+                                    let mut supervisor =
+                                        AgentSupervisor::from_hydrated_review_root(
+                                            hydrated, objective,
+                                        )
+                                        .with_max_direct_children(max_direct_children);
                                     hydrate_completion_report(
                                         &mut supervisor,
                                         task_id,
@@ -577,7 +585,8 @@ impl RuntimeCoordinator {
                         task.attempt_number,
                         task.objective,
                     )
-                };
+                }
+                .with_max_direct_children(max_direct_children);
                 let root_id = supervisor.root_task_id().clone();
                 supervisor.set_workspace_mode(&root_id, root_mode);
                 if let Some(inherited_sandbox) = repository.task_inherited_sandbox(&root_id)? {
@@ -616,7 +625,8 @@ impl RuntimeCoordinator {
                     task.session_id.clone(),
                     Arc::new(AsyncMutex::new({
                         let mut supervisor =
-                            AgentSupervisor::from_hydrated_review_root(hydrated, objective);
+                            AgentSupervisor::from_hydrated_review_root(hydrated, objective)
+                                .with_max_direct_children(max_direct_children);
                         hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
                         supervisor
                     })),
@@ -767,6 +777,7 @@ impl RuntimeCoordinator {
             application_root_attach_lock: Mutex::new(()),
             fork_uploads: Mutex::new(HashMap::new()),
             fork_max_bytes,
+            max_direct_children,
             draining: AtomicBool::new(false),
         })
     }
@@ -781,6 +792,12 @@ impl RuntimeCoordinator {
     /// The largest fork payload this coordinator accepts.
     pub fn fork_max_bytes(&self) -> u64 {
         self.fork_max_bytes
+    }
+
+    /// How many non-terminal direct children each agent this coordinator creates
+    /// may own, inherited from the worker factory at `open`.
+    pub fn max_direct_children(&self) -> usize {
+        self.max_direct_children
     }
 
     pub fn create_session(&self) -> Result<RootSessionId, RuntimeCoordinatorError> {
@@ -808,7 +825,8 @@ impl RuntimeCoordinator {
         self.ensure_admitting()?;
         let session_id = RootSessionId::new();
         let mut supervisor =
-            AgentSupervisor::new_with_objective(session_id.clone(), objective.clone());
+            AgentSupervisor::new_with_objective(session_id.clone(), objective.clone())
+                .with_max_direct_children(self.max_direct_children);
         let root_id = supervisor.root_task_id().clone();
         supervisor.set_workspace_mode(&root_id, workspace_mode);
         if let Some(inherited_sandbox) = inherited_sandbox {
@@ -1055,7 +1073,8 @@ impl RuntimeCoordinator {
             );
             if task.parent_id.is_none() {
                 let mut supervisor =
-                    AgentSupervisor::from_hydrated_review_root(hydrated, objective);
+                    AgentSupervisor::from_hydrated_review_root(hydrated, objective)
+                        .with_max_direct_children(self.max_direct_children);
                 supervisor.set_workspace_mode(&task_id, root_mode);
                 hydrate_completion_report(&mut supervisor, task_id, completion_report)?;
                 hydrated_supervisor = Some(supervisor);
@@ -1503,7 +1522,8 @@ impl RuntimeCoordinator {
             let supervisor = AgentSupervisor::new_with_objective(
                 session.clone(),
                 schedule.definition.objective.clone(),
-            );
+            )
+            .with_max_direct_children(self.max_direct_children);
             let root_id = supervisor.root_task_id().clone();
             let root_attempt = supervisor
                 .task(&root_id)
@@ -4743,6 +4763,7 @@ mod provider_turn_admission_tests {
     /// prove the value survives the trip into the coordinator.
     struct CapacityFactory {
         units: u16,
+        direct_children: usize,
     }
 
     impl AgentWorkerFactory for CapacityFactory {
@@ -4751,6 +4772,9 @@ mod provider_turn_admission_tests {
         }
         fn max_resident_subagents(&self) -> u16 {
             self.units
+        }
+        fn max_direct_children(&self) -> usize {
+            self.direct_children
         }
         fn start(
             &self,
@@ -4771,12 +4795,37 @@ mod provider_turn_admission_tests {
     fn the_factorys_resident_capacity_reaches_the_coordinator() {
         let directory = tempfile::TempDir::new().unwrap();
         let database = directory.path().join("runtime.sqlite");
-        let coordinator =
-            RuntimeCoordinator::open(&database, Arc::new(CapacityFactory { units: 128 })).unwrap();
+        let coordinator = RuntimeCoordinator::open(
+            &database,
+            Arc::new(CapacityFactory {
+                units: 128,
+                direct_children: 4,
+            }),
+        )
+        .unwrap();
         assert_eq!(
             coordinator.resident_capacity(),
             Some(128),
             "the configured capacity must reach the coordinator, not just the constant"
+        );
+    }
+
+    #[test]
+    fn the_factorys_direct_child_limit_reaches_the_coordinator() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let coordinator = RuntimeCoordinator::open(
+            &database,
+            Arc::new(CapacityFactory {
+                units: 128,
+                direct_children: 3,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            coordinator.max_direct_children(),
+            3,
+            "the configured limit must reach the coordinator, not the default"
         );
     }
 
@@ -4790,8 +4839,14 @@ mod provider_turn_admission_tests {
     fn a_cascade_write_re_reads_the_victims_active_attempt_at_commit_time() {
         let directory = tempfile::TempDir::new().unwrap();
         let database = directory.path().join("runtime.sqlite");
-        let coordinator =
-            RuntimeCoordinator::open(&database, Arc::new(CapacityFactory { units: 8 })).unwrap();
+        let coordinator = RuntimeCoordinator::open(
+            &database,
+            Arc::new(CapacityFactory {
+                units: 8,
+                direct_children: 4,
+            }),
+        )
+        .unwrap();
         let root = RootSessionId::new();
         let victim = TaskId::new();
         let stale_attempt = AttemptId::new();
