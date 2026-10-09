@@ -12,6 +12,9 @@ settingGroups:
     base:
       PRODUCT_NAME: yi-agent
       PRODUCT_BUNDLE_IDENTIFIER: com.gongyichen.desktop
+      # 真机/打包签名所需；缺了 xcodebuild 会报 "requires a development team"。
+      # 与 desktop.xcodeproj 里写入的值保持一致（tauri ios init 会按本文件重生成工程）。
+      DEVELOPMENT_TEAM: 4RN6G5K4D4
 targetTemplates:
   app:
     type: application
