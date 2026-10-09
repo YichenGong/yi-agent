@@ -262,7 +262,13 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
           {loadError}
         </p>
       ) : catalog.models.length === 0 ? (
-        <p className="mt-3 text-sm text-fg-muted">还没有配置任何模型</p>
+        // 清单空不等于「没模型可用」：env 兜底在生效时下面那行会说清实际在用哪个，
+        // 这里再说「还没有配置任何模型」就成了自相矛盾的假话。
+        catalog.effective?.source === "env" ? (
+          <p className="mt-3 text-sm text-fg-muted">清单里还没有条目</p>
+        ) : (
+          <p className="mt-3 text-sm text-fg-muted">还没有配置任何模型</p>
+        )
       ) : (
         <table className="mt-3 w-full table-auto text-left text-sm">
           <thead>

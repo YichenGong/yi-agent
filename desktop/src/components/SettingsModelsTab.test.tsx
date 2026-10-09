@@ -210,11 +210,87 @@ describe("SettingsModelsTab", () => {
     // 如实告知「在用 .env 的那个模型」，而不是干说「还没有配置任何模型」。
     expect(await screen.findByText(/来自 \.env/)).toBeTruthy();
     expect(screen.getByText(/env-model/)).toBeTruthy();
+    // 空清单 + env 兜底时那句「还没有配置任何模型」是假话，绝不能与生效行并存。
+    expect(screen.queryByText("还没有配置任何模型")).toBeNull();
+    expect(screen.getByRole("button", { name: "导入当前配置" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "导入当前配置" }));
     await waitFor(() => expect(call).toHaveBeenCalledWith("model/importEnv", {}));
     // 写后重读：model/list 至少被调两次（首载 + 导入后）。
     await waitFor(() => expect(callsTo(call, "model/list").length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("keeps the empty-state wording when nothing is in effect either", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list"
+        ? { models: [], default_model: null, subagent_model: null, effective: null }
+        : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+
+    // 真·空清单（连兜底都没有）：这句才是对的，且没有可导入的生效行。
+    expect(await screen.findByText("还没有配置任何模型")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "导入当前配置" })).toBeNull();
+  });
+
+  it("keeps the empty-state wording when the catalog is empty without an env fallback", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list"
+        ? payload({
+            models: [],
+            default_model: null,
+            effective: {
+              source: "catalog",
+              model_ref: "A",
+              provider: "anthropic",
+              api_url: "u",
+              model: "m",
+              has_key: true,
+              api_key_masked: "••••1234",
+            },
+          })
+        : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+
+    expect(await screen.findByText("还没有配置任何模型")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "导入当前配置" })).toBeNull();
+  });
+
+  it("surfaces the host error and keeps the button when the import is rejected", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) => {
+      if (method === "model/list")
+        return payload({
+          models: [],
+          default_model: null,
+          effective: {
+            source: "env",
+            model_ref: null,
+            provider: "openai",
+            api_url: "https://env",
+            model: "env-model",
+            has_key: true,
+            api_key_masked: "••••9999",
+          },
+        });
+      throw {
+        code: -32602,
+        message: "api_url must not be empty",
+        data: { code: "invalid_model" },
+      };
+    });
+    render(<SettingsModelsTab call={call} />);
+    await screen.findByText(/来自 \.env/);
+
+    fireEvent.click(screen.getByRole("button", { name: "导入当前配置" }));
+
+    // 导入失败不能是静默的：宿主的话必须原样露出来。
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("api_url must not be empty");
+    // 失败后按钮仍在：用户能修好 .env 再点一次。
+    expect(screen.getByRole("button", { name: "导入当前配置" })).toBeTruthy();
+    // 失败不重读：没成功过的写不该伪造一次读取。
+    expect(callsTo(call, "model/list").length).toBe(1);
   });
 
   it("does not offer an import when the model resolves from the catalog", async () => {
