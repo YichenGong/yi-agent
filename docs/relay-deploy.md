@@ -9,8 +9,8 @@
 > **桌面 GUI 与手机共用同一 app-server 会话（合一模式，§1.1）** 已实现，回环前端有单测/
 > 集成测试覆盖，并且**已在真中继下端到端跑通**（同一条中继 session 下，桌面 stdio 端与
 > 扮演手机的 `ws://` 客户端看到同一份 store，均 17 个 thread；§五）。**仍未实跑的只有物理
-> iPhone 那一腿**（经 `wss://…:443` 接入），受可安装 iOS 产物阻塞（§4.2）。此外：本机产不出
-> iOS 构建产物；配对已支持**扫码**（桌面/CLI 出码，手机相机扫）。
+> iPhone 那一腿**（经 `wss://…:443` 接入）。可安装 iOS 产物已具备（§4.2：真机构建 + 安装
+> 已跑通）；配对已支持**扫码**（桌面/CLI 出码，手机相机扫）。
 > 见 [范围与已知限制](#七范围与已知限制)，不要按"开箱即用"理解本文。
 
 ---
@@ -332,33 +332,74 @@ YI_AGENT_RELAY='wss://relay.example.com/connect?session=<你的 session id>'
 
 ## 四、iOS App：构建与配对
 
-### 4.1 工程位置与构建命令
+### 4.1 工程位置
 
-iOS 工程由 Tauri 生成并已提交在 `desktop/src-tauri/gen/apple/`：
+iOS 工程由 Tauri 生成并已提交在 `desktop/src-tauri/gen/apple/`（`project.yml`、
+`desktop.xcodeproj/`、`desktop_iOS/Info.plist` + `.entitlements`、`Assets.xcassets/` 等）。
+工程内的 `project.yml` 是 `desktop.xcodeproj` 的**生成源**：
 
 ```bash
 cd desktop
-npx tauri ios init      # 生成/刷新 iOS 工程（已提交；重复执行不会覆盖业务代码）
-npx tauri ios build     # 产出 iOS 构建（需 Xcode + iOS 平台组件 + 签名）
+npx tauri ios init      # 生成/刷新 iOS 工程。注意：按 project.yml 重生成工程，
+                        # 会覆盖 desktop.xcodeproj 内的手改（见 4.2 的 team 设置）
 ```
 
-### 4.2 构建状态（如实说明）
+### 4.2 真机构建与安装（标准步骤）
 
-`tauri ios init` 已成功并提交；**iOS SDK 已就绪，但本机仍产不出可安装的 iOS 构建**。
-（2026-10-03 实跑 `tauri ios build` 核实；此前记录为"iOS platform not installed"，已过时。）
+> **状态（2026-10-09 更新）：真机构建与安装已跑通，并实装到 iPhone 14 Pro。**
+> 此前本节记录的"卡在签名、产不出可安装 `.ipa`"已解决（见下）。
 
-- **iOS 26.5 SDK 已装**（Xcode 26.6，`iphoneos26.5` + `iphonesimulator26.5` 都在）。
-  实跑能走完编译/链接/资源/Rust 构建脚本。
-- **当前卡在签名**：构建最后一步报
-  `Signing for "desktop_iOS" requires a development team.`——`tauri.conf.json` 未配
-  `developmentTeam`。解决：Apple 开发者账号 + 在 `tauri.conf.json` 的 `bundle.iOS.
-  developmentTeam`（或 Xcode 的 Signing & Capabilities）选择团队。
-- **无模拟器运行时**：`xcrun simctl list runtimes` 为空，故模拟器也跑不起来。解决：
-  `xcodebuild -downloadPlatform iOS`（约 8.5 GB）安装运行时。
-- **无连接设备**：`xcrun devicectl list devices` = "No devices found"。
+**前置**
 
-一句话：**Tier 1 未产出 `.ipa`/`.app`**。障碍已从"缺 SDK"变为"缺签名/运行时"——即
-分发与账号问题，不是代码问题。
+| 项 | 说明 |
+|---|---|
+| Xcode | 26.6，含 `iphoneos26.5` SDK |
+| 签名身份 | `security find-identity -v -p codesigning` 能看到有效的 `Apple Development: …` |
+| 团队 | `DEVELOPMENT_TEAM = 4RN6G5K4D4`，已写入 `project.yml` 与 `desktop.xcodeproj`（见坑 2） |
+| 设备 | USB 连上 iPhone，`xcrun devicectl list devices` 显示 `available (paired)`；**手机须解锁**（坑 1） |
+
+**构建**
+
+```bash
+cd desktop
+export PATH="/opt/homebrew/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
+npx tauri ios build --ci --export-method debugging
+# 产物：
+#   desktop/src-tauri/gen/apple/build/arm64/yi-agent.ipa                （可分发的 ipa）
+#   desktop/src-tauri/gen/apple/build/desktop_iOS.xcarchive/Products/
+#     Applications/yi-agent.app                                        （用于 devicectl 安装）
+```
+
+`--export-method debugging` 产出 development 签名、可装到已注册真机
+（`app-store-connect` / `release-testing` 分别对应 App Store / TestFlight）；`--ci` 免交互。
+
+**安装**
+
+```bash
+xcrun devicectl device install app \
+  --device <设备标识符> \
+  desktop/src-tauri/gen/apple/build/desktop_iOS.xcarchive/Products/Applications/yi-agent.app
+```
+
+设备标识符取 `xcrun devicectl list devices` 的 `Identifier` 列（形如
+`5DE0CC74-6A87-53DD-BADF-E1DADB22F6D8`）。成功回 `App installed:`。
+如需直接拉起：`xcrun devicectl device process launch --device <id> com.gongyichen.desktop`。
+
+**常见坑**
+
+1. **`kAMDMobileImageMounterDeviceLocked: The device is locked`**
+   —— 手机锁屏。**解锁手机**后重试即可（安装/挂载开发者镜像要求解锁）。
+2. **`Signing ... requires a development team`**
+   —— 工程没配 team。本项目已把 `DEVELOPMENT_TEAM = 4RN6G5K4D4` 写进
+   `gen/apple/project.yml` 的 `app` settingGroup（**xcodeproj 的生成源**），并同步进
+   `desktop.xcodeproj/project.pbxproj`。只改 xcodeproj 内联值的话，跑一次 `tauri ios init`
+   就会被 `project.yml` 覆盖回去——故两处都写。
+3. **缺模拟器运行时**（只在跑模拟器时相关，真机不需要）
+   —— `xcrun simctl list runtimes` 为空则 `xcodebuild -downloadPlatform iOS`（约 8.5 GB）。
+4. **development 签名 7 天有效期** —— 免费 Apple ID 路线签出的真机包 7 天后失效，需重新
+   构建安装；长期签名要付费开发者账号。
+5. **iOS 图标规范** —— 图标那套在 `gen/apple/Assets.xcassets/AppIcon.appiconset/`，须为
+   **满幅方形、无 alpha、不加圆角**；iOS 自行渲染圆角遮罩，预烘焙遮罩会"圆角套圆角"。
 
 ### 4.3 App 如何选择远端传输
 
@@ -419,8 +460,8 @@ ws，`initialize` 后直接发这条 RPC，中继桥把它原样转发到本机 
 
 ## 五、手工端到端验证（合一模式）
 
-> **状态：合一模式的真中继 E2E 已由控制器实跑并 PASS；仅物理 iPhone 那一腿未跑（受可安装
-> iOS 产物阻塞，§4.2）。** 控制器实跑记录（本机，非公网）：起一个干净的
+> **状态：合一模式的真中继 E2E 已由控制器实跑并 PASS；仅物理 iPhone 那一腿尚未实跑（可安装
+> iOS 产物已具备，见 §4.2）。** 控制器实跑记录（本机，非公网）：起一个干净的
 > `yi-agent-relay --listen 127.0.0.1:18080`；电脑侧以
 > `yi-agent app-server --listen stdio:// --relay 'ws://127.0.0.1:18080/connect?session=e2e-merged'`
 > 起合一模式（指向一份真实 store，含 17 个 thread），中继日志出现 `agent connected
@@ -472,8 +513,8 @@ ws，`initialize` 后直接发这条 RPC，中继桥把它原样转发到本机 
 
 **真中继上已实跑的是第 4 步（验证 a：两端列出同一份 threads）。** 第 5–7 步（验证 b/c/d：
 turn 实时扇出、审批广播、stdio EOF 生命周期）目前仍只有合一模式**回环前端**的单测/集成测试
-覆盖，尚未在真中继上逐步实跑；此外，物理 iPhone 经 `wss://…:443` 接入这一腿受可安装 iOS
-产物阻塞（§4.2），待具备签名/运行时后进行。上面这段实跑用的是回环 `ws://`，就已覆盖
+覆盖，尚未在真中继上逐步实跑；此外，物理 iPhone 经 `wss://…:443` 接入这一腿尚未实跑
+（可安装 iOS 产物已具备，见 §4.2）。上面这段实跑用的是回环 `ws://`，就已覆盖
 initialize、pair、以及两端同 store 的一致性。
 
 ---
@@ -582,7 +623,7 @@ control < admin`，新设备默认 `control`，admin 类 RPC 返回 `-32014`）�
 `YI_AGENT_RELAY` 设置时以合一模式启动（见 §3.4）。回环前端已由单测/集成测试覆盖，**且在真
 中继下端到端跑通**：桌面 stdio 与扮演手机的 `ws://` 客户端看到同一份 store（均 17 个
 thread），经中继的客户端可 initialize / pair / 列 thread（见 §五）；**仍未实跑的只有物理
-iPhone 经 `wss://…:443` 接入这一腿**（受可安装 iOS 产物阻塞，见 §4.2）。允许 iPhone 与电脑
+iPhone 经 `wss://…:443` 接入这一腿**（可安装 iOS 产物已具备，见 §4.2）。允许 iPhone 与电脑
 **同时**接入同一会话。
 
 **Tier 1.5 已打通端到端：** 配对码**落盘**到 `~/.yi-agent/pairing.json`（epoch 秒过期），
@@ -596,7 +637,7 @@ iOS 配对页「扫码」按钮用相机扫后自动配对（文本手输路径�
 
 **仍不在 Tier 1.5（后续）：**
 
-- **可安装的 iOS 产物**（见 §4.2）——受 Xcode 运行时/签名阻塞。
+- **可安装的 iOS 产物**——已具备（见 §4.2：真机构建 + 安装已跑通）。
 
 **不在 Tier 1（后续）：**
 
@@ -608,8 +649,8 @@ iOS 配对页「扫码」按钮用相机扫后自动配对（文本手输路径�
 
 - **物理 iPhone 经 `wss://…:443` 的合一模式 E2E**——真中继 + 合一模式的 E2E 已由控制器实跑
   并 PASS（用回环 `ws://` 客户端扮演手机：两端同一份 store，均 17 个 thread，可
-  initialize / pair / 列 thread；见 §五）；**尚未实跑**的是物理 iPhone 那一腿，受可安装
-  iOS 产物阻塞（见 §4.2）。
+  initialize / pair / 列 thread；见 §五）；**尚未实跑**的是物理 iPhone 那一腿
+  （可安装 iOS 产物已具备，见 §4.2）。
 - **桌面设置页里能配置侧车中继的字段**——「远程访问」页现有的**中继地址**只用于手机侧
   配对/二维码，侧车目前只认 `YI_AGENT_RELAY` 环境变量（见 §3.4）；让设置页直接配置侧车
   是后续增强，届时不再需要手动设环境变量。
