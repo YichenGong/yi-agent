@@ -64,11 +64,13 @@
   <div className="rounded-lg border border-line-strong bg-surface
                   focus-within:border-fg-subtle transition-colors">   {/* 卡片：原 textarea 的边框搬到这里 */}
     <AttachmentChips ... />                                            {/* 移入卡内顶部 */}
-    <div className="flex items-end gap-2 max-md:flex-col ...">
-      <textarea ... className="flex-1 resize-none bg-transparent border-0
-                               px-3 py-2 ... focus:outline-none
-                               max-md:w-full max-md:flex-none" />      {/* 去掉自身边框/底色 */}
-      <div className="flex items-center justify-between gap-2 px-3 pb-2 ...">
+    {/* 竖排：textarea 在上，工具栏是它下面**满宽的一行**。
+        不能写成 `flex items-end`（那是旧布局的两列并排），否则「附加文件」会被挤到右端。 */}
+    <div className="flex flex-col">
+      <textarea ... className="min-w-0 w-full resize-none bg-transparent
+                               px-3 pt-2 ... focus:outline-none" />     {/* 去掉自身边框/底色 */}
+      <div className="flex items-center justify-between gap-2 px-3 pb-2
+                      max-md:flex-wrap max-md:justify-end">
         <button aria-label="附加文件">附加文件</button>
         <div className="flex items-center gap-2">
           <ModeChip ... />
@@ -84,13 +86,14 @@
 要点：
 
 - 卡片自身承载边框、圆角、底色与聚焦高亮；textarea 退化成无边框、透明底的文本区。
-- 工具栏是**一行**（不是当前的两行两组）：左「附加文件」，右 `Mode / 模型 / Send`。
+- **卡片内是竖排**（`flex flex-col`）：textarea 在上，工具栏是它下面**满宽的一行**。这里**不能**沿用旧布局的 `flex items-end gap-2`——那会把 textarea 与工具栏并排成两列，工具栏作为 flex item 只占自身内容宽，`justify-between` 便无空间可分配，「附加文件」会被挤到右端。实测（1280px 视口，`max-md` 未激活）：并排时「附加文件」距卡左缘 924px、工具栏未满宽；竖排时为 13px、工具栏满宽。
+- 工具栏是**一行**（不是当前的两行两组）：`justify-between` 把「附加文件」钉在左、把 `Mode / 模型 / Send` 那组钉在右。
 - 卡片「随内容长高」由 textarea 的 `rows={3}` 决定（与现状一致，不引入 auto-resize）。
 - `SlashPopup` 仍在卡片外层，绝对定位于 textarea 上方，位置语义不变。
 
 ### 3.2 手机端（`max-md`）
 
-沿用既有的换行策略，只把容器从「textarea 的兄弟」换成「卡片内的工具栏」：
+工具栏本身就是满宽的一行，窄屏只需让它**换行**（右组换行后仍贴右），无需再改列向：
 
 ```
 ┌─────────────────────────────┐
@@ -102,8 +105,8 @@
 └─────────────────────────────┘
 ```
 
-- `max-md:flex-col` 让工具栏（含 textarea 的那一行）纵向堆叠，textarea 独占整行。
 - 工具栏用 `max-md:flex-wrap max-md:justify-end`，让右侧那组在窄屏换行后仍然贴右。
+- 卡片内**恒为竖排**，故 `max-md:flex-col` 与 `max-md:items-stretch` 已无必要（保留亦无害）。
 - 桌面（> 768px，含可缩到 720px 的窗口）不匹配 `max-md`，视觉上就是上面那张桌面图。
 
 ### 3.3 不变项 / YAGNI

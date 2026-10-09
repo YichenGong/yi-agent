@@ -29,8 +29,8 @@
   ├─ SlashPopup（showPopup 时，绝对定位，不动）
   └─ 卡片 [data-testid=composer-card] .rounded-lg.border.border-line-strong.bg-surface.transition-colors.focus-within:border-fg-subtle
        ├─ [data-testid="attachment-chips"]（附件非空时，卡内顶部）
-       └─ 行 .flex.items-end.gap-2.max-md:flex-col.max-md:items-stretch
-            ├─ textarea（flex-1，无自身边框/底色，无 focus:border-*）
+       └─ 列 .flex.flex-col
+            ├─ textarea（w-full，无自身边框/底色，无 focus:border-*）
             └─ 工具栏 [data-composer-toolbar] .flex.items-center.justify-between.gap-2.px-3.pb-2
                  │  .max-md:flex-wrap.max-md:justify-end
                  ├─ 「附加文件」按钮（文档流中第一个控件）
@@ -57,7 +57,7 @@
 
 **Interfaces:**
 - Consumes: 无（纯组件内部结构改动）。
-- Produces: 卡片元素（`data-testid="composer-card"`）类名含 `border-line-strong` + `bg-surface` + `focus-within:border-fg-subtle`；textarea 类名含 `max-md:w-full` + `max-md:flex-none` 且**不含** `border-line-strong` / `focus:border-*`；工具栏（`data-composer-toolbar`）类名含 `max-md:flex-wrap` + `max-md:justify-end`。Task 3 的进度文档引用这些契约。
+- Produces: 卡片元素（`data-testid="composer-card"`）类名含 `border-line-strong` + `bg-surface` + `focus-within:border-fg-subtle`；卡片内是竖排（`flex flex-col`）；textarea 类名含 `w-full` 且**不含** `border-line-strong` / `focus:border-*`；工具栏（`data-composer-toolbar`）类名含 `justify-between` + `max-md:flex-wrap` + `max-md:justify-end`，且**满宽**（卡片的直接 flex 子项）。Task 3 的进度文档引用这些契约。
 
 - [ ] **Step 0: 让测试辅助函数能传 `modelPicker`**
 
@@ -174,24 +174,26 @@ function renderInput(
   });
 ```
 
-**（c）把既有 `it("stacks the composer at the phone breakpoint ...")`（`:171-188`）的正文替换为：**
+**（c）把既有 `it("stacks the composer at the phone breakpoint ...")`（`:171-188`）整段替换为下面这条**（旧断言读的是已不存在的 `flex items-end` 两列布局；新契约是「卡片内竖排 + 工具栏满宽 + 附加文件在左」）：
 
 ```tsx
-  it("stacks the composer at the phone breakpoint so the input keeps its width", () => {
+  it("lays the card out as one column, with a full-width toolbar underneath", () => {
     renderInput();
     const textarea = screen.getByRole("textbox");
-    // 桌面那一行是"输入框 + 右侧控件"；手机上 `max-md` 变体让它纵向堆叠，输入框独占整行。
-    // jsdom 不编译 Tailwind，故只断类名契约。
-    const row = textarea.parentElement!;
-    expect(row.className).toContain("max-md:flex-col");
-    expect(row.className).toContain("max-md:items-stretch");
-    // 输入框在手机上必须"占满整行"而不是"可伸缩的 flex 项"。
-    expect(textarea.className).toContain("max-md:w-full");
-    expect(textarea.className).toContain("max-md:flex-none");
-    // 工具栏在手机上撑满整行并横向换行（模型选择器可能很长），换行后仍贴右。
-    const toolbar = row.querySelector('[data-composer-toolbar]') as HTMLElement;
+    const column = textarea.parentElement as HTMLElement;
+    // 卡片内恒为竖排：textarea 在上，工具栏是它下面满宽的一行。
+    // 若写回旧布局的 `flex items-end`，工具栏会退化成右侧一列、`justify-between`
+    // 失效（「附加文件」被挤到右端）——jsdom 测不出几何，故这里断结构契约。
+    expect(column.className).toContain("flex-col");
+    const toolbar = column.querySelector('[data-composer-toolbar]') as HTMLElement;
+    expect(toolbar).toBeTruthy();
+    expect(toolbar.className).toContain("justify-between");
+    // 窄屏：右组换行后仍贴右。
     expect(toolbar.className).toContain("max-md:flex-wrap");
     expect(toolbar.className).toContain("max-md:justify-end");
+    // 「附加文件」是工具栏的第一个控件（左组），不是被挤到右边去。
+    const firstControl = toolbar.querySelector("button");
+    expect(firstControl?.getAttribute("aria-label")).toBe("附加文件");
   });
 ```
 
@@ -219,11 +221,12 @@ Expected: FAIL。`getByTestId("composer-card")` / `[data-composer-toolbar]` 都�
       >
         <AttachmentChips attachments={attachments} onRemove={onRemoveAttachment} />
         {/*
-         * Phone breakpoint: the desktop row is 输入框 + 底部工具栏。`max-md` 让手机改成
-         * 纵向：输入框独占整行，工具栏落到它下面。桌面（>768px，含可缩到 720px 的窗口）
-         * 不匹配该变体。
+         * 卡片内**恒为竖排**：textarea 在上，工具栏是它下面满宽的一行。
+         * 这里不能用 `flex items-end gap-2`（旧布局的两列并排）——那样工具栏只占自身
+         * 内容宽，`justify-between` 无空间可分配，「附加文件」会被挤到右端（实测 924px
+         * vs 竖排的 13px）。
          */}
-        <div className="flex items-end gap-2 max-md:flex-col max-md:items-stretch">
+        <div className="flex flex-col">
           <textarea
             ref={inputRef}
             value={text}
@@ -313,7 +316,7 @@ Expected: FAIL。`getByTestId("composer-card")` / `[data-composer-toolbar]` 都�
             rows={3}
             placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
             // 无边框、透明底的文本区：边框与聚焦指示都归卡片（见上）。
-            className="min-w-0 flex-1 resize-none bg-transparent px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50 max-md:w-full max-md:flex-none"
+            className="min-w-0 w-full resize-none bg-transparent px-3 pt-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50"
           />
           <div
             data-composer-toolbar

@@ -127,11 +127,12 @@ export function MessageInput({
       >
         <AttachmentChips attachments={attachments} onRemove={onRemoveAttachment} />
         {/*
-         * Phone breakpoint: the desktop row is 输入框 + 底部工具栏。`max-md` 让手机改成
-         * 纵向：输入框独占整行，工具栏落到它下面。桌面（>768px，含可缩到 720px 的窗口）
-         * 不匹配该变体。
+         * 卡片内**恒为竖排**：textarea 在上，工具栏是它下面满宽的一行。
+         * 不能用 `flex items-end gap-2`（旧布局的两列并排）——那样工具栏只占自身内容宽，
+         * `justify-between` 便无空间可分配，「附加文件」会被挤到右端（实测：并排时距卡
+         * 左缘 924px，竖排时 13px）。jsdom 断的是类名而非几何，故这条靠结构契约守住。
          */}
-        <div className="flex items-end gap-2 max-md:flex-col max-md:items-stretch">
+        <div className="flex flex-col">
           <textarea
             ref={inputRef}
             value={text}
@@ -220,7 +221,9 @@ export function MessageInput({
             disabled={disabled || sending || turnActive}
             rows={3}
             placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-            className="min-w-0 flex-1 resize-none bg-transparent px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50 max-md:w-full max-md:flex-none"
+            // 无边框、透明底的文本区：边框与聚焦指示都归卡片（见上）。卡片内是竖排，
+            // 故 textarea 直接占满整行；宽度由 `w-full` 决定，不再需要 `flex-1` / `max-md:*`。
+            className="min-w-0 w-full resize-none bg-transparent px-3 pt-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50"
           />
           <div
             data-composer-toolbar

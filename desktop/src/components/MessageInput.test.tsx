@@ -210,21 +210,23 @@ describe("MessageInput", () => {
     expect(toolbar.contains(screen.getByRole("button", { name: /send/i }))).toBe(true);
   });
 
-  it("stacks the composer at the phone breakpoint so the input keeps its width", () => {
+  it("lays the card out as one column, with a full-width toolbar underneath", () => {
     renderInput();
     const textarea = screen.getByRole("textbox");
-    // 桌面那一行是"输入框 + 右侧控件"；手机上 `max-md` 变体让它纵向堆叠，输入框独占整行。
-    // jsdom 不编译 Tailwind，故只断类名契约。
-    const row = textarea.parentElement!;
-    expect(row.className).toContain("max-md:flex-col");
-    expect(row.className).toContain("max-md:items-stretch");
-    // 输入框在手机上必须"占满整行"而不是"可伸缩的 flex 项"。
-    expect(textarea.className).toContain("max-md:w-full");
-    expect(textarea.className).toContain("max-md:flex-none");
-    // 工具栏在手机上撑满整行并横向换行（模型选择器可能很长），换行后仍贴右。
-    const toolbar = row.querySelector('[data-composer-toolbar]') as HTMLElement;
+    const column = textarea.parentElement as HTMLElement;
+    // 卡片内恒为竖排：textarea 在上，工具栏是它下面满宽的一行。
+    // 若写回旧布局的 `flex items-end`，工具栏会退化成右侧一列、`justify-between` 失效
+    // （「附加文件」被挤到右端）。jsdom 测不出几何，故这里断结构契约。
+    expect(column.className).toContain("flex-col");
+    const toolbar = column.querySelector('[data-composer-toolbar]') as HTMLElement;
+    expect(toolbar).toBeTruthy();
+    expect(toolbar.className).toContain("justify-between");
+    // 窄屏：右组换行后仍贴右。
     expect(toolbar.className).toContain("max-md:flex-wrap");
     expect(toolbar.className).toContain("max-md:justify-end");
+    // 「附加文件」是工具栏的第一个控件（左组），不是被挤到右边去。
+    const firstControl = toolbar.querySelector("button");
+    expect(firstControl?.getAttribute("aria-label")).toBe("附加文件");
   });
 
   it("does not keep a draft of its own: the value prop owns the text", () => {
