@@ -274,7 +274,7 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
           <thead>
             <tr className="text-xs text-fg-subtle">
               <th className="py-1 pr-2 font-normal">名称</th>
-              <th className="py-1 pr-2 font-normal">提供方</th>
+              <th className="py-1 pr-2 font-normal">API 格式</th>
               <th className="py-1 pr-2 font-normal">模型标识</th>
               <th className="py-1 pr-2 font-normal">API 地址</th>
               <th className="py-1 pr-2 font-normal">密钥</th>
@@ -406,7 +406,7 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
               />
             </label>
             <label className="flex flex-col gap-1 text-xs text-fg-muted">
-              提供方
+              API 格式
               <select
                 value={draft.provider}
                 onChange={(e) => patch({ provider: e.target.value as Draft["provider"] })}
