@@ -50,6 +50,22 @@ describe("SettingsModelsTab", () => {
     expect(call).toHaveBeenCalledWith("model/list", {});
   });
 
+  it('labels the provider field as "API 格式" in both the table and the form', async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+    await screen.findByText("••••1234");
+
+    // 表头用「API 格式」，不再用旧措辞「提供方」。
+    expect(screen.getByText("API 格式")).toBeTruthy();
+    expect(screen.queryByText("提供方")).toBeNull();
+
+    // 新增/编辑表单的字段标签同样是「API 格式」。
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    expect(screen.getByLabelText("API 格式")).toBeTruthy();
+  });
+
   it("does not send api_key when the user leaves it untouched", async () => {
     const call = vi.fn(async (method: string, _params: unknown) =>
       method === "model/list" ? payload() : { ok: true },
