@@ -5150,6 +5150,7 @@ fn build_partial(
     turn_id: &str,
     user_prompt: &str,
     user_attachments: &[crate::protocol::Attachment],
+    user_image_refs: &[crate::protocol::ImageRef],
     completed_items: &[crate::protocol::Item],
     messages: Vec<yi_agent_core::Message>,
     usage: Option<crate::thread_store::TurnUsage>,
@@ -5159,6 +5160,7 @@ fn build_partial(
         turn_id,
         user_prompt,
         user_attachments.to_vec(),
+        user_image_refs.to_vec(),
     ));
     items.extend(completed_items.iter().cloned());
     crate::thread_store::PartialTurn {
@@ -5192,6 +5194,7 @@ async fn persist_and_finish_turn(
     turn_id: Option<&str>,
     user_prompt: Option<&str>,
     user_attachments: &[crate::protocol::Attachment],
+    user_image_refs: &[crate::protocol::ImageRef],
     agent: &yi_agent_core::Agent,
     completed_items: Vec<crate::protocol::Item>,
     last_usage: Option<crate::thread_store::TurnUsage>,
@@ -5207,7 +5210,7 @@ async fn persist_and_finish_turn(
             id: format!("user-{}", turn_id.unwrap_or("session-command")),
             text: prompt.to_string(),
             attachments: user_attachments.to_vec(),
-            images: Vec::new(),
+            images: user_image_refs.to_vec(),
         });
     }
     items.extend(completed_items);
@@ -5230,6 +5233,60 @@ async fn persist_and_finish_turn(
     if let Some(turn_id) = turn_id {
         let _ = turn_tx.send(finished_event(thread_id, turn_id)).await;
     }
+}
+
+/// 从一个已编码的图片内容块里反推 `Item` 上的图片引用。
+///
+/// driver 手上只有 `TurnPrompt.image_blocks`（内容块），而落盘/回显要的是
+/// `ImageRef`（只带元数据、绝不含 base64——传输帧上限 1 MiB）。从块上取字段
+/// 而不是在 `TurnPrompt` 里再存一份 `image_refs`：一份数据一个来源，不会漂移。
+///
+/// `size` 取**磁盘上那个文件**的大小（`root.join(path)`），不是 base64 载荷的
+/// 大小：`path` 与文件是配对的，客户端展示的大小必须与它随后经 `image/read`
+/// 取到的字节数一致。载荷是重编码结果（JPEG 重编码 / 超限降采样都会改变大小），
+/// 用它会让气泡上写的大小和真正读到的字节对不上。文件已不在（例如本轮中途被
+/// 删）才退回载荷长度——宁可数字略有出入，也好过整块引用消失。
+fn image_ref_from_block(
+    root: &Path,
+    block: &yi_agent_core::ContentBlock,
+) -> Option<crate::protocol::ImageRef> {
+    let yi_agent_core::ContentBlock::Image {
+        source,
+        detail,
+        path,
+    } = block
+    else {
+        return None;
+    };
+    let path = path.clone()?;
+    let media_type = match source {
+        yi_agent_core::ImageSource::Base64 { media_type, .. } => media_type.clone(),
+        // URL 来源的图片没有本地文件可数，本路径也不产出这种块。
+        yi_agent_core::ImageSource::Url(_) => return None,
+    };
+    let size = match std::fs::metadata(root.join(&path)) {
+        Ok(meta) => meta.len(),
+        Err(_) => match source {
+            yi_agent_core::ImageSource::Base64 { data, .. } => base64_decoded_len(data),
+            yi_agent_core::ImageSource::Url(_) => return None,
+        },
+    };
+    Some(crate::protocol::ImageRef {
+        path,
+        media_type,
+        size,
+        detail: Some(detail.as_wire_str().to_string()),
+    })
+}
+
+/// 标准 base64 串解码后的精确字节数（不分配、不解码）。
+///
+/// `size` 是给 UI 显示的原始字节数，不能用「估算上界」——`image/read` 会按
+/// `size` 决定分片循环的终点，多算几个字节会让客户端去读不存在的尾巴。
+/// 公式：每 4 字符一组产出 3 字节，末尾 `=` 每个吃掉 1 字节。
+fn base64_decoded_len(data: &str) -> u64 {
+    let padding = data.bytes().rev().take_while(|b| *b == b'=').count().min(2);
+    (((data.len() / 4) * 3).saturating_sub(padding)) as u64
 }
 
 /// 在**没有 turn 在跑**的时刻执行一条会话命令，返回（可能被重建过的）agent。
@@ -5272,6 +5329,7 @@ async fn apply_session_command(
                 None,
                 None,
                 &[],
+                &[],
                 &agent,
                 Vec::new(),
                 None,
@@ -5309,6 +5367,7 @@ async fn apply_session_command(
                 thread_id,
                 None,
                 None,
+                &[],
                 &[],
                 &agent,
                 Vec::new(),
@@ -5443,6 +5502,7 @@ async fn run_thread_driver(
             prompt,
             activate,
             attachments: turn_attachments,
+            image_blocks,
             display_text,
         }) = turn_prompt
         else {
@@ -5483,6 +5543,27 @@ async fn run_thread_driver(
         let user_prompt = display_text;
         // 本轮附件暂存:落盘时写进开启的 userMessage item。
         let user_attachments = turn_attachments;
+        // 本轮图片暂存:落盘时写进开启的 userMessage item 的 `images`。
+        // 从内容块里反推元数据,而不是再存一份——块的 `path` 就是落在根内的
+        // 相对路径,`source` 里带着 media_type,一份数据一个来源。
+        // 图片的根 = 该 thread 的 cwd（`ThreadStore` 就是用它建的）。
+        let image_root = store.root().to_path_buf();
+        let user_image_refs: Vec<crate::protocol::ImageRef> = image_blocks
+            .iter()
+            .filter_map(|block| image_ref_from_block(&image_root, block))
+            .collect();
+        // 送给模型的内容块:文本(若有)在前,图片在后。
+        let mut blocks: Vec<yi_agent_core::ContentBlock> = Vec::new();
+        if !prompt.is_empty() {
+            blocks.push(yi_agent_core::ContentBlock::Text(prompt.clone()));
+        }
+        blocks.extend(image_blocks.iter().cloned());
+        // 防御:空 blocks 会给模型塞一条没有任何内容的消息。正常路径够不到
+        // (prepare 已拒绝三缺一的输入),但 driver 的输入里若将来多出一条能
+        // 产生空 prompt 且无图片的来源,这里必须自己兜住,而不是把边界甩给模型。
+        if blocks.is_empty() {
+            blocks.push(yi_agent_core::ContentBlock::Text(String::new()));
+        }
         translator.set_turn(turn_id.clone());
 
         // turn 开始就把提问落进 checkpoint：即使这一轮随后立刻崩溃，
@@ -5494,6 +5575,7 @@ async fn run_thread_driver(
                 &turn_id,
                 &user_prompt,
                 &user_attachments,
+                &user_image_refs,
                 &[],
                 agent.session().messages().to_vec(),
                 None,
@@ -5508,7 +5590,7 @@ async fn run_thread_driver(
             }
         }
 
-        let mut stream = match agent.run(prompt).await {
+        let mut stream = match agent.run_blocks(blocks).await {
             Ok(s) => s,
             Err(e) => {
                 // run() 本身失败:翻译成 Error → turn/completed(failed)。
@@ -5761,6 +5843,7 @@ async fn run_thread_driver(
                             &turn_id,
                             &user_prompt,
                             &user_attachments,
+                            &user_image_refs,
                             &completed_items,
                             agent.session().messages().to_vec(),
                             last_usage.clone(),
@@ -5853,6 +5936,7 @@ async fn run_thread_driver(
             Some(&turn_id),
             Some(&user_prompt),
             &user_attachments,
+            &user_image_refs,
             &agent,
             std::mem::take(&mut completed_items),
             last_usage.take(),
@@ -6157,6 +6241,7 @@ where
                 &prepared.turn_id,
                 &prepared.display_text,
                 prepared.attachments.clone(),
+                prepared.image_refs.clone(),
             ),
         )
         .await?;
@@ -6167,6 +6252,7 @@ where
                 prompt: prepared.prompt,
                 activate: prepared.activate,
                 attachments: prepared.attachments,
+                image_blocks: prepared.image_blocks,
                 display_text: prepared.display_text,
             })
             .await
@@ -6424,6 +6510,10 @@ pub(crate) struct PreparedTurn {
     pub(crate) display_text: String,
     /// 本轮附件元数据；回显在开启项上，并随 `TurnPrompt` 交给 driver 落盘。
     pub(crate) attachments: Vec<crate::protocol::Attachment>,
+    /// 本轮图片内容块（含 base64），随 `TurnPrompt` 进模型上下文。
+    pub(crate) image_blocks: Vec<yi_agent_core::ContentBlock>,
+    /// 本轮图片元数据；回显在开启项上（`Item::UserMessage.images`）。
+    pub(crate) image_refs: Vec<crate::protocol::ImageRef>,
     pub(crate) activate: Option<Arc<ThreadRoot>>,
     pub(crate) status_handle: Arc<std::sync::Mutex<ThreadStatus>>,
 }
@@ -6444,14 +6534,16 @@ async fn prepare_turn_core(
         .and_then(|v| v.as_str())
         .ok_or(TurnPrepareError::MissingThreadId)?
         .to_string();
-    // 一次性拆出「文本 + 附件源路径」:文本为空但有附件时仍然放行(附件-only)。
+    // 一次性拆出「文本 + 附件源路径 + 图片输入」:文本为空但有附件或图片时仍然
+    // 放行(附件-only / 图片-only)。
     let (text, source_paths) = crate::attachments::parse_input(params);
+    let image_inputs = crate::attachments::parse_image_inputs(params);
     let text_opt = if text.trim().is_empty() {
         None
     } else {
         Some(text)
     };
-    if text_opt.is_none() && source_paths.is_empty() {
+    if text_opt.is_none() && source_paths.is_empty() && image_inputs.is_empty() {
         return Err(TurnPrepareError::EmptyInput);
     }
 
@@ -6502,6 +6594,65 @@ async fn prepare_turn_core(
         }
     }
 
+    // 复制 + 编码图片。同样放在占 `active_turn_id` **之前**。
+    //
+    // 两步都走「先复制进工作区，再读**已复制的那一份**」：`prepare_image_file`
+    // 在根外读原文件也可以，但那样回显的 `path` 与真正读到的字节可能来自两个
+    // 位置；统一读根内副本，`path` 与内容才必然同源。
+    let mut image_blocks = Vec::with_capacity(image_inputs.len());
+    let mut image_refs = Vec::with_capacity(image_inputs.len());
+    for input in &image_inputs {
+        let crate::attachments::ImageInput::Path(source) = input;
+        let stored = match crate::attachments::store_attachment(
+            Path::new(&cwd),
+            &thread_id,
+            Path::new(source),
+            max_bytes,
+        ) {
+            Ok(stored) => stored,
+            Err(e) => {
+                return Err(TurnPrepareError::InvalidAttachment(format!(
+                    "image {source}: {e:?}"
+                )));
+            }
+        };
+        let stored_abs = Path::new(&cwd).join(&stored.path);
+        match yi_agent_tools::image_prep::prepare_image_file(
+            &stored_abs,
+            yi_agent_core::ImageDetail::High,
+            yi_agent_tools::image_prep::resolve_budget(),
+        ) {
+            Ok(yi_agent_tools::image_prep::PreparedImage::Ready {
+                media_type, data, ..
+            }) => {
+                image_blocks.push(yi_agent_core::ContentBlock::Image {
+                    source: yi_agent_core::ImageSource::Base64 {
+                        media_type: media_type.clone(),
+                        data,
+                    },
+                    detail: yi_agent_core::ImageDetail::High,
+                    path: Some(stored.path.clone()),
+                });
+                image_refs.push(crate::protocol::ImageRef {
+                    path: stored.path,
+                    media_type,
+                    size: stored.size,
+                    detail: Some(yi_agent_core::ImageDetail::High.as_wire_str().to_string()),
+                });
+            }
+            Ok(yi_agent_tools::image_prep::PreparedImage::Omitted { message }) => {
+                return Err(TurnPrepareError::InvalidAttachment(format!(
+                    "image {source}: {message}"
+                )));
+            }
+            Err(e) => {
+                return Err(TurnPrepareError::InvalidAttachment(format!(
+                    "image {source}: {e:?}"
+                )));
+            }
+        }
+    }
+
     // 占位(复制成功之后)。
     {
         let Some(session) = threads.get_mut(&thread_id) else {
@@ -6512,7 +6663,6 @@ async fn prepare_turn_core(
         }
         session.active_turn_id = Some(turn_id.clone());
     }
-
     let activate = pending_activation.get(&thread_id).cloned().flatten();
     // prompt 送进模型时带上附件清单;气泡文本仍是原话(见 `display_text`)。
     let prompt = crate::attachments::prompt_with_attachments(
@@ -6526,6 +6676,8 @@ async fn prepare_turn_core(
         prompt,
         display_text: text_opt.unwrap_or_default(),
         attachments,
+        image_blocks,
+        image_refs,
         activate,
         status_handle,
     })
@@ -6556,12 +6708,13 @@ fn opening_user_item(
     turn_id: &str,
     text: &str,
     attachments: Vec<crate::protocol::Attachment>,
+    images: Vec<crate::protocol::ImageRef>,
 ) -> crate::protocol::Item {
     crate::protocol::Item::UserMessage {
         id: format!("user-{turn_id}"),
         text: text.to_string(),
         attachments,
-        images: Vec::new(),
+        images,
     }
 }
 
@@ -6633,6 +6786,7 @@ async fn start_turn_core(
             &prepared.turn_id,
             &prepared.display_text,
             prepared.attachments.clone(),
+            prepared.image_refs.clone(),
         ),
     )
     .await?;
@@ -6657,6 +6811,7 @@ async fn start_turn_core(
             prompt: prepared.prompt,
             activate: prepared.activate,
             attachments: prepared.attachments,
+            image_blocks: prepared.image_blocks,
             display_text: prepared.display_text,
         })
         .await
@@ -8707,6 +8862,33 @@ pub(crate) mod tests {
         }
     }
 
+    /// 记录每次调用收到的 `messages`（含内容块），用于断言图片真的以
+    /// `ContentBlock::Image` 进了模型上下文，而不只是回显在 item 上。
+    struct CapturingMessagesProvider {
+        /// 每次 provider 调用一份完整消息列表。
+        messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>>,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for CapturingMessagesProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            self.messages.lock().unwrap().push(req.messages.clone());
+            let events = vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("ok".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
     /// 永不自行结束的 provider:每 5ms 吐一个 delta,turn 会一直活跃,
     /// 直到被 `turn/interrupt` 取消。
     struct SlowProvider;
@@ -9223,6 +9405,17 @@ pub(crate) mod tests {
                 .expect("read_line failed");
             assert!(n > 0, "unexpected EOF while waiting for a message");
             serde_json::from_str(buf.trim()).expect("server wrote invalid JSON")
+        }
+
+        /// 读到 `turn/completed` 为止（最多 40 帧），返回那一帧。
+        pub(crate) async fn read_until_turn_completed(&mut self) -> serde_json::Value {
+            for _ in 0..40 {
+                let v = self.read_value().await;
+                if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                    return v;
+                }
+            }
+            panic!("turn/completed never arrived");
         }
 
         /// 关掉客户端写端(触发 EOF)并等待 server 任务结束。
@@ -10373,6 +10566,222 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// `size` 必须与 `path` 指向的**文件**一致（客户端展示的大小要和 `image/read`
+    /// 真正取到的字节数对得上）；文件不在时才退回载荷长度。
+    #[test]
+    fn image_ref_prefers_the_file_size_and_falls_back_to_the_payload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // "QUJD" 是 "ABC" 的 base64（3 字节）。
+        let block = yi_agent_core::ContentBlock::Image {
+            source: yi_agent_core::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            },
+            detail: yi_agent_core::ImageDetail::High,
+            path: Some(".yi-agent/attachments/t/x.png".into()),
+        };
+        let absent = image_ref_from_block(dir.path(), &block).unwrap();
+        assert_eq!(absent.size, 3, "no file: fall back to the payload length");
+        assert_eq!(absent.media_type, "image/png");
+        assert_eq!(absent.detail.as_deref(), Some("high"));
+
+        let stored = dir.path().join(".yi-agent/attachments/t/x.png");
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        std::fs::write(&stored, [0u8; 5]).unwrap();
+        assert_eq!(
+            image_ref_from_block(dir.path(), &block).unwrap().size,
+            5,
+            "a present file (the re-encoded payload) is the source of truth"
+        );
+    }
+
+    #[test]
+    fn image_ref_ignores_non_images_and_blocks_without_a_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(
+            image_ref_from_block(dir.path(), &yi_agent_core::ContentBlock::Text("hi".into()))
+                .is_none()
+        );
+        let no_path = yi_agent_core::ContentBlock::Image {
+            source: yi_agent_core::ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            },
+            detail: yi_agent_core::ImageDetail::High,
+            path: None,
+        };
+        assert!(image_ref_from_block(dir.path(), &no_path).is_none());
+        let url = yi_agent_core::ContentBlock::Image {
+            source: yi_agent_core::ImageSource::Url("https://example.test/y.png".into()),
+            detail: yi_agent_core::ImageDetail::High,
+            path: Some("y.png".into()),
+        };
+        assert!(image_ref_from_block(dir.path(), &url).is_none());
+    }
+
+    /// 桌面端从「图片」选择器选中的图（工作区外的绝对路径）必须被复制进 thread
+    /// 的 cwd，元数据以 `ImageRef` 回显在开启项上；气泡正文仍是用户原话，
+    /// 图片**不进**附件清单（它是内容块，不是文档附件）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_with_an_image_injects_an_image_block_and_an_item_ref() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 一张 8x8 PNG，放在工作区外（模拟从「图片」选择器选）。
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("shot.png");
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([1, 2, 3]));
+        img.save_with_format(&src, image::ImageFormat::Png).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}},{{"type":"text","text":"这是什么"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") {
+                opener = Some(v["params"]["item"].clone());
+                break;
+            }
+        }
+        let item = opener.expect("the turn must open with an item");
+        assert_eq!(item["type"], "userMessage", "{item}");
+        assert_eq!(item["text"], "这是什么", "{item}");
+        let rel = item["images"][0]["path"].as_str().expect("image path");
+        assert!(rel.starts_with(".yi-agent/attachments/"), "{rel}");
+        assert!(
+            workdir.path().join(rel).is_file(),
+            "image not copied: {rel}"
+        );
+        assert_eq!(item["images"][0]["media_type"], "image/png", "{item}");
+        assert_eq!(item["images"][0]["detail"], "high", "{item}");
+        // 气泡文本里不得注入清单。
+        assert!(
+            !item["text"].as_str().unwrap().contains("Attached files"),
+            "{item}"
+        );
+
+        // 落盘回合里也必须带上 images 引用：resume 回放时气泡要能重新渲染出图。
+        let _ = h.read_until_turn_completed().await;
+        let jsonl = std::fs::read_to_string(
+            workdir
+                .path()
+                .join(".yi-agent")
+                .join("threads")
+                .join(format!("{tid}.jsonl")),
+        )
+        .expect("the thread log must exist after a completed turn");
+        let line: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let opened = &line["items"][0];
+        assert_eq!(opened["type"], "userMessage", "{line}");
+        assert_eq!(opened["images"][0]["path"], rel, "{line}");
+        assert_eq!(opened["images"][0]["size"], src.metadata().unwrap().len());
+        h.shutdown().await;
+    }
+
+    /// 反向断言：图片必须真的以内容块送进**模型**（而不只是回显在 item 上）。
+    ///
+    /// 沿用 `turn_start_prompt_reaching_the_model_contains_the_attachment_manifest`
+    /// 的抓取手法，但捕获的是 provider 收到的 **messages**：首条 user 消息的
+    /// content 里必须有一个带 `path` 的 `ContentBlock::Image`，文本块仍然存在。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_image_reaches_the_model_as_a_content_block() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+
+        let messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let messages_factory = Arc::clone(&messages);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          _cwd: &std::path::Path,
+                          _mode: crate::thread_store::ThreadMode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CapturingMessagesProvider {
+                messages: Arc::clone(&messages_factory),
+            });
+            let config = yi_agent_core::AgentConfig::default();
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            apply_session(&mut agent, session);
+            Ok(BuiltAgent {
+                agent,
+                provider,
+                config,
+                decision_tx: None,
+                decision_rx: None,
+                catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("shot.png");
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([9, 9, 9]));
+        img.save_with_format(&src, image::ImageFormat::Png).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"这是什么"}},{{"type":"image","path":"{}"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        // 等到 turn 收尾，确保 provider 至少被调用过一次。
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        let seen = messages.lock().unwrap().clone();
+        let first = seen.last().expect("the provider must have been called");
+        let first_user = first
+            .iter()
+            .find(|m| m.role == yi_agent_core::Role::User)
+            .expect("the first call must carry a user message");
+        let image = first_user
+            .content
+            .iter()
+            .find_map(|b| match b {
+                yi_agent_core::ContentBlock::Image { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .expect("the user message must carry an image content block");
+        let rel = image.expect("the image block must carry the stored relative path");
+        assert!(rel.starts_with(".yi-agent/attachments/"), "{rel}");
+        assert!(
+            std::path::Path::new(&workdir.path().join(&rel)).is_file(),
+            "the block path must point at the stored copy: {rel}"
+        );
+        let text = first_user
+            .content
+            .iter()
+            .find_map(|b| match b {
+                yi_agent_core::ContentBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the text block must still be there");
+        assert_eq!(text, "这是什么");
+        assert!(
+            !text.contains("Attached files"),
+            "images are content blocks, not manifest entries: {text:?}"
+        );
+
+        h.shutdown().await;
+    }
+
     /// 只发附件、不打字也必须能起 turn（空 input 校验放宽到「既无文本又无附件」）。
     #[tokio::test(flavor = "multi_thread")]
     async fn turn_start_accepts_an_attachment_only_message() {
@@ -10409,6 +10818,108 @@ pub(crate) mod tests {
                 .as_str()
                 .is_some_and(|s| !s.is_empty()),
             "an attachment-only turn must still return a turn_id: {resp:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 只发图片、不打字也必须能起 turn——空 input 校验放宽到「既无文本、又无附件、
+    /// 又无图片」三缺一才算空（控制器裁定 2）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_accepts_an_image_only_message() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("only.png");
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([7, 7, 7]));
+        img.save_with_format(&src, image::ImageFormat::Png).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        let mut resp: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        assert!(
+            resp.get("error").is_none(),
+            "image-only start must succeed: {resp:?}"
+        );
+        assert!(
+            resp["result"]["turn_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "an image-only turn must still return a turn_id: {resp:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 不是图片的「图片输入」（例如把 PDF 塞进 `type:"image"`）必须就地拒绝：
+    /// 错误提到 image，且**一个 turn 都不起**（准备失败早于占位与发帧）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_rejects_a_non_image_image_input() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("not-an-image.png");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}},{{"type":"text","text":"hi"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        let mut methods_before_response: Vec<String> = Vec::new();
+        let mut resp: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(11)) {
+                resp = Some(v);
+                break;
+            }
+            if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
+                methods_before_response.push(m.to_string());
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        let err = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(err.contains("image"), "got: {resp}");
+        assert!(
+            methods_before_response.is_empty(),
+            "no turn may start on a bad image: {methods_before_response:?}"
+        );
+        // 而且活跃标记必须干净：同一 thread 的**下一轮**仍能正常起（不是
+        // 「已占用但起不来」的僵尸 turn）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        let mut second: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(12)) {
+                second = Some(v);
+                break;
+            }
+        }
+        let second = second.expect("the follow-up turn/start must answer");
+        assert!(
+            second.get("error").is_none(),
+            "a rejected image must not leave the turn slot occupied: {second:?}"
         );
         h.shutdown().await;
     }
@@ -10974,6 +11485,7 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                image_blocks: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -11097,6 +11609,7 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                image_blocks: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -11507,6 +12020,7 @@ pub(crate) mod tests {
                     prompt: "hi".into(),
                     activate: None,
                     attachments: Vec::new(),
+                    image_blocks: Vec::new(),
                     display_text: "hi".into(),
                 })
                 .await
@@ -12031,6 +12545,7 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                image_blocks: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -13323,6 +13838,7 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                image_blocks: Vec::new(),
                 display_text: "hi".into(),
             })
             .await

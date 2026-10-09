@@ -160,6 +160,32 @@ pub fn parse_input(params: &serde_json::Value) -> (String, Vec<String>) {
     (text, paths)
 }
 
+/// `turn/start` 的图片输入来源。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageInput {
+    /// 桌面端：文件选择器给的绝对路径，服务端负责复制。
+    Path(String),
+}
+
+/// 拆出图片输入块（`{type:"image", path}`）。非图片块一律忽略。
+///
+/// 图片**不**并入 `parse_input` 的附件清单：文档附件走 `prompt_with_attachments`
+/// 注入文本清单，图片则变成模型可见的 `ContentBlock::Image`。两者可以共存。
+pub fn parse_image_inputs(params: &serde_json::Value) -> Vec<ImageInput> {
+    let Some(input) = params.get("input").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in input {
+        if block.get("type").and_then(|t| t.as_str()) == Some("image") {
+            if let Some(p) = block.get("path").and_then(|p| p.as_str()) {
+                out.push(ImageInput::Path(p.to_string()));
+            }
+        }
+    }
+    out
+}
+
 /// 清单里展示的名字：先走路径安全化（`/`、`\`、控制字符、`:` 全变 `_`），
 /// 再把连续空白折叠成单个空格，最后整体加双引号。
 ///
@@ -403,5 +429,46 @@ mod tests {
     #[test]
     fn empty_attachments_still_return_the_bare_text() {
         assert_eq!(prompt_with_attachments("只有正文", &[]), "只有正文");
+    }
+
+    #[test]
+    fn parse_image_inputs_keeps_only_image_blocks() {
+        let params: serde_json::Value = serde_json::json!({
+            "input": [
+                { "type": "image", "path": "/tmp/a.png" },
+                { "type": "text", "text": "hi" },
+                { "type": "attachment", "path": "/tmp/b.pdf" },
+                { "type": "image" },
+                { "type": "image", "path": "/tmp/c.jpg" }
+            ]
+        });
+        assert_eq!(
+            parse_image_inputs(&params),
+            vec![
+                ImageInput::Path("/tmp/a.png".into()),
+                ImageInput::Path("/tmp/c.jpg".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_image_inputs_tolerates_missing_input() {
+        assert!(parse_image_inputs(&serde_json::json!({})).is_empty());
+        assert!(parse_image_inputs(&serde_json::json!({ "input": "nope" })).is_empty());
+    }
+
+    /// 图片块在 `parse_input` 里必须落进 `_ => {}`：既不能进文本，也不能进文档
+    /// 附件路径（否则同一张图会被复制两次、还会被塞进文本清单）。
+    #[test]
+    fn parse_input_ignores_image_blocks() {
+        let params: serde_json::Value = serde_json::json!({
+            "input": [
+                { "type": "image", "path": "/tmp/a.png" },
+                { "type": "text", "text": "hi" }
+            ]
+        });
+        let (text, paths) = parse_input(&params);
+        assert_eq!(text, "hi");
+        assert!(paths.is_empty(), "{paths:?}");
     }
 }

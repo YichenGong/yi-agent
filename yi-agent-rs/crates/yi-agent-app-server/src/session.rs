@@ -23,6 +23,12 @@ pub struct TurnPrompt {
     pub activate: Option<Arc<yi_agent_subagent::thread_root::ThreadRoot>>,
     /// 本轮用户附加的文档；落盘时写进开启的 `userMessage` item 供回放渲染。
     pub attachments: Vec<crate::protocol::Attachment>,
+    /// 本轮的图片块（已编码，含 base64），随 user 消息进模型上下文。
+    ///
+    /// 与 `attachments` 的区别：文档附件只是清单注入到 `prompt` 文本里，图片是
+    /// 真正的内容块（`ContentBlock::Image`），由 driver 用 `run_blocks` 送出去。
+    /// 两者可以同时存在。
+    pub image_blocks: Vec<yi_agent_core::ContentBlock>,
     /// 气泡与落盘项显示的文本:用户原话,**不含**注入的附件清单。
     ///
     /// `prompt` 是加了清单(送给模型)的那一份;落盘/checkpoint 必须用这一份,
