@@ -254,6 +254,12 @@ impl UploadRegistry {
         }
     }
 
+    /// 该会话属于哪条 thread（含未 commit 的）。`commit` 的 RPC 分支据此解析 cwd：
+    /// 设计的 `commit` 参数只有 `{ uploadId }`，thread 由记录带出。
+    pub fn thread_id_of(&self, upload_id: &str) -> Option<String> {
+        self.sessions.get(upload_id).map(|s| s.thread_id.clone())
+    }
+
     /// 丢弃一条会话（删 staging 与记录）。已落盘的附件**不动**：它已是该 thread
     /// 附件的一部分，删掉会让回放里的气泡指不到文件。
     pub fn abort(&mut self, upload_id: &str) {
@@ -496,7 +502,6 @@ mod tests {
 
     #[test]
     fn append_refuses_an_unknown_upload() {
-        let tmp = tempfile::TempDir::new().unwrap();
         let mut reg = UploadRegistry::new();
         assert!(reg.append("upload-nope", 0, b"x").is_err());
     }
