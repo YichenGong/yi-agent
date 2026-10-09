@@ -3,6 +3,7 @@
 mod config;
 mod control_commands;
 mod llm_prefix;
+mod onboarding_prompt;
 mod schedule_intent;
 mod tracing_init;
 mod tui;
@@ -1296,6 +1297,18 @@ async fn load_permission_checker_for_workdir_async(
 }
 
 fn run_agent(cli: Cli) -> Result<()> {
+    // 首启引导发生在 `config::load` 之前：此时还没有配置，加载器会直接报错。
+    // 落点是全局 `~/.yi-agent/.env`——与桌面 / app-server(`resolve_global_env_path`)
+    // 一致；只有在没有 HOME 时才退回到 workdir 内的本地路径。
+    let env_path =
+        config::resolve_global_env_path().unwrap_or_else(|| config::resolve_env_path(&cli));
+    let prefs_path = env_path.with_file_name("preferences.json");
+    if onboarding_prompt::should_offer(&env_path, &prefs_path) {
+        if let Err(error) = onboarding_prompt::run_onboarding_prompt(&env_path, &prefs_path) {
+            eprintln!("引导未完成：{error}");
+        }
+    }
+
     let config = config::load(&cli)?;
 
     let agent_workdir = config.workdir.clone();
@@ -2417,6 +2430,31 @@ mod tests {
     #[test]
     fn parse_listen_accepts_stdio() {
         assert!(matches!(parse_listen("stdio://").unwrap(), Listen::Stdio));
+    }
+
+    #[test]
+    fn run_agent_offers_onboarding_before_loading_config() {
+        // 新机器上 config::load 会因为缺 key 直接失败，引导必须抢在它前面；
+        // 且落点是全局 `.env`（与桌面 / app-server 一致），不是 workdir 内的本地路径。
+        // Needles built from fragments so this test's own source cannot satisfy them.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn run_agent(")
+            .nth(1)
+            .expect("run_agent must exist");
+        let offer = ["onboarding_prompt::should_offer(", "&env_path"].concat();
+        let global = ["config::resolve_global", "_env_path()"].concat();
+        let load = ["config::load(&cli)"].concat();
+        let offer_at = body.find(&offer).expect("run_agent must offer onboarding");
+        let load_at = body.find(&load).expect("run_agent must load config");
+        assert!(
+            offer_at < load_at,
+            "the onboarding prompt must run before config::load"
+        );
+        assert!(
+            body.contains(&global),
+            "onboarding must target the global env path"
+        );
     }
 
     #[test]
