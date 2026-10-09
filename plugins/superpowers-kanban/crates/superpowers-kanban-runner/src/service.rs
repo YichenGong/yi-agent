@@ -922,10 +922,22 @@ mod tests {
 
         let service = BoardService::new(state_dir, project, Some(dir.path().join("home")));
         // 补领之前：全局池是空的，别的领取者能抢到那张在跑卡片本该占的名额。
-        assert!(
-            lease::acquire_in(&leases_dir, 1).is_some(),
-            "restart starts with an empty pool"
-        );
+        // 探针拿到的租约必须在 `adopt_running_leases` **之前** drop，好让池子
+        // 显得空的；但 `drop` 之后 flock 是内核**异步**释放的，紧接着的补领
+        // 会撞上正在释放的锁而误拿到名额（实测并行跑全套时偶发，症状为下面
+        // 「the running card's slot is re-adopted」断言失败）。所以先探出
+        // 「池子空」，再**有界等待**该探针租约真正释放，确认池子干净，才 adopt。
+        let probe = lease::acquire_in(&leases_dir, 1);
+        assert!(probe.is_some(), "restart starts with an empty pool");
+        drop(probe);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if let Some(lease) = lease::acquire_in(&leases_dir, 1) {
+                drop(lease);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         service.adopt_running_leases(1);
         // 补领之后：唯一的名额被在跑的卡片占住。
         assert!(
@@ -1242,11 +1254,23 @@ mod tests {
         }
         assert_eq!(service.list()["cards"][0]["state"], "merging");
         // 已在 merging：第二次申请被拒（名额的持久载体是卡片状态）。
-        match service.merge_request("card-1").unwrap() {
-            MergeRequest::Denied(reason) => {
-                assert!(reason.contains("not awaiting_merge"), "{reason}")
+        // 这里要有界重试：第一次 `merge_request` 在返回前 drop 了 merge.lock，
+        // 而内核在 `close()` 后**异步**释放 flock，负载下紧随其后的获取会撞上
+        // 正在释放的那把锁而拿到 `Busy`（实测并行跑全套时偶发）。`Busy` 与
+        // 「卡已在 merging」是两回事，只有 `Denied` 才说明额度确实被钉住；
+        // 但 `Busy` 是瞬时窗口，重试即可穿过。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match service.merge_request("card-1").unwrap() {
+                MergeRequest::Denied(reason) => {
+                    assert!(reason.contains("not awaiting_merge"), "{reason}");
+                    break;
+                }
+                MergeRequest::Busy if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => panic!("expected Denied on second request, got {other:?}"),
             }
-            other => panic!("expected Denied on second request, got {other:?}"),
         }
     }
 

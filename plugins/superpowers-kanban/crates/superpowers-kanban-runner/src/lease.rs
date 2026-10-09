@@ -109,10 +109,20 @@ mod tests {
             "第 3 个必须等：只有 2 个名额"
         );
         drop(a);
-        assert!(
-            acquire_in(dir.path(), 2).is_some(),
-            "释放一个名额后必须能再领到"
-        );
+        // 内核在 `close()` 后**异步**释放 flock：drop 之后立刻非阻塞重领，
+        // 负载下可能仍撞上正在释放的那把锁（实测并行跑全套时空载领得到、
+        // 满载偶发领不到）。这里按同模块 `a_slot_held_by_a_dead_process_is_reclaimed`
+        // 的写法做有界重试——释放本身是无界的，只是不保证与 close 同步。
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut reacquired = false;
+        while std::time::Instant::now() < deadline {
+            if acquire_in(dir.path(), 2).is_some() {
+                reacquired = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reacquired, "释放一个名额后必须能再领到");
     }
 
     #[test]
