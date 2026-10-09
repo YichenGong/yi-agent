@@ -42,6 +42,14 @@ export interface PendingAttachment {
    * 内容块（`{type:"image", path}`，服务端摄取成模型直接可见的图片）。
    */
   kind: "document" | "image";
+  /**
+   * 已上传完成、落在服务端工作区里的图片句柄（远端/iOS 路径）。
+   *
+   * 有无它决定发送时的协议形态：有则送 `{type:"uploaded_image", uploadId}`（字节
+   * 早已在服务端落盘，句柄是唯一引用，此时 `path` 只供本地渲染）；无则送
+   * `{type:"image", path}`（桌面端：服务端自己按路径读盘）。
+   */
+  uploadId?: string;
 }
 
 /** 路径的最后一段（兼容 `/` 与 `\`）。 */

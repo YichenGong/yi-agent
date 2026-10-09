@@ -39,6 +39,7 @@ import {
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
+import { uploadImage } from "./lib/imageUpload";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
@@ -113,6 +114,50 @@ function modeForThread(groups: WorkspaceGroup[], pinned: ThreadSummary[], id: st
 function sendMethodMismatchCode(e: unknown): number | null {
   const code = (e as { code?: unknown } | null)?.code;
   return code === -32013 || code === -32012 ? code : null;
+}
+
+/**
+ * 用 webview 自带的文件选择器选图片，返回用户选中的文件（取消为空数组）。
+ *
+ * 远端（iOS）的图片入口：这里没有 Tauri dialog（那是桌面端能力），相册由系统
+ * 选择器交付，`accept="image/*"` 让系统只显示图片，`multiple` 允许多选。
+ *
+ * 选择器**当场造、用完即摘**：没有任何 UI 依赖它长期存在，挂一个隐藏 input 在
+ * DOM 里只会多一份要维护的状态。摘除放在 `change`/`cancel` 之后——提前摘会让某些
+ * 浏览器丢掉选择结果。input 必须在文档里（`display:none` 只是别占位），否则 iOS
+ * 的 `click()` 不会打开系统选择器。
+ *
+ * 取消的兜底有两层：`cancel` 是较新的事件（Safari 16.4+），老 webview 上退而用
+ * 「窗口重新获得焦点」判断对话框已关（把读数推迟一拍，让 `change` 先到）。
+ */
+function pickImageFiles(): Promise<File[]> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/*";
+    input.multiple = true;
+    input.style.display = "none";
+
+    // 只 resolve 一次：change 与 focus 兜底可能都想收尾，先到者摘掉 input，后到者
+    // 被「input 还在文档里吗」挡住（见下）。
+    const done = (files: File[]) => {
+      input.remove();
+      window.removeEventListener("focus", onFocus);
+      resolve(files);
+    };
+    const onFocus = () => {
+      // 推迟一拍：`change` 通常紧跟着 focus 到（甚至更早），先给它机会。
+      setTimeout(() => {
+        if (document.body.contains(input)) done(Array.from(input.files ?? []));
+      }, 0);
+    };
+
+    input.addEventListener("change", () => done(Array.from(input.files ?? [])));
+    input.addEventListener("cancel", () => done([]));
+    window.addEventListener("focus", onFocus);
+    document.body.append(input);
+    input.click();
+  });
 }
 
 export default function App() {
@@ -1322,10 +1367,17 @@ export default function App() {
     //
     // 附件/图片 block 必须排在文本 block **之前**：服务端按顺序读，附件先入场，
     // 文本里只留问题本身，不放任何附件清单。
+    //
+    // 图片有两种引用形态，按待发项有没有 `uploadId` 分派：远端（iOS）的图已经分片
+    // 上传落盘，只能按句柄引用；桌面端的图在本地盘上，交给服务端自己按路径读。
     const params = {
       threadId: id,
       input: [
-        ...images.map((f) => ({ type: "image" as const, path: f.path })),
+        ...images.map((f) =>
+          f.uploadId
+            ? { type: "uploaded_image" as const, uploadId: f.uploadId }
+            : { type: "image" as const, path: f.path },
+        ),
         ...documents.map((f) => ({ type: "attachment" as const, path: f.path })),
         { type: "text" as const, text },
       ],
@@ -1388,7 +1440,8 @@ export default function App() {
   }): Promise<void> => {
     const id = store.currentId;
     if (!id) return;
-    // iOS/远端没有原生选择器：桌面端能力，在别处不假装有。
+    // iOS/远端没有原生选择器：桌面端能力，在别处不假装有。远端图片走自己的路
+    // （见 `pickImagesOnRemote`），同样不碰这里。
     if (isRemoteClient()) return;
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({
@@ -1442,15 +1495,69 @@ export default function App() {
    *
    * 与 `pickFilesToAttach` 同形（共用 `pickIntoSession`），但用图片自己的白名单与
    * 上限：图片不进 `read_document` 清单，走的是内容块，服务端会把它摄取成模型直接
-   * 可见的图片。远端客户端的图片上传走另一条路（尚未接线），这里先不假装有。
+   * 可见的图片。远端（iOS）没有共享文件系统，走自己的上传路径
+   * （`pickImagesOnRemote`）。
    */
   const pickImagesToAttach = (): Promise<void> =>
-    pickIntoSession({
-      filterName: "图片",
-      extensions: IMAGE_EXTENSIONS,
-      problem: imageAttachmentProblem,
-      kind: "image",
-    });
+    isRemoteClient()
+      ? pickImagesOnRemote()
+      : pickIntoSession({
+          filterName: "图片",
+          extensions: IMAGE_EXTENSIONS,
+          problem: imageAttachmentProblem,
+          kind: "image",
+        });
+
+  /**
+   * 远端（iOS）的图片选择器：webview 自带的 `<input type="file">`。
+   *
+   * 这里没有 Tauri dialog（那是桌面端能力），也不该有：iOS 上相册由系统选择器
+   * 交付，`accept="image/*"` 让系统只显示图片，`multiple` 允许多选。选中的是
+   * `File`（字节在本地内存里，iOS 与桌面不共享文件系统），故必须分片上传。
+   *
+   * 选择器是**当场造、用完即摘**的：没有任何 UI 依赖它长期存在，挂一个隐藏 input
+   * 在 DOM 里只会多一份要维护的状态。
+   *
+   * 与 `pickIntoSession` 同一套「逐个处理、好坏互不影响」的语义：坏的（预检不过、
+   * 或上传失败）就地报错并丢弃，好的照常入列；一次多选里混着好坏是常态，不能因为
+   * 一个坏文件把整次选择作废。
+   */
+  const pickImagesOnRemote = async (): Promise<void> => {
+    const id = store.currentId;
+    if (!id) return;
+    // 注意：`pickImageFiles()` 必须在**用户手势的同一个任务**里被调用（它内部
+    // `input.click()` 才会打开系统选择器）。所以它之前不许插入任何 `await`——加了
+    // 一个就会让 iOS 静默地什么都不弹。
+    const files = await pickImageFiles();
+    if (files.length === 0) return;
+
+    const problems: string[] = [];
+    const accepted: PendingAttachment[] = [];
+    for (const file of files) {
+      // 预检用本地就能知道的字节数与文件名（白名单认的是扩展名）：不合格的不必
+      // 先花带宽传上去再被拒。
+      const problem = imageAttachmentProblem(file.name, file.size);
+      if (problem) {
+        problems.push(`${file.name}：${problem}`);
+        continue;
+      }
+      try {
+        // 上传成功即以服务端返回的**工作区相对路径**入列：`image/read` 以会话 cwd
+        // 为根，只有这个路径能读回缩略图（OS 对话框给的绝对路径做不到）。
+        const { uploadId, path } = await uploadImage(imageCall, id, file);
+        accepted.push({ path, name: file.name, size: file.size, kind: "image", uploadId });
+      } catch (e) {
+        problems.push(`${file.name}：${formatError(e)}`);
+      }
+    }
+    if (accepted.length > 0) {
+      setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
+    }
+    if (problems.length > 0) {
+      store.view(id).session.lastError = problems.join("；");
+      force((v) => v + 1);
+    }
+  };
 
   /** 从当前会话的待发列表里移除一个附件（用户点了 chip 上的叉）。 */
   const removePendingAttachment = (path: string): void => {

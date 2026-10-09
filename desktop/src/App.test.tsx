@@ -2980,3 +2980,144 @@ describe("App 附件接线", () => {
     });
   });
 });
+
+// 远端（iOS）图片：没有共享文件系统，也不该弹 Tauri dialog——入口是 webview 自带的
+// `<input type="file">`，选中的字节经 `image/upload/*` 分片送到服务端，待发附件记的是
+// **服务端返回的工作区相对路径**（`image/read` 以会话 cwd 为根，故 chip 缩略图能读回）。
+describe("App 远端图片上传", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+  const imageButton = () => screen.getByRole("button", { name: "附加图片" });
+  const sendButton = () => screen.getByRole("button", { name: /^send$/i });
+
+  /**
+   * 远端（iOS）没有 Tauri dialog：`onPickImages` 会当场造一个 `<input type="file">`
+   * 挂进 body、点了它，再在 change 时摘掉。这里等它出现，把选中的 File 塞进 `files`
+   * 并派发 change。
+   */
+  async function pickImagesRemote(files: File[]) {
+    await act(async () => {
+      fireEvent.click(imageButton());
+    });
+    const input = await waitFor(() => {
+      const el = document.body.querySelector('input[type="file"]');
+      expect(el).not.toBeNull();
+      return el as HTMLInputElement;
+    });
+    // 系统相册的选择器由这两个属性决定：只收图片、可多选。
+    expect(input.accept).toBe("image/*");
+    expect(input.multiple).toBe(true);
+    await act(async () => {
+      fireEvent.change(input, { target: { files } });
+    });
+  }
+
+  /** 一个会说 `image/upload/*` 的假服务端（与 `imageUpload.test.ts` 同形）。 */
+  function uploadServer(opts: { failBeginFor?: string } = {}) {
+    /** 每次 begin→commit 记录一行，用来断言「送上去的是哪个文件的哪些字节」。 */
+    const uploads: Array<{ name: string; mime: string; size: number; bytes: number[] }> = [];
+    let seq = 0;
+    let staging: { name: string; size: number; received: number[] } | null = null;
+    state.dataSources["image/upload/begin"] = (params) => {
+      const p = params as { name: string; mime: string; size: number };
+      if (opts.failBeginFor && p.name.includes(opts.failBeginFor)) {
+        throw { code: -32602, message: "begin refused" };
+      }
+      staging = { name: p.name, size: p.size, received: [] };
+      uploads.push({ name: p.name, mime: p.mime, size: p.size, bytes: [] });
+      return { uploadId: `u${++seq}`, chunkSize: 512 * 1024 };
+    };
+    state.dataSources["image/upload/chunk"] = (params) => {
+      const p = params as { index: number; data: string };
+      const bin = atob(p.data);
+      for (let i = 0; i < bin.length; i += 1) staging!.received.push(bin.charCodeAt(i));
+      return {};
+    };
+    state.dataSources["image/upload/commit"] = () => {
+      const path = `.yi-agent/attachments/t1/ab-${staging!.name}`;
+      uploads[uploads.length - 1].bytes = staging!.received;
+      return { path, mediaType: "image/png", size: staging!.size };
+    };
+    state.dataSources["image/upload/abort"] = () => ({});
+    return { uploads };
+  }
+
+  it("uploads picked Files and assembles an uploaded_image block on send", async () => {
+    asRemote();
+    const server = uploadServer();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickImagesRemote([new File([new Uint8Array([1, 2, 3])], "截图.png", { type: "image/png" })]);
+
+    // chip 出现即「上传完成、进了待发列表」；名字取自选中的文件。
+    expect(await screen.findByText("截图.png")).toBeTruthy();
+    expect(server.uploads).toEqual([
+      { name: "截图.png", mime: "image/png", size: 3, bytes: [1, 2, 3] },
+    ]);
+    // begin → chunk → commit，各一次（小文件一块）。
+    const methods = clients[0].requests.map((r) => r.method);
+    expect(methods.filter((m) => m === "image/upload/begin")).toHaveLength(1);
+    expect(methods.filter((m) => m === "image/upload/chunk")).toHaveLength(1);
+    expect(methods.filter((m) => m === "image/upload/commit")).toHaveLength(1);
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "看看这个" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    // 已上传的图片按**句柄**送（`{type:"uploaded_image", uploadId}`），路径只有本地
+    // 渲染用（桌面端那条 `{type:"image", path}` 一个字都没变）。
+    expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "uploaded_image", uploadId: "u1" },
+        { type: "text", text: "看看这个" },
+      ],
+    });
+  });
+
+  it("keeps the successful files and reports the failed ones in place", async () => {
+    asRemote();
+    uploadServer({ failBeginFor: "坏的" });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 一次多选里混着好坏是常态：坏的只报它自己，好的照样入列。
+    await pickImagesRemote([
+      new File([new Uint8Array([1, 2, 3])], "好的.png", { type: "image/png" }),
+      new File([new Uint8Array([4, 5, 6])], "坏的.png", { type: "image/png" }),
+    ]);
+
+    await waitFor(() => expect(screen.getByText(/begin refused/)).toBeTruthy());
+    expect(screen.getByText("好的.png")).toBeTruthy();
+    expect(screen.queryByText("坏的.png")).toBeNull();
+  });
+
+  it("still uses the plugin-dialog path on the desktop build", async () => {
+    uploadServer();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 桌面（无 relay 绑定）走原生对话框，与既有行为逐字不变。
+    state.picks = [["/tmp/截图.png"]];
+    await act(async () => {
+      fireEvent.click(imageButton());
+    });
+
+    expect(screen.getByText("截图.png")).toBeTruthy();
+    expect(clients[0].requests.some((r) => r.method.startsWith("image/upload/"))).toBe(false);
+  });
+});
