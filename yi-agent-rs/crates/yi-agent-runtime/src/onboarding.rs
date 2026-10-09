@@ -474,6 +474,32 @@ mod tests {
         assert!(text.contains("YI_AGENT_MODEL=new"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn write_uses_0600_for_a_new_file_and_keeps_an_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // 新建：文件含密钥，权限必须收紧到 0600。
+        let fresh = dir.path().join("fresh.env");
+        write_model_settings(&fresh, &settings("openai", "gpt-4o", "https://u", "sk-k")).unwrap();
+        let fresh_mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(fresh_mode, 0o600, "a newly written .env must be 0600");
+
+        // 已存在：用户放宽过的权限必须原样保留，不能被悄悄改回 0600。
+        let existing = dir.path().join("existing.env");
+        std::fs::write(&existing, "MY_CUSTOM_KEY=abc\n").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_model_settings(
+            &existing,
+            &settings("openai", "gpt-4o", "https://u", "sk-k"),
+        )
+        .unwrap();
+        let existing_mode = std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
+        assert_eq!(existing_mode, 0o644, "an existing .env must keep its mode");
+    }
+
     #[test]
     fn validate_rejects_a_bad_provider_and_a_bad_url() {
         assert!(matches!(
