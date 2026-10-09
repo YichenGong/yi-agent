@@ -2758,7 +2758,27 @@ where
                         // 先按**元数据**长度设闸:否则一个几 GB 的文件会先被整个读进
                         // 内存再被拒,分片回传反成了内存放大原语。
                         let declared_len = match std::fs::metadata(&canonical) {
-                            Ok(m) => m.len(),
+                            Ok(m) => {
+                                // 同一趟元数据里挡下**非普通文件**:FIFO 的 `len`
+                                // 恒为 `0`,能骗过尺寸闸,而 `fs::read` 的 `open()`
+                                // 在无写端时会**一直阻塞**——本 RPC 是安全边界,
+                                // 一个构造请求就能把整条 serve 循环(所有客户端/
+                                // thread)挂住。故 `!is_file()` 直接拒绝,不再多发
+                                // 一次 `metadata` 系统调用。
+                                if !m.is_file() {
+                                    write_response(
+                                        &hub,
+                                        &client,
+                                        err_response(
+                                            id,
+                                            RpcError::invalid_params("not a regular file"),
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                                m.len()
+                            }
                             Err(e) => {
                                 write_response(
                                     &hub, &client,
@@ -11344,6 +11364,79 @@ pub(crate) mod tests {
             "the metadata gate must fire before the format guess: {resp}"
         );
         h.shutdown().await;
+    }
+
+    /// 非普通文件必须被拒：`thread` 的 cwd 下可达的一个 FIFO（agent 或克隆下来的
+    /// 仓库都可能放进来）元数据长度为 `0`，能通过尺寸闸；而 `std::fs::read` 的
+    /// `open()` 会在无写端时**阻塞**，把整条 serve 循环（所有客户端/thread）挂住。
+    /// 本 RPC 是安全边界，故 `!is_file()` 必须直接拒绝，绝不进入读取。
+    ///
+    /// 此处**自建 runtime** 而非用 `#[tokio::test]`：修复回退时那个 worker 会卡在
+    /// `open()` 上无法 join，若由 `#[tokio::test]` 代管，进程在 teardown 时挂住、
+    /// 整个套件被拖死。自建 runtime 让测试用 `tokio::time::timeout` 把它变成一次
+    /// **可读的失败**，再 `mem::forget` 掉这个 join 不掉的 runtime，进程照常退出。
+    #[test]
+    fn image_read_refuses_a_non_regular_file() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut h = rt.block_on(Harness::with_cfg(cfg));
+        let tid = rt.block_on(start_thread(&mut h));
+
+        let fifo = workdir
+            .path()
+            .join(".yi-agent/attachments")
+            .join(&tid)
+            .join("trap.png");
+        std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        // 经 `mkfifo` 造 FIFO——`libc` 不是本 crate 的依赖，不为一条测试新增它。
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available to exercise the FIFO path");
+        assert!(status.success(), "mkfifo failed for {fifo:?}");
+        let md = std::fs::symlink_metadata(&fifo).unwrap();
+        assert!(
+            !md.is_file() && !md.is_dir(),
+            "the fixture must really be a non-regular file: {fifo:?}"
+        );
+
+        rt.block_on(h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":550,"method":"image/read","params":{{"threadId":"{tid}","path":".yi-agent/attachments/{tid}/trap.png"}}}}"#
+        )));
+        // 修复缺失时 `image/read` 的 `fs::read` 会卡在 `open()` 上：此处**自己**
+        // 给 `read_line` 设 5s 上限（而不是用 `Harness::read_value`，它内部的
+        // 5s 超时会抢先 panic 掉），超时即说明它**没有**拒绝。超时后把这个卡住的
+        // `read_line` future 直接丢掉，再泄露 runtime、再断言失败——给出一次
+        // 干净的 RED 输出，而不是让整个测试套件挂死。
+        let mut buf = String::new();
+        let got = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), h.client_r.read_line(&mut buf)).await
+        });
+        let Ok(Ok(n)) = got else {
+            std::mem::forget(rt);
+            panic!("image/read must not block on a non-regular file");
+        };
+        assert!(n > 0, "unexpected EOF while waiting for the refusal");
+        let resp: serde_json::Value =
+            serde_json::from_str(buf.trim()).expect("server wrote invalid JSON");
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "a non-regular file must be refused as invalid_params: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("not a regular file"),
+            "the refusal must come from the regular-file check: {resp}"
+        );
+        rt.block_on(h.shutdown());
     }
 
     /// 未知 thread 必须拒绝（`thread_cwd` 两条解析路径都落空）。
