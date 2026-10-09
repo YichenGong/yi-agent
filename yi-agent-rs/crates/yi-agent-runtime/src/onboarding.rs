@@ -252,6 +252,42 @@ pub fn write_model_settings(path: &Path, settings: &ModelSettings) -> std::io::R
     Ok(())
 }
 
+/// `preferences.json` 里「引导已结束」的键：完成或用户选「稍后设置」都置位。
+pub const DISMISSED_KEY: &str = "onboarding_dismissed";
+
+/// 读结束标记。缺文件 / 不可读 / 损坏一律回 `false`（照常可能弹引导），
+/// 坏偏好绝不阻断启动——与 `settings_store` 的既有约定一致。
+pub fn load_dismissed(preferences_path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(preferences_path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    value
+        .get(DISMISSED_KEY)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// 写结束标记：读-改-写并保留其余键，落盘用「临时文件 + rename」保证原子性。
+pub fn save_dismissed(preferences_path: &Path, value: bool) -> std::io::Result<()> {
+    let existing = std::fs::read_to_string(preferences_path).unwrap_or_default();
+    let mut object = serde_json::from_str::<serde_json::Value>(&existing)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    object.insert(DISMISSED_KEY.to_string(), serde_json::Value::Bool(value));
+
+    if let Some(parent) = preferences_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = preferences_path.with_extension(format!("tmp-onboarding-{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&object)?)?;
+    std::fs::rename(&tmp, preferences_path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,5 +551,35 @@ mod tests {
             Err(SettingsError::EmptyField("model"))
         ));
         assert!(validate_settings(&settings("openai", "m", "", "k")).is_ok());
+    }
+
+    #[test]
+    fn missing_preferences_means_not_dismissed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(!load_dismissed(&dir.path().join("preferences.json")));
+    }
+
+    #[test]
+    fn a_corrupt_preferences_file_reads_as_not_dismissed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(!load_dismissed(&path));
+    }
+
+    #[test]
+    fn save_then_load_round_trips_and_preserves_other_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("preferences.json");
+        std::fs::write(&path, r#"{"theme":"light"}"#).unwrap();
+        save_dismissed(&path, true).unwrap();
+        assert!(load_dismissed(&path));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\"theme\""),
+            "other keys must survive: {text}"
+        );
+        save_dismissed(&path, false).unwrap();
+        assert!(!load_dismissed(&path));
     }
 }
