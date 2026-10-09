@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { formatError } from "./errorMessage";
 
 /**
@@ -43,6 +43,29 @@ const cache = new Map<string, string>();
  */
 const inflight = new Map<string, Promise<string>>();
 
+/**
+ * 对象 URL → 当前仍持有它的**已挂载**消费者数量。
+ *
+ * 淘汰一个还有人在显示的对象 URL 会让 `<img>` 变死图，且因为 state 已经等于该
+ * URL、effect 依赖又没变，组件不会自愈。所以淘汰前先看这里：有活消费者就推迟
+ * `revokeObjectURL`，等最后一个消费者卸载再放。
+ *
+ * 按 **URL**（而非 path）计数：每次 `createObjectURL` 都返回唯一 URL，同一个 path
+ * 被重新读回时是新 URL，于是「重新读回」天然不会误伤旧 URL、也不会重复回收。
+ *
+ * 计数**只在 effect 里加减**（它和清理函数成对）：`useState` 初始化器在 StrictMode
+ * 下会被重复调用，在里面计数会重复累加、导致最后一个消费者卸载后也回收不掉。
+ */
+const liveRefs = new Map<string, number>();
+
+/**
+ * 已淘汰（出了 LRU）但仍有人在显示、暂不能回收的对象 URL。
+ *
+ * 最后一个持有它的消费者卸载时回收并清掉；若中途该 path 被重新读回也只是新 URL
+ * 进缓存，旧 URL 仍只由「最后一个旧持有者卸载」来回收——不重复、不悬空。
+ */
+const deferredRevoke = new Set<string>();
+
 /** 命中则刷新 LRU 次序并返回 URL，未命中返回 `null`。 */
 function touchCache(path: string): string | null {
   const url = cache.get(path);
@@ -52,13 +75,37 @@ function touchCache(path: string): string | null {
   return url;
 }
 
-/** 存入缓存；超出上限时淘汰并释放最久未用的对象 URL。 */
+/** 记一个消费者开始持有 `url`。 */
+function acquireRef(url: string): void {
+  liveRefs.set(url, (liveRefs.get(url) ?? 0) + 1);
+}
+
+/** 记一个消费者不再持有 `url`；这是最后一个持有者且该 URL 已被淘汰时，回收它。 */
+function releaseRef(url: string): void {
+  const left = (liveRefs.get(url) ?? 0) - 1;
+  if (left > 0) {
+    liveRefs.set(url, left);
+    return;
+  }
+  liveRefs.delete(url);
+  if (deferredRevoke.has(url)) {
+    deferredRevoke.delete(url);
+    URL.revokeObjectURL(url);
+  }
+}
+
+/** 存入缓存；超出上限时淘汰最久未用的条目，无人显示者当场释放、有人在看者推迟。 */
 function storeCache(path: string, url: string): void {
   cache.set(path, url);
   while (cache.size > IMAGE_CACHE_LIMIT) {
     const oldest = cache.entries().next().value as [string, string];
     cache.delete(oldest[0]);
-    URL.revokeObjectURL(oldest[1]);
+    if ((liveRefs.get(oldest[1]) ?? 0) > 0) {
+      // 还有 <img> 在显示这张图：推迟回收，等最后一个消费者卸载。
+      deferredRevoke.add(oldest[1]);
+    } else {
+      URL.revokeObjectURL(oldest[1]);
+    }
   }
 }
 
@@ -138,7 +185,8 @@ function load(call: ImageReadCall, threadId: string, path: string): Promise<stri
  * `nextOffset === null`，拼成 Blob 后 `createObjectURL`。
  *
  * 缓存键是 `path`（同一工作区里哈希文件名唯一），跨组件共享：第二张相同的 `ref`
- * 命中缓存，**不发请求**。淘汰时释放对象 URL。
+ * 命中缓存，**不发请求**。淘汰时释放对象 URL；但若仍有已挂载消费者在显示该 URL，
+ * 则推迟到最后一个消费者卸载再释放（见 `deferredRevoke`）。
  *
  * `threadId` 为 `null` 或 `path` 为空时不读取（无会话/无引用），返回空状态而不是报错。
  *
@@ -150,10 +198,15 @@ export function useImageData(
   opts: { threadId: string | null; call: ImageReadCall },
 ): { url: string | null; error: string | null } {
   const { threadId, call } = opts;
+  // 本消费者**当前持有计数的那份 URL**（未持有为 `null`）。所有计数加减都在 effect
+  // 里做：effect 与清理函数成对，StrictMode 下也不会重复累加。
+  const heldRef = useRef<string | null>(null);
   const [state, setState] = useState<{ url: string | null; error: string | null }>(
     () => {
       if (!threadId || !path) return { url: null, error: null };
       // 命中缓存时**首帧**就有 URL：既不闪一下空白，也不触发读取 effect。
+      // 这里**不**计数（初始化器可能被 StrictMode 重复调用）；effect 会为这份 URL
+      // 记账，消费者照样计入引用。
       return { url: touchCache(path), error: null };
     },
   );
@@ -167,17 +220,38 @@ export function useImageData(
       return;
     }
 
+    // 归还本消费者占用的那份计数（卸载、换 URL、依赖变化时都走这里，幂等）。
+    const release = () => {
+      const held = heldRef.current;
+      if (held === null) return;
+      heldRef.current = null;
+      releaseRef(held);
+    };
+    // 记下本消费者现在持有 `url` 的计数；换 URL 时先把旧的还掉，避免漏计/多计。
+    const hold = (url: string) => {
+      if (heldRef.current === url) return;
+      release();
+      acquireRef(url);
+      heldRef.current = url;
+    };
+
     const cached = touchCache(path);
     if (cached !== null) {
+      // 命中缓存也要计数：否则淘汰会收回一张正在显示的图。初始化器很可能已把同一
+      // 份 URL 放进 state（首帧即显示），这里再 `hold` 它，计数与显示一致。
+      hold(cached);
       // 返回同一个对象即让 React 跳过重渲染；不能只是「值相等」，对象身份不等。
       setState((prev) => (prev.url === cached ? prev : { url: cached, error: null }));
-      return;
+      return release;
     }
 
     let alive = true;
     void load(call, threadId, path).then(
       (url) => {
-        if (alive) setState({ url, error: null });
+        if (!alive) return;
+        // 读回即持有：这份 URL 归本次挂载，卸载时归还，使淘汰能推迟到那时。
+        hold(url);
+        setState({ url, error: null });
       },
       (e: unknown) => {
         if (alive) setState({ url: null, error: formatError(e) });
@@ -185,6 +259,7 @@ export function useImageData(
     );
     return () => {
       alive = false;
+      release();
     };
   }, [path, threadId, call]);
 
