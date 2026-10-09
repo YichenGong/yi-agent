@@ -116,6 +116,13 @@ fn mime_for(path: &Path) -> Option<String> {
         "txt" | "md" | "csv" => "text/plain",
         "html" | "htm" => "text/html",
         "rtf" => "application/rtf",
+        // 图片与 `image/read`、`image_prep` 支持的四种格式对齐。桌面图片走
+        // `type:"image"` 不进附件清单,故这里主要服务 iOS 分片上传(commit 会把
+        // 该 MIME 回给客户端)。
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
         _ => return None,
     };
     Some(mime.to_string())
@@ -158,6 +165,44 @@ pub fn parse_input(params: &serde_json::Value) -> (String, Vec<String>) {
         }
     }
     (text, paths)
+}
+
+/// `turn/start` 的图片输入来源。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageInput {
+    /// 桌面端：文件选择器给的绝对路径，服务端负责复制。
+    Path(String),
+    /// iOS 端：分片上传先经 `image/upload/*` 落盘，这里只带 `uploadId`；
+    /// 服务端用上传登记表把它解析成同一份已落盘的附件。
+    Upload(String),
+}
+
+/// 拆出图片输入块：`{type:"image", path}`（桌面）与 `{type:"uploaded_image", uploadId}`
+/// （iOS 分片上传）。非图片块一律忽略。
+///
+/// 图片**不**并入 `parse_input` 的附件清单：文档附件走 `prompt_with_attachments`
+/// 注入文本清单，图片则变成模型可见的 `ContentBlock::Image`。两者可以共存。
+pub fn parse_image_inputs(params: &serde_json::Value) -> Vec<ImageInput> {
+    let Some(input) = params.get("input").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for block in input {
+        match block.get("type").and_then(|t| t.as_str()) {
+            Some("image") => {
+                if let Some(p) = block.get("path").and_then(|p| p.as_str()) {
+                    out.push(ImageInput::Path(p.to_string()));
+                }
+            }
+            Some("uploaded_image") => {
+                if let Some(id) = block.get("uploadId").and_then(|v| v.as_str()) {
+                    out.push(ImageInput::Upload(id.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// 清单里展示的名字：先走路径安全化（`/`、`\`、控制字符、`:` 全变 `_`），
@@ -403,5 +448,84 @@ mod tests {
     #[test]
     fn empty_attachments_still_return_the_bare_text() {
         assert_eq!(prompt_with_attachments("只有正文", &[]), "只有正文");
+    }
+
+    #[test]
+    fn parse_image_inputs_keeps_only_image_blocks() {
+        let params: serde_json::Value = serde_json::json!({
+            "input": [
+                { "type": "image", "path": "/tmp/a.png" },
+                { "type": "text", "text": "hi" },
+                { "type": "attachment", "path": "/tmp/b.pdf" },
+                { "type": "image" },
+                { "type": "image", "path": "/tmp/c.jpg" }
+            ]
+        });
+        assert_eq!(
+            parse_image_inputs(&params),
+            vec![
+                ImageInput::Path("/tmp/a.png".into()),
+                ImageInput::Path("/tmp/c.jpg".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_image_inputs_tolerates_missing_input() {
+        assert!(parse_image_inputs(&serde_json::json!({})).is_empty());
+        assert!(parse_image_inputs(&serde_json::json!({ "input": "nope" })).is_empty());
+    }
+
+    /// iOS 路径：`{type:"uploaded_image", uploadId}` 解析成 `ImageInput::Upload`，
+    /// 与桌面的 `{type:"image", path}` 可共存且保序；缺 `uploadId` 的块被忽略。
+    #[test]
+    fn parse_image_inputs_reads_uploaded_image_blocks_too() {
+        let params: serde_json::Value = serde_json::json!({
+            "input": [
+                { "type": "image", "path": "/tmp/a.png" },
+                { "type": "uploaded_image", "uploadId": "upload-1" },
+                { "type": "text", "text": "hi" },
+                { "type": "uploaded_image" },
+                { "type": "uploaded_image", "uploadId": "upload-2" }
+            ]
+        });
+        assert_eq!(
+            parse_image_inputs(&params),
+            vec![
+                ImageInput::Path("/tmp/a.png".into()),
+                ImageInput::Upload("upload-1".into()),
+                ImageInput::Upload("upload-2".into())
+            ]
+        );
+    }
+
+    /// 与图片块同理：`uploaded_image` 也不能进 `parse_input` 的文本/文档清单，
+    /// 否则 `uploadId` 会被当路径复制、还会被塞进附件清单。
+    #[test]
+    fn parse_input_ignores_uploaded_image_blocks() {
+        let params: serde_json::Value = serde_json::json!({
+            "input": [
+                { "type": "uploaded_image", "uploadId": "upload-1" },
+                { "type": "text", "text": "hi" }
+            ]
+        });
+        let (text, paths) = parse_input(&params);
+        assert_eq!(text, "hi");
+        assert!(paths.is_empty(), "{paths:?}");
+    }
+
+    /// 图片块在 `parse_input` 里必须落进 `_ => {}`：既不能进文本，也不能进文档
+    /// 附件路径（否则同一张图会被复制两次、还会被塞进文本清单）。
+    #[test]
+    fn parse_input_ignores_image_blocks() {
+        let params: serde_json::Value = serde_json::json!({
+            "input": [
+                { "type": "image", "path": "/tmp/a.png" },
+                { "type": "text", "text": "hi" }
+            ]
+        });
+        let (text, paths) = parse_input(&params);
+        assert_eq!(text, "hi");
+        assert!(paths.is_empty(), "{paths:?}");
     }
 }

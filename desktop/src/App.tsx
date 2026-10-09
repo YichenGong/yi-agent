@@ -34,9 +34,14 @@ import {
   ATTACHMENT_EXTENSIONS,
   attachmentProblem,
   fileNameOf,
+  imageAttachmentProblem,
+  imageSizeProblem,
+  IMAGE_EXTENSIONS,
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
+import { uploadImage, isHeic } from "./lib/imageUpload";
+import { pickImageFiles } from "./lib/imagePicker";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
@@ -305,6 +310,20 @@ export default function App() {
    * 编辑冲掉。
    */
   const modelCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
+   * 图片读取的宿主接缝（`image/read`）。理由同 `pluginCall`：只闭合 `clientRef`，
+   * 空依赖即稳定。`ChatView` 把它透传给每个气泡/工具卡的 `useImageData`，而那个
+   * effect 依赖 `call`——一旦每次渲染换新函数身份，每张图都会重新分片拉取。
+   */
+  const imageCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
       if (!c) return Promise.reject(new Error("not connected"));
@@ -1320,13 +1339,18 @@ export default function App() {
     if (!id || !c) return false;
     // 这个会话待发送的附件。发送前先取快照：成功要清空它，失败要**留着**重试。
     const files = pending[id] ?? [];
+    // 按类别分组：文档走清单 block，图片走内容 block，协议形态不同。
+    const images = files.filter((f) => f.kind === "image");
+    const documents = files.filter((f) => f.kind !== "image");
     // 附件本身即消息：纯附件(文本框为空)也允许发送。
     if (!text.trim() && files.length === 0) return false;
 
     const session = store.view(id).session;
+    // 乐观回显只带**文档**：图片由服务端在回显的 item 上带 `images` 引用
+    // （元数据来自摄取后的落盘），本地此刻并不知道 media_type/size。
     session.addUserMessage(
       text,
-      files.map((f) => ({ name: f.name, path: f.path, size: f.size })),
+      documents.map((f) => ({ name: f.name, path: f.path, size: f.size })),
     );
     force((v) => v + 1);
     // The cached status can be stale: `turn/completed` reaches us before the
@@ -1335,12 +1359,20 @@ export default function App() {
     // the server's error code say where it disagreed and switch to the other
     // one. Each direction is tried once, so two mismatches cannot ping-pong.
     //
-    // 附件 block 必须排在文本 block **之前**：服务端按顺序读，附件先入场，
+    // 附件/图片 block 必须排在文本 block **之前**：服务端按顺序读，附件先入场，
     // 文本里只留问题本身，不放任何附件清单。
+    //
+    // 图片有两种引用形态，按待发项有没有 `uploadId` 分派：远端（iOS）的图已经分片
+    // 上传落盘，只能按句柄引用；桌面端的图在本地盘上，交给服务端自己按路径读。
     const params = {
       threadId: id,
       input: [
-        ...files.map((f) => ({ type: "attachment" as const, path: f.path })),
+        ...images.map((f) =>
+          f.uploadId
+            ? { type: "uploaded_image" as const, uploadId: f.uploadId }
+            : { type: "image" as const, path: f.path },
+        ),
+        ...documents.map((f) => ({ type: "attachment" as const, path: f.path })),
         { type: "text" as const, text },
       ],
     };
@@ -1380,22 +1412,36 @@ export default function App() {
   };
 
   /**
-   * 打开原生多选文件对话框，把选中的文档加入当前会话的待发附件。
+   * 一次「原生多选 → 逐个预检 → 入待发列表」的公共骨架。
    *
-   * 逐个本地预检：不合格的就地报错(写进会话错误)并丢弃，合格的才进待发列表。
-   * 报错与加入互不影响——一次多选里混着好坏文件是常态，不能因为一个坏文件
-   * 把整次选择作废。
+   * 文档与图片两条路只差三个白名单/上限参数：过滤器的名字、扩展名列表、预检函数，
+   * 外加入列时的 `kind`。此前两者各抄一份 ~90% 相同的代码，任何一处（如失败时
+   * `problems` 的呈现）改动都要同步两遍——抽成一处，行为逐字不变。
+   *
+   * 逐个本地预检：不合格的就地报错（写进会话错误）并丢弃，合格的才进待发列表。
+   * 报错与加入互不影响——一次多选里混着好坏文件是常态，不能因为一个坏文件把
+   * 整次选择作废。
    */
-  const pickFilesToAttach = async (): Promise<void> => {
+  const pickIntoSession = async (spec: {
+    /** 原生对话框里过滤器的显示名（「文档」/「图片」）。 */
+    filterName: string;
+    /** 该入口接受的白名单扩展名。 */
+    extensions: readonly string[];
+    /** 单个路径的本地预检；返回原因字符串表示不可发送。 */
+    problem: (path: string, size: number) => string | null;
+    /** 通过预检后入列的附件类别（决定发送时的协议形态）。 */
+    kind: PendingAttachment["kind"];
+  }): Promise<void> => {
     const id = store.currentId;
     if (!id) return;
-    // iOS/远端没有原生选择器：桌面端能力，在别处不假装有。
+    // iOS/远端没有原生选择器：桌面端能力，在别处不假装有。远端图片走自己的路
+    // （见 `pickImagesOnRemote`），同样不碰这里。
     if (isRemoteClient()) return;
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({
       directory: false,
       multiple: true,
-      filters: [{ name: "文档", extensions: [...ATTACHMENT_EXTENSIONS] }],
+      filters: [{ name: spec.filterName, extensions: [...spec.extensions] }],
     });
     // 多选回数组；单选/取消回字符串或 null。统一成数组再处理。
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
@@ -1406,14 +1452,103 @@ export default function App() {
     for (const p of paths) {
       const name = fileNameOf(p);
       // 桌面端拿不到 file size（dialog 只给路径）：大小交给服务端权威校验，
-      // 这里只做扩展名预检——`attachmentProblem(p, 0)` 的 size=0 意为"未知"，
-      // 不会误判为超限，避免把注定被拒的类型发出去。
-      const problem = attachmentProblem(p, 0);
+      // 这里只做扩展名预检——传 size=0 意为"未知"，不会误判为超限，避免把
+      // 注定被拒的类型发出去。
+      const problem = spec.problem(p, 0);
       if (problem) {
         problems.push(`${name}：${problem}`);
         continue;
       }
-      accepted.push({ path: p, name, size: 0 });
+      accepted.push({ path: p, name, size: 0, kind: spec.kind });
+    }
+    if (accepted.length > 0) {
+      setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
+    }
+    if (problems.length > 0) {
+      store.view(id).session.lastError = problems.join("；");
+      force((v) => v + 1);
+    }
+  };
+
+  /**
+   * 打开原生多选文件对话框，把选中的**文档**加入当前会话的待发附件。
+   *
+   * 图片走自己的按钮（`pickImagesToAttach`）：两个白名单互不重叠，各自的对象存储形态
+   * 也不同，分开入口，用户才不会挑错之后才被告知。
+   */
+  const pickFilesToAttach = (): Promise<void> =>
+    pickIntoSession({
+      filterName: "文档",
+      extensions: ATTACHMENT_EXTENSIONS,
+      problem: attachmentProblem,
+      kind: "document",
+    });
+
+  /**
+   * 打开原生多选图片对话框，把选中的图片加入当前会话的待发附件。
+   *
+   * 与 `pickFilesToAttach` 同形（共用 `pickIntoSession`），但用图片自己的白名单与
+   * 上限：图片不进 `read_document` 清单，走的是内容块，服务端会把它摄取成模型直接
+   * 可见的图片。远端（iOS）没有共享文件系统，走自己的上传路径
+   * （`pickImagesOnRemote`）。
+   */
+  const pickImagesToAttach = (): Promise<void> =>
+    isRemoteClient()
+      ? pickImagesOnRemote()
+      : pickIntoSession({
+          filterName: "图片",
+          extensions: IMAGE_EXTENSIONS,
+          problem: imageAttachmentProblem,
+          kind: "image",
+        });
+
+  /**
+   * 远端（iOS）的图片选择器：webview 自带的 `<input type="file">`。
+   *
+   * 这里没有 Tauri dialog（那是桌面端能力），也不该有：iOS 上相册由系统选择器
+   * 交付，`accept="image/*"` 让系统只显示图片，`multiple` 允许多选。选中的是
+   * `File`（字节在本地内存里，iOS 与桌面不共享文件系统），故必须分片上传。
+   *
+   * 选择器是**当场造、用完即摘**的：没有任何 UI 依赖它长期存在，挂一个隐藏 input
+   * 在 DOM 里只会多一份要维护的状态。
+   *
+   * 与 `pickIntoSession` 同一套「逐个处理、好坏互不影响」的语义：坏的（预检不过、
+   * 或上传失败）就地报错并丢弃，好的照常入列；一次多选里混着好坏是常态，不能因为
+   * 一个坏文件把整次选择作废。
+   */
+  const pickImagesOnRemote = async (): Promise<void> => {
+    const id = store.currentId;
+    if (!id) return;
+    // 注意：`pickImageFiles()` 必须在**用户手势的同一个任务**里被调用（它内部
+    // `input.click()` 才会打开系统选择器）。所以它之前不许插入任何 `await`——加了
+    // 一个就会让 iOS 静默地什么都不弹。
+    const files = await pickImageFiles();
+    if (files.length === 0) return;
+
+    const problems: string[] = [];
+    const accepted: PendingAttachment[] = [];
+    for (const file of files) {
+      // 预检用本地就能知道的字节数与文件名：不合格的不必先花带宽传上去再被拒。
+      //
+      // HEIC/HEIF 是唯一例外——`IMAGE_EXTENSIONS` 白名单里没有它，但那条路**正是**
+      // 要给 `uploadImage` 去转码的（iOS 相册默认就是 HEIC，在这里拦下等于这个功能
+      // 永远走不到）。所以对 HEIC 只保留 20 MB 上限，扩展名白名单交给转码那一步：
+      // 转不动就由 `uploadImage` 抛明确的 HEIC 错误。非 HEIC 仍走完整预检。
+      const problem = isHeic(file)
+        ? imageSizeProblem(file.size)
+        : imageAttachmentProblem(file.name, file.size);
+      if (problem) {
+        problems.push(`${file.name}：${problem}`);
+        continue;
+      }
+      try {
+        // 上传成功即以服务端返回的**工作区相对路径**入列：`image/read` 以会话 cwd
+        // 为根，只有这个路径能读回缩略图（OS 对话框给的绝对路径做不到）。
+        const { uploadId, path } = await uploadImage(imageCall, id, file);
+        accepted.push({ path, name: file.name, size: file.size, kind: "image", uploadId });
+      } catch (e) {
+        problems.push(`${file.name}：${formatError(e)}`);
+      }
     }
     if (accepted.length > 0) {
       setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
@@ -1716,6 +1851,10 @@ export default function App() {
                 items={current?.session.items ?? []}
                 error={current?.session.lastError ?? null}
                 retrying={current?.session.retrying ?? null}
+                threadId={currentId}
+                // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
+                // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
+                call={imageCall}
               />
               <MessageInput
                 turnActive={current?.session.turnActive ?? false}
@@ -1729,7 +1868,12 @@ export default function App() {
                 // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
                 attachments={currentId ? (pending[currentId] ?? []) : []}
                 onPickFiles={() => void pickFilesToAttach()}
+                onPickImages={() => void pickImagesToAttach()}
                 onRemoveAttachment={removePendingAttachment}
+                threadId={currentId}
+                // 稳定的 `imageCall`（见上）：待发图片 chip 的缩略图也经它读取，
+                // 内联箭头会让每张缩略图每次渲染都重拉。
+                call={imageCall}
                 disabled={current === null}
                 modelPicker={
                   current !== null && currentId !== null ? (

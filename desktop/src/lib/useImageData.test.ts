@@ -1,0 +1,280 @@
+/** @vitest-environment jsdom */
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import React from "react";
+import { renderHook, waitFor, cleanup } from "@testing-library/react";
+
+const PATH = ".yi-agent/attachments/t1/ab-shot.png";
+
+// The LRU lives in module scope, so every case must start from a *fresh module
+// instance*: `vi.resetModules()` + a dynamic import gives us one. Without this,
+// the cache-hit case could not distinguish itself from a cache primed by the
+// previous case.
+let mod: typeof import("./useImageData");
+let blobs: Blob[];
+let createdUrls: string[];
+let revokedUrls: string[];
+let urlSeq: number;
+
+beforeEach(async () => {
+  vi.resetModules();
+  mod = await import("./useImageData");
+  blobs = [];
+  createdUrls = [];
+  revokedUrls = [];
+  urlSeq = 0;
+  // jsdom ships neither `URL.createObjectURL` nor `revokeObjectURL`; a
+  // observable stand-in is what lets the tests assert "one Blob per fetch" and
+  // "eviction revokes".
+  URL.createObjectURL = vi.fn((blob: Blob) => {
+    blobs.push(blob);
+    const url = `blob:image-${++urlSeq}`;
+    createdUrls.push(url);
+    return url;
+  });
+  URL.revokeObjectURL = vi.fn((url: string) => {
+    revokedUrls.push(url);
+  });
+});
+
+afterEach(cleanup);
+
+/** Read a Blob back to raw bytes (jsdom has no `Blob.arrayBuffer`). */
+function blobBytes(blob: Blob): Promise<number[]> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error);
+    reader.onload = () =>
+      resolve(Array.from(new Uint8Array(reader.result as ArrayBuffer)));
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
+const b64 = (bytes: number[]) => btoa(String.fromCharCode(...bytes));
+
+/**
+ * A fake `image/read` server that serves `fileBytes` in `chunkSize`-byte
+ * chunks, exactly like the real RPC: `nextOffset` is `null` on the last chunk.
+ */
+function serving(fileBytes: number[], chunkSize = 3) {
+  const requests: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const call = vi.fn(async (method: string, params: unknown) => {
+    expect(method).toBe("image/read");
+    const p = params as { path?: string; offset?: number };
+    requests.push({ method, params: { ...p } });
+    const offset = p.offset ?? 0;
+    const slice = fileBytes.slice(offset, offset + chunkSize);
+    const next = offset + chunkSize >= fileBytes.length ? null : offset + chunkSize;
+    return {
+      data: b64(slice),
+      nextOffset: next,
+      mediaType: "image/png",
+      size: fileBytes.length,
+    };
+  });
+  return { call, requests };
+}
+
+/** The app mounts under StrictMode; double-invoked initializers must not skew refcounts. */
+const strict = ({ children }: { children: React.ReactNode }) =>
+  React.createElement(React.StrictMode, null, children);
+
+describe("useImageData", () => {
+  it("loops image/read by nextOffset and concatenates the raw bytes", async () => {
+    const file = [1, 2, 3, 4, 5, 6, 7];
+    const { call, requests } = serving(file);
+    const { result } = renderHook(() =>
+      mod.useImageData(PATH, { threadId: "t1", call }),
+    );
+
+    await waitFor(() => expect(result.current.url).toBeTruthy());
+
+    // One request per chunk, each carrying the previous response's nextOffset.
+    expect(requests.map((r) => r.params.offset)).toEqual([0, 3, 6]);
+    expect(requests[0].params).toMatchObject({ threadId: "t1", path: PATH, offset: 0 });
+    // The Blob must carry the file's bytes verbatim — `size` from the response
+    // is the stored length, not a limit on what we decode.
+    expect(await blobBytes(blobs[0])).toEqual(file);
+    expect(blobs[0].type).toBe("image/png");
+    expect(result.current.error).toBeNull();
+  });
+
+  it("serves a second consumer of the same path from the cache with no new request", async () => {
+    const { call, requests } = serving([10, 20, 30, 40]);
+    const first = renderHook(() => mod.useImageData(PATH, { threadId: "t1", call }));
+    await waitFor(() => expect(first.result.current.url).toBeTruthy());
+
+    const seen = requests.length;
+    const second = renderHook(() => mod.useImageData(PATH, { threadId: "t1", call }));
+    await waitFor(() =>
+      expect(second.result.current.url).toBe(first.result.current.url),
+    );
+
+    // Same path → same URL, zero extra RPC round-trips, one Blob total.
+    expect(requests.length).toBe(seen);
+    expect(createdUrls).toHaveLength(1);
+  });
+
+  it("keeps two threads that share a relative path apart (the cache is thread-scoped)", async () => {
+    // Tool-result image refs carry the model's `view_image` argument verbatim, so a
+    // relative path like `docs/diagram.png` is NOT thread-unique: two threads with
+    // different cwds can name a same-named file. Keying the cache on `path` alone
+    // would let the second thread render the first one's bytes.
+    const REL = "docs/diagram.png";
+    // One chunk per read, so the request log maps 1:1 onto reads.
+    const { call, requests } = serving([1, 1, 1], 3);
+    const a = renderHook(() => mod.useImageData(REL, { threadId: "t1", call }));
+    await waitFor(() => expect(a.result.current.url).toBeTruthy());
+
+    const b = renderHook(() => mod.useImageData(REL, { threadId: "t2", call }));
+    await waitFor(() => expect(b.result.current.url).toBeTruthy());
+
+    // Each thread gets its own read — the second must not be served from t1's entry.
+    expect(requests.map((r) => r.params.threadId)).toEqual(["t1", "t2"]);
+    expect(createdUrls).toHaveLength(2);
+    expect(a.result.current.url).not.toBe(b.result.current.url);
+  });
+
+  it("surfaces a read failure as an error", async () => {
+    const call = vi.fn(async () => {
+      throw { code: -32000, message: "no such image" };
+    });
+    const { result } = renderHook(() =>
+      mod.useImageData(PATH, { threadId: "t1", call }),
+    );
+
+    await waitFor(() => expect(result.current.error).toBe("no such image"));
+    expect(result.current.url).toBeNull();
+  });
+
+  it("does not read without a thread or a path", async () => {
+    const call = vi.fn(async () => ({ data: "", nextOffset: null, mediaType: "", size: 0 }));
+    const noThread = renderHook(() =>
+      mod.useImageData(PATH, { threadId: null, call }),
+    );
+    const noPath = renderHook(() => mod.useImageData("", { threadId: "t1", call }));
+    await Promise.resolve();
+
+    expect(call).not.toHaveBeenCalled();
+    expect(noThread.result.current).toEqual({ url: null, error: null });
+    expect(noPath.result.current).toEqual({ url: null, error: null });
+  });
+
+  it("evicts the least recently used entry past the cap and revokes its URL", async () => {
+    const { call } = serving([1], 1);
+    const paths = Array.from(
+      { length: mod.IMAGE_CACHE_LIMIT + 1 },
+      (_, i) => `.yi-agent/attachments/t1/x-${i}.png`,
+    );
+    for (const p of paths) {
+      const h = renderHook(() => mod.useImageData(p, { threadId: "t1", call }));
+      await waitFor(() => expect(h.result.current.url).toBeTruthy(), { interval: 1 });
+      // Unmount as we go: no consumer is live when the overflow happens, so the evicted
+      // URL is released at once. (The "still mounted" case is the next test.)
+      h.unmount();
+    }
+
+    // The first path fell out of the LRU window: its object URL is released so
+    // a long session cannot leak every image it ever displayed.
+    expect(revokedUrls).toEqual([createdUrls[0]]);
+  });
+
+  it("keeps an evicted URL alive while a mounted consumer still displays it", async () => {
+    const { call } = serving([1], 1);
+    const paths = Array.from(
+      { length: mod.IMAGE_CACHE_LIMIT + 2 },
+      (_, i) => `.yi-agent/attachments/t1/y-${i}.png`,
+    );
+
+    // The first consumer stays mounted the whole time — e.g. the user scrolled
+    // back to an image they had already loaded. It must not be evicted out from
+    // under the live <img>.
+    const first = renderHook(() => mod.useImageData(paths[0], { threadId: "t1", call }));
+    await waitFor(() => expect(first.result.current.url).toBeTruthy(), { interval: 1 });
+    const firstUrl = first.result.current.url;
+
+    // Mount the rest; overflowing the LRU pushes paths[0] out of the cache.
+    for (const p of paths.slice(1)) {
+      const h = renderHook(() => mod.useImageData(p, { threadId: "t1", call }));
+      await waitFor(() => expect(h.result.current.url).toBeTruthy(), { interval: 1 });
+    }
+
+    // Mounted consumer → the URL must survive the eviction (deferred revoke), and
+    // the still-displayed <img> keeps its src.
+    expect(revokedUrls).not.toContain(firstUrl);
+    expect(first.result.current.url).toBe(firstUrl);
+
+    // The last consumer unmounts → now, and only now, is it safe to release.
+    first.unmount();
+    expect(revokedUrls).toEqual([firstUrl]);
+  });
+
+  it("counts a consumer whose URL came from the initializer cache hit", async () => {
+    const { call } = serving([1], 1);
+    const paths = Array.from(
+      { length: mod.IMAGE_CACHE_LIMIT + 1 },
+      (_, i) => `.yi-agent/attachments/t1/z-${i}.png`,
+    );
+
+    // Prime `paths[0]` into the cache, then let its consumer go.
+    const primer = renderHook(() => mod.useImageData(paths[0], { threadId: "t1", call }));
+    await waitFor(() => expect(primer.result.current.url).toBeTruthy(), { interval: 1 });
+    const primedUrl = primer.result.current.url;
+    primer.unmount();
+
+    // This consumer gets its URL from the `useState` initializer (a first-render
+    // cache hit) — no request, no effect re-run. It is still a live consumer and
+    // must be counted, or the eviction below would revoke a displaying URL.
+    const hit = renderHook(() => mod.useImageData(paths[0], { threadId: "t1", call }));
+    expect(hit.result.current.url).toBe(primedUrl);
+    expect(revokedUrls).toEqual([]);
+
+    for (const p of paths.slice(1)) {
+      const h = renderHook(() => mod.useImageData(p, { threadId: "t1", call }));
+      await waitFor(() => expect(h.result.current.url).toBeTruthy(), { interval: 1 });
+    }
+
+    // paths[0] left the LRU, but the initializer-hit consumer still shows it.
+    expect(revokedUrls).not.toContain(primedUrl);
+    expect(hit.result.current.url).toBe(primedUrl);
+
+    hit.unmount();
+    expect(revokedUrls).toEqual([primedUrl]);
+  });
+
+  it("keeps the refcount correct when a double-invoked initializer is a cache hit", async () => {
+    const { call } = serving([1], 1);
+    const PA = ".yi-agent/attachments/t1/s0.png";
+    const paths = Array.from(
+      { length: mod.IMAGE_CACHE_LIMIT },
+      (_, i) => `.yi-agent/attachments/t1/s-${i + 1}.png`,
+    );
+
+    // Prime PA, then let its consumer go.
+    const primer = renderHook(() => mod.useImageData(PA, { threadId: "t1", call }), {
+      wrapper: strict,
+    });
+    await waitFor(() => expect(primer.result.current.url).toBeTruthy(), { interval: 1 });
+    const primedUrl = primer.result.current.url;
+    primer.unmount();
+
+    // This consumer's URL comes from the initializer, whose double invocation under
+    // StrictMode must not leave a phantom extra count (that would keep the URL alive
+    // forever, defeating eviction).
+    const hit = renderHook(() => mod.useImageData(PA, { threadId: "t1", call }), {
+      wrapper: strict,
+    });
+    expect(hit.result.current.url).toBe(primedUrl);
+
+    for (const p of paths) {
+      const h = renderHook(() => mod.useImageData(p, { threadId: "t1", call }), {
+        wrapper: strict,
+      });
+      await waitFor(() => expect(h.result.current.url).toBeTruthy(), { interval: 1 });
+    }
+
+    expect(revokedUrls).not.toContain(primedUrl);
+    hit.unmount();
+    // Exactly one release: the phantom count would have suppressed this revoke.
+    expect(revokedUrls).toEqual([primedUrl]);
+  });
+});

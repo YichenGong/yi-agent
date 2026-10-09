@@ -782,6 +782,7 @@ mod tests {
             id: "user-turn-1".into(),
             text: "hi".into(),
             attachments: Vec::new(),
+            images: Vec::new(),
         }];
         let messages = vec![Message::user("hi")];
         s.append_turn("thread-a", &turn(items, messages.clone()))
@@ -803,6 +804,7 @@ mod tests {
                     id: "user-turn-1".into(),
                     text: "hi".into(),
                     attachments: Vec::new(),
+                    images: Vec::new(),
                 }],
                 vec![Message::user("hi")],
             ),
@@ -844,6 +846,7 @@ mod tests {
                     id: "user-turn-1".into(),
                     text: "one".into(),
                     attachments: Vec::new(),
+                    images: Vec::new(),
                 }],
                 vec![Message::user("one")],
             ),
@@ -860,6 +863,7 @@ mod tests {
                     id: "user-turn-2".into(),
                     text: "two".into(),
                     attachments: Vec::new(),
+                    images: Vec::new(),
                 }],
                 last_messages.clone(),
             ),
@@ -1105,6 +1109,7 @@ mod tests {
                     id: "u1".into(),
                     text: "ok".into(),
                     attachments: Vec::new(),
+                    images: Vec::new(),
                 }],
                 vec![Message::user("ok")],
             ),
@@ -1126,6 +1131,7 @@ mod tests {
                     id: "u2".into(),
                     text: "still here".into(),
                     attachments: Vec::new(),
+                    images: Vec::new(),
                 }],
                 vec![Message::user("still here")],
             ),
@@ -1181,6 +1187,7 @@ mod tests {
                     id: "u1".into(),
                     text: "ok".into(),
                     attachments: Vec::new(),
+                    images: Vec::new(),
                 }],
                 vec![Message::user("ok")],
             ),
@@ -1413,6 +1420,7 @@ mod tests {
             id: id.into(),
             text: text.into(),
             attachments: Vec::new(),
+            images: Vec::new(),
         }
     }
 

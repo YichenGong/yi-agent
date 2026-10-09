@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures::StreamExt;
 use serde_json::json;
 use std::sync::Mutex as StdMutex;
@@ -48,6 +49,14 @@ const CARD_SCHEDULER_TICK: Duration = Duration::from_secs(3);
 
 /// 首轮 LLM 标题生成的超时:超时即回退兜底标题，绝不卡住 turn 收尾。
 const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `image/read` 每次回传的原始字节上限。传输帧上限 1 MiB,base64 膨胀 4/3 后
+/// 512 KiB 的原始块约 683 KiB,连同其它字段仍在单帧之内。
+pub(crate) const IMAGE_READ_CHUNK_BYTES: u64 = 512 * 1024;
+
+/// `image/read` 允许服务的最大文件字节数。分片只是传输形态,不代表可以无上限地
+/// 服务任意大文件;与 `image_prep::MAX_IMAGE_BYTES` 同值(20 MiB)。
+pub(crate) const IMAGE_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// driver task → 主循环的完成事件。
 enum TurnEvent {
@@ -2130,6 +2139,9 @@ where
     // 该 thread 首个 turn 要激活的 runtime。驱动里做激活(不在请求循环里)以免一个
     // thread 的 socket 调用卡住所有 thread;这里只暂存 attach 的产物。
     let mut pending_activation: HashMap<String, Option<Arc<ThreadRoot>>> = HashMap::new();
+    // 分片上传的会话登记表（iOS 客户端）。与 `threads` 同属主循环局部量，串行
+    // 访问故无需加锁；每轮循环开头 `sweep_expired()` 收走超时会话。
+    let mut uploads = crate::image_upload::UploadRegistry::new();
     // 每个 thread 至多一条被关注的轨迹流。换任务即替换(不并存),thread 删除即收尾。
     let mut trace_watches: HashMap<String, TraceWatch> = HashMap::new();
     // 每个 thread 至多一个子任务列表守望者,首次 agent/children/list 时建立。
@@ -2171,6 +2183,10 @@ where
     let git_diff_handle = git_diff.clone();
 
     loop {
+        // 上传登记表的 TTL 清理：每轮循环开头收走超时的 staging 会话。放在这里
+        // 而不是另起定时器，理由同看板调度器——登记表是主循环局部量，`&mut`
+        // 借用必须串行。
+        uploads.sweep_expired();
         tokio::select! {
             // 合并模式:stdio 读端 EOF → 结束整个循环(并丢弃 `inbound`),故
             // 桌面关闭即整进程优雅退出(spec §3.2 不变量 4)。纯 stdio / 纯 ws
@@ -2773,6 +2789,384 @@ where
                                     .await?
                             }
                         }
+                    }
+                    // 分片回传一张图片的**原始字节**:客户端按 `nextOffset` 循环
+                    // 拉取,base64 解码拼接后即得与磁盘逐字节相同的文件。之所以
+                    // 不在这里重新编码,是因为 `Item.images[].size` 记的就是存盘
+                    // 文件的字节长度(Task 5 的交接),两者必须一致。
+                    //
+                    // 这是一条**安全边界**:限根(拒绝 `..` 与工作区外绝对路径)+
+                    // 只送可解码的图(`guess_format`)+ 文件大小上限,三者缺一,
+                    // 本 RPC 就成了任意文件读取原语。
+                    "image/read" => {
+                        let Some(thread_id) =
+                            req.params.get("threadId").and_then(|v| v.as_str())
+                        else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("threadId required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(rel) = req.params.get("path").and_then(|v| v.as_str()) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("path required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 该 thread 的 cwd:内存优先,其次按 store 定位;都落空即
+                        // 未知 thread。与既有路径限额同源。
+                        let Some(root) = thread_cwd(&threads, &workspaces, &cfg, thread_id) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("unknown thread")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 限根:join 后 canonicalize,再要求结果落在 cwd 之内。
+                        // `canonicalize` 会解掉 `..` 与符号链接,故逃逸一定现形;
+                        // `Path::join` 遇绝对路径会整体替换,也在此被 starts_with 拦下。
+                        let canonical = match root.join(rel).canonicalize() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!("cannot read image: {e}")),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        let root_canonical =
+                            root.canonicalize().unwrap_or_else(|_| root.clone());
+                        if !canonical.starts_with(&root_canonical) {
+                            write_response(
+                                &hub, &client,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params("path escapes the workspace"),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // 先按**元数据**长度设闸:否则一个几 GB 的文件会先被整个读进
+                        // 内存再被拒,分片回传反成了内存放大原语。
+                        let declared_len = match std::fs::metadata(&canonical) {
+                            Ok(m) => {
+                                // 同一趟元数据里挡下**非普通文件**:FIFO 的 `len`
+                                // 恒为 `0`,能骗过尺寸闸,而 `fs::read` 的 `open()`
+                                // 在无写端时会**一直阻塞**——本 RPC 是安全边界,
+                                // 一个构造请求就能把整条 serve 循环(所有客户端/
+                                // thread)挂住。故 `!is_file()` 直接拒绝,不再多发
+                                // 一次 `metadata` 系统调用。
+                                if !m.is_file() {
+                                    write_response(
+                                        &hub,
+                                        &client,
+                                        err_response(
+                                            id,
+                                            RpcError::invalid_params("not a regular file"),
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                                m.len()
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!("cannot read image: {e}")),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        if declared_len > IMAGE_READ_MAX_BYTES {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("image too large")),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let bytes = match std::fs::read(&canonical) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!("cannot read image: {e}")),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 只送可解码的图片:以魔数判定,不看扩展名。
+                        let format = match image::guess_format(&bytes) {
+                            Ok(f) => f,
+                            Err(_) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::invalid_params("not a supported image")),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 元数据长度与实际读到的长度理论上可能竞态,按**实际字节**复核。
+                        if bytes.len() as u64 > IMAGE_READ_MAX_BYTES {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("image too large")),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let offset = req.params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                        // 客户端可要更小的一块,但不得越过帧预算。`0` 视为未指定:
+                        // 否则 `end == start`、`nextOffset` 不前进,客户端会陷入死循环。
+                        let max_bytes = req
+                            .params
+                            .get("maxBytes")
+                            .and_then(|v| v.as_u64())
+                            .filter(|n| *n > 0)
+                            .unwrap_or(IMAGE_READ_CHUNK_BYTES)
+                            .min(IMAGE_READ_CHUNK_BYTES);
+                        let start = (offset as usize).min(bytes.len());
+                        let end = start.saturating_add(max_bytes as usize).min(bytes.len());
+                        let next = if end < bytes.len() {
+                            Some(end as u64)
+                        } else {
+                            None
+                        };
+                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]);
+                        write_response(
+                            &hub,
+                            &client,
+                            ok_response(
+                                id,
+                                json!({
+                                    "data": data,
+                                    "nextOffset": next,
+                                    "mediaType": image_media_type(format),
+                                    "size": bytes.len(),
+                                }),
+                            ),
+                        )
+                        .await?;
+                    }
+                    // iOS 分片上传（设计 §3(3)）：begin / chunk / commit / abort。
+                    //
+                    // 与 `image/read` 恰好反向：那个把工作区里的图分片送出，这个把
+                    // 客户端的分片收进工作区。base64 只在 `chunk.data` 里出现，由
+                    // 服务端解码（裁定 R6，与 `image/read` 的编码端对称）。
+                    //
+                    // 身份链：`begin` 用 `threadId` 解析 cwd（与 `image/read` 同法，
+                    // 复用 `thread_cwd`）；`commit` 的参数只有 `{uploadId}`，thread
+                    // 由记录带出再解析 cwd。
+                    "image/upload/begin" => {
+                        let Some(thread_id) =
+                            req.params.get("threadId").and_then(|v| v.as_str())
+                        else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("threadId required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(root) = thread_cwd(&threads, &workspaces, &cfg, thread_id) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("unknown thread")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let name = req
+                            .params
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("image");
+                        let Some(size) = req.params.get("size").and_then(|v| v.as_u64()) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("size required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 大小/条数上限都在 `begin` 里设闸：一个已认证客户端不能靠
+                        // 反复 begin 占满 inode/fd（见 `image_upload` 的常量注释）。
+                        match uploads.begin(&root, thread_id, name, size) {
+                            Ok(upload_id) => {
+                                write_response(
+                                    &hub, &client,
+                                    ok_response(
+                                        id,
+                                        json!({
+                                            "uploadId": upload_id,
+                                            "chunkSize": crate::image_upload::UPLOAD_CHUNK_BYTES,
+                                        }),
+                                    ),
+                                )
+                                .await?
+                            }
+                            Err(message) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::invalid_params(message)),
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                    "image/upload/chunk" => {
+                        let Some(upload_id) = req.params.get("uploadId").and_then(|v| v.as_str())
+                        else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("uploadId required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(index) = req.params.get("index").and_then(|v| v.as_u64()) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("index required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(data) = req.params.get("data").and_then(|v| v.as_str()) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("data required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 服务端解码（裁定 R6）：解码失败即拒，绝不把半个块写进
+                        // staging。累计上限由 `append` 按声明大小把关。
+                        let bytes =
+                            match base64::engine::general_purpose::STANDARD.decode(data) {
+                                Ok(bytes) => bytes,
+                                Err(e) => {
+                                    write_response(
+                                        &hub,
+                                        &client,
+                                        err_response(
+                                            id,
+                                            RpcError::invalid_params(format!(
+                                                "invalid base64 chunk: {e}"
+                                            )),
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                            };
+                        match uploads.append(upload_id, index, &bytes) {
+                            Ok(()) => {
+                                write_response(&hub, &client, ok_response(id, json!({}))).await?
+                            }
+                            Err(message) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::invalid_params(message)),
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                    "image/upload/commit" => {
+                        let Some(upload_id) = req.params.get("uploadId").and_then(|v| v.as_str())
+                        else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("uploadId required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 设计的 `commit` 参数只有 `{uploadId}`：thread 从记录带出，
+                        // 再解析它该落在哪个工作区。
+                        let Some(thread_id) = uploads.thread_id_of(upload_id) else {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params(format!("unknown upload: {upload_id}")),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(root) = thread_cwd(&threads, &workspaces, &cfg, &thread_id) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("unknown thread")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 裁定 R1：返回**解析句柄**（`path` 给客户端渲染，`uploadId`
+                        // 仍是送模型时的引用），而不是只回一个 `uploadId`。
+                        match uploads.commit(&root, &thread_id, upload_id) {
+                            Ok(attachment) => {
+                                write_response(
+                                    &hub, &client,
+                                    ok_response(
+                                        id,
+                                        json!({
+                                            "path": attachment.path,
+                                            "mediaType": attachment
+                                                .mime
+                                                .unwrap_or_else(|| "application/octet-stream".to_string()),
+                                            "size": attachment.size,
+                                        }),
+                                    ),
+                                )
+                                .await?
+                            }
+                            Err(message) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::invalid_params(message)),
+                                )
+                                .await?
+                            }
+                        }
+                    }
+                    "image/upload/abort" => {
+                        let Some(upload_id) = req.params.get("uploadId").and_then(|v| v.as_str())
+                        else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("uploadId required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 幂等：未知/已 abort 的 id 也回 `{}`（客户端重试不必区分）。
+                        uploads.abort(upload_id);
+                        write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "workspace/list" => {
                         let list: Vec<serde_json::Value> = workspaces
@@ -3828,6 +4222,13 @@ where
                         if let Some(cwd) = thread_store.root().parent().and_then(|p| p.parent()) {
                             crate::attachments::remove_attachments(cwd, &thread_id);
                         }
+                        // 上传登记表也随 thread 一起 prune：否则一条 `Committed`
+                        // 记录会活到 10 分钟 TTL，让被删 thread 的 `uploadId` 仍能
+                        // 反查到已被删掉的附件路径（随后 `prepare_image_file` 读空），
+                        // 未 commit 的 staging 槽与进程级会话名额也被死 thread 白占。
+                        // `drop_thread` 只需内存与每条会话已记的 staging 路径，故这里
+                        // 拿不到 cwd 也无妨（已落盘的附件由上面 `remove_attachments` 收）。
+                        uploads.drop_thread(&thread_id);
                         // 会话文件已摘除：按判定处置 worktree。删除失败只记日志，不阻断会话删除（D9）。
                         // board_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
                         // 但失败这件事本身必须回报：用户刚被告知该 worktree 会被删掉，此刻会话
@@ -3977,6 +4378,7 @@ where
                         if start_turn_core(
                             &mut threads,
                             &pending_activation,
+                            &mut uploads,
                             &hub,
                             &client,
                             &req.params,
@@ -4781,6 +5183,7 @@ where
                     &mut threads,
                     &mut pending_activation,
                     &mut process_watches,
+                    &mut uploads,
                     &runtimes,
                     &thread_roots,
                     &cfg,
@@ -5245,6 +5648,7 @@ fn build_partial(
     turn_id: &str,
     user_prompt: &str,
     user_attachments: &[crate::protocol::Attachment],
+    user_image_refs: &[crate::protocol::ImageRef],
     completed_items: &[crate::protocol::Item],
     messages: Vec<yi_agent_core::Message>,
     usage: Option<crate::thread_store::TurnUsage>,
@@ -5254,6 +5658,7 @@ fn build_partial(
         turn_id,
         user_prompt,
         user_attachments.to_vec(),
+        user_image_refs.to_vec(),
     ));
     items.extend(completed_items.iter().cloned());
     crate::thread_store::PartialTurn {
@@ -5287,6 +5692,7 @@ async fn persist_and_finish_turn(
     turn_id: Option<&str>,
     user_prompt: Option<&str>,
     user_attachments: &[crate::protocol::Attachment],
+    user_image_refs: &[crate::protocol::ImageRef],
     agent: &yi_agent_core::Agent,
     completed_items: Vec<crate::protocol::Item>,
     last_usage: Option<crate::thread_store::TurnUsage>,
@@ -5304,6 +5710,7 @@ async fn persist_and_finish_turn(
             id: format!("user-{}", turn_id.unwrap_or("session-command")),
             text: prompt.to_string(),
             attachments: user_attachments.to_vec(),
+            images: user_image_refs.to_vec(),
         });
     }
     items.extend(completed_items);
@@ -5424,6 +5831,7 @@ async fn apply_session_command(
                 None,
                 None,
                 &[],
+                &[],
                 &agent,
                 Vec::new(),
                 None,
@@ -5463,6 +5871,7 @@ async fn apply_session_command(
                 thread_id,
                 None,
                 None,
+                &[],
                 &[],
                 &agent,
                 Vec::new(),
@@ -5599,6 +6008,8 @@ async fn run_thread_driver(
             prompt,
             activate,
             attachments: turn_attachments,
+            image_blocks,
+            image_refs,
             display_text,
         }) = turn_prompt
         else {
@@ -5639,6 +6050,25 @@ async fn run_thread_driver(
         let user_prompt = display_text;
         // 本轮附件暂存:落盘时写进开启的 userMessage item。
         let user_attachments = turn_attachments;
+        // 本轮图片暂存:落盘时写进开启的 userMessage item 的 `images`。
+        // 直接取 `TurnPrompt` 上 `prepare_turn_core` 算好的那一份引用,不再从
+        // 内容块里反推元数据:反推就得重新求 `size`,而实时开启项（`start_turn_core`
+        // 里的 `opening_user_item`）用的是 prepare 阶段那一份——两处各算各的,
+        // 一旦口径不同,同一个图在实时气泡与回放气泡上会显示成两个大小。
+        let user_image_refs = image_refs;
+        // 送给模型的内容块:文本(若有)在前,图片在后。
+        let mut blocks: Vec<yi_agent_core::ContentBlock> = Vec::new();
+        if !prompt.is_empty() {
+            blocks.push(yi_agent_core::ContentBlock::Text(prompt.clone()));
+        }
+        blocks.extend(image_blocks.iter().cloned());
+        // 防御:空 blocks 会给模型塞一条没有任何内容的消息。正常路径够不到,
+        // 但有一条例外:一条**只有图片**的消息里那张图被丢弃时(上传句柄未知 /
+        // 已过期——见 `prepare_turn_core` 的丢弃分支),文本与图片就都空了。
+        // 此时这里必须自己兜住,而不是把边界甩给模型。
+        if blocks.is_empty() {
+            blocks.push(yi_agent_core::ContentBlock::Text(String::new()));
+        }
         translator.set_turn(turn_id.clone());
 
         // turn 开始就把提问落进 checkpoint：即使这一轮随后立刻崩溃，
@@ -5650,6 +6080,7 @@ async fn run_thread_driver(
                 &turn_id,
                 &user_prompt,
                 &user_attachments,
+                &user_image_refs,
                 &[],
                 agent.session().messages().to_vec(),
                 None,
@@ -5664,7 +6095,7 @@ async fn run_thread_driver(
             }
         }
 
-        let mut stream = match agent.run(prompt).await {
+        let mut stream = match agent.run_blocks(blocks).await {
             Ok(s) => s,
             Err(e) => {
                 // run() 本身失败:翻译成 Error → turn/completed(failed)。
@@ -5925,6 +6356,7 @@ async fn run_thread_driver(
                             &turn_id,
                             &user_prompt,
                             &user_attachments,
+                            &user_image_refs,
                             &completed_items,
                             agent.session().messages().to_vec(),
                             last_usage.clone(),
@@ -6017,6 +6449,7 @@ async fn run_thread_driver(
             Some(&turn_id),
             Some(&user_prompt),
             &user_attachments,
+            &user_image_refs,
             &agent,
             std::mem::take(&mut completed_items),
             last_usage.take(),
@@ -6069,6 +6502,50 @@ fn store_lookup(
     }
 }
 
+/// 解析某个 thread 的工作区 cwd(绝对路径)。
+///
+/// 内存中的会话最权威:直接取 `ThreadSession.cwd`(`thread/start` 已 canonicalize)。
+/// 冷 thread(不在内存)回退 `store_lookup`——它按全局索引定位该 thread 的 store,
+/// 或落回 `cfg.workdir`;store 的 root 恒为 `<cwd>/.yi-agent/threads`,上溯两级即得
+/// 工作区(与 `thread/delete` 分支推导附件目录的写法同源)。
+///
+/// 找不到任何见证(索引里既没有该 thread 的目录,`cfg.workdir` 也不含它)时返回
+/// `None`,由调用方按「未知 thread」拒绝。
+fn thread_cwd(
+    threads: &HashMap<String, ThreadSession>,
+    workspaces: &WorkspaceIndex,
+    cfg: &RuntimeConfig,
+    thread_id: &str,
+) -> Option<PathBuf> {
+    if let Some(session) = threads.get(thread_id) {
+        return Some(PathBuf::from(&session.cwd));
+    }
+    let store = store_lookup(threads, workspaces, cfg, thread_id);
+    if store.exists(thread_id) {
+        return store
+            .root()
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+    }
+    None
+}
+
+/// `image/read` 回传的 MIME:由 `guess_format` 猜出的格式决定。
+///
+/// 只认四种与 `image_prep`(`png/jpeg/gif/webp`)对齐的格式;`guess_format` 虽会
+/// 认出 TIFF/BMP 等魔数,但那些解码器未启用,统一按 `application/octet-stream`
+/// 报出(客户端据此可判「不是我能渲染的图」)。
+fn image_media_type(format: image::ImageFormat) -> &'static str {
+    match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
 /// 一条 `Item` 的稳定 id（用于 `thread/readItems` 的 `afterItemId` 切片与前端去重）。
 pub(crate) fn item_id(item: &crate::protocol::Item) -> Option<&str> {
     match item {
@@ -6098,6 +6575,7 @@ async fn card_scheduler_tick<F>(
     threads: &mut HashMap<String, ThreadSession>,
     pending_activation: &mut HashMap<String, Option<Arc<ThreadRoot>>>,
     process_watches: &mut HashMap<String, ProcessWatch>,
+    uploads: &mut crate::image_upload::UploadRegistry,
     runtimes: &ProjectRuntimes,
     thread_roots: &ThreadRoots,
     cfg: &RuntimeConfig,
@@ -6151,6 +6629,7 @@ async fn card_scheduler_tick<F>(
             threads,
             pending_activation,
             process_watches,
+            uploads,
             runtimes,
             thread_roots,
             cfg,
@@ -6182,6 +6661,9 @@ struct ServeLauncher<'a, F> {
     threads: &'a mut HashMap<String, ThreadSession>,
     pending_activation: &'a mut HashMap<String, Option<Arc<ThreadRoot>>>,
     process_watches: &'a mut HashMap<String, ProcessWatch>,
+    /// 上传登记表：看板会话不起于 RPC，但 `prepare_turn_core` 的签名要求它
+    /// （`{type:"uploaded_image"}` 只可能来自 RPC；看板卡永远不带上传句柄）。
+    uploads: &'a mut crate::image_upload::UploadRegistry,
     runtimes: &'a ProjectRuntimes,
     thread_roots: &'a ThreadRoots,
     cfg: &'a RuntimeConfig,
@@ -6285,23 +6767,25 @@ where
             "threadId": thread_id,
             "input": [{ "type": "text", "text": request.objective }],
         });
-        let prepared = match prepare_turn_core(self.threads, self.pending_activation, &params).await
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                // 准备失败:把占位清掉,否则该 thread 的 `active_turn_id` 永久卡住。
-                if let Some(session) = self.threads.get_mut(&thread_id) {
-                    session.active_turn_id = None;
+        let prepared =
+            match prepare_turn_core(self.threads, self.pending_activation, self.uploads, &params)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    // 准备失败:把占位清掉,否则该 thread 的 `active_turn_id` 永久卡住。
+                    if let Some(session) = self.threads.get_mut(&thread_id) {
+                        session.active_turn_id = None;
+                    }
+                    // 把具体原因带上:调度器只把它写进 `board.release` 的 detail,
+                    // 「准备失败」四个字不足以定位(是 thread 不在?还是 turn 撞车?)。
+                    return Err(anyhow::anyhow!(
+                        "could not prepare the first turn for {}: {}",
+                        request.card_id,
+                        turn_prepare_rpc_error(error).message
+                    ));
                 }
-                // 把具体原因带上:调度器只把它写进 `board.release` 的 detail,
-                // 「准备失败」四个字不足以定位(是 thread 不在?还是 turn 撞车?)。
-                return Err(anyhow::anyhow!(
-                    "could not prepare the first turn for {}: {}",
-                    request.card_id,
-                    turn_prepare_rpc_error(error).message
-                ));
-            }
-        };
+            };
         // 状态走 `thread/status/updated`(通知),不是向某个 client 的响应,故可发:
         // 侧栏据此看到该会话正在跑。用 prepared 的句柄,保证与 `active_turn_id`
         // 的占位来自同一个 session。
@@ -6323,6 +6807,7 @@ where
                 &prepared.turn_id,
                 &prepared.display_text,
                 prepared.attachments.clone(),
+                prepared.image_refs.clone(),
             ),
         )
         .await?;
@@ -6333,6 +6818,8 @@ where
                 prompt: prepared.prompt,
                 activate: prepared.activate,
                 attachments: prepared.attachments,
+                image_blocks: prepared.image_blocks,
+                image_refs: prepared.image_refs,
                 display_text: prepared.display_text,
             })
             .await
@@ -6573,6 +7060,9 @@ enum TurnPrepareError {
     TurnInProgress(String),
     /// 附件不可读 / 超出上限 / 不是文件。
     InvalidAttachment(String),
+    /// 显式路径的图片输入（`{type:"image", path}`）不可用。带 `data.code =
+    /// "invalid_image"`，客户端据此指认是哪张图被拒（见 `invalid_image`）。
+    InvalidImage(String),
 }
 
 /// 一个已经「占位」好的 turn,但**尚未向任何客户端发帧**。
@@ -6590,6 +7080,10 @@ pub(crate) struct PreparedTurn {
     pub(crate) display_text: String,
     /// 本轮附件元数据；回显在开启项上，并随 `TurnPrompt` 交给 driver 落盘。
     pub(crate) attachments: Vec<crate::protocol::Attachment>,
+    /// 本轮图片内容块（含 base64），随 `TurnPrompt` 进模型上下文。
+    pub(crate) image_blocks: Vec<yi_agent_core::ContentBlock>,
+    /// 本轮图片元数据；回显在开启项上（`Item::UserMessage.images`）。
+    pub(crate) image_refs: Vec<crate::protocol::ImageRef>,
     pub(crate) activate: Option<Arc<ThreadRoot>>,
     pub(crate) status_handle: Arc<std::sync::Mutex<ThreadStatus>>,
 }
@@ -6603,6 +7097,7 @@ pub(crate) struct PreparedTurn {
 async fn prepare_turn_core(
     threads: &mut HashMap<String, ThreadSession>,
     pending_activation: &HashMap<String, Option<Arc<ThreadRoot>>>,
+    uploads: &mut crate::image_upload::UploadRegistry,
     params: &serde_json::Value,
 ) -> Result<PreparedTurn, TurnPrepareError> {
     let thread_id = params
@@ -6610,14 +7105,16 @@ async fn prepare_turn_core(
         .and_then(|v| v.as_str())
         .ok_or(TurnPrepareError::MissingThreadId)?
         .to_string();
-    // 一次性拆出「文本 + 附件源路径」:文本为空但有附件时仍然放行(附件-only)。
+    // 一次性拆出「文本 + 附件源路径 + 图片输入」:文本为空但有附件或图片时仍然
+    // 放行(附件-only / 图片-only)。
     let (text, source_paths) = crate::attachments::parse_input(params);
+    let image_inputs = crate::attachments::parse_image_inputs(params);
     let text_opt = if text.trim().is_empty() {
         None
     } else {
         Some(text)
     };
-    if text_opt.is_none() && source_paths.is_empty() {
+    if text_opt.is_none() && source_paths.is_empty() && image_inputs.is_empty() {
         return Err(TurnPrepareError::EmptyInput);
     }
 
@@ -6668,6 +7165,125 @@ async fn prepare_turn_core(
         }
     }
 
+    // 复制 + 编码图片。同样放在占 `active_turn_id` **之前**。
+    //
+    // 两种来源在这里**收敛**到同一条管线（裁定 R3）：
+    // - `Path`（桌面）：文件选择器给的根外绝对路径，先 `store_attachment` 复制进
+    //   工作区；
+    // - `Upload`（iOS 分片上传）：`image/upload/*` 已经把 staging 收拢成同一份
+    //   `store_attachment` 结果（含 `size` = 存盘文件字节长度），这里只反查登记表。
+    //
+    // 之后一律读**根内副本**再编码：`prepare_image_file` 在根外读原文件也可以，
+    // 但那样回显的 `path` 与真正读到的字节可能来自两个位置；统一读根内副本，
+    // `path` 与内容才必然同源，`ImageRef.size` 也才必然等于该文件的字节长度。
+    //
+    // 坏图的两条处置**刻意不同**，判据是「失败能不能靠重试自愈」：
+    // - `Upload`：`uploadId` 未知 / 未 commit / 已过期（10 分钟 TTL）都是**不可
+    //   自愈**的——服务端手里已没有重试所需的任何东西，客户端每重发一次都只会拿
+    //   到一模一样的失败，而它还会把 chip 留着，于是整轮对话被这一张图钉死。故
+    //   **丢弃这张图**（warn 一条）并继续起 turn：用户照样能把消息发出去。
+    //   注：上传路径的图已由 `begin` 的 `MAX_IMAGE_BYTES` 设闸，故「超大」不会
+    //   走到这里；但「上传的字节其实不是图」会——`commit` 只收拢字节，判图是这
+    //   一步的事。
+    // - `Path`：路径是这次请求里的显式参数，指不到/不是图是**调用方请求本身**的
+    //   问题（桌面端的图在本地盘上，重发同一路径多半就是同一个结果），仍按
+    //   `InvalidImage` 硬拒，与文档附件的 `InvalidAttachment` 同口径。
+    let mut image_blocks = Vec::with_capacity(image_inputs.len());
+    let mut image_refs = Vec::with_capacity(image_inputs.len());
+    for input in &image_inputs {
+        let (label, stored) = match input {
+            crate::attachments::ImageInput::Path(source) => {
+                let stored = match crate::attachments::store_attachment(
+                    Path::new(&cwd),
+                    &thread_id,
+                    Path::new(source),
+                    max_bytes,
+                ) {
+                    Ok(stored) => stored,
+                    Err(e) => {
+                        return Err(TurnPrepareError::InvalidImage(format!(
+                            "image {source}: {e:?}"
+                        )));
+                    }
+                };
+                (source.clone(), stored)
+            }
+            crate::attachments::ImageInput::Upload(upload_id) => {
+                // 未 commit / 未知 / 已过期都落到这里。
+                //
+                // 反查必须带 `thread_id`：`uploadId` 是客户端手里的不透明句柄，
+                // 只看 id 不看归属，就能把别条 thread 的图摄进本 turn（跨 thread
+                // 取数）。归属不符与「未知」一样丢弃，不向调用方区分两者。
+                match uploads.resolve_for(upload_id, &thread_id) {
+                    Some(attachment) => (upload_id.clone(), attachment),
+                    None => {
+                        tracing::warn!(
+                            %thread_id,
+                            upload_id = %upload_id,
+                            "dropping unresolvable uploaded image; continuing the turn",
+                        );
+                        continue;
+                    }
+                }
+            }
+        };
+        let stored_abs = Path::new(&cwd).join(&stored.path);
+        match yi_agent_tools::image_prep::prepare_image_file(
+            &stored_abs,
+            yi_agent_core::ImageDetail::High,
+            yi_agent_tools::image_prep::resolve_budget(),
+        ) {
+            Ok(yi_agent_tools::image_prep::PreparedImage::Ready {
+                media_type, data, ..
+            }) => {
+                image_blocks.push(yi_agent_core::ContentBlock::Image {
+                    source: yi_agent_core::ImageSource::Base64 {
+                        media_type: media_type.clone(),
+                        data,
+                    },
+                    detail: yi_agent_core::ImageDetail::High,
+                    path: Some(stored.path.clone()),
+                });
+                image_refs.push(crate::protocol::ImageRef {
+                    path: stored.path,
+                    media_type,
+                    size: stored.size,
+                    detail: Some(yi_agent_core::ImageDetail::High.as_wire_str().to_string()),
+                });
+            }
+            // 已落盘、但读不出/超预算的上传图同样丢：它和「未知 uploadId」一样属于
+            // 重发必然复现的失败，不该毒死整轮。
+            Ok(yi_agent_tools::image_prep::PreparedImage::Omitted { message })
+                if matches!(input, crate::attachments::ImageInput::Upload(_)) =>
+            {
+                tracing::warn!(
+                    %thread_id,
+                    image = %label,
+                    %message,
+                    "dropping an unusable uploaded image; continuing the turn",
+                );
+            }
+            Ok(yi_agent_tools::image_prep::PreparedImage::Omitted { message }) => {
+                return Err(TurnPrepareError::InvalidImage(format!(
+                    "image {label}: {message}"
+                )));
+            }
+            Err(e) if matches!(input, crate::attachments::ImageInput::Upload(_)) => {
+                tracing::warn!(
+                    %thread_id,
+                    image = %label,
+                    error = ?e,
+                    "dropping an unusable uploaded image; continuing the turn",
+                );
+            }
+            Err(e) => {
+                return Err(TurnPrepareError::InvalidImage(format!(
+                    "image {label}: {e:?}"
+                )));
+            }
+        }
+    }
+
     // 占位(复制成功之后)。
     {
         let Some(session) = threads.get_mut(&thread_id) else {
@@ -6678,7 +7294,6 @@ async fn prepare_turn_core(
         }
         session.active_turn_id = Some(turn_id.clone());
     }
-
     let activate = pending_activation.get(&thread_id).cloned().flatten();
     // prompt 送进模型时带上附件清单;气泡文本仍是原话(见 `display_text`)。
     let prompt = crate::attachments::prompt_with_attachments(
@@ -6692,6 +7307,8 @@ async fn prepare_turn_core(
         prompt,
         display_text: text_opt.unwrap_or_default(),
         attachments,
+        image_blocks,
+        image_refs,
         activate,
         status_handle,
     })
@@ -6705,6 +7322,7 @@ fn turn_prepare_rpc_error(error: TurnPrepareError) -> RpcError {
         TurnPrepareError::UnknownThread(thread_id) => RpcError::unknown_thread(&thread_id),
         TurnPrepareError::TurnInProgress(thread_id) => RpcError::turn_in_progress(&thread_id),
         TurnPrepareError::InvalidAttachment(msg) => RpcError::invalid_params(msg),
+        TurnPrepareError::InvalidImage(msg) => RpcError::invalid_image(msg),
     }
 }
 
@@ -6722,11 +7340,13 @@ fn opening_user_item(
     turn_id: &str,
     text: &str,
     attachments: Vec<crate::protocol::Attachment>,
+    images: Vec<crate::protocol::ImageRef>,
 ) -> crate::protocol::Item {
     crate::protocol::Item::UserMessage {
         id: format!("user-{turn_id}"),
         text: text.to_string(),
         attachments,
+        images,
     }
 }
 
@@ -6767,12 +7387,13 @@ async fn emit_item(
 async fn start_turn_core(
     threads: &mut HashMap<String, ThreadSession>,
     pending_activation: &HashMap<String, Option<Arc<ThreadRoot>>>,
+    uploads: &mut crate::image_upload::UploadRegistry,
     hub: &Arc<crate::broadcast::Broadcaster>,
     client: &crate::broadcast::ClientId,
     params: &serde_json::Value,
     id: RequestId,
 ) -> anyhow::Result<Option<String>> {
-    let prepared = match prepare_turn_core(threads, pending_activation, params).await {
+    let prepared = match prepare_turn_core(threads, pending_activation, uploads, params).await {
         Ok(prepared) => prepared,
         Err(error) => {
             write_response(hub, client, err_response(id, turn_prepare_rpc_error(error))).await?;
@@ -6798,6 +7419,7 @@ async fn start_turn_core(
             &prepared.turn_id,
             &prepared.display_text,
             prepared.attachments.clone(),
+            prepared.image_refs.clone(),
         ),
     )
     .await?;
@@ -6822,6 +7444,8 @@ async fn start_turn_core(
             prompt: prepared.prompt,
             activate: prepared.activate,
             attachments: prepared.attachments,
+            image_blocks: prepared.image_blocks,
+            image_refs: prepared.image_refs,
             display_text: prepared.display_text,
         })
         .await
@@ -7784,6 +8408,7 @@ mod card_scheduling_tests {
         threads: HashMap<String, ThreadSession>,
         pending_activation: HashMap<String, Option<Arc<ThreadRoot>>>,
         process_watches: HashMap<String, ProcessWatch>,
+        uploads: crate::image_upload::UploadRegistry,
         runtimes: ProjectRuntimes,
         thread_roots: ThreadRoots,
         cfg: RuntimeConfig,
@@ -7812,6 +8437,7 @@ mod card_scheduling_tests {
                 threads: HashMap::new(),
                 pending_activation: HashMap::new(),
                 process_watches: HashMap::new(),
+                uploads: crate::image_upload::UploadRegistry::new(),
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 cfg: test_config(),
@@ -7842,6 +8468,7 @@ mod card_scheduling_tests {
                 threads: &mut self.threads,
                 pending_activation: &mut self.pending_activation,
                 process_watches: &mut self.process_watches,
+                uploads: &mut self.uploads,
                 runtimes: &self.runtimes,
                 thread_roots: &self.thread_roots,
                 cfg: &self.cfg,
@@ -8894,6 +9521,33 @@ pub(crate) mod tests {
         }
     }
 
+    /// 记录每次调用收到的 `messages`（含内容块），用于断言图片真的以
+    /// `ContentBlock::Image` 进了模型上下文，而不只是回显在 item 上。
+    struct CapturingMessagesProvider {
+        /// 每次 provider 调用一份完整消息列表。
+        messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>>,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for CapturingMessagesProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            self.messages.lock().unwrap().push(req.messages.clone());
+            let events = vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("ok".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
     /// 永不自行结束的 provider:每 5ms 吐一个 delta,turn 会一直活跃,
     /// 直到被 `turn/interrupt` 取消。
     struct SlowProvider;
@@ -9523,6 +10177,17 @@ pub(crate) mod tests {
                 Ok(Ok(n)) if n > 0 => serde_json::from_str(buf.trim()).ok(),
                 _ => None,
             }
+        }
+
+        /// 读到 `turn/completed` 为止（最多 40 帧），返回那一帧。
+        pub(crate) async fn read_until_turn_completed(&mut self) -> serde_json::Value {
+            for _ in 0..40 {
+                let v = self.read_value().await;
+                if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                    return v;
+                }
+            }
+            panic!("turn/completed never arrived");
         }
 
         /// 关掉客户端写端(触发 EOF)并等待 server 任务结束。
@@ -10679,6 +11344,1702 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 桌面端从「图片」选择器选中的图（工作区外的绝对路径）必须被复制进 thread
+    /// 的 cwd，元数据以 `ImageRef` 回显在开启项上；气泡正文仍是用户原话，
+    /// 图片**不进**附件清单（它是内容块，不是文档附件）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_with_an_image_injects_an_image_block_and_an_item_ref() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 一张 8x8 PNG，放在工作区外（模拟从「图片」选择器选）。
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("shot.png");
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([1, 2, 3]));
+        img.save_with_format(&src, image::ImageFormat::Png).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}},{{"type":"text","text":"这是什么"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") {
+                opener = Some(v["params"]["item"].clone());
+                break;
+            }
+        }
+        let item = opener.expect("the turn must open with an item");
+        assert_eq!(item["type"], "userMessage", "{item}");
+        assert_eq!(item["text"], "这是什么", "{item}");
+        let rel = item["images"][0]["path"].as_str().expect("image path");
+        assert!(rel.starts_with(".yi-agent/attachments/"), "{rel}");
+        assert!(
+            workdir.path().join(rel).is_file(),
+            "image not copied: {rel}"
+        );
+        assert_eq!(item["images"][0]["media_type"], "image/png", "{item}");
+        assert_eq!(item["images"][0]["detail"], "high", "{item}");
+        // 气泡文本里不得注入清单。
+        assert!(
+            !item["text"].as_str().unwrap().contains("Attached files"),
+            "{item}"
+        );
+
+        // 落盘回合里也必须带上 images 引用：resume 回放时气泡要能重新渲染出图。
+        let _ = h.read_until_turn_completed().await;
+        let jsonl = std::fs::read_to_string(
+            workdir
+                .path()
+                .join(".yi-agent")
+                .join("threads")
+                .join(format!("{tid}.jsonl")),
+        )
+        .expect("the thread log must exist after a completed turn");
+        let line: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let opened = &line["items"][0];
+        assert_eq!(opened["type"], "userMessage", "{line}");
+        assert_eq!(opened["images"][0]["path"], rel, "{line}");
+        assert_eq!(opened["images"][0]["size"], src.metadata().unwrap().len());
+        h.shutdown().await;
+    }
+
+    /// 回归：`images[].size` 必须取**存盘文件**的大小，而不是重编码后载荷的长度。
+    ///
+    /// 上面那条测试用的是 8x8 直通 PNG：`prepare_image_file` 原样返回源字节，
+    /// 于是「载荷长度」与「文件大小」恰好相等，即使实现数错了也照样通过。
+    /// 真正会暴露问题的是**被重编码**的图：这里用一张宽 4096px 的 PNG，`High`
+    /// 档（最长边 2048）必然触发降采样重编码，载荷与文件大小不再相等。
+    ///
+    /// 同时断言落盘的 `.jsonl` 开启项与实时 `item/started` 开启项**是同一个数**：
+    /// 两者若各算各的（一个读文件、一个量载荷）就会分叉，这正是被修复的缺陷。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_encoded_image_persists_the_stored_file_size() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 宽 4096、高 64 的 PNG：最长边超 2048，`High` 档必降采样重编码；
+        // 且整幅尺寸很小，编码后仍远低于字节预算，所以走的就是「降采样 + 重编码」
+        // 这条（而不是字节超限才降级的）路径。
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("wide.png");
+        let img = image::RgbImage::from_fn(4096, 64, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 253) as u8, ((x ^ y) % 255) as u8])
+        });
+        img.save_with_format(&src, image::ImageFormat::Png).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}},{{"type":"text","text":"看看这张"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        // 实时开启项：`size` 必须等于存盘文件的大小（重编码不影响它）。
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") {
+                opener = Some(v["params"]["item"].clone());
+                break;
+            }
+        }
+        let item = opener.expect("the turn must open with an item");
+        let rel = item["images"][0]["path"]
+            .as_str()
+            .expect("image path")
+            .to_string();
+        let stored = workdir.path().join(&rel);
+        let stored_len = stored.metadata().expect("the stored copy must exist").len();
+
+        // 前提检查：这张图确实被 image_prep 重编码了，否则本条测试抓不到缺陷。
+        //
+        // 存盘文件是源字节的**逐字副本**，所以文件大小永远等于源大小；重编码的
+        // 结果只存在于内存里的 base64 载荷。这里用同一个公开入口复算一次载荷，
+        // 证实「载荷长度 != 文件大小」，于是「缺了这段元数据就只能去量载荷」的
+        // 老实现必然落在这个数上。
+        let payload_len = match yi_agent_tools::image_prep::prepare_image_file(
+            &stored,
+            yi_agent_core::ImageDetail::High,
+            yi_agent_tools::image_prep::resolve_budget(),
+        )
+        .expect("the fixture must be a readable image")
+        {
+            yi_agent_tools::image_prep::PreparedImage::Ready {
+                data, width, note, ..
+            } => {
+                assert!(
+                    width < 4096,
+                    "the fixture must be downscaled (width {width}) for this test to be meaningful"
+                );
+                assert!(
+                    note.is_some(),
+                    "the fixture must be re-encoded (no note means pass-through)"
+                );
+                let b64 = data.as_bytes();
+                let padding = b64.iter().rev().take_while(|b| **b == b'=').count().min(2);
+                ((b64.len() / 4) * 3 - padding) as u64
+            }
+            other => panic!("expected a Ready image, got {other:?}"),
+        };
+        assert_ne!(
+            payload_len, stored_len,
+            "the fixture must actually be re-encoded for this test to be meaningful"
+        );
+        assert_eq!(
+            item["images"][0]["size"].as_u64(),
+            Some(stored_len),
+            "the live opener must report the stored file size, not the payload length: {item}"
+        );
+
+        // 落盘开启项：与实时开启项必须是同一个数（一份来源）。
+        let _ = h.read_until_turn_completed().await;
+        let jsonl = std::fs::read_to_string(
+            workdir
+                .path()
+                .join(".yi-agent")
+                .join("threads")
+                .join(format!("{tid}.jsonl")),
+        )
+        .expect("the thread log must exist after a completed turn");
+        let line: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let opened = &line["items"][0];
+        assert_eq!(opened["images"][0]["path"], rel.as_str(), "{opened}");
+        assert_eq!(
+            opened["images"][0]["size"].as_u64(),
+            Some(stored_len),
+            "the persisted opener must report the stored file size: {opened}"
+        );
+        assert_eq!(
+            opened["images"][0]["size"], item["images"][0]["size"],
+            "the persisted and live openers must agree: {opened} vs {item}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 发一条 RPC 并按 id 读回响应(与 `board_rpc_tests::rpc` 同款,测试流里随时
+    /// 会插入 `process/updated` 等通知,不能假定下一帧就是响应)。
+    async fn rpc(
+        h: &mut Harness,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        h.send(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            })
+            .to_string(),
+        )
+        .await;
+        read_response(h, id).await
+    }
+
+    /// 造一张**必被降采样重编码**的宽 PNG(4096x64,最长边超 High 档的 2048):
+    /// 存盘文件长度与内存里 base64 载荷长度不再相等,正是 Task 5 不变量要求的分辨点。
+    fn write_a_re_encodable_png_into_memory() -> Vec<u8> {
+        let img = image::RgbImage::from_fn(4096, 64, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 253) as u8, ((x ^ y) % 255) as u8])
+        });
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    /// iOS 分片上传的完整往返:`begin → chunk(0..n) → commit → turn/start`。
+    ///
+    /// 断言三件事,每件都是这条 RPC 集结的一条不变量:
+    /// - `commit` 返回的 `path`/`size` 就是**存盘文件**本身(`size` == 该文件字节长度);
+    /// - 存盘内容逐字节等于分块拼接;staging 已被清掉;
+    /// - `turn/start` 用 `{type:"uploaded_image", uploadId}` 摄取后,开启项
+    ///   `images[0].size` 是**文件长度**而非 base64 载荷长度(用真正被重编码的
+    ///   夹具把两者分开),且落盘 `.jsonl` 与实时开启项报同一个数。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uploaded_image_round_trips_through_commit_and_turn_start() {
+        use base64::Engine as _;
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        let bytes = write_a_re_encodable_png_into_memory();
+        let total = bytes.len() as u64;
+
+        let begin = rpc(
+            &mut h,
+            20,
+            "image/upload/begin",
+            serde_json::json!({
+                "threadId": tid, "name": "shot.png", "mime": "image/png", "size": total
+            }),
+        )
+        .await;
+        assert!(begin.get("error").is_none(), "{begin}");
+        let upload_id = begin["result"]["uploadId"]
+            .as_str()
+            .expect("begin must return an uploadId")
+            .to_string();
+        assert!(
+            begin["result"]["chunkSize"].as_u64().unwrap_or(0) > 0,
+            "{begin}"
+        );
+
+        // 切三块发(真实客户端也分批送);块序从 0 起递增。
+        let step = bytes.len().div_ceil(3);
+        for (i, part) in bytes.chunks(step).enumerate() {
+            let data = base64::engine::general_purpose::STANDARD.encode(part);
+            let resp = rpc(
+                &mut h,
+                21 + i as u64,
+                "image/upload/chunk",
+                serde_json::json!({ "uploadId": upload_id, "index": i, "data": data }),
+            )
+            .await;
+            assert!(resp.get("error").is_none(), "chunk {i} refused: {resp}");
+        }
+
+        let commit = rpc(
+            &mut h,
+            30,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": upload_id }),
+        )
+        .await;
+        assert!(commit.get("error").is_none(), "{commit}");
+        let rel = commit["result"]["path"]
+            .as_str()
+            .expect("commit must return the stored path")
+            .to_string();
+        assert!(
+            rel.starts_with(&format!(".yi-agent/attachments/{tid}/")),
+            "{rel}"
+        );
+        assert!(
+            rel.ends_with("-shot.png"),
+            "commit must keep the client's name: {rel}"
+        );
+        assert_eq!(commit["result"]["mediaType"], "image/png", "{commit}");
+        let stored = workdir.path().join(&rel);
+        let stored_len = stored.metadata().expect("the stored copy must exist").len();
+        assert_eq!(
+            commit["result"]["size"].as_u64(),
+            Some(stored_len),
+            "{commit}"
+        );
+        assert_eq!(
+            std::fs::read(&stored).unwrap(),
+            bytes,
+            "the stored copy must be the concatenated chunks"
+        );
+        // staging 必须已被清掉。
+        assert!(
+            !workdir
+                .path()
+                .join(".yi-agent/attachments")
+                .join(&tid)
+                .join(".tmp")
+                .join(&upload_id)
+                .exists(),
+            "the staging file must be gone after commit"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"uploaded_image","uploadId":"{upload_id}"}},{{"type":"text","text":"看看这张"}}]}}}}"#
+        ))
+        .await;
+
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..16 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") {
+                opener = Some(v["params"]["item"].clone());
+                break;
+            }
+        }
+        let item = opener.expect("the turn must open with an item");
+        assert_eq!(item["type"], "userMessage", "{item}");
+        assert_eq!(item["text"], "看看这张", "{item}");
+        assert_eq!(item["images"][0]["path"], rel.as_str(), "{item}");
+        assert_eq!(item["images"][0]["media_type"], "image/png", "{item}");
+        assert_eq!(
+            item["images"][0]["size"].as_u64(),
+            Some(stored_len),
+            "the live opener must report the stored file size: {item}"
+        );
+        // 前提检查:这张图确实被重编码了,否则「size == 文件长度」会因为两者相等
+        // 而抓不到「误用载荷长度」的实现。顺便把载荷本身拿出来,做「Item 里不含
+        // base64」的反向断言。
+        let payload_base64 = match yi_agent_tools::image_prep::prepare_image_file(
+            &stored,
+            yi_agent_core::ImageDetail::High,
+            yi_agent_tools::image_prep::resolve_budget(),
+        )
+        .expect("the fixture must be a readable image")
+        {
+            yi_agent_tools::image_prep::PreparedImage::Ready { data, .. } => data,
+            other => panic!("expected a Ready image, got {other:?}"),
+        };
+        let b64 = payload_base64.as_bytes();
+        let padding = b64.iter().rev().take_while(|b| **b == b'=').count().min(2);
+        let payload_len = ((b64.len() / 4) * 3 - padding) as u64;
+        assert_ne!(
+            payload_len, stored_len,
+            "the fixture must be re-encoded for this test to be meaningful"
+        );
+
+        // 落盘开启项与实时开启项必须同源(同一个数)。
+        let _ = h.read_until_turn_completed().await;
+        let jsonl = std::fs::read_to_string(
+            workdir
+                .path()
+                .join(".yi-agent")
+                .join("threads")
+                .join(format!("{tid}.jsonl")),
+        )
+        .expect("the thread log must exist after a completed turn");
+        let line: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let opened = &line["items"][0];
+        assert_eq!(opened["images"][0]["path"], rel.as_str(), "{opened}");
+        assert_eq!(
+            opened["images"][0]["size"].as_u64(),
+            Some(stored_len),
+            "the persisted opener must report the stored file size: {opened}"
+        );
+        // Item 里绝不能出现 base64 载荷:item 是每条通知都带的东西,内联图片字节
+        // 会撑爆 1 MiB 的帧(设计 §3 的关键约束)。断言只针对**落盘的 items**:
+        // 同一行里的 `messages` 是原样留存的会话(供 resume),其中的内容块本就带
+        // base64,那是 Task 5 既有且必需的行为。
+        assert!(
+            !serde_json::to_string(&line["items"])
+                .unwrap()
+                .contains(&payload_base64),
+            "no base64 may ever appear in an Item"
+        );
+        h.shutdown().await;
+    }
+
+    /// 反向断言:上传路径也必须真的把图送进**模型**(内容块),而不是只回显 item。
+    /// 与桌面 `{type:"image", path}` 落到同一条 `prepare_image_file` 管线(R3)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uploaded_image_reaches_the_model_as_a_content_block() {
+        use base64::Engine as _;
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+
+        let messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let messages_factory = Arc::clone(&messages);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          _cwd: &std::path::Path,
+                          _mode: crate::thread_store::ThreadMode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CapturingMessagesProvider {
+                messages: Arc::clone(&messages_factory),
+            });
+            let config = yi_agent_core::AgentConfig::default();
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            apply_session(&mut agent, session);
+            Ok(BuiltAgent {
+                agent,
+                provider,
+                config,
+                decision_tx: None,
+                decision_rx: None,
+                catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([9, 9, 9]));
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+
+        let begin = rpc(
+            &mut h,
+            40,
+            "image/upload/begin",
+            serde_json::json!({
+                "threadId": tid, "name": "shot.png", "mime": "image/png", "size": bytes.len(),
+            }),
+        )
+        .await;
+        let upload_id = begin["result"]["uploadId"].as_str().unwrap().to_string();
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        rpc(
+            &mut h,
+            41,
+            "image/upload/chunk",
+            serde_json::json!({ "uploadId": upload_id, "index": 0, "data": data }),
+        )
+        .await;
+        let commit = rpc(
+            &mut h,
+            42,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": upload_id }),
+        )
+        .await;
+        let rel = commit["result"]["path"].as_str().unwrap().to_string();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":43,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"这是什么"}},{{"type":"uploaded_image","uploadId":"{upload_id}"}}]}}}}"#
+        ))
+        .await;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        let seen = messages.lock().unwrap().clone();
+        // 首轮收尾会为会话标题再调一次 provider（见 `TITLE_TIMEOUT`），故按**本轮**
+        // 的用户文本挑出那次调用，而不是盲目取最后一次。
+        let first = seen
+            .iter()
+            .find(|msgs| {
+                msgs.iter().any(|m| {
+                    m.role == yi_agent_core::Role::User
+                        && m.content.iter().any(
+                            |b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t == "这是什么"),
+                        )
+                })
+            })
+            .expect("the provider must have been called with the turn");
+        let first_user = first
+            .iter()
+            .find(|m| m.role == yi_agent_core::Role::User)
+            .expect("the turn call must carry a user message");
+        let image_path = first_user
+            .content
+            .iter()
+            .find_map(|b| match b {
+                yi_agent_core::ContentBlock::Image { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .expect("the user message must carry an image content block")
+            .expect("the image block must carry the stored relative path");
+        assert_eq!(image_path, rel);
+        assert!(
+            workdir.path().join(&image_path).is_file(),
+            "the block path must point at the stored copy: {image_path}"
+        );
+        let text = first_user
+            .content
+            .iter()
+            .find_map(|b| match b {
+                yi_agent_core::ContentBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the text block must still be there");
+        assert_eq!(text, "这是什么");
+        h.shutdown().await;
+    }
+
+    /// 未知/已 abort/已过期的 `uploadId` 不再毒死整轮：那张图被**丢弃**，turn 照常
+    /// 起、文本照常送进模型，开启项上不带 `images`。用户于是能把消息发出去，而不是
+    /// 被一张找不回来的图永久卡住（chip 会留着，重试永远同样失败）。
+    ///
+    /// 判据是「失败能不能靠重试自愈」：`uploadId` 未知意味着服务端手里已经没有重试
+    /// 所需的任何东西（记录被 TTL 收走或从未存在），重发必然复现同一结果 → 丢弃。
+    /// 与之相对，显式 `{type:"image", path}` 指不到文件是**请求本身**的问题，仍硬拒
+    /// （见 `turn_start_rejects_a_non_image_image_input`）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_drops_an_unknown_upload_id_and_still_runs_the_turn() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+
+        let messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let messages_factory = Arc::clone(&messages);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          _cwd: &std::path::Path,
+                          _mode: crate::thread_store::ThreadMode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CapturingMessagesProvider {
+                messages: Arc::clone(&messages_factory),
+            });
+            let config = yi_agent_core::AgentConfig::default();
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            apply_session(&mut agent, session);
+            Ok(BuiltAgent {
+                agent,
+                provider,
+                config,
+                decision_tx: None,
+                decision_rx: None,
+                catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":50,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"uploaded_image","uploadId":"upload-does-not-exist"}},{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        // 关键逆转：这条 `turn/start` 必须**成功**（旧行为是回 `invalid_params` 并
+        // 拒绝整轮）。开启项照常发出，只是没有 `images`。
+        let mut resp: Option<serde_json::Value> = None;
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..30 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(50)) {
+                resp = Some(v.clone());
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") && opener.is_none()
+            {
+                opener = Some(v["params"]["item"].clone());
+            }
+            if resp.is_some() && opener.is_some() {
+                break;
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        assert!(
+            resp.get("error").is_none(),
+            "an unrecoverable upload must not fail the whole turn: {resp}"
+        );
+        assert!(
+            resp["result"]["turn_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "the turn must really start: {resp}"
+        );
+        let item = opener.expect("the turn must still open with an item");
+        assert_eq!(item["type"], "userMessage", "{item}");
+        assert_eq!(item["text"], "hi", "the text must survive: {item}");
+        assert!(
+            item["images"].as_array().map_or(true, |a| a.is_empty()),
+            "the dropped image must not be echoed: {item}"
+        );
+
+        // 这一轮必须真的跑到底，且状态回到 idle——「占了槽却起不来」的僵尸 turn
+        // 只会停在 running（只有真正收尾的 turn 才会让主循环清掉活跃标记）。
+        let mut completed = false;
+        let mut idle = false;
+        for _ in 0..80 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("turn/completed") => completed = true,
+                Some("thread/status/updated")
+                    if v["params"]["thread_id"] == serde_json::json!(tid)
+                        && v["params"]["status"] == "idle" =>
+                {
+                    idle = true
+                }
+                _ => {}
+            }
+            if completed && idle {
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "the turn must run to completion after the image is dropped"
+        );
+        assert!(
+            idle,
+            "the thread must go back to idle, not stay a zombie turn"
+        );
+
+        // 文本真的到了模型：拿到 provider 的 user 消息，其中不得有任何图片块
+        // （被丢弃的图既不该进 item，也不该进模型上下文）。
+        let seen = messages.lock().unwrap().clone();
+        // 首轮收尾会为会话标题再调一次 provider（见 `TITLE_TIMEOUT`），故按**本轮**
+        // 的用户文本挑出那次调用，而不是盲目取最后一次。
+        let first = seen
+            .iter()
+            .find(|msgs| {
+                msgs.iter().any(|m| {
+                    m.role == yi_agent_core::Role::User
+                        && m.content
+                            .iter()
+                            .any(|b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t == "hi"))
+                })
+            })
+            .expect("the provider must have been called with the turn");
+        let first_user = first
+            .iter()
+            .find(|m| m.role == yi_agent_core::Role::User)
+            .expect("the turn call must carry a user message");
+
+        assert!(
+            !first_user
+                .content
+                .iter()
+                .any(|b| matches!(b, yi_agent_core::ContentBlock::Image { .. })),
+            "the dropped image must not reach the model: {first_user:?}"
+        );
+        assert!(
+            first_user
+                .content
+                .iter()
+                .any(|b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t == "hi")),
+            "the text must reach the model: {first_user:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 跨会话守卫:为 thread A 上传并 commit 的图,**不能**凭一个 `uploadId` 被摄进
+    /// thread B。`uploadId` 只是不透明的句柄,若反查只认 id 不认归属,任何知道/猜到
+    /// 该 id 的客户端就能把别人的会话里的图塞进自己的会话(跨会话取数)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uploaded_image_cannot_be_ingested_into_another_thread() {
+        use base64::Engine as _;
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid_a = start_thread(&mut h).await;
+        let tid_b = start_thread(&mut h).await;
+
+        let bytes = write_a_re_encodable_png_into_memory();
+        let total = bytes.len() as u64;
+        let begin = rpc(
+            &mut h,
+            20,
+            "image/upload/begin",
+            serde_json::json!({
+                "threadId": tid_a, "name": "shot.png", "mime": "image/png", "size": total
+            }),
+        )
+        .await;
+        let upload_id = begin["result"]["uploadId"]
+            .as_str()
+            .expect("begin must return an uploadId")
+            .to_string();
+        let step = bytes.len().div_ceil(3);
+        for (i, part) in bytes.chunks(step).enumerate() {
+            let data = base64::engine::general_purpose::STANDARD.encode(part);
+            let resp = rpc(
+                &mut h,
+                21 + i as u64,
+                "image/upload/chunk",
+                serde_json::json!({ "uploadId": upload_id, "index": i, "data": data }),
+            )
+            .await;
+            assert!(resp.get("error").is_none(), "chunk {i}: {resp}");
+        }
+        let commit = rpc(
+            &mut h,
+            30,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": upload_id }),
+        )
+        .await;
+        assert!(commit.get("error").is_none(), "{commit}");
+
+        // thread B 用 A 的 uploadId 起 turn:归属不符与「未知」同等对待——那张图被
+        // **丢弃**，turn 照常起（不再毒死整轮），开启项上不带 `images`。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":31,"method":"turn/start","params":{{"threadId":"{tid_b}","input":[{{"type":"uploaded_image","uploadId":"{upload_id}"}},{{"type":"text","text":"steal"}}]}}}}"#
+        ))
+        .await;
+        let mut resp: Option<serde_json::Value> = None;
+        let mut opener_b: Option<serde_json::Value> = None;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(31)) {
+                resp = Some(v.clone());
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started")
+                && opener_b.is_none()
+            {
+                opener_b = Some(v["params"]["item"].clone());
+            }
+            if resp.is_some() && opener_b.is_some() {
+                break;
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        assert!(
+            resp.get("error").is_none(),
+            "B must still run: the foreign image is dropped, not fatal: {resp}"
+        );
+        let item_b = opener_b.expect("thread B must open with an item");
+        assert_eq!(item_b["text"], "steal", "{item_b}");
+        assert!(
+            item_b["images"].as_array().map_or(true, |a| a.is_empty()),
+            "thread B must not receive thread A's image: {item_b}"
+        );
+        // 安全断言不变:A 的字节一个都没进 B 的工作区。
+        assert!(
+            !workdir
+                .path()
+                .join(".yi-agent/attachments")
+                .join(&tid_b)
+                .exists(),
+            "thread B must not receive thread A's image"
+        );
+        // 等 B 这轮收尾,再看 A 的正控——否则 B 的开启项会被下面的循环误当成 A 的。
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        // 正控:A 自己仍能正常摄取这张图。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":32,"method":"turn/start","params":{{"threadId":"{tid_a}","input":[{{"type":"uploaded_image","uploadId":"{upload_id}"}},{{"type":"text","text":"mine"}}]}}}}"#
+        ))
+        .await;
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..16 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") {
+                opener = Some(v["params"]["item"].clone());
+                break;
+            }
+        }
+        let item = opener.expect("thread A must open with an item");
+        assert_eq!(item["type"], "userMessage", "{item}");
+        assert_eq!(
+            item["images"][0]["path"]
+                .as_str()
+                .map(|p| p.starts_with(&format!(".yi-agent/attachments/{tid_a}/"))),
+            Some(true),
+            "thread A must ingest its own upload: {item}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 上传的边界:乱序块、越界块、超 20 MiB 的声明都要被拒(错误响应,不 panic)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_upload_refuses_out_of_order_oversized_and_too_large_uploads() {
+        use base64::Engine as _;
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 乱序:第一条就发 index 1。
+        let begin = rpc(
+            &mut h,
+            60,
+            "image/upload/begin",
+            serde_json::json!({ "threadId": tid, "name": "x.png", "size": 6 }),
+        )
+        .await;
+        let id = begin["result"]["uploadId"].as_str().unwrap().to_string();
+        let out_of_order = rpc(
+            &mut h,
+            61,
+            "image/upload/chunk",
+            serde_json::json!({
+                "uploadId": id, "index": 1,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"def"),
+            }),
+        )
+        .await;
+        assert!(
+            out_of_order["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("out-of-order"),
+            "{out_of_order}"
+        );
+
+        // 越界:声明 4 字节却发 5 字节。
+        let small = rpc(
+            &mut h,
+            62,
+            "image/upload/begin",
+            serde_json::json!({ "threadId": tid, "name": "y.png", "size": 4 }),
+        )
+        .await;
+        let small_id = small["result"]["uploadId"].as_str().unwrap().to_string();
+        let overrun = rpc(
+            &mut h,
+            63,
+            "image/upload/chunk",
+            serde_json::json!({
+                "uploadId": small_id, "index": 0,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"abcde"),
+            }),
+        )
+        .await;
+        assert!(
+            overrun["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("overruns"),
+            "{overrun}"
+        );
+
+        // 声明就超 20 MiB:begin 即拒。
+        let too_big = rpc(
+            &mut h,
+            64,
+            "image/upload/begin",
+            serde_json::json!({
+                "threadId": tid, "name": "huge.png",
+                "size": yi_agent_tools::image_prep::MAX_IMAGE_BYTES + 1,
+            }),
+        )
+        .await;
+        assert!(
+            too_big["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("over"),
+            "{too_big}"
+        );
+
+        // 未知会话:chunk 与 commit 都拒绝,不 panic。
+        let unknown_chunk = rpc(
+            &mut h,
+            65,
+            "image/upload/chunk",
+            serde_json::json!({ "uploadId": "upload-nope", "index": 0, "data": "" }),
+        )
+        .await;
+        assert!(unknown_chunk.get("error").is_some(), "{unknown_chunk}");
+        let unknown_commit = rpc(
+            &mut h,
+            66,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": "upload-nope" }),
+        )
+        .await;
+        assert!(unknown_commit.get("error").is_some(), "{unknown_commit}");
+
+        h.shutdown().await;
+    }
+
+    /// `abort` 清 staging:`image/upload/abort` 之后该 `uploadId` 再也无法 commit
+    /// 或用于 `turn/start`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_upload_abort_discards_the_staging_file() {
+        use base64::Engine as _;
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        let begin = rpc(
+            &mut h,
+            70,
+            "image/upload/begin",
+            serde_json::json!({ "threadId": tid, "name": "z.png", "size": 3 }),
+        )
+        .await;
+        let id = begin["result"]["uploadId"].as_str().unwrap().to_string();
+        rpc(
+            &mut h,
+            71,
+            "image/upload/chunk",
+            serde_json::json!({
+                "uploadId": id, "index": 0,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"abc"),
+            }),
+        )
+        .await;
+        assert!(
+            workdir
+                .path()
+                .join(".yi-agent/attachments")
+                .join(&tid)
+                .join(".tmp")
+                .join(&id)
+                .is_file(),
+            "the staging file must exist before abort"
+        );
+
+        let abort = rpc(
+            &mut h,
+            72,
+            "image/upload/abort",
+            serde_json::json!({ "uploadId": id }),
+        )
+        .await;
+        assert!(abort.get("error").is_none(), "{abort}");
+        assert!(
+            !workdir
+                .path()
+                .join(".yi-agent/attachments")
+                .join(&tid)
+                .join(".tmp")
+                .join(&id)
+                .exists(),
+            "abort must remove the staging file"
+        );
+        let commit = rpc(
+            &mut h,
+            73,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": id }),
+        )
+        .await;
+        assert!(commit.get("error").is_some(), "{commit}");
+        h.shutdown().await;
+    }
+
+    /// `thread/delete` 必须连带prune 该 thread 的上传登记。否则一条 `Receiving`
+    /// 记录会带着它的 staging 槽一直活到 10 分钟 TTL,进程级会话名额被死 thread
+    /// 占着;该 `uploadId` 也仍被当成「这个 thread 的未完成上传」而非「未知」。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_thread_prunes_its_image_upload_sessions() {
+        use base64::Engine as _;
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 一条收了一半的会话(有 staging 文件、未 commit)……
+        let begin = rpc(
+            &mut h,
+            80,
+            "image/upload/begin",
+            serde_json::json!({ "threadId": tid, "name": "half.png", "size": 6 }),
+        )
+        .await;
+        let half_id = begin["result"]["uploadId"].as_str().unwrap().to_string();
+        rpc(
+            &mut h,
+            81,
+            "image/upload/chunk",
+            serde_json::json!({
+                "uploadId": half_id, "index": 0,
+                "data": base64::engine::general_purpose::STANDARD.encode(b"abc"),
+            }),
+        )
+        .await;
+        // ……和一条已 commit 的会话(记录仍在,`turn/start` 靠它反查)。
+        let bytes = write_a_re_encodable_png_into_memory();
+        let begin = rpc(
+            &mut h,
+            82,
+            "image/upload/begin",
+            serde_json::json!({
+                "threadId": tid, "name": "shot.png", "mime": "image/png", "size": bytes.len(),
+            }),
+        )
+        .await;
+        let done_id = begin["result"]["uploadId"].as_str().unwrap().to_string();
+        rpc(
+            &mut h,
+            83,
+            "image/upload/chunk",
+            serde_json::json!({
+                "uploadId": done_id, "index": 0,
+                "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            }),
+        )
+        .await;
+        let commit = rpc(
+            &mut h,
+            84,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": done_id }),
+        )
+        .await;
+        assert!(commit.get("error").is_none(), "{commit}");
+
+        let staging = |id: &str| {
+            workdir
+                .path()
+                .join(".yi-agent/attachments")
+                .join(&tid)
+                .join(".tmp")
+                .join(id)
+        };
+        assert!(
+            staging(&half_id).is_file(),
+            "staging must exist before delete"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":90,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(90)) {
+                assert!(v.get("error").is_none(), "delete must succeed: {v}");
+                break;
+            }
+        }
+
+        // 收了一半的会话必须已被 prune:此刻该 id 是**未知**上传(记录已随 thread
+        // 一起消失),而不是「这条 thread 的未完成上传」——后者说明记录还活着。
+        let after = rpc(
+            &mut h,
+            91,
+            "image/upload/commit",
+            serde_json::json!({ "uploadId": half_id }),
+        )
+        .await;
+        let err = after["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("upload"),
+            "the deleted thread's upload must be unknown, got: {after}"
+        );
+        assert!(
+            !staging(&half_id).exists(),
+            "staging must be gone after delete"
+        );
+        h.shutdown().await;
+    }
+
+    /// 反向断言：图片必须真的以内容块送进**模型**（而不只是回显在 item 上）。
+    ///
+    /// 沿用 `turn_start_prompt_reaching_the_model_contains_the_attachment_manifest`
+    /// 的抓取手法，但捕获的是 provider 收到的 **messages**：首条 user 消息的
+    /// content 里必须有一个带 `path` 的 `ContentBlock::Image`，文本块仍然存在。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_image_reaches_the_model_as_a_content_block() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+
+        let messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let messages_factory = Arc::clone(&messages);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          _cwd: &std::path::Path,
+                          _mode: crate::thread_store::ThreadMode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CapturingMessagesProvider {
+                messages: Arc::clone(&messages_factory),
+            });
+            let config = yi_agent_core::AgentConfig::default();
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            apply_session(&mut agent, session);
+            Ok(BuiltAgent {
+                agent,
+                provider,
+                config,
+                decision_tx: None,
+                decision_rx: None,
+                catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("shot.png");
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([9, 9, 9]));
+        img.save_with_format(&src, image::ImageFormat::Png).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"这是什么"}},{{"type":"image","path":"{}"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        // 等到 turn 收尾，确保 provider 至少被调用过一次。
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
+
+        let seen = messages.lock().unwrap().clone();
+        // 首轮收尾会为会话标题再调一次 provider（见 `TITLE_TIMEOUT`），故按**本轮**
+        // 的用户文本挑出那次调用，而不是盲目取最后一次。
+        let first = seen
+            .iter()
+            .find(|msgs| {
+                msgs.iter().any(|m| {
+                    m.role == yi_agent_core::Role::User
+                        && m.content.iter().any(
+                            |b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t == "这是什么"),
+                        )
+                })
+            })
+            .expect("the provider must have been called with the turn");
+        let first_user = first
+            .iter()
+            .find(|m| m.role == yi_agent_core::Role::User)
+            .expect("the turn call must carry a user message");
+        let image = first_user
+            .content
+            .iter()
+            .find_map(|b| match b {
+                yi_agent_core::ContentBlock::Image { path, .. } => Some(path.clone()),
+                _ => None,
+            })
+            .expect("the user message must carry an image content block");
+        let rel = image.expect("the image block must carry the stored relative path");
+        assert!(rel.starts_with(".yi-agent/attachments/"), "{rel}");
+        assert!(
+            std::path::Path::new(&workdir.path().join(&rel)).is_file(),
+            "the block path must point at the stored copy: {rel}"
+        );
+        let text = first_user
+            .content
+            .iter()
+            .find_map(|b| match b {
+                yi_agent_core::ContentBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the text block must still be there");
+        assert_eq!(text, "这是什么");
+        assert!(
+            !text.contains("Attached files"),
+            "images are content blocks, not manifest entries: {text:?}"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// 造一张**压不动**、必然超过一个分片的 PNG，返回其原始字节。
+    ///
+    /// 伪随机像素让 PNG 的滤波器几乎无从压缩，于是 1024x1024 必然远大于
+    /// `IMAGE_READ_CHUNK_BYTES`（512 KiB），能真的走多块回传那条路径。
+    fn write_an_uncompressed_png(path: &std::path::Path) -> Vec<u8> {
+        let mut state: u32 = 0x1234_5678;
+        let img = image::RgbImage::from_fn(1024, 1024, |_, _| {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state
+            };
+            image::Rgb([next() as u8, next() as u8, next() as u8])
+        });
+        img.save_with_format(path, image::ImageFormat::Png).unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    /// `image/read` 必须把文件的**原始字节**分块回传：客户端按 `nextOffset`
+    /// 循环拉取、base64 解码后拼接，结果必须与磁盘上的文件逐字节相同，
+    /// 且最后一块的 `nextOffset` 为 `null`。
+    ///
+    /// 这条测试同时钉住「`size` 是文件字节长度」与「`mediaType` 由猜测格式得出」
+    /// 两项契约（Task 5 的交接：`size` 必须与取回的字节数一致）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_round_trips_a_file_in_chunks() {
+        use base64::Engine as _;
+
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        let rel = format!(".yi-agent/attachments/{tid}/deadbeef-big.png");
+        let stored = workdir.path().join(&rel);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        let source = write_an_uncompressed_png(&stored);
+        assert!(
+            source.len() > 512 * 1024,
+            "the fixture must span several chunks, got {} bytes",
+            source.len()
+        );
+
+        let mut offset: u64 = 0;
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut media_type: Option<String> = None;
+        let mut chunks = 0usize;
+        for step in 0..64 {
+            h.send(&format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}","offset":{offset}}}}}"#,
+                100 + step
+            ))
+            .await;
+            let resp = h.read_value().await;
+            assert!(resp.get("error").is_none(), "image/read failed: {resp}");
+            let result = &resp["result"];
+            assert_eq!(
+                result["size"].as_u64(),
+                Some(source.len() as u64),
+                "size must be the file's byte length: {resp}"
+            );
+            assert_eq!(
+                result["mediaType"].as_str(),
+                Some("image/png"),
+                "mediaType must come from the guessed format: {resp}"
+            );
+            media_type = result["mediaType"].as_str().map(str::to_string);
+            let chunk = base64::engine::general_purpose::STANDARD
+                .decode(result["data"].as_str().expect("data must be a string"))
+                .expect("data must be valid base64");
+            assert!(
+                chunk.len() <= 512 * 1024,
+                "a chunk must stay within IMAGE_READ_CHUNK_BYTES: {}",
+                chunk.len()
+            );
+            assembled.extend_from_slice(&chunk);
+            chunks += 1;
+            match result["nextOffset"].as_u64() {
+                Some(next) => {
+                    assert_eq!(next, offset + chunk.len() as u64, "nextOffset must advance");
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        let expected_chunks = (source.len() as u64).div_ceil(512 * 1024) as usize;
+        assert!(
+            chunks == expected_chunks,
+            "expected {expected_chunks} chunks of at most 512 KiB, took {chunks}"
+        );
+        assert!(chunks > 1, "the fixture must actually span several chunks");
+        assert_eq!(media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            assembled.len(),
+            source.len(),
+            "the reassembled bytes must cover the whole file"
+        );
+        assert!(
+            assembled == source,
+            "the reassembled bytes must be byte-identical to the file on disk"
+        );
+    }
+
+    /// 分片边界：`offset` 落在文件末尾之后按空块收尾（`nextOffset: null`），
+    /// 不得越界 panic；末块确实返回 `null` 而不是再一次偏移。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_reports_the_final_chunk_with_a_null_offset() {
+        use base64::Engine as _;
+
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        let rel = format!(".yi-agent/attachments/{tid}/beef-small.png");
+        let stored = workdir.path().join(&rel);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([3, 4, 5]));
+        img.save_with_format(&stored, image::ImageFormat::Png)
+            .unwrap();
+        let source = std::fs::read(&stored).unwrap();
+
+        // 一次就取完：小图远小于一个分片。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":200,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert!(resp.get("error").is_none(), "image/read failed: {resp}");
+        let result = &resp["result"];
+        assert!(
+            result["nextOffset"].is_null(),
+            "the final chunk must report a null nextOffset: {resp}"
+        );
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(result["data"].as_str().unwrap())
+            .unwrap();
+        assert!(chunk == source, "the single chunk must be the whole file");
+
+        // 越过末尾的 offset 只能得到空块，不得读越界或 panic。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":201,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}","offset":100000}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert!(resp.get("error").is_none(), "past-the-end read: {resp}");
+        assert_eq!(resp["result"]["data"].as_str(), Some(""), "{resp}");
+        assert!(resp["result"]["nextOffset"].is_null(), "{resp}");
+
+        // `maxBytes` 生效：一次只要 4 字节，`nextOffset` 必须推进 4。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":202,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}","maxBytes":4}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert!(resp.get("error").is_none(), "sized read: {resp}");
+        let first = base64::engine::general_purpose::STANDARD
+            .decode(resp["result"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(first.len(), 4, "{resp}");
+        assert_eq!(resp["result"]["nextOffset"].as_u64(), Some(4), "{resp}");
+
+        // `maxBytes: 0` 不得造成 `nextOffset` 不前进（否则客户端死循环）：按未
+        // 指定处理，整张图一次取完。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":203,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}","maxBytes":0}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert!(resp.get("error").is_none(), "zero-sized read: {resp}");
+        let whole = base64::engine::general_purpose::STANDARD
+            .decode(resp["result"]["data"].as_str().unwrap())
+            .unwrap();
+        assert!(
+            whole == source,
+            "maxBytes:0 must fall back to the chunk cap"
+        );
+        h.shutdown().await;
+    }
+
+    /// 限根是安全边界：`../` 逃逸与工作区外的绝对路径都必须以 `invalid_params`
+    /// 拒绝——`image/read` 不得成为任意文件读取原语。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_refuses_a_path_outside_the_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // cwd 是子目录，父目录里放一张**真图**：这样「被拒」只能是因为越界，
+        // 而不是因为文件不存在或不是图片。
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let secret = tmp.path().join("secret.png");
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([1, 1, 1]));
+        img.save_with_format(&secret, image::ImageFormat::Png)
+            .unwrap();
+
+        let mut cfg = default_config();
+        cfg.workdir = cwd.clone();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // (a) 相对路径向上逃逸。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":300,"method":"image/read","params":{{"threadId":"{tid}","path":"../secret.png"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "a relative escape must be refused as invalid_params: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("path escapes the workspace"),
+            "the escape must be caught by the confinement check, not by a fallback: {resp}"
+        );
+
+        // (b) 工作区外的绝对路径（`Path::join` 遇绝对路径会整体替换）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":301,"method":"image/read","params":{{"threadId":"{tid}","path":"{}"}}}}"#,
+            secret.display()
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "an outside absolute path must be refused as invalid_params: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("path escapes the workspace"),
+            "the absolute path must be caught by the confinement check: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 只送可解码的图片：一个文本文件即使在工作区内也必须被拒。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_refuses_a_non_image_file() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        std::fs::write(workdir.path().join("notes.txt"), b"just some text\n").unwrap();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":400,"method":"image/read","params":{{"threadId":"{tid}","path":"notes.txt"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "a non-image must be refused as invalid_params: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("not a supported image"),
+            "the text file must be rejected by the format guess: {resp}"
+        );
+
+        // 把 PDF 伪装成 .png 的扩展名也一样：判定看的是字节，不是名字。
+        std::fs::write(workdir.path().join("fake.png"), b"%PDF-1.4 fake\n").unwrap();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":401,"method":"image/read","params":{{"threadId":"{tid}","path":"fake.png"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "the extension must not decide; the bytes must: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("not a supported image"),
+            "the mislabelled PDF must be rejected by the format guess: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 超过 `IMAGE_READ_MAX_BYTES`（20 MiB）的图必须被拒——分片只是传输形态，
+    /// 不代表可以无上限地服务任意大文件。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_refuses_an_oversized_image() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 一个宽 6000px 的 PNG 位图够 20 MiB；重新编码成 PNG 更容易超限。
+        let rel = format!(".yi-agent/attachments/{tid}/huge.png");
+        let stored = workdir.path().join(&rel);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        write_an_uncompressed_png(&stored);
+        // 直接从磁盘读回来按字节补齐到 20 MiB 以上；文件本身仍是同一张真 PNG
+        // （PNG 允许附加尾随数据，`guess_format` 只看魔数，尺寸检查据此拒绝）。
+        let mut bytes = std::fs::read(&stored).unwrap();
+        bytes.resize(20 * 1024 * 1024 + 1, 0);
+        std::fs::write(&stored, &bytes).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":500,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "an image past IMAGE_READ_MAX_BYTES must be refused: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("image too large"),
+            "the refusal must come from the size gate: {resp}"
+        );
+
+        // 一个超过上限的**非图片**同样要在读取/解码之前被拒：闸门按元数据长度
+        // 先设，故它报的是尺寸而不是「不是图片」——证明没有先把整个文件读进来。
+        let huge_text = workdir.path().join("huge.txt");
+        std::fs::write(&huge_text, vec![b'a'; 20 * 1024 * 1024 + 1]).unwrap();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":501,"method":"image/read","params":{{"threadId":"{tid}","path":"huge.txt"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "an oversized file of any kind must be refused: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("image too large"),
+            "the metadata gate must fire before the format guess: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 非普通文件必须被拒：`thread` 的 cwd 下可达的一个 FIFO（agent 或克隆下来的
+    /// 仓库都可能放进来）元数据长度为 `0`，能通过尺寸闸；而 `std::fs::read` 的
+    /// `open()` 会在无写端时**阻塞**，把整条 serve 循环（所有客户端/thread）挂住。
+    /// 本 RPC 是安全边界，故 `!is_file()` 必须直接拒绝，绝不进入读取。
+    ///
+    /// 此处**自建 runtime** 而非用 `#[tokio::test]`：修复回退时那个 worker 会卡在
+    /// `open()` 上无法 join，若由 `#[tokio::test]` 代管，进程在 teardown 时挂住、
+    /// 整个套件被拖死。自建 runtime 让测试用 `tokio::time::timeout` 把它变成一次
+    /// **可读的失败**，再 `mem::forget` 掉这个 join 不掉的 runtime，进程照常退出。
+    #[test]
+    fn image_read_refuses_a_non_regular_file() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut h = rt.block_on(Harness::with_cfg(cfg));
+        let tid = rt.block_on(start_thread(&mut h));
+
+        let fifo = workdir
+            .path()
+            .join(".yi-agent/attachments")
+            .join(&tid)
+            .join("trap.png");
+        std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        // 经 `mkfifo` 造 FIFO——`libc` 不是本 crate 的依赖，不为一条测试新增它。
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available to exercise the FIFO path");
+        assert!(status.success(), "mkfifo failed for {fifo:?}");
+        let md = std::fs::symlink_metadata(&fifo).unwrap();
+        assert!(
+            !md.is_file() && !md.is_dir(),
+            "the fixture must really be a non-regular file: {fifo:?}"
+        );
+
+        rt.block_on(h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":550,"method":"image/read","params":{{"threadId":"{tid}","path":".yi-agent/attachments/{tid}/trap.png"}}}}"#
+        )));
+        // 修复缺失时 `image/read` 的 `fs::read` 会卡在 `open()` 上：此处**自己**
+        // 给 `read_line` 设 5s 上限（而不是用 `Harness::read_value`，它内部的
+        // 5s 超时会抢先 panic 掉），超时即说明它**没有**拒绝。超时后把这个卡住的
+        // `read_line` future 直接丢掉，再泄露 runtime、再断言失败——给出一次
+        // 干净的 RED 输出，而不是让整个测试套件挂死。
+        let mut buf = String::new();
+        let got = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), h.client_r.read_line(&mut buf)).await
+        });
+        let Ok(Ok(n)) = got else {
+            std::mem::forget(rt);
+            panic!("image/read must not block on a non-regular file");
+        };
+        assert!(n > 0, "unexpected EOF while waiting for the refusal");
+        let resp: serde_json::Value =
+            serde_json::from_str(buf.trim()).expect("server wrote invalid JSON");
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "a non-regular file must be refused as invalid_params: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("not a regular file"),
+            "the refusal must come from the regular-file check: {resp}"
+        );
+        rt.block_on(h.shutdown());
+    }
+
+    /// 未知 thread 必须拒绝（`thread_cwd` 两条解析路径都落空）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_refuses_an_unknown_thread() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":600,"method":"image/read","params":{"threadId":"thread-nope","path":"a.png"}}"#,
+        )
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "an unknown thread must be refused: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// `thread_cwd` 的两条解析路径（控制器裁定 2）+ 落空：
+    /// - 内存里的会话直接给 `Session.cwd`；
+    /// - 冷 thread 按全局索引定位其 store，再由 `<cwd>/.yi-agent/threads` 上溯两级；
+    /// - 两处都没有 → `None`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_cwd_prefers_memory_then_the_index() {
+        let warm = tempfile::TempDir::new().unwrap();
+        let cold = tempfile::TempDir::new().unwrap();
+        let cfg = default_config();
+
+        // 内存路径：`threads` 里有该 id，工作区取自 `Session.cwd`。
+        let (prompt_tx, _prompt_rx) = mpsc::channel(1);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel(1);
+        let (interject_tx, _interject_rx) = mpsc::channel(1);
+        let (session_tx, _session_rx) = mpsc::channel(1);
+        let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+        threads.insert(
+            "warm".to_string(),
+            ThreadSession {
+                thread_id: "warm".to_string(),
+                cwd: warm.path().to_string_lossy().to_string(),
+                model: "test".to_string(),
+                active_turn_id: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+                prompt_tx,
+                interrupt_tx,
+                interject_tx,
+                session_tx,
+                store: Arc::new(crate::thread_store::ThreadStore::new(warm.path())),
+                status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
+            },
+        );
+
+        // 冷 thread：store 在磁盘上，但它不在 `threads` 里。
+        let cold_store = crate::thread_store::ThreadStore::new(cold.path());
+        cold_store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: "cold".to_string(),
+                cwd: cold.path().to_string_lossy().to_string(),
+                model: "test".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                title: None,
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+                board_project: None,
+                card_id: None,
+                model_ref: None,
+            })
+            .unwrap();
+        // 全局索引指向该工作区（canonicalize 以对齐真实写入的路径形态）。
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let workspaces = WorkspaceIndex::new(index_dir.path().join("workspaces.json"));
+        workspaces
+            .add(&cold.path().canonicalize().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            thread_cwd(&threads, &workspaces, &cfg, "warm"),
+            Some(warm.path().to_path_buf()),
+            "an in-memory thread must resolve from its own session cwd"
+        );
+        assert_eq!(
+            thread_cwd(&threads, &workspaces, &cfg, "cold"),
+            Some(cold.path().canonicalize().unwrap()),
+            "a cold thread must resolve from the store's root, two levels up"
+        );
+        assert_eq!(
+            thread_cwd(&threads, &workspaces, &cfg, "ghost"),
+            None,
+            "a thread with neither an in-memory session nor an index entry is unknown"
+        );
+    }
+
     /// 只发附件、不打字也必须能起 turn（空 input 校验放宽到「既无文本又无附件」）。
     #[tokio::test(flavor = "multi_thread")]
     async fn turn_start_accepts_an_attachment_only_message() {
@@ -10716,6 +13077,180 @@ pub(crate) mod tests {
                 .is_some_and(|s| !s.is_empty()),
             "an attachment-only turn must still return a turn_id: {resp:?}"
         );
+        h.shutdown().await;
+    }
+
+    /// 只发图片、不打字也必须能起 turn——空 input 校验放宽到「既无文本、又无附件、
+    /// 又无图片」三缺一才算空（控制器裁定 2）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_accepts_an_image_only_message() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("only.png");
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([7, 7, 7]));
+        img.save_with_format(&src, image::ImageFormat::Png).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        let mut resp: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        assert!(
+            resp.get("error").is_none(),
+            "image-only start must succeed: {resp:?}"
+        );
+        assert!(
+            resp["result"]["turn_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "an image-only turn must still return a turn_id: {resp:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 不是图片的「图片输入」（例如把 PDF 塞进 `type:"image"`）必须就地拒绝：
+    /// 错误提到 image，且**一个 turn 都不起**（准备失败早于占位与发帧）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_rejects_a_non_image_image_input() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("not-an-image.png");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":11,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}},{{"type":"text","text":"hi"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        let mut methods_before_response: Vec<String> = Vec::new();
+        let mut resp: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(11)) {
+                resp = Some(v);
+                break;
+            }
+            if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
+                methods_before_response.push(m.to_string());
+            }
+        }
+        let resp = resp.expect("turn/start must answer");
+        let err = resp["error"]["message"].as_str().unwrap_or_default();
+        assert!(err.contains("image"), "got: {resp}");
+        assert!(
+            methods_before_response.is_empty(),
+            "no turn may start on a bad image: {methods_before_response:?}"
+        );
+        // 而且活跃标记必须干净：同一 thread 的**下一轮**仍能正常起（不是
+        // 「已占用但起不来」的僵尸 turn）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":12,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+        let mut second: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(12)) {
+                second = Some(v);
+                break;
+            }
+        }
+        let second = second.expect("the follow-up turn/start must answer");
+        assert!(
+            second.get("error").is_none(),
+            "a rejected image must not leave the turn slot occupied: {second:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 显式路径的图片被拒时，错误必须带一个**结构化**判别码（`data.code = "invalid_image"`），
+    /// 客户端才不必去猜/子串匹配那条人话 message。数字码仍是 `invalid_params`——这次
+    /// 拒绝确实是"参数不合法"，加码只是让调用方能分级处理。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_reports_a_structured_code_for_a_bad_image_path() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("missing.png"); // 不创建：路径指不到任何文件
+
+        let resp = rpc(
+            &mut h,
+            13,
+            "turn/start",
+            serde_json::json!({
+                "threadId": tid,
+                "input": [
+                    { "type": "image", "path": src.display().to_string() },
+                    { "type": "text", "text": "hi" }
+                ],
+            }),
+        )
+        .await;
+
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+        assert_eq!(resp["error"]["data"]["code"], "invalid_image", "{resp}");
+        // 人话里仍带 image，供不看码的客户端兜底。
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("image"),
+            "{resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 显式路径的图片被拒**不改变**声明大小以外的判据：非图内容（PDF 冒充 .png）也
+    /// 走同一条 `invalid_image`，报错的仍是路径那一侧。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_reports_a_structured_code_for_a_non_image_file() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("fake.png");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        let resp = rpc(
+            &mut h,
+            14,
+            "turn/start",
+            serde_json::json!({
+                "threadId": tid,
+                "input": [
+                    { "type": "image", "path": src.display().to_string() },
+                    { "type": "text", "text": "hi" }
+                ],
+            }),
+        )
+        .await;
+
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+        assert_eq!(resp["error"]["data"]["code"], "invalid_image", "{resp}");
         h.shutdown().await;
     }
 
@@ -11280,6 +13815,8 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                image_blocks: Vec::new(),
+                image_refs: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -11403,6 +13940,8 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                image_blocks: Vec::new(),
+                image_refs: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -11813,6 +14352,8 @@ pub(crate) mod tests {
                     prompt: "hi".into(),
                     activate: None,
                     attachments: Vec::new(),
+                    image_blocks: Vec::new(),
+                    image_refs: Vec::new(),
                     display_text: "hi".into(),
                 })
                 .await
@@ -12337,6 +14878,8 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                image_blocks: Vec::new(),
+                image_refs: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -13342,6 +15885,7 @@ pub(crate) mod tests {
                         id: "user-t1".into(),
                         text: "first".into(),
                         attachments: Vec::new(),
+                        images: Vec::new(),
                     }],
                     usage: None,
                     messages: vec![],
@@ -13358,6 +15902,7 @@ pub(crate) mod tests {
                             id: "user-turn-t2".into(),
                             text: "second".into(),
                             attachments: Vec::new(),
+                            images: Vec::new(),
                         },
                         crate::protocol::Item::AgentMessage {
                             id: "item-turn-t2-1".into(),
@@ -13445,6 +15990,7 @@ pub(crate) mod tests {
                         id: "user-t1".into(),
                         text: "first".into(),
                         attachments: Vec::new(),
+                        images: Vec::new(),
                     }],
                     usage: None,
                     messages: vec![],
@@ -13462,6 +16008,7 @@ pub(crate) mod tests {
                             id: "user-turn-t2".into(),
                             text: "second".into(),
                             attachments: Vec::new(),
+                            images: Vec::new(),
                         },
                         crate::protocol::Item::AgentMessage {
                             id: "item-turn-t2-1".into(),
@@ -13625,6 +16172,8 @@ pub(crate) mod tests {
                 prompt: "hi".into(),
                 activate: None,
                 attachments: Vec::new(),
+                image_blocks: Vec::new(),
+                image_refs: Vec::new(),
                 display_text: "hi".into(),
             })
             .await

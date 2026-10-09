@@ -37,6 +37,10 @@ pub enum ContentBlock {
         source: ImageSource,
         #[serde(default)]
         detail: ImageDetail,
+        /// 图片的来源路径（相对 workspace 根），供前端显示与 `image/read` 定位。
+        /// 旧序列化数据没有这个字段，缺省 `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
     },
 }
 
@@ -156,6 +160,7 @@ mod tests {
                         data: "base64data".into(),
                     },
                     detail: ImageDetail::High,
+                    path: None,
                 },
             ],
             is_error: false,
@@ -171,6 +176,7 @@ mod tests {
         let block = ContentBlock::Image {
             source,
             detail: ImageDetail::High,
+            path: None,
         };
         let json = serde_json::to_string(&block).unwrap();
         let back: ContentBlock = serde_json::from_str(&json).unwrap();
@@ -197,6 +203,7 @@ mod tests {
                 data: "AAA".into(),
             },
             detail: ImageDetail::Original,
+            path: None,
         };
         let json = serde_json::to_string(&block).unwrap();
         let back: ContentBlock = serde_json::from_str(&json).unwrap();
@@ -250,6 +257,32 @@ mod tests {
         match back {
             ContentBlock::ToolResult { is_error, .. } => assert!(is_error),
             _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[test]
+    fn image_block_carries_an_optional_source_path() {
+        let block = ContentBlock::Image {
+            source: ImageSource::Base64 {
+                media_type: "image/png".into(),
+                data: "AAA".into(),
+            },
+            detail: ImageDetail::High,
+            path: Some(".yi-agent/attachments/t1/deadbeef-x.png".into()),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, back);
+    }
+
+    #[test]
+    fn image_block_without_path_defaults_to_none() {
+        // 旧会话里没有 `path` 字段，必须仍能反序列化。
+        let json = r#"{"Image":{"source":{"Base64":{"media_type":"image/png","data":"AAA"}},"detail":"High"}}"#;
+        let block: ContentBlock = serde_json::from_str(json).unwrap();
+        match block {
+            ContentBlock::Image { path, .. } => assert!(path.is_none()),
+            _ => panic!("expected Image"),
         }
     }
 }

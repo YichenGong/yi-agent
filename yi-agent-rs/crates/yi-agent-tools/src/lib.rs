@@ -13,6 +13,7 @@ mod shell;
 mod skill_tool;
 mod web;
 
+pub mod image_prep;
 pub mod worktree;
 
 use std::path::PathBuf;

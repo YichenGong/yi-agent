@@ -18,6 +18,12 @@ vi.mock("./MarkdownText", () => ({
   AgentMessage: ({ text }: { text: string }) => <div>{text}</div>,
 }));
 
+// 图片字节由 `image/read` 另取（见 useImageData），此处只验证气泡把 hook 给出的
+// URL 画成一个 <img>。真实的分片/缓存行为在 useImageData.test.ts 里测。
+vi.mock("../lib/useImageData", () => ({
+  useImageData: () => ({ url: "blob:test-image", error: null }),
+}));
+
 import { ChatView } from "./ChatView";
 
 // jsdom has no layout, so the auto-scroll effect needs a stub.
@@ -158,5 +164,36 @@ describe("ChatView user attachments", () => {
     // 不能留一个没有标题的空白 chip：退回路径最后一段。
     const chips = getAllByTestId("bubble-attachment");
     expect(chips.map((c) => c.textContent)).toEqual(["abc-预算.xlsx"]);
+  });
+});
+
+describe("ChatView user images", () => {
+  it("renders an image for each server-echoed ref on a user bubble", () => {
+    const { getAllByTestId } = render(
+      <ChatView
+        items={[
+          {
+            type: "userMessage",
+            id: "u4",
+            text: "看这两张",
+            images: [
+              { path: ".yi-agent/attachments/t1/ab-a.png", media_type: "image/png", size: 3 },
+              { path: ".yi-agent/attachments/t1/cd-b.jpg", media_type: "image/jpeg", size: 4 },
+            ],
+          },
+        ]}
+      />,
+    );
+    // 乐观回声只带文档附件；已发送的图片只能靠服务端回声里的 refs 画出来。
+    const imgs = getAllByTestId("bubble-image");
+    expect(imgs).toHaveLength(2);
+    expect(imgs[0].getAttribute("src")).toBe("blob:test-image");
+  });
+
+  it("renders no image when a message has no image refs", () => {
+    const { queryAllByTestId } = render(
+      <ChatView items={[{ type: "userMessage", id: "u5", text: "纯文字" }]} />,
+    );
+    expect(queryAllByTestId("bubble-image")).toHaveLength(0);
   });
 });

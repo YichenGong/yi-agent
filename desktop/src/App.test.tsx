@@ -224,6 +224,12 @@ vi.mock("./lib/platform", async (importOriginal) => {
 import App from "./App";
 import { nextReconnectDelay } from "./lib/reconnect";
 
+// jsdom 没有 `URL.createObjectURL`，而待发图片的 chip 会经 `AttachmentThumb` →
+// `useImageData` 真的去 `image/read` 取字节、建对象 URL（hook 的缓存按 path 全局
+// 共享，用一个稳定桩即可，无需每个用例重置）。没有它，带图片的用例会在这里炸。
+URL.createObjectURL = vi.fn(() => "blob:test-thumb");
+URL.revokeObjectURL = vi.fn();
+
 beforeEach(() => {
   clients.length = 0;
   state.mode = "normal";
@@ -2599,14 +2605,44 @@ describe("App 会话详情栏的开合", () => {
 
 describe("App 附件接线", () => {
   const paperclip = () => screen.getByRole("button", { name: "附加文件" });
+  const imageButton = () => screen.getByRole("button", { name: "附加图片" });
   const sendButton = () => screen.getByRole("button", { name: /^send$/i });
 
-  /** 点回形针触发原生多选，并等界面吸收结果（chips 或错误横幅）。 */
-  async function pickFiles(picked: string | string[] | null) {
+  /** 点某个选择器触发原生多选，并等界面吸收结果（chips 或错误横幅）。 */
+  async function pickWith(button: () => HTMLElement, picked: string | string[] | null) {
     state.picks = [picked];
     await act(async () => {
-      fireEvent.click(paperclip());
+      fireEvent.click(button());
     });
+  }
+
+  /** 点回形针（文档选择器）触发原生多选。 */
+  async function pickFiles(picked: string | string[] | null) {
+    await pickWith(paperclip, picked);
+  }
+
+  /**
+   * 点「附加图片」触发原生多选。
+   *
+   * 图片入列后 chip 会渲染缩略图，`AttachmentThumb` 经 `useImageData` 真的发起
+   * `image/read`；那是另一条链路的职责，这里只关心「图有没有进待发列表」。
+   */
+  async function pickImages(picked: string | string[] | null) {
+    await pickWith(imageButton, picked);
+  }
+
+  /**
+   * 断言待发图片 chip 上的缩略图是**中性占位**，而不是画出来的 `<img>`。
+   *
+   * 待发图片的路径来自 OS 文件对话框，是 `/tmp/...` 这类**绝对**路径，而
+   * `image/read` 以会话 cwd 为根（安全边界），必然读不回来——这是预期内的事实。
+   * 故此处的期望就是占位：`attachment-thumb` 锚点存在但**不是** `<img>`；那个
+   * 假「读到字节」的结果并不代表真实行为，不能替它渲染一张图。真正可读的路径
+   * （服务端回显的 workspace 相对引用）才该画出 `<img>`，由 Task 11 覆盖。
+   */
+  function expectThumbPlaceholder() {
+    const thumb = screen.getByTestId("attachment-thumb");
+    expect(thumb.tagName).not.toBe("IMG");
   }
 
   it("sends attachments as input blocks before the text block", async () => {
@@ -2638,6 +2674,87 @@ describe("App 附件接线", () => {
     });
   });
 
+  it("sends a pending image as an image block before the text block", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 图片走它自己的按钮（Task 10）：chip 出现即「图片确实进了待发列表」的可见
+    // 证据；chip 上的缩略图（此处是占位）证明 kind 被记成了 "image"。
+    //
+    // 待发图片的路径来自 dialog，是 `/tmp/...` 这种**绝对**路径，`image/read` 以
+    // 会话 cwd 为根（安全边界）必然拒绝它——桩客户端默认对未知方法回 `{}`，那会
+    // 被伪造成一张空的「成功」图。这里照实模拟该拒绝，chip 才走到中性占位。
+    state.rejectCode["image/read"] = -1;
+    await pickImages(["/tmp/截图.png"]);
+    expect(screen.getByText("截图.png")).toBeTruthy();
+    expectThumbPlaceholder();
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "看看这个" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    const call = clients[0].requests.find((r) => r.method === "turn/start");
+    // 图片走内容块（`{type:"image", path}`），与文档附件一样排在文本**之前**；
+    // 服务端按顺序读，图片先入场，文本里只留问题本身。
+    expect(call?.params).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "image", path: "/tmp/截图.png" },
+        { type: "text", text: "看看这个" },
+      ],
+    });
+  });
+
+  it("sends images before documents before the text block, and echoes only documents", async () => {
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 同上一例：模拟 `image/read` 对待发绝对路径的拒绝（否则空桩会被伪造成图）。
+    state.rejectCode["image/read"] = -1;
+    await pickFiles(["/tmp/报告.pdf"]);
+    await pickImages(["/tmp/截图.png"]);
+    expect(screen.getByText("截图.png")).toBeTruthy();
+    expect(screen.getByText("报告.pdf")).toBeTruthy();
+    expectThumbPlaceholder();
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "看看这些" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    // 顺序是契约：图片块、文档块，最后才是文本块。
+    expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "image", path: "/tmp/截图.png" },
+        { type: "attachment", path: "/tmp/报告.pdf" },
+        { type: "text", text: "看看这些" },
+      ],
+    });
+
+    // 乐观回显只带文档：图片由服务端在回显的 item 上带 `images` 引用（本地此刻
+    // 不知道 media_type/size）。文档 chip 出现在气泡里，图片名不在。
+    const bubbles = Array.from(container.querySelectorAll("div.self-end")).filter((d) =>
+      Array.from(d.childNodes).some(
+        (n) => n.nodeType === Node.TEXT_NODE && n.textContent === "看看这些",
+      ),
+    );
+    expect(bubbles).toHaveLength(1);
+    expect(within(bubbles[0] as HTMLElement).getByText("报告.pdf")).toBeTruthy();
+    expect(within(bubbles[0] as HTMLElement).queryByText("截图.png")).toBeNull();
+  });
+
   it("surfaces a local pre-check failure instead of sending", async () => {
     render(<App />);
     await waitFor(() =>
@@ -2653,6 +2770,36 @@ describe("App 附件接线", () => {
 
     // 仅凭失效的附件不能发送：附件没进待发列表，文本框为空则 Send 禁用。
     expect((sendButton() as HTMLButtonElement).disabled).toBe(true);
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("rejects an image picked through the document picker", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 回形针现在只收文档：`.png` 在这里必须被就地拒绝并报「不支持的文件类型」，
+    // 而不是悄悄收下一个图片（图片有它自己的按钮与白名单）。
+    await pickFiles(["/tmp/截图.png"]);
+
+    await waitFor(() => expect(screen.getByText(/不支持的文件类型/)).toBeTruthy());
+    expect(screen.queryByText("截图.png")).toBeNull();
+    expect(screen.queryByTestId("attachment-thumb")).toBeNull();
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("rejects a document picked through the image picker", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 反向同理：图片按钮只收图片，`.pdf` 会被 `imageAttachmentProblem` 拒掉。
+    await pickImages(["/tmp/报告.pdf"]);
+
+    await waitFor(() => expect(screen.getByText(/不支持的图片类型/)).toBeTruthy());
+    expect(screen.queryByText("报告.pdf")).toBeNull();
     expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
   });
 
@@ -2889,5 +3036,221 @@ describe("App first-run onboarding gate", () => {
     // 关闭即清空。
     fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
     expect(screen.queryByText(/未纳入模型清单/)).toBeNull();
+  });
+});
+
+// 远端（iOS）图片：没有共享文件系统，也不该弹 Tauri dialog——入口是 webview 自带的
+// `<input type="file">`，选中的字节经 `image/upload/*` 分片送到服务端，待发附件记的是
+// **服务端返回的工作区相对路径**（`image/read` 以会话 cwd 为根，故 chip 缩略图能读回）。
+describe("App 远端图片上传", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+  const imageButton = () => screen.getByRole("button", { name: "附加图片" });
+  const sendButton = () => screen.getByRole("button", { name: /^send$/i });
+
+  /**
+   * 远端（iOS）没有 Tauri dialog：`onPickImages` 会当场造一个 `<input type="file">`
+   * 挂进 body、点了它，再在 change 时摘掉。这里等它出现，把选中的 File 塞进 `files`
+   * 并派发 change。
+   */
+  async function pickImagesRemote(files: File[]) {
+    await act(async () => {
+      fireEvent.click(imageButton());
+    });
+    const input = await waitFor(() => {
+      const el = document.body.querySelector('input[type="file"]');
+      expect(el).not.toBeNull();
+      return el as HTMLInputElement;
+    });
+    // 系统相册的选择器由这两个属性决定：只收图片、可多选。
+    expect(input.accept).toBe("image/*");
+    expect(input.multiple).toBe(true);
+    await act(async () => {
+      fireEvent.change(input, { target: { files } });
+    });
+  }
+
+  /** 一个会说 `image/upload/*` 的假服务端（与 `imageUpload.test.ts` 同形）。 */
+  function uploadServer(opts: { failBeginFor?: string } = {}) {
+    /** 每次 begin→commit 记录一行，用来断言「送上去的是哪个文件的哪些字节」。 */
+    const uploads: Array<{ name: string; mime: string; size: number; bytes: number[] }> = [];
+    let seq = 0;
+    let staging: { name: string; size: number; received: number[] } | null = null;
+    state.dataSources["image/upload/begin"] = (params) => {
+      const p = params as { name: string; mime: string; size: number };
+      if (opts.failBeginFor && p.name.includes(opts.failBeginFor)) {
+        throw { code: -32602, message: "begin refused" };
+      }
+      staging = { name: p.name, size: p.size, received: [] };
+      uploads.push({ name: p.name, mime: p.mime, size: p.size, bytes: [] });
+      return { uploadId: `u${++seq}`, chunkSize: 512 * 1024 };
+    };
+    state.dataSources["image/upload/chunk"] = (params) => {
+      const p = params as { index: number; data: string };
+      const bin = atob(p.data);
+      for (let i = 0; i < bin.length; i += 1) staging!.received.push(bin.charCodeAt(i));
+      return {};
+    };
+    state.dataSources["image/upload/commit"] = () => {
+      const path = `.yi-agent/attachments/t1/ab-${staging!.name}`;
+      uploads[uploads.length - 1].bytes = staging!.received;
+      return { path, mediaType: "image/png", size: staging!.size };
+    };
+    state.dataSources["image/upload/abort"] = () => ({});
+    return { uploads };
+  }
+
+  /**
+   * 装好 HEIC→JPEG 转码环境（与 `imageUpload.test.ts` 的桩同形）。
+   *
+   * iOS 相册默认给 HEIC，转码走 `createImageBitmap` + canvas；jsdom 两样都没有，
+   * 所以这里造一个只会回 JPEG 的桩，让「HEIC 也能进上传」这条路在测试里真的跑通。
+   * 返回的 `restore` 必须在本用例结束时调用（否则桩会漏给同文件后续用例）。
+   */
+  function stubHeicTranscoder() {
+    const bitmap = { width: 4, height: 3, close: vi.fn() };
+    const createImageBitmap = vi.fn(async () => bitmap as unknown as ImageBitmap);
+    vi.stubGlobal("createImageBitmap", createImageBitmap);
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      drawImage: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    const jpeg = new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3])], {
+      type: "image/jpeg",
+    });
+    const toBlob = vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((cb: BlobCallback) => {
+      cb(jpeg);
+    });
+    return {
+      createImageBitmap,
+      toBlob,
+      restore: () => {
+        toBlob.mockRestore();
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+      },
+    };
+  }
+
+  it("transcodes a picked .HEIC and uploads it as JPEG (iOS default camera format)", async () => {
+    asRemote();
+    const server = uploadServer();
+    const t = stubHeicTranscoder();
+    try {
+      render(<App />);
+      await waitFor(() =>
+        expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      );
+
+      // iPhone 相机的默认格式：扩展名与 MIME 都是 HEIC。不转码的话服务端不认，
+      // 但**也不能在客户端预检就被当「不支持的图片类型」拦下**——那会让这条路永
+      // 远走不到转码。
+      await pickImagesRemote([
+        new File([new Uint8Array([0xa0, 0xa1, 0xa2, 0xa3])], "IMG_1234.HEIC", {
+          type: "image/heic",
+        }),
+      ]);
+
+      // chip 出现即「上传完成、进了待发列表」。chip 上的名字是**用户选中的文件名**
+      // （与报告里 pending 名的既有行为一致，属展示层）；转码成 JPEG 这件事由下面
+      // 的 `begin` 名字/MIME 与路径证明。
+      await waitFor(() => expect(screen.getByText("IMG_1234.HEIC")).toBeTruthy());
+      expect(screen.getByTitle(".yi-agent/attachments/t1/ab-IMG_1234.jpg")).toBeTruthy();
+      // 服务端收到的是**转码后的** JPEG：名字换成 .jpg，MIME 换成 image/jpeg。
+      expect(server.uploads).toEqual([
+        { name: "IMG_1234.jpg", mime: "image/jpeg", size: 7, bytes: [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3] },
+      ]);
+
+      await act(async () => {
+        fireEvent.click(sendButton());
+      });
+      await waitFor(() =>
+        expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+      );
+      expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
+        threadId: "t1",
+        input: [{ type: "uploaded_image", uploadId: "u1" }, { type: "text", text: "" }],
+      });
+    } finally {
+      t.restore();
+    }
+  });
+
+  it("uploads picked Files and assembles an uploaded_image block on send", async () => {
+    asRemote();
+    const server = uploadServer();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickImagesRemote([new File([new Uint8Array([1, 2, 3])], "截图.png", { type: "image/png" })]);
+
+    // chip 出现即「上传完成、进了待发列表」；名字取自选中的文件。
+    expect(await screen.findByText("截图.png")).toBeTruthy();
+    expect(server.uploads).toEqual([
+      { name: "截图.png", mime: "image/png", size: 3, bytes: [1, 2, 3] },
+    ]);
+    // begin → chunk → commit，各一次（小文件一块）。
+    const methods = clients[0].requests.map((r) => r.method);
+    expect(methods.filter((m) => m === "image/upload/begin")).toHaveLength(1);
+    expect(methods.filter((m) => m === "image/upload/chunk")).toHaveLength(1);
+    expect(methods.filter((m) => m === "image/upload/commit")).toHaveLength(1);
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "看看这个" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    // 已上传的图片按**句柄**送（`{type:"uploaded_image", uploadId}`），路径只有本地
+    // 渲染用（桌面端那条 `{type:"image", path}` 一个字都没变）。
+    expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "uploaded_image", uploadId: "u1" },
+        { type: "text", text: "看看这个" },
+      ],
+    });
+  });
+
+  it("keeps the successful files and reports the failed ones in place", async () => {
+    asRemote();
+    uploadServer({ failBeginFor: "坏的" });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 一次多选里混着好坏是常态：坏的只报它自己，好的照样入列。
+    await pickImagesRemote([
+      new File([new Uint8Array([1, 2, 3])], "好的.png", { type: "image/png" }),
+      new File([new Uint8Array([4, 5, 6])], "坏的.png", { type: "image/png" }),
+    ]);
+
+    await waitFor(() => expect(screen.getByText(/begin refused/)).toBeTruthy());
+    expect(screen.getByText("好的.png")).toBeTruthy();
+    expect(screen.queryByText("坏的.png")).toBeNull();
+  });
+
+  it("still uses the plugin-dialog path on the desktop build", async () => {
+    uploadServer();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 桌面（无 relay 绑定）走原生对话框，与既有行为逐字不变。
+    state.picks = [["/tmp/截图.png"]];
+    await act(async () => {
+      fireEvent.click(imageButton());
+    });
+
+    expect(screen.getByText("截图.png")).toBeTruthy();
+    expect(clients[0].requests.some((r) => r.method.startsWith("image/upload/"))).toBe(false);
   });
 });

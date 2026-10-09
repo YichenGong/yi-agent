@@ -26,7 +26,7 @@
 - [ ] IPC 集成测试在 Linux CI 上无法覆盖 `accept` 继承 `O_NONBLOCK` 的平台差异（`ci.yml` 跑 `ubuntu-latest`，而 `release.yml` 已有 `self-hosted` Mac runner）；此类平台相关缺陷会继续漏网
 - [ ] app-server 解析失败/传输错误响应使用 id 0，而 JSON-RPC 2.0 要求 id 为 null；RequestId 需支持 Null 变体
 - [x] 桌面端 bash 命令在正文里打印一次、又在 bash 工具箱里显示一次（重复渲染）（修复：app-server `translate.rs` 把 `AgentEvent::DecodeDelta` 与 `AssistantText` 并到同一分支、都追加到 agentMessage；但 `DecodeDelta` 携带的是**工具调用入参**的流式 JSON 分片（`agent.rs` 转发 `ProviderEvent::ToolUseDelta.partial_json`），并非助手散文。结果同一段命令在正文出现一次、又在随后的 `toolCall` 卡片出现一次（分片到达时还显示成半截 JSON）。TUI（`tui/history.rs` 的 `DecodeDelta => 不跟踪`）与 headless drain 都忽略它，translator 改为同样忽略。见 `yi-agent-rs/crates/yi-agent-app-server/src/translate.rs` `on_event`、设计 [§6.5](../superpowers/plans/2026-09-26-desktop-gui-design.md)。验证：`cargo test -p yi-agent-app-server --lib translate::tests::decode_delta_is_not_rendered_as_agent_text`、`cargo test -p yi-agent-app-server --lib translate::tests::decode_delta_alone_does_not_open_agent_message`（修复前分别报 `got [ItemDelta ...]` 与 `got [ItemStarted ...]`））
-- [ ] compaction 的 token 估算把 `ContentBlock::Image` 记为 0 token（`yi-agent-rs/crates/yi-agent-core/src/compact.rs`、`yi-agent-rs/crates/yi-agent-core/src/agent.rs`），图片进入上下文后可能低估用量、延迟 auto-compact 触发
+- [x] compaction 的 token 估算把 `ContentBlock::Image` 记为 0 token（`yi-agent-rs/crates/yi-agent-core/src/compact.rs`、`yi-agent-rs/crates/yi-agent-core/src/agent.rs`），图片进入上下文后可能低估用量、延迟 auto-compact 触发（修复 commit `b7a52a25`：`yi-agent-rs/crates/yi-agent-core/src/compact.rs:95` 记 `IMAGE_TOKEN_ESTIMATE`（常量 `:38` = 1844）；本条为文档过期，代码无需改动）
 - [ ] 基于superpowers的skill，按道理是先写spec再写plan，最后再去实现。但是当前会遇到先完整实现一遍，确认没问题了之后再去写spec和plan的情况。这个有点本末倒置了。这个应该是模型的问题而不是skill的问题？但是这个问题在相同的模型情况下，claude code里面就没有出现。
 - [ ] 检查 OS 沙箱 状态。
 - [ ] slash可用命令这部分，细节不详。

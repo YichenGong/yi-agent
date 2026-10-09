@@ -6,6 +6,7 @@ import { filterCommands, parseSlashInput } from "../lib/slash";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import type { ThreadMode } from "../lib/threadPermissionMode";
 import type { PendingAttachment } from "../lib/attachmentLimits";
+import type { ImageReadCall } from "../lib/useImageData";
 
 export function MessageInput({
   turnActive,
@@ -18,7 +19,10 @@ export function MessageInput({
   onDraftChange,
   attachments,
   onPickFiles,
+  onPickImages,
   onRemoveAttachment,
+  threadId = null,
+  call,
   disabled = false,
   modelPicker,
 }: {
@@ -46,8 +50,18 @@ export function MessageInput({
   attachments: PendingAttachment[];
   /** 用户点了回形针：打开文件选择器是父级的事（Tauri dialog 在 App 里）。 */
   onPickFiles: () => void;
+  /** 用户点了「附加图片」：同上，只是白名单、上限与协议形态都不同。 */
+  onPickImages: () => void;
   /** 用户移除了某个 chip；参数是附件的本地路径。 */
   onRemoveAttachment: (path: string) => void;
+  /**
+   * 当前会话 id 与图片读取接缝，只为待发图片 chip 上的缩略图存在；原样透传给
+   * `AttachmentChips`。`call` **必填**（此前可选并带 `NO_READ` 兜底，会让漏注入
+   * 时静默降级成失败 chip）且**必须稳定引用**（`App` 的 `imageCall`），否则每张
+   * 缩略图都会随每次渲染重新分片拉取。
+   */
+  threadId?: string | null;
+  call: ImageReadCall;
   /**
    * 没有当前 session 时置灰整个输入区（App 不会无会话渲染它，这一层是护栏）：
    * 否则会留下一个能敲字、却因无处存放草稿而静默丢字的文本框。
@@ -125,7 +139,15 @@ export function MessageInput({
         className="rounded-lg border border-line-strong bg-surface transition-colors focus-within:border-fg-subtle"
         data-testid="composer-card"
       >
-        <AttachmentChips attachments={attachments} onRemove={onRemoveAttachment} />
+        <AttachmentChips
+          attachments={attachments}
+          onRemove={onRemoveAttachment}
+          threadId={threadId}
+          call={call}
+          // 输入框上方的 chip 恒为待发：路径是 OS dialog 的绝对路径，`image/read`
+          // 读不回来是预期内的，缩略图走中性占位（见 `AttachmentThumb` 的限制说明）。
+          pending
+        />
         {/*
          * 卡片内**恒为竖排**：textarea 在上，工具栏是它下面满宽的一行。
          * 不能用 `flex items-end gap-2`（旧布局的两列并排）——那样工具栏只占自身内容宽，
@@ -239,6 +261,18 @@ export function MessageInput({
               disabled={disabled}
             >
               附加文件
+            </button>
+            <button
+              type="button"
+              // 图片有自己的入口：白名单（`IMAGE_EXTENSIONS`）与上限（20 MB）都与
+              // 文档不同，混在一个选择器里会让用户挑错才被告知。
+              aria-label="附加图片"
+              title="附加图片"
+              className="rounded-md border border-line-strong px-2 py-0.5 text-xs text-fg-muted hover:bg-raised hover:text-fg disabled:opacity-50"
+              onClick={onPickImages}
+              disabled={disabled}
+            >
+              附加图片
             </button>
             <div className="flex items-center gap-2">
               <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
