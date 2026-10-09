@@ -77,6 +77,16 @@ export function attachmentProblem(path: string, size: number): string | null {
 }
 
 /**
+ * 图片的**大小**预检（不看扩展名）。
+ *
+ * 远端上传路径单独用它：HEIC/HEIF 必须放行到 `uploadImage` 的转码那一步（扩展名
+ * 白名单会把它当「不支持的图片类型」拦下），但 20 MB 上限对所有图片一律先查。
+ */
+export function imageSizeProblem(size: number): string | null {
+  return size > MAX_IMAGE_BYTES ? "图片超过 20 MB 上限" : null;
+}
+
+/**
  * 图片的预检：返回不可发送的原因；可发送返回 null。
  *
  * 与 `attachmentProblem` 分开：图片不进 `read_document` 的清单，走的是内容块，
@@ -87,10 +97,7 @@ export function imageAttachmentProblem(path: string, size: number): string | nul
   if (!(IMAGE_EXTENSIONS as readonly string[]).includes(ext)) {
     return `不支持的图片类型：${ext || "（无扩展名）"}`;
   }
-  if (size > MAX_IMAGE_BYTES) {
-    return "图片超过 20 MB 上限";
-  }
-  return null;
+  return imageSizeProblem(size);
 }
 
 /**

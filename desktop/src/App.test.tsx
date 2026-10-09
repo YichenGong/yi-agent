@@ -3045,6 +3045,81 @@ describe("App 远端图片上传", () => {
     return { uploads };
   }
 
+  /**
+   * 装好 HEIC→JPEG 转码环境（与 `imageUpload.test.ts` 的桩同形）。
+   *
+   * iOS 相册默认给 HEIC，转码走 `createImageBitmap` + canvas；jsdom 两样都没有，
+   * 所以这里造一个只会回 JPEG 的桩，让「HEIC 也能进上传」这条路在测试里真的跑通。
+   * 返回的 `restore` 必须在本用例结束时调用（否则桩会漏给同文件后续用例）。
+   */
+  function stubHeicTranscoder() {
+    const bitmap = { width: 4, height: 3, close: vi.fn() };
+    const createImageBitmap = vi.fn(async () => bitmap as unknown as ImageBitmap);
+    vi.stubGlobal("createImageBitmap", createImageBitmap);
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      drawImage: vi.fn(),
+    } as unknown as CanvasRenderingContext2D);
+    const jpeg = new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3])], {
+      type: "image/jpeg",
+    });
+    const toBlob = vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((cb: BlobCallback) => {
+      cb(jpeg);
+    });
+    return {
+      createImageBitmap,
+      toBlob,
+      restore: () => {
+        toBlob.mockRestore();
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+      },
+    };
+  }
+
+  it("transcodes a picked .HEIC and uploads it as JPEG (iOS default camera format)", async () => {
+    asRemote();
+    const server = uploadServer();
+    const t = stubHeicTranscoder();
+    try {
+      render(<App />);
+      await waitFor(() =>
+        expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      );
+
+      // iPhone 相机的默认格式：扩展名与 MIME 都是 HEIC。不转码的话服务端不认，
+      // 但**也不能在客户端预检就被当「不支持的图片类型」拦下**——那会让这条路永
+      // 远走不到转码。
+      await pickImagesRemote([
+        new File([new Uint8Array([0xa0, 0xa1, 0xa2, 0xa3])], "IMG_1234.HEIC", {
+          type: "image/heic",
+        }),
+      ]);
+
+      // chip 出现即「上传完成、进了待发列表」。chip 上的名字是**用户选中的文件名**
+      // （与报告里 pending 名的既有行为一致，属展示层）；转码成 JPEG 这件事由下面
+      // 的 `begin` 名字/MIME 与路径证明。
+      await waitFor(() => expect(screen.getByText("IMG_1234.HEIC")).toBeTruthy());
+      expect(screen.getByTitle(".yi-agent/attachments/t1/ab-IMG_1234.jpg")).toBeTruthy();
+      // 服务端收到的是**转码后的** JPEG：名字换成 .jpg，MIME 换成 image/jpeg。
+      expect(server.uploads).toEqual([
+        { name: "IMG_1234.jpg", mime: "image/jpeg", size: 7, bytes: [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3] },
+      ]);
+
+      await act(async () => {
+        fireEvent.click(sendButton());
+      });
+      await waitFor(() =>
+        expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+      );
+      expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
+        threadId: "t1",
+        input: [{ type: "uploaded_image", uploadId: "u1" }, { type: "text", text: "" }],
+      });
+    } finally {
+      t.restore();
+    }
+  });
+
   it("uploads picked Files and assembles an uploaded_image block on send", async () => {
     asRemote();
     const server = uploadServer();

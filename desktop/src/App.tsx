@@ -35,11 +35,13 @@ import {
   attachmentProblem,
   fileNameOf,
   imageAttachmentProblem,
+  imageSizeProblem,
   IMAGE_EXTENSIONS,
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
-import { uploadImage } from "./lib/imageUpload";
+import { uploadImage, isHeic } from "./lib/imageUpload";
+import { pickImageFiles } from "./lib/imagePicker";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
@@ -114,50 +116,6 @@ function modeForThread(groups: WorkspaceGroup[], pinned: ThreadSummary[], id: st
 function sendMethodMismatchCode(e: unknown): number | null {
   const code = (e as { code?: unknown } | null)?.code;
   return code === -32013 || code === -32012 ? code : null;
-}
-
-/**
- * 用 webview 自带的文件选择器选图片，返回用户选中的文件（取消为空数组）。
- *
- * 远端（iOS）的图片入口：这里没有 Tauri dialog（那是桌面端能力），相册由系统
- * 选择器交付，`accept="image/*"` 让系统只显示图片，`multiple` 允许多选。
- *
- * 选择器**当场造、用完即摘**：没有任何 UI 依赖它长期存在，挂一个隐藏 input 在
- * DOM 里只会多一份要维护的状态。摘除放在 `change`/`cancel` 之后——提前摘会让某些
- * 浏览器丢掉选择结果。input 必须在文档里（`display:none` 只是别占位），否则 iOS
- * 的 `click()` 不会打开系统选择器。
- *
- * 取消的兜底有两层：`cancel` 是较新的事件（Safari 16.4+），老 webview 上退而用
- * 「窗口重新获得焦点」判断对话框已关（把读数推迟一拍，让 `change` 先到）。
- */
-function pickImageFiles(): Promise<File[]> {
-  return new Promise((resolve) => {
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "image/*";
-    input.multiple = true;
-    input.style.display = "none";
-
-    // 只 resolve 一次：change 与 focus 兜底可能都想收尾，先到者摘掉 input，后到者
-    // 被「input 还在文档里吗」挡住（见下）。
-    const done = (files: File[]) => {
-      input.remove();
-      window.removeEventListener("focus", onFocus);
-      resolve(files);
-    };
-    const onFocus = () => {
-      // 推迟一拍：`change` 通常紧跟着 focus 到（甚至更早），先给它机会。
-      setTimeout(() => {
-        if (document.body.contains(input)) done(Array.from(input.files ?? []));
-      }, 0);
-    };
-
-    input.addEventListener("change", () => done(Array.from(input.files ?? [])));
-    input.addEventListener("cancel", () => done([]));
-    window.addEventListener("focus", onFocus);
-    document.body.append(input);
-    input.click();
-  });
 }
 
 export default function App() {
@@ -1534,9 +1492,15 @@ export default function App() {
     const problems: string[] = [];
     const accepted: PendingAttachment[] = [];
     for (const file of files) {
-      // 预检用本地就能知道的字节数与文件名（白名单认的是扩展名）：不合格的不必
-      // 先花带宽传上去再被拒。
-      const problem = imageAttachmentProblem(file.name, file.size);
+      // 预检用本地就能知道的字节数与文件名：不合格的不必先花带宽传上去再被拒。
+      //
+      // HEIC/HEIF 是唯一例外——`IMAGE_EXTENSIONS` 白名单里没有它，但那条路**正是**
+      // 要给 `uploadImage` 去转码的（iOS 相册默认就是 HEIC，在这里拦下等于这个功能
+      // 永远走不到）。所以对 HEIC 只保留 20 MB 上限，扩展名白名单交给转码那一步：
+      // 转不动就由 `uploadImage` 抛明确的 HEIC 错误。非 HEIC 仍走完整预检。
+      const problem = isHeic(file)
+        ? imageSizeProblem(file.size)
+        : imageAttachmentProblem(file.name, file.size);
       if (problem) {
         problems.push(`${file.name}：${problem}`);
         continue;
