@@ -2420,12 +2420,7 @@ mod tests {
         task: String,
         capability: String,
     ) -> Arc<crate::thread_root::ThreadRoot> {
-        let binding = test_binding(
-            socket,
-            session.clone(),
-            task.clone(),
-            capability.clone(),
-        );
+        let binding = test_binding(socket, session.clone(), task.clone(), capability.clone());
         crate::thread_root::ThreadRoot::from_handle(
             binding,
             crate::AttachedRoot {

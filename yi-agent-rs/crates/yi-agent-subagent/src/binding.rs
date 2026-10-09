@@ -145,7 +145,8 @@ impl RuntimeBinding {
 
     /// Brings the runtime back up (single-flight) and adopts the result.
     pub fn repair(&self) -> Result<RuntimeHandle, String> {
-        self.repair_with_generation().map(|(handle, _generation)| handle)
+        self.repair_with_generation()
+            .map(|(handle, _generation)| handle)
     }
 
     /// Like `repair`, but also reports the generation of the runtime adopted.

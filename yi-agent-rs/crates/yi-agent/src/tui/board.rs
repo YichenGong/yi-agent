@@ -22,7 +22,14 @@ pub fn handle_board(project: &Path, global: &Path, message: &str) -> BoardOutcom
     let resident = yi_agent_store::resident::default_dir().unwrap_or_default();
     let mut launcher = |project: &Path| lifecycle::launch_if_absent(project);
     let mut stopper = |project: &Path| yi_agent_boards::board_daemon::stop(project);
-    handle_board_with(project, global, &resident, message, &mut launcher, &mut stopper)
+    handle_board_with(
+        project,
+        global,
+        &resident,
+        message,
+        &mut launcher,
+        &mut stopper,
+    )
 }
 
 /// 与 [`handle_board`] 同一套语义，但把启动/停止 daemon 注入进来。
@@ -50,9 +57,7 @@ pub fn handle_board_with(
             Err(error) => lines(vec![format!("看板创建失败: {error}")]),
         },
         "remove" => match lifecycle::remove_with(project, global, resident, stopper) {
-            Ok(()) => lines(vec![
-                "看板已移除（队列已删，清单与开关保留）".to_string(),
-            ]),
+            Ok(()) => lines(vec!["看板已移除（队列已删，清单与开关保留）".to_string()]),
             Err(error) => lines(vec![format!("看板移除失败: {error}")]),
         },
         "status" => BoardOutcome {
@@ -76,9 +81,7 @@ fn daemon_phrase(daemon_running: bool) -> String {
 /// `status` 的正文：未登记时给创建指引，已登记时报 daemon 与计数。
 fn render_status(status: &BoardStatus) -> Vec<String> {
     if !status.registered {
-        return vec![
-            "本目录尚未创建看板；用 /superpowers-kanban create 创建".to_string(),
-        ];
+        return vec!["本目录尚未创建看板；用 /superpowers-kanban create 创建".to_string()];
     }
     if status.daemon_running {
         vec![format!(
@@ -103,12 +106,10 @@ mod tests {
     /// 测试夹具同一个套路。用来钉住 create 的 daemon-ready 说法。
     fn launcher_that_leaves_a_daemon() -> impl FnMut(&Path) -> Result<bool, String> {
         move |project: &Path| {
-            let socket = yi_agent_store::ipc::socket_path_for(
-                &project.join(".yi-agent").join("runtime"),
-            )
-            .map_err(|error| error.to_string())?;
-            std::fs::create_dir_all(socket.parent().unwrap())
-                .map_err(|error| error.to_string())?;
+            let socket =
+                yi_agent_store::ipc::socket_path_for(&project.join(".yi-agent").join("runtime"))
+                    .map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(socket.parent().unwrap()).map_err(|error| error.to_string())?;
             let listener = std::os::unix::net::UnixListener::bind(&socket)
                 .map_err(|error| error.to_string())?;
             std::thread::spawn(move || {
@@ -151,9 +152,18 @@ mod tests {
         let mut launcher = |_p: &Path| Ok(false);
         let mut stopper = noop_stopper();
         let out = handle_board_with(
-            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+            &project,
+            &global,
+            &resident,
+            "create",
+            &mut launcher,
+            &mut stopper,
         );
-        assert!(out.lines.iter().any(|l| l.contains("看板已创建")), "{:?}", out.lines);
+        assert!(
+            out.lines.iter().any(|l| l.contains("看板已创建")),
+            "{:?}",
+            out.lines
+        );
         assert!(yi_agent_boards::registry::contains(&global, &project).unwrap());
     }
 
@@ -164,7 +174,11 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let global = dir.path().join("global");
         let out = handle_board(&project, &global, "status");
-        assert!(out.lines.iter().any(|l| l.contains("未创建")), "{:?}", out.lines);
+        assert!(
+            out.lines.iter().any(|l| l.contains("未创建")),
+            "{:?}",
+            out.lines
+        );
     }
 
     #[test]
@@ -177,14 +191,32 @@ mod tests {
         let mut launcher = |_p: &Path| Ok(false);
         let mut stopper = noop_stopper();
         handle_board_with(
-            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+            &project,
+            &global,
+            &resident,
+            "create",
+            &mut launcher,
+            &mut stopper,
         );
         let out = handle_board_with(
-            &project, &global, &resident, "remove", &mut launcher, &mut stopper,
+            &project,
+            &global,
+            &resident,
+            "remove",
+            &mut launcher,
+            &mut stopper,
         );
-        assert!(out.lines.iter().any(|l| l.contains("已移除")), "{:?}", out.lines);
+        assert!(
+            out.lines.iter().any(|l| l.contains("已移除")),
+            "{:?}",
+            out.lines
+        );
         assert!(!yi_agent_boards::registry::contains(&global, &project).unwrap());
-        assert!(project.join(".yi-agent/supervisors/superpowers-kanban.json").exists());
+        assert!(
+            project
+                .join(".yi-agent/supervisors/superpowers-kanban.json")
+                .exists()
+        );
     }
 
     #[test]
@@ -200,10 +232,17 @@ mod tests {
         let mut stopper = noop_stopper();
 
         let out = handle_board_with(
-            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+            &project,
+            &global,
+            &resident,
+            "create",
+            &mut launcher,
+            &mut stopper,
         );
         assert!(
-            out.lines.iter().any(|l| l.contains("看板已创建") && l.contains("未就绪")),
+            out.lines
+                .iter()
+                .any(|l| l.contains("看板已创建") && l.contains("未就绪")),
             "{:?}",
             out.lines
         );
@@ -221,10 +260,17 @@ mod tests {
         let mut stopper = noop_stopper();
 
         let out = handle_board_with(
-            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+            &project,
+            &global,
+            &resident,
+            "create",
+            &mut launcher,
+            &mut stopper,
         );
         assert!(
-            out.lines.iter().any(|l| l.contains("看板已创建") && l.contains("就绪")),
+            out.lines
+                .iter()
+                .any(|l| l.contains("看板已创建") && l.contains("就绪")),
             "{:?}",
             out.lines
         );
@@ -244,7 +290,11 @@ mod tests {
             "已登记的项目不能被说成未创建：{:?}",
             out.lines
         );
-        assert!(out.lines.iter().any(|l| l.contains("未在跑")), "{:?}", out.lines);
+        assert!(
+            out.lines.iter().any(|l| l.contains("未在跑")),
+            "{:?}",
+            out.lines
+        );
     }
 
     #[test]
@@ -268,11 +318,21 @@ mod tests {
         let mut launcher = |_p: &Path| Ok(false);
         let mut stopper = |_p: &Path| Err("daemon 拒绝停止".to_string());
         handle_board_with(
-            &project, &global, &resident, "create", &mut launcher, &mut stopper,
+            &project,
+            &global,
+            &resident,
+            "create",
+            &mut launcher,
+            &mut stopper,
         );
 
         let out = handle_board_with(
-            &project, &global, &resident, "remove", &mut launcher, &mut stopper,
+            &project,
+            &global,
+            &resident,
+            "remove",
+            &mut launcher,
+            &mut stopper,
         );
         assert!(
             out.lines.iter().any(|l| l.contains("移除失败")),

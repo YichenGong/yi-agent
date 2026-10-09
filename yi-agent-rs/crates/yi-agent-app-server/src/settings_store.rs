@@ -226,7 +226,11 @@ mod relay_tests {
     #[test]
     fn save_then_load_round_trips() {
         let dir = tempfile::TempDir::new().unwrap();
-        save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+        save_relay_url(
+            dir.path(),
+            Some("wss://relay.example.com/connect?session=x"),
+        )
+        .unwrap();
         assert_eq!(
             load_relay_url(dir.path()).as_deref(),
             Some("wss://relay.example.com/connect?session=x")
@@ -237,14 +241,22 @@ mod relay_tests {
     #[test]
     fn a_stored_url_is_trimmed_on_save_and_load() {
         let dir = tempfile::TempDir::new().unwrap();
-        save_relay_url(dir.path(), Some("  wss://relay.example.com/connect?session=x  ")).unwrap();
+        save_relay_url(
+            dir.path(),
+            Some("  wss://relay.example.com/connect?session=x  "),
+        )
+        .unwrap();
         assert_eq!(
             load_relay_url(dir.path()).as_deref(),
             Some("wss://relay.example.com/connect?session=x")
         );
         // 直接写带空白的值进文件，读出来同样 trim。
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
-        std::fs::write(preferences_path(dir.path()), r#"{"relay_url":"  wss://r/x  "}"#).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            r#"{"relay_url":"  wss://r/x  "}"#,
+        )
+        .unwrap();
         assert_eq!(load_relay_url(dir.path()).as_deref(), Some("wss://r/x"));
     }
 
@@ -254,7 +266,11 @@ mod relay_tests {
     fn saving_an_empty_or_blank_url_clears_the_key() {
         for blank in ["", "   "] {
             let dir = tempfile::TempDir::new().unwrap();
-            save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+            save_relay_url(
+                dir.path(),
+                Some("wss://relay.example.com/connect?session=x"),
+            )
+            .unwrap();
             save_relay_url(dir.path(), Some(blank)).unwrap();
             assert_eq!(load_relay_url(dir.path()), None, "blank: {blank:?}");
 
@@ -270,7 +286,11 @@ mod relay_tests {
     #[test]
     fn saving_none_clears_the_key() {
         let dir = tempfile::TempDir::new().unwrap();
-        save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+        save_relay_url(
+            dir.path(),
+            Some("wss://relay.example.com/connect?session=x"),
+        )
+        .unwrap();
         save_relay_url(dir.path(), None).unwrap();
         assert_eq!(load_relay_url(dir.path()), None);
     }
@@ -285,11 +305,18 @@ mod relay_tests {
             r#"{"theme":"light","board_watchman_enabled":false,"subagent_runtime":"never"}"#,
         )
         .unwrap();
-        save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+        save_relay_url(
+            dir.path(),
+            Some("wss://relay.example.com/connect?session=x"),
+        )
+        .unwrap();
 
         let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["relay_url"], "wss://relay.example.com/connect?session=x");
+        assert_eq!(
+            value["relay_url"],
+            "wss://relay.example.com/connect?session=x"
+        );
         assert_eq!(value["theme"], "light");
         assert_eq!(value["board_watchman_enabled"], false);
         assert_eq!(value["subagent_runtime"], "never");
@@ -324,13 +351,20 @@ mod relay_tests {
     #[test]
     fn saving_the_relay_url_leaves_no_temp_file_behind() {
         let dir = tempfile::TempDir::new().unwrap();
-        save_relay_url(dir.path(), Some("wss://relay.example.com/connect?session=x")).unwrap();
+        save_relay_url(
+            dir.path(),
+            Some("wss://relay.example.com/connect?session=x"),
+        )
+        .unwrap();
         let stray: Vec<String> = std::fs::read_dir(dir.path().join(".yi-agent"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name != "preferences.json")
             .collect();
-        assert!(stray.is_empty(), "no temp file may survive a save: {stray:?}");
+        assert!(
+            stray.is_empty(),
+            "no temp file may survive a save: {stray:?}"
+        );
     }
 }
 
@@ -398,7 +432,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name != "preferences.json")
             .collect();
-        assert!(stray.is_empty(), "no temp file may survive a save: {stray:?}");
+        assert!(
+            stray.is_empty(),
+            "no temp file may survive a save: {stray:?}"
+        );
     }
 
     /// 每次写入用的临时名必须唯一:固定名会让同一目录的并发写者互相截断。
@@ -418,7 +455,10 @@ mod tests {
             name.contains(&std::process::id().to_string()),
             "the temp name must carry the pid: {name}"
         );
-        assert!(name.ends_with(".tmp"), "the temp name must stay *.tmp: {name}");
+        assert!(
+            name.ends_with(".tmp"),
+            "the temp name must stay *.tmp: {name}"
+        );
         assert_ne!(
             first,
             preferences_path(dir.path()),

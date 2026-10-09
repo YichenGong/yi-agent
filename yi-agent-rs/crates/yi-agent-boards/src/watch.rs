@@ -68,7 +68,11 @@ mod tests {
 
     #[test]
     fn one_failing_project_does_not_stop_the_others() {
-        let projects = vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")];
+        let projects = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/c"),
+        ];
         let seen = RefCell::new(Vec::new());
         let started = ensure_daemons_with(&projects, &mut |project| {
             seen.borrow_mut().push(project.to_path_buf());

@@ -923,10 +923,13 @@ mod tests {
         ];
         let stream = futures::stream::iter(events).boxed();
         let mut seen: Vec<ProviderEvent> = Vec::new();
-        let (content, _end, _usage) =
-            accumulate_stream(stream, |ev| seen.push(ev), None).await.unwrap();
+        let (content, _end, _usage) = accumulate_stream(stream, |ev| seen.push(ev), None)
+            .await
+            .unwrap();
         assert!(
-            content.iter().all(|b| !matches!(b, ContentBlock::ToolUse { .. })),
+            content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::ToolUse { .. })),
             "empty-name tool use must not enter content: {content:?}"
         );
         assert!(
@@ -950,10 +953,13 @@ mod tests {
         ];
         let stream = futures::stream::iter(events).boxed();
         let mut seen: Vec<ProviderEvent> = Vec::new();
-        let (content, _end, _usage) =
-            accumulate_stream(stream, |ev| seen.push(ev), None).await.unwrap();
+        let (content, _end, _usage) = accumulate_stream(stream, |ev| seen.push(ev), None)
+            .await
+            .unwrap();
         assert!(
-            content.iter().all(|b| !matches!(b, ContentBlock::ToolUse { .. })),
+            content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::ToolUse { .. })),
             "empty-id tool use must not enter content: {content:?}"
         );
         assert!(

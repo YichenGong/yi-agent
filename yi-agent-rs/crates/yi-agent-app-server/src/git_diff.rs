@@ -97,7 +97,11 @@ fn commits(repo: &Path, merge_base: &str) -> Vec<CommitInfo> {
     // 单元分隔符用 ASCII 0x1f，记录分隔符用 0x1e，避免 subject 里的空白歧义。
     let Some(raw) = git_ok(
         repo,
-        &["log", "--format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e", &format!("{merge_base}..HEAD")],
+        &[
+            "log",
+            "--format=%H%x1f%h%x1f%s%x1f%an%x1f%at%x1e",
+            &format!("{merge_base}..HEAD"),
+        ],
     ) else {
         return Vec::new();
     };
@@ -113,7 +117,13 @@ fn commits(repo: &Path, merge_base: &str) -> Vec<CommitInfo> {
             let subject = parts.next()?.to_string();
             let author = parts.next()?.to_string();
             let timestamp = parts.next()?.trim().parse::<i64>().ok()?;
-            Some(CommitInfo { sha, short, subject, author, timestamp })
+            Some(CommitInfo {
+                sha,
+                short,
+                subject,
+                author,
+                timestamp,
+            })
         })
         .collect()
 }
@@ -132,9 +142,23 @@ fn repo_root(repo: &Path) -> std::path::PathBuf {
 /// `--full-name` 保证即使 cwd 是子目录，输出仍是仓库根相对——与 `diff --numstat`
 /// 的基准一致；cwd 本就是仓库根时该选项不改变输出。
 fn untracked_paths(repo: &Path) -> Vec<String> {
-    git_ok(repo, &["ls-files", "--others", "--exclude-standard", "--full-name", "-z"])
-        .map(|raw| raw.split('\0').filter(|p| !p.is_empty()).map(str::to_string).collect())
-        .unwrap_or_default()
+    git_ok(
+        repo,
+        &[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "-z",
+        ],
+    )
+    .map(|raw| {
+        raw.split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// 文件清单 = 已跟踪改动（numstat）+ 未跟踪（A）。
@@ -157,10 +181,17 @@ fn files(repo: &Path, root: &Path, merge_base: Option<&str>) -> Vec<FileStat> {
     }
     for path in untracked_paths(repo) {
         let full = root.join(&path);
-        let additions =
-            std::fs::read(&full).map(|b| b.iter().filter(|&&c| c == b'\n').count() as u64).unwrap_or(0);
+        let additions = std::fs::read(&full)
+            .map(|b| b.iter().filter(|&&c| c == b'\n').count() as u64)
+            .unwrap_or(0);
         let binary = is_binary(&full);
-        out.push(FileStat { path, status: "A".into(), additions, deletions: 0, binary });
+        out.push(FileStat {
+            path,
+            status: "A".into(),
+            additions,
+            deletions: 0,
+            binary,
+        });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     out
@@ -185,17 +216,30 @@ fn parse_numstat(raw: &str) -> Vec<FileStat> {
             let new = fields.next().unwrap_or("");
             ("R".to_string(), new.to_string())
         } else {
-            let status =
-                if deletions == 0 && additions > 0 { "A" } else if additions == 0 && deletions > 0 { "D" } else { "M" };
+            let status = if deletions == 0 && additions > 0 {
+                "A"
+            } else if additions == 0 && deletions > 0 {
+                "D"
+            } else {
+                "M"
+            };
             (status.to_string(), path.to_string())
         };
-        out.push(FileStat { path, status, additions, deletions, binary });
+        out.push(FileStat {
+            path,
+            status,
+            additions,
+            deletions,
+            binary,
+        });
     }
     out
 }
 
 fn is_binary(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else { return false };
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
     bytes.iter().take(8000).any(|&b| b == 0)
 }
 
@@ -206,9 +250,13 @@ fn is_binary(path: &Path) -> bool {
 fn untracked_diff(root: &Path, paths: &[String]) -> String {
     let mut out = String::new();
     for path in paths {
-        let Ok(content) = std::fs::read_to_string(root.join(path)) else { continue };
+        let Ok(content) = std::fs::read_to_string(root.join(path)) else {
+            continue;
+        };
         let lines: Vec<&str> = content.lines().collect();
-        out.push_str(&format!("diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"));
+        out.push_str(&format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+        ));
         out.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
         for line in &lines {
             out.push('+');
@@ -293,26 +341,32 @@ mod tests {
             vec!["config", "user.email", "t@example.com"],
             vec!["config", "user.name", "T"],
         ] {
-            assert!(std::process::Command::new("git")
-                .args(&args)
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "."])
                 .current_dir(dir.path())
                 .status()
                 .unwrap()
-                .success());
-        }
-        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("git")
-            .args(["commit", "-q", "-m", "init"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-q", "-m", "init"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         dir
     }
 
@@ -340,10 +394,20 @@ mod tests {
         let d = thread_diff(dir.path(), Some("trunk"));
         // 在 trunk 上 merge-base == HEAD（自己与自己），diff 只含工作区
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
-        assert!(paths.contains(&"a.txt"), "tracked edit must appear: {paths:?}");
-        assert!(paths.contains(&"new.txt"), "untracked file must appear: {paths:?}");
+        assert!(
+            paths.contains(&"a.txt"),
+            "tracked edit must appear: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"new.txt"),
+            "untracked file must appear: {paths:?}"
+        );
         assert!(d.unified_diff.contains("+two"), "diff: {}", d.unified_diff);
-        assert!(d.unified_diff.contains("+hello"), "diff: {}", d.unified_diff);
+        assert!(
+            d.unified_diff.contains("+hello"),
+            "diff: {}",
+            d.unified_diff
+        );
     }
 
     /// 回归 #1：无默认分支（`worktree-only`）时也必须报出已跟踪文件的未提交改动。
@@ -358,10 +422,21 @@ mod tests {
         assert_eq!(d.base_kind, "worktree-only");
         assert_eq!(d.base, None);
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
-        assert!(paths.contains(&"a.txt"), "tracked uncommitted edit must appear: {paths:?}");
+        assert!(
+            paths.contains(&"a.txt"),
+            "tracked uncommitted edit must appear: {paths:?}"
+        );
         let a = d.files.iter().find(|f| f.path == "a.txt").unwrap();
-        assert_eq!((a.additions, a.deletions), (1, 0), "numstat must be read: {a:?}");
-        assert!(d.unified_diff.contains("+two"), "tracked edit must be in the diff: {}", d.unified_diff);
+        assert_eq!(
+            (a.additions, a.deletions),
+            (1, 0),
+            "numstat must be read: {a:?}"
+        );
+        assert!(
+            d.unified_diff.contains("+two"),
+            "tracked edit must be in the diff: {}",
+            d.unified_diff
+        );
     }
 
     /// 回归 #1b：`worktree-only` 下**已暂存**（`git add` 过）的改动同样要报出来。
@@ -373,20 +448,33 @@ mod tests {
     fn worktree_only_includes_staged_only_edits() {
         let dir = repo();
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["add", "a.txt"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "a.txt"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         // 只暂存、不再改动：裸 `git diff` 在这里输出为空。
         let d = thread_diff(dir.path(), None);
         assert_eq!(d.base_kind, "worktree-only");
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
-        assert!(paths.contains(&"a.txt"), "staged-only edit must appear: {paths:?}");
+        assert!(
+            paths.contains(&"a.txt"),
+            "staged-only edit must appear: {paths:?}"
+        );
         let a = d.files.iter().find(|f| f.path == "a.txt").unwrap();
-        assert_eq!((a.additions, a.deletions), (1, 0), "numstat must be read: {a:?}");
-        assert!(d.unified_diff.contains("+two"), "staged-only edit must be in the diff: {}", d.unified_diff);
+        assert_eq!(
+            (a.additions, a.deletions),
+            (1, 0),
+            "numstat must be read: {a:?}"
+        );
+        assert!(
+            d.unified_diff.contains("+two"),
+            "staged-only edit must be in the diff: {}",
+            d.unified_diff
+        );
     }
 
     /// 回归 #1c：已暂存的**新文件**不能被漏掉。
@@ -397,16 +485,22 @@ mod tests {
     fn worktree_only_includes_staged_new_files() {
         let dir = repo();
         std::fs::write(dir.path().join("n.txt"), "brand new\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["add", "n.txt"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "n.txt"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let d = thread_diff(dir.path(), None);
         assert_eq!(d.base_kind, "worktree-only");
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, ["n.txt"], "staged new file must appear exactly once: {paths:?}");
+        assert_eq!(
+            paths,
+            ["n.txt"],
+            "staged new file must appear exactly once: {paths:?}"
+        );
         assert!(
             d.unified_diff.contains("+brand new"),
             "staged new file content must be in the diff: {}",
@@ -419,18 +513,32 @@ mod tests {
     fn worktree_only_reports_staged_and_unstaged_deltas_together() {
         let dir = repo();
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["add", "a.txt"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "a.txt"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap(); // 暂存后再改
         let d = thread_diff(dir.path(), None);
         let a = d.files.iter().find(|f| f.path == "a.txt").unwrap();
-        assert_eq!((a.additions, a.deletions), (2, 0), "both deltas must be counted: {a:?}");
-        assert!(d.unified_diff.contains("+two"), "staged delta missing: {}", d.unified_diff);
-        assert!(d.unified_diff.contains("+three"), "unstaged delta missing: {}", d.unified_diff);
+        assert_eq!(
+            (a.additions, a.deletions),
+            (2, 0),
+            "both deltas must be counted: {a:?}"
+        );
+        assert!(
+            d.unified_diff.contains("+two"),
+            "staged delta missing: {}",
+            d.unified_diff
+        );
+        assert!(
+            d.unified_diff.contains("+three"),
+            "unstaged delta missing: {}",
+            d.unified_diff
+        );
     }
 
     /// 回归 #1e：`file_diff` 的 `None` 分支与 `thread_diff` 同源，同样必须看见已暂存改动。
@@ -438,15 +546,20 @@ mod tests {
     fn file_diff_without_base_includes_staged_only_edits() {
         let dir = repo();
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["add", "a.txt"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["add", "a.txt"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let (diff, truncated) = file_diff(dir.path(), None, "a.txt");
         assert!(!truncated);
-        assert!(diff.contains("+two"), "staged-only edit must be in file_diff: {diff}");
+        assert!(
+            diff.contains("+two"),
+            "staged-only edit must be in file_diff: {diff}"
+        );
     }
 
     /// 回归 #2：`repo` 是工作树子目录时，所有路径必须统一为仓库根相对。
@@ -461,46 +574,66 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         std::fs::write(sub.join("t.txt"), "t\n").unwrap();
         for args in [vec!["add", "."], vec!["commit", "-q", "-m", "add sub"]] {
-            assert!(std::process::Command::new("git")
-                .args(&args)
-                .current_dir(dir.path())
-                .status()
-                .unwrap()
-                .success());
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
         }
         std::fs::write(sub.join("t.txt"), "t\nedit\n").unwrap(); // 已提交文件的未提交改动
         std::fs::write(sub.join("u.txt"), "hello\n").unwrap(); // 子目录里的未跟踪文件
 
         let d = thread_diff(&sub, None); // thread 的 cwd 是子目录（Task 2 的调用方式）
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
-        assert!(paths.contains(&"sub/t.txt"), "tracked edit must be root-relative: {paths:?}");
-        assert!(paths.contains(&"sub/u.txt"), "untracked must be root-relative: {paths:?}");
-        assert!(!paths.contains(&"u.txt") && !paths.contains(&"t.txt"), "no cwd-relative paths: {paths:?}");
         assert!(
-            d.unified_diff.contains("diff --git a/sub/u.txt b/sub/u.txt"),
+            paths.contains(&"sub/t.txt"),
+            "tracked edit must be root-relative: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"sub/u.txt"),
+            "untracked must be root-relative: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"u.txt") && !paths.contains(&"t.txt"),
+            "no cwd-relative paths: {paths:?}"
+        );
+        assert!(
+            d.unified_diff
+                .contains("diff --git a/sub/u.txt b/sub/u.txt"),
             "synthesized header must be root-relative: {}",
             d.unified_diff
         );
-        assert!(d.unified_diff.contains("+hello"), "untracked content must be in the diff: {}", d.unified_diff);
+        assert!(
+            d.unified_diff.contains("+hello"),
+            "untracked content must be in the diff: {}",
+            d.unified_diff
+        );
     }
 
     #[test]
     fn commits_are_the_branch_introduced_ones() {
         let dir = repo();
         // 造一个分叉：从 trunk 起分支并加一个提交
-        assert!(std::process::Command::new("git")
-            .args(["checkout", "-q", "-b", "feature"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["checkout", "-q", "-b", "feature"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::write(dir.path().join("a.txt"), "feature\n").unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["commit", "-qam", "feature work"])
-            .current_dir(dir.path())
-            .status()
-            .unwrap()
-            .success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-qam", "feature work"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         // 以 trunk 为 base 时，feature 引入的提交应被列出
         let d = thread_diff(dir.path(), Some("trunk"));
         assert_eq!(d.commits.len(), 1, "commits: {:?}", d.commits);

@@ -2843,7 +2843,10 @@ mod tests {
             .record_recovery_conflict(&task, "git head moved")
             .unwrap();
         assert!(
-            matches!(supervisor.task(&task).unwrap().state(), TaskState::Blocked(_)),
+            matches!(
+                supervisor.task(&task).unwrap().state(),
+                TaskState::Blocked(_)
+            ),
             "a recovery conflict settles the task in `Blocked`"
         );
 

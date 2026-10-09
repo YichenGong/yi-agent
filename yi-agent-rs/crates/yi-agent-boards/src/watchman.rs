@@ -16,7 +16,10 @@ pub fn plist_path(home: &Path) -> PathBuf {
 
 /// 生成 plist。日志落到 `~/.yi-agent/logs/board-watchman.log`，便于排障。
 pub fn plist_contents(exe: &Path, home: &Path) -> String {
-    let log = home.join(".yi-agent").join("logs").join("board-watchman.log");
+    let log = home
+        .join(".yi-agent")
+        .join("logs")
+        .join("board-watchman.log");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -153,7 +156,10 @@ mod tests {
         install_with(
             &PathBuf::from("/usr/local/bin/yi-agent"),
             home,
-            &mut |args| { calls.push(args.to_vec()); Ok(()) },
+            &mut |args| {
+                calls.push(args.to_vec());
+                Ok(())
+            },
         )
         .unwrap();
         assert!(plist_path(home).exists(), "the plist must be on disk");
@@ -173,7 +179,11 @@ mod tests {
         )
         .unwrap();
         let mut calls: Vec<Vec<String>> = Vec::new();
-        uninstall_with(home, &mut |args| { calls.push(args.to_vec()); Ok(()) }).unwrap();
+        uninstall_with(home, &mut |args| {
+            calls.push(args.to_vec());
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(calls[0][0], "bootout");
         assert!(!plist_path(home).exists(), "the plist must be gone");
     }

@@ -2664,8 +2664,12 @@ impl RuntimeCoordinator {
         let mut stage_victims: Vec<TaskId> = Vec::new();
         let staged = supervisor.stage_review_with_persistence(
             |supervisor| {
-                let (_, victims) =
-                    supervisor.accept_review(task, &parent, delivery.id.clone(), staged_integration)?;
+                let (_, victims) = supervisor.accept_review(
+                    task,
+                    &parent,
+                    delivery.id.clone(),
+                    staged_integration,
+                )?;
                 stage_victims = victims.clone();
                 Ok(victims)
             },
@@ -2673,13 +2677,7 @@ impl RuntimeCoordinator {
                 self.repository
                     .lock()
                     .expect("runtime repository mutex poisoned")
-                    .accept_delivery_review(
-                        task,
-                        &delivery.id,
-                        &parent,
-                        &integration,
-                        &actor_json,
-                    )
+                    .accept_delivery_review(task, &delivery.id, &parent, &integration, &actor_json)
             },
         );
         let (victims, _) = match staged {
@@ -2695,10 +2693,7 @@ impl RuntimeCoordinator {
                 if matches!(error, ReviewPersistenceError::Persistence(_)) {
                     let message = review_persistence_error(error);
                     drop(supervisor);
-                    let victims = stage_victims
-                        .into_iter()
-                        .filter(|id| id != task)
-                        .collect();
+                    let victims = stage_victims.into_iter().filter(|id| id != task).collect();
                     self.persist_cascaded_tasks(victims)?;
                     return Err(message);
                 }
@@ -3074,10 +3069,7 @@ impl RuntimeCoordinator {
                 if matches!(error, ReviewPersistenceError::Persistence(_)) {
                     let message = review_persistence_error(error);
                     drop(supervisor);
-                    let victims = stage_victims
-                        .into_iter()
-                        .filter(|id| id != task)
-                        .collect();
+                    let victims = stage_victims.into_iter().filter(|id| id != task).collect();
                     self.persist_cascaded_tasks(victims)?;
                     return Err(message);
                 }
@@ -4836,7 +4828,10 @@ mod provider_turn_admission_tests {
             repository.active_attempt_id(&victim).unwrap(),
             successor_attempt
         );
-        assert_ne!(repository.active_attempt_id(&victim).unwrap(), stale_attempt);
+        assert_ne!(
+            repository.active_attempt_id(&victim).unwrap(),
+            stale_attempt
+        );
     }
 
     #[test]

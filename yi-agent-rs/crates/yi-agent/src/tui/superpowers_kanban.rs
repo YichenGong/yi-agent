@@ -125,13 +125,18 @@ pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOu
                     toggled_to: Some(on),
                 },
                 Err(QueryFailure::PluginMissing) => unavailable(),
-                Err(QueryFailure::Other(message)) => plain(vec![format!("无法写入开关: {message}")]),
+                Err(QueryFailure::Other(message)) => {
+                    plain(vec![format!("无法写入开关: {message}")])
+                }
             }
         }
         "run" => match query_plugin(workdir, "switch.read", json!({})) {
             Ok(value) => {
                 let on = value.get("on").and_then(Value::as_bool).unwrap_or(false);
-                let source = value.get("source").and_then(Value::as_str).unwrap_or("default");
+                let source = value
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("default");
                 if on {
                     plain(vec![
                         "Superpowers 看板 is enabled; the plugin process advances the queue."
@@ -158,16 +163,13 @@ pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOu
                         json!({ "spec_path": spec, "plan_path": plan }),
                     ) {
                         Ok(value) => {
-                            let id = value
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or("card");
+                            let id = value.get("id").and_then(Value::as_str).unwrap_or("card");
                             plain(vec![format!("Superpowers 看板: delivered {id} to inbox")])
                         }
                         Err(QueryFailure::PluginMissing) => unavailable(),
-                        Err(QueryFailure::Other(message)) => {
-                            plain(vec![format!("Superpowers 看板: could not deliver: {message}")])
-                        }
+                        Err(QueryFailure::Other(message)) => plain(vec![format!(
+                            "Superpowers 看板: could not deliver: {message}"
+                        )]),
                     }
                 }
                 _ => plain(vec![
@@ -184,8 +186,8 @@ pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOu
 
 /// 把插件回的卡片数组渲染成若干行。开关状态由插件给，本地不猜。
 fn render_board(workdir: &Path, value: &Value) -> Result<Vec<String>, String> {
-    let switch = query_plugin(workdir, "switch.read", json!({}))
-        .map_err(|failure| match failure {
+    let switch =
+        query_plugin(workdir, "switch.read", json!({})).map_err(|failure| match failure {
             QueryFailure::PluginMissing => "Superpowers 看板插件未安装。".to_string(),
             QueryFailure::Other(message) => format!("无法读取开关: {message}"),
         })?;
@@ -260,7 +262,10 @@ mod tests {
                 let command = &request["command"];
                 let method = command["method"].as_str().unwrap_or("").to_string();
                 let params = command["params"].clone();
-                captured.lock().unwrap().push((method.clone(), params.clone()));
+                captured
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), params.clone()));
                 let result = match respond(&method, &params) {
                     Ok(value) => json!({ "type": "PluginResult", "value": value }),
                     // The wire code is snake_case (`not_found`), not the Rust

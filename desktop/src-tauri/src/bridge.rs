@@ -413,8 +413,11 @@ mod tests {
     #[test]
     fn resolve_relay_prefers_a_non_blank_env_value() {
         assert_eq!(
-            resolve_relay(Some("wss://env/connect?session=e"), Some("wss://stored/connect?session=s"))
-                .as_deref(),
+            resolve_relay(
+                Some("wss://env/connect?session=e"),
+                Some("wss://stored/connect?session=s")
+            )
+            .as_deref(),
             Some("wss://env/connect?session=e")
         );
         // 两侧都 trim:env 里的空白被剥掉后仍是非空,照样优先。
@@ -465,7 +468,11 @@ mod tests {
     fn saving_the_relay_url_round_trips_through_the_preferences_file() {
         let dir = tempfile::TempDir::new().unwrap();
         save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
-        assert!(dir.path().join(".yi-agent").join("preferences.json").is_file());
+        assert!(dir
+            .path()
+            .join(".yi-agent")
+            .join("preferences.json")
+            .is_file());
         assert_eq!(
             load_relay_url(dir.path()).as_deref(),
             Some("wss://r/connect?session=x")
@@ -517,7 +524,11 @@ mod tests {
     fn a_broken_preferences_file_reads_as_no_relay() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
-        std::fs::write(dir.path().join(".yi-agent").join("preferences.json"), "not json").unwrap();
+        std::fs::write(
+            dir.path().join(".yi-agent").join("preferences.json"),
+            "not json",
+        )
+        .unwrap();
         assert_eq!(load_relay_url(dir.path()), None);
 
         save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
@@ -537,7 +548,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name != "preferences.json")
             .collect();
-        assert!(stray.is_empty(), "no temp file may survive a save: {stray:?}");
+        assert!(
+            stray.is_empty(),
+            "no temp file may survive a save: {stray:?}"
+        );
     }
 
     // `configured_relay` reads a process-global env var. Cargo runs tests in

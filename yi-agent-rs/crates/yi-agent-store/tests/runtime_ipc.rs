@@ -17,7 +17,7 @@ use yi_agent_core::subagent::worker::{
 use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
     ChildReviewDecision, Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision,
-    SubscriptionFilters, PROTOCOL_VERSION, send_request, send_request_with_version, subscribe,
+    PROTOCOL_VERSION, SubscriptionFilters, send_request, send_request_with_version, subscribe,
     subscribe_with_filters,
 };
 use yi_agent_store::repository::{
@@ -6098,8 +6098,7 @@ fn two_conversation_roots_do_not_share_children_or_reach_across() {
             fork_token: None,
         },
     )
-    .unwrap()
-    else {
+    .unwrap() else {
         panic!("A must admit its own child");
     };
 

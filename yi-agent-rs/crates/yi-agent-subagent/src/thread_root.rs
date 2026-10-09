@@ -75,7 +75,10 @@ impl ThreadRoot {
         let thread_id = root.session_id.clone();
         let project_dir = root.workspace.path.clone();
         let thread_root = Self::new(binding, thread_id, project_dir);
-        *thread_root.lock_cached() = Some(CachedRoot { generation: 0, root });
+        *thread_root.lock_cached() = Some(CachedRoot {
+            generation: 0,
+            root,
+        });
         thread_root
     }
 
@@ -135,7 +138,9 @@ impl ThreadRoot {
             workspace,
         } = response
         else {
-            return Err(format!("daemon rejected the conversation root: {response:?}"));
+            return Err(format!(
+                "daemon rejected the conversation root: {response:?}"
+            ));
         };
         *self.lock_cached() = Some(CachedRoot {
             generation,
@@ -174,8 +179,7 @@ impl ThreadRoot {
     /// This conversation's root task id, once attached.
     pub fn root_task_id(&self) -> Option<String> {
         let generation = self.binding.generation();
-        self.live_cached_root(generation)
-            .map(|root| root.task_id)
+        self.live_cached_root(generation).map(|root| root.task_id)
     }
 
     /// Sends one request as this conversation's root, re-attaching and retrying
@@ -209,7 +213,9 @@ impl ThreadRoot {
             objective: objective.to_owned(),
         }) {
             Ok(IpcResponse::ApplicationRootActivated) => Ok(()),
-            Ok(other) => Err(format!("daemon rejected the conversation activation: {other:?}")),
+            Ok(other) => Err(format!(
+                "daemon rejected the conversation activation: {other:?}"
+            )),
             Err(error) => Err(error),
         }
     }

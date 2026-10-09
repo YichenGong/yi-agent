@@ -128,8 +128,9 @@ pub fn launch_if_absent(project: &Path) -> Result<bool, String> {
     if board_daemon::is_running(project) {
         return Ok(true);
     }
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("cannot locate this executable to start the board daemon: {error}"))?;
+    let exe = std::env::current_exe().map_err(|error| {
+        format!("cannot locate this executable to start the board daemon: {error}")
+    })?;
     board_daemon::spawn_detached(&exe, project)
         .map_err(|error| format!("could not start the board daemon: {error}"))?;
     Ok(board_daemon::wait_ready(project, READY_TIMEOUT))
@@ -203,7 +204,7 @@ pub fn remove_with(
             return Err(format!(
                 "could not delete the board queue at {}: {error}",
                 state_dir(project).display()
-            ))
+            ));
         }
     }
     registry::unregister(global, project).map_err(|error| error.to_string())?;
@@ -330,7 +331,8 @@ mod tests {
                             "result": { "type": "Status", "high_water_event_id": 0 },
                         });
                         let mut stream = stream;
-                        std::io::Write::write_all(&mut stream, reply.to_string().as_bytes()).unwrap();
+                        std::io::Write::write_all(&mut stream, reply.to_string().as_bytes())
+                            .unwrap();
                         std::io::Write::write_all(&mut stream, b"\n").unwrap();
                         served += 1;
                     }
@@ -432,7 +434,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(project.join(".yi-agent/superpowers-kanban")).unwrap();
-        std::fs::write(project.join(".yi-agent/superpowers-kanban/board.json"), "{}").unwrap();
+        std::fs::write(
+            project.join(".yi-agent/superpowers-kanban/board.json"),
+            "{}",
+        )
+        .unwrap();
         let global = dir.path().join("global");
         let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
@@ -631,7 +637,10 @@ mod tests {
         handle.join().unwrap();
 
         assert!(created.registered, "{created:?}");
-        assert!(created.daemon_running, "必须报告复用的 daemon 在跑：{created:?}");
+        assert!(
+            created.daemon_running,
+            "必须报告复用的 daemon 在跑：{created:?}"
+        );
     }
 
     #[test]

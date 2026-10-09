@@ -11,7 +11,7 @@ use yi_agent_core::subagent::supervisor::{
 };
 use yi_agent_core::subagent::task::{
     DeliveryReport, InheritedSandbox, IntegrationValidation, PauseReason, PermissionRequestId,
-    RecoveryEvidence, RootSessionId, TaskDepth, TaskId, TaskEvent, TaskState,
+    RecoveryEvidence, RootSessionId, TaskDepth, TaskEvent, TaskId, TaskState,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, SpawnRequest, WorkerError, WorkerHandle, WorkerStart,

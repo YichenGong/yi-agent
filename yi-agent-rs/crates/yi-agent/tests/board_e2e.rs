@@ -204,7 +204,10 @@ fn a_created_board_is_queryable_and_outlives_the_app_server() {
         json!({"project": project_str}),
         CREATE_TIMEOUT,
     );
-    assert!(created.get("error").is_none(), "board/create failed: {created}");
+    assert!(
+        created.get("error").is_none(),
+        "board/create failed: {created}"
+    );
     assert_eq!(created["result"]["registered"], true, "{created}");
     assert_eq!(
         created["result"]["daemon_running"], true,
@@ -214,7 +217,11 @@ fn a_created_board_is_queryable_and_outlives_the_app_server() {
 
     let registry = read_json(&global.join("boards.json"));
     let boards = registry["boards"].as_array().unwrap();
-    assert_eq!(boards.len(), 1, "registry must hold exactly this board: {registry}");
+    assert_eq!(
+        boards.len(),
+        1,
+        "registry must hold exactly this board: {registry}"
+    );
     assert_eq!(boards[0]["project"], project_str, "{registry}");
 
     assert!(
@@ -231,7 +238,10 @@ fn a_created_board_is_queryable_and_outlives_the_app_server() {
         "plugin/query",
         json!({"project": project_str, "plugin": "superpowers-kanban", "method": "switch.read", "params": {}}),
     );
-    assert!(switch.get("error").is_none(), "switch.read failed: {switch}");
+    assert!(
+        switch.get("error").is_none(),
+        "switch.read failed: {switch}"
+    );
     assert_eq!(switch["result"]["on"], true, "{switch}");
     assert_eq!(
         switch["result"]["source"], "project",
@@ -249,7 +259,10 @@ fn a_created_board_is_queryable_and_outlives_the_app_server() {
     );
 
     let listed = server.rpc("board/list", json!({}));
-    assert_eq!(listed["result"]["boards"][0]["project"], project_str, "{listed}");
+    assert_eq!(
+        listed["result"]["boards"][0]["project"], project_str,
+        "{listed}"
+    );
 
     // (3) The board outlives the app-server that created it.
     let status = server.shutdown();
@@ -264,7 +277,10 @@ fn a_created_board_is_queryable_and_outlives_the_app_server() {
     let mut server = AppServer::start(&bin, &home);
     server.initialize();
     let removed = server.rpc("board/remove", json!({"project": project_str}));
-    assert!(removed.get("error").is_none(), "board/remove failed: {removed}");
+    assert!(
+        removed.get("error").is_none(),
+        "board/remove failed: {removed}"
+    );
     let _ = server.shutdown();
 
     assert!(

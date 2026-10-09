@@ -33,7 +33,10 @@ pub fn list(dir: &Path) -> std::io::Result<Vec<Board>> {
 
 /// Whether `project` has a board.
 pub fn contains(dir: &Path, project: &Path) -> std::io::Result<bool> {
-    Ok(read(dir).boards.iter().any(|board| board.project == project))
+    Ok(read(dir)
+        .boards
+        .iter()
+        .any(|board| board.project == project))
 }
 
 /// Register `project`, stamping `created_at`.

@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use yi_agent_relay::backoff::{backoff_start, next_delay, ReconnectSchedule, MAX_BACKOFF};
+use yi_agent_relay::backoff::{MAX_BACKOFF, ReconnectSchedule, backoff_start, next_delay};
 
 #[test]
 fn backoff_doubles_from_one_second_and_caps_at_sixty() {

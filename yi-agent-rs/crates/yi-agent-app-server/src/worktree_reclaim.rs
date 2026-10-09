@@ -138,12 +138,20 @@ pub fn decide(card_id: Option<&str>, board_project: Option<&str>, cwd: &Path) ->
     let base = default_branch(project_path);
     let branch_state = if !git_ok(
         project_path,
-        &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
     )
     .is_some()
     {
         BranchState::Missing
-    } else if git_status_ok(project_path, &["merge-base", "--is-ancestor", &branch, &base]) {
+    } else if git_status_ok(
+        project_path,
+        &["merge-base", "--is-ancestor", &branch, &base],
+    ) {
         BranchState::Merged
     } else {
         BranchState::Unmerged
@@ -204,7 +212,9 @@ fn worktree_list_contains(project: &Path, cwd: &Path) -> bool {
         .filter_map(|line| line.strip_prefix("worktree "))
         .any(|listed| {
             let listed_path = Path::new(listed.trim());
-            listed_path.canonicalize().unwrap_or_else(|_| listed_path.to_path_buf())
+            listed_path
+                .canonicalize()
+                .unwrap_or_else(|_| listed_path.to_path_buf())
                 == Path::new(target.as_ref())
         })
 }
@@ -401,7 +411,10 @@ mod tests {
         let wt = add_kanban_worktree(&project, "card-1");
         remove(&wt, &project, false).expect("clean removal succeeds");
         assert!(!wt.exists(), "worktree dir is gone");
-        assert!(remove(&wt, &project, false).is_err(), "second removal fails");
+        assert!(
+            remove(&wt, &project, false).is_err(),
+            "second removal fails"
+        );
     }
 
     /// 小工具：把路径当目录建出来，便于链式表达式里构造 temp 子目录。

@@ -60,11 +60,7 @@ impl Drop for SuperviseHandle {
 /// 规则只有一条：`owns_daemon` 为真才监督。两个内嵌路径（TUI、桌面）共用它，
 /// 免得各自的 `if` 有一天漂移成两种语义。
 pub fn for_daemon_ownership(workdir: &Path, owns_daemon: bool) -> SuperviseHandle {
-    if owns_daemon {
-        serve(workdir)
-    } else {
-        idle()
-    }
+    if owns_daemon { serve(workdir) } else { idle() }
 }
 
 /// 一个"不监督"的占位句柄——用在借用了别人 daemon 的路径上。
@@ -131,7 +127,9 @@ mod tests {
     static TABLE: Mutex<()> = Mutex::new(());
 
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-        TABLE.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        TABLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 一个假子进程：把 pid 写进 marker 后睡到被杀。与 supervisors 的测试同款，

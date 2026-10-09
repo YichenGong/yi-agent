@@ -120,9 +120,16 @@ mod tests {
         require(dir.path(), &project, "superpowers-kanban").unwrap();
         require(dir.path(), &project, "another-plugin").unwrap();
         release(dir.path(), &project, "superpowers-kanban").unwrap();
-        assert_eq!(list(dir.path()), vec![project.clone()], "still needed by the other plugin");
+        assert_eq!(
+            list(dir.path()),
+            vec![project.clone()],
+            "still needed by the other plugin"
+        );
         release(dir.path(), &project, "another-plugin").unwrap();
-        assert!(list(dir.path()).is_empty(), "entry drops when nothing needs it");
+        assert!(
+            list(dir.path()).is_empty(),
+            "entry drops when nothing needs it"
+        );
     }
 
     #[test]
@@ -130,7 +137,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(registry_path(dir.path()), "{ not json").unwrap();
         assert!(list(dir.path()).is_empty(), "readers must not crash");
-        let error = require(dir.path(), &PathBuf::from("/proj/a"), "superpowers-kanban").unwrap_err();
+        let error =
+            require(dir.path(), &PathBuf::from("/proj/a"), "superpowers-kanban").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Other);
         assert_eq!(
             std::fs::read_to_string(registry_path(dir.path())).unwrap(),

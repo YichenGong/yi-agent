@@ -715,22 +715,28 @@ mod tests {
         // 起一个真实后台进程,断言它出现在同一份 manager 的 list 里。
         let rt = tokio::runtime::Runtime::new().unwrap();
         let started = rt
-            .block_on(setup.process_manager.start(yi_agent_tools::ProcessStartOptions {
-                command: "sleep 30".into(),
-                name: Some("t1-probe".into()),
-                cwd: None,
-                env: Default::default(),
-                on_exit: Default::default(),
-                ready_pattern: None,
-                ready_timeout_sec: None,
-            }))
+            .block_on(
+                setup
+                    .process_manager
+                    .start(yi_agent_tools::ProcessStartOptions {
+                        command: "sleep 30".into(),
+                        name: Some("t1-probe".into()),
+                        cwd: None,
+                        env: Default::default(),
+                        on_exit: Default::default(),
+                        ready_pattern: None,
+                        ready_timeout_sec: None,
+                    }),
+            )
             .expect("start");
         assert_eq!(started.name.as_deref(), Some("t1-probe"));
-        assert!(setup
-            .process_manager
-            .list()
-            .iter()
-            .any(|p| p.name.as_deref() == Some("t1-probe")));
+        assert!(
+            setup
+                .process_manager
+                .list()
+                .iter()
+                .any(|p| p.name.as_deref() == Some("t1-probe"))
+        );
         // 收尾:on_exit 默认 Kill,shutdown 会杀掉它(不留孤儿 sleep 30)。
         // 必须在同一个 runtime 上 block_on —— 进程的 reader/waiter task 挂在
         // 那个 runtime 上,换一个 runtime 收尾是无效的。

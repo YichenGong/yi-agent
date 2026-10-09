@@ -44,7 +44,10 @@ mod tests {
     #[test]
     fn the_global_dir_is_under_home() {
         let dir = global_dir_from(Some(OsStr::new("/home/tester"))).unwrap();
-        assert_eq!(dir, PathBuf::from("/home/tester/.yi-agent/superpowers-kanban"));
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/tester/.yi-agent/superpowers-kanban")
+        );
     }
 
     #[test]

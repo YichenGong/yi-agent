@@ -229,7 +229,10 @@ fn delegation_tools_act_as_the_conversations_own_root() {
         id_a,
         "the delegation tools act as their own conversation's root"
     );
-    assert_eq!(thread_b.handle().expect("B resolves a handle").task_id, id_b);
+    assert_eq!(
+        thread_b.handle().expect("B resolves a handle").task_id,
+        id_b
+    );
 
     // A child spawned as conversation A is out of reach for conversation B:
     // separate roots are separate authorization scopes.
@@ -250,7 +253,10 @@ fn delegation_tools_act_as_the_conversations_own_root() {
         },
     )
     .expect("A's child must be admitted");
-    let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id: child_of_a } = spawned else {
+    let yi_agent_store::ipc::IpcResponse::TaskSpawned {
+        task_id: child_of_a,
+    } = spawned
+    else {
         panic!("A's child must be admitted, got {spawned:?}");
     };
 
