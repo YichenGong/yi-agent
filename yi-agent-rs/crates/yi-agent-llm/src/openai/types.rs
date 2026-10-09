@@ -127,7 +127,7 @@ fn extract_text(blocks: &[ContentBlock]) -> String {
 /// Build an `image_url` part from an image content block.
 fn image_part(block: &ContentBlock) -> Option<OpenaiContentPart> {
     match block {
-        ContentBlock::Image { source, detail } => {
+        ContentBlock::Image { source, detail, .. } => {
             let url = match source {
                 ImageSource::Base64 { media_type, data } => {
                     format!("data:{media_type};base64,{data}")
@@ -565,6 +565,7 @@ mod tests {
                             data: "AAA".into(),
                         },
                         detail: ImageDetail::High,
+                        path: None,
                     },
                 ],
             }],
@@ -612,6 +613,7 @@ mod tests {
                         data: "AAA".into(),
                     },
                     detail: ImageDetail::High,
+                    path: None,
                 },
             ],
             is_error: false,
@@ -663,6 +665,7 @@ mod tests {
                         data: data.into(),
                     },
                     detail: ImageDetail::High,
+                    path: None,
                 },
             ],
             is_error: false,

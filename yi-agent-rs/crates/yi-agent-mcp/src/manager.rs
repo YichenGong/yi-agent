@@ -513,6 +513,7 @@ fn map_result(result: rmcp::model::CallToolResult) -> ToolResult {
                     data: img.data.clone(),
                 },
                 detail: Default::default(),
+                path: None,
             }),
             other => blocks.push(ContentBlock::Text(
                 serde_json::to_string(other).unwrap_or_else(|_| "<unrepresentable>".into()),
@@ -871,6 +872,7 @@ mod map_result_tests {
                     data: "ZGF0YQ==".into(),
                 },
                 detail: ImageDetail::High,
+                path: None,
             }]
         );
     }

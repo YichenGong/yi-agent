@@ -166,6 +166,7 @@ impl Tool for ViewImageTool {
                     ContentBlock::Image {
                         source: ImageSource::Base64 { media_type, data },
                         detail,
+                        path: None,
                     },
                 ])
             }

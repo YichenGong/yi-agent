@@ -5009,6 +5009,7 @@ mod tests {
                         data: "AAAA".into(),
                     },
                     detail: crate::message::ImageDetail::High,
+                    path: None,
                 }],
             }],
             tools: Vec::new(),

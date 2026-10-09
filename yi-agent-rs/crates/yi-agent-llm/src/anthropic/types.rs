@@ -358,6 +358,7 @@ mod tests {
                         data: "AAA".into(),
                     },
                     detail: ImageDetail::High,
+                    path: None,
                 },
             ],
             is_error: false,

@@ -852,6 +852,7 @@ mod tests {
                 data: "AAAA".into(),
             },
             detail: crate::message::ImageDetail::High,
+            path: None,
         };
         const { assert!(IMAGE_TOKEN_ESTIMATE > 0) };
         assert_eq!(estimate_block_tokens(&img), IMAGE_TOKEN_ESTIMATE);
@@ -869,6 +870,7 @@ mod tests {
                         data: "AAAA".into(),
                     },
                     detail: crate::message::ImageDetail::High,
+                    path: None,
                 }],
                 is_error: false,
             }])
