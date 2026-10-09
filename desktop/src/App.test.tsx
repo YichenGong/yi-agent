@@ -2307,25 +2307,24 @@ describe("relay handshake recovery wiring", () => {
   });
 });
 
-// 状态栏图标现在管的是**会话详情面板**（轨迹 + Git Diff）的开合；子 agent 栏的
-// 收起则由栏自己的「收起」按钮负责。两条路径都必须可逆：
-//  - 面板：状态栏图标开，面板页眉的「关闭」关；
-//  - 子 agent 栏：栏内「收起」关，栏收起后由**面板页眉**的「展开子 agent 栏」开
-//    （回归背景：入口曾只在被它关掉的那块 UI 里，收起后开关随面板一起消失，
-//    于是再也打不开——状态栏图标改管面板后，这条退路必须显式补上）。
-describe("App 会话详情面板与子 agent 栏的开合", () => {
-  it("状态栏图标开合详情面板，页眉可关闭", async () => {
+// 状态栏图标管的是**右侧会话详情栏**（子 agent + Git Diff）的开合。它是与左侧
+// 会话侧栏同级的独立列，取代了此前的「底部详情面板 + 独立子 agent 栏」两处：
+//  - 栏：状态栏图标开，栏页眉的「关闭」关——两条路都作用于同一个 `panelOpen`；
+//  - 子 agent 的卡片列表与轨迹详情都收在该栏的「子 agent」Tab 内（点卡片下钻、
+//    「返回子 agent 列表」退回），不再有单独的「收起子 agent」按钮。
+describe("App 会话详情栏的开合", () => {
+  it("状态栏图标开合详情栏，栏页眉可关闭", async () => {
     render(<App />);
     await screen.findByLabelText("会话详情面板");
 
-    // 面板初始不渲染：没有会话详情的 section。
+    // 栏初始不渲染：没有会话详情的 aside。
     expect(screen.queryByLabelText("会话详情")).toBeNull();
 
     const toggle = await screen.findByLabelText("会话详情面板");
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     fireEvent.click(toggle);
     expect(await screen.findByLabelText("会话详情")).toBeTruthy();
-    expect(screen.getByRole("tab", { name: "轨迹" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "子 agent" })).toBeTruthy();
     expect(screen.getByRole("tab", { name: "Git Diff" })).toBeTruthy();
     expect(screen.getByLabelText("会话详情面板").getAttribute("aria-expanded")).toBe("true");
 
@@ -2333,18 +2332,16 @@ describe("App 会话详情面板与子 agent 栏的开合", () => {
     expect(screen.queryByLabelText("会话详情")).toBeNull();
   });
 
-  it("子 agent 栏收起后，仍能从面板页眉把它重新展开", async () => {
+  it("栏宽度可拖拽调整", async () => {
     render(<App />);
-    // 首个会话（t1）自动选中后，子 agent 栏随之出现。
-    fireEvent.click(await screen.findByLabelText("收起子 agent"));
-    expect(screen.queryByLabelText("子 agent")).toBeNull();
-    expect(screen.queryByLabelText("收起子 agent")).toBeNull();
-
-    // 栏没了，但退路还在：打开面板 → 页眉给出「展开子 agent 栏」。
-    fireEvent.click(screen.getByLabelText("会话详情面板"));
-    fireEvent.click(await screen.findByRole("button", { name: "展开子 agent 栏" }));
-    expect(await screen.findByLabelText("子 agent")).toBeTruthy();
-    expect(screen.getByLabelText("收起子 agent")).toBeTruthy();
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    const section = (await screen.findByLabelText("会话详情")) as HTMLElement;
+    const before = section.style.width;
+    const handle = screen.getByRole("separator", { name: "调整会话详情栏宽度" });
+    fireEvent.mouseDown(handle, { clientX: 800 });
+    fireEvent.mouseMove(document, { clientX: 740 });
+    fireEvent.mouseUp(document);
+    expect(section.style.width).not.toBe(before);
   });
 
   it("手机端不渲染场景入口（那里栏与面板都是抽屉）", async () => {
@@ -2389,18 +2386,9 @@ describe("App 会话详情面板与子 agent 栏的开合", () => {
     expect(await screen.findByText("看这里")).toBeTruthy();
   });
 
-  it("点子 agent 卡片回到轨迹 Tab 并打开面板", async () => {
+  it("点子 agent 卡片在栏内下钻到轨迹，可返回列表", async () => {
     state.dataSources["agent/children/list"] = () => ({
       children: [{ taskId: "task-1", objective: "整理日志", state: "running", lastStep: "读文件" }],
-    });
-    state.dataSources["thread/diff/read"] = () => ({
-      base: null,
-      baseKind: "none",
-      mergeBase: null,
-      commits: [],
-      files: [],
-      unifiedDiff: "",
-      truncated: false,
     });
     state.dataSources["agent/trace/read"] = () => ({
       rows: [
@@ -2414,18 +2402,26 @@ describe("App 会话详情面板与子 agent 栏的开合", () => {
       highWaterId: 1,
     });
     render(<App />);
-    // 面板先停在 Git Diff，再点卡片：必须被拨回「轨迹」，否则下钻总是落空。
+    // 卡片列表在「子 agent」Tab 内：打开栏即可见，点它下钻到轨迹。
     fireEvent.click(await screen.findByLabelText("会话详情面板"));
-    fireEvent.click(await screen.findByRole("tab", { name: "Git Diff" }));
     fireEvent.click(await screen.findByRole("button", { name: "查看子 agent task-1" }));
 
-    expect(await screen.findByRole("tab", { name: "轨迹" })).toBeTruthy();
-    expect(screen.getByRole("tab", { name: "轨迹" }).getAttribute("aria-selected")).toBe("true");
-    expect(await screen.findByText("task-1")).toBeTruthy();
+    expect(await screen.findByText(/最近步骤/)).toBeTruthy();
     expect(clients[0].requests).toContainEqual({
       method: "agent/trace/read",
       params: { threadId: "t1", taskId: "task-1" },
     });
+
+    // 返回列表：卡片重新出现，且该任务的流已停（换/退任务都要 unwatch）。
+    fireEvent.click(screen.getByRole("button", { name: /返回子 agent 列表/ }));
+    expect(await screen.findByRole("button", { name: "查看子 agent task-1" })).toBeTruthy();
+    expect(screen.queryByText(/最近步骤/)).toBeNull();
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "agent/trace/unwatch",
+        params: { threadId: "t1" },
+      }),
+    );
   });
 
   it("threadId 为 null 的 focus 落在当前会话上", async () => {

@@ -2,6 +2,7 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import { render, fireEvent, cleanup, screen } from "@testing-library/react";
 import { ThreadDetailPanel } from "./ThreadDetailPanel";
+import { PANEL_WIDTH_STORAGE_KEY, DEFAULT_PANEL_WIDTH } from "../lib/panelWidth";
 
 afterEach(cleanup);
 
@@ -29,103 +30,87 @@ const diffProps = {
   note: null,
 };
 
+const baseProps = {
+  onTabChange: () => {},
+  onClose: () => {},
+  railRows: [],
+  selectedTaskId: null,
+  onOpenTask: () => {},
+  onLeaveTask: () => {},
+  traceProps: null,
+  diffProps,
+  isMobile: false,
+};
+
 describe("ThreadDetailPanel", () => {
   it("renders both tabs and switches on click", () => {
     const onTabChange = vi.fn();
-    render(
-      <ThreadDetailPanel
-        tab="trace"
-        onTabChange={onTabChange}
-        onClose={() => {}}
-        traceProps={traceProps}
-        diffProps={diffProps}
-        railCollapsed={false}
-        onExpandRail={() => {}}
-      />,
-    );
-    expect(screen.getByRole("tab", { name: "轨迹" })).toBeTruthy();
+    render(<ThreadDetailPanel {...baseProps} tab="subagents" onTabChange={onTabChange} />);
+    expect(screen.getByRole("tab", { name: "子 agent" })).toBeTruthy();
     fireEvent.click(screen.getByRole("tab", { name: "Git Diff" }));
     expect(onTabChange).toHaveBeenCalledWith("diff");
   });
 
-  it("shows an empty trace state when no subagent is selected", () => {
+  it("shows the child list on the subagents tab and opens a card", () => {
+    const onOpenTask = vi.fn();
+    const rows = [
+      { taskId: "task-7", objective: "整理日志", state: "running", lastStep: "读文件", finished: false, parentTaskId: null },
+    ];
+    render(<ThreadDetailPanel {...baseProps} tab="subagents" railRows={rows} onOpenTask={onOpenTask} />);
+    fireEvent.click(screen.getByRole("button", { name: /查看子 agent task-7/ }));
+    expect(onOpenTask).toHaveBeenCalledWith("task-7");
+  });
+
+  it("shows the trace with a way back to the list when a task is selected", () => {
+    const onLeaveTask = vi.fn();
     render(
       <ThreadDetailPanel
-        tab="trace"
-        onTabChange={() => {}}
-        onClose={() => {}}
-        traceProps={null}
-        diffProps={diffProps}
-        railCollapsed={false}
-        onExpandRail={() => {}}
+        {...baseProps}
+        tab="subagents"
+        selectedTaskId="t1"
+        traceProps={traceProps}
+        onLeaveTask={onLeaveTask}
       />,
     );
-    expect(screen.getByText(/未选择子 agent/)).toBeTruthy();
+    // 轨迹主体的摘要态在，且不显示卡片列表。
+    expect(screen.getByText(/最近步骤/)).toBeTruthy();
+    expect(screen.queryByText("暂无子 agent")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /返回子 agent 列表/ }));
+    expect(onLeaveTask).toHaveBeenCalled();
   });
 
   it("shows the diff body on the diff tab", () => {
     render(
-      <ThreadDetailPanel
-        tab="diff"
-        onTabChange={() => {}}
-        onClose={() => {}}
-        traceProps={null}
-        diffProps={{ ...diffProps, error: "boom" }}
-        railCollapsed={false}
-        onExpandRail={() => {}}
-      />,
+      <ThreadDetailPanel {...baseProps} tab="diff" diffProps={{ ...diffProps, error: "boom" }} />,
     );
     expect(screen.getByText("boom")).toBeTruthy();
   });
 
   it("closes through the panel header", () => {
     const onClose = vi.fn();
-    render(
-      <ThreadDetailPanel
-        tab="trace"
-        onTabChange={() => {}}
-        onClose={onClose}
-        traceProps={null}
-        diffProps={diffProps}
-        railCollapsed={false}
-        onExpandRail={() => {}}
-      />,
-    );
+    render(<ThreadDetailPanel {...baseProps} tab="subagents" onClose={onClose} />);
     fireEvent.click(screen.getByRole("button", { name: "关闭详情" }));
     expect(onClose).toHaveBeenCalled();
   });
 
-  // 状态栏那颗图标改管面板开合后，子 agent 栏的「收起」本是单向操作：栏收起后
-  // 就再没有控件能把它放回来。面板给出一条退路——只在栏确实收起时出现。
-  it("keeps the collapsed rail reversible from its own header", () => {
-    const onExpandRail = vi.fn();
-    const { rerender } = render(
-      <ThreadDetailPanel
-        tab="trace"
-        onTabChange={() => {}}
-        onClose={() => {}}
-        traceProps={null}
-        diffProps={diffProps}
-        railCollapsed={true}
-        onExpandRail={onExpandRail}
-      />,
-    );
-    const reopen = screen.getByRole("button", { name: "展开子 agent 栏" });
-    fireEvent.click(reopen);
-    expect(onExpandRail).toHaveBeenCalled();
+  // 右栏宽度可拖拽：手柄在左缘，往左拖变宽。桌面端才有手柄。
+  it("resizes by dragging the left-edge handle and persists the width", () => {
+    localStorage.removeItem(PANEL_WIDTH_STORAGE_KEY);
+    const { container } = render(<ThreadDetailPanel {...baseProps} tab="subagents" />);
+    const section = container.querySelector('[aria-label="会话详情"]') as HTMLElement;
+    expect(section.style.width).toBe(`${DEFAULT_PANEL_WIDTH}px`);
 
-    // 栏已展开时不再重复提供这个控件，免得和栏自身的「收起」打架。
-    rerender(
-      <ThreadDetailPanel
-        tab="trace"
-        onTabChange={() => {}}
-        onClose={() => {}}
-        traceProps={null}
-        diffProps={diffProps}
-        railCollapsed={false}
-        onExpandRail={onExpandRail}
-      />,
-    );
-    expect(screen.queryByRole("button", { name: "展开子 agent 栏" })).toBeNull();
+    const handle = screen.getByRole("separator", { name: "调整会话详情栏宽度" });
+    fireEvent.mouseDown(handle, { clientX: 500 });
+    fireEvent.mouseMove(document, { clientX: 440 }); // 往左 60px → 变宽 60px
+    fireEvent.mouseUp(document);
+
+    expect(section.style.width).toBe(`${DEFAULT_PANEL_WIDTH + 60}px`);
+    expect(localStorage.getItem(PANEL_WIDTH_STORAGE_KEY)).toBe(String(DEFAULT_PANEL_WIDTH + 60));
+  });
+
+  it("omits the resize handle on mobile", () => {
+    render(<ThreadDetailPanel {...baseProps} tab="subagents" isMobile />);
+    expect(screen.queryByRole("separator", { name: "调整会话详情栏宽度" })).toBeNull();
   });
 });
