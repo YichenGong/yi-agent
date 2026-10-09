@@ -173,11 +173,18 @@ vi.mock("./lib/rpc", () => ({
       if (method === "workspace/list") return { workspaces: [] };
       if (method === "thread/resume") {
         const { threadId } = params as { threadId: string };
-        return { thread_id: threadId, cwd: "/w", model: "m" };
+        const seeds = state.threads ?? [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
+        // 服务端现在的 resume 响应直接带权威 permission_mode（修复的一部分）。
+        return {
+          thread_id: threadId,
+          cwd: "/w",
+          model: "m",
+          permission_mode: seeds.find((t) => t.thread_id === threadId)?.permission_mode,
+        };
       }
       if (method === "thread/start") {
         const id = `new-${this.requests.length}`;
-        return { thread_id: id, cwd: "/w", model: "m" };
+        return { thread_id: id, cwd: "/w", model: "m", permission_mode: "normal" };
       }
       if (method === "ui/settings/read") return { theme: "dark", board_watchman_enabled: true };
       if (method === "ui/settings/write") return { ok: true };
@@ -375,9 +382,9 @@ describe("App YOLO wiring", () => {
     expect(chip.textContent).not.toContain("YOLO");
   });
 
-  it("stays unknown (not Normal) when the post-resume listAll lookup fails", async () => {
-    // Server-side thread is YOLO, but only the mount-time listing succeeds; the
-    // follow-up lookup that resumes triggers fails.
+  it("takes the mode from the resume response even when the post-resume listAll lookup fails", async () => {
+    // Server-side thread is YOLO; only the mount-time listing succeeds, the
+    // follow-up lookup that the resume triggers fails.
     state.mode = "yolo";
     state.failListAfter = 1;
     render(<App />);
@@ -389,11 +396,24 @@ describe("App YOLO wiring", () => {
       ).toBeGreaterThanOrEqual(2),
     );
 
-    // Must not lie "Normal" — the mode is simply unknown.
-    const chip = modeTrigger() as HTMLButtonElement;
-    expect(chip.disabled).toBe(true);
-    expect(chip.textContent).not.toContain("Normal");
-    expect(chip.textContent).not.toContain("YOLO");
+    // The mode is no longer hostage to the listing: the resume *response* is
+    // authoritative, so the chip still shows YOLO. (Before the fix this test
+    // asserted "unknown" — the very flakiness being fixed.)
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+  });
+
+  it("synchronizes the chip when another client changes the mode (broadcast)", async () => {
+    render(<App />);
+    await waitFor(() => expect(modeTrigger().textContent).toContain("Normal"));
+
+    // Another client (e.g. the desktop) switched this thread to YOLO; the
+    // server broadcasts `thread/permissionModeChanged`.
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({ method: "thread/permissionModeChanged", params: { thread_id: "t1", mode: "yolo" } });
+    });
+
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
   });
 });
 
