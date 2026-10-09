@@ -22,37 +22,42 @@
 - commit message 用 conventional commits，**不写** `Co-Authored-By` 行。
 - 改完同步更新 `docs/project-management/desktop.md`（项目规范要求，见 `CLAUDE.md`）。
 
-## 目标 DOM 结构（两步走）
+## 目标 DOM 结构
 
 ```
 外层 .relative.border-t.border-line.bg-panel.p-3   ← 不动（钉底 + SlashPopup 定位上下文）
   ├─ SlashPopup（showPopup 时，绝对定位，不动）
-  └─ 卡片 [data-testid=composer-card] .relative.rounded-lg.border.border-line-strong.bg-surface.focus-within:border-fg-subtle  ← Task 1 加
-       ├─ [data-testid="attachment-chips"]（名字非空时，移入卡内）                                  ← Task 1 移
-       └─ 行 .flex.items-end.gap-2.max-md:flex-col.max-md:items-stretch                             ← Task 1 加
-            ├─ textarea（flex-1，无自身边框/底色）                                                  ← Task 1 改
+  └─ 卡片 [data-testid=composer-card] .rounded-lg.border.border-line-strong.bg-surface.transition-colors.focus-within:border-fg-subtle
+       ├─ [data-testid="attachment-chips"]（附件非空时，卡内顶部）
+       └─ 行 .flex.items-end.gap-2.max-md:flex-col.max-md:items-stretch
+            ├─ textarea（flex-1，无自身边框/底色，无 focus:border-*）
             └─ 工具栏 [data-composer-toolbar] .flex.items-center.justify-between.gap-2.px-3.pb-2
-                 │  .max-md:flex-wrap.max-md:justify-end                                            ← Task 2 加
-                 ├─ 「附加文件」按钮（文档流中第一个控件）                                          ← Task 1 移入
+                 │  .max-md:flex-wrap.max-md:justify-end
+                 ├─ 「附加文件」按钮（文档流中第一个控件）
                  └─ 右组 .flex.items-center.gap-2
                       ├─ ModeChip
                       ├─ modelPicker
                       └─ Send/Stop
 ```
 
-两步走是为了让修改后的既有测试**每一步都跑得过**：Task 1 保留 textarea 的聚焦类（让 `MessageInput.test.tsx:152-169` 继续通过），Task 2 才把聚焦契约迁到卡片上。
+**边框与聚焦契约是一个整体，必须同一个任务完成。** 「卡片带边框」与「textarea 不带边框」
+是同一件事的两面：既有焦点用例 `MessageInput.test.tsx` 的
+`expect(baseBorder).toBe("border-line-strong")` 读的正是 **textarea** 的类名，所以
+「把边框搬到卡片上」必须**同时**把这条既有用例改成读卡片——拆成两个任务会让其中一个
+必然跑红（该用例与 `expect(textarea.className).not.toContain("border-line-strong")`
+读同一元素的同一条类名，互斥）。
 
 ---
 
-### Task 1: 卡片外壳（边框、无边框 textarea、chip 入卡）
+### Task 1: 输入卡片（边框、无边框 textarea、chip 入卡、聚焦契约迁到卡片）
 
 **Files:**
-- Modify: `desktop/src/components/MessageInput.tsx:116-250`
-- Test: `desktop/src/components/MessageInput.test.tsx`（改 `renderInput` 辅助函数；新增用例；改 `:171-188`）
+- Modify: `desktop/src/components/MessageInput.tsx:116-251`
+- Test: `desktop/src/components/MessageInput.test.tsx`（改 `renderInput` 辅助函数；重写既有聚焦用例；重写移动端用例；新增 3 个用例）
 
 **Interfaces:**
 - Consumes: 无（纯组件内部结构改动）。
-- Produces: 卡片元素（textarea 的祖父）类名含 `border-line-strong` + `bg-surface` + `focus-within:border-fg-subtle`；textarea 类名含 `max-md:w-full` + `max-md:flex-none`；工具栏类名含 `max-md:flex-wrap` + `max-md:justify-end`。Task 2 依赖这些类名。
+- Produces: 卡片元素（`data-testid="composer-card"`）类名含 `border-line-strong` + `bg-surface` + `focus-within:border-fg-subtle`；textarea 类名含 `max-md:w-full` + `max-md:flex-none` 且**不含** `border-line-strong` / `focus:border-*`；工具栏（`data-composer-toolbar`）类名含 `max-md:flex-wrap` + `max-md:justify-end`。Task 3 的进度文档引用这些契约。
 
 - [ ] **Step 0: 让测试辅助函数能传 `modelPicker`**
 
@@ -100,11 +105,40 @@ function renderInput(
 }
 ```
 
-并在文件顶部把 `import type { ComponentProps } from "react";` 改为 `import type { ComponentProps, ReactNode } from "react";`。
+并在文件顶部把 `import type { ComponentProps } from "react";` 改为
+`import type { ComponentProps, ReactNode } from "react";`。
 
-- [ ] **Step 1: 写失败的测试（新增结构用例 + 更新移动端用例）**
+- [ ] **Step 1: 写失败的测试（重写既有聚焦用例 + 重写移动端用例 + 新增 3 个用例）**
 
-在 `desktop/src/components/MessageInput.test.tsx` 的 `describe("MessageInput", ...)` 内、`it("stacks the composer at the phone breakpoint ...")` 之前，插入：
+**（a）重写既有聚焦用例。** 把 `it("gives the composer a visible, theme-aware focus affordance", ...)`
+（当前 `:152-169`）整段替换为：
+
+```tsx
+  it("gives the composer a visible, theme-aware focus affordance", () => {
+    renderInput();
+    const textarea = screen.getByRole("textbox");
+    const card = screen.getByTestId("composer-card");
+    // jsdom 不编译 Tailwind，没有可断言的 CSS，因此这里只断类名契约：
+    // 焦点指示落在**卡片**上（`focus-within` 让卡内任意控件获得焦点时整卡高亮，
+    // 包括底部工具栏的按钮），基色 token 与焦点色 token 必须不同。
+    const classes = card.className.split(/\s+/);
+    const baseBorder = classes.find((c) =>
+      /^border-(line|line-strong|fg|fg-muted|fg-subtle|fg-faint|surface|panel|raised)$/.test(c),
+    );
+    const focusBorder = classes.find((c) => c === "focus-within:border-fg-subtle");
+    expect(baseBorder).toBe("border-line-strong");
+    expect(focusBorder).toBe("focus-within:border-fg-subtle");
+    // 焦点态等于基色就等于没有焦点指示。
+    expect(focusBorder).not.toBe(`focus-within:${baseBorder}`);
+    // 不写字面色阶，否则两套主题里必有一有一观感错。
+    expect(card.className).not.toMatch(/focus-within:border-neutral-/);
+    // 边框只有一处：textarea 不该再自画一个边框，否则卡内会出现"框里套框"。
+    expect(textarea.className).not.toMatch(/(^|\s)focus:border-/);
+  });
+```
+
+**（b）在 `describe("MessageInput", ...)` 内、`it("stacks the composer at the phone breakpoint ...")`
+之前，插入 3 个新用例：**
 
 ```tsx
   it("draws one card around the composer, with a borderless textarea", () => {
@@ -132,7 +166,7 @@ function renderInput(
 
   it("moves the model picker into the toolbar row inside the card", () => {
     renderInput({ modelPicker: <span data-testid="picker">picker</span> });
-    const row = screen.getByRole("textbox").nextElementSibling as HTMLElement;
+    const row = screen.getByRole("textbox").parentElement as HTMLElement;
     const toolbar = row.querySelector('[data-composer-toolbar]') as HTMLElement;
     expect(toolbar.contains(screen.getByTestId("picker"))).toBe(true);
     // 主操作（Send/Stop）和模型选择器同处一行。
@@ -140,7 +174,7 @@ function renderInput(
   });
 ```
 
-把既有 `it("stacks the composer at the phone breakpoint ...")`（`:171-188`）的正文替换为：
+**（c）把既有 `it("stacks the composer at the phone breakpoint ...")`（`:171-188`）的正文替换为：**
 
 ```tsx
   it("stacks the composer at the phone breakpoint so the input keeps its width", () => {
@@ -164,9 +198,9 @@ function renderInput(
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/components/MessageInput.test.tsx`
-Expected: 新增的 3 个用例 FAIL（`card.className` 取到的是当前外层 `border-t border-line bg-panel p-3`，不含 `rounded-lg` / `focus-within:border-fg-subtle`；`toolbar.contains(picker)` 为 false）。
+Expected: FAIL。`getByTestId("composer-card")` / `[data-composer-toolbar]` 都还不存在，至少这几个用例会报「找不到元素」；重写后的聚焦用例也会因找不到卡片而失败。
 
-- [ ] **Step 3: 改实现（引入卡片，textarea 去边框，工具栏收纳，保留 textarea 聚焦类）**
+- [ ] **Step 3: 改实现（引入卡片，textarea 去边框去聚焦类，工具栏收纳）**
 
 用下面整块替换 `MessageInput.tsx` 的 `return (...)`（当前 `:116-251`）：
 
@@ -177,7 +211,7 @@ Expected: 新增的 3 个用例 FAIL（`card.className` 取到的是当前外层
       {/*
        * 输入卡片：整卡承载边框、圆角与底色，聚焦（textarea 或卡内任意控件）时整卡高亮。
        * 边框从 textarea 搬到卡片上——这样"输入的地方"是一个整体，而不是一块输入框加
-       * 一列散在框外的控件。
+       * 一列散在框外的控件。**边框与 textarea 的聚焦类必须一起搬**：两者是同一契约的两面。
        */}
       <div
         className="rounded-lg border border-line-strong bg-surface transition-colors focus-within:border-fg-subtle"
@@ -278,12 +312,8 @@ Expected: 新增的 3 个用例 FAIL（`card.className` 取到的是当前外层
             disabled={disabled || sending || turnActive}
             rows={3}
             placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-            /*
-             * 排序敏感：Task 2 的聚焦契约依赖这里仍带 `focus:border-fg-subtle`（本步骤
-             * 保留它，好让既有的聚焦用例继续通过）。`border`/`bg-transparent` 让 textarea
-             * 退化成卡内无边框文本区。
-             */
-            className="min-w-0 flex-1 resize-none border border-transparent bg-transparent px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50 max-md:w-full max-md:flex-none"
+            // 无边框、透明底的文本区：边框与聚焦指示都归卡片（见上）。
+            className="min-w-0 flex-1 resize-none bg-transparent px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50 max-md:w-full max-md:flex-none"
           />
           <div
             data-composer-toolbar
@@ -326,90 +356,12 @@ Expected: 新增的 3 个用例 FAIL（`card.className` 取到的是当前外层
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx tsc --noEmit && npx vitest run src/components/MessageInput.test.tsx`
-Expected: 全部 PASS（含既有的聚焦用例 `:152-169`——它读的仍是 textarea 的类名，本步骤保留了 `focus:border-fg-subtle`）。
+Expected: 全部 PASS（含重写后的聚焦用例——它现在读**卡片**的类名）。
 
 - [ ] **Step 5: 跑整个前端测试套**
 
 Run: `cd desktop && npx vitest run`
 Expected: 全部 PASS。特别确认 `src/App.test.tsx`（「附加文件」按钮锚点、附件接线）仍通过。
-
-- [ ] **Step 6: 提交**
-
-```bash
-git add desktop/src/components/MessageInput.tsx desktop/src/components/MessageInput.test.tsx
-git commit -m "feat(desktop): wrap the composer in an input card"
-```
-
----
-
-### Task 2: 聚焦契约迁到卡片上
-
-**Files:**
-- Modify: `desktop/src/components/MessageInput.tsx`（textarea 的 `className` 一行）
-- Test: `desktop/src/components/MessageInput.test.tsx:152-169`（重写聚焦用例）
-
-**Interfaces:**
-- Consumes: Task 1 建的卡片元素（textarea 的祖父）与它的 `focus-within:border-fg-subtle`。
-- Produces: textarea 类名**不再**含 `focus:border-*`；聚焦契约由卡片承担。用户的验收判据「点卡内任意控件整卡高亮」由此达成。
-
-- [ ] **Step 1: 重写聚焦用例（先跑红）**
-
-把 `MessageInput.test.tsx` 的 `it("gives the composer a visible, theme-aware focus affordance", ...)`（当前 `:152-169`）整段替换为：
-
-```tsx
-  it("gives the composer a visible, theme-aware focus affordance", () => {
-    renderInput();
-    const textarea = screen.getByRole("textbox");
-    const card = screen.getByTestId("composer-card");
-    // jsdom 不编译 Tailwind，没有可断言的 CSS，因此这里只断类名契约：
-    // 焦点指示落在**卡片**上（`focus-within` 让卡内任意控件获得焦点时整卡高亮，
-    // 包括底部工具栏的按钮），基色 token 与焦点色 token 必须不同。
-    const classes = card.className.split(/\s+/);
-    const baseBorder = classes.find((c) =>
-      /^border-(line|line-strong|fg|fg-muted|fg-subtle|fg-faint|surface|panel|raised)$/.test(c),
-    );
-    const focusBorder = classes.find((c) => c === "focus-within:border-fg-subtle");
-    expect(baseBorder).toBe("border-line-strong");
-    expect(focusBorder).toBe("focus-within:border-fg-subtle");
-    // 焦点态等于基色就等于没有焦点指示（本断言先跑红）。
-    expect(focusBorder).not.toBe(`focus-within:${baseBorder}`);
-    // 不写字面色阶，否则两套主题里必有一有一观感错。
-    expect(card.className).not.toMatch(/focus-within:border-neutral-/);
-    // 边框只有一处：textarea 不该再自画一个边框，否则卡内会出现"框里套框"。
-    expect(textarea.className).not.toMatch(/(^|\s)focus:border-/);
-  });
-```
-
-- [ ] **Step 2: 跑测试确认失败**
-
-Run: `cd desktop && npx vitest run src/components/MessageInput.test.tsx -t "focus affordance"`
-Expected: FAIL —— textarea 的类名仍含 `focus:border-fg-subtle`（Task 1 为了通过旧用例保留了它），最后一条断言先跑红。
-
-- [ ] **Step 3: 改实现（去掉 textarea 的自身边框与聚焦类）**
-
-把 textarea 的 `className` 从：
-
-```
-"min-w-0 flex-1 resize-none border border-transparent bg-transparent px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50 max-md:w-full max-md:flex-none"
-```
-
-改为：
-
-```
-"min-w-0 flex-1 resize-none bg-transparent px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50 max-md:w-full max-md:flex-none"
-```
-
-同时删掉 Task 1 在 `className` 上方留下的那段"排序敏感"注释（它已经过期，聚焦契约现在归卡片）。
-
-- [ ] **Step 4: 跑测试确认通过**
-
-Run: `cd desktop && npx tsc --noEmit && npx vitest run src/components/MessageInput.test.tsx`
-Expected: 全部 PASS。
-
-- [ ] **Step 5: 跑整个前端测试套**
-
-Run: `cd desktop && npx vitest run`
-Expected: 全部 PASS。
 
 - [ ] **Step 6: 手动视觉验收（开发服务器）**
 
@@ -421,18 +373,18 @@ Expected: 全部符合。
 
 ```bash
 git add desktop/src/components/MessageInput.tsx desktop/src/components/MessageInput.test.tsx
-git commit -m "refactor(desktop): let the input card own the focus ring"
+git commit -m "feat(desktop): wrap the composer in an input card"
 ```
 
 ---
 
-### Task 3: 更新项目进度文档
+### Task 2: 更新项目进度文档
 
 **Files:**
 - Modify: `docs/project-management/desktop.md`
 
 **Interfaces:**
-- Consumes: Task 1/2 的最终代码与测试结果。
+- Consumes: Task 1 的最终代码与测试结果。
 - Produces: 无（文档）。
 
 - [ ] **Step 1: 更新「聊天 UI」那条判据的行号**
@@ -460,7 +412,7 @@ git commit -m "docs: record the composer input-card rework"
 
 ---
 
-### Task 4: 合并回 main
+### Task 3: 合并回 main
 
 **Files:** 无（git 操作）。
 
