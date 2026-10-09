@@ -116,107 +116,119 @@ export function MessageInput({
   return (
     <div className="relative border-t border-line bg-panel p-3">
       {showPopup && <SlashPopup commands={options} selected={selected} />}
-      <AttachmentChips attachments={attachments} onRemove={onRemoveAttachment} />
       {/*
-       * Phone breakpoint: the desktop row is 输入框 + 一列右对齐控件（附附加文件 /
-       * Mode / 模型 / Send）。在 393pt 宽的 iPhone 上，那一列相互竞争的控件把输入框
-       * 挤到只剩几十像素宽（真机实测 55pt，桌面是 334pt）。`max-md` 让手机改成纵向：
-       * 输入框独占整行 100%，控件行落到它下面。桌面（>768px，含可缩到 720px 的窗口）
-       * 不匹配该变体，逐像素不变。
+       * 输入卡片：整卡承载边框、圆角与底色，聚焦（textarea 或卡内任意控件）时整卡高亮。
+       * 边框从 textarea 搬到卡片上——这样"输入的地方"是一个整体，而不是一块输入框加
+       * 一列散在框外的控件。
        */}
-      <div className="flex items-end gap-2 max-md:flex-col max-md:items-stretch">
-        <textarea
-          ref={inputRef}
-          value={text}
-          onChange={(e) => {
-            const next = e.target.value;
-            onDraftChange(next);
-            // Re-arm the popup whenever the text still looks like a command name.
-            setPopupOpen(/^\/[^\s/]*$/.test(next.trim()));
-          }}
-          onCompositionStart={ime.onCompositionStart}
-          onCompositionEnd={ime.onCompositionEnd}
-          onBlur={ime.resetComposition}
-          onKeyDown={(e) => {
-            if (isImeEnter(e, ime.composing.current)) return;
-            if (showPopup && options.length > 0) {
-              if (e.key === "ArrowDown") {
-                e.preventDefault();
-                setSelected((i) => (i + 1) % options.length);
-                return;
+      <div
+        className="rounded-lg border border-line-strong bg-surface transition-colors focus-within:border-fg-subtle"
+        data-testid="composer-card"
+      >
+        <AttachmentChips attachments={attachments} onRemove={onRemoveAttachment} />
+        {/*
+         * 卡片内**恒为竖排**：textarea 在上，工具栏是它下面满宽的一行。
+         * 不能用 `flex items-end gap-2`（旧布局的两列并排）——那样工具栏只占自身内容宽，
+         * `justify-between` 便无空间可分配，「附加文件」会被挤到右端（实测：并排时距卡
+         * 左缘 924px，竖排时 13px）。jsdom 断的是类名而非几何，故这条靠结构契约守住。
+         */}
+        <div className="flex flex-col">
+          <textarea
+            ref={inputRef}
+            value={text}
+            onChange={(e) => {
+              const next = e.target.value;
+              onDraftChange(next);
+              // Re-arm the popup whenever the text still looks like a command name.
+              setPopupOpen(/^\/[^\s/]*$/.test(next.trim()));
+            }}
+            onCompositionStart={ime.onCompositionStart}
+            onCompositionEnd={ime.onCompositionEnd}
+            onBlur={ime.resetComposition}
+            onKeyDown={(e) => {
+              if (isImeEnter(e, ime.composing.current)) return;
+              if (showPopup && options.length > 0) {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setSelected((i) => (i + 1) % options.length);
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setSelected((i) => (i - 1 + options.length) % options.length);
+                  return;
+                }
+                if (e.key === "Tab") {
+                  e.preventDefault();
+                  const picked = options[Math.min(selected, options.length - 1)];
+                  onDraftChange(`/${picked.name} `);
+                  setPopupOpen(false);
+                  inputRef.current?.focus();
+                  return;
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setPopupOpen(false);
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  // A bare "/" names no command (`parseSlashInput("/")` is
+                  // `{ kind: "none" }`), yet the popup is offered for it and its
+                  // DEFAULT highlight is index 0 — the destructive `/clear`. A stray
+                  // Enter on that untouched default would erase the transcript, so it
+                  // is inert until the user either types a name character (kind turns
+                  // "command", as for "/cos") or moves the highlight with ↑/↓ (an
+                  // explicit choice, which the line below honours). Tab still
+                  // completes.
+                  if (parsed.kind !== "command" && selected === 0) return;
+                  // A space closes the popup (name-mode only), so no arguments can
+                  // be pending here: accepting the highlighted row is exactly what
+                  // "complete and run" means (`/cos` -> `/cost`). Fully typed
+                  // commands — arguments and unknowns included — reach the
+                  // no-popup branch below with `parsed` intact.
+                  const picked = options[Math.min(selected, options.length - 1)];
+                  runSlash(picked.name, null);
+                  return;
+                }
+                return; // 弹窗开启时吞掉其余按键,不作文本处理
               }
-              if (e.key === "ArrowUp") {
-                e.preventDefault();
-                setSelected((i) => (i - 1 + options.length) % options.length);
-                return;
-              }
-              if (e.key === "Tab") {
-                e.preventDefault();
-                const picked = options[Math.min(selected, options.length - 1)];
-                onDraftChange(`/${picked.name} `);
-                setPopupOpen(false);
-                inputRef.current?.focus();
-                return;
-              }
-              if (e.key === "Escape") {
+              if (e.key === "Escape" && popupOpen) {
                 e.preventDefault();
                 setPopupOpen(false);
                 return;
               }
               if (e.key === "Enter" && !e.shiftKey) {
+                // Confirming a candidate with Enter is the IME's key, not the user's:
+                // let the composition land in the box and wait for the next Enter.
                 e.preventDefault();
-                // A bare "/" names no command (`parseSlashInput("/")` is
-                // `{ kind: "none" }`), yet the popup is offered for it and its
-                // DEFAULT highlight is index 0 — the destructive `/clear`. A stray
-                // Enter on that untouched default would erase the transcript, so it
-                // is inert until the user either types a name character (kind turns
-                // "command", as for "/cos") or moves the highlight with ↑/↓ (an
-                // explicit choice, which the line below honours). Tab still
-                // completes.
-                if (parsed.kind !== "command" && selected === 0) return;
-                // A space closes the popup (name-mode only), so no arguments can
-                // be pending here: accepting the highlighted row is exactly what
-                // "complete and run" means (`/cos` -> `/cost`). Fully typed
-                // commands — arguments and unknowns included — reach the
-                // no-popup branch below with `parsed` intact.
-                const picked = options[Math.min(selected, options.length - 1)];
-                runSlash(picked.name, null);
-                return;
+                if (parsed.kind === "command") {
+                  // This branch is reached when the popup matched nothing: unknown
+                  // commands and matched commands alike belong to the command
+                  // layer, never to the agent (`/nope` reports, it does not send).
+                  runSlash(parsed.name, parsed.args);
+                  return;
+                }
+                if (parsed.kind === "path") {
+                  // Two-slash first token is a path (TUI parity) — falls through.
+                } else if (turnActive) {
+                  onInterrupt();
+                  return;
+                }
+                void handleSend();
               }
-              return; // 弹窗开启时吞掉其余按键,不作文本处理
-            }
-            if (e.key === "Escape" && popupOpen) {
-              e.preventDefault();
-              setPopupOpen(false);
-              return;
-            }
-            if (e.key === "Enter" && !e.shiftKey) {
-              // Confirming a candidate with Enter is the IME's key, not the user's:
-              // let the composition land in the box and wait for the next Enter.
-              e.preventDefault();
-              if (parsed.kind === "command") {
-                // This branch is reached when the popup matched nothing: unknown
-                // commands and matched commands alike belong to the command
-                // layer, never to the agent (`/nope` reports, it does not send).
-                runSlash(parsed.name, parsed.args);
-                return;
-              }
-              if (parsed.kind === "path") {
-                // Two-slash first token is a path (TUI parity) — falls through.
-              } else if (turnActive) {
-                onInterrupt();
-                return;
-              }
-              void handleSend();
-            }
-          }}
-          disabled={disabled || sending || turnActive}
-          rows={3}
-          placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
-          className="flex-1 resize-none rounded-md border border-line-strong bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none disabled:opacity-50 max-md:w-full max-md:flex-none"
-        />
-        <div className="flex flex-col items-end gap-2 max-md:w-full max-md:flex-row max-md:flex-wrap max-md:items-center max-md:justify-end">
-          <div className="flex items-center gap-2">
+            }}
+            disabled={disabled || sending || turnActive}
+            rows={3}
+            placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+            // 无边框、透明底的文本区：边框与聚焦指示都归卡片（见上）。卡片内是竖排，
+            // 故 textarea 直接占满整行；宽度由 `w-full` 决定，不再需要 `flex-1` / `max-md:*`。
+            className="min-w-0 w-full resize-none bg-transparent px-3 pt-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50"
+          />
+          <div
+            data-composer-toolbar
+            className="flex items-center justify-between gap-2 px-3 pb-2 max-md:flex-wrap max-md:justify-end"
+          >
             <button
               type="button"
               // 纯文本标签（仓库不用 emoji）；`aria-label` 与可见文字一致，是测试锚点。
@@ -228,22 +240,22 @@ export function MessageInput({
             >
               附加文件
             </button>
-            <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
-          </div>
-          <div className="flex items-center gap-2">
-            {modelPicker}
-            <button
-              type="button"
-              onClick={turnActive ? onInterrupt : () => void handleSend()}
-              disabled={sendDisabled}
-              className={
-                turnActive
-                  ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
-                  : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50"
-              }
-            >
-              {turnActive ? "Stop" : "Send"}
-            </button>
+            <div className="flex items-center gap-2">
+              <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />
+              {modelPicker}
+              <button
+                type="button"
+                onClick={turnActive ? onInterrupt : () => void handleSend()}
+                disabled={sendDisabled}
+                className={
+                  turnActive
+                    ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
+                    : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                }
+              >
+                {turnActive ? "Stop" : "Send"}
+              </button>
+            </div>
           </div>
         </div>
       </div>
