@@ -3,9 +3,9 @@ use tempfile::TempDir;
 use yi_agent_core::subagent::task::{BudgetKind, TimeoutKind};
 use yi_agent_store::repository::RuntimeRepository;
 use yi_agent_store::schedule::{
-    MissedRunPolicy, OverlapPolicy, RetryDecision, RetryFailure, ScheduleDefinition, SchedulePolicy,
-    SchedulePriority, WatchdogLimits, WatchdogObservation, WatchdogOutcome, WatchdogUsage,
-    evaluate_retry, evaluate_watchdog,
+    MissedRunPolicy, OverlapPolicy, RetryDecision, RetryFailure, ScheduleDefinition,
+    SchedulePolicy, SchedulePriority, WatchdogLimits, WatchdogObservation, WatchdogOutcome,
+    WatchdogUsage, evaluate_retry, evaluate_watchdog,
 };
 
 #[test]
