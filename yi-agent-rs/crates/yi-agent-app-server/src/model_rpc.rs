@@ -11,22 +11,29 @@
 use std::path::Path;
 
 use serde_json::{Value, json};
+use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_runtime::models::{
-    ModelEntry, ModelProvider, load_catalog_from, mask_key, models_path, save_catalog_to,
+    ModelCatalog, ModelEntry, ModelProvider, effective_entry, load_catalog_from, mask_key,
+    models_path, save_catalog_to,
 };
 
 use crate::protocol::RpcError;
 
 /// 生产入口：读写 `~/.yi-agent/models.json`。
-pub fn handle_model_request(method: &str, params: &Value) -> Result<Value, RpcError> {
-    handle_model_request_at(&models_path(), method, params)
+pub fn handle_model_request(
+    method: &str,
+    params: &Value,
+    fallback: &RuntimeConfig,
+) -> Result<Value, RpcError> {
+    handle_model_request_at(&models_path(), method, params, fallback)
 }
 
-/// 可测核心：清单文件路径由调用方注入（测试用 `TempDir`，生产用 `models_path()`）。
+/// 可测核心：清单文件路径与兜底 cfg 均由调用方注入。
 pub fn handle_model_request_at(
     path: &Path,
     method: &str,
     params: &Value,
+    fallback: &RuntimeConfig,
 ) -> Result<Value, RpcError> {
     match method {
         "model/list" => {
@@ -35,6 +42,7 @@ pub fn handle_model_request_at(
                 "models": catalog.models.iter().map(entry_view).collect::<Vec<_>>(),
                 "default_model": catalog.default_model,
                 "subagent_model": catalog.subagent_model,
+                "effective": effective_view(&catalog, fallback),
             }))
         }
         "model/upsert" => upsert(path, params),
@@ -42,6 +50,31 @@ pub fn handle_model_request_at(
         "model/setDefault" => set_reference(path, params, Reference::Default),
         "model/setSubagent" => set_reference(path, params, Reference::Subagent),
         _ => Err(RpcError::method_not_found(method)),
+    }
+}
+
+/// 当前默认实际解析到哪里：命中清单条目就用条目，否则回退 cfg（`.env`）。
+/// key 一律只出掩码——与 [`entry_view`] 同一条安全约定。
+fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
+    match effective_entry(catalog, None) {
+        Some(entry) => json!({
+            "source": "catalog",
+            "model_ref": entry.name,
+            "provider": entry.provider.as_str(),
+            "api_url": entry.api_url,
+            "model": entry.model,
+            "has_key": !entry.api_key.is_empty(),
+            "api_key_masked": mask_key(&entry.api_key),
+        }),
+        None => json!({
+            "source": "env",
+            "model_ref": Value::Null,
+            "provider": cfg.provider,
+            "api_url": cfg.api_url,
+            "model": cfg.model,
+            "has_key": !cfg.api_key.is_empty(),
+            "api_key_masked": mask_key(&cfg.api_key),
+        }),
     }
 }
 
@@ -184,6 +217,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::PathBuf;
+    use yi_agent_runtime::config::RuntimeConfig;
+    use yi_agent_runtime::models::ModelCatalog;
 
     /// 每条用例独占一份清单文件。路径注入而非改 `HOME`：并行测试下 `HOME` 是
     /// 进程全局量，改了会互相踩。
@@ -193,8 +228,36 @@ mod tests {
         (dir, path)
     }
 
+    /// 兜底层 cfg：全部字段可辨，便于断言「生效值来自 cfg」。
+    ///
+    /// `RuntimeConfig` **未实现** `Default`，必须显式构造全部字段（字段表见
+    /// `yi-agent-runtime/src/config.rs:17-40`）。用 `#[cfg(test)]` 的
+    /// `yi_agent_runtime::config::sample_config()` 不可行——它是 runtime crate 的
+    /// `pub(crate)`，跨 crate 用不了。
+    fn fallback_cfg() -> RuntimeConfig {
+        RuntimeConfig {
+            provider: "openai".to_string(),
+            api_url: "https://env.example".to_string(),
+            api_key: "env-secret-9999".to_string(),
+            model: "env-model".to_string(),
+            max_turns: 20,
+            max_resident_subagents: 8,
+            workdir: std::path::PathBuf::from("/tmp/import-env-test"),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: false,
+        }
+    }
+
     fn call(path: &Path, method: &str, params: Value) -> Result<Value, RpcError> {
-        handle_model_request_at(path, method, &params)
+        handle_model_request_at(path, method, &params, &fallback_cfg())
     }
 
     /// 常用 upsert 载荷，省略 `api_key`（= 保留）。
@@ -376,7 +439,58 @@ mod tests {
         call(&path, "model/upsert", entry_json("A")).unwrap();
         assert!(path.exists(), "upsert must land the file");
         // A second, independent read through the public path-based entry.
-        let list = handle_model_request_at(&path, "model/list", &json!({})).unwrap();
+        let list =
+            handle_model_request_at(&path, "model/list", &json!({}), &fallback_cfg()).unwrap();
         assert_eq!(list["models"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn effective_is_the_catalog_default_when_one_resolves() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        call(&path, "model/setDefault", json!({ "name": "A" })).unwrap();
+        let out = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(out["effective"]["source"], "catalog");
+        assert_eq!(out["effective"]["model_ref"], "A");
+        assert_eq!(out["effective"]["model"], "m");
+        assert_eq!(out["effective"]["api_key_masked"], "••••1234");
+        // 明文绝不在任何字段里。
+        assert!(!out.to_string().contains("sk-secret-1234"));
+    }
+
+    #[test]
+    fn effective_is_the_env_fallback_when_the_catalog_cannot_resolve() {
+        let (_dir, path) = catalog_path();
+        // 清单为空 → 必须落到 cfg。
+        let out = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(out["effective"]["source"], "env");
+        assert!(out["effective"]["model_ref"].is_null());
+        assert_eq!(out["effective"]["model"], "env-model");
+        assert_eq!(out["effective"]["api_url"], "https://env.example");
+        assert_eq!(out["effective"]["provider"], "openai");
+        assert_eq!(out["effective"]["api_key_masked"], "••••9999");
+        assert!(!out.to_string().contains("env-secret-9999"));
+    }
+
+    #[test]
+    fn a_dangling_default_falls_back_to_env() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        call(&path, "model/setDefault", json!({ "name": "A" })).unwrap();
+        call(&path, "model/delete", json!({ "name": "A" })).unwrap();
+        // delete 会清掉悬空引用；再手动写一个悬空 default 覆盖该情形。
+        let mut catalog = ModelCatalog::default();
+        catalog.models.push(ModelEntry {
+            name: "B".to_string(),
+            provider: ModelProvider::parse("anthropic").unwrap(),
+            api_url: "https://b".to_string(),
+            model: "mb".to_string(),
+            api_key: String::new(),
+        });
+        catalog.default_model = Some("gone".to_string());
+        yi_agent_runtime::models::save_catalog_to(&path, &catalog).unwrap();
+        let out = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(out["effective"]["source"], "env");
+        assert!(out["effective"]["model_ref"].is_null());
     }
 }

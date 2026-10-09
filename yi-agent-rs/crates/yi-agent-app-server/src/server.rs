@@ -2559,6 +2559,7 @@ where
                             &models_path,
                             method.as_str(),
                             &req.params,
+                            &cfg,
                         ) {
                             Ok(value) => {
                                 write_response(&hub, &client, ok_response(id, value)).await?
@@ -2582,6 +2583,7 @@ where
                             &models_path,
                             method.as_str(),
                             &req.params,
+                            &cfg,
                         ) {
                             Ok(value) => {
                                 write_response(&hub, &client, ok_response(id, value)).await?
