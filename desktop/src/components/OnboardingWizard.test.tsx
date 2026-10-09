@@ -39,12 +39,51 @@ describe("OnboardingWizard", () => {
     fireEvent.change(screen.getByLabelText("模型标识"), { target: { value: "gpt-4o" } });
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() => expect(onDone).toHaveBeenCalled());
+    // 收尾结果随回调上抛：完整成功 = imported:true、无 importError。
+    expect(onDone).toHaveBeenCalledWith({ imported: true, importError: undefined });
     expect(call).toHaveBeenCalledWith("onboarding/apply", {
       provider: "openai",
       model: "gpt-4o",
       api_url: "https://api.openai.com",
       api_key: "sk-x",
     });
+  });
+
+  it("reports a partial success to onDone when the catalog import fails", async () => {
+    // `.env` 写成功但清单收边失败：宿主回 ok:true + imported:false + 原因。
+    const call = vi.fn(async (method: string) => {
+      if (method === "onboarding/apply") {
+        return { ok: true, env_written: true, imported: false, import_error: "disk" };
+      }
+      return { ok: true };
+    });
+    const { onDone } = renderWizard(call);
+    fireEvent.click(screen.getByRole("button", { name: /开始/ }));
+    fireEvent.click(screen.getByRole("button", { name: "openai" }));
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    fireEvent.change(await screen.findByLabelText("API 密钥"), { target: { value: "sk-x" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    await waitFor(() =>
+      expect(onDone).toHaveBeenCalledWith({ imported: false, importError: "disk" }),
+    );
+  });
+
+  it("stays on the form without dismissing when apply returns ok:false", async () => {
+    const call = vi.fn(async (method: string) =>
+      method === "onboarding/apply"
+        ? { ok: false, env_written: false, imported: false, import_error: "写入失败" }
+        : { ok: true },
+    );
+    const { onDone } = renderWizard(call);
+    fireEvent.click(screen.getByRole("button", { name: /开始/ }));
+    fireEvent.click(screen.getByRole("button", { name: "openai" }));
+    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
+    fireEvent.change(await screen.findByLabelText("API 密钥"), { target: { value: "sk-x" } });
+    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
+    // 失败内联显示，向导不前进，也不发 dismiss。
+    expect(await screen.findByText("写入失败")).toBeTruthy();
+    expect(onDone).not.toHaveBeenCalled();
+    expect(call).not.toHaveBeenCalledWith("onboarding/dismiss", {});
   });
 
   it("offers 'save anyway' after a failed connection test", async () => {

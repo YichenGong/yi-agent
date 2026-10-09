@@ -10,6 +10,14 @@ import {
 
 type Step = "welcome" | "provider" | "form";
 
+/**
+ * 向导收尾的结果（spec §4.7）。
+ *
+ * `imported === false` 表示 `.env` 已写、但清单没收边——向导照常关闭进主界面，
+ * 由调用方在主界面顶部留一条可关闭提示。`importError` 是可读原因（如有）。
+ */
+export type OnboardingOutcome = { imported: boolean; importError?: string };
+
 const DEFAULT_URL = {
   anthropic: "https://api.anthropic.com",
   openai: "https://api.openai.com",
@@ -26,7 +34,7 @@ export function OnboardingWizard({
 }: {
   call?: OnboardingRpc;
   reasons?: string[];
-  onDone: () => void;
+  onDone: (result?: OnboardingOutcome) => void;
 }) {
   const [step, setStep] = useState<Step>("welcome");
   const [provider, setProvider] = useState<"anthropic" | "openai">("anthropic");
@@ -72,9 +80,15 @@ export function OnboardingWizard({
     setBusy(true);
     setError(null);
     try {
-      await applyOnboarding(call, input());
+      const result = await applyOnboarding(call, input());
+      // `ok:false` 不是抛错，但与抛错同路：不 dismiss、不进主界面，把失败留在
+      // 向导里内联显示。否则「没保存成功却看着像完成」会静默丢掉用户的配置。
+      if (!result.ok) {
+        setError(result.import_error || "保存失败");
+        return;
+      }
       await dismissOnboarding(call);
-      onDone();
+      onDone({ imported: result.imported && result.ok, importError: result.import_error });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
