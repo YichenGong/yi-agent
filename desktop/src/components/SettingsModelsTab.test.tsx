@@ -16,7 +16,21 @@ const ENTRY: ModelEntryView = {
 };
 
 function payload(overrides: Partial<ModelList> = {}): ModelList {
-  return { models: [ENTRY], default_model: "A", subagent_model: null, ...overrides };
+  return {
+    models: [ENTRY],
+    default_model: "A",
+    subagent_model: null,
+    effective: {
+      source: "catalog",
+      model_ref: "A",
+      provider: "anthropic",
+      api_url: "u",
+      model: "m",
+      has_key: true,
+      api_key_masked: "••••1234",
+    },
+    ...overrides,
+  };
 }
 
 /** 计数某方法被调用了几次（不关心参数）。 */
@@ -171,5 +185,44 @@ describe("SettingsModelsTab", () => {
 
     fireEvent.change(select, { target: { value: "" } });
     await waitFor(() => expect(call).toHaveBeenCalledWith("model/setSubagent", { name: null }));
+  });
+
+  it("says so and offers an import when the model comes from .env", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list"
+        ? payload({
+            models: [],
+            default_model: null,
+            effective: {
+              source: "env",
+              model_ref: null,
+              provider: "openai",
+              api_url: "https://env",
+              model: "env-model",
+              has_key: true,
+              api_key_masked: "••••9999",
+            },
+          })
+        : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+
+    // 如实告知「在用 .env 的那个模型」，而不是干说「还没有配置任何模型」。
+    expect(await screen.findByText(/来自 \.env/)).toBeTruthy();
+    expect(screen.getByText(/env-model/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "导入当前配置" }));
+    await waitFor(() => expect(call).toHaveBeenCalledWith("model/importEnv", {}));
+    // 写后重读：model/list 至少被调两次（首载 + 导入后）。
+    await waitFor(() => expect(callsTo(call, "model/list").length).toBeGreaterThanOrEqual(2));
+  });
+
+  it("does not offer an import when the model resolves from the catalog", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+    await screen.findByText("••••1234");
+    expect(screen.queryByRole("button", { name: "导入当前配置" })).toBeNull();
   });
 });

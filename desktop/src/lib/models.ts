@@ -18,11 +18,31 @@ export type ModelEntryView = {
   api_key_masked: string;
 };
 
-/** `model/list` 的完整回包：清单 + 两个全局引用。 */
+/**
+ * 当前默认**实际解析到哪里**：清单条目（`catalog`）还是回退 `.env`（`env`）。
+ *
+ * 面板只拿它「如实告知」，不做判断：`source` 是宿主算好的权威结论，前端不复算
+ * ——兜底链的细节（环境变量、宿主配置）前端根本看不见。key 只出掩码，原文不经过
+ * 桌面端：`has_key` 说「有没有」，`api_key_masked` 是唯一可显示的凭证形态。
+ */
+export type EffectiveModel = {
+  source: "catalog" | "env";
+  /** 命中的清单条目名；`source === "env"` 时为 `null`（还没进清单）。 */
+  model_ref: string | null;
+  provider: string;
+  api_url: string;
+  model: string;
+  has_key: boolean;
+  api_key_masked: string;
+};
+
+/** `model/list` 的完整回包：清单 + 两个全局引用 + 实际生效的那一份。 */
 export type ModelList = {
   models: ModelEntryView[];
   default_model: string | null;
   subagent_model: string | null;
+  /** 宿主未提供时回 `null`，面板只渲染已知信息（老宿主/降级都能用）。 */
+  effective: EffectiveModel | null;
 };
 
 /**
@@ -37,7 +57,19 @@ export async function listModels(rpc: ModelRpc): Promise<ModelList> {
     models: Array.isArray(result?.models) ? result.models : [],
     default_model: result?.default_model ?? null,
     subagent_model: result?.subagent_model ?? null,
+    effective: result?.effective ?? null,
   };
+}
+
+/**
+ * 把 `.env`（兜底层）当前的模型配置导入清单并设为全局默认。
+ *
+ * 交给宿主**原子**完成：只有它握有明文 key，也避免前端「落条目 / 设默认」两步
+ * 半途失败留下半截状态。回包给出新条目名；缺字段回空串，视图只需一个可显示的值。
+ */
+export async function importEnvModel(rpc: ModelRpc): Promise<{ name: string }> {
+  const result = await rpc<{ name?: unknown }>("model/importEnv", {});
+  return { name: typeof result?.name === "string" ? result.name : "" };
 }
 
 /** `model/upsert` 的入参：`api_key` 省略 = 保留宿主里已有的 key。 */
