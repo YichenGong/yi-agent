@@ -176,6 +176,24 @@ impl RpcError {
             data: Some(serde_json::json!({ "code": "invalid_model" })),
         }
     }
+
+    /// One `turn/start` image input could not be turned into a content block
+    /// (an explicit `{type:"image", path}` that is missing, undecodable,
+    /// oversized or not a regular file).
+    ///
+    /// Numeric code stays in the `invalid_params` family; `data.code` gives the
+    /// client a stable discriminator so it can say *which* image was refused
+    /// instead of substring-matching the human message. A stalled image upload
+    /// (`{type:"uploaded_image"}` whose `uploadId` is unknown/expired) is **not**
+    /// reported here — the server drops it and runs the turn (see
+    /// `prepare_turn_core`), because that failure is retry-proof on the client.
+    pub fn invalid_image(message: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: message.into(),
+            data: Some(serde_json::json!({ "code": "invalid_image" })),
+        }
+    }
 }
 
 /// 服务端 → 客户端通知(无 id)。

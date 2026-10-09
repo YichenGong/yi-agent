@@ -5905,9 +5905,10 @@ async fn run_thread_driver(
             blocks.push(yi_agent_core::ContentBlock::Text(prompt.clone()));
         }
         blocks.extend(image_blocks.iter().cloned());
-        // 防御:空 blocks 会给模型塞一条没有任何内容的消息。正常路径够不到
-        // (prepare 已拒绝三缺一的输入),但 driver 的输入里若将来多出一条能
-        // 产生空 prompt 且无图片的来源,这里必须自己兜住,而不是把边界甩给模型。
+        // 防御:空 blocks 会给模型塞一条没有任何内容的消息。正常路径够不到,
+        // 但有一条例外:一条**只有图片**的消息里那张图被丢弃时(上传句柄未知 /
+        // 已过期——见 `prepare_turn_core` 的丢弃分支),文本与图片就都空了。
+        // 此时这里必须自己兜住,而不是把边界甩给模型。
         if blocks.is_empty() {
             blocks.push(yi_agent_core::ContentBlock::Text(String::new()));
         }
@@ -6892,6 +6893,9 @@ enum TurnPrepareError {
     TurnInProgress(String),
     /// 附件不可读 / 超出上限 / 不是文件。
     InvalidAttachment(String),
+    /// 显式路径的图片输入（`{type:"image", path}`）不可用。带 `data.code =
+    /// "invalid_image"`，客户端据此指认是哪张图被拒（见 `invalid_image`）。
+    InvalidImage(String),
 }
 
 /// 一个已经「占位」好的 turn,但**尚未向任何客户端发帧**。
@@ -7005,6 +7009,18 @@ async fn prepare_turn_core(
     // 之后一律读**根内副本**再编码：`prepare_image_file` 在根外读原文件也可以，
     // 但那样回显的 `path` 与真正读到的字节可能来自两个位置；统一读根内副本，
     // `path` 与内容才必然同源，`ImageRef.size` 也才必然等于该文件的字节长度。
+    //
+    // 坏图的两条处置**刻意不同**，判据是「失败能不能靠重试自愈」：
+    // - `Upload`：`uploadId` 未知 / 未 commit / 已过期（10 分钟 TTL）都是**不可
+    //   自愈**的——服务端手里已没有重试所需的任何东西，客户端每重发一次都只会拿
+    //   到一模一样的失败，而它还会把 chip 留着，于是整轮对话被这一张图钉死。故
+    //   **丢弃这张图**（warn 一条）并继续起 turn：用户照样能把消息发出去。
+    //   注：上传路径的图已由 `begin` 的 `MAX_IMAGE_BYTES` 设闸，故「超大」不会
+    //   走到这里；但「上传的字节其实不是图」会——`commit` 只收拢字节，判图是这
+    //   一步的事。
+    // - `Path`：路径是这次请求里的显式参数，指不到/不是图是**调用方请求本身**的
+    //   问题（桌面端的图在本地盘上，重发同一路径多半就是同一个结果），仍按
+    //   `InvalidImage` 硬拒，与文档附件的 `InvalidAttachment` 同口径。
     let mut image_blocks = Vec::with_capacity(image_inputs.len());
     let mut image_refs = Vec::with_capacity(image_inputs.len());
     for input in &image_inputs {
@@ -7018,7 +7034,7 @@ async fn prepare_turn_core(
                 ) {
                     Ok(stored) => stored,
                     Err(e) => {
-                        return Err(TurnPrepareError::InvalidAttachment(format!(
+                        return Err(TurnPrepareError::InvalidImage(format!(
                             "image {source}: {e:?}"
                         )));
                     }
@@ -7026,17 +7042,20 @@ async fn prepare_turn_core(
                 (source.clone(), stored)
             }
             crate::attachments::ImageInput::Upload(upload_id) => {
-                // 未 commit / 未知 / 已过期都落到这里，报同一条「无法解析」。
+                // 未 commit / 未知 / 已过期都落到这里。
                 //
                 // 反查必须带 `thread_id`：`uploadId` 是客户端手里的不透明句柄，
                 // 只看 id 不看归属，就能把别条 thread 的图摄进本 turn（跨 thread
-                // 取数）。归属不符与「未知」报同一条错，不向调用方区分两者。
+                // 取数）。归属不符与「未知」一样丢弃，不向调用方区分两者。
                 match uploads.resolve_for(upload_id, &thread_id) {
                     Some(attachment) => (upload_id.clone(), attachment),
                     None => {
-                        return Err(TurnPrepareError::InvalidAttachment(format!(
-                            "unknown or incomplete image upload: {upload_id}"
-                        )));
+                        tracing::warn!(
+                            %thread_id,
+                            upload_id = %upload_id,
+                            "dropping unresolvable uploaded image; continuing the turn",
+                        );
+                        continue;
                     }
                 }
             }
@@ -7065,13 +7084,33 @@ async fn prepare_turn_core(
                     detail: Some(yi_agent_core::ImageDetail::High.as_wire_str().to_string()),
                 });
             }
+            // 已落盘、但读不出/超预算的上传图同样丢：它和「未知 uploadId」一样属于
+            // 重发必然复现的失败，不该毒死整轮。
+            Ok(yi_agent_tools::image_prep::PreparedImage::Omitted { message })
+                if matches!(input, crate::attachments::ImageInput::Upload(_)) =>
+            {
+                tracing::warn!(
+                    %thread_id,
+                    image = %label,
+                    %message,
+                    "dropping an unusable uploaded image; continuing the turn",
+                );
+            }
             Ok(yi_agent_tools::image_prep::PreparedImage::Omitted { message }) => {
-                return Err(TurnPrepareError::InvalidAttachment(format!(
+                return Err(TurnPrepareError::InvalidImage(format!(
                     "image {label}: {message}"
                 )));
             }
+            Err(e) if matches!(input, crate::attachments::ImageInput::Upload(_)) => {
+                tracing::warn!(
+                    %thread_id,
+                    image = %label,
+                    error = ?e,
+                    "dropping an unusable uploaded image; continuing the turn",
+                );
+            }
             Err(e) => {
-                return Err(TurnPrepareError::InvalidAttachment(format!(
+                return Err(TurnPrepareError::InvalidImage(format!(
                     "image {label}: {e:?}"
                 )));
             }
@@ -7116,6 +7155,7 @@ fn turn_prepare_rpc_error(error: TurnPrepareError) -> RpcError {
         TurnPrepareError::UnknownThread(thread_id) => RpcError::unknown_thread(&thread_id),
         TurnPrepareError::TurnInProgress(thread_id) => RpcError::turn_in_progress(&thread_id),
         TurnPrepareError::InvalidAttachment(msg) => RpcError::invalid_params(msg),
+        TurnPrepareError::InvalidImage(msg) => RpcError::invalid_image(msg),
     }
 }
 
@@ -11500,14 +11540,48 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
-    /// 未知/已 abort 的 `uploadId` 在 `turn/start` 必须干净拒绝:明确报错、一个
-    /// turn 都不起,且不留下被占住的 turn 槽(同 thread 的下一轮仍能起)。
+    /// 未知/已 abort/已过期的 `uploadId` 不再毒死整轮：那张图被**丢弃**，turn 照常
+    /// 起、文本照常送进模型，开启项上不带 `images`。用户于是能把消息发出去，而不是
+    /// 被一张找不回来的图永久卡住（chip 会留着，重试永远同样失败）。
+    ///
+    /// 判据是「失败能不能靠重试自愈」：`uploadId` 未知意味着服务端手里已经没有重试
+    /// 所需的任何东西（记录被 TTL 收走或从未存在），重发必然复现同一结果 → 丢弃。
+    /// 与之相对，显式 `{type:"image", path}` 指不到文件是**请求本身**的问题，仍硬拒
+    /// （见 `turn_start_rejects_a_non_image_image_input`）。
     #[tokio::test(flavor = "multi_thread")]
-    async fn turn_start_refuses_an_unknown_upload_id() {
+    async fn turn_start_drops_an_unknown_upload_id_and_still_runs_the_turn() {
         let workdir = tempfile::TempDir::new().unwrap();
         let mut cfg = default_config();
         cfg.workdir = workdir.path().to_path_buf();
-        let mut h = Harness::with_cfg(cfg).await;
+
+        let messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let messages_factory = Arc::clone(&messages);
+        let build = move |session: Option<yi_agent_core::Session>,
+                          _cwd: &std::path::Path,
+                          _mode: crate::thread_store::ThreadMode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CapturingMessagesProvider {
+                messages: Arc::clone(&messages_factory),
+            });
+            let config = yi_agent_core::AgentConfig::default();
+            let mut agent = yi_agent_core::Agent::new(
+                provider.clone(),
+                Arc::new(yi_agent_core::ToolRegistry::new()),
+                config.clone(),
+            );
+            apply_session(&mut agent, session);
+            Ok(BuiltAgent {
+                agent,
+                provider,
+                config,
+                decision_tx: None,
+                decision_rx: None,
+                catalog: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            })
+        };
+        let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
         let tid = start_thread(&mut h).await;
 
         h.send(&format!(
@@ -11515,35 +11589,96 @@ pub(crate) mod tests {
         ))
         .await;
 
-        let mut methods_before_response: Vec<String> = Vec::new();
+        // 关键逆转：这条 `turn/start` 必须**成功**（旧行为是回 `invalid_params` 并
+        // 拒绝整轮）。开启项照常发出，只是没有 `images`。
         let mut resp: Option<serde_json::Value> = None;
-        for _ in 0..16 {
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..30 {
             let v = h.read_value().await;
             if v.get("id") == Some(&serde_json::json!(50)) {
-                resp = Some(v);
-                break;
+                resp = Some(v.clone());
             }
-            if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
-                methods_before_response.push(m.to_string());
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") && opener.is_none()
+            {
+                opener = Some(v["params"]["item"].clone());
+            }
+            if resp.is_some() && opener.is_some() {
+                break;
             }
         }
         let resp = resp.expect("turn/start must answer");
-        let err = resp["error"]["message"].as_str().unwrap_or_default();
-        assert!(err.contains("upload"), "got: {resp}");
         assert!(
-            methods_before_response.is_empty(),
-            "no turn may start on an unknown upload: {methods_before_response:?}"
+            resp.get("error").is_none(),
+            "an unrecoverable upload must not fail the whole turn: {resp}"
+        );
+        assert!(
+            resp["result"]["turn_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "the turn must really start: {resp}"
+        );
+        let item = opener.expect("the turn must still open with an item");
+        assert_eq!(item["type"], "userMessage", "{item}");
+        assert_eq!(item["text"], "hi", "the text must survive: {item}");
+        assert!(
+            item["images"].as_array().map_or(true, |a| a.is_empty()),
+            "the dropped image must not be echoed: {item}"
         );
 
-        // turn 槽必须干净:同 thread 的下一轮仍能正常起。
-        let second = rpc(
-            &mut h,
-            51,
-            "turn/start",
-            serde_json::json!({ "threadId": tid, "input": [{ "type": "text", "text": "hi" }] }),
-        )
-        .await;
-        assert!(second.get("error").is_none(), "{second}");
+        // 这一轮必须真的跑到底，且状态回到 idle——「占了槽却起不来」的僵尸 turn
+        // 只会停在 running（只有真正收尾的 turn 才会让主循环清掉活跃标记）。
+        let mut completed = false;
+        let mut idle = false;
+        for _ in 0..80 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("turn/completed") => completed = true,
+                Some("thread/status/updated")
+                    if v["params"]["thread_id"] == serde_json::json!(tid)
+                        && v["params"]["status"] == "idle" =>
+                {
+                    idle = true
+                }
+                _ => {}
+            }
+            if completed && idle {
+                break;
+            }
+        }
+        assert!(
+            completed,
+            "the turn must run to completion after the image is dropped"
+        );
+        assert!(
+            idle,
+            "the thread must go back to idle, not stay a zombie turn"
+        );
+
+        // 文本真的到了模型：拿到 provider 的 user 消息，其中不得有任何图片块
+        // （被丢弃的图既不该进 item，也不该进模型上下文）。
+        let seen = messages.lock().unwrap().clone();
+        let first = seen
+            .last()
+            .expect("the provider must have been called")
+            .clone();
+        let first_user = first
+            .iter()
+            .find(|m| m.role == yi_agent_core::Role::User)
+            .expect("the first call must carry a user message");
+        assert!(
+            !first_user
+                .content
+                .iter()
+                .any(|b| matches!(b, yi_agent_core::ContentBlock::Image { .. })),
+            "the dropped image must not reach the model: {first_user:?}"
+        );
+        assert!(
+            first_user
+                .content
+                .iter()
+                .any(|b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t == "hi")),
+            "the text must reach the model: {first_user:?}"
+        );
         h.shutdown().await;
     }
 
@@ -11596,32 +11731,40 @@ pub(crate) mod tests {
         .await;
         assert!(commit.get("error").is_none(), "{commit}");
 
-        // thread B 用 A 的 uploadId 起 turn:必须被拒,且一个 turn 都不起。
+        // thread B 用 A 的 uploadId 起 turn:归属不符与「未知」同等对待——那张图被
+        // **丢弃**，turn 照常起（不再毒死整轮），开启项上不带 `images`。
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":31,"method":"turn/start","params":{{"threadId":"{tid_b}","input":[{{"type":"uploaded_image","uploadId":"{upload_id}"}},{{"type":"text","text":"steal"}}]}}}}"#
         ))
         .await;
-        let mut methods_before: Vec<String> = Vec::new();
         let mut resp: Option<serde_json::Value> = None;
-        for _ in 0..16 {
+        let mut opener_b: Option<serde_json::Value> = None;
+        for _ in 0..40 {
             let v = h.read_value().await;
             if v.get("id") == Some(&serde_json::json!(31)) {
-                resp = Some(v);
-                break;
+                resp = Some(v.clone());
             }
-            if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
-                methods_before.push(m.to_string());
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started")
+                && opener_b.is_none()
+            {
+                opener_b = Some(v["params"]["item"].clone());
+            }
+            if resp.is_some() && opener_b.is_some() {
+                break;
             }
         }
         let resp = resp.expect("turn/start must answer");
         assert!(
-            resp.get("error").is_some(),
-            "another thread's upload must be refused: {resp}"
+            resp.get("error").is_none(),
+            "B must still run: the foreign image is dropped, not fatal: {resp}"
         );
+        let item_b = opener_b.expect("thread B must open with an item");
+        assert_eq!(item_b["text"], "steal", "{item_b}");
         assert!(
-            methods_before.is_empty(),
-            "no turn may start: {methods_before:?}"
+            item_b["images"].as_array().map_or(true, |a| a.is_empty()),
+            "thread B must not receive thread A's image: {item_b}"
         );
+        // 安全断言不变:A 的字节一个都没进 B 的工作区。
         assert!(
             !workdir
                 .path()
@@ -11630,6 +11773,13 @@ pub(crate) mod tests {
                 .exists(),
             "thread B must not receive thread A's image"
         );
+        // 等 B 这轮收尾,再看 A 的正控——否则 B 的开启项会被下面的循环误当成 A 的。
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                break;
+            }
+        }
 
         // 正控:A 自己仍能正常摄取这张图。
         h.send(&format!(
@@ -12687,6 +12837,78 @@ pub(crate) mod tests {
             second.get("error").is_none(),
             "a rejected image must not leave the turn slot occupied: {second:?}"
         );
+        h.shutdown().await;
+    }
+
+    /// 显式路径的图片被拒时，错误必须带一个**结构化**判别码（`data.code = "invalid_image"`），
+    /// 客户端才不必去猜/子串匹配那条人话 message。数字码仍是 `invalid_params`——这次
+    /// 拒绝确实是"参数不合法"，加码只是让调用方能分级处理。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_reports_a_structured_code_for_a_bad_image_path() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("missing.png"); // 不创建：路径指不到任何文件
+
+        let resp = rpc(
+            &mut h,
+            13,
+            "turn/start",
+            serde_json::json!({
+                "threadId": tid,
+                "input": [
+                    { "type": "image", "path": src.display().to_string() },
+                    { "type": "text", "text": "hi" }
+                ],
+            }),
+        )
+        .await;
+
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+        assert_eq!(resp["error"]["data"]["code"], "invalid_image", "{resp}");
+        // 人话里仍带 image，供不看码的客户端兜底。
+        assert!(
+            resp["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("image"),
+            "{resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 显式路径的图片被拒**不改变**声明大小以外的判据：非图内容（PDF 冒充 .png）也
+    /// 走同一条 `invalid_image`，报错的仍是路径那一侧。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turn_start_reports_a_structured_code_for_a_non_image_file() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("fake.png");
+        std::fs::write(&src, b"%PDF-1.4 fake").unwrap();
+
+        let resp = rpc(
+            &mut h,
+            14,
+            "turn/start",
+            serde_json::json!({
+                "threadId": tid,
+                "input": [
+                    { "type": "image", "path": src.display().to_string() },
+                    { "type": "text", "text": "hi" }
+                ],
+            }),
+        )
+        .await;
+
+        assert_eq!(resp["error"]["code"].as_i64(), Some(-32602), "{resp}");
+        assert_eq!(resp["error"]["data"]["code"], "invalid_image", "{resp}");
         h.shutdown().await;
     }
 
