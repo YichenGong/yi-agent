@@ -2631,6 +2631,20 @@ describe("App 附件接线", () => {
     await pickWith(imageButton, picked);
   }
 
+  /**
+   * 断言待发图片 chip 上的缩略图是**中性占位**，而不是画出来的 `<img>`。
+   *
+   * 待发图片的路径来自 OS 文件对话框，是 `/tmp/...` 这类**绝对**路径，而
+   * `image/read` 以会话 cwd 为根（安全边界），必然读不回来——这是预期内的事实。
+   * 故此处的期望就是占位：`attachment-thumb` 锚点存在但**不是** `<img>`；那个
+   * 假「读到字节」的结果并不代表真实行为，不能替它渲染一张图。真正可读的路径
+   * （服务端回显的 workspace 相对引用）才该画出 `<img>`，由 Task 11 覆盖。
+   */
+  function expectThumbPlaceholder() {
+    const thumb = screen.getByTestId("attachment-thumb");
+    expect(thumb.tagName).not.toBe("IMG");
+  }
+
   it("sends attachments as input blocks before the text block", async () => {
     render(<App />);
     await waitFor(() =>
@@ -2667,10 +2681,15 @@ describe("App 附件接线", () => {
     );
 
     // 图片走它自己的按钮（Task 10）：chip 出现即「图片确实进了待发列表」的可见
-    // 证据；chip 上的缩略图证明 kind 被记成了 "image"。
+    // 证据；chip 上的缩略图（此处是占位）证明 kind 被记成了 "image"。
+    //
+    // 待发图片的路径来自 dialog，是 `/tmp/...` 这种**绝对**路径，`image/read` 以
+    // 会话 cwd 为根（安全边界）必然拒绝它——桩客户端默认对未知方法回 `{}`，那会
+    // 被伪造成一张空的「成功」图。这里照实模拟该拒绝，chip 才走到中性占位。
+    state.rejectCode["image/read"] = -1;
     await pickImages(["/tmp/截图.png"]);
     expect(screen.getByText("截图.png")).toBeTruthy();
-    expect(screen.getByTestId("attachment-thumb")).toBeTruthy();
+    expectThumbPlaceholder();
 
     await act(async () => {
       fireEvent.change(screen.getByRole("textbox"), { target: { value: "看看这个" } });
@@ -2698,11 +2717,13 @@ describe("App 附件接线", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
 
+    // 同上一例：模拟 `image/read` 对待发绝对路径的拒绝（否则空桩会被伪造成图）。
+    state.rejectCode["image/read"] = -1;
     await pickFiles(["/tmp/报告.pdf"]);
     await pickImages(["/tmp/截图.png"]);
     expect(screen.getByText("截图.png")).toBeTruthy();
     expect(screen.getByText("报告.pdf")).toBeTruthy();
-    expect(screen.getByTestId("attachment-thumb")).toBeTruthy();
+    expectThumbPlaceholder();
 
     await act(async () => {
       fireEvent.change(screen.getByRole("textbox"), { target: { value: "看看这些" } });

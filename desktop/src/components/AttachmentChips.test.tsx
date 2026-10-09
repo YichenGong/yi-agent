@@ -26,6 +26,14 @@ function thumbnailImages(): HTMLImageElement[] {
     .filter((el): el is HTMLImageElement => el.tagName === "IMG");
 }
 
+/**
+ * 宿主注入的读取接缝。`call` 现在是**必填** prop：此前它可选并带一个 `NO_READ`
+ * 兜底，任何漏注入 `call` 的嵌入都会静默渲染成「读取失败」的 chip（移除测试其实
+ * 从未走到那条路——文档 chip 不取字节、`threadId=null` 也在 `call` 之前短路）。
+ * 模块级常量保证引用稳定，与真实宿主 `App` 的 `imageCall` 同理。
+ */
+const imageCall = vi.fn(async () => ({}));
+
 beforeEach(() => {
   hook.calls = [];
   hook.result = { url: null, error: null };
@@ -42,6 +50,7 @@ describe("AttachmentChips", () => {
           { path: "/tmp/notes.docx", name: "notes.docx", size: 512, kind: "document" },
         ]}
         onRemove={() => {}}
+        call={imageCall}
       />,
     );
     // The parent needs a stable handle on the row itself (layout/spacing tests in
@@ -63,6 +72,7 @@ describe("AttachmentChips", () => {
           { path: "/tmp/notes.docx", name: "notes.docx", size: 512, kind: "document" },
         ]}
         onRemove={onRemove}
+        call={imageCall}
       />,
     );
     // The remove button names WHICH attachment: two chips must not be ambiguous.
@@ -72,7 +82,9 @@ describe("AttachmentChips", () => {
   });
 
   it("renders nothing when there are no attachments", () => {
-    const { container } = render(<AttachmentChips attachments={[]} onRemove={() => {}} />);
+    const { container } = render(
+      <AttachmentChips attachments={[]} onRemove={() => {}} call={imageCall} />,
+    );
     expect(container.firstChild).toBeNull();
   });
 
@@ -83,6 +95,7 @@ describe("AttachmentChips", () => {
       <AttachmentChips
         attachments={[{ path: "/tmp/picked.pdf", name: "picked.pdf", size: 0, kind: "document" }]}
         onRemove={() => {}}
+        call={imageCall}
       />,
     );
     expect(screen.getByText("picked.pdf")).toBeTruthy();
@@ -95,6 +108,7 @@ describe("AttachmentChips", () => {
       <AttachmentChips
         attachments={[{ path: "/tmp/dir/fallback.pdf", name: "", size: 1024 * 1024 * 1.5, kind: "document" }]}
         onRemove={() => {}}
+        call={imageCall}
       />,
     );
     expect(screen.getByText("fallback.pdf")).toBeTruthy();
@@ -107,6 +121,7 @@ describe("AttachmentChips", () => {
       <AttachmentChips
         attachments={[{ path: "/tmp/a-very-long-dir-name/report.pdf", name: "report.pdf", size: 10, kind: "document" }]}
         onRemove={() => {}}
+        call={imageCall}
       />,
     );
     expect(screen.getByText("report.pdf").getAttribute("title")).toBe(
@@ -116,8 +131,6 @@ describe("AttachmentChips", () => {
 
   // 图片 chip 的缩略图：字节由 `image/read` 另取，chip 只负责把 hook 给出的
   // 状态画出来。锚点是 data-testid，App/Send 的联合测试也靠它。
-  const imageCall = vi.fn(async () => ({}));
-
   function renderChips(
     attachments: Parameters<typeof AttachmentChips>[0]["attachments"],
     overrides: Partial<Parameters<typeof AttachmentChips>[0]> = {},
@@ -129,6 +142,8 @@ describe("AttachmentChips", () => {
         onRemove={onRemove}
         threadId="t1"
         call={imageCall}
+        // 这一行就是待发列表：生产里 App 恒以 pending 渲染，故此处的默认值也是它。
+        pending
         {...overrides}
       />,
     );
@@ -166,14 +181,35 @@ describe("AttachmentChips", () => {
       expect(thumbnailImages()).toHaveLength(0);
     });
 
-    it("marks a read failure instead of showing a broken image", () => {
-      hook.result = { url: null, error: "boom" };
+    it("shows a neutral placeholder for a pending chip whose bytes cannot be read", () => {
+      // 待发图片带的是 OS 文件对话框给的**绝对**路径（如 /tmp/截图.png），而
+      // `image/read` 以会话 cwd 为根（安全边界），这类路径必然读不回来。这是
+      // 预期内的事实，不是错误：必须画中性占位 + 「发送后可预览」，绝不画红色 ✗
+      // ——那会让一张完全正常的待发图片看起来像坏了。
+      hook.result = { url: null, error: "image/read failed" };
       renderChips([{ path: "/tmp/截图.png", name: "截图.png", size: 0, kind: "image" }]);
+
+      expect(screen.queryByTestId("attachment-thumb-error")).toBeNull();
+      const thumb = screen.getByTestId("attachment-thumb");
+      expect(thumb.tagName).not.toBe("IMG");
+      expect(thumb.getAttribute("title")).toBe("发送后可预览");
+      // 中性占位也不吃掉移除入口。
+      expect(screen.getByRole("button", { name: "移除 截图.png" })).toBeTruthy();
+    });
+
+    it("marks a read failure when the chip is not pending (its path should be readable)", () => {
+      // 反面：路径**本该**可读（如服务端回显的 cwd 相对路径）却读失败，才是真错误，
+      // 此时必须留下可见的失败标记，不能悄悄退化成中性占位。
+      hook.result = { url: null, error: "boom" };
+      renderChips(
+        [{ path: ".yi-agent/attachments/pic.png", name: "pic.png", size: 0, kind: "image" }],
+        { pending: false },
+      );
 
       expect(thumbnailImages()).toHaveLength(0);
       expect(screen.getByTestId("attachment-thumb-error")).toBeTruthy();
       // 出错也不能吃掉移除入口：坏图更要能一键摘掉。
-      expect(screen.getByRole("button", { name: "移除 截图.png" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "移除 pic.png" })).toBeTruthy();
     });
 
     it("renders no thumbnail for a document chip and never asks for its bytes", () => {

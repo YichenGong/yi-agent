@@ -56,11 +56,12 @@ export function MessageInput({
   onRemoveAttachment: (path: string) => void;
   /**
    * 当前会话 id 与图片读取接缝，只为待发图片 chip 上的缩略图存在；原样透传给
-   * `AttachmentChips`。`call` **必须稳定引用**（`App` 的 `imageCall`），否则每张
+   * `AttachmentChips`。`call` **必填**（此前可选并带 `NO_READ` 兜底，会让漏注入
+   * 时静默降级成失败 chip）且**必须稳定引用**（`App` 的 `imageCall`），否则每张
    * 缩略图都会随每次渲染重新分片拉取。
    */
   threadId?: string | null;
-  call?: ImageReadCall;
+  call: ImageReadCall;
   /**
    * 没有当前 session 时置灰整个输入区（App 不会无会话渲染它，这一层是护栏）：
    * 否则会留下一个能敲字、却因无处存放草稿而静默丢字的文本框。
@@ -134,6 +135,9 @@ export function MessageInput({
         onRemove={onRemoveAttachment}
         threadId={threadId}
         call={call}
+        // 输入框上方的 chip 恒为待发：路径是 OS dialog 的绝对路径，`image/read`
+        // 读不回来是预期内的，缩略图走中性占位（见 `AttachmentThumb` 的限制说明）。
+        pending
       />
       {/*
        * Phone breakpoint: the desktop row is 输入框 + 一列右对齐控件（附附加文件 /

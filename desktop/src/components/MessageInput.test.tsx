@@ -21,6 +21,9 @@ function renderInput(overrides: Partial<ComponentProps<typeof MessageInput>> = {
     onPickFiles: vi.fn(),
     onPickImages: vi.fn(),
     onRemoveAttachment: vi.fn(),
+    // `call` 现在是必填：待发图片 chip 的缩略图经它读字节（本文件的用例只挂
+    // 文档 chip，永不调用它，但类型上必须给）。
+    call: vi.fn(async () => ({})),
     ...overrides,
   };
   // The composer is controlled: mirror `onDraftChange` back into `value` exactly

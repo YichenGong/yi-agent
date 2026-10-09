@@ -1366,17 +1366,26 @@ export default function App() {
   };
 
   /**
-   * 打开原生多选文件对话框，把选中的**文档**加入当前会话的待发附件。
+   * 一次「原生多选 → 逐个预检 → 入待发列表」的公共骨架。
    *
-   * 图片走自己的按钮（`pickImagesToAttach`）：两个白名单互不重叠，各自的对象存储形态
-   * 也不同，分开入口，用户才不会挑错之后才被告知。
+   * 文档与图片两条路只差三个白名单/上限参数：过滤器的名字、扩展名列表、预检函数，
+   * 外加入列时的 `kind`。此前两者各抄一份 ~90% 相同的代码，任何一处（如失败时
+   * `problems` 的呈现）改动都要同步两遍——抽成一处，行为逐字不变。
    *
-   *
-   * 逐个本地预检：不合格的就地报错(写进会话错误)并丢弃，合格的才进待发列表。
-   * 报错与加入互不影响——一次多选里混着好坏文件是常态，不能因为一个坏文件
-   * 把整次选择作废。
+   * 逐个本地预检：不合格的就地报错（写进会话错误）并丢弃，合格的才进待发列表。
+   * 报错与加入互不影响——一次多选里混着好坏文件是常态，不能因为一个坏文件把
+   * 整次选择作废。
    */
-  const pickFilesToAttach = async (): Promise<void> => {
+  const pickIntoSession = async (spec: {
+    /** 原生对话框里过滤器的显示名（「文档」/「图片」）。 */
+    filterName: string;
+    /** 该入口接受的白名单扩展名。 */
+    extensions: readonly string[];
+    /** 单个路径的本地预检；返回原因字符串表示不可发送。 */
+    problem: (path: string, size: number) => string | null;
+    /** 通过预检后入列的附件类别（决定发送时的协议形态）。 */
+    kind: PendingAttachment["kind"];
+  }): Promise<void> => {
     const id = store.currentId;
     if (!id) return;
     // iOS/远端没有原生选择器：桌面端能力，在别处不假装有。
@@ -1385,7 +1394,7 @@ export default function App() {
     const picked = await open({
       directory: false,
       multiple: true,
-      filters: [{ name: "文档", extensions: [...ATTACHMENT_EXTENSIONS] }],
+      filters: [{ name: spec.filterName, extensions: [...spec.extensions] }],
     });
     // 多选回数组；单选/取消回字符串或 null。统一成数组再处理。
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
@@ -1398,12 +1407,12 @@ export default function App() {
       // 桌面端拿不到 file size（dialog 只给路径）：大小交给服务端权威校验，
       // 这里只做扩展名预检——传 size=0 意为"未知"，不会误判为超限，避免把
       // 注定被拒的类型发出去。
-      const problem = attachmentProblem(p, 0);
+      const problem = spec.problem(p, 0);
       if (problem) {
         problems.push(`${name}：${problem}`);
         continue;
       }
-      accepted.push({ path: p, name, size: 0, kind: "document" });
+      accepted.push({ path: p, name, size: 0, kind: spec.kind });
     }
     if (accepted.length > 0) {
       setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
@@ -1415,45 +1424,33 @@ export default function App() {
   };
 
   /**
+   * 打开原生多选文件对话框，把选中的**文档**加入当前会话的待发附件。
+   *
+   * 图片走自己的按钮（`pickImagesToAttach`）：两个白名单互不重叠，各自的对象存储形态
+   * 也不同，分开入口，用户才不会挑错之后才被告知。
+   */
+  const pickFilesToAttach = (): Promise<void> =>
+    pickIntoSession({
+      filterName: "文档",
+      extensions: ATTACHMENT_EXTENSIONS,
+      problem: attachmentProblem,
+      kind: "document",
+    });
+
+  /**
    * 打开原生多选图片对话框，把选中的图片加入当前会话的待发附件。
    *
-   * 与 `pickFilesToAttach` 同形，但用图片自己的白名单与上限：图片不进
-   * `read_document` 清单，走的是内容块，服务端会把它摄取成模型直接可见的图片。
-   * 远端客户端的图片上传走另一条路（尚未接线），这里先不假装有。
+   * 与 `pickFilesToAttach` 同形（共用 `pickIntoSession`），但用图片自己的白名单与
+   * 上限：图片不进 `read_document` 清单，走的是内容块，服务端会把它摄取成模型直接
+   * 可见的图片。远端客户端的图片上传走另一条路（尚未接线），这里先不假装有。
    */
-  const pickImagesToAttach = async (): Promise<void> => {
-    const id = store.currentId;
-    if (!id) return;
-    if (isRemoteClient()) return;
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const picked = await open({
-      directory: false,
-      multiple: true,
-      filters: [{ name: "图片", extensions: [...IMAGE_EXTENSIONS] }],
+  const pickImagesToAttach = (): Promise<void> =>
+    pickIntoSession({
+      filterName: "图片",
+      extensions: IMAGE_EXTENSIONS,
+      problem: imageAttachmentProblem,
+      kind: "image",
     });
-    const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
-    if (paths.length === 0) return;
-
-    const problems: string[] = [];
-    const accepted: PendingAttachment[] = [];
-    for (const p of paths) {
-      const name = fileNameOf(p);
-      // 同 `pickFilesToAttach`：dialog 不给大小，`size: 0` 意为"未知"，只预检扩展名。
-      const problem = imageAttachmentProblem(p, 0);
-      if (problem) {
-        problems.push(`${name}：${problem}`);
-        continue;
-      }
-      accepted.push({ path: p, name, size: 0, kind: "image" });
-    }
-    if (accepted.length > 0) {
-      setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
-    }
-    if (problems.length > 0) {
-      store.view(id).session.lastError = problems.join("；");
-      force((v) => v + 1);
-    }
-  };
 
   /** 从当前会话的待发列表里移除一个附件（用户点了 chip 上的叉）。 */
   const removePendingAttachment = (path: string): void => {
