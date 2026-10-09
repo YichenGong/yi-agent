@@ -5207,6 +5207,7 @@ async fn persist_and_finish_turn(
             id: format!("user-{}", turn_id.unwrap_or("session-command")),
             text: prompt.to_string(),
             attachments: user_attachments.to_vec(),
+            images: Vec::new(),
         });
     }
     items.extend(completed_items);
@@ -6560,6 +6561,7 @@ fn opening_user_item(
         id: format!("user-{turn_id}"),
         text: text.to_string(),
         attachments,
+        images: Vec::new(),
     }
 }
 
@@ -13034,6 +13036,7 @@ pub(crate) mod tests {
                         id: "user-t1".into(),
                         text: "first".into(),
                         attachments: Vec::new(),
+                        images: Vec::new(),
                     }],
                     usage: None,
                     messages: vec![],
@@ -13050,6 +13053,7 @@ pub(crate) mod tests {
                             id: "user-turn-t2".into(),
                             text: "second".into(),
                             attachments: Vec::new(),
+                            images: Vec::new(),
                         },
                         crate::protocol::Item::AgentMessage {
                             id: "item-turn-t2-1".into(),
@@ -13137,6 +13141,7 @@ pub(crate) mod tests {
                         id: "user-t1".into(),
                         text: "first".into(),
                         attachments: Vec::new(),
+                        images: Vec::new(),
                     }],
                     usage: None,
                     messages: vec![],
@@ -13154,6 +13159,7 @@ pub(crate) mod tests {
                             id: "user-turn-t2".into(),
                             text: "second".into(),
                             attachments: Vec::new(),
+                            images: Vec::new(),
                         },
                         crate::protocol::Item::AgentMessage {
                             id: "item-turn-t2-1".into(),

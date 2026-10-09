@@ -464,6 +464,20 @@ pub struct Attachment {
     pub size: u64,
 }
 
+/// 对工作区内一张图片的引用——**只带路径与元数据，绝不含 base64 字节**。
+///
+/// `Item` 会随每条通知下发,而传输帧上限为 1 MiB;内联图片字节日志会把帧撑爆。
+/// 服务端在起 turn 前把用户选中的图片复制到 `.yi-agent/attachments/<thread_id>/
+/// <hash>-<name>`,客户端据此自行读取并渲染。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageRef {
+    pub path: String,
+    pub media_type: String,
+    pub size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Item {
@@ -472,6 +486,8 @@ pub enum Item {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
     AgentMessage {
         id: String,
@@ -485,6 +501,8 @@ pub enum Item {
         status: ToolStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
     /// A user message that arrived mid-turn, rendered as its own bubble so it is
     /// not confused with the message that opened the turn.
@@ -493,6 +511,8 @@ pub enum Item {
         text: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<Attachment>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
 }
 
@@ -622,6 +642,7 @@ mod tests {
             id: "i1".into(),
             text: "hi".into(),
             attachments: Vec::new(),
+            images: Vec::new(),
         };
         let v: Value = serde_json::to_value(&item).unwrap();
         assert_eq!(v["type"], "userMessage");
@@ -637,6 +658,7 @@ mod tests {
             input: serde_json::json!({"cmd":"ls"}),
             status: ToolStatus::Running,
             result: None,
+            images: Vec::new(),
         };
         let v: Value = serde_json::to_value(&item).unwrap();
         assert_eq!(v["type"], "toolCall");
@@ -767,6 +789,7 @@ mod tests {
                 mime: Some("application/pdf".into()),
                 size: 1234,
             }],
+            images: Vec::new(),
         };
         let json = serde_json::to_value(&item).unwrap();
         assert_eq!(json["attachments"][0]["name"], "报告.pdf");
@@ -781,6 +804,7 @@ mod tests {
             id: "u".into(),
             text: "hi".into(),
             attachments: Vec::new(),
+            images: Vec::new(),
         };
         let json = serde_json::to_value(&item).unwrap();
         assert!(json.get("attachments").is_none(), "got: {json}");
@@ -794,6 +818,43 @@ mod tests {
     }
 
     #[test]
+    fn an_item_carries_image_refs_but_never_base64() {
+        let item = Item::UserMessage {
+            id: "user-turn-1".into(),
+            text: "看图".into(),
+            attachments: Vec::new(),
+            images: vec![ImageRef {
+                path: ".yi-agent/attachments/t1/a1b2-x.png".into(),
+                media_type: "image/png".into(),
+                size: 1234,
+                detail: Some("high".into()),
+            }],
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            v["images"][0]["path"],
+            ".yi-agent/attachments/t1/a1b2-x.png"
+        );
+        assert_eq!(v["images"][0]["media_type"], "image/png");
+        let raw = v.to_string();
+        assert!(
+            !raw.contains("base64"),
+            "an item must never inline image bytes: {raw}"
+        );
+    }
+
+    #[test]
+    fn an_item_without_images_omits_the_field() {
+        let item = Item::UserMessage {
+            id: "user-turn-1".into(),
+            text: "hi".into(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        };
+        assert!(serde_json::to_value(&item).unwrap().get("images").is_none());
+    }
+
+    #[test]
     fn items_completed_serializes_with_method_and_params() {
         let n = Notification::ItemsCompleted {
             thread_id: "t1".to_string(),
@@ -801,6 +862,7 @@ mod tests {
                 id: "user-1".to_string(),
                 text: "hi".to_string(),
                 attachments: Vec::new(),
+                images: Vec::new(),
             }],
         };
         let v = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();

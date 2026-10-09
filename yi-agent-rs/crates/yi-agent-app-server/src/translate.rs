@@ -186,6 +186,7 @@ impl Translator {
                 input: tool.input,
                 status,
                 result,
+                images: Vec::new(),
             },
         });
     }
@@ -255,6 +256,7 @@ impl Translator {
                         input,
                         status: ToolStatus::Running,
                         result: None,
+                        images: Vec::new(),
                     },
                 });
             }
@@ -326,6 +328,7 @@ impl Translator {
                     id,
                     text,
                     attachments: Vec::new(),
+                    images: Vec::new(),
                 };
                 out.push(Notification::ItemStarted {
                     thread_id: self.thread_id.clone(),
