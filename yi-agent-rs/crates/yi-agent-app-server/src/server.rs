@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use base64::Engine as _;
 use futures::StreamExt;
 use serde_json::json;
 use std::sync::Mutex as StdMutex;
@@ -45,6 +46,14 @@ pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// brief 的设计约束):整张 `threads` 表是主循环的局部量,重构成可共享结构会
 /// 把改动面扩散到全部 RPC 分支。3s 足够跟上卡片状态流转,又远短于卡片的生命周期。
 const CARD_SCHEDULER_TICK: Duration = Duration::from_secs(3);
+
+/// `image/read` 每次回传的原始字节上限。传输帧上限 1 MiB,base64 膨胀 4/3 后
+/// 512 KiB 的原始块约 683 KiB,连同其它字段仍在单帧之内。
+pub(crate) const IMAGE_READ_CHUNK_BYTES: u64 = 512 * 1024;
+
+/// `image/read` 允许服务的最大文件字节数。分片只是传输形态,不代表可以无上限地
+/// 服务任意大文件;与 `image_prep::MAX_IMAGE_BYTES` 同值(20 MiB)。
+pub(crate) const IMAGE_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// driver task → 主循环的完成事件。
 enum TurnEvent {
@@ -2678,6 +2687,165 @@ where
                                     .await?
                             }
                         }
+                    }
+                    // 分片回传一张图片的**原始字节**:客户端按 `nextOffset` 循环
+                    // 拉取,base64 解码拼接后即得与磁盘逐字节相同的文件。之所以
+                    // 不在这里重新编码,是因为 `Item.images[].size` 记的就是存盘
+                    // 文件的字节长度(Task 5 的交接),两者必须一致。
+                    //
+                    // 这是一条**安全边界**:限根(拒绝 `..` 与工作区外绝对路径)+
+                    // 只送可解码的图(`guess_format`)+ 文件大小上限,三者缺一,
+                    // 本 RPC 就成了任意文件读取原语。
+                    "image/read" => {
+                        let Some(thread_id) =
+                            req.params.get("threadId").and_then(|v| v.as_str())
+                        else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("threadId required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        let Some(rel) = req.params.get("path").and_then(|v| v.as_str()) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("path required")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 该 thread 的 cwd:内存优先,其次按 store 定位;都落空即
+                        // 未知 thread。与既有路径限额同源。
+                        let Some(root) = thread_cwd(&threads, &workspaces, &cfg, thread_id) else {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("unknown thread")),
+                            )
+                            .await?;
+                            continue;
+                        };
+                        // 限根:join 后 canonicalize,再要求结果落在 cwd 之内。
+                        // `canonicalize` 会解掉 `..` 与符号链接,故逃逸一定现形;
+                        // `Path::join` 遇绝对路径会整体替换,也在此被 starts_with 拦下。
+                        let canonical = match root.join(rel).canonicalize() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!("cannot read image: {e}")),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        let root_canonical =
+                            root.canonicalize().unwrap_or_else(|_| root.clone());
+                        if !canonical.starts_with(&root_canonical) {
+                            write_response(
+                                &hub, &client,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params("path escapes the workspace"),
+                                ),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        // 先按**元数据**长度设闸:否则一个几 GB 的文件会先被整个读进
+                        // 内存再被拒,分片回传反成了内存放大原语。
+                        let declared_len = match std::fs::metadata(&canonical) {
+                            Ok(m) => m.len(),
+                            Err(e) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!("cannot read image: {e}")),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        if declared_len > IMAGE_READ_MAX_BYTES {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("image too large")),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let bytes = match std::fs::read(&canonical) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!("cannot read image: {e}")),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 只送可解码的图片:以魔数判定,不看扩展名。
+                        let format = match image::guess_format(&bytes) {
+                            Ok(f) => f,
+                            Err(_) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::invalid_params("not a supported image")),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 元数据长度与实际读到的长度理论上可能竞态,按**实际字节**复核。
+                        if bytes.len() as u64 > IMAGE_READ_MAX_BYTES {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::invalid_params("image too large")),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let offset = req.params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                        // 客户端可要更小的一块,但不得越过帧预算。`0` 视为未指定:
+                        // 否则 `end == start`、`nextOffset` 不前进,客户端会陷入死循环。
+                        let max_bytes = req
+                            .params
+                            .get("maxBytes")
+                            .and_then(|v| v.as_u64())
+                            .filter(|n| *n > 0)
+                            .unwrap_or(IMAGE_READ_CHUNK_BYTES)
+                            .min(IMAGE_READ_CHUNK_BYTES);
+                        let start = (offset as usize).min(bytes.len());
+                        let end = start.saturating_add(max_bytes as usize).min(bytes.len());
+                        let next = if end < bytes.len() {
+                            Some(end as u64)
+                        } else {
+                            None
+                        };
+                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]);
+                        write_response(
+                            &hub,
+                            &client,
+                            ok_response(
+                                id,
+                                json!({
+                                    "data": data,
+                                    "nextOffset": next,
+                                    "mediaType": image_media_type(format),
+                                    "size": bytes.len(),
+                                }),
+                            ),
+                        )
+                        .await?;
                     }
                     "workspace/list" => {
                         let list: Vec<serde_json::Value> = workspaces
@@ -5928,6 +6096,50 @@ fn store_lookup(
     match threads.get(thread_id) {
         Some(s) => Arc::clone(&s.store),
         None => store_for(workspaces, cfg, thread_id),
+    }
+}
+
+/// 解析某个 thread 的工作区 cwd(绝对路径)。
+///
+/// 内存中的会话最权威:直接取 `ThreadSession.cwd`(`thread/start` 已 canonicalize)。
+/// 冷 thread(不在内存)回退 `store_lookup`——它按全局索引定位该 thread 的 store,
+/// 或落回 `cfg.workdir`;store 的 root 恒为 `<cwd>/.yi-agent/threads`,上溯两级即得
+/// 工作区(与 `thread/delete` 分支推导附件目录的写法同源)。
+///
+/// 找不到任何见证(索引里既没有该 thread 的目录,`cfg.workdir` 也不含它)时返回
+/// `None`,由调用方按「未知 thread」拒绝。
+fn thread_cwd(
+    threads: &HashMap<String, ThreadSession>,
+    workspaces: &WorkspaceIndex,
+    cfg: &RuntimeConfig,
+    thread_id: &str,
+) -> Option<PathBuf> {
+    if let Some(session) = threads.get(thread_id) {
+        return Some(PathBuf::from(&session.cwd));
+    }
+    let store = store_lookup(threads, workspaces, cfg, thread_id);
+    if store.exists(thread_id) {
+        return store
+            .root()
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+    }
+    None
+}
+
+/// `image/read` 回传的 MIME:由 `guess_format` 猜出的格式决定。
+///
+/// 只认四种与 `image_prep`(`png/jpeg/gif/webp`)对齐的格式;`guess_format` 虽会
+/// 认出 TIFF/BMP 等魔数,但那些解码器未启用,统一按 `application/octet-stream`
+/// 报出(客户端据此可判「不是我能渲染的图」)。
+fn image_media_type(format: image::ImageFormat) -> &'static str {
+    match format {
+        image::ImageFormat::Png => "image/png",
+        image::ImageFormat::Jpeg => "image/jpeg",
+        image::ImageFormat::Gif => "image/gif",
+        image::ImageFormat::WebP => "image/webp",
+        _ => "application/octet-stream",
     }
 }
 
@@ -10788,6 +11000,447 @@ pub(crate) mod tests {
         );
 
         h.shutdown().await;
+    }
+
+    /// 造一张**压不动**、必然超过一个分片的 PNG，返回其原始字节。
+    ///
+    /// 伪随机像素让 PNG 的滤波器几乎无从压缩，于是 1024x1024 必然远大于
+    /// `IMAGE_READ_CHUNK_BYTES`（512 KiB），能真的走多块回传那条路径。
+    fn write_an_uncompressed_png(path: &std::path::Path) -> Vec<u8> {
+        let mut state: u32 = 0x1234_5678;
+        let img = image::RgbImage::from_fn(1024, 1024, |_, _| {
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state
+            };
+            image::Rgb([next() as u8, next() as u8, next() as u8])
+        });
+        img.save_with_format(path, image::ImageFormat::Png).unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    /// `image/read` 必须把文件的**原始字节**分块回传：客户端按 `nextOffset`
+    /// 循环拉取、base64 解码后拼接，结果必须与磁盘上的文件逐字节相同，
+    /// 且最后一块的 `nextOffset` 为 `null`。
+    ///
+    /// 这条测试同时钉住「`size` 是文件字节长度」与「`mediaType` 由猜测格式得出」
+    /// 两项契约（Task 5 的交接：`size` 必须与取回的字节数一致）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_round_trips_a_file_in_chunks() {
+        use base64::Engine as _;
+
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        let rel = format!(".yi-agent/attachments/{tid}/deadbeef-big.png");
+        let stored = workdir.path().join(&rel);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        let source = write_an_uncompressed_png(&stored);
+        assert!(
+            source.len() > 512 * 1024,
+            "the fixture must span several chunks, got {} bytes",
+            source.len()
+        );
+
+        let mut offset: u64 = 0;
+        let mut assembled: Vec<u8> = Vec::new();
+        let mut media_type: Option<String> = None;
+        let mut chunks = 0usize;
+        for step in 0..64 {
+            h.send(&format!(
+                r#"{{"jsonrpc":"2.0","id":{},"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}","offset":{offset}}}}}"#,
+                100 + step
+            ))
+            .await;
+            let resp = h.read_value().await;
+            assert!(resp.get("error").is_none(), "image/read failed: {resp}");
+            let result = &resp["result"];
+            assert_eq!(
+                result["size"].as_u64(),
+                Some(source.len() as u64),
+                "size must be the file's byte length: {resp}"
+            );
+            assert_eq!(
+                result["mediaType"].as_str(),
+                Some("image/png"),
+                "mediaType must come from the guessed format: {resp}"
+            );
+            media_type = result["mediaType"].as_str().map(str::to_string);
+            let chunk = base64::engine::general_purpose::STANDARD
+                .decode(result["data"].as_str().expect("data must be a string"))
+                .expect("data must be valid base64");
+            assert!(
+                chunk.len() <= 512 * 1024,
+                "a chunk must stay within IMAGE_READ_CHUNK_BYTES: {}",
+                chunk.len()
+            );
+            assembled.extend_from_slice(&chunk);
+            chunks += 1;
+            match result["nextOffset"].as_u64() {
+                Some(next) => {
+                    assert_eq!(next, offset + chunk.len() as u64, "nextOffset must advance");
+                    offset = next;
+                }
+                None => break,
+            }
+        }
+        let expected_chunks = (source.len() as u64).div_ceil(512 * 1024) as usize;
+        assert!(
+            chunks == expected_chunks,
+            "expected {expected_chunks} chunks of at most 512 KiB, took {chunks}"
+        );
+        assert!(chunks > 1, "the fixture must actually span several chunks");
+        assert_eq!(media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            assembled.len(),
+            source.len(),
+            "the reassembled bytes must cover the whole file"
+        );
+        assert!(
+            assembled == source,
+            "the reassembled bytes must be byte-identical to the file on disk"
+        );
+    }
+
+    /// 分片边界：`offset` 落在文件末尾之后按空块收尾（`nextOffset: null`），
+    /// 不得越界 panic；末块确实返回 `null` 而不是再一次偏移。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_reports_the_final_chunk_with_a_null_offset() {
+        use base64::Engine as _;
+
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        let rel = format!(".yi-agent/attachments/{tid}/beef-small.png");
+        let stored = workdir.path().join(&rel);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([3, 4, 5]));
+        img.save_with_format(&stored, image::ImageFormat::Png)
+            .unwrap();
+        let source = std::fs::read(&stored).unwrap();
+
+        // 一次就取完：小图远小于一个分片。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":200,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert!(resp.get("error").is_none(), "image/read failed: {resp}");
+        let result = &resp["result"];
+        assert!(
+            result["nextOffset"].is_null(),
+            "the final chunk must report a null nextOffset: {resp}"
+        );
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(result["data"].as_str().unwrap())
+            .unwrap();
+        assert!(chunk == source, "the single chunk must be the whole file");
+
+        // 越过末尾的 offset 只能得到空块，不得读越界或 panic。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":201,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}","offset":100000}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert!(resp.get("error").is_none(), "past-the-end read: {resp}");
+        assert_eq!(resp["result"]["data"].as_str(), Some(""), "{resp}");
+        assert!(resp["result"]["nextOffset"].is_null(), "{resp}");
+
+        // `maxBytes` 生效：一次只要 4 字节，`nextOffset` 必须推进 4。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":202,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}","maxBytes":4}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert!(resp.get("error").is_none(), "sized read: {resp}");
+        let first = base64::engine::general_purpose::STANDARD
+            .decode(resp["result"]["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(first.len(), 4, "{resp}");
+        assert_eq!(resp["result"]["nextOffset"].as_u64(), Some(4), "{resp}");
+
+        // `maxBytes: 0` 不得造成 `nextOffset` 不前进（否则客户端死循环）：按未
+        // 指定处理，整张图一次取完。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":203,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}","maxBytes":0}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert!(resp.get("error").is_none(), "zero-sized read: {resp}");
+        let whole = base64::engine::general_purpose::STANDARD
+            .decode(resp["result"]["data"].as_str().unwrap())
+            .unwrap();
+        assert!(
+            whole == source,
+            "maxBytes:0 must fall back to the chunk cap"
+        );
+        h.shutdown().await;
+    }
+
+    /// 限根是安全边界：`../` 逃逸与工作区外的绝对路径都必须以 `invalid_params`
+    /// 拒绝——`image/read` 不得成为任意文件读取原语。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_refuses_a_path_outside_the_workspace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // cwd 是子目录，父目录里放一张**真图**：这样「被拒」只能是因为越界，
+        // 而不是因为文件不存在或不是图片。
+        let cwd = tmp.path().join("ws");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let secret = tmp.path().join("secret.png");
+        let img = image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([1, 1, 1]));
+        img.save_with_format(&secret, image::ImageFormat::Png)
+            .unwrap();
+
+        let mut cfg = default_config();
+        cfg.workdir = cwd.clone();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // (a) 相对路径向上逃逸。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":300,"method":"image/read","params":{{"threadId":"{tid}","path":"../secret.png"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "a relative escape must be refused as invalid_params: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("path escapes the workspace"),
+            "the escape must be caught by the confinement check, not by a fallback: {resp}"
+        );
+
+        // (b) 工作区外的绝对路径（`Path::join` 遇绝对路径会整体替换）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":301,"method":"image/read","params":{{"threadId":"{tid}","path":"{}"}}}}"#,
+            secret.display()
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "an outside absolute path must be refused as invalid_params: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("path escapes the workspace"),
+            "the absolute path must be caught by the confinement check: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 只送可解码的图片：一个文本文件即使在工作区内也必须被拒。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_refuses_a_non_image_file() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        std::fs::write(workdir.path().join("notes.txt"), b"just some text\n").unwrap();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":400,"method":"image/read","params":{{"threadId":"{tid}","path":"notes.txt"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "a non-image must be refused as invalid_params: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("not a supported image"),
+            "the text file must be rejected by the format guess: {resp}"
+        );
+
+        // 把 PDF 伪装成 .png 的扩展名也一样：判定看的是字节，不是名字。
+        std::fs::write(workdir.path().join("fake.png"), b"%PDF-1.4 fake\n").unwrap();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":401,"method":"image/read","params":{{"threadId":"{tid}","path":"fake.png"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "the extension must not decide; the bytes must: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("not a supported image"),
+            "the mislabelled PDF must be rejected by the format guess: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 超过 `IMAGE_READ_MAX_BYTES`（20 MiB）的图必须被拒——分片只是传输形态，
+    /// 不代表可以无上限地服务任意大文件。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_refuses_an_oversized_image() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 一个宽 6000px 的 PNG 位图够 20 MiB；重新编码成 PNG 更容易超限。
+        let rel = format!(".yi-agent/attachments/{tid}/huge.png");
+        let stored = workdir.path().join(&rel);
+        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
+        write_an_uncompressed_png(&stored);
+        // 直接从磁盘读回来按字节补齐到 20 MiB 以上；文件本身仍是同一张真 PNG
+        // （PNG 允许附加尾随数据，`guess_format` 只看魔数，尺寸检查据此拒绝）。
+        let mut bytes = std::fs::read(&stored).unwrap();
+        bytes.resize(20 * 1024 * 1024 + 1, 0);
+        std::fs::write(&stored, &bytes).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":500,"method":"image/read","params":{{"threadId":"{tid}","path":"{rel}"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "an image past IMAGE_READ_MAX_BYTES must be refused: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("image too large"),
+            "the refusal must come from the size gate: {resp}"
+        );
+
+        // 一个超过上限的**非图片**同样要在读取/解码之前被拒：闸门按元数据长度
+        // 先设，故它报的是尺寸而不是「不是图片」——证明没有先把整个文件读进来。
+        let huge_text = workdir.path().join("huge.txt");
+        std::fs::write(&huge_text, vec![b'a'; 20 * 1024 * 1024 + 1]).unwrap();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":501,"method":"image/read","params":{{"threadId":"{tid}","path":"huge.txt"}}}}"#
+        ))
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "an oversized file of any kind must be refused: {resp}"
+        );
+        assert_eq!(
+            resp["error"]["message"].as_str(),
+            Some("image too large"),
+            "the metadata gate must fire before the format guess: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 未知 thread 必须拒绝（`thread_cwd` 两条解析路径都落空）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_read_refuses_an_unknown_thread() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        initialize(&mut h).await;
+
+        h.send(
+            r#"{"jsonrpc":"2.0","id":600,"method":"image/read","params":{"threadId":"thread-nope","path":"a.png"}}"#,
+        )
+        .await;
+        let resp = h.read_value().await;
+        assert_eq!(
+            resp["error"]["code"].as_i64(),
+            Some(-32602),
+            "an unknown thread must be refused: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// `thread_cwd` 的两条解析路径（控制器裁定 2）+ 落空：
+    /// - 内存里的会话直接给 `Session.cwd`；
+    /// - 冷 thread 按全局索引定位其 store，再由 `<cwd>/.yi-agent/threads` 上溯两级；
+    /// - 两处都没有 → `None`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_cwd_prefers_memory_then_the_index() {
+        let warm = tempfile::TempDir::new().unwrap();
+        let cold = tempfile::TempDir::new().unwrap();
+        let cfg = default_config();
+
+        // 内存路径：`threads` 里有该 id，工作区取自 `Session.cwd`。
+        let (prompt_tx, _prompt_rx) = mpsc::channel(1);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel(1);
+        let (interject_tx, _interject_rx) = mpsc::channel(1);
+        let (session_tx, _session_rx) = mpsc::channel(1);
+        let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+        threads.insert(
+            "warm".to_string(),
+            ThreadSession {
+                thread_id: "warm".to_string(),
+                cwd: warm.path().to_string_lossy().to_string(),
+                model: "test".to_string(),
+                active_turn_id: None,
+                yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+                process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+                prompt_tx,
+                interrupt_tx,
+                interject_tx,
+                session_tx,
+                store: Arc::new(crate::thread_store::ThreadStore::new(warm.path())),
+                status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
+            },
+        );
+
+        // 冷 thread：store 在磁盘上，但它不在 `threads` 里。
+        let cold_store = crate::thread_store::ThreadStore::new(cold.path());
+        cold_store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: "cold".to_string(),
+                cwd: cold.path().to_string_lossy().to_string(),
+                model: "test".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                title: None,
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+                board_project: None,
+                card_id: None,
+                model_ref: None,
+            })
+            .unwrap();
+        // 全局索引指向该工作区（canonicalize 以对齐真实写入的路径形态）。
+        let index_dir = tempfile::TempDir::new().unwrap();
+        let workspaces = WorkspaceIndex::new(index_dir.path().join("workspaces.json"));
+        workspaces
+            .add(&cold.path().canonicalize().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            thread_cwd(&threads, &workspaces, &cfg, "warm"),
+            Some(warm.path().to_path_buf()),
+            "an in-memory thread must resolve from its own session cwd"
+        );
+        assert_eq!(
+            thread_cwd(&threads, &workspaces, &cfg, "cold"),
+            Some(cold.path().canonicalize().unwrap()),
+            "a cold thread must resolve from the store's root, two levels up"
+        );
+        assert_eq!(
+            thread_cwd(&threads, &workspaces, &cfg, "ghost"),
+            None,
+            "a thread with neither an in-memory session nor an index entry is unknown"
+        );
     }
 
     /// 只发附件、不打字也必须能起 turn（空 input 校验放宽到「既无文本又无附件」）。
