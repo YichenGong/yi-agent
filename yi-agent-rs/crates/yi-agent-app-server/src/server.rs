@@ -3442,6 +3442,17 @@ where
                                 "[app-server] failed to persist permission_mode for {thread_id}: {e}"
                             ),
                         }
+                        // 广播给所有客户端(列表层恒推):桌面改 → 手机 chip 同步,
+                        // 手机改 → 桌面 chip 同步。与 `setModel` 的 ModelChanged
+                        // 广播同一手法。
+                        let _ = write_notification(
+                            &hub,
+                            &Notification::PermissionModeChanged {
+                                thread_id: thread_id.clone(),
+                                mode,
+                            },
+                        )
+                        .await;
                         write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "thread/setPinned" => {
@@ -15090,6 +15101,40 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 切换模式必须**广播** `thread/permissionModeChanged`:这是跨客户端同步
+    /// （桌面改 → 手机同步、手机改 → 桌面 chip 同步）的唯一通道。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_permission_mode_broadcasts_the_change() {
+        let mut h = Harness::new(); // stdio = Admin,但广播与 scope 无关
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+
+        // 响应与通知都在流上,顺序不保证;分别收敛。
+        let mut response: Option<serde_json::Value> = None;
+        let mut changed: Option<serde_json::Value> = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                response = Some(v);
+            } else if v.get("method").and_then(|m| m.as_str())
+                == Some("thread/permissionModeChanged")
+            {
+                changed = Some(v);
+            }
+            if response.is_some() && changed.is_some() {
+                break;
+            }
+        }
+        assert!(response.is_some(), "setPermissionMode 必须有响应");
+        let changed = changed.expect("must broadcast thread/permissionModeChanged");
+        assert_eq!(changed["params"]["thread_id"].as_str(), Some(tid.as_str()));
+        assert_eq!(changed["params"]["mode"].as_str(), Some("yolo"));
+        h.shutdown().await;
+    }
+
     /// The desktop stdio client is `Admin`: the same call must go through.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_admin_client_may_delete_a_thread() {
@@ -16990,6 +17035,48 @@ pub(crate) mod tests {
             v["error"]["code"], -32014,
             "control client must be denied admin rpc: {v}"
         );
+        h.shutdown().await;
+    }
+
+    /// 跨客户端同步的端到端证明:桌面(stdio)改 mode,手机(ws,Control)必须收到
+    /// `thread/permissionModeChanged`——修复前没有任何 mode 通知,手机停在旧值。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merged_loop_fans_out_permission_mode_change_to_ws_client() {
+        let mut h = MergedHarness::new().await;
+        let mut ws = h.connect_ws().await;
+        crate::server::tests_support::initialize(&mut ws).await;
+
+        // stdio 起一个 thread。
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = h.read_value().await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let mut thread_id = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                thread_id = Some(v["result"]["thread_id"].as_str().unwrap().to_string());
+                break;
+            }
+        }
+        let thread_id = thread_id.expect("thread/start response");
+
+        // ws 客户端先收到 thread/started（建立它的视图），再等 mode 通知。
+        let _ = ws_await_notification(&mut ws, "thread/started").await;
+
+        // stdio 切 yolo。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setPermissionMode","params":{{"threadId":"{thread_id}","mode":"yolo"}}}}"#
+        ))
+        .await;
+
+        let notif = ws_await_notification(&mut ws, "thread/permissionModeChanged").await;
+        assert_eq!(
+            notif["params"]["thread_id"].as_str(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(notif["params"]["mode"].as_str(), Some("yolo"));
         h.shutdown().await;
     }
 }
