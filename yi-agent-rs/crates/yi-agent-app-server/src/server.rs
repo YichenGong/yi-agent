@@ -46,6 +46,9 @@ pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// 把改动面扩散到全部 RPC 分支。3s 足够跟上卡片状态流转,又远短于卡片的生命周期。
 const CARD_SCHEDULER_TICK: Duration = Duration::from_secs(3);
 
+/// 首轮 LLM 标题生成的超时:超时即回退兜底标题，绝不卡住 turn 收尾。
+const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// driver task → 主循环的完成事件。
 enum TurnEvent {
     Finished { thread_id: String, turn_id: String },
@@ -5198,6 +5201,8 @@ async fn persist_and_finish_turn(
     store: &crate::thread_store::ThreadStore,
     hub: &crate::broadcast::Broadcaster,
     turn_tx: &mpsc::Sender<TurnEvent>,
+    provider: &Arc<dyn yi_agent_core::Provider>,
+    config: &yi_agent_core::AgentConfig,
     status: &Arc<std::sync::Mutex<ThreadStatus>>,
 ) {
     let mut items = Vec::with_capacity(completed_items.len() + 1);
@@ -5211,24 +5216,80 @@ async fn persist_and_finish_turn(
     }
     items.extend(completed_items);
 
+    // 先取助手侧材料：`items` 接下来会 move 进 `record`，此后无法再借用。
+    let assistant_text = completed_items_agent_text(&items);
     let record = crate::thread_store::TurnLine::Turn {
         items,
         usage: last_usage,
         messages: agent.session().messages().to_vec(),
     };
     // append 失败则跳过 touch：避免出现"幽灵" thread。
+    let mut first_turn = false;
     if let Err(e) = store.append_turn(thread_id, &record) {
         eprintln!("[app-server] failed to persist turn {thread_id}: {e}");
     } else if let Some(prompt) = user_prompt {
-        if let Err(e) = store.touch(thread_id, Some(prompt)) {
-            eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
+        match store.touch(thread_id, Some(prompt)) {
+            // 本次刚写入兜底截断标题 = 该 thread 的首轮。
+            Ok(true) => first_turn = true,
+            Ok(false) => {}
+            Err(e) => eprintln!("[app-server] failed to update meta for {thread_id}: {e}"),
         }
     }
 
+    // 先广播「本轮已落盘」，再做标题生成：标题是锦上添花，绝不能拖住 turn 收尾。
+    // delete/interrupt 路径正是靠这枚 Finished 判定落盘完成，而标题生成最长可等
+    // TITLE_TIMEOUT——若排在它前面，会让收尾凭空多出 5 秒延迟。
     let _ = update_status(hub, status, thread_id, ThreadStatus::Idle).await;
     if let Some(turn_id) = turn_id {
         let _ = turn_tx.send(finished_event(thread_id, turn_id)).await;
     }
+
+    // 仅首轮生成标题：拿 touch 写入的兜底截断值作 CAS 凭据，尝试用 LLM 标题覆盖。
+    // 任何失败/超时/空结果都静默保留兜底标题。clear / compact 传 `user_prompt = None`，
+    // 天然不会走到这里。
+    if first_turn {
+        if let Some(prompt) = user_prompt {
+            let fallback = crate::thread_store::title_from(prompt);
+            match tokio::time::timeout(
+                TITLE_TIMEOUT,
+                yi_agent_core::title::generate_title(
+                    provider,
+                    config,
+                    prompt,
+                    assistant_text.as_deref(),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(Some(title))) => {
+                    if let Err(e) = store.set_title_if_unchanged(thread_id, &fallback, &title) {
+                        eprintln!("[app-server] failed to set LLM title {thread_id}: {e}");
+                    }
+                }
+                // 模型产出无法作为标题：保留兜底标题。
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => {
+                    tracing::info!(%e, %thread_id, "title generation failed; keeping fallback");
+                }
+                Err(_) => {
+                    tracing::info!(%thread_id, "title generation timed out; keeping fallback");
+                }
+            }
+        }
+    }
+}
+
+/// 从本轮 items 里取第一条助手文本：作为标题生成材料的"助手回复"侧。
+///
+/// 空文本的 `AgentMessage` 视为不存在：`build_title_material` 对 `Some("")` 会渲染
+/// 一个悬空的"助手回复："标签，反而污染标题模型的输入。
+fn completed_items_agent_text(items: &[crate::protocol::Item]) -> Option<String> {
+    items.iter().find_map(|item| match item {
+        crate::protocol::Item::AgentMessage { text, .. } if !text.trim().is_empty() => {
+            Some(text.clone())
+        }
+        _ => None,
+    })
 }
 
 /// 在**没有 turn 在跑**的时刻执行一条会话命令，返回（可能被重建过的）agent。
@@ -5277,6 +5338,8 @@ async fn apply_session_command(
                 store,
                 hub,
                 turn_tx,
+                provider,
+                config,
                 status,
             )
             .await;
@@ -5315,6 +5378,8 @@ async fn apply_session_command(
                 store,
                 hub,
                 turn_tx,
+                provider,
+                config,
                 status,
             )
             .await;
@@ -5866,6 +5931,8 @@ async fn run_thread_driver(
             &store,
             &hub,
             &turn_tx,
+            &provider,
+            &config,
             &status,
         )
         .await;
@@ -8651,6 +8718,9 @@ pub(crate) mod tests {
     }
 
     /// 记录每次调用收到的 message 数,并回显 `n=<count>` 作为 agent 文本。
+    ///
+    /// 标题生成（`system == TITLE_INSTRUCTIONS`）不是对话轮次，不算在内：否则
+    /// 「恢复上下文后第二轮应看到 3 条消息」之类的断言会把标题请求也算成一次调用。
     struct RecordingProvider {
         seen: Arc<std::sync::Mutex<Vec<usize>>>,
     }
@@ -8664,6 +8734,14 @@ pub(crate) mod tests {
             futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
             yi_agent_core::provider::ProviderError,
         > {
+            if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    yi_agent_core::provider::ProviderEvent::TextDelta("t".into()),
+                    yi_agent_core::provider::ProviderEvent::Stop {
+                        reason: yi_agent_core::provider::StopReason::EndTurn,
+                    },
+                ])));
+            }
             let n = req.messages.len();
             self.seen.lock().unwrap().push(n);
             let events = vec![
@@ -8678,6 +8756,9 @@ pub(crate) mod tests {
 
     /// 捕获每次调用里最后一条 user 文本:证明送进**模型**的确实是带清单的
     /// prompt(而不是气泡上的原话)。清单是注入给模型的,气泡只放用户原话。
+    ///
+    /// 标题生成（`system == TITLE_INSTRUCTIONS`）也是"送进模型"的调用，但它送的是
+    /// 标题材料而非对话 prompt，故不捕获——本 provider 只关心对话轮次。
     struct CapturingProvider {
         prompts: Arc<std::sync::Mutex<Vec<String>>>,
     }
@@ -8692,6 +8773,14 @@ pub(crate) mod tests {
             yi_agent_core::provider::ProviderError,
         > {
             use yi_agent_core::message::{ContentBlock, Role};
+            if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    yi_agent_core::provider::ProviderEvent::TextDelta("t".into()),
+                    yi_agent_core::provider::ProviderEvent::Stop {
+                        reason: yi_agent_core::provider::StopReason::EndTurn,
+                    },
+                ])));
+            }
             if let Some(last_user) = req.messages.iter().rev().find(|m| m.role == Role::User) {
                 let text = last_user
                     .content
@@ -8752,6 +8841,74 @@ pub(crate) mod tests {
             Err(yi_agent_core::provider::ProviderError::Network(
                 "boom".into(),
             ))
+        }
+    }
+
+    /// 返回固定标题文本的 provider:用于断言首轮标题来自 LLM。
+    ///
+    /// 主 agent 的对话调用**也**带 system prompt(`config.system_prompt`),所以
+    /// 区分"标题请求"只能精确比较 `system == Some(TITLE_INSTRUCTIONS)`,绝不能用
+    /// `system.is_some()`。
+    struct TitleProvider;
+
+    #[async_trait]
+    impl yi_agent_core::Provider for TitleProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            // 标题请求(恰好命中 TITLE_INSTRUCTIONS)返回固定标题;其余(主 agent
+            // 对话)返回正文 "ok"。
+            let text = if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+                "修复登录报错"
+            } else {
+                "ok"
+            };
+            let events = vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta(text.into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 正文正常返回;但标题请求(恰好命中 `TITLE_INSTRUCTIONS`)返回错误，
+    /// 用于覆盖"生成失败静默回退兜底标题"的路径。
+    ///
+    /// `title_calls` 记录标题请求的命中次数。仅断言"最终标题 == 兜底标题"是**不具
+    /// 辨识力**的:兜底标题本就等于 `title_from(prompt)`,与 `touch` 写入的字节完全
+    /// 一致,哪怕标题请求一次都没发出,断言照样通过。必须能观察到"确实尝试过且失败"。
+    struct RejectingTitleProvider {
+        title_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for RejectingTitleProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+                self.title_calls.fetch_add(1, Ordering::SeqCst);
+                return Err(yi_agent_core::provider::ProviderError::Network(
+                    "title boom".into(),
+                ));
+            }
+            let events = vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("ok".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
         }
     }
 
@@ -8859,6 +9016,38 @@ pub(crate) mod tests {
         // `agent.config().model` 为上报来源(任务 7 评审 Finding 1),若这里沿用
         // `AgentConfig::default()` 的默认串,就会让夹具与生产语义(会话按 cfg 的模型
         // 起跑)脱节。
+        let config = yi_agent_core::AgentConfig {
+            model: super::tests_support::TEST_MODEL.to_string(),
+            ..yi_agent_core::AgentConfig::default()
+        };
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        apply_session(&mut agent, session);
+        Ok(BuiltAgent {
+            agent,
+            provider,
+            config,
+            decision_tx: None,
+            decision_rx: None,
+            catalog: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        })
+    }
+
+    /// 用指定 provider 构造 agent，其余与 `build_test_agent` 一致。
+    ///
+    /// 标题生成测试需要"同一个 provider 既服务主对话、又服务标题请求"，故工厂必须
+    /// 能注入 provider——`build_test_agent` 把 `MockProvider` 写死在体内。
+    fn build_test_agent_with_provider(
+        provider: Arc<dyn yi_agent_core::Provider>,
+        session: Option<yi_agent_core::Session>,
+        _cwd: &std::path::Path,
+        _mode: crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent> {
         let config = yi_agent_core::AgentConfig {
             model: super::tests_support::TEST_MODEL.to_string(),
             ..yi_agent_core::AgentConfig::default()
@@ -14299,6 +14488,96 @@ pub(crate) mod tests {
             .await;
         let v = h.read_value().await;
         assert_eq!(v["error"]["code"], -32011);
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn first_turn_title_comes_from_llm() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(TitleProvider);
+        let mut h = Harness::with_config(
+            cfg,
+            move |session, cwd, mode| {
+                build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+        ))
+        .await;
+        // 读到 turn/completed 后，meta 标题应已是 LLM 给出的标题。标题生成排在
+        // 「本轮已落盘」广播之后（绝不拖住 turn 收尾），故此刻可能先看到兜底标题，
+        // 需轮询到期望的 LLM 标题出现（最多 ~1s）再断言。
+        let mut title = None;
+        for _ in 0..40 {
+            let store = crate::thread_store::ThreadStore::new(dir.path());
+            if let Ok(Some(loaded)) = store.load(&tid) {
+                if let Some(t) = loaded.meta.title {
+                    if t == "修复登录报错" {
+                        title = Some(t);
+                        break;
+                    }
+                    title = Some(t);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(title.as_deref(), Some("修复登录报错"));
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn first_turn_title_falls_back_when_generation_fails() {
+        // 用 RejectingTitleProvider：正文正常、但标题请求（带 system）返回错误。
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let title_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RejectingTitleProvider {
+            title_calls: title_calls.clone(),
+        });
+        let mut h = Harness::with_config(
+            cfg,
+            move |session, cwd, mode| {
+                build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+        ))
+        .await;
+        let mut title = None;
+        for _ in 0..40 {
+            let store = crate::thread_store::ThreadStore::new(dir.path());
+            if let Ok(Some(loaded)) = store.load(&tid) {
+                if let Some(t) = loaded.meta.title {
+                    title = Some(t);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // 关键：标题生成请求**必须真的发出过且失败**。仅断言标题等于 fallback 是
+        // 不具辨识力的——fallback 与 `touch` 写入的字节完全相同，标题请求一次不发
+        // 也照样通过（在基线 commit 上同样通过）。这里以命中计数证明失败路径被走到。
+        assert!(
+            title_calls.load(Ordering::SeqCst) >= 1,
+            "a title-generation request must have been attempted (and failed)"
+        );
+        // 且失败后静默保留兜底标题 —— 即 title_from("登录页报错了")（原样截断）。
+        assert_eq!(title.as_deref(), Some("登录页报错了"));
         h.shutdown().await;
     }
 

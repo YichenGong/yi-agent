@@ -139,6 +139,19 @@ append_turn(thread_id, turn)
 
 - 行为变化仅限"首轮标题来源"。首轮收尾增加一次短路 LLM 调用，最长 5s 超时，
   通常数百毫秒；超时/失败回退，不影响 turn 完成。
-- 无协议、无前端改动；`thread/list(All)` 读的就是 `meta.title`，桌面端
-  `turn/completed` 后已有的 `refreshThreads()` 会自动拉到新标题。
+- 无协议、无前端改动；`thread/list(All)` 读的就是 `meta.title`。
+- **标题不会随 `turn/completed` 自动刷新（已知限制）。** `turn/completed` 由
+  translator 在 `persist_and_finish_turn` **之前**发出，而兜底标题与随后可能的
+  LLM 标题都写在 `persist_and_finish_turn` **之后**。因此桌面端在本轮 `turn/completed`
+  触发的 `refreshThreads()` 只能拿到兜底截断标题；LLM 标题要等到下一次**无关的**
+  刷新（后续轮的 `thread/listAll`、resume、或重连）才会显示。这是本分支**有意**
+  接受的行为，见下。
 - 手动改名（`thread/rename`）优先级通过 CAS 得以保留。
+
+### 5.1 已知限制 / 后续
+
+- **本轮不修**：让 LLM 标题在侧栏即时可见，需要在标题落盘后主动通知桌面端——即
+  新增一条 thread 元数据变更通知（`thread/titleChanged` 之类）。本分支明确约定
+  "不改协议、不碰桌面端"，故**不**添加任何协议消息或通知，仅在此记录该限制。
+- 后续若要做：在 `set_title_if_unchanged` 成功后广播一条独立的元数据变更通知，
+  由桌面端据此仅刷新该 thread 的标题；届时合入应同步更新本节与相关测试。
