@@ -29,6 +29,14 @@ pub struct TurnPrompt {
     /// 真正的内容块（`ContentBlock::Image`），由 driver 用 `run_blocks` 送出去。
     /// 两者可以同时存在。
     pub image_blocks: Vec<yi_agent_core::ContentBlock>,
+    /// 本轮图片的元数据（**不含 base64**），供 driver 落盘/checkpoint 时写进
+    /// 开启的 `userMessage` item 的 `images`。
+    ///
+    /// 与 `image_blocks` 是同一份数据的两种视图：块给模型，引用给 wire。这里
+    /// 直接带上 `prepare_turn_core` 已经算好的那一份，而不是让 driver 从块里
+    /// 反推——反推需要重新求 `size`（读文件 / 量载荷），一旦两处的口径不同，
+    /// 实时开启项与落盘项就会对同一个图报出不同的数字。
+    pub image_refs: Vec<crate::protocol::ImageRef>,
     /// 气泡与落盘项显示的文本:用户原话,**不含**注入的附件清单。
     ///
     /// `prompt` 是加了清单(送给模型)的那一份;落盘/checkpoint 必须用这一份,

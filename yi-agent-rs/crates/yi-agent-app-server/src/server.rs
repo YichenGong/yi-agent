@@ -5235,60 +5235,6 @@ async fn persist_and_finish_turn(
     }
 }
 
-/// 从一个已编码的图片内容块里反推 `Item` 上的图片引用。
-///
-/// driver 手上只有 `TurnPrompt.image_blocks`（内容块），而落盘/回显要的是
-/// `ImageRef`（只带元数据、绝不含 base64——传输帧上限 1 MiB）。从块上取字段
-/// 而不是在 `TurnPrompt` 里再存一份 `image_refs`：一份数据一个来源，不会漂移。
-///
-/// `size` 取**磁盘上那个文件**的大小（`root.join(path)`），不是 base64 载荷的
-/// 大小：`path` 与文件是配对的，客户端展示的大小必须与它随后经 `image/read`
-/// 取到的字节数一致。载荷是重编码结果（JPEG 重编码 / 超限降采样都会改变大小），
-/// 用它会让气泡上写的大小和真正读到的字节对不上。文件已不在（例如本轮中途被
-/// 删）才退回载荷长度——宁可数字略有出入，也好过整块引用消失。
-fn image_ref_from_block(
-    root: &Path,
-    block: &yi_agent_core::ContentBlock,
-) -> Option<crate::protocol::ImageRef> {
-    let yi_agent_core::ContentBlock::Image {
-        source,
-        detail,
-        path,
-    } = block
-    else {
-        return None;
-    };
-    let path = path.clone()?;
-    let media_type = match source {
-        yi_agent_core::ImageSource::Base64 { media_type, .. } => media_type.clone(),
-        // URL 来源的图片没有本地文件可数，本路径也不产出这种块。
-        yi_agent_core::ImageSource::Url(_) => return None,
-    };
-    let size = match std::fs::metadata(root.join(&path)) {
-        Ok(meta) => meta.len(),
-        Err(_) => match source {
-            yi_agent_core::ImageSource::Base64 { data, .. } => base64_decoded_len(data),
-            yi_agent_core::ImageSource::Url(_) => return None,
-        },
-    };
-    Some(crate::protocol::ImageRef {
-        path,
-        media_type,
-        size,
-        detail: Some(detail.as_wire_str().to_string()),
-    })
-}
-
-/// 标准 base64 串解码后的精确字节数（不分配、不解码）。
-///
-/// `size` 是给 UI 显示的原始字节数，不能用「估算上界」——`image/read` 会按
-/// `size` 决定分片循环的终点，多算几个字节会让客户端去读不存在的尾巴。
-/// 公式：每 4 字符一组产出 3 字节，末尾 `=` 每个吃掉 1 字节。
-fn base64_decoded_len(data: &str) -> u64 {
-    let padding = data.bytes().rev().take_while(|b| *b == b'=').count().min(2);
-    (((data.len() / 4) * 3).saturating_sub(padding)) as u64
-}
-
 /// 在**没有 turn 在跑**的时刻执行一条会话命令，返回（可能被重建过的）agent。
 ///
 /// 清空与压缩都**就地**替换会话内容(`set_session_messages`),不换 `Arc`:同一
@@ -5503,6 +5449,7 @@ async fn run_thread_driver(
             activate,
             attachments: turn_attachments,
             image_blocks,
+            image_refs,
             display_text,
         }) = turn_prompt
         else {
@@ -5544,14 +5491,11 @@ async fn run_thread_driver(
         // 本轮附件暂存:落盘时写进开启的 userMessage item。
         let user_attachments = turn_attachments;
         // 本轮图片暂存:落盘时写进开启的 userMessage item 的 `images`。
-        // 从内容块里反推元数据,而不是再存一份——块的 `path` 就是落在根内的
-        // 相对路径,`source` 里带着 media_type,一份数据一个来源。
-        // 图片的根 = 该 thread 的 cwd（`ThreadStore` 就是用它建的）。
-        let image_root = store.root().to_path_buf();
-        let user_image_refs: Vec<crate::protocol::ImageRef> = image_blocks
-            .iter()
-            .filter_map(|block| image_ref_from_block(&image_root, block))
-            .collect();
+        // 直接取 `TurnPrompt` 上 `prepare_turn_core` 算好的那一份引用,不再从
+        // 内容块里反推元数据:反推就得重新求 `size`,而实时开启项（`start_turn_core`
+        // 里的 `opening_user_item`）用的是 prepare 阶段那一份——两处各算各的,
+        // 一旦口径不同,同一个图在实时气泡与回放气泡上会显示成两个大小。
+        let user_image_refs = image_refs;
         // 送给模型的内容块:文本(若有)在前,图片在后。
         let mut blocks: Vec<yi_agent_core::ContentBlock> = Vec::new();
         if !prompt.is_empty() {
@@ -6253,6 +6197,7 @@ where
                 activate: prepared.activate,
                 attachments: prepared.attachments,
                 image_blocks: prepared.image_blocks,
+                image_refs: prepared.image_refs,
                 display_text: prepared.display_text,
             })
             .await
@@ -6812,6 +6757,7 @@ async fn start_turn_core(
             activate: prepared.activate,
             attachments: prepared.attachments,
             image_blocks: prepared.image_blocks,
+            image_refs: prepared.image_refs,
             display_text: prepared.display_text,
         })
         .await
@@ -10566,59 +10512,6 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
-    /// `size` 必须与 `path` 指向的**文件**一致（客户端展示的大小要和 `image/read`
-    /// 真正取到的字节数对得上）；文件不在时才退回载荷长度。
-    #[test]
-    fn image_ref_prefers_the_file_size_and_falls_back_to_the_payload() {
-        let dir = tempfile::TempDir::new().unwrap();
-        // "QUJD" 是 "ABC" 的 base64（3 字节）。
-        let block = yi_agent_core::ContentBlock::Image {
-            source: yi_agent_core::ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "QUJD".into(),
-            },
-            detail: yi_agent_core::ImageDetail::High,
-            path: Some(".yi-agent/attachments/t/x.png".into()),
-        };
-        let absent = image_ref_from_block(dir.path(), &block).unwrap();
-        assert_eq!(absent.size, 3, "no file: fall back to the payload length");
-        assert_eq!(absent.media_type, "image/png");
-        assert_eq!(absent.detail.as_deref(), Some("high"));
-
-        let stored = dir.path().join(".yi-agent/attachments/t/x.png");
-        std::fs::create_dir_all(stored.parent().unwrap()).unwrap();
-        std::fs::write(&stored, [0u8; 5]).unwrap();
-        assert_eq!(
-            image_ref_from_block(dir.path(), &block).unwrap().size,
-            5,
-            "a present file (the re-encoded payload) is the source of truth"
-        );
-    }
-
-    #[test]
-    fn image_ref_ignores_non_images_and_blocks_without_a_path() {
-        let dir = tempfile::TempDir::new().unwrap();
-        assert!(
-            image_ref_from_block(dir.path(), &yi_agent_core::ContentBlock::Text("hi".into()))
-                .is_none()
-        );
-        let no_path = yi_agent_core::ContentBlock::Image {
-            source: yi_agent_core::ImageSource::Base64 {
-                media_type: "image/png".into(),
-                data: "QUJD".into(),
-            },
-            detail: yi_agent_core::ImageDetail::High,
-            path: None,
-        };
-        assert!(image_ref_from_block(dir.path(), &no_path).is_none());
-        let url = yi_agent_core::ContentBlock::Image {
-            source: yi_agent_core::ImageSource::Url("https://example.test/y.png".into()),
-            detail: yi_agent_core::ImageDetail::High,
-            path: Some("y.png".into()),
-        };
-        assert!(image_ref_from_block(dir.path(), &url).is_none());
-    }
-
     /// 桌面端从「图片」选择器选中的图（工作区外的绝对路径）必须被复制进 thread
     /// 的 cwd，元数据以 `ImageRef` 回显在开启项上；气泡正文仍是用户原话，
     /// 图片**不进**附件清单（它是内容块，不是文档附件）。
@@ -10682,6 +10575,121 @@ pub(crate) mod tests {
         assert_eq!(opened["type"], "userMessage", "{line}");
         assert_eq!(opened["images"][0]["path"], rel, "{line}");
         assert_eq!(opened["images"][0]["size"], src.metadata().unwrap().len());
+        h.shutdown().await;
+    }
+
+    /// 回归：`images[].size` 必须取**存盘文件**的大小，而不是重编码后载荷的长度。
+    ///
+    /// 上面那条测试用的是 8x8 直通 PNG：`prepare_image_file` 原样返回源字节，
+    /// 于是「载荷长度」与「文件大小」恰好相等，即使实现数错了也照样通过。
+    /// 真正会暴露问题的是**被重编码**的图：这里用一张宽 4096px 的 PNG，`High`
+    /// 档（最长边 2048）必然触发降采样重编码，载荷与文件大小不再相等。
+    ///
+    /// 同时断言落盘的 `.jsonl` 开启项与实时 `item/started` 开启项**是同一个数**：
+    /// 两者若各算各的（一个读文件、一个量载荷）就会分叉，这正是被修复的缺陷。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_re_encoded_image_persists_the_stored_file_size() {
+        let workdir = tempfile::TempDir::new().unwrap();
+        let mut cfg = default_config();
+        cfg.workdir = workdir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+
+        // 宽 4096、高 64 的 PNG：最长边超 2048，`High` 档必降采样重编码；
+        // 且整幅尺寸很小，编码后仍远低于字节预算，所以走的就是「降采样 + 重编码」
+        // 这条（而不是字节超限才降级的）路径。
+        let outside = tempfile::TempDir::new().unwrap();
+        let src = outside.path().join("wide.png");
+        let img = image::RgbImage::from_fn(4096, 64, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 253) as u8, ((x ^ y) % 255) as u8])
+        });
+        img.save_with_format(&src, image::ImageFormat::Png).unwrap();
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}},{{"type":"text","text":"看看这张"}}]}}}}"#,
+            src.display()
+        ))
+        .await;
+
+        // 实时开启项：`size` 必须等于存盘文件的大小（重编码不影响它）。
+        let mut opener: Option<serde_json::Value> = None;
+        for _ in 0..14 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/started") {
+                opener = Some(v["params"]["item"].clone());
+                break;
+            }
+        }
+        let item = opener.expect("the turn must open with an item");
+        let rel = item["images"][0]["path"]
+            .as_str()
+            .expect("image path")
+            .to_string();
+        let stored = workdir.path().join(&rel);
+        let stored_len = stored.metadata().expect("the stored copy must exist").len();
+
+        // 前提检查：这张图确实被 image_prep 重编码了，否则本条测试抓不到缺陷。
+        //
+        // 存盘文件是源字节的**逐字副本**，所以文件大小永远等于源大小；重编码的
+        // 结果只存在于内存里的 base64 载荷。这里用同一个公开入口复算一次载荷，
+        // 证实「载荷长度 != 文件大小」，于是「缺了这段元数据就只能去量载荷」的
+        // 老实现必然落在这个数上。
+        let payload_len = match yi_agent_tools::image_prep::prepare_image_file(
+            &stored,
+            yi_agent_core::ImageDetail::High,
+            yi_agent_tools::image_prep::resolve_budget(),
+        )
+        .expect("the fixture must be a readable image")
+        {
+            yi_agent_tools::image_prep::PreparedImage::Ready {
+                data, width, note, ..
+            } => {
+                assert!(
+                    width < 4096,
+                    "the fixture must be downscaled (width {width}) for this test to be meaningful"
+                );
+                assert!(
+                    note.is_some(),
+                    "the fixture must be re-encoded (no note means pass-through)"
+                );
+                let b64 = data.as_bytes();
+                let padding = b64.iter().rev().take_while(|b| **b == b'=').count().min(2);
+                ((b64.len() / 4) * 3 - padding) as u64
+            }
+            other => panic!("expected a Ready image, got {other:?}"),
+        };
+        assert_ne!(
+            payload_len, stored_len,
+            "the fixture must actually be re-encoded for this test to be meaningful"
+        );
+        assert_eq!(
+            item["images"][0]["size"].as_u64(),
+            Some(stored_len),
+            "the live opener must report the stored file size, not the payload length: {item}"
+        );
+
+        // 落盘开启项：与实时开启项必须是同一个数（一份来源）。
+        let _ = h.read_until_turn_completed().await;
+        let jsonl = std::fs::read_to_string(
+            workdir
+                .path()
+                .join(".yi-agent")
+                .join("threads")
+                .join(format!("{tid}.jsonl")),
+        )
+        .expect("the thread log must exist after a completed turn");
+        let line: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        let opened = &line["items"][0];
+        assert_eq!(opened["images"][0]["path"], rel.as_str(), "{opened}");
+        assert_eq!(
+            opened["images"][0]["size"].as_u64(),
+            Some(stored_len),
+            "the persisted opener must report the stored file size: {opened}"
+        );
+        assert_eq!(
+            opened["images"][0]["size"], item["images"][0]["size"],
+            "the persisted and live openers must agree: {opened} vs {item}"
+        );
         h.shutdown().await;
     }
 
@@ -11486,6 +11494,7 @@ pub(crate) mod tests {
                 activate: None,
                 attachments: Vec::new(),
                 image_blocks: Vec::new(),
+                image_refs: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -11610,6 +11619,7 @@ pub(crate) mod tests {
                 activate: None,
                 attachments: Vec::new(),
                 image_blocks: Vec::new(),
+                image_refs: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -12021,6 +12031,7 @@ pub(crate) mod tests {
                     activate: None,
                     attachments: Vec::new(),
                     image_blocks: Vec::new(),
+                    image_refs: Vec::new(),
                     display_text: "hi".into(),
                 })
                 .await
@@ -12546,6 +12557,7 @@ pub(crate) mod tests {
                 activate: None,
                 attachments: Vec::new(),
                 image_blocks: Vec::new(),
+                image_refs: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
@@ -13839,6 +13851,7 @@ pub(crate) mod tests {
                 activate: None,
                 attachments: Vec::new(),
                 image_blocks: Vec::new(),
+                image_refs: Vec::new(),
                 display_text: "hi".into(),
             })
             .await
