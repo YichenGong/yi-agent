@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   deleteModel,
+  importEnvModel,
   isModelNotFound,
   listModels,
   setDefaultModel,
@@ -24,6 +25,7 @@ describe("listModels", () => {
       ],
       default_model: "A",
       subagent_model: null,
+      effective: null,
     };
     const rpc = vi.fn().mockResolvedValue(payload);
     await expect(listModels(rpc)).resolves.toEqual(payload);
@@ -36,7 +38,44 @@ describe("listModels", () => {
       models: [],
       default_model: null,
       subagent_model: null,
+      effective: null,
     });
+  });
+});
+
+describe("listModels.effective", () => {
+  it("carries the effective view through", async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      models: [],
+      default_model: null,
+      subagent_model: null,
+      effective: {
+        source: "env",
+        model_ref: null,
+        provider: "openai",
+        api_url: "https://env",
+        model: "env-model",
+        has_key: true,
+        api_key_masked: "••••9999",
+      },
+    });
+    const list = await listModels(rpc);
+    expect(list.effective?.source).toBe("env");
+    expect(list.effective?.model).toBe("env-model");
+  });
+
+  it("defaults a missing effective to null", async () => {
+    const rpc = vi.fn().mockResolvedValue({ models: [], default_model: null, subagent_model: null });
+    expect((await listModels(rpc)).effective).toBeNull();
+  });
+});
+
+describe("importEnvModel", () => {
+  it("calls model/importEnv with empty params and returns the new name", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true, name: "env-model", default_model: "env-model" });
+    const out = await importEnvModel(rpc);
+    expect(rpc).toHaveBeenCalledWith("model/importEnv", {});
+    expect(out).toEqual({ name: "env-model" });
   });
 });
 

@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import {
   deleteModel,
+  importEnvModel,
   isModelNotFound,
   listModels,
   setDefaultModel,
   setSubagentModel,
   upsertModel,
+  type EffectiveModel,
   type ModelEntryView,
   type ModelList,
   type ModelRpc,
@@ -32,7 +34,12 @@ type Draft = {
   keyEdited: boolean;
 };
 
-const EMPTY: ModelList = { models: [], default_model: null, subagent_model: null };
+const EMPTY: ModelList = {
+  models: [],
+  default_model: null,
+  subagent_model: null,
+  effective: null,
+};
 
 /** 「跟随全局默认」哨兵值：模型名不可能是空串（宿主拒绝空名），故 `""` 安全。 */
 const FOLLOW_GLOBAL = "";
@@ -43,6 +50,15 @@ function saveErrorText(error: unknown): string {
   const message = (error as { message?: unknown } | null)?.message;
   if (typeof message === "string" && message.length > 0) return message;
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * 生效来源的密钥指示。
+ *
+ * 只说「有没有」和掩码，原文从不经过桌面端——状态行是给人看的诚实结论，不是凭证面板。
+ */
+function effectiveKeyLabel(effective: EffectiveModel): string {
+  return effective.has_key ? `密钥 ${effective.api_key_masked}` : "未设置密钥";
 }
 
 /**
@@ -203,6 +219,26 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
     }
   };
 
+  /**
+   * 收边：把 `.env` 当前配置导入清单并设为默认。
+   *
+   * 同样遵守「写后重读」：导入后 `effective.source` 会从 `env` 变 `catalog`，
+   * 状态行随宿主回包自己收口，本地不做乐观改判。
+   */
+  const importCurrent = async () => {
+    if (!rpc) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await importEnvModel(rpc);
+      await reload();
+    } catch (error) {
+      setActionError(saveErrorText(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <section className="p-5">
       <h2 className="text-sm font-medium text-fg">模型</h2>
@@ -226,7 +262,13 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
           {loadError}
         </p>
       ) : catalog.models.length === 0 ? (
-        <p className="mt-3 text-sm text-fg-muted">还没有配置任何模型</p>
+        // 清单空不等于「没模型可用」：env 兜底在生效时下面那行会说清实际在用哪个，
+        // 这里再说「还没有配置任何模型」就成了自相矛盾的假话。
+        catalog.effective?.source === "env" ? (
+          <p className="mt-3 text-sm text-fg-muted">清单里还没有条目</p>
+        ) : (
+          <p className="mt-3 text-sm text-fg-muted">还没有配置任何模型</p>
+        )
       ) : (
         <table className="mt-3 w-full table-auto text-left text-sm">
           <thead>
@@ -271,6 +313,37 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
             ))}
           </tbody>
         </table>
+      )}
+
+      {/* 生效来源：无论清单是否为空都要如实告知现在到底在用哪个模型。 */}
+      {catalog.effective !== null && (
+        <p className="mt-4 text-xs text-fg-subtle">
+          {catalog.effective.source === "catalog" ? (
+            <>
+              当前生效：{catalog.effective.model}（清单条目「{catalog.effective.model_ref}」）
+            </>
+          ) : (
+            <>
+              当前实际在用 {catalog.effective.model}（来自 .env，尚未纳入清单）
+            </>
+          )}
+          {" · "}
+          {catalog.effective.provider}
+          {" · "}
+          <span className="font-mono">{catalog.effective.api_url}</span>
+          {" · "}
+          {effectiveKeyLabel(catalog.effective)}
+          {catalog.effective.source === "env" && (
+            <button
+              type="button"
+              onClick={() => void importCurrent()}
+              disabled={!rpc || busy}
+              className="ml-2 rounded border border-line-strong px-2 py-0.5 text-xs text-fg-muted hover:text-fg disabled:opacity-50"
+            >
+              导入当前配置
+            </button>
+          )}
+        </p>
       )}
 
       <div className="mt-4 flex flex-wrap gap-4">

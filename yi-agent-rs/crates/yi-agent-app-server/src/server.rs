@@ -2565,6 +2565,7 @@ where
                             &models_path,
                             method.as_str(),
                             &req.params,
+                            &cfg,
                         ) {
                             Ok(value) => {
                                 write_response(&hub, &client, ok_response(id, value)).await?
@@ -2574,7 +2575,8 @@ where
                             }
                         }
                     }
-                    "model/upsert" | "model/delete" | "model/setDefault" | "model/setSubagent" => {
+                    "model/upsert" | "model/delete" | "model/setDefault" | "model/setSubagent"
+                    | "model/importEnv" => {
                         if client_scope < Scope::Control {
                             write_response(
                                 &hub,
@@ -2588,6 +2590,7 @@ where
                             &models_path,
                             method.as_str(),
                             &req.params,
+                            &cfg,
                         ) {
                             Ok(value) => {
                                 write_response(&hub, &client, ok_response(id, value)).await?

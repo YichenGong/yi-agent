@@ -16,7 +16,7 @@ import { buildModelOptions } from "../lib/modelPicker";
  */
 export type ModelPickerCall = (method: string, params: unknown) => Promise<unknown>;
 
-const EMPTY: ModelList = { models: [], default_model: null, subagent_model: null };
+const EMPTY: ModelList = { models: [], default_model: null, subagent_model: null, effective: null };
 
 /** 把写失败翻成一句给人看的话；「模型不存在」单列，因为它对应的是「被删了」。 */
 function saveErrorText(error: unknown): string {

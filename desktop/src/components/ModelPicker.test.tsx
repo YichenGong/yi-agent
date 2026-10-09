@@ -27,6 +27,7 @@ const catalog: ModelList = {
   ],
   default_model: "A",
   subagent_model: null,
+  effective: null,
 };
 
 /**

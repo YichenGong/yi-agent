@@ -11,22 +11,29 @@
 use std::path::Path;
 
 use serde_json::{Value, json};
+use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_runtime::models::{
-    ModelEntry, ModelProvider, load_catalog_from, mask_key, models_path, save_catalog_to,
+    ModelCatalog, ModelEntry, ModelProvider, effective_entry, load_catalog_from, mask_key,
+    models_path, save_catalog_to,
 };
 
 use crate::protocol::RpcError;
 
 /// 生产入口：读写 `~/.yi-agent/models.json`。
-pub fn handle_model_request(method: &str, params: &Value) -> Result<Value, RpcError> {
-    handle_model_request_at(&models_path(), method, params)
+pub fn handle_model_request(
+    method: &str,
+    params: &Value,
+    fallback: &RuntimeConfig,
+) -> Result<Value, RpcError> {
+    handle_model_request_at(&models_path(), method, params, fallback)
 }
 
-/// 可测核心：清单文件路径由调用方注入（测试用 `TempDir`，生产用 `models_path()`）。
+/// 可测核心：清单文件路径与兜底 cfg 均由调用方注入。
 pub fn handle_model_request_at(
     path: &Path,
     method: &str,
     params: &Value,
+    fallback: &RuntimeConfig,
 ) -> Result<Value, RpcError> {
     match method {
         "model/list" => {
@@ -35,13 +42,40 @@ pub fn handle_model_request_at(
                 "models": catalog.models.iter().map(entry_view).collect::<Vec<_>>(),
                 "default_model": catalog.default_model,
                 "subagent_model": catalog.subagent_model,
+                "effective": effective_view(&catalog, fallback),
             }))
         }
         "model/upsert" => upsert(path, params),
         "model/delete" => delete(path, params),
         "model/setDefault" => set_reference(path, params, Reference::Default),
         "model/setSubagent" => set_reference(path, params, Reference::Subagent),
+        "model/importEnv" => import_env(path, fallback),
         _ => Err(RpcError::method_not_found(method)),
+    }
+}
+
+/// 当前默认实际解析到哪里：命中清单条目就用条目，否则回退 cfg（`.env`）。
+/// key 一律只出掩码——与 [`entry_view`] 同一条安全约定。
+fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
+    match effective_entry(catalog, None) {
+        Some(entry) => json!({
+            "source": "catalog",
+            "model_ref": entry.name,
+            "provider": entry.provider.as_str(),
+            "api_url": entry.api_url,
+            "model": entry.model,
+            "has_key": !entry.api_key.is_empty(),
+            "api_key_masked": mask_key(&entry.api_key),
+        }),
+        None => json!({
+            "source": "env",
+            "model_ref": Value::Null,
+            "provider": cfg.provider,
+            "api_url": cfg.api_url,
+            "model": cfg.model,
+            "has_key": !cfg.api_key.is_empty(),
+            "api_key_masked": mask_key(&cfg.api_key),
+        }),
     }
 }
 
@@ -154,6 +188,46 @@ fn set_reference(path: &Path, params: &Value, which: Reference) -> Result<Value,
     Ok(json!({ "ok": true }))
 }
 
+/// `model/importEnv`：把兜底层 `cfg`（`.env`）当前的 provider/api_url/api_key/model
+/// 原子地落成清单里的一条，并把它设为 `default_model`。
+///
+/// 一次性完成而不是前端两步（upsert + setDefault）：只有服务端握有明文 key，
+/// 且两步之间可能半途失败留下「条目落了、默认没设」的中间态。
+fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
+    if cfg.api_url.trim().is_empty() {
+        return Err(RpcError::invalid_model("api_url must not be empty"));
+    }
+    if cfg.model.trim().is_empty() {
+        return Err(RpcError::invalid_model("model must not be empty"));
+    }
+    let Some(provider) = ModelProvider::parse(&cfg.provider) else {
+        return Err(RpcError::invalid_model(format!(
+            "unknown provider: {}",
+            cfg.provider
+        )));
+    };
+
+    let mut catalog = load_catalog_from(path);
+    let base = cfg.model.trim().to_string();
+    // 重名自动加后缀，静默成功（收边是「零摩擦固化」，不该被重名卡住）。
+    let mut name = base.clone();
+    let mut n = 2u32;
+    while catalog.models.iter().any(|m| m.name == name) {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    catalog.models.push(ModelEntry {
+        name: name.clone(),
+        provider,
+        api_url: cfg.api_url.clone(),
+        model: cfg.model.clone(),
+        api_key: cfg.api_key.clone(),
+    });
+    catalog.default_model = Some(name.clone());
+    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
+    Ok(json!({ "ok": true, "name": name, "default_model": name }))
+}
+
 /// `api_key` 入参的三种形态；见 [`upsert`] 的语义注释。
 enum KeyInput {
     Keep,
@@ -184,6 +258,8 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::PathBuf;
+    use yi_agent_runtime::config::RuntimeConfig;
+    use yi_agent_runtime::models::ModelCatalog;
 
     /// 每条用例独占一份清单文件。路径注入而非改 `HOME`：并行测试下 `HOME` 是
     /// 进程全局量，改了会互相踩。
@@ -193,8 +269,36 @@ mod tests {
         (dir, path)
     }
 
+    /// 兜底层 cfg：全部字段可辨，便于断言「生效值来自 cfg」。
+    ///
+    /// `RuntimeConfig` **未实现** `Default`，必须显式构造全部字段（字段表见
+    /// `yi-agent-runtime/src/config.rs:17-40`）。用 `#[cfg(test)]` 的
+    /// `yi_agent_runtime::config::sample_config()` 不可行——它是 runtime crate 的
+    /// `pub(crate)`，跨 crate 用不了。
+    fn fallback_cfg() -> RuntimeConfig {
+        RuntimeConfig {
+            provider: "openai".to_string(),
+            api_url: "https://env.example".to_string(),
+            api_key: "env-secret-9999".to_string(),
+            model: "env-model".to_string(),
+            max_turns: 20,
+            max_resident_subagents: 8,
+            workdir: std::path::PathBuf::from("/tmp/import-env-test"),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::WorkspaceWrite,
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: false,
+        }
+    }
+
     fn call(path: &Path, method: &str, params: Value) -> Result<Value, RpcError> {
-        handle_model_request_at(path, method, &params)
+        handle_model_request_at(path, method, &params, &fallback_cfg())
     }
 
     /// 常用 upsert 载荷，省略 `api_key`（= 保留）。
@@ -376,7 +480,114 @@ mod tests {
         call(&path, "model/upsert", entry_json("A")).unwrap();
         assert!(path.exists(), "upsert must land the file");
         // A second, independent read through the public path-based entry.
-        let list = handle_model_request_at(&path, "model/list", &json!({})).unwrap();
+        let list =
+            handle_model_request_at(&path, "model/list", &json!({}), &fallback_cfg()).unwrap();
         assert_eq!(list["models"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn effective_is_the_catalog_default_when_one_resolves() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        call(&path, "model/setDefault", json!({ "name": "A" })).unwrap();
+        let out = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(out["effective"]["source"], "catalog");
+        assert_eq!(out["effective"]["model_ref"], "A");
+        assert_eq!(out["effective"]["model"], "m");
+        assert_eq!(out["effective"]["api_key_masked"], "••••1234");
+        // 明文绝不在任何字段里。
+        assert!(!out.to_string().contains("sk-secret-1234"));
+    }
+
+    #[test]
+    fn effective_is_the_env_fallback_when_the_catalog_cannot_resolve() {
+        let (_dir, path) = catalog_path();
+        // 清单为空 → 必须落到 cfg。
+        let out = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(out["effective"]["source"], "env");
+        assert!(out["effective"]["model_ref"].is_null());
+        assert_eq!(out["effective"]["model"], "env-model");
+        assert_eq!(out["effective"]["api_url"], "https://env.example");
+        assert_eq!(out["effective"]["provider"], "openai");
+        assert_eq!(out["effective"]["api_key_masked"], "••••9999");
+        assert!(!out.to_string().contains("env-secret-9999"));
+    }
+
+    #[test]
+    fn a_dangling_default_falls_back_to_env() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        call(&path, "model/setDefault", json!({ "name": "A" })).unwrap();
+        call(&path, "model/delete", json!({ "name": "A" })).unwrap();
+        // delete 会清掉悬空引用；再手动写一个悬空 default 覆盖该情形。
+        let mut catalog = ModelCatalog::default();
+        catalog.models.push(ModelEntry {
+            name: "B".to_string(),
+            provider: ModelProvider::parse("anthropic").unwrap(),
+            api_url: "https://b".to_string(),
+            model: "mb".to_string(),
+            api_key: String::new(),
+        });
+        catalog.default_model = Some("gone".to_string());
+        yi_agent_runtime::models::save_catalog_to(&path, &catalog).unwrap();
+        let out = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(out["effective"]["source"], "env");
+        assert!(out["effective"]["model_ref"].is_null());
+    }
+
+    #[test]
+    fn import_env_lands_the_fallback_and_makes_it_the_default() {
+        let (_dir, path) = catalog_path();
+        let out = call(&path, "model/importEnv", json!({})).unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["name"], "env-model");
+        assert_eq!(out["default_model"], "env-model");
+
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(list["models"].as_array().unwrap().len(), 1);
+        assert_eq!(list["models"][0]["name"], "env-model");
+        assert_eq!(list["models"][0]["api_url"], "https://env.example");
+        assert_eq!(list["models"][0]["model"], "env-model");
+        assert_eq!(list["models"][0]["api_key_masked"], "••••9999");
+        // 导入后生效来源翻成清单，且明文不外泄。
+        assert_eq!(list["effective"]["source"], "catalog");
+        assert_eq!(list["effective"]["model_ref"], "env-model");
+        assert!(!list.to_string().contains("env-secret-9999"));
+    }
+
+    #[test]
+    fn import_env_dedupes_a_name_that_already_exists() {
+        let (_dir, path) = catalog_path();
+        // 清单里先有一条同名 "env-model"。
+        call(
+            &path,
+            "model/upsert",
+            json!({ "name": "env-model", "provider": "anthropic",
+                    "api_url": "https://x", "model": "mx" }),
+        )
+        .unwrap();
+        let out = call(&path, "model/importEnv", json!({})).unwrap();
+        assert_eq!(out["name"], "env-model-2");
+        let list = call(&path, "model/list", json!({})).unwrap();
+        let names: Vec<&str> = list["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"env-model"));
+        assert!(names.contains(&"env-model-2"));
+        // 不覆盖既有条目，且默认指向新条目。
+        assert_eq!(list["default_model"], "env-model-2");
+    }
+
+    #[test]
+    fn import_env_rejects_an_invalid_fallback_without_writing() {
+        let (_dir, path) = catalog_path();
+        let mut cfg = fallback_cfg();
+        cfg.api_url = String::new(); // 非法：url 为空
+        let err = handle_model_request_at(&path, "model/importEnv", &json!({}), &cfg).unwrap_err();
+        assert_eq!(err.data.unwrap()["code"], "invalid_model");
+        assert!(!path.exists(), "a rejected import must not write a catalog");
     }
 }

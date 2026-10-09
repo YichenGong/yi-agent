@@ -15,6 +15,7 @@ const list = (over: Partial<ModelList> = {}): ModelList => ({
   models: [entry("A", "model-a")],
   default_model: "A",
   subagent_model: null,
+  effective: null,
   ...over,
 });
 
