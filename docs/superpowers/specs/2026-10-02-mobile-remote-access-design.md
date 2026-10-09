@@ -307,7 +307,7 @@ agent 触发危险命令
 | 传输加密 | WSS/TLS；自建中继场景可再叠端到端（中继只见密文，v1.1） |
 | 认证 | 设备 token（短期 + 可续期），签名（HMAC/Ed25519），服务端存哈希 |
 | 授权 | scope：`observe` < `control` < `admin`；**新配对设备默认 `control`**（决策 A） |
-| 危险操作 | `admin` 类（`thread/delete`、`process/kill`、`thread/setPermissionMode`=yolo）在 `control` 下返回 `-32014`，引导去桌面端授权 |
+| 危险操作 | `admin` 类（`thread/delete`、`process/kill`、`pair/create`、`device/revoke`）在 `control` 下返回 `-32014`。`thread/setPermissionMode`（切 YOLO）按 `control` 放行（**2026-10-09 修订**：原设计承诺的「引导去桌面端授权」入口从未实现，admin-only 使手机端 YOLO 结构性不可用；它与 `thread/setModel` 同档，Control 本就能 `turn/start` 并在 YOLO 会话上批准任意工具，单开此门不扩大既有能力面） |
 | 撤销 | `device/revoke` 立即断开该设备 ws 并使其 token 失效 |
 | 失败安全 | 审批超时/无效响应一律 `Deny`（沿用现状） |
 | 审计 | 手机端触发的 `turn/start`、审批决定、`process/kill` 打 `tracing` 带 `client_id` |
