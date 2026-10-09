@@ -1,7 +1,15 @@
-//! 首轮结束后生成 thread 标题：材料拼接与标题清洗。
+//! 首轮结束后生成 thread 标题：材料拼接、标题清洗，以及调用 provider 生成。
 //!
-//! 与 `compact.rs` 同风格：纯逻辑（本模块）与"调用 provider 生成标题"分开放，
+//! 与 `compact.rs` 同风格：纯逻辑（材料拼接 / 清洗）与"调用 provider 生成标题"分开放，
 //! 便于单测覆盖清洗规则；生成失败由调用方静默回退到截断标题。
+
+use std::sync::Arc;
+
+use crate::{
+    agent::{AgentConfig, AgentError},
+    message::Message,
+    provider::{Provider, ProviderRequest},
+};
 
 /// 标题字符数上限，与 `thread_store::title_from` 的截断上限保持一致。
 pub const TITLE_MAX_CHARS: usize = 30;
@@ -44,9 +52,124 @@ pub fn sanitize_title(raw: &str) -> Option<String> {
     }
 }
 
+/// 标题生成系统提示：约束模型只吐一个短标题。
+pub const TITLE_INSTRUCTIONS: &str = "\
+你会得到一个会话的开头（用户提问，可能附带助手回复）。请为它生成一个简短的标题。
+要求：
+- 只输出标题本身，不要换行、不要引号、不要“标题：”之类前缀、不要任何解释。
+- 语言跟随用户提问：中文提问用中文标题，英文提问用英文标题。
+- 不超过 20 个汉字（或约 40 个英文字符）。";
+
+/// 用当前模型生成一个 thread 标题。
+///
+/// `assistant_text` 为 `None` 时只用用户提问。返回 `Ok(None)` 表示模型产出
+/// 无法作为标题（空/全空白）；provider 报错时返回 `Err`，由调用方决定回退。
+pub async fn generate_title(
+    provider: &Arc<dyn Provider>,
+    config: &AgentConfig,
+    user_text: &str,
+    assistant_text: Option<&str>,
+) -> Result<Option<String>, AgentError> {
+    let mut params = config.gen_params.clone();
+    // 标题极短：限死输出上限，避免个别模型长篇大论。
+    params.max_tokens = Some(64);
+    let response = provider
+        .call(ProviderRequest {
+            model: config.model.clone(),
+            system: Some(TITLE_INSTRUCTIONS.to_string()),
+            messages: vec![Message::user(build_title_material(
+                user_text,
+                assistant_text,
+            ))],
+            tools: vec![],
+            params,
+        })
+        .await
+        .map_err(AgentError::Provider)?;
+    let text = response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            crate::message::ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(sanitize_title(&text))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        agent::{AgentConfig, AgentError},
+        provider::{Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason},
+    };
+    use async_trait::async_trait;
+    use futures::stream::{BoxStream, StreamExt};
+
+    /// 固定返回一段文本的 provider。
+    struct FixedProvider(String);
+
+    #[async_trait]
+    impl Provider for FixedProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let events = vec![
+                ProviderEvent::TextDelta(self.0.clone()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ];
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    /// 每次调用都失败的 provider。
+    struct FailingProvider;
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            Err(ProviderError::Network("boom".into()))
+        }
+    }
+
+    fn core_config() -> AgentConfig {
+        AgentConfig::default()
+    }
+
+    #[tokio::test]
+    async fn generate_title_returns_sanitized_title() {
+        let provider: std::sync::Arc<dyn Provider> =
+            std::sync::Arc::new(FixedProvider("\"修复登录报错\"".into()));
+        let out = generate_title(&provider, &core_config(), "登录页报错", Some("好"))
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("修复登录报错"));
+    }
+
+    #[tokio::test]
+    async fn generate_title_blank_response_is_none() {
+        let provider: std::sync::Arc<dyn Provider> =
+            std::sync::Arc::new(FixedProvider("   ".into()));
+        let out = generate_title(&provider, &core_config(), "hi", None)
+            .await
+            .unwrap();
+        assert_eq!(out, None);
+    }
+
+    #[tokio::test]
+    async fn generate_title_propagates_provider_error() {
+        let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(FailingProvider);
+        let err = generate_title(&provider, &core_config(), "hi", None).await;
+        assert!(matches!(err, Err(AgentError::Provider(_))));
+    }
 
     #[test]
     fn material_joins_both_sides_with_labels() {

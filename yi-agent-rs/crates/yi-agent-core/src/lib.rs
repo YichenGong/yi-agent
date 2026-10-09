@@ -29,7 +29,10 @@ pub use subagent::task::{
     AgentTask, AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskDepth, TaskEvent,
     TaskId, TaskState,
 };
-pub use title::{TITLE_MATERIAL_SIDE_CHARS, TITLE_MAX_CHARS, build_title_material, sanitize_title};
+pub use title::{
+    TITLE_INSTRUCTIONS, TITLE_MATERIAL_SIDE_CHARS, TITLE_MAX_CHARS, build_title_material,
+    generate_title, sanitize_title,
+};
 pub use tool::{
     OutputStream, Tool, ToolEvent, ToolMetadata, ToolRegistry, ToolResult, ToolSchema, ToolSource,
 };
