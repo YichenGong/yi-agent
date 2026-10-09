@@ -205,6 +205,16 @@ pub enum Notification {
     /// 显示名(`model_ref`)——客户端据此显示"当前跑在哪个真实模型上"。
     #[serde(rename = "thread/modelChanged")]
     ModelChanged { thread_id: String, model: String },
+    /// 该会话的权限模式（自主权）已切换。
+    ///
+    /// 与 `thread/modelChanged` 并列：模式与模型都是会话元数据，切换后必须让
+    /// **所有**客户端（桌面 + 手机）立即刷新各自的 mode chip，否则一端改了
+    /// YOLO、另一端停在旧值。它只带模式、不带正文。
+    #[serde(rename = "thread/permissionModeChanged")]
+    PermissionModeChanged {
+        thread_id: String,
+        mode: crate::thread_store::ThreadMode,
+    },
     #[serde(rename = "item/started")]
     ItemStarted { thread_id: String, item: Item },
     #[serde(rename = "item/delta")]
@@ -322,6 +332,7 @@ impl Notification {
             | Notification::TurnStarted { thread_id, .. }
             | Notification::ThreadStatusUpdated { thread_id, .. }
             | Notification::ModelChanged { thread_id, .. }
+            | Notification::PermissionModeChanged { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
             | Notification::ItemDelta { thread_id, .. }
             | Notification::ItemCompleted { thread_id, .. }
@@ -365,6 +376,7 @@ impl Notification {
             Notification::ThreadStarted { .. }
             | Notification::ThreadStatusUpdated { .. }
             | Notification::ModelChanged { .. }
+            | Notification::PermissionModeChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
@@ -673,6 +685,23 @@ mod tests {
         assert_eq!(v["method"], "thread/modelChanged");
         assert_eq!(v["params"]["thread_id"], "t1");
         assert_eq!(v["params"]["model"], "model-b");
+    }
+
+    /// mode 变更通知的 wire 形状:`thread/permissionModeChanged`,参数 snake_case。
+    #[test]
+    fn permission_mode_changed_notification_carries_method_and_mode() {
+        let n = Notification::PermissionModeChanged {
+            thread_id: "t1".into(),
+            mode: crate::thread_store::ThreadMode::Yolo,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/permissionModeChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["mode"], "yolo");
+        // 投递层级:与 `modelChanged` 同为列表层。远程客户端只订阅少量暖会话,
+        // 若按内容层过滤,窗口外会话的模式变更永远收不到——「概率性不同步」的成因。
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
     }
 
     #[test]

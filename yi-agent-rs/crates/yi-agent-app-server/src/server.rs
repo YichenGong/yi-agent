@@ -2275,10 +2275,16 @@ where
                 // (踢设备、废 token)是特权桌面操作,一并入闸:低权客户端若能铸
                 // 凭据或踢设备,scope 体系形同虚设。`device/list` 只暴露设备名/
                 // scope/时间戳(无秘密),任何已握手客户端可读,故**不**入闸。
-                const ADMIN_METHODS: [&str; 5] = [
+                //
+                // 注:`thread/setPermissionMode` 原在此列,现按 `Control` 放行
+                // （见下方方法分支内的门禁）。设计
+                // （2026-10-02-mobile-remote-access-design.md §5.4）承诺的「引导去
+                // 桌面端授权」入口在代码里并不存在,admin-only 使手机端的 YOLO 切换
+                // 结构性不可用。它与 `thread/setModel` 同档:Control 客户端本就能
+                // `turn/start` 并在 YOLO 会话上批准任意工具,单开此门不扩大既有能力面。
+                const ADMIN_METHODS: [&str; 4] = [
                     "thread/delete",
                     "process/kill",
-                    "thread/setPermissionMode",
                     "pair/create",
                     "device/revoke",
                 ];
@@ -2934,6 +2940,7 @@ where
                                     "cwd": cwd,
                                     "model": model,
                                     "model_ref": model_ref,
+                                    "permission_mode": mode,
                                 }),
                             ),
                         )
@@ -3201,6 +3208,7 @@ where
                                     "cwd": cwd,
                                     "model": model,
                                     "model_ref": loaded.meta.model_ref,
+                                    "permission_mode": loaded.meta.permission_mode,
                                 }),
                             ),
                         )
@@ -3377,6 +3385,17 @@ where
                         .await?;
                     }
                     "thread/setPermissionMode" => {
+                        // 与 `thread/setModel` 同档:Control 起。Observe 拿到的是
+                        // 掩码级视图,不得放开 OS 沙箱。
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
                         let Some(thread_id) =
                             require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
@@ -3425,6 +3444,17 @@ where
                                 "[app-server] failed to persist permission_mode for {thread_id}: {e}"
                             ),
                         }
+                        // 广播给所有客户端(列表层恒推):桌面改 → 手机 chip 同步,
+                        // 手机改 → 桌面 chip 同步。与 `setModel` 的 ModelChanged
+                        // 广播同一手法。
+                        let _ = write_notification(
+                            &hub,
+                            &Notification::PermissionModeChanged {
+                                thread_id: thread_id.clone(),
+                                mode,
+                            },
+                        )
+                        .await;
                         write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "thread/setPinned" => {
@@ -12602,21 +12632,31 @@ pub(crate) mod tests {
         let project_dir = tempfile::TempDir::new().unwrap();
         let project = git_project(&project_dir.path().join("proj"));
         let wt = git_kanban_worktree(&project, "card-1");
-        write_meta(&wt, "t-card", "看板 · card-1",
-            Some(&project.to_string_lossy()), Some("card-1"));
+        write_meta(
+            &wt,
+            "t-card",
+            "看板 · card-1",
+            Some(&project.to_string_lossy()),
+            Some("card-1"),
+        );
 
         let mut h = Harness::new();
         initialize(&mut h).await;
         add_workspace(&mut h, 11, &wt.to_string_lossy()).await;
 
-        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
-            .await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#,
+        )
+        .await;
         let v = read_response(&mut h, 5).await;
         assert!(v.get("error").is_none(), "delete must succeed: {v}");
         // 空成功体是契约：无损静默删除不新增任何成功字段（spec §4.4 实现修正注里
         // 唯一的例外是"该删没删成"，此用例是真删成功，故必须恰好为空）。
         assert_eq!(v["result"], serde_json::json!({}), "{v}");
-        assert!(!wt.join(".yi-agent/threads/t-card.meta.json").exists(), "session gone");
+        assert!(
+            !wt.join(".yi-agent/threads/t-card.meta.json").exists(),
+            "session gone"
+        );
         assert!(!wt.exists(), "clean+merged worktree must be removed");
         h.shutdown().await;
     }
@@ -12628,23 +12668,36 @@ pub(crate) mod tests {
         let project = git_project(&project_dir.path().join("proj"));
         let wt = git_kanban_worktree(&project, "card-1");
         std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
-        write_meta(&wt, "t-card", "看板 · card-1",
-            Some(&project.to_string_lossy()), Some("card-1"));
+        write_meta(
+            &wt,
+            "t-card",
+            "看板 · card-1",
+            Some(&project.to_string_lossy()),
+            Some("card-1"),
+        );
 
         let mut h = Harness::new();
         initialize(&mut h).await;
         add_workspace(&mut h, 11, &wt.to_string_lossy()).await;
 
-        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
-            .await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#,
+        )
+        .await;
         let v = read_response(&mut h, 5).await;
         assert_eq!(v["result"]["status"], "needs_confirmation", "{v}");
         assert_eq!(v["result"]["worktree"]["action"], "remove", "{v}");
         assert!(
-            v["result"]["worktree"]["reason"].as_str().unwrap().contains("未提交"),
+            v["result"]["worktree"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("未提交"),
             "{v}"
         );
-        assert!(wt.join(".yi-agent/threads/t-card.meta.json").exists(), "session untouched");
+        assert!(
+            wt.join(".yi-agent/threads/t-card.meta.json").exists(),
+            "session untouched"
+        );
 
         // force 重发 → 一并删除。
         h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/delete","params":{"threadId":"t-card","force":true}}"#)
@@ -12668,14 +12721,22 @@ pub(crate) mod tests {
         initialize(&mut h).await;
         add_workspace(&mut h, 11, &cwd.to_string_lossy()).await;
 
-        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-plain"}}"#)
-            .await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-plain"}}"#,
+        )
+        .await;
         let v = read_response(&mut h, 5).await;
         assert!(v.get("error").is_none(), "{v}");
-        assert!(v["result"].get("worktree").is_none(), "no worktree field for plain sessions: {v}");
+        assert!(
+            v["result"].get("worktree").is_none(),
+            "no worktree field for plain sessions: {v}"
+        );
         // 比"无 worktree 字段"更强：普通会话的成功体必须**恰好**是空对象。
         assert_eq!(v["result"], serde_json::json!({}), "{v}");
-        assert!(marker.exists(), "the user's own directory must be untouched");
+        assert!(
+            marker.exists(),
+            "the user's own directory must be untouched"
+        );
         h.shutdown().await;
     }
 
@@ -12685,7 +12746,13 @@ pub(crate) mod tests {
         let project_dir = tempfile::TempDir::new().unwrap();
         let project = git_project(&project_dir.path().join("proj"));
         // cwd = 项目根（不是 .worktrees/kanban/... 下的 worktree）。
-        write_meta(&project, "t-card", "看板 · odd", Some(&project.to_string_lossy()), Some("card-1"));
+        write_meta(
+            &project,
+            "t-card",
+            "看板 · odd",
+            Some(&project.to_string_lossy()),
+            Some("card-1"),
+        );
         let marker = project.join("keep-me.txt");
         std::fs::write(&marker, "x").unwrap();
 
@@ -12693,15 +12760,20 @@ pub(crate) mod tests {
         initialize(&mut h).await;
         add_workspace(&mut h, 11, &project.to_string_lossy()).await;
 
-        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
-            .await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#,
+        )
+        .await;
         let v = read_response(&mut h, 5).await;
         assert_eq!(v["result"]["worktree"]["action"], "keep", "{v}");
         // force 也不删。
         h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/delete","params":{"threadId":"t-card","force":true}}"#)
             .await;
         let _ = read_response(&mut h, 6).await;
-        assert!(marker.exists() && project.join("f.txt").exists(), "hard-refused: dir intact");
+        assert!(
+            marker.exists() && project.join("f.txt").exists(),
+            "hard-refused: dir intact"
+        );
         h.shutdown().await;
     }
 
@@ -12732,8 +12804,13 @@ pub(crate) mod tests {
                 .success(),
             "git worktree lock must succeed"
         );
-        write_meta(&wt, "t-card", "看板 · card-1",
-            Some(&project.to_string_lossy()), Some("card-1"));
+        write_meta(
+            &wt,
+            "t-card",
+            "看板 · card-1",
+            Some(&project.to_string_lossy()),
+            Some("card-1"),
+        );
 
         let mut h = Harness::new();
         initialize(&mut h).await;
@@ -12746,7 +12823,10 @@ pub(crate) mod tests {
         assert_eq!(v["result"]["worktree"]["action"], "remove", "{v}");
         assert_eq!(v["result"]["worktree"]["removed"], false, "{v}");
         assert!(
-            !v["result"]["worktree"]["reason"].as_str().unwrap().is_empty(),
+            !v["result"]["worktree"]["reason"]
+                .as_str()
+                .unwrap()
+                .is_empty(),
             "the failure reason must be visible: {v}"
         );
         assert!(
@@ -14990,6 +15070,137 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 手机（Control）必须能切换会话权限模式：设计 §2 的「引导去桌面端授权」
+    /// 入口在代码里并不存在，admin-only 会让手机端的 YOLO 切换永远是死路。
+    /// 与 `thread/setModel` 同档（Control）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_client_may_switch_permission_mode() {
+        let mut h = Harness::with_scope(Scope::Control).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert!(
+            v["result"].is_object(),
+            "Control 客户端必须能切换到 yolo: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 最低档 `Observe` 仍必须被拒：读-only 客户端不得放开沙箱。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observe_client_cannot_switch_permission_mode() {
+        let mut h = Harness::with_scope(Scope::Observe).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(v["error"]["code"], -32014, "Observe 客户端必须被拒: {v}");
+        h.shutdown().await;
+    }
+
+    /// `thread/start` 响应必须直接带权威 `permission_mode`（新线程恒 normal）。
+    /// 客户端靠它建起 mode chip,不必再回读 listAll(那条路径异步、可失败、可竞态)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_response_carries_permission_mode() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":20,"method":"thread/start","params":{}}"#)
+            .await;
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(20)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("thread/start response");
+        assert_eq!(
+            resp["result"]["permission_mode"].as_str(),
+            Some("normal"),
+            "thread/start must carry permission_mode: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// `thread/resume` 响应必须带该会话**持久化**的模式:手机打开一个电脑上
+    /// 已置 yolo 的会话,必须一次请求就看到 yolo,而不是「未知 / 等回读」。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_resume_response_carries_persisted_permission_mode() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        // 切 yolo（走真实 RPC，确保落盘）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                break;
+            }
+        }
+        // 再 resume 同一 thread。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":30,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..24 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(30)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("thread/resume response");
+        assert_eq!(
+            resp["result"]["permission_mode"].as_str(),
+            Some("yolo"),
+            "thread/resume must carry the persisted mode: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 切换模式必须**广播** `thread/permissionModeChanged`:这是跨客户端同步
+    /// （桌面改 → 手机同步、手机改 → 桌面 chip 同步）的唯一通道。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn switching_permission_mode_broadcasts_the_change() {
+        let mut h = Harness::new(); // stdio = Admin,但广播与 scope 无关
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+
+        // 响应与通知都在流上,顺序不保证;分别收敛。
+        let mut response: Option<serde_json::Value> = None;
+        let mut changed: Option<serde_json::Value> = None;
+        for _ in 0..6 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                response = Some(v);
+            } else if v.get("method").and_then(|m| m.as_str())
+                == Some("thread/permissionModeChanged")
+            {
+                changed = Some(v);
+            }
+            if response.is_some() && changed.is_some() {
+                break;
+            }
+        }
+        assert!(response.is_some(), "setPermissionMode 必须有响应");
+        let changed = changed.expect("must broadcast thread/permissionModeChanged");
+        assert_eq!(changed["params"]["thread_id"].as_str(), Some(tid.as_str()));
+        assert_eq!(changed["params"]["mode"].as_str(), Some("yolo"));
+        h.shutdown().await;
+    }
+
     /// The desktop stdio client is `Admin`: the same call must go through.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_admin_client_may_delete_a_thread() {
@@ -16890,6 +17101,48 @@ pub(crate) mod tests {
             v["error"]["code"], -32014,
             "control client must be denied admin rpc: {v}"
         );
+        h.shutdown().await;
+    }
+
+    /// 跨客户端同步的端到端证明:桌面(stdio)改 mode,手机(ws,Control)必须收到
+    /// `thread/permissionModeChanged`——修复前没有任何 mode 通知,手机停在旧值。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merged_loop_fans_out_permission_mode_change_to_ws_client() {
+        let mut h = MergedHarness::new().await;
+        let mut ws = h.connect_ws().await;
+        crate::server::tests_support::initialize(&mut ws).await;
+
+        // stdio 起一个 thread。
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = h.read_value().await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let mut thread_id = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                thread_id = Some(v["result"]["thread_id"].as_str().unwrap().to_string());
+                break;
+            }
+        }
+        let thread_id = thread_id.expect("thread/start response");
+
+        // ws 客户端先收到 thread/started（建立它的视图），再等 mode 通知。
+        let _ = ws_await_notification(&mut ws, "thread/started").await;
+
+        // stdio 切 yolo。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setPermissionMode","params":{{"threadId":"{thread_id}","mode":"yolo"}}}}"#
+        ))
+        .await;
+
+        let notif = ws_await_notification(&mut ws, "thread/permissionModeChanged").await;
+        assert_eq!(
+            notif["params"]["thread_id"].as_str(),
+            Some(thread_id.as_str())
+        );
+        assert_eq!(notif["params"]["mode"].as_str(), Some("yolo"));
         h.shutdown().await;
     }
 }

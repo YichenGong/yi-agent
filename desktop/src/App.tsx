@@ -62,7 +62,11 @@ import { createBoard, listBoards, removeBoard } from "./lib/superpowersKanbanBoa
 import { makeBoardTick } from "./lib/boardRefresh";
 import { pluginProjectPaths } from "./lib/pluginSettings";
 import { threadStartParams } from "./lib/threadStart";
-import { setPermissionModeParams, type ThreadMode } from "./lib/threadPermissionMode";
+import {
+  permissionModeFromResponse,
+  setPermissionModeParams,
+  type ThreadMode,
+} from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
 import { applyTheme, parseTheme, readCachedTheme, type Theme } from "./lib/theme";
@@ -618,16 +622,22 @@ export default function App() {
     if (!c) return;
     inFlightResume.current.add(id);
     try {
-      await c.request("thread/resume", { threadId: id });
+      const resumed = await c.request<{ permission_mode?: ThreadMode }>("thread/resume", {
+        threadId: id,
+      });
       // 删除竞态:resume 在途时用户可能已删掉该冷 thread,此时不能再把它
       // 加回 warm(会复活已删 id)。peek 不创建视图,仅判断是否仍存在。
       const view = store.peek(id);
       if (!view) return;
       warm.current.add(id);
-      // thread/resume 响应不带权限模式,从 listAll 回读后写回该 view。
-      // 按 thread 存储,切回 warm thread 时 chip 自动反映各自模式。
+      // 响应直接带权威 mode：一次请求即定,不受 listAll 快照的竞态/失败影响
+      // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
+      const fromResponse = permissionModeFromResponse(resumed);
+      if (fromResponse !== null) view.mode = fromResponse;
+      // listAll 回读仅作兜底（旧服务端不带该字段时）；缺该 thread 时保留已知值,
+      // 不把已确定的模式打回 null。
       const gs = await refreshThreads();
-      if (gs !== null) view.mode = modeForThread(gs, pinned, id);
+      if (gs !== null) view.mode = modeForThread(gs, pinned, id) ?? view.mode;
       force((v) => v + 1);
     } catch (e) {
       // 同样地,失败路径只在视图仍存在时写错误,避免 re-create 一个已被
@@ -644,14 +654,16 @@ export default function App() {
     const c = clientRef.current;
     if (!c) return;
     try {
-      const t = await c.request<{ thread_id: string; cwd: string; model: string }>(
-        "thread/start",
-        threadStartParams(cwd),
-      );
+      const t = await c.request<{
+        thread_id: string;
+        cwd: string;
+        model: string;
+        permission_mode?: ThreadMode;
+      }>("thread/start", threadStartParams(cwd));
       warm.current.add(t.thread_id);
       store.view(t.thread_id).info = { cwd: t.cwd, model: t.model, model_ref: null };
-      // 新对话默认 normal;仍从 listAll 回读以与服务端保持一致。
-      store.view(t.thread_id).mode = "normal";
+      // 新会话恒 normal，但以响应字段为准（服务端是权威），缺失时回退 normal。
+      store.view(t.thread_id).mode = permissionModeFromResponse(t) ?? "normal";
       store.select(t.thread_id);
       setCurrentId(t.thread_id);
       // 新会话同样是「当前会话变了」：旧 diff 必须退场，否则会挂在新会话上。
@@ -670,8 +682,9 @@ export default function App() {
       }
       const gs = await refreshThreads();
       if (gs !== null) {
-        store.view(t.thread_id).mode = modeForThread(gs, pinned, t.thread_id);
-        force((v) => v + 1);
+        const v = store.view(t.thread_id);
+        v.mode = modeForThread(gs, pinned, t.thread_id) ?? v.mode;
+        force((n) => n + 1);
       }
     } catch (e) {
       setCurrentError(formatError(e));
