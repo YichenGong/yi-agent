@@ -2275,10 +2275,16 @@ where
                 // (踢设备、废 token)是特权桌面操作,一并入闸:低权客户端若能铸
                 // 凭据或踢设备,scope 体系形同虚设。`device/list` 只暴露设备名/
                 // scope/时间戳(无秘密),任何已握手客户端可读,故**不**入闸。
-                const ADMIN_METHODS: [&str; 5] = [
+                //
+                // 注:`thread/setPermissionMode` 原在此列,现按 `Control` 放行
+                // （见下方方法分支内的门禁）。设计
+                // （2026-10-02-mobile-remote-access-design.md §5.4）承诺的「引导去
+                // 桌面端授权」入口在代码里并不存在,admin-only 使手机端的 YOLO 切换
+                // 结构性不可用。它与 `thread/setModel` 同档:Control 客户端本就能
+                // `turn/start` 并在 YOLO 会话上批准任意工具,单开此门不扩大既有能力面。
+                const ADMIN_METHODS: [&str; 4] = [
                     "thread/delete",
                     "process/kill",
-                    "thread/setPermissionMode",
                     "pair/create",
                     "device/revoke",
                 ];
@@ -3377,6 +3383,17 @@ where
                         .await?;
                     }
                     "thread/setPermissionMode" => {
+                        // 与 `thread/setModel` 同档:Control 起。Observe 拿到的是
+                        // 掩码级视图,不得放开 OS 沙箱。
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
                         let Some(thread_id) =
                             require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
@@ -12602,21 +12619,31 @@ pub(crate) mod tests {
         let project_dir = tempfile::TempDir::new().unwrap();
         let project = git_project(&project_dir.path().join("proj"));
         let wt = git_kanban_worktree(&project, "card-1");
-        write_meta(&wt, "t-card", "看板 · card-1",
-            Some(&project.to_string_lossy()), Some("card-1"));
+        write_meta(
+            &wt,
+            "t-card",
+            "看板 · card-1",
+            Some(&project.to_string_lossy()),
+            Some("card-1"),
+        );
 
         let mut h = Harness::new();
         initialize(&mut h).await;
         add_workspace(&mut h, 11, &wt.to_string_lossy()).await;
 
-        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
-            .await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#,
+        )
+        .await;
         let v = read_response(&mut h, 5).await;
         assert!(v.get("error").is_none(), "delete must succeed: {v}");
         // 空成功体是契约：无损静默删除不新增任何成功字段（spec §4.4 实现修正注里
         // 唯一的例外是"该删没删成"，此用例是真删成功，故必须恰好为空）。
         assert_eq!(v["result"], serde_json::json!({}), "{v}");
-        assert!(!wt.join(".yi-agent/threads/t-card.meta.json").exists(), "session gone");
+        assert!(
+            !wt.join(".yi-agent/threads/t-card.meta.json").exists(),
+            "session gone"
+        );
         assert!(!wt.exists(), "clean+merged worktree must be removed");
         h.shutdown().await;
     }
@@ -12628,23 +12655,36 @@ pub(crate) mod tests {
         let project = git_project(&project_dir.path().join("proj"));
         let wt = git_kanban_worktree(&project, "card-1");
         std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
-        write_meta(&wt, "t-card", "看板 · card-1",
-            Some(&project.to_string_lossy()), Some("card-1"));
+        write_meta(
+            &wt,
+            "t-card",
+            "看板 · card-1",
+            Some(&project.to_string_lossy()),
+            Some("card-1"),
+        );
 
         let mut h = Harness::new();
         initialize(&mut h).await;
         add_workspace(&mut h, 11, &wt.to_string_lossy()).await;
 
-        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
-            .await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#,
+        )
+        .await;
         let v = read_response(&mut h, 5).await;
         assert_eq!(v["result"]["status"], "needs_confirmation", "{v}");
         assert_eq!(v["result"]["worktree"]["action"], "remove", "{v}");
         assert!(
-            v["result"]["worktree"]["reason"].as_str().unwrap().contains("未提交"),
+            v["result"]["worktree"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("未提交"),
             "{v}"
         );
-        assert!(wt.join(".yi-agent/threads/t-card.meta.json").exists(), "session untouched");
+        assert!(
+            wt.join(".yi-agent/threads/t-card.meta.json").exists(),
+            "session untouched"
+        );
 
         // force 重发 → 一并删除。
         h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/delete","params":{"threadId":"t-card","force":true}}"#)
@@ -12668,14 +12708,22 @@ pub(crate) mod tests {
         initialize(&mut h).await;
         add_workspace(&mut h, 11, &cwd.to_string_lossy()).await;
 
-        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-plain"}}"#)
-            .await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-plain"}}"#,
+        )
+        .await;
         let v = read_response(&mut h, 5).await;
         assert!(v.get("error").is_none(), "{v}");
-        assert!(v["result"].get("worktree").is_none(), "no worktree field for plain sessions: {v}");
+        assert!(
+            v["result"].get("worktree").is_none(),
+            "no worktree field for plain sessions: {v}"
+        );
         // 比"无 worktree 字段"更强：普通会话的成功体必须**恰好**是空对象。
         assert_eq!(v["result"], serde_json::json!({}), "{v}");
-        assert!(marker.exists(), "the user's own directory must be untouched");
+        assert!(
+            marker.exists(),
+            "the user's own directory must be untouched"
+        );
         h.shutdown().await;
     }
 
@@ -12685,7 +12733,13 @@ pub(crate) mod tests {
         let project_dir = tempfile::TempDir::new().unwrap();
         let project = git_project(&project_dir.path().join("proj"));
         // cwd = 项目根（不是 .worktrees/kanban/... 下的 worktree）。
-        write_meta(&project, "t-card", "看板 · odd", Some(&project.to_string_lossy()), Some("card-1"));
+        write_meta(
+            &project,
+            "t-card",
+            "看板 · odd",
+            Some(&project.to_string_lossy()),
+            Some("card-1"),
+        );
         let marker = project.join("keep-me.txt");
         std::fs::write(&marker, "x").unwrap();
 
@@ -12693,15 +12747,20 @@ pub(crate) mod tests {
         initialize(&mut h).await;
         add_workspace(&mut h, 11, &project.to_string_lossy()).await;
 
-        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#)
-            .await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"thread/delete","params":{"threadId":"t-card"}}"#,
+        )
+        .await;
         let v = read_response(&mut h, 5).await;
         assert_eq!(v["result"]["worktree"]["action"], "keep", "{v}");
         // force 也不删。
         h.send(r#"{"jsonrpc":"2.0","id":6,"method":"thread/delete","params":{"threadId":"t-card","force":true}}"#)
             .await;
         let _ = read_response(&mut h, 6).await;
-        assert!(marker.exists() && project.join("f.txt").exists(), "hard-refused: dir intact");
+        assert!(
+            marker.exists() && project.join("f.txt").exists(),
+            "hard-refused: dir intact"
+        );
         h.shutdown().await;
     }
 
@@ -12732,8 +12791,13 @@ pub(crate) mod tests {
                 .success(),
             "git worktree lock must succeed"
         );
-        write_meta(&wt, "t-card", "看板 · card-1",
-            Some(&project.to_string_lossy()), Some("card-1"));
+        write_meta(
+            &wt,
+            "t-card",
+            "看板 · card-1",
+            Some(&project.to_string_lossy()),
+            Some("card-1"),
+        );
 
         let mut h = Harness::new();
         initialize(&mut h).await;
@@ -12746,7 +12810,10 @@ pub(crate) mod tests {
         assert_eq!(v["result"]["worktree"]["action"], "remove", "{v}");
         assert_eq!(v["result"]["worktree"]["removed"], false, "{v}");
         assert!(
-            !v["result"]["worktree"]["reason"].as_str().unwrap().is_empty(),
+            !v["result"]["worktree"]["reason"]
+                .as_str()
+                .unwrap()
+                .is_empty(),
             "the failure reason must be visible: {v}"
         );
         assert!(
@@ -14987,6 +15054,39 @@ pub(crate) mod tests {
             v["error"]["code"], -32014,
             "admin op from a control client: {v}"
         );
+        h.shutdown().await;
+    }
+
+    /// 手机（Control）必须能切换会话权限模式：设计 §2 的「引导去桌面端授权」
+    /// 入口在代码里并不存在，admin-only 会让手机端的 YOLO 切换永远是死路。
+    /// 与 `thread/setModel` 同档（Control）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_control_client_may_switch_permission_mode() {
+        let mut h = Harness::with_scope(Scope::Control).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert!(
+            v["result"].is_object(),
+            "Control 客户端必须能切换到 yolo: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 最低档 `Observe` 仍必须被拒：读-only 客户端不得放开沙箱。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observe_client_cannot_switch_permission_mode() {
+        let mut h = Harness::with_scope(Scope::Observe).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(v["error"]["code"], -32014, "Observe 客户端必须被拒: {v}");
         h.shutdown().await;
     }
 
