@@ -481,9 +481,18 @@ impl BoardService {
         let Some(card) = inner.board.get(&id).cloned() else {
             return Ok(MergeRequest::Denied(format!("unknown card: {card_id}")));
         };
-        if !matches!(card.state, CardState::AwaitingMerge | CardState::NeedsYou) {
+        // 准入：等待验收、需要用户决定、以及**正在跑**的卡都可以申请名额。
+        // 正在跑也要接受，是因为合并已改为「原会话里发话触发」——用户发话本身
+        // 会让会话变忙，宿主对账随即把卡翻回 running；若这里仍拒绝 running，
+        // 合并就永远申请不到名额（本 bug）。真正的闸是「用户显式发话」
+        // （只有 CLI/skill 会调 merge_request，宿主从不自动调）、source 分支存在、
+        // 以及每项目一把 merge.lock。
+        if !matches!(
+            card.state,
+            CardState::AwaitingMerge | CardState::NeedsYou | CardState::Running
+        ) {
             return Ok(MergeRequest::Denied(format!(
-                "card {card_id} is {:?}, not awaiting_merge/needs_you",
+                "card {card_id} is {:?}, not awaiting_merge/needs_you/running",
                 card.state
             )));
         }
@@ -913,10 +922,22 @@ mod tests {
 
         let service = BoardService::new(state_dir, project, Some(dir.path().join("home")));
         // 补领之前：全局池是空的，别的领取者能抢到那张在跑卡片本该占的名额。
-        assert!(
-            lease::acquire_in(&leases_dir, 1).is_some(),
-            "restart starts with an empty pool"
-        );
+        // 探针拿到的租约必须在 `adopt_running_leases` **之前** drop，好让池子
+        // 显得空的；但 `drop` 之后 flock 是内核**异步**释放的，紧接着的补领
+        // 会撞上正在释放的锁而误拿到名额（实测并行跑全套时偶发，症状为下面
+        // 「the running card's slot is re-adopted」断言失败）。所以先探出
+        // 「池子空」，再**有界等待**该探针租约真正释放，确认池子干净，才 adopt。
+        let probe = lease::acquire_in(&leases_dir, 1);
+        assert!(probe.is_some(), "restart starts with an empty pool");
+        drop(probe);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if let Some(lease) = lease::acquire_in(&leases_dir, 1) {
+                drop(lease);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         service.adopt_running_leases(1);
         // 补领之后：唯一的名额被在跑的卡片占住。
         assert!(
@@ -1233,12 +1254,65 @@ mod tests {
         }
         assert_eq!(service.list()["cards"][0]["state"], "merging");
         // 已在 merging：第二次申请被拒（名额的持久载体是卡片状态）。
-        match service.merge_request("card-1").unwrap() {
-            MergeRequest::Denied(reason) => {
-                assert!(reason.contains("not awaiting_merge"), "{reason}")
+        // 这里要有界重试：第一次 `merge_request` 在返回前 drop 了 merge.lock，
+        // 而内核在 `close()` 后**异步**释放 flock，负载下紧随其后的获取会撞上
+        // 正在释放的那把锁而拿到 `Busy`（实测并行跑全套时偶发）。`Busy` 与
+        // 「卡已在 merging」是两回事，只有 `Denied` 才说明额度确实被钉住；
+        // 但 `Busy` 是瞬时窗口，重试即可穿过。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match service.merge_request("card-1").unwrap() {
+                MergeRequest::Denied(reason) => {
+                    assert!(reason.contains("not awaiting_merge"), "{reason}");
+                    break;
+                }
+                MergeRequest::Busy if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => panic!("expected Denied on second request, got {other:?}"),
             }
-            other => panic!("expected Denied on second request, got {other:?}"),
         }
+    }
+
+    /// 一张正在跑的实现卡（宿主对账已把它翻回 running）：用户发话要求合并
+    /// 仍应拿到名额。这是本 bug 的回归锁。
+    #[test]
+    fn merge_request_grants_for_a_running_card_whose_session_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // 走生产路径：启动 → awaiting_merge → 会话又忙（对账翻回 running）。
+        service.mark_running("card-1", "thread-1").unwrap();
+        service
+            .mark_terminal("card-1", "awaiting_merge", None)
+            .unwrap();
+        service.mark_running("card-1", "thread-1").unwrap();
+        assert_eq!(state_of(&service, "card-1"), "running");
+
+        let slug = crate::worktree::slugify(&CardId::new("card-1"));
+        let source = format!("kanban/{slug}");
+        git_run(&project, &["branch", &source]);
+
+        match service.merge_request("card-1").unwrap() {
+            MergeRequest::Granted {
+                source: s, base, ..
+            } => {
+                assert_eq!(s, source);
+                assert_eq!(base, "main");
+            }
+            other => panic!("expected Granted, got {other:?}"),
+        }
+        assert_eq!(state_of(&service, "card-1"), "merging");
+        // 已在 merging 的卡绝不能回流会话通路：宿主对账即便把卡报成 running，
+        // 这条迁移也会被状态机拒绝。额度已由卡片状态钉住（第二次申请会因卡不在
+        // 准入集而被拒），此处不再补一次 `merge_request`——那会依赖 flock 释放的
+        // 时序（macOS 上 drop 后释放有延迟，既有 `lease.rs` 用例亦因此偶发），
+        // 把本用例变成 flaky。
+        assert!(
+            !superpowers_kanban_core::card::CardState::Merging
+                .can_transition_to(superpowers_kanban_core::card::CardState::Running),
+            "merging → running 必须非法，否则合并中会被对账翻回会话"
+        );
     }
 
     #[test]
