@@ -34,13 +34,37 @@ export interface Attachment {
   size: number;
 }
 
+/**
+ * 一条消息附带的图片引用。**内容不进协议**：只有定位与展示所需的元数据，
+ * 字节由 `image/read` 按需分片取。
+ */
+export interface ImageRef {
+  path: string;
+  media_type: string;
+  /** 图片文件字节数；工具结果里的引用为 0，意为「未知」（非 0 字节）。 */
+  size: number;
+  detail?: string;
+}
+
 export type Item =
-  | { type: "userMessage"; id: string; text: string; attachments?: Attachment[] }
+  | {
+      type: "userMessage";
+      id: string;
+      text: string;
+      attachments?: Attachment[];
+      images?: ImageRef[];
+    }
   /**
    * 中途追加的用户消息：属于当前 turn，但作为独立 item 渲染，避免与开启该
    * turn 的那条消息混为一谈。`id` 是服务端在 RPC 入口铸的 `interjection_id`。
    */
-  | { type: "user_interjection"; id: string; text: string; attachments?: Attachment[] }
+  | {
+      type: "user_interjection";
+      id: string;
+      text: string;
+      attachments?: Attachment[];
+      images?: ImageRef[];
+    }
   | { type: "agentMessage"; id: string; text: string }
   | {
       type: "toolCall";
@@ -50,6 +74,7 @@ export type Item =
       input: unknown;
       status: ToolStatus;
       result?: string;
+      images?: ImageRef[];
     };
 
 export type TurnStatus = "completed" | "interrupted" | "failed";

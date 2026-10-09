@@ -10,8 +10,8 @@ describe("AttachmentChips", () => {
     render(
       <AttachmentChips
         attachments={[
-          { path: "/tmp/report.pdf", name: "report.pdf", size: 2048 },
-          { path: "/tmp/notes.docx", name: "notes.docx", size: 512 },
+          { path: "/tmp/report.pdf", name: "report.pdf", size: 2048, kind: "document" },
+          { path: "/tmp/notes.docx", name: "notes.docx", size: 512, kind: "document" },
         ]}
         onRemove={() => {}}
       />,
@@ -31,8 +31,8 @@ describe("AttachmentChips", () => {
     render(
       <AttachmentChips
         attachments={[
-          { path: "/tmp/report.pdf", name: "report.pdf", size: 2048 },
-          { path: "/tmp/notes.docx", name: "notes.docx", size: 512 },
+          { path: "/tmp/report.pdf", name: "report.pdf", size: 2048, kind: "document" },
+          { path: "/tmp/notes.docx", name: "notes.docx", size: 512, kind: "document" },
         ]}
         onRemove={onRemove}
       />,
@@ -53,7 +53,7 @@ describe("AttachmentChips", () => {
   it("omits the size when it is unknown (size: 0), keeping the label and remove button", () => {
     render(
       <AttachmentChips
-        attachments={[{ path: "/tmp/picked.pdf", name: "picked.pdf", size: 0 }]}
+        attachments={[{ path: "/tmp/picked.pdf", name: "picked.pdf", size: 0, kind: "document" }]}
         onRemove={() => {}}
       />,
     );
@@ -65,7 +65,7 @@ describe("AttachmentChips", () => {
   it("falls back to the path's last segment when the name is empty", () => {
     render(
       <AttachmentChips
-        attachments={[{ path: "/tmp/dir/fallback.pdf", name: "", size: 1024 * 1024 * 1.5 }]}
+        attachments={[{ path: "/tmp/dir/fallback.pdf", name: "", size: 1024 * 1024 * 1.5, kind: "document" }]}
         onRemove={() => {}}
       />,
     );
@@ -77,7 +77,7 @@ describe("AttachmentChips", () => {
   it("exposes the full path as a tooltip while truncating long names", () => {
     render(
       <AttachmentChips
-        attachments={[{ path: "/tmp/a-very-long-dir-name/report.pdf", name: "report.pdf", size: 10 }]}
+        attachments={[{ path: "/tmp/a-very-long-dir-name/report.pdf", name: "report.pdf", size: 10, kind: "document" }]}
         onRemove={() => {}}
       />,
     );

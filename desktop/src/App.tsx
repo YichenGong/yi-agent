@@ -34,6 +34,9 @@ import {
   ATTACHMENT_EXTENSIONS,
   attachmentProblem,
   fileNameOf,
+  imageAttachmentProblem,
+  IMAGE_EXTENSIONS,
+  pendingKindFromPath,
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
@@ -1284,13 +1287,18 @@ export default function App() {
     if (!id || !c) return false;
     // 这个会话待发送的附件。发送前先取快照：成功要清空它，失败要**留着**重试。
     const files = pending[id] ?? [];
+    // 按类别分组：文档走清单 block，图片走内容 block，协议形态不同。
+    const images = files.filter((f) => f.kind === "image");
+    const documents = files.filter((f) => f.kind !== "image");
     // 附件本身即消息：纯附件(文本框为空)也允许发送。
     if (!text.trim() && files.length === 0) return false;
 
     const session = store.view(id).session;
+    // 乐观回显只带**文档**：图片由服务端在回显的 item 上带 `images` 引用
+    // （元数据来自摄取后的落盘），本地此刻并不知道 media_type/size。
     session.addUserMessage(
       text,
-      files.map((f) => ({ name: f.name, path: f.path, size: f.size })),
+      documents.map((f) => ({ name: f.name, path: f.path, size: f.size })),
     );
     force((v) => v + 1);
     // The cached status can be stale: `turn/completed` reaches us before the
@@ -1299,12 +1307,13 @@ export default function App() {
     // the server's error code say where it disagreed and switch to the other
     // one. Each direction is tried once, so two mismatches cannot ping-pong.
     //
-    // 附件 block 必须排在文本 block **之前**：服务端按顺序读，附件先入场，
+    // 附件/图片 block 必须排在文本 block **之前**：服务端按顺序读，附件先入场，
     // 文本里只留问题本身，不放任何附件清单。
     const params = {
       threadId: id,
       input: [
-        ...files.map((f) => ({ type: "attachment" as const, path: f.path })),
+        ...images.map((f) => ({ type: "image" as const, path: f.path })),
+        ...documents.map((f) => ({ type: "attachment" as const, path: f.path })),
         { type: "text" as const, text },
       ],
     };
@@ -1344,7 +1353,7 @@ export default function App() {
   };
 
   /**
-   * 打开原生多选文件对话框，把选中的文档加入当前会话的待发附件。
+   * 打开原生多选文件对话框，把选中的文档或图片加入当前会话的待发附件。
    *
    * 逐个本地预检：不合格的就地报错(写进会话错误)并丢弃，合格的才进待发列表。
    * 报错与加入互不影响——一次多选里混着好坏文件是常态，不能因为一个坏文件
@@ -1359,7 +1368,11 @@ export default function App() {
     const picked = await open({
       directory: false,
       multiple: true,
-      filters: [{ name: "文档", extensions: [...ATTACHMENT_EXTENSIONS] }],
+      // 同一个选择器既收文档也收图片（两个白名单不重叠，按扩展名就能分类），
+      // 用户不必先想清楚"这是文档还是图片"再去点不同的按钮。
+      filters: [
+        { name: "文档或图片", extensions: [...ATTACHMENT_EXTENSIONS, ...IMAGE_EXTENSIONS] },
+      ],
     });
     // 多选回数组；单选/取消回字符串或 null。统一成数组再处理。
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
@@ -1369,15 +1382,17 @@ export default function App() {
     const accepted: PendingAttachment[] = [];
     for (const p of paths) {
       const name = fileNameOf(p);
+      const kind = pendingKindFromPath(p);
+      const isImage = kind === "image";
       // 桌面端拿不到 file size（dialog 只给路径）：大小交给服务端权威校验，
-      // 这里只做扩展名预检——`attachmentProblem(p, 0)` 的 size=0 意为"未知"，
-      // 不会误判为超限，避免把注定被拒的类型发出去。
-      const problem = attachmentProblem(p, 0);
+      // 这里只做扩展名预检——传 size=0 意为"未知"，不会误判为超限，避免把
+      // 注定被拒的类型发出去。图片与文档各用各的白名单与上限。
+      const problem = isImage ? imageAttachmentProblem(p, 0) : attachmentProblem(p, 0);
       if (problem) {
         problems.push(`${name}：${problem}`);
         continue;
       }
-      accepted.push({ path: p, name, size: 0 });
+      accepted.push({ path: p, name, size: 0, kind });
     }
     if (accepted.length > 0) {
       setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));

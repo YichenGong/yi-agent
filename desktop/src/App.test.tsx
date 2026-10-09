@@ -2638,6 +2638,77 @@ describe("App 附件接线", () => {
     });
   });
 
+  it("sends a pending image as an image block before the text block", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 图片经同一个回形针入口入列（Task 10 会给它一个独立按钮）：chip 出现即
+    // 「图片确实进了待发列表」的可见证据。
+    await pickFiles(["/tmp/截图.png"]);
+    expect(screen.getByText("截图.png")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "看看这个" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    const call = clients[0].requests.find((r) => r.method === "turn/start");
+    // 图片走内容块（`{type:"image", path}`），与文档附件一样排在文本**之前**；
+    // 服务端按顺序读，图片先入场，文本里只留问题本身。
+    expect(call?.params).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "image", path: "/tmp/截图.png" },
+        { type: "text", text: "看看这个" },
+      ],
+    });
+  });
+
+  it("sends images before documents before the text block, and echoes only documents", async () => {
+    const { container } = render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    await pickFiles(["/tmp/截图.png", "/tmp/报告.pdf"]);
+    expect(screen.getByText("截图.png")).toBeTruthy();
+    expect(screen.getByText("报告.pdf")).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "看看这些" } });
+      fireEvent.click(sendButton());
+    });
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    // 顺序是契约：图片块、文档块，最后才是文本块。
+    expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
+      threadId: "t1",
+      input: [
+        { type: "image", path: "/tmp/截图.png" },
+        { type: "attachment", path: "/tmp/报告.pdf" },
+        { type: "text", text: "看看这些" },
+      ],
+    });
+
+    // 乐观回显只带文档：图片由服务端在回显的 item 上带 `images` 引用（本地此刻
+    // 不知道 media_type/size）。文档 chip 出现在气泡里，图片名不在。
+    const bubbles = Array.from(container.querySelectorAll("div.self-end")).filter((d) =>
+      Array.from(d.childNodes).some(
+        (n) => n.nodeType === Node.TEXT_NODE && n.textContent === "看看这些",
+      ),
+    );
+    expect(bubbles).toHaveLength(1);
+    expect(within(bubbles[0] as HTMLElement).getByText("报告.pdf")).toBeTruthy();
+    expect(within(bubbles[0] as HTMLElement).queryByText("截图.png")).toBeNull();
+  });
+
   it("surfaces a local pre-check failure instead of sending", async () => {
     render(<App />);
     await waitFor(() =>

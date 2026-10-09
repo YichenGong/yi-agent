@@ -229,7 +229,7 @@ describe("MessageInput", () => {
       renderInput({
         onSend,
         value: "",
-        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10 }],
+        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10, kind: "document" }],
       });
 
       // An empty text box alone must not block the send: the attachment is the
@@ -252,7 +252,7 @@ describe("MessageInput", () => {
       renderInput({
         onSend,
         value: "",
-        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10 }],
+        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10, kind: "document" }],
       });
       // Enter and the Send button must take the same branch.
       fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
@@ -287,7 +287,7 @@ describe("MessageInput", () => {
       renderInput({
         onSend,
         value: "look at this",
-        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10 }],
+        attachments: [{ path: "/tmp/report.pdf", name: "report.pdf", size: 10, kind: "document" }],
         onRemoveAttachment,
       });
       fireEvent.click(screen.getByRole("button", { name: "移除 report.pdf" }));
