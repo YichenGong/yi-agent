@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use yi_agent_core::message::ContentBlock;
+use yi_agent_core::message::{ContentBlock, ImageSource};
 use yi_agent_core::{AgentEvent, DoneReason, TokenUsage};
 
 use crate::protocol::{Item, Notification, ToolStatus, TurnStatus};
@@ -167,11 +167,15 @@ impl Translator {
     ///
     /// The entry is removed from `tool_items`, so a second completion (or a
     /// late `ToolOutputDelta`) for the same `call_id` is automatically a no-op.
+    ///
+    /// `images` carries only *references* to tool-result images (never the
+    /// base64 payload); see [`image_refs_from`].
     fn complete_tool(
         &mut self,
         call_id: &str,
         status: ToolStatus,
         result: Option<String>,
+        images: Vec<crate::protocol::ImageRef>,
         out: &mut Vec<Notification>,
     ) {
         let Some(tool) = self.tool_items.remove(call_id) else {
@@ -186,7 +190,7 @@ impl Translator {
                 input: tool.input,
                 status,
                 result,
-                images: Vec::new(),
+                images,
             },
         });
     }
@@ -200,7 +204,7 @@ impl Translator {
     fn finalize_open_tools(&mut self, status: ToolStatus, out: &mut Vec<Notification>) {
         let open: Vec<String> = self.tool_items.keys().cloned().collect();
         for call_id in open {
-            self.complete_tool(&call_id, status.clone(), None, out);
+            self.complete_tool(&call_id, status.clone(), None, Vec::new(), out);
         }
     }
 
@@ -276,7 +280,8 @@ impl Translator {
                     ToolStatus::Completed
                 };
                 let rendered = render_content(&result.content);
-                self.complete_tool(&id, status, Some(rendered), &mut out);
+                let images = image_refs_from(&result.content);
+                self.complete_tool(&id, status, Some(rendered), images, &mut out);
             }
             AgentEvent::ToolExit { id, code } => {
                 let status = if code == Some(0) {
@@ -284,10 +289,10 @@ impl Translator {
                 } else {
                     ToolStatus::Failed
                 };
-                self.complete_tool(&id, status, None, &mut out);
+                self.complete_tool(&id, status, None, Vec::new(), &mut out);
             }
             AgentEvent::ToolTimeout { id } => {
-                self.complete_tool(&id, ToolStatus::Failed, None, &mut out);
+                self.complete_tool(&id, ToolStatus::Failed, None, Vec::new(), &mut out);
             }
             AgentEvent::ModelChanged { model } => {
                 // Design §5.3 step 4: the driver rebuilt the agent around a new
@@ -413,6 +418,37 @@ impl Translator {
     }
 }
 
+/// Collect the *references* to images carried by tool-result content blocks.
+///
+/// A `ContentBlock::Image` holds a base64 payload; nothing of that payload may
+/// reach the wire (items carry refs, and the UI fetches bytes separately over
+/// `image/read`). Only the image's on-disk `path` and `media_type` are kept.
+///
+/// A block without a `path` is not on-disk-referencable (the UI could not locate
+/// it), so it produces no ref. `size` is `0`: the tool side that produced the
+/// image does not know the original file's size, and the ref consumer does not
+/// need it — inventing a value would be worse than the sentinel.
+fn image_refs_from(blocks: &[ContentBlock]) -> Vec<crate::protocol::ImageRef> {
+    let mut out = Vec::new();
+    for block in blocks {
+        if let ContentBlock::Image { source, path, .. } = block {
+            if let Some(rel) = path {
+                let media_type = match source {
+                    ImageSource::Base64 { media_type, .. } => media_type.clone(),
+                    _ => "image/*".to_string(),
+                };
+                out.push(crate::protocol::ImageRef {
+                    path: rel.clone(),
+                    media_type,
+                    size: 0,
+                    detail: None,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Render tool-result content blocks into a single display string.
 ///
 /// Text blocks are concatenated verbatim; non-text blocks become a short
@@ -437,6 +473,7 @@ mod tests {
     use serde_json::json;
     use yi_agent_core::AgentEvent;
     use yi_agent_core::agent::{AgentError, DoneReason};
+    use yi_agent_core::message::{ImageDetail, ImageSource};
     use yi_agent_core::permission::PermissionKind;
     use yi_agent_core::provider::TokenUsage;
     use yi_agent_core::tool::ToolResult;
@@ -590,6 +627,122 @@ mod tests {
             }
             other => panic!("expected ItemCompleted ToolCall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_result_image_becomes_an_item_ref_without_base64() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::ToolCall {
+            id: "call-1".into(),
+            name: "view_image".into(),
+            input: json!({"path": "logo.png"}),
+        });
+        assert!(!out.is_empty());
+        let out = t.on_event(AgentEvent::ToolResult {
+            id: "call-1".into(),
+            result: ToolResult::with_content(vec![
+                ContentBlock::Text("viewed logo.png (8x8, image/png)".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    },
+                    detail: ImageDetail::High,
+                    path: Some(".yi-agent/attachments/t1/a1-logo.png".into()),
+                },
+            ]),
+        });
+        let item = match out.into_iter().next() {
+            Some(Notification::ItemCompleted {
+                item: item @ Item::ToolCall { .. },
+                ..
+            }) => item,
+            other => panic!("expected one ItemCompleted ToolCall, got {other:?}"),
+        };
+        let images = match &item {
+            Item::ToolCall { images, .. } => images,
+            _ => unreachable!(),
+        };
+        assert_eq!(images.len(), 1, "expected exactly one ref, got {images:?}");
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(
+            v["images"][0]["path"], ".yi-agent/attachments/t1/a1-logo.png",
+            "tool-result image must surface as a path ref, got {v}"
+        );
+        assert_eq!(v["images"][0]["media_type"], "image/png");
+        assert_eq!(v["images"][0]["size"], 0);
+        assert!(
+            !v.to_string().contains("AAAA"),
+            "no base64 in the item, got {v}"
+        );
+        // render_content text behaviour is unchanged: the placeholder stays.
+        assert!(
+            v["result"]
+                .as_str()
+                .is_some_and(|s| s == "viewed logo.png (8x8, image/png)[image]"),
+            "render_content output must be unchanged, got {}",
+            v["result"]
+        );
+    }
+
+    /// A tool-result image that is not on disk (no `path`) has nothing to
+    /// reference: `image/read` could not locate it, so it must not become a ref.
+    #[test]
+    fn tool_result_image_without_a_path_produces_no_ref() {
+        let mut t = translator();
+        t.on_event(AgentEvent::ToolCall {
+            id: "call-1".into(),
+            name: "view_image".into(),
+            input: json!({"path": "logo.png"}),
+        });
+        let out = t.on_event(AgentEvent::ToolResult {
+            id: "call-1".into(),
+            result: ToolResult::with_content(vec![
+                ContentBlock::Text("viewed".into()),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    },
+                    detail: ImageDetail::High,
+                    path: None,
+                },
+            ]),
+        });
+        match &out[0] {
+            Notification::ItemCompleted {
+                item: Item::ToolCall { images, .. },
+                ..
+            } => assert!(
+                images.is_empty(),
+                "a pathless image is not referencable, got {images:?}"
+            ),
+            other => panic!("expected ItemCompleted ToolCall, got {other:?}"),
+        }
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert!(
+            !v.to_string().contains("AAAA"),
+            "no base64 in the item, got {v}"
+        );
+    }
+
+    #[test]
+    fn tool_result_without_images_omits_the_field() {
+        let mut t = translator();
+        t.on_event(AgentEvent::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            input: json!({}),
+        });
+        let out = t.on_event(AgentEvent::ToolResult {
+            id: "c1".into(),
+            result: ToolResult::text("ok"),
+        });
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert!(
+            v["item"].get("images").is_none(),
+            "empty images must be skipped on the wire, got {v}"
+        );
     }
 
     #[test]
