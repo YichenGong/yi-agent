@@ -3,4 +3,5 @@
 pub mod bootstrap;
 pub mod config;
 pub mod models;
+pub mod onboarding;
 pub mod supervise;
