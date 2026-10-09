@@ -135,6 +135,14 @@ export class ThreadStore {
       if (v.info) v.info = { ...v.info, model: n.params.model };
       return;
     }
+    if (n.method === "thread/permissionModeChanged") {
+      // 跨客户端同步通道：另一个客户端（如桌面）切换了该会话的权限模式，服务端
+      // 广播到这里（列表层恒推）。`mode` 是服务端权威值，直接采纳——修复前没有
+      // 这条通道，手机上的 chip 只能靠打开会话那一刻的 listAll 快照，桌面之后改
+      // 的 YOLO 就永远同步不过来。
+      this.view(n.params.thread_id).mode = n.params.mode;
+      return;
+    }
     if (n.method === "error") {
       // 无 thread 归属的全局错误归当前 thread。
       this.current()?.session.apply(n);

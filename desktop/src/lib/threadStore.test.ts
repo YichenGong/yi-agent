@@ -210,4 +210,26 @@ describe("ThreadStore", () => {
     });
     expect(s.view("a").info).toBeNull();
   });
+
+  it("writes the target thread's mode on thread/permissionModeChanged", () => {
+    const s = new ThreadStore();
+    s.seed([summary("a"), summary("b")]);
+    s.applyNotification({
+      method: "thread/permissionModeChanged",
+      params: { thread_id: "a", mode: "yolo" },
+    });
+    // 只动被点名的那个。
+    expect(s.view("a").mode).toBe("yolo");
+    expect(s.view("b").mode).toBeNull();
+  });
+
+  it("applies thread/permissionModeChanged even for a thread with no prior view", () => {
+    const s = new ThreadStore();
+    // 远程客户端未订阅该会话时也可能收到（列表层恒推）：写入即建视图，不崩。
+    s.applyNotification({
+      method: "thread/permissionModeChanged",
+      params: { thread_id: "ghost", mode: "normal" },
+    });
+    expect(s.view("ghost").mode).toBe("normal");
+  });
 });
