@@ -290,6 +290,20 @@ export default function App() {
     [],
   );
 
+  /**
+   * 图片读取的宿主接缝（`image/read`）。理由同 `pluginCall`：只闭合 `clientRef`，
+   * 空依赖即稳定。`ChatView` 把它透传给每个气泡/工具卡的 `useImageData`，而那个
+   * effect 依赖 `call`——一旦每次渲染换新函数身份，每张图都会重新分片拉取。
+   */
+  const imageCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
   // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
   // 展示看板的项目；看板不切换会话，但点某条会话会离开看板（见 selectThread）。
   const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
@@ -1655,6 +1669,10 @@ export default function App() {
                 items={current?.session.items ?? []}
                 error={current?.session.lastError ?? null}
                 retrying={current?.session.retrying ?? null}
+                threadId={currentId}
+                // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
+                // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
+                call={imageCall}
               />
               <MessageInput
                 turnActive={current?.session.turnActive ?? false}

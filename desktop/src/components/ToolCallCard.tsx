@@ -1,6 +1,7 @@
 import { useId, useState } from "react";
 import type { Item, ToolStatus } from "../lib/protocol";
 import { toolCallSummary } from "../lib/toolSummary";
+import { useImageData, type ImageReadCall } from "../lib/useImageData";
 
 type ToolCallItem = Extract<Item, { type: "toolCall" }>;
 
@@ -10,7 +11,52 @@ const statusStyles: Record<ToolStatus, string> = {
   failed: "bg-red-500/15 text-red-300 border-red-500/40",
 };
 
-export function ToolCallCard({ item }: { item: ToolCallItem }) {
+/** 一张工具产出的图片：`path` 经 `useImageData` 分片取回，画成有界大小的 `<img>`。 */
+function ToolImage({
+  path,
+  threadId,
+  call,
+}: {
+  path: string;
+  threadId: string | null;
+  call: ImageReadCall;
+}) {
+  const { url, error } = useImageData(path, { threadId, call });
+  if (error) {
+    return (
+      <div className="rounded border border-red-500/40 bg-red-500/10 px-2 py-1 text-xs text-red-300">
+        图片读取失败：{error}
+      </div>
+    );
+  }
+  // 对象 URL 就绪前不占位：空 <img> 在窄栏里会闪一下 0×0 的边框。
+  return url ? (
+    <img
+      src={url}
+      alt="tool image"
+      data-testid="tool-image"
+      className="max-h-64 max-w-full rounded border border-line"
+    />
+  ) : null;
+}
+
+/**
+ * 一张工具调用卡片。
+ *
+ * `threadId` / `call` 只为读取工具产出的图片（`item.images`），是宿主注入的**稳定**
+ * 引用（`App` 里的 `imageCall`，空依赖 `useCallback`）。调用方（`ChatView` 的
+ * `ToolCallRow`）把它们原样透传，**不要**在这里或那里现造内联箭头/对象，否则 memo
+ * 的浅比较每次都不等，settled 的卡片会随每个流式 delta 重渲染。
+ */
+export function ToolCallCard({
+  item,
+  threadId = null,
+  call,
+}: {
+  item: ToolCallItem;
+  threadId?: string | null;
+  call?: ImageReadCall;
+}) {
   const [open, setOpen] = useState(false);
   const regionId = useId();
   const summary = toolCallSummary(item.name, item.input);
@@ -46,6 +92,13 @@ export function ToolCallCard({ item }: { item: ToolCallItem }) {
             {JSON.stringify(item.input, null, 2)}
           </pre>
         </div>
+        {item.images && item.images.length > 0 && call && (
+          <div className="space-y-2">
+            {item.images.map((img) => (
+              <ToolImage key={img.path} path={img.path} threadId={threadId} call={call} />
+            ))}
+          </div>
+        )}
         {item.result !== undefined && (
           <div>
             <div className="mb-1 text-xs uppercase tracking-wide text-fg-subtle">Result</div>
