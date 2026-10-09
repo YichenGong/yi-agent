@@ -965,10 +965,10 @@ mod tests {
             .set_title_if_unchanged("thread-a", "placeholder", "智能标题")
             .unwrap();
         assert!(replaced);
-        assert_eq!(
-            s.load("thread-a").unwrap().unwrap().meta.title.as_deref(),
-            Some("智能标题")
-        );
+        let m = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(m.title.as_deref(), Some("智能标题"));
+        // 覆盖也是一次标题变更：必须刷新 updated_at，与相邻的 touch 测试同标准。
+        assert!(m.updated_at > 1, "updated_at must be bumped on replace");
     }
 
     #[test]

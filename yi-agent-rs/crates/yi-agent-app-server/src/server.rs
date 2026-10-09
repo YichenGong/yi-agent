@@ -8871,7 +8871,13 @@ pub(crate) mod tests {
 
     /// 正文正常返回;但标题请求(恰好命中 `TITLE_INSTRUCTIONS`)返回错误，
     /// 用于覆盖"生成失败静默回退兜底标题"的路径。
-    struct RejectingTitleProvider;
+    ///
+    /// `title_calls` 记录标题请求的命中次数。仅断言"最终标题 == 兜底标题"是**不具
+    /// 辨识力**的:兜底标题本就等于 `title_from(prompt)`,与 `touch` 写入的字节完全
+    /// 一致,哪怕标题请求一次都没发出,断言照样通过。必须能观察到"确实尝试过且失败"。
+    struct RejectingTitleProvider {
+        title_calls: Arc<AtomicUsize>,
+    }
 
     #[async_trait]
     impl yi_agent_core::Provider for RejectingTitleProvider {
@@ -8883,6 +8889,7 @@ pub(crate) mod tests {
             yi_agent_core::provider::ProviderError,
         > {
             if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+                self.title_calls.fetch_add(1, Ordering::SeqCst);
                 return Err(yi_agent_core::provider::ProviderError::Network(
                     "title boom".into(),
                 ));
@@ -14515,7 +14522,10 @@ pub(crate) mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.workdir = dir.path().to_path_buf();
-        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RejectingTitleProvider);
+        let title_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RejectingTitleProvider {
+            title_calls: title_calls.clone(),
+        });
         let mut h = Harness::with_config(
             cfg,
             move |session, cwd, mode| {
@@ -14542,7 +14552,14 @@ pub(crate) mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        // 回退为 title_from("登录页报错了") —— 即原样截断。
+        // 关键：标题生成请求**必须真的发出过且失败**。仅断言标题等于 fallback 是
+        // 不具辨识力的——fallback 与 `touch` 写入的字节完全相同，标题请求一次不发
+        // 也照样通过（在基线 commit 上同样通过）。这里以命中计数证明失败路径被走到。
+        assert!(
+            title_calls.load(Ordering::SeqCst) >= 1,
+            "a title-generation request must have been attempted (and failed)"
+        );
+        // 且失败后静默保留兜底标题 —— 即 title_from("登录页报错了")（原样截断）。
         assert_eq!(title.as_deref(), Some("登录页报错了"));
         h.shutdown().await;
     }

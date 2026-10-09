@@ -23,7 +23,9 @@ pub const TITLE_MATERIAL_SIDE_CHARS: usize = 2000;
 pub fn build_title_material(user_text: &str, assistant_text: Option<&str>) -> String {
     let truncate = |s: &str| -> String { s.chars().take(TITLE_MATERIAL_SIDE_CHARS).collect() };
     let mut out = format!("用户提问：{}", truncate(user_text));
-    if let Some(a) = assistant_text {
+    // 全空白的助手侧等同缺失：否则会渲染一个悬空的"助手回复："标签，这非但没提供
+    // 信息，反而用一段空结构误导标题模型。
+    if let Some(a) = assistant_text.filter(|a| !a.trim().is_empty()) {
         out.push_str("\n\n助手回复：");
         out.push_str(&truncate(a));
     }
@@ -32,16 +34,26 @@ pub fn build_title_material(user_text: &str, assistant_text: Option<&str>) -> St
 
 /// 把模型返回的原始文本清洗成一个可用标题。
 ///
-/// 步骤：去首尾空白 → 取首个非空行 → 去包裹引号 → 去 `标题:` / `Title:` 前缀
-/// → 截断至 [`TITLE_MAX_CHARS`]。结果为空返回 `None`（调用方据此回退兜底标题）。
+/// 步骤：去首尾空白 → 取首个非空行 → 反复（去包裹引号 → 去 `标题:` / `Title:` 前缀）
+/// 直到稳定 → 截断至 [`TITLE_MAX_CHARS`]。结果为空返回 `None`（调用方据此回退兜底标题）。
+///
+/// 引号与前缀的清洗必须交替循环：模型可能写成 `标题："x"` 或 `"标题：x"`，只做一轮
+/// 固定顺序会留下另一侧的包裹字符，故循环到不再变化为止。
 pub fn sanitize_title(raw: &str) -> Option<String> {
     let first_line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
-    let mut text = first_line.trim_matches(|c| matches!(c, '"' | '\'' | '「' | '」' | '“' | '”'));
-    for prefix in ["标题:", "标题：", "Title:", "title:"] {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            text = rest.trim();
+    let mut text = first_line;
+    loop {
+        let mut next = text.trim_matches(|c| matches!(c, '"' | '\'' | '「' | '」' | '“' | '”'));
+        for prefix in ["标题:", "标题：", "Title:", "title:"] {
+            if let Some(rest) = next.strip_prefix(prefix) {
+                next = rest.trim();
+                break;
+            }
+        }
+        if next == text {
             break;
         }
+        text = next;
     }
     let capped: String = text.chars().take(TITLE_MAX_CHARS).collect();
     let capped = capped.trim().to_string();
@@ -140,6 +152,33 @@ mod tests {
         }
     }
 
+    /// 记录收到的请求、并返回固定文本的 provider。
+    ///
+    /// 用于对 `generate_title` 构造的 `ProviderRequest` 做"请求形状"断言：
+    /// `generate_title` 的约束（`max_tokens`、`system`、`tools`、`model`、保留
+    /// `gen_params`）都只能从实际发出的请求上观察。
+    struct CapturingProvider {
+        seen: std::sync::Arc<std::sync::Mutex<Option<ProviderRequest>>>,
+        reply: String,
+    }
+
+    #[async_trait]
+    impl Provider for CapturingProvider {
+        async fn call_stream(
+            &self,
+            req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            *self.seen.lock().unwrap() = Some(req);
+            let events = vec![
+                ProviderEvent::TextDelta(self.reply.clone()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ];
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
     fn core_config() -> AgentConfig {
         AgentConfig::default()
     }
@@ -171,6 +210,46 @@ mod tests {
         assert!(matches!(err, Err(AgentError::Provider(_))));
     }
 
+    /// `generate_title` 必须把调用绑定在既定请求形状上：限死 `max_tokens`、带
+    /// `TITLE_INSTRUCTIONS` 系统提示、不挂工具、沿用 config 的 model 与非默认 gen_params。
+    #[tokio::test]
+    async fn generate_title_request_shape_is_bound() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let provider: std::sync::Arc<dyn Provider> = std::sync::Arc::new(CapturingProvider {
+            seen: seen.clone(),
+            reply: "标题".into(),
+        });
+        let mut config = core_config();
+        config.model = "capture-model".into();
+        // 非默认字段：证明 generate_title 是"基于 config.gen_params 覆盖 max_tokens"，
+        // 而不是整体重置成默认值。
+        config.gen_params.temperature = Some(0.3);
+
+        let out = generate_title(&provider, &config, "hi", None)
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("标题"));
+
+        let req = seen
+            .lock()
+            .unwrap()
+            .take()
+            .expect("provider must be called");
+        assert_eq!(req.params.max_tokens, Some(64), "标题调用必须限死输出上限");
+        assert_eq!(
+            req.system.as_deref(),
+            Some(TITLE_INSTRUCTIONS),
+            "必须带上标题专用系统提示"
+        );
+        assert!(req.tools.is_empty(), "标题调用不得挂任何工具");
+        assert_eq!(req.model, config.model, "必须沿用会话当前模型");
+        assert_eq!(
+            req.params.temperature,
+            Some(0.3),
+            "config.gen_params 的非默认字段必须被保留"
+        );
+    }
+
     #[test]
     fn material_joins_both_sides_with_labels() {
         let m = build_title_material("帮我修一下登录页的报错", Some("好的，我看下 AuthForm。"));
@@ -183,6 +262,17 @@ mod tests {
         let m = build_title_material("你好", None);
         assert!(m.starts_with("用户提问：你好"));
         assert!(!m.contains("助手回复"), "absent assistant must be omitted");
+    }
+
+    /// 全空白的助手侧等同缺失：不得留下悬空的"助手回复："标签。
+    #[test]
+    fn material_omits_blank_assistant() {
+        let m = build_title_material("hi", Some("   "));
+        assert!(m.starts_with("用户提问：hi"));
+        assert!(
+            !m.contains("助手回复"),
+            "blank assistant must render no assistant section: {m:?}"
+        );
     }
 
     #[test]
@@ -222,6 +312,21 @@ mod tests {
             sanitize_title("Title: fix login").as_deref(),
             Some("fix login")
         );
+    }
+
+    /// 前缀与引号的清洗必须能交替进行：`标题："x"` 先去前缀再去引号才算干净。
+    #[test]
+    fn sanitize_strips_quotes_after_prefix() {
+        assert_eq!(sanitize_title("标题：\"修复\"").as_deref(), Some("修复"));
+        assert_eq!(sanitize_title("\"标题：修复\"").as_deref(), Some("修复"));
+    }
+
+    /// 其余的包裹引号变体与 `\r\n` 行尾：`lines()` 会吃掉 `\r`，首行照常取用。
+    #[test]
+    fn sanitize_handles_quote_variants_and_crlf() {
+        assert_eq!(sanitize_title("'修复'").as_deref(), Some("修复"));
+        assert_eq!(sanitize_title("“修复”").as_deref(), Some("修复"));
+        assert_eq!(sanitize_title("修复\r\n解释一下").as_deref(), Some("修复"));
     }
 
     #[test]
