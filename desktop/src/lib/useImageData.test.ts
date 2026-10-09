@@ -114,6 +114,26 @@ describe("useImageData", () => {
     expect(createdUrls).toHaveLength(1);
   });
 
+  it("keeps two threads that share a relative path apart (the cache is thread-scoped)", async () => {
+    // Tool-result image refs carry the model's `view_image` argument verbatim, so a
+    // relative path like `docs/diagram.png` is NOT thread-unique: two threads with
+    // different cwds can name a same-named file. Keying the cache on `path` alone
+    // would let the second thread render the first one's bytes.
+    const REL = "docs/diagram.png";
+    // One chunk per read, so the request log maps 1:1 onto reads.
+    const { call, requests } = serving([1, 1, 1], 3);
+    const a = renderHook(() => mod.useImageData(REL, { threadId: "t1", call }));
+    await waitFor(() => expect(a.result.current.url).toBeTruthy());
+
+    const b = renderHook(() => mod.useImageData(REL, { threadId: "t2", call }));
+    await waitFor(() => expect(b.result.current.url).toBeTruthy());
+
+    // Each thread gets its own read — the second must not be served from t1's entry.
+    expect(requests.map((r) => r.params.threadId)).toEqual(["t1", "t2"]);
+    expect(createdUrls).toHaveLength(2);
+    expect(a.result.current.url).not.toBe(b.result.current.url);
+  });
+
   it("surfaces a read failure as an error", async () => {
     const call = vi.fn(async () => {
       throw { code: -32000, message: "no such image" };

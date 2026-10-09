@@ -9,6 +9,8 @@
  * 把它记进待发附件（`path` 是工作区相对路径，故 chip 的缩略图能经 `image/read` 读回）。
  */
 
+import { MAX_IMAGE_BYTES } from "./attachmentLimits";
+
 /** 与 app-server 的 `image_upload::UPLOAD_CHUNK_BYTES` 保持一致（512 KiB）。 */
 export const UPLOAD_CHUNK_BYTES = 512 * 1024;
 
@@ -96,6 +98,25 @@ function heicFailure(file: File): Error {
 }
 
 /**
+ * 转码后仍超过 20 MB 上限时的拒绝理由。
+ *
+ * 调用方按**原始**文件大小预检（`imageSizeProblem`），转码只在 HEIC 上发生，而
+ * JPEG 通常比同图 HEIC 大，**转码后**超限完全可能。服务端的 `begin` 只看**声明**
+ * 大小，若客户端把转码后的字节数报上去，恰好卡在「声明 == 实际」这一条上被放行，
+ * 于是这张图会一路 begin+commit 成功，直到 `turn/start` 的 `prepare_image_file`
+ * 才因文件本身超限而炸；那会毒死整轮，而 chip 还留着，用户每次重试都同样失败。
+ * 所以必须在开口（`begin`）之前就地拒绝。桌面 `{type:"image", path}` 那条路一直
+ * 有服务端这道大小闸，这里补上对称的一道。
+ */
+function transcodedTooLarge(file: File): Error {
+  const limit = Math.round(MAX_IMAGE_BYTES / (1024 * 1024));
+  return new Error(
+    `转码后的图片「${file.name}」超过 ${limit} MB 上限（约 ${(file.size / (1024 * 1024)).toFixed(1)} MB）；` +
+      `请先把它裁小或降低分辨率后重试。`,
+  );
+}
+
+/**
  * HEIC/HEIF → JPEG。
  *
  * 服务端的 `image` crate 不认 HEIC（`guess_format` 直接失败），所以**必须**在客户端
@@ -174,6 +195,13 @@ export async function uploadImage(
   // 不得超过声明大小是服务端的硬校验），所以先定下最终形态再开口。
   const upload = isHeic(file) ? await transcodeHeicToJpeg(file) : file;
   const bytes = await readBytes(upload);
+
+  // 转码**之后**再查一次大小：报的是 `bytes.length`，若它超过 20 MB，服务端的
+  // `begin`（比的是声明值与上限，二者此刻相等，会放行）与 `turn/start` 的
+  // `prepare_image_file`（比的是落盘文件与上限，必拒）会在这里分岔——上传白忙一场，
+  // 还毒死整轮。就地拒绝，一个请求都不发。非 HEIC 的图由调用方的
+  // `imageSizeProblem` 预检（原始大小）拦住，走不到这里，故这条分支只对转码结果生效。
+  if (upload !== file && bytes.length > MAX_IMAGE_BYTES) throw transcodedTooLarge(upload);
 
   const uploadId = readUploadId(
     await call("image/upload/begin", {

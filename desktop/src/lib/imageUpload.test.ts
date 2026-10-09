@@ -1,6 +1,7 @@
 /** @vitest-environment jsdom */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { UPLOAD_CHUNK_BYTES, uploadImage } from "./imageUpload";
+import { MAX_IMAGE_BYTES } from "./attachmentLimits";
 
 /**
  * 远端（iOS）分片上传客户端。
@@ -266,6 +267,27 @@ describe("uploadImage / HEIC", () => {
     const s = serving();
 
     await expect(uploadImage(s.call, "t1", heicFile())).rejects.toThrow(/HEIC/);
+    expect(s.calls).toHaveLength(0);
+  });
+
+  it("refuses a HEIC whose transcode exceeds the 20 MB image cap (before any RPC)", async () => {
+    // 转码后的 JPEG 可能比原图还大（HEIC 的压缩率本就高于 JPEG）。调用方按**原始**
+    // 文件大小预检（`imageSizeProblem`），所以这里必须按**转码后**的字节数再查一次。
+    const oversized = new Blob([new Uint8Array(MAX_IMAGE_BYTES + 1)], {
+      type: "image/jpeg",
+    });
+    stubTranscoder(oversized);
+    const s = serving();
+
+    // 报错点名的是**转码后**的那个文件（名字已换成 .jpg），否则用户拿着
+    // 「照片.HEIC」这个名字去相册里找，找不到 20 MB 的东西。
+    await expect(uploadImage(s.call, "t1", heicFile("大图.HEIC"))).rejects.toThrow(
+      /转码后的图片「大图\.jpg」超过 20 MB 上限/,
+    );
+    // 关键：一个请求都没发出去。`begin` 只看**声明**大小（此刻声明值就是转码后的
+    // 超限字节数），而 `prepare_image_file` 比的是落盘文件与上限——两处判据分岔，
+    // 上传会白忙一场再在 `turn/start` 毒死整轮，且 chip 还留着，每次重试都同样
+    // 失败。就地拒绝才是唯一能自愈的做法。
     expect(s.calls).toHaveLength(0);
   });
 });

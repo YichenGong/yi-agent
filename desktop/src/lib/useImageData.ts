@@ -30,13 +30,20 @@ interface ImageChunk {
 export const IMAGE_CACHE_LIMIT = 60;
 
 /**
- * path → 对象 URL。用 `Map` 的插入顺序当 LRU：命中时 delete + set 把条目挪到队尾，
- * 淘汰从队首（最久未用）取。
+ * 缓存键 → 对象 URL。用 `Map` 的插入顺序当 LRU：命中时 delete + set 把条目挪到
+ * 队尾，淘汰从队首（最久未用）取。
+ *
+ * 键是 `threadId:path`，两者缺一不可。path 单独不够用——工具结果的图片引用带的是
+ * 模型 `view_image` 的原样参数，即 `docs/diagram.png` 这样的**工作区相对**路径
+ * （用户发送的引用形如 `.yi-agent/attachments/<tid>/…` 才是 thread 内的）。两条
+ * cwd 不同的 thread 完全可能各自看过一个同名相对路径，只按 path 做键就会让后来的
+ * 那条直接命中前一条的字节，静默显示成别人的图。thread 前缀让「同一 thread、
+ * 同一路径」照旧共享，「不同 thread」各读各的。
  */
 const cache = new Map<string, string>();
 
 /**
- * 同一 path 的**在途**读取。
+ * 同一缓存键的**在途**读取。
  *
  * 两个组件可能在同一帧里为同一张图挂载（例如同一条消息里的两张相同的 ref）：只看
  * 缓存会双双 miss 并发起重复分片请求。这里把并发折成一次，先到的发起、后到的汇合。
@@ -66,12 +73,17 @@ const liveRefs = new Map<string, number>();
  */
 const deferredRevoke = new Set<string>();
 
+/** 缓存键：`threadId:path`（见 `cache` 上的说明）。 */
+function cacheKey(threadId: string, path: string): string {
+  return `${threadId}:${path}`;
+}
+
 /** 命中则刷新 LRU 次序并返回 URL，未命中返回 `null`。 */
-function touchCache(path: string): string | null {
-  const url = cache.get(path);
+function touchCache(key: string): string | null {
+  const url = cache.get(key);
   if (url === undefined) return null;
-  cache.delete(path);
-  cache.set(path, url);
+  cache.delete(key);
+  cache.set(key, url);
   return url;
 }
 
@@ -95,8 +107,8 @@ function releaseRef(url: string): void {
 }
 
 /** 存入缓存；超出上限时淘汰最久未用的条目，无人显示者当场释放、有人在看者推迟。 */
-function storeCache(path: string, url: string): void {
-  cache.set(path, url);
+function storeCache(key: string, url: string): void {
+  cache.set(key, url);
   while (cache.size > IMAGE_CACHE_LIMIT) {
     const oldest = cache.entries().next().value as [string, string];
     cache.delete(oldest[0]);
@@ -164,17 +176,18 @@ async function fetchImageBlob(
 
 /** 取（或发起）一次读取，返回可显示的对象 URL。 */
 function load(call: ImageReadCall, threadId: string, path: string): Promise<string> {
-  const pending = inflight.get(path);
+  const key = cacheKey(threadId, path);
+  const pending = inflight.get(key);
   if (pending) return pending;
   const job = (async () => {
     const url = URL.createObjectURL(await fetchImageBlob(call, threadId, path));
-    storeCache(path, url);
+    storeCache(key, url);
     return url;
   })().finally(() => {
     // 失败也从在途表里摘掉：下一次挂载可以重试，而不是永久汇合到一个失败的 Promise。
-    inflight.delete(path);
+    inflight.delete(key);
   });
-  inflight.set(path, job);
+  inflight.set(key, job);
   return job;
 }
 
@@ -184,9 +197,12 @@ function load(call: ImageReadCall, threadId: string, path: string): Promise<stri
  * 内容不进协议：`ImageRef` 只有定位元数据，字节由 `image/read` 分片取。分片循环到
  * `nextOffset === null`，拼成 Blob 后 `createObjectURL`。
  *
- * 缓存键是 `path`（同一工作区里哈希文件名唯一），跨组件共享：第二张相同的 `ref`
- * 命中缓存，**不发请求**。淘汰时释放对象 URL；但若仍有已挂载消费者在显示该 URL，
- * 则推迟到最后一个消费者卸载再释放（见 `deferredRevoke`）。
+ * 缓存键是 `threadId:path`——**不是** path 单独。工具结果的图片引用带的是模型
+ * `view_image` 的原样参数，`docs/diagram.png` 这类工作区相对路径在两条 cwd 不同的
+ * thread 里可以重名，只看 path 就会让后一条静默显示前一条的字节（跨会话串图）。
+ * 同一 thread 内则照旧共享：第二张相同的 `ref` 命中缓存，**不发请求**。
+ * 淘汰时释放对象 URL；但若仍有已挂载消费者在显示该 URL，则推迟到最后一个消费者
+ * 卸载再释放（见 `deferredRevoke`）。
  *
  * `threadId` 为 `null` 或 `path` 为空时不读取（无会话/无引用），返回空状态而不是报错。
  *
@@ -207,7 +223,7 @@ export function useImageData(
       // 命中缓存时**首帧**就有 URL：既不闪一下空白，也不触发读取 effect。
       // 这里**不**计数（初始化器可能被 StrictMode 重复调用）；effect 会为这份 URL
       // 记账，消费者照样计入引用。
-      return { url: touchCache(path), error: null };
+      return { url: touchCache(cacheKey(threadId, path)), error: null };
     },
   );
 
@@ -235,7 +251,7 @@ export function useImageData(
       heldRef.current = url;
     };
 
-    const cached = touchCache(path);
+    const cached = touchCache(cacheKey(threadId, path));
     if (cached !== null) {
       // 命中缓存也要计数：否则淘汰会收回一张正在显示的图。初始化器很可能已把同一
       // 份 URL 放进 state（首帧即显示），这里再 `hold` 它，计数与显示一致。
