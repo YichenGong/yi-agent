@@ -406,8 +406,14 @@ impl ThreadStore {
     }
 
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
-    /// `title_hint`(本轮 prompt)填充。thread 不存在或 meta 不可读时静默返回。
-    pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<()> {
+    /// `title_hint`(本轮 prompt)填充。
+    ///
+    /// 返回 `true` = 本次确实写入了标题(即该 thread 的首轮);调用方据此决定是否
+    /// 再发起一次 LLM 标题生成。未知 id 或 meta 不可读时静默返回 `Ok(false)`。
+    pub fn touch(&self, id: &str, title_hint: Option<&str>) -> io::Result<bool> {
+        // `update_meta` 的闭包是 `FnOnce`,因此用 `&mut` 捕获即可在调用后读取是否
+        // 实际写入;`Ok(None)`(未知 id / meta 不可读)时闭包未执行,`wrote` 保持 false。
+        let mut wrote = false;
         self.update_meta(id, |meta| {
             meta.updated_at = now_millis();
             if meta.title.is_none() {
@@ -415,11 +421,12 @@ impl ThreadStore {
                     let t = title_from(hint);
                     if !t.is_empty() {
                         meta.title = Some(t);
+                        wrote = true;
                     }
                 }
             }
-        })
-        .map(|_| ())
+        })?;
+        Ok(wrote)
     }
 
     /// thread 是否已知(meta 或 log 任一存在)。
@@ -931,12 +938,14 @@ mod tests {
     fn touch_sets_title_only_when_absent_and_bumps_updated_at() {
         let (_d, s) = store();
         s.create(&meta("thread-a")).unwrap();
-        s.touch("thread-a", Some("  first   message  ")).unwrap();
+        let wrote = s.touch("thread-a", Some("  first   message  ")).unwrap();
+        assert!(wrote, "first touch must report that it wrote a title");
         let m = s.load("thread-a").unwrap().unwrap().meta;
         assert_eq!(m.title.as_deref(), Some("first message"));
         assert!(m.updated_at > 1, "updated_at must be bumped");
 
-        s.touch("thread-a", Some("ignored")).unwrap();
+        let wrote_again = s.touch("thread-a", Some("ignored")).unwrap();
+        assert!(!wrote_again, "an existing title must not be overwritten");
         assert_eq!(
             s.load("thread-a").unwrap().unwrap().meta.title.as_deref(),
             Some("first message"),
@@ -984,8 +993,10 @@ mod tests {
     #[test]
     fn touch_unknown_id_is_silent_noop() {
         let (_d, s) = store();
-        s.touch("nope", Some("x"))
-            .expect("unknown id must not error");
+        assert!(
+            !s.touch("nope", Some("x"))
+                .expect("unknown id must not error")
+        );
     }
 
     #[test]
