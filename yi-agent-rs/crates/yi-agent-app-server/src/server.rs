@@ -5677,7 +5677,12 @@ async fn run_thread_driver(
                                     });
                                 }
                                 // 逐字流：仅当存在订阅者时合并；否则走原来的直发。
-                                // 非 delta 通知前先刷该 thread 的待发，保证顺序。
+                                // **屏障**：任何**非 delta** 通知到达时，先刷它所属 thread
+                                // 的待发 delta，保证「先吐字、再标记这项完成」的顺序不变。
+                                // 缺这道屏障时，某 item 的 `item/completed` 会**越过**自己
+                                // 那条尚未刷出的 delta 先发出：客户端先按 id 整条替换成
+                                // 完整文本，随后迟到的 delta 又被就地追加一遍，尾部于是
+                                // 重复。注释与实现必须同时成立，这里补上被漏掉的分支。
                                 let mut to_send: Vec<Notification> = Vec::new();
                                 match &n {
                                     Notification::ItemDelta { thread_id: t, item_id, delta }
@@ -5692,10 +5697,13 @@ async fn run_thread_driver(
                                         }
                                     }
                                     _ => {
-                                        if let Notification::ItemDelta { thread_id: t, .. } = &n {
+                                        // 非 delta 通知：先刷**它自己 thread** 的待发
+                                        // delta（若有），再发这条通知。无订阅者时
+                                        // 缓冲恒空，这里是 no-op、字节不变。
+                                        if let Some(t) = n.thread_key() {
                                             if let Some((pid, text)) = coalescer.take(t) {
                                                 to_send.push(Notification::ItemDelta {
-                                                    thread_id: t.clone(),
+                                                    thread_id: t.to_string(),
                                                     item_id: pid,
                                                     delta: text,
                                                 });
@@ -9221,6 +9229,15 @@ pub(crate) mod tests {
                 .expect("read_line failed");
             assert!(n > 0, "unexpected EOF while waiting for a message");
             serde_json::from_str(buf.trim()).expect("server wrote invalid JSON")
+        }
+
+        /// 读一帧，超时（或无帧）返回 `None`。用于断言「此后不该再有帧」。
+        pub(crate) async fn try_read_value(&mut self, wait: Duration) -> Option<serde_json::Value> {
+            let mut buf = String::new();
+            match tokio::time::timeout(wait, self.client_r.read_line(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => serde_json::from_str(buf.trim()).ok(),
+                _ => None,
+            }
         }
 
         /// 关掉客户端写端(触发 EOF)并等待 server 任务结束。
@@ -15716,6 +15733,117 @@ pub(crate) mod tests {
         let flushed = c.push("t1", "i3", &big);
         assert_eq!(flushed.len(), 1, "超上限必须立即返回: {flushed:?}");
         assert_eq!(c.take("t1"), None);
+    }
+
+    /// 订阅者存在时，合并器把 delta 攒起来。若屏障缺失，`item/completed` 会
+    /// **越过**自己那条尚未刷出的 delta 先发出——客户端先按 id 整条替换成完整
+    /// 文本，随后那条迟到的 delta 又被就地追加一遍，于是*尾部*被重复一次。
+    ///
+    /// 契约：某 item 的 `item/completed` 之后，不得再出现该 item 的 `item/delta`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completed_item_never_trails_its_own_buffered_delta() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        // 制造「存在已订阅客户端」：这会让驱动走合并路径（生产里由手机订阅触发）。
+        h.hub()
+            .subscribe(&crate::broadcast::ClientId::local(), vec![tid.clone()]);
+        assert!(
+            h.hub().has_subscribed_clients(),
+            "订阅后必须走合并路径，否则本用例测不到屏障"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        // 收集到 turn/completed 为止，记录 agent item 的 completed 位置与其 id。
+        let mut completed_agent_id: Option<String> = None;
+        let mut saw_turn_completed = false;
+        let mut frames: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                saw_turn_completed = true;
+                frames.push(v);
+                break;
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
+                && v["params"]["item"]["type"] == "agentMessage"
+            {
+                completed_agent_id = v["params"]["item"]["id"].as_str().map(str::to_string);
+            }
+            frames.push(v);
+        }
+        assert!(saw_turn_completed, "turn 必须完成: {frames:?}");
+        let agent_id = completed_agent_id.expect("agent message 必须有 item/completed");
+
+        // 完成之后，同一条 item 的 delta 绝不能再出现。
+        let mut stray: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..5 {
+            match h.try_read_value(Duration::from_millis(200)).await {
+                Some(v) => {
+                    if v.get("method").and_then(|m| m.as_str()) == Some("item/delta")
+                        && v["params"]["item_id"] == serde_json::json!(agent_id)
+                    {
+                        stray.push(v);
+                    }
+                }
+                None => break,
+            }
+        }
+        assert!(
+            stray.is_empty(),
+            "item/completed 之后不得再追加同一 item 的 delta（尾部会被重复）: {stray:?}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 触发条件：**无订阅者**（纯桌面 stdio，无手机/中继）时合并器恒空，
+    /// delta 逐条直发，顺序天然成立——这正是规格承诺的「零回归」。它同时钉住
+    /// 上一条用例的前提：重复只在实例内出现订阅者（手机经中继订阅同一会话）时发生。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_subscribers_deltas_stay_immediate_and_in_order() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        assert!(
+            !h.hub().has_subscribed_clients(),
+            "纯 stdio 实例不该有任何订阅者"
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+        ))
+        .await;
+
+        let mut completed_agent_id: Option<String> = None;
+        let mut saw_turn_completed = false;
+        for _ in 0..40 {
+            let v = h.read_value().await;
+            if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                saw_turn_completed = true;
+                break;
+            }
+            if v.get("method").and_then(|m| m.as_str()) == Some("item/completed")
+                && v["params"]["item"]["type"] == "agentMessage"
+            {
+                completed_agent_id = v["params"]["item"]["id"].as_str().map(str::to_string);
+            }
+        }
+        assert!(saw_turn_completed);
+        let agent_id = completed_agent_id.expect("agent message 必须有 item/completed");
+
+        for _ in 0..5 {
+            match h.try_read_value(Duration::from_millis(200)).await {
+                Some(v) => {
+                    let is_stray = v.get("method").and_then(|m| m.as_str()) == Some("item/delta")
+                        && v["params"]["item_id"] == serde_json::json!(agent_id);
+                    assert!(!is_stray, "无订阅者时不得出现迟到 delta: {v}");
+                }
+                None => break,
+            }
+        }
+        h.shutdown().await;
     }
 
     #[test]
