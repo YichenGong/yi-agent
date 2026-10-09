@@ -348,6 +348,25 @@ impl ThreadStore {
             .is_some())
     }
 
+    /// 条件写入标题：仅当当前 `title` 恰好等于 `expected` 时替换为 `new`。
+    ///
+    /// 用于"LLM 生成标题"覆盖"兜底截断标题"：以兜底值为 CAS 凭据，用户若在两次
+    /// 写入之间手动 `rename`，此处便会放弃覆盖——手动改名优先。返回 `Ok(false)`
+    /// 表示未替换（标题已变、或 thread 不存在）。
+    pub fn set_title_if_unchanged(&self, id: &str, expected: &str, new: &str) -> io::Result<bool> {
+        // `update_meta` 的闭包是 `FnOnce`，用 `&mut` 捕获即可在调用后读取是否实际
+        // 替换；`Ok(None)`（未知 id / meta 不可读）时闭包未执行，`replaced` 保持 false。
+        let mut replaced = false;
+        self.update_meta(id, |meta| {
+            if meta.title.as_deref() == Some(expected) {
+                meta.title = Some(new.to_string());
+                meta.updated_at = now_millis();
+                replaced = true;
+            }
+        })?;
+        Ok(replaced)
+    }
+
     /// 只重写 meta 的 `permission_mode`。走同一把 `update_meta` 锁,
     /// 避免与并发 `rename` / `touch` 互相覆盖。
     ///
@@ -660,7 +679,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// 把一段文本规整为标题:压缩空白 + 截断到 30 个字符。
-fn title_from(hint: &str) -> String {
+///
+/// `pub(crate)`:LLM 标题生效后,上层需要用它复算兜底标题,以便与 `set_title_if_unchanged`
+/// 的 CAS 凭据保持完全一致。
+pub(crate) fn title_from(hint: &str) -> String {
     let normalized = hint.split_whitespace().collect::<Vec<_>>().join(" ");
     normalized.chars().take(30).collect()
 }
@@ -932,6 +954,44 @@ mod tests {
     fn rename_unknown_returns_false() {
         let (_d, s) = store();
         assert!(!s.rename("nope", "x").unwrap());
+    }
+
+    #[test]
+    fn set_title_if_unchanged_replaces_on_match() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.touch("thread-a", Some("placeholder")).unwrap();
+        let replaced = s
+            .set_title_if_unchanged("thread-a", "placeholder", "智能标题")
+            .unwrap();
+        assert!(replaced);
+        assert_eq!(
+            s.load("thread-a").unwrap().unwrap().meta.title.as_deref(),
+            Some("智能标题")
+        );
+    }
+
+    #[test]
+    fn set_title_if_unchanged_yields_to_concurrent_rename() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.touch("thread-a", Some("placeholder")).unwrap();
+        // 用户抢先改名：当前标题不再是 expected，CAS 必须放弃覆盖。
+        s.rename("thread-a", "user title").unwrap();
+        let replaced = s
+            .set_title_if_unchanged("thread-a", "placeholder", "智能标题")
+            .unwrap();
+        assert!(!replaced);
+        assert_eq!(
+            s.load("thread-a").unwrap().unwrap().meta.title.as_deref(),
+            Some("user title")
+        );
+    }
+
+    #[test]
+    fn set_title_if_unchanged_unknown_id_returns_false() {
+        let (_d, s) = store();
+        assert!(!s.set_title_if_unchanged("nope", "x", "y").unwrap());
     }
 
     #[test]
