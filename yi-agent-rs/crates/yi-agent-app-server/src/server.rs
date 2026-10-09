@@ -114,6 +114,14 @@ pub(crate) struct RuntimeAttachments {
     /// is: `model/*` must be testable without writing the developer's real
     /// machine-level catalog (and its API keys).
     pub(crate) models_path: PathBuf,
+    /// Where the global `.env` lives, for `onboarding/apply`. Injectable for the
+    /// same reason `models_path` is: onboarding must never write the developer's
+    /// real `~/.yi-agent/.env`.
+    pub(crate) onboarding_env_path: PathBuf,
+    /// Where `preferences.json` lives, for the `onboarding_dismissed` marker.
+    /// Injectable for the same reason `onboarding_env_path` is: dismissing the
+    /// first-run guide must never touch the developer's real preferences file.
+    pub(crate) onboarding_preferences_path: PathBuf,
     /// Where the generic resident-daemon registry lives (`$HOME/.yi-agent`).
     /// Injectable for the same reason `board_dir` is: `board/create` must be
     /// testable without writing the developer's real resident registry.
@@ -1383,6 +1391,11 @@ where
             thread_roots,
             board_dir,
             models_path: yi_agent_runtime::models::models_path(),
+            // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
+            // 注入隔离 tempdir。HOME 缺失回退空路径,与 `board_dir` 同一策略。
+            onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
+                .unwrap_or_default(),
+            onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
@@ -1451,6 +1464,11 @@ where
             thread_roots,
             board_dir,
             models_path: yi_agent_runtime::models::models_path(),
+            // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
+            // 注入隔离 tempdir。HOME 缺失回退空路径,与 `board_dir` 同一策略。
+            onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
+                .unwrap_or_default(),
+            onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
@@ -2074,6 +2092,8 @@ where
         thread_roots,
         board_dir,
         models_path,
+        onboarding_env_path,
+        onboarding_preferences_path,
         resident_dir,
         launcher: board_launcher,
         theme,
@@ -2599,6 +2619,78 @@ where
                                 write_response(&hub, &client, err_response(id, error)).await?
                             }
                         }
+                    }
+                    // 首次安装引导。与 `model/*` 同档:`onboarding/status` 只读
+                    // (Observe);apply/dismiss/test 都触及密钥或落盘,需 `Control`。
+                    "onboarding/status" => {
+                        match crate::onboarding_rpc::handle_onboarding_request_at(
+                            &onboarding_env_path,
+                            &onboarding_preferences_path,
+                            &models_path,
+                            method.as_str(),
+                            &req.params,
+                            &cfg,
+                        ) {
+                            Ok(value) => {
+                                write_response(&hub, &client, ok_response(id, value)).await?
+                            }
+                            Err(error) => {
+                                write_response(&hub, &client, err_response(id, error)).await?
+                            }
+                        }
+                    }
+                    "onboarding/apply" | "onboarding/dismiss" => {
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        match crate::onboarding_rpc::handle_onboarding_request_at(
+                            &onboarding_env_path,
+                            &onboarding_preferences_path,
+                            &models_path,
+                            method.as_str(),
+                            &req.params,
+                            &cfg,
+                        ) {
+                            Ok(value) => {
+                                write_response(&hub, &client, ok_response(id, value)).await?
+                            }
+                            Err(error) => {
+                                write_response(&hub, &client, err_response(id, error)).await?
+                            }
+                        }
+                    }
+                    // 探测只发一次最小请求,**不落盘**:故不归 `onboarding_rpc`
+                    // (它管路径),而是直接调 runtime 的 `test_connection`(async)。
+                    "onboarding/test" => {
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let settings =
+                            match crate::onboarding_rpc::settings_from_params(&req.params) {
+                                Ok(s) => s,
+                                Err(error) => {
+                                    write_response(&hub, &client, err_response(id, error)).await?;
+                                    continue;
+                                }
+                            };
+                        let outcome = yi_agent_runtime::onboarding::test_connection(&settings).await;
+                        let value = serde_json::json!({
+                            "ok": outcome.ok,
+                            "reason": outcome.reason,
+                        });
+                        write_response(&hub, &client, ok_response(id, value)).await?;
                     }
                     "board/create" => {
                         let Some(project) = project_arg(&req.params) else {
@@ -9167,6 +9259,10 @@ pub(crate) mod tests {
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                     board_dir: board_dir.path().to_path_buf(),
                     models_path: models_dir.path().join("models.json"),
+                    // 引导的 .env / preferences 也落在隔离目录里:onboarding/*
+                    // 不得写开发者真实的 `~/.yi-agent`。
+                    onboarding_env_path: index_dir.path().join(".env"),
+                    onboarding_preferences_path: index_dir.path().join("preferences.json"),
                     // 测试里不起真进程:`board/create` 走注入的启动器,
                     // 与 board_dir 注入同一个理由。
                     resident_dir: resident_dir.path().to_path_buf(),
@@ -9982,6 +10078,8 @@ pub(crate) mod tests {
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
                 models_path: PathBuf::new(),
+                onboarding_env_path: PathBuf::new(),
+                onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -10054,6 +10152,8 @@ pub(crate) mod tests {
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
                 models_path: PathBuf::new(),
+                onboarding_env_path: PathBuf::new(),
+                onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -10130,6 +10230,8 @@ pub(crate) mod tests {
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 board_dir: PathBuf::new(),
                 models_path: PathBuf::new(),
+                onboarding_env_path: PathBuf::new(),
+                onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -15282,6 +15384,95 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// `onboarding/status` 只读,`Observe` 即可:空白机器上「需要引导」且未 dismiss。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onboarding_status_is_readable_and_reports_needed() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"onboarding/status","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["needed"], true, "got {v}");
+        assert_eq!(v["result"]["dismissed"], false, "got {v}");
+    }
+
+    /// `onboarding/apply` 落 `.env` 与清单;随后 `status` 立刻翻成 ready。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onboarding_apply_lands_the_env_and_catalog() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"onboarding/apply","params":{"provider":"openai","model":"gpt-4o","api_url":"","api_key":"sk-x"}}"#,
+        )
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["env_written"], true, "got {v}");
+        assert_eq!(v["result"]["imported"], true, "got {v}");
+
+        // 状态随即翻成 ready。
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"onboarding/status","params":{}}"#)
+            .await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["needed"], false, "got {v}");
+    }
+
+    /// `onboarding/test` 用注入的临时 provider 真发一次最小请求。桩必须回
+    /// **SSE** 流(`text/event-stream`)——provider 消费的是流,不是一次性 JSON。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn onboarding_test_probes_the_endpoint() {
+        use wiremock::matchers::{method as wm_method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        let req = serde_json::json!({
+            "jsonrpc":"2.0","id":2,"method":"onboarding/test",
+            "params":{"provider":"anthropic","model":"m",
+                      "api_url": server.uri(), "api_key":"sk-x"}
+        });
+        h.send(&req.to_string()).await;
+        let v = h.read_value().await;
+        assert_eq!(v["result"]["ok"], true, "got {v}");
+    }
+
+    /// `onboarding/apply` 是写操作:最低权 `Observe` 必须被拒(-32014)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observe_client_cannot_apply_onboarding() {
+        let mut h = Harness::with_scope(Scope::Observe).await;
+        initialize(&mut h).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":2,"method":"onboarding/apply","params":{"provider":"openai","model":"m","api_url":"","api_key":"k"}}"#,
+        )
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32014, "got {v}");
+    }
+
     /// 经真实 `model/upsert` 分发把一条模型写进 harness 的隔离清单,返回其响应。
     async fn upsert_model(
         h: &mut Harness,
@@ -16883,6 +17074,8 @@ pub(crate) mod tests {
                     thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                     board_dir: board_dir.path().to_path_buf(),
                     models_path: PathBuf::new(),
+                    onboarding_env_path: PathBuf::new(),
+                    onboarding_preferences_path: PathBuf::new(),
                     resident_dir: PathBuf::new(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
