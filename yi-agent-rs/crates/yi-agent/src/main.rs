@@ -333,7 +333,7 @@ fn format_revoke_result(device_id: &str, removed: bool) -> String {
 /// tracing writes to a file (and to stderr only when `YI_LOG` is set).
 fn run_app_server(cli: Cli) -> Result<()> {
     let mode = app_server_mode(&cli)?;
-    let config = config::load(&cli)?;
+    let config = config::load_lenient(&cli)?;
     let rt = tokio::runtime::Runtime::new()?;
     match mode {
         AppServerMode::Stdio => rt.block_on(yi_agent_app_server::run(
@@ -2395,6 +2395,19 @@ mod tests {
     #[test]
     fn parse_listen_accepts_stdio() {
         assert!(matches!(parse_listen("stdio://").unwrap(), Listen::Stdio));
+    }
+
+    #[test]
+    fn app_server_mode_uses_a_lenient_config_load() {
+        // 生产入口缺 key 也必须能起来，否则新机器上引导 RPC 不可达。
+        // Needle built from fragments: a literal here would match the test's own
+        // source line and make this guard vacuously pass.
+        let needle = ["config::load_lenient", "(&cli)"].concat();
+        let source = include_str!("main.rs");
+        assert!(
+            source.contains(&needle),
+            "run_app_server must use the lenient loader"
+        );
     }
 
     #[test]
