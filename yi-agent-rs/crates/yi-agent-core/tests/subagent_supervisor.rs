@@ -1474,8 +1474,7 @@ async fn a_parent_that_settles_cascades_a_child_already_awaiting_review() {
 
 #[test]
 fn a_configured_direct_child_limit_is_enforced_and_reported() {
-    let mut supervisor =
-        AgentSupervisor::new(RootSessionId::new()).with_max_direct_children(2);
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new()).with_max_direct_children(2);
     let root = supervisor.root_task_id().clone();
 
     supervisor.spawn(root.clone()).unwrap();
