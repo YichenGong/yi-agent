@@ -2940,6 +2940,7 @@ where
                                     "cwd": cwd,
                                     "model": model,
                                     "model_ref": model_ref,
+                                    "permission_mode": mode,
                                 }),
                             ),
                         )
@@ -3207,6 +3208,7 @@ where
                                     "cwd": cwd,
                                     "model": model,
                                     "model_ref": loaded.meta.model_ref,
+                                    "permission_mode": loaded.meta.permission_mode,
                                 }),
                             ),
                         )
@@ -15098,6 +15100,70 @@ pub(crate) mod tests {
         .await;
         let v = read_response(&mut h, 9).await;
         assert_eq!(v["error"]["code"], -32014, "Observe 客户端必须被拒: {v}");
+        h.shutdown().await;
+    }
+
+    /// `thread/start` 响应必须直接带权威 `permission_mode`（新线程恒 normal）。
+    /// 客户端靠它建起 mode chip,不必再回读 listAll(那条路径异步、可失败、可竞态)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_response_carries_permission_mode() {
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":20,"method":"thread/start","params":{}}"#)
+            .await;
+        let mut resp = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(20)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("thread/start response");
+        assert_eq!(
+            resp["result"]["permission_mode"].as_str(),
+            Some("normal"),
+            "thread/start must carry permission_mode: {resp}"
+        );
+        h.shutdown().await;
+    }
+
+    /// `thread/resume` 响应必须带该会话**持久化**的模式:手机打开一个电脑上
+    /// 已置 yolo 的会话,必须一次请求就看到 yolo,而不是「未知 / 等回读」。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_resume_response_carries_persisted_permission_mode() {
+        let mut h = Harness::new();
+        let tid = start_thread(&mut h).await;
+        // 切 yolo（走真实 RPC，确保落盘）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
+        ))
+        .await;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(9)) {
+                break;
+            }
+        }
+        // 再 resume 同一 thread。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":30,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resp = None;
+        for _ in 0..24 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(30)) {
+                resp = Some(v);
+                break;
+            }
+        }
+        let resp = resp.expect("thread/resume response");
+        assert_eq!(
+            resp["result"]["permission_mode"].as_str(),
+            Some("yolo"),
+            "thread/resume must carry the persisted mode: {resp}"
+        );
         h.shutdown().await;
     }
 
