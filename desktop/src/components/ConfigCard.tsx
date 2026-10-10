@@ -25,7 +25,9 @@ const SANDBOX_LABELS: Record<string, string> = {
 };
 
 function sandboxLabel(v: unknown): string {
-  if (typeof v === "string" && v in SANDBOX_LABELS) return SANDBOX_LABELS[v];
+  if (typeof v === "string" && Object.prototype.hasOwnProperty.call(SANDBOX_LABELS, v)) {
+    return SANDBOX_LABELS[v];
+  }
   return scalar(v);
 }
 

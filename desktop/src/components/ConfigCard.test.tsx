@@ -49,10 +49,23 @@ describe("ConfigCard", () => {
     }
   });
 
+  it("falls back to the raw string for a prototype key like toString", () => {
+    // `in` would light up on `Object.prototype`; only own keys are real modes.
+    render(<ConfigCard config={{ sandbox: "toString" }} />);
+    expect(screen.getByText("toString")).toBeTruthy();
+    expect(screen.queryByText(/native code/)).toBeNull();
+  });
+
   it("renders booleans as 是 / 否", () => {
     render(<ConfigCard config={sample} />);
     expect(screen.getByText("是")).toBeTruthy(); // sandbox_promotable
     expect(screen.getByText("否")).toBeTruthy(); // yolo
+  });
+
+  it("renders yolo:false as 否, not a dash", () => {
+    // `false` is a value, not a missing field — this card's only boolean.
+    render(<ConfigCard config={{ yolo: false }} />);
+    expect(screen.getAllByText("否")).toHaveLength(1);
   });
 
   it("labels an unset api key honestly", () => {
@@ -68,6 +81,13 @@ describe("ConfigCard", () => {
   it("shows — for a field the response omits", () => {
     // 12 known rows; with only `provider` present the other 11 are dashes.
     render(<ConfigCard config={{ provider: "anthropic" }} />);
+    expect(screen.getAllByText("—")).toHaveLength(11);
+  });
+
+  it("renders max_turns 0 as 0, not a dash", () => {
+    // `0` is a value, not a missing field.
+    render(<ConfigCard config={{ max_turns: 0 }} />);
+    expect(screen.getByText("0")).toBeTruthy();
     expect(screen.getAllByText("—")).toHaveLength(11);
   });
 
