@@ -309,6 +309,28 @@ describe("Session", () => {
       s.reset();
       expect(s.items).toHaveLength(0);
     });
+
+    it("carries a structured config payload on a notice", () => {
+      const s = new Session();
+      s.noticeConfig({ model: "m" });
+      const item = s.items[0] as {
+        type: string;
+        text: string;
+        config?: { data?: unknown; error?: unknown };
+      };
+      expect(item.type).toBe("notice");
+      expect(item.text).toBe("");
+      expect(item.config?.data).toEqual({ model: "m" });
+      expect(item.config?.error).toBeNull();
+    });
+
+    it("carries a config read error", () => {
+      const s = new Session();
+      s.noticeConfig(null, "boom");
+      const item = s.items[0] as { config?: { data?: unknown; error?: unknown } };
+      expect(item.config?.data).toBeNull();
+      expect(item.config?.error).toBe("boom");
+    });
   });
 
   describe("lastServerItemId", () => {
