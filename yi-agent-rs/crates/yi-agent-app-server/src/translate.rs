@@ -431,19 +431,22 @@ impl Translator {
 fn image_refs_from(blocks: &[ContentBlock]) -> Vec<crate::protocol::ImageRef> {
     let mut out = Vec::new();
     for block in blocks {
-        if let ContentBlock::Image { source, path, .. } = block {
-            if let Some(rel) = path {
-                let media_type = match source {
-                    ImageSource::Base64 { media_type, .. } => media_type.clone(),
-                    _ => "image/*".to_string(),
-                };
-                out.push(crate::protocol::ImageRef {
-                    path: rel.clone(),
-                    media_type,
-                    size: 0,
-                    detail: None,
-                });
-            }
+        if let ContentBlock::Image {
+            source,
+            path: Some(rel),
+            ..
+        } = block
+        {
+            let media_type = match source {
+                ImageSource::Base64 { media_type, .. } => media_type.clone(),
+                _ => "image/*".to_string(),
+            };
+            out.push(crate::protocol::ImageRef {
+                path: rel.clone(),
+                media_type,
+                size: 0,
+                detail: None,
+            });
         }
     }
     out
