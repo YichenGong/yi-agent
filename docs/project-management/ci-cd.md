@@ -13,6 +13,7 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - 三渠道发布（GitHub Release、Homebrew、npm）
 - Mac mini runner 配置
 - 真实 LLM 测试基础设施（`#[ignore]` gate，CI 不跑）
+- GitLab Release 发布 macOS 桌面 App（arm64，内网，不签名）
 
 **不做什么：**
 - 不做覆盖率统计（codecov.io）— YAGNI
@@ -33,6 +34,7 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - [x] GitHub Actions Release 配置 — `.github/workflows/release.yml` tag 触发
 - [x] Mac mini runner 配置 — self-hosted runner 接入
 - [x] 首次端到端验证 — v0.1.0 + v0.1.1 release 流水线全流程通过
+- [x] GitLab 内网发布 macOS 桌面 App（arm64 dmg）— `release:macos-dmg` job（`.gitlab-ci.yml`，tag 触发）+ `desktop/scripts/release-dmg.sh`（版本门禁 / 构建 / 上传 Generic Package / 建 Release）+ `desktop/packaging/install.sh`（清 quarantine）；产物不经 GitHub，下载入口为 GitLab Deploy → Releases；验证：推 `v0.1.4` tag 后 job 全绿、Release 页 dmg 可下载并能在 arm64 Mac 上安装启动 — [设计](../../superpowers/specs/2026-10-09-gitlab-macos-release-design.md)
 - [x] 真实 LLM 测试基础设施 — justfile `test-real-llm` / `test-real-e2e` recipes + `#[ignore]` gate — [设计](../plans/2026-07-26-real-llm-testing-design.md)
 - [-] 覆盖率统计（codecov.io）— YAGNI，暂不做
 - [-] crates.io 发布 — YAGNI，暂不做
