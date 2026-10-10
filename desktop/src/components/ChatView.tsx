@@ -4,6 +4,7 @@ import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
 import { AgentMessage } from "./MarkdownText";
+import { ConfigCard } from "./ConfigCard";
 import { ToolCallCard } from "./ToolCallCard";
 
 /**
@@ -84,7 +85,9 @@ function ChatItem({
 }) {
   switch (item.type) {
     case "notice":
-      return (
+      return item.config ? (
+        <ConfigCard config={item.config.data} error={item.config.error} />
+      ) : (
         <div className="my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted">
           {item.text}
         </div>
