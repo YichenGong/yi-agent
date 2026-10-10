@@ -12,6 +12,11 @@ export interface NoticeItem {
   type: "notice";
   id: string;
   text: string;
+  /**
+   * 结构化载荷。`/config` 用它携带 `config/read` 的原始结果（或读取错误），
+   * 由 `ChatView` 渲染成一张配置卡片。缺省即普通文本 notice。
+   */
+  config?: { data?: Record<string, unknown> | null; error?: string | null };
 }
 
 /**
@@ -114,6 +119,21 @@ export class Session {
   /** Append a command-output line (never sent to the agent). */
   notice(text: string): void {
     this.items.push({ type: "notice", id: nextLocalId(), text });
+  }
+
+  /**
+   * Append a command-output notice that carries structured data — `/config`
+   * hands over the raw `config/read` result (or its error) for `ChatView` to
+   * render as a card. `text` stays empty: the card is the presentation, and no
+   * other consumer reads it.
+   */
+  noticeConfig(data: Record<string, unknown> | null, error?: string | null): void {
+    this.items.push({
+      type: "notice",
+      id: nextLocalId(),
+      text: "",
+      config: { data, error: error ?? null },
+    });
   }
 
   /**

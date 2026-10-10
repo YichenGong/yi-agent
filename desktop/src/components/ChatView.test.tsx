@@ -2,6 +2,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, cleanup, screen } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
+import type { NoticeItem } from "../lib/session";
 
 // Count how often the settled tool card's component body runs. A streamed delta
 // on the trailing agent message must not touch items that cannot have changed.
@@ -195,5 +196,43 @@ describe("ChatView user images", () => {
       <ChatView items={[{ type: "userMessage", id: "u5", text: "纯文字" }]} />,
     );
     expect(queryAllByTestId("bubble-image")).toHaveLength(0);
+  });
+});
+
+describe("ChatView notices", () => {
+  it("renders a config notice as a card", () => {
+    const list = [
+      {
+        type: "notice",
+        id: "n1",
+        text: "",
+        config: { data: { model: "claude-sonnet-4", sandbox: "WorkspaceWrite" } },
+      },
+    ] as unknown as (Item | NoticeItem)[];
+    render(<ChatView items={list} />);
+    expect(screen.getByTestId("config-card")).toBeTruthy();
+    expect(screen.getByText("当前配置")).toBeTruthy();
+    expect(screen.getByText("workspace-write")).toBeTruthy();
+  });
+
+  it("renders a plain notice as the compact capsule", () => {
+    const list = [{ type: "notice", id: "n2", text: "对话已清空" }] as unknown as (
+      | Item
+      | NoticeItem
+    )[];
+    render(<ChatView items={list} />);
+    expect(screen.getByText("对话已清空")).toBeTruthy();
+    expect(screen.queryByTestId("config-card")).toBeNull();
+  });
+
+  it("renders the card when the read failed and data is null", () => {
+    // 读取失败：data 为 null 但 error 非空——父分支必须只看 config 是否存在，
+    // 不能把「data 为空」误判成普通 notice 的胶囊。
+    const list = [
+      { type: "notice", id: "n3", text: "", config: { data: null, error: "boom" } },
+    ] as unknown as (Item | NoticeItem)[];
+    render(<ChatView items={list} />);
+    expect(screen.getByTestId("config-card")).toBeTruthy();
+    expect(screen.getByText("读取配置失败: boom")).toBeTruthy();
   });
 });
