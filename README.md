@@ -41,6 +41,23 @@ npm 包内含 macOS（Intel / Apple Silicon）与 Linux（x64）的预编译二�
 到 [Releases](https://github.com/YichenGong/yi-agent/releases) 下载对应平台的
 `.tar.gz`，解压后把 `yi-agent` 放进 `PATH`。
 
+### macOS 桌面 App（内网）
+
+内网用户到 GitLab 的 **Deploy → Releases** 下载 `yi-agent_<版本>_aarch64.dmg`
+（Apple Silicon），然后：
+
+```bash
+# 1. 安装（自动清 quarantine；未做签名/公证）
+bash install.sh ./yi-agent_<版本>_aarch64.dmg
+
+# 2. 配置模型 key —— App 内没有设置入口，必须手写文件
+mkdir -p ~/.yi-agent
+echo 'MODEL_API_KEY=sk-ant-...' >> ~/.yi-agent/.env
+```
+
+从「应用程序」打开 `yi-agent`。首次打开若提示「无法验证开发者」，到
+System Settings → Privacy & Security 点 **Open Anyway**。仅 arm64（不支持 Intel Mac）。
+
 ### 从源码构建
 
 需要 Rust 1.85 或更高版本。
@@ -237,7 +254,7 @@ yi-agent --provider openai --model gpt-4o
 | yi-agent-cli | 2 / 2 | [详情](docs/project-management/yi-agent-cli.md) |
 | yi-agent-web | 6 / 6 | [详情](docs/project-management/yi-agent-web.md) |
 | permission | 9 / 9 | [详情](docs/project-management/permission.md) |
-| ci-cd | 11 / 13 | [详情](docs/project-management/ci-cd.md) |
+| ci-cd | 12 / 14 | [详情](docs/project-management/ci-cd.md) |
 | tooling | 3 / 3 | [详情](docs/project-management/tooling.md) |
 | yi-agent-mcp | 1 / 1 | [详情](docs/project-management/yi-agent-mcp.md) |
 | yi-agent-store | 5 / 6 | [详情](docs/project-management/yi-agent-store.md) |
