@@ -90,3 +90,103 @@ cp "$DMG_SRC" "$ROOT/dist/$ART"
 ( cd "$ROOT/dist" && shasum -a 256 "$ART" | awk '{print $1}' > "$ART.sha256" )
 log "产物: dist/$ART"
 ls -lh "$ROOT/dist/$ART" "$ROOT/dist/$ART.sha256"
+
+# --- 5. 发布 -------------------------------------------------------------
+: "${CI_API_V4_URL:?缺少 CI_API_V4_URL（只能在 GitLab CI 里跑发布段）}"
+: "${CI_PROJECT_ID:?缺少 CI_PROJECT_ID}"
+: "${CI_COMMIT_TAG:?缺少 CI_COMMIT_TAG}"
+
+PKG_NAME="yi-agent-macos"
+PKG_BASE="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/$PKG_NAME/$VERSION"
+INSTALLER="$HERE/packaging/install.sh"
+
+# 鉴权：优先 JOB-TOKEN；若实例不允许 job token 建 Release，用 RELEASE_TOKEN 兜底。
+# 参考 spec §3 决策 3/4。
+AUTH_KIND="JOB-TOKEN"
+AUTH_VALUE="${CI_JOB_TOKEN:-}"
+if [ -n "${RELEASE_TOKEN:-}" ]; then
+  AUTH_KIND="PRIVATE-TOKEN"
+  AUTH_VALUE="$RELEASE_TOKEN"
+fi
+if [ -z "$AUTH_VALUE" ]; then
+  echo "ERROR: 没有可用凭据（CI_JOB_TOKEN 与 RELEASE_TOKEN 均为空）" >&2
+  exit 1
+fi
+
+upload() {  # upload <local-file> <remote-filename>
+  curl --fail --silent --show-error \
+    --header "$AUTH_KIND: $AUTH_VALUE" \
+    --upload-file "$1" "$PKG_BASE/$2"
+}
+
+log "上传 dmg 与校验和到 Generic Package Registry"
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  echo "[dry-run] curl --header \"$AUTH_KIND: ***\" --upload-file dist/$ART $PKG_BASE/$ART"
+  echo "[dry-run] curl --header \"$AUTH_KIND: ***\" --upload-file dist/$ART.sha256 $PKG_BASE/$ART.sha256"
+else
+  ( cd "$ROOT" && upload "dist/$ART" "$ART" )
+  ( cd "$ROOT" && upload "dist/$ART.sha256" "$ART.sha256" )
+  upload "$INSTALLER" "install.sh"
+fi
+
+log "创建/更新 Release $CI_COMMIT_TAG"
+DESCRIPTION="$(cat <<EOF
+## macOS 桌面 App（Apple Silicon）
+
+下载 \`$ART\` 后：
+
+1. \`bash install.sh ./$ART\`（或双击 dmg 把 yi-agent.app 拖进「应用程序」后执行
+   \`xattr -dr com.apple.quarantine /Applications/yi-agent.app\`）
+2. **配置模型 key（必需，App 内没有设置入口）**：
+   \`mkdir -p ~/.yi-agent && echo 'MODEL_API_KEY=sk-ant-...' >> ~/.yi-agent/.env\`
+3. 从「应用程序」打开 yi-agent。
+
+未签名产物；首次打开如被拦，到 System Settings → Privacy & Security 点 "Open Anyway"。
+EOF
+)"
+
+PAYLOAD="$(jq -n \
+  --arg tag "$CI_COMMIT_TAG" \
+  --arg name "yi-agent $VERSION (macOS arm64)" \
+  --arg desc "$DESCRIPTION" \
+  --arg dmg_url "$PKG_BASE/$ART" \
+  --arg dmg_name "$ART" \
+  --arg sha_url "$PKG_BASE/$ART.sha256" \
+  --arg ins_url "$PKG_BASE/install.sh" \
+  '{
+     tag_name: $tag,
+     name: $name,
+     description: $desc,
+     assets: {
+       links: [
+         {name: $dmg_name, url: $dmg_url,   filepath: ("/" + $dmg_name), link_type: "package"},
+         {name: ($dmg_name + ".sha256"), url: $sha_url, filepath: ("/" + $dmg_name + ".sha256"), link_type: "package"},
+         {name: "install.sh", url: $ins_url, filepath: "/install.sh", link_type: "package"}
+       ]
+     }
+   }')"
+
+RELEASE_API="$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"
+
+if [ "${DRY_RUN:-0}" = "1" ]; then
+  echo "[dry-run] release payload:"
+  echo "$PAYLOAD" | jq .
+else
+  STATUS="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    --header "$AUTH_KIND: $AUTH_VALUE" "$RELEASE_API/$CI_COMMIT_TAG")"
+  if [ "$STATUS" = "200" ]; then
+    echo "Release 已存在，更新中 (PUT)"
+    curl --fail --silent --show-error --request PUT \
+      --header "$AUTH_KIND: $AUTH_VALUE" \
+      --header "Content-Type: application/json" \
+      --data "$PAYLOAD" "$RELEASE_API/$CI_COMMIT_TAG" >/dev/null
+  else
+    echo "创建 Release (POST)"
+    curl --fail --silent --show-error --request POST \
+      --header "$AUTH_KIND: $AUTH_VALUE" \
+      --header "Content-Type: application/json" \
+      --data "$PAYLOAD" "$RELEASE_API" >/dev/null
+  fi
+fi
+
+log "完成: $CI_PROJECT_URL/-/releases/$CI_COMMIT_TAG"
