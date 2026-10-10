@@ -1295,13 +1295,9 @@ export default function App() {
       case "config":
         try {
           const cfg = await c.request<Record<string, unknown>>("config/read", {});
-          session.notice(
-            Object.entries(cfg)
-              .map(([k, v]) => `${k}: ${String(v)}`)
-              .join("\n"),
-          );
+          session.noticeConfig(cfg);
         } catch (e) {
-          session.notice(`读取配置失败: ${formatError(e)}`);
+          session.noticeConfig(null, formatError(e));
         }
         break;
       case "clear":

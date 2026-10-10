@@ -784,6 +784,42 @@ describe("App slash commands", () => {
     ).toBe(false);
   });
 
+  it("renders /config as a card without touching the agent", async () => {
+    state.dataSources["config/read"] = () => ({
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      sandbox: "WorkspaceWrite",
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/config" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByTestId("config-card");
+    expect(screen.getByText("当前配置")).toBeTruthy();
+    expect(screen.getByText("workspace-write")).toBeTruthy();
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("shows a failed /config read inside the card", async () => {
+    state.rejectCode["config/read"] = -1;
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/config" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByTestId("config-card");
+    expect(screen.getByText(/读取配置失败/)).toBeTruthy();
+  });
+
   it("sends thread/clear and empties the transcript on /clear", async () => {
     render(<App />);
     await waitFor(() =>
