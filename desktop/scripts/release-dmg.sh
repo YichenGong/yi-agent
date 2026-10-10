@@ -58,3 +58,35 @@ fi
 log "版本校验通过: $VERSION (arm64)"
 
 log "环境与版本检查完成"
+
+# --- 3. 构建 -------------------------------------------------------------
+# Tauri 的 bundle.targets 默认是 "all"，会连带产出 updater tar 等非必要物；
+# 收窄到 app,dmg。仅改工作区文件，不提交。
+log "收窄 bundle.targets 为 app,dmg"
+CONF="$HERE/src-tauri/tauri.conf.json"
+jq '.bundle.targets = ["app","dmg"]' "$CONF" > "$CONF.tmp"
+mv "$CONF.tmp" "$CONF"
+
+log "npm ci"
+(cd "$HERE" && npm ci)
+
+log "构建 sidecar（release 模式的 yi-agent CLI）"
+(cd "$HERE" && npm run sidecar:release)
+
+log "tauri build"
+(cd "$HERE" && npm run tauri build)
+
+# --- 4. 归档与校验和 -----------------------------------------------------
+log "归档 dmg"
+mkdir -p "$ROOT/dist"
+DMG_SRC="$(ls "$HERE/src-tauri/target/release/bundle/dmg/"*.dmg | head -1)"
+if [ -z "$DMG_SRC" ]; then
+  echo "ERROR: 未找到 tauri 产出的 .dmg（$HERE/src-tauri/target/release/bundle/dmg/）" >&2
+  exit 1
+fi
+ART="yi-agent_${VERSION}_aarch64.dmg"
+export ART
+cp "$DMG_SRC" "$ROOT/dist/$ART"
+( cd "$ROOT/dist" && shasum -a 256 "$ART" | awk '{print $1}' > "$ART.sha256" )
+log "产物: dist/$ART"
+ls -lh "$ROOT/dist/$ART" "$ROOT/dist/$ART.sha256"
