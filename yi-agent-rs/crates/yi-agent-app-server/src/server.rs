@@ -1221,10 +1221,17 @@ pub(crate) struct BoardCard {
     pub id: String,
     pub state: String,
     /// 卡片种类；旧/缺省卡片视为实现卡。
+    ///
+    /// 由看板合并队列设计（§9）定义、桌面端经插件通道消费。宿主自身的
+    /// `card_scheduler` 从不读它（合并卡不进 `running`），生产构建下显示为未读，
+    /// 故显式放行，以免 `-D warnings` 把「协议字段」误判成死代码而删掉。
+    #[allow(dead_code)]
     pub kind: String,
     /// 合并卡的源分支。
+    #[allow(dead_code)]
     pub source: Option<String>,
     /// 合并卡的目标分支。
+    #[allow(dead_code)]
     pub base: Option<String>,
     pub thread_id: Option<String>,
     pub workdir: Option<PathBuf>,
@@ -4236,31 +4243,27 @@ where
                         // 若默默失败，worktree 就无声滞留、用户永远看不见。故除宿主日志外，
                         // 把这一次"该删却没删成"如实回给客户端（失败才现身，成功仍为空）。
                         let mut worktree_failure: Option<serde_json::Value> = None;
-                        match (&reclaim, board_project.as_deref()) {
-                            (
-                                crate::worktree_reclaim::WorktreeReclaim::Delete { path }
-                                | crate::worktree_reclaim::WorktreeReclaim::DestructiveDelete {
-                                    path, ..
-                                },
-                                Some(project),
-                            ) => {
-                                if let Err(error) = crate::worktree_reclaim::remove(
-                                    path,
-                                    Path::new(project),
-                                    force,
-                                ) {
-                                    eprintln!(
-                                        "[app-server] could not remove the worktree for {thread_id}: {error}"
-                                    );
-                                    worktree_failure = Some(json!({
-                                        "action": "remove",
-                                        "removed": false,
-                                        "path": path.to_string_lossy(),
-                                        "reason": error,
-                                    }));
-                                }
+                        if let (
+                            crate::worktree_reclaim::WorktreeReclaim::Delete { path }
+                            | crate::worktree_reclaim::WorktreeReclaim::DestructiveDelete {
+                                path, ..
+                            },
+                            Some(project),
+                        ) = (&reclaim, board_project.as_deref())
+                        {
+                            if let Err(error) =
+                                crate::worktree_reclaim::remove(path, Path::new(project), force)
+                            {
+                                eprintln!(
+                                    "[app-server] could not remove the worktree for {thread_id}: {error}"
+                                );
+                                worktree_failure = Some(json!({
+                                    "action": "remove",
+                                    "removed": false,
+                                    "path": path.to_string_lossy(),
+                                    "reason": error,
+                                }));
                             }
-                            _ => {}
                         }
                         // 只有"被承诺会删、且确实没删成"才带字段；普通会话（reclaim=None）、
                         // Keep、以及删除成功一律仍是空成功体，既有形状零变化。
@@ -11941,7 +11944,7 @@ pub(crate) mod tests {
         assert_eq!(item["type"], "userMessage", "{item}");
         assert_eq!(item["text"], "hi", "the text must survive: {item}");
         assert!(
-            item["images"].as_array().map_or(true, |a| a.is_empty()),
+            item["images"].as_array().is_none_or(|a| a.is_empty()),
             "the dropped image must not be echoed: {item}"
         );
 
@@ -12091,7 +12094,7 @@ pub(crate) mod tests {
         let item_b = opener_b.expect("thread B must open with an item");
         assert_eq!(item_b["text"], "steal", "{item_b}");
         assert!(
-            item_b["images"].as_array().map_or(true, |a| a.is_empty()),
+            item_b["images"].as_array().is_none_or(|a| a.is_empty()),
             "thread B must not receive thread A's image: {item_b}"
         );
         // 安全断言不变:A 的字节一个都没进 B 的工作区。
@@ -16371,7 +16374,7 @@ pub(crate) mod tests {
             missing.is_empty(),
             "resume must replay every item; {} missing (e.g. {:?})",
             missing.len(),
-            &missing.iter().take(5).collect::<Vec<_>>()
+            missing.iter().take(5).collect::<Vec<_>>()
         );
         h.shutdown().await;
     }
@@ -17853,11 +17856,7 @@ pub(crate) mod tests {
     async fn set_pinned_puts_thread_on_top_of_list_all_pinned() {
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = pin_test_config(dir.path());
-        let mut h = Harness::with_config(
-            cfg,
-            |s, p, m| build_test_agent(s, p, m),
-            Duration::from_secs(5),
-        );
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
         initialize(&mut h).await;
 
         let start = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}});
@@ -17900,11 +17899,7 @@ pub(crate) mod tests {
     async fn set_pinned_false_removes_from_pinned_list() {
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = pin_test_config(dir.path());
-        let mut h = Harness::with_config(
-            cfg,
-            |s, p, m| build_test_agent(s, p, m),
-            Duration::from_secs(5),
-        );
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
         initialize(&mut h).await;
         let start = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}});
         h.send(&start.to_string()).await;
@@ -17928,11 +17923,7 @@ pub(crate) mod tests {
     async fn set_pinned_rejects_non_boolean_and_unknown_id() {
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = pin_test_config(dir.path());
-        let mut h = Harness::with_config(
-            cfg,
-            |s, p, m| build_test_agent(s, p, m),
-            Duration::from_secs(5),
-        );
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
         initialize(&mut h).await;
 
         h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/setPinned","params":{"threadId":"thread-x","pinned":"yes"}}"#).await;
@@ -17949,11 +17940,7 @@ pub(crate) mod tests {
     async fn reorder_pinned_rewrites_order_and_rejects_bad_input() {
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = pin_test_config(dir.path());
-        let mut h = Harness::with_config(
-            cfg,
-            |s, p, m| build_test_agent(s, p, m),
-            Duration::from_secs(5),
-        );
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
         initialize(&mut h).await;
 
         let mut tids = Vec::new();

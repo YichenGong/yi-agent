@@ -1352,7 +1352,7 @@ mod tests {
         let out = assign_pin_seqs(&order, &cur);
         // 还原顺序：按 seq 降序读出 id，应等于 order。
         let mut pairs: Vec<(&String, i64)> = out.iter().map(|(i, s)| (i, *s)).collect();
-        pairs.sort_by(|x, y| y.1.cmp(&x.1));
+        pairs.sort_by_key(|x| std::cmp::Reverse(x.1));
         let got: Vec<&String> = pairs.iter().map(|(i, _)| *i).collect();
         assert_eq!(
             got,

@@ -5771,8 +5771,9 @@ mod tests {
 
     // ----- /superpowers-kanban dispatch tests -----
 
-    /// 建一个 command 的通道与 history，返回可复用的前置件。
-    fn kanban_harness() -> (
+    /// /superpowers-kanban dispatch 测试的前置件：history、成本表、四个命令通道
+    /// 与已投递插话账本。抽成别名以免 `type_complexity` 报警。
+    type KanbanHarness = (
         HistoryState,
         CostTracker,
         tokio::sync::mpsc::Sender<String>,
@@ -5780,7 +5781,10 @@ mod tests {
         tokio::sync::mpsc::Sender<String>,
         tokio::sync::mpsc::Sender<crate::ControlCommand>,
         crate::tui::queued::DeliveredInterjections,
-    ) {
+    );
+
+    /// 建一个 command 的通道与 history，返回可复用的前置件。
+    fn kanban_harness() -> KanbanHarness {
         let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
         let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
         let (kill_tx, _kill_rx) = tokio::sync::mpsc::channel::<String>(8);

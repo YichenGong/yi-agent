@@ -4001,7 +4001,7 @@ mod plugin_protocol_tests {
             .lines()
             .find(|line| line.trim_start().starts_with("pub const PROTOCOL_VERSION"))?;
         let value = line.split_once('=')?.1;
-        Some(value.trim().trim_end_matches(';').trim().parse().ok()?)
+        value.trim().trim_end_matches(';').trim().parse().ok()
     }
 
     #[test]
