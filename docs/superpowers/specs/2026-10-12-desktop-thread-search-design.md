@@ -130,7 +130,14 @@ export function filterThreadTree(
    `选择一个目录开始`（仅在 `groupCount(groups) === 0` 时）。
 6. 搜索期间隐藏「看板」条目行（`renderBoardEntry`）：它是项目入口而非会话，本次找的是会话。
    即 `{!isCollapsed && kanbanItemFor(...) && !searching && renderBoardEntry(...)}`。
-7. 分组头、会话行、拖拽、长按、id 归属等其余渲染逻辑**一律不变**。
+7. 给重命名输入框（`ThreadSidebar.tsx:405`）加一个标记属性 `data-rename-input=""`。
+   **这是必需的**：现有 5 处测试用**裸选择器**取重命名输入框——`ThreadSidebar.test.tsx:82`、`:89`、
+   `:93`、`:791` 的 `container.querySelector("input")`，以及 `App.test.tsx:458`、`:481` 的
+   `document.querySelector("input")`。搜索框是文件里**更早**出现的 `<input>`，会把这 6 处一起选错。
+   加属性后把这些选择器改为 `[data-rename-input]`；属性本身不改任何行为与像素。
+   **不要**改这些断言为 `input[type="search"]`——它们断言的是「重命名输入框存在/消失」，指向搜索框
+   会让断言恒真（搜索框常在），等于把测试废掉。
+8. 分组头、会话行、拖拽、长按、id 归属、看板小节等其余渲染逻辑一律不变（第 7 点那个标记属性除外）。
 
 ### 3.3 `index.css`
 
@@ -171,6 +178,12 @@ export function filterThreadTree(
 
   注意：`type="search"` 的输入框在 testing-library 里 role 是 **`searchbox`**（不是
   `textbox`），用例用 `getByLabelText("搜索会话")` 或 `getByRole("searchbox")` 取它。
+- 更新既有用例里的 6 处裸 `input` 选择器为 `[data-rename-input]`：`ThreadSidebar.test.tsx:82`、
+  `:89`、`:93`、`:791`，以及 `App.test.tsx:458`、`:481`。断言语义不变——它们的本意始终是
+  「重命名输入框存在 / 已消失」，只是选择器原先靠「侧栏里只有一个输入框」这一巧合成立。
+- 这 6 处改完后，在 `ThreadSidebar.test.tsx` 新增一条**判别力用例**：搜索栏有内容时双击某个会话行
+  进入重命名，`[data-rename-input]` 必须仍能选中该行输入框（防止未来有人把标记属性挪走、
+  又退回裸 `input` 选择器）。
 
 **既有断言**：`ThreadSidebar.test.tsx` 全部现有用例不得改动且必须通过（尤其
 `div[tabindex]`、`button[aria-haspopup="menu"]`、`[role="separator"]` 三个选择器契约）。
