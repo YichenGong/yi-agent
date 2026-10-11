@@ -3,9 +3,13 @@ import type { Item } from "./protocol";
 import {
   applyTrim,
   estimateItemsBytes,
+  evict,
   MAX_ENTRY_BYTES,
+  MemoryContentStore,
+  persistContent,
   selectEvictions,
 } from "./contentStore";
+import { Session } from "./session";
 
 const msg = (id: string, text: string): Item => ({ type: "agentMessage", id, text });
 
@@ -65,5 +69,66 @@ describe("selectEvictions", () => {
   it("stops as soon as both bounds hold (no over-eviction)", () => {
     const metas = [meta("old", 1, 10), meta("mid", 2, 10), meta("new", 3, 10)];
     expect(selectEvictions(metas, { maxCount: 2, maxBytes: 1000 })).toHaveLength(1);
+  });
+});
+
+describe("MemoryContentStore", () => {
+  it("round-trips an entry, deletes, and lists keys", async () => {
+    const store = new MemoryContentStore();
+    const entry = {
+      threadId: "t1",
+      savedAt: 1,
+      lastServerItemId: "i1",
+      items: [msg("i1", "hi")],
+      trimmed: false,
+      bytes: 3,
+    };
+    await store.write(entry);
+    expect(await store.read("t1")).toEqual(entry);
+    expect(await store.keys()).toEqual(["t1"]);
+    await store.delete("t1");
+    expect(await store.read("t1")).toBeNull();
+    expect(await store.keys()).toEqual([]);
+  });
+
+  it("copies on write so later mutation of the source does not leak in", async () => {
+    const store = new MemoryContentStore();
+    const items = [msg("i1", "hi")];
+    await store.write({ threadId: "t1", savedAt: 1, lastServerItemId: null, items, trimmed: false, bytes: 3 });
+    items.push(msg("i2", "later"));
+    const back = await store.read("t1");
+    expect(back?.items).toHaveLength(1);
+  });
+
+  it("reads a missing key as null", async () => {
+    expect(await new MemoryContentStore().read("nope")).toBeNull();
+  });
+});
+
+describe("evict", () => {
+  const write = async (store: MemoryContentStore, threadId: string, savedAt: number, bytes: number) =>
+    store.write({ threadId, savedAt, lastServerItemId: null, items: [], trimmed: false, bytes });
+
+  it("deletes the least recently written entries past the count bound", async () => {
+    const store = new MemoryContentStore();
+    await write(store, "old", 1, 10);
+    await write(store, "mid", 2, 10);
+    await write(store, "new", 3, 10);
+    await evict(store, { maxCount: 2, maxBytes: 10_000 });
+    expect((await store.keys()).sort()).toEqual(["mid", "new"]);
+  });
+});
+
+describe("persistContent", () => {
+  it("stores only server items (drops local echoes and notices)", async () => {
+    const store = new MemoryContentStore();
+    const session = new Session();
+    session.notice("command output");           // local-* id
+    session.addUserMessage("hi");               // local-* optimistic echo
+    session.apply({ method: "item/completed", params: { item: msg("s1", "server text") } } as never);
+    await persistContent(store, "t1", session);
+    const entry = await store.read("t1");
+    expect(entry?.items.map((i) => i.id)).toEqual(["s1"]);
+    expect(entry?.lastServerItemId).toBe("s1");
   });
 });
