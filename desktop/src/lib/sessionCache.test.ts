@@ -70,6 +70,20 @@ describe("sessionCache", () => {
     expect(readListCache(s)).toBeNull();
   });
 
+  it("returns null when a thread inside a group is not an object", () => {
+    const s = memStorage();
+    // 分组元素本身合法（threads 是数组），但数组里藏着 null：侧栏渲染
+    // `g.threads.filter((t) => !t.pinned …)` 会在 null 上抛错 → 同样白屏。
+    s.setItem(
+      THREAD_LIST_CACHE_KEY,
+      JSON.stringify({
+        version: 1, savedAt: 1, selectedId: null, pinned: [],
+        groups: [{ workspace: "/w", exists: true, threads: [null] }],
+      }),
+    );
+    expect(readListCache(s)).toBeNull();
+  });
+
   it("swallows storage errors on read", () => {
     const s: StorageLike = {
       getItem: () => { throw new Error("blocked"); },

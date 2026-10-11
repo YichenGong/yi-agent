@@ -1348,10 +1348,12 @@ export default function App() {
         // 手机端：握手（含重连/切回前台）不是「用户换了页面」，当前会话——冷启从
         // 缓存恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看
         // 的东西。并且重连后新进程记忆为空（warm 与订阅窗口在 exited 时已清），
-        // 必须对它再走一次 selectThread：冷则补 resume、warm 则补 subscribe，否则
-        // 视图留着而该会话的实时更新会静默停摆。仅当当前会话不在服务端新列表里
-        // （被删）或根本没有已选会话时，才回落第一条。桌面端保留原行为（每次选
-        // 第一条）。
+        // 必须对它再走一次 selectThread：冷则补 resume、running 则补 readItems
+        // （不打断在途回合）、warm 则补 subscribe，否则视图留着而该会话的实时更新
+        // 会静默停摆。仅当当前会话不在服务端新列表里（被删）或根本没有已选会话时，
+        // 才回落第一条。桌面端保留原行为（每次选第一条）。
+        // （副作用：selectThread 会 resetThreadDiff()，故重连时 diff 面板若开着会
+        // 收起——会话未变，属既有行为，且窄屏下 diff 面板本就不渲染。）
         const keptId = isRemoteClient() ? currentIdRef.current : null;
         const kept =
           keptId !== null &&
