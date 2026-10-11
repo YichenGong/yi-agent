@@ -1721,21 +1721,6 @@ export default function App() {
           </div>
         )}
         <div className="flex min-h-0 flex-1 flex-row">
-        {isMobile && (
-          <button
-            type="button"
-            aria-label="会话列表"
-            aria-expanded={sidebarOpen}
-            onClick={() => setSidebarOpen(true)}
-            // 手机上的唯一会话入口：32px 的细条在触屏上既难点到也不好发现，放宽到
-            // 44px（Apple HIG 的最小触控目标）并放大图标。
-            className="app-mobile-toggle flex w-11 shrink-0 items-start justify-center border-r border-line bg-panel pt-2 text-fg-muted hover:text-fg"
-          >
-            <svg viewBox="0 0 16 16" className="size-5" fill="currentColor" aria-hidden="true">
-              <path d="M2 4h12v1.5H2V4Zm0 3.25h12v1.5H2v-1.5ZM2 10.5h12V12H2v-1.5Z" />
-            </svg>
-          </button>
-        )}
         {isMobile && sidebarOpen && (
           <div
             className="app-sidebar-backdrop"
@@ -1783,7 +1768,24 @@ export default function App() {
           onOpenSettings={() => setSettingsOpen(true)}
         />
         </div>
-        <div className="relative flex min-w-0 flex-1 flex-col">
+        <div className="app-main relative flex min-w-0 flex-1 flex-col">
+          {isMobile && (
+            <button
+              type="button"
+              aria-label="会话列表"
+              aria-expanded={sidebarOpen}
+              onClick={() => setSidebarOpen(true)}
+              // 手机上的唯一会话入口：44px 触控目标（Apple HIG），浮在主列左上角，
+              // 不再占一条常驻的左侧竖条——抽屉本身是 fixed 离屏的，收起时聊天区
+              // 因此能拿满整宽。顶部让位内边距由 .app-main 提供（见 index.css），
+              // 免得按钮压住首条消息或看板顶栏。
+              className="absolute left-1 top-1 z-10 flex size-11 items-center justify-center rounded-md bg-panel/80 text-fg-muted hover:text-fg"
+            >
+              <svg viewBox="0 0 16 16" className="size-5" fill="currentColor" aria-hidden="true">
+                <path d="M2 4h12v1.5H2V4Zm0 3.25h12v1.5H2v-1.5ZM2 10.5h12V12H2v-1.5Z" />
+              </svg>
+            </button>
+          )}
           {/* 看板是主区域的一个平级页面：选中才出现，问的是被选中那个项目。
               离开看板走「点某条会话」（selectThread/newThread 清 selectedBoard）；
               没有选中时主区域就是原来的对话。 */}

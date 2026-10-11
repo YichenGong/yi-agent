@@ -204,6 +204,13 @@ html[data-mobile="true"] {
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 /*
+ * 浮在主列左上角那颗抽屉开关的让位：按钮 top(4px) + 高 44px，内容因此从 48px 起，
+ * 首条消息与看板顶栏都不会被压住。桌面端不匹配该选择器，逐字节不变。
+ */
+[data-mobile="true"] .app-main {
+  padding-top: 48px;
+}
+/*
  * 手机端长按（= 右键）的前提：按住会话行时，iOS 会先弹文字选择 / 放大镜 callout，
  * 把长按手势整个抢走——`useLongPress` 便永远等不到那 500ms。这三条把原生手势关掉，
  * 长按才是「打开菜单」而不是「选中文字」。
@@ -238,11 +245,6 @@ html[data-mobile="true"] {
   inset: 0;
   z-index: 20;
   background: rgb(0 0 0 / 0.5);
-}
-
-/* 手机端的抽屉开关按钮；桌面端不渲染该节点，这里只处理安全区留白。 */
-.app-mobile-toggle {
-  padding-top: env(safe-area-inset-top, 0px);
 }
 
 /*

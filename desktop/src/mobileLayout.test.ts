@@ -50,6 +50,16 @@ describe("phone layout CSS", () => {
     expect(css()).toMatch(/\[data-mobile="true"\]\s+\.app-titlebar\s*\{[^}]*display:\s*none/);
   });
 
+  it("floats the drawer toggle over the main column instead of a rail", () => {
+    // 收起抽屉时聊天列本该拿满整宽；那颗按钮原先坐在一条常驻的 44px 竖条列里，白占
+    // 横向宽度。改为浮层后，让位交给主列自己的顶部内边距：按钮 top(4px) + 高 44px，
+    // 内容从 48px 起，首条消息与看板顶栏都不会被压住。
+    expect(css()).toMatch(/\[data-mobile="true"\]\s+\.app-main\s*\{[^}]*padding-top:\s*48px/);
+    // 竖条按钮那条补白规则必须消失：`body` 已经加了同一段安全区，两处叠加会把图标
+    // 下推两倍——按钮已不再是那条竖条。
+    expect(css()).not.toMatch(/\.app-mobile-toggle\s*\{[^}]*padding-top/);
+  });
+
   it("tints the safe-area bands so they read as panel, not as a void", () => {
     // 上下两条安全区留白必须由 `body` 自己铺色。不铺色时它们是**没有背景**的区域，
     // 深色主题下就是两条很长的黑边——正是用户报的「上下黑边太长」。`--panel` 与

@@ -2240,6 +2240,19 @@ describe("App mobile layout (phone client)", () => {
     await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true));
     expect(screen.queryByLabelText("会话列表")).toBeNull();
   });
+
+  it("floats the toggle over the chat column instead of a fixed rail", async () => {
+    asRemote();
+    render(<App />);
+    const toggle = await screen.findByLabelText("会话列表");
+    // 浮在主列内（.app-main），而不是一条 in-flow、通栏高的竖条列。
+    expect(toggle.closest(".app-main")).not.toBeNull();
+    expect(toggle.className).toContain("absolute");
+    // 手机端唯一会话入口：44px 触控目标（Apple HIG）不能丢。
+    expect(toggle.className).toContain("size-11");
+    // 收起态：抽屉未打开时按钮必须报 aria-expanded="false"。
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+  });
 });
 
 // 包裹会话栏的 div 必须自带高度约束（flex + min-h-0）。它无条件存在，桌面端只是
