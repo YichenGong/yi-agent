@@ -60,6 +60,19 @@ describe("phone layout CSS", () => {
     expect(css()).not.toMatch(/\.app-mobile-toggle\s*\{[^}]*padding-top/);
   });
 
+  it("keeps the status bar on a single line on the phone", () => {
+    // 状态栏是一条单行 flex（连接点 / 状态 / cwd / 用量）。手机上 cwd 与用量都是长
+    // 文本，一旦被压到内容下限以下，「N in / M out」会折成多行，整条底栏随之变高
+    // （实测单行 33px、折行后 81px）——正是用户报的「底栏过高」。
+    //
+    // 修法：让状态栏文本不可折行。挤压因此只能落到会截断的 cwd 上（它是唯一的
+    // `.truncate`），用量按钮保持自身宽度、恒为一行。桌面不匹配 `[data-mobile]`，
+    // 逐字节不变；手机端这条也只在文本真的需要折行时才与桌面不同。
+    const rule =
+      /\[data-mobile="true"\]\s+\.app-statusbar\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(rule).toMatch(/white-space:\s*nowrap/);
+  });
+
   it("tints the safe-area bands so they read as panel, not as a void", () => {
     // 上下两条安全区留白必须由 `body` 自己铺色。不铺色时它们是**没有背景**的区域，
     // 深色主题下就是两条很长的黑边——正是用户报的「上下黑边太长」。`--panel` 与
