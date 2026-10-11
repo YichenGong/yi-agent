@@ -3486,3 +3486,42 @@ describe("App mobile local cache", () => {
     expect(contentStore.current).toBeNull();
   });
 });
+
+describe("App mobile offline UX", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+
+  const seed = (listStatus: "idle" | "running", selectedId: string | null) =>
+    localStorage.setItem("yi-agent.threadListCache", JSON.stringify({
+      version: 1, savedAt: Date.now(), selectedId, pinned: [],
+      groups: [{ workspace: "/w", exists: true, threads: [
+        { thread_id: "t1", cwd: "/w", model: "m", created_at: 0, updated_at: 0, title: "one", permission_mode: "normal", status: listStatus },
+      ] }],
+    }));
+
+  it("marks a cached running badge as possibly stale while offline", async () => {
+    asRemote();
+    seed("running", "t1");
+    // Never resolve the list: stay in `connecting`.
+    state.dataSources["thread/listAll"] = () => new Promise(() => {});
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("Thread status")).toBeTruthy());
+    expect(screen.getByLabelText("Thread status").getAttribute("data-stale")).toBe("true");
+  });
+
+  it("refuses to send while offline and keeps the draft", async () => {
+    asRemote();
+    seed("idle", "t1");
+    state.dataSources["thread/listAll"] = () => new Promise(() => {});
+    render(<App />);
+    const box = await screen.findByPlaceholderText(/Type a message/);
+    fireEvent.change(box, { target: { value: "hello offline" } });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+    // No turn/start went out, and the text is still there.
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false));
+    expect((box as HTMLTextAreaElement).value).toBe("hello offline");
+  });
+});

@@ -28,8 +28,9 @@ function unreadDotClass(status: TurnStatus): string {
  * every notification, so a default (identity) comparison would never hit.
  */
 export const StatusBadge = memo(
-  function StatusBadge({ status }: { status: ThreadStatus }) {
+  function StatusBadge({ status, stale = false }: { status: ThreadStatus; stale?: boolean }) {
     if (status === "idle") return null;
+    const label = status === "running" ? "Running" : "Awaiting approval";
     // `animate-spin` stays applied in *both* states on purpose. Removing it while
     // awaiting approval (and re-adding it afterwards) drops and recreates the
     // CSS animation, resetting `currentTime` — the very "plays a short segment
@@ -41,8 +42,9 @@ export const StatusBadge = memo(
         role="img"
         aria-label="Thread status"
         data-status={status}
-        title={status === "running" ? "Running" : "Awaiting approval"}
-        className={`shrink-0 animate-spin rounded-full ${
+        data-stale={stale ? "true" : undefined}
+        title={stale ? `${label}（可能过期）` : label}
+        className={`shrink-0 animate-spin rounded-full ${stale ? "opacity-40" : ""} ${
           status === "running"
             ? "size-3 border-2 border-line-strong border-t-fg"
             : "size-2 bg-amber-400"
@@ -50,7 +52,7 @@ export const StatusBadge = memo(
       />
     );
   },
-  (prev, next) => prev.status === next.status,
+  (prev, next) => prev.status === next.status && prev.stale === next.stale,
 );
 
 export function ThreadSidebar({
@@ -76,6 +78,7 @@ export function ThreadSidebar({
   onOpenBoard,
   onOpenSettings,
   isMobile = false,
+  statusStale = false,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -109,6 +112,9 @@ export function ThreadSidebar({
   onOpenSettings: () => void;
   /** 手机端才挂长按（= 右键）；桌面端保持现状，不装监听、不渲染会话菜单。 */
   isMobile?: boolean;
+  /** 内容来自缓存、尚未与服务器对齐时置 true：徽标降透明并标注"可能过期"。
+   * 仅手机端离线时为 true；桌面端恒为 false，渲染逐字节不变。 */
+  statusStale?: boolean;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -424,7 +430,7 @@ export function ThreadSidebar({
             )}
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
-                <StatusBadge status={st} />
+                <StatusBadge status={st} stale={statusStale} />
                 <div
                   className="truncate"
                   title={t.title ?? t.thread_id}

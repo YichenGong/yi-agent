@@ -6,6 +6,7 @@ import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
+import { CacheNotice } from "./components/CacheNotice";
 import { MessageInput } from "./components/MessageInput";
 import { ModelPicker } from "./components/ModelPicker";
 import { StatusBar } from "./components/StatusBar";
@@ -192,6 +193,8 @@ export default function App() {
   const railStore = useRef(new SubagentRailStore()).current;
   // 手机端：会话侧栏与子 agent 栏是抽屉，不是常驻列，否则聊天区被挤到看不清。
   const isMobile = useIsMobile();
+  // 手机端离线 = 尚未握手成功。桌面端恒为 false（不显示缓存相关 UI）。
+  const offline = isRemoteClient() && status !== "connected";
   // 内容缓存（IndexedDB）：仅手机端。懒建，桌面端永不构造（`null`）。
   const contentStoreRef = useRef<AsyncContentStore | null>(null);
   const getContentStore = (): AsyncContentStore => (contentStoreRef.current ??= createContentStore());
@@ -499,6 +502,11 @@ export default function App() {
     force((v) => v + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // 连上即清"内容来自缓存"的标记：此刻起服务端是唯一来源，提示条退场。
+  useEffect(() => {
+    if (status === "connected") cachedAt.current.clear();
+  }, [status]);
 
   // 页面隐藏 / 卸载时把在途的会话内容立刻写盘：手机切后台后可能很久不再执行
   // 定时器，等着防抖会把最后一段内容丢掉。
@@ -1478,6 +1486,13 @@ export default function App() {
     const id = store.currentId;
     const c = clientRef.current;
     if (!id || !c) return false;
+    // 离线时不发：缓存内容可以看，但不能对着它发消息（服务端根本收不到）。
+    // 只提示、保留草稿，交给用户连上后再发——不排队、不自动重发。
+    if (offline) {
+      store.view(id).session.lastError = "正在连接，请稍候";
+      force((v) => v + 1);
+      return false;
+    }
     // 这个会话待发送的附件。发送前先取快照：成功要清空它，失败要**留着**重试。
     const files = pending[id] ?? [];
     // 按类别分组：文档走清单 block，图片走内容 block，协议形态不同。
@@ -1886,6 +1901,7 @@ export default function App() {
           onRemoveBoard={(path) => void onRemoveBoard(path)}
           onOpenBoard={onOpenBoard}
           isMobile={isMobile}
+          statusStale={offline}
           onOpenSettings={() => setSettingsOpen(true)}
         />
         </div>
@@ -1966,6 +1982,9 @@ export default function App() {
             </section>
           ) : (
             <>
+              {offline && currentId !== null && cachedAt.current.has(currentId) && (
+                <CacheNotice savedAt={cachedAt.current.get(currentId)!} />
+              )}
               <ChatView
                 items={current?.session.items ?? []}
                 error={current?.session.lastError ?? null}
