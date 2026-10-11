@@ -7,6 +7,7 @@ import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
 import { resolveSidebarPressTarget } from "../lib/sidebarPress";
 import { formatRelativeTime } from "../lib/relativeTime";
+import { filterThreadTree } from "../lib/threadSearch";
 
 function unreadDotClass(status: TurnStatus): string {
   if (status === "failed") return "bg-red-400";
@@ -118,6 +119,8 @@ export function ThreadSidebar({
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
+  // 侧栏搜索关键词。仅影响渲染，不进 ThreadStore，也不落盘。
+  const [query, setQuery] = useState("");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // 置顶分区自身的折叠状态（与工作区分组的折叠互不影响）。
   const [pinnedCollapsed, setPinnedCollapsed] = useState(false);
@@ -403,6 +406,7 @@ export function ThreadSidebar({
       >
         {editingId === t.thread_id ? (
           <input
+            data-rename-input=""
             autoFocus
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
@@ -575,13 +579,16 @@ export function ThreadSidebar({
   const renderBoardThreads = (g: WorkspaceGroup) => {
     const cards = g.threads.filter((t) => !t.pinned && t.card_id);
     if (cards.length === 0) return null;
-    const isBoardCollapsed = !boardCollapsed.has(g.workspace);
+    // 搜索期间一律展开，且**关掉这一小节自身的折叠开关**：此时渲染忽略折叠态，
+    // 点了看不到任何反馈，却会悄悄写进 `boardCollapsed`，清空搜索后视图就被改掉了。
+    const isBoardCollapsed = searching ? false : !boardCollapsed.has(g.workspace);
     return (
       <div key={`board-threads:${g.workspace}`}>
         <button
           type="button"
           aria-label="看板会话"
           aria-expanded={!isBoardCollapsed}
+          disabled={searching}
           onClick={() => toggleBoardCollapse(g.workspace)}
           className="flex w-full items-center gap-1 px-2 py-1 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
         >
@@ -592,6 +599,42 @@ export function ThreadSidebar({
       </div>
     );
   };
+
+  // 渲染时过滤：不持有第二份列表副本，服务端刷新后自动跟随。
+  const searching = query.trim() !== "";
+  const filtered = filterThreadTree(groups, pinned, query);
+  // 搜索期间忽略折叠状态；三个 Set 全程不被写入，清空后原样恢复。
+  const pinnedCollapsedNow = searching ? false : pinnedCollapsed;
+
+  const clearQuery = () => setQuery("");
+
+  const searchBar = (
+    <div className="relative px-2 pb-2">
+      <input
+        type="search"
+        aria-label="搜索会话"
+        placeholder="搜索会话…"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        onKeyDown={(e) => {
+          // 清空是幂等动作，不做 IME 特判：输入法组合期按 Esc 取消候选也不会损坏状态。
+          if (e.key === "Escape") clearQuery();
+        }}
+        className="w-full rounded-md border border-line bg-surface px-2 py-1.5 text-sm text-fg placeholder:text-fg-faint focus:border-fg-subtle focus:outline-none"
+      />
+      {query !== "" && (
+        <button
+          type="button"
+          aria-label="清除搜索"
+          title="清除搜索"
+          onClick={clearQuery}
+          className="absolute top-1/2 right-3.5 -translate-y-1/2 rounded px-1 text-fg-subtle hover:text-fg"
+        >
+          ×
+        </button>
+      )}
+    </div>
+  );
 
   return (
     <aside
@@ -663,30 +706,35 @@ export function ThreadSidebar({
           </>
         )}
       </div>
+      {searchBar}
       <div className="flex-1 overflow-y-auto">
-        {groupCount(groups) === 0 && (
+        {groupCount(groups) === 0 && !searching && (
           <p className="px-3 py-2 text-xs text-fg-faint">选择一个目录开始</p>
         )}
-        {pinned.length > 0 && (
+        {searching && filtered.empty && (
+          <p className="px-3 py-2 text-xs text-fg-faint">无匹配会话</p>
+        )}
+        {filtered.pinned.length > 0 && (
           <div>
             <div className="flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle">
               <button
                 type="button"
                 onClick={() => setPinnedCollapsed((v) => !v)}
-                aria-label={pinnedCollapsed ? "Expand pinned" : "Collapse pinned"}
-                title={pinnedCollapsed ? "Expand" : "Collapse"}
+                disabled={searching}
+                aria-label={pinnedCollapsedNow ? "Expand pinned" : "Collapse pinned"}
+                title={pinnedCollapsedNow ? "Expand" : "Collapse"}
                 className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
               >
-                {pinnedCollapsed ? "▸" : "▾"}
+                {pinnedCollapsedNow ? "▸" : "▾"}
               </button>
               <div className="min-w-0 flex-1 truncate text-fg-muted">Pinned</div>
             </div>
-            {!pinnedCollapsed &&
-              pinned.map((t, i) => renderThread(t, { rowAttr: "pinned", dragIndex: i }))}
+            {!pinnedCollapsedNow &&
+              filtered.pinned.map((t, i) => renderThread(t, { rowAttr: "pinned", dragIndex: i }))}
           </div>
         )}
-        {groups.map((g) => {
-          const isCollapsed = collapsed.has(g.workspace);
+        {filtered.groups.map((g) => {
+          const isCollapsed = searching ? false : collapsed.has(g.workspace);
           return (
             <div key={g.workspace} className="relative">
               <div
@@ -719,6 +767,7 @@ export function ThreadSidebar({
                 <button
                   type="button"
                   onClick={() => toggleCollapse(g.workspace)}
+                  disabled={searching}
                   aria-label={isCollapsed ? "Expand" : "Collapse"}
                   title={isCollapsed ? "Expand" : "Collapse"}
                   className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
@@ -781,7 +830,7 @@ export function ThreadSidebar({
                   </div>
                 </>
               )}
-              {!isCollapsed && kanbanItemFor(g.workspace, boards) && renderBoardEntry(g.workspace)}
+              {!isCollapsed && !searching && kanbanItemFor(g.workspace, boards) && renderBoardEntry(g.workspace)}
               {!isCollapsed && renderBoardThreads(g)}
               {!isCollapsed &&
                 g.threads

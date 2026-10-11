@@ -455,7 +455,7 @@ describe("App approval focus", () => {
 
     // The user starts renaming t1 while it runs.
     fireEvent.doubleClick(screen.getByText("one"));
-    const field = document.querySelector<HTMLInputElement>("input")!;
+    const field = document.querySelector<HTMLInputElement>("[data-rename-input]")!;
     expect(field).not.toBeNull();
     expect(document.activeElement).toBe(field);
     fireEvent.change(field, { target: { value: "half-typed" } });
@@ -478,7 +478,7 @@ describe("App approval focus", () => {
     // The dialog must not yank focus out of the rename field: the field's
     // onBlur commits, so a stolen focus silently keeps a half-typed title and
     // unmounts the field.
-    const stillThere = document.querySelector<HTMLInputElement>("input");
+    const stillThere = document.querySelector<HTMLInputElement>("[data-rename-input]");
     expect(stillThere, "rename field must survive the approval dialog").not.toBeNull();
     expect(stillThere!.value).toBe("half-typed");
     expect(document.activeElement).toBe(stillThere);
