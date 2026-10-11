@@ -46,6 +46,14 @@ export function parseListCache(raw: string | null): ThreadListCache | null {
     if (typeof g !== "object" || g === null || !Array.isArray((g as WorkspaceGroup).threads)) {
       return null;
     }
+    // 分组内的每个会话也要挡：`threads: [null]` 这类脏值不会被上面的
+    // `Array.isArray` 拦下，但侧栏渲染 `g.threads.filter((t) => !t.pinned …)`
+    // 会在 `null` 上抛错 → 同样白屏。至少要能取到字符串 thread_id。
+    for (const t of (g as WorkspaceGroup).threads) {
+      if (typeof t !== "object" || t === null || typeof (t as ThreadSummary).thread_id !== "string") {
+        return null;
+      }
+    }
   }
   for (const t of c.pinned) {
     if (typeof t !== "object" || t === null || typeof (t as ThreadSummary).thread_id !== "string") {
