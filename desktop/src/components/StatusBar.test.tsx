@@ -19,4 +19,12 @@ describe("StatusBar", () => {
     render(<StatusBar cwd="/w" status="connected" usage={null} />);
     expect(screen.queryByText("claude-x")).toBeNull();
   });
+
+  it("carries the class the phone CSS hooks on to keep the bar one line", () => {
+    // 手机端「状态栏单行」的 CSS 门禁（见 index.css 的
+    // `[data-mobile="true"] .app-statusbar`）挂在根元素这个类名上：改名或漏加，
+    // 用量文字就会在窄屏折行、把底栏再撑高。这里让 JS 侧与 CSS 侧的锚点对齐。
+    const { container } = render(<StatusBar cwd="/w" status="connected" usage={null} />);
+    expect(container.firstElementChild?.className).toContain("app-statusbar");
+  });
 });

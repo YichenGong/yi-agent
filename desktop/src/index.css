@@ -226,6 +226,23 @@ html[data-mobile="true"] {
   padding-top: 48px;
 }
 /*
+ * 状态栏（`.app-statusbar`：连接点 / 状态 / cwd / 用量）恒为单行。
+ *
+ * 它是一条 `items-center` 的单行 flex，`gap-3` 分隔四段；cwd 与用量都是长文本，
+ * 窄屏上放不下时 flex 会把每件压到内容下限以下——一旦压过下限，`{input} in /
+ * {output} out` 就折成多行（实测 390pt 下按钮被压到约半个内容宽、文字五折，整条
+ * 底栏从单行的 33px 长到 81px），正是用户报的「底栏过高」。
+ *
+ * `white-space: nowrap` 后，挤压只落在会截断的 cwd 上（它是全栏唯一的
+ * `.truncate`），用量按钮保持自身宽度、恒为一行。只作用于手机（选择器带
+ * `[data-mobile="true"]`，由 `useIsMobile` 设在 `<html>` 上）；桌面不匹配，
+ * 逐字节不变——桌面窗口（最小 800px）宽度本就富余，用量的自然宽度与折行与否
+ * 并不改变它现在的单行观感。
+ */
+[data-mobile="true"] .app-statusbar {
+  white-space: nowrap;
+}
+/*
  * 手机端长按（= 右键）的前提：按住会话行时，iOS 会先弹文字选择 / 放大镜 callout，
  * 把长按手势整个抢走——`useLongPress` 便永远等不到那 500ms。这三条把原生手势关掉，
  * 长按才是「打开菜单」而不是「选中文字」。
