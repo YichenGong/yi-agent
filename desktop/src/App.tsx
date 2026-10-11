@@ -6,6 +6,7 @@ import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
 import { transportFactory } from "./transportFactory";
 import { ChatView } from "./components/ChatView";
+import { CacheNotice } from "./components/CacheNotice";
 import { MessageInput } from "./components/MessageInput";
 import { ModelPicker } from "./components/ModelPicker";
 import { StatusBar } from "./components/StatusBar";
@@ -79,6 +80,8 @@ import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
 import { OnboardingWizard, type OnboardingOutcome } from "./components/OnboardingWizard";
 import { onboardingStatus } from "./lib/onboarding";
+import { readListCache, writeListCache } from "./lib/sessionCache";
+import { createContentStore, persistContent, type AsyncContentStore } from "./lib/contentStore";
 
 /**
  * 看板失败的四种说法。
@@ -176,16 +179,82 @@ export default function App() {
   // 原样出现，绝不会把 A 的附件发到 B 上。
   const [pending, setPending] = useState<Record<string, PendingAttachment[]>>({});
   const [status, setStatus] = useState<string>("connecting");
-  const [groups, setGroups] = useState<WorkspaceGroup[]>([]);
+  // 手机端首屏缓存：权威列表在服务端，这里只放一份同步快照，让侧栏在
+  // `thread/listAll` 回来之前就能画出来。桌面端不读（`null`），初值保持 []，
+  // 行为与从前逐字节一致。
+  const initialListCache = useRef(isRemoteClient() ? readListCache() : null).current;
+  const [groups, setGroups] = useState<WorkspaceGroup[]>(initialListCache?.groups ?? []);
   // 服务端排好序的全部置顶会话（从顶到底）。置顶项仍留在各自的分组内，侧栏
   // 渲染分组时需自行过滤，否则会重复渲染。
-  const [pinned, setPinned] = useState<ThreadSummary[]>([]);
+  const [pinned, setPinned] = useState<ThreadSummary[]>(initialListCache?.pinned ?? []);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
   // 手机端：会话侧栏与子 agent 栏是抽屉，不是常驻列，否则聊天区被挤到看不清。
   const isMobile = useIsMobile();
+  // 手机端离线 = 尚未握手成功。桌面端恒为 false（不显示缓存相关 UI）。
+  const offline = isRemoteClient() && status !== "connected";
+  // 内容缓存（IndexedDB）：仅手机端。懒建，桌面端永不构造（`null`）。
+  const contentStoreRef = useRef<AsyncContentStore | null>(null);
+  const getContentStore = (): AsyncContentStore => (contentStoreRef.current ??= createContentStore());
+  // 防抖落盘定时器，按 thread 隔离：一个会话的写入不能被另一个的盖掉。
+  const persistTimers = useRef(new Map<string, number>());
+  // 内容来自缓存、尚未被服务端覆盖的会话 → 其 `savedAt`（供离线提示）。
+  const cachedAt = useRef(new Map<string, number>());
+
+  /**
+   * 从内容缓存预填某会话的对话（手机端）。服务端 item 到达后按 id 就地替换，
+   * 所以这里的旧内容只会短暂停留；若服务端已先填好了内容则整段跳过。
+   *
+   * 预填**不**置 warm：那会让连上后的 `thread/resume` 被跳过，服务端历史
+   * 永远合不进来。缓存（cachedAt）与 warm 是两套东西，必须分开。
+   */
+  const prefillFromCache = (id: string) => {
+    if (!isRemoteClient()) return;
+    const store0 = getContentStore();
+    void store0
+      .read(id)
+      .then((entry) => {
+        if (!entry || entry.items.length === 0) return;
+        const v = store.peek(id);
+        if (!v || v.session.items.length > 0) return; // 服务端已经填过
+        v.session.upsertItems(entry.items);
+        v.session.lastServerItemId = v.session.lastServerItemId ?? entry.lastServerItemId;
+        cachedAt.current.set(id, entry.savedAt);
+        force((n) => n + 1);
+      })
+      .catch(() => {
+        // 预填是附加能力：读失败保留空态，由 resume 兜底。
+      });
+  };
+  /** 节流：内容变更后延迟落盘，避免逐字 delta 每次都写 IndexedDB。 */
+  const CONTENT_PERSIST_DEBOUNCE_MS = 800;
+  const schedulePersist = (id: string) => {
+    if (!isRemoteClient()) return;
+    const timers = persistTimers.current;
+    const existing = timers.get(id);
+    if (existing !== undefined) window.clearTimeout(existing);
+    const timer = window.setTimeout(() => {
+      timers.delete(id);
+      void flushContent(id);
+    }, CONTENT_PERSIST_DEBOUNCE_MS);
+    timers.set(id, timer);
+  };
+  /** 立即落盘某会话（切走 / 页面隐藏 / 卸载时用）。 */
+  const flushContent = (id: string) => {
+    if (!isRemoteClient()) return Promise.resolve();
+    const v = store.peek(id);
+    if (!v) return Promise.resolve();
+    return persistContent(getContentStore(), id, v.session).catch(() => {
+      // 缓存写失败不影响任何用户可见行为。
+    });
+  };
+  /** 删除某会话的内容缓存（仅手机端）。桌面端不构造内容缓存，故此处也必须门控。 */
+  const deleteCachedContent = (id: string) => {
+    if (!isRemoteClient()) return;
+    void getContentStore().delete(id).catch(() => {});
+  };
   const [sidebarOpen, setSidebarOpen] = useState(false);
   // 打开的详情:进入栈 + 该栈顶任务的轨迹行。栈让"子任务再进入"可退回,
   // 与 TUI 页签同一语义。
@@ -416,6 +485,53 @@ export default function App() {
 
   const current = currentId ? store.view(currentId) : null;
 
+  // 首屏：把缓存里的会话播种进 store（标题/cwd/model/状态徽标），并预填选中会话
+  // 的内容。预填**不**置 warm：那会让连上后的 `thread/resume` 被跳过，服务端历史
+  // 永远合不进来。
+  const prefilledOnce = useRef(false);
+  useEffect(() => {
+    const c = initialListCache;
+    if (!c || prefilledOnce.current) return;
+    prefilledOnce.current = true;
+    store.seed([...c.pinned, ...c.groups.flatMap((g) => g.threads)]);
+    if (c.selectedId && c.groups.some((g) => g.threads.some((t) => t.thread_id === c.selectedId))) {
+      store.select(c.selectedId);
+      setCurrentId(c.selectedId);
+      void prefillFromCache(c.selectedId);
+    }
+    force((v) => v + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 连上即清"内容来自缓存"的标记：此刻起服务端是唯一来源，提示条退场。
+  useEffect(() => {
+    if (status === "connected") cachedAt.current.clear();
+  }, [status]);
+
+  // 页面隐藏 / 卸载时把在途的会话内容立刻写盘：手机切后台后可能很久不再执行
+  // 定时器，等着防抖会把最后一段内容丢掉。
+  useEffect(() => {
+    if (!isRemoteClient()) return;
+    const flushAll = () => {
+      for (const id of persistTimers.current.keys()) {
+        window.clearTimeout(persistTimers.current.get(id));
+      }
+      const ids = new Set([...persistTimers.current.keys(), ...store.ids()]);
+      persistTimers.current.clear();
+      for (const id of ids) void flushContent(id);
+    };
+    const onHide = () => {
+      if (document.visibilityState === "hidden") flushAll();
+    };
+    document.addEventListener("visibilitychange", onHide);
+    window.addEventListener("pagehide", flushAll);
+    return () => {
+      document.removeEventListener("visibilitychange", onHide);
+      window.removeEventListener("pagehide", flushAll);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   /** Write an error onto the current thread's session (if any). */
   const setCurrentError = (msg: string) => {
     const s = store.current()?.session;
@@ -435,6 +551,7 @@ export default function App() {
       // seed 喂全集：置顶项仍在分组里，所以不会漏；store 的视图与侧栏的分区
       // 划分无关（状态徽章、未读点都按 thread_id 查 store）。
       store.seed(r.groups.flatMap((g) => g.threads));
+      if (isRemoteClient()) writeListCache(localStorage, r.groups, r.pinned ?? [], store.currentId);
       return r.groups;
     } catch {
       // 列表刷新失败不打断对话。返回 null 表示"未知":调用方必须把 null
@@ -613,8 +730,16 @@ export default function App() {
    * keep serving other threads in parallel.
    */
   const selectThread = async (id: string, opts?: { leaveBoard?: boolean }) => {
+    const prevId = store.currentId;
     store.select(id);
     setCurrentId(id);
+    // 冷会话先拿缓存内容垫上（有则显示、无则空），随后 resume/readItems 覆盖。
+    // 判据是 warm 与在途 resume，与「是否有缓存」无关：预填**不**置 warm，所以
+    // 这里不会因为命中缓存而跳过 resume。这里刻意放在下方的早退分支（running
+    // 会话走 readItems 而非 resume）之前——那条路径同样要先垫上缓存。
+    if (!warm.current.has(id) && !inFlightResume.current.has(id)) prefillFromCache(id);
+    // 切走即把上一条会话的在途内容落盘（切回时预填的就是它）。
+    if (prevId && prevId !== id) void flushContent(prevId);
     // 会话页成为当前页：离开看板（若正在看）。这样点侧栏任意会话即「跳转」
     // 过去，不必再点一次「收起看板」。setSelectedBoard 幂等，不在看板时无害。
     // 仅当这是「用户切到会话」时才是离场：重连后重放选中的那条会话不代表用户
@@ -666,15 +791,27 @@ export default function App() {
     const c = clientRef.current;
     if (!c) return;
     inFlightResume.current.add(id);
+    // 全量回放期间收集服务端 item id；成功后据此删掉缓存里服务端已经没有的项
+    // （clear / compact / 裁剪造成的幽灵内容）。readItems 只补尾部，不走这条路径。
+    const replaySession = store.view(id).session;
+    replaySession.beginReplay();
     try {
       const resumed = await c.request<{ permission_mode?: ThreadMode }>("thread/resume", {
         threadId: id,
       });
+      const replayed = replaySession.endReplay();
+      // 只有真收到过回放帧才允许删项。空集是不能下「服务端没有这些 item」结论的：
+      // 它既可能是「服务端历史本来就空」，也可能是「这趟 resume 压根没投递帧」。
+      // 而后者的代价是把刚预填的缓存整段抹掉——spec §5 的三段式第一步（先显示
+      // 缓存）就此消失。生产 ws 路径上全量回放必然携带帧(thread/started +
+      // items/completed),所以这一守卫只在「无帧可对账」时跳过,不影响幽灵项清理。
+      if (replayed !== null && replayed.size > 0) replaySession.dropStale(replayed);
       // 删除竞态:resume 在途时用户可能已删掉该冷 thread,此时不能再把它
       // 加回 warm(会复活已删 id)。peek 不创建视图,仅判断是否仍存在。
       const view = store.peek(id);
       if (!view) return;
       warm.current.add(id);
+      void flushContent(id);
       // 响应直接带权威 mode：一次请求即定,不受 listAll 快照的竞态/失败影响
       // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
       const fromResponse = permissionModeFromResponse(resumed);
@@ -685,6 +822,7 @@ export default function App() {
       if (gs !== null) view.mode = modeForThread(gs, pinned, id) ?? view.mode;
       force((v) => v + 1);
     } catch (e) {
+      replaySession.endReplay();
       // 同样地,失败路径只在视图仍存在时写错误,避免 re-create 一个已被
       // drop 的 ThreadView(无界泄漏 + 残留 warm 条目)。
       const view = store.peek(id);
@@ -961,6 +1099,11 @@ export default function App() {
     if (v?.approval) dismissedApprovals.current.delete(v.approval.id);
     store.drop(id);
     warm.current.delete(id);
+    // 会话已删:内容缓存与在途的落盘/预填登记一并清掉,否则下次冷启会把一个
+    // 服务端已经没有的会话画回侧栏里。
+    deleteCachedContent(id);
+    persistTimers.current.delete(id);
+    cachedAt.current.delete(id);
     if (id === currentId) {
       setCurrentId(null);
       // 没有当前会话了，面板与它的 diff 也必须退场：留着就是一片无主的旧内容。
@@ -1124,6 +1267,10 @@ export default function App() {
         // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
         store.applyNotification(n);
         force((v) => v + 1);
+        // `Notification` 是判别联合：只有带 `thread_id` 的通知才有会话内容可落盘
+        // （`error` 无归属、由 store 归到当前会话，在此跳过）。其余 `agent/*`、
+        // `ui/*` 通知已在上方分支提前返回。
+        if ("thread_id" in n.params) schedulePersist(n.params.thread_id);
         if (n.method === "turn/completed") void refreshThreads();
       });
       client.onApproval((r) => {
@@ -1196,10 +1343,25 @@ export default function App() {
         setGroups(list.groups);
         setPinned(list.pinned ?? []);
         store.seed(list.groups.flatMap((g) => g.threads));
+        if (isRemoteClient()) writeListCache(localStorage, list.groups, list.pinned ?? [], store.currentId);
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
-        // 重连重放时（新进程记忆为空）不离开看板：这不是用户切换页面的动作。
-        const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
-        if (first) await selectThread(first.thread_id, { leaveBoard: false });
+        // 手机端：握手（含重连/切回前台）不是「用户换了页面」，当前会话——冷启从
+        // 缓存恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看
+        // 的东西。并且重连后新进程记忆为空（warm 与订阅窗口在 exited 时已清），
+        // 必须对它再走一次 selectThread：冷则补 resume、warm 则补 subscribe，否则
+        // 视图留着而该会话的实时更新会静默停摆。仅当当前会话不在服务端新列表里
+        // （被删）或根本没有已选会话时，才回落第一条。桌面端保留原行为（每次选
+        // 第一条）。
+        const keptId = isRemoteClient() ? currentIdRef.current : null;
+        const kept =
+          keptId !== null &&
+          list.groups.some((g) => g.threads.some((t) => t.thread_id === keptId));
+        if (kept) {
+          await selectThread(keptId!, { leaveBoard: false });
+        } else {
+          const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
+          if (first) await selectThread(first.thread_id, { leaveBoard: false });
+        }
         // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         attempt = 0;
@@ -1305,6 +1467,10 @@ export default function App() {
         try {
           await c.request("thread/clear", { threadId: id });
           session.reset();
+          // 清空是服务端权威的「历史没了」:本地内容缓存也必须跟着删,否则下次
+          // 冷启预填会把刚清掉的内容画回来。
+          deleteCachedContent(id);
+          cachedAt.current.delete(id);
           session.notice("对话已清空");
         } catch (e) {
           // 失败绝不清界面:否则会出现"看着清了、服务端还记得"的假象。
@@ -1334,6 +1500,13 @@ export default function App() {
     const id = store.currentId;
     const c = clientRef.current;
     if (!id || !c) return false;
+    // 离线时不发：缓存内容可以看，但不能对着它发消息（服务端根本收不到）。
+    // 只提示、保留草稿，交给用户连上后再发——不排队、不自动重发。
+    if (offline) {
+      store.view(id).session.lastError = "正在连接，请稍候";
+      force((v) => v + 1);
+      return false;
+    }
     // 这个会话待发送的附件。发送前先取快照：成功要清空它，失败要**留着**重试。
     const files = pending[id] ?? [];
     // 按类别分组：文档走清单 block，图片走内容 block，协议形态不同。
@@ -1742,6 +1915,7 @@ export default function App() {
           onRemoveBoard={(path) => void onRemoveBoard(path)}
           onOpenBoard={onOpenBoard}
           isMobile={isMobile}
+          statusStale={offline}
           onOpenSettings={() => setSettingsOpen(true)}
         />
         </div>
@@ -1822,6 +1996,9 @@ export default function App() {
             </section>
           ) : (
             <>
+              {offline && currentId !== null && cachedAt.current.has(currentId) && (
+                <CacheNotice savedAt={cachedAt.current.get(currentId)!} />
+              )}
               <ChatView
                 items={current?.session.items ?? []}
                 error={current?.session.lastError ?? null}

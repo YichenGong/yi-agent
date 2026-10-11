@@ -50,6 +50,54 @@ export class Session {
   lastServerItemId: string | null = null;
 
   /**
+   * Server item ids seen while a full replay is in flight, or `null` when no
+   * replay is being collected. `dropStale` uses the completed set to tell a
+   * cached item the server still has from one it no longer has.
+   */
+  private replayIds: Set<string> | null = null;
+
+  /** Start collecting server item ids (called before `thread/resume`). */
+  beginReplay(): void {
+    this.replayIds = new Set();
+  }
+
+  /**
+   * Stop collecting and hand back the ids seen. Returns `null` when no replay
+   * was in flight, so a caller cannot accidentally reconcile with an empty set.
+   */
+  endReplay(): Set<string> | null {
+    const ids = this.replayIds;
+    this.replayIds = null;
+    return ids;
+  }
+
+  /**
+   * Drop every item the server did not just replay.
+   *
+   * Called only after a *full* replay (a successful `thread/resume`), where the
+   * server re-sent its entire history: any server item we hold that is absent
+   * from `serverIds` no longer exists server-side (cleared, compacted, or
+   * trimmed away) and must not linger as ghost content. Local echoes and notices
+   * are ours, not the server's — they are always kept.
+   */
+  dropStale(serverIds: Set<string>): void {
+    this.items = this.items.filter(
+      (i) => Session.isLocalId(i.id) || serverIds.has(i.id),
+    );
+    // The cursor must point at a surviving server item (or nothing), never at a
+    // dropped one: otherwise a later `readItems(afterItemId)` asks for a window
+    // anchored past content the transcript no longer holds.
+    for (let i = this.items.length - 1; i >= 0; i -= 1) {
+      const id = this.items[i].id;
+      if (!Session.isLocalId(id)) {
+        this.lastServerItemId = id;
+        return;
+      }
+    }
+    this.lastServerItemId = null;
+  }
+
+  /**
    * Drop all accumulated state. Must be called *before* issuing
    * `thread/resume`, because replay notifications can arrive before the resume
    * response — resetting after would wipe the freshly replayed history.
@@ -229,6 +277,7 @@ export class Session {
           incoming.type === "user_interjection"
             ? { type: "userMessage", id: incoming.id, text: incoming.text }
             : incoming;
+        if (this.replayIds !== null) this.replayIds.add(item.id);
         const index = this.items.findIndex((i) => i.id === item.id);
         if (index >= 0) {
           this.items[index] = item;
@@ -255,6 +304,9 @@ export class Session {
       case "items/completed": {
         // 回放期的批量帧：交给 upsertItems（按 id 去重/就地替换/保持顺序/
         // 推进 lastServerItemId），与逐条 item/completed 等价且幂等。
+        if (this.replayIds !== null) {
+          for (const it of notification.params.items) this.replayIds.add(it.id);
+        }
         this.upsertItems(notification.params.items);
         break;
       }
@@ -262,6 +314,7 @@ export class Session {
         // Text resumed: the retry succeeded, so the notice has served its purpose.
         this.retrying = null;
         const { item_id, delta } = notification.params;
+        if (this.replayIds !== null) this.replayIds.add(item_id);
         this.lastServerItemId = item_id;
         const index = this.items.findIndex((i) => i.id === item_id);
         if (index < 0) {
