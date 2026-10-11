@@ -23,8 +23,7 @@ function renderInput(
     value: "",
     onDraftChange: vi.fn(),
     attachments: [],
-    onPickFiles: vi.fn(),
-    onPickImages: vi.fn(),
+    onPickAttachments: vi.fn(),
     onRemoveAttachment: vi.fn(),
     // `call` 现在是必填：待发图片 chip 的缩略图经它读字节（本文件的用例只挂
     // 文档 chip，永不调用它，但类型上必须给）。
@@ -315,43 +314,22 @@ describe("MessageInput", () => {
       expect(onInterrupt).toHaveBeenCalled();
     });
 
-    it("asks the parent to pick files from the paperclip button", () => {
-      const onPickFiles = vi.fn();
-      const { unmount } = renderInput({ onPickFiles, value: "hi" });
+    it("asks the parent to pick attachments from the single attach button", () => {
+      const onPickAttachments = vi.fn();
+      const { unmount } = renderInput({ onPickAttachments, value: "hi" });
       fireEvent.click(paperclip());
-      expect(onPickFiles).toHaveBeenCalledTimes(1);
+      expect(onPickAttachments).toHaveBeenCalledTimes(1);
       unmount();
 
       // A composer with no session is inert everywhere, the picker included.
-      renderInput({ onPickFiles, value: "hi", disabled: true });
+      renderInput({ onPickAttachments, value: "hi", disabled: true });
       expect((paperclip() as HTMLButtonElement).disabled).toBe(true);
     });
 
-    it("keeps documents and images on distinct buttons", () => {
-      const onPickFiles = vi.fn();
-      const onPickImages = vi.fn();
-      renderInput({ onPickFiles, onPickImages });
-
-      // 两个按钮各接各的 handler：回形针只挑文档，图片走它自己的按钮（不同的
-      // 白名单与上限，不能共用一个入口）。
-      const imageButton = screen.getByRole("button", { name: "附加图片" });
-      expect(imageButton).not.toBe(paperclip());
-
-      fireEvent.click(imageButton);
-      expect(onPickImages).toHaveBeenCalledTimes(1);
-      expect(onPickFiles).not.toHaveBeenCalled();
-
-      fireEvent.click(paperclip());
-      expect(onPickFiles).toHaveBeenCalledTimes(1);
-      expect(onPickImages).toHaveBeenCalledTimes(1);
-    });
-
-    it("disables the image picker with the rest of the composer", () => {
-      // 无会话时 composer 处处 inert，图片按钮不能例外。
-      renderInput({ value: "hi", disabled: true });
-      expect((screen.getByRole("button", { name: "附加图片" }) as HTMLButtonElement).disabled).toBe(
-        true,
-      );
+    it("offers a single attach button (no separate image button)", () => {
+      renderInput();
+      // 文档与图片共用一个入口：图片按钮已并入回形针。
+      expect(screen.queryByRole("button", { name: "附加图片" })).toBeNull();
     });
 
     it("reports the removed attachment path and only clears the text on a send", async () => {

@@ -2653,31 +2653,16 @@ describe("App 会话详情栏的开合", () => {
 });
 
 describe("App 附件接线", () => {
-  const paperclip = () => screen.getByRole("button", { name: "附加文件" });
-  const imageButton = () => screen.getByRole("button", { name: "附加图片" });
+  // 文档与图片共用一个入口（合并后只有一个「附加文件」按钮）。
+  const attachButton = () => screen.getByRole("button", { name: "附加文件" });
   const sendButton = () => screen.getByRole("button", { name: /^send$/i });
 
-  /** 点某个选择器触发原生多选，并等界面吸收结果（chips 或错误横幅）。 */
-  async function pickWith(button: () => HTMLElement, picked: string | string[] | null) {
+  /** 点附件入口触发原生多选，并等界面吸收结果（chips 或错误横幅）。 */
+  async function pickAttachments(picked: string | string[] | null) {
     state.picks = [picked];
     await act(async () => {
-      fireEvent.click(button());
+      fireEvent.click(attachButton());
     });
-  }
-
-  /** 点回形针（文档选择器）触发原生多选。 */
-  async function pickFiles(picked: string | string[] | null) {
-    await pickWith(paperclip, picked);
-  }
-
-  /**
-   * 点「附加图片」触发原生多选。
-   *
-   * 图片入列后 chip 会渲染缩略图，`AttachmentThumb` 经 `useImageData` 真的发起
-   * `image/read`；那是另一条链路的职责，这里只关心「图有没有进待发列表」。
-   */
-  async function pickImages(picked: string | string[] | null) {
-    await pickWith(imageButton, picked);
   }
 
   /**
@@ -2700,7 +2685,7 @@ describe("App 附件接线", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
 
-    await pickFiles(["/tmp/报告.pdf"]);
+    await pickAttachments(["/tmp/报告.pdf"]);
     // 多选回传一个数组：chip 是"确实进了待发列表"的可见证据。
     expect(screen.getByText("报告.pdf")).toBeTruthy();
 
@@ -2736,7 +2721,7 @@ describe("App 附件接线", () => {
     // 会话 cwd 为根（安全边界）必然拒绝它——桩客户端默认对未知方法回 `{}`，那会
     // 被伪造成一张空的「成功」图。这里照实模拟该拒绝，chip 才走到中性占位。
     state.rejectCode["image/read"] = -1;
-    await pickImages(["/tmp/截图.png"]);
+    await pickAttachments(["/tmp/截图.png"]);
     expect(screen.getByText("截图.png")).toBeTruthy();
     expectThumbPlaceholder();
 
@@ -2768,8 +2753,8 @@ describe("App 附件接线", () => {
 
     // 同上一例：模拟 `image/read` 对待发绝对路径的拒绝（否则空桩会被伪造成图）。
     state.rejectCode["image/read"] = -1;
-    await pickFiles(["/tmp/报告.pdf"]);
-    await pickImages(["/tmp/截图.png"]);
+    // 一次选择里混选文档与图片，是合并入口的核心路径：分类由扩展名决定。
+    await pickAttachments(["/tmp/报告.pdf", "/tmp/截图.png"]);
     expect(screen.getByText("截图.png")).toBeTruthy();
     expect(screen.getByText("报告.pdf")).toBeTruthy();
     expectThumbPlaceholder();
@@ -2811,7 +2796,7 @@ describe("App 附件接线", () => {
     );
 
     // `.mov` 不在 `ATTACHMENT_EXTENSIONS` 里，本地预检必须就地拒绝。
-    await pickFiles(["/tmp/演示.mov"]);
+    await pickAttachments(["/tmp/演示.mov"]);
 
     // 拒绝原因写进会话错误（渲染成错误横幅），没有变成 chip。
     await waitFor(() => expect(screen.getByText(/不支持的文件类型/)).toBeTruthy());
@@ -2822,43 +2807,13 @@ describe("App 附件接线", () => {
     expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
   });
 
-  it("rejects an image picked through the document picker", async () => {
-    render(<App />);
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
-    );
-
-    // 回形针现在只收文档：`.png` 在这里必须被就地拒绝并报「不支持的文件类型」，
-    // 而不是悄悄收下一个图片（图片有它自己的按钮与白名单）。
-    await pickFiles(["/tmp/截图.png"]);
-
-    await waitFor(() => expect(screen.getByText(/不支持的文件类型/)).toBeTruthy());
-    expect(screen.queryByText("截图.png")).toBeNull();
-    expect(screen.queryByTestId("attachment-thumb")).toBeNull();
-    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
-  });
-
-  it("rejects a document picked through the image picker", async () => {
-    render(<App />);
-    await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
-    );
-
-    // 反向同理：图片按钮只收图片，`.pdf` 会被 `imageAttachmentProblem` 拒掉。
-    await pickImages(["/tmp/报告.pdf"]);
-
-    await waitFor(() => expect(screen.getByText(/不支持的图片类型/)).toBeTruthy());
-    expect(screen.queryByText("报告.pdf")).toBeNull();
-    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
-  });
-
   it("sends with attachments alone and no text", async () => {
     render(<App />);
     await waitFor(() =>
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
 
-    await pickFiles(["/tmp/报告.pdf"]);
+    await pickAttachments(["/tmp/报告.pdf"]);
     await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
 
     // 附件本身即消息：文本框留空，Send 也必须可用。
@@ -2888,7 +2843,7 @@ describe("App 附件接线", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
 
-    await pickFiles(["/tmp/报告.pdf"]);
+    await pickAttachments(["/tmp/报告.pdf"]);
     await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
 
     await act(async () => {
@@ -2924,7 +2879,7 @@ describe("App 附件接线", () => {
       params: { thread_id: "t1", status: "running" },
     });
 
-    await pickFiles(["/tmp/报告.pdf"]);
+    await pickAttachments(["/tmp/报告.pdf"]);
     await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
 
     await act(async () => {
@@ -2954,7 +2909,7 @@ describe("App 附件接线", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
 
-    await pickFiles(["/tmp/报告.pdf"]);
+    await pickAttachments(["/tmp/报告.pdf"]);
     await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
 
     await act(async () => {
@@ -2980,7 +2935,7 @@ describe("App 附件接线", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
 
-    await pickFiles(["/tmp/报告.pdf"]);
+    await pickAttachments(["/tmp/报告.pdf"]);
     await waitFor(() => expect(screen.getByText("报告.pdf")).toBeTruthy());
 
     // 切到 t2：t1 的附件不跟过来。
@@ -3001,7 +2956,7 @@ describe("App 附件接线", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
 
-    await pickFiles(["/tmp/a.pdf", "/tmp/b.md"]);
+    await pickAttachments(["/tmp/a.pdf", "/tmp/b.md"]);
     await waitFor(() => expect(screen.getByText("a.pdf")).toBeTruthy());
     expect(screen.getByText("b.md")).toBeTruthy();
 
@@ -3097,17 +3052,18 @@ describe("App 远端图片上传", () => {
       "yi-agent.remote",
       JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
     );
-  const imageButton = () => screen.getByRole("button", { name: "附加图片" });
+  // 远端没有文档附件：合并后的单一入口在远端回落为图片选择器。
+  const attachButton = () => screen.getByRole("button", { name: "附加文件" });
   const sendButton = () => screen.getByRole("button", { name: /^send$/i });
 
   /**
-   * 远端（iOS）没有 Tauri dialog：`onPickImages` 会当场造一个 `<input type="file">`
+   * 远端（iOS）没有 Tauri dialog：附件入口会当场造一个 `<input type="file">`
    * 挂进 body、点了它，再在 change 时摘掉。这里等它出现，把选中的 File 塞进 `files`
    * 并派发 change。
    */
   async function pickImagesRemote(files: File[]) {
     await act(async () => {
-      fireEvent.click(imageButton());
+      fireEvent.click(attachButton());
     });
     const input = await waitFor(() => {
       const el = document.body.querySelector('input[type="file"]');
@@ -3296,7 +3252,7 @@ describe("App 远端图片上传", () => {
     // 桌面（无 relay 绑定）走原生对话框，与既有行为逐字不变。
     state.picks = [["/tmp/截图.png"]];
     await act(async () => {
-      fireEvent.click(imageButton());
+      fireEvent.click(attachButton());
     });
 
     expect(screen.getByText("截图.png")).toBeTruthy();
