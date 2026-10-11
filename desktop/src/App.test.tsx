@@ -3465,5 +3465,24 @@ describe("App mobile local cache", () => {
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy()); // server list
     // …and must not have constructed a content store.
     expect(contentStore.current).toBeNull();
+
+    // Deleting a thread is reachable on the desktop build too — it is the
+    // sidebar row's onDelete. Routing the cache eviction through the gated
+    // helper must keep the desktop path free of any store construction;
+    // otherwise `thread/delete` builds an IndexedDB-backed store here.
+    // The server answers the post-delete refresh with an empty list, so the row
+    // disappearing proves the eviction (before `refreshThreads`) has run.
+    state.dataSources["thread/delete"] = () => {
+      state.threads = [];
+      return {};
+    };
+    const row = screen.getByText("one");
+    fireEvent.mouseEnter(row.closest("[data-thread-row]") ?? row);
+    fireEvent.click(screen.getByRole("button", { name: "Delete thread" }));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/delete")).toBe(true),
+    );
+    await waitFor(() => expect(screen.queryByText("one")).toBeNull());
+    expect(contentStore.current).toBeNull();
   });
 });

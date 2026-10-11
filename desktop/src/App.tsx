@@ -247,6 +247,11 @@ export default function App() {
       // 缓存写失败不影响任何用户可见行为。
     });
   };
+  /** 删除某会话的内容缓存（仅手机端）。桌面端不构造内容缓存，故此处也必须门控。 */
+  const deleteCachedContent = (id: string) => {
+    if (!isRemoteClient()) return;
+    void getContentStore().delete(id).catch(() => {});
+  };
   const [sidebarOpen, setSidebarOpen] = useState(false);
   // 打开的详情:进入栈 + 该栈顶任务的轨迹行。栈让"子任务再进入"可退回,
   // 与 TUI 页签同一语义。
@@ -1088,7 +1093,7 @@ export default function App() {
     warm.current.delete(id);
     // 会话已删:内容缓存与在途的落盘/预填登记一并清掉,否则下次冷启会把一个
     // 服务端已经没有的会话画回侧栏里。
-    void getContentStore().delete(id).catch(() => {});
+    deleteCachedContent(id);
     persistTimers.current.delete(id);
     cachedAt.current.delete(id);
     if (id === currentId) {
@@ -1442,7 +1447,7 @@ export default function App() {
           session.reset();
           // 清空是服务端权威的「历史没了」:本地内容缓存也必须跟着删,否则下次
           // 冷启预填会把刚清掉的内容画回来。
-          void getContentStore().delete(id).catch(() => {});
+          deleteCachedContent(id);
           cachedAt.current.delete(id);
           session.notice("对话已清空");
         } catch (e) {
