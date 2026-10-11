@@ -127,4 +127,16 @@ describe("ModelPicker", () => {
     // 触发按钮仍显示当前（默认）模型。
     expect(screen.getByRole("button", { name: /模型/ }).textContent).toContain("model-a");
   });
+
+  it("caps the model label width on the phone so it shares one line with Send", async () => {
+    const { call } = seam();
+    render(
+      <ModelPicker call={call} threadId="t1" currentRef={null} currentModel="model-a" onChanged={vi.fn()} />,
+    );
+    const trigger = await screen.findByRole("button", { name: /模型/ });
+    // 手机端给标签一个更小的宽度上限：`max-w-[16rem]`（256px）配 ModeChip 与 `px-4`
+    // 的 Send 会超过窄屏可用宽度，把 Send 挤到下一行（三行）。收到 8rem 后三件在同一
+    // 行放得下，工具栏回到两行。桌面（≥768px）不匹配 `max-md:`，逐字节不变。
+    expect(trigger.className).toContain("max-md:max-w-[8rem]");
+  });
 });

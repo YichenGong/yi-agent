@@ -138,7 +138,7 @@ export function ModelPicker({
         aria-label={`模型：${current.label}`}
         disabled={!rpc || !threadId}
         onClick={() => setOpen((v) => !v)}
-        className="max-w-[16rem] truncate rounded-full border border-line-strong px-2 py-0.5 text-xs font-medium text-fg-muted hover:bg-raised disabled:opacity-50"
+        className="max-w-[16rem] max-md:max-w-[8rem] truncate rounded-full border border-line-strong px-2 py-0.5 text-xs font-medium text-fg-muted hover:bg-raised disabled:opacity-50"
       >
         {current.label}
       </button>

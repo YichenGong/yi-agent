@@ -278,18 +278,19 @@ export function MessageInput({
             className="min-w-0 w-full resize-none bg-transparent px-3 pt-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50"
           />
           {/*
-           * 手机端工具栏的换行方向由 `max-md:justify-start` 决定（窄屏 `flex-wrap`
-           * 已开）。
+           * 手机端工具栏：**两行**——第一行「附加文件」，第二行 Mode / 模型 / Send，
+           * 其中 Send 贴右缘（`max-md:ml-auto`，见下）。桌面端不匹配任何 `max-md:`，
+           * 仍是「附加文件靠左、mode 组靠右」的一行，逐字节不变。
            *
-           * 根因：这三颗控件都有「不可压缩」的内容——模型名可长到 `max-w-[16rem]`
-           * （256px）、Send 是 `px-4` 的实心按钮——而 ModeChip 恰好是这一行**最左**
-           * 的元素。`justify-end` 会让溢出的空白从右侧「吸」走，把最左那颗（ModeChip）
-           * 连同它 `left-0` 的下拉一起**推出屏幕左边界**，用户根本点不到模式；`start`
-           * 对齐则让溢出只落在右侧。承载 ModeChip 的那一组同时开 `max-md:flex-wrap`
-           * + `max-md:min-w-0`（见下），整组的最小内容宽不再撑破屏幕，Send 留得下。
-           *
-           * 桌面端（≥768px）不匹配任何 `max-md:`，仍是「附加文件靠左、mode 组靠右」
-           * 的一行，逐字节不变。
+           * 为什么不能给整组 `max-md:justify-end`：这三颗控件都有「不可压缩」的内容
+           * ——模型名可长到 `max-w-[16rem]`（256px）、Send 是 `px-4` 的实心按钮——而
+           * ModeChip 恰好是这一行**最左**的元素。`justify-end` 会让溢出的空白从右侧
+           * 「吸」走，把最左那颗（ModeChip）连同它 `left-0` 的下拉一起**推出屏幕左
+           * 边界**，用户根本点不到模式；`start` 对齐则让溢出只落在右侧。所以右对齐落在
+           * 单颗 Send 上（`ml-auto`），而不是整组。承载 ModeChip 的那一组同时开
+           * `max-md:flex-wrap` + `max-md:min-w-0` + `max-md:basis-full`（见下）：整组
+           * 独占第二行，其最小内容宽不再撑破屏幕，模型名也被单独收紧到 8rem
+           * （`ModelPicker` 的 `max-md:max-w-[8rem]`），使这三件在窄屏同一行放得下。
            */}
           <div
             data-composer-toolbar
@@ -319,8 +320,8 @@ export function MessageInput({
                 disabled={sendDisabled}
                 className={
                   turnActive
-                    ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
-                    : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+                    ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50 max-md:ml-auto"
+                    : "rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 max-md:ml-auto"
                 }
               >
                 {turnActive ? "Stop" : "Send"}
