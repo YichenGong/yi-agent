@@ -92,6 +92,26 @@ export function ModelPicker({
     };
   }, [rpc]);
 
+  // 每次**展开**下拉再读一次清单。挂载时那份会过时：用户可能刚在设置页写入一条
+  // 模型，而 `rpc` 是稳定身份（宿主用 `useCallback` 只闭合 `clientRef`），上面那个
+  // effect 不会因此重跑——不重读的话，新模型要等组件重挂载才出现。读失败就保留现有
+  // 清单：打开下拉不该因一次读失败把选项清空。
+  useEffect(() => {
+    if (!open || !rpc) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const next = await listModels(rpc);
+        if (!cancelled) setCatalog(next);
+      } catch {
+        // 保留现状。
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [open, rpc]);
+
   // Escape 关闭下拉并把焦点交回触发按钮。
   useEffect(() => {
     if (!open) return;
