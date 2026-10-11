@@ -1849,6 +1849,7 @@ export default function App() {
                 // 内联箭头会让每张缩略图每次渲染都重拉。
                 call={imageCall}
                 disabled={current === null}
+                isMobile={isMobile}
                 modelPicker={
                   current !== null && currentId !== null ? (
                     <ModelPicker
