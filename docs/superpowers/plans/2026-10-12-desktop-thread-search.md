@@ -13,7 +13,9 @@
 
 ## Global Constraints
 
-- 范围仅限 `desktop/`。**不改** `App.tsx`、**不改** Rust、**不改** JSON-RPC 协议。
+- 范围仅限 `desktop/`。**不改** `App.tsx` 的应用逻辑（`App.tsx` 一行不动）；唯一允许的例外是
+  `App.test.tsx:458/:481` 两处裸 `input` 选择器改为 `[data-rename-input]`（见 Task 2 Step 1）。
+  **不改** Rust、**不改** JSON-RPC 协议。
 - 搜索栏位置固定：`ThreadSidebar.tsx` 中「+ New thread」的 `p-2` 区块**之后**、`flex-1 overflow-y-auto`
   滚动容器**之前**，两者是兄弟节点。
 - 搜索栏外层**不得**加 `tabIndex`（会让既有 `div[tabindex]` 选择器选错组头）。
@@ -598,8 +600,9 @@ grep -c '^- \[\.\]' docs/project-management/desktop.md
 grep -n '^| desktop |' README.md
 ```
 
-基线（2026-10-12，本分支起点）：`[x]` = **45**，全部条目 = **57**，README 表为 `| desktop | 42 / 54 |`。
-以你实际跑出的数字为准做 +1。
+基线（2026-10-12，本分支起点，实测）：`[x]` = **45**，全部条目 = **57**。
+注意 `README.md` 第 265 行**已经滞后**于模块文件——它写的是 `| desktop | 42 / 54 |`，比模块文件少 3 条。
+本次一并同步（见 Step 3），不要照抄 README 的旧数字。
 
 - [ ] **Step 2: 在 `docs/project-management/desktop.md` 追加一条已完成条目**
 
@@ -622,7 +625,12 @@ grep -n '^| desktop |' README.md
 
 - [ ] **Step 3: 更新 README 索引计数**
 
-`README.md` 的 `| desktop | 42 / 54 | ... |` 行改为 `| desktop | 43 / 55 | ... |`（若 §Step 1 跑出的基线不同，则以基线 +1 为准）。
+`README.md` 第 265 行的 `| desktop | 42 / 54 | [详情](docs/project-management/desktop.md) |` 改为
+`| desktop | 46 / 58 | [详情](docs/project-management/desktop.md) |`。
+
+46/58 = 模块文件本次改完后的真实数量（起点实测 `[x]` 45 / 共 57，本任务新增 1 条 → 46/58）。
+**同时修掉 README 既有 3 条滞后**：它原本写 42/54，比模块文件少 3 条。
+若 Step 1 实测基线与上面不同，则以「实测基线 +1、并与模块文件完全一致」为准。
 
 - [ ] **Step 4: 更新 desktop.md 末尾的「验证命令」计数**
 
