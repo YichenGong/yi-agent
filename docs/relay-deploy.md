@@ -346,6 +346,10 @@ npx tauri ios init      # 生成/刷新 iOS 工程。注意：按 project.yml �
                         # 会覆盖 desktop.xcodeproj 内的手改（见 4.2 的 team 设置）
 ```
 
+主屏显示名由 `CFBundleDisplayName` 决定（`project.yml` 的 `info.properties` + 已提交的
+`desktop_iOS/Info.plist`，两处都写，值 `Yi-Agent`）；`PRODUCT_NAME` 保持 `yi-agent`，
+故可执行文件名 / `.app` / `.ipa` / dSYM 路径不变，§4.2 的构建与安装命令仍适用。
+
 ### 4.2 真机构建与安装（标准步骤）
 
 > **状态（2026-10-09 更新）：真机构建与安装已跑通，并实装到 iPhone 14 Pro。**
