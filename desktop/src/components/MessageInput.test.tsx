@@ -237,20 +237,27 @@ describe("MessageInput", () => {
     expect(firstControl?.getAttribute("aria-label")).toBe("附加文件");
   });
 
-  it("lets the permission group take its own full-width phone line so the chip and menu stay on screen", () => {
+  it("keeps the permission group on its own phone line so the chip and menu stay on screen", () => {
     renderInput();
     const toolbar = document.querySelector("[data-composer-toolbar]") as HTMLElement;
     // 承载 ModeChip 的那一组：与「附加文件」平级的最右元素（ModeChip 在其中，
     // dropdown 以它为定位上下文）。
     const group = toolbar.querySelector(":scope > div") as HTMLElement;
     expect(group.contains(screen.getByRole("button", { name: /mode/i }))).toBe(true);
-    // `basis-full` 让这一组在手机上独占整行（「附加文件」被换到上一行），ModeChip
-    // 因此落在贴近卡片左缘的位置；`min-w-0` 去掉内容下限，模型名再长也不撑破屏幕；
-    // `flex-wrap` 兜住极窄屏，让 Send 换到下一行而不是被推出右边界。
-    // （`max-md:justify-start` 是另一半修复，见上一条用例。）
+    // `basis-full` 让这一组在手机上独占整行（「附加文件」被留在上一行），ModeChip
+    // 因此落在贴近卡片左缘的位置；`min-w-0` 去掉内容下限；`flex-wrap` 兜住极窄屏。
     expect(group.className).toContain("max-md:basis-full");
     expect(group.className).toContain("max-md:min-w-0");
     expect(group.className).toContain("max-md:flex-wrap");
+  });
+
+  it("pins Send to the phone line's right edge, leaving Mode and the model on the left", () => {
+    renderInput();
+    const send = screen.getByRole("button", { name: /send/i });
+    // `ml-auto` 只把 Send 推到该行右缘；Mode 与模型名留在左侧（用户要的「发送按钮
+    // 向右对齐」）。放在 Send 上而不是给整组 `justify-end`：后者会把 ModeChip 连同
+    // 它 `left-0` 的下拉一并右移，重蹈「出画面」覆辙，且换行时单件行会落回左端。
+    expect(send.className).toContain("max-md:ml-auto");
   });
 
   it("does not keep a draft of its own: the value prop owns the text", () => {
