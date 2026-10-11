@@ -3387,6 +3387,25 @@ describe("App mobile local cache", () => {
     expect(resumed).toEqual(["t1"]);
   });
 
+  it("keeps a cache-restored selection over the first server thread on the first handshake", async () => {
+    asRemote();
+    // 服务端列表是 [t1, t2]，而缓存里选中 t2：恢复出的是 t2 而不是第一条。
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    seedListCache([{ thread_id: "t2", title: "two" }], "t2");
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const resumed = clients[0].requests
+      .filter((r) => r.method === "thread/resume")
+      .map((r) => (r.params as { threadId: string }).threadId);
+    expect(resumed).toContain("t2");
+    expect(resumed).not.toContain("t1");
+  });
+
   it("prefills cached content, then the server replay replaces it in place", async () => {
     asRemote();
     seedListCache([{ thread_id: "t1", title: "one" }], "t1");
@@ -3568,11 +3587,18 @@ describe("App mobile reopen keeps the selection", () => {
     await waitFor(() =>
       expect(clients[clients.length - 1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
     );
-    // 重连绝不能把选中的会话踢回第一条。
-    const resumed = clients[clients.length - 1].requests
-      .filter((r) => r.method === "thread/resume")
-      .map((r) => (r.params as { threadId: string }).threadId);
-    expect(resumed).not.toContain("t1");
+    // 重连绝不能把选中的会话踢回第一条：并且保留的会话要被**真正**重新
+    // resume（新进程记忆为空，冷会话），否则视图留着而实时更新静默停摆。
+    const last = clients[clients.length - 1];
+    await waitFor(() => expect(resumedOn(last)).toContain("t2"));
+    expect(resumedOn(last)).not.toContain("t1");
+    expect(
+      last.requests.some(
+        (r) =>
+          r.method === "thread/subscribe" &&
+          ((r.params as { threadIds?: string[] }).threadIds ?? []).includes("t2"),
+      ),
+    ).toBe(true);
   });
 
   it("still selects the first thread on the desktop reconnect (unchanged)", async () => {

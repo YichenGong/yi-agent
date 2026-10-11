@@ -1718,28 +1718,30 @@ In `desktop/src/App.tsx`, in `handshake`, replace:
 with:
 
 ```ts
-        // 手机端：已有当前会话就保持不变——重连（含切回前台）只是重放握手，
-        // 不是「用户换了页面」，把选中的会话踢回第一条会让人丢掉正在看的东西。
-        // 桌面端保留原行为（每次重放都选第一条），故只在远端加这道门。
-        //
-        // 必须带 `replay` 判据：首次握手时 Task 6 的冷启恢复已把 currentIdRef 写成
-        // 缓存里的 selectedId，若无 replay 条件，首握就会跳过 selectThread → 不发
-        // thread/resume → 服务端历史永远合不进来（打破 Task 6 的冷启恢复用例）。
-        // `handshakes` 是 effect 局部计数（与 `attempt` 同级），每次挂载/pairingVersion
-        // 变更重新起算。
-        const replay = handshakes++ > 0;
-        const restored = replay && isRemoteClient() && currentIdRef.current !== null;
-        if (!restored) {
+        // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
+        // 手机端：握手（含重连/切回前台）不是「用户换了页面」，当前会话——冷启从
+        // 缓存恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看
+        // 的东西。并且重连后新进程记忆为空（warm 与订阅窗口在 exited 时已清），
+        // 必须对它再走一次 selectThread：冷则补 resume、warm 则补 subscribe，否则
+        // 视图留着而该会话的实时更新会静默停摆。仅当当前会话不在服务端新列表里
+        // （被删）或根本没有已选会话时，才回落第一条。桌面端保留原行为（每次选
+        // 第一条）。
+        const keptId = isRemoteClient() ? currentIdRef.current : null;
+        const kept =
+          keptId !== null &&
+          list.groups.some((g) => g.threads.some((t) => t.thread_id === keptId));
+        if (kept) {
+          await selectThread(keptId!, { leaveBoard: false });
+        } else {
           const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
           if (first) await selectThread(first.thread_id, { leaveBoard: false });
         }
 ```
 
-并在 `handshake` 定义之前的 effect 局部状态处（与 `let attempt = 0;` 同级）加：
-
-```ts
-    let handshakes = 0;
-```
+判据是「当前会话是否仍在服务端新列表里」，而不是「这是不是第一次握手」：首握
+时 Task 6 的冷启恢复已把 `currentIdRef` 写成缓存里的 selectedId，只要它还在列表
+里就照旧走 `selectThread`（冷启拿得到服务端历史），既不会把选中的会话踢回第一
+条，也不会漏掉那一次 resume/subscribe。无需任何 effect 局部计数器（设计 §6.4）。
 
 - [ ] **Step 4: Run tests to verify they pass**
 

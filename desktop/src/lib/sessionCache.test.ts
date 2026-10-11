@@ -59,6 +59,17 @@ describe("sessionCache", () => {
     expect(readListCache(s)).toBeNull();
   });
 
+  it("returns null when a groups element has no threads array", () => {
+    const s = memStorage();
+    // threads 缺失的分组元素：若照单全收，App 首屏 `flatMap((g) => g.threads)`
+    // 会在渲染期 effect 里抛错（React 接不住 → 白屏），正是本缓存要预防的故障。
+    s.setItem(
+      THREAD_LIST_CACHE_KEY,
+      JSON.stringify({ version: 1, savedAt: 1, selectedId: null, pinned: [], groups: [{ workspace: "/w" }] }),
+    );
+    expect(readListCache(s)).toBeNull();
+  });
+
   it("swallows storage errors on read", () => {
     const s: StorageLike = {
       getItem: () => { throw new Error("blocked"); },

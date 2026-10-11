@@ -39,6 +39,19 @@ export function parseListCache(raw: string | null): ThreadListCache | null {
   const c = parsed as Partial<ThreadListCache>;
   if (c.version !== THREAD_LIST_CACHE_VERSION) return null;
   if (!Array.isArray(c.groups) || !Array.isArray(c.pinned)) return null;
+  // 元素形状也要挡：groups 里若藏着非分组对象（threads 缺失/非数组），首屏
+  // `flatMap((g) => g.threads)` 会在渲染期 effect 里抛错，React 接不住，正好
+  // 变成本功能要消灭的白屏。宁可当作没有缓存。pinned 同理，至少要能拿到 id。
+  for (const g of c.groups) {
+    if (typeof g !== "object" || g === null || !Array.isArray((g as WorkspaceGroup).threads)) {
+      return null;
+    }
+  }
+  for (const t of c.pinned) {
+    if (typeof t !== "object" || t === null || typeof (t as ThreadSummary).thread_id !== "string") {
+      return null;
+    }
+  }
   return {
     version: THREAD_LIST_CACHE_VERSION,
     savedAt: typeof c.savedAt === "number" ? c.savedAt : 0,
