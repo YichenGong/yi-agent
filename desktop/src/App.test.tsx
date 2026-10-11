@@ -3259,3 +3259,29 @@ describe("App 远端图片上传", () => {
     expect(clients[0].requests.some((r) => r.method.startsWith("image/upload/"))).toBe(false);
   });
 });
+
+describe("App 输入框提示按平台分流", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+
+  it("shows the newline hint (no Shift+Enter) on the phone client", async () => {
+    asRemote();
+    render(<App />);
+    const textarea = await screen.findByRole("textbox");
+    await waitFor(() => {
+      expect(textarea.getAttribute("placeholder")).toContain("tap Send");
+    });
+    expect(textarea.getAttribute("placeholder")).not.toContain("Shift");
+  });
+
+  it("keeps the Shift+Enter hint on the desktop build", async () => {
+    render(<App />);
+    const textarea = await screen.findByRole("textbox");
+    await waitFor(() => {
+      expect(textarea.getAttribute("placeholder")).toContain("Shift+Enter");
+    });
+  });
+});
