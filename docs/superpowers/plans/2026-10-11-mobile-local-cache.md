@@ -1721,11 +1721,24 @@ with:
         // 手机端：已有当前会话就保持不变——重连（含切回前台）只是重放握手，
         // 不是「用户换了页面」，把选中的会话踢回第一条会让人丢掉正在看的东西。
         // 桌面端保留原行为（每次重放都选第一条），故只在远端加这道门。
-        const restored = isRemoteClient() && currentIdRef.current !== null;
+        //
+        // 必须带 `replay` 判据：首次握手时 Task 6 的冷启恢复已把 currentIdRef 写成
+        // 缓存里的 selectedId，若无 replay 条件，首握就会跳过 selectThread → 不发
+        // thread/resume → 服务端历史永远合不进来（打破 Task 6 的冷启恢复用例）。
+        // `handshakes` 是 effect 局部计数（与 `attempt` 同级），每次挂载/pairingVersion
+        // 变更重新起算。
+        const replay = handshakes++ > 0;
+        const restored = replay && isRemoteClient() && currentIdRef.current !== null;
         if (!restored) {
           const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
           if (first) await selectThread(first.thread_id, { leaveBoard: false });
         }
+```
+
+并在 `handshake` 定义之前的 effect 局部状态处（与 `let attempt = 0;` 同级）加：
+
+```ts
+    let handshakes = 0;
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
