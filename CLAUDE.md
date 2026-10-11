@@ -2,6 +2,24 @@
 
 项目级 Claude Code 指令,会被自动加载到 Claude Code 的上下文。
 
+## 启动时强制加载 `using-superpowers` skill
+
+> **本项目的所有工作会话,在开始任何响应或动作之前,都必须先加载
+> `superpowers:using-superpowers` skill。**
+
+- **触发时机:项目启动 / 会话开始。** 只要你在本项目里处理任何需求
+  (包括看似简单的问题、澄清性提问、先看一眼代码再动手等),第一步都必须
+  加载 `superpowers:using-superpowers`,再开始其它任何动作。
+- **这不是可选项。** 只要某个 skill 有哪怕 1% 的可能适用于当前任务,就
+  **必须**加载并使用它。不允许用"这很简单""我先收集一下上下文""我记得
+  这个 skill"之类的理由跳过。
+- **先声明再执行。** 加载后先说一句 "Using [skill] to [purpose]",然后严格
+  按该 skill 的流程执行;若它带 checklist,则逐项建 todo 并依次完成。
+- **典型路径:** 需求/造功能 → 先 `superpowers:brainstorming`;修 bug →
+  先 `superpowers:systematic-debugging`;然后才是具体实现类 skill。
+- **优先级:** 用户在本文件(及直接指令)里的要求 > skill > 默认行为。只有
+  用户明确要求跳过某 skill 流程时才可跳过。
+
 ## 分支与 worktree 规范
 
 - **严禁在 `main` 分支上直接修改代码或提交 commit。** 所有变更——无论代码、
