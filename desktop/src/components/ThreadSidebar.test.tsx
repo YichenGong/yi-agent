@@ -969,6 +969,51 @@ describe("ThreadSidebar 搜索", () => {
     expect(container.textContent).toContain("alpha-thread");
   });
 
+  it("搜索期间折叠控件被禁用，不会悄悄改掉清空后的折叠视图", () => {
+    // 渲染在搜索期间忽略折叠态，折叠控件若仍可点，用户点了毫无反馈却写进了 Set，
+    // 清空搜索后视图就被悄悄改掉——正是「清空即恢复」这条承诺的破口。
+    const withCard: WorkspaceGroup[] = [
+      {
+        workspace: "/proj",
+        exists: true,
+        threads: [
+          thread("t-plain", "plain-thread", "/proj"),
+          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
+    fireEvent.change(searchBox(), { target: { value: "proj" } });
+
+    const collapse = container.querySelector<HTMLButtonElement>('[aria-label="Collapse"]')!;
+    const boardToggle = container.querySelector<HTMLButtonElement>('[aria-label="看板会话"]')!;
+    // 默认态：项目组展开（caret 是 Collapse），看板小节折叠（aria-expanded=false）。
+    expect(collapse.disabled).toBe(true);
+    expect(boardToggle.disabled).toBe(true);
+    expect(boardToggle.getAttribute("aria-expanded")).toBe("true");
+    fireEvent.click(collapse);
+    fireEvent.click(boardToggle);
+
+    // 清空后回到搜索前的折叠态：项目组仍展开、看板小节仍折叠。
+    // 若上面两次点击写进了 Set，二者之一就会翻转，这里即失败。
+    fireEvent.change(searchBox(), { target: { value: "" } });
+    expect(container.querySelector('[aria-label="Collapse"]')).not.toBeNull();
+    expect(container.querySelector('[aria-label="看板会话"]')!.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("搜索期间置顶分区处于展开态", () => {
+    const { container } = renderSidebar({ pinned: [pinnedThread("9", "pin-a")] });
+    fireEvent.click(container.querySelector('[aria-label="Collapse pinned"]')!);
+    expect(container.querySelectorAll("[data-pinned-row]")).toHaveLength(0);
+
+    fireEvent.change(searchBox(), { target: { value: "pin-a" } });
+    expect(container.querySelectorAll("[data-pinned-row]")).toHaveLength(1);
+    expect(screen.getByLabelText("Collapse pinned").hasAttribute("disabled")).toBe(true);
+
+    fireEvent.change(searchBox(), { target: { value: "" } });
+    expect(container.querySelectorAll("[data-pinned-row]")).toHaveLength(0);
+  });
+
   it("搜索期间双击会话行，[data-rename-input] 仍指向该行输入框", () => {
     const { container } = renderSidebar();
     fireEvent.change(searchBox(), { target: { value: "projA" } });

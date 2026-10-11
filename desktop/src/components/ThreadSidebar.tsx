@@ -579,6 +579,8 @@ export function ThreadSidebar({
   const renderBoardThreads = (g: WorkspaceGroup) => {
     const cards = g.threads.filter((t) => !t.pinned && t.card_id);
     if (cards.length === 0) return null;
+    // 搜索期间一律展开，且**关掉这一小节自身的折叠开关**：此时渲染忽略折叠态，
+    // 点了看不到任何反馈，却会悄悄写进 `boardCollapsed`，清空搜索后视图就被改掉了。
     const isBoardCollapsed = searching ? false : !boardCollapsed.has(g.workspace);
     return (
       <div key={`board-threads:${g.workspace}`}>
@@ -586,6 +588,7 @@ export function ThreadSidebar({
           type="button"
           aria-label="看板会话"
           aria-expanded={!isBoardCollapsed}
+          disabled={searching}
           onClick={() => toggleBoardCollapse(g.workspace)}
           className="flex w-full items-center gap-1 px-2 py-1 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
         >
@@ -717,6 +720,7 @@ export function ThreadSidebar({
               <button
                 type="button"
                 onClick={() => setPinnedCollapsed((v) => !v)}
+                disabled={searching}
                 aria-label={pinnedCollapsedNow ? "Expand pinned" : "Collapse pinned"}
                 title={pinnedCollapsedNow ? "Expand" : "Collapse"}
                 className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
@@ -763,6 +767,7 @@ export function ThreadSidebar({
                 <button
                   type="button"
                   onClick={() => toggleCollapse(g.workspace)}
+                  disabled={searching}
                   aria-label={isCollapsed ? "Expand" : "Collapse"}
                   title={isCollapsed ? "Expand" : "Collapse"}
                   className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
