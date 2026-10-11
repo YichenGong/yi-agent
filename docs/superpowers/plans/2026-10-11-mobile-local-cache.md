@@ -206,7 +206,7 @@ describe("selectEvictions", () => {
 
   it("evicts oldest until the byte bound is met too", () => {
     const metas = [meta("old", 1, 600), meta("mid", 2, 600), meta("new", 3, 600)];
-    expect(selectEvictions(metas, { maxCount: 10, maxBytes: 1300 })).toEqual(["old", "mid"]);
+    expect(selectEvictions(metas, { maxCount: 10, maxBytes: 1000 })).toEqual(["old", "mid"]);
   });
 
   it("stops as soon as both bounds hold (no over-eviction)", () => {
