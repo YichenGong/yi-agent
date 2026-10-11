@@ -1150,8 +1150,9 @@ In `desktop/src/App.tsx`, add imports:
 ```ts
 import { readListCache, writeListCache } from "./lib/sessionCache";
 import { createContentStore, persistContent, type AsyncContentStore } from "./lib/contentStore";
-import { CacheNotice } from "./components/CacheNotice";
 ```
+
+（`CacheNotice` 的 import 在 Task 7 接线提示条时再加——本任务还不渲染它。）
 
 Inside `App`, just before the `groups`/`pinned` state (around line 179), add:
 
