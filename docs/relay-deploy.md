@@ -293,10 +293,12 @@ yi-agent app-server --listen 'relay://wss://relay.example.com/connect?session=<�
 
 > **注意：中继模式下本地 app-server 恒以那一枚 `control` token 的身份出现。** 经同
 > 一条中继 session 进来的多台手机，在本地这一层**不区分** per-device scope；因此
-> admin 类 RPC（`pair/create`、`device/revoke`、`thread/delete`、`process/kill`）会被
+> admin 类 RPC（`pair/create`、`device/revoke`、`process/kill`）会被
 > 本地 app-server 正常拒绝——与手机直连时的行为一致
 > （经中继无法执行 admin 操作是 v1 的已知限制）。**`thread/setPermissionMode`（切
-> YOLO）自 2026-10-09 起不在此列**：它按 `control` 放行，故经中继的手机也能切换权限模式。
+> YOLO）自 2026-10-09 起不在此列**：它按 `control` 放行，故经中继的手机也能切换权限模式；
+> **`thread/delete`（删除会话）自 2026-10-11 起同样按 `control` 放行**，手机长按菜单的
+> 「删除」经中继也可用。
 > 合一模式下这条**同样成立**：只有
 > 桌面 stdio（`local`/Admin）能发 admin RPC，手机一律 `control`。
 
@@ -668,7 +670,9 @@ iOS 配对页「扫码」按钮用相机扫后自动配对（文本手输路径�
   客户端（直连 `ws://` 或经中继）一律 `control`，发 admin 类 RPC 会得到 `-32014`。合一
   模式下这条**同样成立**：stdio=`Admin`、中继接入的手机=`Control`，scope 门禁与是否共用
   一个 `serve()` 无关。例外：`thread/setPermissionMode`（切 YOLO）自 2026-10-09 起按
-  `control` 放行，手机也可切换权限模式。`device/revoke` 对**直连的**被撤销设备会即时断开活连接并作废其
+  `control` 放行，手机也可切换权限模式；`thread/delete`（删除会话）自 2026-10-11 起同样
+  按 `control` 放行，手机长按菜单的「删除」也可用（`process/kill`/`pair/create`/`device/revoke`
+  仍严格 admin）。`device/revoke` 对**直连的**被撤销设备会即时断开活连接并作废其
   token；**经中继的手机不适用**——中继只是透传，app-server 侧只看到桥接的单一身份
   （见 §4.4、§七）。
 - **`~/.yi-agent/devices.json` 只存 token 哈希，但请按敏感文件保护**（撤销即删记录）。

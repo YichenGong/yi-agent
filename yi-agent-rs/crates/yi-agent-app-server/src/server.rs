@@ -2328,12 +2328,14 @@ where
                 // 桌面端授权」入口在代码里并不存在,admin-only 使手机端的 YOLO 切换
                 // 结构性不可用。它与 `thread/setModel` 同档:Control 客户端本就能
                 // `turn/start` 并在 YOLO 会话上批准任意工具,单开此门不扩大既有能力面。
-                const ADMIN_METHODS: [&str; 4] = [
-                    "thread/delete",
-                    "process/kill",
-                    "pair/create",
-                    "device/revoke",
-                ];
+                //
+                // 注:`thread/delete` 原在此列,现同样按 `Control` 放行（见下方分支
+                // 内的门禁,2026-10-11 修订）。手机端「长按 = 右键」菜单的「删除」
+                // 对齐桌面右键/悬停删除按钮,admin-only 使它必然 `-32014`、与 YOLO
+                // 同一死路。它属与 `thread/rename` 同级的会话管理,Control 本就能
+                // `thread/start`/`turn/start`,单开此门不扩大既有能力面。`process/kill`
+                // (杀进程)仍严格 admin。
+                const ADMIN_METHODS: [&str; 3] = ["process/kill", "pair/create", "device/revoke"];
                 let client_scope = client_scopes
                     .lock()
                     .await
@@ -4094,6 +4096,17 @@ where
                         }
                     }
                     "thread/delete" => {
+                        // 与 `thread/rename` / `thread/setModel` 同档:Control 起。
+                        // Observe 是掩码级只读视图,不得删除会话。
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
                         let Some(thread_id) =
                             require_thread_id(&hub, &client, &req.params, id.clone()).await?
                         else {
@@ -17990,10 +18003,11 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
-    /// A `Control` client (a paired phone) must not be able to run admin-class
-    /// RPCs; `thread/delete` is the canonical one.
+    /// 手机（`Control`）必须能删除会话：长按菜单的「删除」与重命名/置顶同档，
+    /// 且 `thread/rename` 早已是 `Control` 放行。原先把 `thread/delete` 卡在
+    /// `Admin` 让手机长按菜单的删除项结构性必然报 `-32014`。
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_control_client_cannot_delete_a_thread() {
+    async fn a_control_client_may_delete_a_thread() {
         let mut h = Harness::with_scope(Scope::Control).await;
         let tid = start_thread(&mut h).await;
         h.send(&format!(
@@ -18001,10 +18015,21 @@ pub(crate) mod tests {
         ))
         .await;
         let v = read_response(&mut h, 9).await;
-        assert_eq!(
-            v["error"]["code"], -32014,
-            "admin op from a control client: {v}"
-        );
+        assert!(v["result"].is_object(), "Control 客户端必须能删除会话: {v}");
+        h.shutdown().await;
+    }
+
+    /// 最低档 `Observe` 仍必须被拒：只读客户端不得删除会话。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observe_client_cannot_delete_a_thread() {
+        let mut h = Harness::with_scope(Scope::Observe).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 9).await;
+        assert_eq!(v["error"]["code"], -32014, "Observe 客户端必须被拒: {v}");
         h.shutdown().await;
     }
 
