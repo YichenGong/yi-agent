@@ -110,6 +110,17 @@ describe("phone layout CSS", () => {
     expect(wrapper).not.toMatch(/safe-area-inset-bottom/);
   });
 
+  it("keeps the search box at 16px so iOS cannot auto-zoom on focus", () => {
+    // WKWebView 对字号 < 16px 的输入框会在聚焦时自动放大页面，而 `lockZoom`
+    // 只能禁掉用户的手动捏合缩放，挡不住这条自动放大——放大后页面不再贴合屏幕，
+    // 每次滑动变成两轴平移，正是「缩放之后就需要拖拽」的同一个症状。
+    const rule =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+input\[type="search"\]\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(rule).toMatch(/font-size:\s*16px/);
+  });
+
   it("hugs the drawer so its blank strip cannot swallow the close-tap", () => {
     // 「抽屉打开后有一半空白点不缩回」的根因：包裹层 `.app-sidebar` 是 fixed 的
     // 空盒子，比内层 `aside` 宽出一截（256px vs 82vw≈320px @390pt）。那一截透明

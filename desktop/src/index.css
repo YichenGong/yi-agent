@@ -307,3 +307,11 @@ html[data-mobile="true"] {
     opacity: 0;
   }
 }
+/*
+ * 侧栏搜索框的字号下限：iOS 在聚焦字号 < 16px 的输入框时会自动放大页面，而
+ * `useIsMobile` 的 `lockZoom` 只能禁用用户的手动捏合缩放，挡不住这条自动放大。
+ * 16px 是 iOS 不触发自动放大的下限。桌面端不匹配 `[data-mobile]`，逐字节不变。
+ */
+[data-mobile="true"] .app-sidebar input[type="search"] {
+  font-size: 16px;
+}
