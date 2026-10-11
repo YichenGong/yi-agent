@@ -3525,3 +3525,71 @@ describe("App mobile offline UX", () => {
     expect((box as HTMLTextAreaElement).value).toBe("hello offline");
   });
 });
+
+describe("App mobile reopen keeps the selection", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+
+  const threads = () => [
+    { thread_id: "t1", title: "one", permission_mode: "normal" as const },
+    { thread_id: "t2", title: "two", permission_mode: "normal" as const },
+  ];
+
+  const resumedOn = (client: { requests: { method: string; params: unknown }[] }) =>
+    client.requests
+      .filter((r) => r.method === "thread/resume")
+      .map((r) => (r.params as { threadId: string }).threadId);
+
+  // 模拟一台「切后台后 socket 已被系统掐断」的手机：宿主先报 exited（App 据此清
+  // 掉 warm，新进程的记忆确实是空的），用户仍在看 t2；随后 App 切回前台，前台
+  // 唤醒立刻重建客户端并重放整趟握手。重放里 selectThread 是冷会话（warm 已清），
+  // 于是真的会发 thread/resume —— 修复前它挑的是列表第一条 t1，修复后保持 t2。
+  const foregroundAfterDeadSocket = () => {
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1 });
+    });
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+  };
+
+  it("keeps the current thread across a foreground reconnect (remote)", async () => {
+    asRemote();
+    state.threads = threads();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(resumedOn(clients[0])).toContain("t2"));
+    clients[0].requests.length = 0;
+    foregroundAfterDeadSocket();
+    await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+    await waitFor(() =>
+      expect(clients[clients.length - 1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
+    );
+    // 重连绝不能把选中的会话踢回第一条。
+    const resumed = clients[clients.length - 1].requests
+      .filter((r) => r.method === "thread/resume")
+      .map((r) => (r.params as { threadId: string }).threadId);
+    expect(resumed).not.toContain("t1");
+  });
+
+  it("still selects the first thread on the desktop reconnect (unchanged)", async () => {
+    state.threads = threads();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(resumedOn(clients[0])).toContain("t2"));
+    clients[0].requests.length = 0;
+    foregroundAfterDeadSocket();
+    await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+    await waitFor(() =>
+      expect(clients[clients.length - 1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
+    );
+    // 桌面端重放保留历史行为：每次都回到第一条会话。
+    await waitFor(() =>
+      expect(resumedOn(clients[clients.length - 1])).toContain("t1"),
+    );
+  });
+});

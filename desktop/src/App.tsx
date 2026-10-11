@@ -1175,6 +1175,10 @@ export default function App() {
     // 连续失败次数：第一次断开排 500ms,此后按 1s/2s/4s/8s 翻倍(封顶 10s)。
     // 握手成功即清零,所以偶尔一次闪断不会让下一次重连背负更大的延迟。
     let attempt = 0;
+    // 本挂载会话内已经发起过几次握手。首次握手不是「重放」：即便当前会话是从缓存
+    // 恢复来的，也要由它真正发一次 resume（否则冷启拿不到服务端历史）；此后每次
+    // 重连/切回前台都是重放，手机端在重放里不把选中的会话踢回第一条。
+    let handshakes = 0;
 
     // 断开后的重连入口：清掉可能已在途的定时器,立刻建客户端重试。前台唤醒
     // 用它做即时重连,exited 处理则用 scheduleReconnect 排队。
@@ -1301,6 +1305,7 @@ export default function App() {
 
     // 一次完整握手:任何一次重连都要重放它,因为新进程的记忆是空的。
     const handshake = async (client: RpcClient) => {
+      const replay = handshakes++ > 0;
       try {
         await client.request("initialize", {});
         const settings = await client.request<{
@@ -1346,8 +1351,15 @@ export default function App() {
         if (isRemoteClient()) writeListCache(localStorage, list.groups, list.pinned ?? [], store.currentId);
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
         // 重连重放时（新进程记忆为空）不离开看板：这不是用户切换页面的动作。
-        const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
-        if (first) await selectThread(first.thread_id, { leaveBoard: false });
+        // 手机端：重连（含切回前台）只是重放握手，不是「用户换了页面」，把选中的
+        // 会话踢回第一条会让人丢掉正在看的东西。桌面端保留原行为（每次重放都选
+        // 第一条）；首帧握手（含冷启从缓存恢复选中）也照旧在这里选中，否则那一次
+        // resume 永远不会发出、服务端历史永远合不进来。
+        const restored = replay && isRemoteClient() && currentIdRef.current !== null;
+        if (!restored) {
+          const first = (list.pinned ?? [])[0] ?? list.groups.flatMap((g) => g.threads)[0];
+          if (first) await selectThread(first.thread_id, { leaveBoard: false });
+        }
         // 否则保持空态,等用户选目录新建(设计 §7.2:不再自动在 $HOME 建对话)。
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         attempt = 0;
