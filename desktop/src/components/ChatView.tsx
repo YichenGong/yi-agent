@@ -1,8 +1,9 @@
-import { memo, useEffect, useRef } from "react";
+import { memo, useEffect } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
+import { useStickToBottom } from "../lib/useStickToBottom";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { ToolCallCard } from "./ToolCallCard";
@@ -154,7 +155,7 @@ export function ChatView({
    */
   call?: ImageReadCall;
 }) {
-  const endRef = useRef<HTMLDivElement>(null);
+  const { ref: scrollRef, scrollToBottom } = useStickToBottom();
 
   // `items` is `session.items` — the same array instance for the whole session,
   // mutated in place (push / items[i] = x). React compares deps with Object.is,
@@ -165,12 +166,17 @@ export function ChatView({
   const lastText = lastItem && lastItem.type === "agentMessage" ? lastItem.text : "";
   const effectiveCall = call ?? NO_CALL;
 
+  // 新内容 / 流式文本变化时贴底。`scrollToBottom` 是稳定引用（useCallback []），
+  // 放进依赖数组不会引入额外触发。
   useEffect(() => {
-    endRef.current?.scrollIntoView({ block: "end" });
-  }, [items.length, lastText, error]);
+    scrollToBottom();
+  }, [items.length, lastText, error, scrollToBottom]);
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-3">
+    <div
+      ref={scrollRef}
+      className="flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-3"
+    >
       {items.map((item, index) => (
         // `index` is only a fallback key for defensive unknown-type items; every
         // known item carries a stable protocol `id`.
@@ -194,7 +200,6 @@ export function ChatView({
           {error}
         </div>
       )}
-      <div ref={endRef} />
     </div>
   );
 }

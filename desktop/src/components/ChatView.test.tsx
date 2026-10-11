@@ -27,9 +27,6 @@ vi.mock("../lib/useImageData", () => ({
 
 import { ChatView } from "./ChatView";
 
-// jsdom has no layout, so the auto-scroll effect needs a stub.
-(Element.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = () => {};
-
 afterEach(() => {
   cleanup();
   calls.tool = 0;
