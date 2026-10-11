@@ -3057,7 +3057,7 @@ describe("App 远端图片上传", () => {
   const sendButton = () => screen.getByRole("button", { name: /^send$/i });
 
   /**
-   * 远端（iOS）没有 Tauri dialog：`onPickImages` 会当场造一个 `<input type="file">`
+   * 远端（iOS）没有 Tauri dialog：附件入口会当场造一个 `<input type="file">`
    * 挂进 body、点了它，再在 change 时摘掉。这里等它出现，把选中的 File 塞进 `files`
    * 并派发 change。
    */
