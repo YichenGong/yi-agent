@@ -79,18 +79,18 @@ describe("ThreadSidebar", () => {
     const { container } = renderSidebar({ onRename });
 
     fireEvent.doubleClick(screen.getByText("alpha-thread"));
-    const field = container.querySelector<HTMLInputElement>("input")!;
+    const field = container.querySelector<HTMLInputElement>("[data-rename-input]")!;
     fireEvent.change(field, { target: { value: "中文名" } });
 
     // macOS WKWebView rebuilds the committing keydown after tearing down the
     // composition: isComposing is false by then, keyCode is forced to 229.
     fireEvent.keyDown(field, { key: "Enter", keyCode: 229 });
     expect(onRename).not.toHaveBeenCalled();
-    expect(container.querySelector("input")).not.toBeNull();
+    expect(container.querySelector("[data-rename-input]")).not.toBeNull();
 
     fireEvent.keyDown(field, { key: "Enter" });
     expect(onRename).toHaveBeenCalledWith("1", "中文名");
-    expect(container.querySelector("input")).toBeNull();
+    expect(container.querySelector("[data-rename-input]")).toBeNull();
   });
 
   it("renders each group's basename and its thread rows", () => {
@@ -788,7 +788,7 @@ describe("ThreadSidebar 手机长按", () => {
     await longPress(screen.getByText("alpha-thread"));
     fireEvent.click(screen.getByText("重命名"));
 
-    expect(container.querySelector("input")).not.toBeNull();
+    expect(container.querySelector("[data-rename-input]")).not.toBeNull();
     expect(container.querySelector('[data-thread-menu=""]')).toBeNull();
   });
 
@@ -878,5 +878,102 @@ describe("ThreadSidebar 手机长按", () => {
 
     expect(container.querySelector('[data-thread-menu=""]')).toBeNull();
     expect(container.querySelector('[role="menu"]')).toBeNull();
+  });
+});
+
+describe("ThreadSidebar 搜索", () => {
+  const searchBox = () => screen.getByLabelText("搜索会话") as HTMLInputElement;
+
+  it("搜索栏在 New thread 之后、会话列表之前", () => {
+    const { container } = renderSidebar();
+    const newThread = newThreadTrigger(container);
+    const rows = container.querySelector('[data-group-row]')!;
+    // 4 = DOCUMENT_POSITION_FOLLOWING
+    expect(newThread.compareDocumentPosition(searchBox()) & 4).toBe(4);
+    expect(searchBox().compareDocumentPosition(rows) & 4).toBe(4);
+  });
+
+  it("输入关键词后只留命中的会话与分组", () => {
+    const { container } = renderSidebar();
+    fireEvent.change(searchBox(), { target: { value: "beta" } });
+    expect(container.textContent).toContain("beta-thread");
+    expect(container.textContent).not.toContain("alpha-thread");
+    // alpha 所在的 /work/projA 一行不剩 → 组头一并消失。
+    expect(container.textContent).not.toContain("projA");
+    expect(container.textContent).toContain("projB");
+  });
+
+  it("目录名命中时带出该目录全部会话", () => {
+    const { container } = renderSidebar();
+    fireEvent.change(searchBox(), { target: { value: "projA" } });
+    expect(container.textContent).toContain("alpha-thread");
+    expect(container.textContent).not.toContain("beta-thread");
+  });
+
+  it("无匹配时显示「无匹配会话」", () => {
+    const { container } = renderSidebar();
+    fireEvent.change(searchBox(), { target: { value: "zzz-nothing" } });
+    expect(container.textContent).toContain("无匹配会话");
+  });
+
+  it("列表本身为空且正在搜索时，显示「无匹配会话」而不是「选择一个目录开始」", () => {
+    // 这条锁住空态判据里的 `!searching` 那一半：没有它，一个空列表在搜索时
+    // 会同时冒出「选择一个目录开始」，与「无匹配会话」互相打脸。
+    const { container } = renderSidebar({ groups: [], pinned: [] });
+    expect(container.textContent).toContain("选择一个目录开始");
+
+    fireEvent.change(searchBox(), { target: { value: "anything" } });
+    expect(container.textContent).toContain("无匹配会话");
+    expect(container.textContent).not.toContain("选择一个目录开始");
+  });
+
+  it("折叠的分组在搜索期间自动展开，清空后恢复折叠", () => {
+    const { container } = renderSidebar();
+    // 先折叠 projA（第一个 Collapse 按钮属于它）。
+    fireEvent.click(container.querySelector('[aria-label="Collapse"]')!);
+    expect(container.textContent).not.toContain("alpha-thread");
+
+    fireEvent.change(searchBox(), { target: { value: "alpha" } });
+    expect(container.textContent).toContain("alpha-thread");
+
+    fireEvent.change(searchBox(), { target: { value: "" } });
+    expect(container.textContent).not.toContain("alpha-thread");
+  });
+
+  it("搜索期间隐藏「看板」条目行", () => {
+    const { container } = renderSidebar({ groups: boardGroups, boards: ["/proj"] });
+    expect(container.querySelector('[aria-label="看板"]')).not.toBeNull();
+    fireEvent.change(searchBox(), { target: { value: "proj" } });
+    expect(container.querySelector('[aria-label="看板"]')).toBeNull();
+  });
+
+  it("清除按钮仅在有内容时出现，点击后恢复完整列表", () => {
+    const { container } = renderSidebar();
+    expect(screen.queryByLabelText("清除搜索")).toBeNull();
+
+    fireEvent.change(searchBox(), { target: { value: "beta" } });
+    expect(screen.queryByLabelText("清除搜索")).not.toBeNull();
+    expect(container.textContent).not.toContain("alpha-thread");
+
+    fireEvent.click(screen.getByLabelText("清除搜索"));
+    expect(searchBox().value).toBe("");
+    expect(container.textContent).toContain("alpha-thread");
+    expect(screen.queryByLabelText("清除搜索")).toBeNull();
+  });
+
+  it("Escape 清空查询", () => {
+    const { container } = renderSidebar();
+    fireEvent.change(searchBox(), { target: { value: "beta" } });
+    fireEvent.keyDown(searchBox(), { key: "Escape" });
+    expect(searchBox().value).toBe("");
+    expect(container.textContent).toContain("alpha-thread");
+  });
+
+  it("搜索期间双击会话行，[data-rename-input] 仍指向该行输入框", () => {
+    const { container } = renderSidebar();
+    fireEvent.change(searchBox(), { target: { value: "projA" } });
+    fireEvent.doubleClick(screen.getByText("alpha-thread"));
+    expect(container.querySelector("[data-rename-input]")).not.toBeNull();
+    expect(container.querySelectorAll("[data-rename-input]")).toHaveLength(1);
   });
 });
