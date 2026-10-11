@@ -185,9 +185,9 @@ html[data-mobile="true"] {
 }
 
 /*
- * 宽度与「点击穿透」：`.app-sidebar` 是 `fixed` 的包裹层（见上方抽屉规则），父级
- * 内边距管不到它，所以安全区要自己补；桌面记忆下来的 256px 宽度只写在内层 `aside`
- * 的 `style.width` 上，手机上不再按视口比例取宽——那个 82vw 会与 `aside` 的宽度脱钩。
+ * 宽度与「点击穿透」：`.app-sidebar` 是 `fixed` 的包裹层（见上方抽屉规则）；桌面记忆
+ * 下来的 256px 宽度只写在内层 `aside` 的 `style.width` 上，手机上不再按视口比例取宽
+ * ——那个 82vw 会与 `aside` 的宽度脱钩。
  *
  * 包裹层必须**贴合抽屉本身**（`width: auto` 由内层撑开），否则它会比抽屉宽出一截，
  * 而那一截是**透明的空白**却仍接收点击：背板（`.app-sidebar-backdrop`，z-20）在它
@@ -195,19 +195,23 @@ html[data-mobile="true"] {
  * 子上、永远到不了背板——正是用户报的「一半空白点不缩回」（390pt 上 `aside` 256px、
  * 包裹层却到 320px，那 64px 就是失效区）。`pointer-events: none` 是同一问题的第二道
  * 保险：包裹层的透明区域本就不是可点目标，现在交给下层（背板）。
+ *
+ * 安全区**只在 `aside` 上补一次**（见下方那条），包裹层不再补。两道规则若都在，
+ * `safe-area-inset-top` 会首尾相接叠成两倍：fixed 包裹层从 `top: 0` 起，内层
+ * `aside` 又落进包裹层的内容盒（padding 之内），于是 iPhone 14 Pro 上 59pt 变 118pt，
+ * 「+ New thread」与整个文件夹列表被整体下推，顶出一条谁也点不到的大空白——正是用户
+ * 报的「内容与按钮整体偏下」。
  */
 [data-mobile="true"] .app-sidebar {
   width: auto;
-  padding-top: env(safe-area-inset-top, 0px);
-  padding-bottom: env(safe-area-inset-bottom, 0px);
   overscroll-behavior: contain;
   pointer-events: none;
 }
 /*
- * 安全区落在真正会滚动的元素（`ThreadSidebar` 的 `aside`）上：列表滚动到底时，
- * 最后一行才不会被 Home Indicator 压住。`pointer-events: auto` 收回上面那条
- * 穿透规则——抽屉本体（滚动、长按、行内点击）照常可交互，被穿透的只有包裹层的
- * 透明空白。
+ * 安全区落在真正会滚动的元素（`ThreadSidebar` 的 `aside`）上，且是全链路上**唯一**
+ * 一次：列表滚动到底时最后一行不被 Home Indicator 压住，同时避免与包裹层叠加。
+ * `pointer-events: auto` 收回上面那条穿透规则——抽屉本体（滚动、长按、行内点击）
+ * 照常可交互，被穿透的只有包裹层的透明空白。
  */
 [data-mobile="true"] .app-sidebar aside {
   padding-top: env(safe-area-inset-top, 0px);

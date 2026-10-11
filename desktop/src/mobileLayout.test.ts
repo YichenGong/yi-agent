@@ -86,6 +86,17 @@ describe("phone layout CSS", () => {
     );
   });
 
+  it("applies the drawer safe area exactly once, on the scrolling element", () => {
+    // 包裹层 `.app-sidebar` 与内层 `aside` 都补 `safe-area-inset-top` 时，两条内边距
+    // 首尾相接叠成两倍：fixed 包裹层从 `top: 0` 起，内层 `aside` 又落进包裹层的内容盒
+    // （padding 之内），iPhone 14 Pro 上 59pt 变 118pt，「+ New thread」与整个文件夹
+    // 列表被整体下推，顶出一条点不到的大空白。安全区只允许出现在 `aside` 上。
+    const wrapper =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(wrapper).not.toMatch(/safe-area-inset-top/);
+    expect(wrapper).not.toMatch(/safe-area-inset-bottom/);
+  });
+
   it("hugs the drawer so its blank strip cannot swallow the close-tap", () => {
     // 「抽屉打开后有一半空白点不缩回」的根因：包裹层 `.app-sidebar` 是 fixed 的
     // 空盒子，比内层 `aside` 宽出一截（256px vs 82vw≈320px @390pt）。那一截透明
