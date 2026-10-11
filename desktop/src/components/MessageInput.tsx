@@ -18,8 +18,7 @@ export function MessageInput({
   value,
   onDraftChange,
   attachments,
-  onPickFiles,
-  onPickImages,
+  onPickAttachments,
   onRemoveAttachment,
   threadId = null,
   call,
@@ -48,10 +47,13 @@ export function MessageInput({
    * 知识（`onSend` 返回 true 才代表服务端收下了这一轮）。
    */
   attachments: PendingAttachment[];
-  /** 用户点了回形针：打开文件选择器是父级的事（Tauri dialog 在 App 里）。 */
-  onPickFiles: () => void;
-  /** 用户点了「附加图片」：同上，只是白名单、上限与协议形态都不同。 */
-  onPickImages: () => void;
+  /**
+   * 用户点了回形针：打开文件选择器是父级的事（Tauri dialog 在 App 里）。
+   *
+   * 文档与图片共用一个入口：一次选择里可以混选，分类由父级按扩展名判定（见
+   * `App` 的 `pickAttachments`）。两个白名单互斥，故路径的扩展名足以分流。
+   */
+  onPickAttachments: () => void;
   /** 用户移除了某个 chip；参数是附件的本地路径。 */
   onRemoveAttachment: (path: string) => void;
   /**
@@ -254,25 +256,17 @@ export function MessageInput({
             <button
               type="button"
               // 纯文本标签（仓库不用 emoji）；`aria-label` 与可见文字一致，是测试锚点。
+              //
+              // 文档与图片共用这一个入口：一次选择里可以混选，父级按扩展名分流（两个
+              // 白名单互斥）。合并的是「入口」，不是「预检」——各自的上限与协议形态
+              // 在 App 与发送端照旧。
               aria-label="附加文件"
               title="附加文件"
               className="rounded-md border border-line-strong px-2 py-0.5 text-xs text-fg-muted hover:bg-raised hover:text-fg disabled:opacity-50"
-              onClick={onPickFiles}
+              onClick={onPickAttachments}
               disabled={disabled}
             >
               附加文件
-            </button>
-            <button
-              type="button"
-              // 图片有自己的入口：白名单（`IMAGE_EXTENSIONS`）与上限（20 MB）都与
-              // 文档不同，混在一个选择器里会让用户挑错才被告知。
-              aria-label="附加图片"
-              title="附加图片"
-              className="rounded-md border border-line-strong px-2 py-0.5 text-xs text-fg-muted hover:bg-raised hover:text-fg disabled:opacity-50"
-              onClick={onPickImages}
-              disabled={disabled}
-            >
-              附加图片
             </button>
             <div className="flex items-center gap-2">
               <ModeChip mode={mode} onChange={onModeChange} disabled={mode === null} />

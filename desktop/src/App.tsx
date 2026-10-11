@@ -37,6 +37,7 @@ import {
   imageAttachmentProblem,
   imageSizeProblem,
   IMAGE_EXTENSIONS,
+  pendingKindFromPath,
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
@@ -1408,26 +1409,18 @@ export default function App() {
   };
 
   /**
-   * 一次「原生多选 → 逐个预检 → 入待发列表」的公共骨架。
+   * 附件入口（桌面端）：一次「原生多选 → 逐个预检 → 入待发列表」。
    *
-   * 文档与图片两条路只差三个白名单/上限参数：过滤器的名字、扩展名列表、预检函数，
-   * 外加入列时的 `kind`。此前两者各抄一份 ~90% 相同的代码，任何一处（如失败时
-   * `problems` 的呈现）改动都要同步两遍——抽成一处，行为逐字不变。
+   * 文档与图片**共用一个选择器**：`filters` 给出并集（默认项）与两个收窄项，用户不必
+   * 先判断文件属于哪一类；分类由路径扩展名决定（两个白名单互斥，见
+   * `pendingKindFromPath`），再按类选各自的预检函数（上限不同：文档 50 MB、图片
+   * 20 MB）。发送时的协议形态仍由 `kind` 决定，本入口只负责带对 `kind` 入列。
    *
    * 逐个本地预检：不合格的就地报错（写进会话错误）并丢弃，合格的才进待发列表。
    * 报错与加入互不影响——一次多选里混着好坏文件是常态，不能因为一个坏文件把
    * 整次选择作废。
    */
-  const pickIntoSession = async (spec: {
-    /** 原生对话框里过滤器的显示名（「文档」/「图片」）。 */
-    filterName: string;
-    /** 该入口接受的白名单扩展名。 */
-    extensions: readonly string[];
-    /** 单个路径的本地预检；返回原因字符串表示不可发送。 */
-    problem: (path: string, size: number) => string | null;
-    /** 通过预检后入列的附件类别（决定发送时的协议形态）。 */
-    kind: PendingAttachment["kind"];
-  }): Promise<void> => {
+  const pickIntoSession = async (): Promise<void> => {
     const id = store.currentId;
     if (!id) return;
     // iOS/远端没有原生选择器：桌面端能力，在别处不假装有。远端图片走自己的路
@@ -1437,7 +1430,12 @@ export default function App() {
     const picked = await open({
       directory: false,
       multiple: true,
-      filters: [{ name: spec.filterName, extensions: [...spec.extensions] }],
+      filters: [
+        // 默认项是并集：一次选择里文档与图片都能选。
+        { name: "全部支持的格式", extensions: [...ATTACHMENT_EXTENSIONS, ...IMAGE_EXTENSIONS] },
+        { name: "文档", extensions: [...ATTACHMENT_EXTENSIONS] },
+        { name: "图片", extensions: [...IMAGE_EXTENSIONS] },
+      ],
     });
     // 多选回数组；单选/取消回字符串或 null。统一成数组再处理。
     const paths = Array.isArray(picked) ? picked : picked ? [picked] : [];
@@ -1450,12 +1448,16 @@ export default function App() {
       // 桌面端拿不到 file size（dialog 只给路径）：大小交给服务端权威校验，
       // 这里只做扩展名预检——传 size=0 意为"未知"，不会误判为超限，避免把
       // 注定被拒的类型发出去。
-      const problem = spec.problem(p, 0);
+      //
+      // 分类先于预检：扩展名决定走哪套白名单/上限。文档与图片的白名单互斥，
+      // 故一个路径只会落到其中一支。
+      const kind = pendingKindFromPath(p);
+      const problem = kind === "image" ? imageAttachmentProblem(p, 0) : attachmentProblem(p, 0);
       if (problem) {
         problems.push(`${name}：${problem}`);
         continue;
       }
-      accepted.push({ path: p, name, size: 0, kind: spec.kind });
+      accepted.push({ path: p, name, size: 0, kind });
     }
     if (accepted.length > 0) {
       setPending((prev) => ({ ...prev, [id]: [...(prev[id] ?? []), ...accepted] }));
@@ -1467,36 +1469,11 @@ export default function App() {
   };
 
   /**
-   * 打开原生多选文件对话框，把选中的**文档**加入当前会话的待发附件。
-   *
-   * 图片走自己的按钮（`pickImagesToAttach`）：两个白名单互不重叠，各自的对象存储形态
-   * 也不同，分开入口，用户才不会挑错之后才被告知。
+   * 附件入口：桌面端打开一次原生多选（文档与图片混选，按扩展名分流）；远端
+   * （iOS）没有共享文件系统，回落为图片专用选择器（那里本就不支持文档附件）。
    */
-  const pickFilesToAttach = (): Promise<void> =>
-    pickIntoSession({
-      filterName: "文档",
-      extensions: ATTACHMENT_EXTENSIONS,
-      problem: attachmentProblem,
-      kind: "document",
-    });
-
-  /**
-   * 打开原生多选图片对话框，把选中的图片加入当前会话的待发附件。
-   *
-   * 与 `pickFilesToAttach` 同形（共用 `pickIntoSession`），但用图片自己的白名单与
-   * 上限：图片不进 `read_document` 清单，走的是内容块，服务端会把它摄取成模型直接
-   * 可见的图片。远端（iOS）没有共享文件系统，走自己的上传路径
-   * （`pickImagesOnRemote`）。
-   */
-  const pickImagesToAttach = (): Promise<void> =>
-    isRemoteClient()
-      ? pickImagesOnRemote()
-      : pickIntoSession({
-          filterName: "图片",
-          extensions: IMAGE_EXTENSIONS,
-          problem: imageAttachmentProblem,
-          kind: "image",
-        });
+  const pickAttachments = (): Promise<void> =>
+    isRemoteClient() ? pickImagesOnRemote() : pickIntoSession();
 
   /**
    * 远端（iOS）的图片选择器：webview 自带的 `<input type="file">`。
@@ -1865,8 +1842,7 @@ export default function App() {
                 onDraftChange={changeDraft}
                 // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
                 attachments={currentId ? (pending[currentId] ?? []) : []}
-                onPickFiles={() => void pickFilesToAttach()}
-                onPickImages={() => void pickImagesToAttach()}
+                onPickAttachments={() => void pickAttachments()}
                 onRemoveAttachment={removePendingAttachment}
                 threadId={currentId}
                 // 稳定的 `imageCall`（见上）：待发图片 chip 的缩略图也经它读取，
