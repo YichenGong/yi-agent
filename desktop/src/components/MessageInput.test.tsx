@@ -525,4 +525,80 @@ describe("MessageInput", () => {
       expect(textarea.value).toBe("/he");
     });
   });
+
+  describe("mobile composer", () => {
+    // 手机软键盘的回车恒为 shiftKey=false，且 jsdom 不实现 textarea 的默认
+    // 编辑行为（不会真的插入 \n），所以「换行」只能断成「未触发任何动作」。
+    it("does not send on Enter (Enter is for newline, tap Send to send)", () => {
+      const onSend = vi.fn(async () => true);
+      const onInterrupt = vi.fn();
+      renderInput({ isMobile: true, onSend, onInterrupt });
+
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "line one" } });
+
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSend).not.toHaveBeenCalled();
+      expect(onInterrupt).not.toHaveBeenCalled();
+    });
+
+    it("still sends from the Send button", () => {
+      const onSend = vi.fn(async () => true);
+      renderInput({ isMobile: true, onSend });
+
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "hello" } });
+      fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+      expect(onSend).toHaveBeenCalledWith("hello");
+    });
+
+    it("runs a slash command from the Send button (the Enter entry is gone)", () => {
+      const onSend = vi.fn(async () => true);
+      const onSlashCommand = vi.fn();
+      renderInput({ isMobile: true, onSend, onSlashCommand });
+
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/cost" } });
+      fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+      expect(onSlashCommand).toHaveBeenCalledWith("cost", null);
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("keeps a bare-slash Send inert, like the desktop Enter", () => {
+      // 弹窗默认高亮是破坏性的 `/clear`；裸 `/` 尚未选定命令，Send 必须什么都不做。
+      const onSend = vi.fn(async () => true);
+      const onSlashCommand = vi.fn();
+      renderInput({ isMobile: true, onSend, onSlashCommand });
+
+      const textarea = screen.getByRole("textbox");
+      fireEvent.change(textarea, { target: { value: "/" } });
+      fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+      expect(onSlashCommand).not.toHaveBeenCalled();
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("shows a hint without Shift+Enter", () => {
+      renderInput({ isMobile: true });
+      const textarea = screen.getByRole("textbox");
+      expect(textarea.getAttribute("placeholder")).toContain("tap Send");
+      expect(textarea.getAttribute("placeholder")).not.toContain("Shift");
+    });
+
+    it("keeps the desktop hint and Enter-to-send for the desktop build", () => {
+      // 对照：默认（不传 isMobile）仍是桌面语义，逐字节不变。
+      const onSend = vi.fn(async () => true);
+      renderInput({ onSend });
+      const textarea = screen.getByRole("textbox");
+      expect(textarea.getAttribute("placeholder")).toBe(
+        "Type a message… (Enter to send, Shift+Enter for newline)",
+      );
+
+      fireEvent.change(textarea, { target: { value: "hi" } });
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onSend).toHaveBeenCalledWith("hi");
+    });
+  });
 });

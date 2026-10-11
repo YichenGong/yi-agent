@@ -19,6 +19,7 @@ export function MessageInput({
   onDraftChange,
   attachments,
   onPickAttachments,
+  isMobile = false,
   onRemoveAttachment,
   threadId = null,
   call,
@@ -54,6 +55,12 @@ export function MessageInput({
    * `App` 的 `pickAttachments`）。两个白名单互斥，故路径的扩展名足以分流。
    */
   onPickAttachments: () => void;
+  /**
+   * 手机端（配对 iPhone / iOS webview）：软键盘没有 Shift 键，回车恒为
+   * `shiftKey === false`。此时把回车让给「换行」，发送与命令执行收敛到 Send 按钮；
+   * 桌面端为 `false`，行为与文案逐字节不变。
+   */
+  isMobile?: boolean;
   /** 用户移除了某个 chip；参数是附件的本地路径。 */
   onRemoveAttachment: (path: string) => void;
   /**
@@ -120,6 +127,23 @@ export function MessageInput({
     onSlashCommand(name, args);
     onDraftChange("");
     setPopupOpen(false);
+  };
+
+  /**
+   * Send 按钮的点击处理。
+   *
+   * 桌面端就是 `handleSend`。手机端回车已让给换行，命令（`/cost` 等）的入口必须补
+   * 到 Send 上：草稿解析为命令就先执行它。裸 `/`（`parsed.kind === "none"` 但弹窗
+   * 开着）按桌面端回车的既有语义处理为 inert——弹窗默认高亮是破坏性的 `/clear`，
+   * 未经用户选择不得执行。
+   */
+  const handleSendClick = () => {
+    if (isMobile && parsed.kind === "command") {
+      runSlash(parsed.name, parsed.args);
+      return;
+    }
+    if (isMobile && showPopup && options.length > 0) return;
+    void handleSend();
   };
 
   // 「没什么可发」时按钮就该是灰的，而不是点了没反应：文字与附件都是空时才算空；
@@ -195,7 +219,7 @@ export function MessageInput({
                   setPopupOpen(false);
                   return;
                 }
-                if (e.key === "Enter" && !e.shiftKey) {
+                if (e.key === "Enter" && !e.shiftKey && !isMobile) {
                   e.preventDefault();
                   // A bare "/" names no command (`parseSlashInput("/")` is
                   // `{ kind: "none" }`), yet the popup is offered for it and its
@@ -222,7 +246,7 @@ export function MessageInput({
                 setPopupOpen(false);
                 return;
               }
-              if (e.key === "Enter" && !e.shiftKey) {
+              if (e.key === "Enter" && !e.shiftKey && !isMobile) {
                 // Confirming a candidate with Enter is the IME's key, not the user's:
                 // let the composition land in the box and wait for the next Enter.
                 e.preventDefault();
@@ -244,7 +268,11 @@ export function MessageInput({
             }}
             disabled={disabled || sending || turnActive}
             rows={3}
-            placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+            placeholder={
+              isMobile
+                ? "Type a message… (Enter for newline, tap Send to send)"
+                : "Type a message… (Enter to send, Shift+Enter for newline)"
+            }
             // 无边框、透明底的文本区：边框与聚焦指示都归卡片（见上）。卡片内是竖排，
             // 故 textarea 直接占满整行；宽度由 `w-full` 决定，不再需要 `flex-1` / `max-md:*`。
             className="min-w-0 w-full resize-none bg-transparent px-3 pt-2 text-sm text-fg placeholder:text-fg-faint focus:outline-none disabled:opacity-50"
@@ -273,7 +301,7 @@ export function MessageInput({
               {modelPicker}
               <button
                 type="button"
-                onClick={turnActive ? onInterrupt : () => void handleSend()}
+                onClick={turnActive ? onInterrupt : handleSendClick}
                 disabled={sendDisabled}
                 className={
                   turnActive
