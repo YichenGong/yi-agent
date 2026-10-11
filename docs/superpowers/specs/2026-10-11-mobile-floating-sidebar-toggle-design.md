@@ -1,7 +1,7 @@
 # 手机端：去掉左侧菜单竖条，改为浮动菜单按钮 — 设计
 
 日期：2026-10-11
-状态：设计已确认（方案 A），待转实现计划
+状态：已实现（方案 A），待合并
 分支：`feat/mobile-floating-sidebar-toggle`
 范围：仅前端 `desktop/`（`App.tsx`、`index.css`、两条测试）
 
