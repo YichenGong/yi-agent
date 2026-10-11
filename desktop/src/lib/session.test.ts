@@ -531,4 +531,75 @@ describe("Session", () => {
       expect(s.items[0].id).toBe("user-t1");
     });
   });
+
+  describe("Session replay reconciliation", () => {
+    const serverItem = (id: string, text: string) => ({
+      method: "item/completed",
+      params: { item: { type: "agentMessage", id, text } },
+    });
+
+    it("collects server ids during a replay and drops non-replayed ones", () => {
+      const s = new Session();
+      // Prime the session with a stale cache: A, B, C plus a local echo + a notice.
+      s.upsertItems([
+        { type: "agentMessage", id: "A", text: "a" },
+        { type: "agentMessage", id: "B", text: "b" },
+        { type: "agentMessage", id: "C", text: "c" },
+      ]);
+      s.notice("cmd");
+      s.addUserMessage("hello");
+      const notices = s.items.filter((i) => i.type === "notice");
+      const localEchoes = s.items.filter((i) => i.id.startsWith("local-") && i.type === "userMessage");
+
+      s.beginReplay();
+      s.apply(serverItem("A", "a") as never);
+      s.apply(serverItem("C", "c") as never);
+      const ids = s.endReplay();
+      expect(ids).toEqual(new Set(["A", "C"]));
+
+      s.dropStale(ids!);
+      expect(s.items.filter((i) => i.type !== "notice" && !i.id.startsWith("local-")).map((i) => i.id))
+        .toEqual(["A", "C"]);
+      // Local echoes and notices survive reconciliation.
+      expect(s.items.filter((i) => i.type === "notice")).toHaveLength(notices.length);
+      expect(s.items.filter((i) => i.id.startsWith("local-") && i.type === "userMessage"))
+        .toHaveLength(localEchoes.length);
+    });
+
+    it("endReplay is null when no replay was started, and dropStale drops a server item absent from the replay", () => {
+      const s = new Session();
+      s.upsertItems([{ type: "agentMessage", id: "A", text: "a" }]);
+      expect(s.endReplay()).toBeNull();
+      // An empty replay set cannot be a no-op: `dropStale` is only ever reached
+      // with the completed set after a *successful* full replay, and a cached
+      // server item the server did not re-send is a ghost. The sibling test
+      // "clears lastServerItemId when nothing server-authored survives" pins the
+      // same rule for the cursor, so the two cannot disagree here.
+      s.dropStale(new Set());
+      expect(s.items.map((i) => i.id)).toEqual([]);
+    });
+
+    it("does not collect ids outside a replay", () => {
+      const s = new Session();
+      s.apply(serverItem("X", "x") as never);
+      expect(s.endReplay()).toBeNull();
+    });
+
+    it("recomputes lastServerItemId from the surviving items", () => {
+      const s = new Session();
+      s.upsertItems([
+        { type: "agentMessage", id: "A", text: "a" },
+        { type: "agentMessage", id: "B", text: "b" },
+      ]);
+      s.dropStale(new Set(["A"]));
+      expect(s.lastServerItemId).toBe("A");
+    });
+
+    it("clears lastServerItemId when nothing server-authored survives", () => {
+      const s = new Session();
+      s.upsertItems([{ type: "agentMessage", id: "B", text: "b" }]);
+      s.dropStale(new Set());
+      expect(s.lastServerItemId).toBeNull();
+    });
+  });
 });
