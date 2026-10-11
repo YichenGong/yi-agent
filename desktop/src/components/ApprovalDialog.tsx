@@ -54,17 +54,17 @@ export function ApprovalDialog({
   const blacklisted = kind !== "Normal" ? kind.Blacklisted : null;
 
   return (
-    <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+    <div className="absolute inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/60 p-4 backdrop-blur-sm">
       <div
         role="dialog"
         aria-labelledby={headingId}
-        className="w-full max-w-lg rounded-lg border border-line-strong bg-panel p-4 shadow-xl"
+        className="my-auto flex max-h-full w-full max-w-lg flex-col overflow-y-auto rounded-lg border border-line-strong bg-panel p-4 shadow-xl"
       >
-        <h2 id={headingId} className="mb-2 text-sm font-semibold text-fg">
+        <h2 id={headingId} className="mb-2 shrink-0 text-sm font-semibold text-fg">
           Approve tool call: <span className="font-mono">{tool_name}</span>
         </h2>
 
-        <div className="mb-2 text-xs">
+        <div className="mb-2 shrink-0 text-xs">
           {blacklisted !== null ? (
             <span className="font-medium text-red-400">Blacklisted: {blacklisted}</span>
           ) : (
@@ -73,7 +73,7 @@ export function ApprovalDialog({
         </div>
 
         {prefix_suggestion !== null && (
-          <div className="mb-2 text-xs text-fg-muted">
+          <div className="mb-2 shrink-0 break-all text-xs text-fg-muted">
             Prefix:{" "}
             <code className="rounded bg-surface px-1 font-mono text-fg">
               {prefix_suggestion}
@@ -81,17 +81,17 @@ export function ApprovalDialog({
           </div>
         )}
 
-        <pre className="mb-4 max-h-64 overflow-auto rounded bg-surface p-2 font-mono text-xs whitespace-pre-wrap text-fg-muted">
+        <pre className="mb-4 min-h-24 max-h-64 overflow-auto rounded bg-surface p-2 font-mono text-xs whitespace-pre-wrap text-fg-muted">
           {JSON.stringify(tool_input, null, 2)}
         </pre>
 
-        <div className="flex justify-end gap-2">
+        <div className="flex shrink-0 flex-wrap justify-end gap-2 max-md:flex-col">
           <button
             ref={denyRef}
             type="button"
             disabled={submitted}
             onClick={() => decide({ decision: "deny" })}
-            className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised disabled:opacity-50"
+            className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised disabled:opacity-50 max-md:w-full"
           >
             Deny
           </button>
@@ -99,7 +99,7 @@ export function ApprovalDialog({
             type="button"
             disabled={submitted}
             onClick={() => decide({ decision: "allow_once" })}
-            className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50"
+            className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-500 disabled:opacity-50 max-md:w-full"
           >
             Allow once
           </button>
@@ -107,7 +107,7 @@ export function ApprovalDialog({
             type="button"
             disabled={submitted}
             onClick={() => decide({ decision: "always_allow_tool" })}
-            className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised disabled:opacity-50"
+            className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised disabled:opacity-50 max-md:w-full"
           >
             Always allow tool
           </button>
@@ -118,7 +118,7 @@ export function ApprovalDialog({
               onClick={() =>
                 decide({ decision: "always_allow_prefix", prefix: prefix_suggestion })
               }
-              className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised disabled:opacity-50"
+              className="rounded-md border border-line-strong px-3 py-1.5 text-sm break-all text-fg hover:bg-raised disabled:opacity-50 max-md:w-full"
             >
               Always allow <span className="font-mono">{prefix_suggestion}</span>
             </button>
