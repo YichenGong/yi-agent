@@ -6,19 +6,7 @@ import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/si
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
 import { resolveSidebarPressTarget } from "../lib/sidebarPress";
-
-/** Compact relative time, e.g. "3m", "2h", "5d". */
-function relativeTime(ms: number): string {
-  const diff = Date.now() - ms;
-  const sec = Math.floor(diff / 1000);
-  if (sec < 60) return "now";
-  const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}m`;
-  const hour = Math.floor(min / 60);
-  if (hour < 24) return `${hour}h`;
-  const day = Math.floor(hour / 24);
-  return `${day}d`;
-}
+import { formatRelativeTime } from "../lib/relativeTime";
 
 function unreadDotClass(status: TurnStatus): string {
   if (status === "failed") return "bg-red-400";
@@ -448,7 +436,7 @@ export function ThreadSidebar({
                   {t.title ?? "(untitled)"}
                 </div>
               </div>
-              <div className="text-xs text-fg-faint">{relativeTime(t.updated_at)}</div>
+              <div className="text-xs text-fg-faint">{formatRelativeTime(t.updated_at)}</div>
             </div>
             {un && !active && (
               <span
