@@ -84,7 +84,10 @@ export function useStickToBottom(): StickToBottom {
         frameRef.current = requestAnimationFrame(() => {
           frameRef.current = null;
           const node = ref.current;
-          if (node) node.scrollTop = node.scrollHeight;
+          // 在**执行时**重读「是否贴底」：这次回调可能比「用户在这一帧上翻」晚。
+          // 若把判断冻结在 resize 回调那一刻，键盘收起 / `dvh` 动画期间
+          // 「高度变化 + 用户上滚」同帧发生时，延后的贴底仍会把正在翻历史的用户拽回底部。
+          if (node && atBottomRef.current) node.scrollTop = node.scrollHeight;
         });
       });
       observer.observe(el);

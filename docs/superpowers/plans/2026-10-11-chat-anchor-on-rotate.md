@@ -46,7 +46,7 @@
 
   注：spec §4.1 里画的是泛型 `<T extends HTMLElement>`；本计划收窄为 `HTMLDivElement`（唯一消费者是一个 `<div>`，YAGNI）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `desktop/src/lib/useStickToBottom.test.ts`（`.ts` 非 `.tsx`，故用 `createElement`，与 `lib/useLongPress.test.ts` 同构）：
 
@@ -238,12 +238,12 @@ describe("useStickToBottom", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认它失败**
+- [x] **Step 2: 跑测试确认它失败**
 
 Run: `cd desktop && npx vitest run src/lib/useStickToBottom.test.ts`
 Expected: FAIL —— 模块 `./useStickToBottom` 不存在（`Failed to resolve import` / `Cannot find module`）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 创建 `desktop/src/lib/useStickToBottom.ts`：
 
@@ -354,17 +354,17 @@ export function useStickToBottom(): StickToBottom {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/useStickToBottom.test.ts`
 Expected: PASS（10 个用例：`isAtBottom` 4 + `useStickToBottom` 6）。
 
-- [ ] **Step 5: 类型检查**
+- [x] **Step 5: 类型检查**
 
 Run: `cd desktop && npx tsc --noEmit`
 Expected: 无错误。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add desktop/src/lib/useStickToBottom.ts desktop/src/lib/useStickToBottom.test.ts
@@ -384,7 +384,7 @@ git commit -m "feat(desktop): add useStickToBottom for viewport-change re-pinnin
 - Consumes: `useStickToBottom(): { ref: RefObject<HTMLDivElement | null>; scrollToBottom: () => void }`（Task 1 产出）。
 - Produces: 无对外新接口；纯内部接线。
 
-- [ ] **Step 1: 改 import（第 1 行）**
+- [x] **Step 1: 改 import（第 1 行）**
 
 把
 
@@ -400,7 +400,7 @@ import { memo, useEffect } from "react";
 
 （`noUnusedLocals` 生效：`endRef` 移除后 `useRef` 不再使用，留着会让 `tsc` 报错。）
 
-- [ ] **Step 2: 新增 hook 调用，替换 `endRef`（第 157 行附近）**
+- [x] **Step 2: 新增 hook 调用，替换 `endRef`（第 157 行附近）**
 
 把
 
@@ -420,7 +420,7 @@ import { memo, useEffect } from "react";
 import { useStickToBottom } from "../lib/useStickToBottom";
 ```
 
-- [ ] **Step 3: 改贴底 effect（第 168-170 行）**
+- [x] **Step 3: 改贴底 effect（第 168-170 行）**
 
 把
 
@@ -442,7 +442,7 @@ import { useStickToBottom } from "../lib/useStickToBottom";
 
 保留上方那段关于「依赖 `items.length`/`lastText` 而非 `items`」的注释不动。
 
-- [ ] **Step 4: 把 ref 挂到滚动容器（第 173 行）**
+- [x] **Step 4: 把 ref 挂到滚动容器（第 173 行）**
 
 把
 
@@ -461,7 +461,7 @@ import { useStickToBottom } from "../lib/useStickToBottom";
 
 **类名逐字符不变**（既有测试断言 `overflow-y-auto`/`overflow-x-hidden`/`min-w-0`，且界面外观不变）。
 
-- [ ] **Step 5: 删除末尾贴底锚点（第 197 行）**
+- [x] **Step 5: 删除末尾贴底锚点（第 197 行）**
 
 删除
 
@@ -471,7 +471,7 @@ import { useStickToBottom } from "../lib/useStickToBottom";
 
 （`scrollTop = scrollHeight` 已不需要 DOM 锚点；此处被 `error` 区块之后紧邻的收起标签包围，只删这一行。）
 
-- [ ] **Step 6: 移除 `ChatView.test.tsx` 里已无用的打桩**
+- [x] **Step 6: 移除 `ChatView.test.tsx` 里已无用的打桩**
 
 删除 `desktop/src/components/ChatView.test.tsx` 第 31 行及其上方注释：
 
@@ -482,17 +482,17 @@ import { useStickToBottom } from "../lib/useStickToBottom";
 
 理由：实现已不再调用 `scrollIntoView`；保留一个无人使用的原型打桩是死代码。删掉它同时是**验收信号**——若还有任何代码路径调用 `scrollIntoView`，本文件的测试会立刻抛错。
 
-- [ ] **Step 7: 跑 ChatView 测试确认全绿**
+- [x] **Step 7: 跑 ChatView 测试确认全绿**
 
 Run: `cd desktop && npx vitest run src/components/ChatView.test.tsx`
 Expected: PASS（含 `keeps the streamed text visible` 与横向溢出裁剪那条；无 `scrollIntoView` 报错）。
 
-- [ ] **Step 8: 全量类型检查 + 全量测试**
+- [x] **Step 8: 全量类型检查 + 全量测试**
 
 Run: `cd desktop && npx tsc --noEmit && npx vitest run`
 Expected: 无类型错误；全部测试通过。
 
-- [ ] **Step 9: 登记 bug-list**
+- [x] **Step 9: 登记 bug-list**
 
 在 `docs/bug-list.md` 的已修复区（`[x]` 条目区，紧随其它 `[x]` 行）新增一条，格式对齐现有条目：
 
@@ -500,7 +500,7 @@ Expected: 无类型错误；全部测试通过。
 - [x] 手机 APP 从竖向转到横向、再转回竖向后，会话内容大幅偏移（根因：**贴底 effect 依赖与旋转无关，且前端无任何视口变化监听**。`ChatView` 是会话唯一的滚动容器，其自动贴底只挂在 `[items.length, lastText, error]` 上（`desktop/src/components/ChatView.tsx:168`），旋转三者皆不变，effect 不重跑；全前端亦无 `orientationchange`/`resize`/`visualViewport` 监听。旋转时容器 `clientHeight` 795→341→795，而浏览器保留的是**绝对像素** `scrollTop`，于是转回竖向后被推离底部。Chrome/Firefox 有 scroll anchoring 会自动粘住位置，**Safari/WKWebView 不实现**，故仅 iOS 客户端暴露。修复：新增 `desktop/src/lib/useStickToBottom.ts`——用容器自身 `ResizeObserver` 感知高度变化、用 `scroll` 事件维护「变化前是否贴底」，原本贴底则于下一帧重新贴底，原本在翻历史则不动；`ChatView` 改用它贴底并移除 `endRef`/`scrollIntoView`。验证：`cd desktop && npx vitest run src/lib/useStickToBottom.test.ts src/components/ChatView.test.tsx`、`npx tsc --noEmit && npx vitest run`；真实引擎（无头 Chrome + 真实 `dist` CSS + 同构 DOM + 关 scroll anchoring）实测：竖（贴底 scrollTop 12989）→横→竖由「停在 8643、偏离 4346px」变为「回到 12989、重新贴底」。见 [设计](superpowers/specs/2026-10-11-chat-anchor-on-rotate-design.md)）
 ```
 
-- [ ] **Step 10: 提交**
+- [x] **Step 10: 提交**
 
 ```bash
 git add desktop/src/components/ChatView.tsx desktop/src/components/ChatView.test.tsx docs/bug-list.md
