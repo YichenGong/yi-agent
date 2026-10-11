@@ -71,6 +71,21 @@ const { clients, state } = vi.hoisted(() => ({
   },
 }));
 
+// 内容缓存模块级替换：每个用例一份内存实现。App 在首次远端渲染时才懒建，故用
+// `??=` 记录「本次用例创建的那个」，用例既可读它、也可在 `beforeEach` 里清空
+// 后由用例自己塞一份预置内容（见 "App mobile local cache"）。
+const { contentStore } = vi.hoisted(() => ({
+  contentStore: { current: null as null | import("./lib/contentStore").AsyncContentStore },
+}));
+vi.mock("./lib/contentStore", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lib/contentStore")>();
+  return {
+    ...actual,
+    // One instance per test: the App grabs it lazily on first remote render.
+    createContentStore: () => (contentStore.current ??= new actual.MemoryContentStore()),
+  };
+});
+
 // The board panel's enqueue control opens the native picker twice. Stub it at
 // the module boundary the component imports lazily.
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -222,6 +237,7 @@ vi.mock("./lib/platform", async (importOriginal) => {
 });
 
 import App from "./App";
+import { MemoryContentStore } from "./lib/contentStore";
 import { nextReconnectDelay } from "./lib/reconnect";
 
 // jsdom 没有 `URL.createObjectURL`，而待发图片的 chip 会经 `AttachmentThumb` →
@@ -251,6 +267,7 @@ beforeEach(() => {
   state.hostError = {};
   state.dataSources = {};
   state.platformUa = "";
+  contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
   delete document.documentElement.dataset.theme;
@@ -3283,5 +3300,170 @@ describe("App 输入框提示按平台分流", () => {
     await waitFor(() => {
       expect(textarea.getAttribute("placeholder")).toContain("Shift+Enter");
     });
+  });
+});
+
+// 手机端本地缓存：冷启首屏即有列表与内容，连上后由服务端覆盖。
+describe("App mobile local cache", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+
+  /** Defer `thread/listAll` until the returned resolver is called. */
+  const stallList = () => {
+    let release!: () => void;
+    state.dataSources["thread/listAll"] = () =>
+      new Promise((resolve) => {
+        release = () =>
+          resolve({
+            groups: [
+              {
+                workspace: "/w",
+                exists: true,
+                threads: [
+                  {
+                    thread_id: "srv1", cwd: "/w", model: "m", created_at: 0, updated_at: 0,
+                    title: "server-only", permission_mode: "normal", status: "idle",
+                  },
+                ],
+              },
+            ],
+            pinned: [],
+          });
+      });
+    return () => release();
+  };
+
+  const seedListCache = (threads: { thread_id: string; title: string }[], selectedId: string | null) =>
+    localStorage.setItem(
+      "yi-agent.threadListCache",
+      JSON.stringify({
+        version: 1,
+        savedAt: Date.now(),
+        selectedId,
+        pinned: [],
+        groups: [
+          {
+            workspace: "/w",
+            exists: true,
+            threads: threads.map((t) => ({
+              thread_id: t.thread_id, cwd: "/w", model: "m", created_at: 0, updated_at: 0,
+              title: t.title, permission_mode: "normal", status: "idle",
+            })),
+          },
+        ],
+      }),
+    );
+
+  it("paints the cached list before thread/listAll resolves", async () => {
+    asRemote();
+    seedListCache([{ thread_id: "t1", title: "cached-one" }], null);
+    const release = stallList();
+    render(<App />);
+    // 缓存列表已在屏上，而服务端列表仍被扣着。
+    expect(screen.getByText("cached-one")).toBeTruthy();
+    // `thread/listAll` 是异步发出的（在 initialize → ui/settings/read →
+    // workspace/list 之后），所以扣住它的 resolver 只有在请求真的上了线才存在：
+    // 先等这条请求出现，再放行，让服务端列表覆盖缓存。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/listAll")).toBe(true),
+    );
+    release();
+    await waitFor(() => expect(screen.getByText("server-only")).toBeTruthy());
+  });
+
+  it("restores the cached selected thread instead of the first server thread", async () => {
+    asRemote();
+    seedListCache([{ thread_id: "t1", title: "cached-one" }], "t1");
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const resumed = clients[0].requests
+      .filter((r) => r.method === "thread/resume")
+      .map((r) => (r.params as { threadId: string }).threadId);
+    expect(resumed).toEqual(["t1"]);
+  });
+
+  it("prefills cached content, then the server replay replaces it in place", async () => {
+    asRemote();
+    seedListCache([{ thread_id: "t1", title: "one" }], "t1");
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "A",
+      items: [{ type: "agentMessage", id: "A", text: "cached text" }], trimmed: false, bytes: 11,
+    });
+    // The server replays a *different* item for the same thread.
+    state.dataSources["thread/resume"] = () => ({ thread_id: "t1", cwd: "/w", model: "m", permission_mode: "normal" });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("cached text")).toBeTruthy());
+    // The test double's resume carries no replay frames, so the reconcile guard
+    // treats the empty set as "nothing to reconcile" and leaves the prefill in
+    // place (on the real path the guard is a no-op too, since every replay carries
+    // at least thread/started). The server's authoritative item then replaces the
+    // cached one in place by id.
+    act(() => {
+      for (const h of state.notifHandlers)
+        h({ method: "item/completed", params: { thread_id: "t1", item: { type: "agentMessage", id: "A", text: "server text" } } });
+    });
+    await waitFor(() => expect(screen.getByText("server text")).toBeTruthy());
+    expect(screen.queryByText("cached text")).toBeNull();
+  });
+
+  it("drops a cached item the server no longer has after a full replay", async () => {
+    asRemote();
+    seedListCache([{ thread_id: "t1", title: "one" }], "t1");
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "B",
+      items: [
+        { type: "agentMessage", id: "A", text: "keep me" },
+        { type: "agentMessage", id: "B", text: "ghost" },
+      ], trimmed: false, bytes: 20,
+    });
+    // Resume replays only A; B is gone server-side. Resume is stalled so the
+    // replay can be delivered live, mirroring the production ordering: on the
+    // real ws path the replay frames (thread/started + items/completed) are
+    // enqueued BEFORE the resume response, so every id is collected by the time
+    // `endReplay()` runs. The test double resolves `thread/resume` synchronously
+    // (it cannot emit frames), so we hold it open and push the frame ourselves —
+    // otherwise `endReplay()` would see an empty set, which per the production
+    // guard is NOT treated as "server has no items" (see the test above, where
+    // empty-replay must not wipe the prefill).
+    let releaseResume!: () => void;
+    state.dataSources["thread/resume"] = () =>
+      new Promise((resolve) => {
+        releaseResume = () =>
+          resolve({ thread_id: "t1", cwd: "/w", model: "m", permission_mode: "normal" });
+      });
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("ghost")).toBeTruthy());
+    // A arrives live while the resume is still in flight → collected for reconcile.
+    act(() => {
+      for (const h of state.notifHandlers)
+        h({ method: "item/completed", params: { thread_id: "t1", item: { type: "agentMessage", id: "A", text: "keep me" } } });
+    });
+    await waitFor(() => expect(screen.getByText("keep me")).toBeTruthy());
+    // Now the resume settles: dropStale({"A"}) removes the ghost, keeps A.
+    act(() => releaseResume());
+    await waitFor(() => expect(screen.queryByText("ghost")).toBeNull());
+    expect(screen.getByText("keep me")).toBeTruthy();
+  });
+
+  it("never touches the list/content caches on the desktop build", async () => {
+    localStorage.setItem("yi-agent.threadListCache", JSON.stringify({
+      version: 1, savedAt: 1, selectedId: "t1", pinned: [],
+      groups: [{ workspace: "/w", exists: true, threads: [{ thread_id: "t1", cwd: "/w", model: "m", created_at: 0, updated_at: 0, title: "cached-one", permission_mode: "normal", status: "idle" }] }],
+    }));
+    contentStore.current = null;
+    render(<App />); // no relay binding → desktop
+    // The desktop build must not have painted from the cache…
+    expect(screen.queryByText("cached-one")).toBeNull();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy()); // server list
+    // …and must not have constructed a content store.
+    expect(contentStore.current).toBeNull();
   });
 });
