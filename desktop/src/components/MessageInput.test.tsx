@@ -224,12 +224,33 @@ describe("MessageInput", () => {
     const toolbar = column.querySelector('[data-composer-toolbar]') as HTMLElement;
     expect(toolbar).toBeTruthy();
     expect(toolbar.className).toContain("justify-between");
-    // 窄屏：右组换行后仍贴右。
+    // 窄屏：工具栏允许换行。
     expect(toolbar.className).toContain("max-md:flex-wrap");
-    expect(toolbar.className).toContain("max-md:justify-end");
+    // **手机上必须是 `start` 而不是 `end`**：右组（Mode / 模型 / Send）不可压缩，
+    // 窄屏会溢出一行；`justify-end` 让溢出的空白从右侧「吸」走，把**最左**的
+    // ModeChip 连同它 `left-0` 的下拉一起推出屏幕左边界（用户点不到模式，弹出层
+    // 也只露出一角——就是「点 mode 弹出后出画面」）。`start` 对齐把溢出只留在右侧。
+    expect(toolbar.className).toContain("max-md:justify-start");
+    expect(toolbar.className).not.toContain("max-md:justify-end");
     // 「附加文件」是工具栏的第一个控件（左组），不是被挤到右边去。
     const firstControl = toolbar.querySelector("button");
     expect(firstControl?.getAttribute("aria-label")).toBe("附加文件");
+  });
+
+  it("lets the permission group take its own full-width phone line so the chip and menu stay on screen", () => {
+    renderInput();
+    const toolbar = document.querySelector("[data-composer-toolbar]") as HTMLElement;
+    // 承载 ModeChip 的那一组：与「附加文件」平级的最右元素（ModeChip 在其中，
+    // dropdown 以它为定位上下文）。
+    const group = toolbar.querySelector(":scope > div") as HTMLElement;
+    expect(group.contains(screen.getByRole("button", { name: /mode/i }))).toBe(true);
+    // `basis-full` 让这一组在手机上独占整行（「附加文件」被换到上一行），ModeChip
+    // 因此落在贴近卡片左缘的位置；`min-w-0` 去掉内容下限，模型名再长也不撑破屏幕；
+    // `flex-wrap` 兜住极窄屏，让 Send 换到下一行而不是被推出右边界。
+    // （`max-md:justify-start` 是另一半修复，见上一条用例。）
+    expect(group.className).toContain("max-md:basis-full");
+    expect(group.className).toContain("max-md:min-w-0");
+    expect(group.className).toContain("max-md:flex-wrap");
   });
 
   it("does not keep a draft of its own: the value prop owns the text", () => {
