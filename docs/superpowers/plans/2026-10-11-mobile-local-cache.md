@@ -824,12 +824,12 @@ describe("Session replay reconciliation", () => {
       .toHaveLength(localEchoes.length);
   });
 
-  it("endReplay is null when no replay was started, and dropStale is a no-op for an empty set", () => {
+  it("endReplay is null when no replay was started, and dropStale drops a server item absent from the replay", () => {
     const s = new Session();
     s.upsertItems([{ type: "agentMessage", id: "A", text: "a" }]);
     expect(s.endReplay()).toBeNull();
     s.dropStale(new Set());
-    expect(s.items.map((i) => i.id)).toEqual(["A"]);
+    expect(s.items.map((i) => i.id)).toEqual([]);
   });
 
   it("does not collect ids outside a replay", () => {
