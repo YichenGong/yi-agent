@@ -185,23 +185,34 @@ html[data-mobile="true"] {
 }
 
 /*
- * 宽度：`.app-sidebar` 是 `fixed` 的包裹层（见上方抽屉规则），父级内边距管不到它，
- * 所以安全区要自己补；宽度改为按视口收口，替换掉桌面记忆下来的 256px 固定值——
- * 390pt 的屏幕上那个宽度打开后几乎只剩一条缝。
+ * 宽度与「点击穿透」：`.app-sidebar` 是 `fixed` 的包裹层（见上方抽屉规则），父级
+ * 内边距管不到它，所以安全区要自己补；桌面记忆下来的 256px 宽度只写在内层 `aside`
+ * 的 `style.width` 上，手机上不再按视口比例取宽——那个 82vw 会与 `aside` 的宽度脱钩。
+ *
+ * 包裹层必须**贴合抽屉本身**（`width: auto` 由内层撑开），否则它会比抽屉宽出一截，
+ * 而那一截是**透明的空白**却仍接收点击：背板（`.app-sidebar-backdrop`，z-20）在它
+ * 之下、聊天列之上，于是「抽屉右缘 → 包裹层右缘」这条带里的点击全落在包裹层这个空盒
+ * 子上、永远到不了背板——正是用户报的「一半空白点不缩回」（390pt 上 `aside` 256px、
+ * 包裹层却到 320px，那 64px 就是失效区）。`pointer-events: none` 是同一问题的第二道
+ * 保险：包裹层的透明区域本就不是可点目标，现在交给下层（背板）。
  */
 [data-mobile="true"] .app-sidebar {
-  width: min(82vw, 340px);
+  width: auto;
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
   overscroll-behavior: contain;
+  pointer-events: none;
 }
 /*
  * 安全区落在真正会滚动的元素（`ThreadSidebar` 的 `aside`）上：列表滚动到底时，
- * 最后一行才不会被 Home Indicator 压住。
+ * 最后一行才不会被 Home Indicator 压住。`pointer-events: auto` 收回上面那条
+ * 穿透规则——抽屉本体（滚动、长按、行内点击）照常可交互，被穿透的只有包裹层的
+ * 透明空白。
  */
 [data-mobile="true"] .app-sidebar aside {
   padding-top: env(safe-area-inset-top, 0px);
   padding-bottom: env(safe-area-inset-bottom, 0px);
+  pointer-events: auto;
 }
 /*
  * 浮在主列左上角那颗抽屉开关的让位：按钮 top(4px) + 高 44px，内容因此从 48px 起，

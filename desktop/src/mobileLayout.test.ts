@@ -86,6 +86,23 @@ describe("phone layout CSS", () => {
     );
   });
 
+  it("hugs the drawer so its blank strip cannot swallow the close-tap", () => {
+    // 「抽屉打开后有一半空白点不缩回」的根因：包裹层 `.app-sidebar` 是 fixed 的
+    // 空盒子，比内层 `aside` 宽出一截（256px vs 82vw≈320px @390pt）。那一截透明
+    // 空白仍接收点击，而背板（z-20）在它之下，于是落在该带里的点击到不了背板。
+    // 两道保险都必须钉住：包裹层贴合抽屉宽度，且透明区域不接收指针事件；抽屉本体
+    // 再把指针事件收回来，滚动/长按/行内点击照常。
+    const wrapper =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s*\{([^}]*overscroll-behavior[^}]*)\}/.exec(css())?.[1] ??
+      "";
+    expect(wrapper).toMatch(/width:\s*auto/);
+    expect(wrapper).not.toMatch(/min\(\s*82vw/);
+    expect(wrapper).toMatch(/pointer-events:\s*none/);
+    const asideRule =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+aside\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(asideRule).toMatch(/pointer-events:\s*auto/);
+  });
+
   it("constrains free-standing images so overflow-x-hidden cannot clip them", () => {
     // typography 基准里 `img` 只有上下外边距、没有 `max-width`；会话列一旦
     // `overflow-x-hidden`，超宽图片被裁掉的部分将永久不可达。
