@@ -27,6 +27,8 @@ pub struct GenParams {
     pub max_tokens: Option<u32>,
     pub top_p: Option<f32>,
     pub stop_sequences: Option<Vec<String>>,
+    /// `reasoning_effort` 档位；`None` = 不发该字段（零回归默认）。
+    pub reasoning_effort: Option<String>,
 }
 
 /// Token usage from a provider response.
@@ -36,6 +38,50 @@ pub struct TokenUsage {
     pub output_tokens: u32,
     pub cache_creation_input_tokens: Option<u32>,
     pub cache_read_input_tokens: Option<u32>,
+    /// 推理模型消耗的 reasoning token（responses 提供；chat 常为 None）。
+    pub reasoning_tokens: Option<u32>,
+}
+
+/// Reasoning 增量的种类：完整思考正文 vs 结构化摘要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningKind {
+    /// 完整思考正文（DeepSeek 的 reasoning_text）。
+    Content,
+    /// 结构化摘要（GPT-6 的 reasoning_summary_text）。
+    Summary,
+}
+
+/// 非致命运行期告知的严重级别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeLevel {
+    Info,
+    Warn,
+}
+
+/// 端点风格。解析非法值落回 `Auto`，绝不因一个手写值让条目失效。
+/// 唯一定义处：runtime 的 `RuntimeConfig` 与 llm 的 provider 都引用本类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiStyle {
+    Auto,
+    Responses,
+    Chat,
+}
+
+impl ApiStyle {
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "responses" => Self::Responses,
+            "chat" => Self::Chat,
+            _ => Self::Auto,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Responses => "responses",
+            Self::Chat => "chat",
+        }
+    }
 }
 
 /// Streaming event from a provider.
@@ -60,6 +106,16 @@ pub enum ProviderEvent {
     /// agent loop can decide retryability without string matching.
     StreamError(ProviderError),
     Usage(TokenUsage),
+    /// 归一化的思维链增量；两个端点都映射到它。
+    ReasoningDelta {
+        text: String,
+        kind: ReasoningKind,
+    },
+    /// 非致命的运行期告知（回退/降级），展示在状态栏级。
+    Notice {
+        level: NoticeLevel,
+        text: String,
+    },
 }
 
 /// Why generation stopped.
@@ -219,6 +275,15 @@ where
             ProviderEvent::Usage(u) => {
                 last_usage = Some(u.clone());
                 on_event(ProviderEvent::Usage(u));
+            }
+            ProviderEvent::ReasoningDelta { text, kind } => {
+                // Reasoning is a separate channel: it is forwarded to the
+                // caller for display but never merged into assistant content.
+                on_event(ProviderEvent::ReasoningDelta { text, kind });
+            }
+            ProviderEvent::Notice { level, text } => {
+                // A non-fatal runtime notice is purely informational.
+                on_event(ProviderEvent::Notice { level, text });
             }
         }
     };
@@ -504,6 +569,42 @@ mod tests {
     }
 
     #[test]
+    fn gen_params_defaults_to_no_reasoning_effort() {
+        let p = GenParams::default();
+        assert_eq!(p.reasoning_effort, None);
+    }
+
+    #[test]
+    fn reasoning_and_notice_events_are_constructible() {
+        let a = ProviderEvent::ReasoningDelta {
+            text: "thinking".into(),
+            kind: ReasoningKind::Content,
+        };
+        let b = ProviderEvent::ReasoningDelta {
+            text: "summary".into(),
+            kind: ReasoningKind::Summary,
+        };
+        let c = ProviderEvent::Notice {
+            level: NoticeLevel::Info,
+            text: "fell back to chat".into(),
+        };
+        assert_ne!(a, b);
+        assert!(matches!(c, ProviderEvent::Notice { .. }));
+    }
+
+    #[test]
+    fn token_usage_carries_reasoning_tokens() {
+        let u = TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            reasoning_tokens: Some(7),
+        };
+        assert_eq!(u.reasoning_tokens, Some(7));
+    }
+
+    #[test]
     fn token_usage_default_has_no_cache() {
         let u = TokenUsage::default();
         assert_eq!(u.input_tokens, 0);
@@ -519,6 +620,7 @@ mod tests {
             output_tokens: 50,
             cache_creation_input_tokens: Some(10),
             cache_read_input_tokens: None,
+            reasoning_tokens: None,
         };
         let e = ProviderEvent::Usage(u.clone());
         assert!(matches!(e, ProviderEvent::Usage(_)));
@@ -899,6 +1001,7 @@ mod tests {
             output_tokens: 50,
             cache_creation_input_tokens: Some(20),
             cache_read_input_tokens: Some(10),
+            reasoning_tokens: None,
         };
         assert_eq!(u.cache_creation_input_tokens, Some(20));
         assert_eq!(u.cache_read_input_tokens, Some(10));

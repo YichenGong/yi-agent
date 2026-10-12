@@ -1009,6 +1009,7 @@ mod tests {
             output_tokens: 5,
             cache_creation_input_tokens: Some(100),
             cache_read_input_tokens: Some(200),
+            reasoning_tokens: None,
         };
         let out = t.on_event(AgentEvent::Usage {
             model: "m".into(),
@@ -1063,6 +1064,7 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: Some(7),
                 cache_read_input_tokens: Some(9),
+                reasoning_tokens: None,
             },
         });
         // message_delta:output only
@@ -1073,6 +1075,7 @@ mod tests {
                 output_tokens: 42,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                reasoning_tokens: None,
             },
         });
         match &out[0] {
@@ -1139,6 +1142,7 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: Some(7),
                 cache_read_input_tokens: Some(9),
+                reasoning_tokens: None,
             },
         });
         let _ = t.on_event(AgentEvent::Usage {
@@ -1157,6 +1161,7 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                reasoning_tokens: None,
             },
         });
         match &out[0] {
