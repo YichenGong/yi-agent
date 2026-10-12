@@ -2319,11 +2319,12 @@ impl EffortSource {
 /// selected catalog entry's value applies; with neither, the field is not sent.
 ///
 /// `current_model_ref` is the user-selected display name, and an absent one
-/// means "follow the catalog's `default_model`" — the same entry
-/// `startup_config_from_catalog` uses for the startup config, so the report
-/// matches the running value: an entry default that is shown is one the driver
-/// actually sends.
-fn resolve_effort_state(
+/// means "follow the catalog's `default_model`". This is the **same**
+/// entry-selection rule `startup_config_from_catalog` and the app-server's
+/// `effective_entry` use, so the effort `/effort` reports is the one the request
+/// carries — the cross-check is
+/// `main::tests::startup_sends_the_effort_the_tui_reports`.
+pub(crate) fn resolve_effort_state(
     session_effort: Option<&str>,
     catalog: &yi_agent_runtime::models::ModelCatalog,
     current_model_ref: Option<&str>,

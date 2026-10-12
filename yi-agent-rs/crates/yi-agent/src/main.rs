@@ -1794,32 +1794,31 @@ fn rebuild_driver_agent(
 
 /// Apply the machine-level catalog's entry defaults to the TUI's startup config.
 ///
-/// Mirrors the app-server (`resolve_effective`): the selected (or
-/// `default_model`) entry's `reasoning_effort` becomes the running value, so the
-/// TUI's `/effort` status — which reads the same catalog — describes the value
-/// actually sent.
+/// Uses the **same** entry-selection rule as `resolve_effort_state` (and the
+/// app-server's `resolve_effective`): session override → catalog
+/// `default_model`. Startup has no session override, so it is
+/// `effective_entry(catalog, None)`. The TUI's `/effort` status — which reads
+/// the same catalog through `resolve_effort_state` — therefore reports exactly
+/// the `reasoning_effort` this function sends.
+///
+/// The rule is deliberately **not** "the entry matching `config.model`". With
+/// `.env YI_AGENT_MODEL` naming a non-default entry the running model string
+/// would select one entry for the request while `/effort` (no session override)
+/// selected `default_model` for the report — the field sent and the field shown
+/// would differ (Task 8 review R2 residual). Matching `default_model` here keeps
+/// them one rule.
 ///
 /// Deliberately only handles the **effort** field. The TUI keeps resolving
-/// provider / api_url / api_key / model from env+overrides at startup (matching
-/// how it reports the running model), so pulling those from the catalog here
-/// would be a behavior change beyond this fix. Entries whose **display name**
-/// equals the running model string are the ones the TUI considers "current", so
-/// only they may contribute a default — that keeps reported == sent.
+/// provider / api_url / api_key / model from env+overrides at startup, so
+/// pulling those from the catalog here would be a behavior change beyond this
+/// fix.
 fn startup_config_from_catalog(
     config: &config::Config,
     catalog: &yi_agent_runtime::models::ModelCatalog,
 ) -> config::Config {
-    let entry = catalog
-        .models
-        .iter()
-        .find(|entry| entry.name == config.model)
-        .or_else(|| {
-            catalog
-                .default_model
-                .as_deref()
-                .and_then(|name| catalog.models.iter().find(|entry| entry.name == name))
-        });
-    let Some(effort) = entry.and_then(|entry| entry.reasoning_effort.clone()) else {
+    let Some(effort) = yi_agent_runtime::models::effective_entry(catalog, None)
+        .and_then(|entry| entry.reasoning_effort.clone())
+    else {
         return config.clone();
     };
     let mut resolved = config.clone();
@@ -2830,11 +2829,19 @@ mod tests {
         );
     }
 
-    /// Task 8 review R2: the TUI's startup config must carry the catalog entry's
-    /// default effort, as the app-server's `resolve_effective` does. Otherwise
-    /// `/effort` (no args) reports an entry default the request never sends.
+    /// Task 8 review R2 (residual): the effort the TUI **sends** at startup and
+    /// the effort its `/effort` status **reports** must come from ONE
+    /// entry-selection rule.
+    ///
+    /// `resolve_effort_state` (and the app-server's `resolve_effective`) select
+    /// session override → catalog `default_model`. Startup previously preferred
+    /// the entry matching `config.model`, so with `YI_AGENT_MODEL` naming a
+    /// non-default entry the request carried that entry's effort while `/effort`
+    /// printed the `default_model` entry's — reported `Unset` != sent `low`. This
+    /// cross-check fails under the old `config.model`-first rule and is the
+    /// regression guard for the unified rule.
     #[test]
-    fn startup_config_applies_the_catalog_entry_default_effort() {
+    fn startup_sends_the_effort_the_tui_reports() {
         use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
         let entry = |name: &str, effort: Option<&str>| ModelEntry {
             name: name.into(),
@@ -2845,35 +2852,39 @@ mod tests {
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
         };
-        let catalog = ModelCatalog {
+        let make_catalog = |default: &str| ModelCatalog {
             models: vec![
                 entry("HORIZON-OG-Luna", Some("low")),
                 entry("HORIZON-DeepSeek", None),
             ],
-            default_model: Some("HORIZON-DeepSeek".into()),
+            default_model: Some(default.into()),
             subagent_model: None,
         };
 
-        // Running entry declares an effort → it applies, so the request carries
-        // what `/effort` reports.
+        // The env model ("HORIZON-OG-Luna") is NOT the catalog default and
+        // declares a different effort than the default entry.
+        let catalog = make_catalog("HORIZON-DeepSeek");
         let mut config = test_config();
         config.model = "HORIZON-OG-Luna".into();
         config.reasoning_effort = None; // `load_inner`'s hardcoded default
-        assert_eq!(
-            startup_config_from_catalog(&config, &catalog)
-                .reasoning_effort
-                .as_deref(),
-            Some("low")
-        );
 
-        // Zero regression: a running entry that declares no effort stays unset
-        // (the follow-default entry here is silent).
-        let mut silent = test_config();
-        silent.model = "HORIZON-DeepSeek".into();
+        let sent = startup_config_from_catalog(&config, &catalog).reasoning_effort;
+        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, None);
         assert_eq!(
-            startup_config_from_catalog(&silent, &catalog).reasoning_effort,
-            None
+            sent, reported,
+            "startup reported {reported:?} ({source:?}) but sent {sent:?}"
         );
+        // The unified rule follows `default_model`, whose entry is silent here:
+        // unset stays unset (zero regression for the owner's setup).
+        assert_eq!(sent, None);
+
+        // A `default_model` entry that declares an effort applies to startup and
+        // is what `/effort` reports.
+        let loud = make_catalog("HORIZON-OG-Luna");
+        let sent = startup_config_from_catalog(&config, &loud).reasoning_effort;
+        let (reported, _) = crate::tui::app::resolve_effort_state(None, &loud, None);
+        assert_eq!(sent.as_deref(), Some("low"));
+        assert_eq!(sent, reported);
     }
 
     #[test]
