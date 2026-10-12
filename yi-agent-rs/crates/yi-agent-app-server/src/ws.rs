@@ -121,6 +121,8 @@ where
                     .join(".yi-agent")
                     .join("preferences.json"),
                 resident_dir: yi_agent_store::resident::default_dir().unwrap_or_default(),
+                plugin_command: yi_agent_boards::scaffold::default_plugin_command()
+                    .unwrap_or_default(),
                 launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),

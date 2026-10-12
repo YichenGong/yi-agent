@@ -76,8 +76,18 @@ pub fn create(project: &Path) -> Result<BoardStatus, String> {
 pub fn create_in(project: &Path, global: &Path) -> Result<BoardStatus, String> {
     let resident_dir = resident::default_dir()
         .ok_or_else(|| "cannot locate the resident registry: HOME is not set".to_string())?;
+    // Resolve the plugin executable here, not inside the scaffold: creation must
+    // fail loudly when the plugin is missing, before the registry records a
+    // board nobody can advance.
+    let plugin_command = scaffold::default_plugin_command().map_err(|error| error.to_string())?;
     let mut launcher = |project: &Path| launch_if_absent(project);
-    create_with_project(project, global, &resident_dir, &mut launcher)
+    create_with_project(
+        project,
+        global,
+        &resident_dir,
+        &plugin_command,
+        &mut launcher,
+    )
 }
 
 /// Remove `project`'s board from the default global registry. See [`remove_in`].
@@ -136,7 +146,8 @@ pub fn launch_if_absent(project: &Path) -> Result<bool, String> {
     Ok(board_daemon::wait_ready(project, READY_TIMEOUT))
 }
 
-/// Create with an injected launcher and global directory.
+/// Create a board with an injected launcher, plugin executable, and global and
+/// resident directories.
 ///
 /// Idempotence is keyed on the daemon, not on the registry: the launcher runs
 /// whenever no daemon answers for the project. A project that is already
@@ -146,10 +157,17 @@ pub fn launch_if_absent(project: &Path) -> Result<bool, String> {
 /// for one project" still cannot happen: the real launcher is itself idempotent
 /// (it returns early when `is_running`), and an injected launcher used in tests
 /// is expected to leave a daemon answering, exactly as the real one does.
+///
+/// `plugin_command` is the absolute path scaffolded into the project's
+/// supervisor manifest. It is a parameter rather than resolved internally so
+/// the lifecycle is a pure function of its inputs: a test supplies a fixture
+/// path without the plugin being installed on the machine, exactly as it
+/// already supplies `launcher`, `global`, and `resident_dir`.
 pub fn create_with_project(
     project: &Path,
     global: &Path,
     resident_dir: &Path,
+    plugin_command: &Path,
     launcher: &mut dyn FnMut(&Path) -> Result<bool, String>,
 ) -> Result<BoardStatus, String> {
     // Only a real directory can be a project. Accepting a path that does not
@@ -162,7 +180,7 @@ pub fn create_with_project(
             project.display()
         ));
     }
-    scaffold::install_manifest(project).map_err(|error| error.to_string())?;
+    scaffold::install_manifest(project, plugin_command).map_err(|error| error.to_string())?;
     scaffold::enable_switch(project).map_err(|error| error.to_string())?;
 
     let daemon_running = if board_daemon::is_running(project) {
@@ -280,6 +298,15 @@ mod tests {
     use crate::registry::contains;
     use std::path::Path;
 
+    /// 桩插件可执行路径。
+    ///
+    /// 这些测试验证的是「创建看板」的编排，而不是本机有没有装
+    /// `superpowers-kanban`。把路径注入进来，测试就不再依赖 PATH 或
+    /// Homebrew 前缀——runner 上装没装插件不影响结果。
+    fn stub_plugin() -> PathBuf {
+        PathBuf::from("/nonexistent/superpowers-kanban")
+    }
+
     #[test]
     fn create_scaffolds_registers_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
@@ -343,7 +370,9 @@ mod tests {
             Ok(true)
         };
 
-        let first = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        let first =
+            create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher)
+                .unwrap();
         assert!(first.registered);
         assert_eq!(launched.get(), 1);
         // 清单与开关就位
@@ -359,7 +388,9 @@ mod tests {
         assert_eq!(prefs["superpowers_kanban"], true);
 
         // 再创建一次：不重复起进程
-        let second = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        let second =
+            create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher)
+                .unwrap();
         assert!(second.registered);
         assert_eq!(launched.get(), 1, "重复创建不该再起一个 daemon");
 
@@ -394,7 +425,9 @@ mod tests {
             Ok(true)
         };
 
-        let created = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        let created =
+            create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher)
+                .unwrap();
         assert_eq!(
             launched.get(),
             1,
@@ -415,7 +448,9 @@ mod tests {
         let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
 
-        let error = create_with_project(&project, &global, &resident, &mut launcher).unwrap_err();
+        let error =
+            create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher)
+                .unwrap_err();
         assert!(error.contains("not a directory"), "{error}");
         assert!(
             !global.join("boards.json").exists(),
@@ -442,7 +477,7 @@ mod tests {
         let global = dir.path().join("global");
         let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
-        create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher).unwrap();
 
         let mut stopped = 0;
         let mut stopper = |_p: &Path| {
@@ -485,7 +520,9 @@ mod tests {
         let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
 
-        let created = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        let created =
+            create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher)
+                .unwrap();
         assert!(created.registered);
 
         let reported = status_with(&project, &global);
@@ -633,7 +670,9 @@ mod tests {
         });
 
         let mut launcher = |_p: &Path| panic!("已有 daemon 在跑时不得再起一个");
-        let created = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        let created =
+            create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher)
+                .unwrap();
         handle.join().unwrap();
 
         assert!(created.registered, "{created:?}");
@@ -652,7 +691,9 @@ mod tests {
         let resident = dir.path().join("resident");
         let mut launcher = |_p: &Path| Ok(true);
 
-        let created = create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        let created =
+            create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher)
+                .unwrap();
         assert_eq!(
             serde_json::to_value(&created).unwrap(),
             serde_json::json!({
@@ -673,7 +714,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         let mut launcher = |_project: &Path| Ok(true);
 
-        create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher).unwrap();
         assert_eq!(
             yi_agent_store::resident::list(&resident),
             vec![project.clone()],
@@ -689,7 +730,7 @@ mod tests {
         let project = dir.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let mut launcher = |_project: &Path| Ok(true);
-        create_with_project(&project, &global, &resident, &mut launcher).unwrap();
+        create_with_project(&project, &global, &resident, &stub_plugin(), &mut launcher).unwrap();
 
         remove_with(&project, &global, &resident, &mut |_project: &Path| Ok(())).unwrap();
         assert!(

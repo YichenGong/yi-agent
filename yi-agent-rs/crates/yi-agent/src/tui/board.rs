@@ -20,12 +20,14 @@ pub struct BoardOutcome {
 /// `message` 只认 `create` / `remove` / `status`；其余（含空串）给 usage。
 pub fn handle_board(project: &Path, global: &Path, message: &str) -> BoardOutcome {
     let resident = yi_agent_store::resident::default_dir().unwrap_or_default();
+    let plugin = yi_agent_boards::scaffold::default_plugin_command().unwrap_or_default();
     let mut launcher = |project: &Path| lifecycle::launch_if_absent(project);
     let mut stopper = |project: &Path| yi_agent_boards::board_daemon::stop(project);
     handle_board_with(
         project,
         global,
         &resident,
+        &plugin,
         message,
         &mut launcher,
         &mut stopper,
@@ -38,16 +40,26 @@ pub fn handle_board(project: &Path, global: &Path, message: &str) -> BoardOutcom
 /// 只能是「登记与清单就位、daemon 未就绪」；要钉住「daemon 就绪时也必须说清
 /// 楚」，只能注入一个会留下应答者的启动器。`remove` 的 stopper 同理——进程没
 /// 起来时真实 stop 本就是 no-op。
+///
+/// `plugin_command` 是写进值班清单的插件可执行路径。生产由 [`handle_board`]
+/// 解析（缺插件即创建失败），测试传入桩路径，从而不依赖本机装没装插件。
 pub fn handle_board_with(
     project: &Path,
     global: &Path,
     resident: &Path,
+    plugin_command: &Path,
     message: &str,
     launcher: &mut dyn FnMut(&Path) -> Result<bool, String>,
     stopper: &mut dyn FnMut(&Path) -> Result<(), String>,
 ) -> BoardOutcome {
     match message.trim() {
-        "create" => match lifecycle::create_with_project(project, global, resident, launcher) {
+        "create" => match lifecycle::create_with_project(
+            project,
+            global,
+            resident,
+            plugin_command,
+            launcher,
+        ) {
             Ok(status) => BoardOutcome {
                 lines: vec![format!(
                     "看板已创建（{}）",
@@ -100,6 +112,15 @@ fn lines(lines: Vec<String>) -> BoardOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 桩插件可执行路径。
+    ///
+    /// 这些测试验证的是 `handle_board_with` 的编排，不是本机有没有装
+    /// `superpowers-kanban`。注入桩路径后，测试不再依赖 PATH 或 Homebrew
+    /// 前缀——runner 上装没装插件不影响结果。
+    fn stub_plugin() -> std::path::PathBuf {
+        std::path::PathBuf::from("/nonexistent/superpowers-kanban")
+    }
 
     /// 一个「真的把 daemon 拉起来」的启动器：在项目的 runtime socket 上绑定并
     /// 派一个线程应答 `Status`，于是 `is_running` 为真——和 `lifecycle` 自己的
@@ -155,6 +176,7 @@ mod tests {
             &project,
             &global,
             &resident,
+            &stub_plugin(),
             "create",
             &mut launcher,
             &mut stopper,
@@ -194,6 +216,7 @@ mod tests {
             &project,
             &global,
             &resident,
+            &stub_plugin(),
             "create",
             &mut launcher,
             &mut stopper,
@@ -202,6 +225,7 @@ mod tests {
             &project,
             &global,
             &resident,
+            &stub_plugin(),
             "remove",
             &mut launcher,
             &mut stopper,
@@ -235,6 +259,7 @@ mod tests {
             &project,
             &global,
             &resident,
+            &stub_plugin(),
             "create",
             &mut launcher,
             &mut stopper,
@@ -263,6 +288,7 @@ mod tests {
             &project,
             &global,
             &resident,
+            &stub_plugin(),
             "create",
             &mut launcher,
             &mut stopper,
@@ -321,6 +347,7 @@ mod tests {
             &project,
             &global,
             &resident,
+            &stub_plugin(),
             "create",
             &mut launcher,
             &mut stopper,
@@ -330,6 +357,7 @@ mod tests {
             &project,
             &global,
             &resident,
+            &stub_plugin(),
             "remove",
             &mut launcher,
             &mut stopper,
