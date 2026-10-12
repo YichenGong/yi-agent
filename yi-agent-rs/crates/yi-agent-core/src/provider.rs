@@ -43,7 +43,10 @@ pub struct TokenUsage {
 }
 
 /// Reasoning 增量的种类：完整思考正文 vs 结构化摘要。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize` 是给线协议用的：`AgentEvent::ReasoningDelta` 的序列化必须带上
+/// kind，`thread/reasoningDelta` 通知的 `kind` 字段直接复用本枚举的 wire 形状。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ReasoningKind {
     /// 完整思考正文（DeepSeek 的 reasoning_text）。
     Content,
@@ -52,7 +55,9 @@ pub enum ReasoningKind {
 }
 
 /// 非致命运行期告知的严重级别。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// 同上：`Serialize` 供 `AgentEvent::Notice` 与 `thread/notice` 通知使用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum NoticeLevel {
     Info,
     Warn,

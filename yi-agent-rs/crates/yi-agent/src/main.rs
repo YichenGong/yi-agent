@@ -1533,6 +1533,13 @@ fn record_human<W: std::io::Write, E: std::io::Write>(
         yi_agent_core::AgentEvent::Error(e) => {
             let _ = writeln!(err, "[error:{e}]");
         }
+        // 回退/降级（design §7）在**状态行级**给一行：headless 的等价物是 stderr
+        // 的一行，与 TUI 的 Separator、app-server 的 `thread/notice` 同源。
+        // 只展示、不进正文：CoT 本身（`ReasoningDelta`）在此不渲染，因为
+        // 「只输出答案」是 headless 的既定契约（与 `DecodeDelta` 同处理）。
+        yi_agent_core::AgentEvent::Notice { text, .. } => {
+            let _ = writeln!(err, "[notice] {text}");
+        }
         _ => {}
     }
 }
@@ -1846,7 +1853,11 @@ fn run_tui_agent(
         let is_running_clone = Arc::clone(&is_running);
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
         let rebuild_provider = Arc::clone(&provider);
-        let rebuild_config = agent_config.clone();
+        // The agent config every rebuild clones. `SetModel` mutates the model
+        // (and the entry's default effort) in place, `SetReasoningEffort` the
+        // override, so the two switches compose: a later `/model` cannot
+        // resurrect an earlier model's effort, nor clobber a `/effort` switch.
+        let mut rebuild_config = agent_config.clone();
         let rebuild_decision_rx = Arc::clone(&decision_rx);
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
         let mcp_for_driver = Arc::clone(&mcp);
@@ -2015,13 +2026,18 @@ fn run_tui_agent(
                             // 旧 agent 原样保留(绝不半重建)。
                             match yi_agent_runtime::bootstrap::build_provider(&effective) {
                                 Ok(provider) => {
-                                    let mut next_config = rebuild_config.clone();
-                                    next_config.model = effective.model.clone();
+                                    // 在 `rebuild_config` 上就地更新，而不是改一个
+                                    // 副本：这次切换解析出的条目默认档是新的权威值，
+                                    // 不写回的话下一次 `/model` 或 `/effort` 重建会
+                                    // 带上旧条目的 effort。
+                                    rebuild_config.model = effective.model.clone();
+                                    rebuild_config.gen_params.reasoning_effort =
+                                        effective.reasoning_effort.clone();
                                     let handle = agent.session_handle();
                                     agent = rebuild_driver_agent(
                                         provider,
                                         Arc::clone(&current_tools),
-                                        next_config,
+                                        rebuild_config.clone(),
                                         Arc::clone(&current_checker),
                                         Arc::clone(&rebuild_decision_rx),
                                         handle,
@@ -2054,6 +2070,45 @@ fn run_tui_agent(
                                         .await;
                                 }
                             }
+                        }
+                        ControlCommand::SetReasoningEffort(effort) => {
+                            // `effort` 已由 TUI 按七档白名单校验；`None` = 清
+                            // 覆盖，回落当前条目默认（`SetModel` 分支写回的就是
+                            // 这个默认值）。
+                            //
+                            // **不重建 provider**：effort 是请求级参数
+                            // （`GenParams.reasoning_effort`），provider 持有的
+                            // 是构造期的默认值，请求里的字段总是优先——重建会
+                            // 白白丢掉已探测的 channel 缓存与 effort 拒绝缓存。
+                            // 就地更新 `rebuild_config`：`/model` 会从这里取当前
+                            // 条目默认档，`/effort` 的设置在切模型后不会丢。
+                            rebuild_config.gen_params.reasoning_effort = effort.clone();
+                            let handle = agent.session_handle();
+                            agent = rebuild_driver_agent(
+                                Arc::clone(&rebuild_provider),
+                                Arc::clone(&current_tools),
+                                rebuild_config.clone(),
+                                Arc::clone(&current_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                                handle,
+                            );
+                            tracing::info!(
+                                ?effort,
+                                "agent reasoning effort switched via /effort"
+                            );
+                            // TUI 不预写成功行（与 `/model` 同理），由这条
+                            // 状态行级告知闭环。`gen_params` 是副本，这里回读
+                            // 实际装配进去的值，避免文案与 agent 不一致。
+                            let message = match &effort {
+                                Some(tier) => format!("推理档已设为 {tier}"),
+                                None => "推理档覆盖已清除（回落条目默认）".to_string(),
+                            };
+                            let _ = agent_tx
+                                .send(yi_agent_core::AgentEvent::Notice {
+                                    level: yi_agent_core::NoticeLevel::Info,
+                                    text: message,
+                                })
+                                .await;
                         }
                     }
                     continue;
@@ -2398,6 +2453,12 @@ pub(crate) enum ControlCommand {
     /// providers. Sending only a model string would keep the old (possibly
     /// mismatched) key/url and silently fail at the first request.
     SetModel(Option<String>),
+    /// Rebuild the agent with a different request-level `reasoning_effort`,
+    /// preserving the session (and the provider: effort is a request parameter,
+    /// so no channel probe or cache is thrown away). `Some(tier)` is one of the
+    /// seven tiers; `None` clears the override and falls back to the catalog
+    /// entry's default, which the `/model` switch keeps in `rebuild_config`.
+    SetReasoningEffort(Option<String>),
     /// Rebuild the agent so its tool registry matches the MCP switches the TUI
     /// already applied directly to the shared `McpManager`.
     McpRefresh,
@@ -2492,6 +2553,96 @@ mod tests {
         // `None` clears the override and must not compare equal to a named switch.
         assert_ne!(ControlCommand::SetModel(None), a);
         assert_eq!(ControlCommand::SetModel(Some("claude-opus-4-1".into())), a,);
+    }
+
+    #[test]
+    fn set_reasoning_effort_control_command_distinguishes_its_payload() {
+        // Same guard as `SetModel`: a `PartialEq` that ignored the payload would
+        // make two different tiers equal, and a clear (`None`) indistinguishable
+        // from "no command".
+        let high = ControlCommand::SetReasoningEffort(Some("high".into()));
+        assert_ne!(high, ControlCommand::SetReasoningEffort(Some("low".into())));
+        assert_ne!(ControlCommand::SetReasoningEffort(None), high);
+        assert_ne!(high, ControlCommand::McpRefresh);
+        assert_eq!(
+            ControlCommand::SetReasoningEffort(Some("high".into())),
+            high
+        );
+    }
+
+    /// `/effort` must rebuild the agent with the new request-level effort while
+    /// (a) keeping the session `Arc` and (b) reusing the live provider — effort
+    /// is a request parameter, so dropping the provider would throw away the
+    /// channel probe cache and the effort-rejection cache.
+    ///
+    /// The rebuild is a private closure step in the driver loop, so this mirrors
+    /// it against the same primitives the loop uses.
+    #[test]
+    fn effort_rebuild_applies_gen_params_and_keeps_the_session() {
+        let mut agent = yi_agent_core::Agent::new(
+            Arc::new(NeverCalledProvider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+        );
+        let session = agent.session_handle();
+        session
+            .lock()
+            .unwrap()
+            .push(yi_agent_core::Message::user("before the rebuild"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checker = yi_agent_runtime::bootstrap::load_permission_checker(dir.path(), true)
+            .expect("checker");
+        let (decision_tx, decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(1);
+        drop(decision_tx);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        let provider: Arc<dyn Provider> = Arc::new(NeverCalledProvider);
+        let mut rebuild_config = yi_agent_core::AgentConfig::default();
+
+        // `SetReasoningEffort(Some("high"))`, exactly as the driver handles it.
+        let mut next_config = rebuild_config.clone();
+        next_config.gen_params.reasoning_effort = Some("high".into());
+        agent = rebuild_driver_agent(
+            Arc::clone(&provider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            next_config.clone(),
+            Arc::clone(&checker),
+            Arc::clone(&decision_rx),
+            Arc::clone(&session),
+        );
+        rebuild_config = next_config;
+
+        assert_eq!(
+            agent.config().gen_params.reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert!(
+            Arc::ptr_eq(&session, &agent.session_handle()),
+            "the /effort rebuild must not replace the session Arc"
+        );
+        assert_eq!(
+            session.lock().unwrap().messages().len(),
+            1,
+            "the transcript must survive the effort switch"
+        );
+
+        // `SetReasoningEffort(None)` clears it again.
+        let mut cleared = rebuild_config.clone();
+        cleared.gen_params.reasoning_effort = None;
+        agent = rebuild_driver_agent(
+            provider,
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            cleared.clone(),
+            checker,
+            decision_rx,
+            Arc::clone(&session),
+        );
+        assert_eq!(
+            agent.config().gen_params.reasoning_effort,
+            None,
+            "clearing must fall back to no field sent"
+        );
     }
 
     #[test]
@@ -3340,6 +3491,38 @@ mod tests {
             !stderr.contains("[done:"),
             "EndTurn must not emit [done:EndTurn] on stderr; got: {stderr:?}"
         );
+    }
+
+    /// 回退/降级必须在 headless 也看得见（design §7），但 CoT 不能混进答案流。
+    #[test]
+    fn drain_stream_human_reports_notices_on_stderr_and_keeps_reasoning_out_of_stdout() {
+        let stream = futures::stream::iter(vec![
+            AgentEvent::ReasoningDelta {
+                text: "let me think".into(),
+                kind: yi_agent_core::ReasoningKind::Content,
+            },
+            AgentEvent::Notice {
+                level: yi_agent_core::NoticeLevel::Info,
+                text: "该模型不支持所配推理档，已忽略".into(),
+            },
+            AgentEvent::AssistantText("answer\n".into()),
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        drain_stream_human_sync(stream.boxed(), &mut out, &mut err);
+
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("[notice] 该模型不支持所配推理档，已忽略"),
+            "the notice must reach stderr; got {stderr:?}"
+        );
+        assert!(
+            !stdout.contains("let me think"),
+            "reasoning must not leak into the answer stream; got {stdout:?}"
+        );
+        assert_eq!(stdout, "answer\n");
     }
 
     #[test]

@@ -244,6 +244,26 @@ pub enum Notification {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+    /// 非致命运行期告知（通道回退 / effort 降级），状态栏级一行提示。
+    ///
+    /// 与 `turn/retry` 同为**内容层**（按 thread 路由）：它描述的是某条会话这一次
+    /// 运行走了哪条路，而不是会话元数据，窗口外的会话无需因此刷新控件。
+    #[serde(rename = "thread/notice")]
+    Notice {
+        thread_id: String,
+        level: yi_agent_core::NoticeLevel,
+        text: String,
+    },
+    /// 归一化的思维链增量（两个端点都映射到它），展示用。
+    ///
+    /// 与 `item/delta` 同为内容层：它是仅展示的正文流，绝不回灌进后续轮次
+    /// （见 core 的 `AgentEvent::ReasoningDelta` 文档）。
+    #[serde(rename = "thread/reasoningDelta")]
+    ReasoningDelta {
+        thread_id: String,
+        text: String,
+        kind: yi_agent_core::ReasoningKind,
+    },
     #[serde(rename = "item/started")]
     ItemStarted { thread_id: String, item: Item },
     #[serde(rename = "item/delta")]
@@ -363,6 +383,8 @@ impl Notification {
             | Notification::ModelChanged { thread_id, .. }
             | Notification::PermissionModeChanged { thread_id, .. }
             | Notification::ReasoningEffortChanged { thread_id, .. }
+            | Notification::Notice { thread_id, .. }
+            | Notification::ReasoningDelta { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
             | Notification::ItemDelta { thread_id, .. }
             | Notification::ItemCompleted { thread_id, .. }
@@ -787,6 +809,43 @@ mod tests {
             v["params"].get("effort").is_none(),
             "a cleared override must omit the field: {v}"
         );
+    }
+
+    /// 运行期告知的 wire 形状:`thread/notice`,参数 snake_case,带 level。
+    ///
+    /// 投递层级与 `item/delta` 一致为**内容层**:它描述这一次运行的走法,按 thread
+    /// 路由,不该把窗口外会话的控件刷成脏。
+    #[test]
+    fn notice_notification_carries_method_level_and_text() {
+        let n = Notification::Notice {
+            thread_id: "t1".into(),
+            level: yi_agent_core::NoticeLevel::Warn,
+            text: "该模型不支持所配推理档，已忽略".into(),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/notice");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["level"], "Warn");
+        assert_eq!(v["params"]["text"], "该模型不支持所配推理档，已忽略");
+        assert_eq!(n.delivery(), Delivery::Content);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// 推理增量的 wire 形状:`thread/reasoningDelta`,参数带 kind 判别。
+    #[test]
+    fn reasoning_delta_notification_carries_method_text_and_kind() {
+        let n = Notification::ReasoningDelta {
+            thread_id: "t1".into(),
+            text: "thinking".into(),
+            kind: yi_agent_core::ReasoningKind::Summary,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/reasoningDelta");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["text"], "thinking");
+        assert_eq!(v["params"]["kind"], "Summary");
+        assert_eq!(n.delivery(), Delivery::Content);
+        assert_eq!(n.thread_key(), Some("t1"));
     }
 
     #[test]

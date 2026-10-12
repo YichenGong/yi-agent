@@ -9,6 +9,18 @@ use yi_agent_core::{AgentEvent, DoneReason, RetryCause};
 
 use super::cell::HistoryCell;
 
+/// Render a runtime notice for the status line.
+///
+/// `Warn` gets a `⚠` marker and `Info` a `ℹ`, because "该模型不支持所配推理档" is a
+/// degradation the user may want to act on while "已自动改用 Chat" is an FYI —
+/// collapsing both to one shape would hide that difference.
+fn notice_label(level: yi_agent_core::NoticeLevel, text: &str) -> String {
+    match level {
+        yi_agent_core::NoticeLevel::Info => format!("ℹ {text}"),
+        yi_agent_core::NoticeLevel::Warn => format!("⚠ {text}"),
+    }
+}
+
 /// Whether the boundary after `cell` needs a blank visual spacer.
 fn has_spacer_after(cell: &HistoryCell, next_cell: Option<&HistoryCell>) -> bool {
     next_cell.is_some()
@@ -72,6 +84,12 @@ fn cell_fingerprint(cell: &HistoryCell) -> u64 {
             expanded.hash(&mut hasher);
         }
         HistoryCell::Separator { label } => label.as_ref().map(String::len).hash(&mut hasher),
+        HistoryCell::Reasoning { text, expanded } => {
+            // Streamed text mutates in place, so hash it in full (like
+            // `AssistantMessage`) or a growing block would keep its cached render.
+            text.len().hash(&mut hasher);
+            expanded.hash(&mut hasher);
+        }
         HistoryCell::PermissionRequest {
             summary,
             prefix_suggestion,
@@ -643,6 +661,15 @@ impl HistoryState {
                     }
                 }
             }
+            AgentEvent::ReasoningDelta { text, .. } => {
+                // Streamed CoT mutates the trailing reasoning block in place,
+                // exactly like streamed assistant text.
+                if !text.is_empty() {
+                    if let Some(last) = self.cells.len().checked_sub(1) {
+                        self.invalidate_cell(last);
+                    }
+                }
+            }
             AgentEvent::ToolResult { id, .. } => {
                 let hit = self
                     .cells
@@ -883,6 +910,23 @@ impl HistoryState {
                 }
             },
             AgentEvent::Usage { .. } => {}
+            // CoT 累积进同一个推理块：连续 delta 必须合并成**一个** cell，
+            // 否则一个 token 一个 cell，转录会被思考刷屏。只在末尾是推理块时
+            // 追加；其他任何 cell（助手正文、工具卡、分隔线）都另起一块。
+            AgentEvent::ReasoningDelta { text, .. } => match self.cells.last_mut() {
+                Some(HistoryCell::Reasoning { text: existing, .. }) => existing.push_str(&text),
+                _ => self.cells.push(HistoryCell::Reasoning {
+                    text,
+                    expanded: false,
+                }),
+            },
+            // 回退/降级的可见性（design §7）：状态行级一行，与 `ModelChanged`
+            // 同款 Separator，不进弹窗、不进对话卡片。
+            AgentEvent::Notice { level, text } => {
+                self.cells.push(HistoryCell::Separator {
+                    label: Some(notice_label(level, &text)),
+                });
+            }
             AgentEvent::Cancelled => {
                 self.cells.push(HistoryCell::Separator {
                     label: Some("Interrupted".into()),
@@ -2205,6 +2249,114 @@ mod tests {
                 is_error,
             },
         }
+    }
+
+    /// 连续两条 `ReasoningDelta{Content}` 必须合并进**同一个** `Reasoning` cell，
+    /// 且文本是拼接结果——这是「CoT 是一块、不是一 token 一块」的契约。
+    #[test]
+    fn reasoning_delta_accumulates_into_a_reasoning_block() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::ReasoningDelta {
+                text: "first ".into(),
+                kind: yi_agent_core::ReasoningKind::Content,
+            },
+            80,
+        );
+        s.push_event(
+            AgentEvent::ReasoningDelta {
+                text: "second".into(),
+                kind: yi_agent_core::ReasoningKind::Content,
+            },
+            80,
+        );
+        assert_eq!(s.cells.len(), 1, "two deltas must merge into one block");
+        match &s.cells[0] {
+            HistoryCell::Reasoning { text, expanded } => {
+                assert_eq!(text, "first second");
+                assert!(!*expanded, "the block starts folded");
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+    }
+
+    /// 推理块只在末尾仍是推理块时追加；中间插入别的 cell 后必须另起一块。
+    #[test]
+    fn reasoning_delta_after_other_content_starts_a_new_block() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::ReasoningDelta {
+                text: "think".into(),
+                kind: yi_agent_core::ReasoningKind::Content,
+            },
+            80,
+        );
+        s.push_event(AgentEvent::AssistantText("answer".into()), 80);
+        s.push_event(
+            AgentEvent::ReasoningDelta {
+                text: "more".into(),
+                kind: yi_agent_core::ReasoningKind::Summary,
+            },
+            80,
+        );
+        let blocks = s
+            .cells
+            .iter()
+            .filter(|c| matches!(c, HistoryCell::Reasoning { .. }))
+            .count();
+        assert_eq!(blocks, 2, "a non-reasoning cell must break the run");
+    }
+
+    /// `Notice` 走状态行（Separator），且带级别标记与原文。
+    #[test]
+    fn notice_pushes_a_status_line_separator() {
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::Notice {
+                level: yi_agent_core::NoticeLevel::Warn,
+                text: "该模型不支持所配推理档，已忽略".into(),
+            },
+            80,
+        );
+        assert_eq!(s.cells.len(), 1);
+        match &s.cells[0] {
+            HistoryCell::Separator { label } => {
+                let label = label.as_deref().expect("a notice must carry its text");
+                assert!(
+                    label.contains("该模型不支持所配推理档，已忽略"),
+                    "got {label:?}"
+                );
+                assert!(label.contains('⚠'), "Warn must be marked: {label:?}");
+            }
+            other => panic!("expected Separator, got {other:?}"),
+        }
+    }
+
+    /// 一条新的推理 delta 必须让**已折叠**的推理块重渲染，而不是吃缓存里的旧
+    /// 预览。这条钉住流式追加与渲染缓存之间的配合（同 `AssistantText` 的意义）。
+    #[test]
+    fn streaming_reasoning_delta_invalidates_the_cached_render() {
+        let width = 30u16;
+        let mut s = HistoryState::new();
+        s.push_event(
+            AgentEvent::ReasoningDelta {
+                text: "short".into(),
+                kind: yi_agent_core::ReasoningKind::Content,
+            },
+            width,
+        );
+        let before = s.flattened_line_count(width);
+        s.push_event(
+            AgentEvent::ReasoningDelta {
+                text: " and then a much longer tail that must wrap onto more display lines".into(),
+                kind: yi_agent_core::ReasoningKind::Content,
+            },
+            width,
+        );
+        assert!(
+            s.flattened_line_count(width) > before,
+            "the new text must be rendered, not served from cache"
+        );
     }
 
     #[test]

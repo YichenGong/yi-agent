@@ -33,6 +33,13 @@ pub enum HistoryCell {
     },
     /// Full-width dim separator line between turns.
     Separator { label: Option<String> },
+    /// Streamed chain-of-thought block. Display-only: never part of the
+    /// assistant content, never replayed into later turns (design §6.3).
+    ///
+    /// Consecutive deltas accumulate into one block, which is what keeps a
+    /// long CoT from becoming one cell per token. Folded by default so a
+    /// reasoning model does not bury the answer; `Ctrl+O` expands it.
+    Reasoning { text: String, expanded: bool },
     /// Permission request prompt. Shows a menu for the user to choose a decision.
     /// Permission request prompt. Shows a menu for the user to choose a decision.
     PermissionRequest {
@@ -92,6 +99,7 @@ impl HistoryCell {
                 expanded,
             } => render_tool_result(result_text, *is_error, *expanded, width),
             Self::Separator { label } => render_separator(label.as_deref(), width),
+            Self::Reasoning { text, expanded } => render_reasoning(text, *expanded, width),
             Self::PermissionRequest {
                 tool_name,
                 summary,
@@ -118,7 +126,10 @@ impl HistoryCell {
     /// Whether this cell is foldable (can be toggled with Ctrl+O).
     #[allow(dead_code)]
     pub fn is_foldable(&self) -> bool {
-        matches!(self, Self::ToolCall { .. } | Self::ToolResult { .. })
+        matches!(
+            self,
+            Self::ToolCall { .. } | Self::ToolResult { .. } | Self::Reasoning { .. }
+        )
     }
 
     /// Toggle the expanded state. No-op for non-foldable cells.
@@ -126,6 +137,7 @@ impl HistoryCell {
         match self {
             Self::ToolCall { expanded, .. } => *expanded = !*expanded,
             Self::ToolResult { expanded, .. } => *expanded = !*expanded,
+            Self::Reasoning { expanded, .. } => *expanded = !*expanded,
             _ => {}
         }
     }
@@ -286,6 +298,58 @@ fn render_separator(label: Option<&str>, width: u16) -> Vec<Line<'static>> {
                 .collect()
         }
     }
+}
+
+/// Render the CoT block: a dim 「思考」 header plus the reasoning text.
+///
+/// Folded by default and capped at `MAX_COLLAPSED_LINES` body lines, because
+/// reasoning models can emit paragraphs before the answer and the transcript
+/// must still be scannable. Every line is folded by display width and styled dim
+/// so the block never competes with the assistant's answer.
+fn render_reasoning(text: &str, expanded: bool, width: u16) -> Vec<Line<'static>> {
+    let w = width.max(1) as usize;
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let header_style = Style::new()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM | Modifier::ITALIC);
+    let mut lines: Vec<Line<'static>> = wrap_by_display_width("思考", w, "✻ ", "  ")
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            if i == 0 {
+                Line::styled(chunk, header_style)
+            } else {
+                Line::styled(chunk, dim)
+            }
+        })
+        .collect();
+
+    let body = wrap_by_display_width(text, w, "  ", "  ");
+    let truncated = !expanded && body.len() > MAX_COLLAPSED_LINES;
+    let shown = if truncated {
+        MAX_COLLAPSED_LINES
+    } else {
+        body.len()
+    };
+    for chunk in body.iter().take(shown) {
+        lines.push(Line::styled(chunk.clone(), dim));
+    }
+    if truncated {
+        let hidden = body.len() - MAX_COLLAPSED_LINES;
+        for chunk in wrap_by_display_width(
+            &format!("  … (+{hidden} more lines, [e] to expand)"),
+            w,
+            "",
+            "  ",
+        ) {
+            lines.push(Line::styled(chunk, dim));
+        }
+    } else if expanded && !body.is_empty() {
+        for chunk in wrap_by_display_width("  [e] to collapse", w, "", "  ") {
+            lines.push(Line::styled(chunk, dim));
+        }
+    }
+    lines
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -595,6 +659,7 @@ mod tests {
         match c {
             HistoryCell::ToolCall { expanded, .. } => *expanded,
             HistoryCell::ToolResult { expanded, .. } => *expanded,
+            HistoryCell::Reasoning { expanded, .. } => *expanded,
             _ => false,
         }
     }
@@ -645,6 +710,70 @@ mod tests {
             expanded: false,
         };
         assert!(cell.is_foldable());
+    }
+
+    /// 推理块是 (a) 可折叠、(b) 全 dim 渲染、(c) 带「思考」头。
+    ///
+    /// dim 是设计要求（§6.1）：CoT 不能和助手答案同等醒目。折叠默认开启，
+    /// 因为推理模型会先吐几段话，不折叠会把答案推出屏幕。
+    #[test]
+    fn reasoning_block_renders_dim_with_a_header_and_folds() {
+        let cell = HistoryCell::Reasoning {
+            text: "line one\nline two".into(),
+            expanded: false,
+        };
+        assert!(cell.is_foldable(), "Ctrl+O must be able to expand it");
+        let lines = cell.lines(80);
+        let rendered: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(
+            rendered[0].contains("思考"),
+            "the header must name the block, got {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("line one")),
+            "the reasoning text must be shown, got {rendered:?}"
+        );
+        for line in &lines {
+            // ratatui applies the line's style on top of each span at render
+            // time, so a dim `Line::styled` is genuinely dim even though the
+            // span itself is unstyled.
+            let line_style = line.style;
+            for span in &line.spans {
+                let effective = span.style.patch(line_style);
+                assert!(
+                    effective.add_modifier.contains(Modifier::DIM),
+                    "every reasoning span must be dim, got {effective:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folded_reasoning_truncates_long_bodies() {
+        let long = (0..20)
+            .map(|i| format!("thought {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let folded = HistoryCell::Reasoning {
+            text: long.clone(),
+            expanded: false,
+        };
+        let mut expanded = folded.clone();
+        expanded.toggle_fold();
+        assert!(
+            expanded.lines(60).len() > folded.lines(60).len(),
+            "expanding must reveal the full body"
+        );
+        let rendered = folded
+            .lines(60)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains("expand"),
+            "a truncated block must say how to expand, got {rendered:?}"
+        );
     }
 
     #[test]

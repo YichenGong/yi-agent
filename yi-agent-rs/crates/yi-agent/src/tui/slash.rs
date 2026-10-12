@@ -3,6 +3,16 @@
 use crate::control_commands::{CommandSpec, ControlCommand};
 use crate::tui::runtime_prefs::RuntimePreference;
 
+/// The seven reasoning-effort tiers, in ascending order.
+///
+/// Single source of truth for the TUI's `/effort` validation. The app-server
+/// (`model_rpc::upsert`, `server.rs`'s `thread/setReasoningEffort`) and the
+/// model catalog use the same set; a wrong value here would be caught by the
+/// driver's own rebuild, but a typo would then surface as an opaque error
+/// instead of the usage line.
+pub const REASONING_EFFORT_TIERS: [&str; 7] =
+    ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 /// A slash command the user can invoke from the TUI input.
 ///
 /// Adds metadata (description, arg requirements) needed for the popup UI.
@@ -11,6 +21,7 @@ pub enum SlashCommand {
     Quit,
     Clear,
     Model,
+    Effort,
     Cost,
     Compact,
     Config,
@@ -67,6 +78,7 @@ impl SlashCommand {
             Self::Quit
             | Self::Clear
             | Self::Model
+            | Self::Effort
             | Self::Cost
             | Self::Compact
             | Self::Config
@@ -88,6 +100,7 @@ impl SlashCommand {
             SlashCommand::Quit => "quit",
             SlashCommand::Clear => "clear",
             SlashCommand::Model => "model",
+            SlashCommand::Effort => "effort",
             SlashCommand::Cost => "cost",
             SlashCommand::Compact => "compact",
             SlashCommand::Config => "config",
@@ -127,6 +140,7 @@ impl SlashCommand {
             SlashCommand::Quit => "退出程序",
             SlashCommand::Clear => "清空对话上下文",
             SlashCommand::Model => "查看模型清单 / 切换模型",
+            SlashCommand::Effort => "查看或设置本会话的推理档（reasoning effort）",
             SlashCommand::Cost => "显示 token 使用量",
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
@@ -168,6 +182,8 @@ impl SlashCommand {
             // 清单里同名的条目永远无法通过 `/model` 选中（见
             // `handle_model_command` 与未知名提示文案）。
             SlashCommand::Model => Some("[<name>|default]"),
+            // `default` 同 `/model` 是保留字（清空本会话覆盖、回落条目默认）。
+            SlashCommand::Effort => Some("[none|minimal|low|medium|high|xhigh|max|default]"),
             SlashCommand::Agent => Some("<task-id>"),
             SlashCommand::Events | SlashCommand::Diff | SlashCommand::Mailbox => Some("<task-id>"),
             SlashCommand::Message => Some("<task-id> <text>"),
@@ -199,6 +215,7 @@ impl SlashCommand {
             SlashCommand::Quit,
             SlashCommand::Clear,
             SlashCommand::Model,
+            SlashCommand::Effort,
             SlashCommand::Cost,
             SlashCommand::Compact,
             SlashCommand::Config,
@@ -367,6 +384,33 @@ pub fn parse_runtime_args(args: &str) -> Result<RuntimeAction, String> {
         ["always"] => Ok(RuntimeAction::Set(RuntimePreference::Always)),
         ["never"] => Ok(RuntimeAction::Set(RuntimePreference::Never)),
         _ => Err("用法: /runtime [ask|always|never]".into()),
+    }
+}
+
+/// A parsed `/effort` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EffortAction {
+    /// Show the current effective effort and where it comes from.
+    Status,
+    /// Clear the session override and fall back to the catalog entry's default.
+    Clear,
+    /// Set the session override to one of the seven tiers.
+    Set(String),
+}
+
+/// Parse `/effort` arguments. Returns a user-facing usage error on bad input.
+///
+/// `default` is a reserved word (clear the override), mirroring `/model`; it is
+/// deliberately not spellable as a tier.
+pub fn parse_effort_args(args: &str) -> Result<EffortAction, String> {
+    match args.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] | ["status"] => Ok(EffortAction::Status),
+        ["default"] => Ok(EffortAction::Clear),
+        [tier] if REASONING_EFFORT_TIERS.contains(tier) => Ok(EffortAction::Set((*tier).into())),
+        _ => Err(format!(
+            "用法: /effort [{}|default]",
+            REASONING_EFFORT_TIERS.join("|")
+        )),
     }
 }
 
@@ -883,6 +927,52 @@ mod tests {
             Some("[ask|always|never]")
         );
         assert!(SlashCommand::all().contains(&SlashCommand::Runtime));
+    }
+
+    /// `/effort` 接受七档、`default`、空参（=status），拒绝白名单外的值。
+    ///
+    /// 空参与 `default` 分属两个动作（看状态 vs 清覆盖），绝不能混：否则
+    /// `/effort default` 会静默变成「打印状态」，用户的清覆盖意图就丢了。
+    #[test]
+    fn parse_effort_args_accepts_every_tier_clear_and_status() {
+        assert_eq!(parse_effort_args(""), Ok(EffortAction::Status));
+        assert_eq!(parse_effort_args("status"), Ok(EffortAction::Status));
+        assert_eq!(parse_effort_args("  "), Ok(EffortAction::Status));
+        assert_eq!(parse_effort_args("default"), Ok(EffortAction::Clear));
+        for tier in REASONING_EFFORT_TIERS {
+            assert_eq!(
+                parse_effort_args(tier),
+                Ok(EffortAction::Set(tier.to_string())),
+                "tier {tier} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_effort_args_rejects_unknown_tier_and_extra_tokens() {
+        let usage = format!(
+            "用法: /effort [{}|default]",
+            REASONING_EFFORT_TIERS.join("|")
+        );
+        assert_eq!(parse_effort_args("bogus"), Err(usage.clone()));
+        assert_eq!(parse_effort_args("high max"), Err(usage.clone()));
+        assert_eq!(parse_effort_args("HIGH"), Err(usage));
+    }
+
+    #[test]
+    fn effort_command_is_registered_with_usage_and_help() {
+        assert_eq!(
+            SlashCommand::from_name("effort"),
+            Some(SlashCommand::Effort)
+        );
+        assert_eq!(SlashCommand::Effort.name(), "effort");
+        assert_eq!(
+            SlashCommand::Effort.argument_usage(),
+            Some("[none|minimal|low|medium|high|xhigh|max|default]")
+        );
+        assert!(SlashCommand::all().contains(&SlashCommand::Effort));
+        assert!(help_text(None).contains("/effort"));
+        assert!(help_text(Some("effort")).contains("/effort"));
     }
 
     #[test]
