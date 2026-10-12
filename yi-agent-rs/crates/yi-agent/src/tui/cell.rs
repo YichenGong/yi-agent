@@ -248,7 +248,7 @@ fn render_tool_result(
     let dim = Style::new().add_modifier(Modifier::DIM);
     let summary_style = Style::new().fg(arrow_color).add_modifier(Modifier::DIM);
     // Only the first physical line is previewed when folded; the full text is
-    // available via [e]. Fold it by display width so a multi-byte preview is
+    // available via Ctrl+O. Fold it by display width so a multi-byte preview is
     // neither over-wide nor silently cut.
     let summary = text.lines().next().unwrap_or("");
     let mut lines: Vec<Line<'static>> = wrap_by_display_width(summary, w, "  └ ", "    ")
@@ -337,7 +337,7 @@ fn render_reasoning(text: &str, expanded: bool, width: u16) -> Vec<Line<'static>
     if truncated {
         let hidden = body.len() - MAX_COLLAPSED_LINES;
         for chunk in wrap_by_display_width(
-            &format!("  … (+{hidden} more lines, [e] to expand)"),
+            &format!("  … (+{hidden} more lines, Ctrl+O to expand)"),
             w,
             "",
             "  ",
@@ -345,7 +345,7 @@ fn render_reasoning(text: &str, expanded: bool, width: u16) -> Vec<Line<'static>
             lines.push(Line::styled(chunk, dim));
         }
     } else if expanded && !body.is_empty() {
-        for chunk in wrap_by_display_width("  [e] to collapse", w, "", "  ") {
+        for chunk in wrap_by_display_width("  Ctrl+O to collapse", w, "", "  ") {
             lines.push(Line::styled(chunk, dim));
         }
     }
@@ -402,7 +402,7 @@ fn render_permission_request(
     if truncated {
         let hidden = body_lines.len() - MAX_COLLAPSED_LINES;
         for chunk in wrap_by_display_width(
-            &format!("  … (+{hidden} more lines, [e] to expand)"),
+            &format!("  … (+{hidden} more lines, Ctrl+O to expand)"),
             w,
             "",
             "  ",
@@ -410,7 +410,7 @@ fn render_permission_request(
             lines.push(Line::from(chunk).style(dim_style));
         }
     } else if expanded {
-        for chunk in wrap_by_display_width("  [e] to collapse", w, "", "  ") {
+        for chunk in wrap_by_display_width("  Ctrl+O to collapse", w, "", "  ") {
             lines.push(Line::from(chunk).style(dim_style));
         }
     }
@@ -990,14 +990,17 @@ mod tests {
     fn permission_collapsed_shows_expand_hint_when_truncated() {
         let cell = perm_cell(LONG_CMD, LONG_CMD, false);
         let text = joined_text(&cell.lines(20));
-        assert!(text.contains("[e]"), "expected expand hint: {text:?}");
+        assert!(
+            text.contains("Ctrl+O"),
+            "expected expand hint naming the real fold binding: {text:?}"
+        );
     }
 
     #[test]
     fn permission_not_truncated_has_no_expand_hint() {
         let cell = perm_cell("ls", "ls", false);
         let text = joined_text(&cell.lines(80));
-        assert!(!text.contains("[e]"), "unexpected hint: {text:?}");
+        assert!(!text.contains("Ctrl+O"), "unexpected hint: {text:?}");
     }
 
     #[test]

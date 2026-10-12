@@ -2319,9 +2319,10 @@ impl EffortSource {
 /// selected catalog entry's value applies; with neither, the field is not sent.
 ///
 /// `current_model_ref` is the user-selected display name, and an absent one
-/// means "follow the catalog's `default_model`" — exactly what
-/// `resolve_effective` does for the driver, so this can never disagree with the
-/// actually-running value.
+/// means "follow the catalog's `default_model`" — the same entry
+/// `startup_config_from_catalog` uses for the startup config, so the report
+/// matches the running value: an entry default that is shown is one the driver
+/// actually sends.
 fn resolve_effort_state(
     session_effort: Option<&str>,
     catalog: &yi_agent_runtime::models::ModelCatalog,
