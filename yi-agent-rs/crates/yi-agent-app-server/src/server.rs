@@ -1541,22 +1541,21 @@ fn current_session_model_ref() -> Option<String> {
 thread_local! {
     /// 本次 `build_agent` 调用所属会话的 effort 覆盖（七档之一）。与
     /// [`SESSION_MODEL_REF`] 同一理由：工厂闭包签名带不进这个逐会话参数。
-    /// 槽位为 `Some` 时**覆盖** `resolve_effective` 从条目带出的默认值，
-    /// 实现解析链「会话覆盖 → 条目默认 → 未设置」。
-    static SESSION_REASONING_EFFORT: std::cell::RefCell<Option<Option<String>>> =
+    /// 槽位为 `Some` 时**覆盖** `resolve_effective` 从条目带出的默认值；为 `None`
+    /// 时跟随条目默认。解析链「会话覆盖 → 条目默认 → 未设置」由此收敛：工厂只认
+    /// 「有没有覆盖」，**没有**「强制不发」这一态——清除覆盖等同于未设置(都跟随
+    /// 条目默认),这样 resume 重建与活线程经 provider 自补的路径手感一致。
+    static SESSION_REASONING_EFFORT: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// 在调用工厂(`build_agent`)前设定本次会话的 effort 覆盖，供工厂解析。
 ///
-/// 外层 `Option` 区分「未设置槽位」与「设为清除覆盖(`Some(None)`）」：仅当前者
-/// 时工厂才沿用 `resolve_effective` 的条目默认。调用返回后恢复调用前的值，故嵌套
-/// 调用不会泄漏覆盖。`thread/start` 传 `None`（跟随条目默认），`thread/resume`
-/// 传 `meta.reasoning_effort`。
-pub(crate) fn with_session_reasoning_effort<T>(
-    effort: Option<Option<String>>,
-    f: impl FnOnce() -> T,
-) -> T {
+/// `Some(tier)` 覆盖条目默认；`None` 表示本次会话没有覆盖，工厂沿用
+/// `resolve_effective` 带出的条目默认。调用返回后恢复调用前的值，故嵌套调用不会
+/// 泄漏覆盖。`thread/start` 传 `None`（新会话无覆盖），`thread/resume` 传
+/// `meta.reasoning_effort`（清过的即为 `None` ⇒ 同样回落条目默认）。
+pub(crate) fn with_session_reasoning_effort<T>(effort: Option<String>, f: impl FnOnce() -> T) -> T {
     SESSION_REASONING_EFFORT.with(|slot| {
         let prev = slot.replace(effort);
         let out = f();
@@ -1566,8 +1565,8 @@ pub(crate) fn with_session_reasoning_effort<T>(
 }
 
 /// 工厂内部读取当前会话的 effort 覆盖；不在
-/// [`with_session_reasoning_effort`] 内时返回 `None`（未设置槽位）。
-fn current_session_reasoning_effort() -> Option<Option<String>> {
+/// [`with_session_reasoning_effort`] 内时为 `None`（无覆盖，跟随条目默认）。
+fn current_session_reasoning_effort() -> Option<String> {
     SESSION_REASONING_EFFORT.with(|slot| slot.borrow().clone())
 }
 
@@ -1601,11 +1600,13 @@ pub(crate) fn production_factory(
             model_ref.as_deref(),
         );
         // 会话 effort 覆盖（若有）优先于条目默认：`resolve_effective` 已带出条目
-        // 的 `reasoning_effort`，仅当槽位显式设为 `Some(_)` 时才覆盖——`Some(None)`
-        // 表示「清除覆盖，回落到未设置（不发该字段）」，`None`（未设槽位）表示
-        // 「跟随条目默认」。
+        // 的 `reasoning_effort`，仅当槽位**确有覆盖**（`Some(tier)`）时才覆盖它。
+        // 槽位为 `None` 时一律保留条目默认 —— 这同时覆盖「新会话无覆盖」与「显式
+        // 清除覆盖」：清除 = 回落条目默认（解析链第 2 级），而非不发该字段。二者
+        // 必须一致，否则同一个 meta 在「活线程清除」（provider 自补条目档）与
+        // 「resume 重建」两条路径上会有两种线上行为。
         if let Some(effort) = current_session_reasoning_effort() {
-            thread_cfg.reasoning_effort = effort;
+            thread_cfg.reasoning_effort = Some(effort);
         }
         let built = yi_agent_runtime::bootstrap::bootstrap_agent(
             &thread_cfg,
@@ -3445,6 +3446,12 @@ where
                         // `agent.config().model` 才能保证「上报 == 实际运行」。
                         let model = built.agent.config().model.clone();
 
+                        // 与 `model` 同源:上报**实际建出**的 agent 的生效档位。
+                        // 用硬编码 null 会在条目带默认档时谎报(本会话其实跑着该档),
+                        // 且与 resume 的口径不一致。
+                        let reasoning_effort =
+                            built.agent.config().gen_params.reasoning_effort.clone();
+
                         // 内核负责「attach_delegation → 建 driver 通道 → insert 到
                         // `threads` → spawn 守望者与 driver」;RPC 层的通知与响应仍在
                         // 本分支完成,与抽取前逐字一致。
@@ -3493,8 +3500,9 @@ where
                                     "model": model,
                                     "model_ref": model_ref,
                                     "permission_mode": mode,
-                                    // 新会话无 effort 覆盖(跟随条目默认)。
-                                    "reasoning_effort": serde_json::Value::Null,
+                                    // 新会话无覆盖 ⇒ 上报实际运行值(解析出的条目默认
+                                    // 或 cfg;都没有则 null),与实际建出的 agent 同源。
+                                    "reasoning_effort": reasoning_effort,
                                 }),
                             ),
                         )
@@ -3579,10 +3587,9 @@ where
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
                         let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
-                            with_session_reasoning_effort(
-                                Some(loaded.meta.reasoning_effort.clone()),
-                                || build_agent(Some(session), Path::new(&cwd), mode),
-                            )
+                            with_session_reasoning_effort(loaded.meta.reasoning_effort.clone(), || {
+                                build_agent(Some(session), Path::new(&cwd), mode)
+                            })
                         }) {
                             Ok(a) => a,
                             Err(e) => {
@@ -3600,6 +3607,11 @@ where
                         // (任务 7 评审 Finding 1);不照抄 meta.model 也是为了让旧库/异常库里
                         // 一个与当前清单不符的陈旧串被本次实际生效值取代。
                         let model = built.agent.config().model.clone();
+                        // 与 `model` 同源:上报**实际建出**的 agent 的生效档位。清除覆盖
+                        // 后的 meta 是 `None`,但工厂此时已回落到条目默认,故响应必须报
+                        // 该实际值,而非照抄 meta 的 null(否则客户端挂着的控件会骗人)。
+                        let reasoning_effort =
+                            built.agent.config().gen_params.reasoning_effort.clone();
                         let runtime_dir =
                             yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
                         let activation = attach_delegation(
@@ -3766,7 +3778,7 @@ where
                                     "model": model,
                                     "model_ref": loaded.meta.model_ref,
                                     "permission_mode": loaded.meta.permission_mode,
-                                    "reasoning_effort": loaded.meta.reasoning_effort,
+                                    "reasoning_effort": reasoning_effort,
                                 }),
                             ),
                         )
@@ -18921,6 +18933,98 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 评审修正(important):显式清除覆盖后,解析链第 2 级 —— **条目默认** ——
+    /// 必须生效,而不是落到「未设置」。
+    ///
+    /// 同一份 meta(无覆盖 + 条目默认 `low`)在两条路径上必须落到同一结果:
+    /// 活线程的清理由 driver 把 `gen_params.reasoning_effort` 置 `None`、provider
+    /// 再自补其烤入的条目档;冷线程 resume 走工厂重建,工厂**不得**把
+    /// `resolve_effective` 刚带出的条目默认覆盖掉。故 resume 报出的生效值必须是
+    /// 条目默认 `low`,而非 `null`(修此前「重启后两手感」的内部不一致)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clearing_the_override_falls_back_to_the_entry_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        cfg.provider = "openai".to_string();
+        cfg.api_url = "https://a.example".to_string();
+        cfg.api_key = "key-a".to_string();
+        cfg.model = "model-a".to_string();
+        // 注入清单:全局默认即条目 A,且 A 带默认档 "low"(三个字段同源,免动 HOME)。
+        let mut catalog = model_catalog_entries(Some("A"));
+        catalog.models[0].reasoning_effort = Some("low".into());
+        let factory = production_factory(cfg.clone(), test_theme(), Arc::new(catalog));
+        let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        // (c) 无覆盖 + 条目默认 low → start 必须上报实际运行的 "low"
+        // (此前硬编码 null,与本会话真正跑的值不符)。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let mut start = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                start = Some(v);
+                break;
+            }
+        }
+        let start = start.expect("thread/start must respond");
+        let tid = start["result"]["thread_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            start["result"]["reasoning_effort"], "low",
+            "start must report the effort the built agent runs: {start}"
+        );
+
+        // (a) 设覆盖 high → 落盘。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"high"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["result"]["ok"], true, "got {v}");
+
+        // (b) 清除覆盖(effort: null)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":null}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 4).await;
+        assert_eq!(v["result"]["ok"], true, "got {v}");
+        assert!(
+            v["result"]["effort"].is_null(),
+            "the response must echo the cleared override: {v}"
+        );
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("thread persists");
+        assert_eq!(
+            loaded.meta.reasoning_effort, None,
+            "a clear must drop the persisted override"
+        );
+
+        // (b) 冷 resume:工厂按 meta(无覆盖)重建 ⇒ 条目默认 low 必须生效。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resumed = None;
+        for _ in 0..24 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                resumed = Some(v);
+                break;
+            }
+        }
+        let resumed = resumed.expect("thread/resume must respond");
+        assert_eq!(
+            resumed["result"]["reasoning_effort"], "low",
+            "resume with a cleared override must fall back to the entry default: {resumed}"
+        );
+        h.shutdown().await;
+    }
+
     /// 回归任务 7 评审 Finding 1:上报/落盘的 `model` 必须等于工厂**实际建出**的
     /// agent 的 `agent.config().model`,而不是另按清单再解析一次的结果。二者在
     /// 「工厂持有启动时快照、另解析却重读磁盘」时会分歧(运行期 `model/upsert`
@@ -20024,7 +20128,7 @@ pub(crate) mod tests {
         let factory = production_factory(test_config(), test_theme(), Arc::new(catalog));
 
         // 会话覆盖 high → 胜过条目默认 low。
-        let built = with_session_reasoning_effort(Some(Some("high".to_string())), || {
+        let built = with_session_reasoning_effort(Some("high".to_string()), || {
             factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
         })
         .expect("bootstrap");
@@ -20042,15 +20146,24 @@ pub(crate) mod tests {
             "without an override the entry default must apply"
         );
 
-        // 显式清除覆盖 `Some(None)` → 落到「未设置」(不发该字段),而非条目默认。
-        let built = with_session_reasoning_effort(Some(None), || {
+        // 清除覆盖后的 resume 走的是**同一入参**：`thread/resume` 把 meta 的
+        // `None` 直接交给槽位，故「清除」与「从未设过」在工厂侧不可区分——这正是
+        // 要求的收敛：二者都必须保留条目默认 low（第 2 级），而不是「不发该字段」。
+        // 活线程的清除路径同样落到条目默认（driver 把 gen_params 置空后 provider
+        // 自补其烤入的同一条目档），两条路径手感一致。
+        let cleared = with_session_reasoning_effort(None, || {
             factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
         })
         .unwrap();
         assert_eq!(
-            built.agent.config().gen_params.reasoning_effort,
-            None,
-            "an explicit clear must fall through to unset, not the entry default"
+            cleared
+                .agent
+                .config()
+                .gen_params
+                .reasoning_effort
+                .as_deref(),
+            Some("low"),
+            "a cleared override must fall back to the entry default, not to unset"
         );
     }
 
@@ -20068,7 +20181,7 @@ pub(crate) mod tests {
     fn the_session_effort_override_does_not_leak_across_calls() {
         let dir = tempfile::TempDir::new().unwrap();
         let factory = production_factory(test_config(), test_theme(), test_catalog());
-        let built = with_session_reasoning_effort(Some(Some("max".to_string())), || {
+        let built = with_session_reasoning_effort(Some("max".to_string()), || {
             factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
         })
         .unwrap();
