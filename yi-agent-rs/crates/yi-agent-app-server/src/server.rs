@@ -8959,6 +8959,17 @@ pub(crate) mod tests_support {
     /// 不一致会凭空造出「上报 != 运行」的假象。
     pub(crate) const TEST_MODEL: &str = "test-model";
 
+    /// 等待一个**必然到来**的正面事件（一帧 JSONL、一条 turn 事件、server 任务结束）
+    /// 时使用的上限。
+    ///
+    /// 这些等待的语义是「最终一定会来」；`5s` 只够空载机器，满载（CI 上并跑
+    /// 数十个测试）时正确实现也会错过它，于是把宿主机负载误报成产品 bug。放宽上限
+    /// 只是把「机器忙」从失败里排除掉，断言强度一字未动。
+    ///
+    /// 不要拿它当「断言某事**不该**发生」的观察窗口——那种负等待要的是**短**窗口
+    /// （`Harness::try_read_value` 等）。
+    pub(crate) const EVENT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// 对一条已连接的 ws 发 `initialize` 并读回响应。
     ///
     /// 跨传输复用(`ws.rs` 的多客户端 E2E 与若干准入测试都要先握手),故放在
@@ -9006,6 +9017,8 @@ pub(crate) mod tests_support {
 pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    use super::tests_support::EVENT_WAIT;
 
     /// 单轮逻辑是共享的 `watch::once`(Task 3 已在其自身 crate 内测过);这里只
     /// 断言 app-server 用的是同名同款:读登记 → 把登记项目交给 ensurer。
@@ -10188,7 +10201,7 @@ pub(crate) mod tests {
 
         pub(crate) async fn read_value(&mut self) -> serde_json::Value {
             let mut buf = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(5), self.client_r.read_line(&mut buf))
+            let n = tokio::time::timeout(EVENT_WAIT, self.client_r.read_line(&mut buf))
                 .await
                 .expect("timed out waiting for a message")
                 .expect("read_line failed");
@@ -10222,7 +10235,7 @@ pub(crate) mod tests {
                 client_w, handle, ..
             } = self;
             drop(client_w);
-            let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            let res = tokio::time::timeout(EVENT_WAIT, handle)
                 .await
                 .expect("server must shut down within the timeout")
                 .expect("server task must not panic");
@@ -10285,7 +10298,8 @@ pub(crate) mod tests {
         // 在盘上"的版本：turn-start 那次写入只有用户 item（items 长度 1），
         // 助手 item 只能由 500ms tick 的 flush 分支落盘。
         let mut saved: Option<serde_json::Value> = None;
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while tokio::time::Instant::now() < deadline {
             if let Ok(t) = std::fs::read_to_string(&partial) {
                 let v: serde_json::Value = serde_json::from_str(&t).unwrap();
                 if v["items"].as_array().map(|a| a.len() >= 2).unwrap_or(false) {
@@ -10350,7 +10364,8 @@ pub(crate) mod tests {
             .path()
             .join(".yi-agent/threads")
             .join(format!("{tid}.partial.json"));
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while tokio::time::Instant::now() < deadline {
             if !partial.exists() {
                 break;
             }
@@ -10992,7 +11007,7 @@ pub(crate) mod tests {
 
         // 什么都不发,直接关掉写端 → server 应看到 EOF 并 Ok(()) 退出。
         drop(client_w);
-        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+        let result = tokio::time::timeout(EVENT_WAIT, handle)
             .await
             .expect("server must exit within the timeout")
             .expect("server task must not panic");
@@ -11098,7 +11113,7 @@ pub(crate) mod tests {
         );
 
         drop(client_w);
-        let res = tokio::time::timeout(Duration::from_secs(5), handle)
+        let res = tokio::time::timeout(EVENT_WAIT, handle)
             .await
             .expect("server must shut down within the timeout")
             .expect("server task must not panic");
@@ -11151,7 +11166,7 @@ pub(crate) mod tests {
         let _ = client_w.write_all(&frame).await;
         let _ = client_w.flush().await;
 
-        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+        let result = tokio::time::timeout(EVENT_WAIT, handle)
             .await
             .expect("server must exit within the timeout")
             .expect("server task must not panic");
@@ -12950,7 +12965,7 @@ pub(crate) mod tests {
         // 干净的 RED 输出，而不是让整个测试套件挂死。
         let mut buf = String::new();
         let got = rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(5), h.client_r.read_line(&mut buf)).await
+            tokio::time::timeout(EVENT_WAIT, h.client_r.read_line(&mut buf)).await
         });
         let Ok(Ok(n)) = got else {
             std::mem::forget(rt);
@@ -13749,7 +13764,8 @@ pub(crate) mod tests {
 
         // 精确等到 provider 已经进入 call_stream（请求在途、响应头未回）再打断，
         // 否则 Stop 会落在它之前的 Check 1，测不出这个窗口。
-        for _ in 0..500 {
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while tokio::time::Instant::now() < deadline {
             if SLOW_CALL_ENTERED.load(Ordering::SeqCst) {
                 break;
             }
@@ -13855,7 +13871,7 @@ pub(crate) mod tests {
         let mut status = None;
         for _ in 0..10 {
             let mut buf = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(5), client_r.read_line(&mut buf))
+            let n = tokio::time::timeout(EVENT_WAIT, client_r.read_line(&mut buf))
                 .await
                 .expect("timed out waiting for a notification")
                 .unwrap();
@@ -13876,12 +13892,12 @@ pub(crate) mod tests {
 
         drop(prompt_tx);
         drop(interrupt_tx);
-        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+        let ev = tokio::time::timeout(EVENT_WAIT, turn_rx.recv())
             .await
             .unwrap()
             .unwrap();
         assert!(matches!(ev, TurnEvent::Finished { .. }));
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = tokio::time::timeout(EVENT_WAIT, handle).await;
     }
 
     /// Critical 2:往一个已注销的 **ws** 客户端写响应**不得**是致命错误。
@@ -13976,14 +13992,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+        let ev = tokio::time::timeout(EVENT_WAIT, turn_rx.recv())
             .await
             .expect("driver must report Finished even when writes fail")
             .expect("turn channel must stay open");
         assert!(matches!(ev, TurnEvent::Finished { ref turn_id, .. } if turn_id == "turn-1"));
 
         drop(prompt_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = tokio::time::timeout(EVENT_WAIT, handle).await;
     }
 
     /// 回归:driver 空闲(没有 turn 在跑)时,也必须在有限时间内响应会话命令。
@@ -14044,7 +14060,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let outcome = tokio::time::timeout(Duration::from_secs(5), answer)
+        let outcome = tokio::time::timeout(EVENT_WAIT, answer)
             .await
             .expect("an idle driver must service a session command without a new turn")
             .expect("the reply channel must be fulfilled");
@@ -14314,7 +14330,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
 
-        let result = tokio::time::timeout(Duration::from_secs(5), answer)
+        let result = tokio::time::timeout(EVENT_WAIT, answer)
             .await
             .expect("an idle driver must service SetModel without a new turn")
             .expect("the reply channel must be fulfilled");
@@ -14389,7 +14405,7 @@ pub(crate) mod tests {
                 .unwrap();
             loop {
                 let mut buf = String::new();
-                let n = tokio::time::timeout(Duration::from_secs(5), client_r.read_line(&mut buf))
+                let n = tokio::time::timeout(EVENT_WAIT, client_r.read_line(&mut buf))
                     .await
                     .expect("timed out waiting for a notification")
                     .unwrap();
@@ -14405,7 +14421,7 @@ pub(crate) mod tests {
                     break;
                 }
             }
-            let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+            let ev = tokio::time::timeout(EVENT_WAIT, turn_rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -14426,7 +14442,7 @@ pub(crate) mod tests {
         );
 
         drop(prompt_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = tokio::time::timeout(EVENT_WAIT, handle).await;
     }
 
     /// 第一次调用触发一个受权限管控的 bash 工具调用;第二次调用返回文本并结束。
@@ -14919,7 +14935,7 @@ pub(crate) mod tests {
         let mut approval_id = None;
         for _ in 0..20 {
             let mut buf = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(5), client_r.read_line(&mut buf))
+            let n = tokio::time::timeout(EVENT_WAIT, client_r.read_line(&mut buf))
                 .await
                 .expect("timed out")
                 .unwrap();
@@ -14949,14 +14965,14 @@ pub(crate) mod tests {
             .expect("pending approval must survive a stale interrupt");
         sender.send(Decision::AllowOnce).unwrap();
 
-        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+        let ev = tokio::time::timeout(EVENT_WAIT, turn_rx.recv())
             .await
             .expect("turn must finish")
             .unwrap();
         assert!(matches!(ev, TurnEvent::Finished { ref turn_id, .. } if turn_id == "turn-1"));
 
         drop(prompt_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = tokio::time::timeout(EVENT_WAIT, handle).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -15847,7 +15863,8 @@ pub(crate) mod tests {
             .join(format!("{tid}.jsonl"));
         // 落盘是尽力而为且发生在 driver 写完 turn/completed 之后,故轮询等待。
         let mut text = String::new();
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while tokio::time::Instant::now() < deadline {
             match std::fs::read_to_string(&log) {
                 Ok(t) if !t.trim().is_empty() => {
                     text = t;
@@ -16107,7 +16124,8 @@ pub(crate) mod tests {
             .join(".yi-agent/threads")
             .join(format!("{tid}.jsonl"));
         let mut text = String::new();
-        for _ in 0..100 {
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while tokio::time::Instant::now() < deadline {
             text = std::fs::read_to_string(&log).unwrap_or_default();
             if text.contains("item-turn-t2-1") {
                 break;
@@ -16209,7 +16227,7 @@ pub(crate) mod tests {
             .unwrap();
 
         // 审批请求命中"发起方已断连"分支 → 收尾并 return。
-        let ev = tokio::time::timeout(Duration::from_secs(5), turn_rx.recv())
+        let ev = tokio::time::timeout(EVENT_WAIT, turn_rx.recv())
             .await
             .expect("driver must report Finished when the initiator is gone")
             .expect("turn channel must stay open");
@@ -16231,7 +16249,7 @@ pub(crate) mod tests {
         );
 
         drop(prompt_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        let _ = tokio::time::timeout(EVENT_WAIT, handle).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -16455,7 +16473,8 @@ pub(crate) mod tests {
             .join(".yi-agent/threads")
             .join(format!("{tid}.jsonl"));
         let mut persisted = false;
-        for _ in 0..200 {
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while tokio::time::Instant::now() < deadline {
             if let Ok(t) = std::fs::read_to_string(&log) {
                 if !t.trim().is_empty() {
                     persisted = true;
@@ -17196,7 +17215,8 @@ pub(crate) mod tests {
         // 「本轮已落盘」广播之后（绝不拖住 turn 收尾），故此刻可能先看到兜底标题，
         // 需轮询到期望的 LLM 标题出现（最多 ~1s）再断言。
         let mut title = None;
-        for _ in 0..40 {
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while tokio::time::Instant::now() < deadline {
             let store = crate::thread_store::ThreadStore::new(dir.path());
             if let Ok(Some(loaded)) = store.load(&tid) {
                 if let Some(t) = loaded.meta.title {
@@ -17238,17 +17258,19 @@ pub(crate) mod tests {
             r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
         ))
         .await;
-        let mut title = None;
-        for _ in 0..40 {
-            let store = crate::thread_store::ThreadStore::new(dir.path());
-            if let Ok(Some(loaded)) = store.load(&tid) {
-                if let Some(t) = loaded.meta.title {
-                    title = Some(t);
-                    break;
-                }
-            }
+        // 等待的是**被断言的信号本身**(标题请求已发出并失败),而不是「标题非空」:
+        // 兜底标题在回合开始就由 `touch` 写好,轮询它必然立刻退出,而标题请求发生在
+        // 回合收尾之后——满载时它可能还没发出,抢先断言就会把宿主机负载误报成产品
+        // bug(本用例正是在 12 路负载下暴露的)。
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while title_calls.load(Ordering::SeqCst) < 1 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
+        let title = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .ok()
+            .flatten()
+            .and_then(|loaded| loaded.meta.title);
         // 关键：标题生成请求**必须真的发出过且失败**。仅断言标题等于 fallback 是
         // 不具辨识力的——fallback 与 `touch` 写入的字节完全相同，标题请求一次不发
         // 也照样通过（在基线 commit 上同样通过）。这里以命中计数证明失败路径被走到。
@@ -17749,7 +17771,7 @@ pub(crate) mod tests {
             assert_eq!(killed["result"]["ok"], true, "run {run}");
 
             // 状态必须落到终态之一,而不是仍显示 running。
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + EVENT_WAIT;
             loop {
                 let snap = held
                     .list()
@@ -20096,7 +20118,7 @@ pub(crate) mod tests {
         async fn read_value(&mut self) -> serde_json::Value {
             use tokio::io::AsyncBufReadExt;
             let mut buf = String::new();
-            let n = tokio::time::timeout(Duration::from_secs(5), self.client_r.read_line(&mut buf))
+            let n = tokio::time::timeout(EVENT_WAIT, self.client_r.read_line(&mut buf))
                 .await
                 .expect("timed out waiting for a message")
                 .expect("read_line failed");
@@ -20109,7 +20131,7 @@ pub(crate) mod tests {
                 client_w, handle, ..
             } = self;
             drop(client_w);
-            let res = tokio::time::timeout(Duration::from_secs(5), handle)
+            let res = tokio::time::timeout(EVENT_WAIT, handle)
                 .await
                 .expect("server must shut down within the timeout")
                 .expect("server task must not panic");
@@ -20151,7 +20173,7 @@ pub(crate) mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        let msg = tokio::time::timeout(EVENT_WAIT, ws.next())
             .await
             .expect("timed out waiting for a ws frame")
             .expect("ws stream ended before a frame arrived")
@@ -20372,7 +20394,7 @@ mod theme_watcher_tests {
         let mut saw_light_after_the_lag = false;
         for _ in 0..200 {
             theme.set(crate::settings_store::Theme::Light);
-            match tokio::time::timeout(Duration::from_secs(5), out.recv()).await {
+            match tokio::time::timeout(tests_support::EVENT_WAIT, out.recv()).await {
                 Ok(Some(frame)) => {
                     if frame["method"] == "ui/settings/updated"
                         && frame["params"]["theme"] == "light"
@@ -20402,7 +20424,7 @@ mod theme_watcher_tests {
         let (tx, rx) = tokio::sync::broadcast::channel::<crate::settings_store::Theme>(16);
         let pump = tokio::spawn(pump_theme_notifications(rx, Arc::clone(&hub)));
         drop(tx);
-        let finished = tokio::time::timeout(Duration::from_secs(5), pump)
+        let finished = tokio::time::timeout(tests_support::EVENT_WAIT, pump)
             .await
             .expect("the watcher must exit once the broadcast is closed");
         assert!(finished.is_ok());
