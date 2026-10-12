@@ -59,7 +59,11 @@ pub fn plugin_name() -> &'static str {
 /// The Homebrew prefix is the supported installation; when the plugin is
 /// somewhere else (a `cargo install`, a dev build) fall back to the first
 /// executable named `superpowers-kanban` on `PATH`.
-fn plugin_command() -> std::io::Result<PathBuf> {
+///
+/// Callers resolve this once and pass the resulting path to
+/// [`install_manifest`]: keeping the resolution out of the install lets a test
+/// scaffold a manifest without the plugin being installed on the machine.
+pub fn default_plugin_command() -> std::io::Result<PathBuf> {
     let homebrew = PathBuf::from("/opt/homebrew/bin").join(SUPERVISOR_NAME);
     if homebrew.is_file() {
         return Ok(homebrew);
@@ -82,11 +86,15 @@ fn plugin_command() -> std::io::Result<PathBuf> {
 }
 
 /// Write `<project>/.yi-agent/supervisors/superpowers-kanban.json` (idempotent).
-pub fn install_manifest(project: &Path) -> std::io::Result<()> {
-    let command = plugin_command()?;
+///
+/// `plugin_command` is the absolute path written into the manifest's `command`
+/// field. The caller resolves it (production via [`default_plugin_command`]) and
+/// injects it here so the install is a pure function of its inputs — a test can
+/// name a path that does not exist without the machine deciding the outcome.
+pub fn install_manifest(project: &Path, plugin_command: &Path) -> std::io::Result<()> {
     let dir = project.join(".yi-agent").join("supervisors");
     std::fs::create_dir_all(&dir)?;
-    let text = MANIFEST_TEMPLATE.replace("{command}", &command.to_string_lossy());
+    let text = MANIFEST_TEMPLATE.replace("{command}", &plugin_command.to_string_lossy());
     std::fs::write(dir.join(format!("{SUPERVISOR_NAME}.json")), text)
 }
 
@@ -142,8 +150,9 @@ mod tests {
     #[test]
     fn installing_the_manifest_is_idempotent_and_uses_the_absolute_command() {
         let dir = tempfile::tempdir().unwrap();
-        install_manifest(dir.path()).unwrap();
-        install_manifest(dir.path()).unwrap();
+        let plugin = dir.path().join("bin").join("superpowers-kanban"); // 桩路径
+        install_manifest(dir.path(), &plugin).unwrap();
+        install_manifest(dir.path(), &plugin).unwrap();
         let path = dir
             .path()
             .join(".yi-agent/supervisors/superpowers-kanban.json");
@@ -166,6 +175,28 @@ mod tests {
         );
     }
 
+    /// The manifest's `command` is exactly the plugin path the caller injected,
+    /// even when that path does not exist on this machine. This is what lets a
+    /// test install a manifest without the real plugin being on `PATH`.
+    #[test]
+    fn install_manifest_writes_the_injected_plugin_command_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("superpowers-kanban"); // 故意不创建
+        assert!(!plugin.exists(), "桩路径本就不该存在");
+
+        install_manifest(dir.path(), &plugin).unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                dir.path()
+                    .join(".yi-agent/supervisors/superpowers-kanban.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["command"], plugin.to_string_lossy().as_ref());
+    }
+
     #[test]
     fn enabling_the_switch_creates_the_file_and_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -181,7 +212,8 @@ mod tests {
     #[test]
     fn the_installed_manifest_expands_to_the_plugin_arguments() {
         let dir = tempfile::tempdir().unwrap();
-        install_manifest(dir.path()).unwrap();
+        let plugin = dir.path().join("bin").join("superpowers-kanban"); // 桩路径
+        install_manifest(dir.path(), &plugin).unwrap();
         let path = dir
             .path()
             .join(".yi-agent/supervisors/superpowers-kanban.json");

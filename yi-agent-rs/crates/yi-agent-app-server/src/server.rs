@@ -138,6 +138,11 @@ pub(crate) struct RuntimeAttachments {
     /// Injectable for the same reason `board_dir` is: `board/create` must be
     /// testable without writing the developer's real resident registry.
     pub(crate) resident_dir: PathBuf,
+    /// The absolute path of the `superpowers-kanban` executable written into
+    /// each project's supervisor manifest. Injectable for the same reason
+    /// `board_dir` is: `board/create` must be testable without the plugin being
+    /// installed on the machine.
+    pub(crate) plugin_command: PathBuf,
     /// How `board/create` starts a project's daemon. Injectable for the same
     /// reason `board_dir` is: a test must not spawn a real detached process,
     /// and the app's production launcher is what an integration test would
@@ -1416,6 +1421,7 @@ where
                 .unwrap_or_default(),
             onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
+            plugin_command: yi_agent_boards::scaffold::default_plugin_command().unwrap_or_default(),
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -1489,6 +1495,7 @@ where
                 .unwrap_or_default(),
             onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
+            plugin_command: yi_agent_boards::scaffold::default_plugin_command().unwrap_or_default(),
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -2114,6 +2121,7 @@ where
         onboarding_env_path,
         onboarding_preferences_path,
         resident_dir,
+        plugin_command,
         launcher: board_launcher,
         theme,
         git_diff,
@@ -2734,6 +2742,7 @@ where
                             &project,
                             &board_dir,
                             &resident_dir,
+                            &plugin_command,
                             &mut launcher,
                         ) {
                             Ok(status) => {
@@ -10133,6 +10142,7 @@ pub(crate) mod tests {
                     // 测试里不起真进程:`board/create` 走注入的启动器,
                     // 与 board_dir 注入同一个理由。
                     resident_dir: resident_dir.path().to_path_buf(),
+                    plugin_command: PathBuf::from("/nonexistent/superpowers-kanban"),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
                     git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -10968,6 +10978,7 @@ pub(crate) mod tests {
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
+                plugin_command: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -11042,6 +11053,7 @@ pub(crate) mod tests {
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
+                plugin_command: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -11120,6 +11132,7 @@ pub(crate) mod tests {
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
+                plugin_command: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -20045,6 +20058,7 @@ pub(crate) mod tests {
                     onboarding_env_path: PathBuf::new(),
                     onboarding_preferences_path: PathBuf::new(),
                     resident_dir: PathBuf::new(),
+                    plugin_command: PathBuf::new(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
                     git_diff: crate::git_diff_tool::GitDiffHandle::new(),
