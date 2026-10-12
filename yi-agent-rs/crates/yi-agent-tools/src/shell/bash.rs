@@ -723,19 +723,48 @@ mod tests {
     #[tokio::test]
     async fn dropping_bash_call_stops_the_child_process() {
         let tmp = TempDir::new().unwrap();
+        let pid_file = tmp.path().join("child.pid");
         let marker = tmp.path().join("should-not-exist");
         let tool = Arc::new(make_tool(&tmp));
-        let command = format!("sleep 0.2; touch {}", marker.display());
+        // 先同步写出自身 pid，再长睡，最后才 touch：给出确定的观察点，
+        // 且「是否被杀」可由 pid 存活直接判定。
+        let command = format!(
+            "echo $$ > {}; sleep 30; touch {}",
+            pid_file.display(),
+            marker.display()
+        );
 
         let task = tokio::spawn({
             let tool = tool.clone();
             async move { tool.call(serde_json::json!({"command": command})).await }
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 等子进程真的起来（写出 pid）再取消。原先固定睡 50ms 是**竞态**：满载下
+        // 这个 timer 会迟到，命令可能已经跑完（marker 已写出）才 abort，于是一次
+        // 本该过的用例误报。先确认「已启动」，abort 才确实是在测「取消会杀掉它」。
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pid_file.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .expect("child must have started and written its pid before we cancel it");
+
         task.abort();
         let _ = task.await;
 
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // 取消必须杀掉子进程：有界等待它消失（满载下 SIGKILL 的回收也可能稍晚）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while pid_alive(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !pid_alive(pid),
+            "cancelled tool call must kill the child (pid {pid} still alive)"
+        );
+        // 子进程既亡，其后半段（touch）不可能执行。
         assert!(
             !marker.exists(),
             "child process outlived cancelled tool call"
@@ -979,6 +1008,14 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// 进程 `pid` 是否仍存在。`kill(pid, 0)` 探测：`EPERM` 也算存在（无权限≠不存在），
+    /// 只有 `ESRCH` 才是真的没了。
+    fn pid_alive(pid: i32) -> bool {
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_timeout_kills_the_whole_process_group() {
         let tmp = TempDir::new().unwrap();
@@ -1017,11 +1054,19 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let tool = make_tool(&tmp);
 
-        // 正常结束：后台进程应存活（跨调用长驻）。
-        let marker = tmp.path().join("bg.txt");
+        // 命令：前台先同步写下后台进程的 pid，再退出；后台进程长睡着。
+        //
+        // 前台同步写 pid 是关键——这样 pid 一定可读，断言才能精确区分「后台进程被
+        // 误杀」与「后台进程压根没起来」这两种截然不同的故障。若让后台进程自己晚点
+        // 写，两者症状相同（文件不出现），就无法归因。
+        //
+        // 只用 `sh`（它在 PATH 上，否则本用例的 `sh -c` 根本起不来）与 /bin 的
+        // `sleep`：不依赖 /usr/bin 的 `nohup`/`touch`，避免受限 PATH 下解析失败又被
+        // `>/dev/null 2>&1` 吞掉、外层仍 `exit 0` 的静默误报。
+        let pid_file = tmp.path().join("bg.pid");
         let cmd = format!(
-            "nohup sh -c 'sleep 1; touch {}' >/dev/null 2>&1 & exit 0",
-            marker.display()
+            "sh -c 'sleep 30' >/dev/null 2>&1 & echo $! > {}; exit 0",
+            pid_file.display()
         );
         let result = tool
             // 显式给出 expected_timeout_sec：正常结束时后台进程仍攥着管道，
@@ -1038,19 +1083,31 @@ mod tests {
             result.content
         );
 
-        // 后台进程仍在（未被 disarmed guard 误杀）→ 1 秒后写出 marker。
-        //
-        // 这里轮询「marker 出现」而不是固定睡一个够长的时长：后台进程是 `sleep 1`
-        // 之后再 touch，满载机器上它可能远晚于 1.8s 才被调度到，固定等待就会把
-        // 宿主机负载误报成「后台进程被杀了」。条件轮询只是给足上限，断言不变。
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !marker.exists() && std::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // 等前台 shell 写下后台 pid（只是等「它已写出」这一正面事件，上限给足）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pid_file.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "front-end shell never wrote the background pid ({e}); cmd={cmd:?} result={:?}",
+                    result.content
+                )
+            });
+
+        // 核心断言：调用已返回，后台进程必须仍活着。这是被测属性本身，
+        // 确定且即时——不再依赖「等它稍后写一个文件」这种间接代理。
         assert!(
-            marker.exists(),
-            "background process must survive normal exit"
+            pid_alive(pid),
+            "background process (pid {pid}) must survive normal exit; cmd={cmd:?}"
         );
+
+        // 收尾：不留 `sleep 30` 给后续测试添乱。
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
     }
 
     #[cfg(unix)]
