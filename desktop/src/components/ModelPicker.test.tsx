@@ -71,6 +71,9 @@ function seam({
       if (fail) throw { code: -32025, message: "model_not_found" };
       return { ok: true, model: effective };
     }
+    if (method === "thread/setReasoningEffort") {
+      return { ok: true, effort: (params as { effort: string | null }).effort };
+    }
     return {};
   });
   return { call, calls, setCatalog: (next: ModelList) => (current = next) };
@@ -185,5 +188,87 @@ describe("ModelPicker", () => {
       expect(screen.getByRole("menuitemradio", { name: "C" })).toBeTruthy(),
     );
     expect(calls.filter((c) => c.method === "model/list").length).toBe(2);
+  });
+});
+
+describe("ModelPicker effort control", () => {
+  it("writes the session override and reflects the server's applied effort", async () => {
+    const { call, calls } = seam();
+    const onEffortChanged = vi.fn();
+    render(
+      <ModelPicker
+        call={call}
+        threadId="t1"
+        currentRef={null}
+        currentModel="model-a"
+        currentEffort={null}
+        onChanged={vi.fn()}
+        onEffortChanged={onEffortChanged}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /推理档位/ }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "high" }));
+
+    await waitFor(() =>
+      expect(calls).toContainEqual({
+        method: "thread/setReasoningEffort",
+        params: { threadId: "t1", effort: "high" },
+      }),
+    );
+    expect(onEffortChanged).toHaveBeenCalledWith("t1", "high");
+  });
+
+  it("shows the entry default while there is no session override", async () => {
+    // 条目自己声明了 low：无会话覆盖时控件应显示「继承 low」，与请求会带的档同源。
+    const withEffort: ModelList = { ...catalog, models: catalog.models.map((m) => ({ ...m })) };
+    withEffort.models[0].reasoning_effort = "low";
+    const { call } = seam({ catalog: withEffort });
+    render(
+      <ModelPicker
+        call={call}
+        threadId="t1"
+        currentRef={null}
+        currentModel="model-a"
+        currentEffort={null}
+        onChanged={vi.fn()}
+        onEffortChanged={vi.fn()}
+      />,
+    );
+    const trigger = await screen.findByRole("button", { name: /推理档位/ });
+    await waitFor(() => expect(trigger.textContent).toContain("low"));
+  });
+
+  it("reflects the server-pushed effort for the thread", async () => {
+    const { call } = seam();
+    render(
+      <ModelPicker
+        call={call}
+        threadId="t1"
+        currentRef={null}
+        currentModel="model-a"
+        currentEffort="xhigh"
+        onChanged={vi.fn()}
+        onEffortChanged={vi.fn()}
+      />,
+    );
+    const trigger = await screen.findByRole("button", { name: /推理档位/ });
+    expect(trigger.textContent).toContain("xhigh");
+  });
+
+  it("disables the effort control without a thread", async () => {
+    const { call } = seam();
+    render(
+      <ModelPicker
+        call={call}
+        threadId={null}
+        currentRef={null}
+        currentModel={null}
+        currentEffort={null}
+        onChanged={vi.fn()}
+        onEffortChanged={vi.fn()}
+      />,
+    );
+    const trigger = await screen.findByRole("button", { name: /推理档位/ });
+    expect((trigger as HTMLButtonElement).disabled).toBe(true);
   });
 });

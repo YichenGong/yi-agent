@@ -207,6 +207,9 @@ vi.mock("./lib/rpc", () => ({
         if (state.failSet) throw { code: -32011, message: "unknown thread" };
         return {};
       }
+      if (method === "thread/setReasoningEffort") {
+        return { ok: true, effort: (params as { effort: string | null }).effort };
+      }
       if (method === "thread/clear") return {};
       if (method === "thread/compact") return { status: "compacted" };
       if (method === "board/list") return { boards: state.boards };
@@ -3616,6 +3619,38 @@ describe("App mobile reopen keeps the selection", () => {
     // 桌面端重放保留历史行为：每次都回到第一条会话。
     await waitFor(() =>
       expect(resumedOn(clients[clients.length - 1])).toContain("t1"),
+    );
+  });
+});
+
+describe("App reasoning effort wiring", () => {
+  it("writes the session override and reflects the server-pushed effort", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /推理档位/ }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "high" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/setReasoningEffort",
+        params: { threadId: "t1", effort: "high" },
+      }),
+    );
+    // 以回包为准更新控件。
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /推理档位/ }).textContent).toContain("high"),
+    );
+
+    // 另一客户端改了 effort：服务端广播，桌面控件回显。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({ method: "thread/reasoningEffortChanged", params: { thread_id: "t1", effort: "xhigh" } });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /推理档位/ }).textContent).toContain("xhigh"),
     );
   });
 });

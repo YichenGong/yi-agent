@@ -318,3 +318,59 @@ describe("SettingsModelsTab", () => {
     expect(screen.queryByRole("button", { name: "导入当前配置" })).toBeNull();
   });
 });
+
+describe("SettingsModelsTab channel fields", () => {
+  it("keeps the advanced section collapsed by default", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+    await screen.findByText("••••1234");
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    // 「推理档位」是正常字段，直接可见。
+    expect(screen.getByLabelText("推理档位")).toBeTruthy();
+    // 「高级」默认收起：api_style 选择器不可见。
+    expect(screen.queryByLabelText("API 通道")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /高级/ }));
+    expect(screen.getByLabelText("API 通道")).toBeTruthy();
+  });
+
+  it("sends reasoning_effort and api_style when the user picks them", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+    await screen.findByText("••••1234");
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByLabelText("推理档位"), { target: { value: "high" } });
+    fireEvent.click(screen.getByRole("button", { name: /高级/ }));
+    fireEvent.change(screen.getByLabelText("API 通道"), { target: { value: "responses" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() =>
+      expect(call).toHaveBeenCalledWith(
+        "model/upsert",
+        expect.objectContaining({ reasoning_effort: "high", api_style: "responses" }),
+      ),
+    );
+  });
+
+  it("does not send unset fields, so editing without touching them writes nothing extra", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+    await screen.findByText("••••1234");
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.change(screen.getByLabelText("API 地址"), { target: { value: "https://b" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(callsTo(call, "model/upsert").length).toBe(1));
+    const params = callsTo(call, "model/upsert")[0][1] as Record<string, unknown>;
+    expect(params).not.toHaveProperty("api_style");
+    expect(params).not.toHaveProperty("reasoning_effort");
+  });
+});

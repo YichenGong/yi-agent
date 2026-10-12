@@ -333,6 +333,95 @@ describe("Session", () => {
     });
   });
 
+  describe("reasoning stream", () => {
+    it("merges consecutive reasoning deltas into one block, concatenating the text", () => {
+      const s = new Session();
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "first ", kind: "Content" },
+      });
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "second", kind: "Content" },
+      });
+      // CoT 是一块，不是一 token 一块——与 TUI 的单 `Reasoning` cell 同契约。
+      const blocks = s.items.filter((i) => i.type === "reasoning");
+      expect(blocks).toHaveLength(1);
+      expect((blocks[0] as { text: string }).text).toBe("first second");
+    });
+
+    it("starts a new block when non-reasoning content lands in between", () => {
+      const s = new Session();
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "think", kind: "Content" },
+      });
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+      });
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "more", kind: "Summary" },
+      });
+      expect(s.items.filter((i) => i.type === "reasoning")).toHaveLength(2);
+    });
+
+    it("never lets reasoning text leak into the agent message", () => {
+      const s = new Session();
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "private", kind: "Content" },
+      });
+      s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "answer" } });
+      const agent = s.items.find((i) => i.type === "agentMessage") as { text: string };
+      expect(agent.text).toBe("answer");
+    });
+  });
+
+  describe("server notices", () => {
+    it("pushes a notice carrying its level", () => {
+      const s = new Session();
+      s.apply({
+        method: "thread/notice",
+        params: { thread_id: "t", level: "Warn", text: "该模型不支持所配推理档，已忽略" },
+      });
+      expect(s.items).toHaveLength(1);
+      expect(s.items[0]).toMatchObject({
+        type: "notice",
+        text: "该模型不支持所配推理档，已忽略",
+        level: "Warn",
+      });
+    });
+  });
+
+  describe("effort state", () => {
+    it("defaults to no override and updates from thread/reasoningEffortChanged", () => {
+      const s = new Session();
+      expect(s.reasoningEffort).toBeNull();
+      s.apply({
+        method: "thread/reasoningEffortChanged",
+        params: { thread_id: "t", effort: "high" },
+      });
+      expect(s.reasoningEffort).toBe("high");
+    });
+
+    it("clears the override when the notification omits effort", () => {
+      const s = new Session();
+      s.reasoningEffort = "high";
+      s.apply({ method: "thread/reasoningEffortChanged", params: { thread_id: "t" } });
+      expect(s.reasoningEffort).toBeNull();
+    });
+
+    it("resets the effort override", () => {
+      const s = new Session();
+      s.reasoningEffort = "high";
+      s.reset();
+      expect(s.reasoningEffort).toBeNull();
+    });
+  });
+
+
   describe("lastServerItemId", () => {
     it("tracks the id of the newest server item", () => {
       const s = new Session();

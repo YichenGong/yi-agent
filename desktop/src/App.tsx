@@ -796,7 +796,10 @@ export default function App() {
     const replaySession = store.view(id).session;
     replaySession.beginReplay();
     try {
-      const resumed = await c.request<{ permission_mode?: ThreadMode }>("thread/resume", {
+      const resumed = await c.request<{
+        permission_mode?: ThreadMode;
+        reasoning_effort?: string | null;
+      }>("thread/resume", {
         threadId: id,
       });
       const replayed = replaySession.endReplay();
@@ -816,6 +819,10 @@ export default function App() {
       // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
       const fromResponse = permissionModeFromResponse(resumed);
       if (fromResponse !== null) view.mode = fromResponse;
+      // effort 同样以 resume 回包为权威：服务端报的是**实际建出**的 agent 的档位
+      // （清过覆盖时 meta 是 null，但工厂已回落条目默认，故回包仍是实际值）。旧
+      // 服务端不带该字段时按「无覆盖」记，控件回落条目默认。
+      view.reasoningEffort = typeof resumed.reasoning_effort === "string" ? resumed.reasoning_effort : null;
       // listAll 回读仅作兜底（旧服务端不带该字段时）；缺该 thread 时保留已知值,
       // 不把已确定的模式打回 null。
       const gs = await refreshThreads();
@@ -842,9 +849,13 @@ export default function App() {
         cwd: string;
         model: string;
         permission_mode?: ThreadMode;
+        reasoning_effort?: string | null;
       }>("thread/start", threadStartParams(cwd));
       warm.current.add(t.thread_id);
       store.view(t.thread_id).info = { cwd: t.cwd, model: t.model, model_ref: null };
+      // 新会话无覆盖 ⇒ 回包报的是实际生效档（解析出的条目默认或 null），控件据此回显。
+      store.view(t.thread_id).reasoningEffort =
+        typeof t.reasoning_effort === "string" ? t.reasoning_effort : null;
       // 新会话恒 normal，但以响应字段为准（服务端是权威），缺失时回退 normal。
       store.view(t.thread_id).mode = permissionModeFromResponse(t) ?? "normal";
       store.select(t.thread_id);
@@ -1756,6 +1767,20 @@ export default function App() {
   };
 
   /**
+   * 记下某会话 effort 控件写入成功后的**已应用**档位（`null` = 已清除覆盖）。
+   *
+   * 与 `changeThreadModel` 同理：只更新被点名的那条会话，写入在途时用户可能已切走，
+   * 按 id 落笔才不会落到别人头上。写入方（ModelPicker）已确认 RPC 成功、并以服务端
+   * 回包为准，这里不再乐观推断。跨客户端改的走 `thread/reasoningEffortChanged`。
+   */
+  const changeThreadEffort = (id: string, effort: string | null) => {
+    const view = store.peek(id);
+    if (!view) return;
+    view.reasoningEffort = effort;
+    force((v) => v + 1);
+  };
+
+  /**
    * 切换宿主级「后台值守」。不做乐观更新：值以宿主返回的为准，安装/卸载失败
    * 的告知（warning）原样摆到面板上——静默会让用户以为已经生效。
    */
@@ -2036,7 +2061,9 @@ export default function App() {
                       threadId={currentId}
                       currentRef={current.info?.model_ref ?? null}
                       currentModel={current.info?.model ?? null}
+                      currentEffort={current.reasoningEffort}
                       onChanged={(id, ref, model) => changeThreadModel(id, ref, model)}
+                      onEffortChanged={(id, effort) => changeThreadEffort(id, effort)}
                     />
                   ) : null
                 }

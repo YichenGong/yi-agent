@@ -13,10 +13,29 @@ export interface NoticeItem {
   id: string;
   text: string;
   /**
+   * 服务端 `thread/notice`（通道回退 / effort 降级）的级别，用来给 Warn 变体换色调。
+   * 本地 `/命令` 提示没有级别（缺省），渲染成既有的中性胶囊。**PascalCase**：照抄
+   * 线形状（core 的 `NoticeLevel` 无 `rename_all`）。
+   */
+  level?: "Info" | "Warn";
+  /**
    * 结构化载荷。`/config` 用它携带 `config/read` 的原始结果（或读取错误），
    * 由 `ChatView` 渲染成一张配置卡片。缺省即普通文本 notice。
    */
   config?: { data?: Record<string, unknown> | null; error?: string | null };
+}
+
+/**
+ * 一段累积的思维链（CoT）。**本地展示条目，不是 wire `Item`**：服务端从不把它作为
+ * item 发送，只以 `thread/reasoningDelta` 流式推送；它同样绝不回灌进后续轮次。
+ *
+ * 连续 delta 合并进**同一个**块——与 TUI 的单 `HistoryCell::Reasoning` 同一契约，
+ * 否则一个 token 一个块会把转录刷屏。
+ */
+export interface ReasoningItem {
+  type: "reasoning";
+  id: string;
+  text: string;
 }
 
 /**
@@ -35,12 +54,20 @@ export class Session {
    * "这次追加没生效，请把它还给用户"。渲染层据此提示用户重新提交。
    */
   returnedInterjections: string[] = [];
-  items: (Item | NoticeItem)[] = [];
+  items: (Item | NoticeItem | ReasoningItem)[] = [];
   turnActive = false;
   lastStatus: TurnStatus | null = null;
   lastError: string | null = null;
   usage: Usage | null = null;
   retrying: { attempt: number; max: number; cause: RetryCause } | null = null;
+
+  /**
+   * 本会话的 reasoning effort 覆盖：`thread/setReasoningEffort`/`thread/start`/
+   * `thread/resume` 的生效值，或 `thread/reasoningEffortChanged` 的推送。`null` =
+   * **无会话覆盖**（回落清单条目默认），不是「未设置」——未设置也表现为本会话
+   * 可能正跑着条目默认档。控件据此回显。
+   */
+  reasoningEffort: string | null = null;
 
   /**
    * 服务端 item 流里最新的、带服务端 id 的 item id（本地生成的用户气泡/通知
@@ -113,6 +140,7 @@ export class Session {
     this.usage = null;
     this.returnedInterjections = [];
     this.lastServerItemId = null;
+    this.reasoningEffort = null;
   }
 
   /**
@@ -327,6 +355,33 @@ export class Session {
         // in the baseline UI.
         break;
       }
+      case "thread/reasoningDelta": {
+        // CoT 累积进同一个推理块：只在末尾**仍是**推理块时追加，其他任何条目
+        // （助手正文、工具卡、notice）都另起一块——与 TUI 的 Reasoning cell 同契约。
+        const { text } = notification.params;
+        const last = this.items[this.items.length - 1];
+        if (last && last.type === "reasoning") {
+          last.text += text;
+        } else {
+          this.items.push({ type: "reasoning", id: nextLocalId(), text });
+        }
+        break;
+      }
+      case "thread/notice":
+        // 内容层告知（通道回退 / effort 降级）：复用本地 notice 形状，带上级别
+        // 以便 Warn 变体可样式化。它**不是**服务端 item，不该进 lastServerItemId。
+        this.items.push({
+          type: "notice",
+          id: nextLocalId(),
+          text: notification.params.text,
+          level: notification.params.level,
+        });
+        break;
+      case "thread/reasoningEffortChanged":
+        // 会话元数据：更新本会话的覆盖（缺省 = 已清除）。`null` 表示「无覆盖」，
+        // 由控件回落条目默认。
+        this.reasoningEffort = notification.params.effort ?? null;
+        break;
       case "turn/started":
         this.turnActive = true;
         this.lastError = null;

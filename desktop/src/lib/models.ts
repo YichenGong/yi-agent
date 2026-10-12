@@ -16,6 +16,16 @@ export type ModelEntryView = {
   model: string;
   has_key: boolean;
   api_key_masked: string;
+  /**
+   * 该条目声明的接口风格：`auto`（默认）/ `responses` / `chat`。**缺省/null = 未声明**
+   * （回落 `auto` 的解析语义）；旧服务端不发送此字段，读取时按 `null` 处理。
+   */
+  api_style?: string | null;
+  /**
+   * 该条目声明的推理档位（七个白名单值之一）。**缺省/null = 未声明**，请求就不带
+   * `reasoning_effort`，由模型自行决定。
+   */
+  reasoning_effort?: string | null;
 };
 
 /**
@@ -79,6 +89,10 @@ export type ModelUpsertInput = {
   api_url: string;
   model: string;
   api_key?: string;
+  /** 省略 = 保留宿主里已有的声明（与 `api_key` 同写法）。 */
+  api_style?: string;
+  /** 省略 = 保留宿主里已有的声明（与 `api_key` 同写法）。 */
+  reasoning_effort?: string;
 };
 
 /**
@@ -96,6 +110,10 @@ export async function upsertModel(rpc: ModelRpc, input: ModelUpsertInput): Promi
     model: input.model,
   };
   if (input.api_key !== undefined) params.api_key = input.api_key;
+  // 同样只在显式给出时才进参数：省略 = 保留宿主里已有的声明。UI 未动这两个
+  // 字段时（`undefined`），写入不携带它们，既有条目因此零改动。
+  if (input.api_style !== undefined) params.api_style = input.api_style;
+  if (input.reasoning_effort !== undefined) params.reasoning_effort = input.reasoning_effort;
   await rpc("model/upsert", params);
 }
 
@@ -132,6 +150,27 @@ export async function setThreadModel(
 ): Promise<{ model: string }> {
   const result = await rpc<{ model?: unknown }>("thread/setModel", { threadId, name });
   return { model: typeof result?.model === "string" ? result.model : "" };
+}
+
+/** `thread/setReasoningEffort` 的回包：`effort: null` = 已清除覆盖。 */
+export type ThreadEffortResult = { effort: string | null };
+
+/**
+ * 设某个会话的 reasoning effort 覆盖；`null` 清除（回落清单条目默认）。
+ *
+ * 与 `setThreadModel` 同族：覆盖只作用于该 thread。回包 `{ ok, effort }` 带回
+ * **已实际应用**的档位（服务端在重建 agent 成功后才落盘、才回包），调用方据此
+ * 回显，而不是拿本地选择当事实。host 报 null/缺省即「无覆盖」。 */
+export async function setThreadReasoningEffort(
+  rpc: ModelRpc,
+  threadId: string,
+  effort: string | null,
+): Promise<ThreadEffortResult> {
+  const result = await rpc<{ effort?: unknown }>("thread/setReasoningEffort", {
+    threadId,
+    effort,
+  });
+  return { effort: typeof result?.effort === "string" ? result.effort : null };
 }
 
 /**

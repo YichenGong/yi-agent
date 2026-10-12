@@ -1,7 +1,7 @@
-import { memo, useEffect } from "react";
+import { memo, useEffect, useState } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
-import type { NoticeItem } from "../lib/session";
+import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
 import { useStickToBottom } from "../lib/useStickToBottom";
 import { AgentMessage } from "./MarkdownText";
@@ -37,6 +37,37 @@ function BubbleImage({
       data-testid="bubble-image"
       className="max-h-64 max-w-full rounded"
     />
+  );
+}
+
+/**
+ * 一段 dim 色的「思考」块（design §6.1）。
+ *
+ * 服务端从不把它作为 item 发送，只以 `thread/reasoningDelta` 流式推送，session 层
+ * 已把连续 delta 合并成一块——这里只渲染一块。默认折叠，标题可点开（Mac/iOS 的
+ * 「默认折叠、可展开」）。
+ *
+ * 折叠状态是**每块**的局部 state：不放进 item，因为 item 归 session 所有、且会被
+ * 流式追加就地改写；把 UI 状态塞进去会让「展开」也被序列化进缓存。
+ */
+function ReasoningBlock({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <div
+      data-testid="reasoning-block"
+      className="my-1 self-start rounded-md border border-line px-2 py-1 text-xs text-fg-subtle"
+    >
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((v) => !v)}
+        className="flex items-center gap-1 font-medium hover:text-fg-muted"
+      >
+        <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+        思考
+      </button>
+      {expanded && <div className="mt-1 whitespace-pre-wrap">{text}</div>}
+    </div>
   );
 }
 
@@ -80,7 +111,7 @@ function ChatItem({
   threadId,
   call,
 }: {
-  item: Item | NoticeItem;
+  item: Item | NoticeItem | ReasoningItem;
   threadId: string | null;
   call: ImageReadCall;
 }) {
@@ -89,10 +120,21 @@ function ChatItem({
       return item.config ? (
         <ConfigCard config={item.config.data} error={item.config.error} />
       ) : (
-        <div className="my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted">
+        // 服务端 `thread/notice` 带 level：Warn（通道回退 / effort 降级）用琥珀色
+        // 让人一眼看出「走了别的路」；本地 `/命令` 提示与 Info 保持既有中性胶囊。
+        <div
+          data-testid="notice"
+          className={
+            item.level === "Warn"
+              ? "my-1 self-center rounded-md bg-amber-500/10 px-3 py-1 text-xs text-amber-300"
+              : "my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted"
+          }
+        >
           {item.text}
         </div>
       );
+    case "reasoning":
+      return <ReasoningBlock text={item.text} />;
     case "userMessage":
       return (
         <div className="my-1 max-w-[80%] self-end rounded-lg bg-blue-600 px-3 py-2 text-sm whitespace-pre-wrap text-white">
@@ -144,7 +186,7 @@ export function ChatView({
   threadId = null,
   call,
 }: {
-  items: (Item | NoticeItem)[];
+  items: (Item | NoticeItem | ReasoningItem)[];
   error?: string | null;
   retrying?: { attempt: number; max: number; cause: RetryCause } | null;
   /** 当前会话 id，透传给气泡/工具卡读取图片；`null`（无会话）时不读取。 */

@@ -13,6 +13,7 @@ import {
   type ModelRpc,
   type ModelUpsertInput,
 } from "../lib/models";
+import { REASONING_EFFORTS } from "../lib/modelPicker";
 
 /**
  * 宿主注入的模型 RPC 接缝。
@@ -32,7 +33,20 @@ type Draft = {
   api_key: string;
   /** 用户是否真的动过 key 框——没动就绝不发送 `api_key`（= 保留宿主里的旧 key）。 */
   keyEdited: boolean;
+  /**
+   * 「高级」区里的 `api_style`：`""` = 未选择（不发送，保留宿主既有声明）。
+   * 普通用户无需展开；`auto` 与「不发送」等价（服务端解析期默认就是 auto）。
+   */
+  api_style: string;
+  /**
+   * 推理档位：`""` = 未设置（不发送，保留宿主既有声明），否则七档之一。
+   * 与「API 格式」平级的正常字段。
+   */
+  reasoning_effort: string;
 };
+
+/** 「未设置」哨兵值：空串不可能是合法档位 / 通道，故安全。 */
+const UNSET = "";
 
 const EMPTY: ModelList = {
   models: [],
@@ -83,6 +97,8 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 「▸ 高级」折叠区：默认收起，普通用户无需展开。 */
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // 接缝在运行时不变（宿主用稳定函数、测试用同一个 vi.fn），但 effect 只认它的
   // 身份：换身份才重读，避免用户没保存的草稿被无关重渲染冲掉。
@@ -136,7 +152,10 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       model: "",
       api_key: "",
       keyEdited: false,
+      api_style: UNSET,
+      reasoning_effort: UNSET,
     });
+    setAdvancedOpen(false);
   };
 
   const startEdit = (entry: ModelEntryView) => {
@@ -150,7 +169,10 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       model: entry.model,
       api_key: "",
       keyEdited: false,
+      api_style: entry.api_style ?? UNSET,
+      reasoning_effort: entry.reasoning_effort ?? UNSET,
     });
+    setAdvancedOpen(false);
   };
 
   const saveDraft = async () => {
@@ -166,6 +188,9 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       };
       // 只有用户真的改过 key 才发送：省略即保留。
       if (draft.keyEdited) input.api_key = draft.api_key;
+      // 通道两项同理：未选择（空串）即不发送 = 保留既有声明，零回归。
+      if (draft.api_style !== UNSET) input.api_style = draft.api_style;
+      if (draft.reasoning_effort !== UNSET) input.reasoning_effort = draft.reasoning_effort;
       await upsertModel(rpc, input);
       setDraft(null);
       await reload();
@@ -417,6 +442,21 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
               </select>
             </label>
             <label className="flex flex-col gap-1 text-xs text-fg-muted">
+              推理档位
+              <select
+                value={draft.reasoning_effort}
+                onChange={(e) => patch({ reasoning_effort: e.target.value })}
+                className="rounded border border-line bg-surface px-2 py-1 text-sm text-fg"
+              >
+                <option value={UNSET}>未设置</option>
+                {REASONING_EFFORTS.map((tier) => (
+                  <option key={tier} value={tier}>
+                    {tier}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1 text-xs text-fg-muted">
               API 地址
               <input
                 value={draft.api_url}
@@ -442,6 +482,31 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
                 className="rounded border border-line bg-surface px-2 py-1 text-sm text-fg"
               />
             </label>
+          </div>
+          {/* 「▸ 高级」：默认收起，仅放 api_style。普通用户无需展开。 */}
+          <div className="mt-3">
+            <button
+              type="button"
+              aria-expanded={advancedOpen}
+              onClick={() => setAdvancedOpen((v) => !v)}
+              className="text-xs text-fg-subtle hover:text-fg-muted"
+            >
+              {advancedOpen ? "▾" : "▸"} 高级
+            </button>
+            {advancedOpen && (
+              <label className="mt-2 flex flex-col gap-1 text-xs text-fg-muted">
+                API 通道
+                <select
+                  value={draft.api_style}
+                  onChange={(e) => patch({ api_style: e.target.value })}
+                  className="rounded border border-line bg-surface px-2 py-1 text-sm text-fg"
+                >
+                  <option value={UNSET}>自动</option>
+                  <option value="responses">responses</option>
+                  <option value="chat">chat</option>
+                </select>
+              </label>
+            )}
           </div>
           <div className="mt-3 flex items-center gap-2">
             <button

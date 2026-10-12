@@ -14,6 +14,12 @@ export interface ThreadView {
   /** 服务端权威权限模式；null = 未知,勿当作 normal。 */
   mode: ThreadMode | null;
   /**
+   * 本会话的 reasoning effort **覆盖**（`thread/setReasoningEffort` / `thread/start` /
+   * `thread/resume` 的生效值，或 `thread/reasoningEffortChanged` 的推送）。
+   * `null` = 无会话覆盖（控件回落清单条目默认）。纯客户端元数据，不是转录内容。
+   */
+  reasoningEffort: string | null;
+  /**
    * 输入框中尚未发送的草稿。**按 thread 隔离**：切走时留下、切回时原样出现，
    * 否则一处未发出的文字会跟着用户跑到另一个会话里（那不是它要发去的地方）。
    * 纯客户端、纯 UI：不上协议，服务端不知道它的存在。
@@ -47,6 +53,7 @@ export class ThreadStore {
       approval: null,
       info: null,
       mode: null,
+      reasoningEffort: null,
       draft: "",
     };
   }
@@ -133,6 +140,13 @@ export class ThreadStore {
       // （`model_ref`）由本客户端的下拉写入成功后自行落笔，这里不能替它猜。
       const v = this.view(n.params.thread_id);
       if (v.info) v.info = { ...v.info, model: n.params.model };
+      return;
+    }
+    if (n.method === "thread/reasoningEffortChanged") {
+      // 跨客户端同步通道：另一个客户端切了该会话的 effort，服务端广播到这里。
+      // `null`（或缺失）= 已清除覆盖，回落条目默认——按「无覆盖」记录，别当作
+      // 「未设置」：控件要显示的是本会话可能正跑着的条目默认档。
+      this.view(n.params.thread_id).reasoningEffort = n.params.effort ?? null;
       return;
     }
     if (n.method === "thread/permissionModeChanged") {

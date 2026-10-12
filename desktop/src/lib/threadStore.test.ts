@@ -233,3 +233,27 @@ describe("ThreadStore", () => {
     expect(s.view("ghost").mode).toBe("normal");
   });
 });
+
+describe("threadStore reasoning effort", () => {
+  it("records thread/reasoningEffortChanged and defaults to no override", () => {
+    const s = new ThreadStore();
+    expect(s.view("a").reasoningEffort).toBeNull();
+    s.applyNotification({
+      method: "thread/reasoningEffortChanged",
+      params: { thread_id: "a", effort: "high" },
+    });
+    expect(s.view("a").reasoningEffort).toBe("high");
+    // 只动被点名的那个。
+    expect(s.view("b").reasoningEffort).toBeNull();
+  });
+
+  it("clears the override when effort is omitted", () => {
+    const s = new ThreadStore();
+    s.applyNotification({
+      method: "thread/reasoningEffortChanged",
+      params: { thread_id: "a", effort: "high" },
+    });
+    s.applyNotification({ method: "thread/reasoningEffortChanged", params: { thread_id: "a" } });
+    expect(s.view("a").reasoningEffort).toBeNull();
+  });
+});

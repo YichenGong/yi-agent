@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, cleanup, screen } from "@testing-library/react";
+import { render, cleanup, screen, fireEvent } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
 import type { NoticeItem } from "../lib/session";
 
@@ -231,5 +231,38 @@ describe("ChatView notices", () => {
     render(<ChatView items={list} />);
     expect(screen.getByTestId("config-card")).toBeTruthy();
     expect(screen.getByText("读取配置失败: boom")).toBeTruthy();
+  });
+});
+
+describe("ChatView reasoning", () => {
+  const block = { type: "reasoning", id: "r1", text: "let me think about this" };
+
+  it("renders a dim「思考」block, collapsed by default and expandable", () => {
+    render(<ChatView items={[block] as unknown as (Item | NoticeItem)[]} />);
+    const el = screen.getByTestId("reasoning-block");
+    // dim 前景（fg-subtle）+ 「思考」前缀。
+    expect(el.className).toContain("text-fg-subtle");
+    const toggle = screen.getByRole("button", { name: /思考/ });
+    // 默认折叠：正文不在 DOM 里。
+    expect(screen.queryByText("let me think about this")).toBeNull();
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // 可展开。
+    fireEvent.click(toggle);
+    expect(screen.getByText("let me think about this")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /思考/ }).getAttribute("aria-expanded")).toBe("true");
+  });
+});
+
+describe("ChatView server notices", () => {
+  const notice = (level: string) => ({ type: "notice", id: "n", text: "一条提示", level });
+
+  it("tones a Warn notice differently from an Info notice", () => {
+    render(<ChatView items={[notice("Info")] as unknown as (Item | NoticeItem)[]} />);
+    const infoClass = screen.getByTestId("notice").className;
+    cleanup();
+    render(<ChatView items={[notice("Warn")] as unknown as (Item | NoticeItem)[]} />);
+    const warnClass = screen.getByTestId("notice").className;
+    expect(warnClass).not.toBe(infoClass);
+    expect(warnClass).toContain("amber");
   });
 });
