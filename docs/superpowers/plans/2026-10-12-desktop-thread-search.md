@@ -651,11 +651,133 @@ git commit -m "docs: record the sidebar thread search bar in the desktop module"
 
 ---
 
+### Task 5: 手机端搜索栏随列表滚动（定位修订）
+
+> 追加任务（2026-10-12 修订）：用户要求手机端搜索栏像 iOS 抽屉一样**随列表一起滑动**
+> （上滑即滚出视野），**Mac 保持原样**钉在列表上方。spec 见
+> `docs/superpowers/specs/2026-10-12-desktop-thread-search-design.md`「修订记录」。
+
+**Files:**
+- Modify: `desktop/src/components/ThreadSidebar.tsx`（把 `{searchBar}` 一处渲染改成按平台两处）
+- Test: `desktop/src/components/ThreadSidebar.test.tsx`（`describe("ThreadSidebar 搜索")` 内追加 3 条）
+
+**Interfaces:**
+- Consumes: Task 2 定义的 `searchBar` 元素、`isMobile` prop（`ThreadSidebar.tsx:81`，默认 `false`）。
+- Produces: 无后续任务依赖。
+
+- [ ] **Step 1: 写失败测试**
+
+在 `desktop/src/components/ThreadSidebar.test.tsx` 的 `describe("ThreadSidebar 搜索")` 内
+（`const searchBox = () => screen.getByLabelText("搜索会话") as HTMLInputElement;` 之后）追加：
+
+```tsx
+  it("手机端：搜索框与会话行同属滚动容器（随列表滚动）", () => {
+    const { container } = renderSidebar({ isMobile: true });
+    const row = container.querySelector("[data-group-row]")!;
+    const scroller = row.closest(".overflow-y-auto");
+    expect(scroller).not.toBeNull();
+    expect(searchBox().closest(".overflow-y-auto")).toBe(scroller);
+  });
+
+  it("桌面端：搜索框在任何滚动容器之外（钉在列表上方）", () => {
+    const { container } = renderSidebar();
+    const row = container.querySelector("[data-group-row]")!;
+    expect(row.closest(".overflow-y-auto")).not.toBeNull();
+    expect(searchBox().closest(".overflow-y-auto")).toBeNull();
+  });
+
+  it("搜索命中藏在「看板会话」折叠小节里时，该小节搜索期间自动展开", () => {
+    const withCard: WorkspaceGroup[] = [
+      {
+        workspace: "/proj",
+        exists: true,
+        threads: [
+          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
+    // 默认折叠：空闲时命中行不可见。
+    expect(container.textContent).not.toContain("看板 · card-1");
+    fireEvent.change(searchBox(), { target: { value: "card-1" } });
+    // 搜索期间小节自动展开：命中行可见。
+    expect(container.textContent).toContain("看板 · card-1");
+    fireEvent.change(searchBox(), { target: { value: "" } });
+    // 清空后恢复折叠。
+    expect(container.textContent).not.toContain("看板 · card-1");
+  });
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
+
+Expected: **前 2 条失败**（手机端搜索框此时还在滚动容器之外：`closest(".overflow-y-auto")` 为
+`null`，不等于会话行的容器），**第 3 条通过**。
+
+第 3 条**预期立即通过**——这不是缺陷，它是**锁定性测试**：现有代码 `searching ? false : !boardCollapsed.has(...)`
+（`ThreadSidebar.tsx:584`）在搜索期间已经把该小节当作展开。已用探针实测确认：空闲 `false` →
+搜索 `true` → 清空 `false`。**若第 3 条反而失败**，说明现有折叠逻辑与我的判断不符，
+**停下来查清原因再继续**，不要改测试去迁就代码。
+
+- [ ] **Step 3: 实现（按平台两处渲染）**
+
+在 `desktop/src/components/ThreadSidebar.tsx` 中，把：
+
+```tsx
+      {searchBar}
+      <div className="flex-1 overflow-y-auto">
+```
+
+改为：
+
+```tsx
+      {!isMobile && searchBar}
+      <div className="flex-1 overflow-y-auto">
+        {isMobile && searchBar}
+```
+
+要点：
+- 桌面（`isMobile=false`）：第一行求值为 `searchBar`，渲染位置与 className 与改动前**逐字节一致**；
+  容器内那行求值为 `false`，不产生任何节点。
+- 手机（`isMobile=true`）：容器外那行为 `false`，搜索框成为滚动容器的**首个子元素**，随列表滚动。
+- 搜索框区块的 className（`relative px-2 pb-2`）不需要改：作为容器首个子元素，上下内边距自然生效，
+  下方紧接列表内容。
+- 手机端 16px 字号规则是**后代选择器** `[data-mobile="true"] .app-sidebar input[type="search"]`，
+  移入容器后依然命中，**CSS 无需改动**。
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
+
+Expected: PASS，`74 + 3 = 77` 个用例。
+
+- [ ] **Step 5: 全量回归 + 类型检查**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit`
+
+Expected: 全绿，`tsc` 无输出。**特别确认既有 `搜索栏在 New thread 之后、会话列表之前` 用例仍通过**
+——其"之后/之前"用的是 `compareDocumentPosition` 文档顺序，手机端把搜索框移入容器后，
+它仍排在第一个会话行之前，故该断言两端都成立。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add desktop/src/components/ThreadSidebar.tsx desktop/src/components/ThreadSidebar.test.tsx
+git commit -m "feat(desktop): let the phone search bar scroll with the thread list"
+```
+
+---
+
 ## 验收（全部任务完成后跑一次）
 
 ```bash
 export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit
 ```
 
-对着 spec §6 的 8 条验收标准逐条核对；第 1、7 条（两端都有搜索栏、手机端聚焦不放大）需要人工在
-Mac 应用与手机端各点一遍确认。
+对着 spec §6 的 8 条验收标准逐条核对；第 1、7 条（两端都有搜索栏、手机端聚焦不放大）与
+**第 2 条（手机端搜索框随列表滚动、Mac 固定）**需要人工在 Mac 应用与手机端各点一遍确认。
+
+> 注：原 Task 4（同步 `docs/project-management/desktop.md` 与 `README.md` 索引）**尚未执行**
+> （`README.md:265` 仍为 `| desktop | 42 / 54 |`，模块文件里也还没有搜索栏条目）。
+> 若之后执行，请把手机端「随列表滚动、Mac 固定」这一行为一并写进该条目。
