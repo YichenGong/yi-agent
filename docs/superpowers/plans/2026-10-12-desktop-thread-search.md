@@ -16,8 +16,9 @@
 - 范围仅限 `desktop/`。**不改** `App.tsx` 的应用逻辑（`App.tsx` 一行不动）；唯一允许的例外是
   `App.test.tsx:458/:481` 两处裸 `input` 选择器改为 `[data-rename-input]`（见 Task 2 Step 1）。
   **不改** Rust、**不改** JSON-RPC 协议。
-- 搜索栏位置固定：`ThreadSidebar.tsx` 中「+ New thread」的 `p-2` 区块**之后**、`flex-1 overflow-y-auto`
-  滚动容器**之前**，两者是兄弟节点。
+- 搜索栏位置**按平台分两处**（2026-10-12 修订，见 Task 5）：**桌面**在「+ New thread」的 `p-2` 区块
+  **之后**、`flex-1 overflow-y-auto` 滚动容器**之前**，两者是兄弟节点（DOM 逐字节不变）；
+  **手机**作为该滚动容器的**首个子元素**，随列表一起滚动（像 iOS 抽屉，上滑滚出视野）。
 - 搜索栏外层**不得**加 `tabIndex`（会让既有 `div[tabindex]` 选择器选错组头）。
 - 搜索栏区块内**不得**出现 `aria-haspopup`（会让既有 `button[aria-haspopup="menu"]` 选错 New thread 触发器）。
 - 重命名输入框必须加标记属性 `data-rename-input=""`；既有 6 处裸 `input` 选择器改为 `[data-rename-input]`。
