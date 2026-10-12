@@ -50,11 +50,35 @@ temperature / max_tokens / top_p / stop（`yi-agent-core/src/provider.rs:25`）�
 
 ### 1.4 实测能力矩阵（决定设计的关键事实）
 
+**effort 档位接受度矩阵**（实测 horizon，`✓`=200，`✗`=400）：
+
+| 模型 | 端点 | none | minimal | low | medium | high | xhigh | max |
+|---|---|---|---|---|---|---|---|---|
+| DeepSeek | chat | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| DeepSeek | responses | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Luna | chat | ✓* | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ |
+| Luna | responses | ✓ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Sol | chat | ✓* | ✗ | ✓ | ✓ | ✓ | ✓ | ✗ |
+| Sol | responses | ✗ | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+`✓*`（Luna/Sol 的 chat + `none`）**仅在请求不带 tools 时成立**；带 tools 时
+只有 `none` 通过——这正是 1.1 报错的来源。
+
+**表外结论**：**没有一个档位能对所有 (模型 × 端点) 通用**。`minimal` 是 GPT-6
+系（Luna/Sol）在两端的共同禁区；`max` 在 Luna/Sol 的 chat 端被拒。故设计的
+「网关拒则自动剥离重投」（§5.5）不是可选项而是**必需项**，它同时兜住了
+`minimal` 与 `max` 的模型差异。
+
+**CoT 明文能力**：
+
 | 模型 | chat/completions + tools | responses + tools | 明文 CoT |
 |---|---|---|---|
 | DeepSeek | 任意档 effort 都 200 | 200 | **有**（`reasoning_content` / responses 的 `reasoning.content[].text`） |
-| Sol | 不带 tools 时 `low..max` 200；**带 tools 时只有 `none` 通过**（不带 effort 直接 400） | `low..max` 全 200；`none`/`minimal` **被拒** | **有**（`reasoning.summary[].text`，需传 `summary:"auto"`） |
-| Luna | 带 tools 只有 `none` 过 | `low..max` 全 200；`none` 200、`minimal` **被拒** | **无文本**（`content=[]`、`summary=[]`，仅 `encrypted_content`） |
+| Sol | 带 tools 时只有 `none` 通过（不带 effort 直接 400） | `low..max` 全 200；`none`/`minimal` 被拒 | **有**（`reasoning.summary[].text`，需传 `summary:"auto"`） |
+| Luna | 带 tools 只有 `none` 过 | `low..max` 全 200；`none` 200、`minimal` 被拒 | **无文本**（`content=[]`、`summary=[]`，仅 `encrypted_content`） |
+
+**图片输入**：chat 的 `image_url` 与 responses 的 `input_image`（data URL）
+**均实测可用**，模型正确识别图像内容。
 
 端点可用性探测（实测 horizon）：
 
@@ -307,7 +331,7 @@ chat 通道下若网关回 `param: reasoning.effort` / `reasoning_effort` 类 40
 | 模型拒所配 effort | 剥离该字段重投 + Notice + 缓存降级 |
 | `api_style` 显式 `responses` 但网关没有 | 直接报错（尊重用户强制），不静默回退 |
 | 旧 `models.json` / 旧 thread meta 无新字段 | 按 `auto` / 未设置处理，零迁移 |
-| responses 的图片输入 | **待验证**（实测用合成 PNG 被网关拒，疑网关限制或测试数据问题；实现前需用真实图片复测，列入计划首项） |
+| responses 的图片输入 | **已验证可用**：`input_image` + data URL 正常，模型正确识别图像内容（实测回答 "Red"）。此前一次失败是测试用 1x1 PNG 无效所致，非网关限制 |
 
 ## 10. 测试策略
 
@@ -342,7 +366,14 @@ P1 单独可交付且能立刻解决用户报错；P2–P4 逐步推进。
 
 ## 12. 待确认 / 待验证
 
-1. **responses 图片输入格式**（`input_image`）——实现前用真实图片复测（§9）。
-2. **`minimal` 档**是否在所有目标模型上稳定——按「网关拒则自动剥离」兜底，
-   无需预先裁剪 UI 选项。
-3. 是否需要为 `xhigh`/`max` 在 UI 上做「高级」区分（当前计划全量平铺）。
+1. ~~responses 图片输入格式~~ **已验证**（见 §1.4 / §9）：`input_image` + data
+   URL 可用，模型正确识别图像。
+2. ~~`minimal` 档稳定性~~ **已验证**（见 §1.4 矩阵）：`minimal` 是 GPT-6 系在
+   两端的共同禁区，由「网关拒则自动剥离」（§5.5）兜住，无需裁剪 UI 选项。
+3. `xhigh` / `max` 的 UI 呈现：实测二者对三模型在 responses 端全通，仅在
+   Luna/Sol 的 chat 端 `max` 被拒。故 **UI 可全量平铺 7 档**，被拒档位由自动
+   剥离兜底 + 一行提示；无需为 `xhigh`/`max` 单独设「高级」分区。此项按此结论
+   定稿，实现中若发现网关行为变化再调整。
+4. **唯一保留的实现级未知**：网关 responses 端点在某些自建网关上「能连但返回
+   非标准事件流」时的具体形态无法预先枚举——已由「显式 `api_style:"chat"`
+   逃生门」覆盖（§5.3 / §9）。
