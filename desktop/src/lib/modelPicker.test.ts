@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { REASONING_EFFORTS, buildEffortOptions, buildModelOptions, entryEffortOf } from "./modelPicker";
+import { REASONING_EFFORTS, buildEffortOptions, buildModelOptions, entryEffortOf, overrideFromEffective } from "./modelPicker";
 import type { ModelEntryView, ModelList } from "./models";
 
 const entry = (name: string, model: string): ModelEntryView => ({
@@ -118,6 +118,29 @@ describe("buildEffortOptions", () => {
     expect(opts[0].selected).toBe(false);
     expect(opts.find((o) => o.value === "high")?.selected).toBe(true);
     expect(opts.filter((o) => o.selected)).toHaveLength(1);
+  });
+});
+
+describe("overrideFromEffective", () => {
+  it("reports no override when the effective value is the entry default", () => {
+    // resume 上报的是**生效值**（无覆盖时即条目默认）：与条目默认相同就是「没有
+    // 可区分的覆盖」，控件该显示「未设置（继承 low）」而不是把 low 打勾。
+    expect(overrideFromEffective("low", "low")).toBeNull();
+  });
+
+  it("keeps an effective value that differs from the entry default", () => {
+    // 生效值与条目默认不同 ⇒ 一定存在会话覆盖（resume 带的 meta 覆盖）。
+    expect(overrideFromEffective("high", "low")).toBe("high");
+  });
+
+  it("keeps an effective value the entry default cannot explain", () => {
+    // 条目没声明默认而生效值非空 ⇒ 只可能是会话覆盖。
+    expect(overrideFromEffective("high", null)).toBe("high");
+  });
+
+  it("passes null through", () => {
+    expect(overrideFromEffective(null, "low")).toBeNull();
+    expect(overrideFromEffective(null, null)).toBeNull();
   });
 });
 

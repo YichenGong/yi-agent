@@ -377,6 +377,93 @@ describe("Session", () => {
       const agent = s.items.find((i) => i.type === "agentMessage") as { text: string };
       expect(agent.text).toBe("answer");
     });
+
+    it("keeps the block before the answer when the send path opens with a user item", () => {
+      // 真实发送路径：本地回声 → 服务端开启项(user) → CoT 增量 → 开启项(agent) → 正文
+      // 增量。上面那条「无先行服务端项」的用例里块恰好落在末尾，看不出锚点问题；
+      // 这里块必须停在用户气泡之后、**正文之前**（design §6.1「位于正文之前」），
+      // 而不是被随后到达的 agent 项甩到转录末尾。
+      const s = new Session();
+      s.addUserMessage("q1");
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "userMessage", id: "user-t1", text: "q1" } },
+      });
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "T1a", kind: "Content" },
+      });
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "T1b", kind: "Content" },
+      });
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+      });
+      s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "A1" } });
+
+      expect(s.items.map((i) => i.type)).toEqual(["userMessage", "reasoning", "agentMessage"]);
+      expect(s.items.map((i) => i.id)).toEqual(["user-t1", expect.stringMatching(/^local-/), "a1"]);
+      // 连续 delta 仍是一块。
+      expect((s.items[1] as { text: string }).text).toBe("T1aT1b");
+      expect((s.items[2] as { text: string }).text).toBe("A1");
+    });
+
+    it("starts a separate block per turn instead of stranding one merged block at the tail", () => {
+      // 两轮：每轮的 CoT 各自成块，且都落在自己那一轮的答案之前
+      // （reasoning[T1] | agentMessage[A1] | reasoning[T2] | agentMessage[A2]）。
+      const s = new Session();
+      s.addUserMessage("q1");
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "userMessage", id: "user-t1", text: "q1" } },
+      });
+      for (const text of ["T1a", "T1b"]) {
+        s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text, kind: "Content" } });
+      }
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+      });
+      s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "A1" } });
+      s.apply({
+        method: "item/completed",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "A1" } },
+      });
+
+      s.addUserMessage("q2");
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "userMessage", id: "user-t2", text: "q2" } },
+      });
+      s.apply({
+        method: "thread/reasoningDelta",
+        params: { thread_id: "t", text: "T2a", kind: "Content" },
+      });
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "agentMessage", id: "a2", text: "" } },
+      });
+      s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a2", delta: "A2" } });
+
+      expect(s.items.map((i) => i.type)).toEqual([
+        "userMessage",
+        "reasoning",
+        "agentMessage",
+        "userMessage",
+        "reasoning",
+        "agentMessage",
+      ]);
+      expect(s.items.map((i) => (i.type === "reasoning" ? (i as { text: string }).text : i.id))).toEqual([
+        "user-t1",
+        "T1aT1b",
+        "a1",
+        "user-t2",
+        "T2a",
+        "a2",
+      ]);
+    });
   });
 
   describe("server notices", () => {
@@ -396,28 +483,25 @@ describe("Session", () => {
   });
 
   describe("effort state", () => {
-    it("defaults to no override and updates from thread/reasoningEffortChanged", () => {
+    it("does not keep a session-level override (the live state is ThreadView.reasoningEffort)", () => {
+      // `thread/reasoningEffortChanged` 由 `ThreadStore.applyNotification` 在到达
+      // `Session.apply` 之前截走（见 threadStore.ts），会话元数据住在
+      // `ThreadView.reasoningEffort`。这里曾经有一个同名 Session 字段，但它在本
+      // 应用的调用路径上永远到不了，读起来像「活的覆盖」其实是死的——删掉以免
+      // 误以为有覆盖。此用例钉住「Session 不再是该状态的持有者」。
       const s = new Session();
-      expect(s.reasoningEffort).toBeNull();
       s.apply({
         method: "thread/reasoningEffortChanged",
         params: { thread_id: "t", effort: "high" },
       });
-      expect(s.reasoningEffort).toBe("high");
+      expect((s as unknown as { reasoningEffort?: unknown }).reasoningEffort).toBeUndefined();
     });
 
-    it("clears the override when the notification omits effort", () => {
+    it("ignores the effort notification without disturbing the transcript", () => {
       const s = new Session();
-      s.reasoningEffort = "high";
+      s.notice("before");
       s.apply({ method: "thread/reasoningEffortChanged", params: { thread_id: "t" } });
-      expect(s.reasoningEffort).toBeNull();
-    });
-
-    it("resets the effort override", () => {
-      const s = new Session();
-      s.reasoningEffort = "high";
-      s.reset();
-      expect(s.reasoningEffort).toBeNull();
+      expect(s.items).toHaveLength(1);
     });
   });
 

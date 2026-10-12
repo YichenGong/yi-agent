@@ -819,9 +819,12 @@ export default function App() {
       // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
       const fromResponse = permissionModeFromResponse(resumed);
       if (fromResponse !== null) view.mode = fromResponse;
-      // effort 同样以 resume 回包为权威：服务端报的是**实际建出**的 agent 的档位
-      // （清过覆盖时 meta 是 null，但工厂已回落条目默认，故回包仍是实际值）。旧
-      // 服务端不带该字段时按「无覆盖」记，控件回落条目默认。
+      // effort 同样以 resume 回包为权威：服务端报的是**实际建出**的 agent 的生效
+      // **值**（清过覆盖时 meta 是 null，但工厂已回落条目默认，故回包仍是实际值）。
+      // 这个值是「生效值」而非「覆盖值」——无覆盖时它就等于条目默认，本字段便
+      // 无法自己区分两者。控件（ModelPicker）拿清单里的条目默认与之比对折回覆盖：
+      // 相等即当「无覆盖」，显示「未设置（继承 X）」，不会把默认档错误打勾。故这里
+      // 如实记下服务端报告的值即可（旧服务端不带该字段时记 null）。
       view.reasoningEffort = typeof resumed.reasoning_effort === "string" ? resumed.reasoning_effort : null;
       // listAll 回读仅作兜底（旧服务端不带该字段时）；缺该 thread 时保留已知值,
       // 不把已确定的模式打回 null。
@@ -853,7 +856,9 @@ export default function App() {
       }>("thread/start", threadStartParams(cwd));
       warm.current.add(t.thread_id);
       store.view(t.thread_id).info = { cwd: t.cwd, model: t.model, model_ref: null };
-      // 新会话无覆盖 ⇒ 回包报的是实际生效档（解析出的条目默认或 null），控件据此回显。
+      // 新会话无覆盖 ⇒ 回包报的是实际**生效值**（解析出的条目默认，或条目/配置都没有
+      // 时的 null）。与 resume 同款：值本身分不出「覆盖」与「条目默认」，交给控件按
+      // 清单条目默认比对折回覆盖。
       store.view(t.thread_id).reasoningEffort =
         typeof t.reasoning_effort === "string" ? t.reasoning_effort : null;
       // 新会话恒 normal，但以响应字段为准（服务端是权威），缺失时回退 normal。

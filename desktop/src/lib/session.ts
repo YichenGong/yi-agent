@@ -62,12 +62,15 @@ export class Session {
   retrying: { attempt: number; max: number; cause: RetryCause } | null = null;
 
   /**
-   * 本会话的 reasoning effort 覆盖：`thread/setReasoningEffort`/`thread/start`/
-   * `thread/resume` 的生效值，或 `thread/reasoningEffortChanged` 的推送。`null` =
-   * **无会话覆盖**（回落清单条目默认），不是「未设置」——未设置也表现为本会话
-   * 可能正跑着条目默认档。控件据此回显。
+   * 仍处于「流式累积」中的那个推理块，或 `null`（没有打开的块）。
+   *
+   * 连续 delta 合并进它；一旦有任何**服务端项**落到它之后（本轮开项的 agentMessage、
+   * 下一轮的 userMessage、工具卡……），运行即被打断——见 {@link breakReasoningRun}。
+   * 不能用「数组末尾是不是推理块」来判断：服务端项经
+   * {@link insertAfterLastServerItem} 插在最后一个服务端项之后，会把推理块甩到
+   * 它自己的答案后面。
    */
-  reasoningEffort: string | null = null;
+  private openReasoning: ReasoningItem | null = null;
 
   /**
    * 服务端 item 流里最新的、带服务端 id 的 item id（本地生成的用户气泡/通知
@@ -140,7 +143,7 @@ export class Session {
     this.usage = null;
     this.returnedInterjections = [];
     this.lastServerItemId = null;
-    this.reasoningEffort = null;
+    this.openReasoning = null;
   }
 
   /**
@@ -152,6 +155,8 @@ export class Session {
    * 出现（`...(…)` 展开），以免凭空造出一个空数组字段与服务端形状不符。
    */
   addUserMessage(text: string, attachments: Attachment[] = []): void {
+    // 用户又发了一条：上一段的 CoT 到此为止，不会与这一轮的思考混成一块。
+    this.breakReasoningRun();
     this.items.push({
       type: "userMessage",
       id: nextLocalId(),
@@ -171,19 +176,31 @@ export class Session {
   }
 
   /**
-   * Insert a server item right after the last server item already held.
+   * Insert a server item right after the last item that already holds a position.
    *
    * Appending to the array end was wrong whenever a locally-minted bubble sat
    * there: the first server item of a turn (the opening user message) would land
    * *after* the local echo that preceded it, or — for a thread opened while a
    * turn was already running — after agent text that arrived first, which is
    * exactly how the opening prompt ended up at the bottom of the transcript.
-   * Anchoring to the last server item keeps reload-on-open order.
+   * Anchoring to the last positioned item keeps reload-on-open order.
+   *
+   * The anchor is a server item **or an already-placed reasoning block**: the CoT
+   * block is a local item, but it is positioned by this very logic and must stay
+   * ahead of the answer it precedes. If it did not anchor, the turn's
+   * `agentMessage` would be spliced in before it and the 「思考」block would end
+   * up trailing its own answer (design §6.1: 位于正文之前). Local echoes and
+   * notices are still not anchors — the server transcript is the authority.
    */
   private insertAfterLastServerItem(item: Item): void {
+    // 任何服务端项一旦插到推理块之后，就该由**它**来承载这一轮的正文：推理块
+    // 到此为止（下一段 CoT 另起一块）。不打断的话，`reasoning[上一轮]` 会一直
+    // 留在末尾，把下一轮 delta 吸进上一轮的块里。
+    this.breakReasoningRun();
     let last = -1;
     for (let i = this.items.length - 1; i >= 0; i -= 1) {
-      if (!Session.isLocalId(this.items[i].id)) {
+      const held = this.items[i];
+      if (!Session.isLocalId(held.id) || held.type === "reasoning") {
         last = i;
         break;
       }
@@ -192,8 +209,19 @@ export class Session {
     else this.items.splice(last + 1, 0, item);
   }
 
+  /**
+   * 关闭当前打开的推理块：下一段 `thread/reasoningDelta` 会新起一块。
+   *
+   * 站在「合并成一块」的反面——它只让**连续**的 delta 合并，别的任何条目（服务端
+   * 正文/工具/用户气泡，或本地 notice）落进来就断开。
+   */
+  private breakReasoningRun(): void {
+    this.openReasoning = null;
+  }
+
   /** Append a command-output line (never sent to the agent). */
   notice(text: string): void {
+    this.breakReasoningRun();
     this.items.push({ type: "notice", id: nextLocalId(), text });
   }
 
@@ -204,6 +232,7 @@ export class Session {
    * other consumer reads it.
    */
   noticeConfig(data: Record<string, unknown> | null, error?: string | null): void {
+    this.breakReasoningRun();
     this.items.push({
       type: "notice",
       id: nextLocalId(),
@@ -235,6 +264,8 @@ export class Session {
    * monotonic with what the transcript now holds.
    */
   upsertItems(items: Item[]): void {
+    // 回放/补齐的服务端项同样打断推理块：否则下一轮 delta 会续进上一轮那块。
+    this.breakReasoningRun();
     let reconciledLocalEcho = false;
     for (const item of items) {
       // Same normalisation as `apply`: a mid-turn interjection renders as a user
@@ -306,6 +337,8 @@ export class Session {
             ? { type: "userMessage", id: incoming.id, text: incoming.text }
             : incoming;
         if (this.replayIds !== null) this.replayIds.add(item.id);
+        // 任何服务端项都断开推理块的合并运行：正文/工具/用户气泡一到，当前块结束。
+        this.breakReasoningRun();
         const index = this.items.findIndex((i) => i.id === item.id);
         if (index >= 0) {
           this.items[index] = item;
@@ -344,6 +377,9 @@ export class Session {
         const { item_id, delta } = notification.params;
         if (this.replayIds !== null) this.replayIds.add(item_id);
         this.lastServerItemId = item_id;
+        // 正文增量同样打断推理块：一旦 agent 文本开始流，当前 CoT 块就结束了，
+        // 块不会因此移位（正文会插到它之后）。
+        this.breakReasoningRun();
         const index = this.items.findIndex((i) => i.id === item_id);
         if (index < 0) {
           this.insertAfterLastServerItem({ type: "agentMessage", id: item_id, text: delta });
@@ -356,20 +392,28 @@ export class Session {
         break;
       }
       case "thread/reasoningDelta": {
-        // CoT 累积进同一个推理块：只在末尾**仍是**推理块时追加，其他任何条目
-        // （助手正文、工具卡、notice）都另起一块——与 TUI 的 Reasoning cell 同契约。
+        // CoT 累积进同一个推理块：只在**当前这一轮**的连续 delta 之间合并，其他
+        // 任何条目（助手正文、工具卡、notice、下一轮开启项）都已断开运行
+        // （见 `breakReasoningRun`）→ 新起一块。与 TUI 的 Reasoning cell 同契约。
+        //
+        // 块用一个稳定锚点（openReasoning），而不是「数组末尾」：服务端项会被
+        // 插到最后一个服务端项之后，若以末尾为准，本轮的 agentMessage 会把块甩到
+        // 它自己的答案后面（design §6.1 要求块位于正文之前）。
         const { text } = notification.params;
-        const last = this.items[this.items.length - 1];
-        if (last && last.type === "reasoning") {
-          last.text += text;
+        if (this.openReasoning) {
+          this.openReasoning.text += text;
         } else {
-          this.items.push({ type: "reasoning", id: nextLocalId(), text });
+          const block: ReasoningItem = { type: "reasoning", id: nextLocalId(), text };
+          this.openReasoning = block;
+          this.items.push(block);
         }
         break;
       }
       case "thread/notice":
         // 内容层告知（通道回退 / effort 降级）：复用本地 notice 形状，带上级别
         // 以便 Warn 变体可样式化。它**不是**服务端 item，不该进 lastServerItemId。
+        // 它会插入转录、打断推理块的合并运行。
+        this.breakReasoningRun();
         this.items.push({
           type: "notice",
           id: nextLocalId(),
@@ -377,12 +421,11 @@ export class Session {
           level: notification.params.level,
         });
         break;
-      case "thread/reasoningEffortChanged":
-        // 会话元数据：更新本会话的覆盖（缺省 = 已清除）。`null` 表示「无覆盖」，
-        // 由控件回落条目默认。
-        this.reasoningEffort = notification.params.effort ?? null;
-        break;
       case "turn/started":
+        // 新的一轮：上一轮的 CoT 到此为止，本轮 CoT 另起一块。这是「按轮分块」的
+        // 兜底保证——即便上一轮以 turn/completed 收尾（而非某项）而运行尚未合上，
+        // 新轮开始也一定断开。
+        this.breakReasoningRun();
         this.turnActive = true;
         this.lastError = null;
         break;

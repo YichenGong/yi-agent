@@ -14,9 +14,11 @@ export interface ThreadView {
   /** 服务端权威权限模式；null = 未知,勿当作 normal。 */
   mode: ThreadMode | null;
   /**
-   * 本会话的 reasoning effort **覆盖**（`thread/setReasoningEffort` / `thread/start` /
-   * `thread/resume` 的生效值，或 `thread/reasoningEffortChanged` 的推送）。
-   * `null` = 无会话覆盖（控件回落清单条目默认）。纯客户端元数据，不是转录内容。
+   * 本会话最近一次上报的 reasoning effort：`thread/setReasoningEffort` 回包与
+   * `thread/reasoningEffortChanged` 推送给的是**覆盖值**（`null` = 已清除覆盖），
+   * `thread/start` / `thread/resume` 回包给的是**生效值**（无覆盖时即条目默认）。
+   * 两者在协议上不可区分，故这里如实存下服务端的值，由控件（`ModelPicker`）用清单
+   * 条目默认与之比对折回覆盖、决定打勾与「继承 X」标签。纯客户端元数据，不是转录内容。
    */
   reasoningEffort: string | null;
   /**

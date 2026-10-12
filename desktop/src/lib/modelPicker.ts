@@ -117,3 +117,25 @@ export function entryEffortOf(list: ModelList, ref: string | null): string | nul
   if (name === null) return null;
   return list.models.find((m) => m.name === name)?.reasoning_effort ?? null;
 }
+
+/**
+ * 把「服务端上报的**生效值**」折回「会话覆盖」，供控件回显。
+ *
+ * `thread/start` / `thread/resume` 的 `reasoning_effort` 是**生效值**：没有覆盖时
+ * 它等于条目默认（工厂回落的结果），有覆盖时等于覆盖档。线协议无法把这两种情形
+ * 分开——同一个 `"low"` 既可能是「无覆盖、跑条目默认 low」，也可能是「显式覆盖成
+ * low」。既然条目的默认档在本客户端的清单里读得到，就用它做判定：生效值与条目默认
+ * 相同 ⇒ 记作**无覆盖**（控件显示「未设置（继承 low）」），不同 ⇒ 一定是覆盖。
+ *
+ * 这样冷启动（resume 报 low、条目默认也是 low）不会把 low 打勾成「已选覆盖」，
+ * 与用户看到的状态一致；而真正切过档的会话（生效 high ≠ 条目默认 low）仍能回显。
+ * 无法区分的那一档（两者恰好相等）保守地按「无覆盖」处理：控件会显示「继承 low」，
+ * 与生效值同字面，不会撒谎。
+ */
+export function overrideFromEffective(
+  effective: string | null,
+  entryDefault: string | null,
+): string | null {
+  if (effective === null) return null;
+  return effective === entryDefault ? null : effective;
+}

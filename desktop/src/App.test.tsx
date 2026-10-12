@@ -3654,3 +3654,44 @@ describe("App reasoning effort wiring", () => {
     );
   });
 });
+
+describe("App reasoning rendering", () => {
+  it("keeps each turn's CoT block before that turn's answer", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const notify = (n: unknown) =>
+      act(() => {
+        for (const cb of state.notifHandlers) cb(n);
+      });
+
+    // 真实顺序：开启项(user) → CoT 增量 → 开启项(agent) → 正文增量。
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "userMessage", id: "user-1", text: "q1" } } });
+    notify({ method: "thread/reasoningDelta", params: { thread_id: "t1", text: "T1", kind: "Content" } });
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "agentMessage", id: "a1", text: "" } } });
+    notify({ method: "item/delta", params: { thread_id: "t1", item_id: "a1", delta: "answer-one" } });
+
+    // 第二轮。
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "userMessage", id: "user-2", text: "q2" } } });
+    notify({ method: "thread/reasoningDelta", params: { thread_id: "t1", text: "T2", kind: "Content" } });
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "agentMessage", id: "a2", text: "" } } });
+    notify({ method: "item/delta", params: { thread_id: "t1", item_id: "a2", delta: "answer-two" } });
+
+    // 两轮的 CoT 各自成块，不是尾部一个合并块。
+    const blocks = screen.getAllByTestId("reasoning-block");
+    expect(blocks).toHaveLength(2);
+    const q1 = screen.getByText("q1");
+    const a1 = screen.getByText("answer-one");
+    const q2 = screen.getByText("q2");
+    const a2 = screen.getByText("answer-two");
+    const before = (a: Element, b: Element) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    // q1 | 思考[T1] | A1 | q2 | 思考[T2] | A2
+    expect(before(q1, blocks[0])).toBe(true);
+    expect(before(blocks[0], a1)).toBe(true);
+    expect(before(a1, q2)).toBe(true);
+    expect(before(q2, blocks[1])).toBe(true);
+    expect(before(blocks[1], a2)).toBe(true);
+  });
+});

@@ -7,7 +7,7 @@ import {
   type ModelList,
   type ModelRpc,
 } from "../lib/models";
-import { buildEffortOptions, buildModelOptions, entryEffortOf } from "../lib/modelPicker";
+import { buildEffortOptions, buildModelOptions, entryEffortOf, overrideFromEffective } from "../lib/modelPicker";
 
 /**
  * 宿主注入的模型 RPC 接缝。
@@ -55,8 +55,13 @@ export function ModelPicker({
   /** 会话当前实际生效的模型标识（宿主解析后）；未知为 `null`。 */
   currentModel: string | null;
   /**
-   * 会话当前的 effort **覆盖**（`null` = 无覆盖）。来源：本会话的
-   * `thread/reasoningEffortChanged` 推送，或 thread 回包写入后落下的值。
+   * 会话当前的 effort：`thread/reasoningEffortChanged` 推送的覆盖，或 thread 回包
+   * 落下的**生效值**（`null` = 未上报 / 无覆盖）。
+   *
+   * 两种来源在「无覆盖」时长得一样（回包的生效值 = 条目默认），所以本组件不直接
+   * 把它当作覆盖：先用 {@link overrideFromEffective} 与条目默认比对折回覆盖
+   * （无覆盖 ⇒ `null`），再交给 `buildEffortOptions` 决定打勾与「继承 X」标签。
+   * 否则冷启动会把条目默认档错误地打勾成「已选覆盖」。
    */
   currentEffort?: string | null;
   /**
@@ -129,15 +134,17 @@ export function ModelPicker({
     };
   }, [open, rpc]);
 
-  // Escape 关闭任一打开的下拉并把焦点交回对应的触发按钮。
+  // Escape 关闭任一打开的下拉，并把焦点交回**那个**下拉的触发按钮（不是模型按钮）：
+  // 在 effort 菜单里按 Escape 时把焦点甩到模型按钮会让人以为按错了控件。
   useEffect(() => {
     if (!open && !effortOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
+        const restore = effortOpen ? effortTriggerRef.current : triggerRef.current;
         setOpen(false);
         setEffortOpen(false);
-        triggerRef.current?.focus();
+        restore?.focus();
       }
     };
     document.addEventListener("keydown", onKey);
@@ -148,7 +155,13 @@ export function ModelPicker({
   const current = options.find((o) => o.selected) ?? options[0];
   // 条目默认档由本组件读到的清单现算（与模型下拉同一份 catalog、同一个引用选择
   // 口径）：无覆盖时控件显示「继承 X」，正是请求会带的那一档。
-  const effortOptions = buildEffortOptions(currentEffort, entryEffortOf(catalog, currentRef));
+  const entryDefault = entryEffortOf(catalog, currentRef);
+  // 回包/推送带来的是**生效值**：无覆盖时它恰好等于条目默认，故先折回「覆盖」，
+  // 否则冷启动会把条目默认档错误地打勾。`thread/reasoningEffortChanged` 的推送
+  // 本身就是覆盖值，若它也恰好等于条目默认，同样按「无覆盖」显示——两种情形在
+  // 控件上等价（「继承 X」的 X 与生效值同字面）。
+  const effortOverride = overrideFromEffective(currentEffort, entryDefault);
+  const effortOptions = buildEffortOptions(effortOverride, entryDefault);
   const currentEffortOption = effortOptions.find((o) => o.selected) ?? effortOptions[0];
 
   const choose = async (value: string | null) => {

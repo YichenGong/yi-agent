@@ -271,4 +271,49 @@ describe("ModelPicker effort control", () => {
     const trigger = await screen.findByRole("button", { name: /推理档位/ });
     expect((trigger as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it("shows the inherit label, not a checked tier, when the reported value is the entry default", async () => {
+    // 冷启动：resume 报的**生效值** low 恰好等于条目默认 low ⇒ 没有可区分的覆盖，
+    // 菜单该把「未设置（继承 low）」打勾，而不是把 low 打勾成「已选覆盖」。
+    const withEffort: ModelList = { ...catalog, models: catalog.models.map((m) => ({ ...m })) };
+    withEffort.models[0].reasoning_effort = "low";
+    const { call } = seam({ catalog: withEffort });
+    render(
+      <ModelPicker
+        call={call}
+        threadId="t1"
+        currentRef={null}
+        currentModel="model-a"
+        currentEffort="low"
+        onChanged={vi.fn()}
+        onEffortChanged={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /推理档位/ }));
+    const unset = screen.getByRole("menuitemradio", { name: /未设置/ });
+    expect(unset.getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("menuitemradio", { name: "low" }).getAttribute("aria-checked")).toBe(
+      "false",
+    );
+  });
+
+  it("refocuses the effort trigger, not the model trigger, when Escape closes the effort menu", async () => {
+    const { call } = seam();
+    render(
+      <ModelPicker
+        call={call}
+        threadId="t1"
+        currentRef={null}
+        currentModel="model-a"
+        onChanged={vi.fn()}
+        onEffortChanged={vi.fn()}
+      />,
+    );
+    const trigger = await screen.findByRole("button", { name: /推理档位/ });
+    fireEvent.click(trigger);
+    expect(screen.getByRole("menu")).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
 });
