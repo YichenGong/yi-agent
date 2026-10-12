@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use yi_agent_core::{GenParams, Message, Provider, ProviderRequest, StopReason};
@@ -40,6 +40,53 @@ fn provider_with_style(server: &MockServer, style: &str) -> OpenaiProvider {
         reasoning_effort: None,
     })
     .expect("provider construction")
+}
+
+fn provider_with_style_and_effort(
+    server: &MockServer,
+    style: &str,
+    effort: &str,
+) -> OpenaiProvider {
+    OpenaiProvider::new(OpenaiProviderOpts {
+        base_url: Some(server.uri()),
+        api_key: Some("k".into()),
+        timeout: Some(Duration::from_secs(5)),
+        api_style: Some(style.into()),
+        reasoning_effort: Some(effort.into()),
+    })
+    .expect("provider construction")
+}
+
+async fn count_chat_requests(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/chat/completions")
+        .count()
+}
+
+async fn count_chat_requests_with_effort(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/chat/completions")
+        .filter(|r| String::from_utf8_lossy(&r.body).contains("reasoning_effort"))
+        .count()
+}
+
+async fn count_chat_requests_without_effort(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/chat/completions")
+        .filter(|r| !String::from_utf8_lossy(&r.body).contains("reasoning_effort"))
+        .count()
 }
 
 #[tokio::test]
@@ -184,5 +231,104 @@ async fn auto_caches_chat_so_later_calls_skip_responses() {
             .count(),
         1,
         "the missing-route probe must happen at most once"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_effort_is_stripped_and_retried_with_a_notice() {
+    let server = MockServer::start().await;
+    // 第一次：带 reasoning_effort 的 chat 请求 → 400（模拟 Sol 拒 none/minimal）
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(
+            serde_json::json!({"reasoning_effort":"minimal"}),
+        ))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"message":"Unsupported value","param":"reasoning_effort","code":"unsupported_value"}}"#,
+        ))
+        .mount(&server)
+        .await;
+    // 第二次：不带该字段 → 200
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(|r: &wiremock::Request| !String::from_utf8_lossy(&r.body).contains("reasoning_effort"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SSE_TEXT_ONLY))
+        .mount(&server)
+        .await;
+
+    let provider = provider_with_style_and_effort(&server, "chat", "minimal");
+    let resp = provider
+        .call(simple_request())
+        .await
+        .expect("strip+retry must succeed");
+    assert_eq!(resp.stop_reason, StopReason::EndTurn);
+    assert!(resp.notices.iter().any(|n| n.text.contains("推理档")));
+    // 恰好一次带 effort（被拒）+ 一次不带 effort（成功）。
+    assert_eq!(count_chat_requests_with_effort(&server).await, 1);
+    assert_eq!(count_chat_requests_without_effort(&server).await, 1);
+}
+
+#[tokio::test]
+async fn rejected_effort_is_remembered_so_later_calls_omit_it() {
+    let server = MockServer::start().await;
+    // 仅在带 reasoning_effort 时 400。
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(|r: &wiremock::Request| String::from_utf8_lossy(&r.body).contains("reasoning_effort"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"message":"reasoning_effort are not supported for gpt-6-luna","param":"reasoning_effort"}}"#,
+        ))
+        .mount(&server)
+        .await;
+    // 不带该字段 → 200。
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(|r: &wiremock::Request| !String::from_utf8_lossy(&r.body).contains("reasoning_effort"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SSE_TEXT_ONLY))
+        .mount(&server)
+        .await;
+
+    let provider = provider_with_style_and_effort(&server, "chat", "minimal");
+
+    // 第一次：带 effort 被拒 → 剥离重投成功。
+    let first = provider.call(simple_request()).await.expect("first call");
+    assert!(first.notices.iter().any(|n| n.text.contains("推理档")));
+
+    // 第二次：命中拒绝缓存，首次 POST 就不带 effort。
+    let second = provider
+        .call(simple_request())
+        .await
+        .expect("second call must skip the rejected effort");
+    assert_eq!(second.stop_reason, StopReason::EndTurn);
+
+    assert_eq!(
+        count_chat_requests_with_effort(&server).await,
+        1,
+        "only the very first POST should ever carry the rejected effort"
+    );
+    assert_eq!(count_chat_requests_without_effort(&server).await, 2);
+    assert_eq!(count_chat_requests(&server).await, 3);
+}
+
+#[tokio::test]
+async fn non_effort_400_is_not_retried() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"message":"Unsupported value for temperature","param":"temperature"}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let provider = provider_with_style_and_effort(&server, "chat", "minimal");
+    provider
+        .call(simple_request())
+        .await
+        .expect_err("a non-effort 400 must stay an error");
+    assert_eq!(
+        count_chat_requests(&server).await,
+        1,
+        "a non-effort rejection must not be retried"
     );
 }

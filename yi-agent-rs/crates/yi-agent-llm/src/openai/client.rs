@@ -1,6 +1,6 @@
 //! OpenaiProvider and Provider trait implementation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,7 +14,7 @@ use yi_agent_core::{
 };
 
 use crate::openai::channel::{Channel, ChannelCache, looks_like_missing_route};
-use crate::openai::error::map_status_error_from;
+use crate::openai::error::{is_effort_rejection, map_status_error_from};
 use crate::openai::responses::stream::ResponsesStream;
 use crate::openai::responses::types::responses_request_from;
 use crate::openai::stream::OpenaiStream;
@@ -61,6 +61,8 @@ pub struct OpenaiProvider {
     reasoning_effort: Option<String>,
     /// 网关能力判定缓存(`base_url` → 实际通道),进程内共享。
     channel_cache: ChannelCache,
+    /// effort 拒绝缓存(`base_url|model|channel`),命中后不再补入 effort。
+    effort_reject_cache: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for OpenaiProvider {
@@ -125,6 +127,7 @@ impl OpenaiProvider {
             api_style,
             reasoning_effort: opts.reasoning_effort,
             channel_cache: Arc::new(Mutex::new(HashMap::new())),
+            effort_reject_cache: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -149,6 +152,13 @@ impl OpenaiProvider {
     fn cache_channel(&self, channel: Channel) {
         if let Ok(mut cache) = self.channel_cache.lock() {
             cache.insert(self.base_url.clone(), channel);
+        }
+    }
+
+    /// 记住 (base_url, model, channel) 拒绝过 effort,后续请求不再补入。
+    fn cache_effort_reject(&self, key: String) {
+        if let Ok(mut cache) = self.effort_reject_cache.lock() {
+            cache.insert(key);
         }
     }
 
@@ -199,6 +209,58 @@ impl OpenaiProvider {
         };
         Ok(guard_terminal(event_stream))
     }
+
+    /// Resolve the channel, build the body, POST it, and apply the missing-route
+    /// fallback. This is today's `call_stream` body minus the effort promotion —
+    /// the strip-retry path re-enters *here* so a stripped retry never re-adds
+    /// the rejected effort.
+    async fn dispatch(
+        &self,
+        req: &ProviderRequest,
+    ) -> Result<BoxStream<'static, ProviderEvent>, PostError> {
+        let model = &req.model;
+        let msg_count = req.messages.len();
+        let channel = self.resolve_channel();
+        tracing::info!(provider = "openai", model = %model, msg_count, ?channel, "sending request");
+
+        let body = channel_body(channel, req).map_err(PostError::Transport)?;
+        let (status, body_text) = match self.post_channel(channel, &body).await {
+            Ok(stream) => return Ok(stream),
+            Err(PostError::Transport(e)) => return Err(PostError::Transport(e)),
+            Err(PostError::Status(status, body_text)) => (status, body_text),
+        };
+
+        let missing_route = channel == Channel::Responses
+            && self.api_style == ApiStyle::Auto
+            && looks_like_missing_route(status, &body_text);
+        if !missing_route {
+            return Err(PostError::Status(status, body_text));
+        }
+
+        // 网关无 /v1/responses：缓存 chat，并用同一逻辑请求重投一次。
+        tracing::info!(
+            provider = "openai",
+            status,
+            "responses route missing; caching Chat and retrying as chat"
+        );
+        self.cache_channel(Channel::Chat);
+
+        let chat_body = channel_body(Channel::Chat, req).map_err(PostError::Transport)?;
+        let chat_stream = self.post_channel(Channel::Chat, &chat_body).await?;
+
+        let notice = ProviderEvent::Notice {
+            level: NoticeLevel::Info,
+            text: "该地址不支持 Responses，已自动改用 Chat".into(),
+        };
+        Ok(futures::stream::once(std::future::ready(notice))
+            .chain(chat_stream)
+            .boxed())
+    }
+}
+
+/// 拒绝缓存的键:`base_url|model|channel`。
+fn effort_reject_key(base_url: &str, model: &str, channel: Channel) -> String {
+    format!("{base_url}|{model}|{channel:?}")
 }
 
 /// Serialize the request body for `channel`; both builders read the same
@@ -244,53 +306,55 @@ impl Provider for OpenaiProvider {
         &self,
         mut req: ProviderRequest,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
-        // provider 级 effort 是 resolve 后的权威值:请求未显式指定时补入,
-        // 已显式设置的请求值不被覆盖/剥离(剥离是 Task 6)。
-        if self.reasoning_effort.is_some() && req.params.reasoning_effort.is_none() {
+        // provider 级 effort 是 resolve 后的权威值:请求未显式指定时补入。
+        // 该 (base_url,model,channel) 曾拒绝 effort 时跳过补入,（Task 6）。
+        let channel = self.resolve_channel();
+        let eff_key = effort_reject_key(&self.base_url, &req.model, channel);
+        let already_rejected = self
+            .effort_reject_cache
+            .lock()
+            .map(|s| s.contains(&eff_key))
+            .unwrap_or(false);
+        if !already_rejected
+            && self.reasoning_effort.is_some()
+            && req.params.reasoning_effort.is_none()
+        {
             req.params.reasoning_effort = self.reasoning_effort.clone();
         }
-        let model = req.model.clone();
-        let msg_count = req.messages.len();
-        let channel = self.resolve_channel();
-        tracing::info!(provider = "openai", model = %model, msg_count, ?channel, "sending request");
+        let had_effort = req.params.reasoning_effort.is_some();
 
-        let body = channel_body(channel, &req)?;
-        match self.post_channel(channel, &body).await {
-            Ok(stream) => Ok(stream),
-            Err(PostError::Transport(e)) => Err(e),
-            Err(PostError::Status(status, body_text)) => {
-                let missing_route = channel == Channel::Responses
-                    && self.api_style == ApiStyle::Auto
-                    && looks_like_missing_route(status, &body_text);
-                if !missing_route {
-                    return Err(map_status_error_from(status, &body_text));
-                }
-
-                // 网关无 /v1/responses：缓存 chat，并用同一逻辑请求重投一次。
+        match self.dispatch(&req).await {
+            // 网关拒绝所配 effort:剥离该字段重投一次,并低声告知。
+            // 重投走 `dispatch`(而非本函数),因此不会再次补入 effort。
+            Err(PostError::Status(status, body))
+                if had_effort && is_effort_rejection(status, &body) =>
+            {
+                self.cache_effort_reject(eff_key);
                 tracing::info!(
                     provider = "openai",
                     status,
-                    "responses route missing; caching Chat and retrying as chat"
+                    "reasoning effort rejected; retrying without it"
                 );
-                self.cache_channel(Channel::Chat);
-
-                let chat_body = channel_body(Channel::Chat, &req)?;
-                let chat_stream = match self.post_channel(Channel::Chat, &chat_body).await {
+                let mut retry = req.clone();
+                retry.params.reasoning_effort = None;
+                let stream = match self.dispatch(&retry).await {
                     Ok(s) => s,
                     Err(PostError::Transport(e)) => return Err(e),
                     Err(PostError::Status(status, body)) => {
                         return Err(map_status_error_from(status, &body));
                     }
                 };
-
                 let notice = ProviderEvent::Notice {
                     level: NoticeLevel::Info,
-                    text: "该地址不支持 Responses，已自动改用 Chat".into(),
+                    text: "该模型不支持所配推理档，已忽略".into(),
                 };
                 Ok(futures::stream::once(std::future::ready(notice))
-                    .chain(chat_stream)
+                    .chain(stream)
                     .boxed())
             }
+            Ok(stream) => Ok(stream),
+            Err(PostError::Transport(e)) => Err(e),
+            Err(PostError::Status(status, body)) => Err(map_status_error_from(status, &body)),
         }
     }
 }
