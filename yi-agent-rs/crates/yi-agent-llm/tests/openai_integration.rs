@@ -44,6 +44,20 @@ fn provider_for(server: &MockServer) -> OpenaiProvider {
     .expect("provider construction")
 }
 
+/// Explicit `chat` style: used by tests that assert exact stream positions, so
+/// the auto-fallback Notice (which only fires on default `auto`) cannot prepend
+/// an extra event.
+fn chat_provider_for(server: &MockServer) -> OpenaiProvider {
+    OpenaiProvider::new(OpenaiProviderOpts {
+        base_url: Some(server.uri()),
+        api_key: Some("test-key".to_string()),
+        timeout: Some(Duration::from_secs(5)),
+        api_style: Some("chat".to_string()),
+        ..Default::default()
+    })
+    .expect("provider construction")
+}
+
 fn simple_request() -> ProviderRequest {
     ProviderRequest {
         model: "gpt-4o".to_string(),
@@ -392,7 +406,7 @@ async fn mid_stream_error_becomes_terminal_stop() {
         .mount(&server)
         .await;
 
-    let provider = provider_for(&server);
+    let provider = chat_provider_for(&server);
     let stream = provider
         .call_stream(simple_request())
         .await

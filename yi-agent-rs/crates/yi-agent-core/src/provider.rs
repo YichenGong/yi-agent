@@ -58,6 +58,13 @@ pub enum NoticeLevel {
     Warn,
 }
 
+/// 非致命的运行期告知条目（回退/降级），聚合在 [`ProviderResponse`] 上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderNotice {
+    pub level: NoticeLevel,
+    pub text: String,
+}
+
 /// 端点风格。解析非法值落回 `Auto`，绝不因一个手写值让条目失效。
 /// 唯一定义处：runtime 的 `RuntimeConfig` 与 llm 的 provider 都引用本类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +143,8 @@ pub enum StopReason {
 pub struct ProviderResponse {
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
+    /// 流中收到的非致命告知（如 auto 回退到 chat）；默认空。
+    pub notices: Vec<ProviderNotice>,
 }
 
 /// Errors from a provider.
@@ -330,7 +339,18 @@ pub trait Provider: Send + Sync {
     /// Convenience: accumulate stream into full response.
     async fn call(&self, req: ProviderRequest) -> Result<ProviderResponse, ProviderError> {
         let stream = self.call_stream(req).await?;
-        let (content, end, _usage) = accumulate_stream(stream, |_| {}, None).await?;
+        // 告知只经由 `on_event` 回传，这里聚合成 `notices`（不改 accumulate_stream 签名）。
+        let mut notices: Vec<ProviderNotice> = Vec::new();
+        let (content, end, _usage) = accumulate_stream(
+            stream,
+            |event| {
+                if let ProviderEvent::Notice { level, text } = event {
+                    notices.push(ProviderNotice { level, text });
+                }
+            },
+            None,
+        )
+        .await?;
         let stop_reason = match end {
             StreamEnd::Stopped(reason) => reason,
             StreamEnd::Failed(error) => return Err(error),
@@ -338,6 +358,7 @@ pub trait Provider: Send + Sync {
         Ok(ProviderResponse {
             content,
             stop_reason,
+            notices,
         })
     }
 

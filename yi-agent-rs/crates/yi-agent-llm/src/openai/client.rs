@@ -1,15 +1,22 @@
 //! OpenaiProvider and Provider trait implementation.
 
+use std::collections::HashMap;
 use std::env;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use yi_agent_core::{ApiStyle, Provider, ProviderError, ProviderEvent, ProviderRequest};
+use yi_agent_core::{
+    ApiStyle, NoticeLevel, Provider, ProviderError, ProviderEvent, ProviderRequest,
+};
 
-use crate::openai::error::map_status_error;
+use crate::openai::channel::{Channel, ChannelCache, looks_like_missing_route};
+use crate::openai::error::map_status_error_from;
+use crate::openai::responses::stream::ResponsesStream;
+use crate::openai::responses::types::responses_request_from;
 use crate::openai::stream::OpenaiStream;
 use crate::openai::types::OpenaiRequest;
 
@@ -48,10 +55,12 @@ pub struct OpenaiProvider {
     base_url: String,
     api_key: String,
     timeout: Duration,
-    /// 端点风格(Task 5 的分发消费);本任务只存储。
+    /// 端点风格:显式指定直接定通道,`Auto` 走探测/回退。
     api_style: ApiStyle,
     /// resolve 后的权威 effort:请求未显式指定时由它补入。
     reasoning_effort: Option<String>,
+    /// 网关能力判定缓存(`base_url` → 实际通道),进程内共享。
+    channel_cache: ChannelCache,
 }
 
 impl std::fmt::Debug for OpenaiProvider {
@@ -63,6 +72,15 @@ impl std::fmt::Debug for OpenaiProvider {
             .field("reasoning_effort", &self.reasoning_effort)
             .finish_non_exhaustive()
     }
+}
+
+/// A non-success POST outcome. The status/body are kept (rather than mapped
+/// eagerly) so the `auto` path can inspect them before deciding to fall back.
+enum PostError {
+    /// Transport-level failure (DNS, connection, timeout) — always terminal.
+    Transport(ProviderError),
+    /// Non-2xx HTTP status with the body already read for classification.
+    Status(u16, String),
 }
 
 impl OpenaiProvider {
@@ -106,8 +124,118 @@ impl OpenaiProvider {
             timeout,
             api_style,
             reasoning_effort: opts.reasoning_effort,
+            channel_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
+
+    /// Decide which endpoint this request should target.
+    ///
+    /// `Auto` has no side effects here: an unknown gateway defaults to
+    /// `Responses`, and the missing-route fallback in `call_stream` caches the
+    /// negative result so later requests skip the wasted POST.
+    fn resolve_channel(&self) -> Channel {
+        match self.api_style {
+            ApiStyle::Chat => Channel::Chat,
+            ApiStyle::Responses => Channel::Responses,
+            ApiStyle::Auto => self
+                .channel_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&self.base_url).copied())
+                .unwrap_or(Channel::Responses),
+        }
+    }
+
+    fn cache_channel(&self, channel: Channel) {
+        if let Ok(mut cache) = self.channel_cache.lock() {
+            cache.insert(self.base_url.clone(), channel);
+        }
+    }
+
+    /// POST a serialized body to `channel` and map the streamed response into
+    /// provider events. Shared by the normal path and the chat fallback.
+    async fn post_channel(
+        &self,
+        channel: Channel,
+        body: &serde_json::Value,
+    ) -> Result<BoxStream<'static, ProviderEvent>, PostError> {
+        let path = match channel {
+            Channel::Chat => "/v1/chat/completions",
+            Channel::Responses => "/v1/responses",
+        };
+
+        let resp = self
+            .client
+            .post(format!("{}{}", self.base_url, path))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .json(body)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(provider = "openai", error = %e, "request failed");
+                PostError::Transport(ProviderError::Network(e.to_string()))
+            })?;
+
+        let status = resp.status();
+        tracing::info!(provider = "openai", %status, ?channel, "response received");
+
+        if !status.is_success() {
+            tracing::warn!(provider = "openai", %status, ?channel, "error response");
+            let status_u16 = status.as_u16();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(PostError::Status(status_u16, body_text));
+        }
+
+        let byte_stream = resp.bytes_stream();
+        let event_stream: BoxStream<'static, ProviderEvent> = match channel {
+            Channel::Chat => OpenaiStream::new(byte_stream)
+                .map(|item| item.unwrap_or_else(ProviderEvent::StreamError))
+                .boxed(),
+            Channel::Responses => ResponsesStream::new(byte_stream)
+                .map(|item| item.unwrap_or_else(ProviderEvent::StreamError))
+                .boxed(),
+        };
+        Ok(guard_terminal(event_stream))
+    }
+}
+
+/// Serialize the request body for `channel`; both builders read the same
+/// normalized `ProviderRequest`, so `reasoning_effort` promotion applies to both.
+fn channel_body(
+    channel: Channel,
+    req: &ProviderRequest,
+) -> Result<serde_json::Value, ProviderError> {
+    let serialized = match channel {
+        Channel::Chat => serde_json::to_value(OpenaiRequest::from(req.clone())),
+        Channel::Responses => serde_json::to_value(responses_request_from(req.clone())),
+    };
+    serialized
+        .map_err(|e| ProviderError::InvalidRequest(format!("failed to serialize request: {e}")))
+}
+
+/// Latch a terminal guard: after `Stop`/`StreamError` nothing more is yielded
+/// (except a trailing `Usage`, which OpenAI sends in a final chunk).
+fn guard_terminal(stream: BoxStream<'static, ProviderEvent>) -> BoxStream<'static, ProviderEvent> {
+    stream
+        .scan(Some(()), |state, event| {
+            let yield_event = state.is_some();
+            // Both a natural stop and a transport failure are terminal:
+            // either must latch the guard, or a failed stream would keep
+            // yielding until the server closes (defeating the deadline).
+            if matches!(
+                event,
+                ProviderEvent::Stop { .. } | ProviderEvent::StreamError(_)
+            ) {
+                *state = None;
+            }
+            // Usage can arrive after Stop (OpenAI sends it in a final chunk).
+            // Always yield it even after Stop so token counts are captured.
+            let yield_event = yield_event || matches!(event, ProviderEvent::Usage(_));
+            std::future::ready(if yield_event { Some(event) } else { None })
+        })
+        .boxed()
 }
 
 #[async_trait]
@@ -123,56 +251,46 @@ impl Provider for OpenaiProvider {
         }
         let model = req.model.clone();
         let msg_count = req.messages.len();
-        tracing::info!(provider = "openai", model = %model, msg_count, "sending request");
+        let channel = self.resolve_channel();
+        tracing::info!(provider = "openai", model = %model, msg_count, ?channel, "sending request");
 
-        let body: OpenaiRequest = req.into();
-
-        let resp = self
-            .client
-            .post(format!("{}/v1/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("content-type", "application/json")
-            .json(&body)
-            .timeout(self.timeout)
-            .send()
-            .await
-            .map_err(|e| {
-                tracing::warn!(provider = "openai", error = %e, "request failed");
-                ProviderError::Network(e.to_string())
-            })?;
-
-        let status = resp.status();
-        tracing::info!(provider = "openai", status = %status, "response received");
-
-        if !resp.status().is_success() {
-            tracing::warn!(provider = "openai", status = %status, "error response");
-            return Err(map_status_error(resp).await);
-        }
-
-        let byte_stream = resp.bytes_stream();
-        let event_stream = OpenaiStream::new(byte_stream);
-
-        let mapped = event_stream
-            .map(|item| match item {
-                Ok(event) => event,
-                Err(e) => ProviderEvent::StreamError(e),
-            })
-            .scan(Some(()), |state, event| {
-                let yield_event = state.is_some();
-                // Both a natural stop and a transport failure are terminal:
-                // either must latch the guard, or a failed stream would keep
-                // yielding until the server closes (defeating the deadline).
-                if matches!(
-                    event,
-                    ProviderEvent::Stop { .. } | ProviderEvent::StreamError(_)
-                ) {
-                    *state = None;
+        let body = channel_body(channel, &req)?;
+        match self.post_channel(channel, &body).await {
+            Ok(stream) => Ok(stream),
+            Err(PostError::Transport(e)) => Err(e),
+            Err(PostError::Status(status, body_text)) => {
+                let missing_route = channel == Channel::Responses
+                    && self.api_style == ApiStyle::Auto
+                    && looks_like_missing_route(status, &body_text);
+                if !missing_route {
+                    return Err(map_status_error_from(status, &body_text));
                 }
-                // Usage can arrive after Stop (OpenAI sends it in a final chunk).
-                // Always yield it even after Stop so token counts are captured.
-                let yield_event = yield_event || matches!(event, ProviderEvent::Usage(_));
-                std::future::ready(if yield_event { Some(event) } else { None })
-            });
-        Ok(mapped.boxed())
+
+                // 网关无 /v1/responses：缓存 chat，并用同一逻辑请求重投一次。
+                tracing::info!(
+                    provider = "openai",
+                    status,
+                    "responses route missing; caching Chat and retrying as chat"
+                );
+                self.cache_channel(Channel::Chat);
+
+                let chat_body = channel_body(Channel::Chat, &req)?;
+                let chat_stream = match self.post_channel(Channel::Chat, &chat_body).await {
+                    Ok(s) => s,
+                    Err(PostError::Transport(e)) => return Err(e),
+                    Err(PostError::Status(status, body)) => {
+                        return Err(map_status_error_from(status, &body));
+                    }
+                };
+
+                let notice = ProviderEvent::Notice {
+                    level: NoticeLevel::Info,
+                    text: "该地址不支持 Responses，已自动改用 Chat".into(),
+                };
+                Ok(futures::stream::once(std::future::ready(notice))
+                    .chain(chat_stream)
+                    .boxed())
+            }
+        }
     }
 }

@@ -14,7 +14,12 @@ use yi_agent_core::ProviderError;
 pub async fn map_status_error(resp: reqwest::Response) -> ProviderError {
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
+    map_status_error_from(status, &body)
+}
 
+/// Classify a status + already-read body. Split out so callers that must read
+/// the body themselves (e.g. the auto-fallback probe) can reuse the same arms.
+pub fn map_status_error_from(status: u16, body: &str) -> ProviderError {
     match status {
         401 | 403 => ProviderError::Auth(format!("{}: {}", status, body)),
         429 => ProviderError::RateLimited,
