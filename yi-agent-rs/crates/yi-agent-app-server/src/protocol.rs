@@ -233,6 +233,17 @@ pub enum Notification {
         thread_id: String,
         mode: crate::thread_store::ThreadMode,
     },
+    /// 该会话的 reasoning effort 覆盖已切换（或清除）。
+    ///
+    /// 与 `thread/modelChanged` / `thread/permissionModeChanged` 并列：effort 是
+    /// 会话元数据，切换后必须让**所有**客户端立即刷新各自的 effort 控件，否则
+    /// 一端改了、另一端停在旧值。`effort: None` ＝ 已清除覆盖（回落条目默认）。
+    #[serde(rename = "thread/reasoningEffortChanged")]
+    ReasoningEffortChanged {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
     #[serde(rename = "item/started")]
     ItemStarted { thread_id: String, item: Item },
     #[serde(rename = "item/delta")]
@@ -351,6 +362,7 @@ impl Notification {
             | Notification::ThreadStatusUpdated { thread_id, .. }
             | Notification::ModelChanged { thread_id, .. }
             | Notification::PermissionModeChanged { thread_id, .. }
+            | Notification::ReasoningEffortChanged { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
             | Notification::ItemDelta { thread_id, .. }
             | Notification::ItemCompleted { thread_id, .. }
@@ -395,6 +407,7 @@ impl Notification {
             | Notification::ThreadStatusUpdated { .. }
             | Notification::ModelChanged { .. }
             | Notification::PermissionModeChanged { .. }
+            | Notification::ReasoningEffortChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
@@ -742,6 +755,38 @@ mod tests {
         // 若按内容层过滤,窗口外会话的模式变更永远收不到——「概率性不同步」的成因。
         assert_eq!(n.delivery(), Delivery::List);
         assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// effort 变更通知的 wire 形状:`thread/reasoningEffortChanged`,参数
+    /// snake_case。与 `permissionModeChanged` 同为列表层恒推,且按 thread 路由。
+    #[test]
+    fn reasoning_effort_changed_notification_carries_method_and_effort() {
+        let n = Notification::ReasoningEffortChanged {
+            thread_id: "t1".into(),
+            effort: Some("high".into()),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/reasoningEffortChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["effort"], "high");
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// 清覆盖(`effort: None`)时 `effort` 键必须缺省,而不是显式 `null`:
+    /// 客户端据此区分「没有值」与「本次没带」——与 `model_ref` 的既有约定一致。
+    #[test]
+    fn cleared_reasoning_effort_omits_the_field() {
+        let n = Notification::ReasoningEffortChanged {
+            thread_id: "t1".into(),
+            effort: None,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/reasoningEffortChanged");
+        assert!(
+            v["params"].get("effort").is_none(),
+            "a cleared override must omit the field: {v}"
+        );
     }
 
     #[test]

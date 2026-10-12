@@ -56,6 +56,9 @@ pub fn handle_model_request_at(
 
 /// 当前默认实际解析到哪里：命中清单条目就用条目，否则回退 cfg（`.env`）。
 /// key 一律只出掩码——与 [`entry_view`] 同一条安全约定。
+///
+/// `api_style` / `reasoning_effort` 同 `resolve_effective` 的语义：命中条目即
+/// 取条目的值（缺省 = 未设置），否则回退 cfg。二者是「生效值」，UI 据此回显。
 fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
     match effective_entry(catalog, None) {
         Some(entry) => json!({
@@ -64,6 +67,8 @@ fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
             "provider": entry.provider.as_str(),
             "api_url": entry.api_url,
             "model": entry.model,
+            "api_style": entry.api_style,
+            "reasoning_effort": entry.reasoning_effort,
             "has_key": !entry.api_key.is_empty(),
             "api_key_masked": mask_key(&entry.api_key),
         }),
@@ -73,6 +78,8 @@ fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
             "provider": cfg.provider,
             "api_url": cfg.api_url,
             "model": cfg.model,
+            "api_style": cfg.api_style.as_str(),
+            "reasoning_effort": cfg.reasoning_effort,
             "has_key": !cfg.api_key.is_empty(),
             "api_key_masked": mask_key(&cfg.api_key),
         }),
@@ -653,6 +660,37 @@ mod tests {
         let reloaded = yi_agent_runtime::models::load_catalog_from(&path);
         assert_eq!(reloaded.models[0].api_style.as_deref(), Some("responses"));
         assert_eq!(reloaded.models[0].reasoning_effort.as_deref(), Some("low"));
+    }
+
+    /// `effective` 也带生效的 `api_style` / `reasoning_effort`（任务 2 的 deferred
+    /// Minor）：命中条目即取条目值，供 UI 回显「当前默认跑在什么档位/通道上」。
+    #[test]
+    fn effective_carries_api_style_and_reasoning_effort_from_the_entry() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({
+                "name": "A", "provider": "openai", "api_url": "u", "model": "m",
+                "api_style": "chat", "reasoning_effort": "none",
+            }),
+        )
+        .unwrap();
+        call(&path, "model/setDefault", json!({ "name": "A" })).unwrap();
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(list["effective"]["source"], "catalog");
+        assert_eq!(list["effective"]["api_style"], "chat");
+        assert_eq!(list["effective"]["reasoning_effort"], "none");
+    }
+
+    /// 未命中条目时回退 cfg：`api_style` 出解析后串，`reasoning_effort` 出 cfg 值。
+    #[test]
+    fn effective_fallback_reports_the_cfg_values() {
+        let (_dir, path) = catalog_path();
+        let out = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(out["effective"]["source"], "env");
+        assert_eq!(out["effective"]["api_style"], "auto");
+        assert!(out["effective"]["reasoning_effort"].is_null());
     }
 
     #[test]

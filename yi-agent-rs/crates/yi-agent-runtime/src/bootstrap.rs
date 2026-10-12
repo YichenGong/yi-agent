@@ -301,6 +301,13 @@ pub fn build_agent_config(
         model: cfg.model.clone(),
         system_prompt,
         max_turns: Some(cfg.max_turns),
+        // 请求级的 effort 取自 cfg（`resolve_effective` 已把条目的默认值、
+        // 或 app-server 注入的会话覆盖写进 `cfg.reasoning_effort`）。`None`
+        // 表示不发该字段 ⇒ 零回归；precedence 由 `cfg` 单一权威。
+        gen_params: yi_agent_core::GenParams {
+            reasoning_effort: cfg.reasoning_effort.clone(),
+            ..Default::default()
+        },
         compact_threshold: Some(cfg.compact_threshold),
         compact_user_budget_tokens: cfg.compact_user_budget_tokens,
         compact_tool_budget_tokens: cfg.compact_tool_budget_tokens,
@@ -575,6 +582,28 @@ mod tests {
             Arc::strong_count(&built.provider) >= 2,
             "the exposed provider must be the instance the agent runs on"
         );
+    }
+
+    /// `build_agent_config` 把 `cfg.reasoning_effort` 搬进请求级的
+    /// `gen_params.reasoning_effort`。这是 precedence 的落点：`resolve_effective`
+    /// 已把「条目默认」写进 cfg，app-server 的会话覆盖又写在 cfg 之上，故 agent
+    /// 主循环取 `config.gen_params` 时读到的正是最终生效档位。
+    #[test]
+    fn build_agent_config_carries_the_effort_into_gen_params() {
+        let mut cfg = sample_config();
+        cfg.reasoning_effort = Some("high".into());
+        let ac = build_agent_config(&cfg, None);
+        assert_eq!(ac.gen_params.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// 未设置 effort ⇒ `None` ⇒ provider 不发该字段（零回归）。这条钉住的是
+    /// 「缺省即不发」的核心契约，任何把 `None` 变成默认档位的改动都会让它失败。
+    #[test]
+    fn unset_reasoning_effort_stays_none() {
+        let mut cfg = sample_config();
+        cfg.reasoning_effort = None;
+        let ac = build_agent_config(&cfg, None);
+        assert_eq!(ac.gen_params.reasoning_effort, None);
     }
 
     #[test]

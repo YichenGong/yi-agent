@@ -50,6 +50,10 @@ pub struct ThreadMeta {
     /// `model_ref` 是用户在清单里选中的**显示名**（选择用）。
     #[serde(default)]
     pub model_ref: Option<String>,
+    /// 会话级 reasoning effort 覆盖（七档之一）。None = 跟随条目默认（再回退
+    /// 「未设置＝不发该字段」）。旧 meta 缺字段时默认 None，零迁移。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// 一次 turn 的 token 用量。
@@ -424,6 +428,22 @@ impl ThreadStore {
         }
     }
 
+    /// 设置/清除该 thread 的 reasoning effort 覆盖（七档之一）。
+    ///
+    /// 与 [`set_model_ref`] 同款：走 `update_meta` 的读-改-写锁与原子写路径，避免
+    /// 与并发 `touch` / `rename` 互相覆盖。`None` = 清覆盖（回落到条目默认）。
+    /// 返回 `Err(NotFound)` 表示 thread 不存在或 meta 不可读。
+    pub fn set_reasoning_effort(&self, id: &str, effort: Option<&str>) -> io::Result<()> {
+        let updated = self.update_meta(id, |meta| {
+            meta.reasoning_effort = effort.map(str::to_string);
+            meta.updated_at = now_millis();
+        })?;
+        match updated {
+            Some(_) => Ok(()),
+            None => Err(io::Error::new(io::ErrorKind::NotFound, "unknown thread")),
+        }
+    }
+
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
     /// `title_hint`(本轮 prompt)填充。
     ///
@@ -725,6 +745,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         board_project: None,
         card_id: None,
         model_ref: None,
+        reasoning_effort: None,
     }
 }
 
@@ -752,6 +773,7 @@ mod tests {
             board_project: None,
             card_id: None,
             model_ref: None,
+            reasoning_effort: None,
         }
     }
 
@@ -1412,6 +1434,7 @@ mod tests {
             board_project: None,
             card_id: None,
             model_ref: None,
+            reasoning_effort: None,
         }
     }
 
@@ -1744,6 +1767,7 @@ mod tests {
             board_project: Some("/proj".into()),
             card_id: Some("c1".into()),
             model_ref: None,
+            reasoning_effort: None,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -1780,6 +1804,7 @@ mod tests {
             board_project: None,
             card_id: None,
             model_ref: None,
+            reasoning_effort: None,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -1788,5 +1813,41 @@ mod tests {
         store.set_model_ref("t", None).unwrap();
         let loaded = store.load("t").unwrap().unwrap();
         assert_eq!(loaded.meta.model_ref, None);
+    }
+
+    /// 旧 meta 缺 `reasoning_effort` 字段 → `None`(零迁移);设值往返;
+    /// 清覆盖回 `None`。与 `set_model_ref_round_trips` 同款:走真实 `create`
+    /// + `set_reasoning_effort` + `load` 的读-改-写路径。
+    #[test]
+    fn reasoning_effort_round_trips_and_legacy_defaults_none() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        // 旧 meta 无该字段(逐字模拟今天的盘上 JSON):反序列化必须给 `None`。
+        let json = r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
+        let legacy: ThreadMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(legacy.reasoning_effort, None, "旧 meta 缺字段必须回 None");
+
+        store.create(&meta("t")).unwrap();
+        assert_eq!(
+            store.load("t").unwrap().unwrap().meta.reasoning_effort,
+            None
+        );
+        store.set_reasoning_effort("t", Some("high")).unwrap();
+        let loaded = store.load("t").unwrap().unwrap();
+        assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("high"));
+        store.set_reasoning_effort("t", None).unwrap();
+        let loaded = store.load("t").unwrap().unwrap();
+        assert_eq!(loaded.meta.reasoning_effort, None);
+    }
+
+    /// 未知 id 必须回 `Err(NotFound)`,与 `set_model` 同一错误语义(调用方据此
+    /// 映射 `unknown_thread`),而不是静默成功。
+    #[test]
+    fn set_reasoning_effort_on_an_unknown_thread_is_not_found() {
+        let (_d, s) = store();
+        let err = s
+            .set_reasoning_effort("ghost", Some("high"))
+            .expect_err("an unknown thread must not be silently accepted");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
