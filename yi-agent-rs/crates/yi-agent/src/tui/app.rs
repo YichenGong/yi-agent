@@ -9366,6 +9366,8 @@ mod tests {
             api_url: format!("https://{name}.example"),
             model: model.into(),
             api_key: "sk-secret".into(),
+            api_style: None,
+            reasoning_effort: None,
         };
         ModelCatalog {
             models: vec![

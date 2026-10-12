@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use yi_agent_core::ApiStyle;
 
 use crate::config::RuntimeConfig;
 
@@ -46,6 +47,12 @@ pub struct ModelEntry {
     pub model: String,
     #[serde(default)]
     pub api_key: String,
+    /// `auto`（默认）| `responses` | `chat`；未知值按 `auto` 处理。
+    #[serde(default)]
+    pub api_style: Option<String>,
+    /// 七档之一；`None` = 不发该字段。
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 /// 反序列化时把非法 provider 变成错误，让整条被跳过（见 `load_catalog_from` 的逐条过滤）。
@@ -205,7 +212,7 @@ pub fn mask_key(key: &str) -> String {
 }
 
 /// 会话覆盖 → 全局默认 → 原 cfg 三级解析，返回改写了 provider/api_url/api_key/model
-/// 四个字段的 cfg 克隆，其余字段保持原值。
+/// 以及 `api_style` / `reasoning_effort` 的 cfg 克隆，其余字段保持原值。
 pub fn resolve_effective(
     cfg: &RuntimeConfig,
     catalog: &ModelCatalog,
@@ -218,6 +225,12 @@ pub fn resolve_effective(
             out.api_url = entry.api_url.clone();
             out.api_key = entry.api_key.clone();
             out.model = entry.model.clone();
+            out.api_style = entry
+                .api_style
+                .as_deref()
+                .map(ApiStyle::parse)
+                .unwrap_or(RuntimeConfig::default_api_style());
+            out.reasoning_effort = entry.reasoning_effort.clone();
             out
         }
         None => cfg.clone(),
@@ -256,6 +269,8 @@ mod tests {
             api_url: "https://x".into(),
             model: "claude-x".into(),
             api_key: "sk-secret-1234".into(),
+            api_style: None,
+            reasoning_effort: None,
         }
     }
 
@@ -356,6 +371,41 @@ mod tests {
         assert_eq!(mask_key("ab"), "••••");
         assert_eq!(mask_key(""), "••••");
     }
+
+    #[test]
+    fn entries_round_trip_the_two_new_optional_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"L","provider":"openai","api_url":"u","model":"m",
+            "api_key":"k","api_style":"responses","reasoning_effort":"none"}]}"#,
+        )
+        .unwrap();
+        let catalog = load_catalog_from(&path);
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].api_style.as_deref(), Some("responses"));
+        assert_eq!(catalog.models[0].reasoning_effort.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn legacy_entries_without_the_new_fields_still_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"A","provider":"openai","api_url":"u","model":"m","api_key":"k"}]}"#,
+        )
+        .unwrap();
+        let catalog = load_catalog_from(&path);
+        assert_eq!(
+            catalog.models.len(),
+            1,
+            "missing optional fields must not skip the entry"
+        );
+        assert_eq!(catalog.models[0].api_style, None);
+        assert_eq!(catalog.models[0].reasoning_effort, None);
+    }
 }
 
 #[cfg(test)]
@@ -364,7 +414,7 @@ mod resolve_tests {
     use crate::config::RuntimeConfig;
 
     /// `config.rs` exposes no reusable test constructor, so build a complete
-    /// literal here. The four fields the resolver rewrites are deliberately set
+    /// literal here. The fields the resolver rewrites are deliberately set
     /// to recognizable "base" values so the tests can tell them apart.
     fn cfg() -> RuntimeConfig {
         RuntimeConfig {
@@ -372,6 +422,9 @@ mod resolve_tests {
             api_url: "https://base".into(),
             api_key: "base-key".into(),
             model: "base-model".into(),
+            // Base values for the two fields the resolver also rewrites.
+            api_style: yi_agent_core::ApiStyle::Chat,
+            reasoning_effort: Some("base-effort".into()),
             max_turns: 200,
             max_resident_subagents: 64,
             max_direct_children: crate::config::DIRECT_CHILDREN_DEFAULT,
@@ -398,6 +451,8 @@ mod resolve_tests {
                     api_url: "https://a".into(),
                     model: "model-a".into(),
                     api_key: "key-a".into(),
+                    api_style: None,
+                    reasoning_effort: None,
                 },
                 ModelEntry {
                     name: "B".into(),
@@ -405,6 +460,8 @@ mod resolve_tests {
                     api_url: "https://b".into(),
                     model: "model-b".into(),
                     api_key: "key-b".into(),
+                    api_style: None,
+                    reasoning_effort: None,
                 },
             ],
             default_model: Some("A".into()),
@@ -436,8 +493,10 @@ mod resolve_tests {
         assert_eq!(out.api_url, base.api_url);
     }
 
+    /// 条目改写的是四个身份字段（provider/api_url/api_key/model）与两个通道字段
+    /// （api_style/reasoning_effort）；其余字段必须原样带过。
     #[test]
-    fn only_the_four_fields_change() {
+    fn only_the_model_identity_fields_change() {
         let base = cfg();
         let out = resolve_effective(&base, &catalog(), Some("B"));
         assert_eq!(out.workdir, base.workdir);
@@ -452,5 +511,22 @@ mod resolve_tests {
         let mut cat2 = cat.clone();
         cat2.subagent_model = Some("B".into());
         assert_eq!(subagent_entry(&cat2).map(|e| e.name.as_str()), Some("B"));
+    }
+
+    #[test]
+    fn resolve_effective_carries_api_style_and_effort_from_the_entry() {
+        let mut cat = catalog();
+        cat.models[1].api_style = Some("responses".into());
+        cat.models[1].reasoning_effort = Some("low".into());
+        let out = resolve_effective(&cfg(), &cat, Some("B"));
+        assert_eq!(out.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(out.api_style.as_str(), "responses");
+    }
+
+    #[test]
+    fn resolve_effective_defaults_to_auto_and_no_effort_when_entry_silent() {
+        let out = resolve_effective(&cfg(), &catalog(), Some("A"));
+        assert_eq!(out.reasoning_effort, None);
+        assert_eq!(out.api_style.as_str(), "auto");
     }
 }

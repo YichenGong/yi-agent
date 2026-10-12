@@ -400,6 +400,8 @@ mod tests {
                 api_url: "https://a".into(),
                 model: "m".into(),
                 api_key: api_key.into(),
+                api_style: None,
+                reasoning_effort: None,
             }],
             default_model: Some(name.into()),
             subagent_model: None,
