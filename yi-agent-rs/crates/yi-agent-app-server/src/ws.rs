@@ -599,7 +599,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
             .await
             .expect("timed out waiting for a ws frame")
             .expect("ws stream ended before a frame arrived")
@@ -667,7 +667,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
             .expect("handshake completes; the close follows");
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
             .await
             .expect("server must close an unauthenticated connection")
             .expect("stream must not end without a close frame")
@@ -694,7 +694,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(request)
             .await
             .expect("handshake completes; the close follows");
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
             .await
             .expect("server must close an invalid-token connection")
             .expect("stream must not end without a close frame")
@@ -779,7 +779,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(request)
             .await
             .expect("handshake completes; the close follows");
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
             .await
             .expect("server must close the connection")
             .expect("stream must not end without a close frame")
@@ -799,7 +799,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?{query}"))
             .await
             .expect("handshake completes; the close follows");
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
             .await
             .expect("server must close the connection")
             .expect("stream must not end without a close frame")
@@ -925,7 +925,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        let closed = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
             .await
             .expect("the server must close a one-shot pairing connection");
         match closed {
@@ -1214,7 +1214,7 @@ mod tests {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         loop {
-            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            let frame = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
                 .await
                 .expect("timed out waiting for requestApproval")
                 .expect("ws stream ended before requestApproval")
@@ -1241,7 +1241,7 @@ mod tests {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         loop {
-            let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+            let frame = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for {method}"))
                 .expect("ws stream ended before the expected frame")

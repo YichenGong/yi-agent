@@ -1039,7 +1039,14 @@ mod tests {
         );
 
         // 后台进程仍在（未被 disarmed guard 误杀）→ 1 秒后写出 marker。
-        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
+        //
+        // 这里轮询「marker 出现」而不是固定睡一个够长的时长：后台进程是 `sleep 1`
+        // 之后再 touch，满载机器上它可能远晚于 1.8s 才被调度到，固定等待就会把
+        // 宿主机负载误报成「后台进程被杀了」。条件轮询只是给足上限，断言不变。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(
             marker.exists(),
             "background process must survive normal exit"
