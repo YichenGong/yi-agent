@@ -21,6 +21,8 @@ pub fn build_provider(cfg: &RuntimeConfig) -> Result<Arc<dyn yi_agent_core::Prov
             yi_agent_llm::OpenaiProviderOpts {
                 base_url: Some(cfg.api_url.clone()),
                 api_key: Some(cfg.api_key.clone()),
+                api_style: Some(cfg.api_style.as_str().to_string()),
+                reasoning_effort: cfg.reasoning_effort.clone(),
                 ..Default::default()
             },
         )?)),

@@ -306,9 +306,10 @@ pub async fn test_connection(settings: &ModelSettings) -> ConnectionOutcome {
             base_url: Some(settings.api_url.clone()),
             api_key: Some(settings.api_key.clone()),
             // 探测只等一小会儿（spec §5 建议 ~15s）：默认 300s 会让「地址写错」
-            // 看起来像界面卡死。三个字段至此全部指定，`..Default::default()`
-            // 会成为无效果的 struct update（clippy::needless_update），故去掉。
+            // 看起来像界面卡死。
             timeout: Some(std::time::Duration::from_secs(15)),
+            // 探测不携带 api_style/reasoning_effort：连接验证只需 key/url/model。
+            ..Default::default()
         }) {
             Ok(p) => std::sync::Arc::new(p),
             Err(error) => return failure(error),

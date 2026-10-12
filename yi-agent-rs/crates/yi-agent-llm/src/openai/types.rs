@@ -85,6 +85,8 @@ pub struct OpenaiGenParams {
     pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "stop")]
     pub stop_sequences: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -311,6 +313,7 @@ impl From<ProviderRequest> for OpenaiRequest {
                 max_tokens: req.params.max_tokens,
                 top_p: req.params.top_p,
                 stop_sequences: req.params.stop_sequences,
+                reasoning_effort: req.params.reasoning_effort.clone(),
             },
         }
     }

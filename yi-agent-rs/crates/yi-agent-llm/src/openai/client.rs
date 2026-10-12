@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use yi_agent_core::{Provider, ProviderError, ProviderEvent, ProviderRequest};
+use yi_agent_core::{ApiStyle, Provider, ProviderError, ProviderEvent, ProviderRequest};
 
 use crate::openai::error::map_status_error;
 use crate::openai::stream::OpenaiStream;
@@ -37,6 +37,10 @@ pub struct OpenaiProviderOpts {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub timeout: Option<Duration>,
+    /// `auto`(默认) | `responses` | `chat`。非法值解析为 `auto`。
+    pub api_style: Option<String>,
+    /// 推理努力档位;`None` = 不发该字段(零回归默认)。
+    pub reasoning_effort: Option<String>,
 }
 
 pub struct OpenaiProvider {
@@ -44,6 +48,10 @@ pub struct OpenaiProvider {
     base_url: String,
     api_key: String,
     timeout: Duration,
+    /// 端点风格(Task 5 的分发消费);本任务只存储。
+    api_style: ApiStyle,
+    /// resolve 后的权威 effort:请求未显式指定时由它补入。
+    reasoning_effort: Option<String>,
 }
 
 impl std::fmt::Debug for OpenaiProvider {
@@ -51,6 +59,8 @@ impl std::fmt::Debug for OpenaiProvider {
         f.debug_struct("OpenaiProvider")
             .field("base_url", &self.base_url)
             .field("timeout", &self.timeout)
+            .field("api_style", &self.api_style)
+            .field("reasoning_effort", &self.reasoning_effort)
             .finish_non_exhaustive()
     }
 }
@@ -78,6 +88,12 @@ impl OpenaiProvider {
             .timeout
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
 
+        let api_style = opts
+            .api_style
+            .as_deref()
+            .map(ApiStyle::parse)
+            .unwrap_or(ApiStyle::Auto);
+
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
@@ -88,6 +104,8 @@ impl OpenaiProvider {
             base_url,
             api_key,
             timeout,
+            api_style,
+            reasoning_effort: opts.reasoning_effort,
         })
     }
 }
@@ -96,8 +114,13 @@ impl OpenaiProvider {
 impl Provider for OpenaiProvider {
     async fn call_stream(
         &self,
-        req: ProviderRequest,
+        mut req: ProviderRequest,
     ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+        // provider 级 effort 是 resolve 后的权威值:请求未显式指定时补入,
+        // 已显式设置的请求值不被覆盖/剥离(剥离是 Task 6)。
+        if self.reasoning_effort.is_some() && req.params.reasoning_effort.is_none() {
+            req.params.reasoning_effort = self.reasoning_effort.clone();
+        }
         let model = req.model.clone();
         let msg_count = req.messages.len();
         tracing::info!(provider = "openai", model = %model, msg_count, "sending request");

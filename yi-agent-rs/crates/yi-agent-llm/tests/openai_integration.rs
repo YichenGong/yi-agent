@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use futures::stream::StreamExt;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use yi_agent_core::{
@@ -39,6 +39,7 @@ fn provider_for(server: &MockServer) -> OpenaiProvider {
         base_url: Some(server.uri()),
         api_key: Some("test-key".to_string()),
         timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
     })
     .expect("provider construction")
 }
@@ -301,6 +302,7 @@ async fn trims_trailing_slash_in_base_url() {
         base_url: Some(format!("{}/", server.uri())),
         api_key: Some("test-key".to_string()),
         timeout: Some(Duration::from_secs(5)),
+        ..Default::default()
     })
     .expect("provider construction");
     let _ = provider
@@ -494,4 +496,53 @@ async fn tool_result_image_reaches_request_body_as_image_url() {
         params: GenParams::default(),
     };
     let _ = provider.call_stream(req).await.expect("stream ok");
+}
+
+#[tokio::test]
+async fn chat_request_carries_reasoning_effort_when_set() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(
+            serde_json::json!({"reasoning_effort": "none"}),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SSE_TEXT_STREAM))
+        .mount(&server)
+        .await;
+    let provider = OpenaiProvider::new(OpenaiProviderOpts {
+        base_url: Some(server.uri()),
+        api_key: Some("k".into()),
+        timeout: Some(Duration::from_secs(5)),
+        api_style: Some("chat".into()),
+        reasoning_effort: Some("none".into()),
+    })
+    .unwrap();
+    let mut req = simple_request();
+    req.params.reasoning_effort = Some("none".into());
+    let _ = provider.call(req).await.expect("call ok");
+}
+
+#[tokio::test]
+async fn chat_request_omits_reasoning_effort_when_unset() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        // 断言请求体里根本没有 reasoning_effort 键
+        .and(|req: &wiremock::Request| {
+            !serde_json::from_slice::<serde_json::Value>(&req.body)
+                .map(|v| v.get("reasoning_effort").is_some())
+                .unwrap_or(true)
+        })
+        .respond_with(ResponseTemplate::new(200).set_body_string(SSE_TEXT_STREAM))
+        .mount(&server)
+        .await;
+    let provider = OpenaiProvider::new(OpenaiProviderOpts {
+        base_url: Some(server.uri()),
+        api_key: Some("k".into()),
+        timeout: Some(Duration::from_secs(5)),
+        api_style: Some("chat".into()),
+        reasoning_effort: None,
+    })
+    .unwrap();
+    let _ = provider.call(simple_request()).await.expect("call ok");
 }
