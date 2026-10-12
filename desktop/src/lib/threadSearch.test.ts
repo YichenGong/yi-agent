@@ -81,6 +81,38 @@ describe("filterThreadTree", () => {
     expect(r.groups.map((g) => g.workspace)).toEqual(["/work/projA"]);
   });
 
+  it("分组只剩置顶行可渲染时整组移除，而置顶会话仍在 pinned 中返回", () => {
+    // 置顶会话按约定仍留在各自分组内，但分组**不**渲染它（Pinned 区渲染）。
+    const pin = { ...thread("p", "pin-a", "/work/projA"), pinned: true };
+    const normal = thread("n", "normal thing", "/work/projA");
+    const g: WorkspaceGroup[] = [
+      { workspace: "/work/projA", exists: true, threads: [normal, pin] },
+    ];
+
+    // 只有置顶会话命中 ⇒ 该分组一行都渲染不出来 ⇒ 连表头一起移除。
+    const hitPin = filterThreadTree(g, [pin], "pin-a");
+    expect(hitPin.pinned.map((t) => t.thread_id)).toEqual(["p"]);
+    expect(hitPin.groups).toEqual([]);
+
+    // 命中普通会话时分组照常保留（意图：移除只由「零可渲染行」触发）。
+    const hitNormal = filterThreadTree(g, [pin], "normal thing");
+    expect(hitNormal.groups.map((w) => w.workspace)).toEqual(["/work/projA"]);
+    expect(hitNormal.groups[0].threads.map((t) => t.thread_id)).toEqual(["n"]);
+  });
+
+  it("卡片会话不算「零可渲染行」：命中的卡片由分组自身的「看板会话」小节渲染", () => {
+    // 与置顶会话不同：卡片会话不在分组外的独立区段渲染，而由本组的
+    // renderBoardThreads 渲染（搜索期间强制展开）。故卡片命中时分组必须保留，
+    // 否则 ThreadSidebar 那条「搜索命中折叠小节时自动展开」的行为会被误删。
+    const card = { ...thread("c", "card-a", "/work/projB"), card_id: "k1" };
+    const normal = thread("n", "normal thing", "/work/projB");
+    const g: WorkspaceGroup[] = [
+      { workspace: "/work/projB", exists: true, threads: [normal, card] },
+    ];
+    expect(idsOf(filterThreadTree(g, [], "card-a"))).toEqual(["c"]);
+    expect(idsOf(filterThreadTree(g, [], "normal thing"))).toEqual(["n"]);
+  });
+
   it("无命中时 groups 为空且 empty 为 true", () => {
     const r = filterThreadTree(groups, [], "zzz-nothing");
     expect(r.groups).toEqual([]);
