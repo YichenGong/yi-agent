@@ -706,8 +706,9 @@ export function ThreadSidebar({
           </>
         )}
       </div>
-      {searchBar}
+      {!isMobile && searchBar}
       <div className="flex-1 overflow-y-auto">
+        {isMobile && searchBar}
         {groupCount(groups) === 0 && !searching && (
           <p className="px-3 py-2 text-xs text-fg-faint">选择一个目录开始</p>
         )}

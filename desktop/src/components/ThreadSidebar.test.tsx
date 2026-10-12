@@ -884,6 +884,42 @@ describe("ThreadSidebar 手机长按", () => {
 describe("ThreadSidebar 搜索", () => {
   const searchBox = () => screen.getByLabelText("搜索会话") as HTMLInputElement;
 
+  it("手机端：搜索框与会话行同属滚动容器（随列表滚动）", () => {
+    const { container } = renderSidebar({ isMobile: true });
+    const row = container.querySelector("[data-group-row]")!;
+    const scroller = row.closest(".overflow-y-auto");
+    expect(scroller).not.toBeNull();
+    expect(searchBox().closest(".overflow-y-auto")).toBe(scroller);
+  });
+
+  it("桌面端：搜索框在任何滚动容器之外（钉在列表上方）", () => {
+    const { container } = renderSidebar();
+    const row = container.querySelector("[data-group-row]")!;
+    expect(row.closest(".overflow-y-auto")).not.toBeNull();
+    expect(searchBox().closest(".overflow-y-auto")).toBeNull();
+  });
+
+  it("搜索命中藏在「看板会话」折叠小节里时，该小节搜索期间自动展开", () => {
+    const withCard: WorkspaceGroup[] = [
+      {
+        workspace: "/proj",
+        exists: true,
+        threads: [
+          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: withCard, boards: ["/proj"] });
+    // 默认折叠：空闲时命中行不可见。
+    expect(container.textContent).not.toContain("看板 · card-1");
+    fireEvent.change(searchBox(), { target: { value: "card-1" } });
+    // 搜索期间小节自动展开：命中行可见。
+    expect(container.textContent).toContain("看板 · card-1");
+    fireEvent.change(searchBox(), { target: { value: "" } });
+    // 清空后恢复折叠。
+    expect(container.textContent).not.toContain("看板 · card-1");
+  });
+
   it("搜索栏在 New thread 之后、会话列表之前", () => {
     const { container } = renderSidebar();
     const newThread = newThreadTrigger(container);
