@@ -48,11 +48,23 @@ pub struct ModelEntry {
     #[serde(default)]
     pub api_key: String,
     /// `auto`（默认）| `responses` | `chat`；未知值按 `auto` 处理。
-    #[serde(default)]
+    /// 非字符串值按「未设置」处理，不让整条被跳过（见 `de_optional_string`）。
+    #[serde(default, deserialize_with = "de_optional_string")]
     pub api_style: Option<String>,
     /// 七档之一；`None` = 不发该字段。
-    #[serde(default)]
+    /// 非字符串值按「未设置」处理，不让整条被跳过（见 `de_optional_string`）。
+    #[serde(default, deserialize_with = "de_optional_string")]
     pub reasoning_effort: Option<String>,
+}
+
+/// 反序列化时把非字符串值当作「未设置」（None），避免一个手写值让整条被跳过。
+/// 缺失 / `null` / 任意非字符串 → `None`；字符串 → `Some(s)`（不在读路径校验档位）。
+fn de_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_str().map(str::to_string)))
 }
 
 /// 反序列化时把非法 provider 变成错误，让整条被跳过（见 `load_catalog_from` 的逐条过滤）。
@@ -404,6 +416,45 @@ mod tests {
             "missing optional fields must not skip the entry"
         );
         assert_eq!(catalog.models[0].api_style, None);
+        assert_eq!(catalog.models[0].reasoning_effort, None);
+    }
+
+    /// 非字符串值（例如手写的 `5` / `["x"]`）必须退化成「未设置」，
+    /// 而不能让整条 model entry 被跳过（设计 4.1：非法值按「默认 / 不发」处理）。
+    #[test]
+    fn non_string_new_fields_degrade_to_none_without_skipping_the_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"N","provider":"openai","api_url":"u","model":"m",
+            "api_key":"k","api_style":5,"reasoning_effort":["x"]}]}"#,
+        )
+        .unwrap();
+        let catalog = load_catalog_from(&path);
+        assert_eq!(
+            catalog.models.len(),
+            1,
+            "non-string new fields must not skip the entry"
+        );
+        assert_eq!(catalog.models[0].api_style, None);
+        assert_eq!(catalog.models[0].reasoning_effort, None);
+    }
+
+    /// 非字符串值只影响它自己那个字段：同一侧的合法字符串仍照常读出。
+    #[test]
+    fn non_string_new_field_does_not_clear_a_valid_sibling() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"N","provider":"openai","api_url":"u","model":"m",
+            "api_key":"k","api_style":"responses","reasoning_effort":{"tier":"low"}}]}"#,
+        )
+        .unwrap();
+        let catalog = load_catalog_from(&path);
+        assert_eq!(catalog.models.len(), 1, "entry must still load");
+        assert_eq!(catalog.models[0].api_style.as_deref(), Some("responses"));
         assert_eq!(catalog.models[0].reasoning_effort, None);
     }
 }
