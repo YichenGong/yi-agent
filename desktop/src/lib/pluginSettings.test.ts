@@ -5,6 +5,8 @@ import {
   writeKanbanSettings,
   pluginErrorKind,
   pluginProjectPaths,
+  parseDays,
+  renderDays,
 } from "./pluginSettings";
 
 // `PluginRpc` returns a generic `Promise<T>`, so a concrete stub is not
@@ -105,5 +107,45 @@ describe("pluginSettings", () => {
     expect(
       pluginErrorKind(new Error("the plugin rejected the query: validation")),
     ).toBe("plugin_rejected");
+  });
+});
+
+describe("weekday specs", () => {
+  const T = true;
+  const F = false;
+
+  it("parses a range, a list and a single day (Mon-first)", () => {
+    expect(parseDays("Mon-Fri")).toEqual([T, T, T, T, T, F, F]);
+    expect(parseDays("Sat,Sun")).toEqual([F, F, F, F, F, T, T]);
+    expect(parseDays("Mon,Wed,Fri")).toEqual([T, F, T, F, T, F, F]);
+    expect(parseDays("Sun")).toEqual([F, F, F, F, F, F, T]);
+  });
+
+  it("accepts full names, any case, and stray spaces", () => {
+    expect(parseDays("monday")).toEqual([T, F, F, F, F, F, F]);
+    expect(parseDays("MON-FRI")).toEqual([T, T, T, T, T, F, F]);
+    expect(parseDays(" Mon - Wed , Sat ")).toEqual([T, T, T, F, F, T, F]);
+  });
+
+  it("reads nothing selected and unknown names as empty", () => {
+    expect(parseDays("")).toEqual([F, F, F, F, F, F, F]);
+    expect(parseDays("nonsense")).toEqual([F, F, F, F, F, F, F]);
+  });
+
+  it("compresses a selection back into the plugin's spec form", () => {
+    expect(renderDays([T, T, T, T, T, F, F])).toBe("Mon-Fri");
+    // 周六+周日相邻，插件同样压成区间（与 `render_days` 一致，不是 `Sat,Sun`）。
+    expect(renderDays([F, F, F, F, F, T, T])).toBe("Sat-Sun");
+    expect(renderDays([T, F, T, F, T, F, F])).toBe("Mon,Wed,Fri");
+    expect(renderDays([T, T, T, T, T, T, T])).toBe("Mon-Sun");
+    expect(renderDays([F, F, F, F, F, F, F])).toBe("");
+  });
+
+  it("round-trips the canonical specs the plugin produces", () => {
+    for (const spec of ["Mon-Fri", "Sat-Sun", "Mon,Wed,Fri", "Sun", "Mon-Sun"]) {
+      expect(renderDays(parseDays(spec))).toBe(spec);
+    }
+    // 非规范输入（手写 TOML 里的逗号写法）读得进、写出来是规范形式。
+    expect(renderDays(parseDays("Sat,Sun"))).toBe("Sat-Sun");
   });
 });

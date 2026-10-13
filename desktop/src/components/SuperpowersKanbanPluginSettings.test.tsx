@@ -73,8 +73,10 @@ describe("SuperpowersKanbanPluginSettings", () => {
     await screen.findByLabelText("默认并发上限");
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
-    // 重读回来的窗口必须渲染出来。
-    await screen.findByLabelText("窗口 0 星期");
+    // 重读回来的窗口必须渲染出来：days="Mon" 只点亮「星期一」。
+    const monday = await screen.findByLabelText("窗口 0 星期一");
+    expect(monday.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByLabelText("窗口 0 星期二").getAttribute("aria-pressed")).toBe("false");
     expect((screen.getByLabelText("窗口 0 上限") as HTMLInputElement).value).toBe("5");
     expect(writes).toBe(1);
   });
@@ -94,8 +96,14 @@ describe("SuperpowersKanbanPluginSettings", () => {
     ]);
     const { container } = render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
 
-    await screen.findByLabelText("窗口 0 星期");
+    await screen.findByLabelText("窗口 0 星期一");
     expect(container.querySelector("table")).toBeNull();
+    // 星期不再是文本框，而是七个可点按的按钮（组本身仍带「窗口 N 星期」标签）。
+    expect(screen.getByLabelText("窗口 0 星期").tagName).not.toBe("INPUT");
+    expect((screen.getByLabelText("窗口 0 星期一") as HTMLButtonElement).type).toBe("button");
+    for (const zh of ["一", "二", "三", "四", "五", "六", "日"]) {
+      expect(screen.getByLabelText(`窗口 0 星期${zh}`)).toBeTruthy();
+    }
     expect(screen.getByLabelText("窗口 0 上限")).toBeTruthy();
     expect(screen.getByLabelText("窗口 0 开始")).toBeTruthy();
     expect(screen.getByLabelText("窗口 0 结束")).toBeTruthy();
@@ -118,12 +126,12 @@ describe("SuperpowersKanbanPluginSettings", () => {
     ]);
     render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
 
-    await screen.findByLabelText("窗口 1 星期");
+    await screen.findByLabelText("窗口 1 星期六");
     // 删第一行：剩下的「Sat」应当挪到索引 0。
     fireEvent.click(screen.getByRole("button", { name: "删除窗口 0" }));
 
-    expect((screen.getByLabelText("窗口 0 星期") as HTMLInputElement).value).toBe("Sat");
-    await waitFor(() => expect(screen.queryByLabelText("窗口 1 星期")).toBeNull());
+    expect(screen.getByLabelText("窗口 0 星期六").getAttribute("aria-pressed")).toBe("true");
+    await waitFor(() => expect(screen.queryByLabelText("窗口 1 星期六")).toBeNull());
   });
 
   it("surfaces the plugin's rejection message instead of 插件未运行", async () => {
@@ -180,5 +188,77 @@ describe("SuperpowersKanbanPluginSettings", () => {
     expect(maxTasks.value).toBe("3");
     expect(interval.value).toBe("10");
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  });
+
+  it("toggling a day chip writes the compressed spec back", async () => {
+    let written: { settings?: { windows?: { days: string }[] } } | undefined;
+    const rpc = scriptedRpc(
+      [
+        {
+          settings: {
+            default_max_tasks: 3,
+            interval_secs: 10,
+            windows: [{ days: "Mon", start: "09:00", end: "17:00", all_day: false, max_tasks: 5 }],
+          },
+        },
+      ],
+      (params) => {
+        written = params as typeof written;
+      },
+    );
+    render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
+
+    // 加一天：Mon + Wed → 插件规范串 "Mon,Wed"。
+    fireEvent.click(await screen.findByLabelText("窗口 0 星期三"));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(written?.settings?.windows?.[0].days).toBe("Mon,Wed"));
+  });
+
+  it("clearing a day chip writes only the remaining days", async () => {
+    let written: { settings?: { windows?: { days: string }[] } } | undefined;
+    const rpc = scriptedRpc(
+      [
+        {
+          settings: {
+            default_max_tasks: 3,
+            interval_secs: 10,
+            windows: [{ days: "Mon,Wed", start: "09:00", end: "17:00", all_day: false, max_tasks: 5 }],
+          },
+        },
+      ],
+      (params) => {
+        written = params as typeof written;
+      },
+    );
+    render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
+
+    // 去掉一天：Mon + Wed 里取消 Mon → "Wed"。
+    fireEvent.click(await screen.findByLabelText("窗口 0 星期一"));
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(written?.settings?.windows?.[0].days).toBe("Wed"));
+  });
+
+  it("keeps the last selected day (the plugin rejects an all-empty spec)", async () => {
+    let writes = 0;
+    const rpc = scriptedRpc(
+      [
+        {
+          settings: {
+            default_max_tasks: 3,
+            interval_secs: 10,
+            windows: [{ days: "Wed", start: "09:00", end: "17:00", all_day: false, max_tasks: 5 }],
+          },
+        },
+      ],
+      () => writes++,
+    );
+    render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
+
+    const wed = await screen.findByLabelText("窗口 0 星期三");
+    // 最后一个选中的日子不可点：保持选中，且不产生写入。
+    expect((wed as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(wed);
+    expect(wed.getAttribute("aria-pressed")).toBe("true");
+    expect(writes).toBe(0);
   });
 });
