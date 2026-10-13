@@ -4899,7 +4899,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4940,7 +4940,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-app-server"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4972,7 +4972,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-boards"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "libc",
@@ -4984,7 +4984,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "chrono",
@@ -5005,7 +5005,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-llm"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5021,7 +5021,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-mcp"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5039,7 +5039,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-relay"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
@@ -5055,7 +5055,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-runtime"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5079,7 +5079,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-skills"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "include_dir",
  "serde",
@@ -5093,7 +5093,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-store"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -5116,7 +5116,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-subagent"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5136,7 +5136,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-supervisors"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -5147,7 +5147,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-tools"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5179,7 +5179,7 @@ dependencies = [
 
 [[package]]
 name = "yi-agent-web"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "axum",
