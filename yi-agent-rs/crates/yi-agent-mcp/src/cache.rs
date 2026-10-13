@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::{ServerConfig, ServerKind};
+use crate::config::ServerConfig;
 
 /// 一个被缓存的远端工具。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +111,7 @@ impl McpCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerKind;
     use std::collections::BTreeMap;
 
     fn server(cmd: &str) -> ServerConfig {
@@ -203,6 +204,29 @@ mod tests {
         assert!(c.get_for("ws", &b).is_none(), "changed url must miss");
     }
 
+    /// 指纹必须覆盖 http header 的**值**:URL 相同、仅 header 值不同时,缓存
+    /// 也必须失效并重新探测(spec §4 / §7.1)。用两个仅 header 值不同、其余
+    /// 完全一致的 http 配置,同时锁定指纹摘要本身与 `get_for` 的命中/失效。
+    #[test]
+    fn fingerprint_changes_when_header_value_changes() {
+        let a = http_server_with_auth("Bearer token-a");
+        let b = http_server_with_auth("Bearer token-b");
+
+        assert_ne!(
+            fingerprint(&a),
+            fingerprint(&b),
+            "same url with a different header value must change the fingerprint"
+        );
+
+        let mut c = McpCache::default();
+        c.put("ws", &a, vec![]);
+        assert!(c.get_for("ws", &a).is_some(), "same config must hit");
+        assert!(
+            c.get_for("ws", &b).is_none(),
+            "changed header value must miss"
+        );
+    }
+
     fn http_server(url: &str) -> ServerConfig {
         ServerConfig {
             kind: ServerKind::Http,
@@ -211,6 +235,22 @@ mod tests {
             env: BTreeMap::new(),
             url: Some(url.to_string()),
             headers: BTreeMap::new(),
+            enabled: true,
+        }
+    }
+
+    /// 一个 http server:URL 固定,`Authorization` header 值可变(其余字段一致),
+    /// 用于证明仅 header 值不同就会改变指纹。
+    fn http_server_with_auth(auth: &str) -> ServerConfig {
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), auth.to_string());
+        ServerConfig {
+            kind: ServerKind::Http,
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            url: Some("https://x/mcp".to_string()),
+            headers,
             enabled: true,
         }
     }

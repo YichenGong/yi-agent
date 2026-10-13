@@ -257,7 +257,7 @@ mod tests {
         let out = expand_headers(&h);
         assert_eq!(out.get("A").map(String::as_str), Some("plain"));
         assert!(
-            out.get("B").is_none(),
+            !out.contains_key("B"),
             "undefined env header must be dropped"
         );
     }

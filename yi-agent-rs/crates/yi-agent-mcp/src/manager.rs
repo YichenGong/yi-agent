@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use yi_agent_core::{Tool, ToolRegistry, ToolResult};
 
 use crate::cache::{CachedTool, McpCache};
-use crate::config::{McpConfig, ServerConfig, ServerKind, Transport};
+use crate::config::{McpConfig, ServerConfig, Transport};
 use crate::tool::McpTool;
 
 /// Upper bound on a single remote tool call.
@@ -564,6 +564,7 @@ fn map_result(result: rmcp::model::CallToolResult) -> ToolResult {
 mod tests {
     use super::*;
     use crate::cache::CachedTool;
+    use crate::config::ServerKind;
     use yi_agent_core::ToolRegistry;
 
     fn cfg(cmd: &str) -> ServerConfig {
