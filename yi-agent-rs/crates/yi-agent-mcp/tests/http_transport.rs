@@ -134,3 +134,43 @@ async fn probes_and_calls_over_streamable_http() {
 
     mgr.shutdown().await;
 }
+
+/// 真实 horizon-websearch 端点冒烟。默认跳过(CI 不跑);手动运行:
+/// `cargo test -p yi-agent-mcp --test http_transport -- --ignored`
+///
+/// 无外网时该测试会失败,故用 `#[ignore]` gate 隔离。
+#[tokio::test]
+#[ignore]
+async fn real_horizon_websearch_smoke() {
+    const URL: &str = "https://llmapi.horizon.auto/mcp-servers/horizon-websearch/Mcp";
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut servers = BTreeMap::new();
+    servers.insert("horizon-websearch".to_string(), http_server(URL));
+    let cfg = McpConfig {
+        enabled: true,
+        mcp_servers: servers,
+    };
+
+    let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+    let names: Vec<String> = mgr
+        .enabled_tools()
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    assert!(
+        names.contains(&"mcp__horizon-websearch__SearchPro".to_string()),
+        "expected real endpoint to expose SearchPro; got {names:?}"
+    );
+
+    let res = mgr
+        .call_tool(
+            "horizon-websearch",
+            "SearchPro",
+            json!({ "Query": "今天北京天气", "Cnt": "10" }),
+        )
+        .await;
+    assert!(!res.is_error, "real SearchPro call should succeed: {res:?}");
+
+    mgr.shutdown().await;
+}
