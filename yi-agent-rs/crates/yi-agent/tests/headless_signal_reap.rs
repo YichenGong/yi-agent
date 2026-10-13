@@ -34,6 +34,17 @@ fn spawn_mock_gateway(port: u16, probe_cmd: &str) -> std::thread::JoinHandle<()>
             let mut buf = vec![0u8; 65536];
             let n = stream.read(&mut buf).unwrap_or(0);
             let body = String::from_utf8_lossy(&buf[..n]).to_string();
+            // This gateway speaks chat-completions only. With `api_style: auto`
+            // the client probes `/v1/responses` first and only falls back to
+            // chat when the route answers 404/405 with an empty body, so answer
+            // that probe explicitly instead of serving a chat-shaped 200 on
+            // every path (which would leave the Responses parser starved).
+            if body.starts_with("POST /v1/responses") {
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
             let saw_tool_result =
                 body.contains("\"role\":\"tool\"") || body.contains("\"role\": \"tool\"");
             let frames = if saw_tool_result {
