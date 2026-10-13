@@ -58,6 +58,9 @@ echo 'MODEL_API_KEY=sk-ant-...' >> ~/.yi-agent/.env
 从「应用程序」打开 `yi-agent`。首次打开若提示「无法验证开发者」，到
 System Settings → Privacy & Security 点 **Open Anyway**。仅 arm64（不支持 Intel Mac）。
 
+只用命令行、不装 App 的话，Release 页还提供独立 CLI 二进制
+`yi-agent-aarch64-apple-darwin.tar.gz`（附 `.sha256`，用法见 Release 说明）。
+
 ### 从源码构建
 
 需要 Rust 1.85 或更高版本。

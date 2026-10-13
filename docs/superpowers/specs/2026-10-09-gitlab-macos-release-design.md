@@ -45,7 +45,7 @@ GitLab 部署在内网（`ssh://git@10.79.10.70:1022`，Web 在 `http://10.79.10
 - **不支持 Intel mac**（x86_64-apple-darwin）。用户拍板只 arm64。
 - 不做 GitLab Pages 下载页（YAGNI；Release 页够用）。
 - 不改动 GitHub release 流水线（那条继续管 CLI/npm/Homebrew）。
-- 不做版本号自动同步（把 `desktop/*` 三处对齐 Cargo.toml）。本次只在 job 里**校验** tag 与 Cargo.toml 一致，不做写入。
+- ~~不做版本号自动同步~~ **已改为构建时注入**：job 仍**校验** tag 与 `yi-agent-rs/Cargo.toml` 一致，随后把 tag 版本写入 `tauri.conf.json` 与 `desktop/src-tauri/Cargo.toml`（仅工作区、不提交），使 App 的 `CFBundleShortVersionString` 与 tag 一致（决策 8/10）。
 - 不做 Linux/Windows 桌面产物（YAGNI）。
 
 ## 3. 设计决策汇总
@@ -59,9 +59,10 @@ GitLab 部署在内网（`ssh://git@10.79.10.70:1022`，Web 在 `http://10.79.10
 | 5 | 资产直链 | Release `assets.links` 带 `filepath` | 用户点下载时文件名是 `yi-agent_<版本>_aarch64.dmg`，而非 URL 尾段 |
 | 6 | 架构 | 仅 arm64 | 用户拍板；与 GitHub release 的 `aarch64-apple-darwin` 一致 |
 | 7 | 签名 | 不签名 + 附 `install.sh` 清 quarantine | 用户拍板；内网分发，避免 Apple 账号成本 |
-| 8 | 版本真源 | `yi-agent-rs/Cargo.toml` 的 workspace `version` | 与 GitHub release 的校验逻辑一致（`release.yml` 的 "Verify tag matches Cargo.toml version"）；桌面端三处 version 不参与 |
+| 8 | 版本真源 | `yi-agent-rs/Cargo.toml` 的 workspace `version` | 与 GitHub release 的校验逻辑一致（`release.yml` 的 “Verify tag matches Cargo.toml version”）；桌面端 `tauri.conf.json` 与 `desktop/src-tauri/Cargo.toml` 的 version 由 job 在构建时注入 `VERSION`（不提交），使 App 版本随 tag。 |
 | 9 | bundle 目标 | job 内把 `targets` 改为 `app,dmg` | 现为 `"all"`，会连带产出 updater tar 等，且大版本下 `all` 可能引入非 mac 目标导致失败 |
-| 10 | dmg 文件名 | 统一重命名为 `yi-agent_<版本>_aarch64.dmg` | Tauri 默认用 `package.json` 的 `0.1.0`，与 tag 版本不符 |
+| 10 | dmg 文件名 | 统一重命名为 `yi-agent_<版本>_aarch64.dmg` | 注入版本后 tauri 的产出名即与之一致；脚本仍按精确名取，避免持久 runner 上残留的旧版本 dmg 被误发。 |
+| 11 | 附加 CLI 产物 | 同一 Release 附独立 arm64 CLI（`yi-agent-aarch64-apple-darwin.tar.gz` + `.sha256`） | 复用 sidecar 已编译的 release 二进制（零额外编译）；给只用命令行的用户一个入口，命名对齐 justfile 的 `package-target`。 |
 
 ## 4. 设计细节
 
@@ -94,9 +95,10 @@ job 保持"薄"：全部逻辑在 `desktop/scripts/release-dmg.sh` 里，便于�
 2. **版本校验**：从 `$CI_COMMIT_TAG` 或参数取 tag；比对 `yi-agent-rs/Cargo.toml` 的 `^version`；不一致直接 `exit 1`。算出 `VERSION`。
 3. **前端依赖**：`cd desktop && npm ci`。
 4. **sidecar**：`npm run sidecar:release`（把 release 构建的 `yi-agent` 复制成 `src-tauri/binaries/yi-agent-aarch64-apple-darwin`，机制见 `desktop/scripts/build-sidecar.sh:8-21`）。
-5. **改 bundle 目标**：用 `jq` 把 `tauri.conf.json` 的 `bundle.targets` 从 `"all"` 改写为 `["app","dmg"]`（仅工作区临时改，不提交）。
+5. **改 bundle 目标 + 注入版本**：用 `jq` 把 `tauri.conf.json` 的 `bundle.targets` 从 `"all"` 改写为 `["app","dmg"]` 并把 `version` 设为 `VERSION`；再对 `desktop/src-tauri/Cargo.toml` 的 `^version` 做同样替换（仅工作区临时改，不提交）。
 6. **构建**：`npm run tauri build`。
-7. **重命名**：把 `bundle/dmg/*.dmg` 复制为 `yi-agent_<VERSION>_aarch64.dmg`；同时产出 `.sha256`。
+7. **归档 dmg**：按精确名取 `bundle/dmg/yi-agent_<VERSION>_aarch64.dmg`（注入版本后 tauri 的产出名即与之一致；按名取可避免误取持久 runner 上残留的旧版本 dmg），复制到 `dist/`；同时产出 `.sha256`。
+7b. **归档独立 CLI**：把 sidecar 已编译的 `yi-agent-rs/target/release/yi-agent` 打成 `dist/yi-agent-aarch64-apple-darwin.tar.gz` 并产出 `.sha256`。
 8. **上传 Package**：
    ```bash
    curl --fail --header "JOB-TOKEN: $CI_JOB_TOKEN" \
@@ -106,6 +108,7 @@ job 保持"薄"：全部逻辑在 `desktop/scripts/release-dmg.sh` 里，便于�
    同一 URL 亦可 `.sha256` 上传。
 9. **建 Release**：`curl -X POST "$CI_API_V4_URL/projects/$CI_PROJECT_ID/releases"`，body 含 `tag_name`、`name`、`description`（写明安装步骤 + `~/.yi-agent/.env` 配置要求 + quarantine 旁路），以及 `assets.links`：
    - `name: yi-agent_<VERSION>_aarch64.dmg`，`url: <package URL>`，`filepath: /yi-agent_<VERSION>_aarch64.dmg`，`link_type: package`
+   - 独立 CLI 同理：`name: yi-agent-aarch64-apple-darwin.tar.gz`，`link_type: package`（附 `.sha256`）
    - 安装脚本同理挂为 `/install.sh`
 10. **install.sh**：随 Release 上传，内容为挂载 dmg、`ditto` 拷贝到 `/Applications`、`xattr -dr com.apple.quarantine`。
 

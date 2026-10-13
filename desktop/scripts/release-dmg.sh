@@ -61,11 +61,16 @@ log "环境与版本检查完成"
 
 # --- 3. 构建 -------------------------------------------------------------
 # Tauri 的 bundle.targets 默认是 "all"，会连带产出 updater tar 等非必要物；
-# 收窄到 app,dmg。仅改工作区文件，不提交。
-log "收窄 bundle.targets 为 app,dmg"
+# 收窄到 app,dmg。同时把 tag 版本注入 tauri.conf.json 与桌面 crate 的
+# Cargo.toml——否则 App 的 CFBundleShortVersionString 会一直停在写死的
+# 0.1.0（产物文件名被本脚本重命名过，看不出这个不一致）。
+# 仅改工作区文件，不提交。
+log "收窄 bundle.targets 为 app,dmg，并注入版本 $VERSION"
 CONF="$HERE/src-tauri/tauri.conf.json"
-jq '.bundle.targets = ["app","dmg"]' "$CONF" > "$CONF.tmp"
+jq --arg v "$VERSION" '.bundle.targets = ["app","dmg"] | .version = $v' "$CONF" > "$CONF.tmp"
 mv "$CONF.tmp" "$CONF"
+sed -i.bak -E "s/^version = \".*\"/version = \"$VERSION\"/" "$HERE/src-tauri/Cargo.toml"
+rm -f "$HERE/src-tauri/Cargo.toml.bak"
 
 log "npm ci"
 (cd "$HERE" && npm ci)
@@ -77,19 +82,41 @@ log "tauri build"
 (cd "$HERE" && npm run tauri build)
 
 # --- 4. 归档与校验和 -----------------------------------------------------
-log "归档 dmg"
+log "归档 dmg 与独立 CLI 二进制"
 mkdir -p "$ROOT/dist"
-DMG_SRC="$(ls "$HERE/src-tauri/target/release/bundle/dmg/"*.dmg | head -1)"
-if [ -z "$DMG_SRC" ]; then
-  echo "ERROR: 未找到 tauri 产出的 .dmg（$HERE/src-tauri/target/release/bundle/dmg/）" >&2
-  exit 1
-fi
+
+# 4a. 桌面 App 的 dmg。版本已注入 tauri 配置，故 tauri 产出的文件名恰好
+#     等于 ART；按精确文件名取，避免持久 runner 的 build 目录里残留的旧
+#     版本 dmg 被误发（旧的 `ls | head` 会按字典序选中它）。
 ART="yi-agent_${VERSION}_aarch64.dmg"
 export ART
+DMG_SRC="$HERE/src-tauri/target/release/bundle/dmg/$ART"
+if [ ! -f "$DMG_SRC" ]; then
+  echo "ERROR: 未找到 tauri 产出的 $ART（目录内容如下）" >&2
+  ls -l "$HERE/src-tauri/target/release/bundle/dmg/" >&2 || true
+  exit 1
+fi
 cp "$DMG_SRC" "$ROOT/dist/$ART"
 ( cd "$ROOT/dist" && shasum -a 256 "$ART" | awk '{print $1}' > "$ART.sha256" )
 log "产物: dist/$ART"
 ls -lh "$ROOT/dist/$ART" "$ROOT/dist/$ART.sha256"
+
+# 4b. 独立 CLI（arm64）。直接复用第 3 步 sidecar 已编译好的 release 二进制，
+#     避免再跑一次等价的交叉编译。命名对齐 justfile 的 package-target。
+HOST_TRIPLE="$(rustc -vV 2>/dev/null | awk '/^host:/ {print $2}' || true)"
+[ -n "$HOST_TRIPLE" ] || HOST_TRIPLE="aarch64-apple-darwin"
+CLI_ART="yi-agent-${HOST_TRIPLE}.tar.gz"
+export CLI_ART
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/yi-agent-rs/target}"
+CLI_BIN="$TARGET_DIR/release/yi-agent"
+if [ ! -x "$CLI_BIN" ]; then
+  echo "ERROR: 未找到 sidecar CLI 二进制（$CLI_BIN）" >&2
+  exit 1
+fi
+tar -czf "$ROOT/dist/$CLI_ART" -C "$(dirname "$CLI_BIN")" yi-agent
+( cd "$ROOT/dist" && shasum -a 256 "$CLI_ART" | awk '{print $1}' > "$CLI_ART.sha256" )
+log "产物: dist/$CLI_ART"
+ls -lh "$ROOT/dist/$CLI_ART" "$ROOT/dist/$CLI_ART.sha256"
 
 # --- 5. 发布 -------------------------------------------------------------
 : "${CI_API_V4_URL:?缺少 CI_API_V4_URL（只能在 GitLab CI 里跑发布段）}"
@@ -119,13 +146,16 @@ upload() {  # upload <local-file> <remote-filename>
     --upload-file "$1" "$PKG_BASE/$2"
 }
 
-log "上传 dmg 与校验和到 Generic Package Registry"
+log "上传桌面 App 与 CLI 到 Generic Package Registry"
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "[dry-run] curl --header \"$AUTH_KIND: ***\" --upload-file dist/$ART $PKG_BASE/$ART"
-  echo "[dry-run] curl --header \"$AUTH_KIND: ***\" --upload-file dist/$ART.sha256 $PKG_BASE/$ART.sha256"
+  for f in "dist/$ART" "dist/$ART.sha256" "dist/$CLI_ART" "dist/$CLI_ART.sha256" "$INSTALLER"; do
+    echo "[dry-run] curl --header \"$AUTH_KIND: ***\" --upload-file $f $PKG_BASE/$(basename "$f")"
+  done
 else
   ( cd "$ROOT" && upload "dist/$ART" "$ART" )
   ( cd "$ROOT" && upload "dist/$ART.sha256" "$ART.sha256" )
+  ( cd "$ROOT" && upload "dist/$CLI_ART" "$CLI_ART" )
+  ( cd "$ROOT" && upload "dist/$CLI_ART.sha256" "$CLI_ART.sha256" )
   upload "$INSTALLER" "install.sh"
 fi
 
@@ -142,6 +172,19 @@ DESCRIPTION="$(cat <<EOF
 3. 从「应用程序」打开 yi-agent。
 
 未签名产物；首次打开如被拦，到 System Settings → Privacy & Security 点 "Open Anyway"。
+
+## 命令行版 yi-agent（可选）
+
+只想在终端用 CLI、不装 App 的话，下载 \`$CLI_ART\`：
+
+\`\`\`bash
+tar -xzf $CLI_ART
+sudo install -m 755 yi-agent /usr/local/bin/yi-agent
+\`\`\`
+
+校验（可选）：\`shasum -a 256 $CLI_ART\` 的输出应与 \`$CLI_ART.sha256\` 的内容一致。
+
+（桌面 App 已内置同一份 CLI，装了 App 就无需再装这个。）
 EOF
 )"
 
@@ -152,6 +195,9 @@ PAYLOAD="$(jq -n \
   --arg dmg_url "$PKG_BASE/$ART" \
   --arg dmg_name "$ART" \
   --arg sha_url "$PKG_BASE/$ART.sha256" \
+  --arg cli_url "$PKG_BASE/$CLI_ART" \
+  --arg cli_name "$CLI_ART" \
+  --arg cli_sha_url "$PKG_BASE/$CLI_ART.sha256" \
   --arg ins_url "$PKG_BASE/install.sh" \
   '{
      tag_name: $tag,
@@ -161,6 +207,8 @@ PAYLOAD="$(jq -n \
        links: [
          {name: $dmg_name, url: $dmg_url,   filepath: ("/" + $dmg_name), link_type: "package"},
          {name: ($dmg_name + ".sha256"), url: $sha_url, filepath: ("/" + $dmg_name + ".sha256"), link_type: "package"},
+         {name: $cli_name, url: $cli_url,   filepath: ("/" + $cli_name), link_type: "package"},
+         {name: ($cli_name + ".sha256"), url: $cli_sha_url, filepath: ("/" + $cli_name + ".sha256"), link_type: "package"},
          {name: "install.sh", url: $ins_url, filepath: "/install.sh", link_type: "package"}
        ]
      }
