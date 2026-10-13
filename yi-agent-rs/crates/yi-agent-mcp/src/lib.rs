@@ -17,7 +17,7 @@ use anyhow::{Result, anyhow};
 use yi_agent_core::ToolRegistry;
 
 pub use cache::CachedTool;
-pub use config::{McpConfig, ServerConfig};
+pub use config::{McpConfig, ServerConfig, ServerKind, Transport};
 pub use manager::McpManager;
 pub use tool::McpTool;
 
@@ -96,9 +96,12 @@ mod tests {
 
         let command = "/nonexistent/definitely-not-here";
         let sc = ServerConfig {
-            command: command.into(),
+            kind: ServerKind::Stdio,
+            command: Some(command.into()),
             args: Vec::new(),
             env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
         };
 

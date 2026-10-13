@@ -23,7 +23,7 @@ use tracing::{info, warn};
 use yi_agent_core::{Tool, ToolRegistry, ToolResult};
 
 use crate::cache::{CachedTool, McpCache};
-use crate::config::{McpConfig, ServerConfig};
+use crate::config::{McpConfig, ServerConfig, ServerKind, Transport};
 use crate::tool::McpTool;
 
 /// Upper bound on a single remote tool call.
@@ -391,9 +391,13 @@ async fn connect(cfg: &ServerConfig) -> Result<Client> {
     use rmcp::ServiceExt;
     use rmcp::transport::TokioChildProcess;
 
-    let mut command = tokio::process::Command::new(&cfg.command);
-    command.args(&cfg.args);
-    for (k, v) in &cfg.env {
+    let (command_bin, args, env) = match cfg.transport()? {
+        Transport::Stdio { command, args, env } => (command, args, env),
+        Transport::Http { .. } => return Err(anyhow!("http transport is not wired up yet")),
+    };
+    let mut command = tokio::process::Command::new(command_bin);
+    command.args(&args);
+    for (k, v) in &env {
         command.env(k, v);
     }
     let transport = TokioChildProcess::new(command)?;
@@ -542,9 +546,12 @@ mod tests {
 
     fn cfg(cmd: &str) -> ServerConfig {
         ServerConfig {
-            command: cmd.into(),
+            kind: ServerKind::Stdio,
+            command: Some(cmd.into()),
             args: vec![],
             env: Default::default(),
+            url: None,
+            headers: Default::default(),
             enabled: true,
         }
     }
@@ -798,9 +805,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let sc = ServerConfig {
-            command: "echo".into(),
+            kind: ServerKind::Stdio,
+            command: Some("echo".into()),
             args: vec![],
             env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
         };
         let mut servers = BTreeMap::new();

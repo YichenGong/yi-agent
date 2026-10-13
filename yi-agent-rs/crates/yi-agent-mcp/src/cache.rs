@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, ServerKind};
 
 /// 一个被缓存的远端工具。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,9 +111,12 @@ mod tests {
 
     fn server(cmd: &str) -> ServerConfig {
         ServerConfig {
-            command: cmd.into(),
+            kind: ServerKind::Stdio,
+            command: Some(cmd.into()),
             args: vec!["--x".into()],
             env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
         }
     }
