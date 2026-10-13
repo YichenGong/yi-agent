@@ -379,7 +379,9 @@ fn test_connector() -> Option<TestConnector> {
     TEST_CONNECTOR.lock().unwrap().clone()
 }
 
-/// Spawn the MCP server as a child process and complete the MCP handshake.
+/// 按 `cfg.transport()` 分派到 stdio 子进程或 Streamable HTTP,完成 MCP 握手。
+///
+/// 两条路径都产出同一个 `Client`,因此懒连接/重连/超时/shutdown 逻辑无需分支。
 async fn connect(cfg: &ServerConfig) -> Result<Client> {
     #[cfg(test)]
     {
@@ -389,20 +391,40 @@ async fn connect(cfg: &ServerConfig) -> Result<Client> {
     }
 
     use rmcp::ServiceExt;
-    use rmcp::transport::TokioChildProcess;
 
-    let (command_bin, args, env) = match cfg.transport()? {
-        Transport::Stdio { command, args, env } => (command, args, env),
-        Transport::Http { .. } => return Err(anyhow!("http transport is not wired up yet")),
-    };
-    let mut command = tokio::process::Command::new(command_bin);
-    command.args(&args);
-    for (k, v) in &env {
-        command.env(k, v);
+    match cfg.transport()? {
+        Transport::Stdio { command, args, env } => {
+            use rmcp::transport::TokioChildProcess;
+
+            let mut cmd = tokio::process::Command::new(&command);
+            cmd.args(&args);
+            for (k, v) in &env {
+                cmd.env(k, v);
+            }
+            let transport = TokioChildProcess::new(cmd)?;
+            Ok(().serve(transport).await?)
+        }
+        Transport::Http { url, headers } => {
+            use rmcp::transport::StreamableHttpClientTransport;
+            use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+            let expanded = crate::config::expand_headers(&headers);
+            let mut http_cfg = StreamableHttpClientTransportConfig::with_uri(url);
+            if !expanded.is_empty() {
+                let mut map = std::collections::HashMap::new();
+                for (k, v) in &expanded {
+                    let name = http::HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|e| anyhow!("invalid http header name {k:?}: {e}"))?;
+                    let value = http::HeaderValue::from_str(v)
+                        .map_err(|e| anyhow!("invalid http header value for {k:?}: {e}"))?;
+                    map.insert(name, value);
+                }
+                http_cfg = http_cfg.custom_headers(map);
+            }
+            let transport = StreamableHttpClientTransport::from_config(http_cfg);
+            Ok(().serve(transport).await?)
+        }
     }
-    let transport = TokioChildProcess::new(command)?;
-    let client = ().serve(transport).await?;
-    Ok(client)
 }
 
 /// Connect once, list every tool, convert to cache entries, then disconnect.

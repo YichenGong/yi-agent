@@ -1,8 +1,8 @@
 //! 磁盘上的工具 schema 缓存:`.yi-agent/mcp-cache.json`。
 //!
-//! 用 `ServerConfig`(命令/参数/环境变量)的 SHA-256 指纹做失效判断:配置变了
-//! 就丢弃旧缓存,重新拉取远端工具列表。指纹用摘要而非原文,避免 `env` 里的
-//! token/密钥明文落盘。
+//! 用 `ServerConfig`(kind/命令/参数/环境变量/URL/header)的 SHA-256 指纹做失效
+//! 判断:配置变了就丢弃旧缓存,重新拉取远端工具列表。指纹用摘要而非原文,避免
+//! `env`/`headers` 里的 token/密钥明文落盘。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ pub struct CachedTool {
 /// 单个 server 的缓存条目。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedServer {
-    /// `ServerConfig`(command+args+env)的 SHA-256 十六进制指纹。
+    /// `ServerConfig`(kind+command+args+env+url+headers)的 SHA-256 十六进制指纹。
     fingerprint: String,
     tools: Vec<CachedTool>,
 }
