@@ -899,6 +899,17 @@ describe("ThreadSidebar 搜索", () => {
     expect(searchBox().closest(".overflow-y-auto")).toBeNull();
   });
 
+  it("为滚动会话内容预留右侧滚动条安全间距", () => {
+    const { container } = renderSidebar();
+    const row = container.querySelector("[data-group-row]")!;
+    const content = row.closest("[data-thread-list-content]");
+    const scroller = row.closest(".overflow-y-auto");
+
+    expect(content).not.toBeNull();
+    expect(content!.className.split(/\s+/)).toContain("pr-4");
+    expect(content!.parentElement).toBe(scroller);
+  });
+
   it("搜索命中藏在「看板会话」折叠小节里时，该小节搜索期间自动展开", () => {
     const withCard: WorkspaceGroup[] = [
       {
