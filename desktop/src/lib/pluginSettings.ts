@@ -5,6 +5,93 @@ export type PluginRpc = <T = unknown>(method: string, params: unknown) => Promis
 export const KANBAN_PLUGIN = "superpowers-kanban";
 
 /**
+ * 星期的规范顺序（周一到周日），与插件 `render_days` 的压缩顺序一致。
+ * 界面上用中文单字展示，但线上格式始终是 `Mon`…`Sun`。
+ */
+export const WEEKDAYS = [
+  { en: "Mon", zh: "一" },
+  { en: "Tue", zh: "二" },
+  { en: "Wed", zh: "三" },
+  { en: "Thu", zh: "四" },
+  { en: "Fri", zh: "五" },
+  { en: "Sat", zh: "六" },
+  { en: "Sun", zh: "日" },
+] as const;
+
+/** `Mon`/`monday` → 0…6；不认识返回 undefined。与插件 `weekday_index` 同一套别名。 */
+function weekdayIndex(name: string): number | undefined {
+  switch (name.trim().toLowerCase()) {
+    case "mon":
+    case "monday":
+      return 0;
+    case "tue":
+    case "tuesday":
+      return 1;
+    case "wed":
+    case "wednesday":
+      return 2;
+    case "thu":
+    case "thursday":
+      return 3;
+    case "fri":
+    case "friday":
+      return 4;
+    case "sat":
+    case "saturday":
+      return 5;
+    case "sun":
+    case "sunday":
+      return 6;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * 把插件的星期串（`Mon-Fri` / `Sat,Sun` / `Mon,Wed,Fri`）解析成长度 7 的布尔数组。
+ *
+ * 纯客户端逻辑：插件永远返回压缩后的规范串，本函数只负责把它变成点按控件要的
+ * 选中集合。无法识别的段（含倒序区间）一律忽略——坏数据宁可少选，也不能崩。
+ */
+export function parseDays(spec: string): boolean[] {
+  const selected = [false, false, false, false, false, false, false];
+  for (const raw of spec.split(",")) {
+    const part = raw.trim();
+    if (part === "") continue;
+    const dash = part.indexOf("-");
+    if (dash === -1) {
+      const day = weekdayIndex(part);
+      if (day !== undefined) selected[day] = true;
+      continue;
+    }
+    const from = weekdayIndex(part.slice(0, dash));
+    const to = weekdayIndex(part.slice(dash + 1));
+    if (from === undefined || to === undefined || from > to) continue;
+    for (let day = from; day <= to; day += 1) selected[day] = true;
+  }
+  return selected;
+}
+
+/** {@link parseDays} 的逆：把选中集合压缩回插件认的规范串（全选 → `Mon-Sun`）。 */
+export function renderDays(selected: boolean[]): string {
+  const parts: string[] = [];
+  let i = 0;
+  while (i < WEEKDAYS.length) {
+    if (!selected[i]) {
+      i += 1;
+      continue;
+    }
+    const start = i;
+    while (i + 1 < WEEKDAYS.length && selected[i + 1]) i += 1;
+    parts.push(
+      i === start ? WEEKDAYS[start].en : `${WEEKDAYS[start].en}-${WEEKDAYS[i].en}`,
+    );
+    i += 1;
+  }
+  return parts.join(",");
+}
+
+/**
  * 「插件」Tab 可选的配置项目：最近目录 ∪ 已登记看板，去重且保序。
  *
  * 看板是按项目安装的，所以已登记看板的项目即使没进最近目录也必须在列；最近

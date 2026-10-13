@@ -4,6 +4,9 @@ import {
   readKanbanSettings,
   writeKanbanSettings,
   pluginErrorKind,
+  renderDays,
+  parseDays,
+  WEEKDAYS,
   type KanbanSettings,
   type KanbanWindow,
   type PluginRpc,
@@ -147,22 +150,53 @@ export function SuperpowersKanbanPluginSettings({
        * 面板（固定 about:blank 的 70vw 弹窗里只有 ~300px），右侧的「上限」与
        * 「删除」两列被整列裁掉——面板只 `overflow-y-auto`，横向溢出既看不见也
        * 滚不到，用户因此找不到每行的删除按钮。换行布局把宽度交给容器，任何宽度
-       * 下所有控件都在视野内；ARIA 标签（`窗口 N 星期` 等）保持不变。
+       * 下所有控件都在视野内。
        */}
       <div className="mt-2 divide-y divide-line rounded border border-line">
-        {settings.windows.map((w, index) => (
-          <div key={index} className="flex flex-wrap items-center gap-2 p-2 text-xs">
+        {settings.windows.map((w, index) => {
+          const selectedDays = parseDays(w.days);
+          return (
+            <div key={index} className="flex flex-wrap items-center gap-2 p-2 text-xs">
+              <div className="flex items-center gap-2">
+                <span className="whitespace-nowrap text-fg-subtle">星期</span>
+                {/*
+                 * 点按选星期，不再用文本框：文本框要用户记住 `Mon-Fri` 这种语法，
+                 * 容易打错。七个中文单字按钮与 `days` 的选中集合一一对应，
+                 * `title` 给出英文缩写（线上格式）。
+                 */}
+                <div role="group" aria-label={`窗口 ${index} 星期`} className="flex gap-1">
+                  {WEEKDAYS.map((day, dayIndex) => {
+                    const isOn = selectedDays[dayIndex];
+                    // 插件不接受「一天都不选」，所以最后一个选中的日子不可取消，
+                    // 免得把用户送进一个保存必失败的态。
+                    const isLastOn = isOn && selectedDays.filter(Boolean).length === 1;
+                    return (
+                      <button
+                        key={day.en}
+                        type="button"
+                        aria-label={`窗口 ${index} 星期${day.zh}`}
+                        aria-pressed={isOn}
+                        title={isLastOn ? "至少保留一天" : day.en}
+                        disabled={isLastOn}
+                        onClick={() => {
+                          const next = [...selectedDays];
+                          next[dayIndex] = !isOn;
+                          patchWindow(index, { days: renderDays(next) });
+                        }}
+                        className={`h-7 w-7 rounded border text-center ${
+                          isOn
+                            ? "border-fg bg-fg text-surface"
+                            : "border-line text-fg-muted hover:text-fg"
+                        } ${isLastOn ? "cursor-not-allowed" : ""}`}
+                      >
+                        {day.zh}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             <label className="flex items-center gap-1">
-              <span className="text-fg-subtle">星期</span>
-              <input
-                aria-label={`窗口 ${index} 星期`}
-                className="w-24 rounded border border-line bg-surface px-2 py-0.5"
-                value={w.days}
-                onChange={(e) => patchWindow(index, { days: e.target.value })}
-              />
-            </label>
-            <label className="flex items-center gap-1">
-              <span className="text-fg-subtle">开始</span>
+              <span className="whitespace-nowrap text-fg-subtle">开始</span>
               <input
                 aria-label={`窗口 ${index} 开始`}
                 className="w-20 rounded border border-line bg-surface px-2 py-0.5"
@@ -172,7 +206,7 @@ export function SuperpowersKanbanPluginSettings({
               />
             </label>
             <label className="flex items-center gap-1">
-              <span className="text-fg-subtle">结束</span>
+              <span className="whitespace-nowrap text-fg-subtle">结束</span>
               <input
                 aria-label={`窗口 ${index} 结束`}
                 className="w-20 rounded border border-line bg-surface px-2 py-0.5"
@@ -182,7 +216,7 @@ export function SuperpowersKanbanPluginSettings({
               />
             </label>
             <label className="flex items-center gap-1">
-              <span className="text-fg-subtle">上限</span>
+              <span className="whitespace-nowrap text-fg-subtle">上限</span>
               <input
                 aria-label={`窗口 ${index} 上限`}
                 className="w-16 rounded border border-line bg-surface px-2 py-0.5"
@@ -204,7 +238,8 @@ export function SuperpowersKanbanPluginSettings({
               删除
             </button>
           </div>
-        ))}
+          );
+        })}
         {settings.windows.length === 0 && (
           <p className="p-2 text-xs text-fg-subtle">未设置时段窗口</p>
         )}
