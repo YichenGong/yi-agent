@@ -26,3 +26,9 @@ yi-agent 的 Model Context Protocol（MCP）客户端 crate。目标是连接 MC
   - 注册入口：`yi-agent-rs/crates/yi-agent-mcp/src/lib.rs` 的 `register_mcp_tools`
   - 运行时开关：`/mcp` slash 命令（`yi-agent-rs/crates/yi-agent/src/tui/slash.rs`）+ agent 热刷新（`ControlCommand::McpRefresh`，`yi-agent-rs/crates/yi-agent/src/main.rs`）
   - 验证：`cargo test -p yi-agent-mcp`（含 duplex 进程内协议往返测试 `manager::tests::probe_then_call_over_duplex`）
+- [x] Streamable HTTP transport（仅 POST + JSON）
+  - 配置：`ServerConfig` 增加 `type`（`"stdio"` 默认 / `"http"`）、`url`、`headers`；`transport()` 集中校验
+  - 展开：http header 值支持 `${ENV_VAR}`，未定义变量丢弃该 header 并 warn；缓存指纹以未展开原文参与
+  - 接线：`manager.rs` 的 `connect()` 按 `Transport` 分派 `TokioChildProcess` / `StreamableHttpClientTransport`
+  - 指纹：`cache.rs` 缓存指纹扩展为覆盖 `kind`/`url`/`headers`（排除 `enabled`）
+  - 验证：`cargo test -p yi-agent-mcp --test http_transport`（wiremock 往返）+ `-- --ignored`（真实 horizon 端点）
