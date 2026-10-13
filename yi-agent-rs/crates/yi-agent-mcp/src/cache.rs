@@ -1,8 +1,8 @@
 //! 磁盘上的工具 schema 缓存:`.yi-agent/mcp-cache.json`。
 //!
-//! 用 `ServerConfig`(命令/参数/环境变量)的 SHA-256 指纹做失效判断:配置变了
-//! 就丢弃旧缓存,重新拉取远端工具列表。指纹用摘要而非原文,避免 `env` 里的
-//! token/密钥明文落盘。
+//! 用 `ServerConfig`(kind/命令/参数/环境变量/URL/header)的 SHA-256 指纹做失效
+//! 判断:配置变了就丢弃旧缓存,重新拉取远端工具列表。指纹用摘要而非原文,避免
+//! `env`/`headers` 里的 token/密钥明文落盘。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ pub struct CachedTool {
 /// 单个 server 的缓存条目。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedServer {
-    /// `ServerConfig`(command+args+env)的 SHA-256 十六进制指纹。
+    /// `ServerConfig`(kind+command+args+env+url+headers)的 SHA-256 十六进制指纹。
     fingerprint: String,
     tools: Vec<CachedTool>,
 }
@@ -45,14 +45,18 @@ fn cache_path(workdir: &Path) -> PathBuf {
 
 /// 计算 `ServerConfig` 的确定性指纹(SHA-256 十六进制摘要)。
 ///
-/// 只包含 command+args+env;`enabled` 是运行时开关,不影响 schema,故意排除
-/// 以免切换开关时无谓地让缓存失效。摘要而非原文,避免把 `env` 里的
-/// token/密钥明文落到 `.yi-agent/mcp-cache.json`。
+/// 覆盖传输相关的全部字段(kind+command+args+env+url+headers);`enabled` 是
+/// 运行时开关,不影响 schema,故意排除以免切换开关时无谓地让缓存失效。摘要
+/// 而非原文,避免把 `env`/`headers` 里的 token/密钥明文落到 `.yi-agent/mcp-cache.json`。
+/// header 值里的 `${ENV_VAR}` 以**未展开原文**参与指纹,轮换 token 不失效缓存。
 fn fingerprint(cfg: &ServerConfig) -> String {
     let key = serde_json::json!({
+        "kind": cfg.kind,
         "command": cfg.command,
         "args": cfg.args,
         "env": cfg.env,
+        "url": cfg.url,
+        "headers": cfg.headers,
     });
     // 序列化 `serde_json::Value` 不会失败;显式 panic 好过静默回退成空串
     // (空串会让所有配置都判定为命中,从而一直提供过期 schema)。
@@ -107,13 +111,17 @@ impl McpCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ServerKind;
     use std::collections::BTreeMap;
 
     fn server(cmd: &str) -> ServerConfig {
         ServerConfig {
-            command: cmd.into(),
+            kind: ServerKind::Stdio,
+            command: Some(cmd.into()),
             args: vec!["--x".into()],
             env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
             enabled: true,
         }
     }
@@ -184,5 +192,66 @@ mod tests {
         let mut disabled = server("npx");
         disabled.enabled = false;
         assert!(loaded.get_for("fs", &disabled).is_some());
+    }
+
+    #[test]
+    fn fingerprint_changes_when_url_changes() {
+        let a = http_server("https://x/one");
+        let b = http_server("https://x/two");
+        let mut c = McpCache::default();
+        c.put("ws", &a, vec![]);
+        assert!(c.get_for("ws", &a).is_some(), "same config must hit");
+        assert!(c.get_for("ws", &b).is_none(), "changed url must miss");
+    }
+
+    /// 指纹必须覆盖 http header 的**值**:URL 相同、仅 header 值不同时,缓存
+    /// 也必须失效并重新探测(spec §4 / §7.1)。用两个仅 header 值不同、其余
+    /// 完全一致的 http 配置,同时锁定指纹摘要本身与 `get_for` 的命中/失效。
+    #[test]
+    fn fingerprint_changes_when_header_value_changes() {
+        let a = http_server_with_auth("Bearer token-a");
+        let b = http_server_with_auth("Bearer token-b");
+
+        assert_ne!(
+            fingerprint(&a),
+            fingerprint(&b),
+            "same url with a different header value must change the fingerprint"
+        );
+
+        let mut c = McpCache::default();
+        c.put("ws", &a, vec![]);
+        assert!(c.get_for("ws", &a).is_some(), "same config must hit");
+        assert!(
+            c.get_for("ws", &b).is_none(),
+            "changed header value must miss"
+        );
+    }
+
+    fn http_server(url: &str) -> ServerConfig {
+        ServerConfig {
+            kind: ServerKind::Http,
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            url: Some(url.to_string()),
+            headers: BTreeMap::new(),
+            enabled: true,
+        }
+    }
+
+    /// 一个 http server:URL 固定,`Authorization` header 值可变(其余字段一致),
+    /// 用于证明仅 header 值不同就会改变指纹。
+    fn http_server_with_auth(auth: &str) -> ServerConfig {
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), auth.to_string());
+        ServerConfig {
+            kind: ServerKind::Http,
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            url: Some("https://x/mcp".to_string()),
+            headers,
+            enabled: true,
+        }
     }
 }
