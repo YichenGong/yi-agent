@@ -32,6 +32,8 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
         api_url: "https://api.anthropic.com".into(),
         api_key: String::new(),
         model: "test-model".into(),
+        api_style: yi_agent_core::ApiStyle::Auto,
+        reasoning_effort: None,
         max_turns: 4,
         max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
         max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,

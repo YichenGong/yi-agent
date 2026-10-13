@@ -54,3 +54,88 @@ export function buildModelOptions(
 
   return [follow, ...entries];
 }
+
+/**
+ * 推理档位（七个白名单值），顺序即 UI 顺序。
+ *
+ * 与 app-server `thread/setReasoningEffort` 的白名单（`server.rs:3981`）以及 TUI 的
+ * `REASONING_EFFORT_TIERS` 一致——三端各持一份字面量，改档位要三处同改。
+ */
+export const REASONING_EFFORTS = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+] as const;
+
+/** effort 下拉里的一项。`value === null` 即「未设置」（清除会话覆盖）。 */
+export type EffortOption = {
+  /** 选中后写进 `thread/setReasoningEffort` 的档位；`null` = 清除覆盖。 */
+  value: string | null;
+  label: string;
+  selected: boolean;
+};
+
+/**
+ * 由「会话当前覆盖」与「清单条目默认档」构造 effort 下拉项。
+ *
+ * 第一项恒为「未设置」：它落在 `thread/setReasoningEffort { effort: null }` 上，即
+ * 清除会话覆盖、回落条目默认。条目默认非空时把继承值写进标签
+ * （「未设置（继承 low）」），用户才知道清掉覆盖后会跑哪一档；条目没声明时只写
+ * 「未设置」（请求不带该字段，由模型自行决定）。
+ *
+ * `current` 是**会话覆盖**：非空时那一档标记 selected；为空时是无覆盖状态，故
+ * 「未设置」项被标记（哪怕实际生效值来自条目默认——那正是「未设置」的语义）。
+ */
+export function buildEffortOptions(current: string | null, entryDefault: string | null): EffortOption[] {
+  const unset: EffortOption = {
+    value: null,
+    label: entryDefault !== null ? `未设置（继承 ${entryDefault}）` : "未设置",
+    selected: current === null,
+  };
+  const tiers: EffortOption[] = REASONING_EFFORTS.map((tier) => ({
+    value: tier,
+    label: tier,
+    selected: tier === current,
+  }));
+  return [unset, ...tiers];
+}
+
+/**
+ * 当前生效的**条目默认** effort：会话引用的清单条目（`ref` 为空 = 跟随
+ * `default_model`）自己声明的档位；都没有则 `null`。
+ *
+ * 与 app-server / TUI 的条目选择口径一致（`current_model_ref` → `default_model`），
+ * 所以控件显示的「继承 X」正是请求实际会带的那一档。纯函数：给控件做回显用，
+ * 不替服务端解析渠道。
+ */
+export function entryEffortOf(list: ModelList, ref: string | null): string | null {
+  const name = ref ?? list.default_model;
+  if (name === null) return null;
+  return list.models.find((m) => m.name === name)?.reasoning_effort ?? null;
+}
+
+/**
+ * 把「服务端上报的**生效值**」折回「会话覆盖」，供控件回显。
+ *
+ * `thread/start` / `thread/resume` 的 `reasoning_effort` 是**生效值**：没有覆盖时
+ * 它等于条目默认（工厂回落的结果），有覆盖时等于覆盖档。线协议无法把这两种情形
+ * 分开——同一个 `"low"` 既可能是「无覆盖、跑条目默认 low」，也可能是「显式覆盖成
+ * low」。既然条目的默认档在本客户端的清单里读得到，就用它做判定：生效值与条目默认
+ * 相同 ⇒ 记作**无覆盖**（控件显示「未设置（继承 low）」），不同 ⇒ 一定是覆盖。
+ *
+ * 这样冷启动（resume 报 low、条目默认也是 low）不会把 low 打勾成「已选覆盖」，
+ * 与用户看到的状态一致；而真正切过档的会话（生效 high ≠ 条目默认 low）仍能回显。
+ * 无法区分的那一档（两者恰好相等）保守地按「无覆盖」处理：控件会显示「继承 low」，
+ * 与生效值同字面，不会撒谎。
+ */
+export function overrideFromEffective(
+  effective: string | null,
+  entryDefault: string | null,
+): string | null {
+  if (effective === null) return null;
+  return effective === entryDefault ? null : effective;
+}

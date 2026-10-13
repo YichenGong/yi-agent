@@ -22,8 +22,8 @@ pub use compact::{
 };
 pub use message::{ContentBlock, ImageDetail, ImageSource, Message, Role};
 pub use provider::{
-    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderResponse,
-    StopReason, StreamEnd, TokenUsage,
+    ApiStyle, GenParams, NoticeLevel, Provider, ProviderError, ProviderEvent, ProviderNotice,
+    ProviderRequest, ProviderResponse, ReasoningKind, StopReason, StreamEnd, TokenUsage,
 };
 pub use subagent::task::{
     AgentTask, AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskDepth, TaskEvent,

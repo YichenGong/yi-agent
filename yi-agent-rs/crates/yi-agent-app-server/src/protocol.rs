@@ -233,6 +233,37 @@ pub enum Notification {
         thread_id: String,
         mode: crate::thread_store::ThreadMode,
     },
+    /// 该会话的 reasoning effort 覆盖已切换（或清除）。
+    ///
+    /// 与 `thread/modelChanged` / `thread/permissionModeChanged` 并列：effort 是
+    /// 会话元数据，切换后必须让**所有**客户端立即刷新各自的 effort 控件，否则
+    /// 一端改了、另一端停在旧值。`effort: None` ＝ 已清除覆盖（回落条目默认）。
+    #[serde(rename = "thread/reasoningEffortChanged")]
+    ReasoningEffortChanged {
+        thread_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+    },
+    /// 非致命运行期告知（通道回退 / effort 降级），状态栏级一行提示。
+    ///
+    /// 与 `turn/retry` 同为**内容层**（按 thread 路由）：它描述的是某条会话这一次
+    /// 运行走了哪条路，而不是会话元数据，窗口外的会话无需因此刷新控件。
+    #[serde(rename = "thread/notice")]
+    Notice {
+        thread_id: String,
+        level: yi_agent_core::NoticeLevel,
+        text: String,
+    },
+    /// 归一化的思维链增量（两个端点都映射到它），展示用。
+    ///
+    /// 与 `item/delta` 同为内容层：它是仅展示的正文流，绝不回灌进后续轮次
+    /// （见 core 的 `AgentEvent::ReasoningDelta` 文档）。
+    #[serde(rename = "thread/reasoningDelta")]
+    ReasoningDelta {
+        thread_id: String,
+        text: String,
+        kind: yi_agent_core::ReasoningKind,
+    },
     #[serde(rename = "item/started")]
     ItemStarted { thread_id: String, item: Item },
     #[serde(rename = "item/delta")]
@@ -351,6 +382,9 @@ impl Notification {
             | Notification::ThreadStatusUpdated { thread_id, .. }
             | Notification::ModelChanged { thread_id, .. }
             | Notification::PermissionModeChanged { thread_id, .. }
+            | Notification::ReasoningEffortChanged { thread_id, .. }
+            | Notification::Notice { thread_id, .. }
+            | Notification::ReasoningDelta { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
             | Notification::ItemDelta { thread_id, .. }
             | Notification::ItemCompleted { thread_id, .. }
@@ -395,6 +429,7 @@ impl Notification {
             | Notification::ThreadStatusUpdated { .. }
             | Notification::ModelChanged { .. }
             | Notification::PermissionModeChanged { .. }
+            | Notification::ReasoningEffortChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
@@ -741,6 +776,75 @@ mod tests {
         // 投递层级:与 `modelChanged` 同为列表层。远程客户端只订阅少量暖会话,
         // 若按内容层过滤,窗口外会话的模式变更永远收不到——「概率性不同步」的成因。
         assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// effort 变更通知的 wire 形状:`thread/reasoningEffortChanged`,参数
+    /// snake_case。与 `permissionModeChanged` 同为列表层恒推,且按 thread 路由。
+    #[test]
+    fn reasoning_effort_changed_notification_carries_method_and_effort() {
+        let n = Notification::ReasoningEffortChanged {
+            thread_id: "t1".into(),
+            effort: Some("high".into()),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/reasoningEffortChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["effort"], "high");
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// 清覆盖(`effort: None`)时 `effort` 键必须缺省,而不是显式 `null`:
+    /// 客户端据此区分「没有值」与「本次没带」——与 `model_ref` 的既有约定一致。
+    #[test]
+    fn cleared_reasoning_effort_omits_the_field() {
+        let n = Notification::ReasoningEffortChanged {
+            thread_id: "t1".into(),
+            effort: None,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/reasoningEffortChanged");
+        assert!(
+            v["params"].get("effort").is_none(),
+            "a cleared override must omit the field: {v}"
+        );
+    }
+
+    /// 运行期告知的 wire 形状:`thread/notice`,参数 snake_case,带 level。
+    ///
+    /// 投递层级与 `item/delta` 一致为**内容层**:它描述这一次运行的走法,按 thread
+    /// 路由,不该把窗口外会话的控件刷成脏。
+    #[test]
+    fn notice_notification_carries_method_level_and_text() {
+        let n = Notification::Notice {
+            thread_id: "t1".into(),
+            level: yi_agent_core::NoticeLevel::Warn,
+            text: "该模型不支持所配推理档，已忽略".into(),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/notice");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["level"], "Warn");
+        assert_eq!(v["params"]["text"], "该模型不支持所配推理档，已忽略");
+        assert_eq!(n.delivery(), Delivery::Content);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// 推理增量的 wire 形状:`thread/reasoningDelta`,参数带 kind 判别。
+    #[test]
+    fn reasoning_delta_notification_carries_method_text_and_kind() {
+        let n = Notification::ReasoningDelta {
+            thread_id: "t1".into(),
+            text: "thinking".into(),
+            kind: yi_agent_core::ReasoningKind::Summary,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/reasoningDelta");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["text"], "thinking");
+        assert_eq!(v["params"]["kind"], "Summary");
+        assert_eq!(n.delivery(), Delivery::Content);
         assert_eq!(n.thread_key(), Some("t1"));
     }
 

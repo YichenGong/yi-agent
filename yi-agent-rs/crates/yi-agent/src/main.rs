@@ -1310,6 +1310,11 @@ fn run_agent(cli: Cli) -> Result<()> {
     }
 
     let config = config::load(&cli)?;
+    // 条目默认档在**启动时**也要生效：与 app-server 同口径
+    // （`resolve_effective`）。否则 `/effort`（无参）忠实地读清单、报出条目默认
+    // 档，请求里却没有该字段（`load_inner` 硬编码 `reasoning_effort: None`），
+    // 状态行就命名了一个并未发出的值（Task 8 评审 R2）。
+    let config = startup_config_from_catalog(&config, &yi_agent_runtime::models::load_catalog());
 
     let agent_workdir = config.workdir.clone();
 
@@ -1532,6 +1537,13 @@ fn record_human<W: std::io::Write, E: std::io::Write>(
         }
         yi_agent_core::AgentEvent::Error(e) => {
             let _ = writeln!(err, "[error:{e}]");
+        }
+        // 回退/降级（design §7）在**状态行级**给一行：headless 的等价物是 stderr
+        // 的一行，与 TUI 的 Separator、app-server 的 `thread/notice` 同源。
+        // 只展示、不进正文：CoT 本身（`ReasoningDelta`）在此不渲染，因为
+        // 「只输出答案」是 headless 的既定契约（与 `DecodeDelta` 同处理）。
+        yi_agent_core::AgentEvent::Notice { text, .. } => {
+            let _ = writeln!(err, "[notice] {text}");
         }
         _ => {}
     }
@@ -1780,6 +1792,155 @@ fn rebuild_driver_agent(
         .with_permission(checker, decision_rx)
 }
 
+/// Apply the machine-level catalog's entry defaults to the TUI's startup config.
+///
+/// Uses the **same** entry-selection rule as `resolve_effort_state` (and the
+/// app-server's `resolve_effective`): session override → catalog
+/// `default_model`. Startup has no session override, so it is
+/// `effective_entry(catalog, None)`. The TUI's `/effort` status — which reads
+/// the same catalog through `resolve_effort_state` — therefore reports exactly
+/// the `reasoning_effort` this function sends.
+///
+/// The rule is deliberately **not** "the entry matching `config.model`". With
+/// `.env YI_AGENT_MODEL` naming a non-default entry the running model string
+/// would select one entry for the request while `/effort` (no session override)
+/// selected `default_model` for the report — the field sent and the field shown
+/// would differ (Task 8 review R2 residual). Matching `default_model` here keeps
+/// them one rule.
+///
+/// Deliberately only handles the **effort** field. The TUI keeps resolving
+/// provider / api_url / api_key / model from env+overrides at startup, so
+/// pulling those from the catalog here would be a behavior change beyond this
+/// fix.
+fn startup_config_from_catalog(
+    config: &config::Config,
+    catalog: &yi_agent_runtime::models::ModelCatalog,
+) -> config::Config {
+    let Some(effort) = yi_agent_runtime::models::effective_entry(catalog, None)
+        .and_then(|entry| entry.reasoning_effort.clone())
+    else {
+        return config.clone();
+    };
+    let mut resolved = config.clone();
+    resolved.reasoning_effort = Some(effort);
+    resolved
+}
+
+/// The live provider + agent config every driver rebuild is built from.
+///
+/// They are bundled into one struct on purpose. `provider` bakes in
+/// construction-time state that a rebuild **must not** silently keep from a
+/// previous model: the base URL / API key, the `reasoning_effort` the provider
+/// self-fills when a request omits the field (so "clear the override" must fall
+/// back to the *new* entry's default, not the old provider's baked value), and
+/// the per-(base_url, model, channel) effort-rejection cache. Both fields must
+/// therefore change together, which is why `apply_selection` writes them in one
+/// step and is the only way the model is switched.
+///
+/// Bug this rules out: `/model X` then `/effort default` rebuilt the agent
+/// against the `/model`-era provider, so the request omitted the field and the
+/// OLD provider re-injected the PREVIOUS model's effort (Task 8 review R1).
+#[derive(Clone)]
+struct LiveRebuild {
+    provider: Arc<dyn Provider>,
+    config: yi_agent_core::AgentConfig,
+    /// The **session** effort override (`/effort <tier>`), or `None` when there
+    /// is none. Kept apart from the entry default so a `/model` switch cannot
+    /// erase it: design §4.2's precedence is 会话覆盖 → 条目默认 → 未设置, and a
+    /// model switch changes level 2 only.
+    session_effort_override: Option<String>,
+    /// The **current catalog entry's** default effort (level 2), seeded from the
+    /// startup config (already resolved by `startup_config_from_catalog`) and
+    /// refreshed by every `apply_selection`. The request field is always
+    /// `session_effort_override.or(entry_effort)`.
+    entry_effort: Option<String>,
+}
+
+impl LiveRebuild {
+    fn new(provider: Arc<dyn Provider>, config: yi_agent_core::AgentConfig) -> Self {
+        // Startup carries no session override (the TUI starts with `/effort`
+        // unset), and the config's effort is the resolved entry default.
+        let entry_effort = config.gen_params.reasoning_effort.clone();
+        Self {
+            provider,
+            config,
+            session_effort_override: None,
+            entry_effort,
+        }
+    }
+
+    /// Apply a catalog selection produced by `resolve_effective`: adopt the
+    /// provider built for `effective` and the model + entry-default effort it
+    /// resolved. Returns the newly assembled agent.
+    ///
+    /// Only level 2 (条目默认) changes: a session `/effort` override survives the
+    /// switch (design §4.2), and the request field is recomputed as
+    /// `override.or(entry)` — never overwritten with the entry value alone.
+    /// The app-server's `SessionCommand::SetModel` does the same (clone the
+    /// agent config, overwrite just `model`), so the two consumers agree.
+    fn apply_selection(
+        &mut self,
+        effective: &config::Config,
+        provider: Arc<dyn Provider>,
+        tools: Arc<yi_agent_core::ToolRegistry>,
+        checker: Arc<yi_agent_core::permission::PermissionChecker>,
+        decision_rx: Arc<
+            tokio::sync::Mutex<
+                tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>,
+            >,
+        >,
+        session: Arc<std::sync::Mutex<yi_agent_core::Session>>,
+    ) -> yi_agent_core::Agent {
+        self.config.model = effective.model.clone();
+        self.entry_effort = effective.reasoning_effort.clone();
+        self.config.gen_params.reasoning_effort = self
+            .session_effort_override
+            .clone()
+            .or(self.entry_effort.clone());
+        self.provider = provider;
+        self.rebuild(tools, checker, decision_rx, session)
+    }
+
+    /// Set (or clear, with `None`) the session effort override, keeping the
+    /// current provider. Effort is a request-level parameter
+    /// (`GenParams.reasoning_effort`); rebuilding the provider would throw away
+    /// the channel probe cache and the effort-rejection cache for nothing.
+    ///
+    /// The override is stored and the request field recomputed as
+    /// `override.or(entry)`, so `/effort default` reclaims the *current entry's*
+    /// default (design §4.2 level 2) instead of sending no field at all.
+    fn set_effort(&mut self, effort: Option<String>) {
+        self.session_effort_override = effort;
+        self.config.gen_params.reasoning_effort = self
+            .session_effort_override
+            .clone()
+            .or(self.entry_effort.clone());
+    }
+
+    /// Reassemble the agent from the current provider + config, reusing the
+    /// caller's session `Arc` (see [`rebuild_driver_agent`]).
+    fn rebuild(
+        &self,
+        tools: Arc<yi_agent_core::ToolRegistry>,
+        checker: Arc<yi_agent_core::permission::PermissionChecker>,
+        decision_rx: Arc<
+            tokio::sync::Mutex<
+                tokio::sync::mpsc::Receiver<(u64, yi_agent_core::permission::Decision)>,
+            >,
+        >,
+        session: Arc<std::sync::Mutex<yi_agent_core::Session>>,
+    ) -> yi_agent_core::Agent {
+        rebuild_driver_agent(
+            Arc::clone(&self.provider),
+            tools,
+            self.config.clone(),
+            checker,
+            decision_rx,
+            session,
+        )
+    }
+}
+
 /// Run the ratatui TUI. Sets up channels, spawns agent driver task, calls run_tui.
 #[allow(clippy::too_many_arguments)]
 fn run_tui_agent(
@@ -1845,8 +2006,13 @@ fn run_tui_agent(
         let config_clone = agent_config.clone();
         let is_running_clone = Arc::clone(&is_running);
         let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
-        let rebuild_provider = Arc::clone(&provider);
-        let rebuild_config = agent_config.clone();
+        // The live provider + the agent config every rebuild is built from,
+        // bundled so a switch can never update one without the other. `SetModel`
+        // swaps both (new provider, new model, new entry-default effort),
+        // `SetReasoningEffort` only the override, so the two switches compose: a
+        // later `/model` cannot resurrect an earlier model's effort, nor clobber
+        // a `/effort` switch (Task 8 review R1).
+        let mut live = LiveRebuild::new(Arc::clone(&provider), agent_config.clone());
         let rebuild_decision_rx = Arc::clone(&decision_rx);
         let runtime_detach_for_driver = Arc::clone(&runtime_detach);
         let mcp_for_driver = Arc::clone(&mcp);
@@ -1912,10 +2078,8 @@ fn run_tui_agent(
                             // it stays live; the contents are emptied in place, and
                             // `last_input_tokens` is dropped like a fresh session.
                             let handle = agent.session_handle();
-                            agent = rebuild_driver_agent(
-                                Arc::clone(&rebuild_provider),
+                            agent = live.rebuild(
                                 Arc::clone(&current_tools),
-                                rebuild_config.clone(),
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
                                 Arc::clone(&handle),
@@ -1932,18 +2096,16 @@ fn run_tui_agent(
                             let session = agent.session();
                             let old_msg_count = session.messages().len();
                             match yi_agent_core::compact_session(
-                                &rebuild_provider,
-                                &rebuild_config,
+                                &live.provider,
+                                &live.config,
                                 &session,
                             )
                             .await
                             {
                                 Ok(Some(new_session)) => {
                                     let new_msg_count = new_session.messages().len();
-                                    agent = rebuild_driver_agent(
-                                        Arc::clone(&rebuild_provider),
+                                    agent = live.rebuild(
                                         Arc::clone(&current_tools),
-                                        rebuild_config.clone(),
                                         Arc::clone(&current_checker),
                                         Arc::clone(&rebuild_decision_rx),
                                         Arc::clone(&handle),
@@ -1992,10 +2154,8 @@ fn run_tui_agent(
                             // Reuse the session Arc: a fresh one would orphan the
                             // handle the delegation caller is bound to.
                             let handle = agent.session_handle();
-                            agent = rebuild_driver_agent(
-                                Arc::clone(&rebuild_provider),
+                            agent = live.rebuild(
                                 Arc::clone(&current_tools),
-                                rebuild_config.clone(),
                                 Arc::clone(&current_checker),
                                 Arc::clone(&rebuild_decision_rx),
                                 handle,
@@ -2015,13 +2175,16 @@ fn run_tui_agent(
                             // 旧 agent 原样保留(绝不半重建)。
                             match yi_agent_runtime::bootstrap::build_provider(&effective) {
                                 Ok(provider) => {
-                                    let mut next_config = rebuild_config.clone();
-                                    next_config.model = effective.model.clone();
+                                    // `apply_selection` 一次性写回 **provider 与
+                                    // config**:`/model` 之后每一次重建都基于新
+                                    // provider,而不是启动时那个 —— 否则 `/effort
+                                    // default` 会让请求省略字段,再被**旧** provider
+                                    // 补回上一模型的档位(Task 8 评审 R1)。
                                     let handle = agent.session_handle();
-                                    agent = rebuild_driver_agent(
+                                    agent = live.apply_selection(
+                                        &effective,
                                         provider,
                                         Arc::clone(&current_tools),
-                                        next_config,
                                         Arc::clone(&current_checker),
                                         Arc::clone(&rebuild_decision_rx),
                                         handle,
@@ -2054,6 +2217,44 @@ fn run_tui_agent(
                                         .await;
                                 }
                             }
+                        }
+                        ControlCommand::SetReasoningEffort(effort) => {
+                            // `effort` 已由 TUI 按七档白名单校验；`None` = 清
+                            // 覆盖，回落当前条目默认（`apply_selection` 写回的
+                            // 就是这个默认值）。
+                            //
+                            // **不重建 provider**：effort 是请求级参数
+                            // （`GenParams.reasoning_effort`），provider 持有的
+                            // 是构造期的默认值，请求里的字段总是优先——重建会
+                            // 白白丢掉已探测的 channel 缓存与 effort 拒绝缓存。
+                            // `set_effort` 只动 config，`live.provider` 保持
+                            // 当前（`/model` 之后即新 provider），故 `/effort
+                            // default` 只会回落到**当前**条目默认。
+                            live.set_effort(effort.clone());
+                            let handle = agent.session_handle();
+                            agent = live.rebuild(
+                                Arc::clone(&current_tools),
+                                Arc::clone(&current_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                                handle,
+                            );
+                            tracing::info!(
+                                ?effort,
+                                "agent reasoning effort switched via /effort"
+                            );
+                            // TUI 不预写成功行（与 `/model` 同理），由这条
+                            // 状态行级告知闭环。文案只陈述用户刚下的命令，成功
+                            // 与否由 TUI 依自身状态重算的生效值呈现。
+                            let message = match &effort {
+                                Some(tier) => format!("推理档已设为 {tier}"),
+                                None => "推理档覆盖已清除（回落条目默认）".to_string(),
+                            };
+                            let _ = agent_tx
+                                .send(yi_agent_core::AgentEvent::Notice {
+                                    level: yi_agent_core::NoticeLevel::Info,
+                                    text: message,
+                                })
+                                .await;
                         }
                     }
                     continue;
@@ -2129,10 +2330,8 @@ fn run_tui_agent(
                                             let handle = agent.session_handle();
                                             current_tools = next_tools;
                                             current_checker = next_checker;
-                                            agent = rebuild_driver_agent(
-                                                Arc::clone(&rebuild_provider),
+                                            agent = live.rebuild(
                                                 Arc::clone(&current_tools),
-                                                rebuild_config.clone(),
                                                 Arc::clone(&current_checker),
                                                 Arc::clone(&rebuild_decision_rx),
                                                 Arc::clone(&handle),
@@ -2398,6 +2597,12 @@ pub(crate) enum ControlCommand {
     /// providers. Sending only a model string would keep the old (possibly
     /// mismatched) key/url and silently fail at the first request.
     SetModel(Option<String>),
+    /// Rebuild the agent with a different request-level `reasoning_effort`,
+    /// preserving the session (and the provider: effort is a request parameter,
+    /// so no channel probe or cache is thrown away). `Some(tier)` is one of the
+    /// seven tiers; `None` clears the override and falls back to the current
+    /// catalog entry's default, which `apply_selection` keeps in the live config.
+    SetReasoningEffort(Option<String>),
     /// Rebuild the agent so its tool registry matches the MCP switches the TUI
     /// already applied directly to the shared `McpManager`.
     McpRefresh,
@@ -2492,6 +2697,426 @@ mod tests {
         // `None` clears the override and must not compare equal to a named switch.
         assert_ne!(ControlCommand::SetModel(None), a);
         assert_eq!(ControlCommand::SetModel(Some("claude-opus-4-1".into())), a,);
+    }
+
+    #[test]
+    fn set_reasoning_effort_control_command_distinguishes_its_payload() {
+        // Same guard as `SetModel`: a `PartialEq` that ignored the payload would
+        // make two different tiers equal, and a clear (`None`) indistinguishable
+        // from "no command".
+        let high = ControlCommand::SetReasoningEffort(Some("high".into()));
+        assert_ne!(high, ControlCommand::SetReasoningEffort(Some("low".into())));
+        assert_ne!(ControlCommand::SetReasoningEffort(None), high);
+        assert_ne!(high, ControlCommand::McpRefresh);
+        assert_eq!(
+            ControlCommand::SetReasoningEffort(Some("high".into())),
+            high
+        );
+    }
+
+    /// `/effort` must rebuild the agent with the new request-level effort while
+    /// (a) keeping the session `Arc` and (b) reusing the live provider — effort
+    /// is a request parameter, so dropping the provider would throw away the
+    /// channel probe cache and the effort-rejection cache.
+    ///
+    /// The rebuild is a private closure step in the driver loop, so this mirrors
+    /// it against the same primitives the loop uses.
+    #[test]
+    fn effort_rebuild_applies_gen_params_and_keeps_the_session() {
+        let mut agent = yi_agent_core::Agent::new(
+            Arc::new(NeverCalledProvider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+        );
+        let session = agent.session_handle();
+        session
+            .lock()
+            .unwrap()
+            .push(yi_agent_core::Message::user("before the rebuild"));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checker = yi_agent_runtime::bootstrap::load_permission_checker(dir.path(), true)
+            .expect("checker");
+        let (decision_tx, decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(1);
+        drop(decision_tx);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        let provider: Arc<dyn Provider> = Arc::new(NeverCalledProvider);
+        let mut rebuild_config = yi_agent_core::AgentConfig::default();
+
+        // `SetReasoningEffort(Some("high"))`, exactly as the driver handles it.
+        let mut next_config = rebuild_config.clone();
+        next_config.gen_params.reasoning_effort = Some("high".into());
+        agent = rebuild_driver_agent(
+            Arc::clone(&provider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            next_config.clone(),
+            Arc::clone(&checker),
+            Arc::clone(&decision_rx),
+            Arc::clone(&session),
+        );
+        rebuild_config = next_config;
+
+        assert_eq!(
+            agent.config().gen_params.reasoning_effort.as_deref(),
+            Some("high")
+        );
+        assert!(
+            Arc::ptr_eq(&session, &agent.session_handle()),
+            "the /effort rebuild must not replace the session Arc"
+        );
+        assert_eq!(
+            session.lock().unwrap().messages().len(),
+            1,
+            "the transcript must survive the effort switch"
+        );
+
+        // `SetReasoningEffort(None)` clears it again.
+        let mut cleared = rebuild_config.clone();
+        cleared.gen_params.reasoning_effort = None;
+        agent = rebuild_driver_agent(
+            provider,
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            cleared.clone(),
+            checker,
+            decision_rx,
+            Arc::clone(&session),
+        );
+        assert_eq!(
+            agent.config().gen_params.reasoning_effort,
+            None,
+            "clearing must fall back to no field sent"
+        );
+    }
+
+    /// Regression for Task 8 review R1: `/model` must move the **live provider**
+    /// too, so a following `/effort default` rebuilds against the new provider.
+    ///
+    /// The reviewed bug rebuilt against the startup provider, whose baked
+    /// `reasoning_effort` the request omits and re-fills — after `/effort
+    /// default` cleared the override that re-injected the *previous* model's
+    /// effort. The composition below fails if the live provider is not tracked.
+    #[test]
+    fn model_switch_moves_the_provider_used_by_a_later_effort_switch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checker = yi_agent_runtime::bootstrap::load_permission_checker(dir.path(), true)
+            .expect("checker");
+        let (decision_tx, decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(1);
+        drop(decision_tx);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        let startup_provider: Arc<dyn Provider> = Arc::new(NeverCalledProvider);
+        let switched_provider: Arc<dyn Provider> = Arc::new(NeverCalledProvider);
+        let mut live = LiveRebuild::new(
+            Arc::clone(&startup_provider),
+            yi_agent_core::AgentConfig::default(),
+        );
+        let mut agent = yi_agent_core::Agent::new(
+            Arc::clone(&startup_provider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+        );
+        let session = agent.session_handle();
+
+        // `/model <entry>` where the catalog entry resolves model `model-b` and
+        // declared a default effort of `medium`.
+        let mut effective = test_config();
+        effective.model = "model-b".into();
+        effective.reasoning_effort = Some("medium".into());
+        agent = live.apply_selection(
+            &effective,
+            Arc::clone(&switched_provider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            Arc::clone(&checker),
+            Arc::clone(&decision_rx),
+            Arc::clone(&session),
+        );
+        assert_eq!(agent.config().model, "model-b");
+        assert_eq!(
+            agent.config().gen_params.reasoning_effort.as_deref(),
+            Some("medium")
+        );
+
+        // `/effort default`: clear the override. The rebuild must use the
+        // SWITCHED provider (effort is a request parameter, so the provider is
+        // deliberately kept) — otherwise its stale baked effort wins.
+        live.set_effort(None);
+        let cleared = live.rebuild(
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            Arc::clone(&checker),
+            Arc::clone(&decision_rx),
+            Arc::clone(&session),
+        );
+        assert!(
+            Arc::ptr_eq(&live.provider, &switched_provider),
+            "the live provider must track /model so a later /effort rebuilds on \
+             the new provider (R1)"
+        );
+        assert_eq!(
+            cleared.config().gen_params.reasoning_effort.as_deref(),
+            Some("medium"),
+            "/effort default must reclaim the current entry's default (design \
+             §4.2 level 2), not resurrect the previous model's effort nor send \
+             no field at all"
+        );
+        assert_eq!(cleared.config().model, "model-b");
+        assert!(
+            Arc::ptr_eq(&session, &cleared.session_handle()),
+            "the switch must keep the caller's session Arc"
+        );
+    }
+
+    /// Task 8 review R2 (second hole): a `/model` switch must not drop the
+    /// **session** `/effort` override, and the effort the driver sends must keep
+    /// equalling the effort `/effort` reports.
+    ///
+    /// The reviewed bug: `apply_selection` wrote `effective.reasoning_effort`
+    /// straight into `gen_params.reasoning_effort`, so `/effort high` followed by
+    /// a `/model` whose entry is silent cleared the field — while the TUI (which
+    /// never clears `effort_override` on `ModelSelected`) went on printing
+    /// `high（会话覆盖）`. Design §4.2 precedence is 会话覆盖 → 条目默认 → 未设置:
+    /// `/model` changes level 2 only, never level 1. The app-server reference
+    /// (`SessionCommand::SetModel`) clones the agent config and overwrites just
+    /// `model`, so its thread-level effort survives; the TUI must match.
+    #[test]
+    fn a_model_switch_keeps_the_session_effort_override() {
+        use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
+        let entry = |name: &str, effort: Option<&str>| ModelEntry {
+            name: name.into(),
+            provider: ModelProvider::Openai,
+            api_url: "https://x.example".into(),
+            model: name.into(),
+            api_key: "sk-secret".into(),
+            api_style: None,
+            reasoning_effort: effort.map(str::to_string),
+        };
+        // `/model Y`: Y declares no effort of its own.
+        let catalog = ModelCatalog {
+            models: vec![entry("Y", None)],
+            default_model: Some("Y".into()),
+            subagent_model: None,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checker = yi_agent_runtime::bootstrap::load_permission_checker(dir.path(), true)
+            .expect("checker");
+        let (decision_tx, decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(1);
+        drop(decision_tx);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        let startup_provider: Arc<dyn Provider> = Arc::new(NeverCalledProvider);
+        let switched_provider: Arc<dyn Provider> = Arc::new(NeverCalledProvider);
+        let mut live = LiveRebuild::new(
+            Arc::clone(&startup_provider),
+            yi_agent_core::AgentConfig::default(),
+        );
+        let mut agent = yi_agent_core::Agent::new(
+            Arc::clone(&startup_provider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+        );
+        let session = agent.session_handle();
+
+        // `/effort high`: the session override (level 1), provider kept.
+        live.set_effort(Some("high".into()));
+        assert_eq!(
+            live.config.gen_params.reasoning_effort.as_deref(),
+            Some("high")
+        );
+
+        // `/model Y`, Y silent: level 2 changes, level 1 must survive.
+        let mut effective = test_config();
+        effective.model = "Y".into();
+        effective.reasoning_effort = None;
+        agent = live.apply_selection(
+            &effective,
+            Arc::clone(&switched_provider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            Arc::clone(&checker),
+            Arc::clone(&decision_rx),
+            session,
+        );
+        let sent = agent.config().gen_params.reasoning_effort.clone();
+        let (reported, source) =
+            crate::tui::app::resolve_effort_state(Some("high"), &catalog, Some("Y"));
+        assert_eq!(
+            sent.as_deref(),
+            Some("high"),
+            "/model must not drop the session effort override"
+        );
+        assert_eq!(
+            sent, reported,
+            "the driver sent {sent:?} but /effort reported {reported:?}"
+        );
+        assert_eq!(source, crate::tui::app::EffortSource::Session);
+
+        // Same again when the entry declares a DIFFERENT effort: level 1 still
+        // beats level 2, and sent still equals reported.
+        let loud = ModelCatalog {
+            models: vec![entry("Y", Some("low"))],
+            default_model: Some("Y".into()),
+            subagent_model: None,
+        };
+        let mut loud_effective = test_config();
+        loud_effective.model = "Y".into();
+        loud_effective.reasoning_effort = Some("low".into());
+        agent = live.apply_selection(
+            &loud_effective,
+            switched_provider,
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            checker,
+            decision_rx,
+            agent.session_handle(),
+        );
+        let sent = agent.config().gen_params.reasoning_effort.clone();
+        let (reported, _) = crate::tui::app::resolve_effort_state(Some("high"), &loud, Some("Y"));
+        assert_eq!(sent.as_deref(), Some("high"));
+        assert_eq!(sent, reported);
+
+        // `/effort default` now reclaims level 2 — the current entry's default —
+        // rather than clearing the field outright.
+        live.set_effort(None);
+        assert_eq!(
+            live.config.gen_params.reasoning_effort.as_deref(),
+            Some("low")
+        );
+    }
+
+    /// Mirror of the above with **no** session override: the entry default must
+    /// track `/model` (silent entry → unsent, loud entry → sent) and stay equal
+    /// to what `/effort` reports. Paired with
+    /// `startup_sends_the_effort_the_tui_reports`, this pins design §4.2 level 2
+    /// end to end.
+    #[test]
+    fn a_model_switch_tracks_the_entry_default_without_an_override() {
+        use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
+        let entry = |name: &str, effort: Option<&str>| ModelEntry {
+            name: name.into(),
+            provider: ModelProvider::Openai,
+            api_url: "https://x.example".into(),
+            model: name.into(),
+            api_key: "sk-secret".into(),
+            api_style: None,
+            reasoning_effort: effort.map(str::to_string),
+        };
+        let catalog = ModelCatalog {
+            models: vec![entry("Y", None), entry("Z", Some("low"))],
+            default_model: Some("Y".into()),
+            subagent_model: None,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checker = yi_agent_runtime::bootstrap::load_permission_checker(dir.path(), true)
+            .expect("checker");
+        let (decision_tx, decision_rx) =
+            tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(1);
+        drop(decision_tx);
+        let decision_rx = Arc::new(tokio::sync::Mutex::new(decision_rx));
+
+        let mut live = LiveRebuild::new(
+            Arc::new(NeverCalledProvider) as Arc<dyn Provider>,
+            yi_agent_core::AgentConfig::default(),
+        );
+        let mut agent = yi_agent_core::Agent::new(
+            Arc::new(NeverCalledProvider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            yi_agent_core::AgentConfig::default(),
+        );
+        let session = agent.session_handle();
+
+        // `/model Y` (silent): unset stays unset, and stays unsent.
+        let mut y = test_config();
+        y.model = "Y".into();
+        y.reasoning_effort = None;
+        agent = live.apply_selection(
+            &y,
+            Arc::new(NeverCalledProvider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            Arc::clone(&checker),
+            Arc::clone(&decision_rx),
+            Arc::clone(&session),
+        );
+        let sent = agent.config().gen_params.reasoning_effort.clone();
+        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, Some("Y"));
+        assert_eq!(sent, None, "a silent entry must send no field");
+        assert_eq!(sent, reported);
+        assert_eq!(source, crate::tui::app::EffortSource::Unset);
+
+        // `/model Z` (loud `low`): the entry default now applies to both sides.
+        let mut z = test_config();
+        z.model = "Z".into();
+        z.reasoning_effort = Some("low".into());
+        agent = live.apply_selection(
+            &z,
+            Arc::new(NeverCalledProvider),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            Arc::clone(&checker),
+            Arc::clone(&decision_rx),
+            Arc::clone(&session),
+        );
+        let sent = agent.config().gen_params.reasoning_effort.clone();
+        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, Some("Z"));
+        assert_eq!(sent.as_deref(), Some("low"));
+        assert_eq!(sent, reported);
+        assert_eq!(source, crate::tui::app::EffortSource::Entry);
+    }
+
+    /// Task 8 review R2 (residual): the effort the TUI **sends** at startup and
+    /// the effort its `/effort` status **reports** must come from ONE
+    /// entry-selection rule.
+    ///
+    /// `resolve_effort_state` (and the app-server's `resolve_effective`) select
+    /// session override → catalog `default_model`. Startup previously preferred
+    /// the entry matching `config.model`, so with `YI_AGENT_MODEL` naming a
+    /// non-default entry the request carried that entry's effort while `/effort`
+    /// printed the `default_model` entry's — reported `Unset` != sent `low`. This
+    /// cross-check fails under the old `config.model`-first rule and is the
+    /// regression guard for the unified rule.
+    #[test]
+    fn startup_sends_the_effort_the_tui_reports() {
+        use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
+        let entry = |name: &str, effort: Option<&str>| ModelEntry {
+            name: name.into(),
+            provider: ModelProvider::Openai,
+            api_url: "https://x.example".into(),
+            model: name.into(),
+            api_key: "sk-secret".into(),
+            api_style: None,
+            reasoning_effort: effort.map(str::to_string),
+        };
+        let make_catalog = |default: &str| ModelCatalog {
+            models: vec![
+                entry("HORIZON-OG-Luna", Some("low")),
+                entry("HORIZON-DeepSeek", None),
+            ],
+            default_model: Some(default.into()),
+            subagent_model: None,
+        };
+
+        // The env model ("HORIZON-OG-Luna") is NOT the catalog default and
+        // declares a different effort than the default entry.
+        let catalog = make_catalog("HORIZON-DeepSeek");
+        let mut config = test_config();
+        config.model = "HORIZON-OG-Luna".into();
+        config.reasoning_effort = None; // `load_inner`'s hardcoded default
+
+        let sent = startup_config_from_catalog(&config, &catalog).reasoning_effort;
+        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, None);
+        assert_eq!(
+            sent, reported,
+            "startup reported {reported:?} ({source:?}) but sent {sent:?}"
+        );
+        // The unified rule follows `default_model`, whose entry is silent here:
+        // unset stays unset (zero regression for the owner's setup).
+        assert_eq!(sent, None);
+
+        // A `default_model` entry that declares an effort applies to startup and
+        // is what `/effort` reports.
+        let loud = make_catalog("HORIZON-OG-Luna");
+        let sent = startup_config_from_catalog(&config, &loud).reasoning_effort;
+        let (reported, _) = crate::tui::app::resolve_effort_state(None, &loud, None);
+        assert_eq!(sent.as_deref(), Some("low"));
+        assert_eq!(sent, reported);
     }
 
     #[test]
@@ -2817,6 +3442,8 @@ mod tests {
             api_url: "https://api.anthropic.com".into(),
             api_key: "test-key".into(),
             model: "claude-sonnet-4-5".into(),
+            api_style: yi_agent_core::ApiStyle::Auto,
+            reasoning_effort: None,
             max_turns: 50,
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
@@ -3338,6 +3965,38 @@ mod tests {
             !stderr.contains("[done:"),
             "EndTurn must not emit [done:EndTurn] on stderr; got: {stderr:?}"
         );
+    }
+
+    /// 回退/降级必须在 headless 也看得见（design §7），但 CoT 不能混进答案流。
+    #[test]
+    fn drain_stream_human_reports_notices_on_stderr_and_keeps_reasoning_out_of_stdout() {
+        let stream = futures::stream::iter(vec![
+            AgentEvent::ReasoningDelta {
+                text: "let me think".into(),
+                kind: yi_agent_core::ReasoningKind::Content,
+            },
+            AgentEvent::Notice {
+                level: yi_agent_core::NoticeLevel::Info,
+                text: "该模型不支持所配推理档，已忽略".into(),
+            },
+            AgentEvent::AssistantText("answer\n".into()),
+        ]);
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        drain_stream_human_sync(stream.boxed(), &mut out, &mut err);
+
+        let stdout = String::from_utf8(out).unwrap();
+        let stderr = String::from_utf8(err).unwrap();
+        assert!(
+            stderr.contains("[notice] 该模型不支持所配推理档，已忽略"),
+            "the notice must reach stderr; got {stderr:?}"
+        );
+        assert!(
+            !stdout.contains("let me think"),
+            "reasoning must not leak into the answer stream; got {stdout:?}"
+        );
+        assert_eq!(stdout, "answer\n");
     }
 
     #[test]

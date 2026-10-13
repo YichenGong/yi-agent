@@ -1538,6 +1538,38 @@ fn current_session_model_ref() -> Option<String> {
     SESSION_MODEL_REF.with(|slot| slot.borrow().clone())
 }
 
+thread_local! {
+    /// 本次 `build_agent` 调用所属会话的 effort 覆盖（七档之一）。与
+    /// [`SESSION_MODEL_REF`] 同一理由：工厂闭包签名带不进这个逐会话参数。
+    /// 槽位为 `Some` 时**覆盖** `resolve_effective` 从条目带出的默认值；为 `None`
+    /// 时跟随条目默认。解析链「会话覆盖 → 条目默认 → 未设置」由此收敛：工厂只认
+    /// 「有没有覆盖」，**没有**「强制不发」这一态——清除覆盖等同于未设置(都跟随
+    /// 条目默认),这样 resume 重建与活线程经 provider 自补的路径手感一致。
+    static SESSION_REASONING_EFFORT: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 在调用工厂(`build_agent`)前设定本次会话的 effort 覆盖，供工厂解析。
+///
+/// `Some(tier)` 覆盖条目默认；`None` 表示本次会话没有覆盖，工厂沿用
+/// `resolve_effective` 带出的条目默认。调用返回后恢复调用前的值，故嵌套调用不会
+/// 泄漏覆盖。`thread/start` 传 `None`（新会话无覆盖），`thread/resume` 传
+/// `meta.reasoning_effort`（清过的即为 `None` ⇒ 同样回落条目默认）。
+pub(crate) fn with_session_reasoning_effort<T>(effort: Option<String>, f: impl FnOnce() -> T) -> T {
+    SESSION_REASONING_EFFORT.with(|slot| {
+        let prev = slot.replace(effort);
+        let out = f();
+        slot.replace(prev);
+        out
+    })
+}
+
+/// 工厂内部读取当前会话的 effort 覆盖；不在
+/// [`with_session_reasoning_effort`] 内时为 `None`（无覆盖，跟随条目默认）。
+fn current_session_reasoning_effort() -> Option<String> {
+    SESSION_REASONING_EFFORT.with(|slot| slot.borrow().clone())
+}
+
 /// 生产环境的 agent 工厂:按 thread 的 cwd 覆盖 workdir 与 yolo 后引导一个 agent。
 ///
 /// `catalog` 在进程启动时经 `load_catalog()` 读入一次并共享;每次调用再按本次会话
@@ -1562,11 +1594,20 @@ pub(crate) fn production_factory(
         thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
         let model_ref = current_session_model_ref();
         // 按本次会话解析 provider/api_url/api_key/model;不中则原样回退 cfg。
-        let thread_cfg = yi_agent_runtime::models::resolve_effective(
+        let mut thread_cfg = yi_agent_runtime::models::resolve_effective(
             &thread_cfg,
             &catalog,
             model_ref.as_deref(),
         );
+        // 会话 effort 覆盖（若有）优先于条目默认：`resolve_effective` 已带出条目
+        // 的 `reasoning_effort`，仅当槽位**确有覆盖**（`Some(tier)`）时才覆盖它。
+        // 槽位为 `None` 时一律保留条目默认 —— 这同时覆盖「新会话无覆盖」与「显式
+        // 清除覆盖」：清除 = 回落条目默认（解析链第 2 级），而非不发该字段。二者
+        // 必须一致，否则同一个 meta 在「活线程清除」（provider 自补条目档）与
+        // 「resume 重建」两条路径上会有两种线上行为。
+        if let Some(effort) = current_session_reasoning_effort() {
+            thread_cfg.reasoning_effort = Some(effort);
+        }
         let built = yi_agent_runtime::bootstrap::bootstrap_agent(
             &thread_cfg,
             yi_agent_runtime::bootstrap::PermissionMode::Interactive,
@@ -3387,7 +3428,9 @@ where
                         // 本次会话的 `model_ref` 经 thread-local 交给工厂解析 provider /
                         // api_url / api_key / model(命中清单默认则用条目,否则回退 cfg)。
                         let built = match with_session_model_ref(model_ref.clone(), || {
-                            build_agent(None, Path::new(&cwd), mode)
+                            with_session_reasoning_effort(None, || {
+                                build_agent(None, Path::new(&cwd), mode)
+                            })
                         }) {
                             Ok(a) => a,
                             Err(e) => {
@@ -3402,6 +3445,12 @@ where
                         // 上报一个工厂实际未采用的模型(任务 7 评审 Finding 1)。用
                         // `agent.config().model` 才能保证「上报 == 实际运行」。
                         let model = built.agent.config().model.clone();
+
+                        // 与 `model` 同源:上报**实际建出**的 agent 的生效档位。
+                        // 用硬编码 null 会在条目带默认档时谎报(本会话其实跑着该档),
+                        // 且与 resume 的口径不一致。
+                        let reasoning_effort =
+                            built.agent.config().gen_params.reasoning_effort.clone();
 
                         // 内核负责「attach_delegation → 建 driver 通道 → insert 到
                         // `threads` → spawn 守望者与 driver」;RPC 层的通知与响应仍在
@@ -3451,6 +3500,9 @@ where
                                     "model": model,
                                     "model_ref": model_ref,
                                     "permission_mode": mode,
+                                    // 新会话无覆盖 ⇒ 上报实际运行值(解析出的条目默认
+                                    // 或 cfg;都没有则 null),与实际建出的 agent 同源。
+                                    "reasoning_effort": reasoning_effort,
                                 }),
                             ),
                         )
@@ -3535,7 +3587,9 @@ where
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
                         let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
-                            build_agent(Some(session), Path::new(&cwd), mode)
+                            with_session_reasoning_effort(loaded.meta.reasoning_effort.clone(), || {
+                                build_agent(Some(session), Path::new(&cwd), mode)
+                            })
                         }) {
                             Ok(a) => a,
                             Err(e) => {
@@ -3553,6 +3607,11 @@ where
                         // (任务 7 评审 Finding 1);不照抄 meta.model 也是为了让旧库/异常库里
                         // 一个与当前清单不符的陈旧串被本次实际生效值取代。
                         let model = built.agent.config().model.clone();
+                        // 与 `model` 同源:上报**实际建出**的 agent 的生效档位。清除覆盖
+                        // 后的 meta 是 `None`,但工厂此时已回落到条目默认,故响应必须报
+                        // 该实际值,而非照抄 meta 的 null(否则客户端挂着的控件会骗人)。
+                        let reasoning_effort =
+                            built.agent.config().gen_params.reasoning_effort.clone();
                         let runtime_dir =
                             yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
                         let activation = attach_delegation(
@@ -3719,6 +3778,7 @@ where
                                     "model": model,
                                     "model_ref": loaded.meta.model_ref,
                                     "permission_mode": loaded.meta.permission_mode,
+                                    "reasoning_effort": reasoning_effort,
                                 }),
                             ),
                         )
@@ -3891,6 +3951,137 @@ where
                         write_response(
                             &hub, &client,
                             ok_response(id, json!({ "ok": true, "model": effective.model })),
+                        )
+                        .await?;
+                    }
+                    "thread/setReasoningEffort" => {
+                        // 与 `thread/setModel` 同档:effort 会改推理行为(能力面/计费),
+                        // 需 `Control`。
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // `effort: null`(或缺失)= 清覆盖;字符串必须在七档白名单内,
+                        // 否则 `-32602`;其余 JSON 类型同样 `-32602`,不静默当作清覆盖。
+                        // 白名单与 `model_rpc::upsert` 的条目校验逐字一致。
+                        let effort = match req.params.get("effort") {
+                            None | Some(serde_json::Value::Null) => None,
+                            Some(serde_json::Value::String(s)) => {
+                                if !matches!(
+                                    s.as_str(),
+                                    "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                                ) {
+                                    write_response(
+                                        &hub, &client,
+                                        err_response(
+                                            id,
+                                            RpcError::invalid_params(
+                                                "effort must be one of \
+                                                 none|minimal|low|medium|high|xhigh|max",
+                                            ),
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                }
+                                Some(s.clone())
+                            }
+                            Some(_) => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params("effort must be a string or null"),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 先让在场 driver 用新 effort 重建 agent（复用当前 provider——
+                        // effort 不烤进 URL/key），成功后再落盘。铁律「上报/落盘 == 实际
+                        // 运行」同 setModel:若重建失败,agent 仍跑旧档位,此时落盘就会让
+                        // 磁盘与响应谎报。故先重建、后落盘;失败即回错误且零磁盘副作用。
+                        //
+                        // 冷 thread(不在内存)没有 driver 可发:只能先落盘,resume 时会按
+                        // meta.reasoning_effort 重建,故跳过本段。
+                        if threads.contains_key(&thread_id) {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            // 借用只活在下面这个块内(send 的 future 借 `session`),
+                            // 出块即释放,后续 `threads.get_mut` 才不被占用。
+                            let send_result = {
+                                let session = threads
+                                    .get(&thread_id)
+                                    .expect("contains_key was just checked");
+                                session
+                                    .session_tx
+                                    .send(SessionCommand::SetReasoningEffort {
+                                        effort: effort.clone(),
+                                        reply: reply_tx,
+                                    })
+                                    .await
+                            };
+                            // reply 为 `Ok(Err(_))` 表示 driver 重建失败;发送失败(通道关闭)
+                            // 同样意味着无法保证生效,一并按失败处理。
+                            let applied =
+                                send_result.is_ok() && matches!(reply_rx.await, Ok(Ok(())));
+                            if !applied {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::internal(
+                                            "the live session could not switch to the requested \
+                                             reasoning effort; it is still running the previous one"
+                                                .to_string(),
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                        // 重建成功后(冷 thread 则直接)落盘:读-改-写 + 原子写,与
+                        // `set_model` 同锁,避免并发 `touch` / `rename` 互相覆盖。
+                        let store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
+                        if let Err(e) = store.set_reasoning_effort(&thread_id, effort.as_deref()) {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            } else {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                            continue;
+                        }
+                        // 列表层恒推(同 `thread/permissionModeChanged`):桌面改 → 手机
+                        // effort 控件同步,反之亦然。
+                        let _ = write_notification(
+                            &hub,
+                            &Notification::ReasoningEffortChanged {
+                                thread_id: thread_id.clone(),
+                                effort: effort.clone(),
+                            },
+                        )
+                        .await;
+                        write_response(
+                            &hub, &client,
+                            ok_response(id, json!({ "ok": true, "effort": effort })),
                         )
                         .await?;
                     }
@@ -5962,6 +6153,26 @@ async fn apply_session_command(
             let _ = reply.send(Ok(()));
             agent = rebuilt;
         }
+        SessionCommand::SetReasoningEffort { effort, reply } => {
+            // effort 不烤进 provider（URL/key 未变），故复用当前 `provider`，
+            // 只换 `AgentConfig.gen_params.reasoning_effort` 后重建 agent。
+            // 三样必须原样保留：session `Arc`、工具注册表、审批路径
+            // （checker + decision_rx）。与 `SetModel` 的重建语义一致。
+            let mut next_config = agent.config().clone();
+            next_config.gen_params.reasoning_effort = effort.clone();
+            let session_handle = agent.session_handle();
+            let tools = agent.tools();
+            let permission = agent.permission_checker();
+            let decision = agent.decision_rx();
+            let mut rebuilt = yi_agent_core::Agent::new(provider.clone(), tools, next_config)
+                .with_session_arc(session_handle);
+            if let (Some(checker), Some(rx)) = (permission, decision) {
+                rebuilt = rebuilt.with_permission(checker, rx);
+            }
+            tracing::info!(?effort, "session reasoning effort switched");
+            let _ = reply.send(Ok(()));
+            agent = rebuilt;
+        }
     }
     agent
 }
@@ -6439,6 +6650,9 @@ async fn run_thread_driver(
                                 ));
                             }
                             SessionCommand::SetModel { reply, .. } => {
+                                let _ = reply.send(Err("另有一个会话命令待执行".into()));
+                            }
+                            SessionCommand::SetReasoningEffort { reply, .. } => {
                                 let _ = reply.send(Err("另有一个会话命令待执行".into()));
                             }
                         }
@@ -6991,6 +7205,7 @@ async fn start_thread_core(
         board_project: board_project.map(str::to_string),
         card_id: card_id.map(str::to_string),
         model_ref,
+        reasoning_effort: None,
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -8995,6 +9210,8 @@ pub(crate) mod tests_support {
             api_url: "https://api.anthropic.com".to_string(),
             api_key: String::new(),
             model: super::tests_support::TEST_MODEL.to_string(),
+            api_style: yi_agent_core::ApiStyle::Auto,
+            reasoning_effort: None,
             max_turns: 20,
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
@@ -13058,6 +13275,7 @@ pub(crate) mod tests {
                 board_project: None,
                 card_id: None,
                 model_ref: None,
+                reasoning_effort: None,
             })
             .unwrap();
         // 全局索引指向该工作区（canonicalize 以对齐真实写入的路径形态）。
@@ -14195,6 +14413,96 @@ pub(crate) mod tests {
             "the rebuild must keep the decision channel"
         );
 
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a session command with no turn must not report a turn as finished"
+        );
+    }
+
+    /// 切 effort = 在两轮之间**重建** agent：只换 `gen_params.reasoning_effort`，
+    /// provider 原样复用（effort 不烤进 URL/key）。session `Arc`、工具注册表、
+    /// 审批路径三样必须原样保留（与 SetModel 同款重建语义）。
+    #[tokio::test]
+    async fn set_reasoning_effort_command_rebuilds_without_a_new_provider() {
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r); // 本测试不看 writer 输出
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        registry.register(Arc::new(FakeBash));
+        let tools: Arc<yi_agent_core::ToolRegistry> = Arc::new(registry);
+        let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+            yi_agent_core::permission::PermissionsConfig::default(),
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
+            Arc::new(|_cmd: &str| None),
+        ));
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
+        let rx_arc = Arc::new(Mutex::new(decision_rx));
+        let mut agent = yi_agent_core::Agent::new(provider.clone(), tools.clone(), config.clone())
+            .with_permission(checker.clone(), rx_arc.clone());
+        let original_handle = agent.session_handle();
+        let _keep_decision_tx = decision_tx;
+        assert_eq!(
+            agent.config().gen_params.reasoning_effort,
+            None,
+            "the fixture starts with no effort"
+        );
+
+        let (reply, answer) = oneshot::channel();
+        agent = apply_session_command(
+            agent,
+            SessionCommand::SetReasoningEffort {
+                effort: Some("high".into()),
+                reply,
+            },
+            &provider,
+            &config,
+            &store,
+            "thread-set-effort-1",
+            &hub,
+            &turn_tx,
+            &ThreadSession::new_status(),
+        )
+        .await;
+        answer
+            .await
+            .expect("the set-effort reply channel must be fulfilled")
+            .expect("rebuilding with a valid effort must succeed");
+
+        assert_eq!(
+            agent.config().gen_params.reasoning_effort.as_deref(),
+            Some("high"),
+            "the rebuilt agent must run the newly selected effort"
+        );
+        assert!(
+            Arc::ptr_eq(&original_handle, &agent.session_handle()),
+            "the rebuild must reuse the session Arc, not swap in a new one"
+        );
+        let kept_tools = agent.tools();
+        assert!(
+            Arc::ptr_eq(&kept_tools, &tools),
+            "the rebuild must keep the very same tool registry"
+        );
+        let kept_checker = agent
+            .permission_checker()
+            .expect("the rebuild must re-attach the permission checker");
+        assert!(
+            Arc::ptr_eq(&kept_checker, &checker),
+            "the rebuild must keep the approval checker"
+        );
+        let kept_rx = agent
+            .decision_rx()
+            .expect("the rebuild must re-attach the decision channel");
+        assert!(
+            Arc::ptr_eq(&kept_rx, &rx_arc),
+            "the rebuild must keep the decision channel"
+        );
         assert!(
             turn_rx.try_recv().is_err(),
             "a session command with no turn must not report a turn as finished"
@@ -15472,6 +15780,7 @@ pub(crate) mod tests {
             board_project: board_project.map(str::to_string),
             card_id: card_id.map(str::to_string),
             model_ref: None,
+            reasoning_effort: None,
         };
         crate::thread_store::ThreadStore::new(dir)
             .create(&meta)
@@ -15921,6 +16230,7 @@ pub(crate) mod tests {
                 board_project: None,
                 card_id: None,
                 model_ref: None,
+                reasoning_effort: None,
             })
             .unwrap();
         store
@@ -16025,6 +16335,7 @@ pub(crate) mod tests {
                 board_project: None,
                 card_id: None,
                 model_ref: None,
+                reasoning_effort: None,
             })
             .unwrap();
         // 一轮正常收尾过的历史。
@@ -18520,6 +18831,200 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// `thread/setReasoningEffort` 必须落盘 meta 的 `reasoning_effort` 并广播
+    /// `thread/reasoningEffortChanged`(跨客户端同步 effort 控件的唯一通道)。
+    /// 形状照 `thread_set_model_persists_and_reports_the_effective_model`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_set_reasoning_effort_persists_and_broadcasts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        // 只订阅这一个 thread:内容层/列表层的过滤都不能把它挡掉
+        // (effort 变更必须像 modelChanged 一样恒推)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/subscribe","params":{{"threadIds":["{tid}"]}}}}"#
+        ))
+        .await;
+        assert_eq!(
+            read_response(&mut h, 9).await["result"]["subscribed"][0].as_str(),
+            Some(tid.as_str())
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"high"}}}}"#
+        ))
+        .await;
+
+        // 响应与广播都在流上,顺序不保证;分别收敛。
+        let mut response: Option<serde_json::Value> = None;
+        let mut changed: Option<serde_json::Value> = None;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(20)) {
+                response = Some(v);
+            } else if v.get("method").and_then(|m| m.as_str())
+                == Some("thread/reasoningEffortChanged")
+            {
+                changed = Some(v);
+            }
+            if response.is_some() && changed.is_some() {
+                break;
+            }
+        }
+        let response = response.expect("setReasoningEffort must respond");
+        assert_eq!(response["result"]["ok"], true, "got {response}");
+        assert_eq!(
+            response["result"]["effort"], "high",
+            "the response must echo the applied effort: {response}"
+        );
+        let changed = changed.expect("must broadcast thread/reasoningEffortChanged");
+        assert_eq!(changed["params"]["thread_id"].as_str(), Some(tid.as_str()));
+        assert_eq!(changed["params"]["effort"].as_str(), Some("high"));
+
+        // 落盘:resume 走的正是这份 meta。
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("setReasoningEffort must persist meta");
+        assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("high"));
+        h.shutdown().await;
+    }
+
+    /// 与 `thread/setModel` 同档:切 effort 会改推理行为(计费/能力面),
+    /// `Observe` 客户端必须被拒 `-32014`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observe_client_cannot_set_reasoning_effort() {
+        let mut h = Harness::with_scope(Scope::Observe).await;
+        initialize(&mut h).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{"threadId":"t1","effort":"high"}}"#,
+        )
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32014, "got {v}");
+        h.shutdown().await;
+    }
+
+    /// 档位必须在七档白名单内:非法值 `-32602`,且**零副作用**(不落盘、不广播)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_effort_value_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"bogus"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 20).await;
+        assert_eq!(v["error"]["code"], -32602, "got {v}");
+
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("thread persists");
+        assert_eq!(
+            loaded.meta.reasoning_effort, None,
+            "rejection must not write"
+        );
+        h.shutdown().await;
+    }
+
+    /// 评审修正(important):显式清除覆盖后,解析链第 2 级 —— **条目默认** ——
+    /// 必须生效,而不是落到「未设置」。
+    ///
+    /// 同一份 meta(无覆盖 + 条目默认 `low`)在两条路径上必须落到同一结果:
+    /// 活线程的清理由 driver 把 `gen_params.reasoning_effort` 置 `None`、provider
+    /// 再自补其烤入的条目档;冷线程 resume 走工厂重建,工厂**不得**把
+    /// `resolve_effective` 刚带出的条目默认覆盖掉。故 resume 报出的生效值必须是
+    /// 条目默认 `low`,而非 `null`(修此前「重启后两手感」的内部不一致)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clearing_the_override_falls_back_to_the_entry_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        cfg.provider = "openai".to_string();
+        cfg.api_url = "https://a.example".to_string();
+        cfg.api_key = "key-a".to_string();
+        cfg.model = "model-a".to_string();
+        // 注入清单:全局默认即条目 A,且 A 带默认档 "low"(三个字段同源,免动 HOME)。
+        let mut catalog = model_catalog_entries(Some("A"));
+        catalog.models[0].reasoning_effort = Some("low".into());
+        let factory = production_factory(cfg.clone(), test_theme(), Arc::new(catalog));
+        let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        // (c) 无覆盖 + 条目默认 low → start 必须上报实际运行的 "low"
+        // (此前硬编码 null,与本会话真正跑的值不符)。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let mut start = None;
+        for _ in 0..4 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                start = Some(v);
+                break;
+            }
+        }
+        let start = start.expect("thread/start must respond");
+        let tid = start["result"]["thread_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            start["result"]["reasoning_effort"], "low",
+            "start must report the effort the built agent runs: {start}"
+        );
+
+        // (a) 设覆盖 high → 落盘。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"high"}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["result"]["ok"], true, "got {v}");
+
+        // (b) 清除覆盖(effort: null)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":null}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 4).await;
+        assert_eq!(v["result"]["ok"], true, "got {v}");
+        assert!(
+            v["result"]["effort"].is_null(),
+            "the response must echo the cleared override: {v}"
+        );
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("thread persists");
+        assert_eq!(
+            loaded.meta.reasoning_effort, None,
+            "a clear must drop the persisted override"
+        );
+
+        // (b) 冷 resume:工厂按 meta(无覆盖)重建 ⇒ 条目默认 low 必须生效。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resumed = None;
+        for _ in 0..24 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(5)) {
+                resumed = Some(v);
+                break;
+            }
+        }
+        let resumed = resumed.expect("thread/resume must respond");
+        assert_eq!(
+            resumed["result"]["reasoning_effort"], "low",
+            "resume with a cleared override must fall back to the entry default: {resumed}"
+        );
+        h.shutdown().await;
+    }
+
     /// 回归任务 7 评审 Finding 1:上报/落盘的 `model` 必须等于工厂**实际建出**的
     /// agent 的 `agent.config().model`,而不是另按清单再解析一次的结果。二者在
     /// 「工厂持有启动时快照、另解析却重读磁盘」时会分歧(运行期 `model/upsert`
@@ -19529,6 +20034,8 @@ pub(crate) mod tests {
                     api_url: "https://a.example".into(),
                     model: "model-a".into(),
                     api_key: "key-a".into(),
+                    api_style: None,
+                    reasoning_effort: None,
                 },
                 ModelEntry {
                     name: "B".into(),
@@ -19536,6 +20043,8 @@ pub(crate) mod tests {
                     api_url: "https://b.example".into(),
                     model: "model-b".into(),
                     api_key: "key-b".into(),
+                    api_style: None,
+                    reasoning_effort: None,
                 },
             ],
             default_model: default_model.map(str::to_string),
@@ -19607,6 +20116,85 @@ pub(crate) mod tests {
             built.agent.config().model,
             "model-a",
             "the override must not leak past with_session_model_ref"
+        );
+    }
+
+    /// 解析链 §4.2 的工厂一侧：会话 effort 覆盖优先于条目默认。
+    #[test]
+    fn a_session_effort_override_beats_the_entry_default() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut catalog = model_catalog_entries(Some("A"));
+        catalog.models[0].reasoning_effort = Some("low".into());
+        let factory = production_factory(test_config(), test_theme(), Arc::new(catalog));
+
+        // 会话覆盖 high → 胜过条目默认 low。
+        let built = with_session_reasoning_effort(Some("high".to_string()), || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .expect("bootstrap");
+        assert_eq!(
+            built.agent.config().gen_params.reasoning_effort.as_deref(),
+            Some("high"),
+            "the session override must win over the entry default"
+        );
+
+        // 未设槽位 → 跟随条目默认 low。
+        let built = factory(None, dir.path(), crate::thread_store::ThreadMode::Normal).unwrap();
+        assert_eq!(
+            built.agent.config().gen_params.reasoning_effort.as_deref(),
+            Some("low"),
+            "without an override the entry default must apply"
+        );
+
+        // 清除覆盖后的 resume 走的是**同一入参**：`thread/resume` 把 meta 的
+        // `None` 直接交给槽位，故「清除」与「从未设过」在工厂侧不可区分——这正是
+        // 要求的收敛：二者都必须保留条目默认 low（第 2 级），而不是「不发该字段」。
+        // 活线程的清除路径同样落到条目默认（driver 把 gen_params 置空后 provider
+        // 自补其烤入的同一条目档），两条路径手感一致。
+        let cleared = with_session_reasoning_effort(None, || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .unwrap();
+        assert_eq!(
+            cleared
+                .agent
+                .config()
+                .gen_params
+                .reasoning_effort
+                .as_deref(),
+            Some("low"),
+            "a cleared override must fall back to the entry default, not to unset"
+        );
+    }
+
+    /// 条目无默认 + 未设覆盖 ⇒ 不发该字段(零回归)。
+    #[test]
+    fn no_effort_anywhere_stays_unset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory = production_factory(test_config(), test_theme(), test_catalog());
+        let built = factory(None, dir.path(), crate::thread_store::ThreadMode::Normal).unwrap();
+        assert_eq!(built.agent.config().gen_params.reasoning_effort, None);
+    }
+
+    /// 覆盖不得跨调用泄漏（与 `model_ref` 同一契约）。
+    #[test]
+    fn the_session_effort_override_does_not_leak_across_calls() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory = production_factory(test_config(), test_theme(), test_catalog());
+        let built = with_session_reasoning_effort(Some("max".to_string()), || {
+            factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
+        })
+        .unwrap();
+        assert_eq!(
+            built.agent.config().gen_params.reasoning_effort.as_deref(),
+            Some("max")
+        );
+
+        let built = factory(None, dir.path(), crate::thread_store::ThreadMode::Normal).unwrap();
+        assert_eq!(
+            built.agent.config().gen_params.reasoning_effort,
+            None,
+            "the override must not leak past with_session_reasoning_effort"
         );
     }
 

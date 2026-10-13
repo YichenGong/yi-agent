@@ -80,6 +80,7 @@ mod tests {
             output_tokens: output,
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            reasoning_tokens: None,
         }
     }
 
@@ -120,12 +121,14 @@ mod tests {
             output_tokens: 50,
             cache_creation_input_tokens: Some(20),
             cache_read_input_tokens: Some(10),
+            reasoning_tokens: None,
         };
         let u2 = TokenUsage {
             input_tokens: 200,
             output_tokens: 30,
             cache_creation_input_tokens: Some(5),
             cache_read_input_tokens: Some(40),
+            reasoning_tokens: None,
         };
         t.record("m", &u1);
         t.record("m", &u2);

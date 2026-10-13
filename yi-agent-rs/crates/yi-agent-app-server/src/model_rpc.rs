@@ -56,6 +56,9 @@ pub fn handle_model_request_at(
 
 /// 当前默认实际解析到哪里：命中清单条目就用条目，否则回退 cfg（`.env`）。
 /// key 一律只出掩码——与 [`entry_view`] 同一条安全约定。
+///
+/// `api_style` / `reasoning_effort` 同 `resolve_effective` 的语义：命中条目即
+/// 取条目的值（缺省 = 未设置），否则回退 cfg。二者是「生效值」，UI 据此回显。
 fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
     match effective_entry(catalog, None) {
         Some(entry) => json!({
@@ -64,6 +67,8 @@ fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
             "provider": entry.provider.as_str(),
             "api_url": entry.api_url,
             "model": entry.model,
+            "api_style": entry.api_style,
+            "reasoning_effort": entry.reasoning_effort,
             "has_key": !entry.api_key.is_empty(),
             "api_key_masked": mask_key(&entry.api_key),
         }),
@@ -73,6 +78,8 @@ fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
             "provider": cfg.provider,
             "api_url": cfg.api_url,
             "model": cfg.model,
+            "api_style": cfg.api_style.as_str(),
+            "reasoning_effort": cfg.reasoning_effort,
             "has_key": !cfg.api_key.is_empty(),
             "api_key_masked": mask_key(&cfg.api_key),
         }),
@@ -87,6 +94,8 @@ fn entry_view(entry: &ModelEntry) -> Value {
         "provider": entry.provider.as_str(),
         "api_url": entry.api_url,
         "model": entry.model,
+        "api_style": entry.api_style,
+        "reasoning_effort": entry.reasoning_effort,
         "has_key": !entry.api_key.is_empty(),
         "api_key_masked": mask_key(&entry.api_key),
     })
@@ -113,6 +122,26 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
     if model.trim().is_empty() {
         return Err(RpcError::invalid_model("model must not be empty"));
     }
+    // 通道两项：缺省/null/非字符串都按「未声明」处理（`optional_string_field`）；
+    // 一旦给了字符串就必须是已知值——未知值宁可报错，也不静默落盘一个打错的值
+    // （`ApiStyle::parse` 会把未知值吞成 `auto`，那是解析期的语义，不是写入期的）。
+    let api_style = optional_string_field(params, "api_style");
+    if let Some(v) = &api_style {
+        if !matches!(v.as_str(), "auto" | "responses" | "chat") {
+            return Err(RpcError::invalid_model(
+                "api_style must be auto|responses|chat",
+            ));
+        }
+    }
+    let reasoning_effort = optional_string_field(params, "reasoning_effort");
+    if let Some(v) = &reasoning_effort {
+        if !matches!(
+            v.as_str(),
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            return Err(RpcError::invalid_model("unknown reasoning_effort"));
+        }
+    }
 
     let mut catalog = load_catalog_from(path);
     // Key semantics: absent (or `null`) keeps the stored value; `""` clears it;
@@ -132,6 +161,8 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
         api_url,
         model,
         api_key,
+        api_style,
+        reasoning_effort,
     };
     match existing {
         Some(i) => catalog.models[i] = entry,
@@ -222,6 +253,9 @@ fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
         api_url: cfg.api_url.clone(),
         model: cfg.model.clone(),
         api_key: cfg.api_key.clone(),
+        // 兜底层 cfg 的通道选择随条目固化（与 upsert 的默认语义一致）。
+        api_style: Some(cfg.api_style.as_str().to_string()),
+        reasoning_effort: cfg.reasoning_effort.clone(),
     });
     catalog.default_model = Some(name.clone());
     save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
@@ -253,6 +287,16 @@ fn string_field(params: &Value, field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// `Option<String>` 入参的宽松读取：缺失 / `null` / 非字符串 → `None`；
+/// 字符串（含空串）→ `Some`。
+///
+/// 用于 `api_style` / `reasoning_effort` 这类「未声明即默认」的字段：非字符串
+/// 既不是可用的值，也不构成拒绝理由，因此按「未声明」处理。空串会原样返回，
+/// 由调用方的白名单校验决定接受与否——不在这里替调用方猜意图。
+fn optional_string_field(params: &Value, key: &str) -> Option<String> {
+    params.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +325,8 @@ mod tests {
             api_url: "https://env.example".to_string(),
             api_key: "env-secret-9999".to_string(),
             model: "env-model".to_string(),
+            api_style: yi_agent_core::ApiStyle::Auto,
+            reasoning_effort: None,
             max_turns: 20,
             max_resident_subagents: 8,
             max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
@@ -528,6 +574,8 @@ mod tests {
             api_url: "https://b".to_string(),
             model: "mb".to_string(),
             api_key: String::new(),
+            api_style: None,
+            reasoning_effort: None,
         });
         catalog.default_model = Some("gone".to_string());
         yi_agent_runtime::models::save_catalog_to(&path, &catalog).unwrap();
@@ -590,5 +638,179 @@ mod tests {
         let err = handle_model_request_at(&path, "model/importEnv", &json!({}), &cfg).unwrap_err();
         assert_eq!(err.data.unwrap()["code"], "invalid_model");
         assert!(!path.exists(), "a rejected import must not write a catalog");
+    }
+
+    #[test]
+    fn upsert_persists_and_lists_the_two_new_optional_fields() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({
+                "name": "A", "provider": "openai", "api_url": "u", "model": "m",
+                "api_style": "responses", "reasoning_effort": "low",
+            }),
+        )
+        .unwrap();
+        // 条目视图把两键原样回给前端。
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(list["models"][0]["api_style"], "responses");
+        assert_eq!(list["models"][0]["reasoning_effort"], "low");
+        // 且真的落进了清单文件（下一次独立读取仍能看到）。
+        let reloaded = yi_agent_runtime::models::load_catalog_from(&path);
+        assert_eq!(reloaded.models[0].api_style.as_deref(), Some("responses"));
+        assert_eq!(reloaded.models[0].reasoning_effort.as_deref(), Some("low"));
+    }
+
+    /// `effective` 也带生效的 `api_style` / `reasoning_effort`（任务 2 的 deferred
+    /// Minor）：命中条目即取条目值，供 UI 回显「当前默认跑在什么档位/通道上」。
+    #[test]
+    fn effective_carries_api_style_and_reasoning_effort_from_the_entry() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({
+                "name": "A", "provider": "openai", "api_url": "u", "model": "m",
+                "api_style": "chat", "reasoning_effort": "none",
+            }),
+        )
+        .unwrap();
+        call(&path, "model/setDefault", json!({ "name": "A" })).unwrap();
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(list["effective"]["source"], "catalog");
+        assert_eq!(list["effective"]["api_style"], "chat");
+        assert_eq!(list["effective"]["reasoning_effort"], "none");
+    }
+
+    /// 未命中条目时回退 cfg：`api_style` 出解析后串，`reasoning_effort` 出 cfg 值。
+    #[test]
+    fn effective_fallback_reports_the_cfg_values() {
+        let (_dir, path) = catalog_path();
+        let out = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(out["effective"]["source"], "env");
+        assert_eq!(out["effective"]["api_style"], "auto");
+        assert!(out["effective"]["reasoning_effort"].is_null());
+    }
+
+    #[test]
+    fn upsert_without_the_new_fields_leaves_them_unset() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert!(list["models"][0]["api_style"].is_null());
+        assert!(list["models"][0]["reasoning_effort"].is_null());
+    }
+
+    #[test]
+    fn upsert_rejects_an_unknown_api_style_without_writing() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let err = call(
+            &path,
+            "model/upsert",
+            json!({
+                "name": "B", "provider": "openai", "api_url": "u", "model": "m",
+                "api_style": "grpc",
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.data.unwrap()["code"], "invalid_model");
+        // 一个字节都不写：仍是原来那一条。
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(list["models"].as_array().unwrap().len(), 1);
+        assert_eq!(list["models"][0]["name"], "A");
+    }
+
+    #[test]
+    fn upsert_rejects_an_unknown_reasoning_effort_without_writing() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let err = call(
+            &path,
+            "model/upsert",
+            json!({
+                "name": "B", "provider": "openai", "api_url": "u", "model": "m",
+                "reasoning_effort": "ultra",
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.data.unwrap()["code"], "invalid_model");
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(list["models"].as_array().unwrap().len(), 1);
+        assert_eq!(list["models"][0]["name"], "A");
+    }
+
+    #[test]
+    fn upsert_accepts_every_documented_effort_tier() {
+        let (_dir, path) = catalog_path();
+        for (i, tier) in ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .iter()
+            .enumerate()
+        {
+            let name = format!("t{i}");
+            call(
+                &path,
+                "model/upsert",
+                json!({
+                    "name": name, "provider": "openai", "api_url": "u", "model": "m",
+                    "reasoning_effort": tier,
+                }),
+            )
+            .unwrap_or_else(|e| panic!("tier {tier} must be accepted: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn upsert_accepts_the_three_api_styles() {
+        let (_dir, path) = catalog_path();
+        for (i, style) in ["auto", "responses", "chat"].iter().enumerate() {
+            let name = format!("s{i}");
+            call(
+                &path,
+                "model/upsert",
+                json!({
+                    "name": name, "provider": "openai", "api_url": "u", "model": "m",
+                    "api_style": style,
+                }),
+            )
+            .unwrap_or_else(|e| panic!("api_style {style} must be accepted: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn upsert_treats_a_null_new_field_as_unset() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({
+                "name": "A", "provider": "openai", "api_url": "u", "model": "m",
+                "api_style": null, "reasoning_effort": null,
+            }),
+        )
+        .unwrap();
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert!(list["models"][0]["api_style"].is_null());
+        assert!(list["models"][0]["reasoning_effort"].is_null());
+    }
+
+    #[test]
+    fn upsert_treats_a_non_string_new_field_as_unset() {
+        let (_dir, path) = catalog_path();
+        // 非字符串既不是合法值也不是拒绝理由：按「未声明」处理（契约见
+        // `optional_string_field`）。
+        call(
+            &path,
+            "model/upsert",
+            json!({
+                "name": "A", "provider": "openai", "api_url": "u", "model": "m",
+                "api_style": 42, "reasoning_effort": ["low"],
+            }),
+        )
+        .unwrap();
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert!(list["models"][0]["api_style"].is_null());
+        assert!(list["models"][0]["reasoning_effort"].is_null());
     }
 }

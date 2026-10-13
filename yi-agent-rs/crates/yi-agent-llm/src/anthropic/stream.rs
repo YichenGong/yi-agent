@@ -228,6 +228,7 @@ where
                         output_tokens,
                         cache_creation_input_tokens: None,
                         cache_read_input_tokens: None,
+                        reasoning_tokens: None,
                     })));
                 }
 
@@ -264,6 +265,7 @@ where
                     output_tokens: 0,
                     cache_creation_input_tokens,
                     cache_read_input_tokens,
+                    reasoning_tokens: None,
                 })))
             }
             "message_stop" | "ping" => Ok(None),

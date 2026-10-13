@@ -3,10 +3,11 @@ import {
   isModelNotFound,
   listModels,
   setThreadModel,
+  setThreadReasoningEffort,
   type ModelList,
   type ModelRpc,
 } from "../lib/models";
-import { buildModelOptions } from "../lib/modelPicker";
+import { buildEffortOptions, buildModelOptions, entryEffortOf, overrideFromEffective } from "../lib/modelPicker";
 
 /**
  * 宿主注入的模型 RPC 接缝。
@@ -42,7 +43,9 @@ export function ModelPicker({
   threadId,
   currentRef,
   currentModel,
+  currentEffort = null,
   onChanged,
+  onEffortChanged,
 }: {
   call?: ModelPickerCall;
   /** 当前会话 id；`null`（无会话）时置灰，避免对空会话发写。 */
@@ -51,6 +54,16 @@ export function ModelPicker({
   currentRef: string | null;
   /** 会话当前实际生效的模型标识（宿主解析后）；未知为 `null`。 */
   currentModel: string | null;
+  /**
+   * 会话当前的 effort：`thread/reasoningEffortChanged` 推送的覆盖，或 thread 回包
+   * 落下的**生效值**（`null` = 未上报 / 无覆盖）。
+   *
+   * 两种来源在「无覆盖」时长得一样（回包的生效值 = 条目默认），所以本组件不直接
+   * 把它当作覆盖：先用 {@link overrideFromEffective} 与条目默认比对折回覆盖
+   * （无覆盖 ⇒ `null`），再交给 `buildEffortOptions` 决定打勾与「继承 X」标签。
+   * 否则冷启动会把条目默认档错误地打勾成「已选覆盖」。
+   */
+  currentEffort?: string | null;
   /**
    * 写给成功后回调：`threadId` 是本次渲染对应的会话，`ref` 是新的会话引用
    * （`null` = 跟随默认），`model` 是服务端返回的生效模型标识。父级据此更新
@@ -61,6 +74,11 @@ export function ModelPicker({
    * 头上。以本组件渲染时的 `threadId` 为准，切换也不会错位。
    */
   onChanged: (threadId: string, ref: string | null, model: string | null) => void;
+  /**
+   * effort 写成功后回调：`threadId` 是本次渲染对应的会话，`effort` 是服务端返回的
+   * **已应用**档位（`null` = 已清除覆盖）。父级据此更新该会话的 effort 值。
+   */
+  onEffortChanged?: (threadId: string, effort: string | null) => void;
 }) {
   // 接缝在运行时就是 ModelRpc 的形状；一次性补回调用方自选返回类型的泛型能力。
   const rpc = call as ModelRpc | undefined;
@@ -70,6 +88,10 @@ export function ModelPicker({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const [effortOpen, setEffortOpen] = useState(false);
+  const [effortBusy, setEffortBusy] = useState(false);
+  const [effortError, setEffortError] = useState<string | null>(null);
+  const effortTriggerRef = useRef<HTMLButtonElement>(null);
 
   // 读清单一次（接缝身份变化才重读）：下拉项要与设置页的清单保持一致。
   useEffect(() => {
@@ -112,22 +134,35 @@ export function ModelPicker({
     };
   }, [open, rpc]);
 
-  // Escape 关闭下拉并把焦点交回触发按钮。
+  // Escape 关闭任一打开的下拉，并把焦点交回**那个**下拉的触发按钮（不是模型按钮）：
+  // 在 effort 菜单里按 Escape 时把焦点甩到模型按钮会让人以为按错了控件。
   useEffect(() => {
-    if (!open) return;
+    if (!open && !effortOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
+        const restore = effortOpen ? effortTriggerRef.current : triggerRef.current;
         setOpen(false);
-        triggerRef.current?.focus();
+        setEffortOpen(false);
+        restore?.focus();
       }
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [open]);
+  }, [open, effortOpen]);
 
   const options = buildModelOptions(catalog, currentRef, currentModel);
   const current = options.find((o) => o.selected) ?? options[0];
+  // 条目默认档由本组件读到的清单现算（与模型下拉同一份 catalog、同一个引用选择
+  // 口径）：无覆盖时控件显示「继承 X」，正是请求会带的那一档。
+  const entryDefault = entryEffortOf(catalog, currentRef);
+  // 回包/推送带来的是**生效值**：无覆盖时它恰好等于条目默认，故先折回「覆盖」，
+  // 否则冷启动会把条目默认档错误地打勾。`thread/reasoningEffortChanged` 的推送
+  // 本身就是覆盖值，若它也恰好等于条目默认，同样按「无覆盖」显示——两种情形在
+  // 控件上等价（「继承 X」的 X 与生效值同字面）。
+  const effortOverride = overrideFromEffective(currentEffort, entryDefault);
+  const effortOptions = buildEffortOptions(effortOverride, entryDefault);
+  const currentEffortOption = effortOptions.find((o) => o.selected) ?? effortOptions[0];
 
   const choose = async (value: string | null) => {
     setOpen(false);
@@ -148,7 +183,25 @@ export function ModelPicker({
     }
   };
 
+  const chooseEffort = async (value: string | null) => {
+    setEffortOpen(false);
+    effortTriggerRef.current?.focus();
+    if (!rpc || !threadId || effortBusy) return;
+    setEffortBusy(true);
+    setEffortError(null);
+    try {
+      // 以服务端回包为准：`effort` 是重建 agent 成功后才落盘、才回传的已应用档位。
+      const { effort } = await setThreadReasoningEffort(rpc, threadId, value);
+      onEffortChanged?.(threadId, effort);
+    } catch (e) {
+      setEffortError(saveErrorText(e));
+    } finally {
+      setEffortBusy(false);
+    }
+  };
+
   return (
+    <div className="flex items-center gap-1">
     <div className="relative inline-block">
       <button
         ref={triggerRef}
@@ -192,6 +245,54 @@ export function ModelPicker({
           {error}
         </p>
       )}
+    </div>
+
+    {/* 会话级 effort 覆盖（与模型下拉同风格的小控件）。改的是**当前会话**的档位，
+        显示生效值：会话覆盖 ?? 条目默认 ?? 未设置。 */}
+    <div className="relative inline-block">
+      <button
+        ref={effortTriggerRef}
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded={effortOpen}
+        aria-label={`推理档位：${currentEffortOption.label}`}
+        disabled={!rpc || !threadId}
+        onClick={() => setEffortOpen((v) => !v)}
+        className="max-w-[10rem] max-md:max-w-[8rem] truncate rounded-full border border-line-strong px-2 py-0.5 text-xs font-medium text-fg-muted hover:bg-raised disabled:opacity-50"
+      >
+        {currentEffortOption.label}
+      </button>
+
+      {effortOpen && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setEffortOpen(false)} />
+          <div
+            role="menu"
+            className="absolute right-0 bottom-full z-20 mb-1 max-h-64 overflow-y-auto rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+          >
+            {effortOptions.map((option) => (
+              <button
+                key={option.value ?? "__unset__"}
+                type="button"
+                role="menuitemradio"
+                aria-checked={option.selected}
+                onClick={() => void chooseEffort(option.value)}
+                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+              >
+                <span className="w-3 text-fg-muted">{option.selected ? "✓" : ""}</span>
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+
+      {effortError !== null && (
+        <p role="alert" className="absolute right-0 bottom-full mb-1 text-xs text-red-400">
+          {effortError}
+        </p>
+      )}
+    </div>
     </div>
   );
 }

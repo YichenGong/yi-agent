@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::message::{ContentBlock, Message, Role};
 use crate::provider::{
-    GenParams, Provider, ProviderError, ProviderEvent, ProviderRequest, StopReason, StreamEnd,
-    TokenUsage,
+    GenParams, NoticeLevel, Provider, ProviderError, ProviderEvent, ProviderRequest, ReasoningKind,
+    StopReason, StreamEnd, TokenUsage,
 };
 use crate::tool::{ToolEvent, ToolRegistry, ToolResult};
 
@@ -269,6 +269,18 @@ pub enum AgentEvent {
     Usage {
         model: String,
         usage: TokenUsage,
+    },
+    /// Streamed chain-of-thought delta for display only; never merged into the
+    /// assistant content or replayed into later turns.
+    ReasoningDelta {
+        text: String,
+        kind: ReasoningKind,
+    },
+    /// Non-fatal runtime notice (channel fallback / effort downgrade), rendered at
+    /// status-line level.
+    Notice {
+        level: NoticeLevel,
+        text: String,
     },
     /// Heuristic estimate of prefill (input) tokens, emitted before the
     /// provider returns real usage. Lets the status bar show activity.
@@ -1605,6 +1617,12 @@ async fn accumulate_provider_stream(
             ProviderEvent::ToolUseDelta { partial_json, .. } => {
                 let _ = tx.try_send(AgentEvent::DecodeDelta(partial_json));
             }
+            ProviderEvent::ReasoningDelta { text, kind } => {
+                let _ = tx.try_send(AgentEvent::ReasoningDelta { text, kind });
+            }
+            ProviderEvent::Notice { level, text } => {
+                let _ = tx.try_send(AgentEvent::Notice { level, text });
+            }
             _ => {}
         },
         idle_timeout,
@@ -1679,6 +1697,61 @@ mod tests {
         };
         assert!(
             matches!(event, AgentEvent::ModelChanged { ref model } if model == "claude-opus-4-1")
+        );
+    }
+
+    /// The provider-level `ReasoningDelta` / `Notice` events must survive the
+    /// agent's event translation.
+    ///
+    /// Before this, `accumulate_provider_stream` matched only text / usage /
+    /// tool-use deltas and swallowed the rest with `_ => {}`, so the two new
+    /// provider events stopped dead at the core layer and no consumer (TUI,
+    /// app-server, headless drain) could ever see them. The forward-only
+    /// contract of `accumulate_stream` (Task 1) was therefore untestable until
+    /// the agent carried the events through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_reasoning_and_notice_events_reach_the_agent_stream() {
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ReasoningDelta {
+                text: "step one".into(),
+                kind: ReasoningKind::Content,
+            },
+            ProviderEvent::Notice {
+                level: NoticeLevel::Info,
+                text: "已自动改用 Chat".into(),
+            },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ReasoningDelta { text, kind }
+                    if text == "step one" && *kind == ReasoningKind::Content
+            )),
+            "the reasoning delta must be forwarded, got: {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::Notice { level: NoticeLevel::Info, text }
+                    if text == "已自动改用 Chat"
+            )),
+            "the notice must be forwarded, got: {events:?}"
+        );
+        // Forward-only: reasoning must never be merged into assistant content.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AssistantText(t) if t.contains("step one"))),
+            "reasoning must not leak into assistant text: {events:?}"
         );
     }
 

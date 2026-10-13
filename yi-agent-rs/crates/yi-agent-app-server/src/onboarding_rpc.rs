@@ -127,6 +127,9 @@ fn import_into_catalog(
         api_url: settings.api_url.clone(),
         model: settings.model.clone(),
         api_key: settings.api_key.clone(),
+        // 引导固化的是 .env 的四个字段，通道两项不在此声明 → 保持默认。
+        api_style: None,
+        reasoning_effort: None,
     });
     catalog.default_model = Some(name.clone());
     save_catalog_to(models_path, &catalog).map_err(|e| e.to_string())?;
@@ -172,6 +175,8 @@ mod tests {
             api_url: "https://api.anthropic.com".to_string(),
             api_key: String::new(),
             model: "cfg-model".to_string(),
+            api_style: yi_agent_core::ApiStyle::Auto,
+            reasoning_effort: None,
             max_turns: 20,
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,

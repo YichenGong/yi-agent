@@ -78,6 +78,16 @@ pub enum SessionCommand {
         model_ref: Option<String>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// 切换该 thread 的会话 reasoning effort 覆盖：写路径已完成 meta 更新，
+    /// 这里只负责把新档位写进 `AgentConfig.gen_params.reasoning_effort` 并重建 agent。
+    ///
+    /// 与 [`SessionCommand::SetModel`] 的区别：effort **不**烤进 provider（URL/key
+    /// 未变），故复用当前 provider，无需重建。
+    SetReasoningEffort {
+        /// 新档位；`None` = 清除覆盖（回落条目默认）。
+        effort: Option<String>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// `/compact` 的三种结果。`NotReduced` 是"历史太短、无需压缩"，**不是错误**。
@@ -139,6 +149,7 @@ mod tests {
             SessionCommand::Clear { reply } => reply.send(Ok(())).unwrap(),
             SessionCommand::Compact { .. } => panic!("expected Clear"),
             SessionCommand::SetModel { .. } => panic!("expected Clear"),
+            SessionCommand::SetReasoningEffort { .. } => panic!("expected Clear"),
         }
         assert_eq!(answer.await.unwrap(), Ok(()));
     }

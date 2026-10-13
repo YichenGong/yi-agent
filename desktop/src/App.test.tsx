@@ -207,6 +207,9 @@ vi.mock("./lib/rpc", () => ({
         if (state.failSet) throw { code: -32011, message: "unknown thread" };
         return {};
       }
+      if (method === "thread/setReasoningEffort") {
+        return { ok: true, effort: (params as { effort: string | null }).effort };
+      }
       if (method === "thread/clear") return {};
       if (method === "thread/compact") return { status: "compacted" };
       if (method === "board/list") return { boards: state.boards };
@@ -3617,5 +3620,78 @@ describe("App mobile reopen keeps the selection", () => {
     await waitFor(() =>
       expect(resumedOn(clients[clients.length - 1])).toContain("t1"),
     );
+  });
+});
+
+describe("App reasoning effort wiring", () => {
+  it("writes the session override and reflects the server-pushed effort", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: /推理档位/ }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "high" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/setReasoningEffort",
+        params: { threadId: "t1", effort: "high" },
+      }),
+    );
+    // 以回包为准更新控件。
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /推理档位/ }).textContent).toContain("high"),
+    );
+
+    // 另一客户端改了 effort：服务端广播，桌面控件回显。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({ method: "thread/reasoningEffortChanged", params: { thread_id: "t1", effort: "xhigh" } });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /推理档位/ }).textContent).toContain("xhigh"),
+    );
+  });
+});
+
+describe("App reasoning rendering", () => {
+  it("keeps each turn's CoT block before that turn's answer", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const notify = (n: unknown) =>
+      act(() => {
+        for (const cb of state.notifHandlers) cb(n);
+      });
+
+    // 真实顺序：开启项(user) → CoT 增量 → 开启项(agent) → 正文增量。
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "userMessage", id: "user-1", text: "q1" } } });
+    notify({ method: "thread/reasoningDelta", params: { thread_id: "t1", text: "T1", kind: "Content" } });
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "agentMessage", id: "a1", text: "" } } });
+    notify({ method: "item/delta", params: { thread_id: "t1", item_id: "a1", delta: "answer-one" } });
+
+    // 第二轮。
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "userMessage", id: "user-2", text: "q2" } } });
+    notify({ method: "thread/reasoningDelta", params: { thread_id: "t1", text: "T2", kind: "Content" } });
+    notify({ method: "item/started", params: { thread_id: "t1", item: { type: "agentMessage", id: "a2", text: "" } } });
+    notify({ method: "item/delta", params: { thread_id: "t1", item_id: "a2", delta: "answer-two" } });
+
+    // 两轮的 CoT 各自成块，不是尾部一个合并块。
+    const blocks = screen.getAllByTestId("reasoning-block");
+    expect(blocks).toHaveLength(2);
+    const q1 = screen.getByText("q1");
+    const a1 = screen.getByText("answer-one");
+    const q2 = screen.getByText("q2");
+    const a2 = screen.getByText("answer-two");
+    const before = (a: Element, b: Element) =>
+      Boolean(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    // q1 | 思考[T1] | A1 | q2 | 思考[T2] | A2
+    expect(before(q1, blocks[0])).toBe(true);
+    expect(before(blocks[0], a1)).toBe(true);
+    expect(before(a1, q2)).toBe(true);
+    expect(before(q2, blocks[1])).toBe(true);
+    expect(before(blocks[1], a2)).toBe(true);
   });
 });

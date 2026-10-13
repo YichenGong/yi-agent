@@ -136,6 +136,7 @@ impl From<AnthropicGenParams> for yi_agent_core::GenParams {
             max_tokens: p.max_tokens,
             top_p: p.top_p,
             stop_sequences: p.stop_sequences,
+            reasoning_effort: None,
         }
     }
 }

@@ -7,6 +7,7 @@ import {
   setDefaultModel,
   setSubagentModel,
   setThreadModel,
+  setThreadReasoningEffort,
   upsertModel,
 } from "./models";
 
@@ -151,6 +152,49 @@ describe("setThreadModel", () => {
   it("falls back to an empty model when the server omits it", async () => {
     const rpc = vi.fn().mockResolvedValue({ ok: true });
     await expect(setThreadModel(rpc, "t1", "A")).resolves.toEqual({ model: "" });
+  });
+});
+
+describe("upsertModel channel fields", () => {
+  it("omits api_style / reasoning_effort when the caller leaves them undefined", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true });
+    await upsertModel(rpc, { name: "A", provider: "anthropic", api_url: "u", model: "m" });
+    expect(rpc.mock.calls[0][1]).not.toHaveProperty("api_style");
+    expect(rpc.mock.calls[0][1]).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("passes api_style / reasoning_effort through when supplied", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true });
+    await upsertModel(rpc, {
+      name: "A",
+      provider: "openai",
+      api_url: "u",
+      model: "m",
+      api_style: "responses",
+      reasoning_effort: "high",
+    });
+    expect(rpc).toHaveBeenCalledWith("model/upsert", {
+      name: "A",
+      provider: "openai",
+      api_url: "u",
+      model: "m",
+      api_style: "responses",
+      reasoning_effort: "high",
+    });
+  });
+});
+
+describe("setThreadReasoningEffort", () => {
+  it("sets the override scoped to the thread and returns the applied effort", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true, effort: "high" });
+    await expect(setThreadReasoningEffort(rpc, "t1", "high")).resolves.toEqual({ effort: "high" });
+    expect(rpc).toHaveBeenCalledWith("thread/setReasoningEffort", { threadId: "t1", effort: "high" });
+  });
+
+  it("clears the override with an explicit null and reports no override", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true, effort: null });
+    await expect(setThreadReasoningEffort(rpc, "t1", null)).resolves.toEqual({ effort: null });
+    expect(rpc).toHaveBeenCalledWith("thread/setReasoningEffort", { threadId: "t1", effort: null });
   });
 });
 

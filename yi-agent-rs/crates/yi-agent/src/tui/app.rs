@@ -186,7 +186,8 @@ fn snapshot_for_tests() -> TuiConfigSnapshot {
 }
 
 /// An empty model catalog for tests that thread one through the TUI wrappers
-/// but never exercise `/model`. Kept in memory: tests must not touch `HOME`.
+/// but never exercise `/model` or `/effort`. Kept in memory: tests must not
+/// touch `HOME`.
 #[cfg(test)]
 fn catalog_for_tests() -> yi_agent_runtime::models::ModelCatalog {
     yi_agent_runtime::models::ModelCatalog::default()
@@ -342,6 +343,10 @@ fn run_loop<B: Backend, E: EventSource>(
     // 同一个 model 串，且 model 串未必等于显示名，故「当前选中」只能按显示名判定。
     // 启动时为 `None`：TUI 跟随清单 `default_model`。
     let mut current_model_ref: Option<String> = None;
+    // 本会话的 effort 覆盖（`/effort <tier>` 写入，`/effort default` 清空）。
+    // 生效值不缓存：每次现算（`resolve_effort_state`），因为清单与覆盖都会在
+    // 会话中变化。启动时无覆盖，与 TUI 没有持久化的 thread meta 一致。
+    let mut effort_override: Option<String> = None;
     let mut pending_quit = false;
     let mut popup: Option<CommandPopup> = None;
     let mut queued = crate::tui::queued::DeliveredInterjections::new();
@@ -705,6 +710,13 @@ fn run_loop<B: Backend, E: EventSource>(
                 let history_text_width =
                     history.text_width(history_area.width, history_area.height);
                 let max_offset = history.max_scroll_offset(history_text_width, history_area.height);
+                // 每次按键现算:覆盖刚被 `/effort` 改过,清单也可能被 `/model`
+                // 选中新条目——两者都不该缓存住。
+                let (current_effort, effort_source) = resolve_effort_state(
+                    effort_override.as_deref(),
+                    catalog,
+                    current_model_ref.as_deref(),
+                );
                 match handle_key(
                     key,
                     input,
@@ -728,6 +740,8 @@ fn run_loop<B: Backend, E: EventSource>(
                     &current_model,
                     current_model_ref.as_deref(),
                     catalog,
+                    current_effort.as_deref(),
+                    effort_source,
                 ) {
                     KeyOutcome::Quit => break,
                     KeyOutcome::Submit(_) => {
@@ -738,6 +752,12 @@ fn run_loop<B: Backend, E: EventSource>(
                         // 「← 当前」标记使用;`/model default` 清空(跟随
                         // default_model)。只有命令真的进了 channel 才更新。
                         current_model_ref = selection;
+                    }
+                    KeyOutcome::EffortChanged(effort) => {
+                        // `/effort <tier>` 已下发:记下本会话覆盖。driver 收到的
+                        // 就是这个值,故 TUI 侧不需要回读;下发失败的档位会被
+                        // driver 以 `Notice` 告知(渲染在状态行)。
+                        effort_override = effort;
                     }
                     KeyOutcome::OpenAgentDetail(task_id) => {
                         if let Ok(socket) = crate::runtime_socket_for(&workdir) {
@@ -1782,6 +1802,8 @@ enum KeyOutcome {
     Submit(String),
     /// `/model` 已成功下发:携带用户选中的清单显示名（`None` = 清覆盖/跟随默认）。
     ModelSelected(Option<String>),
+    /// `/effort` 已成功下发:携带本次要写入的档位（`None` = 清覆盖）。
+    EffortChanged(Option<String>),
     /// Open the subagent tab directly on a task's read-only detail.
     OpenAgentDetail(String),
 }
@@ -1817,6 +1839,9 @@ fn handle_key(
     // 用户选中的清单显示名（`None` = 跟随清单 default_model）。
     current_model_ref: Option<&str>,
     catalog: &yi_agent_runtime::models::ModelCatalog,
+    // 当前生效 effort 与来源（run_loop 维护；见 `EffortSource`）。
+    current_effort: Option<&str>,
+    effort_source: EffortSource,
 ) -> KeyOutcome {
     // Check if there's a pending permission request. Clone the small fields
     // we need so the immutable borrow ends before we mutate history.
@@ -1991,6 +2016,8 @@ fn handle_key(
                             model,
                             current_model_ref,
                             catalog,
+                            current_effort,
+                            effort_source,
                         );
                     } else {
                         // No command selected (empty filter) — show error
@@ -2077,6 +2104,8 @@ fn handle_key(
                         model,
                         current_model_ref,
                         catalog,
+                        current_effort,
+                        effort_source,
                     );
                 } else {
                     // Unknown slash command
@@ -2258,6 +2287,124 @@ fn render_model_list(
     text
 }
 
+/// Where the current effective reasoning effort comes from.
+///
+/// `/effort` must name the source, because "已设置 high" is useless when the
+/// user cannot tell whether it is this session's override or the catalog
+/// entry's default: the fix differs (clear the override vs edit the entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffortSource {
+    /// No value anywhere: the field is not sent and the model uses its own default.
+    Unset,
+    /// `/model`-style session override (what `/effort <tier>` sets).
+    Session,
+    /// The selected catalog entry's `reasoning_effort`.
+    Entry,
+}
+
+impl EffortSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unset => "未设置（使用模型默认）",
+            Self::Session => "本会话覆盖",
+            Self::Entry => "清单条目默认",
+        }
+    }
+}
+
+/// Resolve the effective effort and its source from the live session state.
+///
+/// Precedence mirrors the app-server (`thread_store` override > catalog entry
+/// `reasoning_effort` > unset): a session override always wins; without one, the
+/// selected catalog entry's value applies; with neither, the field is not sent.
+///
+/// `current_model_ref` is the user-selected display name, and an absent one
+/// means "follow the catalog's `default_model`". This is the **same**
+/// entry-selection rule `startup_config_from_catalog` and the app-server's
+/// `effective_entry` use, so the effort `/effort` reports is the one the request
+/// carries — the cross-check is
+/// `main::tests::startup_sends_the_effort_the_tui_reports`.
+pub(crate) fn resolve_effort_state(
+    session_effort: Option<&str>,
+    catalog: &yi_agent_runtime::models::ModelCatalog,
+    current_model_ref: Option<&str>,
+) -> (Option<String>, EffortSource) {
+    if let Some(tier) = session_effort {
+        return (Some(tier.to_string()), EffortSource::Session);
+    }
+    let entry = current_model_ref
+        .and_then(|name| catalog.models.iter().find(|m| m.name == name))
+        .or_else(|| {
+            // 与 `yi_agent_runtime::models::effective_entry` 同口径:没有会话
+            // 覆盖时跟随清单 `default_model`。
+            catalog
+                .default_model
+                .as_deref()
+                .and_then(|name| catalog.models.iter().find(|m| m.name == name))
+        });
+    match entry.and_then(|e| e.reasoning_effort.as_deref()) {
+        Some(tier) => (Some(tier.to_string()), EffortSource::Entry),
+        None => (None, EffortSource::Unset),
+    }
+}
+
+/// Render the current effective effort and its source for `/effort` (no args).
+fn render_effort_status(effort: Option<&str>, source: EffortSource) -> String {
+    match effort {
+        Some(tier) => format!(
+            "当前推理档: {tier}（来源: {}）\n\
+             可用: {} | default\n\
+             `/effort <档位>` 设置本会话覆盖，`/effort default` 清覆盖并回落条目默认。",
+            source.label(),
+            crate::tui::slash::REASONING_EFFORT_TIERS.join(" | ")
+        ),
+        None => format!(
+            "当前推理档: {}（即不发 `reasoning_effort` 字段，由模型自行决定）\n\
+             可用: {} | default",
+            EffortSource::Unset.label(),
+            crate::tui::slash::REASONING_EFFORT_TIERS.join(" | ")
+        ),
+    }
+}
+
+/// Handle `/effort`: show the effective value, set a session override, or clear it.
+///
+/// Shaped like [`handle_model_command`]: transcript output goes into `history`
+/// and the returned command is what the driver must act on (`None` = handled
+/// locally, nothing to send).
+///
+/// The override is resolved by the driver against the *live* catalog entry, so
+/// this function only validates the tier and reports; it never pretends a
+/// switch succeeded (the driver's `Notice` is the authoritative confirmation).
+///
+/// Reserved keyword: `default` always means "clear the override" (see
+/// `parse_effort_args`), so it can never be a tier.
+fn handle_effort_command(
+    arg: Option<&str>,
+    current_effort: Option<&str>,
+    source: EffortSource,
+    history: &mut HistoryState,
+    width: u16,
+) -> Option<crate::ControlCommand> {
+    match crate::tui::slash::parse_effort_args(arg.unwrap_or("")) {
+        Ok(crate::tui::slash::EffortAction::Status) => {
+            let text = render_effort_status(current_effort, source);
+            history.push(HistoryCell::Markdown { text }, width);
+            None
+        }
+        Ok(crate::tui::slash::EffortAction::Clear) => {
+            Some(crate::ControlCommand::SetReasoningEffort(None))
+        }
+        Ok(crate::tui::slash::EffortAction::Set(tier)) => {
+            Some(crate::ControlCommand::SetReasoningEffort(Some(tier)))
+        }
+        Err(usage) => {
+            history.push(HistoryCell::Separator { label: Some(usage) }, width);
+            None
+        }
+    }
+}
+
 /// Handle `/model`: list the catalog, switch to a named entry, or clear the
 /// session override.
 ///
@@ -2329,6 +2476,10 @@ fn execute_slash_command(
     // 用户选中的清单显示名（`None` = 跟随清单 default_model）。
     current_model_ref: Option<&str>,
     catalog: &yi_agent_runtime::models::ModelCatalog,
+    // 本会话的 effort 覆盖 / 当前生效值与来源。由 run_loop 维护并在每次
+    // `Notice`/`SetReasoningEffort` 后更新（driver 是权威，TUI 只回显）。
+    current_effort: Option<&str>,
+    effort_source: EffortSource,
 ) -> KeyOutcome {
     match cmd {
         SlashCommand::Quit => KeyOutcome::Quit,
@@ -2411,6 +2562,31 @@ fn execute_slash_command(
                 // 免得 channel 关闭时标记谎报一个 driver 从未收到的切换。
                 if control_tx.blocking_send(command).is_ok() {
                     return KeyOutcome::ModelSelected(selection);
+                }
+            }
+            KeyOutcome::None
+        }
+        SlashCommand::Effort => {
+            // 与 `/model` 同形状：清单相关的判定（当前条目默认档）已经由
+            // run_loop 解析成 `current_effort`/`effort_source` 传进来，
+            // 这里只负责校验 + 下发 + 打印状态。
+            if let Some(command) = handle_effort_command(
+                args.as_deref(),
+                current_effort,
+                effort_source,
+                history,
+                width,
+            ) {
+                // 回报**本次要写入的档位**（`None` = 清覆盖），供 run_loop 维护
+                // 本地覆盖。与 `/model` 一样，只有命令真的进了 channel 才回报。
+                let requested = match &command {
+                    crate::ControlCommand::SetReasoningEffort(effort) => effort.clone(),
+                    _ => None,
+                };
+                // 确认行由 driver 的 `Notice` 事件驱动（与 `/model` 不预写成功行
+                // 同理）。
+                if control_tx.blocking_send(command).is_ok() {
+                    return KeyOutcome::EffortChanged(requested);
                 }
             }
             KeyOutcome::None
@@ -5824,6 +6000,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -5862,6 +6040,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -5898,6 +6078,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         let labels = separator_labels(&history);
@@ -5937,6 +6119,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         let labels = separator_labels(&history);
@@ -5978,6 +6162,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(
@@ -6019,6 +6205,8 @@ mod tests {
                 "test-model",
                 None,
                 &catalog_for_tests(),
+                None,
+                EffortSource::Unset,
             );
             let labels = separator_labels(&history);
             assert!(
@@ -8425,6 +8613,8 @@ mod tests {
                 "test-model",
                 None,
                 &catalog_for_tests(),
+                None,
+                EffortSource::Unset,
             );
             assert_eq!(outcome, KeyOutcome::None);
             assert_eq!(history.scroll_offset, expected_offset, "key {key:?}");
@@ -8454,6 +8644,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(history.selected, Some(4));
         assert_eq!(
@@ -8500,6 +8692,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "Esc must not arm process exit");
@@ -8547,6 +8741,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(!pending_quit, "idle Esc must not arm process exit");
@@ -8594,6 +8790,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(result, KeyOutcome::None);
         assert!(pending_quit);
@@ -8638,6 +8836,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         let result = handle_key(
             make_key(KeyCode::Esc, KeyModifiers::NONE),
@@ -8662,6 +8862,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(result, KeyOutcome::None);
     }
@@ -8710,6 +8912,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(result, KeyOutcome::Submit(path.to_string()));
@@ -8761,6 +8965,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(result, KeyOutcome::None);
@@ -8815,6 +9021,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(input_rx.try_recv().unwrap(), "inflight msg");
         let history_len_before = history.cells.len();
@@ -8845,6 +9053,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -8918,6 +9128,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(
@@ -9089,6 +9301,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         match result {
             KeyOutcome::Submit(text) => {
@@ -9145,6 +9359,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(input_rx.try_recv().unwrap(), "inflight");
 
@@ -9175,6 +9391,8 @@ mod tests {
                 "test-model",
                 None,
                 &catalog_for_tests(),
+                None,
+                EffortSource::Unset,
             );
         }
         assert_eq!(
@@ -9219,6 +9437,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(
@@ -9283,6 +9503,8 @@ mod tests {
                 "test-model",
                 None,
                 &catalog_for_tests(),
+                None,
+                EffortSource::Unset,
             );
         }
         // Both reached the driver already: the first opened the turn, the second
@@ -9338,6 +9560,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -9366,6 +9590,8 @@ mod tests {
             api_url: format!("https://{name}.example"),
             model: model.into(),
             api_key: "sk-secret".into(),
+            api_style: None,
+            reasoning_effort: None,
         };
         ModelCatalog {
             models: vec![
@@ -9409,6 +9635,189 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// `/effort` 测试的清单:与 `/model` 用同一个，另加一条带条目默认档的条目。
+    fn effort_catalog_for_tests() -> yi_agent_runtime::models::ModelCatalog {
+        let mut catalog = model_catalog_for_tests();
+        catalog.models[0].reasoning_effort = Some("low".into());
+        catalog
+    }
+
+    #[test]
+    fn effort_command_sets_the_session_override() {
+        let mut history = HistoryState::new();
+
+        let command =
+            handle_effort_command(Some("high"), None, EffortSource::Unset, &mut history, 80);
+        assert_eq!(
+            command,
+            Some(crate::ControlCommand::SetReasoningEffort(Some(
+                "high".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn effort_command_default_clears_the_override() {
+        let catalog = effort_catalog_for_tests();
+        let mut history = HistoryState::new();
+
+        let command = handle_effort_command(
+            Some("default"),
+            Some("high"),
+            EffortSource::Session,
+            &mut history,
+            80,
+        );
+        assert_eq!(
+            command,
+            Some(crate::ControlCommand::SetReasoningEffort(None)),
+            "`default` clears the override; the driver falls back to the entry"
+        );
+        assert!(
+            matches!(catalog.default_model.as_deref(), Some("A")),
+            "the entry default is what the clear falls back to"
+        );
+    }
+
+    /// 无参 `/effort` 只打印当前生效值 + 来源,绝不下发命令。
+    #[test]
+    fn effort_command_without_args_reports_the_effective_value_and_source() {
+        let mut history = HistoryState::new();
+
+        let command =
+            handle_effort_command(None, Some("low"), EffortSource::Entry, &mut history, 80);
+
+        assert!(command.is_none(), "status must not send a control command");
+        let text = markdown_bodies(&history);
+        assert!(
+            text.contains("low"),
+            "the effective tier must be shown: {text}"
+        );
+        assert!(
+            text.contains(EffortSource::Entry.label()),
+            "the source must be named: {text}"
+        );
+    }
+
+    #[test]
+    fn effort_command_without_args_reports_unset_as_unset() {
+        let mut history = HistoryState::new();
+        let command = handle_effort_command(None, None, EffortSource::Unset, &mut history, 80);
+        assert!(command.is_none());
+        let text = markdown_bodies(&history);
+        assert!(
+            text.contains(EffortSource::Unset.label()),
+            "an unset effort must be reported as unset, not as a tier: {text}"
+        );
+    }
+
+    /// 非白名单档位 → 用法行,不下发。
+    #[test]
+    fn effort_command_rejects_an_unknown_tier_with_a_usage_line() {
+        let mut history = HistoryState::new();
+        let command =
+            handle_effort_command(Some("bogus"), None, EffortSource::Unset, &mut history, 80);
+        assert!(command.is_none(), "an unknown tier must not be sent");
+        let labels = separator_labels(&history);
+        assert!(
+            labels.iter().any(|l| l.contains("用法: /effort")),
+            "expected the usage line, got {labels:?}"
+        );
+    }
+
+    /// 优先级:会话覆盖 > 选中条目默认 > 未设置。
+    #[test]
+    fn resolve_effort_state_prefers_the_session_override() {
+        let catalog = effort_catalog_for_tests();
+
+        assert_eq!(
+            resolve_effort_state(Some("max"), &catalog, Some("A")),
+            (Some("max".into()), EffortSource::Session)
+        );
+        assert_eq!(
+            resolve_effort_state(None, &catalog, Some("A")),
+            (Some("low".into()), EffortSource::Entry),
+            "no override: the selected entry's own default applies"
+        );
+        assert_eq!(
+            resolve_effort_state(None, &catalog, Some("B")),
+            (None, EffortSource::Unset),
+            "entry B declares no effort"
+        );
+        // 无选中显示名 = 跟随清单 default_model(A, low)。
+        assert_eq!(
+            resolve_effort_state(None, &catalog, None),
+            (Some("low".into()), EffortSource::Entry)
+        );
+    }
+
+    /// `/effort high` 全链路:下发 `SetReasoningEffort(Some("high"))` 并回报
+    /// 已选档位(供 run_loop 维护「当前生效值」)。
+    #[test]
+    fn effort_slash_command_sends_the_override_and_reports_it() {
+        let catalog = effort_catalog_for_tests();
+        let mut history = HistoryState::new();
+        let (input_tx, _input_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (interrupt_tx, _interrupt_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (kill_tx, mut _kill_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<crate::ControlCommand>(4);
+        let mut queued = crate::tui::queued::DeliveredInterjections::new();
+
+        let outcome = execute_slash_command(
+            SlashCommand::Effort,
+            None,
+            Some("high".into()),
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+            None,
+            &catalog,
+            None,
+            EffortSource::Unset,
+        );
+        assert_eq!(outcome, KeyOutcome::EffortChanged(Some("high".into())));
+        assert_eq!(
+            control_rx.try_recv(),
+            Ok(crate::ControlCommand::SetReasoningEffort(Some(
+                "high".into()
+            )))
+        );
+
+        // `/effort` 无参:只打印,不发命令。
+        let outcome = execute_slash_command(
+            SlashCommand::Effort,
+            None,
+            None,
+            &mut history,
+            80,
+            &CostTracker::default(),
+            &input_tx,
+            &interrupt_tx,
+            &kill_tx,
+            &control_tx,
+            &std::env::temp_dir(),
+            &mut queued,
+            &yi_agent_mcp::McpManager::empty(),
+            &snapshot_for_tests(),
+            "test-model",
+            None,
+            &catalog,
+            Some("high"),
+            EffortSource::Session,
+        );
+        assert_eq!(outcome, KeyOutcome::None);
+        assert!(control_rx.try_recv().is_err(), "status must send nothing");
     }
 
     #[test]
@@ -9535,6 +9944,8 @@ mod tests {
             "test-model",
             None,
             &catalog,
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(
             outcome,
@@ -9565,6 +9976,8 @@ mod tests {
             "test-model",
             Some("B"),
             &catalog,
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(outcome, KeyOutcome::ModelSelected(None));
         assert_eq!(
@@ -9600,6 +10013,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(outcome, KeyOutcome::None);
         let labels = separator_labels(&history);
@@ -9637,6 +10052,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         let labels = separator_labels(&history);
         assert!(
@@ -9682,6 +10099,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -9727,6 +10146,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(outcome, KeyOutcome::None);
         let rendered: String = history
@@ -9769,6 +10190,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(outcome, KeyOutcome::None);
         let cell = history.cells.last().unwrap();
@@ -9814,6 +10237,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(outcome, KeyOutcome::None);
         assert!(mcp.master(), "/mcp on must set the master switch");
@@ -9852,6 +10277,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(outcome, KeyOutcome::None);
         // The unknown server must be reported, not silently ignored...
@@ -9899,6 +10326,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert_eq!(outcome, KeyOutcome::None);
         match history.cells.last().unwrap() {
@@ -9942,6 +10371,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -9985,6 +10416,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -10030,6 +10463,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
 
         assert_eq!(outcome, KeyOutcome::None);
@@ -10444,6 +10879,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert!(
@@ -10502,6 +10939,8 @@ mod tests {
             "test-model",
             None,
             &catalog_for_tests(),
+            None,
+            EffortSource::Unset,
         );
         assert!(matches!(outcome, KeyOutcome::None));
         assert_eq!(

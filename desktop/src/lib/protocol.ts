@@ -93,6 +93,32 @@ export type Notification =
       method: "thread/permissionModeChanged";
       params: { thread_id: string; mode: ThreadMode };
     }
+  /**
+   * 该会话的 reasoning effort 覆盖已切换到 `effort`（或清除）。与
+   * `thread/modelChanged` 同族：会话元数据，列表层恒推，所有客户端的控件据此刷新。
+   * `effort` **缺省即已清除覆盖**（不发送该字段），回落清单条目默认。
+   */
+  | {
+      method: "thread/reasoningEffortChanged";
+      params: { thread_id: string; effort?: string | null };
+    }
+  /**
+   * 运行期告知（通道回退 / effort 降级），状态栏级一行提示。**注意 `level` 是
+   * PascalCase**：core 的 `NoticeLevel` 无 `rename_all`，与同文件其余 snake_case
+   * 参数不同（`protocol.rs:814-832` 钉死了这个线形状）。
+   */
+  | {
+      method: "thread/notice";
+      params: { thread_id: string; level: "Info" | "Warn"; text: string };
+    }
+  /**
+   * 归一化的思维链增量（仅展示，**绝不回灌**后续轮次）。`kind` 同样 PascalCase
+   * （core 的 `ReasoningKind` 无 `rename_all`）。
+   */
+  | {
+      method: "thread/reasoningDelta";
+      params: { thread_id: string; text: string; kind: "Content" | "Summary" };
+    }
   | { method: "turn/started"; params: { thread_id: string; turn_id: string } }
   | { method: "item/started"; params: { thread_id: string; item: Item } }
   | { method: "item/delta"; params: { thread_id: string; item_id: string; delta: string } }

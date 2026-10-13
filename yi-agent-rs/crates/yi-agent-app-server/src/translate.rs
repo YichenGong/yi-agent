@@ -303,6 +303,27 @@ impl Translator {
                     model,
                 });
             }
+            AgentEvent::ReasoningDelta { text, kind } => {
+                // Display-only CoT. It is deliberately NOT merged into the open
+                // agent message: reasoning never enters the transcript, so a
+                // client renders it in a separate block (design §6).
+                out.push(Notification::ReasoningDelta {
+                    thread_id: self.thread_id.clone(),
+                    text,
+                    kind,
+                });
+            }
+            AgentEvent::Notice { level, text } => {
+                // A non-fatal runtime notice (channel fallback / effort
+                // downgrade). Status-line level by design §7: the client must
+                // not render it as a turn failure. No barrier flush is needed —
+                // the server flushes pending deltas on any non-delta frame.
+                out.push(Notification::Notice {
+                    thread_id: self.thread_id.clone(),
+                    level,
+                    text,
+                });
+            }
             AgentEvent::Usage { model, usage } => {
                 self.usage.merge(&model, &usage);
                 out.push(Notification::TokenUsage {
@@ -575,6 +596,76 @@ mod tests {
             out.is_empty(),
             "decode delta must not open an agentMessage, got {out:?}"
         );
+    }
+
+    /// 推理增量必须变成 `thread/reasoningDelta`，并带上本 translator 的 thread。
+    ///
+    /// 它**不能**打开/追加 agentMessage：CoT 是仅展示的旁路，翻译进正文会让
+    /// 客户端把思考当答案，也会让它被后续轮次回灌（design §6.3 明确不做）。
+    #[test]
+    fn reasoning_delta_becomes_a_reasoning_notification() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::AssistantText("hi".into()));
+        assert!(
+            out.iter()
+                .any(|n| matches!(n, Notification::ItemStarted { .. })),
+            "precondition: an agent message is open"
+        );
+
+        let out = t.on_event(AgentEvent::ReasoningDelta {
+            text: "let me think".into(),
+            kind: yi_agent_core::ReasoningKind::Content,
+        });
+        assert_eq!(out.len(), 1, "expected exactly the notice, got {out:?}");
+        match &out[0] {
+            Notification::ReasoningDelta {
+                thread_id,
+                text,
+                kind,
+            } => {
+                assert_eq!(thread_id, "th1");
+                assert_eq!(text, "let me think");
+                assert_eq!(*kind, yi_agent_core::ReasoningKind::Content);
+            }
+            other => panic!("expected ReasoningDelta, got {other:?}"),
+        }
+
+        // 打开的 agentMessage 不受影响：CoT 不落到正文里。
+        let out = t.on_event(AgentEvent::AssistantText(" world".into()));
+        assert!(
+            out.iter().any(|n| matches!(
+                n,
+                Notification::ItemDelta { delta, .. } if delta == " world"
+            )),
+            "the open agent message must keep receiving text, got {out:?}"
+        );
+    }
+
+    /// 运行期告知必须变成 `thread/notice`，带 level 与 text。
+    #[test]
+    fn notice_becomes_a_notice_notification() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::Notice {
+            level: yi_agent_core::NoticeLevel::Info,
+            text: "已自动改用 Chat".into(),
+        });
+        assert_eq!(
+            out.len(),
+            1,
+            "expected exactly one notification, got {out:?}"
+        );
+        match &out[0] {
+            Notification::Notice {
+                thread_id,
+                level,
+                text,
+            } => {
+                assert_eq!(thread_id, "th1");
+                assert_eq!(*level, yi_agent_core::NoticeLevel::Info);
+                assert_eq!(text, "已自动改用 Chat");
+            }
+            other => panic!("expected Notice, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1009,6 +1100,7 @@ mod tests {
             output_tokens: 5,
             cache_creation_input_tokens: Some(100),
             cache_read_input_tokens: Some(200),
+            reasoning_tokens: None,
         };
         let out = t.on_event(AgentEvent::Usage {
             model: "m".into(),
@@ -1063,6 +1155,7 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: Some(7),
                 cache_read_input_tokens: Some(9),
+                reasoning_tokens: None,
             },
         });
         // message_delta:output only
@@ -1073,6 +1166,7 @@ mod tests {
                 output_tokens: 42,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                reasoning_tokens: None,
             },
         });
         match &out[0] {
@@ -1139,6 +1233,7 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: Some(7),
                 cache_read_input_tokens: Some(9),
+                reasoning_tokens: None,
             },
         });
         let _ = t.on_event(AgentEvent::Usage {
@@ -1157,6 +1252,7 @@ mod tests {
                 output_tokens: 0,
                 cache_creation_input_tokens: None,
                 cache_read_input_tokens: None,
+                reasoning_tokens: None,
             },
         });
         match &out[0] {

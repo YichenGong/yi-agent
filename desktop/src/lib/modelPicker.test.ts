@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildModelOptions } from "./modelPicker";
+import { REASONING_EFFORTS, buildEffortOptions, buildModelOptions, entryEffortOf, overrideFromEffective } from "./modelPicker";
 import type { ModelEntryView, ModelList } from "./models";
 
 const entry = (name: string, model: string): ModelEntryView => ({
@@ -68,5 +68,97 @@ describe("buildModelOptions", () => {
     );
     expect(opts[0].label).toContain("model-a");
     expect(opts[0].label).not.toContain("model-b");
+  });
+});
+
+describe("REASONING_EFFORTS", () => {
+  it("lists the seven tiers in order", () => {
+    expect(REASONING_EFFORTS).toEqual([
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+});
+
+describe("buildEffortOptions", () => {
+  it("puts an unset option first and labels it with the entry default", () => {
+    const opts = buildEffortOptions(null, "low");
+    expect(opts[0]).toMatchObject({ value: null, selected: true });
+    expect(opts[0].label).toContain("未设置");
+    expect(opts[0].label).toContain("low");
+  });
+
+  it("labels the unset option plainly when the entry declares no default", () => {
+    const opts = buildEffortOptions(null, null);
+    expect(opts[0].value).toBeNull();
+    expect(opts[0].label).toBe("未设置");
+  });
+
+  it("lists the seven tiers after the unset option", () => {
+    const opts = buildEffortOptions(null, "low");
+    expect(opts.map((o) => o.value)).toEqual([
+      null,
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  it("marks the current value as selected", () => {
+    const opts = buildEffortOptions("high", "low");
+    expect(opts[0].selected).toBe(false);
+    expect(opts.find((o) => o.value === "high")?.selected).toBe(true);
+    expect(opts.filter((o) => o.selected)).toHaveLength(1);
+  });
+});
+
+describe("overrideFromEffective", () => {
+  it("reports no override when the effective value is the entry default", () => {
+    // resume 上报的是**生效值**（无覆盖时即条目默认）：与条目默认相同就是「没有
+    // 可区分的覆盖」，控件该显示「未设置（继承 low）」而不是把 low 打勾。
+    expect(overrideFromEffective("low", "low")).toBeNull();
+  });
+
+  it("keeps an effective value that differs from the entry default", () => {
+    // 生效值与条目默认不同 ⇒ 一定存在会话覆盖（resume 带的 meta 覆盖）。
+    expect(overrideFromEffective("high", "low")).toBe("high");
+  });
+
+  it("keeps an effective value the entry default cannot explain", () => {
+    // 条目没声明默认而生效值非空 ⇒ 只可能是会话覆盖。
+    expect(overrideFromEffective("high", null)).toBe("high");
+  });
+
+  it("passes null through", () => {
+    expect(overrideFromEffective(null, "low")).toBeNull();
+    expect(overrideFromEffective(null, null)).toBeNull();
+  });
+});
+
+describe("entryEffortOf", () => {
+  it("returns the selected entry's effort", () => {
+    const catalog = list({ models: [entry("A", "model-a"), entry("B", "model-b")] });
+    catalog.models[1].reasoning_effort = "high";
+    expect(entryEffortOf(catalog, "B")).toBe("high");
+  });
+
+  it("falls back to the catalog's default entry when following the default", () => {
+    const catalog = list({ models: [entry("A", "model-a")] });
+    catalog.models[0].reasoning_effort = "medium";
+    expect(entryEffortOf(catalog, null)).toBe("medium");
+  });
+
+  it("returns null when the entry declares nothing or the catalog is empty", () => {
+    expect(entryEffortOf(list(), "A")).toBeNull();
+    expect(entryEffortOf(list({ models: [] }), null)).toBeNull();
   });
 });

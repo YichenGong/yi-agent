@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use yi_agent_core::ApiStyle;
 
 /// Default resident subagent capacity, mirrored by
 /// `AgentWorkerFactory::max_resident_subagents`'s default so a factory that does
@@ -25,6 +26,11 @@ pub struct RuntimeConfig {
     pub api_url: String,
     pub api_key: String,
     pub model: String,
+    /// 端点风格：`auto`（默认）| `responses` | `chat`。条目未声明时为
+    /// [`RuntimeConfig::default_api_style`]。
+    pub api_style: ApiStyle,
+    /// 推理努力档位（七档之一）；`None` = 请求体不带该字段（零回归默认）。
+    pub reasoning_effort: Option<String>,
     pub max_turns: u32,
     /// Resident subagent capacity for the daemon this config starts. Roots do not
     /// consume it. Defaults to [`RESIDENT_SUBAGENTS_DEFAULT`].
@@ -181,6 +187,13 @@ pub fn resolve_workdir(overrides: &ConfigOverrides) -> Result<PathBuf> {
 }
 
 impl RuntimeConfig {
+    /// 条目未声明 `api_style` 时运行时采用的默认端点风格（`auto`）。
+    ///
+    /// 与 `resolve_effective` 的兜底同源，避免两处各写一份常量而漂移。
+    pub fn default_api_style() -> ApiStyle {
+        ApiStyle::Auto
+    }
+
     /// 从覆盖项 + 环境变量加载配置。
     ///
     /// 优先级:覆盖项 > 环境变量 > 默认值。
@@ -361,6 +374,8 @@ impl RuntimeConfig {
             api_url,
             api_key,
             model,
+            api_style: RuntimeConfig::default_api_style(),
+            reasoning_effort: None,
             max_turns,
             max_resident_subagents,
             max_direct_children,
@@ -408,6 +423,8 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         api_url: "https://api.anthropic.com".to_string(),
         api_key: "sk-secret".to_string(),
         model: "test-model".to_string(),
+        api_style: RuntimeConfig::default_api_style(),
+        reasoning_effort: None,
         max_turns: 20,
         max_resident_subagents: RESIDENT_SUBAGENTS_DEFAULT,
         max_direct_children: DIRECT_CHILDREN_DEFAULT,
