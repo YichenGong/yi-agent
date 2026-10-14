@@ -30,6 +30,28 @@ const diffProps = {
   note: null,
 };
 
+const processProps = {
+  processes: [
+    {
+      process_id: "proc_1",
+      name: "dev",
+      pid: 4242,
+      command: "npm run dev",
+      cwd: "/w",
+      status: { state: "running" },
+      ready: false,
+      on_exit: "kill" as const,
+      exit_code: null,
+      elapsed_sec: 1.5,
+    },
+  ],
+  selectedProcessId: null,
+  onOpenProcess: () => {},
+  onCloseProcess: () => {},
+  output: null,
+  onKill: async () => {},
+};
+
 const baseProps = {
   onTabChange: () => {},
   onClose: () => {},
@@ -39,6 +61,7 @@ const baseProps = {
   onLeaveTask: () => {},
   traceProps: null,
   diffProps,
+  processProps,
   isMobile: false,
 };
 
@@ -84,6 +107,43 @@ describe("ThreadDetailPanel", () => {
       <ThreadDetailPanel {...baseProps} tab="diff" diffProps={{ ...diffProps, error: "boom" }} />,
     );
     expect(screen.getByText("boom")).toBeTruthy();
+  });
+
+  it("offers a processes tab that switches on click", () => {
+    const onTabChange = vi.fn();
+    render(<ThreadDetailPanel {...baseProps} tab="subagents" onTabChange={onTabChange} />);
+    fireEvent.click(screen.getByRole("tab", { name: /后台进程/ }));
+    expect(onTabChange).toHaveBeenCalledWith("processes");
+  });
+
+  it("lists processes on the processes tab and opens one", () => {
+    const onOpenProcess = vi.fn();
+    render(
+      <ThreadDetailPanel
+        {...baseProps}
+        tab="processes"
+        processProps={{ ...processProps, onOpenProcess }}
+      />,
+    );
+    expect(screen.getByText("dev")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /查看进程 dev/ }));
+    expect(onOpenProcess).toHaveBeenCalledWith("proc_1");
+  });
+
+  it("shows process detail with output on the processes tab when one is selected", () => {
+    render(
+      <ThreadDetailPanel
+        {...baseProps}
+        tab="processes"
+        processProps={{
+          ...processProps,
+          selectedProcessId: "proc_1",
+          output: { stdout: "ready on 3000\n", stderr: "", truncated: false },
+        }}
+      />,
+    );
+    expect(screen.getByText(/ready on 3000/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /关闭进程详情/ })).toBeTruthy();
   });
 
   it("closes through the panel header", () => {
