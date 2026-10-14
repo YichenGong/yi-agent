@@ -85,14 +85,20 @@ pub fn ignore_project_local_runtime_state(workdir: &Path) {
 /// The child's model and credentials come from the machine catalog's
 /// `subagent_model` entry, falling back to the global default, and finally to
 /// `cfg` itself when neither is configured (see [`build_worker_factory`]).
+///
+/// `models_path` is passed in rather than resolved from `$HOME` here, so the
+/// app-server injects the *same* catalog its `model/*` RPCs read and a test can
+/// isolate one without mutating process-wide state. Pass
+/// `yi_agent_runtime::models::models_path()` for the production location.
 pub fn worker_factory(
     cfg: &RuntimeConfig,
     runtime_socket: PathBuf,
+    models_path: &Path,
 ) -> anyhow::Result<std::sync::Arc<dyn AgentWorkerFactory>> {
     Ok(std::sync::Arc::new(build_worker_factory(
         cfg,
         runtime_socket,
-        &yi_agent_runtime::models::load_catalog(),
+        &yi_agent_runtime::models::load_catalog_from(models_path),
     )?))
 }
 
@@ -146,8 +152,8 @@ fn build_worker_factory(
     .with_max_direct_children(usize::from(effective.max_direct_children)))
 }
 
-/// Test-only seam: load a catalog from an explicit path instead of `HOME`, so a
-/// test can inject one without mutating process-wide environment state.
+/// Test-only seam: build the concrete factory from an explicit catalog path so a
+/// test can read its resolved values without going through the trait object.
 #[cfg(test)]
 fn worker_factory_with_catalog(
     cfg: &RuntimeConfig,
@@ -167,9 +173,15 @@ fn worker_factory_with_catalog(
 /// caller (and a test) can isolate one project's runtime without mutating
 /// process-wide state. Pass `project_runtime_directory(&cfg.workdir)` for the
 /// default location.
+///
+/// `models_path` is passed in for the same reason: the daemon's worker factory
+/// resolves the subagent model from the machine catalog, and whoever brings the
+/// runtime up must point it at the *same* catalog its own `model/*` surface
+/// reads (see [`worker_factory`]). Pass `models::models_path()` for production.
 pub fn attach_project_runtime(
     cfg: &RuntimeConfig,
     runtime_dir: PathBuf,
+    models_path: &Path,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
     let database = runtime_dir.join("runtime.sqlite");
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)
@@ -177,7 +189,7 @@ pub fn attach_project_runtime(
     // Record the project-local state before the daemon creates it, otherwise the
     // root provisioning sees a checkout dirtied by our own store.
     ignore_project_local_runtime_state(&cfg.workdir);
-    let factory = worker_factory(cfg, socket_path.clone())
+    let factory = worker_factory(cfg, socket_path.clone(), models_path)
         .map_err(|error| AttachFailure::new("worker factory", error))?;
     let embedded_daemon = match Daemon::start_with_factory(&runtime_dir, &database, factory) {
         Ok(daemon) => Some(daemon),
@@ -359,9 +371,14 @@ fn is_dead_io(error: &std::io::Error) -> bool {
 ///
 /// `Unknown` is not a takeover signal: it is returned as an `AttachFailure` so
 /// the caller degrades exactly as it did before.
+///
+/// `models_path` is forwarded to [`attach_project_runtime`] so a replacement
+/// daemon's worker factory resolves the subagent model from the caller's
+/// catalog rather than re-reading `$HOME`.
 pub fn ensure_owned_runtime(
     cfg: &RuntimeConfig,
     runtime_dir: PathBuf,
+    models_path: &Path,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)
         .map_err(|error| AttachFailure::new("runtime directory", error))?;
@@ -386,7 +403,7 @@ pub fn ensure_owned_runtime(
     // `attach_project_runtime` already implements the three outcomes this
     // classification implies: a fresh start, a join on `AlreadyRunning`, or a
     // start over the socket node a dead daemon left behind.
-    attach_project_runtime(cfg, runtime_dir)
+    attach_project_runtime(cfg, runtime_dir, models_path)
 }
 
 /// Retires a *wedged* daemon (listening, but every request answers `internal`)
@@ -529,6 +546,67 @@ mod tests {
         );
     }
 
+    /// The public `worker_factory` must resolve against the catalog path it is
+    /// handed, never `$HOME`.
+    ///
+    /// This is the seam the app-server relies on: its `model/*` RPCs read an
+    /// injected `models_path`, and the worker factory a project's daemon starts
+    /// must read that same file. Before this was a parameter the factory called
+    /// `load_catalog()` (i.e. `$HOME`), so on any machine with a
+    /// `subagent_model`/`default_model` entry the resolved provider silently
+    /// diverged from the caller's `cfg` — which is exactly what turned three
+    /// app-server delegation tests red on a host with a configured catalog.
+    ///
+    /// The two cases below are a pair: together they pin "the injected path
+    /// decides" in *every* environment. With a configured `$HOME`, the second
+    /// case fails on the old code (which would read that catalog and succeed);
+    /// with an empty `$HOME`, the first case fails on the old code (which would
+    /// find no catalog and reject `cfg`'s provider).
+    #[test]
+    fn the_public_worker_factory_reads_the_injected_catalog() {
+        let directory = tempfile::TempDir::new().unwrap();
+        // `cfg` names a provider `build_provider` rejects; the injected catalog
+        // must override it with its `subagent_model` entry.
+        let catalog_path = catalog_file(
+            directory.path(),
+            r#"{"models":[
+                {"name":"S","provider":"openai","api_url":"https://s","model":"model-s","api_key":"key-s"}
+            ],"subagent_model":"S"}"#,
+        );
+        let mut cfg = base_config(directory.path());
+        cfg.provider = "isolated-placeholder".into();
+
+        let factory =
+            super::worker_factory(&cfg, directory.path().join("runtime.sock"), &catalog_path);
+
+        assert!(
+            factory.is_ok(),
+            "the injected catalog's provider must win over cfg, got {:?}",
+            factory.err().map(|e| e.to_string())
+        );
+    }
+
+    /// The complement: with no catalog at the injected path, the factory must
+    /// fall through to `cfg` (and reject this deliberately unknown provider)
+    /// rather than reaching for the developer's real `$HOME`.
+    #[test]
+    fn the_public_worker_factory_never_falls_back_to_home() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let mut cfg = base_config(directory.path());
+        cfg.provider = "isolated-placeholder".into();
+
+        let factory = super::worker_factory(
+            &cfg,
+            directory.path().join("runtime.sock"),
+            &directory.path().join("missing-models.json"),
+        );
+
+        assert!(
+            factory.is_err(),
+            "a missing injected catalog must leave cfg in force, not read $HOME"
+        );
+    }
+
     /// The configured capacity must survive the trip through the factory: this
     /// is what makes `YI_AGENT_MAX_RESIDENT_SUBAGENTS` effective in the daemon
     /// instead of inert. A regression that drops the `with_max_resident_subagents`
@@ -560,7 +638,10 @@ mod tests {
         };
         let socket = directory.path().join("runtime.sock");
 
-        let factory = worker_factory(&cfg, socket).expect("factory");
+        // A missing catalog keeps this test off the developer's real `$HOME`:
+        // the capacity assertions do not depend on the resolved model.
+        let factory = worker_factory(&cfg, socket, &directory.path().join("missing-models.json"))
+            .expect("factory");
 
         assert_eq!(
             factory.max_resident_subagents(),
@@ -601,7 +682,9 @@ mod tests {
         };
         let socket = directory.path().join("runtime.sock");
 
-        let factory = worker_factory(&cfg, socket).expect("factory");
+        // Same as the capacity test: a missing catalog keeps this off `$HOME`.
+        let factory = worker_factory(&cfg, socket, &directory.path().join("missing-models.json"))
+            .expect("factory");
 
         assert_eq!(
             factory.max_direct_children(),

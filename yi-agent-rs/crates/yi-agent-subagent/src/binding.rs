@@ -28,6 +28,10 @@ pub struct RuntimeHandle {
 struct RepairPlan {
     cfg: RuntimeConfig,
     runtime_dir: PathBuf,
+    /// The machine catalog path the worker factory must resolve against. Held
+    /// here so a repaired daemon keeps reading the same catalog the original
+    /// bring-up used instead of re-deriving it from `$HOME`.
+    models_path: PathBuf,
 }
 
 /// The mutable half: which handle is current, and -- for a managed binding -- the
@@ -62,6 +66,7 @@ impl RuntimeBinding {
     pub fn managed(
         cfg: &RuntimeConfig,
         runtime_dir: PathBuf,
+        models_path: PathBuf,
         initial: Arc<AttachedProjectRuntime>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -73,6 +78,7 @@ impl RuntimeBinding {
             repair: Some(RepairPlan {
                 cfg: cfg.clone(),
                 runtime_dir,
+                models_path,
             }),
             flight: Mutex::new(()),
         })
@@ -166,8 +172,9 @@ impl RuntimeBinding {
                 return Ok((state.handle.clone(), state.generation));
             }
         }
-        let fresh = attach::ensure_owned_runtime(&plan.cfg, plan.runtime_dir.clone())
-            .map_err(|failure| format!("{}: {}", failure.stage, failure.cause))?;
+        let fresh =
+            attach::ensure_owned_runtime(&plan.cfg, plan.runtime_dir.clone(), &plan.models_path)
+                .map_err(|failure| format!("{}: {}", failure.stage, failure.cause))?;
         let handle = Self::handle_of(&fresh);
         let mut state = self.lock_state();
         state.handle = handle.clone();

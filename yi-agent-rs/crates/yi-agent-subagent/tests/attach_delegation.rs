@@ -51,6 +51,17 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
     }
 }
 
+/// A per-test catalog path that does not exist, so the worker factory resolves
+/// against an empty catalog instead of the developer's real `~/.yi-agent`.
+///
+/// These tests exercise the attach/delegate wiring, not model selection; reading
+/// the real machine catalog would make them depend on whatever models happen to
+/// be configured on the host (and, before `models_path` was injected, flip the
+/// resolved provider and silently break the attach assumptions).
+fn isolated_models_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("models.json")
+}
+
 /// The whole point of the shared crate: a project attaches, its root activates
 /// from the first real prompt, a delegated child is admitted, and detaching
 /// always succeeds.
@@ -61,9 +72,12 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
     init_git_repo(repo.path());
     let cfg = config_for(repo.path());
 
-    let attached =
-        yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime_dir.path().to_path_buf())
-            .expect("a clean git project must attach");
+    let attached = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime_dir.path().to_path_buf(),
+        &isolated_models_path(repo.path()),
+    )
+    .expect("a clean git project must attach");
     assert!(
         attached
             .workspace_root
@@ -149,8 +163,12 @@ fn ensure_owned_starts_a_daemon_when_none_is_listening() {
     init_git_repo(repo.path());
     let cfg = config_for(repo.path());
 
-    let owned = yi_agent_subagent::attach::ensure_owned_runtime(&cfg, runtime.path().to_path_buf())
-        .expect("a dead runtime must be replaced with a fresh one");
+    let owned = yi_agent_subagent::attach::ensure_owned_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &isolated_models_path(repo.path()),
+    )
+    .expect("a dead runtime must be replaced with a fresh one");
 
     assert!(
         owned.embedded_daemon.is_some(),
@@ -177,14 +195,19 @@ fn ensure_owned_reuses_a_healthy_daemon() {
     // factory has no workspace service, so the attach that follows would be
     // rejected for unrelated reasons and this test could not tell "reused"
     // from "broken".
-    let factory = yi_agent_subagent::attach::worker_factory(&cfg, socket).expect("factory");
+    let factory =
+        yi_agent_subagent::attach::worker_factory(&cfg, socket, &isolated_models_path(repo.path()))
+            .expect("factory");
     let _existing =
         yi_agent_store::ipc::Daemon::start_with_factory(runtime.path(), &database, factory)
             .expect("daemon starts");
 
-    let joined =
-        yi_agent_subagent::attach::ensure_owned_runtime(&cfg, runtime.path().to_path_buf())
-            .expect("a healthy runtime must be adopted, not replaced");
+    let joined = yi_agent_subagent::attach::ensure_owned_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &isolated_models_path(repo.path()),
+    )
+    .expect("a healthy runtime must be adopted, not replaced");
 
     assert!(
         joined.embedded_daemon.is_none(),
@@ -201,9 +224,12 @@ fn delegation_tools_act_as_the_conversations_own_root() {
     let runtime_dir = tempfile::TempDir::new().unwrap();
     init_git_repo(repo.path());
     let cfg = config_for(repo.path());
-    let attached =
-        yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime_dir.path().to_path_buf())
-            .expect("a clean git project must attach");
+    let attached = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime_dir.path().to_path_buf(),
+        &isolated_models_path(repo.path()),
+    )
+    .expect("a clean git project must attach");
 
     // One shared binding (one daemon), two conversations: exactly the desktop
     // app-server's arrangement.
@@ -340,9 +366,12 @@ fn a_process_that_owns_the_daemon_supervises_its_plugins() {
     arm_plugin(repo.path(), &marker);
     let cfg = config_for(repo.path());
 
-    let attached =
-        yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime_dir.path().to_path_buf())
-            .expect("a clean git project must attach");
+    let attached = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime_dir.path().to_path_buf(),
+        &isolated_models_path(repo.path()),
+    )
+    .expect("a clean git project must attach");
     assert!(
         attached.embedded_daemon.is_some(),
         "this test needs the process to own the daemon"
