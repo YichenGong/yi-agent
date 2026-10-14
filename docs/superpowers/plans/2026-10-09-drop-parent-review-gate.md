@@ -8,6 +8,14 @@
 
 **Tech Stack:** Rust（edition 2024，workspace 14 crate）、rusqlite/SQLite、serde、tokio；依据 spec `docs/superpowers/specs/2026-10-09-drop-parent-review-gate-design.md`。
 
+> **行号基准（2026-10-14 rebase 核验）**：本分支已 rebase 到 `main`（`065a4e0d`）。
+> 自本计划原始基点（`40cd506e`）以来 `main` 前进 214 个提交，但**后端 6 文件与全部测试文件
+> 未被触碰**（`task.rs`、`supervisor.rs`、`mailbox.rs`、`repository.rs`、`runtime.rs`、`ipc.rs`、
+> `yi-agent-subagent/src/lib.rs`，逐文件 `git diff 40cd506e..main` 为空），故 Task 1-3、Task 5 及
+> spec 的行号引用**仍然精确**。只有 **Task 4 的前端 3 文件漂移**：`app-server/src/server.rs`
+> （+1040）、`tui/app.rs`（+175）、`main.rs`（+1）。下方 Task 4 的行号已按实测值回写；执行时仍以
+> 编译器错误 + `grep -n` 现查为准。
+
 ## Global Constraints
 
 - **严禁在 `main` 上改代码或提交**：先 `git worktree add .worktrees/<branch> -b <type>/<name>`；改完在 worktree 内跑测试 + `cargo fmt --all`。
@@ -397,7 +405,7 @@ git commit -m "refactor(store): 删除 review 决策面与 IPC，交付走普通
     );
 ```
 
-在 `yi-agent-app-server/src/server.rs`：把 `DELEGATION_TOOLS`（`server.rs:8233-8240`）改为五项（去掉 `"review_agent"`），相关断言同步。
+在 `yi-agent-app-server/src/server.rs`：把 `DELEGATION_TOOLS`（`server.rs:9273-9280`，原计划写 8233-8240，rebase 后已漂移 +1040）改为五项（去掉 `"review_agent"`），相关断言同步。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -410,9 +418,9 @@ Expected: 编译失败或断言失败（`review_agent` 仍在）。
 
 - [ ] **Step 4: 改 TUI 与 CLI**
 
-`tui/app.rs`：删 `/accept` `/rework` `/reject` 分派（2604-2630）、helper `parse_accept_args` / `parse_rework_args` / `parse_reject_args` / `parse_review_text_args`（2794-2819）、`daemon_accept*` / `daemon_rework*` / `daemon_reject*`（3175-3250）、相关测试（4159-4167, 4280-4345）。
+`tui/app.rs`：删 `/accept` `/rework` `/reject` 分派（`SlashCommand::{Accept,Rework,Reject}` 臂在 2779-2817）、helper `parse_accept_args` / `parse_rework_args` / `parse_reject_args` / `parse_review_text_args`（2970-3025）、`daemon_accept*` / `daemon_rework*` / `daemon_reject*` / `daemon_review_decision_at`（3351-3472）、相关测试（`review_command_parsers_accept_confirmation_tokens_and_freeform_text` 4332、`accept/rework/reject_control_previews_then_confirms_review_from_tui` 4453/4480/4515）。
 
-`main.rs`：删 `AgentAction::{Accept, Rework, Reject}` 及其 `ConfirmReview` 调用（516-575）、结果分支 `ReviewApproved/ReviewReworkRequested/ReviewRejected`（620-622）、`preview_review` helper 与 `ReviewPreview` 处理（634-644）。
+`main.rs`：删 `AgentAction::{Accept, Rework, Reject}` 及其 `ConfirmReview` 调用（517-575）、结果分支 `ReviewApproved/ReviewReworkRequested/ReviewRejected`（621-623）、`preview_review` helper（`show_review_preview`，632-665）与 `ReviewPreview` 处理。
 
 - [ ] **Step 5: 跑受影响 crate 测试**
 
