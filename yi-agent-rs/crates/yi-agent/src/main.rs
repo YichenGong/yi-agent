@@ -861,7 +861,11 @@ fn build_daemon_worker_factory(
     runtime_socket: std::path::PathBuf,
 ) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
     let config = config::load(cli)?;
-    yi_agent_subagent::attach::worker_factory(&config, runtime_socket)
+    yi_agent_subagent::attach::worker_factory(
+        &config,
+        runtime_socket,
+        &yi_agent_runtime::models::models_path(),
+    )
 }
 
 /// The runtime socket for a project, resolved identically everywhere.

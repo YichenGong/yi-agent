@@ -281,6 +281,7 @@ fn attach_delegation(
     runtimes: &ProjectRuntimes,
     thread_roots: &ThreadRoots,
     runtime_dir: &Path,
+    models_path: &Path,
     cfg: &RuntimeConfig,
     cwd: &str,
     thread_id: &str,
@@ -290,7 +291,7 @@ fn attach_delegation(
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
     thread_cfg.workdir = PathBuf::from(cwd);
-    let binding = match attach_cwd_runtime(runtimes, runtime_dir, &thread_cfg) {
+    let binding = match attach_cwd_runtime(runtimes, runtime_dir, &thread_cfg, models_path) {
         Ok(binding) => binding,
         Err(cause) => {
             tracing::warn!(
@@ -762,6 +763,7 @@ fn attach_cwd_runtime(
     runtimes: &ProjectRuntimes,
     runtime_dir: &Path,
     cfg: &RuntimeConfig,
+    models_path: &Path,
 ) -> Result<Arc<RuntimeBinding>, String> {
     let key = project_key(&cfg.workdir);
     if let Some(existing) = runtimes.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
@@ -771,9 +773,20 @@ fn attach_cwd_runtime(
     // one. The binding it returns heals itself on later calls, so a daemon that
     // dies after this point (e.g. its terminal closes) no longer strands the
     // thread's delegation tools.
-    let outcome = yi_agent_subagent::attach::ensure_owned_runtime(cfg, runtime_dir.to_path_buf())
-        .map(|attached| RuntimeBinding::managed(cfg, runtime_dir.to_path_buf(), Arc::new(attached)))
-        .map_err(|failure| format!("{}: {}", failure.stage, failure.cause));
+    let outcome = yi_agent_subagent::attach::ensure_owned_runtime(
+        cfg,
+        runtime_dir.to_path_buf(),
+        models_path,
+    )
+    .map(|attached| {
+        RuntimeBinding::managed(
+            cfg,
+            runtime_dir.to_path_buf(),
+            models_path.to_path_buf(),
+            Arc::new(attached),
+        )
+    })
+    .map_err(|failure| format!("{}: {}", failure.stage, failure.cause));
     runtimes
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -3461,6 +3474,7 @@ where
                             &mut process_watches,
                             &runtimes,
                             &thread_roots,
+                            &models_path,
                             &cfg,
                             &cwd,
                             mode,
@@ -3618,6 +3632,7 @@ where
                             &runtimes,
                             &thread_roots,
                             &runtime_dir,
+                            &models_path,
                             &cfg,
                             &cwd,
                             &thread_id,
@@ -5402,6 +5417,7 @@ where
                     &mut uploads,
                     &runtimes,
                     &thread_roots,
+                    &models_path,
                     &cfg,
                     &hub,
                     &turn_tx,
@@ -6817,6 +6833,7 @@ async fn card_scheduler_tick<F>(
     uploads: &mut crate::image_upload::UploadRegistry,
     runtimes: &ProjectRuntimes,
     thread_roots: &ThreadRoots,
+    models_path: &Path,
     cfg: &RuntimeConfig,
     hub: &Arc<crate::broadcast::Broadcaster>,
     turn_tx: &mpsc::Sender<TurnEvent>,
@@ -6871,6 +6888,7 @@ async fn card_scheduler_tick<F>(
             uploads,
             runtimes,
             thread_roots,
+            models_path,
             cfg,
             hub,
             turn_tx,
@@ -6905,6 +6923,9 @@ struct ServeLauncher<'a, F> {
     uploads: &'a mut crate::image_upload::UploadRegistry,
     runtimes: &'a ProjectRuntimes,
     thread_roots: &'a ThreadRoots,
+    /// 机器级模型清单路径:看板会话的委派链路与手工会话读同一份,而非各自
+    /// 重读 `$HOME`。
+    models_path: &'a Path,
     cfg: &'a RuntimeConfig,
     hub: &'a Arc<crate::broadcast::Broadcaster>,
     turn_tx: &'a mpsc::Sender<TurnEvent>,
@@ -6966,6 +6987,7 @@ where
             self.process_watches,
             self.runtimes,
             self.thread_roots,
+            self.models_path,
             self.cfg,
             &request.workdir,
             crate::thread_store::ThreadMode::Yolo,
@@ -7138,6 +7160,7 @@ async fn start_thread_core(
     process_watches: &mut HashMap<String, ProcessWatch>,
     runtimes: &ProjectRuntimes,
     thread_roots: &ThreadRoots,
+    models_path: &Path,
     cfg: &RuntimeConfig,
     cwd: &str,
     mode: crate::thread_store::ThreadMode,
@@ -7168,6 +7191,7 @@ async fn start_thread_core(
         runtimes,
         thread_roots,
         &runtime_dir,
+        models_path,
         cfg,
         cwd,
         &thread_id,
@@ -8515,6 +8539,7 @@ mod plugins_tests {
 mod card_scheduling_tests {
     use super::*;
     use crate::server::tests::{build_test_agent, test_config};
+    use crate::server::tests_support::isolated_models_path;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -8661,6 +8686,9 @@ mod card_scheduling_tests {
         git_diff: crate::git_diff_tool::GitDiffHandle,
         workspaces: WorkspaceIndex,
         workdir: PathBuf,
+        /// 委派链路要读的机器清单路径。指向本测试的隔离目录,避免读到开发者
+        /// 真实的 `~/.yi-agent/models.json` 而改变解析出的 provider。
+        models_path: PathBuf,
         _workdir_dir: tempfile::TempDir,
         _theme_dir: tempfile::TempDir,
         _workspace_dir: tempfile::TempDir,
@@ -8690,6 +8718,7 @@ mod card_scheduling_tests {
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 workspaces: WorkspaceIndex::new(workspace_dir.path().join("workspaces.json")),
                 workdir,
+                models_path: isolated_models_path(theme_dir.path()),
                 _workdir_dir: workdir_dir,
                 _theme_dir: theme_dir,
                 _workspace_dir: workspace_dir,
@@ -8711,6 +8740,7 @@ mod card_scheduling_tests {
                 uploads: &mut self.uploads,
                 runtimes: &self.runtimes,
                 thread_roots: &self.thread_roots,
+                models_path: &self.models_path,
                 cfg: &self.cfg,
                 hub: &self.hub,
                 turn_tx: &self.turn_tx,
@@ -9174,6 +9204,16 @@ pub(crate) mod tests_support {
     /// 不一致会凭空造出「上报 != 运行」的假象。
     pub(crate) const TEST_MODEL: &str = "test-model";
 
+    /// 一份指向不存在文件的机器清单路径,供直接自建 runtime 的测试使用。
+    ///
+    /// 这些测试不经过 `Harness`(后者的 `models_path` 已隔离),所以委派链路若从
+    /// 真实 `$HOME` 解析清单,就会依赖宿主机配了哪些模型——一旦存在
+    /// `subagent_model`/`default_model` 条目,解析出的 provider 会被悄悄改写、
+    /// 偏离测试的 `cfg`。传一个空清单让决策留在测试内。
+    pub(crate) fn isolated_models_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("models.json")
+    }
+
     /// 等待一个**必然到来**的正面事件（一帧 JSONL、一条 turn 事件、server 任务结束）
     /// 时使用的上限。
     ///
@@ -9235,7 +9275,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use super::tests_support::EVENT_WAIT;
+    use super::tests_support::{EVENT_WAIT, isolated_models_path};
 
     /// 单轮逻辑是共享的 `watch::once`(Task 3 已在其自身 crate 内测过);这里只
     /// 断言 app-server 用的是同名同款:读登记 → 把登记项目交给 ensurer。
@@ -9293,11 +9333,19 @@ pub(crate) mod tests {
         cfg.workdir = repo.path().to_path_buf();
 
         let attached = Arc::new(
-            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
-                .expect("a clean git repo must attach"),
+            yi_agent_subagent::attach::attach_project_runtime(
+                &cfg,
+                runtime.path().to_path_buf(),
+                &isolated_models_path(runtime.path()),
+            )
+            .expect("a clean git repo must attach"),
         );
-        let binding =
-            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let binding = RuntimeBinding::managed(
+            &cfg,
+            runtime.path().to_path_buf(),
+            isolated_models_path(runtime.path()),
+            Arc::clone(&attached),
+        );
         let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
 
         let tooling = build_runtime_tooling(
@@ -9362,11 +9410,19 @@ pub(crate) mod tests {
         cfg.workdir = repo.path().to_path_buf();
 
         let attached = Arc::new(
-            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
-                .expect("a clean git repo must attach"),
+            yi_agent_subagent::attach::attach_project_runtime(
+                &cfg,
+                runtime.path().to_path_buf(),
+                &isolated_models_path(runtime.path()),
+            )
+            .expect("a clean git repo must attach"),
         );
-        let binding =
-            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let binding = RuntimeBinding::managed(
+            &cfg,
+            runtime.path().to_path_buf(),
+            isolated_models_path(runtime.path()),
+            Arc::clone(&attached),
+        );
         let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
 
         let names = build_runtime_tooling(
@@ -9400,9 +9456,12 @@ pub(crate) mod tests {
         // The default test sandbox is workspace-write and promotable.
         assert!(cfg.sandbox_promotable);
 
-        let attached =
-            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
-                .expect("a clean git repo must attach");
+        let attached = yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach");
 
         let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
             yi_agent_subagent::binding::RuntimeHandle {
@@ -9452,16 +9511,23 @@ pub(crate) mod tests {
         let mut cfg = test_config();
         cfg.workdir = plain.path().to_path_buf();
 
-        let outcome =
-            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf());
+        let outcome = yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        );
 
         let attached = Arc::new(outcome.expect("a plain directory attaches as an in-place root"));
         assert_eq!(
             attached.workspace_root, attached.project_root,
             "a non-git project has no checkout to move the root into"
         );
-        let binding =
-            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let binding = RuntimeBinding::managed(
+            &cfg,
+            runtime.path().to_path_buf(),
+            isolated_models_path(runtime.path()),
+            Arc::clone(&attached),
+        );
         let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
         let names = build_runtime_tooling(
             &cfg,
@@ -9592,6 +9658,7 @@ pub(crate) mod tests {
             &runtimes,
             &thread_roots,
             runtime.path(),
+            &isolated_models_path(runtime.path()),
             &cfg,
             &cwd,
             "thread-a",
@@ -9603,6 +9670,7 @@ pub(crate) mod tests {
             &runtimes,
             &thread_roots,
             runtime.path(),
+            &isolated_models_path(runtime.path()),
             &cfg,
             &cwd,
             "thread-b",
@@ -9639,8 +9707,13 @@ pub(crate) mod tests {
         cfg.workdir = repo.path().to_path_buf();
 
         let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
-        let binding =
-            attach_cwd_runtime(&runtimes, runtime.path(), &cfg).expect("a git project must attach");
+        let binding = attach_cwd_runtime(
+            &runtimes,
+            runtime.path(),
+            &cfg,
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a git project must attach");
         let socket = binding.current().unwrap().socket_path.clone();
 
         // Simulate the owning process exiting: drop every handle to the runtime
@@ -9654,8 +9727,13 @@ pub(crate) mod tests {
         );
 
         // Asking again must replace the dead runtime rather than cache the miss.
-        let repaired = attach_cwd_runtime(&runtimes, runtime.path(), &cfg)
-            .expect("a dead runtime must be replaced, not cached as a failure");
+        let repaired = attach_cwd_runtime(
+            &runtimes,
+            runtime.path(),
+            &cfg,
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a dead runtime must be replaced, not cached as a failure");
         assert_eq!(
             yi_agent_subagent::attach::probe_runtime(&repaired.current().unwrap().socket_path),
             yi_agent_subagent::attach::RuntimeProbe::Healthy,
@@ -19931,11 +20009,19 @@ pub(crate) mod tests {
         cfg.workdir = repo.path().to_path_buf();
 
         let attached = Arc::new(
-            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
-                .expect("a clean git repo must attach"),
+            yi_agent_subagent::attach::attach_project_runtime(
+                &cfg,
+                runtime.path().to_path_buf(),
+                &isolated_models_path(runtime.path()),
+            )
+            .expect("a clean git repo must attach"),
         );
-        let binding =
-            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let binding = RuntimeBinding::managed(
+            &cfg,
+            runtime.path().to_path_buf(),
+            isolated_models_path(runtime.path()),
+            Arc::clone(&attached),
+        );
         let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
 
         let tooling = build_runtime_tooling(
@@ -20325,11 +20411,19 @@ pub(crate) mod tests {
         cfg.workdir = repo.path().to_path_buf();
 
         let attached = Arc::new(
-            yi_agent_subagent::attach::attach_project_runtime(&cfg, runtime.path().to_path_buf())
-                .expect("a clean git repo must attach"),
+            yi_agent_subagent::attach::attach_project_runtime(
+                &cfg,
+                runtime.path().to_path_buf(),
+                &isolated_models_path(runtime.path()),
+            )
+            .expect("a clean git repo must attach"),
         );
-        let binding =
-            RuntimeBinding::managed(&cfg, runtime.path().to_path_buf(), Arc::clone(&attached));
+        let binding = RuntimeBinding::managed(
+            &cfg,
+            runtime.path().to_path_buf(),
+            isolated_models_path(runtime.path()),
+            Arc::clone(&attached),
+        );
         let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
         let tooling = build_runtime_tooling(
             &cfg,
