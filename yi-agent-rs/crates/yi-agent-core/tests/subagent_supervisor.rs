@@ -10,8 +10,8 @@ use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools, WorkerStartError,
 };
 use yi_agent_core::subagent::task::{
-    DeliveryReport, InheritedSandbox, IntegrationValidation, PauseReason, PermissionRequestId,
-    RecoveryEvidence, RootSessionId, TaskDepth, TaskEvent, TaskId, TaskState,
+    DeliveryReport, InheritedSandbox, PauseReason, PermissionRequestId, RecoveryEvidence,
+    RootSessionId, TaskDepth, TaskEvent, TaskId, TaskState,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, SpawnRequest, WorkerError, WorkerHandle, WorkerStart,
@@ -36,20 +36,10 @@ async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
         .clone()
         .expect("spawned child owns a workspace");
     let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p child");
-    let delivery_id = delivery.id.clone();
     handle.report_delivery(delivery);
     supervisor.reconcile_worker_events().unwrap();
-    // A parent resolves a child's delivery; only then does the child become
-    // terminal and enter the completion snapshot.
-    supervisor
-        .accept_review(
-            &child,
-            &root,
-            delivery_id,
-            IntegrationValidation::passed("cargo test -p parent"),
-        )
-        .unwrap();
-
+    // A delivered child is terminal immediately: no parent review gate stands
+    // between the delivery and the completion snapshot.
     let (_, reports) = supervisor.child_completion_snapshot(&root);
 
     assert_eq!(
@@ -59,19 +49,19 @@ async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
     );
     assert_eq!(
         reports[0].state, "completed",
-        "the accepted child is terminal"
+        "the delivered child is terminal without any review step"
     );
 }
 
 /// A coding child delivers a commit to its parent over the mailbox. If that
 /// parent is already terminal (a recovered root is parked in
-/// `recovery_required`, which is terminal), the notification can never be
-/// accepted. Under the cascade design a settled parent must not keep running
+/// `recovery_required`, which is terminal), the notification has no live
+/// audience. Under the cascade design a settled parent must not keep running
 /// children at all — any live child is cancelled, and a delivery that has no
-/// remaining audience is not kept around. So this test no longer asserts the
-/// child parks in `AwaitingParentReview`; what it still guards is the weaker
-/// but essential invariant that reconciliation never wedges, whether or not the
-/// delivery happens to be accepted before the cascade lands. Before the fix this
+/// remaining audience is not kept around. With the review gate gone a delivery
+/// lands the child in `Completed` outright, so what this test guards is the
+/// weaker but essential invariant that reconciliation never wedges, whether or
+/// not the delivery is processed before the cascade lands. Before the fix this
 /// `Delivered` event failed, the error aborted the whole reconciliation pass,
 /// and the child stayed `running` forever with no completion event.
 #[tokio::test]
@@ -1414,15 +1404,15 @@ fn a_recovery_required_parent_does_not_cascade() {
     );
 }
 
-/// The design names this risk explicitly (spec §5): a child parked in
-/// `AwaitingParentReview` is *not* terminal, so a parent that settles afterwards
-/// must cascade it. Otherwise a review waiter with no living reviewer holds its
-/// worktree lease and concurrency slot forever, and its delivery has no remaining
-/// audience. Drive the exact order the risk describes — the child parks first,
-/// the parent settles second — rather than the reverse (`Delivered` arriving
-/// after the parent is already terminal, covered separately).
+/// Dropping the parent-review gate closes the old spec §5 risk at the source: a
+/// child that delivers is `Completed` (terminal) the moment the delivery lands,
+/// so it can no longer sit in a non-terminal review wait holding a worktree
+/// lease and concurrency slot. What still matters is the follow-on invariant —
+/// a settling parent must leave the child's terminal outcome alone rather than
+/// re-cancel and overwrite it. Drive the exact order: the child delivers first,
+/// the parent settles second.
 #[tokio::test]
-async fn a_parent_that_settles_cascades_a_child_already_awaiting_review() {
+async fn a_parent_that_settles_leaves_a_completed_child_terminal() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
     let root = supervisor.root_task_id().clone();
     let child = supervisor.spawn(root.clone()).unwrap();
@@ -1436,16 +1426,14 @@ async fn a_parent_that_settles_cascades_a_child_already_awaiting_review() {
         .clone()
         .expect("spawned child owns a workspace");
 
-    // The child parks in `AwaitingParentReview` first.
+    // The child delivers first and lands `Completed` immediately.
     let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p child");
     handle.report_delivery(delivery);
     supervisor.reconcile_worker_events().unwrap();
-    assert!(
-        matches!(
-            supervisor.task(&child).unwrap().state(),
-            TaskState::AwaitingParentReview(_)
-        ),
-        "fixture requires a child parked in review, got {:?}",
+    assert_eq!(
+        supervisor.task(&child).unwrap().state(),
+        &TaskState::Completed,
+        "fixture requires an already completed child, got {:?}",
         supervisor.task(&child).unwrap().state()
     );
 
@@ -1454,20 +1442,13 @@ async fn a_parent_that_settles_cascades_a_child_already_awaiting_review() {
     let affected = supervisor.fail_task(&root, "the root crashed").unwrap();
 
     assert!(
-        affected.contains(&child),
-        "a child awaiting review under a settling parent must be reported as a victim, got {affected:?}"
+        !affected.contains(&child),
+        "a completed child is already settled, so it is not a cascade victim, got {affected:?}"
     );
-    assert!(
-        supervisor.task(&child).unwrap().state().is_terminal(),
-        "a review waiter must not outlive a settled parent, got {:?}",
-        supervisor.task(&child).unwrap().state()
-    );
-    assert!(
-        matches!(
-            supervisor.task(&child).unwrap().state(),
-            TaskState::Cancelled(_)
-        ),
-        "the cascade must cancel the waiter, got {:?}",
+    assert_eq!(
+        supervisor.task(&child).unwrap().state(),
+        &TaskState::Completed,
+        "a settled parent must not rewrite the completed child's outcome, got {:?}",
         supervisor.task(&child).unwrap().state()
     );
 }

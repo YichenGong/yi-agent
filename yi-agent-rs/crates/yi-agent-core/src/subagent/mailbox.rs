@@ -20,9 +20,6 @@ pub struct ProgressReport(pub String);
 pub struct ScopeChangeDraft(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReworkInstruction(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserInstruction(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +30,6 @@ pub enum MessageKind {
     Failed(TaskFailure),
     PermissionRequest(PermissionRequestId),
     ScopeChange(ScopeChangeDraft),
-    Rework(ReworkInstruction),
-    ReviewRejected(MessageId),
     UserInstruction(UserInstruction),
 }
 
@@ -42,12 +37,9 @@ impl MessageKind {
     fn priority(&self) -> MessagePriority {
         match self {
             Self::PermissionRequest(_) => MessagePriority::Critical,
-            Self::Completed(_)
-            | Self::Blocked(_)
-            | Self::Failed(_)
-            | Self::ScopeChange(_)
-            | Self::Rework(_)
-            | Self::ReviewRejected(_) => MessagePriority::High,
+            Self::Completed(_) | Self::Blocked(_) | Self::Failed(_) | Self::ScopeChange(_) => {
+                MessagePriority::High
+            }
             Self::Progress(_) | Self::UserInstruction(_) => MessagePriority::Normal,
         }
     }
@@ -225,12 +217,6 @@ impl Mailbox {
         &self.messages
     }
 
-    pub fn is_rework(&self, id: &MessageId) -> bool {
-        self.messages
-            .iter()
-            .any(|message| &message.id == id && matches!(message.kind, MessageKind::Rework(_)))
-    }
-
     pub fn user_instruction(&self, id: &MessageId) -> Option<String> {
         self.messages
             .iter()
@@ -257,19 +243,14 @@ impl Mailbox {
             .collect()
     }
 
-    /// Controller inputs include external overrides and direct-parent rework
-    /// instructions, both of which must reach a newly started worker prompt.
+    /// Controller inputs are the external overrides that must reach a newly
+    /// started worker prompt before it can make progress.
     pub fn pending_worker_inputs(&self) -> Vec<(MessageId, String)> {
         self.messages
             .iter()
             .filter_map(|message| match (&message.sender, &message.kind) {
                 (None, MessageKind::UserInstruction(UserInstruction(body)))
                     if !message.consumed_by_worker =>
-                {
-                    Some((message.id.clone(), body.clone()))
-                }
-                (Some(_), MessageKind::Rework(ReworkInstruction(body)))
-                    if !message.delivered_to_worker =>
                 {
                     Some((message.id.clone(), body.clone()))
                 }

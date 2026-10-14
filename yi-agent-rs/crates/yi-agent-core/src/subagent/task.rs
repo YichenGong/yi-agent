@@ -48,7 +48,6 @@ uuid_id!(AttemptId);
 uuid_id!(RootSessionId);
 uuid_id!(DeliveryId);
 uuid_id!(MessageId);
-uuid_id!(IntegrationId);
 uuid_id!(PermissionRequestId);
 uuid_id!(AuthorityId);
 uuid_id!(WorkspaceLeaseId);
@@ -150,7 +149,6 @@ pub enum TaskState {
     WaitingForPermission(PermissionRequestId),
     WaitingForChildren(WaitSelector),
     Paused(PauseReason),
-    AwaitingParentReview(DeliveryId),
     Completed,
     CompletedNoChanges,
     Blocked(BlockReason),
@@ -184,8 +182,8 @@ impl TaskState {
                     | Self::WaitingForPermission(_)
                     | Self::WaitingForChildren(_)
                     | Self::Paused(_)
+                    | Self::Completed
                     | Self::CompletedNoChanges
-                    | Self::AwaitingParentReview(_)
                     | Self::Blocked(_)
                     | Self::Stalled(_)
                     | Self::TimedOut(_)
@@ -207,9 +205,6 @@ impl TaskState {
             ) | (
                 Self::Paused(_),
                 Self::Queued | Self::Cancelled(_) | Self::RecoveryRequired(_)
-            ) | (
-                Self::AwaitingParentReview(_),
-                Self::Completed | Self::CompletedNoChanges | Self::Blocked(_) | Self::Cancelled(_)
             )
         );
 
@@ -244,24 +239,6 @@ impl TaskState {
 pub struct TaskTransitionError {
     pub from: TaskState,
     pub to: TaskState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DeliveryState {
-    None,
-    ReadyForReview(DeliveryId),
-    Accepted {
-        delivery: DeliveryId,
-        integration: IntegrationValidation,
-    },
-    ReworkRequested {
-        previous: DeliveryId,
-        feedback: MessageId,
-    },
-    Rejected {
-        delivery: DeliveryId,
-        reason: MessageId,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,35 +300,6 @@ impl DeliveryReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IntegrationValidation {
-    pub id: IntegrationId,
-    pub succeeded: bool,
-    pub evidence: String,
-}
-
-impl IntegrationValidation {
-    pub fn passed(evidence: impl Into<String>) -> Self {
-        Self {
-            id: IntegrationId::new(),
-            succeeded: true,
-            evidence: evidence.into(),
-        }
-    }
-
-    pub fn failed(evidence: impl Into<String>) -> Self {
-        Self {
-            id: IntegrationId::new(),
-            succeeded: false,
-            evidence: evidence.into(),
-        }
-    }
-
-    fn is_valid(&self) -> bool {
-        self.succeeded && !self.evidence.trim().is_empty()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StableCheckpoint(pub String);
 
 impl StableCheckpoint {
@@ -382,7 +330,6 @@ pub enum TerminalReason {
     Failed(TaskFailure),
     Cancelled(CancelReason),
     RecoveryRequired(RecoveryEvidence),
-    ReworkRequested,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,7 +460,6 @@ pub struct AgentTask {
     active_attempt: AttemptId,
     state: TaskState,
     pause_request: Option<PauseReason>,
-    delivery: DeliveryState,
     pub workspace: Option<WorkspaceLeaseId>,
     attempts: Vec<TaskAttempt>,
 }
@@ -533,7 +479,6 @@ impl AgentTask {
             active_attempt: attempt.id.clone(),
             state: TaskState::Queued,
             pause_request: None,
-            delivery: DeliveryState::None,
             workspace: None,
             attempts: vec![attempt],
         }
@@ -575,7 +520,6 @@ impl AgentTask {
                 "recovered after runtime restart".into(),
             )),
             pause_request: None,
-            delivery: DeliveryState::None,
             workspace: None,
             attempts: vec![attempt],
         }
@@ -626,8 +570,8 @@ impl AgentTask {
         task
     }
 
-    /// Reconstructs reducer state needed to route durable review mail after a
-    /// process restart. Historical rows remain authoritative in SQLite.
+    /// Reconstructs reducer state for a task rehydrated from durable rows
+    /// after a process restart. Historical rows remain authoritative in SQLite.
     #[allow(clippy::too_many_arguments)]
     pub fn hydrated_review_task(
         root_session_id: RootSessionId,
@@ -637,7 +581,6 @@ impl AgentTask {
         attempt_id: AttemptId,
         attempt_number: u32,
         state: TaskState,
-        delivery: Option<DeliveryReport>,
     ) -> Self {
         let ended_at = state.is_terminal().then(Utc::now);
         let attempt = TaskAttempt {
@@ -647,16 +590,10 @@ impl AgentTask {
             started_at: Utc::now(),
             ended_at,
             checkpoint: None,
-            delivery: delivery.clone(),
+            delivery: None,
             budget: EffectiveBudget::default(),
             usage: AttemptUsage::default(),
             terminal_reason: None,
-        };
-        let delivery = match (&state, delivery) {
-            (TaskState::AwaitingParentReview(_), Some(report)) => {
-                DeliveryState::ReadyForReview(report.id)
-            }
-            _ => DeliveryState::None,
         };
         Self {
             id: task_id,
@@ -669,7 +606,6 @@ impl AgentTask {
             active_attempt: attempt_id,
             state,
             pause_request: None,
-            delivery,
             workspace: None,
             attempts: vec![attempt],
         }
@@ -710,10 +646,6 @@ impl AgentTask {
         self.pause_request.is_some()
     }
 
-    pub fn delivery(&self) -> &DeliveryState {
-        &self.delivery
-    }
-
     fn active_attempt_mut(&mut self) -> &mut TaskAttempt {
         self.attempts
             .iter_mut()
@@ -734,7 +666,6 @@ impl AgentTask {
     fn start_next_attempt(
         &mut self,
         terminal_reason: TerminalReason,
-        clear_delivery: bool,
         now: DateTime<Utc>,
     ) -> Result<TaskAttempt, AttemptLifecycleError> {
         let current = self.active_attempt_mut();
@@ -746,9 +677,6 @@ impl AgentTask {
         self.active_attempt = next.id.clone();
         self.attempts.push(next.clone());
         self.state = TaskState::Queued;
-        if clear_delivery {
-            self.delivery = DeliveryState::None;
-        }
         Ok(next)
     }
 
@@ -780,8 +708,6 @@ impl AgentTask {
 pub enum AttemptLifecycleError {
     #[error("retry requires a terminal task state")]
     RetryRequiresTerminalState,
-    #[error("rework requires awaiting parent review")]
-    ReworkRequiresReviewState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -829,22 +755,6 @@ pub enum TaskEvent {
     WorkerFailed {
         attempt_id: AttemptId,
         failure: TaskFailure,
-    },
-    ReviewAccepted {
-        attempt_id: AttemptId,
-        actor: TaskId,
-        delivery_id: DeliveryId,
-        integration: IntegrationValidation,
-    },
-    ReviewRework {
-        attempt_id: AttemptId,
-        delivery_id: DeliveryId,
-        feedback: MessageId,
-    },
-    ReviewRejected {
-        attempt_id: AttemptId,
-        delivery_id: DeliveryId,
-        reason: MessageId,
     },
     CancelRequested {
         attempt_id: AttemptId,
@@ -896,9 +806,6 @@ impl TaskEvent {
             | Self::WorkerDelivered { attempt_id, .. }
             | Self::WorkerCompletedNoChanges { attempt_id }
             | Self::WorkerFailed { attempt_id, .. }
-            | Self::ReviewAccepted { attempt_id, .. }
-            | Self::ReviewRework { attempt_id, .. }
-            | Self::ReviewRejected { attempt_id, .. }
             | Self::CancelRequested { attempt_id, .. }
             | Self::PauseRequested { attempt_id, .. }
             | Self::PauseAcknowledged { attempt_id }
@@ -926,11 +833,6 @@ pub enum TaskReduceError {
         event_attempt: AttemptId,
         active_attempt: AttemptId,
     },
-    #[error("event delivery does not match the delivery awaiting review")]
-    DeliveryMismatch {
-        expected: DeliveryId,
-        actual: DeliveryId,
-    },
     #[error("permission resolution does not match the active wait")]
     PermissionMismatch {
         expected: PermissionRequestId,
@@ -943,12 +845,6 @@ pub enum TaskReduceError {
     },
     #[error("invalid coding delivery evidence: {reason}")]
     InvalidDeliveryEvidence { reason: &'static str },
-    #[error("review acceptance requires a non-root task")]
-    ReviewRequiresParent,
-    #[error("review actor does not match direct parent")]
-    ReviewActorMismatch { expected: TaskId, actual: TaskId },
-    #[error("integration validation did not succeed with evidence")]
-    IntegrationNotValidated,
     #[error(transparent)]
     Transition(#[from] TaskTransitionError),
     #[error(transparent)]
@@ -1023,74 +919,14 @@ pub fn reduce(
             delivery
                 .validate_for(task)
                 .map_err(|reason| TaskReduceError::InvalidDeliveryEvidence { reason })?;
-            transition(
-                task,
-                TaskState::AwaitingParentReview(delivery.id.clone()),
-                now,
-            )?;
             task.active_attempt_mut().delivery = Some(delivery.clone());
-            task.delivery = DeliveryState::ReadyForReview(delivery.id);
+            transition(task, TaskState::Completed, now)?;
         }
         TaskEvent::WorkerFailed { failure, .. } => {
             transition(task, TaskState::Failed(failure), now)?
         }
         TaskEvent::WorkerCompletedNoChanges { .. } => {
             transition(task, TaskState::CompletedNoChanges, now)?
-        }
-        TaskEvent::ReviewAccepted {
-            delivery_id,
-            actor,
-            integration,
-            ..
-        } => {
-            require_review_delivery(task, &delivery_id)?;
-            let parent_id = task
-                .parent_id
-                .as_ref()
-                .ok_or(TaskReduceError::ReviewRequiresParent)?;
-            if parent_id != &actor {
-                return Err(TaskReduceError::ReviewActorMismatch {
-                    expected: parent_id.clone(),
-                    actual: actor,
-                });
-            }
-            if !integration.is_valid() {
-                return Err(TaskReduceError::IntegrationNotValidated);
-            }
-            task.delivery = DeliveryState::Accepted {
-                delivery: delivery_id,
-                integration,
-            };
-            transition(task, TaskState::Completed, now)?;
-        }
-        TaskEvent::ReviewRework {
-            delivery_id,
-            feedback,
-            ..
-        } => {
-            require_review_delivery(task, &delivery_id)?;
-            task.delivery = DeliveryState::ReworkRequested {
-                previous: delivery_id,
-                feedback,
-            };
-            result.new_attempt =
-                Some(task.start_next_attempt(TerminalReason::ReworkRequested, false, now)?);
-        }
-        TaskEvent::ReviewRejected {
-            delivery_id,
-            reason,
-            ..
-        } => {
-            require_review_delivery(task, &delivery_id)?;
-            task.delivery = DeliveryState::Rejected {
-                delivery: delivery_id,
-                reason,
-            };
-            transition(
-                task,
-                TaskState::Blocked(BlockReason("review rejected".into())),
-                now,
-            )?;
         }
         TaskEvent::CancelRequested { reason, .. } => {
             transition(task, TaskState::Cancelled(reason), now)?
@@ -1141,33 +977,10 @@ pub fn reduce(
             if !task.state().is_terminal() {
                 return Err(AttemptLifecycleError::RetryRequiresTerminalState.into());
             }
-            result.new_attempt =
-                Some(task.start_next_attempt(task.terminal_reason(), true, now)?);
+            result.new_attempt = Some(task.start_next_attempt(task.terminal_reason(), now)?);
         }
     }
     Ok(result)
-}
-
-// The reducer error includes the full unexpected state for operator diagnosis.
-#[allow(clippy::result_large_err)]
-fn require_review_delivery(
-    task: &AgentTask,
-    delivery_id: &DeliveryId,
-) -> Result<(), TaskReduceError> {
-    let TaskState::AwaitingParentReview(expected) = task.state() else {
-        return Err(TaskTransitionError {
-            from: task.state().clone(),
-            to: TaskState::Completed,
-        }
-        .into());
-    };
-    if expected != delivery_id {
-        return Err(TaskReduceError::DeliveryMismatch {
-            expected: expected.clone(),
-            actual: delivery_id.clone(),
-        });
-    }
-    Ok(())
 }
 
 // The reducer error includes the full unexpected state for operator diagnosis.
@@ -1259,7 +1072,7 @@ mod tests {
         );
         assert!(
             TaskState::Running
-                .can_transition_to(TaskState::AwaitingParentReview(DeliveryId::new()))
+                .can_transition_to(TaskState::Completed)
                 .is_ok()
         );
     }
@@ -1369,15 +1182,12 @@ mod tests {
         assert_eq!(task.state(), &TaskState::Running);
     }
 
+    /// 交付直接落终态：不再有中间审阅态。
     #[test]
-    fn review_events_require_the_current_delivery() {
-        let parent_id = TaskId::new();
-        let workspace = WorkspaceLeaseId::new();
-        let mut task = AgentTask::new_child(RootSessionId::new(), parent_id.clone())
-            .with_workspace(workspace.clone());
+    fn worker_delivery_completes_the_child_directly() {
+        let (mut task, workspace) = task_with_workspace();
         let now = Utc::now();
         let attempt_id = task.active_attempt_id().clone();
-        let delivery = coding_delivery(workspace);
         task.reduce(
             TaskEvent::AdmissionGranted {
                 attempt_id: attempt_id.clone(),
@@ -1385,29 +1195,22 @@ mod tests {
             now,
         )
         .unwrap();
+        let delivery = coding_delivery(workspace);
         task.reduce(
             TaskEvent::WorkerDelivered {
-                attempt_id: attempt_id.clone(),
+                attempt_id,
                 delivery: delivery.clone(),
             },
             now,
         )
         .unwrap();
-
-        let result = task.reduce(
-            TaskEvent::ReviewAccepted {
-                attempt_id,
-                actor: parent_id,
-                delivery_id: DeliveryId::new(),
-                integration: IntegrationValidation::passed("integration test"),
-            },
-            now,
+        assert_eq!(task.state(), &TaskState::Completed);
+        assert!(task.state().is_terminal());
+        assert_eq!(
+            task.active_attempt().delivery.as_ref(),
+            Some(&delivery),
+            "attempt 仍保留交付报告，供父读取 commit"
         );
-        assert!(matches!(
-            result,
-            Err(TaskReduceError::DeliveryMismatch { .. })
-        ));
-        assert_eq!(task.state(), &TaskState::AwaitingParentReview(delivery.id));
     }
 
     #[test]
@@ -1439,8 +1242,8 @@ mod tests {
     }
 
     #[test]
-    fn retry_and_rework_create_attempts_without_erasing_evidence() {
-        let (mut task, workspace) = task_with_workspace();
+    fn retry_creates_a_successor_attempt_without_erasing_evidence() {
+        let (mut task, _workspace) = task_with_workspace();
         let now = Utc::now();
         let original_id = task.active_attempt_id().clone();
         task.reduce(
@@ -1474,128 +1277,8 @@ mod tests {
             task.attempts()[0].terminal_reason,
             Some(TerminalReason::Failed(TaskFailure::new("worker failed")))
         );
-
-        let delivery = coding_delivery(workspace);
-        task.reduce(
-            TaskEvent::AdmissionGranted {
-                attempt_id: retry.id.clone(),
-            },
-            now,
-        )
-        .unwrap();
-        task.reduce(
-            TaskEvent::WorkerDelivered {
-                attempt_id: retry.id.clone(),
-                delivery: delivery.clone(),
-            },
-            now,
-        )
-        .unwrap();
-        let rework = task
-            .reduce(
-                TaskEvent::ReviewRework {
-                    attempt_id: retry.id.clone(),
-                    delivery_id: delivery.id.clone(),
-                    feedback: MessageId::new(),
-                },
-                now,
-            )
-            .unwrap()
-            .new_attempt
-            .unwrap();
-        assert_ne!(rework.id, retry.id);
-        assert_eq!(task.attempts().len(), 3);
-        assert_eq!(task.attempts()[1].delivery, Some(delivery.clone()));
-        assert!(
-            matches!(task.delivery(), DeliveryState::ReworkRequested { previous, .. } if *previous == delivery.id)
-        );
-    }
-
-    #[test]
-    fn only_parent_with_successful_integration_can_accept_review() {
-        let parent_id = TaskId::new();
-        let workspace = WorkspaceLeaseId::new();
-        let mut task = AgentTask::new_child(RootSessionId::new(), parent_id.clone())
-            .with_workspace(workspace.clone());
-        let now = Utc::now();
-        let attempt_id = task.active_attempt_id().clone();
-        let delivery = coding_delivery(workspace);
-        task.reduce(
-            TaskEvent::AdmissionGranted {
-                attempt_id: attempt_id.clone(),
-            },
-            now,
-        )
-        .unwrap();
-        task.reduce(
-            TaskEvent::WorkerDelivered {
-                attempt_id: attempt_id.clone(),
-                delivery: delivery.clone(),
-            },
-            now,
-        )
-        .unwrap();
-
-        let wrong_actor = task.reduce(
-            TaskEvent::ReviewAccepted {
-                attempt_id: attempt_id.clone(),
-                actor: TaskId::new(),
-                delivery_id: delivery.id.clone(),
-                integration: IntegrationValidation::passed("integration test"),
-            },
-            now,
-        );
-        assert!(matches!(
-            wrong_actor,
-            Err(TaskReduceError::ReviewActorMismatch { .. })
-        ));
-        let failed_integration = task.reduce(
-            TaskEvent::ReviewAccepted {
-                attempt_id,
-                actor: parent_id,
-                delivery_id: delivery.id,
-                integration: IntegrationValidation::failed("integration failed"),
-            },
-            now,
-        );
-        assert!(matches!(
-            failed_integration,
-            Err(TaskReduceError::IntegrationNotValidated)
-        ));
-    }
-
-    #[test]
-    fn root_task_cannot_accept_its_own_review() {
-        let (mut task, workspace) = task_with_workspace();
-        let now = Utc::now();
-        let attempt_id = task.active_attempt_id().clone();
-        let delivery = coding_delivery(workspace);
-        task.reduce(
-            TaskEvent::AdmissionGranted {
-                attempt_id: attempt_id.clone(),
-            },
-            now,
-        )
-        .unwrap();
-        task.reduce(
-            TaskEvent::WorkerDelivered {
-                attempt_id: attempt_id.clone(),
-                delivery: delivery.clone(),
-            },
-            now,
-        )
-        .unwrap();
-
-        let result = task.reduce(
-            TaskEvent::ReviewAccepted {
-                attempt_id,
-                actor: TaskId::new(),
-                delivery_id: delivery.id,
-                integration: IntegrationValidation::passed("integration test"),
-            },
-            now,
-        );
-        assert!(matches!(result, Err(TaskReduceError::ReviewRequiresParent)));
+        assert_eq!(task.active_attempt_id(), &retry.id);
+        assert_eq!(task.state(), &TaskState::Queued);
     }
 
     #[test]
