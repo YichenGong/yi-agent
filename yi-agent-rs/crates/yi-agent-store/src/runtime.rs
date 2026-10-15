@@ -2832,6 +2832,9 @@ impl RuntimeCoordinator {
                     .confirm_user_override_consumed(task_id, message_id);
             }
         }
+        // 交付即终态：这里落库的是 `task_delivered`，它才是「已交付子任务」的终止
+        // 标记（交付子任务不会再发 `task_completed`）。v14 只把历史 review 行改成
+        // `task_completed`，不要因此改动新事件类型，否则重启的逐字事件断言会失效。
         for (task_id, attempt, delivery) in deliveries {
             self.repository
                 .lock()

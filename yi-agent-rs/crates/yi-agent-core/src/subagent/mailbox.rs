@@ -59,9 +59,6 @@ pub struct MailboxMessage {
     pub correlation_id: Option<AttemptId>,
     pub created_at: DateTime<Utc>,
     pub coalesced_count: u32,
-    /// In-memory acknowledgement that this daemon process handed the item to
-    /// a worker inbox. Durable consumption is tracked separately by runtime.
-    pub delivered_to_worker: bool,
     /// The worker has committed to injecting this external override into its
     /// next prompt. The runtime persists the corresponding acknowledgement.
     pub consumed_by_worker: bool,
@@ -201,7 +198,6 @@ impl Mailbox {
             correlation_id: draft.correlation_id,
             created_at: Utc::now(),
             coalesced_count: 1,
-            delivered_to_worker: false,
             consumed_by_worker: false,
         };
         let receipt = DeliveryReceipt {
@@ -257,18 +253,6 @@ impl Mailbox {
                 _ => None,
             })
             .collect()
-    }
-
-    pub fn mark_delivered_to_worker(&mut self, id: &MessageId) {
-        if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
-            message.delivered_to_worker = true;
-        }
-    }
-
-    pub fn mark_pending_for_worker(&mut self, id: &MessageId) {
-        if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
-            message.delivered_to_worker = false;
-        }
     }
 
     /// Only external user overrides participate in the durable consumption

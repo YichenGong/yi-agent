@@ -389,3 +389,124 @@ fn delivery_survives_restart_without_restarting_worker() {
         before
     );
 }
+
+/// 重启后重新挂载时，父级必须仍能从 `WaitAgent` 读到子任务交付的 commit。
+///
+/// `delivery_survives_restart_without_restarting_worker` 里 root 处于 running，
+/// 重启走的是 recovery 分支（只重建 root，不经过 attach 水合）；本测试刻意让
+/// root 停在 queued 且不 activate，重启后 `AttachApplicationRoot` 才会真正水合，
+/// 从而覆盖 `hydrate_delivered_child`：去掉它，水合出的 attempt.delivery 会是
+/// None，`completed_child_reports` 的 delivery 随之丢失，下面的断言就会失败。
+#[test]
+fn delivered_child_commit_survives_restart_and_is_reported_to_parent() {
+    let dir = TempDir::new().unwrap();
+    let database = dir.path().join("runtime.sqlite");
+    let runtime = dir.path().join("runtime");
+    let factory = Arc::new(DeliveryFactory::default());
+    let daemon = Daemon::start_with_factory(&runtime, &database, factory.clone()).unwrap();
+    let IpcResponse::ApplicationRootAttached {
+        session_id,
+        root_task_id,
+        message_capability,
+        ..
+    } = send_request(
+        daemon.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "runtime-e2e-delivery-report-restart".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected attached application root");
+    };
+    // root 停在 queued（不 activate），这样它的状态不属于 recover_inflight_tasks
+    // 的扫描范围，重启后只能靠 attach 水合把它和孩子一起重建。
+    let IpcResponse::TaskSpawned { task_id } = send_request(
+        daemon.socket_path(),
+        IpcRequest::SpawnApplicationChild {
+            workdir: None,
+            session_id: session_id.clone(),
+            parent_task_id: root_task_id.clone(),
+            capability: message_capability.clone(),
+            objective: "deliver".into(),
+            mode: Some("coding".into()),
+            model: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a spawned child");
+    };
+    let started = factory.starts.lock().unwrap()[0].clone();
+    factory.handles.lock().unwrap()[0].report_delivery(DeliveryReport::coding(
+        "deadbeef",
+        "main",
+        started.workspace_lease_id.unwrap(),
+        "verified",
+    ));
+    let mut completed = false;
+    for _ in 0..100 {
+        if matches!(send_request(daemon.socket_path(), IpcRequest::InspectTask { task_id: task_id.clone() }).unwrap(), IpcResponse::TaskDetail(ref detail) if detail.state == "completed")
+        {
+            completed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(completed, "a delivered child must reach completed");
+
+    let starts = factory.starts.lock().unwrap().len();
+    drop(daemon);
+    let restarted = Daemon::start_with_factory(&runtime, &database, factory.clone()).unwrap();
+    assert_eq!(factory.starts.lock().unwrap().len(), starts);
+
+    let IpcResponse::ApplicationRootAttached {
+        session_id: reattached_session,
+        root_task_id: reattached_root,
+        message_capability: reattached_capability,
+        ..
+    } = send_request(
+        restarted.socket_path(),
+        IpcRequest::AttachApplicationRoot {
+            idempotency_key: "runtime-e2e-delivery-report-restart".into(),
+            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("expected reattached application root");
+    };
+    let response = send_request(
+        restarted.socket_path(),
+        IpcRequest::WaitAgent {
+            session_id: reattached_session,
+            caller_task_id: root_task_id.clone(),
+            capability: reattached_capability,
+            mode: "all".into(),
+            timeout_ms: None,
+        },
+    )
+    .unwrap();
+    let IpcResponse::WaitCompleted {
+        status,
+        children,
+        reports,
+    } = response
+    else {
+        panic!("expected wait completion after restart, got {response:?}");
+    };
+    assert_eq!(status, "completed");
+    assert_eq!(children, vec![task_id.clone()]);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].task_id, task_id);
+    assert_eq!(reports[0].state, "completed");
+    assert_eq!(
+        reports[0].delivery.as_deref(),
+        Some("deadbeef"),
+        "重启水合必须把交付 commit 补回 attempt，否则父级会丢掉子任务的交付"
+    );
+    assert_eq!(reattached_root, root_task_id);
+}

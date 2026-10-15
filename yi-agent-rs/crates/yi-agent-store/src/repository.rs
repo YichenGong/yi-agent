@@ -1517,6 +1517,11 @@ impl RuntimeRepository {
     /// the direct parent's high-priority mailbox notification, in one durable
     /// transaction. Delivering IS completing: there is no review wait to land
     /// in, so the task and its attempt both finish here.
+    ///
+    /// The emitted `task_delivered` is the terminal marker for a delivered
+    /// child; a delivered child never emits `task_completed`. (v14 rewrites
+    /// historical review rows to `task_completed` but does not change what new
+    /// deliveries emit.)
     pub fn record_delivery(
         &mut self,
         task: &TaskId,
@@ -1618,31 +1623,6 @@ impl RuntimeRepository {
             )
             .optional()?
             .flatten())
-    }
-
-    pub fn mark_rework_messages_delivered(
-        &mut self,
-        task: &TaskId,
-        message_ids: &[MessageId],
-    ) -> Result<(), RepositoryError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for message_id in message_ids {
-            let changed = transaction.execute(
-                "UPDATE mailbox_messages SET delivered_at = CURRENT_TIMESTAMP
-                 WHERE id = ?1 AND recipient_task_id = ?2 AND kind = 'rework'
-                   AND delivered_at IS NULL",
-                params![message_id.to_string(), task.to_string()],
-            )?;
-            if changed != 1 {
-                return Err(RepositoryError::MailboxMessageNotFound {
-                    message_id: message_id.to_string(),
-                });
-            }
-        }
-        transaction.commit()?;
-        Ok(())
     }
 
     /// Returns a task's durable mailbox in enqueue order without acknowledging it.
@@ -4128,6 +4108,9 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
     // v14：父审状态下线。历史行改写为 `completed`，并清掉 review-only 的
     // mailbox 消息与事件 kind——否则删除枚举后 `RuntimeEvent::parse` 会对
     // 残留 kind 直接报 UnknownEventKind，让 ReadTaskEvents 整条读取失败。
+    // 父审通知行 kind 是仍在用的 'user_override'，靠 payload 里的
+    // 'user_review_override' 区分；它们同样是 review 时代产物，必须一并清掉，
+    // 否则重启后会被当成真的用户指令重放给父级。
     if current_version < 14 {
         let transaction = connection.unchecked_transaction()?;
         transaction.execute_batch(
@@ -4136,7 +4119,10 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
              UPDATE attempts SET state = 'completed'
                  WHERE state = 'awaiting_parent_review';
              DELETE FROM mailbox_messages
-                 WHERE kind IN ('rework', 'review_rejected');
+                 WHERE kind IN ('rework', 'review_rejected')
+                    OR (kind = 'user_override'
+                        AND sender_task_id IS NULL
+                        AND json_extract(payload_json, '$.kind') = 'user_review_override');
              UPDATE events SET kind = 'task_completed'
                  WHERE kind IN ('review_approved', 'review_accepted',
                                 'review_rework', 'review_rejected');",

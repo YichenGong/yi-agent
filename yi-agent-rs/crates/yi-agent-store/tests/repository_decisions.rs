@@ -189,6 +189,21 @@ fn migration_v14_folds_review_state_into_completed() {
             ],
         )
         .unwrap();
+    // 父审通知：kind 是仍在用的 'user_override'，只有 payload 里的
+    // 'user_review_override' 暴露它的 review 出身。
+    let review_notification = MessageId::new();
+    connection
+        .execute(
+            "INSERT INTO mailbox_messages
+             (id, recipient_task_id, sender_task_id, kind, priority, payload_json)
+             VALUES (?1, ?2, NULL, 'user_override', 1, ?3)",
+            rusqlite::params![
+                review_notification.to_string(),
+                parent.to_string(),
+                r#"{"message":"stale review notification","kind":"user_review_override"}"#
+            ],
+        )
+        .unwrap();
     drop(connection);
 
     let repository = RuntimeRepository::open(&database).unwrap();
@@ -231,6 +246,19 @@ fn migration_v14_folds_review_state_into_completed() {
     assert_eq!(
         review_mailbox_rows, 0,
         "review-only mailbox rows cannot be replayed once their kinds are gone"
+    );
+    let review_notification_rows: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM mailbox_messages
+             WHERE kind = 'user_override'
+               AND json_extract(payload_json, '$.kind') = 'user_review_override'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        review_notification_rows, 0,
+        "parent-facing review notifications must not replay as user instructions"
     );
 }
 
