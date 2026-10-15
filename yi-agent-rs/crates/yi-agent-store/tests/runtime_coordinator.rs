@@ -986,9 +986,6 @@ async fn a_delivered_child_reconciles_directly_to_completed() {
     assert!(mailbox[0].payload_json.contains(&delivery.id.to_string()));
 }
 
-#[tokio::test]
-async fn a_delivered_child_reconciles_directly_to_completed_placeholder() {}
-
 fn git_output(directory: &Path, args: &[&str]) -> Result<String, WorkerError> {
     let output = Command::new("git")
         .args(args)
