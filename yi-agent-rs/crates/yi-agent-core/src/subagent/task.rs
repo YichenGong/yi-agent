@@ -653,6 +653,17 @@ impl AgentTask {
             .expect("active attempt must be retained in attempt history")
     }
 
+    /// Restores the delivery a task produced before a restart.
+    ///
+    /// `hydrated_review_task` rebuilds the active attempt with `delivery = None`
+    /// because that reconstruction is generic. A terminal delivery row is the
+    /// authoritative evidence that the task really did deliver, so hydration
+    /// hands the report back here; without it a restarted parent could no longer
+    /// read the commit its child produced.
+    pub fn hydrate_delivery(&mut self, delivery: DeliveryReport) {
+        self.active_attempt_mut().delivery = Some(delivery);
+    }
+
     // Reducer errors preserve complete state-transition evidence for callers.
     #[allow(clippy::result_large_err)]
     pub fn reduce(

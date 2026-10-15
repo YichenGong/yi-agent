@@ -9,7 +9,7 @@ use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
     WorkerWorkspace, WorkerWorkspaceProvider, WorkerWorkspaceRegistry,
 };
-use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, IpcReviewDecision, send_request};
+use yi_agent_store::ipc::{Daemon, IpcRequest, IpcResponse, send_request};
 
 #[derive(Clone, Default)]
 struct DeliveryFactory {
@@ -202,202 +202,6 @@ fn concurrent_cancel_confirmation_has_one_winner() {
     );
 }
 
-#[test]
-fn competing_review_confirmations_have_one_winner() {
-    let (_directory, daemon, factory, session_id, root_task_id, capability) = active_runtime();
-    let task_id = spawn_child(
-        &daemon,
-        &session_id,
-        &root_task_id,
-        &capability,
-        "review concurrently",
-    );
-    report_delivery_and_wait_for_review(&daemon, &factory, &task_id);
-    let IpcResponse::ReviewPreview {
-        confirmation_token: accept_token,
-        ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::PreviewReview {
-            task_id: task_id.clone(),
-            decision: IpcReviewDecision::Accept {},
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected accept preview");
-    };
-    let IpcResponse::ReviewPreview {
-        confirmation_token: reject_token,
-        ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::PreviewReview {
-            task_id: task_id.clone(),
-            decision: IpcReviewDecision::Reject {
-                reason: "race".into(),
-            },
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected reject preview");
-    };
-
-    let barrier = Arc::new(Barrier::new(2));
-    let responses = thread::scope(|scope| {
-        let accept = scope.spawn(|| {
-            barrier.wait();
-            send_request(
-                daemon.socket_path(),
-                IpcRequest::ConfirmReview {
-                    task_id: task_id.clone(),
-                    decision: IpcReviewDecision::Accept {},
-                    confirmation_token: accept_token.clone(),
-                },
-            )
-            .unwrap()
-        });
-        let reject = scope.spawn(|| {
-            barrier.wait();
-            send_request(
-                daemon.socket_path(),
-                IpcRequest::ConfirmReview {
-                    task_id: task_id.clone(),
-                    decision: IpcReviewDecision::Reject {
-                        reason: "race".into(),
-                    },
-                    confirmation_token: reject_token.clone(),
-                },
-            )
-            .unwrap()
-        });
-        [accept.join().unwrap(), reject.join().unwrap()]
-    });
-
-    assert_eq!(
-        responses
-            .iter()
-            .filter(|response| {
-                matches!(
-                    response,
-                    IpcResponse::ReviewApproved | IpcResponse::ReviewRejected
-                )
-            })
-            .count(),
-        1
-    );
-    assert_eq!(
-        responses
-            .iter()
-            .filter(|response| matches!(response, IpcResponse::Error { .. }))
-            .count(),
-        1
-    );
-    let IpcResponse::TaskEvents { events } = send_request(
-        daemon.socket_path(),
-        IpcRequest::ReadTaskEvents {
-            task_id,
-            after_event_id: None,
-        },
-    )
-    .unwrap() else {
-        panic!("expected task events");
-    };
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == "review_approved" || event.kind == "review_rejected")
-            .count(),
-        1
-    );
-}
-
-#[test]
-fn rework_creates_one_successor_attempt_with_feedback() {
-    let (_directory, daemon, factory, session_id, root_task_id, capability) = active_runtime();
-    let task_id = spawn_child(
-        &daemon,
-        &session_id,
-        &root_task_id,
-        &capability,
-        "rework delivery",
-    );
-    report_delivery_and_wait_for_review(&daemon, &factory, &task_id);
-    let first_start = factory.starts.lock().unwrap()[0].clone();
-    let IpcResponse::ReviewPreview {
-        confirmation_token, ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::PreviewReview {
-            task_id: task_id.clone(),
-            decision: IpcReviewDecision::Rework {
-                feedback: "replace marker".into(),
-            },
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected rework preview");
-    };
-    assert!(matches!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::ConfirmReview {
-                task_id: task_id.clone(),
-                decision: IpcReviewDecision::Rework {
-                    feedback: "replace marker".into(),
-                },
-                confirmation_token: confirmation_token.clone(),
-            },
-        )
-        .unwrap(),
-        IpcResponse::ReviewReworkRequested
-    ));
-    let starts = factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 2);
-    assert_ne!(starts[1].attempt_id, first_start.attempt_id);
-    assert!(
-        starts[1]
-            .initial_user_messages
-            .iter()
-            .any(|message| message.body.contains("replace marker"))
-    );
-    drop(starts);
-    assert!(matches!(
-        send_request(
-            daemon.socket_path(),
-            IpcRequest::ConfirmReview {
-                task_id,
-                decision: IpcReviewDecision::Rework {
-                    feedback: "replace marker".into(),
-                },
-                confirmation_token,
-            },
-        )
-        .unwrap(),
-        IpcResponse::Error { .. }
-    ));
-}
-
-fn report_delivery_and_wait_for_review(daemon: &Daemon, factory: &DeliveryFactory, task_id: &str) {
-    let started = factory.starts.lock().unwrap()[0].clone();
-    factory.handles.lock().unwrap()[0].report_delivery(DeliveryReport::coding(
-        "deadbeef",
-        "main",
-        started.workspace_lease_id.unwrap(),
-        "verified",
-    ));
-    for _ in 0..100 {
-        if matches!(send_request(daemon.socket_path(), IpcRequest::InspectTask { task_id: task_id.into() }).unwrap(), IpcResponse::TaskDetail(ref detail) if detail.state == "awaiting_parent_review")
-        {
-            return;
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-    panic!("task never reached awaiting_parent_review");
-}
-
 fn active_runtime() -> (
     TempDir,
     Daemon,
@@ -483,7 +287,7 @@ fn spawn_child(
 }
 
 #[test]
-fn delivery_review_survives_restart_without_restarting_worker() {
+fn delivery_survives_restart_without_restarting_worker() {
     let dir = TempDir::new().unwrap();
     let database = dir.path().join("runtime.sqlite");
     let runtime = dir.path().join("runtime");
@@ -544,43 +348,18 @@ fn delivery_review_survives_restart_without_restarting_worker() {
         started.workspace_lease_id.unwrap(),
         "verified",
     ));
+    // 交付即完成：没有 awaiting_parent_review 中间态可以等待。
+    let mut completed = false;
     for _ in 0..100 {
-        if matches!(send_request(daemon.socket_path(), IpcRequest::InspectTask { task_id: task_id.clone() }).unwrap(), IpcResponse::TaskDetail(ref detail) if detail.state == "awaiting_parent_review")
+        if matches!(send_request(daemon.socket_path(), IpcRequest::InspectTask { task_id: task_id.clone() }).unwrap(), IpcResponse::TaskDetail(ref detail) if detail.state == "completed")
         {
+            completed = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    let IpcResponse::ReviewPreview {
-        confirmation_token, ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::PreviewReview {
-            task_id: task_id.clone(),
-            decision: IpcReviewDecision::Reject {
-                reason: "test rejection".into(),
-            },
-        },
-    )
-    .unwrap()
-    else {
-        panic!()
-    };
-    let review_response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ConfirmReview {
-            task_id: task_id.clone(),
-            decision: IpcReviewDecision::Reject {
-                reason: "test rejection".into(),
-            },
-            confirmation_token,
-        },
-    )
-    .unwrap();
-    assert!(
-        matches!(review_response, IpcResponse::ReviewRejected),
-        "expected rejected review, got {review_response:?}"
-    );
+    assert!(completed, "a delivered child must reach completed");
+
     let starts = factory.starts.lock().unwrap().len();
     let before = send_request(
         daemon.socket_path(),
@@ -593,8 +372,10 @@ fn delivery_review_survives_restart_without_restarting_worker() {
     drop(daemon);
     let restarted = Daemon::start_with_factory(&runtime, &database, factory.clone()).unwrap();
     assert_eq!(factory.starts.lock().unwrap().len(), starts);
+    // 重启重新水合终态交付行后，任务仍是 completed，事件流逐字不变
+    //（旧 review_* kind 若未在 v14 里改写，ReadTaskEvents 会直接解析失败）。
     assert!(
-        matches!(send_request(restarted.socket_path(), IpcRequest::InspectTask { task_id: task_id.clone() }).unwrap(), IpcResponse::TaskDetail(detail) if detail.state == "blocked")
+        matches!(send_request(restarted.socket_path(), IpcRequest::InspectTask { task_id: task_id.clone() }).unwrap(), IpcResponse::TaskDetail(ref detail) if detail.state == "completed")
     );
     assert_eq!(
         send_request(

@@ -12,10 +12,10 @@ use uuid::Uuid;
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::scheduler::AdmissionPriority;
 use super::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, InheritedSandbox,
-    PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence, RootSessionId,
-    TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind, TransitionResult, WatchdogEvidence,
-    WorkspaceLeaseId,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryReport,
+    InheritedSandbox, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
+    RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind, TransitionResult,
+    WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::trace::TraceFact;
 use super::worker::{
@@ -315,6 +315,26 @@ impl AgentSupervisor {
             return Err("hydrated completion report references a missing task".into());
         }
         self.completion_reports.insert(task_id, report);
+        Ok(())
+    }
+
+    /// Restores a hydrated task's delivered commit onto its active attempt.
+    ///
+    /// `AgentTask::hydrated_review_task` cannot carry the delivery itself, so a
+    /// caller holding a terminal delivery row calls this right after inserting
+    /// the task. Without it, restart would resurrect the task as `Completed`
+    /// while `completed_child_reports` reported no delivery, and the parent
+    /// would lose the commit its child had produced.
+    pub fn hydrate_delivered_child(
+        &mut self,
+        task_id: &TaskId,
+        delivery: DeliveryReport,
+    ) -> Result<(), String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "hydrated delivery references a missing task".to_string())?;
+        task.hydrate_delivery(delivery);
         Ok(())
     }
 

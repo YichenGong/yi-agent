@@ -5,17 +5,14 @@ use chrono::{DateTime, Local, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
-use yi_agent_core::subagent::task::{
-    BudgetKind, DeliveryId, DeliveryReport, IntegrationValidation, TimeoutKind,
-};
+use yi_agent_core::subagent::task::{BudgetKind, DeliveryReport, TimeoutKind};
 use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionRequestId};
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
 
-const LATEST_SCHEMA_VERSION: i64 = 13;
+const LATEST_SCHEMA_VERSION: i64 = 14;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -99,16 +96,6 @@ pub enum RepositoryError {
     DeliveryRequiresParent { task: String },
     #[error("task is not running its expected attempt for delivery: {task}")]
     TaskNotReadyForDelivery { task: String },
-    #[error("delivery is not awaiting review for task {task}: {delivery}")]
-    DeliveryNotAwaitingReview { task: String, delivery: String },
-    #[error("review actor is not the direct parent of task {task}: {actor}")]
-    ReviewActorMismatch { task: String, actor: String },
-    #[error("accepted review requires successful integration evidence")]
-    IntegrationNotValidated,
-    #[error("rework review requires non-empty feedback")]
-    ReviewFeedbackRequired,
-    #[error("rejected review requires a non-empty reason")]
-    ReviewReasonRequired,
     #[error("worker recovery context is not durable: {reason}")]
     InvalidWorkerRecoveryContext { reason: String },
     #[error("admission cursor is invalid for {key}: {reason}")]
@@ -147,10 +134,6 @@ pub enum RuntimeEvent {
     MailboxMessageConsumed,
     PermissionRequested,
     PermissionResolved,
-    ReviewApproved,
-    ReviewAccepted,
-    ReviewRework,
-    ReviewRejected,
 }
 
 impl RuntimeEvent {
@@ -177,10 +160,6 @@ impl RuntimeEvent {
             Self::MailboxMessageConsumed => "mailbox_message_consumed",
             Self::PermissionRequested => "permission_requested",
             Self::PermissionResolved => "permission_resolved",
-            Self::ReviewApproved => "review_approved",
-            Self::ReviewAccepted => "review_accepted",
-            Self::ReviewRework => "review_rework",
-            Self::ReviewRejected => "review_rejected",
         }
     }
 
@@ -207,10 +186,6 @@ impl RuntimeEvent {
             "mailbox_message_consumed" => Ok(Self::MailboxMessageConsumed),
             "permission_requested" => Ok(Self::PermissionRequested),
             "permission_resolved" => Ok(Self::PermissionResolved),
-            "review_approved" => Ok(Self::ReviewApproved),
-            "review_accepted" => Ok(Self::ReviewAccepted),
-            "review_rework" => Ok(Self::ReviewRework),
-            "review_rejected" => Ok(Self::ReviewRejected),
             _ => Err(RepositoryError::UnknownEventKind { kind }),
         }
     }
@@ -388,7 +363,8 @@ pub struct PersistedActiveLease {
     pub resource_key: String,
 }
 
-/// A delivery not yet accepted by a direct-parent review.
+/// A delivery a destructive-control preview must disclose as not yet merged
+/// into its parent's branch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedUnmergedDelivery {
     pub delivery_id: String,
@@ -423,7 +399,7 @@ pub struct PersistedRecoveredTask {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PersistedReviewHydrationTask {
+pub struct PersistedHydrationTask {
     pub session_id: RootSessionId,
     pub task_id: TaskId,
     pub parent_id: Option<TaskId>,
@@ -1537,9 +1513,11 @@ impl RuntimeRepository {
             })?)
     }
 
-    /// Commits a child delivery, its review wait, and the direct parent's
-    /// high-priority mailbox notification as one durable transaction.
-    pub fn record_delivery_for_review(
+    /// Commits a child delivery as the task's terminal state, together with
+    /// the direct parent's high-priority mailbox notification, in one durable
+    /// transaction. Delivering IS completing: there is no review wait to land
+    /// in, so the task and its attempt both finish here.
+    pub fn record_delivery(
         &mut self,
         task: &TaskId,
         attempt: &AttemptId,
@@ -1569,7 +1547,7 @@ impl RuntimeRepository {
             })?;
         let changed = transaction.execute(
             "UPDATE tasks
-             SET state_json = 'awaiting_parent_review', delivery_json = ?1,
+             SET state_json = 'completed', delivery_json = ?1,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2 AND active_attempt_id = ?3 AND state_json = 'running'",
             params![delivery_json, task.to_string(), attempt.to_string()],
@@ -1580,7 +1558,7 @@ impl RuntimeRepository {
             });
         }
         transaction.execute(
-            "UPDATE attempts SET state = 'awaiting_parent_review'
+            "UPDATE attempts SET state = 'completed'
              WHERE id = ?1 AND task_id = ?2",
             params![attempt.to_string(), task.to_string()],
         )?;
@@ -1622,549 +1600,6 @@ impl RuntimeRepository {
                 "sender_task_id": task,
                 "delivery_id": delivery.id,
             }))?,
-        )?;
-        transaction.commit()?;
-        Ok(event_id)
-    }
-
-    /// Atomically records a direct-parent acceptance and completes the exact
-    /// attempt whose delivery was reviewed.
-    pub fn accept_delivery_review(
-        &mut self,
-        task: &TaskId,
-        delivery: &DeliveryId,
-        actor: &TaskId,
-        integration: &IntegrationValidation,
-        actor_json: &str,
-    ) -> Result<i64, RepositoryError> {
-        let actor_value = serde_json::from_str::<serde_json::Value>(actor_json)?;
-        if !integration.succeeded || integration.evidence.trim().is_empty() {
-            return Err(RepositoryError::IntegrationNotValidated);
-        }
-        let integration_json = serde_json::to_string(integration)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let review_target = transaction
-            .query_row(
-                "SELECT tasks.parent_id, tasks.active_attempt_id, deliveries.attempt_id
-                 FROM deliveries
-                 JOIN tasks ON tasks.id = deliveries.task_id
-                 JOIN attempts ON attempts.id = deliveries.attempt_id
-                 WHERE deliveries.id = ?1 AND deliveries.task_id = ?2
-                   AND tasks.state_json = 'awaiting_parent_review'
-                   AND tasks.delivery_json = deliveries.payload_json
-                   AND attempts.task_id = tasks.id
-                   AND attempts.state = 'awaiting_parent_review'",
-                params![delivery.to_string(), task.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            })?;
-        let Some(parent_id) = review_target.0 else {
-            return Err(RepositoryError::DeliveryRequiresParent {
-                task: task.to_string(),
-            });
-        };
-        if parent_id != actor.to_string() {
-            return Err(RepositoryError::ReviewActorMismatch {
-                task: task.to_string(),
-                actor: actor.to_string(),
-            });
-        }
-        if review_target.1 != review_target.2 {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        let changed = transaction.execute(
-            "UPDATE tasks SET state_json = 'completed', updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?1 AND active_attempt_id = ?2
-               AND state_json = 'awaiting_parent_review'",
-            params![task.to_string(), review_target.1],
-        )?;
-        if changed != 1 {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        let changed = transaction.execute(
-            "UPDATE attempts SET state = 'completed', ended_at = CURRENT_TIMESTAMP
-             WHERE id = ?1 AND task_id = ?2 AND state = 'awaiting_parent_review'",
-            params![review_target.2, task.to_string()],
-        )?;
-        if changed != 1 {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        transaction.execute(
-            "INSERT INTO reviews (id, delivery_id, actor_json, decision, evidence_json)
-             VALUES (?1, ?2, ?3, 'accepted', ?4)",
-            params![
-                Uuid::new_v4().to_string(),
-                delivery.to_string(),
-                actor_json,
-                integration_json,
-            ],
-        )?;
-        let payload_json = serde_json::to_string(&serde_json::json!({
-            "delivery_id": delivery,
-            "actor_task_id": actor,
-            "actor": actor_value,
-            "decision": "accepted",
-            "before_state": "awaiting_parent_review",
-            "after_state": "completed",
-            "integration": integration,
-        }))?;
-        let event_id = append_event_with_actor_payload(
-            &transaction,
-            task,
-            RuntimeEvent::ReviewAccepted,
-            actor_json,
-            &payload_json,
-        )?;
-        transaction.commit()?;
-        Ok(event_id)
-    }
-
-    /// Audits local-user approval and wakes the canonical direct parent without
-    /// claiming that parent integration has happened.
-    pub fn approve_delivery_review(
-        &mut self,
-        task: &TaskId,
-        delivery: &DeliveryId,
-        actor: &TaskId,
-        actor_json: &str,
-        parent_notification: &MessageId,
-    ) -> Result<i64, RepositoryError> {
-        let actor_value = serde_json::from_str::<serde_json::Value>(actor_json)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let parent_id = transaction
-            .query_row(
-                "SELECT tasks.parent_id
-                 FROM deliveries
-                 JOIN tasks ON tasks.id = deliveries.task_id
-                 JOIN attempts ON attempts.id = deliveries.attempt_id
-                 WHERE deliveries.id = ?1 AND deliveries.task_id = ?2
-                   AND tasks.state_json = 'awaiting_parent_review'
-                   AND tasks.delivery_json = deliveries.payload_json
-                   AND tasks.active_attempt_id = deliveries.attempt_id
-                   AND attempts.task_id = tasks.id
-                   AND attempts.state = 'awaiting_parent_review'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM reviews WHERE reviews.delivery_id = deliveries.id
-                   )",
-                params![delivery.to_string(), task.to_string()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .ok_or_else(|| RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            })?
-            .ok_or_else(|| RepositoryError::DeliveryRequiresParent {
-                task: task.to_string(),
-            })?;
-        if parent_id != actor.to_string() {
-            return Err(RepositoryError::ReviewActorMismatch {
-                task: task.to_string(),
-                actor: actor.to_string(),
-            });
-        }
-        let evidence_json = serde_json::to_string(&serde_json::json!({
-            "delivery_id": delivery,
-            "user_approved": true,
-            "integration_completed": false,
-        }))?;
-        transaction.execute(
-            "INSERT INTO reviews (id, delivery_id, actor_json, decision, evidence_json)
-             VALUES (?1, ?2, ?3, 'approved', ?4)",
-            params![
-                Uuid::new_v4().to_string(),
-                delivery.to_string(),
-                actor_json,
-                evidence_json,
-            ],
-        )?;
-        let event_id = append_event_with_actor_payload(
-            &transaction,
-            task,
-            RuntimeEvent::ReviewApproved,
-            actor_json,
-            &serde_json::to_string(&serde_json::json!({
-                "delivery_id": delivery,
-                "actor_task_id": actor,
-                "actor": actor_value,
-                "decision": "approved",
-                "state": "awaiting_parent_review",
-                "integration_completed": false,
-            }))?,
-        )?;
-        insert_review_parent_notification(
-            &transaction,
-            parent_notification,
-            actor,
-            task,
-            delivery,
-            "approved",
-            actor_json,
-        )?;
-        transaction.commit()?;
-        Ok(event_id)
-    }
-
-    pub fn delivery_has_review(&self, delivery: &DeliveryId) -> Result<bool, RepositoryError> {
-        Ok(self
-            .connection
-            .query_row(
-                "SELECT 1 FROM reviews WHERE delivery_id = ?1 LIMIT 1",
-                params![delivery.to_string()],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    }
-
-    /// Persists a rework decision, preserves the reviewed attempt, and starts
-    /// its durable successor with the same feedback mailbox identity.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rework_delivery_review(
-        &mut self,
-        task: &TaskId,
-        delivery: &DeliveryId,
-        actor: &TaskId,
-        feedback: &str,
-        feedback_message: &MessageId,
-        successor_attempt: &AttemptId,
-        successor_number: u32,
-        actor_json: &str,
-        parent_notification: &MessageId,
-    ) -> Result<i64, RepositoryError> {
-        let actor_value = serde_json::from_str::<serde_json::Value>(actor_json)?;
-        if feedback.trim().is_empty() {
-            return Err(RepositoryError::ReviewFeedbackRequired);
-        }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (parent_id, active_attempt, delivery_attempt) = transaction
-            .query_row(
-                "SELECT tasks.parent_id, tasks.active_attempt_id, deliveries.attempt_id
-                 FROM deliveries
-                 JOIN tasks ON tasks.id = deliveries.task_id
-                 JOIN attempts ON attempts.id = deliveries.attempt_id
-                 WHERE deliveries.id = ?1 AND deliveries.task_id = ?2
-                   AND tasks.state_json = 'awaiting_parent_review'
-                   AND tasks.delivery_json = deliveries.payload_json
-                   AND attempts.task_id = tasks.id
-                   AND attempts.state = 'awaiting_parent_review'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM reviews WHERE reviews.delivery_id = deliveries.id
-                   )",
-                params![delivery.to_string(), task.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            })?;
-        let parent_id = parent_id.ok_or_else(|| RepositoryError::DeliveryRequiresParent {
-            task: task.to_string(),
-        })?;
-        if parent_id != actor.to_string() {
-            return Err(RepositoryError::ReviewActorMismatch {
-                task: task.to_string(),
-                actor: actor.to_string(),
-            });
-        }
-        if active_attempt != delivery_attempt {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        let changed = transaction.execute(
-            "UPDATE tasks SET state_json = 'queued', active_attempt_id = ?1,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?2 AND active_attempt_id = ?3
-               AND state_json = 'awaiting_parent_review'",
-            params![
-                successor_attempt.to_string(),
-                task.to_string(),
-                active_attempt
-            ],
-        )?;
-        if changed != 1 {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        let changed = transaction.execute(
-            "UPDATE attempts SET state = 'rework_requested', ended_at = CURRENT_TIMESTAMP,
-                 terminal_json = ?1
-             WHERE id = ?2 AND task_id = ?3 AND state = 'awaiting_parent_review'",
-            params![
-                serde_json::to_string(&serde_json::json!({
-                    "kind": "rework_requested",
-                    "delivery_id": delivery,
-                    "feedback_message_id": feedback_message,
-                }))?,
-                delivery_attempt,
-                task.to_string(),
-            ],
-        )?;
-        if changed != 1 {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        insert_attempt(
-            &transaction,
-            successor_attempt,
-            task,
-            successor_number,
-            "queued",
-        )?;
-        let evidence_json = serde_json::to_string(&serde_json::json!({
-            "feedback": feedback,
-            "feedback_message_id": feedback_message,
-            "successor_attempt_id": successor_attempt,
-        }))?;
-        transaction.execute(
-            "INSERT INTO reviews (id, delivery_id, actor_json, decision, evidence_json)
-             VALUES (?1, ?2, ?3, 'rework', ?4)",
-            params![
-                Uuid::new_v4().to_string(),
-                delivery.to_string(),
-                actor_json,
-                evidence_json,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO mailbox_messages
-             (id, recipient_task_id, sender_task_id, kind, priority, correlation_id, payload_json)
-             VALUES (?1, ?2, ?3, 'rework', 1, ?4, ?5)",
-            params![
-                feedback_message.to_string(),
-                task.to_string(),
-                parent_id,
-                successor_attempt.to_string(),
-                evidence_json,
-            ],
-        )?;
-        let event_payload = serde_json::to_string(&serde_json::json!({
-            "delivery_id": delivery,
-            "actor_task_id": actor,
-            "actor": actor_value,
-            "decision": "rework",
-            "feedback": feedback,
-            "feedback_message_id": feedback_message,
-            "before_state": "awaiting_parent_review",
-            "after_state": "queued",
-            "successor_attempt_id": successor_attempt,
-        }))?;
-        let event_id = append_event_with_actor_payload(
-            &transaction,
-            task,
-            RuntimeEvent::ReviewRework,
-            actor_json,
-            &event_payload,
-        )?;
-        append_event_with_payload(
-            &transaction,
-            task,
-            RuntimeEvent::MailboxMessageQueued,
-            &serde_json::to_string(&serde_json::json!({
-                "message_id": feedback_message,
-                "sender_task_id": actor,
-                "kind": "rework",
-            }))?,
-        )?;
-        insert_review_parent_notification(
-            &transaction,
-            parent_notification,
-            actor,
-            task,
-            delivery,
-            "rework",
-            actor_json,
-        )?;
-        transaction.commit()?;
-        Ok(event_id)
-    }
-
-    /// Persists a rejected delivery and its durable reason without discarding
-    /// the reviewed delivery or attempt evidence.
-    #[allow(clippy::too_many_arguments)]
-    pub fn reject_delivery_review(
-        &mut self,
-        task: &TaskId,
-        delivery: &DeliveryId,
-        actor: &TaskId,
-        reason: &str,
-        reason_message: &MessageId,
-        actor_json: &str,
-        parent_notification: &MessageId,
-    ) -> Result<i64, RepositoryError> {
-        let actor_value = serde_json::from_str::<serde_json::Value>(actor_json)?;
-        if reason.trim().is_empty() {
-            return Err(RepositoryError::ReviewReasonRequired);
-        }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (parent_id, active_attempt, delivery_attempt) = transaction
-            .query_row(
-                "SELECT tasks.parent_id, tasks.active_attempt_id, deliveries.attempt_id
-                 FROM deliveries
-                 JOIN tasks ON tasks.id = deliveries.task_id
-                 JOIN attempts ON attempts.id = deliveries.attempt_id
-                 WHERE deliveries.id = ?1 AND deliveries.task_id = ?2
-                   AND tasks.state_json = 'awaiting_parent_review'
-                   AND tasks.delivery_json = deliveries.payload_json
-                   AND attempts.task_id = tasks.id
-                   AND attempts.state = 'awaiting_parent_review'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM reviews WHERE reviews.delivery_id = deliveries.id
-                   )",
-                params![delivery.to_string(), task.to_string()],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            })?;
-        let parent_id = parent_id.ok_or_else(|| RepositoryError::DeliveryRequiresParent {
-            task: task.to_string(),
-        })?;
-        if parent_id != actor.to_string() {
-            return Err(RepositoryError::ReviewActorMismatch {
-                task: task.to_string(),
-                actor: actor.to_string(),
-            });
-        }
-        if active_attempt != delivery_attempt {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        let changed = transaction.execute(
-            "UPDATE tasks SET state_json = 'blocked', updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?1 AND active_attempt_id = ?2
-               AND state_json = 'awaiting_parent_review'",
-            params![task.to_string(), active_attempt],
-        )?;
-        if changed != 1 {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        let evidence_json = serde_json::to_string(&serde_json::json!({
-            "reason": reason,
-            "reason_message_id": reason_message,
-        }))?;
-        let changed = transaction.execute(
-            "UPDATE attempts SET state = 'blocked', ended_at = CURRENT_TIMESTAMP,
-                 terminal_json = ?1
-             WHERE id = ?2 AND task_id = ?3 AND state = 'awaiting_parent_review'",
-            params![evidence_json, delivery_attempt, task.to_string()],
-        )?;
-        if changed != 1 {
-            return Err(RepositoryError::DeliveryNotAwaitingReview {
-                task: task.to_string(),
-                delivery: delivery.to_string(),
-            });
-        }
-        transaction.execute(
-            "INSERT INTO reviews (id, delivery_id, actor_json, decision, evidence_json)
-             VALUES (?1, ?2, ?3, 'rejected', ?4)",
-            params![
-                Uuid::new_v4().to_string(),
-                delivery.to_string(),
-                actor_json,
-                evidence_json,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO mailbox_messages
-             (id, recipient_task_id, sender_task_id, kind, priority, correlation_id, payload_json)
-             VALUES (?1, ?2, ?3, 'review_rejected', 1, ?4, ?5)",
-            params![
-                reason_message.to_string(),
-                task.to_string(),
-                parent_id,
-                delivery_attempt,
-                evidence_json,
-            ],
-        )?;
-        let event_payload = serde_json::to_string(&serde_json::json!({
-            "delivery_id": delivery,
-            "actor_task_id": actor,
-            "actor": actor_value,
-            "decision": "rejected",
-            "reason": reason,
-            "reason_message_id": reason_message,
-            "before_state": "awaiting_parent_review",
-            "after_state": "blocked",
-        }))?;
-        let event_id = append_event_with_actor_payload(
-            &transaction,
-            task,
-            RuntimeEvent::ReviewRejected,
-            actor_json,
-            &event_payload,
-        )?;
-        append_event_with_payload(
-            &transaction,
-            task,
-            RuntimeEvent::MailboxMessageQueued,
-            &serde_json::to_string(&serde_json::json!({
-                "message_id": reason_message,
-                "sender_task_id": actor,
-                "kind": "review_rejected",
-            }))?,
-        )?;
-        insert_review_parent_notification(
-            &transaction,
-            parent_notification,
-            actor,
-            task,
-            delivery,
-            "rejected",
-            actor_json,
         )?;
         transaction.commit()?;
         Ok(event_id)
@@ -3809,92 +3244,10 @@ impl RuntimeRepository {
             .collect()
     }
 
-    /// Returns complete task trees for sessions that own durable review mail.
-    /// Tree order lets the runtime rebuild parents before children.
-    pub fn review_hydration_tasks(
-        &self,
-    ) -> Result<Vec<PersistedReviewHydrationTask>, RepositoryError> {
-        let mut statement = self.connection.prepare(
-            "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth,
-                    tasks.active_attempt_id, attempts.number, tasks.state_json,
-                    tasks.delivery_json, attempts.terminal_json
-             FROM tasks
-             JOIN attempts ON attempts.id = tasks.active_attempt_id
-             WHERE tasks.root_session_id IN (
-                 SELECT DISTINCT recipient.root_session_id
-                 FROM mailbox_messages
-                 JOIN tasks AS recipient ON recipient.id = mailbox_messages.recipient_task_id
-                 WHERE mailbox_messages.kind IN ('rework', 'review_rejected')
-                    OR (mailbox_messages.kind = 'user_override'
-                        AND json_extract(mailbox_messages.payload_json, '$.kind') = 'user_review_override')
-             )
-             ORDER BY tasks.root_session_id, tasks.depth, tasks.created_at, tasks.id",
-        )?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, u8>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, u32>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                ))
-            })?
-            .map(|row| {
-                let (
-                    session,
-                    task,
-                    parent,
-                    depth,
-                    attempt,
-                    number,
-                    state,
-                    delivery_json,
-                    terminal_json,
-                ) = row?;
-                Ok(PersistedReviewHydrationTask {
-                    session_id: session
-                        .parse()
-                        .map_err(|_| RepositoryError::UnknownEventKind {
-                            kind: format!("invalid review session ID in store: {session}"),
-                        })?,
-                    task_id: task
-                        .parse()
-                        .map_err(|_| RepositoryError::UnknownEventKind {
-                            kind: format!("invalid review task ID in store: {task}"),
-                        })?,
-                    parent_id: parent
-                        .map(|value| {
-                            value
-                                .parse()
-                                .map_err(|_| RepositoryError::UnknownEventKind {
-                                    kind: format!("invalid review parent ID in store: {value}"),
-                                })
-                        })
-                        .transpose()?,
-                    depth,
-                    attempt_id: attempt
-                        .parse()
-                        .map_err(|_| RepositoryError::UnknownEventKind {
-                            kind: format!("invalid review attempt ID in store: {attempt}"),
-                        })?,
-                    attempt_number: number,
-                    state,
-                    delivery_json,
-                    terminal_json,
-                })
-            })
-            .collect()
-    }
-
     pub fn application_root_hydration_tasks(
         &self,
         root_session_id: &RootSessionId,
-    ) -> Result<Vec<PersistedReviewHydrationTask>, RepositoryError> {
+    ) -> Result<Vec<PersistedHydrationTask>, RepositoryError> {
         let mut statement = self.connection.prepare(
             "SELECT tasks.root_session_id, tasks.id, tasks.parent_id, tasks.depth,
                     tasks.active_attempt_id, attempts.number, tasks.state_json,
@@ -3930,7 +3283,7 @@ impl RuntimeRepository {
                     delivery_json,
                     terminal_json,
                 ) = row?;
-                Ok(PersistedReviewHydrationTask {
+                Ok(PersistedHydrationTask {
                     session_id: session
                         .parse()
                         .map_err(|_| RepositoryError::UnknownEventKind {
@@ -4105,12 +3458,10 @@ impl RuntimeRepository {
                     .collect::<Result<Vec<_>, _>>()?,
             );
             let mut deliveries = self.connection.prepare(
+                // 父审下线后不再写 reviews，所有交付行都尚未被合并，
+                // 因此取消预览一律把它们当作待合并交付披露。
                 "SELECT deliveries.id, deliveries.payload_json FROM deliveries
                  WHERE deliveries.task_id = ?1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM reviews
-                       WHERE reviews.delivery_id = deliveries.id AND reviews.decision = 'accepted'
-                   )
                  ORDER BY deliveries.created_at, deliveries.id",
             )?;
             unmerged_deliveries.extend(
@@ -4351,52 +3702,6 @@ fn append_event_with_actor_payload(
         });
     }
     Ok(transaction.last_insert_rowid())
-}
-
-fn insert_review_parent_notification(
-    transaction: &Transaction<'_>,
-    message_id: &MessageId,
-    parent: &TaskId,
-    subject: &TaskId,
-    delivery: &DeliveryId,
-    decision: &str,
-    actor_json: &str,
-) -> Result<(), RepositoryError> {
-    let message =
-        format!("Local user review {decision} delivery {delivery} for direct child {subject}");
-    let payload_json = serde_json::to_string(&serde_json::json!({
-        "message": message,
-        "kind": "user_review_override",
-        "decision": decision,
-        "subject_task_id": subject,
-        "delivery_id": delivery,
-    }))?;
-    transaction.execute(
-        "INSERT INTO mailbox_messages
-         (id, recipient_task_id, sender_task_id, kind, priority, correlation_id, payload_json)
-         VALUES (?1, ?2, NULL, 'user_override', 1, ?3, ?4)",
-        params![
-            message_id.to_string(),
-            parent.to_string(),
-            delivery.to_string(),
-            payload_json,
-        ],
-    )?;
-    append_event_with_actor_payload(
-        transaction,
-        parent,
-        RuntimeEvent::MailboxMessageQueued,
-        actor_json,
-        &serde_json::to_string(&serde_json::json!({
-            "message_id": message_id,
-            "sender": "local_user",
-            "kind": "user_review_override",
-            "decision": decision,
-            "subject_task_id": subject,
-            "delivery_id": delivery,
-        }))?,
-    )?;
-    Ok(())
 }
 
 fn insert_attempt(
@@ -4819,6 +4124,26 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (13)", [])?;
         transaction.commit()?;
     }
+
+    // v14：父审状态下线。历史行改写为 `completed`，并清掉 review-only 的
+    // mailbox 消息与事件 kind——否则删除枚举后 `RuntimeEvent::parse` 会对
+    // 残留 kind 直接报 UnknownEventKind，让 ReadTaskEvents 整条读取失败。
+    if current_version < 14 {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "UPDATE tasks SET state_json = 'completed'
+                 WHERE state_json = 'awaiting_parent_review';
+             UPDATE attempts SET state = 'completed'
+                 WHERE state = 'awaiting_parent_review';
+             DELETE FROM mailbox_messages
+                 WHERE kind IN ('rework', 'review_rejected');
+             UPDATE events SET kind = 'task_completed'
+                 WHERE kind IN ('review_approved', 'review_accepted',
+                                'review_rework', 'review_rejected');",
+        )?;
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (14)", [])?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -4870,7 +4195,7 @@ mod tests {
             )
             .unwrap();
         assert!(has_thread_id);
-        assert_eq!(LATEST_SCHEMA_VERSION, 13);
+        assert_eq!(LATEST_SCHEMA_VERSION, 14);
     }
 
     #[test]
@@ -4888,13 +4213,13 @@ mod tests {
             .execute_batch(
                 "DROP TABLE task_trace_events;
                  ALTER TABLE tasks DROP COLUMN thread_id;
-                 DELETE FROM schema_migrations WHERE version = 13;",
+                 DELETE FROM schema_migrations WHERE version >= 13;",
             )
             .unwrap();
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 13);
+        assert_eq!(repository.schema_version().unwrap(), 14);
         let connection = repository.connection_for_test();
         assert!(
             connection
@@ -4932,13 +4257,13 @@ mod tests {
                 "DROP TABLE task_trace_events;
                  ALTER TABLE tasks DROP COLUMN thread_id;
                  ALTER TABLE tasks DROP COLUMN inherited_sandbox;
-                 DELETE FROM schema_migrations WHERE version IN (12, 13);",
+                 DELETE FROM schema_migrations WHERE version >= 12;",
             )
             .unwrap();
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 13);
+        assert_eq!(repository.schema_version().unwrap(), 14);
         let connection = repository.connection_for_test();
         for (probe, what) in [
             (
@@ -5113,14 +4438,7 @@ mod tests {
             "recovery_gated",
             "recovery_attested",
         ];
-        let live = [
-            "running",
-            "queued",
-            "paused",
-            // A delivery waiting on its parent is resting, not finished: its
-            // trace is exactly what the reviewer needs to read.
-            "awaiting_parent_review",
-        ];
+        let live = ["running", "queued", "paused"];
         // Pin the production set itself, so drift in either direction — a state
         // quietly added, or one quietly dropped — fails here rather than in the
         // field, where the symptom would be a truncated or uncollectable trace.
