@@ -418,23 +418,45 @@ fn real_subagent_merges_delivery_into_parent_history() {
         child_head,
         "the child branch tip must be the delivered commit {child_head}; delivery: {delivery_json}"
     );
-    // The checkout the run itself started in is the parent's own history. The
-    // child's worktree is a linked worktree of this repository but a distinct
-    // checkout/branch, so this HEAD does NOT contain the child commit until the
-    // parent actually integrates it: `git merge-base --is-ancestor` is false
-    // here unless the parent ran its own `git merge --no-ff <child-commit>`.
+    // The run started in `fixture.repository`, so that is the parent's own
+    // checkout; `delivery-worktree` is a linked worktree on its own branch. The
+    // child commit is therefore absent from the parent's HEAD until the parent
+    // itself runs `git merge --no-ff <child-commit>`, and it is absent from the
+    // parent's immutable starting point (the fixture baseline) as well. The
+    // post-merge `--is-ancestor` check below pins the integration to the
+    // parent, not to the child's branch.
     let parent_checkout = fixture.repository.as_path();
-    let pre_merge_fixture = fixture.repository.join(DELIVERY_FILE);
+    let child_checkout = fixture.repository.join("delivery-worktree");
+    // The child branch descends from the fixture baseline; `rev-list
+    // --max-parents=0` resolves that starting commit from the delivered head
+    // itself, so the baseline stays correct even if the child stacks commits.
+    let baseline = git(
+        parent_checkout,
+        &["rev-list", "--max-parents=0", &child_head],
+    )
+    .lines()
+    .map(str::trim)
+    .find(|line| !line.is_empty() && *line != child_head)
+    .unwrap_or_else(|| {
+        panic!("child commit {child_head} has no baseline parent; delivery: {delivery_json}")
+    })
+    .to_owned();
+    // These pre-merge checks query that immutable baseline rather than the
+    // parent's live HEAD, so they cannot race the parent's merge: the baseline
+    // never gains the child commit or the delivered file.
     assert!(
         !git_exit_status(
             parent_checkout,
-            &["merge-base", "--is-ancestor", &child_head, "HEAD"],
+            &["merge-base", "--is-ancestor", &child_head, &baseline],
         ),
-        "the child commit must be absent from the parent's own checkout before the run finishes; delivery: {delivery_json}"
+        "the child commit must be absent from the parent's starting point; delivery: {delivery_json}"
     );
     assert!(
-        !pre_merge_fixture.exists(),
-        "the delivered file must not appear in the parent's own checkout before the parent merges; delivery: {delivery_json}"
+        !git_exit_status(
+            parent_checkout,
+            &["cat-file", "-e", &format!("{baseline}:{DELIVERY_FILE}")],
+        ),
+        "the delivered file must not exist at the parent's starting point; delivery: {delivery_json}"
     );
     let output = run.wait();
     assert!(
@@ -467,12 +489,23 @@ fn real_subagent_merges_delivery_into_parent_history() {
         )
     });
     assert_eq!(merged_content, format!("{DELIVERY_MARKER}\n"));
-    assert_eq!(git(parent_checkout, &["status", "--porcelain"]), "");
-    // The daemon owns nothing here: the parent checkout keeps only the merge the
-    // agents themselves drove plus the child's own worktree.
+    // The child's own checkout had no stray changes after its commit, and the
+    // parent merging the child branch into the root checkout does not write
+    // anything into that linked checkout.
     assert_eq!(
-        git(&fixture.repository, &["status", "--porcelain"]),
-        "?? delivery-worktree/\n"
+        git(&child_checkout, &["status", "--porcelain"]),
+        "",
+        "the child checkout must be clean after the child commits and the parent merges"
+    );
+    // The root checkout is not "clean": it permanently reports the child's
+    // untracked linked worktree directory (`.gitignore` only covers
+    // `.worktrees/`), both before and after the parent's merge. The daemon
+    // owning nothing here means that untracked worktree directory is the ONLY
+    // status line - no stray modifications of its own.
+    assert_eq!(
+        git(parent_checkout, &["status", "--porcelain"]),
+        "?? delivery-worktree/\n",
+        "the parent checkout must contain no stray changes beyond the child's own worktree"
     );
 }
 
