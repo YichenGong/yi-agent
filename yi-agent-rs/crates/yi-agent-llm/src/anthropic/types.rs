@@ -150,7 +150,15 @@ impl From<ContentBlock> for AnthropicContentBlock {
                 is_error,
             } => AnthropicContentBlock::ToolResult {
                 tool_use_id,
-                content: content.into_iter().map(Into::into).collect(),
+                content: content
+                    .into_iter()
+                    // tool_result 的嵌套 content 只接受 text/image/document/search_result；
+                    // thinking 是 assistant 专属块，任何深度出现都必须丢弃——
+                    // Signature/Redacted 会造出非法 wire 形状(400)，Encrypted/None 会触达
+                    // unreachable!(panic)。故此处无条件剥离。
+                    .filter(|b| !matches!(b, ContentBlock::Thinking { .. }))
+                    .map(Into::into)
+                    .collect(),
                 is_error,
             },
             ContentBlock::Image { source, .. } => AnthropicContentBlock::Image {
@@ -556,6 +564,102 @@ mod tests {
             "no manual budget"
         );
         assert_eq!(json["output_config"]["effort"], "high");
+    }
+
+    /// 递归断言某 JSON 子树内不存在任何 thinking / redacted_thinking 块。
+    /// `tool_result.content` 在 Anthropic API 上只接受
+    /// text / image / document / search_result，故嵌套的所有深度都必须干净。
+    fn assert_no_nested_thinking(value: &serde_json::Value, ctx: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(t) = map.get("type") {
+                    assert_ne!(t, "thinking", "thinking block leaked into {ctx}");
+                    assert_ne!(
+                        t, "redacted_thinking",
+                        "redacted_thinking leaked into {ctx}"
+                    );
+                }
+                for v in map.values() {
+                    assert_no_nested_thinking(v, ctx);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    assert_no_nested_thinking(v, ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 嵌套于 `ToolResult` 内的 `ThinkingToken::None` 必须被丢弃。
+    /// 修复前该用例会触达 `From<ContentBlock>` 里的 `unreachable!` 而 panic。
+    #[test]
+    fn tool_result_drops_nested_thinking_without_signature() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "leaked".into(),
+                    token: ThinkingToken::None,
+                },
+                ContentBlock::Text("tool output".into()),
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "claude-opus-5-5".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        let inner = json["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inner.len(), 1, "nested Thinking must be dropped");
+        assert_eq!(inner[0]["type"], "text");
+        assert_no_nested_thinking(&json["messages"][0]["content"][0], "tool_result");
+    }
+
+    /// 嵌套于 `ToolResult` 内的 `ThinkingToken::Signature` 同样是非法 wire 形状
+    /// （tool_result 不接受 assistant 专属的 thinking 块），必须一并丢弃；
+    /// 兄弟 `Text` 块须保留。
+    #[test]
+    fn tool_result_drops_nested_signed_thinking_but_keeps_text() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: vec![
+                ContentBlock::Text("kept".into()),
+                ContentBlock::Thinking {
+                    text: "".into(),
+                    token: ThinkingToken::Signature("sig-part-1.sig-part-2".into()),
+                },
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "claude-opus-5-5".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        let inner = json["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inner.len(), 1, "nested signed Thinking must be dropped");
+        assert_eq!(inner[0]["type"], "text");
+        assert_eq!(inner[0]["text"], "kept", "sibling text must survive");
+        assert_no_nested_thinking(&json["messages"][0]["content"][0], "tool_result");
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains("sig-part-1"),
+            "the signature must not appear anywhere on the wire"
+        );
     }
 
     #[test]
