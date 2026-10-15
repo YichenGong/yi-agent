@@ -3884,7 +3884,7 @@ mod tests {
                 .unwrap()
                 .task_state(&task_id.parse().unwrap())
                 .unwrap()
-                == "awaiting_parent_review"
+                == "completed"
             {
                 break;
             }

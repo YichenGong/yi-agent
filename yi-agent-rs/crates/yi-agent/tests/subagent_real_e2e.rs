@@ -86,6 +86,18 @@ fn git(repository: &Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).expect("git stdout is UTF-8")
 }
 
+/// Runs git for predicates such as `merge-base --is-ancestor`, which signal a
+/// false answer with a non-zero exit status rather than an error.
+fn git_exit_status(repository: &Path, arguments: &[&str]) -> bool {
+    Command::new("git")
+        .current_dir(repository)
+        .args(arguments)
+        .output()
+        .expect("run git")
+        .status
+        .success()
+}
+
 fn initialize_repository(repository: &Path) {
     std::fs::write(repository.join("README.md"), "real subagent fixture\n")
         .expect("write baseline README");
@@ -235,7 +247,7 @@ fn await_direct_child(socket: &Path, run: &mut RealAgentRun) -> String {
         )
         .expect("list runtime tasks");
         if let IpcResponse::TaskSummaries { tasks } = response {
-            // The root's DIRECT child is the one under review. A misbehaving
+            // The root's DIRECT child is the delegated child. A misbehaving
             // root can also spawn a grandchild, so select by depth rather than
             // by counting non-root tasks.
             for task in tasks.into_iter().filter(|task| !task.is_root) {
@@ -261,7 +273,7 @@ fn await_direct_child(socket: &Path, run: &mut RealAgentRun) -> String {
     }
 }
 
-fn await_review(
+fn await_child_completion(
     socket: &Path,
     repository: &Path,
     task_id: &str,
@@ -277,7 +289,7 @@ fn await_review(
         .expect("inspect child task") else {
             panic!("expected child task detail");
         };
-        if detail.state == "awaiting_parent_review" {
+        if detail.state == "completed" {
             return detail;
         }
         if matches!(
@@ -298,7 +310,7 @@ fn await_review(
                 Err(error) => format!("event read failed: {error}"),
             };
             panic!(
-                "child task terminated before review in state {}; terminal: {}; repository status: {repository_status:?}; repository log: {repository_log:?}; events: {events}",
+                "child task terminated before delivery in state {}; terminal: {}; repository status: {repository_status:?}; repository log: {repository_log:?}; events: {events}",
                 detail.state,
                 detail
                     .terminal_json
@@ -308,46 +320,10 @@ fn await_review(
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for child review; last state: {}",
+            "timed out waiting for child completion; last state: {}",
             detail.state
         );
         std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn confirm_review(socket: &Path, task_id: &str, decision: yi_agent_store::ipc::IpcReviewDecision) {
-    let IpcResponse::ReviewPreview {
-        confirmation_token, ..
-    } = send_request(
-        socket,
-        IpcRequest::PreviewReview {
-            task_id: task_id.into(),
-            decision: decision.clone(),
-        },
-    )
-    .expect("preview child review")
-    else {
-        panic!("expected review preview");
-    };
-    let response = send_request(
-        socket,
-        IpcRequest::ConfirmReview {
-            task_id: task_id.into(),
-            decision: decision.clone(),
-            confirmation_token,
-        },
-    )
-    .expect("confirm child review");
-    match decision {
-        yi_agent_store::ipc::IpcReviewDecision::Accept {} => {
-            assert!(matches!(response, IpcResponse::ReviewApproved));
-        }
-        yi_agent_store::ipc::IpcReviewDecision::Rework { .. } => {
-            assert!(matches!(response, IpcResponse::ReviewReworkRequested));
-        }
-        yi_agent_store::ipc::IpcReviewDecision::Reject { .. } => {
-            assert!(matches!(response, IpcResponse::ReviewRejected));
-        }
     }
 }
 
@@ -411,7 +387,7 @@ const DELIVERY_MARKER: &str = "REAL_SUBAGENT_DELIVERY_MARKER_V1";
 
 #[test]
 #[ignore]
-fn real_subagent_accepts_delivery_into_parent_history() {
+fn real_subagent_merges_delivery_into_parent_history() {
     let Some(config) =
         resolve_real_llm_test_config().expect("real-test configuration must validate")
     else {
@@ -422,11 +398,11 @@ fn real_subagent_accepts_delivery_into_parent_history() {
     let mut run = start_real_subagent(
         &config,
         &fixture,
-        "First run this exact command yourself: git worktree add -b feat/real-subagent delivery-worktree. Then call spawn_agent exactly once with mode \"coding\" and workdir \"delivery-worktree\" (pass mode: coding and that workdir) so the child runs in that worktree. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in your workdir. The child must not delegate. Do not create that file yourself. Do not call wait_agent: a local human reviewer will accept the child delivery and you will then receive its completion report. Do not attempt review or acceptance.",
+        "First run this exact command yourself: git worktree add -b feat/real-subagent delivery-worktree. Then call spawn_agent exactly once with mode \"coding\" and workdir \"delivery-worktree\" (pass mode: coding and that workdir) so the child runs in that worktree. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in your workdir. The child must not delegate. Do not create that file yourself. Call wait_agent with mode \"all\" and then merge the delivered commit into your own history with git merge --no-ff <commit> from the child's completion report (run that command yourself in your own worktree checkout).",
     );
     let socket = fixture.runtime_dir.join("runtime.sock");
     let child_id = await_direct_child(&socket, &mut run);
-    let delivery = await_review(&socket, &fixture.repository, &child_id);
+    let delivery = await_child_completion(&socket, &fixture.repository, &child_id);
     let delivery_json: serde_json::Value =
         serde_json::from_str(&delivery.delivery_json).expect("child delivery JSON");
     let child_head = delivery_json["commit"]
@@ -434,24 +410,33 @@ fn real_subagent_accepts_delivery_into_parent_history() {
         .unwrap_or_else(|| panic!("delivery commit missing from {delivery_json}"))
         .to_owned();
     let parent_workspace = fixture.repository.join("delivery-worktree");
-    confirm_review(
-        &socket,
-        &child_id,
-        yi_agent_store::ipc::IpcReviewDecision::Accept {},
-    );
     let output = run.wait();
     assert!(
         output.status.success(),
         "real delivery root failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The runtime no longer accepts deliveries: the parent must integrate the
+    // child commit itself (`git merge --no-ff <commit>`), so the child's
+    // delivered commit has to appear in the parent's own history.
+    let parent_log = git(&parent_workspace, &["log", "--oneline", "-3"]);
+    assert!(
+        git_exit_status(
+            &parent_workspace,
+            &["merge-base", "--is-ancestor", &child_head, "HEAD"],
+        ),
+        "the parent must have merged the child commit {child_head}; parent log: {parent_log:?}; delivery: {delivery_json}"
+    );
     let accepted_file = parent_workspace.join(DELIVERY_FILE);
     let accepted_content = std::fs::read_to_string(&accepted_file).unwrap_or_else(|error| {
         let parent_status = git(&parent_workspace, &["status", "--porcelain"]);
         let parent_log = git(&parent_workspace, &["log", "--oneline", "-3"]);
-        let child_tree = git(&parent_workspace, &["show", "--format=", "--name-only", &child_head]);
+        let child_tree = git(
+            &parent_workspace,
+            &["show", "--format=", "--name-only", &child_head],
+        );
         panic!(
-            "accepted file {} is missing: {error}; child commit: {child_head}; child tree: {child_tree:?}; parent status: {parent_status:?}; parent log: {parent_log:?}; delivery: {delivery_json}",
+            "merged file {} is missing: {error}; child commit: {child_head}; child tree: {child_tree:?}; parent status: {parent_status:?}; parent log: {parent_log:?}; delivery: {delivery_json}",
             accepted_file.display(),
         )
     });
@@ -463,7 +448,6 @@ fn real_subagent_accepts_delivery_into_parent_history() {
         git(&fixture.repository, &["status", "--porcelain"]),
         "?? delivery-worktree/\n"
     );
-    let _ = child_head;
 }
 
 #[test]

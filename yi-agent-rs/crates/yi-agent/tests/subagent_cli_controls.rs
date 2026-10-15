@@ -74,16 +74,15 @@ fn cli_confirmation_controls_reject_yes_without_a_preview_token() {
         panic!("expected runtime session");
     };
 
-    for arguments in [vec!["agent", "cancel", &root_task_id, "--yes"]] {
-        let output = invoke(&runtime, &arguments);
-        assert!(
-            !output.status.success(),
-            "{arguments:?} must require preview token"
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("confirmation token is required"),
-            "unexpected confirmation error: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    let arguments: [&str; 4] = ["agent", "cancel", &root_task_id, "--yes"];
+    let output = invoke(&runtime, &arguments);
+    assert!(
+        !output.status.success(),
+        "{arguments:?} must require preview token"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("confirmation token is required"),
+        "unexpected confirmation error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

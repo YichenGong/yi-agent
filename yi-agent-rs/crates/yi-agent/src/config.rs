@@ -757,9 +757,7 @@ mod tests {
     fn cli_rejects_missing_required_task_control_arguments() {
         use clap::Parser;
 
-        for argv in [vec!["yi-agent", "agent", "cancel"]] {
-            assert!(Cli::try_parse_from(argv).is_err());
-        }
+        assert!(Cli::try_parse_from(["yi-agent", "agent", "cancel"]).is_err());
     }
 
     #[test]
