@@ -16,7 +16,7 @@
 - 提交前在 `yi-agent-rs/` 跑 `cargo fmt --all`；commit message 用 conventional commits，首行 ≤72 字符，**不写** `Co-Authored-By`。
 - 测试按 crate 跑（`cargo test -p <crate>`），避免 `--workspace` 全量。
 - 后端改动不得让既有测试变红。每个任务结束时，受影响的 crate 测试须全绿。
-- **零回归硬要求**：`reasoning_effort` 未配置时，各 provider 请求体中该字段不得出现；未开启 thinking 时 Anthropic 请求形状除 `max_tokens` 外与今天一致。
+- **零回归硬要求**：`reasoning_effort` 未配置时，各 provider 请求体中该字段不得出现。Anthropic 请求除 `thinking` / `output_config` / `max_tokens` 三个新增字段外，其余形状与今天一致（见 spec §5.1，thinking 无条件发送）。
 - **凭证保真铁律**（spec §1.3）：凭证必须逐字回传，不重编码、不过滤；`display:"omitted"` 场景明文为空串但凭证必须完整；明文可丢，凭证不可丢。
 - **明文不进摘要**：thinking 明文不得进入 compaction 摘要输入（spec §4.2）。
 - worktree 内所有 `cargo` 命令用 worktree 自己的目录（`<worktree>/yi-agent-rs`）。
@@ -684,26 +684,18 @@ pub struct OutputConfig {
                 yi_agent_core::ThinkingToken::Redacted(data) => {
                     AnthropicContentBlock::RedactedThinking { data }
                 }
-                // 非 Anthropic 形态不应出现在本通道；保守丢弃而非编造凭证。
-                yi_agent_core::ThinkingToken::Encrypted(_)
-                | yi_agent_core::ThinkingToken::None => {
-                    AnthropicContentBlock::Text { text: String::new() }
-                }
-            },
-```
-
-**注意**：上面 `Encrypted`/`None` 分支返回空 `Text` 块会让测试 `deepseek_and_responses_tokens_are_not_sent_to_anthropic`
-失败（它断言 `blocks.len() == 1`）。**改为在 `From<ProviderRequest>` 的 assistant
-分支里过滤**（见 Step 4），`From<ContentBlock>` 的这两个分支用 `unreachable!()`：
-
-```rust
+                // 非 Anthropic 形态**不会**到达这里：`From<ProviderRequest>` 已先过滤。
+                // 保守起见用 unreachable 而非编造凭证——静默造出非法 wire 形状更糟。
                 yi_agent_core::ThinkingToken::Encrypted(_)
                 | yi_agent_core::ThinkingToken::None => {
                     unreachable!("non-Anthropic thinking tokens are filtered before conversion")
                 }
+            },
 ```
 
-并在 `From<ProviderRequest>` 中过滤后再 `Into::into`。
+**为什么过滤放在 `From<ProviderRequest>` 而不是这里**：`From<ContentBlock>` 无上下文，
+无法决定「要不要整条消息丢弃」；过滤需要看整条消息。故该分支只作防御性断言，
+真正的过滤在 Step 4。
 
 - [ ] **Step 4: 实现请求构造（过滤 + 字段填充 + max_tokens 默认）**
 
@@ -1950,9 +1942,18 @@ Expected: 编译失败（字段不存在）
 
 并把 `messages: messages.clone()` 改为 `messages: request_messages`。
 
-**注意**：`messages`（历史）本身**不**改——剥离只作用于**请求副本**，避免影响
-session 与落盘。关闭开关时落盘的剥离由 Task 11 的持久化路径另行处理（或接受
-transcript 保留、请求剥离的差异——**此差异须在 spec 中记录**）。
+**注意**：`messages`（历史）本身**不**改剥离结果——剥离只作用于**请求副本**。
+但按 spec §4.1 的裁定，关闭开关时**落盘的 transcript 也必须剥离**，否则重开会话后
+被剥离的凭证会「复活」。落地方式：切换开关的命令处理里，对 session 的消息执行
+`strip_thinking` 并把结果写回 session（与 meta 更新同一事务）。因此：
+
+- **请求路径**：`preserve_thinking=false` → 每次请求前对副本执行
+  `strip_thinking_except_last_assistant`（保留当前轮）。
+- **落盘路径**：开关切到 `false` 时 → 对 session 执行 `strip_thinking`（全剥），
+  写回并随下一次 `append_turn` 落盘。
+
+**两条路径的粒度不同是有意的**：请求需要当前轮的凭证（轮内硬保证），而落盘是
+"该会话已放弃跨轮保留"的持久状态，不留历史凭证。
 
 `SessionCommand` 加变体（与 `SetReasoningEffort` 同构）：
 

@@ -164,8 +164,9 @@ pub enum ThinkingToken {
   `SessionCommand` 加变体 + app-server 重建 agent（与 `SetReasoningEffort` 同构，
   见 `yi-agent-app-server/src/session.rs:86`）。
 - 关闭时的语义：构造请求前**剥离所有历史轮**的 `Thinking` 块，仅保留当前轮工具
-  循环内产生的。**必须同时作用于落盘的 transcript**，否则重开会话时被剥离的块
-  「复活」。
+  循环内产生的。**同时作用于落盘的 transcript**（裁定结果）：若只剥请求副本，
+  重开会话后被剥离的凭证会「复活」，与开关语义直接矛盾——这是正确性问题，不是
+  一致性问题。落地方式：开关变更时（或写入前）对 session 的消息同样执行剥离。
 - `None`/缺省 = `true`（零迁移：旧 meta 无此字段时按默认开启解释）。
 
 ### 4.2 compaction 冲突（本设计最高风险项）
@@ -184,19 +185,34 @@ created on or after August 31, 2026」。今天是 2026-10-15，**新建账号�
 1. **剥离被压缩区间的思考块**。压缩语义是「历史被摘要替代」，被替换掉的轮次其推理
    凭证已失去对应上下文，保留必然触发前缀失效。`plan_compaction` 选中的保留区间
    之外的 `Thinking` 块一律丢弃。
-2. **保证保留后缀自其首个思考块起 append-only**。摘要**不得**插入保留区间内某个
-   assistant 消息的 content 数组中间——那会改变该消息的块序列，破坏前缀。当前
-   `build_compacted_messages` 的 `first.content.insert(0, summary)` **正是这种插入**，
-   必须改造：摘要应作为**独立的消息/块**置于保留后缀之前，而非插入既有 assistant
-   消息内部。
-
-   **这一改动影响所有 provider**（不只 Anthropic），是本设计中波及面最大的一处，
-   需重点评审与测试。
+2. **保留后缀的思考块同样统一剥离**（裁定结果，见下方"与初稿的差异"）。压缩后
+   历史中**不留任何** `Thinking` 块，故不存在"需要保护的前缀"。
 3. **不做 `prefix_mismatch_behavior` 兜底**（见 §4.3）。
+
+**摘要仍作为独立消息产出**：尽管第 2 层降级为"统一剥离"，`build_compacted_messages`
+**仍然**不得把摘要插入既有 assistant 消息的 content 内部（当前实现
+`first.content.insert(0, summary)` 正是这种插入）。理由：插入会改写该消息的块序列，
+而块序列是 provider 无关结构的一部分（也是未来若要恢复"保留并保护前缀"的前提）；
+摘要独立成消息是更干净、更可验证的形状，且不影响任何 provider 的既有语义。
 
 **明文不进摘要**：`format_messages_for_summary` 不得把 thinking 明文纳入摘要
 输入。理由：凭证不会被摘要模型重现，摘要里出现推理内容会造成「摘要声称有、实际
 凭证已丢」的语义错位，且徒增摘要成本。
+
+### 4.2.1 与初稿的差异（裁定记录）
+
+初稿第 2 层要求"保证保留后缀自其首个思考块起 append-only"，即压缩后**保留**近期
+工具循环的思考块并保护其前缀。
+
+**裁定：降级为"统一剥离"**，即压缩后不留任何思考块。理由：
+
+- 保留并保证 append-only 需要跨请求追踪前缀状态（`system` / `tools` / 消息前缀），
+  实现与测试成本都高，且与 §4.3 不发 `prefix_mismatch_behavior` 的保守立场叠加后，
+  正确性只能靠客户端自律。
+- 收益仅在"压缩后仍希望保留近期推理连续性"这一窄场景。压缩本身已意味着历史被
+  摘要替代，近期轮次若仍需推理连续性，可由用户关闭自动压缩或提高阈值来达成。
+- **后果如实记录**：压缩会释放全部历史推理凭证（含近期），模型在压缩后的下一轮
+  会失去此前的推理连续性。这由 §4.4 的 Notice 告知用户。
 
 ### 4.3 保守取舍：不发 `prefix_mismatch_behavior`
 
@@ -301,6 +317,20 @@ pub output_config: Option<OutputConfig>,   // {effort:"<档位>"}
 - `display` 恒为 `"summarized"`（决策见 §5.4）。
 - `effort` 来自 `GenParams.reasoning_effort`，原样映射。`None` = 不发该字段，沿用
   模型默认档（零回归）。
+
+**`thinking` 字段无条件发送**（裁定结果）：本期不支持关闭 Anthropic 的 thinking，
+故恒发 `{type:"adaptive", display:"summarized"}`。
+
+理由与限制（如实记录）：
+
+- 新代模型（Opus 5.5 / Sonnet 5.5 / Fable / Mythos）**thinking 恒开且拒绝 `disabled`**，
+  发不发 `thinking` 字段都是开着的，显式发只是把它写明。
+- 少数模型（Sonnet 5、Opus 5、Haiku 5.5）**默认开但可关**。本期**不提供**关闭通路
+  ——若将来需要，应在模型目录加能力位（如 `thinking_disabled_supported`）而非靠
+  调用方猜测，因为可用性随代际变化（Sonnet 5.5 用 `between_tools`，Haiku 5.5 受
+  effort 上限约束）。
+- 因此 Global Constraints 的"未开启 thinking 时请求形状与今天一致"**修正**为：
+  除 `thinking` / `output_config` / `max_tokens` 三个新增字段外，其余请求形状与今天一致。
 
 **消息回传**：`From<ProviderRequest> for AnthropicRequest` 的 assistant 分支：
 
