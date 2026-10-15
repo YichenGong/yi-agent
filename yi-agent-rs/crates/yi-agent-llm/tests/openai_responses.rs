@@ -332,3 +332,98 @@ async fn non_effort_400_is_not_retried() {
         "a non-effort rejection must not be retried"
     );
 }
+
+/// 线上真实形态的「网关内部组件瞬时拒绝」响应体（外层内层均为 JSON，内层被转义）。
+const TRANSIENT_MAAS_BODY: &str = concat!(
+    r#"{"error":{"message":"{\"error\":{\"type\":\"invalid_request_error\",\"code\":\"400001\","#,
+    r#"\"message\":\"The request is invalid: the request was rejected by an internal MaaS component. "#,
+    r#"Please check the request body, required fields, and request format.\",\"source\":\"client\","#,
+    r#"\"request_id\":\"5f5338e2-5c52-46b3-99b2-6c0780e2dcc4\"}}\n","type":"upstream_error"}}"#
+);
+
+async fn count_responses_requests(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/v1/responses")
+        .count()
+}
+
+#[tokio::test]
+async fn a_transient_maas_rejection_is_retried_unchanged_until_it_succeeds() {
+    let server = MockServer::start().await;
+    // 前两次：网关内部组件瞬时拒绝（body 逐字节相同，无 param 可指认）→ 400。
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(TRANSIENT_MAAS_BODY))
+        .up_to_n_times(2)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // 之后：恢复正常流式。
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SSE_RESPONSES_TEXT_ONLY))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let provider = provider_with_style(&server, "responses");
+    let resp = provider
+        .call(simple_request())
+        .await
+        .expect("a transient gateway rejection must be retried and then succeed");
+    assert_eq!(resp.stop_reason, StopReason::EndTurn);
+    assert_eq!(
+        count_responses_requests(&server).await,
+        3,
+        "two rejected attempts plus one success"
+    );
+}
+
+#[tokio::test]
+async fn a_transient_rejection_that_never_clears_stays_an_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(TRANSIENT_MAAS_BODY))
+        .mount(&server)
+        .await;
+
+    let provider = provider_with_style(&server, "responses");
+    provider
+        .call(simple_request())
+        .await
+        .expect_err("an unrelenting rejection must surface, not loop forever");
+    assert_eq!(
+        count_responses_requests(&server).await,
+        3,
+        "the retry budget is bounded (initial attempt + 2 retries)"
+    );
+}
+
+#[tokio::test]
+async fn a_maas_rejection_naming_a_field_is_not_retried() {
+    let server = MockServer::start().await;
+    // 同一个网关错误码，但指名了字段 —— 这是确定性问题，重投必然再失败。
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"message":"x","type":"upstream_error","code":"400001","param":"reasoning_effort"}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let provider = provider_with_style(&server, "responses");
+    provider
+        .call(simple_request())
+        .await
+        .expect_err("a field-bearing rejection must stay an error");
+    assert_eq!(
+        count_responses_requests(&server).await,
+        1,
+        "a deterministic rejection must not be retried"
+    );
+}
