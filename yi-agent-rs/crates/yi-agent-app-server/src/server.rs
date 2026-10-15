@@ -9309,14 +9309,13 @@ pub(crate) mod tests {
         }
     }
 
-    /// The six tools a root agent needs to delegate.
-    const DELEGATION_TOOLS: [&str; 6] = [
+    /// The five tools a root agent needs to delegate.
+    const DELEGATION_TOOLS: [&str; 5] = [
         "spawn_agent",
         "send_message",
         "wait_agent",
         "inspect_agent",
         "cancel_agent",
-        "review_agent",
     ];
 
     /// A git project thread reaches the delegation tools.
@@ -9366,7 +9365,7 @@ pub(crate) mod tests {
             );
         }
 
-        // Existing is not enough: the six tools have to work here. Drive the
+        // Existing is not enough: the five tools have to work here. Drive the
         // same request `spawn_agent` sends, so the test fails the day a git
         // project stops admitting a delegated child.
         yi_agent_subagent::attach::activate_root(

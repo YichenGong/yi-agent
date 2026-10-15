@@ -74,12 +74,7 @@ fn cli_confirmation_controls_reject_yes_without_a_preview_token() {
         panic!("expected runtime session");
     };
 
-    for arguments in [
-        vec!["agent", "cancel", &root_task_id, "--yes"],
-        vec!["agent", "accept", &root_task_id, "--yes"],
-        vec!["agent", "rework", &root_task_id, "feedback", "--yes"],
-        vec!["agent", "reject", &root_task_id, "reason", "--yes"],
-    ] {
+    for arguments in [vec!["agent", "cancel", &root_task_id, "--yes"]] {
         let output = invoke(&runtime, &arguments);
         assert!(
             !output.status.success(),

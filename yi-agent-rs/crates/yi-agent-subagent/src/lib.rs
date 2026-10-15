@@ -196,7 +196,6 @@ impl DaemonAgentWorkerFactory {
             "wait_agent".to_string(),
             "inspect_agent".to_string(),
             "cancel_agent".to_string(),
-            "review_agent".to_string(),
         ]);
         names.sort();
         names.dedup();
@@ -220,7 +219,6 @@ impl DaemonAgentWorkerFactory {
                     "wait_agent".to_string(),
                     "inspect_agent".to_string(),
                     "cancel_agent".to_string(),
-                    "review_agent".to_string(),
                 ]);
                 names.sort();
                 names.dedup();
@@ -653,9 +651,6 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                     root: Arc::clone(&worker_root),
                 }),
                 Arc::new(DaemonCancelAgentTool {
-                    root: Arc::clone(&worker_root),
-                }),
-                Arc::new(DaemonReviewAgentTool {
                     root: Arc::clone(&worker_root),
                 }),
             ] {
@@ -1410,9 +1405,6 @@ pub fn register_application_subagent_tools_in_thread(
     registry.register(Arc::new(DaemonCancelAgentTool {
         root: Arc::clone(&root),
     }));
-    registry.register(Arc::new(DaemonReviewAgentTool {
-        root: Arc::clone(&root),
-    }));
 }
 
 fn format_ipc_rejection(action: &str, response: &yi_agent_store::ipc::IpcResponse) -> String {
@@ -1674,10 +1666,6 @@ struct DaemonCancelAgentTool {
     root: Arc<crate::thread_root::ThreadRoot>,
 }
 
-struct DaemonReviewAgentTool {
-    root: Arc<crate::thread_root::ThreadRoot>,
-}
-
 struct DaemonWaitAgentTool {
     root: Arc<crate::thread_root::ThreadRoot>,
 }
@@ -1924,85 +1912,6 @@ impl Tool for DaemonCancelAgentTool {
 }
 
 #[async_trait]
-impl Tool for DaemonReviewAgentTool {
-    fn name(&self) -> &str {
-        "review_agent"
-    }
-
-    fn description(&self) -> &str {
-        "Act on a direct child's delivery that is awaiting your review: send it back to rework with feedback, or reject it. Use decision \"rework\" to have the child try again with your feedback, or \"reject\" to stop it. To accept a delivery, merge the child's commit into your own branch instead; the runtime then completes the child."
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task_id": { "type": "string", "description": "Your direct child task whose delivery you are reviewing." },
-                "decision": {
-                    "type": "string",
-                    "enum": ["rework", "reject"],
-                    "description": "rework sends the child back with feedback; reject stops it."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Feedback for a rework, or the reason for a rejection. Must not be empty."
-                }
-            },
-            "required": ["task_id", "decision", "message"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn call(&self, args: Value) -> ToolResult {
-        let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
-            return ToolResult::error("task_id is required");
-        };
-        if task_id.parse::<yi_agent_core::TaskId>().is_err() {
-            return ToolResult::error("task_id must be a task UUID");
-        }
-        let Some(message) = args.get("message").and_then(Value::as_str) else {
-            return ToolResult::error("message is required");
-        };
-        let decision = match args.get("decision").and_then(Value::as_str) {
-            Some("rework") => yi_agent_store::ipc::ChildReviewDecision::Rework {
-                feedback: message.to_owned(),
-            },
-            Some("reject") => yi_agent_store::ipc::ChildReviewDecision::Reject {
-                reason: message.to_owned(),
-            },
-            Some(other) => {
-                return ToolResult::error(format!(
-                    "decision must be \"rework\" or \"reject\", got {other:?}"
-                ));
-            }
-            None => return ToolResult::error("decision is required"),
-        };
-        let task_id = task_id.to_owned();
-        let handle = match self.root.handle() {
-            Ok(handle) => handle,
-            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
-        };
-        let response = yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::ReviewChild {
-                session_id: handle.session_id.clone(),
-                caller_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
-                task_id: task_id.clone(),
-                decision: decision.clone(),
-            },
-        );
-        match response {
-            Ok(yi_agent_store::ipc::IpcResponse::ChildReviewAccepted) => ToolResult::text(
-                json!({ "task_id": task_id, "status": "review_recorded" }).to_string(),
-            ),
-            Ok(other) => ToolResult::error(format_ipc_rejection("review request", &other)),
-            Err(error) => ToolResult::error(format!("daemon is unavailable: {error}")),
-        }
-    }
-}
-
-#[async_trait]
 impl Tool for DaemonWaitAgentTool {
     fn name(&self) -> &str {
         "wait_agent"
@@ -2156,7 +2065,7 @@ impl Tool for DaemonSpawnAgentTool {
 
 #[cfg(test)]
 mod tests {
-    /// The whole point of the root refactor: the six application delegation tools
+    /// The whole point of the root refactor: the five application delegation tools
     /// share one conversation root instead of freezing their own socket.
     #[test]
     fn application_tools_share_one_root() {
@@ -2183,10 +2092,14 @@ mod tests {
             "send_message",
             "inspect_agent",
             "cancel_agent",
-            "review_agent",
         ] {
             assert!(registry.get(name).is_some(), "{name} must be registered");
         }
+        // 交付即完成：验收是父自己的 git 动作，运行时不再有交互式 review 工具。
+        assert!(
+            registry.get("review_agent").is_none(),
+            "review_agent must not be registered: delivery is terminal and integration is the parent's own git action"
+        );
     }
 
     #[test]
@@ -2547,51 +2460,12 @@ mod tests {
             "wait_agent",
             "inspect_agent",
             "cancel_agent",
-            "review_agent",
         ] {
             assert!(
                 names.contains(&expected.to_string()),
                 "the recovery preflight must know {expected}, got {names:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn review_agent_validates_its_arguments_before_touching_the_daemon() {
-        let tool = DaemonReviewAgentTool {
-            root: test_root(
-                PathBuf::from("/tmp/unused.sock"),
-                "s".into(),
-                "c".into(),
-                "k".into(),
-            ),
-        };
-        let uuid = "00000000-0000-0000-0000-000000000001";
-        assert!(tool.call(json!({})).await.is_error, "task_id is required");
-        assert!(
-            tool.call(json!({"task_id": "nope", "decision": "rework", "message": "m"}))
-                .await
-                .is_error,
-            "task_id must be a UUID"
-        );
-        assert!(
-            tool.call(json!({"task_id": uuid, "message": "m"}))
-                .await
-                .is_error,
-            "decision is required"
-        );
-        assert!(
-            tool.call(json!({"task_id": uuid, "decision": "approve", "message": "m"}))
-                .await
-                .is_error,
-            "approve is not an agent decision: integration is the parent\'s own git action"
-        );
-        assert!(
-            tool.call(json!({"task_id": uuid, "decision": "rework"}))
-                .await
-                .is_error,
-            "message is required"
-        );
     }
 
     #[tokio::test]
