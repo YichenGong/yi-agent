@@ -8,6 +8,7 @@ import {
   setSubagentModel,
   setThreadModel,
   setThreadReasoningEffort,
+  testModel,
   upsertModel,
 } from "./models";
 
@@ -195,6 +196,44 @@ describe("setThreadReasoningEffort", () => {
     const rpc = vi.fn().mockResolvedValue({ ok: true, effort: null });
     await expect(setThreadReasoningEffort(rpc, "t1", null)).resolves.toEqual({ effort: null });
     expect(rpc).toHaveBeenCalledWith("thread/setReasoningEffort", { threadId: "t1", effort: null });
+  });
+});
+
+describe("testModel", () => {
+  it("sends api_key only when explicitly provided", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true, reason: null });
+
+    await testModel(rpc, {
+      provider: "openai",
+      model: "m",
+      api_url: "https://x/v1",
+      api_key: "sk-draft",
+    });
+    expect(rpc).toHaveBeenCalledWith(
+      "model/test",
+      expect.objectContaining({ api_key: "sk-draft" }),
+    );
+  });
+
+  it("sends name instead of api_key when no key is given", async () => {
+    const rpc = vi.fn().mockResolvedValue({ ok: true, reason: null });
+
+    await testModel(rpc, {
+      provider: "openai",
+      model: "m",
+      api_url: "https://x/v1",
+      name: "A",
+    });
+    const params = rpc.mock.calls[0][1] as Record<string, unknown>;
+    expect(params.name).toBe("A");
+    expect("api_key" in params).toBe(false);
+  });
+
+  it("treats a missing ok field as failure", async () => {
+    const rpc = vi.fn().mockResolvedValue({});
+    await expect(
+      testModel(rpc, { provider: "openai", model: "m", api_url: "https://x/v1", name: "A" }),
+    ).resolves.toEqual({ ok: false, reason: null });
   });
 });
 

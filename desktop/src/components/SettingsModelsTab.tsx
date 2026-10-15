@@ -6,6 +6,7 @@ import {
   listModels,
   setDefaultModel,
   setSubagentModel,
+  testModel,
   upsertModel,
   type EffectiveModel,
   type ModelEntryView,
@@ -97,6 +98,11 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 最近一次「测试」的结论：null = 还没测；测成功显示成功，失败显示原因。 */
+  const [testResult, setTestResult] = useState<
+    { ok: boolean; reason: string | null } | null
+  >(null);
+  const [testing, setTesting] = useState(false);
   /** 「▸ 高级」折叠区：默认收起，普通用户无需展开。 */
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
@@ -156,6 +162,7 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       reasoning_effort: UNSET,
     });
     setAdvancedOpen(false);
+    setTestResult(null);
   };
 
   const startEdit = (entry: ModelEntryView) => {
@@ -173,6 +180,7 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       reasoning_effort: entry.reasoning_effort ?? UNSET,
     });
     setAdvancedOpen(false);
+    setTestResult(null);
   };
 
   const saveDraft = async () => {
@@ -199,6 +207,31 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       setActionError(saveErrorText(error));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const runTest = async () => {
+    if (!rpc || !draft) return;
+    setTesting(true);
+    setTestResult(null);
+    setActionError(null);
+    try {
+      // key 解析约定：改过 key 就传草稿 key，否则传条目名让服务端取已存 key。
+      const result = await testModel(rpc, {
+        provider: draft.provider,
+        model: draft.model,
+        api_url: draft.api_url,
+        ...(draft.keyEdited
+          ? { api_key: draft.api_key }
+          : draft.original !== null
+            ? { name: draft.original }
+            : { api_key: draft.api_key }),
+      });
+      setTestResult(result);
+    } catch (error) {
+      setTestResult({ ok: false, reason: saveErrorText(error) });
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -511,6 +544,14 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
           <div className="mt-3 flex items-center gap-2">
             <button
               type="button"
+              onClick={() => void runTest()}
+              disabled={testing || !rpc}
+              className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg-muted hover:text-fg disabled:opacity-50"
+            >
+              {testing ? "测试中…" : "测试"}
+            </button>
+            <button
+              type="button"
               onClick={() => void saveDraft()}
               disabled={busy || !rpc}
               className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg-muted hover:text-fg disabled:opacity-50"
@@ -528,6 +569,13 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
               取消
             </button>
           </div>
+          {testResult !== null && (
+            <p
+              className={`mt-2 text-xs ${testResult.ok ? "text-green-400" : "text-red-400"}`}
+            >
+              {testResult.ok ? "连接成功" : (testResult.reason ?? "连接失败")}
+            </p>
+          )}
         </div>
       )}
     </section>

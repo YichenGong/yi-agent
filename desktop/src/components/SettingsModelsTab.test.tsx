@@ -317,6 +317,37 @@ describe("SettingsModelsTab", () => {
     await screen.findByText("••••1234");
     expect(screen.queryByRole("button", { name: "导入当前配置" })).toBeNull();
   });
+
+  it("tests with name (not api_key) when editing without changing the key", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true, reason: null },
+    );
+    render(<SettingsModelsTab call={call} />);
+    await screen.findByText("••••1234");
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑" }));
+    fireEvent.click(screen.getByRole("button", { name: "测试" }));
+
+    await waitFor(() => expect(callsTo(call, "model/test")).toHaveLength(1));
+    const params = callsTo(call, "model/test")[0][1] as Record<string, unknown>;
+    expect(params.name).toBe("A");
+    expect("api_key" in params).toBe(false);
+    expect(await screen.findByText("连接成功")).toBeTruthy();
+  });
+
+  it("shows the server reason when the test fails", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) => {
+      if (method === "model/list") return { models: [], default_model: null, subagent_model: null, effective: null };
+      if (method === "model/test") return { ok: false, reason: "API 密钥无效或无权限" };
+      return {};
+    });
+    render(<SettingsModelsTab call={call} />);
+    fireEvent.click(await screen.findByRole("button", { name: "添加模型" }));
+    fireEvent.change(screen.getByLabelText("API 地址"), { target: { value: "https://x/v1" } });
+    fireEvent.click(screen.getByRole("button", { name: "测试" }));
+
+    expect(await screen.findByText("API 密钥无效或无权限")).toBeTruthy();
+  });
 });
 
 describe("SettingsModelsTab channel fields", () => {
