@@ -10,8 +10,8 @@ use yi_agent_core::ProviderTurnGate;
 use yi_agent_core::RootSessionId;
 use yi_agent_core::subagent::scheduler::ResourceCoordinator;
 use yi_agent_core::subagent::task::{
-    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox, IntegrationValidation,
-    MessageId, PermissionDecision, PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
+    AttemptId, BudgetKind, ChildWriteMode, DeliveryReport, InheritedSandbox, PermissionDecision,
+    PermissionRequestId, TaskId, TimeoutKind, WorkspaceLeaseId,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryAttestation,
@@ -21,7 +21,7 @@ use yi_agent_core::subagent::worker::{
 use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
 };
-use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
+use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
 use yi_agent_store::schedule::{
     MissedRunPolicy, ScheduleDefinition, WatchdogLimits, WatchdogUsage,
 };
@@ -721,7 +721,7 @@ async fn child_recovery_context_uses_the_in_memory_workspace_assignment() {
 }
 
 #[tokio::test]
-async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
+async fn child_delivery_uses_the_assigned_workspace_lease() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let starts = Arc::new(Mutex::new(Vec::new()));
@@ -771,7 +771,7 @@ async fn child_delivery_uses_the_assigned_workspace_lease_for_review() {
             .unwrap()
             .task_state(&child)
             .unwrap(),
-        "awaiting_parent_review"
+        "completed"
     );
 }
 
@@ -917,10 +917,7 @@ async fn coordinator_persists_worker_delivery_and_notifies_direct_parent() {
     coordinator.reconcile_worker_events().await.unwrap();
 
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(
-        repository.task_state(&child).unwrap(),
-        "awaiting_parent_review"
-    );
+    assert_eq!(repository.task_state(&child).unwrap(), "completed");
     let mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
     assert_eq!(mailbox.len(), 1);
     assert!(mailbox[0].payload_json.contains(&delivery.id.to_string()));
@@ -948,8 +945,9 @@ async fn coordinator_persists_worker_delivery_and_notifies_direct_parent() {
     );
 }
 
+/// 子任务交付后 reconcile 直接落 completed，无需任何 review 调用。
 #[tokio::test]
-async fn trusted_parent_integration_requires_passed_validation_to_complete_review() {
+async fn a_delivered_child_reconciles_directly_to_completed() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let factory = Arc::new(MessageRecordingFactory::default());
@@ -962,12 +960,8 @@ async fn trusted_parent_integration_requires_passed_validation_to_complete_revie
         .workspace_lease_id
         .clone()
         .unwrap();
-    let delivery = yi_agent_core::subagent::task::DeliveryReport::coding(
-        "deadbeef",
-        "main",
-        workspace,
-        "cargo test -p child",
-    );
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p child");
+
     factory
         .handles
         .lock()
@@ -977,892 +971,19 @@ async fn trusted_parent_integration_requires_passed_validation_to_complete_revie
         .report_delivery(delivery.clone());
     coordinator.reconcile_worker_events().await.unwrap();
 
-    assert!(
-        coordinator
-            .accept_review(
-                &child,
-                IntegrationValidation::failed("parent integration tests failed"),
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-
-    coordinator
-        .accept_review(
-            &child,
-            IntegrationValidation::passed("cargo test -p parent"),
-        )
-        .await
-        .unwrap();
-
+    // 没有 accept_review 之类的调用：交付本身就是终局。
     let repository = RuntimeRepository::open(&database).unwrap();
     assert_eq!(repository.task_state(&child).unwrap(), "completed");
-    let review_actor: String = Connection::open(&database)
-        .unwrap()
-        .query_row(
-            "SELECT actor_json FROM reviews WHERE delivery_id = ?1",
-            [delivery.id.to_string()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let review_actor: serde_json::Value = serde_json::from_str(&review_actor).unwrap();
-    assert_eq!(review_actor["task_id"], parent.to_string());
-    assert_eq!(review_actor["initiated_by"]["kind"], "parent_integration");
-    let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
-    assert_eq!(parent_mailbox.len(), 1);
-}
-
-#[tokio::test]
-async fn unmerged_delivery_stays_awaiting_review_across_reconcile() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let repository_root = directory.path().join("repo");
-    std::fs::create_dir(&repository_root).unwrap();
-    initialize_git_repository(&repository_root);
-    let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(Arc::new(GitWorkspaceService::new(repository_root.clone()))),
-        ..Default::default()
-    });
-    let (coordinator, _session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-
-    coordinator.reconcile_worker_events().await.unwrap();
-
-    let repository = RuntimeRepository::open(&database).unwrap();
+    let child_attempt = repository.active_attempt_id(&child).unwrap();
     assert_eq!(
-        repository.task_state(&child).unwrap(),
-        "awaiting_parent_review"
+        repository.attempt_state(&child_attempt).unwrap(),
+        "completed"
     );
-    assert!(
-        repository
-            .event_records_for_task_after(&child, 0)
-            .unwrap()
-            .iter()
-            .all(|event| !matches!(event.event, RuntimeEvent::ReviewAccepted)),
-        "an unmerged delivery is never auto-accepted"
-    );
-}
-
-#[tokio::test]
-async fn review_confirmation_rejects_a_delivery_head_change_between_preview_and_confirm() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let repository_root = directory.path().join("repo");
-    std::fs::create_dir(&repository_root).unwrap();
-    initialize_git_repository(&repository_root);
-    let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
-    let factory = Arc::new(MessageRecordingFactory {
-        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
-        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
-        ..Default::default()
-    });
-    let (coordinator, _session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-
-    let preview = coordinator
-        .preview_review(&child, yi_agent_store::runtime::ReviewDecision::Approve)
-        .await
-        .unwrap();
-    let workspace = factory
-        .starts
-        .lock()
-        .unwrap()
-        .last()
-        .unwrap()
-        .workspace
-        .clone()
-        .expect("worker received a workspace");
-    std::fs::write(workspace.path.join("review_change.txt"), "changed\n").unwrap();
-    Command::new("git")
-        .args(["add", "review_change.txt"])
-        .current_dir(&workspace.path)
-        .status()
-        .unwrap();
-    Command::new("git")
-        .args(["commit", "-m", "changed after preview"])
-        .current_dir(&workspace.path)
-        .status()
-        .unwrap();
-
-    assert!(
-        coordinator
-            .confirm_review(
-                &child,
-                yi_agent_store::runtime::ReviewDecision::Approve,
-                &preview.confirmation_token,
-            )
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-}
-
-#[tokio::test]
-async fn review_preview_rejects_a_delivery_that_already_has_a_review_decision() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, _session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-    let preview = coordinator
-        .preview_review(&child, yi_agent_store::runtime::ReviewDecision::Approve)
-        .await
-        .unwrap();
-    coordinator
-        .confirm_review(
-            &child,
-            yi_agent_store::runtime::ReviewDecision::Approve,
-            &preview.confirmation_token,
-        )
-        .await
-        .unwrap();
-
-    assert!(
-        coordinator
-            .preview_review(&child, yi_agent_store::runtime::ReviewDecision::Approve)
-            .await
-            .is_err()
-    );
-}
-
-#[tokio::test]
-async fn coordinator_rework_persists_feedback_and_starts_the_successor_attempt() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, _session, parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-    let previous_attempt = factory.starts.lock().unwrap()[0].attempt_id.clone();
-
-    coordinator
-        .rework_review(&child, "update the parser contract and rerun its tests")
-        .await
-        .unwrap();
-
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(
-        repository.attempt_state(&previous_attempt).unwrap(),
-        "rework_requested"
-    );
-    assert_eq!(repository.task_state(&child).unwrap(), "running");
-    let successor = repository.active_attempt_id(&child).unwrap();
-    assert_ne!(successor, previous_attempt);
-    let starts = factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 2);
-    assert!(
-        starts[1]
-            .initial_user_messages
-            .iter()
-            .any(|message| message.body.contains("parser contract"))
-    );
-    let worker_feedback_id = starts[1].initial_user_messages[0].id.to_string();
-    drop(starts);
-    let mailbox = repository.mailbox_messages_for_task(&child).unwrap();
+    // 直接父级仍拿到含交付 commit 的通知。
+    let mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
     assert_eq!(mailbox.len(), 1);
-    assert_eq!(mailbox[0].kind, "rework");
-    assert!(mailbox[0].payload_json.contains("parser contract"));
-    assert_eq!(worker_feedback_id, mailbox[0].message_id);
-    let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
-    assert_eq!(parent_mailbox.len(), 2);
-    assert!(parent_mailbox[1].payload_json.contains("rework"));
-}
-
-#[tokio::test]
-async fn failed_rework_transaction_does_not_advance_the_in_memory_supervisor() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, _session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_rework_review
-             BEFORE INSERT ON reviews
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected review failure');
-             END;",
-        )
-        .unwrap();
-
-    assert!(
-        coordinator
-            .rework_review(&child, "update the parser contract")
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-
-    connection
-        .execute_batch("DROP TRIGGER fail_rework_review;")
-        .unwrap();
-    coordinator
-        .rework_review(&child, "update the parser contract")
-        .await
-        .unwrap();
-
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "running"
-    );
-    assert_eq!(factory.starts.lock().unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn coordinator_rejects_delivery_with_a_durable_reason() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, _session, parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory).await;
-
-    coordinator
-        .reject_review(&child, "the regression test is missing")
-        .await
-        .unwrap();
-
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.task_state(&child).unwrap(), "blocked");
-    let mailbox = repository.mailbox_messages_for_task(&child).unwrap();
-    assert_eq!(mailbox.len(), 1);
-    assert_eq!(mailbox[0].kind, "review_rejected");
-    assert!(mailbox[0].payload_json.contains("regression test"));
-    let parent_mailbox = repository.mailbox_messages_for_task(&parent).unwrap();
-    assert_eq!(parent_mailbox.len(), 2);
-    assert!(parent_mailbox[1].payload_json.contains("rejected"));
-}
-
-#[derive(Clone, Copy)]
-enum ReviewDecision {
-    Approve,
-    Rework,
-    Reject,
-}
-
-#[tokio::test]
-async fn committed_review_decisions_reach_the_live_parent_with_the_durable_message_id() {
-    for decision in [
-        ReviewDecision::Approve,
-        ReviewDecision::Rework,
-        ReviewDecision::Reject,
-    ] {
-        let directory = TempDir::new().unwrap();
-        let database = directory.path().join("runtime.sqlite");
-        let factory = Arc::new(MessageRecordingFactory::default());
-        let (coordinator, session, parent, child, _delivery) =
-            delivered_child_coordinator(&database, factory.clone()).await;
-        coordinator.start_worker(&session, &parent).await.unwrap();
-        let parent_handle = factory.handles.lock().unwrap()[1].clone();
-        let mut parent_mailbox = parent_handle.subscribe_messages();
-
-        match decision {
-            ReviewDecision::Approve => coordinator.approve_review(&child).await.unwrap(),
-            ReviewDecision::Rework => coordinator
-                .rework_review(&child, "rerun the parser regression suite")
-                .await
-                .unwrap(),
-            ReviewDecision::Reject => coordinator
-                .reject_review(&child, "missing parser regression evidence")
-                .await
-                .unwrap(),
-        }
-
-        let durable = RuntimeRepository::open(&database)
-            .unwrap()
-            .mailbox_messages_for_task(&parent)
-            .unwrap()
-            .pop()
-            .expect("review transaction persists a parent notification");
-        let delivered = tokio::time::timeout(Duration::from_millis(100), parent_mailbox.recv())
-            .await
-            .expect("committed notification wakes the live parent")
-            .expect("live parent mailbox remains open");
-        assert_eq!(delivered.id.to_string(), durable.message_id);
-        let payload: serde_json::Value = serde_json::from_str(&durable.payload_json).unwrap();
-        assert_eq!(delivered.body, payload["message"].as_str().unwrap());
-
-        parent_handle.report_message_consumed(delivered.id.clone());
-        coordinator.reconcile_worker_events().await.unwrap();
-        assert!(
-            RuntimeRepository::open(&database)
-                .unwrap()
-                .mailbox_message_delivered_at(&delivered.id)
-                .unwrap()
-                .is_some()
-        );
-    }
-}
-
-#[tokio::test]
-async fn rework_acknowledgement_failure_enters_controlled_recovery_before_replay() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_rework_delivery_ack
-             BEFORE UPDATE OF delivered_at ON mailbox_messages
-             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
-             END;",
-        )
-        .unwrap();
-
-    assert!(
-        coordinator
-            .rework_review(&child, "rerun the parser regression suite")
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        factory.starts.lock().unwrap().len(),
-        2,
-        "the ambiguous worker start is never hidden as an unattempted delivery"
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "recovery_required"
-    );
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert!(
-        !repository
-            .has_active_lease_prefix(&child, "resident:")
-            .unwrap()
-    );
-    assert!(
-        repository
-            .has_active_lease_prefix(&child, "workspace:")
-            .unwrap()
-    );
-    assert!(
-        repository
-            .has_active_lease_prefix(&child, "worktree:")
-            .unwrap()
-    );
-    drop(repository);
-    let feedback_id: MessageId = RuntimeRepository::open(&database)
-        .unwrap()
-        .mailbox_messages_for_task(&child)
-        .unwrap()[0]
-        .message_id
-        .parse()
-        .unwrap();
-    assert!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .mailbox_message_delivered_at(&feedback_id)
-            .unwrap()
-            .is_none()
-    );
-
-    connection
-        .execute_batch("DROP TRIGGER fail_rework_delivery_ack;")
-        .unwrap();
-    drop(coordinator);
-    let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
-    reopened.resume_task(&session, &child).await.unwrap();
-    let starts = factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 3);
-    assert_eq!(starts[2].initial_user_messages.len(), 1);
-    assert_eq!(starts[2].initial_user_messages[0].id, feedback_id);
-    drop(starts);
-    assert!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .mailbox_message_delivered_at(&feedback_id)
-            .unwrap()
-            .is_some()
-    );
-}
-
-#[tokio::test]
-async fn failed_recovery_persistence_retains_the_admission_context_for_explicit_resume() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_rework_delivery_ack
-             BEFORE UPDATE OF delivered_at ON mailbox_messages
-             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
-             END;
-             CREATE TRIGGER fail_recovery_transition
-             BEFORE UPDATE OF state_json ON tasks
-             WHEN NEW.state_json = 'recovery_required'
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected recovery transition failure');
-             END;",
-        )
-        .unwrap();
-
-    assert!(
-        coordinator
-            .rework_review(&child, "rerun the parser regression suite")
-            .await
-            .is_err()
-    );
-    assert!(
-        factory.handles.lock().unwrap()[1]
-            .cancellation_token()
-            .is_cancelled()
-    );
-    let expected: (Option<String>, Option<String>, String) = connection
-        .query_row(
-            "SELECT tasks.workspace_lease_id, attempts.checkpoint_json, attempts.usage_json
-             FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
-             WHERE tasks.id = ?1",
-            [child.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-
-    connection
-        .execute_batch(
-            "DROP TRIGGER fail_rework_delivery_ack;
-             DROP TRIGGER fail_recovery_transition;",
-        )
-        .unwrap();
-    coordinator.resume_task(&session, &child).await.unwrap();
-
-    let preflights = factory.recovery_preflights.lock().unwrap();
-    let context = &preflights
-        .last()
-        .expect("resume must pass the recovery gate")
-        .context;
-    assert_eq!(context.workspace_lease_id, expected.0);
-    assert_eq!(context.worktree_lease, durable_context().worktree_lease);
-    assert_eq!(context.checkpoint_json, expected.1.clone().unwrap());
-    assert_eq!(context.tool_state_json, expected.2);
-}
-
-#[tokio::test]
-async fn failed_recovery_transition_still_releases_the_durable_resident_lease() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory.clone()).await;
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_rework_delivery_ack
-             BEFORE UPDATE OF delivered_at ON mailbox_messages
-             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
-             END;
-             CREATE TRIGGER fail_recovery_transition
-             BEFORE UPDATE OF state_json ON tasks
-             WHEN NEW.state_json = 'recovery_required'
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected recovery transition failure');
-             END;",
-        )
-        .unwrap();
-
-    assert!(
-        coordinator
-            .rework_review(&child, "rerun the parser regression suite")
-            .await
-            .is_err()
-    );
-    assert!(
-        factory.handles.lock().unwrap()[1]
-            .cancellation_token()
-            .is_cancelled()
-    );
-    let expected: (Option<String>, Option<String>, String) = connection
-        .query_row(
-            "SELECT tasks.workspace_lease_id, attempts.checkpoint_json, attempts.usage_json
-             FROM tasks JOIN attempts ON attempts.id = tasks.active_attempt_id
-             WHERE tasks.id = ?1",
-            [child.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
-    let feedback_id: MessageId = RuntimeRepository::open(&database)
-        .unwrap()
-        .mailbox_messages_for_task(&child)
-        .unwrap()[0]
-        .message_id
-        .parse()
-        .unwrap();
-
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert!(
-        !repository
-            .has_active_lease_prefix(&child, "resident:")
-            .unwrap()
-    );
-    assert!(
-        repository
-            .has_active_lease_prefix(&child, "workspace:")
-            .unwrap()
-    );
-    assert!(
-        repository
-            .has_active_lease_prefix(&child, "worktree:")
-            .unwrap()
-    );
-    drop(repository);
-
-    connection
-        .execute_batch(
-            "DROP TRIGGER fail_rework_delivery_ack;
-             DROP TRIGGER fail_recovery_transition;",
-        )
-        .unwrap();
-    drop(connection);
-    drop(coordinator);
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .recover_inflight_tasks()
-        .unwrap();
-    let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
-    reopened.resume_task(&session, &child).await.unwrap();
-
-    let starts = factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 3);
-    assert_eq!(starts[2].initial_user_messages.len(), 1);
-    assert_eq!(starts[2].initial_user_messages[0].id, feedback_id);
-    drop(starts);
-    let preflights = factory.recovery_preflights.lock().unwrap();
-    let context = &preflights
-        .last()
-        .expect("resume must pass the recovery gate")
-        .context;
-    assert_eq!(context.workspace_lease_id, expected.0);
-    assert_eq!(context.worktree_lease, durable_context().worktree_lease);
-    assert_eq!(context.checkpoint_json, expected.1.unwrap());
-    assert_eq!(context.tool_state_json, expected.2);
-}
-
-#[tokio::test]
-async fn failed_rework_fallback_reports_ack_cleanup_and_recovery_failures() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, _session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory).await;
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_rework_delivery_ack
-             BEFORE UPDATE OF delivered_at ON mailbox_messages
-             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
-             END;
-             CREATE TRIGGER fail_process_lease_cleanup
-             BEFORE UPDATE OF state ON resource_leases
-             WHEN OLD.resource_key LIKE 'resident:%' AND NEW.state = 'released'
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected process lease cleanup failure');
-             END;
-             CREATE TRIGGER fail_recovery_transition
-             BEFORE UPDATE OF state_json ON tasks
-             WHEN NEW.state_json = 'recovery_required'
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected recovery transition failure');
-             END;",
-        )
-        .unwrap();
-
-    let error = coordinator
-        .rework_review(&child, "rerun the parser regression suite")
-        .await
-        .expect_err("the injected fallback failures must surface");
-    let RuntimeCoordinatorError::ControlledRecoveryPersistence {
-        acknowledgement,
-        cleanup: Some(cleanup),
-        recovery: Some(recovery),
-    } = error
-    else {
-        panic!("expected combined controlled recovery evidence, got {error:?}");
-    };
-    assert!(acknowledgement.contains("injected rework acknowledgement failure"));
-    assert!(cleanup.contains("injected process lease cleanup failure"));
-    assert!(recovery.contains("injected recovery transition failure"));
-}
-
-#[tokio::test]
-async fn cleanup_failure_rolls_back_controlled_recovery_transition() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, _session, _parent, child, _delivery) =
-        delivered_child_coordinator(&database, factory).await;
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER fail_rework_delivery_ack
-             BEFORE UPDATE OF delivered_at ON mailbox_messages
-             WHEN OLD.kind = 'rework' AND NEW.delivered_at IS NOT NULL
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected rework acknowledgement failure');
-             END;
-             CREATE TRIGGER fail_process_lease_cleanup
-             BEFORE UPDATE OF state ON resource_leases
-             WHEN OLD.resource_key LIKE 'resident:%' AND NEW.state = 'released'
-             BEGIN
-                 SELECT RAISE(ABORT, 'injected process lease cleanup failure');
-             END;",
-        )
-        .unwrap();
-
-    let error = coordinator
-        .rework_review(&child, "rerun the parser regression suite")
-        .await
-        .expect_err("the injected cleanup failure must surface");
-    let RuntimeCoordinatorError::ControlledRecoveryPersistence {
-        acknowledgement,
-        cleanup: Some(cleanup),
-        recovery: None,
-    } = error
-    else {
-        panic!("expected acknowledgement plus cleanup evidence, got {error:?}");
-    };
-    assert!(acknowledgement.contains("injected rework acknowledgement failure"));
-    assert!(cleanup.contains("injected process lease cleanup failure"));
-
-    let repository = RuntimeRepository::open(&database).unwrap();
-    let task_state = repository.task_state(&child).unwrap();
-    let resident_active = repository
-        .has_active_lease_prefix(&child, "resident:")
-        .unwrap();
-    assert!(
-        !(task_state == "recovery_required" && resident_active),
-        "cleanup failure must not leave recovery_required with an active resident lease"
-    );
-}
-
-#[tokio::test]
-async fn restart_hydrates_a_committed_user_review_notification() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, session, parent, child, delivery) =
-        delivered_child_coordinator(&database, factory).await;
-    let actor_json = local_user_review_actor(&parent);
-    let notification_id = MessageId::new();
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .approve_delivery_review(&child, &delivery.id, &parent, &actor_json, &notification_id)
-        .unwrap();
-    drop(coordinator);
-    let restart_factory = Arc::new(MessageRecordingFactory::default());
-    let reopened = RuntimeCoordinator::open(&database, restart_factory.clone()).unwrap();
-
-    reopened.start_worker(&session, &parent).await.unwrap();
-
-    let starts = restart_factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 1);
-    assert_eq!(starts[0].initial_user_messages.len(), 1);
-    assert_eq!(starts[0].initial_user_messages[0].id, notification_id);
-    assert!(starts[0].initial_user_messages[0].body.contains("approved"));
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-}
-
-#[tokio::test]
-async fn restart_hydrates_review_mail_when_the_session_contains_a_failed_task() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, session, parent, child, delivery) =
-        delivered_child_coordinator(&database, factory).await;
-    let notification_id = MessageId::new();
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .approve_delivery_review(
-            &child,
-            &delivery.id,
-            &parent,
-            &local_user_review_actor(&parent),
-            &notification_id,
-        )
-        .unwrap();
-    let parent_attempt = RuntimeRepository::open(&database)
-        .unwrap()
-        .active_attempt_id(&parent)
-        .unwrap();
-    Connection::open(&database)
-        .unwrap()
-        .execute_batch(&format!(
-            "UPDATE tasks SET state_json = 'failed' WHERE id = '{parent}';
-             UPDATE attempts SET state = 'failed' WHERE id = '{parent_attempt}';"
-        ))
-        .unwrap();
-    drop(coordinator);
-
-    let reopened = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
-    let mailbox = reopened.mailbox_snapshot(&session, &parent).await.unwrap();
-
-    assert_eq!(mailbox.len(), 1);
-    assert_eq!(mailbox[0].id, notification_id);
-}
-
-#[tokio::test]
-async fn restart_hydrates_rework_once_with_its_durable_message_id() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, session, parent, child, delivery) =
-        delivered_child_coordinator(&database, factory).await;
-    let prior_attempt = RuntimeRepository::open(&database)
-        .unwrap()
-        .active_attempt_id(&child)
-        .unwrap();
-    let successor = AttemptId::new();
-    let feedback_id = MessageId::new();
-    let actor_json = local_user_review_actor(&parent);
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .rework_delivery_review(
-            &child,
-            &delivery.id,
-            &parent,
-            "rerun the parser regression suite",
-            &feedback_id,
-            &successor,
-            2,
-            &actor_json,
-            &MessageId::new(),
-        )
-        .unwrap();
-    drop(coordinator);
-    let first_factory = Arc::new(MessageRecordingFactory::default());
-    let first_restart = RuntimeCoordinator::open(&database, first_factory.clone()).unwrap();
-
-    first_restart.start_worker(&session, &child).await.unwrap();
-
-    {
-        let first_starts = first_factory.starts.lock().unwrap();
-        assert_eq!(first_starts.len(), 1);
-        assert_eq!(first_starts[0].attempt_id, successor);
-        assert_eq!(first_starts[0].initial_user_messages.len(), 1);
-        assert_eq!(first_starts[0].initial_user_messages[0].id, feedback_id);
-    }
-    assert!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .mailbox_message_delivered_at(&feedback_id)
-            .unwrap()
-            .is_some()
-    );
-    drop(first_restart);
-    Connection::open(&database)
-        .unwrap()
-        .execute_batch(&format!(
-            "UPDATE tasks SET state_json = 'queued' WHERE id = '{child}';
-             UPDATE attempts SET state = 'queued' WHERE id = '{successor}';"
-        ))
-        .unwrap();
-    let second_factory = Arc::new(MessageRecordingFactory::default());
-    let second_restart = RuntimeCoordinator::open(&database, second_factory.clone()).unwrap();
-
-    second_restart.start_worker(&session, &child).await.unwrap();
-
-    assert!(
-        second_factory.starts.lock().unwrap()[0]
-            .initial_user_messages
-            .is_empty()
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .attempt_state(&prior_attempt)
-            .unwrap(),
-        "rework_requested"
-    );
-}
-
-#[tokio::test]
-async fn restart_hydrates_rejection_evidence_with_the_durable_message_id() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(MessageRecordingFactory::default());
-    let (coordinator, session, parent, child, delivery) =
-        delivered_child_coordinator(&database, factory).await;
-    let reason_id = MessageId::new();
-    let actor_json = local_user_review_actor(&parent);
-    RuntimeRepository::open(&database)
-        .unwrap()
-        .reject_delivery_review(
-            &child,
-            &delivery.id,
-            &parent,
-            "missing regression evidence",
-            &reason_id,
-            &actor_json,
-            &MessageId::new(),
-        )
-        .unwrap();
-    drop(coordinator);
-
-    let reopened = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
-    let mailbox = reopened.mailbox_snapshot(&session, &child).await.unwrap();
-
-    assert_eq!(mailbox.len(), 1);
-    assert_eq!(mailbox[0].id, reason_id);
-    assert!(matches!(
-        mailbox[0].kind,
-        yi_agent_core::subagent::mailbox::MessageKind::ReviewRejected(ref id) if id == &reason_id
-    ));
-    let durable = RuntimeRepository::open(&database)
-        .unwrap()
-        .mailbox_messages_for_task(&child)
-        .unwrap();
-    assert_eq!(durable[0].message_id, reason_id.to_string());
-}
-
-fn local_user_review_actor(parent: &yi_agent_core::TaskId) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "kind": "task",
-        "task_id": parent,
-        "source": "daemon",
-        "initiated_by": { "kind": "local_user", "source": "daemon" },
-    }))
-    .unwrap()
+    assert_eq!(mailbox[0].kind, "completed");
+    assert!(mailbox[0].payload_json.contains(&delivery.id.to_string()));
 }
 
 fn git_output(directory: &Path, args: &[&str]) -> Result<String, WorkerError> {
@@ -1879,21 +1000,6 @@ fn git_output(directory: &Path, args: &[&str]) -> Result<String, WorkerError> {
     }
     String::from_utf8(output.stdout)
         .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))
-}
-
-fn git_ok(directory: &Path, args: &[&str]) -> Result<(), WorkerError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(directory)
-        .output()
-        .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
-    if !output.status.success() {
-        return Err(WorkerError::Startup(format!(
-            "Git workspace error: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(())
 }
 
 fn initialize_git_repository(directory: &Path) {
@@ -1928,67 +1034,6 @@ fn initialize_git_repository(directory: &Path) {
             .unwrap()
             .success()
     );
-}
-
-async fn delivered_child_coordinator(
-    database: &std::path::Path,
-    factory: Arc<MessageRecordingFactory>,
-) -> (
-    RuntimeCoordinator,
-    RootSessionId,
-    yi_agent_core::TaskId,
-    yi_agent_core::TaskId,
-    yi_agent_core::subagent::task::DeliveryReport,
-) {
-    let coordinator = RuntimeCoordinator::open(database, factory.clone()).unwrap();
-    let session = coordinator.create_session().unwrap();
-    let parent = coordinator.root_task_id(&session).unwrap();
-    if factory.workspace_service.is_some() {
-        coordinator.start_worker(&session, &parent).await.unwrap();
-    }
-    let child = coordinator
-        .spawn_child_with_objective(
-            &session,
-            &parent,
-            "Complete the delegated task.".into(),
-            ChildWriteMode::Coding,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    coordinator.start_worker(&session, &child).await.unwrap();
-    let child_start = factory.starts.lock().unwrap().last().unwrap().clone();
-    let workspace = child_start.workspace_lease_id.clone().unwrap();
-    let commit = if let Some(worker_workspace) = child_start.workspace.as_ref() {
-        std::fs::write(worker_workspace.path.join("delivery.txt"), "ready\n").unwrap();
-        git_ok(&worker_workspace.path, &["add", "delivery.txt"]).unwrap();
-        git_ok(&worker_workspace.path, &["commit", "-m", "child delivery"]).unwrap();
-        git_output(&worker_workspace.path, &["rev-parse", "HEAD"])
-            .unwrap()
-            .trim()
-            .to_owned()
-    } else {
-        "deadbeef".into()
-    };
-    let delivery = yi_agent_core::subagent::task::DeliveryReport::coding(
-        commit,
-        "main",
-        workspace,
-        "cargo test -p child",
-    );
-    factory
-        .handles
-        .lock()
-        .unwrap()
-        .last()
-        .unwrap()
-        .report_delivery(delivery.clone());
-    coordinator.reconcile_worker_events().await.unwrap();
-    (coordinator, session, parent, child, delivery)
 }
 
 #[test]
@@ -3409,31 +2454,34 @@ async fn a_watchdog_timed_out_parent_cascades_and_releases_its_childs_lease() {
     );
 }
 
-/// Accepting a review is a settled terminal transition, so it cascades the
-/// reviewed task's own live descendants.
+/// Delivering is a settled terminal transition, so it cascades the delivered
+/// task's own live descendants.
 ///
-/// The reviewed child here is itself the parent of a running grandchild. When
-/// the review is accepted the reviewed child completes, the reducer cancels the
-/// live grandchild in memory (and cancels its worker), and the returned victim
+/// The delivered child here is itself the parent of a running grandchild. When
+/// the delivery lands the child completes, the reducer cancels the live
+/// grandchild in memory (and cancels its worker), and the returned victim
 /// list is the only report that grandchild will ever produce — `reconcile`
 /// skips tasks it already finds terminal. The coordinator must persist the
 /// grandchild as `cancelled` and release its lease instead of discarding the
 /// list.
 #[tokio::test]
-async fn an_accepted_review_cascades_and_releases_its_childs_lease() {
+async fn a_delivery_cascades_and_releases_its_childs_lease() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let factory = Arc::new(MessageRecordingFactory::default());
     let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
     let session = coordinator.create_session().unwrap();
     let root = coordinator.root_task_id(&session).unwrap();
-    let reviewed = coordinator.spawn_child(&session, &root).await.unwrap();
-    coordinator.start_worker(&session, &reviewed).await.unwrap();
+    let delivered = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator
+        .start_worker(&session, &delivered)
+        .await
+        .unwrap();
     let workspace = factory.starts.lock().unwrap()[0]
         .workspace_lease_id
         .clone()
         .unwrap();
-    let grandchild = coordinator.spawn_child(&session, &reviewed).await.unwrap();
+    let grandchild = coordinator.spawn_child(&session, &delivered).await.unwrap();
     coordinator
         .start_worker(&session, &grandchild)
         .await
@@ -3446,8 +2494,8 @@ async fn an_accepted_review_cascades_and_releases_its_childs_lease() {
         "fixture requires the grandchild to hold a workspace lease"
     );
 
-    // The reviewed child delivers a commit and waits for its parent's review.
-    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p reviewed");
+    // The child delivers a commit; that is already its terminal transition.
+    let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "cargo test -p delivered");
     factory
         .handles
         .lock()
@@ -3456,28 +2504,11 @@ async fn an_accepted_review_cascades_and_releases_its_childs_lease() {
         .unwrap()
         .report_delivery(delivery.clone());
     coordinator.reconcile_worker_events().await.unwrap();
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&reviewed)
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-
-    // Accepting that review completes the reviewed task, which must cascade the
-    // still-live grandchild.
-    coordinator
-        .accept_review(
-            &reviewed,
-            IntegrationValidation::passed("cargo test -p root"),
-        )
-        .await
-        .unwrap();
 
     assert_eq!(
         RuntimeRepository::open(&database)
             .unwrap()
-            .task_state(&reviewed)
+            .task_state(&delivered)
             .unwrap(),
         "completed"
     );

@@ -285,32 +285,6 @@ pub enum AgentAction {
         #[arg(long)]
         deadline: Option<u64>,
     },
-    Accept {
-        task_id: String,
-        #[arg(long)]
-        yes: bool,
-        /// Single-use token returned by the preceding review preview.
-        #[arg(long)]
-        confirmation: Option<String>,
-    },
-    Rework {
-        task_id: String,
-        feedback: String,
-        #[arg(long)]
-        yes: bool,
-        /// Single-use token returned by the preceding review preview.
-        #[arg(long)]
-        confirmation: Option<String>,
-    },
-    Reject {
-        task_id: String,
-        reason: String,
-        #[arg(long)]
-        yes: bool,
-        /// Single-use token returned by the preceding review preview.
-        #[arg(long)]
-        confirmation: Option<String>,
-    },
 }
 
 #[derive(clap::Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,9 +746,6 @@ mod tests {
             vec!["yi-agent", "agent", "retry", "task"],
             vec!["yi-agent", "agent", "pause", "task"],
             vec!["yi-agent", "agent", "resume", "task"],
-            vec!["yi-agent", "agent", "accept", "task"],
-            vec!["yi-agent", "agent", "rework", "task", "feedback"],
-            vec!["yi-agent", "agent", "reject", "task", "reason"],
             vec!["yi-agent", "daemon", "status"],
             vec!["yi-agent", "daemon", "stop"],
         ] {
@@ -786,13 +757,7 @@ mod tests {
     fn cli_rejects_missing_required_task_control_arguments() {
         use clap::Parser;
 
-        for argv in [
-            vec!["yi-agent", "agent", "cancel"],
-            vec!["yi-agent", "agent", "rework", "task"],
-            vec!["yi-agent", "agent", "reject", "task"],
-        ] {
-            assert!(Cli::try_parse_from(argv).is_err());
-        }
+        assert!(Cli::try_parse_from(["yi-agent", "agent", "cancel"]).is_err());
     }
 
     #[test]
@@ -819,13 +784,6 @@ mod tests {
             cancel.command,
             Some(Command::Agent { action: AgentAction::Cancel { task_id, recursive: true, yes: true, confirmation: Some(confirmation) } })
                 if task_id == "task-123" && confirmation == "preview-token"
-        ));
-
-        let rework = Cli::parse_from(["yi-agent", "agent", "rework", "task-123", "tighten tests"]);
-        assert!(matches!(
-            rework.command,
-            Some(Command::Agent { action: AgentAction::Rework { task_id, feedback, .. } })
-                if task_id == "task-123" && feedback == "tighten tests"
         ));
     }
 }

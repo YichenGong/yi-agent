@@ -20,9 +20,6 @@ pub struct ProgressReport(pub String);
 pub struct ScopeChangeDraft(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReworkInstruction(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserInstruction(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +30,6 @@ pub enum MessageKind {
     Failed(TaskFailure),
     PermissionRequest(PermissionRequestId),
     ScopeChange(ScopeChangeDraft),
-    Rework(ReworkInstruction),
-    ReviewRejected(MessageId),
     UserInstruction(UserInstruction),
 }
 
@@ -42,12 +37,9 @@ impl MessageKind {
     fn priority(&self) -> MessagePriority {
         match self {
             Self::PermissionRequest(_) => MessagePriority::Critical,
-            Self::Completed(_)
-            | Self::Blocked(_)
-            | Self::Failed(_)
-            | Self::ScopeChange(_)
-            | Self::Rework(_)
-            | Self::ReviewRejected(_) => MessagePriority::High,
+            Self::Completed(_) | Self::Blocked(_) | Self::Failed(_) | Self::ScopeChange(_) => {
+                MessagePriority::High
+            }
             Self::Progress(_) | Self::UserInstruction(_) => MessagePriority::Normal,
         }
     }
@@ -67,9 +59,6 @@ pub struct MailboxMessage {
     pub correlation_id: Option<AttemptId>,
     pub created_at: DateTime<Utc>,
     pub coalesced_count: u32,
-    /// In-memory acknowledgement that this daemon process handed the item to
-    /// a worker inbox. Durable consumption is tracked separately by runtime.
-    pub delivered_to_worker: bool,
     /// The worker has committed to injecting this external override into its
     /// next prompt. The runtime persists the corresponding acknowledgement.
     pub consumed_by_worker: bool,
@@ -209,7 +198,6 @@ impl Mailbox {
             correlation_id: draft.correlation_id,
             created_at: Utc::now(),
             coalesced_count: 1,
-            delivered_to_worker: false,
             consumed_by_worker: false,
         };
         let receipt = DeliveryReceipt {
@@ -223,12 +211,6 @@ impl Mailbox {
 
     pub fn messages(&self) -> &[MailboxMessage] {
         &self.messages
-    }
-
-    pub fn is_rework(&self, id: &MessageId) -> bool {
-        self.messages
-            .iter()
-            .any(|message| &message.id == id && matches!(message.kind, MessageKind::Rework(_)))
     }
 
     pub fn user_instruction(&self, id: &MessageId) -> Option<String> {
@@ -257,8 +239,8 @@ impl Mailbox {
             .collect()
     }
 
-    /// Controller inputs include external overrides and direct-parent rework
-    /// instructions, both of which must reach a newly started worker prompt.
+    /// Controller inputs are the external overrides that must reach a newly
+    /// started worker prompt before it can make progress.
     pub fn pending_worker_inputs(&self) -> Vec<(MessageId, String)> {
         self.messages
             .iter()
@@ -268,26 +250,9 @@ impl Mailbox {
                 {
                     Some((message.id.clone(), body.clone()))
                 }
-                (Some(_), MessageKind::Rework(ReworkInstruction(body)))
-                    if !message.delivered_to_worker =>
-                {
-                    Some((message.id.clone(), body.clone()))
-                }
                 _ => None,
             })
             .collect()
-    }
-
-    pub fn mark_delivered_to_worker(&mut self, id: &MessageId) {
-        if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
-            message.delivered_to_worker = true;
-        }
-    }
-
-    pub fn mark_pending_for_worker(&mut self, id: &MessageId) {
-        if let Some(message) = self.messages.iter_mut().find(|message| &message.id == id) {
-            message.delivered_to_worker = false;
-        }
     }
 
     /// Only external user overrides participate in the durable consumption

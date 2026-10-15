@@ -9,8 +9,7 @@ fn control_command_catalog_covers_the_documented_cli_and_slash_actions() {
         .collect::<Vec<_>>();
     for required in [
         "agents", "agent", "events", "diff", "mailbox", "message", "pause", "resume", "cancel",
-        "retry", "priority", "approve", "deny", "review", "accept", "rework", "reject", "budget",
-        "daemon", "help",
+        "retry", "priority", "approve", "deny", "review", "budget", "daemon", "help",
     ] {
         assert!(names.contains(&required), "missing /{required}");
     }

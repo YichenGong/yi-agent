@@ -25,9 +25,7 @@ use yi_agent_core::subagent::worker::{
 };
 
 use crate::repository::{DEFAULT_ORPHAN_GRACE_SECS, RuntimeRepository};
-use crate::runtime::{
-    ReviewDecision, RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions,
-};
+use crate::runtime::{RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions};
 use crate::schedule::ScheduleDefinition;
 
 /// Bumped whenever the request/response wire shape changes. `PluginQuery` is an
@@ -329,19 +327,6 @@ pub enum IpcRequest {
         request_id: String,
         decision: IpcPermissionDecision,
     },
-    Review {
-        task_id: String,
-        decision: IpcReviewDecision,
-    },
-    PreviewReview {
-        task_id: String,
-        decision: IpcReviewDecision,
-    },
-    ConfirmReview {
-        task_id: String,
-        decision: IpcReviewDecision,
-        confirmation_token: String,
-    },
     SendMessage {
         session_id: String,
         sender_task_id: String,
@@ -387,17 +372,6 @@ pub enum IpcRequest {
         task_id: String,
         #[serde(default)]
         recursive: bool,
-    },
-    /// A parent directing one of its own descendants to rework or rejecting its
-    /// delivery. Authorized the same way `InspectChild` and `CancelChild` are.
-    /// This is the agent-facing counterpart of the human `Review` decision,
-    /// which the runtime otherwise reserves for the local operator.
-    ReviewChild {
-        session_id: String,
-        caller_task_id: String,
-        capability: String,
-        task_id: String,
-        decision: ChildReviewDecision,
     },
     ListTaskSummaries {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -540,19 +514,6 @@ pub enum IpcResponse {
     TaskPaused,
     TaskResumed,
     PermissionResolved,
-    ReviewPreview {
-        task_id: String,
-        delivery_id: String,
-        decision: IpcReviewDecision,
-        confirmation_token: String,
-        expires_in_secs: u64,
-    },
-    ReviewApproved,
-    ReviewReworkRequested,
-    ReviewRejected,
-    /// A direct parent's review direction for a child delivery was recorded.
-    /// The successor attempt (rework) or rejection is already durable.
-    ChildReviewAccepted,
     MessageQueued,
     WaitCompleted {
         status: String,
@@ -637,37 +598,6 @@ impl From<IpcPermissionDecision> for PermissionDecision {
             IpcPermissionDecision::Deny => Self::Deny,
         }
     }
-}
-
-impl From<IpcReviewDecision> for ReviewDecision {
-    fn from(decision: IpcReviewDecision) -> Self {
-        match decision {
-            IpcReviewDecision::Accept {} => Self::Approve,
-            IpcReviewDecision::Rework { feedback } => Self::Rework { feedback },
-            IpcReviewDecision::Reject { reason } => Self::Reject { reason },
-        }
-    }
-}
-
-/// Actor-free review decisions. The daemon resolves task lineage, current
-/// delivery, and the direct-parent actor from its canonical runtime state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[serde(deny_unknown_fields)]
-pub enum IpcReviewDecision {
-    Accept {},
-    Rework { feedback: String },
-    Reject { reason: String },
-}
-
-/// What a parent asks of a child's delivery. Approval is deliberately absent:
-/// integration is the parent's own git action, and the runtime accepts a
-/// delivery by observing ancestry, never by an agent's assertion.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChildReviewDecision {
-    Rework { feedback: String },
-    Reject { reason: String },
 }
 
 /// Stable public error categories for IPC consumers. Error responses never
@@ -1714,47 +1644,6 @@ fn preview_cancel(
         unmerged_deliveries: scope.unmerged_deliveries,
         expires_in_secs: CONFIRMATION_TTL.as_secs(),
     })
-}
-
-fn preview_review(
-    coordinator: &RuntimeCoordinator,
-    task_id: String,
-    decision: IpcReviewDecision,
-) -> Result<IpcResponse, IpcError> {
-    let task = parse_id::<TaskId>(&task_id)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let preview = runtime.block_on(coordinator.preview_review(&task, decision.clone().into()))?;
-    Ok(IpcResponse::ReviewPreview {
-        task_id,
-        delivery_id: preview.delivery_id.to_string(),
-        decision,
-        confirmation_token: preview.confirmation_token,
-        expires_in_secs: preview.expires_in_secs,
-    })
-}
-
-fn confirm_review(
-    coordinator: &RuntimeCoordinator,
-    task_id: String,
-    decision: IpcReviewDecision,
-    confirmation_token: String,
-) -> Result<IpcResponse, IpcError> {
-    let task = parse_id::<TaskId>(&task_id)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(coordinator.confirm_review(
-        &task,
-        decision.clone().into(),
-        &confirmation_token,
-    ))?;
-    match decision {
-        IpcReviewDecision::Accept {} => Ok(IpcResponse::ReviewApproved),
-        IpcReviewDecision::Rework { .. } => Ok(IpcResponse::ReviewReworkRequested),
-        IpcReviewDecision::Reject { .. } => Ok(IpcResponse::ReviewRejected),
-    }
 }
 
 fn cancellation_scope(
@@ -3011,16 +2900,9 @@ fn repository_error_code(error: &crate::repository::RepositoryError) -> IpcError
             IpcErrorCode::InvalidState
         }
         crate::repository::RepositoryError::DeliveryRequiresParent { .. }
-        | crate::repository::RepositoryError::TaskNotReadyForDelivery { .. }
-        | crate::repository::RepositoryError::DeliveryNotAwaitingReview { .. } => {
+        | crate::repository::RepositoryError::TaskNotReadyForDelivery { .. } => {
             IpcErrorCode::InvalidState
         }
-        crate::repository::RepositoryError::ReviewActorMismatch { .. } => {
-            IpcErrorCode::AuthorityDenied
-        }
-        crate::repository::RepositoryError::IntegrationNotValidated
-        | crate::repository::RepositoryError::ReviewFeedbackRequired
-        | crate::repository::RepositoryError::ReviewReasonRequired => IpcErrorCode::Validation,
         crate::repository::RepositoryError::Sql(_)
         | crate::repository::RepositoryError::Json(_)
         | crate::repository::RepositoryError::InvalidWorkerRecoveryContext { .. }
@@ -3091,10 +2973,6 @@ fn runtime_event_name(event: crate::repository::RuntimeEvent) -> &'static str {
         crate::repository::RuntimeEvent::MailboxMessageConsumed => "mailbox_message_consumed",
         crate::repository::RuntimeEvent::PermissionRequested => "permission_requested",
         crate::repository::RuntimeEvent::PermissionResolved => "permission_resolved",
-        crate::repository::RuntimeEvent::ReviewApproved => "review_approved",
-        crate::repository::RuntimeEvent::ReviewAccepted => "review_accepted",
-        crate::repository::RuntimeEvent::ReviewRework => "review_rework",
-        crate::repository::RuntimeEvent::ReviewRejected => "review_rejected",
     }
 }
 
@@ -3545,18 +3423,6 @@ fn respond(
             runtime.block_on(coordinator.resolve_permission(&request_id, decision.into()))?;
             Ok(IpcResponse::PermissionResolved)
         }
-        IpcRequest::Review { .. } => Ok(IpcResponse::Error {
-            code: IpcErrorCode::ConfirmationRequired,
-            message: None,
-        }),
-        IpcRequest::PreviewReview { task_id, decision } => {
-            preview_review(coordinator, task_id, decision)
-        }
-        IpcRequest::ConfirmReview {
-            task_id,
-            decision,
-            confirmation_token,
-        } => confirm_review(coordinator, task_id, decision, confirmation_token),
         IpcRequest::SendMessage {
             session_id,
             sender_task_id,
@@ -3778,28 +3644,6 @@ fn respond(
                 recursive,
             ))?;
             Ok(IpcResponse::TaskCancelled)
-        }
-        IpcRequest::ReviewChild {
-            session_id,
-            caller_task_id,
-            capability,
-            task_id,
-            decision,
-        } => {
-            let session_id = parse_id::<RootSessionId>(&session_id)?;
-            let caller_task_id = parse_id::<TaskId>(&caller_task_id)?;
-            let task_id = parse_id::<TaskId>(&task_id)?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            runtime.block_on(coordinator.review_child_authorized(
-                &session_id,
-                &caller_task_id,
-                &capability,
-                &task_id,
-                decision,
-            ))?;
-            Ok(IpcResponse::ChildReviewAccepted)
         }
         IpcRequest::ListTaskSummaries {
             session_id,

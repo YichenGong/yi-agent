@@ -2776,45 +2776,6 @@ fn execute_slash_command(
             history.push(HistoryCell::Separator { label: Some(label) }, width);
             KeyOutcome::None
         }
-        SlashCommand::Accept => {
-            let label = match parse_accept_args(args.as_deref()) {
-                Ok((task_id, confirmation)) => {
-                    match daemon_accept(workdir, task_id, confirmation) {
-                        Ok(message) => message,
-                        Err(error) => format!("无法接受 delivery: {error}"),
-                    }
-                }
-                Err(error) => error,
-            };
-            history.push(HistoryCell::Separator { label: Some(label) }, width);
-            KeyOutcome::None
-        }
-        SlashCommand::Rework => {
-            let label = match parse_rework_args(args.as_deref()) {
-                Ok((task_id, feedback, confirmation)) => {
-                    match daemon_rework(workdir, task_id, feedback, confirmation) {
-                        Ok(message) => message,
-                        Err(error) => format!("无法请求返工: {error}"),
-                    }
-                }
-                Err(error) => error,
-            };
-            history.push(HistoryCell::Separator { label: Some(label) }, width);
-            KeyOutcome::None
-        }
-        SlashCommand::Reject => {
-            let label = match parse_reject_args(args.as_deref()) {
-                Ok((task_id, reason, confirmation)) => {
-                    match daemon_reject(workdir, task_id, reason, confirmation) {
-                        Ok(message) => message,
-                        Err(error) => format!("无法拒绝 delivery: {error}"),
-                    }
-                }
-                Err(error) => error,
-            };
-            history.push(HistoryCell::Separator { label: Some(label) }, width);
-            KeyOutcome::None
-        }
         SlashCommand::Events => {
             let label = match parse_review_args(args.as_deref()) {
                 Ok(task_id) => match daemon_events(workdir, task_id) {
@@ -2965,63 +2926,6 @@ fn parse_retry_args(args: Option<&str>) -> Result<&str, String> {
 
 fn parse_review_args(args: Option<&str>) -> Result<&str, String> {
     parse_pause_resume_args(args, "review")
-}
-
-fn parse_accept_args(args: Option<&str>) -> Result<(&str, Option<&str>), String> {
-    let usage = "用法: /accept <task-id> [--confirm <token>]";
-    let Some(args) = args else {
-        return Err(usage.into());
-    };
-    let mut parts = args.split_whitespace();
-    let Some(task_id) = parts.next() else {
-        return Err(usage.into());
-    };
-    let confirmation = match parts.next() {
-        None => None,
-        Some("--confirm") => Some(parts.next().ok_or_else(|| usage.to_string())?),
-        _ => return Err(usage.into()),
-    };
-    if parts.next().is_some() {
-        return Err(usage.into());
-    }
-    Ok((task_id, confirmation))
-}
-
-fn parse_rework_args(args: Option<&str>) -> Result<(&str, &str, Option<&str>), String> {
-    parse_review_text_args(args, "rework", "feedback")
-}
-
-fn parse_reject_args(args: Option<&str>) -> Result<(&str, &str, Option<&str>), String> {
-    parse_review_text_args(args, "reject", "reason")
-}
-
-fn parse_review_text_args<'a>(
-    args: Option<&'a str>,
-    command: &str,
-    text_name: &str,
-) -> Result<(&'a str, &'a str, Option<&'a str>), String> {
-    let usage = || format!("用法: /{command} <task-id> <{text_name}> [--confirm <token>]");
-    let Some(args) = args.map(str::trim).filter(|args| !args.is_empty()) else {
-        return Err(usage());
-    };
-    let Some((task_id, rest)) = args.split_once(char::is_whitespace) else {
-        return Err(usage());
-    };
-    let rest = rest.trim();
-    if task_id.is_empty() || rest.is_empty() {
-        return Err(usage());
-    }
-    let (text, confirmation) = match rest.rsplit_once(" --confirm ") {
-        Some((text, token)) => {
-            let token = token.trim();
-            if text.trim().is_empty() || token.is_empty() || token.split_whitespace().count() != 1 {
-                return Err(usage());
-            }
-            (text.trim(), Some(token))
-        }
-        None => (rest, None),
-    };
-    Ok((task_id, text, confirmation))
 }
 
 fn parse_pause_resume_args<'a>(args: Option<&'a str>, command: &str) -> Result<&'a str, String> {
@@ -3345,129 +3249,6 @@ fn daemon_mailbox_at(socket: &std::path::Path, task_id: &str) -> Result<String, 
             format_ipc_error(code, message)
         )),
         _ => Err("daemon 返回了非 mailbox 响应".into()),
-    }
-}
-
-fn daemon_accept(
-    workdir: &std::path::Path,
-    task_id: &str,
-    confirmation: Option<&str>,
-) -> Result<String, String> {
-    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
-    daemon_accept_at(&socket, task_id, confirmation)
-}
-
-fn daemon_accept_at(
-    socket: &std::path::Path,
-    task_id: &str,
-    confirmation: Option<&str>,
-) -> Result<String, String> {
-    daemon_review_decision_at(
-        socket,
-        task_id,
-        yi_agent_store::ipc::IpcReviewDecision::Accept {},
-        confirmation,
-        format!("/accept {task_id}"),
-    )
-}
-
-fn daemon_rework(
-    workdir: &std::path::Path,
-    task_id: &str,
-    feedback: &str,
-    confirmation: Option<&str>,
-) -> Result<String, String> {
-    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
-    daemon_rework_at(&socket, task_id, feedback, confirmation)
-}
-
-fn daemon_rework_at(
-    socket: &std::path::Path,
-    task_id: &str,
-    feedback: &str,
-    confirmation: Option<&str>,
-) -> Result<String, String> {
-    daemon_review_decision_at(
-        socket,
-        task_id,
-        yi_agent_store::ipc::IpcReviewDecision::Rework {
-            feedback: feedback.to_owned(),
-        },
-        confirmation,
-        format!("/rework {task_id} {feedback}"),
-    )
-}
-
-fn daemon_reject(
-    workdir: &std::path::Path,
-    task_id: &str,
-    reason: &str,
-    confirmation: Option<&str>,
-) -> Result<String, String> {
-    let socket = crate::runtime_socket_for(workdir).map_err(|error| error.to_string())?;
-    daemon_reject_at(&socket, task_id, reason, confirmation)
-}
-
-fn daemon_reject_at(
-    socket: &std::path::Path,
-    task_id: &str,
-    reason: &str,
-    confirmation: Option<&str>,
-) -> Result<String, String> {
-    daemon_review_decision_at(
-        socket,
-        task_id,
-        yi_agent_store::ipc::IpcReviewDecision::Reject {
-            reason: reason.to_owned(),
-        },
-        confirmation,
-        format!("/reject {task_id} {reason}"),
-    )
-}
-
-fn daemon_review_decision_at(
-    socket: &std::path::Path,
-    task_id: &str,
-    decision: yi_agent_store::ipc::IpcReviewDecision,
-    confirmation: Option<&str>,
-    confirm_command: String,
-) -> Result<String, String> {
-    let request = match confirmation {
-        Some(confirmation_token) => yi_agent_store::ipc::IpcRequest::ConfirmReview {
-            task_id: task_id.to_owned(),
-            decision,
-            confirmation_token: confirmation_token.to_owned(),
-        },
-        None => yi_agent_store::ipc::IpcRequest::PreviewReview {
-            task_id: task_id.to_owned(),
-            decision,
-        },
-    };
-    let response =
-        yi_agent_store::ipc::send_request(socket, request).map_err(|error| error.to_string())?;
-    match response {
-        yi_agent_store::ipc::IpcResponse::ReviewPreview {
-            delivery_id,
-            confirmation_token,
-            expires_in_secs,
-            ..
-        } => Ok(format!(
-            "审查预览: task={task_id} delivery={delivery_id}；使用 {confirm_command} --confirm {confirmation_token} 在 {expires_in_secs}s 内确认"
-        )),
-        yi_agent_store::ipc::IpcResponse::ReviewApproved => {
-            Ok(format!("已接受 delivery: {task_id}"))
-        }
-        yi_agent_store::ipc::IpcResponse::ReviewReworkRequested => {
-            Ok(format!("已请求子任务返工: {task_id}"))
-        }
-        yi_agent_store::ipc::IpcResponse::ReviewRejected => {
-            Ok(format!("已拒绝 delivery: {task_id}"))
-        }
-        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(format!(
-            "daemon 拒绝审查决策: {}",
-            format_ipc_error(code, message)
-        )),
-        _ => Err("daemon 返回了非审查决策响应".into()),
     }
 }
 
@@ -4098,17 +3879,22 @@ mod tests {
                 "cargo test -p child",
             ),
         );
+        let task = task_id.parse().unwrap();
+        let mut state = String::new();
         for _ in 0..100 {
-            if yi_agent_store::repository::RuntimeRepository::open(&database)
+            state = yi_agent_store::repository::RuntimeRepository::open(&database)
                 .unwrap()
-                .task_state(&task_id.parse().unwrap())
-                .unwrap()
-                == "awaiting_parent_review"
-            {
+                .task_state(&task)
+                .unwrap();
+            if state == "completed" {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert_eq!(
+            state, "completed",
+            "a delivered child must reach completed before the review control reads it"
+        );
         (directory, daemon, task_id)
     }
 
@@ -4329,23 +4115,6 @@ mod tests {
     }
 
     #[test]
-    fn review_command_parsers_accept_confirmation_tokens_and_freeform_text() {
-        assert_eq!(parse_review_args(Some("task-1")).unwrap(), "task-1");
-        assert_eq!(
-            parse_accept_args(Some("task-1 --confirm token-1")).unwrap(),
-            ("task-1", Some("token-1"))
-        );
-        assert_eq!(
-            parse_rework_args(Some("task-1 修一下边界条件 --confirm token-2")).unwrap(),
-            ("task-1", "修一下边界条件", Some("token-2"))
-        );
-        assert_eq!(
-            parse_reject_args(Some("task-1 方向不对，先停止")).unwrap(),
-            ("task-1", "方向不对，先停止", None)
-        );
-    }
-
-    #[test]
     fn review_control_reads_delivery_json_from_daemon() {
         let (_directory, daemon, task_id) = start_daemon_with_delivered_child();
 
@@ -4447,103 +4216,6 @@ mod tests {
 
         assert!(diff.contains("Diff"));
         assert!(diff.contains("Root session objective not specified."));
-    }
-
-    #[test]
-    fn accept_control_previews_then_confirms_review_from_tui() {
-        let (_directory, daemon, task_id) = start_daemon_with_delivered_child();
-
-        let preview = daemon_accept_at(daemon.socket_path(), &task_id, None).unwrap();
-
-        assert!(preview.contains("审查预览"));
-        assert!(preview.contains("/accept"));
-        let yi_agent_store::ipc::IpcResponse::ReviewPreview {
-            confirmation_token, ..
-        } = yi_agent_store::ipc::send_request(
-            daemon.socket_path(),
-            yi_agent_store::ipc::IpcRequest::PreviewReview {
-                task_id: task_id.clone(),
-                decision: yi_agent_store::ipc::IpcReviewDecision::Accept {},
-            },
-        )
-        .unwrap()
-        else {
-            panic!("expected a review preview");
-        };
-        let result =
-            daemon_accept_at(daemon.socket_path(), &task_id, Some(&confirmation_token)).unwrap();
-
-        assert!(result.contains("已接受"));
-    }
-
-    #[test]
-    fn rework_control_previews_then_confirms_review_from_tui() {
-        let (_directory, daemon, task_id) = start_daemon_with_delivered_child();
-
-        let preview = daemon_rework_at(daemon.socket_path(), &task_id, "补测试", None).unwrap();
-
-        assert!(preview.contains("审查预览"));
-        assert!(preview.contains("/rework"));
-        assert!(preview.contains("补测试"));
-        let yi_agent_store::ipc::IpcResponse::ReviewPreview {
-            confirmation_token, ..
-        } = yi_agent_store::ipc::send_request(
-            daemon.socket_path(),
-            yi_agent_store::ipc::IpcRequest::PreviewReview {
-                task_id: task_id.clone(),
-                decision: yi_agent_store::ipc::IpcReviewDecision::Rework {
-                    feedback: "补测试".into(),
-                },
-            },
-        )
-        .unwrap()
-        else {
-            panic!("expected a review preview");
-        };
-        let result = daemon_rework_at(
-            daemon.socket_path(),
-            &task_id,
-            "补测试",
-            Some(&confirmation_token),
-        )
-        .unwrap();
-
-        assert!(result.contains("已请求子任务返工"));
-    }
-
-    #[test]
-    fn reject_control_previews_then_confirms_review_from_tui() {
-        let (_directory, daemon, task_id) = start_daemon_with_delivered_child();
-
-        let preview = daemon_reject_at(daemon.socket_path(), &task_id, "方向不对", None).unwrap();
-
-        assert!(preview.contains("审查预览"));
-        assert!(preview.contains("/reject"));
-        assert!(preview.contains("方向不对"));
-        let yi_agent_store::ipc::IpcResponse::ReviewPreview {
-            confirmation_token, ..
-        } = yi_agent_store::ipc::send_request(
-            daemon.socket_path(),
-            yi_agent_store::ipc::IpcRequest::PreviewReview {
-                task_id: task_id.clone(),
-                decision: yi_agent_store::ipc::IpcReviewDecision::Reject {
-                    reason: "方向不对".into(),
-                },
-            },
-        )
-        .unwrap()
-        else {
-            panic!("expected a review preview");
-        };
-        let result = daemon_reject_at(
-            daemon.socket_path(),
-            &task_id,
-            "方向不对",
-            Some(&confirmation_token),
-        )
-        .unwrap();
-
-        assert!(result.contains("已拒绝"));
     }
 
     #[test]

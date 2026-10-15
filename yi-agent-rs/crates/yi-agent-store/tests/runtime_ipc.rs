@@ -16,9 +16,8 @@ use yi_agent_core::subagent::worker::{
 };
 use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 use yi_agent_store::ipc::{
-    ChildReviewDecision, Daemon, IpcErrorCode, IpcRequest, IpcResponse, IpcReviewDecision,
-    PROTOCOL_VERSION, SubscriptionFilters, send_request, send_request_with_version, subscribe,
-    subscribe_with_filters,
+    Daemon, IpcErrorCode, IpcRequest, IpcResponse, PROTOCOL_VERSION, SubscriptionFilters,
+    send_request, send_request_with_version, subscribe, subscribe_with_filters,
 };
 use yi_agent_store::repository::{
     RepositoryError, RuntimeCursorState, RuntimeEvent, RuntimeRepository,
@@ -74,13 +73,13 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
             "DROP TABLE application_root_attachments;
-             DELETE FROM schema_migrations WHERE version IN (7, 8, 9, 10, 11, 12, 13);",
+             DELETE FROM schema_migrations WHERE version >= 7;",
         )
         .unwrap();
     database
@@ -118,57 +117,6 @@ struct ReportingWorkerFactory {
     handle: Arc<Mutex<Option<WorkerHandle>>>,
 }
 
-#[derive(Clone, Default)]
-struct ReviewReportingFactory {
-    starts: Arc<Mutex<Vec<WorkerStart>>>,
-    handles: Arc<Mutex<Vec<WorkerHandle>>>,
-}
-
-/// Records starts and hands out worker handles for an *application root*
-/// session, so a test can drive a delivered child through the socket while the
-/// root inspects or reviews it. `ReviewReportingFactory` cannot: it does not
-/// expose an application-root workspace service, which attachment requires.
-#[derive(Clone, Default)]
-struct ApplicationReportingFactory {
-    starts: Arc<Mutex<Vec<WorkerStart>>>,
-    handles: Arc<Mutex<Vec<WorkerHandle>>>,
-}
-
-impl AgentWorkerFactory for ApplicationReportingFactory {
-    fn recovery_context(&self) -> WorkerRecoveryContext {
-        durable_context()
-    }
-
-    fn workspace_service_for_project(
-        &self,
-        workspace: &std::path::Path,
-    ) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
-        Some(Arc::new(LiveWorkspaceService {
-            repository_root: workspace.to_path_buf(),
-        }))
-    }
-
-    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
-        let handle = WorkerHandle::new(request.cancellation.clone());
-        self.starts.lock().unwrap().push(request);
-        self.handles.lock().unwrap().push(handle.clone());
-        Box::pin(async move { Ok(handle) })
-    }
-}
-
-impl AgentWorkerFactory for ReviewReportingFactory {
-    fn recovery_context(&self) -> WorkerRecoveryContext {
-        durable_context()
-    }
-
-    fn start(&self, request: WorkerStart) -> BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
-        let handle = WorkerHandle::new(request.cancellation.clone());
-        self.starts.lock().unwrap().push(request);
-        self.handles.lock().unwrap().push(handle.clone());
-        Box::pin(async move { Ok(handle) })
-    }
-}
-
 impl AgentWorkerFactory for ReportingWorkerFactory {
     fn default_workspace_service(&self) -> Option<Arc<dyn WorkerWorkspaceProvider>> {
         Some(Arc::new(StaticWorkspaceService))
@@ -191,71 +139,6 @@ struct StaticWorkspaceService;
 #[derive(Clone)]
 struct ProjectWorkspaceService {
     repository_root: PathBuf,
-}
-
-/// A workspace service whose directories really exist, so a reworked child can
-/// restart on a fresh attempt. `ProjectWorkspaceService` reports paths without
-/// creating them, which a restart treats as a reclaimed worktree needing a
-/// rebuild it cannot perform.
-#[derive(Clone)]
-struct LiveWorkspaceService {
-    repository_root: PathBuf,
-}
-
-impl LiveWorkspaceService {
-    fn workspace_for(&self, task_id: &TaskId) -> WorkerWorkspace {
-        WorkerWorkspace {
-            lease_id: WorkspaceLeaseId::new(),
-            repository_root: self.repository_root.clone(),
-            path: self
-                .repository_root
-                .join(".worktrees")
-                .join(task_id.to_string()),
-            branch: format!("feat/{task_id}"),
-            parent_branch: "main".into(),
-            base_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
-        }
-    }
-}
-
-impl WorkerWorkspaceProvider for LiveWorkspaceService {
-    fn in_place_workspace(
-        &self,
-        _root_session_id: &RootSessionId,
-        task_id: &TaskId,
-        _attempt_id: &AttemptId,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        let workspace = self.workspace_for(task_id);
-        std::fs::create_dir_all(&workspace.path)
-            .map_err(|error| WorkerError::Startup(error.to_string()))?;
-        Ok(workspace)
-    }
-
-    fn workspace_in(
-        &self,
-        task_id: &TaskId,
-        _workdir: &std::path::Path,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        let workspace = self.workspace_for(task_id);
-        std::fs::create_dir_all(&workspace.path)
-            .map_err(|error| WorkerError::Startup(error.to_string()))?;
-        Ok(workspace)
-    }
-
-    fn read_only_workspace(
-        &self,
-        parent: Option<&WorkerWorkspace>,
-        _task_id: &TaskId,
-    ) -> Result<WorkerWorkspace, WorkerError> {
-        let mut workspace = parent
-            .cloned()
-            .unwrap_or_else(|| self.workspace_for(&TaskId::new()));
-        workspace.lease_id = WorkspaceLeaseId::new();
-        workspace.branch = String::new();
-        workspace.parent_branch = String::new();
-        workspace.base_commit = String::new();
-        Ok(workspace)
-    }
 }
 
 impl WorkerWorkspaceProvider for ProjectWorkspaceService {
@@ -701,7 +584,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
     for table in [
         "sessions",
         "tasks",
@@ -711,7 +594,6 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
         "mailbox_messages",
         "resource_leases",
         "deliveries",
-        "reviews",
         "permission_requests",
         "schedules",
         "attempt_watchdogs",
@@ -730,7 +612,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     // Rebuild the pre-v11 shape of the attachment table and roll the schema
@@ -763,7 +645,7 @@ fn a_version_10_database_is_migrated_to_the_current_schema() {
     let database = v10_database_without_workspace_root();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
     let has_column: bool = Connection::open(&database)
         .unwrap()
         .query_row(
@@ -819,7 +701,7 @@ fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
     assert!(
         repository
             .has_table("application_root_attachments")
@@ -2102,6 +1984,18 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
                 attempt_id TEXT, actor_json TEXT NOT NULL, kind TEXT NOT NULL,
                 payload_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE attempts (
+                id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), number INTEGER NOT NULL,
+                state TEXT NOT NULL, checkpoint_json TEXT, budget_json TEXT NOT NULL, usage_json TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, ended_at TEXT, terminal_json TEXT,
+                UNIQUE(task_id, number)
+            );
+            CREATE TABLE mailbox_messages (
+                id TEXT PRIMARY KEY, recipient_task_id TEXT NOT NULL REFERENCES tasks(id), sender_task_id TEXT,
+                kind TEXT NOT NULL, priority INTEGER NOT NULL, correlation_id TEXT, causation_id TEXT,
+                payload_json TEXT NOT NULL, coalesced_count INTEGER NOT NULL DEFAULT 0, delivered_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             INSERT INTO schema_migrations (version) VALUES (1);",
         )
         .unwrap();
@@ -2134,7 +2028,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -4602,423 +4496,6 @@ fn resolve_permission_ipc_uses_only_the_daemon_owned_request_identity() {
 }
 
 #[test]
-fn review_ipc_accept_records_user_approval_without_completing_integration() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(ReviewReportingFactory::default());
-    let daemon =
-        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
-            .unwrap();
-    let IpcResponse::SessionCreated {
-        session_id,
-        root_task_id,
-    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-    let IpcResponse::TaskSpawned {
-        task_id: child_task_id,
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::SpawnChild {
-            workdir: None,
-            session_id: session_id.clone(),
-            parent_task_id: root_task_id.clone(),
-            objective: "Implement the parser".into(),
-            mode: Some("coding".into()),
-            model: None,
-            sandbox: None,
-            fork_token: None,
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected a spawned child");
-    };
-    let child: TaskId = child_task_id.parse().unwrap();
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "running"
-    );
-    let workspace = factory.starts.lock().unwrap()[0]
-        .workspace_lease_id
-        .clone()
-        .unwrap();
-    factory.handles.lock().unwrap()[0].report_delivery(
-        yi_agent_core::subagent::task::DeliveryReport::coding(
-            "deadbeef",
-            "main",
-            workspace,
-            "cargo test -p child",
-        ),
-    );
-    for _ in 0..100 {
-        if RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap()
-            == "awaiting_parent_review"
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-
-    let accept_preview: IpcRequest = serde_json::from_value(serde_json::json!({
-        "type": "PreviewReview",
-        "task_id": child_task_id,
-        "decision": { "type": "accept" }
-    }))
-    .expect("accept has no caller-supplied integration evidence");
-    let response = send_request(daemon.socket_path(), accept_preview).unwrap();
-    let IpcResponse::ReviewPreview {
-        confirmation_token, ..
-    } = response
-    else {
-        panic!("expected a review preview");
-    };
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ConfirmReview {
-            task_id: child_task_id.clone(),
-            decision: IpcReviewDecision::Accept {},
-            confirmation_token,
-        },
-    )
-    .unwrap();
-
-    let review_detail = RuntimeRepository::open(&database)
-        .unwrap()
-        .task_detail(&child_task_id.parse().unwrap())
-        .unwrap();
-    assert!(
-        serde_json::to_value(&response).unwrap()["type"] == "ReviewApproved",
-        "unexpected review response: {response:?}; state={}; delivery={}",
-        review_detail.state,
-        review_detail.delivery_json
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-    let connection = rusqlite::Connection::open(&database).unwrap();
-    let (decision, actor_json): (String, String) = connection
-        .query_row(
-            "SELECT decision, actor_json FROM reviews ORDER BY created_at DESC LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!(decision, "approved");
-    let actor: serde_json::Value = serde_json::from_str(&actor_json).unwrap();
-    assert_eq!(actor["task_id"], root_task_id);
-    assert_eq!(actor["initiated_by"]["kind"], "local_user");
-    let parent: TaskId = root_task_id.parse().unwrap();
-    let parent_mailbox = RuntimeRepository::open(&database)
-        .unwrap()
-        .mailbox_messages_for_task(&parent)
-        .unwrap();
-    assert_eq!(parent_mailbox.len(), 2);
-    assert!(parent_mailbox[1].payload_json.contains("approved"));
-    let encoded = serde_json::to_value(IpcRequest::PreviewReview {
-        task_id: child_task_id,
-        decision: IpcReviewDecision::Reject {
-            reason: "not acceptable".into(),
-        },
-    })
-    .unwrap();
-    assert_eq!(encoded["decision"]["type"], "reject");
-    assert!(encoded.get("actor").is_none());
-    assert!(encoded.get("session_id").is_none());
-    assert!(encoded.get("delivery_id").is_none());
-}
-
-#[test]
-fn legacy_review_request_fails_instead_of_silently_previewing() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(ReviewReportingFactory::default());
-    let daemon =
-        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
-            .unwrap();
-    let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
-
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::Review {
-            task_id: child_task_id,
-            decision: IpcReviewDecision::Accept {},
-        },
-    )
-    .unwrap();
-
-    assert!(matches!(
-        response,
-        IpcResponse::Error {
-            code: yi_agent_store::ipc::IpcErrorCode::ConfirmationRequired,
-            message: None,
-        }
-    ));
-}
-
-#[test]
-fn review_ipc_accept_rejects_forged_integration_evidence() {
-    let forged = serde_json::from_value::<IpcReviewDecision>(serde_json::json!({
-        "type": "accept",
-        "integration_evidence": "caller claims merge and tests passed"
-    }));
-
-    assert!(forged.is_err());
-}
-
-#[test]
-fn review_ipc_requires_a_confirmation_token_before_integrating_a_delivery() {
-    let command = serde_json::json!({
-        "type": "ConfirmReview",
-        "task_id": TaskId::new().to_string(),
-        "decision": { "type": "accept" },
-        "confirmation_token": "not-a-token"
-    });
-
-    let request = serde_json::from_value::<IpcRequest>(command).unwrap();
-    assert!(matches!(request, IpcRequest::ConfirmReview { .. }));
-}
-
-#[test]
-fn review_ipc_rejects_caller_supplied_routing_or_actor_identity() {
-    for forged_field in ["actor", "session_id", "delivery_id"] {
-        let mut command = serde_json::json!({
-            "type": "PreviewReview",
-            "task_id": TaskId::new().to_string(),
-            "decision": { "type": "accept" }
-        });
-        command[forged_field] = serde_json::json!("caller-controlled");
-
-        assert!(serde_json::from_value::<IpcRequest>(command).is_err());
-    }
-}
-
-#[test]
-fn review_ipc_routes_rework_feedback_into_the_successor_worker() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(ReviewReportingFactory::default());
-    let daemon =
-        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
-            .unwrap();
-    let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
-
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::PreviewReview {
-            task_id: child_task_id.clone(),
-            decision: IpcReviewDecision::Rework {
-                feedback: "rerun the parser regression suite".into(),
-            },
-        },
-    )
-    .unwrap();
-
-    let IpcResponse::ReviewPreview {
-        confirmation_token, ..
-    } = response
-    else {
-        panic!("expected a review preview");
-    };
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ConfirmReview {
-            task_id: child_task_id.clone(),
-            decision: IpcReviewDecision::Rework {
-                feedback: "rerun the parser regression suite".into(),
-            },
-            confirmation_token,
-        },
-    )
-    .unwrap();
-
-    assert!(matches!(response, IpcResponse::ReviewReworkRequested));
-    let starts = factory.starts.lock().unwrap();
-    assert_eq!(starts.len(), 2);
-    assert!(
-        starts[1]
-            .initial_user_messages
-            .iter()
-            .any(|message| message.body.contains("parser regression"))
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child_task_id.parse().unwrap())
-            .unwrap(),
-        "running"
-    );
-}
-
-#[test]
-fn review_ipc_rejects_with_a_required_durable_reason() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(ReviewReportingFactory::default());
-    let daemon =
-        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
-            .unwrap();
-    let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
-
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::PreviewReview {
-            task_id: child_task_id.clone(),
-            decision: IpcReviewDecision::Reject {
-                reason: "missing regression evidence".into(),
-            },
-        },
-    )
-    .unwrap();
-
-    let IpcResponse::ReviewPreview {
-        confirmation_token, ..
-    } = response
-    else {
-        panic!("expected a review preview");
-    };
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ConfirmReview {
-            task_id: child_task_id.clone(),
-            decision: IpcReviewDecision::Reject {
-                reason: "missing regression evidence".into(),
-            },
-            confirmation_token,
-        },
-    )
-    .unwrap();
-
-    assert!(matches!(response, IpcResponse::ReviewRejected));
-    let child: TaskId = child_task_id.parse().unwrap();
-    let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.task_state(&child).unwrap(), "blocked");
-    assert!(
-        repository.mailbox_messages_for_task(&child).unwrap()[0]
-            .payload_json
-            .contains("regression evidence")
-    );
-}
-
-#[test]
-fn review_ipc_rejects_empty_rework_and_rejection_text() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(ReviewReportingFactory::default());
-    let daemon =
-        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
-            .unwrap();
-    let child_task_id = delivered_child_over_ipc(&daemon, &database, &factory);
-
-    for decision in [
-        IpcReviewDecision::Rework {
-            feedback: " ".into(),
-        },
-        IpcReviewDecision::Reject {
-            reason: "\n".into(),
-        },
-    ] {
-        assert!(matches!(
-            send_request(
-                daemon.socket_path(),
-                IpcRequest::PreviewReview {
-                    task_id: child_task_id.clone(),
-                    decision,
-                },
-            )
-            .unwrap(),
-            IpcResponse::Error {
-                code: yi_agent_store::ipc::IpcErrorCode::Validation,
-                message: None,
-            }
-        ));
-    }
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child_task_id.parse().unwrap())
-            .unwrap(),
-        "awaiting_parent_review"
-    );
-}
-
-fn delivered_child_over_ipc(
-    daemon: &Daemon,
-    database: &std::path::Path,
-    factory: &ReviewReportingFactory,
-) -> String {
-    let IpcResponse::SessionCreated {
-        session_id,
-        root_task_id,
-    } = send_request(daemon.socket_path(), IpcRequest::CreateSession).unwrap()
-    else {
-        panic!("expected a created session");
-    };
-    let IpcResponse::TaskSpawned {
-        task_id: child_task_id,
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::SpawnChild {
-            workdir: None,
-            session_id,
-            parent_task_id: root_task_id,
-            objective: "Implement the parser".into(),
-            mode: Some("coding".into()),
-            model: None,
-            sandbox: None,
-            fork_token: None,
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected a spawned child");
-    };
-    let workspace = factory.starts.lock().unwrap()[0]
-        .workspace_lease_id
-        .clone()
-        .unwrap();
-    factory.handles.lock().unwrap()[0].report_delivery(
-        yi_agent_core::subagent::task::DeliveryReport::coding(
-            "deadbeef",
-            "main",
-            workspace,
-            "cargo test -p child",
-        ),
-    );
-    let child: TaskId = child_task_id.parse().unwrap();
-    for _ in 0..100 {
-        if RuntimeRepository::open(database)
-            .unwrap()
-            .task_state(&child)
-            .unwrap()
-            == "awaiting_parent_review"
-        {
-            return child_task_id;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    panic!("delivery did not reach durable parent review");
-}
-
-#[test]
 fn raw_cancel_request_cannot_bypass_confirmation() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
@@ -5106,7 +4583,7 @@ fn workspace_mode_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
@@ -5455,200 +4932,6 @@ fn a_response_payload_larger_than_the_socket_send_buffer_arrives_intact() {
     );
 }
 
-/// Attaches an application root and spawns one coding child that has delivered,
-/// so the child is awaiting its parent's review over a real socket. Returns
-/// `(session_id, root_task_id, capability, child_task_id)`.
-fn delivered_application_child_over_ipc(
-    daemon: &Daemon,
-    database: &std::path::Path,
-    factory: &ApplicationReportingFactory,
-) -> (String, String, String, String) {
-    let IpcResponse::ApplicationRootAttached {
-        session_id,
-        root_task_id,
-        message_capability,
-        ..
-    } = send_request(
-        daemon.socket_path(),
-        IpcRequest::AttachApplicationRoot {
-            idempotency_key: "review-child".into(),
-            workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
-        },
-    )
-    .unwrap()
-    else {
-        panic!("expected an attached application root");
-    };
-    let IpcResponse::TaskSpawned { task_id: child } = send_request(
-        daemon.socket_path(),
-        IpcRequest::SpawnApplicationChild {
-            workdir: None,
-            session_id: session_id.clone(),
-            parent_task_id: root_task_id.clone(),
-            capability: message_capability.clone(),
-            objective: "Implement the parser".into(),
-            mode: Some("coding".into()),
-            model: None,
-            thread_id: None,
-            sandbox: None,
-            fork_token: None,
-        },
-    )
-    .unwrap() else {
-        panic!("expected a spawned child");
-    };
-
-    let (index, workspace) = {
-        let starts = factory.starts.lock().unwrap();
-        let index = starts
-            .iter()
-            .position(|start| start.task_id.to_string() == child)
-            .expect("the child worker was started");
-        let workspace = starts[index]
-            .workspace_lease_id
-            .clone()
-            .expect("a coding child owns a workspace lease");
-        (index, workspace)
-    };
-    factory.handles.lock().unwrap()[index].report_delivery(
-        yi_agent_core::subagent::task::DeliveryReport::coding(
-            "deadbeef",
-            "main",
-            workspace,
-            "cargo test -p child",
-        ),
-    );
-    let child_id: TaskId = child.parse().unwrap();
-    for _ in 0..200 {
-        if RuntimeRepository::open(database)
-            .unwrap()
-            .task_state(&child_id)
-            .unwrap()
-            == "awaiting_parent_review"
-        {
-            return (session_id, root_task_id, message_capability, child);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    panic!("the delivery did not reach durable parent review");
-}
-
-#[test]
-fn a_parent_reworks_a_child_delivery_over_ipc() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(ApplicationReportingFactory::default());
-    let daemon =
-        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
-            .unwrap();
-    let (session_id, root_task_id, capability, child) =
-        delivered_application_child_over_ipc(&daemon, &database, &factory);
-
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ReviewChild {
-            session_id: session_id.clone(),
-            caller_task_id: root_task_id.clone(),
-            capability: capability.clone(),
-            task_id: child.clone(),
-            decision: ChildReviewDecision::Rework {
-                feedback: "rerun the parser regression suite".into(),
-            },
-        },
-    )
-    .unwrap();
-    assert!(
-        matches!(response, IpcResponse::ChildReviewAccepted),
-        "the direct parent may rework its child's delivery, got {response:?}"
-    );
-
-    let starts = factory.starts.lock().unwrap();
-    assert!(
-        starts.iter().any(|start| start
-            .initial_user_messages
-            .iter()
-            .any(|message| message.body.contains("parser regression"))),
-        "the successor worker starts with the parent's feedback"
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child.parse().unwrap())
-            .unwrap(),
-        "running",
-        "a reworked child runs again on a fresh attempt"
-    );
-}
-
-#[test]
-fn a_reviewer_who_is_not_the_direct_parent_is_refused_over_ipc() {
-    let directory = TempDir::new().unwrap();
-    let database = directory.path().join("runtime.sqlite");
-    let factory = Arc::new(ApplicationReportingFactory::default());
-    let daemon =
-        Daemon::start_with_factory(directory.path().join("runtime"), &database, factory.clone())
-            .unwrap();
-    let (session_id, root_task_id, capability, child) =
-        delivered_application_child_over_ipc(&daemon, &database, &factory);
-
-    // A second child is a sibling of the delivered child, not its parent, so it
-    // may not review it even though it lies in the same subtree.
-    let sibling_response = send_request(
-        daemon.socket_path(),
-        IpcRequest::SpawnApplicationChild {
-            workdir: None,
-            session_id: session_id.clone(),
-            parent_task_id: root_task_id.clone(),
-            capability: capability.clone(),
-            objective: "A sibling that must not review".into(),
-            mode: Some("read_only".into()),
-            model: None,
-            thread_id: None,
-            sandbox: None,
-            fork_token: None,
-        },
-    )
-    .unwrap();
-    let IpcResponse::TaskSpawned { task_id: sibling } = sibling_response else {
-        panic!("expected a sibling child, got {sibling_response:?}");
-    };
-
-    let response = send_request(
-        daemon.socket_path(),
-        IpcRequest::ReviewChild {
-            session_id: session_id.clone(),
-            caller_task_id: sibling,
-            capability: capability.clone(),
-            task_id: child.clone(),
-            decision: ChildReviewDecision::Reject {
-                reason: "not mine to judge".into(),
-            },
-        },
-    )
-    .unwrap();
-    assert!(
-        matches!(
-            response,
-            IpcResponse::Error {
-                code: IpcErrorCode::AuthorityDenied,
-                ..
-            }
-        ),
-        "only a delivery's direct parent may review it, got {response:?}"
-    );
-    assert_eq!(
-        RuntimeRepository::open(&database)
-            .unwrap()
-            .task_state(&child.parse().unwrap())
-            .unwrap(),
-        "awaiting_parent_review",
-        "a refused review leaves the delivery untouched"
-    );
-}
-
-/// The restart path is where ghosts accumulate: a killed daemon leaves rows in
-/// `running`/`paused`/`queued` that no live supervisor owns, and the startup
-/// sweep alone would only park them in the terminal `recovery_required` pen.
 #[test]
 fn daemon_start_drains_tasks_whose_owning_root_is_gone() {
     let directory = TempDir::new().unwrap();
@@ -5982,7 +5265,7 @@ fn inherited_sandbox_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 13);
+    assert_eq!(repository.schema_version().unwrap(), 14);
 
     let session = RootSessionId::new();
     let root = TaskId::new();

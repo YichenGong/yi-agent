@@ -12,10 +12,10 @@ use uuid::Uuid;
 use super::mailbox::{Mailbox, MailboxMessageDraft, MessageKind, MessagePriority, UserInstruction};
 use super::scheduler::AdmissionPriority;
 use super::task::{
-    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryId,
-    InheritedSandbox, IntegrationValidation, MessageId, PauseReason, PermissionDecision,
-    PermissionRequestId, RecoveryEvidence, RootSessionId, TaskAttempt, TaskEvent, TaskFailure,
-    TaskId, TaskState, TimeoutKind, TransitionResult, WatchdogEvidence, WorkspaceLeaseId,
+    AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryReport,
+    InheritedSandbox, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
+    RootSessionId, TaskEvent, TaskFailure, TaskId, TaskState, TimeoutKind, TransitionResult,
+    WatchdogEvidence, WorkspaceLeaseId,
 };
 use super::trace::TraceFact;
 use super::worker::{
@@ -135,12 +135,6 @@ pub struct AgentSupervisor {
     pending_user_override_acks: Vec<(TaskId, super::task::MessageId)>,
     events: Vec<SupervisorEvent>,
     updates: watch::Sender<u64>,
-}
-
-#[derive(Debug)]
-pub enum ReviewPersistenceError<E> {
-    Supervisor(String),
-    Persistence(E),
 }
 
 impl AgentSupervisor {
@@ -324,6 +318,26 @@ impl AgentSupervisor {
         Ok(())
     }
 
+    /// Restores a hydrated task's delivered commit onto its active attempt.
+    ///
+    /// `AgentTask::hydrated_review_task` cannot carry the delivery itself, so a
+    /// caller holding a terminal delivery row calls this right after inserting
+    /// the task. Without it, restart would resurrect the task as `Completed`
+    /// while `completed_child_reports` reported no delivery, and the parent
+    /// would lose the commit its child had produced.
+    pub fn hydrate_delivered_child(
+        &mut self,
+        task_id: &TaskId,
+        delivery: DeliveryReport,
+    ) -> Result<(), String> {
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| "hydrated delivery references a missing task".to_string())?;
+        task.hydrate_delivery(delivery);
+        Ok(())
+    }
+
     pub fn completion_report(&self, task_id: &TaskId) -> Option<&str> {
         self.completion_reports.get(task_id).map(String::as_str)
     }
@@ -503,18 +517,6 @@ impl AgentSupervisor {
         self.children.get(task_id).map(Vec::as_slice).unwrap_or(&[])
     }
 
-    /// Tasks currently waiting for their direct parent's review.
-    pub fn tasks_awaiting_parent_review(&self) -> Vec<TaskId> {
-        let mut ids = self
-            .tasks
-            .iter()
-            .filter(|(_, task)| matches!(task.state(), TaskState::AwaitingParentReview(_)))
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        ids.sort_by_key(|id| id.to_string());
-        ids
-    }
-
     pub fn events(&self) -> &[SupervisorEvent] {
         &self.events
     }
@@ -604,10 +606,13 @@ impl AgentSupervisor {
 
     /// Quarantines one worker at an ambiguous durable-delivery boundary. The
     /// message may be offered again only through the explicit recovery gate.
+    ///
+    /// `_message_ids` names the ambiguous messages for callers; the mailbox no
+    /// longer carries in-memory delivery state, so nothing is mutated here.
     pub fn interrupt_worker_for_recovery(
         &mut self,
         task_id: &TaskId,
-        message_ids: &[super::task::MessageId],
+        _message_ids: &[super::task::MessageId],
         evidence: impl Into<String>,
     ) -> Result<(), String> {
         self.workers
@@ -627,13 +632,6 @@ impl AgentSupervisor {
                 evidence: RecoveryEvidence(evidence.into()),
             },
         )?;
-        let mailbox = self
-            .mailboxes
-            .get_mut(task_id)
-            .expect("task mailbox is created with task");
-        for message_id in message_ids {
-            mailbox.mark_pending_for_worker(message_id);
-        }
         self.workers.remove(task_id);
         self.worker_message_capabilities.remove(task_id);
         self.notify_update();
@@ -734,13 +732,6 @@ impl AgentSupervisor {
         };
         self.worker_message_capabilities
             .insert(task_id.clone(), message_capability);
-        for (id, _) in initial_user_messages {
-            let mailbox = self
-                .mailboxes
-                .get_mut(task_id)
-                .expect("task mailbox is created with task");
-            mailbox.mark_delivered_to_worker(&id);
-        }
         self.workers.insert(task_id.clone(), handle);
         Ok(())
     }
@@ -769,7 +760,8 @@ impl AgentSupervisor {
 
     /// Applies worker facts through the task reducer and discards handles for
     /// terminal tasks. A normal model completion without a structured delivery
-    /// is intentionally a failure: coding completion requires review evidence.
+    /// is intentionally not a coding completion: a coding child finishes only
+    /// by delivering a validated commit.
     pub fn reconcile_worker_events(&mut self) -> Result<Vec<TaskId>, String> {
         let events = self
             .workers
@@ -845,7 +837,11 @@ impl AgentSupervisor {
                     // failure abort the whole reconciliation pass (which would
                     // strand the child in `running` forever and starve every other
                     // task in the same pass).
-                    let notification = self.send_message(
+                    //
+                    // The child is terminal by now, so the live-sender rule is
+                    // relaxed for this one outcome announcement; its own delivery
+                    // is precisely what the parent must receive.
+                    let notification = self.deliver_message(
                         &task_id,
                         MailboxMessageDraft::new(
                             task_id.clone(),
@@ -853,6 +849,7 @@ impl AgentSupervisor {
                             MessageKind::Completed(delivery),
                             Some(attempt_id),
                         ),
+                        false,
                     );
                     if let Err(error) = notification {
                         if !matches!(error, MessageDeliveryError::RecipientTerminal) {
@@ -965,11 +962,7 @@ impl AgentSupervisor {
             }
             for id in std::iter::once(task_id.clone()).chain(affected) {
                 if self.tasks.get(&id).is_some_and(|task| {
-                    task.state().is_terminal()
-                        || matches!(
-                            task.state(),
-                            TaskState::Paused(_) | TaskState::AwaitingParentReview(_)
-                        )
+                    task.state().is_terminal() || matches!(task.state(), TaskState::Paused(_))
                 }) {
                     self.workers.remove(&id);
                     self.worker_message_capabilities.remove(&id);
@@ -1185,18 +1178,15 @@ impl AgentSupervisor {
         })
     }
 
-    /// Children whose outcome the caller must act on: finished children, and
-    /// children holding a delivery or report that is waiting for the caller's
-    /// review. A delivery is not terminal yet, so terminality alone would hide
-    /// exactly the child the caller has to merge.
+    /// Children whose outcome the caller must act on: finished children, or
+    /// children that produced a completion report. A delivered child is now
+    /// terminal on delivery, so `is_terminal()` covers the old review wait.
     fn children_needing_attention(&self, caller: &TaskId) -> Vec<TaskId> {
         self.children_of(caller)
             .iter()
             .filter(|child| {
                 self.task(child).is_some_and(|task| {
-                    task.state().is_terminal()
-                        || task.active_attempt().delivery.is_some()
-                        || self.completion_reports.contains_key(*child)
+                    task.state().is_terminal() || self.completion_reports.contains_key(*child)
                 })
             })
             .cloned()
@@ -1312,10 +1302,25 @@ impl AgentSupervisor {
         sender: &TaskId,
         draft: MailboxMessageDraft,
     ) -> Result<(), MessageDeliveryError> {
+        self.deliver_message(sender, draft, true)
+    }
+
+    /// Shared mailbox delivery path. `enforce_live_sender` is normally `true`,
+    /// keeping the rule that a terminal task cannot inject new work. It is
+    /// `false` only for a child announcing its own terminal delivery: that child
+    /// is terminal precisely *because* the delivery landed, and that outcome is
+    /// exactly the parent's next input, so the live-sender rule must not
+    /// suppress the notification. Recipient adjacency and terminal-recipient
+    /// checks still apply.
+    fn deliver_message(
+        &mut self,
+        sender: &TaskId,
+        draft: MailboxMessageDraft,
+        enforce_live_sender: bool,
+    ) -> Result<(), MessageDeliveryError> {
         let recipient = draft.recipient().clone();
         let worker_message = match draft.kind() {
             MessageKind::UserInstruction(UserInstruction(body)) => Some(body.clone()),
-            MessageKind::Rework(instruction) => Some(instruction.0.clone()),
             // A child's terminal outcome is the parent's next input: the parent
             // acts on a delivery even when it never called wait_agent.
             MessageKind::Completed(delivery) => {
@@ -1335,7 +1340,7 @@ impl AgentSupervisor {
             .tasks
             .get(sender)
             .ok_or(MessageDeliveryError::SenderNotFound)?;
-        if sender_task.state().is_terminal() {
+        if enforce_live_sender && sender_task.state().is_terminal() {
             return Err(MessageDeliveryError::SenderTerminal);
         }
         let recipient_task = self
@@ -1372,8 +1377,8 @@ impl AgentSupervisor {
     }
 
     /// Restores or stages an already-authorized durable mailbox fact. This is
-    /// reserved for runtime hydration/review transactions and deliberately
-    /// does not weaken ordinary live sender, adjacency, or terminal checks.
+    /// reserved for runtime hydration transactions and deliberately does not
+    /// weaken ordinary live sender, adjacency, or terminal checks.
     pub fn stage_persisted_message(
         &mut self,
         draft: MailboxMessageDraft,
@@ -1406,25 +1411,9 @@ impl AgentSupervisor {
                 id: message_id.clone(),
                 body,
             });
-            self.mailboxes
-                .get_mut(recipient)
-                .expect("recipient mailbox was checked")
-                .mark_delivered_to_worker(message_id);
         }
         self.notify_update();
         Ok(())
-    }
-
-    pub fn pending_rework_message_ids(&self, task_id: &TaskId) -> Vec<super::task::MessageId> {
-        let Some(mailbox) = self.mailboxes.get(task_id) else {
-            return Vec::new();
-        };
-        mailbox
-            .pending_worker_inputs()
-            .into_iter()
-            .map(|(id, _)| id)
-            .filter(|id| mailbox.is_rework(id))
-            .collect()
     }
 
     /// Delivers the daemon's text-only control message through the same
@@ -1572,10 +1561,6 @@ impl AgentSupervisor {
                 id: receipt.message_id.clone(),
                 body: message,
             });
-            self.mailboxes
-                .get_mut(&recipient)
-                .expect("task mailbox is created with task")
-                .mark_delivered_to_worker(&receipt.message_id);
         }
         self.notify_update();
         Ok(())
@@ -1728,163 +1713,6 @@ impl AgentSupervisor {
         )?;
         self.notify_update();
         Ok(attempt_id)
-    }
-
-    /// Applies an accepted delivery through the task reducer. The reducer
-    /// verifies both direct-parent ownership and integration evidence.
-    ///
-    /// An accepted delivery reaches `TaskState::Completed`, a settled terminal
-    /// state, so `reduce_task` can fire the parent-terminal cascade. The id list
-    /// is returned alongside the attempt so callers persist the cascade victims
-    /// instead of leaving them running with live leases.
-    pub fn accept_review(
-        &mut self,
-        task_id: &TaskId,
-        actor: &TaskId,
-        delivery_id: DeliveryId,
-        integration: IntegrationValidation,
-    ) -> Result<(AttemptId, Vec<TaskId>), String> {
-        let attempt_id = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?
-            .active_attempt_id()
-            .clone();
-        let affected = self.reduce_task(
-            task_id,
-            TaskEvent::ReviewAccepted {
-                attempt_id: attempt_id.clone(),
-                actor: actor.clone(),
-                delivery_id,
-                integration,
-            },
-        )?;
-        self.notify_update();
-        Ok((attempt_id, affected))
-    }
-
-    /// Requests rework of the exact reviewed delivery and returns the newly
-    /// created attempt for durable persistence by the runtime coordinator.
-    pub fn rework_review(
-        &mut self,
-        task_id: &TaskId,
-        actor: &TaskId,
-        delivery_id: DeliveryId,
-        feedback: MessageId,
-    ) -> Result<TaskAttempt, String> {
-        let successor = self.reduce_rework_review(task_id, actor, delivery_id, feedback)?;
-        self.notify_update();
-        Ok(successor)
-    }
-
-    /// Stages reducer/mailbox changes while the caller holds the supervisor
-    /// lock, then commits the matching repository transaction. Failed staging
-    /// or persistence restores both in-memory snapshots before returning.
-    pub fn stage_review_with_persistence<S, T, E>(
-        &mut self,
-        stage: impl FnOnce(&mut Self) -> Result<S, String>,
-        persist: impl FnOnce(&S) -> Result<T, E>,
-    ) -> Result<(S, T), ReviewPersistenceError<E>> {
-        let original_tasks = self.tasks.clone();
-        let original_mailboxes = self.mailboxes.clone();
-        let staged = match stage(self) {
-            Ok(staged) => staged,
-            Err(error) => {
-                self.tasks = original_tasks;
-                self.mailboxes = original_mailboxes;
-                return Err(ReviewPersistenceError::Supervisor(error));
-            }
-        };
-        let persisted = match persist(&staged) {
-            Ok(persisted) => persisted,
-            Err(error) => {
-                self.tasks = original_tasks;
-                self.mailboxes = original_mailboxes;
-                return Err(ReviewPersistenceError::Persistence(error));
-            }
-        };
-        self.notify_update();
-        Ok((staged, persisted))
-    }
-
-    fn reduce_rework_review(
-        &mut self,
-        task_id: &TaskId,
-        actor: &TaskId,
-        delivery_id: DeliveryId,
-        feedback: MessageId,
-    ) -> Result<TaskAttempt, String> {
-        if self
-            .tasks
-            .get(task_id)
-            .and_then(|task| task.parent_id.as_ref())
-            != Some(actor)
-        {
-            return Err("review actor does not match direct parent".into());
-        }
-        let attempt_id = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?
-            .active_attempt_id()
-            .clone();
-        let (_affected, transition) = self.reduce_task_returning_transition(
-            task_id,
-            TaskEvent::ReviewRework {
-                attempt_id,
-                delivery_id,
-                feedback,
-            },
-        )?;
-        transition
-            .new_attempt
-            .ok_or_else(|| "rework did not create a successor attempt".to_string())
-    }
-
-    /// Rejects the exact reviewed delivery through reducer-owned state.
-    ///
-    /// A rejection blocks the reviewed task, which is also a settled terminal
-    /// state, so the reducer's parent-terminal cascade can fire here too; the
-    /// affected ids are returned so the runtime can persist the victims.
-    pub fn reject_review(
-        &mut self,
-        task_id: &TaskId,
-        actor: &TaskId,
-        delivery_id: DeliveryId,
-        reason: MessageId,
-    ) -> Result<(AttemptId, Vec<TaskId>), String> {
-        if self
-            .tasks
-            .get(task_id)
-            .and_then(|task| task.parent_id.as_ref())
-            != Some(actor)
-        {
-            return Err("review actor does not match direct parent".into());
-        }
-        let attempt_id = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| "task does not exist".to_string())?
-            .active_attempt_id()
-            .clone();
-        let affected = self.reduce_task(
-            task_id,
-            TaskEvent::ReviewRejected {
-                attempt_id: attempt_id.clone(),
-                delivery_id,
-                reason: reason.clone(),
-            },
-        )?;
-        self.stage_persisted_message(MailboxMessageDraft::new_with_id(
-            reason.clone(),
-            actor.clone(),
-            task_id.clone(),
-            MessageKind::ReviewRejected(reason),
-            Some(attempt_id.clone()),
-        ))
-        .map_err(|error| error.to_string())?;
-        self.notify_update();
-        Ok((attempt_id, affected))
     }
 
     /// Records a recovery conflict as a settled `Blocked` state.
@@ -2132,7 +1960,6 @@ fn task_state_label(state: &TaskState) -> &'static str {
         TaskState::WaitingForPermission(_) => "waiting_for_permission",
         TaskState::WaitingForChildren(_) => "waiting_for_children",
         TaskState::Paused(_) => "paused",
-        TaskState::AwaitingParentReview(_) => "awaiting_parent_review",
         TaskState::Completed => "completed",
         TaskState::CompletedNoChanges => "completed_no_changes",
         TaskState::Blocked(_) => "blocked",
@@ -2359,10 +2186,8 @@ struct SendMessageTool {
 #[allow(clippy::items_after_test_module)]
 mod provider_turn_priority_tests {
     use super::*;
-    use crate::subagent::mailbox::ReworkInstruction;
     use crate::subagent::task::{
-        DeliveryReport, IntegrationValidation, MessageId, PermissionDecision, PermissionRequestId,
-        WorkspaceLeaseId,
+        DeliveryReport, PermissionDecision, PermissionRequestId, WorkspaceLeaseId,
     };
 
     #[test]
@@ -2402,7 +2227,7 @@ mod provider_turn_priority_tests {
                 MailboxMessageDraft::new(
                     child.clone(),
                     root.clone(),
-                    MessageKind::Rework(ReworkInstruction("review this result".into())),
+                    MessageKind::Blocked(BlockReason("needs a parent decision".into())),
                     None,
                 ),
             )
@@ -2436,157 +2261,18 @@ mod provider_turn_priority_tests {
     }
 
     #[test]
-    fn worker_delivery_transitions_a_child_to_direct_parent_review() {
-        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
-        let root = supervisor.root_task_id().clone();
-        let child = supervisor.spawn(root).unwrap();
-        let workspace = WorkspaceLeaseId::new();
-        supervisor.tasks.get_mut(&child).unwrap().workspace = Some(workspace.clone());
-        supervisor.start_task(&child).unwrap();
-        let handle = WorkerHandle::new(tokio_util::sync::CancellationToken::new());
-        supervisor.workers.insert(child.clone(), handle.clone());
-        let delivery = DeliveryReport::coding("deadbeef", "main", workspace, "checks passed");
-
-        handle.report_delivery(delivery.clone());
-        supervisor.reconcile_worker_events().unwrap();
+    fn worker_delivery_transitions_a_child_straight_to_completed() {
+        let (supervisor, _parent, child, delivery) = delivered_child();
 
         assert_eq!(
             supervisor.task(&child).unwrap().state(),
-            &TaskState::AwaitingParentReview(delivery.id)
+            &TaskState::Completed,
+            "a delivered child is terminal on delivery, with no review wait"
         );
-    }
-
-    #[test]
-    fn tasks_awaiting_parent_review_lists_only_review_waiters() {
-        let (supervisor, _parent, child, _delivery) = delivered_child();
-
-        assert_eq!(supervisor.tasks_awaiting_parent_review(), vec![child]);
-    }
-
-    #[test]
-    fn tasks_awaiting_parent_review_is_empty_without_review_waiters() {
-        let supervisor = AgentSupervisor::new(RootSessionId::new());
-        assert!(supervisor.tasks_awaiting_parent_review().is_empty());
-    }
-
-    #[test]
-    fn direct_parent_accepts_a_validated_child_delivery() {
-        let (mut supervisor, parent, child, delivery) = delivered_child();
-
-        supervisor
-            .accept_review(
-                &child,
-                &parent,
-                delivery.id.clone(),
-                IntegrationValidation::passed("parent integration passed"),
-            )
-            .unwrap();
-
         assert_eq!(
-            supervisor.task(&child).unwrap().state(),
-            &TaskState::Completed
-        );
-    }
-
-    #[test]
-    fn direct_parent_rework_creates_a_successor_attempt() {
-        let (mut supervisor, parent, child, delivery) = delivered_child();
-        let previous_attempt = supervisor.task(&child).unwrap().active_attempt_id().clone();
-
-        let successor = supervisor
-            .rework_review(&child, &parent, delivery.id, MessageId::new())
-            .unwrap();
-
-        assert_ne!(successor.id, previous_attempt);
-        assert_eq!(successor.number, 2);
-        assert_eq!(supervisor.task(&child).unwrap().state(), &TaskState::Queued);
-        assert_eq!(
-            supervisor.task(&child).unwrap().active_attempt_id(),
-            &successor.id
-        );
-    }
-
-    #[test]
-    fn direct_parent_reject_blocks_the_reviewed_child() {
-        let (mut supervisor, parent, child, delivery) = delivered_child();
-        let reason = MessageId::new();
-
-        supervisor
-            .reject_review(&child, &parent, delivery.id, reason.clone())
-            .unwrap();
-
-        assert!(matches!(
-            supervisor.task(&child).unwrap().state(),
-            TaskState::Blocked(_)
-        ));
-        assert_eq!(supervisor.mailbox(&child).unwrap().messages()[0].id, reason);
-    }
-
-    #[test]
-    fn rework_rejects_an_actor_other_than_the_direct_parent() {
-        let (mut supervisor, _parent, child, delivery) = delivered_child();
-
-        let error = supervisor
-            .rework_review(&child, &TaskId::new(), delivery.id, MessageId::new())
-            .unwrap_err();
-
-        assert_eq!(error, "review actor does not match direct parent");
-        assert!(matches!(
-            supervisor.task(&child).unwrap().state(),
-            TaskState::AwaitingParentReview(_)
-        ));
-    }
-
-    #[test]
-    fn rejection_rejects_an_actor_other_than_the_direct_parent() {
-        let (mut supervisor, _parent, child, delivery) = delivered_child();
-
-        let error = supervisor
-            .reject_review(&child, &TaskId::new(), delivery.id, MessageId::new())
-            .unwrap_err();
-
-        assert_eq!(error, "review actor does not match direct parent");
-        assert!(matches!(
-            supervisor.task(&child).unwrap().state(),
-            TaskState::AwaitingParentReview(_)
-        ));
-    }
-
-    #[test]
-    fn failed_review_persistence_rolls_back_staged_state_and_mailboxes() {
-        let (mut supervisor, parent, child, delivery) = delivered_child();
-        let before_child = supervisor.task(&child).unwrap().clone();
-        let before_parent_mailbox = supervisor.mailbox(&parent).unwrap().messages().to_vec();
-        let notification = MessageId::new();
-
-        let result = supervisor.stage_review_with_persistence(
-            |supervisor| {
-                supervisor.accept_review(
-                    &child,
-                    &parent,
-                    delivery.id.clone(),
-                    IntegrationValidation::passed("trusted integration passed"),
-                )?;
-                supervisor
-                    .stage_persisted_message(MailboxMessageDraft::user_override_with_id(
-                        notification,
-                        parent.clone(),
-                        "review accepted",
-                    ))
-                    .map_err(|error| error.to_string())?;
-                Ok(())
-            },
-            |_| Err::<(), _>("injected repository failure"),
-        );
-
-        assert!(matches!(
-            result,
-            Err(ReviewPersistenceError::Persistence(_))
-        ));
-        assert_eq!(supervisor.task(&child).unwrap(), &before_child);
-        assert_eq!(
-            supervisor.mailbox(&parent).unwrap().messages(),
-            before_parent_mailbox
+            supervisor.task(&child).unwrap().active_attempt().delivery,
+            Some(delivery),
+            "the attempt keeps the delivery so the parent can read the commit"
         );
     }
 

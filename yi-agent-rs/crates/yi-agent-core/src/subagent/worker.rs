@@ -597,7 +597,7 @@ pub trait WorkerWorkspaceRegistry: Send + Sync {
     }
 
     /// Reads a workspace's delivery, probing its directory rather than a
-    /// daemon-managed worktree. The numbers a review needs (head, branch,
+    /// daemon-managed worktree. The facts a delivery carries (head, branch,
     /// cleanliness) all come from the workdir itself.
     fn inspect_delivery(&self, workspace: &WorkerWorkspace) -> Result<DeliveryReport, WorkerError> {
         let _ = workspace;
