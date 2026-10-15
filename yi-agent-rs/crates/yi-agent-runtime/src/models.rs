@@ -14,6 +14,23 @@ use yi_agent_core::ApiStyle;
 
 use crate::config::RuntimeConfig;
 
+/// 旧版 openai 默认值（不含版本段）。仅这一精确值会被迁移，自定义地址不动。
+const LEGACY_OPENAI_BASE_URL: &str = "https://api.openai.com";
+/// 新版 openai 默认值：含版本段的 API 根（对齐 OpenAI 官方 SDK 约定）。
+const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// 加载期精确迁移：把「恰为旧默认值的 openai 条目」改写为含 `/v1` 的新默认值。
+///
+/// 只认一对一映射（旧默认值 → 新默认值），不做任何启发式猜测；自定义地址
+/// （如网关根 `https://llmapi.horizon.auto`）一律不动，由设置页提示用户自查。
+fn migrate_openai_api_url(entry: &mut ModelEntry) {
+    if entry.provider == ModelProvider::Openai
+        && entry.api_url.trim_end_matches('/') == LEGACY_OPENAI_BASE_URL
+    {
+        entry.api_url = OPENAI_BASE_URL.to_string();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelProvider {
@@ -124,11 +141,12 @@ pub fn load_catalog_from(path: &Path) -> ModelCatalog {
     if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
         for raw in models {
             match serde_json::from_value::<ModelEntry>(raw.clone()) {
-                Ok(entry)
+                Ok(mut entry)
                     if !entry.name.trim().is_empty()
                         && !entry.api_url.trim().is_empty()
                         && !entry.model.trim().is_empty() =>
                 {
+                    migrate_openai_api_url(&mut entry);
                     catalog.models.push(entry);
                 }
                 Ok(_) => tracing::warn!(path = %path.display(), "skipping incomplete model entry"),
@@ -456,6 +474,55 @@ mod tests {
         assert_eq!(catalog.models.len(), 1, "entry must still load");
         assert_eq!(catalog.models[0].api_style.as_deref(), Some("responses"));
         assert_eq!(catalog.models[0].reasoning_effort, None);
+    }
+
+    /// 加载期精确迁移：只有「openai 且恰为旧默认值」才改写；其余一律不动。
+    #[test]
+    fn legacy_openai_default_url_is_migrated_to_v1() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(
+            &path,
+            r#"{"models":[
+                {"name":"legacy","provider":"openai","api_url":"https://api.openai.com","model":"m","api_key":"k"},
+                {"name":"legacy-slash","provider":"openai","api_url":"https://api.openai.com/","model":"m","api_key":"k"},
+                {"name":"custom","provider":"openai","api_url":"https://llmapi.horizon.auto","model":"m","api_key":"k"},
+                {"name":"already","provider":"openai","api_url":"https://api.openai.com/v1","model":"m","api_key":"k"},
+                {"name":"anth","provider":"anthropic","api_url":"https://api.openai.com","model":"m","api_key":"k"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let catalog = load_catalog_from(&path);
+        let url_of = |name: &str| {
+            catalog
+                .models
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .api_url
+                .clone()
+        };
+        assert_eq!(url_of("legacy"), "https://api.openai.com/v1");
+        assert_eq!(url_of("legacy-slash"), "https://api.openai.com/v1");
+        // 自定义地址绝不改写——这正是方案 A 的立场。
+        assert_eq!(url_of("custom"), "https://llmapi.horizon.auto");
+        // 已是新默认值：幂等，不变。
+        assert_eq!(url_of("already"), "https://api.openai.com/v1");
+        // anthropic 条目零影响。
+        assert_eq!(url_of("anth"), "https://api.openai.com");
+    }
+
+    /// 迁移只在内存里发生，不写回文件：读一次不该改用户的数据。
+    #[test]
+    fn migration_does_not_rewrite_the_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        let original = r#"{"models":[{"name":"legacy","provider":"openai","api_url":"https://api.openai.com","model":"m","api_key":"k"}]}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let _ = load_catalog_from(&path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 }
 
