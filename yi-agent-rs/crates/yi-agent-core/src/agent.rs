@@ -1672,6 +1672,11 @@ fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
                 crate::message::ContentBlock::Image { .. } => {
                     total += crate::compact::IMAGE_TOKEN_ESTIMATE as u32;
                 }
+                // 与 compact 的 estimate_block_tokens 口径一致：只按明文估算，
+                // 凭证不计入，否则状态栏估算与实际上下文漂移（spec §3.3）。
+                crate::message::ContentBlock::Thinking { text, .. } => {
+                    total += estimate_tokens(text);
+                }
             }
         }
     }

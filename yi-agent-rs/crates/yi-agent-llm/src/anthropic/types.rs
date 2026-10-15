@@ -125,6 +125,14 @@ impl From<ContentBlock> for AnthropicContentBlock {
             ContentBlock::Image { source, .. } => AnthropicContentBlock::Image {
                 source: source.into(),
             },
+            // Placeholder for Task 1 only: credential round-tripping for Anthropic is
+            // implemented in Task 4 (spec §3.3, plan Task 4). Nothing constructs a
+            // `Thinking` block yet, so this is unreachable in the current state; it
+            // fails loudly rather than silently dropping a credential (which would
+            // trigger a 400 per spec §1.3).
+            ContentBlock::Thinking { .. } => {
+                unreachable!("ContentBlock::Thinking -> AnthropicContentBlock is Task 4")
+            }
         }
     }
 }

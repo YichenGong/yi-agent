@@ -485,6 +485,7 @@ fn render_content(blocks: &[ContentBlock]) -> String {
             ContentBlock::ToolUse { .. } => rendered.push_str("[tool_use]"),
             ContentBlock::ToolResult { .. } => rendered.push_str("[tool_result]"),
             ContentBlock::Image { .. } => rendered.push_str("[image]"),
+            ContentBlock::Thinking { .. } => rendered.push_str("[thinking]"),
         }
     }
     rendered

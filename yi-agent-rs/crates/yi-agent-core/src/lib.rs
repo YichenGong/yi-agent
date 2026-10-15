@@ -20,7 +20,7 @@ pub use compact::{
     CompactError, CompactionPlan, DEFAULT_COMPACT_TOOL_BUDGET_TOKENS,
     DEFAULT_COMPACT_USER_BUDGET_TOKENS, compact_session,
 };
-pub use message::{ContentBlock, ImageDetail, ImageSource, Message, Role};
+pub use message::{ContentBlock, ImageDetail, ImageSource, Message, Role, ThinkingToken};
 pub use provider::{
     ApiStyle, GenParams, NoticeLevel, Provider, ProviderError, ProviderEvent, ProviderNotice,
     ProviderRequest, ProviderResponse, ReasoningKind, StopReason, StreamEnd, TokenUsage,

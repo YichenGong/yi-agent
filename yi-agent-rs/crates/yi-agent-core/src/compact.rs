@@ -93,6 +93,8 @@ fn estimate_block_tokens(block: &ContentBlock) -> usize {
         }
         ContentBlock::ToolResult { content, .. } => content.iter().map(estimate_block_tokens).sum(),
         ContentBlock::Image { .. } => IMAGE_TOKEN_ESTIMATE,
+        // 凭证不计入用户预算（无法估算且不该计入），只按明文长度估算。
+        ContentBlock::Thinking { text, .. } => estimate_text_tokens(text),
     }
 }
 
@@ -410,6 +412,9 @@ pub fn format_messages_for_summary(messages: &[Message]) -> String {
                     format!("[工具结果: {inner}]")
                 }
                 ContentBlock::Image { .. } => "[图片]".to_string(),
+                // 明文不进摘要：凭证不会被摘要模型重现，摘要里出现推理内容会造成
+                // 「摘要声称有、实际凭证已丢」的语义错位（spec §4.2）。
+                ContentBlock::Thinking { .. } => "[思考]".to_string(),
             })
             .collect::<Vec<_>>()
             .join("");
