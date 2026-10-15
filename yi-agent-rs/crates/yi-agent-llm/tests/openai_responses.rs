@@ -2,10 +2,13 @@
 
 use std::time::Duration;
 
+use futures::StreamExt;
 use wiremock::matchers::{body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use yi_agent_core::{GenParams, Message, Provider, ProviderRequest, StopReason};
+use yi_agent_core::{
+    Agent, AgentConfig, GenParams, Message, Provider, ProviderRequest, StopReason, ToolRegistry,
+};
 use yi_agent_llm::{OpenaiProvider, OpenaiProviderOpts};
 
 /// 最小 chat SSE：一段文本 + `stop` + `[DONE]`。
@@ -87,6 +90,149 @@ async fn count_chat_requests_without_effort(server: &MockServer) -> usize {
         .filter(|r| r.url.path() == "/v1/chat/completions")
         .filter(|r| !String::from_utf8_lossy(&r.body).contains("reasoning_effort"))
         .count()
+}
+
+/// The wire-level end-to-end proof (spec §7.2): the tool loop's SECOND HTTP
+/// request really carries the FIRST round's reasoning credential.
+///
+/// Everything below this test asserts on an in-memory `ProviderRequest` or a
+/// serialized struct. Only this one drives a real `Agent` over a real
+/// `OpenaiProvider` against an HTTP server, so only this one can prove the
+/// credential survives the whole path: Responses SSE -> `ProviderEvent::
+/// ThinkingBlock` -> accumulated content -> assistant message in the session ->
+/// `ProviderRequest.messages` -> `responses_request_from` -> the actual POST body.
+///
+/// The server answers the FIRST POST with a `reasoning` item carrying
+/// `encrypted_content` followed by a `function_call`; the loop then calls the
+/// (unregistered) tool, gets a tool-not-found result, and issues a SECOND POST.
+/// That second request body is what we assert on.
+const SSE_RESPONSES_REASONING_THEN_TOOL_CALL: &str = "\
+event: response.output_item.done\n\
+data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc-round-one\",\"summary\":[]}}\n\n\
+event: response.output_item.added\n\
+data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"\"}}\n\n\
+event: response.function_call_arguments.delta\n\
+data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{}\"}\n\n\
+event: response.output_item.done\n\
+data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo\",\"arguments\":\"{}\"}}\n\n\
+event: response.completed\n\
+data: {\"type\":\"response.completed\",\"response\":{}}\n\n";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_loop_second_request_body_replays_the_first_round_reasoning_item() {
+    let server = MockServer::start().await;
+
+    // The first POST carries no conversation history yet (messages == [user "hi"]).
+    // The extra predicate keeps this mock from also swallowing later rounds:
+    // `body_partial_json` compares arrays by index inclusively, so the `input[0]`
+    // user item alone would match every round.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(serde_json::json!({
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        })))
+        .and(|r: &wiremock::Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&r.body).expect("request body must be JSON");
+            body["input"]
+                .as_array()
+                .is_some_and(|input| !input.iter().any(|i| i["type"] == "reasoning"))
+        })
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(SSE_RESPONSES_REASONING_THEN_TOOL_CALL),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The second POST must already carry the reasoning item AND the function_call,
+    // in that order. Index-aligned expectations pin both the content and the
+    // ordering; if either were missing this mock would not match and the loop
+    // would surface a 404 instead.
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "reasoning", "encrypted_content": "enc-round-one"},
+                {"type": "function_call", "call_id": "call_1", "name": "echo"}
+            ]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SSE_RESPONSES_TEXT_ONLY))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // `echo` is deliberately unregistered: the loop gets a tool-not-found result
+    // and still advances to a second round.
+    let provider = provider_with_style(&server, "responses");
+    // Pin the model the agent sends (`AgentConfig::default()` is a Claude model)
+    // so the mock can assert on a realistic body.
+    let config = AgentConfig {
+        model: "gpt-4o".into(),
+        ..AgentConfig::default()
+    };
+    let mut agent = Agent::new(
+        std::sync::Arc::new(provider),
+        std::sync::Arc::new(ToolRegistry::new()),
+        config,
+    );
+
+    let mut stream = agent.run("hi".into()).await.expect("agent run");
+    // Drain the stream to completion. The bound is a guard, not an expectation:
+    // a healthy loop ends on its own, and the bound stops a hypothetical
+    // duplicate-`Done` regression from hanging the suite.
+    let mut done = 0usize;
+    let mut seen = 0usize;
+    while let Some(event) = stream.next().await {
+        seen += 1;
+        assert!(seen < 1000, "the agent event stream must terminate");
+        if matches!(event, yi_agent_core::AgentEvent::Done { .. }) {
+            done += 1;
+        }
+    }
+    let requests = server.received_requests().await.expect("received requests");
+    assert_eq!(done, 1, "the tool loop must finish with exactly one Done");
+
+    let bodies: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|r| r.url.path() == "/v1/responses")
+        .map(|r| serde_json::from_slice(&r.body).expect("request body must be JSON"))
+        .collect();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the tool loop must issue exactly two HTTP requests, got {}",
+        bodies.len()
+    );
+
+    // The assertion that matters: the REAL second-round HTTP body replays the
+    // credential the first round produced.
+    let input = bodies[1]["input"]
+        .as_array()
+        .expect("the second request must carry an input array");
+    let reasoning_at = input
+        .iter()
+        .position(|i| i["type"] == "reasoning")
+        .unwrap_or_else(|| {
+            panic!("the second request must replay a reasoning item, got input: {input:?}")
+        });
+    assert_eq!(
+        input[reasoning_at]["encrypted_content"], "enc-round-one",
+        "the credential must be replayed byte-for-byte"
+    );
+    let call_at = input
+        .iter()
+        .position(|i| i["type"] == "function_call")
+        .expect("the function_call must be replayed alongside it");
+    assert!(
+        reasoning_at < call_at,
+        "the reasoning item must precede its function_call (server returns them in that order)"
+    );
 }
 
 #[tokio::test]

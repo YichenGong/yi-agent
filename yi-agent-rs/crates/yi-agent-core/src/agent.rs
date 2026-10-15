@@ -1760,11 +1760,90 @@ mod tests {
         );
     }
 
+    /// End-to-end proof that a tool loop's SECOND request carries the FIRST
+    /// round's thinking block.
+    ///
+    /// Every layer below this has its own unit test (the block type round-trips,
+    /// the Anthropic/DeepSeek/Responses encoders emit it), but none of them prove
+    /// the block survives the actual loop: `ProviderEvent::ThinkingBlock` ->
+    /// accumulated content -> assistant message in the session -> the next
+    /// `ProviderRequest`. That whole chain is what this test pins down.
+    ///
+    /// Note the tool loop is triggered by the PRESENCE of a `ToolUse` block in the
+    /// accumulated content, not by `StopReason` (which has no `ToolUse` variant),
+    /// so the first script must really emit `ToolUseStart`/`ToolUseDelta`/
+    /// `ToolUseEnd` to build one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_loop_round_two_carries_the_thinking_block() {
+        use crate::message::{ContentBlock, ThinkingToken};
+
+        // Round one: thinking + tool_use. Round two: plain text, ends the loop.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ThinkingBlock {
+                    text: "".into(),
+                    token: ThinkingToken::Signature("SIG-1".into()),
+                },
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]));
+        // "echo" is deliberately unregistered: the call yields a tool-not-found
+        // result, which the loop still feeds back as a tool_result round-trip.
+        let tools = Arc::new(ToolRegistry::new());
+        // Keep the test-side handle: `Agent::new` takes the Arc by value.
+        let mut agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let _ = collect_events(stream);
+
+        // The second request must carry the first round's thinking block.
+        let requests = provider.recorded_requests();
+        assert!(
+            requests.len() >= 2,
+            "tool loop must issue a second request, got {}",
+            requests.len()
+        );
+        let has_sig = requests[1].messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::Thinking { token: ThinkingToken::Signature(s), .. } if s == "SIG-1"
+                )
+            })
+        });
+        assert!(
+            has_sig,
+            "the second request must carry the first round's signature, got: {:?}",
+            requests[1].messages
+        );
+    }
+
     /// Provider that returns a fixed sequence of events.
     /// Each call returns the next script; if scripts exhausted, returns empty (EndTurn).
     struct ScriptedProvider {
         scripts: Vec<Vec<ProviderEvent>>,
         call_index: std::sync::Mutex<usize>,
+        /// Every `ProviderRequest` handed to `call_stream`, in order.
+        /// Lets a test assert on what round N actually sent (e.g. that the
+        /// second round carries the first round's thinking block).
+        requests: std::sync::Mutex<Vec<crate::provider::ProviderRequest>>,
     }
 
     impl ScriptedProvider {
@@ -1772,7 +1851,12 @@ mod tests {
             Self {
                 scripts,
                 call_index: std::sync::Mutex::new(0),
+                requests: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn recorded_requests(&self) -> Vec<crate::provider::ProviderRequest> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -1780,8 +1864,9 @@ mod tests {
     impl Provider for ScriptedProvider {
         async fn call_stream(
             &self,
-            _req: ProviderRequest,
+            req: ProviderRequest,
         ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            self.requests.lock().unwrap().push(req);
             let mut idx = self.call_index.lock().unwrap();
             let script = self.scripts.get(*idx).cloned().unwrap_or_else(|| {
                 vec![ProviderEvent::Stop {
