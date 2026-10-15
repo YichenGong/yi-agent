@@ -217,6 +217,69 @@ created on or after August 31, 2026」。今天是 2026-10-15，**新建账号�
 
 ## 5. 请求构造与流解析
 
+### 5.0 凭证的跨层传输（新增事件通道）
+
+**这是实现 §3 数据模型时暴露的一个缺口，必须在动手前定案。**
+
+`accumulate_stream`（`yi-agent-core/src/provider.rs:191`）是**唯一**从 `ProviderEvent`
+流构造 `Vec<ContentBlock>` 的地方——`AgentEvent` 只影响展示，不参与会话历史。因此
+凭证要进入 `Message.content`，**必须经由 `ProviderEvent` 传输**。
+
+而现有的事件形状不够用：
+
+```rust
+ProviderEvent::ReasoningDelta { text: String, kind: ReasoningKind }
+```
+
+它只携带展示用的明文，**没有凭证的位置**。有两种做法：
+
+- **(A) 给 `ReasoningDelta` 加凭证字段** —— 否决。
+- **(B) 凭证走独立的块级事件** —— 采纳。
+
+**采纳 (B) 的理由**（与 §1.3 铁律一致）：
+
+1. **语义不同**：`ReasoningDelta` 的契约是「归一化的思维链增量，两个端点都映射到它」
+   （`provider.rs:118`），是**展示**通道；凭证是**协议**数据。
+2. **粒度不同**：明文是逐 delta 流式的，凭证是**块级**的——Anthropic 的 signature
+   在块结束（`content_block_stop`）才完整；DeepSeek 的 `reasoning_content` 属于整条
+   assistant 消息，**根本不是块**。把这两种粒度塞进同一个 delta 事件会立刻自相矛盾。
+3. **`accumulate_stream` 需要原子地构造 `ContentBlock::Thinking`**（块级操作），
+   而不是从流式片段里重组。
+
+**新增事件**
+
+```rust
+/// 一个完整的、携带凭证的思考块。块级（非流式）。
+///
+/// 与 `ReasoningDelta`（展示通道）严格分离：本事件是协议数据，用于构造
+/// `ContentBlock::Thinking` 并参与上下文回传。两者互不替代——
+/// `display:"omitted"` 时只有本事件、没有 `ReasoningDelta`。
+ThinkingBlock {
+    /// 明文摘要（可为空串）。
+    text: String,
+    /// 凭证形态。
+    token: ThinkingToken,
+},
+```
+
+`ThinkingToken` 定义在 `yi-agent-core`（`message.rs`），`ProviderEvent` 引用它即可，
+无循环依赖。
+
+**`accumulate_stream` 的处理**：收到 `ThinkingBlock` 时 `content.push(ContentBlock::Thinking{..})`，
+并**照常转发**给 `on_event`（供需要完整块的上层使用）。
+
+**各 provider 的事件产出时机**
+
+| Provider | 产出时机 | 依据 |
+|---|---|---|
+| Anthropic 明文 thinking | `content_block_stop` | signature 到块结束才完整，必须等 |
+| Anthropic redacted | `content_block_stop` | 与上同理，统一在块结束产出 |
+| DeepSeek chat | 该次流**结束时**，且非空 | `reasoning_content` 属整条消息，非块 |
+| OpenAI Responses | reasoning item 的 `output_item.done` | 与 function_call 的现有处理对称 |
+
+**反向映射**：`AgentEvent::ReasoningDelta` 保持现状（仅展示），**不**新增对应的
+AgentEvent。上层若需了解块已产生，可从 `ContentBlock` 读取。
+
 ### 5.1 Anthropic 请求侧
 
 **前置改动（§1.4）**：为 Anthropic 路径提供 `max_tokens` 默认值。默认值应足够容纳
@@ -261,18 +324,22 @@ ContentBlock::Thinking { text, token } =>
 
 | SSE 事件 | 处理 |
 |---|---|
-| `content_block_start` with `type:"thinking"` | 开启 thinking 块（记 index → 块类型） |
-| `content_block_start` with `type:"redacted_thinking"` | 开启 redacted 块 |
-| `content_block_delta` with `thinking_delta` | 累积明文；emit `ProviderEvent::ReasoningDelta{kind:Summary}` |
-| `content_block_delta` with `signature_delta` | **累积 signature 片段** |
-| `content_block_stop`（thinking 类块） | 产出 `ContentBlock::Thinking` |
+| `content_block_start` with `type:"thinking"` | 开启 thinking 块（记 index → 块类型 + 累积缓冲） |
+| `content_block_start` with `type:"redacted_thinking"` | 开启 redacted 块，其 `data` 在此一次性给出 |
+| `content_block_delta` with `thinking_delta` | 累积明文到缓冲；emit `ReasoningDelta{kind:Summary}`（展示） |
+| `content_block_delta` with `signature_delta` | **累积 signature 片段到缓冲** |
+| `content_block_stop`（thinking 类块） | 产出 `ThinkingBlock{text, token}`（见 §5.0）——signature 至此才完整 |
 
 **最高风险点**：signature 通过 `signature_delta` **分段流式**到达，必须完整拼接。
 少一段即回传失败（且失败形态可能是 400 或静默失效）。**需要针对分段 signature 的
 专门测试**，包括 signature 被切成多片、以及 thinking 块出现在 tool_use 之前的顺序。
 
+**为什么在 `content_block_stop` 才产出**：signature 是分片的，块进行中它不完整；
+过早产出 `ThinkingBlock` 会回传残缺凭证。这与 §5.0 的"块级、非流式"契约一致。
+
 **redacted 处理**：`redacted_thinking` 块的 `data` 在 `content_block_start` 里一次
-给出（非 delta），直接落 `ThinkingToken::Redacted`。
+给出（非 delta）。缓冲它，同样在 `content_block_stop` 产出
+`ThinkingBlock{text:"", token:Redacted(data)}`，与其他块走同一条产出路径。
 
 **stop_reason**：现有映射表已含 `"max_tokens"`；新增 `"model_context_window_exceeded"`
 若出现则需归类（先归 `Other`，实测后调整）。
