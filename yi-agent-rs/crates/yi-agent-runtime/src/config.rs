@@ -238,7 +238,7 @@ impl RuntimeConfig {
         };
 
         let default_api_url = match provider.as_str() {
-            "openai" => "https://api.openai.com",
+            "openai" => "https://api.openai.com/v1",
             _ => "https://api.anthropic.com",
         };
         let default_model = match provider.as_str() {
@@ -949,7 +949,7 @@ mod tests {
         };
         let config = RuntimeConfig::load(&overrides).unwrap();
         assert_eq!(config.provider, "openai");
-        assert_eq!(config.api_url, "https://api.openai.com");
+        assert_eq!(config.api_url, "https://api.openai.com/v1");
         assert_eq!(config.model, "gpt-4o");
     }
 

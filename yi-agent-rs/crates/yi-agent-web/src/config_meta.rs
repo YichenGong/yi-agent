@@ -91,7 +91,7 @@ pub static ALL_VARS: &[VarMeta] = &[
     },
     VarMeta {
         key: "OPENAI_BASE_URL",
-        default: Some("https://api.openai.com"),
+        default: Some("https://api.openai.com/v1"),
         var_type: VarType::Text,
         group: "Model Provider",
         description: "OpenAI API base URL",

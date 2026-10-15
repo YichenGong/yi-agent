@@ -44,7 +44,7 @@ describe("OnboardingWizard", () => {
     expect(call).toHaveBeenCalledWith("onboarding/apply", {
       provider: "openai",
       model: "gpt-4o",
-      api_url: "https://api.openai.com",
+      api_url: "https://api.openai.com/v1",
       api_key: "sk-x",
     });
   });
