@@ -1166,4 +1166,36 @@ mod tests {
         // blacklisted commands resolve as Deny instead of blocking forever.
         assert!(b.decision_tx.is_none(), "auto-allow exposes no sender");
     }
+
+    /// 回归锁定（非 RED→GREEN）：`max_tokens` 是 Anthropic Messages API 的**必填**
+    /// 字段，缺席会被判 400。Task 4 已在 `From<GenParams> for AnthropicGenParams`
+    /// 里用 `DEFAULT_ANTHROPIC_MAX_TOKENS` 兜底，本测试只是钉住该不变量，防止日后
+    /// 有人把兜底误改回直接透传 `None`。故此处没有失败阶段，也没有生产代码改动。
+    #[test]
+    fn anthropic_gen_params_always_carry_max_tokens() {
+        let params = yi_agent_core::GenParams::default();
+        let anthropic: yi_agent_llm::anthropic::types::AnthropicGenParams = params.into();
+        assert!(
+            anthropic.max_tokens.is_some(),
+            "max_tokens 是 Anthropic 必填字段，转换后绝不为 None"
+        );
+    }
+
+    /// 上一条只钉住「不为 `None`」，这条钉住「缺席时落到哪个值」：`GenParams` 显式
+    /// 给 `None` 时，转换后必须是 `DEFAULT_ANTHROPIC_MAX_TOKENS`，而不是任意>0 的
+    /// 数字。定值断言比 `is_some()` 更紧，能挡住「兜底名存实亡、换了个魔法数」的
+    /// 回归。
+    #[test]
+    fn anthropic_gen_params_fallback_to_default_max_tokens() {
+        let params = yi_agent_core::GenParams {
+            max_tokens: None,
+            ..Default::default()
+        };
+        let anthropic: yi_agent_llm::anthropic::types::AnthropicGenParams = params.into();
+        assert_eq!(
+            anthropic.max_tokens,
+            Some(yi_agent_llm::anthropic::types::DEFAULT_ANTHROPIC_MAX_TOKENS),
+            "未指定 max_tokens 时必须落到 DEFAULT_ANTHROPIC_MAX_TOKENS"
+        );
+    }
 }
