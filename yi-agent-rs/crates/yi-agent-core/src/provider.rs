@@ -307,6 +307,14 @@ where
                 on_event(ProviderEvent::ReasoningDelta { text, kind });
             }
             ProviderEvent::ThinkingBlock { text, token } => {
+                // Flush any buffered text first, mirroring the ToolUseStart
+                // drain: a block-level event must not jump ahead of text that
+                // arrived before it, or wire order within `content` differs
+                // from the stream order (e.g. Text("a") -> Thinking -> Text("b")
+                // must yield [Text("a"), Thinking, Text("b")]).
+                if !current_text.is_empty() {
+                    content.push(ContentBlock::Text(std::mem::take(&mut current_text)));
+                }
                 // 块级协议数据：原子地进入 assistant content，同时转发。
                 // 与 ReasoningDelta 不同，本事件**参与**上下文回传。
                 content.push(crate::message::ContentBlock::Thinking {
@@ -1156,6 +1164,43 @@ mod tests {
                 ProviderEvent::ThinkingBlock { text, .. } if text == "summary"
             )),
             "the thinking block must also be forwarded to on_event"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_block_after_text_delta_preserves_wire_order() {
+        use crate::message::{ContentBlock, ThinkingToken};
+        // Interleaved stream: text arrives, then a block-level thinking block,
+        // then more text. Because `TextDelta` buffers into `current_text`, the
+        // `ThinkingBlock` arm must drain that buffer before pushing, otherwise
+        // the thinking block jumps ahead of the text that preceded it on the wire.
+        let stream = futures::stream::iter(vec![
+            ProviderEvent::TextDelta("a".into()),
+            ProviderEvent::ThinkingBlock {
+                text: "t".into(),
+                token: ThinkingToken::Signature("sig".into()),
+            },
+            ProviderEvent::TextDelta("b".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ])
+        .boxed();
+
+        let (content, _end, _) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+
+        assert_eq!(
+            content,
+            vec![
+                ContentBlock::Text("a".into()),
+                ContentBlock::Thinking {
+                    text: "t".into(),
+                    token: ThinkingToken::Signature("sig".into())
+                },
+                ContentBlock::Text("b".into()),
+            ],
+            "wire order must be preserved: text buffered before the thinking block \
+             must be flushed first, not coalesced after it"
         );
     }
 }
