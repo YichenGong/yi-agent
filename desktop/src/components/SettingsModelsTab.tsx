@@ -59,6 +59,15 @@ const EMPTY: ModelList = {
 /** 「跟随全局默认」哨兵值：模型名不可能是空串（宿主拒绝空名），故 `""` 安全。 */
 const FOLLOW_GLOBAL = "";
 
+/**
+ * openai 兼容网关的地址通常以 `/v1` 结尾。这里只做启发式提醒，不下硬结论：
+ * 含 `/v1` 前缀（如 `/openai/v1`）即视为无虞，无法判断的（如 `/api`）宁可少提示。
+ */
+function suspectsMissingV1(entry: ModelEntryView): boolean {
+  if (entry.provider !== "openai") return false;
+  return !entry.api_url.trimEnd().replace(/\/+$/, "").endsWith("/v1");
+}
+
 /** 把写失败翻成一句给人看的话；「模型不存在」单列，因为它对应的是「被删了」。 */
 function saveErrorText(error: unknown): string {
   if (isModelNotFound(error)) return "模型不存在，可能已被删除";
@@ -345,7 +354,14 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
                 <td className="py-1.5 pr-2 text-fg">{entry.name}</td>
                 <td className="py-1.5 pr-2 text-fg-muted">{entry.provider}</td>
                 <td className="py-1.5 pr-2 text-fg-muted">{entry.model}</td>
-                <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">{entry.api_url}</td>
+                <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">
+                  {entry.api_url}
+                  {suspectsMissingV1(entry) && (
+                    <span className="ml-2 font-sans text-fg-muted">
+                      （OpenAI 兼容接口地址通常以 /v1 结尾，请确认）
+                    </span>
+                  )}
+                </td>
                 {/* key 只以掩码示人：原始值从不经过桌面端。 */}
                 <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">
                   {entry.has_key ? entry.api_key_masked : "未设置"}

@@ -404,4 +404,27 @@ describe("SettingsModelsTab channel fields", () => {
     expect(params).not.toHaveProperty("api_style");
     expect(params).not.toHaveProperty("reasoning_effort");
   });
+
+  it("hints when an openai url does not end with /v1", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list"
+        ? {
+            models: [
+              { name: "suspect", provider: "openai", api_url: "https://llmapi.horizon.auto", model: "m", has_key: true, api_key_masked: "••••1" },
+              { name: "ok", provider: "openai", api_url: "https://llmapi.horizon.auto/v1", model: "m", has_key: true, api_key_masked: "••••2" },
+              { name: "anth", provider: "anthropic", api_url: "https://llmapi.horizon.auto", model: "m", has_key: true, api_key_masked: "••••3" },
+            ],
+            default_model: null,
+            subagent_model: null,
+            effective: null,
+          }
+        : {},
+    );
+    render(<SettingsModelsTab call={call} />);
+    // 模型名在两处渲染（表格单元格 + 默认/子代理的下拉选项），故限定在单元格里等。
+    await screen.findByText("suspect", { selector: "td" });
+
+    // 只有 suspect 该被标出；ok（含 /v1）与 anth（anthropic）不提示。
+    expect(await screen.findAllByText(/以 \/v1 结尾/)).toHaveLength(1);
+  });
 });
