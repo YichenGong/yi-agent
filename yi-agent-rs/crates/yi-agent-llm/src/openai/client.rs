@@ -14,7 +14,9 @@ use yi_agent_core::{
 };
 
 use crate::openai::channel::{Channel, ChannelCache, looks_like_missing_route};
-use crate::openai::error::{is_effort_rejection, map_status_error_from};
+use crate::openai::error::{
+    is_effort_rejection, is_transient_gateway_rejection, map_status_error_from,
+};
 use crate::openai::responses::stream::ResponsesStream;
 use crate::openai::responses::types::responses_request_from;
 use crate::openai::stream::OpenaiStream;
@@ -23,13 +25,23 @@ use crate::openai::types::OpenaiRequest;
 const DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
+/// 「网关瞬时拒绝」时的重投次数（首次之外）。
+const TRANSIENT_RETRY_ATTEMPTS: u32 = 2;
+/// 首次重投前的等待；随后指数退避（`base * 2^(attempt-1)`）。
+const TRANSIENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+
 #[cfg(test)]
 mod tests {
-    use super::DEFAULT_TIMEOUT_SECS;
+    use super::{DEFAULT_TIMEOUT_SECS, TRANSIENT_RETRY_ATTEMPTS};
 
     #[test]
     fn default_stream_timeout_is_five_minutes() {
         assert_eq!(DEFAULT_TIMEOUT_SECS, 300);
+    }
+
+    #[test]
+    fn transient_rejection_retry_budget_is_bounded() {
+        assert_eq!(TRANSIENT_RETRY_ATTEMPTS, 2);
     }
 }
 
@@ -224,10 +236,33 @@ impl OpenaiProvider {
         tracing::info!(provider = "openai", model = %model, msg_count, ?channel, "sending request");
 
         let body = channel_body(channel, req).map_err(PostError::Transport)?;
-        let (status, body_text) = match self.post_channel(channel, &body).await {
-            Ok(stream) => return Ok(stream),
-            Err(PostError::Transport(e)) => return Err(PostError::Transport(e)),
-            Err(PostError::Status(status, body_text)) => (status, body_text),
+        let mut attempt: u32 = 0;
+        let (status, body_text) = loop {
+            match self.post_channel(channel, &body).await {
+                Ok(stream) => return Ok(stream),
+                Err(PostError::Transport(e)) => return Err(PostError::Transport(e)),
+                Err(PostError::Status(status, body_text)) => {
+                    // 网关内部组件瞬间拒绝了这次请求（无可指认字段）：body 本身没有
+                    // 可修之处，原样重投才是正解；退避后重试是有界的，耗尽即按原样上抛。
+                    if attempt < TRANSIENT_RETRY_ATTEMPTS
+                        && is_transient_gateway_rejection(status, &body_text)
+                    {
+                        attempt += 1;
+                        let delay = TRANSIENT_RETRY_BASE_DELAY * 2u32.pow(attempt - 1);
+                        tracing::warn!(
+                            provider = "openai",
+                            status,
+                            attempt,
+                            max = TRANSIENT_RETRY_ATTEMPTS,
+                            delay_ms = delay.as_millis() as u64,
+                            "gateway transiently rejected the request; retrying unchanged"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    break (status, body_text);
+                }
+            }
         };
 
         let missing_route = channel == Channel::Responses
