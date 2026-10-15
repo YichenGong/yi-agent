@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 
 use yi_agent_core::provider::TokenUsage;
-use yi_agent_core::{ProviderError, ProviderEvent, StopReason};
+use yi_agent_core::{ProviderError, ProviderEvent, ReasoningKind, StopReason};
 
 struct SseFrame {
     data: String,
@@ -95,6 +95,8 @@ pub struct OpenaiStream<S> {
     pending_tool_calls: HashMap<usize, PendingToolCall>,
     /// Whether a Stop event has already been emitted (from finish_reason or [DONE]).
     stopped: bool,
+    /// 累积本条消息的 `reasoning_content`（DeepSeek 属整条消息，非块）。
+    reasoning_buffer: String,
 }
 
 impl<S> OpenaiStream<S>
@@ -109,6 +111,7 @@ where
             pending_events: VecDeque::new(),
             pending_tool_calls: HashMap::new(),
             stopped: false,
+            reasoning_buffer: String::new(),
         }
     }
 
@@ -206,9 +209,17 @@ where
                 return Ok(vec![]);
             }
             self.stopped = true;
-            return Ok(vec![ProviderEvent::Stop {
+            let mut events = vec![ProviderEvent::Stop {
                 reason: StopReason::EndTurn,
-            }]);
+            }];
+            // 流结束：整条消息的 reasoning 汇总为一个块（DeepSeek 的粒度是消息级）。
+            if !self.reasoning_buffer.is_empty() {
+                events.push(ProviderEvent::ThinkingBlock {
+                    text: std::mem::take(&mut self.reasoning_buffer),
+                    token: yi_agent_core::ThinkingToken::None,
+                });
+            }
+            return Ok(events);
         }
 
         if let Some(rest) = frame.data.strip_prefix("{\"__parse_error\":") {
@@ -275,6 +286,18 @@ where
                 // reply.
                 if !self.stopped {
                     if let Some(delta) = choice.get("delta") {
+                        if let Some(reasoning) =
+                            delta.get("reasoning_content").and_then(Value::as_str)
+                        {
+                            if !reasoning.is_empty() {
+                                self.reasoning_buffer.push_str(reasoning);
+                                events.push(ProviderEvent::ReasoningDelta {
+                                    text: reasoning.to_string(),
+                                    kind: ReasoningKind::Content,
+                                });
+                            }
+                        }
+
                         if let Some(content) = delta.get("content").and_then(Value::as_str) {
                             if !content.is_empty() {
                                 events.push(ProviderEvent::TextDelta(content.to_string()));
@@ -325,6 +348,15 @@ where
                     }
                 }
             }
+        }
+
+        // 流结束：整条消息的 reasoning 汇总为一个块（DeepSeek 的粒度是消息级）。
+        // 两处（finish_reason 与 [DONE]）都用 `mem::take`——先到者清空缓冲，后者成为空操作。
+        if self.stopped && !self.reasoning_buffer.is_empty() {
+            events.push(ProviderEvent::ThinkingBlock {
+                text: std::mem::take(&mut self.reasoning_buffer),
+                token: yi_agent_core::ThinkingToken::None,
+            });
         }
 
         Ok(events)
@@ -769,5 +801,40 @@ mod tests {
             events
         );
         assert!(matches!(events.last(), Some(ProviderEvent::Stop { .. })));
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_is_parsed_as_thinking_block() {
+        let body = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"step \"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"one\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_events(vec![bytes.as_slice()])
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let deltas: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ReasoningDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["step ", "one"], "展示通道按增量产出");
+
+        let block = events.iter().find_map(|e| match e {
+            ProviderEvent::ThinkingBlock { text, token } => Some((text.clone(), token.clone())),
+            _ => None,
+        });
+        let (text, token) = block.expect("stream end must emit one ThinkingBlock");
+        assert_eq!(
+            text, "step one",
+            "整条消息的 reasoning_content 汇总为一个块"
+        );
+        assert_eq!(token, yi_agent_core::ThinkingToken::None, "DeepSeek 无凭证");
     }
 }
