@@ -7,6 +7,7 @@ pub mod message;
 pub mod permission;
 pub mod provider;
 pub mod subagent;
+pub mod thinking;
 pub mod title;
 pub mod tool;
 
@@ -29,6 +30,7 @@ pub use subagent::task::{
     AgentTask, AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskDepth, TaskEvent,
     TaskId, TaskState,
 };
+pub use thinking::{message_has_tool_use, strip_thinking, strip_thinking_except_last_assistant};
 pub use title::{
     TITLE_INSTRUCTIONS, TITLE_MATERIAL_SIDE_CHARS, TITLE_MAX_CHARS, build_title_material,
     generate_title, sanitize_title,
