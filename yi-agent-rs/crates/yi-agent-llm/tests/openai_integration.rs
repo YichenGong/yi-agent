@@ -36,7 +36,7 @@ data: [DONE]\n\n";
 
 fn provider_for(server: &MockServer) -> OpenaiProvider {
     OpenaiProvider::new(OpenaiProviderOpts {
-        base_url: Some(server.uri()),
+        base_url: Some(format!("{}/v1", server.uri())),
         api_key: Some("test-key".to_string()),
         timeout: Some(Duration::from_secs(5)),
         ..Default::default()
@@ -49,7 +49,7 @@ fn provider_for(server: &MockServer) -> OpenaiProvider {
 /// an extra event.
 fn chat_provider_for(server: &MockServer) -> OpenaiProvider {
     OpenaiProvider::new(OpenaiProviderOpts {
-        base_url: Some(server.uri()),
+        base_url: Some(format!("{}/v1", server.uri())),
         api_key: Some("test-key".to_string()),
         timeout: Some(Duration::from_secs(5)),
         api_style: Some("chat".to_string()),
@@ -313,7 +313,7 @@ async fn trims_trailing_slash_in_base_url() {
         .await;
 
     let provider = OpenaiProvider::new(OpenaiProviderOpts {
-        base_url: Some(format!("{}/", server.uri())),
+        base_url: Some(format!("{}/v1/", server.uri())),
         api_key: Some("test-key".to_string()),
         timeout: Some(Duration::from_secs(5)),
         ..Default::default()
@@ -524,7 +524,7 @@ async fn chat_request_carries_reasoning_effort_when_set() {
         .mount(&server)
         .await;
     let provider = OpenaiProvider::new(OpenaiProviderOpts {
-        base_url: Some(server.uri()),
+        base_url: Some(format!("{}/v1", server.uri())),
         api_key: Some("k".into()),
         timeout: Some(Duration::from_secs(5)),
         api_style: Some("chat".into()),
@@ -551,7 +551,7 @@ async fn chat_request_omits_reasoning_effort_when_unset() {
         .mount(&server)
         .await;
     let provider = OpenaiProvider::new(OpenaiProviderOpts {
-        base_url: Some(server.uri()),
+        base_url: Some(format!("{}/v1", server.uri())),
         api_key: Some("k".into()),
         timeout: Some(Duration::from_secs(5)),
         api_style: Some("chat".into()),

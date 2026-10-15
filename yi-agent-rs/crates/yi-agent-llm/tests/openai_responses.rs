@@ -33,7 +33,7 @@ fn simple_request() -> ProviderRequest {
 
 fn provider_with_style(server: &MockServer, style: &str) -> OpenaiProvider {
     OpenaiProvider::new(OpenaiProviderOpts {
-        base_url: Some(server.uri()),
+        base_url: Some(format!("{}/v1", server.uri())),
         api_key: Some("k".into()),
         timeout: Some(Duration::from_secs(5)),
         api_style: Some(style.into()),
@@ -48,7 +48,7 @@ fn provider_with_style_and_effort(
     effort: &str,
 ) -> OpenaiProvider {
     OpenaiProvider::new(OpenaiProviderOpts {
-        base_url: Some(server.uri()),
+        base_url: Some(format!("{}/v1", server.uri())),
         api_key: Some("k".into()),
         timeout: Some(Duration::from_secs(5)),
         api_style: Some(style.into()),
