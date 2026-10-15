@@ -606,10 +606,13 @@ impl AgentSupervisor {
 
     /// Quarantines one worker at an ambiguous durable-delivery boundary. The
     /// message may be offered again only through the explicit recovery gate.
+    ///
+    /// `_message_ids` names the ambiguous messages for callers; the mailbox no
+    /// longer carries in-memory delivery state, so nothing is mutated here.
     pub fn interrupt_worker_for_recovery(
         &mut self,
         task_id: &TaskId,
-        message_ids: &[super::task::MessageId],
+        _message_ids: &[super::task::MessageId],
         evidence: impl Into<String>,
     ) -> Result<(), String> {
         self.workers
@@ -629,13 +632,6 @@ impl AgentSupervisor {
                 evidence: RecoveryEvidence(evidence.into()),
             },
         )?;
-        let mailbox = self
-            .mailboxes
-            .get_mut(task_id)
-            .expect("task mailbox is created with task");
-        for message_id in message_ids {
-            mailbox.mark_pending_for_worker(message_id);
-        }
         self.workers.remove(task_id);
         self.worker_message_capabilities.remove(task_id);
         self.notify_update();
@@ -736,13 +732,6 @@ impl AgentSupervisor {
         };
         self.worker_message_capabilities
             .insert(task_id.clone(), message_capability);
-        for (id, _) in initial_user_messages {
-            let mailbox = self
-                .mailboxes
-                .get_mut(task_id)
-                .expect("task mailbox is created with task");
-            mailbox.mark_delivered_to_worker(&id);
-        }
         self.workers.insert(task_id.clone(), handle);
         Ok(())
     }
@@ -771,7 +760,8 @@ impl AgentSupervisor {
 
     /// Applies worker facts through the task reducer and discards handles for
     /// terminal tasks. A normal model completion without a structured delivery
-    /// is intentionally a failure: coding completion requires review evidence.
+    /// is intentionally not a coding completion: a coding child finishes only
+    /// by delivering a validated commit.
     pub fn reconcile_worker_events(&mut self) -> Result<Vec<TaskId>, String> {
         let events = self
             .workers
@@ -1387,8 +1377,8 @@ impl AgentSupervisor {
     }
 
     /// Restores or stages an already-authorized durable mailbox fact. This is
-    /// reserved for runtime hydration/review transactions and deliberately
-    /// does not weaken ordinary live sender, adjacency, or terminal checks.
+    /// reserved for runtime hydration transactions and deliberately does not
+    /// weaken ordinary live sender, adjacency, or terminal checks.
     pub fn stage_persisted_message(
         &mut self,
         draft: MailboxMessageDraft,
@@ -1421,10 +1411,6 @@ impl AgentSupervisor {
                 id: message_id.clone(),
                 body,
             });
-            self.mailboxes
-                .get_mut(recipient)
-                .expect("recipient mailbox was checked")
-                .mark_delivered_to_worker(message_id);
         }
         self.notify_update();
         Ok(())
@@ -1575,10 +1561,6 @@ impl AgentSupervisor {
                 id: receipt.message_id.clone(),
                 body: message,
             });
-            self.mailboxes
-                .get_mut(&recipient)
-                .expect("task mailbox is created with task")
-                .mark_delivered_to_worker(&receipt.message_id);
         }
         self.notify_update();
         Ok(())

@@ -1,6 +1,6 @@
 //! Application-owned construction for daemon subagent workers, plus the client
 //! half of the local runtime: attaching an application root and giving it the
-//! six delegation tools.
+//! five delegation tools.
 //!
 //! The TUI and the desktop app-server both drive the same daemon contract, so
 //! both build their runtime wiring here rather than each keeping a copy.
@@ -1344,7 +1344,7 @@ pub struct AttachedRoot {
     pub workspace: WorkerWorkspace,
 }
 
-/// Adds the six delegation tools to a root agent's registry.
+/// Adds the five delegation tools to a root agent's registry.
 pub fn register_attached_root_tools(
     registry: &mut ToolRegistry,
     root: Arc<crate::thread_root::ThreadRoot>,
@@ -2466,6 +2466,11 @@ mod tests {
                 "the recovery preflight must know {expected}, got {names:?}"
             );
         }
+        // 交付即完成：恢复预检同样不得再暴露已下线的 review 工具。
+        assert!(
+            !names.contains(&"review_agent".to_string()),
+            "the recovery preflight must not know review_agent: delivery is terminal, integration is the parent's own git action, got {names:?}"
+        );
     }
 
     #[tokio::test]
