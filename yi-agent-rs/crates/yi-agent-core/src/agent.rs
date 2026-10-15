@@ -270,11 +270,26 @@ pub enum AgentEvent {
         model: String,
         usage: TokenUsage,
     },
-    /// Streamed chain-of-thought delta for display only; never merged into the
-    /// assistant content or replayed into later turns.
+    /// Streamed chain-of-thought delta for display only, emitted incrementally so
+    /// a client can render CoT live. Deliberately NOT merged into the assistant
+    /// content: this is the display channel, not the credential path.
+    ///
+    /// The block-level credential travels separately via
+    /// [`AgentEvent::ThinkingBlock`]. Since the thinking block became part of the
+    /// assistant content (Task 2), that credential IS replayed into later turns —
+    /// this display-only delta is not.
     ReasoningDelta {
         text: String,
         kind: ReasoningKind,
+    },
+    /// 一个完整的、携带凭证的思考块。块级（非流式）。
+    ///
+    /// 与 [`AgentEvent::ReasoningDelta`]（仅展示的增量）不同：本事件对应
+    /// `ContentBlock::Thinking`，**已经在 `accumulate_stream` 里进入 assistant
+    /// content / session**（故会随下一次请求回传）。app-server 据此产出展示条目。
+    ThinkingBlock {
+        text: String,
+        token: crate::message::ThinkingToken,
     },
     /// Non-fatal runtime notice (channel fallback / effort downgrade), rendered at
     /// status-line level.
@@ -1620,6 +1635,9 @@ async fn accumulate_provider_stream(
             ProviderEvent::ReasoningDelta { text, kind } => {
                 let _ = tx.try_send(AgentEvent::ReasoningDelta { text, kind });
             }
+            ProviderEvent::ThinkingBlock { text, token } => {
+                let _ = tx.try_send(AgentEvent::ThinkingBlock { text, token });
+            }
             ProviderEvent::Notice { level, text } => {
                 let _ = tx.try_send(AgentEvent::Notice { level, text });
             }
@@ -1757,6 +1775,44 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::AssistantText(t) if t.contains("step one"))),
             "reasoning must not leak into assistant text: {events:?}"
+        );
+    }
+
+    /// The provider-level `ThinkingBlock` must survive the agent's event
+    /// translation with its credential intact.
+    ///
+    /// `ThinkingBlock` is the credential-carrying, block-level event (as opposed
+    /// to the display-only `ReasoningDelta` above). It already enters the
+    /// assistant content inside `accumulate_stream`; this test pins the *event
+    /// channel* side — core -> `AgentEvent::ThinkingBlock` — so app-server and
+    /// the TUI can observe the block. The token must arrive byte-for-byte.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_thinking_block_reaches_the_agent_stream_with_its_token() {
+        use crate::message::ThinkingToken;
+
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ThinkingBlock {
+                text: "cot summary".into(),
+                token: ThinkingToken::Signature("SIG-1".into()),
+            },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ThinkingBlock { text, token }
+                    if text == "cot summary"
+                        && *token == ThinkingToken::Signature("SIG-1".into())
+            )),
+            "the thinking block must be forwarded with its token intact, got: {events:?}"
         );
     }
 

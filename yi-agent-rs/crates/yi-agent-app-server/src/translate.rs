@@ -305,13 +305,27 @@ impl Translator {
             }
             AgentEvent::ReasoningDelta { text, kind } => {
                 // Display-only CoT. It is deliberately NOT merged into the open
-                // agent message: reasoning never enters the transcript, so a
-                // client renders it in a separate block (design §6).
+                // agent message: a client renders it in a separate block
+                // (design §6). The block-level credential is a different
+                // channel — see the `ThinkingBlock` arm below.
                 out.push(Notification::ReasoningDelta {
                     thread_id: self.thread_id.clone(),
                     text,
                     kind,
                 });
+            }
+            AgentEvent::ThinkingBlock { .. } => {
+                // 块级凭证已在 `accumulate_stream` 进入 session，并随 `TurnLine.messages`
+                // 落盘（server.rs 直接取 `agent.session().messages()`），故此处**无需**再
+                // 持久化任何东西——本任务只接入通道，不改变落盘行为。
+                //
+                // 展示也不缺：明文增量已由 `ReasoningDelta` 走
+                // `thread/reasoningDelta` 实时下发。thinking 的独立展示条目
+                // （`Item::Thinking`，**不携带凭证**）属于 Task 13。
+                //
+                // 因此本分支刻意不产出任何通知：绝不能打开/追加 agentMessage——
+                // 那会把 CoT 当答案正文（既有测试
+                // `reasoning_delta_becomes_a_reasoning_notification` 钉住了这一点）。
             }
             AgentEvent::Notice { level, text } => {
                 // A non-fatal runtime notice (channel fallback / effort
@@ -498,7 +512,7 @@ mod tests {
     use serde_json::json;
     use yi_agent_core::AgentEvent;
     use yi_agent_core::agent::{AgentError, DoneReason};
-    use yi_agent_core::message::{ImageDetail, ImageSource};
+    use yi_agent_core::message::{ImageDetail, ImageSource, ThinkingToken};
     use yi_agent_core::permission::PermissionKind;
     use yi_agent_core::provider::TokenUsage;
     use yi_agent_core::tool::ToolResult;
@@ -639,6 +653,67 @@ mod tests {
                 Notification::ItemDelta { delta, .. } if delta == " world"
             )),
             "the open agent message must keep receiving text, got {out:?}"
+        );
+    }
+
+    /// 块级凭证事件**不得**把 CoT 写进可见的 agentMessage。
+    ///
+    /// `ThinkingBlock` 携带 `ContentBlock::Thinking` 的凭证，而凭证已由
+    /// `accumulate_stream` 写进 session、随 `TurnLine.messages` 落盘
+    /// （server.rs 直接取 `agent.session().messages()`）。翻译层因此无需再
+    /// 做任何持久化——它唯一需要保证的是**不污染展示**：明文增量已由
+    /// `reasoningDelta` 走旁路，若这里再打开/追加 agentMessage，CoT 就会
+    /// 被当成答案正文（同一约束见
+    /// `reasoning_delta_becomes_a_reasoning_notification`）。
+    ///
+    /// 断言的是真实保证：不产生任何开/追加 agentMessage 的通知。它**不**断言
+    /// 通知为空——Task 13 会在此接入 `Item::Thinking`（不携带凭证）的展示条目，
+    /// 届时多出一条 thinking 通知是合法的。
+    #[test]
+    fn thinking_block_does_not_leak_into_the_visible_agent_message() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::AssistantText("hi".into()));
+        assert!(
+            out.iter()
+                .any(|n| matches!(n, Notification::ItemStarted { .. })),
+            "precondition: an agent message is open"
+        );
+
+        let out = t.on_event(AgentEvent::ThinkingBlock {
+            text: "cot summary".into(),
+            token: ThinkingToken::Signature("SIG".into()),
+        });
+        assert!(
+            !out.iter().any(|n| matches!(
+                n,
+                Notification::ItemStarted {
+                    item: Item::AgentMessage { .. },
+                    ..
+                } | Notification::ItemDelta { .. }
+                    | Notification::ItemCompleted {
+                        item: Item::AgentMessage { .. },
+                        ..
+                    }
+            )),
+            "the thinking block must not open or append the visible agent \
+             message body, got {out:?}"
+        );
+
+        // 正文仍是纯答案：把消息收尾后，完成的 agentMessage 只含答案文本。
+        let out = t.on_event(AgentEvent::Done {
+            reason: yi_agent_core::DoneReason::EndTurn,
+        });
+        let body = out.iter().find_map(|n| match n {
+            Notification::ItemCompleted {
+                item: Item::AgentMessage { text, .. },
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            body.as_deref(),
+            Some("hi"),
+            "the completed message body must be the answer alone, got {out:?}"
         );
     }
 

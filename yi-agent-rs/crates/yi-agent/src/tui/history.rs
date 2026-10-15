@@ -1041,6 +1041,10 @@ impl HistoryState {
             | AgentEvent::DecodeDelta(_) => {
                 // Not tracked in history
             }
+            // 块级凭证事件：凭证已随 session 落盘，明文增量也已由
+            // `ReasoningDelta` 累积进推理 cell（见上），故此处无需另建 cell。
+            // 独立的 thinking 展示条目属于 Task 13。
+            AgentEvent::ThinkingBlock { .. } => {}
         }
 
         self.note_content_change();
