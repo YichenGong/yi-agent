@@ -27,6 +27,9 @@ import type {
   DiffTextResult,
   Workspace,
   WorkspaceGroup,
+  ProcessInfo,
+  ProcessListResult,
+  ProcessReadResult,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
@@ -280,7 +283,16 @@ export default function App() {
   // 路径驱动——点子 agent 卡片（回到「子 agent」Tab 的轨迹）与模型推送的
   // `ui/gitDiff/focus`（切到 diff）。
   const [panelOpen, setPanelOpen] = useState(false);
-  const [detailTab, setDetailTab] = useState<"subagents" | "diff">("subagents");
+  const [detailTab, setDetailTab] = useState<"subagents" | "diff" | "processes">("subagents");
+  // 当前会话的后台进程列表与详情态。列表由 process/list 拉取、process/updated 提示
+  // 重拉；详情打开时以 500ms 增量轮询 process/read（只在详情打开期间）。
+  const [processes, setProcesses] = useState<ProcessInfo[]>([]);
+  const [openProcessId, setOpenProcessId] = useState<string | null>(null);
+  const [processOutput, setProcessOutput] = useState<{
+    stdout: string;
+    stderr: string;
+    truncated: boolean;
+  } | null>(null);
   // 会话级 diff 快照与它的加载态/提交下钻态，全部由面板消费。
   const [threadDiff, setThreadDiff] = useState<ThreadDiffResult | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
@@ -508,6 +520,47 @@ export default function App() {
     if (status === "connected") cachedAt.current.clear();
   }, [status]);
 
+  // 进程详情打开期间，以 500ms 增量拉取 stdout/stderr；关闭或终态即停。
+  // 光标是本次订阅的局部量，进程/会话一变就随 effect 重建。
+  useEffect(() => {
+    if (!currentId || !openProcessId) return;
+    const c = clientRef.current;
+    if (!c) return;
+    let cursor = 0;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const tick = async () => {
+      try {
+        const r = await c.request<ProcessReadResult>("process/read", {
+          thread_id: currentId,
+          process_id: openProcessId,
+          cursor,
+        });
+        if (cancelled) return;
+        cursor = r.next_cursor;
+        setProcessOutput({
+          stdout: r.stdout,
+          stderr: r.stderr,
+          truncated: r.truncated,
+        });
+        // 终态即停:不再有新增输出,退出码已经由列表侧展示。
+        const state = r.status?.state;
+        if (state === "exited" || state === "killed" || state === "failed_to_start") {
+          return;
+        }
+      } catch {
+        // 读失败(例如进程刚被移除):不打断 UI,等下一次 tick 或用户关闭。
+      }
+      if (!cancelled) timer = window.setTimeout(tick, 500);
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [currentId, openProcessId]);
+
   // 页面隐藏 / 卸载时把在途的会话内容立刻写盘：手机切后台后可能很久不再执行
   // 定时器，等着防抖会把最后一段内容丢掉。
   useEffect(() => {
@@ -701,6 +754,27 @@ export default function App() {
   };
 
   /**
+   * 取某对话当前的后台进程列表。
+   *
+   * 失败即放弃:与子 agent 暂留区同类,附属视图读不到就保持上一次的值(或空),
+   * 绝不因为它把对话打断。未知 thread 服务端返回空表,不会走到 catch。
+   */
+  const refreshProcesses = async (threadId: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      const r = await c.request<ProcessListResult>("process/list", { thread_id: threadId });
+      // 只写当前对话:后台 thread 的状态通知不应改到用户正在看的这一列。
+      if (store.currentId === threadId) {
+        setProcesses(r.processes);
+        force((v) => v + 1);
+      }
+    } catch {
+      // 附属视图:读失败不改动已有内容。
+    }
+  };
+
+  /**
    * 丢掉会话级 diff 的全部状态。
    *
    * diff 是**有主**的（属于某条会话），凡是「当前会话变了」或「会话没了」都必须
@@ -752,6 +826,11 @@ export default function App() {
     force((v) => v + 1);
     // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
     void refreshSubagents(id);
+    // 该对话的后台进程:重进对话时重新拉取。
+    void refreshProcesses(id);
+    // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
+    setOpenProcessId(null);
+    setProcessOutput(null);
     // Remote-only (S2): keep this thread in the warm subscription window, and
     // catch up a cold-but-running thread with the read-only `thread/readItems`
     // instead of `thread/resume` — resume interrupts the in-flight turn, which
@@ -1278,6 +1357,11 @@ export default function App() {
           setTraceRows((prev) =>
             n.params.taskId === openTaskId.current ? [...prev, n.params.row] : prev,
           );
+          return;
+        }
+        if (n.method === "process/updated") {
+          // 通知只是"该重拉了":它不携带权威数据,重拉 process/list 才是。
+          void refreshProcesses(n.params.thread_id);
           return;
         }
         // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
@@ -2154,6 +2238,11 @@ export default function App() {
               setDetailTab(t);
               // 切到 diff 就取一份当前快照；轨迹侧的行由 openDetail/watch 维护。
               if (t === "diff") void loadThreadDiff(currentId, diffBase);
+              // 切走进程 tab 即离开当前进程详情:留着会让详情盖住别的 tab 的列表。
+              if (t !== "processes") {
+                setOpenProcessId(null);
+                setProcessOutput(null);
+              }
             }}
             onClose={() => {
               setPanelOpen(false);
@@ -2207,6 +2296,30 @@ export default function App() {
               onRefresh: () => void loadThreadDiff(currentId, diffBase),
               onOpenCommit: (sha) => void openCommit(currentId, sha),
               onCloseCommit: () => setActiveCommit(null),
+            }}
+            processProps={{
+              processes,
+              selectedProcessId: openProcessId,
+              onOpenProcess: (processId) => {
+                setOpenProcessId(processId);
+                setProcessOutput(null);
+              },
+              onCloseProcess: () => {
+                setOpenProcessId(null);
+                setProcessOutput(null);
+              },
+              output: processOutput,
+              onKill: async () => {
+                try {
+                  await clientRef.current?.request("process/kill", {
+                    thread_id: currentId,
+                    process_id: openProcessId,
+                  });
+                } finally {
+                  // 无论成败都重拉:失败时列表会保持原状态,不留下假象。
+                  await refreshProcesses(currentId);
+                }
+              },
             }}
             isMobile={isMobile}
           />
