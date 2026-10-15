@@ -2,6 +2,8 @@ import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "../lib/protocol";
 import { basename, groupCount } from "../lib/workspaceGroups";
 import { kanbanItemFor } from "../lib/boardIndex";
+import { useSpinPhase } from "../lib/useSpinPhase";
+import { supportsWaapi } from "../lib/spinPhase";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
 import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
@@ -18,43 +20,60 @@ function unreadDotClass(status: TurnStatus): string {
 /**
  * The per-thread status badge.
  *
- * `running` and `awaiting_approval` must render the *same* element. The server
- * flips a thread through running → awaiting_approval → running once per
- * permission prompt; two mutually exclusive elements would unmount/remount the
- * node on every flip, restarting the CSS animation from `currentTime = 0`. That
- * restart is what makes the spinner look like it "plays a short segment then
- * loops". One span, class-only variation, keeps the animation timeline intact.
+ * Two independent restart hazards, both now handled:
+ *
+ * 1. **Status flips** (running → awaiting_approval → running once per permission
+ *    prompt): handled by rendering the *same* element in both states instead of
+ *    two mutually exclusive ones.
+ * 2. **Row reorders**: the sidebar list is server-sorted by `updated_at` desc, so
+ *    whenever any thread's `updated_at` bumps (another thread finishes a turn,
+ *    gets renamed, changes model, …) this row is *moved* in the DOM — React
+ *    applies a keyed reorder as `insertBefore` on a mounted node. A CSS animation
+ *    restarts from `currentTime = 0` on any such move, which snaps the ring back
+ *    to 12 o'clock: the visible "回退". Preserving the node's *identity* does not
+ *    help (identity is kept, the timeline still resets).
+ *
+ * So the rotation is driven by the **Web Animations API** via `useSpinPhase`
+ * instead of the CSS `animate-spin`: a WAAPI animation is tied to the element and
+ * does *not* restart on a DOM move, and its phase is anchored to the wall clock,
+ * so even a genuine remount resumes in phase. `animate-spin` is kept on the class
+ * only as a fallback for environments without WAAPI (e.g. jsdom); where WAAPI
+ * exists it wins the cascade for `transform`.
  *
  * `memo` compares the semantic status only: `App` rebuilds the `statuses` Map on
  * every notification, so a default (identity) comparison would never hit.
  */
-export const StatusBadge = memo(
-  function StatusBadge({ status, stale = false }: { status: ThreadStatus; stale?: boolean }) {
-    if (status === "idle") return null;
-    const label = status === "running" ? "Running" : "Awaiting approval";
-    // `animate-spin` stays applied in *both* states on purpose. Removing it while
-    // awaiting approval (and re-adding it afterwards) drops and recreates the
-    // CSS animation, resetting `currentTime` — the very "plays a short segment
-    // then loops" symptom. A rotating perfect circle is visually static, so the
-    // amber dot loses nothing by keeping the animation alive, and the timeline
-    // survives the whole running → awaiting_approval → running flip.
-    return (
-      <span
-        role="img"
-        aria-label="Thread status"
-        data-status={status}
-        data-stale={stale ? "true" : undefined}
-        title={stale ? `${label}（可能过期）` : label}
-        className={`shrink-0 animate-spin rounded-full ${stale ? "opacity-40" : ""} ${
-          status === "running"
-            ? "size-3 border-2 border-line-strong border-t-fg"
-            : "size-2 bg-amber-400"
-        }`}
-      />
-    );
-  },
-  (prev, next) => prev.status === next.status && prev.stale === next.stale,
-);
+export const StatusBadge = memo(function StatusBadge({
+  status,
+  stale = false,
+}: {
+  status: ThreadStatus;
+  stale?: boolean;
+}) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useSpinPhase(ref, status !== "idle");
+  if (status === "idle") return null;
+  const label = status === "running" ? "Running" : "Awaiting approval";
+  // Exactly one mechanism drives the spin. Where WAAPI exists it is the driver
+  // and the CSS class is omitted (two animations on `transform` would be
+  // ambiguous and redundant); where it does not (jsdom, ancient webviews) we fall
+  // back to the CSS `animate-spin` so the indicator still rotates — losing only
+  // the "survives a row reorder" property.
+  const cssFallback = !supportsWaapi();
+  return (
+    <span
+      ref={ref}
+      role="img"
+      aria-label="Thread status"
+      data-status={status}
+      data-stale={stale ? "true" : undefined}
+      title={stale ? `${label}（可能过期）` : label}
+      className={`shrink-0 rounded-full ${cssFallback ? "animate-spin" : ""} ${
+        stale ? "opacity-40" : ""
+      } ${status === "running" ? "size-3 border-2 border-line-strong border-t-fg" : "size-2 bg-amber-400"}`}
+    />
+  );
+}, (prev, next) => prev.status === next.status && prev.stale === next.stale);
 
 export function ThreadSidebar({
   groups,
