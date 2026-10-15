@@ -398,7 +398,7 @@ fn real_subagent_merges_delivery_into_parent_history() {
     let mut run = start_real_subagent(
         &config,
         &fixture,
-        "First run this exact command yourself: git worktree add -b feat/real-subagent delivery-worktree. Then call spawn_agent exactly once with mode \"coding\" and workdir \"delivery-worktree\" (pass mode: coding and that workdir) so the child runs in that worktree. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in your workdir. The child must not delegate. Do not create that file yourself. Call wait_agent with mode \"all\" and then merge the delivered commit into your own history with git merge --no-ff <commit> from the child's completion report (run that command yourself in your own worktree checkout).",
+        "First run this exact command yourself: git worktree add -b feat/real-subagent delivery-worktree. Then call spawn_agent exactly once with mode \"coding\" and workdir \"delivery-worktree\" (pass mode: coding and that workdir) so the child runs in that worktree. Give the child this exact objective: create real-subagent-delivery.txt with exactly REAL_SUBAGENT_DELIVERY_MARKER_V1 followed by one newline; then run git add real-subagent-delivery.txt and git commit -m 'test: add real subagent delivery marker' in your workdir. The child must not delegate. Do not create that file yourself. Call wait_agent with mode \"all\" and then merge the delivered commit into the history of the checkout you started the run in with git merge --no-ff <commit> from the child's completion report. Run that merge yourself in that same checkout, not in delivery-worktree; do not leave the delivered commit unmerged.",
     );
     let socket = fixture.runtime_dir.join("runtime.sock");
     let child_id = await_direct_child(&socket, &mut run);
@@ -409,7 +409,33 @@ fn real_subagent_merges_delivery_into_parent_history() {
         .as_str()
         .unwrap_or_else(|| panic!("delivery commit missing from {delivery_json}"))
         .to_owned();
-    let parent_workspace = fixture.repository.join("delivery-worktree");
+    // The child commits inside the `delivery-worktree` linked checkout, so that
+    // branch tip has to BE the delivered head. This proves the child really
+    // committed into the parent's worktree before we assert anything about the
+    // parent's own checkout.
+    assert_eq!(
+        git(&fixture.repository, &["rev-parse", "feat/real-subagent"]).trim(),
+        child_head,
+        "the child branch tip must be the delivered commit {child_head}; delivery: {delivery_json}"
+    );
+    // The checkout the run itself started in is the parent's own history. The
+    // child's worktree is a linked worktree of this repository but a distinct
+    // checkout/branch, so this HEAD does NOT contain the child commit until the
+    // parent actually integrates it: `git merge-base --is-ancestor` is false
+    // here unless the parent ran its own `git merge --no-ff <child-commit>`.
+    let parent_checkout = fixture.repository.as_path();
+    let pre_merge_fixture = fixture.repository.join(DELIVERY_FILE);
+    assert!(
+        !git_exit_status(
+            parent_checkout,
+            &["merge-base", "--is-ancestor", &child_head, "HEAD"],
+        ),
+        "the child commit must be absent from the parent's own checkout before the run finishes; delivery: {delivery_json}"
+    );
+    assert!(
+        !pre_merge_fixture.exists(),
+        "the delivered file must not appear in the parent's own checkout before the parent merges; delivery: {delivery_json}"
+    );
     let output = run.wait();
     assert!(
         output.status.success(),
@@ -419,31 +445,31 @@ fn real_subagent_merges_delivery_into_parent_history() {
     // The runtime no longer accepts deliveries: the parent must integrate the
     // child commit itself (`git merge --no-ff <commit>`), so the child's
     // delivered commit has to appear in the parent's own history.
-    let parent_log = git(&parent_workspace, &["log", "--oneline", "-3"]);
+    let parent_log = git(parent_checkout, &["log", "--oneline", "-3"]);
     assert!(
         git_exit_status(
-            &parent_workspace,
+            parent_checkout,
             &["merge-base", "--is-ancestor", &child_head, "HEAD"],
         ),
         "the parent must have merged the child commit {child_head}; parent log: {parent_log:?}; delivery: {delivery_json}"
     );
-    let accepted_file = parent_workspace.join(DELIVERY_FILE);
-    let accepted_content = std::fs::read_to_string(&accepted_file).unwrap_or_else(|error| {
-        let parent_status = git(&parent_workspace, &["status", "--porcelain"]);
-        let parent_log = git(&parent_workspace, &["log", "--oneline", "-3"]);
+    let merged_file = parent_checkout.join(DELIVERY_FILE);
+    let merged_content = std::fs::read_to_string(&merged_file).unwrap_or_else(|error| {
+        let parent_status = git(parent_checkout, &["status", "--porcelain"]);
+        let parent_log = git(parent_checkout, &["log", "--oneline", "-3"]);
         let child_tree = git(
-            &parent_workspace,
+            parent_checkout,
             &["show", "--format=", "--name-only", &child_head],
         );
         panic!(
             "merged file {} is missing: {error}; child commit: {child_head}; child tree: {child_tree:?}; parent status: {parent_status:?}; parent log: {parent_log:?}; delivery: {delivery_json}",
-            accepted_file.display(),
+            merged_file.display(),
         )
     });
-    assert_eq!(accepted_content, format!("{DELIVERY_MARKER}\n"));
-    assert_eq!(git(&parent_workspace, &["status", "--porcelain"]), "");
-    // The daemon owns nothing here: the checkout the run started in keeps only
-    // what the agents themselves wrote.
+    assert_eq!(merged_content, format!("{DELIVERY_MARKER}\n"));
+    assert_eq!(git(parent_checkout, &["status", "--porcelain"]), "");
+    // The daemon owns nothing here: the parent checkout keeps only the merge the
+    // agents themselves drove plus the child's own worktree.
     assert_eq!(
         git(&fixture.repository, &["status", "--porcelain"]),
         "?? delivery-worktree/\n"

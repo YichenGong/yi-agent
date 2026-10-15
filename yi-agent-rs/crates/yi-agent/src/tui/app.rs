@@ -3879,17 +3879,22 @@ mod tests {
                 "cargo test -p child",
             ),
         );
+        let task = task_id.parse().unwrap();
+        let mut state = String::new();
         for _ in 0..100 {
-            if yi_agent_store::repository::RuntimeRepository::open(&database)
+            state = yi_agent_store::repository::RuntimeRepository::open(&database)
                 .unwrap()
-                .task_state(&task_id.parse().unwrap())
-                .unwrap()
-                == "completed"
-            {
+                .task_state(&task)
+                .unwrap();
+            if state == "completed" {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert_eq!(
+            state, "completed",
+            "a delivered child must reach completed before the review control reads it"
+        );
         (directory, daemon, task_id)
     }
 
