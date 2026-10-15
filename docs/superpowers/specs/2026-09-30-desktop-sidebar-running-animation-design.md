@@ -93,6 +93,17 @@ React 无法复用这两个节点（类型、`aria-label` 不同），**状态�
   正确；系统未开「减弱动态效果」（`reduceMotion` 未设置，`prefers-reduced-motion`
   相关的 `motion-reduce`/`motion-safe` 并未被用到，故此项不参与）。
 
+> **更正（后续复报「它会回退」时补做）**：上面「父组件重渲染不会重置」只测了
+> **重渲染**，没测**移动 DOM 节点**。补测后结论相反：**CSS 动画在元素被移动、
+> 或从文档移除后再插入时会从头重放**（`currentTime` 归零、`animationstart` 再次
+> 触发）；移动**祖先**子树同样如此。而 React 对带 `key` 的列表做重排用的正是
+> 「对已挂载节点 `insertBefore`」——于是侧栏按 `updated_at` 降序、任何会话刷新
+> `updated_at` 都会重排行、把运行中那行的旋转环拽回 12 点（用户看到的「回退」）。
+> **节点的身份不变救不了它**（同一节点被移动照样重启，实测 `identityChanges=0`
+> 但时间轴归零）。因此 §2.2 的「同节点 + `animate-spin` 常驻」只覆盖了**不移动**
+> 的状态翻转，覆盖不了**移动**的行重排；后续改为 Web Animations API 驱动旋转
+> （`element.animate` 不随移动重启），并把相位锚到墙钟。详见 §5。
+
 因此**不采用**「换掉 CSS 动画」「加 `will-change`/`translateZ` 强制独立合成层」这类
 绕过手段：前者是症状掩盖，后者换不来正确性（LAYER 合成同样受主线程提交约束）。
 
@@ -207,3 +218,78 @@ WKWebView 加载 `desktop/dist`，桩 `__TAURI_INTERNALS__` 回放合成流式�
   不会被观察到的合成器动画；收益是翻转期间时间轴连续。
 
 
+
+---
+
+## 5. 后续修复：行重排导致的「回退」
+
+**触发**：用户在本 PR 合入后复报——「当前正在运行的转圈的动画还是有问题，它会回退」。
+
+### 5.1 根因（与 §1.2 不同的一条）
+
+§1.2 修的是**状态翻转**（`running → awaiting_approval → running`，节点**不移动**，
+只是同节点换 class）。本条是**行重排**：侧栏列表由服务端按 `updated_at` 降序返回，
+任何会话刷新 `updated_at`（**别的**会话跑完一轮、改名、换模型……）都会改变列表顺序；
+React 对带 `key` 的列表做重排，实现为**对已挂载节点 `insertBefore`**＝一次**DOM 移动**。
+而 **CSS 动画在元素被移动、或移除后再插入时会从头重放**（`currentTime` 归零、
+`animationstart` 再次触发）——于是运行中那行的旋转环**跳回 12 点**，就是「回退」。
+
+**关键**：节点的**身份不变救不了它**。实测（真实 App + 桩桥，单次流式回合里插入一次
+列表重排）：徽标始终是**同一 DOM 节点**（`identityChanges = 0`），时间轴却归零一次
+（`ahead = 1`，且 MutationObserver 记到该行 `removedNodes/addedNodes` 各 1 次）。
+所以 §2.2「同节点 + `animate-spin` 常驻」是**必要但不足**的。
+
+### 5.2 引擎层机制（真实 Chrome + 真实 WKWebView，均为真实 dist CSS）
+
+| 操作 | CSS 动画（`animate-spin`） | Web Animations（`element.animate`） |
+|---|---|---|
+| 同父节点内移动该元素 | `currentTime` **归零**、`animationstart` 再次触发 | `currentTime` **连续**（700ms→1000ms） |
+| 移动**祖先**子树（整组重排） | 角度 **252° → 102°**（倒退 150°） | 角度 252° → 360°（**连续**） |
+| 移除 200ms 后再插入 | `currentTime` 归零 | `currentTime` 连续（`playState` 保持 running） |
+
+（`animate-spin` 在本仓库的构建产物 CSS 里与 `--animate-spin: spin 1s linear infinite`
+一致；无 `prefers-reduced-motion` 影响。）
+
+### 5.3 修复
+
+不再用会随节点生命周期重启的 CSS 动画，改由 **Web Animations API** 驱动旋转：
+
+- `desktop/src/lib/spinPhase.ts` —— 纯内核：`SPIN_PERIOD_MS`(1000) / `spinPhaseMs(now)`
+  （墙钟相位，负时钟取模归正）/ `SPIN_KEYFRAMES` / `SPIN_TIMING` / `supportsWaapi()` /
+  `anchorSpin(el, now)`（起动画并把 `currentTime` 锚到 `spinPhaseMs(now)`）。
+- `desktop/src/lib/useSpinPhase.ts` —— `useLayoutEffect`（首帧前挂相位，避免闪一帧
+  0deg）在 `active` 时起动画、卸载时 `cancel`；依赖仅 `[ref, active]`，故 running ↔
+  awaiting_approval 翻转时**不重建**，仅 idle ↔ 非 idle 才重建，而重建又按墙钟相位挂号。
+- `desktop/src/components/ThreadSidebar.tsx` 的 `StatusBadge` 改用 `useSpinPhase`；
+  `animate-spin` **只在无 WAAPI 的环境**（jsdom、极老 webview）作为兜底保留——有 WAAPI
+  时省去，避免两条动画抢 `transform` 造成相位不确定。
+
+### 5.4 验收
+
+**自动化**：`cd desktop && npx vitest run src/lib/spinPhase.test.ts
+src/lib/useSpinPhase.test.tsx src/components/ThreadSidebar.test.tsx`
+- `does not restart the running badge's animation when the list reorders`：重排后徽标仍是
+  同一节点，**且没起新动画**（回退修复即红——修复前会起第二个动画）。
+- `spinPhase*`：相位锚墙钟、负时钟归正、同相位特性；`useSpinPhase*`：active 翻转不重建、
+  取消/重锚、无 WAAPI 不崩。
+- 全量 `npx vitest run`（1065）、`npx tsc --noEmit`、`npm run build`。
+
+**真实引擎 A/B（WKWebView + 真实构建产物 + 桩 `__TAURI_INTERNALS__`）**：回放合成流并
+每 700ms 触发一次列表重排，采样徽标**绘制角度**，统计**倒退次数**与**最大回退角**：
+
+| 场景（5s、7 次重排） | 倒退次数 | 最大回退 | 净推进 |
+|---|---|---|---|
+| 修复前（`animate-spin`） | **3** | **132°** | — |
+| 修复后（WAAPI） | **0** | **0°** | **1800°（= 5s × 360°/s，完全匀速）** |
+
+同一场景在真实 Chrome 复现同样结论（CSS 徽标倒退、WAAPI 徽标连续）。
+
+### 5.5 残留与风险
+
+- **无 WAAPI 的环境退回 CSS 兜底**：此时仍能得到「转」，但拿不到「防重排」。桌面
+  （WKWebView）与 iOS（WKWebView）都支持 WAAPI，实测覆盖；仅 jsdom（测试）走兜底。
+- **相位跨会话一致**：所有运行中徽标共用同一墙钟相位，故它们**同相**旋转（视觉上像
+  一起转）。此前每行从各自 0 起算、相位互不相同；这是有意的取舍——正是「锚到墙钟」
+  换来「重挂/重排后不跳」。
+- **`Animation` 实例的生命周期**：由 `useSpinPhase` 的 effect 清理（`cancel()`）管理；
+  `StatusBadge` 用 `memo` 按语义比较，`statuses` Map 的引用变化不会导致重建。

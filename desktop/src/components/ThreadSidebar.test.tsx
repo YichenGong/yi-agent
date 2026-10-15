@@ -336,7 +336,28 @@ describe("ThreadSidebar status", () => {
     const { container } = renderSidebar({ statuses: new Map([["1", "running"]]) });
     const badge = container.querySelector('[aria-label="Thread status"]')!;
     expect(badge.getAttribute("data-status")).toBe("running");
+    // jsdom has no Web Animations API, so we fall back to the CSS `animate-spin`.
+    // (Where WAAPI exists the spin is driven by `useSpinPhase` instead; see the
+    // reorder test below.)
+    expect(typeof Element.prototype.animate).toBe("undefined");
     expect(badge.className).toContain("animate-spin");
+  });
+
+  it("drives the spin with WAAPI (no CSS class) when the API is available", () => {
+    const created: Element[] = [];
+    (Element.prototype as unknown as { animate?: unknown }).animate = function (this: Element) {
+      created.push(this);
+      return { currentTime: 0, cancel() {} } as unknown as Animation;
+    };
+    try {
+      const { container } = renderSidebar({ statuses: new Map([["1", "running"]]) });
+      const badge = container.querySelector('[aria-label="Thread status"]')!;
+      expect(created).toContain(badge);
+      // Exactly one driver: the WAAPI animation, not also the CSS class.
+      expect(badge.className).not.toContain("animate-spin");
+    } finally {
+      delete (Element.prototype as unknown as { animate?: unknown }).animate;
+    }
   });
 
   it("shows an amber badge for an awaiting-approval thread", () => {
@@ -344,8 +365,8 @@ describe("ThreadSidebar status", () => {
     const badge = container.querySelector('[aria-label="Thread status"]')!;
     expect(badge.getAttribute("data-status")).toBe("awaiting_approval");
     expect(badge.className).toContain("bg-amber-400");
-    // The animation must stay applied across states: dropping and re-adding it
-    // recreates the CSS animation and resets its timeline.
+    // The badge keeps rotating across states (the animation is not dropped and
+    // re-added, which would restart it): the CSS fallback class stays applied.
     expect(badge.className).toContain("animate-spin");
   });
 
@@ -409,6 +430,68 @@ describe("ThreadSidebar status", () => {
 
     rerender(<ThreadSidebar {...props} statuses={new Map([["1", "running"]])} />);
     expect(container.querySelector('[aria-label="Thread status"]')).toBe(running);
+  });
+
+  it("does not restart the running badge's animation when the list reorders", () => {
+    // Root cause of the "回退" (rewind): the sidebar is server-sorted by
+    // `updated_at` desc, so when any thread's `updated_at` bumps this row is MOVED
+    // in the DOM (React applies a keyed reorder as `insertBefore`). A CSS animation
+    // restarts from `currentTime = 0` on any such move — snapping the ring back to
+    // 12 o'clock — while a Web-Animations animation does not. We drive the spin
+    // with WAAPI, so a reorder must not create a new animation.
+    const created: { el: Element; currentTime: number }[] = [];
+    (Element.prototype as unknown as { animate?: unknown }).animate = function (this: Element) {
+      const rec = { el: this, currentTime: 0 };
+      created.push(rec);
+      return {
+        get currentTime() {
+          return rec.currentTime;
+        },
+        set currentTime(v: number) {
+          rec.currentTime = v;
+        },
+        cancel() {},
+      } as unknown as Animation;
+    };
+    try {
+      const props = sidebarProps({
+        groups: [
+          {
+            workspace: "/work/projA",
+            exists: true,
+            threads: [thread("1", "alpha-thread", "/work/projA"), thread("3", "gamma-thread", "/work/projA")],
+          },
+        ],
+        statuses: new Map([["1", "running"]]),
+      });
+      const { container, rerender } = render(<ThreadSidebar {...props} />);
+      const badge = container.querySelector('[aria-label="Thread status"]')!;
+      expect(badge).not.toBeNull();
+      expect(created).toHaveLength(1);
+      const first = created[0].el;
+
+      // The server now returns the other thread first (its `updated_at` bumped).
+      rerender(
+        <ThreadSidebar
+          {...props}
+          groups={[
+            {
+              workspace: "/work/projA",
+              exists: true,
+              threads: [thread("3", "gamma-thread", "/work/projA"), thread("1", "alpha-thread", "/work/projA")],
+            },
+          ]}
+        />,
+      );
+
+      // The row was moved (order flipped) but the badge element is the same node
+      // and NO new animation was started — the timeline survived the reorder.
+      expect(container.querySelector('[aria-label="Thread status"]')).toBe(badge);
+      expect(created).toHaveLength(1);
+      expect(created[0].el).toBe(first);
+    } finally {
+      delete (Element.prototype as unknown as { animate?: unknown }).animate;
+    }
   });
 
   it("renders no status badge for an idle thread", () => {
