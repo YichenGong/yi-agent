@@ -123,6 +123,17 @@ pub enum ProviderEvent {
         text: String,
         kind: ReasoningKind,
     },
+    /// 一个完整的、携带凭证的思考块。块级（非流式）。
+    ///
+    /// 与 [`ProviderEvent::ReasoningDelta`]（展示通道）严格分离：本事件是**协议数据**，
+    /// 用于构造 [`crate::message::ContentBlock::Thinking`] 并参与上下文回传。
+    /// 两者互不替代——`display:"omitted"` 时只有本事件、没有 `ReasoningDelta`。
+    ThinkingBlock {
+        /// 明文摘要（可为空串）。
+        text: String,
+        /// 凭证形态。
+        token: crate::message::ThinkingToken,
+    },
     /// 非致命的运行期告知（回退/降级），展示在状态栏级。
     Notice {
         level: NoticeLevel,
@@ -294,6 +305,15 @@ where
                 // Reasoning is a separate channel: it is forwarded to the
                 // caller for display but never merged into assistant content.
                 on_event(ProviderEvent::ReasoningDelta { text, kind });
+            }
+            ProviderEvent::ThinkingBlock { text, token } => {
+                // 块级协议数据：原子地进入 assistant content，同时转发。
+                // 与 ReasoningDelta 不同，本事件**参与**上下文回传。
+                content.push(crate::message::ContentBlock::Thinking {
+                    text: text.clone(),
+                    token: token.clone(),
+                });
+                on_event(ProviderEvent::ThinkingBlock { text, token });
             }
             ProviderEvent::Notice { level, text } => {
                 // A non-fatal runtime notice is purely informational.
@@ -1096,6 +1116,46 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ProviderEvent::ToolUseStart { .. })),
             "empty-id tool use must not be forwarded: {seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_block_enters_content_and_is_forwarded() {
+        use crate::message::{ContentBlock, ThinkingToken};
+        let stream = futures::stream::iter(vec![
+            ProviderEvent::ThinkingBlock {
+                text: "summary".into(),
+                token: ThinkingToken::Signature("sig".into()),
+            },
+            ProviderEvent::TextDelta("answer".into()),
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ])
+        .boxed();
+
+        let mut forwarded = Vec::new();
+        let (content, _end, _) = accumulate_stream(stream, |e| forwarded.push(e.clone()), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            content,
+            vec![
+                ContentBlock::Thinking {
+                    text: "summary".into(),
+                    token: ThinkingToken::Signature("sig".into())
+                },
+                ContentBlock::Text("answer".into()),
+            ],
+            "the thinking block must be part of assistant content, in order"
+        );
+        assert!(
+            forwarded.iter().any(|e| matches!(
+                e,
+                ProviderEvent::ThinkingBlock { text, .. } if text == "summary"
+            )),
+            "the thinking block must also be forwarded to on_event"
         );
     }
 }
