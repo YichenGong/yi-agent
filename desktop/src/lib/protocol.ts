@@ -162,6 +162,15 @@ export type Notification =
       method: "agent/trace/event";
       params: { threadId: string; taskId: string; row: AgentTraceRow };
     }
+  /**
+   * 该 thread 的某个受管后台进程状态变了。**不含 Output**：stdout 是高频流，
+   * 只在用户打开详情时经 `process/read` 增量拉取。它只是「该重拉了」的提示，
+   * 权威数据在 `process/list` 的响应里，收到后重拉即可。
+   */
+  | {
+      method: "process/updated";
+      params: { thread_id: string; process_id: string; state: string };
+    }
   | { method: "ui/settings/updated"; params: { theme: string } }
   | {
       method: "ui/gitDiff/focus";
@@ -335,4 +344,51 @@ export interface ThreadDiffResult {
 export interface DiffTextResult {
   unifiedDiff: string;
   truncated: boolean;
+}
+
+/**
+ * 一个受管后台进程的状态。
+ *
+ * **注意线形状**：Rust 侧 `ProcessStatus` 带
+ * `#[serde(tag = "state", rename_all = "snake_case")]`，是内部标记枚举，序列化成
+ * **对象**（`{"state":"running"}`），不是裸字符串。`exited` 会带 `code`，
+ * `failed_to_start` 会带 `reason`。读取状态一律用 `.state`。
+ */
+export interface ProcessStatus {
+  state: string;
+  /** 仅 `exited` 携带；`null` 表示进程没有退出码。 */
+  code?: number | null;
+  /** 仅 `failed_to_start` 携带。 */
+  reason?: string;
+}
+
+/** `process/list` 的一项。镜像 Rust 的 `ManagedProcessSnapshot`（snake_case）。 */
+export interface ProcessInfo {
+  process_id: string;
+  name: string | null;
+  pid: number | null;
+  command: string;
+  cwd: string;
+  status: ProcessStatus;
+  ready: boolean;
+  on_exit: "kill" | "keep";
+  exit_code: number | null;
+  elapsed_sec: number;
+}
+
+/** `process/list` 的响应。 */
+export interface ProcessListResult {
+  processes: ProcessInfo[];
+}
+
+/** `process/read` 的响应。`next_cursor` 是下一次增量读的游标。 */
+export interface ProcessReadResult {
+  process_id: string;
+  name: string | null;
+  stdout: string;
+  stderr: string;
+  next_cursor: number;
+  truncated: boolean;
+  status: ProcessStatus;
+  ready: boolean;
 }

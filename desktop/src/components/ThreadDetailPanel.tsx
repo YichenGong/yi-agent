@@ -14,7 +14,10 @@ import { useEffect, useRef, useState } from "react";
 import { SubagentTrace } from "./SubagentTrace";
 import { GitDiffView } from "./GitDiffView";
 import { SubagentRail } from "./SubagentRail";
+import { ProcessRail } from "./ProcessRail";
+import { ProcessDetail } from "./ProcessDetail";
 import type { SubagentRow } from "../lib/subagents";
+import type { ProcessInfo } from "../lib/protocol";
 import {
   clampPanelWidth,
   loadPanelWidth,
@@ -22,7 +25,7 @@ import {
 } from "../lib/panelWidth";
 import type { ComponentProps } from "react";
 
-type Tab = "subagents" | "diff";
+type Tab = "subagents" | "diff" | "processes";
 
 export function ThreadDetailPanel({
   tab,
@@ -34,6 +37,7 @@ export function ThreadDetailPanel({
   onLeaveTask,
   traceProps,
   diffProps,
+  processProps,
   isMobile,
 }: {
   tab: Tab;
@@ -49,6 +53,15 @@ export function ThreadDetailPanel({
   /** 选中任务时的轨迹详情 props；`selectedTaskId` 为 null 时该位为 null。 */
   traceProps: ComponentProps<typeof SubagentTrace> | null;
   diffProps: ComponentProps<typeof GitDiffView>;
+  /** 「后台进程」Tab 的全部 props；列表/详情二选一由 `selectedProcessId` 决定。 */
+  processProps: {
+    processes: ProcessInfo[];
+    selectedProcessId: string | null;
+    onOpenProcess: (processId: string) => void;
+    onCloseProcess: () => void;
+    output: { stdout: string; stderr: string; truncated: boolean } | null;
+    onKill: () => Promise<void>;
+  };
   /** 手机端不渲染拖拽手柄（那里宽度由媒体查询定）。 */
   isMobile: boolean;
 }) {
@@ -136,6 +149,15 @@ export function ThreadDetailPanel({
           <button
             type="button"
             role="tab"
+            aria-selected={tab === "processes"}
+            className={tabClass("processes")}
+            onClick={() => onTabChange("processes")}
+          >
+            后台进程{processProps.processes.length > 0 ? ` ${processProps.processes.length}` : ""}
+          </button>
+          <button
+            type="button"
+            role="tab"
             aria-selected={tab === "diff"}
             className={tabClass("diff")}
             onClick={() => onTabChange("diff")}
@@ -175,8 +197,27 @@ export function ThreadDetailPanel({
               embedded
             />
           )
-        ) : (
+        ) : tab === "diff" ? (
           <GitDiffView {...diffProps} />
+        ) : processProps.selectedProcessId &&
+          processProps.processes.some((p) => p.process_id === processProps.selectedProcessId) ? (
+          <ProcessDetail
+            info={
+              processProps.processes.find(
+                (p) => p.process_id === processProps.selectedProcessId,
+              )!
+            }
+            output={processProps.output}
+            onClose={processProps.onCloseProcess}
+            onKill={processProps.onKill}
+          />
+        ) : (
+          <ProcessRail
+            processes={processProps.processes}
+            selectedProcessId={processProps.selectedProcessId}
+            onOpen={processProps.onOpenProcess}
+            embedded
+          />
         )}
       </div>
     </aside>

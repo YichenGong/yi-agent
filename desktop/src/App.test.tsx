@@ -68,6 +68,8 @@ const { clients, state } = vi.hoisted(() => ({
     // pre-existing test shape keeps its behavior; the iOS pairing test sets a
     // phone UA and persists a config where it needs one.
     platformUa: "",
+    // `process/list` 返回的进程;默认空,需要时由用例填充。
+    processes: [] as Array<Record<string, unknown>>,
   },
 }));
 
@@ -212,6 +214,22 @@ vi.mock("./lib/rpc", () => ({
       }
       if (method === "thread/clear") return {};
       if (method === "thread/compact") return { status: "compacted" };
+      if (method === "process/list") {
+        return { processes: state.processes };
+      }
+      if (method === "process/read") {
+        return {
+          process_id: (params as { process_id: string }).process_id,
+          name: "dev",
+          stdout: "ready on 3000\n",
+          stderr: "",
+          next_cursor: 0,
+          truncated: false,
+          status: { state: "running" },
+          ready: false,
+        };
+      }
+      if (method === "process/kill") return { ok: true };
       if (method === "board/list") return { boards: state.boards };
       if (method === "plugin/query") {
         const inner = (params as { method?: string }).method ?? "";
@@ -270,6 +288,7 @@ beforeEach(() => {
   state.hostError = {};
   state.dataSources = {};
   state.platformUa = "";
+  state.processes = [];
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
@@ -3693,5 +3712,103 @@ describe("App reasoning rendering", () => {
     expect(before(a1, q2)).toBe(true);
     expect(before(q2, blocks[1])).toBe(true);
     expect(before(blocks[1], a2)).toBe(true);
+  });
+});
+
+describe("App 后台进程接线", () => {
+  const runningProcess = {
+    process_id: "proc_1",
+    name: "dev",
+    pid: 4242,
+    command: "npm run dev",
+    cwd: "/w",
+    status: { state: "running" },
+    ready: false,
+    on_exit: "kill",
+    exit_code: null,
+    elapsed_sec: 1.5,
+  };
+
+  const readCount = () =>
+    clients[0].requests.filter((r) => r.method === "process/read").length;
+
+  it("shows the process tab and lists a process reported by process/list", async () => {
+    state.processes = [runningProcess];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    const tab = await screen.findByRole("tab", { name: /后台进程/ });
+    fireEvent.click(tab);
+    expect(await screen.findByText("dev")).toBeTruthy();
+  });
+
+  it("refetches the process list when process/updated arrives", async () => {
+    state.processes = [runningProcess];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const before = clients[0].requests.filter((r) => r.method === "process/list").length;
+
+    // 通知只是"该重拉了":服务端不把权威数据放在事件里。
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({
+          method: "process/updated",
+          params: { thread_id: "t1", process_id: "proc_1", state: "exited" },
+        });
+      }
+    });
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter((r) => r.method === "process/list").length,
+      ).toBeGreaterThan(before),
+    );
+  });
+
+  it("opens a detail that polls process/read, and stops polling once closed", async () => {
+    state.processes = [runningProcess];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("tab", { name: /后台进程/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /查看进程 dev/ }));
+
+    await waitFor(() => expect(readCount()).toBeGreaterThan(0));
+    expect(await screen.findByText(/ready on 3000/)).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /关闭进程详情/ }));
+    const settled = readCount();
+    // 轮询间隔 500ms:等 1.2s;若清理没生效,计数必然增长。
+    await new Promise((r) => setTimeout(r, 1200));
+    expect(readCount()).toBe(settled);
+  });
+
+  it("kills via process/kill and refetches the list", async () => {
+    state.processes = [runningProcess];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    fireEvent.click(await screen.findByLabelText("会话详情面板"));
+    fireEvent.click(await screen.findByRole("tab", { name: /后台进程/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /查看进程 dev/ }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "终止进程" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认终止" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "process/kill",
+        params: { thread_id: "t1", process_id: "proc_1" },
+      }),
+    );
   });
 });
