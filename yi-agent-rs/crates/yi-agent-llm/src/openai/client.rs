@@ -22,7 +22,7 @@ use crate::openai::responses::types::responses_request_from;
 use crate::openai::stream::OpenaiStream;
 use crate::openai::types::OpenaiRequest;
 
-const DEFAULT_BASE_URL: &str = "https://api.openai.com";
+const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 /// 「网关瞬时拒绝」时的重投次数（首次之外）。
@@ -32,7 +32,7 @@ const TRANSIENT_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_TIMEOUT_SECS, TRANSIENT_RETRY_ATTEMPTS};
+    use super::{DEFAULT_BASE_URL, DEFAULT_TIMEOUT_SECS, TRANSIENT_RETRY_ATTEMPTS};
 
     #[test]
     fn default_stream_timeout_is_five_minutes() {
@@ -42,6 +42,14 @@ mod tests {
     #[test]
     fn transient_rejection_retry_budget_is_bounded() {
         assert_eq!(TRANSIENT_RETRY_ATTEMPTS, 2);
+    }
+
+    /// base_url 语义 = 含版本段的 API 根：默认值必须自带 `/v1`,
+    /// 否则拼出的路径会缺 `/v1`（这正是本次要修的老问题）。
+    #[test]
+    fn default_base_url_carries_the_version_segment() {
+        assert_eq!(DEFAULT_BASE_URL, "https://api.openai.com/v1");
+        assert!(DEFAULT_BASE_URL.ends_with("/v1"));
     }
 }
 
@@ -182,8 +190,8 @@ impl OpenaiProvider {
         body: &serde_json::Value,
     ) -> Result<BoxStream<'static, ProviderEvent>, PostError> {
         let path = match channel {
-            Channel::Chat => "/v1/chat/completions",
-            Channel::Responses => "/v1/responses",
+            Channel::Chat => "/chat/completions",
+            Channel::Responses => "/responses",
         };
 
         let resp = self
@@ -272,7 +280,7 @@ impl OpenaiProvider {
             return Err(PostError::Status(status, body_text));
         }
 
-        // 网关无 /v1/responses：缓存 chat，并用同一逻辑请求重投一次。
+        // 网关无 /responses 路由：缓存 chat，并用同一逻辑请求重投一次。
         tracing::info!(
             provider = "openai",
             status,
