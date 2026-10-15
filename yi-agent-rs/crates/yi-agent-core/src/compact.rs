@@ -265,8 +265,10 @@ pub fn plan_compaction(
 ) -> Option<CompactionPlan> {
     let (retained_user, retained_user_tokens) =
         select_retained_user_message(messages, user_budget)?;
-    let (retained_tool_suffix, retained_tool_tokens) =
+    let (retained_tool_suffix_raw, retained_tool_tokens) =
         select_retained_tool_suffix(&extract_complete_tool_units(messages), tool_budget);
+    // 被压缩区间的凭证已失去对应上下文，保留只会触发前缀失效——统一剥离。
+    let retained_tool_suffix = crate::thinking::strip_thinking(&retained_tool_suffix_raw);
     let plan = CompactionPlan {
         retained_user,
         retained_tool_suffix,
@@ -282,13 +284,14 @@ pub fn build_compacted_messages(
     plan: &CompactionPlan,
     summary: &str,
 ) -> Result<Vec<Message>, CompactError> {
-    let summary = ContentBlock::Text(format!("[对话摘要]\n{summary}"));
+    let summary_block = ContentBlock::Text(format!("[对话摘要]\n{summary}"));
     let mut messages = vec![plan.retained_user.clone()];
+
     if plan.retained_tool_suffix.is_empty() {
-        messages.push(Message::assistant(vec![summary]));
+        messages.push(Message::assistant(vec![summary_block]));
     } else {
-        let mut suffix = plan.retained_tool_suffix.clone();
-        let Some(first) = suffix.first_mut() else {
+        let suffix = plan.retained_tool_suffix.clone();
+        let Some(first) = suffix.first() else {
             return Err(CompactError::NoReduction);
         };
         if first.role != Role::Assistant || tool_use_ids(first).is_empty() {
@@ -296,7 +299,12 @@ pub fn build_compacted_messages(
                 "tool suffix must start with assistant tool use".into(),
             ));
         }
-        first.content.insert(0, summary);
+        // 摘要作为**独立的 assistant 消息**置于保留后缀之前。
+        //
+        // 不能像此前那样 `first.content.insert(0, summary)`：那会改写该
+        // assistant 消息的块序列，而 Anthropic 的 thinking 前缀校验要求
+        // 思考块之前的内容 append-only，块序列一变即凭证失效。
+        messages.push(Message::assistant(vec![summary_block]));
         messages.extend(suffix);
     }
     validate_compacted_messages(&messages)?;
@@ -317,9 +325,15 @@ pub fn validate_compacted_messages(messages: &[Message]) -> Result<(), CompactEr
             ));
         }
         if pair[0].role == Role::Assistant && pair[1].role == Role::Assistant {
-            return Err(CompactError::InvalidHistory(
-                "adjacent assistant messages".into(),
-            ));
+            // 允许「摘要 assistant」紧跟「保留后缀的首个 tool_use assistant」这一特例：
+            // 摘要必须独立成块（不得插进 tool_use 消息内部，否则破坏 thinking 前缀校验）。
+            let summary_then_tool_use =
+                is_summary_message(&pair[0]) && !tool_use_ids(&pair[1]).is_empty();
+            if !summary_then_tool_use {
+                return Err(CompactError::InvalidHistory(
+                    "adjacent assistant messages".into(),
+                ));
+            }
         }
     }
 
@@ -564,11 +578,15 @@ mod tests {
             &compacted[0].content[0],
             ContentBlock::Text(text) if text.contains("fix the test")
         ));
-        assert!(compacted[1].content.iter().any(|block| {
-            matches!(block, ContentBlock::Text(text) if text == "[对话摘要]\ncheckpoint")
-        }));
+        // 摘要现在是**独立的 assistant 消息**（下标 1），tool_use 紧跟其后（下标 2）。
+        assert_eq!(compacted[1].role, Role::Assistant);
+        assert!(matches!(
+            &compacted[1].content[..],
+            [ContentBlock::Text(text)] if text == "[对话摘要]\ncheckpoint"
+        ));
+        assert_eq!(compacted[2].role, Role::Assistant);
         assert!(
-            compacted[1]
+            compacted[2]
                 .content
                 .iter()
                 .any(|block| { matches!(block, ContentBlock::ToolUse { id, .. } if id == "t3") })
@@ -612,12 +630,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(compacted.len(), 3);
+        // [user, assistant(摘要), assistant(tool_use new), tool(result new)]
+        assert_eq!(compacted.len(), 4);
         assert!(
-            matches!(&compacted[1].content[1], ContentBlock::ToolUse { id, .. } if id == "new")
+            matches!(&compacted[2].content[0], ContentBlock::ToolUse { id, .. } if id == "new")
         );
         assert!(
-            matches!(&compacted[2].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "new")
+            matches!(&compacted[3].content[0], ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "new")
         );
     }
 
@@ -639,7 +658,8 @@ mod tests {
             "summary",
         )
         .unwrap();
-        let ids = compacted[1]
+        // [user, assistant(摘要), assistant(tool_use one+two), tool(results)]
+        let ids = compacted[2]
             .content
             .iter()
             .filter_map(|block| match block {
@@ -649,7 +669,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["one", "two"]);
         assert!(
-            matches!(&compacted[2].content[..], [ContentBlock::ToolResult { tool_use_id, .. }, ContentBlock::ToolResult { tool_use_id: second, .. }] if tool_use_id == "one" && second == "two")
+            matches!(&compacted[3].content[..], [ContentBlock::ToolResult { tool_use_id, .. }, ContentBlock::ToolResult { tool_use_id: second, .. }] if tool_use_id == "one" && second == "two")
         );
     }
 
@@ -704,6 +724,147 @@ mod tests {
         assert_eq!(compacted.len(), 2);
         assert_eq!(compacted[0].role, Role::User);
         assert_eq!(compacted[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn summary_is_not_inserted_into_an_assistant_message() {
+        // 保留后缀以 assistant(tool_use) 开头时，摘要必须是独立的消息/块，
+        // 不得插进该 assistant 消息的 content 内部——那会改写其块序列，
+        // 破坏 Anthropic 的 thinking 前缀校验。
+        //
+        // 数据说明（本测试必须真正走到「有保留后缀」分支，否则断言恒真）：
+        // t1 单元只是把 t2 单元顶出预算之外的填充；t2 必须同时有
+        // Assistant[ToolUse t2] **和** 紧随其后的 Tool 结果，才会被
+        // `extract_complete_tool_units` 认成一个完整单元并进入保留后缀。
+        let messages = vec![
+            Message::user("old request"),
+            Message::assistant(vec![ContentBlock::Text("old work".into())]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: vec![ContentBlock::Text("old result".into())],
+                is_error: false,
+            }]),
+            Message::user("current request"),
+            Message::assistant(vec![ContentBlock::ToolUse {
+                id: "t2".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            }]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "t2".into(),
+                content: vec![ContentBlock::Text("current result".into())],
+                is_error: false,
+            }]),
+        ];
+        let plan = plan_compaction(&messages, 20_000, 3).expect("must plan");
+        assert!(
+            !plan.retained_tool_suffix.is_empty(),
+            "test data is vacuous: it must exercise the non-empty suffix branch"
+        );
+        let built = build_compacted_messages(&plan, "summary text").unwrap();
+
+        // 保留的 assistant（含 tool_use）消息内不得混入摘要文本。
+        for m in &built {
+            if m.content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }))
+            {
+                let summary_block_indices: Vec<usize> = m
+                    .content
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, b)| matches!(b, ContentBlock::Text(t) if t.starts_with("[对话摘要]\n")))
+                    .map(|(index, _)| index)
+                    .collect();
+                assert!(
+                    summary_block_indices.is_empty(),
+                    "summary must not be injected into an assistant tool_use message; \
+                     found summary block(s) {summary_block_indices:?} inside {m:?}"
+                );
+            }
+        }
+
+        // 摘要仍必须存在，且是**独立**的 assistant 消息。
+        let summary_message = built
+            .iter()
+            .position(is_summary_message)
+            .expect("summary must still be present as its own assistant message");
+        assert_eq!(built[summary_message].content.len(), 1);
+        assert!(tool_use_ids(&built[summary_message]).is_empty());
+    }
+
+    #[test]
+    fn compaction_strips_thinking_from_dropped_region() {
+        use crate::message::ThinkingToken;
+        // thinking 必须位于**被保留的工具单元**内：`plan_compaction` 只对
+        // retained_tool_suffix 做剥离，落在压缩区间的 thinking 本来就丢了。
+        // 同时历史必须足够长，让 `plan_compaction` 的「重建后更短」检查成立。
+        let messages = vec![
+            Message::user("old"),
+            Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "old cot".into(),
+                    token: ThinkingToken::Signature("OLD".into()),
+                },
+                ContentBlock::ToolUse {
+                    id: "t9".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                },
+            ]),
+            Message::tool_results(vec![ContentBlock::ToolResult {
+                tool_use_id: "t9".into(),
+                content: vec![ContentBlock::Text("result".into())],
+                is_error: false,
+            }]),
+            Message::assistant(vec![ContentBlock::Text("later work".into())]),
+            Message::user("current request"),
+        ];
+        let plan = plan_compaction(&messages, 20_000, 3).expect("must plan");
+        assert!(
+            !plan.retained_tool_suffix.is_empty(),
+            "test data is vacuous: the thinking block must sit in the retained suffix"
+        );
+        let built = build_compacted_messages(&plan, "s").unwrap();
+        let surviving: Vec<&ContentBlock> = built
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter(|b| matches!(b, ContentBlock::Thinking { .. }))
+            .collect();
+        assert!(
+            surviving.is_empty(),
+            "被压缩区间的 thinking 必须剥离（凭证已失去对应上下文），仍存活: {surviving:?}"
+        );
+    }
+
+    #[test]
+    fn validator_accepts_summary_assistant_before_tool_use_assistant() {
+        // 摘要独立成块后必然出现「assistant(仅摘要) → assistant(tool_use)」，
+        // 验证器必须放行这一特例，但继续拒绝其它相邻 assistant。
+        let summary_only = vec![
+            Message::user("task"),
+            Message::assistant(vec![ContentBlock::Text("[对话摘要]\ncheckpoint".into())]),
+            Message::assistant(vec![planned_tool_use("t1")]),
+            Message::tool_results(vec![planned_tool_result("t1", "result")]),
+        ];
+        assert!(
+            validate_compacted_messages(&summary_only).is_ok(),
+            "summary-only assistant followed by a tool_use assistant must be accepted"
+        );
+
+        let plain_adjacent = vec![
+            Message::user("task"),
+            Message::assistant(vec![ContentBlock::Text("plain".into())]),
+            Message::assistant(vec![planned_tool_use("t1")]),
+            Message::tool_results(vec![planned_tool_result("t1", "result")]),
+        ];
+        assert!(
+            matches!(
+                validate_compacted_messages(&plain_adjacent),
+                Err(CompactError::InvalidHistory(_))
+            ),
+            "a non-summary assistant must not be allowed to precede another assistant"
+        );
     }
 
     #[test]
