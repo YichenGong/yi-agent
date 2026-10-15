@@ -94,7 +94,7 @@ pub fn resolve_real_llm_test_config() -> Result<Option<RealLlmTestConfig>, Strin
         let (default_api_url, default_model) = if provider == "anthropic" {
             ("https://api.anthropic.com", "claude-sonnet-4-20250514")
         } else {
-            ("https://api.openai.com", "gpt-4o")
+            ("https://api.openai.com/v1", "gpt-4o")
         };
         return Ok(Some(RealLlmTestConfig {
             provider,
@@ -126,7 +126,7 @@ pub fn resolve_real_llm_test_config() -> Result<Option<RealLlmTestConfig>, Strin
     let (api_url, model) = if provider == "anthropic" {
         ("https://api.anthropic.com", "claude-sonnet-4-20250514")
     } else {
-        ("https://api.openai.com", "gpt-4o")
+        ("https://api.openai.com/v1", "gpt-4o")
     };
     Ok(Some(RealLlmTestConfig {
         provider: provider.into(),

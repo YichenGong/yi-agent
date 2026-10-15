@@ -174,6 +174,31 @@ export async function setThreadReasoningEffort(
 }
 
 /**
+ * 用当前草稿值（未保存也能测）发一次最小探测。
+ *
+ * `api_key` 省略即「让服务端按 `name` 取已存明文 key」——桌面端从不持有明文，
+ * 与 `upsertModel` 的「省略即保留」同一条安全约定。回包 `ok/reason` 缺字段时
+ * 保守地当作失败，避免把「宿主少发字段」误报成连接成功。
+ */
+export async function testModel(
+  rpc: ModelRpc,
+  input: { provider: string; model: string; api_url: string; api_key?: string; name?: string },
+): Promise<{ ok: boolean; reason: string | null }> {
+  const params: Record<string, unknown> = {
+    provider: input.provider,
+    model: input.model,
+    api_url: input.api_url,
+  };
+  if (input.api_key !== undefined) params.api_key = input.api_key;
+  else if (input.name !== undefined) params.name = input.name;
+  const result = await rpc<{ ok?: unknown; reason?: unknown }>("model/test", params);
+  return {
+    ok: result?.ok === true,
+    reason: typeof result?.reason === "string" ? result.reason : null,
+  };
+}
+
+/**
  * 该错误是否为「引用了不存在的模型」。
  *
  * 结构化码优先：宿主在 `data.code` 里放稳定的 `model_not_found`（数字码

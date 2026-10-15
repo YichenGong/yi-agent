@@ -262,6 +262,45 @@ fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
     Ok(json!({ "ok": true, "name": name, "default_model": name }))
 }
 
+/// 把 `model/test` 的入参解析成一份可探测的 [`ModelSettings`]。
+///
+/// 密钥解析是本函数的核心：桌面端的 key 框不回填（明文从不经过桌面端），
+/// 因此「编辑已有条目但没改 key」时，只能由服务端按 `name` 取已存明文 key。
+/// 两者都拿不到时明确拒绝，绝不用空 key 去发一次注定 401 的探测。
+pub fn resolve_test_settings(
+    path: &Path,
+    params: &Value,
+) -> Result<yi_agent_runtime::onboarding::ModelSettings, RpcError> {
+    let provider = string_field(params, "provider").unwrap_or_default();
+    let model = string_field(params, "model").unwrap_or_default();
+    let api_url = string_field(params, "api_url").unwrap_or_default();
+
+    let explicit = string_field(params, "api_key").filter(|k| !k.is_empty());
+    let api_key = match explicit {
+        Some(key) => key,
+        None => {
+            let name = string_field(params, "name").unwrap_or_default();
+            let stored = load_catalog_from(path)
+                .models
+                .into_iter()
+                .find(|e| e.name == name)
+                .map(|e| e.api_key)
+                .filter(|k| !k.is_empty());
+            stored.ok_or_else(|| RpcError::invalid_model("请填写 API 密钥"))?
+        }
+    };
+
+    let settings = yi_agent_runtime::onboarding::ModelSettings {
+        provider,
+        model,
+        api_url,
+        api_key,
+    };
+    yi_agent_runtime::onboarding::validate_settings(&settings)
+        .map_err(|e| RpcError::invalid_model(e.to_string()))?;
+    Ok(settings)
+}
+
 /// `api_key` 入参的三种形态；见 [`upsert`] 的语义注释。
 enum KeyInput {
     Keep,
@@ -812,5 +851,55 @@ mod tests {
         let list = call(&path, "model/list", json!({})).unwrap();
         assert!(list["models"][0]["api_style"].is_null());
         assert!(list["models"][0]["reasoning_effort"].is_null());
+    }
+
+    /// 显式给出 api_key 时用它——新增模型/改过 key 的场景。
+    #[test]
+    fn test_settings_prefer_explicit_api_key() {
+        let (dir, path) = catalog_path();
+        let _ = dir;
+        let params = json!({
+            "provider": "openai",
+            "model": "m",
+            "api_url": "https://x/v1",
+            "api_key": "sk-draft",
+        });
+        let settings = resolve_test_settings(&path, &params).unwrap();
+        assert_eq!(settings.api_key, "sk-draft");
+        assert_eq!(settings.api_url, "https://x/v1");
+    }
+
+    /// 没给 api_key 时按条目名取已存明文 key——编辑但没改 key 的场景。
+    #[test]
+    fn test_settings_fall_back_to_named_entry_key() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"openai","api_url":"https://a/v1","model":"m","api_key":"sk-stored"}),
+        )
+        .unwrap();
+
+        let params = json!({
+            "provider": "openai",
+            "model": "m",
+            "api_url": "https://a/v1",
+            "name": "A",
+        });
+        let settings = resolve_test_settings(&path, &params).unwrap();
+        assert_eq!(settings.api_key, "sk-stored");
+    }
+
+    /// 既没 api_key 也没可命中的 name → 结构化拒绝，绝不用空 key 去探测。
+    #[test]
+    fn test_settings_reject_when_no_key_available() {
+        let (_dir, path) = catalog_path();
+        let params = json!({
+            "provider": "openai",
+            "model": "m",
+            "api_url": "https://a/v1",
+            "name": "missing",
+        });
+        assert!(resolve_test_settings(&path, &params).is_err());
     }
 }

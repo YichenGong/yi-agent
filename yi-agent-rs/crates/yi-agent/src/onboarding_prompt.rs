@@ -17,7 +17,7 @@ pub(crate) fn should_offer(env_path: &Path, preferences_path: &Path) -> bool {
 /// provider 的默认 (api_url, model)，与 `config.rs` 的默认值同源。
 pub(crate) fn provider_defaults(provider: &str) -> (&'static str, &'static str) {
     if provider == "openai" {
-        ("https://api.openai.com", "gpt-4o")
+        ("https://api.openai.com/v1", "gpt-4o")
     } else {
         ("https://api.anthropic.com", "claude-sonnet-4-20250514")
     }
@@ -147,7 +147,7 @@ mod tests {
     fn provider_defaults_cover_both_providers() {
         assert_eq!(
             provider_defaults("openai"),
-            ("https://api.openai.com", "gpt-4o")
+            ("https://api.openai.com/v1", "gpt-4o")
         );
         assert_eq!(
             provider_defaults("anthropic"),

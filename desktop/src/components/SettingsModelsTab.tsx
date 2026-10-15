@@ -6,6 +6,7 @@ import {
   listModels,
   setDefaultModel,
   setSubagentModel,
+  testModel,
   upsertModel,
   type EffectiveModel,
   type ModelEntryView,
@@ -58,6 +59,15 @@ const EMPTY: ModelList = {
 /** 「跟随全局默认」哨兵值：模型名不可能是空串（宿主拒绝空名），故 `""` 安全。 */
 const FOLLOW_GLOBAL = "";
 
+/**
+ * openai 兼容网关的地址通常以 `/v1` 结尾。这里只做启发式提醒，不下硬结论：
+ * 含 `/v1` 前缀（如 `/openai/v1`）即视为无虞，无法判断的（如 `/api`）宁可少提示。
+ */
+function suspectsMissingV1(entry: ModelEntryView): boolean {
+  if (entry.provider !== "openai") return false;
+  return !entry.api_url.trimEnd().replace(/\/+$/, "").endsWith("/v1");
+}
+
 /** 把写失败翻成一句给人看的话；「模型不存在」单列，因为它对应的是「被删了」。 */
 function saveErrorText(error: unknown): string {
   if (isModelNotFound(error)) return "模型不存在，可能已被删除";
@@ -97,6 +107,11 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 最近一次「测试」的结论：null = 还没测；测成功显示成功，失败显示原因。 */
+  const [testResult, setTestResult] = useState<
+    { ok: boolean; reason: string | null } | null
+  >(null);
+  const [testing, setTesting] = useState(false);
   /** 「▸ 高级」折叠区：默认收起，普通用户无需展开。 */
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
@@ -156,6 +171,7 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       reasoning_effort: UNSET,
     });
     setAdvancedOpen(false);
+    setTestResult(null);
   };
 
   const startEdit = (entry: ModelEntryView) => {
@@ -173,6 +189,7 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       reasoning_effort: entry.reasoning_effort ?? UNSET,
     });
     setAdvancedOpen(false);
+    setTestResult(null);
   };
 
   const saveDraft = async () => {
@@ -199,6 +216,31 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
       setActionError(saveErrorText(error));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const runTest = async () => {
+    if (!rpc || !draft) return;
+    setTesting(true);
+    setTestResult(null);
+    setActionError(null);
+    try {
+      // key 解析约定：改过 key 就传草稿 key，否则传条目名让服务端取已存 key。
+      const result = await testModel(rpc, {
+        provider: draft.provider,
+        model: draft.model,
+        api_url: draft.api_url,
+        ...(draft.keyEdited
+          ? { api_key: draft.api_key }
+          : draft.original !== null
+            ? { name: draft.original }
+            : { api_key: draft.api_key }),
+      });
+      setTestResult(result);
+    } catch (error) {
+      setTestResult({ ok: false, reason: saveErrorText(error) });
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -312,7 +354,14 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
                 <td className="py-1.5 pr-2 text-fg">{entry.name}</td>
                 <td className="py-1.5 pr-2 text-fg-muted">{entry.provider}</td>
                 <td className="py-1.5 pr-2 text-fg-muted">{entry.model}</td>
-                <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">{entry.api_url}</td>
+                <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">
+                  {entry.api_url}
+                  {suspectsMissingV1(entry) && (
+                    <span className="ml-2 font-sans text-fg-muted">
+                      （OpenAI 兼容接口地址通常以 /v1 结尾，请确认）
+                    </span>
+                  )}
+                </td>
                 {/* key 只以掩码示人：原始值从不经过桌面端。 */}
                 <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">
                   {entry.has_key ? entry.api_key_masked : "未设置"}
@@ -511,6 +560,14 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
           <div className="mt-3 flex items-center gap-2">
             <button
               type="button"
+              onClick={() => void runTest()}
+              disabled={testing || !rpc}
+              className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg-muted hover:text-fg disabled:opacity-50"
+            >
+              {testing ? "测试中…" : "测试"}
+            </button>
+            <button
+              type="button"
               onClick={() => void saveDraft()}
               disabled={busy || !rpc}
               className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg-muted hover:text-fg disabled:opacity-50"
@@ -528,6 +585,13 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
               取消
             </button>
           </div>
+          {testResult !== null && (
+            <p
+              className={`mt-2 text-xs ${testResult.ok ? "text-green-400" : "text-red-400"}`}
+            >
+              {testResult.ok ? "连接成功" : (testResult.reason ?? "连接失败")}
+            </p>
+          )}
         </div>
       )}
     </section>

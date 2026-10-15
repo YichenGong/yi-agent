@@ -2710,6 +2710,33 @@ where
                             }
                         }
                     }
+                    // 探测只发一次最小请求、**不落盘**：与 `onboarding/test` 同档
+                    // （触及密钥，需 Control），且因探测是 async 而单独开分支。
+                    "model/test" => {
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub,
+                                &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let settings =
+                            match crate::model_rpc::resolve_test_settings(&models_path, &req.params) {
+                                Ok(s) => s,
+                                Err(error) => {
+                                    write_response(&hub, &client, err_response(id, error)).await?;
+                                    continue;
+                                }
+                            };
+                        let outcome = yi_agent_runtime::onboarding::test_connection(&settings).await;
+                        let value = serde_json::json!({
+                            "ok": outcome.ok,
+                            "reason": outcome.reason,
+                        });
+                        write_response(&hub, &client, ok_response(id, value)).await?;
+                    }
                     // 首次安装引导。与 `model/*` 同档:`onboarding/status` 只读
                     // (Observe);apply/dismiss/test 都触及密钥或落盘,需 `Control`。
                     "onboarding/status" => {

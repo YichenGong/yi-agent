@@ -20,7 +20,7 @@ export type OnboardingOutcome = { imported: boolean; importError?: string };
 
 const DEFAULT_URL = {
   anthropic: "https://api.anthropic.com",
-  openai: "https://api.openai.com",
+  openai: "https://api.openai.com/v1",
 } as const;
 const DEFAULT_MODEL = {
   anthropic: "claude-sonnet-4-20250514",
