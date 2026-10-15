@@ -36,6 +36,19 @@ pub fn responses_request_from(req: ProviderRequest) -> ResponsesRequest {
         match m.role {
             Role::User => input.push(user_item(&m.content)),
             Role::Assistant => {
+                // reasoning item 必须在 function_call 之前——与服务端返回顺序一致。
+                for b in &m.content {
+                    if let ContentBlock::Thinking {
+                        token: yi_agent_core::ThinkingToken::Encrypted(enc),
+                        ..
+                    } = b
+                    {
+                        input.push(serde_json::json!({
+                            "type": "reasoning",
+                            "encrypted_content": enc
+                        }));
+                    }
+                }
                 let text: String = m
                     .content
                     .iter()
@@ -200,7 +213,7 @@ fn image_url_part(source: &ImageSource) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yi_agent_core::{GenParams, ImageDetail, Message, ToolSchema};
+    use yi_agent_core::{GenParams, ImageDetail, Message, ThinkingToken, ToolSchema};
 
     const MARKER: &str = "\n[image attached in the following message]";
 
@@ -324,5 +337,66 @@ mod tests {
         assert_eq!(input[0]["output"], format!("error: boom{MARKER}"));
         assert_eq!(input[1]["role"], "user");
         assert_eq!(input[1]["content"][0]["type"], "input_image");
+    }
+
+    #[test]
+    fn reasoning_item_is_replayed_before_function_call() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let req = ProviderRequest {
+            model: "gpt-6-sol".into(),
+            system: None,
+            messages: vec![Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "".into(),
+                    token: ThinkingToken::Encrypted("enc-blob".into()),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                },
+            ])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let body = serde_json::to_value(responses_request_from(req)).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let reasoning_at = input
+            .iter()
+            .position(|i| i["type"] == "reasoning")
+            .expect("reasoning item must be present");
+        let call_at = input
+            .iter()
+            .position(|i| i["type"] == "function_call")
+            .expect("function_call must be present");
+        assert!(
+            reasoning_at < call_at,
+            "reasoning must precede function_call"
+        );
+        assert_eq!(input[reasoning_at]["encrypted_content"], "enc-blob");
+    }
+
+    // ---- 以下为超出 brief 的防御性用例 ----
+
+    #[test]
+    fn non_encrypted_thinking_tokens_yield_no_reasoning_item() {
+        // Signature/Redacted/None 都是非本通道凭证，不得伪装成 reasoning item。
+        let tokens = vec![
+            ThinkingToken::Signature("sig".into()),
+            ThinkingToken::Redacted("red".into()),
+            ThinkingToken::None,
+        ];
+        for token in tokens {
+            let req = base_request(vec![Message::assistant(vec![ContentBlock::Thinking {
+                text: "summary".into(),
+                token: token.clone(),
+            }])]);
+            let body = serde_json::to_value(responses_request_from(req)).unwrap();
+            let input = body["input"].as_array().unwrap();
+            assert!(
+                !input.iter().any(|i| i["type"] == "reasoning"),
+                "token {token:?} must not produce a reasoning item: {input:?}"
+            );
+        }
     }
 }
