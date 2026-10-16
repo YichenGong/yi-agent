@@ -88,6 +88,16 @@ pub enum SessionCommand {
         effort: Option<String>,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// 切换该会话的跨轮 CoT 保留。`true` = 保留（默认）。
+    ///
+    /// 与 `SetReasoningEffort` 同构：provider 不变，只换 `AgentConfig` 后重建
+    /// agent。但**多一步**：切到 `false` 时必须先对 session 的消息执行
+    /// `strip_thinking`（全剥）并写回，否则已被剥离的凭证会在落盘的 transcript
+    /// 里「复活」，与开关语义直接矛盾（spec §4.1 的裁定）。
+    SetPreserveThinking {
+        preserve: bool,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// `/compact` 的三种结果。`NotReduced` 是"历史太短、无需压缩"，**不是错误**。
@@ -150,6 +160,7 @@ mod tests {
             SessionCommand::Compact { .. } => panic!("expected Clear"),
             SessionCommand::SetModel { .. } => panic!("expected Clear"),
             SessionCommand::SetReasoningEffort { .. } => panic!("expected Clear"),
+            SessionCommand::SetPreserveThinking { .. } => panic!("expected Clear"),
         }
         assert_eq!(answer.await.unwrap(), Ok(()));
     }

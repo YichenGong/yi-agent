@@ -244,6 +244,13 @@ pub enum Notification {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+    /// 该会话的跨轮 CoT 保留开关已切换。
+    ///
+    /// 与 `thread/reasoningEffortChanged` 并列：开关同为会话元数据，切换后必须让
+    /// **所有**客户端（桌面 + 手机）立即刷新各自的控件，否则一端改了、另一端停在
+    /// 旧值。它只带布尔开关、不带正文。
+    #[serde(rename = "thread/preserveThinkingChanged")]
+    PreserveThinkingChanged { thread_id: String, preserve: bool },
     /// 非致命运行期告知（通道回退 / effort 降级），状态栏级一行提示。
     ///
     /// 与 `turn/retry` 同为**内容层**（按 thread 路由）：它描述的是某条会话这一次
@@ -383,6 +390,7 @@ impl Notification {
             | Notification::ModelChanged { thread_id, .. }
             | Notification::PermissionModeChanged { thread_id, .. }
             | Notification::ReasoningEffortChanged { thread_id, .. }
+            | Notification::PreserveThinkingChanged { thread_id, .. }
             | Notification::Notice { thread_id, .. }
             | Notification::ReasoningDelta { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
@@ -430,6 +438,7 @@ impl Notification {
             | Notification::ModelChanged { .. }
             | Notification::PermissionModeChanged { .. }
             | Notification::ReasoningEffortChanged { .. }
+            | Notification::PreserveThinkingChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
@@ -809,6 +818,24 @@ mod tests {
             v["params"].get("effort").is_none(),
             "a cleared override must omit the field: {v}"
         );
+    }
+
+    /// 保留开关通知的 wire 形状:`thread/preserveThinkingChanged`,参数 snake_case。
+    /// 与 `reasoningEffortChanged` 同为列表层恒推,且按 thread 路由。
+    #[test]
+    fn preserve_thinking_changed_notification_carries_method_and_flag() {
+        let n = Notification::PreserveThinkingChanged {
+            thread_id: "t1".into(),
+            preserve: false,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/preserveThinkingChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["preserve"], false);
+        // 与 `reasoningEffortChanged` 同为会话元数据:必须列表层恒推,否则窗口外
+        // 会话的控件在不同客户端之间「概率性不同步」。
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
     }
 
     /// 运行期告知的 wire 形状:`thread/notice`,参数 snake_case,带 level。
