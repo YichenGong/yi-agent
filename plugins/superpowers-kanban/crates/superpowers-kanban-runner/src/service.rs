@@ -832,6 +832,71 @@ mod tests {
         );
     }
 
+    /// R1：`next_launch` 建 worktree 失败时，卡片必须**落盘**成 `Failed`。
+    ///
+    /// 这是本任务最容易被重新写坏的一处：`with_board` 的契约是「闭包返回 `Err`
+    /// 即不落盘」，而失败路径必须先落盘 `Failed`，所以闭包内必须成功返回
+    /// （`Ok(None)`）并把错误留到锁外再抛。谁若改回 `return Err(..)`，卡片会停在
+    /// `Launching`、永远不再被认领——下面直读 `board.json` 的断言正是钉这一点。
+    ///
+    /// 触发方式：预先占用分支名 `kanban/<slug>`，`git worktree add -b` 必因分支
+    /// 已存在而失败（`worktree.rs` 在该情形返回 `Err`）。
+    #[test]
+    fn next_launch_persists_failed_when_the_worktree_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // service_with_card 的 state_dir / home 落点（与它保持一致）。
+        let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
+        let leases_dir = dir.path().join("home/.yi-agent/superpowers-kanban/leases");
+        let slug = crate::worktree::slugify(&CardId::new("card-1"));
+        let branch = format!("kanban/{slug}");
+        git_run(&project, &["branch", &branch]);
+
+        // (a) 失败必须报出来（消息里带 "worktree for"）。
+        // 用 match 而不是 `expect_err`：`LaunchClaim` 未实现 `Debug`，为一条测试去
+        // 给产品类型加 derive 是扩大产品 API，这里避开即可。
+        let error = match service.next_launch(1, at()) {
+            Err(error) => error,
+            Ok(_) => panic!("a pre-existing branch must fail the worktree creation"),
+        };
+        assert!(error.contains("worktree for"), "{error}");
+
+        // (b) 经 list 看到 failed。
+        assert_eq!(state_of(&service, "card-1"), "failed");
+
+        // (c) 直读磁盘：`Failed` 必须已经落盘，而不是只活在闭包里的内存副本。
+        // （这正是 `return Err(..)` 会静默破坏的那条：闭包失败 → 改动被丢弃。）
+        let on_disk = persist::read_board(&state_dir);
+        assert_eq!(
+            on_disk.get(&CardId::new("card-1")).unwrap().state,
+            CardState::Failed,
+            "worktree failure must be persisted, not merely staged inside the closure"
+        );
+
+        // (d) 名额已释放：认领失败不能泄漏槽位（`claimed` 为 None → 租约就地 drop）。
+        // macOS 上 flock 的释放是异步的，故有界重试而不是裸断言。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match lease::acquire_in(&leases_dir, 1) {
+                Some(lease) => {
+                    drop(lease);
+                    break;
+                }
+                None => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the slot of a failed worktree creation was never released"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+
+        // 失败后队空、名额空闲：下一轮必须如实返回 None（而不是又抢一次槽）。
+        assert!(service.next_launch(1, at()).unwrap().is_none());
+    }
+
     #[test]
     fn mark_terminal_releases_the_slot_and_records_the_outcome() {
         let dir = tempfile::tempdir().unwrap();
@@ -1039,6 +1104,40 @@ mod tests {
             states["card-1"], "done",
             "merge success drives the origin card to done"
         );
+    }
+
+    /// R2：合并**前置**失败（source 分支缺失）必须把卡留在 `NeedsYou`（等人处理），
+    /// 而不是 `Failed`。`Failed` 只留给 `merge::run` 真的跑挂。
+    ///
+    /// 最便宜的确定触发：合并卡的 source 分支根本不存在（不建分支即可）。
+    #[test]
+    fn a_pre_merge_failure_keeps_the_card_needs_you_instead_of_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // 合并卡指向一个不存在的 source；origin 配一张已等合并的实现卡。
+        service.enqueue_merge_card_for_test("m1", "feat/x", "main", Some("card-1"));
+        service.mark_running("card-1", "thread-1").unwrap();
+        service
+            .mark_terminal("card-1", "awaiting_merge", None)
+            .unwrap();
+        // 故意不建 feat/x。
+
+        let claim = service.merge_next().unwrap().expect("a merge claim");
+        assert_eq!(claim.card_id, "m1");
+        assert!(
+            matches!(claim.outcome, MergeOutcome::GitError(_)),
+            "{:?}",
+            claim.outcome
+        );
+        assert_eq!(
+            state_of(&service, "m1"),
+            "needs_you",
+            "a missing source branch is a human-actionable pre-merge failure, not a git crash"
+        );
+        assert_ne!(state_of(&service, "m1"), "failed");
+        // origin 卡不受影响：只有真正合并成功才级联 done。
+        assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
     }
 
     /// 崩溃若发生在「置 Merging」之后、「回写终态」之前，board.json 会留下 `Merging`
