@@ -22,6 +22,28 @@
 - 无标签的会话行渲染必须与现状**逐像素一致**（不占位）。
 - TUI 不涉及本功能。
 
+### 运行环境（所有任务的测试命令都适用）
+
+本机 `cargo` **不在默认 PATH**，`npm`/`npx` 在 `/opt/homebrew/bin`。每条 cargo 命令都这样写：
+
+```bash
+export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test ...
+```
+
+给它**多个测试名过滤词**时必须用 `--` 分隔，否则 cargo 报 `unexpected argument`：
+
+```bash
+cargo test -p yi-agent-app-server --lib -- thread_store::tests::set_tag thread_store::tests::is_valid_tag
+```
+
+单个过滤词可省略 `--`（`cargo test -p yi-agent-app-server --lib thread_store` 可用），但为统一，计划中所有含多个过滤词或含 `::` 路径的命令一律用 `--`。前端命令：
+
+```bash
+export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run <file>
+```
+
+本机可能**同时有其它 worktree 在跑 cargo**（并发是常态，环境内存充裕）。不要因此改用 `cargo test --workspace`；始终按 crate 跑。
+
 ---
 
 ### Task 1: 存储层 — `ThreadMeta.tag` 与 `set_tag`
@@ -93,7 +115,7 @@
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib thread_store::tests::set_tag thread_store::tests::legacy_meta_without_tag thread_store::tests::is_valid_tag`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib -- thread_store::tests::set_tag thread_store::tests::legacy_meta_without_tag thread_store::tests::is_valid_tag`
 
 Expected: 编译失败，报 `no field tag`、`no method named set_tag`、`cannot find value TAG_IDS`。
 
@@ -151,7 +173,7 @@ pub fn is_valid_tag(id: &str) -> bool {
 
 - [ ] **Step 6: 跑测试确认通过**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib thread_store`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib thread_store`
 
 Expected: PASS（含既有 pin_seq 测试）。
 
@@ -243,7 +265,7 @@ git commit -m "feat(store): thread meta 增加颜色标签字段与 set_tag"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib settings_store::tests::load_tag_names settings_store::tests::save_tag_names`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib -- settings_store::tests::load_tag_names settings_store::tests::save_tag_names`
 
 Expected: 编译失败，报 `cannot find function load_tag_names`。
 
@@ -297,7 +319,7 @@ pub fn save_tag_names(
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib settings_store`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib settings_store`
 
 Expected: PASS（含既有 relay_url / theme 测试）。
 
@@ -372,7 +394,7 @@ git commit -m "feat(settings): preferences.json 支持标签显示名覆盖"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib protocol::tests::tag`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib protocol::tests::tag`
 
 Expected: 编译失败，报 `no variant named TagChanged`。
 
@@ -420,7 +442,7 @@ Expected: 编译失败，报 `no variant named TagChanged`。
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib protocol`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib protocol`
 
 Expected: PASS。
 
@@ -559,7 +581,7 @@ git commit -m "feat(protocol): 新增 thread/tagChanged 与 ui/tagNames/updated 
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::set_tag`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::set_tag`
 
 Expected: 失败——`thread/setTag` 是未知方法（测试会读到错误回包或超时断言不符）。
 
@@ -651,7 +673,7 @@ Expected: 失败——`thread/setTag` 是未知方法（测试会读到错误回
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::set_tag`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::set_tag`
 
 Expected: PASS（4 个测试）。
 
@@ -747,7 +769,7 @@ git commit -m "feat(app-server): thread/setTag RPC 与列表 tag 字段"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::ui_settings_read_returns_tag_names server::tests::ui_settings_write_broadcasts`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib -- server::tests::ui_settings_read_returns_tag_names server::tests::ui_settings_write_broadcasts`
 
 Expected: 失败（`tag_names` 尚未出现在 read 回包 / 未广播）。
 
@@ -874,7 +896,7 @@ const TAG_NAME_MAX_LEN: usize = 24;
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::ui_settings`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib server::tests::ui_settings`
 
 Expected: PASS（含既有 ui_settings 测试）。
 
@@ -977,7 +999,7 @@ describe("threadTags", () => {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd desktop && npx vitest run src/lib/threadTags.test.ts`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadTags.test.ts`
 
 Expected: FAIL，报找不到模块 `./threadTags`。
 
@@ -1056,7 +1078,7 @@ export function tagLabel(id: TagId, names: Record<TagId, string>): string {
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd desktop && npx vitest run src/lib/threadTags.test.ts`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadTags.test.ts`
 
 Expected: PASS（7 个用例）。
 
@@ -1143,7 +1165,7 @@ import { resolveTagNames } from "./threadTags";
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd desktop && npx vitest run src/lib/threadSearch.test.ts`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadSearch.test.ts`
 
 Expected: FAIL（"红" 搜不到，因为 `haystack` 还没并入标签名）。
 
@@ -1232,7 +1254,7 @@ export function filterThreadTree(
 
 - [ ] **Step 5: 跑测试确认通过**
 
-Run: `cd desktop && npx vitest run src/lib/threadSearch.test.ts`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadSearch.test.ts`
 
 Expected: PASS（含既有搜索用例）。
 
@@ -1367,7 +1389,7 @@ import { DEFAULT_TAG_NAMES, resolveTagNames } from "../lib/threadTags";
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 
 Expected: FAIL（找不到 `menuitemradio`、无 `data-thread-tag`）。
 
@@ -1519,13 +1541,13 @@ import { TAG_DOT_CLASS, TAG_IDS, isValidTagId, tagLabel, type TagId } from "../l
 
 - [ ] **Step 8: 跑测试确认通过**
 
-Run: `cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 
 Expected: PASS（含既有侧栏用例）。
 
 - [ ] **Step 9: 跑全量前端测试确认无回归**
 
-Run: `cd desktop && npm test`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npm test`
 
 Expected: PASS——含 `App.test.tsx`（含刚改过选择器的 `openBoardFor`）。
 
@@ -1599,7 +1621,7 @@ describe("applyTagChange", () => {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd desktop && npx vitest run src/lib/threadListUpdate.test.ts`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadListUpdate.test.ts`
 
 Expected: FAIL，报 `applyTagChange is not a function`。
 
@@ -1638,7 +1660,7 @@ export function applyTagChange(
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd desktop && npx vitest run src/lib/threadListUpdate.test.ts`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadListUpdate.test.ts`
 
 Expected: PASS。
 
@@ -1687,7 +1709,7 @@ Expected: PASS。
 
 - [ ] **Step 6: 跑测试确认失败**
 
-Run: `cd desktop && npx vitest run src/App.test.tsx -t "tagChanged"`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/App.test.tsx -t "tagChanged"`
 
 Expected: FAIL（无 `data-thread-tag` 节点）。
 
@@ -1776,7 +1798,7 @@ import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
 
 - [ ] **Step 8: 跑测试确认通过**
 
-Run: `cd desktop && npx vitest run src/App.test.tsx`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/App.test.tsx`
 
 Expected: PASS（含既有 App 用例）。
 
@@ -1892,7 +1914,7 @@ describe("SettingsTagsTab", () => {
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd desktop && npx vitest run src/components/SettingsTagsTab.test.tsx`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/SettingsTagsTab.test.tsx`
 
 Expected: FAIL，报找不到模块 `./SettingsTagsTab`。
 
@@ -2011,7 +2033,7 @@ export function SettingsTagsTab({
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd desktop && npx vitest run src/components/SettingsTagsTab.test.tsx`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/SettingsTagsTab.test.tsx`
 
 Expected: PASS（6 个用例）。
 
@@ -2080,7 +2102,7 @@ import type { TagId } from "../lib/threadTags";
 
 - [ ] **Step 7: 跑测试确认通过**
 
-Run: `cd desktop && npx vitest run src/components/SettingsDialog.test.tsx src/components/SettingsTagsTab.test.tsx`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/SettingsDialog.test.tsx src/components/SettingsTagsTab.test.tsx`
 
 Expected: PASS。
 
@@ -2116,7 +2138,7 @@ Expected: PASS。
 
 - [ ] **Step 9: 跑全量前端测试**
 
-Run: `cd desktop && npm test`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npm test`
 
 Expected: PASS（全绿）。
 
@@ -2150,13 +2172,13 @@ Expected: PASS，无回归。
 
 - [ ] **Step 2: fmt 与 lint**
 
-Run: `cd yi-agent-rs && cargo fmt --all && cargo fmt --all -- --check`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo fmt --all && cargo fmt --all -- --check`
 
 Expected: 无 diff、无报错。
 
 - [ ] **Step 3: 前端全量测试与类型检查**
 
-Run: `cd desktop && npm test && npx tsc --noEmit`
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npm test && npx tsc --noEmit`
 
 Expected: 测试全绿、类型无错。
 
@@ -2221,7 +2243,7 @@ Expected: 合并成功。若 `main` 上 `docs/superpowers/specs/2026-10-15-cot-r
 
 - [ ] **Step 3: 合并后再验一次**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server && cd ../desktop && npm test`
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server && cd ../desktop && npm test`
 
 Expected: PASS（合并结果与分支一致）。
 
