@@ -45,7 +45,11 @@ pub fn responses_request_from(req: ProviderRequest) -> ResponsesRequest {
                     {
                         input.push(serde_json::json!({
                             "type": "reasoning",
-                            "encrypted_content": enc
+                            "encrypted_content": enc,
+                            // 上游要求 reasoning item 必带 `summary`（省略即 400：
+                            // `Missing required parameter: 'input[1].summary'`），
+                            // 且**空数组也必须显式发**。
+                            "summary": []
                         }));
                     }
                 }
@@ -374,6 +378,34 @@ mod tests {
             "reasoning must precede function_call"
         );
         assert_eq!(input[reasoning_at]["encrypted_content"], "enc-blob");
+    }
+
+    #[test]
+    fn replayed_reasoning_item_always_carries_a_summary_field() {
+        // 上游硬要求：reasoning item 必须带 `summary`，省略即 400
+        //（实测 `Missing required parameter: 'input[1].summary'`）。空数组也必须显式发。
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let req = base_request(vec![Message::assistant(vec![
+            ContentBlock::Thinking {
+                text: "".into(),
+                token: ThinkingToken::Encrypted("enc-blob".into()),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            },
+        ])]);
+        let body = serde_json::to_value(responses_request_from(req)).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input
+            .iter()
+            .find(|i| i["type"] == "reasoning")
+            .expect("reasoning item must be present");
+        assert!(
+            reasoning.get("summary").is_some_and(|s| s.is_array()),
+            "reasoning item must carry an array `summary` field: {reasoning:?}"
+        );
     }
 
     // ---- 以下为超出 brief 的防御性用例 ----
