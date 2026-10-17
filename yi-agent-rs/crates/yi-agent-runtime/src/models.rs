@@ -380,12 +380,14 @@ pub fn mask_key(key: &str) -> String {
 
 /// 会话覆盖 → 全局默认 → 原 cfg 三级解析，返回改写了 provider/api_url/api_key/model
 /// 以及 `api_style` / `reasoning_effort` 的 cfg 克隆，其余字段保持原值。
+///
+/// 条目选择走 [`effective_entry_for`]：会话覆盖 > 整包注入 > 清单默认。
 pub fn resolve_effective(
     cfg: &RuntimeConfig,
     catalog: &ModelCatalog,
     session_override: Option<&str>,
 ) -> RuntimeConfig {
-    match effective_entry(catalog, session_override) {
+    match effective_entry_for(cfg, catalog, session_override) {
         Some(entry) => {
             let mut out = cfg.clone();
             out.provider = entry.provider.as_str().to_string();
@@ -412,7 +414,27 @@ pub fn resolve_effective(
     }
 }
 
-/// 会话覆盖命中则用它；否则全局默认；都命中不了返回 None（调用方回退 cfg）。
+/// 解析 `cfg` 与清单得到本次生效条目。优先级：会话覆盖 > 整包注入 > 清单默认。
+///
+/// 注入存在时**不看**清单默认：用户显式给的一整包压过持久化的默认值，
+/// 这正是「改了没反应」那个病的解药。
+pub fn effective_entry_for<'a>(
+    cfg: &RuntimeConfig,
+    catalog: &'a ModelCatalog,
+    session_override: Option<&str>,
+) -> Option<&'a ModelEntry> {
+    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
+    if let Some(entry) = session_override.and_then(by_name) {
+        return Some(entry);
+    }
+    if cfg.model_injected {
+        return None;
+    }
+    catalog.default_model.as_deref().and_then(by_name)
+}
+
+/// 无注入语境下的条目解析（启动期、`onboarding` 评估等）。等价于
+/// `effective_entry_for` 且 `cfg` 无注入标记。
 pub fn effective_entry<'a>(
     catalog: &'a ModelCatalog,
     session_override: Option<&str>,
@@ -887,6 +909,24 @@ mod resolve_tests {
     fn a_dangling_override_falls_back_to_the_default() {
         let out = resolve_effective(&cfg(), &catalog(), Some("gone"));
         assert_eq!(out.model, "model-a");
+    }
+
+    #[test]
+    fn an_injection_beats_the_catalog_default() {
+        let mut base = cfg();
+        base.model_injected = true;
+        base.model = "injected-model".into();
+        let out = resolve_effective(&base, &catalog(), None);
+        assert_eq!(out.model, "injected-model");
+    }
+
+    #[test]
+    fn a_session_override_still_beats_an_injection() {
+        let mut base = cfg();
+        base.model_injected = true;
+        base.model = "injected-model".into();
+        let out = resolve_effective(&base, &catalog(), Some("B"));
+        assert_eq!(out.model, "model-b");
     }
 
     #[test]

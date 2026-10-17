@@ -2320,8 +2320,9 @@ impl EffortSource {
 ///
 /// `current_model_ref` is the user-selected display name, and an absent one
 /// means "follow the catalog's `default_model`". This is the **same**
-/// entry-selection rule `startup_config_from_catalog` and the app-server's
-/// `effective_entry` use, so the effort `/effort` reports is the one the request
+/// entry-selection rule the startup resolver (`models::resolve_effective`) and
+/// the app-server's `effective_entry_for` use, so the effort `/effort` reports
+/// is the one the request
 /// carries — the cross-check is
 /// `main::tests::startup_sends_the_effort_the_tui_reports`.
 pub(crate) fn resolve_effort_state(
