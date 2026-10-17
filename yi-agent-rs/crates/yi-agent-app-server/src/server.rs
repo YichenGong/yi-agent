@@ -7514,6 +7514,7 @@ async fn start_thread_core(
         card_id: card_id.map(str::to_string),
         model_ref,
         reasoning_effort: None,
+        tag: None,
         // 新会话默认开启跨轮保留(与 `ThreadMeta` 的缺省语义一致)。
         preserve_thinking: true,
     };
@@ -13639,6 +13640,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
             })
             .unwrap();
@@ -15150,6 +15152,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
             })
             .unwrap();
@@ -15255,6 +15258,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: false,
             })
             .unwrap();
@@ -15348,6 +15352,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
             })
             .unwrap();
@@ -16669,6 +16674,7 @@ pub(crate) mod tests {
             card_id: card_id.map(str::to_string),
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
         };
         crate::thread_store::ThreadStore::new(dir)
@@ -17120,6 +17126,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
             })
             .unwrap();
@@ -17226,6 +17233,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
             })
             .unwrap();

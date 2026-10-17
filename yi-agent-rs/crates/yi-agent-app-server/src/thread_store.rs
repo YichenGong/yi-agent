@@ -22,6 +22,15 @@ pub enum ThreadMode {
     Yolo,
 }
 
+/// 合法的颜色标签 id。顺序即 UI 菜单顺序，**不含灰色**（深色主题下与「无标签」
+/// 难以区分）。
+pub const TAG_IDS: [&str; 6] = ["red", "orange", "yellow", "green", "blue", "purple"];
+
+/// 该字符串是否是合法的颜色标签 id。
+pub fn is_valid_tag(id: &str) -> bool {
+    TAG_IDS.contains(&id)
+}
+
 /// thread 元数据(`.meta.json` 的内容)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadMeta {
@@ -54,6 +63,10 @@ pub struct ThreadMeta {
     /// 「未设置＝不发该字段」）。旧 meta 缺字段时默认 None，零迁移。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 会话的颜色标签 id（`TAG_IDS` 之一）。`None` = 无标签。
+    /// 旧 meta 缺字段时默认 `None`（零迁移）。
+    #[serde(default)]
+    pub tag: Option<String>,
     /// 是否跨轮保留思考块（Anthropic thinking / Responses encrypted_content 等）。
     ///
     /// `true`（默认）= 历史轮的推理凭证原样回传与落盘；`false` = 请求前剥离历史轮、
@@ -404,6 +417,17 @@ impl ThreadStore {
     /// 返回 false 表示 thread 不存在或 meta 不可读。
     pub fn set_pin_seq(&self, id: &str, seq: Option<i64>) -> io::Result<bool> {
         Ok(self.update_meta(id, |meta| meta.pin_seq = seq)?.is_some())
+    }
+
+    /// 写入会话的颜色标签（`None` = 清除）。
+    ///
+    /// 有意**不**刷新 `updated_at`：打标签是用户视图标记而非 thread 活动，不应把
+    /// 会话顶到「最近更新」最前面（与 `set_pin_seq` / `set_permission_mode` 同理）。
+    /// 返回 false 表示 thread 不存在或 meta 不可读。
+    pub fn set_tag(&self, id: &str, tag: Option<&str>) -> io::Result<bool> {
+        Ok(self
+            .update_meta(id, |meta| meta.tag = tag.map(str::to_string))?
+            .is_some())
     }
 
     /// 更新该 thread 的模型覆盖选择（清单里的显示名），保留其余 meta 字段。
@@ -775,6 +799,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         card_id: None,
         model_ref: None,
         reasoning_effort: None,
+        tag: None,
         // 缺 meta 时从日志重建:无从得知曾经的开关,按默认「保留」解释。
         preserve_thinking: true,
     }
@@ -805,6 +830,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
         }
     }
@@ -1385,6 +1411,54 @@ mod tests {
     }
 
     #[test]
+    fn set_tag_sets_value_without_bumping_updated_at() {
+        let (_d, s) = store();
+        let mut m = meta("thread-a");
+        m.updated_at = 7;
+        s.create(&m).unwrap();
+        assert!(s.set_tag("thread-a", Some("red")).unwrap());
+        let got = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(got.tag.as_deref(), Some("red"));
+        assert_eq!(got.updated_at, 7, "打标签不得刷新 updated_at");
+    }
+
+    #[test]
+    fn set_tag_none_clears_it() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.set_tag("thread-a", Some("blue")).unwrap();
+        assert!(s.set_tag("thread-a", None).unwrap());
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.tag, None);
+    }
+
+    #[test]
+    fn set_tag_unknown_id_returns_false() {
+        let (_d, s) = store();
+        assert!(!s.set_tag("nope", Some("red")).unwrap());
+    }
+
+    #[test]
+    fn legacy_meta_without_tag_deserializes_to_none() {
+        let (_d, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        // 旧格式：没有 tag 字段。
+        let legacy = r#"{"thread_id":"thread-a","cwd":"/tmp","model":"m",
+            "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal"}"#;
+        std::fs::write(s.meta_path("thread-a"), legacy).unwrap();
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.tag, None);
+    }
+
+    #[test]
+    fn is_valid_tag_accepts_the_six_ids_only() {
+        for id in TAG_IDS {
+            assert!(is_valid_tag(id), "{id} 必须是合法标签");
+        }
+        assert!(!is_valid_tag("gray"), "不含灰色");
+        assert!(!is_valid_tag("RED"), "大小写敏感");
+        assert!(!is_valid_tag(""));
+    }
+
+    #[test]
     fn legacy_meta_without_pin_seq_deserializes_unpinned() {
         let (_d, s) = store();
         std::fs::create_dir_all(&s.root).unwrap();
@@ -1467,6 +1541,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
         }
     }
@@ -1841,6 +1916,7 @@ mod tests {
             card_id: Some("c1".into()),
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
         };
         let text = serde_json::to_string(&meta).unwrap();
@@ -1879,6 +1955,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
         };
         store.create(&meta).unwrap();
