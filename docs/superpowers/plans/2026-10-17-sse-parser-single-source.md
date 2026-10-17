@@ -151,7 +151,8 @@ impl SseLineParser {
 ///
 /// 分类必须在 `is_timeout()` 上做：一个 reqwest deadline 的 `Display` 是
 /// "error decoding response body"，不含 "timed out" 文本，只有 `is_timeout()`
-/// 会回溯 source 链；且要在 `is_decode()` 之前判定——后者也会匹配到它。
+/// 会回溯 source 链。因此这里**禁止**改用 `is_decode()`（或任何解码分支判定）来分类：
+/// 请求 deadline 的 `Display` 同样会匹配它，会把可重试的超时误判成不可重试的传输中断。
 pub struct SseStreamCore<S> {
     line_parser: SseLineParser,
     inner: S,
@@ -199,6 +200,7 @@ where
                     // 回到循环：若这一批 feed 还有残留帧则先发完，否则返回 None。
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    // `Network`（超时）分支由 tests/integration.rs 的 request_timeout_is_a_total_deadline_not_an_idle_timeout 端到端覆盖。
                     let error = if e.is_timeout() {
                         ProviderError::Network(format!("stream error: timed out: {e}"))
                     } else {
