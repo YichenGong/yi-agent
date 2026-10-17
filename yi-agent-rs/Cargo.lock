@@ -4965,6 +4965,7 @@ dependencies = [
  "yi-agent-core",
  "yi-agent-relay",
  "yi-agent-runtime",
+ "yi-agent-skills",
  "yi-agent-store",
  "yi-agent-subagent",
  "yi-agent-supervisors",

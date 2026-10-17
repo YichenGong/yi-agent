@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod server;
 pub mod session;
 pub mod settings_store;
+pub mod skill_rpc;
 pub mod theme_tool;
 pub mod thread_store;
 pub mod translate;
