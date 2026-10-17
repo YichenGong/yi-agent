@@ -9,6 +9,60 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use yi_agent_core::ApiStyle;
 
+/// `.env` 不再持有这些键；它们只认「真实进程环境 + CLI 覆盖」这一条整包注入路径。
+pub const MODEL_ENV_KEYS: &[&str] = &[
+    "YI_AGENT_PROVIDER",
+    "YI_AGENT_MODEL",
+    "YI_AGENT_MODEL_CONTEXT_LENGTH",
+    "MODEL_API_KEY",
+    "MODEL_API_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+];
+
+/// 加载任何 `.env` **之前**对模型键做一次进程环境快照。
+///
+/// 必要性：`dotenvy::from_path` 会把 `.env` 的值写进进程环境变量，之后
+/// `std::env::var("MODEL_API_KEY")` 无法分辨它是用户 shell 导出的、还是刚从
+/// `.env` 读进来的。快照是唯一能区分二者的时刻。
+pub struct ModelEnvSnapshot {
+    values: std::collections::BTreeMap<&'static str, Option<String>>,
+}
+
+impl ModelEnvSnapshot {
+    pub fn take() -> Self {
+        Self {
+            values: MODEL_ENV_KEYS
+                .iter()
+                .map(|key| {
+                    let value = std::env::var(key).ok().filter(|v| !v.is_empty());
+                    (*key, value)
+                })
+                .collect(),
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        self.values.get(key).cloned().flatten()
+    }
+}
+
+/// 把「因 `.env` 而出现」的模型键从进程环境剔除，避免泄漏给子进程。
+///
+/// 判据：快照里没有、现在却有 → 它必然来自 `.env`。真实进程环境里的键不动。
+fn prune_dotenv_model_keys(snapshot: &ModelEnvSnapshot) {
+    for key in MODEL_ENV_KEYS {
+        let from_real_env = snapshot.values.get(key).is_some_and(Option::is_some);
+        if !from_real_env && std::env::var(key).ok().is_some_and(|v| !v.is_empty()) {
+            unsafe {
+                std::env::remove_var(key);
+            }
+        }
+    }
+}
+
 /// Default resident subagent capacity, mirrored by
 /// `AgentWorkerFactory::max_resident_subagents`'s default so a factory that does
 /// not override it and a config that does not set it agree.
@@ -57,6 +111,9 @@ pub struct RuntimeConfig {
     pub skills_catalog_budget: usize,
     /// True if user explicitly set the budget via CLI flag or env var (skips interactive prompt).
     pub skills_catalog_budget_explicit: bool,
+    /// 本次配置是否来自「整包注入」（CLI flag 或真实进程环境变量）。
+    /// 为真时它压过清单的 `default_model`（会话覆盖仍在其上）。
+    pub model_injected: bool,
 }
 
 /// 来自 CLI flag 或 GUI 请求的纯数据覆盖项。不依赖 clap。
@@ -216,6 +273,8 @@ impl RuntimeConfig {
     }
 
     fn load_inner(overrides: &ConfigOverrides, allow_missing_key: bool) -> Result<Self> {
+        // 快照必须早于任何 .env 加载（见 `ModelEnvSnapshot` 的文档）。
+        let model_env = ModelEnvSnapshot::take();
         let local_env_path = resolve_env_path(overrides);
         let global_env_path = if is_workdir_explicit(overrides) {
             None
@@ -223,24 +282,42 @@ impl RuntimeConfig {
             resolve_global_env_path()
         };
         load_env_files(&local_env_path, global_env_path.as_deref());
+        prune_dotenv_model_keys(&model_env);
 
-        let provider = overrides
+        let injected_provider = overrides
             .provider
             .clone()
-            .or_else(|| std::env::var("YI_AGENT_PROVIDER").ok())
-            .unwrap_or_else(|| "anthropic".to_string());
-
-        let api_key = match overrides
+            .or_else(|| model_env.get("YI_AGENT_PROVIDER"));
+        let injected_model = overrides
+            .model
+            .clone()
+            .or_else(|| model_env.get("YI_AGENT_MODEL"));
+        let injected_url = overrides
+            .api_url
+            .clone()
+            .or_else(|| model_env.get("MODEL_API_URL"));
+        let injected_key = overrides
             .api_key
             .clone()
-            .or_else(|| std::env::var("MODEL_API_KEY").ok())
-        {
-            Some(key) if !key.is_empty() => key,
-            _ if allow_missing_key => String::new(),
-            Some(_) => bail!("API key is empty: set MODEL_API_KEY or use --api-key"),
-            None => bail!("API key required: set MODEL_API_KEY or use --api-key"),
-        };
+            .or_else(|| model_env.get("MODEL_API_KEY"));
 
+        // 「整包」判据：注入要生效，provider 与 api_key 必须给全。给一半即报错，
+        // 绝不拼出 anthropic 地址配 openai 模型名这类畸形组合。
+        let injection_present = injected_provider.is_some()
+            || injected_key.is_some()
+            || injected_url.is_some()
+            || injected_model.is_some();
+        let model_injected = injected_provider.is_some() && injected_key.is_some();
+        if injection_present && !model_injected {
+            bail!(
+                "incomplete model override: provide both provider and api_key \
+                 (got provider={}, api_key={}); use the settings UI to configure a model entry instead",
+                injected_provider.is_some(),
+                injected_key.is_some()
+            );
+        }
+
+        let provider = injected_provider.unwrap_or_else(|| "anthropic".to_string());
         let default_api_url = match provider.as_str() {
             "openai" => "https://api.openai.com/v1",
             _ => "https://api.anthropic.com",
@@ -249,18 +326,13 @@ impl RuntimeConfig {
             "openai" => "gpt-4o",
             _ => "claude-sonnet-4-20250514",
         };
-
-        let api_url = overrides
-            .api_url
-            .clone()
-            .or_else(|| std::env::var("MODEL_API_URL").ok())
-            .unwrap_or_else(|| default_api_url.to_string());
-
-        let model = overrides
-            .model
-            .clone()
-            .or_else(|| std::env::var("YI_AGENT_MODEL").ok())
-            .unwrap_or_else(|| default_model.to_string());
+        let api_url = injected_url.unwrap_or_else(|| default_api_url.to_string());
+        let model = injected_model.unwrap_or_else(|| default_model.to_string());
+        let api_key = match injected_key {
+            Some(key) => key,
+            _ if allow_missing_key => String::new(),
+            _ => bail!("API key required: set MODEL_API_KEY or use --api-key"),
+        };
 
         let max_turns = overrides
             .max_turns
@@ -290,8 +362,8 @@ impl RuntimeConfig {
             .filter(|s| !s.is_empty());
 
         let model_context_length = overrides.model_context_length.or_else(|| {
-            std::env::var("YI_AGENT_MODEL_CONTEXT_LENGTH")
-                .ok()
+            model_env
+                .get("YI_AGENT_MODEL_CONTEXT_LENGTH")
                 .and_then(|s| s.parse().ok())
         });
 
@@ -396,6 +468,7 @@ impl RuntimeConfig {
             sandbox_writable_roots,
             skills_catalog_budget,
             skills_catalog_budget_explicit,
+            model_injected,
         })
     }
 
@@ -447,6 +520,7 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         sandbox_writable_roots: Vec::new(),
         skills_catalog_budget: 8192,
         skills_catalog_budget_explicit: false,
+        model_injected: false,
     }
 }
 
@@ -567,6 +641,7 @@ mod tests {
     /// 测试用覆盖项:只设置 API key 和 workdir,其余走默认值。
     fn test_overrides() -> ConfigOverrides {
         ConfigOverrides {
+            provider: Some("anthropic".into()),
             api_key: Some("test-key".into()),
             workdir: Some(PathBuf::from(".")),
             ..Default::default()
@@ -762,7 +837,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = isolated_config_env();
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -798,7 +873,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = isolated_config_env();
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -825,7 +900,7 @@ mod tests {
     #[test]
     fn load_computes_threshold_from_context_and_ratio() {
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -854,7 +929,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = isolated_config_env();
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -879,7 +954,7 @@ mod tests {
     #[test]
     fn load_rejects_nonexistent_workdir() {
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -908,7 +983,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = isolated_config_env();
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -961,13 +1036,17 @@ mod tests {
         assert_eq!(config.model, "gpt-4o");
     }
 
+    /// `.env` 仍会被加载（非模型键需要它），但它**不再是模型 key 的来源**。
+    ///
+    /// 这是 Task 2 的语义翻转：同一个 `MODEL_API_KEY=...` 仍写进 `<dir>/.yi-agent/.env`，
+    /// 但整包注入只认「真实进程环境 + CLI 覆盖」，故它既不进 config，也不残留在进程
+    /// 环境里（`prune_dotenv_model_keys` 已剔除），更不会泄漏给子进程。
     #[test]
     fn load_reads_dotenv_file() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        env.remove("MODEL_API_KEY");
+        let _env = isolated_config_env();
         // 创建临时目录和 .yi-agent/.env 文件
         let temp_dir = std::env::temp_dir().join(".env_test_dotenv_dir");
         let yi_agent_dir = temp_dir.join(".yi-agent");
@@ -994,8 +1073,14 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
-        assert_eq!(config.api_key, "from-dotenv-file");
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
+        assert_eq!(config.api_key, "", "dotenv must not supply the model key");
+        assert!(!config.model_injected);
+        assert_eq!(
+            std::env::var("MODEL_API_KEY").ok(),
+            None,
+            "the key dotenvy injected must be pruned from the process env"
+        );
 
         std::fs::remove_dir_all(&temp_dir).ok();
     }
@@ -1053,6 +1138,82 @@ mod tests {
         };
         let path = resolve_env_path(&overrides);
         assert_eq!(path, PathBuf::from("/tmp/my-env-dir/.yi-agent/.env"));
+    }
+
+    #[test]
+    fn a_dotenv_model_key_never_reaches_the_config() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::TempDir::new().unwrap();
+        // `.env` 必须落在 `resolve_env_path` 会读的位置：<dir>/.yi-agent/.env。
+        let env_dir = dir.path().join(".yi-agent");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(env_dir.join(".env"), "MODEL_API_KEY=from-dotenv\n").unwrap();
+
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_WORKDIR", dir.path());
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_ne!(cfg.api_key, "from-dotenv");
+        assert_eq!(std::env::var("MODEL_API_KEY").ok(), None);
+    }
+
+    #[test]
+    fn a_real_process_env_key_still_injects() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = isolated_config_env();
+        env.set("MODEL_API_KEY", "from-shell");
+        env.set("YI_AGENT_PROVIDER", "openai");
+
+        let cfg = RuntimeConfig::load_lenient(&ConfigOverrides::default()).unwrap();
+        assert_eq!(cfg.api_key, "from-shell");
+        assert!(cfg.model_injected);
+    }
+
+    /// 剔除只针对「因 `.env` 而出现」的键；真实 shell 导出的键必须原样留在进程环境里
+    /// （它仍要能被 spawn 出去的子进程继承）。
+    #[test]
+    fn prune_leaves_a_real_process_env_key_alone() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = isolated_config_env();
+        env.set("MODEL_API_KEY", "from-shell");
+        env.set("YI_AGENT_PROVIDER", "openai");
+        let temp = tempfile::TempDir::new().unwrap();
+
+        RuntimeConfig::load_lenient(&ConfigOverrides {
+            workdir: Some(temp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::env::var("MODEL_API_KEY").ok().as_deref(),
+            Some("from-shell")
+        );
+        assert_eq!(
+            std::env::var("YI_AGENT_PROVIDER").ok().as_deref(),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn half_an_injection_is_an_error() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut env = isolated_config_env();
+        env.set("YI_AGENT_PROVIDER", "openai"); // no key anywhere
+        let result = RuntimeConfig::load_lenient(&ConfigOverrides::default());
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1161,12 +1322,13 @@ mod tests {
         let _cwd = CurrentDirGuard::change_to(&temp);
 
         // 清除可能干扰的环境变量
-        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR", "MODEL_API_KEY"]);
+        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR", "MODEL_API_KEY", "YI_AGENT_PROVIDER"]);
         env.remove("YI_AGENT_WORKDIR");
+        env.remove("YI_AGENT_PROVIDER");
         env.remove("MODEL_API_KEY");
 
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -1199,11 +1361,11 @@ mod tests {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
+        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR", "YI_AGENT_PROVIDER", "MODEL_API_KEY"]);
         // 设置空字符串环境变量,应该 fallback 到 current_dir 而非变成空路径
         env.set("YI_AGENT_WORKDIR", "");
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -1388,7 +1550,7 @@ mod tests {
     #[test]
     fn load_yolo_defaults_false() {
         let overrides = ConfigOverrides {
-            provider: None,
+            provider: Some("anthropic".into()),
             api_url: None,
             api_key: Some("test-key".into()),
             model: None,
@@ -1434,6 +1596,7 @@ mod tests {
         let _env = isolated_config_env();
         let temp = tempfile::TempDir::new().expect("tempdir");
         let overrides = ConfigOverrides {
+            provider: Some("anthropic".into()),
             api_key: Some("sk-test".into()),
             workdir: Some(temp.path().to_path_buf()),
             ..ConfigOverrides::default()
@@ -1451,6 +1614,7 @@ mod tests {
         env.set("YI_AGENT_MAX_RESIDENT_SUBAGENTS", "8");
         let temp = tempfile::TempDir::new().expect("tempdir");
         let overrides = ConfigOverrides {
+            provider: Some("anthropic".into()),
             api_key: Some("sk-test".into()),
             workdir: Some(temp.path().to_path_buf()),
             ..ConfigOverrides::default()
@@ -1467,6 +1631,7 @@ mod tests {
         let mut env = isolated_config_env();
         let temp = tempfile::TempDir::new().expect("tempdir");
         let overrides = ConfigOverrides {
+            provider: Some("anthropic".into()),
             api_key: Some("sk-test".into()),
             workdir: Some(temp.path().to_path_buf()),
             ..ConfigOverrides::default()

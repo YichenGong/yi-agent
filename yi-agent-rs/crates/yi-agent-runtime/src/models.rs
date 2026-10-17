@@ -841,6 +841,7 @@ mod resolve_tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 0,
             skills_catalog_budget_explicit: false,
+            model_injected: false,
         }
     }
 
