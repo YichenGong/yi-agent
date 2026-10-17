@@ -41,6 +41,7 @@
 | 12 | 组长起 thread | **起真 thread**（与用户起的同构，带 `created_by` 标记），不占 `MAX_DIRECT_CHILDREN` |
 | 13 | 组长目标 | **由用户在 IM 里给**；后台只围绕该意图盯梢推进，不自创目标 |
 | 14 | 唤醒条件 | **事件驱动 + 低频兜底 tick** |
+| 15 | 项目纪律 | **靠 system prompt 注入**（`<workdir>/AGENTS.md`），不在 lead 派活时重复强调；该注入曾于 2026-08-15 被 merge 静默丢弃，已恢复（§7.7） |
 
 ## 3. 概念模型
 
@@ -277,6 +278,31 @@ lead，走 `ask_lead`（§5）。
 ——归纳仍是一份 `memory.md`，不引入新载体；也可配合 §7.1 的索引思路，给条目加可检索
 的头部。触发时应当留痕（§8），因为归纳会丢信息。
 
+### 7.7 前提：项目纪律靠注入，不靠 lead 每次强调
+
+lead 起的 thread 必须遵守项目纪律（本项目即「开始任何动作前先加载 `using-superpowers`」）。
+**这个前提曾不成立**，现已修复：
+
+- `be027f46 feat: load project AGENTS instructions` 曾完整实现 `<workdir>/AGENTS.md`
+  注入（含 3 个测试），经 `f5dc5ce4` 合入主线。
+- 在 `34c63d2c merge: integrate subagent runtime` 中，提示词助手取了从未携带该功能的
+  一侧，实现被**静默丢弃**；此后 `b4a7018e` 搬迁装配时 `resolve_system_prompt` 已只剩
+  `(user)` 参数，功能无从搬起。项目文档只记了现象（「全仓未找到实现」），未记根因。
+- **已恢复**：只读 `<workdir>/AGENTS.md`（不向父目录搜索、缺失即 `None`、其它 IO 错误记
+  警告后按缺失处理），注入顺序固定为 默认 prompt → user prompt → 项目指令 → 日期；
+  `build_prompt_setup` 与 `build_catalog_handle` 两个入口都传 `workdir`，因此
+  **catalog 非空的常规路径也带上项目指令**。代码：
+  `yi-agent-rs/crates/yi-agent-runtime/src/bootstrap.rs`；验证：
+  `cargo test -p yi-agent-runtime --lib resolve_system_prompt_`、
+  `cargo test -p yi-agent-runtime --lib catalog_handle_carries_project_instructions`。
+
+**为什么这决定了「不需要额外强调」**：纪律现在是 system prompt 的一部分，对
+用户起的 thread、lead 起的 thread、lead 自己、TUI、桌面**一律生效**。因此
+**不在 lead 派活时重复写强调语**——那会依赖 LLM 每次记得写，而机制保证远比
+提示词自律可靠。若将来发现某个前端路径不经过 `build_prompt_setup`，正确做法是
+修那条路径，而不是在 lead 的 objective 里打补丁。
+
+
 ## 8. 权限边界与审计
 
 后台循环可写：取消 / 打回 / 改 objective。但每个动作必须：
@@ -321,6 +347,7 @@ lead 状态本就是 `Delivery::List` 层（`protocol.rs:434`），恒推不违�
 | lead 长寿命导致上下文被压碎 | 可再生信息每轮现算、不进历史；不可再生的落 `memory.md`（§6.4、§7.3） |
 | `memory.md` 变成第二个真相源 | 职责收窄为「不可再生」；只经 `lead_remember` 写；可再生的一律不进（§7.3） |
 | `memory.md` 无限增长 | **本期接受为已知限制**（§7.6）：渐进劣化、非悬崖；将来在 `lead_remember` 加归纳压缩 |
+| lead 起的 thread 不遵守项目纪律 | 已从根上修：项目指令注入 system prompt，全体生效（§7.7）；**不靠** lead 重复强调 |
 
 ## 11. 实现分期
 
