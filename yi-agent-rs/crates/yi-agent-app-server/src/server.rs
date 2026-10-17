@@ -1417,8 +1417,9 @@ where
     // 工厂闭包 `'static`,拿不到主循环里的 `theme`;先克隆一份专供工厂。
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
-    // 清单在启动时读一次;`production_factory` 的闭包持有它,逐会话按 `model_ref` 解析。
-    let catalog = Arc::new(yi_agent_runtime::models::load_catalog());
+    // 清单按指纹跟随 `models.json`:运行期改条目,新建 thread 立刻用上新值。
+    let catalog =
+        yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
     serve_stdio(
         reader,
         writer,
@@ -1490,8 +1491,9 @@ where
     spawn_board_watchman_loop(resident_dir.clone());
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
-    // 与 `run` 一致:清单启动读一次,工厂逐会话解析。
-    let catalog = Arc::new(yi_agent_runtime::models::load_catalog());
+    // 与 `run` 一致:清单按指纹跟随 `models.json`,工厂逐会话取当前值。
+    let catalog =
+        yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     serve_scoped_core(
         reader,
@@ -1628,7 +1630,7 @@ fn current_session_preserve_thinking() -> bool {
 pub(crate) fn production_factory(
     cfg: RuntimeConfig,
     theme: crate::theme_tool::ThemeHandle,
-    catalog: Arc<yi_agent_runtime::models::ModelCatalog>,
+    catalog: Arc<yi_agent_runtime::models::CatalogWatcher>,
 ) -> impl Fn(
     Option<yi_agent_core::Session>,
     &Path,
@@ -1642,6 +1644,8 @@ pub(crate) fn production_factory(
         thread_cfg.workdir = cwd.to_path_buf();
         thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
         let model_ref = current_session_model_ref();
+        // 取「当前」清单:运行期新增/修改的条目立刻可见(原先持启动快照)。
+        let catalog = catalog.current();
         // 按本次会话解析 provider/api_url/api_key/model;不中则原样回退 cfg。
         let mut thread_cfg = yi_agent_runtime::models::resolve_effective(
             &thread_cfg,
@@ -15052,7 +15056,7 @@ pub(crate) mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.workdir = dir.path().to_path_buf();
-        let factory = production_factory(cfg.clone(), test_theme(), test_catalog());
+        let factory = production_factory(cfg.clone(), test_theme(), fixed_watcher(test_catalog()));
         let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
         let tid = start_thread(&mut h).await;
 
@@ -19955,7 +19959,8 @@ pub(crate) mod tests {
         // 注入清单:全局默认即条目 A,且 A 带默认档 "low"(三个字段同源,免动 HOME)。
         let mut catalog = model_catalog_entries(Some("A"));
         catalog.models[0].reasoning_effort = Some("low".into());
-        let factory = production_factory(cfg.clone(), test_theme(), Arc::new(catalog));
+        let factory =
+            production_factory(cfg.clone(), test_theme(), fixed_watcher(Arc::new(catalog)));
         let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
         initialize(&mut h).await;
 
@@ -20042,7 +20047,11 @@ pub(crate) mod tests {
         // 注入清单且**无全局默认**:只有显式的 modelRef 才命中条目。生产工厂按
         // "B" 解析 ⇒ agent 实际跑 "model-b"。若实现改用「另读一次磁盘清单」来上报,
         // 在该清单里 B 不存在,就会报出别的模型,断言即失败。
-        let factory = production_factory(cfg.clone(), test_theme(), test_catalog_without_default());
+        let factory = production_factory(
+            cfg.clone(),
+            test_theme(),
+            fixed_watcher(test_catalog_without_default()),
+        );
         let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
         initialize(&mut h).await;
         h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"modelRef":"B"}}"#)
@@ -20109,7 +20118,7 @@ pub(crate) mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut cfg = test_config();
         cfg.workdir = dir.path().to_path_buf();
-        let factory = production_factory(cfg.clone(), test_theme(), test_catalog());
+        let factory = production_factory(cfg.clone(), test_theme(), fixed_watcher(test_catalog()));
         let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
         initialize(&mut h).await;
 
@@ -21027,6 +21036,83 @@ pub(crate) mod tests {
         Arc::new(model_catalog_entries(Some("A")))
     }
 
+    /// 固定快照 watcher:测试要的是「注入一份清单」,不是「跟随磁盘」。
+    fn fixed_watcher(
+        catalog: Arc<yi_agent_runtime::models::ModelCatalog>,
+    ) -> Arc<yi_agent_runtime::models::CatalogWatcher> {
+        yi_agent_runtime::models::CatalogWatcher::from_catalog(
+            std::path::PathBuf::new(),
+            (*catalog).clone(),
+        )
+    }
+
+    /// 运行期改 `models.json` 后,**新建** thread 必须用上新条目——这是
+    /// app-server 侧「工厂不再持启动快照」的直接断言。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_thread_started_after_a_catalog_change_uses_the_new_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{"models":[
+                {"name":"A","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-a","api_key":"k"},
+                {"name":"B","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-b","api_key":"k"}
+            ],"default_model":"A"}"#,
+        )
+        .unwrap();
+
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        cfg.provider = "openai".to_string();
+        cfg.api_key = "k".to_string();
+
+        let watcher = yi_agent_runtime::models::CatalogWatcher::new(models_path.clone());
+        let factory = production_factory(cfg.clone(), test_theme(), Arc::clone(&watcher));
+        let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+        initialize(&mut h).await;
+
+        // 第一个 thread:走默认条目 A。`Harness` 无 `read_until_id`,用既有
+        // 「循环 read_value 直到 id 匹配」的写法(见 server.rs 的 thread/start 测试)。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let first = loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(2)) {
+                break v;
+            }
+        };
+        assert_eq!(
+            first["result"]["model"].as_str(),
+            Some("model-a"),
+            "the first thread must run the entry present at startup"
+        );
+
+        // 运行期换默认条目(改 mtime + size),**不重启 app-server**。
+        std::fs::write(
+            &models_path,
+            r#"{"models":[
+                {"name":"A","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-a","api_key":"k"},
+                {"name":"B","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-b","api_key":"k"}
+            ],"default_model":"B"}"#,
+        )
+        .unwrap();
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/start","params":{}}"#)
+            .await;
+        let second = loop {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(3)) {
+                break v;
+            }
+        };
+        assert_eq!(
+            second["result"]["model"].as_str(),
+            Some("model-b"),
+            "a thread started after the change must use the new default entry"
+        );
+        h.shutdown().await;
+    }
+
     /// 同 [`test_catalog`] 但没有全局默认,用于断言「无默认时回退 cfg」。
     fn test_catalog_without_default() -> Arc<yi_agent_runtime::models::ModelCatalog> {
         Arc::new(model_catalog_entries(None))
@@ -21069,7 +21155,7 @@ pub(crate) mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let cfg = test_config();
         assert_ne!(cfg.model, "model-b", "precondition: cfg differs from entry");
-        let factory = production_factory(cfg, test_theme(), test_catalog());
+        let factory = production_factory(cfg, test_theme(), fixed_watcher(test_catalog()));
 
         let built = with_session_model_ref(Some("B".to_string()), || {
             factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
@@ -21083,7 +21169,8 @@ pub(crate) mod tests {
     #[test]
     fn an_unknown_model_ref_falls_back_to_the_catalog_default() {
         let dir = tempfile::TempDir::new().unwrap();
-        let factory = production_factory(test_config(), test_theme(), test_catalog());
+        let factory =
+            production_factory(test_config(), test_theme(), fixed_watcher(test_catalog()));
 
         let built = with_session_model_ref(Some("nope".to_string()), || {
             factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
@@ -21097,8 +21184,11 @@ pub(crate) mod tests {
     #[test]
     fn no_override_and_no_default_falls_back_to_the_global_cfg() {
         let dir = tempfile::TempDir::new().unwrap();
-        let factory =
-            production_factory(test_config(), test_theme(), test_catalog_without_default());
+        let factory = production_factory(
+            test_config(),
+            test_theme(),
+            fixed_watcher(test_catalog_without_default()),
+        );
 
         let built = with_session_model_ref(None, || {
             factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
@@ -21113,7 +21203,8 @@ pub(crate) mod tests {
     #[test]
     fn the_session_model_ref_does_not_leak_across_calls() {
         let dir = tempfile::TempDir::new().unwrap();
-        let factory = production_factory(test_config(), test_theme(), test_catalog());
+        let factory =
+            production_factory(test_config(), test_theme(), fixed_watcher(test_catalog()));
 
         let built = with_session_model_ref(Some("B".to_string()), || {
             factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
@@ -21135,7 +21226,11 @@ pub(crate) mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut catalog = model_catalog_entries(Some("A"));
         catalog.models[0].reasoning_effort = Some("low".into());
-        let factory = production_factory(test_config(), test_theme(), Arc::new(catalog));
+        let factory = production_factory(
+            test_config(),
+            test_theme(),
+            fixed_watcher(Arc::new(catalog)),
+        );
 
         // 会话覆盖 high → 胜过条目默认 low。
         let built = with_session_reasoning_effort(Some("high".to_string()), || {
@@ -21181,7 +21276,8 @@ pub(crate) mod tests {
     #[test]
     fn no_effort_anywhere_stays_unset() {
         let dir = tempfile::TempDir::new().unwrap();
-        let factory = production_factory(test_config(), test_theme(), test_catalog());
+        let factory =
+            production_factory(test_config(), test_theme(), fixed_watcher(test_catalog()));
         let built = factory(None, dir.path(), crate::thread_store::ThreadMode::Normal).unwrap();
         assert_eq!(built.agent.config().gen_params.reasoning_effort, None);
     }
@@ -21190,7 +21286,8 @@ pub(crate) mod tests {
     #[test]
     fn the_session_effort_override_does_not_leak_across_calls() {
         let dir = tempfile::TempDir::new().unwrap();
-        let factory = production_factory(test_config(), test_theme(), test_catalog());
+        let factory =
+            production_factory(test_config(), test_theme(), fixed_watcher(test_catalog()));
         let built = with_session_reasoning_effort(Some("max".to_string()), || {
             factory(None, dir.path(), crate::thread_store::ThreadMode::Normal)
         })
