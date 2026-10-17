@@ -446,6 +446,20 @@ export default function App() {
   );
 
   /**
+   * 「技能」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖即稳定；
+   * 若每次渲染换新身份，技能面板的读取 effect 会跟着重跑，把已展开的正文与滚动
+   * 位置一起冲掉。
+   */
+  const skillsCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
    * 图片读取的宿主接缝（`image/read`）。理由同 `pluginCall`：只闭合 `clientRef`，
    * 空依赖即稳定。`ChatView` 把它透传给每个气泡/工具卡的 `useImageData`，而那个
    * effect 依赖 `call`——一旦每次渲染换新函数身份，每张图都会重新分片拉取。
@@ -2469,6 +2483,12 @@ export default function App() {
         // 模型 Tab 同样走当前 transport（桌面 stdio = Admin），能调 model/*。
         // 用稳定的 `modelCall`（见上），别在这里内联箭头。
         modelCall={modelCall}
+        // 技能三层根同样按项目解析（`<项目>/.yi-agent/skills`），候选与默认值直接
+        // 复用插件那份——两者指的都是「项目目录下的 .yi-agent」，来源分叉会让用户
+        // 在两个面板里看到不同的项目列表。
+        skillsCall={skillsCall}
+        skillsProjects={pluginProjectPaths(workspaces, boards)}
+        skillsDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。
