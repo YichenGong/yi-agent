@@ -77,3 +77,34 @@ describe("SuperpowersKanbanBoard", () => {
     expect(screen.getByText(/done/i)).toBeTruthy();
   });
 });
+
+// 宽度自适应：长标题不能把看板撑出左右滚动条（用户报的「左右过宽」）。
+// jsdom 不做布局计算，这里只能钉住撑宽的两处成因类名——二者缺一即复发：
+// (1) 行容器不得再声明 `overflow-x-auto`（那就是左右滚动本身）；
+// (2) 四个列必须 `min-w-0`，否则 flex 项默认 `min-width:auto` 会取内容最小宽度，
+//     卡片标题（`truncate` = `white-space:nowrap`）的 min-content 就是整条标题宽，
+//     列拒绝收缩 → 整行溢出。窄屏则纵向堆叠，让「上下滑动」取代左右滑动。
+describe("SuperpowersKanbanBoard width adapts to the container", () => {
+  it("never enables a horizontal scrollbar on the board row", () => {
+    const { container } = render(<SuperpowersKanbanBoard cards={[card("q", "queued")]} />);
+    const row = container.firstElementChild as HTMLElement;
+    expect(row.className.split(/\s+/)).not.toContain("overflow-x-auto");
+  });
+
+  it("stacks the columns vertically on a narrow screen", () => {
+    const { container } = render(<SuperpowersKanbanBoard cards={[card("q", "queued")]} />);
+    const row = container.firstElementChild as HTMLElement;
+    const classes = row.className.split(/\s+/);
+    // 默认（窄屏）纵向堆叠，`md:` 以上才并排。
+    expect(classes).toContain("flex-col");
+    expect(classes).toContain("md:flex-row");
+  });
+
+  it("lets every column shrink so a long title cannot widen it", () => {
+    const { container } = render(<SuperpowersKanbanBoard cards={[card("q", "queued")]} />);
+    for (const label of ["QUEUED", "DOING", "NEED DECISION", "DONE"]) {
+      const column = container.querySelector(`[aria-label="看板列 ${label}"]`)!;
+      expect(column.className.split(/\s+/)).toContain("min-w-0");
+    }
+  });
+});
