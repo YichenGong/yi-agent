@@ -162,9 +162,12 @@ export function SettingsRemoteTab({
     setRevokingId(id);
     setDeviceError(null);
     try {
-      const result = (await call("device/revoke", { device_id: id })) as { removed?: boolean };
-      // 只有服务端确认删掉才撤行；`removed:false` 说明它还在。
-      if (result?.removed) setDevices((rows) => rows.filter((row) => row.id !== id));
+      // 服务端 ack 的字段名是 `revoked`（`server.rs` 的 `device/revoke` 分支）。
+      // 曾误读 `removed`——`undefined` 恒为假，于是服务端已经删掉记录、UI 却
+      // 什么都不做：按钮看起来「点了没用」。
+      const result = (await call("device/revoke", { device_id: id })) as { revoked?: boolean };
+      // 只有服务端确认删掉才撤行；`revoked:false` 说明它还在。
+      if (result?.revoked) setDevices((rows) => rows.filter((row) => row.id !== id));
     } catch (e) {
       setDeviceError(errorText(e));
     } finally {
