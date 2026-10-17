@@ -911,6 +911,18 @@ async fn run_loop(
             // Compaction replaced the history, so the incremental request-log
             // cursor no longer refers to this message vector.
             last_logged = 0;
+            // 压缩常态触发时会释放历史轮的推理凭证。用户显式选择跨轮保留
+            // （`preserve_thinking = true`）时，这次释放不得静默——发一条 Info 级
+            // 状态提示（与 §7 的降级提示同级：不弹窗、不进对话卡片）。关闭保留时
+            // 凭证本就逐轮剥离，无需告知。
+            if config.preserve_thinking {
+                let _ = tx
+                    .send(AgentEvent::Notice {
+                        level: NoticeLevel::Info,
+                        text: "已压缩历史，推理凭证已释放".into(),
+                    })
+                    .await;
+            }
         }
 
         turn += 1;
@@ -4990,6 +5002,173 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
+    }
+
+    /// 自动压缩会释放历史轮的推理凭证——`preserve_thinking=true` 时不得静默，
+    /// 必须发一条 Info 级 Notice 告知用户「凭证已释放」。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_emits_notice_about_released_credentials() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 200,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("summary text".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let config = AgentConfig {
+            compact_threshold: Some(100),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            preserve_thinking: true,
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        session.push(Message::user("old1"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply1".into(),
+        )]));
+        session.push(Message::user("old2"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply2".into(),
+        )]));
+        let mut agent =
+            Agent::new(Arc::new(provider), Arc::new(tools), config).with_session(session);
+
+        let stream = agent.run("prompt".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AutoCompacting { .. })),
+            "precondition: a compaction must have happened, events: {events:?}"
+        );
+        let notice = events.iter().find_map(|e| match e {
+            AgentEvent::Notice { text, level } => Some((text.clone(), *level)),
+            _ => None,
+        });
+        let (text, level) = notice.expect("compaction must emit a Notice, events: {events:?}");
+        assert_eq!(level, crate::provider::NoticeLevel::Info);
+        assert!(
+            text.contains("凭证"),
+            "the notice must say the credentials were released, got: {text}"
+        );
+        // 排序：Notice 应与压缩同一分支产出（紧随 AutoCompacting 之后），
+        // 而非拖到轮末。
+        let compact_at = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::AutoCompacting { .. }))
+            .unwrap();
+        let notice_at = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Notice { .. }))
+            .unwrap();
+        assert!(
+            notice_at > compact_at,
+            "the notice follows the compaction, got compact@{compact_at} notice@{notice_at}"
+        );
+    }
+
+    /// 反面：`preserve_thinking=false` 时凭证本就跨轮剥离，压缩无需再告知——
+    /// 不得多发一条 Notice（用户已选择不保留）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_without_preserve_emits_no_notice() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 200,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("summary text".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let config = AgentConfig {
+            compact_threshold: Some(100),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            preserve_thinking: false,
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        session.push(Message::user("old1"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply1".into(),
+        )]));
+        session.push(Message::user("old2"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply2".into(),
+        )]));
+        let mut agent =
+            Agent::new(Arc::new(provider), Arc::new(tools), config).with_session(session);
+
+        let stream = agent.run("prompt".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AutoCompacting { .. })),
+            "precondition: a compaction must have happened, events: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { .. })),
+            "preserve_thinking=false must not emit the credentials-released notice, \
+             events: {events:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
