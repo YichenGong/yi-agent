@@ -101,6 +101,24 @@ describe("SettingsDialog", () => {
     fireEvent.click(screen.getByRole("tab", { name: "模型" }));
     expect(await screen.findByText("还没有配置任何模型")).toBeTruthy();
   });
+
+  it("shows the 标签 tab and forwards a name edit", async () => {
+    const saveTagName = vi.fn();
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        saveTagName={saveTagName}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "标签" }));
+    const input = document.querySelector<HTMLInputElement>('[data-tag-name-input="red"]')!;
+    fireEvent.change(input, { target: { value: "紧急" } });
+    fireEvent.blur(input);
+    expect(saveTagName).toHaveBeenCalledWith("red", "紧急");
+  });
 });
 
 describe("SettingsDialog focus management & tab wiring", () => {

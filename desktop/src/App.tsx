@@ -1288,6 +1288,23 @@ export default function App() {
     }
   };
 
+  /**
+   * 保存单个颜色标签的显示名。
+   *
+   * 只提交改动的那一个键（服务端按键合并），成功后用**服务端**读回的覆盖项重建
+   * 本地映射——服务端是权威，本端不自行猜测合并结果。广播随后到达，两端一致。
+   */
+  const saveTagName = async (tagId: TagId, name: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("ui/settings/write", { tag_names: { [tagId]: name } });
+      force((v) => v + 1);
+    } catch (e) {
+      setCurrentError(formatError(e));
+    }
+  };
+
   /** 置顶分区内拖拽排序落盘；乐观更新 + 失败回滚重拉。 */
   const onReorderPinned = async (orderedIds: string[]) => {
     const c = clientRef.current;
@@ -2527,6 +2544,8 @@ export default function App() {
         relayUrl={relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
         saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}
+        tagNames={tagNames}
+        saveTagName={saveTagName}
       />
     </>
   );

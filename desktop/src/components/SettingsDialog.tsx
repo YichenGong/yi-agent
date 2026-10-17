@@ -5,6 +5,8 @@ import { SettingsGeneralTab } from "./SettingsGeneralTab";
 import { SettingsRemoteTab, type RemoteCall } from "./SettingsRemoteTab";
 import { SettingsPluginsTab } from "./SettingsPluginsTab";
 import { SettingsModelsTab } from "./SettingsModelsTab";
+import { SettingsTagsTab } from "./SettingsTagsTab";
+import { DEFAULT_TAG_NAMES, type TagId } from "../lib/threadTags";
 
 /** 左侧 Tab 栏。加一个 Tab 只需往这张表里加项，再在下面渲染它的面板。 */
 const TABS = [
@@ -12,6 +14,7 @@ const TABS = [
   { id: "remote", label: "远程访问" },
   { id: "plugins", label: "插件" },
   { id: "models", label: "模型" },
+  { id: "tags", label: "标签" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -33,6 +36,8 @@ export function SettingsDialog({
   pluginDefaultProject,
   relayUrl,
   saveRelayUrl,
+  tagNames,
+  saveTagName,
 }: {
   open: boolean;
   /**
@@ -64,6 +69,10 @@ export function SettingsDialog({
    * `set_relay_url`）。缺省时保存按钮不可用（iOS 构建没有该 Tauri 命令）。
    */
   saveRelayUrl?: (value: string | null) => Promise<void>;
+  /** 已解析的标签显示名（6 键齐全）。缺省时「标签」Tab 只读回退默认名。 */
+  tagNames?: Record<TagId, string>;
+  /** 「标签」Tab 保存单个颜色显示名的接缝（写 ui/settings/write）。 */
+  saveTagName?: (tagId: TagId, name: string) => Promise<void> | void;
 }) {
   const [active, setActive] = useState<TabId>("general");
   // roving tabIndex：只有选中的 Tab 是 Tab 停靠点，↑↓←→ 在表内移动。
@@ -192,8 +201,13 @@ export function SettingsDialog({
                 projects={pluginProjects ?? []}
                 defaultProject={pluginDefaultProject}
               />
-            ) : (
+            ) : active === "models" ? (
               <SettingsModelsTab call={modelCall} isMobile={isMobile} />
+            ) : (
+              <SettingsTagsTab
+                tagNames={tagNames ?? DEFAULT_TAG_NAMES}
+                onSave={saveTagName ?? (() => {})}
+              />
             )}
           </div>
         </div>
