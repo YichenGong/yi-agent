@@ -729,8 +729,10 @@ describe("App send recovery from a status disagreement", () => {
   it("falls back to turn/start when turn/interject answers -32013", async () => {
     seedRunning();
     render(<App />);
+    // 运行中的会话不再走 resume（那会打断在跑的 turn），改用只读 readItems 补齐。
+    // 等它发出即证明 listAll 的 running 状态已落进 store。
     await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
     );
     state.rejectCode = { "turn/interject": -32013 };
 
@@ -771,8 +773,9 @@ describe("App send recovery from a status disagreement", () => {
   it("does not ping-pong when both methods fail, and surfaces the error", async () => {
     seedRunning();
     render(<App />);
+    // 同上：运行中的会话以 readItems 补齐，不再 resume。
     await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
     );
     state.rejectCode = { "turn/interject": -32013, "turn/start": -32012 };
 
