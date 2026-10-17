@@ -257,7 +257,7 @@ vi.mock("./lib/platform", async (importOriginal) => {
   };
 });
 
-import App from "./App";
+import App, { REPAIR_REMOVED_TEXT } from "./App";
 import { MemoryContentStore } from "./lib/contentStore";
 import { nextReconnectDelay } from "./lib/reconnect";
 
@@ -2095,6 +2095,30 @@ describe("App mobile repair path", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("opens the pairing screen automatically when the server rejects the token", async () => {
+    pairedPhone();
+    render(<App />);
+    await settle();
+    // 服务端以 4401 明确拒绝这个 token（ws.rs 的 close_unauthorized）：
+    // 重试无意义，直接送上重配界面并说明原因。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 4401 });
+    });
+    expect(screen.getByRole("form", { name: "配对" })).toBeTruthy();
+    expect(screen.getByText(REPAIR_REMOVED_TEXT)).toBeTruthy();
+  });
+
+  it("leaves an ordinary disconnect to the backoff loop (no repair screen)", async () => {
+    pairedPhone();
+    render(<App />);
+    await settle();
+    // 普通断线（1006 等）：这是"网络抖了一下"，必须继续退避重连，不弹重配。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 1006 });
+    });
+    expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
   });
 
   it("never offers the entry on the desktop", async () => {

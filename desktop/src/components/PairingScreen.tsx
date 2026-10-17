@@ -66,6 +66,13 @@ export interface PairingScreenProps {
    * 的 DOM 因此逐字节不变。已配对的手机进这里则是"再看一眼凭据"，退出该是自由的。
    */
   onCancel?: () => void;
+  /**
+   * 宿主给的一句提示（如"此设备已被桌面移除"）；**只在传入时渲染**。
+   *
+   * 与组件内部的 `error` 分开：`error` 是本次提交失败的结果，`notice` 是"你为什么
+   * 会看到这个界面"。不传时 DOM 不变。
+   */
+  notice?: string;
   /** 是否显示「扫码」按钮；默认仅 iOS（远程构建）。 */
   enableScan?: boolean;
   /**
@@ -101,6 +108,7 @@ export function PairingScreen({
   redeem,
   onPaired,
   onCancel,
+  notice,
   enableScan,
   scan,
 }: PairingScreenProps) {
@@ -173,6 +181,12 @@ export function PairingScreen({
         <p className="mt-2 text-xs text-fg-subtle">
           在桌面端「远程访问」生成配对码，把中继地址和码填到这里。
         </p>
+
+        {notice !== undefined && (
+          <p role="status" className="mt-2 text-xs text-amber-400">
+            {notice}
+          </p>
+        )}
 
         <label className="mt-4 block text-xs text-fg-muted" htmlFor="pairing-url">
           服务器地址
