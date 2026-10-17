@@ -1152,3 +1152,25 @@ describe("ThreadSidebar 搜索", () => {
     expect(container.querySelectorAll("[data-rename-input]")).toHaveLength(1);
   });
 });
+
+describe("ThreadSidebar lead entry", () => {
+  it("renders the lead entry above the pinned section, and not twice", () => {
+    const lead: ThreadSummary = { ...thread("lead-1", "组长", "/p"), role: "lead" };
+    const pinned: ThreadSummary = pinnedThread("pin-1", "pinned");
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/p", exists: true, threads: [lead] }],
+      pinned: [pinned],
+    });
+
+    const leadRow = container.querySelector<HTMLElement>("[data-lead-row]")!;
+    expect(leadRow).not.toBeNull();
+    const leadTitle = screen.getByText("组长");
+    const pinnedTitle = screen.getByText("pinned");
+    // 组长条目必须排在 Pinned 分区**之前**：它在列表顶部的固定分区里。
+    expect(
+      leadTitle.compareDocumentPosition(pinnedTitle) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // 组长只出现一次：它由专属条目渲染，不再作为普通分组行重复一遍。
+    expect(container.querySelectorAll("[data-group-row]")).toHaveLength(0);
+  });
+});

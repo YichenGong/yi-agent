@@ -166,6 +166,10 @@ export default function App() {
   // the latest one.
   const recoveryRef = useRef<((raw: RequestFn) => Promise<void>) | null>(null);
   const inited = useRef(false);
+  // 首屏是否为「缺组长的项目目录」补建过组长。组长是项目级固定入口，一个进程
+  // 只补一次即可：服务端创建幂等，且补过之后该目录的分组里就有组长条目了。
+  // 用 ref 而非 state：它不参与渲染，且需要跨多次握手/重连保持「已补过」。
+  const leadEnsured = useRef(false);
   // Threads whose history has already been replayed (resumed) this session;
   // switching back to them must not replay again.
   const warm = useRef(new Set<string>());
@@ -1494,6 +1498,39 @@ export default function App() {
         setPinned(list.pinned ?? []);
         store.seed(list.groups.flatMap((g) => g.threads));
         if (isRemoteClient()) writeListCache(localStorage, list.groups, list.pinned ?? [], store.currentId);
+        // 已有会话的项目目录不会被服务端的 `listAll` 懒创建覆盖（那会改写它既
+        // 有的分组语义），故这类项目的组长入口要靠客户端补：对「一个组长都没
+        // 有」且确实存在的目录组逐个 `thread/lead`，再重取一次列表把新组长带出
+        // 来。**不 await 在首屏关键路径上**——补组长是锦上添花，绝不能推迟首屏
+        // 渲染或扣住后续的 selectThread；失败一律忽略。只在整个进程里补一次
+        // （`leadEnsured`），服务端创建本身幂等。
+        if (!leadEnsured.current) {
+          const needsLead = list.groups.filter(
+            (g) => g.exists && !g.threads.some((t) => t.role === "lead"),
+          );
+          if (needsLead.length > 0) {
+            leadEnsured.current = true;
+            void (async () => {
+              for (const g of needsLead) {
+                try {
+                  await client.request("thread/lead", { cwd: g.workspace });
+                } catch {
+                  // 单个目录补建失败只影响它自己的组长条目，继续下一个。
+                }
+              }
+              try {
+                const patched = await client.request<{
+                  groups: WorkspaceGroup[];
+                  pinned?: ThreadSummary[];
+                }>("thread/listAll", {});
+                setGroups(patched.groups);
+                store.seed(patched.groups.flatMap((g) => g.threads));
+              } catch {
+                // 重取失败就保留首屏那一份：至少侧栏照常可用。
+              }
+            })();
+          }
+        }
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
         // 手机端：握手（含重连/切回前台）不是「用户换了页面」，当前会话——冷启从
         // 缓存恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看

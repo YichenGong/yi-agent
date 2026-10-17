@@ -6078,7 +6078,7 @@ fn thread_summary_json(
     m: &crate::thread_store::ThreadMeta,
     threads: &HashMap<String, ThreadSession>,
 ) -> serde_json::Value {
-    json!({
+    let mut value = json!({
         "thread_id": m.thread_id,
         "cwd": m.cwd,
         "model": m.model,
@@ -6091,7 +6091,13 @@ fn thread_summary_json(
         "board_project": m.board_project,
         "card_id": m.card_id,
         "status": thread_status(threads, &m.thread_id),
-    })
+    });
+    // 只在确实是组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
+    // 的字节比对与快照测试失效,而我们只需要一个新值。
+    if m.role.as_deref() == Some(crate::thread_store::LEAD_ROLE) {
+        value["role"] = json!("lead");
+    }
+    value
 }
 
 /// 把客户端对反向请求的响应路由到等待中的 driver。
@@ -22765,6 +22771,44 @@ pub(crate) mod tests {
             Some(thread_id.as_str())
         );
         assert_eq!(notif["params"]["mode"].as_str(), Some("yolo"));
+        h.shutdown().await;
+    }
+
+    /// `role` 必须在列表条目上暴露;普通会话不得带该 key(旧客户端字节兼容)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_all_exposes_the_lead_role_only_for_the_lead() {
+        let (mut h, _dir) = isolated_harness().await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h, 1).await;
+        let start = start_thread(&mut h).await;
+        let lead = rpc(&mut h, 5, "thread/lead", serde_json::json!({})).await;
+        let lead_id = lead["result"]["thread_id"].as_str().unwrap().to_string();
+
+        let all = list_all(&mut h).await;
+        // 朴素收集:`.leak()` 会永久泄漏内存,只为借出一个 `&Value`;克隆更清楚。
+        let entries: Vec<serde_json::Value> = all["result"]["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .flat_map(|g| g["threads"].as_array().cloned().unwrap_or_default())
+            .collect();
+
+        let lead_entry = entries
+            .iter()
+            .find(|t| t["thread_id"].as_str() == Some(lead_id.as_str()))
+            .expect("lead entry");
+        assert_eq!(lead_entry["role"], serde_json::json!("lead"));
+
+        let plain_entry = entries
+            .iter()
+            .find(|t| t["thread_id"].as_str() == Some(start.as_str()))
+            .expect("plain entry");
+        assert!(
+            plain_entry.get("role").is_none(),
+            "a plain thread must not carry a role key: {plain_entry}"
+        );
+
         h.shutdown().await;
     }
 }

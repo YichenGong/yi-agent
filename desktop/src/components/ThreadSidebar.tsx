@@ -10,6 +10,7 @@ import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
 import { resolveSidebarPressTarget } from "../lib/sidebarPress";
 import { formatRelativeTime } from "../lib/relativeTime";
 import { filterThreadTree } from "../lib/threadSearch";
+import { findLeadThread } from "../lib/leadThread";
 
 function unreadDotClass(status: TurnStatus): string {
   if (status === "failed") return "bg-red-400";
@@ -619,11 +620,71 @@ export function ThreadSidebar({
     );
   };
 
+  // 组长条目：该项目若有 `role === "lead"` 的会话，它固定渲染在列表最顶部
+  // （Pinned 分区之上），并且**不再**作为普通分组行出现——同一条会话出现两次
+  // 会让人以为是两个入口。判定规则与服务端 `ThreadStore::find_lead` 一致
+  // （`role === "lead"` 且 `created_at` 最小），未知 role 一律忽略。
+  const lead = findLeadThread(groups.flatMap((g) => g.threads));
+  const leadId = lead?.thread_id ?? null;
+
+  // 组长行：与普通会话行同构（同样的状态徽标、标题、相对时间、未读点、点击选
+  // 中），只多一个 `data-lead-row` 标记并去掉图钉/删除按钮——组长是项目级的固
+  // 定入口，置顶与删除对它没有意义。带 `data-thread-row` 以便移动端长按与既有
+  // 样式规则照旧生效。
+  const renderLeadRow = (t: ThreadSummary) => {
+    const active = t.thread_id === currentId;
+    const st = statuses.get(t.thread_id) ?? "idle";
+    const un = unread.get(t.thread_id);
+    return (
+      <div
+        key={t.thread_id}
+        data-lead-row=""
+        data-thread-row={t.thread_id}
+        onClick={(e) => {
+          if (editingId) return;
+          if (e.detail > 1) return;
+          onSelect(t.thread_id);
+        }}
+        className={`group relative flex items-center justify-between gap-1 pl-3 py-2 text-sm ${
+          active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
+        } cursor-pointer`}
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <StatusBadge status={st} stale={statusStale} />
+            <div className="truncate" title={t.title ?? t.thread_id}>
+              {t.title ?? "(untitled)"}
+            </div>
+          </div>
+          <div className="text-xs text-fg-faint">{formatRelativeTime(t.updated_at)}</div>
+        </div>
+        {un && !active && (
+          <span
+            aria-label="Unread"
+            title="Unread result"
+            className={`size-2 shrink-0 rounded-full ${unreadDotClass(un)}`}
+          />
+        )}
+      </div>
+    );
+  };
+
   // 渲染时过滤：不持有第二份列表副本，服务端刷新后自动跟随。
   const searching = query.trim() !== "";
   const filtered = filterThreadTree(groups, pinned, query);
   // 搜索期间忽略折叠状态；三个 Set 全程不被写入，清空后原样恢复。
   const pinnedCollapsedNow = searching ? false : pinnedCollapsed;
+
+  // 组长行与搜索结果同口径：复用 `filterThreadTree` 的匹配规则（同一份
+  // haystack：标题 + 目录名 + 完整路径），避免出现「搜到了组内会话、组长却
+  // 凭空消失」或反之的分歧。无查询时 `filterThreadTree` 原样返回，恒可见。
+  const leadVisible =
+    lead !== null &&
+    filterThreadTree(
+      [{ workspace: lead.cwd, exists: true, threads: [lead] }],
+      [],
+      query,
+    ).groups.length > 0;
 
   const clearQuery = () => setQuery("");
 
@@ -735,6 +796,7 @@ export function ThreadSidebar({
           {searching && filtered.empty && (
             <p className="px-3 py-2 text-xs text-fg-faint">无匹配会话</p>
           )}
+          {leadVisible && lead && <div>{renderLeadRow(lead)}</div>}
           {filtered.pinned.length > 0 && (
             <div>
               <div className="flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle">
@@ -855,7 +917,7 @@ export function ThreadSidebar({
                 {!isCollapsed && renderBoardThreads(g)}
                 {!isCollapsed &&
                   g.threads
-                    .filter((t) => !t.pinned && !t.card_id)
+                    .filter((t) => !t.pinned && !t.card_id && t.thread_id !== leadId)
                     .map((t) => renderThread(t, { rowAttr: "group" }))}
               </div>
             );

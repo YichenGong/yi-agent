@@ -70,6 +70,15 @@ const { clients, state } = vi.hoisted(() => ({
     platformUa: "",
     // `process/list` 返回的进程;默认空,需要时由用例填充。
     processes: [] as Array<Record<string, unknown>>,
+    // 已补建组长的目录（`thread/lead` 被调用过）。`thread/listAll` 据此在这些
+    // 分组里多报一条 `role: "lead"` 的会话——模拟服务端真的落盘了组长 meta。
+    // 默认空：既有用例的分组里没有组长，与改动前逐字节一致。
+    leadCwds: [] as string[],
+    // 让 `thread/lead` 抛错，用于验证「单个目录补建失败不挡首屏」。
+    failLead: false,
+    // 每次 `thread/lead` 调用都记一笔它请求的 cwd——即便失败也记，这样「失败
+    // 路径确实被走到」可被断言，而不是靠「首屏照常」这种两边都成立的弱断言。
+    leadAttempts: [] as string[],
   },
 }));
 
@@ -153,24 +162,43 @@ vi.mock("./lib/rpc", () => ({
           state.threads ??
           [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
         const workspaces = state.groupWorkspaces ?? ["/w"];
+        const leadEntries = (workspace: string) =>
+          state.leadCwds.includes(workspace)
+            ? [
+                {
+                  thread_id: `lead-${workspace}`,
+                  cwd: workspace,
+                  model: "m",
+                  created_at: 0,
+                  updated_at: 0,
+                  title: "组长",
+                  role: "lead",
+                  status: "idle",
+                  pinned: false,
+                },
+              ]
+            : [];
         return {
           groups: workspaces.map((workspace, index) => ({
             workspace,
             exists: true,
             threads:
               index === 0
-                ? seeds.map((t) => ({
-                    thread_id: t.thread_id,
-                    cwd: workspace,
-                    model: "m",
-                    created_at: 0,
-                    updated_at: 0,
-                    title: t.title,
-                    permission_mode: t.permission_mode,
-                    status: state.listStatus,
-                    pinned: state.pinnedIds.includes(t.thread_id),
-                  }))
-                : [],
+                ? [
+                    ...seeds.map((t) => ({
+                      thread_id: t.thread_id,
+                      cwd: workspace,
+                      model: "m",
+                      created_at: 0,
+                      updated_at: 0,
+                      title: t.title,
+                      permission_mode: t.permission_mode,
+                      status: state.listStatus,
+                      pinned: state.pinnedIds.includes(t.thread_id),
+                    })),
+                    ...leadEntries(workspace),
+                  ]
+                : leadEntries(workspace),
           })),
           // 置顶项照旧留在分组里（服务端为向后兼容不摘除），顶层这里只是重排一份。
           pinned: state.pinnedIds.map((id) => ({
@@ -188,6 +216,15 @@ vi.mock("./lib/rpc", () => ({
         };
       }
       if (method === "workspace/list") return { workspaces: [] };
+      if (method === "thread/lead") {
+        const cwd = (params as { cwd?: string } | undefined)?.cwd;
+        if (typeof cwd === "string") state.leadAttempts.push(cwd);
+        if (state.failLead) throw { code: -1, message: "lead failed" };
+        if (typeof cwd === "string" && !state.leadCwds.includes(cwd)) {
+          state.leadCwds.push(cwd);
+        }
+        return { thread_id: `lead-${cwd ?? "default"}`, created: true };
+      }
       if (method === "thread/resume") {
         const { threadId } = params as { threadId: string };
         const seeds = state.threads ?? [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
@@ -289,6 +326,9 @@ beforeEach(() => {
   state.dataSources = {};
   state.platformUa = "";
   state.processes = [];
+  state.leadCwds = [];
+  state.failLead = false;
+  state.leadAttempts = [];
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
@@ -4014,5 +4054,37 @@ describe("App 后台进程接线", () => {
         params: { thread_id: "t1", process_id: "proc_1" },
       }),
     );
+  });
+});
+
+describe("App lead entry reachability", () => {
+  it("asks thread/lead for a project group that has no lead, and shows the lead", async () => {
+    render(<App />);
+    // 首屏 listAll 只有普通会话（mock 默认 /w 组含 t1，无 role:"lead"）。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) => r.method === "thread/lead" && (r.params as { cwd?: string }).cwd === "/w",
+        ),
+      ).toBe(true),
+    );
+    // 服务端补建后重取 listAll，随之出现组长条目（mock 的 leadCwds 让它报出来）。
+    await waitFor(() => expect(screen.getByText("组长")).toBeTruthy());
+    // 补建过就不再重复发起：thread/lead 对 /w 只应有一次。
+    expect(
+      clients[0].requests.filter(
+        (r) => r.method === "thread/lead" && (r.params as { cwd?: string }).cwd === "/w",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("still paints the first screen when thread/lead fails", async () => {
+    state.failLead = true;
+    render(<App />);
+    // 补建路径确实被走到了：对 /w 发过 thread/lead（且失败了）。
+    await waitFor(() => expect(state.leadAttempts).toContain("/w"));
+    // 失败不得挡住首屏：既有会话照旧渲染，且没有凭空冒出组长条目。
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    expect(screen.queryByText("组长")).toBeNull();
   });
 });
