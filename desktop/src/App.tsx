@@ -1476,6 +1476,9 @@ export default function App() {
         const msg = formatError(e);
         setCurrentError(msg);
         setStatus(`error: ${msg}`);
+        // 握手失败同样是"没连上"：必须排队重试，否则会永久停在 error。
+        // （经中继时"电脑未连接"正是这条路径——见 rpc.ts 的无 id 错误帧。）
+        scheduleReconnect();
       }
     };
 

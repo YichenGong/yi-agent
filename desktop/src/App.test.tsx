@@ -1674,6 +1674,21 @@ describe("App reconnect resilience", () => {
     expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true);
   });
 
+  it("schedules a reconnect when the handshake itself fails", async () => {
+    // 首连接握手失败（如经中继时电脑未连接）：必须退避重试，而不是停在 error。
+    state.rejectCode["initialize"] = -32000;
+    render(<App />);
+    await flush();
+    expect(clients.length).toBe(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(1));
+    });
+    expect(clients.length).toBe(2);
+    await flush();
+    expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true);
+  });
+
   it("does not double-apply notifications after a foreground reconnect", async () => {
     render(<App />);
     await waitMounted();
