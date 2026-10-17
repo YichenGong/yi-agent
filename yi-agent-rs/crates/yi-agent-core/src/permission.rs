@@ -84,25 +84,42 @@ pub type BlocklistFn = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 pub struct PermissionChecker {
     config: Mutex<PermissionsConfig>,
     yolo: crate::autonomy::YoloSwitch,
-    workdir: std::path::PathBuf,
+    /// 会话根集，`roots[0]` 为主根。相对路径白名单按**命中的那个根**解析，
+    /// 因此关联（次）根里的 `src/**` 也能命中同一份白名单。
+    roots: Vec<std::path::PathBuf>,
     blocklist_fn: BlocklistFn,
     next_request_id: AtomicU64,
 }
 
 impl PermissionChecker {
+    /// 单根构造（既有调用点不破）。
     pub fn new(
         config: PermissionsConfig,
         yolo: crate::autonomy::YoloSwitch,
         workdir: std::path::PathBuf,
         blocklist_fn: BlocklistFn,
     ) -> Self {
+        Self::with_roots(config, yolo, vec![workdir], blocklist_fn)
+    }
+
+    pub fn with_roots(
+        config: PermissionsConfig,
+        yolo: crate::autonomy::YoloSwitch,
+        roots: Vec<std::path::PathBuf>,
+        blocklist_fn: BlocklistFn,
+    ) -> Self {
         Self {
             config: Mutex::new(config),
             yolo,
-            workdir,
+            roots,
             blocklist_fn,
             next_request_id: AtomicU64::new(1),
         }
+    }
+
+    /// 主根：`roots[0]`。空根集返回 `None`（调用方各自决定拒绝口径）。
+    fn primary_root(&self) -> Option<&Path> {
+        self.roots.first().map(|root| root.as_path())
     }
 
     /// 当前 yolo 开关值;供上层读取以展示/持久化运行时模式。
@@ -130,7 +147,7 @@ impl PermissionChecker {
             return self.check_blacklist_then_allow(tool_name, tool_input);
         }
         // 第二层:前缀/路径
-        if Self::prefix_level_allows(&config, tool_name, tool_input, &self.workdir) {
+        if Self::prefix_level_allows(&config, tool_name, tool_input, &self.roots) {
             return self.check_blacklist_then_allow(tool_name, tool_input);
         }
         // 未命中白名单,需要确认
@@ -174,7 +191,7 @@ impl PermissionChecker {
         config: &PermissionsConfig,
         tool_name: &str,
         tool_input: &serde_json::Value,
-        workdir: &Path,
+        roots: &[std::path::PathBuf],
     ) -> bool {
         match tool_name {
             "bash" | "process_start" => {
@@ -192,19 +209,31 @@ impl PermissionChecker {
                 let Some(path) = tool_input.get("path").and_then(|v| v.as_str()) else {
                     return false;
                 };
+                // 相对路径只按主根拼:不跨根猜测(与 fs 工具的 resolve 同口径)。
+                let primary = match roots.first() {
+                    Some(root) => root,
+                    // 空根集:无基点可解析,拒绝(绝不索引 panic)。
+                    None => return false,
+                };
                 let abs = if Path::new(path).is_absolute() {
                     Path::new(path).to_path_buf()
                 } else {
-                    workdir.join(path)
+                    primary.join(path)
                 };
-                let rel = abs.strip_prefix(workdir).unwrap_or(&abs);
-                let rel_str = rel.to_string_lossy();
                 let patterns = match tool_name {
                     "write" => &config.prefix_level.write.paths,
                     "edit" => &config.prefix_level.edit.paths,
                     _ => return false,
                 };
-                patterns.iter().any(|pattern| glob_match(pattern, &rel_str))
+                // 按**命中哪个根**取相对路径：副目录里的 src/** 也能命中白名单。
+                // 必须遍历全部根——只对主根判断会让关联目录的白名单永远不生效。
+                roots.iter().any(|root| match abs.strip_prefix(root) {
+                    Ok(rel) => {
+                        let rel_str = rel.to_string_lossy();
+                        patterns.iter().any(|pattern| glob_match(pattern, &rel_str))
+                    }
+                    Err(_) => false,
+                })
             }
             _ => false,
         }
@@ -285,7 +314,15 @@ impl PermissionChecker {
     }
 
     fn save_config(&self, config: &PermissionsConfig) -> std::io::Result<()> {
-        let dir = self.workdir.join(".yi-agent");
+        // 权限配置固定写在**主根**（`roots[0]`）下：关联（次）根是别人的目录，
+        // 不该往里塞本会话的 `.yi-agent`；无论路径命中哪个根，配置始终只有一份。
+        let primary = self.primary_root().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "会话根集为空:无法确定 permissions.toml 的落盘位置",
+            )
+        })?;
+        let dir = primary.join(".yi-agent");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("permissions.toml");
         let toml_str = toml::to_string(config)
@@ -1090,5 +1127,125 @@ bash = true
         } else {
             panic!("expected NeedConfirm");
         }
+    }
+
+    #[test]
+    fn path_whitelist_resolves_relative_to_the_matching_root() {
+        let primary = std::path::PathBuf::from("/tmp/perm-primary");
+        let secondary = std::path::PathBuf::from("/tmp/perm-secondary");
+        let cfg = PermissionsConfig {
+            prefix_level: PrefixLevelConfig {
+                write: PathPrefixConfig {
+                    paths: vec!["src/**".to_string()],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let checker = PermissionChecker::with_roots(
+            cfg,
+            crate::autonomy::YoloSwitch::new(false),
+            vec![primary.clone(), secondary.clone()],
+            Arc::new(|_| None),
+        );
+        // 副目录里的 src/** 也应命中白名单（关联即"B 属于这个项目"）。
+        let input = serde_json::json!({ "path": "/tmp/perm-secondary/src/main.rs" });
+        assert!(matches!(checker.check("write", &input), CheckResult::Allow));
+    }
+
+    #[test]
+    fn path_whitelist_still_rejects_outside_every_root() {
+        let cfg = PermissionsConfig {
+            prefix_level: PrefixLevelConfig {
+                write: PathPrefixConfig {
+                    paths: vec!["src/**".to_string()],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let checker = PermissionChecker::with_roots(
+            cfg,
+            crate::autonomy::YoloSwitch::new(false),
+            vec![std::path::PathBuf::from("/tmp/perm-a")],
+            Arc::new(|_| None),
+        );
+        let input = serde_json::json!({ "path": "/etc/passwd" });
+        assert!(matches!(
+            checker.check("write", &input),
+            CheckResult::NeedConfirm(_)
+        ));
+    }
+
+    #[test]
+    fn empty_root_set_denies_path_tools_without_panicking() {
+        let cfg = PermissionsConfig {
+            prefix_level: PrefixLevelConfig {
+                write: PathPrefixConfig {
+                    paths: vec!["src/**".to_string()],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let checker = PermissionChecker::with_roots(
+            cfg,
+            crate::autonomy::YoloSwitch::new(false),
+            Vec::new(),
+            Arc::new(|_| None),
+        );
+        // 空根集没有可解析的基点：既不放行也不索引 panic，一律落到"需确认"。
+        assert!(matches!(
+            checker.check("write", &serde_json::json!({"path": "src/main.rs"})),
+            CheckResult::NeedConfirm(_)
+        ));
+        assert!(matches!(
+            checker.check("write", &serde_json::json!({"path": "/tmp/x/src/main.rs"})),
+            CheckResult::NeedConfirm(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_root_set_save_config_errors_instead_of_panicking() {
+        let checker = PermissionChecker::with_roots(
+            PermissionsConfig::default(),
+            crate::autonomy::YoloSwitch::new(false),
+            Vec::new(),
+            Arc::new(|_| None),
+        );
+        // 主根缺席时无法确定 permissions.toml 的落盘位置：返回 Err 而非 panic，
+        // 也绝不退化成写到某个猜测出来的目录。
+        let result = checker
+            .apply_decision("bash", &Decision::AlwaysAllowTool, &PermissionKind::Normal)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("会话根集为空"));
+    }
+
+    #[tokio::test]
+    async fn config_is_persisted_at_the_primary_root_only() {
+        let primary = tempfile::tempdir().unwrap();
+        let secondary = tempfile::tempdir().unwrap();
+        let checker = PermissionChecker::with_roots(
+            PermissionsConfig::default(),
+            crate::autonomy::YoloSwitch::new(false),
+            vec![primary.path().to_path_buf(), secondary.path().to_path_buf()],
+            Arc::new(|_| None),
+        );
+        // 白名单前缀落在次根也一样生效，但配置始终只写主根。
+        checker
+            .apply_decision(
+                "write",
+                &Decision::AlwaysAllowPrefix("src/**".to_string()),
+                &PermissionKind::Normal,
+            )
+            .await
+            .unwrap();
+        let loaded = PermissionChecker::load(primary.path()).await.unwrap();
+        assert_eq!(loaded.prefix_level.write.paths, vec!["src/**".to_string()]);
+        assert!(
+            !secondary.path().join(".yi-agent").exists(),
+            "关联根不该被写入本会话的 .yi-agent"
+        );
     }
 }
