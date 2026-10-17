@@ -181,4 +181,59 @@ describe("phone layout CSS", () => {
     expect(rule).toMatch(/-webkit-user-select:\s*text/);
     expect(rule).toMatch(/user-select:\s*text/);
   });
+
+  it("turns the phone settings into a full-screen page with a top tab bar", () => {
+    // 「设置区域过于小」的根因：弹窗 `w-[70vw]` 在 390pt 上只有 273px，左侧竖栏又是
+    // 写死的 `w-40`(160px)，占去 59%，内容面板只剩 111px 且横向溢出滚不到。手机端
+    // 必须整屏（`position: fixed` + `inset: 0`）并让导航横排，内容才拿得到全部宽度。
+    const shell =
+      /\[data-mobile="true"\]\s+\.settings-shell\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(shell).toMatch(/position:\s*fixed/);
+    expect(shell).toMatch(/inset:\s*0/);
+    expect(shell).toMatch(/flex-direction:\s*column/);
+    // 弹窗那套尺寸必须被解除，否则 fixed 了却仍是 70vw/70vh 的小盒子。
+    expect(shell).toMatch(/width:\s*auto/);
+    expect(shell).toMatch(/max-width:\s*none/);
+    expect(shell).toMatch(/height:\s*auto/);
+
+    const nav = /\[data-mobile="true"\]\s+\.settings-nav\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(nav).toMatch(/flex-direction:\s*row/);
+    // 竖栏那条右边框要撤掉，改由底边框分栏。
+    expect(nav).toMatch(/border-right:\s*0/);
+
+    const tab =
+      /\[data-mobile="true"\]\s+\.settings-nav\s*>\s*\[role="tab"\]\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    // 每格等宽：320pt 上也有 80px，四字标签不折行。
+    expect(tab).toMatch(/flex:\s*1 1 0/);
+    expect(tab).toMatch(/white-space:\s*nowrap/);
+    // 44px 触控下限（Apple HIG）：上下各 12px 内边距 + 行高。
+    expect(tab).toMatch(/padding-top:\s*12px/);
+    expect(tab).toMatch(/padding-bottom:\s*12px/);
+  });
+
+  it("hides the settings backdrop on the phone", () => {
+    // 全屏页没有浮层，遮罩只剩白占屏；关闭改走右上角按钮或 Escape。
+    expect(css()).toMatch(
+      /\[data-mobile="true"\]\s+\[data-settings-backdrop\]\s*\{[^}]*display:\s*none/,
+    );
+  });
+
+  it("gives the phone settings page its own safe-area insets", () => {
+    // 全屏页是 `fixed`，脱离 `body` 的内边距，顶部（刘海）与底部（Home Indicator）
+    // 都必须自己补：顶部落在头部栏，底部落在唯一的滚动容器上，且各只补一次。
+    const head =
+      /\[data-mobile="true"\]\s+\.settings-header\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(head).toMatch(/padding-top:\s*max\(env\(safe-area-inset-top/);
+
+    const panel =
+      /\[data-mobile="true"\]\s+\.settings-panel\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(panel).toMatch(/padding-bottom:\s*env\(safe-area-inset-bottom/);
+
+    // shell 自身不得再补底部安全区，否则与面板那条叠成两倍。
+    const shell =
+      /\[data-mobile="true"\]\s+\.settings-shell\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(shell).toMatch(/padding-bottom:\s*0/);
+  });
 });

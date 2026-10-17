@@ -22,6 +22,7 @@ const panelId = (id: TabId) => `settings-panel-${id}`;
 
 export function SettingsDialog({
   open,
+  isMobile = false,
   theme,
   onThemeChange,
   onClose,
@@ -34,6 +35,15 @@ export function SettingsDialog({
   saveRelayUrl,
 }: {
   open: boolean;
+  /**
+   * 手机端（配对后的 iPhone 客户端）：居中弹窗改成整屏页面。由宿主把已有的
+   * `useIsMobile()` 结论传下来，本组件不重复探测——`<html data-mobile>` 只能有
+   * 一个设置者，两处 effect 会重复写 `dataset`。
+   *
+   * 只影响两件事：导航方向（`aria-orientation`）与「模型」Tab 的表格/卡片形态。
+   * 其余外观覆写全在 `index.css` 的 `[data-mobile="true"]` 前缀规则里，桌面不匹配。
+   */
+  isMobile?: boolean;
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
   onClose: () => void;
@@ -112,13 +122,13 @@ export function SettingsDialog({
         role="dialog"
         aria-modal="true"
         aria-label="设置"
-        className="relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
+        className="settings-shell relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
       >
         <nav
           role="tablist"
-          aria-orientation="vertical"
+          aria-orientation={isMobile ? "horizontal" : "vertical"}
           onKeyDown={onTablistKeyDown}
-          className="flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
+          className="settings-nav flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
         >
           {TABS.map((t) => (
             <button
@@ -139,13 +149,13 @@ export function SettingsDialog({
           ))}
         </nav>
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex items-center justify-between border-b border-line px-4 py-2">
+          <div className="settings-header flex items-center justify-between border-b border-line px-4 py-2">
             <span className="text-xs text-fg-subtle">设置</span>
             <button
               type="button"
               aria-label="关闭设置"
               onClick={onClose}
-              className="rounded px-2 text-fg-subtle hover:text-fg"
+              className="flex size-11 shrink-0 items-center justify-center rounded text-fg-subtle hover:text-fg"
             >
               ×
             </button>
@@ -155,7 +165,7 @@ export function SettingsDialog({
             role="tabpanel"
             id={panelId(active)}
             aria-labelledby={tabId(active)}
-            className="min-h-0 flex-1 overflow-y-auto"
+            className="settings-panel min-h-0 flex-1 overflow-y-auto"
           >
             {active === "general" ? (
               <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />

@@ -167,3 +167,50 @@ describe("SettingsDialog focus management & tab wiring", () => {
     expect(document.activeElement).toBe(remoteTab);
   });
 });
+
+// 手机端把设置从「居中弹窗 + 左侧竖栏」改成「全屏页 + 顶部横条」：导航方向随之由
+// 竖变横，`aria-orientation` 必须跟着翻——这是语义，CSS 表达不了。挂点类是外观
+// 覆写（index.css 里 `[data-mobile="true"] .settings-*`）的抓手，两个平台都渲染，
+// 桌面无样式命中。
+describe("SettingsDialog phone layout hooks", () => {
+  it("flips the tablist orientation to horizontal on the phone", () => {
+    render(
+      <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    expect(screen.getByRole("tablist").getAttribute("aria-orientation")).toBe("horizontal");
+  });
+
+  it("keeps the vertical orientation on the desktop", () => {
+    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+    expect(screen.getByRole("tablist").getAttribute("aria-orientation")).toBe("vertical");
+  });
+
+  it("renders the four class hooks the phone CSS targets, on both platforms", () => {
+    // 用 rerender 切换平台，而不是手动 cleanup()——文件顶部已有 `afterEach(cleanup)`，
+    // 在用例中间自行清理会卸掉组件、让后续断言失去目标。
+    const { container, rerender } = render(
+      <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    expect(container.querySelector(".settings-shell")).toBeTruthy();
+    expect(container.querySelector(".settings-header")).toBeTruthy();
+    expect(container.querySelector(".settings-nav")).toBeTruthy();
+    expect(container.querySelector(".settings-panel")).toBeTruthy();
+
+    // 桌面端同样渲染（类无条件存在，只是没有规则命中）
+    rerender(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+    expect(container.querySelector(".settings-shell")).toBeTruthy();
+    expect(container.querySelector(".settings-header")).toBeTruthy();
+    expect(container.querySelector(".settings-nav")).toBeTruthy();
+    expect(container.querySelector(".settings-panel")).toBeTruthy();
+  });
+
+  it("keeps the close button reachable on the phone (44px touch target)", () => {
+    render(
+      <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={vi.fn()} />,
+    );
+    const close = screen.getByRole("button", { name: "关闭设置" });
+    // 手机上遮罩被 CSS 隐藏，关闭只能靠这颗按钮或 Escape——触控目标不能还是桌面的
+    // 小尺寸。44px 是 Apple HIG 下限，与抽屉按钮 `size-11` 同一标准。
+    expect(close.className).toContain("size-11");
+  });
+});
