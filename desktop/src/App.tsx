@@ -370,6 +370,14 @@ export default function App() {
    */
   const repairingRef = useRef(false);
   repairingRef.current = repairing;
+  /**
+   * 用户是否已对"此设备已被移除"这一自动提示做过回答（点了返回）。
+   *
+   * 没有它，「返回」形同虚设：后台退避重连每轮都会再撞上 4401，于是每轮都把
+   * 用户弹回去——用户的决定被反复撤销。握手成功（真的连上了）时重新武装，
+   * 因为那之后凭据若再失效就是一件新事，该再提示一次。
+   */
+  const repairDismissedRef = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // 「本机侧车要连的中继地址」：首屏由 ui/settings/read 回填，用户在设置页改后
   // 经 Tauri `set_relay_url` 落盘并触发侧车重启。
@@ -1412,7 +1420,12 @@ export default function App() {
         // 守卫只用 ref 判断"是否已在重配界面"：`setStatus` 刚把状态置为 exited，
         // 用 status 判断此刻恒真；闭包里的 status 也是旧快照。普通断线（1006 等）
         // 不在此分支，继续走既有退避重连。
-        if (isRemoteClient() && s.code === 4401 && !repairingRef.current) {
+        if (
+          isRemoteClient() &&
+          s.code === 4401 &&
+          !repairingRef.current &&
+          !repairDismissedRef.current
+        ) {
           setRepairNotice(REPAIR_REMOVED_TEXT);
           setRepairing(true);
         }
@@ -1505,6 +1518,9 @@ export default function App() {
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         attempt = 0;
         setStatus("connected");
+        // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
+        // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
+        repairDismissedRef.current = false;
         // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
         // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
         // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
@@ -1997,6 +2013,8 @@ export default function App() {
         onCancel={() => {
           setRepairing(false);
           setRepairNotice(null);
+          // 记住"用户已经答过"：退避重连再撞 4401 也不得把他弹回来。
+          repairDismissedRef.current = true;
         }}
         onPaired={() => {
           // 已配对过时 `inited.current` 仍是 true，单靠版本号会被守卫挡掉；

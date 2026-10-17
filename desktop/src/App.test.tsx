@@ -2121,6 +2121,46 @@ describe("App mobile repair path", () => {
     expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
   });
 
+  it("does not re-open after the user dismisses an automatic offer", async () => {
+    pairedPhone();
+    render(<App />);
+    await settle();
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 4401 });
+    });
+    expect(screen.getByRole("form", { name: "配对" })).toBeTruthy();
+
+    // 用户明确「返回」：后台退避重连会再次撞上 4401，但不得把他弹回去——
+    // 否则「返回」形同虚设（每轮重连都撤销一次用户的决定）。
+    fireEvent.click(screen.getByRole("button", { name: "返回" }));
+    expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0) + 1);
+    });
+    await settle();
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 4401 });
+    });
+    expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
+  });
+
+  it("re-arms the automatic offer after a successful connection", async () => {
+    pairedPhone();
+    // 先让握手真的成功一次（status -> connected），这会把自动提示重新武装。
+    state.dataSources = {};
+    render(<App />);
+    await settle();
+    // 假定时器下 waitFor 不推进时间，settle 后直接断言。
+    expect(clients[0].requests.some((r) => r.method === "thread/listAll")).toBe(true);
+
+    // 连接成功后凭据才失效（例如桌面撤销了这台设备）：此时应当自动提示。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited", code: 4401 });
+    });
+    expect(screen.getByRole("form", { name: "配对" })).toBeTruthy();
+  });
+
   it("never offers the entry on the desktop", async () => {
     render(<App />);
     await settle();
