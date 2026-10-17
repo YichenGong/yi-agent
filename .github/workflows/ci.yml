@@ -25,3 +25,7 @@ jobs:
       - name: Run CI
         working-directory: yi-agent-rs
         run: just ci
+
+      - name: Check generated TypeScript bindings
+        working-directory: yi-agent-rs
+        run: just bindings-check
