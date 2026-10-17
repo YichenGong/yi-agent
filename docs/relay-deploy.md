@@ -661,6 +661,26 @@ reconnecting` 交替、并伴随大量 `ws connection rejected: invalid token`�
 - **下次复现先抓现场**：`journalctl -u yi-agent-relay --since "2 hours ago"`，再决定修法。
 - **即时恢复**：`ssh <vps> 'systemctl restart yi-agent-relay'`（不影响 Caddy，443 不中断）。
 
+#### 已定的一个成因：被顶替的电脑连接成了「僵尸」（已修，2026-10-17）
+
+上面「根因未定」的假死，至少有一族已查明并修复。症状比「新连接 1006」更具体：
+
+- 中继日志里 `agent connected` **偶尔冒一次又消失**（不是持续出现）；
+- 电脑侧桥进程 TCP **仍 `ESTABLISHED`**、CPU 0%，但本地 trace（`~/.yi-agent/trace/*.jsonl`）
+  **再无任何 `yi_agent_relay` 事件**——它自己以为连接好着，永不重连；
+- 手机发帧收到 `-32000 no computer connected for this session`（配对页即「无法连接服务器」）；
+- **只有重启中继才自愈**。
+
+根因：中继在同一 session 收到新的电脑连接时按「顶替」语义把旧连接的**路由条目**换掉，
+却**从不关闭旧 socket**（`attach_agent`）。被顶替者既收不到帧也收不到 Close，于是成了
+僵尸；新连接一旦离开，该 session 就再无电脑。**一条误连 `/connect` 的探针即可触发**——
+排查时用错端点的裸 ws 探针（手机侧端点应是 `/ws`）就会把真正的桥顶成僵尸。
+
+修复：顶替时向被顶替连接的出站口排一个 `Close` 帧，旧客户端据此结束本次连接并按既有
+退避重连（`crates/yi-agent-relay/src/lib.rs`；回归见 `tests/bridge.rs` 的
+`a_displaced_bridge_reconnects_and_restores_the_session`）。**部署中继二进制后即生效**，
+故此后 `systemctl restart` 只是应急手段、不再是唯一出路。
+
 **拟定修法（另开 worktree，TDD）**：① 服务端周期性 Ping、N 秒无 Pong 即 `break` 并摘除
 （治最可疑的半开连接）；② 电脑侧 `agent` 下行写加超时/有界；③ 连接建立/关闭/ping 超时/
 队列满全部打日志；④ 先写"半开连接导致无法恢复"的复现测试把修法钉住。
