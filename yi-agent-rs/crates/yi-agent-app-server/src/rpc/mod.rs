@@ -14,11 +14,13 @@
 
 // 域子模块:每个模块承载一个域,臂体逐字搬移自 `serve()` 的 dispatch。
 pub(crate) mod board;
+pub(crate) mod image;
 pub(crate) mod model;
 pub(crate) mod onboarding;
 pub(crate) mod plugin;
 pub(crate) mod ui;
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -26,7 +28,9 @@ use yi_agent_runtime::config::RuntimeConfig;
 
 use crate::broadcast::{Broadcaster, ClientId};
 use crate::protocol::Scope;
+use crate::session::ThreadSession;
 use crate::theme_tool::ThemeHandle;
+use crate::workspace_index::WorkspaceIndex;
 
 /// 值守安装句柄。与 `server.rs` 里的私有 `type WatchmanInstall` 是**同一个**
 /// 类型(同一个 `Arc<dyn Fn ..>`),在对齐处互换无碍——故这里重声明一份,省下
@@ -77,6 +81,8 @@ pub(crate) enum Domain {
     Board,
     /// `plugin/*` 与 `plugins/*`。
     Plugin,
+    /// `image/*`(含分片上传)。
+    Image,
     /// 未搬移(含 `initialize`)。
     Unknown,
 }
@@ -94,6 +100,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("onboarding") => Domain::Onboarding,
         Some("board") => Domain::Board,
         Some("plugin") | Some("plugins") => Domain::Plugin,
+        Some("image") => Domain::Image,
         _ => Domain::Unknown,
     }
 }
@@ -153,6 +160,18 @@ pub(crate) struct AppState<'a> {
     pub(crate) watchman_uninstall: &'a WatchmanUninstall,
     /// 如何为项目拉起看板守护进程。搬移前臂里的 `board_launcher`。
     pub(crate) board_launcher: &'a BoardLauncher,
+
+    // ---- 主循环的可变局部量(按域逐批搬入) ----
+    /// 分片上传登记表(`image/upload/*`)。搬移前臂里的 `uploads`,按 `&mut` 借用
+    /// —— 臂内 `begin` / `append` / `commit` / `abort` 都要改它。
+    pub(crate) uploads: &'a mut crate::image_upload::UploadRegistry,
+    /// 内存中的会话表(`threads`)。`image/*` 经 `thread_cwd` 查 cwd,`turn/*` 读
+    /// 会话并投递中断/追加,`process/*` 取该 thread 的进程管理器。搬移前臂里的
+    /// `threads`,按 `&mut` 借用(`turn/start` 经 `start_turn_core` 要 `&mut`)。
+    pub(crate) threads: &'a mut HashMap<String, ThreadSession>,
+    /// 附加到 thread 的运行时登记(设备/工作区开关)。`image/*` 经 `thread_cwd`
+    /// 冷回退时要用,`workspace/*` 直接增删。搬移前臂里的 `workspaces`。
+    pub(crate) workspaces: &'a Arc<WorkspaceIndex>,
 }
 
 impl<'a> AppState<'a> {
@@ -177,6 +196,9 @@ impl<'a> AppState<'a> {
         watchman_install: &'a WatchmanInstall,
         watchman_uninstall: &'a WatchmanUninstall,
         board_launcher: &'a BoardLauncher,
+        uploads: &'a mut crate::image_upload::UploadRegistry,
+        threads: &'a mut HashMap<String, ThreadSession>,
+        workspaces: &'a Arc<WorkspaceIndex>,
     ) -> Self {
         Self {
             hub,
@@ -194,6 +216,9 @@ impl<'a> AppState<'a> {
             watchman_install,
             watchman_uninstall,
             board_launcher,
+            uploads,
+            threads,
+            workspaces,
         }
     }
 }

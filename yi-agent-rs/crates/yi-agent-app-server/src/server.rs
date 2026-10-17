@@ -12,7 +12,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use base64::Engine as _;
 use futures::StreamExt;
 use serde_json::json;
 use std::sync::Mutex as StdMutex;
@@ -2429,7 +2428,8 @@ where
                             &hub, &client, client_scope, &cfg, &theme_handle, &models_path,
                             &onboarding_env_path, &onboarding_preferences_path, &board_dir,
                             &resident_dir, &plugin_command, &watchman_home, &watchman_install,
-                            &watchman_uninstall, &board_launcher,
+                            &watchman_uninstall, &board_launcher, &mut uploads, &mut threads,
+                            &workspaces,
                         )
                     };
                 }
@@ -2484,6 +2484,16 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::Image => {
+                        let mut state = app_state!();
+                        match crate::rpc::image::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     // 尚未搬移的域(以及 `initialize`)仍走原始 dispatch。
                     // 逐域搬移期间,还没搬的域也落到这里,故用 `_` 一并兜住
                     // (`Domain::Unknown` 覆盖 `initialize` 与所有未识别前缀)。
@@ -2507,384 +2517,6 @@ where
                             ),
                         )
                         .await?;
-                    }
-                    // 分片回传一张图片的**原始字节**:客户端按 `nextOffset` 循环
-                    // 拉取,base64 解码拼接后即得与磁盘逐字节相同的文件。之所以
-                    // 不在这里重新编码,是因为 `Item.images[].size` 记的就是存盘
-                    // 文件的字节长度(Task 5 的交接),两者必须一致。
-                    //
-                    // 这是一条**安全边界**:限根(拒绝 `..` 与工作区外绝对路径)+
-                    // 只送可解码的图(`guess_format`)+ 文件大小上限,三者缺一,
-                    // 本 RPC 就成了任意文件读取原语。
-                    "image/read" => {
-                        let Some(thread_id) =
-                            req.params.get("threadId").and_then(|v| v.as_str())
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("threadId required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let Some(rel) = req.params.get("path").and_then(|v| v.as_str()) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("path required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 该 thread 的 cwd:内存优先,其次按 store 定位;都落空即
-                        // 未知 thread。与既有路径限额同源。
-                        let Some(root) = thread_cwd(&threads, &workspaces, &cfg, thread_id) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("unknown thread")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 限根:join 后 canonicalize,再要求结果落在 cwd 之内。
-                        // `canonicalize` 会解掉 `..` 与符号链接,故逃逸一定现形;
-                        // `Path::join` 遇绝对路径会整体替换,也在此被 starts_with 拦下。
-                        let canonical = match root.join(rel).canonicalize() {
-                            Ok(p) => p,
-                            Err(e) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(
-                                        id,
-                                        RpcError::invalid_params(format!("cannot read image: {e}")),
-                                    ),
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-                        let root_canonical =
-                            root.canonicalize().unwrap_or_else(|_| root.clone());
-                        if !canonical.starts_with(&root_canonical) {
-                            write_response(
-                                &hub, &client,
-                                err_response(
-                                    id,
-                                    RpcError::invalid_params("path escapes the workspace"),
-                                ),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        // 先按**元数据**长度设闸:否则一个几 GB 的文件会先被整个读进
-                        // 内存再被拒,分片回传反成了内存放大原语。
-                        let declared_len = match std::fs::metadata(&canonical) {
-                            Ok(m) => {
-                                // 同一趟元数据里挡下**非普通文件**:FIFO 的 `len`
-                                // 恒为 `0`,能骗过尺寸闸,而 `fs::read` 的 `open()`
-                                // 在无写端时会**一直阻塞**——本 RPC 是安全边界,
-                                // 一个构造请求就能把整条 serve 循环(所有客户端/
-                                // thread)挂住。故 `!is_file()` 直接拒绝,不再多发
-                                // 一次 `metadata` 系统调用。
-                                if !m.is_file() {
-                                    write_response(
-                                        &hub,
-                                        &client,
-                                        err_response(
-                                            id,
-                                            RpcError::invalid_params("not a regular file"),
-                                        ),
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                m.len()
-                            }
-                            Err(e) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(
-                                        id,
-                                        RpcError::invalid_params(format!("cannot read image: {e}")),
-                                    ),
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-                        if declared_len > IMAGE_READ_MAX_BYTES {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("image too large")),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        let bytes = match std::fs::read(&canonical) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(
-                                        id,
-                                        RpcError::invalid_params(format!("cannot read image: {e}")),
-                                    ),
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-                        // 只送可解码的图片:以魔数判定,不看扩展名。
-                        let format = match image::guess_format(&bytes) {
-                            Ok(f) => f,
-                            Err(_) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::invalid_params("not a supported image")),
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-                        // 元数据长度与实际读到的长度理论上可能竞态,按**实际字节**复核。
-                        if bytes.len() as u64 > IMAGE_READ_MAX_BYTES {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("image too large")),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        let offset = req.params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-                        // 客户端可要更小的一块,但不得越过帧预算。`0` 视为未指定:
-                        // 否则 `end == start`、`nextOffset` 不前进,客户端会陷入死循环。
-                        let max_bytes = req
-                            .params
-                            .get("maxBytes")
-                            .and_then(|v| v.as_u64())
-                            .filter(|n| *n > 0)
-                            .unwrap_or(IMAGE_READ_CHUNK_BYTES)
-                            .min(IMAGE_READ_CHUNK_BYTES);
-                        let start = (offset as usize).min(bytes.len());
-                        let end = start.saturating_add(max_bytes as usize).min(bytes.len());
-                        let next = if end < bytes.len() {
-                            Some(end as u64)
-                        } else {
-                            None
-                        };
-                        let data = base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]);
-                        write_response(
-                            &hub,
-                            &client,
-                            ok_response(
-                                id,
-                                json!({
-                                    "data": data,
-                                    "nextOffset": next,
-                                    "mediaType": image_media_type(format),
-                                    "size": bytes.len(),
-                                }),
-                            ),
-                        )
-                        .await?;
-                    }
-                    // iOS 分片上传（设计 §3(3)）：begin / chunk / commit / abort。
-                    //
-                    // 与 `image/read` 恰好反向：那个把工作区里的图分片送出，这个把
-                    // 客户端的分片收进工作区。base64 只在 `chunk.data` 里出现，由
-                    // 服务端解码（裁定 R6，与 `image/read` 的编码端对称）。
-                    //
-                    // 身份链：`begin` 用 `threadId` 解析 cwd（与 `image/read` 同法，
-                    // 复用 `thread_cwd`）；`commit` 的参数只有 `{uploadId}`，thread
-                    // 由记录带出再解析 cwd。
-                    "image/upload/begin" => {
-                        let Some(thread_id) =
-                            req.params.get("threadId").and_then(|v| v.as_str())
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("threadId required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let Some(root) = thread_cwd(&threads, &workspaces, &cfg, thread_id) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("unknown thread")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let name = req
-                            .params
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("image");
-                        let Some(size) = req.params.get("size").and_then(|v| v.as_u64()) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("size required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 大小/条数上限都在 `begin` 里设闸：一个已认证客户端不能靠
-                        // 反复 begin 占满 inode/fd（见 `image_upload` 的常量注释）。
-                        match uploads.begin(&root, thread_id, name, size) {
-                            Ok(upload_id) => {
-                                write_response(
-                                    &hub, &client,
-                                    ok_response(
-                                        id,
-                                        json!({
-                                            "uploadId": upload_id,
-                                            "chunkSize": crate::image_upload::UPLOAD_CHUNK_BYTES,
-                                        }),
-                                    ),
-                                )
-                                .await?
-                            }
-                            Err(message) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::invalid_params(message)),
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                    "image/upload/chunk" => {
-                        let Some(upload_id) = req.params.get("uploadId").and_then(|v| v.as_str())
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("uploadId required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let Some(index) = req.params.get("index").and_then(|v| v.as_u64()) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("index required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let Some(data) = req.params.get("data").and_then(|v| v.as_str()) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("data required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 服务端解码（裁定 R6）：解码失败即拒，绝不把半个块写进
-                        // staging。累计上限由 `append` 按声明大小把关。
-                        let bytes =
-                            match base64::engine::general_purpose::STANDARD.decode(data) {
-                                Ok(bytes) => bytes,
-                                Err(e) => {
-                                    write_response(
-                                        &hub,
-                                        &client,
-                                        err_response(
-                                            id,
-                                            RpcError::invalid_params(format!(
-                                                "invalid base64 chunk: {e}"
-                                            )),
-                                        ),
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                            };
-                        match uploads.append(upload_id, index, &bytes) {
-                            Ok(()) => {
-                                write_response(&hub, &client, ok_response(id, json!({}))).await?
-                            }
-                            Err(message) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::invalid_params(message)),
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                    "image/upload/commit" => {
-                        let Some(upload_id) = req.params.get("uploadId").and_then(|v| v.as_str())
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("uploadId required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 设计的 `commit` 参数只有 `{uploadId}`：thread 从记录带出，
-                        // 再解析它该落在哪个工作区。
-                        let Some(thread_id) = uploads.thread_id_of(upload_id) else {
-                            write_response(
-                                &hub,
-                                &client,
-                                err_response(
-                                    id,
-                                    RpcError::invalid_params(format!("unknown upload: {upload_id}")),
-                                ),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let Some(root) = thread_cwd(&threads, &workspaces, &cfg, &thread_id) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("unknown thread")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 裁定 R1：返回**解析句柄**（`path` 给客户端渲染，`uploadId`
-                        // 仍是送模型时的引用），而不是只回一个 `uploadId`。
-                        match uploads.commit(&root, &thread_id, upload_id) {
-                            Ok(attachment) => {
-                                write_response(
-                                    &hub, &client,
-                                    ok_response(
-                                        id,
-                                        json!({
-                                            "path": attachment.path,
-                                            "mediaType": attachment
-                                                .mime
-                                                .unwrap_or_else(|| "application/octet-stream".to_string()),
-                                            "size": attachment.size,
-                                        }),
-                                    ),
-                                )
-                                .await?
-                            }
-                            Err(message) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::invalid_params(message)),
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                    "image/upload/abort" => {
-                        let Some(upload_id) = req.params.get("uploadId").and_then(|v| v.as_str())
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("uploadId required")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 幂等：未知/已 abort 的 id 也回 `{}`（客户端重试不必区分）。
-                        uploads.abort(upload_id);
-                        write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "workspace/list" => {
                         let list: Vec<serde_json::Value> = workspaces
@@ -5242,7 +4874,7 @@ fn apply_session(agent: &mut yi_agent_core::Agent, session: Option<yi_agent_core
 /// `Arc<Mutex<HashMap<String, ClientId>>>` 交给本函数要读的进程级句柄
 /// ([`install_device_registry`])。表为空(纯 stdio、无 ws,或尚未起 ws)时
 /// 安全返回 `None`。
-fn ws_client_for_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
+pub(crate) fn ws_client_for_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
     let registry = device_registry().get()?;
     let guard = registry.lock().unwrap_or_else(|p| p.into_inner());
     guard.get(device_id).cloned()
@@ -5254,7 +4886,7 @@ fn ws_client_for_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
 /// `device_id → ClientId` 映射不该留在全局表里等下一个同名设备(或迟到的清理)
 /// 撞上。真正的连接关闭由调用方 `hub.unregister` + ws 读循环的 disconnected
 /// tick 完成;这里只负责让主循环侧不再记得它。
-fn forget_ws_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
+pub(crate) fn forget_ws_device(device_id: &str) -> Option<crate::broadcast::ClientId> {
     let registry = device_registry().get()?;
     let mut guard = registry.lock().unwrap_or_else(|p| p.into_inner());
     guard.remove(device_id)
@@ -6628,7 +6260,7 @@ fn store_lookup(
 ///
 /// 找不到任何见证(索引里既没有该 thread 的目录,`cfg.workdir` 也不含它)时返回
 /// `None`,由调用方按「未知 thread」拒绝。
-fn thread_cwd(
+pub(crate) fn thread_cwd(
     threads: &HashMap<String, ThreadSession>,
     workspaces: &WorkspaceIndex,
     cfg: &RuntimeConfig,
@@ -6653,7 +6285,7 @@ fn thread_cwd(
 /// 只认四种与 `image_prep`(`png/jpeg/gif/webp`)对齐的格式;`guess_format` 虽会
 /// 认出 TIFF/BMP 等魔数,但那些解码器未启用,统一按 `application/octet-stream`
 /// 报出(客户端据此可判「不是我能渲染的图」)。
-fn image_media_type(format: image::ImageFormat) -> &'static str {
+pub(crate) fn image_media_type(format: image::ImageFormat) -> &'static str {
     match format {
         image::ImageFormat::Png => "image/png",
         image::ImageFormat::Jpeg => "image/jpeg",
@@ -7513,7 +7145,7 @@ async fn emit_item(
 /// 校验失败时在此就地写错误响应并返回 `Ok(None)`,调用方据此 continue——帧的
 /// 顺序与错误响应语义与 6a 抽取前逐字一致(响应急在 prompt 投递之前)。
 /// 成功返回 `Ok(Some(thread_id))`。
-async fn start_turn_core(
+pub(crate) async fn start_turn_core(
     threads: &mut HashMap<String, ThreadSession>,
     pending_activation: &HashMap<String, Option<Arc<ThreadRoot>>>,
     uploads: &mut crate::image_upload::UploadRegistry,
@@ -7619,7 +7251,7 @@ async fn resolve_thread_cwd(
 }
 
 /// 从 params 提取 `threadId`;缺失时写 `-32602` 并返回 `Ok(None)`。
-async fn require_thread_id(
+pub(crate) async fn require_thread_id(
     hub: &crate::broadcast::Broadcaster,
     client: &crate::broadcast::ClientId,
     params: &serde_json::Value,
@@ -7644,7 +7276,7 @@ async fn require_thread_id(
 /// 非 text 的 block（含 attachment）由 `crate::attachments::parse_input` 另行处理；
 /// 这里只看文本，空文本返回 `None`。**注意**：附件-only 的消息在这里是 `None`，
 /// 是否放行由调用方结合附件列表决定（见 `prepare_turn_core`）。
-fn extract_prompt(params: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_prompt(params: &serde_json::Value) -> Option<String> {
     let (text, _paths) = crate::attachments::parse_input(params);
     if text.trim().is_empty() {
         None
