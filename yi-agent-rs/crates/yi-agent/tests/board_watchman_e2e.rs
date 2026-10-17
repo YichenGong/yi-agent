@@ -58,12 +58,15 @@
 //! lock plus the plugin's queued-launch unit tests, and is stated as such in the
 //! spec's evidence table.
 
-use std::io::{BufRead, BufReader, Write};
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::json;
+
+use common::AppServer;
 
 /// The plugin executable a production board's scaffold resolves to (Homebrew
 /// first, then `PATH`). Mirrors `board_e2e::PLUGIN_BIN`. Only
@@ -126,95 +129,6 @@ fn needs_published_plugin() -> Option<String> {
         return Some(format!("{PUBLISHED_PLUGIN_BIN} is not installed"));
     }
     None
-}
-
-// ---------------------------------------------------------------------------
-// A live `yi-agent app-server` speaking JSONL JSON-RPC on stdio.
-// (Same technique as `board_e2e.rs`; kept self-contained on purpose so the two
-// integration tests can evolve independently.)
-// ---------------------------------------------------------------------------
-
-struct AppServer {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<std::process::ChildStdout>,
-    next_id: u64,
-}
-
-impl AppServer {
-    fn start(bin: &Path, home: &Path) -> AppServer {
-        let mut child = Command::new(bin)
-            .args(["app-server", "--listen", "stdio://"])
-            .env("HOME", home)
-            // Never boot a host LaunchAgent from a test. `board/create` installs
-            // the watchman on first use; the switch degrades that production
-            // install/uninstall to a no-op (see `production_watchman_install`).
-            .env("YI_AGENT_DISABLE_WATCHMAN", "1")
-            // A bundled app launches from `/`; mirror that so an accidental
-            // reliance on the cwd shows up here rather than in production.
-            .current_dir("/")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn yi-agent app-server");
-        let stdin = child.stdin.take().expect("app-server stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("app-server stdout"));
-        AppServer {
-            child,
-            stdin: Some(stdin),
-            stdout,
-            next_id: 0,
-        }
-    }
-
-    fn rpc(&mut self, method: &str, params: Value) -> Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let stdin = self.stdin.as_mut().expect("app-server stdin open");
-        writeln!(stdin, "{request}").expect("write request");
-        stdin.flush().expect("flush request");
-        loop {
-            let mut line = String::new();
-            let read = self.stdout.read_line(&mut line).expect("read response");
-            assert!(read > 0, "app-server closed before answering `{method}`");
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if value.get("id") == Some(&json!(id)) {
-                return value;
-            }
-        }
-    }
-
-    fn rpc_within(&mut self, method: &str, params: Value, timeout: Duration) -> Value {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let value = self.rpc(method, params.clone());
-            if value.get("error").is_none() || Instant::now() >= deadline {
-                return value;
-            }
-            std::thread::sleep(POLL);
-        }
-    }
-
-    fn initialize(&mut self) {
-        let value = self.rpc("initialize", json!({}));
-        assert!(value.get("error").is_none(), "initialize failed: {value}");
-    }
-
-    fn shutdown(mut self) -> std::process::ExitStatus {
-        drop(self.stdin.take());
-        self.child.wait().expect("wait for app-server")
-    }
-}
-
-impl Drop for AppServer {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 // ---------------------------------------------------------------------------
