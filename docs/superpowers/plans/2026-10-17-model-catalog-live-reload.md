@@ -1189,6 +1189,15 @@ git commit -m "feat(app-server): 会话工厂按指纹跟随模型清单"
 - Consumes: Task 3/4 的 daemon 刷新行为；`yi_agent_store::ipc::{IpcRequest, send_request}`。
 - Produces: 一条 `#[ignore]` 的真机测试（默认跳过，需 `--ignored`）。
 
+> **实现时发现并修正的 4 个判据失效点**（计划初稿的代码片段按下述修正；测试文件是权威版本）：
+> 1. root 侧凭据必须走 CLI 且带 `/v1`（root 的 provider 来自 env/CLI，与清单无关），
+>    否则第 2 步会把 root 一起打死、跑不到 worker 失败；
+> 2. `run` 必须带 `--subagents`，否则 headless root 不注册委派工具；
+> 3. 子任务按 `depth == 1` 且**排除已有 task id** 选取：daemon 跨次保留历史任务，
+>    否则第 2 步立刻读到第 1 步遗留的子任务终态；
+> 4. 404 属不可重试错误 → `report_failure` → 任务落 `failed`（不是卡在 `running`），
+>    故第 2 步可稳定观测到 `failed`。
+
 - [ ] **Step 1: 写测试（隔离 daemon + 三步判据）**
 
 ```rust
