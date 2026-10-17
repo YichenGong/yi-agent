@@ -1419,6 +1419,20 @@ describe("App settings & theme wiring", () => {
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
   });
 
+  it("reflects a thread/titleChanged in the sidebar without re-listing", async () => {
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+    // 首轮 LLM 标题生成成功后服务端推来的权威标题。
+    notify("thread/titleChanged", { thread_id: "t1", title: "修复登录报错" });
+    await waitFor(() => expect(screen.getByText("修复登录报错")).toBeTruthy());
+    // 就地把权威值落笔，不该为此再拉一次全量 thread/listAll。
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+  });
+
   it("reflects a thread/modelChanged from another client in that thread's picker", async () => {
     render(<App />);
     await settle();

@@ -33,6 +33,7 @@ import type {
   ProcessReadResult,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
+import { applyTitleChange } from "./lib/threadListUpdate";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
 import {
@@ -290,6 +291,16 @@ export default function App() {
   useEffect(() => {
     currentIdRef.current = currentId;
   }, [currentId]);
+  // 同上：`thread/titleChanged` 的处理也在 `wireClient` 的一次性闭包里，读不到最新
+  // 的 groups/pinned。标题就地更新需要「当前列表」做底，故各放一个 ref 影子。
+  const groupsRef = useRef<WorkspaceGroup[]>(groups);
+  const pinnedRef = useRef<ThreadSummary[]>(pinned);
+  useEffect(() => {
+    groupsRef.current = groups;
+  }, [groups]);
+  useEffect(() => {
+    pinnedRef.current = pinned;
+  }, [pinned]);
   // 右侧会话详情栏的开合与当前 Tab。栏由状态栏那颗图标开合；Tab 还受两条外部
   // 路径驱动——点子 agent 卡片（回到「子 agent」Tab 的轨迹）与模型推送的
   // `ui/gitDiff/focus`（切到 diff）。
@@ -1396,6 +1407,21 @@ export default function App() {
         if (n.method === "process/updated") {
           // 通知只是"该重拉了":它不携带权威数据,重拉 process/list 才是。
           void refreshProcesses(n.params.thread_id);
+          return;
+        }
+        if (n.method === "thread/titleChanged") {
+          // 首轮 LLM 标题生成成功后服务端推来的权威标题。通知自带权威值，就地把
+          // 它写进本地列表的两份（分组 + 置顶）即可——不必再拉一次全量
+          // `thread/listAll`，也与 `thread/modelChanged` 同族。
+          const next = applyTitleChange(
+            groupsRef.current,
+            pinnedRef.current,
+            n.params.thread_id,
+            n.params.title,
+          );
+          setGroups(next.groups);
+          setPinned(next.pinned);
+          force((v) => v + 1);
           return;
         }
         // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。

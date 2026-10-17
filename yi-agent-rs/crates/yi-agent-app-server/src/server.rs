@@ -6196,8 +6196,30 @@ async fn persist_and_finish_turn(
             .await
             {
                 Ok(Ok(Some(title))) => {
-                    if let Err(e) = store.set_title_if_unchanged(thread_id, &fallback, &title) {
-                        eprintln!("[app-server] failed to set LLM title {thread_id}: {e}");
+                    // 仅在 CAS **确实替换**（`Ok(true)`）后广播：`Ok(false)` 表示标题
+                    // 已被手动改名抢占或 thread 不存在，磁盘上不是这个值，广播它会让
+                    // 客户端显示一个不存在的标题。广播失败只记 stderr——标题是锦上
+                    // 添花，绝不能拖住 turn 收尾。
+                    match store.set_title_if_unchanged(thread_id, &fallback, &title) {
+                        Ok(true) => {
+                            if let Err(e) = write_notification(
+                                hub,
+                                &Notification::TitleChanged {
+                                    thread_id: thread_id.to_string(),
+                                    title,
+                                },
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "[app-server] failed to broadcast title change {thread_id}: {e}"
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            eprintln!("[app-server] failed to set LLM title {thread_id}: {e}")
+                        }
                     }
                 }
                 // 模型产出无法作为标题：保留兜底标题。
@@ -18460,6 +18482,96 @@ pub(crate) mod tests {
         );
         // 且失败后静默保留兜底标题 —— 即 title_from("登录页报错了")（原样截断）。
         assert_eq!(title.as_deref(), Some("登录页报错了"));
+        h.shutdown().await;
+    }
+
+    /// 标题生成失败时**不得**广播 `thread/titleChanged`：磁盘标题仍是兜底截断值，
+    /// 广播一个未被写入的标题会让客户端显示一个不存在的名字。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_title_generation_broadcasts_no_title_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let title_calls = Arc::new(AtomicUsize::new(0));
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RejectingTitleProvider {
+            title_calls: title_calls.clone(),
+        });
+        let mut h = Harness::with_config(
+            cfg,
+            move |session, cwd, mode| {
+                build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+        ))
+        .await;
+
+        // 先等标题请求确实发出且失败（与回退用例同款：轮询被断言的信号本身）。
+        let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+        while title_calls.load(Ordering::SeqCst) < 1 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            title_calls.load(Ordering::SeqCst) >= 1,
+            "title request must fire"
+        );
+        // 读到 turn/completed（收尾已发生），确认此后没有 titleChanged 尾随。
+        let _ = read_until_method(&mut h, "turn/completed").await;
+        // 负等待：收尾后再给一个短窗口，断言这段里没有任何 titleChanged 帧。
+        let mut saw_title_change = false;
+        while let Some(v) = h.try_read_value(Duration::from_millis(300)).await {
+            if v.get("method").and_then(|m| m.as_str()) == Some("thread/titleChanged") {
+                saw_title_change = true;
+            }
+        }
+        assert!(
+            !saw_title_change,
+            "a failed title generation must not broadcast thread/titleChanged"
+        );
+        h.shutdown().await;
+    }
+
+    /// 首轮 LLM 标题落盘后必须**主动广播** `thread/titleChanged`，携带权威标题。
+    ///
+    /// 这是本条修复的核心：`turn/completed` 早于标题落盘发出，桌面端在该通知触发
+    /// 的 `refreshThreads()` 只能读到兜底截断标题；没有这条广播，LLM 标题要等到一次
+    /// 无关的列表刷新才可见。断言的是**通知真的发出**且**带的是 LLM 标题**（而非
+    /// 兜底值 `title_from("登录页报错了")`）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn first_turn_broadcasts_llm_title_change() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(TitleProvider);
+        let mut h = Harness::with_config(
+            cfg,
+            move |session, cwd, mode| {
+                build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        initialize(&mut h).await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+        ))
+        .await;
+
+        // 标题生成排在 turn 收尾广播之后，故要读到它可能跨若干帧（状态、正文、完成）。
+        let ev = read_until_method(&mut h, "thread/titleChanged").await;
+        assert_eq!(ev["params"]["thread_id"], tid);
+        assert_eq!(
+            ev["params"]["title"], "修复登录报错",
+            "通知必须携带 LLM 标题，而不是兜底截断值"
+        );
         h.shutdown().await;
     }
 
