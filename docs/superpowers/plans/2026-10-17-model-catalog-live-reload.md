@@ -318,7 +318,7 @@ git commit -m "feat(runtime): 新增严格清单读取 try_load_catalog_from"
 
 - [ ] **Step 2: 跑测试确认失败**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib watcher_ from_catalog_is_a_fixed_snapshot`
+Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib watcher_`
 Expected: 编译失败，报 `cannot find struct 'CatalogWatcher'`（RED）。
 
 - [ ] **Step 3: 实现**
@@ -377,6 +377,8 @@ struct WatcherState {
 /// - 文件不存在 → 采纳空清单（「没有配置」是明确信号，不是错误）。
 pub struct CatalogWatcher {
     path: PathBuf,
+    /// `from_catalog` 造的固定快照：永不重读（见 `current`）。
+    pinned: bool,
     state: Mutex<WatcherState>,
 }
 
@@ -393,6 +395,7 @@ impl CatalogWatcher {
                 catalog,
             }),
             path,
+            pinned: false,
         })
     }
 
@@ -400,19 +403,20 @@ impl CatalogWatcher {
     pub fn from_catalog(path: PathBuf, catalog: ModelCatalog) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(WatcherState {
-                // 一个不会再被匹配到的指纹：磁盘怎么变都不会触发重读。
-                fingerprint: Fingerprint {
-                    mtime: None,
-                    size: u64::MAX,
-                },
+                fingerprint: fingerprint_of(&path),
                 catalog: Arc::new(catalog),
             }),
             path,
+            pinned: true,
         })
     }
 
     /// 返回当前清单：指纹变了才重读，且只在解析成功时推进指纹。
     pub fn current(&self) -> Arc<ModelCatalog> {
+        // 固定快照（`from_catalog`）：无论磁盘怎么变都返回构造函数给的那份。
+        if self.pinned {
+            return Arc::clone(&self.state.lock().unwrap_or_else(|p| p.into_inner()).catalog);
+        }
         let observed = fingerprint_of(&self.path);
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if observed == state.fingerprint {
@@ -438,13 +442,16 @@ impl CatalogWatcher {
 }
 ```
 
-> `from_catalog` 的指纹用 `{ mtime: None, size: u64::MAX }`：真实文件不可能同时
-> 满足「无 mtime 且 size 恰为 u64::MAX」，故永不匹配 → 永不重读。
+> `from_catalog` 用独立的 `pinned: bool` 表达「固定快照」：`current()` 见到它
+> 就直接返回构造时给的 `Arc`，与磁盘指纹无关。**不要**用「构造一个永不匹配的
+> 指纹」来表达固定——`current()` 的规则是「指纹不同就重读」，永不匹配恰恰会
+> 导致每次都重读（计划初稿的注释与代码在此自相矛盾，测试为准）。
 
 - [ ] **Step 4: 跑测试确认通过**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib watcher_ from_catalog_is_a_fixed_snapshot`
-Expected: PASS（5 passed）。
+Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib watcher_`（4 passed）
+再 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib from_catalog_is_a_fixed_snapshot`（1 passed）
+Expected: PASS（合计 5 passed）。cargo 只接受单个 TESTNAME 过滤词，两条命令分别跑。
 
 - [ ] **Step 5: 提交**
 
