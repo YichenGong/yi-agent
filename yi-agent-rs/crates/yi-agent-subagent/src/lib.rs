@@ -35,6 +35,7 @@ use yi_agent_core::{
 };
 use yi_agent_runtime::models::CatalogWatcher;
 use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
+use yi_agent_store::terminal::text_completion_report;
 
 const DEFAULT_PROVIDER_RETRY_LIMIT: u16 = 3;
 
@@ -1825,16 +1826,6 @@ struct DaemonApplicationSpawnAgentTool {
     /// The live conversation that owns this tool, so a `fork:true` spawn can
     /// upload the caller's transcript at call time rather than at assembly.
     caller: CallerContext,
-}
-
-/// Extract the child's text report from its stored terminal payload, using the
-/// same `kind` marker the store writes.
-fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
-    let payload = serde_json::from_str::<Value>(terminal_json?).ok()?;
-    (payload.get("kind").and_then(Value::as_str) == Some("text_completion"))
-        .then(|| payload.get("report").and_then(Value::as_str))
-        .flatten()
-        .map(str::to_owned)
 }
 
 struct DaemonInspectAgentTool {

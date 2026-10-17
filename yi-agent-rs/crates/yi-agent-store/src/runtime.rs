@@ -40,6 +40,7 @@ use crate::repository::{
     WatchdogTerminal,
 };
 use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
+use crate::terminal::text_completion_report;
 
 /// The largest fork payload a daemon accepts when `YI_AGENT_FORK_MAX_BYTES` is
 /// absent or unparsable.
@@ -3156,14 +3157,6 @@ fn budget_exhausted_terminal_json(report: Option<&str>) -> Result<String, Runtim
     }))
     .map_err(RepositoryError::from)
     .map_err(RuntimeCoordinatorError::from)
-}
-
-fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
-    let payload = serde_json::from_str::<serde_json::Value>(terminal_json?).ok()?;
-    (payload.get("kind").and_then(serde_json::Value::as_str) == Some("text_completion"))
-        .then(|| payload.get("report").and_then(serde_json::Value::as_str))
-        .flatten()
-        .map(str::to_owned)
 }
 
 fn hydrate_completion_report(
