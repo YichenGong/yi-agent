@@ -12,6 +12,10 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# 线协议类型（`src/protocol.rs`）的 TypeScript 绑定从这里生成，桌面端不再手抄
+# 一份镜像（`desktop/src/lib/generated/`）。`serde-compat` 让生成物跟随
+# `#[serde(...)]` 的大小写/标签约定，即线上 JSON 形状。
+ts-rs = { version = "11", features = ["serde-compat"] }
 yi-agent-core = { workspace = true }
 yi-agent-runtime = { workspace = true }
 yi-agent-store = { workspace = true }
