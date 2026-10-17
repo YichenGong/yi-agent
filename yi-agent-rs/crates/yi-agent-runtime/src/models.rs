@@ -130,13 +130,39 @@ pub fn load_catalog_from(path: &Path) -> ModelCatalog {
             return ModelCatalog::default();
         }
     };
-    let value: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(value) => value,
+    match parse_catalog(&text, path) {
+        Ok(catalog) => catalog,
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "invalid models.json; treating as empty");
-            return ModelCatalog::default();
+            ModelCatalog::default()
         }
+    }
+}
+
+/// 严格读取清单：区分「文件不存在」与「不可读 / 不可解析」。
+///
+/// `Ok(空清单)` 表示「确定没有配置」（文件缺失是明确信号，调用方据此回退 `cfg`）；
+/// `Err(reason)` 表示「有文件但读不出来 / 解析不了」——调用方据此保留上一次可用值，
+/// 而不是把一次坏编辑当成「用户清空了配置」。
+///
+/// 既有的 [`load_catalog_from`] 保持「绝不报错」的容错语义（坏文件不阻断启动），
+/// 两者是**互补**而非替代关系。
+pub fn try_load_catalog_from(path: &Path) -> Result<ModelCatalog, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ModelCatalog::default());
+        }
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
+    parse_catalog(&text, path).map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+/// 把清单文本解析为 [`ModelCatalog`]。`load_catalog_from`（宽松）与
+/// `try_load_catalog_from`（严格）共用它，保证两份读取口径逐字节一致
+/// （含 warning 日志字段，故**必须**接收 `path`）。
+fn parse_catalog(text: &str, path: &Path) -> Result<ModelCatalog, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(text)?;
     let mut catalog = ModelCatalog::default();
     if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
         for raw in models {
@@ -164,7 +190,7 @@ pub fn load_catalog_from(path: &Path) -> ModelCatalog {
         .get("subagent_model")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    catalog
+    Ok(catalog)
 }
 
 pub fn save_catalog(catalog: &ModelCatalog) -> std::io::Result<()> {
@@ -523,6 +549,41 @@ mod tests {
 
         let _ = load_catalog_from(&path);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// 严格读取必须区分「文件不存在」（可判定的明确信号 → Ok 空清单）与
+    /// 「不可读 / 不可解析」（→ Err），否则调用方无法实现「坏文件保留旧值」。
+    #[test]
+    fn try_load_distinguishes_absent_from_corrupt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+
+        // 不存在：Ok 空清单（与 cfg 回退语义一致，不是错误）。
+        let absent = try_load_catalog_from(&path).expect("absent file must be Ok(empty)");
+        assert!(absent.models.is_empty());
+        assert!(absent.default_model.is_none());
+
+        // 合法内容：Ok，条目就位。
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"A","provider":"openai","api_url":"https://a/v1","model":"m","api_key":"k"}],"default_model":"A"}"#,
+        )
+        .unwrap();
+        let good = try_load_catalog_from(&path).expect("valid file must be Ok");
+        assert_eq!(good.default_model.as_deref(), Some("A"));
+
+        // 坏 JSON：Err（这是「损坏」，绝不能被当成空清单）。
+        std::fs::write(&path, "{ not json").unwrap();
+        let corrupt = try_load_catalog_from(&path);
+        assert!(
+            corrupt.is_err(),
+            "corrupt file must be Err, got {:?}",
+            corrupt.map(|c| c.models.len())
+        );
+
+        // 合法但为空清单：Ok（合法空不等于损坏）。
+        std::fs::write(&path, r#"{"models":[]}"#).unwrap();
+        assert!(try_load_catalog_from(&path).is_ok());
     }
 }
 
