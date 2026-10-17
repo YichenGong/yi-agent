@@ -590,7 +590,7 @@ git commit -m "fix(desktop): keep the phone search box at 16px so iOS will not a
 - Consumes: Task 1–3 的实际代码位置与验证命令。
 - Produces: 无后续任务依赖。
 
-- [ ] **Step 1: 记录基线计数**
+- [x] **Step 1: 记录基线计数**
 
 Run:
 
@@ -605,7 +605,7 @@ grep -n '^| desktop |' README.md
 注意 `README.md` 第 265 行**已经滞后**于模块文件——它写的是 `| desktop | 42 / 54 |`，比模块文件少 3 条。
 本次一并同步（见 Step 3），不要照抄 README 的旧数字。
 
-- [ ] **Step 2: 在 `docs/project-management/desktop.md` 追加一条已完成条目**
+- [x] **Step 2: 在 `docs/project-management/desktop.md` 追加一条已完成条目**
 
 追加到文件里既有 `[x]` 条目之后（与「手机端侧栏长按」等同级的位置），按该文件既有风格写成一行，
 必须带**代码位置**与**可执行判据**：
@@ -624,7 +624,7 @@ grep -n '^| desktop |' README.md
   判据：`cd desktop && npx vitest run src/lib/threadSearch.test.ts src/components/ThreadSidebar.test.tsx src/mobileLayout.test.ts src/App.test.tsx && npx tsc --noEmit`
 ```
 
-- [ ] **Step 3: 更新 README 索引计数**
+- [x] **Step 3: 更新 README 索引计数**
 
 `README.md` 第 265 行的 `| desktop | 42 / 54 | [详情](docs/project-management/desktop.md) |` 改为
 `| desktop | 46 / 58 | [详情](docs/project-management/desktop.md) |`。
@@ -633,7 +633,7 @@ grep -n '^| desktop |' README.md
 **同时修掉 README 既有 3 条滞后**：它原本写 42/54，比模块文件少 3 条。
 若 Step 1 实测基线与上面不同，则以「实测基线 +1、并与模块文件完全一致」为准。
 
-- [ ] **Step 4: 更新 desktop.md 末尾的「验证命令」计数**
+- [x] **Step 4: 更新 desktop.md 末尾的「验证命令」计数**
 
 `docs/project-management/desktop.md` 末尾那段 `**验证命令：**` 里列了逐文件用例数与总数（现为 930/81）。
 跑一遍拿到新数字并同步：
@@ -643,7 +643,7 @@ Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run --re
 把 `（930 个前端单测 / 81 个测试文件：…）` 里的总数、文件数，以及 `ThreadSidebar.test.tsx 62`、
 `mobileLayout.test.ts 15` 两个分项，改成实测值，并补上 `lib/threadSearch.test.ts 14` 一项。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs/project-management/desktop.md README.md
