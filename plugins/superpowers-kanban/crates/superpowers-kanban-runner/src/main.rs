@@ -531,19 +531,7 @@ fn command_done(
     project_root: &std::path::Path,
 ) -> Result<String, String> {
     use superpowers_kanban_core::card::{CardId, CardState};
-    let path = state_dir.join("board.json");
-    let mut board = superpowers_kanban_runner::persist::load_board(&path);
     let id = CardId::new(card_id);
-    match board.get(&id) {
-        None => return Err(format!("unknown card: {card_id}")),
-        Some(card) if card.state != CardState::AwaitingMerge => {
-            return Err(format!(
-                "card {card_id} is {:?}, not awaiting_merge",
-                card.state
-            ));
-        }
-        Some(_) => {}
-    }
     // 核对：推导分支并判是否已并入 base（分支可能已被删除——那时只能采信人工确认）。
     let source = format!(
         "kanban/{}",
@@ -558,10 +546,22 @@ fn command_done(
     } else {
         "not-merged"
     };
-    board
-        .transition(&id, CardState::Done)
-        .map_err(|e| e.to_string())?;
-    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    // 状态变更在锁内落盘：daemon 在跑也不会覆盖（它下个 tick 读到的是新文件）。
+    superpowers_kanban_runner::persist::with_board(state_dir, |board| {
+        match board.get(&id) {
+            None => return Err(format!("unknown card: {card_id}")),
+            Some(card) if card.state != CardState::AwaitingMerge => {
+                return Err(format!(
+                    "card {card_id} is {:?}, not awaiting_merge",
+                    card.state
+                ));
+            }
+            Some(_) => {}
+        }
+        board
+            .transition(&id, CardState::Done)
+            .map_err(|e| e.to_string())
+    })?;
     Ok(format!(
         "card {card_id} -> done ({verdict}); auto-archives in 24h — \
          `superpowers-kanban archive {card_id}` to hide it now"
@@ -575,26 +575,25 @@ fn command_archive(
     all_terminal: bool,
 ) -> Result<String, String> {
     use superpowers_kanban_core::card::CardId;
-    let path = state_dir.join("board.json");
-    let mut board = superpowers_kanban_runner::persist::load_board(&path);
-    let archived = if all_terminal {
-        let due: Vec<CardId> = board
-            .cards()
-            .iter()
-            .filter(|card| card.state.is_terminal() && !card.archived)
-            .map(|card| card.id.clone())
-            .collect();
-        let count = due.len();
-        for id in due {
+    let archived = superpowers_kanban_runner::persist::with_board(state_dir, |board| {
+        if all_terminal {
+            let due: Vec<CardId> = board
+                .cards()
+                .iter()
+                .filter(|card| card.state.is_terminal() && !card.archived)
+                .map(|card| card.id.clone())
+                .collect();
+            let count = due.len();
+            for id in due {
+                board.archive(&id).map_err(|e| e.to_string())?;
+            }
+            Ok(count)
+        } else {
+            let id = CardId::new(card_id.expect("parse guarantees an id or --all-terminal"));
             board.archive(&id).map_err(|e| e.to_string())?;
+            Ok(1)
         }
-        count
-    } else {
-        let id = CardId::new(card_id.expect("parse guarantees an id or --all-terminal"));
-        board.archive(&id).map_err(|e| e.to_string())?;
-        1
-    };
-    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    })?;
     Ok(format!("archived {archived} card(s)"))
 }
 
@@ -605,16 +604,15 @@ fn command_purge(
     all_archived: bool,
 ) -> Result<String, String> {
     use superpowers_kanban_core::card::CardId;
-    let path = state_dir.join("board.json");
-    let mut board = superpowers_kanban_runner::persist::load_board(&path);
-    let removed = if all_archived {
-        board.purge_archived()
-    } else {
-        let id = CardId::new(card_id.expect("parse guarantees an id or --all-archived"));
-        board.purge(&id).map_err(|e| e.to_string())?;
-        1
-    };
-    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    let removed = superpowers_kanban_runner::persist::with_board(state_dir, |board| {
+        if all_archived {
+            Ok(board.purge_archived())
+        } else {
+            let id = CardId::new(card_id.expect("parse guarantees an id or --all-archived"));
+            board.purge(&id).map_err(|e| e.to_string())?;
+            Ok(1)
+        }
+    })?;
     Ok(format!("purged {removed} card(s)"))
 }
 
@@ -1328,6 +1326,63 @@ mod tests {
         assert_eq!(
             effective_interval(None, dir.path()),
             Duration::from_secs(10)
+        );
+    }
+
+    #[test]
+    fn two_concurrent_transactions_both_land_on_disk() {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::CardId;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = Board::new();
+        for id in ["a", "b"] {
+            board.enqueue(
+                CardId::new(id),
+                format!("{id}.spec.md").into(),
+                format!("{id}.plan.md").into(),
+                chrono::Local::now(),
+            );
+        }
+        superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
+            .unwrap();
+
+        let a_dir = state_dir.clone();
+        let b_dir = state_dir.clone();
+        let a = std::thread::spawn(move || {
+            superpowers_kanban_runner::persist::with_board(&a_dir, |board| {
+                board
+                    .transition(
+                        &CardId::new("a"),
+                        superpowers_kanban_core::card::CardState::Running,
+                    )
+                    .map_err(|e| e.to_string())
+            })
+        });
+        let b = std::thread::spawn(move || {
+            superpowers_kanban_runner::persist::with_board(&b_dir, |board| {
+                board
+                    .transition(
+                        &CardId::new("b"),
+                        superpowers_kanban_core::card::CardState::Running,
+                    )
+                    .map_err(|e| e.to_string())
+            })
+        });
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+
+        let final_board = superpowers_kanban_runner::persist::read_board(&state_dir);
+        assert_eq!(
+            final_board.get(&CardId::new("a")).unwrap().state,
+            superpowers_kanban_core::card::CardState::Running,
+            "a 的写入必须留下"
+        );
+        assert_eq!(
+            final_board.get(&CardId::new("b")).unwrap().state,
+            superpowers_kanban_core::card::CardState::Running,
+            "b 的写入必须留下——锁内 load 才能做到"
         );
     }
 }
