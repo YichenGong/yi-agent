@@ -35,11 +35,22 @@ fn spawn_mock_gateway(port: u16, probe_cmd: &str) -> std::thread::JoinHandle<()>
             let n = stream.read(&mut buf).unwrap_or(0);
             let body = String::from_utf8_lossy(&buf[..n]).to_string();
             // This gateway speaks chat-completions only. With `api_style: auto`
-            // the client probes `/v1/responses` first and only falls back to
-            // chat when the route answers 404/405 with an empty body, so answer
-            // that probe explicitly instead of serving a chat-shaped 200 on
-            // every path (which would leave the Responses parser starved).
-            if body.starts_with("POST /v1/responses") {
+            // the client probes the Responses route first and only falls back to
+            // chat when it answers 404/405 with an empty body, so answer that
+            // probe explicitly instead of serving a chat-shaped 200 on every
+            // path (which would leave the Responses parser starved).
+            //
+            // Match on the request-line **path suffix**: the client posts to
+            // `{base_url}/responses`, and this test passes
+            // `--api-url http://127.0.0.1:{port}` (no `/v1`), so the request
+            // line is `POST /responses` — not `POST /v1/responses`. Matching the
+            // literal `/v1/...` never fired, the probe got a 200, and the task
+            // never reached the chat fallback (the bash tool then never ran).
+            // `/responses` uniquely identifies this route (`/chat/completions`
+            // does not contain it) and also covers a base_url that does carry
+            // `/v1`.
+            let request_line = body.lines().next().unwrap_or("");
+            if request_line.contains("/responses") {
                 let _ = stream.write_all(
                     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
