@@ -2504,6 +2504,16 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::Process => {
+                        let mut state = app_state!();
+                        match crate::rpc::process::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     // 尚未搬移的域(以及 `initialize`)仍走原始 dispatch。
                     // 逐域搬移期间,还没搬的域也落到这里,故用 `_` 一并兜住
                     // (`Domain::Unknown` 覆盖 `initialize` 与所有未识别前缀)。
@@ -4394,139 +4404,6 @@ where
                             watch.stop().await;
                         }
                         write_response(&hub, &client, ok_response(id, json!({ "stopped": true }))).await?;
-                    }
-                    "process/list" => {
-                        let Some(thread_id) =
-                            req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing thread_id")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 未知 thread 返回空表而非错误:切走再切回、thread 已删除
-                        // 都是正常路径,报错只会弹一条无意义的红条。
-                        let processes = threads
-                            .get(&thread_id)
-                            .map(|s| s.process_manager.list())
-                            .unwrap_or_default();
-                        write_response(&hub, &client, ok_response(id, json!({ "processes": processes })))
-                            .await?;
-                    }
-                    "process/read" => {
-                        let Some(thread_id) =
-                            req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing thread_id")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let Some(process_id) = req
-                            .params
-                            .get("process_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing process_id")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let Some(session) = threads.get(&thread_id) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::unknown_thread(&thread_id)),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let cursor = req.params.get("cursor").and_then(|v| v.as_u64());
-                        let max_bytes = req
-                            .params
-                            .get("max_bytes")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(64 * 1024) as usize;
-                        match session
-                            .process_manager
-                            .read(yi_agent_tools::ProcessSelector::Id(process_id), cursor, max_bytes)
-                            .await
-                        {
-                            Ok(result) => {
-                                write_response(
-                                    &hub, &client,
-                                    ok_response(
-                                        id,
-                                        serde_json::to_value(result)
-                                            .unwrap_or(serde_json::Value::Null),
-                                    ),
-                                )
-                                .await?
-                            }
-                            Err(message) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::invalid_params(message)),
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                    "process/kill" => {
-                        let Some(thread_id) =
-                            req.params.get("thread_id").and_then(|v| v.as_str()).map(str::to_string)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing thread_id")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let Some(process_id) = req
-                            .params
-                            .get("process_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing process_id")),
-                            )
-                            .await?;
-                            continue;
-                        };
-        let Some(session) = threads.get(&thread_id) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::unknown_thread(&thread_id)),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        match session
-                            .process_manager
-                            .kill(yi_agent_tools::ProcessSelector::Id(process_id))
-                            .await
-                        {
-                            Ok(()) => {
-                                write_response(&hub, &client, ok_response(id, json!({ "ok": true })))
-                                    .await?
-                            }
-                            Err(message) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::invalid_params(message)),
-                                )
-                                .await?
-                            }
-                        }
                     }
                     "pair/create" => {
                         // 铸一枚一次性配对码,交桌面端渲染二维码。设备注册属于

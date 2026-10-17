@@ -18,6 +18,7 @@ pub(crate) mod image;
 pub(crate) mod model;
 pub(crate) mod onboarding;
 pub(crate) mod plugin;
+pub(crate) mod process;
 pub(crate) mod ui;
 pub(crate) mod workspace;
 
@@ -86,6 +87,8 @@ pub(crate) enum Domain {
     Image,
     /// `workspace/*`。
     Workspace,
+    /// `process/*`。
+    Process,
     /// 未搬移(含 `initialize`)。
     Unknown,
 }
@@ -105,6 +108,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("plugin") | Some("plugins") => Domain::Plugin,
         Some("image") => Domain::Image,
         Some("workspace") => Domain::Workspace,
+        Some("process") => Domain::Process,
         _ => Domain::Unknown,
     }
 }
