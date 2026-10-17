@@ -142,8 +142,27 @@ In `config.rs`'s `load_inner`, the existing locals already hold `compact_ratio` 
             model_context_length,
 ```
 
-Fix the two other `RuntimeConfig` literals: `sample_config()` (`config.rs:417`) gains
-`compact_ratio: 80,` and `model_context_length: None,`.
+**Adding a field to a public struct breaks every struct literal in the workspace.** There are
+12 sites; update all of them in this task so no crate is left uncompilable. Add
+`compact_ratio: 80,` and `model_context_length: None,` to each of these (values chosen to
+match the surrounding fixture's intent — `compact_ratio: 80` is the production default):
+
+| File | Site |
+|---|---|
+| `yi-agent-runtime/src/config.rs` | `sample_config()` |
+| `yi-agent-runtime/src/models.rs` | `mod tests`'s `cfg()` |
+| `yi-agent-app-server/src/server.rs` | `tests_support::test_config()` |
+| `yi-agent-app-server/src/onboarding_rpc.rs` | `tests`'s `fallback()` |
+| `yi-agent-app-server/src/model_rpc.rs` | `tests`'s `fallback_cfg()` |
+| `yi-agent-subagent/src/attach.rs` | `base_config()`, and the two inline `let cfg =` at :625 and :669 |
+| `yi-agent-subagent/src/lib.rs` | `watcher_test_config()` |
+| `yi-agent-subagent/tests/attach_delegation.rs` | `config_for()` |
+
+Verify none are missed before committing:
+
+```bash
+cd yi-agent-rs && cargo build --workspace --all-targets 2>&1 | grep -c "missing field" # expect 0
+```
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -186,8 +205,10 @@ Add to `config.rs`'s `mod tests`:
     #[test]
     fn a_dotenv_model_key_never_reaches_the_config() {
         let dir = tempfile::TempDir::new().unwrap();
-        let env_path = dir.path().join(".env");
-        std::fs::write(&env_path, "MODEL_API_KEY=from-dotenv\n").unwrap();
+        // `.env` 必须落在 `resolve_env_path` 会读的位置：<dir>/.yi-agent/.env。
+        let env_dir = dir.path().join(".yi-agent");
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(env_dir.join(".env"), "MODEL_API_KEY=from-dotenv\n").unwrap();
 
         let mut env = isolated_config_env();
         env.set("YI_AGENT_WORKDIR", dir.path());
@@ -307,9 +328,27 @@ Rewrite `load_inner`'s env section. Replace the current `let local_env_path = ..
         prune_dotenv_model_keys(&model_env);
 ```
 
-For this task only, keep `resolve_env_path` as-is and change `load_env_files` to take a single
-path (Task 3 finishes the call-site cleanup). In the same task, replace the four model locals
-so they read the snapshot instead of the live env:
+For this task only, keep `resolve_env_path` and `load_env_files`'s existing two-argument
+signature untouched so the 4 existing `load_env_files_*` tests keep passing; Task 7 collapses
+them to a single path. Only the *call site* inside `load_inner` changes, to keep loading the
+same two files in the same order:
+
+```rust
+        // 快照必须早于任何 .env 加载（见 `ModelEnvSnapshot` 的文档）。
+        let model_env = ModelEnvSnapshot::take();
+        let local_env_path = resolve_env_path(overrides);
+        let global_env_path = if is_workdir_explicit(overrides) {
+            None
+        } else {
+            resolve_global_env_path()
+        };
+        load_env_files(&local_env_path, global_env_path.as_deref());
+        prune_dotenv_model_keys(&model_env);
+```
+
+(That is the existing block verbatim, with the `ModelEnvSnapshot::take()` line prepended and
+`prune_dotenv_model_keys` appended — no signature churn in this task.) In the same task,
+replace the four model locals so they read the snapshot instead of the live env:
 
 ```rust
         let injected_provider = overrides
@@ -688,21 +727,30 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_env_degrades_without_losing_the_catalog() {
+    fn a_read_only_env_dir_degrades_without_losing_the_catalog() {
         let dir = tempfile::TempDir::new().unwrap();
-        let env = write_env(dir.path(), "MODEL_API_KEY=sk-x\n");
+        // 把 .env 放进只读子目录：原子写的临时文件创建会失败（rename 只需目录可写，
+        // 所以只 chmod 文件本身测不出来）。models.json 留在可写的根目录。
+        let ro = dir.path().join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        let env = write_env(&ro, "MODEL_API_KEY=sk-x\n");
         let models = dir.path().join("models.json");
-        let mut perms = std::fs::metadata(&env).unwrap().permissions();
+        let mut perms = std::fs::metadata(&ro).unwrap().permissions();
         perms.set_readonly(true);
-        std::fs::set_permissions(&env, perms).unwrap();
+        std::fs::set_permissions(&ro, perms).unwrap();
 
         match migrate_model_keys(&env, &models) {
             MigrationOutcome::EnvNotWritable { .. } => {}
             other => panic!("expected EnvNotWritable, got {other:?}"),
         }
         // The catalog write already happened; the key is not lost.
-        let catalog = yi_agent_runtime::models::load_catalog_from(&models);
+        let catalog = crate::models::load_catalog_from(&models);
         assert_eq!(catalog.models[0].api_key, "sk-x");
+
+        // 恢复可写以便 TempDir 清理。
+        let mut perms = std::fs::metadata(&ro).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&ro, perms).unwrap();
     }
 }
 ```
