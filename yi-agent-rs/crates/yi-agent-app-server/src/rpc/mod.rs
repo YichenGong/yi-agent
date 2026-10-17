@@ -21,6 +21,7 @@ pub(crate) mod onboarding;
 pub(crate) mod pair;
 pub(crate) mod plugin;
 pub(crate) mod process;
+pub(crate) mod thread;
 pub(crate) mod turn;
 pub(crate) mod ui;
 pub(crate) mod workspace;
@@ -29,7 +30,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::time::Duration;
 
+use tokio::sync::{mpsc, oneshot};
+
+use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
 use crate::broadcast::{Broadcaster, ClientId};
@@ -56,6 +61,26 @@ pub(crate) type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send
 /// 的臂把它转发给 daemon 查询 helper(`socket_for_thread` 等)。
 pub(crate) type ProjectRuntimes =
     Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
+
+/// 每会话自身的 root 表(建在项目共享 binding 之上)。同 [`ProjectRuntimes`],
+/// 与 `server.rs` 的同名私有别名是同一个类型。
+pub(crate) type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
+
+/// 会话 agent 工厂:`serve()` 的 `build_agent` 参数。`thread/start`(建新 agent)与
+/// `thread/resume`(按历史重建)两个臂各调用一次。
+///
+/// 存的是**裸 trait 对象引用**而非 `&F`:AppState 刻意不带泛型参数(12 个域的
+/// `handle` 签名必须一致),而 `&F` 恰好在 `app_state!()` 那一个调用点自动 unsize
+/// 成 `&dyn Fn(..)` —— 同一个工厂、同一个调用,中间没有转接层。
+pub(crate) type BuildAgent<'a> = &'a (
+        dyn Fn(
+    Option<yi_agent_core::Session>,
+    &Path,
+    crate::thread_store::ThreadMode,
+) -> anyhow::Result<crate::server::BuiltAgent>
+            + Send
+            + Sync
+    );
 
 /// 一个域 handler 的返回值:是否已经处理完本轮请求。
 ///
@@ -107,6 +132,8 @@ pub(crate) enum Domain {
     Pair,
     /// `turn/*`。
     Turn,
+    /// `thread/*`(会话生命周期:列表、建/恢复、改名、模型档、置顶、删除、订阅)。
+    Thread,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
     Agent,
     /// 未搬移(含 `initialize`)。
@@ -132,6 +159,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("pair") => Domain::Pair,
         Some("device") => Domain::Pair,
         Some("turn") => Domain::Turn,
+        Some("thread") => Domain::Thread,
         Some("agent") => Domain::Agent,
         _ => Domain::Unknown,
     }
@@ -211,8 +239,10 @@ pub(crate) struct AppState<'a> {
     /// attach 产出、待该 thread 的首个 turn 激活的 runtime。`turn/start` 经
     /// `start_turn_core` 读取它。搬移前臂里的 `pending_activation`;只读借用。
     /// attach 产出、待该 thread 的首个 turn 激活的 runtime。`turn/start` 经
-    /// `start_turn_core` 读取它。搬移前臂里的 `pending_activation`;只读借用。
-    pub(crate) pending_activation: &'a HashMap<String, Option<Arc<ThreadRoot>>>,
+    /// `start_turn_core` 读取它。搬移前臂里的 `pending_activation`;batch 3 改为按
+    /// `&mut` 借用——`thread/start` 经 `start_thread_core` 写入、`thread/resume`
+    /// 直接 `insert`,两处都要独占(`turn/start` 那条只读路径由 `&mut` 自动重借)。
+    pub(crate) pending_activation: &'a mut HashMap<String, Option<Arc<ThreadRoot>>>,
 
     // ---- batch 3:`thread/*` 与 `agent/*` 依赖的主循环局部量 ----
     /// 项目共享 runtime 登记表。`thread/*` 与 `agent/*` 都经 daemon IPC helper
@@ -220,6 +250,9 @@ pub(crate) struct AppState<'a> {
     /// `thread/start`、`thread/resume` 还把它交给 `start_thread_core` /
     /// `attach_delegation`。搬移前臂里的 `runtimes`;只读借用(`Arc` 内部自锁)。
     pub(crate) runtimes: &'a ProjectRuntimes,
+    /// 每会话自己的 root 表。`thread/resume` 经 `attach_delegation` 挂 root,
+    /// `thread/delete` 摘掉该会话的 root 并 `detach`。搬移前臂里的 `thread_roots`。
+    pub(crate) thread_roots: &'a ThreadRoots,
     /// 每 thread 一个进程状态守望者。`thread/start`/`thread/resume`/`thread/delete`
     /// 增删它,`agent/trace/unwatch` 停它。搬移前臂里的 `process_watches`,按 `&mut`
     /// 借用。
@@ -230,6 +263,28 @@ pub(crate) struct AppState<'a> {
     /// 每 thread 至多一个子任务列表守望者。`agent/children/list` 建立它,
     /// `agent/trace/unwatch`/`thread/delete` 停它。搬移前臂里的 `children_watches`。
     pub(crate) children_watches: &'a mut HashMap<String, crate::server::ChildrenWatch>,
+    /// 反向权限请求的等待登记表。`thread/start`/`thread/resume` 交给
+    /// `start_thread_core`/`run_thread_driver`。搬移前臂里的 `pending`。
+    pub(crate) pending: &'a Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
+    /// 审批 id 的全局序号(跨 thread 唯一)。与 [`AppState::pending`] 同路交出去。
+    /// 搬移前臂里的 `perm_seq`。
+    pub(crate) perm_seq: &'a Arc<std::sync::atomic::AtomicU64>,
+    /// 权限审批默认超时。与 [`AppState::pending`] 同路交出去。搬移前臂里的
+    /// `permission_timeout`;按值拷贝(`Duration` 是 `Copy`)。
+    pub(crate) permission_timeout: Duration,
+    /// 主循环的 turn 完成事件接收端。`thread/resume` 与 `thread/delete` 经
+    /// `interrupt_and_wait_for_persist` 用它等待 driver 落盘。搬移前臂里的
+    /// `turn_rx`,按 `&mut` 借用。
+    pub(crate) turn_rx: &'a mut mpsc::Receiver<crate::server::TurnEvent>,
+    /// 主循环的 turn 完成事件发送端(driver task 用它上报)。`thread/start` /
+    /// `thread/resume` 各 clone 一份给 driver。搬移前臂里的 `turn_tx`。
+    pub(crate) turn_tx: &'a mpsc::Sender<crate::server::TurnEvent>,
+    /// 会话 agent 工厂。`thread/start`(建新 agent)与 `thread/resume`(按历史
+    /// 重建)各调用一次。搬移前臂里的 `build_agent`。
+    pub(crate) build_agent: BuildAgent<'a>,
+    /// Git Diff 焦点句柄。与 [`AppState::theme_handle`] 同路,交给会话的工具集。
+    /// 搬移前臂里的 `git_diff_handle`。
+    pub(crate) git_diff_handle: &'a crate::git_diff_tool::GitDiffHandle,
 }
 
 impl<'a> AppState<'a> {
@@ -258,11 +313,19 @@ impl<'a> AppState<'a> {
         threads: &'a mut HashMap<String, ThreadSession>,
         workspaces: &'a Arc<WorkspaceIndex>,
         pairing: &'a Arc<PairingState>,
-        pending_activation: &'a HashMap<String, Option<Arc<ThreadRoot>>>,
+        pending_activation: &'a mut HashMap<String, Option<Arc<ThreadRoot>>>,
         runtimes: &'a ProjectRuntimes,
+        thread_roots: &'a ThreadRoots,
         process_watches: &'a mut HashMap<String, crate::server::ProcessWatch>,
         trace_watches: &'a mut HashMap<String, crate::server::TraceWatch>,
         children_watches: &'a mut HashMap<String, crate::server::ChildrenWatch>,
+        pending: &'a Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
+        perm_seq: &'a Arc<std::sync::atomic::AtomicU64>,
+        permission_timeout: Duration,
+        turn_rx: &'a mut mpsc::Receiver<crate::server::TurnEvent>,
+        turn_tx: &'a mpsc::Sender<crate::server::TurnEvent>,
+        build_agent: BuildAgent<'a>,
+        git_diff_handle: &'a crate::git_diff_tool::GitDiffHandle,
     ) -> Self {
         Self {
             hub,
@@ -286,9 +349,17 @@ impl<'a> AppState<'a> {
             pairing,
             pending_activation,
             runtimes,
+            thread_roots,
             process_watches,
             trace_watches,
             children_watches,
+            pending,
+            perm_seq,
+            permission_timeout,
+            turn_rx,
+            turn_tx,
+            build_agent,
+            git_diff_handle,
         }
     }
 }
