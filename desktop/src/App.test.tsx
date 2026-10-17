@@ -1470,6 +1470,62 @@ describe("App settings & theme wiring", () => {
     );
   });
 
+  it("does not tag optimistically, and re-lists once thread/setTag resolves", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    // Hold the RPC open so we can observe the UI *before* the server answers.
+    let release: () => void = () => {};
+    state.dataSources["thread/setTag"] = () =>
+      new Promise<void>((resolve) => {
+        release = () => resolve();
+      });
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    fireEvent.contextMenu(container.querySelector('[data-thread-row="t1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/setTag")).toBe(true),
+    );
+    expect(clients[0].requests.find((r) => r.method === "thread/setTag")!.params).toEqual({
+      threadId: "t1",
+      tag: "red",
+    });
+    // 不做乐观更新：回包之前 UI 不能显示色点，也不能为此重拉列表。
+    expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+
+    act(() => release());
+    await waitFor(() => {
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThan(listCallsBefore);
+    });
+  });
+
+  it("surfaces the error and still re-lists when thread/setTag rejects", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.rejectCode["thread/setTag"] = -32011;
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    fireEvent.contextMenu(container.querySelector('[data-thread-row="t1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+
+    await waitFor(() => expect(screen.getByText(/forced -32011/)).toBeTruthy());
+    // 失败同样重拉：本地不假装成功，以服务端为权威。
+    await waitFor(() => {
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThan(listCallsBefore);
+    });
+    expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
+  });
+
   it("reflects a thread/modelChanged from another client in that thread's picker", async () => {
     render(<App />);
     await settle();
