@@ -890,40 +890,50 @@ export default function App() {
     // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
     setOpenProcessId(null);
     setProcessOutput(null);
-    // Remote-only (S2): keep this thread in the warm subscription window, and
-    // catch up a cold-but-running thread with the read-only `thread/readItems`
-    // instead of `thread/resume` — resume interrupts the in-flight turn, which
-    // is exactly what a passive "look at it" must not do. Desktop (stdio) never
-    // subscribes: its single client receives everything.
+    // **看**一个运行中的会话绝不走 `thread/resume`：resume 会先中断在跑的
+    // turn（服务端 `interrupt_and_wait_for_persist`），而「点开看一眼」是纯
+    // 被动动作，不该有把别人打断的副作用。改用只读的 `thread/readItems` 补齐
+    // 内容，之后靠既有的通知流继续跟新。这对桌面端同样成立——桌面端过去没有
+    // 这层保护（它被 `isRemoteClient()` 关在远端分支里），于是点开一张正在跑
+    // 的看板卡就会把它打断。
+    const curView = store.peek(id);
+    const running =
+      curView?.status === "running" || curView?.status === "awaiting_approval";
+
+    // Remote-only (S2): keep this thread in the warm subscription window.
+    // Desktop (stdio) never subscribes: its single client receives everything.
+    let inWindow = false;
     if (isRemoteClient()) {
-      const inWindow = subWindow.current.has(id);
+      inWindow = subWindow.current.has(id);
       const win = subWindow.current.touch(id);
-      const view = store.peek(id);
-      const running = view?.status === "running" || view?.status === "awaiting_approval";
+      void clientRef.current
+        ?.request("thread/subscribe", { threadIds: win })
+        .catch(() => {});
+      // Already warm → view-only swap.
+      if (inWindow) return;
+    }
+
+    if (running) {
       const c0 = clientRef.current;
       if (c0) {
-        if (!inWindow && running) {
-          const after = store.peek(id)?.session.lastServerItemId ?? null;
-          void (async () => {
-            try {
-              const r = await c0.request<{ items: Item[] }>(
-                "thread/readItems",
-                after ? { threadId: id, afterItemId: after } : { threadId: id },
-              );
-              const v = store.peek(id);
-              if (v) {
-                v.session.upsertItems(r.items);
-                force((n) => n + 1);
-              }
-            } catch {
-              // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+        const after = store.peek(id)?.session.lastServerItemId ?? null;
+        void (async () => {
+          try {
+            const r = await c0.request<{ items: Item[] }>(
+              "thread/readItems",
+              after ? { threadId: id, afterItemId: after } : { threadId: id },
+            );
+            const v = store.peek(id);
+            if (v) {
+              v.session.upsertItems(r.items);
+              force((n) => n + 1);
             }
-          })();
-        }
-        void c0.request("thread/subscribe", { threadIds: win }).catch(() => {});
+          } catch {
+            // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+          }
+        })();
       }
-      // Already warm, or caught up via readItems above → view-only swap.
-      if (inWindow || running) return;
+      return;
     }
     if (warm.current.has(id) || inFlightResume.current.has(id)) return; // warm → 只切视图
     const c = clientRef.current;

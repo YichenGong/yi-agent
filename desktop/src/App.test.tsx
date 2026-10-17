@@ -2424,6 +2424,40 @@ describe("App remote subscription wiring (S2)", () => {
     expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
   });
 
+  it("does not interrupt a running thread on the desktop build", async () => {
+    // 桌面端过去没有这层保护（它被 `isRemoteClient()` 关在远端分支里）：点开
+    // 一张正在跑的看板卡会话就会 resume，而 resume 会先中断在跑的 turn。这条
+    // 用例把「看一眼 = 只读」钉死为**两种客户端共有**的不变量。
+    state.listStatus = "running";
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />); // no persisted config → desktop
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) =>
+            r.method === "thread/readItems" &&
+            (r.params as { threadId: string }).threadId === "t1",
+        ),
+      ).toBe(true),
+    );
+    // The defining property: looking at a running thread never resumes it.
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+    // Desktop still never subscribes; that stays remote-only.
+    expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
+  });
+
+  it("still resumes a cold idle thread on the desktop build", async () => {
+    // 回归护栏：把「运行中才只读」这条边钉住。若有人把 running 判断写错成
+    // 「一律不 resume」，冷会话就再也合不进服务端历史（resume 是它唯一的就绪
+    // 途径，turn/start 对冷会话返回 -32011）。
+    render(<App />); // listStatus 默认 idle
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
+  });
+
   it("catches a cold running thread up with readItems instead of resume", async () => {
     asRemote();
     state.threads = [
