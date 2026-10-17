@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
-import { describe, it, expect, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { render, screen, cleanup, fireEvent } from "@testing-library/react";
 import { StatusBar } from "./StatusBar";
 
 afterEach(cleanup);
@@ -26,5 +26,20 @@ describe("StatusBar", () => {
     // 用量文字就会在窄屏折行、把底栏再撑高。这里让 JS 侧与 CSS 侧的锚点对齐。
     const { container } = render(<StatusBar cwd="/w" status="connected" usage={null} />);
     expect(container.firstElementChild?.className).toContain("app-statusbar");
+  });
+
+  it("offers a re-pair entry only when the host passes one", () => {
+    const { rerender } = render(<StatusBar cwd="/w" status="connecting" usage={null} />);
+    expect(screen.queryByRole("button", { name: "重新配对" })).toBeNull();
+
+    rerender(<StatusBar cwd="/w" status="connecting" usage={null} onRepair={() => {}} />);
+    expect(screen.getByRole("button", { name: "重新配对" })).toBeTruthy();
+  });
+
+  it("invokes the re-pair callback when clicked", () => {
+    const onRepair = vi.fn();
+    render(<StatusBar cwd="/w" status="connecting" usage={null} onRepair={onRepair} />);
+    fireEvent.click(screen.getByRole("button", { name: "重新配对" }));
+    expect(onRepair).toHaveBeenCalledTimes(1);
   });
 });
