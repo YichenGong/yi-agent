@@ -13,6 +13,7 @@
 //! `continue`。
 
 // 域子模块:每个模块承载一个域,臂体逐字搬移自 `serve()` 的 dispatch。
+pub(crate) mod agent;
 pub(crate) mod board;
 pub(crate) mod image;
 pub(crate) mod model;
@@ -25,8 +26,9 @@ pub(crate) mod ui;
 pub(crate) mod workspace;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use yi_agent_runtime::config::RuntimeConfig;
 
@@ -36,6 +38,7 @@ use crate::protocol::Scope;
 use crate::session::ThreadSession;
 use crate::theme_tool::ThemeHandle;
 use crate::workspace_index::WorkspaceIndex;
+use yi_agent_subagent::binding::RuntimeBinding;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
 /// 值守安装句柄。与 `server.rs` 里的私有 `type WatchmanInstall` 是**同一个**
@@ -46,6 +49,13 @@ pub(crate) type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String>
 pub(crate) type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 /// 看板守护进程启动器句柄,同 [`WatchmanInstall`]。
 pub(crate) type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
+
+/// 项目的共享 runtime 登记表(按 canonical cwd 键)。与 `server.rs` 里的私有
+/// `type ProjectRuntimes` 是**同一个**类型(同一个 `Arc<StdMutex<HashMap<..>>>`),
+/// 在对齐处互换无碍——与 [`WatchmanInstall`] 同一手法。`agent/*` 与 `thread/*`
+/// 的臂把它转发给 daemon 查询 helper(`socket_for_thread` 等)。
+pub(crate) type ProjectRuntimes =
+    Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
 
 /// 一个域 handler 的返回值:是否已经处理完本轮请求。
 ///
@@ -97,6 +107,8 @@ pub(crate) enum Domain {
     Pair,
     /// `turn/*`。
     Turn,
+    /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
+    Agent,
     /// 未搬移(含 `initialize`)。
     Unknown,
 }
@@ -120,6 +132,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("pair") => Domain::Pair,
         Some("device") => Domain::Pair,
         Some("turn") => Domain::Turn,
+        Some("agent") => Domain::Agent,
         _ => Domain::Unknown,
     }
 }
@@ -197,7 +210,26 @@ pub(crate) struct AppState<'a> {
     pub(crate) pairing: &'a Arc<PairingState>,
     /// attach 产出、待该 thread 的首个 turn 激活的 runtime。`turn/start` 经
     /// `start_turn_core` 读取它。搬移前臂里的 `pending_activation`;只读借用。
+    /// attach 产出、待该 thread 的首个 turn 激活的 runtime。`turn/start` 经
+    /// `start_turn_core` 读取它。搬移前臂里的 `pending_activation`;只读借用。
     pub(crate) pending_activation: &'a HashMap<String, Option<Arc<ThreadRoot>>>,
+
+    // ---- batch 3:`thread/*` 与 `agent/*` 依赖的主循环局部量 ----
+    /// 项目共享 runtime 登记表。`thread/*` 与 `agent/*` 都经 daemon IPC helper
+    /// (`socket_for_thread` / `forward_to_daemon` / `detach_unused_runtimes`)查它;
+    /// `thread/start`、`thread/resume` 还把它交给 `start_thread_core` /
+    /// `attach_delegation`。搬移前臂里的 `runtimes`;只读借用(`Arc` 内部自锁)。
+    pub(crate) runtimes: &'a ProjectRuntimes,
+    /// 每 thread 一个进程状态守望者。`thread/start`/`thread/resume`/`thread/delete`
+    /// 增删它,`agent/trace/unwatch` 停它。搬移前臂里的 `process_watches`,按 `&mut`
+    /// 借用。
+    pub(crate) process_watches: &'a mut HashMap<String, crate::server::ProcessWatch>,
+    /// 每 thread 至多一条被关注的轨迹流。`agent/trace/watch` 换它,
+    /// `agent/trace/unwatch`/`thread/delete` 停它。搬移前臂里的 `trace_watches`。
+    pub(crate) trace_watches: &'a mut HashMap<String, crate::server::TraceWatch>,
+    /// 每 thread 至多一个子任务列表守望者。`agent/children/list` 建立它,
+    /// `agent/trace/unwatch`/`thread/delete` 停它。搬移前臂里的 `children_watches`。
+    pub(crate) children_watches: &'a mut HashMap<String, crate::server::ChildrenWatch>,
 }
 
 impl<'a> AppState<'a> {
@@ -227,6 +259,10 @@ impl<'a> AppState<'a> {
         workspaces: &'a Arc<WorkspaceIndex>,
         pairing: &'a Arc<PairingState>,
         pending_activation: &'a HashMap<String, Option<Arc<ThreadRoot>>>,
+        runtimes: &'a ProjectRuntimes,
+        process_watches: &'a mut HashMap<String, crate::server::ProcessWatch>,
+        trace_watches: &'a mut HashMap<String, crate::server::TraceWatch>,
+        children_watches: &'a mut HashMap<String, crate::server::ChildrenWatch>,
     ) -> Self {
         Self {
             hub,
@@ -249,6 +285,10 @@ impl<'a> AppState<'a> {
             workspaces,
             pairing,
             pending_activation,
+            runtimes,
+            process_watches,
+            trace_watches,
+            children_watches,
         }
     }
 }

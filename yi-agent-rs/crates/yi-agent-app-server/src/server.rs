@@ -101,7 +101,8 @@ struct RuntimeTooling {
 ///
 /// 失败也缓存(存 `Err(原因)`):否则纯目录下每开一个 thread 都会重跑一遍注定失败的
 /// bring-up(git 检查 + daemon 起停尝试)。
-type ProjectRuntimes = Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
+pub(crate) type ProjectRuntimes =
+    Arc<StdMutex<HashMap<PathBuf, Result<Arc<RuntimeBinding>, String>>>>;
 
 /// 每会话自己的 root,建在项目共享 binding 之上。
 ///
@@ -357,7 +358,7 @@ fn attach_delegation(
 ///
 /// Distinct from an unattached conversation, which exists and answers with an
 /// empty result: a thread id that was never started is a caller error.
-async fn require_known_thread(
+pub(crate) async fn require_known_thread(
     hub: &crate::broadcast::Broadcaster,
     client: &crate::broadcast::ClientId,
     threads: &HashMap<String, ThreadSession>,
@@ -381,7 +382,7 @@ async fn require_known_thread(
 /// The socket belongs to the attached project root, which is keyed by the
 /// thread's own directory. A thread that never attached has no socket, and every
 /// `agent/*` answer for it is empty rather than an error.
-fn socket_for_thread(
+pub(crate) fn socket_for_thread(
     runtimes: &ProjectRuntimes,
     threads: &HashMap<String, ThreadSession>,
     thread_id: &str,
@@ -455,7 +456,7 @@ fn cancel_thread_children(
 }
 
 /// The task summaries the daemon holds for a conversation's directory.
-fn list_task_summaries(
+pub(crate) fn list_task_summaries(
     runtimes: &ProjectRuntimes,
     threads: &HashMap<String, ThreadSession>,
     thread_id: &str,
@@ -477,7 +478,7 @@ fn list_task_summaries(
 }
 
 /// Read a task's persisted trace, plus the high-water mark to resume from.
-fn read_task_trace(
+pub(crate) fn read_task_trace(
     runtimes: &ProjectRuntimes,
     threads: &HashMap<String, ThreadSession>,
     thread_id: &str,
@@ -491,7 +492,7 @@ fn read_task_trace(
 }
 
 /// The watch's opening frame carries the backlog the client would otherwise miss.
-fn snapshot_for_watch(
+pub(crate) fn snapshot_for_watch(
     runtimes: &ProjectRuntimes,
     threads: &HashMap<String, ThreadSession>,
     thread_id: &str,
@@ -519,7 +520,7 @@ fn agent_trace_row(row: yi_agent_store::ipc::IpcTraceRow) -> crate::protocol::Ag
 /// own error frame is turned into the RPC error rather than swallowed. A
 /// conversation with no attached runtime is an unknown-thread error, since there
 /// is nothing to send to.
-fn forward_to_daemon(
+pub(crate) fn forward_to_daemon(
     runtimes: &ProjectRuntimes,
     threads: &HashMap<String, ThreadSession>,
     thread_id: &str,
@@ -544,7 +545,7 @@ fn forward_to_daemon(
 /// synchronously, so pushing it again would be a duplicate. Every later
 /// difference is pushed whole, because the list is small and a client that
 /// applies it wholesale cannot drift out of order.
-async fn watch_children(
+pub(crate) async fn watch_children(
     hub: Arc<crate::broadcast::Broadcaster>,
     thread_id: String,
     socket: PathBuf,
@@ -624,7 +625,7 @@ async fn watch_processes(
 /// The subscription is non-blocking so the task yields between polls; it ends on
 /// its own when the daemon closes the stream, and is aborted when the client
 /// unwatches, watches another task, or closes the thread.
-async fn stream_trace(
+pub(crate) async fn stream_trace(
     hub: Arc<crate::broadcast::Broadcaster>,
     thread_id: String,
     task_id: String,
@@ -679,7 +680,7 @@ async fn stream_trace(
 /// attached root, so the marker is the only thing that separates their children.
 /// Root tasks are never children, and the `thread_id` filter is exact, so an
 /// untagged task belongs to no conversation rather than to all of them.
-fn children_for_thread(
+pub(crate) fn children_for_thread(
     tasks: &[yi_agent_store::ipc::IpcTaskSummary],
     thread_id: &str,
 ) -> Vec<crate::protocol::AgentChild> {
@@ -716,12 +717,12 @@ fn is_terminal_state(state: &str) -> bool {
 /// reuses the same read the initial `agent/children/list` does, so the pushed
 /// list can never disagree with a fresh request. The observable contract is
 /// unchanged: whole-list `agent/children/updated` notifications on change.
-struct ChildrenWatch {
-    task: tokio::task::JoinHandle<()>,
+pub(crate) struct ChildrenWatch {
+    pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
 impl ChildrenWatch {
-    async fn stop(self) {
+    pub(crate) async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
     }
@@ -729,12 +730,12 @@ impl ChildrenWatch {
 
 /// 每个 thread 一个进程状态守望者:订阅该 thread 生效 manager 的广播,把
 /// 低频状态事件转成 `process/updated` 通知。`Output` 事件在此丢弃。
-struct ProcessWatch {
-    task: tokio::task::JoinHandle<()>,
+pub(crate) struct ProcessWatch {
+    pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
 impl ProcessWatch {
-    async fn stop(self) {
+    pub(crate) async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
     }
@@ -745,13 +746,13 @@ impl ProcessWatch {
 /// At most one task per conversation is watched, because the client shows one
 /// detail at a time; watching another replaces the watch rather than adding a
 /// second stream, so rows never arrive for a task the user has left.
-struct TraceWatch {
-    task: tokio::task::JoinHandle<()>,
+pub(crate) struct TraceWatch {
+    pub(crate) task: tokio::task::JoinHandle<()>,
 }
 
 impl TraceWatch {
     /// Stop forwarding and wait for the task to observe the cancellation.
-    async fn stop(self) {
+    pub(crate) async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
     }
@@ -2424,12 +2425,7 @@ where
                 // 各局部量的所有权与借用关系与搬移前完全一致。
                 macro_rules! app_state {
                     () => {
-                        crate::rpc::AppState::new(
-                            &hub, &client, client_scope, &cfg, &theme_handle, &models_path,
-                            &onboarding_env_path, &onboarding_preferences_path, &board_dir,
-                            &resident_dir, &plugin_command, &watchman_home, &watchman_install,
-                            &watchman_uninstall, &board_launcher, &mut uploads, &mut threads,
-                            &workspaces, &pairing, &pending_activation,
+                        crate::rpc::AppState::new(&hub, &client, client_scope, &cfg, &theme_handle, &models_path, &onboarding_env_path, &onboarding_preferences_path, &board_dir, &resident_dir, &plugin_command, &watchman_home, &watchman_install, &watchman_uninstall, &board_launcher, &mut uploads, &mut threads, &workspaces, &pairing, &pending_activation, &runtimes, &mut process_watches, &mut trace_watches, &mut children_watches
                         )
                     };
                 }
@@ -2527,6 +2523,16 @@ where
                     crate::rpc::Domain::Turn => {
                         let mut state = app_state!();
                         match crate::rpc::turn::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    crate::rpc::Domain::Agent => {
+                        let mut state = app_state!();
+                        match crate::rpc::agent::handle(&mut state, &req, id.clone()).await? {
                             // 已搬移的域在应答后一律回下一轮(等价于搬移前的
                             // `continue`)。
                             crate::rpc::Flow::Continue => continue,
@@ -3989,71 +3995,6 @@ where
                         };
                         write_response(&hub, &client, ok_response(id, result)).await?;
                     }
-                    "agent/children/list" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
-                            continue;
-                        }
-                        // 列表是尽力而为的只读视图:attach 未就绪或 daemon 不可达时返回空表,
-                        // 而不是报错。桌面端的暂留区因此永远能渲染,turn 也照常跑。
-                        let snapshot = list_task_summaries(&runtimes, &threads, &thread_id);
-                        let children =
-                            children_for_thread(&snapshot.unwrap_or_default(), &thread_id);
-                        // 首次拉取时建立守望者:此后列表变化由 agent/children/updated 推出,
-                        // 客户端不必轮询。daemon 不可达时不建立(没有可观察的变化)。
-                        if !children_watches.contains_key(&thread_id) {
-                            if let Some(socket) = socket_for_thread(&runtimes, &threads, &thread_id) {
-                                let task = tokio::spawn(watch_children(
-                                    Arc::clone(&hub),
-                                    thread_id.clone(),
-                                    socket,
-                                    children.clone(),
-                                ));
-                                children_watches.insert(thread_id.clone(), ChildrenWatch { task });
-                            }
-                        }
-                        write_response(&hub, &client, ok_response(id, json!({ "children": children })))
-                            .await?;
-                    }
-                    "agent/trace/read" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
-                            continue;
-                        }
-                        let Some(task_id) =
-                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing taskId")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        match read_task_trace(&runtimes, &threads, &thread_id, &task_id) {
-                            Ok((rows, high_water_id)) => {
-                                write_response(
-                                    &hub, &client,
-                                    ok_response(
-                                        id,
-                                        json!({ "rows": rows, "highWaterId": high_water_id }),
-                                    ),
-                                )
-                                .await?;
-                            }
-                            Err(error) => {
-                                write_response(&hub, &client, err_response(id, error)).await?;
-                            }
-                        }
-                    }
                     "thread/diff/read" => {
                         let Some(thread_id) =
                             require_thread_id(&hub, &client, &req.params, id.clone()).await?
@@ -4093,227 +4034,6 @@ where
                                     .unwrap_or(json!(null))
                             };
                         write_response(&hub, &client, ok_response(id, result)).await?;
-                    }
-                    "agent/trace/watch" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
-                            continue;
-                        }
-                        let Some(task_id) =
-                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing taskId")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 替换而不是叠加:一个 thread 只关注一个任务,旧流必须先停,
-                        // 否则换任务后两个任务的行使会同时到达客户端。
-                        if let Some(previous) = trace_watches.remove(&thread_id) {
-                            previous.stop().await;
-                        }
-                        match snapshot_for_watch(&runtimes, &threads, &thread_id, &task_id) {
-                            Ok((rows, high_water_id)) => {
-                                let handle = tokio::spawn(stream_trace(
-                                    Arc::clone(&hub),
-                                    thread_id.clone(),
-                                    task_id.clone(),
-                                    socket_for_thread(&runtimes, &threads, &thread_id)
-                                        .unwrap_or_default(),
-                                    high_water_id,
-                                ));
-                                trace_watches.insert(thread_id.clone(), TraceWatch { task: handle });
-                                write_response(
-                                    &hub, &client,
-                                    ok_response(id, json!({ "rows": rows, "highWaterId": high_water_id })),
-                                )
-                                .await?;
-                            }
-                            Err(error) => {
-                                write_response(&hub, &client, err_response(id, error)).await?;
-                            }
-                        }
-                    }
-                    "agent/message" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
-                            continue;
-                        }
-                        let task_id =
-                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string);
-                        let message =
-                            req.params.get("message").and_then(|v| v.as_str()).map(str::to_string);
-                        let (Some(task_id), Some(message)) = (task_id, message) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing taskId or message")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        match forward_to_daemon(
-                            &runtimes,
-                            &threads,
-                            &thread_id,
-                            yi_agent_store::ipc::IpcRequest::SendUserMessage {
-                                task_id: task_id.clone(),
-                                message,
-                            },
-                        ) {
-                            Ok(_) => {
-                                write_response(&hub, &client, ok_response(id, json!({ "queued": true })))
-                                    .await?;
-                            }
-                            Err(error) => {
-                                write_response(&hub, &client, err_response(id, error)).await?;
-                            }
-                        }
-                    }
-                    "agent/cancel/preview" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
-                            continue;
-                        }
-                        let Some(task_id) =
-                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing taskId")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        // 取消必须两步:预览拿 token,确认才真取消。这里只做第一步,
-                        // 绝不代客户端跳过确认。
-                        match forward_to_daemon(
-                            &runtimes,
-                            &threads,
-                            &thread_id,
-                            yi_agent_store::ipc::IpcRequest::PreviewCancel {
-                                task_id: task_id.clone(),
-                                recursive: false,
-                            },
-                        ) {
-                            Ok(yi_agent_store::ipc::IpcResponse::CancelPreview {
-                                confirmation_token,
-                                task_ids,
-                                expires_in_secs,
-                                ..
-                            }) => {
-                                write_response(
-                                    &hub, &client,
-                                    ok_response(
-                                        id,
-                                        json!({
-                                            "confirmationToken": confirmation_token,
-                                            "taskIds": task_ids,
-                                            "expiresInSecs": expires_in_secs,
-                                        }),
-                                    ),
-                                )
-                                .await?;
-                            }
-                            Ok(other) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(
-                                        id,
-                                        RpcError::internal(format!(
-                                            "daemon returned a non-preview response: {other:?}"
-                                        )),
-                                    ),
-                                )
-                                .await?;
-                            }
-                            Err(error) => {
-                                write_response(&hub, &client, err_response(id, error)).await?;
-                            }
-                        }
-                    }
-                    "agent/cancel" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
-                            continue;
-                        }
-                        let task_id =
-                            req.params.get("taskId").and_then(|v| v.as_str()).map(str::to_string);
-                        let confirmation_token = req
-                            .params
-                            .get("confirmationToken")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                        let (Some(task_id), Some(confirmation_token)) =
-                            (task_id, confirmation_token)
-                        else {
-                            write_response(
-                                &hub, &client,
-                                err_response(
-                                    id,
-                                    RpcError::invalid_params(
-                                        "missing taskId or confirmationToken; preview first",
-                                    ),
-                                ),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        match forward_to_daemon(
-                            &runtimes,
-                            &threads,
-                            &thread_id,
-                            yi_agent_store::ipc::IpcRequest::ConfirmCancel {
-                                task_id: task_id.clone(),
-                                recursive: false,
-                                confirmation_token,
-                            },
-                        ) {
-                            Ok(_) => {
-                                write_response(&hub, &client, ok_response(id, json!({ "cancelled": true })))
-                                    .await?;
-                            }
-                            Err(error) => {
-                                write_response(&hub, &client, err_response(id, error)).await?;
-                            }
-                        }
-                    }
-                    "agent/trace/unwatch" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        if !require_known_thread(&hub, &client, &threads, &thread_id, id.clone()).await? {
-                            continue;
-                        }
-                        if let Some(watch) = trace_watches.remove(&thread_id) {
-                            watch.stop().await;
-                        }
-                        if let Some(watch) = children_watches.remove(&thread_id) {
-                            watch.stop().await;
-                        }
-                        if let Some(watch) = process_watches.remove(&thread_id) {
-                            watch.stop().await;
-                        }
-                        write_response(&hub, &client, ok_response(id, json!({ "stopped": true }))).await?;
                     }
                     "thread/subscribe" => {
                         // 整体替换该客户端的订阅集合。**不在 ADMIN_METHODS 内**:
