@@ -770,15 +770,112 @@ git commit -m "feat(desktop): let the phone search bar scroll with the thread li
 
 ---
 
+### Task 6: 手机端搜索框的间距与触控高度（观感修订）
+
+> 追加任务（2026-10-17）：手机端搜索框移入滚动容器后贴上顶边，且实测高度约 34px，
+> 低于本项目在手机上采用的 Apple HIG 44px 触控目标。spec 见
+> `docs/superpowers/specs/2026-10-12-desktop-thread-search-design.md`「修订记录」第三条。
+
+**Files:**
+- Modify: `desktop/src/index.css`（扩展已有那条 `[data-mobile="true"] .app-sidebar input[type="search"]` 规则）
+- Test: `desktop/src/mobileLayout.test.ts`（扩展已有那条 16px 用例）
+
+**Interfaces:**
+- Consumes: Task 5 的把搜索框放进手机端滚动容器的布局；Task 3 建立的同一条手机端 CSS 规则。
+- Produces: 无后续任务依赖。
+
+- [ ] **Step 1: 扩展失败的测试**
+
+把 `desktop/src/mobileLayout.test.ts` 里现有的那条用例
+`keeps the search box at 16px so iOS cannot auto-zoom on focus` **整体替换**为：
+
+```ts
+  it("keeps the phone search box big enough to tap and clears the scroller's top edge", () => {
+    // 字号 16px：WKWebView 对字号 < 16px 的输入框会在聚焦时自动放大页面，而 `lockZoom`
+    // 只能禁掉用户的手动捏合缩放，挡不住这条自动放大——放大后页面不再贴合屏幕，
+    // 每次滑动变成两轴平移，正是「缩放之后就需要拖拽」的同一个症状。
+    // 44px：手机上搜索框是高频点击控件，本项目的触控目标按 Apple HIG 的 44px
+    // （原约 34px = 20px 行高 + 12px 内边距 + 2px 边框）。
+    // margin-top 8px：补回移入滚动容器后丢失的顶部间距（原由「+ New thread」区块的
+    // `p-2` 下内边距提供，换父节点后归零，输入框因此贴上容器顶边）。
+    const rule =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+input\[type="search"\]\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(rule).toMatch(/font-size:\s*16px/);
+    expect(rule).toMatch(/min-height:\s*44px/);
+    expect(rule).toMatch(/margin-top:\s*0\.5rem/);
+  });
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/mobileLayout.test.ts`
+
+Expected: FAIL —— 规则里目前只有 `font-size: 16px`，`min-height` 与 `margin-top` 两条断言失败
+（`font-size` 那条仍通过）。
+
+- [ ] **Step 3: 扩展 CSS 规则**
+
+把 `desktop/src/index.css` 里这条规则及其注释替换为：
+
+```css
+/*
+ * 手机端侧栏搜索框：三条都是手机专属，桌面端不匹配 `[data-mobile]`，逐字节不变。
+ *
+ * `font-size: 16px`——iOS 在聚焦字号 < 16px 的输入框时会自动放大页面，而
+ * `useIsMobile` 的 `lockZoom` 只能禁用用户的手动捏合缩放，挡不住这条自动放大。
+ * 16px 是 iOS 不触发自动放大的下限。
+ * `min-height: 44px`——手机上搜索框是高频点击控件，触控目标按 Apple HIG 的 44px
+ * （输入框原约 34px = 20px 行高 + 12px 内边距 + 2px 边框）。
+ * `margin-top: 0.5rem`——补回移入滚动容器后丢失的顶部 8px 间距：那是「+ New thread」
+ * 区块 `p-2` 的下内边距，桌面端仍在，手机端因换了父节点而丢失，输入框贴上了容器顶边。
+ * 用输入框自身的 margin，而不是包裹层的 padding——包裹层 `relative px-2 pb-2` 是两端
+ * 共用的 DOM，没有可用的样式钩子，改它会连带改掉桌面端。
+ */
+[data-mobile="true"] .app-sidebar input[type="search"] {
+  font-size: 16px;
+  min-height: 44px;
+  margin-top: 0.5rem;
+}
+```
+
+**不要**改任何 JSX/DOM，也**不要**动 `ThreadSidebar.tsx`：搜索框的选择器
+`input[type="search"]` 早已存在且稳定，无需新增钩子属性；DOM 不变则桌面端逐字节不变、
+`ThreadSidebar.test.tsx` 无需改动。
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/mobileLayout.test.ts`
+
+Expected: PASS（22 个用例，条数不变——是扩展既有用例而非新增）。
+
+- [ ] **Step 5: 全量回归 + 类型检查**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit`
+
+Expected: 全绿，`tsc` 无输出。**特别确认既有 `手机端：搜索框与会话行同属滚动容器` 用例仍通过**
+——本次只加样式，不改 DOM 结构，那个断言不受影响。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add desktop/src/index.css desktop/src/mobileLayout.test.ts
+git commit -m "fix(desktop): give the phone search box a 44px touch height and its top gap"
+```
+
+---
+
 ## 验收（全部任务完成后跑一次）
 
 ```bash
 export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit
 ```
 
-对着 spec §6 的 8 条验收标准逐条核对；第 1、7 条（两端都有搜索栏、手机端聚焦不放大）与
-**第 2 条（手机端搜索框随列表滚动、Mac 固定）**需要人工在 Mac 应用与手机端各点一遍确认。
+对着 spec §6 的 8 条验收标准逐条核对；第 1、7 条（两端都有搜索栏、手机端聚焦不放大 +
+触控高度与顶边间距）与**第 2 条（手机端搜索框随列表滚动、Mac 固定）**需要人工在 Mac 应用与
+手机端各点一遍确认。
 
-> 注：原 Task 4（同步 `docs/project-management/desktop.md` 与 `README.md` 索引）**尚未执行**
-> （`README.md:265` 仍为 `| desktop | 42 / 54 |`，模块文件里也还没有搜索栏条目）。
-> 若之后执行，请把手机端「随列表滚动、Mac 固定」这一行为一并写进该条目。
+> 注：原 Task 4（同步 `docs/project-management/desktop.md` 与 `README.md` 索引）**已执行完毕**
+> （提交 `49df68e9`：模块文件已加搜索栏条目，末尾验证计数与逐文件清单已按实测重建为 1112/89，
+> README 的 `desktop` 行同步为 `50 / 62`）。
