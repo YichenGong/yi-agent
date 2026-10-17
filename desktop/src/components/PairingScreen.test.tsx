@@ -158,6 +158,22 @@ describe("PairingScreen error mapping", () => {
     await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(INVALID_CODE_TEXT));
   });
 
+  // 中继路径（`?session=…`）不走 4401 关帧：`pair/redeem` 作为 JSON-RPC 调用失败，
+  // 服务端返回 -32001「invalid or expired pairing code」。若只认 4401，过期/用过的码
+  // 就会被误报成「无法连接服务器」，把「重新生成码」引向「排查网络」的死路。
+  it("recognises the relay's -32001 invalid-code rejection", async () => {
+    const redeem = vi.fn().mockRejectedValue({
+      code: -32001,
+      message: "invalid or expired pairing code",
+    });
+    render(<PairingScreen redeem={redeem} storage={storages()} />);
+
+    fill(fields());
+    fireEvent.click(fields().submit);
+
+    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe(INVALID_CODE_TEXT));
+  });
+
   it("maps every other failure to the connect message", async () => {
     const redeem = vi.fn().mockRejectedValue(new Error("pairing socket closed (1006)"));
     render(<PairingScreen redeem={redeem} storage={storages()} />);
