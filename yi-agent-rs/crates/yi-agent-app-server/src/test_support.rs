@@ -33,7 +33,7 @@ pub(crate) const EVENT_WAIT: std::time::Duration = std::time::Duration::from_sec
 /// 对一条已连接的 ws 发 `initialize` 并读回响应。
 ///
 /// 跨传输复用(`ws.rs` 的多客户端 E2E 与若干准入测试都要先握手),故放在
-/// tests_support 里;`#[cfg(test)]` 的 `mod tests` 对其它文件不可见。
+/// `test_support` 里;`#[cfg(test)]` 的 `mod tests` 对其它文件不可见。
 pub(crate) async fn initialize<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,

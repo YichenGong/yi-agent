@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::rpc::{Domain, domain_for};
 use crate::test_support::{EVENT_WAIT, isolated_models_path};
 
 /// 单轮逻辑是共享的 `watch::once`(Task 3 已在其自身 crate 内测过);这里只
@@ -1818,6 +1819,96 @@ async fn unknown_method_returns_method_not_found() {
     let v = h.read_value().await;
     assert_eq!(v["id"], 2);
     assert_eq!(v["error"]["code"], -32601);
+
+    // 每个域模块实现了的方法都必须路由到它自己的域。这是 `domain_for` 那张
+    // 手维护表的回归网:漏掉一个前缀不会编译报错、也不会让任何测试失败,只会
+    // 把一个**本来能工作**的 RPC 静默降级成 `method_not_found`(`device/*`
+    // 在重构期间就是这么坏的)。共 63 行,覆盖除 `initialize`(由 `serve()`
+    // 自己处理)之外的全部域方法。
+    for (method, expected) in [
+        // ---- Ui(`ui/*`,外加并入的 `config/read`) ----
+        ("config/read", Domain::Ui),
+        ("ui/settings/read", Domain::Ui),
+        ("ui/settings/write", Domain::Ui),
+        // ---- Model ----
+        ("model/list", Domain::Model),
+        ("model/test", Domain::Model),
+        ("model/upsert", Domain::Model),
+        ("model/delete", Domain::Model),
+        ("model/setDefault", Domain::Model),
+        ("model/setSubagent", Domain::Model),
+        ("model/importEnv", Domain::Model),
+        // ---- Onboarding ----
+        ("onboarding/apply", Domain::Onboarding),
+        ("onboarding/dismiss", Domain::Onboarding),
+        ("onboarding/status", Domain::Onboarding),
+        ("onboarding/test", Domain::Onboarding),
+        // ---- Board ----
+        ("board/create", Domain::Board),
+        ("board/list", Domain::Board),
+        ("board/remove", Domain::Board),
+        // ---- Plugin(`plugin/*` 与 `plugins/*`) ----
+        ("plugin/query", Domain::Plugin),
+        ("plugin/settings/read", Domain::Plugin),
+        ("plugin/settings/write", Domain::Plugin),
+        ("plugins/list", Domain::Plugin),
+        // ---- Image ----
+        ("image/read", Domain::Image),
+        ("image/upload/abort", Domain::Image),
+        ("image/upload/begin", Domain::Image),
+        ("image/upload/chunk", Domain::Image),
+        ("image/upload/commit", Domain::Image),
+        // ---- Workspace ----
+        ("workspace/add", Domain::Workspace),
+        ("workspace/list", Domain::Workspace),
+        ("workspace/remove", Domain::Workspace),
+        // ---- Process ----
+        ("process/kill", Domain::Process),
+        ("process/list", Domain::Process),
+        ("process/read", Domain::Process),
+        // ---- Pair(`pair/*` 与 `device/*` 共享同一 `PairingState`) ----
+        ("pair/create", Domain::Pair),
+        ("pair/redeem", Domain::Pair),
+        ("device/list", Domain::Pair),
+        ("device/revoke", Domain::Pair),
+        // ---- Turn ----
+        ("turn/interject", Domain::Turn),
+        ("turn/interrupt", Domain::Turn),
+        ("turn/start", Domain::Turn),
+        // ---- Thread ----
+        ("thread/clear", Domain::Thread),
+        ("thread/compact", Domain::Thread),
+        ("thread/delete", Domain::Thread),
+        ("thread/diff/read", Domain::Thread),
+        ("thread/list", Domain::Thread),
+        ("thread/listAll", Domain::Thread),
+        ("thread/readItems", Domain::Thread),
+        ("thread/rename", Domain::Thread),
+        ("thread/reorderPinned", Domain::Thread),
+        ("thread/resume", Domain::Thread),
+        ("thread/setModel", Domain::Thread),
+        ("thread/setPermissionMode", Domain::Thread),
+        ("thread/setPinned", Domain::Thread),
+        ("thread/setPreserveThinking", Domain::Thread),
+        ("thread/setReasoningEffort", Domain::Thread),
+        ("thread/start", Domain::Thread),
+        ("thread/subscribe", Domain::Thread),
+        // ---- Agent ----
+        ("agent/cancel", Domain::Agent),
+        ("agent/cancel/preview", Domain::Agent),
+        ("agent/children/list", Domain::Agent),
+        ("agent/message", Domain::Agent),
+        ("agent/trace/read", Domain::Agent),
+        ("agent/trace/unwatch", Domain::Agent),
+        ("agent/trace/watch", Domain::Agent),
+    ] {
+        assert_eq!(
+            domain_for(method),
+            expected,
+            "`{method}` must route to its own domain (an unmapped prefix silently becomes method_not_found)"
+        );
+    }
+
     h.shutdown().await;
 }
 

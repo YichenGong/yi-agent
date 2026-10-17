@@ -7,10 +7,10 @@
 //! `initialize`、transport 与兜底 `_ =>`。
 //!
 //! 为什么 handler 不是纯 `-> Result<Value>` 函数:这些臂在应答时直接写传输层
-//! (`write_response(&hub, &client, ...)` 在搬移前出现 189 次),并且靠
-//! `continue` 结束本轮循环(128 次)。故每个 handler 收一份 [`AppState`],借到
-//! 主循环的局部量与响应出口,并返回一个 [`Flow`] 告诉 `serve()` 该不该
-//! `continue`。
+//! (`write_response(&hub, &client, ...)` 在搬移前出现 189 次 —— 188 次在域臂内,
+//! 第 189 次在兜底 `_ =>` 臂),并且靠 `continue` 结束本轮循环(125 次)。故每个
+//! handler 收一份 [`AppState`],借到主循环的局部量与响应出口,并返回一个
+//! [`Flow`] 告诉 `serve()` 该不该 `continue`。
 
 // 域子模块:每个模块承载一个域,臂体逐字搬移自 `serve()` 的 dispatch。
 pub(crate) mod agent;
@@ -172,10 +172,12 @@ pub(crate) fn domain_for(method: &str) -> Domain {
 /// 借用生命周期与搬移前完全一致,本结构**不**改变任何状态的所有权,也不引入
 /// 新的共享状态。
 ///
-/// 字段分三层:响应出口与调用方、路径与宿主偏好(共享只读)、注入句柄。
-/// batch 2/3 会继续往这里加(`threads`、`tracked`、`runtimes`、`uploads`、
-/// `process_watches`、`pairing`、`theme`、`build_agent` 等);[`AppState::new`] 是
-/// 唯一的构造点,加一个字段只需改它一处和 `serve()` 的 `app_state!()`。
+/// 字段分三层:响应出口与调用方、路径与宿主偏好(共享只读)、注入句柄,外加
+/// 主循环的可变局部量(按域分批搬入,见 `batch 3` 一节)。三层里已全部有主:
+/// 域 handler 需要的量都已在结构里就位。唯一的构造点是 `serve()` 里的
+/// `app_state!()` 宏,它按**字段名**逐项写出 32 个字段(见 [`AppState`] 各字段
+/// 的注释),故加一个字段只需改该宏一处;同类型的相邻字段因逐名写出而不会错位
+/// —— 七个相邻的 `&Path`(`models_path` 到 `watchman_home`)尤其需要这条保证。
 pub(crate) struct AppState<'a> {
     // ---- 响应出口与调用方 ----
     /// 广播出口:handler 用它定向回包(`write_response`)与做订阅
@@ -237,8 +239,6 @@ pub(crate) struct AppState<'a> {
     /// 搬移前臂里的 `pairing`,由调用方注入。
     pub(crate) pairing: &'a Arc<PairingState>,
     /// attach 产出、待该 thread 的首个 turn 激活的 runtime。`turn/start` 经
-    /// `start_turn_core` 读取它。搬移前臂里的 `pending_activation`;只读借用。
-    /// attach 产出、待该 thread 的首个 turn 激活的 runtime。`turn/start` 经
     /// `start_turn_core` 读取它。搬移前臂里的 `pending_activation`;batch 3 改为按
     /// `&mut` 借用——`thread/start` 经 `start_thread_core` 写入、`thread/resume`
     /// 直接 `insert`,两处都要独占(`turn/start` 那条只读路径由 `&mut` 自动重借)。
@@ -285,81 +285,4 @@ pub(crate) struct AppState<'a> {
     /// Git Diff 焦点句柄。与 [`AppState::theme_handle`] 同路,交给会话的工具集。
     /// 搬移前臂里的 `git_diff_handle`。
     pub(crate) git_diff_handle: &'a crate::git_diff_tool::GitDiffHandle,
-}
-
-impl<'a> AppState<'a> {
-    /// 在 `serve()` 的 `app_state!()` 宏里构造:逐项借用主循环的局部量。
-    ///
-    /// 参数多(15 个)是「就地借用」的直接代价 —— 这里刻意不引入一层聚合结构,
-    /// 免得为批量搬移再造一套与主循环局部量平行的所有权。
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        hub: &'a Arc<Broadcaster>,
-        client: &'a ClientId,
-        client_scope: Scope,
-        cfg: &'a RuntimeConfig,
-        theme_handle: &'a ThemeHandle,
-        models_path: &'a Path,
-        onboarding_env_path: &'a Path,
-        onboarding_preferences_path: &'a Path,
-        board_dir: &'a Path,
-        resident_dir: &'a Path,
-        plugin_command: &'a Path,
-        watchman_home: &'a Path,
-        watchman_install: &'a WatchmanInstall,
-        watchman_uninstall: &'a WatchmanUninstall,
-        board_launcher: &'a BoardLauncher,
-        uploads: &'a mut crate::image_upload::UploadRegistry,
-        threads: &'a mut HashMap<String, ThreadSession>,
-        workspaces: &'a Arc<WorkspaceIndex>,
-        pairing: &'a Arc<PairingState>,
-        pending_activation: &'a mut HashMap<String, Option<Arc<ThreadRoot>>>,
-        runtimes: &'a ProjectRuntimes,
-        thread_roots: &'a ThreadRoots,
-        process_watches: &'a mut HashMap<String, crate::server::ProcessWatch>,
-        trace_watches: &'a mut HashMap<String, crate::server::TraceWatch>,
-        children_watches: &'a mut HashMap<String, crate::server::ChildrenWatch>,
-        pending: &'a Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<Decision>>>>,
-        perm_seq: &'a Arc<std::sync::atomic::AtomicU64>,
-        permission_timeout: Duration,
-        turn_rx: &'a mut mpsc::Receiver<crate::server::TurnEvent>,
-        turn_tx: &'a mpsc::Sender<crate::server::TurnEvent>,
-        build_agent: BuildAgent<'a>,
-        git_diff_handle: &'a crate::git_diff_tool::GitDiffHandle,
-    ) -> Self {
-        Self {
-            hub,
-            client,
-            client_scope,
-            cfg,
-            theme_handle,
-            models_path,
-            onboarding_env_path,
-            onboarding_preferences_path,
-            board_dir,
-            resident_dir,
-            plugin_command,
-            watchman_home,
-            watchman_install,
-            watchman_uninstall,
-            board_launcher,
-            uploads,
-            threads,
-            workspaces,
-            pairing,
-            pending_activation,
-            runtimes,
-            thread_roots,
-            process_watches,
-            trace_watches,
-            children_watches,
-            pending,
-            perm_seq,
-            permission_timeout,
-            turn_rx,
-            turn_tx,
-            build_agent,
-            git_diff_handle,
-        }
-    }
 }

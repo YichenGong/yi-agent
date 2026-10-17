@@ -8,9 +8,10 @@
 //! 臂体保持原样,只有三处语言强制的改名:主循环局部量改走 [`AppState`] 字段
 //! (`hub` -> `state.hub` 等;字段本身已是引用,故冗余的 `&` 一并去掉)、`continue`
 //! 换成 `return Ok(Flow::Continue)`(语义由 `serve()` 翻回 `continue`),以及
-//! 模块自身的 `match` 键改用 `req.method`。46 个回主循环的 `continue` 换成返回值,
-//! 另外 3 个 `continue` 与 3 个 `break` 都在臂**内层**的 `for` 里
-//! (`thread/listAll`、`thread/resume`、`thread/reorderPinned`),目标不变。
+//! 模块自身的 `match` 键改用 `req.method`。54 处回主循环的 `continue` 换成了返回值
+//! (53 处独占一行,`thread/start` 内联 1 处),另有 1 处残留的臂**内层**
+//! `continue`(`thread/listAll` 的 `for dir in &dirs`)与 3 处臂**内层**的
+//! `break`(`thread/resume`、`thread/reorderPinned`),目标不变。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

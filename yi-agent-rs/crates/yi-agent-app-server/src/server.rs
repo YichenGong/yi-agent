@@ -2424,8 +2424,45 @@ where
                 // 各局部量的所有权与借用关系与搬移前完全一致。
                 macro_rules! app_state {
                     () => {
-                        crate::rpc::AppState::new(&hub, &client, client_scope, &cfg, &theme_handle, &models_path, &onboarding_env_path, &onboarding_preferences_path, &board_dir, &resident_dir, &plugin_command, &watchman_home, &watchman_install, &watchman_uninstall, &board_launcher, &mut uploads, &mut threads, &workspaces, &pairing, &mut pending_activation, &runtimes, &thread_roots, &mut process_watches, &mut trace_watches, &mut children_watches, &pending, &perm_seq, permission_timeout, &mut turn_rx, &turn_tx, &build_agent, &git_diff_handle
-                        )
+                        // 字段名逐项写出(而非位置参数):`models_path` /
+                        // `onboarding_env_path` / `onboarding_preferences_path` /
+                        // `board_dir` / `resident_dir` / `plugin_command` /
+                        // `watchman_home` 七个相邻字段同为 `&Path`,位置一旦
+                        // 写错照样编译通过、却会静默把机器级路径接错。
+                        crate::rpc::AppState {
+                            hub: &hub,
+                            client: &client,
+                            client_scope,
+                            cfg: &cfg,
+                            theme_handle: &theme_handle,
+                            models_path: &models_path,
+                            onboarding_env_path: &onboarding_env_path,
+                            onboarding_preferences_path: &onboarding_preferences_path,
+                            board_dir: &board_dir,
+                            resident_dir: &resident_dir,
+                            plugin_command: &plugin_command,
+                            watchman_home: &watchman_home,
+                            watchman_install: &watchman_install,
+                            watchman_uninstall: &watchman_uninstall,
+                            board_launcher: &board_launcher,
+                            uploads: &mut uploads,
+                            threads: &mut threads,
+                            workspaces: &workspaces,
+                            pairing: &pairing,
+                            pending_activation: &mut pending_activation,
+                            runtimes: &runtimes,
+                            thread_roots: &thread_roots,
+                            process_watches: &mut process_watches,
+                            trace_watches: &mut trace_watches,
+                            children_watches: &mut children_watches,
+                            pending: &pending,
+                            perm_seq: &perm_seq,
+                            permission_timeout,
+                            turn_rx: &mut turn_rx,
+                            turn_tx: &turn_tx,
+                            build_agent: &build_agent,
+                            git_diff_handle: &git_diff_handle,
+                        }
                     };
                 }
                 match crate::rpc::domain_for(method.as_str()) {
@@ -6472,6 +6509,9 @@ mod card_scheduling_tests {
 }
 
 #[cfg(test)]
+// 这里的模块名必须与文件名不同:`#[path]` 只换文件来源,模块路径由 `mod tests`
+// 决定,故仍是 `crate::server::tests`,该路径下 227 个测试名一字未变(若命名成
+// `mod rpc_tests;` 则路径会变成 `server::rpc_tests`,测试名全变)。
 #[path = "rpc_tests.rs"]
 pub(crate) mod tests;
 

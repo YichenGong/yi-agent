@@ -1,4 +1,6 @@
-//! 共享 helper:供 e2e_real.rs 和 e2e_complex.rs 复用。
+//! 共享 helper:供任何需要它的测试二进制复用(当前 6 个:e2e_real、
+//! e2e_complex、model_catalog_live_reload_e2e、subagent_real_e2e、board_e2e、
+//! board_watchman_e2e)。
 //!
 //! 每个测试二进制独立编译本模块,未被该二进制使用的 helper 会触发 dead_code。
 //! 加 module-level allow 避免每个函数单独标注。
