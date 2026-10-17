@@ -131,6 +131,7 @@ where
                 watchman_install: crate::server::production_watchman_install(),
                 watchman_uninstall: crate::server::production_watchman_uninstall(),
                 watchman_home: crate::server::home_dir(),
+                lead_inbox: crate::lead::LeadInbox::new(),
             },
             build_agent,
             serve_scopes,

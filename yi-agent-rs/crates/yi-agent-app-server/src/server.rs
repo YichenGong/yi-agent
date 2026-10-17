@@ -167,6 +167,10 @@ pub(crate) struct RuntimeAttachments {
     /// 它是「往哪个 `Library/LaunchAgents` 写」与「读哪个 plist 判已装」的
     /// 唯一来源，抽出来测试才不会误判真实 home 里的安装状态。
     pub(crate) watchman_home: PathBuf,
+    /// 组长信箱:普通会话经 `ask_lead` 投递的消息进这里,主循环的
+    /// `select!` 分支消费它。与 `theme`/`git_diff` 同样的注入理由——测试要在
+    /// 主循环之外拿到**同一个**实例投递,自造一份会投进没人听的通道。
+    pub(crate) lead_inbox: crate::lead::LeadInbox,
 }
 
 /// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
@@ -291,6 +295,7 @@ fn attach_delegation(
     thread_id: &str,
     theme: &crate::theme_tool::ThemeHandle,
     git_diff: &crate::git_diff_tool::GitDiffHandle,
+    lead_inbox: &crate::lead::LeadInbox,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -338,6 +343,10 @@ fn attach_delegation(
         built.yolo.clone(),
         theme.clone(),
         git_diff.clone(),
+        // 项目键从本次会话的 cwd 求得(与 `ask_lead` 的投递路由同一来源):
+        // 会话给组长留言时,消息必须落到「本目录」的组长信箱。
+        crate::thread_store::ThreadStore::new(Path::new(cwd)).project_key(),
+        lead_inbox.clone(),
     ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
@@ -838,6 +847,11 @@ fn build_runtime_tooling(
     yolo: yi_agent_core::autonomy::YoloSwitch,
     theme: crate::theme_tool::ThemeHandle,
     git_diff: crate::git_diff_tool::GitDiffHandle,
+    // 本会话所属项目的键(见 `ThreadStore::project_key`)与该进程的组长信箱。
+    // 两者绑在装配期,与下面的 thread marker 同一理由:模型看不到自己的
+    // thread id,也不知道自己在哪个项目,只能由装配期注入。
+    project_key: String,
+    lead_inbox: crate::lead::LeadInbox,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
@@ -876,6 +890,14 @@ fn build_runtime_tooling(
     registry.register(Arc::new(crate::git_diff_tool::ShowGitDiffTool::new(
         git_diff,
         Some(thread_id.to_string()),
+    )));
+    // 普通会话用它给组长留言。`from_thread_id` 绑在装配期,与
+    // `register_attached_root_tools_in_thread` 的 thread marker 同理由:
+    // 模型看不到自己的 thread id,只能由装配期注入。
+    registry.register(Arc::new(crate::lead::AskLeadTool::new(
+        lead_inbox,
+        project_key,
+        thread_id.to_string(),
     )));
     Ok(RuntimeTooling {
         registry: Arc::new(registry),
@@ -1451,6 +1473,8 @@ where
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
+            // 进程一条组长信箱,由 `serve` 的主循环消费。
+            lead_inbox: crate::lead::LeadInbox::new(),
         },
         production_factory(cfg, theme_for_factory, catalog),
     )
@@ -1527,6 +1551,8 @@ where
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
+            // 进程一条组长信箱,由 `serve` 的主循环消费。
+            lead_inbox: crate::lead::LeadInbox::new(),
         },
         production_factory(cfg, theme_for_factory, catalog),
         // 桌面 = Admin(与 `run`/`serve_stdio` 的 stdio 注册完全一致)。
@@ -2229,6 +2255,7 @@ where
         watchman_install,
         watchman_uninstall,
         watchman_home,
+        lead_inbox,
     } = attachments;
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
@@ -2297,6 +2324,14 @@ where
     ));
     // 建 thread 的工具仍需该句柄(与 watcher 同一实例,故通知不落空)。
     let git_diff_handle = git_diff.clone();
+    // 组长信箱的消费端。订阅**在这里**、而不是在 RPC 分支里懒订阅:订阅者一旦
+    // 晚于投递建立,那条消息就永远收不到(见 `LeadInbox::deliver` 的「无人订阅」
+    // 退化分支)。主循环是唯一消费者,故一条 `broadcast` 通道即可。
+    //
+    // 消费必须留在本循环的 `select!` 里:`threads` 是本函数独占的 `&mut`,投放
+    // 到 `tokio::spawn` 需要 `'static` 或共享可变状态,两者都会拆掉「一个主循环
+    // 串行拥有 threads」这条前提(与看板调度器同一约束)。
+    let mut lead_rx = lead_inbox.subscribe();
 
     loop {
         // 上传登记表的 TTL 清理：每轮循环开头收走超时的 staging 会话。放在这里
@@ -3437,15 +3472,47 @@ where
                             }
                             // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
                             // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
-                            let metas = match crate::thread_store::ThreadStore::new(path).list() {
+                            let mut read_ok = true;
+                            let mut metas = match crate::thread_store::ThreadStore::new(path).list() {
                                 Ok(metas) => metas,
                                 Err(e) => {
                                     eprintln!(
                                         "[app-server] thread/listAll failed to list {dir}: {e}"
                                     );
+                                    read_ok = false;
                                     Vec::new()
                                 }
                             };
+                            // 每个被列举的**空**项目目录都确保有组长,让侧栏里本就没有
+                            // 任何条目的项目也有一个组长入口。失败只记日志——列表查询
+                            // 不得因单个目录不可写而整体失败。
+                            //
+                            // 为什么限定「没有任何会话」:组长 meta 的 `board_project`
+                            // 是 `None`,一旦写进已有会话的目录,它就会被算作「该目录
+                            // 自己的会话」,从而①把「每个目录组恰好一个会话」变成两个、
+                            // ②让只含卡片会话的 worktree 不再被抑制成顶层组。两者都是
+                            // `listAll` 既有行为的一部分,列表查询不得改写它。已有会话的
+                            // 项目仍是懒创建的目标,只是触发点更准:用户点组长入口
+                            // (`thread/lead`)或某个会话给组长留言(`resolve_lead_target`)。
+                            //
+                            // 读失败的目录(`read_ok == false`)不写:读不到就不该有副作用。
+                            if read_ok && metas.is_empty() {
+                                if let Err(e) = crate::lead::ensure_lead_meta(
+                                    &crate::thread_store::ThreadStore::new(path),
+                                    path,
+                                ) {
+                                    eprintln!(
+                                        "[app-server] thread/listAll could not ensure a lead for {dir}: {e}"
+                                    );
+                                }
+                                // 新落的组长 meta 并入本轮列举结果,否则「本目录的
+                                // 会话」是懒创建**之前**的快照,刚种下的组长在这一
+                                // 次响应里就不可见(要等下一次刷新才出现)。
+                                if let Ok(fresh) = crate::thread_store::ThreadStore::new(path).list()
+                                {
+                                    metas = fresh;
+                                }
+                            }
                             let own: Vec<_> = metas
                                 .iter()
                                 .filter(|m| m.board_project.is_none())
@@ -3590,6 +3657,7 @@ where
                             model_ref.clone(),
                             None,
                             None,
+                            &lead_inbox,
                         )
                         .await?;
 
@@ -3619,6 +3687,31 @@ where
                             ),
                         )
                         .await?;
+                    }
+                    "thread/lead" => {
+                        // 组长归属当前请求的项目根。与 `thread/start` 同源,保证
+                        // 「用户在哪个项目里问组长」与「组长管哪个项目」一致。
+                        let cwd = match resolve_thread_cwd(&req.params, &cfg, &hub, &client, id.clone()).await? {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        let store = crate::thread_store::ThreadStore::new(Path::new(&cwd));
+                        match crate::lead::ensure_lead_meta(&store, Path::new(&cwd)) {
+                            Ok((meta, created)) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    ok_response(id, json!({
+                                        "thread_id": meta.thread_id,
+                                        "created": created,
+                                    })),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                write_response(&hub, &client, err_response(id, RpcError::internal(e.to_string()))).await?;
+                            }
+                        }
                     }
                     "thread/resume" => {
                         let Some(thread_id) =
@@ -3742,6 +3835,7 @@ where
                             &thread_id,
                             &theme,
                             &git_diff_handle,
+                            &lead_inbox,
                             built,
                         );
                         let BuiltAgent {
@@ -5646,8 +5740,48 @@ where
                     &git_diff_handle,
                     &workspaces,
                     &build_agent,
+                    &lead_inbox,
                 )
                 .await;
+            }
+            envelope = lead_rx.recv() => {
+                let Ok(envelope) = envelope else { continue };
+                // 按 project_key 找到该项目的组长。找不到就跳过并记日志:
+                // 一条投递失效不该影响主循环处理其它请求。
+                let target = match resolve_lead_target(&envelope.project_key) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        eprintln!(
+                            "[app-server] could not resolve a lead for {}: {error}",
+                            envelope.project_key
+                        );
+                        continue;
+                    }
+                };
+                let mut launcher = ServeLauncher {
+                    threads: &mut threads,
+                    pending_activation: &mut pending_activation,
+                    process_watches: &mut process_watches,
+                    uploads: &mut uploads,
+                    runtimes: &runtimes,
+                    thread_roots: &thread_roots,
+                    models_path: &models_path,
+                    cfg: &cfg,
+                    hub: &hub,
+                    turn_tx: &turn_tx,
+                    pending: &pending,
+                    permission_timeout,
+                    perm_seq: &perm_seq,
+                    theme: &theme,
+                    git_diff: &git_diff_handle,
+                    workspaces: &workspaces,
+                    build_agent: &build_agent,
+                    lead_inbox: &lead_inbox,
+                    lead_target: Some(target),
+                };
+                if let Err(error) = launcher.deliver_to_lead(&envelope).await {
+                    eprintln!("[app-server] lead delivery failed: {error}");
+                }
             }
         }
     }
@@ -5969,7 +6103,7 @@ fn thread_summary_json(
     m: &crate::thread_store::ThreadMeta,
     threads: &HashMap<String, ThreadSession>,
 ) -> serde_json::Value {
-    json!({
+    let mut value = json!({
         "thread_id": m.thread_id,
         "cwd": m.cwd,
         "model": m.model,
@@ -5982,7 +6116,13 @@ fn thread_summary_json(
         "board_project": m.board_project,
         "card_id": m.card_id,
         "status": thread_status(threads, &m.thread_id),
-    })
+    });
+    // 只在确实是组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
+    // 的字节比对与快照测试失效,而我们只需要一个新值。
+    if m.role.as_deref() == Some(crate::thread_store::LEAD_ROLE) {
+        value["role"] = json!("lead");
+    }
+    value
 }
 
 /// 把客户端对反向请求的响应路由到等待中的 driver。
@@ -7153,6 +7293,7 @@ async fn card_scheduler_tick<F>(
     git_diff: &crate::git_diff_tool::GitDiffHandle,
     workspaces: &WorkspaceIndex,
     build_agent: &F,
+    lead_inbox: &crate::lead::LeadInbox,
 ) where
     F: Fn(
         Option<yi_agent_core::Session>,
@@ -7208,6 +7349,13 @@ async fn card_scheduler_tick<F>(
             git_diff,
             workspaces,
             build_agent,
+            lead_inbox,
+            // 看板调度器从不对组长投递:`LeadTarget` 的解析会**落盘**一个组长
+            // meta(见 `resolve_lead_target`),而调度器每 3s 就要为本进程的每个
+            // 看板项目构造一次 launcher——在这里解析会让每次 tick 都替所有项目
+            // 写一遍 meta,并把「谁拉起组长」变成调度器。`None` 是诚实取值:
+            // 该 launcher 只负责起看板会话。
+            lead_target: None,
         };
         crate::card_scheduler::run_once(&board.project, board_dir, tracked, &mut launcher, &flags)
             .await;
@@ -7245,6 +7393,24 @@ struct ServeLauncher<'a, F> {
     git_diff: &'a crate::git_diff_tool::GitDiffHandle,
     workspaces: &'a WorkspaceIndex,
     build_agent: &'a F,
+    /// 组长信箱:普通会话经 `ask_lead` 投递的消息从这里被消费。与主循环共享
+    /// 同一个实例(见 `serve` 的注入),自造一份会投进没人听的通道。
+    lead_inbox: &'a crate::lead::LeadInbox,
+    /// 该 launcher 对应项目的组长 thread id 与 cwd,由消费方在调用前解析。
+    /// 用 owned 值而非从 `threads` 反查:组长可能尚未被打开,不在 `threads` 里。
+    /// `None` = 该 launcher 不承载组长投递(目前只有看板调度器,见其构造点)。
+    lead_target: Option<LeadTarget>,
+}
+
+/// 一次组长投递的目标:该项目当前应承载消息的组长 thread。
+///
+/// `Clone`(而非借用 `self.lead_target`)是刻意的:`deliver_to_lead` 随后要把
+/// `&mut self.threads` 交给内核,任何未结束的 `&self.lead_target` 借用都会与它
+/// 冲突。三个 `String` 的克隆相对一次 agent 装配可以忽略。
+#[derive(Clone)]
+struct LeadTarget {
+    cwd: String,
+    thread_id: String,
 }
 
 impl<F> CardLauncher for ServeLauncher<'_, F>
@@ -7317,6 +7483,7 @@ where
             None,
             Some(&request.board_project),
             Some(&request.card_id),
+            self.lead_inbox,
         )
         .await?;
 
@@ -7402,6 +7569,189 @@ where
         }
         Ok(thread_id)
     }
+
+    /// 把一条投递给组长的消息转成组长 thread 的一次 turn。
+    ///
+    /// 与 `launch_inner` 的三点差异,每一点都是刻意的:
+    /// - 复用**已存在的**组长 thread id(不新铸 uuid),因此重复投递落在同一个会话;
+    /// - `mode` 用 Normal,而非看板的 Yolo 强制值(组长会话不是看板卡);
+    /// - 不设 `board_project` / `card_id`,组长不是看板卡。
+    ///
+    /// **不发任何 RPC 帧**:投递不是客户端请求,没有可应答的 id。唯一可发的是
+    /// `thread/status/updated` 这类不带 id 的通知,这里也不发——投递方(某个普通
+    /// 会话的 `ask_lead`)不需要它,而多发一帧会让「谁触发这轮」变得含糊。
+    async fn deliver_to_lead(
+        &mut self,
+        envelope: &crate::lead::LeadEnvelope,
+    ) -> anyhow::Result<String> {
+        // 先取出目标(克隆),此后整段函数都不再借用 `self.lead_target`:
+        // `start_thread_core` 要 `&mut self.threads`,未结束的 `&self.…` 借用
+        // 会让它借不到。
+        let target = self
+            .lead_target
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("this launcher has no lead target"))?;
+        // `mut` 只为下方冷启动的历史恢复:「先建空会话、再就地填入历史」是
+        // `apply_session` 的形式,它保住的正是 session 的 `Arc`(见那里的说明)。
+        let mut built = (self.build_agent)(
+            None,
+            Path::new(&target.cwd),
+            crate::thread_store::ThreadMode::Normal,
+        )?;
+        let model = built.agent.config().model.clone();
+
+        // 组长已在本进程内打开时,直接往它已有的 driver 投递,不必重建
+        // (重建会丢掉该会话已累积的上下文,并让正在跑的那轮被替换)。
+        if let Some(session) = self.threads.get(&target.thread_id) {
+            let turn_id = format!("turn-{}", uuid::Uuid::new_v4());
+            let text = format!("[来自会话 {}] {}", envelope.from_thread_id, envelope.text);
+            // 与 `thread/resume` 同款:激活只在本 thread 首次起 driver 时做。
+            let activate = self
+                .pending_activation
+                .get(&target.thread_id)
+                .cloned()
+                .flatten();
+            let send = session
+                .prompt_tx
+                .send(TurnPrompt {
+                    turn_id,
+                    prompt: text.clone(),
+                    activate,
+                    attachments: Vec::new(),
+                    image_blocks: Vec::new(),
+                    image_refs: Vec::new(),
+                    display_text: text,
+                })
+                .await;
+            return match send {
+                Ok(()) => Ok(target.thread_id),
+                Err(_) => Err(anyhow::anyhow!("lead driver is gone")),
+            };
+        }
+
+        // 冷启动:该组长的 driver 不在本进程(进程重启,或它的 driver 因
+        // `prompt_rx` 关闭而收尾)。`build_agent` 此刻建出的是**空会话**,而磁盘上的
+        // `.jsonl` 记着此前投递过的每一轮。不填回去,同一条 thread 就会有两种语义:
+        // warm 路径有记忆、cold 路径失忆。故这里镜像 `thread/resume` 的恢复三件事:
+        // 载入 → `replace_messages` → 恢复上次用量(使 auto-compact 在恢复后的首轮
+        // 即生效)。
+        //
+        // 组长的 meta 刚由 `ensure_lead_meta` 建、尚无 `.jsonl` 时 `load` 回 `None`:
+        // 维持现状(空会话),与一次全新 `thread/start` 完全一致。
+        match crate::thread_store::ThreadStore::new(Path::new(&target.cwd)).load(&target.thread_id)
+        {
+            Ok(Some(loaded)) => {
+                let mut restored = yi_agent_core::Session::new();
+                if let Some(usage) = &loaded.usage {
+                    restored.set_last_input_tokens(Some(usage.input_tokens));
+                }
+                restored.replace_messages(loaded.messages);
+                // `apply_session` 而非 `with_session`:前者就地替换内容、保住 session
+                // 的 `Arc`,与 `thread/resume` 的重建路径走同一个助手,因此委派工具
+                // 持有的 `CallerContext` 不会在恢复后指向一个被丢弃的旧会话。
+                apply_session(&mut built.agent, Some(restored));
+            }
+            Ok(None) => {}
+            // 按 `thread/resume` 的口径:读不出来就明确失败,绝不静默地起一个
+            // 失忆的组长。(id 由 `ensure_lead_meta` 铸造,恒合法;`load` 的读错误
+            // 内部已吞成空历史,故此处实际不可达。)
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "could not load the lead's history for {}: {e}",
+                    target.thread_id
+                ));
+            }
+        }
+
+        // 冷启动:走与 `launch_inner` 相同的无帧内核(登记会话 + spawn driver)。
+        let hub = Arc::clone(self.hub);
+        let client = crate::broadcast::ClientId::local();
+        start_thread_core(
+            self.threads,
+            self.pending_activation,
+            self.process_watches,
+            self.runtimes,
+            self.thread_roots,
+            self.models_path,
+            self.cfg,
+            &target.cwd,
+            crate::thread_store::ThreadMode::Normal,
+            target.thread_id.clone(),
+            built,
+            &hub,
+            &client,
+            self.turn_tx,
+            self.pending,
+            self.permission_timeout,
+            self.perm_seq,
+            self.theme,
+            self.git_diff,
+            self.workspaces,
+            model,
+            None,
+            None,
+            None,
+            self.lead_inbox,
+        )
+        .await?;
+
+        // 无帧地占好首个 turn,再自行投递 prompt——与 `launch_inner` 同一顺序。
+        let params = json!({
+            "threadId": target.thread_id,
+            "input": [{ "type": "text",
+                        "text": format!("[来自会话 {}] {}", envelope.from_thread_id, envelope.text) }],
+        });
+        let prepared =
+            prepare_turn_core(self.threads, self.pending_activation, self.uploads, &params)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "could not prepare the lead's first turn: {}",
+                        turn_prepare_rpc_error(error).message
+                    )
+                })?;
+        if prepared
+            .prompt_tx
+            .send(TurnPrompt {
+                turn_id: prepared.turn_id,
+                prompt: prepared.prompt,
+                activate: prepared.activate,
+                attachments: prepared.attachments,
+                image_blocks: prepared.image_blocks,
+                image_refs: prepared.image_refs,
+                display_text: prepared.display_text,
+            })
+            .await
+            .is_err()
+        {
+            return Err(anyhow::anyhow!(
+                "lead driver is gone before its first prompt"
+            ));
+        }
+        Ok(target.thread_id)
+    }
+}
+
+/// 由项目键反推该项目当前应承载消息的组长。
+///
+/// 项目键本身就是 `<cwd>/.yi-agent` 的 canonical 路径(见 `ThreadStore::project_key`),
+/// 故 cwd 可由它去掉末段得到。组长 meta 不存在时当场补建——用户可能直接让某个
+/// 会话给组长留言,而从未打开过组长对话。
+///
+/// 只经 `store` 落盘 meta,不触碰 agent / runtime / 任何 `cfg` 字段,故**不需要**
+/// `RuntimeConfig`:把它列在签名里只会是一个没人读的参数(brief 的签名多带了
+/// `cfg`,经核实无消费方,已去掉)。
+fn resolve_lead_target(project_key: &str) -> anyhow::Result<LeadTarget> {
+    let state_dir = Path::new(project_key);
+    let cwd = state_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("project key has no parent: {project_key}"))?;
+    let store = crate::thread_store::ThreadStore::new(cwd);
+    let (meta, _created) = crate::lead::ensure_lead_meta(&store, cwd)?;
+    Ok(LeadTarget {
+        cwd: cwd.display().to_string(),
+        thread_id: meta.thread_id,
+    })
 }
 
 /// 启动恢复:插件此刻报 `running`、但本进程并未跟踪的卡片,一律回写
@@ -7490,6 +7840,8 @@ async fn start_thread_core(
     model_ref: Option<String>,
     board_project: Option<&str>,
     card_id: Option<&str>,
+    // 进程的组长信箱:转交 `attach_delegation`,使本会话的 `ask_lead` 能投递。
+    lead_inbox: &crate::lead::LeadInbox,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -7506,6 +7858,7 @@ async fn start_thread_core(
         &thread_id,
         theme,
         git_diff,
+        lead_inbox,
         built,
     );
     let BuiltAgent {
@@ -7541,10 +7894,18 @@ async fn start_thread_core(
         reasoning_effort: None,
         // 新会话默认开启跨轮保留(与 `ThreadMeta` 的缺省语义一致)。
         preserve_thinking: true,
+        role: None,
     };
-    if let Err(e) = thread_store.create(&meta) {
-        // 持久化是尽力而为:写失败不阻断 thread 创建。
-        eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
+    // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
+    // 的 `role: "lead"` 抹掉(本函数的 meta 不带 role),懒创建出来的组长就
+    // 成了一个普通会话。先探测再建,代价是一次 `meta.json` 读;`thread/start`
+    // 每次都用新铸的 uuid,故该路径行为不变(仍然是建)。
+    let already_persisted = thread_store.load(&thread_id).ok().flatten().is_some();
+    if !already_persisted {
+        if let Err(e) = thread_store.create(&meta) {
+            // 持久化是尽力而为:写失败不阻断 thread 创建。
+            eprintln!("[app-server] failed to create thread meta for {thread_id}: {e}");
+        }
     }
     // 记录到全局「最近目录」索引,供 thread/listAll 与侧栏复用。
     // 索引键统一为 canonical,与 workspace/remove 的规范化对齐;
@@ -9127,6 +9488,8 @@ mod card_scheduling_tests {
         /// 委派链路要读的机器清单路径。指向本测试的隔离目录,避免读到开发者
         /// 真实的 `~/.yi-agent/models.json` 而改变解析出的 provider。
         models_path: PathBuf,
+        /// 该 launcher 的组长信箱。测试不投递,故用一份空信箱即可。
+        lead_inbox: crate::lead::LeadInbox,
         _workdir_dir: tempfile::TempDir,
         _theme_dir: tempfile::TempDir,
         _workspace_dir: tempfile::TempDir,
@@ -9157,6 +9520,7 @@ mod card_scheduling_tests {
                 workspaces: WorkspaceIndex::new(workspace_dir.path().join("workspaces.json")),
                 workdir,
                 models_path: isolated_models_path(theme_dir.path()),
+                lead_inbox: crate::lead::LeadInbox::new(),
                 _workdir_dir: workdir_dir,
                 _theme_dir: theme_dir,
                 _workspace_dir: workspace_dir,
@@ -9172,6 +9536,8 @@ mod card_scheduling_tests {
             ) -> anyhow::Result<BuiltAgent>,
         {
             ServeLauncher {
+                lead_inbox: &self.lead_inbox,
+                lead_target: None,
                 threads: &mut self.threads,
                 pending_activation: &mut self.pending_activation,
                 process_watches: &mut self.process_watches,
@@ -9792,6 +10158,8 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
         )
         .expect("tooling");
         let names = tooling.registry.names();
@@ -9869,6 +10237,8 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
         )
         .expect("tooling")
         .registry
@@ -9918,6 +10288,8 @@ pub(crate) mod tests {
             switch.clone(),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
         )
         .expect("tooling");
         let bash = tooling.registry.get("bash").expect("bash is registered");
@@ -9973,6 +10345,8 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
         )
         .expect("tooling")
         .registry
@@ -10101,6 +10475,7 @@ pub(crate) mod tests {
             "thread-a",
             &test_theme(),
             &crate::git_diff_tool::GitDiffHandle::new(),
+            &crate::lead::LeadInbox::new(),
             build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
         let second = attach_delegation(
@@ -10113,6 +10488,7 @@ pub(crate) mod tests {
             "thread-b",
             &test_theme(),
             &crate::git_diff_tool::GitDiffHandle::new(),
+            &crate::lead::LeadInbox::new(),
             build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
 
@@ -10706,6 +11082,9 @@ pub(crate) mod tests {
         /// 隔离的「家目录」：`skill/list` / `skill/read` 从这里派生三层根，绝不读
         /// 开发者真实的 `~/.yi-agent/skills`。字段同时用于持有 tempdir。
         pub(crate) skills_home_dir: tempfile::TempDir,
+        /// 与主循环**共享**的组长信箱:测试据此直接投递,验证主循环真的把它
+        /// 转成了组长 thread 的一次输入。
+        pub(crate) lead_inbox: crate::lead::LeadInbox,
     }
 
     /// 记录到的 watchman 调用:安装为 `true`、卸载为 `false`，附所针对的 home。
@@ -10873,6 +11252,8 @@ pub(crate) mod tests {
             // 模型清单也落在隔离目录里:`model/*` 不得写开发者真实的
             // `~/.yi-agent/models.json`(里面是明文密钥)。
             let models_dir = tempfile::TempDir::new().unwrap();
+            // 组长信箱:先造一份,clone 进 `serve`,原件留在 `Harness` 上。
+            let lead_inbox = crate::lead::LeadInbox::new();
             let handle = tokio::spawn(serve_scoped(
                 server_r,
                 server_w,
@@ -10901,6 +11282,10 @@ pub(crate) mod tests {
                     watchman_install: install,
                     watchman_uninstall: uninstall,
                     watchman_home: watchman_home.path().to_path_buf(),
+                    // 与主循环**共享**同一份信箱(clone 共用同一个 broadcast
+                    // sender):测试经 `lead_inbox` 直接投递的消息必须被主循环
+                    // 收到,自造第二份会投进没人听的通道。
+                    lead_inbox: lead_inbox.clone(),
                 },
                 build,
                 scope,
@@ -10918,6 +11303,7 @@ pub(crate) mod tests {
                 watchman_calls: calls,
                 _watchman_home: watchman_home,
                 skills_home_dir: skills_home,
+                lead_inbox,
             }
         }
 
@@ -10942,6 +11328,29 @@ pub(crate) mod tests {
             self.client_w.write_all(line.as_bytes()).await.unwrap();
             self.client_w.write_all(b"\n").await.unwrap();
             self.client_w.flush().await.unwrap();
+        }
+
+        /// 测试专用:直接往该 harness 的组长信箱投递,不经过真实模型。
+        ///
+        /// 需要一个「与主循环共享的信箱句柄」——即 `Harness::lead_inbox`,它与
+        /// 交给 `serve` 的是同一个 broadcast sender(克隆共享),故这里投递的消息
+        /// 会被主循环的那条 `select!` 分支收到并转成组长 thread 的一次输入。
+        ///
+        /// `project_key` 由调用方给出的隔离 workdir 求得,不从 `Harness` 反查:
+        /// 测试的 workdir 由它自己的 `TempDir` 持有(见 `isolated_harness`)。
+        pub(crate) fn deliver_lead_message_for_test(
+            h: &Harness,
+            workdir: &std::path::Path,
+            from_thread_id: &str,
+            text: &str,
+        ) {
+            h.lead_inbox
+                .deliver(crate::lead::LeadEnvelope {
+                    project_key: crate::thread_store::ThreadStore::new(workdir).project_key(),
+                    from_thread_id: from_thread_id.to_string(),
+                    text: text.to_string(),
+                })
+                .expect("deliver");
         }
 
         pub(crate) async fn read_value(&mut self) -> serde_json::Value {
@@ -11748,6 +12157,7 @@ pub(crate) mod tests {
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
                 watchman_home: PathBuf::new(),
+                lead_inbox: crate::lead::LeadInbox::new(),
             },
             build_test_agent,
         ));
@@ -11825,6 +12235,7 @@ pub(crate) mod tests {
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
                 watchman_home: PathBuf::new(),
+                lead_inbox: crate::lead::LeadInbox::new(),
             },
             |_s: Option<yi_agent_core::Session>,
              _cwd: &std::path::Path,
@@ -11906,6 +12317,7 @@ pub(crate) mod tests {
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
                 watchman_home: PathBuf::new(),
+                lead_inbox: crate::lead::LeadInbox::new(),
             },
             build_test_agent,
         ));
@@ -13811,6 +14223,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
         // 全局索引指向该工作区（canonicalize 以对齐真实写入的路径形态）。
@@ -15322,6 +15735,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
 
@@ -15427,6 +15841,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: false,
+                role: None,
             })
             .unwrap();
 
@@ -15520,6 +15935,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
 
@@ -16841,6 +17257,7 @@ pub(crate) mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            role: None,
         };
         crate::thread_store::ThreadStore::new(dir)
             .create(&meta)
@@ -17205,6 +17622,306 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 建一个 workdir 隔离的 harness,返回 (harness, 该 workdir 的持有者)。
+    ///
+    /// `Harness::new()` 的 workdir 是**固定的共享路径**
+    /// (`/tmp/yi-agent-app-server-test`),多个测试共用会互相污染、还会往真实路径
+    /// 写 meta。持有者必须在测试结束前存活,否则 tempdir 被删、meta 无处可写。
+    async fn isolated_harness() -> (Harness, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = tests_support::test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        (Harness::with_cfg(cfg).await, dir)
+    }
+
+    /// `thread/lead` 必须幂等:同一 cwd 反复调用只造一个组长,第二次 `created=false`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_lead_is_idempotent_per_project() {
+        let (mut h, _dir) = isolated_harness().await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h, 1).await;
+
+        let first = rpc(&mut h, 2, "thread/lead", serde_json::json!({})).await;
+        let first_id = first["result"]["thread_id"]
+            .as_str()
+            .expect("thread/lead must answer with a thread_id")
+            .to_string();
+        assert_eq!(first["result"]["created"], serde_json::json!(true));
+
+        let second = rpc(&mut h, 3, "thread/lead", serde_json::json!({})).await;
+        assert_eq!(second["result"]["thread_id"].as_str().unwrap(), first_id);
+        assert_eq!(second["result"]["created"], serde_json::json!(false));
+
+        // 落盘上只有一个组长 meta——「至多一个组长」是落盘事实,不只是返回值口径。
+        let leads: Vec<String> = crate::thread_store::ThreadStore::new(_dir.path())
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.role.as_deref() == Some(crate::thread_store::LEAD_ROLE))
+            .map(|m| m.thread_id)
+            .collect();
+        assert_eq!(leads, vec![first_id], "exactly one lead meta on disk");
+
+        h.shutdown().await;
+    }
+
+    /// 组长必须出现在 `thread/listAll` 的目录分组里,否则侧栏点不进去。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lead_appears_in_list_all() {
+        let (mut h, dir) = isolated_harness().await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h, 1).await;
+        let lead = rpc(&mut h, 2, "thread/lead", serde_json::json!({})).await;
+        let lead_id = lead["result"]["thread_id"].as_str().unwrap().to_string();
+        // `listAll` 只列举全局目录索引里的目录:把隔离 workdir 加进去,等于
+        // 「用户打开过这个项目」。不加的话它根本不在 `groups` 里,与懒创建无关。
+        add_workspace(&mut h, 3, &dir.path().to_string_lossy()).await;
+
+        let all = list_all(&mut h).await;
+        let found = all["result"]["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .flat_map(|g| g["threads"].as_array().cloned().unwrap_or_default())
+            .any(|t| t["thread_id"].as_str() == Some(lead_id.as_str()));
+        assert!(found, "lead thread must be listed: {all}");
+
+        h.shutdown().await;
+    }
+
+    /// 投递到组长信箱的消息必须转成组长 thread 的一次输入;组长尚未被打开时
+    /// 也必须能被拉起(driver 按需建)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivered_message_reaches_the_lead_thread() {
+        let (mut h, _dir) = isolated_harness().await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h, 1).await;
+        let lead = rpc(&mut h, 2, "thread/lead", serde_json::json!({})).await;
+        let lead_id = lead["result"]["thread_id"].as_str().unwrap().to_string();
+
+        // 测试专用入口直接投递,避免依赖真实模型。
+        Harness::deliver_lead_message_for_test(&h, _dir.path(), "thread-sender-1", "需要你裁决 X");
+
+        // 组长 thread 的 `.jsonl` 必须出现那条消息(以用户消息形式注入)。
+        // 断言直接钉在**主日志**上:`ThreadStore::load` 在崩溃残留时也会采纳
+        // checkpoint,只看 `load` 的结果无法区分「已 append」与「只写了
+        // partial」,而本任务要求的正是那条 append。
+        let log = _dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{lead_id}.jsonl"));
+        let deadline = std::time::Instant::now() + EVENT_WAIT;
+        loop {
+            let appended = std::fs::read_to_string(&log)
+                .map(|text| text.contains("需要你裁决 X"))
+                .unwrap_or(false);
+            // `_dir` 持有隔离 workdir;它就在本测试的栈上,直接复用它。
+            let store = crate::thread_store::ThreadStore::new(_dir.path());
+            let loaded = store.load(&lead_id).ok().flatten().is_some_and(|loaded| {
+                loaded.messages.iter().any(|m| {
+                    m.content.iter().any(|b| match b {
+                        yi_agent_core::ContentBlock::Text(t) => t.contains("需要你裁决 X"),
+                        _ => false,
+                    })
+                })
+            });
+            if appended && loaded {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "the delivered message never reached the lead thread (appended={appended}, loaded={loaded})"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        // 组长被拉起时,`start_thread_core` 不得把它落盘的 `role` 抹掉。
+        let meta = crate::thread_store::ThreadStore::new(_dir.path())
+            .load(&lead_id)
+            .unwrap()
+            .expect("the lead thread must have been persisted")
+            .meta;
+        assert_eq!(
+            meta.role.as_deref(),
+            Some(crate::thread_store::LEAD_ROLE),
+            "the lead's role must survive being opened"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// 用 `RecordingProvider` 建 agent,并把每次对话调用看到的 message 数记进 `seen`。
+    /// 与 `build_test_agent_with_provider` 同一夹具,只是把 provider 换成记账的那款。
+    fn recording_agent_factory(
+        seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> impl Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent>
+    + Send
+    + Sync
+    + 'static {
+        move |session, cwd, mode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RecordingProvider {
+                seen: Arc::clone(&seen),
+            });
+            build_test_agent_with_provider(provider, session, cwd, mode)
+        }
+    }
+
+    /// 等组长这一轮**完全收尾**:历史已 append 进主 `.jsonl`、`load` 能看到全部给定
+    /// 文本、且崩溃残留 checkpoint 已清除。
+    ///
+    /// 三个条件缺一不可:只看 append 会在 driver 尚未清 checkpoint 时放行,而
+    /// `load` 会把未收尾的 partial 合流进来,让下一条 harness 看到的状态与本测试
+    /// 断言的状态不同源。
+    async fn wait_for_lead_turn_to_settle(workdir: &Path, thread_id: &str, texts: &[&str]) {
+        let log = workdir
+            .join(".yi-agent/threads")
+            .join(format!("{thread_id}.jsonl"));
+        let partial = workdir
+            .join(".yi-agent/threads")
+            .join(format!("{thread_id}.partial.json"));
+        let deadline = std::time::Instant::now() + EVENT_WAIT;
+        loop {
+            let appended = std::fs::read_to_string(&log)
+                .map(|line| texts.iter().all(|t| line.contains(t)))
+                .unwrap_or(false);
+            let loaded = crate::thread_store::ThreadStore::new(workdir)
+                .load(thread_id)
+                .ok()
+                .flatten()
+                .is_some_and(|loaded| transcript_contains(&loaded.messages, texts));
+            if appended && loaded && !partial.exists() {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "the lead turn never settled for {texts:?} \
+                     (appended={appended}, loaded={loaded}, partial={})",
+                    partial.exists()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 这些文本是否都能在给定的消息列表里找到。
+    fn transcript_contains(messages: &[yi_agent_core::Message], texts: &[&str]) -> bool {
+        texts.iter().all(|want| {
+            messages.iter().any(|m| {
+                m.content.iter().any(|b| match b {
+                    yi_agent_core::ContentBlock::Text(text) => text.contains(want),
+                    _ => false,
+                })
+            })
+        })
+    }
+
+    /// 冷启动投递必须带回组长既有对话的历史。
+    ///
+    /// 「冷启动」= 组长 thread 不在本进程的 `threads` 里(进程重启,或它的 driver
+    /// 已随 `prompt_rx` 关闭而收尾),而磁盘上的 `.jsonl` 仍记着此前投递过的每一轮。
+    /// 修复前该路径拿**空会话**拉起组长:同一条 thread 经 `thread/resume` 打开有
+    /// 记忆、经投递冷启却失忆,两条入口语义分裂(规格决策 9:组长就是一个 thread,
+    /// 该有普通 thread 的对话连续性)。
+    ///
+    /// 用两个共享同一 workdir 的 harness 复刻重启:第一个里真的投递一轮(于是
+    /// `.jsonl` 由生产路径写出),关掉它(driver 随之消失),第二个用同一目录再投
+    /// 一轮,断言模型这轮看到的是「历史 + 本次」而非只有本次。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_lead_delivery_restores_the_persisted_history() {
+        const FIRST: &str = "需要你裁决 X";
+        const SECOND: &str = "还有一件事要你裁决 Y";
+        let dir = tempfile::TempDir::new().unwrap();
+        let workdir = dir.path().to_path_buf();
+
+        // ---- 第一次投递:真走生产路径,让 `.jsonl` 得到一轮由投递产生的历史 ----
+        let seen_1 = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let mut h1 = {
+            let mut cfg = test_config();
+            cfg.workdir = workdir.clone();
+            Harness::with_config(
+                cfg,
+                recording_agent_factory(Arc::clone(&seen_1)),
+                PERMISSION_TIMEOUT,
+            )
+        };
+        h1.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h1, 1).await;
+        let lead = rpc(&mut h1, 2, "thread/lead", json!({})).await;
+        let lead_id = lead["result"]["thread_id"].as_str().unwrap().to_string();
+        Harness::deliver_lead_message_for_test(&h1, &workdir, "thread-sender-1", FIRST);
+        wait_for_lead_turn_to_settle(&workdir, &lead_id, &[FIRST]).await;
+        // 新建的组长没有历史:这一轮只带本次投递这一条 user 消息。
+        assert_eq!(
+            *seen_1.lock().unwrap(),
+            vec![1],
+            "a brand-new lead has nothing to restore: the first turn must carry only its own message"
+        );
+        // 关掉:serve 主循环结束 → `threads` 被 drop → `prompt_tx` 关闭 →
+        // 组长的 driver 读到 `prompt_rx` 关闭后收尾退出。这正是「重启后该 thread
+        // 不在内存」的复刻,也是本 finding 描述的冷启动入口。
+        h1.shutdown().await;
+
+        // ---- 第二次投递:同一 workdir,历史在盘上,而内存里没有该 thread ----
+        let seen_2 = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let mut h2 = {
+            let mut cfg = test_config();
+            cfg.workdir = workdir.clone();
+            Harness::with_config(
+                cfg,
+                recording_agent_factory(Arc::clone(&seen_2)),
+                PERMISSION_TIMEOUT,
+            )
+        };
+        h2.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h2, 1).await;
+        let again = rpc(&mut h2, 2, "thread/lead", json!({})).await;
+        assert_eq!(
+            again["result"]["thread_id"].as_str().unwrap(),
+            lead_id,
+            "one project keeps one lead thread across a restart"
+        );
+        Harness::deliver_lead_message_for_test(&h2, &workdir, "thread-sender-2", SECOND);
+        // 等**本次**投递收尾(历史是否被恢复不在本等待里判:那是下面的断言,
+        // 让失败信息直指「历史丢了」而非一句超时)。
+        wait_for_lead_turn_to_settle(&workdir, &lead_id, &[SECOND]).await;
+
+        // 本轮落盘的消息 = 恢复后的完整会话:先前的提问与回复都在,再加本次。
+        // 修复前这里是 [user(SECOND), assistant],`FIRST` 已丢——断言会失败。
+        let loaded = crate::thread_store::ThreadStore::new(&workdir)
+            .load(&lead_id)
+            .unwrap()
+            .expect("the lead thread must be persisted");
+        assert!(
+            transcript_contains(&loaded.messages, &[FIRST]),
+            "the cold-start turn must persist the restored history, not just this \
+             message: {:?}",
+            loaded.messages
+        );
+        assert!(
+            transcript_contains(&loaded.messages, &[SECOND]),
+            "the cold-start turn must also persist its own message: {:?}",
+            loaded.messages
+        );
+        // 模型这一轮看到的是「历史(2)+ 本次(1)」,不是只有本次(1)。
+        assert_eq!(
+            *seen_2.lock().unwrap(),
+            vec![3],
+            "the cold-start turn must send the restored history to the model"
+        );
+
+        h2.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn turn_completion_persists_items_and_messages() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -17292,6 +18009,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
         store
@@ -17398,6 +18116,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
         // 一轮正常收尾过的历史。
@@ -21247,6 +21966,8 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
         )
         .expect("tooling");
         assert!(
@@ -21736,6 +22457,8 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
         )
         .expect("tooling");
         // Taken *before* the rebuild: a clone shares the caller slot the tools
@@ -22076,6 +22799,7 @@ pub(crate) mod tests {
                     watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                     watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
                     watchman_home: PathBuf::new(),
+                    lead_inbox: crate::lead::LeadInbox::new(),
                 },
                 build_test_agent,
                 Scope::Admin,
@@ -22332,6 +23056,44 @@ pub(crate) mod tests {
             Some(thread_id.as_str())
         );
         assert_eq!(notif["params"]["mode"].as_str(), Some("yolo"));
+        h.shutdown().await;
+    }
+
+    /// `role` 必须在列表条目上暴露;普通会话不得带该 key(旧客户端字节兼容)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn list_all_exposes_the_lead_role_only_for_the_lead() {
+        let (mut h, _dir) = isolated_harness().await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h, 1).await;
+        let start = start_thread(&mut h).await;
+        let lead = rpc(&mut h, 5, "thread/lead", serde_json::json!({})).await;
+        let lead_id = lead["result"]["thread_id"].as_str().unwrap().to_string();
+
+        let all = list_all(&mut h).await;
+        // 朴素收集:`.leak()` 会永久泄漏内存,只为借出一个 `&Value`;克隆更清楚。
+        let entries: Vec<serde_json::Value> = all["result"]["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .flat_map(|g| g["threads"].as_array().cloned().unwrap_or_default())
+            .collect();
+
+        let lead_entry = entries
+            .iter()
+            .find(|t| t["thread_id"].as_str() == Some(lead_id.as_str()))
+            .expect("lead entry");
+        assert_eq!(lead_entry["role"], serde_json::json!("lead"));
+
+        let plain_entry = entries
+            .iter()
+            .find(|t| t["thread_id"].as_str() == Some(start.as_str()))
+            .expect("plain entry");
+        assert!(
+            plain_entry.get("role").is_none(),
+            "a plain thread must not carry a role key: {plain_entry}"
+        );
+
         h.shutdown().await;
     }
 }

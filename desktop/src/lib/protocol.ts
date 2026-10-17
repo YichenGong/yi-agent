@@ -285,6 +285,11 @@ export interface ThreadSummary {
    * 旧服务端不发送此字段，读取时按 `null` 处理。
    */
   model_ref?: string | null;
+  /**
+   * 会话角色。`"lead"` = 该会话是所属项目的组长。缺省 = 普通会话
+   * （旧服务端不发送此字段）。未知取值必须忽略，不得当成组长。
+   */
+  role?: string;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */

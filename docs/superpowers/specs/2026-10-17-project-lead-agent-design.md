@@ -1,7 +1,7 @@
 # 项目组长 Agent（Project Lead）设计
 
 日期：2026-10-17
-状态：设计定稿，待实现
+状态：P1 已实现并合入（见下），P2/P3 待实现
 模块：`yi-agent-app-server`、`yi-agent-subagent`、`desktop`、移动端远程
 关联：`docs/project-management/yi-agent-app-server.md`、`docs/project-management/subagent-runtime.md`、
 `docs/project-management/desktop.md`
@@ -359,6 +359,11 @@ lead thread 存在 + 自动归属 + 单向 `ask_lead` + 桌面能点开 lead 并
 
 验收：能自动出现一个 lead thread；普通 thread 能单向投递消息给 lead；lead 能在
 IM 里看到并回应；桌面侧栏能看到 lead 条目。
+
+**状态：已实现**（`docs/superpowers/plans/2026-10-17-project-lead-agent-p1.md`，
+4 任务）。已知限制（本期接受）：`listAll` 懒创建只在空目录种组长（可达性由桌面 Step 9a
+补建闭合）；warm 投递路径不占 `active_turn_id`（消息在容量 8 的 channel 排队串行执行，
+不丢不坏）；冷启动投递未对齐 `thread/resume` 的 `promote_partial`（仅崩溃恢复角落可达）。
 
 ### P2 前后台 async + lead_memory
 
