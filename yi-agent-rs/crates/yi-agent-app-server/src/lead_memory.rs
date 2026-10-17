@@ -44,6 +44,10 @@ pub fn append_entry(project_root: &Path, entry: &MemoryEntry) -> std::io::Result
 }
 
 /// 读出全部条目。文件不存在视为空；无法解析的行跳过（账本损坏不应让 lead 崩）。
+///
+/// 跳过时每行记一条 stderr（与 `thread_store` 的 corrupt-record 处理一致）：账本装的是
+/// **不可再生**信息，静默丢行会让 lead 以为「记性变少」而不是「文件坏了」。半行
+/// （大条目 `write_all` 跨多次 syscall，中途被杀会留半行）与未来的 schema 漂移都会走这里。
 pub fn read_entries(project_root: &Path) -> std::io::Result<Vec<MemoryEntry>> {
     let path = memory_path(project_root);
     let text = match std::fs::read_to_string(&path) {
@@ -54,7 +58,13 @@ pub fn read_entries(project_root: &Path) -> std::io::Result<Vec<MemoryEntry>> {
     Ok(text
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .filter_map(|l| serde_json::from_str::<MemoryEntry>(l).ok())
+        .filter_map(|l| match serde_json::from_str::<MemoryEntry>(l) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                eprintln!("[app-server] skipping corrupt lead memory line: {e}");
+                None
+            }
+        })
         .collect())
 }
 
@@ -159,5 +169,28 @@ mod tests {
         )
         .expect("append");
         assert_eq!(search(dir.path(), "fmt", 10).expect("search").len(), 1);
+    }
+
+    #[test]
+    fn corrupt_lines_are_skipped_without_losing_valid_entries() {
+        let dir = temp_project();
+        let valid = MemoryEntry {
+            timestamp_ms: 1,
+            source: "s".into(),
+            text: "打回 thread A：偏离了验收标准".into(),
+        };
+        let path = memory_path(dir.path());
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("create_dir_all");
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n{{\"timestamp_ms\": 2, \"source\": \"s\", \"te",
+                serde_json::to_string(&valid).expect("serialize")
+            ),
+        )
+        .expect("write");
+
+        let loaded = read_entries(dir.path()).expect("read");
+        assert_eq!(loaded, vec![valid]);
     }
 }
