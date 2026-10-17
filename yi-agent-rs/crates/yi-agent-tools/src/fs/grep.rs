@@ -376,6 +376,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grep_reports_relative_path_against_the_matching_root() {
+        let primary = TempDir::new().unwrap();
+        let secondary = TempDir::new().unwrap();
+        fs::write(secondary.path().join("sib.rs"), "fn main() {}\n").unwrap();
+        let ctx = Arc::new(ToolsContext::with_roots(vec![
+            primary.path().to_path_buf(),
+            secondary.path().to_path_buf(),
+        ]));
+        let tool = GrepTool::new(ctx);
+        let result = tool
+            .call(serde_json::json!({
+                "pattern": "fn main",
+                "path": secondary.path().to_string_lossy(),
+                "output_mode": "files_with_matches",
+            }))
+            .await;
+        assert!(!result.is_error);
+        // 必须相对**命中的那个根**（secondary）报路径，而不是绝对路径、
+        // 也不是相对主根。等值断言才拦得住"退回旧行为"的回归。
+        assert_eq!(text_result(&result), "sib.rs\n");
+    }
+
+    #[tokio::test]
     async fn grep_files_mode_truncates_many_matching_files() {
         let tmp = TempDir::new().unwrap();
         for index in 0..201 {
