@@ -123,7 +123,13 @@ export class ThreadStore {
       n.method === "agent/children/updated" ||
       n.method === "agent/trace/event" ||
       n.method === "ui/settings/updated" ||
-      n.method === "ui/gitDiff/focus"
+      n.method === "ui/gitDiff/focus" ||
+      // `item/toolCall/approvalResolved` 是**无 thread 归属**的广播：Rust 侧的载荷
+      // 只有 `perm_id` / `by` / `decision`（`protocol.rs` 的
+      // `ToolCallApprovalResolved`）。若任其落到下面的 `n.params.thread_id`，类型上
+      // 会失败，运行期则会把这条广播错记到当前 thread。它不属于任何 transcript，
+      // 显式忽略。
+      n.method === "item/toolCall/approvalResolved"
     ) {
       return;
     }

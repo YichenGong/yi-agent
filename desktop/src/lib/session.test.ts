@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { Session } from "./session";
+import type { Notification } from "./protocol";
 
 describe("Session", () => {
   it("appends a user message locally", () => {
@@ -121,11 +122,20 @@ describe("Session", () => {
   });
 
   it("defaults cache tokens to zero when absent", () => {
+    // 服务端现在恒发这两个 cache 字段，生成出来的线类型因此把二者标为必需。
+    // 本用例的**全部意义**就是「它们缺席时折叠层仍然容错」，所以这里刻意按
+    // 改码前的（cache 可选）形状构造载荷，在调用点断言成通知类型。
+    const legacyUsage = {
+      thread_id: "t",
+      model: "m",
+      input_tokens: 1,
+      output_tokens: 2,
+    };
     const s = new Session();
     s.apply({
       method: "thread/tokenUsage/updated",
-      params: { thread_id: "t", model: "m", input_tokens: 1, output_tokens: 2 },
-    });
+      params: legacyUsage,
+    } as unknown as Notification);
     expect(s.usage).toEqual({
       model: "m",
       input: 1,
@@ -139,11 +149,11 @@ describe("Session", () => {
     const s = new Session();
     s.apply({
       method: "thread/tokenUsage/updated",
-      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 0, cache_read_input_tokens: 9 },
+      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 9 },
     });
     s.apply({
       method: "thread/tokenUsage/updated",
-      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 42, cache_read_input_tokens: 9 },
+      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 42, cache_creation_input_tokens: 0, cache_read_input_tokens: 9 },
     });
     expect(s.usage).toEqual({ model: "m", input: 100, output: 42, cacheRead: 9, cacheWrite: 0 });
   });
@@ -192,6 +202,18 @@ describe("Session", () => {
     expect(s.retrying).toBeNull();
   });
 
+  it("falls back to a labelled cause when the server reports an unknown one", () => {
+    // `cause` 在线形状里是 `string`：服务端将来新增一个原因而前端还没跟上时，
+    // 收窄必须给出一个**有文案**的成员，否则 `RETRY_CAUSE_LABELS[cause]` 会渲染
+    // 成空标签。`network_error` 是这里的兜底。
+    const s = new Session();
+    s.apply({
+      method: "turn/retry",
+      params: { thread_id: "t", turn_id: "u1", attempt: 1, max: 3, cause: "brand_new_cause" },
+    });
+    expect(s.retrying).toEqual({ attempt: 1, max: 3, cause: "network_error" });
+  });
+
   it("clears a retry notice when the turn completes", () => {
     const s = new Session();
     s.apply({
@@ -213,7 +235,7 @@ describe("Session", () => {
       params: {
         thread_id: "t",
         turn_id: "u1",
-        item: { type: "user_interjection", id: "interject-u1-1", text: "also do X" },
+        item: { type: "userInterjection", id: "interject-u1-1", text: "also do X" },
       },
     } as never);
 
@@ -230,7 +252,7 @@ describe("Session", () => {
     const s = new Session();
     const params = {
       thread_id: "t",
-      item: { type: "user_interjection", id: "interject-u1-1", text: "also do X" },
+      item: { type: "userInterjection", id: "interject-u1-1", text: "also do X" },
     };
     s.apply({ method: "item/started", params } as never);
     s.apply({ method: "item/completed", params } as never);
@@ -265,7 +287,7 @@ describe("Session", () => {
     s.apply({ method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
     s.apply({
       method: "thread/tokenUsage/updated",
-      params: { thread_id: "t", model: "m", input_tokens: 1, output_tokens: 2 },
+      params: { thread_id: "t", model: "m", input_tokens: 1, output_tokens: 2, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
     });
     s.apply({ method: "error", params: { message: "boom" } });
     s.apply({
