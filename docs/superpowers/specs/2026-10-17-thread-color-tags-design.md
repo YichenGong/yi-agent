@@ -293,11 +293,16 @@ TagNamesUpdated { tag_names: std::collections::BTreeMap<String, String> },
 `SettingsDialog` 的 `TABS` 表增加一项 `{ id: "tags", label: "标签" }`，新组件
 `SettingsTagsTab.tsx`：
 
-- 6 行，每行 = 色点 + 文本输入框（值为当前名，`placeholder` 为默认名）。
+- 6 行，每行 = 色点 + 文本输入框（值为当前名）。输入框只挂稳定属性
+  `data-tag-name-input={id}`；`aria-label` 用**默认名**（`` `${DEFAULT_TAG_NAMES[id]}标签名` ``），
+  与当前显示名解耦，改名后仍可定位。
 - 提交时机：失焦（`onBlur`）与回车（Enter，需过 IME 守卫，复用
   `useImeGuard`——中文输入法确认 Enter 不能提交）。
-- 提交走 `ui/settings/write { tag_names: {...} }`；成功后用回包/通知刷新本地。
-- 校验失败（空串）时内联提示且不落盘，回填旧值。
+- 提交走 `ui/settings/write { tag_names: {...} }`，且**只带改动的那一个键**
+  （服务端按键合并）；成功后 `force` 重渲染，权威值由 `ui/tagNames/updated`
+  广播落地，本端不自行猜测合并结果。
+- 校验失败（空串 / 超 `TAG_NAME_MAX_LEN`）时内联提示且不落盘。**保留用户所输**
+  以便就地改正，不清回旧值；重新聚焦改正后错误随之清除。
 - 该 Tab 复用对话框既有的 Tab 键盘导航（roving tabIndex）机制，无需特殊处理。
 
 #### 3.4.7 搜索

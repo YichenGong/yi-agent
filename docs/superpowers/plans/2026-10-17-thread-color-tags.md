@@ -2032,7 +2032,7 @@ import {
   type TagId,
 } from "../lib/threadTags";
 
-/** 一行的编辑态：受控值 + 上一次已保存值（用于失败回填与「是否已改动」判定）。 */
+/** 一行的编辑态：受控值 + 内联错误（未改动判定用当前的 `tagNames[id]`）。 */
 interface RowState {
   value: string;
   error: string | null;
