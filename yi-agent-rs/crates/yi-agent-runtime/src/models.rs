@@ -398,8 +398,13 @@ pub fn resolve_effective(
                 .map(ApiStyle::parse)
                 .unwrap_or(RuntimeConfig::default_api_style());
             out.reasoning_effort = entry.reasoning_effort.clone();
+            // `context_length` 来自手写 `models.json`，是外部输入：饱和乘法挡住 `length * ratio`
+            // 的溢出（debug 会 panic、release 会静默回绕）；`0` 视为"未声明"，否则
+            // `compact_threshold == 0` 会让每一轮都触发压缩。静默条目保持 cfg 阈值原样。
             if let Some(length) = entry.context_length {
-                out.compact_threshold = length * out.compact_ratio / 100;
+                if length > 0 {
+                    out.compact_threshold = length.saturating_mul(out.compact_ratio) / 100;
+                }
             }
             out
         }
@@ -943,5 +948,30 @@ mod resolve_tests {
         let base = cfg();
         let out = resolve_effective(&base, &catalog(), Some("A"));
         assert_eq!(out.compact_threshold, base.compact_threshold);
+    }
+
+    /// `context_length: 0` 是手写 `models.json` 里可达的输入。它必须被当成"未声明"：
+    /// 阈值保持 cfg 原值，否则 `compact_threshold == 0` 会让每一轮都触发压缩。
+    #[test]
+    fn a_zero_context_length_is_treated_as_silent() {
+        let base = cfg();
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(0);
+        let out = resolve_effective(&base, &cat, Some("B"));
+        assert_eq!(out.compact_threshold, base.compact_threshold);
+    }
+
+    /// 一个被误写成原始窗口/字符数的超大值不能在 `length * ratio` 上溢出：
+    /// debug 构建会 panic（会话启动路径），release 会静默回绕。饱和乘法必须让它算完。
+    #[test]
+    fn a_huge_context_length_saturates_instead_of_overflowing() {
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(1_000_000_000);
+        // cfg() 的 compact_ratio 为 80（非零），正是会溢出的倍数。
+        let out = resolve_effective(&cfg(), &cat, Some("B"));
+        assert_eq!(
+            out.compact_threshold,
+            1_000_000_000u32.saturating_mul(80) / 100
+        );
     }
 }
