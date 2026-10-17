@@ -15,6 +15,12 @@ pub mod protocol;
 pub mod server;
 pub mod session;
 pub mod settings_store;
+/// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。
+///
+/// 放在 `mod tests` 之外，因为 `#[cfg(test)]` 的 `mod tests` 对其它文件不可见；
+/// 这里同样只在 test 构建下存在，避免生产构建出现 dead_code。
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod theme_tool;
 pub mod thread_store;
 pub mod translate;
