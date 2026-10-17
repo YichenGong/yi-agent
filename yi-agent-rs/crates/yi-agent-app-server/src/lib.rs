@@ -12,6 +12,7 @@ pub mod onboarding_rpc;
 pub mod pair_uri;
 pub mod pairing;
 pub mod protocol;
+pub(crate) mod rpc;
 pub mod server;
 pub mod session;
 pub mod settings_store;
