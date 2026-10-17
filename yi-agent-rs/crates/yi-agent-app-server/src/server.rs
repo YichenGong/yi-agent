@@ -7494,6 +7494,7 @@ async fn start_thread_core(
         reasoning_effort: None,
         // 新会话默认开启跨轮保留(与 `ThreadMeta` 的缺省语义一致)。
         preserve_thinking: true,
+        role: None,
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -13618,6 +13619,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
         // 全局索引指向该工作区（canonicalize 以对齐真实写入的路径形态）。
@@ -15129,6 +15131,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
 
@@ -15234,6 +15237,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: false,
+                role: None,
             })
             .unwrap();
 
@@ -15327,6 +15331,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
 
@@ -16648,6 +16653,7 @@ pub(crate) mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            role: None,
         };
         crate::thread_store::ThreadStore::new(dir)
             .create(&meta)
@@ -17099,6 +17105,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
         store
@@ -17205,6 +17212,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                role: None,
             })
             .unwrap();
         // 一轮正常收尾过的历史。

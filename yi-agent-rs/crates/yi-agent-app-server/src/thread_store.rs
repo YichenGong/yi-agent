@@ -13,6 +13,9 @@ use yi_agent_core::{ContentBlock, Message, Role};
 
 use crate::protocol::Item;
 
+/// 组长角色的 `ThreadMeta.role` 取值。一个项目目录至多一个。
+pub const LEAD_ROLE: &str = "lead";
+
 /// 线程的自主权模式。持久化到 `.meta.json`,重开 app 后恢复。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -62,6 +65,10 @@ pub struct ThreadMeta {
     /// `default_true`，否则老会话会被静默降级为「丢弃凭证」）。
     #[serde(default = "default_true")]
     pub preserve_thinking: bool,
+    /// 会话角色标记。`Some("lead")` = 该会话是所属项目目录的组长;`None` = 普通会话。
+    /// 旧 meta 缺字段一律读成 `None`(零迁移)。
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// `#[serde(default = "…")]` 的显式默认：`bool` 的内建默认是 `false`，而本开关
@@ -316,6 +323,39 @@ impl ThreadStore {
                 .then_with(|| a.thread_id.cmp(&b.thread_id))
         });
         Ok(out)
+    }
+
+    /// 组长归属键:项目状态目录 `<cwd>/.yi-agent` 的 canonical 字符串。
+    ///
+    /// 用 canonical 路径而非 cwd 原串,是因为同一个目录可以有多种写法(尾斜杠、
+    /// 符号链接、相对路径),原串比较会让同一项目被判成两个项目、造出两个组长。
+    /// canonicalize 失败(目录尚未创建)时退回原串:此时也还没有任何会话,
+    /// 键取什么都只会被用一次。
+    pub fn project_key(&self) -> String {
+        let state_dir = self
+            .root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.root.clone());
+        state_dir
+            .canonicalize()
+            .unwrap_or(state_dir)
+            .display()
+            .to_string()
+    }
+
+    /// 本目录的组长,按 `created_at` 升序取第一个。
+    ///
+    /// 取「最早创建」而非「最新」,是为了让懒创建幂等:并发/重复调用无论如何
+    /// 都收敛到同一个组长,而不是每次挑一个不同的。
+    pub fn find_lead(&self) -> io::Result<Option<ThreadMeta>> {
+        let mut leads: Vec<ThreadMeta> = self
+            .list()?
+            .into_iter()
+            .filter(|meta| meta.role.as_deref() == Some(LEAD_ROLE))
+            .collect();
+        leads.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(leads.into_iter().next())
     }
 
     /// 在 store 锁内对 meta 做读-改-写。`Ok(None)` 表示 thread 不存在或 meta 不可读。
@@ -777,6 +817,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         reasoning_effort: None,
         // 缺 meta 时从日志重建:无从得知曾经的开关,按默认「保留」解释。
         preserve_thinking: true,
+        role: None,
     }
 }
 
@@ -806,6 +847,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            role: None,
         }
     }
 
@@ -941,6 +983,7 @@ mod tests {
             );
             let bad_meta = ThreadMeta {
                 thread_id: bad.into(),
+                role: None,
                 ..meta("placeholder")
             };
             assert!(
@@ -1468,6 +1511,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            role: None,
         }
     }
 
@@ -1842,6 +1886,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            role: None,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -1880,6 +1925,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            role: None,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -1977,5 +2023,136 @@ mod tests {
             .set_preserve_thinking("ghost", false)
             .expect_err("an unknown thread must not be silently accepted");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// 组长标记必须能在落盘后读回,且旧 meta(无 `role`)读取为 `None`。
+    #[test]
+    fn role_round_trips_and_legacy_meta_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+
+        let lead = ThreadMeta {
+            thread_id: "thread-lead-1".into(),
+            cwd: dir.path().display().to_string(),
+            model: "m".into(),
+            created_at: 1,
+            updated_at: 1,
+            title: None,
+            permission_mode: ThreadMode::Normal,
+            pin_seq: None,
+            board_project: None,
+            card_id: None,
+            model_ref: None,
+            reasoning_effort: None,
+            preserve_thinking: true,
+            role: Some(LEAD_ROLE.to_string()),
+        };
+        store.create(&lead).unwrap();
+        store
+            .append_turn(
+                "thread-lead-1",
+                &TurnLine::Turn {
+                    items: Vec::new(),
+                    usage: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let found = store.find_lead().unwrap().expect("lead must be found");
+        assert_eq!(found.thread_id, "thread-lead-1");
+        assert_eq!(found.role.as_deref(), Some(LEAD_ROLE));
+
+        // 旧 meta:手工写一份不含 `role` 的 JSON,必须读成 None 且不被 find_lead 选中。
+        let raw = serde_json::json!({
+            "thread_id": "thread-old-1",
+            "cwd": dir.path().display().to_string(),
+            "model": "m",
+            "created_at": 2,
+            "updated_at": 2,
+            "title": null,
+            "permission_mode": "normal",
+            "pin_seq": null,
+            "board_project": null,
+            "card_id": null,
+            "model_ref": null,
+            "reasoning_effort": null,
+            "preserve_thinking": true
+        });
+        std::fs::write(
+            dir.path().join(".yi-agent/threads/thread-old-1.meta.json"),
+            serde_json::to_vec_pretty(&raw).unwrap(),
+        )
+        .unwrap();
+        let loaded = store.load("thread-old-1").unwrap().unwrap();
+        assert_eq!(
+            loaded.meta.role, None,
+            "legacy meta must read as a plain thread"
+        );
+        // 组长仍只有那一个。
+        assert_eq!(
+            store.find_lead().unwrap().unwrap().thread_id,
+            "thread-lead-1"
+        );
+    }
+
+    /// 多个组长并存(理论上的异常态)时 `find_lead` 必须稳定返回最早创建的那个,
+    /// 使懒创建幂等:并发两次调用不会在第二次又造一个新组长。
+    #[test]
+    fn find_lead_is_stable_when_more_than_one_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        for (id, created) in [("thread-lead-b", 20i64), ("thread-lead-a", 10i64)] {
+            store
+                .create(&ThreadMeta {
+                    thread_id: id.into(),
+                    cwd: dir.path().display().to_string(),
+                    model: "m".into(),
+                    created_at: created,
+                    updated_at: created,
+                    title: None,
+                    permission_mode: ThreadMode::Normal,
+                    pin_seq: None,
+                    board_project: None,
+                    card_id: None,
+                    model_ref: None,
+                    reasoning_effort: None,
+                    preserve_thinking: true,
+                    role: Some(LEAD_ROLE.to_string()),
+                })
+                .unwrap();
+            store
+                .append_turn(
+                    id,
+                    &TurnLine::Turn {
+                        items: Vec::new(),
+                        usage: None,
+                        messages: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.find_lead().unwrap().unwrap().thread_id,
+            "thread-lead-a"
+        );
+        assert_eq!(
+            store.find_lead().unwrap().unwrap().thread_id,
+            "thread-lead-a"
+        );
+    }
+
+    /// 项目键必须是 `<cwd>/.yi-agent` 的 canonical 路径:同一 cwd 的两种写法
+    /// (含符号链接)必须得到同一个键,否则会造出两个组长。
+    #[test]
+    fn project_key_is_canonical_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        let store = ThreadStore::new(&real);
+        assert_eq!(
+            store.project_key(),
+            real.join(".yi-agent").display().to_string()
+        );
+        assert_eq!(store.project_key(), store.project_key());
     }
 }
