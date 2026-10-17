@@ -113,12 +113,13 @@ pub fn try_load_catalog_from(path: &Path) -> Result<ModelCatalog, String> {
         }
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
-    parse_catalog(&text).map_err(|error| format!("invalid {}: {error}", path.display()))
+    parse_catalog(&text, path).map_err(|error| format!("invalid {}: {error}", path.display()))
 }
 
 /// 把清单文本解析为 [`ModelCatalog`]。`load_catalog_from`（宽松）与
-/// `try_load_catalog_from`（严格）共用它，保证两份读取口径逐字节一致。
-fn parse_catalog(text: &str) -> Result<ModelCatalog, serde_json::Error> {
+/// `try_load_catalog_from`（严格）共用它，保证两份读取口径逐字节一致
+/// （含 warning 日志字段，故**必须**接收 `path`）。
+fn parse_catalog(text: &str, path: &Path) -> Result<ModelCatalog, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(text)?;
     let mut catalog = ModelCatalog::default();
     if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
@@ -132,8 +133,10 @@ fn parse_catalog(text: &str) -> Result<ModelCatalog, serde_json::Error> {
                     migrate_openai_api_url(&mut entry);
                     catalog.models.push(entry);
                 }
-                Ok(_) => tracing::warn!("skipping incomplete model entry"),
-                Err(error) => tracing::warn!(%error, "skipping malformed model entry"),
+                Ok(_) => tracing::warn!(path = %path.display(), "skipping incomplete model entry"),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "skipping malformed model entry")
+                }
             }
         }
     }
@@ -163,7 +166,7 @@ pub fn load_catalog_from(path: &Path) -> ModelCatalog {
             return ModelCatalog::default();
         }
     };
-    match parse_catalog(&text) {
+    match parse_catalog(&text, path) {
         Ok(catalog) => catalog,
         Err(error) => {
             tracing::warn!(%error, path = %path.display(), "invalid models.json; treating as empty");
