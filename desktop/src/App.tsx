@@ -6,6 +6,7 @@ import { useDiffState } from "./hooks/useDiffState";
 import { useProcessState } from "./hooks/useProcessState";
 import { useBoardState } from "./hooks/useBoardState";
 import { useSessionState } from "./hooks/useSessionState";
+import { useSettingsState } from "./hooks/useSettingsState";
 import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
@@ -65,7 +66,7 @@ import {
 } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
-import { applyTheme, parseTheme, readCachedTheme, type Theme } from "./lib/theme";
+import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
 import { OnboardingWizard, type OnboardingOutcome } from "./components/OnboardingWizard";
@@ -173,14 +174,6 @@ export default function App() {
   const subWindow = useRef(new SubscriptionWindow());
   // Approvals the user has dismissed from the banner; keyed by approval id.
   const dismissedApprovals = useRef(new Set<string>());
-  // 处理，绝不因为一个读失败挡住主界面（见 handshake）。
-  const [onboarding, setOnboarding] = useState<{ needed: boolean; reasons: string[] }>({
-    needed: false,
-    reasons: [],
-  });
-  // 部分成功提示（spec §4.7）：`.env` 写成功、但清单未收边时在主界面顶部留一条
-  // 可关闭横幅。`null` = 无提示；关闭即清空。完整成功不设此项。
-  const [onboardingNotice, setOnboardingNotice] = useState<string | null>(null);
   // 每个会话待发送的附件。按会话隔离，与草稿同理：切走时留在原会话、切回时
   // 原样出现，绝不会把 A 的附件发到 B 上。
   const [pending, setPending] = useState<Record<string, PendingAttachment[]>>({});
@@ -286,46 +279,14 @@ export default function App() {
   // 握手后拉登记表与注册 2 秒计时器那两个现场，都留在 App，只把引用改成 `board.*`。
   const board = useBoardState({ clientRef });
 
-  // iOS 首启：没有远端配置时先配对。版本号是「让 transport 重算」的触发器——
-  // 配对落盘后加一，下面那个 effect 才第一次真正建客户端（此前被
-  // `needsPairing` 挡住），这一次读到的是 ws 配置。
-  const [pairingVersion, setPairingVersion] = useState(0);
-  /**
-   * 手机端「重新配对」：true 时全屏呈现配对界面。
-   *
-   * **非破坏性**——不动已存配置，提交成功才覆盖；点「返回」即回原离线态。
-   * 首启配对走 `needsPairing`，与此独立（首启优先）。
-   */
-  const [repairing, setRepairing] = useState(false);
-  /** 自动进入重配时展示的原因（如凭据被移除）；手动进入或返回后清空。 */
-  const [repairNotice, setRepairNotice] = useState<string | null>(null);
-  /**
-   * effect 闭包读不到最新 state，故用 ref 判断「是否已在重配界面」，避免重复进入。
-   * 每次渲染同步一次。
-   */
-  const repairingRef = useRef(false);
-  repairingRef.current = repairing;
-  /**
-   * 用户是否已对"此设备已被移除"这一自动提示做过回答（点了返回）。
-   *
-   * 没有它，「返回」形同虚设：后台退避重连每轮都会再撞上 4401，于是每轮都把
-   * 用户弹回去——用户的决定被反复撤销。握手成功（真的连上了）时重新武装，
-   * 因为那之后凭据若再失效就是一件新事，该再提示一次。
-   */
-  const repairDismissedRef = useRef(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  // 「本机侧车要连的中继地址」：首屏由 ui/settings/read 回填，用户在设置页改后
-  // 经 Tauri `set_relay_url` 落盘并触发侧车重启。
-  const [relayUrl, setRelayUrl] = useState("");
-  // 首屏先用缓存渲染，连上后以 ui/settings/read 的权威值为准。
-  const [theme, setTheme] = useState<Theme>(() => readCachedTheme() ?? "dark");
-  // 挂载后主题是否已被更新的选择触碰过（ui/settings/updated 通知或用户
-  // changeTheme）。首屏 read 在途时若被触碰，read 返回的旧值不得覆盖它。
-  const themeTouchedRef = useRef(false);
-  // 服务端已确认（或首屏 read 采纳）的主题，即「乐观更新可以回退到」的基线。
-  // 用 ref 而非 state：写失败的回调读到的是最新基线，而不是某次调用时刻的
-  // 陈旧闭包值——否则并发写会退回到中间态（见 changeTheme）。
-  const confirmedThemeRef = useRef<Theme>(readCachedTheme() ?? "dark");
+  // 设置关注点（设置页/配对界面开合、首启引导、本机中继地址、主题、重配提示）
+  // 整体搬进 hook，见 `hooks/useSettingsState.ts`。跨关注点的编排不在这里：
+  // 生命周期 effect 里那几处（跟随 `ui/settings/updated`、采纳首屏 read、4401
+  // 进重配、握手成功重新武装提示）与 JSX（`SettingsDialog`/`PairingScreen`/
+  // `OnboardingWizard`，后者的 `onDone` 还要 `restartSidecar`/`modelCall`）都留在
+  // App，只把引用改成 `prefs.*`。`changeTheme` 的写失败要落一条对话红字并强制
+  // 重渲染，故 `force`/`setCurrentError` 作为参数注入。
+  const prefs = useSettingsState({ rpc, force, setCurrentError });
 
   /**
    * 插件 Tab 的宿主接缝。必须稳定：它只闭合 `clientRef`（一个 ref），所以
@@ -679,20 +640,6 @@ export default function App() {
     return typeof picked === "string" ? picked : null;
   };
 
-  /**
-   * 保存侧车的中继地址（设置页「远程访问」的保存按钮调用）。
-   *
-   * 只有桌面构建有侧车与这条 Tauri 命令；iOS 是纯 ws 客户端，接缝传 undefined
-   * 让保存按钮不可用（与 `pickDirectory` 的守卫同一口径）。落盘由宿主完成，并会
-   * 杀掉侧车让监管循环用新值重启；成功后本地状态跟上，失败原样抛出由组件内联提示。
-   */
-  const saveRelayUrl = async (value: string | null): Promise<void> => {
-    if (isRemoteClient()) throw new Error("远程客户端不支持配置本机侧车");
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("set_relay_url", { url: value });
-    setRelayUrl(value ?? "");
-  };
-
   const addWorkspace = async (path: string): Promise<boolean> => {
     try {
       await clientRef.current?.request("workspace/add", { path });
@@ -951,10 +898,10 @@ export default function App() {
         if (n.method === "ui/settings/updated") {
           // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
           // 的首屏 read 用旧值把它覆盖回去。服务端推来的即权威值，记作回退基线。
-          themeTouchedRef.current = true;
+          prefs.themeTouchedRef.current = true;
           const next = parseTheme(n.params.theme);
-          confirmedThemeRef.current = next;
-          setTheme(next);
+          prefs.confirmedThemeRef.current = next;
+          prefs.setTheme(next);
           return;
         }
         if (n.method === "ui/gitDiff/focus") {
@@ -1028,11 +975,11 @@ export default function App() {
         if (
           isRemoteClient() &&
           s.code === 4401 &&
-          !repairingRef.current &&
-          !repairDismissedRef.current
+          !prefs.repairingRef.current &&
+          !prefs.repairDismissedRef.current
         ) {
-          setRepairNotice(REPAIR_REMOVED_TEXT);
-          setRepairing(true);
+          prefs.setRepairNotice(REPAIR_REMOVED_TEXT);
+          prefs.setRepairing(true);
         }
         // sidecar 退出后宿主会自动重启它(bridge 的监管循环)。重连不能依赖用户
         // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
@@ -1065,13 +1012,13 @@ export default function App() {
         }>("ui/settings/read", {});
         // 中继地址没有「用户正在改」的触碰标记：设置页是模态的，首屏 read 回来
         // 时用户还没法编辑它，直接采纳权威值即可。未配置（null）→ 空串。
-        setRelayUrl(typeof settings.relay_url === "string" ? settings.relay_url : "");
+        prefs.setRelayUrl(typeof settings.relay_url === "string" ? settings.relay_url : "");
         // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
         // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
-        if (!themeTouchedRef.current) {
+        if (!prefs.themeTouchedRef.current) {
           const authoritative = parseTheme(settings.theme);
-          confirmedThemeRef.current = authoritative;
-          setTheme(authoritative);
+          prefs.confirmedThemeRef.current = authoritative;
+          prefs.setTheme(authoritative);
         }
         // 值守：直接读这份 settings（同一趟请求里就有），不再多发一次
         // `ui/settings/read`。缺省口径由 parseBoardWatchman 与 readBoardWatchman 共享。
@@ -1086,9 +1033,9 @@ export default function App() {
           const status = await onboardingStatus((m, p) =>
             (clientRef.current as RpcClient).request(m, p),
           );
-          setOnboarding({ needed: status.needed && !status.dismissed, reasons: status.reasons });
+          prefs.setOnboarding({ needed: status.needed && !status.dismissed, reasons: status.reasons });
         } catch {
-          setOnboarding({ needed: false, reasons: [] });
+          prefs.setOnboarding({ needed: false, reasons: [] });
         }
         await sess.refreshWorkspaces();
         const list = await client.request<{
@@ -1125,7 +1072,7 @@ export default function App() {
         setStatus("connected");
         // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
         // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
-        repairDismissedRef.current = false;
+        prefs.repairDismissedRef.current = false;
         // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
         // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
         // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
@@ -1182,7 +1129,7 @@ export default function App() {
       window.clearInterval(boardTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pairingVersion]);
+  }, [prefs.pairingVersion]);
 
   /**
    * Run a slash command. Commands never reach the agent: their output is a
@@ -1547,25 +1494,6 @@ export default function App() {
     }
   };
 
-  const changeTheme = (next: Theme) => {
-    // 立即生效，再落盘。
-    themeTouchedRef.current = true;
-    setTheme(next);
-    clientRef.current?.request("ui/settings/write", { theme: next }).then(
-      () => {
-        // 服务端已接受：把它记作新的回退基线。
-        confirmedThemeRef.current = next;
-      },
-      (e) => {
-        // 写失败：回退到**最近一次已确认**的主题，而不是本次调用时刻的闭包值。
-        // 并发写时后者会退回到中间态（例如先浅后深都失败，却停在深）。
-        setTheme(confirmedThemeRef.current);
-        setCurrentError(formatError(e));
-        force((v) => v + 1);
-      },
-    );
-  };
-
   // Sidebar badges: server-authoritative status per thread + unread marker for
   // threads that finished a turn while the user was looking elsewhere.
   const statuses = new Map<string, ThreadStatus>();
@@ -1584,10 +1512,6 @@ export default function App() {
     .pendingApprovalsElsewhere()
     .filter((r) => !dismissedApprovals.current.has(r.id));
 
-  useEffect(() => {
-    applyTheme(theme);
-  }, [theme]);
-
   // 首启的 iOS 没有远端配置时先配对：此时 transportFactory 会退回
   // tauriTransport()，而 iOS 上根本没有 Tauri IPC——继续往下渲染就是死路。
   // 桌面永远不会进这个分支（isIos 为 false）。
@@ -1597,7 +1521,7 @@ export default function App() {
         // PairingScreen 保证这个回调发生在 saveRemoteConfig 之后，所以此刻
         // 存储里已经有 {url, token}；版本号让上面的 effect 重跑，这一次
         // transportFactory 选中的是 ws。
-        onPaired={() => setPairingVersion((v) => v + 1)}
+        onPaired={() => prefs.setPairingVersion((v) => v + 1)}
         redeem={defaultRedeem}
       />
     );
@@ -1605,7 +1529,7 @@ export default function App() {
 
   // 已配对的手机点「重新配对」：同一个界面，多一条返回。非破坏性——提交成功
   // 才覆盖配置，返回即回原离线态继续退避重连。
-  if (repairing) {
+  if (prefs.repairing) {
     return (
       <PairingScreen
         // 预填当前已存地址（用户可改可重扫）；读不到时留空，不影响提交。
@@ -1614,20 +1538,20 @@ export default function App() {
             (globalThis.localStorage as StorageLike | undefined) ?? emptyStorageLike,
           )?.url
         }
-        notice={repairNotice ?? undefined}
+        notice={prefs.repairNotice ?? undefined}
         onCancel={() => {
-          setRepairing(false);
-          setRepairNotice(null);
+          prefs.setRepairing(false);
+          prefs.setRepairNotice(null);
           // 记住"用户已经答过"：退避重连再撞 4401 也不得把他弹回来。
-          repairDismissedRef.current = true;
+          prefs.repairDismissedRef.current = true;
         }}
         onPaired={() => {
           // 已配对过时 `inited.current` 仍是 true，单靠版本号会被守卫挡掉；
           // 必须先放开守卫，让旧 effect 走 cleanup、新 effect 真正建连。
           inited.current = false;
-          setRepairing(false);
-          setRepairNotice(null);
-          setPairingVersion((v) => v + 1);
+          prefs.setRepairing(false);
+          prefs.setRepairNotice(null);
+          prefs.setPairingVersion((v) => v + 1);
         }}
         redeem={defaultRedeem}
       />
@@ -1636,16 +1560,16 @@ export default function App() {
 
   return (
     <>
-      {onboarding.needed && (
+      {prefs.onboarding.needed && (
         <OnboardingWizard
-          reasons={onboarding.reasons}
+          reasons={prefs.onboarding.reasons}
           call={(m, p) => (clientRef.current as RpcClient).request(m, p)}
           onDone={(result?: OnboardingOutcome) => {
-            setOnboarding({ needed: false, reasons: [] });
+            prefs.setOnboarding({ needed: false, reasons: [] });
             // `.env` 已写、清单没收边（部分成功）：主界面顶部留一条可关闭提示，
             // 别让用户在「已保存」与「模型仍不可用」之间一头雾水。
             if (result && !result.imported) {
-              setOnboardingNotice(
+              prefs.setOnboardingNotice(
                 "已保存到 .env，但未纳入模型清单（可稍后在设置里点「导入当前配置」）" +
                   (result.importError ? `：${result.importError}` : ""),
               );
@@ -1661,16 +1585,16 @@ export default function App() {
         <TitleBar />
         {/* 引导部分成功的提示（spec §4.7）：可关闭的顶部横幅，样式与 ApprovalBanner
             一致；关闭即清空状态，不再出现。 */}
-        {onboardingNotice !== null && (
+        {prefs.onboardingNotice !== null && (
           <div
             role="status"
             aria-live="polite"
             className="flex flex-wrap items-center gap-3 border-b border-amber-900/60 bg-amber-950/60 px-3 py-2 text-xs text-amber-100"
           >
-            <span className="min-w-0">{onboardingNotice}</span>
+            <span className="min-w-0">{prefs.onboardingNotice}</span>
             <button
               type="button"
-              onClick={() => setOnboardingNotice(null)}
+              onClick={() => prefs.setOnboardingNotice(null)}
               aria-label="关闭提示"
               className="ml-auto rounded px-1 text-amber-300 hover:text-amber-100"
             >
@@ -1724,7 +1648,7 @@ export default function App() {
           onOpenBoard={onOpenBoard}
           isMobile={isMobile}
           statusStale={offline}
-          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenSettings={() => prefs.setSettingsOpen(true)}
         />
         </div>
         <div className="app-main relative flex min-w-0 flex-1 flex-col">
@@ -1868,8 +1792,8 @@ export default function App() {
               offline
                 ? () => {
                     // 手动进入不带自动路径的原因文案（那是另一条路的事）。
-                    setRepairNotice(null);
-                    setRepairing(true);
+                    prefs.setRepairNotice(null);
+                    prefs.setRepairing(true);
                   }
                 : undefined
             }
@@ -2029,13 +1953,13 @@ export default function App() {
         </div>
       </div>
       <SettingsDialog
-        open={settingsOpen}
+        open={prefs.settingsOpen}
         // 手机端把设置改成全屏页（见 index.css 的 [data-mobile="true"] .settings-shell）。
         // 复用上面已有的 `isMobile`，不在这里新探测。
         isMobile={isMobile}
-        theme={theme}
-        onThemeChange={changeTheme}
-        onClose={() => setSettingsOpen(false)}
+        theme={prefs.theme}
+        onThemeChange={prefs.changeTheme}
+        onClose={() => prefs.setSettingsOpen(false)}
         // 远程访问 Tab 走**当前 transport**（桌面 stdio = Admin），所以能调
         // pair/create、device/revoke；网络客户端会拿到 -32014，Tab 会提示权限。
         remoteCall={(method, params) =>
@@ -2053,9 +1977,9 @@ export default function App() {
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。
         pluginProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         pluginDefaultProject={current?.info?.cwd}
-        relayUrl={relayUrl}
+        relayUrl={prefs.relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
-        saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}
+        saveRelayUrl={isRemoteClient() ? undefined : prefs.saveRelayUrl}
       />
     </>
   );
