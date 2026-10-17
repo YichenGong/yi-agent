@@ -195,6 +195,20 @@ describe("ThreadSidebar", () => {
     expect(container.textContent).not.toContain("alpha-thread");
     expect(header.querySelector('button[aria-label="Expand"]')).not.toBeNull();
   });
+
+  it("相邻文件夹分组之间留出空档", () => {
+    const { container } = renderSidebar();
+    const headers = Array.from(container.querySelectorAll<HTMLElement>("[data-ws-header]"));
+    const wrappers = headers.map((h) => h.parentElement!);
+
+    // 无空档时各分组容器直接相邻、上一条会话与下一个文件夹头紧贴，四个文件夹连成
+    // 一整列，看不出边界。间距必须**只落在分组之间**：两个分组容器同属一个带
+    // `space-y-2` 的父容器，故首个分组之前不会多出空白（`space-y-*` 只作用于兄弟
+    // 之间），置顶分区与组之间的既有留白也不受影响。
+    expect(wrappers).toHaveLength(2);
+    expect(wrappers[0].parentElement).toBe(wrappers[1].parentElement);
+    expect(wrappers[0].parentElement!.className.split(/\s+/)).toContain("space-y-2");
+  });
 });
 
 const aside = (container: HTMLElement) => container.querySelector("aside")!;
