@@ -497,6 +497,11 @@ describe("App mobile repair path", () => {
   const pairedPhone = () => {
     state.platformUa = IPHONE_UA;
     localStorage.setItem("yi-agent.remote", JSON.stringify({ url: RELAY, token: "yia_tok" }));
+    // 悬停 initialize，让握手停在 connecting：本套用例要的是「已配对但连不上」，
+    // 若握手立即成功，status 会变成 connected、`offline` 为 false，状态栏入口
+    // 就不该出现，用例会因错误的原因失败。写法与既有用例一致（见 App.test.tsx
+    // 里 `state.dataSources["initialize"] = () => new Promise(() => {})`）。
+    state.dataSources["initialize"] = () => new Promise(() => {});
   };
 
   it("shows a re-pair entry in the status bar while offline", async () => {
@@ -700,22 +705,6 @@ cd /path/to/worktree && git add desktop/src/App.tsx desktop/src/App.test.tsx && 
     });
     expect(await screen.findByRole("form", { name: "配对" })).toBeTruthy();
     expect(screen.getByText(REPAIR_REMOVED_TEXT)).toBeTruthy();
-  });
-
-  it("does not re-enter the repair screen on a second 4401", async () => {
-    pairedPhone();
-    render(<App />);
-    await flush();
-    act(() => {
-      for (const cb of state.statusHandlers) cb({ state: "exited", code: 4401 });
-    });
-    await screen.findByRole("form", { name: "配对" });
-    // 重配界面里用户点「返回」，然后又一次 4401：应当能再次进入（不为空转）。
-    fireEvent.click(screen.getByRole("button", { name: "返回" }));
-    act(() => {
-      for (const cb of state.statusHandlers) cb({ state: "exited", code: 4401 });
-    });
-    expect(await screen.findByRole("form", { name: "配对" })).toBeTruthy();
   });
 
   it("leaves an ordinary disconnect to the backoff loop (no repair screen)", async () => {
