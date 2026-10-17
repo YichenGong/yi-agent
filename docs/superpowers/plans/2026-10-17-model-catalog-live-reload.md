@@ -765,7 +765,11 @@ impl WorkerRefresh {
             .as_ref()
             .map(|parts| parts.config.clone())
             .unwrap_or_else(|| self.config.clone());
-        config.model = self.worker_config_model(&request.model);
+        // 未装刷新器时才走静态取值：有刷新器时 `parts.config.model` 已是当前
+        // 清单解析出的模型，不能被静态配置覆盖回去。
+        if refreshed.is_none() {
+            config.model = self.worker_config_model(&request.model);
+        }
 ```
 
 其中新增一个以「基准工具集」为准的注册辅助（把既有 `worker_tool_registry` 改为它的薄封装，**保持既有方法签名与行为不变**）：
