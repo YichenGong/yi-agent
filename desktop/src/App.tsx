@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
+import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
 import { useIsMobile } from "./lib/useIsMobile";
 import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
@@ -141,6 +142,13 @@ async function restartSidecar() {
     // 见上：失败不阻塞。
   }
 }
+
+/** 读不到全局 storage 时的空实现（隐私模式等），与 `lib/platform.ts` 同形。 */
+const emptyStorageLike: StorageLike = {
+  getItem: () => null,
+  setItem: () => {},
+  removeItem: () => {},
+};
 
 export default function App() {
   // Per-thread state lives in a mutable store; the `force` tick is how React
@@ -344,6 +352,13 @@ export default function App() {
   // 配对落盘后加一，下面那个 effect 才第一次真正建客户端（此前被
   // `needsPairing` 挡住），这一次读到的是 ws 配置。
   const [pairingVersion, setPairingVersion] = useState(0);
+  /**
+   * 手机端「重新配对」：true 时全屏呈现配对界面。
+   *
+   * **非破坏性**——不动已存配置，提交成功才覆盖；点「返回」即回原离线态。
+   * 首启配对走 `needsPairing`，与此独立（首启优先）。
+   */
+  const [repairing, setRepairing] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // 「本机侧车要连的中继地址」：首屏由 ui/settings/read 回填，用户在设置页改后
   // 经 Tauri `set_relay_url` 落盘并触发侧车重启。
@@ -1945,6 +1960,30 @@ export default function App() {
     );
   }
 
+  // 已配对的手机点「重新配对」：同一个界面，多一条返回。非破坏性——提交成功
+  // 才覆盖配置，返回即回原离线态继续退避重连。
+  if (repairing) {
+    return (
+      <PairingScreen
+        // 预填当前已存地址（用户可改可重扫）；读不到时留空，不影响提交。
+        initialUrl={
+          storedRemoteConfig(
+            (globalThis.localStorage as StorageLike | undefined) ?? emptyStorageLike,
+          )?.url
+        }
+        onCancel={() => setRepairing(false)}
+        onPaired={() => {
+          // 已配对过时 `inited.current` 仍是 true，单靠版本号会被守卫挡掉；
+          // 必须先放开守卫，让旧 effect 走 cleanup、新 effect 真正建连。
+          inited.current = false;
+          setRepairing(false);
+          setPairingVersion((v) => v + 1);
+        }}
+        redeem={defaultRedeem}
+      />
+    );
+  }
+
   return (
     <>
       {onboarding.needed && (
@@ -2174,6 +2213,8 @@ export default function App() {
           <StatusBar
             cwd={current?.info?.cwd ?? null}
             status={status}
+            // 手机端离线时给出重连的出路：状态栏此刻必然在屏上，与状态显示同源。
+            onRepair={offline ? () => setRepairing(true) : undefined}
             usage={current?.session.usage ?? null}
             /*
              * 右侧详情栏（子 agent + Git Diff）的**常驻**入口：收起动作够不着的

@@ -1979,6 +1979,131 @@ describe("App iOS first-launch pairing", () => {
   });
 });
 
+describe("App mobile repair path", () => {
+  const IPHONE_UA =
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+  const RELAY = "wss://relay.test/ws?session=abc";
+
+  /** 冲掉在途的微任务/React 更新。 */
+  const settle = async () => {
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    }
+  };
+
+  /**
+   * 已配对但连不上的手机。
+   *
+   * 必须悬停 initialize：否则 mock 的握手会立即成功、status 变成 connected，
+   * `offline` 为 false，状态栏入口本就不该出现——用例会因错误的原因失败。
+   */
+  const pairedPhone = () => {
+    state.platformUa = IPHONE_UA;
+    localStorage.setItem("yi-agent.remote", JSON.stringify({ url: RELAY, token: "yia_tok" }));
+    state.dataSources["initialize"] = () => new Promise(() => {});
+  };
+
+  // 本套用 `vi.advanceTimersByTimeAsync` 推进 React 更新，必须有假定时器。
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows a re-pair entry in the status bar while offline", async () => {
+    pairedPhone();
+    render(<App />);
+    await settle();
+    // 假定时器下 findBy* 的轮询不会自行推进，故 settle 后直接断言。
+    expect(screen.getByRole("button", { name: "重新配对" })).toBeTruthy();
+  });
+
+  it("opens the pairing screen prefilled with the persisted url", async () => {
+    pairedPhone();
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "重新配对" }));
+
+    expect(screen.getByRole("form", { name: "配对" })).toBeTruthy();
+    expect((screen.getByLabelText("服务器地址") as HTMLInputElement).value).toBe(RELAY);
+  });
+
+  it("returns to the main view without clearing the persisted config", async () => {
+    pairedPhone();
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "重新配对" }));
+    fireEvent.click(screen.getByRole("button", { name: "返回" }));
+
+    expect(screen.queryByRole("form", { name: "配对" })).toBeNull();
+    // 非破坏性：返回不清配置（默认清零发生在配对成功那一刻，不是这里）。
+    expect(localStorage.getItem("yi-agent.remote")).not.toBeNull();
+    expect(clients.length).toBe(1);
+  });
+
+  it("rebuilds the connection after a successful re-pair", async () => {
+    pairedPhone();
+    const opened: string[] = [];
+    class FakeSocket {
+      onopen: (() => void) | null = null;
+      onmessage: ((e: { data: unknown }) => void) | null = null;
+      onclose: ((e: { code: number }) => void) | null = null;
+      onerror: unknown = null;
+      constructor(readonly url: string) {
+        opened.push(url);
+        queueMicrotask(() => this.onopen?.());
+      }
+      send(raw: string) {
+        const frame = JSON.parse(raw) as { id?: number };
+        if (frame.id === 1) {
+          queueMicrotask(() =>
+            this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id: 1, result: {} }) }),
+          );
+        } else if (frame.id === 2) {
+          queueMicrotask(() =>
+            this.onmessage?.({
+              data: JSON.stringify({
+                jsonrpc: "2.0",
+                id: 2,
+                result: { device_id: "dev-2", token: "yia_new", scope: "control" },
+              }),
+            }),
+          );
+        }
+      }
+      close() {}
+    }
+    vi.stubGlobal("WebSocket", FakeSocket);
+    try {
+      render(<App />);
+      await settle();
+      expect(clients.length).toBe(1);
+      fireEvent.click(screen.getByRole("button", { name: "重新配对" }));
+      fireEvent.change(screen.getByLabelText("配对码"), { target: { value: "ABCD-EFGH" } });
+      fireEvent.click(screen.getByRole("button", { name: "配对" }));
+
+      // 重配成功后必须真的重建连接：inited 守卫已放开，新 client 重新握手。
+      // 假定时器下 waitFor 不推进时间，故用 settle 冲掉微任务后再断言。
+      await settle();
+      expect(clients.length).toBe(2);
+      expect(clients[1].requests.some((r) => r.method === "initialize")).toBe(true);
+      expect(opened[0]).toBe(RELAY);
+      expect(JSON.parse(localStorage.getItem("yi-agent.remote")!).token).toBe("yia_new");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("never offers the entry on the desktop", async () => {
+    render(<App />);
+    await settle();
+    expect(screen.queryByRole("button", { name: "重新配对" })).toBeNull();
+  });
+});
+
 describe("deleting a thread that still runs subagents", () => {
   const deleteButton = () => screen.getByRole("button", { name: /delete thread/i });
 
