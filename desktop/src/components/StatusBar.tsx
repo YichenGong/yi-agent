@@ -7,6 +7,7 @@ export function StatusBar({
   status,
   usage,
   actions,
+  onRepair,
 }: {
   cwd: string | null;
   status: string;
@@ -16,6 +17,14 @@ export function StatusBar({
    * 入口若跟着面板一起收起，就再也没有东西能把它打开。
    */
   actions?: ReactNode;
+  /**
+   * 手机端「重新配对」入口；**只在传入时渲染**。
+   *
+   * 由宿主按连接状态决定是否传入（远程客户端且未连接）。做成状态栏自己的语义
+   * 而不是塞进通用的 `actions`：它的可见性由连接状态决定，与状态栏的职责同源
+   * ——状态显示在哪，从该状态脱困的入口就在哪。
+   */
+  onRepair?: () => void;
 }) {
   const connected = status === "connected";
   const [showUsage, setShowUsage] = useState(false);
@@ -38,6 +47,15 @@ export function StatusBar({
             onClick={() => setShowUsage((v) => !v)}
           >
             {usage.input} in / {usage.output} out
+          </button>
+        )}
+        {onRepair && (
+          <button
+            type="button"
+            onClick={onRepair}
+            className="rounded border border-line-strong px-2 py-0.5 text-fg-muted hover:text-fg"
+          >
+            重新配对
           </button>
         )}
         {actions}

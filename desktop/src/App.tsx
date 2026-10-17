@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
+import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
 import { useIsMobile } from "./lib/useIsMobile";
 import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
@@ -141,6 +142,16 @@ async function restartSidecar() {
     // 见上：失败不阻塞。
   }
 }
+
+/** 读不到全局 storage 时的空实现（隐私模式等），与 `lib/platform.ts` 同形。 */
+const emptyStorageLike: StorageLike = {
+  getItem: () => null,
+  setItem: () => {},
+  removeItem: () => {},
+};
+
+/** 凭据被服务端明确拒绝（直连 4401）时的文案；与「配对码无效」区分开。 */
+export const REPAIR_REMOVED_TEXT = "此设备已被桌面移除，请重新配对";
 
 export default function App() {
   // Per-thread state lives in a mutable store; the `force` tick is how React
@@ -344,6 +355,29 @@ export default function App() {
   // 配对落盘后加一，下面那个 effect 才第一次真正建客户端（此前被
   // `needsPairing` 挡住），这一次读到的是 ws 配置。
   const [pairingVersion, setPairingVersion] = useState(0);
+  /**
+   * 手机端「重新配对」：true 时全屏呈现配对界面。
+   *
+   * **非破坏性**——不动已存配置，提交成功才覆盖；点「返回」即回原离线态。
+   * 首启配对走 `needsPairing`，与此独立（首启优先）。
+   */
+  const [repairing, setRepairing] = useState(false);
+  /** 自动进入重配时展示的原因（如凭据被移除）；手动进入或返回后清空。 */
+  const [repairNotice, setRepairNotice] = useState<string | null>(null);
+  /**
+   * effect 闭包读不到最新 state，故用 ref 判断「是否已在重配界面」，避免重复进入。
+   * 每次渲染同步一次。
+   */
+  const repairingRef = useRef(false);
+  repairingRef.current = repairing;
+  /**
+   * 用户是否已对"此设备已被移除"这一自动提示做过回答（点了返回）。
+   *
+   * 没有它，「返回」形同虚设：后台退避重连每轮都会再撞上 4401，于是每轮都把
+   * 用户弹回去——用户的决定被反复撤销。握手成功（真的连上了）时重新武装，
+   * 因为那之后凭据若再失效就是一件新事，该再提示一次。
+   */
+  const repairDismissedRef = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // 「本机侧车要连的中继地址」：首屏由 ui/settings/read 回填，用户在设置页改后
   // 经 Tauri `set_relay_url` 落盘并触发侧车重启。
@@ -1379,6 +1413,22 @@ export default function App() {
       });
       client.onStatus((s) => {
         setStatus(s.state);
+        // 直连时服务端用 4401 明确拒绝这个 token（ws.rs 的 close_unauthorized）：
+        // 重试一万次也不会有别的结局，直接把用户送上重配界面。中继路径不会出现
+        // 4401（中继不校验手机 token），故该分支只在直连生效。
+        //
+        // 守卫只用 ref 判断"是否已在重配界面"：`setStatus` 刚把状态置为 exited，
+        // 用 status 判断此刻恒真；闭包里的 status 也是旧快照。普通断线（1006 等）
+        // 不在此分支，继续走既有退避重连。
+        if (
+          isRemoteClient() &&
+          s.code === 4401 &&
+          !repairingRef.current &&
+          !repairDismissedRef.current
+        ) {
+          setRepairNotice(REPAIR_REMOVED_TEXT);
+          setRepairing(true);
+        }
         // sidecar 退出后宿主会自动重启它(bridge 的监管循环)。重连不能依赖用户
         // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
         // warm 缓存,免得切回旧对话时跳过 resume(新进程并不记得任何会话)。
@@ -1468,6 +1518,9 @@ export default function App() {
         // 握手走通才算真的连上:清零退避,下一次断开从 500ms 重新起算。
         attempt = 0;
         setStatus("connected");
+        // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
+        // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
+        repairDismissedRef.current = false;
         // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
         // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
         // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
@@ -1476,6 +1529,9 @@ export default function App() {
         const msg = formatError(e);
         setCurrentError(msg);
         setStatus(`error: ${msg}`);
+        // 握手失败同样是"没连上"：必须排队重试，否则会永久停在 error。
+        // （经中继时"电脑未连接"正是这条路径——见 rpc.ts 的无 id 错误帧。）
+        scheduleReconnect();
       }
     };
 
@@ -1942,6 +1998,37 @@ export default function App() {
     );
   }
 
+  // 已配对的手机点「重新配对」：同一个界面，多一条返回。非破坏性——提交成功
+  // 才覆盖配置，返回即回原离线态继续退避重连。
+  if (repairing) {
+    return (
+      <PairingScreen
+        // 预填当前已存地址（用户可改可重扫）；读不到时留空，不影响提交。
+        initialUrl={
+          storedRemoteConfig(
+            (globalThis.localStorage as StorageLike | undefined) ?? emptyStorageLike,
+          )?.url
+        }
+        notice={repairNotice ?? undefined}
+        onCancel={() => {
+          setRepairing(false);
+          setRepairNotice(null);
+          // 记住"用户已经答过"：退避重连再撞 4401 也不得把他弹回来。
+          repairDismissedRef.current = true;
+        }}
+        onPaired={() => {
+          // 已配对过时 `inited.current` 仍是 true，单靠版本号会被守卫挡掉；
+          // 必须先放开守卫，让旧 effect 走 cleanup、新 effect 真正建连。
+          inited.current = false;
+          setRepairing(false);
+          setRepairNotice(null);
+          setPairingVersion((v) => v + 1);
+        }}
+        redeem={defaultRedeem}
+      />
+    );
+  }
+
   return (
     <>
       {onboarding.needed && (
@@ -2171,6 +2258,16 @@ export default function App() {
           <StatusBar
             cwd={current?.info?.cwd ?? null}
             status={status}
+            // 手机端离线时给出重连的出路：状态栏此刻必然在屏上，与状态显示同源。
+            onRepair={
+              offline
+                ? () => {
+                    // 手动进入不带自动路径的原因文案（那是另一条路的事）。
+                    setRepairNotice(null);
+                    setRepairing(true);
+                  }
+                : undefined
+            }
             usage={current?.session.usage ?? null}
             /*
              * 右侧详情栏（子 agent + Git Diff）的**常驻**入口：收起动作够不着的

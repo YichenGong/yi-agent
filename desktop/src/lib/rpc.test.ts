@@ -7,6 +7,8 @@ function fakeTransport(opts: { failSend?: boolean } = {}) {
   // so a test can prove that a client which forgets to dispose keeps receiving
   // frames alongside its replacement.
   const messageListeners = new Set<(m: unknown) => void>();
+  // 状态订阅者集合，与消息订阅同形：让用例能手动触发 transport 的状态。
+  const statusListeners = new Set<(s: { state: string; code?: number | null }) => void>();
   const transport: Transport = {
     send: async (m) => {
       if (opts.failSend) throw new Error("sidecar down");
@@ -20,7 +22,12 @@ function fakeTransport(opts: { failSend?: boolean } = {}) {
       };
     },
     onRequest: () => () => {},
-    onStatus: () => () => {},
+    onStatus: (cb) => {
+      statusListeners.add(cb);
+      return () => {
+        statusListeners.delete(cb);
+      };
+    },
     dispose: () => {},
   };
   return {
@@ -28,6 +35,9 @@ function fakeTransport(opts: { failSend?: boolean } = {}) {
     sent,
     emit: (m: unknown) => {
       for (const cb of [...messageListeners]) cb(m);
+    },
+    emitStatus: (s: { state: string; code?: number | null }) => {
+      for (const cb of [...statusListeners]) cb(s);
     },
     messageListenerCount: () => messageListeners.size,
   };
@@ -238,6 +248,62 @@ describe("RpcClient", () => {
     const p = client.request("thread/listAll", {});
     emit({ jsonrpc: "2.0", id: 1, error: { code: -32010, message: "server not initialized" } });
     await expect(p).rejects.toMatchObject({ code: -32010 });
+  });
+
+  it("treats an id-less error frame as a session-level failure", async () => {
+    // 中继的 no-agent 错误帧：有 error、无 id、无 method。
+    const { transport, emit } = fakeTransport();
+    const client = new RpcClient(transport);
+    const statuses: Array<{ state: string; code?: number | null }> = [];
+    client.onStatus((s) => statuses.push(s));
+
+    // 一条在途请求（就是 handshake 里的 initialize）：必须被 reject 而不是悬挂。
+    const inflight = client.request("initialize", {});
+    emit({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "no computer connected for this session" },
+    });
+
+    await expect(inflight).rejects.toMatchObject({ code: -32000 });
+    expect(statuses).toEqual([{ state: "exited", code: -32000 }]);
+  });
+
+  it("reports the synthesized exit at most once", async () => {
+    const { transport, emit } = fakeTransport();
+    const client = new RpcClient(transport);
+    const statuses: Array<{ state: string; code?: number | null }> = [];
+    client.onStatus((s) => statuses.push(s));
+
+    const frame = {
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "no computer connected for this session" },
+    };
+    emit(frame);
+    emit(frame);
+    expect(statuses).toHaveLength(1);
+  });
+
+  it("leaves an id-carrying error response alone (no synthesized exit)", async () => {
+    const { transport, emit } = fakeTransport();
+    const client = new RpcClient(transport);
+    const statuses: Array<{ state: string; code?: number | null }> = [];
+    client.onStatus((s) => statuses.push(s));
+
+    const p = client.request("nope", {});
+    emit({ jsonrpc: "2.0", id: 1, error: { code: -32000, message: "forced" } });
+    await expect(p).rejects.toMatchObject({ code: -32000 });
+    // 带 id 的是普通响应拒绝：不产生合成 exited。
+    expect(statuses).toEqual([]);
+  });
+
+  it("still forwards the transport's own status to subscribers", () => {
+    // 既有语义不得回归：transport 的状态照常扇出，且只扇出一次。
+    const { transport, emitStatus } = fakeTransport();
+    const statuses: Array<{ state: string; code?: number | null }> = [];
+    const client = new RpcClient(transport);
+    client.onStatus((s) => statuses.push(s));
+    emitStatus({ state: "exited", code: 1006 });
+    expect(statuses).toEqual([{ state: "exited", code: 1006 }]);
   });
 
 });

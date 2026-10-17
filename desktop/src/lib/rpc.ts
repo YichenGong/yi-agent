@@ -70,6 +70,20 @@ export class RpcClient {
   private unsubscribeTransport: () => void;
   private disposed = false;
   /**
+   * 自身合成的状态订阅者。中继的 no-agent 错误帧没有 `id`，既不是响应也不是通知
+   * （见 `onMessage`），却意味着「这条会话已经废了」——必须有一个出口把它告诉
+   * App，否则 handshake 会永久悬挂。与 transport 的状态共用一个 `onStatus` 入口。
+   */
+  private statusHandlers = new Set<(status: { state: string; code?: number | null }) => void>();
+  /**
+   * transport 状态转发订阅；懒建（首个 `onStatus` 订阅者）且**只建一次**。
+   *
+   * 逐个订阅者各建一个转发器会把同一条状态投递 N 遍，故必须单例。
+   */
+  private unsubscribeTransportStatus: (() => void) | null = null;
+  /** 合成 exit 只报一次：中继可能连发同类帧，重复上报只会让 App 反复重建客户端。 */
+  private synthesizedExit = false;
+  /**
    * The in-flight recovery handshake, at most one at a time. Several requests
    * can be refused with `-32010` in the same tick (a session switch fires
    * `thread/subscribe` and `thread/resume` together); without this they would
@@ -103,7 +117,10 @@ export class RpcClient {
     if (this.disposed) return;
     this.disposed = true;
     this.unsubscribeTransport();
+    this.unsubscribeTransportStatus?.();
+    this.unsubscribeTransportStatus = null;
     this.notificationHandlers.clear();
+    this.statusHandlers.clear();
     for (const [, pending] of this.pending) {
       pending.reject(new Error("rpc client disposed"));
     }
@@ -122,7 +139,22 @@ export class RpcClient {
   }
 
   onStatus(handler: (status: { state: string; code?: number | null }) => void): () => void {
-    return this.transport.onStatus(handler);
+    this.statusHandlers.add(handler);
+    // transport 的转发器只在首个订阅者时建立：逐个订阅者各建一个会把同一条
+    // 状态投递 N 遍。
+    this.ensureTransportStatusSubscription();
+    return () => {
+      this.statusHandlers.delete(handler);
+    };
+  }
+
+  /** 建立（一次）transport → 本地订阅者的状态转发。 */
+  private ensureTransportStatusSubscription(): void {
+    if (this.unsubscribeTransportStatus) return;
+    this.unsubscribeTransportStatus = this.transport.onStatus((status) => {
+      if (this.disposed) return;
+      for (const h of this.statusHandlers) h(status);
+    });
   }
 
   async request<T = unknown>(method: string, params: unknown): Promise<T> {
@@ -205,6 +237,26 @@ export class RpcClient {
       result?: unknown;
       error?: RpcError;
     };
+    // 中继的 no-agent 错误帧：有 `error`、无 `id`、无 `method`。
+    //
+    // 按**帧结构**判定而非错误码：中继不解析 JSON-RPC 语义（relay/src/lib.rs），
+    // 它发出的错误帧天然没有 `id`；而 app-server 的业务错误码段
+    // （-32001~-32025、-32600+）不含 -32000，且一律带 `id`——按 id 判不会误伤。
+    //
+    // 不接住它，下面的两个分支都不匹配，帧被静默丢弃：`initialize` 永久悬挂，
+    // 状态无声地停在离线态。
+    if (msg.id === undefined && msg.method === undefined && msg.error !== undefined) {
+      // 在途请求全部失败：`initialize` 因此不再悬挂。
+      const error = msg.error;
+      for (const [, pending] of this.pending) pending.reject(error);
+      this.pending.clear();
+      this.buffered.clear();
+      if (!this.synthesizedExit) {
+        this.synthesizedExit = true;
+        for (const h of this.statusHandlers) h({ state: "exited", code: error.code });
+      }
+      return;
+    }
     if (msg.id !== undefined && msg.method === undefined) {
       // Response.
       const pending = this.pending.get(msg.id);

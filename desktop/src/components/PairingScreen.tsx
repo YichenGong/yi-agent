@@ -59,6 +59,20 @@ export interface PairingScreenProps {
   redeem?: (url: string, code: string, deviceName: string) => Promise<PairedDevice>;
   /** 凭据落盘后回调——宿主据此把 transport 重算成 ws。 */
   onPaired?: () => void;
+  /**
+   * 重配场景的「返回」；**只在传入时渲染**。
+   *
+   * 首启配对无处可去（iOS 上没有 Tauri IPC），故那时不传、不渲染——首启路径
+   * 的 DOM 因此逐字节不变。已配对的手机进这里则是"再看一眼凭据"，退出该是自由的。
+   */
+  onCancel?: () => void;
+  /**
+   * 宿主给的一句提示（如"此设备已被桌面移除"）；**只在传入时渲染**。
+   *
+   * 与组件内部的 `error` 分开：`error` 是本次提交失败的结果，`notice` 是"你为什么
+   * 会看到这个界面"。不传时 DOM 不变。
+   */
+  notice?: string;
   /** 是否显示「扫码」按钮；默认仅 iOS（远程构建）。 */
   enableScan?: boolean;
   /**
@@ -93,6 +107,8 @@ export function PairingScreen({
   storage,
   redeem,
   onPaired,
+  onCancel,
+  notice,
   enableScan,
   scan,
 }: PairingScreenProps) {
@@ -166,6 +182,12 @@ export function PairingScreen({
           在桌面端「远程访问」生成配对码，把中继地址和码填到这里。
         </p>
 
+        {notice !== undefined && (
+          <p role="status" className="mt-2 text-xs text-amber-400">
+            {notice}
+          </p>
+        )}
+
         <label className="mt-4 block text-xs text-fg-muted" htmlFor="pairing-url">
           服务器地址
           <input
@@ -221,6 +243,16 @@ export function PairingScreen({
         >
           {busy ? "配对中…" : "配对"}
         </button>
+
+        {onCancel && (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="mt-3 w-full rounded-md border border-line-strong px-3 py-2 text-sm text-fg-muted hover:text-fg"
+          >
+            返回
+          </button>
+        )}
 
         {canScan && (
           <button
