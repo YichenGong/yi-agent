@@ -7538,7 +7538,9 @@ where
             .lead_target
             .clone()
             .ok_or_else(|| anyhow::anyhow!("this launcher has no lead target"))?;
-        let built = (self.build_agent)(
+        // `mut` 只为下方冷启动的历史恢复:「先建空会话、再就地填入历史」是
+        // `apply_session` 的形式,它保住的正是 session 的 `Arc`(见那里的说明)。
+        let mut built = (self.build_agent)(
             None,
             Path::new(&target.cwd),
             crate::thread_store::ThreadMode::Normal,
@@ -7572,6 +7574,40 @@ where
                 Ok(()) => Ok(target.thread_id),
                 Err(_) => Err(anyhow::anyhow!("lead driver is gone")),
             };
+        }
+
+        // 冷启动:该组长的 driver 不在本进程(进程重启,或它的 driver 因
+        // `prompt_rx` 关闭而收尾)。`build_agent` 此刻建出的是**空会话**,而磁盘上的
+        // `.jsonl` 记着此前投递过的每一轮。不填回去,同一条 thread 就会有两种语义:
+        // warm 路径有记忆、cold 路径失忆。故这里镜像 `thread/resume` 的恢复三件事:
+        // 载入 → `replace_messages` → 恢复上次用量(使 auto-compact 在恢复后的首轮
+        // 即生效)。
+        //
+        // 组长的 meta 刚由 `ensure_lead_meta` 建、尚无 `.jsonl` 时 `load` 回 `None`:
+        // 维持现状(空会话),与一次全新 `thread/start` 完全一致。
+        match crate::thread_store::ThreadStore::new(Path::new(&target.cwd)).load(&target.thread_id)
+        {
+            Ok(Some(loaded)) => {
+                let mut restored = yi_agent_core::Session::new();
+                if let Some(usage) = &loaded.usage {
+                    restored.set_last_input_tokens(Some(usage.input_tokens));
+                }
+                restored.replace_messages(loaded.messages);
+                // `apply_session` 而非 `with_session`:前者就地替换内容、保住 session
+                // 的 `Arc`,与 `thread/resume` 的重建路径走同一个助手,因此委派工具
+                // 持有的 `CallerContext` 不会在恢复后指向一个被丢弃的旧会话。
+                apply_session(&mut built.agent, Some(restored));
+            }
+            Ok(None) => {}
+            // 按 `thread/resume` 的口径:读不出来就明确失败,绝不静默地起一个
+            // 失忆的组长。(id 由 `ensure_lead_meta` 铸造,恒合法;`load` 的读错误
+            // 内部已吞成空历史,故此处实际不可达。)
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "could not load the lead's history for {}: {e}",
+                    target.thread_id
+                ));
+            }
         }
 
         // 冷启动:走与 `launch_inner` 相同的无帧内核(登记会话 + spawn driver)。
@@ -17517,6 +17553,174 @@ pub(crate) mod tests {
         );
 
         h.shutdown().await;
+    }
+
+    /// 用 `RecordingProvider` 建 agent,并把每次对话调用看到的 message 数记进 `seen`。
+    /// 与 `build_test_agent_with_provider` 同一夹具,只是把 provider 换成记账的那款。
+    fn recording_agent_factory(
+        seen: Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> impl Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent>
+    + Send
+    + Sync
+    + 'static {
+        move |session, cwd, mode| {
+            let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(RecordingProvider {
+                seen: Arc::clone(&seen),
+            });
+            build_test_agent_with_provider(provider, session, cwd, mode)
+        }
+    }
+
+    /// 等组长这一轮**完全收尾**:历史已 append 进主 `.jsonl`、`load` 能看到全部给定
+    /// 文本、且崩溃残留 checkpoint 已清除。
+    ///
+    /// 三个条件缺一不可:只看 append 会在 driver 尚未清 checkpoint 时放行,而
+    /// `load` 会把未收尾的 partial 合流进来,让下一条 harness 看到的状态与本测试
+    /// 断言的状态不同源。
+    async fn wait_for_lead_turn_to_settle(workdir: &Path, thread_id: &str, texts: &[&str]) {
+        let log = workdir
+            .join(".yi-agent/threads")
+            .join(format!("{thread_id}.jsonl"));
+        let partial = workdir
+            .join(".yi-agent/threads")
+            .join(format!("{thread_id}.partial.json"));
+        let deadline = std::time::Instant::now() + EVENT_WAIT;
+        loop {
+            let appended = std::fs::read_to_string(&log)
+                .map(|line| texts.iter().all(|t| line.contains(t)))
+                .unwrap_or(false);
+            let loaded = crate::thread_store::ThreadStore::new(workdir)
+                .load(thread_id)
+                .ok()
+                .flatten()
+                .is_some_and(|loaded| transcript_contains(&loaded.messages, texts));
+            if appended && loaded && !partial.exists() {
+                return;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "the lead turn never settled for {texts:?} \
+                     (appended={appended}, loaded={loaded}, partial={})",
+                    partial.exists()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 这些文本是否都能在给定的消息列表里找到。
+    fn transcript_contains(messages: &[yi_agent_core::Message], texts: &[&str]) -> bool {
+        texts.iter().all(|want| {
+            messages.iter().any(|m| {
+                m.content.iter().any(|b| match b {
+                    yi_agent_core::ContentBlock::Text(text) => text.contains(want),
+                    _ => false,
+                })
+            })
+        })
+    }
+
+    /// 冷启动投递必须带回组长既有对话的历史。
+    ///
+    /// 「冷启动」= 组长 thread 不在本进程的 `threads` 里(进程重启,或它的 driver
+    /// 已随 `prompt_rx` 关闭而收尾),而磁盘上的 `.jsonl` 仍记着此前投递过的每一轮。
+    /// 修复前该路径拿**空会话**拉起组长:同一条 thread 经 `thread/resume` 打开有
+    /// 记忆、经投递冷启却失忆,两条入口语义分裂(规格决策 9:组长就是一个 thread,
+    /// 该有普通 thread 的对话连续性)。
+    ///
+    /// 用两个共享同一 workdir 的 harness 复刻重启:第一个里真的投递一轮(于是
+    /// `.jsonl` 由生产路径写出),关掉它(driver 随之消失),第二个用同一目录再投
+    /// 一轮,断言模型这轮看到的是「历史 + 本次」而非只有本次。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cold_lead_delivery_restores_the_persisted_history() {
+        const FIRST: &str = "需要你裁决 X";
+        const SECOND: &str = "还有一件事要你裁决 Y";
+        let dir = tempfile::TempDir::new().unwrap();
+        let workdir = dir.path().to_path_buf();
+
+        // ---- 第一次投递:真走生产路径,让 `.jsonl` 得到一轮由投递产生的历史 ----
+        let seen_1 = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let mut h1 = {
+            let mut cfg = test_config();
+            cfg.workdir = workdir.clone();
+            Harness::with_config(
+                cfg,
+                recording_agent_factory(Arc::clone(&seen_1)),
+                PERMISSION_TIMEOUT,
+            )
+        };
+        h1.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h1, 1).await;
+        let lead = rpc(&mut h1, 2, "thread/lead", json!({})).await;
+        let lead_id = lead["result"]["thread_id"].as_str().unwrap().to_string();
+        Harness::deliver_lead_message_for_test(&h1, &workdir, "thread-sender-1", FIRST);
+        wait_for_lead_turn_to_settle(&workdir, &lead_id, &[FIRST]).await;
+        // 新建的组长没有历史:这一轮只带本次投递这一条 user 消息。
+        assert_eq!(
+            *seen_1.lock().unwrap(),
+            vec![1],
+            "a brand-new lead has nothing to restore: the first turn must carry only its own message"
+        );
+        // 关掉:serve 主循环结束 → `threads` 被 drop → `prompt_tx` 关闭 →
+        // 组长的 driver 读到 `prompt_rx` 关闭后收尾退出。这正是「重启后该 thread
+        // 不在内存」的复刻,也是本 finding 描述的冷启动入口。
+        h1.shutdown().await;
+
+        // ---- 第二次投递:同一 workdir,历史在盘上,而内存里没有该 thread ----
+        let seen_2 = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let mut h2 = {
+            let mut cfg = test_config();
+            cfg.workdir = workdir.clone();
+            Harness::with_config(
+                cfg,
+                recording_agent_factory(Arc::clone(&seen_2)),
+                PERMISSION_TIMEOUT,
+            )
+        };
+        h2.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h2, 1).await;
+        let again = rpc(&mut h2, 2, "thread/lead", json!({})).await;
+        assert_eq!(
+            again["result"]["thread_id"].as_str().unwrap(),
+            lead_id,
+            "one project keeps one lead thread across a restart"
+        );
+        Harness::deliver_lead_message_for_test(&h2, &workdir, "thread-sender-2", SECOND);
+        // 等**本次**投递收尾(历史是否被恢复不在本等待里判:那是下面的断言,
+        // 让失败信息直指「历史丢了」而非一句超时)。
+        wait_for_lead_turn_to_settle(&workdir, &lead_id, &[SECOND]).await;
+
+        // 本轮落盘的消息 = 恢复后的完整会话:先前的提问与回复都在,再加本次。
+        // 修复前这里是 [user(SECOND), assistant],`FIRST` 已丢——断言会失败。
+        let loaded = crate::thread_store::ThreadStore::new(&workdir)
+            .load(&lead_id)
+            .unwrap()
+            .expect("the lead thread must be persisted");
+        assert!(
+            transcript_contains(&loaded.messages, &[FIRST]),
+            "the cold-start turn must persist the restored history, not just this \
+             message: {:?}",
+            loaded.messages
+        );
+        assert!(
+            transcript_contains(&loaded.messages, &[SECOND]),
+            "the cold-start turn must also persist its own message: {:?}",
+            loaded.messages
+        );
+        // 模型这一轮看到的是「历史(2)+ 本次(1)」,不是只有本次(1)。
+        assert_eq!(
+            *seen_2.lock().unwrap(),
+            vec![3],
+            "the cold-start turn must send the restored history to the model"
+        );
+
+        h2.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
