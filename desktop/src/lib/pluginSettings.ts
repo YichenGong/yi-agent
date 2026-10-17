@@ -1,5 +1,8 @@
+import { RPC } from "./routes";
+import type { RpcCall } from "./rpcCall";
+
 /** 桌面与宿主通用插件通道之间的接缝。形状与 `BoardRpc` 一致。 */
-export type PluginRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
+export type PluginRpc = RpcCall;
 
 /** 看板插件名。宿主按名字转发，壳子不含看板语义。 */
 export const KANBAN_PLUGIN = "superpowers-kanban";
@@ -150,7 +153,7 @@ function scopeParams(project?: string): Record<string, string> {
 
 /** 列出已装插件。`project` 指定枚举哪个项目的清单；缺省用宿主 workdir。 */
 export async function listPlugins(rpc: PluginRpc, project?: string): Promise<PluginSummary[]> {
-  const result = await rpc<{ plugins?: Array<Record<string, unknown>> }>("plugins/list", {
+  const result = await rpc<{ plugins?: Array<Record<string, unknown>> }>(RPC.pluginsList, {
     ...scopeParams(project),
   });
   const rows = Array.isArray(result?.plugins) ? result.plugins : [];
