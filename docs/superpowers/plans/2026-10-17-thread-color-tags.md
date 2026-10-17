@@ -201,6 +201,8 @@ git commit -m "feat(store): thread meta 增加颜色标签字段与 set_tag"
 
 **注意语义：** `load_tag_names` 返回**磁盘上实际的覆盖项**（可能只有 1 个键，也可能空），**不**补齐默认名——默认名只在前端定义（Global Constraints）。
 
+**注意日志契约：** 读侧必须与同文件 `load()` 的既有契约一致——**缺文件是正常情形不打日志**；文件存在却读不出来 / 解析不了则 `tracing::warn!`（两类措辞不同）。理由是 `load()` 注释里写下的同一条：否则「我改的标签名总是复位」在日志里无从诊断。**不要**用裸 `.ok()` 链静默吞掉这两类错误（`load_watchman_enabled` / `load_relay_url` 是早期写法，本任务不跟）。值的形状不是对象（如 `{"tag_names": "not-an-object"}`）仍是**静默**当空映射，不告警。
+
 - [ ] **Step 1: 写失败的测试**
 
 在 `settings_store.rs` 测试模块内加入：
@@ -263,6 +265,73 @@ git commit -m "feat(store): thread meta 增加颜色标签字段与 set_tag"
     }
 ```
 
+另外在 `warning_tests` 模块内补齐标签名的日志契约测试（照该模块既有的三个 theme 测试写，同一个 `capture_logs` 辅助）：
+
+```rust
+    /// 缺文件是正常的首次运行,不能告警。
+    #[test]
+    fn a_missing_tag_names_file_is_not_logged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_names, logged) = capture_logs(|| load_tag_names(dir.path()));
+        assert!(
+            logged.is_empty(),
+            "a genuinely missing file must not warn: {logged}"
+        );
+    }
+
+    /// 存在却读不出来:必须 warn 且指明路径,与「解析失败」措辞可区分。
+    #[test]
+    fn an_unreadable_tag_names_file_is_logged_and_falls_back_to_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let prefs = dir.path().join(".yi-agent").join("preferences.json");
+        std::fs::create_dir_all(&prefs).unwrap(); // 目录 → read_to_string 失败且非 NotFound
+        let (names, logged) = capture_logs(|| load_tag_names(dir.path()));
+        assert!(names.is_empty());
+        assert!(logged.contains("WARN"), "must be a warning: {logged}");
+        assert!(
+            logged.contains("preferences.json"),
+            "must name the file: {logged}"
+        );
+        assert!(
+            logged.contains("could not read"),
+            "must distinguish the read failure: {logged}"
+        );
+        assert!(
+            !logged.contains("invalid"),
+            "a read failure is not a parse failure: {logged}"
+        );
+    }
+
+    /// 存在但损坏(非法 JSON):必须 warn 且与「读失败」措辞可区分。
+    #[test]
+    fn a_corrupt_tag_names_file_is_logged_and_falls_back_to_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(preferences_path(dir.path()), "not json at all").unwrap();
+        let (names, logged) = capture_logs(|| load_tag_names(dir.path()));
+        assert!(names.is_empty());
+        assert!(logged.contains("WARN"), "must be a warning: {logged}");
+        assert!(
+            logged.contains("preferences.json"),
+            "must name the file: {logged}"
+        );
+        assert!(
+            logged.contains("invalid"),
+            "must distinguish the parse failure: {logged}"
+        );
+        assert!(
+            !logged.contains("could not read"),
+            "a parse failure is not a read failure: {logged}"
+        );
+    }
+```
+
+- [ ] **Step 1b: 确认既有 warning 契约测试仍在**
+
+Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib -- settings_store::warning_tests`
+
+Expected: PASS（主题侧 4 个测试不受影响）。
+
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib -- settings_store::tests::load_tag_names settings_store::tests::save_tag_names`
@@ -283,24 +352,54 @@ pub const TAG_NAMES_KEY: &str = "tag_names";
 /// 在此补齐 6 个默认名：默认名由前端 `threadTags.ts` 唯一持有，后端再定义一套就会
 /// 变成两份必须手工保持一致的默认名。
 ///
-/// 缺文件 / 坏文件 / 值的形状不是对象一律当空映射——坏偏好绝不阻断 UI。
+/// 与 [`load`] 同一日志约定：缺文件是正常情形，不打日志；文件存在却读不出来或解析
+/// 不了则 `tracing::warn!`（两类措辞不同），否则「我改的标签名总是复位」在日志里
+/// 无从诊断。值的形状不是对象（`{"tag_names": "..."}`）静默当空映射——坏偏好绝不
+/// 阻断 UI。
 pub fn load_tag_names(workdir: &Path) -> std::collections::BTreeMap<String, String> {
     let path = preferences_path(workdir);
-    std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.get(TAG_NAMES_KEY).and_then(|v| v.as_object()).cloned())
-        .map(|object| {
-            object
-                .into_iter()
-                .filter_map(|(key, value)| value.as_str().map(|s| (key, s.to_string())))
-                .collect()
-        })
-        .unwrap_or_default()
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        // 缺文件是首次运行的正常情形,不是故障,不打日志。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return std::collections::BTreeMap::new()
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "could not read the tag names preference; using the defaults"
+            );
+            return std::collections::BTreeMap::new();
+        }
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => value
+            .get(TAG_NAMES_KEY)
+            .and_then(|v| v.as_object())
+            .map(|object| {
+                object
+                    .iter()
+                    .filter_map(|(key, value)| value.as_str().map(|s| (key.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "invalid tag names preference; using the defaults"
+            );
+            std::collections::BTreeMap::new()
+        }
+    }
 }
 
 /// 合并写入颜色标签显示名：只覆盖 `updates` 提到的键，保留既有的其它标签键与
 /// 同文件的无关顶层键（theme / relay_url / …）。
+///
+/// [`read_write_key`] 只写单个顶层键，故「按键合并」在它之上实现：先读出既有覆盖
+/// 项、并入 `updates`，再把整个对象作为 `tag_names` 的值原子落盘。
 pub fn save_tag_names(
     workdir: &Path,
     updates: &std::collections::BTreeMap<String, String>,

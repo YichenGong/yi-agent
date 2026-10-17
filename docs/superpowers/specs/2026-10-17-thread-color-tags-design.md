@@ -368,7 +368,7 @@ query），由 `ThreadSidebar` 从 App 传入。
 | 旧服务端（无 tag 字段） | 前端 `ThreadSummary.tag` 为 `undefined` → 按无标签渲染 |
 | 旧客户端收到 `tag` 字段 | 忽略（结构体无 `deny_unknown_fields`），不影响 |
 | meta 里 `tag` 是未知 id | 不渲染色点；搜索不并入；不报错、不崩 |
-| `preferences.json` 里 `tag_names` 是坏 JSON | `load_tag_names` 返回空映射 → 前端全用默认名（既有 `settings_store` 的容错约定） |
+| `preferences.json` 里 `tag_names` 是坏 JSON | `load_tag_names` `tracing::warn!` 后返回空映射 → 前端全用默认名（与同文件 `load()` 的日志契约一致，便于诊断「标签名总是复位」） |
 | `tag_names` 某键值超长 / 空串 | `ui/settings/write` 拒绝，`-32602`，磁盘不变 |
 | 会话被删除 | 其 tag 随 meta 文件一起消失，无残留 |
 | 同一会话两端同时改 | 后到的写赢（读-改-写锁串行），两端最终由各自重拉 / 通知收敛到同一值 |
@@ -397,6 +397,10 @@ query），由 `ThreadSidebar` 从 App 传入。
 7. `save_tag_names_merges_and_preserves_other_keys`——先存 `theme` + `relay_url`，
    再 `save_tag_names({red})`，断言三者都在；再 `save_tag_names({blue})`，断言
    `red` 与 `blue` 都在（合并而非替换）。
+7a. （`settings_store::warning_tests`）`a_missing_tag_names_file_is_not_logged` /
+   `an_unreadable_tag_names_file_is_logged_and_falls_back_to_empty` /
+   `a_corrupt_tag_names_file_is_logged_and_falls_back_to_empty`——读侧日志契约与
+   `load()` 对齐：缺文件静默，读失败 / 解析失败各打一条可区分的 `tracing::warn!`。
 
 `server.rs`（RPC 层，照 `set_pinned_*` 三个测试写）：
 
