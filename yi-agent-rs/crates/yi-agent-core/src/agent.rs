@@ -113,6 +113,21 @@ pub struct AgentConfig {
     /// Base delay for stall retry backoff. Attempt `n` (1-based) waits
     /// `base * 2^(n-1)`, capped at 30s. Defaults to 2s → 2s/4s/8s.
     pub think_stall_backoff_base: std::time::Duration,
+    /// Max automatic retries when the provider **rejects the request outright**
+    /// with a retryable error (HTTP 429/5xx, or a network failure before any
+    /// response). Planned retries emit `AgentEvent::ProviderRetry`, so the
+    /// backoff is never a silent freeze. `0` disables provider-error retries.
+    ///
+    /// Shares the retry budget with `think_stall_retry_limit`: a stall and a
+    /// timeout inside one turn consume the same budget, so the worst case stays
+    /// bounded at `think_stall_retry_limit` retries, not twice that.
+    ///
+    /// Deliberately *not* retried: `InvalidRequest` (deterministic — repeating it
+    /// fails identically; the reasoning-effort / MaaS-marker cases are handled
+    /// where they are fixable), `Auth` (a credential problem never resolves by
+    /// waiting), and `Stream` (a connection reset mid-stream is not an idle
+    /// transport hiccup).
+    pub provider_error_retry_limit: u16,
     /// Whether thinking blocks from *previous* turns are replayed verbatim in
     /// each provider request (and kept on disk). Default `true` = today's
     /// behaviour, so the request body is byte-identical.
@@ -140,6 +155,7 @@ impl Default for AgentConfig {
             think_idle_timeout: Some(std::time::Duration::from_secs(60)),
             think_stall_retry_limit: 3,
             think_stall_backoff_base: std::time::Duration::from_secs(2),
+            provider_error_retry_limit: 3,
             preserve_thinking: true,
         }
     }
@@ -387,7 +403,7 @@ pub enum AgentEvent {
     },
 }
 
-/// Why a THINK attempt was retried. Distinguishes the two transient failure
+/// Why a THINK attempt was retried. Distinguishes the transient failure
 /// modes so consumers can explain the delay accurately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RetryCause {
@@ -395,6 +411,14 @@ pub enum RetryCause {
     IdleStall,
     /// The provider request hit its total-deadline timeout.
     RequestTimeout,
+    /// The provider rejected the request outright because it was rate limited
+    /// (HTTP 429) — a capacity condition, not a defect in the request.
+    RateLimited,
+    /// The provider failed server-side (HTTP 5xx).
+    ServerError,
+    /// The request never reached a response (connection error / transport break
+    /// before any HTTP status).
+    NetworkError,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -795,6 +819,26 @@ fn stall_backoff_delay(base: std::time::Duration, attempt: u16) -> std::time::Du
     scaled.min(std::time::Duration::from_secs(30))
 }
 
+/// The retry cause for a provider error that is worth resending identically, or
+/// `None` when the failure is deterministic and resending cannot help.
+///
+/// Resending is justified only for conditions that describe *the moment* rather
+/// than *the request*: server capacity (429), a server-side fault (5xx), or a
+/// transport failure that never produced a response. Measured on the real
+/// gateway: a `param`-bearing 400 reproduced 10/10 times byte-identically, which
+/// is why `InvalidRequest` is excluded — retrying it would only triple the
+/// latency before the same failure.
+fn retryable_provider_error_cause(error: &ProviderError) -> Option<RetryCause> {
+    match error {
+        ProviderError::RateLimited => Some(RetryCause::RateLimited),
+        ProviderError::Server(_) => Some(RetryCause::ServerError),
+        ProviderError::Network(_) => Some(RetryCause::NetworkError),
+        ProviderError::Auth(_) | ProviderError::InvalidRequest(_) | ProviderError::Stream(_) => {
+            None
+        }
+    }
+}
+
 /// Sender half of the agent's event stream.
 ///
 /// Backed by an **unbounded** channel so streamed events are never dropped when
@@ -985,9 +1029,13 @@ async fn run_loop(
         let prefill_estimate = estimate_prefill_tokens(&req);
         let _ = tx.try_send(AgentEvent::EstimatedPrefill(prefill_estimate));
 
-        // Retry loop for a transiently failed THINK stream (idle stall or
-        // request deadline). Each attempt is a fresh provider turn (own lease);
-        // a failed attempt's partial content is not committed to the session.
+        // Retry loop for a transiently failed THINK attempt. Two families are
+        // retried: an idle stall / request deadline that ended the *stream*, and
+        // an outright provider rejection (429 / 5xx / network) that produced *no*
+        // stream at all. Both consume the same `stall_retries` budget, so the
+        // worst case inside one turn stays bounded by a single limit rather than
+        // two. Each attempt is a fresh provider turn (own lease); a failed
+        // attempt's partial content is never committed to the session.
         let mut stall_retries: u16 = 0;
         let (content, end, last_usage) = loop {
             let provider_turn_lease = match &provider_turn_gate {
@@ -1021,6 +1069,54 @@ async fn run_loop(
                     }
                     Err(e) => {
                         warn!(turn, error = %e, "provider call failed");
+                        // A retryable outright rejection (429/5xx/network) is
+                        // retried with backoff instead of killing the turn: these
+                        // are capacity/transport conditions, so resending the same
+                        // request is the standard remedy. Deterministic failures
+                        // (InvalidRequest, Auth) get no such treatment.
+                        if let Some(cause) = retryable_provider_error_cause(&e) {
+                            if stall_retries < config.provider_error_retry_limit {
+                                stall_retries += 1;
+                                let delay =
+                                    stall_backoff_delay(config.think_stall_backoff_base, stall_retries);
+                                tracing::warn!(
+                                    turn,
+                                    attempt = stall_retries,
+                                    max = config.provider_error_retry_limit,
+                                    delay_ms = delay.as_millis() as u64,
+                                    ?cause,
+                                    "provider rejected the request transiently; retrying after backoff"
+                                );
+                                // Surface it: a silent backoff looks like a hang.
+                                if tx
+                                    .send(AgentEvent::ProviderRetry {
+                                        attempt: stall_retries,
+                                        max: config.provider_error_retry_limit,
+                                        idle_secs: 0,
+                                        cause,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return; // Receiver dropped, stop the loop
+                                }
+                                // Release the turn lease before sleeping: a retry
+                                // backoff must not hold provider capacity.
+                                drop(provider_turn_lease);
+                                tokio::select! {
+                                    _ = tokio::time::sleep(delay) => {}
+                                    _ = cancel_token.cancelled() => {
+                                        info!(turn, "agent loop cancelled during retry backoff");
+                                        let keep = safe_cancel_truncate_len(&session.lock().unwrap());
+                                        session.lock().unwrap().truncate(keep);
+                                        flush_unconsumed(&tx, &inbox).await;
+                                        let _ = tx.send(AgentEvent::Cancelled).await;
+                                        return;
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         if tx
                             .send(AgentEvent::Error(AgentError::Provider(e)))
                             .await
@@ -2920,6 +3016,188 @@ mod tests {
         ));
     }
 
+    /// Fails the first `fail_for` calls with `errors[i]`, then succeeds. Used to
+    /// drive the outright-rejection retry path (429 / 5xx / network).
+    struct ErrOnceThenSucceedProvider {
+        calls: std::sync::Mutex<u32>,
+        errors: Vec<ProviderError>,
+    }
+
+    impl ErrOnceThenSucceedProvider {
+        fn new(errors: Vec<ProviderError>) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(0),
+                errors,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ErrOnceThenSucceedProvider {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            let index = (*calls - 1) as usize;
+            if let Some(error) = self.errors.get(index) {
+                return Err(error.clone());
+            }
+            Ok(futures::stream::iter(vec![
+                ProviderEvent::TextDelta("fresh".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ])
+            .boxed())
+        }
+    }
+
+    /// A rate-limited rejection is resent and succeeds; the retry is announced
+    /// with its own cause so the backoff is never a silent freeze.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_retries_a_rate_limited_rejection_and_completes() {
+        let provider = Arc::new(ErrOnceThenSucceedProvider::new(vec![
+            ProviderError::RateLimited,
+        ]));
+        let calls = provider.clone();
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        assert_eq!(
+            *calls.calls.lock().unwrap(),
+            2,
+            "one rejection + one success"
+        );
+        let causes: Vec<RetryCause> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ProviderRetry { cause, .. } => Some(*cause),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(causes, vec![RetryCause::RateLimited], "{events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                reason: DoneReason::EndTurn
+            })
+        ));
+    }
+
+    /// A server-side 5xx and a pre-response network break are both retried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_retries_server_error_and_network_breaks() {
+        let provider = Arc::new(ErrOnceThenSucceedProvider::new(vec![
+            ProviderError::Server("500: boom".into()),
+            ProviderError::Network("connection reset".into()),
+        ]));
+        let calls = provider.clone();
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        assert_eq!(*calls.calls.lock().unwrap(), 3);
+        let causes: Vec<RetryCause> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ProviderRetry { cause, .. } => Some(*cause),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            causes,
+            vec![RetryCause::ServerError, RetryCause::NetworkError],
+            "{events:?}"
+        );
+    }
+
+    /// An `InvalidRequest` is deterministic, so it must NOT be resent: repeating
+    /// it can only burn three backoffs before the identical failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deterministic_invalid_request_is_not_retried() {
+        let provider = Arc::new(ErrOnceThenSucceedProvider::new(vec![
+            ProviderError::InvalidRequest("400: bad".into()),
+        ]));
+        let calls = provider.clone();
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        assert_eq!(
+            *calls.calls.lock().unwrap(),
+            1,
+            "a deterministic rejection must fail on the first attempt"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ProviderRetry { .. })),
+            "no retry may be announced for a deterministic failure: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error(AgentError::Provider(_))))
+        );
+    }
+
+    /// An auth failure never resolves by waiting, so it stays terminal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auth_failure_is_not_retried() {
+        let provider = Arc::new(ErrOnceThenSucceedProvider::new(vec![ProviderError::Auth(
+            "401: nope".into(),
+        )]));
+        let calls = provider.clone();
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        assert_eq!(*calls.calls.lock().unwrap(), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ProviderRetry { .. }))
+        );
+    }
+
+    /// A rate limit that never clears exhausts the budget and then reports the
+    /// error, instead of looping forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unrelenting_rate_limit_exhausts_the_budget_then_reports() {
+        let provider = Arc::new(ErrOnceThenSucceedProvider::new(vec![
+            ProviderError::RateLimited,
+            ProviderError::RateLimited,
+            ProviderError::RateLimited,
+            ProviderError::RateLimited,
+        ]));
+        let calls = provider.clone();
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(provider, tools, fast_stall_config());
+
+        let events = collect_events_async(agent.run("hi".into()).await.unwrap()).await;
+
+        // Initial attempt + the 3-retry limit.
+        assert_eq!(*calls.calls.lock().unwrap(), 4);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::ProviderRetry { .. }))
+                .count(),
+            3
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error(AgentError::Provider(ProviderError::RateLimited))
+        )));
+    }
+
     /// Every call fails with a request timeout, so retries are always exhausted.
     struct AlwaysTimeoutProvider {
         calls: std::sync::Mutex<u32>,
@@ -4491,6 +4769,7 @@ mod tests {
             think_idle_timeout: None,
             think_stall_retry_limit: 0,
             think_stall_backoff_base: std::time::Duration::from_secs(1),
+            provider_error_retry_limit: 3,
             preserve_thinking: true,
         };
         assert_eq!(config.model, "custom-model");

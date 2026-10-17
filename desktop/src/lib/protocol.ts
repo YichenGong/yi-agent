@@ -234,7 +234,12 @@ export interface AgentCancelPreviewResult {
 }
 
 /// Why the turn is being retried, as reported by the server on `turn/retry`.
-export type RetryCause = "idle_stall" | "request_timeout";
+export type RetryCause =
+  | "idle_stall"
+  | "request_timeout"
+  | "rate_limited"
+  | "server_error"
+  | "network_error";
 
 export type PermissionKind = "Normal" | { Blacklisted: string };
 

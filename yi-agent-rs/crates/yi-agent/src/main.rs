@@ -1423,6 +1423,15 @@ fn record_human<W: std::io::Write, E: std::io::Write>(
             yi_agent_core::RetryCause::RequestTimeout => {
                 let _ = writeln!(err, "[provider-retry:{attempt}/{max} timeout]");
             }
+            yi_agent_core::RetryCause::RateLimited => {
+                let _ = writeln!(err, "[provider-retry:{attempt}/{max} rate-limited]");
+            }
+            yi_agent_core::RetryCause::ServerError => {
+                let _ = writeln!(err, "[provider-retry:{attempt}/{max} server-error]");
+            }
+            yi_agent_core::RetryCause::NetworkError => {
+                let _ = writeln!(err, "[provider-retry:{attempt}/{max} network-error]");
+            }
         },
         yi_agent_core::AgentEvent::Done { reason } => match reason {
             // Normal completion is already signaled by exit code 0; the

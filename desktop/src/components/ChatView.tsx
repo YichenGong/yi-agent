@@ -188,6 +188,16 @@ function ChatItem({
   }
 }
 
+/// How each retry cause is worded in the amber retry banner. Kept as a lookup so
+/// adding a cause is a one-line change instead of another ternary branch.
+const RETRY_CAUSE_LABELS: Record<RetryCause, string> = {
+  idle_stall: "Provider stalled",
+  request_timeout: "Provider request timed out",
+  rate_limited: "Provider rate limited (429)",
+  server_error: "Provider server error (5xx)",
+  network_error: "Provider unreachable",
+};
+
 export function ChatView({
   items,
   error,
@@ -240,10 +250,8 @@ export function ChatView({
       ))}
       {retrying && (
         <div className="my-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-300">
-          {retrying.cause === "request_timeout"
-            ? "Provider request timed out"
-            : "Provider stalled"}{" "}
-          — retrying {retrying.attempt}/{retrying.max}…
+          {RETRY_CAUSE_LABELS[retrying.cause]} — retrying {retrying.attempt}/
+          {retrying.max}…
         </div>
       )}
       {error && (
