@@ -1526,6 +1526,28 @@ describe("App settings & theme wiring", () => {
     expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
   });
 
+  it("writes only the changed key when a tag name is edited in settings", async () => {
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", tag_names: {} });
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "标签" }));
+    const input = document.querySelector<HTMLInputElement>('[data-tag-name-input="red"]')!;
+    fireEvent.change(input, { target: { value: "紧急" } });
+    fireEvent.blur(input);
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { tag_names: { red: "紧急" } },
+      }),
+    );
+    // 只提交改动的那一个键：其余 5 色不得出现在同一请求里。
+    const write = clients[0].requests.find((r) => r.method === "ui/settings/write")!;
+    expect(Object.keys((write.params as { tag_names: Record<string, string> }).tag_names)).toEqual([
+      "red",
+    ]);
+  });
+
   it("reflects a thread/modelChanged from another client in that thread's picker", async () => {
     render(<App />);
     await settle();
