@@ -760,19 +760,23 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 /// 这里**不再创建会话**：认领（`board.next_launch`）、起会话、回写终态都由宿主
 /// 调度器负责（plan Task 5/6）。插件只负责消费 inbox 把卡排进队列，并落盘。
 fn run_daemon(args: Args) {
-    // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到就等旧实例让位——
-    // 旧实例要么正常退出，要么靠 daemon 失联探测自行退出。用轮询避免忙等。
+    let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
+    // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到锁就在有界预算内
+    // 重试，超时即让位退出——旧的无限等待会留下永不推进也不退出的空转进程。
     // 锁必须在函数存活期间一直持有：`_lock` 绑在这里，函数结束才 drop。
-    let _lock = loop {
-        if let Some(lock) = superpowers_kanban_runner::single_instance::acquire(&args.state_dir) {
-            break lock;
-        }
-        eprintln!(
-            "superpowers-kanban: another instance holds the lock at {}; waiting",
-            args.state_dir.join("plugin.lock").display()
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    };
+    let wait = Duration::from_secs(calendar.instance_wait_secs as u64);
+    let _lock =
+        match superpowers_kanban_runner::single_instance::acquire_within(&args.state_dir, wait) {
+            Some(lock) => lock,
+            None => {
+                eprintln!(
+                    "superpowers-kanban: another instance holds the lock at {}; exiting after {}s",
+                    args.state_dir.join("plugin.lock").display(),
+                    wait.as_secs()
+                );
+                std::process::exit(0);
+            }
+        };
 
     // daemon 存活探测的地址。取不到（runtime 目录不可用）就没有可探的目标，此后
     // 的探测一律当作「已失联」——孤儿必须能有界退出。
@@ -781,7 +785,6 @@ fn run_daemon(args: Args) {
         .map(BoardDaemon::new)
         .map(Arc::new);
 
-    let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
     // 推进循环与查询服务共享同一实例，槽位租约与看板状态因此只有一份真相。
     let service = Arc::new(BoardService::new(
         args.state_dir.clone(),

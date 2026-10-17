@@ -13,6 +13,9 @@ const MAX_INTERVAL_SECS: u64 = 3600;
 /// 终态卡片的默认归档宽限期（小时）。
 pub const DEFAULT_ARCHIVE_GRACE_HOURS: u32 = 24;
 
+/// 拿不到 plugin.lock 时的默认等待预算（秒）。超时即让位退出，不无限空转。
+pub const DEFAULT_INSTANCE_WAIT_SECS: u32 = 10;
+
 /// 读路径把 `interval_secs` 归一到 `[1, MAX_INTERVAL_SECS]`。
 ///
 /// 写路径（`from_settings_json`）对越界是拒绝；读路径不同——文件可能是手改
@@ -90,6 +93,8 @@ pub struct ConcurrencyCalendar {
     pub interval_secs: u64,
     /// 真终止态卡片的归档宽限期（小时）。`0` = 立即归档。
     pub archive_grace_hours: u32,
+    /// 拿不到 plugin.lock 时的等待预算（秒）。`0` = 不等待、只试一次。
+    pub instance_wait_secs: u32,
     pub windows: Vec<ConcurrencyWindow>,
 }
 
@@ -99,6 +104,7 @@ impl Default for ConcurrencyCalendar {
             default_max_tasks: DEFAULT_MAX_TASKS,
             interval_secs: DEFAULT_INTERVAL_SECS,
             archive_grace_hours: DEFAULT_ARCHIVE_GRACE_HOURS,
+            instance_wait_secs: DEFAULT_INSTANCE_WAIT_SECS,
             windows: Vec::new(),
         }
     }
@@ -129,6 +135,9 @@ impl ConcurrencyCalendar {
             archive_grace_hours: file
                 .archive_grace_hours
                 .unwrap_or(DEFAULT_ARCHIVE_GRACE_HOURS),
+            instance_wait_secs: file
+                .instance_wait_secs
+                .unwrap_or(DEFAULT_INSTANCE_WAIT_SECS),
             windows,
         })
     }
@@ -164,8 +173,11 @@ impl ConcurrencyCalendar {
     /// 语义等价的往返才是目标，不追求与原文件逐字节相同。
     pub fn to_toml(&self) -> String {
         let mut out = format!(
-            "default_max_tasks = {}\ninterval_secs = {}\narchive_grace_hours = {}\n",
-            self.default_max_tasks, self.interval_secs, self.archive_grace_hours
+            "default_max_tasks = {}\ninterval_secs = {}\narchive_grace_hours = {}\ninstance_wait_secs = {}\n",
+            self.default_max_tasks,
+            self.interval_secs,
+            self.archive_grace_hours,
+            self.instance_wait_secs
         );
         for window in &self.windows {
             out.push_str("\n[[window]]\n");
@@ -200,6 +212,7 @@ impl ConcurrencyCalendar {
             "default_max_tasks": self.default_max_tasks,
             "interval_secs": self.interval_secs,
             "archive_grace_hours": self.archive_grace_hours,
+            "instance_wait_secs": self.instance_wait_secs,
             "windows": windows,
         })
     }
@@ -236,6 +249,14 @@ impl ConcurrencyCalendar {
             })?)
             .map_err(|_| SettingsError("archive_grace_hours must fit in u32".into()))?,
         };
+        // 让位预算：缺省 10s；给了就必须是 u32（与上同款，越界一律拒绝）。
+        let instance_wait_secs = match value.get("instance_wait_secs") {
+            None | Some(serde_json::Value::Null) => DEFAULT_INSTANCE_WAIT_SECS,
+            Some(raw) => u32::try_from(raw.as_u64().ok_or_else(|| {
+                SettingsError("instance_wait_secs must be a non-negative integer".into())
+            })?)
+            .map_err(|_| SettingsError("instance_wait_secs must fit in u32".into()))?,
+        };
         let raw_windows = value
             .get("windows")
             .and_then(serde_json::Value::as_array)
@@ -251,6 +272,7 @@ impl ConcurrencyCalendar {
             default_max_tasks,
             interval_secs,
             archive_grace_hours,
+            instance_wait_secs,
             windows,
         })
     }
@@ -280,6 +302,7 @@ struct CalendarFile {
     default_max_tasks: Option<u16>,
     interval_secs: Option<u64>,
     archive_grace_hours: Option<u32>,
+    instance_wait_secs: Option<u32>,
     #[serde(default)]
     window: Vec<RawWindow>,
 }
@@ -678,6 +701,13 @@ max_tasks = 99
         let c = ConcurrencyCalendar::from_toml("default_max_tasks = 3\narchive_grace_hours = 0\n")
             .unwrap();
         assert_eq!(c.archive_grace_hours, 0, "0 = 立即归档");
+    }
+
+    #[test]
+    fn instance_wait_defaults_to_ten_and_can_be_overridden() {
+        assert_eq!(ConcurrencyCalendar::default().instance_wait_secs, 10);
+        let c = ConcurrencyCalendar::from_toml("instance_wait_secs = 0\n").unwrap();
+        assert_eq!(c.instance_wait_secs, 0);
     }
 
     #[test]
