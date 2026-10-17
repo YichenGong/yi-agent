@@ -31,7 +31,7 @@
 | 2 | 发起方 | **两者都要**：用户能起 thread，组长也能起 thread，两种在组长眼里等价 |
 | 3 | 前后台 async | **组长有常驻后台循环**，前台对话是读同一份状态的投影，故前台秒回、不被后台 LLM 拖慢 |
 | 4 | thread→组长 函数语义 | **两者都要**：默认单向投递，显式 `blocking: true` 才等回信 |
-| 5 | memory | **纯结构抽象**：本期不新增持久化载体。「文件夹 = 一组 memory」靠组长可检索既有数据（代码、`CLAUDE.md`、`.jsonl` 转录、SQLite task/trace）成立 |
+| 5 | memory | **结构抽象 + 一个受控的决策日志**。「文件夹 = 一组 memory」主要靠组长可检索既有数据（代码、`CLAUDE.md`、`.jsonl` 转录、SQLite task/trace）成立；此外在 `<project>/.yi-agent/lead_memory/memory.md` 放一份 lead 自己维护的 **`memory.md`**，职责严格收窄为「不可再生」的信息（见 §7.3） |
 | 6 | 后台权限边界 | **可写，但留痕、可撤销**，且走既有 delivery/review 状态机（不绕过） |
 | 7 | 前端范围 | **桌面 + 移动端远程**；TUI 本期只要求「能起 thread、thread 内能发言」 |
 | 8 | 归属规则 | **自动全量归属**：thread 的 cwd 在项目目录下即自动归该项目组长，零认领、零额外状态 |
@@ -150,6 +150,37 @@ lead 的后台 turn 跑在「可让位」模式下：在每个工具调用边界
 
 「前台是投影」由此成立：投影读同一份状态，秒回不需要等后台的 LLM 调用。
 
+### 6.4 上下文预算与压缩
+
+lead 是长寿命 thread，会反复被后台唤醒，因此它比普通 thread 更早撞上上下文上限。
+
+**兜底已存在**：`maybe_auto_compact` 在每轮 THINK 之前检查
+（`yi-agent-rs/crates/yi-agent-core/src/agent.rs:909`），阈值 = 有效窗口 ×
+`compact_ratio / 100`（默认 80%，`yi-agent-rs/crates/yi-agent-runtime/src/config.rs:304`）。
+压缩保留最多 20,000 token 的真实 user 输入 + 12,000 token 的完整工具后缀，其余交给
+provider 生成 handoff 摘要（`yi-agent-rs/crates/yi-agent-core/src/compact.rs:261`）。
+所以「撑爆窗口」这个字面问题不存在，lead 不会死。
+
+**但 lead 撞的是压缩质量问题**：`plan_compaction` 的保留规则对 topic 无感知，而 lead
+最需要的恰是「thread A 卡在哪 / thread B 的交付我还没看」这类中间区记忆，会被随机压掉；
+且压缩有连锁放大——lead 越活跃、注入越多、压得越频繁、记忆切得越碎。
+另有一个加速机制：`inject_pending` 被刻意放在 max_turns 检查**之后**
+（`agent.rs:947`），所以每插一条消息就消耗一个 turn，注入越频繁，turn 数与上下文增长越快。
+
+**对策（核心原则）**：区分「可再生的」与「不可再生的」。
+
+- **可再生信息绝不依赖对话历史**：名下每个 thread 的状态是每轮**现算的投影**（§7.1）。
+  它被压缩掉毫无损失，因为下一轮唤醒会重新算出来。这条成立后，压缩对 lead 的伤害
+  结构性归零——压掉的全是可再生的。
+- **不可再生的信息落盘**：决策与理由写进 `memory.md`（§7.3），不靠历史承载。
+
+配套措施：
+
+1. **注入预算上限**：后台唤醒只注入「有变化 / 需关注」的条目，不注入全量索引。
+2. **变化优先**：未变化的 thread 只给一行状态，不展开。
+3. **lead 单独配置压缩阈值**：长寿命 thread 不应与普通 thread 共用一套 ratio。
+4. **压缩后无需重建态势**：态势本来就每轮现算，这是前三条的必然结果。
+
 ## 7. Lead 的视野（memory 的落法）
 
 ### 7.1 索引：app-server 机械计算
@@ -161,21 +192,73 @@ app-server 从既有数据（`ThreadMeta` + `ThreadStatus` + `.jsonl` 尾部 + d
 
 ### 7.2 内容：lead 按需拉取
 
-新增 lead 侧工具：
+新增 lead 侧工具族：
 
 - `lead_list_threads`：读索引（§7.1）。
 - `lead_read_thread`：读指定 thread 的转录片段（增量/截断，受既有 trace 裁剪口径约束）。
+- `lead_remember`：向 `memory.md` 追加一条带时间戳与来源的条目（§7.3）。
+- `lead_recall`：检索 `memory.md` 的相关片段（按需，不灌全量）。
 
 **绝不预灌全量上下文**——项目里已有 auto-compact 兜底
 （`2026-07-26-auto-compact-design`），但那是兜底不是策略；20 个 thread 的完整转录
-会撑爆任何窗口。
+会撑爆任何窗口（见 §6.4）。
 
-这就是决策 5「纯结构抽象」的落地：可检索，而非一份要维护的大文档。
+这就是决策 5「结构抽象」的落地：可检索，而非一份要维护的大文档。
 
-### 7.3 明确不做
+### 7.3 lead_memory：`memory.md`（决策 5 的补充）
 
-本期不新增 `.yi-agent/lead/memory.md` 之类的共享 memory 文档。理由：
-它会与 thread 历史重叠，成为第二个真相源（决策 5、11 的共识）。
+路径：`<project>/.yi-agent/lead_memory/memory.md`。
+
+**它只装「不可再生」的信息**——这是它与 §7.1/§7.2 的分工边界：
+
+| 内容 | 归属 | 理由 |
+|------|------|------|
+| 决策与理由（「为什么打回 thread X」） | `memory.md` | 现算不出来；结论在 delivery 记录里，但**理由**只在当时的对话里，且会被压缩吃掉 |
+| 你交代过的长期偏好 / 跨 thread 约定 | `memory.md` | 同上 |
+| thread 状态 / 进度 / 交付结论 | §7.1 索引（现算） | 可再生的写进 memory 就是重复，且会过期 |
+
+**不装可再生的东西**，因此 `memory.md` 与既有数据没有重叠，不构成第二个真相源。
+这是它区别于「一份要维护的项目文档」的关键。
+
+三条硬约束：
+
+1. **只由 lead 写**，且必须经工具 `lead_remember`（禁止 lead 直接用 `write`/`edit`
+   改它）。单一写者，因此无并发写冲突；且 write / edit 工具的既有约束
+   （必须落在 workspace root 内，`yi-agent-rs/crates/yi-agent-tools/src/fs/path_util.rs:11`）
+   依然生效。
+2. **不确认、但可审计**：写入无需用户批准（否则后台无人值守时写不了，缺口原样回来），
+   但每条条目自带时间戳与来源（关联 thread id / turn id），且这次工具调用会进 lead
+   自己的 `.jsonl` 转录，因此任何时候都能回答「这条是谁、什么时候、因为什么写的」。
+3. **进上下文必须按需**：绝不把整份 `memory.md` 灌进历史——那会立刻吃掉上下文预算，
+   正好抵消它存在的意义（见 §6.4）。检索走 `lead_recall`（§7.2 的工具族）。
+
+**沙箱与 git**：`.yi-agent/` 在 workspace root 之下，`WorkspaceWrite` 模式下天然可写
+（writable roots = workspace root + `extra_writable_roots`，
+`yi-agent-rs/crates/yi-agent-tools/src/sandbox.rs:87`）；且项目已用
+`.git/info/exclude` 把 `.yi-agent/` 标为忽略，因此 `memory.md` 不会弄脏 checkout、
+不破坏 worktree 创建（`yi-agent-rs/crates/yi-agent-tools/src/worktree.rs:94`）。
+
+**工作目录一致性**：lead 的 workdir 是**项目根**（不是子 agent 的
+`.worktrees/<branch>/`），因此 lead 读写 `memory.md` 的路径始终一致；子 worker 看不到它，
+这是刻意的（§7.5）。
+
+### 7.4 明确不做
+
+- 不做「lead 记得的一切」这种泛化 memory——那会退化成第二个真相源。
+- 不做 `memory.md` 之外的结构化记忆表（需要时再说）。
+- 不让子 worker 读写 lead_memory。
+
+### 7.5 边界：谁能读写
+
+| 对象 | 读 | 写 |
+|------|----|----|
+| lead | `memory.md`、全部 thread 索引与转录（§7.1/§7.2） | `memory.md`（仅经 `lead_remember`） |
+| 普通 thread | 不读 lead_memory | 不写 |
+| 子 worker（`spawn_agent`） | 不读 | 不写 |
+
+子 worker 的 workspace 是 `.worktrees/<branch>/`，`.yi-agent/` 不在其内，因此天然看不到
+lead_memory——这是刻意的：`memory.md` 是 lead 的私有账本，不是协作媒介。thread 要影响
+lead，走 `ask_lead`（§5）。
 
 ## 8. 权限边界与审计
 
@@ -218,6 +301,8 @@ lead 状态本就是 `Delivery::List` 层（`protocol.rs:434`），恒推不违�
 | 摘要规则写死导致 lead 瞎 | 索引只放机械可判的事实，内容一律按需拉取（§7） |
 | 无人值守的写动作变成黑箱 | 留痕 + 可撤销 + 不绕过状态机（§8） |
 | 与 daemon 隔离不变量冲突 | 通信全部经 app-server，不新增跨 root capability（§4） |
+| lead 长寿命导致上下文被压碎 | 可再生信息每轮现算、不进历史；不可再生的落 `memory.md`（§6.4、§7.3） |
+| `memory.md` 变成第二个真相源 | 职责收窄为「不可再生」；只经 `lead_remember` 写；可再生的一律不进（§7.3） |
 
 ## 11. 实现分期
 
@@ -230,22 +315,26 @@ lead thread 存在 + 自动归属 + 单向 `ask_lead` + 桌面能点开 lead 并
 验收：能自动出现一个 lead thread；普通 thread 能单向投递消息给 lead；lead 能在
 IM 里看到并回应；桌面侧栏能看到 lead 条目。
 
-### P2 前后台 async
+### P2 前后台 async + lead_memory
 
-后台循环 + 事件唤醒 + 前台抢占 + 阻塞式 `ask_lead`。
+后台循环 + 事件唤醒 + 前台抢占 + 阻塞式 `ask_lead` + `lead_memory/memory.md` 与
+`lead_remember` / `lead_recall`。
 
-**注意**：这是全新机制——今天所有 turn 都由用户输入触发。复杂度集中于此。
+**注意**：前后台是全新机制——今天所有 turn 都由用户输入触发。复杂度集中于此。
+`memory.md` 放本期（而非 P3）的理由：P2 的后台循环正是产生「决策与理由」的地方，
+缺了它，P2 一上线就会开始丢过程性记忆（§6.4）。
 
 ### P3 lead 视野与安全
 
-按需拉取工具（`lead_list_threads` / `lead_read_thread`）+ 权限留痕/撤销
+按需拉取工具（`lead_list_threads` / `lead_read_thread` 的完整形态）+ 权限留痕/撤销
 + 移动端远程。
 
 ## 12. 范围外
 
 - 不为 lead 另建一套转录/持久化（复用 thread 那套）。
 - 不新增跨 root capability，不改 daemon 的会话隔离模型。
-- 不新增共享 memory 文档载体。
+- 不做「lead 记得的一切」式泛化 memory；`memory.md` 只装不可再生的信息（§7.3）。
+- 不把 lead_memory 暴露给普通 thread 或子 worker（§7.5）。
 - 不做多组长并存（一个项目一个 lead）。
 - 不改 TUI 的 UI。
 - 不改现有审批、delivery、review 状态机的语义。
