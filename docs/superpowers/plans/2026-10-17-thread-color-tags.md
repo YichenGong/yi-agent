@@ -140,12 +140,14 @@ pub fn is_valid_tag(id: &str) -> bool {
 
 - [ ] **Step 5: 修所有 `ThreadMeta` 字面量构造点**
 
-新增字段会让所有不用 `..` 展开的字面量编译失败。逐个补 `tag: None,`（放在 `reasoning_effort` 行之后、`preserve_thinking` 之前）。共 12 处：
+新增字段会让所有不用 `..` 展开的字面量编译失败。逐个补 `tag: None,`（放在 `reasoning_effort` 行之后、`preserve_thinking` 之前）。共 13 处：
 
-`thread_store.rs`：`rebuild_meta`（约 765 行）、`fn meta`（约 795）、`fn sample_meta`（约 1457）、约 1831、约 1869。
-`server.rs`：约 7504、13629、15140、15245、15338、16659、17110、17216。
+`thread_store.rs`：`rebuild_meta`（765 行）、`fn meta`（795）、`fn sample_meta`（1457）、1831、1869 —— 共 5 处。
+`server.rs`：7504、13629、15140、15245、15338、16659、17110、17216 —— 共 8 处。
 
-（`thread_store.rs` 约 942 行的 `ThreadMeta { thread_id: bad.into(), ..meta("placeholder") }` 用了 `..` 展开，**不需要**改。）
+（`thread_store.rs:942` 的 `ThreadMeta { thread_id: bad.into(), ..meta("placeholder") }` 用了 `..` 展开，**不需要**改。）
+
+编译失败时以编译器报错为准逐个补齐——上表是「预扫描」结果，可能因你实现时的行号漂移而有出入。
 
 - [ ] **Step 6: 跑测试确认通过**
 
