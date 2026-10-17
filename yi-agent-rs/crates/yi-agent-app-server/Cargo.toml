@@ -26,6 +26,9 @@ yi-agent-boards = { path = "../yi-agent-boards" }
 yi-agent-supervisors = { path = "../yi-agent-supervisors" }
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
+# `lead::ensure_lead_meta` 给组长 meta 盖创建时间戳(epoch 毫秒)。与
+# `yi-agent-runtime` 同一份工作区依赖,不引入新版本。
+chrono.workspace = true
 async-trait = "0.1"
 # `image/read` 分片回传的是原始字节，base64 只在响应体的 `data` 字段出现。
 base64 = "0.22"

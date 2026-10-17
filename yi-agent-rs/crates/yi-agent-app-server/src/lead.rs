@@ -9,10 +9,14 @@
 //!
 //! P1 只实现单向投递(`blocking: false`)。阻塞往返的形状见 spec §5.2,属 P2。
 
+use std::path::Path;
+
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
+
+use crate::thread_store::{LEAD_ROLE, ThreadMeta, ThreadMode, ThreadStore};
 
 /// 一条投给组长的消息。
 ///
@@ -70,6 +74,51 @@ impl LeadInbox {
 impl Default for LeadInbox {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 确保 `cwd` 目录存在组长 meta,返回它以及本次是否真的建了。
+///
+/// 只写 meta,不建 agent、不起 driver:调用点之一是 `thread/listAll`,那是纯
+/// 列表查询,在上面做重活会让侧栏每次刷新都付一次装配成本。真正的 agent 由
+/// 用户打开组长对话时的 `thread/resume` 建。
+///
+/// `created` 区分本次调用是否真的建了:`ThreadMeta` 不带该信息,故一并返回,
+/// 让 `thread/lead` 能如实回答调用方。
+///
+/// 注意返回的是**落盘后重新查一次** `find_lead` 的结果(首次创建时也一样),
+/// 而不是刚造出的那份 `meta`。竞态下用户可能拿到一份「落盘晚于别人」的 id,
+/// 若直接回它,`thread/lead` 就会毒化客户端缓存:此后 `listAll` 里
+/// `find_lead` 选的是另一个组长,而客户端还记着刚才那个。以 `find_lead` 的
+/// 结论为唯一出口,分歧就只在落盘内存在(见 `ThreadStore::find_lead` 的注释)。
+pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(ThreadMeta, bool)> {
+    if let Some(existing) = store.find_lead()? {
+        return Ok((existing, false));
+    }
+    // 竞态说明:两个请求同时走到这里会各造一个 meta。`find_lead` 取 `created_at`
+    // 最早者,故此后所有读取都收敛到同一个;下面的复读让本次响应也以它为准。
+    let now = chrono::Utc::now().timestamp_millis();
+    let meta = ThreadMeta {
+        thread_id: format!("thread-lead-{}", uuid::Uuid::new_v4()),
+        cwd: cwd.display().to_string(),
+        model: String::new(), // 空 = 跟随全局默认,与「损坏重建」同款兜底
+        created_at: now,
+        updated_at: now,
+        title: Some("组长".to_string()),
+        permission_mode: ThreadMode::Normal,
+        pin_seq: None,
+        board_project: None,
+        card_id: None,
+        model_ref: None,
+        reasoning_effort: None,
+        preserve_thinking: true,
+        role: Some(LEAD_ROLE.to_string()),
+    };
+    store.create(&meta)?;
+    // 复读:并发下这里可能读到别人先落的、`created_at` 更早的那一个。
+    match store.find_lead()? {
+        Some(winner) => Ok((winner, true)),
+        None => Ok((meta, true)),
     }
 }
 
