@@ -1154,6 +1154,70 @@ bash = true
     }
 
     #[test]
+    fn relative_path_binds_to_the_primary_root_only() {
+        // 钉死「相对路径只拼主根（roots[0]），绝不跨根猜」这条设计红线。
+        //
+        // 先说清为什么"两个各自独立的同级 tempdir + 相对输入 src/main.rs + 白名单
+        // src/**"钉不住这条规则：那种布局下，相对路径拼到主根得 P/src/main.rs、拼到
+        // 副根得 S/src/main.rs，二者按各自所属根取出的相对路径都恰好是 `src/main.rs`，
+        // 与 `src/**` 恒等匹配 —— 猜或不猜结论都是 Allow，断言不会翻面（实测确认）。
+        // 能区分两种口径的最小构造必须让"主根投影"与"猜测根的投影"不同。
+        //
+        // 构造：主根 = base，副根 = base 内部的子目录 base/linked（现实中 = 用户把主根
+        // 当成某个更外层目录打开，linked 作为关联根挂进来）。白名单锚定 `linked/src/**`，
+        // 即"主根下 linked/src/ 里面的写入"。
+        //   - 只拼主根（本实现）：abspath = base/src/main.rs；遍历各根取相对路径：
+        //     主根给出 `src/main.rs`（不匹配 `linked/src/**`），副根不是它的前缀（Err）
+        //     → NeedConfirm；
+        //   - 跨根猜（把相对路径拼到"能让它命中的那个根"上，即被禁止的写法）：
+        //     先试主根不中，再拼到副根得 base/linked/src/main.rs，按主根取相对路径得
+        //     `linked/src/main.rs` → 命中 `linked/src/**` → Allow。
+        // 同一输入、同一白名单，两种口径结论相反：本测试真正 load-bearing。
+        // 已实测验证：把 line 218-222 换成"跨根猜"版本后，本断言翻成 Allow 且测试失败。
+        //
+        // 全程不做任何文件系统写入：权限层是纯词法比对（strip_prefix），路径在磁盘上
+        // 存不存在无关紧要，故 base/linked 故意不创建，本测试无 I/O、不会 flaky。
+        let base = tempfile::tempdir().unwrap();
+        let linked = base.path().join("linked"); // 故意不创建：无需它存在
+        let cfg = PermissionsConfig {
+            prefix_level: PrefixLevelConfig {
+                write: PathPrefixConfig {
+                    paths: vec!["linked/src/**".to_string()],
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let checker = PermissionChecker::with_roots(
+            cfg,
+            crate::autonomy::YoloSwitch::new(false),
+            vec![base.path().to_path_buf(), linked.clone()],
+            Arc::new(|_| None),
+        );
+        // 负向断言，且断言变体而非 is_ok()（CheckResult 没有 is_ok）：NeedConfirm 正是
+        // "相对输入没有跨根猜中副根"的证据。
+        assert!(
+            matches!(
+                checker.check("write", &serde_json::json!({ "path": "src/main.rs" })),
+                CheckResult::NeedConfirm(_)
+            ),
+            "相对路径只能拼主根，不得跨根猜中副根"
+        );
+        // 正向对照（同一根集、同一份白名单）：同一份 `linked/src/**` 用**绝对**路径显式
+        // 指向副根时应当放行。它与上一条并存，证明上条的 NeedConfirm 来自"相对路径不
+        // 跨根猜"，而不是"副根白名单整体失灵"。
+        // 注：`path_whitelist_resolves_relative_to_the_matching_root` 已覆盖"绝对路径
+        // 按命中根解析"的通用语义，此处只作本反例的内部阳性对照，不重复其断言面。
+        assert!(matches!(
+            checker.check(
+                "write",
+                &serde_json::json!({ "path": linked.join("src/main.rs").display().to_string() })
+            ),
+            CheckResult::Allow
+        ));
+    }
+
+    #[test]
     fn path_whitelist_still_rejects_outside_every_root() {
         let cfg = PermissionsConfig {
             prefix_level: PrefixLevelConfig {
