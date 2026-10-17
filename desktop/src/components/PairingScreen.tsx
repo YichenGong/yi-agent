@@ -82,12 +82,21 @@ export interface PairingScreenProps {
   scan?: (onText: (t: string) => void, onError: (e: unknown) => void) => () => void;
 }
 
-/** 只认 `code === 4401` 的拒绝；文案里带 4401 也算（`pairing.ts` 的拒绝是纯文本）。 */
+/**
+ * 只认「码无效/过期」的两种拒绝形态:
+ * - `code === 4401`,或文案里带 4401——**直连**路径在握手时以 4401 关帧拒绝;
+ * - `code === -32001`——**中继**路径把 `pair/redeem` 当普通 JSON-RPC 调用,
+ *   失败时回错误帧(见 `protocol.rs::invalid_pairing_code`),不是关帧。
+ *
+ * 两者都必须归到同一文案:否则经中继配对时,过期/用过的码会被误报成
+ * 「无法连接服务器」,把用户引向排查网络的死路。
+ */
 function isInvalidCode(e: unknown): boolean {
   const code = (e as { code?: unknown } | null)?.code;
-  if (code === 4401) return true;
+  if (code === 4401 || code === -32001) return true;
   const message = e instanceof Error ? e.message : (e as { message?: unknown } | null)?.message;
-  return typeof message === "string" && message.includes("4401");
+  if (typeof message !== "string") return false;
+  return message.includes("4401") || message.includes("invalid or expired pairing code");
 }
 
 /** `localStorage` 的默认实现；不可用（隐私模式等）时退化为无操作。 */
