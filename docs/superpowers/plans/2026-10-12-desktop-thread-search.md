@@ -47,7 +47,7 @@ worktree 的 `desktop/node_modules` 已软链到主仓库。
   与 `filterThreadTree(groups: WorkspaceGroup[], pinned: ThreadSummary[], query: string): ThreadSearchResult`。
   Task 2 只依赖这两个导出。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 Create `desktop/src/lib/threadSearch.test.ts`:
 
@@ -161,12 +161,12 @@ describe("filterThreadTree", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadSearch.test.ts`
 Expected: FAIL — `Failed to resolve import "./threadSearch"`。
 
-- [ ] **Step 3: 实现最小代码**
+- [x] **Step 3: 实现最小代码**
 
 Create `desktop/src/lib/threadSearch.ts`:
 
@@ -243,12 +243,12 @@ export function filterThreadTree(
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadSearch.test.ts`
 Expected: PASS（14 个用例）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadSearch.test.ts
@@ -270,7 +270,7 @@ git commit -m "feat(desktop): add the pure sidebar thread-search filter"
   清除按钮 `[aria-label="清除搜索"]`、无匹配提示文本 `无匹配会话`、重命名输入框标记 `[data-rename-input]`。
   Task 3 只读 `index.css`，不依赖本任务的 DOM。
 
-- [ ] **Step 1: 改既有 6 处裸 `input` 选择器（先改测试，此时应失败）**
+- [x] **Step 1: 改既有 6 处裸 `input` 选择器（先改测试，此时应失败）**
 
 `desktop/src/components/ThreadSidebar.test.tsx` 的 4 处：
 
@@ -287,7 +287,7 @@ git commit -m "feat(desktop): add the pure sidebar thread-search filter"
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx src/App.test.tsx`
 Expected: FAIL — 属性尚不存在，`querySelector` 返回 null。
 
-- [ ] **Step 2: 给重命名输入框加标记属性**
+- [x] **Step 2: 给重命名输入框加标记属性**
 
 `desktop/src/components/ThreadSidebar.tsx` 的 `<input autoFocus value={draft}` 起那段，加一行属性：
 
@@ -301,7 +301,7 @@ Expected: FAIL — 属性尚不存在，`querySelector` 返回 null。
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx src/App.test.tsx`
 Expected: PASS（既有用例全绿，回到基线 939 个）。
 
-- [ ] **Step 3: 写搜索栏的失败测试**
+- [x] **Step 3: 写搜索栏的失败测试**
 
 在 `desktop/src/components/ThreadSidebar.test.tsx` 末尾追加：
 
@@ -407,12 +407,12 @@ describe("ThreadSidebar 搜索", () => {
 注意：`newThreadTrigger`、`boardGroups`、`renderSidebar` 都是该文件里已有的 helper，直接复用；
 第一条用例里 `searchBox` 与 `rows` 的 `compareDocumentPosition` 断言用的是 DOM 顺序，不依赖像素。
 
-- [ ] **Step 4: 跑测试确认失败**
+- [x] **Step 4: 跑测试确认失败**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 Expected: FAIL — `Unable to find a label with the text of: 搜索会话`。
 
-- [ ] **Step 5: 实现搜索状态与过滤渲染**
+- [x] **Step 5: 实现搜索状态与过滤渲染**
 
 `desktop/src/components/ThreadSidebar.tsx`，四处改动：
 
@@ -499,18 +499,18 @@ import { filterThreadTree } from "../lib/threadSearch";
      const isBoardCollapsed = searching ? false : !boardCollapsed.has(g.workspace);
    ```
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 Expected: PASS（原有 62 个 + 新增 10 个 = 72 个）。
 
-- [ ] **Step 7: 全量回归 + 类型检查**
+- [x] **Step 7: 全量回归 + 类型检查**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit`
 Expected: 全部通过（82 个测试文件 + 新增 1 个 = 83；用例 939 + 14（Task 1）+ 10（本任务）= 963；
 Task 3 再加 1 例 → 964），tsc 无输出。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add desktop/src/components/ThreadSidebar.tsx desktop/src/components/ThreadSidebar.test.tsx desktop/src/App.test.tsx
@@ -529,7 +529,7 @@ git commit -m "feat(desktop): filter the sidebar thread tree by a search box"
 - Consumes: Task 2 产出的搜索框（`input[type="search"]` 位于 `.app-sidebar` 内）。
 - Produces: 无后续任务依赖。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `desktop/src/mobileLayout.test.ts` 的 `describe("phone layout CSS")` 内追加：
 
@@ -546,12 +546,12 @@ git commit -m "feat(desktop): filter the sidebar thread tree by a search box"
   });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/mobileLayout.test.ts`
 Expected: FAIL — 正则匹配不到规则，`rule` 为空字符串。
 
-- [ ] **Step 3: 加 CSS**
+- [x] **Step 3: 加 CSS**
 
 `desktop/src/index.css` 末尾（`[data-mobile="true"] .app-sidebar [data-ws-header]` 那条之后）追加：
 
@@ -566,12 +566,12 @@ Expected: FAIL — 正则匹配不到规则，`rule` 为空字符串。
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/mobileLayout.test.ts`
 Expected: PASS（原有 15 个 + 新增 1 个）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add desktop/src/index.css desktop/src/mobileLayout.test.ts
@@ -666,7 +666,7 @@ git commit -m "docs: record the sidebar thread search bar in the desktop module"
 - Consumes: Task 2 定义的 `searchBar` 元素、`isMobile` prop（`ThreadSidebar.tsx:81`，默认 `false`）。
 - Produces: 无后续任务依赖。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `desktop/src/components/ThreadSidebar.test.tsx` 的 `describe("ThreadSidebar 搜索")` 内
 （`const searchBox = () => screen.getByLabelText("搜索会话") as HTMLInputElement;` 之后）追加：
@@ -709,7 +709,7 @@ git commit -m "docs: record the sidebar thread search bar in the desktop module"
   });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 
@@ -721,7 +721,7 @@ Expected: **前 2 条失败**（手机端搜索框此时还在滚动容器之外
 搜索 `true` → 清空 `false`。**若第 3 条反而失败**，说明现有折叠逻辑与我的判断不符，
 **停下来查清原因再继续**，不要改测试去迁就代码。
 
-- [ ] **Step 3: 实现（按平台两处渲染）**
+- [x] **Step 3: 实现（按平台两处渲染）**
 
 在 `desktop/src/components/ThreadSidebar.tsx` 中，把：
 
@@ -747,13 +747,13 @@ Expected: **前 2 条失败**（手机端搜索框此时还在滚动容器之外
 - 手机端 16px 字号规则是**后代选择器** `[data-mobile="true"] .app-sidebar input[type="search"]`，
   移入容器后依然命中，**CSS 无需改动**。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 
 Expected: PASS，`74 + 3 = 77` 个用例。
 
-- [ ] **Step 5: 全量回归 + 类型检查**
+- [x] **Step 5: 全量回归 + 类型检查**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit`
 
@@ -761,7 +761,7 @@ Expected: 全绿，`tsc` 无输出。**特别确认既有 `搜索栏在 New thre
 ——其"之后/之前"用的是 `compareDocumentPosition` 文档顺序，手机端把搜索框移入容器后，
 它仍排在第一个会话行之前，故该断言两端都成立。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add desktop/src/components/ThreadSidebar.tsx desktop/src/components/ThreadSidebar.test.tsx
