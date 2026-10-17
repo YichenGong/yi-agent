@@ -181,6 +181,9 @@ pub fn resolve_for_write_roots(roots: &[PathBuf], path: &str) -> Result<PathBuf,
         return Err(ToolsError::PathEscapesRoot(candidate));
     }
 
+    // 返回值与单根版有差异（brief 要求记录）：原单根 `resolve_for_write` 的最后一步是
+    // `Ok(candidate)`（未归一化），多根版返回 `normalized`；多根版更严格——归一化后的路径
+    // 仍须落在根集之内，因此这里的归一化不是放宽而是收紧。
     Ok(normalized)
 }
 
@@ -424,6 +427,27 @@ mod tests {
     #[test]
     fn empty_roots_is_an_error() {
         let result = resolve_and_check_roots(&[], "file.txt");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn roots_write_rejects_symlink_escape_from_secondary() {
+        let a = TempDir::new().unwrap();
+        let b = TempDir::new().unwrap();
+        let secret = TempDir::new().unwrap();
+        fs::write(secret.path().join("secret.txt"), "no").unwrap();
+        // 终组件符号链接：写在次根内，指向根外。
+        std::os::unix::fs::symlink(secret.path().join("secret.txt"), b.path().join("evil.txt"))
+            .unwrap();
+        let roots = canonicalize_roots(&[a.path().to_path_buf(), b.path().to_path_buf()]);
+        let target = b.path().join("evil.txt").to_string_lossy().to_string();
+        let result = resolve_for_write_roots(&roots, &target);
+        assert!(matches!(result, Err(ToolsError::PathEscapesRoot(_))));
+    }
+
+    #[test]
+    fn empty_roots_is_an_error_for_write() {
+        let result = resolve_for_write_roots(&[], "file.txt");
         assert!(result.is_err());
     }
 }
