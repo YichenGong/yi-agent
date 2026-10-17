@@ -566,6 +566,33 @@ lsof -nP -p "$(pgrep -f 'app-server.*--relay' | head -1)" | grep 101.47.76.100
 `yi-agent` 二进制）后重启 App；应急排查可看桥进程 stderr 是否含
 `Could not automatically determine the process-level CryptoProvider`。
 
+#### 桥接连上就断、每 ~2 秒重连（trace 刷 `invalid token`）
+
+症状：中继日志里**出现过** `agent connected`，但随即消失、反复出现；本机 trace
+（`~/.yi-agent/trace/*.jsonl`）里 `relay bridge up` 与 `relay bridge closed;
+reconnecting` 交替、并伴随大量 `ws connection rejected: invalid token`。
+
+**根因是 `~/.yi-agent/devices.json`（设备表）被清空**，桥接凭根据此消失，于是桥接
+每次连本机环回 ws 都被 4401 拒。历史上被清空的成因是 `DeviceStore::write` 用了**固定**
+临时名 `devices.json.tmp`，而该表被多进程共享、写入又频繁，并发 `rename` 会 `ENOENT`
+且读-改-写互相覆盖；`read()` 解析失败返回空表，把一次损坏固化。修复后读-改-写在
+内核 `flock` 下跨进程串行化、临时名唯一化（`crates/yi-agent-app-server/src/device_store.rs`）。
+
+**应急恢复**：把桥接凭据重新铸回设备表即可让桥接立刻稳定——正常启动 `--relay` 会
+经 `PairingState::seed_local_device("relay-bridge")` 按名字幂等取回或重铸一枚，
+故**重启桌面 App/侧车**即可自愈；若要免重启，可从 `~/.yi-agent/local-device.json`
+取出桥接明文 token 对应的 `device_id`/哈希手工补回 `devices.json`。
+
+#### 手机报「无法连接服务器」，但其实是配对码过期
+
+症状：手机填了码点「配对」，显示「无法连接服务器」，而中继日志两端连接都正常。
+
+**先看配对码是否过期**：中继路径把 `pair/redeem` 当普通 JSON-RPC 调用，码无效/过期
+回的是 `-32001 invalid or expired pairing code`（不是 4401 关帧）。修复前手机只认
+4401，故把过期码误报成「无法连接服务器」，把人引向排查网络的死路。现在已同时认
+`-32001`，会直接提示「配对码无效或已过期，请在桌面重新生成」。配对码 TTL 只有
+**300 秒**，在桌面「设置 → 远程访问」重新生成即可（或 `yi-agent pair code`）。
+
 ### 手机发消息没有电脑响应
 
 - 中继在"该 session 没有电脑"时，会把手机发来的帧回一个最小错误帧：
