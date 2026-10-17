@@ -86,6 +86,8 @@ git 目录原地成 root，`workspace_root == project_root`），真正需要仓
 app-server 侧的钉法是 `cargo test -p yi-agent-app-server
 a_non_git_cwd_attaches_in_place_with_the_delegation_tools`。
 
+- [x] daemon 工厂按指纹跟随模型清单（运行期热重载）— `DaemonAgentWorkerFactory::with_catalog_watcher(cfg, watcher)`（`src/lib.rs:231`）装一个 `WorkerRefresh`（`:121`）；worker start 时先用 `EffectiveKey::of`（`:98`，`resolve_effective` 覆盖的 6 字段）比对缓存，命中则复用，未命中则 `WorkerParts::rebuild`（`:55`）按当前清单重建 provider/tools/config/sandbox（装配口径与 `attach::build_worker_factory` 一致：skills-only 注册表 + 同一组 `bootstrap` 构造函数）；重建失败保留上一次可用派生件。**`new()` 签名逐字节不变**，未装刷新器的 22 处既有构造点行为不变（零回归）；`worker_config_model` 仅在无刷新器时生效，有刷新器时模型名来自当前清单条目。生产装配在 `attach.rs:156`（`build_worker_factory` 新增 `models_path` 形参后 `.with_catalog_watcher(cfg.clone(), CatalogWatcher::new(models_path))`）。验证：`cargo test -p yi-agent-subagent`（65 lib + 5 e2e，含 `a_watcher_backed_factory_follows_a_changed_subagent_model`、`a_factory_without_a_watcher_keeps_its_static_config`、`the_attached_worker_factory_follows_a_changed_catalog`、`the_attached_worker_factory_survives_a_corrupt_catalog`）；真机三步判据见 `yi-agent/tests/model_catalog_live_reload_e2e.rs` — [设计](../superpowers/specs/2026-10-17-model-catalog-live-reload-design.md)
+
 **验证命令：** `cargo test -p yi-agent-subagent`（含 `binding::` 单测与
 `application_tools_share_one_binding`；依赖真 socket 的 `probe_reports_healthy_on_status`
 需在可 bind Unix socket 的环境运行）

@@ -33,6 +33,7 @@ use yi_agent_core::{
     Agent, AgentConfig, AgentError, AgentEvent, ContentBlock, Message, Provider, ProviderError,
     ProviderTurnGate, Session, Tool, ToolRegistry, ToolResult,
 };
+use yi_agent_runtime::models::CatalogWatcher;
 use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
 
 const DEFAULT_PROVIDER_RETRY_LIMIT: u16 = 3;
@@ -47,6 +48,115 @@ const TUI_WAIT_AGENT_TIMEOUT_MS: u64 = 10;
 
 /// Reuses the selected provider, tool registry, and system prompt for each
 /// delegated worker while the supervisor supplies its narrow objective.
+/// 由 `effective` 派生、供 worker 启动使用的一组对象。
+///
+/// 与 `DaemonAgentWorkerFactory` 的静态字段一一对应：装刷新器后它们由
+/// 当前清单重建，未装时仍用 `new()` 传入的那份。
+struct WorkerParts {
+    provider: Arc<dyn Provider>,
+    tools: Arc<ToolRegistry>,
+    config: AgentConfig,
+    sandbox: yi_agent_tools::SandboxMode,
+}
+
+impl WorkerParts {
+    /// 从清单解析出 `effective` 并重建全部派生件。
+    ///
+    /// 装配口径与 `attach::build_worker_factory` 一致：skills-only 注册表、
+    /// 同一组 `bootstrap` 构造函数。两处若漂移，刷新路径就会产出一个与启动
+    /// 路径不同的 worker。
+    fn rebuild(
+        cfg: &yi_agent_runtime::config::RuntimeConfig,
+        catalog: &yi_agent_runtime::models::ModelCatalog,
+    ) -> anyhow::Result<Self> {
+        let effective = yi_agent_runtime::models::resolve_effective(
+            cfg,
+            catalog,
+            catalog.subagent_model.as_deref(),
+        );
+        let provider = yi_agent_runtime::bootstrap::build_provider(&effective)?;
+        let prompt = yi_agent_runtime::bootstrap::build_prompt_setup(&effective)?;
+        let mut registry = ToolRegistry::new();
+        if let Some(skills) = &prompt.skills {
+            registry.register(Arc::new(yi_agent_tools::SkillTool::new(skills.clone())));
+        }
+        let config =
+            yi_agent_runtime::bootstrap::build_agent_config(&effective, prompt.system_prompt);
+        Ok(Self {
+            provider,
+            tools: Arc::new(registry),
+            config,
+            sandbox: effective.sandbox,
+        })
+    }
+}
+
+/// 决定派生件是否需要重建的键：`resolve_effective` 覆盖的 6 个字段全等即命中。
+///
+/// 刻意**不派生 `Debug`**：`api_key` 是敏感字段，不得进入任何可打印位置。
+#[derive(PartialEq, Eq)]
+struct EffectiveKey {
+    provider: String,
+    api_url: String,
+    api_key: String,
+    model: String,
+    api_style: yi_agent_core::ApiStyle,
+    reasoning_effort: Option<String>,
+}
+
+impl EffectiveKey {
+    fn of(cfg: &yi_agent_runtime::config::RuntimeConfig) -> Self {
+        Self {
+            provider: cfg.provider.clone(),
+            api_url: cfg.api_url.clone(),
+            api_key: cfg.api_key.clone(),
+            model: cfg.model.clone(),
+            api_style: cfg.api_style,
+            reasoning_effort: cfg.reasoning_effort.clone(),
+        }
+    }
+}
+
+/// 按指纹重建派生件所需的一切。
+struct WorkerRefresh {
+    cfg: yi_agent_runtime::config::RuntimeConfig,
+    watcher: Arc<CatalogWatcher>,
+    cache: Mutex<Option<(EffectiveKey, Arc<WorkerParts>)>>,
+}
+
+impl WorkerRefresh {
+    /// 取当前清单解析出的派生件；键命中则复用缓存。
+    ///
+    /// 重建失败（例如新条目 provider 名非法）时保留上一次可用派生件：
+    /// 一次坏编辑不该当场打断所有委派（与设计文档 §5 的降级策略一致）。
+    fn parts(&self) -> Option<Arc<WorkerParts>> {
+        let catalog = self.watcher.current();
+        let effective = yi_agent_runtime::models::resolve_effective(
+            &self.cfg,
+            &catalog,
+            catalog.subagent_model.as_deref(),
+        );
+        let key = EffectiveKey::of(&effective);
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((cached_key, parts)) = cache.as_ref() {
+            if *cached_key == key {
+                return Some(Arc::clone(parts));
+            }
+        }
+        match WorkerParts::rebuild(&self.cfg, &catalog) {
+            Ok(parts) => {
+                let parts = Arc::new(parts);
+                *cache = Some((key, Arc::clone(&parts)));
+                Some(parts)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not rebuild worker parts from the current catalog; keeping the previous ones");
+                cache.as_ref().map(|(_, parts)| Arc::clone(parts))
+            }
+        }
+    }
+}
+
 pub struct DaemonAgentWorkerFactory {
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
@@ -67,6 +177,9 @@ pub struct DaemonAgentWorkerFactory {
     /// Direct-child limit passed to each supervisor this daemon creates.
     /// Defaults to [`yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT`].
     max_direct_children: usize,
+    /// 装了它才按指纹重建派生件；未装则完全沿用 `new()` 传入的静态字段
+    /// （全部测试构造点因此行为不变）。
+    refresh: Option<WorkerRefresh>,
 }
 
 impl DaemonAgentWorkerFactory {
@@ -89,6 +202,7 @@ impl DaemonAgentWorkerFactory {
             catalog: None,
             max_resident_subagents: yi_agent_runtime::config::RESIDENT_SUBAGENTS_DEFAULT,
             max_direct_children: usize::from(yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT),
+            refresh: None,
         }
     }
 
@@ -110,6 +224,33 @@ impl DaemonAgentWorkerFactory {
         self.sandbox = sandbox;
         self.sandbox_writable_roots = writable_roots;
         self
+    }
+
+    /// 让工厂按指纹跟随 `models.json`：`cfg` 是 `resolve_effective` 的基准，
+    /// `watcher` 提供当前清单。未调用它时工厂完全静态（零回归）。
+    pub fn with_catalog_watcher(
+        mut self,
+        cfg: yi_agent_runtime::config::RuntimeConfig,
+        watcher: Arc<CatalogWatcher>,
+    ) -> Self {
+        self.refresh = Some(WorkerRefresh {
+            cfg,
+            watcher,
+            cache: Mutex::new(None),
+        });
+        self
+    }
+
+    /// 测试接缝：当前清单解析出的模型名。未装刷新器时回落静态配置。
+    #[cfg(test)]
+    fn resolved_model_for_test(&self) -> String {
+        match &self.refresh {
+            Some(refresh) => refresh
+                .parts()
+                .map(|parts| parts.config.model.clone())
+                .unwrap_or_else(|| self.config.model.clone()),
+            None => self.config.model.clone(),
+        }
     }
 
     /// Configures the Git repository from which task worktrees are created.
@@ -162,7 +303,24 @@ impl DaemonAgentWorkerFactory {
         workspace_mode: ChildWriteMode,
         inherited: Option<yi_agent_core::InheritedSandbox>,
     ) -> ToolRegistry {
-        let mut tools = (*self.tools).clone();
+        self.worker_tool_registry_with_base(
+            workspace,
+            workspace_mode,
+            inherited,
+            Arc::clone(&self.tools),
+        )
+    }
+
+    /// 与 [`Self::worker_tool_registry`] 同逻辑，但基准工具集由调用方给出
+    /// （刷新路径传入当前清单重建出的那份）。
+    fn worker_tool_registry_with_base(
+        &self,
+        workspace: &WorkerWorkspace,
+        workspace_mode: ChildWriteMode,
+        inherited: Option<yi_agent_core::InheritedSandbox>,
+        base: Arc<ToolRegistry>,
+    ) -> ToolRegistry {
+        let mut tools = (*base).clone();
         let (sandbox, writable_roots) = match workspace_mode {
             ChildWriteMode::Coding => {
                 let mut writable_roots = vec![workspace.path.clone()];
@@ -560,7 +718,12 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         request: WorkerStart,
         provider_turn_gate: Option<Arc<dyn ProviderTurnGate>>,
     ) -> futures::future::BoxFuture<'static, Result<WorkerHandle, WorkerError>> {
-        let provider = Arc::clone(&self.provider);
+        // 装了刷新器就用「当前清单」重建出的派生件；否则用 `new()` 传入的静态字段。
+        let refreshed = self.refresh.as_ref().and_then(|refresh| refresh.parts());
+        let provider = refreshed
+            .as_ref()
+            .map(|parts| Arc::clone(&parts.provider))
+            .unwrap_or_else(|| Arc::clone(&self.provider));
         let Some(workspace) = request.workspace.clone() else {
             return Box::pin(async {
                 Err(WorkerError::Startup(
@@ -569,19 +732,35 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             });
         };
         let workspace_mode = request.workspace_mode;
+        let base_sandbox = refreshed
+            .as_ref()
+            .map_or(self.sandbox, |parts| parts.sandbox);
         let effective_sandbox = match workspace_mode {
             ChildWriteMode::Coding => {
-                resolve_effective_sandbox(self.sandbox, request.inherited_sandbox)
+                resolve_effective_sandbox(base_sandbox, request.inherited_sandbox)
             }
             ChildWriteMode::ReadOnly => yi_agent_tools::SandboxMode::ReadOnly,
         };
-        let worker_tools = Arc::new(self.worker_tool_registry(
-            &workspace,
-            workspace_mode,
-            request.inherited_sandbox,
-        ));
-        let mut config = self.config.clone();
-        config.model = self.worker_config_model(&request.model);
+        let worker_tools = Arc::new(match refreshed.as_ref() {
+            Some(parts) => self.worker_tool_registry_with_base(
+                &workspace,
+                workspace_mode,
+                request.inherited_sandbox,
+                Arc::clone(&parts.tools),
+            ),
+            None => {
+                self.worker_tool_registry(&workspace, workspace_mode, request.inherited_sandbox)
+            }
+        });
+        let mut config = refreshed
+            .as_ref()
+            .map(|parts| parts.config.clone())
+            .unwrap_or_else(|| self.config.clone());
+        // 未装刷新器时才走静态取值：有刷新器时 `parts.config.model` 已是当前
+        // 清单解析出的模型，不能被静态配置覆盖回去。
+        if refreshed.is_none() {
+            config.model = self.worker_config_model(&request.model);
+        }
         if let Some(catalog) = &self.catalog {
             if let Some(prompt) = catalog.current_system_prompt() {
                 config.system_prompt = Some(prompt);
@@ -2410,6 +2589,88 @@ mod tests {
             format_ipc_rejection("spawn request", &response),
             "daemon rejected spawn request: invalid_state: an agent may have at most 4 direct children"
         );
+    }
+
+    /// 测试用 `RuntimeConfig`：`RuntimeConfig` 无 `Default`，逐字段写出。
+    /// 字段集与 `attach.rs` 的 `base_config` 同构。
+    fn watcher_test_config(workdir: &std::path::Path) -> yi_agent_runtime::config::RuntimeConfig {
+        yi_agent_runtime::config::RuntimeConfig {
+            provider: "openai".into(),
+            api_url: "http://127.0.0.1:9/v1".into(),
+            api_key: "k".into(),
+            model: "base-model".into(),
+            api_style: yi_agent_core::ApiStyle::Auto,
+            reasoning_effort: None,
+            max_turns: 4,
+            max_resident_subagents: 8,
+            max_direct_children: yi_agent_runtime::config::DIRECT_CHILDREN_DEFAULT,
+            workdir: workdir.to_path_buf(),
+            system_prompt: None,
+            compact_threshold: 160_000,
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            yolo: false,
+            sandbox_promotable: true,
+            sandbox: yi_agent_tools::SandboxMode::default(),
+            sandbox_writable_roots: Vec::new(),
+            skills_catalog_budget: 8192,
+            skills_catalog_budget_explicit: true,
+        }
+    }
+
+    /// 装了 watcher 的工厂必须在下一次调用用上新清单：改 `models.json` 的
+    /// `subagent_model` 指向另一条条目后，解析出的模型必须跟着变。
+    /// 这是「daemon 不再冻结启动快照」的最小可观测断言。
+    #[test]
+    fn a_watcher_backed_factory_follows_a_changed_subagent_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        let catalog = |subagent: &str| {
+            format!(
+                r#"{{"models":[
+                    {{"name":"S1","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-one","api_key":"k"}},
+                    {{"name":"S2","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-two","api_key":"k"}}
+                ],"subagent_model":"{subagent}"}}"#
+            )
+        };
+        std::fs::write(&path, catalog("S1")).unwrap();
+
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            dir.path().join("runtime.sock"),
+        )
+        .with_catalog_watcher(
+            watcher_test_config(dir.path()),
+            yi_agent_runtime::models::CatalogWatcher::new(path.clone()),
+        );
+
+        assert_eq!(factory.resolved_model_for_test(), "model-one");
+
+        std::fs::write(&path, catalog("S2")).unwrap();
+
+        assert_eq!(
+            factory.resolved_model_for_test(),
+            "model-two",
+            "the next call must use the new catalog, not the startup snapshot"
+        );
+    }
+
+    /// 未装 watcher 的工厂行为必须逐字节不变（零回归门禁）。
+    #[test]
+    fn a_factory_without_a_watcher_keeps_its_static_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let factory = DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig {
+                model: "static-model".into(),
+                ..AgentConfig::default()
+            },
+            dir.path().join("runtime.sock"),
+        );
+        assert_eq!(factory.worker_config_model("ignored"), "static-model");
     }
 
     #[test]

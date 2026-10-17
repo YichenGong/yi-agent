@@ -99,6 +99,7 @@ pub fn worker_factory(
         cfg,
         runtime_socket,
         &yi_agent_runtime::models::load_catalog_from(models_path),
+        models_path,
     )?))
 }
 
@@ -111,6 +112,7 @@ fn build_worker_factory(
     cfg: &RuntimeConfig,
     runtime_socket: PathBuf,
     catalog: &yi_agent_runtime::models::ModelCatalog,
+    models_path: &Path,
 ) -> anyhow::Result<crate::DaemonAgentWorkerFactory> {
     use std::sync::Arc;
 
@@ -149,7 +151,12 @@ fn build_worker_factory(
     .with_max_resident_subagents(effective.max_resident_subagents)
     // Same reasoning for the direct-child limit: skipping this silently yields
     // the trait default and makes YI_AGENT_MAX_DIRECT_CHILDREN inert.
-    .with_max_direct_children(usize::from(effective.max_direct_children)))
+    .with_max_direct_children(usize::from(effective.max_direct_children))
+    // 本次新增：装刷新器，使 daemon 跟随 models.json 的运行期变更。
+    .with_catalog_watcher(
+        cfg.clone(),
+        yi_agent_runtime::models::CatalogWatcher::new(models_path.to_path_buf()),
+    ))
 }
 
 /// Test-only seam: build the concrete factory from an explicit catalog path so a
@@ -164,6 +171,7 @@ fn worker_factory_with_catalog(
         cfg,
         runtime_socket,
         &yi_agent_runtime::models::load_catalog_from(catalog_path),
+        catalog_path,
     )
 }
 
@@ -732,5 +740,87 @@ mod tests {
         let socket = yi_agent_store::ipc::socket_path_for(runtime.path()).unwrap();
         assert_eq!(probe_runtime(&socket), RuntimeProbe::Healthy);
         drop(daemon);
+    }
+
+    /// 生产装配路径必须装上刷新器：改 `models.json` 的 `subagent_model` 后，
+    /// 工厂解析出的模型必须跟着变（这是 daemon 侧对本次事故的直接回归门禁）。
+    #[test]
+    fn the_attached_worker_factory_follows_a_changed_catalog() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = catalog_file(
+            directory.path(),
+            r#"{"models":[
+                {"name":"S1","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-one","api_key":"k"},
+                {"name":"S2","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-two","api_key":"k"}
+            ],"subagent_model":"S1"}"#,
+        );
+        let cfg = base_config(directory.path());
+        let socket = directory.path().join("runtime.sock");
+
+        // 走生产装配路径 `build_worker_factory`（返回具体类型，便于断言）。
+        let factory = super::build_worker_factory(
+            &cfg,
+            socket,
+            &yi_agent_runtime::models::load_catalog_from(&path),
+            &path,
+        )
+        .expect("factory");
+        assert_eq!(
+            factory.resolved_model_for_test(),
+            "model-one",
+            "the factory must start from the on-disk catalog"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"models":[
+                {"name":"S1","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-one","api_key":"k"},
+                {"name":"S2","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-two","api_key":"k"}
+            ],"subagent_model":"S2"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            factory.resolved_model_for_test(),
+            "model-two",
+            "changing models.json must take effect without restarting the daemon"
+        );
+    }
+
+    /// 坏清单不得让工厂崩掉或清空配置：保留上一次可用值。
+    #[test]
+    fn the_attached_worker_factory_survives_a_corrupt_catalog() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = catalog_file(
+            directory.path(),
+            r#"{"models":[{"name":"S1","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"model-one","api_key":"k"}],"subagent_model":"S1"}"#,
+        );
+        let cfg = base_config(directory.path());
+        let factory = super::build_worker_factory(
+            &cfg,
+            directory.path().join("runtime.sock"),
+            &yi_agent_runtime::models::load_catalog_from(&path),
+            &path,
+        )
+        .expect("factory");
+        assert_eq!(factory.resolved_model_for_test(), "model-one");
+
+        std::fs::write(&path, "{ broken").unwrap();
+        assert_eq!(
+            factory.resolved_model_for_test(),
+            "model-one",
+            "a corrupt catalog must keep the last known good model"
+        );
+
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"S1","provider":"openai","api_url":"http://127.0.0.1:9/v1","model":"healed","api_key":"k"}],"subagent_model":"S1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            factory.resolved_model_for_test(),
+            "healed",
+            "a fixed catalog must take effect on the next call"
+        );
     }
 }
