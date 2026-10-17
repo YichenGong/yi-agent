@@ -25,6 +25,14 @@ describe("RPC route table", () => {
     expect(RPC.threadSetModel).toBe("thread/setModel");
     expect(RPC.threadSetReasoningEffort).toBe("thread/setReasoningEffort");
     expect(RPC.modelTest).toBe("model/test");
+    expect(RPC.pluginSettingsRead).toBe("plugin/settings/read");
+    expect(RPC.pluginSettingsWrite).toBe("plugin/settings/write");
+    expect(RPC.uiSettingsRead).toBe("ui/settings/read");
+    expect(RPC.uiSettingsWrite).toBe("ui/settings/write");
+    expect(RPC.imageUploadBegin).toBe("image/upload/begin");
+    expect(RPC.imageUploadChunk).toBe("image/upload/chunk");
+    expect(RPC.imageUploadCommit).toBe("image/upload/commit");
+    expect(RPC.imageUploadAbort).toBe("image/upload/abort");
   });
 
   it("has no two constants sharing a wire value", () => {

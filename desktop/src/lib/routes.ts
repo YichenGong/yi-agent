@@ -24,4 +24,12 @@ export const RPC = {
   threadSetModel: "thread/setModel",
   threadSetReasoningEffort: "thread/setReasoningEffort",
   modelTest: "model/test",
+  pluginSettingsRead: "plugin/settings/read",
+  pluginSettingsWrite: "plugin/settings/write",
+  uiSettingsRead: "ui/settings/read",
+  uiSettingsWrite: "ui/settings/write",
+  imageUploadBegin: "image/upload/begin",
+  imageUploadChunk: "image/upload/chunk",
+  imageUploadCommit: "image/upload/commit",
+  imageUploadAbort: "image/upload/abort",
 } as const;

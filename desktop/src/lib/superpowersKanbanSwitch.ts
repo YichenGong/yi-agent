@@ -147,7 +147,7 @@ export function parseBoardWatchman(value: unknown): boolean {
  * 多发这一趟。
  */
 export async function readBoardWatchman(rpc: BoardRpc): Promise<boolean> {
-  const settings = await rpc<{ board_watchman_enabled?: unknown }>("ui/settings/read", {});
+  const settings = await rpc<{ board_watchman_enabled?: unknown }>(RPC.uiSettingsRead, {});
   return parseBoardWatchman(settings.board_watchman_enabled);
 }
 
@@ -159,7 +159,7 @@ export async function writeBoardWatchman(
   rpc: BoardRpc,
   enabled: boolean,
 ): Promise<{ warning?: string | null }> {
-  return rpc<{ warning?: string | null }>("ui/settings/write", {
+  return rpc<{ warning?: string | null }>(RPC.uiSettingsWrite, {
     board_watchman_enabled: enabled,
   });
 }

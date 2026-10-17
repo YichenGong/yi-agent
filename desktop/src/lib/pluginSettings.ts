@@ -171,7 +171,7 @@ export async function readKanbanSettings(
   rpc: PluginRpc,
   project?: string,
 ): Promise<KanbanSettings> {
-  const result = await rpc<{ settings?: KanbanSettings }>("plugin/settings/read", {
+  const result = await rpc<{ settings?: KanbanSettings }>(RPC.pluginSettingsRead, {
     plugin: KANBAN_PLUGIN,
     ...scopeParams(project),
   });
@@ -185,7 +185,7 @@ export async function writeKanbanSettings(
   settings: KanbanSettings,
   project?: string,
 ): Promise<void> {
-  await rpc("plugin/settings/write", {
+  await rpc(RPC.pluginSettingsWrite, {
     plugin: KANBAN_PLUGIN,
     settings,
     ...scopeParams(project),
