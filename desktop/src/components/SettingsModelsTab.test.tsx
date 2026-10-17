@@ -428,3 +428,66 @@ describe("SettingsModelsTab channel fields", () => {
     expect(await screen.findAllByText(/以 \/v1 结尾/)).toHaveLength(1);
   });
 });
+
+describe("SettingsModelsTab phone layout", () => {
+  it("renders cards instead of a table on the phone", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    const { container } = render(<SettingsModelsTab call={call} isMobile />);
+    await screen.findByText("••••1234");
+
+    // 5 列表格固有 463px，390pt 的面板只有 ~390px，窄屏必须换成纵向卡片。
+    expect(container.querySelector("table")).toBeNull();
+    expect(container.querySelector("[data-model-card]")).toBeTruthy();
+  });
+
+  it("keeps the table on the desktop", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    const { container } = render(<SettingsModelsTab call={call} />);
+    await screen.findByText("••••1234");
+    expect(container.querySelector("table")).toBeTruthy();
+    expect(container.querySelector("[data-model-card]")).toBeNull();
+  });
+
+  it("keeps the card actionable — same labels, same callback names", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    const { container } = render(<SettingsModelsTab call={call} isMobile />);
+    await screen.findByText("••••1234");
+
+    // 限定在卡片内查找：表格形态的 <th> 也有同样的文本，不限定就会误通过（从而
+    // 让这条用例失去「卡片必须自己渲染字段标签」的效力）。
+    const card = container.querySelector("[data-model-card]")!;
+    expect(card).toBeTruthy();
+    expect(card.textContent).toContain("API 格式");
+    expect(card.textContent).toContain("模型标识");
+    // 操作按钮语义不变（可点、有可访问名）；44px 触控目标由 `py-2` 实现。
+    expect(screen.getByRole("button", { name: "编辑" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "删除 A" })).toBeTruthy();
+  });
+
+  it("still shows the /v1 hint on a phone card", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list"
+        ? {
+            models: [
+              { name: "suspect", provider: "openai", api_url: "https://llmapi.horizon.auto", model: "m", has_key: true, api_key_masked: "••••1" },
+            ],
+            default_model: null,
+            subagent_model: null,
+            effective: null,
+          }
+        : {},
+    );
+    const { container } = render(<SettingsModelsTab call={call} isMobile />);
+    // 等卡片出现再断言。不用 `findByText("suspect")`——模型名还会渲染成下方两个
+    // 下拉的 <option>，按文本找会命中多个（表格形态的既有用例正是靠 `selector: "td"`
+    // 才避开这点；卡片形态没有 td）。
+    await waitFor(() => expect(container.querySelector("[data-model-card]")).toBeTruthy());
+    expect(screen.getAllByText(/以 \/v1 结尾/)).toHaveLength(1);
+  });
+});

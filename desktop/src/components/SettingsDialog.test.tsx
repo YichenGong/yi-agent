@@ -168,6 +168,39 @@ describe("SettingsDialog focus management & tab wiring", () => {
   });
 });
 
+describe("SettingsDialog wires phone layout down to the models tab", () => {
+  it("passes isMobile to the models panel, so it renders cards not a table", async () => {
+    // 接线缺口：`SettingsModelsTab` 有了 `isMobile`，但如果 `SettingsDialog` 不把它
+    // 传下去，模型 Tab 在手机上仍会渲染那张固有 463px 的表格、继续横向溢出。这条
+    // 用例穿过真实接线（Dialog → Tab），比只测子组件更能挡住这类断线。
+    const modelCall = async (method: string) =>
+      method === "model/list"
+        ? {
+            models: [
+              { name: "A", provider: "anthropic", api_url: "u", model: "m", has_key: true, api_key_masked: "••••1234" },
+            ],
+            default_model: null,
+            subagent_model: null,
+            effective: null,
+          }
+        : { ok: true };
+    const { container } = render(
+      <SettingsDialog
+        open
+        isMobile
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        modelCall={modelCall}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "模型" }));
+    await screen.findByText("••••1234");
+    expect(container.querySelector("[data-model-card]")).toBeTruthy();
+    expect(container.querySelector("table")).toBeNull();
+  });
+});
+
 // 手机端把设置从「居中弹窗 + 左侧竖栏」改成「全屏页 + 顶部横条」：导航方向随之由
 // 竖变横，`aria-orientation` 必须跟着翻——这是语义，CSS 表达不了。挂点类是外观
 // 覆写（index.css 里 `[data-mobile="true"] .settings-*`）的抓手，两个平台都渲染，

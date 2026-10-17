@@ -188,7 +188,7 @@ export function SettingsDialog({
                 defaultProject={pluginDefaultProject}
               />
             ) : (
-              <SettingsModelsTab call={modelCall} />
+              <SettingsModelsTab call={modelCall} isMobile={isMobile} />
             )}
           </div>
         </div>
