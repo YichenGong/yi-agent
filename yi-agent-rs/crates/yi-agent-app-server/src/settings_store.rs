@@ -148,6 +148,56 @@ pub fn save_relay_url(workdir: &Path, url: Option<&str>) -> std::io::Result<()> 
     read_write_key(workdir, RELAY_URL_KEY, value)
 }
 
+/// 颜色标签显示名覆盖（`preferences.json` 的 `tag_names` 键）。
+pub const TAG_NAMES_KEY: &str = "tag_names";
+
+/// 读用户自定义的颜色标签显示名（颜色 id → 名称）。
+///
+/// 返回磁盘上**实际存在的覆盖项**（可能只有 1 个键，也可能是空映射）。**刻意不**
+/// 在此补齐 6 个默认名：默认名由前端 `threadTags.ts` 唯一持有，后端再定义一套就会
+/// 变成两份必须手工保持一致的默认名。
+///
+/// 缺文件 / 坏文件 / 值的形状不是对象一律当空映射——坏偏好绝不阻断 UI。
+pub fn load_tag_names(workdir: &Path) -> std::collections::BTreeMap<String, String> {
+    let path = preferences_path(workdir);
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .get(TAG_NAMES_KEY)
+                .and_then(|v| v.as_object())
+                .cloned()
+        })
+        .map(|object| {
+            object
+                .into_iter()
+                .filter_map(|(key, value)| value.as_str().map(|s| (key, s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 合并写入颜色标签显示名：只覆盖 `updates` 提到的键，保留既有的其它标签键与
+/// 同文件的无关顶层键（theme / relay_url / …）。
+///
+/// [`read_write_key`] 只写单个顶层键，故「按键合并」在它之上实现：先读出既有覆盖
+/// 项、并入 `updates`，再把整个对象作为 `tag_names` 的值原子落盘。
+pub fn save_tag_names(
+    workdir: &Path,
+    updates: &std::collections::BTreeMap<String, String>,
+) -> std::io::Result<()> {
+    let mut merged = load_tag_names(workdir);
+    for (key, value) in updates {
+        merged.insert(key.clone(), value.clone());
+    }
+    let object: serde_json::Map<String, serde_json::Value> = merged
+        .into_iter()
+        .map(|(key, value)| (key, serde_json::Value::String(value)))
+        .collect();
+    set_object_value(workdir, TAG_NAMES_KEY, serde_json::Value::Object(object))
+}
+
 /// 读 `<workdir>/.yi-agent/preferences.json` 的顶层对象、设置（或删除）一个键、
 /// 原子替换。
 ///
@@ -464,6 +514,71 @@ mod tests {
             preferences_path(dir.path()),
             "the temp name must not be the final file name"
         );
+    }
+
+    /// 颜色标签显示名覆盖（`tag_names`）的读写。
+    ///
+    /// 关键语义：`load_tag_names` 只回磁盘上**实际存过的覆盖项**，不补齐 6 个默认
+    /// 名（默认名唯一持有者是前端 `threadTags.ts`）；`save_tag_names` 是**按键合并**
+    /// 而非整体替换，且与 `theme`/`relay_url` 共处同一文件时互不覆盖。
+    #[test]
+    fn load_tag_names_returns_empty_map_when_absent() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(load_tag_names(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn load_tag_names_returns_only_stored_overrides() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut updates = std::collections::BTreeMap::new();
+        updates.insert("red".to_string(), "紧急".to_string());
+        save_tag_names(dir.path(), &updates).unwrap();
+        let got = load_tag_names(dir.path());
+        assert_eq!(got.len(), 1, "只存了 1 个键就只该回 1 个: {got:?}");
+        assert_eq!(got.get("red").map(String::as_str), Some("紧急"));
+    }
+
+    #[test]
+    fn save_tag_names_merges_and_preserves_other_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+        save(dir.path(), Theme::Light).unwrap();
+        save_relay_url(dir.path(), Some("wss://r/connect?session=x")).unwrap();
+
+        let mut first = std::collections::BTreeMap::new();
+        first.insert("red".to_string(), "紧急".to_string());
+        save_tag_names(dir.path(), &first).unwrap();
+
+        // 第二次只改 blue：red 必须还在（合并而非替换）。
+        let mut second = std::collections::BTreeMap::new();
+        second.insert("blue".to_string(), "参考".to_string());
+        save_tag_names(dir.path(), &second).unwrap();
+
+        let got = load_tag_names(dir.path());
+        assert_eq!(
+            got.get("red").map(String::as_str),
+            Some("紧急"),
+            "red 不得被抹掉"
+        );
+        assert_eq!(got.get("blue").map(String::as_str), Some("参考"));
+
+        // 同文件的其它键不受影响。
+        assert_eq!(load(dir.path()), Theme::Light);
+        assert_eq!(
+            load_relay_url(dir.path()).as_deref(),
+            Some("wss://r/connect?session=x")
+        );
+    }
+
+    #[test]
+    fn load_tag_names_is_empty_on_corrupt_value_shape() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            r#"{"tag_names": "not-an-object"}"#,
+        )
+        .unwrap();
+        assert!(load_tag_names(dir.path()).is_empty(), "坏形状当空映射");
     }
 }
 
