@@ -1166,6 +1166,40 @@ export default function App() {
     await refreshWorkspaces();
   };
 
+  /**
+   * 关联文件夹：原生选目录 → `workspace/link` → 刷新分组与最近目录。
+   *
+   * 关联只在**新建会话时**快照进 `ThreadMeta.extra_roots`，所以这里不需要碰任何
+   * 已在跑的会话：它们的根集在设计上就固定了（改关联只影响之后新建的会话）。
+   */
+  const linkFolder = async (primary: string) => {
+    let child: string | null = null;
+    try {
+      child = await pickDirectory();
+      if (!child) return;
+      await clientRef.current?.request("workspace/link", { primary, child });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+      return;
+    }
+    // 成功后刷新：附属根要从顶层分组挪进主根的嵌套小节，两份数据都得重新拉。
+    await refreshThreads();
+    await refreshWorkspaces();
+  };
+
+  /** 解除关联。失败也刷新，保证 UI 与服务端一致（与 removeWorkspace 同口径）。 */
+  const unlinkFolder = async (child: string) => {
+    try {
+      await clientRef.current?.request("workspace/unlink", { child });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+    }
+    await refreshThreads();
+    await refreshWorkspaces();
+  };
+
   const renameThread = async (id: string, title: string) => {
     const c = clientRef.current;
     if (!c) return;
@@ -2146,6 +2180,8 @@ export default function App() {
           isMobile={isMobile}
           statusStale={offline}
           onOpenSettings={() => setSettingsOpen(true)}
+          onLinkFolder={linkFolder}
+          onUnlinkFolder={unlinkFolder}
         />
         </div>
         <div className="app-main relative flex min-w-0 flex-1 flex-col">
