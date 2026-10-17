@@ -62,6 +62,13 @@ pub struct ThreadMeta {
     /// `default_true`，否则老会话会被静默降级为「丢弃凭证」）。
     #[serde(default = "default_true")]
     pub preserve_thinking: bool,
+    /// 该会话的关联根（主根之外的附属根，canonical 绝对路径）。
+    ///
+    /// `thread/start` 时从本机索引快照，运行期不变——**不**随索引后续变化而追改，
+    /// 故同一目录下先建的会话不会忽然多出一根。旧 meta 缺字段时为空 =
+    /// 单根会话（`Vec` 的内建默认即空，无需 `default_true` 那样的显式默认）。
+    #[serde(default)]
+    pub extra_roots: Vec<String>,
 }
 
 /// `#[serde(default = "…")]` 的显式默认：`bool` 的内建默认是 `false`，而本开关
@@ -777,6 +784,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         reasoning_effort: None,
         // 缺 meta 时从日志重建:无从得知曾经的开关,按默认「保留」解释。
         preserve_thinking: true,
+        extra_roots: Vec::new(),
     }
 }
 
@@ -806,6 +814,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            extra_roots: Vec::new(),
         }
     }
 
@@ -1468,6 +1477,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            extra_roots: Vec::new(),
         }
     }
 
@@ -1842,6 +1852,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            extra_roots: Vec::new(),
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -1858,7 +1869,34 @@ mod tests {
         let json = r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
         let meta: ThreadMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.model_ref, None);
+        // 同一行的旧 meta 也没有 `extra_roots`：缺字段必须读成空集（= 单根会话，
+        // 与关联能力上线前逐字节等价的运行语义）。
+        assert!(meta.extra_roots.is_empty());
         let _ = store;
+    }
+
+    /// `extra_roots` 落盘后必须原样读回，且**不**写进旧 meta 时也当空集——
+    /// 后者即「旧库零迁移」。
+    #[test]
+    fn extra_roots_round_trip_and_legacy_meta_defaults_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        let meta = ThreadMeta {
+            extra_roots: vec!["/w/linked-b".into(), "/w/linked-c".into()],
+            ..sample_meta("t-roots")
+        };
+        store.create(&meta).unwrap();
+        let loaded = store.load("t-roots").unwrap().unwrap();
+        assert_eq!(
+            loaded.meta.extra_roots,
+            vec!["/w/linked-b".to_string(), "/w/linked-c".to_string()]
+        );
+
+        // 旧形状的 meta（无该字段）读成空集。
+        let mut value = serde_json::to_value(sample_meta("t-legacy")).unwrap();
+        value.as_object_mut().unwrap().remove("extra_roots");
+        let back: ThreadMeta = serde_json::from_value(value).unwrap();
+        assert!(back.extra_roots.is_empty());
     }
 
     #[test]
@@ -1880,6 +1918,7 @@ mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            extra_roots: Vec::new(),
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();

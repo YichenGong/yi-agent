@@ -1619,12 +1619,9 @@ thread_local! {
 /// 泄漏关联根。`thread/start` 取本会话的关联根、`thread/resume` 取
 /// `meta.extra_roots`。
 ///
-/// 生产调用点（`thread/start`、`thread/resume` 两个分支）落在 Task 6——那一步才会
-/// 从索引/`meta` 算出根集。在那之前仅测试可达，故按本仓既有口径用
-/// `cfg_attr(not(test), allow(dead_code))`（而非把插槽改成 `#[cfg(test)]`：
-/// `production_factory` 是生产代码，必须能读到它）。Task 6 接上生产调用点后应删掉
-/// 这个属性。
-#[cfg_attr(not(test), allow(dead_code))]
+/// 生产调用点（`thread/start`、`thread/resume` 两个分支）各自捕获本会话的根集
+/// 后传入槽位；`start_thread_core` 与 resume 侧的 `attach_delegation` 收到的都是
+/// 同一个局部量，故槽位与委派路径不可能漂移。
 pub(crate) fn with_session_extra_roots<T>(roots: Vec<PathBuf>, f: impl FnOnce() -> T) -> T {
     SESSION_EXTRA_ROOTS.with(|slot| {
         let prev = slot.replace(roots);
@@ -1640,8 +1637,8 @@ pub(crate) fn with_session_extra_roots<T>(roots: Vec<PathBuf>, f: impl FnOnce() 
 /// 可见性与 [`current_session_model_ref`] 一致（同为私有 `fn`）：`mod tests` 是
 /// `server` 的子模块，直接可达父模块私有项，故测试无需放宽可见性。
 ///
-/// 生产侧有 `production_factory` 这个读点，故无需任何 `allow(dead_code)`（只有插槽
-/// **设定器**在 Task 6 接上生产调用点前是测试专用）。
+/// 读点有两个：生产代码 `production_factory`，以及测试里的记录型工厂
+/// （断言槽位里真正可见的根集）。
 fn current_session_extra_roots() -> Vec<PathBuf> {
     SESSION_EXTRA_ROOTS.with(|slot| slot.borrow().clone())
 }
@@ -3369,14 +3366,74 @@ where
                         write_response(&hub, &client, ok_response(id, json!({}))).await?;
                     }
                     "workspace/list" => {
-                        let list: Vec<serde_json::Value> = workspaces
-                            .list()
-                            .into_iter()
-                            .map(|p| json!({ "path": p, "exists": Path::new(&p).is_dir() }))
+                                let dirs = workspaces.list();
+                                let list: Vec<serde_json::Value> = dirs
+                                    .iter()
+                                    .map(|p| {
+                                        // 只在主根仍登记时上报 linked_to：主根被「Remove from
+                                        // list」后，附属根自动回到顶层显示（见 spec §7）。
+                                        // `links` 记录本身不被 `remove` 抹掉，故主根加回来时
+                                        // 关联显示自动恢复（dangling link 自愈）。
+                                        let linked_to = workspaces
+                                            .linked_to(Path::new(p))
+                                            .filter(|primary| dirs.iter().any(|d| d == primary));
+                                        json!({
+                                            "path": p,
+                                            "exists": Path::new(p).is_dir(),
+                                            "linked_to": linked_to,
+                                        })
+                                    })
                             .collect();
                         write_response(&hub, &client, ok_response(id, json!({ "workspaces": list })))
                             .await?;
                     }
+                            "workspace/link" => {
+                                let primary = req.params.get("primary").and_then(|v| v.as_str()).unwrap_or("");
+                                let child = req.params.get("child").and_then(|v| v.as_str()).unwrap_or("");
+                                match workspaces.link(Path::new(primary), Path::new(child)) {
+                                    Ok(()) => {
+                                        // 附属根也必须进「最近目录」索引：`thread/listAll` 靠
+                                        // `workspaces.list()` 发现冷会话，把附属根从 `dirs` 摘掉
+                                        // 会让它的会话直接从侧栏消失。「附属根不作为顶层组」是
+                                        // **显示层**行为，不是存储层行为（spec §1 关键约束）。
+                                        let canonical = std::fs::canonicalize(child)
+                                            .unwrap_or_else(|_| PathBuf::from(child));
+                                        if let Err(e) = workspaces.add(&canonical) {
+                                            eprintln!(
+                                                "[app-server] failed to index linked workspace {}: {e}",
+                                                canonical.display()
+                                            );
+                                        }
+                                        write_response(&hub, &client, ok_response(id, json!({}))).await?
+                                    }
+                                    // 拒绝一律 `-32602` + 面向用户的原因（UI 原样显示），与
+                                    // `workspace/add` 的非目录拒绝同码。
+                                    Err(e) => {
+                                        write_response(
+                                            &hub, &client,
+                                            err_response(id, RpcError::invalid_params(e.to_string())),
+                                        )
+                                        .await?
+                                    }
+                                }
+                            }
+                            "workspace/unlink" => {
+                                let child = req.params.get("child").and_then(|v| v.as_str()).unwrap_or("");
+                                // 与 `workspace/remove` 同口径：`links` 存的是 canonical，
+                                // 故这里也必须规范化，否则符号链接 / 相对路径 / 尾斜杠会静默
+                                // no-op。canonicalize 失败（路径已不存在）时回退原始串，保持幂等。
+                                let key = std::fs::canonicalize(child).unwrap_or_else(|_| PathBuf::from(child));
+                                match workspaces.unlink(&key) {
+                                    Ok(()) => write_response(&hub, &client, ok_response(id, json!({}))).await?,
+                                    Err(e) => {
+                                        write_response(
+                                            &hub, &client,
+                                            err_response(id, RpcError::internal(e.to_string())),
+                                        )
+                                        .await?
+                                    }
+                                }
+                            }
                     "workspace/add" => {
                         let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
                         match std::fs::canonicalize(raw) {
@@ -3566,14 +3623,23 @@ where
                             .and_then(|v| v.as_str())
                             .map(str::to_string);
 
+                                // 本次会话的关联根：`thread/start` 从索引快照一次，之后**只**用这个局部量
+        // ——既进工厂槽位（决定沙箱/工具/权限的根集），也进 meta（落盘快照）与
+        // `attach_delegation`（委派路径的根集）。三处必须同源，故不各自重读索引。
+                                let extra_roots = linked_extra_roots(&workspaces, &cwd);
+
                         // 本次会话的 `model_ref` 经 thread-local 交给工厂解析 provider /
                         // api_url / api_key / model(命中清单默认则用条目,否则回退 cfg)。
+                                // 关联根同路经 thread-local 传入:工厂是按目录构建、被同目录多个
+                                // 会话共享的,把根集写进共享 `cfg` 会让它泄漏给别的会话。
                         let built = match with_session_model_ref(model_ref.clone(), || {
+                                    with_session_extra_roots(extra_roots.clone(), || {
                             with_session_reasoning_effort(None, || {
                                 with_session_preserve_thinking(true, || {
                                     build_agent(None, Path::new(&cwd), mode)
                                 })
                             })
+                                    })
                         }) {
                             Ok(a) => a,
                             Err(e) => {
@@ -3612,6 +3678,9 @@ where
                             &cwd,
                             mode,
                             thread_id.clone(),
+                                    // 本会话的关联根：上面已捕获的同一个局部量，内核据此写
+                                    // meta 并传给 `attach_delegation`（不在那里重读槽位）。
+                                    extra_roots,
                             built,
                             &hub,
                             &client,
@@ -3734,12 +3803,26 @@ where
                         let thread_store =
                             Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
+                                // 附属根从 meta 快照重建（不在 resume 时重读索引：关联是**会话属性**，
+        // 建会话时定了就不再追改，否则同一会话的权限根集会随索引漂移）。
+                                // 已删的附属根静默丢弃——它是能力增量，不该让会话打不开；
+                                // cwd 已删仍走上方既有报错（那是权威基点）。
+                                let extra_roots: Vec<PathBuf> = loaded
+                                    .meta
+                                    .extra_roots
+                                    .iter()
+                                    .map(PathBuf::from)
+                                    .filter(|p| p.is_dir())
+                                    .collect();
+
                         let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
+                                    with_session_extra_roots(extra_roots.clone(), || {
                             with_session_reasoning_effort(loaded.meta.reasoning_effort.clone(), || {
                                 with_session_preserve_thinking(loaded.meta.preserve_thinking, || {
                                     build_agent(Some(session), Path::new(&cwd), mode)
                                 })
                             })
+                                    })
                         }) {
                             Ok(a) => a,
                             Err(e) => {
@@ -3778,11 +3861,9 @@ where
                             &thread_id,
                             &theme,
                             &git_diff_handle,
-                            // 本调用点位于 `build_agent` 的插槽作用域**之外**，故此处
-                            // 读到的恒为空集（= 单根会话，与改动前一致）。Task 6 会改为
-                            // 传入它自己捕获的 `extra_roots`；换掉这一行的实参即可，
-                            // 无需动签名。
-                            current_session_extra_roots(),
+                                    // 与工厂槽位**同一个值**：resume 侧的委派路径必须与
+                                    // 重建 agent 时下发到工厂的根集一致。
+                                    extra_roots,
                             built,
                         );
                         let BuiltAgent {
@@ -7342,6 +7423,10 @@ where
             &request.workdir,
             crate::thread_store::ThreadMode::Yolo,
             thread_id.clone(),
+            // 看板会话起在卡片 worktree 里，那不是用户登记的「主根」，没有关联根
+            // 可言；空集 = 单根会话（与改动前逐字一致，spec §7「看板项目列表行为
+            // 不变」）。
+            Vec::new(),
             built,
             &hub,
             &client,
@@ -7515,6 +7600,11 @@ async fn start_thread_core(
     cwd: &str,
     mode: crate::thread_store::ThreadMode,
     thread_id: String,
+    // 本会话的关联根（主根之外的附属根），由调用方在 `with_session_extra_roots`
+    // 的同一作用域内捕获后传入：既写进 meta（快照），也交给 `attach_delegation`
+    // 供委派路径构造多根工具集。**不在此处读槽位**，否则调用点一旦漏设就会静默
+    // 拿到空集（或残留值）。
+    extra_roots: Vec<PathBuf>,
     built: BuiltAgent,
     hub: &Arc<crate::broadcast::Broadcaster>,
     client: &crate::broadcast::ClientId,
@@ -7547,9 +7637,9 @@ async fn start_thread_core(
         &thread_id,
         theme,
         git_diff,
-        // 本调用点位于 `build_agent` 的插槽作用域**之外**，故此处读到的恒为空集
-        // （= 单根会话，与改动前一致）。Task 6 会改为传入它自己捕获的 `extra_roots`。
-        current_session_extra_roots(),
+        // 调用方捕获的同一根集：落进 meta 的与交给委派路径的必须是同一个值，
+        // 否则「meta 说有一根、实际工具集里没有」这类不一致无从察觉。
+        extra_roots.clone(),
         built,
     );
     let BuiltAgent {
@@ -7585,6 +7675,11 @@ async fn start_thread_core(
         reasoning_effort: None,
         // 新会话默认开启跨轮保留(与 `ThreadMeta` 的缺省语义一致)。
         preserve_thinking: true,
+        // 从索引快照下来的关联根：运行期不变（后续改索引不追改本会话）。
+        extra_roots: extra_roots
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -8077,6 +8172,23 @@ async fn start_turn_core(
         }
     }
     Ok(Some(prepared.thread_id))
+}
+
+/// 解析某主根当前关联的附属根：取索引里的记录，丢掉已不存在的目录。
+///
+/// 静默丢弃（而非报错）是有意的：附属根是能力增量，它消失不该让会话打不开；
+/// `cwd` 本身已删仍照既有行为报错（`resolve_thread_cwd` / resume 的守卫），
+/// 因为那是权威基点。
+///
+/// `WorkspaceIndex::children` 返回的已是 canonical 绝对路径（`link` 写入前
+/// canonicalize 过），故此处无需再规范化。
+fn linked_extra_roots(workspaces: &WorkspaceIndex, cwd: &str) -> Vec<PathBuf> {
+    workspaces
+        .children(Path::new(cwd))
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .collect()
 }
 
 /// 解析 `thread/start` 的目标目录:显式 `params.cwd` 优先,缺省用 `cfg.workdir`。
@@ -13715,6 +13827,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                extra_roots: Vec::new(),
             })
             .unwrap();
         // 全局索引指向该工作区（canonicalize 以对齐真实写入的路径形态）。
@@ -15226,6 +15339,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                extra_roots: Vec::new(),
             })
             .unwrap();
 
@@ -15331,6 +15445,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: false,
+                extra_roots: Vec::new(),
             })
             .unwrap();
 
@@ -15424,6 +15539,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                extra_roots: Vec::new(),
             })
             .unwrap();
 
@@ -16745,6 +16861,7 @@ pub(crate) mod tests {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            extra_roots: Vec::new(),
         };
         crate::thread_store::ThreadStore::new(dir)
             .create(&meta)
@@ -17196,6 +17313,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                extra_roots: Vec::new(),
             })
             .unwrap();
         store
@@ -17302,6 +17420,7 @@ pub(crate) mod tests {
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
+                extra_roots: Vec::new(),
             })
             .unwrap();
         // 一轮正常收尾过的历史。
@@ -22251,6 +22370,293 @@ pub(crate) mod tests {
             Some(thread_id.as_str())
         );
         assert_eq!(notif["params"]["mode"].as_str(), Some("yolo"));
+        h.shutdown().await;
+    }
+
+    /// 记录型工厂：把每次 `build_agent` 时**槽位里实际可见**的关联根记下来。
+    ///
+    /// 只断言 meta 里的字符串是不够的——那条链「meta ← 索引」通、「槽位 → 工厂」
+    /// 断掉时，关联根同样是形同虚设的；本夹具把后半段钉死。
+    fn recording_roots_factory(
+        seen: Arc<std::sync::Mutex<Vec<Vec<PathBuf>>>>,
+    ) -> impl Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent>
+    + Send
+    + Sync
+    + 'static {
+        move |session, cwd, mode| {
+            seen.lock().unwrap().push(current_session_extra_roots());
+            build_test_agent(session, cwd, mode)
+        }
+    }
+
+    /// 读某个 cwd 下某 thread 的 `.meta.json`（真实布局是
+    /// `<cwd>/.yi-agent/threads/<tid>.meta.json`）。
+    fn read_meta(cwd: &Path, tid: &str) -> serde_json::Value {
+        let path = cwd
+            .join(".yi-agent")
+            .join("threads")
+            .join(format!("{tid}.meta.json"));
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    /// Task 6 §2：`thread/start` 把主根当前关联的附属根快照进 meta；
+    /// `thread/resume` 从 meta 重建同一根集并再次下发到工厂。
+    ///
+    /// 两侧都断言：meta 里的字符串（持久化）与工厂槽位里的值（真正生效）。
+    /// resume 前先 `unlink`，从而证明重建来源是 **meta 快照**而非再读索引。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_start_records_linked_roots_and_resume_rebuilds_them() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = dir.path().join("primary");
+        let secondary = dir.path().join("secondary");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&secondary).unwrap();
+        let primary = primary.canonicalize().unwrap();
+        let secondary = secondary.canonicalize().unwrap();
+
+        let seen: Arc<std::sync::Mutex<Vec<Vec<PathBuf>>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let mut h = Harness::with_factory(
+            recording_roots_factory(Arc::clone(&seen)),
+            PERMISSION_TIMEOUT,
+        );
+        initialize(&mut h).await;
+
+        // 关联：primary ← secondary。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace/link","params":{{"primary":"{}","child":"{}"}}}}"#,
+            primary.display(),
+            secondary.display()
+        ))
+        .await;
+        let linked = read_response(&mut h, 2).await;
+        assert_eq!(linked["result"], json!({}), "{linked}");
+
+        // 在 primary 建会话 → meta 应记下 secondary，工厂也必须拿到它。
+        h.send(
+            &json!({"jsonrpc":"2.0","id":3,"method":"thread/start",
+            "params":{"cwd": primary.to_string_lossy()}})
+            .to_string(),
+        )
+        .await;
+        let tid = read_thread_start_response(&mut h, 3).await;
+
+        let meta = read_meta(&primary, &tid);
+        assert_eq!(
+            meta["extra_roots"],
+            json!([secondary.to_string_lossy()]),
+            "{meta}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [vec![secondary.clone()]],
+            "工厂槽位里必须是本会话的关联根"
+        );
+
+        // 取消关联后再 resume：根集只能来自 meta 快照（索引此时已空）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"workspace/unlink","params":{{"child":"{}"}}}}"#,
+            secondary.display()
+        ))
+        .await;
+        let unlinked = read_response(&mut h, 4).await;
+        assert_eq!(unlinked["result"], json!({}), "{unlinked}");
+
+        h.send(
+            &json!({"jsonrpc":"2.0","id":5,"method":"thread/resume","params":{"threadId": tid}})
+                .to_string(),
+        )
+        .await;
+        let resumed = read_response(&mut h, 5).await;
+        assert!(resumed.get("error").is_none(), "{resumed}");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [vec![secondary.clone()], vec![secondary.clone()]],
+            "resume 必须从 meta 重建同一根集，而非再读索引"
+        );
+        h.shutdown().await;
+    }
+
+    /// 关联是**会话快照**，不是目录的活属性：同一 cwd 后建的会话拿到新关联，
+    /// 先建会话的 meta 不被追改，其槽位也不会忽然多出一根。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn linked_roots_do_not_leak_across_threads_in_one_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cwd = dir.path().join("proj");
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let other = other.canonicalize().unwrap();
+
+        let seen: Arc<std::sync::Mutex<Vec<Vec<PathBuf>>>> =
+            Arc::new(std::sync::Mutex::new(vec![]));
+        let mut h = Harness::with_factory(
+            recording_roots_factory(Arc::clone(&seen)),
+            PERMISSION_TIMEOUT,
+        );
+        initialize(&mut h).await;
+
+        // 未关联时建的会话：根集为空（meta 与槽位两侧）。
+        h.send(
+            &json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{"cwd": cwd.to_string_lossy()}})
+            .to_string(),
+        )
+        .await;
+        let first = read_thread_start_response(&mut h, 2).await;
+        assert_eq!(read_meta(&cwd, &first)["extra_roots"], json!([]));
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [Vec::<PathBuf>::new()],
+            "未关联即单根会话"
+        );
+
+        // 之后才关联 cwd ← other。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace/link","params":{{"primary":"{}","child":"{}"}}}}"#,
+            cwd.display(),
+            other.display()
+        ))
+        .await;
+        let linked = read_response(&mut h, 3).await;
+        assert_eq!(linked["result"], json!({}), "{linked}");
+
+        h.send(
+            &json!({"jsonrpc":"2.0","id":4,"method":"thread/start",
+            "params":{"cwd": cwd.to_string_lossy()}})
+            .to_string(),
+        )
+        .await;
+        let second = read_thread_start_response(&mut h, 4).await;
+        assert_ne!(first, second, "两个会话必须是不同的 thread");
+        assert_eq!(
+            read_meta(&cwd, &second)["extra_roots"],
+            json!([other.to_string_lossy()]),
+            "后建的会话应拿到新关联"
+        );
+        assert_eq!(
+            read_meta(&cwd, &first)["extra_roots"],
+            json!([]),
+            "先建会话的 meta 不得被追改"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [vec![], vec![other.clone()]],
+            "同一 cwd 的两个会话各拿自己的根集"
+        );
+        h.shutdown().await;
+    }
+
+    /// `workspace/link` 的输入校验：自关联与不存在的目录一律 `-32602`
+    /// （与 `workspace/add` 的非目录拒绝同码，UI 直接显示服务端原因）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_link_rejects_self_and_unknown_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace/link","params":{{"primary":"{p}","child":"{p}"}}}}"#,
+            p = a.display()
+        ))
+        .await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["error"]["code"], -32602, "{v}");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace/link","params":{{"primary":"{p}","child":"{n}"}}}}"#,
+            p = a.display(),
+            n = dir.path().join("nope").display()
+        ))
+        .await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["error"]["code"], -32602, "{v}");
+        h.shutdown().await;
+    }
+
+    /// `workspace/list` 的每项带 `linked_to`：附属根指向主根，主根自身为 `null`。
+    /// 附属根必须仍在 `dirs` 里（`thread/listAll` 靠它发现冷会话）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn workspace_list_reports_linked_to() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let a = a.canonicalize().unwrap();
+        let b = b.canonicalize().unwrap();
+        let mut h = Harness::new();
+        initialize(&mut h).await;
+
+        // 主根先在索引里（真实流程：用户从侧栏某目录的组头菜单里「关联文件夹」，
+        // 该目录必然已因建会话或 Add folder 进了索引）。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"workspace/add","params":{{"path":"{}"}}}}"#,
+            a.display()
+        ))
+        .await;
+        let added = read_response(&mut h, 2).await;
+        assert!(added.get("error").is_none(), "{added}");
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"workspace/link","params":{{"primary":"{a}","child":"{b}"}}}}"#,
+            a = a.display(),
+            b = b.display()
+        ))
+        .await;
+        let linked = read_response(&mut h, 3).await;
+        assert_eq!(linked["result"], json!({}), "{linked}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        let list = v["result"]["workspaces"].as_array().unwrap();
+        let entry = list
+            .iter()
+            .find(|w| w["path"] == json!(b.to_string_lossy()))
+            .unwrap_or_else(|| panic!("linked dir must be listed: {v}"));
+        assert_eq!(entry["linked_to"], json!(a.to_string_lossy()), "{v}");
+        // `workspace/link` 顺带把附属根 add 进索引：`thread/listAll` 靠它发现冷会话。
+        assert_eq!(entry["exists"], json!(true), "{v}");
+        let primary = list
+            .iter()
+            .find(|w| w["path"] == json!(a.to_string_lossy()))
+            .unwrap_or_else(|| panic!("primary must be listed too: {v}"));
+        assert_eq!(primary["linked_to"], serde_json::Value::Null, "{v}");
+
+        // dangling link 自愈（spec §7）：主根被「Remove from list」后，附属根必须
+        // 回到顶层显示（`linked_to` 不再上报），而 `links` 记录本身不被抹掉。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":5,"method":"workspace/remove","params":{{"path":"{}"}}}}"#,
+            a.display()
+        ))
+        .await;
+        let removed = read_response(&mut h, 5).await;
+        assert!(removed.get("error").is_none(), "{removed}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"workspace/list","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 6).await;
+        let entry = v["result"]["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["path"] == json!(b.to_string_lossy()))
+            .unwrap_or_else(|| panic!("linked dir must still be listed: {v}"));
+        assert_eq!(
+            entry["linked_to"],
+            serde_json::Value::Null,
+            "主根掉出索引后附属根必须回到顶层: {v}"
+        );
         h.shutdown().await;
     }
 }
