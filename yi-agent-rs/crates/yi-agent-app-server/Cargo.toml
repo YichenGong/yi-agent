@@ -37,6 +37,9 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 sha2 = "0.10"
+# `devices.json` 的读-改-写要在内核 `flock` 下跨进程串行化(见 device_store.rs):
+# 该表被桌面侧车、`--relay` 实例与 CLI 共享,进程内 `Mutex` 挡不住别的进程。
+libc = "0.2"
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
