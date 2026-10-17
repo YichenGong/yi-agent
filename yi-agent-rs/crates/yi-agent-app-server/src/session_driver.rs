@@ -3,10 +3,11 @@
 //! 本模块不认识看板、卡片、合并。它只认识两件事：宿主能提供的通用事实
 //! （某个会话闲不闲），与宿主能执行的两个通用动作（新建会话 / 追加一轮）。
 //!
-//! 本任务到达时消费方尚未接线（`driver_step` 在下一任务、`SessionLauncher` 的真
-//! 实现更晚），所以下面这些类型在生产构建下暂时「未读」。它们是**跨进程协议面**
-//! （字段名与插件逐字对齐），删掉才是错的，故照本 crate 既有的协议字段放行做法
-//! 显式 `#[allow(dead_code)]`；消费方接入后应当把放行去掉。
+//! 本任务到达时消费方尚未接线：拉拍循环 `driver_step` 已就位但主循环要到 Task 6
+//! 才调它，`SessionLauncher` 的真实现更晚（Task 5）。所以下面这些类型、以及
+//! `driver_step` / `threads_payload` 在生产构建下暂时「未读」。它们是**跨进程协议
+//! 面**（字段名与插件逐字对齐），删掉才是错的，故照本 crate 既有的协议字段放行
+//! 做法显式 `#[allow(dead_code)]`；消费方接入后应当把放行去掉。
 
 use serde_json::Value;
 
@@ -86,6 +87,81 @@ pub(crate) trait SessionLauncher {
     async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String>;
 }
 
+/// 把宿主持有的会话事实编成 `driver/next` 的 `threads` 参数。
+#[allow(dead_code)]
+pub(crate) fn threads_payload(threads: &[DriverThread], idle: &dyn Fn(&str) -> bool) -> Value {
+    Value::Array(
+        threads
+            .iter()
+            .map(|thread| {
+                serde_json::json!({
+                    "thread_id": thread.thread_id,
+                    "idle": idle(&thread.thread_id),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// 拉一拍：问插件「下一步做什么」，执行至多一个动作，返回其结果。
+///
+/// `results` 里是上一拍尚未回报的结果；本拍把它们上送后清空。
+#[allow(dead_code)]
+pub(crate) async fn driver_step<L: SessionLauncher>(
+    query: &dyn Fn(&Value) -> Result<Value, String>,
+    threads: &mut Vec<DriverThread>,
+    results: &mut Vec<ActionResult>,
+    launcher: &mut L,
+) -> Option<ActionResult> {
+    let results_payload = Value::Array(
+        results
+            .iter()
+            .map(|result| {
+                serde_json::json!({
+                    "action_id": result.action_id,
+                    "ok": result.ok,
+                    "thread_id": result.thread_id,
+                    "error": result.error,
+                })
+            })
+            .collect(),
+    );
+    let params = serde_json::json!({
+        "threads": threads_payload(threads, &|_| false),
+        "results": results_payload,
+    });
+    results.clear();
+
+    let answer = match query(&params) {
+        Ok(answer) => answer,
+        // 插件/daemon 不可用：本拍无法推进，留给下一拍重试。
+        Err(_) => return None,
+    };
+    let action = parse_action(&answer)?;
+
+    match launcher.launch(&action).await {
+        Ok(thread_id) => {
+            if let DriverActionKind::Launch { .. } = &action.kind {
+                threads.push(DriverThread {
+                    thread_id: thread_id.clone(),
+                });
+            }
+            Some(ActionResult {
+                action_id: action.action_id,
+                ok: true,
+                thread_id: Some(thread_id),
+                error: None,
+            })
+        }
+        Err(error) => Some(ActionResult {
+            action_id: action.action_id,
+            ok: false,
+            thread_id: None,
+            error: Some(error.to_string()),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +218,115 @@ mod tests {
     #[test]
     fn a_missing_action_id_is_ignored() {
         assert!(parse_action(&json!({ "kind": "launch", "workdir": "/w" })).is_none());
+    }
+
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct FakeLauncher {
+        seen: Vec<DriverAction>,
+        thread_id: String,
+        fail: Option<String>,
+    }
+
+    impl SessionLauncher for FakeLauncher {
+        async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String> {
+            self.seen.push(action.clone());
+            match &self.fail {
+                Some(detail) => Err(anyhow::anyhow!(detail.clone())),
+                None => Ok(self.thread_id.clone()),
+            }
+        }
+    }
+
+    fn answering(reply: Value) -> impl Fn(&Value) -> Result<Value, String> {
+        move |_params: &Value| Ok(reply.clone())
+    }
+
+    #[tokio::test]
+    async fn a_launch_action_is_executed_and_reported_ok() {
+        let reply = json!({
+            "action_id": "a1", "kind": "launch",
+            "workdir": "/w", "title": "T", "objective": "do it"
+        });
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher {
+            thread_id: "thread-9".into(),
+            ..Default::default()
+        };
+
+        let outcome =
+            driver_step(&answering(reply), &mut threads, &mut results, &mut launcher).await;
+
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.action_id, "a1");
+        assert!(outcome.ok);
+        assert_eq!(launcher.seen.len(), 1, "the launcher runs exactly once");
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_is_reported_with_the_error_and_no_thread() {
+        let reply = json!({
+            "action_id": "a2", "kind": "launch",
+            "workdir": "/w", "title": "T", "objective": "do it"
+        });
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher {
+            fail: Some("worktree gone".into()),
+            ..Default::default()
+        };
+
+        let outcome = driver_step(&answering(reply), &mut threads, &mut results, &mut launcher)
+            .await
+            .unwrap();
+
+        assert!(!outcome.ok);
+        assert_eq!(outcome.error.as_deref(), Some("worktree gone"));
+        assert!(outcome.thread_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_null_answer_performs_no_side_effect() {
+        let mut threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher::default();
+
+        let outcome = driver_step(
+            &answering(json!({ "action": null })),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+        )
+        .await;
+
+        assert!(outcome.is_none());
+        assert!(launcher.seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_results_are_sent_on_the_next_call_and_then_cleared() {
+        let reply = json!({ "action": null });
+        let mut threads = Vec::new();
+        let mut results = vec![ActionResult {
+            action_id: "a0".into(),
+            ok: false,
+            thread_id: None,
+            error: Some("boom".into()),
+        }];
+        let seen: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+        let query = |params: &Value| {
+            seen.borrow_mut().push(params.clone());
+            Ok(reply.clone())
+        };
+        let mut launcher = FakeLauncher::default();
+
+        driver_step(&query, &mut threads, &mut results, &mut launcher).await;
+
+        let sent = seen.borrow().clone();
+        assert_eq!(sent[0]["results"][0]["action_id"], "a0");
+        assert_eq!(sent[0]["results"][0]["ok"], false);
+        assert!(results.is_empty(), "consumed results are cleared");
     }
 }
