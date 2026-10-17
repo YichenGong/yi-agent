@@ -148,7 +148,13 @@ export function SettingsDialog({
             </button>
           ))}
         </nav>
-        <div className="flex min-w-0 flex-1 flex-col">
+        {/*
+          手机端要靠 `order` 把标题栏排到 Tab 条之前（DOM 里 nav 是 shell 的第一个
+          子元素，标题栏却嵌在这个包裹层里）；跨层级无法直接重排，故手机端给这一层
+          `display: contents` 让它「消失」，其子元素升为 shell 的 flex item，order 才
+          生效。桌面端该类无任何样式命中，DOM 与观感逐字节不变。
+        */}
+        <div className="settings-body flex min-w-0 flex-1 flex-col">
           <div className="settings-header flex items-center justify-between border-b border-line px-4 py-2">
             <span className="text-xs text-fg-subtle">设置</span>
             <button

@@ -236,4 +236,33 @@ describe("phone layout CSS", () => {
       /\[data-mobile="true"\]\s+\.settings-shell\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
     expect(shell).toMatch(/padding-bottom:\s*0/);
   });
+
+  it("puts the settings header above the tab bar on the phone", () => {
+    // DOM 顺序是 [nav, (header, panel)]，而手机上要的视觉顺序是 [header, nav, panel]。
+    // 标题栏若排在 Tab 条之后：(1) 观感上「设置」标题跑到 Tab 条下面；(2) 更实际的，
+    // 顶部安全区（刘海）内边距挂在 `.settings-header` 上，那段留白会落到屏幕中部，
+    // Tab 条反而紧贴状态栏被压住。跨嵌套层级要靠 `display: contents` 让包裹层「消失」
+    // 再对子元素用 `order`——真机 Chrome 实测修正前 header.y=0 但渲染在 nav 之后。
+    const bodyRule =
+      /\[data-mobile="true"\]\s+\.settings-body\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(bodyRule).toMatch(/display:\s*contents/);
+
+    // 同一选择器会有多条规则块（安全区、order…），必须汇总全部声明再断言；
+    // 只取第一条会漏掉 `order`。
+    const blocks = (selector: string) =>
+      [...css().matchAll(new RegExp(`\\[data-mobile="true"\\]\\s+\\${selector}\\s*\\{([^}]*)\\}`, "g"))]
+        .map((m) => m[1])
+        .join("\n");
+
+    const head = blocks(".settings-header");
+    const nav = blocks(".settings-nav");
+    const panel = blocks(".settings-panel");
+
+    const orderOf = (rule: string) => Number(/order:\s*(\d+)/.exec(rule)?.[1] ?? "0");
+    expect(orderOf(head)).toBe(1);
+    expect(orderOf(nav)).toBe(2);
+    expect(orderOf(panel)).toBe(3);
+    // 升为 flex item 后必须锁住高度，否则会被纵向 flex 压缩。
+    expect(head).toMatch(/flex-shrink:\s*0/);
+  });
 });

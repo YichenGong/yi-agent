@@ -394,3 +394,29 @@ html[data-mobile="true"] {
   padding-bottom: env(safe-area-inset-bottom, 0px);
   overscroll-behavior: contain;
 }
+
+/*
+ * 手机端的层级重排：DOM 顺序是 [nav, (header, panel)]，而手机上要的视觉顺序是
+ * [header, nav, panel]——标题栏必须在 Tab 条**之上**，否则：(1) 观感上「设置」标题
+ * 跑到了 Tab 条下面；(2) 更实际的，顶部安全区（刘海）内边距挂在 `.settings-header`
+ * 上，标题栏一旦排在后面，那段留白就落到了屏幕中部，Tab 条反而紧贴刘海/状态栏，
+ * 真机上会被状态栏压住。
+ *
+ * 跨嵌套层级无法用 `order` 直接重排，故让中间那层包裹 div `display: contents`
+ * 「消失」（它本身没有边框/背景/内边距，只是布局容器），其子元素升为 shell 的直接
+ * flex item，order 随即可用。桌面端不匹配该选择器，DOM 与观感逐字节不变。
+ */
+[data-mobile="true"] .settings-body {
+  display: contents;
+}
+[data-mobile="true"] .settings-header {
+  order: 1;
+  /* 升为 flex item 后必须锁住自身高度，否则会被纵向 flex 压缩。 */
+  flex-shrink: 0;
+}
+[data-mobile="true"] .settings-nav {
+  order: 2;
+}
+[data-mobile="true"] .settings-panel {
+  order: 3;
+}
