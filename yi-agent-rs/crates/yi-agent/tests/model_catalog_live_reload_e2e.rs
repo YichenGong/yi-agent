@@ -124,7 +124,7 @@ fn start_fixture() -> Option<Fixture> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if matches!(
-            send_request(&fixture.socket(), IpcRequest::Status),
+            send_request(fixture.socket(), IpcRequest::Status),
             Ok(IpcResponse::Status { .. })
         ) {
             break;
