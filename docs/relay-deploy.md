@@ -538,6 +538,34 @@ initialize、pair、以及两端同 store 的一致性。
 - 电脑侧反向代理需支持 WebSocket 升级（Caddy 开箱即用；nginx 要 `Upgrade`/
   `Connection` 头，见 §2.3）。
 
+#### 手机连不上、电脑端却一切正常（中继日志只有 `app connected`、没有 `agent connected`）
+
+症状：手机一直显示「无法连接服务器」并每 ~11 秒重连，中继日志里 `app connected`
+反复出现、`agent connected` 从不出现，电脑上的 App 运行完全正常。
+
+**这表示电脑侧的出站中继桥没挂上，而非中继/Caddy/手机侧故障。** 若中继日志两端都
+有连接，问题就在别处（见上一条）。
+
+先确认电脑侧确实没连上中继：
+
+```bash
+# 电脑上：中继桥进程应持有到中继 443 的 ESTABLISHED 连接
+lsof -nP -p "$(pgrep -f 'app-server.*--relay' | head -1)" | grep 101.47.76.100
+# 空 = 桥没挂上
+```
+
+历史根因（已修，`0f4f7c59` 之后引入）：**rustls 0.23 的 crypto provider 冲突**。
+桌面 app-server 依赖图里 `ring`（自有 `reqwest 0.12`）与 `aws_lc_rs`（`rmcp` 经
+`reqwest 0.13`）两个 provider feature 并存时，rustls 无法从 crate features 判定
+进程级 provider，`ClientConfig::builder()` 直接 panic；中继客户端是进程里唯一建
+`wss://` 的地方，该 panic 落在被 `spawn` 的桥接任务里被 tokio 吞掉——于是「手机连
+不上、电脑看起来正常」。修复是在 `yi-agent-relay` 的 `run_client` 起始处显式
+`install_default()` 定死 provider（`crates/yi-agent-relay/src/crypto.rs`）。
+
+**若再现且为旧二进制**：升级/重建桌面 app（`--relay` 侧车用的是桌面自带的
+`yi-agent` 二进制）后重启 App；应急排查可看桥进程 stderr 是否含
+`Could not automatically determine the process-level CryptoProvider`。
+
 ### 手机发消息没有电脑响应
 
 - 中继在"该 session 没有电脑"时，会把手机发来的帧回一个最小错误帧：

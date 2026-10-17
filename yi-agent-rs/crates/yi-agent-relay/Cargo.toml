@@ -15,7 +15,18 @@ futures.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true }
+# rustls provider 的**显式**选择:见 `src/crypto.rs`。crate features 判定在
+# 双 provider 组合下会 panic,故这里固定启用 `ring`(与自有 reqwest 0.12 一致,
+# 且对 musl 静态交叉编译比 aws-lc-rs 更省事)。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-tungstenite = { version = "0.29", features = ["url", "rustls-tls-webpki-roots"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+# 复刻桌面 app-server 进程的 rustls provider feature 组合:`ring`(自有 `reqwest 0.12`)
+# 与 `aws_lc_rs`(`rmcp`→`reqwest 0.13`)**同时**启用。此时 rustls 无法从 crate features
+# 判定进程级默认 provider,任何隐式取 provider 的 TLS 客户端构造都会 panic。把它放进
+# dev-dependency,使本 crate 的回归测试**稳定**复现该歧义,而不依赖桌面侧的依赖图。
+rustls = { version = "0.23", default-features = false, features = ["ring", "aws_lc_rs", "std"] }

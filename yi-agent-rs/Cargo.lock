@@ -5044,6 +5044,7 @@ dependencies = [
  "anyhow",
  "axum",
  "futures",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
