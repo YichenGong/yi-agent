@@ -175,3 +175,89 @@ async fn run_client_with_a_bad_local_token_never_delivers() {
     .unwrap_or(false);
     assert!(!got, "a bad local token must not yield a bridged echo");
 }
+
+/// 回归:被顶替的电脑连接必须**被关闭并重连**,否则它变成僵尸、该 session 永久失效。
+///
+/// 复现 2026-10-17 的实机故障:一条误连 `/connect` 的探针顶替了真正的桥,中继只换
+/// 路由条目、不关旧 socket,旧客户端(桥)因此永不重连;探针离开后该 session 再无电脑,
+/// 手机长期收到 `no computer connected for this session`,直到中继重启。
+///
+/// 断言顺序:桥先当上电脑 → 探针顶替 → 探针离开 → **桥在退避窗口内重连并重新当上
+/// 电脑**,于是手机帧又能往返。修复前这一步永远等不到(桥是僵尸)。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_displaced_bridge_reconnects_and_restores_the_session() {
+    let local = spawn_fake_local_app_server().await;
+    let relay = spawn_relay().await;
+    let relay_url = || Url::parse(&format!("ws://{relay}/connect")).unwrap();
+    let local_url = || Url::parse(&format!("ws://{local}/ws")).unwrap();
+
+    // 真正的桥:常驻,断开即自行退避重连(这正是被测行为)。
+    tokio::spawn({
+        let (relay_url, local_url) = (relay_url(), local_url());
+        async move {
+            let _ = yi_agent_relay::run_client(
+                relay_url,
+                local_url,
+                "session-z".to_string(),
+                "dev-token".to_string(),
+            )
+            .await;
+        }
+    });
+
+    // 手机连上,轮询直到「桥已当上电脑」(帧能往返)。
+    let (mut phone, _) =
+        tokio_tungstenite::connect_async(format!("ws://{relay}/ws?session=session-z"))
+            .await
+            .expect("phone connect");
+    round_trip(&mut phone, "before").await;
+
+    // 探针(误连电脑侧端点)顶替真正的桥。用一个直接连中继 `/connect` 的裸 ws 模拟。
+    let (probe, _) =
+        tokio_tungstenite::connect_async(format!("ws://{relay}/connect?session=session-z"))
+            .await
+            .expect("probe connect");
+    // 顶替需要登记生效;随即离开,模拟探针用完就走。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(probe); // 或 probe.close(None).await
+
+    // 探针走后,真正的桥必须在退避窗口内重连并重新当上电脑 → 手机帧又能往返。
+    // 修复前:桥收不到 Close、永不重连,这里会一直等到超时。
+    let echoed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(t) = try_round_trip(&mut phone, "after").await {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("被顶替的桥必须重连,使该 session 恢复可用");
+    assert_eq!(echoed, "after");
+}
+
+/// 发一帧并等到回显,最多重试到超时(桥可能尚未就绪)。
+async fn round_trip(phone: &mut Phone, payload: &str) -> String {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(t) = try_round_trip(phone, payload).await {
+                return t;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("frame must round-trip through relay + run_client + local endpoint")
+}
+
+/// 试一次:发帧后短窗口内看是否有等值回显。
+async fn try_round_trip(phone: &mut Phone, payload: &str) -> Option<String> {
+    phone.send(ClientMessage::Text(payload.into())).await.ok()?;
+    match tokio::time::timeout(Duration::from_millis(300), phone.next()).await {
+        Ok(Some(Ok(ClientMessage::Text(t)))) if t == payload => Some(t.to_string()),
+        _ => None,
+    }
+}
+
+type Phone =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
