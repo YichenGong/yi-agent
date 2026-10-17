@@ -1491,6 +1491,12 @@ export default function App() {
           // 这次握手已经废了:重新从 base 起算退避(handshake 成功时本就会归零,
           // 这里针对的是"连上后立刻断"——attempt 不能被永久抬到高位)。
           warm.current.clear();
+          // 推送来的运行状态同样不再成立：新进程对任何会话都没有内存 agent。
+          // 不清它的话，一条崩溃前正在跑、而 `listAll` 现已报 `idle` 的会话会
+          // 停在 `running`，`selectThread` 会因此跳过 resume，新进程里那个 agent
+          // 永远不被重建，之后发送撞上 `-32011` 且无法自愈。详见
+          // `ThreadStore.forgetPushStatuses`。
+          store.forgetPushStatuses();
           // 同样的理由:新进程不记得任何订阅,窗口必须清空,否则重连后
           // 返回"看起来还 warm"的会话时不会再发 subscribe,内容通知被静默过滤。
           subWindow.current = new SubscriptionWindow();

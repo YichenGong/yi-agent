@@ -1825,6 +1825,39 @@ describe("App reconnect resilience", () => {
     expect(clients.length).toBe(3);
   });
 
+  it("re-resumes a thread after a crash even though its status was live-running", async () => {
+    // 崩溃前该会话在跑（推送把状态标为 "live" running）。侧车重启后新进程对
+    // 它没有内存 agent，listAll 报 idle。若不清掉那条推送状态，`seed` 不会覆盖
+    // 它 → selectThread 误判"仍在跑" → 跳过 resume → 新进程里 agent 永不重建
+    // → 之后发送撞 -32011 且无法自愈。这条用例钉住"重连后必须重新 resume"。
+    render(<App />);
+    await waitMounted();
+    await flush();
+    // 让 t1 进入 live-running（推送流），并把后续 listAll 改为报 idle。
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "thread/status/updated", params: { thread_id: "t1", status: "running" } });
+      }
+    });
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+
+    // 重连之前：视图确实停在 running。
+    exit();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+
+    // 新客户端上必须出现 thread/resume（而不是被陈旧 running 拦住）。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    expect(
+      clients[1].requests.some((r) => r.method === "thread/resume"),
+    ).toBe(true);
+  });
+
   it("reconnects immediately when the app returns to the foreground", async () => {
     render(<App />);
     await waitMounted();
