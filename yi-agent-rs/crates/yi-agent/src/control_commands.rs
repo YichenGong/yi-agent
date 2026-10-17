@@ -69,7 +69,7 @@ impl ControlCommand {
             Self::Agents => spec(
                 self,
                 "agents",
-                "[--project PATH]",
+                "[--all|--active]",
                 "显示 agent 任务树",
                 false,
             ),
