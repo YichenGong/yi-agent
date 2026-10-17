@@ -61,6 +61,8 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onRemoveBoard: vi.fn(),
     onOpenBoard: vi.fn(),
     onOpenSettings: vi.fn(),
+    onLinkFolder: vi.fn(),
+    onUnlinkFolder: vi.fn(),
     ...overrides,
   };
   return props;
@@ -1150,5 +1152,135 @@ describe("ThreadSidebar 搜索", () => {
     fireEvent.doubleClick(screen.getByText("alpha-thread"));
     expect(container.querySelector("[data-rename-input]")).not.toBeNull();
     expect(container.querySelectorAll("[data-rename-input]")).toHaveLength(1);
+  });
+});
+
+describe("ThreadSidebar linked folders", () => {
+  const linkedGroups: WorkspaceGroup[] = [
+    { workspace: "/a", exists: true, threads: [thread("1", "one", "/a")] },
+    { workspace: "/b", exists: true, threads: [thread("2", "two", "/b")] },
+  ];
+  const linkedWorkspaces: Workspace[] = [
+    { path: "/a", exists: true, linked_to: null },
+    { path: "/b", exists: true, linked_to: "/a" },
+  ];
+
+  it("nests a linked folder under its primary and hides it from the top level", () => {
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    // 顶层组头只剩主根一个（附属根不再是顶层组）。
+    expect(container.querySelectorAll("[data-ws-header]")).toHaveLength(1);
+    // 附属根以嵌套小节出现，缩进显示。
+    const child = container.querySelector<HTMLElement>('[data-linked-child="/b"]');
+    expect(child).not.toBeNull();
+    // 缩进发生在小节外层包裹元素上（小节头本身仍与组头同一起点基线）。
+    expect(child!.parentElement!.className).toContain("pl-3");
+    expect(screen.getByText("b")).toBeTruthy();
+  });
+
+  it("offers 关联文件夹 on the group menu and calls onLinkFolder", () => {
+    const props = sidebarProps({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    const { container } = render(<ThreadSidebar {...props} />);
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-ws-header="/a"]')!);
+    fireEvent.click(screen.getByText("关联文件夹…"));
+    expect(props.onLinkFolder).toHaveBeenCalledWith("/a");
+  });
+
+  it("offers 取消关联 on a linked child and calls onUnlinkFolder", () => {
+    const props = sidebarProps({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    const { container } = render(<ThreadSidebar {...props} />);
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-linked-child="/b"]')!);
+    fireEvent.click(screen.getByText("取消关联"));
+    expect(props.onUnlinkFolder).toHaveBeenCalledWith("/b");
+  });
+
+  it("does not offer New thread here for a linked child", () => {
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-linked-child="/b"]')!);
+    expect(screen.queryByText("New thread here")).toBeNull();
+  });
+
+  // 搜索用数据：主根与附属根**同时**命中（两者路径都含 "proj"），主根因此留在
+  // 结果里、附属根也就仍然嵌套（而不是被临时升到顶层）。
+  const searchGroups: WorkspaceGroup[] = [
+    { workspace: "/proj", exists: true, threads: [thread("1", "api", "/proj")] },
+    { workspace: "/proj/docs", exists: true, threads: [thread("2", "guide", "/proj/docs")] },
+  ];
+  const searchWorkspaces: Workspace[] = [
+    { path: "/proj", exists: true, linked_to: null },
+    { path: "/proj/docs", exists: true, linked_to: "/proj" },
+  ];
+
+  it("shows a nested linked child's matching rows while searching", () => {
+    // 搜索时命中行先被抽成扁平列表、再重新归拢到主根之下。若附属根小节在搜索期间
+    // 不渲染（或被折叠状态挡住），用户搜到了却看不见——这条锁住"搜得到也看得见"。
+    const { container } = renderSidebar({
+      groups: searchGroups,
+      workspaces: searchWorkspaces,
+    });
+    fireEvent.change(screen.getByLabelText("搜索会话"), { target: { value: "proj" } });
+    expect(container.querySelector('[data-linked-child="/proj/docs"]')).not.toBeNull();
+    expect(container.textContent).toContain("guide");
+  });
+
+  it("hides New thread here for a linked child that search promoted to the top", () => {
+    // 只命中附属根时它会临时落到顶层：菜单口径必须与嵌套时一致——附属根不能作
+    // cwd。断言菜单真的开了，避免"元素不存在"造成的假通过。
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    fireEvent.change(screen.getByLabelText("搜索会话"), { target: { value: "two" } });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-linked-child="/b"]')!);
+    expect(screen.getByRole("menu").textContent).toContain("取消关联");
+    expect(screen.queryByText("New thread here")).toBeNull();
+  });
+
+  it("keeps a linked child searchable by its own path after collapsing it", () => {
+    // 折叠状态在搜索期间不应挡住命中行（与置顶分区/项目组同一口径）。
+    const { container } = renderSidebar({
+      groups: searchGroups,
+      workspaces: searchWorkspaces,
+    });
+    fireEvent.click(
+      container.querySelector<HTMLElement>('[data-linked-child="/proj/docs"]')!
+        .querySelector('button[aria-label="Collapse"]')!,
+    );
+    expect(container.textContent).not.toContain("guide");
+    fireEvent.change(screen.getByLabelText("搜索会话"), { target: { value: "proj" } });
+    expect(container.textContent).toContain("guide");
+  });
+
+  it("keeps an unlinked workspace as a top-level group with its full menu", () => {
+    const { container } = renderSidebar();
+    fireEvent.contextMenu(container.querySelectorAll<HTMLElement>("[data-ws-header]")[0]);
+    expect(screen.getByText("New thread here")).toBeTruthy();
+    expect(screen.getByText("关联文件夹…")).toBeTruthy();
+  });
+  it("indents a linked child's thread rows one level deeper than direct rows", () => {
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-group-row]"));
+    const direct = rows.find((r) => r.textContent!.includes("one"))!;
+    const inChild = rows.find((r) => r.textContent!.includes("two"))!;
+    expect(direct.className).toContain("pl-3");
+    expect(inChild.className).toContain("pl-11");
+  });
+
+  it("collapses a linked child section from its own caret", () => {
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    const child = container.querySelector<HTMLElement>('[data-linked-child="/b"]')!;
+    fireEvent.click(child.querySelector('button[aria-label="Collapse"]')!);
+    expect(container.textContent).not.toContain("two");
+  });
+
+  it("长按附属根小节头只给取消关联", async () => {
+    vi.useFakeTimers();
+    const props = sidebarProps({ groups: linkedGroups, workspaces: linkedWorkspaces, isMobile: true });
+    const { container } = render(<ThreadSidebar {...props} />);
+
+    const header = container.querySelector<HTMLElement>('[data-linked-child="/b"]')!;
+    await longPress(header);
+
+    const menu = container.querySelector('[role="menu"]');
+    expect(menu!.textContent).toContain("取消关联");
+    expect(menu!.textContent).not.toContain("New thread here");
+    fireEvent.click(screen.getByText("取消关联"));
+    expect(props.onUnlinkFolder).toHaveBeenCalledWith("/b");
   });
 });

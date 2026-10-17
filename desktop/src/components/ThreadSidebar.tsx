@@ -1,6 +1,6 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "../lib/protocol";
-import { basename, groupCount } from "../lib/workspaceGroups";
+import { basename, groupCount, nestLinkedGroups } from "../lib/workspaceGroups";
 import { kanbanItemFor } from "../lib/boardIndex";
 import { useSpinPhase } from "../lib/useSpinPhase";
 import { supportsWaapi } from "../lib/spinPhase";
@@ -97,6 +97,8 @@ export function ThreadSidebar({
   onRemoveBoard,
   onOpenBoard,
   onOpenSettings,
+  onLinkFolder,
+  onUnlinkFolder,
   isMobile = false,
   statusStale = false,
 }: {
@@ -130,6 +132,10 @@ export function ThreadSidebar({
   onRemoveBoard: (path: string) => void;
   onOpenBoard: (path: string) => void;
   onOpenSettings: () => void;
+  /** 把某个主根与用户选中的目录关联（由 App 弹原生目录选择器）。 */
+  onLinkFolder: (primary: string) => void;
+  /** 解除某个附属根的关联。 */
+  onUnlinkFolder: (child: string) => void;
   /** 手机端才挂长按（= 右键）；桌面端保持现状，不装监听、不渲染会话菜单。 */
   isMobile?: boolean;
   /** 内容来自缓存、尚未与服务器对齐时置 true：徽标降透明并标注"可能过期"。
@@ -164,7 +170,10 @@ export function ThreadSidebar({
   // menu 用联合类型：`group` 是桌面右键那份工作区菜单，`thread` 是手机长按新增的
   // 会话菜单——同一个槽位保证两种菜单不会同时开着。
   const [menu, setMenu] = useState<
-    { kind: "group"; ws: string } | { kind: "thread"; id: string } | null
+    | { kind: "group"; ws: string }
+    | { kind: "child"; ws: string }
+    | { kind: "thread"; id: string }
+    | null
   >(null);
   // 顶部 “+ New thread” 按钮的点击涟漪：按下时按指针位置生成一圈扩散，
   // `animationend` 后移除，避免节点堆积。键盘激活没有坐标，退化为居中涟漪。
@@ -240,12 +249,20 @@ export function ThreadSidebar({
         if (editingId === el.dataset.threadRow) return null;
         return { kind: "thread", id: el.dataset.threadRow, el };
       }
+      // 附属根小节头：长按只给「取消关联」，不给 New thread here（附属根不能作 cwd）。
+      if (el.dataset.linkedChild !== undefined) {
+        return { kind: "child", ws: el.dataset.linkedChild, el };
+      }
       return { kind: "group", ws: el.dataset.wsHeader ?? "", el };
     },
     onLongPress: (t) => {
       setNewMenuOpen(false);
       setMenu(
-        t.kind === "thread" ? { kind: "thread", id: t.id } : { kind: "group", ws: t.ws },
+        t.kind === "thread"
+          ? { kind: "thread", id: t.id }
+          : t.kind === "child"
+            ? { kind: "child", ws: t.ws }
+            : { kind: "group", ws: t.ws },
       );
     },
   });
@@ -363,8 +380,9 @@ export function ThreadSidebar({
       rowAttr?: "group" | "pinned";
       dragIndex?: number;
       /** 行相对项目组的缩进档位：0=普通会话行（项目组直属），1=看板会话行（嵌在
-       * 「看板会话」小节里）。默认 0，保持既有渲染逐像素不变。 */
-      indentLevel?: 0 | 1;
+       * 「看板会话」小节里），2=附属根小节里的会话行（嵌在缩进的附属根小节里）。
+       * 默认 0，保持既有渲染逐像素不变。 */
+      indentLevel?: 0 | 1 | 2;
     } = {},
   ) => {
     const active = t.thread_id === currentId;
@@ -375,7 +393,9 @@ export function ThreadSidebar({
     // 看板会话行多缩进一档（pl-7 vs pl-3）：折叠小节头是 ▸ 视觉起点，其下的
     // 会话若与直属行同一起点，就分不清谁属于谁。缩进让「小节头 → 卡片会话」的
     // 从属关系一眼可读。仅改左内边距，不影响拖拽/点击。
-    const indent = opts.indentLevel === 1 ? "pl-7" : "pl-3";
+    // 缩进逐档递增：0→pl-3（直属）、1→pl-7（看板会话）、2→pl-11（附属根会话）。
+    const indent =
+      opts.indentLevel === 2 ? "pl-11" : opts.indentLevel === 1 ? "pl-7" : "pl-3";
     const dataAttr =
       opts.rowAttr === "pinned" ? { "data-pinned-row": "" } : { "data-group-row": "" };
     return (
@@ -622,10 +642,188 @@ export function ThreadSidebar({
   // 渲染时过滤：不持有第二份列表副本，服务端刷新后自动跟随。
   const searching = query.trim() !== "";
   const filtered = filterThreadTree(groups, pinned, query);
+  // 过滤之后再按 linked_to 归拢：搜索 / 置顶 / 看板会话三个既有分支都不受影响。
+  // 搜索期间不复用归拢结果——`filterThreadTree` 只留下命中的组，附属根会临时回到
+  // 顶层；渲染时用下面的 isLinkedChild 兜住"顶层但其实是附属根"这一情形。
+  const nested = useMemo(
+    () => nestLinkedGroups(filtered.groups, workspaces),
+    [filtered.groups, workspaces],
+  );
+  const linkedChildOf = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const w of workspaces) if (w.linked_to) m.set(w.path, w.linked_to);
+    return m;
+  }, [workspaces]);
   // 搜索期间忽略折叠状态；三个 Set 全程不被写入，清空后原样恢复。
   const pinnedCollapsedNow = searching ? false : pinnedCollapsed;
 
   const clearQuery = () => setQuery("");
+
+  /**
+   * 渲染一个目录分组节点。`indent === 0` 是主根（顶层组头，功能齐全）；`indent === 1`
+   * 是附属根小节（缩进一档，菜单只有「取消关联」）。
+   *
+   * 两种节点共用这一份渲染，差异只在「入口开关」与缩进：附属根不能作会话 `cwd`
+   * （cwd 决定 agent base prompt / store 定位 / skills 发现 / 权限相对路径），所以
+   * 不提供「New thread here」；看板是**主根级**项目特性，附属根小节只承担"会话在
+   * 这里"这一件事。若把两套菜单各写一遍，下次加菜单项时两边口径必然悄悄漂移。
+   *
+   * 搜索期间也不复用归拢结果：`filterThreadTree` 只留下命中的组，附属根会临时落到
+   * 顶层——`linkedChildOf` 兜住这种"顶层但其实是附属根"的情形，菜单口径保持一致。
+   */
+  const renderGroupNode = (g: WorkspaceGroup, children: WorkspaceGroup[], indent: 0 | 1) => {
+    const isChild = indent === 1 || linkedChildOf.has(g.workspace);
+    // 搜索期间忽略折叠（与置顶分区同一口径）：否则命中附属根的会话行会被折叠状态
+    // 挡住，搜到了却看不见。
+    const isCollapsed = searching ? false : collapsed.has(g.workspace);
+    const menuKind: "group" | "child" = isChild ? "child" : "group";
+    const menuOpen = menu?.kind === menuKind && menu.ws === g.workspace;
+    return (
+      <div key={g.workspace} className={isChild ? "relative pl-3" : "relative"}>
+        <div
+          tabIndex={0}
+          {...(isChild
+            ? { "data-linked-child": g.workspace }
+            : { "data-ws-header": g.workspace })}
+          aria-haspopup="menu"
+          aria-expanded={menuOpen}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            setNewMenuOpen(false);
+            setMenu({ kind: menuKind, ws: g.workspace });
+          }}
+          onKeyDown={(e) => {
+            // 键盘等价于右键:Enter/Space 打开(或关闭)该组的菜单。
+            // 只处理组头自身获焦的情况——caret 按钮是子元素,其 keydown 会冒泡到
+            // 此处;若在此 preventDefault 会吞掉 caret 的 Enter/Space 激活,
+            // 导致键盘无法折叠分组(回归)。
+            if (e.target !== e.currentTarget) return;
+            if (e.key !== "Enter" && e.key !== " ") return;
+            e.preventDefault();
+            setNewMenuOpen(false);
+            setMenu((cur) =>
+              cur?.kind === menuKind && cur.ws === g.workspace
+                ? null
+                : { kind: menuKind, ws: g.workspace },
+            );
+          }}
+          className={
+            isChild
+              ? "flex items-center gap-1 px-2 py-1 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
+              : "flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
+          }
+        >
+          <button
+            type="button"
+            onClick={() => toggleCollapse(g.workspace)}
+            disabled={searching}
+            aria-label={isCollapsed ? "Expand" : "Collapse"}
+            title={isCollapsed ? "Expand" : "Collapse"}
+            className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
+          >
+            {isCollapsed ? "▸" : "▾"}
+          </button>
+          <div
+            className={`min-w-0 flex-1 truncate ${
+              isChild ? "text-fg-faint" : g.exists ? "text-fg-muted" : "text-fg-faint"
+            }`}
+            title={g.workspace}
+          >
+            {basename(g.workspace)}
+            {!g.exists && " (missing)"}
+          </div>
+        </div>
+        {menuOpen && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={closeMenus} />
+            <div
+              role="menu"
+              className={`absolute ${
+                isChild ? "top-6" : "top-7"
+              } left-4 z-20 rounded-md border border-line-strong bg-raised py-1 shadow-xl`}
+            >
+              {!isChild && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    closeMenus();
+                    onNew(g.workspace);
+                  }}
+                  className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                >
+                  New thread here
+                </button>
+              )}
+              {!isChild && (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    closeMenus();
+                    if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
+                    else onCreateBoard(g.workspace);
+                  }}
+                  className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
+                >
+                  {kanbanItemFor(g.workspace, boards) ? "移除看板" : "创建 Superpowers 看板"}
+                </button>
+              )}
+              {isChild ? (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    closeMenus();
+                    onUnlinkFolder(g.workspace);
+                  }}
+                  className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                >
+                  取消关联
+                </button>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      closeMenus();
+                      onLinkFolder(g.workspace);
+                    }}
+                    className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                  >
+                    关联文件夹…
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      closeMenus();
+                      onRemoveWorkspace(g.workspace);
+                    }}
+                    className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                  >
+                    Remove from list
+                  </button>
+                </>
+              )}
+            </div>
+          </>
+        )}
+        {!isCollapsed &&
+          !isChild &&
+          !searching &&
+          kanbanItemFor(g.workspace, boards) &&
+          renderBoardEntry(g.workspace)}
+        {!isCollapsed && renderBoardThreads(g)}
+        {!isCollapsed &&
+          g.threads
+            .filter((t) => !t.pinned && !t.card_id)
+            .map((t) => renderThread(t, { rowAttr: "group", indentLevel: isChild ? 2 : 0 }))}
+        {children.map((child) => renderGroupNode(child, [], 1))}
+      </div>
+    );
+  };
 
   const searchBar = (
     <div className="relative px-2 pb-2">
@@ -754,112 +952,7 @@ export function ThreadSidebar({
                 filtered.pinned.map((t, i) => renderThread(t, { rowAttr: "pinned", dragIndex: i }))}
             </div>
           )}
-          {filtered.groups.map((g) => {
-            const isCollapsed = searching ? false : collapsed.has(g.workspace);
-            return (
-              <div key={g.workspace} className="relative">
-                <div
-                  tabIndex={0}
-                  data-ws-header={g.workspace}
-                  aria-haspopup="menu"
-                  aria-expanded={menu?.kind === "group" && menu.ws === g.workspace}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setNewMenuOpen(false);
-                    setMenu({ kind: "group", ws: g.workspace });
-                  }}
-                  onKeyDown={(e) => {
-                    // 键盘等价于右键:Enter/Space 打开(或关闭)该组的菜单。
-                    // 只处理组头自身获焦的情况——caret 按钮是子元素,其 keydown 会
-                    // 冒泡到此处;若在此 preventDefault 会吞掉 caret 的 Enter/Space 激活,
-                    // 导致键盘无法折叠分组(回归)。
-                    if (e.target !== e.currentTarget) return;
-                    if (e.key !== "Enter" && e.key !== " ") return;
-                    e.preventDefault();
-                    setNewMenuOpen(false);
-                    setMenu((cur) =>
-                      cur?.kind === "group" && cur.ws === g.workspace
-                        ? null
-                        : { kind: "group", ws: g.workspace },
-                    );
-                  }}
-                  className="flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
-                >
-                  <button
-                    type="button"
-                    onClick={() => toggleCollapse(g.workspace)}
-                    disabled={searching}
-                    aria-label={isCollapsed ? "Expand" : "Collapse"}
-                    title={isCollapsed ? "Expand" : "Collapse"}
-                    className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
-                  >
-                    {isCollapsed ? "▸" : "▾"}
-                  </button>
-                  <div
-                    className={`min-w-0 flex-1 truncate ${
-                      g.exists ? "text-fg-muted" : "text-fg-faint"
-                    }`}
-                    title={g.workspace}
-                  >
-                    {basename(g.workspace)}
-                    {!g.exists && " (missing)"}
-                  </div>
-                </div>
-                {menu?.kind === "group" && menu.ws === g.workspace && (
-                  <>
-                    <div className="fixed inset-0 z-10" onClick={closeMenus} />
-                    <div
-                      role="menu"
-                      className="absolute top-7 left-4 z-20 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
-                    >
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          closeMenus();
-                          onNew(g.workspace);
-                        }}
-                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-                      >
-                        New thread here
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          closeMenus();
-                          if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
-                          else onCreateBoard(g.workspace);
-                        }}
-                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
-                      >
-                        {kanbanItemFor(g.workspace, boards)
-                          ? "移除看板"
-                          : "创建 Superpowers 看板"}
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          closeMenus();
-                          onRemoveWorkspace(g.workspace);
-                        }}
-                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-                      >
-                        Remove from list
-                      </button>
-                    </div>
-                  </>
-                )}
-                {!isCollapsed && !searching && kanbanItemFor(g.workspace, boards) && renderBoardEntry(g.workspace)}
-                {!isCollapsed && renderBoardThreads(g)}
-                {!isCollapsed &&
-                  g.threads
-                    .filter((t) => !t.pinned && !t.card_id)
-                    .map((t) => renderThread(t, { rowAttr: "group" }))}
-              </div>
-            );
-          })}
+          {nested.top.map(({ group: g, children }) => renderGroupNode(g, children, 0))}
         </div>
       </div>
       <div className="mt-auto flex items-center border-t border-line p-2">
