@@ -2429,7 +2429,7 @@ where
                             &onboarding_env_path, &onboarding_preferences_path, &board_dir,
                             &resident_dir, &plugin_command, &watchman_home, &watchman_install,
                             &watchman_uninstall, &board_launcher, &mut uploads, &mut threads,
-                            &workspaces,
+                            &workspaces, &pairing,
                         )
                     };
                 }
@@ -2507,6 +2507,16 @@ where
                     crate::rpc::Domain::Process => {
                         let mut state = app_state!();
                         match crate::rpc::process::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    crate::rpc::Domain::Pair => {
+                        let mut state = app_state!();
+                        match crate::rpc::pair::handle(&mut state, &req, id.clone()).await? {
                             // 已搬移的域在应答后一律回下一轮(等价于搬移前的
                             // `continue`)。
                             crate::rpc::Flow::Continue => continue,
@@ -4404,126 +4414,6 @@ where
                             watch.stop().await;
                         }
                         write_response(&hub, &client, ok_response(id, json!({ "stopped": true }))).await?;
-                    }
-                    "pair/create" => {
-                        // 铸一枚一次性配对码,交桌面端渲染二维码。设备注册属于
-                        // `pair/redeem`(见下),这里只铸码。
-                        let code = pairing.create_code();
-                        write_response(
-                            &hub,
-                            &client,
-                            ok_response(
-                                id,
-                                json!({ "code": code.code, "expires_in": code.expires_in }),
-                            ),
-                        )
-                        .await?;
-                    }
-                    "pair/redeem" => {
-                        // 帧级兑换:一次性配对码换设备 token。与 ws 升级时的
-                        // `?pair=<code>` 等价,但走**帧**——这是**经中继**配对的唯一
-                        // 通路:中继只转发 ws 帧、不改写升级查询串,所以手机的
-                        // `?pair=` 到不了本机 app-server;而手机连上中继后发的这条
-                        // RPC 会被中继桥原样转发过来,本机据此铸设备。
-                        //
-                        // **不在 `ADMIN_METHODS` 内**:调用者(含中继桥)无需 admin——
-                        // 凭证是那枚一次性码本身(只有桌面能铸),无码即无效。
-                        let Some(code) = req
-                            .params
-                            .get("code")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                        else {
-                            write_response(
-                                &hub,
-                                &client,
-                                err_response(id, RpcError::invalid_params("missing code")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let name = req
-                            .params
-                            .get("device_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("remote device")
-                            .to_string();
-                        match pairing.redeem(&code, &name) {
-                            Ok((device, token)) => {
-                                write_response(
-                                    &hub,
-                                    &client,
-                                    ok_response(
-                                        id,
-                                        json!({
-                                            "device_id": device.id,
-                                            "token": token,
-                                            "scope": device.scope,
-                                        }),
-                                    ),
-                                )
-                                .await?;
-                            }
-                            Err(_) => {
-                                // 码不存在/已用/已过期:与"无 token"一致的说法,
-                                // 不泄露码是否存在。
-                                write_response(
-                                    &hub,
-                                    &client,
-                                    err_response(id, RpcError::invalid_pairing_code()),
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                    "device/list" => {
-                        let devices: Vec<serde_json::Value> = pairing
-                            .store()
-                            .list()
-                            .into_iter()
-                            .map(|d| {
-                                json!({
-                                    "id": d.id,
-                                    "name": d.name,
-                                    "scope": d.scope,
-                                    "created_at": d.created_at,
-                                    "last_seen_at": d.last_seen_at,
-                                })
-                            })
-                            .collect();
-                        write_response(&hub, &client, ok_response(id, json!({ "devices": devices })))
-                            .await?;
-                    }
-                    "device/revoke" => {
-                        let Some(device_id) = req
-                            .params
-                            .get("device_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                        else {
-                            write_response(
-                                &hub,
-                                &client,
-                                err_response(id, RpcError::invalid_params("missing device_id")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let revoked = pairing.revoke(&device_id).unwrap_or(false);
-                        if revoked {
-                            // 先取当前连接:撤销即掉线由「`hub.unregister` + 读循环
-                            // 的 disconnected tick」共同完成。用 `get` + `forget`
-                            // 两步是为了兼顾两种语义——`ws_client_for_device` 仍是
-                            // 「此刻该设备连在哪」的权威读法(测试与将来 RPC 复用),
-                            // `forget_ws_device` 顺带把该映射从全局表摘掉,不留陈旧项。
-                            let cid = ws_client_for_device(&device_id);
-                            forget_ws_device(&device_id);
-                            if let Some(cid) = cid {
-                                hub.unregister(&cid);
-                            }
-                        }
-                        write_response(&hub, &client, ok_response(id, json!({ "revoked": revoked })))
-                            .await?;
                     }
                     "thread/subscribe" => {
                         // 整体替换该客户端的订阅集合。**不在 ADMIN_METHODS 内**:

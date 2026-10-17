@@ -17,6 +17,7 @@ pub(crate) mod board;
 pub(crate) mod image;
 pub(crate) mod model;
 pub(crate) mod onboarding;
+pub(crate) mod pair;
 pub(crate) mod plugin;
 pub(crate) mod process;
 pub(crate) mod ui;
@@ -29,6 +30,7 @@ use std::sync::Arc;
 use yi_agent_runtime::config::RuntimeConfig;
 
 use crate::broadcast::{Broadcaster, ClientId};
+use crate::pairing::PairingState;
 use crate::protocol::Scope;
 use crate::session::ThreadSession;
 use crate::theme_tool::ThemeHandle;
@@ -89,6 +91,8 @@ pub(crate) enum Domain {
     Workspace,
     /// `process/*`。
     Process,
+    /// `pair/*` 与 `device/*`(共享同一 `Arc<PairingState>`,故同域)。
+    Pair,
     /// 未搬移(含 `initialize`)。
     Unknown,
 }
@@ -109,6 +113,8 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("image") => Domain::Image,
         Some("workspace") => Domain::Workspace,
         Some("process") => Domain::Process,
+        Some("pair") => Domain::Pair,
+        Some("device") => Domain::Pair,
         _ => Domain::Unknown,
     }
 }
@@ -180,6 +186,10 @@ pub(crate) struct AppState<'a> {
     /// 附加到 thread 的运行时登记(设备/工作区开关)。`image/*` 经 `thread_cwd`
     /// 冷回退时要用,`workspace/*` 直接增删。搬移前臂里的 `workspaces`。
     pub(crate) workspaces: &'a Arc<WorkspaceIndex>,
+    /// 配对码与设备注册表:`pair/create` 铸码,`pair/redeem` 兑成设备 token,
+    /// `device/list`/`device/revoke` 读写同一张表(与 ws 升级时的 `?pair=` 等价)。
+    /// 搬移前臂里的 `pairing`,由调用方注入。
+    pub(crate) pairing: &'a Arc<PairingState>,
 }
 
 impl<'a> AppState<'a> {
@@ -207,6 +217,7 @@ impl<'a> AppState<'a> {
         uploads: &'a mut crate::image_upload::UploadRegistry,
         threads: &'a mut HashMap<String, ThreadSession>,
         workspaces: &'a Arc<WorkspaceIndex>,
+        pairing: &'a Arc<PairingState>,
     ) -> Self {
         Self {
             hub,
@@ -227,6 +238,7 @@ impl<'a> AppState<'a> {
             uploads,
             threads,
             workspaces,
+            pairing,
         }
     }
 }
