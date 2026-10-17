@@ -11349,6 +11349,7 @@ pub(crate) mod tests {
                     project_key: crate::thread_store::ThreadStore::new(workdir).project_key(),
                     from_thread_id: from_thread_id.to_string(),
                     text: text.to_string(),
+                    request_id: None,
                 })
                 .expect("deliver");
         }
