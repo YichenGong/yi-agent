@@ -138,6 +138,10 @@ pub(crate) struct RuntimeAttachments {
     /// Injectable for the same reason `board_dir` is: `board/create` must be
     /// testable without writing the developer's real resident registry.
     pub(crate) resident_dir: PathBuf,
+    /// 拼 skill 根目录用的「家目录」。Injectable for the same reason `board_dir`
+    /// is: `skill/list` / `skill/read` must be testable without reading the
+    /// developer's real `~/.yi-agent/skills`.
+    pub(crate) skills_home: PathBuf,
     /// The absolute path of the `superpowers-kanban` executable written into
     /// each project's supervisor manifest. Injectable for the same reason
     /// `board_dir` is: `board/create` must be testable without the plugin being
@@ -1439,6 +1443,7 @@ where
                 .unwrap_or_default(),
             onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
+            skills_home: home_dir(),
             plugin_command: yi_agent_boards::scaffold::default_plugin_command().unwrap_or_default(),
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
@@ -1514,6 +1519,7 @@ where
                 .unwrap_or_default(),
             onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
+            skills_home: home_dir(),
             plugin_command: yi_agent_boards::scaffold::default_plugin_command().unwrap_or_default(),
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
@@ -2215,6 +2221,7 @@ where
         onboarding_env_path,
         onboarding_preferences_path,
         resident_dir,
+        skills_home,
         plugin_command,
         launcher: board_launcher,
         theme,
@@ -2638,6 +2645,24 @@ where
                                     ),
                                 )
                                 .await?
+                            }
+                        }
+                    }
+                    // 设置页「技能」面板：枚举三层 skill 根 + 按需读正文。只读，
+                    // 故与 `config/read` / `plugins/list` 同档只需 `Observe`——
+                    // iOS 设备默认 Control，加闸即手机端结构性不可用。
+                    "skill/list" | "skill/read" => {
+                        match crate::skill_rpc::handle_skill_request(
+                            theme_handle.workdir(),
+                            &skills_home,
+                            method.as_str(),
+                            &req.params,
+                        ) {
+                            Ok(value) => {
+                                write_response(&hub, &client, ok_response(id, value)).await?
+                            }
+                            Err(error) => {
+                                write_response(&hub, &client, err_response(id, error)).await?
                             }
                         }
                     }
@@ -8613,6 +8638,133 @@ mod plugins_tests {
         assert!(list_installed_plugins(dir.path()).is_empty());
     }
 
+    /// 设置页「技能」面板的两个 RPC：三层分组、正文读取、越界拒绝，且都必须落在
+    /// `Observe` 档（iOS 设备默认 Control，加闸即手机端不可用）。
+    mod skill_rpc_tests {
+        // 本模块嵌在 `plugins_tests` 里，故 harness 要用 crate 全路径（`super::tests`
+        // 会解析到 `plugins_tests::tests`，那里不存在）。
+        use crate::protocol::Scope;
+        use crate::server::tests::{Harness, initialize};
+
+        /// 在隔离 home 里造一个用户级 skill，返回它的 SKILL.md 路径。
+        fn seed_user_skill(h: &Harness, name: &str) -> std::path::PathBuf {
+            let dir = h.skills_home().join(".yi-agent/skills").join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("SKILL.md");
+            std::fs::write(
+                &path,
+                format!("---\nname: {name}\ndescription: 测试用。\n---\n# {name}\n\n正文"),
+            )
+            .unwrap();
+            path
+        }
+
+        /// 握手后再发请求并取回该 id 的响应——未 initialize 的客户端除
+        /// `initialize` 外一律被拒，少了这一步所有用例都会红在 `-32010`。
+        async fn call(h: &mut Harness, id: i64, method: &str, params: &str) -> serde_json::Value {
+            h.send(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{params}}}"#
+            ))
+            .await;
+            // 按 id 收敛:进程守望者可能把通知插进同一路流。
+            for _ in 0..16 {
+                let v = h.read_value().await;
+                if v.get("id") == Some(&serde_json::json!(id)) {
+                    return v;
+                }
+            }
+            panic!("no response for id {id}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn skill_list_is_available_at_observe_scope() {
+            let mut h = (Harness::with_scope(Scope::Observe)).await;
+            initialize(&mut h).await;
+            let resp = call(&mut h, 1, "skill/list", "{}").await;
+            assert!(
+                resp.get("error").is_none(),
+                "observe must list skills: {resp}"
+            );
+            assert!(resp["result"]["groups"].is_array());
+            h.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn skill_read_is_available_at_observe_scope() {
+            let mut h = (Harness::with_scope(Scope::Observe)).await;
+            let path = seed_user_skill(&h, "user-skill");
+            initialize(&mut h).await;
+            let resp = call(
+                &mut h,
+                2,
+                "skill/read",
+                &format!(r#"{{"path":"{}"}}"#, path.to_string_lossy()),
+            )
+            .await;
+            assert!(
+                resp.get("error").is_none(),
+                "observe must read skills: {resp}"
+            );
+            h.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn skill_list_groups_the_installed_skills() {
+            let mut h = Harness::new();
+            seed_user_skill(&h, "user-skill");
+            initialize(&mut h).await;
+            let resp = call(&mut h, 3, "skill/list", "{}").await;
+            let groups = resp["result"]["groups"].as_array().unwrap();
+            let user = groups
+                .iter()
+                .find(|g| g["scope"] == "user")
+                .expect("user group present");
+            assert!(
+                user["skills"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["name"] == "user-skill")
+            );
+            h.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn skill_read_returns_the_body() {
+            let mut h = Harness::new();
+            let path = seed_user_skill(&h, "user-skill");
+            initialize(&mut h).await;
+            let resp = call(
+                &mut h,
+                4,
+                "skill/read",
+                &format!(r#"{{"path":"{}"}}"#, path.to_string_lossy()),
+            )
+            .await;
+            assert!(resp.get("error").is_none(), "read failed: {resp}");
+            assert_eq!(resp["result"]["body"], "# user-skill\n\n正文");
+            h.shutdown().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn skill_read_refuses_a_path_outside_the_roots() {
+            let mut h = Harness::new();
+            let outside = h.skills_home().join("outside/SKILL.md");
+            std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+            std::fs::write(&outside, "---\nname: x\ndescription: y\n---\nsecret").unwrap();
+            initialize(&mut h).await;
+            let resp = call(
+                &mut h,
+                5,
+                "skill/read",
+                &format!(r#"{{"path":"{}"}}"#, outside.to_string_lossy()),
+            )
+            .await;
+            assert_eq!(resp["error"]["code"], -32602, "{resp}");
+            h.shutdown().await;
+        }
+    }
+
     /// 通用插件通道的作用域：给了非空 `project` 就用它，否则回落宿主 workdir。
     /// 看板按项目安装，桌面侧车 workdir 是 home，这一条是「看板跑着、设置页却
     /// 空着」能修好的前提。
@@ -10551,6 +10703,9 @@ pub(crate) mod tests {
         pub(crate) watchman_calls: WatchmanCalls,
         /// 注入的 watchman home（tempdir），仅用于持有它。
         pub(crate) _watchman_home: tempfile::TempDir,
+        /// 隔离的「家目录」：`skill/list` / `skill/read` 从这里派生三层根，绝不读
+        /// 开发者真实的 `~/.yi-agent/skills`。字段同时用于持有 tempdir。
+        pub(crate) skills_home_dir: tempfile::TempDir,
     }
 
     /// 记录到的 watchman 调用:安装为 `true`、卸载为 `false`，附所针对的 home。
@@ -10712,6 +10867,9 @@ pub(crate) mod tests {
             // 值守的 home 也落在隔离目录里:安装/卸载经调用方注入的闭包,绝不
             // 触碰真实的 `~/Library/LaunchAgents`。
             let watchman_home = tempfile::TempDir::new().unwrap();
+            // skill 根同样落在隔离目录里:`skill/list` 不得枚举开发者真实的
+            // `~/.yi-agent/skills`。
+            let skills_home = tempfile::TempDir::new().unwrap();
             // 模型清单也落在隔离目录里:`model/*` 不得写开发者真实的
             // `~/.yi-agent/models.json`(里面是明文密钥)。
             let models_dir = tempfile::TempDir::new().unwrap();
@@ -10735,6 +10893,7 @@ pub(crate) mod tests {
                     // 测试里不起真进程:`board/create` 走注入的启动器,
                     // 与 board_dir 注入同一个理由。
                     resident_dir: resident_dir.path().to_path_buf(),
+                    skills_home: skills_home.path().to_path_buf(),
                     plugin_command: PathBuf::from("/nonexistent/superpowers-kanban"),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,
@@ -10758,6 +10917,7 @@ pub(crate) mod tests {
                 hub,
                 watchman_calls: calls,
                 _watchman_home: watchman_home,
+                skills_home_dir: skills_home,
             }
         }
 
@@ -10769,6 +10929,11 @@ pub(crate) mod tests {
 
         /// 测试直接驱动的配对状态句柄,与主循环共享同一个 `Arc`:这里 `redeem`
         /// 出的设备正是 `device/list` 会读到的那一条。
+        /// 隔离 home 的路径:测试据此播种 skill 与断言路径包含关系。
+        pub(crate) fn skills_home(&self) -> std::path::PathBuf {
+            self.skills_home_dir.path().to_path_buf()
+        }
+
         pub(crate) fn pairing(&self) -> Arc<PairingState> {
             Arc::clone(&self.pairing)
         }
@@ -11573,6 +11738,8 @@ pub(crate) mod tests {
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
+                // 空路径 = 不读真实 home；这些用例不查 skill。
+                skills_home: PathBuf::new(),
                 plugin_command: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -11648,6 +11815,8 @@ pub(crate) mod tests {
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
+                // 空路径 = 不读真实 home；这些用例不查 skill。
+                skills_home: PathBuf::new(),
                 plugin_command: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -11727,6 +11896,8 @@ pub(crate) mod tests {
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
+                // 空路径 = 不读真实 home；这些用例不查 skill。
+                skills_home: PathBuf::new(),
                 plugin_command: PathBuf::new(),
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme: test_theme(),
@@ -19349,7 +19520,7 @@ pub(crate) mod tests {
     /// 最低档 `Observe` 仍必须被拒：只读客户端不得删除会话。
     #[tokio::test(flavor = "multi_thread")]
     async fn an_observe_client_cannot_delete_a_thread() {
-        let mut h = Harness::with_scope(Scope::Observe).await;
+        let mut h = (Harness::with_scope(Scope::Observe)).await;
         let tid = start_thread(&mut h).await;
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":9,"method":"thread/delete","params":{{"threadId":"{tid}"}}}}"#
@@ -19382,7 +19553,7 @@ pub(crate) mod tests {
     /// 最低档 `Observe` 仍必须被拒：读-only 客户端不得放开沙箱。
     #[tokio::test(flavor = "multi_thread")]
     async fn an_observe_client_cannot_switch_permission_mode() {
-        let mut h = Harness::with_scope(Scope::Observe).await;
+        let mut h = (Harness::with_scope(Scope::Observe)).await;
         let tid = start_thread(&mut h).await;
         h.send(&format!(
             r#"{{"jsonrpc":"2.0","id":9,"method":"thread/setPermissionMode","params":{{"threadId":"{tid}","mode":"yolo"}}}}"#
@@ -19546,7 +19717,7 @@ pub(crate) mod tests {
     /// `Control`, which is *allowed* to write, so this uses the lowest tier.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_observe_client_may_list_but_not_write_models() {
-        let mut h = Harness::with_scope(Scope::Observe).await;
+        let mut h = (Harness::with_scope(Scope::Observe)).await;
         initialize(&mut h).await;
         h.send(r#"{"jsonrpc":"2.0","id":9,"method":"model/list","params":{}}"#)
             .await;
@@ -19647,7 +19818,7 @@ pub(crate) mod tests {
     /// `onboarding/apply` 是写操作:最低权 `Observe` 必须被拒(-32014)。
     #[tokio::test(flavor = "multi_thread")]
     async fn an_observe_client_cannot_apply_onboarding() {
-        let mut h = Harness::with_scope(Scope::Observe).await;
+        let mut h = (Harness::with_scope(Scope::Observe)).await;
         initialize(&mut h).await;
         h.send(
             r#"{"jsonrpc":"2.0","id":2,"method":"onboarding/apply","params":{"provider":"openai","model":"m","api_url":"","api_key":"k"}}"#,
@@ -19877,7 +20048,7 @@ pub(crate) mod tests {
     /// `Observe` 客户端必须被拒 `-32014`。
     #[tokio::test(flavor = "multi_thread")]
     async fn an_observe_client_cannot_set_reasoning_effort() {
-        let mut h = Harness::with_scope(Scope::Observe).await;
+        let mut h = (Harness::with_scope(Scope::Observe)).await;
         initialize(&mut h).await;
         h.send(
             r#"{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{"threadId":"t1","effort":"high"}}"#,
@@ -19978,7 +20149,7 @@ pub(crate) mod tests {
     /// 与 `thread/setReasoningEffort` 同档:`Observe` 客户端必须被拒 `-32014`。
     #[tokio::test(flavor = "multi_thread")]
     async fn an_observe_client_cannot_set_preserve_thinking() {
-        let mut h = Harness::with_scope(Scope::Observe).await;
+        let mut h = (Harness::with_scope(Scope::Observe)).await;
         initialize(&mut h).await;
         h.send(
             r#"{"jsonrpc":"2.0","id":20,"method":"thread/setPreserveThinking","params":{"threadId":"t1","preserve":false}}"#,
@@ -21895,6 +22066,8 @@ pub(crate) mod tests {
                     onboarding_env_path: PathBuf::new(),
                     onboarding_preferences_path: PathBuf::new(),
                     resident_dir: PathBuf::new(),
+                    // 空路径 = 不读真实 home；这些用例不查 skill。
+                    skills_home: PathBuf::new(),
                     plugin_command: PathBuf::new(),
                     launcher: Arc::new(|_project: &Path| Ok(true)),
                     theme,

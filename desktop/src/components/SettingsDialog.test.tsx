@@ -101,6 +101,33 @@ describe("SettingsDialog", () => {
     fireEvent.click(screen.getByRole("tab", { name: "模型" }));
     expect(await screen.findByText("还没有配置任何模型")).toBeTruthy();
   });
+
+it("shows a 技能 tab backed by the injected skillsCall", async () => {
+    const skillsCall = async (method: string) =>
+      method === "skill/list"
+        ? {
+            groups: [{ scope: "user", skills: [{ name: "user-skill", description: "用户级。", path: "/u/SKILL.md" }] }],
+            roots: { project: "/p", user: "/u", system: "/s" },
+          }
+        : { body: "" };
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        skillsCall={skillsCall}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "技能" }));
+    expect(await screen.findByText("user-skill")).toBeTruthy();
+  });
+
+  it("lists all five categories on the desktop", () => {
+    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+    const names = screen.getAllByRole("tab").map((t) => t.textContent);
+    expect(names).toEqual(["通用", "远程访问", "插件", "模型", "技能"]);
+  });
 });
 
 describe("SettingsDialog focus management & tab wiring", () => {
@@ -194,7 +221,10 @@ describe("SettingsDialog wires phone layout down to the models tab", () => {
         modelCall={modelCall}
       />,
     );
-    fireEvent.click(screen.getByRole("tab", { name: "模型" }));
+    // 手机端没有 tablist，改从分类列表进入「模型」。
+    fireEvent.click(
+      document.querySelector('[data-settings-category="models"]') as HTMLElement,
+    );
     await screen.findByText("••••1234");
     expect(container.querySelector("[data-model-card]")).toBeTruthy();
     expect(container.querySelector("table")).toBeNull();
@@ -206,35 +236,95 @@ describe("SettingsDialog wires phone layout down to the models tab", () => {
 // 覆写（index.css 里 `[data-mobile="true"] .settings-*`）的抓手，两个平台都渲染，
 // 桌面无样式命中。
 describe("SettingsDialog phone layout hooks", () => {
-  it("flips the tablist orientation to horizontal on the phone", () => {
+/** 手机上按分类 id 取那一行（文本里含 `›` 装饰，故不按文本查）。 */
+  const categoryRow = (id: string) =>
+    document.querySelector(`[data-settings-category="${id}"]`) as HTMLElement;
+
+  it("renders a category list, not a tablist, on the phone", () => {
+    // 手机上分类很多，等宽横条放不下（5 格时 320pt 每格仅 64px，「远程访问」四字
+    // 会溢出）。改成「分类列表 → 点进内容」的两级结构，横向宽度不再是约束。
+    // 同时必须真的没有 tablist：留着一个隐藏的 tablist 会与可见列表争可访问名。
     render(
       <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
     );
-    expect(screen.getByRole("tablist").getAttribute("aria-orientation")).toBe("horizontal");
+    expect(screen.queryByRole("tablist")).toBeNull();
+    expect(screen.queryByRole("tab")).toBeNull();
+    expect(document.querySelector(".settings-categories")).toBeTruthy();
+    const rows = Array.from(document.querySelectorAll("[data-settings-category]"));
+    expect(rows.map((r) => r.getAttribute("data-settings-category"))).toEqual([
+      "general",
+      "remote",
+      "plugins",
+      "models",
+      "skills",
+    ]);
   });
 
-  it("keeps the vertical orientation on the desktop", () => {
-    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
-    expect(screen.getByRole("tablist").getAttribute("aria-orientation")).toBe("vertical");
+  it("drills into a category and comes back", () => {
+    render(
+      <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    fireEvent.click(categoryRow("general"));
+    // 子页：返回按钮 + 该分类的面板（「通用」里是主题选择）。
+    expect(screen.getByRole("button", { name: "返回设置分类" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "深色" })).toBeTruthy();
+    // 列表已不在。
+    expect(document.querySelector(".settings-categories")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "返回设置分类" }));
+    expect(document.querySelector(".settings-categories")).toBeTruthy();
   });
 
-  it("renders the four class hooks the phone CSS targets, on both platforms", () => {
-    // 用 rerender 切换平台，而不是手动 cleanup()——文件顶部已有 `afterEach(cleanup)`，
-    // 在用例中间自行清理会卸掉组件、让后续断言失去目标。
+  it("returns focus to the category row it came from", () => {
+    render(
+      <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    fireEvent.click(categoryRow("models"));
+    fireEvent.click(screen.getByRole("button", { name: "返回设置分类" }));
+    // 返回后焦点落在刚才那一行，键盘/读屏用户不用重新找位置。
+    expect(document.activeElement).toBe(categoryRow("models"));
+  });
+
+  it("starts on the category list every time settings opens", () => {
+    // 上次停在哪个子页与本次打开无关；留着会让人以为设置只有那一页。
+    const { rerender } = render(
+      <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    fireEvent.click(categoryRow("models"));
+    expect(document.querySelector(".settings-categories")).toBeNull();
+    rerender(
+      <SettingsDialog open={false} isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    rerender(
+      <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
+    );
+    expect(document.querySelector(".settings-categories")).toBeTruthy();
+  });
+
+  it("renders the class hooks the phone CSS targets, on both platforms", () => {
     const { container, rerender } = render(
       <SettingsDialog open isMobile theme="dark" onThemeChange={() => {}} onClose={() => {}} />,
     );
+    // 手机端首页是分类列表：shell 与 header 齐备，导航条与面板都不渲染
+    // （面板要等点进某个分类才出现，见下一条用例）。
     expect(container.querySelector(".settings-shell")).toBeTruthy();
     expect(container.querySelector(".settings-header")).toBeTruthy();
-    expect(container.querySelector(".settings-nav")).toBeTruthy();
-    expect(container.querySelector(".settings-panel")).toBeTruthy();
+    expect(container.querySelector(".settings-nav")).toBeNull();
+    expect(container.querySelector(".settings-panel")).toBeNull();
+    expect(container.querySelector(".settings-categories")).toBeTruthy();
 
-    // 桌面端同样渲染（类无条件存在，只是没有规则命中）
+    // 桌面端四类挂点齐备（`.settings-categories` 是手机专属，桌面不渲染）。
     rerender(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
     expect(container.querySelector(".settings-shell")).toBeTruthy();
     expect(container.querySelector(".settings-header")).toBeTruthy();
     expect(container.querySelector(".settings-nav")).toBeTruthy();
     expect(container.querySelector(".settings-panel")).toBeTruthy();
+    expect(container.querySelector(".settings-categories")).toBeNull();
+  });
+
+  it("keeps the vertical orientation on the desktop", () => {
+    render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
+    expect(screen.getByRole("tablist").getAttribute("aria-orientation")).toBe("vertical");
   });
 
   it("keeps the close button reachable on the phone (44px touch target)", () => {
