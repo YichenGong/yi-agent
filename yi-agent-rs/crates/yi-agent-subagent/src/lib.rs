@@ -1849,6 +1849,43 @@ struct DaemonWaitAgentTool {
     root: Arc<crate::thread_root::ThreadRoot>,
 }
 
+/// `spawn_agent` 面向模型的文案。
+///
+/// 普通 worker（`DaemonSpawnAgentTool`）与应用级子代理
+/// （`DaemonApplicationSpawnAgentTool`）共用这一份，避免文案漂移。
+pub(crate) fn spawn_agent_description() -> &'static str {
+    "Create an asynchronously scheduled direct child agent."
+}
+
+/// `spawn_agent` 的 JSON schema。
+///
+/// 两个 `Daemon*SpawnAgentTool` 共用；两工具的差异只在 `call()` 里沙箱来源
+/// （`self.sandbox` vs `self.controller.effective()`），与 schema 无关。
+pub(crate) fn spawn_agent_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "task": { "type": "string", "description": "Delegated objective." },
+            "mode": {
+                "type": "string",
+                "enum": ["coding", "read_only"],
+                "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+            },
+            "workdir": {
+                "type": "string",
+                "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
+            },
+            "fork": {
+                "type": "boolean",
+                "default": false,
+                "description": "Fork the caller's current conversation into the child so it inherits context. Off by default: pass true only when the child genuinely needs the history."
+            }
+        },
+        "required": ["task"],
+        "additionalProperties": false
+    })
+}
+
 #[async_trait]
 impl Tool for DaemonApplicationSpawnAgentTool {
     fn name(&self) -> &str {
@@ -1856,32 +1893,11 @@ impl Tool for DaemonApplicationSpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Create an asynchronously scheduled direct child agent."
+        spawn_agent_description()
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task": { "type": "string", "description": "Delegated objective." },
-                "mode": {
-                    "type": "string",
-                    "enum": ["coding", "read_only"],
-                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
-                },
-                "fork": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Fork the caller's current conversation into the child so it inherits context. Off by default: pass true only when the child genuinely needs the history."
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": false
-        })
+        spawn_agent_schema()
     }
 
     async fn call(&self, args: Value) -> ToolResult {
@@ -2152,32 +2168,11 @@ impl Tool for DaemonSpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Create an asynchronously scheduled direct child agent."
+        spawn_agent_description()
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task": { "type": "string", "description": "Delegated objective." },
-                "mode": {
-                    "type": "string",
-                    "enum": ["coding", "read_only"],
-                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
-                },
-                "fork": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Fork the caller's current conversation into the child so it inherits context. Off by default: pass true only when the child genuinely needs the history."
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": false
-        })
+        spawn_agent_schema()
     }
 
     async fn call(&self, args: Value) -> ToolResult {
@@ -2350,6 +2345,22 @@ mod tests {
                 "fork must stay optional"
             );
         }
+    }
+
+    #[test]
+    fn spawn_agent_schema_pins_the_wire_contract() {
+        let schema = spawn_agent_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["task"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["coding", "read_only"])
+        );
+        assert_eq!(
+            spawn_agent_description(),
+            "Create an asynchronously scheduled direct child agent."
+        );
     }
 
     #[tokio::test]
