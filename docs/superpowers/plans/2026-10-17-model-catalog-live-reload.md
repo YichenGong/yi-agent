@@ -46,7 +46,7 @@
 - Produces: `pub fn try_load_catalog_from(path: &Path) -> Result<ModelCatalog, String>`
   —— `Ok` = 可用清单（文件不存在也是 `Ok(空清单)`）；`Err(reason)` = 不可读/不可解析。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `models.rs` 的 `mod tests` 内（`legacy_openai_default_url_is_migrated_to_v1` 之后）追加：
 
@@ -87,12 +87,12 @@
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib try_load_distinguishes_absent_from_corrupt`
 Expected: 编译失败，报 `cannot find function 'try_load_catalog_from'`（RED）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 在 `models.rs` 中 `load_catalog_from` 函数定义之后新增（**复用**其解析体，避免两份解析逻辑）：
 
@@ -176,7 +176,7 @@ pub fn load_catalog_from(path: &Path) -> ModelCatalog {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib try_load_distinguishes_absent_from_corrupt`
 Expected: PASS（1 passed）。
@@ -185,7 +185,7 @@ Expected: PASS（1 passed）。
 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib models`
 Expected: 全绿（含 `legacy_openai_default_url_is_migrated_to_v1`）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -209,7 +209,7 @@ git commit -m "feat(runtime): 新增严格清单读取 try_load_catalog_from"
   - `pub fn CatalogWatcher::from_catalog(path: PathBuf, catalog: ModelCatalog) -> Arc<CatalogWatcher>`
   - `pub fn CatalogWatcher::current(&self) -> Arc<ModelCatalog>`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `models.rs` 的 `mod tests` 内追加（`std::sync::Arc` 已在测试内可用，若未 import 则写全路径 `std::sync::Arc`）：
 
@@ -316,12 +316,12 @@ git commit -m "feat(runtime): 新增严格清单读取 try_load_catalog_from"
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib watcher_`
 Expected: 编译失败，报 `cannot find struct 'CatalogWatcher'`（RED）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 在 `models.rs` 顶部的 `use` 区补：
 
@@ -447,13 +447,13 @@ impl CatalogWatcher {
 > 指纹」来表达固定——`current()` 的规则是「指纹不同就重读」，永不匹配恰恰会
 > 导致每次都重读（计划初稿的注释与代码在此自相矛盾，测试为准）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib watcher_`（4 passed）
 再 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib from_catalog_is_a_fixed_snapshot`（1 passed）
 Expected: PASS（合计 5 passed）。cargo 只接受单个 TESTNAME 过滤词，两条命令分别跑。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -475,7 +475,7 @@ git commit -m "feat(runtime): 新增 CatalogWatcher 按指纹自更新清单句�
   - `pub fn DaemonAgentWorkerFactory::with_catalog_watcher(self, cfg: RuntimeConfig, watcher: Arc<CatalogWatcher>) -> Self`
   - 内部 `struct WorkerRefresh` / `struct WorkerParts` / `struct EffectiveKey` + `fn WorkerParts::rebuild(cfg, catalog) -> anyhow::Result<WorkerParts>` + `fn EffectiveKey::of(cfg: &RuntimeConfig) -> EffectiveKey`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `lib.rs` 的 `mod tests` 内追加（构造风格照同模块既有的 `DaemonAgentWorkerFactory::new`（L2426 起）与 `AgentConfig::default()`；`RuntimeConfig` **没有** `Default`，须逐字段写出——照 `attach.rs:438` 的 `base_config`）：
 
@@ -563,12 +563,12 @@ git commit -m "feat(runtime): 新增 CatalogWatcher 按指纹自更新清单句�
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-subagent --lib a_watcher_backed_factory_follows_a_changed_subagent_model`
 Expected: 编译失败，报 `no method named 'with_catalog_watcher'`（RED）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 3a. 在 `lib.rs` 顶部 `use` 区补（按既有 import 风格）：
 
@@ -800,7 +800,7 @@ impl WorkerRefresh {
 
 3f. 若 `resolve_effective_sandbox` 的 `workspace` 分支还用到 `self.sandbox_writable_roots`（既有代码在别处使用），一并按 `refreshed` 优先取值。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-subagent --lib a_watcher_backed_factory_follows_a_changed_subagent_model a_factory_without_a_watcher_keeps_its_static_config`
 Expected: PASS（2 passed）。
@@ -809,7 +809,7 @@ Expected: PASS（2 passed）。
 Run: `cd yi-agent-rs && cargo test -p yi-agent-subagent`
 Expected: 全绿。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -829,7 +829,7 @@ git commit -m "feat(subagent): worker 工厂按指纹跟随模型清单"
 - Consumes: Task 3 的 `with_catalog_watcher(cfg, watcher)`；Task 2 的 `CatalogWatcher::new(path)`。
 - Produces: 装配后的 daemon 工厂（`worker_factory` 签名不变，行为变为「按指纹跟随清单」）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `attach.rs` 的 `mod tests` 内追加：
 
@@ -922,12 +922,12 @@ git commit -m "feat(subagent): worker 工厂按指纹跟随模型清单"
 > 再调其 `#[cfg(test)] resolved_model_for_test()`——**不**给 core 的生产 trait 加测试方法。
 > `build_worker_factory` 需在 Task 3 完成后带上 `models_path` 形参（见本任务 Step 3）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-subagent --lib the_attached_worker_factory_follows_a_changed_catalog`
 Expected: RED（刷新器尚未装配，第二次断言拿到 `model-one`）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `attach.rs` 的 `build_worker_factory` 增加 `models_path` 参数并装刷新器：
 
@@ -978,12 +978,12 @@ pub fn worker_factory(
 `worker_factory_with_catalog`（`#[cfg(test)]`，L158）同样补 `models_path` 形参并透传。
 `attach_project_runtime`（L192）的调用已是 `worker_factory(cfg, socket, models_path)`，**无需改**。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-subagent`
 Expected: 全绿（含既有 `the_worker_uses_the_subagent_model_entry` 等）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1004,7 +1004,7 @@ git commit -m "feat(subagent): daemon 装配清单刷新器"
 - Consumes: Task 2 的 `CatalogWatcher`（`new` / `from_catalog` / `current`）。
 - Produces: `production_factory(cfg: RuntimeConfig, theme: ThemeHandle, catalog: Arc<CatalogWatcher>) -> impl Fn(...)`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `server.rs` 的 `mod tests` 内追加（沿用既有 `test_catalog()` / `Harness` 风格；`test_catalog` 是清单辅助，这里是 watcher 版本）：
 
@@ -1081,12 +1081,12 @@ git commit -m "feat(subagent): daemon 装配清单刷新器"
 > `id` 匹配」写法（参见 `thread_start_and_resume_report_the_built_agents_model`，`server.rs:20036`）。
 > `test_catalog()` 返回的是 `Arc<ModelCatalog>`（`server.rs:21026`），传参时按此取用。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib a_thread_started_after_a_catalog_change_uses_the_new_entry`
 Expected: RED（第二条断言拿到 `model-a`，因为工厂持启动快照）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 3a. `production_factory` 签名与取清单方式：
 
@@ -1160,7 +1160,7 @@ production_factory(cfg, test_theme(), Arc::new(yi_agent_runtime::models::Catalog
 分别改为 `fixed_watcher(test_catalog())` / `fixed_watcher(test_catalog_without_default())` /
 `fixed_watcher(Arc::new(catalog))`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib a_thread_started_after_a_catalog_change_uses_the_new_entry`
 Expected: PASS。
@@ -1169,7 +1169,7 @@ Expected: PASS。
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib`
 Expected: 全绿。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1198,7 +1198,7 @@ git commit -m "feat(app-server): 会话工厂按指纹跟随模型清单"
 > 4. 404 属不可重试错误 → `report_failure` → 任务落 `failed`（不是卡在 `running`），
 >    故第 2 步可稳定观测到 `failed`。
 
-- [ ] **Step 1: 写测试（隔离 daemon + 三步判据）**
+- [x] **Step 1: 写测试（隔离 daemon + 三步判据）**
 
 ```rust
 //! 真机 e2e：改 `models.json` 后 daemon 必须不重启即跟上。
@@ -1388,7 +1388,7 @@ impl Fixture {
 }
 ```
 
-- [ ] **Step 1c: 三步判据主体**
+- [x] **Step 1c: 三步判据主体**
 
 ```rust
 /// 真机三步判据。`#[ignore]`：默认跳过，CI 不跑（避免成本与密钥依赖）。
@@ -1426,17 +1426,17 @@ fn changing_models_json_takes_effect_without_restarting_the_daemon() {
 }
 ```
 
-- [ ] **Step 2: 无 key 时确认安全跳过**
+- [x] **Step 2: 无 key 时确认安全跳过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --test model_catalog_live_reload_e2e`
 Expected: PASS（0 个测试运行，`#[ignore]` 生效）。
 
-- [ ] **Step 3: 有 key 时跑三步判据**
+- [x] **Step 3: 有 key 时跑三步判据**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent --test model_catalog_live_reload_e2e -- --ignored --nocapture`
 Expected: 三步全绿：成功 → 失败 → 成功。**且第 3 步必须成功**（本次事故正是这里卡住）。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -1456,7 +1456,7 @@ git commit -m "test(e2e): 模型清单热重载真机三步判据"
 - Consumes: Task 1-6 的全部产出与实测数据。
 - Produces: 可追溯的缺陷登记与进度同步。
 
-- [ ] **Step 1: 全量回归**
+- [x] **Step 1: 全量回归**
 
 ```bash
 ps aux | grep -v grep | grep -E "cargo|rustc|yi_agent" || echo "clean"
@@ -1470,7 +1470,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 Expected: 全绿；fmt/clippy 干净。
 
-- [ ] **Step 2: 登记 `bug-list.md`**
+- [x] **Step 2: 登记 `bug-list.md`**
 
 按该文件既有格式追加一条 `[x]`（一段式：症状 → 根因 → 修复 → 验证判据 → 设计文档相对链接）：
 
@@ -1480,21 +1480,21 @@ Expected: 全绿；fmt/clippy 干净。
 - 验证：`cargo test -p yi-agent-runtime --lib watcher_`、`-p yi-agent-subagent`、`-p yi-agent-app-server --lib`；真机 e2e 三步判据（成功 → 改坏必失败 → 改好必成功，全程不重启 daemon）；对照现场：旧 daemon 200/404 = 0/120，修复后第 3 步直接成功。
 - 链接：`../superpowers/specs/2026-10-17-model-catalog-live-reload-design.md`
 
-- [ ] **Step 3: 同步模块进度**
+- [x] **Step 3: 同步模块进度**
 
 按 CLAUDE.md「项目进度维护」：
 - 在 `docs/project-management/yi-agent-runtime.md` 登记 `try_load_catalog_from` 与 `CatalogWatcher`（带 `file.rs:line` 判据）。
 - 在 `docs/project-management/yi-agent-subagent.md` 登记 `with_catalog_watcher`。
 - 同步 `README.md` 模块索引表的「完成 / 总计」计数（若有计数变化）。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 cd .. && git add docs/bug-list.md docs/project-management/
 git commit -m "docs: 登记模型清单热重载修复与实测判据"
 ```
 
-- [ ] **Step 5: 合并回 main（按 CLAUDE.md 流程）**
+- [x] **Step 5: 合并回 main（按 CLAUDE.md 流程）**
 
 ```bash
 cd /Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent
