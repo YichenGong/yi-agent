@@ -1439,6 +1439,40 @@ mod tests {
 
     #[test]
     fn legacy_meta_without_tag_deserializes_to_none() {
+        // 严格解析：直接对 **类型** `ThreadMeta` 断言，**绕过** `load()`。
+        //
+        // 为什么不能只靠下方的盘上往返断言：`load()` 反序列化失败时会回落
+        // `rebuild_meta`，而后者硬编码 `tag: None`。任何使 `from_str::<ThreadMeta>`
+        // 失败的变化都会让 `load()` 悄悄改走兜底路径，「读回 tag == None」照旧成立
+        // —— 该断言对反序列化回归完全失明。已用探针证实：把必填的 `model` 挖掉后，
+        // 严格解析报错，而 `load(...).meta.tag` 仍为 `None`。
+        //
+        // 这份 JSON 省略**全部** `#[serde(default)]` 字段，即最严苛的「旧 meta」形状。
+        let legacy_json = r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
+        let legacy: ThreadMeta = serde_json::from_str(legacy_json)
+            .expect("旧 meta（缺所有后加字段）必须能被 ThreadMeta 直接反序列化");
+        assert_eq!(legacy.tag, None, "旧 meta 缺 tag 字段必须回 None（零迁移）");
+
+        // 对照断言：下面两个字段**没有** serde 对 `Option` 的隐式兜底，其
+        // `#[serde(default)]` 是真能失败的 ——
+        //   * `permission_mode: ThreadMode`（非 `Option`）：摘掉属性后上面这句
+        //     `from_str` 直接报 `missing field permission_mode`；
+        //   * `preserve_thinking: bool` 用了 `default = "default_true"`：删掉属性会
+        //     静默变 `false`，本断言随即可失败。
+        // 已实证：摘掉 `permission_mode` 的 `#[serde(default)]` 后本测试失败；而 `tag`
+        // 那条（`Option`）断言不会失败 —— serde derive 的 `missing_field` 对缺字段的
+        // `Option<T>` 直接给 `None`（serde-1.0.229 `src/private/de.rs`）。
+        assert_eq!(
+            legacy.permission_mode,
+            ThreadMode::Normal,
+            "旧 meta 缺 permission_mode 必须回 Normal（零迁移）"
+        );
+        assert!(
+            legacy.preserve_thinking,
+            "旧 meta 缺 preserve_thinking 必须回 true（零迁移）"
+        );
+
+        // 互补属性（保留）：同一份旧 JSON 落盘后经 `load()` 读回仍为 None。
         let (_d, s) = store();
         std::fs::create_dir_all(&s.root).unwrap();
         // 旧格式：没有 tag 字段。
