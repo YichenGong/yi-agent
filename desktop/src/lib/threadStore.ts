@@ -117,13 +117,18 @@ export class ThreadStore {
   /** 按 `thread_id` 路由一条通知。 */
   applyNotification(n: Notification): void {
     // agent/* notifications belong to a conversation's附属视图 (the subagent
-    // rail), not to its transcript; `ui/*` is app chrome (theme, git-diff focus)
-    // handled by App's own notification branch. None is folded into a Session.
+    // rail), not to its transcript; `ui/*` is app chrome (theme, git-diff focus,
+    // tag-name overrides) handled by App's own notification branch. None is folded
+    // into a Session.
     if (
       n.method === "agent/children/updated" ||
       n.method === "agent/trace/event" ||
       n.method === "ui/settings/updated" ||
-      n.method === "ui/gitDiff/focus"
+      n.method === "ui/gitDiff/focus" ||
+      // 标签显示名是宿主级偏好，无 thread 归属（`thread_key()` = None），
+      // 由 App 的通知分支处理；这条提前返回同时也让下方的 `n.params.thread_id`
+      // 收窄仍然成立（TS 否则会因该臂无 `thread_id` 而报错）。
+      n.method === "ui/tagNames/updated"
     ) {
       return;
     }

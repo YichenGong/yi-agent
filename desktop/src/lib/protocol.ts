@@ -103,6 +103,16 @@ export type Notification =
    * 客户端就地落笔，不必再拉一次 `thread/listAll`。
    */
   | { method: "thread/titleChanged"; params: { thread_id: string; title: string } }
+  /**
+   * 该会话的颜色标签已变。与 `thread/titleChanged` 同族：元数据变更、列表层恒推、
+   * 直接携带权威值（`tag: null` = 已清除），客户端就地落笔。
+   */
+  | { method: "thread/tagChanged"; params: { thread_id: string; tag: string | null } }
+  /**
+   * 标签显示名（颜色 id → 名称）已变。**全局**帧，携带用户覆盖的权威映射
+   * （可能只含被改的键），客户端与自己的默认名表合并后再渲染。
+   */
+  | { method: "ui/tagNames/updated"; params: { tag_names: Record<string, string> } }
   | {
       method: "thread/permissionModeChanged";
       params: { thread_id: string; mode: ThreadMode };
@@ -280,6 +290,11 @@ export interface ThreadSummary {
    * 旧服务端不发送此字段，读取时按 `null` 处理。
    */
   model_ref?: string | null;
+  /**
+   * 颜色标签 id（`threadTags.ts` 的 `TAG_IDS` 之一）。缺省 / `null` = 无标签。
+   * 旧服务端不发送此字段；读取时先过 `isValidTagId` 再渲染，脏值按无标签处理。
+   */
+  tag?: string | null;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */
