@@ -2420,6 +2420,35 @@ where
                     continue;
                 }
 
+                // 域 handler 需要主循环的局部量;每个域臂按需构造一次
+                // [`crate::rpc::AppState`],借用到臂末(通常 `continue`)为止,故主循环
+                // 各局部量的所有权与借用关系与搬移前完全一致。
+                macro_rules! app_state {
+                    () => {
+                        crate::rpc::AppState::new(
+                            &hub, &client, client_scope, &cfg, &theme_handle, &models_path,
+                            &onboarding_env_path, &onboarding_preferences_path, &board_dir,
+                            &resident_dir, &plugin_command, &watchman_home, &watchman_install,
+                            &watchman_uninstall, &board_launcher,
+                        )
+                    };
+                }
+                match crate::rpc::domain_for(method.as_str()) {
+                    crate::rpc::Domain::Ui => {
+                        let mut state = app_state!();
+                        match crate::rpc::ui::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    // 尚未搬移的域(以及 `initialize`)仍走原始 dispatch。
+                    // 逐域搬移期间,还没搬的域也落到这里,故用 `_` 一并兜住
+                    // (`Domain::Unknown` 覆盖 `initialize` 与所有未识别前缀)。
+                    _ => {}
+                }
                 match method.as_str() {
                     "initialize" => {
                         initialized.lock().await.insert(client.clone(), true);
@@ -2438,131 +2467,6 @@ where
                             ),
                         )
                         .await?;
-                    }
-                    "config/read" => {
-                        write_response(&hub, &client, ok_response(id, cfg.redacted_view())).await?;
-                    }
-                    "ui/settings/read" => {
-                        // 以共享句柄的当前值为权威（与 `set_theme` 工具同一实例）;
-                        // 句柄在构造时已从磁盘载入，故首次读即反映持久化值。
-                        // 值守开关是宿主级偏好，与 theme 同处一个文件，目录取
-                        // 句柄的 workdir 以保证两者读写的是同一个 preferences.json。
-                        let theme = theme_handle.current();
-                        let workdir = theme_handle.workdir();
-                        let watchman_enabled =
-                            crate::settings_store::load_watchman_enabled(workdir);
-                        // 侧车中继地址（桌面设置页写入）：与 theme/值守同处一个
-                        // preferences.json，故一并从同一个 workdir 读。未配置即
-                        // `null`，桌面首屏据此回填空串。
-                        let relay_url = crate::settings_store::load_relay_url(workdir);
-                        write_response(
-                            &hub,
-                            &client,
-                            ok_response(
-                                id,
-                                json!({
-                                    "theme": theme.as_str(),
-                                    "board_watchman_enabled": watchman_enabled,
-                                    "relay_url": relay_url,
-                                }),
-                            ),
-                        )
-                        .await?;
-                    }
-                    "ui/settings/write" => {
-                        if let Some(enabled) =
-                            req.params.get("board_watchman_enabled").and_then(|v| v.as_bool())
-                        {
-                            let workdir = theme_handle.workdir();
-                            // 落盘失败就整体失败：偏好没写成功却去动系统状态，
-                            // 会让开关与磁盘记录不一致。
-                            if let Err(error) =
-                                crate::settings_store::save_watchman_enabled(workdir, enabled)
-                            {
-                                write_response(
-                                    &hub,
-                                    &client,
-                                    err_response(id, RpcError::internal(error.to_string())),
-                                )
-                                .await?;
-                                continue;
-                            }
-                            // 落盘成功但装/卸失败不能静默：开关状态与系统实际
-                            // 状态已经不一致，前端需要拿到原因做内联提示。
-                            let outcome = if enabled {
-                                match std::env::current_exe() {
-                                    Ok(exe) => watchman_install(&exe, &watchman_home),
-                                    Err(error) => Err(error.to_string()),
-                                }
-                            } else {
-                                watchman_uninstall(&watchman_home)
-                            };
-                            let warning = outcome.err();
-                            if let Some(warning) = &warning {
-                                tracing::warn!(%warning, enabled, "board watchman switch did not take effect");
-                            }
-                            write_response(
-                                &hub,
-                                &client,
-                                ok_response(id, json!({ "ok": true, "warning": warning })),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        // theme 只在请求里显式带上时才校验/应用：只写 relay_url
-                        // 的请求不该因为「没有 theme」而被拒绝。先校验再落盘，
-                        // 免得非法 theme 把一个有效的 relay_url 写了一半。
-                        let requested_theme = if req.params.get("theme").is_some() {
-                            let requested =
-                                req.params.get("theme").and_then(|v| v.as_str()).unwrap_or("");
-                            match requested.trim().to_ascii_lowercase().as_str() {
-                                "dark" => Some(crate::settings_store::Theme::Dark),
-                                "light" => Some(crate::settings_store::Theme::Light),
-                                other => {
-                                    write_response(
-                                        &hub,
-                                        &client,
-                                        err_response(
-                                            id,
-                                            RpcError::invalid_params(format!(
-                                                "unsupported theme '{other}': expected 'dark' or 'light'"
-                                            )),
-                                        ),
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        // `relay_url`（桌面设置页）：与 theme 各写各的键，共处一个
-                        // 文件，故两条路径都走 settings_store 的读-改-写。
-                        // `null` / 空 / 空白 → 清除该键。非串非 null（客户端写错
-                        // 类型）不改动既有配置——静默清除是破坏性的。
-                        if let Some(value) = req.params.get("relay_url") {
-                            if value.is_null() || value.is_string() {
-                                let workdir = theme_handle.workdir();
-                                if let Err(error) =
-                                    crate::settings_store::save_relay_url(workdir, value.as_str())
-                                {
-                                    write_response(
-                                        &hub,
-                                        &client,
-                                        err_response(id, RpcError::internal(error.to_string())),
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                            }
-                        }
-
-                        if let Some(theme) = requested_theme {
-                            theme_handle.set(theme);
-                        }
-                        write_response(&hub, &client, ok_response(id, json!({ "ok": true })))
-                            .await?;
                     }
                     "plugin/query" => {
                         // `project` names the project being queried, not the
@@ -5668,7 +5572,7 @@ pub(crate) fn install_device_registry(registry: WsDeviceRegistry) -> WsDeviceReg
     device_registry().get().cloned().unwrap_or(registry)
 }
 
-fn ok_response(id: RequestId, result: serde_json::Value) -> ResponseEnvelope {
+pub(crate) fn ok_response(id: RequestId, result: serde_json::Value) -> ResponseEnvelope {
     ResponseEnvelope {
         jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id,
@@ -5677,7 +5581,7 @@ fn ok_response(id: RequestId, result: serde_json::Value) -> ResponseEnvelope {
     }
 }
 
-fn err_response(id: RequestId, error: RpcError) -> ResponseEnvelope {
+pub(crate) fn err_response(id: RequestId, error: RpcError) -> ResponseEnvelope {
     ResponseEnvelope {
         jsonrpc: Some(JSONRPC_VERSION.to_string()),
         id,
@@ -5686,7 +5590,7 @@ fn err_response(id: RequestId, error: RpcError) -> ResponseEnvelope {
     }
 }
 
-async fn write_response(
+pub(crate) async fn write_response(
     hub: &crate::broadcast::Broadcaster,
     client: &crate::broadcast::ClientId,
     resp: ResponseEnvelope,
