@@ -671,6 +671,50 @@ chat 侧发 `detail`（`openai/types.rs` 的 `image_part`，取 `ImageDetail::as
   仍须能启动）。故 `yi-agent run ...` 不会采纳清单的 `api_style`；需 chat 通道时用
   `--api-style`（若后续补该 flag）或改走桌面/TUI。
 
+### 8.3 Responses reasoning item 回放缺 `summary`（缺陷 + 修复，2026-10-17）
+
+**现象**：`HORIZON-OG-Luna`（`gpt-6-luna`）走 responses 通道时，**只要 agent 用工具，
+第二轮必定 400**；裸模型（`--naked`）与单轮对话都正常，故表现为「时好时坏」。
+
+**报错**（逐字）：
+```
+400 {"error":{"message":"{\n  \"error\": {\n    \"message\": \"Missing required parameter: 'input[1].summary'.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"input[1].summary\",\n    \"code\": \"missing_required_parameter\"\n  }\n}","type":"upstream_error"}}
+```
+
+**根因**：客户端在收到工具结果后重放对话历史时，reasoning item **只发了
+`encrypted_content`、漏了上游必需的 `summary`**（`openai/responses/types.rs`）。触发条件
+是**第 2 轮及以后**（首轮无历史可重放），故单轮/裸模型都不出错。由 `bcf9b6be` 引入，与
+base_url 的 `/v1` 改动无关。
+
+**真实往返实测**（`gpt-6-luna`，捕获真实 `encrypted_content` 再重放）：
+
+| 重放形态 | 结果 |
+|---|---|
+| `reasoning` + `encrypted_content`，**无 `summary`**（修复前行为） | **400 `Missing required parameter: 'input[1].summary'`** |
+| `reasoning` + `encrypted_content` + `summary:[]` | 200 |
+| `reasoning` + `encrypted_content` + 非空 `summary:[{type,text}]` | 200 |
+| `summary` 传字符串而非数组 | 400（必须是对象数组） |
+| 丢弃 reasoning item | 200 |
+
+上游 reasoning item 形状为 `{id, type, content, encrypted_content, summary}`，`summary`
+常见为 `[]`，但**必须显式发这个空数组，不能省略字段**。
+
+**修复（B 方案 / 完整）**：让凭证携带 `summary` 原文——`ThinkingToken::Encrypted` 从
+`Encrypted(String)` 改为 `Encrypted { encrypted_content, summary }`；流式解析
+（`responses/stream.rs`）逐字捕获上游 `summary`；回放（`responses/types.rs`）逐字带上。
+`summary` 与 `encrypted_content` 同属回放必需字段，空数组也必须显式在场。旧 transcript
+的字符串形态 `{"Encrypted":"..."}` 经 `serde(from)` 中转形态仍可反序列化（缺省 `summary`
+为空数组），向后兼容。
+
+**端到端验证**：真实客户端经记录代理跑「带工具的第 2 轮」，捕获到实际的第二轮请求体
+（修复前必 400）：
+
+```json
+{"type":"reasoning","encrypted_content":"gAAAAABq04RQJR4D...(1336 chars)","summary":[]}
+```
+
+该回合正常完成（工具执行 + 模型作答），修复前同一场景第二轮 400。
+
 ## 9. 交付顺序建议
 
 1. **数据模型**（§3）+ 编译期强制补齐所有 match → 独立可提交，行为零变化。
