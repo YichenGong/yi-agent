@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { KeyboardEvent } from "react";
+import { Modal } from "../ui/Modal";
 import type { Theme } from "../lib/theme";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
 import { SettingsRemoteTab, type RemoteCall } from "./SettingsRemoteTab";
@@ -84,15 +85,6 @@ export function SettingsDialog({
     return () => restoreRef.current?.focus();
   }, [open]);
 
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
-
   if (!open) return null;
 
   /** 表内箭头/Home/End 导航：移动选区并同步把焦点带过去。 */
@@ -112,92 +104,90 @@ export function SettingsDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div
-        data-settings-backdrop
-        className="absolute inset-0 bg-black/50"
-        onClick={onClose}
-      />
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="设置"
-        className="settings-shell relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
+    <Modal
+      open={open}
+      onClose={onClose}
+      overlayClassName="fixed inset-0 z-50 flex items-center justify-center"
+      // 该 backdrop 必须留在遮罩内、面板前：手机上由 CSS 隐藏，也是测试的选择器。
+      overlayBackdrop={
+        <div data-settings-backdrop className="absolute inset-0 bg-black/50" onClick={onClose} />
+      }
+      ariaLabel="设置"
+      panelClassName="settings-shell relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
+    >
+      <nav
+        role="tablist"
+        aria-orientation={isMobile ? "horizontal" : "vertical"}
+        onKeyDown={onTablistKeyDown}
+        className="settings-nav flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
       >
-        <nav
-          role="tablist"
-          aria-orientation={isMobile ? "horizontal" : "vertical"}
-          onKeyDown={onTablistKeyDown}
-          className="settings-nav flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
-        >
-          {TABS.map((t) => (
-            <button
-              key={t.id}
-              id={tabId(t.id)}
-              ref={(el) => {
-                tabRefs.current[t.id] = el;
-              }}
-              role="tab"
-              aria-selected={t.id === active}
-              aria-controls={panelId(t.id)}
-              tabIndex={t.id === active ? 0 : -1}
-              onClick={() => setActive(t.id)}
-              className="rounded px-3 py-1.5 text-left text-sm text-fg-muted hover:bg-raised/50 aria-selected:text-fg"
-            >
-              {t.label}
-            </button>
-          ))}
-        </nav>
-        {/*
-          手机端要靠 `order` 把标题栏排到 Tab 条之前（DOM 里 nav 是 shell 的第一个
-          子元素，标题栏却嵌在这个包裹层里）；跨层级无法直接重排，故手机端给这一层
-          `display: contents` 让它「消失」，其子元素升为 shell 的 flex item，order 才
-          生效。桌面端该类无任何样式命中，DOM 与观感逐字节不变。
-        */}
-        <div className="settings-body flex min-w-0 flex-1 flex-col">
-          <div className="settings-header flex items-center justify-between border-b border-line px-4 py-2">
-            <span className="text-xs text-fg-subtle">设置</span>
-            {/* 手机端给足 44px 触控目标（Apple HIG，与抽屉按钮同一标准）——手机上
-                遮罩被 CSS 隐藏，关闭只能靠这颗按钮或 Escape。桌面沿用原样（`px-2`），
-                保持「桌面逐字节不变」这条硬不变量。 */}
-            <button
-              type="button"
-              aria-label="关闭设置"
-              onClick={onClose}
-              className={`${
-                isMobile ? "flex size-11 shrink-0 items-center justify-center" : "px-2"
-              } rounded text-fg-subtle hover:text-fg`}
-            >
-              ×
-            </button>
-          </div>
-          {/* 一次只渲染选中的面板；id/aria-labelledby 与上面的 Tab 成对。 */}
-          <div
-            role="tabpanel"
-            id={panelId(active)}
-            aria-labelledby={tabId(active)}
-            className="settings-panel min-h-0 flex-1 overflow-y-auto"
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            id={tabId(t.id)}
+            ref={(el) => {
+              tabRefs.current[t.id] = el;
+            }}
+            role="tab"
+            aria-selected={t.id === active}
+            aria-controls={panelId(t.id)}
+            tabIndex={t.id === active ? 0 : -1}
+            onClick={() => setActive(t.id)}
+            className="rounded px-3 py-1.5 text-left text-sm text-fg-muted hover:bg-raised/50 aria-selected:text-fg"
           >
-            {active === "general" ? (
-              <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
-            ) : active === "remote" ? (
-              <SettingsRemoteTab
-                call={remoteCall}
-                initialRelayUrl={relayUrl}
-                saveRelayUrl={saveRelayUrl}
-              />
-            ) : active === "plugins" ? (
-              <SettingsPluginsTab
-                call={pluginCall}
-                projects={pluginProjects ?? []}
-                defaultProject={pluginDefaultProject}
-              />
-            ) : (
-              <SettingsModelsTab call={modelCall} isMobile={isMobile} />
-            )}
-          </div>
+            {t.label}
+          </button>
+        ))}
+      </nav>
+      {/*
+        手机端要靠 `order` 把标题栏排到 Tab 条之前（DOM 里 nav 是 shell 的第一个
+        子元素，标题栏却嵌在这个包裹层里）；跨层级无法直接重排，故手机端给这一层
+        `display: contents` 让它「消失」，其子元素升为 shell 的 flex item，order 才
+        生效。桌面端该类无任何样式命中，DOM 与观感逐字节不变。
+      */}
+      <div className="settings-body flex min-w-0 flex-1 flex-col">
+        <div className="settings-header flex items-center justify-between border-b border-line px-4 py-2">
+          <span className="text-xs text-fg-subtle">设置</span>
+          {/* 手机端给足 44px 触控目标（Apple HIG，与抽屉按钮同一标准）——手机上
+              遮罩被 CSS 隐藏，关闭只能靠这颗按钮或 Escape。桌面沿用原样（`px-2`），
+              保持「桌面逐字节不变」这条硬不变量。 */}
+          <button
+            type="button"
+            aria-label="关闭设置"
+            onClick={onClose}
+            className={`${
+              isMobile ? "flex size-11 shrink-0 items-center justify-center" : "px-2"
+            } rounded text-fg-subtle hover:text-fg`}
+          >
+            ×
+          </button>
+        </div>
+        {/* 一次只渲染选中的面板；id/aria-labelledby 与上面的 Tab 成对。 */}
+        <div
+          role="tabpanel"
+          id={panelId(active)}
+          aria-labelledby={tabId(active)}
+          className="settings-panel min-h-0 flex-1 overflow-y-auto"
+        >
+          {active === "general" ? (
+            <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
+          ) : active === "remote" ? (
+            <SettingsRemoteTab
+              call={remoteCall}
+              initialRelayUrl={relayUrl}
+              saveRelayUrl={saveRelayUrl}
+            />
+          ) : active === "plugins" ? (
+            <SettingsPluginsTab
+              call={pluginCall}
+              projects={pluginProjects ?? []}
+              defaultProject={pluginDefaultProject}
+            />
+          ) : (
+            <SettingsModelsTab call={modelCall} isMobile={isMobile} />
+          )}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
