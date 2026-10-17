@@ -89,7 +89,18 @@ impl Relay {
         mut from_agent: mpsc::Receiver<Message>,
     ) {
         let token = self.take_token();
-        lock(&self.agents).insert(session.clone(), Slot { sink, token });
+        // 顶替:取出被顶替的旧连接,先放锁再向它发 Close。
+        //
+        // 只换路由条目**不够**:被顶替的旧 socket 既收不到帧也收不到关闭,在它
+        // 自己看来连接完全健康,于是永不重连;新连接一旦离开,该 session 就此
+        // 再无电脑可用(实测一条误连的探针即可造成,见下方回归测试)。
+        let displaced = lock(&self.agents).insert(session.clone(), Slot { sink, token });
+        if let Some(prev) = displaced {
+            // 在旧连接的**出站口**排一个 Close 帧:`split_bridge` 的写循环会把它
+            // 发给旧 socket,旧客户端据此结束本次连接并退避重连。队列满则丢弃——
+            // 满即慢消费者,它自己的读循环迟早也会结束。
+            let _ = prev.sink.try_send(Message::Close(None));
+        }
 
         // 电脑 → 手机:扇出到该 session 的全部 App。
         while let Some(frame) = from_agent.recv().await {
@@ -377,6 +388,28 @@ mod tests {
         assert!(
             relay.has_agent("s1"),
             "the old agent's teardown must not evict the new one"
+        );
+    }
+
+    /// 顶替旧电脑连接时,中继必须**主动关闭**被顶替的那条。
+    ///
+    /// 否则被顶替者的 socket 看起来仍然健康(中继不再给它发帧、也不发关闭),
+    /// 它的客户端因此永不重连;而新连接一旦离开,该 session 就再无电脑可用。
+    /// 实测:一条误连 `/connect` 的探针即可把真正的桥置成这种「僵尸」,此后手机
+    /// 长期收到 `no computer connected for this session`,直到中继重启。
+    #[tokio::test]
+    async fn a_replaced_agent_is_closed_so_it_reconnects() {
+        let relay = Arc::new(Relay::new());
+        let (mut old_out, _old_in, _old_task) = attach_agent(&relay, "s1");
+        settle().await;
+
+        let (_new_out, _new_in, _new_task) = attach_agent(&relay, "s1");
+        settle().await;
+
+        let frame = recv(&mut old_out).await;
+        assert!(
+            matches!(frame, Message::Close(_)),
+            "被顶替的电脑连接必须收到 Close 帧(据此重连),实际收到 {frame:?}"
         );
     }
 
