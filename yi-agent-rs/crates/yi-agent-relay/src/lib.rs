@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 
 pub mod backoff;
 pub mod client;
+pub mod crypto;
 pub mod server;
 
 pub use client::run_client;

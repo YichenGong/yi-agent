@@ -49,6 +49,11 @@ pub async fn run_client(
     session_id: String,
     local_token: String,
 ) -> Result<()> {
+    // 建 `wss://` 前先定死本进程的 rustls provider:双 provider feature 组合
+    // (桌面 app-server 里 ring 与 aws_lc_rs 并存)会让隐式的 crate-feature 判定
+    // panic,而该 panic 会被桥接任务吞掉、表现为「手机连不上」。见 `crate::crypto`。
+    crate::crypto::ensure_default_provider();
+
     let relay = with_query(relay_url, "session", &session_id);
     let local = with_query(app_server_ws, "token", &local_token);
 
