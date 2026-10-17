@@ -43,14 +43,16 @@ function BubbleImage({
 /**
  * 一段 dim 色的「思考」块（design §6.1）。
  *
- * 服务端从不把它作为 item 发送，只以 `thread/reasoningDelta` 流式推送，session 层
- * 已把连续 delta 合并成一块——这里只渲染一块。默认折叠，标题可点开（Mac/iOS 的
- * 「默认折叠、可展开」）。
+ * 服务端在实时期间只以 `thread/reasoningDelta` 流式推送，session 层已把连续 delta
+ * 合并成一块；一旦块级 `item/thinking` 到达，该服务端条目即就地接管同一张卡片。
+ * 历史回放期则由 `Item::Thinking` 直接渲染。这里只渲染一块。默认折叠，标题可点开
+ * （Mac/iOS 的「默认折叠、可展开」）。`redacted` 块无明文（凭证不下发前端），呈现
+ * 「已加密」占位。
  *
  * 折叠状态是**每块**的局部 state：不放进 item，因为 item 归 session 所有、且会被
  * 流式追加就地改写；把 UI 状态塞进去会让「展开」也被序列化进缓存。
  */
-function ReasoningBlock({ text }: { text: string }) {
+function ReasoningBlock({ text, redacted = false }: { text: string; redacted?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   return (
     <div
@@ -66,7 +68,12 @@ function ReasoningBlock({ text }: { text: string }) {
         <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
         思考
       </button>
-      {expanded && <div className="mt-1 whitespace-pre-wrap">{text}</div>}
+      {expanded && (
+        <div className="mt-1 whitespace-pre-wrap">
+          {/* redacted 块无明文（凭证不下发）：只呈现「已加密」占位，不显示空白。 */}
+          {redacted ? "已加密的思考" : text}
+        </div>
+      )}
     </div>
   );
 }
@@ -135,6 +142,8 @@ function ChatItem({
       );
     case "reasoning":
       return <ReasoningBlock text={item.text} />;
+    case "thinking":
+      return <ReasoningBlock text={item.text} redacted={item.redacted} />;
     case "userMessage":
       return (
         <div className="my-1 max-w-[80%] self-end rounded-lg bg-blue-600 px-3 py-2 text-sm whitespace-pre-wrap text-white">

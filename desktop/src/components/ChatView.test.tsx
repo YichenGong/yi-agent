@@ -251,6 +251,33 @@ describe("ChatView reasoning", () => {
     expect(screen.getByText("let me think about this")).toBeTruthy();
     expect(screen.getByRole("button", { name: /思考/ }).getAttribute("aria-expanded")).toBe("true");
   });
+
+  it("renders a replayed server thinking item with the same collapsible card", () => {
+    // 历史回放（thread/resume / 冷缓存）期没有本地推理块，思考卡片由服务端的
+    // `Item::Thinking` 直接驱动——复用同一张折叠卡片，不新建组件。
+    const thinking = {
+      type: "thinking",
+      id: "item-turn1-2",
+      text: "历史思考内容",
+      redacted: false,
+    };
+    render(<ChatView items={[thinking] as unknown as (Item | NoticeItem)[]} />);
+    const el = screen.getByTestId("reasoning-block");
+    expect(el.className).toContain("text-fg-subtle");
+    const toggle = screen.getByRole("button", { name: /思考/ });
+    expect(screen.queryByText("历史思考内容")).toBeNull();
+    fireEvent.click(toggle);
+    expect(screen.getByText("历史思考内容")).toBeTruthy();
+  });
+
+  it("renders a redacted thinking item as a placeholder, not raw text", () => {
+    const thinking = { type: "thinking", id: "th1", text: "", redacted: true };
+    render(<ChatView items={[thinking] as unknown as (Item | NoticeItem)[]} />);
+    // 占位文案可见且不暴露凭证；空明文不渲染成一坨空白。
+    expect(screen.getByTestId("reasoning-block")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /思考/ }));
+    expect(screen.getByText("已加密的思考")).toBeTruthy();
+  });
 });
 
 describe("ChatView server notices", () => {

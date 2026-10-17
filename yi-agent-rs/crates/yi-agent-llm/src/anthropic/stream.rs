@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use serde_json::Value;
 
 use yi_agent_core::provider::TokenUsage;
-use yi_agent_core::{ProviderError, ProviderEvent, StopReason};
+use yi_agent_core::{ProviderError, ProviderEvent, ReasoningKind, StopReason};
 
 /// One SSE frame parsed from the byte stream.
 struct SseFrame {
@@ -104,6 +104,18 @@ pub struct AnthropicStream<S> {
     /// Queued Stop event from a message_delta that carried both usage and stop_reason.
     /// Emitted on the next `poll_next` call, after the Usage event.
     pending_stop: Option<StopReason>,
+    /// 进行中的 thinking / redacted_thinking 块缓冲：index → 已累积内容。
+    /// signature 分段到达，故必须缓冲到 content_block_stop 才能产出完整块。
+    thinking_buffers: HashMap<usize, ThinkingBuffer>,
+}
+
+/// 进行中的 thinking 块累积状态。
+#[derive(Default)]
+struct ThinkingBuffer {
+    /// 明文摘要（thinking_delta 累积）。
+    text: String,
+    /// 凭证载荷（signature_delta 累积，或 redacted 的一次性 data）。
+    token: Option<yi_agent_core::ThinkingToken>,
 }
 
 impl<S> AnthropicStream<S>
@@ -117,6 +129,7 @@ where
             pending_frames: VecDeque::new(),
             block_ids: HashMap::new(),
             pending_stop: None,
+            thinking_buffers: HashMap::new(),
         }
     }
 
@@ -144,6 +157,26 @@ where
                 let block = data.get("content_block").cloned().unwrap_or(Value::Null);
                 let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
 
+                if block_type == "thinking" {
+                    self.thinking_buffers
+                        .insert(index, ThinkingBuffer::default());
+                    return Ok(None);
+                }
+                if block_type == "redacted_thinking" {
+                    let data = block
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    self.thinking_buffers.insert(
+                        index,
+                        ThinkingBuffer {
+                            text: String::new(),
+                            token: Some(yi_agent_core::ThinkingToken::Redacted(data)),
+                        },
+                    );
+                    return Ok(None);
+                }
                 if block_type == "tool_use" {
                     let id = block
                         .get("id")
@@ -189,6 +222,32 @@ where
                         })?;
                         Ok(Some(ProviderEvent::ToolUseDelta { id, partial_json }))
                     }
+                    "thinking_delta" => {
+                        let text = delta.get("thinking").and_then(Value::as_str).unwrap_or("");
+                        if let Some(buf) = self.thinking_buffers.get_mut(&index) {
+                            buf.text.push_str(text);
+                        }
+                        if text.is_empty() {
+                            return Ok(None);
+                        }
+                        Ok(Some(ProviderEvent::ReasoningDelta {
+                            text: text.to_string(),
+                            kind: ReasoningKind::Summary,
+                        }))
+                    }
+                    "signature_delta" => {
+                        let sig = delta.get("signature").and_then(Value::as_str).unwrap_or("");
+                        if let Some(buf) = self.thinking_buffers.get_mut(&index) {
+                            // 分段拼接：少一段即回传失败。
+                            let buf_token = buf.token.get_or_insert_with(|| {
+                                yi_agent_core::ThinkingToken::Signature(String::new())
+                            });
+                            if let yi_agent_core::ThinkingToken::Signature(s) = buf_token {
+                                s.push_str(sig);
+                            }
+                        }
+                        Ok(None)
+                    }
                     _ => Ok(None),
                 }
             }
@@ -196,6 +255,24 @@ where
                 let index = data.get("index").and_then(Value::as_u64).ok_or_else(|| {
                     ProviderError::Stream("content_block_stop missing index".into())
                 })? as usize;
+                if let Some(buf) = self.thinking_buffers.remove(&index) {
+                    let token = buf
+                        .token
+                        .unwrap_or_else(|| yi_agent_core::ThinkingToken::Signature(String::new()));
+                    // 无凭证且无明文：空块无意义，不产出。
+                    let meaningful = !buf.text.is_empty()
+                        || !matches!(
+                            token,
+                            yi_agent_core::ThinkingToken::Signature(ref s) if s.is_empty()
+                        );
+                    if meaningful {
+                        return Ok(Some(ProviderEvent::ThinkingBlock {
+                            text: buf.text,
+                            token,
+                        }));
+                    }
+                    return Ok(None);
+                }
                 if let Some(id) = self.block_ids.remove(&index) {
                     Ok(Some(ProviderEvent::ToolUseEnd { id }))
                 } else {
@@ -577,5 +654,100 @@ mod tests {
                 reason: StopReason::EndTurn
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn thinking_block_concatenates_fragmented_signature() {
+        let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+             event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"let me \"}}\n\n\
+             event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"think\"}}\n\n\
+             event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"AAA\"}}\n\n\
+             event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"BBB\"}}\n\n\
+             event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"CCC\"}}\n\n\
+             event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+             event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_events(vec![bytes.as_slice()])
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let block = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::ThinkingBlock { text, token } => Some((text.clone(), token.clone())),
+                _ => None,
+            })
+            .expect("a ThinkingBlock must be emitted at content_block_stop");
+
+        assert_eq!(block.0, "let me think", "明文按序拼接");
+        assert_eq!(
+            block.1,
+            yi_agent_core::ThinkingToken::Signature("AAABBBCCC".into()),
+            "分段 signature 必须完整拼接——少一段即回传失败"
+        );
+
+        // 展示通道照常收到增量。
+        let deltas: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ReasoningDelta { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, vec!["let me ".to_string(), "think".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn redacted_thinking_is_emitted_as_its_own_token() {
+        let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"redacted_thinking\",\"data\":\"enc-blob\"}}\n\n\
+             event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+             event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_events(vec![bytes.as_slice()])
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let found = events.iter().any(|e| {
+            matches!(
+                e,
+                ProviderEvent::ThinkingBlock { text, token }
+                    if text.is_empty()
+                        && *token == yi_agent_core::ThinkingToken::Redacted("enc-blob".into())
+            )
+        });
+        assert!(
+            found,
+            "redacted_thinking must map to ThinkingToken::Redacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_emitted_before_tool_use_in_stream_order() {
+        let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n\
+             event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"signature_delta\",\"signature\":\"SIG\"}}\n\n\
+             event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+             event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\",\"input\":{}}}\n\n\
+             event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+             event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_events(vec![bytes.as_slice()])
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let thinking_at = events
+            .iter()
+            .position(|e| matches!(e, ProviderEvent::ThinkingBlock { .. }))
+            .expect("thinking emitted");
+        let tool_at = events
+            .iter()
+            .position(|e| matches!(e, ProviderEvent::ToolUseStart { .. }))
+            .expect("tool use emitted");
+        assert!(thinking_at < tool_at, "thinking must precede tool_use");
     }
 }

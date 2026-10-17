@@ -5,6 +5,12 @@ use serde_json::Value;
 
 use yi_agent_core::{ContentBlock, ImageSource, ProviderRequest, Role, ToolSchema};
 
+/// Anthropic Messages API 的 `max_tokens` 是**必填**字段（缺失即 400）。
+///
+/// 取值需同时容纳 thinking token 与响应文本——thinking 计入 `max_tokens`。
+/// 该值对当前新代模型（输出上限 ≥64k）留有充足余量。
+pub const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 32_000;
+
 /// Anthropic /v1/messages request body.
 #[derive(Serialize)]
 pub struct AnthropicRequest {
@@ -16,8 +22,26 @@ pub struct AnthropicRequest {
     pub tools: Vec<AnthropicTool>,
     #[serde(flatten)]
     pub params: AnthropicGenParams,
+    /// 无条件发送（spec §5.1）：恒为自适应思考。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+    /// 仅当 `reasoning_effort` 设置时存在；否则整个字段缺席（零回归硬要求）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
     /// Always true — we always stream.
     pub stream: bool,
+}
+
+/// adaptive thinking 配置。新代模型拒绝 `budget_tokens`，故不带该字段。
+#[derive(Serialize, Debug)]
+pub struct ThinkingConfig {
+    pub r#type: String,  // 恒为 "adaptive"
+    pub display: String, // 恒为 "summarized"
+}
+
+#[derive(Serialize, Debug)]
+pub struct OutputConfig {
+    pub effort: String,
 }
 
 #[derive(Serialize)]
@@ -44,6 +68,13 @@ pub enum AnthropicContentBlock {
     },
     Image {
         source: AnthropicImageSource,
+    },
+    Thinking {
+        thinking: String,
+        signature: String,
+    },
+    RedactedThinking {
+        data: String,
     },
 }
 
@@ -119,11 +150,35 @@ impl From<ContentBlock> for AnthropicContentBlock {
                 is_error,
             } => AnthropicContentBlock::ToolResult {
                 tool_use_id,
-                content: content.into_iter().map(Into::into).collect(),
+                content: content
+                    .into_iter()
+                    // tool_result 的嵌套 content 只接受 text/image/document/search_result；
+                    // thinking 是 assistant 专属块，任何深度出现都必须丢弃——
+                    // Signature/Redacted 会造出非法 wire 形状(400)，Encrypted/None 会触达
+                    // unreachable!(panic)。故此处无条件剥离。
+                    .filter(|b| !matches!(b, ContentBlock::Thinking { .. }))
+                    .map(Into::into)
+                    .collect(),
                 is_error,
             },
             ContentBlock::Image { source, .. } => AnthropicContentBlock::Image {
                 source: source.into(),
+            },
+            ContentBlock::Thinking { text, token } => match token {
+                yi_agent_core::ThinkingToken::Signature(signature) => {
+                    AnthropicContentBlock::Thinking {
+                        thinking: text,
+                        signature,
+                    }
+                }
+                yi_agent_core::ThinkingToken::Redacted(data) => {
+                    AnthropicContentBlock::RedactedThinking { data }
+                }
+                // 非 Anthropic 形态**不会**到达这里：`From<ProviderRequest>` 已先过滤。
+                // 保守起见用 unreachable 而非编造凭证——静默造出非法 wire 形状更糟。
+                yi_agent_core::ThinkingToken::Encrypted(_) | yi_agent_core::ThinkingToken::None => {
+                    unreachable!("non-Anthropic thinking tokens are filtered before conversion")
+                }
             },
         }
     }
@@ -145,7 +200,8 @@ impl From<yi_agent_core::GenParams> for AnthropicGenParams {
     fn from(p: yi_agent_core::GenParams) -> Self {
         Self {
             temperature: p.temperature,
-            max_tokens: p.max_tokens,
+            // 必填字段：未指定时用默认，绝不序列化缺席。
+            max_tokens: Some(p.max_tokens.unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS)),
             top_p: p.top_p,
             stop_sequences: p.stop_sequences,
         }
@@ -188,9 +244,27 @@ impl From<ProviderRequest> for AnthropicRequest {
                 }
                 _ => {
                     let role = role_label(m.role).to_string();
-                    let content: Vec<AnthropicContentBlock> =
-                        m.content.into_iter().map(Into::into).collect();
-                    messages.push(AnthropicMessage { role, content });
+                    let content: Vec<AnthropicContentBlock> = m
+                        .content
+                        .into_iter()
+                        // Anthropic 只认自己的两种凭证形态；其他 provider 的
+                        // 思考块在转换前丢弃，避免编造出非法 wire 形状。
+                        .filter(|b| {
+                            !matches!(
+                                b,
+                                ContentBlock::Thinking {
+                                    token: yi_agent_core::ThinkingToken::Encrypted(_)
+                                        | yi_agent_core::ThinkingToken::None,
+                                    ..
+                                }
+                            )
+                        })
+                        .map(Into::into)
+                        .collect();
+                    // 全空的 assistant 消息（只有被过滤的块）不发送。
+                    if !content.is_empty() {
+                        messages.push(AnthropicMessage { role, content });
+                    }
                 }
             }
         }
@@ -206,12 +280,25 @@ impl From<ProviderRequest> for AnthropicRequest {
             Some(system_parts.join("\n\n"))
         };
 
+        let thinking = Some(ThinkingConfig {
+            r#type: "adaptive".into(),
+            display: "summarized".into(),
+        });
+        // `reasoning_effort` 只被读取（clone），故 `req.params.into()` 可在其后移动。
+        let output_config = req
+            .params
+            .reasoning_effort
+            .clone()
+            .map(|effort| OutputConfig { effort });
+
         Self {
             model: req.model,
             messages,
             system,
             tools: req.tools.into_iter().map(Into::into).collect(),
             params: req.params.into(),
+            thinking,
+            output_config,
             stream: true,
         }
     }
@@ -382,5 +469,212 @@ mod tests {
         assert_eq!(inner[1]["source"]["type"], "base64");
         assert_eq!(inner[1]["source"]["media_type"], "image/png");
         assert_eq!(inner[1]["source"]["data"], "AAA");
+    }
+
+    #[test]
+    fn thinking_block_serializes_before_tool_use_with_verbatim_signature() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let req = ProviderRequest {
+            model: "claude-opus-5-5".into(),
+            system: None,
+            messages: vec![Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "".into(), // display:"omitted"
+                    token: ThinkingToken::Signature("sig-part-1.sig-part-2".into()),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".into(),
+                    name: "read".into(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                },
+            ])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        let blocks = json["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "thinking", "thinking must be first");
+        assert_eq!(blocks[0]["signature"], "sig-part-1.sig-part-2", "verbatim");
+        assert_eq!(blocks[0]["thinking"], "");
+        assert_eq!(blocks[1]["type"], "tool_use", "tool_use must follow");
+    }
+
+    #[test]
+    fn redacted_thinking_serializes_as_its_own_type() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let req = ProviderRequest {
+            model: "claude-opus-5-5".into(),
+            system: None,
+            messages: vec![Message::assistant(vec![ContentBlock::Thinking {
+                text: "".into(),
+                token: ThinkingToken::Redacted("enc-blob".into()),
+            }])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        let block = &json["messages"][0]["content"][0];
+        assert_eq!(block["type"], "redacted_thinking");
+        assert_eq!(block["data"], "enc-blob");
+        assert!(block.get("signature").is_none());
+    }
+
+    #[test]
+    fn deepseek_and_responses_tokens_are_not_sent_to_anthropic() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        for token in [ThinkingToken::None, ThinkingToken::Encrypted("x".into())] {
+            let req = ProviderRequest {
+                model: "claude-opus-5-5".into(),
+                system: None,
+                messages: vec![Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: "t".into(),
+                        token,
+                    },
+                    ContentBlock::Text("visible".into()),
+                ])],
+                tools: vec![],
+                params: GenParams::default(),
+            };
+            let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+            let blocks = json["messages"][0]["content"].as_array().unwrap();
+            assert_eq!(blocks.len(), 1, "non-Anthropic token must be dropped");
+            assert_eq!(blocks[0]["type"], "text");
+        }
+    }
+
+    #[test]
+    fn thinking_and_output_config_are_emitted_when_effort_set() {
+        use yi_agent_core::GenParams;
+        let req = ProviderRequest {
+            model: "claude-opus-5-5".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            params: GenParams {
+                reasoning_effort: Some("high".into()),
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        assert_eq!(json["thinking"]["type"], "adaptive");
+        assert_eq!(json["thinking"]["display"], "summarized");
+        assert!(
+            json["thinking"].get("budget_tokens").is_none(),
+            "no manual budget"
+        );
+        assert_eq!(json["output_config"]["effort"], "high");
+    }
+
+    /// 递归断言某 JSON 子树内不存在任何 thinking / redacted_thinking 块。
+    /// `tool_result.content` 在 Anthropic API 上只接受
+    /// text / image / document / search_result，故嵌套的所有深度都必须干净。
+    fn assert_no_nested_thinking(value: &serde_json::Value, ctx: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(t) = map.get("type") {
+                    assert_ne!(t, "thinking", "thinking block leaked into {ctx}");
+                    assert_ne!(
+                        t, "redacted_thinking",
+                        "redacted_thinking leaked into {ctx}"
+                    );
+                }
+                for v in map.values() {
+                    assert_no_nested_thinking(v, ctx);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    assert_no_nested_thinking(v, ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 嵌套于 `ToolResult` 内的 `ThinkingToken::None` 必须被丢弃。
+    /// 修复前该用例会触达 `From<ContentBlock>` 里的 `unreachable!` 而 panic。
+    #[test]
+    fn tool_result_drops_nested_thinking_without_signature() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "leaked".into(),
+                    token: ThinkingToken::None,
+                },
+                ContentBlock::Text("tool output".into()),
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "claude-opus-5-5".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        let inner = json["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inner.len(), 1, "nested Thinking must be dropped");
+        assert_eq!(inner[0]["type"], "text");
+        assert_no_nested_thinking(&json["messages"][0]["content"][0], "tool_result");
+    }
+
+    /// 嵌套于 `ToolResult` 内的 `ThinkingToken::Signature` 同样是非法 wire 形状
+    /// （tool_result 不接受 assistant 专属的 thinking 块），必须一并丢弃；
+    /// 兄弟 `Text` 块须保留。
+    #[test]
+    fn tool_result_drops_nested_signed_thinking_but_keeps_text() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let result = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: vec![
+                ContentBlock::Text("kept".into()),
+                ContentBlock::Thinking {
+                    text: "".into(),
+                    token: ThinkingToken::Signature("sig-part-1.sig-part-2".into()),
+                },
+            ],
+            is_error: false,
+        };
+        let req = ProviderRequest {
+            model: "claude-opus-5-5".into(),
+            system: None,
+            messages: vec![Message::tool_results(vec![result])],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        let inner = json["messages"][0]["content"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(inner.len(), 1, "nested signed Thinking must be dropped");
+        assert_eq!(inner[0]["type"], "text");
+        assert_eq!(inner[0]["text"], "kept", "sibling text must survive");
+        assert_no_nested_thinking(&json["messages"][0]["content"][0], "tool_result");
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains("sig-part-1"),
+            "the signature must not appear anywhere on the wire"
+        );
+    }
+
+    #[test]
+    fn max_tokens_always_present_even_when_unset() {
+        let req = ProviderRequest {
+            model: "claude-opus-5-5".into(),
+            system: None,
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+        let json = serde_json::to_value(AnthropicRequest::from(req)).unwrap();
+        assert!(
+            json["max_tokens"].as_u64().is_some(),
+            "max_tokens is required by the Anthropic API; must never be absent"
+        );
     }
 }

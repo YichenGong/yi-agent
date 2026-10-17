@@ -930,7 +930,11 @@ fn rebuild_thread_agent_with_theme(
         process_manager,
         ..
     } = built;
-    let config = agent.config().clone();
+    let mut config = agent.config().clone();
+    // 让重建后的 agent 沿用本次会话的 `preserve_thinking`：`build_agent_config`
+    // 只认 `RuntimeConfig`（无该字段），故值经 thread-local 由本函数落到
+    // `AgentConfig` 上（镜像 effort 的做法）。未设定时按默认 `true`。
+    config.preserve_thinking = current_session_preserve_thinking();
     let permission = agent.permission_checker();
     let decision = agent.decision_rx();
     // Reuse the original session `Arc`, not a deep clone: a `CallerContext`
@@ -1581,6 +1585,38 @@ pub(crate) fn with_session_reasoning_effort<T>(effort: Option<String>, f: impl F
 /// [`with_session_reasoning_effort`] 内时为 `None`（无覆盖，跟随条目默认）。
 fn current_session_reasoning_effort() -> Option<String> {
     SESSION_REASONING_EFFORT.with(|slot| slot.borrow().clone())
+}
+
+thread_local! {
+    /// 本次 `build_agent` 调用所属会话的 `preserve_thinking`（跨轮 CoT 保留）。
+    /// 与 [`SESSION_REASONING_EFFORT`] 同一理由：工厂闭包签名带不进这个逐会话
+    /// 参数，而 `build_agent_config` 只认 `RuntimeConfig`（其中没有该字段）。
+    ///
+    /// `Some(v)` = 本次会话显式指定的值（`thread/resume` 传
+    /// `meta.preserve_thinking`）；`None` = 未指定（直接构建与测试），此时按默认
+    /// `true` 解释，与 `AgentConfig::default()` 一致 ⇒ 零回归。
+    static SESSION_PRESERVE_THINKING: std::cell::RefCell<Option<bool>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 在调用工厂(`build_agent`)前设定本次会话的 `preserve_thinking`，供工厂解析。
+///
+/// 调用返回后恢复调用前的值，故嵌套调用不会泄漏。`thread/start` 传 `true`
+/// （新会话默认保留）；`thread/resume` 传 `meta.preserve_thinking`——让重开的
+/// 会话沿用落盘的开关，否则被关闭保留的会话重开后会静默恢复为「保留」，与
+/// 磁盘和已广播给各端的值相悖。
+pub(crate) fn with_session_preserve_thinking<T>(preserve: bool, f: impl FnOnce() -> T) -> T {
+    SESSION_PRESERVE_THINKING.with(|slot| {
+        let prev = slot.replace(Some(preserve));
+        let out = f();
+        slot.replace(prev);
+        out
+    })
+}
+
+/// 工厂内部读取当前会话的 `preserve_thinking`；未设定时按默认 `true` 解释。
+fn current_session_preserve_thinking() -> bool {
+    SESSION_PRESERVE_THINKING.with(|slot| slot.borrow().unwrap_or(true))
 }
 
 /// 生产环境的 agent 工厂:按 thread 的 cwd 覆盖 workdir 与 yolo 后引导一个 agent。
@@ -3469,7 +3505,9 @@ where
                         // api_url / api_key / model(命中清单默认则用条目,否则回退 cfg)。
                         let built = match with_session_model_ref(model_ref.clone(), || {
                             with_session_reasoning_effort(None, || {
-                                build_agent(None, Path::new(&cwd), mode)
+                                with_session_preserve_thinking(true, || {
+                                    build_agent(None, Path::new(&cwd), mode)
+                                })
                             })
                         }) {
                             Ok(a) => a,
@@ -3491,6 +3529,9 @@ where
                         // 且与 resume 的口径不一致。
                         let reasoning_effort =
                             built.agent.config().gen_params.reasoning_effort.clone();
+
+                        // 与 `model` 同源:上报**实际建出**的 agent 的开关值。
+                        let preserve_thinking = built.agent.config().preserve_thinking;
 
                         // 内核负责「attach_delegation → 建 driver 通道 → insert 到
                         // `threads` → spawn 守望者与 driver」;RPC 层的通知与响应仍在
@@ -3544,6 +3585,7 @@ where
                                     // 新会话无覆盖 ⇒ 上报实际运行值(解析出的条目默认
                                     // 或 cfg;都没有则 null),与实际建出的 agent 同源。
                                     "reasoning_effort": reasoning_effort,
+                                    "preserve_thinking": preserve_thinking,
                                 }),
                             ),
                         )
@@ -3629,7 +3671,9 @@ where
 
                         let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
                             with_session_reasoning_effort(loaded.meta.reasoning_effort.clone(), || {
-                                build_agent(Some(session), Path::new(&cwd), mode)
+                                with_session_preserve_thinking(loaded.meta.preserve_thinking, || {
+                                    build_agent(Some(session), Path::new(&cwd), mode)
+                                })
                             })
                         }) {
                             Ok(a) => a,
@@ -3653,6 +3697,10 @@ where
                         // 该实际值,而非照抄 meta 的 null(否则客户端挂着的控件会骗人)。
                         let reasoning_effort =
                             built.agent.config().gen_params.reasoning_effort.clone();
+                        // 与 `reasoning_effort` 同源:上报**实际建出**的 agent 的开关
+                        // 值(取自 meta,经工厂落到 config),让重开的客户端立刻拿到
+                        // 初始状态,而不必等一次广播。
+                        let preserve_thinking = built.agent.config().preserve_thinking;
                         let runtime_dir =
                             yi_agent_subagent::attach::project_runtime_directory(Path::new(&cwd));
                         let activation = attach_delegation(
@@ -3821,6 +3869,7 @@ where
                                     "model_ref": loaded.meta.model_ref,
                                     "permission_mode": loaded.meta.permission_mode,
                                     "reasoning_effort": reasoning_effort,
+                                    "preserve_thinking": preserve_thinking,
                                 }),
                             ),
                         )
@@ -4124,6 +4173,119 @@ where
                         write_response(
                             &hub, &client,
                             ok_response(id, json!({ "ok": true, "effort": effort })),
+                        )
+                        .await?;
+                    }
+                    "thread/setPreserveThinking" => {
+                        // 与 `thread/setReasoningEffort` 同档:开关会改请求体(是否回传
+                        // 历史轮的推理凭证),需 `Control`。
+                        if client_scope < Scope::Control {
+                            write_response(
+                                &hub, &client,
+                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                            )
+                            .await?;
+                            continue;
+                        }
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // `preserve` 必须是 JSON 布尔;缺失/null/字符串/数字一律
+                        // `-32602`,**不**静默取默认值——静默默认会让调用方以为开关
+                        // 已按其所愿设置,而实际可能停在相反的值。
+                        let preserve = match req.params.get("preserve") {
+                            Some(serde_json::Value::Bool(b)) => *b,
+                            _ => {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params("preserve must be a boolean"),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        // 先让在场 driver 用新开关重建 agent(复用当前 provider——
+                        // 开关不烤进 URL/key),成功后再落盘。铁律「上报/落盘 == 实际
+                        // 运行」同 setReasoningEffort:若重建失败,agent 仍跑旧值,此时
+                        // 落盘就会让磁盘与响应谎报。故先重建、后落盘;失败即回错误且
+                        // 零磁盘副作用。
+                        //
+                        // 冷 thread(不在内存)没有 driver 可发:只能先落盘,resume 时会按
+                        // meta.preserve_thinking 重建,故跳过本段。
+                        if threads.contains_key(&thread_id) {
+                            let (reply_tx, reply_rx) = oneshot::channel();
+                            // 借用只活在下面这个块内(send 的 future 借 `session`),
+                            // 出块即释放,后续 `threads.get_mut` 才不被占用。
+                            let send_result = {
+                                let session = threads
+                                    .get(&thread_id)
+                                    .expect("contains_key was just checked");
+                                session
+                                    .session_tx
+                                    .send(SessionCommand::SetPreserveThinking {
+                                        preserve,
+                                        reply: reply_tx,
+                                    })
+                                    .await
+                            };
+                            // reply 为 `Ok(Err(_))` 表示 driver 重建失败;发送失败(通道关闭)
+                            // 同样意味着无法保证生效,一并按失败处理。
+                            let applied =
+                                send_result.is_ok() && matches!(reply_rx.await, Ok(Ok(())));
+                            if !applied {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(
+                                        id,
+                                        RpcError::internal(
+                                            "the live session could not switch the \
+                                             preserve-thinking flag; it is still running the \
+                                             previous value"
+                                                .to_string(),
+                                        ),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+                        // 重建成功后(冷 thread 则直接)落盘:读-改-写 + 原子写,与
+                        // `set_reasoning_effort` 同锁,避免并发 `touch` / `rename` 互相覆盖。
+                        let store = store_lookup(&threads, &workspaces, &cfg, &thread_id);
+                        if let Err(e) = store.set_preserve_thinking(&thread_id, preserve) {
+                            if e.kind() == std::io::ErrorKind::NotFound {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            } else {
+                                write_response(
+                                    &hub, &client,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                            continue;
+                        }
+                        // 列表层恒推(同 `thread/reasoningEffortChanged`):桌面改 → 手机
+                        // 控件同步,反之亦然。
+                        let _ = write_notification(
+                            &hub,
+                            &Notification::PreserveThinkingChanged {
+                                thread_id: thread_id.clone(),
+                                preserve,
+                            },
+                        )
+                        .await;
+                        write_response(
+                            &hub, &client,
+                            ok_response(id, json!({ "ok": true, "preserve": preserve })),
                         )
                         .await?;
                     }
@@ -5976,10 +6138,20 @@ async fn persist_and_finish_turn(
 
     // 先取助手侧材料：`items` 接下来会 move 进 `record`，此后无法再借用。
     let assistant_text = completed_items_agent_text(&items);
+    // 落盘副本：关闭跨轮保留（`preserve_thinking == false`）时剥离思考块，使磁盘
+    // 与「已放弃跨轮保留」的会话状态一致——否则每轮追加的日志行仍携带刚产出的
+    // 凭证，重开会话即「复活」（spec §4.1/§7.4）。session 本体（展示与请求的权威）
+    // 不受影响：这里只剥**落盘副本**，与请求路径的剥离互不干扰。
+    // 默认 `true` 时逐字取会话内容 ⇒ 与今日落盘完全一致（零回归）。
+    let persisted_messages = if agent.config().preserve_thinking {
+        agent.session().messages().to_vec()
+    } else {
+        yi_agent_core::strip_thinking(agent.session().messages())
+    };
     let record = crate::thread_store::TurnLine::Turn {
         items,
         usage: last_usage,
-        messages: agent.session().messages().to_vec(),
+        messages: persisted_messages,
     };
     // append 失败则跳过 touch：避免出现"幽灵" thread。
     let mut first_turn = false;
@@ -6215,6 +6387,61 @@ async fn apply_session_command(
             tracing::info!(?effort, "session reasoning effort switched");
             let _ = reply.send(Ok(()));
             agent = rebuilt;
+        }
+        SessionCommand::SetPreserveThinking { preserve, reply } => {
+            // provider 不变（开关不烤进 URL/key），故复用当前 `provider`，只把
+            // `AgentConfig.preserve_thinking` 换掉后重建 agent。
+            //
+            // **先**把 strip 落到共享 session 本体：`preserve_thinking` 只影响请求
+            // 副本（见 core 的 `run_loop`），若不在此就地剥离，落盘/展示的权威
+            // transcript 仍带着凭证，重开会话后它们会「复活」——与「关闭保留」的
+            // 开关语义直接矛盾（spec §4.1）。`set_session_messages` 与
+            // `session_handle()` 摸的是同一个 `Arc<Mutex<Session>>`，故先写后取。
+            if !preserve {
+                let stripped = yi_agent_core::strip_thinking(agent.session().messages());
+                agent.set_session_messages(stripped);
+            }
+            let mut next_config = agent.config().clone();
+            next_config.preserve_thinking = preserve;
+            // 三样必须原样保留：session `Arc`（否则委派 caller 读不到本会话）、
+            // 工具注册表、审批路径（checker + decision_rx）。与
+            // `SetReasoningEffort` 的重建语义一致。
+            let session_handle = agent.session_handle();
+            let tools = agent.tools();
+            let permission = agent.permission_checker();
+            let decision = agent.decision_rx();
+            let mut rebuilt = yi_agent_core::Agent::new(provider.clone(), tools, next_config)
+                .with_session_arc(session_handle);
+            if let (Some(checker), Some(rx)) = (permission, decision) {
+                rebuilt = rebuilt.with_permission(checker, rx);
+            }
+            tracing::info!(preserve, "session preserve-thinking switched");
+            agent = rebuilt;
+            // 立即把（可能已剥离的）会话状态落盘：否则「关闭后、下一轮开始前」
+            // 重开会话，日志最后一行仍是切换前那条带凭证的记录，凭证就此「复活」
+            // ——与「关闭保留」的语义矛盾（spec §7.4：关闭时落盘结果同样被剥离）。
+            // 必须在 `agent = rebuilt` **之后**调用：`persist_and_finish_turn` 会读
+            // `agent.config().preserve_thinking` 决定落盘副本是否剥离，读到旧值就
+            // 会在关闭时仍把凭证写盘。与 `Clear` / `Compact` 同款：`turn_id` 传
+            // `None`（不发 Finished），也不 touch meta（meta 已由 RPC 层落盘）。
+            persist_and_finish_turn(
+                thread_id,
+                None,
+                None,
+                &[],
+                &[],
+                &agent,
+                Vec::new(),
+                None,
+                store,
+                hub,
+                turn_tx,
+                provider,
+                config,
+                status,
+            )
+            .await;
+            let _ = reply.send(Ok(()));
         }
     }
     agent
@@ -6698,6 +6925,9 @@ async fn run_thread_driver(
                             SessionCommand::SetReasoningEffort { reply, .. } => {
                                 let _ = reply.send(Err("另有一个会话命令待执行".into()));
                             }
+                            SessionCommand::SetPreserveThinking { reply, .. } => {
+                                let _ = reply.send(Err("另有一个会话命令待执行".into()));
+                            }
                         }
                     } else {
                         pending_session_command = Some(command);
@@ -6834,7 +7064,8 @@ pub(crate) fn item_id(item: &crate::protocol::Item) -> Option<&str> {
         crate::protocol::Item::UserMessage { id, .. }
         | crate::protocol::Item::AgentMessage { id, .. }
         | crate::protocol::Item::ToolCall { id, .. }
-        | crate::protocol::Item::UserInterjection { id, .. } => Some(id),
+        | crate::protocol::Item::UserInterjection { id, .. }
+        | crate::protocol::Item::Thinking { id, .. } => Some(id),
     }
 }
 
@@ -7257,6 +7488,8 @@ async fn start_thread_core(
         card_id: card_id.map(str::to_string),
         model_ref,
         reasoning_effort: None,
+        // 新会话默认开启跨轮保留(与 `ThreadMeta` 的缺省语义一致)。
+        preserve_thinking: true,
     };
     if let Err(e) = thread_store.create(&meta) {
         // 持久化是尽力而为:写失败不阻断 thread 创建。
@@ -13380,6 +13613,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                preserve_thinking: true,
             })
             .unwrap();
         // 全局索引指向该工作区（canonicalize 以对齐真实写入的路径形态）。
@@ -14613,6 +14847,530 @@ pub(crate) mod tests {
         );
     }
 
+    /// 切 `preserve_thinking = false` 必须**真的**把历史轮的思考凭证从共享 session
+    /// 本体里剥掉:不只是换请求副本,而是把落盘/展示的权威 transcript 一并剥离。
+    /// 否则重开会话后凭证会「复活」——与「关闭保留」直接矛盾(spec §4.1)。
+    ///
+    /// 这条测试刻意驱动真实的 `apply_session_command`(不是 mock 出来的中间态):
+    /// 凭证先**确实存在**,调用后**确实消失**,以此证伪「没接到 session」的假设。
+    #[tokio::test]
+    async fn set_preserve_thinking_false_strips_the_shared_session() {
+        use yi_agent_core::{ContentBlock, Message, ThinkingToken};
+
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r); // 本测试不看 writer 输出
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        registry.register(Arc::new(FakeBash));
+        let tools: Arc<yi_agent_core::ToolRegistry> = Arc::new(registry);
+        let checker = Arc::new(yi_agent_core::permission::PermissionChecker::new(
+            yi_agent_core::permission::PermissionsConfig::default(),
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            std::path::PathBuf::from("/tmp/yi-agent-app-server-test"),
+            Arc::new(|_cmd: &str| None),
+        ));
+        let (decision_tx, decision_rx) = mpsc::channel::<(u64, Decision)>(16);
+        let rx_arc = Arc::new(Mutex::new(decision_rx));
+        let mut agent = yi_agent_core::Agent::new(provider.clone(), tools.clone(), config.clone())
+            .with_permission(checker.clone(), rx_arc.clone());
+        // 会话里放一条**带思考凭证**的 assistant 消息——这是待剥离的对象。
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .replace_messages(vec![
+                Message::user("q"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: "reasoning".into(),
+                        token: ThinkingToken::Signature("SIG-XYZ".into()),
+                    },
+                    ContentBlock::Text("a".into()),
+                ]),
+            ]);
+        let original_handle = agent.session_handle();
+        let _keep_decision_tx = decision_tx;
+
+        // 前置:凭证此刻**确实在**(否则后面的断言可能因 fixture 错而假绿)。
+        let before = agent.session().messages().to_vec();
+        assert!(
+            before
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::Thinking { .. })),
+            "fixture must start with a Thinking block in the session"
+        );
+
+        let (reply, answer) = oneshot::channel();
+        agent = apply_session_command(
+            agent,
+            SessionCommand::SetPreserveThinking {
+                preserve: false,
+                reply,
+            },
+            &provider,
+            &config,
+            &store,
+            "thread-set-preserve-1",
+            &hub,
+            &turn_tx,
+            &ThreadSession::new_status(),
+        )
+        .await;
+        answer
+            .await
+            .expect("the set-preserve reply channel must be fulfilled")
+            .expect("toggling the flag must succeed");
+
+        assert!(
+            !agent.config().preserve_thinking,
+            "the rebuilt agent must carry the new flag"
+        );
+        assert!(
+            Arc::ptr_eq(&original_handle, &agent.session_handle()),
+            "the rebuild must reuse the session Arc, not swap in a new one"
+        );
+        let after = agent.session().messages().to_vec();
+        assert!(
+            !after
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::Thinking { .. })),
+            "turning the flag off must strip Thinking blocks from the shared session: {after:?}"
+        );
+        // 剥离只该去凭证:正文消息与数量必须原样。
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "stripping must not drop messages"
+        );
+        assert!(
+            after
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::Text(t) if t == "a")),
+            "stripping must leave the neighbouring text block intact"
+        );
+        let kept_tools = agent.tools();
+        assert!(
+            Arc::ptr_eq(&kept_tools, &tools),
+            "the rebuild must keep the very same tool registry"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &agent.permission_checker().expect("checker re-attached"),
+                &checker
+            ),
+            "the rebuild must keep the approval checker"
+        );
+        assert!(
+            Arc::ptr_eq(
+                &agent.decision_rx().expect("decision channel re-attached"),
+                &rx_arc
+            ),
+            "the rebuild must keep the decision channel"
+        );
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "a session command with no turn must not report a turn as finished"
+        );
+    }
+
+    /// 反向:切 `preserve_thinking = true` 不该动 session 的既有内容(凭证原样留下)。
+    #[tokio::test]
+    async fn set_preserve_thinking_true_leaves_the_shared_session_untouched() {
+        use yi_agent_core::{ContentBlock, Message, ThinkingToken};
+
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig {
+            preserve_thinking: false,
+            ..yi_agent_core::AgentConfig::default()
+        };
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r);
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+
+        let mut agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .replace_messages(vec![Message::assistant(vec![ContentBlock::Thinking {
+                text: "r".into(),
+                token: ThinkingToken::Signature("SIG-KEEP".into()),
+            }])]);
+        let before = agent.session().messages().to_vec();
+
+        let (reply, answer) = oneshot::channel();
+        agent = apply_session_command(
+            agent,
+            SessionCommand::SetPreserveThinking {
+                preserve: true,
+                reply,
+            },
+            &provider,
+            &config,
+            &store,
+            "thread-set-preserve-2",
+            &hub,
+            &turn_tx,
+            &ThreadSession::new_status(),
+        )
+        .await;
+        answer.await.unwrap().unwrap();
+
+        assert!(agent.config().preserve_thinking);
+        assert_eq!(
+            agent.session().messages().to_vec(),
+            before,
+            "enabling preserve must not touch the session transcript"
+        );
+    }
+
+    /// F1(评审修正 important):关闭 `preserve_thinking` 后**重开**会话,工厂必须
+    /// 从 `meta.preserve_thinking` 重建,而不是回落到默认 `true`。否则磁盘与所有
+    /// 客户端都说「已关闭」,重开的会话却仍在回传跨轮凭证——磁盘对运行态说谎,
+    /// 也违反 spec §7.4「会话重开后(往返)一致」。
+    ///
+    /// 用 `production_factory` 驱动重开路径(它经 `rebuild_thread_agent_with_theme`,
+    /// 正是注入点所在);响应里回显的 `preserve_thinking` 与重建后的 agent 同源。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_honors_a_persisted_preserve_thinking_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let factory = production_factory(cfg.clone(), test_theme(), test_catalog());
+        let mut h = Harness::with_config(cfg, factory, PERMISSION_TIMEOUT);
+        let tid = start_thread(&mut h).await;
+
+        // 活着时关掉开关。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"thread/setPreserveThinking","params":{{"threadId":"{tid}","preserve":false}}}}"#
+        ))
+        .await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["result"]["ok"], true, "got {v}");
+        // 确认确实落了盘(重开读的就是这份 meta)。
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("thread persists");
+        assert!(!loaded.meta.preserve_thinking, "the flag must be persisted");
+
+        // 重开:必须仍为 false(修 F1 前这里会回落 true)。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":4,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+        ))
+        .await;
+        let mut resumed = None;
+        for _ in 0..24 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(4)) {
+                resumed = Some(v);
+                break;
+            }
+        }
+        let resumed = resumed.expect("thread/resume must respond");
+        assert_eq!(
+            resumed["result"]["preserve_thinking"], false,
+            "resume must honor the persisted switch, not fall back to the default: {resumed}"
+        );
+        h.shutdown().await;
+    }
+
+    /// F2(评审修正):切换开关必须**立即**落盘剥离后的会话状态。否则「关闭后、
+    /// 下一轮开始前」重开会话,日志最后一行仍是切换前那条带凭证的记录,凭证复活
+    /// (spec §7.4「关闭时落盘结果同样被剥离」)。
+    ///
+    /// 直接驱动生产函数 `apply_session_command`(与 clear/compact 测试同款),并从
+    /// 真实 store 读回落盘副本断言其不含 `Thinking`。
+    #[tokio::test]
+    async fn toggling_preserve_off_persists_a_stripped_transcript() {
+        use yi_agent_core::{ContentBlock, Message, ThinkingToken};
+
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r);
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+        let tid = "thread-persist-toggle";
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: "/tmp".into(),
+                model: "m".into(),
+                created_at: 1,
+                updated_at: 1,
+                title: None,
+                permission_mode: Default::default(),
+                pin_seq: None,
+                board_project: None,
+                card_id: None,
+                model_ref: None,
+                reasoning_effort: None,
+                preserve_thinking: true,
+            })
+            .unwrap();
+
+        let agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .replace_messages(vec![
+                Message::user("q"),
+                Message::assistant(vec![
+                    ContentBlock::Thinking {
+                        text: "r".into(),
+                        token: ThinkingToken::Signature("SIG-PERSIST".into()),
+                    },
+                    ContentBlock::Text("a".into()),
+                ]),
+            ]);
+
+        let (reply, answer) = oneshot::channel();
+        let agent = apply_session_command(
+            agent,
+            SessionCommand::SetPreserveThinking {
+                preserve: false,
+                reply,
+            },
+            &provider,
+            &config,
+            &store,
+            tid,
+            &hub,
+            &turn_tx,
+            &ThreadSession::new_status(),
+        )
+        .await;
+        answer.await.unwrap().unwrap();
+        drop(agent);
+
+        // 落盘副本里不得再有凭证(修 F2 前:切换不 append,盘上仍是旧行→此处失败)。
+        let loaded = store
+            .load(tid)
+            .expect("load must not fail")
+            .expect("the toggle must have appended");
+        assert!(
+            !loaded
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::Thinking { .. })),
+            "the persisted transcript must be stripped once retention is off: {:?}",
+            loaded.messages
+        );
+        // 正文必须原样留下(剥离只去凭证)。
+        assert!(
+            loaded
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::Text(t) if t == "a")),
+            "stripping must leave the neighbouring text block intact"
+        );
+    }
+
+    /// F3(评审修正):关闭保留后**新一轮**的落盘也必須无凭证。`run_loop` 只剥请求
+    /// 副本,session 本体在关闭后仍可能持有当轮凭证;`persist_and_finish_turn` 必须
+    /// 剥落盘副本,否则每轮日志都追加带凭证的行,重开即复活。
+    ///
+    /// 直接驱动生产函数 `persist_and_finish_turn`,用一个 `preserve_thinking=false`
+    /// 且 session 含凭证的 agent:落盘副本应无凭证,而 session 本体不变(它仍是
+    /// 展示/请求的权威)。
+    #[tokio::test]
+    async fn a_turn_while_off_persists_without_credentials() {
+        use yi_agent_core::{ContentBlock, Message, ThinkingToken};
+
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig {
+            preserve_thinking: false,
+            ..yi_agent_core::AgentConfig::default()
+        };
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r);
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+        let tid = "thread-persist-turn";
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: "/tmp".into(),
+                model: "m".into(),
+                created_at: 1,
+                updated_at: 1,
+                title: None,
+                permission_mode: Default::default(),
+                pin_seq: None,
+                board_project: None,
+                card_id: None,
+                model_ref: None,
+                reasoning_effort: None,
+                preserve_thinking: false,
+            })
+            .unwrap();
+
+        let agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .replace_messages(vec![Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "r".into(),
+                    token: ThinkingToken::Signature("SIG-TURN".into()),
+                },
+                ContentBlock::Text("a".into()),
+            ])]);
+
+        persist_and_finish_turn(
+            tid,
+            None,
+            None,
+            &[],
+            &[],
+            &agent,
+            Vec::new(),
+            None,
+            &store,
+            &hub,
+            &turn_tx,
+            &provider,
+            &config,
+            &ThreadSession::new_status(),
+        )
+        .await;
+
+        let loaded = store
+            .load(tid)
+            .expect("load must not fail")
+            .expect("the turn must have been persisted");
+        assert!(
+            !loaded
+                .messages
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::Thinking { .. })),
+            "a turn persisted while retention is off must carry no credentials: {:?}",
+            loaded.messages
+        );
+        // session 本体不动:它仍是展示/请求的权威。
+        assert!(
+            agent
+                .session()
+                .messages()
+                .iter()
+                .flat_map(|m| m.content.iter())
+                .any(|b| matches!(b, ContentBlock::Thinking { .. })),
+            "the persist-time strip must not mutate the live session"
+        );
+    }
+
+    /// 零回归:默认 `true` 时,落盘副本必须与会话内容**逐字相同**(一条凭证都不少)。
+    #[tokio::test]
+    async fn a_turn_with_default_retention_persists_the_session_verbatim() {
+        use yi_agent_core::{ContentBlock, Message, ThinkingToken};
+
+        let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MockProvider);
+        let config = yi_agent_core::AgentConfig::default();
+        assert!(config.preserve_thinking, "the default must be retention on");
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        drop(client_r);
+        let (hub, _client) = test_hub(server_w);
+        let (turn_tx, _turn_rx) = mpsc::channel::<TurnEvent>(8);
+        let store_dir = tempfile::TempDir::new().unwrap();
+        let store = crate::thread_store::ThreadStore::new(store_dir.path());
+        let tid = "thread-persist-default";
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: "/tmp".into(),
+                model: "m".into(),
+                created_at: 1,
+                updated_at: 1,
+                title: None,
+                permission_mode: Default::default(),
+                pin_seq: None,
+                board_project: None,
+                card_id: None,
+                model_ref: None,
+                reasoning_effort: None,
+                preserve_thinking: true,
+            })
+            .unwrap();
+
+        let agent = yi_agent_core::Agent::new(
+            provider.clone(),
+            Arc::new(yi_agent_core::ToolRegistry::new()),
+            config.clone(),
+        );
+        agent
+            .session_handle()
+            .lock()
+            .unwrap()
+            .replace_messages(vec![Message::assistant(vec![
+                ContentBlock::Thinking {
+                    text: "r".into(),
+                    token: ThinkingToken::Signature("SIG-VERBATIM".into()),
+                },
+                ContentBlock::Text("a".into()),
+            ])]);
+
+        persist_and_finish_turn(
+            tid,
+            None,
+            None,
+            &[],
+            &[],
+            &agent,
+            Vec::new(),
+            None,
+            &store,
+            &hub,
+            &turn_tx,
+            &provider,
+            &config,
+            &ThreadSession::new_status(),
+        )
+        .await;
+
+        let loaded = store
+            .load(tid)
+            .expect("load must not fail")
+            .expect("the turn must have been persisted");
+        assert_eq!(
+            loaded.messages,
+            agent.session().messages().to_vec(),
+            "default retention must persist the session transcript verbatim"
+        );
+    }
     /// provider 构造失败时(如未授权的 provider 名):回执 `Err`,且**原 agent 原样保留**,
     /// 绝不留下半重建状态(沿用既有重建的原子性)。
     #[tokio::test]
@@ -15885,6 +16643,7 @@ pub(crate) mod tests {
             card_id: card_id.map(str::to_string),
             model_ref: None,
             reasoning_effort: None,
+            preserve_thinking: true,
         };
         crate::thread_store::ThreadStore::new(dir)
             .create(&meta)
@@ -16335,6 +17094,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                preserve_thinking: true,
             })
             .unwrap();
         store
@@ -16440,6 +17200,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                preserve_thinking: true,
             })
             .unwrap();
         // 一轮正常收尾过的历史。
@@ -19034,6 +19795,143 @@ pub(crate) mod tests {
             loaded.meta.reasoning_effort, None,
             "rejection must not write"
         );
+        h.shutdown().await;
+    }
+
+    /// `thread/setPreserveThinking` 必须落盘 meta 的 `preserve_thinking` 并广播
+    /// `thread/preserveThinkingChanged`(跨客户端同步开关的唯一通道)。形状照
+    /// `thread_set_reasoning_effort_persists_and_broadcasts`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn thread_set_preserve_thinking_persists_and_broadcasts() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":9,"method":"thread/subscribe","params":{{"threadIds":["{tid}"]}}}}"#
+        ))
+        .await;
+        assert_eq!(
+            read_response(&mut h, 9).await["result"]["subscribed"][0].as_str(),
+            Some(tid.as_str())
+        );
+
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setPreserveThinking","params":{{"threadId":"{tid}","preserve":false}}}}"#
+        ))
+        .await;
+
+        let mut response: Option<serde_json::Value> = None;
+        let mut changed: Option<serde_json::Value> = None;
+        for _ in 0..8 {
+            let v = h.read_value().await;
+            if v.get("id") == Some(&serde_json::json!(20)) {
+                response = Some(v);
+            } else if v.get("method").and_then(|m| m.as_str())
+                == Some("thread/preserveThinkingChanged")
+            {
+                changed = Some(v);
+            }
+            if response.is_some() && changed.is_some() {
+                break;
+            }
+        }
+        let response = response.expect("setPreserveThinking must respond");
+        assert_eq!(response["result"]["ok"], true, "got {response}");
+        assert_eq!(
+            response["result"]["preserve"], false,
+            "the response must echo the applied flag: {response}"
+        );
+        let changed = changed.expect("must broadcast thread/preserveThinkingChanged");
+        assert_eq!(changed["params"]["thread_id"].as_str(), Some(tid.as_str()));
+        assert_eq!(changed["params"]["preserve"], false);
+
+        // 落盘:resume 走的正是这份 meta。
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("setPreserveThinking must persist meta");
+        assert!(
+            !loaded.meta.preserve_thinking,
+            "the flag must be persisted to disk"
+        );
+        h.shutdown().await;
+    }
+
+    /// 与 `thread/setReasoningEffort` 同档:`Observe` 客户端必须被拒 `-32014`。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_observe_client_cannot_set_preserve_thinking() {
+        let mut h = Harness::with_scope(Scope::Observe).await;
+        initialize(&mut h).await;
+        h.send(
+            r#"{"jsonrpc":"2.0","id":20,"method":"thread/setPreserveThinking","params":{"threadId":"t1","preserve":false}}"#,
+        )
+        .await;
+        let v = h.read_value().await;
+        assert_eq!(v["error"]["code"], -32014, "got {v}");
+        h.shutdown().await;
+    }
+
+    /// `preserve` 必须是 JSON 布尔:缺失/null/字符串/数字一律 `-32602`,且**零副作用**
+    /// (不落盘、不广播)。这里刻意不静默默认——静默默认会让调用方以为开关已按其所愿
+    /// 设置,而实际可能停在相反的值。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_preserve_value_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_cfg(cfg).await;
+        let tid = start_thread(&mut h).await;
+        // 订阅本会话：若拒绝路径错误地广播了变更，订阅者会收到，下面的
+        // `try_read_value` 就能捕获。未订阅则内容层通知会被过滤，断言失去意义。
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":8,"method":"thread/subscribe","params":{{"threadIds":["{tid}"]}}}}"#
+        ))
+        .await;
+        assert_eq!(
+            read_response(&mut h, 8).await["result"]["subscribed"][0].as_str(),
+            Some(tid.as_str())
+        );
+        for (i, raw) in [
+            format!(
+                r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setPreserveThinking","params":{{"threadId":"{tid}"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":21,"method":"thread/setPreserveThinking","params":{{"threadId":"{tid}","preserve":null}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":22,"method":"thread/setPreserveThinking","params":{{"threadId":"{tid}","preserve":"yes"}}}}"#
+            ),
+            format!(
+                r#"{{"jsonrpc":"2.0","id":23,"method":"thread/setPreserveThinking","params":{{"threadId":"{tid}","preserve":1}}}}"#
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            h.send(&raw).await;
+            let v = read_response(&mut h, 20 + i as u64).await;
+            assert_eq!(v["error"]["code"], -32602, "got {v}");
+        }
+
+        let loaded = crate::thread_store::ThreadStore::new(dir.path())
+            .load(&tid)
+            .expect("load must not fail")
+            .expect("thread persists");
+        assert!(
+            loaded.meta.preserve_thinking,
+            "rejection must not write: the default must stay true"
+        );
+        // 「零副作用」的另一半：拒绝路径**不得**广播变更。四次非法请求后不该有
+        // 任何 `thread/preserveThinkingChanged`（订阅者仍连着，故若广播会收到）。
+        while let Some(v) = h.try_read_value(Duration::from_millis(150)).await {
+            assert_ne!(
+                v.get("method").and_then(|m| m.as_str()),
+                Some("thread/preserveThinkingChanged"),
+                "a rejected request must not broadcast a change: {v}"
+            );
+        }
         h.shutdown().await;
     }
 

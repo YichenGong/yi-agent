@@ -54,6 +54,20 @@ pub struct ThreadMeta {
     /// 「未设置＝不发该字段」）。旧 meta 缺字段时默认 None，零迁移。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 是否跨轮保留思考块（Anthropic thinking / Responses encrypted_content 等）。
+    ///
+    /// `true`（默认）= 历史轮的推理凭证原样回传与落盘；`false` = 请求前剥离历史轮、
+    /// 并把落盘 transcript 一并剥离（spec §4.1）。**旧 meta 缺字段必须解释为
+    /// `true`**（零迁移：`bool` 的 `#[serde(default)]` 是 `false`，故必须显式给
+    /// `default_true`，否则老会话会被静默降级为「丢弃凭证」）。
+    #[serde(default = "default_true")]
+    pub preserve_thinking: bool,
+}
+
+/// `#[serde(default = "…")]` 的显式默认：`bool` 的内建默认是 `false`，而本开关
+/// 的缺省语义必须为「保留」。
+fn default_true() -> bool {
+    true
 }
 
 /// 一次 turn 的 token 用量。
@@ -444,6 +458,21 @@ impl ThreadStore {
         }
     }
 
+    /// 设置该 thread 的 `preserve_thinking`（跨轮 CoT 保留）覆盖。
+    ///
+    /// 与 [`set_reasoning_effort`] 同款：走 `update_meta` 的读-改-写锁与原子写路径。
+    /// 返回 `Err(NotFound)` 表示 thread 不存在或 meta 不可读。
+    pub fn set_preserve_thinking(&self, id: &str, preserve: bool) -> io::Result<()> {
+        let updated = self.update_meta(id, |meta| {
+            meta.preserve_thinking = preserve;
+            meta.updated_at = now_millis();
+        })?;
+        match updated {
+            Some(_) => Ok(()),
+            None => Err(io::Error::new(io::ErrorKind::NotFound, "unknown thread")),
+        }
+    }
+
     /// 每 turn 完成时调用:更新 `updated_at`,并在 `title` 仍为 `None` 时用
     /// `title_hint`(本轮 prompt)填充。
     ///
@@ -746,6 +775,8 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         card_id: None,
         model_ref: None,
         reasoning_effort: None,
+        // 缺 meta 时从日志重建:无从得知曾经的开关,按默认「保留」解释。
+        preserve_thinking: true,
     }
 }
 
@@ -774,6 +805,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            preserve_thinking: true,
         }
     }
 
@@ -1435,6 +1467,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            preserve_thinking: true,
         }
     }
 
@@ -1466,6 +1499,46 @@ mod tests {
         let loaded = store.load("thread-a").unwrap().unwrap();
         assert_eq!(loaded.items.len(), 1);
         assert!(!loaded.pending_turn, "no partial file ⇒ nothing pending");
+    }
+
+    /// `Item::Thinking` 走既有 item 机制落盘/回放：append → load 后逐字等价，
+    /// 且磁盘上的 JSONL **不含**任何凭证（signature / encrypted_content）。
+    #[test]
+    fn thinking_item_round_trips_and_stays_credential_free() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-a")).unwrap();
+        let thinking = crate::protocol::Item::Thinking {
+            id: "item-turn1-2".into(),
+            text: "cot summary".into(),
+            redacted: false,
+        };
+        store
+            .append_turn(
+                "thread-a",
+                &TurnLine::Turn {
+                    items: vec![user_item("user-t1", "hi"), thinking.clone()],
+                    usage: None,
+                    messages: vec![],
+                },
+            )
+            .unwrap();
+
+        let loaded = store.load("thread-a").unwrap().unwrap();
+        assert_eq!(
+            loaded.items.last(),
+            Some(&thinking),
+            "thinking item must replay verbatim after append + load"
+        );
+
+        // 磁盘上不得出现凭证字段：展示条目只带明文与 redacted 位。
+        let log =
+            std::fs::read_to_string(dir.path().join(".yi-agent/threads/thread-a.jsonl")).unwrap();
+        assert!(log.contains("\"type\":\"thinking\""), "got: {log}");
+        assert!(
+            !log.contains("signature") && !log.contains("encrypted_content"),
+            "persisted thinking item must never carry a credential: {log}"
+        );
     }
 
     #[test]
@@ -1768,6 +1841,7 @@ mod tests {
             card_id: Some("c1".into()),
             model_ref: None,
             reasoning_effort: None,
+            preserve_thinking: true,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -1805,6 +1879,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            preserve_thinking: true,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -1847,6 +1922,59 @@ mod tests {
         let (_d, s) = store();
         let err = s
             .set_reasoning_effort("ghost", Some("high"))
+            .expect_err("an unknown thread must not be silently accepted");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// `preserve_thinking` 的零迁移契约(spec §4.1):旧 meta 缺该字段时必须回
+    /// `true`(保留),而不是 `bool` 的 `serde(default)` = `false`。
+    #[test]
+    fn preserve_thinking_defaults_true_and_legacy_meta_migrates() {
+        // 逐字模拟今天的盘上 JSON:没有 preserve_thinking 字段 ⇒ 必须回 true。
+        // 必填字段(thread_id/cwd/model/created_at/updated_at/title)照实给全,
+        // 只**故意**省掉 preserve_thinking。
+        let legacy: ThreadMeta = serde_json::from_str(
+            r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#,
+        )
+        .unwrap();
+        assert!(
+            legacy.preserve_thinking,
+            "旧 meta 缺字段必须回 true(零迁移:老会话按「保留」解释)"
+        );
+    }
+
+    /// `set_preserve_thinking` + `load` 的真实往返:true/false 都必须落盘并可读回。
+    #[test]
+    fn preserve_thinking_round_trips_through_set_and_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&meta("t")).unwrap();
+        // 新建的 meta 默认保留。
+        assert!(
+            store.load("t").unwrap().unwrap().meta.preserve_thinking,
+            "新建 meta 必须默认保留思考"
+        );
+
+        store.set_preserve_thinking("t", false).unwrap();
+        assert!(
+            !store.load("t").unwrap().unwrap().meta.preserve_thinking,
+            "关闭开关必须落盘为 false"
+        );
+
+        store.set_preserve_thinking("t", true).unwrap();
+        assert!(
+            store.load("t").unwrap().unwrap().meta.preserve_thinking,
+            "重新开启必须落盘为 true"
+        );
+    }
+
+    /// 未知 id 与 `set_reasoning_effort` 同一错误语义:回 `Err(NotFound)`,调用方
+    /// 据此映射 `unknown_thread`,而不是静默成功。
+    #[test]
+    fn set_preserve_thinking_on_an_unknown_thread_is_not_found() {
+        let (_d, s) = store();
+        let err = s
+            .set_preserve_thinking("ghost", false)
             .expect_err("an unknown thread must not be silently accepted");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }

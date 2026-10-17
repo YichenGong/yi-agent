@@ -3,7 +3,9 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use yi_agent_core::{ContentBlock, ImageSource, ProviderRequest, Role, ToolSchema};
+use yi_agent_core::{
+    ContentBlock, ImageSource, ProviderRequest, Role, ToolSchema, message_has_tool_use,
+};
 
 /// OpenAI /v1/chat/completions request body.
 #[derive(Serialize)]
@@ -36,6 +38,10 @@ pub struct OpenaiMessage {
     pub tool_calls: Option<Vec<OpenaiToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// DeepSeek thinking mode 的思维链。**仅在有 tool_calls 时回传**——
+    /// 无工具调用时官方要求用后即弃。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -176,6 +182,7 @@ impl From<ProviderRequest> for OpenaiRequest {
                 content: Some(OpenaiContent::Text(s)),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
 
@@ -190,6 +197,7 @@ impl From<ProviderRequest> for OpenaiRequest {
                                 content: Some(OpenaiContent::Text(t.clone())),
                                 tool_calls: None,
                                 tool_call_id: None,
+                                reasoning_content: None,
                             });
                         }
                     }
@@ -201,6 +209,7 @@ impl From<ProviderRequest> for OpenaiRequest {
                         content: Some(user_content(&m.content)),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     });
                 }
                 Role::Assistant => {
@@ -234,6 +243,21 @@ impl From<ProviderRequest> for OpenaiRequest {
                         None
                     };
 
+                    // DeepSeek thinking mode 的思维链：只有 `ThinkingToken::None`
+                    // （无凭证）的明文参与回传；其他凭证形态（Anthropic signature /
+                    // redacted / OpenAI encrypted）不是 `reasoning_content` 的语义。
+                    let reasoning: String = m
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Thinking {
+                                text,
+                                token: yi_agent_core::ThinkingToken::None,
+                            } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+
                     messages.push(OpenaiMessage {
                         role: "assistant".to_string(),
                         name: None,
@@ -244,6 +268,9 @@ impl From<ProviderRequest> for OpenaiRequest {
                             Some(tool_calls)
                         },
                         tool_call_id: None,
+                        // 仅在有工具调用时回传——无工具调用时官方要求用后即弃。
+                        reasoning_content: (message_has_tool_use(&m) && !reasoning.is_empty())
+                            .then_some(reasoning),
                     });
                 }
                 Role::Tool => {
@@ -283,6 +310,7 @@ impl From<ProviderRequest> for OpenaiRequest {
                                 content: Some(OpenaiContent::Text(body)),
                                 tool_calls: None,
                                 tool_call_id: Some(tool_use_id),
+                                reasoning_content: None,
                             });
                         }
                     }
@@ -294,6 +322,7 @@ impl From<ProviderRequest> for OpenaiRequest {
                             content: Some(OpenaiContent::Parts(image_parts)),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         });
                     }
                 }
@@ -713,5 +742,46 @@ mod tests {
         let json = serde_json::to_value(&o).unwrap();
         assert_eq!(json["messages"].as_array().unwrap().len(), 1);
         assert_eq!(json["messages"][0]["content"], "ok");
+    }
+
+    #[test]
+    fn reasoning_content_emitted_only_when_tool_calls_present() {
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let base = |blocks: Vec<ContentBlock>| ProviderRequest {
+            model: "deepseek-v4".into(),
+            system: None,
+            messages: vec![Message::assistant(blocks)],
+            tools: vec![],
+            params: GenParams::default(),
+        };
+
+        // 有 tool_calls：reasoning_content 必须回传。
+        let with_tool = base(vec![
+            ContentBlock::Thinking {
+                text: "cot".into(),
+                token: ThinkingToken::None,
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".into(),
+                name: "read".into(),
+                input: serde_json::json!({}),
+            },
+        ]);
+        let json = serde_json::to_value(OpenaiRequest::from(with_tool)).unwrap();
+        assert_eq!(json["messages"][0]["reasoning_content"], "cot");
+
+        // 无 tool_calls：用后即弃，不得回传。
+        let without_tool = base(vec![
+            ContentBlock::Thinking {
+                text: "cot".into(),
+                token: ThinkingToken::None,
+            },
+            ContentBlock::Text("answer".into()),
+        ]);
+        let json = serde_json::to_value(OpenaiRequest::from(without_tool)).unwrap();
+        assert!(
+            json["messages"][0].get("reasoning_content").is_none(),
+            "无工具调用时 reasoning_content 不得回传"
+        );
     }
 }

@@ -219,6 +219,18 @@ where
             }
             "response.output_item.done" => {
                 if let Some(item) = data.get("item") {
+                    if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                        if let Some(enc) = item
+                            .get("encrypted_content")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                        {
+                            events.push(ProviderEvent::ThinkingBlock {
+                                text: String::new(),
+                                token: yi_agent_core::ThinkingToken::Encrypted(enc.to_string()),
+                            });
+                        }
+                    }
                     if item.get("type").and_then(Value::as_str) == Some("function_call") {
                         let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
                         let call_id = item
@@ -555,5 +567,52 @@ mod tests {
         let events = collect(body).await;
         assert_eq!(events.len(), 1, "events: {events:?}");
         assert!(matches!(&events[0], ProviderEvent::TextDelta(t) if t == "Hi"));
+    }
+
+    #[tokio::test]
+    async fn reasoning_item_done_emits_thinking_block_with_encrypted_content() {
+        let body = "event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc-blob\",\"summary\":[]}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_chunks(&[bytes.as_slice()])
+            .await
+            .into_iter()
+            .collect();
+
+        let found = events.iter().any(|e| {
+            matches!(
+                e,
+                ProviderEvent::ThinkingBlock { token, .. }
+                    if *token == yi_agent_core::ThinkingToken::Encrypted("enc-blob".into())
+            )
+        });
+        assert!(found, "reasoning item must surface its encrypted_content");
+    }
+
+    // ---- 以下为超出 brief 的防御性用例 ----
+
+    #[tokio::test]
+    async fn reasoning_item_without_encrypted_content_emits_no_block() {
+        // 空 encrypted_content 与缺失字段都不得产出块（否则回传空凭证）。
+        for item in [
+            r#"{"type":"reasoning","id":"rs_1","encrypted_content":"","summary":[]}"#,
+            r#"{"type":"reasoning","id":"rs_1","summary":[]}"#,
+        ] {
+            let body = format!(
+                "event: response.output_item.done\n\
+                 data: {{\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{item}}}\n\n\
+                 event: response.completed\n\
+                 data: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}\n\n"
+            );
+            let events = collect(&body).await;
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, ProviderEvent::ThinkingBlock { .. })),
+                "item {item} must not emit a thinking block: {events:?}"
+            );
+        }
     }
 }

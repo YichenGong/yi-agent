@@ -464,6 +464,80 @@ describe("Session", () => {
         "a2",
       ]);
     });
+
+    it("hands the open local block over to the server's thinking item in place", () => {
+      // 服务端 thinking item 是权威：实时期间本地推理块只保留流式手感，item 一到
+      // 就**就地接管**（位置不变、记服务端 id），其后 delta 不再并入它。
+      const s = new Session();
+      s.addUserMessage("q1");
+      s.apply({
+        method: "item/started",
+        params: { thread_id: "t", item: { type: "userMessage", id: "user-t1", text: "q1" } },
+      });
+      for (const text of ["T1a", "T1b"]) {
+        s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text, kind: "Content" } });
+      }
+      expect(s.items.map((i) => i.type)).toEqual(["userMessage", "reasoning"]);
+
+      s.apply({
+        method: "item/started",
+        params: {
+          thread_id: "t",
+          item: { type: "thinking", id: "item-turn1-2", text: "T1aT1b", redacted: false },
+        },
+      });
+      // 就地在原推理块的位置换成服务端项——不是新起一块、也不是丢到末尾。
+      expect(s.items.map((i) => i.type)).toEqual(["userMessage", "thinking"]);
+      expect(s.items.map((i) => i.id)).toEqual(["user-t1", "item-turn1-2"]);
+      expect(s.items[1]).toMatchObject({ type: "thinking", text: "T1aT1b", redacted: false });
+
+      // 之后的 delta 不再并入已接管的块：另起一块本地推理块。
+      s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text: "T2", kind: "Content" } });
+      expect(s.items.map((i) => i.type)).toEqual(["userMessage", "thinking", "reasoning"]);
+    });
+
+    it("does not take over a fresh local block on the paired item/completed", () => {
+      // 防御：started 已接管并断开运行；若其后（completed 之前）又来了 delta，
+      // 会新起一个本地块 B2。completed 绝不能把 B2 也误当作「当前打开的块」接管
+      // ——否则同一服务端 id 会重复，且 B2 的内容被吞。
+      const s = new Session();
+      s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text: "T1", kind: "Content" } });
+      const started = { type: "thinking", id: "item-turn1-1", text: "T1", redacted: false } as const;
+      s.apply({ method: "item/started", params: { thread_id: "t", item: started } });
+      // completed 之前到达的新 delta：另起本地块。
+      s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text: "T2", kind: "Content" } });
+      expect(s.items.map((i) => i.type)).toEqual(["thinking", "reasoning"]);
+      // 配对的 completed 只能按 id 就地替换已接管的服务端项，不碰 B2。
+      s.apply({ method: "item/completed", params: { thread_id: "t", item: started } });
+      expect(s.items.map((i) => i.type)).toEqual(["thinking", "reasoning"]);
+      expect(s.items.filter((i) => i.type === "thinking")).toHaveLength(1);
+      expect((s.items[1] as { text: string }).text).toBe("T2");
+    });
+
+    it("replaces the taken-over item on the paired item/completed without duplicating", () => {
+      const s = new Session();
+      s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text: "cot", kind: "Content" } });
+      const item = { type: "thinking", id: "item-turn1-1", text: "cot", redacted: false } as const;
+      s.apply({ method: "item/started", params: { thread_id: "t", item } });
+      s.apply({ method: "item/completed", params: { thread_id: "t", item } });
+      const thinking = s.items.filter((i) => i.type === "thinking");
+      expect(thinking).toHaveLength(1);
+      expect(thinking[0].id).toBe("item-turn1-1");
+    });
+
+    it("replays a thinking item on a cold resume", () => {
+      // 回放期没有打开的本地块：thinking item 走常规服务端项路径落到转录里，
+      // 使历史会话的思考卡片可被渲染（design §6.1）。
+      const s = new Session();
+      s.upsertItems([
+        { type: "userMessage", id: "user-t1", text: "q1" },
+        { type: "thinking", id: "item-turn1-2", text: "历史思考", redacted: false },
+        { type: "agentMessage", id: "a1", text: "A1" },
+      ]);
+      expect(s.items.map((i) => i.type)).toEqual(["userMessage", "thinking", "agentMessage"]);
+      expect(s.items[1]).toMatchObject({ type: "thinking", text: "历史思考" });
+      expect(s.lastServerItemId).toBe("a1");
+    });
   });
 
   describe("server notices", () => {

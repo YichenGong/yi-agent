@@ -244,6 +244,13 @@ pub enum Notification {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effort: Option<String>,
     },
+    /// 该会话的跨轮 CoT 保留开关已切换。
+    ///
+    /// 与 `thread/reasoningEffortChanged` 并列：开关同为会话元数据，切换后必须让
+    /// **所有**客户端（桌面 + 手机）立即刷新各自的控件，否则一端改了、另一端停在
+    /// 旧值。它只带布尔开关、不带正文。
+    #[serde(rename = "thread/preserveThinkingChanged")]
+    PreserveThinkingChanged { thread_id: String, preserve: bool },
     /// 非致命运行期告知（通道回退 / effort 降级），状态栏级一行提示。
     ///
     /// 与 `turn/retry` 同为**内容层**（按 thread 路由）：它描述的是某条会话这一次
@@ -383,6 +390,7 @@ impl Notification {
             | Notification::ModelChanged { thread_id, .. }
             | Notification::PermissionModeChanged { thread_id, .. }
             | Notification::ReasoningEffortChanged { thread_id, .. }
+            | Notification::PreserveThinkingChanged { thread_id, .. }
             | Notification::Notice { thread_id, .. }
             | Notification::ReasoningDelta { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
@@ -430,6 +438,7 @@ impl Notification {
             | Notification::ModelChanged { .. }
             | Notification::PermissionModeChanged { .. }
             | Notification::ReasoningEffortChanged { .. }
+            | Notification::PreserveThinkingChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
@@ -566,6 +575,16 @@ pub enum Item {
         attachments: Vec<Attachment>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
+    },
+    /// 一次推理的展示条目（design §6.1 的「思考」卡片）。**不携带凭证**——
+    /// signature / encrypted_content 是服务端回传 API 用的协议数据，前端渲染
+    /// 不需要，也不应持有（避免经客户端往返被意外改写）。
+    Thinking {
+        id: String,
+        /// 展示用明文（`display:"omitted"` 时为空串）。
+        text: String,
+        /// redacted 占位（前端渲染「已加密」，无明文可展示）。
+        redacted: bool,
     },
 }
 
@@ -811,6 +830,24 @@ mod tests {
         );
     }
 
+    /// 保留开关通知的 wire 形状:`thread/preserveThinkingChanged`,参数 snake_case。
+    /// 与 `reasoningEffortChanged` 同为列表层恒推,且按 thread 路由。
+    #[test]
+    fn preserve_thinking_changed_notification_carries_method_and_flag() {
+        let n = Notification::PreserveThinkingChanged {
+            thread_id: "t1".into(),
+            preserve: false,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/preserveThinkingChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["preserve"], false);
+        // 与 `reasoningEffortChanged` 同为会话元数据:必须列表层恒推,否则窗口外
+        // 会话的控件在不同客户端之间「概率性不同步」。
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
     /// 运行期告知的 wire 形状:`thread/notice`,参数 snake_case,带 level。
     ///
     /// 投递层级与 `item/delta` 一致为**内容层**:它描述这一次运行的走法,按 thread
@@ -974,6 +1011,30 @@ mod tests {
             images: Vec::new(),
         };
         assert!(serde_json::to_value(&item).unwrap().get("images").is_none());
+    }
+
+    /// thinking 展示条目**绝不**携带凭证：signature / encrypted_content 是服务端
+    /// 回传 API 用的协议数据，前端渲染不需要，也不该持有（避免经客户端往返被改写）。
+    /// 这条测试是「凭证不下发前端」的回归钉。
+    #[test]
+    fn thinking_item_serializes_without_credentials() {
+        let item = Item::Thinking {
+            id: "th_1".into(),
+            text: "summary".into(),
+            redacted: false,
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["type"], "thinking");
+        assert_eq!(json["id"], "th_1");
+        assert_eq!(json["text"], "summary");
+        assert_eq!(json["redacted"], false);
+        assert!(json.get("signature").is_none(), "凭证不得下发前端");
+        assert!(json.get("encrypted_content").is_none(), "凭证不得下发前端");
+        let raw = json.to_string();
+        assert!(
+            !raw.contains("signature") && !raw.contains("encrypted_content"),
+            "thinking item 的 wire 形状不得出现任何凭证字段: {raw}"
+        );
     }
 
     #[test]

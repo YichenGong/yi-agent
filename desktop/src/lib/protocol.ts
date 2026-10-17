@@ -66,6 +66,14 @@ export type Item =
       images?: ImageRef[];
     }
   | { type: "agentMessage"; id: string; text: string }
+  /**
+   * 一段推理的展示条目（design §6.1 的「思考」卡片）。**不携带凭证**：signature /
+   * encrypted_content 只存在于服务端回传 API 的路径上，绝不下发前端。
+   *
+   * 实时期间前端先用本地 `thread/reasoningDelta` 累积的块保留流式手感，本 item
+   * 一到就**就地接管**（位置不变）；历史回放期则由本 item 直接驱动渲染。
+   */
+  | { type: "thinking"; id: string; text: string; redacted: boolean }
   | {
       type: "toolCall";
       id: string;

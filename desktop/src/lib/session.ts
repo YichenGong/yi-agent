@@ -26,8 +26,10 @@ export interface NoticeItem {
 }
 
 /**
- * 一段累积的思维链（CoT）。**本地展示条目，不是 wire `Item`**：服务端从不把它作为
- * item 发送，只以 `thread/reasoningDelta` 流式推送；它同样绝不回灌进后续轮次。
+ * 一段累积的思维链（CoT）。**本地展示条目，不是 wire `Item`**：服务端在实时期间
+ * 只以 `thread/reasoningDelta` 流式推送，好让前端保留流式手感；一旦块级
+ * `item/thinking`（服务端权威条目）到达，本块即被**就地接管**（见 `apply`）。
+ * 回放期则直接由 `Item::Thinking` 驱动，本类型不出场。它同样绝不回灌进后续轮次。
  *
  * 连续 delta 合并进**同一个**块——与 TUI 的单 `HistoryCell::Reasoning` 同一契约，
  * 否则一个 token 一个块会把转录刷屏。
@@ -337,6 +339,27 @@ export class Session {
             ? { type: "userMessage", id: incoming.id, text: incoming.text }
             : incoming;
         if (this.replayIds !== null) this.replayIds.add(item.id);
+        // 服务端 thinking item 是权威：实时期间前端先用本地 `reasoning` 块保留流式
+        // 手感，本 item 一到就**就地接管**——在原块的位置换成服务端项（位置不变），
+        // 并记下服务端 id，使随后的 `item/completed` 按 id 就地替换而不重复。接管后
+        // 运行断开，其后到达的 delta 另起一块本地块（design §6.1 单一渲染路径）。
+        //
+        // 仅在**本服务端 id 尚未入转录**时才接管：否则配对的 `item/completed`
+        // （此刻 openReasoning 可能已是 started/completed 之间新起的本地块）会
+        // 误吞那个新块并产生重复的服务端项。已存在则走下面的按 id 就地替换。
+        if (
+          item.type === "thinking" &&
+          this.openReasoning &&
+          this.items.findIndex((i) => i.id === item.id) < 0
+        ) {
+          const held = this.items.findIndex((i) => i.id === this.openReasoning!.id);
+          if (held >= 0) {
+            this.items[held] = item;
+            this.lastServerItemId = item.id;
+            this.breakReasoningRun();
+            break;
+          }
+        }
         // 任何服务端项都断开推理块的合并运行：正文/工具/用户气泡一到，当前块结束。
         this.breakReasoningRun();
         const index = this.items.findIndex((i) => i.id === item.id);
@@ -355,6 +378,10 @@ export class Session {
         } else if (item.type === "agentMessage") {
           // agent 文本是**续写**:锚定在最后一个服务端项之后,不落在本地回声之后
           // (否则同一轮的 agent 回复会排到用户气泡前面)。
+          this.insertAfterLastServerItem(item);
+        } else if (item.type === "thinking") {
+          // 回放/未接管的服务端思考条目:与其他服务端项同样锚定在最后一个服务端项
+          // 之后——它必须停在自己那一轮的答案之前(design §6.1 位于正文之前)。
           this.insertAfterLastServerItem(item);
         } else {
           this.items.push(item);

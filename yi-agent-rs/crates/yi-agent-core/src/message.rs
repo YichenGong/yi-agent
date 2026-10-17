@@ -42,6 +42,30 @@ pub enum ContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
+
+    Thinking {
+        /// 可读摘要。`display:"summarized"` 时有值；`omitted` 或 redacted 时为空串。
+        text: String,
+        /// 不透明推理状态凭证。回传时必须逐字不变。
+        token: ThinkingToken,
+    },
+}
+
+/// 推理状态凭证的形态。
+///
+/// 注意：`Signature` 与 `Redacted` 都是 Anthropic 的凭证载荷，但序列化成**不同**的
+/// `type` 值（`thinking` vs `redacted_thinking`），故必须区分为两个变体——单靠
+/// 「有没有凭证」无法决定回传时的 `type`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThinkingToken {
+    /// Anthropic 明文 thinking 块（text 可有内容，display 决定）。
+    Signature(String),
+    /// Anthropic redacted_thinking 块（text 恒为空，只有 data）。
+    Redacted(String),
+    /// OpenAI Responses 的 encrypted_content。
+    Encrypted(String),
+    /// 无凭证。DeepSeek 的 reasoning_content 按规范不需回传，明文仅供展示。
+    None,
 }
 
 /// Requested fidelity for an image block. Only affects how the image is
@@ -283,6 +307,43 @@ mod tests {
         match block {
             ContentBlock::Image { path, .. } => assert!(path.is_none()),
             _ => panic!("expected Image"),
+        }
+    }
+
+    #[test]
+    fn thinking_block_roundtrips_all_token_kinds() {
+        let cases = vec![
+            ThinkingToken::Signature("sig-abc".into()),
+            ThinkingToken::Redacted("red-xyz".into()),
+            ThinkingToken::Encrypted("enc-123".into()),
+            ThinkingToken::None,
+        ];
+        for token in cases {
+            let block = ContentBlock::Thinking {
+                text: "summary".into(),
+                token: token.clone(),
+            };
+            let json = serde_json::to_string(&block).unwrap();
+            let back: ContentBlock = serde_json::from_str(&json).unwrap();
+            assert_eq!(block, back, "thinking block must round-trip losslessly");
+        }
+    }
+
+    #[test]
+    fn thinking_block_preserves_empty_text_with_token() {
+        // display:"omitted" 场景：明文为空串，凭证必须仍在。
+        let block = ContentBlock::Thinking {
+            text: String::new(),
+            token: ThinkingToken::Signature("sig-full".into()),
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        match back {
+            ContentBlock::Thinking { text, token } => {
+                assert_eq!(text, "");
+                assert_eq!(token, ThinkingToken::Signature("sig-full".into()));
+            }
+            other => panic!("expected Thinking, got {other:?}"),
         }
     }
 }

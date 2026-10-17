@@ -514,11 +514,72 @@ Thinking {
 **未决问题**
 
 1. Anthropic `max_tokens` 默认值的具体数值（取决于目标模型的输出上限）。
-2. `model_context_window_exceeded` stop_reason 的归类（实测后定）。
-3. `prefix_mismatch_behavior` 是否在你们的网关上被透传（需实测）。
+2. `model_context_window_exceeded` stop_reason 的归类（实测后定）。**未实测**：本次无可用
+   的 Anthropic 直连端点（`api.anthropic.com` 返回 403），该 stop_reason 只能在真实
+   Anthropic 或透传它的网关上观测，留待有端点时补。
+3. `prefix_mismatch_behavior` 是否在你们的网关上被透传（需实测）。**未实测**：同上，
+   依赖 beta header 的 Anthropic 直连不可达；且 §4.3 已决定**默认不发**，故不阻塞。
 4. §1.2 表格中「DeepSeek chat + tools 全档 200」与官方硬要求存在张力——**建议实测
    一次**：若真实端点进入 thinking mode 且执行校验，则本设计的 §5.3 是修 bug；
-   若网关不做校验，则它是防御性实现。
+   若网关不做校验，则它是防御性实现。**已实测（2026-10-17）**，结论见 §8.1。
+
+### 8.1 实测记录（2026-10-17）
+
+**未决 4 —— DeepSeek `reasoning_content` 回传：真实端点确实校验（是修 bug，非纯防御）**
+
+用真实端点复现工具调用回合（assistant 消息带 `tool_calls`，其后跟 `tool` 结果消息），
+对比「回传 / 不回传 `reasoning_content`」两种请求：
+
+| 端点 | 模型 | 不回传 | 回传 |
+|---|---|---|---|
+| `api.deepseek.com`（官方直连） | `deepseek-v4-pro` | **400** `The reasoning_content in the thinking mode must be passed back to the API.` | 200 |
+| `api.deepseek.com`（官方直连） | `deepseek-flash` | **400**（同上） | 200 |
+| `llmapi.horizon.auto`（本司 MaaS 网关） | `HORIZON-DeepSeek` | 200 | 200 |
+
+**结论**：官方直连**会**硬校验、缺 `reasoning_content` 即 400，故 §5.3 的「有 tool_calls
+才回传」是**修 bug**；本司 MaaS 网关**不**做该校验（两种都 200），故对网关路径它是
+**防御性实现**。同一份 §5.3 代码在两种端点上都是正确形态（网关不多发字段、直连不发即错），
+无需按端点分叉。
+
+**未决 2（部分）——Responses 通道「回传 reasoning item 是否降低 reasoning token」：
+无可观测收益**
+
+在 `llmapi.horizon.auto` 的 `/v1/responses` 上构造工具调用回合，第二轮对比「回传 reasoning
+item」与「不回传」，各 5 次采样（`reasoning.effort=high`）：
+
+| 变体 | `reasoning_tokens` 样本 | 中位数 |
+|---|---|---|
+| 不回传 | 79, 93, 53, 68, 74 | ~74 |
+| 回传 | 68, 78, 167, 75, 75 | ~75 |
+
+两者均 200（印证 §5.3「不回传**不报错**，官方措辞是 highly recommend」），且本次采样
+**未观察到 reasoning token 下降**（差异被噪声淹没）。故 Task 7 定位为**效果优化、非
+bug 修复**的标注是准确的；在拿到显著收益数据前，不得声称「省了 token」。
+
+**另注**：该网关的 Responses reasoning item **不含 `encrypted_content`**（只有
+`summary`，见下），故本设计的「捕获 `encrypted_content`、有则回传」在该网关上是
+no-op（`Option::None` 分支）——回传与否都只影响 summary，这与实测「无收益」一致。
+
+**Step 5 —— Anthropic 通道端到端走查（用 DeepSeek 的 Anthropic 兼容端点）**
+
+`api.anthropic.com` 直连 403，改用 DeepSeek 暴露的 Anthropic 兼容端点
+（`https://api.deepseek.com/anthropic/v1/messages`，`api_capabilities.anthropic_messages`
+声明支持），经由项目**真实** `AnthropicProvider`（`base_url` 覆盖）跑通：
+
+- **请求体含 `thinking` 与 `output_config`**：本地捕获实测请求体为
+  `{"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"high"},
+  "max_tokens":32000,...}`——与 §5.1/§5.4/§1.4 一致（`max_tokens` 必含、`budget_tokens` 不出现）。
+- **第二轮请求含第一轮的思考块与 signature**：round 1（带 tools）产出
+  `content_block: thinking{thinking, signature:"fa41b3a1-…"}` + `tool_use`；把该 thinking 块
+  连同 `signature` 原样放回 round 2 的 assistant 消息（`tool_use` 之前）、其后跟
+  `tool_result`，端到端 **200 且 `Stop` 正常**、产出答案——签名逐字回传被真实端点接受。
+- **signature 分段拼接**：本地 mock 把 `signature_delta` 切成单片验证拼接路径，产出
+  `Signature("SIG-ABC")` 逐字正确。
+
+**未覆盖**：真实的 **Anthropic 官方**端点（403 不可达）——`display:"summarized"` 对
+官方 `claude-*` 的实际行为、以及官方对 `prefix_mismatch_behavior` 的透传，均未实测；
+DeepSeek 的 Anthropic 兼容实现可能比官方宽松。此局限如实登记，不影响本分支代码正确性
+（请求/回传形状已由单测 + 兼容端点双重钉住）。
 
 ## 9. 交付顺序建议
 

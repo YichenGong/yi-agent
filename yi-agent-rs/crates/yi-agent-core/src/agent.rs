@@ -113,6 +113,14 @@ pub struct AgentConfig {
     /// Base delay for stall retry backoff. Attempt `n` (1-based) waits
     /// `base * 2^(n-1)`, capped at 30s. Defaults to 2s → 2s/4s/8s.
     pub think_stall_backoff_base: std::time::Duration,
+    /// Whether thinking blocks from *previous* turns are replayed verbatim in
+    /// each provider request (and kept on disk). Default `true` = today's
+    /// behaviour, so the request body is byte-identical.
+    ///
+    /// When `false`, `run_loop` strips history turns' `Thinking` blocks from the
+    /// request copy while keeping the **last** assistant message's (the in-round
+    /// hard guarantee: the current tool loop's credentials must round-trip).
+    pub preserve_thinking: bool,
 }
 
 impl Default for AgentConfig {
@@ -132,6 +140,7 @@ impl Default for AgentConfig {
             think_idle_timeout: Some(std::time::Duration::from_secs(60)),
             think_stall_retry_limit: 3,
             think_stall_backoff_base: std::time::Duration::from_secs(2),
+            preserve_thinking: true,
         }
     }
 }
@@ -270,11 +279,26 @@ pub enum AgentEvent {
         model: String,
         usage: TokenUsage,
     },
-    /// Streamed chain-of-thought delta for display only; never merged into the
-    /// assistant content or replayed into later turns.
+    /// Streamed chain-of-thought delta for display only, emitted incrementally so
+    /// a client can render CoT live. Deliberately NOT merged into the assistant
+    /// content: this is the display channel, not the credential path.
+    ///
+    /// The block-level credential travels separately via
+    /// [`AgentEvent::ThinkingBlock`]. Since the thinking block became part of the
+    /// assistant content (Task 2), that credential IS replayed into later turns —
+    /// this display-only delta is not.
     ReasoningDelta {
         text: String,
         kind: ReasoningKind,
+    },
+    /// 一个完整的、携带凭证的思考块。块级（非流式）。
+    ///
+    /// 与 [`AgentEvent::ReasoningDelta`]（仅展示的增量）不同：本事件对应
+    /// `ContentBlock::Thinking`，**已经在 `accumulate_stream` 里进入 assistant
+    /// content / session**（故会随下一次请求回传）。app-server 据此产出展示条目。
+    ThinkingBlock {
+        text: String,
+        token: crate::message::ThinkingToken,
     },
     /// Non-fatal runtime notice (channel fallback / effort downgrade), rendered at
     /// status-line level.
@@ -887,6 +911,18 @@ async fn run_loop(
             // Compaction replaced the history, so the incremental request-log
             // cursor no longer refers to this message vector.
             last_logged = 0;
+            // 压缩常态触发时会释放历史轮的推理凭证。用户显式选择跨轮保留
+            // （`preserve_thinking = true`）时，这次释放不得静默——发一条 Info 级
+            // 状态提示（与 §7 的降级提示同级：不弹窗、不进对话卡片）。关闭保留时
+            // 凭证本就逐轮剥离，无需告知。
+            if config.preserve_thinking {
+                let _ = tx
+                    .send(AgentEvent::Notice {
+                        level: NoticeLevel::Info,
+                        text: "已压缩历史，推理凭证已释放".into(),
+                    })
+                    .await;
+            }
         }
 
         turn += 1;
@@ -925,10 +961,21 @@ async fn run_loop(
         last_logged = messages.len();
 
         // 1. THINK
+        //
+        // 关闭跨轮保留时，剥离**历史轮**的思考块，仅保留最后一条 assistant（当前
+        // 工具循环）的——轮内硬保证：本轮的凭证必须回传，否则 Anthropic 的
+        // signature 校验会失败。剥离只作用于**请求副本**：session 自身（落盘/展示
+        // 的权威）在默认路径下原样保留，故 `preserve_thinking` 为默认 `true` 时
+        // 请求体逐字不变（零回归）。
+        let request_messages = if config.preserve_thinking {
+            messages.clone()
+        } else {
+            crate::thinking::strip_thinking_except_last_assistant(&messages)
+        };
         let req = ProviderRequest {
             model: config.model.clone(),
             system: config.system_prompt.clone(),
-            messages: messages.clone(),
+            messages: request_messages,
             tools: tools.schemas(),
             params: config.gen_params.clone(),
         };
@@ -1620,6 +1667,9 @@ async fn accumulate_provider_stream(
             ProviderEvent::ReasoningDelta { text, kind } => {
                 let _ = tx.try_send(AgentEvent::ReasoningDelta { text, kind });
             }
+            ProviderEvent::ThinkingBlock { text, token } => {
+                let _ = tx.try_send(AgentEvent::ThinkingBlock { text, token });
+            }
             ProviderEvent::Notice { level, text } => {
                 let _ = tx.try_send(AgentEvent::Notice { level, text });
             }
@@ -1671,6 +1721,11 @@ fn estimate_prefill_tokens(req: &crate::provider::ProviderRequest) -> u32 {
                 }
                 crate::message::ContentBlock::Image { .. } => {
                     total += crate::compact::IMAGE_TOKEN_ESTIMATE as u32;
+                }
+                // 与 compact 的 estimate_block_tokens 口径一致：只按明文估算，
+                // 凭证不计入，否则状态栏估算与实际上下文漂移（spec §3.3）。
+                crate::message::ContentBlock::Thinking { text, .. } => {
+                    total += estimate_tokens(text);
                 }
             }
         }
@@ -1755,11 +1810,316 @@ mod tests {
         );
     }
 
+    /// The provider-level `ThinkingBlock` must survive the agent's event
+    /// translation with its credential intact.
+    ///
+    /// `ThinkingBlock` is the credential-carrying, block-level event (as opposed
+    /// to the display-only `ReasoningDelta` above). It already enters the
+    /// assistant content inside `accumulate_stream`; this test pins the *event
+    /// channel* side — core -> `AgentEvent::ThinkingBlock` — so app-server and
+    /// the TUI can observe the block. The token must arrive byte-for-byte.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_thinking_block_reaches_the_agent_stream_with_its_token() {
+        use crate::message::ThinkingToken;
+
+        let provider = ScriptedProvider::new(vec![vec![
+            ProviderEvent::ThinkingBlock {
+                text: "cot summary".into(),
+                token: ThinkingToken::Signature("SIG-1".into()),
+            },
+            ProviderEvent::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ]]);
+        let tools = Arc::new(ToolRegistry::new());
+        let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::ThinkingBlock { text, token }
+                    if text == "cot summary"
+                        && *token == ThinkingToken::Signature("SIG-1".into())
+            )),
+            "the thinking block must be forwarded with its token intact, got: {events:?}"
+        );
+    }
+
+    /// End-to-end proof that a tool loop's SECOND request carries the FIRST
+    /// round's thinking block.
+    ///
+    /// Every layer below this has its own unit test (the block type round-trips,
+    /// the Anthropic/DeepSeek/Responses encoders emit it), but none of them prove
+    /// the block survives the actual loop: `ProviderEvent::ThinkingBlock` ->
+    /// accumulated content -> assistant message in the session -> the next
+    /// `ProviderRequest`. That whole chain is what this test pins down.
+    ///
+    /// Note the tool loop is triggered by the PRESENCE of a `ToolUse` block in the
+    /// accumulated content, not by `StopReason` (which has no `ToolUse` variant),
+    /// so the first script must really emit `ToolUseStart`/`ToolUseDelta`/
+    /// `ToolUseEnd` to build one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_loop_round_two_carries_the_thinking_block() {
+        use crate::message::{ContentBlock, ThinkingToken};
+
+        // Round one: thinking + tool_use. Round two: plain text, ends the loop.
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ThinkingBlock {
+                    text: "".into(),
+                    token: ThinkingToken::Signature("SIG-1".into()),
+                },
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]));
+        // "echo" is deliberately unregistered: the call yields a tool-not-found
+        // result, which the loop still feeds back as a tool_result round-trip.
+        let tools = Arc::new(ToolRegistry::new());
+        // Keep the test-side handle: `Agent::new` takes the Arc by value.
+        let mut agent = Agent::new(provider.clone(), tools, AgentConfig::default());
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let _ = collect_events(stream);
+
+        // The second request must carry the first round's thinking block.
+        let requests = provider.recorded_requests();
+        assert!(
+            requests.len() >= 2,
+            "tool loop must issue a second request, got {}",
+            requests.len()
+        );
+        let has_sig = requests[1].messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::Thinking { token: ThinkingToken::Signature(s), .. } if s == "SIG-1"
+                )
+            })
+        });
+        assert!(
+            has_sig,
+            "the second request must carry the first round's signature, got: {:?}",
+            requests[1].messages
+        );
+    }
+
+    /// `preserve_thinking = false` 时,请求体必须剥掉**历史轮**的思考块,
+    /// 但**保留最后一条 assistant**(= 当前轮)的凭证——轮内硬保证。
+    ///
+    /// 这里刻意用两轮**带工具调用**的脚本:每轮都以 `tool_use` 收尾,循环会继续
+    /// 发下一次请求,于是有三条真实请求落在 `ScriptedProvider` 的录制里。断言的是
+    /// 实际交给 provider 的 `ProviderRequest`,不是 mock 出来的中间态。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preserve_thinking_false_strips_history_but_keeps_current_round() {
+        use crate::message::{ContentBlock, ThinkingToken};
+
+        // 轮 1:思考(SIG-1) + 工具调用;轮 2:思考(SIG-2) + 工具调用;
+        // 轮 3:纯文本结束循环。
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ThinkingBlock {
+                    text: "old".into(),
+                    token: ThinkingToken::Signature("SIG-1".into()),
+                },
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::ThinkingBlock {
+                    text: "now".into(),
+                    token: ThinkingToken::Signature("SIG-2".into()),
+                },
+                ProviderEvent::ToolUseStart {
+                    id: "t2".into(),
+                    name: "echo".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t2".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t2".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]));
+        let config = AgentConfig {
+            preserve_thinking: false,
+            ..Default::default()
+        };
+        let mut agent = Agent::new(provider.clone(), Arc::new(ToolRegistry::new()), config);
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let _ = collect_events(stream);
+
+        let requests = provider.recorded_requests();
+        assert!(
+            requests.len() >= 3,
+            "the tool loop must issue a third request, got {}",
+            requests.len()
+        );
+
+        // 台账工具:按凭证串数一数某条请求里的 thinking 块。
+        let sigs = |msgs: &[crate::message::Message]| -> Vec<String> {
+            msgs.iter()
+                .flat_map(|m| m.content.iter())
+                .filter_map(|b| match b {
+                    ContentBlock::Thinking {
+                        token: ThinkingToken::Signature(s),
+                        ..
+                    } => Some(s.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // 轮 3 的请求:轮 1/轮 2 的历史思考块必须都不在,只留当前轮(轮 2)的。
+        assert_eq!(
+            sigs(&requests[2].messages),
+            vec!["SIG-2".to_string()],
+            "关闭开关后请求只应带当前轮的凭证,实际: {:?}",
+            requests[2].messages
+        );
+        // 轮 2 的请求(第一条工具轮之后):此刻最后一条 assistant 正是轮 1,
+        // 它的凭证属于**当前轮的轮内工具循环**,必须原样回传(轮内硬保证)。
+        assert_eq!(
+            sigs(&requests[1].messages),
+            vec!["SIG-1".to_string()],
+            "当前轮的凭证必须回传,实际: {:?}",
+            requests[1].messages
+        );
+
+        // 会话自身**不**被请求副本的剥离波及:历史仍留着凭证(落盘/展示的权威)。
+        let session_sigs = sigs(agent.session().messages());
+        assert!(
+            session_sigs.contains(&"SIG-1".to_string())
+                && session_sigs.contains(&"SIG-2".to_string()),
+            "剥离只作用于请求副本,session 必须原样保留凭证,实际: {session_sigs:?}"
+        );
+    }
+
+    /// 与上一条互为正反面(零回归):默认 `preserve_thinking = true` 时,请求里的
+    /// 消息必须与会话**逐字相同**——一条 thinking 都不许少。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn preserve_thinking_true_leaves_the_request_unchanged() {
+        use crate::message::{ContentBlock, ThinkingToken};
+
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ThinkingBlock {
+                    text: "".into(),
+                    token: ThinkingToken::Signature("SIG-1".into()),
+                },
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "echo".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: "{}".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]));
+        // 显式写出 `true`(而非依赖默认)以钉住「默认即保留」这一契约本身。
+        let config = AgentConfig {
+            preserve_thinking: true,
+            ..Default::default()
+        };
+        let mut agent = Agent::new(provider.clone(), Arc::new(ToolRegistry::new()), config);
+
+        let stream = agent.run("hi".into()).await.unwrap();
+        let _ = collect_events(stream);
+
+        let requests = provider.recorded_requests();
+        assert!(
+            requests.len() >= 2,
+            "the tool loop must issue a second request, got {}",
+            requests.len()
+        );
+        // 第二次请求的 messages 必须含轮 1 的凭证(历史回传是默认行为)。
+        let second = &requests[1];
+        let has_sig = second.messages.iter().any(|m| {
+            m.content.iter().any(|b| {
+                matches!(
+                    b,
+                    ContentBlock::Thinking { token: ThinkingToken::Signature(s), .. } if s == "SIG-1"
+                )
+            })
+        });
+        assert!(
+            has_sig,
+            "保留开启时历史凭证必须原样回传,实际: {:?}",
+            second.messages
+        );
+        // 且与会话快照逐字相同(除最后一条 tool_result 已由循环 append 进 session,
+        // 故请求是 session 的前缀:此处断言请求 == 请求触发时刻的 session 视图)。
+        let session_msgs = agent.session().messages().to_vec();
+        assert!(
+            session_msgs.len() >= second.messages.len(),
+            "session 至少包含请求时的全部消息"
+        );
+        assert_eq!(
+            second.messages,
+            session_msgs[..second.messages.len()].to_vec(),
+            "保留开启时请求必须逐字等于会话内容(零回归)"
+        );
+    }
+
     /// Provider that returns a fixed sequence of events.
     /// Each call returns the next script; if scripts exhausted, returns empty (EndTurn).
     struct ScriptedProvider {
         scripts: Vec<Vec<ProviderEvent>>,
         call_index: std::sync::Mutex<usize>,
+        /// Every `ProviderRequest` handed to `call_stream`, in order.
+        /// Lets a test assert on what round N actually sent (e.g. that the
+        /// second round carries the first round's thinking block).
+        requests: std::sync::Mutex<Vec<crate::provider::ProviderRequest>>,
     }
 
     impl ScriptedProvider {
@@ -1767,7 +2127,12 @@ mod tests {
             Self {
                 scripts,
                 call_index: std::sync::Mutex::new(0),
+                requests: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn recorded_requests(&self) -> Vec<crate::provider::ProviderRequest> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -1775,8 +2140,9 @@ mod tests {
     impl Provider for ScriptedProvider {
         async fn call_stream(
             &self,
-            _req: ProviderRequest,
+            req: ProviderRequest,
         ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            self.requests.lock().unwrap().push(req);
             let mut idx = self.call_index.lock().unwrap();
             let script = self.scripts.get(*idx).cloned().unwrap_or_else(|| {
                 vec![ProviderEvent::Stop {
@@ -4125,6 +4491,7 @@ mod tests {
             think_idle_timeout: None,
             think_stall_retry_limit: 0,
             think_stall_backoff_base: std::time::Duration::from_secs(1),
+            preserve_thinking: true,
         };
         assert_eq!(config.model, "custom-model");
         assert_eq!(config.max_turns, Some(50));
@@ -4635,6 +5002,173 @@ mod tests {
                 reason: DoneReason::EndTurn
             })
         ));
+    }
+
+    /// 自动压缩会释放历史轮的推理凭证——`preserve_thinking=true` 时不得静默，
+    /// 必须发一条 Info 级 Notice 告知用户「凭证已释放」。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_emits_notice_about_released_credentials() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 200,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("summary text".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let config = AgentConfig {
+            compact_threshold: Some(100),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            preserve_thinking: true,
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        session.push(Message::user("old1"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply1".into(),
+        )]));
+        session.push(Message::user("old2"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply2".into(),
+        )]));
+        let mut agent =
+            Agent::new(Arc::new(provider), Arc::new(tools), config).with_session(session);
+
+        let stream = agent.run("prompt".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AutoCompacting { .. })),
+            "precondition: a compaction must have happened, events: {events:?}"
+        );
+        let notice = events.iter().find_map(|e| match e {
+            AgentEvent::Notice { text, level } => Some((text.clone(), *level)),
+            _ => None,
+        });
+        let (text, level) = notice.expect("compaction must emit a Notice, events: {events:?}");
+        assert_eq!(level, crate::provider::NoticeLevel::Info);
+        assert!(
+            text.contains("凭证"),
+            "the notice must say the credentials were released, got: {text}"
+        );
+        // 排序：Notice 应与压缩同一分支产出（紧随 AutoCompacting 之后），
+        // 而非拖到轮末。
+        let compact_at = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::AutoCompacting { .. }))
+            .unwrap();
+        let notice_at = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Notice { .. }))
+            .unwrap();
+        assert!(
+            notice_at > compact_at,
+            "the notice follows the compaction, got compact@{compact_at} notice@{notice_at}"
+        );
+    }
+
+    /// 反面：`preserve_thinking=false` 时凭证本就跨轮剥离，压缩无需再告知——
+    /// 不得多发一条 Notice（用户已选择不保留）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compaction_without_preserve_emits_no_notice() {
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "upper".into(),
+                },
+                ProviderEvent::ToolUseDelta {
+                    id: "t1".into(),
+                    partial_json: r#"{"text":"a"}"#.into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 200,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("summary text".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+            vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        ]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(UpperEchoTool));
+        let config = AgentConfig {
+            compact_threshold: Some(100),
+            compact_user_budget_tokens: 20_000,
+            compact_tool_budget_tokens: 12_000,
+            preserve_thinking: false,
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        session.push(Message::user("old1"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply1".into(),
+        )]));
+        session.push(Message::user("old2"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply2".into(),
+        )]));
+        let mut agent =
+            Agent::new(Arc::new(provider), Arc::new(tools), config).with_session(session);
+
+        let stream = agent.run("prompt".into()).await.unwrap();
+        let events = collect_events(stream);
+
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::AutoCompacting { .. })),
+            "precondition: a compaction must have happened, events: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice { .. })),
+            "preserve_thinking=false must not emit the credentials-released notice, \
+             events: {events:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
