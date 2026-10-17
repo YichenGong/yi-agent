@@ -127,6 +127,12 @@ impl WorkspaceIndex {
                 "{primary} is already linked into another project"
             )));
         }
+        // 禁链式（另一半）：child 自己已经是主根（有附属根）时，不能再被挂到别人下面。
+        if file.links.contains_key(&child) {
+            return Err(LinkError(format!(
+                "{child} is already a project root with linked folders"
+            )));
+        }
         // 环：child 已有附属根时，那个附属根不能是 primary 的后代。
         if let Some(existing) = file.links.get(&primary) {
             if existing.iter().any(|k| k == &child) {
@@ -357,6 +363,28 @@ mod tests {
             .link(Path::new("/tmp/wsidx-c"), Path::new("/tmp/wsidx-g"))
             .unwrap_err();
         assert!(err.0.contains("linked"), "unexpected: {}", err.0);
+    }
+
+    #[test]
+    fn link_rejects_making_a_primary_into_a_child() {
+        let (_d, idx) = index();
+        for d in ["/tmp/wsidx-root", "/tmp/wsidx-mid", "/tmp/wsidx-grand"] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // mid 已是主根（挂着 grand）。
+        idx.link(Path::new("/tmp/wsidx-mid"), Path::new("/tmp/wsidx-grand"))
+            .unwrap();
+        // 再把 mid 挂到 root 下就成了两层链。
+        let err = idx
+            .link(Path::new("/tmp/wsidx-root"), Path::new("/tmp/wsidx-mid"))
+            .unwrap_err();
+        assert!(err.0.contains("already"), "unexpected: {}", err.0);
+        // 拒绝必须是原子的：不该留下半个关联。
+        assert!(idx.children(Path::new("/tmp/wsidx-root")).is_empty());
+        assert_eq!(
+            idx.children(Path::new("/tmp/wsidx-mid")),
+            vec![canon("/tmp/wsidx-grand")]
+        );
     }
 
     #[test]
