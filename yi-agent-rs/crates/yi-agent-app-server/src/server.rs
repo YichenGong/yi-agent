@@ -1007,8 +1007,8 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
 /// installed", and a bare message collapsed all three into one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoardQueryError {
-    code: &'static str,
-    message: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl BoardQueryError {
@@ -1039,7 +1039,7 @@ impl std::fmt::Display for BoardQueryError {
 /// (or none) — the "clicked and nothing happened" bug. `global` is the board
 /// registry that says whether `project` has a board at all; a project without
 /// one has no daemon worth dialing.
-fn plugin_query(
+pub(crate) fn plugin_query(
     project: &Path,
     global: &Path,
     method: &str,
@@ -1117,7 +1117,7 @@ fn plugin_query(
 /// 自己的 daemon 监管，桌面侧车 app-server 的 workdir 却是用户 home：固定用 workdir
 /// 会既找不到清单（读成 `plugin_not_installed`）、又拨不到 socket（读成
 /// `plugin_unavailable`）——这正是「看板跑着、设置页却空着」的根因。
-fn plugin_query_self(
+pub(crate) fn plugin_query_self(
     scope: &Path,
     plugin: &str,
     method: &str,
@@ -1350,7 +1350,7 @@ pub(crate) fn project_arg(params: &serde_json::Value) -> Option<PathBuf> {
 /// 安装、由项目自己的 daemon 监管，而桌面侧车的 workdir 是 home，所以设置页
 /// 必须能把作用域指到它要配置的那个项目（清单与 socket 都在它下面）；不传
 /// `project` 的调用方（TUI、旧客户端）保持「宿主 workdir」的原语义。
-fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBuf {
+pub(crate) fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBuf {
     params
         .get("project")
         .and_then(|value| value.as_str())
@@ -2474,6 +2474,16 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::Plugin => {
+                        let mut state = app_state!();
+                        match crate::rpc::plugin::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     // 尚未搬移的域(以及 `initialize`)仍走原始 dispatch。
                     // 逐域搬移期间,还没搬的域也落到这里,故用 `_` 一并兜住
                     // (`Domain::Unknown` 覆盖 `initialize` 与所有未识别前缀)。
@@ -2497,115 +2507,6 @@ where
                             ),
                         )
                         .await?;
-                    }
-                    "plugin/query" => {
-                        // `project` names the project being queried, not the
-                        // server's cwd: the whole point of the RPC is to reach
-                        // a board that lives under another project's daemon.
-                        let Some(project) = project_arg(&req.params) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing or empty project")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let plugin = req
-                            .params
-                            .get("plugin")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let method = req
-                            .params
-                            .get("method")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        let params = req
-                            .params
-                            .get("params")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        match plugin_query(&project, &board_dir, method, plugin, params) {
-                            Ok(value) => {
-                                write_response(&hub, &client, ok_response(id, value)).await?
-                            }
-                            Err(error) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(
-                                        id,
-                                        RpcError::board_query(error.code, error.message),
-                                    ),
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                    "plugins/list" => {
-                        let workdir = theme_handle.workdir();
-                        // 清单按项目安装，故作用域可由调用方的 `project` 指定；
-                        // 缺省回落到宿主 workdir（TUI 与旧客户端）。
-                        let scope = plugin_scope(workdir, &req.params);
-                        let plugins: Vec<serde_json::Value> = list_installed_plugins(&scope)
-                            .into_iter()
-                            .map(|plugin| {
-                                json!({
-                                    "name": plugin.name,
-                                    "queryable": plugin.queryable,
-                                    "switch_key": plugin.switch_key,
-                                })
-                            })
-                            .collect();
-                        write_response(&hub, &client, ok_response(id, json!({ "plugins": plugins })))
-                            .await?;
-                    }
-                    "plugin/settings/read" => {
-                        let workdir = theme_handle.workdir().to_path_buf();
-                        let scope = plugin_scope(&workdir, &req.params);
-                        let plugin = req
-                            .params
-                            .get("plugin")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        match plugin_query_self(&scope, &plugin, "settings.read", json!({})) {
-                            Ok(value) => write_response(&hub, &client, ok_response(id, value)).await?,
-                            Err(error) => {
-                                write_response(
-                                    &hub,
-                                    &client,
-                                    err_response(id, RpcError::board_query(error.code, error.message)),
-                                )
-                                .await?
-                            }
-                        }
-                    }
-                    "plugin/settings/write" => {
-                        let workdir = theme_handle.workdir().to_path_buf();
-                        let scope = plugin_scope(&workdir, &req.params);
-                        let plugin = req
-                            .params
-                            .get("plugin")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        let settings = req.params.get("settings").cloned().unwrap_or(json!({}));
-                        match plugin_query_self(
-                            &scope,
-                            &plugin,
-                            "settings.write",
-                            json!({ "settings": settings }),
-                        ) {
-                            Ok(value) => write_response(&hub, &client, ok_response(id, value)).await?,
-                            Err(error) => {
-                                write_response(
-                                    &hub,
-                                    &client,
-                                    err_response(id, RpcError::board_query(error.code, error.message)),
-                                )
-                                .await?
-                            }
-                        }
                     }
                     // 分片回传一张图片的**原始字节**:客户端按 `nextOffset` 循环
                     // 拉取,base64 解码拼接后即得与磁盘逐字节相同的文件。之所以
