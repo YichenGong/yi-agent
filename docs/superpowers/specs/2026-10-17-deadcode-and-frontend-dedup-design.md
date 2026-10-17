@@ -53,6 +53,10 @@ crates/yi-agent-core/src/subagent/supervisor.rs    (定义本身)
 `enum ControlCommand`——**同 crate 同名不同义**（前者是 TUI→driver 的重建指令，后者
 是 daemon 控制目录）。
 
+> **归属说明**：该重命名会连带改 `tui/app.rs` 的 101 处引用，而 `tui/app.rs` 是
+> "后端结构收敛"卡的领地（它要拆 `handle_key`）。为避免两张卡并发改同一文件，
+> **重命名归那张卡**，本卡不碰 `main.rs` / `app.rs`。
+
 ### 1.4 前端五处重复
 
 | 项 | 证据 |
@@ -60,8 +64,6 @@ crates/yi-agent-core/src/subagent/supervisor.rs    (定义本身)
 | `lib/panelWidth.ts` ≡ `lib/sidebarWidth.ts` | 各 32 行，规范化后仅 6 行不同（全是常量值）；`clamp/load/save` 结构逐字相同 |
 | `KANBAN_PLUGIN` 定义两次 | `lib/pluginSettings.ts:5` 与 `lib/superpowersKanbanSwitch.ts:42` 都是 `export const KANBAN_PLUGIN = "superpowers-kanban"` |
 | RPC 调用别名重复 5 份 | `BoardRpc`(×2)、`PluginRpc`、`OnboardingRpc`、`ModelRpc`，全是 `<T = unknown>(method, params) => Promise<T>` |
-| 无路由常量表 | 135 个路由字符串字面量散落（52 个在 `App.tsx`），打错编译期无感 |
-| 前端"无报告"语义 | （属 P3，不在本卡） |
 
 ## 2. 目标与非目标
 
@@ -69,10 +71,11 @@ crates/yi-agent-core/src/subagent/supervisor.rs    (定义本身)
 
 1. 删除 `SupervisorTools` 死代码块，并把其测试迁到生产工具上（保留覆盖）。
 2. 合并 `subagent/src/lib.rs` 里两个近乎相同的 `Daemon*SpawnAgentTool`。
-3. 修正 `/agents` 目录 usage、删 `slash.rs` 三个函数里的死 `match` 臂、重命名重复的
-   `ControlCommand`。
-4. 前端：`panelWidth`/`sidebarWidth` 合一、`KANBAN_PLUGIN` 去重、RPC 别名统一、
-   新增 `lib/routes.ts` 路由常量表。
+3. 修正 `/agents` 目录 usage、删 `slash.rs` 三个函数里的死 `match` 臂。
+4. 前端：`panelWidth`/`sidebarWidth` 合一、`KANBAN_PLUGIN` 去重、RPC 别名统一。
+
+> **本卡不动 `App.tsx`、`main.rs`、`tui/app.rs`**——它们分别归"前端架构"卡与
+> "后端结构收敛"卡。本卡与那两张卡**零文件重叠**，故可并行执行、合并无冲突。
 
 ### 非目标
 
@@ -145,7 +148,8 @@ crates/yi-agent-core/src/subagent/supervisor.rs    (定义本身)
    五个模块改为 `export type BoardRpc = RpcCall;` 之类（保留别名以免改调用点），
    或直接替换为 `RpcCall`。
 
-4. **路由常量表**：新建 `lib/routes.ts`，把出现过的 RPC 方法名集中为常量：
+4. **路由常量表**：新建 `lib/routes.ts`，把 `lib/` 下五个 rpc 模块里出现的 RPC 方法名
+   集中为常量：
 
    ```ts
    /** app-server JSON-RPC 方法名。值即线上字符串，勿改。 */
@@ -156,9 +160,12 @@ crates/yi-agent-core/src/subagent/supervisor.rs    (定义本身)
    } as const;
    ```
 
-   调用点逐步改用 `RPC.threadStart` —— **本卡只建立表并替换五个 rpc 模块内的字面量**。
-   `App.tsx` 的 52 处字面量替换**留到前端架构卡**（那里本就要大改 `App.tsx`），
+   调用点改用 `RPC.threadStart`。**只替换 `lib/` 下那五个 rpc 模块的字面量**。
+   `App.tsx` 的 52 处替换**留到前端架构卡**（那里本就要大改 `App.tsx`），
    避免两张卡并发修改同一文件。
+
+   该表与协议 codegen 卡互不重叠：那张卡改的是 `lib/protocol.ts` 与
+   `lib/generated/`（DTO 类型），不碰 `lib/routes.ts`。
 
 ## 4. 测试策略
 

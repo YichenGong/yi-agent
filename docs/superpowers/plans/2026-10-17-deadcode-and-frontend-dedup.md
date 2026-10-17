@@ -4,7 +4,7 @@
 
 **Goal:** 删掉生产死代码 `SupervisorTools`、收敛 `spawn_agent` schema、修正命令目录漂移、消除前端四处重复。
 
-**Architecture:** Rust 侧删死代码并把其测试迁到生产工具；`spawn_agent` 的描述/schema 提为 `yi-agent-subagent` 的单一函数；`/agents` usage 修正、`slash.rs` 死臂删除、`main.rs` 的 `ControlCommand` 改名 `DriverControl`。前端侧：宽度模块工厂化、`KANBAN_PLUGIN` 去重、`RpcCall` 别名统一、新增 `lib/routes.ts`。
+**Architecture:** Rust 侧删死代码并把其测试迁到生产工具；`spawn_agent` 的描述/schema 提为 `yi-agent-subagent` 的单一函数；`/agents` usage 修正、`slash.rs` 死臂删除。前端侧：宽度模块工厂化、`KANBAN_PLUGIN` 去重、`RpcCall` 别名统一、新增 `lib/routes.ts`。
 
 **Tech Stack:** Rust（`yi-agent-core` / `yi-agent-subagent` / `yi-agent`）；前端 TS（React + vitest）。
 
@@ -27,7 +27,6 @@
 - `yi-agent-rs/crates/yi-agent-subagent/src/lib.rs` — 提 schema 为单一函数；两个 `Daemon*` 合并。
 - `yi-agent-rs/crates/yi-agent/src/control_commands.rs` — 修 `/agents` usage。
 - `yi-agent-rs/crates/yi-agent/src/tui/slash.rs` — 删死臂。
-- `yi-agent-rs/crates/yi-agent/src/main.rs` — `ControlCommand` → `DriverControl`。
 - `desktop/src/lib/persistedWidth.ts` / `panelWidth.ts` / `sidebarWidth.ts` — 工厂化。
 - `desktop/src/lib/rpcCall.ts` / `routes.ts` — 新增。
 - `desktop/src/lib/pluginSettings.ts` / `superpowersKanbanSwitch.ts` — 常量去重。
@@ -271,15 +270,15 @@ git commit -m "refactor(subagent): single source for the spawn_agent description
 
 ---
 
-### Task 3: 修正命令目录漂移并消除同名枚举
+### Task 3: 修正命令目录漂移并删死臂
 
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent/src/control_commands.rs:72`
 - Modify: `yi-agent-rs/crates/yi-agent/src/tui/slash.rs`
-- Modify: `yi-agent-rs/crates/yi-agent/src/main.rs`
 
-**Interfaces:**
-- Produces: `enum DriverControl`（原 `main.rs` 的 `ControlCommand`）。
+> **不含 `main.rs` / `tui/app.rs`**：`ControlCommand` 改名（`DriverControl`）连带
+> `app.rs` 的 101 处引用，而归"后端结构收敛"卡负责（它要拆 `handle_key`）。
+> 本卡与那张卡的**文件集零重叠**，故可并行、合并无冲突。
 
 - [ ] **Step 1: 修 `/agents` usage**
 
@@ -297,7 +296,8 @@ git commit -m "refactor(subagent): single source for the spawn_agent description
 
 - [ ] **Step 2: 加一致性测试**
 
-在 `control_commands_tests.rs` 加：
+在 `crates/yi-agent/src/control_commands_tests.rs` 加（该文件的既有约定是
+`use super::control_commands::ControlCommand;`，测试写在 crate 根模块里）：
 
 ```rust
 #[test]
@@ -361,34 +361,7 @@ Run（确认删干净）: `cd yi-agent-rs && grep -c "SlashCommand::Agents" crat
 
 Expected: `1`（只剩 `control_spec()` 里的映射）。
 
-- [ ] **Step 4: 重命名 `main.rs` 的枚举（含 `app.rs` 引用点）**
-
-**引用面必须先量清**（基线实测）：
-
-```
-main.rs                     18 处  `ControlCommand`（含定义）
-tui/app.rs                 101 处  `crate::ControlCommand`  ← 同一类型，必须一起改
-tui/slash.rs                19 处  `ControlCommand` via `use crate::control_commands::...`  ← 不许动
-control_commands.rs          4 处  定义 + `CommandSpec.command`            ← 不许动
-control_commands_tests.rs    3 处  ← 不许动
-```
-
-```bash
-cd yi-agent-rs
-# 注意：macOS 的 BSD sed 不支持 `\b`（会静默不改），必须用 perl。
-perl -pi -e 's/\bControlCommand\b/DriverControl/g' crates/yi-agent/src/main.rs
-perl -pi -e 's/crate::ControlCommand/crate::DriverControl/g' crates/yi-agent/src/tui/app.rs
-echo "main.rs DriverControl=$(grep -c 'DriverControl' crates/yi-agent/src/main.rs) residual=$(grep -c 'ControlCommand' crates/yi-agent/src/main.rs)"
-echo "app.rs residual=$(grep -c 'crate::ControlCommand' crates/yi-agent/src/tui/app.rs || true)"
-```
-
-Expected: `main.rs DriverControl=18 residual=0`；`app.rs residual=0`。已实测此改法
-`cargo test -p yi-agent` 635 测试全绿。
-
-> `slash.rs` / `control_commands.rs` / `control_commands_tests.rs` **不要 sed**——
-> 它们用的是 `control_commands::ControlCommand`，属另一类型。
-
-- [ ] **Step 5: 编译 + 测试**
+- [ ] **Step 4: 编译 + 测试**
 
 ```bash
 cd yi-agent-rs
@@ -399,11 +372,11 @@ cargo test -p yi-agent --offline 2>&1 | grep -E "test result|error" | tail -8
 
 Expected: 全绿。
 
-- [ ] **Step 6: commit**
+- [ ] **Step 5: commit**
 
 ```bash
 cd yi-agent-rs && export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cargo fmt -p yi-agent && cd ..
-git add yi-agent-rs/crates/yi-agent/src/control_commands.rs yi-agent-rs/crates/yi-agent/src/tui/slash.rs yi-agent-rs/crates/yi-agent/src/main.rs
+git add yi-agent-rs/crates/yi-agent/src/control_commands.rs yi-agent-rs/crates/yi-agent/src/tui/slash.rs
 git commit -m "fix(tui): correct the /agents usage and drop stray command arms"
 ```
 
@@ -575,8 +548,8 @@ Expected: 全绿（**只有 `sidebarWidth.test.ts` 存在**——`panelWidth.tes
    把 `superpowersKanbanSwitch.ts` / `pluginSettings.ts` / `superpowersKanbanBoards.ts` /
    `onboarding.ts` / `models.ts` 里的别名改为 `export type BoardRpc = RpcCall;` 等。
 3. `lib/routes.ts`：按
-   `grep -rhoE '"[a-z]+/[A-Za-z]+"' desktop/src | sort -u`
-   结果建常量表，并把**五个 rpc 模块**里的路由字面量改为 `RPC.xxx`。
+   `grep -rhoE '"[a-z]+/[A-Za-z]+"' desktop/src/lib | sort -u`
+   结果建常量表，并把**`desktop/src/lib/` 下各 rpc 模块**里的路由字面量改为 `RPC.xxx`。
    **不要改 `App.tsx`**——它由前端架构卡处理，避免并发冲突。
 
 - [ ] **Step 8: 全量验证 + commit**
