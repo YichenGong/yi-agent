@@ -251,6 +251,17 @@ pub enum Notification {
     /// 旧值。它只带布尔开关、不带正文。
     #[serde(rename = "thread/preserveThinkingChanged")]
     PreserveThinkingChanged { thread_id: String, preserve: bool },
+    /// 该会话的标题已变（LLM 首轮生成成功写入）。
+    ///
+    /// 与 `thread/modelChanged` 同族：标题是会话元数据，变更后必须让**所有**
+    /// 客户端（桌面 + 手机）立即刷新侧栏，否则首轮结束生成的标题要等到一次
+    /// **无关的**列表刷新才可见（`turn/completed` 早于标题落盘发出，桌面端在
+    /// 那一刻重拉只能拿到兜底截断标题）。
+    ///
+    /// **直接携带权威标题字符串**（而非「该重拉了」的提示）：标题就是一个小
+    /// 字符串，客户端就地落笔即可，不必再付一次全量 `thread/listAll`。
+    #[serde(rename = "thread/titleChanged")]
+    TitleChanged { thread_id: String, title: String },
     /// 非致命运行期告知（通道回退 / effort 降级），状态栏级一行提示。
     ///
     /// 与 `turn/retry` 同为**内容层**（按 thread 路由）：它描述的是某条会话这一次
@@ -391,6 +402,7 @@ impl Notification {
             | Notification::PermissionModeChanged { thread_id, .. }
             | Notification::ReasoningEffortChanged { thread_id, .. }
             | Notification::PreserveThinkingChanged { thread_id, .. }
+            | Notification::TitleChanged { thread_id, .. }
             | Notification::Notice { thread_id, .. }
             | Notification::ReasoningDelta { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
@@ -439,6 +451,7 @@ impl Notification {
             | Notification::PermissionModeChanged { .. }
             | Notification::ReasoningEffortChanged { .. }
             | Notification::PreserveThinkingChanged { .. }
+            | Notification::TitleChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::Error { .. }
@@ -844,6 +857,25 @@ mod tests {
         assert_eq!(v["params"]["preserve"], false);
         // 与 `reasoningEffortChanged` 同为会话元数据:必须列表层恒推,否则窗口外
         // 会话的控件在不同客户端之间「概率性不同步」。
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// 标题变更通知的 wire 形状:`thread/titleChanged`,参数 snake_case。
+    ///
+    /// 与 `modelChanged` / `permissionModeChanged` 同为**会话元数据**:必须列表层
+    /// 恒推,否则窗口外会话的标题在手机上「概率性不同步」;并按 thread 路由。
+    /// 它**直接携带权威标题**,客户端就地落笔,不必再拉一次 `thread/listAll`。
+    #[test]
+    fn title_changed_notification_carries_method_and_title() {
+        let n = Notification::TitleChanged {
+            thread_id: "t1".into(),
+            title: "修复登录报错".into(),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/titleChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["title"], "修复登录报错");
         assert_eq!(n.delivery(), Delivery::List);
         assert_eq!(n.thread_key(), Some("t1"));
     }

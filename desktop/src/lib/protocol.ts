@@ -97,6 +97,12 @@ export type Notification =
     }
   | { method: "thread/status/updated"; params: { thread_id: string; status: ThreadStatus } }
   | { method: "thread/modelChanged"; params: { thread_id: string; model: string } }
+  /**
+   * 该会话的标题已变（LLM 首轮生成成功写入）。与 `thread/modelChanged` 同族：
+   * 会话元数据，列表层恒推，所有客户端据此就地刷新侧栏。**直接携带权威标题**，
+   * 客户端就地落笔，不必再拉一次 `thread/listAll`。
+   */
+  | { method: "thread/titleChanged"; params: { thread_id: string; title: string } }
   | {
       method: "thread/permissionModeChanged";
       params: { thread_id: string; mode: ThreadMode };
