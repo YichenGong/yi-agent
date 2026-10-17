@@ -57,15 +57,74 @@ pub enum ContentBlock {
 /// `type` 值（`thinking` vs `redacted_thinking`），故必须区分为两个变体——单靠
 /// 「有没有凭证」无法决定回传时的 `type`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ThinkingTokenRepr")]
 pub enum ThinkingToken {
     /// Anthropic 明文 thinking 块（text 可有内容，display 决定）。
     Signature(String),
     /// Anthropic redacted_thinking 块（text 恒为空，只有 data）。
     Redacted(String),
-    /// OpenAI Responses 的 encrypted_content。
-    Encrypted(String),
+    /// OpenAI Responses 的 reasoning item 凭证。
+    ///
+    /// `summary` 与 `encrypted_content` **同为回放必需字段**：重放 reasoning item 时
+    /// 两者都必须在场——只发 `encrypted_content` 会被上游判 400
+    /// `Missing required parameter: 'input[1].summary'`（实测 2026-10-17）。
+    /// `summary` 常见为空数组 `[]`，但**空数组也必须显式发**，不能省略字段，
+    /// 故此处保存上游原文（不解析、不重编码，见设计铁律「凭证逐字保真」）。
+    Encrypted {
+        encrypted_content: String,
+        /// 上游 reasoning item 的 `summary` 原文（通常为 `[]`）。
+        summary: Vec<serde_json::Value>,
+    },
     /// 无凭证。DeepSeek 的 reasoning_content 按规范不需回传，明文仅供展示。
     None,
+}
+
+/// `ThinkingToken` 的反序列化中转形态。
+///
+/// 存在的唯一理由：旧 transcript 把 `Encrypted` 序列化成**字符串**
+/// `{"Encrypted":"<blob>"}`（该变体曾是 `Encrypted(String)`），新形态是带
+/// `summary` 的结构体。两者都要能读入，否则旧会话回放会静默丢凭证。
+/// 见 `legacy_encrypted_token_without_summary_still_deserializes`。
+#[derive(Deserialize)]
+enum ThinkingTokenRepr {
+    Signature(String),
+    Redacted(String),
+    Encrypted(EncryptedRepr),
+    None,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EncryptedRepr {
+    /// 旧形态：只有 encrypted_content。
+    Legacy(String),
+    /// 新形态：携带 summary 原文。
+    Full {
+        encrypted_content: String,
+        #[serde(default)]
+        summary: Vec<serde_json::Value>,
+    },
+}
+
+impl From<ThinkingTokenRepr> for ThinkingToken {
+    fn from(repr: ThinkingTokenRepr) -> Self {
+        match repr {
+            ThinkingTokenRepr::Signature(s) => ThinkingToken::Signature(s),
+            ThinkingTokenRepr::Redacted(d) => ThinkingToken::Redacted(d),
+            ThinkingTokenRepr::Encrypted(EncryptedRepr::Legacy(enc)) => ThinkingToken::Encrypted {
+                encrypted_content: enc,
+                summary: Vec::new(),
+            },
+            ThinkingTokenRepr::Encrypted(EncryptedRepr::Full {
+                encrypted_content,
+                summary,
+            }) => ThinkingToken::Encrypted {
+                encrypted_content,
+                summary,
+            },
+            ThinkingTokenRepr::None => ThinkingToken::None,
+        }
+    }
 }
 
 /// Requested fidelity for an image block. Only affects how the image is
@@ -315,7 +374,10 @@ mod tests {
         let cases = vec![
             ThinkingToken::Signature("sig-abc".into()),
             ThinkingToken::Redacted("red-xyz".into()),
-            ThinkingToken::Encrypted("enc-123".into()),
+            ThinkingToken::Encrypted {
+                encrypted_content: "enc-123".into(),
+                summary: vec![],
+            },
             ThinkingToken::None,
         ];
         for token in cases {
@@ -327,6 +389,37 @@ mod tests {
             let back: ContentBlock = serde_json::from_str(&json).unwrap();
             assert_eq!(block, back, "thinking block must round-trip losslessly");
         }
+    }
+
+    #[test]
+    fn encrypted_token_roundtrips_its_summary_verbatim() {
+        // reasoning item 回放必须带 `summary`，故凭证须保存上游原文（空数组也一样），
+        // 且逐字保真——不得解析、不得重编码（设计铁律）。
+        let token = ThinkingToken::Encrypted {
+            encrypted_content: "enc-123".into(),
+            summary: vec![serde_json::json!({"type": "summary_text", "text": "hi"})],
+        };
+        let block = ContentBlock::Thinking {
+            text: String::new(),
+            token,
+        };
+        let json = serde_json::to_string(&block).unwrap();
+        let back: ContentBlock = serde_json::from_str(&json).unwrap();
+        assert_eq!(block, back, "encrypted credential must round-trip verbatim");
+    }
+
+    #[test]
+    fn legacy_encrypted_token_without_summary_still_deserializes() {
+        // 旧 transcript 把该凭证序列化成 `{"Encrypted":"<blob>"}`（无 summary）。
+        // 必须能反序列化，否则旧会话回放会静默丢凭证——`summary` 缺省为空数组。
+        let back: ThinkingToken = serde_json::from_str(r#"{"Encrypted":"legacy-blob"}"#).unwrap();
+        assert_eq!(
+            back,
+            ThinkingToken::Encrypted {
+                encrypted_content: "legacy-blob".into(),
+                summary: vec![],
+            }
+        );
     }
 
     #[test]

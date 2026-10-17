@@ -39,17 +39,19 @@ pub fn responses_request_from(req: ProviderRequest) -> ResponsesRequest {
                 // reasoning item 必须在 function_call 之前——与服务端返回顺序一致。
                 for b in &m.content {
                     if let ContentBlock::Thinking {
-                        token: yi_agent_core::ThinkingToken::Encrypted(enc),
+                        token:
+                            yi_agent_core::ThinkingToken::Encrypted {
+                                encrypted_content,
+                                summary,
+                            },
                         ..
                     } = b
                     {
                         input.push(serde_json::json!({
                             "type": "reasoning",
-                            "encrypted_content": enc,
-                            // 上游要求 reasoning item 必带 `summary`（省略即 400：
-                            // `Missing required parameter: 'input[1].summary'`），
-                            // 且**空数组也必须显式发**。
-                            "summary": []
+                            "encrypted_content": encrypted_content,
+                            // `summary` 必须显式在场（省略即 400），逐字回放捕获值。
+                            "summary": summary
                         }));
                     }
                 }
@@ -352,7 +354,10 @@ mod tests {
             messages: vec![Message::assistant(vec![
                 ContentBlock::Thinking {
                     text: "".into(),
-                    token: ThinkingToken::Encrypted("enc-blob".into()),
+                    token: ThinkingToken::Encrypted {
+                        encrypted_content: "enc-blob".into(),
+                        summary: vec![],
+                    },
                 },
                 ContentBlock::ToolUse {
                     id: "call_1".into(),
@@ -388,7 +393,10 @@ mod tests {
         let req = base_request(vec![Message::assistant(vec![
             ContentBlock::Thinking {
                 text: "".into(),
-                token: ThinkingToken::Encrypted("enc-blob".into()),
+                token: ThinkingToken::Encrypted {
+                    encrypted_content: "enc-blob".into(),
+                    summary: vec![],
+                },
             },
             ContentBlock::ToolUse {
                 id: "call_1".into(),
@@ -405,6 +413,34 @@ mod tests {
         assert!(
             reasoning.get("summary").is_some_and(|s| s.is_array()),
             "reasoning item must carry an array `summary` field: {reasoning:?}"
+        );
+    }
+
+    #[test]
+    fn replayed_reasoning_item_carries_the_captured_summary_verbatim() {
+        // B 方案核心：捕获到的 `summary` 必须逐字回放，不能被压成 `[]`。
+        use yi_agent_core::{ContentBlock, ThinkingToken};
+        let summary = vec![
+            serde_json::json!({"type": "summary_text", "text": "first"}),
+            serde_json::json!({"type": "summary_text", "text": "second"}),
+        ];
+        let req = base_request(vec![Message::assistant(vec![ContentBlock::Thinking {
+            text: "".into(),
+            token: ThinkingToken::Encrypted {
+                encrypted_content: "enc-blob".into(),
+                summary: summary.clone(),
+            },
+        }])]);
+        let body = serde_json::to_value(responses_request_from(req)).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let reasoning = input
+            .iter()
+            .find(|i| i["type"] == "reasoning")
+            .expect("reasoning item must be present");
+        assert_eq!(
+            reasoning["summary"],
+            serde_json::Value::Array(summary),
+            "the captured summary must be replayed verbatim"
         );
     }
 
