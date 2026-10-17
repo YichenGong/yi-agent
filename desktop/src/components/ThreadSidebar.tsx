@@ -10,6 +10,7 @@ import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
 import { resolveSidebarPressTarget } from "../lib/sidebarPress";
 import { formatRelativeTime } from "../lib/relativeTime";
 import { filterThreadTree } from "../lib/threadSearch";
+import { TAG_DOT_CLASS, TAG_IDS, isValidTagId, tagLabel, type TagId } from "../lib/threadTags";
 
 function unreadDotClass(status: TurnStatus): string {
   if (status === "failed") return "bg-red-400";
@@ -87,6 +88,8 @@ export function ThreadSidebar({
   onDelete,
   onTogglePin,
   onReorderPinned,
+  onSetTag,
+  tagNames,
   onNew,
   onRemoveWorkspace,
   onBrowse,
@@ -115,6 +118,10 @@ export function ThreadSidebar({
   onTogglePin: (id: string, pinned: boolean) => void;
   /** 置顶分区拖拽落点：新的从顶到底顺序。 */
   onReorderPinned: (orderedIds: string[]) => void;
+  /** 给会话打 / 清颜色标签（`TagId` 或 null=清除）。 */
+  onSetTag: (id: string, tag: TagId | null) => void;
+  /** 已解析的标签显示名（6 键齐全，由 App 经 `resolveTagNames` 得到）。 */
+  tagNames: Record<TagId, string>;
   /** No cwd → App opens the picker; with cwd → create in that dir. */
   onNew: (cwd?: string) => void;
   onRemoveWorkspace: (cwd: string) => void;
@@ -419,6 +426,28 @@ export function ThreadSidebar({
           if (e.detail > 1) return;
           onSelect(t.thread_id);
         }}
+        onContextMenu={(e) => {
+          // 桌面端打标签的入口：右键会话行打开与手机长按**同一份**菜单。
+          e.preventDefault();
+          if (editingId === t.thread_id) return;
+          setNewMenuOpen(false);
+          setMenu({ kind: "thread", id: t.thread_id });
+        }}
+        tabIndex={0}
+        aria-haspopup="menu"
+        aria-expanded={menu?.kind === "thread" && menu.id === t.thread_id}
+        onKeyDown={(e) => {
+          // 键盘等价于右键：Enter/Space 开关本行的菜单。
+          if (e.target !== e.currentTarget) return;
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.preventDefault();
+          setNewMenuOpen(false);
+          setMenu((cur) =>
+            cur?.kind === "thread" && cur.id === t.thread_id
+              ? null
+              : { kind: "thread", id: t.thread_id },
+          );
+        }}
         className={`group relative flex items-center justify-between gap-1 ${indent} py-2 text-sm ${
           dragId === t.thread_id ? "opacity-50" : ""
         } ${active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"} cursor-pointer`}
@@ -454,6 +483,14 @@ export function ThreadSidebar({
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <StatusBadge status={st} stale={statusStale} />
+                {isValidTagId(t.tag) && (
+                  <span
+                    data-thread-tag={t.tag}
+                    aria-label={tagLabel(t.tag, tagNames)}
+                    title={tagLabel(t.tag, tagNames)}
+                    className={`size-2 shrink-0 rounded-full ${TAG_DOT_CLASS[t.tag]}`}
+                  />
+                )}
                 <div
                   className="truncate"
                   title={t.title ?? t.thread_id}
@@ -523,6 +560,45 @@ export function ThreadSidebar({
               onClick={(e) => e.stopPropagation()}
               className="absolute top-full left-3 z-20 mt-0.5 min-w-32 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
             >
+              <div
+                role="group"
+                aria-label="标签"
+                className="flex items-center gap-1.5 border-b border-line px-2 py-1.5"
+              >
+                {TAG_IDS.map((id) => {
+                  const active = t.tag === id;
+                  const name = tagLabel(id, tagNames);
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={active}
+                      aria-label={name}
+                      title={name}
+                      onClick={() => {
+                        closeMenus();
+                        onSetTag(t.thread_id, id);
+                      }}
+                      className={`size-3.5 rounded-full ${TAG_DOT_CLASS[id]} ${
+                        active ? "ring-2 ring-fg ring-offset-1 ring-offset-raised" : ""
+                      }`}
+                    />
+                  );
+                })}
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={!isValidTagId(t.tag)}
+                  onClick={() => {
+                    closeMenus();
+                    onSetTag(t.thread_id, null);
+                  }}
+                  className="ml-auto px-1 text-xs whitespace-nowrap text-fg-muted hover:text-fg"
+                >
+                  无标签
+                </button>
+              </div>
               <button
                 type="button"
                 role="menuitem"
@@ -621,7 +697,7 @@ export function ThreadSidebar({
 
   // 渲染时过滤：不持有第二份列表副本，服务端刷新后自动跟随。
   const searching = query.trim() !== "";
-  const filtered = filterThreadTree(groups, pinned, query);
+  const filtered = filterThreadTree(groups, pinned, query, tagNames);
   // 搜索期间忽略折叠状态；三个 Set 全程不被写入，清空后原样恢复。
   const pinnedCollapsedNow = searching ? false : pinnedCollapsed;
 

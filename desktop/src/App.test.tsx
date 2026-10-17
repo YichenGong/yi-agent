@@ -927,7 +927,7 @@ describe("App slash commands", () => {
  */
 async function openBoardFor(project: string) {
   // 打开小组右键菜单（与键盘路径同一条处理链）→ 点「看板」条目。
-  const header = document.querySelector<HTMLElement>('div[tabindex][aria-haspopup="menu"]')!;
+  const header = document.querySelector<HTMLElement>("[data-ws-header]")!;
   fireEvent.contextMenu(header);
   await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
   fireEvent.click(screen.getByLabelText("看板"));
