@@ -2454,6 +2454,16 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::Onboarding => {
+                        let mut state = app_state!();
+                        match crate::rpc::onboarding::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     // 尚未搬移的域(以及 `initialize`)仍走原始 dispatch。
                     // 逐域搬移期间,还没搬的域也落到这里,故用 `_` 一并兜住
                     // (`Domain::Unknown` 覆盖 `initialize` 与所有未识别前缀)。
@@ -2586,78 +2596,6 @@ where
                                 .await?
                             }
                         }
-                    }
-                    // 首次安装引导。与 `model/*` 同档:`onboarding/status` 只读
-                    // (Observe);apply/dismiss/test 都触及密钥或落盘,需 `Control`。
-                    "onboarding/status" => {
-                        match crate::onboarding_rpc::handle_onboarding_request_at(
-                            &onboarding_env_path,
-                            &onboarding_preferences_path,
-                            &models_path,
-                            method.as_str(),
-                            &req.params,
-                            &cfg,
-                        ) {
-                            Ok(value) => {
-                                write_response(&hub, &client, ok_response(id, value)).await?
-                            }
-                            Err(error) => {
-                                write_response(&hub, &client, err_response(id, error)).await?
-                            }
-                        }
-                    }
-                    "onboarding/apply" | "onboarding/dismiss" => {
-                        if client_scope < Scope::Control {
-                            write_response(
-                                &hub,
-                                &client,
-                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        match crate::onboarding_rpc::handle_onboarding_request_at(
-                            &onboarding_env_path,
-                            &onboarding_preferences_path,
-                            &models_path,
-                            method.as_str(),
-                            &req.params,
-                            &cfg,
-                        ) {
-                            Ok(value) => {
-                                write_response(&hub, &client, ok_response(id, value)).await?
-                            }
-                            Err(error) => {
-                                write_response(&hub, &client, err_response(id, error)).await?
-                            }
-                        }
-                    }
-                    // 探测只发一次最小请求,**不落盘**:故不归 `onboarding_rpc`
-                    // (它管路径),而是直接调 runtime 的 `test_connection`(async)。
-                    "onboarding/test" => {
-                        if client_scope < Scope::Control {
-                            write_response(
-                                &hub,
-                                &client,
-                                err_response(id, RpcError::insufficient_scope(Scope::Control)),
-                            )
-                            .await?;
-                            continue;
-                        }
-                        let settings =
-                            match crate::onboarding_rpc::settings_from_params(&req.params) {
-                                Ok(s) => s,
-                                Err(error) => {
-                                    write_response(&hub, &client, err_response(id, error)).await?;
-                                    continue;
-                                }
-                            };
-                        let outcome = yi_agent_runtime::onboarding::test_connection(&settings).await;
-                        let value = serde_json::json!({
-                            "ok": outcome.ok,
-                            "reason": outcome.reason,
-                        });
-                        write_response(&hub, &client, ok_response(id, value)).await?;
                     }
                     "board/create" => {
                         let Some(project) = project_arg(&req.params) else {
