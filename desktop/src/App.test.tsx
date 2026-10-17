@@ -1433,6 +1433,43 @@ describe("App settings & theme wiring", () => {
     );
   });
 
+  it("reflects a thread/tagChanged in the sidebar without re-listing", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    notify("thread/tagChanged", { thread_id: "t1", tag: "red" });
+    await waitFor(() =>
+      expect(document.querySelector('[data-thread-tag="red"]')).toBeTruthy(),
+    );
+    // 就地把权威值落笔，不该为此再拉一次全量 thread/listAll。
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+  });
+
+  it("reflects ui/tagNames/updated in the existing dot's label", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    notify("thread/tagChanged", { thread_id: "t1", tag: "red" });
+    await waitFor(() => expect(document.querySelector('[data-thread-tag="red"]')).toBeTruthy());
+
+    notify("ui/tagNames/updated", { tag_names: { red: "紧急" } });
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-thread-tag="red"]')?.getAttribute("aria-label"),
+      ).toBe("紧急"),
+    );
+  });
+
   it("reflects a thread/modelChanged from another client in that thread's picker", async () => {
     render(<App />);
     await settle();
