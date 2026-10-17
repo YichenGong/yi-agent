@@ -19,6 +19,7 @@ pub(crate) mod model;
 pub(crate) mod onboarding;
 pub(crate) mod plugin;
 pub(crate) mod ui;
+pub(crate) mod workspace;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -83,6 +84,8 @@ pub(crate) enum Domain {
     Plugin,
     /// `image/*`(含分片上传)。
     Image,
+    /// `workspace/*`。
+    Workspace,
     /// 未搬移(含 `initialize`)。
     Unknown,
 }
@@ -101,6 +104,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("board") => Domain::Board,
         Some("plugin") | Some("plugins") => Domain::Plugin,
         Some("image") => Domain::Image,
+        Some("workspace") => Domain::Workspace,
         _ => Domain::Unknown,
     }
 }

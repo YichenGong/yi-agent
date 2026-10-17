@@ -2494,6 +2494,16 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::Workspace => {
+                        let mut state = app_state!();
+                        match crate::rpc::workspace::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     // 尚未搬移的域(以及 `initialize`)仍走原始 dispatch。
                     // 逐域搬移期间,还没搬的域也落到这里,故用 `_` 一并兜住
                     // (`Domain::Unknown` 覆盖 `initialize` 与所有未识别前缀)。
@@ -2517,63 +2527,6 @@ where
                             ),
                         )
                         .await?;
-                    }
-                    "workspace/list" => {
-                        let list: Vec<serde_json::Value> = workspaces
-                            .list()
-                            .into_iter()
-                            .map(|p| json!({ "path": p, "exists": Path::new(&p).is_dir() }))
-                            .collect();
-                        write_response(&hub, &client, ok_response(id, json!({ "workspaces": list })))
-                            .await?;
-                    }
-                    "workspace/add" => {
-                        let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                        match std::fs::canonicalize(raw) {
-                            Ok(p) if p.is_dir() => {
-                                let value = p.to_string_lossy().to_string();
-                                match workspaces.add(&p) {
-                                    Ok(()) => {
-                                        write_response(&hub, &client, ok_response(id, json!({ "path": value })))
-                                            .await?
-                                    }
-                                    Err(e) => {
-                                        write_response(
-                                            &hub, &client,
-                                            err_response(id, RpcError::internal(e.to_string())),
-                                        )
-                                        .await?
-                                    }
-                                }
-                            }
-                            _ => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(
-                                        id,
-                                        RpcError::invalid_params("path is not a directory"),
-                                    ),
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                    "workspace/remove" => {
-                        let raw = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                        // add 存的是 canonical 路径;remove 也必须规范化,否则
-                        // 符号链接 / 相对路径 / 尾斜杠会静默 no-op 却仍回成功。
-                        // canonicalize 失败(路径已不存在)时回退原始串,保持幂等。
-                        let key = std::fs::canonicalize(raw).unwrap_or_else(|_| PathBuf::from(raw));
-                        match workspaces.remove(&key) {
-                            Ok(()) => write_response(&hub, &client, ok_response(id, json!({}))).await?,
-                            Err(e) => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::internal(e.to_string())),
-                                )
-                                .await?
-                            }
-                        }
                     }
                     "thread/list" => {
                         // 单目录列表:仍是 `cfg.workdir` 的 store。跨目录分组见下方
