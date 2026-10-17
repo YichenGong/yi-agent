@@ -78,14 +78,13 @@ pub(crate) async fn handle(
                 .await?;
                 return Ok(Flow::Continue);
             }
-            let settings =
-                match crate::onboarding_rpc::settings_from_params(&req.params) {
-                    Ok(s) => s,
-                    Err(error) => {
-                        write_response(state.hub, state.client, err_response(id, error)).await?;
-                        return Ok(Flow::Continue);
-                    }
-                };
+            let settings = match crate::onboarding_rpc::settings_from_params(&req.params) {
+                Ok(s) => s,
+                Err(error) => {
+                    write_response(state.hub, state.client, err_response(id, error)).await?;
+                    return Ok(Flow::Continue);
+                }
+            };
             let outcome = yi_agent_runtime::onboarding::test_connection(&settings).await;
             let value = serde_json::json!({
                 "ok": outcome.ok,

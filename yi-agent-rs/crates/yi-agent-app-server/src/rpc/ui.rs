@@ -24,7 +24,12 @@ pub(crate) async fn handle(
 ) -> anyhow::Result<Flow> {
     match req.method.as_str() {
         "config/read" => {
-            write_response(state.hub, state.client, ok_response(id, state.cfg.redacted_view())).await?;
+            write_response(
+                state.hub,
+                state.client,
+                ok_response(id, state.cfg.redacted_view()),
+            )
+            .await?;
         }
         "ui/settings/read" => {
             // 以共享句柄的当前值为权威（与 `set_theme` 工具同一实例）;
@@ -33,8 +38,7 @@ pub(crate) async fn handle(
             // 句柄的 workdir 以保证两者读写的是同一个 preferences.json。
             let theme = state.theme_handle.current();
             let workdir = state.theme_handle.workdir();
-            let watchman_enabled =
-                crate::settings_store::load_watchman_enabled(workdir);
+            let watchman_enabled = crate::settings_store::load_watchman_enabled(workdir);
             // 侧车中继地址（桌面设置页写入）：与 theme/值守同处一个
             // preferences.json，故一并从同一个 workdir 读。未配置即
             // `null`，桌面首屏据此回填空串。
@@ -54,15 +58,15 @@ pub(crate) async fn handle(
             .await?;
         }
         "ui/settings/write" => {
-            if let Some(enabled) =
-                req.params.get("board_watchman_enabled").and_then(|v| v.as_bool())
+            if let Some(enabled) = req
+                .params
+                .get("board_watchman_enabled")
+                .and_then(|v| v.as_bool())
             {
                 let workdir = state.theme_handle.workdir();
                 // 落盘失败就整体失败：偏好没写成功却去动系统状态，
                 // 会让开关与磁盘记录不一致。
-                if let Err(error) =
-                    crate::settings_store::save_watchman_enabled(workdir, enabled)
-                {
+                if let Err(error) = crate::settings_store::save_watchman_enabled(workdir, enabled) {
                     write_response(
                         state.hub,
                         state.client,
@@ -97,8 +101,11 @@ pub(crate) async fn handle(
             // 的请求不该因为「没有 theme」而被拒绝。先校验再落盘，
             // 免得非法 theme 把一个有效的 relay_url 写了一半。
             let requested_theme = if req.params.get("theme").is_some() {
-                let requested =
-                    req.params.get("theme").and_then(|v| v.as_str()).unwrap_or("");
+                let requested = req
+                    .params
+                    .get("theme")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 match requested.trim().to_ascii_lowercase().as_str() {
                     "dark" => Some(crate::settings_store::Theme::Dark),
                     "light" => Some(crate::settings_store::Theme::Light),
@@ -145,8 +152,12 @@ pub(crate) async fn handle(
             if let Some(theme) = requested_theme {
                 state.theme_handle.set(theme);
             }
-            write_response(state.hub, state.client, ok_response(id, json!({ "ok": true })))
-                .await?;
+            write_response(
+                state.hub,
+                state.client,
+                ok_response(id, json!({ "ok": true })),
+            )
+            .await?;
         }
         // 域内兜底:本模块只实现上面列出的方法。若 `domain_for` 把别的同前缀
         // 方法也划给本域,交回 `serve()` 原始 dispatch,而不是在这里自行编造响应。

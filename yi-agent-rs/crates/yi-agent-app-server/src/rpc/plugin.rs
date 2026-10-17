@@ -10,7 +10,10 @@ use serde_json::json;
 
 use crate::protocol::{RequestEnvelope, RequestId, RpcError};
 use crate::rpc::{AppState, Flow};
-use crate::server::{err_response, list_installed_plugins, ok_response, plugin_query, plugin_query_self, plugin_scope, project_arg, write_response};
+use crate::server::{
+    err_response, list_installed_plugins, ok_response, plugin_query, plugin_query_self,
+    plugin_scope, project_arg, write_response,
+};
 
 /// 处理本域的一个 RPC 请求。
 ///
@@ -29,7 +32,8 @@ pub(crate) async fn handle(
             // a board that lives under another project's daemon.
             let Some(project) = project_arg(&req.params) else {
                 write_response(
-                    state.hub, state.client,
+                    state.hub,
+                    state.client,
                     err_response(id, RpcError::invalid_params("missing or empty project")),
                 )
                 .await?;
@@ -56,11 +60,9 @@ pub(crate) async fn handle(
                 }
                 Err(error) => {
                     write_response(
-                        state.hub, state.client,
-                        err_response(
-                            id,
-                            RpcError::board_query(error.code, error.message),
-                        ),
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::board_query(error.code, error.message)),
                     )
                     .await?
                 }
@@ -81,8 +83,12 @@ pub(crate) async fn handle(
                     })
                 })
                 .collect();
-            write_response(state.hub, state.client, ok_response(id, json!({ "plugins": plugins })))
-                .await?;
+            write_response(
+                state.hub,
+                state.client,
+                ok_response(id, json!({ "plugins": plugins })),
+            )
+            .await?;
         }
         "plugin/settings/read" => {
             let workdir = state.theme_handle.workdir().to_path_buf();
@@ -94,7 +100,9 @@ pub(crate) async fn handle(
                 .unwrap_or("")
                 .to_string();
             match plugin_query_self(&scope, &plugin, "settings.read", json!({})) {
-                Ok(value) => write_response(state.hub, state.client, ok_response(id, value)).await?,
+                Ok(value) => {
+                    write_response(state.hub, state.client, ok_response(id, value)).await?
+                }
                 Err(error) => {
                     write_response(
                         state.hub,
@@ -121,7 +129,9 @@ pub(crate) async fn handle(
                 "settings.write",
                 json!({ "settings": settings }),
             ) {
-                Ok(value) => write_response(state.hub, state.client, ok_response(id, value)).await?,
+                Ok(value) => {
+                    write_response(state.hub, state.client, ok_response(id, value)).await?
+                }
                 Err(error) => {
                     write_response(
                         state.hub,

@@ -12,7 +12,9 @@ use serde_json::json;
 
 use crate::protocol::{RequestEnvelope, RequestId, RpcError};
 use crate::rpc::{AppState, Flow};
-use crate::server::{ensure_watchman_installed, err_response, ok_response, project_arg, to_json, write_response};
+use crate::server::{
+    ensure_watchman_installed, err_response, ok_response, project_arg, to_json, write_response,
+};
 
 /// 处理本域的一个 RPC 请求。
 ///
@@ -28,7 +30,8 @@ pub(crate) async fn handle(
         "board/create" => {
             let Some(project) = project_arg(&req.params) else {
                 write_response(
-                    state.hub, state.client,
+                    state.hub,
+                    state.client,
                     err_response(id, RpcError::invalid_params("missing or empty project")),
                 )
                 .await?;
@@ -51,28 +54,44 @@ pub(crate) async fn handle(
                         state.watchman_home,
                         state.watchman_install,
                     );
-                    write_response(state.hub, state.client, ok_response(id, to_json(&status))).await?
+                    write_response(state.hub, state.client, ok_response(id, to_json(&status)))
+                        .await?
                 }
                 Err(message) => {
-                    write_response(state.hub, state.client, err_response(id, RpcError::internal(message)))
-                        .await?
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(message)),
+                    )
+                    .await?
                 }
             }
         }
         "board/remove" => {
             let Some(project) = project_arg(&req.params) else {
                 write_response(
-                    state.hub, state.client,
+                    state.hub,
+                    state.client,
                     err_response(id, RpcError::invalid_params("missing or empty project")),
                 )
                 .await?;
                 return Ok(Flow::Continue);
             };
-            match yi_agent_boards::lifecycle::remove_in(&project, state.board_dir, state.resident_dir) {
-                Ok(()) => write_response(state.hub, state.client, ok_response(id, json!({}))).await?,
+            match yi_agent_boards::lifecycle::remove_in(
+                &project,
+                state.board_dir,
+                state.resident_dir,
+            ) {
+                Ok(()) => {
+                    write_response(state.hub, state.client, ok_response(id, json!({}))).await?
+                }
                 Err(message) => {
-                    write_response(state.hub, state.client, err_response(id, RpcError::internal(message)))
-                        .await?
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(message)),
+                    )
+                    .await?
                 }
             }
         }
@@ -96,12 +115,20 @@ pub(crate) async fn handle(
                             })
                         })
                         .collect();
-                    write_response(state.hub, state.client, ok_response(id, json!({ "boards": boards })))
-                        .await?
+                    write_response(
+                        state.hub,
+                        state.client,
+                        ok_response(id, json!({ "boards": boards })),
+                    )
+                    .await?
                 }
                 Err(message) => {
-                    write_response(state.hub, state.client, err_response(id, RpcError::internal(message.to_string())))
-                        .await?
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(message.to_string())),
+                    )
+                    .await?
                 }
             }
         }
