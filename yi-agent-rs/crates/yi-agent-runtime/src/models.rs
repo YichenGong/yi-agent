@@ -74,6 +74,9 @@ pub struct ModelEntry {
     /// 非字符串值按「未设置」处理，不让整条被跳过（见 `de_optional_string`）。
     #[serde(default, deserialize_with = "de_optional_string")]
     pub reasoning_effort: Option<String>,
+    /// 该条目的上下文窗口（tokens）；`None` = 沿用 cfg 的既有阈值。
+    #[serde(default)]
+    pub context_length: Option<u32>,
 }
 
 /// 反序列化时把非字符串值当作「未设置」（None），避免一个手写值让整条被跳过。
@@ -395,6 +398,9 @@ pub fn resolve_effective(
                 .map(ApiStyle::parse)
                 .unwrap_or(RuntimeConfig::default_api_style());
             out.reasoning_effort = entry.reasoning_effort.clone();
+            if let Some(length) = entry.context_length {
+                out.compact_threshold = length * out.compact_ratio / 100;
+            }
             out
         }
         None => cfg.clone(),
@@ -435,6 +441,7 @@ mod tests {
             api_key: "sk-secret-1234".into(),
             api_style: None,
             reasoning_effort: None,
+            context_length: None,
         }
     }
 
@@ -819,6 +826,8 @@ mod resolve_tests {
             workdir: std::path::PathBuf::from("."),
             system_prompt: None,
             compact_threshold: 1000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 100,
             compact_tool_budget_tokens: 100,
             yolo: false,
@@ -841,6 +850,7 @@ mod resolve_tests {
                     api_key: "key-a".into(),
                     api_style: None,
                     reasoning_effort: None,
+                    context_length: None,
                 },
                 ModelEntry {
                     name: "B".into(),
@@ -850,6 +860,7 @@ mod resolve_tests {
                     api_key: "key-b".into(),
                     api_style: None,
                     reasoning_effort: None,
+                    context_length: None,
                 },
             ],
             default_model: Some("A".into()),
@@ -916,5 +927,21 @@ mod resolve_tests {
         let out = resolve_effective(&cfg(), &catalog(), Some("A"));
         assert_eq!(out.reasoning_effort, None);
         assert_eq!(out.api_style.as_str(), "auto");
+    }
+
+    #[test]
+    fn an_entrys_context_length_recomputes_the_compact_threshold() {
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(100_000);
+        // cfg() defaults to compact_ratio 80.
+        let out = resolve_effective(&cfg(), &cat, Some("B"));
+        assert_eq!(out.compact_threshold, 80_000);
+    }
+
+    #[test]
+    fn a_silent_context_length_leaves_the_threshold_alone() {
+        let base = cfg();
+        let out = resolve_effective(&base, &catalog(), Some("A"));
+        assert_eq!(out.compact_threshold, base.compact_threshold);
     }
 }

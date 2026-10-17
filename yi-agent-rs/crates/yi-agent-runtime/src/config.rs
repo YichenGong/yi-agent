@@ -41,6 +41,10 @@ pub struct RuntimeConfig {
     pub workdir: PathBuf,
     pub system_prompt: Option<String>,
     pub compact_threshold: u32, // computed: context_length * ratio / 100
+    /// 触发自动压缩的上下文占比（百分数）。保留原值以便条目改写 context_length 时重算阈值。
+    pub compact_ratio: u32,
+    /// 显式声明的上下文窗口（tokens）；`None` = 未声明（阈值用兜底长度算出）。
+    pub model_context_length: Option<u32>,
     pub compact_user_budget_tokens: usize,
     pub compact_tool_budget_tokens: usize,
     pub yolo: bool,
@@ -382,6 +386,8 @@ impl RuntimeConfig {
             workdir,
             system_prompt,
             compact_threshold,
+            compact_ratio,
+            model_context_length,
             compact_user_budget_tokens,
             compact_tool_budget_tokens,
             yolo,
@@ -431,6 +437,8 @@ pub(crate) fn sample_config() -> RuntimeConfig {
         workdir: PathBuf::from("/tmp/test-workdir"),
         system_prompt: None,
         compact_threshold: 160_000,
+        compact_ratio: 80,
+        model_context_length: None,
         compact_user_budget_tokens: 20_000,
         compact_tool_budget_tokens: 12_000,
         yolo: false,

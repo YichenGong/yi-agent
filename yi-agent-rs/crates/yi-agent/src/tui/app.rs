@@ -9264,6 +9264,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: None,
+            context_length: None,
         };
         ModelCatalog {
             models: vec![

@@ -403,6 +403,7 @@ mod tests {
                 api_key: api_key.into(),
                 api_style: None,
                 reasoning_effort: None,
+                context_length: None,
             }],
             default_model: Some(name.into()),
             subagent_model: None,

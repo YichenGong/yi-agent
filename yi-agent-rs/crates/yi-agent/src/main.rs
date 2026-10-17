@@ -2814,6 +2814,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            context_length: None,
         };
         // `/model Y`: Y declares no effort of its own.
         let catalog = ModelCatalog {
@@ -2923,6 +2924,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            context_length: None,
         };
         let catalog = ModelCatalog {
             models: vec![entry("Y", None), entry("Z", Some("low"))],
@@ -3007,6 +3009,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            context_length: None,
         };
         let make_catalog = |default: &str| ModelCatalog {
             models: vec![
@@ -3067,6 +3070,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: style.map(str::to_string),
             reasoning_effort: None,
+            context_length: None,
         };
         let catalog = |default: &str| ModelCatalog {
             models: vec![
@@ -3430,6 +3434,8 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 8192,
             compact_tool_budget_tokens: 4096,
             yolo: false,

@@ -130,6 +130,7 @@ fn import_into_catalog(
         // 引导固化的是 .env 的四个字段，通道两项不在此声明 → 保持默认。
         api_style: None,
         reasoning_effort: None,
+        context_length: None,
     });
     catalog.default_model = Some(name.clone());
     save_catalog_to(models_path, &catalog).map_err(|e| e.to_string())?;
@@ -183,6 +184,8 @@ mod tests {
             workdir: PathBuf::from("/tmp/onboarding-rpc-test"),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,

@@ -163,6 +163,7 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
         api_key,
         api_style,
         reasoning_effort,
+        context_length: None,
     };
     match existing {
         Some(i) => catalog.models[i] = entry,
@@ -256,6 +257,7 @@ fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
         // 兜底层 cfg 的通道选择随条目固化（与 upsert 的默认语义一致）。
         api_style: Some(cfg.api_style.as_str().to_string()),
         reasoning_effort: cfg.reasoning_effort.clone(),
+        context_length: None,
     });
     catalog.default_model = Some(name.clone());
     save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
@@ -372,6 +374,8 @@ mod tests {
             workdir: std::path::PathBuf::from("/tmp/import-env-test"),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
@@ -615,6 +619,7 @@ mod tests {
             api_key: String::new(),
             api_style: None,
             reasoning_effort: None,
+            context_length: None,
         });
         catalog.default_model = Some("gone".to_string());
         yi_agent_runtime::models::save_catalog_to(&path, &catalog).unwrap();
