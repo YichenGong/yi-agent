@@ -803,6 +803,9 @@ mod tests {
 
     #[test]
     fn load_loads_from_cli_args() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let overrides = ConfigOverrides {
             provider: Some("openai".into()),
             api_url: Some("https://example.com".into()),
@@ -899,6 +902,9 @@ mod tests {
 
     #[test]
     fn load_computes_threshold_from_context_and_ratio() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let overrides = ConfigOverrides {
             provider: Some("anthropic".into()),
             api_url: None,
@@ -953,6 +959,9 @@ mod tests {
 
     #[test]
     fn load_rejects_nonexistent_workdir() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let overrides = ConfigOverrides {
             provider: Some("anthropic".into()),
             api_url: None,
@@ -1216,6 +1225,27 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// 整包注入的判据是 `is_some()`（不是「非空」），所以显式的空串覆盖会被当成
+    /// 完整的整包：严格模式 `load` 不再报错，`api_key` 就是那个空串。Task 2 收敛掉了
+    /// 原先 `Some(_) => bail!("API key is empty: ...")` 那一支，这里把新行为钉住。
+    #[test]
+    fn explicit_empty_api_key_is_accepted_as_a_full_package() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env = isolated_config_env();
+        let overrides = ConfigOverrides {
+            provider: Some("anthropic".into()),
+            api_key: Some(String::new()),
+            workdir: Some(PathBuf::from(".")),
+            ..Default::default()
+        };
+
+        let cfg = RuntimeConfig::load(&overrides).expect("an explicit empty key is a full package");
+        assert_eq!(cfg.api_key, "");
+        assert!(cfg.model_injected);
+    }
+
     #[test]
     fn load_env_files_loads_global_when_no_local() {
         let _lock = ENV_TEST_MUTEX
@@ -1436,6 +1466,9 @@ mod tests {
 
     #[test]
     fn explicit_cli_sandbox_overrides_yolo() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut overrides = test_overrides();
         overrides.yolo = true;
         overrides.sandbox = Some(yi_agent_tools::SandboxMode::ReadOnly);
@@ -1462,6 +1495,9 @@ mod tests {
 
     #[test]
     fn sandbox_promotable_false_when_sandbox_explicit() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut overrides = test_overrides();
         overrides.yolo = true;
         overrides.sandbox = Some(yi_agent_tools::SandboxMode::ReadOnly);
@@ -1549,6 +1585,9 @@ mod tests {
 
     #[test]
     fn load_yolo_defaults_false() {
+        let _lock = ENV_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let overrides = ConfigOverrides {
             provider: Some("anthropic".into()),
             api_url: None,
