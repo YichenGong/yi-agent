@@ -21281,6 +21281,66 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 上限 `TAG_NAME_MAX_LEN` 按**字符**而非**字节**计。
+    ///
+    /// 这是一个可判别的钉子:每个 CJK 字符占 3 字节,故 9 个字符(27 字节)与
+    /// 恰好 24 个字符(72 字节)都必须被接受——若实现退化成 `name.len()` 字节
+    /// 计数,这两条会双双被误拒而失败。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_tag_name_length_counts_characters_not_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        // 9 个 CJK 字符 = 27 字节:字节计数会误拒的最小反例。
+        let nine = "字".repeat(9);
+        assert_eq!(nine.chars().count(), 9);
+        assert_eq!(nine.len(), 27);
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"ui/settings/write",
+            "params":{"tag_names":{"green": nine}}});
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 2).await;
+        assert!(
+            v.get("error").is_none(),
+            "9 个 CJK 字符(27 字节)必须被接受: {v}"
+        );
+
+        // 恰好 24 个 CJK 字符 = 72 字节:边界上必须接受,字节计数会误拒。
+        let max = "字".repeat(TAG_NAME_MAX_LEN);
+        assert_eq!(max.chars().count(), TAG_NAME_MAX_LEN);
+        assert_eq!(max.len(), 72);
+        let req = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"ui/settings/write",
+            "params":{"tag_names":{"blue": max}}});
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 3).await;
+        assert!(
+            v.get("error").is_none(),
+            "恰好 {TAG_NAME_MAX_LEN} 个 CJK 字符(72 字节)必须被接受: {v}"
+        );
+
+        // 回读确认确实落盘(而非只是"没报错")。
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        let names = v["result"]["tag_names"]
+            .as_object()
+            .expect("tag_names 必须是对象");
+        assert_eq!(names["green"], nine.as_str(), "{v}");
+        assert_eq!(names["blue"], max.as_str(), "{v}");
+
+        // 边界另一侧:25 个字符必须被拒。
+        let too_long = "字".repeat(TAG_NAME_MAX_LEN + 1);
+        assert_eq!(too_long.chars().count(), 25);
+        let req = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"ui/settings/write",
+            "params":{"tag_names":{"red": too_long}}});
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 5).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+
+        h.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn ui_settings_write_broadcasts_tag_names_updated() {
         let dir = tempfile::TempDir::new().unwrap();
