@@ -8,6 +8,8 @@
 //! 临时名逐次唯一、`rename` 原子替换；文件含密钥，权限收紧为 `0600`。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use yi_agent_core::ApiStyle;
@@ -156,6 +158,112 @@ pub fn try_load_catalog_from(path: &Path) -> Result<ModelCatalog, String> {
         Err(error) => return Err(format!("could not read {}: {error}", path.display())),
     };
     parse_catalog(&text, path).map_err(|error| format!("invalid {}: {error}", path.display()))
+}
+
+/// `models.json` 的指纹：`(mtime, size)`；`None` 的 mtime 表示文件不存在。
+///
+/// 用 stat 而非内容哈希：每次调用只是一次微秒级 syscall，而重建清单解析只在
+/// 指纹真的变化后发生（见 `2026-10-17-model-catalog-live-reload-design.md` §6.3）。
+#[derive(Clone, PartialEq, Eq)]
+struct Fingerprint {
+    mtime: Option<SystemTime>,
+    size: u64,
+}
+
+fn fingerprint_of(path: &Path) -> Fingerprint {
+    match std::fs::metadata(path) {
+        Ok(meta) => Fingerprint {
+            mtime: meta.modified().ok(),
+            size: meta.len(),
+        },
+        Err(_) => Fingerprint {
+            mtime: None,
+            size: 0,
+        },
+    }
+}
+
+struct WatcherState {
+    fingerprint: Fingerprint,
+    catalog: Arc<ModelCatalog>,
+}
+
+/// 进程内「按指纹自更新的模型清单」句柄。
+///
+/// 谁使用清单、谁就负责它的新鲜度：daemon 的 worker 工厂与 app-server 的
+/// 会话工厂都通过它取清单，于是运行期改 `models.json`（无论手工编辑、CLI/TUI
+/// 写入还是设置页 RPC）都会在下一次用到时生效，无需重启进程。
+///
+/// 语义（与设计文档 §4.2 一致）：
+/// - 指纹未变 → 直接返回缓存的 `Arc`（零解析）；
+/// - 指纹变化且解析成功 → 换缓存 + 推进指纹；
+/// - 指纹变化但解析失败（损坏 / 不可读）→ **保留旧值且不推进指纹**，于是文件
+///   修好后下一次调用立即生效；
+/// - 文件不存在 → 采纳空清单（「没有配置」是明确信号，不是错误）。
+pub struct CatalogWatcher {
+    path: PathBuf,
+    /// `from_catalog` 造的固定快照：永不重读（见 `current`）。
+    pinned: bool,
+    state: Mutex<WatcherState>,
+}
+
+impl CatalogWatcher {
+    /// 构造即读一次并记指纹。
+    ///
+    /// 首次读取用宽松版：启动期的坏文件不该让 daemon 起不来（与既有
+    /// 「坏文件绝不阻断启动」一致）。
+    pub fn new(path: PathBuf) -> Arc<Self> {
+        let catalog = Arc::new(load_catalog_from(&path));
+        Arc::new(Self {
+            state: Mutex::new(WatcherState {
+                fingerprint: fingerprint_of(&path),
+                catalog,
+            }),
+            path,
+            pinned: false,
+        })
+    }
+
+    /// 固定快照：永不重读。测试与「本就持有清单」的调用方用它。
+    pub fn from_catalog(path: PathBuf, catalog: ModelCatalog) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(WatcherState {
+                fingerprint: fingerprint_of(&path),
+                catalog: Arc::new(catalog),
+            }),
+            path,
+            pinned: true,
+        })
+    }
+
+    /// 返回当前清单：指纹变了才重读，且只在解析成功时推进指纹。
+    pub fn current(&self) -> Arc<ModelCatalog> {
+        // 固定快照（`from_catalog`）：无论磁盘怎么变都返回构造函数给的那份。
+        if self.pinned {
+            return Arc::clone(&self.state.lock().unwrap_or_else(|p| p.into_inner()).catalog);
+        }
+        let observed = fingerprint_of(&self.path);
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if observed == state.fingerprint {
+            return Arc::clone(&state.catalog);
+        }
+        match try_load_catalog_from(&self.path) {
+            Ok(catalog) => {
+                state.fingerprint = observed;
+                state.catalog = Arc::new(catalog);
+                Arc::clone(&state.catalog)
+            }
+            Err(reason) => {
+                // 保留 last-known-good，且**不推进指纹**：文件改好后下一次调用即生效。
+                tracing::warn!(
+                    path = %self.path.display(),
+                    %reason,
+                    "model catalog is unreadable; keeping the last known good catalog"
+                );
+                Arc::clone(&state.catalog)
+            }
+        }
+    }
 }
 
 /// 把清单文本解析为 [`ModelCatalog`]。`load_catalog_from`（宽松）与
@@ -584,6 +692,107 @@ mod tests {
         // 合法但为空清单：Ok（合法空不等于损坏）。
         std::fs::write(&path, r#"{"models":[]}"#).unwrap();
         assert!(try_load_catalog_from(&path).is_ok());
+    }
+
+    /// 指纹未变时必须复用同一个 `Arc`——用 `ptr_eq` 证明「零重读」，而不是
+    /// 只看值相等（值相等无法区分「重读后恰好相同」与「根本没读」）。
+    #[test]
+    fn watcher_reuses_the_cached_catalog_when_the_fingerprint_is_unchanged() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"models":[],"default_model":"A"}"#).unwrap();
+
+        let watcher = CatalogWatcher::new(path.clone());
+        let first = watcher.current();
+        let second = watcher.current();
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "unchanged fingerprint must return the cached Arc, not a re-read"
+        );
+    }
+
+    /// 指纹变化后必须读到新值（这是「配置改了进程要跟上」的最小断言）。
+    #[test]
+    fn watcher_picks_up_a_changed_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"models":[],"default_model":"OLD"}"#).unwrap();
+
+        let watcher = CatalogWatcher::new(path.clone());
+        assert_eq!(watcher.current().default_model.as_deref(), Some("OLD"));
+
+        // 改 mtime + size 都变，确保指纹判定必然不同。
+        std::fs::write(&path, r#"{"models":[],"default_model":"NEWER-VALUE"}"#).unwrap();
+        assert_eq!(
+            watcher.current().default_model.as_deref(),
+            Some("NEWER-VALUE")
+        );
+    }
+
+    /// 坏文件必须保留上一次可用值，**且不推进指纹**——这样文件修好后下一次
+    /// `current()` 立即生效（本修复的核心行为）。
+    #[test]
+    fn watcher_keeps_last_known_good_across_a_corrupt_file_and_heals() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"models":[],"default_model":"GOOD"}"#).unwrap();
+
+        let watcher = CatalogWatcher::new(path.clone());
+        let good = watcher.current();
+        assert_eq!(good.default_model.as_deref(), Some("GOOD"));
+
+        // 坏文件：保留旧值（同一个 Arc），不 panic、不变空。
+        std::fs::write(&path, "{ broken").unwrap();
+        let during = watcher.current();
+        assert!(
+            std::sync::Arc::ptr_eq(&good, &during),
+            "a corrupt file must keep the last known good catalog"
+        );
+        assert_eq!(during.default_model.as_deref(), Some("GOOD"));
+
+        // 修好：下一次 current() 立即生效（不推进指纹的意义所在）。
+        std::fs::write(&path, r#"{"models":[],"default_model":"HEALED"}"#).unwrap();
+        assert_eq!(
+            watcher.current().default_model.as_deref(),
+            Some("HEALED"),
+            "a fixed file must take effect on the very next call"
+        );
+    }
+
+    /// 文件被删除是明确信号（不是损坏）：采纳空清单、回退 cfg。
+    #[test]
+    fn watcher_adopts_an_absent_file_as_empty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"models":[],"default_model":"X"}"#).unwrap();
+
+        let watcher = CatalogWatcher::new(path.clone());
+        assert_eq!(watcher.current().default_model.as_deref(), Some("X"));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            watcher.current().default_model.is_none(),
+            "a deleted file means 'no configured catalog', not 'keep the old one'"
+        );
+    }
+
+    /// `from_catalog` 是固定快照：即便磁盘变了也不重读（测试与「本就持有清单」的调用方用它）。
+    #[test]
+    fn from_catalog_is_a_fixed_snapshot() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, r#"{"models":[],"default_model":"DISK"}"#).unwrap();
+
+        let fixed = ModelCatalog {
+            models: Vec::new(),
+            default_model: Some("PINNED".into()),
+            subagent_model: None,
+        };
+        let watcher = CatalogWatcher::from_catalog(path, fixed);
+        let a = watcher.current();
+        let b = watcher.current();
+        assert_eq!(a.default_model.as_deref(), Some("PINNED"));
+        assert!(std::sync::Arc::ptr_eq(&a, &b));
     }
 }
 
