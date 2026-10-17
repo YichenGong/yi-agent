@@ -1712,21 +1712,32 @@ fn rebuild_driver_agent(
 /// would differ (Task 8 review R2 residual). Matching `default_model` here keeps
 /// them one rule.
 ///
-/// Deliberately only handles the **effort** field. The TUI keeps resolving
-/// provider / api_url / api_key / model from env+overrides at startup, so
-/// pulling those from the catalog here would be a behavior change beyond this
-/// fix.
+/// Deliberately only handles the **effort** and **api_style** fields. The TUI
+/// keeps resolving provider / api_url / api_key / model from env+overrides at
+/// startup, so pulling those from the catalog here would be a behavior change
+/// beyond this fix.
+///
+/// `api_style` is included because it is the same class of bug as effort: the
+/// catalog entry that `/model` and `/effort` report must be the one the request
+/// actually uses. Without it, a `"chat"` entry (the only channel that
+/// round-trips DeepSeek's `reasoning_content`, spec §8.2) was silently ignored
+/// at startup — `RuntimeConfig.api_style` stayed at `load_inner`'s hardcoded
+/// `Auto`, which targets `/responses`. A silent entry leaves the startup default
+/// untouched (zero regression for catalogs that don't set the field).
 fn startup_config_from_catalog(
     config: &config::Config,
     catalog: &yi_agent_runtime::models::ModelCatalog,
 ) -> config::Config {
-    let Some(effort) = yi_agent_runtime::models::effective_entry(catalog, None)
-        .and_then(|entry| entry.reasoning_effort.clone())
-    else {
+    let Some(entry) = yi_agent_runtime::models::effective_entry(catalog, None) else {
         return config.clone();
     };
     let mut resolved = config.clone();
-    resolved.reasoning_effort = Some(effort);
+    if let Some(effort) = entry.reasoning_effort.clone() {
+        resolved.reasoning_effort = Some(effort);
+    }
+    if let Some(style) = entry.api_style.as_deref() {
+        resolved.api_style = yi_agent_core::ApiStyle::parse(style);
+    }
     resolved
 }
 
@@ -3021,6 +3032,62 @@ mod tests {
         let (reported, _) = crate::tui::app::resolve_effort_state(None, &loud, None);
         assert_eq!(sent.as_deref(), Some("low"));
         assert_eq!(sent, reported);
+    }
+
+    /// Startup must adopt the catalog entry's `api_style`, not just its
+    /// `reasoning_effort`.
+    ///
+    /// `startup_config_from_catalog` originally mirrored only the effort field
+    /// (its doc comment says so explicitly), leaving `RuntimeConfig.api_style`
+    /// at the hardcoded `Auto` that `load_inner` sets. `Auto` targets
+    /// `/responses` for an unknown gateway, so a catalog entry pinned to
+    /// `"chat"` — the only channel that round-trips DeepSeek's
+    /// `reasoning_content` (spec §8.2) — was silently ignored at CLI/TUI
+    /// startup while the desktop and the TUI's `/model` switch honored it. The
+    /// two entry-selection sites must agree on `api_style` exactly as they do
+    /// on effort.
+    #[test]
+    fn startup_adopts_the_entries_api_style() {
+        use yi_agent_core::ApiStyle;
+        use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
+        let entry = |name: &str, style: Option<&str>| ModelEntry {
+            name: name.into(),
+            provider: ModelProvider::Openai,
+            api_url: "https://llmapi.horizon.auto/v1".into(),
+            model: name.into(),
+            api_key: "sk-secret".into(),
+            api_style: style.map(str::to_string),
+            reasoning_effort: None,
+        };
+        let catalog = |default: &str| ModelCatalog {
+            models: vec![
+                entry("HORIZON-DeepSeek", Some("chat")),
+                entry("HORIZON-OG-Luna", Some("responses")),
+            ],
+            default_model: Some(default.into()),
+            subagent_model: None,
+        };
+
+        // The default entry declares "chat": startup must send it (today it
+        // silently stays `Auto` -> `/responses`, the reported bug).
+        let mut config = test_config();
+        config.api_style = ApiStyle::Auto; // `load_inner`'s hardcoded default
+        let sent = startup_config_from_catalog(&config, &catalog("HORIZON-DeepSeek")).api_style;
+        assert_eq!(sent, ApiStyle::Chat);
+
+        // A different default entry's style flows through too.
+        let sent = startup_config_from_catalog(&config, &catalog("HORIZON-OG-Luna")).api_style;
+        assert_eq!(sent, ApiStyle::Responses);
+
+        // An entry that is silent on `api_style` leaves the startup default
+        // (`Auto`) untouched — zero regression for catalogs that don't set it.
+        let silent = ModelCatalog {
+            models: vec![entry("HORIZON-X", None)],
+            default_model: Some("HORIZON-X".into()),
+            subagent_model: None,
+        };
+        let sent = startup_config_from_catalog(&config, &silent).api_style;
+        assert_eq!(sent, ApiStyle::Auto);
     }
 
     #[test]
