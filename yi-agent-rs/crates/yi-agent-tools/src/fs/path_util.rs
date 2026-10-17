@@ -54,7 +54,7 @@ fn lexical_contained_in_any(normalized: &Path, roots: &[PathBuf]) -> bool {
     }
 }
 
-/// 多根版 [`resolve_and_check`]：相对路径拼**主根**（`roots[0]`），
+/// 多根版 [`resolve_and_check_roots`]：相对路径拼**主根**（`roots[0]`），
 /// 包含检查要求落在**任一根**之内。
 ///
 /// - Absolute paths are interpreted as-is (but must still be inside a root).
@@ -127,7 +127,7 @@ pub fn resolve_and_check_roots(roots: &[PathBuf], path: &str) -> Result<PathBuf,
     Ok(resolved)
 }
 
-/// 多根版 [`resolve_for_write`]。
+/// 多根版 [`resolve_for_write_roots`]。
 ///
 /// Like `resolve_and_check_roots` but allows the target path (and parent dirs)
 /// to not exist yet. Used by WriteTool which creates parent directories as
