@@ -2429,7 +2429,7 @@ where
                             &onboarding_env_path, &onboarding_preferences_path, &board_dir,
                             &resident_dir, &plugin_command, &watchman_home, &watchman_install,
                             &watchman_uninstall, &board_launcher, &mut uploads, &mut threads,
-                            &workspaces, &pairing,
+                            &workspaces, &pairing, &pending_activation,
                         )
                     };
                 }
@@ -2517,6 +2517,16 @@ where
                     crate::rpc::Domain::Pair => {
                         let mut state = app_state!();
                         match crate::rpc::pair::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    crate::rpc::Domain::Turn => {
+                        let mut state = app_state!();
+                        match crate::rpc::turn::handle(&mut state, &req, id.clone()).await? {
                             // 已搬移的域在应答后一律回下一轮(等价于搬移前的
                             // `continue`)。
                             crate::rpc::Flow::Continue => continue,
@@ -3978,116 +3988,6 @@ where
                             Err(_) => json!({"status": "failed", "error": "thread driver dropped"}),
                         };
                         write_response(&hub, &client, ok_response(id, result)).await?;
-                    }
-                    "turn/start" => {
-                        // 校验 / 占 `active_turn_id` / turn/started / Running 状态 /
-                        // 响应 / 投递 prompt 全在 start_turn_core 内,顺序与抽取前一致;
-                        // `Ok(None)` 表示已写过错误响应,这里 continue。
-                        if start_turn_core(
-                            &mut threads,
-                            &pending_activation,
-                            &mut uploads,
-                            &hub,
-                            &client,
-                            &req.params,
-                            id,
-                        )
-                        .await?
-                        .is_none()
-                        {
-                            continue;
-                        }
-                    }
-                    "turn/interrupt" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        let Some(session) = threads.get(&thread_id) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::unknown_thread(&thread_id)),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        if let Some(turn_id) = session.active_turn_id.clone() {
-                            // 幂等 level 信号:用 try_send 避免主循环在满队列上阻塞。
-                            let _ = session.interrupt_tx.try_send(turn_id);
-                        }
-                        write_response(&hub, &client, ok_response(id, json!({}))).await?;
-                    }
-                    "turn/interject" => {
-                        let Some(thread_id) =
-                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
-                        else {
-                            continue;
-                        };
-                        let text = match extract_prompt(&req.params) {
-                            Some(p) => p,
-                            None => {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(
-                                        id,
-                                        RpcError::invalid_params("missing or empty input text"),
-                                    ),
-                                )
-                                .await?;
-                                continue;
-                            }
-                        };
-                        // 单值 `active_turn_id` 决定了"往哪一轮追加":没有活跃 turn
-                        // 就没有可并入的上下文,返回 -32013 让客户端改走 turn/start。
-                        let (tx, turn_id) = {
-                            let Some(session) = threads.get(&thread_id) else {
-                                write_response(
-                                    &hub, &client,
-                                    err_response(id, RpcError::unknown_thread(&thread_id)),
-                                )
-                                .await?;
-                                continue;
-                            };
-                            match session.active_turn_id.clone() {
-                                Some(turn_id) => (session.interject_tx.clone(), turn_id),
-                                None => {
-                                    write_response(
-                                        &hub, &client,
-                                        err_response(id, RpcError::not_running()),
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                            }
-                        };
-                        let interjection_id =
-                            format!("interject-{}-{}", turn_id, uuid::Uuid::new_v4());
-                        if tx
-                            .send(InterjectionRequest {
-                                turn_id: turn_id.clone(),
-                                interjection_id: interjection_id.clone(),
-                                text,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            // driver 已退出:没有接收方,按"没有活跃 turn"报。
-                            write_response(&hub, &client, err_response(id, RpcError::not_running()))
-                                .await?;
-                            continue;
-                        }
-                        write_response(
-                            &hub, &client,
-                            ok_response(
-                                id,
-                                json!({
-                                    "turn_id": turn_id,
-                                    "interjection_id": interjection_id,
-                                }),
-                            ),
-                        )
-                        .await?;
                     }
                     "agent/children/list" => {
                         let Some(thread_id) =

@@ -20,6 +20,7 @@ pub(crate) mod onboarding;
 pub(crate) mod pair;
 pub(crate) mod plugin;
 pub(crate) mod process;
+pub(crate) mod turn;
 pub(crate) mod ui;
 pub(crate) mod workspace;
 
@@ -35,6 +36,7 @@ use crate::protocol::Scope;
 use crate::session::ThreadSession;
 use crate::theme_tool::ThemeHandle;
 use crate::workspace_index::WorkspaceIndex;
+use yi_agent_subagent::thread_root::ThreadRoot;
 
 /// 值守安装句柄。与 `server.rs` 里的私有 `type WatchmanInstall` 是**同一个**
 /// 类型(同一个 `Arc<dyn Fn ..>`),在对齐处互换无碍——故这里重声明一份,省下
@@ -93,6 +95,8 @@ pub(crate) enum Domain {
     Process,
     /// `pair/*` 与 `device/*`(共享同一 `Arc<PairingState>`,故同域)。
     Pair,
+    /// `turn/*`。
+    Turn,
     /// 未搬移(含 `initialize`)。
     Unknown,
 }
@@ -115,6 +119,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("process") => Domain::Process,
         Some("pair") => Domain::Pair,
         Some("device") => Domain::Pair,
+        Some("turn") => Domain::Turn,
         _ => Domain::Unknown,
     }
 }
@@ -190,6 +195,9 @@ pub(crate) struct AppState<'a> {
     /// `device/list`/`device/revoke` 读写同一张表(与 ws 升级时的 `?pair=` 等价)。
     /// 搬移前臂里的 `pairing`,由调用方注入。
     pub(crate) pairing: &'a Arc<PairingState>,
+    /// attach 产出、待该 thread 的首个 turn 激活的 runtime。`turn/start` 经
+    /// `start_turn_core` 读取它。搬移前臂里的 `pending_activation`;只读借用。
+    pub(crate) pending_activation: &'a HashMap<String, Option<Arc<ThreadRoot>>>,
 }
 
 impl<'a> AppState<'a> {
@@ -218,6 +226,7 @@ impl<'a> AppState<'a> {
         threads: &'a mut HashMap<String, ThreadSession>,
         workspaces: &'a Arc<WorkspaceIndex>,
         pairing: &'a Arc<PairingState>,
+        pending_activation: &'a HashMap<String, Option<Arc<ThreadRoot>>>,
     ) -> Self {
         Self {
             hub,
@@ -239,6 +248,7 @@ impl<'a> AppState<'a> {
             threads,
             workspaces,
             pairing,
+            pending_activation,
         }
     }
 }
