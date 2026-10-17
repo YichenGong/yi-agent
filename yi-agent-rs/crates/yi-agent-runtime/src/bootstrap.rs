@@ -89,7 +89,7 @@ pub fn build_prompt_setup(cfg: &RuntimeConfig) -> Result<PromptSetup> {
     let catalog = build_catalog_handle(cfg, &skills);
     let system_prompt = match &catalog {
         Some(handle) => handle.current_system_prompt(),
-        None => resolve_system_prompt(cfg.system_prompt.clone()),
+        None => resolve_system_prompt(cfg.system_prompt.clone(), &cfg.workdir),
     };
     Ok(PromptSetup {
         skills,
@@ -422,15 +422,49 @@ pub fn load_permission_checker_with_switch(
     )))
 }
 
+/// Read the project instructions file at the workdir root.
+///
+/// Only `<workdir>/AGENTS.md` is read: parent directories are deliberately not
+/// searched, so a nested workdir never silently inherits an unrelated project's
+/// rules. A missing file is the normal case (non-git directories, projects that
+/// never wrote instructions) and yields `None`; any other I/O failure is logged
+/// and treated as absent, because project instructions must never be able to
+/// take down the agent.
+fn load_project_instructions(workdir: &Path) -> Option<String> {
+    let path = workdir.join("AGENTS.md");
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), "failed to read project instructions: {error}");
+            None
+        }
+    }
+}
+
 /// Resolve the effective system prompt: fall back to the built-in default
-/// when the user did not provide one. The current local date is appended to
-/// the end so the model knows today's date; placed at the tail to avoid
-/// disrupting the cached prefix of the prompt.
-fn resolve_system_prompt(user: Option<String>) -> Option<String> {
+/// when the user did not provide one. Project instructions from
+/// `<workdir>/AGENTS.md` are appended next, then the current local date at the
+/// tail so the model knows today's date without disrupting the cached prefix.
+///
+/// Order is deliberate and test-pinned: default → user → project → date. The
+/// project block comes after the user's own prompt because it is repository
+/// state, not model-native instruction, and is labelled as such.
+///
+/// Regression note: this loading was silently dropped when
+/// `34c63d2c merge: integrate subagent runtime` resolved the prompt helper in
+/// favour of a side that never carried it, so every later caller compiled
+/// without a `workdir` argument and the feature stayed gone. The tests below
+/// exist to make that loss impossible to repeat unnoticed.
+fn resolve_system_prompt(user: Option<String>, workdir: &Path) -> Option<String> {
     let mut base = yi_agent_core::AgentConfig::default_system_prompt();
     if let Some(user) = user {
         base.push_str("\n\nUser-provided instructions:\n");
         base.push_str(&user);
+    }
+    if let Some(instructions) = load_project_instructions(workdir) {
+        base.push_str("\n\nProject instructions (AGENTS.md):\n");
+        base.push_str(&instructions);
     }
     let today = chrono::Local::now().format("%Y-%m-%d");
     Some(format!("{base}\n\nCurrent date: {today}"))
@@ -494,7 +528,7 @@ fn build_catalog_handle(
     );
     Some(SkillsCatalogHandle {
         service,
-        base_prompt: resolve_system_prompt(cfg.system_prompt.clone()),
+        base_prompt: resolve_system_prompt(cfg.system_prompt.clone(), &cfg.workdir),
         budget,
     })
 }
@@ -885,7 +919,10 @@ mod tests {
 
     #[test]
     fn resolve_system_prompt_none_uses_default() {
-        let resolved = resolve_system_prompt(None);
+        // 用一个没有 AGENTS.md 的临时目录,隔离掉项目指令,以免宿主仓库的
+        // AGENTS.md 混进断言。
+        let project = tempfile::TempDir::new().unwrap();
+        let resolved = resolve_system_prompt(None, project.path());
         let default = yi_agent_core::AgentConfig::default_system_prompt();
         // The resolved prompt should start with the default prompt and have
         // the current date appended at the end.
@@ -902,7 +939,8 @@ mod tests {
 
     #[test]
     fn resolve_system_prompt_custom_keeps_base_instructions() {
-        let resolved = resolve_system_prompt(Some("custom".into()));
+        let project = tempfile::TempDir::new().unwrap();
+        let resolved = resolve_system_prompt(Some("custom".into()), project.path());
         let default = yi_agent_core::AgentConfig::default_system_prompt();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         assert!(
@@ -911,6 +949,80 @@ mod tests {
                 && r.ends_with(&today)),
             "resolved should retain base instructions, append custom prompt, and end with date: {resolved:?}"
         );
+    }
+
+    /// 项目指令注入：`<workdir>/AGENTS.md` 必须在 user prompt 之后、日期之前
+    /// 进入 system prompt。这条行为曾在 2026-08-15 的一次整合
+    /// （`34c63d2c merge: integrate subagent runtime`）中被静默丢弃，本测试
+    /// 钉住恢复后的顺序契约，防止再次被 merge 悄悄吃掉。
+    #[test]
+    fn resolve_system_prompt_appends_root_agents_md_after_custom_instructions() {
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("AGENTS.md"),
+            "Always run focused tests.",
+        )
+        .expect("write AGENTS.md");
+
+        let resolved = resolve_system_prompt(Some("Use concise output.".into()), project.path());
+        let prompt = resolved.expect("normal mode should have a system prompt");
+
+        assert!(prompt.contains("User-provided instructions:\nUse concise output."));
+        assert!(prompt.contains("Project instructions (AGENTS.md):\nAlways run focused tests."));
+        assert!(
+            prompt.find("User-provided instructions:").unwrap()
+                < prompt.find("Project instructions (AGENTS.md):").unwrap(),
+            "project instructions come after the user prompt"
+        );
+        assert!(
+            prompt.find("Project instructions (AGENTS.md):").unwrap()
+                < prompt.find("Current date:").unwrap(),
+            "project instructions come before the date"
+        );
+    }
+
+    /// 缺失时不得注入任何标记，也不得报错（非 git / 无 AGENTS.md 的项目照常工作）。
+    #[test]
+    fn resolve_system_prompt_ignores_missing_root_agents_md() {
+        let project = tempfile::TempDir::new().unwrap();
+        let prompt = resolve_system_prompt(None, project.path())
+            .expect("normal mode should have a system prompt");
+
+        assert!(!prompt.contains("Project instructions"));
+    }
+
+    /// 只读项目根的 `AGENTS.md`：不得向上搜索父目录的 AGENTS.md。
+    #[test]
+    fn resolve_system_prompt_does_not_search_parent_directories() {
+        let parent = tempfile::TempDir::new().unwrap();
+        std::fs::write(parent.path().join("AGENTS.md"), "parent rules").unwrap();
+        let child = parent.path().join("nested");
+        std::fs::create_dir_all(&child).unwrap();
+
+        // 子目录没有自己的 AGENTS.md，父目录的不得被采用。
+        // 注意：TempDir 的路径可能经过符号链接（macOS 的 /var -> /private/var），
+        // 因此用 canonicalize 后的 child 作 workdir。
+        let workdir = child.canonicalize().unwrap();
+        let prompt =
+            resolve_system_prompt(None, &workdir).expect("normal mode should have a prompt");
+        assert!(
+            !prompt.contains("parent rules"),
+            "only the workdir's own AGENTS.md may be loaded, got: {prompt}"
+        );
+    }
+
+    /// workdir 下的 AGENTS.md 读取失败（如它是目录）必须降级为非致命：
+    /// 只记警告，prompt 照常生成。
+    #[test]
+    fn resolve_system_prompt_survives_an_unreadable_agents_md() {
+        let project = tempfile::TempDir::new().unwrap();
+        // 把 AGENTS.md 建成目录：`read_to_string` 会以非 NotFound 的错误失败。
+        std::fs::create_dir_all(project.path().join("AGENTS.md")).unwrap();
+
+        let prompt = resolve_system_prompt(None, project.path())
+            .expect("an unreadable AGENTS.md must not remove the system prompt");
+        assert!(prompt.contains("Current date:"));
+        assert!(!prompt.contains("Project instructions"));
     }
 
     #[test]
@@ -945,12 +1057,49 @@ mod tests {
         assert!(build_catalog_handle(&cfg, &None).is_none());
     }
 
+    /// catalog 路径（几乎所有正常启动都走它）必须同样带上项目指令：
+    /// `build_catalog_handle` 把 `resolve_system_prompt(workdir)` 的结果作为
+    /// `base_prompt`，catalog 非空时拼在它后面。这条测试钉住「项目指令在
+    /// catalog 路径下不丢」，因为只修 `build_prompt_setup` 是修不到这里的。
+    #[test]
+    fn catalog_handle_carries_project_instructions_into_the_catalog_prompt() {
+        let mut cfg = sample_config();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            project.path().join("AGENTS.md"),
+            "MAGIC-PROJECT-RULE: always cite evidence.",
+        )
+        .unwrap();
+        cfg.workdir = project.path().to_path_buf();
+
+        // 一个非空的 skills service,迫使 prompt 走 catalog 拼接分支。
+        let skills_dir = project.path().join(".yi-agent/skills");
+        write_skills(&skills_dir, 1, 20);
+        let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![(
+            skills_dir,
+            yi_agent_skills::SkillScope::Project,
+        )]));
+        let handle = build_catalog_handle(&cfg, &Some(svc)).expect("handle");
+
+        let prompt = handle.current_system_prompt().expect("prompt");
+        assert!(
+            prompt.contains(
+                "Project instructions (AGENTS.md):\nMAGIC-PROJECT-RULE: always cite evidence."
+            ),
+            "project instructions must survive the catalog path, got: {prompt}"
+        );
+        assert!(prompt.contains("## Skills"), "catalog is still appended");
+    }
+
     #[test]
     fn catalog_handle_empty_catalog_returns_base_prompt() {
         let cfg = sample_config();
         let svc = Arc::new(yi_agent_skills::SkillsService::new(vec![]));
         let handle = build_catalog_handle(&cfg, &Some(svc)).expect("handle");
-        assert_eq!(handle.current_system_prompt(), resolve_system_prompt(None));
+        assert_eq!(
+            handle.current_system_prompt(),
+            resolve_system_prompt(None, &cfg.workdir)
+        );
     }
 
     #[test]
