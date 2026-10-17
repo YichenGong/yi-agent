@@ -2026,7 +2026,7 @@ mod tests {
         );
 
         // 会话自身**不**被请求副本的剥离波及:历史仍留着凭证(落盘/展示的权威)。
-        let session_sigs = sigs(&agent.session().messages().to_vec());
+        let session_sigs = sigs(agent.session().messages());
         assert!(
             session_sigs.contains(&"SIG-1".to_string())
                 && session_sigs.contains(&"SIG-2".to_string()),

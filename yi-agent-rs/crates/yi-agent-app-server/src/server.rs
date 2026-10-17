@@ -6119,7 +6119,7 @@ async fn persist_and_finish_turn(
     let persisted_messages = if agent.config().preserve_thinking {
         agent.session().messages().to_vec()
     } else {
-        yi_agent_core::strip_thinking(&agent.session().messages().to_vec())
+        yi_agent_core::strip_thinking(agent.session().messages())
     };
     let record = crate::thread_store::TurnLine::Turn {
         items,
@@ -6371,7 +6371,7 @@ async fn apply_session_command(
             // 开关语义直接矛盾（spec §4.1）。`set_session_messages` 与
             // `session_handle()` 摸的是同一个 `Arc<Mutex<Session>>`，故先写后取。
             if !preserve {
-                let stripped = yi_agent_core::strip_thinking(&agent.session().messages().to_vec());
+                let stripped = yi_agent_core::strip_thinking(agent.session().messages());
                 agent.set_session_messages(stripped);
             }
             let mut next_config = agent.config().clone();

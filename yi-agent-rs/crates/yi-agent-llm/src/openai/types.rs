@@ -250,11 +250,10 @@ impl From<ProviderRequest> for OpenaiRequest {
                         .content
                         .iter()
                         .filter_map(|b| match b {
-                            ContentBlock::Thinking { text, token }
-                                if matches!(token, yi_agent_core::ThinkingToken::None) =>
-                            {
-                                Some(text.as_str())
-                            }
+                            ContentBlock::Thinking {
+                                text,
+                                token: yi_agent_core::ThinkingToken::None,
+                            } => Some(text.as_str()),
                             _ => None,
                         })
                         .collect();
