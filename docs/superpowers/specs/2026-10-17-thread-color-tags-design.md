@@ -174,18 +174,32 @@ TagChanged { thread_id: String, tag: Option<String> },
 
 #### 3.3.5 标签名的读写（走既有 `ui/settings/*`）
 
-- `ui/settings/read`（`server.rs:2479`）回包增加 `"tag_names"`：把磁盘上的部分覆盖
-  与内置默认名合并后的**完整 6 键映射**返回（前端可直接用，不必自己回退）。
+- `ui/settings/read`（`server.rs:2479`）回包增加 `"tag_names"`：磁盘上**用户实际
+  留下的覆盖项**（可能只有 1 个键，也可能为空对象）。**不是**合并后的完整映射——
+  默认名由前端唯一持有（见 §3.4.1），服务端不重复定义一套中文默认名，避免两处
+  默认名必须手工保持同步。
 - `ui/settings/write`（`server.rs:2506`）接受可选 `tag_names`。校验：
   - 键必须是 6 个合法 id 之一，否则 `-32602`；
   - 值必须是字符串，`trim` 后非空，长度上限 24 字符（防超长撑破菜单），否则
     `-32602`；
-  - 落盘写**合并后的完整映射**（读旧值 → 覆盖本次给的键 → 写回），保证后续读取
-    无需再猜。
-- 名字变更后广播既有 `ui/settings/updated`（该通知是全局帧，`Delivery::Global`）。
-  **注意**：现有 `UiSettingsUpdated { theme }` 只带 theme 字段。为使另一台设备改
-  名字后本端即时刷新，把该通知扩展为可选的 `tag_names` 字段（`#[serde(skip_serializing_if
-  = "Option::is_none")]`），不带时行为与现状完全一致，旧客户端忽略新字段。
+  - 校验通过后把这些键**逐个合并**进已存映射（不删除未提及的键），再原子落盘。
+- 名字变更成功后广播一条**独立**通知 `ui/tagNames/updated`：
+
+```rust
+/// 标签显示名（颜色 id → 名称）已变。与 `ui/settings/updated`（主题）同为
+/// **全局**帧：改名字是对所有会话生效的宿主级偏好，任何线程上下文都无关。
+#[serde(rename = "ui/tagNames/updated")]
+TagNamesUpdated { tag_names: std::collections::BTreeMap<String, String> },
+```
+
+  - `thread_key()` → `None`；`delivery()` → `Delivery::Global`。
+  - **为什么不挤进 `UiSettingsUpdated`**：那条通知由主题 watcher 从
+    `broadcast::Sender<Theme>` 通道泵出（`server.rs:2127`），语义是「主题变了」；
+    而标签名只经 `ui/settings/write` 变更、没有 watcher。硬塞进去会让该通知的值
+    时而带 `tag_names`、时而不带（watcher 路径没有它），语义含混。独立通知还
+    省掉了改动既有变体及其多个构造点。
+  - 携带**权威覆盖映射**（而非「该重读了」提示）：内容很短，就地落笔比重读
+    `ui/settings/read` 便宜，与 `thread/titleChanged` 同一取向。
 
 ### 3.4 前端
 
@@ -193,27 +207,36 @@ TagChanged { thread_id: String, tag: Option<String> },
 
 - `protocol.ts`：`ThreadSummary` 增加 `tag?: string | null`；
   `Notification` 联合类型增加 `thread/tagChanged`
-  （`{ thread_id: string; tag: string | null }`）；`ui/settings/updated` 通知类型
-  增加可选 `tag_names`。
+  （`{ thread_id: string; tag: string | null }`）与 `ui/tagNames/updated`
+  （`{ tag_names: Record<string, string> }`）。
 - 新模块 `desktop/src/lib/threadTags.ts`：纯函数 + 常量，无 React、无 RPC：
   - `TAG_IDS`（6 个 id 的固定顺序数组）
-  - `DEFAULT_TAG_NAMES`（id → 默认中文名）
-  - `TAG_DOT_CLASS`（id → 色点 class）
-  - `tagName(id, names)`：查表，未知 id / 缺失时回退默认名
-  - `isValidTagId(v)`：用于渲染前过滤脏数据
+  - `DEFAULT_TAG_NAMES`（id → 默认中文名）；`TAG_DOT_CLASS`（id → 色点 class）
+  - `isValidTagId(v)`：类型守卫，用于渲染前过滤脏数据
+  - `resolveTagNames(overrides)`：把服务端给的**部分覆盖**合成完整 6 键映射，
+    缺失键回退 `DEFAULT_TAG_NAMES`。这是**默认名的唯一权威定义处**——Rust 侧
+    不做同样的事（否则两套中文默认名必须手工保持一致）。
+  - `tagLabel(id, names)`：查表取名，未知 id / 缺失时回退默认名
 
 #### 3.4.2 行内色点
 
 `ThreadSidebar` 的 `renderThread`：在 `StatusBadge` 之后、标题之前插入
 
 ```tsx
-{t.tag ? <span aria-label={tagName(t.tag, tagNames)}
-               className={`size-2 shrink-0 rounded-full ${TAG_DOT_CLASS[t.tag]}`} /> : null}
+{isValidTagId(t.tag) ? (
+  <span
+    data-thread-tag={t.tag}
+    aria-label={tagLabel(t.tag, tagNames)}
+    title={tagLabel(t.tag, tagNames)}
+    className={`size-2 shrink-0 rounded-full ${TAG_DOT_CLASS[t.tag]}`}
+  />
+) : null}
 ```
 
 - 规格与既有未读点一致（`size-2 rounded-full`），视觉上同一族。
-- **合法性防御**：`t.tag` 不是合法 id 时（手工改坏 meta）不渲染，而不是渲染成
-  透明 / 错色。
+- **合法性防御**：`t.tag` 不是合法 id 时（手工改坏 meta / 旧字段）不渲染，而不是
+  渲染成透明 / 错色。`isValidTagId` 同时充当类型守卫，故 `TAG_DOT_CLASS[t.tag]`
+  的索引是类型安全的。
 - 无标签 → 渲染 `null`，**布局逐像素不变**（不占位）。
 
 #### 3.4.3 打开菜单：桌面右键（新增）+ 移动长按（沿用）
@@ -296,10 +319,17 @@ query），由 `ThreadSidebar` 从 App 传入。
 三条更新路径：
 
 1. **首屏 / 每次重连握手**：`ui/settings/read` 已在握手序列中调用
-   （`App.tsx:1486`），把 `tag_names` 一并读出并 `setTagNames`。缺字段时回退
-   `DEFAULT_TAG_NAMES`（旧服务端）。
-2. **本端改名字**：设置页提交成功 → 用回包给出的完整映射更新（服务端为权威）。
-3. **远端改名字**：收到 `ui/settings/updated` 且带 `tag_names` → `setTagNames`。
+   （`App.tsx:1486`），把 `tag_names` 一并读出，经 `resolveTagNames` 合成完整
+   映射后 `setTagNames`。字段缺失或形状不对（旧服务端）→ 全默认名。
+2. **本端改名字**：设置页提交成功后，本地立即用 `resolveTagNames(提交后的合并
+   映射)` 更新；服务端回归的广播是权威的第二道确认。
+3. **远端改名字**：收到 `ui/tagNames/updated` → `resolveTagNames(n.params.tag_names)`
+   → `setTagNames`。
+
+**不需要 `touched` 守卫**（对比 theme / watchman 的 `themeTouchedRef` 处理）：那两个
+偏好是「用户可能正在拨开关」的控件，迟到的 read 会覆盖正在进行的操作；而标签名只在
+模态设置页里编辑，且改名的写路径（`ui/settings/write`）本身权威、并会广播新值，
+迟到的 read 与它竞争的最坏结果是短暂显示旧名，下一次通知即纠正。故此处从简。
 
 **不需要 `touched` 守卫**（对比 theme / watchman 的 `themeTouchedRef` 处理）：那两个
 偏好是「用户可能正在拨开关」的控件，迟到的 read 会覆盖正在进行的操作；而标签名只在
@@ -323,9 +353,10 @@ query），由 `ThreadSidebar` 从 App 传入。
 
 用户改标签名「红」→「紧急」
   → 设置页 ui/settings/write { tag_names: { red: "紧急" } }
-     → settings_store 读-改-写 preferences.json（逐键合并）
-     → 广播 ui/settings/updated（Delivery::Global，带 tag_names）
-  → 两端：菜单 aria-label、行内色点 title、搜索文本全部即时跟上
+     → settings_store 读-改-写 preferences.json（逐键合并，保留既有覆盖）
+     → 广播 ui/tagNames/updated（Delivery::Global，带权威覆盖映射）
+  → 两端：resolveTagNames 合成完整映射 → 菜单 aria-label、行内色点 title、
+     搜索文本全部即时跟上
   → 已打 red 的会话**不受影响**（存的是 id，不是名字）
 ```
 
@@ -337,11 +368,12 @@ query），由 `ThreadSidebar` 从 App 传入。
 | 旧服务端（无 tag 字段） | 前端 `ThreadSummary.tag` 为 `undefined` → 按无标签渲染 |
 | 旧客户端收到 `tag` 字段 | 忽略（结构体无 `deny_unknown_fields`），不影响 |
 | meta 里 `tag` 是未知 id | 不渲染色点；搜索不并入；不报错、不崩 |
-| `preferences.json` 里 `tag_names` 是坏 JSON | 回退全部默认名（既有 `settings_store` 的容错约定） |
+| `preferences.json` 里 `tag_names` 是坏 JSON | `load_tag_names` 返回空映射 → 前端全用默认名（既有 `settings_store` 的容错约定） |
 | `tag_names` 某键值超长 / 空串 | `ui/settings/write` 拒绝，`-32602`，磁盘不变 |
 | 会话被删除 | 其 tag 随 meta 文件一起消失，无残留 |
 | 同一会话两端同时改 | 后到的写赢（读-改-写锁串行），两端最终由各自重拉 / 通知收敛到同一值 |
 | 打标签是否会顶到列表前面 | 否。`set_tag` 不刷新 `updated_at`，时间语义不被篡改 |
+| 旧客户端收到 `ui/tagNames/updated` | 未知通知方法，忽略（前端 `if (n.method === ...)` 逐个分支，无 else 兜底报错） |
 
 ## 4. 测试
 
@@ -356,60 +388,85 @@ query），由 `ThreadSidebar` 从 App 传入。
 4. `legacy_meta_without_tag_deserializes_to_none`——旧格式 JSON（无 `tag` 键）
    读出来是 `None`。
 
+`settings_store.rs`：
+
+5. `load_tag_names_returns_empty_map_when_absent`——无 `tag_names` 键 → 空映射
+   （不是错误、不是 panic）。
+6. `load_tag_names_returns_only_stored_overrides`——只写 1 个键 → 读回只有 1 个键
+   （**不**在后端补齐 6 个默认名）。
+7. `save_tag_names_merges_and_preserves_other_keys`——先存 `theme` + `relay_url`，
+   再 `save_tag_names({red})`，断言三者都在；再 `save_tag_names({blue})`，断言
+   `red` 与 `blue` 都在（合并而非替换）。
+
 `server.rs`（RPC 层，照 `set_pinned_*` 三个测试写）：
 
-5. `set_tag_persists_and_reports_in_list`——设 `red` 后 `thread/listAll` 里该条
+8. `set_tag_persists_and_reports_in_list`——设 `red` 后 `thread/listAll` 里该条
    `tag == "red"`。
-6. `set_tag_null_clears`。
-7. `set_tag_rejects_unknown_color_and_unknown_thread`——`tag: "chartreuse"` →
-   `-32602`；未知 threadId → `unknown_thread`。
-8. `set_tag_broadcasts_tag_changed`——断言收到 `thread/tagChanged` 且参数正确
-   （wire 形状：snake_case）。
-9. `ui_settings_read_returns_full_tag_names_with_defaults`——磁盘只覆盖 1 个键时，
-   回包仍是完整 6 键、其余为默认名。
-10. `ui_settings_write_rejects_invalid_tag_name_key_and_empty_value`。
-11. `ui_settings_write_merges_tag_names_preserving_other_prefs`——写 `tag_names`
-    不冲掉同文件的 `theme` / `relay_url`。
+9. `set_tag_null_clears`。
+10. `set_tag_rejects_unknown_color_and_unknown_thread`——`tag: "chartreuse"` →
+    `-32602`；未知 threadId → `unknown_thread`。
+11. `set_tag_broadcasts_tag_changed`——断言收到 `thread/tagChanged` 且参数正确
+    （wire 形状：snake_case）。
+12. `ui_settings_read_returns_tag_names_overrides`——磁盘只覆盖 1 个键时，回包
+    `tag_names` 恰有那 1 个键（默认名不来自后端）。
+13. `ui_settings_write_rejects_invalid_tag_name_key_and_empty_value`。
+14. `ui_settings_write_broadcasts_tag_names_updated`——写名字后收到
+    `ui/tagNames/updated`，带权威映射（wire 形状：`ui/tagNames/updated` +
+    `params.tag_names`）。
+
+`protocol.rs`：
+
+15. `tag_changed_notification_carries_method_and_tag`——wire 形状断言
+    （`thread/tagChanged`、`params.thread_id`、`params.tag`；`tag: null` 时
+    `params.tag == null`），且 `delivery() == List`、`thread_key() == Some(id)`。
+16. `tag_names_updated_notification_is_global`——`ui/tagNames/updated`、
+    `params.tag_names`、`delivery() == Global`、`thread_key() == None`。
 
 ### TypeScript（`npm test` / vitest，在 `desktop/`）
 
-12. `threadTags.test.ts`：`TAG_IDS` 恰 6 个且顺序固定；默认名表键集与 `TAG_IDS`
-    一致；`isValidTagId` 拒绝未知值 / `null` / 数字；`tagName` 未知 id 回退。
-13. `ThreadSidebar.test.tsx`：有 tag → 渲染色点且带正确 aria-label；无 tag →
-    不渲染色点（并断言标题节点不受影响）；非法 tag → 不渲染色点。
-14. `ThreadSidebar.test.tsx`：桌面右键会话行 → 打开菜单（`data-thread-menu`）；
-    点「红」→ 调用 `onSetTag(id, "red")`；点「无标签」→ `onSetTag(id, null)`；
-    当前 tag 对应的色点 `aria-checked="true"`。
-15. `ThreadSidebar.test.tsx`：移动端长按 → 同一菜单（回归：确认复用而非新开）。
-16. `threadSearch.test.ts`：搜标签名能命中对应会话；改过名的标签按其新名命中；
-    非法 tag 不影响搜索。
-17. `SettingsTagsTab.test.tsx`：改名字失焦 → 发 `ui/settings/write`；空串 → 不
-    提交且内联报错；IME 组合中的 Enter 不提交。
-18. `App.test.tsx`：收到 `thread/tagChanged` → 对应行的色点更新（通知路径）。
+17. `threadTags.test.ts`：`TAG_IDS` 恰 6 个且顺序固定；`DEFAULT_TAG_NAMES` 键集与
+    `TAG_IDS` 一致、每个值非空；`TAG_DOT_CLASS` 键集同上；`isValidTagId` 接受 6 个
+    id、拒绝未知串 / `null` / `undefined` / 数字 / 对象；`resolveTagNames({})` 等于
+    全默认；`resolveTagNames({ red: "紧急" })` 其余 5 个仍是默认名（不因部分覆盖而
+    丢键）；`tagLabel` 未知 id 回退默认名而不抛。
+18. `ThreadSidebar.test.tsx`：有 tag → 渲染色点（`[data-thread-tag="red"]`）且
+    `aria-label` 是当前名；无 tag → 无该节点（并断言标题节点不受影响）；非法 tag
+    （`tag: "chartreuse"`）→ 无该节点。
+19. `ThreadSidebar.test.tsx`：桌面右键会话行 → 打开菜单（`[data-thread-menu]`）；
+    点「红」→ `onSetTag(id, "red")`；点「无标签」→ `onSetTag(id, null)`；当前 tag
+    对应的色点 `aria-checked="true"`，其余为 `false`。
+20. `ThreadSidebar.test.tsx`：移动端长按 → 同一菜单（回归：确认复用而非新开）。
+21. `threadSearch.test.ts`：搜标签名命中对应会话；改过名后按新名命中（旧名不再
+    命中）；非法 tag 不影响搜索（不崩、不误命中）。
+22. `SettingsTagsTab.test.tsx`：改名字失焦 → 发 `ui/settings/write` 且
+    `params.tag_names` 只含改动键；空串 → 不提交且内联报错；IME 组合中的 Enter
+    不提交。
+23. `App.test.tsx`：收到 `thread/tagChanged` → 对应行的色点更新（通知路径）；
+    收到 `ui/tagNames/updated` → 行内色点的 `title` 变成新名。
 
 ### 手工验证
 
-19. 桌面右键 → 打「红」→ 行内立刻出红点；改成「蓝」→ 红点变蓝点；「无标签」→
+24. 桌面右键 → 打「红」→ 行内立刻出红点；改成「蓝」→ 红点变蓝点；「无标签」→
     色点消失。重启 app → 标签仍在（落盘生效）。
-20. 手机连同一 app-server：桌面改标签，手机侧栏**无需重连**即变色；反向亦然。
-21. 设置里把「红」改成「紧急」：两端菜单提示与搜索（搜「紧急」）立即跟上；
+25. 手机连同一 app-server：桌面改标签，手机侧栏**无需重连**即变色；反向亦然。
+26. 设置里把「红」改成「紧急」：两端菜单提示与搜索（搜「紧急」）立即跟上；
     已打红色的会话颜色不变。
-22. 打标签**不会**把会话顶到「最近更新」的最前面（`updated_at` 未变）。
+27. 打标签**不会**把会话顶到「最近更新」的最前面（`updated_at` 未变）。
 
 ## 5. 影响面
 
 | 层 | 文件 | 改动 |
 | --- | --- | --- |
 | 存储 | `thread_store.rs` | `ThreadMeta.tag`；`set_tag`；旧 meta 容错测试 |
-| 存储 | `settings_store.rs` | `load_tag_names` / `save_tag_names`（读-改-写合并） |
-| 协议 | `protocol.rs` | `Notification::TagChanged`；`UiSettingsUpdated` 增可选 `tag_names` |
-| 服务 | `server.rs` | `thread/setTag` 分支；`ui/settings/read\|write` 扩展；`thread_summary_json` 加 `tag`；广播点 |
-| 前端类型 | `lib/protocol.ts` | `ThreadSummary.tag`；通知联合类型 |
-| 前端常量 | `lib/threadTags.ts`（新） | 6 色 id / 默认名 / 色值 / 两个纯函数 |
+| 存储 | `settings_store.rs` | `load_tag_names` / `save_tag_names`（逐键合并，保留无关键） |
+| 协议 | `protocol.rs` | `Notification::TagChanged`（List）+ `Notification::TagNamesUpdated`（Global） |
+| 服务 | `server.rs` | `thread/setTag` 分支；`ui/settings/read\|write` 扩展；`thread_summary_json` 加 `tag`；`ui/tagNames/updated` 广播点 |
+| 前端类型 | `lib/protocol.ts` | `ThreadSummary.tag`；两条新通知的联合类型 |
+| 前端常量 | `lib/threadTags.ts`（新） | 6 色 id / 默认名 / 色值 / `resolveTagNames` / `isValidTagId` / `tagLabel` |
 | 前端 UI | `components/ThreadSidebar.tsx` | 行内色点；`onContextMenu`；菜单标签区；传 `tagNames` |
 | 前端 UI | `components/SettingsTagsTab.tsx`（新）、`SettingsDialog.tsx` | 新 Tab |
-| 前端逻辑 | `lib/threadSearch.ts` | `haystack` 并入标签名；签名加入参 |
-| 前端逻辑 | `App.tsx` | `onSetTag`；`thread/tagChanged` 处理；`tagNames` 状态与加载 |
+| 前端逻辑 | `lib/threadSearch.ts` | `haystack` 并入标签名；签名加 `tagNames` 入参 |
+| 前端逻辑 | `App.tsx` | `onSetTag`；两条通知的处理；`tagNames` 状态与握手加载 |
 | 文档 | `docs/project-management/desktop.md`、`yi-agent-app-server.md` | 按项目规范同步进度 |
 
 ## 6. 未决 / 留待后续
