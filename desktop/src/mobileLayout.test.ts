@@ -276,4 +276,13 @@ describe("phone layout CSS", () => {
       )?.[1] ?? "";
     expect(rule).toMatch(/font-size:\s*16px/);
   });
+
+  it("only enlarges the settings close button on the phone", () => {
+    // 手机端关闭按钮要 44px（Apple HIG）：遮罩被隐藏后它成了主要出口。但它必须
+    // **条件化**——无条件 `size-11` 会把桌面那颗按钮从约 24px 撑到 44px，破坏
+    // 「桌面逐字节不变」这条硬不变量（实测量测：桌面弹窗几何 800px 窗口下 560x420
+    // 本应完全不变，按钮却是唯一被撑大的元素）。
+    const src = readFileSync(`${dir}/components/SettingsDialog.tsx`, "utf8");
+    expect(src).toMatch(/isMobile\s*\?\s*"flex size-11[^"]*"\s*:\s*"px-2"/);
+  });
 });

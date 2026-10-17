@@ -157,11 +157,16 @@ export function SettingsDialog({
         <div className="settings-body flex min-w-0 flex-1 flex-col">
           <div className="settings-header flex items-center justify-between border-b border-line px-4 py-2">
             <span className="text-xs text-fg-subtle">设置</span>
+            {/* 手机端给足 44px 触控目标（Apple HIG，与抽屉按钮同一标准）——手机上
+                遮罩被 CSS 隐藏，关闭只能靠这颗按钮或 Escape。桌面沿用原样（`px-2`），
+                保持「桌面逐字节不变」这条硬不变量。 */}
             <button
               type="button"
               aria-label="关闭设置"
               onClick={onClose}
-              className="flex size-11 shrink-0 items-center justify-center rounded text-fg-subtle hover:text-fg"
+              className={`${
+                isMobile ? "flex size-11 shrink-0 items-center justify-center" : "px-2"
+              } rounded text-fg-subtle hover:text-fg`}
             >
               ×
             </button>
