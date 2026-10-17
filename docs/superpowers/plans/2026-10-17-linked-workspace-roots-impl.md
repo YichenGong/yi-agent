@@ -638,21 +638,26 @@ git commit -m "feat(tools): resolve fs paths against a root set"
 ```rust
     #[tokio::test]
     async fn glob_reports_relative_path_against_the_matching_root() {
-        let primary = tempfile::TempDir::new().unwrap();
-        let secondary = tempfile::TempDir::new().unwrap();
-        std::fs::write(secondary.path().join("sib.rs"), "fn main() {}").unwrap();
+        let primary = TempDir::new().unwrap();
+        let secondary = TempDir::new().unwrap();
+        fs::write(secondary.path().join("sib.rs"), "fn main() {}").unwrap();
         let ctx = Arc::new(ToolsContext::with_roots(vec![
             primary.path().to_path_buf(),
             secondary.path().to_path_buf(),
         ]));
         let tool = GlobTool::new(ctx);
-        let out = tool
+        let result = tool
             .call(serde_json::json!({
                 "pattern": "sib.rs",
                 "path": secondary.path().to_string_lossy(),
             }))
             .await;
-        assert!(format!("{out:?}").contains("sib.rs"));
+        assert!(!result.is_error);
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            // 必须相对**命中的那个根**（secondary）报路径，而不是绝对路径、
+            // 也不是相对主根。等值断言才拦得住"退回旧行为"的回归。
+            assert_eq!(s, "sib.rs");
+        }
     }
 ```
 
