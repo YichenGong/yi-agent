@@ -934,6 +934,12 @@ mod tests {
             tag: None,
         };
         let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        // 必须**存在且为 null**，而不是整个键被省略：前者客户端读 `tag === null`
+        // 即知「清除」，后者只能靠 `undefined`，两者在跨端解码里并不等价。
+        assert!(
+            v["params"].as_object().unwrap().contains_key("tag"),
+            "tag 键必须存在: {v}"
+        );
         assert!(v["params"]["tag"].is_null(), "清除必须是显式 null: {v}");
     }
 
