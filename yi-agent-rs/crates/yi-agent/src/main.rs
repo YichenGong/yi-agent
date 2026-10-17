@@ -1859,7 +1859,7 @@ fn run_tui_agent(
         let (agent_tx, agent_rx) = mpsc::channel::<yi_agent_core::AgentEvent>(256);
         let (input_tx, mut input_rx) = mpsc::channel::<String>(16);
         let (interrupt_tx, mut interrupt_rx) = mpsc::channel::<()>(1);
-        let (control_tx, mut control_rx) = mpsc::channel::<ControlCommand>(8);
+        let (control_tx, mut control_rx) = mpsc::channel::<DriverControl>(8);
         // Mid-turn kill requests (TUI bash panel) need their own channel: the
         // control channel is consumed at prompt boundaries, and a kill has to
         // land while the tool is actually running.
@@ -1886,7 +1886,7 @@ fn run_tui_agent(
 
         enum DriverInput {
             Prompt(Option<String>),
-            Control(Option<ControlCommand>),
+            Control(Option<DriverControl>),
             RuntimeChoice(Option<crate::tui::subagents::RuntimeStartupChoice>),
         }
 
@@ -1963,7 +1963,7 @@ fn run_tui_agent(
                 // Handle control commands first (rebuild agent, no prompt run).
                 if let DriverInput::Control(Some(cmd)) = input {
                     match cmd {
-                        ControlCommand::Clear => {
+                        DriverControl::Clear => {
                             // Rebuild agent with empty session. The session Arc is
                             // reused (not replaced) so the `CallerContext` bound to
                             // it stays live; the contents are emptied in place, and
@@ -1979,7 +1979,7 @@ fn run_tui_agent(
                             handle.lock().unwrap().set_last_input_tokens(None);
                             tracing::info!("agent session cleared via /clear");
                         }
-                        ControlCommand::Compact => {
+                        DriverControl::Compact => {
                             // Keep the session Arc: compaction replaces the
                             // contents in place, so the bound caller handle is
                             // not left pointing at a discarded session.
@@ -2038,7 +2038,7 @@ fn run_tui_agent(
                                 }
                             }
                         }
-                        ControlCommand::McpRefresh => {
+                        DriverControl::McpRefresh => {
                             let mut refreshed = (*current_tools).clone();
                             mcp_for_driver.refresh_registry(&mut refreshed);
                             current_tools = Arc::new(refreshed);
@@ -2053,7 +2053,7 @@ fn run_tui_agent(
                             );
                             tracing::info!("MCP tool registry refreshed");
                         }
-                        ControlCommand::SetModel(display_name) => {
+                        DriverControl::SetModel(display_name) => {
                             // display name → 清单条目 → provider/api_url/api_key/model。
                             // 载入清单在闭包里,不在 TUI 线程:切换只在控制命令这一刻读盘。
                             let model_catalog = yi_agent_runtime::models::load_catalog();
@@ -2109,7 +2109,7 @@ fn run_tui_agent(
                                 }
                             }
                         }
-                        ControlCommand::SetReasoningEffort(effort) => {
+                        DriverControl::SetReasoningEffort(effort) => {
                             // `effort` 已由 TUI 按七档白名单校验；`None` = 清
                             // 覆盖，回落当前条目默认（`apply_selection` 写回的
                             // 就是这个默认值）。
@@ -2473,7 +2473,7 @@ fn run_tui_agent(
 /// Allows the TUI to trigger agent session rebuilds (e.g. /clear, /compact)
 /// without reconstructing the whole agent inline.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ControlCommand {
+pub(crate) enum DriverControl {
     /// Clear the agent session (rebuild with empty session).
     Clear,
     /// Compact the agent session (summarize old messages, keep recent turns).
@@ -2581,13 +2581,13 @@ mod tests {
         // Guards against a `PartialEq` that ignores the payload (e.g. compares only
         // the discriminant): two different models must not compare equal, and
         // `SetModel` must not compare equal to a payload-less variant.
-        let a = ControlCommand::SetModel(Some("claude-opus-4-1".into()));
-        let b = ControlCommand::SetModel(Some("claude-sonnet-4-5".into()));
+        let a = DriverControl::SetModel(Some("claude-opus-4-1".into()));
+        let b = DriverControl::SetModel(Some("claude-sonnet-4-5".into()));
         assert_ne!(a, b);
-        assert_ne!(a, ControlCommand::McpRefresh);
+        assert_ne!(a, DriverControl::McpRefresh);
         // `None` clears the override and must not compare equal to a named switch.
-        assert_ne!(ControlCommand::SetModel(None), a);
-        assert_eq!(ControlCommand::SetModel(Some("claude-opus-4-1".into())), a,);
+        assert_ne!(DriverControl::SetModel(None), a);
+        assert_eq!(DriverControl::SetModel(Some("claude-opus-4-1".into())), a,);
     }
 
     #[test]
@@ -2595,14 +2595,11 @@ mod tests {
         // Same guard as `SetModel`: a `PartialEq` that ignored the payload would
         // make two different tiers equal, and a clear (`None`) indistinguishable
         // from "no command".
-        let high = ControlCommand::SetReasoningEffort(Some("high".into()));
-        assert_ne!(high, ControlCommand::SetReasoningEffort(Some("low".into())));
-        assert_ne!(ControlCommand::SetReasoningEffort(None), high);
-        assert_ne!(high, ControlCommand::McpRefresh);
-        assert_eq!(
-            ControlCommand::SetReasoningEffort(Some("high".into())),
-            high
-        );
+        let high = DriverControl::SetReasoningEffort(Some("high".into()));
+        assert_ne!(high, DriverControl::SetReasoningEffort(Some("low".into())));
+        assert_ne!(DriverControl::SetReasoningEffort(None), high);
+        assert_ne!(high, DriverControl::McpRefresh);
+        assert_eq!(DriverControl::SetReasoningEffort(Some("high".into())), high);
     }
 
     /// `/effort` must rebuild the agent with the new request-level effort while
