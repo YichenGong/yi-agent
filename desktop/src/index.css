@@ -420,3 +420,15 @@ html[data-mobile="true"] {
 [data-mobile="true"] .settings-panel {
   order: 3;
 }
+
+/*
+ * 设置面板内的输入控件字号下限：面板里的输入框是 `text-sm`（14px），而 iOS 在聚焦
+ * 字号 < 16px 的输入框时会自动放大页面——`lockZoom` 只能禁掉用户的手动捏合缩放，
+ * 挡不住这条自动放大；放大后页面不再贴合屏幕，之后每次滑动都变成两轴平移。
+ * 16px 是 iOS 不触发自动放大的下限，与侧栏搜索框那条（见上）同源、同理由。
+ * 桌面端不匹配 `[data-mobile]`，逐字节不变。
+ */
+[data-mobile="true"] .settings-panel input,
+[data-mobile="true"] .settings-panel select {
+  font-size: 16px;
+}

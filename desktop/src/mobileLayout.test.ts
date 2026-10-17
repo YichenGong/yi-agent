@@ -265,4 +265,15 @@ describe("phone layout CSS", () => {
     // 升为 flex item 后必须锁住高度，否则会被纵向 flex 压缩。
     expect(head).toMatch(/flex-shrink:\s*0/);
   });
+
+  it("keeps the settings inputs at 16px so iOS cannot auto-zoom on focus", () => {
+    // 面板里的文本输入框是 14px（`text-sm`），低于 iOS 自动放大阈值 16px。`lockZoom`
+    // 只禁手动捏合，挡不住这条自动放大——放大后页面不再贴合屏幕，每次滑动变成两轴
+    // 平移。与侧栏搜索框那条同源、同理由。
+    const rule =
+      /\[data-mobile="true"\]\s+\.settings-panel\s+(?:input|select)[^{]*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(rule).toMatch(/font-size:\s*16px/);
+  });
 });
