@@ -721,10 +721,27 @@ max_tasks = 99
 
     #[test]
     fn to_toml_round_trips_windows_semantically() {
-        let calendar = ConcurrencyCalendar::from_toml(SPEC_CONFIG).unwrap();
+        // `archive_grace_hours` 与 `instance_wait_secs` 取非默认且互不相同的值：
+        // `to_toml` 用同一个 `format!` 按顺序写这两个旋钮，把参数写反了必须被
+        // 下面的断言抓住（相同或缺省值都抓不住）。
+        let source = r#"
+default_max_tasks = 3
+interval_secs = 30
+archive_grace_hours = 7
+instance_wait_secs = 3
+
+[[window]]
+days = "Mon-Fri"
+start = "09:00"
+end = "24:00"
+max_tasks = 3
+"#;
+        let calendar = ConcurrencyCalendar::from_toml(source).unwrap();
         let reparsed = ConcurrencyCalendar::from_toml(&calendar.to_toml()).unwrap();
         assert_eq!(reparsed.default_max_tasks, calendar.default_max_tasks);
         assert_eq!(reparsed.interval_secs, calendar.interval_secs);
+        assert_eq!(reparsed.archive_grace_hours, calendar.archive_grace_hours);
+        assert_eq!(reparsed.instance_wait_secs, calendar.instance_wait_secs);
         assert_eq!(reparsed.windows.len(), calendar.windows.len());
         for (a, b) in reparsed.windows.iter().zip(calendar.windows.iter()) {
             assert_eq!(a.days, b.days);
