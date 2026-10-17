@@ -287,6 +287,10 @@ fn attach_delegation(
     thread_id: &str,
     theme: &crate::theme_tool::ThemeHandle,
     git_diff: &crate::git_diff_tool::GitDiffHandle,
+    // 本次会话的关联根（主根之外），由调用方在 `with_session_extra_roots` 的同一
+    // 作用域内捕获后传入——**不在此处再读槽位**，否则调用点一旦漏设就会静默拿到
+    // 空集（或残留值）。
+    extra_roots: Vec<PathBuf>,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -334,6 +338,7 @@ fn attach_delegation(
         built.yolo.clone(),
         theme.clone(),
         git_diff.clone(),
+        extra_roots,
     ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
@@ -834,10 +839,18 @@ fn build_runtime_tooling(
     yolo: yi_agent_core::autonomy::YoloSwitch,
     theme: crate::theme_tool::ThemeHandle,
     git_diff: crate::git_diff_tool::GitDiffHandle,
+    // 本次会话的关联根（主根之外）。逐调用传入：它同时决定 FS 根集与 shell 沙箱的
+    // 额外可写根，且不得跨会话共享。
+    extra_roots: Vec<PathBuf>,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
     let workspace_root = root.handle()?.workspace_root;
+    // FS 根集 = 主根（工作区）+ 关联根。shell 沙箱的额外可写根由
+    // `build_tool_setup_with_controller` 内部按同一口径推导（`roots[1..]` +
+    // `cfg.sandbox_writable_roots`），故此处不再单独拼一遍。
+    let mut roots = vec![workspace_root.clone()];
+    roots.extend(extra_roots.iter().cloned());
     // One controller, one truth: it backs the root's builtin tools AND the
     // subagent spawn tools, and it reads the thread's live YOLO switch.
     let controller =
@@ -845,7 +858,7 @@ fn build_runtime_tooling(
     let setup = yi_agent_runtime::bootstrap::build_tool_setup_with_controller(
         cfg,
         false,
-        &workspace_root,
+        &roots,
         controller.clone(),
     )
     .map_err(|error| error.to_string())?;
@@ -865,9 +878,8 @@ fn build_runtime_tooling(
         Some(thread_id.to_string()),
         caller.clone(),
     );
-    let permission =
-        yi_agent_runtime::bootstrap::load_permission_checker_with_switch(&workspace_root, yolo)
-            .map_err(|error| error.to_string())?;
+    let permission = yi_agent_runtime::bootstrap::load_permission_checker_with_roots(&roots, yolo)
+        .map_err(|error| error.to_string())?;
     register_theme_tool(&mut registry, theme);
     registry.register(Arc::new(crate::git_diff_tool::ShowGitDiffTool::new(
         git_diff,
@@ -1590,6 +1602,51 @@ fn current_session_reasoning_effort() -> Option<String> {
 }
 
 thread_local! {
+    /// 本次 `build_agent` 调用所属会话的**关联根**（主根之外的附属根）。与
+    /// [`SESSION_MODEL_REF`] 同一理由：工厂闭包签名带不进这个逐会话参数。
+    ///
+    /// **必须逐调用传**：daemon 的 worker factory 按项目目录构建、被同目录多个会话
+    /// 共享，把根集写进共享 `cfg` 会让 A 会话的关联根泄漏给同目录的其它会话（那些
+    /// 会话会凭空拿到不该有的写权限）。故这里走 thread-local，工厂每次克隆 `cfg`
+    /// 时再逐调用写入。
+    static SESSION_EXTRA_ROOTS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 在调用工厂（`build_agent`）前设定本次会话的关联根，供工厂写入 `thread_cfg`。
+///
+/// 调用返回后恢复调用前的值，故嵌套调用（如 `thread/start` 内再建其它 agent）不会
+/// 泄漏关联根。`thread/start` 取本会话的关联根、`thread/resume` 取
+/// `meta.extra_roots`。
+///
+/// 生产调用点（`thread/start`、`thread/resume` 两个分支）落在 Task 6——那一步才会
+/// 从索引/`meta` 算出根集。在那之前仅测试可达，故按本仓既有口径用
+/// `cfg_attr(not(test), allow(dead_code))`（而非把插槽改成 `#[cfg(test)]`：
+/// `production_factory` 是生产代码，必须能读到它）。Task 6 接上生产调用点后应删掉
+/// 这个属性。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn with_session_extra_roots<T>(roots: Vec<PathBuf>, f: impl FnOnce() -> T) -> T {
+    SESSION_EXTRA_ROOTS.with(|slot| {
+        let prev = slot.replace(roots);
+        let out = f();
+        slot.replace(prev);
+        out
+    })
+}
+
+/// 工厂内部读取当前会话的关联根；不在 [`with_session_extra_roots`] 内时为空
+/// （空 = 单根会话，与改动前逐字节一致）。
+///
+/// 可见性与 [`current_session_model_ref`] 一致（同为私有 `fn`）：`mod tests` 是
+/// `server` 的子模块，直接可达父模块私有项，故测试无需放宽可见性。
+///
+/// 生产侧有 `production_factory` 这个读点，故无需任何 `allow(dead_code)`（只有插槽
+/// **设定器**在 Task 6 接上生产调用点前是测试专用）。
+fn current_session_extra_roots() -> Vec<PathBuf> {
+    SESSION_EXTRA_ROOTS.with(|slot| slot.borrow().clone())
+}
+
+thread_local! {
     /// 本次 `build_agent` 调用所属会话的 `preserve_thinking`（跨轮 CoT 保留）。
     /// 与 [`SESSION_REASONING_EFFORT`] 同一理由：工厂闭包签名带不进这个逐会话
     /// 参数，而 `build_agent_config` 只认 `RuntimeConfig`（其中没有该字段）。
@@ -1643,6 +1700,10 @@ pub(crate) fn production_factory(
         let mut thread_cfg = cfg.clone();
         thread_cfg.workdir = cwd.to_path_buf();
         thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
+        // 本会话的关联根（逐调用传入，不共享）。空 = 单根会话，与改动前一致。
+        // **不得**把根集留在共享 `cfg` 里：本工厂按项目目录构建、被同目录多个会话
+        // 共享，那样会让 A 会话的关联根泄漏给同目录的其它会话。
+        thread_cfg.sandbox_writable_roots = current_session_extra_roots();
         let model_ref = current_session_model_ref();
         // 取「当前」清单:运行期新增/修改的条目立刻可见(原先持启动快照)。
         let catalog = catalog.current();
@@ -3717,6 +3778,11 @@ where
                             &thread_id,
                             &theme,
                             &git_diff_handle,
+                            // 本调用点位于 `build_agent` 的插槽作用域**之外**，故此处
+                            // 读到的恒为空集（= 单根会话，与改动前一致）。Task 6 会改为
+                            // 传入它自己捕获的 `extra_roots`；换掉这一行的实参即可，
+                            // 无需动签名。
+                            current_session_extra_roots(),
                             built,
                         );
                         let BuiltAgent {
@@ -7481,6 +7547,9 @@ async fn start_thread_core(
         &thread_id,
         theme,
         git_diff,
+        // 本调用点位于 `build_agent` 的插槽作用域**之外**，故此处读到的恒为空集
+        // （= 单根会话，与改动前一致）。Task 6 会改为传入它自己捕获的 `extra_roots`。
+        current_session_extra_roots(),
         built,
     );
     let BuiltAgent {
@@ -9640,6 +9709,7 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
         )
         .expect("tooling");
         let names = tooling.registry.names();
@@ -9717,6 +9787,7 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
         )
         .expect("tooling")
         .registry
@@ -9766,6 +9837,7 @@ pub(crate) mod tests {
             switch.clone(),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
         )
         .expect("tooling");
         let bash = tooling.registry.get("bash").expect("bash is registered");
@@ -9821,6 +9893,7 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
         )
         .expect("tooling")
         .registry
@@ -9949,6 +10022,7 @@ pub(crate) mod tests {
             "thread-a",
             &test_theme(),
             &crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
             build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
         let second = attach_delegation(
@@ -9961,6 +10035,7 @@ pub(crate) mod tests {
             "thread-b",
             &test_theme(),
             &crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
             build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
         );
 
@@ -21076,6 +21151,7 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
         )
         .expect("tooling");
         assert!(
@@ -21332,6 +21408,21 @@ pub(crate) mod tests {
         );
     }
 
+    /// 关联根槽位必须「进入时设定、退出时还原」：daemon 的 worker factory 按项目
+    /// 目录构建、被同目录多个会话共享，槽位若不还原，A 会话的关联根会泄漏给同目录
+    /// 的下一个会话（拿到不该有的写权限）。
+    #[test]
+    fn session_extra_roots_slot_scopes_and_restores() {
+        assert!(current_session_extra_roots().is_empty());
+        let roots = vec![
+            std::path::PathBuf::from("/tmp/slot-a"),
+            std::path::PathBuf::from("/tmp/slot-b"),
+        ];
+        let seen = with_session_extra_roots(roots.clone(), current_session_extra_roots);
+        assert_eq!(seen, roots);
+        assert!(current_session_extra_roots().is_empty());
+    }
+
     /// 解析链 §4.2 的工厂一侧：会话 effort 覆盖优先于条目默认。
     #[test]
     fn a_session_effort_override_beats_the_entry_default() {
@@ -21565,6 +21656,7 @@ pub(crate) mod tests {
             yi_agent_core::autonomy::YoloSwitch::new(false),
             test_theme(),
             crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
         )
         .expect("tooling");
         // Taken *before* the rebuild: a clone shares the caller slot the tools

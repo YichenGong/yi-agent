@@ -51,22 +51,35 @@ pub fn register_process_tools(registry: &mut ToolRegistry, manager: Arc<ProcessM
 /// - WebFetchTool is always registered.
 /// - WebSearchTool is only registered if BOCHA_API_KEY env var is set.
 pub fn register_builtin_tools(registry: &mut ToolRegistry, root: PathBuf) {
-    register_builtin_tools_with_sandbox(registry, root, SandboxMode::WorkspaceWrite, Vec::new());
+    register_builtin_tools_with_sandbox(
+        registry,
+        vec![root],
+        SandboxMode::WorkspaceWrite,
+        Vec::new(),
+    );
 }
 
 /// Register builtin tools with an explicit shell sandbox policy.
+///
+/// `roots` 是本次会话的 **FS 根集**（`roots[0]` = 主根）：`read`/`write`/`edit`/
+/// `glob`/`grep` 的逃逸检查与相对路径解析都以整集为准（关联根里的文件与主根同等
+/// 可达）。
+///
+/// `sandbox_writable_roots` 是 **shell 沙箱**的额外可写根，与 `roots` 刻意分开：
+/// worker 路径会把 git 内部目录放进去，那些目录必须能让 `bash` 写，却**不能**因此
+/// 变成 FS 工具的写根。
 pub fn register_builtin_tools_with_sandbox(
     registry: &mut ToolRegistry,
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     sandbox_mode: SandboxMode,
-    extra_writable_roots: Vec<PathBuf>,
+    sandbox_writable_roots: Vec<PathBuf>,
 ) {
     let controller = SandboxController::new(
         yi_agent_core::autonomy::YoloSwitch::new(false),
         sandbox_mode,
         false,
     );
-    register_builtin_tools_with_controller(registry, root, controller, extra_writable_roots);
+    register_builtin_tools_with_controller(registry, roots, controller, sandbox_writable_roots);
 }
 
 /// Register builtin tools sharing one externally-owned sandbox controller.
@@ -76,14 +89,14 @@ pub fn register_builtin_tools_with_sandbox(
 /// path at once instead of drifting between independent policies.
 pub fn register_builtin_tools_with_controller(
     registry: &mut ToolRegistry,
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     controller: SandboxController,
-    extra_writable_roots: Vec<PathBuf>,
+    sandbox_writable_roots: Vec<PathBuf>,
 ) {
-    // FS 根集就是这里的 `root`（Task 5 才会把 shell sandbox 的额外可写根合并进来，
-    // 本任务刻意不混入，保持单根行为逐字节不变）。
-    let ctx = Arc::new(ToolsContext::new(root));
-    let sandbox = SandboxPolicy::with_controller(ctx.root(), extra_writable_roots, controller);
+    // FS 根集 = 整集（关联根也进工具层）；shell 沙箱的主根仍取 `ctx.root()`（主根），
+    // 额外可写根只认调用方给的沙箱汇总项。
+    let ctx = Arc::new(ToolsContext::with_roots(roots));
+    let sandbox = SandboxPolicy::with_controller(ctx.root(), sandbox_writable_roots, controller);
     // A read-only session has no write/edit tool surface, in addition to the
     // process-level file-write denial enforced for shell commands.
     registry.register(Arc::new(ReadTool::new(ctx.clone())));
@@ -105,4 +118,26 @@ pub fn register_builtin_tools_with_controller(
         registry.register(Arc::new(WebSearchTool::new(Arc::new(bocha))));
     }
     // BOCHA_API_KEY not set: WebSearchTool not registered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 注册入口按**根集**收参：主根之外的关联根同样进 FS 工具层（Task 3 的
+    /// `ToolsContext::with_roots`），而 shell 沙箱的额外可写根另走一个参数。
+    #[test]
+    fn builtin_registration_accepts_a_root_set() {
+        let primary = tempfile::TempDir::new().unwrap();
+        let secondary = tempfile::TempDir::new().unwrap();
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        register_builtin_tools_with_sandbox(
+            &mut registry,
+            vec![primary.path().to_path_buf(), secondary.path().to_path_buf()],
+            SandboxMode::WorkspaceWrite,
+            vec![secondary.path().to_path_buf()],
+        );
+        let names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"write".to_string()));
+    }
 }
