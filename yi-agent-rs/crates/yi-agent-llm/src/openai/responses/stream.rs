@@ -227,7 +227,16 @@ where
                         {
                             events.push(ProviderEvent::ThinkingBlock {
                                 text: String::new(),
-                                token: yi_agent_core::ThinkingToken::Encrypted(enc.to_string()),
+                                token: yi_agent_core::ThinkingToken::Encrypted {
+                                    encrypted_content: enc.to_string(),
+                                    // 逐字带走上游 `summary`（缺失/非数组时落为空 Vec），
+                                    // 供下一轮回放——回放时该字段必须显式在场。
+                                    summary: item
+                                        .get("summary")
+                                        .and_then(Value::as_array)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                },
                             });
                         }
                     }
@@ -585,10 +594,68 @@ mod tests {
             matches!(
                 e,
                 ProviderEvent::ThinkingBlock { token, .. }
-                    if *token == yi_agent_core::ThinkingToken::Encrypted("enc-blob".into())
+                    if *token == yi_agent_core::ThinkingToken::Encrypted {
+                        encrypted_content: "enc-blob".into(),
+                        summary: vec![],
+                    }
             )
         });
         assert!(found, "reasoning item must surface its encrypted_content");
+    }
+
+    #[tokio::test]
+    async fn reasoning_item_done_captures_summary_verbatim() {
+        // B 方案内核：捕获端必须把上游 `summary` 原样存进凭证，供下一轮回放。
+        let body = "event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc-blob\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thought\"}]}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_chunks(&[bytes.as_slice()])
+            .await
+            .into_iter()
+            .collect();
+
+        let found = events.iter().any(|e| {
+            matches!(
+                e,
+                ProviderEvent::ThinkingBlock { token, .. }
+                    if *token == yi_agent_core::ThinkingToken::Encrypted {
+                        encrypted_content: "enc-blob".into(),
+                        summary: vec![serde_json::json!({"type": "summary_text", "text": "thought"})],
+                    }
+            )
+        });
+        assert!(
+            found,
+            "reasoning item must capture its summary verbatim: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_item_done_captures_an_empty_summary_as_an_empty_vec() {
+        // 上游 `summary` 常见为 `[]`；捕获端须落为空 Vec（回放时仍显式发出）。
+        let body = "event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc-blob\",\"summary\":[]}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_chunks(&[bytes.as_slice()])
+            .await
+            .into_iter()
+            .collect();
+
+        let found = events.iter().any(|e| {
+            matches!(
+                e,
+                ProviderEvent::ThinkingBlock { token, .. }
+                    if *token == yi_agent_core::ThinkingToken::Encrypted {
+                        encrypted_content: "enc-blob".into(),
+                        summary: vec![],
+                    }
+            )
+        });
+        assert!(found, "empty summary must be captured as an empty vec");
     }
 
     // ---- 以下为超出 brief 的防御性用例 ----

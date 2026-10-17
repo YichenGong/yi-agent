@@ -176,7 +176,8 @@ impl From<ContentBlock> for AnthropicContentBlock {
                 }
                 // 非 Anthropic 形态**不会**到达这里：`From<ProviderRequest>` 已先过滤。
                 // 保守起见用 unreachable 而非编造凭证——静默造出非法 wire 形状更糟。
-                yi_agent_core::ThinkingToken::Encrypted(_) | yi_agent_core::ThinkingToken::None => {
+                yi_agent_core::ThinkingToken::Encrypted { .. }
+                | yi_agent_core::ThinkingToken::None => {
                     unreachable!("non-Anthropic thinking tokens are filtered before conversion")
                 }
             },
@@ -253,7 +254,7 @@ impl From<ProviderRequest> for AnthropicRequest {
                             !matches!(
                                 b,
                                 ContentBlock::Thinking {
-                                    token: yi_agent_core::ThinkingToken::Encrypted(_)
+                                    token: yi_agent_core::ThinkingToken::Encrypted { .. }
                                         | yi_agent_core::ThinkingToken::None,
                                     ..
                                 }
@@ -522,7 +523,13 @@ mod tests {
     #[test]
     fn deepseek_and_responses_tokens_are_not_sent_to_anthropic() {
         use yi_agent_core::{ContentBlock, ThinkingToken};
-        for token in [ThinkingToken::None, ThinkingToken::Encrypted("x".into())] {
+        for token in [
+            ThinkingToken::None,
+            ThinkingToken::Encrypted {
+                encrypted_content: "x".into(),
+                summary: vec![],
+            },
+        ] {
             let req = ProviderRequest {
                 model: "claude-opus-5-5".into(),
                 system: None,
