@@ -330,7 +330,7 @@ git commit -m "feat(store): thread meta 增加颜色标签字段与 set_tag"
 
 Run: `export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && cd yi-agent-rs && cargo test -p yi-agent-app-server --lib -- settings_store::warning_tests`
 
-Expected: PASS（主题侧 4 个测试不受影响）。
+Expected: PASS（主题侧 3 个测试不受影响）。
 
 - [ ] **Step 2: 跑测试确认失败**
 
