@@ -457,7 +457,7 @@ cd desktop && npx vitest run src/components/SettingsModelsTab.test.tsx -t "phone
 
 Expected: FAIL —— 四条全红。`isMobile` 还未被组件接受（TS 会报 prop 不存在，运行时该 prop 被忽略），清单始终走表格分支：`[data-model-card]` 查不到（第 1、3、4 条红）、桌面那条虽有表格但 `[data-model-card]` 的 `toBeNull()` 与 `table` 的 `toBeTruthy()` 都会通过（第 2 条绿，属预期）。
 
-- [ ] **Step 3: 实现卡片渲染**
+- [ ] **Step 3: 实现卡片渲染（表格与卡片共享一份字段描述表）**
 
 在 `desktop/src/components/SettingsModelsTab.tsx` 里，给组件签名加 `isMobile`：
 
@@ -467,14 +467,55 @@ export function SettingsModelsTab({
   isMobile = false,
 }: {
   call?: ModelsCall;
-  /** 手机端（窄屏）：5 列表格换成纵向卡片，见下方 `renderCatalogCards`。 */
+  /** 手机端（窄屏）：5 列表格换成纵向卡片，见下方 `catalogFields`。 */
   isMobile?: boolean;
 }) {
 ```
 
-然后在**紧接 `return (` 之前**（即所有回调如 `startEdit` / `remove` / `saveDraft` 都已定义之后）插入两个 `const` 箭头函数。位置必须是这里——它们闭包引用 `startEdit` / `remove` / `catalog`，写在使用点之前才不会有 TDZ 问题：
+**为什么用字段描述表而不是两个各写一遍的 render 函数**：表格与卡片要展示的是同一批
+字段（名称 / API 格式 / 模型标识 / API 地址 / 密钥），只是排布不同——表格横排成行，
+卡片竖排成 `<dt>/<dd>`。若各写一遍 JSX，字段逻辑（尤其 `/v1` 启发式提示与密钥掩码）
+就有两份副本，将来改一处漏一处。抽成一份 `catalogFields` 描述表后，两种形态各自只
+负责「怎么排」，字段本身只定义一次。
+
+先导入 `ReactNode` 类型（文件顶部 `import { useEffect, useState } from "react";` 改为）：
 
 ```tsx
+import { useEffect, useState, type ReactNode } from "react";
+```
+
+然后在**紧接 `return (` 之前**（即所有回调如 `startEdit` / `remove` / `saveDraft` 都已定义之后）插入下面这段。位置必须是这里——`catalogFields` 是 `useMemo`/`const`，闭包引用 `catalog`，写在 `return` 之前才不会有 TDZ 问题，也让下面的 `renderCatalogTable` / `renderCatalogCards` 能直接引用它：
+
+```tsx
+  /**
+   * 清单的一行/一张卡片要展示哪些字段。**只定义一次**，两种形态共用：
+   * 表格把它映射成 `<td>`，卡片映射成 `<dt>/<dd>`。字段逻辑（`/v1` 启发式提示、
+   * 密钥只显掩码）因此只有一份，不会出现「改了一处漏了另一处」。
+   */
+  const catalogFields: Array<{ label: string; value: (entry: ModelEntryView) => ReactNode }> = [
+    { label: "名称", value: (entry) => entry.name },
+    { label: "API 格式", value: (entry) => entry.provider },
+    { label: "模型标识", value: (entry) => entry.model },
+    {
+      label: "API 地址",
+      value: (entry) => (
+        <>
+          {entry.api_url}
+          {suspectsMissingV1(entry) && (
+            <span className="ml-2 font-sans text-fg-muted">
+              （OpenAI 兼容接口地址通常以 /v1 结尾，请确认）
+            </span>
+          )}
+        </>
+      ),
+    },
+    {
+      label: "密钥",
+      // key 只以掩码示人：原始值从不经过桌面端。
+      value: (entry) => (entry.has_key ? entry.api_key_masked : "未设置"),
+    },
+  ];
+
   /**
    * 清单的桌面形态：5 列表格。固有宽度约 463px，只在足够宽的窗口里成立。
    */
@@ -482,33 +523,37 @@ export function SettingsModelsTab({
     <table className="mt-3 w-full table-auto text-left text-sm">
       <thead>
         <tr className="text-xs text-fg-subtle">
-          <th className="py-1 pr-2 font-normal">名称</th>
-          <th className="py-1 pr-2 font-normal">API 格式</th>
-          <th className="py-1 pr-2 font-normal">模型标识</th>
-          <th className="py-1 pr-2 font-normal">API 地址</th>
-          <th className="py-1 pr-2 font-normal">密钥</th>
+          {catalogFields.map((field) => (
+            <th key={field.label} className="py-1 pr-2 font-normal">
+              {field.label}
+            </th>
+          ))}
           <th className="py-1 font-normal">操作</th>
         </tr>
       </thead>
       <tbody>
         {catalog.models.map((entry) => (
           <tr key={entry.name} className="border-t border-line">
-            <td className="py-1.5 pr-2 text-fg">{entry.name}</td>
-            <td className="py-1.5 pr-2 text-fg-muted">{entry.provider}</td>
-            <td className="py-1.5 pr-2 text-fg-muted">{entry.model}</td>
-            <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">
-              {entry.api_url}
-              {suspectsMissingV1(entry) && (
-                <span className="ml-2 font-sans text-fg-muted">
-                  （OpenAI 兼容接口地址通常以 /v1 结尾，请确认）
-                </span>
-              )}
-            </td>
-            {/* key 只以掩码示人：原始值从不经过桌面端。 */}
-            <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">
-              {entry.has_key ? entry.api_key_masked : "未设置"}
-            </td>
+            {/* 「名称」列用 `text-fg` 提亮，其余用 `text-fg-muted`；地址与密钥另外
+                用等宽小字（它们是标识符/凭证，不是散文）。 */}
+            {catalogFields.map((field) => (
+              <td
+                key={field.label}
+                className={
+                  field.label === "名称"
+                    ? "py-1.5 pr-2 text-fg"
+                    : field.label === "API 地址" || field.label === "密钥"
+                      ? "py-1.5 pr-2 font-mono text-xs text-fg-subtle"
+                      : "py-1.5 pr-2 text-fg-muted"
+                }
+              >
+                {field.value(entry)}
+              </td>
+            ))}
             <td className="py-1.5">
+              {/* 桌面这两颗按钮的类名与结构保持原样（`px-2 py-0.5 text-xs`、`ml-1`）：
+                  spec 要求桌面 5 列表格「JSX 与类名不变」。手机卡片另给 44px 触控
+                  尺寸——按钮是两种排布各自的呈现细节，不与字段逻辑共享。 */}
               <button
                 type="button"
                 onClick={() => startEdit(entry)}
@@ -537,46 +582,34 @@ export function SettingsModelsTab({
    * 表格固有约 463px 宽，而 390pt 手机上全屏设置页的内宽约 390px——表格怎么调都
    * 装不下，且面板只允许纵向滚动，被裁掉的列（密钥、操作）永久不可达。卡片把
    * 宽度交给容器，任何宽度下所有字段与按钮都在视野内。字段标签在卡片形态下必须
-   * 显式渲染（表格形态下由 `<th>` 承担）。
+   * 显式渲染（表格形态下由 `<th>` 承担），这里用 `<dt>` 承担。
    */
   const renderCatalogCards = () => (
     <ul className="mt-3 space-y-3">
       {catalog.models.map((entry) => (
-        <li
-          key={entry.name}
-          data-model-card
-          className="rounded-md border border-line p-3"
-        >
+        <li key={entry.name} data-model-card className="rounded-md border border-line p-3">
           <h3 className="text-sm font-medium text-fg">{entry.name}</h3>
           <dl className="mt-2 space-y-2 text-xs">
-            <div>
-              <dt className="text-fg-subtle">API 格式</dt>
-              <dd className="text-fg-muted">{entry.provider}</dd>
-            </div>
-            <div>
-              <dt className="text-fg-subtle">模型标识</dt>
-              <dd className="break-all text-fg-muted">{entry.model}</dd>
-            </div>
-            <div>
-              <dt className="text-fg-subtle">API 地址</dt>
-              <dd className="break-all font-mono text-fg-subtle">
-                {entry.api_url}
-                {suspectsMissingV1(entry) && (
-                  <span className="mt-1 block font-sans text-fg-muted">
-                    （OpenAI 兼容接口地址通常以 /v1 结尾，请确认）
-                  </span>
-                )}
-              </dd>
-            </div>
-            <div>
-              <dt className="text-fg-subtle">密钥</dt>
-              {/* key 只以掩码示人：原始值从不经过桌面端。 */}
-              <dd className="font-mono text-fg-subtle">
-                {entry.has_key ? entry.api_key_masked : "未设置"}
-              </dd>
-            </div>
+            {/* 名称已作标题，正文里不再重复。 */}
+            {catalogFields
+              .filter((field) => field.label !== "名称")
+              .map((field) => (
+                <div key={field.label}>
+                  <dt className="text-fg-subtle">{field.label}</dt>
+                  <dd
+                    className={
+                      field.label === "API 地址" || field.label === "密钥"
+                        ? "break-all font-mono text-fg-subtle"
+                        : "break-all text-fg-muted"
+                    }
+                  >
+                    {field.value(entry)}
+                  </dd>
+                </div>
+              ))}
           </dl>
           <div className="mt-3 flex items-center gap-2">
+            {/* 手机端触控目标：`px-3 py-2` + `text-sm` ≈ 44px 高（Apple HIG）。 */}
             <button
               type="button"
               onClick={() => startEdit(entry)}
@@ -599,13 +632,28 @@ export function SettingsModelsTab({
   );
 ```
 
-然后把 `return (` 里那段 `<table className="mt-3 w-full table-auto text-left text-sm"> ... </table>`（从 `<table className="mt-3 w-full table-auto text-left text-sm">` 到它的 `</table>`，即原 `:340-386`）整体替换为：
+> 三个取舍，评审时不必当作缺陷：
+> - **共享的是字段逻辑，不是按钮**。真正会「改一处漏一处」的是 `/v1` 启发式提示与
+>   「密钥只显掩码」这条业务逻辑，它现在只在 `catalogFields` 定义一次。按钮的类名是
+>   两种排布各自的呈现细节（桌面 `px-2 py-0.5 text-xs` 必须保持原样，手机要 44px
+>   触控目标），刻意不共享——强行共享会迫使桌面按钮变大，违反 spec 的「桌面 5 列表格
+>   JSX 与类名不变」。
+> - **卡片里不重复渲染「名称」**：它已作 `<h3>` 标题，`catalogFields` 里那条用
+>   `.filter((f) => f.label !== "名称")` 跳过；表格则全部 5 条映射成列。同一条描述表，
+>   两种排布各取所需。
+> - **`catalogFields` 未用 `useMemo`**：它是每渲染重建的字面量数组，元素是 5 个字段描述。
+>   清单通常个位数条目，这点分配可忽略；加 `useMemo` 反而让依赖数组（`catalog`）成为
+>   新的出错面。YAGNI。
+
+然后把 `return (` 里那段 `<table className="mt-3 w-full table-auto text-left text-sm"> ... </table>`
+（原 `:340-386`，即 `{catalog.models.length === 0 ? ( ... ) : ( <table>...</table> )}` 的后半支）
+整体替换为：
 
 ```tsx
         isMobile ? renderCatalogCards() : renderCatalogTable()
 ```
 
-同时把上面的 `{catalog.models.length === 0 ? ( ... ) : ( <table .../> )}` 三元里的后半支照此替换，保持结构不变：
+即最终结构为：
 
 ```tsx
       ) : (
