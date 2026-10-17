@@ -754,112 +754,117 @@ export function ThreadSidebar({
                 filtered.pinned.map((t, i) => renderThread(t, { rowAttr: "pinned", dragIndex: i }))}
             </div>
           )}
-          {filtered.groups.map((g) => {
-            const isCollapsed = searching ? false : collapsed.has(g.workspace);
-            return (
-              <div key={g.workspace} className="relative">
-                <div
-                  tabIndex={0}
-                  data-ws-header={g.workspace}
-                  aria-haspopup="menu"
-                  aria-expanded={menu?.kind === "group" && menu.ws === g.workspace}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setNewMenuOpen(false);
-                    setMenu({ kind: "group", ws: g.workspace });
-                  }}
-                  onKeyDown={(e) => {
-                    // 键盘等价于右键:Enter/Space 打开(或关闭)该组的菜单。
-                    // 只处理组头自身获焦的情况——caret 按钮是子元素,其 keydown 会
-                    // 冒泡到此处;若在此 preventDefault 会吞掉 caret 的 Enter/Space 激活,
-                    // 导致键盘无法折叠分组(回归)。
-                    if (e.target !== e.currentTarget) return;
-                    if (e.key !== "Enter" && e.key !== " ") return;
-                    e.preventDefault();
-                    setNewMenuOpen(false);
-                    setMenu((cur) =>
-                      cur?.kind === "group" && cur.ws === g.workspace
-                        ? null
-                        : { kind: "group", ws: g.workspace },
-                    );
-                  }}
-                  className="flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
-                >
-                  <button
-                    type="button"
-                    onClick={() => toggleCollapse(g.workspace)}
-                    disabled={searching}
-                    aria-label={isCollapsed ? "Expand" : "Collapse"}
-                    title={isCollapsed ? "Expand" : "Collapse"}
-                    className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
-                  >
-                    {isCollapsed ? "▸" : "▾"}
-                  </button>
+          {/* 分组之间留一档空档：无间距时上一条会话与下一个文件夹头紧贴，多个文件夹
+              连成一整列、看不出边界。`space-y-2` 只作用于兄弟之间，故首个分组之前
+              不多出空白，也不动置顶分区与组之间既有的留白。 */}
+          <div className="space-y-2">
+            {filtered.groups.map((g) => {
+              const isCollapsed = searching ? false : collapsed.has(g.workspace);
+              return (
+                <div key={g.workspace} className="relative">
                   <div
-                    className={`min-w-0 flex-1 truncate ${
-                      g.exists ? "text-fg-muted" : "text-fg-faint"
-                    }`}
-                    title={g.workspace}
+                    tabIndex={0}
+                    data-ws-header={g.workspace}
+                    aria-haspopup="menu"
+                    aria-expanded={menu?.kind === "group" && menu.ws === g.workspace}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setNewMenuOpen(false);
+                      setMenu({ kind: "group", ws: g.workspace });
+                    }}
+                    onKeyDown={(e) => {
+                      // 键盘等价于右键:Enter/Space 打开(或关闭)该组的菜单。
+                      // 只处理组头自身获焦的情况——caret 按钮是子元素,其 keydown 会
+                      // 冒泡到此处;若在此 preventDefault 会吞掉 caret 的 Enter/Space 激活,
+                      // 导致键盘无法折叠分组(回归)。
+                      if (e.target !== e.currentTarget) return;
+                      if (e.key !== "Enter" && e.key !== " ") return;
+                      e.preventDefault();
+                      setNewMenuOpen(false);
+                      setMenu((cur) =>
+                        cur?.kind === "group" && cur.ws === g.workspace
+                          ? null
+                          : { kind: "group", ws: g.workspace },
+                      );
+                    }}
+                    className="flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
                   >
-                    {basename(g.workspace)}
-                    {!g.exists && " (missing)"}
-                  </div>
-                </div>
-                {menu?.kind === "group" && menu.ws === g.workspace && (
-                  <>
-                    <div className="fixed inset-0 z-10" onClick={closeMenus} />
-                    <div
-                      role="menu"
-                      className="absolute top-7 left-4 z-20 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+                    <button
+                      type="button"
+                      onClick={() => toggleCollapse(g.workspace)}
+                      disabled={searching}
+                      aria-label={isCollapsed ? "Expand" : "Collapse"}
+                      title={isCollapsed ? "Expand" : "Collapse"}
+                      className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
                     >
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          closeMenus();
-                          onNew(g.workspace);
-                        }}
-                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-                      >
-                        New thread here
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          closeMenus();
-                          if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
-                          else onCreateBoard(g.workspace);
-                        }}
-                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
-                      >
-                        {kanbanItemFor(g.workspace, boards)
-                          ? "移除看板"
-                          : "创建 Superpowers 看板"}
-                      </button>
-                      <button
-                        type="button"
-                        role="menuitem"
-                        onClick={() => {
-                          closeMenus();
-                          onRemoveWorkspace(g.workspace);
-                        }}
-                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-                      >
-                        Remove from list
-                      </button>
+                      {isCollapsed ? "▸" : "▾"}
+                    </button>
+                    <div
+                      className={`min-w-0 flex-1 truncate ${
+                        g.exists ? "text-fg-muted" : "text-fg-faint"
+                      }`}
+                      title={g.workspace}
+                    >
+                      {basename(g.workspace)}
+                      {!g.exists && " (missing)"}
                     </div>
-                  </>
-                )}
-                {!isCollapsed && !searching && kanbanItemFor(g.workspace, boards) && renderBoardEntry(g.workspace)}
-                {!isCollapsed && renderBoardThreads(g)}
-                {!isCollapsed &&
-                  g.threads
-                    .filter((t) => !t.pinned && !t.card_id)
-                    .map((t) => renderThread(t, { rowAttr: "group" }))}
-              </div>
-            );
-          })}
+                  </div>
+                  {menu?.kind === "group" && menu.ws === g.workspace && (
+                    <>
+                      <div className="fixed inset-0 z-10" onClick={closeMenus} />
+                      <div
+                        role="menu"
+                        className="absolute top-7 left-4 z-20 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+                      >
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            closeMenus();
+                            onNew(g.workspace);
+                          }}
+                          className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                        >
+                          New thread here
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            closeMenus();
+                            if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
+                            else onCreateBoard(g.workspace);
+                          }}
+                          className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
+                        >
+                          {kanbanItemFor(g.workspace, boards)
+                            ? "移除看板"
+                            : "创建 Superpowers 看板"}
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => {
+                            closeMenus();
+                            onRemoveWorkspace(g.workspace);
+                          }}
+                          className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                        >
+                          Remove from list
+                        </button>
+                      </div>
+                    </>
+                  )}
+                  {!isCollapsed && !searching && kanbanItemFor(g.workspace, boards) && renderBoardEntry(g.workspace)}
+                  {!isCollapsed && renderBoardThreads(g)}
+                  {!isCollapsed &&
+                    g.threads
+                      .filter((t) => !t.pinned && !t.card_id)
+                      .map((t) => renderThread(t, { rowAttr: "group" }))}
+                </div>
+              );
+            })}
+          </div>
         </div>
       </div>
       <div className="mt-auto flex items-center border-t border-line p-2">
