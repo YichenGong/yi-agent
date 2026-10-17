@@ -187,7 +187,11 @@ pub fn resolve_for_write_roots(roots: &[PathBuf], path: &str) -> Result<PathBuf,
     Ok(normalized)
 }
 
-/// 单根包装：等价于把 `root` 当作唯一根，供尚未迁移的调用点使用。
+/// 单根包装（**仅测试**）：等价于把 `root` 当作唯一根。
+///
+/// 生产代码（FS 工具）已全部改用 [`resolve_and_check_roots`]；这里只服务于本模块的单根
+/// 行为回归测试——单根是空根集的退化情形，必须逐字节保持旧语义。故用 `#[cfg(test)]`
+/// 而不是 `allow(dead_code)`：它不属于生产面，不该进二进制。
 ///
 /// Resolve `path` relative to `root`, then verify the canonicalized path
 /// is still inside `root`. Prevents `../` escapes and symlink escapes.
@@ -196,14 +200,16 @@ pub fn resolve_for_write_roots(roots: &[PathBuf], path: &str) -> Result<PathBuf,
 /// - Relative paths are joined to root.
 /// - Parent directories that don't exist yet cause an error (callers should
 ///   create them first when writing).
+#[cfg(test)]
 pub fn resolve_and_check(root: &Path, path: &str) -> Result<PathBuf, ToolsError> {
     resolve_and_check_roots(&[root.to_path_buf()], path)
 }
 
-/// 单根包装：等价于把 `root` 当作唯一根，供尚未迁移的调用点使用。
+/// 单根包装（**仅测试**）：见 [`resolve_and_check`] 的说明。
 ///
 /// Like `resolve_and_check` but allows the target path (and parent dirs) to
 /// not exist yet. Used by WriteTool which creates parent directories as needed.
+#[cfg(test)]
 pub fn resolve_for_write(root: &Path, path: &str) -> Result<PathBuf, ToolsError> {
     resolve_for_write_roots(&[root.to_path_buf()], path)
 }

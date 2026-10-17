@@ -80,6 +80,8 @@ pub fn register_builtin_tools_with_controller(
     controller: SandboxController,
     extra_writable_roots: Vec<PathBuf>,
 ) {
+    // FS 根集就是这里的 `root`（Task 5 才会把 shell sandbox 的额外可写根合并进来，
+    // 本任务刻意不混入，保持单根行为逐字节不变）。
     let ctx = Arc::new(ToolsContext::new(root));
     let sandbox = SandboxPolicy::with_controller(ctx.root(), extra_writable_roots, controller);
     // A read-only session has no write/edit tool surface, in addition to the

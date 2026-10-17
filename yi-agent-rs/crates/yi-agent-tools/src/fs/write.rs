@@ -1,6 +1,6 @@
 use crate::context::ToolsContext;
 use crate::error::ToolsError;
-use crate::fs::path_util::resolve_for_write;
+use crate::fs::path_util::resolve_for_write_roots;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
@@ -50,7 +50,7 @@ impl Tool for WriteTool {
             Err(e) => return ToolsError::ArgsParse(e).into(),
         };
 
-        let resolved = match resolve_for_write(self.ctx.root(), &args.path) {
+        let resolved = match resolve_for_write_roots(self.ctx.roots(), &args.path) {
             Ok(p) => p,
             Err(e) => return e.into(),
         };

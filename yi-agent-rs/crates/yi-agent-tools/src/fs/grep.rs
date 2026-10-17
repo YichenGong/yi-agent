@@ -3,6 +3,7 @@ use crate::error::ToolsError;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use walkdir::WalkDir;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
@@ -83,7 +84,9 @@ impl Tool for GrepTool {
             Err(e) => return ToolsError::Regex(e).into(),
         };
 
+        // 绝对路径按原样解释（可落在根集任一根内）；相对路径一律拼**主根**。
         let base = match &args.path {
+            Some(p) if Path::new(p).is_absolute() => PathBuf::from(p),
             Some(p) => self.ctx.root().join(p),
             None => self.ctx.root().to_path_buf(),
         };
@@ -103,7 +106,7 @@ impl Tool for GrepTool {
             glob_pattern.as_ref(),
             mode,
             context,
-            self.ctx.root(),
+            self.ctx.roots(),
         ) {
             Ok(output) => {
                 if output.is_empty() {
@@ -150,12 +153,12 @@ fn append_entry(output: &mut String, entry_count: &mut usize, entry: String) -> 
 }
 
 fn grep_search(
-    base: &std::path::Path,
+    base: &Path,
     re: &regex::Regex,
     glob_filter: Option<&glob::Pattern>,
     mode: OutputMode,
     context: usize,
-    root: &std::path::Path,
+    roots: &[PathBuf],
 ) -> Result<String, ToolsError> {
     let mut output = String::new();
     let mut found_any = false;
@@ -199,7 +202,11 @@ fn grep_search(
         }
         found_any = true;
 
-        let rel = path.strip_prefix(root).unwrap_or(path);
+        // 命中哪个根就相对哪个根报，避免副根的匹配被报成主根下的路径；任一含它的
+        // 根都没有时退回绝对路径（例如 `path` 直接传了根集之外的目录）。
+        let rel = crate::context::relative_to_roots(roots, path)
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+        let shown = rel.as_str();
 
         match mode {
             OutputMode::Content => {
@@ -207,7 +214,7 @@ fn grep_search(
                     if !append_entry(
                         &mut output,
                         &mut entry_count,
-                        format!("{}:{}:{}\n", rel.display(), i + 1, line),
+                        format!("{}:{}:{}\n", shown, i + 1, line),
                     ) {
                         truncated = true;
                         break 'walk;
@@ -220,7 +227,7 @@ fn grep_search(
                                 && !append_entry(
                                     &mut output,
                                     &mut entry_count,
-                                    format!("{}-{}:{}\n", rel.display(), j + 1, context_line),
+                                    format!("{}-{}:{}\n", shown, j + 1, context_line),
                                 )
                             {
                                 truncated = true;
@@ -231,11 +238,7 @@ fn grep_search(
                 }
             }
             OutputMode::FilesWithMatches => {
-                if !append_entry(
-                    &mut output,
-                    &mut entry_count,
-                    format!("{}\n", rel.display()),
-                ) {
+                if !append_entry(&mut output, &mut entry_count, format!("{}\n", shown)) {
                     truncated = true;
                     break;
                 }
@@ -244,7 +247,7 @@ fn grep_search(
                 if !append_entry(
                     &mut output,
                     &mut entry_count,
-                    format!("{}:{}\n", rel.display(), file_matches.len()),
+                    format!("{}:{}\n", shown, file_matches.len()),
                 ) {
                     truncated = true;
                     break;
