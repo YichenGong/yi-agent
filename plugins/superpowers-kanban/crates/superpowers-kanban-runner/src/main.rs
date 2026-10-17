@@ -725,6 +725,34 @@ impl superpowers_kanban_ipc::server::Dispatch for QueryDispatch {
     }
 }
 
+/// 清一个候选路径上的陈旧 socket：连得上就保留，连不上就删。
+///
+/// 「连不上」是「绑定进程已不在」的可靠证据（Unix socket 语义）；不用 mtime/
+/// 存在性——那些会被无关操作扰动。
+fn sweep_one_socket(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return; // 有活实例，绝不误删。
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// 清理本插件派生出的两个确定路径上的死 socket。
+///
+/// 只碰这两条确定路径（直连 + 回退），**不扫 `$TMPDIR`**——那里其它
+/// `plugin-*.sock` 属于别的项目/别的 state_dir，无法证明归属。
+fn sweep_stale_sockets(state_dir: &std::path::Path) {
+    let direct = state_dir.join("superpowers-kanban.sock");
+    sweep_one_socket(&direct);
+    if let Ok(resolved) = superpowers_kanban_ipc::server::socket_path(state_dir) {
+        if resolved != direct {
+            sweep_one_socket(&resolved);
+        }
+    }
+}
+
 /// 起查询服务线程。跑在自己的线程里，慢客户端不能拖住推进循环；
 /// 进程退出即随之消失，不需要显式 join。
 fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -> Arc<AtomicBool> {
@@ -798,6 +826,8 @@ fn run_daemon(args: Args) {
     service.migrate_legacy_running();
     service.adopt_running_leases(calendar.limit_at(chrono::Local::now()));
 
+    // 清理上一次运行遗留的死 socket（当前实例尚未 bind，不会误删自己）。
+    sweep_stale_sockets(&args.state_dir);
     // 查询通道与推进循环互不阻塞：宿主问状态时队列照常在动。
     let _query_server = start_query_server(Arc::clone(&service), &args.state_dir);
 
@@ -865,7 +895,8 @@ mod tests {
     use super::{
         Duration, Subcommand, command_add, command_add_merge, command_archive, command_done,
         command_list, command_merge_finish, command_merge_request, command_purge,
-        command_set_switch, effective_interval, parse_subcommand,
+        command_set_switch, effective_interval, parse_subcommand, sweep_one_socket,
+        sweep_stale_sockets,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -1387,5 +1418,49 @@ mod tests {
             superpowers_kanban_core::card::CardState::Running,
             "b 的写入必须留下——锁内 load 才能做到"
         );
+    }
+
+    #[test]
+    fn sweep_removes_a_dead_socket_and_keeps_a_live_one() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // 死 socket：建了监听再关掉，文件留下但没人应答。
+        let dead = state_dir.join("superpowers-kanban.sock");
+        {
+            let listener = UnixListener::bind(&dead).unwrap();
+            drop(listener);
+        }
+        // 关掉监听后，内核对这条刚关闭 socket 的拆除不是瞬时的：紧接着 connect 有
+        // 概率仍然成功（本机并行实测约 1/3），会让「死」socket 看着还活着。必须等到
+        // connect 真的被拒，这才是产品判据 `sweep_one_socket` 判定「死」的同一个条件；
+        // 不等就断言，等于在赌内核的拆除时序（单线程跑总是过，并行就偶发红）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&dead).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "前置：关掉的 socket 必须在预算内变成连不上"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            dead.exists(),
+            "前置：死 socket 文件必须存在（没人应答但文件还在）"
+        );
+
+        // 活 socket：监听者活着。
+        let live_dir = dir.path().join("live");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let live = live_dir.join("superpowers-kanban.sock");
+        let _listener = UnixListener::bind(&live).unwrap();
+
+        sweep_stale_sockets(&state_dir);
+        assert!(!dead.exists(), "连不上的死 socket 必须被清掉");
+
+        // 直接对 live 路径调一次（绕过 state_dir 推导），确认活 socket 不被删。
+        sweep_one_socket(&live);
+        assert!(live.exists(), "有活实例应答的 socket 绝不删");
     }
 }
