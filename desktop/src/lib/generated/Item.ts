@@ -3,7 +3,7 @@ import type { Attachment } from "./Attachment";
 import type { ImageRef } from "./ImageRef";
 import type { ToolStatus } from "./ToolStatus";
 
-export type Item = { "type": "userMessage", id: string, text: string, attachments?: Array<Attachment>, images?: Array<ImageRef>, } | { "type": "agentMessage", id: string, text: string, } | { "type": "toolCall", id: string, call_id: string, name: string, input: unknown, status: ToolStatus, result: string | null, images?: Array<ImageRef>, } | { "type": "userInterjection", id: string, text: string, attachments?: Array<Attachment>, images?: Array<ImageRef>, } | { "type": "thinking", id: string, 
+export type Item = { "type": "userMessage", id: string, text: string, attachments?: Array<Attachment>, images?: Array<ImageRef>, } | { "type": "agentMessage", id: string, text: string, } | { "type": "toolCall", id: string, call_id: string, name: string, input: unknown, status: ToolStatus, result?: string, images?: Array<ImageRef>, } | { "type": "userInterjection", id: string, text: string, attachments?: Array<Attachment>, images?: Array<ImageRef>, } | { "type": "thinking", id: string, 
 /**
  * 展示用明文（`display:"omitted"` 时为空串）。
  */

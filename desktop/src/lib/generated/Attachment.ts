@@ -6,4 +6,4 @@
  * `path` 相对工作区根，形如 `.yi-agent/attachments/<thread_id>/<hash>-<name>`；
  * 服务端在起 turn 前把用户选中的文件复制到该位置，工具据此读取。
  */
-export type Attachment = { name: string, path: string, mime: string | null, size: bigint, };
+export type Attachment = { name: string, path: string, mime?: string, size: number, };

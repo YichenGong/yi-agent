@@ -25,6 +25,8 @@ pub enum Scope {
 #[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(untagged)]
 pub enum RequestId {
+    // 线上是 JSON 数字,与 `Str` 并列构成 `number | string`。
+    #[ts(type = "number")]
     Num(i64),
     Str(String),
 }
@@ -85,9 +87,12 @@ pub struct ReverseRequest<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct RpcError {
+    // JSON-RPC 错误码,线上是 JSON 数字。
+    #[ts(type = "number")]
     pub code: i64,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     #[ts(type = "unknown")]
     pub data: Option<Value>,
 }
@@ -324,6 +329,7 @@ pub enum Notification {
         turn_id: String,
         status: TurnStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         error: Option<String>,
     },
     /// Mid-turn user messages the server could not consume, handed back so the
@@ -506,6 +512,8 @@ pub struct AgentChild {
 #[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTraceRow {
+    // daemon 的持久化行号,线上是 JSON 数字。
+    #[ts(type = "number")]
     pub event_id: i64,
     pub task_id: String,
     pub kind: String,
@@ -563,7 +571,10 @@ pub struct Attachment {
     pub name: String,
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub mime: Option<String>,
+    // 文件字节数;线上是 JSON 数字(远小于 2^53)。
+    #[ts(type = "number")]
     pub size: u64,
 }
 
@@ -577,8 +588,11 @@ pub struct Attachment {
 pub struct ImageRef {
     pub path: String,
     pub media_type: String,
+    // 图片文件字节数;线上是 JSON 数字(远小于 2^53)。
+    #[ts(type = "number")]
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub detail: Option<String>,
 }
 
@@ -606,6 +620,7 @@ pub enum Item {
         input: Value,
         status: ToolStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,

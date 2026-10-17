@@ -7,4 +7,4 @@
  * 服务端在起 turn 前把用户选中的图片复制到 `.yi-agent/attachments/<thread_id>/
  * <hash>-<name>`,客户端据此自行读取并渲染。
  */
-export type ImageRef = { path: string, media_type: string, size: bigint, detail: string | null, };
+export type ImageRef = { path: string, media_type: string, size: number, detail?: string, };

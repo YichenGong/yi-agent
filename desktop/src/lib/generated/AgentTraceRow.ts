@@ -3,4 +3,4 @@
 /**
  * 一条轨迹行,原样透传 daemon 的 `IpcTraceRow`。
  */
-export type AgentTraceRow = { eventId: bigint, taskId: string, kind: string, payloadJson: string, };
+export type AgentTraceRow = { eventId: number, taskId: string, kind: string, payloadJson: string, };
