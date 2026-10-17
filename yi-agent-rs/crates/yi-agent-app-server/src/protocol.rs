@@ -576,6 +576,16 @@ pub enum Item {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
     },
+    /// 一次推理的展示条目（design §6.1 的「思考」卡片）。**不携带凭证**——
+    /// signature / encrypted_content 是服务端回传 API 用的协议数据，前端渲染
+    /// 不需要，也不应持有（避免经客户端往返被意外改写）。
+    Thinking {
+        id: String,
+        /// 展示用明文（`display:"omitted"` 时为空串）。
+        text: String,
+        /// redacted 占位（前端渲染「已加密」，无明文可展示）。
+        redacted: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1001,6 +1011,30 @@ mod tests {
             images: Vec::new(),
         };
         assert!(serde_json::to_value(&item).unwrap().get("images").is_none());
+    }
+
+    /// thinking 展示条目**绝不**携带凭证：signature / encrypted_content 是服务端
+    /// 回传 API 用的协议数据，前端渲染不需要，也不该持有（避免经客户端往返被改写）。
+    /// 这条测试是「凭证不下发前端」的回归钉。
+    #[test]
+    fn thinking_item_serializes_without_credentials() {
+        let item = Item::Thinking {
+            id: "th_1".into(),
+            text: "summary".into(),
+            redacted: false,
+        };
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(json["type"], "thinking");
+        assert_eq!(json["id"], "th_1");
+        assert_eq!(json["text"], "summary");
+        assert_eq!(json["redacted"], false);
+        assert!(json.get("signature").is_none(), "凭证不得下发前端");
+        assert!(json.get("encrypted_content").is_none(), "凭证不得下发前端");
+        let raw = json.to_string();
+        assert!(
+            !raw.contains("signature") && !raw.contains("encrypted_content"),
+            "thinking item 的 wire 形状不得出现任何凭证字段: {raw}"
+        );
     }
 
     #[test]

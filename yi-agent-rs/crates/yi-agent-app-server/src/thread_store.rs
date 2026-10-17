@@ -1501,6 +1501,46 @@ mod tests {
         assert!(!loaded.pending_turn, "no partial file ⇒ nothing pending");
     }
 
+    /// `Item::Thinking` 走既有 item 机制落盘/回放：append → load 后逐字等价，
+    /// 且磁盘上的 JSONL **不含**任何凭证（signature / encrypted_content）。
+    #[test]
+    fn thinking_item_round_trips_and_stays_credential_free() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-a")).unwrap();
+        let thinking = crate::protocol::Item::Thinking {
+            id: "item-turn1-2".into(),
+            text: "cot summary".into(),
+            redacted: false,
+        };
+        store
+            .append_turn(
+                "thread-a",
+                &TurnLine::Turn {
+                    items: vec![user_item("user-t1", "hi"), thinking.clone()],
+                    usage: None,
+                    messages: vec![],
+                },
+            )
+            .unwrap();
+
+        let loaded = store.load("thread-a").unwrap().unwrap();
+        assert_eq!(
+            loaded.items.last(),
+            Some(&thinking),
+            "thinking item must replay verbatim after append + load"
+        );
+
+        // 磁盘上不得出现凭证字段：展示条目只带明文与 redacted 位。
+        let log =
+            std::fs::read_to_string(dir.path().join(".yi-agent/threads/thread-a.jsonl")).unwrap();
+        assert!(log.contains("\"type\":\"thinking\""), "got: {log}");
+        assert!(
+            !log.contains("signature") && !log.contains("encrypted_content"),
+            "persisted thinking item must never carry a credential: {log}"
+        );
+    }
+
     #[test]
     fn load_merges_an_uncommitted_partial_turn() {
         let dir = tempfile::TempDir::new().unwrap();

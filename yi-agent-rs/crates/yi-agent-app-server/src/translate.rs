@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use yi_agent_core::message::{ContentBlock, ImageSource};
+use yi_agent_core::message::{ContentBlock, ImageSource, ThinkingToken};
 use yi_agent_core::{AgentEvent, DoneReason, TokenUsage};
 
 use crate::protocol::{Item, Notification, ToolStatus, TurnStatus};
@@ -314,18 +314,30 @@ impl Translator {
                     kind,
                 });
             }
-            AgentEvent::ThinkingBlock { .. } => {
+            AgentEvent::ThinkingBlock { text, token } => {
                 // 块级凭证已在 `accumulate_stream` 进入 session，并随 `TurnLine.messages`
                 // 落盘（server.rs 直接取 `agent.session().messages()`），故此处**无需**再
-                // 持久化任何东西——本任务只接入通道，不改变落盘行为。
+                // 持久化任何东西——本任务只接入展示通道，不改变落盘行为。
                 //
-                // 展示也不缺：明文增量已由 `ReasoningDelta` 走
-                // `thread/reasoningDelta` 实时下发。thinking 的独立展示条目
-                // （`Item::Thinking`，**不携带凭证**）属于 Task 13。
+                // 展示：明文增量由 `ReasoningDelta` 走 `thread/reasoningDelta` 实时下发；
+                // 这里额外产出一个**不携带凭证**的 `Item::Thinking`（design §6.3），
+                // 让客户端在历史回放期也能渲染「思考」卡片（实时期前端会用它接管
+                // 已打开的本地推理块）。凭证（signature / encrypted_content / redacted
+                // data）**绝不**进入该 item——`redacted` 只暴露"这是占位"这一位信息。
                 //
-                // 因此本分支刻意不产出任何通知：绝不能打开/追加 agentMessage——
-                // 那会把 CoT 当答案正文（既有测试
+                // 本分支绝不打开/追加 agentMessage：那会把 CoT 当答案正文（既有测试
                 // `reasoning_delta_becomes_a_reasoning_notification` 钉住了这一点）。
+                let redacted = matches!(token, ThinkingToken::Redacted(_));
+                let id = self.alloc_item_id();
+                let item = Item::Thinking { id, text, redacted };
+                out.push(Notification::ItemStarted {
+                    thread_id: self.thread_id.clone(),
+                    item: item.clone(),
+                });
+                out.push(Notification::ItemCompleted {
+                    thread_id: self.thread_id.clone(),
+                    item,
+                });
             }
             AgentEvent::Notice { level, text } => {
                 // A non-fatal runtime notice (channel fallback / effort
@@ -667,8 +679,9 @@ mod tests {
     /// `reasoning_delta_becomes_a_reasoning_notification`）。
     ///
     /// 断言的是真实保证：不产生任何开/追加 agentMessage 的通知。它**不**断言
-    /// 通知为空——Task 13 会在此接入 `Item::Thinking`（不携带凭证）的展示条目，
-    /// 届时多出一条 thinking 通知是合法的。
+    /// 通知为空——Task 13 已在此接入 `Item::Thinking`（不携带凭证）的展示条目，
+    /// 故本事件会多出一条 thinking 通知（见
+    /// `thinking_block_becomes_a_credential_free_thinking_item`）。
     #[test]
     fn thinking_block_does_not_leak_into_the_visible_agent_message() {
         let mut t = translator();
@@ -714,6 +727,78 @@ mod tests {
             body.as_deref(),
             Some("hi"),
             "the completed message body must be the answer alone, got {out:?}"
+        );
+    }
+
+    /// 块级 `ThinkingBlock` 必须产出一个**不携带凭证**的 `Item::Thinking`
+    /// 展示条目（design §6.3 / §6.1）：`item/started` + `item/completed` 各一次，
+    /// text 为明文、redacted 由 token 变体决定，wire 上**绝不**出现 signature /
+    /// encrypted_content。
+    #[test]
+    fn thinking_block_becomes_a_credential_free_thinking_item() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::ThinkingBlock {
+            text: "cot summary".into(),
+            token: ThinkingToken::Signature("SIG-MUST-NOT-LEAK".into()),
+        });
+
+        let started = out.iter().find_map(|n| match n {
+            Notification::ItemStarted {
+                item: Item::Thinking { id, text, redacted },
+                ..
+            } => Some((id.clone(), text.clone(), *redacted)),
+            _ => None,
+        });
+        let (id, text, redacted) = started.expect("a thinking item must be started");
+        assert_eq!(text, "cot summary");
+        assert!(!redacted, "a signature block is not a redacted placeholder");
+
+        let completed = out
+            .iter()
+            .find_map(|n| match n {
+                Notification::ItemCompleted {
+                    item: Item::Thinking { id: cid, .. },
+                    ..
+                } => Some(cid.clone()),
+                _ => None,
+            })
+            .expect("a thinking item must be completed");
+        assert_eq!(id, completed, "started and completed must share one id");
+
+        // 凭证保真铁律的反面：展示条目不得把 signature 带到 wire 上。
+        let raw = serde_json::to_string(&out).unwrap();
+        assert!(
+            !raw.contains("SIG-MUST-NOT-LEAK") && !raw.contains("signature"),
+            "the thinking item must never carry the block credential: {raw}"
+        );
+    }
+
+    /// redacted 块（Anthropic `redacted_thinking`）展示为占位：明文为空、
+    /// `redacted = true`，同样不带凭证本体。
+    #[test]
+    fn redacted_thinking_block_becomes_a_placeholder_item() {
+        let mut t = translator();
+        let out = t.on_event(AgentEvent::ThinkingBlock {
+            text: String::new(),
+            token: ThinkingToken::Redacted("REDACTED-DATA".into()),
+        });
+
+        let found = out.iter().find_map(|n| match n {
+            Notification::ItemStarted {
+                item: Item::Thinking { text, redacted, .. },
+                ..
+            } => Some((text.clone(), *redacted)),
+            _ => None,
+        });
+        assert_eq!(
+            found,
+            Some((String::new(), true)),
+            "a redacted block renders as an empty-text placeholder, got {out:?}"
+        );
+        let raw = serde_json::to_string(&out).unwrap();
+        assert!(
+            !raw.contains("REDACTED-DATA"),
+            "the redacted credential must not reach the client: {raw}"
         );
     }
 

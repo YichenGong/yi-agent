@@ -7037,7 +7037,8 @@ pub(crate) fn item_id(item: &crate::protocol::Item) -> Option<&str> {
         crate::protocol::Item::UserMessage { id, .. }
         | crate::protocol::Item::AgentMessage { id, .. }
         | crate::protocol::Item::ToolCall { id, .. }
-        | crate::protocol::Item::UserInterjection { id, .. } => Some(id),
+        | crate::protocol::Item::UserInterjection { id, .. }
+        | crate::protocol::Item::Thinking { id, .. } => Some(id),
     }
 }
 
