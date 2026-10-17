@@ -8,69 +8,13 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde_json::Value;
 
 use yi_agent_core::provider::TokenUsage;
 use yi_agent_core::{ProviderError, ProviderEvent, ReasoningKind, StopReason};
 
-struct SseFrame {
-    data: String,
-}
-
-struct SseLineParser {
-    buf: Vec<u8>,
-    current_data_lines: Vec<String>,
-}
-
-impl SseLineParser {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            current_data_lines: Vec::new(),
-        }
-    }
-
-    fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
-        self.buf.extend_from_slice(chunk);
-        let mut frames = Vec::new();
-
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = self.buf.drain(..=nl).collect();
-            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
-
-            let mut line = match std::str::from_utf8(line_bytes) {
-                Ok(s) => s.to_string(),
-                Err(e) => {
-                    frames.push(SseFrame {
-                        data: format!("{{\"__parse_error\":\"invalid UTF-8 in SSE line: {e}\"}}"),
-                    });
-                    continue;
-                }
-            };
-
-            if line.ends_with('\r') {
-                line.pop();
-            }
-
-            if line.is_empty() {
-                if !self.current_data_lines.is_empty() {
-                    let data = std::mem::take(&mut self.current_data_lines).join("\n");
-                    frames.push(SseFrame { data });
-                }
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("data:") {
-                self.current_data_lines.push(rest.trim().to_string());
-            } else if line.starts_with(':') {
-                // Comment, ignore.
-            }
-        }
-
-        frames
-    }
-}
+use crate::sse::{SseFrame, SseStreamCore};
 
 /// A tool call being assembled from streamed deltas.
 ///
@@ -88,9 +32,7 @@ struct PendingToolCall {
 }
 
 pub struct OpenaiStream<S> {
-    line_parser: SseLineParser,
-    inner: S,
-    pending_frames: VecDeque<SseFrame>,
+    core: SseStreamCore<S>,
     pending_events: VecDeque<ProviderEvent>,
     pending_tool_calls: HashMap<usize, PendingToolCall>,
     /// Whether a Stop event has already been emitted (from finish_reason or [DONE]).
@@ -105,9 +47,7 @@ where
 {
     pub fn new(inner: S) -> Self {
         Self {
-            line_parser: SseLineParser::new(),
-            inner,
-            pending_frames: VecDeque::new(),
+            core: SseStreamCore::new(inner),
             pending_events: VecDeque::new(),
             pending_tool_calls: HashMap::new(),
             stopped: false,
@@ -220,11 +160,6 @@ where
                 });
             }
             return Ok(events);
-        }
-
-        if let Some(rest) = frame.data.strip_prefix("{\"__parse_error\":") {
-            let msg = rest.trim_end_matches('}');
-            return Err(ProviderError::Stream(msg.to_string()));
         }
 
         let data: Value = serde_json::from_str(&frame.data).map_err(|e| {
@@ -375,51 +310,19 @@ where
                 return Poll::Ready(Some(Ok(event)));
             }
 
-            while let Some(frame) = self.pending_frames.pop_front() {
-                match self.parse_frame(frame) {
+            match self.core.poll_next_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(frame))) => match self.parse_frame(frame) {
                     Ok(events) => {
                         if events.is_empty() {
                             continue;
                         }
-                        for ev in events {
-                            self.pending_events.push_back(ev);
-                        }
-                        // Break out of the while loop to go back to the top of
-                        // the outer loop, which will drain pending_events first.
-                        break;
+                        self.pending_events.extend(events);
                     }
                     Err(e) => return Poll::Ready(Some(Err(e))),
-                }
-            }
-
-            // If we have events queued from the while loop above, loop back
-            // to drain them before polling the inner stream.
-            if !self.pending_events.is_empty() {
-                continue;
-            }
-
-            match self.inner.poll_next_unpin(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Err(e))) => {
-                    // See the Anthropic stream for why `is_timeout()` must be
-                    // checked before `is_decode()`: a deadline's Display text is
-                    // "error decoding response body".
-                    // Only a deadline is retryable, so only it becomes
-                    // `Network`. A connection reset or other transport break
-                    // stays `Stream`, which the agent loop treats as terminal
-                    // (see the design's retryable/not-retryable table).
-                    let error = if e.is_timeout() {
-                        ProviderError::Network(format!("stream error: timed out: {e}"))
-                    } else {
-                        ProviderError::Stream(format!("stream error: {e}"))
-                    };
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let frames = self.line_parser.feed(&chunk);
-                    self.pending_frames.extend(frames);
-                }
+                },
             }
         }
     }
@@ -836,5 +739,20 @@ mod tests {
             "整条消息的 reasoning_content 汇总为一个块"
         );
         assert_eq!(token, yi_agent_core::ThinkingToken::None, "DeepSeek 无凭证");
+    }
+
+    #[tokio::test]
+    async fn surfaces_invalid_utf8_as_a_stream_error() {
+        let chunks: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: \xff\n\n"))];
+        let stream = OpenaiStream::new(stream::iter(chunks));
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Err(ProviderError::Stream(msg)) => {
+                assert!(msg.starts_with("invalid UTF-8 in SSE line: "), "got: {msg}")
+            }
+            other => panic!("expected Stream error, got {other:?}"),
+        }
     }
 }

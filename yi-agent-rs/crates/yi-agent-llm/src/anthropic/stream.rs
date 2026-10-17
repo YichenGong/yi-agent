@@ -3,102 +3,23 @@
 //! Reads raw bytes from a `reqwest` response stream and emits `ProviderEvent`s.
 //! Handles the standard SSE wire format: `event: <name>\n` / `data: <json>\n` / `\n` (event boundary).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde_json::Value;
 
 use yi_agent_core::provider::TokenUsage;
 use yi_agent_core::{ProviderError, ProviderEvent, ReasoningKind, StopReason};
 
-/// One SSE frame parsed from the byte stream.
-struct SseFrame {
-    data: String,
-}
-
-/// Parses raw byte chunks into SSE frames.
-///
-/// Buffers raw bytes (not a `String`) so that TCP chunk boundaries splitting a
-/// multi-byte UTF-8 character do not cause data loss. Bytes are only decoded to
-/// UTF-8 once a complete line (terminated by `\n`) is available.
-struct SseLineParser {
-    buf: Vec<u8>,
-    current_data_lines: Vec<String>,
-}
-
-impl SseLineParser {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            current_data_lines: Vec::new(),
-        }
-    }
-
-    /// Feed a chunk of bytes. Returns completed SSE frames.
-    fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
-        self.buf.extend_from_slice(chunk);
-        let mut frames = Vec::new();
-
-        // Process each complete line while leaving a partial trailing line buffered.
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            // Extract the line (without the `\n`) and remove it from the buffer.
-            let line_bytes: Vec<u8> = self.buf.drain(..=nl).collect();
-            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
-
-            // Decode the complete line to UTF-8. A complete SSE line is always
-            // valid UTF-8 from Anthropic; if it isn't, we surface the error
-            // rather than silently dropping bytes.
-            let mut line = match std::str::from_utf8(line_bytes) {
-                Ok(s) => s.to_string(),
-                Err(e) => {
-                    // Drop the malformed line but keep going; surface the error
-                    // via a synthetic frame so the caller can decide.
-                    frames.push(SseFrame {
-                        data: format!("{{\"type\":\"__parse_error\",\"error\":\"invalid UTF-8 in SSE line: {e}\"}}"),
-                    });
-                    continue;
-                }
-            };
-
-            // Strip trailing \r if present (CRLF)
-            if line.ends_with('\r') {
-                line.pop();
-            }
-
-            if line.is_empty() {
-                // Empty line = event boundary. Emit a frame if we have data.
-                if !self.current_data_lines.is_empty() {
-                    let data = std::mem::take(&mut self.current_data_lines).join("\n");
-                    frames.push(SseFrame { data });
-                }
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("data:") {
-                self.current_data_lines.push(rest.trim().to_string());
-            } else if line.starts_with(':') {
-                // Comment, ignore.
-            } else {
-                // Unknown field (including `event:`) — we dispatch on the JSON
-                // `type` field in the data payload, so the SSE `event:` line
-                // is not needed.
-            }
-        }
-
-        frames
-    }
-}
+use crate::sse::{SseFrame, SseStreamCore};
 
 /// Converts a `Stream<Item = Result<Bytes, reqwest::Error>>` into a
 /// `Stream<Item = Result<ProviderEvent, ProviderError>>`.
 pub struct AnthropicStream<S> {
-    line_parser: SseLineParser,
-    inner: S,
-    /// Frames parsed from the inner stream but not yet emitted as events.
-    pending_frames: VecDeque<SseFrame>,
+    core: SseStreamCore<S>,
     /// Maps content block index → tool_use_id (set on content_block_start, read on delta/stop).
     block_ids: HashMap<usize, String>,
     /// Queued Stop event from a message_delta that carried both usage and stop_reason.
@@ -124,9 +45,7 @@ where
 {
     pub fn new(inner: S) -> Self {
         Self {
-            line_parser: SseLineParser::new(),
-            inner,
-            pending_frames: VecDeque::new(),
+            core: SseStreamCore::new(inner),
             block_ids: HashMap::new(),
             pending_stop: None,
             thinking_buffers: HashMap::new(),
@@ -143,13 +62,6 @@ where
         let event_type = data.get("type").and_then(Value::as_str).unwrap_or("");
 
         match event_type {
-            "__parse_error" => {
-                let msg = data
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("invalid UTF-8 in SSE line");
-                Err(ProviderError::Stream(msg.to_string()))
-            }
             "content_block_start" => {
                 let index = data.get("index").and_then(Value::as_u64).ok_or_else(|| {
                     ProviderError::Stream("content_block_start missing index".into())
@@ -367,48 +279,21 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            // First, emit any pending Stop event (from a message_delta that had
-            // both usage + stop_reason).  This must be checked BEFORE draining
-            // pending_frames so that the Stop event comes after the Usage event.
+            // 先发挂起的 Stop（来自同时带 usage + stop_reason 的 message_delta），
+            // 必须早于取帧，才能保证 Stop 排在 Usage 之后。
             if let Some(reason) = self.pending_stop.take() {
                 return Poll::Ready(Some(Ok(ProviderEvent::Stop { reason })));
             }
 
-            // Then, drain any pending frames from a previous chunk.
-            while let Some(frame) = self.pending_frames.pop_front() {
-                match self.parse_frame(frame) {
+            match self.core.poll_next_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(frame))) => match self.parse_frame(frame) {
                     Ok(Some(event)) => return Poll::Ready(Some(Ok(event))),
                     Ok(None) => continue,
                     Err(e) => return Poll::Ready(Some(Err(e))),
-                }
-            }
-
-            // No pending frames — poll the inner stream for more bytes.
-            match self.inner.poll_next_unpin(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Err(e))) => {
-                    // Classify while the `reqwest::Error` is still in hand: for a
-                    // deadline its Display is "error decoding response body",
-                    // which carries no "timed out" text. `is_timeout()` walks the
-                    // source chain and is the only reliable signal. Check it
-                    // before `is_decode()`, which also matches this error.
-                    // Only a deadline is retryable, so only it becomes
-                    // `Network`. A connection reset or other transport break
-                    // stays `Stream`, which the agent loop treats as terminal
-                    // (see the design's retryable/not-retryable table).
-                    let error = if e.is_timeout() {
-                        ProviderError::Network(format!("stream error: timed out: {e}"))
-                    } else {
-                        ProviderError::Stream(format!("stream error: {e}"))
-                    };
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let frames = self.line_parser.feed(&chunk);
-                    self.pending_frames.extend(frames);
-                    // Loop back to drain the newly queued frames.
-                }
+                },
             }
         }
     }
@@ -749,5 +634,20 @@ mod tests {
             .position(|e| matches!(e, ProviderEvent::ToolUseStart { .. }))
             .expect("tool use emitted");
         assert!(thinking_at < tool_at, "thinking must precede tool_use");
+    }
+
+    #[tokio::test]
+    async fn surfaces_invalid_utf8_as_a_stream_error() {
+        let chunks: Vec<Result<Bytes, reqwest::Error>> =
+            vec![Ok(Bytes::from_static(b"data: \xff\n\n"))];
+        let stream = AnthropicStream::new(stream::iter(chunks));
+        let events: Vec<_> = stream.collect().await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Err(ProviderError::Stream(msg)) => {
+                assert!(msg.starts_with("invalid UTF-8 in SSE line: "), "got: {msg}")
+            }
+            other => panic!("expected Stream error, got {other:?}"),
+        }
     }
 }
