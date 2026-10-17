@@ -4413,6 +4413,75 @@ where
                             }
                         }
                     }
+                    "thread/setTag" => {
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // 参数校验先于 thread 存在性：非法颜色一律 `-32602`，
+                        // 与 setPinned 的「非布尔先报错」同一顺序。
+                        let raw = req
+                            .params
+                            .get("tag")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let tag: Option<String> = match raw {
+                            serde_json::Value::Null => None,
+                            serde_json::Value::String(s)
+                                if crate::thread_store::is_valid_tag(&s) =>
+                            {
+                                Some(s)
+                            }
+                            other => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!(
+                                            "tag must be null or one of the 6 palette ids, got {other}"
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        match store_lookup(&threads, &workspaces, &cfg, &thread_id)
+                            .set_tag(&thread_id, tag.as_deref())
+                        {
+                            Ok(true) => {
+                                write_response(&hub, &client, ok_response(id, json!({}))).await?;
+                                // 广播给所有客户端（含本端）：列表层恒推，就在地
+                                // 更新色点，无需各自重拉 thread/listAll。
+                                let _ = write_notification(
+                                    &hub,
+                                    &Notification::TagChanged {
+                                        thread_id: thread_id.clone(),
+                                        tag: tag.clone(),
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(false) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
                     "thread/reorderPinned" => {
                         let arr = match req.params.get("threadIds").and_then(|v| v.as_array()) {
                             Some(a) => a,
@@ -5956,6 +6025,7 @@ fn thread_summary_json(
         "pinned": m.pin_seq.is_some(),
         "board_project": m.board_project,
         "card_id": m.card_id,
+        "tag": m.tag,
         "status": thread_status(threads, &m.thread_id),
     })
 }
@@ -19335,6 +19405,117 @@ pub(crate) mod tests {
         h.send(&dup.to_string()).await;
         let v = read_response(&mut h, 23).await;
         assert_eq!(v["error"]["code"], -32602, "重复 id → invalid_params: {v}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_tag_persists_and_reports_in_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        let set = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/setTag",
+            "params":{"threadId": tid, "tag": "red"}});
+        h.send(&set.to_string()).await;
+        let resp = read_response(&mut h, 3).await;
+        assert!(resp.get("error").is_none(), "setTag 应成功: {resp}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        let me = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap().iter())
+            .find(|t| t["thread_id"].as_str() == Some(tid.as_str()))
+            .expect("in group");
+        assert_eq!(me["tag"], "red");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_tag_null_clears() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        for (id, tag) in [
+            (3u64, serde_json::json!("green")),
+            (4, serde_json::Value::Null),
+        ] {
+            let req = serde_json::json!({"jsonrpc":"2.0","id": id, "method":"thread/setTag",
+                "params":{"threadId": tid, "tag": tag}});
+            h.send(&req.to_string()).await;
+            let resp = read_response(&mut h, id).await;
+            assert!(resp.get("error").is_none(), "setTag 应成功: {resp}");
+        }
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        let me = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap().iter())
+            .find(|t| t["thread_id"].as_str() == Some(tid.as_str()))
+            .expect("in group");
+        assert!(me["tag"].is_null(), "清除后应为 null: {me}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_tag_rejects_unknown_color_and_unknown_thread() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        // 先校验颜色：非法值一律 -32602，无论 thread 是否存在。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/setTag","params":{"threadId":"thread-x","tag":"chartreuse"}}"#).await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/setTag","params":{"threadId":"thread-x","tag":"red"}}"#).await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(
+            v["error"]["code"],
+            serde_json::json!(-32011),
+            "合法颜色 + 未知 thread 应为 unknown_thread: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_tag_broadcasts_tag_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        let set = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/setTag",
+            "params":{"threadId": tid, "tag": "purple"}});
+        h.send(&set.to_string()).await;
+        let _ = read_response(&mut h, 3).await;
+
+        let ev = read_until_method(&mut h, "thread/tagChanged").await;
+        assert_eq!(ev["params"]["thread_id"], tid);
+        assert_eq!(ev["params"]["tag"], "purple");
         h.shutdown().await;
     }
 
