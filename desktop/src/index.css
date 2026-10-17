@@ -315,3 +315,120 @@ html[data-mobile="true"] {
 [data-mobile="true"] .app-sidebar input[type="search"] {
   font-size: 16px;
 }
+
+/*
+ * 手机端设置：居中弹窗 → 全屏页。
+ *
+ * 桌面是「70vw 居中浮层 + 160px 左侧竖栏」。390pt 上 70vw 只有 273px，而左侧栏是
+ * 写死的 `w-40`（160px，不随视口缩放）——它吃掉 59%，内容面板只剩 111px，四个 Tab
+ * 全部横向溢出（实测：通用 +4px、远程访问 +28px、插件 +183px、模型 +352px）。溢出
+ * 还滚不到：面板是 `overflow-y-auto`，只允许纵向滚动，右侧内容永久不可达。
+ *
+ * 手机端改成整屏页面、导航移到顶部横排，内容因此拿到全部宽度（实测 390px）。桌面
+ * 不匹配 `[data-mobile="true"]`，布局与观感逐字节不变。
+ */
+[data-mobile="true"] .settings-shell {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  width: auto;
+  max-width: none;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  /* 底部安全区落在下面的滚动容器上（见 `.settings-panel`），这里不铺，免得
+     滚动条区域也留白。 */
+  padding-bottom: 0;
+}
+
+/*
+ * 导航：左侧竖栏 → 顶部横条，每格等宽。实测 320/360/375/390/430pt 五档
+ * `tablist.scrollWidth == clientWidth`（零溢出）；最窄的 320pt 上每格仍有 80px，
+ * 最长的「远程访问」四字单行放得下。
+ */
+[data-mobile="true"] .settings-nav {
+  flex-direction: row;
+  width: auto;
+  flex-shrink: 0;
+  border-right: 0;
+  border-bottom: 1px solid var(--line);
+}
+[data-mobile="true"] .settings-nav > [role="tab"] {
+  flex: 1 1 0;
+  white-space: nowrap;
+  text-align: center;
+  padding-top: 12px;
+  padding-bottom: 12px; /* 单格高 ≈ 44px，达到 Apple HIG 触控下限 */
+}
+
+/*
+ * 全屏页没有浮层，遮罩无意义——隐藏它（关闭走右上角按钮或 Escape）。复用既有的
+ * `data-settings-backdrop` 属性选择器，不新加类名；jsdom 里没有 `data-mobile`，
+ * 该规则不生效，「点击遮罩关闭」那条既有用例不受影响。
+ */
+[data-mobile="true"] [data-settings-backdrop] {
+  display: none;
+}
+
+/*
+ * 头部栏的顶部安全区：全屏页从 `top: 0` 起，刘海区必须有留白，否则「设置」标题与
+ * 关闭按钮会落在刘海/状态栏底下。`max(..., 12px)` 兜住没有安全区的设备（横屏
+ * 时安全区在左右两侧，此处回落 12px 常规留白）。
+ *
+ * 用挂点类而不是 `.settings-shell > div:first-child`：shell 的第一个子元素是
+ * `<nav>`，而头部栏嵌在第二层的包裹 div 里——位置选择器要么匹配不到，要么写成一串
+ * 脆弱的后代链。显式类名与 `.app-statusbar` 的做法一致。
+ */
+[data-mobile="true"] .settings-header {
+  padding-top: max(env(safe-area-inset-top, 0px), 12px);
+}
+
+/*
+ * 面板：全屏页里它是唯一的滚动容器，底部安全区补在它身上——`.settings-shell` 是
+ * `fixed`，脱离 `body` 的内边距，安全区必须自己补一次，滚到底时最后一行才不被
+ * Home Indicator 压住。与侧栏 `aside`（见上方 `.app-sidebar aside`）同一理由与
+ * 同一做法，且全链路只补这一次。
+ */
+[data-mobile="true"] .settings-panel {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  overscroll-behavior: contain;
+}
+
+/*
+ * 手机端的层级重排：DOM 顺序是 [nav, (header, panel)]，而手机上要的视觉顺序是
+ * [header, nav, panel]——标题栏必须在 Tab 条**之上**，否则：(1) 观感上「设置」标题
+ * 跑到了 Tab 条下面；(2) 更实际的，顶部安全区（刘海）内边距挂在 `.settings-header`
+ * 上，标题栏一旦排在后面，那段留白就落到了屏幕中部，Tab 条反而紧贴刘海/状态栏，
+ * 真机上会被状态栏压住。
+ *
+ * 跨嵌套层级无法用 `order` 直接重排，故让中间那层包裹 div `display: contents`
+ * 「消失」（它本身没有边框/背景/内边距，只是布局容器），其子元素升为 shell 的直接
+ * flex item，order 随即可用。桌面端不匹配该选择器，DOM 与观感逐字节不变。
+ */
+[data-mobile="true"] .settings-body {
+  display: contents;
+}
+[data-mobile="true"] .settings-header {
+  order: 1;
+  /* 升为 flex item 后必须锁住自身高度，否则会被纵向 flex 压缩。 */
+  flex-shrink: 0;
+}
+[data-mobile="true"] .settings-nav {
+  order: 2;
+}
+[data-mobile="true"] .settings-panel {
+  order: 3;
+}
+
+/*
+ * 设置面板内的输入控件字号下限：面板里的输入框是 `text-sm`（14px），而 iOS 在聚焦
+ * 字号 < 16px 的输入框时会自动放大页面——`lockZoom` 只能禁掉用户的手动捏合缩放，
+ * 挡不住这条自动放大；放大后页面不再贴合屏幕，之后每次滑动都变成两轴平移。
+ * 16px 是 iOS 不触发自动放大的下限，与侧栏搜索框那条（见上）同源、同理由。
+ * 桌面端不匹配 `[data-mobile]`，逐字节不变。
+ */
+[data-mobile="true"] .settings-panel input,
+[data-mobile="true"] .settings-panel select {
+  font-size: 16px;
+}

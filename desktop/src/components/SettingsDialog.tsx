@@ -22,6 +22,7 @@ const panelId = (id: TabId) => `settings-panel-${id}`;
 
 export function SettingsDialog({
   open,
+  isMobile = false,
   theme,
   onThemeChange,
   onClose,
@@ -34,6 +35,15 @@ export function SettingsDialog({
   saveRelayUrl,
 }: {
   open: boolean;
+  /**
+   * 手机端（配对后的 iPhone 客户端）：居中弹窗改成整屏页面。由宿主把已有的
+   * `useIsMobile()` 结论传下来，本组件不重复探测——`<html data-mobile>` 只能有
+   * 一个设置者，两处 effect 会重复写 `dataset`。
+   *
+   * 只影响两件事：导航方向（`aria-orientation`）与「模型」Tab 的表格/卡片形态。
+   * 其余外观覆写全在 `index.css` 的 `[data-mobile="true"]` 前缀规则里，桌面不匹配。
+   */
+  isMobile?: boolean;
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
   onClose: () => void;
@@ -112,13 +122,13 @@ export function SettingsDialog({
         role="dialog"
         aria-modal="true"
         aria-label="设置"
-        className="relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
+        className="settings-shell relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
       >
         <nav
           role="tablist"
-          aria-orientation="vertical"
+          aria-orientation={isMobile ? "horizontal" : "vertical"}
           onKeyDown={onTablistKeyDown}
-          className="flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
+          className="settings-nav flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
         >
           {TABS.map((t) => (
             <button
@@ -138,14 +148,25 @@ export function SettingsDialog({
             </button>
           ))}
         </nav>
-        <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex items-center justify-between border-b border-line px-4 py-2">
+        {/*
+          手机端要靠 `order` 把标题栏排到 Tab 条之前（DOM 里 nav 是 shell 的第一个
+          子元素，标题栏却嵌在这个包裹层里）；跨层级无法直接重排，故手机端给这一层
+          `display: contents` 让它「消失」，其子元素升为 shell 的 flex item，order 才
+          生效。桌面端该类无任何样式命中，DOM 与观感逐字节不变。
+        */}
+        <div className="settings-body flex min-w-0 flex-1 flex-col">
+          <div className="settings-header flex items-center justify-between border-b border-line px-4 py-2">
             <span className="text-xs text-fg-subtle">设置</span>
+            {/* 手机端给足 44px 触控目标（Apple HIG，与抽屉按钮同一标准）——手机上
+                遮罩被 CSS 隐藏，关闭只能靠这颗按钮或 Escape。桌面沿用原样（`px-2`），
+                保持「桌面逐字节不变」这条硬不变量。 */}
             <button
               type="button"
               aria-label="关闭设置"
               onClick={onClose}
-              className="rounded px-2 text-fg-subtle hover:text-fg"
+              className={`${
+                isMobile ? "flex size-11 shrink-0 items-center justify-center" : "px-2"
+              } rounded text-fg-subtle hover:text-fg`}
             >
               ×
             </button>
@@ -155,7 +176,7 @@ export function SettingsDialog({
             role="tabpanel"
             id={panelId(active)}
             aria-labelledby={tabId(active)}
-            className="min-h-0 flex-1 overflow-y-auto"
+            className="settings-panel min-h-0 flex-1 overflow-y-auto"
           >
             {active === "general" ? (
               <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
@@ -172,7 +193,7 @@ export function SettingsDialog({
                 defaultProject={pluginDefaultProject}
               />
             ) : (
-              <SettingsModelsTab call={modelCall} />
+              <SettingsModelsTab call={modelCall} isMobile={isMobile} />
             )}
           </div>
         </div>

@@ -181,4 +181,108 @@ describe("phone layout CSS", () => {
     expect(rule).toMatch(/-webkit-user-select:\s*text/);
     expect(rule).toMatch(/user-select:\s*text/);
   });
+
+  it("turns the phone settings into a full-screen page with a top tab bar", () => {
+    // 「设置区域过于小」的根因：弹窗 `w-[70vw]` 在 390pt 上只有 273px，左侧竖栏又是
+    // 写死的 `w-40`(160px)，占去 59%，内容面板只剩 111px 且横向溢出滚不到。手机端
+    // 必须整屏（`position: fixed` + `inset: 0`）并让导航横排，内容才拿得到全部宽度。
+    const shell =
+      /\[data-mobile="true"\]\s+\.settings-shell\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(shell).toMatch(/position:\s*fixed/);
+    expect(shell).toMatch(/inset:\s*0/);
+    expect(shell).toMatch(/flex-direction:\s*column/);
+    // 弹窗那套尺寸必须被解除，否则 fixed 了却仍是 70vw/70vh 的小盒子。
+    expect(shell).toMatch(/width:\s*auto/);
+    expect(shell).toMatch(/max-width:\s*none/);
+    expect(shell).toMatch(/height:\s*auto/);
+
+    const nav = /\[data-mobile="true"\]\s+\.settings-nav\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(nav).toMatch(/flex-direction:\s*row/);
+    // 竖栏那条右边框要撤掉，改由底边框分栏。
+    expect(nav).toMatch(/border-right:\s*0/);
+
+    const tab =
+      /\[data-mobile="true"\]\s+\.settings-nav\s*>\s*\[role="tab"\]\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    // 每格等宽：320pt 上也有 80px，四字标签不折行。
+    expect(tab).toMatch(/flex:\s*1 1 0/);
+    expect(tab).toMatch(/white-space:\s*nowrap/);
+    // 44px 触控下限（Apple HIG）：上下各 12px 内边距 + 行高。
+    expect(tab).toMatch(/padding-top:\s*12px/);
+    expect(tab).toMatch(/padding-bottom:\s*12px/);
+  });
+
+  it("hides the settings backdrop on the phone", () => {
+    // 全屏页没有浮层，遮罩只剩白占屏；关闭改走右上角按钮或 Escape。
+    expect(css()).toMatch(
+      /\[data-mobile="true"\]\s+\[data-settings-backdrop\]\s*\{[^}]*display:\s*none/,
+    );
+  });
+
+  it("gives the phone settings page its own safe-area insets", () => {
+    // 全屏页是 `fixed`，脱离 `body` 的内边距，顶部（刘海）与底部（Home Indicator）
+    // 都必须自己补：顶部落在头部栏，底部落在唯一的滚动容器上，且各只补一次。
+    const head =
+      /\[data-mobile="true"\]\s+\.settings-header\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(head).toMatch(/padding-top:\s*max\(env\(safe-area-inset-top/);
+
+    const panel =
+      /\[data-mobile="true"\]\s+\.settings-panel\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(panel).toMatch(/padding-bottom:\s*env\(safe-area-inset-bottom/);
+
+    // shell 自身不得再补底部安全区，否则与面板那条叠成两倍。
+    const shell =
+      /\[data-mobile="true"\]\s+\.settings-shell\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(shell).toMatch(/padding-bottom:\s*0/);
+  });
+
+  it("puts the settings header above the tab bar on the phone", () => {
+    // DOM 顺序是 [nav, (header, panel)]，而手机上要的视觉顺序是 [header, nav, panel]。
+    // 标题栏若排在 Tab 条之后：(1) 观感上「设置」标题跑到 Tab 条下面；(2) 更实际的，
+    // 顶部安全区（刘海）内边距挂在 `.settings-header` 上，那段留白会落到屏幕中部，
+    // Tab 条反而紧贴状态栏被压住。跨嵌套层级要靠 `display: contents` 让包裹层「消失」
+    // 再对子元素用 `order`——真机 Chrome 实测修正前 header.y=0 但渲染在 nav 之后。
+    const bodyRule =
+      /\[data-mobile="true"\]\s+\.settings-body\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(bodyRule).toMatch(/display:\s*contents/);
+
+    // 同一选择器会有多条规则块（安全区、order…），必须汇总全部声明再断言；
+    // 只取第一条会漏掉 `order`。
+    const blocks = (selector: string) =>
+      [...css().matchAll(new RegExp(`\\[data-mobile="true"\\]\\s+\\${selector}\\s*\\{([^}]*)\\}`, "g"))]
+        .map((m) => m[1])
+        .join("\n");
+
+    const head = blocks(".settings-header");
+    const nav = blocks(".settings-nav");
+    const panel = blocks(".settings-panel");
+
+    const orderOf = (rule: string) => Number(/order:\s*(\d+)/.exec(rule)?.[1] ?? "0");
+    expect(orderOf(head)).toBe(1);
+    expect(orderOf(nav)).toBe(2);
+    expect(orderOf(panel)).toBe(3);
+    // 升为 flex item 后必须锁住高度，否则会被纵向 flex 压缩。
+    expect(head).toMatch(/flex-shrink:\s*0/);
+  });
+
+  it("keeps the settings inputs at 16px so iOS cannot auto-zoom on focus", () => {
+    // 面板里的文本输入框是 14px（`text-sm`），低于 iOS 自动放大阈值 16px。`lockZoom`
+    // 只禁手动捏合，挡不住这条自动放大——放大后页面不再贴合屏幕，每次滑动变成两轴
+    // 平移。与侧栏搜索框那条同源、同理由。
+    const rule =
+      /\[data-mobile="true"\]\s+\.settings-panel\s+(?:input|select)[^{]*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(rule).toMatch(/font-size:\s*16px/);
+  });
+
+  it("only enlarges the settings close button on the phone", () => {
+    // 手机端关闭按钮要 44px（Apple HIG）：遮罩被隐藏后它成了主要出口。但它必须
+    // **条件化**——无条件 `size-11` 会把桌面那颗按钮从约 24px 撑到 44px，破坏
+    // 「桌面逐字节不变」这条硬不变量（实测量测：桌面弹窗几何 800px 窗口下 560x420
+    // 本应完全不变，按钮却是唯一被撑大的元素）。
+    const src = readFileSync(`${dir}/components/SettingsDialog.tsx`, "utf8");
+    expect(src).toMatch(/isMobile\s*\?\s*"flex size-11[^"]*"\s*:\s*"px-2"/);
+  });
 });

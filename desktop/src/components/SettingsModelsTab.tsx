@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   deleteModel,
   importEnvModel,
@@ -97,7 +97,14 @@ function effectiveKeyLabel(effective: EffectiveModel): string {
  * - **key 默认不动**：key 框不回填（掩码也不回填），只有用户真的改过才发送
  *   `api_key`；留空即「保留旧 key」。
  */
-export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
+export function SettingsModelsTab({
+  call,
+  isMobile = false,
+}: {
+  call?: ModelsCall;
+  /** 手机端（窄屏）：5 列表格换成纵向卡片，见下方 `catalogFields`。 */
+  isMobile?: boolean;
+}) {
   // 接缝在运行时就是 ModelRpc 的形状；一次性补回调用方自选返回类型的泛型能力。
   const rpc = call as ModelRpc | undefined;
 
@@ -306,6 +313,152 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
     }
   };
 
+  /**
+   * 清单的一行/一张卡片要展示哪些字段。**只定义一次**，两种形态共用：
+   * 表格把它映射成 `<td>`，卡片映射成 `<dt>/<dd>`。字段逻辑（`/v1` 启发式提示、
+   * 密钥只显掩码）因此只有一份，不会出现「改了一处漏了另一处」。
+   */
+  const catalogFields: Array<{
+    label: string;
+    value: (entry: ModelEntryView) => ReactNode;
+  }> = [
+    { label: "名称", value: (entry) => entry.name },
+    { label: "API 格式", value: (entry) => entry.provider },
+    { label: "模型标识", value: (entry) => entry.model },
+    {
+      label: "API 地址",
+      value: (entry) => (
+        <>
+          {entry.api_url}
+          {suspectsMissingV1(entry) && (
+            <span className="ml-2 font-sans text-fg-muted">
+              （OpenAI 兼容接口地址通常以 /v1 结尾，请确认）
+            </span>
+          )}
+        </>
+      ),
+    },
+    {
+      label: "密钥",
+      // key 只以掩码示人：原始值从不经过桌面端。
+      value: (entry) => (entry.has_key ? entry.api_key_masked : "未设置"),
+    },
+  ];
+
+  /**
+   * 清单的桌面形态：5 列表格。固有宽度约 463px，只在足够宽的窗口里成立。
+   */
+  const renderCatalogTable = () => (
+    <table className="mt-3 w-full table-auto text-left text-sm">
+      <thead>
+        <tr className="text-xs text-fg-subtle">
+          {catalogFields.map((field) => (
+            <th key={field.label} className="py-1 pr-2 font-normal">
+              {field.label}
+            </th>
+          ))}
+          <th className="py-1 font-normal">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        {catalog.models.map((entry) => (
+          <tr key={entry.name} className="border-t border-line">
+            {/* 「名称」列比其他列亮一档；地址与密钥是标识符/凭证，用等宽小字。 */}
+            {catalogFields.map((field) => (
+              <td
+                key={field.label}
+                className={
+                  field.label === "名称"
+                    ? "py-1.5 pr-2 text-fg"
+                    : field.label === "API 地址" || field.label === "密钥"
+                      ? "py-1.5 pr-2 font-mono text-xs text-fg-subtle"
+                      : "py-1.5 pr-2 text-fg-muted"
+                }
+              >
+                {field.value(entry)}
+              </td>
+            ))}
+            <td className="py-1.5">
+              {/* 桌面这两颗按钮的类名与结构保持原样（`px-2 py-0.5 text-xs`、`ml-1`）：
+                  桌面 5 列表格「JSX 与类名不变」。手机卡片另给 44px 触控尺寸——按钮
+                  是两种排布各自的呈现细节，不与字段逻辑共享。 */}
+              <button
+                type="button"
+                onClick={() => startEdit(entry)}
+                className="rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
+              >
+                编辑
+              </button>
+              <button
+                type="button"
+                aria-label={`删除 ${entry.name}`}
+                onClick={() => void remove(entry.name)}
+                className="ml-1 rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
+              >
+                删除
+              </button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+
+  /**
+   * 清单的手机形态：一条模型一张纵向卡片。
+   *
+   * 表格固有约 463px 宽，而 390pt 手机上全屏设置页的内宽约 390px——表格怎么调都
+   * 装不下，且面板只允许纵向滚动，被裁掉的列（密钥、操作）永久不可达。卡片把
+   * 宽度交给容器，任何宽度下所有字段与按钮都在视野内。字段标签在卡片形态下必须
+   * 显式渲染（表格形态下由 `<th>` 承担），这里用 `<dt>` 承担。
+   */
+  const renderCatalogCards = () => (
+    <ul className="mt-3 space-y-3">
+      {catalog.models.map((entry) => (
+        <li key={entry.name} data-model-card className="rounded-md border border-line p-3">
+          <h3 className="text-sm font-medium text-fg">{entry.name}</h3>
+          <dl className="mt-2 space-y-2 text-xs">
+            {/* 名称已作标题，正文里不再重复。 */}
+            {catalogFields
+              .filter((field) => field.label !== "名称")
+              .map((field) => (
+                <div key={field.label}>
+                  <dt className="text-fg-subtle">{field.label}</dt>
+                  <dd
+                    className={
+                      field.label === "API 地址" || field.label === "密钥"
+                        ? "break-all font-mono text-fg-subtle"
+                        : "break-all text-fg-muted"
+                    }
+                  >
+                    {field.value(entry)}
+                  </dd>
+                </div>
+              ))}
+          </dl>
+          <div className="mt-3 flex items-center gap-2">
+            {/* 手机端触控目标：`px-3 py-2` + `text-sm` ≈ 44px 高（Apple HIG）。 */}
+            <button
+              type="button"
+              onClick={() => startEdit(entry)}
+              className="rounded border border-line-strong px-3 py-2 text-sm text-fg-muted hover:text-fg"
+            >
+              编辑
+            </button>
+            <button
+              type="button"
+              aria-label={`删除 ${entry.name}`}
+              onClick={() => void remove(entry.name)}
+              className="rounded border border-line-strong px-3 py-2 text-sm text-fg-muted hover:text-fg"
+            >
+              删除
+            </button>
+          </div>
+        </li>
+      ))}
+    </ul>
+  );
+
   return (
     <section className="p-5">
       <h2 className="text-sm font-medium text-fg">模型</h2>
@@ -337,56 +490,7 @@ export function SettingsModelsTab({ call }: { call?: ModelsCall }) {
           <p className="mt-3 text-sm text-fg-muted">还没有配置任何模型</p>
         )
       ) : (
-        <table className="mt-3 w-full table-auto text-left text-sm">
-          <thead>
-            <tr className="text-xs text-fg-subtle">
-              <th className="py-1 pr-2 font-normal">名称</th>
-              <th className="py-1 pr-2 font-normal">API 格式</th>
-              <th className="py-1 pr-2 font-normal">模型标识</th>
-              <th className="py-1 pr-2 font-normal">API 地址</th>
-              <th className="py-1 pr-2 font-normal">密钥</th>
-              <th className="py-1 font-normal">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {catalog.models.map((entry) => (
-              <tr key={entry.name} className="border-t border-line">
-                <td className="py-1.5 pr-2 text-fg">{entry.name}</td>
-                <td className="py-1.5 pr-2 text-fg-muted">{entry.provider}</td>
-                <td className="py-1.5 pr-2 text-fg-muted">{entry.model}</td>
-                <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">
-                  {entry.api_url}
-                  {suspectsMissingV1(entry) && (
-                    <span className="ml-2 font-sans text-fg-muted">
-                      （OpenAI 兼容接口地址通常以 /v1 结尾，请确认）
-                    </span>
-                  )}
-                </td>
-                {/* key 只以掩码示人：原始值从不经过桌面端。 */}
-                <td className="py-1.5 pr-2 font-mono text-xs text-fg-subtle">
-                  {entry.has_key ? entry.api_key_masked : "未设置"}
-                </td>
-                <td className="py-1.5">
-                  <button
-                    type="button"
-                    onClick={() => startEdit(entry)}
-                    className="rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
-                  >
-                    编辑
-                  </button>
-                  <button
-                    type="button"
-                    aria-label={`删除 ${entry.name}`}
-                    onClick={() => void remove(entry.name)}
-                    className="ml-1 rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
-                  >
-                    删除
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        isMobile ? renderCatalogCards() : renderCatalogTable()
       )}
 
       {/* 生效来源：无论清单是否为空都要如实告知现在到底在用哪个模型。 */}

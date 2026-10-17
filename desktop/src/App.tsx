@@ -2328,6 +2328,9 @@ export default function App() {
       </div>
       <SettingsDialog
         open={settingsOpen}
+        // 手机端把设置改成全屏页（见 index.css 的 [data-mobile="true"] .settings-shell）。
+        // 复用上面已有的 `isMobile`，不在这里新探测。
+        isMobile={isMobile}
         theme={theme}
         onThemeChange={changeTheme}
         onClose={() => setSettingsOpen(false)}
