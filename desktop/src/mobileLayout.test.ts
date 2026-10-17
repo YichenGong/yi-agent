@@ -110,15 +110,21 @@ describe("phone layout CSS", () => {
     expect(wrapper).not.toMatch(/safe-area-inset-bottom/);
   });
 
-  it("keeps the search box at 16px so iOS cannot auto-zoom on focus", () => {
-    // WKWebView 对字号 < 16px 的输入框会在聚焦时自动放大页面，而 `lockZoom`
+  it("keeps the phone search box big enough to tap and clears the scroller's top edge", () => {
+    // 字号 16px：WKWebView 对字号 < 16px 的输入框会在聚焦时自动放大页面，而 `lockZoom`
     // 只能禁掉用户的手动捏合缩放，挡不住这条自动放大——放大后页面不再贴合屏幕，
     // 每次滑动变成两轴平移，正是「缩放之后就需要拖拽」的同一个症状。
+    // 44px：手机上搜索框是高频点击控件，本项目的触控目标按 Apple HIG 的 44px
+    // （原约 34px = 20px 行高 + 12px 内边距 + 2px 边框）。
+    // margin-top 8px：补回移入滚动容器后丢失的顶部间距（原由「+ New thread」区块的
+    // `p-2` 下内边距提供，换父节点后归零，输入框因此贴上容器顶边）。
     const rule =
       /\[data-mobile="true"\]\s+\.app-sidebar\s+input\[type="search"\]\s*\{([^}]*)\}/.exec(
         css(),
       )?.[1] ?? "";
     expect(rule).toMatch(/font-size:\s*16px/);
+    expect(rule).toMatch(/min-height:\s*44px/);
+    expect(rule).toMatch(/margin-top:\s*0\.5rem/);
   });
 
   it("hugs the drawer so its blank strip cannot swallow the close-tap", () => {
