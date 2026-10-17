@@ -187,41 +187,8 @@ fn relay_endpoint(url: &str) -> Result<String> {
     }
 }
 
-/// 把中继端点拆成「去掉 `session` 的 URL」+「session id」。
-///
-/// `run_client` 会自己补 `?session=<id>`,故这里必须把它摘掉,否则 URL 上会出现
-/// 两个 `session` 参数。不依赖 `url` crate(与 app-server 的依赖面保持一致),
-/// 只做本场景够用的查询串切分。
 fn relay_parts(relay_url: &str) -> Result<(String, String)> {
-    let (base, query) = match relay_url.split_once('?') {
-        Some((base, query)) => (base, Some(query)),
-        None => (relay_url, None),
-    };
-    let session = query
-        .unwrap_or("")
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| *key == "session")
-        .map(|(_, value)| value.to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "relay endpoint `{relay_url}` is missing `?session=<id>`: \
-                 the phone and the computer must agree on the same session id"
-            )
-        })?;
-
-    let kept: Vec<&str> = query
-        .unwrap_or("")
-        .split('&')
-        .filter(|pair| !pair.is_empty() && !pair.starts_with("session="))
-        .collect();
-    let url = if kept.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", kept.join("&"))
-    };
-    Ok((url, session))
+    yi_agent_relay::parse_relay_parts(relay_url)
 }
 
 /// Emit a clap-generated shell completion script for `shell` on stdout.

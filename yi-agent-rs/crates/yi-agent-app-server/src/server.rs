@@ -1724,42 +1724,8 @@ where
     .await
 }
 
-/// 把中继端点拆成「去掉 `session` 的 URL」+「session id」。
-///
-/// 与二进制 crate 的 `relay_parts` 同义(此处复制一份,app-server 不得反向依赖
-/// 二进制):`yi_agent_relay::run_client` 会自己补 `?session=<id>`,故 base 里必须
-/// 先摘掉,否则 URL 上会出现两个 `session`。只做本场景够用的查询串切分,不引
-/// `url` crate 的解析——输入来自 CLI,格式由调用方保证。
 fn parse_relay_url(relay_url: &str) -> anyhow::Result<(String, String)> {
-    let (base, query) = match relay_url.split_once('?') {
-        Some((base, query)) => (base, Some(query)),
-        None => (relay_url, None),
-    };
-    let session = query
-        .unwrap_or("")
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| *key == "session")
-        .map(|(_, value)| value.to_string())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "relay endpoint `{relay_url}` is missing `?session=<id>`: \
-                 the phone and the computer must agree on the same session id"
-            )
-        })?;
-
-    let kept: Vec<&str> = query
-        .unwrap_or("")
-        .split('&')
-        .filter(|pair| !pair.is_empty() && !pair.starts_with("session="))
-        .collect();
-    let url = if kept.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", kept.join("&"))
-    };
-    Ok((url, session))
+    yi_agent_relay::parse_relay_parts(relay_url)
 }
 
 /// 与 [`serve_stdio`] 逐字节相同,只多一个 `client_scope`。
