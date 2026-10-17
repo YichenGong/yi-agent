@@ -86,6 +86,163 @@ pub fn search(project_root: &Path, query: &str, limit: usize) -> std::io::Result
     Ok(hits)
 }
 
+use serde_json::Value;
+use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
+
+fn lead_memory_metadata() -> ToolMetadata {
+    ToolMetadata {
+        source: ToolSource::Plugin {
+            name: "lead".to_string(),
+        },
+        requires_confirmation: false,
+        read_only: false, // 调用方按需覆盖
+        version: None,
+    }
+}
+
+/// 向 `memory.md` 追加一条。**只由 lead 使用**（注册点见 `build_runtime_tooling`）。
+///
+/// 不需要用户确认是刻意的：后台无人值守时若需批准，就写不了，缺口原样回来
+/// （spec §7.3 硬约束 2）。可审计性由「时间戳 + 来源 + 本次调用进 lead 的
+/// `.jsonl`」三者保证。
+pub struct LeadRememberTool {
+    project_root: PathBuf,
+}
+
+impl LeadRememberTool {
+    pub fn new(project_root: PathBuf) -> Self {
+        Self { project_root }
+    }
+}
+
+#[derive(Deserialize)]
+struct LeadRememberArgs {
+    text: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl Tool for LeadRememberTool {
+    fn name(&self) -> &str {
+        "lead_remember"
+    }
+
+    fn description(&self) -> &str {
+        "Append one entry to this project's lead memory. Use it ONLY for information that cannot be recomputed: why you rejected a thread, a long-term preference the user stated, a cross-thread convention. Never record thread status/progress — those are recomputed every wake-up. Entry text must be self-contained."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "The fact to remember. Self-contained, with the reason." },
+                "source": { "type": "string", "description": "Where this came from (thread id / turn id). Optional." }
+            },
+            "required": ["text"]
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let parsed: LeadRememberArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+        };
+        let text = parsed.text.trim().to_string();
+        if text.is_empty() {
+            return ToolResult::error("text must not be empty");
+        }
+        let entry = MemoryEntry {
+            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+            source: parsed.source.unwrap_or_else(|| "lead".to_string()),
+            text,
+        };
+        match append_entry(&self.project_root, &entry) {
+            Ok(()) => ToolResult::text(format!(
+                "已记入项目账本（{}）。",
+                memory_path(&self.project_root).display()
+            )),
+            Err(e) => ToolResult::error(format!("failed to write lead memory: {e}")),
+        }
+    }
+
+    fn metadata(&self) -> ToolMetadata {
+        lead_memory_metadata()
+    }
+}
+
+/// 检索 `memory.md`。**按需**返回，绝不整份灌进上下文（spec §7.3 硬约束 3）。
+pub struct LeadRecallTool {
+    project_root: PathBuf,
+}
+
+impl LeadRecallTool {
+    pub fn new(project_root: PathBuf) -> Self {
+        Self { project_root }
+    }
+}
+
+#[derive(Deserialize)]
+struct LeadRecallArgs {
+    query: String,
+    #[serde(default = "default_recall_limit")]
+    limit: usize,
+}
+
+fn default_recall_limit() -> usize {
+    10
+}
+
+#[async_trait::async_trait]
+impl Tool for LeadRecallTool {
+    fn name(&self) -> &str {
+        "lead_recall"
+    }
+
+    fn description(&self) -> &str {
+        "Search this project's lead memory for entries matching a query. Returns only matching entries (never the whole ledger). Call it when you need to recall why a past decision was made."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "Substring to match (case-insensitive)." },
+                "limit": { "type": "number", "description": "Max entries to return (default 10)." }
+            },
+            "required": ["query"]
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let parsed: LeadRecallArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+        };
+        match search(&self.project_root, &parsed.query, parsed.limit) {
+            Ok(entries) if entries.is_empty() => ToolResult::text("账本里没有匹配的条目。"),
+            Ok(entries) => {
+                let mut out = String::new();
+                for e in entries {
+                    out.push_str(&format!(
+                        "- [{}] ({}) {}\n",
+                        e.timestamp_ms, e.source, e.text
+                    ));
+                }
+                ToolResult::text(out)
+            }
+            Err(e) => ToolResult::error(format!("failed to read lead memory: {e}")),
+        }
+    }
+
+    fn metadata(&self) -> ToolMetadata {
+        ToolMetadata {
+            read_only: true,
+            ..lead_memory_metadata()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +349,83 @@ mod tests {
 
         let loaded = read_entries(dir.path()).expect("read");
         assert_eq!(loaded, vec![valid]);
+    }
+
+    use yi_agent_core::Tool;
+
+    #[tokio::test]
+    async fn lead_remember_appends_a_timestamped_entry() {
+        let dir = temp_project();
+        let tool = LeadRememberTool::new(dir.path().to_path_buf());
+        let out = tool
+            .call(serde_json::json!({
+                "text": "为什么打回 thread A：偏离验收标准",
+                "source": "thread-a",
+            }))
+            .await;
+        assert!(!out.is_error, "call must succeed: {out:?}");
+
+        let entries = read_entries(dir.path()).expect("read");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, "为什么打回 thread A：偏离验收标准");
+        assert_eq!(entries[0].source, "thread-a");
+        assert!(
+            entries[0].timestamp_ms > 0,
+            "timestamp must be minted by the tool"
+        );
+    }
+
+    #[tokio::test]
+    async fn lead_remember_rejects_empty_text() {
+        let dir = temp_project();
+        let tool = LeadRememberTool::new(dir.path().to_path_buf());
+        let out = tool.call(serde_json::json!({ "text": "   " })).await;
+        assert!(out.is_error, "blank text must be rejected");
+        assert!(read_entries(dir.path()).expect("read").is_empty());
+    }
+
+    #[tokio::test]
+    async fn lead_recall_returns_matching_entries_only() {
+        let dir = temp_project();
+        let remember = LeadRememberTool::new(dir.path().to_path_buf());
+        remember
+            .call(serde_json::json!({ "text": "打回 thread A", "source": "a" }))
+            .await;
+        remember
+            .call(serde_json::json!({ "text": "无关内容", "source": "b" }))
+            .await;
+
+        let recall = LeadRecallTool::new(dir.path().to_path_buf());
+        let out = recall.call(serde_json::json!({ "query": "打回" })).await;
+        assert!(!out.is_error, "recall must succeed: {out:?}");
+        let body = format!("{out:?}");
+        assert!(
+            body.contains("打回 thread A"),
+            "hit must be present: {body}"
+        );
+        assert!(!body.contains("无关内容"), "non-hit must be absent: {body}");
+    }
+
+    #[tokio::test]
+    async fn lead_recall_reports_an_empty_ledger_without_erroring() {
+        let dir = temp_project();
+        let recall = LeadRecallTool::new(dir.path().to_path_buf());
+        let out = recall.call(serde_json::json!({ "query": "任何" })).await;
+        assert!(!out.is_error, "empty ledger is not an error: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn lead_remember_is_not_read_only_and_recall_is() {
+        let dir = temp_project();
+        assert!(
+            !LeadRememberTool::new(dir.path().to_path_buf())
+                .metadata()
+                .read_only
+        );
+        assert!(
+            LeadRecallTool::new(dir.path().to_path_buf())
+                .metadata()
+                .read_only
+        );
     }
 }
