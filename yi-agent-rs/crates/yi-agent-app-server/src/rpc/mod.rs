@@ -13,6 +13,7 @@
 //! `continue`。
 
 // 域子模块:每个模块承载一个域,臂体逐字搬移自 `serve()` 的 dispatch。
+pub(crate) mod board;
 pub(crate) mod onboarding;
 pub(crate) mod model;
 pub(crate) mod ui;

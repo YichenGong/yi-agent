@@ -214,7 +214,7 @@ pub(crate) fn production_watchman_uninstall() -> WatchmanUninstall {
 /// best-effort：安装失败只记日志。调用方是 `board/create`，创建一个看板不该
 /// 因为装不上开机自启而整体失败。`EXE` 换位置也要重装（升级后常见），故判据是
 /// [`yi_agent_boards::watchman::is_installed_for`] 而非「plist 是否存在」。
-fn ensure_watchman_installed(workdir: &Path, home: &Path, install: &WatchmanInstall) {
+pub(crate) fn ensure_watchman_installed(workdir: &Path, home: &Path, install: &WatchmanInstall) {
     if !crate::settings_store::load_watchman_enabled(workdir) {
         return;
     }
@@ -1336,7 +1336,7 @@ pub(crate) fn board_cards(
 /// twice and draw two sidebar entries for one board. Returns `None` for a
 /// missing or empty `project`, which every `board/*` handler answers with
 /// `invalid_params`.
-fn project_arg(params: &serde_json::Value) -> Option<PathBuf> {
+pub(crate) fn project_arg(params: &serde_json::Value) -> Option<PathBuf> {
     let raw = params.get("project").and_then(|value| value.as_str())?;
     if raw.is_empty() {
         return None;
@@ -1363,7 +1363,7 @@ fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBuf {
 /// Serialize a board value for the wire. A value that cannot serialize is the
 /// null case rather than a hang: these shapes are plain data, so this never
 /// fires in practice, but an RPC must always write *some* response.
-fn to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
+pub(crate) fn to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
     serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
@@ -2464,6 +2464,16 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::Board => {
+                        let mut state = app_state!();
+                        match crate::rpc::board::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     // 尚未搬移的域(以及 `initialize`)仍走原始 dispatch。
                     // 逐域搬移期间,还没搬的域也落到这里,故用 `_` 一并兜住
                     // (`Domain::Unknown` 覆盖 `initialize` 与所有未识别前缀)。
@@ -2594,86 +2604,6 @@ where
                                     err_response(id, RpcError::board_query(error.code, error.message)),
                                 )
                                 .await?
-                            }
-                        }
-                    }
-                    "board/create" => {
-                        let Some(project) = project_arg(&req.params) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing or empty project")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        let mut launcher = |project: &Path| board_launcher(project);
-                        match yi_agent_boards::lifecycle::create_with_project(
-                            &project,
-                            &board_dir,
-                            &resident_dir,
-                            &plugin_command,
-                            &mut launcher,
-                        ) {
-                            Ok(status) => {
-                                // 看板建好后确保值守在装：开关为开且 plist 未指向
-                                // 当前 exe 时装上。best-effort——装不上值守不该让
-                                // 「创建成功」变成失败（前端已拿到看板）。
-                                ensure_watchman_installed(
-                                    theme_handle.workdir(),
-                                    &watchman_home,
-                                    &watchman_install,
-                                );
-                                write_response(&hub, &client, ok_response(id, to_json(&status))).await?
-                            }
-                            Err(message) => {
-                                write_response(&hub, &client, err_response(id, RpcError::internal(message)))
-                                    .await?
-                            }
-                        }
-                    }
-                    "board/remove" => {
-                        let Some(project) = project_arg(&req.params) else {
-                            write_response(
-                                &hub, &client,
-                                err_response(id, RpcError::invalid_params("missing or empty project")),
-                            )
-                            .await?;
-                            continue;
-                        };
-                        match yi_agent_boards::lifecycle::remove_in(&project, &board_dir, &resident_dir) {
-                            Ok(()) => write_response(&hub, &client, ok_response(id, json!({}))).await?,
-                            Err(message) => {
-                                write_response(&hub, &client, err_response(id, RpcError::internal(message)))
-                                    .await?
-                            }
-                        }
-                    }
-                    "board/list" => {
-                        // The registry is the whole answer: the sidebar decides
-                        // which projects get a board entry from exactly this.
-                        match yi_agent_boards::registry::list(&board_dir) {
-                            Ok(boards) => {
-                                let boards: Vec<serde_json::Value> = boards
-                                    .into_iter()
-                                    .map(|board| {
-                                        json!({
-                                            "project": board.project.to_string_lossy(),
-                                            "created_at": board.created_at,
-                                            "status": to_json(
-                                                &yi_agent_boards::lifecycle::status_with(
-                                                    &board.project,
-                                                    &board_dir,
-                                                ),
-                                            ),
-                                        })
-                                    })
-                                    .collect();
-                                write_response(&hub, &client, ok_response(id, json!({ "boards": boards })))
-                                    .await?
-                            }
-                            Err(message) => {
-                                write_response(&hub, &client, err_response(id, RpcError::internal(message.to_string())))
-                                    .await?
                             }
                         }
                     }
