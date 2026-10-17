@@ -59,6 +59,13 @@ export interface PairingScreenProps {
   redeem?: (url: string, code: string, deviceName: string) => Promise<PairedDevice>;
   /** 凭据落盘后回调——宿主据此把 transport 重算成 ws。 */
   onPaired?: () => void;
+  /**
+   * 重配场景的「返回」；**只在传入时渲染**。
+   *
+   * 首启配对无处可去（iOS 上没有 Tauri IPC），故那时不传、不渲染——首启路径
+   * 的 DOM 因此逐字节不变。已配对的手机进这里则是"再看一眼凭据"，退出该是自由的。
+   */
+  onCancel?: () => void;
   /** 是否显示「扫码」按钮；默认仅 iOS（远程构建）。 */
   enableScan?: boolean;
   /**
@@ -93,6 +100,7 @@ export function PairingScreen({
   storage,
   redeem,
   onPaired,
+  onCancel,
   enableScan,
   scan,
 }: PairingScreenProps) {
@@ -221,6 +229,16 @@ export function PairingScreen({
         >
           {busy ? "配对中…" : "配对"}
         </button>
+
+        {onCancel && (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="mt-3 w-full rounded-md border border-line-strong px-3 py-2 text-sm text-fg-muted hover:text-fg"
+          >
+            返回
+          </button>
+        )}
 
         {canScan && (
           <button

@@ -266,3 +266,18 @@ describe("PairingScreen QR scan", () => {
     expect(screen.getByRole("button", { name: "取消" })).toBeTruthy(); // 扫描器仍开着
   });
 });
+
+describe("PairingScreen optional cancel", () => {
+  it("renders no cancel button on the first-launch path", () => {
+    // 首启不传 `onCancel`：DOM 必须与从前一致（QR 配对的硬不变量）。
+    render(<PairingScreen redeem={vi.fn()} storage={storages()} />);
+    expect(screen.queryByRole("button", { name: "返回" })).toBeNull();
+  });
+
+  it("renders a working cancel button when the host passes one", () => {
+    const onCancel = vi.fn();
+    render(<PairingScreen redeem={vi.fn()} storage={storages()} onCancel={onCancel} />);
+    fireEvent.click(screen.getByRole("button", { name: "返回" }));
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+});
