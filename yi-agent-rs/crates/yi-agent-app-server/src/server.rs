@@ -2549,10 +2549,11 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
-                    // 尚未搬移的域(以及 `initialize`)仍走原始 dispatch。
-                    // 逐域搬移期间,还没搬的域也落到这里,故用 `_` 一并兜住
-                    // (`Domain::Unknown` 覆盖 `initialize` 与所有未识别前缀)。
-                    _ => {}
+                    // 所有域都已有自己的模块:只有 `Domain::Unknown`(即 `initialize`
+                    // 与未识别前缀)会落到这里,再走原始 dispatch。
+                    // `Domain` 已是穷尽匹配,这里必须显式写出唯一剩下的变体 —— 用
+                    // `_` 会让「新加一个域却忘了加 dispatch 臂」重新变得静默可行。
+                    crate::rpc::Domain::Unknown => {}
                 }
                 match method.as_str() {
                     "initialize" => {

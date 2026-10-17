@@ -106,7 +106,7 @@ pub(crate) enum Flow {
 /// 一个 RPC 方法所属的域。`serve()` 先按它选模块,再由模块内的
 /// `match req.method.as_str()` 挑具体方法。
 ///
-/// [`Domain::Unknown`] 覆盖 `initialize` 与所有尚未搬移的域,让它们照旧走
+/// [`Domain::Unknown`] 只覆盖 `initialize` 与未识别前缀,让它们照旧走
 /// `serve()` 的原始 `match` —— `initialize` 要动 `serve()` 私有的 `initialized`
 /// 表,不适合外移;而兜底 `_ =>` 必须留在原处才能保住原样的
 /// `method_not_found` 响应。
@@ -136,7 +136,7 @@ pub(crate) enum Domain {
     Thread,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
     Agent,
-    /// 未搬移(含 `initialize`)。
+    /// 未搬移者:只剩 `initialize` 与未识别前缀(全部域都已搬走)。
     Unknown,
 }
 
