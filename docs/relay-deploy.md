@@ -362,7 +362,8 @@ npx tauri ios init      # 生成/刷新 iOS 工程。注意：按 project.yml �
 | Xcode | 26.6，含 `iphoneos26.5` SDK |
 | 签名身份 | `security find-identity -v -p codesigning` 能看到有效的 `Apple Development: …` |
 | 团队 | `DEVELOPMENT_TEAM = 4RN6G5K4D4`，已写入 `project.yml` 与 `desktop.xcodeproj`（见坑 2） |
-| 设备 | USB 连上 iPhone，`xcrun devicectl list devices` 显示 `available (paired)`；**手机须解锁**（坑 1） |
+| 设备 | 手机与 Mac **在同一局域网**，`xcrun devicectl list devices` 显示 `available (paired)`；**手机须解锁且亮屏**（坑 1、坑 6）。**USB 不是必需**——已配对设备可直接走局域网安装（坑 6、§4.2「安装」） |
+| 系统代理 | **必须关闭**（坑 6）：Clash/Surge 等把 `127.0.0.1:7897` 设为系统代理时，`remotepairingd` 连设备的 49152 端口会被 SOCKS 劫持，ARP 探测失败被判 `unavailable` |
 
 **构建**
 
@@ -391,6 +392,11 @@ xcrun devicectl device install app \
 `5DE0CC74-6A87-53DD-BADF-E1DADB22F6D8`）。成功回 `App installed:`。
 如需直接拉起：`xcrun devicectl device process launch --device <id> com.gongyichen.desktop`。
 
+**无需 USB（局域网安装，2026-10-17 实测）：** 上面的安装命令**不插线也能用**。前置是
+该设备此前**用 USB 配对过一次**（一次性，配对信息持久化在 Mac 上），此后同一局域网内
+`devicectl` 即可经 TCP 隧道安装——实测全程 `system_profiler SPUSBDataType` 无 iPhone、
+仍回 `App installed:`。两个前提：**手机解锁且亮屏**，以及**系统代理必须关闭**（坑 6）。
+
 **常见坑**
 
 1. **`kAMDMobileImageMounterDeviceLocked: The device is locked`**
@@ -406,6 +412,20 @@ xcrun devicectl device install app \
    构建安装；长期签名要付费开发者账号。
 5. **iOS 图标规范** —— 图标那套在 `gen/apple/Assets.xcassets/AppIcon.appiconset/`，须为
    **满幅方形、无 alpha、不加圆角**；iOS 自行渲染圆角遮罩，预烘焙遮罩会"圆角套圆角"。
+6. **`devicectl list devices` 显示 `unavailable`，但手机明明在线**（同网段、能 ping 通、
+   62078/49152 端口开放）—— **系统代理劫持了 CoreDevice 的 RemotePairing 通道**。
+   日志特征（`log stream --predicate 'process CONTAINS "remotepairingd"'`）：
+   `Output protocol connected (socksv5)` 与 `... 127.0.0.1:7897 ... Hostname#…:49152 ready proxy`
+   之后紧跟 `CUNetLinkManager reported the device as unavailable using ARP. Invalidating connection`
+   —— 即 `remotepairingd` 连设备 49152 端口时被 SOCKS 代理接管，其 ARP 在线探测随之失败。
+   **关闭系统代理后重试**即可（Clash Verge：关"系统代理"；或
+   `networksetup -setwebproxystate Wi-Fi off` + `-setsecurewebproxystate` +
+   `-setsocksfirewallproxystate`，改完记得开回来）。
+   两个附带现象：① 被反复毒化后 `remotepairingd` 会**卡死**（实测膨胀到 23 GB 内存 /
+   93% CPU 空转、不再产生任何日志），此时 `sudo launchctl kickstart -k
+   system/com.apple.CoreDevice.remotepairingd` 重启即可；② 手机**息屏会停掉 Wi-Fi
+   常连接**（`ping` 全丢包、mDNS 仍能解析出旧 IP），安装窗口只有亮屏那几十秒，
+   建议保持解锁亮屏再执行。
 
 ### 4.3 App 如何选择远端传输
 
@@ -631,6 +651,13 @@ reconnecting` 交替、并伴随大量 `ws connection rejected: invalid token`�
 - 中继与 app-server 都对"跟不上的慢消费者"采取**摘除 + 重连**策略（出站队列写满即
   踢），而不是在 JSON-RPC 流中间静默丢帧。恢复路径是**重连后 `thread/resume` 增量
   回放**。若频繁触发，多为网络抖动或手机长时间后台。
+
+### 安装/调试时 Mac 认不到手机（`devicectl` 显示 `unavailable`）
+
+症状：手机明明在线（同网段、能 ping 通、62078/49152 端口开放、mDNS 有 `_remotepairing._tcp`
+广播），但 `xcrun devicectl list devices` 报 `unavailable`、任何命令回
+`CoreDeviceError error 1011`。**不是中继问题，是本机 CoreDevice 通道**——成因与解法见
+[§4.2 坑 6](#42-真机构建与安装标准步骤)（系统代理劫持、守护进程卡死、手机息屏三件事）。
 
 ### 中继"假死"（进程活着，但连不上）
 
