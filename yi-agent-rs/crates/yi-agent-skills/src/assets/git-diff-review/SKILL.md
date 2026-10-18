@@ -43,11 +43,11 @@ show_git_diff({ "command": "git diff --stat", "note": "先给你看改动规模"
 | 看**还没提交**的工作区改动 | `"git diff HEAD"` |
 | 只看某个目录/文件 | `"git diff <base> -- <path>"` |
 | 看某个提交本身 | `"git show <sha>"` |
+| 看工作区有哪些新文件 | `"git status --short"` |
 
 > **合并提交要加 `--first-parent`**：`git show <merge>` 对干净合并输出为空、
 > 对带冲突解决的合并输出组合 diff（`diff --cc`），面板都显示不出东西。
 > 看合并提交用 `"git show --first-parent --format= <sha>"`。
-| 看工作区有哪些新文件 | `"git status --short"` |
 
 组合示例：
 
@@ -81,7 +81,8 @@ show_git_diff({ "command": "git diff --stat", "note": "先给你看改动规模"
 
 `command` 在 **read-only 沙箱**里执行，它**无法修改工作树**。
 任何会改状态的 git 命令——`git stash push`、`git checkout`、`git switch`、`git commit`、
-`git reset`、`git clean`、`git add`——都会被**直接拒绝**，写了只会白跑一趟。
+`git reset`、`git clean`、`git add`——都会被沙箱挡住（命令非零退出），写了只会白跑一趟；
+它不会改出半个状态，所以也别指望用这种命令「探路」。
 
 - 想看未提交改动，直接 `"git diff HEAD"`，不要试图先 stash 再看。
 - 想换 base 比较，用 `"git diff <ref>"` 指定 ref，不要 checkout 过去。
