@@ -104,6 +104,22 @@ export class Session {
   lastServerItemId: string | null = null;
 
   /**
+   * The server's content generation for this thread, as last learned from
+   * `syncPlan` / `ThreadSummary`. `null` means we have not learned one yet
+   * (first sighting this session) — which must NOT be treated as "matches"
+   * (spec §4.3): a missing version degrades to the conservative full resume.
+   */
+  contentEpoch: number | null = null;
+
+  /**
+   * True once a full replay was triggered by a generation change. Guards
+   * `prefillFromCache`: an async cache read that resolves *after*
+   * `adoptEpoch` wiped the transcript would otherwise see `items.length === 0`
+   * and inject the very stale content we just judged invalid (spec §6.4).
+   */
+  epochInvalidated = false;
+
+  /**
    * Server item ids seen while a full replay is in flight, or `null` when no
    * replay is being collected. `dropStale` uses the completed set to tell a
    * cached item the server still has from one it no longer has.
@@ -123,6 +139,32 @@ export class Session {
     const ids = this.replayIds;
     this.replayIds = null;
     return ids;
+  }
+
+  /**
+   * Adopt the server's authoritative content generation for this thread.
+   *
+   * When the generation changed, everything we hold is structurally stale —
+   * the server no longer has these items (it was `/clear`ed) — so the whole
+   * transcript is dropped. Returns `true` to tell the caller a full
+   * `thread/resume` is required.
+   *
+   * A same-generation call only advances the cursor: "anchor present but
+   * behind" is the normal shape of two clients coexisting, not an error
+   * (spec §7.2).
+   */
+  adoptEpoch(epoch: number, lastItemId: string | null): boolean {
+    const changed = this.contentEpoch !== null && this.contentEpoch !== epoch;
+    this.contentEpoch = epoch;
+    if (changed) {
+      this.items = [];
+      this.lastServerItemId = null;
+      this.openReasoning = null;
+      this.epochInvalidated = true;
+      return true;
+    }
+    if (lastItemId !== null) this.lastServerItemId = lastItemId;
+    return false;
   }
 
   /**
@@ -168,6 +210,7 @@ export class Session {
     this.returnedInterjections = [];
     this.lastServerItemId = null;
     this.openReasoning = null;
+    this.epochInvalidated = false;
   }
 
   /**

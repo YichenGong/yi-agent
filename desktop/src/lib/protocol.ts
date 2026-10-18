@@ -126,6 +126,13 @@ export interface ThreadSummary {
    * 旧服务端不发送此字段；读取时先过 `isValidTagId` 再渲染，脏值按无标签处理。
    */
   tag?: string | null;
+  /**
+   * 服务端的内容世代。旧服务端不发送此字段：读取时必须按"未知"处理
+   * （保守全量 resume），绝不当作"一致"（spec §4.3）。`null` 与缺省同义。
+   */
+  content_epoch?: number | null;
+  /** 服务端最后一条 item 的 id；`null` = 该会话从未有过 item。 */
+  last_item_id?: string | null;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */

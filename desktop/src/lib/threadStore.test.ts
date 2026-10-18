@@ -300,4 +300,9 @@ describe("threadStore reasoning effort", () => {
     s.applyNotification({ method: "thread/reasoningEffortChanged", params: { thread_id: "a" } });
     expect(s.view("a").reasoningEffort).toBeNull();
   });
+
+  it("defaults syncState to synced so the desktop path is unchanged", () => {
+    const s = new ThreadStore();
+    expect(s.view("t1").syncState).toBe("synced");
+  });
 });

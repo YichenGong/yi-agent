@@ -27,6 +27,13 @@ export interface ThreadView {
    * 纯客户端、纯 UI：不上协议，服务端不知道它的存在。
    */
   draft: string;
+  /**
+   * Whether this thread's transcript has been reconciled with the server on
+   * this connection. `syncing` means the catch-up (resume / readItems) is in
+   * flight: the content on screen may be the cached one, so the UI must say so
+   * and must not let the user send against it (spec §5).
+   */
+  syncState: "syncing" | "synced";
 }
 
 /**
@@ -57,6 +64,7 @@ export class ThreadStore {
       mode: null,
       reasoningEffort: null,
       draft: "",
+      syncState: "synced",
     };
   }
 

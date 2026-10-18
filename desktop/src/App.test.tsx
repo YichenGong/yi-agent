@@ -3758,6 +3758,9 @@ describe("App 远端图片上传", () => {
       );
       expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
         threadId: "t1",
+        // 手机端的 turn/start 现在带上下文锚点（Task 12，spec §7.1）：该会话尚未
+        // 对过账，故 contentEpoch 为初始 0、游标为 null。
+        contextAnchor: { contentEpoch: 0, lastItemId: null },
         input: [{ type: "uploaded_image", uploadId: "u1" }, { type: "text", text: "" }],
       });
     } finally {
@@ -3798,6 +3801,8 @@ describe("App 远端图片上传", () => {
     // 渲染用（桌面端那条 `{type:"image", path}` 一个字都没变）。
     expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
       threadId: "t1",
+      // 手机端 turn/start 携带上下文锚点（Task 12，spec §7.1）。
+      contextAnchor: { contentEpoch: 0, lastItemId: null },
       input: [
         { type: "uploaded_image", uploadId: "u1" },
         { type: "text", text: "看看这个" },
@@ -4068,6 +4073,344 @@ describe("App mobile local cache", () => {
     );
     await waitFor(() => expect(screen.queryByText("one")).toBeNull());
     expect(contentStore.current).toBeNull();
+  });
+
+  it("resumes a thread the server flagged full, and drops the ghost content", async () => {
+    asRemote();
+    // 服务端说这个会话 epoch 变了（期间被 clear 过）。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "full", epoch: 4, reason: "epoch_changed" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "stale content" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // 幽灵内容必须被清掉，而不是留在屏上。
+    await waitFor(() => expect(screen.queryByText("stale content")).toBeNull());
+  });
+
+  it("forces a full resume for a trimmed cache even when the plan says none", async () => {
+    asRemote();
+    // 服务端**正确地说 none**（同世代、锚点仍在日志里）——但本地条目因超 1MB 丢过
+    // 头部。照 none 跳过 resume 会让用户静默看到一个被截断的会话（spec §4.2 例外）。
+    // 这条只依赖客户端自己知道的信息（自己有没有裁过），故 plan 覆盖时也必须生效。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-tail", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-tail", text: "tail only" }],
+      trimmed: true, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+  });
+
+  it("catches up a thread the server marked none so a stale tail is filled", async () => {
+    asRemote();
+    // 服务端说 none：缓存**有效**，但这只表示"不必作废"，**不表示"已是最新"**。
+    // 会话在两轮之间又长了几条，而客户端的锚点仍有效，故服务端不会给 full
+    // （spec §4.2：落后是正常的并存形状，补齐交给常规路径）。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    state.dataSources["thread/readItems"] = () => ({
+      items: [{ type: "agentMessage", id: "i-new", text: "fresh tail" }],
+    });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-old", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-old", text: "cached head" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    // 必须真的补一次尾部（只读 readItems，不打断任何在途回合）——否则用户永远停在
+    // 缓存尾部却以为内容是最新的，而 `turn/start` 又会因"锚点仍在"被放行，正是
+    // 本特性要消除的"拿旧信息操作"。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    await waitFor(() => expect(screen.getByText("fresh tail")).toBeTruthy());
+  });
+
+  it("re-tops-up a none thread after a reconnect (socket died, process survived)", async () => {
+    asRemote();
+    // 场景：socket 被系统掐断但 sidecar 未退出（经中继的瞬断 / 切回前台），
+    // 于是 `exited` 不触发、`subWindow` 不清。此时若只按订阅窗口判定是否补齐，
+    // warm idle 会话会**永远停在缓存尾部**——正是 C2 的残留缺口。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-old", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-old", text: "cached head" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    const first = clients[0].requests.filter((r) => r.method === "thread/readItems").length;
+
+    // 前台唤醒重建客户端（没有 exited）。新连接必须为这个会话**再补一次**。
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+    const last = clients[clients.length - 1];
+    await waitFor(() =>
+      expect(last.requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    // 且**同一连接内**再切回不会重复发（每连接每会话只补一次）。
+    expect(first).toBe(1);
+  });
+
+  it("does not let a late cache read re-inject content judged stale", async () => {
+    asRemote();
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "full", epoch: 4, reason: "epoch_changed" }],
+      });
+    // 缓存读故意延迟到 adoptEpoch 之后才 resolve。只延迟**第二次**读（prefill 的
+    // 那次）：第一次是挂载预热，必须放行，否则 cacheMetaRef 为空、裁决无从播种
+    // 缓存世代，测试就退化成「什么都没验」的空洞用例（曾实测）。读返回**快照**
+    // 而非 resolve 时刻的 store：App 会在读到之前把已清空的会话落盘覆盖 ghost。
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const real = new MemoryContentStore();
+    await real.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "must not come back" }],
+      trimmed: false, bytes: 1,
+    });
+    const ghostSnapshot = (await real.read("t1"))!;
+    let reads = 0;
+    contentStore.current = {
+      read: async (id: string) => {
+        if (id === "t1" && (reads += 1) > 1) await gate;
+        return id === "t1" ? ghostSnapshot : real.read(id);
+      },
+      write: (e) => real.write(e),
+      delete: (id) => real.delete(id),
+      keys: () => real.keys(),
+    };
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // 此刻裁决已判 full 并 adoptEpoch（世代 2→4）。
+    release();
+    // 读回是异步的：给它足够的 tick 走到回调里，否则断言会早于回调求值而空洞通过。
+    await act(async () => { await new Promise((r) => setTimeout(r, 60)); });
+    expect(screen.queryByText("must not come back")).toBeNull();
+  });
+
+  it("blocks sending on a running thread until its catch-up lands", async () => {
+    asRemote();
+    state.listStatus = "running";
+    contentStore.current = new MemoryContentStore();
+    // readItems 挂住：模拟补尾部在途。
+    let release!: (v: unknown) => void;
+    state.dataSources["thread/readItems"] = () =>
+      new Promise((resolve) => { release = resolve; });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+
+    // 同步中：提示条在（文案「正在同步…」，带省略号），且发送被拦（不发出 turn/start）。
+    await waitFor(() => expect(screen.getByText(/正在同步…/)).toBeTruthy());
+    const before = clients[0].requests.filter((r) => r.method === "turn/start").length;
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    expect(clients[0].requests.filter((r) => r.method === "turn/start").length).toBe(before);
+
+    // 补完 ⇒ 解禁，提示条退场，且此时真的发得出去。
+    // 断言用带省略号的提示条文案，而非裸 `/正在同步/`：被拦时写入的错误文案
+    // 「正在同步，请稍候」同样含该子串，会在同步结束后仍留在会话上，裸正则必然
+    // 恒不匹配（计划自带的这条断言在计划自己的实现下不可能通过，已实测确认）。
+    release({ items: [{ type: "agentMessage", id: "a1", text: "done" }] });
+    await waitFor(() => expect(screen.queryByText(/正在同步…/)).toBeNull());
+    const turnsBefore = clients[0].requests.filter(
+      (r) => r.method === "turn/start" || r.method === "turn/interject",
+    ).length;
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter(
+          (r) => r.method === "turn/start" || r.method === "turn/interject",
+        ).length,
+      ).toBe(turnsBefore + 1),
+    );
+  });
+
+  it("converges out of syncing even when the catch-up fails", async () => {
+    asRemote();
+    state.listStatus = "running";
+    contentStore.current = new MemoryContentStore();
+    state.dataSources["thread/readItems"] = () => { throw new Error("boom"); };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    // 失败也必须收敛，否则永久无法发送（spec §11 风险 3）。
+    await waitFor(() => expect(screen.queryByText(/正在同步/)).toBeNull());
+  });
+
+  it("shows no syncing notice on the desktop path", async () => {
+    // 桌面：不调 asRemote()。
+    state.listStatus = "running";
+    render(<App />);
+    // 桌面端 running 会话走只读 readItems（不 resume、不置 syncing），等它落地即可。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    expect(screen.queryByText(/正在同步/)).toBeNull();
+    expect(screen.queryByText(/离线内容/)).toBeNull();
+  });
+
+  it("does not block sending on switching back to a warm idle thread", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // resume 已回放并置 warm；此刻会话 idle 且已在订阅窗口内 —— 切回不应置 syncing
+    // 也绝不能让用户永久无法发送（设计 §11 风险 3）。
+    await waitFor(() => expect(screen.queryByText(/正在同步/)).toBeNull());
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+  });
+
+  it("sends a contextAnchor and does not resend after stale_context", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    // `turn/start` 报 stale_context（顶层方法用 dataSources 而非 rpcError，
+    // 后者只在 plugin/query 的内层分支被读）。
+    state.dataSources["turn/start"] = () => {
+      throw { code: -32026, data: { code: "stale_context" } };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+
+    await waitFor(() => {
+      const turns = clients[0].requests.filter((r) => r.method === "turn/start");
+      expect(turns).toHaveLength(1);
+      expect((turns[0].params as { contextAnchor?: unknown }).contextAnchor).toBeTruthy();
+    });
+
+    // 不自动重发：只提示 + 触发重同步（多一次 thread/resume）。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/resume").length,
+      ).toBeGreaterThan(1),
+    );
+    // 发送没有成功：乐观回声（用户气泡）必须回滚，否则转录里会留下一条「已发出」
+    // 的幽灵消息；草稿必须保留，用户确认后能重发（spec §7.3「草稿保留」）。
+    // 只查**气泡**（用户消息气泡那个 class），不查裸文本：草稿框的值也是 "hello"。
+    await waitFor(() =>
+      expect(document.querySelector(".bg-blue-600.self-end")).toBeNull(),
+    );
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("hello");
+    expect(clients[0].requests.filter((r) => r.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("does not send a contextAnchor from the desktop path", async () => {
+    // 桌面：不调 asRemote()。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    const turn = clients[0].requests.find((r) => r.method === "turn/start");
+    expect((turn?.params as { contextAnchor?: unknown } | undefined)?.contextAnchor).toBeUndefined();
+  });
+
+  it("declares resumeHints on initialize for a remote client", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: 5, lastServerItemId: "i1", contentEpoch: 3,
+      items: [], trimmed: false, bytes: 1,
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    // hints 从缓存元数据组装；缓存是异步读的，故轮询等待那一次 initialize 带上它。
+    await waitFor(() => {
+      const init = clients[0].requests.find((r) => r.method === "initialize");
+      const hints = (init?.params as { resumeHints?: unknown[] } | undefined)?.resumeHints;
+      expect(Array.isArray(hints)).toBe(true);
+    });
+  });
+
+  it("does not send resumeHints from the desktop path", async () => {
+    // 不调 asRemote()：桌面路径。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    const init = clients[0].requests.find((r) => r.method === "initialize");
+    expect((init?.params as { resumeHints?: unknown } | undefined)?.resumeHints).toBeUndefined();
+  });
+
+  it("drops a deleted thread's cached content and its cache entry", async () => {
+    asRemote();
+    // 服务端说这个会话已不存在（被另一端删除）——它因此不会出现在 listAll 里。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "drop", epoch: 0, reason: "deleted" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "deleted transcript" }],
+      trimmed: false, bytes: 1,
+    });
+    render(<App />);
+    // 该会话是当前选中：它会被 drop、缓存被删、屏上不留内容。
+    await waitFor(() => expect(screen.queryByText("deleted transcript")).toBeNull());
+    await waitFor(async () => expect(await contentStore.current!.read("t1")).toBeNull());
   });
 });
 

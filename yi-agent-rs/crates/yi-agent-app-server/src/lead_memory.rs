@@ -465,6 +465,8 @@ mod tests {
             preserve_thinking: true,
             extra_roots: Vec::new(),
             role: role.map(str::to_string),
+            content_epoch: 0,
+            last_item_id: None,
         }
     }
 
