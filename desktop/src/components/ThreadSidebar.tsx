@@ -760,8 +760,9 @@ export function ThreadSidebar({
 
   // 组长行：与普通会话行同构（同样的状态徽标、标题、相对时间、未读点、点击选
   // 中），只多一个 `data-lead-row` 标记并去掉图钉/删除按钮——组长是项目级的固
-  // 定入口，置顶与删除对它没有意义。带 `data-thread-row` 以便移动端长按与既有
-  // 样式规则照旧生效。
+  // 定入口，置顶与删除对它没有意义。仍带 `data-thread-row`（选中逻辑与样式
+  // 规则要用），但 `resolveSidebarPressTarget` 会因 `data-lead-row` 先返回 null，
+  // 故手机长按组长行**不会**弹出会话菜单。
   const renderLeadRow = (t: ThreadSummary) => {
     const active = t.thread_id === currentId;
     const st = statuses.get(t.thread_id) ?? "idle";
