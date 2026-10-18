@@ -140,7 +140,13 @@ export class ThreadStore {
       // 标签显示名是宿主级偏好，无 thread 归属（`thread_key()` = None），
       // 由 App 的通知分支处理；这条提前返回同时也让下方的 `n.params.thread_id`
       // 收窄仍然成立（TS 否则会因该臂无 `thread_id` 而报错）。
-      n.method === "ui/tagNames/updated"
+      n.method === "ui/tagNames/updated" ||
+      // `item/toolCall/approvalResolved` 是**无 thread 归属**的广播：Rust 侧的载荷
+      // 只有 `perm_id` / `by` / `decision`（`protocol.rs` 的
+      // `ToolCallApprovalResolved`）。若任其落到下面的 `n.params.thread_id`，类型上
+      // 会失败，运行期则会把这条广播错记到当前 thread。它不属于任何 transcript，
+      // 显式忽略。
+      n.method === "item/toolCall/approvalResolved"
     ) {
       return;
     }

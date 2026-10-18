@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ts_rs::TS;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -11,7 +12,8 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 ///
 /// `Ord` 从弱到强：`Observe < Control < Admin`。新配对设备默认 `Control`
 /// （决策 A）。Task 3 会围绕它扩展配对/设备 RPC。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
     Observe,
@@ -19,30 +21,37 @@ pub enum Scope {
     Admin,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(untagged)]
 pub enum RequestId {
+    // 线上是 JSON 数字,与 `Str` 并列构成 `number | string`。
+    #[ts(type = "number")]
     Num(i64),
     Str(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct RequestEnvelope {
     #[serde(default)]
     pub jsonrpc: Option<String>,
     pub id: RequestId,
     pub method: String,
     #[serde(default)]
+    #[ts(type = "unknown")]
     pub params: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct ResponseEnvelope {
     #[serde(default)]
     pub jsonrpc: Option<String>,
     pub id: RequestId,
     /// 成功响应时省略;与 `error` 互斥。
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown")]
     pub result: Option<Value>,
     /// 错误响应时省略;与 `result` 互斥。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,31 +59,41 @@ pub struct ResponseEnvelope {
 }
 
 /// 客户端 → 服务端、针对反向请求的响应(id 与请求匹配,无 `method`)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct ClientResponse {
     #[serde(default)]
     pub jsonrpc: Option<String>,
     pub id: RequestId,
     #[serde(default)]
+    #[ts(type = "unknown")]
     pub result: Option<Value>,
     #[serde(default)]
+    #[ts(type = "unknown")]
     pub error: Option<Value>,
 }
 
 /// 服务端 → 客户端的反向请求(带 `id`,需要客户端回响应)。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct ReverseRequest<'a> {
     pub jsonrpc: &'a str,
     pub id: String,
     pub method: &'a str,
+    #[ts(type = "unknown")]
     pub params: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct RpcError {
+    // JSON-RPC 错误码,线上是 JSON 数字。
+    #[ts(type = "number")]
     pub code: i64,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "unknown")]
     pub data: Option<Value>,
 }
 
@@ -197,7 +216,8 @@ impl RpcError {
 }
 
 /// 服务端 → 客户端通知(无 id)。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(tag = "method", content = "params")]
 pub enum Notification {
     #[serde(rename = "thread/started")]
@@ -231,6 +251,9 @@ pub enum Notification {
     #[serde(rename = "thread/permissionModeChanged")]
     PermissionModeChanged {
         thread_id: String,
+        // `ThreadMode` 在 `thread_store.rs`,不在本模块的导出清单里;这里只标注它
+        // 的线上形状(`#[serde(rename_all = "lowercase")]` 的外部标签)。
+        #[ts(type = "\"normal\" | \"yolo\"")]
         mode: crate::thread_store::ThreadMode,
     },
     /// 该会话的 reasoning effort 覆盖已切换（或清除）。
@@ -279,6 +302,8 @@ pub enum Notification {
     #[serde(rename = "thread/notice")]
     Notice {
         thread_id: String,
+        // `NoticeLevel` 在 `yi-agent-core`,同上:只标注线上形状(外部标签,原样变体名)。
+        #[ts(type = "\"Info\" | \"Warn\"")]
         level: yi_agent_core::NoticeLevel,
         text: String,
     },
@@ -290,6 +315,8 @@ pub enum Notification {
     ReasoningDelta {
         thread_id: String,
         text: String,
+        // `ReasoningKind` 同上:线上是外部标签的变体名。
+        #[ts(type = "\"Content\" | \"Summary\"")]
         kind: yi_agent_core::ReasoningKind,
     },
     #[serde(rename = "item/started")]
@@ -312,6 +339,7 @@ pub enum Notification {
         turn_id: String,
         status: TurnStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         error: Option<String>,
     },
     /// Mid-turn user messages the server could not consume, handed back so the
@@ -402,6 +430,11 @@ pub enum Notification {
     /// 时而带 `tag_names` 时而不带（watcher 路径没有它），语义含混。
     #[serde(rename = "ui/tagNames/updated")]
     TagNamesUpdated {
+        // ts-rs 默认把 `BTreeMap<String, String>` 渲染成 `{ [key in string]?: string }`
+        // （值可 `undefined`），比线上更宽：serde 序列化该 map 的值恒为字符串，
+        // 线上的形状是 `Record<string, string>`。显式标注复现线上形状（同 §3.2 对
+        // `u64`/`Option` 的处理），否则前端按 `Record<string, string>` 消费会报窄化错误。
+        #[ts(type = "Record<string, string>")]
         tag_names: std::collections::BTreeMap<String, String>,
     },
     /// 模型（`show_git_diff` 工具）请求桌面端聚焦 Git Diff 视图。
@@ -490,7 +523,8 @@ impl Notification {
 }
 
 /// 一条子 agent 的列表项。字段沿用 JSON-RPC 的 camelCase。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentChild {
     pub task_id: String,
@@ -507,9 +541,12 @@ pub struct AgentChild {
 }
 
 /// 一条轨迹行,原样透传 daemon 的 `IpcTraceRow`。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTraceRow {
+    // daemon 的持久化行号,线上是 JSON 数字。
+    #[ts(type = "number")]
     pub event_id: i64,
     pub task_id: String,
     pub kind: String,
@@ -520,7 +557,8 @@ pub struct AgentTraceRow {
 ///
 /// `Notification` 自身只带 `method` / `params`,缺 `jsonrpc` 字段;发到线上
 /// 前需经本信封补齐 `"jsonrpc":"2.0"`。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct NotificationEnvelope<'a> {
     pub jsonrpc: &'a str,
     #[serde(flatten)]
@@ -536,7 +574,8 @@ impl<'a> NotificationEnvelope<'a> {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
     Completed,
@@ -546,7 +585,8 @@ pub enum TurnStatus {
 
 /// thread 级实时状态。`failed` 刻意缺席：失败是事件不是状态，失败后 thread
 /// 立刻回 `Idle`；"失败未读"由前端从 `turn/completed.params.status` 自行表达。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadStatus {
     Idle,
@@ -558,12 +598,16 @@ pub enum ThreadStatus {
 ///
 /// `path` 相对工作区根，形如 `.yi-agent/attachments/<thread_id>/<hash>-<name>`；
 /// 服务端在起 turn 前把用户选中的文件复制到该位置，工具据此读取。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct Attachment {
     pub name: String,
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub mime: Option<String>,
+    // 文件字节数;线上是 JSON 数字(远小于 2^53)。
+    #[ts(type = "number")]
     pub size: u64,
 }
 
@@ -572,16 +616,21 @@ pub struct Attachment {
 /// `Item` 会随每条通知下发,而传输帧上限为 1 MiB;内联图片字节日志会把帧撑爆。
 /// 服务端在起 turn 前把用户选中的图片复制到 `.yi-agent/attachments/<thread_id>/
 /// <hash>-<name>`,客户端据此自行读取并渲染。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct ImageRef {
     pub path: String,
     pub media_type: String,
+    // 图片文件字节数;线上是 JSON 数字(远小于 2^53)。
+    #[ts(type = "number")]
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Item {
     UserMessage {
@@ -600,9 +649,11 @@ pub enum Item {
         id: String,
         call_id: String,
         name: String,
+        #[ts(type = "unknown")]
         input: Value,
         status: ToolStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
@@ -629,7 +680,8 @@ pub enum Item {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
     Running,
