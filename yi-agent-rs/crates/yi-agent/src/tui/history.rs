@@ -804,10 +804,12 @@ impl HistoryState {
 
     /// Enforce [`MAX_HISTORY_CELLS`], dropping oldest-first.
     ///
-    /// Dropping the head shifts every index, so the cached entries must shift
-    /// with them. Rather than reshuffling the cache under the borrow, the cache
-    /// is rebuilt lazily: `entries` is cleared and the surviving cells are
-    /// treated as new by `ensure_cache`'s tail scan.
+    /// The drop is **surgical**: it removes the head cells and the cache entries
+    /// that mirror them, then shifts the surviving indexes down. The cells that
+    /// did not change keep their rendered lines, so the next frame re-renders
+    /// only what actually moved. Clearing the whole cache here instead would
+    /// make every push at the cap cost a full re-render of the retained history
+    /// — the per-event O(N) work this module exists to remove.
     fn enforce_history_cap(&mut self) {
         if self.cells.len() <= MAX_HISTORY_CELLS {
             return;
@@ -815,15 +817,42 @@ impl HistoryState {
         let excess = self.cells.len() - MAX_HISTORY_CELLS;
         self.cells.drain(0..excess);
         self.dropped_cells += excess;
-        self.selected = None;
-        let cache = self.cache.get_mut();
-        cache.entries.clear();
-        cache.dirty.clear();
-        cache.cumulative.truncate(1);
-        cache.part_offsets.clear();
-        cache.decision = None;
-        // The viewport is re-derived from scratch after a head drop.
-        self.scroll_offset = 0;
+
+        // `selected` indexes cells, so it shifts with them; a selection that was
+        // on a dropped cell is gone.
+        self.selected = match self.selected {
+            Some(index) if index >= excess => Some(index - excess),
+            _ => None,
+        };
+
+        // Drop the head *entries* alongside the head cells so the two stay
+        // index-aligned. The cells that did not change keep their rendered
+        // lines; only the new tail will be rendered by the next frame.
+        {
+            let cache = self.cache.get_mut();
+            cache.entries.drain(0..excess.min(cache.entries.len()));
+            // Re-key the dirty set the same way the entries were re-keyed. An
+            // index that referred to a dropped cell is discarded; every other
+            // index must keep pointing at its own cell.
+            cache.dirty = cache
+                .dirty
+                .iter()
+                .filter_map(|&index| index.checked_sub(excess))
+                .collect();
+            // The width verdict was made against content that no longer exists.
+            cache.decision = None;
+        }
+
+        // No `scroll_offset` adjustment: it counts lines *up from the bottom*,
+        // and a head drop leaves the bottom exactly where it was, so the reader
+        // keeps looking at the same content. Resetting it to 0 (as this used to)
+        // yanks anyone scrolled up down to the newest line; if the anchor itself
+        // was among the dropped lines, `reconcile_scroll_offset` clamps it.
+
+        // `cumulative`/`part_offsets` describe the entries, so they follow the
+        // entries. Rebuilding from the surviving ones keeps every lookup honest;
+        // leaving them describing the old sequence would misplace every line.
+        self.recompute_cache_accelerators();
     }
 
     fn apply_scroll_delta(&mut self, was_scrolled: bool, lines_before: usize, width: u16) {
@@ -3663,6 +3692,94 @@ mod tests {
         ));
     }
 
+    /// The pending-compaction label is a *separator mutated in place*: the
+    /// pending line is rendered across the driver round-trip, then the terminal
+    /// event replaces its label **without appending a cell**. With the per-frame
+    /// full scan gone, no "new tail" index can reach it — only
+    /// `replace_pending_compaction`'s own dirty registration can. So a frame read
+    /// after the event must show the new label, not the stale pending one.
+    ///
+    /// The two tests above assert cell *state*; this one asserts rendered output
+    /// through the same frame path (`flattened_lines` -> `ensure_cache`), which is
+    /// what actually goes stale if the registration is dropped.
+    #[test]
+    fn replaced_compaction_label_is_visible_in_the_next_frame() {
+        fn rendered_text(state: &HistoryState, width: u16) -> String {
+            HistoryView { state, width: 80 }
+                .flattened_lines(width)
+                .into_iter()
+                .flat_map(|(_, line)| line.spans.into_iter().map(|s| s.content.into_owned()))
+                .collect()
+        }
+
+        // The driver emits this label when `/compact` starts (`app.rs` pushes the
+        // same cell), so this is the real pending separator.
+        const PENDING: &str = "正在压缩对话...";
+        let width = 80u16;
+
+        // Success path: the replacement must be visible in the next frame.
+        let mut success = HistoryState::new();
+        success.push(
+            HistoryCell::Separator {
+                label: Some(PENDING.into()),
+            },
+            width,
+        );
+        let before = rendered_text(&success, width);
+        assert!(
+            before.contains(PENDING),
+            "the pending label must render while the compaction runs, got {before:?}"
+        );
+
+        success.push_event(
+            AgentEvent::ManualCompacted {
+                old_msg_count: 12,
+                new_msg_count: 5,
+            },
+            width,
+        );
+        let after = rendered_text(&success, width);
+        assert!(
+            after.contains("压缩完成（12 → 5 条消息）"),
+            "the replaced label must re-render in the next frame, got {after:?}"
+        );
+        assert!(
+            !after.contains(PENDING),
+            "the stale pending label must be gone after the replacement, got {after:?}"
+        );
+        assert_eq!(
+            success.cells.len(),
+            1,
+            "the label is replaced in place, not appended"
+        );
+
+        // Failure path: same in-place replacement, same visibility requirement.
+        let mut failed = HistoryState::new();
+        failed.push(
+            HistoryCell::Separator {
+                label: Some(PENDING.into()),
+            },
+            width,
+        );
+        let _ = rendered_text(&failed, width);
+
+        failed.push_event(
+            AgentEvent::ManualCompactFailed {
+                message: "provider unavailable".into(),
+            },
+            width,
+        );
+        let after = rendered_text(&failed, width);
+        assert!(
+            after.contains("压缩失败：provider unavailable"),
+            "the failure label must re-render in the next frame, got {after:?}"
+        );
+        assert!(
+            !after.contains(PENDING),
+            "the stale pending label must be gone after the failure, got {after:?}"
+        );
+    }
+
     #[test]
     fn model_changed_event_renders_the_new_model() {
         let mut history = HistoryState::new();
@@ -3882,6 +3999,149 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("blocked by safety filter: test rule")),
             "deny reason must be rendered; got: {rendered:?}"
+        );
+    }
+
+    /// At saturation, one push must not cost a full cache rebuild.
+    ///
+    /// `enforce_history_cap` drops the oldest cell on every push once the cap is
+    /// reached. If the drop also discarded the cache's mapping for the cells that
+    /// did NOT change, the next frame would re-render the entire retained history,
+    /// reintroducing exactly the per-event O(N) cost this module removes. The drop
+    /// must therefore be surgical: only the dropped head entries go, and every
+    /// surviving cell keeps its rendered lines.
+    #[test]
+    fn a_push_at_the_cap_does_not_re_render_the_whole_history() {
+        const WIDTH: u16 = 80;
+
+        let mut state = HistoryState::new();
+        for index in 0..(MAX_HISTORY_CELLS + 5) {
+            state.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("answer {index}"),
+                },
+                WIDTH,
+            );
+        }
+        assert_eq!(state.cells.len(), MAX_HISTORY_CELLS);
+
+        // Warm exactly like a frame does, so every retained cell has lines.
+        let _ = HistoryView {
+            state: &state,
+            width: WIDTH,
+        }
+        .flattened_lines(WIDTH);
+
+        // One more cell arrives; the cap drops the oldest to make room.
+        crate::tui::cell::reset_lines_call_count();
+        state.push(
+            HistoryCell::AssistantMessage {
+                markdown: "the newest answer".into(),
+            },
+            WIDTH,
+        );
+        let rendered = HistoryView {
+            state: &state,
+            width: WIDTH,
+        }
+        .flattened_lines(WIDTH);
+        let re_rendered = crate::tui::cell::lines_call_count();
+
+        assert_eq!(state.cells.len(), MAX_HISTORY_CELLS);
+        assert!(
+            re_rendered <= 3,
+            "a push at the cap must re-render only the new tail, but it re-rendered \
+             {re_rendered} of {MAX_HISTORY_CELLS} cells"
+        );
+
+        // The newest cell survives.
+        match state.cells.last().expect("history must not be empty") {
+            HistoryCell::AssistantMessage { markdown } => {
+                assert_eq!(markdown, "the newest answer")
+            }
+            other => panic!("expected the newest assistant message, got {other:?}"),
+        }
+
+        // Entry alignment: cell 0 must render its OWN text. A cache whose
+        // entries were shifted without their cells (or vice versa) would show a
+        // neighbour's text here.
+        let head: String = rendered
+            .iter()
+            .filter(|(index, _)| *index == 0)
+            .flat_map(|(_, line)| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        match &state.cells[0] {
+            HistoryCell::AssistantMessage { markdown } => assert_eq!(&head, markdown),
+            other => panic!("expected an assistant message at the head, got {other:?}"),
+        }
+    }
+
+    /// A head drop must not disturb where a scrolled-up reader is looking.
+    ///
+    /// `scroll_offset` counts lines *up from the bottom*. Dropping the oldest
+    /// cells removes lines from the top and leaves the bottom exactly where it
+    /// was, so an unchanged offset keeps the reader on the same content. (The
+    /// previous implementation reset the offset to 0 on every drop, yanking the
+    /// reader down to the newest line.)
+    #[test]
+    fn a_head_drop_keeps_a_scrolled_reader_in_place() {
+        const WIDTH: u16 = 80;
+        const HEIGHT: u16 = 10;
+
+        /// The first line the reader can see, as text.
+        fn top_visible_line(state: &HistoryState, width: u16, height: u16) -> String {
+            let lines = HistoryView {
+                state,
+                width: HEIGHT,
+            }
+            .flattened_lines(width);
+            let total = lines.len();
+            let effective = state
+                .scroll_offset
+                .min(total.saturating_sub(height as usize));
+            let start = total.saturating_sub(height as usize + effective);
+            lines
+                .into_iter()
+                .nth(start)
+                .map(|(_, line)| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        }
+
+        let mut state = HistoryState::new();
+        for index in 0..MAX_HISTORY_CELLS {
+            state.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("answer {index}"),
+                },
+                WIDTH,
+            );
+        }
+
+        // Scroll up a few lines; the reader is now looking at older content.
+        state.scroll_up(5, state.max_scroll_offset(WIDTH, HEIGHT));
+        assert!(state.scroll_offset > 0, "the reader must be scrolled up");
+        let before = top_visible_line(&state, WIDTH, HEIGHT);
+        assert!(!before.is_empty(), "the reader must have content in view");
+
+        // One more cell tips the cap: the oldest cell is dropped off the top.
+        state.push(
+            HistoryCell::AssistantMessage {
+                markdown: "newest".into(),
+            },
+            WIDTH,
+        );
+        state.reconcile_scroll_offset(WIDTH, HEIGHT);
+
+        assert_eq!(state.cells.len(), MAX_HISTORY_CELLS);
+        assert_eq!(
+            top_visible_line(&state, WIDTH, HEIGHT),
+            before,
+            "a head drop must leave a scrolled-up reader on the same content"
         );
     }
 }
