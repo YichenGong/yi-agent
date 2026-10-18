@@ -90,9 +90,6 @@ pub const MODEL_KEY: &str = "YI_AGENT_MODEL";
 pub const API_URL_KEY: &str = "MODEL_API_URL";
 pub const API_KEY_KEY: &str = "MODEL_API_KEY";
 
-/// 分组注释：缺失键追加时补上，与 `.env.example` / `yi-agent-web` 的格式一致。
-const GROUP_COMMENT: &str = "# === Model Provider ===";
-
 /// 引导收敛出的模型配置（写入 `.env` 的四个键）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSettings {
@@ -178,78 +175,6 @@ fn strip_quotes(s: &str) -> String {
         }
     }
     s.to_string()
-}
-
-/// 行级保留式写入：只就地替换/追加这四个键，其余行（含用户自定义键与注释）
-/// 逐字节保留。落盘用「临时文件 + rename」保证原子性，与 `models.json` /
-/// `preferences.json` 同一约定。文件含密钥，新建时权限收紧为 `0600`。
-pub fn write_model_settings(path: &Path, settings: &ModelSettings) -> std::io::Result<()> {
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let mut lines: Vec<String> = existing.lines().map(str::to_string).collect();
-
-    let mut replaced = [false; 4];
-    let targets = [
-        (PROVIDER_KEY, settings.provider.as_str()),
-        (MODEL_KEY, settings.model.as_str()),
-        (API_URL_KEY, settings.api_url.as_str()),
-        (API_KEY_KEY, settings.api_key.as_str()),
-    ];
-
-    for line in lines.iter_mut() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some(eq) = trimmed.find('=') else {
-            continue;
-        };
-        let key = trimmed[..eq].trim().to_string();
-        let mut replacement: Option<usize> = None;
-        for (i, (name, _)) in targets.iter().enumerate() {
-            if key == *name {
-                replacement = Some(i);
-            }
-        }
-        if let Some(i) = replacement {
-            let (name, value) = targets[i];
-            *line = format!("{name}={value}");
-            replaced[i] = true;
-        }
-    }
-
-    let missing: Vec<&(&str, &str)> = targets
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !replaced[*i])
-        .map(|(_, t)| t)
-        .collect();
-    if !missing.is_empty() {
-        lines.push(GROUP_COMMENT.to_string());
-        for (name, value) in missing {
-            lines.push(format!("{name}={value}"));
-        }
-    }
-
-    let mut output = lines.join("\n");
-    output.push('\n');
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("tmp-onboarding-{}", std::process::id()));
-    std::fs::write(&tmp, output)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // 新文件收紧到 0600；若目标已存在，rename 前把临时文件的权限对齐它，
-        // 避免把用户放宽过的权限悄悄改回 0600。
-        let mode = std::fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o777)
-            .unwrap_or(0o600);
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 /// `preferences.json` 里「引导已结束」的键：完成或用户选「稍后设置」都置位。
@@ -625,90 +550,6 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let f = read_env_fields(&dir.path().join("nope.env")).unwrap();
         assert_eq!(f, EnvModelFields::default());
-    }
-
-    #[test]
-    fn write_creates_the_file_with_the_four_keys_and_a_group_comment() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join(".env");
-        write_model_settings(&path, &settings("openai", "gpt-4o", "https://u", "sk-k")).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("YI_AGENT_PROVIDER=openai"));
-        assert!(text.contains("YI_AGENT_MODEL=gpt-4o"));
-        assert!(text.contains("MODEL_API_URL=https://u"));
-        assert!(text.contains("MODEL_API_KEY=sk-k"));
-        assert!(text.contains("# === Model Provider ==="));
-        let f = read_env_fields(&path).unwrap();
-        assert_eq!(f.api_key, "sk-k");
-    }
-
-    #[test]
-    fn write_updates_existing_keys_in_place() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join(".env");
-        std::fs::write(
-            &path,
-            "# my notes\nYI_AGENT_PROVIDER=anthropic\nYI_AGENT_MAX_TURNS=500\n",
-        )
-        .unwrap();
-        write_model_settings(&path, &settings("openai", "gpt-4o", "https://u", "sk-k")).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("YI_AGENT_PROVIDER=openai"));
-        assert!(
-            text.contains("YI_AGENT_MAX_TURNS=500"),
-            "unrelated key must survive"
-        );
-        assert!(text.contains("# my notes"), "comments must survive");
-    }
-
-    #[test]
-    fn write_appends_missing_keys_and_preserves_user_keys() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join(".env");
-        std::fs::write(&path, "MY_CUSTOM_KEY=abc\n").unwrap();
-        write_model_settings(&path, &settings("anthropic", "claude-x", "", "sk-k")).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("MY_CUSTOM_KEY=abc"));
-        assert!(text.contains("YI_AGENT_PROVIDER=anthropic"));
-        assert!(text.contains("YI_AGENT_MODEL=claude-x"));
-        assert!(text.contains("MODEL_API_KEY=sk-k"));
-    }
-
-    #[test]
-    fn write_does_not_duplicate_an_existing_key() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join(".env");
-        std::fs::write(&path, "YI_AGENT_MODEL=old\n").unwrap();
-        write_model_settings(&path, &settings("openai", "new", "", "sk-k")).unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.matches("YI_AGENT_MODEL=").count(), 1);
-        assert!(text.contains("YI_AGENT_MODEL=new"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_uses_0600_for_a_new_file_and_keeps_an_existing_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::TempDir::new().unwrap();
-
-        // 新建：文件含密钥，权限必须收紧到 0600。
-        let fresh = dir.path().join("fresh.env");
-        write_model_settings(&fresh, &settings("openai", "gpt-4o", "https://u", "sk-k")).unwrap();
-        let fresh_mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
-        assert_eq!(fresh_mode, 0o600, "a newly written .env must be 0600");
-
-        // 已存在：用户放宽过的权限必须原样保留，不能被悄悄改回 0600。
-        let existing = dir.path().join("existing.env");
-        std::fs::write(&existing, "MY_CUSTOM_KEY=abc\n").unwrap();
-        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_model_settings(
-            &existing,
-            &settings("openai", "gpt-4o", "https://u", "sk-k"),
-        )
-        .unwrap();
-        let existing_mode = std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
-        assert_eq!(existing_mode, 0o644, "an existing .env must keep its mode");
     }
 
     #[test]
