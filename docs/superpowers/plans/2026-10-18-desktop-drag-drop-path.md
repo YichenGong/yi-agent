@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- 所有改动在 worktree `.worktrees/drag-drop-path`（分支 `feat/desktop-drag-drop-path`）内，**不碰 `main`**。
+- 工作区：本计划会在看板预建的 worktree 里执行（`.worktrees/kanban/<slug>/`，分支 `kanban/<slug>`）。下面所有相对路径都以**该 worktree** 为根；**不碰 `main`**。
 - 前端命令在 `<worktree>/desktop/` 下跑；先 `export PATH="/opt/homebrew/bin:$PATH"`；vitest 需 `TMPDIR="$PWD/.tmpverify"`，该目录在 worktree 里**尚不存在**，首次使用前 `mkdir -p .tmpverify`。
 - **不新增任何 npm / Rust 依赖**（`@tauri-apps/api` 已在依赖里）。
 - 提交用 conventional commits（`feat:` / `test:` / `docs:`），首行 ≤72 字符，**不写 `Co-Authored-By` 行**；`git status` 核对后**精确 `git add` 具体文件，不要 `git add -A`**。
@@ -110,7 +110,7 @@ describe("insertDroppedPaths", () => {
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && mkdir -p .tmpverify && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/lib/droppedPaths.test.ts
+cd <worktree>/desktop && mkdir -p .tmpverify && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/lib/droppedPaths.test.ts
 ```
 
 Expected: FAIL —— 无法解析 `./droppedPaths`（模块不存在）。
@@ -169,7 +169,7 @@ export function insertDroppedPaths(
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/lib/droppedPaths.test.ts
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/lib/droppedPaths.test.ts
 ```
 
 Expected: PASS（11 个用例）。
@@ -177,7 +177,7 @@ Expected: PASS（11 个用例）。
 - [ ] **Step 5: 提交**
 
 ```bash
-cd .worktrees/drag-drop-path && git add desktop/src/lib/droppedPaths.ts desktop/src/lib/droppedPaths.test.ts && git commit -m "feat(desktop): 拖入路径的排版纯函数" 
+cd <worktree> && git add desktop/src/lib/droppedPaths.ts desktop/src/lib/droppedPaths.test.ts && git commit -m "feat(desktop): 拖入路径的排版纯函数" 
 ```
 
 ---
@@ -339,7 +339,7 @@ describe("useDragDropPaths", () => {
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/hooks/useDragDropPaths.test.ts
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/hooks/useDragDropPaths.test.ts
 ```
 
 Expected: FAIL —— 无法解析 `./useDragDropPaths`（模块不存在）。
@@ -458,7 +458,7 @@ export function useDragDropPaths({
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/hooks/useDragDropPaths.test.ts
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/hooks/useDragDropPaths.test.ts
 ```
 
 Expected: PASS（11 个用例）。
@@ -466,7 +466,7 @@ Expected: PASS（11 个用例）。
 - [ ] **Step 5: 提交**
 
 ```bash
-cd .worktrees/drag-drop-path && git add desktop/src/hooks/useDragDropPaths.ts desktop/src/hooks/useDragDropPaths.test.ts && git commit -m "feat(desktop): 订阅窗口拖放并判定落点" 
+cd <worktree> && git add desktop/src/hooks/useDragDropPaths.ts desktop/src/hooks/useDragDropPaths.test.ts && git commit -m "feat(desktop): 订阅窗口拖放并判定落点" 
 ```
 
 ---
@@ -542,7 +542,7 @@ describe("拖入高亮与光标", () => {
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/components/MessageInput.test.tsx
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/components/MessageInput.test.tsx
 ```
 
 Expected: FAIL —— `dropActive` / `caretSeek` / `onCaretChange` / `cardRef` 不是已知 props（TS/运行时均不生效），5 个新用例失败。
@@ -638,7 +638,7 @@ import { useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/components/MessageInput.test.tsx src/lib/droppedPaths.test.ts src/hooks/useDragDropPaths.test.ts
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/components/MessageInput.test.tsx src/lib/droppedPaths.test.ts src/hooks/useDragDropPaths.test.ts
 ```
 
 Expected: PASS —— 新增 5 例通过，且既有用例（含 `:164` 那条基础类断言）**不回归**。
@@ -646,7 +646,7 @@ Expected: PASS —— 新增 5 例通过，且既有用例（含 `:164` 那条�
 - [ ] **Step 5: 提交**
 
 ```bash
-cd .worktrees/drag-drop-path && git add desktop/src/components/MessageInput.tsx desktop/src/components/MessageInput.test.tsx && git commit -m "feat(desktop): 输入卡片拖入高亮与光标定位" 
+cd <worktree> && git add desktop/src/components/MessageInput.tsx desktop/src/components/MessageInput.test.tsx && git commit -m "feat(desktop): 输入卡片拖入高亮与光标定位" 
 ```
 
 ---
@@ -740,7 +740,7 @@ function stubRect(el: HTMLElement, r: { left: number; top: number; right: number
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/App.test.tsx -t "拖入路径"
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/App.test.tsx -t "拖入路径"
 ```
 
 Expected: FAIL —— `dragDrop.fn` 恒为 `null`（`App` 还没订阅），草稿为空。
@@ -831,7 +831,7 @@ import { insertDroppedPaths } from "./lib/droppedPaths";
 - [ ] **Step 4: 跑测试确认通过**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/App.test.tsx src/components/MessageInput.test.tsx src/lib/droppedPaths.test.ts src/hooks/useDragDropPaths.test.ts
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx vitest run src/App.test.tsx src/components/MessageInput.test.tsx src/lib/droppedPaths.test.ts src/hooks/useDragDropPaths.test.ts
 ```
 
 Expected: PASS（含新增 2 例；`App.test.tsx` 既有用例不回归）。
@@ -839,7 +839,7 @@ Expected: PASS（含新增 2 例；`App.test.tsx` 既有用例不回归）。
 - [ ] **Step 5: 提交**
 
 ```bash
-cd .worktrees/drag-drop-path && git add desktop/src/App.tsx desktop/src/lib/dragDropSubscribe.ts desktop/src/App.test.tsx && git commit -m "feat(desktop): 拖入的文件/文件夹路径自动录入当前会话" 
+cd <worktree> && git add desktop/src/App.tsx desktop/src/lib/dragDropSubscribe.ts desktop/src/App.test.tsx && git commit -m "feat(desktop): 拖入的文件/文件夹路径自动录入当前会话" 
 ```
 
 ---
@@ -857,7 +857,7 @@ cd .worktrees/drag-drop-path && git add desktop/src/App.tsx desktop/src/lib/drag
 - [ ] **Step 1: 类型检查 + 全量测试**
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx tsc --noEmit && TMPDIR="$PWD/.tmpverify" npx vitest run
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && TMPDIR="$PWD/.tmpverify" npx tsc --noEmit && TMPDIR="$PWD/.tmpverify" npx vitest run
 ```
 
 Expected: `tsc` 无输出；vitest 全绿（既有用例 + 本次新增 29 例：Task 1 的 11 例 + Task 2 的 11 例 + Task 3 的 5 例 + Task 4 的 2 例）。
@@ -879,19 +879,19 @@ Expected: `tsc` 无输出；vitest 全绿（既有用例 + 本次新增 29 例�
 - [ ] **Step 4: 提交**
 
 ```bash
-cd .worktrees/drag-drop-path && git add docs/project-management/desktop.md README.md && git commit -m "docs: 记录拖入路径功能与模块计数" 
+cd <worktree> && git add docs/project-management/desktop.md README.md && git commit -m "docs: 记录拖入路径功能与模块计数" 
 ```
 
 - [ ] **Step 5: 收尾（按 finishing-a-development-branch）**
 
-用 `superpowers:finishing-a-development-branch` 决定合回方式：本仓库约定为回 `main` 做 `git merge --no-ff feat/desktop-drag-drop-path`，合并后删分支 + `git worktree remove .worktrees/drag-drop-path`。
+用 `superpowers:finishing-a-development-branch` 决定合回方式：本仓库约定为回到 `main` 做 `git merge --no-ff <本卡分支>`（看板卡的分支是 `kanban/<slug>`，见 `service.rs:175`），合并后删分支 + 移除 worktree。**注意**：看板卡由插件在 `awaiting_merge` 时经 `merge-request` 名额合并，故这里只需按 `finishing-a-development-branch` 呈现选项，**不要自己直接 `git merge`**。
 
 ---
 
 ## 手工验收（不进 CI，需真机）
 
 ```bash
-cd .worktrees/drag-drop-path/desktop && export PATH="/opt/homebrew/bin:$PATH" && npm run tauri dev
+cd <worktree>/desktop && export PATH="/opt/homebrew/bin:$PATH" && npm run tauri dev
 ```
 
 1. 从 Finder 拖一个**文件夹**到输入卡片上 → 卡片出现蓝色圆环高亮，松手后输入框出现该文件夹绝对路径。
