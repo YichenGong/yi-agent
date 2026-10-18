@@ -8,12 +8,13 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
 
-pub mod board_daemon;
 pub mod lifecycle;
 pub mod registry;
 pub mod scaffold;
-pub mod watch;
-pub mod watchman;
+
+/// 过渡期再导出：通用部分已迁进 `yi-agent-supervisors`，这里只是让尚未收口的
+/// 调用点（Task 6 前）继续编译。Task 6 删本 crate 时一并删除。
+pub use yi_agent_supervisors::{daemon as board_daemon, watch, watchman};
 
 /// Directory holding the global board registry and the shared lease slots:
 /// `$HOME/.yi-agent/superpowers-kanban`.

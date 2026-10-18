@@ -186,14 +186,18 @@ pub enum Command {
         action: PairAction,
     },
     /// 常驻值守：保证登记在册的项目各自有一个活着的 daemon。
-    Boards {
+    ///
+    /// 通用子命令。`boards` 是它的旧名（launchd plist 装过旧名），过渡期保留为
+    /// 隐藏别名；Task 6 删 `yi-agent-boards` 时一并移除。
+    #[command(alias = "boards")]
+    Resident {
         #[command(subcommand)]
-        action: BoardsAction,
+        action: ResidentAction,
     },
 }
 
 #[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
-pub enum BoardsAction {
+pub enum ResidentAction {
     /// 值守循环：按登记表确保各项目 daemon 存活（由 launchd 常驻托管）。
     Watch {
         #[arg(long, default_value_t = 30)]

@@ -6911,7 +6911,6 @@ mod resident_rpc_tests {
         );
         h.shutdown().await;
     }
-
 }
 
 #[cfg(test)]

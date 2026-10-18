@@ -131,7 +131,11 @@ fn write_manifest_with_query_socket(
 /// real contract is broken.
 fn probe_path(manifest: &SupervisorManifest, layout: &Layout) -> PathBuf {
     manifest
-        .query_socket_path(&layout.workdir, &layout.state_dir, &layout.runtime_dir)
+        .query_socket_path(
+            &layout.workdir,
+            &layout.state_dir(&manifest.name),
+            &layout.runtime_dir,
+        )
         .expect("manifest declares a query_socket")
         .expect("tempdir path is short enough to stay as declared")
 }
@@ -313,13 +317,21 @@ fn stop_all_reaps_every_child() {
     assert_eq!(supervisor.running_count(), 0);
 }
 
+/// 磁盘契约：清单名 `superpowers-kanban` 必须派生出与通用化之前**逐字相同**的
+/// 目录，否则既有安装的清单（含插件据此反推的项目根与偏好文件）会指错地方。
 #[test]
-fn the_layout_state_dir_uses_the_superpowers_kanban_name() {
+fn the_layout_state_dir_follows_the_manifest_name_and_keeps_the_contract() {
     let dir = tempfile::tempdir().unwrap();
     let layout = Layout::for_workdir(dir.path());
     assert_eq!(
-        layout.state_dir,
-        dir.path().join(".yi-agent/superpowers-kanban")
+        layout.state_dir("superpowers-kanban"),
+        dir.path().join(".yi-agent/superpowers-kanban"),
+        "the on-disk contract must not move"
+    );
+    assert_ne!(
+        layout.state_dir("superpowers-kanban"),
+        layout.state_dir("some-other-plugin"),
+        "each manifest name gets its own directory"
     );
 }
 
@@ -339,7 +351,7 @@ fn a_deep_workdir_publishes_the_path_the_plugin_actually_binds() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(&workdir, &marker);
     let layout = layout_for(&workdir);
-    let state_dir = layout.state_dir.clone();
+    let state_dir = layout.state_dir("superpowers-kanban");
 
     // 清单声明查询 socket（与真实清单同款模板），并打开开关。
     std::fs::create_dir_all(layout.manifests_dir()).unwrap();

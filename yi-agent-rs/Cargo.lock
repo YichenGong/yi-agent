@@ -5011,11 +5011,11 @@ name = "yi-agent-boards"
 version = "0.1.6"
 dependencies = [
  "chrono",
- "libc",
  "serde",
  "serde_json",
  "tempfile",
  "yi-agent-store",
+ "yi-agent-supervisors",
 ]
 
 [[package]]
@@ -5176,11 +5176,13 @@ name = "yi-agent-supervisors"
 version = "0.1.6"
 dependencies = [
  "chrono",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tracing",
+ "yi-agent-store",
 ]
 
 [[package]]

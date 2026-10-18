@@ -13,18 +13,13 @@ use serde::{Deserialize, Serialize};
 
 use yi_agent_store::resident;
 
-use crate::board_daemon;
 use crate::registry;
 use crate::scaffold;
+use yi_agent_supervisors::daemon;
 
 /// 看板在通用常驻登记里的请求者名。写进 `resident-daemons.json` 的
 /// `required_by`，值守者据此知道这条需要是看板提出的（而不是别的组件）。
 pub const REQUESTER: &str = "superpowers-kanban";
-
-/// How long [`create`] waits for a freshly spawned daemon to answer before
-/// giving up on it. Generous enough for a cold plugin load, short enough that a
-/// wedged start does not look like a hung UI.
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The plugin method whose answer carries the card list, and the params it
 /// takes. The host does not interpret the board, so both are plain data.
@@ -113,7 +108,7 @@ pub fn remove(project: &Path) -> Result<(), String> {
 /// `resident_dir` is threaded through like in [`create_in`]: the app-server
 /// injects its own so a test's board/remove never writes the real `~/.yi-agent`.
 pub fn remove_in(project: &Path, global: &Path, resident_dir: &Path) -> Result<(), String> {
-    let mut stopper = |project: &Path| board_daemon::stop(project);
+    let mut stopper = |project: &Path| daemon::stop(project);
     remove_with(project, global, resident_dir, &mut stopper)
 }
 
@@ -133,19 +128,12 @@ pub fn status(project: &Path) -> BoardStatus {
 ///
 /// Public so the app-server can inject it into its dispatch loop unchanged; the
 /// `board/create` RPC and the TUI command therefore start daemons the same way.
+///
+/// The generic logic now lives in `yi-agent_supervisors::daemon::ensure_running`
+/// (which owns the ready timeout); this name stays only for the call sites that
+/// Task 6 has not yet moved off `yi-agent-boards`.
 pub fn launch_if_absent(project: &Path) -> Result<bool, String> {
-    // The spec's rule: a project that already has a live daemon (perhaps
-    // because a thread was opened there first) keeps it. Two daemons on one
-    // project would fight over the runtime lock.
-    if board_daemon::is_running(project) {
-        return Ok(true);
-    }
-    let exe = std::env::current_exe().map_err(|error| {
-        format!("cannot locate this executable to start the board daemon: {error}")
-    })?;
-    board_daemon::spawn_detached(&exe, project)
-        .map_err(|error| format!("could not start the board daemon: {error}"))?;
-    Ok(board_daemon::wait_ready(project, READY_TIMEOUT))
+    daemon::ensure_running(project)
 }
 
 /// Create a board with an injected launcher, plugin executable, and global and
@@ -185,7 +173,7 @@ pub fn create_with_project(
     scaffold::install_manifest(project, plugin_command).map_err(|error| error.to_string())?;
     scaffold::enable_switch(project).map_err(|error| error.to_string())?;
 
-    let daemon_running = if board_daemon::is_running(project) {
+    let daemon_running = if daemon::is_running(project) {
         true
     } else {
         launcher(project)?
@@ -243,7 +231,7 @@ pub fn remove_with(
 /// detail, the registered/running flags are the answer.
 pub fn status_with(project: &Path, global: &Path) -> BoardStatus {
     let registered = registry::contains(global, project).unwrap_or(false);
-    let daemon_running = board_daemon::is_running(project);
+    let daemon_running = daemon::is_running(project);
     let (queued, running, pre_queued) = if daemon_running {
         card_counts(project).unwrap_or((0, 0, 0))
     } else {

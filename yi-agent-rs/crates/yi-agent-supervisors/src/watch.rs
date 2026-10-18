@@ -5,9 +5,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// 生产入口：用真实 `launch_if_absent`。
+/// 生产入口：用真实的 daemon 生命周期（复用已应答的 daemon，否则拉起一个）。
 pub fn ensure_daemons(projects: &[PathBuf]) {
-    ensure_daemons_with(projects, &mut crate::lifecycle::launch_if_absent);
+    ensure_daemons_with(projects, &mut crate::daemon::ensure_running);
 }
 
 /// 注入版：返回本次真正拉起的项目。单个失败只记日志，不影响其余项目。
@@ -22,7 +22,7 @@ pub fn ensure_daemons_with(
             Ok(false) => {}
             Err(error) => {
                 eprintln!(
-                    "board watchman: could not ensure a daemon for {}: {error}",
+                    "resident watchman: could not ensure a daemon for {}: {error}",
                     project.display()
                 );
             }
