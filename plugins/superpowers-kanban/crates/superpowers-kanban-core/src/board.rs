@@ -67,6 +67,7 @@ impl Board {
             origin_card: None,
             archived: false,
             terminal_at: None,
+            title: None,
         });
         &self.cards[index]
     }
@@ -100,8 +101,93 @@ impl Board {
             origin_card: origin,
             archived: false,
             terminal_at: None,
+            title: None,
         });
         &self.cards[index]
+    }
+
+    /// 排入一张预排队卡：无 spec/plan，只有一个标题；id 由调用方定死。
+    pub fn enqueue_prequeued(&mut self, id: CardId, title: String, now: DateTime<Local>) -> &Card {
+        let order = self.next_order;
+        self.next_order += 1;
+        let index = self.cards.len();
+        self.cards.push(Card {
+            id,
+            spec_path: PathBuf::new(),
+            plan_path: PathBuf::new(),
+            state: CardState::PreQueued,
+            enqueued_at: now,
+            order,
+            workdir: None,
+            task_id: None,
+            thread_id: None,
+            base_commit: None,
+            kind: CardKind::Implementation,
+            source_ref: None,
+            base_ref: None,
+            origin_card: None,
+            archived: false,
+            terminal_at: None,
+            title: Some(title),
+        });
+        &self.cards[index]
+    }
+
+    /// 未占用的预排队卡 id。
+    ///
+    /// `slug(title)` 只保留 ASCII 字母数字，中文标题会 slug 成空串——此时用
+    /// `prequeued-<YYYYMMDDHHMMSS>` 回退。**绝不**把所有非 ASCII 标题塌成同一个
+    /// `prequeued`：那会让每张中文卡的 id 撞成一个（`slugify` 再把它压成 `card`），
+    /// worktree 分支名与追踪线一起废掉。
+    pub fn next_free_prequeued_id(&self, title: &str, now: DateTime<Local>) -> CardId {
+        let slug = crate::card_id::slug(title);
+        let base = if slug.is_empty() {
+            format!("prequeued-{}", now.format("%Y%m%d%H%M%S"))
+        } else {
+            slug
+        };
+        if !self.contains(&base) {
+            return CardId::new(base);
+        }
+        for n in 2u32.. {
+            let candidate = format!("{base}-{n}");
+            if !self.contains(&candidate) {
+                return CardId::new(candidate);
+            }
+        }
+        unreachable!("u32 suffix space exhausted")
+    }
+
+    /// 提升一张预排队卡：补 spec/plan、可换标题、翻 `Queued`、**重排到队尾**。
+    /// id 不变——这是「追踪不断线」的核心保障。
+    pub fn promote_prequeued(
+        &mut self,
+        id: &CardId,
+        spec: PathBuf,
+        plan: PathBuf,
+        title: Option<String>,
+    ) -> Result<(), TransitionError> {
+        let order = self.next_order;
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|card| &card.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        if !card.state.can_transition_to(CardState::Queued) {
+            return Err(TransitionError::Illegal {
+                from: card.state,
+                to: CardState::Queued,
+            });
+        }
+        card.spec_path = spec;
+        card.plan_path = plan;
+        if let Some(title) = title {
+            card.title = Some(title);
+        }
+        card.order = order;
+        card.state = CardState::Queued;
+        self.next_order += 1;
+        Ok(())
     }
 
     pub fn get(&self, id: &CardId) -> Option<&Card> {
@@ -698,5 +784,96 @@ mod tests {
         let json = r#"{"cards":[{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}],"next_order":1}"#;
         let board: Board = serde_json::from_str(json).unwrap();
         assert_eq!(board.get(&CardId::new("a")).unwrap().workdir, None);
+    }
+
+    #[test]
+    fn a_pre_queued_card_is_queued_nowhere_near_a_slot() {
+        let mut board = Board::new();
+        board.enqueue_prequeued(CardId::new("idea"), "一个想法".into(), at(1, 0));
+        let card = board.get(&CardId::new("idea")).unwrap();
+        assert_eq!(card.state, CardState::PreQueued);
+        assert_eq!(card.title.as_deref(), Some("一个想法"));
+        assert!(card.spec_path.as_os_str().is_empty());
+        assert!(card.plan_path.as_os_str().is_empty());
+        // 不占槽、不会被 claim 起来跑（它压根不是 Queued）。
+        assert_eq!(board.running_count(), 0);
+        assert_eq!(board.next_startable(), None);
+        assert_eq!(board.claim_next_launch(3), None);
+    }
+
+    #[test]
+    fn a_pre_queued_id_falls_back_and_gets_a_suffix_on_collision() {
+        let mut board = Board::new();
+        assert_eq!(
+            board.next_free_prequeued_id("idea", at(1, 0)),
+            CardId::new("idea")
+        );
+        // `slug()` 只保留 ASCII 字母数字，中文标题会 slug 成空串——此时回退到
+        // 带时间戳的 id，绝不能全部塌成同一个 `prequeued`（否则每张卡同 id，
+        // 追踪就废了，且 worktree 分支名会互撞）。
+        let fallback = board.next_free_prequeued_id("我的想法", at(1, 0));
+        assert!(
+            fallback.0.starts_with("prequeued-"),
+            "非 ASCII slug 回退到带时间戳的 id: {fallback:?}"
+        );
+        let other = board.next_free_prequeued_id("另一个想法", at(1, 1));
+        assert_ne!(fallback, other, "两张中文标题的卡必须拿到不同 id");
+        board.enqueue_prequeued(CardId::new("idea"), "idea".into(), at(1, 0));
+        assert_eq!(
+            board.next_free_prequeued_id("idea", at(1, 1)),
+            CardId::new("idea-2")
+        );
+    }
+
+    #[test]
+    fn promoting_fills_the_paths_keeps_the_id_and_moves_to_the_back() {
+        let mut board = board_with(&["older"]);
+        board.enqueue_prequeued(CardId::new("idea"), "想法".into(), at(1, 5));
+        let idea = CardId::new("idea");
+        board
+            .promote_prequeued(
+                &idea,
+                "docs/idea.spec.md".into(),
+                "docs/idea.plan.md".into(),
+                None,
+            )
+            .unwrap();
+        let card = board.get(&idea).unwrap();
+        assert_eq!(card.id, idea, "id 绝不重算");
+        assert_eq!(card.state, CardState::Queued);
+        assert_eq!(card.spec_path, PathBuf::from("docs/idea.spec.md"));
+        assert_eq!(card.plan_path, PathBuf::from("docs/idea.plan.md"));
+        assert_eq!(card.title.as_deref(), Some("想法"), "未给新标题则保留");
+        // 重排到队尾：`older`(order 0) 之后。
+        assert_eq!(board.next_startable(), Some(CardId::new("older")));
+        assert!(card.order > board.get(&CardId::new("older")).unwrap().order);
+    }
+
+    #[test]
+    fn promoting_with_a_new_title_overwrites_it_but_not_the_id() {
+        let mut board = Board::new();
+        let idea = CardId::new("idea");
+        board.enqueue_prequeued(idea.clone(), "旧标题".into(), at(1, 0));
+        board
+            .promote_prequeued(&idea, "s".into(), "p".into(), Some("新标题".into()))
+            .unwrap();
+        let card = board.get(&idea).unwrap();
+        assert_eq!(card.title.as_deref(), Some("新标题"));
+        assert_eq!(card.id, idea);
+    }
+
+    #[test]
+    fn promoting_a_card_that_is_not_pre_queued_is_rejected() {
+        let mut board = board_with(&["a"]); // a 已是 Queued
+        let error = board
+            .promote_prequeued(&CardId::new("a"), "s".into(), "p".into(), None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            TransitionError::Illegal {
+                from: CardState::Queued,
+                to: CardState::Queued,
+            }
+        );
     }
 }
