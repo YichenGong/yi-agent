@@ -48,9 +48,66 @@ function totals(files: FileStat[]): { additions: number; deletions: number } {
   return { additions, deletions };
 }
 
-/** 帧「有内容」：命令、stdout、stderr 任一非空。空帧退化成结构化 diff。 */
-function frameHasContent(f: ViewFrame): boolean {
-  return f.command !== null || f.stdout !== "" || f.stderr !== "";
+/**
+ * 帧「有内容」：命令、stdout、stderr 任一为**非空字符串**。空帧退化成结构化 diff。
+ *
+ * 判据收严成 `typeof === "string" && !== ""`：训练里见过的坏形状（`command: undefined`）
+ * 会被 `!== null` 放行，于是一个空壳帧顶掉整份结构化正文，只剩空白面板。
+ */
+function frameHasContent(f: ViewFrame | null | undefined): boolean {
+  if (!f) return false;
+  const hasCommand = typeof f.command === "string" && f.command !== "";
+  const hasStdout = typeof f.stdout === "string" && f.stdout !== "";
+  const hasStderr = typeof f.stderr === "string" && f.stderr !== "";
+  return hasCommand || hasStdout || hasStderr;
+}
+
+/** 帧的可读基准标签：`session` → 「本次会话」，否则用 ref，都没有则「工作区」。 */
+function frameBaseLabel(f: ViewFrame): string {
+  if (f.baseKind === "session") return "本次会话";
+  return f.base ?? "工作区";
+}
+
+/**
+ * 帧的头部：命令条（命令原文 + 超时/截断/退出码）与基准/提示语。
+ *
+ * 抽成组件是为了「只有帧、没有结构化快照」那条路径能复用同一套头部——
+ * 那条路径没有 commits/files 可汇总，头部只剩命令与基准。
+ */
+function FrameHead({
+  frame,
+  baseLabel,
+  note,
+  onRefresh,
+}: {
+  frame: ViewFrame;
+  baseLabel: string;
+  note: string | null;
+  onRefresh: () => void;
+}) {
+  return (
+    <>
+      <div className="flex items-center justify-between px-3 py-2">
+        <span className="truncate text-xs text-fg-muted">对比 {baseLabel}</span>
+        <button type="button" className="text-xs text-fg-subtle hover:text-fg-muted" onClick={onRefresh}>
+          刷新
+        </button>
+      </div>
+      <div className="flex items-center gap-2 px-3 pb-1">
+        <span className="min-w-0 flex-1 truncate font-mono text-xs text-fg-subtle">
+          {frame.command ?? "（结构化默认）"}
+        </span>
+        {frame.timedOut && <span className="text-xs text-red-300">命令超时</span>}
+        {frame.truncated && <span className="text-xs text-amber-300">输出已截断</span>}
+        {frame.exitCode !== null && (
+          <span className={`text-xs ${frame.exitCode === 0 ? "text-fg-faint" : "text-red-300"}`}>
+            退出码 {frame.exitCode}
+          </span>
+        )}
+      </div>
+      {note && <p className="px-3 pb-1 text-xs text-sky-300">{note}</p>}
+    </>
+  );
 }
 
 const FileBlock = memo(function FileBlock({ file, open }: { file: FileDiff; open: boolean }) {
@@ -199,17 +256,37 @@ export function GitDiffView({
     );
   }
 
-  if (error) {
+  // 帧说了算：模型给的命令有内容时，即使结构化快照还没到（`diff === null`）也要
+  // 渲染它——否则 Task 8 的整条帧渲染路径在真实接线里永远走不到（focus 只取帧）。
+  const frameBody = frameHasContent(frame) ? frame : null;
+  // 帧有内容时它才是权威正文：此时结构化快照那路的错误（`thread/diff/read` 失败）
+  // 不当致命——帧本身是好的，为一份没取到的快照把有用的正文换成红字并不划算。
+  if (error && !frameBody) {
     return <p className="px-3 py-2 text-sm text-red-300">{error}</p>;
   }
-  if (loading && !diff) {
+  if (loading && !diff && !frameBody) {
     return <p className="px-3 py-2 text-sm text-fg-subtle">正在计算 diff…</p>;
   }
-  if (!diff) {
-    return <p className="px-3 py-2 text-sm text-fg-subtle">尚无 diff 数据</p>;
-  }
-  const empty = diff.files.length === 0 && diff.commits.length === 0;
-  if (empty) {
+  // 只有帧、没有结构化正文（没有快照，或快照为空）：头部/汇总行拿不到
+  // commits/files，只画命令条 + 基准 + 正文。
+  const empty = diff !== null && diff.files.length === 0 && diff.commits.length === 0;
+  if (!diff || empty) {
+    if (frameBody) {
+      return (
+        <div className="flex min-h-0 flex-1 flex-col">
+          <FrameHead
+            frame={frameBody}
+            baseLabel={frameBaseLabel(frameBody)}
+            note={note}
+            onRefresh={onRefresh}
+          />
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <FrameBody frame={frameBody} />
+          </div>
+        </div>
+      );
+    }
+    if (!diff) return <p className="px-3 py-2 text-sm text-fg-subtle">尚无 diff 数据</p>;
     return (
       <div className="px-3 py-2 text-sm text-fg-muted">
         <p>没有改动</p>
@@ -220,12 +297,9 @@ export function GitDiffView({
     );
   }
 
-  // 帧存在且有内容时它说了算；否则退回结构化 diff（一字不改的旧路径）。
-  const frameBody = frame && frameHasContent(frame) ? frame : null;
+  // 帧存在且有内容时正文由它说了算；否则退回结构化 diff（一字不改的旧路径）。
   const { additions, deletions } = totals(diff.files);
-  const base = frameBody ? frameBody.base : diff.base;
-  const baseKind = frameBody ? frameBody.baseKind : diff.baseKind;
-  const baseLabel = baseKind === "session" ? "本次会话" : base ?? "工作区";
+  const baseLabel = frameBody ? frameBaseLabel(frameBody) : diff.baseKind === "session" ? "本次会话" : diff.base ?? "工作区";
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">

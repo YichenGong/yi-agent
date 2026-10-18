@@ -2938,6 +2938,126 @@ describe("App 会话详情栏的开合", () => {
     expect(await screen.findByText("看这里")).toBeTruthy();
   });
 
+  it("ui/gitDiff/focus 同时取该会话的视图帧，并渲染模型给的命令输出", async () => {
+    // 结构化快照给得出 commits/files（汇总行要它），但正文由**帧**说了算。
+    state.dataSources["thread/diff/read"] = () => ({
+      base: "origin/main",
+      baseKind: "origin-default",
+      mergeBase: "abc1234",
+      commits: [],
+      files: [{ path: "a.txt", status: "M", additions: 1, deletions: 1, binary: false }],
+      unifiedDiff: "",
+      truncated: false,
+    });
+    state.dataSources["thread/view/read"] = () => ({
+      command: "git log --oneline -2",
+      asKind: "log",
+      exitCode: 0,
+      stdout: "abc1234 fix a\ndef5678 add b\n",
+      stderr: "",
+      truncated: false,
+      timedOut: false,
+      note: null,
+      base: null,
+      baseKind: "",
+    });
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: null } });
+      }
+    });
+
+    await screen.findByLabelText("会话详情");
+    // 帧被真的取了。
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/view/read",
+        params: { threadId: "t1" },
+      }),
+    );
+    // 命令条（命令 + 退出码）与 log 原语（提交列表）都画出来了。
+    expect(await screen.findByText(/git log --oneline -2/)).toBeTruthy();
+    expect(await screen.findByText("fix a")).toBeTruthy();
+    expect(screen.getByText("add b")).toBeTruthy();
+  });
+
+  it("只有帧、没有结构化快照时，帧仍然渲染（不回落到空态）", async () => {
+    // 帧路径与结构化快照是两条独立请求：这一条钉死「快照缺席不得吞掉帧」——
+    // 否则 Task 8 的整条帧渲染路径在真实接线里永远走不到。
+    state.dataSources["thread/diff/read"] = () => {
+      throw { code: -1, message: "no structured diff" };
+    };
+    state.dataSources["thread/view/read"] = () => ({
+      command: "git diff --stat",
+      asKind: "text",
+      exitCode: 0,
+      stdout: " a.txt | 2 +-\n",
+      stderr: "",
+      truncated: false,
+      timedOut: false,
+      note: null,
+      base: null,
+      baseKind: "",
+    });
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: null } });
+      }
+    });
+
+    // 帧的文本原样可见，且不是「尚无 diff 数据」的空态。
+    expect(await screen.findByText(/a\.txt \| 2 \+-/)).toBeTruthy();
+    expect(screen.queryByText(/尚无 diff 数据/)).toBeNull();
+  });
+
+  it("单文件正文缺席时点标注补一次带 path 的 thread/diff/read（D1）", async () => {
+    state.dataSources["thread/view/read"] = () => null; // 无帧：走结构化路径
+    state.dataSources["thread/diff/read"] = (params) => {
+      const p = params as { threadId: string; path?: string };
+      if (p.path) {
+        // 懒加载的 path 分支：给该文件的正文。
+        return {
+          unifiedDiff: "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n",
+          truncated: false,
+        };
+      }
+      // 会话级快照：文件列在 files[] 里，但正文被截断（unifiedDiff 空）。
+      return {
+        base: "origin/main",
+        baseKind: "origin-default",
+        mergeBase: "abc1234",
+        commits: [],
+        files: [{ path: "a.txt", status: "M", additions: 1, deletions: 1, binary: false }],
+        unifiedDiff: "",
+        truncated: true,
+      };
+    };
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: null } });
+      }
+    });
+    await screen.findByLabelText("会话详情");
+
+    // 正文缺席 -> 标注可点；点它触发一次带 path 的懒加载。
+    fireEvent.click(await screen.findByRole("button", { name: /正文已截断/ }));
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/diff/read",
+        params: { threadId: "t1", path: "a.txt" },
+      }),
+    );
+  });
+
   it("点子 agent 卡片在栏内下钻到轨迹，可返回列表", async () => {
     state.dataSources["agent/children/list"] = () => ({
       children: [{ taskId: "task-1", objective: "整理日志", state: "running", lastStep: "读文件" }],
