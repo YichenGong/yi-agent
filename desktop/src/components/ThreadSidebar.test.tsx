@@ -215,6 +215,42 @@ describe("ThreadSidebar", () => {
     expect(wrappers[0].parentElement!.className.split(/\s+/)).toContain("space-y-2");
   });
 
+  it("文件夹名比会话名更大，层级不再倒置", () => {
+    const { container } = renderSidebar();
+    // jsdom 不加载 Tailwind，`getComputedStyle` 拿不到字号，故按类名折算。这里只
+    // 钉住「文件夹名 > 会话名」这一相对关系：此前文件夹头是 `text-xs`(12px)、会话
+    // 行是 `text-sm`(14px)，分组头比它底下的条目还小，层级是反的。
+    const FONT_PX: Record<string, number> = { "text-xs": 12, "text-sm": 14, "text-base": 16 };
+    const px = (el: HTMLElement) => {
+      const cls = el.className.split(/\s+/).find((c) => c in FONT_PX);
+      return cls === undefined ? NaN : FONT_PX[cls];
+    };
+
+    const header = container.querySelector<HTMLElement>("[data-ws-header]")!;
+    const row = container.querySelector<HTMLElement>("[data-group-row]")!;
+    // 两边都得取到字号，否则比较没有意义（NaN > NaN 恒为 false 会误报通过）。
+    expect(Number.isNaN(px(header))).toBe(false);
+    expect(Number.isNaN(px(row))).toBe(false);
+    expect(px(header)).toBeGreaterThan(px(row));
+  });
+
+  it("每个文件夹上方有一条分隔线", () => {
+    const { container } = renderSidebar();
+    const headers = Array.from(container.querySelectorAll<HTMLElement>("[data-ws-header]"));
+    const wrappers = headers.map((h) => h.parentElement!);
+    const list = wrappers[0].parentElement!;
+
+    // 线必须画在**每个分组的上面**（`> * + *` 排除了第一个分组），而不是 `divide-y`
+    // ——后者落在下一个兄弟的下边框上（实测：分组的上边框宽度 0px），线会跑到上一个
+    // 分组的末尾、离文件夹头还隔着一个 8px 的间距，不是"文件夹上方那条线"。
+    // 首个文件夹上方不加线，避免列表顶部多出一条悬空的线。颜色用语义 token。
+    expect(wrappers[1].parentElement).toBe(list);
+    const cls = list.className;
+    expect(cls).toContain("[&>*+*]:border-t");
+    expect(cls).toContain("[&>*+*]:border-line");
+    expect(cls).not.toContain("divide-y");
+  });
+
   it("renders a colour dot for a tagged thread and nothing for an untagged one", () => {
     const tagged: WorkspaceGroup[] = [
       {
