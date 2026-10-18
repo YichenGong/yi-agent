@@ -1856,7 +1856,9 @@ fn spawn_outcome(
 }
 
 /// Resolves the `fork_token` a spawn request should carry: uploading the
-/// caller's transcript when `fork` is set, and `None` otherwise.
+/// caller's transcript whenever fork is enabled, which it is by default. `None`
+/// means the child gets no inherited context, which happens only for an explicit
+/// `fork: false` or a degraded default.
 ///
 /// A [`ForkChoice::Default`] attempt that cannot produce a payload degrades to
 /// `None`; a [`ForkChoice::Yes`] attempt reports the failure, because a caller

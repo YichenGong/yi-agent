@@ -64,7 +64,8 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
   child task id → detach；这是 TUI 与 app-server 共用的那条链路的可执行说明
 - [x] `spawn_agent` 的 `fork` 参数与调用者上下文 fork — `fork` 现在**默认开启**
   （schema `default:true`，描述改为「子 agent 默认继承你的对话历史，`fork:false`
-  是从零开始的逃生口」），省略即 fork；`CallerContext` 持调用者会话的**活
+  是从零开始的逃生口」；`required` 仍只有 `task`，显式非布尔值报错而非忽略），
+  省略即 fork；`CallerContext` 持调用者会话的**活
   `Arc<Mutex<Session>>`**，每次调用经 `snapshot()` 读取「此刻」的 `forkable_messages`
   （协议有效性裁剪，末位悬空 `tool_use` 丢弃），故 Agent 重建/compact 不会让工具读到
   陈旧转录；fork 时 `upload_forked_context`（`src/lib.rs:1784`）把 JSON 历史按
@@ -74,7 +75,9 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
   **降级语义按来源区分**（`ForkChoice`，`src/lib.rs:1672`）：显式 `fork:true`
   遇 fork 不可行仍报错（无绑定 caller → `fork requested but no caller context available`）；
   默认路径（省略 `fork`）遇到任何 fork 失败都 `tracing::warn!` 后回落无 fork，
-  spawn 照常成功并返回 `forked:false`。降级**不分类错误、不镜像 daemon 上限**：
+  spawn 照常成功并返回 `forked:false`。注意 `forked:false` 同时覆盖「显式
+  `fork:false`」与「默认路径降级」两种情形（字段只证明子 agent 无继承上下文，
+  不区分原因，原因只在客户端 `tracing::warn!` 里）。降级**不分类错误、不镜像 daemon 上限**：
   上限是 daemon 策略、可经 `YI_AGENT_FORK_MAX_BYTES` 覆盖，客户端硬编码会漂移；
   且超限在第一个 `BeginForkUpload` 就被拒（分配 token 之前），而 fork 上传发生在
   spawn 请求之前，故降级只需把 `fork_token` 置 `None`，spawn 总共只发一次。
