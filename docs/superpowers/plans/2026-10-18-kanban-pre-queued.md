@@ -1571,6 +1571,7 @@ git commit -m "feat(board): count pre-queued cards in board status"
 - Modify: `desktop/src/components/SuperpowersKanbanBoard.tsx`
 - Modify: `desktop/src/components/SuperpowersKanbanColumn.tsx`
 - Test: `desktop/src/lib/superpowersKanbanBoard.test.ts`、`desktop/src/lib/superpowersKanbanState.test.ts`
+- Test: `desktop/src/components/SuperpowersKanbanBoard.test.tsx`（实现时才暴露的必改文件：新增的 `PRE-QUEUED` 列标题与既有空看板断言里的 `/queued/i` 正则冲突——`PRE-QUEUED · 0` 与 `QUEUED · 0` 同时命中，该测试必须改成精确标题断言，否则 Step 6 的验收命令不可能全绿）
 
 **Interfaces:**
 - Consumes: 插件 `list()` 的 `state: "pre_queued"` 与 `title`。
