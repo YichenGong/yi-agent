@@ -58,12 +58,12 @@ check() { # check <name> <expected_exit> <actual_exit>
   else echo "FAIL - $1 (expected exit $2, got $3)"; failn=$((failn+1)); fi
 }
 
-# --- case 1: 真实 session 在跟踪文件里 → 必须 exit 1
+# --- case 1: 合成 32 位 session 形状在跟踪文件里 → 必须 exit 1
 r1="$work/leaked"; mkdir -p "$r1/docs"
 git -C "$r1" init -q
-printf 'see wss://relay.yi-agent.top/connect?session=fe42addbfed257dcd396e7fcc45e2725\n' > "$r1/docs/a.md"
+printf 'see wss://relay.example.com/connect?session=0123456789abcdef0123456789abcdef\n' > "$r1/docs/a.md"
 git -C "$r1" add docs/a.md
-( cd "$r1" && bash "$SCRIPT" >/dev/null 2>&1 ); check "real session in tracked file fails" 1 $?
+( cd "$r1" && bash "$SCRIPT" >/dev/null 2>&1 ); check "synthetic session-shaped value in tracked file fails" 1 $?
 
 # --- case 2: 只有示例值 → 必须 exit 0
 r2="$work/clean"; mkdir -p "$r2/docs"
@@ -73,19 +73,19 @@ printf 'lsof -nP -p "$(pgrep -f app-server)" | grep 203.0.113.10\n' >> "$r2/docs
 git -C "$r2" add docs/a.md
 ( cd "$r2" && bash "$SCRIPT" >/dev/null 2>&1 ); check "example values pass" 0 $?
 
-# --- case 3: 真实值但文件未被跟踪 → 必须 exit 0（不误伤 .relay-local.md 范式）
+# --- case 3: 敏感字段形状在未跟踪文件里 → 必须 exit 0（不误伤 .relay-local.md 范式）
 r3="$work/untracked"; mkdir -p "$r3/deploy"
 git -C "$r3" init -q
-printf 'session = fe42addbfed257dcd396e7fcc45e2725\nip = 101.47.76.100\n' > "$r3/deploy/local.md"
+printf 'session = 0123456789abcdef0123456789abcdef\nip = 203.0.113.10\n' > "$r3/deploy/local.md"
 printf 'x\n' > "$r3/keep.md"; git -C "$r3" add keep.md
 ( cd "$r3" && bash "$SCRIPT" >/dev/null 2>&1 ); check "untracked file is ignored" 0 $?
 
-# --- case 4: 真实域名在跟踪文件里 → 必须 exit 1
+# --- case 4: 非示例中继域名在跟踪文件里 → 必须 exit 1
 r4="$work/host"; mkdir -p "$r4/docs"
 git -C "$r4" init -q
-printf 'connect to wss://relay.yi-agent.top/ws\n' > "$r4/docs/a.md"
+printf 'connect to wss://relay.production.invalid/ws\n' > "$r4/docs/a.md"
 git -C "$r4" add docs/a.md
-( cd "$r4" && bash "$SCRIPT" >/dev/null 2>&1 ); check "real hostname in tracked file fails" 1 $?
+( cd "$r4" && bash "$SCRIPT" >/dev/null 2>&1 ); check "non-example hostname in tracked file fails" 1 $?
 
 echo
 if [ "$failn" -ne 0 ]; then echo "$failn failed, $pass passed"; exit 1; fi
@@ -140,26 +140,26 @@ report_hits() { # report_hits <label> <git-grep-output>
   done <<< "$hits"
 }
 
-# 1) 已知泄露值的字面量。轮换后若再出现，即为「有人从历史里捞回来」的回归。
+# 1) 类 session 参数中的 32 位十六进制 token 形状。
 set +e
-hits=$(git grep -n -e 'fe42addbfed257dcd396e7fcc45e2725' -- . 2>/dev/null)
+hits=$(git grep -n -E 'session=[0-9a-f]{32}' -- . 2>/dev/null)
 set -e
 if [ -n "$hits" ]; then
-  report_hits "known leaked session id present:" "$hits"
+  report_hits "session-shaped token present:" "$hits"
 fi
 
-# 2) 真实中继域名（示例域名 relay.example.com 不匹配本条）。
+# 2) 中继域名形状（过滤文档示例域名 relay.example.com）。
 set +e
-hits=$(git grep -n -E 'relay\.yi-agent\.top' -- . 2>/dev/null)
+hits=$(git grep -n -E 'relay\.[[:alnum:].-]+' -- . 2>/dev/null | grep -vF 'relay.example.com' || true)
 set -e
 if [ -n "$hits" ]; then
-  report_hits "real relay hostname in tracked file:" "$hits"
+  report_hits "non-example relay hostname in tracked file:" "$hits"
 fi
 
-# 3) 非保留段的公网 IP，且处于 ssh/relay 语境。
+# 3) relay 的 lsof grep 或 ssh root 语境中的 IPv4 地址。
 #    RFC 5737 保留段（192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）不匹配。
 set +e
-hits=$(git grep -n -E '(101\.47\.76\.100)|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . 2>/dev/null)
+hits=$(git grep -n -E '(lsof[^\n]*grep[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3})|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . 2>/dev/null | grep -vE '(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)' || true)
 set -e
 if [ -n "$hits" ]; then
   report_hits "public IP in relay/ssh context:" "$hits"
@@ -168,7 +168,7 @@ fi
 if [ "$fail" -ne 0 ]; then
   echo
   echo "凭据卫生检查失败。示例值请用 relay.example.com 与 RFC 5737 保留段（如 203.0.113.10）；"
-  echo "真实值请写在被忽略的文件里（范式见 deploy/relay/.relay-local.md）。"
+  echo "部署凭据请写在被忽略的文件里（范式见 deploy/relay/.relay-local.md）。"
   exit 1
 fi
 
@@ -214,7 +214,7 @@ git commit -m "ci: 加凭据卫生门禁脚本与自测（当前对已知泄露�
 
 Run:
 ```bash
-grep -n 'fe42addbfed257dcd396e7fcc45e2725\|101\.47\.76\.100\|relay\.yi-agent\.top' docs/bug-list.md docs/relay-deploy.md
+grep -n -E 'session=|lsof.*grep' docs/bug-list.md docs/relay-deploy.md
 ```
 Expected: 命中 `docs/bug-list.md` 的 115、117 行与 `docs/relay-deploy.md` 的 573 行。记下每行里的**字面值出现位置**。
 
@@ -222,12 +222,12 @@ Expected: 命中 `docs/bug-list.md` 的 115、117 行与 `docs/relay-deploy.md` 
 
 Run:
 ```bash
-# 域名 → 示例域名
-perl -pi -e 's/relay\.yi-agent\.top/relay.example.com/g' docs/bug-list.md
-# session → 占位符
-perl -pi -e 's/fe42addbfed257dcd396e7fcc45e2725/<session_id>/g' docs/bug-list.md
-# VPS IP → RFC 5737 保留地址
-perl -pi -e 's/101\.47\.76\.100/203.0.113.10/g' docs/bug-list.md docs/relay-deploy.md
+# 只修改 Step 1 已确认的三处命中：
+# - 真实中继域名 → relay.example.com
+# - URL 中的 session 值 → <session_id>
+# - 真实公网地址 → 203.0.113.10（RFC 5737 保留段）
+# 操作时从原文件读取并就地替换，不要把原值复制进命令行、日志或其他文件。
+$EDITOR docs/bug-list.md docs/relay-deploy.md
 ```
 
 - [ ] **Step 3: 人工复核 diff —— 只许字面值变，结论不许变**
@@ -244,9 +244,9 @@ Expected: `secret-check passed` 与 `exit=0`。
 
 Run:
 ```bash
-git grep -n 'fe42addbfed257dcd396e7fcc45e2725' ; echo "session hits=$?"
-git grep -n '101\.47\.76\.100' ; echo "ip hits=$?"
-git grep -n 'relay\.yi-agent\.top' ; echo "host hits=$?"
+git grep -n -E 'session=[0-9a-f]{32}' ; echo "session hits=$?"
+git grep -n -E 'lsof.*grep[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3}' ; echo "ip hits=$?"
+git grep -n -E 'relay\.[[:alnum:].-]+' | grep -vF 'relay.example.com' ; echo "host hits=$?"
 ```
 Expected: 三条 `git grep` **都无输出**，各自的 `echo` 打印 `=1`（grep 无匹配的退出码）。
 
@@ -312,7 +312,7 @@ Expected: 输出里包含 `bash ../scripts/check-secrets.sh`（证明 `secret-ch
 
 Run:
 ```bash
-printf '\nleak: fe42addbfed257dcd396e7fcc45e2725\n' >> docs/bug-list.md
+printf '\nleak: wss://relay.example.com/connect?session=0123456789abcdef0123456789abcdef\n' >> docs/bug-list.md
 cd yi-agent-rs && just secret-check; echo "exit=$?" ; cd ..
 git checkout -- docs/bug-list.md
 ```
@@ -384,7 +384,7 @@ git commit -m "docs: 说明凭据卫生门禁，示例值统一用保留段"
 
 **Interfaces:**
 - Consumes: 无。
-- Produces: 作废的旧 session（`fe42addbfed257dcd396e7fcc45e2725`）与记录在 PR 里的验证证据。
+- Produces: 作废的旧 session（具体值只存在于本机私密记录）与记录在 PR 里的验证证据。
 
 > **这是人工步骤，不是 agent 能代替的**：它需要在 Mac 上改配置、在手机上改地址、
 > 并在 VPS 上查日志。agent 的职责是**把步骤与验证命令写清楚**，并在用户执行后
@@ -416,7 +416,7 @@ Expected: 出现**新 session** 的 `agent connected` 行。
 
 - [ ] **Step 5: 验证旧 session 已作废**
 
-Run: `ssh <vps> 'journalctl -u yi-agent-relay --since "5 min ago" | grep "fe42addbfed257dcd396e7fcc45e2725"'`
+Run: `ssh <vps> 'journalctl -u yi-agent-relay --since "5 min ago" | grep "agent connected"'`，并在 VPS 上用本机私密记录里的旧值确认无活动；旧值不写入 PR 或仓库。
 Expected: **无输出**（旧 session 不再有任何连接；即使有人拿旧值来连，也不会与你的电脑配对）。
 
 - [ ] **Step 6: 把上面两步的输出粘进 PR 描述，并 Commit 一个空记录（可选）**
