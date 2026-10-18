@@ -10,6 +10,9 @@ use std::sync::Mutex;
 pub struct ToolsContext {
     roots: Vec<PathBuf>,
     cwd: Mutex<PathBuf>,
+    /// 注入给 shell 子进程的环境变量（如当前会话的 thread id）。默认空集，
+    /// 此时子进程行为与今天完全一致。
+    session_env: Vec<(String, String)>,
 }
 
 impl ToolsContext {
@@ -19,11 +22,22 @@ impl ToolsContext {
     }
 
     pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self::with_roots_and_env(roots, Vec::new())
+    }
+
+    /// 同 [`Self::with_roots`]，但额外带上注入 shell 子进程的环境变量。
+    pub fn with_roots_and_env(roots: Vec<PathBuf>, session_env: Vec<(String, String)>) -> Self {
         let cwd = roots.first().cloned().unwrap_or_default();
         Self {
             roots,
             cwd: Mutex::new(cwd),
+            session_env,
         }
+    }
+
+    /// 注入给 shell 子进程的环境变量（默认空）。
+    pub fn session_env(&self) -> &[(String, String)] {
+        &self.session_env
     }
 
     /// The primary root: the base for relative paths and for `cwd`.
@@ -104,5 +118,23 @@ mod tests {
             Some("src/main.rs".to_string())
         );
         assert_eq!(ctx.relative_to_roots(Path::new("/tmp/elsewhere/x")), None);
+    }
+
+    #[test]
+    fn a_context_without_env_exposes_an_empty_session_env() {
+        let ctx = ToolsContext::new(PathBuf::from("/tmp/foo"));
+        assert!(ctx.session_env().is_empty());
+    }
+
+    #[test]
+    fn a_context_carries_its_session_env() {
+        let ctx = ToolsContext::with_roots_and_env(
+            vec![PathBuf::from("/tmp/foo")],
+            vec![("YI_AGENT_THREAD_ID".to_string(), "thread-abc".to_string())],
+        );
+        assert_eq!(
+            ctx.session_env(),
+            &[("YI_AGENT_THREAD_ID".to_string(), "thread-abc".to_string())]
+        );
     }
 }

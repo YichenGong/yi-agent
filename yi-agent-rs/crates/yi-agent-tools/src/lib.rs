@@ -93,9 +93,27 @@ pub fn register_builtin_tools_with_controller(
     controller: SandboxController,
     sandbox_writable_roots: Vec<PathBuf>,
 ) {
+    register_builtin_tools_with_controller_and_env(
+        registry,
+        roots,
+        controller,
+        sandbox_writable_roots,
+        Vec::new(),
+    );
+}
+
+/// 同 [`register_builtin_tools_with_controller`]，但把 `session_env` 交给
+/// `ToolsContext`，由 `BashTool` 注入 shell 子进程（如当前会话的 thread id）。
+pub fn register_builtin_tools_with_controller_and_env(
+    registry: &mut ToolRegistry,
+    roots: Vec<PathBuf>,
+    controller: SandboxController,
+    sandbox_writable_roots: Vec<PathBuf>,
+    session_env: Vec<(String, String)>,
+) {
     // FS 根集 = 整集（关联根也进工具层）；shell 沙箱的主根仍取 `ctx.root()`（主根），
     // 额外可写根只认调用方给的沙箱汇总项。
-    let ctx = Arc::new(ToolsContext::with_roots(roots));
+    let ctx = Arc::new(ToolsContext::with_roots_and_env(roots, session_env));
     let sandbox = SandboxPolicy::with_controller(ctx.root(), sandbox_writable_roots, controller);
     // A read-only session has no write/edit tool surface, in addition to the
     // process-level file-write denial enforced for shell commands.
@@ -139,5 +157,32 @@ mod tests {
         );
         let names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
         assert!(names.contains(&"write".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_env_carrying_registration_reaches_the_bash_tool() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
+        let controller = SandboxController::new(switch, SandboxMode::WorkspaceWrite, false);
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        register_builtin_tools_with_controller_and_env(
+            &mut registry,
+            vec![tmp.path().to_path_buf()],
+            controller,
+            Vec::new(),
+            vec![("YI_AGENT_THREAD_ID".to_string(), "thread-abc".to_string())],
+        );
+        // 真实调用一次，证明 env 确实随注册入口一路到达 shell 子进程——
+        // 只断言「bash 被注册」证明不了本函数承诺的那件事。
+        let bash = registry.get("bash").expect("bash is registered");
+        let result = bash
+            .call(serde_json::json!({ "command": "echo $YI_AGENT_THREAD_ID" }))
+            .await;
+        assert!(!result.is_error, "bash failed: {:?}", result.content);
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            assert!(s.contains("thread-abc"), "env must reach the child: {s}");
+        } else {
+            panic!("expected text block");
+        }
     }
 }

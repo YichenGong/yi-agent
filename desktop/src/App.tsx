@@ -2114,7 +2114,12 @@ export default function App() {
                   enqueueBoardCard(board.boardRpc, board.selectedBoard!, spec, plan)
                 }
                 prequeue={(title) =>
-                  enqueuePrequeuedCard(board.boardRpc, board.selectedBoard!, title)
+                  enqueuePrequeuedCard(
+                    board.boardRpc,
+                    board.selectedBoard!,
+                    title,
+                    sess.currentId,
+                  )
                 }
               />
               <SuperpowersKanbanView

@@ -63,6 +63,12 @@ superpowers-kanban promote <card-id> <spec> <plan> [--title <新标题>]
 插件下一次 tick 消费掉预排队卡之后再执行（此时卡已在 `board.json` 上）；同一 tick 内
 紧跟着提升会报 `unknown card`。
 
+预排队卡会记下**提出它的讨论会话**：在会话里经 bash 调 `superpowers-kanban
+add-prequeued "<标题>"` 时，宿主已把当前会话 id 注入环境变量 `YI_AGENT_THREAD_ID`，
+插件读它并随卡保存；桌面端看板面板则直接带上当前会话。桌面卡片上的会话链接在卡片
+被提升/开跑前指向那次讨论，跑起来后自动切到执行会话。拿不到会话（会话外手动调用、
+TUI 本地会话）时该字段为空，**不阻断**投递。
+
 ```
 superpowers-kanban add-merge kanban/2026-10-03-a-feature
 superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop

@@ -8,7 +8,7 @@ import {
 } from "./superpowersKanbanBoard";
 
 function card(id: string, state: string, extra: Partial<BoardCard> = {}): BoardCard {
-  return { id, state, progress: null, detail: "", threadId: null, ...extra };
+  return { id, state, progress: null, detail: "", threadId: null, originThreadId: null, ...extra };
 }
 
 describe("columnForState", () => {

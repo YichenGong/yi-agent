@@ -204,4 +204,18 @@ describe("normalizeCard", () => {
     expect(normalizeCard(null)).toBeNull();
     expect(normalizeCard("nope")).toBeNull();
   });
+
+  it("reads origin_thread_id as originThreadId", () => {
+    const card = normalizeCard({
+      id: "idea",
+      state: "pre_queued",
+      origin_thread_id: "thread-abc",
+    });
+    expect(card?.originThreadId).toBe("thread-abc");
+  });
+
+  it("defaults a missing origin_thread_id to null", () => {
+    const card = normalizeCard({ id: "idea", state: "pre_queued" });
+    expect(card?.originThreadId).toBeNull();
+  });
 });

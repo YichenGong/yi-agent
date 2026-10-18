@@ -996,6 +996,7 @@ fn build_runtime_tooling(
         false,
         &roots,
         controller.clone(),
+        vec![("YI_AGENT_THREAD_ID".to_string(), thread_id.to_string())],
     )
     .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
