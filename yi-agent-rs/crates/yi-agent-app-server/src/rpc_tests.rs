@@ -15566,3 +15566,52 @@ async fn list_all_exposes_the_lead_role_only_for_the_lead() {
 
     h.shutdown().await;
 }
+
+/// 启动期迁移的接线契约：服务端入口调用的函数确实把存量 `.env` 模型键搬进清单。
+///
+/// 入口点（`run` / `serve_stdio_with_relay`）自身的调用由生产 `HOME` 注入的路径
+/// 决定，测试不便直接驱动；这里锁定「入口调用的那个函数」的行为，与计划 Task 6
+/// Step 1 的意图一致。
+#[test]
+fn startup_migrates_legacy_model_keys_into_the_catalog() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let env_path = dir.path().join(".env");
+    std::fs::write(
+        &env_path,
+        "YI_AGENT_PROVIDER=openai\nMODEL_API_KEY=sk-old\n",
+    )
+    .unwrap();
+    let models_path = dir.path().join("models.json");
+
+    yi_agent_runtime::migrate::migrate_model_keys(&env_path, &models_path);
+
+    let catalog = yi_agent_runtime::models::load_catalog_from(&models_path);
+    assert_eq!(catalog.models.len(), 1);
+    assert!(
+        !std::fs::read_to_string(&env_path)
+            .unwrap()
+            .contains("\nMODEL_API_KEY=sk-old")
+    );
+}
+
+/// `log_outcome` 必须对五种结果都不 panic（日志措辞由 tracing 承接）。
+#[test]
+fn log_outcome_handles_every_variant() {
+    use yi_agent_runtime::migrate::{MigrationOutcome, log_outcome};
+    let env = std::path::Path::new("/tmp/yi-agent-migrate-probe/.env");
+    log_outcome(&MigrationOutcome::NothingToDo, env);
+    log_outcome(&MigrationOutcome::Migrated { entry: "m".into() }, env);
+    log_outcome(&MigrationOutcome::AlreadyCategorized, env);
+    log_outcome(
+        &MigrationOutcome::EnvNotWritable {
+            reason: "ro".into(),
+        },
+        env,
+    );
+    log_outcome(
+        &MigrationOutcome::CatalogNotWritable {
+            reason: "ro".into(),
+        },
+        env,
+    );
+}

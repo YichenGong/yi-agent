@@ -55,6 +55,15 @@ fn main() -> Result<()> {
                 } else {
                     config::resolve_global_env_path()
                 };
+                // 与 `run_agent` 同一迁移：web 也是用户面向入口。显式 workdir 时
+                // `global_env_path` 为 `None`（该项目不读全局配置），此时不迁移。
+                if let Some(ref global_env_path) = global_env_path {
+                    let migration = yi_agent_runtime::migrate::migrate_model_keys(
+                        global_env_path,
+                        &yi_agent_runtime::models::models_path(),
+                    );
+                    yi_agent_runtime::migrate::log_outcome(&migration, global_env_path);
+                }
                 yi_agent_web::serve(host, *port, env_path, global_env_path).await
             })
         }
@@ -1177,6 +1186,13 @@ fn run_agent(cli: Cli) -> Result<()> {
     let env_path =
         config::resolve_global_env_path().unwrap_or_else(|| config::resolve_env_path(&cli));
     let prefs_path = env_path.with_file_name("preferences.json");
+    // 一次性迁移必须在引导与 `config::load` 之前：`.env` 里的存量模型键要在被
+    // 「忽略」之前先收边进清单。清单优先落盘、`.env` 后注释，任一步失败都只降级。
+    let migration = yi_agent_runtime::migrate::migrate_model_keys(
+        &env_path,
+        &yi_agent_runtime::models::models_path(),
+    );
+    yi_agent_runtime::migrate::log_outcome(&migration, &env_path);
     if onboarding_prompt::should_offer(&env_path, &prefs_path) {
         if let Err(error) = onboarding_prompt::run_onboarding_prompt(&env_path, &prefs_path) {
             eprintln!("引导未完成：{error}");

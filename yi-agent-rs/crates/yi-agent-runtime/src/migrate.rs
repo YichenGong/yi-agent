@@ -204,6 +204,37 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
     outcome
 }
 
+/// 把迁移结果记成日志。三个触发点共用，保证每种结果都有可见、可区分的措辞。
+///
+/// `NothingToDo` 是常态（没有存量模型键），静默；其余四种都值得一条 warning：
+/// 迁移成功要告知用户 `.env` 里的键已被注释，而三种降级（清单已接管 / `.env`
+/// 不可写 / 清单不可写）分别对应「键已成死配置」「键被忽略」「键未动、可重试」，
+/// 措辞必须能把它们分开。
+pub fn log_outcome(outcome: &MigrationOutcome, env_path: &Path) {
+    match outcome {
+        MigrationOutcome::NothingToDo => {}
+        MigrationOutcome::Migrated { entry } => tracing::warn!(
+            entry = %entry,
+            path = %env_path.display(),
+            "migrated model settings from .env into models.json; the .env lines were commented out"
+        ),
+        MigrationOutcome::AlreadyCategorized => tracing::warn!(
+            path = %env_path.display(),
+            "the model keys in .env are no longer read; remove them or use the settings UI"
+        ),
+        MigrationOutcome::EnvNotWritable { reason } => tracing::warn!(
+            path = %env_path.display(),
+            %reason,
+            "could not comment out the legacy model keys in .env; they are ignored regardless"
+        ),
+        MigrationOutcome::CatalogNotWritable { reason } => tracing::warn!(
+            path = %env_path.display(),
+            %reason,
+            "could not migrate the legacy model keys; .env was left untouched"
+        ),
+    }
+}
+
 /// 原子写：临时文件 + rename，权限 0600（.env 含密钥）。
 fn atomic_write(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
