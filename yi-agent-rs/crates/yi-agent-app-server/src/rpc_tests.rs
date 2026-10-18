@@ -15881,3 +15881,110 @@ fn a_card_session_does_not_get_ask_lead() {
         "a plain session keeps ask_lead, got {names:?}"
     );
 }
+
+/// 组长**不该**拿到 `ask_lead`:它自己就是那个收件人,投递等于自问自答。
+///
+/// 根因:装配期只排除了卡片 worktree(见上一条测试),而组长的项目键就是它自己
+/// 的 cwd/项目根,于是它也被注册了 `ask_lead`。组长调它时,主循环的
+/// `resolve_lead_target(project_key)` 反查出来的正是**它自己**(`find_lead` 返回
+/// 该组长),消息便投回本 thread —— 一个自环:单向模式下每一轮都往自己信箱里塞
+/// 一条 `[来自会话 <自己>]`,阻塞模式下则登记一个只有自己才能回填的 request_id,
+/// 一路上无人应答、只能等满 120s 超时。正常实现里组长要影响自己直接写就行,不
+/// 需要、也不该有这个工具。
+///
+/// 判定复用**唯一权威** `lead_memory::is_lead_thread`(读落盘的 `ThreadMeta.role`),
+/// 与同函数内 lead_memory 的注册同源;不靠标题/cwd/名字猜。
+#[test]
+fn the_lead_does_not_get_ask_lead() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+    let project_root = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    // 正臂的组长走生产的落盘路径(`ensure_lead_meta`),不手搓一个「像组长」的形状。
+    let store = crate::thread_store::ThreadStore::new(&project_root);
+    let (lead, _created) = crate::lead::ensure_lead_meta(&store, &project_root).expect("lead meta");
+    assert_eq!(
+        lead.role.as_deref(),
+        Some(crate::thread_store::LEAD_ROLE),
+        "the production lead path must persist the role"
+    );
+
+    let build = |thread_id: &str| {
+        build_runtime_tooling(
+            &cfg,
+            &root,
+            thread_id,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
+            project_root.join(".yi-agent").display().to_string(),
+            crate::lead::LeadInbox::new(),
+            crate::lead::LeadReplies::new(),
+        )
+        .expect("tooling")
+    };
+
+    let lead_names = build(&lead.thread_id).registry.names();
+    assert!(
+        !lead_names.contains(&"ask_lead".to_string()),
+        "the lead is its own recipient and must not ask itself, got {lead_names:?}"
+    );
+    // 非空 witness:「看不到」必须是真的缺席,而不是整个 registry 空掉——组长
+    // 照旧拿得到自己该有的东西(委派工具与账本)。
+    assert!(
+        lead_names.contains(&"spawn_agent".to_string()),
+        "the lead still gets the shared tools, got {lead_names:?}"
+    );
+    assert!(
+        lead_names.contains(&"lead_remember".to_string()),
+        "the lead still gets its ledger, got {lead_names:?}"
+    );
+
+    // 负臂:落过盘的普通会话照旧有 `ask_lead`——排除的是组长,不是功能。
+    let plain = crate::thread_store::ThreadMeta {
+        thread_id: "thread-plain".to_string(),
+        cwd: project_root.display().to_string(),
+        model: String::new(),
+        created_at: 1,
+        updated_at: 1,
+        title: Some("普通会话".to_string()),
+        permission_mode: crate::thread_store::ThreadMode::Normal,
+        pin_seq: None,
+        driver_project: None,
+        driver_ref: None,
+        model_ref: None,
+        reasoning_effort: None,
+        tag: None,
+        preserve_thinking: true,
+        extra_roots: Vec::new(),
+        role: None,
+        content_epoch: 0,
+        last_item_id: None,
+    };
+    store.create(&plain).expect("a plain meta must persist");
+    let plain_names = build("thread-plain").registry.names();
+    assert!(
+        plain_names.contains(&"ask_lead".to_string()),
+        "a plain session keeps ask_lead, got {plain_names:?}"
+    );
+}

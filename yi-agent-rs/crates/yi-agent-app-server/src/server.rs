@@ -1004,14 +1004,21 @@ fn build_runtime_tooling(
     // `register_attached_root_tools_in_thread` 的 thread marker 同理由:
     // 模型看不到自己的 thread id,只能由装配期注入。
     //
-    // 卡片会话(项目键落在 `.worktrees/kanban/` 下)**不注册**:它所在的那个
-    // worktree 不是项目、没有组长,`ask_lead` 只会把消息投进一个空邮箱,并在主
-    // 循环里经 `resolve_lead_target` 给 worktree 造一个假组长(真机已有 9 例)。
-    // 与 `find_lead`/`is_lead_meta` 同一判定来源(`project_key` 就是
-    // `<cwd>/.yi-agent` 的 canonical 串,去掉末段即 cwd)。
+    // 两类会话**不注册**:
+    // - 卡片会话(项目键落在 `.worktrees/kanban/` 下):它所在的那个 worktree 不是
+    //   项目、没有组长,`ask_lead` 只会把消息投进一个空邮箱,并在主循环里经
+    //   `resolve_lead_target` 给 worktree 造一个假组长(真机已有 9 例)。与
+    //   `find_lead`/`is_lead_meta` 同一判定来源(`project_key` 就是
+    //   `<cwd>/.yi-agent` 的 canonical 串,去掉末段即 cwd)。
+    // - 组长自己:它就是那个收件人(`resolve_lead_target(project_key)` 反查回来的
+    //   正是它),注册了等于自问自答——单向时每轮往自己信箱塞一条「来自会话<自己>」,
+    //   阻塞时登记一个只有自己能回填的 request_id,无人应答、白等满 120s 超时。
+    //   判定复用下面的 `is_lead_thread`(落盘 `ThreadMeta.role`,唯一权威),与
+    //   lead_memory 的注册同源;组长要影响自己直接写即可,不需要这个工具。
+    let is_lead = crate::lead_memory::is_lead_thread(&store, thread_id);
     let state_dir = Path::new(&project_key);
     let session_cwd = state_dir.parent().unwrap_or(state_dir);
-    if !crate::thread_store::is_card_worktree(session_cwd) {
+    if !is_lead && !crate::thread_store::is_card_worktree(session_cwd) {
         registry.register(Arc::new(
             crate::lead::AskLeadTool::new(lead_inbox, project_key, thread_id.to_string())
                 // 回信能力**必须**在这里接上:漏掉它没有编译错误,`blocking: true`
@@ -1022,7 +1029,7 @@ fn build_runtime_tooling(
     }
     // lead_memory 只给组长:普通会话与子 worker 一律看不到(spec §7.5)。判定用
     // 落盘的 `ThreadMeta.role`(唯一权威),不靠标题/名字/cwd 猜——判定函数见
-    // `lead_memory::is_lead_thread`。
+    // `lead_memory::is_lead_thread`(结论已在上面的 `is_lead` 里取过一次,此处复用)。
     //
     // `project_root` 取 `cfg.workdir`(= thread cwd),理由与上面的 store 同根:
     // ① meta 落在 `<cwd>/.yi-agent/threads`,故账本也必须落在 `<cwd>/.yi-agent`
@@ -1033,7 +1040,7 @@ fn build_runtime_tooling(
     // ③ 若留成 git toplevel,`<repo>` 与 `<repo>/sub` 两个不同 project_key(两个
     //    不同组长)会共用同一份 `<repo>/.yi-agent/lead_memory/memory.md`,跨项目
     //    账本串味。
-    if crate::lead_memory::is_lead_thread(&store, thread_id) {
+    if is_lead {
         let project_root = cfg.workdir.clone();
         registry.register(Arc::new(crate::lead_memory::LeadRememberTool::new(
             project_root.clone(),
