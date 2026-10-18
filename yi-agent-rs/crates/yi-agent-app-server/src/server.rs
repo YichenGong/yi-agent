@@ -1212,12 +1212,14 @@ impl std::fmt::Display for BoardQueryError {
 /// the manifest lives at `<project>/.yi-agent/supervisors/`, the socket at
 /// `<project>/.yi-agent/runtime/`, and the daemon is the project's own. Using the
 /// app's cwd instead made every query for another project hit the wrong socket
-/// (or none) — the "clicked and nothing happened" bug. `global` is the board
-/// registry that says whether `project` has a board at all; a project without
-/// one has no daemon worth dialing.
+/// (or none) — the "clicked and nothing happened" bug.
+///
+/// Deliberately **not** gated on any registry: whether an answer exists is the
+/// socket's business, not the host's. Gating it on "does this project have a
+/// board" made the generic channel refuse projects the plugin could have served,
+/// and left the host knowing what a board is.
 pub(crate) fn plugin_query(
     project: &Path,
-    global: &Path,
     method: &str,
     plugin: &str,
     params: serde_json::Value,
@@ -1228,19 +1230,8 @@ pub(crate) fn plugin_query(
             "plugin/query needs a `plugin` name",
         ));
     }
-    match yi_agent_boards::registry::contains(global, project) {
-        Ok(true) => {}
-        // An unreadable registry reads as "no board": `contains` already
-        // degrades a corrupt file to empty, so this arm is the same absence.
-        Ok(false) | Err(_) => {
-            return Err(BoardQueryError::new(
-                "board_not_created",
-                "this project has no board",
-            ));
-        }
-    }
     // The daemon that runs the plugin lives at the project root, which is also
-    // what `yi_agent_boards::lifecycle` and `board_daemon` dial.
+    // what `board_daemon` dials.
     // 复用共享 helper 而不是手写 `.yi-agent/runtime`：它先认 `YI_AGENT_RUNTIME_DIR`，
     // 与工作区其它地方对「runtime socket 在哪」保持同一个定义。
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(project);
@@ -2582,6 +2573,7 @@ where
                             onboarding_env_path: &onboarding_env_path,
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
+                            resident_dir: &resident_dir,
                             watchman_install: &watchman_install,
                             watchman_uninstall: &watchman_uninstall,
                             uploads: &mut uploads,
@@ -2636,6 +2628,13 @@ where
                             // `continue`)。
                             crate::rpc::Flow::Continue => continue,
                             // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    crate::rpc::Domain::Resident => {
+                        let mut state = app_state!();
+                        match crate::rpc::resident::handle(&mut state, &req, id.clone()).await? {
+                            crate::rpc::Flow::Continue => continue,
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
@@ -6526,6 +6525,108 @@ mod board_rpc_tests {
     }
 }
 
+/// `resident/*`（通用常驻登记）与通用转发的 stdio 用例。
+///
+/// 与 `board/*` 无关：数据源是通用常驻登记（harness 已把它指向隔离 tempdir），
+/// 故这些用例**不随看板域退役**——它们钉的正是「宿主只提供通用面」这件事。
+#[cfg(test)]
+mod resident_rpc_tests {
+    use super::*;
+
+    async fn rpc(
+        h: &mut tests::Harness,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        h.send(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            })
+            .to_string(),
+        )
+        .await;
+        loop {
+            let value = h.read_value().await;
+            if value.get("id") == Some(&json!(id)) {
+                return value;
+            }
+        }
+    }
+
+    /// `resident/list` 走完整 dispatch（域路由 + handler + 线格式），插进
+    /// **已有**的登记目录，故 harness 的隔离 tempdir 就是数据源。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resident_list_answers_over_the_wire_from_the_injected_registry() {
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        yi_agent_store::resident::require(
+            h.resident_dir.path(),
+            Path::new("/registered/project"),
+            "some-plugin",
+        )
+        .unwrap();
+
+        let response = rpc(&mut h, 2, "resident/list", json!({})).await;
+
+        assert_eq!(
+            response["result"]["projects"][0]["project"], "/registered/project",
+            "{response}"
+        );
+        assert_eq!(
+            response["result"]["projects"][0]["required_by"][0], "some-plugin",
+            "{response}"
+        );
+        h.shutdown().await;
+    }
+
+    /// 没有登记表时报空表（不是错误）：侧栏据此不画条目，与「登记表还没有」
+    /// 是同一件事。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resident_list_is_empty_and_not_an_error_before_anything_registers() {
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+
+        let response = rpc(&mut h, 2, "resident/list", json!({})).await;
+
+        assert_eq!(response["result"], json!({ "projects": [] }), "{response}");
+        assert!(response.get("error").is_none(), "{response}");
+        h.shutdown().await;
+    }
+
+    /// 未登记的项目照样能被转发：通用通道不看登记表（门控已摘）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plugin_query_answers_for_a_project_that_never_registered() {
+        let mut h = tests::Harness::new();
+        tests::initialize(&mut h).await;
+        let project = h.board_dir.path().join("never-registered");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let response = rpc(
+            &mut h,
+            2,
+            "plugin/query",
+            json!({
+                "project": project.to_string_lossy(),
+                "plugin": "superpowers-kanban",
+                "method": "list",
+                "params": {},
+            }),
+        )
+        .await;
+
+        // 没有 daemon 在答，于是失败——但失败的理由是「拨不到」，不是「没有看板」。
+        assert_eq!(
+            response["error"]["data"]["code"], "daemon_unavailable",
+            "{response}"
+        );
+        h.shutdown().await;
+    }
+}
+
 #[cfg(test)]
 mod plugin_query_tests {
     use super::*;
@@ -6576,21 +6677,59 @@ mod plugin_query_tests {
         (socket, seen, handle)
     }
 
-    /// A project directory plus the registry it is (or is not) registered in.
-    fn project_and_registry(dir: &Path, register: bool) -> (PathBuf, PathBuf) {
+    /// 一个存在的项目目录。
+    ///
+    /// 曾经这里还会按需写一份 `boards.json`（`project_and_registry`），用来
+    /// 表达「这个项目登记没登记」——门控在场时那决定了 `plugin_query` 答不答。
+    /// 门控摘掉后登记表不再参与通用转发，故这个 helper 只剩「建一个目录」，
+    /// 名字也随之改回它真正做的事。
+    fn project_dir(dir: &Path) -> PathBuf {
         let project = dir.join("proj");
         std::fs::create_dir_all(&project).unwrap();
-        let global = dir.join("global");
-        if register {
-            yi_agent_boards::registry::register(&global, &project).unwrap();
-        }
-        (project, global)
+        project
+    }
+
+    /// 通用转发不再按「这个项目有没有看板」拒答。
+    ///
+    /// 反向断言的是**具体错误码**，不是「有没有报错」：摘掉门控后，一个
+    /// 未登记的项目会走到「拨 socket」，于是失败码是 `daemon_unavailable`
+    /// （socket 不在），**不再**是 `board_not_created`。
+    #[test]
+    fn a_query_is_not_gated_on_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        // 不放 boards.json，也不要 nonce：这个项目从未登记过。
+        let error = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap_err();
+        assert_eq!(error.code, "daemon_unavailable", "{error}");
+        assert_ne!(error.code, "board_not_created", "{error}");
+    }
+
+    /// 而且它**真的**拨到了那个项目的 socket：门控给的是「登记表说了算」，
+    /// 摘掉之后「谁来答」只由 socket 是否应答决定。
+    #[test]
+    fn an_unregistered_project_still_reaches_its_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        // 没有 boards.json：登记表只会在**旧**实现里参与判断。
+        let (_socket, seen, handle) = fake_daemon(
+            &project,
+            json!({ "type": "PluginResult", "value": { "cards": [] } }),
+        );
+
+        let value = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap();
+
+        assert_eq!(value["cards"], json!([]));
+        let request = seen.lock().unwrap().clone();
+        assert_eq!(request["command"]["method"], "list", "{request}");
+        handle.join().unwrap();
     }
 
     #[test]
     fn a_query_reaches_the_daemon_with_the_plugin_and_method_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let (project, global) = project_and_registry(dir.path(), true);
+        let project = project_dir(dir.path());
         let (_socket, seen, handle) = fake_daemon(
             &project,
             json!({ "type": "PluginResult", "value": { "cards": [] } }),
@@ -6598,7 +6737,6 @@ mod plugin_query_tests {
 
         plugin_query(
             &project,
-            &global,
             "list",
             "superpowers-kanban",
             json!({ "verbose": true }),
@@ -6616,8 +6754,8 @@ mod plugin_query_tests {
     #[test]
     fn a_missing_plugin_name_is_refused_before_touching_the_daemon() {
         let dir = tempfile::tempdir().unwrap();
-        let (project, global) = project_and_registry(dir.path(), true);
-        let error = plugin_query(&project, &global, "list", "", json!({})).unwrap_err();
+        let project = project_dir(dir.path());
+        let error = plugin_query(&project, "list", "", json!({})).unwrap_err();
         assert!(error.message.contains("plugin"), "{error}");
         assert_eq!(
             error.code, "invalid_params",
@@ -6628,43 +6766,16 @@ mod plugin_query_tests {
     #[test]
     fn an_unreachable_daemon_reports_that_the_plugin_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let (project, global) = project_and_registry(dir.path(), true);
-        let error =
-            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
+        let project = project_dir(dir.path());
+        let error = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap_err();
         assert!(error.message.contains("daemon is unavailable"), "{error}");
         assert_eq!(error.code, "daemon_unavailable", "{error}");
     }
 
     #[test]
-    fn a_query_without_a_registered_board_is_refused_with_its_own_code() {
-        let dir = tempfile::tempdir().unwrap();
-        let (project, global) = project_and_registry(dir.path(), false);
-
-        let error =
-            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
-        assert_eq!(error.code, "board_not_created", "{error}");
-    }
-
-    #[test]
-    fn a_registered_board_without_a_daemon_reports_daemon_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-        let (project, global) = project_and_registry(dir.path(), true);
-
-        let error =
-            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
-        assert_eq!(
-            error.code, "daemon_unavailable",
-            "不能让 UI 误以为是「插件没装」:{error}"
-        );
-    }
-
-    /// The daemon owns the plugin table, so a plugin it does not supervise is
-    /// its answer to give. The wording has to stay matchable by the desktop's
-    /// `pluginIsUnavailable`, which looks for `is not available`.
-    #[test]
     fn a_daemon_that_does_not_supervise_the_plugin_reports_plugin_unavailable() {
         let dir = tempfile::tempdir().unwrap();
-        let (project, global) = project_and_registry(dir.path(), true);
+        let project = project_dir(dir.path());
         let (_socket, _seen, handle) = fake_daemon(
             &project,
             json!({
@@ -6674,8 +6785,7 @@ mod plugin_query_tests {
             }),
         );
 
-        let error =
-            plugin_query(&project, &global, "list", "superpowers-kanban", json!({})).unwrap_err();
+        let error = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap_err();
         handle.join().unwrap();
 
         assert_eq!(error.code, "plugin_unavailable", "{error}");
@@ -6728,8 +6838,12 @@ mod plugin_query_tests {
     /// The dispatch mapping the UI actually reads. The numeric code is the
     /// coarse fallback; `data.code` is the stable string, so both have to reach
     /// the wire together.
+    ///
+    /// 摘掉登记表门控后，未登记的项目会走到「拨 socket」而不是被拒，故这条
+    /// 断言的是 `daemon_unavailable` + `-32021`：`board_not_created`（-32020）
+    /// 已不存在——宿主不再有「这个项目没有看板」这个回答。
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_rpc_maps_a_missing_board_to_its_own_code_in_data() {
+    async fn the_rpc_reports_a_missing_daemon_in_data_for_an_unregistered_project() {
         let mut h = tests::Harness::new();
         tests::initialize(&mut h).await;
         let project = h.board_dir.path().join("unregistered");
@@ -6758,10 +6872,10 @@ mod plugin_query_tests {
             }
         };
         assert_eq!(
-            value["error"]["data"]["code"], "board_not_created",
+            value["error"]["data"]["code"], "daemon_unavailable",
             "{value}"
         );
-        assert_eq!(value["error"]["code"], -32020, "{value}");
+        assert_eq!(value["error"]["code"], -32021, "{value}");
         h.shutdown().await;
     }
 }

@@ -21,6 +21,7 @@ pub(crate) mod onboarding;
 pub(crate) mod pair;
 pub(crate) mod plugin;
 pub(crate) mod process;
+pub(crate) mod resident;
 pub(crate) mod skill;
 pub(crate) mod thread;
 pub(crate) mod turn;
@@ -159,6 +160,8 @@ pub(crate) enum Domain {
     Model,
     /// `onboarding/*`。
     Onboarding,
+    /// `resident/*`(通用常驻登记:哪些项目要常驻 daemon)。
+    Resident,
     /// `board/*`。
     Board,
     /// `plugin/*` 与 `plugins/*`。
@@ -194,6 +197,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("ui") | Some("config") => Domain::Ui,
         Some("model") => Domain::Model,
         Some("onboarding") => Domain::Onboarding,
+        Some("resident") => Domain::Resident,
         Some("board") => Domain::Board,
         Some("plugin") | Some("plugins") => Domain::Plugin,
         Some("image") => Domain::Image,
@@ -257,6 +261,9 @@ pub(crate) struct AppState<'a> {
     pub(crate) onboarding_preferences_path: &'a Path,
     /// 值守安装/卸载所针对的 home。搬移前臂里的 `watchman_home`。
     pub(crate) watchman_home: &'a Path,
+    /// 通用常驻登记目录（`$HOME/.yi-agent`）。`resident/list` 的唯一输入，
+    /// 与值守读登记表用的是同一份，故同属「路径与宿主偏好」这一层，按 `&` 借用。
+    pub(crate) resident_dir: &'a Path,
 
     // ---- 注入句柄(测试可替身) ----
     /// 安装常驻值守。搬移前臂里的 `watchman_install`。

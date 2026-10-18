@@ -2476,6 +2476,8 @@ async fn unknown_method_returns_method_not_found() {
         ("onboarding/dismiss", Domain::Onboarding),
         ("onboarding/status", Domain::Onboarding),
         ("onboarding/test", Domain::Onboarding),
+        // ---- Resident(通用常驻登记) ----
+        ("resident/list", Domain::Resident),
         // ---- Board ----
         ("board/create", Domain::Board),
         ("board/list", Domain::Board),
