@@ -4996,6 +4996,7 @@ dependencies = [
  "wiremock",
  "yi-agent-boards",
  "yi-agent-core",
+ "yi-agent-mcp",
  "yi-agent-relay",
  "yi-agent-runtime",
  "yi-agent-skills",

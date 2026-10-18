@@ -393,6 +393,20 @@ export default function App() {
   );
 
   /**
+   * 「MCP」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖即稳定；
+   * 若每次渲染换新身份，MCP 面板的读取 effect 会跟着重跑，把已展开的工具清单与
+   * 折叠状态一起冲掉。
+   */
+  const mcpCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
    * 图片读取的宿主接缝（`image/read`）。理由同 `pluginCall`：只闭合 `clientRef`，
    * 空依赖即稳定。`ChatView` 把它透传给每个气泡/工具卡的 `useImageData`，而那个
    * effect 依赖 `call`——一旦每次渲染换新函数身份，每张图都会重新分片拉取。
@@ -2471,6 +2485,12 @@ export default function App() {
         skillsCall={skillsCall}
         skillsProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         skillsDefaultProject={current?.info?.cwd}
+        // MCP 的配置也是项目级文件（<项目>/.yi-agent/mcp.json），候选与默认值直接
+        // 复用插件/技能那份——三者指的都是「项目目录下的 .yi-agent」，来源分叉会让
+        // 用户在三个面板里看到不同的项目列表。
+        mcpCall={mcpCall}
+        mcpProjects={pluginProjectPaths(sess.workspaces, board.boards)}
+        mcpDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。

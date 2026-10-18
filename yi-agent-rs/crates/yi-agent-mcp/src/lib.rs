@@ -17,9 +17,65 @@ use anyhow::{Result, anyhow};
 use yi_agent_core::ToolRegistry;
 
 pub use cache::CachedTool;
-pub use config::{McpConfig, ServerConfig, ServerKind, Transport};
+pub use config::{McpConfig, ServerConfig, ServerKind, Transport, config_path};
 pub use manager::McpManager;
 pub use tool::McpTool;
+
+/// 缓存里一个远端工具的**只读视图**，供设置页展示。
+///
+/// 刻意不带 `input_schema`：那份 schema 可能有上千字，面板只展示名字与一行描述，
+/// 把它下发既无用又撑大响应。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCacheEntry {
+    pub name: String,
+    pub description: Option<String>,
+    pub read_only: bool,
+}
+
+/// 读 `workdir` 下 `.yi-agent/mcp-cache.json` 里 `name` 的工具清单。
+///
+/// 指纹与 `cfg` 不匹配或缓存缺失时返回 `None`——调用方据此区分「尚未探测」与
+/// 「探测过但没有工具」（后者是 `Some(vec![])`）。判定逻辑复用同源的
+/// `cache::McpCache::get_for`，故面板看到的清单与真正注册进工具集的那份一致。
+pub fn cached_tools_for(
+    workdir: &Path,
+    name: &str,
+    cfg: &ServerConfig,
+) -> Option<Vec<McpCacheEntry>> {
+    let cache = cache::McpCache::load(workdir);
+    cache.get_for(name, cfg).map(|tools| {
+        tools
+            .iter()
+            .map(|t| McpCacheEntry {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                read_only: t.read_only,
+            })
+            .collect()
+    })
+}
+
+/// 测试支撑：让下游 crate 的测试能写入真实的缓存文件，而不必复刻 SHA-256 指纹
+/// 格式（那会让下游测试对私有实现脆弱）。
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
+
+    /// 一个挂在 `workdir` 上的缓存（尚未 `save`）。
+    pub fn cache_with(workdir: &Path) -> cache::McpCache {
+        cache::McpCache::load(workdir)
+    }
+
+    /// 造一条缓存工具记录。
+    pub fn cached_tool(name: &str, read_only: bool) -> cache::CachedTool {
+        cache::CachedTool {
+            name: name.to_string(),
+            description: Some(format!("{name} 描述")),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only,
+        }
+    }
+}
 
 /// Load MCP config, build the manager, probe missing caches, and register tools.
 ///
