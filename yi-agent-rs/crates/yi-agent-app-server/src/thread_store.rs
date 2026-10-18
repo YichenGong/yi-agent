@@ -89,6 +89,18 @@ pub struct ThreadMeta {
     /// 旧 meta 缺字段一律读成 `None`(零迁移)。
     #[serde(default)]
     pub role: Option<String>,
+    /// 该会话**可见内容集合**的世代。只有会改变服务端 item 集合的操作才递增
+    /// ——今天仅 `thread/clear`（`compact` 不递增：它落盘时 items 为空、历史
+    /// item 分毫未动，见 spec §1.2）。旧 meta 缺字段必须解释为 0。
+    ///
+    /// 客户端握手时上报自己缓存的 epoch，服务端据此裁决是否需要全量重同步。
+    #[serde(default)]
+    pub content_epoch: u64,
+    /// 该会话最后一条 item 的 id。仅用于 `thread/listAll` 携带「客户端是否落后」
+    /// 的**保守下界**——真正的锚点有效性由 `contains_item_id` 读 jsonl 判定。
+    /// 第二处写入点 `promote_partial` 不维护它（偏旧只导致多补一段，不漏内容）。
+    #[serde(default)]
+    pub last_item_id: Option<String>,
 }
 
 /// `#[serde(default = "…")]` 的显式默认：`bool` 的内建默认是 `false`，而本开关
@@ -464,6 +476,43 @@ impl ThreadStore {
     /// 返回 false 表示 thread 不存在或 meta 不可读。
     pub fn set_pin_seq(&self, id: &str, seq: Option<i64>) -> io::Result<bool> {
         Ok(self.update_meta(id, |meta| meta.pin_seq = seq)?.is_some())
+    }
+
+    /// 递增该 thread 的**内容世代**。调用方必须是「会改变服务端 item 集合」的
+    /// 操作——今天只有 `thread/clear`（成功 `truncate` 之后）。加新调用点前请回到
+    /// spec §3 的判据确认，`compact` **不是**这样的操作。
+    ///
+    /// 有意**不**刷新 `updated_at`：世代变更属内容维护，不应影响按活动时间的
+    /// 列表排序（与 `set_permission_mode` 同款）。返回 false 表示 thread 不存在
+    /// 或 meta 不可读。
+    pub fn bump_content_epoch(&self, id: &str) -> io::Result<bool> {
+        Ok(self
+            .update_meta(id, |meta| {
+                meta.content_epoch = meta.content_epoch.saturating_add(1)
+            })?
+            .is_some())
+    }
+
+    /// 记录该 thread 最后一条 item 的 id（`None` = 该次落盘没有 item）。
+    /// 与 `persist_and_finish_turn` 的 `touch` 相邻调用，共用 `meta_lock`。
+    pub fn set_last_item_id(&self, id: &str, last: Option<&str>) -> io::Result<()> {
+        self.update_meta(id, |meta| meta.last_item_id = last.map(str::to_string))?;
+        Ok(())
+    }
+
+    /// 该 thread 的日志里是否含某 item id（用于校验客户端上报的上下文锚点）。
+    ///
+    /// 读真实 `.jsonl` 而非信任 meta 的 `last_item_id` 冗余：冗余由
+    /// `persist_and_finish_turn` 维护，`promote_partial` 不维护它，故它可能偏旧；
+    /// 而「锚点是否仍在」是正确性判据，必须读权威来源。
+    pub fn contains_item_id(&self, id: &str, item_id: &str) -> io::Result<bool> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let (items, _, _) = self.read_log(id);
+        Ok(items
+            .iter()
+            .any(|it| crate::server::item_id(it) == Some(item_id)))
     }
 
     /// 写入会话的颜色标签（`None` = 清除）。
@@ -851,6 +900,8 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         preserve_thinking: true,
         extra_roots: Vec::new(),
         role: None,
+        content_epoch: 0,
+        last_item_id: None,
     }
 }
 
@@ -883,6 +934,8 @@ mod tests {
             preserve_thinking: true,
             extra_roots: Vec::new(),
             role: None,
+            content_epoch: 0,
+            last_item_id: None,
         }
     }
 
@@ -1631,6 +1684,8 @@ mod tests {
             preserve_thinking: true,
             extra_roots: Vec::new(),
             role: None,
+            content_epoch: 0,
+            last_item_id: None,
         }
     }
 
@@ -2008,6 +2063,8 @@ mod tests {
             preserve_thinking: true,
             extra_roots: Vec::new(),
             role: None,
+            content_epoch: 0,
+            last_item_id: None,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -2076,6 +2133,8 @@ mod tests {
             preserve_thinking: true,
             extra_roots: Vec::new(),
             role: None,
+            content_epoch: 0,
+            last_item_id: None,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -2198,6 +2257,8 @@ mod tests {
             preserve_thinking: true,
             extra_roots: Vec::new(),
             role: Some(LEAD_ROLE.to_string()),
+            content_epoch: 0,
+            last_item_id: None,
         };
         store.create(&lead).unwrap();
         store
@@ -2273,6 +2334,8 @@ mod tests {
                     preserve_thinking: true,
                     extra_roots: Vec::new(),
                     role: Some(LEAD_ROLE.to_string()),
+                    content_epoch: 0,
+                    last_item_id: None,
                 })
                 .unwrap();
             store
@@ -2308,5 +2371,115 @@ mod tests {
             real.join(".yi-agent").display().to_string()
         );
         assert_eq!(store.project_key(), store.project_key());
+    }
+
+    /// 旧 meta（本字段出现前落盘的文件）必须读成 epoch 0 / last_item_id None，
+    /// 而不是解析失败——这是零迁移的硬要求（与 `pin_seq` / `reasoning_effort` 同款）。
+    #[test]
+    fn a_legacy_meta_without_the_new_fields_reads_as_epoch_zero() {
+        // 直接反序列化最老的 meta 形状：这条路径**不会**回退到 `rebuild_meta`，
+        // 因此只有 `#[serde(default)]` 在位时才能通过。
+        let legacy_json = r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
+        let legacy: ThreadMeta = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            legacy.content_epoch, 0,
+            "missing content_epoch must read as 0"
+        );
+        assert_eq!(
+            legacy.last_item_id, None,
+            "missing last_item_id must read as None"
+        );
+        assert_eq!(legacy.thread_id, "t", "other fields must survive");
+    }
+
+    #[test]
+    fn bump_content_epoch_increments_without_touching_updated_at() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        let before = s.load("thread-a").unwrap().unwrap().meta;
+
+        assert!(
+            s.bump_content_epoch("thread-a").unwrap(),
+            "an existing thread must bump"
+        );
+        let after = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(after.content_epoch, before.content_epoch + 1);
+        // 世代变更属内容维护，不是会话活动：不得改变按 updated_at 的列表顺序。
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "bump must not touch updated_at"
+        );
+
+        assert!(s.bump_content_epoch("thread-a").unwrap());
+        assert_eq!(
+            s.load("thread-a").unwrap().unwrap().meta.content_epoch,
+            2,
+            "each bump advances by exactly one"
+        );
+    }
+
+    #[test]
+    fn bump_content_epoch_on_an_unknown_thread_is_false_not_an_error() {
+        let (_d, s) = store();
+        assert!(!s.bump_content_epoch("nope").unwrap());
+    }
+
+    #[test]
+    fn contains_item_id_matches_only_ids_present_in_the_log() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.append_turn(
+            "thread-a",
+            &turn(
+                vec![Item::AgentMessage {
+                    id: "a-1".into(),
+                    text: "hi".into(),
+                }],
+                vec![],
+            ),
+        )
+        .unwrap();
+
+        assert!(s.contains_item_id("thread-a", "a-1").unwrap());
+        assert!(!s.contains_item_id("thread-a", "a-2").unwrap());
+        // 清空日志后锚点即失效——这正是 `thread/clear` 后的形状。
+        s.truncate("thread-a").unwrap();
+        assert!(!s.contains_item_id("thread-a", "a-1").unwrap());
+    }
+
+    #[test]
+    fn contains_item_id_on_an_unknown_thread_is_false_not_an_error() {
+        // 未知会话（没有日志文件）⇒ 不匹配，而不是把整个握手带崩。这条是 C 判据
+        // （`turn/start` 的锚点校验）与握手裁决的**唯一权威入口**，必须钉住：
+        // `read_log` 在文件不存在时返回空 items ⇒ `false`（fail-closed，宁可让
+        // 客户端多补一次，也不同意为锚点仍在）。
+        let (_d, s) = store();
+        assert!(!s.contains_item_id("never-created", "a-1").unwrap());
+    }
+
+    #[test]
+    fn contains_item_id_rejects_a_malformed_id() {
+        // 非法 id（含路径分隔符）是**调用方 bug**，不是"不匹配"：必须 Err，
+        // 否则会静默把一次畸形请求当成"锚点不存在"而误判失效。
+        let (_d, s) = store();
+        assert!(s.contains_item_id("bad/id", "a-1").is_err());
+    }
+
+    #[test]
+    fn set_last_item_id_records_and_clears_the_cursor() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.set_last_item_id("thread-a", Some("i-9")).unwrap();
+        assert_eq!(
+            s.load("thread-a")
+                .unwrap()
+                .unwrap()
+                .meta
+                .last_item_id
+                .as_deref(),
+            Some("i-9")
+        );
+        s.set_last_item_id("thread-a", None).unwrap();
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.last_item_id, None);
     }
 }

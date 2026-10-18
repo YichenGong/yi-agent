@@ -412,6 +412,8 @@ fn only_the_lead_sees_the_memory_tools() {
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             role: None,
             tag: None,
             extra_roots: Vec::new(),
@@ -4638,6 +4640,8 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6152,6 +6156,8 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6260,6 +6266,8 @@ async fn a_turn_while_off_persists_without_credentials() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: false,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6357,6 +6365,8 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7641,6 +7651,66 @@ async fn list_all(h: &mut Harness) -> serde_json::Value {
     panic!("thread/listAll must respond");
 }
 
+/// 从 `thread/listAll` 响应里取某 thread 的 `content_epoch`。
+fn content_epoch_of(list: &serde_json::Value, thread_id: &str) -> u64 {
+    let row = find_listed(list, thread_id);
+    row["content_epoch"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("content_epoch must be present: {row}"))
+}
+
+/// 从 `thread/listAll` 响应里取某 thread 的 `last_item_id`（缺省/`null` → None）。
+fn last_item_id_of(list: &serde_json::Value, thread_id: &str) -> Option<String> {
+    find_listed(list, thread_id)["last_item_id"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// 在 groups 与 pinned 里查找某 thread 的 summary（两处都可能出现）。
+fn find_listed<'a>(list: &'a serde_json::Value, thread_id: &str) -> &'a serde_json::Value {
+    let in_groups = list["result"]["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|g| g["threads"].as_array().into_iter().flatten());
+    let in_pinned = list["result"]["pinned"].as_array().into_iter().flatten();
+    in_groups
+        .chain(in_pinned)
+        .find(|t| t["thread_id"] == serde_json::json!(thread_id))
+        .unwrap_or_else(|| panic!("thread {thread_id} must be listed: {list}"))
+}
+
+/// 列表必须携带版本字段，客户端才能自判「我是否落后」而不必逐个读日志。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_carries_content_epoch_and_last_item_id() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let listed = list_all(&mut h).await;
+    assert_eq!(
+        content_epoch_of(&listed, &tid),
+        0,
+        "a fresh thread must be listed at epoch 0: {listed}"
+    );
+    assert_eq!(
+        last_item_id_of(&listed, &tid),
+        None,
+        "a fresh thread has no items yet: {listed}"
+    );
+
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+
+    let listed = list_all(&mut h).await;
+    assert!(
+        last_item_id_of(&listed, &tid).is_some(),
+        "a persisted turn must record last_item_id: {listed}"
+    );
+    h.shutdown().await;
+}
+
 async fn add_workspace(h: &mut Harness, id: u64, path: &str) {
     h.send(
         &serde_json::json!({"jsonrpc":"2.0","id":id,"method":"workspace/add",
@@ -7679,6 +7749,8 @@ fn write_meta(
         reasoning_effort: None,
         tag: None,
         preserve_thinking: true,
+        content_epoch: 0,
+        last_item_id: None,
         extra_roots: Vec::new(),
         role: None,
     };
@@ -9201,6 +9273,8 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -9310,6 +9384,8 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -9814,6 +9890,223 @@ async fn thread_clear_empties_the_context_and_resume_does_not_revive_it() {
     h.shutdown().await;
 }
 
+/// 跑一轮，并等到它**真正落盘**。
+///
+/// 落盘发生在 `turn/completed` **之后**（见
+/// `thread_clear_empties_the_context_and_resume_does_not_revive_it` 的注释），
+/// 所以不能只读到 `turn/completed` 就认为盘上有了：必须轮询 `.jsonl`。
+/// 随后把 `turn/completed` 排空，免得它污染后续断言。
+///
+/// 后续任务（clear 世代、listAll 版本字段、锚点校验）都复用它。
+async fn run_a_turn_and_wait_for_persist(
+    h: &mut Harness,
+    workdir: &std::path::Path,
+    tid: &str,
+    text: &str,
+) {
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 700, "method": "turn/start",
+            "params": { "threadId": tid, "input": [{ "type": "text", "text": text }] },
+        })
+        .to_string(),
+    )
+    .await;
+    let log = workdir
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.jsonl"));
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    let mut persisted = false;
+    while tokio::time::Instant::now() < deadline {
+        if std::fs::read_to_string(&log).is_ok_and(|t| !t.trim().is_empty()) {
+            persisted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(persisted, "turn for {tid} must reach disk");
+    for _ in 0..60 {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            return;
+        }
+    }
+    panic!("turn/completed never arrived for {tid}");
+}
+
+/// `/clear` 是**唯一**的世代递增点：它让服务端 item 集合从"有"变"无"，
+/// 客户端手上的内容就此结构性不一致。断言直接读 meta 文件，故本用例不依赖
+/// `thread/listAll` 是否已携带 `content_epoch`。
+#[tokio::test(flavor = "multi_thread")]
+async fn clearing_a_thread_bumps_its_content_epoch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    let store = crate::thread_store::ThreadStore::new(dir.path());
+
+    assert_eq!(
+        store.load(&tid).unwrap().unwrap().meta.content_epoch,
+        0,
+        "a fresh thread must start at epoch 0"
+    );
+
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    assert_eq!(
+        store.load(&tid).unwrap().unwrap().meta.content_epoch,
+        1,
+        "clear must bump the content epoch"
+    );
+    h.shutdown().await;
+}
+
+/// 不带锚点（桌面 / 老客户端）→ 不做任何校验。这是零回归门禁。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_without_a_context_anchor_is_not_validated() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    // epoch 被 clear 推到 1，但客户端不带锚点 ⇒ 照常准入（服务端不做推断）。
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    let resp = rpc(
+        &mut h,
+        71,
+        "turn/start",
+        json!({ "threadId": tid, "input": [{ "type": "text", "text": "hi" }] }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "no anchor must mean no validation: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 锚点世代已失效（会话在客户端不知情时被 clear）→ 拒绝。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_with_a_stale_epoch_is_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    let resp = rpc(
+        &mut h,
+        72,
+        "turn/start",
+        json!({
+            "threadId": tid,
+            "input": [{ "type": "text", "text": "hi" }],
+            "contextAnchor": { "contentEpoch": 0 },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32026),
+        "must be stale_context: {resp}"
+    );
+    assert_eq!(resp["error"]["data"]["code"], json!("stale_context"));
+    h.shutdown().await;
+}
+
+/// **关键正向用例**：锚点仍在但落后于末条 → 放行。
+/// 落后是两端并存的正常形状；拒绝它会破坏父 spec 的核心场景。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_with_an_anchor_behind_the_tail_is_accepted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "first").await;
+
+    // 取一个早期的 item 作为"落后"的锚点。
+    let read = rpc(&mut h, 73, "thread/readItems", json!({ "threadId": tid })).await;
+    let early = read["result"]["items"][0]["id"]
+        .as_str()
+        .expect("the first turn must have items")
+        .to_string();
+
+    // 落盘发生在 turn/completed 之后：收尾窗口内 turn/start 会被 -32012 拒。
+    // 锚点校验的正向用例不该被这个无关竞态判红，故重试。
+    let mut resp = json!(null);
+    for attempt in 0..20 {
+        resp = rpc(
+            &mut h,
+            74,
+            "turn/start",
+            json!({
+                "threadId": tid,
+                "input": [{ "type": "text", "text": "second" }],
+                "contextAnchor": { "contentEpoch": 0, "lastItemId": early },
+            }),
+        )
+        .await;
+        if resp["error"]["code"] != json!(-32012) {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let _ = attempt;
+    }
+    assert!(
+        resp.get("error").is_none(),
+        "a behind-but-present anchor must pass: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 锚点在世代相同的会话里已不在日志中 → 拒绝。
+/// 这是 `anchor_gone` 分支的正向钉：只钉「世代不符」会漏掉同世代的失效锚点。
+/// 用全新会话（epoch 0、无 item）直接构造：任何 lastItemId 都不存在，
+/// 且不必先跑一轮（避免撞上 turn 收尾窗口的 `-32012`）。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_with_a_same_epoch_but_absent_anchor_is_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let resp = rpc(
+        &mut h,
+        75,
+        "turn/start",
+        json!({
+            "threadId": tid,
+            "input": [{ "type": "text", "text": "second" }],
+            "contextAnchor": { "contentEpoch": 0, "lastItemId": "item-does-not-exist" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32026),
+        "an absent anchor must be stale_context: {resp}"
+    );
+    assert_eq!(resp["error"]["data"]["code"], json!("stale_context"));
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn thread_clear_rejects_an_unknown_thread() {
     let mut h = Harness::new();
@@ -9892,6 +10185,53 @@ async fn thread_compact_reports_compacted_when_history_shrinks() {
     assert_eq!(
         v["result"]["status"], "compacted",
         "expected compaction: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// `compact` **不得**抹掉 `last_item_id`。
+///
+/// 机制：`compact` 走的 `persist_and_finish_turn` 传空 prompt + 空 items，
+/// 且它刻意**不**递增 epoch、也**不**删除日志里既有的 item 行（读取时按行
+/// 拼接）。若空 items 的落盘把游标写成 `None`，`thread/listAll` 就会把一个
+/// 「仍有 items」的会话报成「从未有过 item」——客户端据此会认为本地锚点毫无
+/// 意义，`listAll` 的「是否落后」信号被永久削弱。故空落盘必须**不**覆盖游标。
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_does_not_erase_last_item_id() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, compactable_factory, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    // 先跑一轮真实 turn，让日志里真的落进 item（游标由此被写上）。
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+
+    let before = list_all(&mut h).await;
+    let anchor = last_item_id_of(&before, &tid);
+    assert!(
+        anchor.is_some(),
+        "a persisted turn must record last_item_id before compact: {before}"
+    );
+    let epoch = content_epoch_of(&before, &tid);
+
+    let v = compact_thread(&mut h, &tid).await;
+    assert_eq!(
+        v["result"]["status"], "compacted",
+        "compaction must actually happen, else this test proves nothing: {v}"
+    );
+
+    let after = list_all(&mut h).await;
+    assert_eq!(
+        last_item_id_of(&after, &tid),
+        anchor,
+        "compact must NOT erase last_item_id: the items are still there \
+         (compact appends an empty line and never deletes the log): {after}"
+    );
+    assert_eq!(
+        content_epoch_of(&after, &tid),
+        epoch,
+        "compact is deliberately not an epoch bump: {after}"
     );
     h.shutdown().await;
 }
@@ -14531,6 +14871,315 @@ async fn merged_loop_fans_out_permission_mode_change_to_ws_client() {
     );
     assert_eq!(notif["params"]["mode"].as_str(), Some("yolo"));
     h.shutdown().await;
+}
+/// 裁决是纯函数：给定 hints 与服务端每会话的 (epoch, 锚点是否仍在)，
+/// 产出每个 hint 的动作、诊断原因、以及服务端 epoch。四条判定按优先级
+/// 短路（spec §4.2）。`server` 返回 `None` 表示该 thread 已不存在。
+#[test]
+fn plan_sync_covers_the_four_verdicts() {
+    let hint = |id: &str, e: u64, anchor: Option<&str>| SyncHint {
+        thread_id: id.to_string(),
+        content_epoch: e,
+        last_item_id: anchor.map(str::to_string),
+    };
+    let server = |id: &str| -> Option<(u64, bool)> {
+        match id {
+            "t-deleted" => None,
+            "t-stale" => Some((5, true)),
+            "t-lost" => Some((3, false)),
+            "t-ok" => Some((3, true)),
+            "t-behind" => Some((3, true)),
+            _ => None,
+        }
+    };
+    let hints = vec![
+        hint("t-deleted", 1, Some("a")),
+        hint("t-stale", 3, Some("a")),
+        hint("t-lost", 3, Some("gone")),
+        hint("t-ok", 3, Some("a")),
+        hint("t-behind", 3, Some("older")),
+    ];
+
+    let plan = plan_sync(&hints, &server);
+    let row = |id: &str| {
+        plan.iter()
+            .find(|(t, _, _, _)| t == id)
+            .map(|(_, a, r, e)| (*a, *r, *e))
+    };
+    assert_eq!(row("t-deleted"), Some((SyncAction::Drop, "deleted", 0)));
+    assert_eq!(row("t-stale"), Some((SyncAction::Full, "epoch_changed", 5)));
+    assert_eq!(row("t-lost"), Some((SyncAction::Full, "anchor_missing", 3)));
+    assert_eq!(row("t-ok"), Some((SyncAction::None, "match", 3)));
+    // 「落后」不是失败：锚点仍在 → 缓存有效，补齐交给常规路径（spec §7.2）。
+    assert_eq!(row("t-behind"), Some((SyncAction::None, "match", 3)));
+    // 顺序必须与 hints 一一对应：调用方按序写回 syncPlan，错位即张冠李戴。
+    assert_eq!(
+        plan.iter().map(|(t, ..)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t-deleted", "t-stale", "t-lost", "t-ok", "t-behind"],
+        "plan must preserve the hint order"
+    );
+}
+
+/// 空 hints（桌面端 / 老客户端）→ 空 plan。这是零回归的门禁。
+#[test]
+fn plan_sync_is_empty_for_no_hints() {
+    assert!(plan_sync(&[], &|_| panic!("must not be called")).is_empty());
+}
+
+/// `lastItemId` 为 None（会话从未有过 item）时不得当成"锚点缺失"而误判全量。
+#[test]
+fn plan_sync_treats_a_null_anchor_as_present_when_epochs_match() {
+    let hints = vec![SyncHint {
+        thread_id: "t".into(),
+        content_epoch: 0,
+        last_item_id: None,
+    }];
+    let plan = plan_sync(&hints, &|_| Some((0, true)));
+    assert_eq!(plan[0].1, SyncAction::None);
+}
+
+/// 会话删除后，hints 里对它的条目必须判 `drop` —— 端到端跑一遍：
+/// `thread/delete` 真的把会话从盘上抹掉，随后拿**生产用的那个查询**
+/// （`ThreadStore::load`）当 `plan_sync` 的 `server` 回调，断言 `Drop` /
+/// `"deleted"` / epoch 0。
+///
+/// 相对纯函数里的 stub 用例，这里额外钉住的是「删除在 service 层真的可见，
+/// 且 `load` 的 `None` 与 `plan_sync` 约定的 `None` 同义」：stub 只证明算法，
+/// 证明不了是哪个查询在喂它。
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_sync_drops_a_deleted_thread_end_to_end() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    let store = crate::thread_store::ThreadStore::new(dir.path());
+
+    // 删除前该会话存在：epoch 0，锚点视为仍在（从未有过 item）。
+    let hints = vec![SyncHint {
+        thread_id: tid.clone(),
+        content_epoch: 0,
+        last_item_id: None,
+    }];
+    let live = |id: &str| {
+        store
+            .load(id)
+            .unwrap()
+            .map(|t| (t.meta.content_epoch, true))
+    };
+    assert_eq!(
+        plan_sync(&hints, &live)[0].1,
+        SyncAction::None,
+        "a live thread must not be dropped"
+    );
+
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 12, "method": "thread/delete",
+            "params": { "threadId": tid },
+        })
+        .to_string(),
+    )
+    .await;
+    let deleted = read_response(&mut h, 12).await;
+    assert!(
+        deleted.get("error").is_none(),
+        "delete must succeed: {deleted}"
+    );
+
+    assert!(
+        store.load(&tid).unwrap().is_none(),
+        "delete must remove the thread"
+    );
+    // 同一条 hint：会话消失后必须整条 drop，而不是静默留一个空缓存。
+    assert_eq!(
+        plan_sync(&hints, &live)[0],
+        (tid.clone(), SyncAction::Drop, "deleted", 0),
+        "a deleted thread must be dropped"
+    );
+    h.shutdown().await;
+}
+
+/// 无 hints（桌面端 / 老客户端）→ 空 plan，其余字段不变。桌面零回归门禁。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_without_hints_reports_an_empty_sync_plan() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    // `initialize` 助手的响应在流里，重新发一次带 id 的以便断言。
+    let resp = rpc(&mut h, 61, "initialize", json!({})).await;
+    assert_eq!(
+        resp["result"]["syncPlan"],
+        json!([]),
+        "no hints → empty plan: {resp}"
+    );
+    assert!(
+        resp["result"]["serverInfo"].is_object(),
+        "existing fields must survive: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 带 hints 时按 §4.2 裁决：clear 过的会话被判 full（epoch 变了）。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_a_full_resync_for_a_cleared_thread() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    // 客户端手上有 epoch 0 的缓存，但服务端已经是 1。
+    let resp = rpc(
+        &mut h,
+        62,
+        "initialize",
+        json!({ "resumeHints": [{ "threadId": tid, "contentEpoch": 0 }] }),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"]
+        .as_array()
+        .unwrap_or_else(|| panic!("syncPlan must be an array: {resp}"));
+    assert_eq!(plan.len(), 1, "one hint must yield one entry: {resp}");
+    assert_eq!(plan[0]["threadId"], json!(tid));
+    assert_eq!(plan[0]["action"], json!("full"));
+    assert_eq!(plan[0]["reason"], json!("epoch_changed"));
+    assert_eq!(
+        plan[0]["epoch"],
+        json!(1),
+        "the entry must carry the server epoch"
+    );
+    h.shutdown().await;
+}
+
+/// epoch 一致且锚点仍在 → none（缓存有效，不必重同步）。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_nothing_when_the_hint_matches() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+    let listed = list_all(&mut h).await;
+    let anchor = last_item_id_of(&listed, &tid).expect("a turn must record an anchor");
+
+    let resp = rpc(
+        &mut h,
+        63,
+        "initialize",
+        json!({ "resumeHints": [{
+            "threadId": tid, "contentEpoch": 0, "lastItemId": anchor,
+        }]}),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"].as_array().unwrap();
+    assert_eq!(plan[0]["action"], json!("none"));
+    assert_eq!(plan[0]["reason"], json!("match"));
+    h.shutdown().await;
+}
+
+/// 会话存在但**从未有过 item**（hint 不带 `lastItemId`）→ none。锚点为 null 时
+/// 不得当成"锚点缺失"去查盘或判全量：那会把"还没有内容"误读成"缓存失效"。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_nothing_for_a_thread_that_has_no_anchor() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let resp = rpc(
+        &mut h,
+        65,
+        "initialize",
+        json!({ "resumeHints": [{ "threadId": tid, "contentEpoch": 0 }] }),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"].as_array().unwrap();
+    assert_eq!(plan[0]["epoch"], json!(0), "epoch must come from the store");
+    assert_eq!(plan[0]["action"], json!("none"));
+    assert_eq!(plan[0]["reason"], json!("match"));
+    h.shutdown().await;
+}
+
+/// 锚点已被抹掉（clear 过内容但 epoch 未变的极端形状）→ full / anchor_missing，
+/// 证明 `lastItemId` 确实拿去查了真实 jsonl，而不是被忽略或凭 meta 断言。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_a_full_resync_when_the_anchor_is_gone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let resp = rpc(
+        &mut h,
+        66,
+        "initialize",
+        json!({ "resumeHints": [{
+            "threadId": tid, "contentEpoch": 0, "lastItemId": "item-never-existed",
+        }]}),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"].as_array().unwrap();
+    assert_eq!(plan[0]["action"], json!("full"));
+    assert_eq!(plan[0]["reason"], json!("anchor_missing"));
+    h.shutdown().await;
+}
+
+/// 不存在的会话 → drop。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_a_drop_for_a_deleted_thread() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    let resp = rpc(
+        &mut h,
+        64,
+        "initialize",
+        json!({ "resumeHints": [{ "threadId": "thread-gone", "contentEpoch": 0 }] }),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"].as_array().unwrap();
+    assert_eq!(plan[0]["action"], json!("drop"));
+    assert_eq!(plan[0]["reason"], json!("deleted"));
+    h.shutdown().await;
+}
+
+/// `parse_resume_hints` 是纯函数：畸形条目静默跳过，上限 20 条按 cachedAt 最新优先。
+#[test]
+fn parse_resume_hints_is_bounded_and_skips_malformed() {
+    let raw = json!([
+        { "threadId": "t1", "contentEpoch": 2, "lastItemId": "i1", "cachedAt": 5 },
+        { "contentEpoch": 9 },                       // 缺 threadId → 跳过
+        { "threadId": "t2", "cachedAt": 50 },        // 缺 epoch → 0
+        "not-an-object",                             // 畸形 → 跳过
+    ]);
+    let hints = parse_resume_hints(Some(&raw));
+    assert_eq!(
+        hints.len(),
+        2,
+        "malformed entries must be skipped: {hints:?}"
+    );
+    assert_eq!(hints[0].thread_id, "t2", "newest cachedAt must come first");
+    assert_eq!(hints[0].content_epoch, 0);
+    assert_eq!(hints[1].thread_id, "t1");
+    assert_eq!(hints[1].last_item_id.as_deref(), Some("i1"));
+
+    // 上限 20：造 25 条，取 cachedAt 最大的 20 条。
+    let many: Vec<serde_json::Value> = (0..25)
+        .map(|i| json!({ "threadId": format!("t{i}"), "cachedAt": i }))
+        .collect();
+    let hints = parse_resume_hints(Some(&json!(many)));
+    assert_eq!(hints.len(), 20);
+    assert_eq!(hints[0].thread_id, "t24", "the newest must be kept");
+
+    assert!(parse_resume_hints(None).is_empty());
+    assert!(parse_resume_hints(Some(&json!("nope"))).is_empty());
 }
 
 /// 记录型工厂：把每次 `build_agent` 时**槽位里实际可见**的关联根记下来。

@@ -12,7 +12,8 @@ use serde_json::json;
 use crate::protocol::{RequestEnvelope, RequestId, RpcError};
 use crate::rpc::{AppState, Flow};
 use crate::server::{
-    err_response, extract_prompt, ok_response, require_thread_id, start_turn_core, write_response,
+    err_response, extract_prompt, ok_response, require_thread_id, start_turn_core, store_lookup,
+    write_response,
 };
 use crate::session::InterjectionRequest;
 
@@ -28,6 +29,40 @@ pub(crate) async fn handle(
 ) -> anyhow::Result<Flow> {
     match req.method.as_str() {
         "turn/start" => {
+            // 客户端可携带它以为的上下文锚点（spec §7.1）。仅当携带时校验：
+            // 桌面/老客户端不带 ⇒ 逐字节零回归。
+            if let Some(anchor) = req.params.get("contextAnchor") {
+                if let Some(thread_id) = req.params.get("threadId").and_then(|v| v.as_str()) {
+                    let store = store_lookup(state.threads, state.workspaces, state.cfg, thread_id);
+                    let current_epoch = store
+                        .load(thread_id)
+                        .ok()
+                        .flatten()
+                        .map(|l| l.meta.content_epoch);
+                    let claimed_epoch = anchor.get("contentEpoch").and_then(|v| v.as_u64());
+                    // 世代不符 ⇒ 客户端持有的是服务端不存在的内容。
+                    let epoch_stale = matches!(
+                        (claimed_epoch, current_epoch),
+                        (Some(c), Some(cur)) if c != cur
+                    );
+                    // 锚点已不在日志中 ⇒ 同样结构性不一致。
+                    // **落后于末条不算失效**：那是两端并存的正常形状。
+                    let anchor_gone = match anchor.get("lastItemId").and_then(|v| v.as_str()) {
+                        Some(a) => !store.contains_item_id(thread_id, a).unwrap_or(false),
+                        None => false,
+                    };
+                    if epoch_stale || anchor_gone {
+                        write_response(
+                            state.hub,
+                            state.client,
+                            err_response(id.clone(), RpcError::stale_context(thread_id)),
+                        )
+                        .await?;
+                        return Ok(Flow::Continue);
+                    }
+                }
+                // 缺 threadId：交给 `prepare_turn_core` 统一报错。
+            }
             // 校验 / 占 `active_turn_id` / turn/started / Running 状态 /
             // 响应 / 投递 prompt 全在 start_turn_core 内,顺序与抽取前一致;
             // `Ok(None)` 表示已写过错误响应,这里 continue。

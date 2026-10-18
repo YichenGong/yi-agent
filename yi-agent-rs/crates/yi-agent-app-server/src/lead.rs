@@ -172,6 +172,8 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
         // 关联根是**会话级**能力增量，组长这里保持单根（空集）。
         extra_roots: Vec::new(),
         role: Some(LEAD_ROLE.to_string()),
+        content_epoch: 0,
+        last_item_id: None,
     };
     store.create(&meta)?;
     // 复读:并发下这里可能读到别人先落的、`created_at` 更早的那一个。

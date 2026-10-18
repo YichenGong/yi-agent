@@ -2824,6 +2824,49 @@ where
                 match method.as_str() {
                     "initialize" => {
                         initialized.lock().await.insert(client.clone(), true);
+                        // 客户端在**第一帧**声明它手上有什么（spec §4.1）：这不需要
+                        // 新增往返——initialize 是连上那一刻必发的帧。仅手机端会带
+                        // `resumeHints`；桌面/老客户端不带 ⇒ 空 plan，零回归。
+                        let hints = parse_resume_hints(req.params.get("resumeHints"));
+                        let by_id = |id: &str| {
+                            hints
+                                .iter()
+                                .find(|h| h.thread_id == id)
+                                .and_then(|h| h.last_item_id.as_deref())
+                        };
+                        let plan = plan_sync(&hints, &|id| {
+                            // 定位该 thread 的 store：内存里的 thread 用它自己的
+                            // （与 driver 共享锁），冷 thread 走全局索引。
+                            let store = store_lookup(&threads, &workspaces, &cfg, id);
+                            let loaded = store.load(id).ok().flatten()?;
+                            // 锚点校验读真实 jsonl（`contains_item_id`），不信任 meta
+                            // 的 `last_item_id` 冗余。仅在 hint 真的带了 `lastItemId`
+                            // 时才查盘；hint 的锚点为 null（该会话从未有过 item）时
+                            // 视为"仍在"——否则会把"还没有内容"误判成"锚点缺失"而
+                            // 平白触发一次全量。读失败同样按"仍在"处理：宁可让客户端
+                            // 少做一次全量，也不要因一次 IO 抖动误判为失效。
+                            let anchor_present = match by_id(id) {
+                                Some(anchor) => store.contains_item_id(id, anchor).unwrap_or(true),
+                                None => true,
+                            };
+                            Some((loaded.meta.content_epoch, anchor_present))
+                        });
+                        let sync_plan: Vec<serde_json::Value> = plan
+                            .into_iter()
+                            .map(|(thread_id, action, reason, epoch)| {
+                                let action = match action {
+                                    SyncAction::Full => "full",
+                                    SyncAction::None => "none",
+                                    SyncAction::Drop => "drop",
+                                };
+                                json!({
+                                    "threadId": thread_id,
+                                    "action": action,
+                                    "epoch": epoch,
+                                    "reason": reason,
+                                })
+                            })
+                            .collect();
                         write_response(
                             &hub, &client,
                             ok_response(
@@ -2835,6 +2878,7 @@ where
                                     },
                                     "protocolVersion": PROTOCOL_VERSION,
                                     "capabilities": {},
+                                    "syncPlan": sync_plan,
                                 }),
                             ),
                         )
@@ -3324,6 +3368,101 @@ pub(crate) fn worktree_json(
     }
 }
 
+/// 客户端在握手第一帧声明的、某会话的缓存状态。
+///
+/// 生产调用点：`initialize` 分支读 `params.resumeHints` → `parse_resume_hints`
+/// → `plan_sync`（Task 6 落地）。
+#[derive(Debug, Clone)]
+pub(crate) struct SyncHint {
+    pub(crate) thread_id: String,
+    pub(crate) content_epoch: u64,
+    pub(crate) last_item_id: Option<String>,
+}
+
+/// 服务端对该 hint 的裁决。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncAction {
+    /// 缓存内容必须整段作废，客户端须走全量 `thread/resume`。
+    Full,
+    /// 缓存内容**仍然有效**。注意这不是"客户端已是最新"——落后是正常的并存
+    /// 形状，补齐由常规的 resume / readItems / 订阅流承担（spec §4.2）。
+    None,
+    /// 该会话已不存在，客户端须丢弃本地条目与视图。
+    Drop,
+}
+
+/// 把 hints 与服务端现状裁成一份 `syncPlan`。纯函数：`server(id)` 由调用方
+/// 提供该会话的 `(content_epoch, 锚点是否仍在日志中)`，`None` 表示不存在。
+///
+/// 判定按优先级短路（spec §4.2）：不存在 → drop；epoch 不符 → full；
+/// 锚点缺失 → full；否则 none。返回的末位是服务端 epoch（`drop` 时 0），
+/// 免得调用方为写 `syncPlan` 的 `epoch` 字段再查一次库。
+pub(crate) fn plan_sync(
+    hints: &[SyncHint],
+    server: &dyn Fn(&str) -> Option<(u64, bool)>,
+) -> Vec<(String, SyncAction, &'static str, u64)> {
+    let mut out = Vec::with_capacity(hints.len());
+    for h in hints {
+        let (action, reason, epoch) = match server(&h.thread_id) {
+            None => (SyncAction::Drop, "deleted", 0),
+            Some((epoch, anchor_present)) => {
+                if epoch != h.content_epoch {
+                    (SyncAction::Full, "epoch_changed", epoch)
+                } else if h.last_item_id.is_some() && !anchor_present {
+                    (SyncAction::Full, "anchor_missing", epoch)
+                } else {
+                    (SyncAction::None, "match", epoch)
+                }
+            }
+        };
+        out.push((h.thread_id.clone(), action, reason, epoch));
+    }
+    out
+}
+
+/// 解析 `initialize` 的 `resumeHints`。上限 20 条（按 `cachedAt` 降序取，缺
+/// `cachedAt` 视为 0），超出截断——声明必须是"非常小的数据量"（spec §4.1）。
+/// 任何畸形条目静默跳过：声明是优化，不该让握手失败。
+pub(crate) fn parse_resume_hints(raw: Option<&serde_json::Value>) -> Vec<SyncHint> {
+    const MAX_HINTS: usize = 20;
+    let Some(items) = raw.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut hints: Vec<(i64, SyncHint)> = items
+        .iter()
+        .filter_map(|it| {
+            let thread_id = it.get("threadId")?.as_str()?.to_string();
+            let content_epoch = it.get("contentEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
+            let last_item_id = it
+                .get("lastItemId")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let cached_at = it.get("cachedAt").and_then(|v| v.as_i64()).unwrap_or(0);
+            Some((
+                cached_at,
+                SyncHint {
+                    thread_id,
+                    content_epoch,
+                    last_item_id,
+                },
+            ))
+        })
+        .collect();
+    // 降序：cachedAt 越大越新，优先保留。
+    hints.sort_by_key(|a| std::cmp::Reverse(a.0));
+    hints.truncate(MAX_HINTS);
+    hints.into_iter().map(|(_, h)| h).collect()
+}
+
+/// 一条落盘记录里的最后一条 item id（`items` 的末项）。
+fn record_last_item_id(record: &crate::thread_store::TurnLine) -> Option<String> {
+    match record {
+        crate::thread_store::TurnLine::Turn { items, .. } => {
+            items.last().and_then(item_id).map(str::to_string)
+        }
+    }
+}
+
 /// 把 thread meta 渲染成 wire 上的 ThreadSummary（含 `pinned`）。
 pub(crate) fn thread_summary_json(
     m: &crate::thread_store::ThreadMeta,
@@ -3343,6 +3482,8 @@ pub(crate) fn thread_summary_json(
         "card_id": m.card_id,
         "tag": m.tag,
         "status": thread_status(threads, &m.thread_id),
+        "content_epoch": m.content_epoch,
+        "last_item_id": m.last_item_id,
     });
     // 只在确实是组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
     // 的字节比对与快照测试失效,而我们只需要一个新值。
@@ -3626,16 +3767,30 @@ async fn persist_and_finish_turn(
         usage: last_usage,
         messages: persisted_messages,
     };
-    // append 失败则跳过 touch：避免出现"幽灵" thread。
+    // append 失败则跳过 meta 维护：避免出现"幽灵" thread。
     let mut first_turn = false;
     if let Err(e) = store.append_turn(thread_id, &record) {
         eprintln!("[app-server] failed to persist turn {thread_id}: {e}");
-    } else if let Some(prompt) = user_prompt {
-        match store.touch(thread_id, Some(prompt)) {
-            // 本次刚写入兜底截断标题 = 该 thread 的首轮。
-            Ok(true) => first_turn = true,
-            Ok(false) => {}
-            Err(e) => eprintln!("[app-server] failed to update meta for {thread_id}: {e}"),
+    } else {
+        // `last_item_id` 供 `thread/listAll` 报告"客户端是否落后"的**保守下界**；
+        // 「锚点是否仍在」的权威判据是读真实 jsonl 的 `contains_item_id`（spec §3）。
+        //
+        // 只有本次落盘确实产出了 item 才更新游标。空 items 的落盘（`compact` /
+        // `SetPreserveThinking`）不改变可见内容集合，写 `None` 会把「有 items」
+        // 误报成「从未有过 item」，从而永久削弱 `listAll` 的「是否落后」信号。
+        // 真正清空内容的 `clear` 路径在它的调用点显式清游标（见下）。
+        if let Some(last) = record_last_item_id(&record) {
+            if let Err(e) = store.set_last_item_id(thread_id, Some(&last)) {
+                eprintln!("[app-server] failed to record last_item_id for {thread_id}: {e}");
+            }
+        }
+        if let Some(prompt) = user_prompt {
+            match store.touch(thread_id, Some(prompt)) {
+                // 本次刚写入兜底截断标题 = 该 thread 的首轮。
+                Ok(true) => first_turn = true,
+                Ok(false) => {}
+                Err(e) => eprintln!("[app-server] failed to update meta for {thread_id}: {e}"),
+            }
         }
     }
 
@@ -3773,6 +3928,22 @@ async fn apply_session_command(
             let truncate = store.truncate(thread_id);
             if let Err(e) = &truncate {
                 eprintln!("[app-server] failed to truncate thread log {thread_id}: {e}");
+            }
+            // 世代递增：/clear 让可见内容集合从"有"变"无"，客户端手上的内容就此
+            // 结构性不一致，必须靠 epoch 变化才能被判为过期（spec §3）。这是**唯一**
+            // 的递增点——`compact` 不在此列，它不丢 item（spec §1.2）。
+            // 失败只记 stderr：清空本身已成功，世代滞后最坏让客户端做一次多余的
+            // 全量 resume（幂等），绝不因此让 clear 报错。
+            if truncate.is_ok() {
+                if let Err(e) = store.bump_content_epoch(thread_id) {
+                    eprintln!("[app-server] failed to bump content epoch ({thread_id}): {e}");
+                }
+                // clear 是唯一真正清空可见内容的路径：世代已递增，游标也必须清掉，
+                // 否则 listAll 会继续报一个已被删除的 item id。
+                // 与上面的 bump 同款：失败只记 stderr，绝不让 clear 报错。
+                if let Err(e) = store.set_last_item_id(thread_id, None) {
+                    eprintln!("[app-server] failed to clear last_item_id for {thread_id}: {e}");
+                }
             }
             // 不是 turn 收尾：turn_id 传 None（不发 Finished），也不 touch meta。
             persist_and_finish_turn(
@@ -5417,6 +5588,8 @@ pub(crate) async fn start_thread_core(
             .map(|p| p.to_string_lossy().to_string())
             .collect(),
         role: None,
+        content_epoch: 0,
+        last_item_id: None,
     };
     // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
     // 的 `role: "lead"` 抹掉(本函数的 meta 不带 role),懒创建出来的组长就
