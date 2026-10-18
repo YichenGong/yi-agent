@@ -5,7 +5,7 @@ import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testi
 type Mode = "normal" | "yolo";
 type ThreadSeed = { thread_id: string; title: string | null; permission_mode: Mode };
 
-const { clients, state } = vi.hoisted(() => ({
+const { clients, state, dragDrop } = vi.hoisted(() => ({
   clients: [] as Array<{
     requests: { method: string; params: unknown }[];
     // The recovery hook the App injects as `RpcClient`'s 2nd constructor arg.
@@ -80,6 +80,8 @@ const { clients, state } = vi.hoisted(() => ({
     // 路径确实被走到」可被断言，而不是靠「首屏照常」这种两边都成立的弱断言。
     leadAttempts: [] as string[],
   },
+  // 捕获 `@tauri-apps/api/webview` 注册的拖放 handler，供用例驱动事件。
+  dragDrop: { fn: null as null | ((event: unknown) => void) },
 }));
 
 // 内容缓存模块级替换：每个用例一份内存实现。App 在首次远端渲染时才懒建，故用
@@ -281,6 +283,24 @@ vi.mock("./lib/rpc", () => ({
   },
 }));
 
+// 拖放订阅走动态 import 的 `@tauri-apps/api/webview`；在模块边界桩掉它，
+// 并把注册的 handler 记在 `dragDrop.fn` 上。Tauri 交来的是事件对象
+// （`{ payload }`），故这里回放时也要包一层——`App` 的 subscribe 只转发 payload。
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: async (handler: (event: unknown) => void) => {
+      dragDrop.fn = handler;
+      return () => {};
+    },
+  }),
+}));
+
+/** jsdom 的 rect 恒为 0，落点判定需要一个真矩形。 */
+function stubRect(el: HTMLElement, r: { left: number; top: number; right: number; bottom: number }) {
+  el.getBoundingClientRect = () =>
+    ({ ...r, width: r.right - r.left, height: r.bottom - r.top, x: r.left, y: r.top, toJSON: () => ({}) }) as DOMRect;
+}
+
 vi.mock("./transportFactory", () => ({ transportFactory: () => ({}) }));
 
 // iOS-vs-desktop 的唯一判定入口。只换掉 `isIos`：其余（`isRemoteClient` 等）
@@ -329,6 +349,7 @@ beforeEach(() => {
   state.leadCwds = [];
   state.failLead = false;
   state.leadAttempts = [];
+  dragDrop.fn = null;
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
@@ -4728,5 +4749,30 @@ describe("App lead entry reachability", () => {
     // 失败不得挡住首屏：既有会话照旧渲染，且没有凭空冒出组长条目。
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
     expect(screen.queryByText("组长")).toBeNull();
+  });
+});
+
+describe("拖入路径", () => {
+  it("drop 落在输入卡片上时把路径写进当前会话草稿", async () => {
+    render(<App />);
+    // 首屏自动 resume 第一条会话后，输入框才不是 disabled。
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe('"/Users/me/My Docs"');
+  });
+
+  it("drop 落在卡片之外时不改草稿", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/a"], position: { x: 900, y: 900 } } });
+    });
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   });
 });
