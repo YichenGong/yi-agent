@@ -186,13 +186,12 @@ pub enum IpcRequest {
         /// The root session's linked roots (canonical absolute paths). An older
         /// client omits the field, which reads as "no linked roots".
         ///
-        /// Deliberately no `PROTOCOL_VERSION` bump, unlike the additive
-        /// `PluginQuery` *variant* that bumped 1 → 2: an additive, optional,
-        /// `#[serde(default)]` field on an *existing* variant parses
-        /// compatibly in both directions (an old daemon ignores the unknown
-        /// field; a new daemon defaults it), so no version disagreement is
-        /// observable. Same shape as the `fork_token` fields added to the two
-        /// spawn requests without a bump.
+        /// Additive and `#[serde(default)]`: a new daemon reads an old client's request
+        /// as "no linked roots", unchanged. The reverse is not compatible: an old daemon
+        /// rejects it as a bare parse error (`Validation`, no message), since
+        /// `deny_unknown_fields` covers this internally-tagged variant (ipc.rs:178). A bump
+        /// would not fix that (the command is parsed before `protocol_version`, 1492-1493)
+        /// and would only force the unrelated plugin crate to bump; no bump, per `fork_token`.
         #[serde(default)]
         extra_roots: Vec<String>,
     },
