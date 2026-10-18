@@ -162,6 +162,14 @@ pub(in crate::tui) struct CachedCell {
     lines: Option<Vec<ratatui::text::Line<'static>>>,
 }
 
+/// Upper bound on retained history cells.
+///
+/// A TUI session can run for days; without a cap the render cache and the cells
+/// themselves grow without bound. Dropping is display-only: the authoritative
+/// transcript lives in the server's `.jsonl` and is re-fetched by
+/// `thread/resume`, so nothing is lost — see [`HistoryState::push`].
+pub const MAX_HISTORY_CELLS: usize = 2000;
+
 /// Flattened, memoized rendering of the history at one width.
 ///
 /// A frame reads the line count and the visible window many times; without this
@@ -171,6 +179,14 @@ pub(in crate::tui) struct CachedCell {
 pub(in crate::tui) struct HistoryCache {
     width: u16,
     entries: Vec<CachedCell>,
+    /// Cell indexes known to need a re-render.
+    ///
+    /// `invalidate_cell` already knows exactly which cell an event mutated; this
+    /// set carries that knowledge to `ensure_cache` so a frame no longer has to
+    /// re-discover it by fingerprinting every cell. A `BTreeSet` (not a `HashSet`)
+    /// so a batch of mutations is processed in ascending index order, which keeps
+    /// `recompute_cache_accelerators` linear.
+    dirty: std::collections::BTreeSet<usize>,
     /// `cumulative[i]` = lines in entries `0..i`, spacers included.
     cumulative: Vec<usize>,
     /// Absolute line index at which each entry starts, spacer included.
@@ -197,6 +213,7 @@ impl HistoryCache {
         Self {
             width,
             entries: Vec::new(),
+            dirty: std::collections::BTreeSet::new(),
             cumulative: vec![0],
             part_offsets: Vec::new(),
             reflected_generation: 0,
@@ -240,6 +257,10 @@ pub struct HistoryState {
     /// have changed, and the number of cells stops mattering for a frame.
     /// `Cell` because the read paths only hold `&self`.
     content_generation: Cell<u64>,
+    /// How many cells have been dropped from the head to respect
+    /// [`MAX_HISTORY_CELLS`]. Surfaced so the UI can say the history was trimmed
+    /// rather than silently losing it.
+    dropped_cells: usize,
 }
 
 impl HistoryState {
@@ -250,6 +271,7 @@ impl HistoryState {
             scroll_offset: 0,
             cache: RefCell::new(HistoryCache::new(0)),
             content_generation: Cell::new(0),
+            dropped_cells: 0,
         }
     }
 
@@ -263,7 +285,17 @@ impl HistoryState {
             scroll_offset,
             cache: RefCell::new(HistoryCache::new(0)),
             content_generation: Cell::new(0),
+            dropped_cells: 0,
         }
+    }
+
+    /// Number of cells dropped from the head of the history so far.
+    ///
+    /// The status bar is the intended consumer; until it reads it, the
+    /// accessor is exercised only by tests (same shape as `total_lines`).
+    #[allow(dead_code)]
+    pub fn dropped_cells(&self) -> usize {
+        self.dropped_cells
     }
 
     /// Push a new cell while preserving the visible position when scrolled up.
@@ -273,6 +305,7 @@ impl HistoryState {
         self.cells.push(cell);
         self.note_content_change();
         self.apply_scroll_delta(was_scrolled, lines_before, width);
+        self.enforce_history_cap();
     }
 
     /// Append `more` to the trailing assistant message, if that is what the
@@ -285,6 +318,12 @@ impl HistoryState {
             return false;
         };
         markdown.push_str(more);
+        // The trailing cell was mutated in place, so it has to be registered:
+        // with the per-frame full scan gone, `note_content_change` alone would
+        // re-run `ensure_cache` but leave this cell out of the candidates and it
+        // would render stale. This is the subagent trace stream's hot path
+        // (`trace.rs`).
+        self.invalidate_cell(self.cells.len() - 1);
         self.note_content_change();
         self.apply_scroll_delta(was_scrolled, lines_before, width);
         true
@@ -295,8 +334,10 @@ impl HistoryState {
         self.cells.clear();
         self.selected = None;
         self.scroll_offset = 0;
+        self.dropped_cells = 0;
         let cache = self.cache.get_mut();
         cache.entries.clear();
+        cache.dirty.clear();
         cache.part_offsets.clear();
         cache.cumulative.truncate(1);
         cache.decision = None;
@@ -327,14 +368,28 @@ impl HistoryState {
             if cache.width != width {
                 // A wrap is width-specific, so a resize invalidates everything.
                 cache.entries.clear();
+                cache.dirty.clear();
                 cache.cumulative.truncate(1);
                 cache.part_offsets.clear();
                 cache.width = width;
                 rebuild_tables = true;
             }
 
+            // Only the cells that were explicitly invalidated, plus any newly
+            // appended ones, can differ. Fingerprinting the whole scrollback here
+            // is what made a frame cost grow with the session length.
+            let mut candidates: std::collections::BTreeSet<usize> = cache.dirty.clone();
+            for index in cache.entries.len()..self.cells.len() {
+                candidates.insert(index);
+            }
+
             let mut changed = Vec::new();
-            for index in 0..self.cells.len() {
+            for index in candidates {
+                if index >= self.cells.len() {
+                    continue;
+                }
+                #[cfg(test)]
+                perf_counters::note_fingerprint();
                 let fingerprint = cell_fingerprint(&self.cells[index]);
                 // `lines.is_some()` matters: invalidation drops the rendered
                 // lines without touching the fingerprint, so a matching
@@ -348,6 +403,7 @@ impl HistoryState {
                     changed.push((index, fingerprint));
                 }
             }
+            cache.dirty.clear();
             if !changed.is_empty() || cache.entries.len() > self.cells.len() {
                 rebuild_tables = true;
             }
@@ -624,6 +680,7 @@ impl HistoryState {
             if let Some(cell) = self.cells.get_mut(i) {
                 cell.toggle_fold();
                 self.invalidate_cell(i);
+                self.note_content_change();
             }
         }
     }
@@ -636,16 +693,25 @@ impl HistoryState {
         self.cache.borrow_mut().decision = None;
     }
 
-    /// Drop the cached render for one cell.
+    /// Register a mutated cell so the next `ensure_cache` re-renders just it.
     ///
-    /// Callers pass the index they just mutated. The cache also catches this
-    /// through the fingerprint, but dropping the lines here keeps a long
-    /// collapsed body from being held in memory after it is folded away.
+    /// Callers pass the index they just mutated. The cache also catches the
+    /// change through the fingerprint, but the dirty set is what lets
+    /// `ensure_cache` find it without scanning every cell. Dropping the lines
+    /// here also keeps a long collapsed body from being held in memory after it
+    /// is folded away.
+    ///
+    /// This deliberately does **not** bump the generation: `ensure_cache` is
+    /// gated by `cache_is_current`, which early-returns while the generation is
+    /// unchanged, so a caller that registered dirty without bumping would leave
+    /// the entry unprocessed and the cell stale. Every caller must therefore end
+    /// with a `note_content_change()`.
     fn invalidate_cell(&self, index: usize) {
-        if let Some(entry) = self.cache.borrow_mut().entries.get_mut(index) {
+        let mut cache = self.cache.borrow_mut();
+        if let Some(entry) = cache.entries.get_mut(index) {
             entry.lines = None;
         }
-        self.note_content_change();
+        cache.dirty.insert(index);
     }
 
     /// Drop cached renders for any cell an event mutates in place.
@@ -736,6 +802,30 @@ impl HistoryState {
         self.scroll_offset = 0;
     }
 
+    /// Enforce [`MAX_HISTORY_CELLS`], dropping oldest-first.
+    ///
+    /// Dropping the head shifts every index, so the cached entries must shift
+    /// with them. Rather than reshuffling the cache under the borrow, the cache
+    /// is rebuilt lazily: `entries` is cleared and the surviving cells are
+    /// treated as new by `ensure_cache`'s tail scan.
+    fn enforce_history_cap(&mut self) {
+        if self.cells.len() <= MAX_HISTORY_CELLS {
+            return;
+        }
+        let excess = self.cells.len() - MAX_HISTORY_CELLS;
+        self.cells.drain(0..excess);
+        self.dropped_cells += excess;
+        self.selected = None;
+        let cache = self.cache.get_mut();
+        cache.entries.clear();
+        cache.dirty.clear();
+        cache.cumulative.truncate(1);
+        cache.part_offsets.clear();
+        cache.decision = None;
+        // The viewport is re-derived from scratch after a head drop.
+        self.scroll_offset = 0;
+    }
+
     fn apply_scroll_delta(&mut self, was_scrolled: bool, lines_before: usize, width: u16) {
         if !was_scrolled {
             return;
@@ -796,25 +886,37 @@ impl HistoryState {
             *expanded = !*expanded;
         }
         self.invalidate_cell(index);
+        self.note_content_change();
         true
     }
 }
 
 impl HistoryState {
     /// Replaces the latest manual compact progress separator, if it exists.
+    ///
+    /// The label is mutated in place, so the cell has to be registered as dirty
+    /// or `ensure_cache` would keep serving its pre-mutation render (the caller
+    /// `push_event` bumps the generation at the end, which is what lets the
+    /// registered entry actually be processed).
     fn replace_pending_compaction(&mut self, label: String) {
-        if let Some(HistoryCell::Separator {
-            label: pending_label,
-        }) = self.cells.iter_mut().rev().find(|cell| {
+        let hit = self.cells.iter().rposition(|cell| {
             matches!(
                 cell,
                 HistoryCell::Separator {
                     label: Some(label)
                 } if label == "正在压缩对话..."
             )
-        }) {
+        });
+        let Some(index) = hit else {
+            return;
+        };
+        if let HistoryCell::Separator {
+            label: pending_label,
+        } = &mut self.cells[index]
+        {
             *pending_label = Some(label);
         }
+        self.invalidate_cell(index);
     }
 
     /// Process an AgentEvent and update the cell list accordingly.
@@ -1058,6 +1160,7 @@ impl HistoryState {
 
         self.note_content_change();
         self.apply_scroll_delta(was_scrolled, lines_before, width);
+        self.enforce_history_cap();
     }
 }
 
@@ -1265,11 +1368,33 @@ mod perf_counters {
 
     thread_local! {
         pub(super) static REBUILDS: Cell<usize> = const { Cell::new(0) };
+        /// Fingerprints computed by `ensure_cache`. This is the quantity that
+        /// used to grow with `cells.len()` on every frame; tests assert it stays
+        /// proportional to the mutated cells instead.
+        pub(super) static FINGERPRINTS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(super) fn note_rebuild() {
         REBUILDS.with(|count| count.set(count.get() + 1));
     }
+
+    pub(super) fn note_fingerprint() {
+        FINGERPRINTS.with(|count| count.set(count.get() + 1));
+    }
+}
+
+/// Number of fingerprints `ensure_cache` has computed since the last reset.
+///
+/// This is the TUI's per-frame scan cost: it must depend on the dirty cells,
+/// not on the history length.
+#[cfg(test)]
+pub(crate) fn reset_fingerprint_count() {
+    perf_counters::FINGERPRINTS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn fingerprint_count() -> usize {
+    perf_counters::FINGERPRINTS.with(|count| count.get())
 }
 
 /// Number of times the flattened history has been rebuilt from scratch.
@@ -1390,6 +1515,38 @@ mod tests {
         );
     }
 
+    /// A very long session must not grow without bound; the oldest cells are
+    /// dropped, and the transcript says so instead of silently losing them.
+    #[test]
+    fn history_is_capped_and_reports_what_it_dropped() {
+        let mut state = HistoryState::new();
+        for index in 0..(MAX_HISTORY_CELLS + 50) {
+            state.push(
+                HistoryCell::AssistantMessage {
+                    markdown: format!("answer {index}"),
+                },
+                80,
+            );
+        }
+        assert!(state.cells.len() <= MAX_HISTORY_CELLS);
+        assert!(
+            state.dropped_cells() >= 50,
+            "dropped count must be reported"
+        );
+        // The most recent cell must survive: dropping is oldest-first.
+        let last = state.cells.last().expect("history must not be empty");
+        match last {
+            HistoryCell::AssistantMessage { markdown } => {
+                assert!(markdown.contains(&format!("answer {}", MAX_HISTORY_CELLS + 49)));
+            }
+            other => panic!("expected the newest assistant message, got {other:?}"),
+        }
+        // And the visible window must still be coherent after the drop.
+        let width = state.text_width(80, 24);
+        state.reconcile_scroll_offset(width, 24);
+        assert!(state.scroll_offset <= state.max_scroll_offset(width, 24));
+    }
+
     /// The cache must not grow the per-frame cost with the number of cells even
     /// when the history fits the viewport (where `text_width` probes a narrower
     /// width than it renders at). The bound has to be a constant, not `N`.
@@ -1431,6 +1588,111 @@ mod tests {
         assert!(
             large <= 2 * small + 4,
             "fitting-frame work must not scale with cell count: 10 cells -> {small} renders, 50 cells -> {large} renders"
+        );
+    }
+
+    /// Extending the trailing assistant message mutates it in place. With the
+    /// per-frame full scan gone, this path relies on its invalidation being
+    /// registered — otherwise the appended text renders stale.
+    ///
+    /// Covers both entry points: `extend_last_assistant_text` (the subagent
+    /// trace stream, `trace.rs`) and the `AssistantText` event arm.
+    #[test]
+    fn appended_assistant_text_is_visible_after_the_full_scan_is_gone() {
+        fn rendered_text(state: &HistoryState, width: u16) -> String {
+            HistoryView { state, width: 80 }
+                .flattened_lines(width)
+                .into_iter()
+                .flat_map(|(_, line)| line.spans.into_iter().map(|s| s.content.into_owned()))
+                .collect()
+        }
+
+        let mut state = HistoryState::new();
+        state.push(HistoryCell::from_assistant_text("first"), 80);
+        let width = state.text_width(80, 24);
+
+        // 1) the trace-stream entry point
+        assert!(state.extend_last_assistant_text(" second", 80));
+        assert!(
+            rendered_text(&state, width).contains("first second"),
+            "extend_last_assistant_text must invalidate the cell it mutated"
+        );
+
+        // 2) the agent-event entry point
+        state.push_event(AgentEvent::AssistantText(" third".into()), 80);
+        assert!(
+            rendered_text(&state, width).contains("first second third"),
+            "the AssistantText arm must invalidate the cell it appended to"
+        );
+    }
+
+    /// Streaming must not touch the settled scrollback: neither the cell
+    /// re-renders nor the fingerprints computed for one streamed delta may grow
+    /// with `cells.len()`.
+    ///
+    /// This is the TUI counterpart of the desktop delivery: a long session must
+    /// not pay for its length on every frame.
+    #[test]
+    fn a_streamed_delta_does_not_rescan_the_whole_history() {
+        fn renders_for_one_delta(cells: usize) -> (usize, usize) {
+            let mut state = HistoryState::new();
+            for index in 0..cells {
+                state.push(
+                    HistoryCell::AssistantMessage {
+                        markdown: format!("answer {index} with some words"),
+                    },
+                    80,
+                );
+            }
+            // Warm: settle at the same width a frame will read at, so the
+            // measured step is a pure content change rather than an incidental
+            // resize (a resize legitimately re-renders the whole scrollback).
+            let width = state.text_width(80, 24);
+            let _ = HistoryView {
+                state: &state,
+                width: 80,
+            }
+            .flattened_lines(width);
+            assert_eq!(
+                state.cache.borrow().entries.len(),
+                cells,
+                "the warm-up must have rendered every cell"
+            );
+
+            // One streamed delta, applied at the width the frame renders at.
+            state.push_event(AgentEvent::AssistantText(" more".into()), width);
+
+            // One frame read. `HistoryView::render` calls `ensure_cache` the
+            // same way, so this is where the per-frame scan happens.
+            crate::tui::cell::reset_lines_call_count();
+            reset_fingerprint_count();
+            let _ = HistoryView {
+                state: &state,
+                width: 80,
+            }
+            .flattened_lines(width);
+            (crate::tui::cell::lines_call_count(), fingerprint_count())
+        }
+
+        let (small_renders, small_scans) = renders_for_one_delta(10);
+        let (large_renders, large_scans) = renders_for_one_delta(200);
+        assert_eq!(
+            small_renders, large_renders,
+            "a streamed delta re-rendered {small_renders} vs {large_renders} \
+             cells; it must not depend on the history length"
+        );
+        assert!(
+            large_renders <= 2,
+            "only the mutated tail may re-render, got {large_renders}"
+        );
+        assert_eq!(
+            small_scans, large_scans,
+            "a streamed delta fingerprinted {small_scans} vs {large_scans} \
+             cells; the per-frame scan must not depend on the history length"
+        );
+        assert!(
+            large_scans <= 2,
+            "only the mutated tail may be fingerprinted, got {large_scans}"
         );
     }
 
