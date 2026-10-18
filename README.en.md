@@ -205,33 +205,45 @@ rationale: [mobile remote access design](docs/superpowers/specs/2026-10-02-mobil
 Priority, lowest to highest:
 
 1. Built-in defaults
-2. Global config `~/.yi-agent/.env`
-3. Project config `<project>/.yi-agent/.env` (overrides global)
-4. CLI flags / environment variables (highest)
+2. Global config `~/.yi-agent/.env` (non-model settings: turns, compaction, sandbox)
+3. Model config `~/.yi-agent/models.json` (**the single source of truth for models**)
+4. CLI flags / real environment variables (temporary whole-package override:
+   `--provider` + `--api-key`)
 
-Config never lands in your project root — it goes in `.yi-agent/.env`, so your
-repo stays clean.
+`~/.yi-agent/.env` is the only `.env` — there is no project-level one. `--workdir`
+only picks where tools operate; it does not change where config comes from. Config
+never lands in your project root, so your repo stays clean.
 
-**Easy path**: run `yi-agent web` and fill things in from the browser
-(<http://127.0.0.1:7292> by default). It writes the files above for you.
+**One-liner**: `--model` is a model **string**; overriding it requires the whole
+package (`--provider` + `--api-key`, `--api-url` optional) — a partial injection
+is rejected outright.
+
+**Easy path**: configure models in the desktop app (Settings → Models, writing
+`~/.yi-agent/models.json`); `yi-agent web` (<http://127.0.0.1:7292> by default)
+manages only non-model settings.
+
+> Breaking change: model keys are no longer read from `.env`. On first start after
+> upgrading, the active model keys in `.env` are migrated into `models.json` and
+> those lines are commented out (`# MIGRATED: ...`).
 
 ## Common settings
 
 | Goal | Environment variable | CLI flag |
 | --- | --- | --- |
+| Switch model (whole package) | `YI_AGENT_PROVIDER` + `MODEL_API_KEY` | `--provider` + `--api-key` (`--model` / `--api-url` optional) |
 | API key | `MODEL_API_KEY` | `--api-key` |
 | Switch provider | `YI_AGENT_PROVIDER` (`anthropic` / `openai`) | `--provider` |
-| Switch model | `YI_AGENT_MODEL` | `--model` |
+| Model identifier | — (use the settings UI / `models.json`) | `--model` (needs `--provider` + `--api-key`) |
 | Custom API endpoint | `MODEL_API_URL` | `--api-url` |
 | Set the working directory | `YI_AGENT_WORKDIR` | `--workdir` |
 | Max steps per turn | `YI_AGENT_MAX_TURNS` (default 200) | `--max-turns` |
 | Auto-compact threshold | `YI_AGENT_COMPACT_RATIO` (default 80, percent of context) | `--compact-ratio` |
 | Web search | `BOCHA_API_KEY` | — |
 
-**Switching models**, for example to OpenAI:
+**Switching models**, for example to OpenAI (provide the whole package):
 
 ```bash
-yi-agent --provider openai --model gpt-4o
+yi-agent --provider openai --api-key sk-... --model gpt-4o
 ```
 
 **About permission prompts.** By default every risky operation asks for
