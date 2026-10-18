@@ -269,11 +269,11 @@ yi-agent --provider openai --api-key sk-... --model gpt-4o
 | tooling | 3 / 3 | [详情](docs/project-management/tooling.md) |
 | yi-agent-mcp | 1 / 1 | [详情](docs/project-management/yi-agent-mcp.md) |
 | yi-agent-store | 7 / 8 | [详情](docs/project-management/yi-agent-store.md) |
-| yi-agent-runtime | 13 / 13 | [详情](docs/project-management/yi-agent-runtime.md) |
+| yi-agent-runtime | 16 / 16 | [详情](docs/project-management/yi-agent-runtime.md) |
 | yi-agent-subagent | 9 / 9 | [详情](docs/project-management/yi-agent-subagent.md) |
-| yi-agent-app-server | 47 / 47 | [详情](docs/project-management/yi-agent-app-server.md) |
+| yi-agent-app-server | 52 / 52 | [详情](docs/project-management/yi-agent-app-server.md) |
 | subagent-runtime | 44 / 52 | [详情](docs/project-management/subagent-runtime.md) |
-| desktop | 60 / 72 | [详情](docs/project-management/desktop.md) |
+| desktop | 65 / 77 | [详情](docs/project-management/desktop.md) |
 
 </details>
 

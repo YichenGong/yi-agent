@@ -22,11 +22,11 @@
 | tooling | 3 / 3 | [详情](./tooling.md) |
 | yi-agent-mcp | 1 / 1 | [详情](./yi-agent-mcp.md) |
 | yi-agent-store | 5 / 5 | [详情](./yi-agent-store.md) |
-| yi-agent-runtime | 14 / 14 | [详情](./yi-agent-runtime.md) |
+| yi-agent-runtime | 16 / 16 | [详情](./yi-agent-runtime.md) |
 | yi-agent-subagent | 8 / 8 | [详情](./yi-agent-subagent.md) |
-| yi-agent-app-server | 51 / 51 | [详情](./yi-agent-app-server.md) |
+| yi-agent-app-server | 52 / 52 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 42 / 49 | [详情](./subagent-runtime.md) |
-| desktop | 64 / 76 | [详情](./desktop.md) |
+| desktop | 65 / 77 | [详情](./desktop.md) |
 
 ## 已知问题
 
