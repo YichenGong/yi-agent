@@ -7,16 +7,67 @@
 //! 因此 thread → 组长的通信一律经 app-server 中转:app-server 本就持有
 //! 「thread → 项目 → 组长」的映射。
 //!
-//! P1 只实现单向投递(`blocking: false`)。阻塞往返的形状见 spec §5.2,属 P2。
+//! P1 只实现单向投递(`blocking: false`);P2 补上阻塞往返:投递时带一个
+//! `request_id`,本 thread 在 `LeadReplies` 里登记一个 oneshot 后 await,
+//! 组长那轮的收尾回填(见 spec §5.2)。
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
 use crate::thread_store::{LEAD_ROLE, ThreadMeta, ThreadMode, ThreadStore};
+
+/// 阻塞式 `ask_lead` 的默认超时。与 TUI `wait_agent` 的默认 2 分钟一致
+/// (spec §5.3):组长是一个 thread、一个 agent,turn 串行,必须有界收口,
+/// 否则本 thread 会永久挂死。
+pub const ASK_LEAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 阻塞回信的登记表。形状照抄审批路径的 `pending`
+/// (`server.rs` 的 `Arc<Mutex<HashMap<String, oneshot::Sender<Decision>>>>`):
+/// 投递方登记一个 `oneshot::Sender` 后 await,应答方(组长那轮的收尾)回填。
+///
+/// 内部 `Arc<Mutex<..>>` 而非裸 `Mutex`:工具实例经 `Arc` 注册进 registry 共用,
+/// 克隆句柄比改造 `Tool::call` 的所有权简单。
+#[derive(Clone, Default)]
+pub struct LeadReplies {
+    waiting: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
+}
+
+impl LeadReplies {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 登记一次等待,返回接收端。等待方超时后 drop 掉接收端即可
+    /// (`resolve` 会安全失败,不 panic)。
+    pub fn register(&self, request_id: String) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel();
+        self.waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(request_id, tx);
+        rx
+    }
+
+    /// 回填一次。无人等待(已超时/从未登记)返回 `false`,不 panic。
+    pub fn resolve(&self, request_id: &str, reply: String) -> bool {
+        let sender = self
+            .waiting
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(request_id);
+        match sender {
+            Some(tx) => tx.send(reply).is_ok(),
+            None => false,
+        }
+    }
+}
 
 /// 一条投给组长的消息。
 ///
@@ -27,6 +78,10 @@ pub struct LeadEnvelope {
     pub project_key: String,
     pub from_thread_id: String,
     pub text: String,
+    /// `Some` = 阻塞投递,等这个 id 的回信;`None` = 单向投递(P1 行为)。
+    ///
+    /// 纯进程内结构,不是 wire 类型,故与 `serde` 无关。
+    pub request_id: Option<String>,
 }
 
 /// 每项目一份的组长信箱。
@@ -128,12 +183,16 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
 
 /// 普通会话用来给组长留言的工具。
 ///
-/// P1 只做单向投递。`blocking: true` 显式拒绝而非降级——静默降级会让模型
-/// 以为自己在等一个答复,而 P1 根本不会回信,那比报错更难排查。
+/// 默认(不带 `with_replies`)是 P1 的纯单向行为,`blocking: true` 显式拒绝
+/// 而非降级——静默降级会让模型以为自己在等一个答复,而无人回信时那比报错
+/// 更难排查。装配提供了回信登记表后,`blocking: true` 才真的有界往返。
 pub struct AskLeadTool {
     inbox: LeadInbox,
     project_key: String,
     from_thread_id: String,
+    /// P2:本 thread 所属项目的组长回信登记表 + 阻塞超时。`None` = 无回信能力
+    /// (P1 行为)。用 `Option` 保持 `new` 的三参数签名不变。
+    replies: Option<(LeadReplies, Duration)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,7 +208,17 @@ impl AskLeadTool {
             inbox,
             project_key,
             from_thread_id,
+            replies: None,
         }
+    }
+
+    /// P2:注入本 thread 所属项目的组长回信登记表与阻塞超时。
+    ///
+    /// 不放进 `new` 的第 4 个参数:装配侧尚未接回信时(P1 的调用点)仍走三参数
+    /// `new`,行为与 P1 完全一致。
+    pub fn with_replies(mut self, replies: LeadReplies, timeout: Duration) -> Self {
+        self.replies = Some((replies, timeout));
+        self
     }
 }
 
@@ -160,7 +229,7 @@ impl Tool for AskLeadTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to this project's lead agent. The lead coordinates all threads in this project. Delivery is one-way in this version: you will not receive a reply during this turn, so keep working after calling it. Use it to report a blocker, hand over a decision, or flag something the lead must know."
+        "Send a message to this project's lead agent. The lead coordinates all threads in this project. By default delivery is one-way: you will not receive a reply during this turn, so keep working after calling it. Set `blocking: true` when you are blocked and need the lead's decision before continuing; you then wait for a reply (bounded, ~2 minutes) and the result carries the lead's answer. Use it to report a blocker, hand over a decision, or flag something the lead must know."
     }
 
     fn schema(&self) -> Value {
@@ -173,7 +242,7 @@ impl Tool for AskLeadTool {
                 },
                 "blocking": {
                     "type": "boolean",
-                    "description": "Reserved. Waiting for a reply is not implemented in this version; do not set it."
+                    "description": "Set true to wait for the lead's reply (bounded to about 2 minutes). Use only when you genuinely cannot proceed without the lead's decision; on timeout you are told to continue on your own. Defaults to false (one-way delivery)."
                 }
             },
             "required": ["message"]
@@ -185,20 +254,43 @@ impl Tool for AskLeadTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
         };
-        if parsed.blocking {
-            return ToolResult::error(
-                "ask_lead blocking mode is not implemented in P1; \
-                 resend without `blocking` so the message is delivered one-way",
-            );
-        }
         let text = parsed.message.trim().to_string();
         if text.is_empty() {
             return ToolResult::error("message must not be empty");
+        }
+        if parsed.blocking {
+            let Some((replies, timeout)) = self.replies.clone() else {
+                // 装配未提供回信能力(例如 TUI 侧尚未接):保持 P1 的显式拒绝,
+                // 绝不静默降级成单向——那会让模型以为自己在等答复。
+                return ToolResult::error(
+                    "ask_lead blocking mode is not implemented here; \
+                     resend without `blocking` so the message is delivered one-way",
+                );
+            };
+            let request_id = format!("lead-ask-{}", uuid::Uuid::new_v4());
+            let rx = replies.register(request_id.clone());
+            if let Err(e) = self.inbox.deliver(LeadEnvelope {
+                project_key: self.project_key.clone(),
+                from_thread_id: self.from_thread_id.clone(),
+                text: text.clone(),
+                request_id: Some(request_id),
+            }) {
+                return ToolResult::error(format!("failed to deliver to lead: {e}"));
+            }
+            // 有界收口:绝不能在此永久挂住 thread(组长那轮的 turn 可能很长)。
+            return match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(reply)) => ToolResult::text(format!("组长回复：{reply}")),
+                Ok(Err(_)) => ToolResult::error("组长回信通道已关闭。"),
+                Err(_) => {
+                    ToolResult::text("组长暂未回应（已等待超时）。请自行继续手上的工作，别空等。")
+                }
+            };
         }
         let envelope = LeadEnvelope {
             project_key: self.project_key.clone(),
             from_thread_id: self.from_thread_id.clone(),
             text: text.clone(),
+            request_id: None,
         };
         match self.inbox.deliver(envelope) {
             Ok(()) => ToolResult::text(format!(
@@ -288,5 +380,87 @@ mod tests {
     fn ask_lead_is_read_only() {
         let tool = AskLeadTool::new(LeadInbox::new(), "p".into(), "t".into());
         assert!(tool.metadata().read_only);
+    }
+
+    #[test]
+    fn lead_replies_resolving_a_registered_request_delivers_the_reply() {
+        let replies = LeadReplies::new();
+        let rx = replies.register("req-1".to_string());
+        assert!(replies.resolve("req-1", "组长回复：先别动".to_string()));
+        assert_eq!(rx.blocking_recv().expect("reply"), "组长回复：先别动");
+    }
+
+    #[test]
+    fn lead_replies_resolving_an_unknown_request_is_a_no_op() {
+        let replies = LeadReplies::new();
+        assert!(!replies.resolve("nobody", "x".to_string()));
+    }
+
+    #[test]
+    fn lead_replies_dropping_the_receiver_does_not_panic_on_late_resolve() {
+        let replies = LeadReplies::new();
+        let rx = replies.register("req-2".to_string());
+        drop(rx);
+        // 等待方已走（超时），迟到的回信不得 panic。
+        assert!(!replies.resolve("req-2", "late".to_string()));
+    }
+
+    #[tokio::test]
+    async fn lead_replies_blocking_ask_lead_times_out_with_a_readable_message() {
+        let inbox = LeadInbox::new();
+        let _sub = inbox.subscribe(); // 有人听，投递会成功
+        let replies = LeadReplies::new();
+        let tool = AskLeadTool::new(inbox, "p".into(), "t".into())
+            .with_replies(replies, std::time::Duration::from_millis(50));
+        let out = tool
+            .call(serde_json::json!({ "message": "怎么办", "blocking": true }))
+            .await;
+        let body = format!("{out:?}");
+        assert!(body.contains("暂未"), "must explain the timeout: {body}");
+    }
+
+    #[test]
+    fn lead_replies_a_blocking_envelope_carries_a_request_id() {
+        let e = LeadEnvelope {
+            project_key: "p".into(),
+            from_thread_id: "t".into(),
+            text: "hi".into(),
+            request_id: Some("req-9".into()),
+        };
+        assert_eq!(e.request_id.as_deref(), Some("req-9"));
+        let one_way = LeadEnvelope {
+            project_key: "p".into(),
+            from_thread_id: "t".into(),
+            text: "hi".into(),
+            request_id: None,
+        };
+        assert!(one_way.request_id.is_none());
+    }
+
+    /// 阻塞往返的完整形状:投递携带 `request_id`,组长那轮据此回填,
+    /// 本 thread 拿到的是回信文本而非超时文本。超时是兜底,不是常态。
+    #[tokio::test]
+    async fn lead_replies_a_blocking_ask_returns_the_leads_reply() {
+        let inbox = LeadInbox::new();
+        let mut rx = inbox.subscribe();
+        let replies = LeadReplies::new();
+        let tool = AskLeadTool::new(inbox, "p".into(), "t".into())
+            .with_replies(replies.clone(), std::time::Duration::from_secs(5));
+
+        let call = tokio::spawn(async move {
+            tool.call(serde_json::json!({ "message": "怎么办", "blocking": true }))
+                .await
+        });
+
+        // 扮演主循环:收到信封后按 `request_id` 回信。
+        let envelope = rx.recv().await.expect("envelope");
+        let request_id = envelope.request_id.expect("blocking 投递必须带 request_id");
+        assert_eq!(envelope.text, "怎么办");
+        assert!(replies.resolve(&request_id, "先别动".to_string()));
+
+        let out = call.await.expect("call task");
+        let body = format!("{out:?}");
+        assert!(body.contains("先别动"), "must carry the reply: {body}");
+        assert!(!out.is_error, "拿到回信不是错误: {body}");
     }
 }
