@@ -28,7 +28,8 @@ use superpowers_kanban_runner::service::BoardService;
 #[derive(Debug)]
 struct Args {
     /// supervisor 清单仍传 `--runtime-dir`，所以 CLI 必须继续接受它；但插件已不再
-    /// 直连 daemon 建会话（改由宿主调度器驱动 `board.*`），此字段暂无用途。
+    /// 直连 daemon 建会话（改由宿主的通用驱动器每 tick 问插件 `driver/next`），
+    /// 此字段暂无用途。
     #[allow(dead_code)]
     runtime_dir: PathBuf,
     state_dir: PathBuf,
@@ -759,8 +760,9 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 
 /// 周期性推进队列，直到进程被杀。
 ///
-/// 这里**不再创建会话**：认领（`board.next_launch`）、起会话、回写终态都由宿主
-/// 调度器负责（plan Task 5/6）。插件只负责消费 inbox 把卡排进队列，并落盘。
+/// 这里**不再创建会话**：宿主每 tick 问一次 `driver/next`，由插件在 `driver_step`
+/// 里认领队首卡并交出通用动作（起会话 / 追加一轮），宿主只负责执行。插件在这里
+/// 只消费 inbox 把卡排进队列、收敛已并入的分支、归档终点卡，并落盘。
 fn run_daemon(args: Args) {
     // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到就等旧实例让位——
     // 旧实例要么正常退出，要么靠 daemon 失联探测自行退出。用轮询避免忙等。
@@ -819,7 +821,8 @@ fn run_daemon(args: Args) {
         }
 
         // 插件在这里只做一件事：把 inbox 里的投递排进共享看板并落盘。认领与
-        // 会话推进全部交给宿主调度器经 `board.*` 驱动。
+        // 会话推进都由宿主每 tick 经 `driver/next` 问出来，插件在 `driver_step`
+        // 里决定——宿主不认看板，也不调任何 `board.*` 方法。
         for outcome in service.consume_inbox(chrono::Local::now()) {
             match outcome.result {
                 Ok(()) => eprintln!("superpowers-kanban: enqueued {}", outcome.id),
