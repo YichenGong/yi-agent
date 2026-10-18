@@ -468,8 +468,8 @@ fn only_the_lead_sees_the_memory_tools() {
             title: Some("组长".to_string()), // 标题写着「组长」也不许算组长
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
@@ -930,6 +930,119 @@ fn a_dead_runtime_is_repaired_on_the_next_tool_call() {
     );
 }
 
+/// A project directory that no longer exists must not be brought up.
+#[test]
+fn a_vanished_project_directory_is_refused_and_not_recreated() {
+    let repo = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let runtime = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+    let workdir = cfg.workdir.clone();
+
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+
+    drop(repo);
+
+    // `RuntimeBinding` 不实现 `Debug`，故用 match 而不是 `expect_err`。
+    let error = match attach_cwd_runtime(
+        &runtimes,
+        runtime.path(),
+        &cfg,
+        &isolated_models_path(runtime.path()),
+    ) {
+        Ok(_) => panic!("a vanished project directory must not attach"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains(&workdir.display().to_string()),
+        "the error must name the missing directory, got: {error}"
+    );
+    assert!(
+        !workdir.exists(),
+        "refusing to attach must not recreate the project directory"
+    );
+
+    std::fs::create_dir_all(&workdir).unwrap();
+    init_git_repo(&workdir);
+    attach_cwd_runtime(
+        &runtimes,
+        runtime.path(),
+        &cfg,
+        &isolated_models_path(runtime.path()),
+    )
+    .expect("a restored project directory must attach on the next call");
+}
+
+/// The incident, end to end.
+#[test]
+fn a_reclaimed_worktree_converges_instead_of_retrying_forever() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let deep_slug = "2026-10-17-backend-module-split-design-2026-10-17-backend-module-split";
+    let workdir = directory.path().join(deep_slug);
+    std::fs::create_dir_all(&workdir).unwrap();
+    init_git_repo(&workdir);
+    let mut cfg = test_config();
+    cfg.workdir = workdir.clone();
+    let runtime = workdir.join(".yi-agent/runtime");
+
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    let binding = attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime))
+        .expect("a git project must attach");
+    let socket = binding.current().unwrap().socket_path.clone();
+    assert_eq!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy,
+        "the runtime must be live before we reclaim its directory"
+    );
+    assert!(
+        !socket.starts_with(&runtime),
+        "precondition: the socket must live outside the runtime directory"
+    );
+
+    drop(binding);
+    std::fs::remove_dir_all(&workdir).unwrap();
+
+    let error = match attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime))
+    {
+        Ok(_) => panic!("a reclaimed worktree must not attach"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains(&workdir.display().to_string()),
+        "the error must name the missing directory, got: {error}"
+    );
+    assert!(
+        !workdir.exists(),
+        "the refusal must not recreate the reclaimed project directory"
+    );
+
+    let mut socket_died = false;
+    for _ in 0..240 {
+        if !socket.exists() {
+            socket_died = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let _ = std::fs::remove_file(&socket);
+    assert!(
+        socket_died,
+        "the daemon must stop once its runtime directory is gone"
+    );
+
+    for _ in 0..5 {
+        assert!(
+            attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime)).is_err(),
+            "a reclaimed worktree stays refused"
+        );
+    }
+    assert!(
+        !workdir.exists(),
+        "repeated refusals must not recreate the reclaimed project directory"
+    );
+}
+
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1338,7 +1451,7 @@ fn build_test_agent_with_provider(
     })
 }
 
-fn build_slow_agent(
+pub(crate) fn build_slow_agent(
     session: Option<yi_agent_core::Session>,
     _cwd: &std::path::Path,
     _mode: crate::thread_store::ThreadMode,
@@ -1442,8 +1555,8 @@ pub(crate) struct Harness {
     /// 真实的 `~/.yi-agent/models.json`。字段仅用于持有 tempdir。
     pub(crate) _models_dir: tempfile::TempDir,
     /// 隔离的常驻登记目录,理由同 `board_dir`:board/create|remove 不得写
-    /// 真的 `$HOME/.yi-agent`。字段仅用于持有 tempdir。
-    _resident_dir: tempfile::TempDir,
+    /// 真的 `$HOME/.yi-agent`;驱动器测试还要往里注册插件,故 `pub(crate)`。
+    pub(crate) resident_dir: tempfile::TempDir,
     /// 与主循环**共享**的配对状态:测试经 [`Harness::pairing`] 直接 `redeem`,
     /// 所得设备必须能被同一主循环的 `device/list` 看见。
     pairing: Arc<PairingState>,
@@ -1681,7 +1794,7 @@ impl Harness {
             _index_dir: index_dir,
             board_dir,
             _models_dir: models_dir,
-            _resident_dir: resident_dir,
+            resident_dir,
             pairing,
             hub,
             watchman_calls: calls,
@@ -4695,8 +4808,8 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             title: None,
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -6211,8 +6324,8 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             title: None,
             permission_mode: Default::default(),
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -6321,8 +6434,8 @@ async fn a_turn_while_off_persists_without_credentials() {
             title: None,
             permission_mode: Default::default(),
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -6420,8 +6533,8 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             title: None,
             permission_mode: Default::default(),
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -7792,8 +7905,8 @@ fn write_meta(
     dir: &Path,
     id: &str,
     title: &str,
-    board_project: Option<&str>,
-    card_id: Option<&str>,
+    driver_project: Option<&str>,
+    driver_ref: Option<&str>,
 ) {
     let meta = crate::thread_store::ThreadMeta {
         thread_id: id.into(),
@@ -7804,8 +7917,8 @@ fn write_meta(
         title: Some(title.into()),
         permission_mode: crate::thread_store::ThreadMode::Normal,
         pin_seq: None,
-        board_project: board_project.map(str::to_string),
-        card_id: card_id.map(str::to_string),
+        driver_project: driver_project.map(str::to_string),
+        driver_ref: driver_ref.map(str::to_string),
         model_ref: None,
         reasoning_effort: None,
         tag: None,
@@ -7814,6 +7927,33 @@ fn write_meta(
         last_item_id: None,
         extra_roots: Vec::new(),
         role: None,
+    };
+    crate::thread_store::ThreadStore::new(dir)
+        .create(&meta)
+        .unwrap();
+}
+
+/// 手工落一份 `role:"lead"` 的 meta(复刻真机里误落盘的幽灵组长)。
+fn write_lead_meta(dir: &Path, id: &str) {
+    let meta = crate::thread_store::ThreadMeta {
+        thread_id: id.into(),
+        cwd: dir.to_string_lossy().into(),
+        model: String::new(),
+        created_at: 0,
+        updated_at: 0,
+        title: Some("组长".into()),
+        permission_mode: crate::thread_store::ThreadMode::Normal,
+        pin_seq: None,
+        driver_project: None,
+        driver_ref: None,
+        model_ref: None,
+        reasoning_effort: None,
+        tag: None,
+        preserve_thinking: true,
+        content_epoch: 0,
+        last_item_id: None,
+        extra_roots: Vec::new(),
+        role: Some(crate::thread_store::LEAD_ROLE.to_string()),
     };
     crate::thread_store::ThreadStore::new(dir)
         .create(&meta)
@@ -7868,7 +8008,7 @@ fn git_kanban_worktree(project: &Path, card_id: &str) -> PathBuf {
     path.canonicalize().unwrap()
 }
 
-/// 卡片会话（cwd 在 worktree、board_project=项目）删除：干净且已并入 → 会话与 worktree 一并消失。
+/// 驱动会话（cwd 在 worktree、driver_project=项目）删除：干净且已并入 → 会话与 worktree 一并消失。
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_card_session_also_removes_its_worktree() {
     let project_dir = tempfile::TempDir::new().unwrap();
@@ -8075,7 +8215,7 @@ async fn deleting_a_card_session_reports_a_failed_worktree_removal() {
     h.shutdown().await;
 }
 
-/// 卡片会话(在 worktree、board_project=项目) 折进项目组；worktree 不再顶层成组。
+/// 驱动会话(在 worktree、driver_project=项目) 折进项目组；worktree 不再顶层成组。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_board_thread_folds_into_its_project_group() {
     let project_dir = tempfile::TempDir::new().unwrap();
@@ -8132,8 +8272,8 @@ async fn a_board_thread_folds_into_its_project_group() {
         .iter()
         .find(|t| t["thread_id"] == "t-card")
         .unwrap();
-    assert_eq!(card["card_id"], "card-1", "wire must expose card_id");
-    assert_eq!(card["board_project"], p.as_str());
+    assert_eq!(card["driver_ref"], "card-1", "wire must expose driver_ref");
+    assert_eq!(card["driver_project"], p.as_str());
     h.shutdown().await;
 }
 
@@ -9328,8 +9468,8 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             title: None,
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -9439,8 +9579,8 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             title: None,
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -15613,5 +15753,287 @@ fn log_outcome_handles_every_variant() {
             reason: "ro".into(),
         },
         env,
+
+/// 看板卡片会话所在的 worktree **不是项目**,`thread/lead` 不得为它种组长。
+///
+/// 这正是真机上的幽灵组长来源:卡片会话的 cwd 是 `<项目>/.worktrees/kanban/<slug>`,
+/// 它调 `ask_lead` → 主循环 `resolve_lead_target` → 这条 RPC 的同一个
+/// `ensure_lead_meta`,于是 worktree 里凭空多出一个 `role:"lead"`,侧栏里那个
+/// worktree 就变成一个带组长的顶层项目组。真机数据里已有 9 例。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_lead_refuses_to_create_a_lead_in_a_card_worktree() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = git_project(&dir.path().join("proj"));
+    let wt = git_kanban_worktree(&project, "card-1");
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let v = rpc(
+        &mut h,
+        5,
+        "thread/lead",
+        serde_json::json!({ "cwd": wt.to_string_lossy() }),
+    )
+    .await;
+    assert!(
+        v.get("error").is_some(),
+        "a card worktree has no project to lead; the call must be refused: {v}"
+    );
+    assert!(
+        crate::thread_store::ThreadStore::new(&wt)
+            .find_lead()
+            .unwrap()
+            .is_none(),
+        "nothing may be persisted inside the card worktree"
+    );
+
+    // 项目根照旧:拒绝的是路径,不是功能。
+    let ok = rpc(
+        &mut h,
+        6,
+        "thread/lead",
+        serde_json::json!({ "cwd": project.to_string_lossy() }),
+    )
+    .await;
+    assert!(
+        ok["result"]["thread_id"].as_str().is_some(),
+        "a real project still gets its lead: {ok}"
+    );
+
+    h.shutdown().await;
+}
+
+/// `listAll` 不得给「只含卡片会话的 worktree」懒创建组长,也不得把 worktree 里
+/// 的假组长当作组长暴露出去。
+///
+/// 两条懒创建/暴露路径都必须与 `find_lead` 同口径,否则 worktree 会在侧栏里
+/// 顶层成组、并多出一条「组长」行——正是用户报的现象。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_never_treats_a_card_worktree_as_a_project_with_a_lead() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = git_project(&dir.path().join("proj"));
+    let wt = git_kanban_worktree(&project, "card-1");
+    let p = project.to_string_lossy().to_string();
+    let w = wt.to_string_lossy().to_string();
+    write_meta(&wt, "t-card", "看板 · card-1", Some(&p), Some("card-1"));
+    // 复刻真机落盘状态:worktree 里还躺着一个幽灵组长(`role:"lead"`,
+    // `driver_project: None`)。它必须既不顶层成组、也不暴露为组长。
+    write_lead_meta(&wt, "t-phantom-lead");
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    // worktree 进索引 = 卡片会话落盘后的样子;项目根也进索引。
+    add_workspace(&mut h, 11, &w).await;
+    add_workspace(&mut h, 12, &p).await;
+
+    let all = list_all(&mut h).await;
+    let groups = all["result"]["groups"].as_array().unwrap();
+    assert!(
+        !groups.iter().any(|g| g["workspace"] == w.as_str()),
+        "the card worktree must not become a top-level group: {all}"
+    );
+
+    let entries: Vec<serde_json::Value> = groups
+        .iter()
+        .flat_map(|g| g["threads"].as_array().cloned().unwrap_or_default())
+        .collect();
+    // 只有**卡片 worktree 里**的条目不许被暴露为组长:项目根自己那个组长
+    // (listAll 为它懒创建,合法)照旧带 `role:"lead"`。
+    assert!(
+        !entries.iter().any(|t| {
+            t["role"] == serde_json::json!("lead") && t["cwd"] == serde_json::json!(w)
+        }),
+        "the card worktree must not expose a lead row: {all}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|t| t["thread_id"] == serde_json::json!("t-phantom-lead")),
+        "the phantom lead is not a project's session and must not be listed: {all}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 卡片会话（项目键落在 `.worktrees/kanban/` 下）不该拿到 `ask_lead`:它没有组长,
+/// 注册了只会投进空邮箱,并在主循环里造一个假组长。判定由装配期传入的项目键决定。
+#[test]
+fn a_card_session_does_not_get_ask_lead() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    // 一个真实的卡片会话项目键:<worktree>/.yi-agent。
+    let card_key = repo
+        .path()
+        .join(".worktrees/kanban/card-1")
+        .join(".yi-agent")
+        .display()
+        .to_string();
+    let names = build_runtime_tooling(
+        &cfg,
+        &root,
+        "thread-card",
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        card_key,
+        crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
+    )
+    .expect("tooling")
+    .registry
+    .names();
+    assert!(
+        !names.contains(&"ask_lead".to_string()),
+        "a card session has no lead to ask, got {names:?}"
+    );
+
+    // 普通会话照旧有 `ask_lead`:排除的是卡片会话,不是功能。
+    let names = build_runtime_tooling(
+        &cfg,
+        &root,
+        "thread-plain",
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        repo.path().join(".yi-agent").display().to_string(),
+        crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
+    )
+    .expect("tooling")
+    .registry
+    .names();
+    assert!(
+        names.contains(&"ask_lead".to_string()),
+        "a plain session keeps ask_lead, got {names:?}"
+    );
+}
+
+/// 组长**不该**拿到 `ask_lead`:它自己就是那个收件人,投递等于自问自答。
+///
+/// 根因:装配期只排除了卡片 worktree(见上一条测试),而组长的项目键就是它自己
+/// 的 cwd/项目根,于是它也被注册了 `ask_lead`。组长调它时,主循环的
+/// `resolve_lead_target(project_key)` 反查出来的正是**它自己**(`find_lead` 返回
+/// 该组长),消息便投回本 thread —— 一个自环:单向模式下每一轮都往自己信箱里塞
+/// 一条 `[来自会话 <自己>]`,阻塞模式下则登记一个只有自己才能回填的 request_id,
+/// 一路上无人应答、只能等满 120s 超时。正常实现里组长要影响自己直接写就行,不
+/// 需要、也不该有这个工具。
+///
+/// 判定复用**唯一权威** `lead_memory::is_lead_thread`(读落盘的 `ThreadMeta.role`),
+/// 与同函数内 lead_memory 的注册同源;不靠标题/cwd/名字猜。
+#[test]
+fn the_lead_does_not_get_ask_lead() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+    let project_root = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    // 正臂的组长走生产的落盘路径(`ensure_lead_meta`),不手搓一个「像组长」的形状。
+    let store = crate::thread_store::ThreadStore::new(&project_root);
+    let (lead, _created) = crate::lead::ensure_lead_meta(&store, &project_root).expect("lead meta");
+    assert_eq!(
+        lead.role.as_deref(),
+        Some(crate::thread_store::LEAD_ROLE),
+        "the production lead path must persist the role"
+    );
+
+    let build = |thread_id: &str| {
+        build_runtime_tooling(
+            &cfg,
+            &root,
+            thread_id,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
+            project_root.join(".yi-agent").display().to_string(),
+            crate::lead::LeadInbox::new(),
+            crate::lead::LeadReplies::new(),
+        )
+        .expect("tooling")
+    };
+
+    let lead_names = build(&lead.thread_id).registry.names();
+    assert!(
+        !lead_names.contains(&"ask_lead".to_string()),
+        "the lead is its own recipient and must not ask itself, got {lead_names:?}"
+    );
+    // 非空 witness:「看不到」必须是真的缺席,而不是整个 registry 空掉——组长
+    // 照旧拿得到自己该有的东西(委派工具与账本)。
+    assert!(
+        lead_names.contains(&"spawn_agent".to_string()),
+        "the lead still gets the shared tools, got {lead_names:?}"
+    );
+    assert!(
+        lead_names.contains(&"lead_remember".to_string()),
+        "the lead still gets its ledger, got {lead_names:?}"
+    );
+
+    // 负臂:落过盘的普通会话照旧有 `ask_lead`——排除的是组长,不是功能。
+    let plain = crate::thread_store::ThreadMeta {
+        thread_id: "thread-plain".to_string(),
+        cwd: project_root.display().to_string(),
+        model: String::new(),
+        created_at: 1,
+        updated_at: 1,
+        title: Some("普通会话".to_string()),
+        permission_mode: crate::thread_store::ThreadMode::Normal,
+        pin_seq: None,
+        driver_project: None,
+        driver_ref: None,
+        model_ref: None,
+        reasoning_effort: None,
+        tag: None,
+        preserve_thinking: true,
+        extra_roots: Vec::new(),
+        role: None,
+        content_epoch: 0,
+        last_item_id: None,
+    };
+    store.create(&plain).expect("a plain meta must persist");
+    let plain_names = build("thread-plain").registry.names();
+    assert!(
+        plain_names.contains(&"ask_lead".to_string()),
+        "a plain session keeps ask_lead, got {plain_names:?}"
     );
 }

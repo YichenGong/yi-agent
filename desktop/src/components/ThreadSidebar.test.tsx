@@ -778,7 +778,7 @@ describe("ThreadSidebar 看板", () => {
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -800,7 +800,7 @@ describe("ThreadSidebar 看板", () => {
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -827,7 +827,7 @@ describe("ThreadSidebar 看板", () => {
         workspace: "/proj",
         exists: true,
         threads: [
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -1195,7 +1195,7 @@ describe("ThreadSidebar 搜索", () => {
         workspace: "/proj",
         exists: true,
         threads: [
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -1304,7 +1304,7 @@ describe("ThreadSidebar 搜索", () => {
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];

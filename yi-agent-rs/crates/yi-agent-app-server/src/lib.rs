@@ -2,7 +2,6 @@
 
 pub mod attachments;
 pub mod broadcast;
-pub(crate) mod card_scheduler;
 pub mod device_store;
 pub(crate) mod git_diff;
 pub mod git_diff_tool;
@@ -18,6 +17,7 @@ pub mod protocol;
 pub(crate) mod rpc;
 pub mod server;
 pub mod session;
+pub(crate) mod session_driver;
 pub mod settings_store;
 pub mod skill_rpc;
 /// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。

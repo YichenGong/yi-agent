@@ -12,6 +12,7 @@
   ],
   "switch_key": "superpowers_kanban",
   "stop_when_disabled": false,
+  "session_driver": true,
   "restart_backoff_ms": 1000,
   "restart_backoff_max_ms": 30000,
   "query_socket": "{state_dir}/superpowers-kanban.sock"

@@ -51,12 +51,18 @@ pub struct ThreadMeta {
     /// 旧 meta 缺字段时默认 `None`。
     #[serde(default)]
     pub pin_seq: Option<i64>,
-    /// 该会话由看板创建时，它所属的项目根（绝对路径，canonical）。None = 普通会话。
-    #[serde(default)]
-    pub board_project: Option<String>,
-    /// 该会话对应的看板卡 id。None = 普通会话。
-    #[serde(default)]
-    pub card_id: Option<String>,
+    /// 被驱动的会话所属的项目根（绝对路径，canonical）。None = 普通会话。
+    ///
+    /// 字段名通用化自 `board_project`（被动方不再假定「谁」在驱动）。旧 meta 写的
+    /// 是旧键，`alias` 让它们照样读得进来（零迁移：不写盘、不重命名文件）。
+    #[serde(default, alias = "board_project")]
+    pub driver_project: Option<String>,
+    /// 驱动方交给本会话的**不透明**句柄（宿主不解释其含义，只在 worktree 判定时按
+    /// 既有约定使用）。None = 普通会话。
+    ///
+    /// 字段名通用化自 `card_id`；旧键经 `alias` 兼容读取（零迁移，理由同上）。
+    #[serde(default, alias = "card_id")]
+    pub driver_ref: Option<String>,
     /// 会话模型覆盖：清单里的显示名。None = 跟随全局默认模型。
     /// 与 `model` 的区别：`model` 是**当前生效的 model 串**（显示用），
     /// `model_ref` 是用户在清单里选中的**显示名**（选择用）。
@@ -107,6 +113,42 @@ pub struct ThreadMeta {
 /// 的缺省语义必须为「保留」。
 fn default_true() -> bool {
     true
+}
+
+/// 看板卡片 worktree 的**约定落点**:`<vcs 根>/.worktrees/kanban/<slug>`。
+///
+/// 卡片会话的 cwd 就是这里(插件 `worktree::worktree_path` 与宿主
+/// `worktree_reclaim::decide` 用的是同一条路径)。这类目录**不是一个项目**:
+/// 它没有组长,也不该出现在侧栏的顶层目录组里。
+///
+/// 为什么按「路径里含 `.worktrees/kanban` 这一段」判,而不是按 meta 的
+/// `board_project`/`card_id`:判定要能作用于**任意**一条 meta,包括真机里已经
+/// 落错的那些幽灵组长(`role:"lead"` 且 `board_project: None`)——它们只有路径
+/// 这条线索。反过来,一个恰好带 `card_id` 的会话若 cwd 不在该约定之下,便不是
+/// 卡片 worktree,照旧当普通会话。
+pub fn is_card_worktree(cwd: &Path) -> bool {
+    let mut saw_worktrees = false;
+    for part in cwd.components() {
+        let std::path::Component::Normal(part) = part else {
+            continue;
+        };
+        let part = part.to_string_lossy();
+        if part == "kanban" && saw_worktrees {
+            return true;
+        }
+        saw_worktrees = part == ".worktrees";
+    }
+    false
+}
+
+/// 一条 meta 是否是**合法**组长:带组长角色,且不在卡片 worktree 里。
+///
+/// 卡片 worktree 不是项目,那里的 `role:"lead"` 只可能是误落盘(真机已有 9 例:
+/// 卡片会话 `ask_lead` → `resolve_lead_target` 懒创建)。把它当作非法,是为了让
+/// 「谁是组长」在这一个函数里只有一种答案:`find_lead`、wire 上的 `role`、
+/// `is_lead_thread`、`listAll` 的分组全部引用它。
+pub fn is_lead_meta(meta: &ThreadMeta) -> bool {
+    meta.role.as_deref() == Some(LEAD_ROLE) && !is_card_worktree(Path::new(&meta.cwd))
 }
 
 /// 一次 turn 的 token 用量。
@@ -380,13 +422,12 @@ impl ThreadStore {
     ///
     /// 取「最早创建」而非「最新」,是为了让懒创建幂等:并发/重复调用无论如何
     /// 都收敛到同一个组长,而不是每次挑一个不同的。
+    ///
+    /// 只认**合法**组长(见 [`is_lead_meta`]):卡片 worktree 里那份 `role:"lead"`
+    /// 是假组长,必须忽略,否则该 worktree 会在侧栏里变成带组长的顶层项目组。
     pub fn find_lead(&self) -> io::Result<Option<ThreadMeta>> {
-        let mut leads: Vec<ThreadMeta> = self
-            .list()?
-            .into_iter()
-            .filter(|meta| meta.role.as_deref() == Some(LEAD_ROLE))
-            .collect();
-        leads.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        let mut leads: Vec<ThreadMeta> = self.list()?.into_iter().filter(is_lead_meta).collect();
+        leads.sort_by_key(|a| a.created_at);
         Ok(leads.into_iter().next())
     }
 
@@ -891,8 +932,8 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         title: first_user_text(messages),
         permission_mode: ThreadMode::Normal,
         pin_seq: None,
-        board_project: None,
-        card_id: None,
+        driver_project: None,
+        driver_ref: None,
         model_ref: None,
         reasoning_effort: None,
         tag: None,
@@ -926,8 +967,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -1676,8 +1717,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -2037,15 +2078,15 @@ mod tests {
         );
     }
     #[test]
-    fn a_meta_without_board_fields_defaults_to_none() {
+    fn a_meta_without_driver_fields_defaults_to_none() {
         let json = r#"{"thread_id":"t1","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
         let meta: ThreadMeta = serde_json::from_str(json).unwrap();
-        assert_eq!(meta.board_project, None, "旧 meta 缺字段必须回 None");
-        assert_eq!(meta.card_id, None);
+        assert_eq!(meta.driver_project, None, "旧 meta 缺字段必须回 None");
+        assert_eq!(meta.driver_ref, None);
     }
 
     #[test]
-    fn board_fields_round_trip() {
+    fn driver_fields_round_trip() {
         let meta = ThreadMeta {
             thread_id: "t1".into(),
             cwd: "/w".into(),
@@ -2055,8 +2096,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: Some("/proj".into()),
-            card_id: Some("c1".into()),
+            driver_project: Some("/proj".into()),
+            driver_ref: Some("c1".into()),
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -2068,8 +2109,61 @@ mod tests {
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.board_project.as_deref(), Some("/proj"));
-        assert_eq!(back.card_id.as_deref(), Some("c1"));
+        assert_eq!(back.driver_project.as_deref(), Some("/proj"));
+        assert_eq!(back.driver_ref.as_deref(), Some("c1"));
+    }
+
+    /// 字段名通用化是**零迁移**的:磁盘上按旧键(`board_project`/`card_id`)写的 meta
+    /// 仍必须读进新字段——否则升级后所有既有驱动会话都会失去归属,侧栏归组与
+    /// worktree 判定一并退化。`#[serde(alias = …)]` 是这条保证的唯一实现。
+    #[test]
+    fn legacy_meta_written_with_the_old_keys_loads_into_the_new_fields() {
+        let json = r#"{"thread_id":"t1","cwd":"/w","model":"m","created_at":1,
+            "updated_at":2,"title":null,"board_project":"/proj","card_id":"c1"}"#;
+        let meta: ThreadMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            meta.driver_project.as_deref(),
+            Some("/proj"),
+            "旧键 board_project 必须读进 driver_project"
+        );
+        assert_eq!(
+            meta.driver_ref.as_deref(),
+            Some("c1"),
+            "旧键 card_id 必须读进 driver_ref"
+        );
+    }
+
+    /// 新键是**唯一**的写出形态:不再双写旧键(单一名字,不留两种盘上表示)。
+    #[test]
+    fn the_new_keys_are_the_only_ones_written() {
+        let meta = ThreadMeta {
+            thread_id: "t1".into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            created_at: 1,
+            updated_at: 2,
+            title: None,
+            permission_mode: ThreadMode::Normal,
+            pin_seq: None,
+            driver_project: Some("/proj".into()),
+            driver_ref: Some("c1".into()),
+            model_ref: None,
+            reasoning_effort: None,
+            tag: None,
+            preserve_thinking: true,
+            extra_roots: Vec::new(),
+            role: None,
+            content_epoch: 0,
+            last_item_id: None,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert_eq!(value["driver_project"], "/proj");
+        assert_eq!(value["driver_ref"], "c1");
+        assert!(
+            value.get("board_project").is_none() && value.get("card_id").is_none(),
+            "旧键不得再被写出(alias 只用于读): {value}"
+        );
     }
 
     #[test]
@@ -2125,8 +2219,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -2249,8 +2343,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -2286,8 +2380,8 @@ mod tests {
             "title": null,
             "permission_mode": "normal",
             "pin_seq": null,
-            "board_project": null,
-            "card_id": null,
+            "driver_project": null,
+            "driver_ref": null,
             "model_ref": null,
             "reasoning_effort": null,
             "preserve_thinking": true
@@ -2326,8 +2420,8 @@ mod tests {
                     title: None,
                     permission_mode: ThreadMode::Normal,
                     pin_seq: None,
-                    board_project: None,
-                    card_id: None,
+                    driver_project: None,
+                    driver_ref: None,
                     model_ref: None,
                     reasoning_effort: None,
                     tag: None,
@@ -2371,6 +2465,53 @@ mod tests {
             real.join(".yi-agent").display().to_string()
         );
         assert_eq!(store.project_key(), store.project_key());
+    }
+
+    /// 看板 worktree 的路径必须被认出来:`<vcs 根>/.worktrees/kanban/<slug>`。
+    /// 排除的是这一条**约定路径**,不是「任何带 worktree 字样的目录」。
+    #[test]
+    fn card_worktree_paths_are_recognised() {
+        assert!(is_card_worktree(Path::new("/p/.worktrees/kanban/card-1")));
+        assert!(is_card_worktree(Path::new("/p/.worktrees/kanban")));
+        assert!(!is_card_worktree(Path::new("/p")));
+        assert!(!is_card_worktree(Path::new("/p/.worktrees/other/x")));
+        assert!(!is_card_worktree(Path::new("/p/kanban/x")));
+    }
+
+    /// 看板 worktree 不是「项目」:它里面**没有**组长。
+    ///
+    /// 一条落在那里的 `role:"lead"` meta 是假组长(真机数据里已有 9 例:
+    /// 卡片会话 `ask_lead` → `resolve_lead_target` 在 worktree 里懒创建)。
+    /// `find_lead` 必须无视它,否则该 worktree 会在侧栏里变成一个带组长的
+    /// 顶层项目组。
+    #[test]
+    fn a_kanban_worktree_never_hosts_a_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join(".worktrees/kanban/card-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = ThreadStore::new(&worktree);
+        let mut phantom = meta("thread-lead-phantom");
+        phantom.cwd = worktree.display().to_string();
+        phantom.role = Some(LEAD_ROLE.to_string());
+        store.create(&phantom).unwrap();
+
+        assert!(
+            store.find_lead().unwrap().is_none(),
+            "a card worktree has no lead, even when a lead meta sits there"
+        );
+
+        // 同一个 role 落在普通项目目录里仍被认成组长:排除的是**路径**,不是 role。
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_store = ThreadStore::new(&project);
+        let mut real = meta("thread-lead-real");
+        real.cwd = project.display().to_string();
+        real.role = Some(LEAD_ROLE.to_string());
+        project_store.create(&real).unwrap();
+        assert_eq!(
+            project_store.find_lead().unwrap().unwrap().thread_id,
+            "thread-lead-real"
+        );
     }
 
     /// 旧 meta（本字段出现前落盘的文件）必须读成 epoch 0 / last_item_id None，
@@ -2481,5 +2622,85 @@ mod tests {
         );
         s.set_last_item_id("thread-a", None).unwrap();
         assert_eq!(s.load("thread-a").unwrap().unwrap().meta.last_item_id, None);
+    }
+
+    /// The user's requirement: after a crash, everything produced must still be
+    /// visible. A checkpoint written mid-turn must survive `load` intact and be
+    /// promotable into the authoritative log.
+    ///
+    /// This pins existing behaviour; it does not ask for any change. It exists so
+    /// a future "optimisation" cannot silently thin the checkpoint.
+    #[test]
+    fn a_crash_mid_turn_loses_none_of_the_completed_items() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-crash")).unwrap();
+
+        // A turn in progress: the opening prompt plus N completed items.
+        // Built inline like the existing partial tests do — there is no
+        // `assistant_item` helper in this module.
+        let mut items = vec![user_item("user-turn-x", "do the thing")];
+        for i in 0..50 {
+            items.push(crate::protocol::Item::AgentMessage {
+                id: format!("item-turn-x-{i}"),
+                text: format!("step {i}"),
+            });
+        }
+        store
+            .write_partial(
+                "thread-crash",
+                &PartialTurn {
+                    turn_id: "turn-x".into(),
+                    items: items.clone(),
+                    messages: Vec::new(),
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        // Crash here: nothing else is written. Resume must see everything.
+        let loaded = store.load("thread-crash").unwrap().unwrap();
+        assert!(loaded.pending_turn, "an uncommitted turn must be reported");
+        assert_eq!(
+            loaded.items.len(),
+            items.len(),
+            "a crash must not lose completed items"
+        );
+
+        // And promoting it must make the content authoritative, not drop it.
+        assert!(store.promote_partial("thread-crash").unwrap());
+        let after = store.load("thread-crash").unwrap().unwrap();
+        assert!(!after.pending_turn);
+        assert_eq!(after.items.len(), items.len());
+    }
+
+    /// The driver checkpoints the opening prompt before the model is even called
+    /// (`server.rs` "turn 开始就把提问落进 checkpoint"). A crash immediately
+    /// after that must still show the question the user typed.
+    #[test]
+    fn the_opening_prompt_survives_an_immediate_crash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-early")).unwrap();
+
+        store
+            .write_partial(
+                "thread-early",
+                &PartialTurn {
+                    turn_id: "turn-e".into(),
+                    items: vec![user_item("user-turn-e", "did you save me?")],
+                    messages: Vec::new(),
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        let loaded = store.load("thread-early").unwrap().unwrap();
+        assert_eq!(loaded.items.len(), 1);
+        assert_eq!(
+            crate::server::item_id(&loaded.items[0]),
+            Some("user-turn-e"),
+            "the opening prompt must be recoverable"
+        );
     }
 }

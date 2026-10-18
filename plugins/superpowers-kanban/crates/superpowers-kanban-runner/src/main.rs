@@ -28,7 +28,8 @@ use superpowers_kanban_runner::service::BoardService;
 #[derive(Debug)]
 struct Args {
     /// supervisor 清单仍传 `--runtime-dir`，所以 CLI 必须继续接受它；但插件已不再
-    /// 直连 daemon 建会话（改由宿主调度器驱动 `board.*`），此字段暂无用途。
+    /// 直连 daemon 建会话（改由宿主的通用驱动器每 tick 问插件 `driver/next`），
+    /// 此字段暂无用途。
     #[allow(dead_code)]
     runtime_dir: PathBuf,
     state_dir: PathBuf,
@@ -901,8 +902,9 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 
 /// 周期性推进队列，直到进程被杀。
 ///
-/// 这里**不再创建会话**：认领（`board.next_launch`）、起会话、回写终态都由宿主
-/// 调度器负责（plan Task 5/6）。插件只负责消费 inbox 把卡排进队列，并落盘。
+/// 这里**不再创建会话**：宿主每 tick 问一次 `driver/next`，由插件在 `driver_step`
+/// 里认领队首卡并交出通用动作（起会话 / 追加一轮），宿主只负责执行。插件在这里
+/// 只消费 inbox 把卡排进队列、收敛已并入的分支、归档终点卡，并落盘。
 fn run_daemon(args: Args) {
     let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
     // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到锁就在有界预算内
@@ -966,7 +968,8 @@ fn run_daemon(args: Args) {
         }
 
         // 插件在这里只做一件事：把 inbox 里的投递排进共享看板并落盘。认领与
-        // 会话推进全部交给宿主调度器经 `board.*` 驱动。
+        // 会话推进都由宿主每 tick 经 `driver/next` 问出来，插件在 `driver_step`
+        // 里决定——宿主不认看板，也不调任何 `board.*` 方法。
         for outcome in service.consume_inbox(chrono::Local::now()) {
             match outcome.result {
                 Ok(()) => eprintln!("superpowers-kanban: enqueued {}", outcome.id),
@@ -983,15 +986,9 @@ fn run_daemon(args: Args) {
             );
         }
 
-        // 合并与实现共用一个 tick：消费投递后，若本项目没有合并在跑，就做一张。
-        match service.merge_next() {
-            Ok(Some(claim)) => eprintln!(
-                "superpowers-kanban: merged {} ({:?})",
-                claim.card_id, claim.outcome
-            ),
-            Ok(None) => {}
-            Err(error) => eprintln!("superpowers-kanban: merge failed: {error}"),
-        }
+        // 合并轮不再由 runner 认领跑 git：它已是**会话里的一回合**——插件经
+        // `driver_step` 派发、模型动手、插件用 git 复核出判词（见 service 的
+        // `driver_step` 与 `merge_finish`）。这里只留收敛与归档。
 
         // 归档：真终止态过宽限期自动隐藏；awaiting_merge/needs_you 永不自动。
         let swept = service.archive_due(chrono::Local::now());

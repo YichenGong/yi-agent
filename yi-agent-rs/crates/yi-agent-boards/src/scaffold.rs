@@ -22,6 +22,11 @@ const SWITCH_KEY: &str = "superpowers_kanban";
 /// way to read the switch and turn it back on. The plugin gates its own work on
 /// the switch instead (see `run_daemon`), so off still means "stop advancing".
 ///
+/// `session_driver` is `true`: the host discovers the plugins it should ask for
+/// the next session action only through this generic field (`driver_plugins`
+/// filters on it). A manifest without it is never asked, so the board stalls
+/// silently -- the plugin would be installed and running yet drive nothing.
+///
 /// The manifest does not pass `--interval-secs`: the plugin reads its tick
 /// interval from the plugin settings each tick, so a config change takes effect
 /// without a restart, and the plugin's own default bounds how long an orphaned
@@ -41,6 +46,7 @@ const MANIFEST_TEMPLATE: &str = r#"{
   ],
   "switch_key": "superpowers_kanban",
   "stop_when_disabled": false,
+  "session_driver": true,
   "restart_backoff_ms": 1000,
   "restart_backoff_max_ms": 30000,
   "query_socket": "{state_dir}/superpowers-kanban.sock"
@@ -172,6 +178,50 @@ mod tests {
         assert!(
             Path::new(command).is_absolute(),
             "命令必须绝对路径：{command}"
+        );
+    }
+
+    /// The generated manifest must declare the plugin a session driver.
+    ///
+    /// The host discovers drivers only through this generic field
+    /// (`driver_plugins` filters on `manifest.session_driver`). Without it the
+    /// tick finds no plugin, calls nobody, and the whole board stalls silently —
+    /// so this is the last piece that makes the driver actually run.
+    #[test]
+    fn the_generated_manifest_declares_session_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let plugin = dir.path().join("bin").join("superpowers-kanban"); // 桩路径
+        install_manifest(dir.path(), &plugin).unwrap();
+        let path = dir
+            .path()
+            .join(".yi-agent/supervisors/superpowers-kanban.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            value["session_driver"], true,
+            "生成的清单必须声明 session_driver:true，否则宿主发现环找不到驱动插件、\
+             一拍都不会问"
+        );
+    }
+
+    /// The plugin's own shipped manifest is a second write path for the same
+    /// file, so it must declare the same field.
+    ///
+    /// Read at runtime (not `include_str!`): the plugin can be installed or
+    /// removed on its own, and a compile-time dependency would break the host's
+    /// build. A missing directory means "no plugin checkout", not a failure —
+    /// mirroring the cross-workspace guard in `manifest.rs`'s socket contract.
+    #[test]
+    fn the_shipped_manifest_declares_session_driver_too() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../plugins/superpowers-kanban/supervisors/superpowers-kanban.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return; // 插件目录不在：无从对照。
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["session_driver"], true,
+            "插件自带的清单也必须声明 session_driver:true（它是同一份文件的另一条写入路径）"
         );
     }
 

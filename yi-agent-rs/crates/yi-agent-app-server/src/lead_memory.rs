@@ -29,10 +29,11 @@ pub fn memory_path(project_root: &Path) -> PathBuf {
 
 /// 该 thread 是不是组长。
 ///
-/// **唯一权威**是落盘的 `ThreadMeta.role == Some(LEAD_ROLE)`:标题、cwd、名字都能
-/// 被人为凑出组长的样子,而 role 只有 `lead::ensure_lead_meta` 会写。读不到
-/// (`load` 报错 / 没有 meta)一律视为非组长——装配期放行一个非组长去写项目账本,
-/// 比拒绝一个真组长严重得多,故缺证据时不授予。
+/// **唯一权威**是落盘的 `ThreadMeta.role == Some(LEAD_ROLE)`,且不在卡片 worktree
+/// 里(见 `ThreadStore::is_lead_meta`):标题、cwd、名字都能被人为凑出组长的样子,
+/// 而 role 只有 `lead::ensure_lead_meta` 会写;卡片 worktree 里的那份则是误落盘的
+/// 假组长(真机已有 9 例)。读不到(`load` 报错 / 没有 meta)一律视为非组长——
+/// 装配期放行一个非组长去写项目账本,比拒绝一个真组长严重得多,故缺证据时不授予。
 ///
 /// 组长 meta 是**懒创建**的:刚落盘、还没跑过一轮的组长没有 `.jsonl`,但
 /// `ThreadStore::load` 对 meta-only 也返回 `Some`,所以新建的组长照样能被认出。
@@ -41,7 +42,7 @@ pub fn is_lead_thread(store: &crate::thread_store::ThreadStore, thread_id: &str)
         .load(thread_id)
         .ok()
         .flatten()
-        .map(|l| l.meta.role.as_deref() == Some(crate::thread_store::LEAD_ROLE))
+        .map(|l| crate::thread_store::is_lead_meta(&l.meta))
         .unwrap_or(false)
 }
 
@@ -457,8 +458,8 @@ mod tests {
             title: None,
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -512,5 +513,23 @@ mod tests {
         let dir = temp_project();
         let store = crate::thread_store::ThreadStore::new(dir.path());
         assert!(!is_lead_thread(&store, "../escape"));
+    }
+
+    /// 看板 worktree 里的 `role:"lead"` 不是组长——判定必须与 `find_lead` 同口径,
+    /// 否则一个假会长到项目账本写权限(真机数据里已有 9 个这样的假组长)。
+    #[test]
+    fn a_lead_in_a_card_worktree_is_not_the_lead() {
+        let dir = temp_project();
+        let worktree = dir.path().join(".worktrees/kanban/card-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = crate::thread_store::ThreadStore::new(&worktree);
+        let mut phantom = lead_test_meta("lead-1", Some(crate::thread_store::LEAD_ROLE));
+        phantom.cwd = worktree.display().to_string();
+        store.create(&phantom).expect("create");
+
+        assert!(
+            !is_lead_thread(&store, "lead-1"),
+            "a card worktree has no lead, so its ledger tools must stay unregistered"
+        );
     }
 }

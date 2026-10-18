@@ -78,7 +78,7 @@ pub(crate) async fn handle(
             // 分组两段式,与抽取前逐字等价,只多一层「归属优先」的折拢:
             // ① 按索引顺序(最近在前)为**每个**目录建组——含失效目录
             //   (exists:false、threads 空,不深扫),普通会话留在本目录组;
-            // ② 带 `board_project` 的卡片会话折进它所属的项目组(项目可不在
+            // ② 带 `driver_project` 的驱动会话折进它所属的项目组(项目可不在
             //   索引里,则合成一组);只含卡片会话的目录(卡片 worktree)
             //   第一段被抑制,不再顶层成组。
             // **不动索引**:目录仍留在 workspaces 里,冷会话定位靠它。
@@ -114,7 +114,7 @@ pub(crate) async fn handle(
                 // 任何条目的项目也有一个组长入口。失败只记日志——列表查询
                 // 不得因单个目录不可写而整体失败。
                 //
-                // 为什么限定「没有任何会话」:组长 meta 的 `board_project`
+                // 为什么限定「没有任何会话」:组长 meta 的 `driver_project`
                 // 是 `None`,一旦写进已有会话的目录,它就会被算作「该目录
                 // 自己的会话」,从而①把「每个目录组恰好一个会话」变成两个、
                 // ②让只含卡片会话的 worktree 不再被抑制成顶层组。两者都是
@@ -123,7 +123,10 @@ pub(crate) async fn handle(
                 // (`thread/lead`)或某个会话给组长留言(`resolve_lead_target`)。
                 //
                 // 读失败的目录(`read_ok == false`)不写:读不到就不该有副作用。
-                if read_ok && metas.is_empty() {
+                // 卡片 worktree(`.worktrees/kanban/<slug>`)不是项目:它没有组长,
+                // 绝不能在这里被种一个——真机上 9 个幽灵组长正是这条懒创建路径
+                // (经卡片会话 `ask_lead` → `resolve_lead_target`)落下的。
+                if read_ok && metas.is_empty() && !crate::thread_store::is_card_worktree(path) {
                     if let Err(e) = crate::lead::ensure_lead_meta(
                         &crate::thread_store::ThreadStore::new(path),
                         path,
@@ -139,10 +142,18 @@ pub(crate) async fn handle(
                         metas = fresh;
                     }
                 }
-                let own: Vec<_> = metas.iter().filter(|m| m.board_project.is_none()).collect();
+                let own: Vec<_> = metas
+                    .iter()
+                    .filter(|m| m.driver_project.is_none())
+                    .collect();
+                // 卡片 worktree(`.worktrees/kanban/<slug>`)不是项目:它永不顶层成组,
+                // 也不贡献「自己的会话」。真机上这类目录里还躺着一个误落盘的幽灵组长
+                // (`role:"lead"`,`driver_project: None`)——若照旧把它算进 `own`,该
+                // worktree 就会在侧栏里变成一个带「组长」行的顶层项目组(用户报的现象)。
+                let card_worktree = crate::thread_store::is_card_worktree(path);
                 // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
                 // 否则它只是卡片 worktree,归拢后被抑制。
-                if !own.is_empty() || metas.is_empty() {
+                if !card_worktree && (!own.is_empty() || metas.is_empty()) {
                     for m in own {
                         plain
                             .entry(dir.clone())
@@ -154,9 +165,9 @@ pub(crate) async fn handle(
                     seen.remove(dir);
                     order.retain(|d| d != dir);
                 }
-                // 卡片会话:归入 board_project 指定的组(可为索引外的项目)。
-                for m in metas.iter().filter(|m| m.board_project.is_some()) {
-                    let target = m.board_project.clone().unwrap();
+                // 驱动会话:归入 driver_project 指定的组(可为索引外的项目)。
+                for m in metas.iter().filter(|m| m.driver_project.is_some()) {
+                    let target = m.driver_project.clone().unwrap();
                     if seen.insert(target.clone()) {
                         order.push(target.clone());
                         exists_of.insert(target.clone(), Path::new(&target).is_dir());
@@ -369,12 +380,14 @@ pub(crate) async fn handle(
                     .await?;
                 }
                 Err(e) => {
-                    write_response(
-                        state.hub,
-                        state.client,
-                        err_response(id, RpcError::internal(e.to_string())),
-                    )
-                    .await?;
+                    // 卡片 worktree 之类的「不是项目」是调用方问错了目录(InvalidInput),
+                    // 按参数错误回;真正的 I/O 故障仍是 internal。
+                    let rpc_error = if e.kind() == std::io::ErrorKind::InvalidInput {
+                        RpcError::invalid_params(e.to_string())
+                    } else {
+                        RpcError::internal(e.to_string())
+                    };
+                    write_response(state.hub, state.client, err_response(id, rpc_error)).await?;
                 }
             }
         }
@@ -1441,15 +1454,15 @@ pub(crate) async fn handle(
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             // 卡片会话的 worktree 判定：只读会话自带 meta，不碰插件。
-            // 顺手把 board_project 拷到局部变量：会话文件随后即被删除，
+            // 顺手把 driver_project 拷到局部变量：会话文件随后即被删除，
             // 到执行删除时再 load 只会失败，故必须在此刻留下。
-            let mut board_project: Option<String> = None;
+            let mut driver_project: Option<String> = None;
             let reclaim = match thread_store.load(&thread_id) {
                 Ok(Some(loaded)) => {
-                    board_project = loaded.meta.board_project.clone();
+                    driver_project = loaded.meta.driver_project.clone();
                     crate::worktree_reclaim::decide(
-                        loaded.meta.card_id.as_deref(),
-                        loaded.meta.board_project.as_deref(),
+                        loaded.meta.driver_ref.as_deref(),
+                        loaded.meta.driver_project.as_deref(),
                         Path::new(&loaded.meta.cwd),
                     )
                 }
@@ -1564,7 +1577,7 @@ pub(crate) async fn handle(
             // 拿不到 cwd 也无妨（已落盘的附件由上面 `remove_attachments` 收）。
             state.uploads.drop_thread(&thread_id);
             // 会话文件已摘除：按判定处置 worktree。删除失败只记日志，不阻断会话删除（D9）。
-            // board_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
+            // driver_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
             // 但失败这件事本身必须回报：用户刚被告知该 worktree 会被删掉，此刻会话
             // 已摘除、应用内再也删不掉它，又按 D10 让卡片上的 thread_id 悬空——
             // 若默默失败，worktree 就无声滞留、用户永远看不见。故除宿主日志外，
@@ -1574,7 +1587,7 @@ pub(crate) async fn handle(
                 crate::worktree_reclaim::WorktreeReclaim::Delete { path }
                 | crate::worktree_reclaim::WorktreeReclaim::DestructiveDelete { path, .. },
                 Some(project),
-            ) = (&reclaim, board_project.as_deref())
+            ) = (&reclaim, driver_project.as_deref())
             {
                 if let Err(error) = crate::worktree_reclaim::remove(path, Path::new(project), force)
                 {

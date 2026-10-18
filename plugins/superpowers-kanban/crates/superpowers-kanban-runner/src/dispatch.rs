@@ -191,6 +191,40 @@ pub fn dispatch_with_service(
                 .map_err(|error| format!("could not write {}: {error}", path.display()))?;
             Ok(json!({ "on": on }))
         }
+        "driver/next" => {
+            // 宿主每 tick 拉一拍：给它一份会话空闲快照与上一拍的结果，回至多一个
+            // 通用动作（spec §4.2/§4.3）。参数形状不对时把话说清楚——静默当成空
+            // 一拍会让宿主以为「插件没事可做」而永远推不动。
+            let threads = params
+                .get("threads")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "driver/next needs a `threads` array".to_string())?;
+            let mut snapshot: Vec<(String, bool)> = Vec::with_capacity(threads.len());
+            for thread in threads {
+                let thread_id = thread
+                    .get("thread_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "driver/next threads need a `thread_id`".to_string())?;
+                // 缺 `idle` 当作「不闲」：唯一安全的默认——把忙当闲会让插件对
+                // 一台正在跑的会话下结论。
+                let idle = thread.get("idle").and_then(Value::as_bool).unwrap_or(false);
+                snapshot.push((thread_id.to_string(), idle));
+            }
+            let results: Vec<crate::service::DriverResult> = params
+                .get("results")
+                .map(|value| {
+                    serde_json::from_value(value.clone())
+                        .map_err(|error| format!("driver/next could not read `results`: {error}"))
+                })
+                .transpose()?
+                .unwrap_or_default();
+
+            match service.driver_step(&snapshot, &results)? {
+                Some(action) => Ok(action.to_json()),
+                // 一拍无事可做：契约形状是 `{"action": null}`。
+                None => Ok(json!({ "action": null })),
+            }
+        }
         "board.next_launch" => {
             // 日历上限按当前时刻算；服务内不读时钟，交由这里注入。
             let calendar =
@@ -658,6 +692,234 @@ mod tests {
         assert!(error.contains("unknown card"), "{error}");
     }
 
+    /// 真实的最小 git 仓库（与 `service.rs` 的测试搭台同型）：driver/next 要
+    /// 真建 worktree，喂一个假目录不行。
+    fn project_with_worktree(dir: &Path) -> PathBuf {
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        std::fs::write(dir.join("README.md"), "seed\n").unwrap();
+        std::fs::write(dir.join(".gitignore"), ".yi-agent/\n.worktrees/\n").unwrap();
+        git(&["add", "README.md", ".gitignore"]);
+        git(&[
+            "-c",
+            "user.email=e@e",
+            "-c",
+            "user.name=E",
+            "commit",
+            "-q",
+            "-m",
+            "seed",
+        ]);
+        dir.to_path_buf()
+    }
+
+    /// 隔离的 `BoardService`（lease 落在临时 home 里）：单例服务共用真实 `HOME`
+    /// 的全局名额池，并行跑用例时会互相抢名额、把「有名额」的断言变 flaky。
+    fn service_with_one_card(project: &Path) -> crate::service::BoardService {
+        let state = state_dir(project);
+        std::fs::create_dir_all(&state).unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue(
+            superpowers_kanban_core::card::CardId::new("card-1"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&state.join("board.json"), &board).unwrap();
+        crate::service::BoardService::new(state, project.to_path_buf(), Some(project.join("home")))
+    }
+
+    /// 一拍无事可做（空板）时，契约形状是 `{"action": null}`。
+    #[test]
+    fn driver_next_reports_no_action_as_a_null_action() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        std::fs::create_dir_all(&state).unwrap();
+        let service = crate::service::BoardService::new(
+            state.clone(),
+            project.clone(),
+            Some(project.join("home")),
+        );
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [] }),
+        )
+        .unwrap();
+        assert_eq!(value["action"], Value::Null, "{value}");
+    }
+
+    /// 端到端跨进程契约：一张排队卡 → 恰好一个 `launch`，字段名逐字对齐宿主
+    /// `session_driver::parse_action`（spec §4.3）。
+    #[test]
+    fn driver_next_hands_a_launch_action_in_the_agreed_shape() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [] }),
+        )
+        .unwrap();
+        assert_eq!(value["kind"], "launch", "{value}");
+        assert!(value["action_id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(
+            Path::new(value["workdir"].as_str().unwrap())
+                .join(".git")
+                .exists(),
+            "workdir 是插件建好的 worktree：{value}"
+        );
+        assert_eq!(value["title"], "看板 · a.spec");
+        let objective = value["objective"].as_str().unwrap();
+        assert!(objective.contains("a.plan.md"), "{objective}");
+        assert!(objective.contains("Never merge yourself"), "{objective}");
+        // 宿主不认识看板：动作里没有卡片语义（spec D3）。
+        assert!(value.get("card_id").is_none(), "{value}");
+
+        // 一拍只走一个动作：再问一遍，卡已在 launching，不再交出动作。
+        let again = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [] }),
+        )
+        .unwrap();
+        assert_eq!(again["action"], Value::Null, "{again}");
+    }
+
+    /// 回报的形状就是宿主 `ActionResult` 的序列化：按 `action_id` 认领，
+    /// 带回 `thread_id` → 卡 `running`（D5：映射由插件持有）。
+    #[test]
+    fn driver_next_applies_a_launch_result_by_action_id() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+
+        let launch = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [] }),
+        )
+        .unwrap();
+        let action_id = launch["action_id"].as_str().unwrap().to_string();
+
+        // 下一拍：会话快照里多了一台忙着的会话，并回传上一拍的结果。
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({
+                "threads": [{ "thread_id": "thread-1", "idle": false }],
+                "results": [{ "action_id": action_id, "ok": true, "thread_id": "thread-1" }],
+            }),
+        )
+        .unwrap();
+        assert_eq!(value["action"], Value::Null, "{value}");
+        let listed = service.list();
+        assert_eq!(listed["cards"][0]["state"], "running");
+        assert_eq!(listed["cards"][0]["thread_id"], "thread-1");
+
+        // 重复投递同一条回报（宿主可能重发）：不报错，也不改坏状态。
+        let again = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({
+                "threads": [{ "thread_id": "thread-1", "idle": false }],
+                "results": [{ "action_id": action_id, "ok": true, "thread_id": "thread-1" }],
+            }),
+        )
+        .unwrap();
+        assert_eq!(again["action"], Value::Null, "{again}");
+        assert_eq!(service.list()["cards"][0]["state"], "running");
+    }
+
+    /// 线程对象缺 `idle` 时**按「不闲」处理**：唯一安全的默认——把忙当闲会让
+    /// 插件对一台正在跑的会话下结论（例如把 `running` 卡错判成跑完了）。
+    /// 这里用一张不可能被正确判定的卡来钉住这半边：卡是 `merging`，若缺省被当成
+    /// 空闲，`driver_step` 会走 git 复核把卡收尾；按「不闲」则原样不动。
+    #[test]
+    fn driver_next_treats_a_thread_without_idle_as_busy() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let service = service_with_one_card(&project);
+        let state = state_dir(&project);
+
+        // 让 card-1 走到 `merging`（合并轮进行中）：先把它的 source 分支建出来，
+        // 否则 `merge_request` 会因分支缺失而拒绝。
+        let slug = crate::worktree::slugify(&superpowers_kanban_core::card::CardId::new("card-1"));
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(["branch", &format!("kanban/{slug}")])
+                .status()
+                .unwrap()
+                .success()
+        );
+        service
+            .mark_running("card-1", "thread-1")
+            .expect("card-1 runs");
+        service
+            .mark_terminal("card-1", "awaiting_merge", None)
+            .unwrap();
+        assert!(matches!(
+            service.merge_request("card-1").unwrap(),
+            crate::service::MergeRequest::Granted { .. }
+        ));
+        assert_eq!(service.list()["cards"][0]["state"], "merging");
+
+        // 会话对象**没有** `idle` 字段：只能按「不闲」理解，卡原样留在 merging。
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [{ "thread_id": "thread-1" }], "results": [] }),
+        )
+        .unwrap();
+        assert_eq!(value["action"], Value::Null, "{value}");
+        assert_eq!(
+            service.list()["cards"][0]["state"],
+            "merging",
+            "缺 `idle` 不得被当成空闲（否则会误判一个还在跑的会话）"
+        );
+    }
+
+    /// 缺 `threads` 是调用方的错，必须明确报错而不是静默回一个空拍：
+    /// 静默会让宿主以为「插件没事可做」而永远推不动。
+    #[test]
+    fn driver_next_rejects_a_request_without_threads() {
+        let workdir = tempfile::tempdir().unwrap();
+        let state = state_dir(workdir.path());
+        let error = dispatch_with_global(&state, None, "driver/next", &json!({ "results": [] }))
+            .unwrap_err();
+        assert!(error.contains("threads"), "{error}");
+    }
     #[test]
     fn list_reports_a_prequeued_card_with_its_title() {
         // 本任务产出的另一半契约：`list()` 的每张卡多一个 `title` 字段，
