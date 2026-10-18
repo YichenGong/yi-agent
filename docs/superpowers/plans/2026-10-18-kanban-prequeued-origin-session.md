@@ -746,8 +746,8 @@ Expected: PASS（含新增 2 个测试与既有 bash 测试）。
 在 `lib.rs` 的 `mod tests` 追加：
 
 ```rust
-    #[test]
-    fn the_env_carrying_registration_reaches_the_bash_tool() {
+    #[tokio::test]
+    async fn the_env_carrying_registration_reaches_the_bash_tool() {
         let tmp = tempfile::TempDir::new().unwrap();
         let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
         let controller = SandboxController::new(switch, SandboxMode::WorkspaceWrite, false);
@@ -759,13 +759,24 @@ Expected: PASS（含新增 2 个测试与既有 bash 测试）。
             Vec::new(),
             vec![("YI_AGENT_THREAD_ID".to_string(), "thread-abc".to_string())],
         );
-        // bash 注册成功即可（注入行为由 bash.rs 的单测覆盖）。
-        assert!(registry.get("bash").is_some());
+        // 真实调用一次，证明 env 确实随注册入口一路到达 shell 子进程——
+        // 只断言「bash 被注册」证明不了本函数承诺的那件事。
+        let bash = registry.get("bash").expect("bash is registered");
+        let result = bash
+            .call(serde_json::json!({ "command": "echo $YI_AGENT_THREAD_ID" }))
+            .await;
+        assert!(!result.is_error, "bash failed: {:?}", result.content);
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            assert!(s.contains("thread-abc"), "env must reach the child: {s}");
+        } else {
+            panic!("expected text block");
+        }
     }
 ```
 
 （`ToolRegistry::get` 已存在，见 `yi-agent-core/src/tool.rs:159`；`tmp` 用 `TempDir`
-而非 `tempfile::tempdir()`，与同模块既有测试一致。）
+而非 `tempfile::tempdir()`，与同模块既有测试一致。用 `#[tokio::test]`——同 crate 的
+`bash.rs` 已在用，tokio 的 test macro 可用。）
 
 - [ ] **Step 10: 跑测试确认失败**
 
