@@ -55,6 +55,51 @@ pub fn deliver_merge_card(
     std::fs::rename(&tmp, &path)
 }
 
+/// 提升投递的文件路径：`<state_dir>/inbox/<id>.promote.json`。
+///
+/// 与建卡投递分文件：同一张卡可能在同一 tick 内先建后提，两件事必须能并存。
+pub fn promote_path(state_dir: &Path, id: &str) -> PathBuf {
+    inbox_dir(state_dir).join(format!("{id}.promote.json"))
+}
+
+/// 投递一张预排队卡：`{"kind":"prequeued","id","title"}`。
+pub fn deliver_prequeued_card(state_dir: &Path, id: &str, title: &str) -> std::io::Result<()> {
+    let dir = inbox_dir(state_dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = enqueue_path(state_dir, id);
+    let body = serde_json::json!({ "kind": "prequeued", "id": id, "title": title });
+    let text = serde_json::to_string_pretty(&body).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, &path)
+}
+
+/// 投递一次提升：`{"kind":"promote","id","spec_path","plan_path"[,"title"]}`。
+pub fn deliver_promote_card(
+    state_dir: &Path,
+    id: &str,
+    spec: &str,
+    plan: &str,
+    title: Option<&str>,
+) -> std::io::Result<()> {
+    let dir = inbox_dir(state_dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = promote_path(state_dir, id);
+    let mut body = serde_json::json!({
+        "kind": "promote",
+        "id": id,
+        "spec_path": spec,
+        "plan_path": plan,
+    });
+    if let Some(title) = title {
+        body["title"] = serde_json::Value::String(title.to_string());
+    }
+    let text = serde_json::to_string_pretty(&body).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, &path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +161,38 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join("inbox/merge-a.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["origin_card"], "card-1");
+    }
+
+    #[test]
+    fn delivers_a_prequeued_card_with_its_kind_and_title() {
+        let dir = tempfile::tempdir().unwrap();
+        deliver_prequeued_card(dir.path(), "idea", "一个想法").unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/idea.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"], "prequeued");
+        assert_eq!(value["id"], "idea");
+        assert_eq!(value["title"], "一个想法");
+    }
+
+    #[test]
+    fn delivers_a_promote_with_its_own_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        deliver_promote_card(dir.path(), "idea", "a.spec.md", "a.plan.md", Some("新标题")).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/idea.promote.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["kind"], "promote");
+        assert_eq!(value["id"], "idea");
+        assert_eq!(value["spec_path"], "a.spec.md");
+        assert_eq!(value["plan_path"], "a.plan.md");
+        assert_eq!(value["title"], "新标题");
+    }
+
+    #[test]
+    fn a_promote_without_a_title_omits_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        deliver_promote_card(dir.path(), "idea", "s", "p", None).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/idea.promote.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(value.get("title").is_none());
     }
 }
