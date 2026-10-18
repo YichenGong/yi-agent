@@ -108,8 +108,11 @@ bindings-check:
 ```
 
 - 本地：`just bindings-check`。
-- CI：`.github/workflows/ci.yml` 的 `ci` job 在 `just ci` 之后加一步
-  `just bindings-check`（在 `working-directory: yi-agent-rs` 下）。
+- CI：并入 `just ci`（`yi-agent-rs/justfile` 的
+  `ci: fmt-check lint test build bindings-check`）。这样 GitHub PR / GitLab
+  push / GitLab MR 三条路径都跑到该门禁，无需在 `.github/workflows/ci.yml`
+  里单列一步。（早期实现确实另加了一步 `just bindings-check`，后因会重复执行
+  而合入 `just ci`。）
 
 > 注意 `export_bindings` 测试由 ts-rs 自动生成（每个带 `export` 的类型一个
 > `export_bindings_<name>` 测试），名字随类型名变化，所以配方用**测试名前缀过滤**

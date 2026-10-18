@@ -315,7 +315,11 @@ Expected: 该次 `bindings-check` 退出码非 0（`git diff --exit-code` 发现
 
 - [ ] **Step 4: 加进 CI**
 
-在 `.github/workflows/ci.yml` 的 `ci` job 里，`Run CI` 一步之后加：
+**（实现偏差，如实记录）** 落地时最初照下面这样单列了一步，但随后发现它会与
+`just ci` 重复：GitHub PR / GitLab push / GitLab MR 三条路径统一跑 `just ci`，
+而门禁已并入 `just ci`（`ci: fmt-check lint test build bindings-check`）。故**该单列
+步骤已被移除**——`.github/workflows/ci.yml` 现只在注释里指向 `just ci`。本节保留原
+设计意图供追溯，实际以 `justfile` 与 `ci.yml` 现状为准。
 
 ```yaml
       - name: Check generated TypeScript bindings
