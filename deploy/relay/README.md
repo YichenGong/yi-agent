@@ -6,6 +6,10 @@
 > **安全提醒**：中继按 `session` 配对转发，**不鉴权**——`session_id` 本身就是凭据。
 > 请把地址与 `session_id` **按秘密保管**（见 `docs/relay-deploy.md` §2.6），
 > 不要提交进公开仓库。本机真实值记在 `deploy/relay/.relay-local.md`（已 gitignore）。
+>
+> 仓库已加机械门禁（`just secret-check`，随 `just ci` 执行）：真实域名/IP/session
+> 出现在 git 跟踪文件里会直接让 CI 失败。示例值统一用 `relay.example.com` 与
+> RFC 5737 保留段（如 `203.0.113.10`）。
 
 ## 本机当前部署（真实值）
 
