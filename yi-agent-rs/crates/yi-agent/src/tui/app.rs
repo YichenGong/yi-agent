@@ -572,6 +572,10 @@ fn run_loop<B: Backend, E: EventSource>(
             .iter()
             .filter(|snapshot| is_active_managed_process(&snapshot.status))
             .count();
+        // Read the dropped-cell count *outside* the draw closure: the closure
+        // already borrows `history` immutably, so this keeps that borrow simple
+        // and the count is a plain copy.
+        let trimmed_history = history.dropped_cells();
         terminal.draw(|f| {
             let chunks = layout.chunks.clone();
 
@@ -594,6 +598,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 &statusbar_state,
                 &task_registry,
                 active_process_count,
+                trimmed_history,
                 &current_model,
                 chunks[2].width,
             );

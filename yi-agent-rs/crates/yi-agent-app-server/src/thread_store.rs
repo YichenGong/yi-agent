@@ -2623,4 +2623,84 @@ mod tests {
         s.set_last_item_id("thread-a", None).unwrap();
         assert_eq!(s.load("thread-a").unwrap().unwrap().meta.last_item_id, None);
     }
+
+    /// The user's requirement: after a crash, everything produced must still be
+    /// visible. A checkpoint written mid-turn must survive `load` intact and be
+    /// promotable into the authoritative log.
+    ///
+    /// This pins existing behaviour; it does not ask for any change. It exists so
+    /// a future "optimisation" cannot silently thin the checkpoint.
+    #[test]
+    fn a_crash_mid_turn_loses_none_of_the_completed_items() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-crash")).unwrap();
+
+        // A turn in progress: the opening prompt plus N completed items.
+        // Built inline like the existing partial tests do — there is no
+        // `assistant_item` helper in this module.
+        let mut items = vec![user_item("user-turn-x", "do the thing")];
+        for i in 0..50 {
+            items.push(crate::protocol::Item::AgentMessage {
+                id: format!("item-turn-x-{i}"),
+                text: format!("step {i}"),
+            });
+        }
+        store
+            .write_partial(
+                "thread-crash",
+                &PartialTurn {
+                    turn_id: "turn-x".into(),
+                    items: items.clone(),
+                    messages: Vec::new(),
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        // Crash here: nothing else is written. Resume must see everything.
+        let loaded = store.load("thread-crash").unwrap().unwrap();
+        assert!(loaded.pending_turn, "an uncommitted turn must be reported");
+        assert_eq!(
+            loaded.items.len(),
+            items.len(),
+            "a crash must not lose completed items"
+        );
+
+        // And promoting it must make the content authoritative, not drop it.
+        assert!(store.promote_partial("thread-crash").unwrap());
+        let after = store.load("thread-crash").unwrap().unwrap();
+        assert!(!after.pending_turn);
+        assert_eq!(after.items.len(), items.len());
+    }
+
+    /// The driver checkpoints the opening prompt before the model is even called
+    /// (`server.rs` "turn 开始就把提问落进 checkpoint"). A crash immediately
+    /// after that must still show the question the user typed.
+    #[test]
+    fn the_opening_prompt_survives_an_immediate_crash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&sample_meta("thread-early")).unwrap();
+
+        store
+            .write_partial(
+                "thread-early",
+                &PartialTurn {
+                    turn_id: "turn-e".into(),
+                    items: vec![user_item("user-turn-e", "did you save me?")],
+                    messages: Vec::new(),
+                    usage: None,
+                },
+            )
+            .unwrap();
+
+        let loaded = store.load("thread-early").unwrap().unwrap();
+        assert_eq!(loaded.items.len(), 1);
+        assert_eq!(
+            crate::server::item_id(&loaded.items[0]),
+            Some("user-turn-e"),
+            "the opening prompt must be recoverable"
+        );
+    }
 }
