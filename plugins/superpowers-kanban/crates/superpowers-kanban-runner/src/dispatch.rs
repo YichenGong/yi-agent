@@ -99,8 +99,13 @@ pub fn dispatch_with_service(
             if title.trim().is_empty() {
                 return Err("enqueue_prequeued needs a non-empty `title`".to_string());
             }
+            // 来源会话可选：桌面面板带上当前会话，其它调用方可以不带。
+            let origin_thread_id = params
+                .get("origin_thread_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty());
             let id = service.next_free_prequeued_id(title, chrono::Local::now());
-            deliver_prequeued_card(state_dir, &id, title)
+            deliver_prequeued_card(state_dir, &id, title, origin_thread_id)
                 .map_err(|error| format!("could not deliver the card: {error}"))?;
             Ok(json!({ "id": id }))
         }
@@ -929,6 +934,7 @@ mod tests {
         board.enqueue_prequeued(
             superpowers_kanban_core::card::CardId::new("idea"),
             "我的想法".into(),
+            None,
             chrono::Local::now(),
         );
         crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
@@ -1040,6 +1046,7 @@ mod tests {
         board.enqueue_prequeued(
             superpowers_kanban_core::card::CardId::new("idea"),
             "旧标题".to_string(),
+            None,
             chrono::Local::now(),
         );
         crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
@@ -1100,6 +1107,7 @@ mod tests {
         board.enqueue_prequeued(
             superpowers_kanban_core::card::CardId::new("known"),
             "标题".to_string(),
+            None,
             chrono::Local::now(),
         );
         crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
@@ -1148,5 +1156,49 @@ mod tests {
                 && !dir.path().parent().unwrap().join("x.promote.json").exists(),
             "inbox 之外不得出现杂散投递"
         );
+    }
+
+    #[test]
+    fn enqueue_prequeued_passes_an_optional_origin_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "my idea", "origin_thread_id": "thread-abc" }),
+        )
+        .unwrap();
+        assert_eq!(value["id"], "my-idea");
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let delivery: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(delivery["origin_thread_id"], "thread-abc");
+    }
+
+    #[test]
+    fn enqueue_prequeued_without_an_origin_thread_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "my idea" }),
+        )
+        .unwrap();
+        assert_eq!(value["id"], "my-idea");
+    }
+
+    #[test]
+    fn list_reports_the_origin_thread_of_a_prequeued_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue_prequeued(
+            superpowers_kanban_core::card::CardId::new("idea"),
+            "我的想法".into(),
+            Some("thread-abc".into()),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
+        let value = dispatch_with_global(dir.path(), None, "list", &json!({})).unwrap();
+        assert_eq!(value["cards"][0]["origin_thread_id"], "thread-abc");
     }
 }

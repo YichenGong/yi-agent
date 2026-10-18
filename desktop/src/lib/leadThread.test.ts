@@ -51,4 +51,17 @@ describe("findLeadThread", () => {
     const real = thread({ thread_id: "lead-real", role: "lead", cwd: "/p", created_at: 99 });
     expect(findLeadThread([phantom, real])?.thread_id).toBe("lead-real");
   });
+
+  it("ignores a lead inside the merge round's worktree (它同样不是项目)", () => {
+    // 合并轮把 base 检出到 `.worktrees/kanban-merge/<slug>`;那里的会话也是看板
+    // 产生的,同样没有组长。判定若只认 `kanban` 段,这一条就会漏。
+    const phantom = thread({
+      thread_id: "lead-merge-phantom",
+      role: "lead",
+      cwd: "/p/.worktrees/kanban-merge/main",
+    });
+    expect(findLeadThread([phantom])).toBeNull();
+    const real = thread({ thread_id: "lead-real", role: "lead", cwd: "/p", created_at: 99 });
+    expect(findLeadThread([phantom, real])?.thread_id).toBe("lead-real");
+  });
 });

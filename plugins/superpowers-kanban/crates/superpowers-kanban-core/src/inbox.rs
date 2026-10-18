@@ -66,12 +66,21 @@ pub fn promote_path(state_dir: &Path, id: &str) -> PathBuf {
     inbox_dir(state_dir).join(format!("{id}.promote.json"))
 }
 
-/// 投递一张预排队卡：`{"kind":"prequeued","id","title"}`。
-pub fn deliver_prequeued_card(state_dir: &Path, id: &str, title: &str) -> std::io::Result<()> {
+/// 投递一张预排队卡：`{"kind":"prequeued","id","title"[,"origin_thread_id"]}`。
+/// `origin_thread_id` 为 `None` 时不落该键。
+pub fn deliver_prequeued_card(
+    state_dir: &Path,
+    id: &str,
+    title: &str,
+    origin_thread_id: Option<&str>,
+) -> std::io::Result<()> {
     let dir = inbox_dir(state_dir);
     std::fs::create_dir_all(&dir)?;
     let path = enqueue_path(state_dir, id);
-    let body = serde_json::json!({ "kind": "prequeued", "id": id, "title": title });
+    let mut body = serde_json::json!({ "kind": "prequeued", "id": id, "title": title });
+    if let Some(origin) = origin_thread_id {
+        body["origin_thread_id"] = serde_json::Value::String(origin.to_string());
+    }
     let text = serde_json::to_string_pretty(&body).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text)?;
@@ -200,14 +209,25 @@ mod tests {
     }
 
     #[test]
-    fn delivers_a_prequeued_card_with_its_kind_and_title() {
+    fn delivers_a_prequeued_card_with_its_discussion_session() {
         let dir = tempfile::tempdir().unwrap();
-        deliver_prequeued_card(dir.path(), "idea", "一个想法").unwrap();
+        deliver_prequeued_card(dir.path(), "idea", "一个想法", Some("thread-abc")).unwrap();
         let text = std::fs::read_to_string(dir.path().join("inbox/idea.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(value["kind"], "prequeued");
         assert_eq!(value["id"], "idea");
         assert_eq!(value["title"], "一个想法");
+        assert_eq!(value["origin_thread_id"], "thread-abc");
+    }
+
+    #[test]
+    fn a_prequeued_delivery_without_a_session_omits_the_key() {
+        // 没有会话时**不落**该键（与 deliver_promote_card 对 title 的处理同款）。
+        let dir = tempfile::tempdir().unwrap();
+        deliver_prequeued_card(dir.path(), "idea", "一个想法", None).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/idea.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(value.get("origin_thread_id").is_none());
     }
 
     #[test]
@@ -239,7 +259,7 @@ mod tests {
         let now = Local.with_ymd_and_hms(2026, 10, 18, 17, 7, 29).unwrap();
         // 两个不同的中文标题在同一秒：基名相同，第二个必须换 id。
         let first = next_free_prequeued_id(&board, dir.path(), "一个想法", now);
-        deliver_prequeued_card(dir.path(), &first.0, "一个想法").unwrap();
+        deliver_prequeued_card(dir.path(), &first.0, "一个想法", None).unwrap();
         let second = next_free_prequeued_id(&board, dir.path(), "另一个想法", now);
         assert_ne!(first, second, "同一窗口的第二次捕获必须换 id");
         assert!(dir.path().join(format!("inbox/{}.json", first.0)).exists());
@@ -252,7 +272,7 @@ mod tests {
         let now = Local.with_ymd_and_hms(2026, 10, 18, 17, 7, 29).unwrap();
         let first = next_free_prequeued_id(&board, dir.path(), "idea", now);
         assert_eq!(first.0, "idea");
-        deliver_prequeued_card(dir.path(), &first.0, "idea").unwrap();
+        deliver_prequeued_card(dir.path(), &first.0, "idea", None).unwrap();
         let second = next_free_prequeued_id(&board, dir.path(), "idea", now);
         assert_eq!(second.0, "idea-2");
     }
@@ -276,7 +296,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut board = Board::new();
         let now = Local.with_ymd_and_hms(2026, 10, 18, 17, 7, 29).unwrap();
-        board.enqueue_prequeued(crate::card::CardId::new("idea"), "idea".into(), now);
+        board.enqueue_prequeued(crate::card::CardId::new("idea"), "idea".into(), None, now);
         assert_eq!(
             next_free_prequeued_id(&board, dir.path(), "idea", now).0,
             "idea-2"

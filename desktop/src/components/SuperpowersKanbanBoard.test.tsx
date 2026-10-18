@@ -7,7 +7,7 @@ import { SuperpowersKanbanBoard } from "./SuperpowersKanbanBoard";
 afterEach(() => cleanup());
 
 function card(id: string, state: string, extra: Partial<BoardCard> = {}): BoardCard {
-  return { id, state, progress: null, detail: "", threadId: null, title: id, ...extra };
+  return { id, state, progress: null, detail: "", threadId: null, originThreadId: null, title: id, ...extra };
 }
 
 describe("SuperpowersKanbanBoard", () => {

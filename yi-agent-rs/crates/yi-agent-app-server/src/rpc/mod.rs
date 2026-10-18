@@ -326,6 +326,10 @@ pub(crate) struct AppState<'a> {
     /// Git Diff 焦点句柄。与 [`AppState::theme_handle`] 同路,交给会话的工具集。
     /// 搬移前臂里的 `git_diff_handle`。
     pub(crate) git_diff_handle: &'a crate::git_diff_tool::GitDiffHandle,
+    /// 模型驱动的视图帧表(每会话一帧,内存态)。`thread/view/read` 读它、按需
+    /// 重算后写回。与 [`AppState::git_diff_handle`] 同一注入理由:测试要在主循环
+    /// 之外往**同一张**表里塞帧。
+    pub(crate) view_frames: &'a crate::server::ViewFrames,
 
     // ---- batch 4:`skill/*` 与 `thread/*`(组长)新增的宿主路径与信箱 ----
     /// 技能根解析所针对的 home(生产为 `home_dir()`,`skills_home()` 可替身)。
