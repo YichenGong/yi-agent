@@ -61,8 +61,11 @@ stem 派生（`plugins/superpowers-kanban/crates/superpowers-kanban-core/src/car
 ### 3.3 id 规则
 
 - 预排队卡 id = `slug(title)`；撞名时追加 `-2`/`-3`…（复用 `board.rs::next_free_merge_id`
-  的既有套路，新写一个 `next_free_prequeued_id(title)`）。
-- `slug` 结果为空时回退 `"prequeued"` 再加后缀。
+  的既有套路，新写一个 `next_free_prequeued_id(title, now)`）。
+- **`slug` 结果为空时回退 `prequeued-<YYYYMMDDHHMMSS>`，绝不塌成同一个 `"prequeued"`。**
+  `card_id.rs::slug` 只保留 ASCII 字母数字，中文标题（如「一个想法」）会 slug 成空串；
+  若一律回退成同一个 id，则每张中文卡 id 相同——追踪线废掉，且 id 经 `worktree::slugify`
+  变分支名 `kanban/<slug>`、包在 `.worktrees/kanban/` 下时多张卡会互撞。时间戳保证区分。
 - 复用 `card_id.rs::slug`，不新造 slug 规则。
 - **`promote` 绝不重算 id**：这是「追踪不断线」的核心保障。
 
@@ -169,7 +172,7 @@ stem 派生（`plugins/superpowers-kanban/crates/superpowers-kanban-core/src/car
 - **core**（`superpowers-kanban-core`）：`PreQueued` 迁移表两条边、`occupies_slot` 为
   false、`is_terminal` 为 false、`title` 前向兼容（旧 json → `None`）、
   `enqueue_prequeued`、`next_free_prequeued_id` 撞名后缀、`promote_prequeued`
-  重排 order 且不换 id、`slug` 为空回退。
+  重排 order 且不换 id、`slug` 为空回退时间戳 id 且两张中文标题卡 id 不同。
 - **runner**：`consume` 两趟顺序（同一 tick 内建卡 + 提升都生效）、promote 各失败分支
   落 `rejected/`、幂等、CLI 参数解析（`add-prequeued`/`promote`）、dispatch 两个新方法。
 - **desktop**（vitest）：`columnForState("pre_queued") === "preQueued"`、`boardColumns`
