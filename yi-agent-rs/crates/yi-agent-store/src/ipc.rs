@@ -1027,12 +1027,22 @@ impl Daemon {
         coordinator: &RuntimeCoordinator,
         now: DateTime<Local>,
     ) {
-        // The runtime is part of this seam's signature because the async watchdog
-        // sweep is driven through it; today's three operations are all
-        // coordinator-synchronous, so bind it explicitly rather than leave an
-        // unused-parameter warning.
-        let _ = runtime;
         let _ = coordinator.evaluate_schedules(now);
+        // 看门狗决定任务生死（终止越限 attempt 并释放其租约），所以它的失败
+        // 不能像 prune 那样静默：一个失败的 tick 意味着越限的任务又活了一分钟。
+        // `evaluate_watchdogs` 是 async（要拿 supervisor 的 async 锁），用
+        // current-thread runtime 的 block_on 驱动——与 `reconcile_worker_events`
+        // 在 accept 循环里的调用方式一致。
+        match runtime.block_on(coordinator.evaluate_watchdogs(Utc::now())) {
+            Ok(terminated) if terminated > 0 => {
+                tracing::info!(terminated, "watchdog terminated over-budget attempts")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                error = %error,
+                "watchdog evaluation failed; over-budget attempts survive until the next tick"
+            ),
+        }
         // Trace retention is cleanup, not work: a failure here must never wedge
         // the accept loop, but a wedged database must be visible rather than silent.
         match coordinator.prune_terminal_traces(Utc::now()) {
