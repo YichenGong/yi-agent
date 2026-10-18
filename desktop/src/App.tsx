@@ -77,6 +77,9 @@ import { onboardingStatus } from "./lib/onboarding";
 import { readListCache, writeListCache } from "./lib/sessionCache";
 import { createContentStore, persistContent, type AsyncContentStore, type ContentEntry } from "./lib/contentStore";
 import { parseSyncPlan, resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
+import { useDragDropPaths } from "./hooks/useDragDropPaths";
+import { subscribeDragDrop } from "./lib/dragDropSubscribe";
+import { insertDroppedPaths } from "./lib/droppedPaths";
 
 /**
  * 看板失败的四种说法。
@@ -1849,6 +1852,41 @@ export default function App() {
   };
 
   /**
+   * 拖入的路径落点：光标位置（不驱动渲染，故用 ref）与最近一次定位请求。
+   *
+   * `caret` 记用户最后一次移动光标的位置，拖入时用它决定插在哪；`seek` 是给
+   * `MessageInput` 的"把光标放到这里"请求，用自增 `seq` 让同位置连拖也能各生效一次。
+   */
+  const composerCaret = useRef(0);
+  const seekSeq = useRef(0);
+  const [caretSeek, setCaretSeek] = useState<{ seq: number; pos: number } | null>(null);
+  const composerCardRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * 把拖入的路径插进**当前会话**的草稿。
+   *
+   * 与 `changeDraft` 同一条通路（写 `view(id).draft` + `force`）：草稿属于会话，
+   * 所以切走再切回，路径仍在原会话的输入框里。没有当前会话时无处可放，忽略——
+   * 与输入框的 `disabled` 护栏一致，不留"拖进去却静默丢路径"的死路。
+   */
+  const dropPathsIntoDraft = (paths: string[]): void => {
+    const id = store.currentId;
+    if (!id) return;
+    const { text, caret } = insertDroppedPaths(store.view(id).draft, composerCaret.current, paths);
+    store.setDraft(id, text);
+    composerCaret.current = caret;
+    setCaretSeek({ seq: ++seekSeq.current, pos: caret });
+    force((v) => v + 1);
+  };
+
+  const dragDrop = useDragDropPaths({
+    subscribe: subscribeDragDrop,
+    isRemote: isRemoteClient(),
+    targetRef: composerCardRef,
+    onDrop: dropPathsIntoDraft,
+  });
+
+  /**
    * 记下某会话下拉写入成功后的模型结果。
    *
    * 只更新**那个**会话的 `info.model_ref` / `info.model`：写的是哪个会话，就更新
@@ -2190,6 +2228,12 @@ export default function App() {
                 onSlashCommand={(name, args) => void onSlashCommand(name, args)}
                 value={current?.draft ?? ""}
                 onDraftChange={changeDraft}
+                cardRef={composerCardRef}
+                dropActive={dragDrop.active}
+                caretSeek={caretSeek}
+                onCaretChange={(caret) => {
+                  composerCaret.current = caret;
+                }}
                 // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
                 attachments={sess.currentId ? (pending[sess.currentId] ?? []) : []}
                 onPickAttachments={() => void pickAttachments()}

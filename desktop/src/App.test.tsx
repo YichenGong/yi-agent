@@ -5,7 +5,7 @@ import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testi
 type Mode = "normal" | "yolo";
 type ThreadSeed = { thread_id: string; title: string | null; permission_mode: Mode };
 
-const { clients, state } = vi.hoisted(() => ({
+const { clients, state, dragDrop } = vi.hoisted(() => ({
   clients: [] as Array<{
     requests: { method: string; params: unknown }[];
     // The recovery hook the App injects as `RpcClient`'s 2nd constructor arg.
@@ -80,6 +80,8 @@ const { clients, state } = vi.hoisted(() => ({
     // 路径确实被走到」可被断言，而不是靠「首屏照常」这种两边都成立的弱断言。
     leadAttempts: [] as string[],
   },
+  // 捕获 `@tauri-apps/api/webview` 注册的拖放 handler，供用例驱动事件。
+  dragDrop: { fn: null as null | ((event: unknown) => void) },
 }));
 
 // 内容缓存模块级替换：每个用例一份内存实现。App 在首次远端渲染时才懒建，故用
@@ -281,6 +283,24 @@ vi.mock("./lib/rpc", () => ({
   },
 }));
 
+// 拖放订阅走动态 import 的 `@tauri-apps/api/webview`；在模块边界桩掉它，
+// 并把注册的 handler 记在 `dragDrop.fn` 上。Tauri 交来的是事件对象
+// （`{ payload }`），故这里回放时也要包一层——`App` 的 subscribe 只转发 payload。
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: async (handler: (event: unknown) => void) => {
+      dragDrop.fn = handler;
+      return () => {};
+    },
+  }),
+}));
+
+/** jsdom 的 rect 恒为 0，落点判定需要一个真矩形。 */
+function stubRect(el: HTMLElement, r: { left: number; top: number; right: number; bottom: number }) {
+  el.getBoundingClientRect = () =>
+    ({ ...r, width: r.right - r.left, height: r.bottom - r.top, x: r.left, y: r.top, toJSON: () => ({}) }) as DOMRect;
+}
+
 vi.mock("./transportFactory", () => ({ transportFactory: () => ({}) }));
 
 // iOS-vs-desktop 的唯一判定入口。只换掉 `isIos`：其余（`isRemoteClient` 等）
@@ -329,6 +349,7 @@ beforeEach(() => {
   state.leadCwds = [];
   state.failLead = false;
   state.leadAttempts = [];
+  dragDrop.fn = null;
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
@@ -4848,5 +4869,64 @@ describe("App lead entry reachability", () => {
     // 失败不得挡住首屏：既有会话照旧渲染，且没有凭空冒出组长条目。
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
     expect(screen.queryByText("组长")).toBeNull();
+  });
+});
+
+describe("拖入路径", () => {
+  it("drop 落在输入卡片上时把路径写进当前会话草稿", async () => {
+    render(<App />);
+    // 首屏自动 resume 第一条会话后，输入框才不是 disabled。
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(ta.value).toBe('"/Users/me/My Docs"');
+    // 光标必须落在插入块的末尾：App 把 `caretSeek` 交给 MessageInput，由它
+    // `setSelectionRange`。含空格的路径带引号后长 19，故 19。
+    expect(ta.selectionStart).toBe(19);
+    expect(ta.selectionEnd).toBe(19);
+  });
+
+  it("连续两次 drop 都把光标放在新插入块的末尾", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // 第一次：空草稿 → 19 个字符，光标 19。
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    expect(ta.value).toBe('"/Users/me/My Docs"');
+    expect(ta.selectionStart).toBe(19);
+    // 第二次前把光标挪回行首（走组件自己的 onSelect 通路，与用户点一下行首同路）。
+    // 这一步是这条用例能否证伪的关键：jsdom 在 `value` 被赋值时会把选区挪到**全文
+    // 末尾**，所以「插在末尾」的第二次插入无论 caretSeek 在不在，选区都恰好等于
+    // 插入块末尾（19 → 39），证伪不了任何东西。只有让第二次插入落在文本**中间**，
+    // 「插入块末尾」(19) 与「全文末尾」(38) 才分开，而把光标放到 19 只能靠
+    // caretSeek 这条 App→MessageInput 通路。
+    ta.setSelectionRange(0, 0);
+    fireEvent.select(ta);
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    // 行首插入不加前导空格（needsSpace 只在光标前有内容且不以空白结尾时成立）。
+    expect(ta.value).toBe('"/Users/me/My Docs""/Users/me/My Docs"');
+    expect(ta.selectionStart).toBe(19);
+    expect(ta.selectionEnd).toBe(19);
+  });
+
+  it("drop 落在卡片之外时不改草稿", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/a"], position: { x: 900, y: 900 } } });
+    });
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   });
 });
