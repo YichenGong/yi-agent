@@ -77,20 +77,38 @@
     }
 
     #[test]
-    fn unreachable_anchor_degrades_to_the_default_branch_chain_not_worktree_only() {
+    fn unreachable_anchor_falls_through_to_the_default_branch_candidate() {
         let dir = repo();
-        // 锚点已不可达（模拟 rebase / gc 掉）：不得降级为「仅工作区」，
-        // 否则 diff 会突然只剩未提交改动，比报错更难理解。
+        // 前提：仓库里必须真有候选可落。故先造一个 origin/main，否则本测试只能断言
+        // 「没有候选时是 worktree-only」，而那正是「误降级」与「正确落链」共有的输出。
+        std::fs::create_dir_all(dir.path().join(".git/refs/remotes/origin")).unwrap();
+        let head = git_ok(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(
+            dir.path().join(".git/refs/remotes/origin/main"),
+            format!("{}\n", head.trim()),
+        )
+        .unwrap();
+        // 锚点已不可达（模拟 rebase / gc 掉）：必须落到候选链，不得降级为「仅工作区」。
         let (base, kind) = resolve_base(dir.path(), None, Some("deadbeefdeadbeef"));
-        assert_eq!(kind, "worktree-only", "no other candidate exists here");
-        assert_eq!(base, None);
+        assert_eq!(base.as_deref(), Some("origin/main"));
+        assert_eq!(kind, "origin-default");
     }
 
     #[test]
     fn session_anchor_reads_head() {
         let dir = repo();
         let sha = session_anchor(dir.path()).expect("a git repo has an anchor");
-        assert_eq!(sha.trim(), git_ok(dir.path(), &["rev-parse", "HEAD"]).unwrap().trim());
+        // 不拿 git 的同一条命令自比（f(x) == f(x)，实现返回错的 ref 也照样绿）；
+        // 断言返回值自身的性质：完整 40 位十六进制 sha，且可被 git 当 committish 解析。
+        assert_eq!(sha.len(), 40, "anchor must be a full sha: {sha:?}");
+        assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(
+            git_ok(
+                dir.path(),
+                &["rev-parse", "--verify", "--quiet", &format!("{sha}^{{commit}}")]
+            )
+            .is_some()
+        );
     }
 
     #[test]
