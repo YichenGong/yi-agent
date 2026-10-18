@@ -10,6 +10,7 @@
 //! 做法显式 `#[allow(dead_code)]`；消费方接入后应当把放行去掉。
 
 use serde_json::Value;
+use std::path::Path;
 
 /// 宿主能执行的通用动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +165,25 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
             error: Some(error.to_string()),
         }),
     }
+}
+
+/// 声明了 `session_driver` 的插件名（按插件名排序，稳定）。
+///
+/// 读的是**通用**清单目录；宿主不认识任何具体插件。
+///
+/// 本任务（Task 4）到达时消费方尚未接线：把插件列表接进主循环是 Task 6 的事，
+/// 在此之前生产构建下它「未读」。删除才是错的（这是宿主发现驱动插件的唯一入口），
+/// 故照本 crate 既有做法显式 `#[allow(dead_code)]`；Task 6 接线后应把放行去掉。
+#[allow(dead_code)]
+pub(crate) fn driver_plugins(scope: &Path) -> Vec<String> {
+    let dir = scope.join(".yi-agent").join("supervisors");
+    let mut names: Vec<String> = yi_agent_supervisors::manifest::load_manifests(&dir)
+        .into_iter()
+        .filter(|manifest| manifest.session_driver)
+        .map(|manifest| manifest.name)
+        .collect();
+    names.sort();
+    names
 }
 
 #[cfg(test)]
@@ -382,5 +402,29 @@ mod tests {
             results.is_empty(),
             "the results were delivered, so a null answer must not re-send them"
         );
+    }
+
+    #[test]
+    fn only_plugins_declaring_session_driver_are_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = dir.path();
+        let manifests = scope.join(".yi-agent").join("supervisors");
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(
+            manifests.join("driver.json"),
+            r#"{"name":"driver","command":"/bin/d","args":[],"switch_key":"d",
+                "restart_backoff_ms":1000,"restart_backoff_max_ms":30000,
+                "stop_when_disabled":false,"session_driver":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            manifests.join("plain.json"),
+            r#"{"name":"plain","command":"/bin/p","args":[],"switch_key":"p",
+                "restart_backoff_ms":1000,"restart_backoff_max_ms":30000,
+                "stop_when_disabled":false}"#,
+        )
+        .unwrap();
+
+        assert_eq!(driver_plugins(scope), vec!["driver".to_string()]);
     }
 }
