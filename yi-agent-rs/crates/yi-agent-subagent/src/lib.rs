@@ -1910,8 +1910,8 @@ pub(crate) fn spawn_agent_schema() -> serde_json::Value {
             },
             "fork": {
                 "type": "boolean",
-                "default": false,
-                "description": "Fork the caller's current conversation into the child so it inherits context. Off by default: pass true only when the child genuinely needs the history."
+                "default": true,
+                "description": "The child inherits this conversation's history by default. Pass false for an isolated child that should start clean."
             }
         },
         "required": ["task"],
@@ -2368,10 +2368,10 @@ mod tests {
     }
 
     #[test]
-    fn both_spawn_schemas_offer_fork_and_default_to_false() {
+    fn both_spawn_schemas_offer_fork_and_default_to_true() {
         for schema in [application_spawn_schema(), core_spawn_schema()] {
             assert_eq!(schema["properties"]["fork"]["type"], "boolean");
-            assert_eq!(schema["properties"]["fork"]["default"], false);
+            assert_eq!(schema["properties"]["fork"]["default"], true);
             assert_eq!(
                 schema["required"],
                 json!(["task"]),
