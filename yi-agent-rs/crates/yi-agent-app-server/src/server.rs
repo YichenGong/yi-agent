@@ -2214,12 +2214,12 @@ where
     //
     // 消费必须留在本循环的 `select!` 里:`threads` 是本函数独占的 `&mut`,投放
     // 到 `tokio::spawn` 需要 `'static` 或共享可变状态,两者都会拆掉「一个主循环
-    // 串行拥有 threads」这条前提(与看板调度器同一约束)。
+    // 串行拥有 threads」这条前提(与通用会话驱动器同一约束)。
     let mut lead_rx = lead_inbox.subscribe();
 
     loop {
         // 上传登记表的 TTL 清理：每轮循环开头收走超时的 staging 会话。放在这里
-        // 而不是另起定时器，理由同看板调度器——登记表是主循环局部量，`&mut`
+        // 而不是另起定时器，理由同通用会话驱动器——登记表是主循环局部量，`&mut`
         // 借用必须串行。
         uploads.sweep_expired();
         tokio::select! {
@@ -3334,7 +3334,7 @@ where
                         // ① 按索引顺序(最近在前)为**每个**目录建组——含失效目录
                         //   (exists:false、threads 空,不深扫),普通会话留在本目录组;
                         // ② 带 `driver_project` 的驱动会话折进它所属的项目组(项目可不在
-                        //   索引里,则合成一组);只含卡片会话的目录(卡片 worktree)
+                        //   索引里,则合成一组);只含驱动会话的目录(驱动会话的 worktree)
                         //   第一段被抑制,不再顶层成组。
                         // **不动索引**:目录仍留在 workspaces 里,冷会话定位靠它。
                         let dirs = workspaces.list();
@@ -3374,7 +3374,7 @@ where
                             // 为什么限定「没有任何会话」:组长 meta 的 `driver_project`
                             // 是 `None`,一旦写进已有会话的目录,它就会被算作「该目录
                             // 自己的会话」,从而①把「每个目录组恰好一个会话」变成两个、
-                            // ②让只含卡片会话的 worktree 不再被抑制成顶层组。两者都是
+                            // ②让只含驱动会话的 worktree 不再被抑制成顶层组。两者都是
                             // `listAll` 既有行为的一部分,列表查询不得改写它。已有会话的
                             // 项目仍是懒创建的目标,只是触发点更准:用户点组长入口
                             // (`thread/lead`)或某个会话给组长留言(`resolve_lead_target`)。
@@ -3402,7 +3402,7 @@ where
                                 .filter(|m| m.driver_project.is_none())
                                 .collect();
                             // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
-                            // 否则它只是卡片 worktree,归拢后被抑制。
+                            // 否则它只是驱动会话的 worktree,归拢后被抑制。
                             if !own.is_empty() || metas.is_empty() {
                                 for m in own {
                                     plain.entry(dir.clone())
@@ -3410,7 +3410,7 @@ where
                                         .push(thread_summary_json(m, &threads));
                                 }
                             } else {
-                                // 只含卡片会话:抑制顶层空组(稍后不产出)。
+                                // 只含驱动会话:抑制顶层空组(稍后不产出)。
                                 seen.remove(dir);
                                 order.retain(|d| d != dir);
                             }
@@ -4546,7 +4546,7 @@ where
                             .get("force")
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false);
-                        // 卡片会话的 worktree 判定：只读会话自带 meta，不碰插件。
+                        // 驱动会话的 worktree 判定：只读会话自带 meta，不碰插件。
                         // 顺手把 driver_project 拷到局部变量：会话文件随后即被删除，
                         // 到执行删除时再 load 只会失败，故必须在此刻留下。
                         let mut driver_project: Option<String> = None;
@@ -4663,7 +4663,7 @@ where
                         // 会话文件已摘除：按判定处置 worktree。删除失败只记日志，不阻断会话删除（D9）。
                         // driver_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
                         // 但失败这件事本身必须回报：用户刚被告知该 worktree 会被删掉，此刻会话
-                        // 已摘除、应用内再也删不掉它，又按 D10 让卡片上的 thread_id 悬空——
+                        // 已摘除、应用内再也删不掉它，又按 D10 让插件侧记着的 thread_id 悬空——
                         // 若默默失败，worktree 就无声滞留、用户永远看不见。故除宿主日志外，
                         // 把这一次"该删却没删成"如实回给客户端（失败才现身，成功仍为空）。
                         let mut worktree_failure: Option<serde_json::Value> = None;
@@ -7159,8 +7159,10 @@ pub(crate) fn item_id(item: &crate::protocol::Item) -> Option<&str> {
 /// 下一拍插件才看得到它的状态;且闭包持有的是 owned `HashMap`,不与 launcher
 /// 需要的 `&mut threads` 冲突。
 ///
-/// 单个 (项目, 插件) 的失败(daemon 掉线、坏清单)只记日志:一个插件不可用不得
-/// 影响其它插件,更不得影响 RPC。
+/// 两处失败**只记日志**,绝不中断本拍、也不影响 RPC:项目在常驻登记表里却没有任何
+/// 驱动插件(宿主这一拍**根本没问**),以及某个插件这一拍问不通(问了但没打通)。
+/// 二者必须分得开,否则「我没人可问」在日志里与「我问了、它失败了」一模一样。
+/// 与主循环其它失败点同款:一个插件不可用不得影响其它插件。
 #[allow(clippy::too_many_arguments)]
 async fn driver_tick<F>(
     resident_dir: &Path,
@@ -7191,7 +7193,19 @@ async fn driver_tick<F>(
     ) -> anyhow::Result<BuiltAgent>,
 {
     for project in yi_agent_store::resident::list(resident_dir) {
-        for plugin in crate::session_driver::driver_plugins(&project) {
+        // 「没人可问」必须与「问了、失败了」在日志里分得开:项目已在常驻登记表里,
+        // 却拿不出任何声明 `session_driver` 的插件(清单目录缺失,或里面每份清单都
+        // 损坏被 `load_manifests` 丢掉)。若只在这里静默 `continue`,一个健康的 daemon
+        // 就会永远不被问起而无一行日志——那正是「注册过了却什么都没发生」的现场。
+        let plugins = crate::session_driver::driver_plugins(&project);
+        if plugins.is_empty() {
+            eprintln!(
+                "[app-server] driver tick: {} is registered as resident but has no \
+                 session_driver plugin, so nothing was asked",
+                project.display()
+            );
+        }
+        for plugin in plugins {
             // 先快照 idle(owned `HashMap`):闭包因此不再借用 `threads`,与下面
             // launcher 的 `&mut threads` 不冲突。
             let snapshot: HashMap<String, bool> = threads
@@ -7239,9 +7253,22 @@ async fn driver_tick<F>(
             // 查询闭包走**通用**插件通道(`plugin_query_self`):宿主只转发
             // `method`/`params`,不解释应答,也不受任何看板登记表门控。
             let scope = project.clone();
+            let log_project = project.clone();
+            let log_plugin = plugin.clone();
             let query = move |params: &serde_json::Value| {
-                plugin_query_self(&scope, &plugin, "driver/next", params.clone())
-                    .map_err(|error| error.message)
+                plugin_query_self(&scope, &plugin, "driver/next", params.clone()).map_err(|error| {
+                    // `driver_step` 把查询失败整体吞成「这一拍不推进」(`Err(_) =>
+                    // return None`),它的签名与语义是插件契约的一部分,这里不改。
+                    // 但失败必须留痕:否则「问了、没打通」与「问了、插件说无事可做」
+                    // 在日志里完全同型,坏清单/daemon 掉线就成了无声停摆。
+                    eprintln!(
+                        "[app-server] driver tick: could not reach {} for {}: {}",
+                        log_plugin,
+                        log_project.display(),
+                        error.message
+                    );
+                    error.message
+                })
             };
             let outcome = crate::session_driver::driver_step(
                 &query,
@@ -7269,18 +7296,18 @@ async fn driver_tick<F>(
 /// 直接登记会话,故驱动器无需另起一个并发访问它们的任务。
 ///
 /// `build_agent` 是 `serve` 的工厂参数(按引用借入,不要求 `'static`,也不要求
-/// launcher 自己拥有它)——与 `thread/start` 分支用同一个工厂,因此看板会话与
+/// launcher 自己拥有它)——与 `thread/start` 分支用同一个工厂,因此被驱动的会话与
 /// 手工会话的 agent 构造完全同源。
 struct ServeLauncher<'a, F> {
     threads: &'a mut HashMap<String, ThreadSession>,
     pending_activation: &'a mut HashMap<String, Option<Arc<ThreadRoot>>>,
     process_watches: &'a mut HashMap<String, ProcessWatch>,
-    /// 上传登记表：看板会话不起于 RPC，但 `prepare_turn_core` 的签名要求它
-    /// （`{type:"uploaded_image"}` 只可能来自 RPC；看板卡永远不带上传句柄）。
+    /// 上传登记表：被驱动的会话不起于 RPC，但 `prepare_turn_core` 的签名要求它
+    /// （`{type:"uploaded_image"}` 只可能来自 RPC；`driver/next` 的动作不带上传句柄）。
     uploads: &'a mut crate::image_upload::UploadRegistry,
     runtimes: &'a ProjectRuntimes,
     thread_roots: &'a ThreadRoots,
-    /// 机器级模型清单路径:看板会话的委派链路与手工会话读同一份,而非各自
+    /// 机器级模型清单路径:被驱动的会话的委派链路与手工会话读同一份,而非各自
     /// 重读 `$HOME`。
     models_path: &'a Path,
     cfg: &'a RuntimeConfig,
@@ -7298,7 +7325,8 @@ struct ServeLauncher<'a, F> {
     lead_inbox: &'a crate::lead::LeadInbox,
     /// 该 launcher 对应项目的组长 thread id 与 cwd,由消费方在调用前解析。
     /// 用 owned 值而非从 `threads` 反查:组长可能尚未被打开,不在 `threads` 里。
-    /// `None` = 该 launcher 不承载组长投递(目前只有看板调度器,见其构造点)。
+    /// `None` = 该 launcher 不承载组长投递(目前只有 `driver_tick` 构造的
+    /// launcher,见其构造点)。
     lead_target: Option<LeadTarget>,
 }
 
@@ -7560,7 +7588,7 @@ where
     ///
     /// 与 `launch_inner` 的三点差异,每一点都是刻意的:
     /// - 复用**已存在的**组长 thread id(不新铸 uuid),因此重复投递落在同一个会话;
-    /// - `mode` 用 Normal,而非看板的 Yolo 强制值(组长会话不是看板卡);
+    /// - `mode` 用 Normal,而非被驱动会话所用的 Yolo 强制值(组长会话不是被驱动的会话);
     /// - 不设 `driver_project` / `driver_ref`,组长不是被驱动的会话。
     ///
     /// **不发任何 RPC 帧**:投递不是客户端请求,没有可应答的 id。唯一可发的是
@@ -7925,7 +7953,7 @@ async fn start_thread_core(
 }
 
 /// `prepare_turn_core` 的失败。每一种都对应 `turn/start` 的一条固定错误响应,
-/// 由 `start_turn_core` 负责把它写出去(这样「校验」与「写响应」解耦,调度器可以
+/// 由 `start_turn_core` 负责把它写出去(这样「校验」与「写响应」解耦,驱动器可以
 /// 只复用前者而不向任何客户端广播)。
 enum TurnPrepareError {
     MissingThreadId,
@@ -9589,6 +9617,106 @@ mod session_driver_tests {
         yi_agent_store::resident::require(resident_dir, project, name).unwrap();
     }
 
+    /// 子进程里跑一个 `#[ignore]` 探针,取回它的 stdout+stderr 合并文本。
+    ///
+    /// **为什么非得开子进程**:libtest 默认把 `eprintln!` 收进线程私有的捕获缓冲
+    /// (`std::io::set_output_capture`),根本不写 fd 2——父进程怎么重定向 fd 2 都
+    /// 看不到(实测两种模式见 `task-6-report.md` 的 FIX ROUND 1)。子进程加
+    /// `--nocapture` 后 `eprintln!` 才落回真 fd 2,这时才可观察。
+    ///
+    /// 探针用 `#[ignore]` 标记:常规 `cargo test` 不会直接跑它(它只负责「在子进程
+    /// 里制造一次 tick」),由本函数的调用方显式带 `--ignored --exact` 拉起。
+    fn logs_of_ignored_probe(probe: &str) -> String {
+        let exe = std::env::current_exe().expect("the test binary must be locatable");
+        let output = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                probe,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .expect("the test binary must be runnable");
+        let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
+        text.push_str(&String::from_utf8_lossy(&output.stdout));
+        assert!(
+            output.status.success(),
+            "the probe {probe} must pass; its output was:\n{text}"
+        );
+        text
+    }
+
+    /// 探针(默认跳过,由 `logs_of_ignored_probe` 在子进程里拉起):
+    /// 项目在常驻登记表里、但没有任何声明 `session_driver` 的插件 → 一拍 tick。
+    #[test]
+    #[ignore]
+    fn probe_a_registered_project_without_a_driver_plugin() {
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        // 登记为常驻,却不写任何清单目录:这正是「注册过了却没人可问」。
+        yi_agent_store::resident::require(resident_dir.path(), project_dir.path(), "some-plugin")
+            .unwrap();
+        let mut host = Host::new();
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(host.tick(resident_dir.path(), &mut drivers, &build_test_agent));
+    }
+
+    /// 探针(默认跳过):插件清单在、可查询,但 daemon/套接字拨不通 → 一拍 tick。
+    #[test]
+    #[ignore]
+    fn probe_a_driver_plugin_that_cannot_be_reached() {
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        let project_dir = tempfile::TempDir::new().unwrap();
+        // 目录就叫 `project`,好让日志断言能核对「这一行点了名」而不是碰巧匹配。
+        let project = project_dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        // 清单写了 `query_socket`,却没有 daemon 听在那个 socket 上。
+        install_driver_plugin(&project, resident_dir.path(), DRIVER_PLUGIN);
+        let mut host = Host::new();
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(host.tick(resident_dir.path(), &mut drivers, &build_test_agent));
+    }
+
+    /// F1:登记为常驻却没有驱动插件的项目,必须在日志里说明「这一拍没问任何人」。
+    ///
+    /// 这是「静默停摆」与「问了、失败了」在运维眼里唯一的分界:若这一行不存在,
+    /// 一个健康的 daemon 永远不被问起也不留痕。
+    #[test]
+    fn a_registered_project_without_a_driver_plugin_says_nothing_was_asked() {
+        let logs = logs_of_ignored_probe(
+            "server::session_driver_tests::probe_a_registered_project_without_a_driver_plugin",
+        );
+        assert!(
+            logs.contains("has no session_driver plugin, so nothing was asked"),
+            "the never-asked case must leave a log line: {logs}"
+        );
+    }
+
+    /// F1:问不通的 (项目, 插件) 必须在日志里各留一行,而不是无声跳过。
+    ///
+    /// `driver_step` 把查询失败整体吞成「不推进」,故这一行只能由 tick 侧留下。
+    #[test]
+    fn a_driver_plugin_that_cannot_be_reached_leaves_a_log_line() {
+        let logs = logs_of_ignored_probe(
+            "server::session_driver_tests::probe_a_driver_plugin_that_cannot_be_reached",
+        );
+        assert!(
+            logs.contains("driver tick: could not reach")
+                && logs.contains(DRIVER_PLUGIN)
+                && logs.contains("/project:"),
+            "a failed query must name the plugin and the project: {logs}"
+        );
+    }
+
     /// 一轮 tick：插件回 launch/append → 宿主真的按它拉会话，且**不调用**任何
     /// `board.*` 方法名。
     ///
@@ -9604,8 +9732,20 @@ mod session_driver_tests {
         let work_path = workdir.clone();
         let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let seen = Arc::clone(&rounds);
-        let daemon = FakeDaemon::bind(move |_project, method, params| match method {
-            "driver/next" => match seen.fetch_add(1, Ordering::SeqCst) {
+        // 每拍请求里 `threads[0].idle` 的原样记录(缺省记 `null`)。
+        let idle_seen: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_idle = Arc::clone(&idle_seen);
+        let daemon = FakeDaemon::bind(move |_project, method, params| {
+            if method != "driver/next" {
+                return Ok(json!({ "ok": true }));
+            }
+            // 原样记下本拍请求里的 `threads[0].idle`(本拍尚无会话时是 `null`),
+            // 供 F4 断言「宿主经 tick 送出的是真 idle,不是常量」。
+            recorded_idle
+                .lock()
+                .unwrap()
+                .push(params["threads"][0]["idle"].clone());
+            match seen.fetch_add(1, Ordering::SeqCst) {
                 // 第一拍：起一个会话。
                 0 => Ok(json!({
                     "action_id": "a1",
@@ -9629,8 +9769,7 @@ mod session_driver_tests {
                     }))
                 }
                 _ => Ok(serde_json::Value::Null),
-            },
-            _ => Ok(json!({ "ok": true })),
+            }
         });
         let resident_dir = tempfile::TempDir::new().unwrap();
         install_driver_plugin(&daemon.project, resident_dir.path(), "driver");
@@ -9654,10 +9793,16 @@ mod session_driver_tests {
         host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
             .await;
 
+        // 第三拍：只问不做（插件回 `null`）。它让第二拍动手后的空闲事实有一次
+        // 上送机会——`append` 在那拍里刚投递完，此刻该会话正忙（见下面的 F4 断言）。
+        host.tick(resident_dir.path(), &mut drivers, &build_test_agent)
+            .await;
+
         let calls = daemon.calls();
-        assert!(
-            calls.len() >= 2,
-            "both ticks must ask the plugin: {calls:?}"
+        assert_eq!(
+            calls.len(),
+            3,
+            "one plugin call per tick, three ticks: {calls:?}"
         );
         let methods: Vec<&str> = calls
             .iter()
@@ -9671,15 +9816,22 @@ mod session_driver_tests {
             methods.iter().all(|method| !method.starts_with("board.")),
             "no board vocabulary may leave the host: {methods:?}"
         );
-        assert!(
-            !daemon.calls_to("driver/next").is_empty(),
-            "the plugin must have been asked at least once: {calls:?}"
-        );
+        // 上面 `all(== "driver/next")` 已经蕴含「至少问过一次」,故不再单列
+        // `calls_to("driver/next").is_empty()` 断言——它对本用例是冗余的。
 
         assert_eq!(host.threads.len(), 1, "append must reuse the session");
         assert!(
             host.threads[&thread_id].active_turn_id.is_some(),
             "the appended round must be delivered to the same session"
+        );
+        // F4:`threads[].idle` 是**经 tick 上送的真事实**,不是常量。三拍快照依次是
+        // 「还没有会话(无 thread → 数组下标缺省 `null`)」「首轮已收尾(空闲 `true`)」
+        // 「刚追加的一轮仍在飞(忙 `false`)」——同一字段三种取值,常量填不出来。
+        let idle_series: Vec<serde_json::Value> = idle_seen.lock().unwrap().clone();
+        assert_eq!(
+            idle_series,
+            vec![serde_json::Value::Null, json!(true), json!(false)],
+            "the tick must wire real idle, not a constant: {idle_series:?}"
         );
         assert!(
             host.settle_turn(&thread_id, Duration::from_secs(10)).await,
@@ -10216,9 +10368,9 @@ mod session_driver_tests {
 
     /// `driver/next` 的 `launch` 应答只带 `workdir`/`title`/`objective`(spec §4.3),
     /// 宿主**不认识 card id**——所以走通用动作起的会话,`driver_ref` 必须是 `None`
-    /// (计划已把该填充缺口记给 G2),而 `driver_project` 同样为 `None`(发现环在
-    /// Task 6 接线时才按项目补入)。这里同时钉住「会话仍然可见、首轮仍然投递」,
-    /// 即缺这两个归属值不影响起会话本身。
+    /// (计划已把该填充缺口记给 G2),而 `driver_project` 同样为 `None`(发现环按
+    /// 项目遍历,却仍不填这两个归属值——同一缺口,见 plan 归 G2)。这里同时钉住
+    /// 「会话仍然可见、首轮仍然投递」,即缺这两个归属值不影响起会话本身。
     #[tokio::test(flavor = "multi_thread")]
     async fn a_launch_action_records_no_driver_origin_and_still_starts_a_turn() {
         let mut host = Host::new();
