@@ -141,6 +141,8 @@ export interface Usage {
 export interface Workspace {
   path: string;
   exists: boolean;
+  /** 该目录被关联到的主根（canonical 绝对路径）；null / 缺省 = 顶层目录。 */
+  linked_to?: string | null;
 }
 
 /** `thread/listAll` 的一个目录分组。 */

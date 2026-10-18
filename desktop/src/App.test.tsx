@@ -3149,6 +3149,91 @@ describe("App 会话详情栏的开合", () => {
   });
 });
 
+describe("App 关联文件夹接线", () => {
+  /** 打开某个目录分组的右键菜单。 */
+  const openGroupMenu = (ws: string) => {
+    fireEvent.contextMenu(document.querySelector<HTMLElement>(`[data-ws-header="${ws}"]`)!);
+  };
+
+  it("links the picked folder to the group it was invoked from", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.picks = ["/proj/docs"];
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "workspace/link",
+        params: { primary: "/proj", child: "/proj/docs" },
+      }),
+    );
+  });
+
+  it("does nothing when the native picker is cancelled", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.picks = [null];
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await waitFor(() => expect(state.picks).toHaveLength(0));
+    expect(clients[0].requests.some((r) => r.method === "workspace/link")).toBe(false);
+  });
+
+  it("unlinks a folder from its linked-child section menu", async () => {
+    state.groupWorkspaces = ["/proj", "/proj/docs"];
+    state.dataSources["workspace/list"] = () => ({
+      workspaces: [
+        { path: "/proj", exists: true, linked_to: null },
+        { path: "/proj/docs", exists: true, linked_to: "/proj" },
+      ],
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-linked-child="/proj/docs"]')).not.toBeNull(),
+    );
+
+    fireEvent.contextMenu(
+      document.querySelector<HTMLElement>('[data-linked-child="/proj/docs"]')!,
+    );
+    fireEvent.click(screen.getByText("取消关联"));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "workspace/unlink",
+        params: { child: "/proj/docs" },
+      }),
+    );
+  });
+
+  it("surfaces a server-side link rejection instead of pretending it worked", async () => {
+    // 服务端会拒掉成环 / 链式关联（-32602）。吞掉它就等于让用户以为关联成功。
+    state.groupWorkspaces = ["/proj"];
+    state.picks = ["/proj/outer"];
+    state.dataSources["workspace/link"] = () => {
+      throw { code: -32602, message: "主根本身已是附属根" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await screen.findByText("主根本身已是附属根");
+  });
+});
+
 describe("App 附件接线", () => {
   // 文档与图片共用一个入口（合并后只有一个「附加文件」按钮）。
   const attachButton = () => screen.getByRole("button", { name: "附加文件" });

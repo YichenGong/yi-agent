@@ -113,6 +113,9 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
         reasoning_effort: None,
         tag: None,
         preserve_thinking: true,
+        // 组长由 `thread/lead` 懒创建，不经 `thread/start` 的关联根快照路径；
+        // 关联根是**会话级**能力增量，组长这里保持单根（空集）。
+        extra_roots: Vec::new(),
         role: Some(LEAD_ROLE.to_string()),
     };
     store.create(&meta)?;

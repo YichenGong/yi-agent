@@ -11,7 +11,7 @@
 
 use crate::context::ToolsContext;
 use crate::error::ToolsError;
-use crate::fs::path_util::resolve_and_check;
+use crate::fs::path_util::resolve_and_check_roots;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
@@ -374,7 +374,7 @@ impl Tool for ReadDocumentTool {
             Ok(a) => a,
             Err(e) => return ToolsError::ArgsParse(e).into(),
         };
-        let resolved = match resolve_and_check(self.ctx.root(), &args.path) {
+        let resolved = match resolve_and_check_roots(self.ctx.roots(), &args.path) {
             Ok(p) => p,
             Err(e) => return e.into(),
         };

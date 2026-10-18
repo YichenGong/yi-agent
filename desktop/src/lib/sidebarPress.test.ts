@@ -12,6 +12,7 @@ function tree(): { header: HTMLElement; row: HTMLElement; pin: HTMLElement; blan
     <aside>
       <div data-ws-header=""><span id="h-text">projA</span></div>
       <div data-thread-row="t1"><span id="r-text">alpha</span><button id="pin">pin</button></div>
+      <div data-linked-child="/b"><span id="c-text">childB</span></div>
       <div id="blank">footer</div>
     </aside>
   `;
@@ -35,6 +36,13 @@ describe("resolveSidebarPressTarget", () => {
     tree();
     expect(resolveSidebarPressTarget(document.querySelector("#h-text"))).toBe(
       document.querySelector("[data-ws-header]"),
+    );
+  });
+
+  it("resolves a press inside a linked-child section header to that header", () => {
+    tree();
+    expect(resolveSidebarPressTarget(document.querySelector("#c-text"))).toBe(
+      document.querySelector("[data-linked-child]"),
     );
   });
 
