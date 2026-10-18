@@ -14,10 +14,22 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DriverActionKind {
     /// 在一个 workdir 里新建会话，并投递 `objective` 作为首轮。
+    ///
+    /// `driver_project` / `driver_ref` 是这个新会话的**归属**，由插件在动作里给出
+    /// （宿主不知道也不该知道它是什么含义），宿主只负责落进会话 meta：
+    /// - `driver_project` 是归属项目根：`thread/listAll` 只有靠它才能把会话折进
+    ///   项目组（否则落进 `own` 桶）；
+    /// - `driver_ref` 是驱动方给的不透明句柄，桌面侧栏据此把会话归入「驱动会话」
+    ///   小节。
+    ///
+    /// 两者都是 `Option`：旧插件不发（前向兼容），此时行为与改动前一致
+    /// （会话不进项目组），绝不因为缺字段把整条动作判废。
     Launch {
         workdir: String,
         title: String,
         objective: String,
+        driver_project: Option<String>,
+        driver_ref: Option<String>,
     },
     /// 向已有会话追加一轮。
     Append {
@@ -49,6 +61,14 @@ pub(crate) fn parse_action(value: &Value) -> Option<DriverAction> {
                 .unwrap_or_default()
                 .to_string(),
             objective: action.get("objective")?.as_str()?.to_string(),
+            driver_project: action
+                .get("driver_project")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            driver_ref: action
+                .get("driver_ref")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         },
         "append" => DriverActionKind::Append {
             thread_id: action.get("thread_id")?.as_str()?.to_string(),
@@ -221,17 +241,43 @@ mod tests {
     fn a_launch_answer_parses_its_fields() {
         let value = json!({
             "action_id": "a1", "kind": "launch",
-            "workdir": "/w", "title": "T", "objective": "do it"
+            "workdir": "/w", "title": "T", "objective": "do it",
+            "driver_project": "/proj", "driver_ref": "card-1"
         });
         match parse_action(&value).unwrap().kind {
             DriverActionKind::Launch {
                 workdir,
                 title,
                 objective,
+                driver_project,
+                driver_ref,
             } => {
                 assert_eq!(workdir, "/w");
                 assert_eq!(title, "T");
                 assert_eq!(objective, "do it");
+                assert_eq!(driver_project.as_deref(), Some("/proj"));
+                assert_eq!(driver_ref.as_deref(), Some("card-1"));
+            }
+            other => panic!("expected launch, got {other:?}"),
+        }
+    }
+
+    /// 归属字段是**后加**的：旧插件（升级前）不发这两个键，宿主必须照旧起会话，
+    /// 只是落在「未分组」——不能因为缺字段就整条动作判废。这正是前向兼容面。
+    #[test]
+    fn a_launch_answer_without_ownership_still_parses() {
+        let value = json!({
+            "action_id": "a1", "kind": "launch",
+            "workdir": "/w", "title": "T", "objective": "do it"
+        });
+        match parse_action(&value).unwrap().kind {
+            DriverActionKind::Launch {
+                driver_project,
+                driver_ref,
+                ..
+            } => {
+                assert_eq!(driver_project, None);
+                assert_eq!(driver_ref, None);
             }
             other => panic!("expected launch, got {other:?}"),
         }
@@ -549,10 +595,14 @@ mod tests {
                 workdir,
                 title,
                 objective,
+                driver_project,
+                driver_ref,
             } => {
                 assert_eq!(workdir, "/w/card-1");
                 assert_eq!(title, "看板 · a.spec");
                 assert_eq!(objective, "do the card");
+                assert_eq!(driver_project.as_deref(), Some("/proj"));
+                assert_eq!(driver_ref.as_deref(), Some("card-1"));
             }
             other => panic!("expected launch, got {other:?}"),
         }
