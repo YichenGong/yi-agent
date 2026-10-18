@@ -647,11 +647,19 @@ Expected: FAIL（未实现）
 - `DriverActionKind::Append { thread_id, objective }` → 直接 `prepare_and_deliver`；
   thread 不存在 → `Err("unknown thread: {thread_id}")`（回报 `ok:false`，由插件决定重试）。
 
-`launch_inner` 的 meta 落盘字段名去掉 `card_id`/`board_project`：
-- `card_id` → 删（宿主不认识卡片）。
-- `board_project` → 通用 `driver_project`（本插件作用的项目根）。
-- `thread_store` 的 meta 结构若为此需要改，则一并改（`thread_store.rs`），并保留
-  旧字段的**兼容读取**（旧会话仍能被读出）。
+`launch_inner` 的 meta 落盘字段名通用化（**改名，不是删除**）：
+- `board_project` → `driver_project`（被驱动会话所属的项目根）。
+- `card_id` → `driver_ref`（插件给这张工作单元的**不透明**句柄；宿主不解释其含义，
+  只在 worktree 判定时按既有约定使用）。**不得删除**：`worktree_reclaim` 需要它推导
+  `kanban/<slug>` 分支（`worktree_reclaim.rs:137`），而**该语义重写归 G2**（见本任务
+  开头的范围裁决）。删掉它等于把 G2 的工作（改为从 worktree 自身读分支）提前到 G1。
+- `thread_store` 的 meta 结构随之改名，并对旧名保留**兼容读取**：新字段加
+  `#[serde(alias = "board_project")]` / `#[serde(alias = "card_id")]`，使磁盘上的旧
+  meta 仍能被正确读出（本文件既有「零迁移」做法，参见 `preserve_thinking`）。
+- `thread_summary_json`（`server.rs:6116-6117`）与 `desktop/src/lib/protocol.ts:280/282`
+  的**有线键同步改名**（单一名字，不保留双写）；`ThreadSidebar.tsx:600/924` 与
+  `ThreadSidebar.test.tsx` 的 5 处 fixture、`threadSearch.ts/.test.ts` 同步。
+  桌面「看板会话」小节的**文案**不改（属 G2 的桌面面），只改它据以分组的键。
 
 - [ ] **Step 4: 跑测试确认通过**
 
