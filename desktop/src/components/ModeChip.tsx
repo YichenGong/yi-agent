@@ -7,6 +7,8 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import type { ThreadMode } from "../lib/threadPermissionMode";
+import { Modal } from "../ui/Modal";
+import { Popover } from "../ui/Popover";
 
 const LABEL: Record<ThreadMode, string> = { normal: "Normal", yolo: "YOLO" };
 const OPTIONS = ["normal", "yolo"] as const;
@@ -37,19 +39,6 @@ export function ModeChip({
     // Single place that hands focus back once a surface is dismissed.
     triggerRef.current?.focus();
   }, []);
-
-  // Escape dismisses whichever surface is open without changing the mode.
-  useEffect(() => {
-    if (!open && !confirming) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        close();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [open, confirming, close]);
 
   // Move focus into whichever surface just opened.
   useEffect(() => {
@@ -125,73 +114,68 @@ export function ModeChip({
         {label}
       </button>
 
-      {open && !confirming && (
-        <>
-          <div className="fixed inset-0 z-10" onClick={close} />
-          <div
-            role="menu"
-            onKeyDown={onMenuKeyDown}
-            className="absolute bottom-full left-0 z-20 mb-1 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
-          >
-            {OPTIONS.map((m, i) => (
-              <button
-                key={m}
-                ref={(el) => {
-                  itemRefs.current[i] = el;
-                }}
-                type="button"
-                role="menuitemradio"
-                aria-checked={m === mode}
-                onClick={() => choose(m)}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-              >
-                <span className="w-3 text-fg-muted">{m === mode ? "✓" : ""}</span>
-                {LABEL[m]}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-
-      {confirming && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby={headingId}
-            className="w-full max-w-md rounded-lg border border-line-strong bg-panel p-4 shadow-xl"
-          >
-            <h2 id={headingId} className="mb-2 text-sm font-semibold text-fg">
-              Enable YOLO mode?
-            </h2>
-            <ul className="mb-4 list-disc space-y-1 pl-5 text-xs text-fg-muted">
-              <li>Skips tool-approval prompts.</li>
-              <li>Relaxes the OS sandbox to full access.</li>
-              <li>Blacklisted commands are still hard-denied.</li>
-            </ul>
-            <div className="flex justify-end gap-2">
-              <button
-                ref={cancelRef}
-                type="button"
-                onClick={close}
-                className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  close();
-                  onChange("yolo");
-                }}
-                className="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500"
-              >
-                Confirm YOLO
-              </button>
-            </div>
-          </div>
+      {/* 下拉与确认弹层各自的 Escape 关闭都由原语负责（onClose=close 含回焦）。 */}
+      <Popover open={open && !confirming} onClose={close}>
+        <div
+          role="menu"
+          onKeyDown={onMenuKeyDown}
+          className="absolute bottom-full left-0 z-20 mb-1 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+        >
+          {OPTIONS.map((m, i) => (
+            <button
+              key={m}
+              ref={(el) => {
+                itemRefs.current[i] = el;
+              }}
+              type="button"
+              role="menuitemradio"
+              aria-checked={m === mode}
+              onClick={() => choose(m)}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+            >
+              <span className="w-3 text-fg-muted">{m === mode ? "✓" : ""}</span>
+              {LABEL[m]}
+            </button>
+          ))}
         </div>
-      )}
+      </Popover>
+
+      <Modal
+        open={confirming}
+        onClose={close}
+        overlayClassName="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+        panelClassName="w-full max-w-md rounded-lg border border-line-strong bg-panel p-4 shadow-xl"
+        labelledBy={headingId}
+      >
+        <h2 id={headingId} className="mb-2 text-sm font-semibold text-fg">
+          Enable YOLO mode?
+        </h2>
+        <ul className="mb-4 list-disc space-y-1 pl-5 text-xs text-fg-muted">
+          <li>Skips tool-approval prompts.</li>
+          <li>Relaxes the OS sandbox to full access.</li>
+          <li>Blacklisted commands are still hard-denied.</li>
+        </ul>
+        <div className="flex justify-end gap-2">
+          <button
+            ref={cancelRef}
+            type="button"
+            onClick={close}
+            className="rounded-md border border-line-strong px-3 py-1.5 text-sm text-fg hover:bg-raised"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              close();
+              onChange("yolo");
+            }}
+            className="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500"
+          >
+            Confirm YOLO
+          </button>
+        </div>
+      </Modal>
     </div>
   );
 }
