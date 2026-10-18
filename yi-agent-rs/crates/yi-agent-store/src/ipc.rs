@@ -3139,10 +3139,9 @@ impl RequestContext {
 
     /// 借出那条长生命周期连接。调用方在闭包内串行使用它。
     ///
-    /// 只有测试走这里：`respond` 的分支要反复借用同一条连接，因此它直接持有
-    /// `repository` 守卫。这个入口是 `RequestContext` 的契约（见 task brief 的
-    /// Interfaces），保留它是因为后续按请求取连接的调用方应从它走。
-    #[allow(dead_code)]
+    /// `respond` 只有那四个真正读写 sqlite 的 arm 走这里，借还都落在 arm 内，
+    /// 绝不跨 `block_on`（尤其是能永久挂住的 `WaitAgent`）持有——连接的互斥因此
+    /// 不会把一个请求的等待时间转嫁到另一个请求上。
     pub(crate) fn with_repository<R>(
         &self,
         f: impl FnOnce(&mut RuntimeRepository) -> Result<R, IpcError>,
@@ -3183,13 +3182,17 @@ fn respond(
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
     context.reconcile_if_stale(coordinator)?;
-    let mut repository = context
-        .repository
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // 每条连接一个 handler 线程，所以请求**是**并发的：`respond` 里既有秒级
+    // 的协调器调用，也有能永久挂住的 `WaitAgent`（`timeout_ms: None` 时
+    // `wait_for_children_authorized` 永不返回）。连接因此必须**按需**借、绝不可
+    // 跨这些调用持有：否则一个仍在等待的 `WaitAgent` 会把每个 `Status` 轮询都
+    // 挡在锁后——恰恰是这次改动要修掉的那种「`pwd && ls` 都慢」。真正用到连接
+    // 的只有下面四个 arm，它们都只做一次本地 sqlite 读写，不阻塞。
     match request {
         IpcRequest::Status => Ok(IpcResponse::Status {
-            high_water_event_id: repository.latest_event_id()?,
+            high_water_event_id: context.with_repository(|repository| {
+                repository.latest_event_id().map_err(IpcError::from)
+            })?,
         }),
         IpcRequest::Stop => Ok(IpcResponse::Stopping),
         IpcRequest::CreateSession => {
@@ -3262,14 +3265,18 @@ fn respond(
             let next_run_at = definition.next_run_after(Local::now()).map_err(|error| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
             })?;
-            let schedule = repository.create_schedule(&definition, next_run_at)?;
+            let schedule = context.with_repository(|repository| {
+                repository
+                    .create_schedule(&definition, next_run_at)
+                    .map_err(IpcError::from)
+            })?;
             Ok(IpcResponse::ScheduleCreated {
                 schedule_id: schedule.id,
             })
         }
         IpcRequest::ListSchedules => Ok(IpcResponse::Schedules {
-            schedules: repository
-                .schedules()?
+            schedules: context
+                .with_repository(|repository| repository.schedules().map_err(IpcError::from))?
                 .into_iter()
                 .map(|schedule| IpcSchedule {
                     schedule_id: schedule.id,
@@ -3288,7 +3295,11 @@ fn respond(
             params,
         } => forward_plugin_query(&plugin, &method, params),
         IpcRequest::DeleteSchedule { schedule_id } => {
-            if !repository.delete_schedule(&schedule_id)? {
+            if !context.with_repository(|repository| {
+                repository
+                    .delete_schedule(&schedule_id)
+                    .map_err(IpcError::from)
+            })? {
                 return Err(IpcError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "schedule does not exist",
@@ -3670,7 +3681,9 @@ fn respond(
         }
         IpcRequest::InspectTask { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let detail = repository.task_detail(&task_id)?;
+            let detail = context.with_repository(|repository| {
+                repository.task_detail(&task_id).map_err(IpcError::from)
+            })?;
             Ok(IpcResponse::TaskDetail(IpcTaskDetail {
                 task_id: detail.task_id,
                 session_id: detail.session_id,
@@ -3739,8 +3752,12 @@ fn respond(
                 .as_deref()
                 .map(parse_id::<RootSessionId>)
                 .transpose()?;
-            let tasks = repository
-                .task_summaries(session_id.as_ref(), active_only)?
+            let tasks = context
+                .with_repository(|repository| {
+                    repository
+                        .task_summaries(session_id.as_ref(), active_only)
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(|task| IpcTaskSummary {
                     task_id: task.task_id,
@@ -3757,8 +3774,12 @@ fn respond(
             after_event_id,
         } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let events = repository
-                .event_records_for_task_after(&task_id, after_event_id.unwrap_or(0))?
+            let events = context
+                .with_repository(|repository| {
+                    repository
+                        .event_records_for_task_after(&task_id, after_event_id.unwrap_or(0))
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(ipc_event)
                 .collect();
@@ -3766,8 +3787,12 @@ fn respond(
         }
         IpcRequest::ReadTaskMailbox { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let messages = repository
-                .mailbox_messages_for_task(&task_id)?
+            let messages = context
+                .with_repository(|repository| {
+                    repository
+                        .mailbox_messages_for_task(&task_id)
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(|message| IpcMailboxMessage {
                     message_id: message.message_id,
@@ -3784,7 +3809,9 @@ fn respond(
         }
         IpcRequest::ReadTaskDiff { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let detail = repository.task_detail(&task_id)?;
+            let detail = context.with_repository(|repository| {
+                repository.task_detail(&task_id).map_err(IpcError::from)
+            })?;
             let diff = coordinator.delivery_diff(&task_id).ok().flatten();
             Ok(IpcResponse::TaskDiff {
                 task_id: detail.task_id,
@@ -3794,8 +3821,10 @@ fn respond(
         }
         IpcRequest::ReadTaskTrace { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let rows: Vec<IpcTraceRow> = repository
-                .trace_after(&task_id, 0)?
+            let rows: Vec<IpcTraceRow> = context
+                .with_repository(|repository| {
+                    repository.trace_after(&task_id, 0).map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(ipc_trace_row)
                 .collect();
@@ -3812,7 +3841,11 @@ fn respond(
             after_event_id,
             filters,
         } => {
-            let snapshot = repository.subscription_snapshot(after_event_id)?;
+            let snapshot = context.with_repository(|repository| {
+                repository
+                    .subscription_snapshot(after_event_id)
+                    .map_err(IpcError::from)
+            })?;
             let tasks = snapshot
                 .tasks
                 .into_iter()
@@ -4532,5 +4565,47 @@ mod request_context_tests {
             .with_repository(|repository| repository.schema_version().map_err(IpcError::from))
             .expect("second read");
         assert_eq!(first, second);
+    }
+
+    /// 回归测试：不用仓库的 arm 不得被用仓库的 arm 挡住。
+    ///
+    /// 每条连接一个 handler 线程，请求是并发的。曾经的写法在 `match` 之前就
+    /// `context.repository.lock()` 并跨整个 `match` 持有；那样一个仍在等待的
+    /// `WaitAgent`（`timeout_ms: None` 时永不返回）会把每个 `Status` 轮询都挡在
+    /// 锁后——正是这次要修掉的「`pwd && ls` 都慢」。这里用一个在 sqlite 读期间
+    /// 故意睡 300ms 的持有者模拟慢 arm：`Stop` 根本不碰仓库，正确的按 arm 借还
+    /// 下它会立刻返回；跨 arm 持锁的写法则会让它排队等满那 300ms。
+    #[test]
+    fn an_arm_that_does_not_use_the_repository_is_not_blocked_by_one_that_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("runtime.sqlite");
+        let factory: Arc<dyn AgentWorkerFactory> = Arc::new(UnavailableWorkerFactory);
+        let coordinator =
+            Arc::new(RuntimeCoordinator::open(&database_path, factory).expect("coordinator opens"));
+        let context = Arc::new(RequestContext::new(&database_path).expect("context builds"));
+
+        let slow_context = Arc::clone(&context);
+        let slow = thread::spawn(move || {
+            slow_context
+                .with_repository(|repository| {
+                    thread::sleep(Duration::from_millis(300));
+                    repository.latest_event_id().map_err(IpcError::from)
+                })
+                .expect("slow read");
+        });
+        // 与该持有者争用同一条连接。
+        thread::sleep(Duration::from_millis(50));
+
+        // `Stop` 不碰仓库：它不该被那个持有者挡住。
+        let started = Instant::now();
+        let response = respond(&context, &coordinator, IpcRequest::Stop).expect("stop answers");
+        let elapsed = started.elapsed();
+        slow.join().unwrap();
+
+        assert!(matches!(response, IpcResponse::Stopping));
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "an arm that never touches the repository must not wait behind one that does; waited {elapsed:?}"
+        );
     }
 }
