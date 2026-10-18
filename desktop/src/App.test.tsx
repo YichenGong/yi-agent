@@ -4762,7 +4762,41 @@ describe("拖入路径", () => {
     await act(async () => {
       dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
     });
-    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe('"/Users/me/My Docs"');
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(ta.value).toBe('"/Users/me/My Docs"');
+    // 光标必须落在插入块的末尾：App 把 `caretSeek` 交给 MessageInput，由它
+    // `setSelectionRange`。含空格的路径带引号后长 19，故 19。
+    expect(ta.selectionStart).toBe(19);
+    expect(ta.selectionEnd).toBe(19);
+  });
+
+  it("连续两次 drop 都把光标放在新插入块的末尾", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // 第一次：空草稿 → 19 个字符，光标 19。
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    expect(ta.value).toBe('"/Users/me/My Docs"');
+    expect(ta.selectionStart).toBe(19);
+    // 第二次前把光标挪回行首（走组件自己的 onSelect 通路，与用户点一下行首同路）。
+    // 这一步是这条用例能否证伪的关键：jsdom 在 `value` 被赋值时会把选区挪到**全文
+    // 末尾**，所以「插在末尾」的第二次插入无论 caretSeek 在不在，选区都恰好等于
+    // 插入块末尾（19 → 39），证伪不了任何东西。只有让第二次插入落在文本**中间**，
+    // 「插入块末尾」(19) 与「全文末尾」(38) 才分开，而把光标放到 19 只能靠
+    // caretSeek 这条 App→MessageInput 通路。
+    ta.setSelectionRange(0, 0);
+    fireEvent.select(ta);
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    // 行首插入不加前导空格（needsSpace 只在光标前有内容且不以空白结尾时成立）。
+    expect(ta.value).toBe('"/Users/me/My Docs""/Users/me/My Docs"');
+    expect(ta.selectionStart).toBe(19);
+    expect(ta.selectionEnd).toBe(19);
   });
 
   it("drop 落在卡片之外时不改草稿", async () => {
