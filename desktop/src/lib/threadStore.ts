@@ -91,8 +91,9 @@ export class ThreadStore {
   }
 
   /**
-   * Seeds status and cwd/model from a `thread/listAll` snapshot. **Does not
-   * touch session content** — sessions are accumulated from notifications only.
+   * Seeds status, cwd/model and the permission mode from a `thread/listAll`
+   * snapshot. **Does not touch session content** — sessions are accumulated from
+   * notifications only.
    *
    * The snapshot is a point-in-time read that can be stale: the server writes
    * `turn/completed` *before* it persists the turn and flips the thread back to
@@ -102,6 +103,13 @@ export class ThreadStore {
    * written one, the snapshot must not roll it back. A default `idle` from a
    * merely-created view is not "written by the push stream" — `statusSource`
    * records which it is.
+   *
+   * The mode seed is likewise a fill-in-when-missing: a snapshot that does not
+   * carry the field (an older server, or a thread it no longer lists) leaves the
+   * existing value alone, and can *never* roll a known one back to `null` — that
+   * unconditional overwrite was the bug fixed in `8ef49300`. A push
+   * (`thread/permissionModeChanged`) and the `thread/resume` / `thread/start`
+   * responses stay the higher authority.
    */
   seed(threads: ThreadSummary[]): void {
     for (const t of threads) {
@@ -111,6 +119,10 @@ export class ThreadStore {
         this.statusSource.set(t.thread_id, "snapshot");
       }
       v.info = { cwd: t.cwd, model: t.model, model_ref: t.model_ref ?? null };
+      // 权限模式同样从快照补：只补「未知」，绝不把已确定的值打回 null（`8ef49300`
+      // 修的正是后者）。清单里缺该字段（旧服务端/该会话不在快照中）⇒ 保持未知，
+      // 交给 resume 回包或 `thread/permissionModeChanged` 推送定案。
+      if (t.permission_mode !== undefined) v.mode = t.permission_mode;
     }
   }
 
