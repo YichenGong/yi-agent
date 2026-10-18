@@ -3,18 +3,15 @@
 //! 本模块不认识看板、卡片、合并。它只认识两件事：宿主能提供的通用事实
 //! （某个会话闲不闲），与宿主能执行的两个通用动作（新建会话 / 追加一轮）。
 //!
-//! 本任务到达时消费方尚未接线：拉拍循环 `driver_step` 已就位但主循环要到 Task 6
-//! 才调它，`SessionLauncher` 的真实现更晚（Task 5）。所以下面这些类型、以及
-//! `driver_step` / `threads_payload` 在生产构建下暂时「未读」。它们是**跨进程协议
-//! 面**（字段名与插件逐字对齐），删掉才是错的，故照本 crate 既有的协议字段放行
-//! 做法显式 `#[allow(dead_code)]`；消费方接入后应当把放行去掉。
+//! 主循环里的 `driver_tick` 是消费方：它按通用常驻登记表遍历项目、用插件清单
+//! 发现「谁要驱动会话」（`driver_plugins`），再对每个 (项目, 插件) 组合拉一拍
+//! （`driver_step`），由 `SessionLauncher` 的真实现执行动作。
 
 use serde_json::Value;
 use std::path::Path;
 
 /// 宿主能执行的通用动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum DriverActionKind {
     /// 在一个 workdir 里新建会话，并投递 `objective` 作为首轮。
     Launch {
@@ -30,7 +27,6 @@ pub(crate) enum DriverActionKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct DriverAction {
     pub action_id: String,
     pub kind: DriverActionKind,
@@ -40,7 +36,6 @@ pub(crate) struct DriverAction {
 ///
 /// `{"action": null}`、缺 `action_id`、或未知 `kind` 一律返回 `None`：调度器
 /// 前向兼容——插件日后新增动作类型时，旧宿主只是「这一拍什么都不做」。
-#[allow(dead_code)]
 pub(crate) fn parse_action(value: &Value) -> Option<DriverAction> {
     let action = value.get("action").unwrap_or(value);
     let action_id = action.get("action_id")?.as_str()?.to_string();
@@ -66,14 +61,12 @@ pub(crate) fn parse_action(value: &Value) -> Option<DriverAction> {
 
 /// 宿主为本插件启动或追加过的会话（宿主自身的通用记账）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct DriverThread {
     pub thread_id: String,
 }
 
 /// 一次动作的结果，下一拍回传插件。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct ActionResult {
     pub action_id: String,
     pub ok: bool,
@@ -81,16 +74,31 @@ pub(crate) struct ActionResult {
     pub error: Option<String>,
 }
 
+/// 一个 (项目, 插件) 组合的驱动记账，随主循环存活、跨 tick 累积。
+///
+/// 之所以要持久：`results` 是「上一拍做完、本拍要回报插件」的结果（`driver_step`
+/// 送出去之后才清空），`threads` 是宿主为该插件起过的会话——两者都必须比一次
+/// tick 活得久，否则插件永远收不到 `thread_id`、也无从判断某个会话是否空闲。
+///
+/// 它不是共享状态：只被主循环的 tick 分支按顺序 `&mut` 借用（与 `threads` 同属
+/// 主循环局部量），故不需要加锁，也没有任何任务并发访问它。
+#[derive(Default)]
+pub(crate) struct DriverState {
+    pub threads: Vec<DriverThread>,
+    pub results: Vec<ActionResult>,
+}
+
 /// 执行动作的副作用。真实现复用 `start_thread_core` / `prepare_turn_core` 的
-/// 无响应帧路径（Task 5 接线）；测试用替身驱动纯逻辑。
-#[allow(dead_code)]
+/// 无响应帧路径；测试用替身驱动纯逻辑。
 pub(crate) trait SessionLauncher {
     async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String>;
 }
 
 /// 把宿主持有的会话事实编成 `driver/next` 的 `threads` 参数。
-#[allow(dead_code)]
-pub(crate) fn threads_payload(threads: &[DriverThread], idle: &dyn Fn(&str) -> bool) -> Value {
+pub(crate) fn threads_payload(
+    threads: &[DriverThread],
+    idle: &(dyn Fn(&str) -> bool + Sync),
+) -> Value {
     Value::Array(
         threads
             .iter()
@@ -106,14 +114,18 @@ pub(crate) fn threads_payload(threads: &[DriverThread], idle: &dyn Fn(&str) -> b
 
 /// 拉一拍：问插件「下一步做什么」，执行至多一个动作，返回其结果。
 ///
+/// `idle` 是宿主对「某个会话此刻闲不闲」的回答（主循环按 tick 采一次快照，
+/// 见 `driver_tick`）：插件靠它判断某一轮跑完了没有。它是宿主唯一能提供的
+/// 通用事实，故由调用方传入而非在本函数里读取任何 thread 表。
+///
 /// `results` 里是上一拍尚未回报的结果；本拍把它们上送，**送达之后**才清空
 /// （`query` 失败时保留，下一拍重发）。
-#[allow(dead_code)]
 pub(crate) async fn driver_step<L: SessionLauncher>(
-    query: &dyn Fn(&Value) -> Result<Value, String>,
+    query: &(dyn Fn(&Value) -> Result<Value, String> + Sync),
     threads: &mut Vec<DriverThread>,
     results: &mut Vec<ActionResult>,
     launcher: &mut L,
+    idle: &(dyn Fn(&str) -> bool + Sync),
 ) -> Option<ActionResult> {
     let results_payload = Value::Array(
         results
@@ -129,7 +141,7 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
             .collect(),
     );
     let params = serde_json::json!({
-        "threads": threads_payload(threads, &|_| false),
+        "threads": threads_payload(threads, idle),
         "results": results_payload,
     });
     let answer = match query(&params) {
@@ -170,11 +182,6 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
 /// 声明了 `session_driver` 的插件名（按插件名排序，稳定）。
 ///
 /// 读的是**通用**清单目录；宿主不认识任何具体插件。
-///
-/// 本任务（Task 4）到达时消费方尚未接线：把插件列表接进主循环是 Task 6 的事，
-/// 在此之前生产构建下它「未读」。删除才是错的（这是宿主发现驱动插件的唯一入口），
-/// 故照本 crate 既有做法显式 `#[allow(dead_code)]`；Task 6 接线后应把放行去掉。
-#[allow(dead_code)]
 pub(crate) fn driver_plugins(scope: &Path) -> Vec<String> {
     let dir = scope.join(".yi-agent").join("supervisors");
     let mut names: Vec<String> = yi_agent_supervisors::manifest::load_manifests(&dir)
@@ -244,8 +251,6 @@ mod tests {
         assert!(parse_action(&json!({ "kind": "launch", "workdir": "/w" })).is_none());
     }
 
-    use std::cell::RefCell;
-
     #[derive(Default)]
     struct FakeLauncher {
         seen: Vec<DriverAction>,
@@ -267,6 +272,14 @@ mod tests {
         move |_params: &Value| Ok(reply.clone())
     }
 
+    /// 测试用的空闲快照：默认「谁都不闲」。
+    ///
+    /// 与接线前 `driver_step` 内部写死的 `&|_| false` 同义，故这些既有测试
+    /// 断言的仍是同一套行为；真的空闲来源由主循环的 `driver_tick` 采集。
+    fn nobody_idle() -> impl Fn(&str) -> bool {
+        |_| false
+    }
+
     #[tokio::test]
     async fn a_launch_action_is_executed_and_reported_ok() {
         let reply = json!({
@@ -280,8 +293,14 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome =
-            driver_step(&answering(reply), &mut threads, &mut results, &mut launcher).await;
+        let outcome = driver_step(
+            &answering(reply),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+        )
+        .await;
 
         let outcome = outcome.unwrap();
         assert_eq!(outcome.action_id, "a1");
@@ -302,9 +321,15 @@ mod tests {
             ..Default::default()
         };
 
-        let outcome = driver_step(&answering(reply), &mut threads, &mut results, &mut launcher)
-            .await
-            .unwrap();
+        let outcome = driver_step(
+            &answering(reply),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+        )
+        .await
+        .unwrap();
 
         assert!(!outcome.ok);
         assert_eq!(outcome.error.as_deref(), Some("worktree gone"));
@@ -322,6 +347,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            &nobody_idle(),
         )
         .await;
 
@@ -339,16 +365,23 @@ mod tests {
             thread_id: None,
             error: Some("boom".into()),
         }];
-        let seen: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+        let seen = std::sync::Mutex::new(Vec::new());
         let query = |params: &Value| {
-            seen.borrow_mut().push(params.clone());
+            seen.lock().unwrap().push(params.clone());
             Ok(reply.clone())
         };
         let mut launcher = FakeLauncher::default();
 
-        driver_step(&query, &mut threads, &mut results, &mut launcher).await;
+        driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+        )
+        .await;
 
-        let sent = seen.borrow().clone();
+        let sent = seen.lock().unwrap().clone();
         assert_eq!(sent[0]["results"][0]["action_id"], "a0");
         assert_eq!(sent[0]["results"][0]["ok"], false);
         assert!(results.is_empty(), "consumed results are cleared");
@@ -366,7 +399,14 @@ mod tests {
         let query = |_params: &Value| Err("daemon down".to_string());
         let mut launcher = FakeLauncher::default();
 
-        let outcome = driver_step(&query, &mut threads, &mut results, &mut launcher).await;
+        let outcome = driver_step(
+            &query,
+            &mut threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+        )
+        .await;
 
         assert!(outcome.is_none(), "a failed query cannot advance the tick");
         assert!(launcher.seen.is_empty(), "no action is executed");
@@ -394,6 +434,7 @@ mod tests {
             &mut threads,
             &mut results,
             &mut launcher,
+            &nobody_idle(),
         )
         .await;
 
@@ -402,6 +443,43 @@ mod tests {
             results.is_empty(),
             "the results were delivered, so a null answer must not re-send them"
         );
+    }
+
+    /// 空闲快照必须真的进到 `threads[]` 里：插件唯一的「这轮跑完了」信号就是它
+    /// （spec §4.6）。接线时若把参数丢掉、退回写死的 `false`，插件就永远推进不了
+    /// 卡片状态，故这里钉住快照与 thread_id 的对应关系。
+    #[tokio::test]
+    async fn the_idle_snapshot_reaches_the_wire_per_thread() {
+        let mut threads = vec![
+            DriverThread {
+                thread_id: "busy".into(),
+            },
+            DriverThread {
+                thread_id: "done".into(),
+            },
+        ];
+        let mut results = Vec::new();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let query = |params: &Value| {
+            seen.lock().unwrap().push(params.clone());
+            Ok(json!({ "action": null }))
+        };
+        let mut launcher = FakeLauncher::default();
+        let idle = |thread_id: &str| thread_id == "done";
+
+        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle).await;
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(
+            sent[0]["threads"][0]["idle"], false,
+            "a busy thread must be reported busy: {sent:?}"
+        );
+        assert_eq!(sent[0]["threads"][0]["thread_id"], "busy");
+        assert_eq!(
+            sent[0]["threads"][1]["idle"], true,
+            "the snapshot must answer per thread, not globally: {sent:?}"
+        );
+        assert_eq!(sent[0]["threads"][1]["thread_id"], "done");
     }
 
     #[test]
