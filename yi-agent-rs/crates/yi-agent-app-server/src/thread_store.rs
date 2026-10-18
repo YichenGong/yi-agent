@@ -115,6 +115,42 @@ fn default_true() -> bool {
     true
 }
 
+/// 看板卡片 worktree 的**约定落点**:`<vcs 根>/.worktrees/kanban/<slug>`。
+///
+/// 卡片会话的 cwd 就是这里(插件 `worktree::worktree_path` 与宿主
+/// `worktree_reclaim::decide` 用的是同一条路径)。这类目录**不是一个项目**:
+/// 它没有组长,也不该出现在侧栏的顶层目录组里。
+///
+/// 为什么按「路径里含 `.worktrees/kanban` 这一段」判,而不是按 meta 的
+/// `board_project`/`card_id`:判定要能作用于**任意**一条 meta,包括真机里已经
+/// 落错的那些幽灵组长(`role:"lead"` 且 `board_project: None`)——它们只有路径
+/// 这条线索。反过来,一个恰好带 `card_id` 的会话若 cwd 不在该约定之下,便不是
+/// 卡片 worktree,照旧当普通会话。
+pub fn is_card_worktree(cwd: &Path) -> bool {
+    let mut saw_worktrees = false;
+    for part in cwd.components() {
+        let std::path::Component::Normal(part) = part else {
+            continue;
+        };
+        let part = part.to_string_lossy();
+        if part == "kanban" && saw_worktrees {
+            return true;
+        }
+        saw_worktrees = part == ".worktrees";
+    }
+    false
+}
+
+/// 一条 meta 是否是**合法**组长:带组长角色,且不在卡片 worktree 里。
+///
+/// 卡片 worktree 不是项目,那里的 `role:"lead"` 只可能是误落盘(真机已有 9 例:
+/// 卡片会话 `ask_lead` → `resolve_lead_target` 懒创建)。把它当作非法,是为了让
+/// 「谁是组长」在这一个函数里只有一种答案:`find_lead`、wire 上的 `role`、
+/// `is_lead_thread`、`listAll` 的分组全部引用它。
+pub fn is_lead_meta(meta: &ThreadMeta) -> bool {
+    meta.role.as_deref() == Some(LEAD_ROLE) && !is_card_worktree(Path::new(&meta.cwd))
+}
+
 /// 一次 turn 的 token 用量。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnUsage {
@@ -386,12 +422,11 @@ impl ThreadStore {
     ///
     /// 取「最早创建」而非「最新」,是为了让懒创建幂等:并发/重复调用无论如何
     /// 都收敛到同一个组长,而不是每次挑一个不同的。
+    ///
+    /// 只认**合法**组长(见 [`is_lead_meta`]):卡片 worktree 里那份 `role:"lead"`
+    /// 是假组长,必须忽略,否则该 worktree 会在侧栏里变成带组长的顶层项目组。
     pub fn find_lead(&self) -> io::Result<Option<ThreadMeta>> {
-        let mut leads: Vec<ThreadMeta> = self
-            .list()?
-            .into_iter()
-            .filter(|meta| meta.role.as_deref() == Some(LEAD_ROLE))
-            .collect();
+        let mut leads: Vec<ThreadMeta> = self.list()?.into_iter().filter(is_lead_meta).collect();
         leads.sort_by_key(|a| a.created_at);
         Ok(leads.into_iter().next())
     }
@@ -2430,6 +2465,53 @@ mod tests {
             real.join(".yi-agent").display().to_string()
         );
         assert_eq!(store.project_key(), store.project_key());
+    }
+
+    /// 看板 worktree 的路径必须被认出来:`<vcs 根>/.worktrees/kanban/<slug>`。
+    /// 排除的是这一条**约定路径**,不是「任何带 worktree 字样的目录」。
+    #[test]
+    fn card_worktree_paths_are_recognised() {
+        assert!(is_card_worktree(Path::new("/p/.worktrees/kanban/card-1")));
+        assert!(is_card_worktree(Path::new("/p/.worktrees/kanban")));
+        assert!(!is_card_worktree(Path::new("/p")));
+        assert!(!is_card_worktree(Path::new("/p/.worktrees/other/x")));
+        assert!(!is_card_worktree(Path::new("/p/kanban/x")));
+    }
+
+    /// 看板 worktree 不是「项目」:它里面**没有**组长。
+    ///
+    /// 一条落在那里的 `role:"lead"` meta 是假组长(真机数据里已有 9 例:
+    /// 卡片会话 `ask_lead` → `resolve_lead_target` 在 worktree 里懒创建)。
+    /// `find_lead` 必须无视它,否则该 worktree 会在侧栏里变成一个带组长的
+    /// 顶层项目组。
+    #[test]
+    fn a_kanban_worktree_never_hosts_a_lead() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join(".worktrees/kanban/card-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = ThreadStore::new(&worktree);
+        let mut phantom = meta("thread-lead-phantom");
+        phantom.cwd = worktree.display().to_string();
+        phantom.role = Some(LEAD_ROLE.to_string());
+        store.create(&phantom).unwrap();
+
+        assert!(
+            store.find_lead().unwrap().is_none(),
+            "a card worktree has no lead, even when a lead meta sits there"
+        );
+
+        // 同一个 role 落在普通项目目录里仍被认成组长:排除的是**路径**,不是 role。
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_store = ThreadStore::new(&project);
+        let mut real = meta("thread-lead-real");
+        real.cwd = project.display().to_string();
+        real.role = Some(LEAD_ROLE.to_string());
+        project_store.create(&real).unwrap();
+        assert_eq!(
+            project_store.find_lead().unwrap().unwrap().thread_id,
+            "thread-lead-real"
+        );
     }
 
     /// 旧 meta（本字段出现前落盘的文件）必须读成 epoch 0 / last_item_id None，

@@ -123,7 +123,10 @@ pub(crate) async fn handle(
                 // (`thread/lead`)或某个会话给组长留言(`resolve_lead_target`)。
                 //
                 // 读失败的目录(`read_ok == false`)不写:读不到就不该有副作用。
-                if read_ok && metas.is_empty() {
+                // 卡片 worktree(`.worktrees/kanban/<slug>`)不是项目:它没有组长,
+                // 绝不能在这里被种一个——真机上 9 个幽灵组长正是这条懒创建路径
+                // (经卡片会话 `ask_lead` → `resolve_lead_target`)落下的。
+                if read_ok && metas.is_empty() && !crate::thread_store::is_card_worktree(path) {
                     if let Err(e) = crate::lead::ensure_lead_meta(
                         &crate::thread_store::ThreadStore::new(path),
                         path,
@@ -139,10 +142,18 @@ pub(crate) async fn handle(
                         metas = fresh;
                     }
                 }
-                let own: Vec<_> = metas.iter().filter(|m| m.driver_project.is_none()).collect();
+                let own: Vec<_> = metas
+                    .iter()
+                    .filter(|m| m.driver_project.is_none())
+                    .collect();
+                // 卡片 worktree(`.worktrees/kanban/<slug>`)不是项目:它永不顶层成组,
+                // 也不贡献「自己的会话」。真机上这类目录里还躺着一个误落盘的幽灵组长
+                // (`role:"lead"`,`driver_project: None`)——若照旧把它算进 `own`,该
+                // worktree 就会在侧栏里变成一个带「组长」行的顶层项目组(用户报的现象)。
+                let card_worktree = crate::thread_store::is_card_worktree(path);
                 // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
                 // 否则它只是卡片 worktree,归拢后被抑制。
-                if !own.is_empty() || metas.is_empty() {
+                if !card_worktree && (!own.is_empty() || metas.is_empty()) {
                     for m in own {
                         plain
                             .entry(dir.clone())
@@ -369,12 +380,14 @@ pub(crate) async fn handle(
                     .await?;
                 }
                 Err(e) => {
-                    write_response(
-                        state.hub,
-                        state.client,
-                        err_response(id, RpcError::internal(e.to_string())),
-                    )
-                    .await?;
+                    // 卡片 worktree 之类的「不是项目」是调用方问错了目录(InvalidInput),
+                    // 按参数错误回;真正的 I/O 故障仍是 internal。
+                    let rpc_error = if e.kind() == std::io::ErrorKind::InvalidInput {
+                        RpcError::invalid_params(e.to_string())
+                    } else {
+                        RpcError::internal(e.to_string())
+                    };
+                    write_response(state.hub, state.client, err_response(id, rpc_error)).await?;
                 }
             }
         }

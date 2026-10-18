@@ -7933,6 +7933,33 @@ fn write_meta(
         .unwrap();
 }
 
+/// 手工落一份 `role:"lead"` 的 meta(复刻真机里误落盘的幽灵组长)。
+fn write_lead_meta(dir: &Path, id: &str) {
+    let meta = crate::thread_store::ThreadMeta {
+        thread_id: id.into(),
+        cwd: dir.to_string_lossy().into(),
+        model: String::new(),
+        created_at: 0,
+        updated_at: 0,
+        title: Some("组长".into()),
+        permission_mode: crate::thread_store::ThreadMode::Normal,
+        pin_seq: None,
+        driver_project: None,
+        driver_ref: None,
+        model_ref: None,
+        reasoning_effort: None,
+        tag: None,
+        preserve_thinking: true,
+        content_epoch: 0,
+        last_item_id: None,
+        extra_roots: Vec::new(),
+        role: Some(crate::thread_store::LEAD_ROLE.to_string()),
+    };
+    crate::thread_store::ThreadStore::new(dir)
+        .create(&meta)
+        .unwrap();
+}
+
 /// 建一个真 git 仓库（main 分支 + 一次提交），返回 canonical 路径。
 fn git_project(dir: &Path) -> PathBuf {
     let run = |args: &[&str]| {
@@ -15676,4 +15703,181 @@ async fn list_all_exposes_the_lead_role_only_for_the_lead() {
     );
 
     h.shutdown().await;
+}
+
+/// 看板卡片会话所在的 worktree **不是项目**,`thread/lead` 不得为它种组长。
+///
+/// 这正是真机上的幽灵组长来源:卡片会话的 cwd 是 `<项目>/.worktrees/kanban/<slug>`,
+/// 它调 `ask_lead` → 主循环 `resolve_lead_target` → 这条 RPC 的同一个
+/// `ensure_lead_meta`,于是 worktree 里凭空多出一个 `role:"lead"`,侧栏里那个
+/// worktree 就变成一个带组长的顶层项目组。真机数据里已有 9 例。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_lead_refuses_to_create_a_lead_in_a_card_worktree() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = git_project(&dir.path().join("proj"));
+    let wt = git_kanban_worktree(&project, "card-1");
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let v = rpc(
+        &mut h,
+        5,
+        "thread/lead",
+        serde_json::json!({ "cwd": wt.to_string_lossy() }),
+    )
+    .await;
+    assert!(
+        v.get("error").is_some(),
+        "a card worktree has no project to lead; the call must be refused: {v}"
+    );
+    assert!(
+        crate::thread_store::ThreadStore::new(&wt)
+            .find_lead()
+            .unwrap()
+            .is_none(),
+        "nothing may be persisted inside the card worktree"
+    );
+
+    // 项目根照旧:拒绝的是路径,不是功能。
+    let ok = rpc(
+        &mut h,
+        6,
+        "thread/lead",
+        serde_json::json!({ "cwd": project.to_string_lossy() }),
+    )
+    .await;
+    assert!(
+        ok["result"]["thread_id"].as_str().is_some(),
+        "a real project still gets its lead: {ok}"
+    );
+
+    h.shutdown().await;
+}
+
+/// `listAll` 不得给「只含卡片会话的 worktree」懒创建组长,也不得把 worktree 里
+/// 的假组长当作组长暴露出去。
+///
+/// 两条懒创建/暴露路径都必须与 `find_lead` 同口径,否则 worktree 会在侧栏里
+/// 顶层成组、并多出一条「组长」行——正是用户报的现象。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_never_treats_a_card_worktree_as_a_project_with_a_lead() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = git_project(&dir.path().join("proj"));
+    let wt = git_kanban_worktree(&project, "card-1");
+    let p = project.to_string_lossy().to_string();
+    let w = wt.to_string_lossy().to_string();
+    write_meta(&wt, "t-card", "看板 · card-1", Some(&p), Some("card-1"));
+    // 复刻真机落盘状态:worktree 里还躺着一个幽灵组长(`role:"lead"`,
+    // `driver_project: None`)。它必须既不顶层成组、也不暴露为组长。
+    write_lead_meta(&wt, "t-phantom-lead");
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    // worktree 进索引 = 卡片会话落盘后的样子;项目根也进索引。
+    add_workspace(&mut h, 11, &w).await;
+    add_workspace(&mut h, 12, &p).await;
+
+    let all = list_all(&mut h).await;
+    let groups = all["result"]["groups"].as_array().unwrap();
+    assert!(
+        !groups.iter().any(|g| g["workspace"] == w.as_str()),
+        "the card worktree must not become a top-level group: {all}"
+    );
+
+    let entries: Vec<serde_json::Value> = groups
+        .iter()
+        .flat_map(|g| g["threads"].as_array().cloned().unwrap_or_default())
+        .collect();
+    // 只有**卡片 worktree 里**的条目不许被暴露为组长:项目根自己那个组长
+    // (listAll 为它懒创建,合法)照旧带 `role:"lead"`。
+    assert!(
+        !entries.iter().any(|t| {
+            t["role"] == serde_json::json!("lead") && t["cwd"] == serde_json::json!(w)
+        }),
+        "the card worktree must not expose a lead row: {all}"
+    );
+    assert!(
+        !entries
+            .iter()
+            .any(|t| t["thread_id"] == serde_json::json!("t-phantom-lead")),
+        "the phantom lead is not a project's session and must not be listed: {all}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 卡片会话（项目键落在 `.worktrees/kanban/` 下）不该拿到 `ask_lead`:它没有组长,
+/// 注册了只会投进空邮箱,并在主循环里造一个假组长。判定由装配期传入的项目键决定。
+#[test]
+fn a_card_session_does_not_get_ask_lead() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    // 一个真实的卡片会话项目键:<worktree>/.yi-agent。
+    let card_key = repo
+        .path()
+        .join(".worktrees/kanban/card-1")
+        .join(".yi-agent")
+        .display()
+        .to_string();
+    let names = build_runtime_tooling(
+        &cfg,
+        &root,
+        "thread-card",
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        card_key,
+        crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
+    )
+    .expect("tooling")
+    .registry
+    .names();
+    assert!(
+        !names.contains(&"ask_lead".to_string()),
+        "a card session has no lead to ask, got {names:?}"
+    );
+
+    // 普通会话照旧有 `ask_lead`:排除的是卡片会话,不是功能。
+    let names = build_runtime_tooling(
+        &cfg,
+        &root,
+        "thread-plain",
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        repo.path().join(".yi-agent").display().to_string(),
+        crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
+    )
+    .expect("tooling")
+    .registry
+    .names();
+    assert!(
+        names.contains(&"ask_lead".to_string()),
+        "a plain session keeps ask_lead, got {names:?}"
+    );
 }
