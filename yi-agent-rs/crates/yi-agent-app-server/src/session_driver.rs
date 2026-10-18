@@ -105,7 +105,8 @@ pub(crate) fn threads_payload(threads: &[DriverThread], idle: &dyn Fn(&str) -> b
 
 /// 拉一拍：问插件「下一步做什么」，执行至多一个动作，返回其结果。
 ///
-/// `results` 里是上一拍尚未回报的结果；本拍把它们上送后清空。
+/// `results` 里是上一拍尚未回报的结果；本拍把它们上送，**送达之后**才清空
+/// （`query` 失败时保留，下一拍重发）。
 #[allow(dead_code)]
 pub(crate) async fn driver_step<L: SessionLauncher>(
     query: &dyn Fn(&Value) -> Result<Value, String>,
@@ -130,13 +131,16 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
         "threads": threads_payload(threads, &|_| false),
         "results": results_payload,
     });
-    results.clear();
-
     let answer = match query(&params) {
         Ok(answer) => answer,
-        // 插件/daemon 不可用：本拍无法推进，留给下一拍重试。
+        // 本拍无法推进：动作留给下一拍重试，待回报的 results 保留不丢。
         Err(_) => return None,
     };
+    // 只在成功上送之后消费：`query` 失败时上面已提前返回，`results` 原样留给
+    // 下一拍重发。注意清空必须早于下面的 `?`——答案虽为空/未知动作，results 却
+    // 已经送达插件，绝不能再重发一次。
+    results.clear();
+
     let action = parse_action(&answer)?;
 
     match launcher.launch(&action).await {
@@ -328,5 +332,55 @@ mod tests {
         assert_eq!(sent[0]["results"][0]["action_id"], "a0");
         assert_eq!(sent[0]["results"][0]["ok"], false);
         assert!(results.is_empty(), "consumed results are cleared");
+    }
+
+    #[tokio::test]
+    async fn pending_results_survive_a_failed_query() {
+        let mut threads = Vec::new();
+        let mut results = vec![ActionResult {
+            action_id: "a0".into(),
+            ok: true,
+            thread_id: Some("thread-1".into()),
+            error: None,
+        }];
+        let query = |_params: &Value| Err("daemon down".to_string());
+        let mut launcher = FakeLauncher::default();
+
+        let outcome = driver_step(&query, &mut threads, &mut results, &mut launcher).await;
+
+        assert!(outcome.is_none(), "a failed query cannot advance the tick");
+        assert!(launcher.seen.is_empty(), "no action is executed");
+        assert_eq!(
+            results.len(),
+            1,
+            "results that were never delivered must be kept for the next tick"
+        );
+        assert_eq!(results[0].action_id, "a0");
+    }
+
+    #[tokio::test]
+    async fn a_delivered_null_answer_still_consumes_the_results() {
+        let mut threads = Vec::new();
+        let mut results = vec![ActionResult {
+            action_id: "a0".into(),
+            ok: false,
+            thread_id: None,
+            error: Some("boom".into()),
+        }];
+        let mut launcher = FakeLauncher::default();
+
+        let outcome = driver_step(
+            &answering(json!({ "action": null })),
+            &mut threads,
+            &mut results,
+            &mut launcher,
+        )
+        .await;
+
+        assert!(outcome.is_none());
+        assert!(
+            results.is_empty(),
+            "the results were delivered, so a null answer must not re-send them"
+        );
     }
 }
