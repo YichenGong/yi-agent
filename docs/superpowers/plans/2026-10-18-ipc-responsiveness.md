@@ -209,6 +209,14 @@ git commit -m "perf(kanban-ipc): poll for connections instead of sleeping 200ms"
 
 **Rationale:** `respond()` builds a fresh current-thread tokio runtime and reopens the sqlite repository (`Connection::open` + two PRAGMAs + `migrate`'s schema parse) on **every** request. Measured `Status` p50 = 45ms on a path that touches no plugin. Reuse removes that per-request cost.
 
+> **Correction (from Task 2's measurements):** the 45ms was **not** the per-request
+> cost. Direct measurement puts `Runtime::new()` + `RuntimeRepository::open()`
+> together at ~0.2ms; the 45ms was the accept loop's 10ms `WouldBlock` sleep, fixed
+> by **Task 3**. This task is still correct and necessary — it removes the ~0.2ms and
+> its reused connection is what makes Task 2's review fix (`1dfc6fed`, scoping the
+> borrow to the four sqlite arms instead of holding it across the whole `match`)
+> expressible. See the plan's Task 3 and the evidence file §3.3.
+
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent-store/src/ipc.rs:3094-3103` (`respond`), `:910-925` (daemon accept loop, to build the context once), `:1452-1458` (`handle_client` signature)
 - Test: `yi-agent-rs/crates/yi-agent-store/src/ipc.rs` (`mod tests`)
@@ -433,6 +441,12 @@ git commit -m "perf(daemon): reuse one runtime and repository per daemon"
 ### Task 3: Daemon accept loop polls instead of sleeping 10ms
 
 **Rationale:** The daemon's listener sets non-blocking and sleeps 10ms on `WouldBlock`, adding 0-10ms of baseline latency and ~100 wakeups/sec to every request. Same `poll(2)` treatment as Task 1.
+
+> **This is the dominant daemon fix.** Task 2's measurements showed the 45ms `Status`
+> p50 lived here, not in per-request setup: with this sleep at 10ms the round-trip
+> was 46.8ms; at 100µs it was 0.54ms. Independently reproduced via
+> `daemon_handler_thread_leak` (1500 connections): 21.97s → 0.83s. See the evidence
+> file §3.3.
 
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent-store/src/ipc.rs:858-859` (`set_nonblocking`), `:915-948` (accept match), and the `listener.accept` error arm
