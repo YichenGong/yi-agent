@@ -870,6 +870,29 @@ mod tests {
     }
 
     #[test]
+    fn promoting_a_prequeued_card_keeps_its_origin_thread() {
+        // 提升不重算 id、也不动溯源：讨论会话随卡走到 Queued。
+        let mut board = Board::new();
+        board.enqueue_prequeued(
+            CardId::new("idea"),
+            "一个想法".into(),
+            Some("thread-discuss-1".into()),
+            at(1, 0),
+        );
+        board
+            .promote_prequeued(
+                &CardId::new("idea"),
+                "a.spec.md".into(),
+                "a.plan.md".into(),
+                None,
+            )
+            .unwrap();
+        let card = board.get(&CardId::new("idea")).unwrap();
+        assert_eq!(card.state, CardState::Queued);
+        assert_eq!(card.origin_thread_id.as_deref(), Some("thread-discuss-1"));
+    }
+
+    #[test]
     fn promoting_with_a_new_title_overwrites_it_but_not_the_id() {
         let mut board = Board::new();
         let idea = CardId::new("idea");
