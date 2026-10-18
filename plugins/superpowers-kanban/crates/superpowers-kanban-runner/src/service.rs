@@ -2558,7 +2558,7 @@ mod tests {
     /// 独立合并卡——`add-merge`（main.rs）/ `enqueue_merge`（dispatch.rs）的产物：
     /// 出生即 `Queued`、`kind == Merge`、**没有** `thread_id`——必须能接进会话合并轮。
     ///
-    /// 这是回归锁：`claim_next_merge` 随裸 git 通路退役后，合并轮一度只认「追加到
+    /// 这是回归锁：裸 git 通路（连同 `claim_next_merge`）退役后，合并轮一度只认「追加到
     /// 已有会话」，这类卡的四条路全断（`next_startable` 排除非实现卡、收敛扫描只认
     /// 实现卡、`merge_request` 拒 `Queued`、CLI `done` 要求 `awaiting_merge`），
     /// 只能永远停在队列里。
