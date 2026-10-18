@@ -145,6 +145,8 @@ fn a_git_project_gets_the_delegation_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -227,6 +229,8 @@ fn a_git_project_gets_the_show_git_diff_tool() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -281,6 +285,8 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -344,6 +350,8 @@ fn the_assembly_hands_the_reply_registry_to_ask_lead() {
         "proj-test".to_string(),
         inbox.clone(),
         replies.clone(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -513,6 +521,8 @@ fn only_the_lead_sees_the_memory_tools() {
             "proj-test".to_string(),
             crate::lead::LeadInbox::new(),
             crate::lead::LeadReplies::new(),
+            crate::lead_control::LeadControlInbox::new(),
+            crate::lead_control::LeadControlReplies::new(),
             None,
         )
         .expect("tooling")
@@ -563,6 +573,96 @@ fn only_the_lead_sees_the_memory_tools() {
     assert!(
         crate::lead_memory::memory_path(&project_root).exists(),
         "the ledger must land under the project root, not somewhere else"
+    );
+}
+
+/// 两个写工具(`lead_interrupt_thread` / `lead_reject_thread`)只给组长:普通会话
+/// 装配后注册表里绝不能有它们。
+///
+/// 负臂是本测试的重点,理由与 `only_the_lead_sees_the_memory_tools` 同款:只断言
+/// 「组长看得到」会漏掉最危险的接法——无条件注册;那样组长那条断言照样绿,而每个
+/// 普通会话都悄悄拿到了「取消 / 打回项目里别的 thread」的写权限。故这里同时钉:
+/// ① 从未落过盘的普通会话看不到;② 该会话的工具集非空(`ask_lead` 还在),证明
+/// 「看不到」不是 registry 整体空掉。
+///
+/// 判定只看落盘的 `ThreadMeta.role`(唯一权威):正臂走生产的 `ensure_lead_meta`
+/// 造 meta,不手搓一个「像组长」的形状。
+#[test]
+fn only_the_lead_sees_the_control_tools() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    // 两个写工具是组长写通道的消费侧:装配期注入一对独立实例即可(本测试只断言
+    // 「注册表里有没有」,不发指令;发指令的集成测试是 Task 5 的事)。
+    let build = |thread_id: &str| {
+        build_runtime_tooling(
+            &cfg,
+            &root,
+            thread_id,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
+            crate::lead::LeadReplies::new(),
+            crate::lead_control::LeadControlInbox::new(),
+            crate::lead_control::LeadControlReplies::new(),
+            None,
+        )
+        .expect("tooling")
+    };
+
+    // 负臂:从未落过盘的普通会话。
+    let plain_names = build("thread-never-persisted").registry.names();
+    assert!(
+        !plain_names.contains(&"lead_interrupt_thread".to_string())
+            && !plain_names.contains(&"lead_reject_thread".to_string()),
+        "a plain thread must not see the control tools, got {plain_names:?}"
+    );
+    // 非空 witness:缺席是真的缺席,而不是整个 registry 空掉。
+    assert!(
+        plain_names.contains(&"ask_lead".to_string()),
+        "a plain thread still gets the shared tools, got {plain_names:?}"
+    );
+
+    // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。`project_root` 取
+    // `canonicalize()` 形态(与 `only_the_lead_sees_the_memory_tools` 同一手法);
+    // store 仍用生产拼写(`cfg.workdir`,非 canonical),与装配里读 role 的那份同源。
+    let project_root = repo.path().canonicalize().expect("repo path canonicalizes");
+    let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
+    let (lead_meta, _created) = crate::lead::ensure_lead_meta(&store, &project_root)
+        .expect("the production lead path must persist a lead meta");
+    assert_eq!(
+        lead_meta.role.as_deref(),
+        Some(crate::thread_store::LEAD_ROLE),
+        "the production lead path must persist the role"
+    );
+
+    let lead_names = build(&lead_meta.thread_id).registry.names();
+    assert!(
+        lead_names.contains(&"lead_interrupt_thread".to_string())
+            && lead_names.contains(&"lead_reject_thread".to_string()),
+        "the lead must see both control tools, got {lead_names:?}"
     );
 }
 
@@ -650,6 +750,8 @@ fn a_lead_in_a_repo_subdirectory_sees_the_memory_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -726,6 +828,8 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -858,6 +962,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         &crate::lead::LeadInbox::new(),
         &crate::lead::LeadReplies::new(),
+        &crate::lead_control::LeadControlInbox::new(),
+        &crate::lead_control::LeadControlReplies::new(),
         // 这些测试直接调 attach_delegation，不起会话，故无起点。
         None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
@@ -875,6 +981,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         &crate::lead::LeadInbox::new(),
         &crate::lead::LeadReplies::new(),
+        &crate::lead_control::LeadControlInbox::new(),
+        &crate::lead_control::LeadControlReplies::new(),
         // 这些测试直接调 attach_delegation，不起会话，故无起点。
         None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
@@ -1592,9 +1700,9 @@ pub(crate) struct Harness {
     /// 与主循环**共享**的组长写通道:Task 5 的测试据此直接投递写指令,
     /// 断言主循环真的把它转成了对目标 thread 的动作。
     ///
-    /// 本 Task 只把它接进 `Harness` 的 `RuntimeAttachments`(与 `lead_inbox` 同一
-    /// 手法),读者是 Task 5 的测试;接线前 clippy 会判成 dead_code,故暂放行——
-    /// **Task 5 落地后必须删掉下面两行 allow**。
+    /// 这两个字段与 `lead_inbox` 同一手法(接进 `Harness` 的 `RuntimeAttachments`),
+    /// 但**读者是 Task 5 的集成测试**,尚未落地,故这里仍判成 dead_code。allow 的
+    /// 归属人是 **Task 5**:其测试落地后必须删掉下面两行 allow。
     #[allow(dead_code)]
     pub(crate) lead_control: crate::lead_control::LeadControlInbox,
     /// 与主循环**共享**的写结果登记表,同一手法:测试据此扮演组长工具,
@@ -14449,6 +14557,8 @@ fn delegation_tooling_carries_the_theme_tool() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -14952,6 +15062,8 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -16384,6 +16496,8 @@ fn a_card_session_does_not_get_ask_lead() {
         card_key,
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -16406,6 +16520,8 @@ fn a_card_session_does_not_get_ask_lead() {
         repo.path().join(".yi-agent").display().to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -16466,6 +16582,8 @@ fn a_merge_round_session_does_not_get_ask_lead() {
         merge_key,
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -16535,6 +16653,8 @@ fn the_lead_does_not_get_ask_lead() {
             project_root.join(".yi-agent").display().to_string(),
             crate::lead::LeadInbox::new(),
             crate::lead::LeadReplies::new(),
+            crate::lead_control::LeadControlInbox::new(),
+            crate::lead_control::LeadControlReplies::new(),
             None,
         )
         .expect("tooling")

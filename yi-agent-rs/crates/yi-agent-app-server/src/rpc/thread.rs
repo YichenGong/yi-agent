@@ -316,6 +316,8 @@ pub(crate) async fn handle(
                 None,
                 state.lead_inbox,
                 state.lead_replies,
+                state.lead_control,
+                state.lead_control_replies,
             )
             .await?;
 
@@ -541,6 +543,8 @@ pub(crate) async fn handle(
                 extra_roots,
                 state.lead_inbox,
                 state.lead_replies,
+                state.lead_control,
+                state.lead_control_replies,
                 // resume 路径：meta 已在盘上，起点取已落盘的 `anchor_sha`。
                 // 旧会话没有该字段时是 `None`——那表示「无起点」，按方案 1 不回填。
                 loaded.meta.anchor_sha.clone(),

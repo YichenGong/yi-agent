@@ -359,13 +359,6 @@ pub(crate) struct AppState<'a> {
     /// 组长写通道与结果登记表。`thread/start` 与 `thread/resume` 各把前者交给
     /// `start_thread_core` / `attach_delegation`（转交给组长写工具）。与
     /// [`AppState::lead_inbox`] 同一理由，按 `&` 借用。
-    ///
-    /// 本 Task 只把它们接进 `AppState`（主循环注入），真正的读者（组长写工具经
-    /// `build_runtime_tooling` 取用）由下一个 Task 接线；接线前 clippy 会把它们
-    /// 判成 dead_code，故暂放行——**接线后必须删掉这两行 allow**（与 `lead_control`
-    /// 模块上那行同一时限，见 `lib.rs`）。
-    #[allow(dead_code)]
     pub(crate) lead_control: &'a crate::lead_control::LeadControlInbox,
-    #[allow(dead_code)]
     pub(crate) lead_control_replies: &'a crate::lead_control::LeadControlReplies,
 }
