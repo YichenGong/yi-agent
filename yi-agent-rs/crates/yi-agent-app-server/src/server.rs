@@ -1503,6 +1503,8 @@ where
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
     // 启动期把存量 `.env` 模型键收边进清单（一次性、幂等）。
     migrate_legacy_model_keys_on_startup();
+    // 启动期把旧看板登记表导入通用常驻登记（一次性、幂等；失败只 warn）。
+    migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
     serve_stdio(
         reader,
         writer,
@@ -1586,6 +1588,8 @@ where
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
     // 与 `run` 一致:启动期做一次性 `.env` → 清单迁移。
     migrate_legacy_model_keys_on_startup();
+    // 与 `run` 一致:启动期把旧看板登记表导入通用常驻登记(一次性、幂等)。
+    migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     serve_scoped_core(
         reader,
@@ -1887,6 +1891,250 @@ fn migrate_legacy_model_keys_on_startup() {
             &yi_agent_runtime::models::models_path(),
         );
         yi_agent_runtime::migrate::log_outcome(&outcome, &env_path);
+    }
+}
+
+/// 旧看板登记表里登记的项目路径，按 `{"boards":[{"project":"<abs>"}]}` 解析。
+///
+/// 这里**故意不依赖 `yi_agent_boards`**：Task 6 会删掉那整个 crate，而迁移代码
+/// 必须活下来（它是旧环境能否保住看板的唯一路径）。旧格式只有 `boards[].project`
+/// 一个字段有意义，故几十行本地解析比引一个即将消失的依赖更安全。
+///
+/// 读侧宽容，且**故意不**在损坏时改名：一份手改坏的 `boards.json` 若被当成
+/// 「空表」然后改名取证，用户就再也拿不回里面的项目了。损坏 → 返回 `None`、
+/// 文件原地不动，由调用方记一条 warn；缺文件 → 空列表（没什么可迁的）。
+fn parse_legacy_board_projects(legacy_file: &Path) -> Option<Vec<PathBuf>> {
+    let text = match std::fs::read_to_string(legacy_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %legacy_file.display(),
+                "could not read the legacy board registry; leaving it in place"
+            );
+            return None;
+        }
+    };
+    #[derive(serde::Deserialize)]
+    struct Legacy {
+        #[serde(default)]
+        boards: Vec<LegacyBoard>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyBoard {
+        project: PathBuf,
+    }
+    match serde_json::from_str::<Legacy>(&text) {
+        Ok(registry) => Some(registry.boards.into_iter().map(|b| b.project).collect()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %legacy_file.display(),
+                "the legacy board registry is corrupt; leaving it in place"
+            );
+            None
+        }
+    }
+}
+
+/// 生产启动期的一次性迁移：旧看板登记表 → 通用常驻登记。
+///
+/// 只在生产入口（`run` / `serve_stdio_with_relay`）调用一次，与
+/// [`migrate_legacy_model_keys_on_startup`] 同一段初始化。**任何失败都只记 warn，
+/// 绝不阻断启动**——迁移是便利，不是前置：登记表读不动时宿主照样要能起来。
+///
+/// 请求者名用字面量而非 `yi_agent_boards::lifecycle::REQUESTER`：那个 crate 会被
+/// Task 6 删掉，而写进 `resident-daemons.json` 的 `required_by` 是**磁盘契约**，
+/// 迁移时写下的名字必须与看板插件此后读写的一致。
+fn migrate_legacy_board_requests_on_startup(board_dir: &Path, resident_dir: &Path) {
+    let legacy_file = board_dir.join("boards.json");
+    let Some(projects) = parse_legacy_board_projects(&legacy_file) else {
+        return;
+    };
+    if projects.is_empty() {
+        return;
+    }
+    match yi_agent_store::resident::import_legacy_projects(
+        &projects,
+        &legacy_file,
+        resident_dir,
+        "superpowers-kanban",
+    ) {
+        Ok(imported) => tracing::info!(
+            imported,
+            path = %legacy_file.display(),
+            "imported legacy board registrations into the resident registry"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            path = %legacy_file.display(),
+            "could not import the legacy board registry; it is left in place for the next run"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod legacy_board_migration_tests {
+    use super::*;
+
+    /// 旧格式只有 `boards[].project` 有意义;读出来的顺序即文件顺序。
+    #[test]
+    fn the_legacy_registry_yields_its_project_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("boards.json");
+        std::fs::write(
+            &legacy,
+            r#"{"boards":[{"project":"/p/a","created_at":"x"},{"project":"/p/b"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_legacy_board_projects(&legacy),
+            Some(vec![PathBuf::from("/p/a"), PathBuf::from("/p/b")])
+        );
+    }
+
+    /// 缺文件不是错误:没什么可迁的(而不是「读不动」)。
+    #[test]
+    fn an_absent_legacy_registry_is_nothing_to_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            parse_legacy_board_projects(&dir.path().join("boards.json")),
+            Some(Vec::new())
+        );
+    }
+
+    /// 手改坏的登记表**不得**被当成空表然后改名:那会把里面的项目永久丢掉。
+    /// 故解析失败返回 `None` 且文件原文不动。
+    #[test]
+    fn a_corrupt_legacy_registry_is_left_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("boards.json");
+        std::fs::write(&legacy, "{ not json").unwrap();
+
+        assert_eq!(parse_legacy_board_projects(&legacy), None);
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "{ not json",
+            "the damaged file must be left for a human to recover"
+        );
+    }
+
+    /// 启动期整套动作:旧表 → 登记(请求者名字正确) → 旧表改名。
+    #[test]
+    fn the_startup_migration_imports_the_projects_and_renames_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let board_dir = dir.path().join("boards");
+        let resident_dir = dir.path().join("resident");
+        std::fs::create_dir_all(&board_dir).unwrap();
+        let legacy = board_dir.join("boards.json");
+        std::fs::write(&legacy, r#"{"boards":[{"project":"/p/a"}]}"#).unwrap();
+
+        migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+
+        assert_eq!(
+            yi_agent_store::resident::list(&resident_dir),
+            vec![PathBuf::from("/p/a")]
+        );
+        assert_eq!(
+            yi_agent_store::resident::entries(&resident_dir)[0].required_by,
+            vec!["superpowers-kanban"],
+            "the requester name is the disk contract the plugin reads back"
+        );
+        assert!(!legacy.exists(), "the old file is renamed");
+        assert!(board_dir.join("boards.json.migrated").exists());
+    }
+
+    /// 幂等:第二次启动时旧表已改名 → 什么都没发生,登记内容一字不变。
+    #[test]
+    fn the_startup_migration_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let board_dir = dir.path().join("boards");
+        let resident_dir = dir.path().join("resident");
+        std::fs::create_dir_all(&board_dir).unwrap();
+        std::fs::write(
+            board_dir.join("boards.json"),
+            r#"{"boards":[{"project":"/p/a"}]}"#,
+        )
+        .unwrap();
+
+        migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+        let after_first = yi_agent_store::resident::list(&resident_dir);
+
+        migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+
+        assert_eq!(yi_agent_store::resident::list(&resident_dir), after_first);
+        assert!(!board_dir.join("boards.json").exists());
+    }
+
+    /// 坏表 / 无表都不能让启动失败:迁移是便利,不是前置。
+    #[test]
+    fn the_startup_migration_never_blocks_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let board_dir = dir.path().join("boards");
+        let resident_dir = dir.path().join("resident");
+        std::fs::create_dir_all(&board_dir).unwrap();
+        std::fs::write(board_dir.join("boards.json"), "{ not json").unwrap();
+
+        // 返回 `()` 本身就是断言:没有 `Result` 可传播,也就没有失败路径。
+        migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+
+        assert!(!board_dir.join("boards.json.migrated").exists());
+    }
+
+    /// 生产源码:截到本测试模块之前,并去掉注释行。
+    ///
+    /// 两个理由:① 这些断言问的是「生产入口有没有调」,测试模块里的调用不算数;
+    /// ② 迁移函数的**文档注释**里提到了那个即将被删的 crate 名(说明为何用字面量
+    /// 而不是引用它),那是 prose 而非依赖,不该被当成命中。
+    fn production_source() -> String {
+        let source = include_str!("server.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod legacy_board_migration_tests")
+            .next()
+            .expect("this module must exist");
+        production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 真实调用点:纯函数测得再细,没有调用者时验收 §6.6 仍不成立。
+    /// 两个生产入口(`run` 与 `serve_stdio_with_relay`)都必须调它。
+    #[test]
+    fn both_production_entries_run_the_migration_at_startup() {
+        let production = production_source();
+        let call = [
+            "migrate_legacy_board_requests",
+            "_on_startup(&board_dir, &resident_dir)",
+        ]
+        .concat();
+        assert_eq!(
+            production.matches(&call).count(),
+            2,
+            "`run` and `serve_stdio_with_relay` must each run the migration once"
+        );
+    }
+
+    /// 迁移代码**不得**依赖即将被删的 `yi_agent_boards`(Task 6):否则它会随那个
+    /// crate 一起消失,旧环境的看板就没人来迁了。
+    #[test]
+    fn the_migration_does_not_depend_on_the_boards_crate() {
+        let production = production_source();
+        // 只取两个迁移函数本体,到下一个顶层函数为止:文件别处(**生产入口**也)
+        // 还有 `yi_agent_boards` 的引用,那些是 Task 6 的事,不该算进这里。
+        let body = production
+            .split("fn parse_legacy_board_projects(")
+            .nth(1)
+            .and_then(|rest| rest.split("\npub(crate) async fn serve_scoped").next())
+            .expect("the migration functions must sit just before `serve_scoped`");
+        let needle = ["yi_agent", "_boards"].concat();
+        assert!(
+            !body.contains(&needle),
+            "the migration path must stay independent of the boards crate"
+        );
     }
 }
 
@@ -6663,6 +6911,7 @@ mod resident_rpc_tests {
         );
         h.shutdown().await;
     }
+
 }
 
 #[cfg(test)]
