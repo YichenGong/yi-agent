@@ -118,7 +118,8 @@
 
 **P3 路线图：**
 
-- [ ] MCP 集成 — 后端 `yi-agent-mcp` 已完成（配置/懒连接/调用/`/mcp` 开关，见 [yi-agent-mcp](./yi-agent-mcp.md)）；判据：GUI 可查看 / 启停 MCP server
+- [x] MCP 面板（只读查看）— 设置页新增「MCP」Tab，按项目列出 server 名字 / 传输（stdio 的 `command args`、http 的 `url`）/ 文件里的开关默认值 / 缓存中的工具清单（可展开，显示名字 + 一行描述 + 只读标记）；`env`/`headers` **只显示键名**，值不下发；缓存缺失或指纹不匹配时显示「工具清单尚未探测」而不是假装最新。后端 `mcp/list`（`Observe` 档，纯读盘、不起进程、不发网络）：`yi-agent-rs/crates/yi-agent-app-server/src/mcp_rpc.rs:32`（`handle_mcp_request_at`）、域 handler `yi-agent-rs/crates/yi-agent-app-server/src/rpc/mcp.rs:23`、缓存视图 `yi-agent-rs/crates/yi-agent-mcp/src/lib.rs:29`（`McpCacheEntry`）/`:40`（`cached_tools_for`）；前端 `desktop/src/components/SettingsMcpTab.tsx:28`、`desktop/src/lib/mcp.ts:101`。判据：`cd desktop && npx vitest run src/components/SettingsMcpTab.test.tsx src/lib/mcp.test.ts src/components/SettingsDialog.test.tsx && npx tsc --noEmit` + `cd yi-agent-rs && cargo test -p yi-agent-app-server mcp` — [设计](../superpowers/specs/2026-10-18-mcp-settings-panel-design.md)、[计划](../superpowers/plans/2026-10-18-mcp-settings-panel.md)
+- [ ] MCP 启停 — 在面板上启用/停用 server（需先让 app-server 留存 `McpManager` 并接通 `refresh_registry` + agent 重建，令改动对活着的会话生效）；判据：GUI 可启停 MCP server，且新开的 turn 里工具集随之变化
 
 - [ ] WebSocket 传输（app-server 侧已支持 `--listen ws://`，见 [yi-agent-app-server](./yi-agent-app-server.md)；**iOS App 已经走 ws**，见上方 iOS target 条目；桌面端 GUI 仍走 stdio，尚未接入 ws）
 - [ ] 多窗口共享 daemon — 判据：多个 GUI 窗口连同一 daemon
