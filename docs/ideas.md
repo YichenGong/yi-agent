@@ -63,3 +63,65 @@
 
 选 A 的话，直接出 spec（复用 iOS 客户端路径 + 补文档上传通道）然后进 writing-plans；
 选 B 的话，先 brainstorm 认证 / 多租户 / 沙箱边界。
+
+## 3. Superpowers 看板卡片依赖关系与 DAG 可视化
+
+**状态：暂不开发（2026-10-18 记录）。需求留档，开工前先回答下面的"待决策"。**
+
+一句话：让看板卡片能声明"卡 B 依赖卡 A"，**A 合并完成之前 B 不许开始开发**；
+并在桌面端把卡片之间的依赖画成有向无环图（DAG）。
+
+### 为什么现在提
+
+现在的调度只看队列顺序（`order`），不看卡片之间的真实先后关系。两件真实存在的事
+说明这个缺口不是假想的：
+
+- plan 正文里已经在**手写**"前置"约定：`docs/superpowers/plans/2026-10-17-plugin-lifecycle-decoupling.md:12`
+  写着「**前置：** G1（`2026-10-17-session-driver-decoupling.md`）**先落地**——G1 已删
+  `card_scheduler` 与 `board_query`，本 plan 再删 `yi-agent-boards` 与 `board/*` RPC，
+  避免两处并行改同一批文件」。这条依赖目前**只靠人记得住**，看板一无所知。
+- 若两张这样的卡同时在队里，调度器会把它们（在槽位允许时）一起启动，两处并行改同一批文件，
+  正是上面那句注释想避免的事故。
+
+### 已确认的现状线索（2026-10-18 摸代码）
+
+- **卡片模型里没有依赖字段**：`Card` 有 `kind`（implementation/merge）、`order`、
+  `origin_card`（仅自动派生合并卡时指回实现卡），但没有"我依赖谁" ——
+  `plugins/superpowers-kanban/crates/superpowers-kanban-core/src/card.rs:113-155`。
+- **调度器只看 `order`，不看依赖**：`Board::next_startable` / `claim_next_launch` 只筛
+  `Queued && Implementation`，取 `order` 最小者 ——
+  `plugins/superpowers-kanban/crates/superpowers-kanban-core/src/board.rs:186-221`。
+  调用点：`.../superpowers-kanban-runner/src/service.rs:172`（会话通路）、`:409`（合并通路）。
+- **状态机已经区分"开发"与"合并"**：`CardState` 有 `Running`（占会话槽）与
+  `Merging`（不占会话槽），终态含 `Done` —— `card.rs:32-47`、`card.rs:49-111`。
+  "A 合并完成才放 B" 的判据可以落在 A 的 `Done` 上，语义已具备。
+- **前端是四列看板、没有图概念**：`boardColumns` 把状态映射到
+  queued/doing/needDecision/done 四列（`desktop/src/lib/superpowersKanbanBoard.ts:22-42`），
+  渲染在 `desktop/src/components/SuperpowersKanbanBoard.tsx` / `SuperpowersKanbanColumn.tsx`，
+  卡片形状见 `desktop/src/lib/superpowersKanbanState.ts`（`BoardCard`）。
+- **`board.json` 是控制面与插件之间的事实契约（文件即契约）** ——
+  `board.rs:28-36` 的注释；新增依赖边要经这里落盘、再被前端读到。
+
+### 待决策（真正开工前要逐条回答，brainstorm 的落点）
+
+1. **依赖从哪里来？**
+   - A. 显式 CLI 参数：`add <spec> <plan> --depends-on <card-id>`（可多次），依赖成为
+     卡片一等字段。意图明确、可校验无环，但要求入队时手填。
+   - B. 从 plan 正文解析「前置：…」段落自动抽边。零额外输入，但解析散文不可靠，
+     漏掉依赖 = 后卡在前卡没合并时开跑（正是要防的事故）。
+   - C. A + B 组合：显式参数为主，正文解析出的边作为建议打印出来让人确认/否决。
+2. **依赖的判据是"A 卡片 done"还是"A 已合并进 main"？** 前者简单（读 A 的状态即可），
+   后者才是需求原话（"前一个要合并完了"）。注意卡片 `Done` 与"真的合并进主线"在现有
+   语义下并不等价（合并卡与实现卡是两类卡片，`card.rs:22-30`）。
+3. **环怎么办？** 入队时拒绝（保持 DAG）还是允许并检测？失败/取消的上游如何处理
+   下游（永久阻塞 / 自动取消 / 提醒人）？
+4. **可视化形态？** 复用四列之上叠加依赖线、还是另开一个"图"标签页画 DAG
+   （布局算法、缩放/平移、悬停高亮上下游）？注意现有看板是纯四列 + 卡片，没有 SVG/图库。
+5. **与既有并发控制的关系？** 依赖阻塞的卡是否要显式占用一个"被阻塞"状态（新增状态
+   会影响 `CardState::can_transition_to` 的迁移表和一堆测试），还是仅靠调度器过滤
+   （不新增状态，最小改动）？
+
+### 开工时的第一步
+
+先 brainstorm 定 Q1/Q2（依赖来源与判据是地基），再出 spec → writing-plans。
+最小可用切片建议：显式 `--depends-on` + 调度器过滤 + `board.json` 落边，先不做可视化。
