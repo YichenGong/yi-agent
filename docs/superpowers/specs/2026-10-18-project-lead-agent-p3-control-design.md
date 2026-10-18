@@ -1,6 +1,6 @@
 # 项目组长 Agent P3-B/C：写动作与移动端缺口设计
 
-状态：待实现
+状态：已实现
 
 上级设计：[2026-10-17-project-lead-agent-design.md](./2026-10-17-project-lead-agent-design.md)（§6.1、§6.2、§8、§9.1、§9.2、§10、决策 6/12/13）
 前序分期：[P1](./2026-10-17-project-lead-agent-p1.md) 已实现、[P2](./2026-10-17-project-lead-agent-p2.md) 已实现、[P3-A](./2026-10-18-project-lead-agent-p3-view-design.md) 已实现（视野工具）。

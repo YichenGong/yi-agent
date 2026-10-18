@@ -1,7 +1,7 @@
 # 项目组长 Agent（Project Lead）设计
 
 日期：2026-10-17
-状态：P1/P2 已实现并合入，P3 待实现
+状态：P1/P2 已实现并合入，P3-A/P3-B/P3-C 已实现
 模块：`yi-agent-app-server`、`yi-agent-subagent`、`desktop`、移动端远程
 关联：`docs/project-management/yi-agent-app-server.md`、`docs/project-management/subagent-runtime.md`、
 `docs/project-management/desktop.md`
