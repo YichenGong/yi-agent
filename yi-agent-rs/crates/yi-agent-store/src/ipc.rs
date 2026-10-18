@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use chrono::{Local, Timelike, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -941,25 +941,7 @@ impl Daemon {
                     .with_second(0)
                     .and_then(|value| value.with_nanosecond(0));
                 if minute != last_schedule_minute {
-                    let _ = coordinator.evaluate_schedules(now);
-                    // Trace retention is cleanup, not work: a failure here must
-                    // never wedge the accept loop, but a wedged database must be
-                    // visible rather than silent.
-                    match coordinator.prune_terminal_traces(Utc::now()) {
-                        Ok(pruned) => tracing::debug!(pruned, "pruned terminal task traces"),
-                        Err(error) => tracing::warn!(
-                            error = %error,
-                            "terminal trace pruning failed; retrying next minute"
-                        ),
-                    }
-                    // Abandoned fork uploads are the other per-minute leak: a
-                    // client that dies mid-upload leaves state a later client
-                    // may never claim. Reaping is pure in-memory bookkeeping,
-                    // so it shares the trace sweep's non-wedging shape.
-                    let expired_uploads = coordinator.prune_expired_fork_uploads(Instant::now());
-                    if expired_uploads > 0 {
-                        tracing::debug!(expired_uploads, "pruned expired fork uploads");
-                    }
+                    Daemon::run_minute_maintenance(&runtime, &coordinator, now);
                     last_schedule_minute = minute;
                 }
                 // Block until a connection arrives or the wait times out. This
@@ -1035,6 +1017,37 @@ impl Daemon {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// 每分钟的周期维护。抽成方法是为了让测试能驱动**线程每分会调用的同一条
+    /// 路径**，而不是等墙上时钟走到下一个整分（否则测试只能绕过驱动路径
+    /// 直调各方法，那正好测不到「接线」本身）。
+    fn run_minute_maintenance(
+        runtime: &tokio::runtime::Runtime,
+        coordinator: &RuntimeCoordinator,
+        now: DateTime<Local>,
+    ) {
+        // The runtime is part of this seam's signature because the async watchdog
+        // sweep is driven through it; today's three operations are all
+        // coordinator-synchronous, so bind it explicitly rather than leave an
+        // unused-parameter warning.
+        let _ = runtime;
+        let _ = coordinator.evaluate_schedules(now);
+        // Trace retention is cleanup, not work: a failure here must never wedge
+        // the accept loop, but a wedged database must be visible rather than silent.
+        match coordinator.prune_terminal_traces(Utc::now()) {
+            Ok(pruned) => tracing::debug!(pruned, "pruned terminal task traces"),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "terminal trace pruning failed; retrying next minute"
+            ),
+        }
+        // Abandoned fork uploads are the other per-minute leak: a client that
+        // dies mid-upload leaves state a later client may never claim.
+        let expired_uploads = coordinator.prune_expired_fork_uploads(Instant::now());
+        if expired_uploads > 0 {
+            tracing::debug!(expired_uploads, "pruned expired fork uploads");
+        }
     }
 
     /// How many orphaned tasks this daemon's startup sweep reclaimed.
