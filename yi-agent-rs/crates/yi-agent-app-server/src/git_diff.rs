@@ -386,7 +386,9 @@ pub async fn run_view_command(repo: &Path, command: &str) -> ViewCommandOutput {
             };
         }
         Err(_) => {
-            // `kill_on_drop` 已在 drop 时杀掉整个进程组；这里只需如实报 timeout。
+            // `kill_on_drop` 在 drop 时只回收直接 spawn 的那个子进程
+            // （`sandbox-exec` / `sh`），不保证杀掉它再派生出的后代；
+            // 这里只需如实报 timeout。
             return ViewCommandOutput {
                 exit_code: None,
                 stdout: String::new(),
@@ -886,6 +888,15 @@ mod tests {
         );
     }
 
+    // 以下四个测试会真正把命令交给沙箱去跑，故只在 macOS 上编译。
+    // Linux 上 ReadOnly 走 `bwrap`，而 CI runner（ubuntu-latest）默认没装
+    // bubblewrap：`platform_command` 直接返回 `SandboxUnavailable`，
+    // `run_view_command` fail closed（`exit_code: None`、`timed_out: false`）、
+    // 一个字节都不执行。在那里断言「跑出什么」是没有意义的——既测不到超时，
+    // 也测不到写入被拒。这与仓库既有做法一致：`yi-agent-tools` 里沙箱测试都是
+    // `#[cfg(target_os = "macos")]`（见 `shell/bash.rs`、`tests/sandbox_readonly.rs`）。
+    // 注意 `valid_rev_*` 不在此列：它只走纯 git，任何平台都得跑。
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn view_command_rejects_an_output_option_that_would_write() {
         let dir = repo();
@@ -905,6 +916,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn view_command_reports_read_output() {
         let dir = repo();
@@ -914,6 +926,7 @@ mod tests {
         assert!(!out.timed_out);
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn view_command_denies_writes_in_read_only_mode() {
         let dir = repo();
@@ -930,6 +943,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn view_command_times_out_instead_of_hanging() {
         let dir = repo();
