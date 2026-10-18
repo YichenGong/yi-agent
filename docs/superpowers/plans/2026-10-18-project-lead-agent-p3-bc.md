@@ -648,20 +648,22 @@ git commit -m "feat(app-server): 组长写工具 lead_interrupt_thread / lead_re
     ) -> Result<String, String> {
         use crate::lead_control::{classify_target, ControlTarget, LeadControlKind};
 
-        // 项目键必须完全相等；目标必须在 `threads` 里（冷会话不做，spec §5.4）。
-        let in_threads = self.threads.contains_key(&cmd.thread_id);
-        let project_key = self
-            .lead_inbox
-            .project_key_of_thread(&cmd.thread_id)
-            .unwrap_or_else(|| cmd.project_key.clone());
-        match classify_target(&cmd.project_key, &project_key, in_threads) {
-            ControlTarget::NotOpen => {
-                return Err(format!(
-                    "目标会话 {} 当前未打开（或不属于本项目），无法下达指令",
-                    cmd.thread_id
-                ));
-            }
-            ControlTarget::Session => {}
+        // 目标 thread 所属的项目键：从它的 store 现取（每个 thread 有自己的
+        // `cwd` → store，`threads` 里可能有多个项目的 thread）。取不到 = 目标不在场。
+        let target_project_key = self
+            .threads
+            .get(&cmd.thread_id)
+            .map(|s| s.store.project_key());
+        let target = classify_target(
+            &cmd.project_key,
+            target_project_key.as_deref().unwrap_or(""),
+            target_project_key.is_some(),
+        );
+        if target == ControlTarget::NotOpen {
+            return Err(format!(
+                "目标会话 {} 当前未打开（或不属于本项目），无法下达指令",
+                cmd.thread_id
+            ));
         }
 
         match cmd.kind {
@@ -710,23 +712,7 @@ git commit -m "feat(app-server): 组长写工具 lead_interrupt_thread / lead_re
     }
 ```
 
-> **实现者注意**：上面的 `lead_inbox.project_key_of_thread(..)` 是**占位**——`LeadInbox` 没有这个方法。真正可行的判定是：主循环**就是**「本项目」的唯一现场，`threads` 里的每个 thread 都属于本进程正在服务的项目。因此正确的判定是「目标在 `threads` 里即视为本项目」（跨项目 thread 不可能出现在本进程的 `threads` 里——daemon 隔离保证）。**请把那段改成**：
-
-```rust
-        // `threads` 是本进程正在服务的项目现场：里面的 thread 都属本项目。
-        // 跨项目 thread 不可能出现在这里（daemon 会话隔离的不变量），故
-        // 「不在 threads」就是唯一不可达原因。
-        let target = classify_target(&cmd.project_key, &cmd.project_key, in_threads);
-        match target {
-            ControlTarget::NotOpen => {
-                return Err(format!(
-                    "目标会话 {} 当前未打开，无法下达指令",
-                    cmd.thread_id
-                ));
-            }
-            ControlTarget::Session => {}
-        }
-```
+> **实现者注意**：这段用 `self.threads.get(&cmd.thread_id).map(|s| s.store.project_key())` 取目标项目键——每个 `ThreadSession` 自带 `store`（`session.rs` 的 `Arc<ThreadStore>`），而 `ThreadStore::project_key()`（`thread_store.rs:418`）给出该 thread 所属项目。**这是必要的**：`serve()` 的 `threads` 里可能同时有**多个项目**的 thread（侧栏跨 workspace），不能假定"在 `threads` 里就是本项目"。`classify_target` 要求项目键完全相等，跨项目目标一律 `NotOpen`（daemon 隔离不变量）。
 
 - [ ] **Step 3: 主循环接线**
 
@@ -921,36 +907,16 @@ fn only_the_lead_sees_the_control_tools() {
         "a plain thread must not see the control tools, got {names:?}"
     );
 
-    // 组长（role: lead）——两个写工具都必须出现。
+    // 组长（role: lead）——两个写工具都必须出现。用**生产的组长落盘路径**
+    // 造 meta，而不是手搓 role 字段（与 `only_the_lead_sees_the_memory_tools` 同一手法）。
     let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
-    store
-        .create(&crate::thread_store::ThreadMeta {
-            thread_id: "thread-lead".to_string(),
-            cwd: cfg.workdir.to_string_lossy().to_string(),
-            model: "test".to_string(),
-            created_at: 1,
-            updated_at: 1,
-            title: None,
-            permission_mode: crate::thread_store::ThreadMode::Normal,
-            pin_seq: None,
-            driver_project: None,
-            driver_ref: None,
-            model_ref: None,
-            reasoning_effort: None,
-            tag: None,
-            preserve_thinking: true,
-            extra_roots: Vec::new(),
-            role: Some(crate::thread_store::LEAD_ROLE.to_string()),
-            anchor_sha: None,
-            content_epoch: 0,
-            last_item_id: None,
-        })
-        .expect("lead meta");
+    let (lead_meta, _created) = crate::lead::ensure_lead_meta(&store, &project_root)
+        .expect("the production lead path must persist a lead meta");
 
     let lead_names = build_runtime_tooling(
         &cfg,
         &root,
-        "thread-lead",
+        &lead_meta.thread_id,
         yi_agent_core::autonomy::YoloSwitch::new(false),
         test_theme(),
         crate::git_diff_tool::GitDiffHandle::new(),
@@ -974,7 +940,10 @@ fn only_the_lead_sees_the_control_tools() {
 }
 ```
 
-> 若 `ThreadMeta` 的字面量字段与当前定义不符（例如新增了字段），按编译器提示补齐。
+> **实现者注意**：`ensure_lead_meta` 要求 `project_root` 是有效项目目录（非 kanban worktree）；
+> 本测试的 `project_root`（`repo.path().canonicalize()`）满足。`lead_meta.thread_id` 是
+> 生产路径铸出的组长 id，直接用它调 `build_runtime_tooling`（`is_lead_thread` 会读到刚落的 role）。
+> 若 `ensure_lead_meta` 的签名与上面不符，按编译器提示调整。
 
 - [ ] **Step 2: 运行测试确认失败**
 
@@ -1434,6 +1403,6 @@ git commit -m "docs: 项目组长 P3-B/C 实现状态与模块条目"
 - §7.3 `created_by` 不做 → 无需任务（范围外）。
 - §8 测试 → Task 1/2/4/5/6/7。
 
-**Placeholder scan:** Task 3 Step 2 里有一处**故意标注的占位**（`project_key_of_thread`）并紧跟正确改法——已给实现者明确指令，不算悬空占位。其余步骤均有可执行代码。
+**Placeholder scan:** 无 `TBD`/`TODO`/悬空占位。Task 3 Step 2 的项目键判定曾写作占位，已改为可直接落地的 `session.store.project_key()`（`thread_store.rs:418`）。Task 5 的测试一度用了不存在的 `Harness::start()`/`project_key()`/`read_items()`，已改为文件内既有的 `isolated_harness()`/`rpc()`/`read_response()`/`EVENT_WAIT`。
 
 **Type consistency:** `LeadControlCmd` 字段（`project_key`/`kind`/`thread_id`/`reason`/`request_id`）在 Task 1 定义、Task 2 构造、Task 3 消费、Task 5 测试构造，名称一致。`LeadControlReplies::resolve` 签名（`Result<String,String>`）在 Task 1/3 一致。`classify_target` 三参数在 Task 1/3 一致。`build_runtime_tooling` 新形参名（`lead_control`/`lead_control_replies`）在 Task 3/4 一致。
