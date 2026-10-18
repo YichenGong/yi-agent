@@ -287,10 +287,13 @@ impl DaemonAgentWorkerFactory {
         self
     }
 
+    /// Recovery/attestation naming path: the tool *names* a single workspace
+    /// yields, which the inherited root set never changes. The live worker path
+    /// is [`Self::worker_tool_registry`], where the inherited roots do reach
+    /// both the FS root set and the shell sandbox.
     fn tool_registry_for_workspace(&self, workspace: PathBuf) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
-        // FS 根集就是这一根；shell 沙箱的额外可写根仍走原来的 `sandbox_writable_roots`
-        // （工作流 2 才会把继承的关联根集接进这两个参数）。
+        // FS 根集就是这一根；shell 沙箱的额外可写根仍走原来的 `sandbox_writable_roots`。
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
             vec![workspace],
@@ -305,41 +308,55 @@ impl DaemonAgentWorkerFactory {
         workspace: &WorkerWorkspace,
         workspace_mode: ChildWriteMode,
         inherited: Option<yi_agent_core::InheritedSandbox>,
+        inherited_roots: Vec<PathBuf>,
     ) -> ToolRegistry {
         self.worker_tool_registry_with_base(
             workspace,
             workspace_mode,
             inherited,
+            inherited_roots,
             Arc::clone(&self.tools),
         )
     }
 
     /// 与 [`Self::worker_tool_registry`] 同逻辑，但基准工具集由调用方给出
     /// （刷新路径传入当前清单重建出的那份）。
+    ///
+    /// `inherited_roots` 是父会话传下来的关联根集（主根除外；空集 = 今天的
+    /// 单根行为）。它进**两个**参数：FS 根集（`read`/`write`/`edit`/`glob`/
+    /// `grep` 的路径解析）与 shell 沙箱的可写根集。
     fn worker_tool_registry_with_base(
         &self,
         workspace: &WorkerWorkspace,
         workspace_mode: ChildWriteMode,
         inherited: Option<yi_agent_core::InheritedSandbox>,
+        inherited_roots: Vec<PathBuf>,
         base: Arc<ToolRegistry>,
     ) -> ToolRegistry {
         let mut tools = (*base).clone();
+        // FS 根集与 shell 沙箱可写根是**两个**参数，必须分开算。顺序上自有
+        // worktree 在前：它是这一根 worker 的主根，相对路径与 cwd 都挂在它上面。
+        let mut fs_roots = vec![workspace.path.clone()];
+        fs_roots.extend(inherited_roots.iter().cloned());
         let (sandbox, writable_roots) = match workspace_mode {
             ChildWriteMode::Coding => {
-                let mut writable_roots = vec![workspace.path.clone()];
+                // shell 沙箱的可写位置 = FS 根集 + git 内部目录（后者只属于沙箱）。
+                let mut writable_roots = fs_roots.clone();
                 writable_roots.extend(git_writable_roots_for_worktree(&workspace.path));
                 (
                     resolve_effective_sandbox(self.sandbox, inherited),
                     writable_roots,
                 )
             }
+            // 只读子 agent 继承根集只扩大**读**路径解析；沙箱可写根仍为空。
             ChildWriteMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
-        // FS 根集只含该 worker 自己的 worktree；`writable_roots`（含 git 内部目录）
-        // 是 shell 沙箱专属，**不得**混进 FS 根集——否则 FS 工具能写 git 内部目录。
+        // `writable_roots`（含 git 内部目录）是 shell 沙箱专属，**不得**混进
+        // FS 根集——否则 FS 工具能写 git 内部目录。`fs_roots` 里只有该 worker
+        // 自己的 worktree 与继承来的关联根。
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
-            vec![workspace.path.clone()],
+            fs_roots,
             sandbox,
             writable_roots,
         );
@@ -746,16 +763,24 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             }
             ChildWriteMode::ReadOnly => yi_agent_tools::SandboxMode::ReadOnly,
         };
+        // `request.extra_roots` is not `Copy` and `request` is partially moved
+        // further down (`objective`, `initial_user_messages`, `fork_messages`),
+        // so take the root set before those moves.
+        let extra_roots = request.extra_roots.clone();
         let worker_tools = Arc::new(match refreshed.as_ref() {
             Some(parts) => self.worker_tool_registry_with_base(
                 &workspace,
                 workspace_mode,
                 request.inherited_sandbox,
+                extra_roots.clone(),
                 Arc::clone(&parts.tools),
             ),
-            None => {
-                self.worker_tool_registry(&workspace, workspace_mode, request.inherited_sandbox)
-            }
+            None => self.worker_tool_registry(
+                &workspace,
+                workspace_mode,
+                request.inherited_sandbox,
+                extra_roots.clone(),
+            ),
         });
         let mut config = refreshed
             .as_ref()
@@ -3079,6 +3104,18 @@ mod tests {
         }
     }
 
+    /// 与 `sandbox_inheritance_tests::factory_with_sandbox` 同一构造口径，但
+    /// 落在本模块，好和 `worker_workspace` / `initialize_git_repository` 一起用。
+    fn worker_factory(sandbox: yi_agent_tools::SandboxMode) -> DaemonAgentWorkerFactory {
+        DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            std::env::temp_dir().join("runtime.sock"),
+        )
+        .with_sandbox(sandbox, Vec::new())
+    }
+
     #[tokio::test]
     async fn child_worker_registry_allows_git_index_writes_in_its_repository() {
         let repository = TempDir::new().unwrap();
@@ -3114,7 +3151,8 @@ mod tests {
             repository.path().join("runtime.sock"),
         )
         .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
-        let registry = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
+        let registry =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None, Vec::new());
         let write = registry.get("write").expect("write tool");
         assert!(
             !write
@@ -3235,7 +3273,8 @@ mod tests {
             base_commit: String::new(),
         };
 
-        let read_only = factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly, None);
+        let read_only =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly, None, Vec::new());
         let read_only_names: Vec<_> = read_only
             .schemas()
             .into_iter()
@@ -3248,7 +3287,8 @@ mod tests {
             "read-only registry must omit write/edit, got {read_only_names:?}"
         );
 
-        let coding = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
+        let coding =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None, Vec::new());
         let coding_names: Vec<_> = coding
             .schemas()
             .into_iter()
@@ -3258,6 +3298,366 @@ mod tests {
             coding_names.iter().any(|name| name == "write")
                 && coding_names.iter().any(|name| name == "edit"),
             "coding registry must include write/edit, got {coding_names:?}"
+        );
+    }
+
+    /// 用户可见契约（工作流 2）：coding 子 agent 的 FS 工具覆盖「主根 + 继承的
+    /// 关联根」，同时仍然拒绝根集之外的位置。
+    #[tokio::test]
+    async fn coding_worker_gets_fs_tools_over_the_inherited_roots() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let linked = tempfile::TempDir::new().unwrap();
+        std::fs::write(linked.path().join("linked.txt"), "linked content\n").unwrap();
+        let outsider = tempfile::TempDir::new().unwrap();
+        let factory = worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let workspace = worker_workspace(dir.path());
+        let registry = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::Coding,
+            None,
+            vec![linked.path().to_path_buf()],
+        );
+        let names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"write".to_string()));
+        assert!(names.contains(&"read".to_string()));
+
+        // 继承来的关联根读得到。
+        let read = registry.get("read").expect("read tool");
+        let linked_read = read
+            .call(json!({"path": linked.path().join("linked.txt")}))
+            .await;
+        assert!(
+            !linked_read.is_error,
+            "an inherited root must be readable: {linked_read:?}"
+        );
+
+        // 继承来的关联根也写得到。
+        let write = registry.get("write").expect("write tool");
+        assert!(
+            !write
+                .call(json!({"path": linked.path().join("delivery.txt"), "content": "ready\n"}))
+                .await
+                .is_error,
+            "an inherited root must be writable for a coding child",
+        );
+        assert_eq!(
+            std::fs::read_to_string(linked.path().join("delivery.txt")).unwrap(),
+            "ready\n"
+        );
+
+        // 自带 worktree 仍是主根：相对路径落在它里面，不是关联根里。
+        assert!(
+            !write
+                .call(json!({"path": "own.txt", "content": "own\n"}))
+                .await
+                .is_error
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("own.txt")).unwrap(),
+            "own\n"
+        );
+
+        // 根集之外仍被拒绝：继承根集只加宽，不放宽。
+        assert!(
+            write
+                .call(json!({"path": outsider.path().join("escape.txt"), "content": "no"}))
+                .await
+                .is_error,
+            "a path outside every root must stay refused",
+        );
+        assert!(!outsider.path().join("escape.txt").exists());
+    }
+
+    /// 只读子 agent 继承根集只扩大**读**路径解析：仍然没有 write/edit，
+    /// shell 沙箱也仍是 read-only。
+    #[tokio::test]
+    async fn read_only_worker_inherits_roots_without_write_tools() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let linked = tempfile::TempDir::new().unwrap();
+        std::fs::write(linked.path().join("linked.txt"), "linked content\n").unwrap();
+        let outsider = tempfile::TempDir::new().unwrap();
+        std::fs::write(outsider.path().join("outsider.txt"), "outsider content\n").unwrap();
+        let factory = worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let workspace = worker_workspace(dir.path());
+        let registry = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::ReadOnly,
+            None,
+            vec![linked.path().to_path_buf()],
+        );
+        let names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
+        assert!(!names.contains(&"write".to_string()));
+        assert!(!names.contains(&"edit".to_string()));
+        assert!(names.contains(&"read".to_string()));
+
+        // 关联根可读。
+        let read = registry.get("read").expect("read tool");
+        assert!(
+            !read
+                .call(json!({"path": linked.path().join("linked.txt")}))
+                .await
+                .is_error,
+            "a read-only child must still read its inherited roots",
+        );
+        // 根集之外仍不可读。
+        assert!(
+            read.call(json!({"path": outsider.path().join("outsider.txt")}))
+                .await
+                .is_error
+        );
+        // 继承不改变只读沙箱。
+        assert!(registry.get("write").is_none());
+        assert_eq!(
+            registry.get("bash").unwrap().sandbox_mode(),
+            Some("read-only")
+        );
+    }
+
+    /// shell 沙箱的可写根集同样含继承的关联根，且仍把别处挡住。
+    #[tokio::test]
+    async fn coding_worker_shell_sandbox_covers_the_inherited_roots() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let linked = tempfile::TempDir::new().unwrap();
+        let outsider = tempfile::TempDir::new().unwrap();
+        let factory = worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let workspace = worker_workspace(dir.path());
+        let registry = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::Coding,
+            None,
+            vec![linked.path().to_path_buf()],
+        );
+        let bash = registry.get("bash").expect("bash tool");
+
+        let linked_probe = linked.path().join("probe.txt");
+        let linked_write = bash
+            .call(json!({"command": format!("touch {}", linked_probe.display())}))
+            .await;
+        assert!(
+            matches!(
+                linked_write.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "the shell sandbox must let a child write its inherited roots: {linked_write:?}"
+        );
+        assert!(linked_probe.exists());
+
+        let outsider_probe = outsider.path().join("probe.txt");
+        let outsider_write = bash
+            .call(json!({"command": format!("touch {}", outsider_probe.display())}))
+            .await;
+        assert!(
+            !matches!(
+                outsider_write.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "the shell sandbox must still refuse paths outside every root: {outsider_write:?}"
+        );
+        assert!(!outsider_probe.exists());
+    }
+
+    /// 两个根集**不许**混：`git_writable_roots_for_worktree` 的 git 内部目录
+    /// 只能进 shell 沙箱，绝不能进 FS 根集，否则 `write` 能直写 git 内部。
+    #[tokio::test]
+    async fn fs_roots_stay_clear_of_the_git_roots_the_shell_sandbox_needs() {
+        let repository = TempDir::new().unwrap();
+        let base_head = initialize_git_repository(repository.path());
+        let child_path = repository.path().join(".worktrees/child");
+        assert!(
+            Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/yi-agent-fs-root-split",
+                    child_path.to_str().unwrap(),
+                ])
+                .current_dir(repository.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: repository.path().to_path_buf(),
+            path: child_path.clone(),
+            branch: "feat/yi-agent-fs-root-split".into(),
+            parent_branch: "main".into(),
+            base_commit: base_head,
+        };
+        let factory = worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let registry =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None, Vec::new());
+
+        // git 内部目录在 FS 根集之外：`write` 必须写不进去。
+        let config = repository.path().join(".git/config");
+        let before = std::fs::read_to_string(&config).unwrap();
+        let write = registry.get("write").expect("write tool");
+        assert!(
+            write
+                .call(json!({"path": config, "content": "[core]\n\tevil = true\n"}))
+                .await
+                .is_error,
+            "FS tools must not reach the git metadata roots",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            before,
+            "a refused write must not touch the git config",
+        );
+
+        // 同一份 git 根必须仍进 shell 沙箱：`git add` 要能成功。
+        std::fs::write(child_path.join("delivery.txt"), "ready\n").unwrap();
+        let bash = registry.get("bash").expect("bash tool");
+        let add = bash.call(json!({"command": "git add delivery.txt"})).await;
+        assert!(
+            matches!(
+                add.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "the shell sandbox must keep the git roots writable: {add:?}"
+        );
+    }
+
+    /// 发一次 `read`（关联根内）+ 一次 `read`（根集外），把结果回灌给 provider。
+    ///
+    /// 用来测 `start_with_provider_turn_gate` 的接线：只测 `worker_tool_registry`
+    /// 会漏掉「`WorkerStart.extra_roots` 没被传下去」这一类缺陷。
+    struct LinkedRootReadProvider {
+        linked_file: String,
+        outsider_file: String,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for LinkedRootReadProvider {
+        async fn call_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            let events = match turn {
+                0 => vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "read-linked".into(),
+                        name: "read".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "read-linked".into(),
+                        partial_json: json!({"path": self.linked_file}).to_string(),
+                    },
+                    ProviderEvent::ToolUseEnd {
+                        id: "read-linked".into(),
+                    },
+                    ProviderEvent::ToolUseStart {
+                        id: "read-outsider".into(),
+                        name: "read".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "read-outsider".into(),
+                        partial_json: json!({"path": self.outsider_file}).to_string(),
+                    },
+                    ProviderEvent::ToolUseEnd {
+                        id: "read-outsider".into(),
+                    },
+                    ProviderEvent::Stop {
+                        reason: yi_agent_core::StopReason::EndTurn,
+                    },
+                ],
+                _ => vec![ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                }],
+            };
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    fn tool_results_in(request: &ProviderRequest) -> Vec<(String, bool, String)> {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                yi_agent_core::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let text = content
+                        .iter()
+                        .filter_map(|block| match block {
+                            yi_agent_core::ContentBlock::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Some((tool_use_id.clone(), *is_error, text))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 端到端接线：`WorkerStart.extra_roots` 必须真的到达 worker 自己的 FS 工具。
+    #[tokio::test]
+    async fn worker_start_hands_the_inherited_roots_to_its_fs_tools() {
+        let dir = TempDir::new().unwrap();
+        let linked = TempDir::new().unwrap();
+        let outsider = TempDir::new().unwrap();
+        std::fs::write(linked.path().join("linked.txt"), "linked content\n").unwrap();
+        std::fs::write(outsider.path().join("outsider.txt"), "outsider content\n").unwrap();
+        let provider = Arc::new(LinkedRootReadProvider {
+            linked_file: linked
+                .path()
+                .join("linked.txt")
+                .to_string_lossy()
+                .into_owned(),
+            outsider_file: outsider
+                .path()
+                .join("outsider.txt")
+                .to_string_lossy()
+                .into_owned(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            dir.path().join("runtime.sock"),
+        )
+        .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Read both files.")
+            .with_workspace_mode(ChildWriteMode::Coding)
+            .with_workspace(worker_workspace(dir.path()))
+            .with_extra_roots(vec![linked.path().to_path_buf()]);
+        let handle = factory.start(request).await.unwrap();
+        wait_until(
+            || provider.requests.lock().unwrap().len() >= 2,
+            "the worker to feed its read results back to the provider",
+        )
+        .await;
+        handle.cancel();
+
+        let requests = provider.requests.lock().unwrap();
+        let results = tool_results_in(&requests[1]);
+        let (_, linked_error, linked_text) = results
+            .iter()
+            .find(|(id, ..)| id == "read-linked")
+            .expect("the worker must run the inherited-root read");
+        assert!(
+            !linked_error && linked_text.contains("linked content"),
+            "extra_roots must reach the worker's FS tools: {results:?}"
+        );
+        let (_, outsider_error, _) = results
+            .iter()
+            .find(|(id, ..)| id == "read-outsider")
+            .expect("the worker must run the outside-root read");
+        assert!(
+            *outsider_error,
+            "the inherited root set must not widen the boundary: {results:?}"
         );
     }
 
@@ -4400,6 +4800,7 @@ mod sandbox_inheritance_tests {
             &workspace,
             ChildWriteMode::Coding,
             Some(InheritedSandbox::DangerFullAccess),
+            Vec::new(),
         );
         assert_eq!(
             tools.get("bash").unwrap().sandbox_mode(),
@@ -4412,6 +4813,7 @@ mod sandbox_inheritance_tests {
             &workspace,
             ChildWriteMode::Coding,
             Some(InheritedSandbox::ReadOnly),
+            Vec::new(),
         );
         assert_eq!(
             tools.get("bash").unwrap().sandbox_mode(),
@@ -4419,7 +4821,8 @@ mod sandbox_inheritance_tests {
         );
 
         // No inheritance: the factory's configured mode stands.
-        let tools = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
+        let tools =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None, Vec::new());
         assert_eq!(
             tools.get("bash").unwrap().sandbox_mode(),
             Some("workspace-write")
@@ -4430,6 +4833,7 @@ mod sandbox_inheritance_tests {
             &workspace,
             ChildWriteMode::ReadOnly,
             Some(InheritedSandbox::DangerFullAccess),
+            Vec::new(),
         );
         assert_eq!(tools.get("bash").unwrap().sandbox_mode(), Some("read-only"));
     }
