@@ -40,6 +40,8 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
         workdir: repo.to_path_buf(),
         system_prompt: None,
         compact_threshold: 160_000,
+        compact_ratio: 80,
+        model_context_length: None,
         compact_user_budget_tokens: 20_000,
         compact_tool_budget_tokens: 12_000,
         yolo: false,
@@ -48,6 +50,7 @@ fn config_for(repo: &Path) -> yi_agent_runtime::config::RuntimeConfig {
         sandbox_writable_roots: Vec::new(),
         skills_catalog_budget: 8192,
         skills_catalog_budget_explicit: true,
+        model_injected: false,
     }
 }
 

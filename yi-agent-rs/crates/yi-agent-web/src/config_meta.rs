@@ -1,4 +1,4 @@
-//! 15 个环境变量的元数据定义。
+//! 7 个环境变量的元数据定义（模型键已迁到 `~/.yi-agent/models.json`）。
 
 /// 字段类型。
 #[derive(Debug, Clone, PartialEq)]
@@ -22,81 +22,8 @@ pub struct VarMeta {
     pub options: &'static [&'static str],
 }
 
-/// 所有 15 个环境变量的元数据，按分组排列。
+/// 所有 7 个环境变量的元数据，按分组排列（不含模型键）。
 pub static ALL_VARS: &[VarMeta] = &[
-    // === Model Provider ===
-    VarMeta {
-        key: "YI_AGENT_PROVIDER",
-        default: Some("anthropic"),
-        var_type: VarType::Select,
-        group: "Model Provider",
-        description: "LLM provider backend",
-        options: &["anthropic", "openai"],
-    },
-    VarMeta {
-        key: "YI_AGENT_MODEL",
-        default: None,
-        var_type: VarType::Text,
-        group: "Model Provider",
-        description: "Model identifier string",
-        options: &[],
-    },
-    VarMeta {
-        key: "YI_AGENT_MODEL_CONTEXT_LENGTH",
-        default: None,
-        var_type: VarType::Number,
-        group: "Model Provider",
-        description: "Model max context length in tokens (fallback: 200000)",
-        options: &[],
-    },
-    VarMeta {
-        key: "MODEL_API_KEY",
-        default: None,
-        var_type: VarType::Secret,
-        group: "Model Provider",
-        description: "API key (overrides provider-specific key)",
-        options: &[],
-    },
-    VarMeta {
-        key: "MODEL_API_URL",
-        default: None,
-        var_type: VarType::Text,
-        group: "Model Provider",
-        description: "API endpoint URL (overrides provider-specific URL)",
-        options: &[],
-    },
-    VarMeta {
-        key: "ANTHROPIC_API_KEY",
-        default: None,
-        var_type: VarType::Secret,
-        group: "Model Provider",
-        description: "Anthropic provider API key",
-        options: &[],
-    },
-    VarMeta {
-        key: "ANTHROPIC_BASE_URL",
-        default: Some("https://api.anthropic.com"),
-        var_type: VarType::Text,
-        group: "Model Provider",
-        description: "Anthropic API base URL",
-        options: &[],
-    },
-    VarMeta {
-        key: "OPENAI_API_KEY",
-        default: None,
-        var_type: VarType::Secret,
-        group: "Model Provider",
-        description: "OpenAI provider API key",
-        options: &[],
-    },
-    VarMeta {
-        key: "OPENAI_BASE_URL",
-        default: Some("https://api.openai.com/v1"),
-        var_type: VarType::Text,
-        group: "Model Provider",
-        description: "OpenAI API base URL",
-        options: &[],
-    },
     // === Agent ===
     VarMeta {
         key: "YI_AGENT_MAX_TURNS",
@@ -179,26 +106,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_vars_count_is_16() {
-        assert_eq!(ALL_VARS.len(), 16);
+    fn all_vars_count_is_7() {
+        assert_eq!(ALL_VARS.len(), 7);
     }
 
     #[test]
-    fn groups_count_is_3() {
-        assert_eq!(groups().len(), 3);
+    fn model_keys_are_no_longer_editable() {
+        // 9 个模型键必须从这里消失——它们归 models.json，不再有绕过清单的写入口。
+        for key in yi_agent_runtime::config::MODEL_ENV_KEYS {
+            assert!(find(key).is_none(), "{key} must no longer be editable here");
+        }
+    }
+
+    #[test]
+    fn groups_count_is_2() {
+        assert_eq!(groups().len(), 2);
     }
 
     #[test]
     fn groups_are_ordered() {
         let g = groups();
-        assert_eq!(g, vec!["Model Provider", "Agent", "Tools"]);
+        assert_eq!(g, vec!["Agent", "Tools"]);
     }
 
     #[test]
     fn find_returns_meta() {
-        let m = find("YI_AGENT_PROVIDER").unwrap();
-        assert_eq!(m.var_type, VarType::Select);
-        assert_eq!(m.options, &["anthropic", "openai"]);
+        let m = find("YI_AGENT_MAX_TURNS").unwrap();
+        assert_eq!(m.var_type, VarType::Number);
     }
 
     #[test]
@@ -242,8 +176,8 @@ mod tests {
     }
 
     #[test]
-    fn context_length_has_no_default() {
-        let m = find("YI_AGENT_MODEL_CONTEXT_LENGTH").unwrap();
+    fn workdir_has_no_default() {
+        let m = find("YI_AGENT_WORKDIR").unwrap();
         assert!(m.default.is_none());
     }
 

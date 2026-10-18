@@ -12757,7 +12757,7 @@ async fn onboarding_status_is_readable_and_reports_needed() {
     assert_eq!(v["result"]["dismissed"], false, "got {v}");
 }
 
-/// `onboarding/apply` 落 `.env` 与清单;随后 `status` 立刻翻成 ready。
+/// `onboarding/apply` 只落清单(不再写 `.env`);随后 `status` 立刻翻成 ready。
 #[tokio::test(flavor = "multi_thread")]
 async fn onboarding_apply_lands_the_env_and_catalog() {
     let mut h = Harness::new();
@@ -12767,8 +12767,10 @@ async fn onboarding_apply_lands_the_env_and_catalog() {
     )
     .await;
     let v = h.read_value().await;
-    assert_eq!(v["result"]["env_written"], true, "got {v}");
-    assert_eq!(v["result"]["imported"], true, "got {v}");
+    assert_eq!(v["result"]["ok"], true, "got {v}");
+    assert!(v["result"].get("name").is_some(), "got {v}");
+    assert!(v["result"].get("env_written").is_none(), "got {v}");
+    assert!(v["result"].get("imported").is_none(), "got {v}");
 
     // 状态随即翻成 ready。
     h.send(r#"{"jsonrpc":"2.0","id":3,"method":"onboarding/status","params":{}}"#)
@@ -14588,6 +14590,7 @@ fn model_catalog_entries(default_model: Option<&str>) -> yi_agent_runtime::model
                 api_key: "key-a".into(),
                 api_style: None,
                 reasoning_effort: None,
+                context_length: None,
             },
             ModelEntry {
                 name: "B".into(),
@@ -14597,6 +14600,7 @@ fn model_catalog_entries(default_model: Option<&str>) -> yi_agent_runtime::model
                 api_key: "key-b".into(),
                 api_style: None,
                 reasoning_effort: None,
+                context_length: None,
             },
         ],
         default_model: default_model.map(str::to_string),
@@ -16149,6 +16153,61 @@ async fn list_all_exposes_the_lead_role_only_for_the_lead() {
     );
 
     h.shutdown().await;
+}
+
+/// 启动期迁移的接线契约：服务端入口调用的函数确实把存量 `.env` 模型键搬进清单。
+///
+/// 入口点（`run` / `serve_stdio_with_relay`）自身的调用由生产 `HOME` 注入的路径
+/// 决定，测试不便直接驱动；这里锁定「入口调用的那个函数」的行为，与计划 Task 6
+/// Step 1 的意图一致。
+#[test]
+fn startup_migrates_legacy_model_keys_into_the_catalog() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let env_path = dir.path().join(".env");
+    std::fs::write(
+        &env_path,
+        "YI_AGENT_PROVIDER=openai\nMODEL_API_KEY=sk-old\n",
+    )
+    .unwrap();
+    let models_path = dir.path().join("models.json");
+
+    yi_agent_runtime::migrate::migrate_model_keys(&env_path, &models_path);
+
+    let catalog = yi_agent_runtime::models::load_catalog_from(&models_path);
+    assert_eq!(catalog.models.len(), 1);
+    assert!(
+        !std::fs::read_to_string(&env_path)
+            .unwrap()
+            .contains("\nMODEL_API_KEY=sk-old")
+    );
+}
+
+/// `log_outcome` 必须对每一种结果都不 panic（日志措辞由 tracing 承接）。
+#[test]
+fn log_outcome_handles_every_variant() {
+    use yi_agent_runtime::migrate::{MigrationOutcome, log_outcome};
+    let env = std::path::Path::new("/tmp/yi-agent-migrate-probe/.env");
+    log_outcome(&MigrationOutcome::NothingToDo, env);
+    log_outcome(&MigrationOutcome::Migrated { entry: "m".into() }, env);
+    log_outcome(&MigrationOutcome::AlreadyCategorized, env);
+    log_outcome(
+        &MigrationOutcome::EnvNotWritable {
+            reason: "ro".into(),
+        },
+        env,
+    );
+    log_outcome(
+        &MigrationOutcome::CatalogNotWritable {
+            reason: "ro".into(),
+        },
+        env,
+    );
+    log_outcome(
+        &MigrationOutcome::InvalidProvider {
+            reason: "unknown provider: azure".into(),
+        },
+        env,
+    );
 }
 
 /// 看板卡片会话所在的 worktree **不是项目**,`thread/lead` 不得为它种组长。

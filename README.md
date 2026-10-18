@@ -196,22 +196,30 @@ yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
 按优先级从低到高：
 
 1. 默认值
-2. 全局配置 `~/.yi-agent/.env`
-3. 项目配置 `<项目目录>/.yi-agent/.env`（覆盖全局）
-4. 命令行参数 / 环境变量（优先级最高）
+2. 全局配置 `~/.yi-agent/.env`（非模型设置：轮次、压缩、沙箱等）
+3. 模型配置 `~/.yi-agent/models.json`（**模型设置的唯一真相源**）
+4. 命令行参数 / 真实环境变量（临时整包覆盖：`--provider` + `--api-key`）
 
-配置文件不会写进项目根目录，而是放在 `.yi-agent/.env`，不会污染你的仓库。
+`~/.yi-agent/.env` 是唯一的 `.env`，没有项目级 `.env`；`--workdir` 只决定工具干活
+的目录，不影响配置来源。配置文件不会写进项目根目录，不会污染你的仓库。
 
-**懒人做法**：跑 `yi-agent web`，在浏览器里（默认 <http://127.0.0.1:7292>）图形化填写，
-它会把配置写进上面的文件。
+**一行说明**：`--model` 给的是模型**字符串**；要覆盖它必须同时给出 `--provider`
+与 `--api-key`（`--api-url` 可选）——这是「整包注入」，缺项会直接报错。
+
+**懒人做法**：桌面端「设置 → 模型」图形化配置模型（写 `~/.yi-agent/models.json`）；
+`yi-agent web`（默认 <http://127.0.0.1:7292>）只管理非模型设置。
+
+> 破坏性变更：模型键不再从 `.env` 读取。升级后首次启动会把存量 `.env` 里的活跃
+> 模型键收边进 `models.json`，并把那几行注释掉（`# MIGRATED: ...`）。
 
 ## 常用配置
 
 | 想做什么 | 环境变量 | 命令行参数 |
 | --- | --- | --- |
+| 换模型（整包覆盖） | `YI_AGENT_PROVIDER` + `MODEL_API_KEY` | `--provider` + `--api-key`（`--model` / `--api-url` 可选） |
 | API key | `MODEL_API_KEY` | `--api-key` |
 | 换服务商 | `YI_AGENT_PROVIDER`（`anthropic` / `openai`） | `--provider` |
-| 换模型 | `YI_AGENT_MODEL` | `--model` |
+| 换模型标识 | —— （用设置 UI / `models.json`） | `--model`（须配 `--provider` + `--api-key`） |
 | 自定义 API 地址 | `MODEL_API_URL` | `--api-url` |
 | 指定工作目录 | `YI_AGENT_WORKDIR` | `--workdir` |
 | 单轮最大步数 | `YI_AGENT_MAX_TURNS`（默认 200） | `--max-turns` |
@@ -220,10 +228,10 @@ yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
 | 压缩触发阈值 | `YI_AGENT_COMPACT_RATIO`（默认 80，按上下文百分比） | `--compact-ratio` |
 | 联网搜索 | `BOCHA_API_KEY` | —— |
 
-**换模型**，比如用 OpenAI：
+**换模型**，比如用 OpenAI（整包给全）：
 
 ```bash
-yi-agent --provider openai --model gpt-4o
+yi-agent --provider openai --api-key sk-... --model gpt-4o
 ```
 
 **关于权限确认。** 默认每个危险操作都要你点一次确认。这是启动时的开关：
@@ -250,22 +258,22 @@ yi-agent --provider openai --model gpt-4o
 | --- | --- | --- |
 | yi-agent-core | 23 / 24 | [详情](docs/project-management/yi-agent-core.md) |
 | yi-agent-llm | 6 / 9 | [详情](docs/project-management/yi-agent-llm.md) |
-| yi-agent-tools | 18 / 18 | [详情](docs/project-management/yi-agent-tools.md) |
+| yi-agent-tools | 19 / 19 | [详情](docs/project-management/yi-agent-tools.md) |
 | yi-agent-skills | 8 / 8 | [详情](docs/project-management/yi-agent-skills.md) |
-| yi-agent-tui | 32 / 34 | [详情](docs/project-management/yi-agent-tui.md) |
+| yi-agent-tui | 34 / 35 | [详情](docs/project-management/yi-agent-tui.md) |
 | yi-agent-run | 10 / 10 | [详情](docs/project-management/yi-agent-run.md) |
 | yi-agent-cli | 2 / 2 | [详情](docs/project-management/yi-agent-cli.md) |
 | yi-agent-web | 6 / 6 | [详情](docs/project-management/yi-agent-web.md) |
 | permission | 9 / 9 | [详情](docs/project-management/permission.md) |
 | ci-cd | 12 / 14 | [详情](docs/project-management/ci-cd.md) |
 | tooling | 3 / 3 | [详情](docs/project-management/tooling.md) |
-| yi-agent-mcp | 1 / 1 | [详情](docs/project-management/yi-agent-mcp.md) |
+| yi-agent-mcp | 3 / 3 | [详情](docs/project-management/yi-agent-mcp.md) |
 | yi-agent-store | 7 / 8 | [详情](docs/project-management/yi-agent-store.md) |
-| yi-agent-runtime | 13 / 13 | [详情](docs/project-management/yi-agent-runtime.md) |
+| yi-agent-runtime | 16 / 16 | [详情](docs/project-management/yi-agent-runtime.md) |
 | yi-agent-subagent | 9 / 9 | [详情](docs/project-management/yi-agent-subagent.md) |
-| yi-agent-app-server | 47 / 47 | [详情](docs/project-management/yi-agent-app-server.md) |
+| yi-agent-app-server | 52 / 52 | [详情](docs/project-management/yi-agent-app-server.md) |
 | subagent-runtime | 44 / 52 | [详情](docs/project-management/subagent-runtime.md) |
-| desktop | 65 / 77 | [详情](docs/project-management/desktop.md) |
+| desktop | 67 / 79 | [详情](docs/project-management/desktop.md) |
 
 </details>
 

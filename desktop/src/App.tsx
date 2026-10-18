@@ -72,7 +72,7 @@ import { estimateCost, formatCost } from "./lib/pricing";
 import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
-import { OnboardingWizard, type OnboardingOutcome } from "./components/OnboardingWizard";
+import { OnboardingWizard } from "./components/OnboardingWizard";
 import { onboardingStatus } from "./lib/onboarding";
 import { readListCache, writeListCache } from "./lib/sessionCache";
 import { createContentStore, persistContent, type AsyncContentStore, type ContentEntry } from "./lib/contentStore";
@@ -2015,16 +2015,8 @@ export default function App() {
         <OnboardingWizard
           reasons={prefs.onboarding.reasons}
           call={(m, p) => (clientRef.current as RpcClient).request(m, p)}
-          onDone={(result?: OnboardingOutcome) => {
+          onDone={() => {
             prefs.setOnboarding({ needed: false, reasons: [] });
-            // `.env` 已写、清单没收边（部分成功）：主界面顶部留一条可关闭提示，
-            // 别让用户在「已保存」与「模型仍不可用」之间一头雾水。
-            if (result && !result.imported) {
-              prefs.setOnboardingNotice(
-                "已保存到 .env，但未纳入模型清单（可稍后在设置里点「导入当前配置」）" +
-                  (result.importError ? `：${result.importError}` : ""),
-              );
-            }
             // 新配置要重启侧车才生效（cfg/清单在启动时读入）。宿主重启后会经
             // 既有 exited → 重新握手路径刷回来；顺带尽力刷一次模型清单。
             void restartSidecar();
@@ -2034,25 +2026,6 @@ export default function App() {
       )}
       <div className="app-shell flex h-screen flex-col bg-surface text-fg">
         <TitleBar />
-        {/* 引导部分成功的提示（spec §4.7）：可关闭的顶部横幅，样式与 ApprovalBanner
-            一致；关闭即清空状态，不再出现。 */}
-        {prefs.onboardingNotice !== null && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="flex flex-wrap items-center gap-3 border-b border-amber-900/60 bg-amber-950/60 px-3 py-2 text-xs text-amber-100"
-          >
-            <span className="min-w-0">{prefs.onboardingNotice}</span>
-            <button
-              type="button"
-              onClick={() => prefs.setOnboardingNotice(null)}
-              aria-label="关闭提示"
-              className="ml-auto rounded px-1 text-amber-300 hover:text-amber-100"
-            >
-              ✕
-            </button>
-          </div>
-        )}
         <div className="flex min-h-0 flex-1 flex-row">
         {isMobile && sess.sidebarOpen && (
           <div

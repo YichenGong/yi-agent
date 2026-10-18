@@ -49,13 +49,16 @@ fn main() -> Result<()> {
         Some(Command::Web { ref host, ref port }) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                let env_path = config::resolve_env_path(&cli);
-                let global_env_path = if config::is_workdir_explicit(&cli) {
-                    None
-                } else {
-                    config::resolve_global_env_path()
-                };
-                yi_agent_web::serve(host, *port, env_path, global_env_path).await
+                // 唯一 `.env`：全局 `~/.yi-agent/.env`，无 HOME 时退回本地 `.yi-agent/.env`。
+                let env_path = config::resolve_global_env_path()
+                    .unwrap_or_else(|| std::path::PathBuf::from(".yi-agent").join(".env"));
+                // 与 `run_agent` 同一迁移：web 也是用户面向入口。
+                let migration = yi_agent_runtime::migrate::migrate_model_keys(
+                    &env_path,
+                    &yi_agent_runtime::models::models_path(),
+                );
+                yi_agent_runtime::migrate::log_outcome(&migration, &env_path);
+                yi_agent_web::serve(host, *port, env_path).await
             })
         }
         Some(Command::Run {
@@ -1174,21 +1177,43 @@ fn run_agent(cli: Cli) -> Result<()> {
     // 首启引导发生在 `config::load` 之前：此时还没有配置，加载器会直接报错。
     // 落点是全局 `~/.yi-agent/.env`——与桌面 / app-server(`resolve_global_env_path`)
     // 一致；只有在没有 HOME 时才退回到 workdir 内的本地路径。
-    let env_path =
-        config::resolve_global_env_path().unwrap_or_else(|| config::resolve_env_path(&cli));
+    let env_path = config::resolve_global_env_path()
+        .unwrap_or_else(|| std::path::PathBuf::from(".yi-agent").join(".env"));
     let prefs_path = env_path.with_file_name("preferences.json");
+    // 一次性迁移必须在引导与 `config::load` 之前：`.env` 里的存量模型键要在被
+    // 「忽略」之前先收边进清单。清单优先落盘、`.env` 后注释，任一步失败都只降级。
+    let migration = yi_agent_runtime::migrate::migrate_model_keys(
+        &env_path,
+        &yi_agent_runtime::models::models_path(),
+    );
+    yi_agent_runtime::migrate::log_outcome(&migration, &env_path);
+    // 引导写进清单（与 `onboarding/apply` 同一路径）。先算一次清单路径，
+    // 让 should_offer / prompt 与运行期读点一致。
+    let models_path = yi_agent_runtime::models::models_path();
     if onboarding_prompt::should_offer(&env_path, &prefs_path) {
-        if let Err(error) = onboarding_prompt::run_onboarding_prompt(&env_path, &prefs_path) {
+        if let Err(error) = onboarding_prompt::run_onboarding_prompt(&models_path, &prefs_path) {
             eprintln!("引导未完成：{error}");
         }
     }
 
-    let config = config::load(&cli)?;
-    // 条目默认档在**启动时**也要生效：与 app-server 同口径
-    // （`resolve_effective`）。否则 `/effort`（无参）忠实地读清单、报出条目默认
-    // 档，请求里却没有该字段（`load_inner` 硬编码 `reasoning_effort: None`），
-    // 状态行就命名了一个并未发出的值（Task 8 评审 R2）。
-    let config = startup_config_from_catalog(&config, &yi_agent_runtime::models::load_catalog());
+    let config = config::load_lenient(&cli)?;
+    // 条目默认档在**启动时**也要生效：与 app-server 同口径，走同一条解析链
+    // （会话覆盖 > 整包注入 > 清单默认）。注入存在时（`model_injected`）整包压过
+    // 清单默认；否则沿用清单 `default_model`，`/effort` 报出的即请求发出的。
+    //
+    // 这里必须用**宽松**加载器：清单接手模型配置之后（计划 Tasks 5/6 会把 `.env`
+    // 的模型键搬进 `models.json` 并注释掉），一台只有清单的机器既没有 flag 也没有
+    // 进程环境变量，严格加载器会在 `load_inner` 里直接 `API key required` bail——
+    // 于是清单里的 key 永远等不到 `resolve_effective` 去取，CLI 根本起不来（Task 8
+    // 的引导也救不了：它写的正是清单）。缺 key 由下面的指引负责，不由加载器负责。
+    let catalog = yi_agent_runtime::models::load_catalog();
+    let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
+    // 一台既没有配置、也拿不到 key 的机器，给出与 `run_headless` 同一条指引，
+    // 而不是加载器那句干巴巴的 "API key required"。
+    if let Some(line) = unconfigured_guidance(!config.api_key.trim().is_empty()) {
+        eprintln!("{line}");
+        std::process::exit(1);
+    }
 
     let agent_workdir = config.workdir.clone();
 
@@ -1680,51 +1705,6 @@ fn rebuild_driver_agent(
         .with_permission(checker, decision_rx)
 }
 
-/// Apply the machine-level catalog's entry defaults to the TUI's startup config.
-///
-/// Uses the **same** entry-selection rule as `resolve_effort_state` (and the
-/// app-server's `resolve_effective`): session override → catalog
-/// `default_model`. Startup has no session override, so it is
-/// `effective_entry(catalog, None)`. The TUI's `/effort` status — which reads
-/// the same catalog through `resolve_effort_state` — therefore reports exactly
-/// the `reasoning_effort` this function sends.
-///
-/// The rule is deliberately **not** "the entry matching `config.model`". With
-/// `.env YI_AGENT_MODEL` naming a non-default entry the running model string
-/// would select one entry for the request while `/effort` (no session override)
-/// selected `default_model` for the report — the field sent and the field shown
-/// would differ (Task 8 review R2 residual). Matching `default_model` here keeps
-/// them one rule.
-///
-/// Deliberately only handles the **effort** and **api_style** fields. The TUI
-/// keeps resolving provider / api_url / api_key / model from env+overrides at
-/// startup, so pulling those from the catalog here would be a behavior change
-/// beyond this fix.
-///
-/// `api_style` is included because it is the same class of bug as effort: the
-/// catalog entry that `/model` and `/effort` report must be the one the request
-/// actually uses. Without it, a `"chat"` entry (the only channel that
-/// round-trips DeepSeek's `reasoning_content`, spec §8.2) was silently ignored
-/// at startup — `RuntimeConfig.api_style` stayed at `load_inner`'s hardcoded
-/// `Auto`, which targets `/responses`. A silent entry leaves the startup default
-/// untouched (zero regression for catalogs that don't set the field).
-fn startup_config_from_catalog(
-    config: &config::Config,
-    catalog: &yi_agent_runtime::models::ModelCatalog,
-) -> config::Config {
-    let Some(entry) = yi_agent_runtime::models::effective_entry(catalog, None) else {
-        return config.clone();
-    };
-    let mut resolved = config.clone();
-    if let Some(effort) = entry.reasoning_effort.clone() {
-        resolved.reasoning_effort = Some(effort);
-    }
-    if let Some(style) = entry.api_style.as_deref() {
-        resolved.api_style = yi_agent_core::ApiStyle::parse(style);
-    }
-    resolved
-}
-
 /// The live provider + agent config every driver rebuild is built from.
 ///
 /// They are bundled into one struct on purpose. `provider` bakes in
@@ -1749,7 +1729,7 @@ struct LiveRebuild {
     /// model switch changes level 2 only.
     session_effort_override: Option<String>,
     /// The **current catalog entry's** default effort (level 2), seeded from the
-    /// startup config (already resolved by `startup_config_from_catalog`) and
+    /// startup config (already resolved by `models::resolve_effective`) and
     /// refreshed by every `apply_selection`. The request field is always
     /// `session_effort_override.or(entry_effort)`.
     entry_effort: Option<String>,
@@ -1937,6 +1917,7 @@ fn run_tui_agent(
         };
         let tui_config = crate::tui::slash::TuiConfigSnapshot {
             provider: config.provider.clone(),
+            model_injected: config.model_injected,
             workdir: snapshot_workdir.clone(),
             sandbox: config.sandbox.as_str().to_string(),
             yolo: config.yolo,
@@ -2536,22 +2517,57 @@ mod tests {
 
     #[test]
     fn run_agent_offers_onboarding_before_loading_config() {
-        // 新机器上 config::load 会因为缺 key 直接失败，引导必须抢在它前面；
-        // 且落点是全局 `.env`（与桌面 / app-server 一致），不是 workdir 内的本地路径。
+        // 新机器上还没有配置，引导必须抢在加载之前；且落点是全局 `.env`（与桌面 /
+        // app-server 一致），不是 workdir 内的本地路径。
         // Needles built from fragments so this test's own source cannot satisfy them.
         let source = include_str!("main.rs");
+        // 只取 `run_agent` 本体，到下一个列 0 的 `fn` 为止：否则 needle 会被文件后面
+        // 同名调用（`run_headless` 也调用 `load_lenient`）满足，断言就成了空转。
         let body = source
             .split("fn run_agent(")
             .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
             .expect("run_agent must exist");
         let offer = ["onboarding_prompt::should_offer(", "&env_path"].concat();
         let global = ["config::resolve_global", "_env_path()"].concat();
-        let load = ["config::load(&cli)"].concat();
+        // 宽松加载器：清单里已经有模型（无任何注入）的机器，严格加载器会因为
+        // 「没有 key」直接 bail，用户永远起不来。与 `run_headless` 同形——缺 key
+        // 由下面的指引接管，而不是加载器那句干巴巴的报错。
+        let load = ["config::load_lenient", "(&cli)"].concat();
+        let strict = ["config::load(", "&cli)"].concat();
+        let catalog = ["models::load_catalog", "()"].concat();
+        let resolve = ["models::resolve_effective(&config, &catalog", ", None)"].concat();
+        let guide = [
+            "unconfigured_guidance(",
+            "!config.api_key.trim().is_empty())",
+        ]
+        .concat();
         let offer_at = body.find(&offer).expect("run_agent must offer onboarding");
-        let load_at = body.find(&load).expect("run_agent must load config");
+        let load_at = body
+            .find(&load)
+            .expect("run_agent must load config leniently");
+        let catalog_at = body
+            .find(&catalog)
+            .expect("run_agent must load the catalog");
+        let resolve_at = body
+            .find(&resolve)
+            .expect("run_agent must resolve the config through the catalog");
+        assert!(
+            !body.contains(&strict),
+            "run_agent must not use the strict loader: a catalog-only machine has no key \
+             until the catalog resolves, so the loader would bail before it can start"
+        );
         assert!(
             offer_at < load_at,
-            "the onboarding prompt must run before config::load"
+            "the onboarding prompt must run before the config load"
+        );
+        assert!(
+            catalog_at < resolve_at,
+            "the catalog must be loaded before resolve_effective consumes it"
+        );
+        assert!(
+            body.contains(&guide),
+            "a machine with neither a key nor a catalog entry must get the guidance line"
         );
         assert!(
             body.contains(&global),
@@ -2786,6 +2802,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            context_length: None,
         };
         // `/model Y`: Y declares no effort of its own.
         let catalog = ModelCatalog {
@@ -2835,7 +2852,7 @@ mod tests {
         );
         let sent = agent.config().gen_params.reasoning_effort.clone();
         let (reported, source) =
-            crate::tui::app::resolve_effort_state(Some("high"), &catalog, Some("Y"));
+            crate::tui::app::resolve_effort_state(Some("high"), &catalog, Some("Y"), false);
         assert_eq!(
             sent.as_deref(),
             Some("high"),
@@ -2866,7 +2883,8 @@ mod tests {
             agent.session_handle(),
         );
         let sent = agent.config().gen_params.reasoning_effort.clone();
-        let (reported, _) = crate::tui::app::resolve_effort_state(Some("high"), &loud, Some("Y"));
+        let (reported, _) =
+            crate::tui::app::resolve_effort_state(Some("high"), &loud, Some("Y"), false);
         assert_eq!(sent.as_deref(), Some("high"));
         assert_eq!(sent, reported);
 
@@ -2895,6 +2913,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            context_length: None,
         };
         let catalog = ModelCatalog {
             models: vec![entry("Y", None), entry("Z", Some("low"))],
@@ -2933,7 +2952,8 @@ mod tests {
             Arc::clone(&session),
         );
         let sent = agent.config().gen_params.reasoning_effort.clone();
-        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, Some("Y"));
+        let (reported, source) =
+            crate::tui::app::resolve_effort_state(None, &catalog, Some("Y"), false);
         assert_eq!(sent, None, "a silent entry must send no field");
         assert_eq!(sent, reported);
         assert_eq!(source, crate::tui::app::EffortSource::Unset);
@@ -2951,7 +2971,8 @@ mod tests {
             Arc::clone(&session),
         );
         let sent = agent.config().gen_params.reasoning_effort.clone();
-        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, Some("Z"));
+        let (reported, source) =
+            crate::tui::app::resolve_effort_state(None, &catalog, Some("Z"), false);
         assert_eq!(sent.as_deref(), Some("low"));
         assert_eq!(sent, reported);
         assert_eq!(source, crate::tui::app::EffortSource::Entry);
@@ -2979,6 +3000,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            context_length: None,
         };
         let make_catalog = |default: &str| ModelCatalog {
             models: vec![
@@ -2996,8 +3018,9 @@ mod tests {
         config.model = "HORIZON-OG-Luna".into();
         config.reasoning_effort = None; // `load_inner`'s hardcoded default
 
-        let sent = startup_config_from_catalog(&config, &catalog).reasoning_effort;
-        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, None);
+        let sent =
+            yi_agent_runtime::models::resolve_effective(&config, &catalog, None).reasoning_effort;
+        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, None, false);
         assert_eq!(
             sent, reported,
             "startup reported {reported:?} ({source:?}) but sent {sent:?}"
@@ -3009,17 +3032,87 @@ mod tests {
         // A `default_model` entry that declares an effort applies to startup and
         // is what `/effort` reports.
         let loud = make_catalog("HORIZON-OG-Luna");
-        let sent = startup_config_from_catalog(&config, &loud).reasoning_effort;
-        let (reported, _) = crate::tui::app::resolve_effort_state(None, &loud, None);
+        let sent =
+            yi_agent_runtime::models::resolve_effective(&config, &loud, None).reasoning_effort;
+        let (reported, _) = crate::tui::app::resolve_effort_state(None, &loud, None, false);
         assert_eq!(sent.as_deref(), Some("low"));
         assert_eq!(sent, reported);
+    }
+
+    /// Task 3 review fix round 1 (Finding 2): with an **injected** package the
+    /// send path suppresses the catalog entry, so `/effort` must suppress it too.
+    ///
+    /// The reviewed defect: `/effort` picked the entry without knowing about
+    /// injection (session override → `current_model_ref` → catalog
+    /// `default_model`), while `effective_entry_for` returns `None` under
+    /// injection. With an injected package, no `/model` selection, and a catalog
+    /// default that declares an effort, `/effort` named that tier (清单条目默认)
+    /// while the request carried nothing — reported != sent, the exact Task 8 R2
+    /// defect the deleted `startup_config_from_catalog` existed to prevent. The
+    /// existing guard could not see it: `test_config()` hardcodes
+    /// `model_injected: false`, a state the strict loader could never produce and
+    /// which the catalog-only path now *does* produce.
+    #[test]
+    fn an_injected_startup_reports_the_effort_it_sends() {
+        use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider};
+        let entry = |name: &str, effort: Option<&str>| ModelEntry {
+            name: name.into(),
+            provider: ModelProvider::Openai,
+            api_url: "https://x.example".into(),
+            model: name.into(),
+            api_key: "sk-secret".into(),
+            api_style: None,
+            reasoning_effort: effort.map(str::to_string),
+            context_length: None,
+        };
+        let catalog = ModelCatalog {
+            models: vec![
+                entry("HORIZON-OG-Luna", Some("low")),
+                entry("HORIZON-DeepSeek", None),
+            ],
+            default_model: Some("HORIZON-OG-Luna".into()),
+            subagent_model: None,
+        };
+
+        // The injected package: provider + api_key supplied out-of-band. The
+        // catalog default declares `low`, but injection beats it (chain level 2).
+        let mut config = test_config();
+        config.model_injected = true;
+        config.reasoning_effort = None; // `load_inner`'s hardcoded default
+
+        // No `/model` selection: the catalog default's tier must NOT leak into
+        // the report, because the request does not carry it.
+        let sent =
+            yi_agent_runtime::models::resolve_effective(&config, &catalog, None).reasoning_effort;
+        let (reported, source) = crate::tui::app::resolve_effort_state(None, &catalog, None, true);
+        assert_eq!(
+            sent, reported,
+            "injected startup reported {reported:?} ({source:?}) but sent {sent:?}"
+        );
+        assert_eq!(sent, None, "the injected package declares no effort");
+        assert_eq!(
+            source,
+            crate::tui::app::EffortSource::Unset,
+            "an injected package must report 未设置, not the catalog default's tier"
+        );
+
+        // A `/model` selection beats the injection on BOTH legs (chain level 1:
+        // session override > injection > catalog default).
+        let sent =
+            yi_agent_runtime::models::resolve_effective(&config, &catalog, Some("HORIZON-OG-Luna"))
+                .reasoning_effort;
+        let (reported, source) =
+            crate::tui::app::resolve_effort_state(None, &catalog, Some("HORIZON-OG-Luna"), true);
+        assert_eq!(sent.as_deref(), Some("low"));
+        assert_eq!(sent, reported);
+        assert_eq!(source, crate::tui::app::EffortSource::Entry);
     }
 
     /// Startup must adopt the catalog entry's `api_style`, not just its
     /// `reasoning_effort`.
     ///
-    /// `startup_config_from_catalog` originally mirrored only the effort field
-    /// (its doc comment says so explicitly), leaving `RuntimeConfig.api_style`
+    /// Startup previously mirrored only the effort field
+    /// (noted explicitly in its old doc comment), leaving `RuntimeConfig.api_style`
     /// at the hardcoded `Auto` that `load_inner` sets. `Auto` targets
     /// `/responses` for an unknown gateway, so a catalog entry pinned to
     /// `"chat"` — the only channel that round-trips DeepSeek's
@@ -3039,6 +3132,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: style.map(str::to_string),
             reasoning_effort: None,
+            context_length: None,
         };
         let catalog = |default: &str| ModelCatalog {
             models: vec![
@@ -3053,11 +3147,18 @@ mod tests {
         // silently stays `Auto` -> `/responses`, the reported bug).
         let mut config = test_config();
         config.api_style = ApiStyle::Auto; // `load_inner`'s hardcoded default
-        let sent = startup_config_from_catalog(&config, &catalog("HORIZON-DeepSeek")).api_style;
+        let sent = yi_agent_runtime::models::resolve_effective(
+            &config,
+            &catalog("HORIZON-DeepSeek"),
+            None,
+        )
+        .api_style;
         assert_eq!(sent, ApiStyle::Chat);
 
         // A different default entry's style flows through too.
-        let sent = startup_config_from_catalog(&config, &catalog("HORIZON-OG-Luna")).api_style;
+        let sent =
+            yi_agent_runtime::models::resolve_effective(&config, &catalog("HORIZON-OG-Luna"), None)
+                .api_style;
         assert_eq!(sent, ApiStyle::Responses);
 
         // An entry that is silent on `api_style` leaves the startup default
@@ -3067,7 +3168,7 @@ mod tests {
             default_model: Some("HORIZON-X".into()),
             subagent_model: None,
         };
-        let sent = startup_config_from_catalog(&config, &silent).api_style;
+        let sent = yi_agent_runtime::models::resolve_effective(&config, &silent, None).api_style;
         assert_eq!(sent, ApiStyle::Auto);
     }
 
@@ -3402,6 +3503,8 @@ mod tests {
             workdir: PathBuf::from("/tmp"),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 8192,
             compact_tool_budget_tokens: 4096,
             yolo: false,
@@ -3410,6 +3513,7 @@ mod tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
+            model_injected: false,
         }
     }
 

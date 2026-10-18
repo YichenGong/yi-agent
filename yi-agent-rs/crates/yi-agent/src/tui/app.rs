@@ -214,6 +214,7 @@ impl EventSource for CrosstermEventSource {
 fn snapshot_for_tests() -> TuiConfigSnapshot {
     TuiConfigSnapshot {
         provider: "anthropic".into(),
+        model_injected: false,
         workdir: std::path::PathBuf::from("/tmp/proj"),
         sandbox: "workspace-write".into(),
         yolo: false,
@@ -763,6 +764,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     effort_override.as_deref(),
                     catalog,
                     current_model_ref.as_deref(),
+                    config.model_injected,
                 );
                 match handle_key(
                     key,
@@ -2353,34 +2355,38 @@ impl EffortSource {
 
 /// Resolve the effective effort and its source from the live session state.
 ///
-/// Precedence mirrors the app-server (`thread_store` override > catalog entry
-/// `reasoning_effort` > unset): a session override always wins; without one, the
-/// selected catalog entry's value applies; with neither, the field is not sent.
+/// Precedence mirrors the app-server and the startup resolver exactly: a session
+/// override always wins; with no override, an **injected** package means no
+/// catalog entry applies (the request carries no field); otherwise the selected
+/// entry — `current_model_ref`, else the catalog's `default_model` — supplies
+/// the value, and with none of those the field is not sent.
 ///
 /// `current_model_ref` is the user-selected display name, and an absent one
-/// means "follow the catalog's `default_model`". This is the **same**
-/// entry-selection rule `startup_config_from_catalog` and the app-server's
-/// `effective_entry` use, so the effort `/effort` reports is the one the request
-/// carries — the cross-check is
-/// `main::tests::startup_sends_the_effort_the_tui_reports`.
+/// means "follow the catalog's `default_model`". `model_injected` comes from the
+/// real config (`RuntimeConfig::model_injected`) via [`TuiConfigSnapshot`]; it
+/// must be truthful, never synthesized from the catalog, or this reports a
+/// catalog tier the request will not carry.
+///
+/// The entry selection is `models::effective_entry_with_injection` — the *same*
+/// function `models::resolve_effective` drives the startup/send path with, so
+/// the effort `/effort` reports is the one the request carries (design §4.2
+/// level 2). The cross-checks are
+/// `main::tests::startup_sends_the_effort_the_tui_reports` and
+/// `main::tests::an_injected_startup_reports_the_effort_it_sends`.
 pub(crate) fn resolve_effort_state(
     session_effort: Option<&str>,
     catalog: &yi_agent_runtime::models::ModelCatalog,
     current_model_ref: Option<&str>,
+    model_injected: bool,
 ) -> (Option<String>, EffortSource) {
     if let Some(tier) = session_effort {
         return (Some(tier.to_string()), EffortSource::Session);
     }
-    let entry = current_model_ref
-        .and_then(|name| catalog.models.iter().find(|m| m.name == name))
-        .or_else(|| {
-            // 与 `yi_agent_runtime::models::effective_entry` 同口径:没有会话
-            // 覆盖时跟随清单 `default_model`。
-            catalog
-                .default_model
-                .as_deref()
-                .and_then(|name| catalog.models.iter().find(|m| m.name == name))
-        });
+    let entry = yi_agent_runtime::models::effective_entry_with_injection(
+        catalog,
+        current_model_ref,
+        model_injected,
+    );
     match entry.and_then(|e| e.reasoning_effort.as_deref()) {
         Some(tier) => (Some(tier.to_string()), EffortSource::Entry),
         None => (None, EffortSource::Unset),
@@ -9361,6 +9367,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: None,
+            context_length: None,
         };
         ModelCatalog {
             models: vec![
@@ -9502,22 +9509,22 @@ mod tests {
         let catalog = effort_catalog_for_tests();
 
         assert_eq!(
-            resolve_effort_state(Some("max"), &catalog, Some("A")),
+            resolve_effort_state(Some("max"), &catalog, Some("A"), false),
             (Some("max".into()), EffortSource::Session)
         );
         assert_eq!(
-            resolve_effort_state(None, &catalog, Some("A")),
+            resolve_effort_state(None, &catalog, Some("A"), false),
             (Some("low".into()), EffortSource::Entry),
             "no override: the selected entry's own default applies"
         );
         assert_eq!(
-            resolve_effort_state(None, &catalog, Some("B")),
+            resolve_effort_state(None, &catalog, Some("B"), false),
             (None, EffortSource::Unset),
             "entry B declares no effort"
         );
         // 无选中显示名 = 跟随清单 default_model(A, low)。
         assert_eq!(
-            resolve_effort_state(None, &catalog, None),
+            resolve_effort_state(None, &catalog, None, false),
             (Some("low".into()), EffortSource::Entry)
         );
     }

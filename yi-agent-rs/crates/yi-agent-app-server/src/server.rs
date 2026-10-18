@@ -1510,6 +1510,8 @@ where
     // 清单按指纹跟随 `models.json`:运行期改条目,新建 thread 立刻用上新值。
     let catalog =
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
+    // 启动期把存量 `.env` 模型键收边进清单（一次性、幂等）。
+    migrate_legacy_model_keys_on_startup();
     serve_stdio(
         reader,
         writer,
@@ -1591,6 +1593,8 @@ where
     // 与 `run` 一致:清单按指纹跟随 `models.json`,工厂逐会话取当前值。
     let catalog =
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
+    // 与 `run` 一致:启动期做一次性 `.env` → 清单迁移。
+    migrate_legacy_model_keys_on_startup();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     serve_scoped_core(
         reader,
@@ -1876,6 +1880,23 @@ where
 
 fn parse_relay_url(relay_url: &str) -> anyhow::Result<(String, String)> {
     yi_agent_relay::parse_relay_parts(relay_url)
+}
+
+/// 生产启动期的一次性 `.env` → 清单迁移，供两个生产入口（`run` 与
+/// `serve_stdio_with_relay`）共用。
+///
+/// 只在生产入口调用：测试用 `Harness` 注入隔离路径，绝不能在这里产生副作用。
+/// `HOME` 缺失时 `resolve_global_env_path` 为 `None`，此时不迁移（避免在一个
+/// 凭空拼出的路径上写文件）。清单路径与 `RuntimeAttachments` 用的是同一个
+/// `models_path()`，保证迁移落点与运行期读点是同一个文件。
+fn migrate_legacy_model_keys_on_startup() {
+    if let Some(env_path) = yi_agent_runtime::config::resolve_global_env_path() {
+        let outcome = yi_agent_runtime::migrate::migrate_model_keys(
+            &env_path,
+            &yi_agent_runtime::models::models_path(),
+        );
+        yi_agent_runtime::migrate::log_outcome(&outcome, &env_path);
+    }
 }
 
 /// 与 [`serve_stdio`] 逐字节相同,只多一个 `client_scope`。
@@ -8408,7 +8429,6 @@ mod session_driver_tests {
 // `mod rpc_tests;` 则路径会变成 `server::rpc_tests`,测试名全变)。
 #[path = "rpc_tests.rs"]
 pub(crate) mod tests;
-
 /// 主题守望者的回归测试。
 ///
 /// 这些测试直接驱动生产里的 [`pump_theme_notifications`],不再照抄一份循环体:
