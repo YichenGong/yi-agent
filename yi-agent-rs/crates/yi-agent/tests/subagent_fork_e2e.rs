@@ -165,6 +165,7 @@ impl ForkFixture {
             IpcRequest::AttachApplicationRoot {
                 idempotency_key: "fork-e2e".into(),
                 workspace: repo.path().to_path_buf(),
+                extra_roots: Vec::new(),
             },
         )
         .expect("the runtime socket must accept an application root")

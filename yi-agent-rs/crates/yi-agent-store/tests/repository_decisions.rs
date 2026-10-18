@@ -137,7 +137,7 @@ fn migration_v14_folds_review_state_into_completed() {
     // 一条 review_accepted 事件、一条 rework 邮件。重新 open 必须触发 v14。
     let connection = Connection::open(&database).unwrap();
     connection
-        .execute("DELETE FROM schema_migrations WHERE version = 14", [])
+        .execute("DELETE FROM schema_migrations WHERE version >= 14", [])
         .unwrap();
     connection
         .execute(
@@ -207,7 +207,7 @@ fn migration_v14_folds_review_state_into_completed() {
     drop(connection);
 
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
     assert_eq!(repository.task_state(&child).unwrap(), "completed");
     assert_eq!(
         repository.attempt_state(&child_attempt).unwrap(),

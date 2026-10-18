@@ -3199,13 +3199,13 @@ async fn non_git_application_root_can_be_reattached() {
     let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
 
     let first = coordinator
-        .attach_application_root("non-git-project", &application_root)
+        .attach_application_root("non-git-project", &application_root, &[])
         .await
         .unwrap();
     // Reattaching the same non-git root must stay idempotent even though it
     // keeps no `task_workspaces` row.
     let second = coordinator
-        .attach_application_root("non-git-project", &application_root)
+        .attach_application_root("non-git-project", &application_root, &[])
         .await
         .unwrap();
 
@@ -3663,5 +3663,98 @@ async fn one_supervisors_failure_does_not_discard_another_sessions_completion() 
             .unwrap(),
         "completed_no_changes",
         "a healthy session's completion must survive another session's failure"
+    );
+}
+
+fn non_git_coordinator(
+    directory: &TempDir,
+) -> (RuntimeCoordinator, std::path::PathBuf, std::path::PathBuf) {
+    let database = directory.path().join("runtime.sqlite");
+    let application_root = directory.path().join("not-a-repo");
+    std::fs::create_dir(&application_root).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: application_root.clone(),
+        })),
+        ..Default::default()
+    });
+    (
+        RuntimeCoordinator::open(&database, factory).unwrap(),
+        database,
+        application_root,
+    )
+}
+
+/// The linked roots ride along with the creation of the root session, so they
+/// are readable from the durable row afterwards.
+#[tokio::test]
+async fn attaching_an_application_root_records_its_linked_roots() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, database, application_root) = non_git_coordinator(&directory);
+    let linked = vec!["/w/linked-b".to_string(), "/w/linked-c".to_string()];
+
+    let attached = coordinator
+        .attach_application_root("linked-roots-project", &application_root, &linked)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_extra_roots(&attached.root_task_id)
+            .unwrap(),
+        linked
+    );
+}
+
+/// Reattaching must not rewrite the root set: it is fixed when the root session
+/// is created, and a later attach is idempotent, not an update.
+#[tokio::test]
+async fn reattaching_an_application_root_keeps_the_originally_recorded_roots() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, database, application_root) = non_git_coordinator(&directory);
+    let original = vec!["/w/linked-b".to_string()];
+
+    let first = coordinator
+        .attach_application_root("linked-roots-project", &application_root, &original)
+        .await
+        .unwrap();
+    let second = coordinator
+        .attach_application_root(
+            "linked-roots-project",
+            &application_root,
+            &["/w/other".to_string()],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(second.session_id, first.session_id);
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_extra_roots(&first.root_task_id)
+            .unwrap(),
+        original
+    );
+}
+
+/// No linked roots is today's behavior: the row keeps `NULL`, which reads back
+/// as an empty set.
+#[tokio::test]
+async fn attaching_an_application_root_without_linked_roots_records_nothing() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, database, application_root) = non_git_coordinator(&directory);
+
+    let attached = coordinator
+        .attach_application_root("single-root-project", &application_root, &[])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_extra_roots(&attached.root_task_id)
+            .unwrap(),
+        Vec::<String>::new()
     );
 }

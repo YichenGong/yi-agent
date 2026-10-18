@@ -130,6 +130,10 @@ impl ThreadRoot {
                 .send_with_generation(|_handle| IpcRequest::AttachApplicationRoot {
                     idempotency_key: application_root_key(&self.thread_id),
                     workspace: self.project_dir.clone(),
+                    // The conversation root is created before the thread's
+                    // linked roots are known on this path; the session stays
+                    // single-root until a later task supplies them.
+                    extra_roots: Vec::new(),
                 })?;
         let IpcResponse::ApplicationRootAttached {
             session_id,

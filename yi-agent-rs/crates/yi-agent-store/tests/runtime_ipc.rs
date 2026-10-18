@@ -73,7 +73,7 @@ fn legacy_v6_database() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     connection
@@ -343,6 +343,7 @@ fn a_parent_inspects_a_delivered_child_merges_it_and_the_child_completes() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "inspect-loop".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -418,6 +419,7 @@ fn authorized_child_inspection_is_confined_to_the_caller_subtree() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "authz-project".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -517,6 +519,7 @@ fn a_child_model_is_persisted_and_survives_a_daemon_restart() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "model-project".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -584,7 +587,7 @@ fn opening_runtime_store_migrates_the_complete_runtime_schema() {
     let directory = TempDir::new().unwrap();
     let repository = RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
     for table in [
         "sessions",
         "tasks",
@@ -612,7 +615,7 @@ fn v10_database_without_workspace_root() -> PathBuf {
     let directory = TempDir::new().unwrap();
     let database = directory.keep().join("runtime.sqlite");
     let repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
     drop(repository);
     let connection = Connection::open(&database).unwrap();
     // Rebuild the pre-v11 shape of the attachment table and roll the schema
@@ -645,7 +648,7 @@ fn a_version_10_database_is_migrated_to_the_current_schema() {
     let database = v10_database_without_workspace_root();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
     let has_column: bool = Connection::open(&database)
         .unwrap()
         .query_row(
@@ -687,6 +690,7 @@ fn attaching_to_a_version_10_database_succeeds() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui:v10".into(),
             workspace,
+            extra_roots: Vec::new(),
         },
     )
     .unwrap();
@@ -701,7 +705,7 @@ fn v6_database_migrates_to_attachment_tables() {
     let database = legacy_v6_database();
     let repository = RuntimeRepository::open(&database).unwrap();
 
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
     assert!(
         repository
             .has_table("application_root_attachments")
@@ -734,6 +738,7 @@ fn application_roots_use_their_attaching_project_workspace() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "project-a".into(),
             workspace: project_a.clone(),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -750,6 +755,7 @@ fn application_roots_use_their_attaching_project_workspace() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "project-b".into(),
             workspace: project_b.clone(),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -813,6 +819,7 @@ fn application_root_reattach_rejects_a_different_project_workspace() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "same-client".into(),
             workspace: project_a,
+            extra_roots: Vec::new(),
         },
     )
     .unwrap();
@@ -826,6 +833,7 @@ fn application_root_reattach_rejects_a_different_project_workspace() {
             IpcRequest::AttachApplicationRoot {
                 idempotency_key: "same-client".into(),
                 workspace: project_b,
+                extra_roots: Vec::new(),
             },
         )
         .unwrap(),
@@ -849,6 +857,7 @@ fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-start-1".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap();
@@ -857,6 +866,7 @@ fn application_root_attach_is_idempotent_and_returns_the_same_workspace() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-start-1".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap();
@@ -908,6 +918,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-a".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -922,6 +933,7 @@ fn application_root_delegation_rejects_a_capability_from_another_attached_root()
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-b".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -965,6 +977,7 @@ fn application_root_capability_is_not_derived_from_idempotency_key() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-random-capability".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1004,6 +1017,7 @@ fn concurrent_application_root_attach_reuses_one_durable_root() {
                     IpcRequest::AttachApplicationRoot {
                         idempotency_key: "tui-concurrent".into(),
                         workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+                        extra_roots: Vec::new(),
                     },
                 )
                 .unwrap()
@@ -1064,6 +1078,7 @@ fn application_root_activate_marks_the_foreground_root_running_without_starting_
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-activate".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1109,6 +1124,7 @@ fn concurrent_application_root_activation_records_one_first_objective() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-concurrent-activate".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1183,6 +1199,7 @@ fn application_root_activation_keeps_the_first_objective() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-first-objective".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1241,6 +1258,7 @@ fn application_root_detach_requires_capability_and_does_not_complete_root() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-detach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1312,6 +1330,7 @@ fn application_root_can_spawn_and_send_message_to_its_child() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-send".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1379,6 +1398,7 @@ fn application_root_can_spawn_multiple_direct_children() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-multiple-spawn".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1438,6 +1458,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-second-spawn-while-running".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1516,6 +1537,7 @@ fn application_root_rejects_more_than_four_direct_children() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-direct-child-limit".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1587,6 +1609,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-terminal-slot-reuse".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1667,6 +1690,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-paused-reattach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1708,6 +1732,7 @@ fn detached_paused_application_root_can_reattach_activate_and_spawn() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-paused-reattach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1774,6 +1799,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-reattach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1803,6 +1829,7 @@ fn detached_application_root_can_be_reattached_with_the_same_key() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-reattach".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -1855,6 +1882,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
             IpcRequest::AttachApplicationRoot {
                 idempotency_key: "tui-restart".into(),
                 workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+                extra_roots: Vec::new(),
             },
         )
         .unwrap();
@@ -1879,6 +1907,7 @@ fn attached_application_root_can_be_reused_after_daemon_restart() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -2028,7 +2057,7 @@ fn opening_a_version_one_store_adds_replay_metadata_without_rewriting_history() 
     drop(connection);
 
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
     assert!(repository.has_table("attempt_watchdogs").unwrap());
     assert!(repository.has_table("runtime_metadata").unwrap());
     assert_eq!(
@@ -3096,6 +3125,7 @@ fn daemon_waits_for_the_callers_direct_children_through_the_runtime() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3180,6 +3210,7 @@ fn daemon_wait_agent_times_out_instead_of_waiting_forever() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-timeout".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3248,6 +3279,7 @@ fn daemon_wait_agent_timeout_returns_partial_completed_reports() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-partial-timeout".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3344,6 +3376,7 @@ fn daemon_wait_any_returns_only_terminal_child_reports() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-any-terminal-only".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3440,6 +3473,7 @@ fn daemon_wait_completed_report_wakes_before_timeout() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-completed-wake".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3519,6 +3553,7 @@ fn daemon_wait_timeout_does_not_bypass_application_capability() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-timeout-auth".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3582,6 +3617,7 @@ fn daemon_bounded_wait_keeps_other_ipc_clients_responsive() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-concurrent-client".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3661,6 +3697,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-report-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3717,6 +3754,7 @@ fn daemon_wait_agent_keeps_completed_child_reports_after_restart() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-report-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3772,6 +3810,7 @@ fn daemon_wait_agent_returns_completed_child_reports() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-wait-report".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -3859,6 +3898,7 @@ fn worker_lifecycle_is_reconciled_without_another_client_request() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-worker-wait".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -4583,7 +4623,7 @@ fn workspace_mode_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
@@ -4663,6 +4703,7 @@ fn daemon_spawn_agent_honors_the_coding_mode() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "spawn-mode-coding".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -4714,6 +4755,7 @@ fn daemon_spawn_agent_defaults_to_read_only() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "spawn-mode-default".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -5049,6 +5091,7 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-budget-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -5122,6 +5165,7 @@ fn daemon_keeps_a_budget_exhausted_child_report_after_restart() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "tui-budget-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -5265,7 +5309,7 @@ fn inherited_sandbox_is_persisted_and_recovered() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let mut repository = RuntimeRepository::open(&database).unwrap();
-    assert_eq!(repository.schema_version().unwrap(), 14);
+    assert_eq!(repository.schema_version().unwrap(), 15);
 
     let session = RootSessionId::new();
     let root = TaskId::new();
@@ -5353,6 +5397,7 @@ fn two_conversation_roots_do_not_share_children_or_reach_across() {
             IpcRequest::AttachApplicationRoot {
                 idempotency_key: key.into(),
                 workspace: workspace.clone(),
+                extra_roots: Vec::new(),
             },
         )
         .unwrap()
@@ -5461,6 +5506,7 @@ fn ending_one_conversation_reclaims_only_its_own_root() {
             IpcRequest::AttachApplicationRoot {
                 idempotency_key: key.into(),
                 workspace: workspace.clone(),
+                extra_roots: Vec::new(),
             },
         )
         .unwrap()
@@ -5543,6 +5589,7 @@ fn cancelling_a_thread_cancels_only_its_own_children() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "thread-scoped-cancel".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()

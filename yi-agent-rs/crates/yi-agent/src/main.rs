@@ -838,6 +838,8 @@ fn attach_application_root_request(
     yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
         idempotency_key,
         workspace,
+        // The headless runtime runs single-root: it links no extra folders.
+        extra_roots: Vec::new(),
     }
 }
 
@@ -4156,6 +4158,7 @@ mod tests {
         let yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
             idempotency_key,
             workspace,
+            extra_roots,
         } = attach_application_root_request(
             "test-key".into(),
             std::path::PathBuf::from("/projects/b"),
@@ -4165,6 +4168,7 @@ mod tests {
         };
         assert_eq!(idempotency_key, "test-key");
         assert_eq!(workspace, std::path::PathBuf::from("/projects/b"));
+        assert!(extra_roots.is_empty());
     }
 
     #[test]

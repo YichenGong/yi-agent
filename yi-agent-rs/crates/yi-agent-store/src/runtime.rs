@@ -687,6 +687,7 @@ impl RuntimeCoordinator {
         &self,
         idempotency_key: &str,
         requested_workspace: &Path,
+        extra_roots: &[String],
     ) -> Result<AttachedApplicationRoot, RuntimeCoordinatorError> {
         let _attach_guard = self
             .application_root_attach_lock
@@ -798,6 +799,13 @@ impl RuntimeCoordinator {
                 &capability,
                 &workspace.repository_root.to_string_lossy(),
             )?;
+        // The linked roots are a property of the session, snapshotted here at
+        // creation. The existing/reattach branch above returns before this
+        // point precisely so a later attach cannot rewrite them.
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .set_task_extra_roots(&root_task_id, extra_roots)?;
         Ok(AttachedApplicationRoot {
             session_id,
             root_task_id,

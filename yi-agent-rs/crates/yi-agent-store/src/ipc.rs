@@ -183,6 +183,10 @@ pub enum IpcRequest {
     AttachApplicationRoot {
         idempotency_key: String,
         workspace: PathBuf,
+        /// The root session's linked roots (canonical absolute paths). An older
+        /// client omits the field, which reads as "no linked roots".
+        #[serde(default)]
+        extra_roots: Vec<String>,
     },
     ActivateApplicationRoot {
         session_id: String,
@@ -3117,12 +3121,16 @@ fn respond(
         IpcRequest::AttachApplicationRoot {
             idempotency_key,
             workspace,
+            extra_roots,
         } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let attached = runtime
-                .block_on(coordinator.attach_application_root(&idempotency_key, &workspace))?;
+            let attached = runtime.block_on(coordinator.attach_application_root(
+                &idempotency_key,
+                &workspace,
+                &extra_roots,
+            ))?;
             Ok(IpcResponse::ApplicationRootAttached {
                 session_id: attached.session_id.to_string(),
                 root_task_id: attached.root_task_id.to_string(),
@@ -4406,5 +4414,42 @@ mod fork_wire_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod attach_application_root_wire_tests {
+    use super::*;
+
+    /// An older client does not send the field at all, and that must keep
+    /// parsing as "no linked roots" rather than failing the request.
+    #[test]
+    fn attach_application_root_defaults_missing_extra_roots_to_empty() {
+        let raw = r#"{"type":"AttachApplicationRoot","idempotency_key":"k","workspace":"/tmp/w"}"#;
+        let request: IpcRequest = serde_json::from_str(raw).unwrap();
+        match request {
+            IpcRequest::AttachApplicationRoot { extra_roots, .. } => {
+                assert!(
+                    extra_roots.is_empty(),
+                    "missing extra_roots must read as empty"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The linked roots a caller does send must survive the wire verbatim.
+    #[test]
+    fn attach_application_root_carries_extra_roots_over_the_wire() {
+        let request = IpcRequest::AttachApplicationRoot {
+            idempotency_key: "k".into(),
+            workspace: PathBuf::from("/tmp/w"),
+            extra_roots: vec!["/w/linked-b".into(), "/w/linked-c".into()],
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&encoded).unwrap(),
+            request
+        );
     }
 }

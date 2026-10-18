@@ -348,6 +348,7 @@ fn temporary_repository_allows_an_application_root_worktree() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "fixture-root-worktree".into(),
             workspace: fixture.repository.clone(),
+            extra_roots: Vec::new(),
         },
     )
     .expect("attach application root");
