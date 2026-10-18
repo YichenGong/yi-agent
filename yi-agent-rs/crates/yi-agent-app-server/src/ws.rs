@@ -602,7 +602,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
+        let msg = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
             .await
             .expect("timed out waiting for a ws frame")
             .expect("ws stream ended before a frame arrived")
@@ -622,7 +622,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        crate::server::tests_support::initialize(ws).await;
+        crate::test_support::initialize(ws).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -632,7 +632,7 @@ mod tests {
             token,
             handle,
             ..
-        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        } = spawn_ws_with_token(crate::test_support::test_config()).await;
         let mut ws = connect_authed(addr, &token).await;
         initialize(&mut ws).await;
         // config/read
@@ -654,7 +654,7 @@ mod tests {
             token,
             handle,
             ..
-        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        } = spawn_ws_with_token(crate::test_support::test_config()).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?token={token}"))
             .await
             .expect("query-string token connect");
@@ -666,11 +666,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_connection_without_a_token_is_closed_with_4401() {
         let WsFixture { addr, handle, .. } =
-            spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+            spawn_ws_with_token(crate::test_support::test_config()).await;
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
             .await
             .expect("handshake completes; the close follows");
-        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
+        let msg = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
             .await
             .expect("server must close an unauthenticated connection")
             .expect("stream must not end without a close frame")
@@ -688,7 +688,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_connection_with_an_invalid_token_is_closed_with_4401() {
         let WsFixture { addr, handle, .. } =
-            spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+            spawn_ws_with_token(crate::test_support::test_config()).await;
         let uri: axum::http::Uri = format!("ws://{addr}/ws").parse().unwrap();
         let request = ClientRequestBuilder::new(uri)
             .with_header("Authorization", "Bearer not-a-real-token")
@@ -697,7 +697,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(request)
             .await
             .expect("handshake completes; the close follows");
-        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
+        let msg = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
             .await
             .expect("server must close an invalid-token connection")
             .expect("stream must not end without a close frame")
@@ -718,7 +718,7 @@ mod tests {
             token,
             handle,
             ..
-        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        } = spawn_ws_with_token(crate::test_support::test_config()).await;
         let mut first = connect_authed(addr, &token).await;
         initialize(&mut first).await;
 
@@ -747,7 +747,7 @@ mod tests {
             token,
             handle,
             ..
-        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        } = spawn_ws_with_token(crate::test_support::test_config()).await;
 
         // 第一个连接:推一个超过 MAX_FRAME_BYTES 的帧。
         let mut first = connect_authed(addr, &token).await;
@@ -782,7 +782,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(request)
             .await
             .expect("handshake completes; the close follows");
-        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
+        let msg = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
             .await
             .expect("server must close the connection")
             .expect("stream must not end without a close frame")
@@ -802,7 +802,7 @@ mod tests {
         let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws?{query}"))
             .await
             .expect("handshake completes; the close follows");
-        let msg = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
+        let msg = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
             .await
             .expect("server must close the connection")
             .expect("stream must not end without a close frame")
@@ -826,7 +826,7 @@ mod tests {
             pairing,
             handle,
             ..
-        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        } = spawn_ws_with_token(crate::test_support::test_config()).await;
         let code = pairing.create_code();
 
         // 1. 未认证连接带 `?pair=<code>` 与 `device_name`,服务端必须回 `pair/redeemed`。
@@ -886,7 +886,7 @@ mod tests {
 
         // "relay/ws 进程":另一个实例,同一组文件。
         let workspaces = Arc::new(WorkspaceIndex::new(dir.path().join("workspaces.json")));
-        let mut cfg = crate::server::tests_support::test_config();
+        let mut cfg = crate::test_support::test_config();
         cfg.workdir = dir.path().to_path_buf();
         // 这个进程的 PairingState 与桌面实例共享同一组文件,但实例不同。
         // 本测试只走 `?pair=`,不需要本机凭据。
@@ -928,7 +928,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        let closed = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
+        let closed = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
             .await
             .expect("the server must close a one-shot pairing connection");
         match closed {
@@ -956,7 +956,7 @@ mod tests {
             handle,
             ..
         } = spawn_ws_with_token_for(
-            crate::server::tests_support::test_config(),
+            crate::test_support::test_config(),
             crate::protocol::Scope::Admin,
         )
         .await;
@@ -1017,7 +1017,7 @@ mod tests {
             token,
             handle,
             ..
-        } = spawn_ws_with_token(crate::server::tests_support::test_config()).await;
+        } = spawn_ws_with_token(crate::test_support::test_config()).await;
         let mut gone = connect_authed(addr, &token).await;
         initialize(&mut gone).await;
         let mut live = connect_authed(addr, &token).await;
@@ -1095,11 +1095,11 @@ mod tests {
             token,
             handle,
             ..
-        } = spawn_ws_permission(crate::server::tests_support::test_config()).await;
+        } = spawn_ws_permission(crate::test_support::test_config()).await;
         let mut a = connect_authed(addr, &token).await;
         let mut b = connect_authed(addr, &token).await;
-        crate::server::tests_support::initialize(&mut a).await;
-        crate::server::tests_support::initialize(&mut b).await;
+        crate::test_support::initialize(&mut a).await;
+        crate::test_support::initialize(&mut b).await;
 
         // A 建 thread 并起一个会触发 bash 审批的 turn。
         send_json(
@@ -1217,7 +1217,7 @@ mod tests {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         loop {
-            let frame = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
+            let frame = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
                 .await
                 .expect("timed out waiting for requestApproval")
                 .expect("ws stream ended before requestApproval")
@@ -1244,7 +1244,7 @@ mod tests {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
         loop {
-            let frame = tokio::time::timeout(crate::server::tests_support::EVENT_WAIT, ws.next())
+            let frame = tokio::time::timeout(crate::test_support::EVENT_WAIT, ws.next())
                 .await
                 .unwrap_or_else(|_| panic!("timed out waiting for {method}"))
                 .expect("ws stream ended before the expected frame")
