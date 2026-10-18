@@ -930,6 +930,119 @@ fn a_dead_runtime_is_repaired_on_the_next_tool_call() {
     );
 }
 
+/// A project directory that no longer exists must not be brought up.
+#[test]
+fn a_vanished_project_directory_is_refused_and_not_recreated() {
+    let repo = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let runtime = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+    let workdir = cfg.workdir.clone();
+
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+
+    drop(repo);
+
+    // `RuntimeBinding` 不实现 `Debug`，故用 match 而不是 `expect_err`。
+    let error = match attach_cwd_runtime(
+        &runtimes,
+        runtime.path(),
+        &cfg,
+        &isolated_models_path(runtime.path()),
+    ) {
+        Ok(_) => panic!("a vanished project directory must not attach"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains(&workdir.display().to_string()),
+        "the error must name the missing directory, got: {error}"
+    );
+    assert!(
+        !workdir.exists(),
+        "refusing to attach must not recreate the project directory"
+    );
+
+    std::fs::create_dir_all(&workdir).unwrap();
+    init_git_repo(&workdir);
+    attach_cwd_runtime(
+        &runtimes,
+        runtime.path(),
+        &cfg,
+        &isolated_models_path(runtime.path()),
+    )
+    .expect("a restored project directory must attach on the next call");
+}
+
+/// The incident, end to end.
+#[test]
+fn a_reclaimed_worktree_converges_instead_of_retrying_forever() {
+    let directory = tempfile::TempDir::new().unwrap();
+    let deep_slug = "2026-10-17-backend-module-split-design-2026-10-17-backend-module-split";
+    let workdir = directory.path().join(deep_slug);
+    std::fs::create_dir_all(&workdir).unwrap();
+    init_git_repo(&workdir);
+    let mut cfg = test_config();
+    cfg.workdir = workdir.clone();
+    let runtime = workdir.join(".yi-agent/runtime");
+
+    let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+    let binding = attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime))
+        .expect("a git project must attach");
+    let socket = binding.current().unwrap().socket_path.clone();
+    assert_eq!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy,
+        "the runtime must be live before we reclaim its directory"
+    );
+    assert!(
+        !socket.starts_with(&runtime),
+        "precondition: the socket must live outside the runtime directory"
+    );
+
+    drop(binding);
+    std::fs::remove_dir_all(&workdir).unwrap();
+
+    let error = match attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime))
+    {
+        Ok(_) => panic!("a reclaimed worktree must not attach"),
+        Err(error) => error,
+    };
+    assert!(
+        error.contains(&workdir.display().to_string()),
+        "the error must name the missing directory, got: {error}"
+    );
+    assert!(
+        !workdir.exists(),
+        "the refusal must not recreate the reclaimed project directory"
+    );
+
+    let mut socket_died = false;
+    for _ in 0..240 {
+        if !socket.exists() {
+            socket_died = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let _ = std::fs::remove_file(&socket);
+    assert!(
+        socket_died,
+        "the daemon must stop once its runtime directory is gone"
+    );
+
+    for _ in 0..5 {
+        assert!(
+            attach_cwd_runtime(&runtimes, &runtime, &cfg, &isolated_models_path(&runtime)).is_err(),
+            "a reclaimed worktree stays refused"
+        );
+    }
+    assert!(
+        !workdir.exists(),
+        "repeated refusals must not recreate the reclaimed project directory"
+    );
+}
+
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};

@@ -867,6 +867,15 @@ impl Daemon {
         clear_plugin_sockets();
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        // Record the socket node's identity so the exit path can tell our node
+        // apart from a replacement bound at the same path after this directory
+        // was rebuilt.
+        let socket_identity = {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(&socket_path)
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .ok()
+        };
         // Stays non-blocking: `accept` runs only after the poll reports
         // readiness, but the peer can disconnect in between, and that must
         // surface as `WouldBlock` rather than blocking the loop.
@@ -881,8 +890,10 @@ impl Daemon {
         let listener_handlers = Arc::clone(&client_handlers);
         let database_path = database_path.as_ref().to_path_buf();
         let request_context = Arc::new(RequestContext::new(&database_path)?);
+        let watched_runtime_dir = runtime_dir.to_path_buf();
         let cleanup_socket = socket_path.clone();
         let cleanup_lock = lock_path.clone();
+        let cleanup_socket_identity = socket_identity;
         let listener = thread::spawn(move || {
             // Worker facts arrive independently of client traffic. Reconcile
             // them here so a parent blocked in wait_agent is always woken.
@@ -891,7 +902,31 @@ impl Daemon {
                 .build()
                 .expect("daemon reconciliation runtime must initialize");
             let mut last_schedule_minute = None;
+            let mut last_runtime_dir_check: Option<Instant> = None;
             while !thread_stop.load(Ordering::Acquire) {
+                // The directory this daemon serves can be removed underneath it
+                // -- `git worktree remove --force` on the project does exactly
+                // that, and the socket survives in $TMPDIR when the runtime path
+                // is too long for `sun_path`. Every later request then fails to
+                // open a database that no longer exists, while the socket stays
+                // alive, so nothing upstream recognises the daemon as dead and it
+                // retries forever. A missing runtime directory is terminal: say
+                // why, then stop so the socket dies and the normal repair path
+                // can take over.
+                if last_runtime_dir_check
+                    .map(|last| last.elapsed() >= DAEMON_RUNTIME_DIR_CHECK)
+                    .unwrap_or(true)
+                {
+                    last_runtime_dir_check = Some(Instant::now());
+                    if !watched_runtime_dir.exists() {
+                        tracing::warn!(
+                            runtime_dir = %watched_runtime_dir.display(),
+                            "runtime directory disappeared; stopping this daemon so its socket can be replaced"
+                        );
+                        thread_stop.store(true, Ordering::Release);
+                        break;
+                    }
+                }
                 // Worker facts arrive independently of client traffic. A failure
                 // here used to vanish, so a wedged repository looked like a
                 // healthy daemon: keep listening, but say what broke.
@@ -985,7 +1020,7 @@ impl Daemon {
             for handler in handlers {
                 let _ = handler.join();
             }
-            let _ = remove_if_exists(&cleanup_socket);
+            remove_socket_if_same_inode(&cleanup_socket, cleanup_socket_identity);
             let _ = remove_if_exists(&cleanup_lock);
         });
         Ok(Self {
@@ -1180,6 +1215,29 @@ fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// Removes a socket node only if it is still the one we bound.
+///
+/// The daemon's exit path unlinks its socket by path. Between a runtime
+/// directory being removed and rebuilt -- which is exactly what a kanban retry
+/// does -- a replacement daemon can bind the same path first, and the outgoing
+/// daemon would then unlink *its* socket, stranding the replacement the same way
+/// this whole design exists to prevent. Comparing `(dev, ino)` deletes only the
+/// node this daemon bound.
+fn remove_socket_if_same_inode(path: &Path, expected: Option<(u64, u64)>) {
+    use std::os::unix::fs::MetadataExt;
+    // No recorded identity means we cannot tell our node from someone else's, so
+    // leave the path alone rather than risk unlinking a live daemon's socket.
+    let Some(expected) = expected else {
+        return;
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if (metadata.dev(), metadata.ino()) == expected {
+        let _ = remove_if_exists(path);
     }
 }
 
@@ -1508,6 +1566,12 @@ fn daemon_accept_wait(listener: &UnixListener, timeout: Duration) -> std::io::Re
 /// accept wait granularity: it only decides how often `thread_stop` is checked,
 /// it is no longer a per-request latency floor.
 const DAEMON_ACCEPT_POLL: Duration = Duration::from_millis(10);
+
+/// How often the accept loop asks whether the runtime directory it serves still
+/// exists. A missing runtime directory is terminal and unrecoverable -- this
+/// daemon's database lives there -- so the check is deliberately coarse: the
+/// 10ms accept poll would stat a directory every tick for nothing.
+const DAEMON_RUNTIME_DIR_CHECK: Duration = Duration::from_secs(1);
 
 fn handle_client(
     mut stream: UnixStream,
@@ -4117,6 +4181,80 @@ mod socket_path_tests {
         let second = socket_path_for(shared).expect("resolves");
 
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod socket_identity_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixListener;
+
+    fn identity(path: &Path) -> (u64, u64) {
+        let metadata = fs::symlink_metadata(path).expect("node must exist");
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[test]
+    fn a_socket_node_we_still_own_is_removed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("own.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let recorded = identity(&path);
+
+        remove_socket_if_same_inode(&path, Some(recorded));
+
+        assert!(!path.exists(), "our own socket node must be cleaned up");
+        drop(listener);
+    }
+
+    #[test]
+    fn a_replacement_socket_at_the_same_path_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("reused.sock");
+        let first = UnixListener::bind(&path).unwrap();
+        let stale_identity = identity(&path);
+        // 换掉节点：unlink 后重新 bind，拿到一个 (dev, ino) 不同的新节点。
+        // 注意 drop(listener) 本身**不会** unlink 文件——必须先显式删。
+        drop(first);
+        std::fs::remove_file(&path).unwrap();
+        let _replacement = UnixListener::bind(&path).unwrap();
+        assert_ne!(
+            stale_identity,
+            identity(&path),
+            "precondition: rebinding the same path must yield a new inode"
+        );
+
+        remove_socket_if_same_inode(&path, Some(stale_identity));
+
+        assert!(
+            path.exists(),
+            "a socket node bound by a replacement daemon must survive the outgoing daemon's cleanup"
+        );
+    }
+
+    #[test]
+    fn an_unknown_identity_removes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("unknown.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        remove_socket_if_same_inode(&path, None);
+
+        assert!(
+            path.exists(),
+            "without a recorded identity the cleanup must not guess"
+        );
+    }
+
+    #[test]
+    fn a_vanished_node_is_not_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("absent.sock");
+
+        remove_socket_if_same_inode(&path, Some((0, 0)));
+
+        assert!(!path.exists());
     }
 }
 

@@ -848,6 +848,23 @@ fn attach_cwd_runtime(
     models_path: &Path,
 ) -> Result<Arc<RuntimeBinding>, String> {
     let key = project_key(&cfg.workdir);
+    // A project directory that no longer exists has nothing to bring up, and the
+    // bring-up path creates the runtime directory -- which would resurrect
+    // `.yi-agent/runtime` inside a worktree that was already reclaimed. Refuse
+    // before consulting the cache, and *drop* any cached entry: the cache stores
+    // failures on purpose so a doomed bring-up is not re-run on every thread, but
+    // a missing directory is recoverable -- the project can come back -- and a
+    // cached `Err` would lock that recovery out forever.
+    if !cfg.workdir.exists() {
+        runtimes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+        return Err(format!(
+            "the project directory {} no longer exists",
+            cfg.workdir.display()
+        ));
+    }
     if let Some(existing) = runtimes.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
         return existing.clone();
     }
