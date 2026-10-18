@@ -9,6 +9,7 @@ license.workspace = true
 serde.workspace = true
 sha2 = "0.10"
 serde_json.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
