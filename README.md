@@ -258,16 +258,16 @@ yi-agent --provider openai --api-key sk-... --model gpt-4o
 | --- | --- | --- |
 | yi-agent-core | 23 / 24 | [详情](docs/project-management/yi-agent-core.md) |
 | yi-agent-llm | 6 / 9 | [详情](docs/project-management/yi-agent-llm.md) |
-| yi-agent-tools | 18 / 18 | [详情](docs/project-management/yi-agent-tools.md) |
+| yi-agent-tools | 19 / 19 | [详情](docs/project-management/yi-agent-tools.md) |
 | yi-agent-skills | 8 / 8 | [详情](docs/project-management/yi-agent-skills.md) |
-| yi-agent-tui | 32 / 34 | [详情](docs/project-management/yi-agent-tui.md) |
+| yi-agent-tui | 34 / 35 | [详情](docs/project-management/yi-agent-tui.md) |
 | yi-agent-run | 10 / 10 | [详情](docs/project-management/yi-agent-run.md) |
 | yi-agent-cli | 2 / 2 | [详情](docs/project-management/yi-agent-cli.md) |
 | yi-agent-web | 6 / 6 | [详情](docs/project-management/yi-agent-web.md) |
 | permission | 9 / 9 | [详情](docs/project-management/permission.md) |
 | ci-cd | 12 / 14 | [详情](docs/project-management/ci-cd.md) |
 | tooling | 3 / 3 | [详情](docs/project-management/tooling.md) |
-| yi-agent-mcp | 1 / 1 | [详情](docs/project-management/yi-agent-mcp.md) |
+| yi-agent-mcp | 3 / 3 | [详情](docs/project-management/yi-agent-mcp.md) |
 | yi-agent-store | 7 / 8 | [详情](docs/project-management/yi-agent-store.md) |
 | yi-agent-runtime | 16 / 16 | [详情](docs/project-management/yi-agent-runtime.md) |
 | yi-agent-subagent | 9 / 9 | [详情](docs/project-management/yi-agent-subagent.md) |
