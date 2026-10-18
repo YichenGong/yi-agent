@@ -546,11 +546,26 @@ pub fn thread_diff(repo: &Path, explicit_base: Option<&str>, anchor: Option<&str
     }
 }
 
+/// 单个提交的 diff。
+///
+/// `--first-parent`：对**合并提交**这一条是必需的——`git show --format= <merge>`
+/// 按设计输出为空（实测 0 字节），面板会是一片空白；`--first-parent` 给出一份
+/// 连贯的「这次合并带进来了什么」。不采用 `-m`：它把两个父提交的 diff 拼接在
+/// 一起（同一改动列两遍），读起来像重复列举。对非合并提交，两者与裸 `show`
+/// 完全等价。
 pub fn commit_diff(repo: &Path, sha: &str) -> (String, bool) {
-    let raw = git_ok(repo, &["show", "--no-color", "--format=", sha]).unwrap_or_default();
+    let raw = git_ok(
+        repo,
+        &["show", "--no-color", "--first-parent", "--format=", sha],
+    )
+    .unwrap_or_default();
     truncate(raw)
 }
 
+/// 单文件 diff。
+///
+/// 未跟踪文件不在任何 `git diff` 的输出里，需单独合成——否则 `path` 分支对它
+/// 返回 0 字节，前端懒加载出来是空白（D1）。
 pub fn file_diff(repo: &Path, merge_base: Option<&str>, path: &str) -> (String, bool) {
     // `None` 分支与 `files` / `thread_diff` 保持一致：`HEAD` 覆盖已暂存 + 未暂存，
     // 裸 `git diff` 会漏掉已暂存的改动。
@@ -558,6 +573,11 @@ pub fn file_diff(repo: &Path, merge_base: Option<&str>, path: &str) -> (String, 
         Some(mb) => git_ok(repo, &["diff", "--no-color", mb, "--", path]).unwrap_or_default(),
         None => git_ok(repo, &["diff", "--no-color", "HEAD", "--", path]).unwrap_or_default(),
     };
+    // 只有「diff 为空」且该路径**确在未跟踪清单里**时才合成「整文件新增」。
+    // 「已跟踪但无改动」也返回空，但它不在未跟踪清单里，故不会被捏造出内容。
+    if raw.trim().is_empty() && untracked_paths(repo).iter().any(|p| p == path) {
+        return truncate(untracked_diff(&repo_root(repo), &[path.to_string()]));
+    }
     truncate(raw)
 }
 
@@ -1114,5 +1134,100 @@ mod tests {
             assert!(obj.contains_key(key), "missing `{key}` in {v}");
         }
         assert_eq!(obj.len(), 10, "no extra/renamed keys: {v}");
+    }
+
+    /// D2：合并提交的 diff 不能是空白。
+    ///
+    /// `git show --format= <merge>` 按设计输出 0 字节（实测），面板会是一片空白。
+    /// `--first-parent` 给出一份连贯的「这次合并带进来了什么」；`-m` 会把两个父
+    /// 提交的 diff 拼在一起（同一改动列两遍），故不采用。
+    #[test]
+    fn merge_commits_render_a_first_parent_diff() {
+        let dir = repo();
+        let run = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.path().join("b.txt"), "side\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "side work"]);
+        run(&["checkout", "-q", "trunk"]);
+        std::fs::write(dir.path().join("a.txt"), "main edit\n").unwrap();
+        run(&["commit", "-qam", "main work"]);
+        run(&["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+
+        let merge = git_ok(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        let (diff, _) = commit_diff(dir.path(), merge.trim());
+        assert!(
+            !diff.trim().is_empty(),
+            "a merge commit must not render blank (that was the bug)"
+        );
+        assert!(
+            diff.contains("b.txt"),
+            "the merged-in change must show: {diff}"
+        );
+        // `-m` 会把同一改动对两个父各列一遍；`--first-parent` 只列一遍。
+        assert_eq!(
+            diff.matches("diff --git a/b.txt").count(),
+            1,
+            "the merge must be rendered against the first parent only: {diff}"
+        );
+    }
+
+    /// 非合并提交的行为**不得**因加 `--first-parent` 而改变。
+    #[test]
+    fn non_merge_commits_are_unchanged() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["commit", "-qam", "edit a"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let (diff, _) = commit_diff(dir.path(), "HEAD");
+        assert!(
+            diff.contains("+two"),
+            "non-merge behaviour must not change: {diff}"
+        );
+    }
+
+    /// D1：未跟踪文件不在任何 `git diff` 的输出里，单文件视图必须自己合成，
+    /// 否则点开它是一片空白（`path` 分支返回 0 字节）。
+    #[test]
+    fn file_diff_covers_untracked_files() {
+        let dir = repo();
+        std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap();
+        let (diff, _) = file_diff(dir.path(), Some("trunk"), "new.txt");
+        assert!(
+            diff.contains("+hello"),
+            "an untracked file's content must be synthesized (the path branch returned 0 bytes): {diff}"
+        );
+        // 未跟踪不应被误判成「已跟踪但无改动」的空白：必须带 new file 头。
+        assert!(
+            diff.contains("new file mode"),
+            "the synthesized diff must look like a new file: {diff}"
+        );
+    }
+
+    /// 合成只针对**未跟踪**路径：已跟踪但无改动的文件仍应返回空，不得凭空捏造。
+    #[test]
+    fn file_diff_leaves_a_clean_tracked_file_empty() {
+        let dir = repo();
+        let (diff, _) = file_diff(dir.path(), Some("trunk"), "a.txt");
+        assert!(
+            diff.trim().is_empty(),
+            "a clean tracked file has no diff; nothing may be synthesized: {diff}"
+        );
     }
 }
