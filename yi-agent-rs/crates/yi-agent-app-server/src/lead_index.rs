@@ -271,6 +271,138 @@ pub fn render_tail(tail: &ThreadTail) -> String {
     out
 }
 
+use serde::Deserialize;
+use serde_json::Value;
+use std::path::PathBuf;
+use yi_agent_core::{Tool, ToolResult};
+
+/// 列出本项目里组长的**手下会话**（磁盘真相，不含实时状态）。
+pub struct LeadListThreadsTool {
+    project_root: PathBuf,
+}
+
+impl LeadListThreadsTool {
+    pub fn new(project_root: PathBuf) -> Self {
+        Self { project_root }
+    }
+}
+
+#[derive(Deserialize)]
+struct LeadListArgs {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for LeadListThreadsTool {
+    fn name(&self) -> &str {
+        "lead_list_threads"
+    }
+
+    fn description(&self) -> &str {
+        "List the conversations in this project that you (the lead) are responsible for. Shows each thread's id, title, last update time, item count, and its last assistant conclusion. This is a disk-only snapshot and does NOT include live status (running/awaiting approval) — status changes arrive via background wake-ups."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "number", "description": "Max threads to list (default 50, max 200)." }
+            }
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let parsed: LeadListArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+        };
+        let limit = parsed
+            .limit
+            .unwrap_or(LIST_DEFAULT_LIMIT)
+            .min(LIST_MAX_LIMIT);
+        match list_summaries(&self.project_root, limit) {
+            Ok((rows, total)) => {
+                ToolResult::text(render_summaries(&rows, total, &self.project_root))
+            }
+            Err(e) => ToolResult::error(format!("failed to list threads: {e}")),
+        }
+    }
+
+    fn metadata(&self) -> yi_agent_core::ToolMetadata {
+        yi_agent_core::ToolMetadata {
+            read_only: true,
+            ..crate::lead_memory::lead_memory_metadata()
+        }
+    }
+}
+
+/// 读某个手下会话的**转录尾部**（最近的来往）。
+pub struct LeadReadThreadTool {
+    project_root: PathBuf,
+}
+
+impl LeadReadThreadTool {
+    pub fn new(project_root: PathBuf) -> Self {
+        Self { project_root }
+    }
+}
+
+#[derive(Deserialize)]
+struct LeadReadArgs {
+    thread_id: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for LeadReadThreadTool {
+    fn name(&self) -> &str {
+        "lead_read_thread"
+    }
+
+    fn description(&self) -> &str {
+        "Read the tail of one of your project's conversation transcripts (the most recent items). Use it to see what a thread actually delivered or where it got stuck. Returns only the most recent items, and says how many were omitted."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thread_id": { "type": "string", "description": "The thread id to read (must belong to this project)." },
+                "limit": { "type": "number", "description": "Max items to return (default 20, max 50)." }
+            },
+            "required": ["thread_id"]
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        let parsed: LeadReadArgs = match serde_json::from_value(args) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+        };
+        let limit = parsed
+            .limit
+            .unwrap_or(READ_DEFAULT_ITEMS)
+            .min(READ_MAX_ITEMS);
+        match read_tail(&self.project_root, &parsed.thread_id, limit) {
+            Ok(Some(tail)) => ToolResult::text(render_tail(&tail)),
+            Ok(None) => ToolResult::error(format!(
+                "no such thread in this project: {} (it may belong to another project)",
+                parsed.thread_id
+            )),
+            Err(e) => ToolResult::error(format!("failed to read thread: {e}")),
+        }
+    }
+
+    fn metadata(&self) -> yi_agent_core::ToolMetadata {
+        yi_agent_core::ToolMetadata {
+            read_only: true,
+            ..crate::lead_memory::lead_memory_metadata()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +556,52 @@ mod tests {
         let out = render_tail(&tail);
         assert!(out.contains("共 50 条"), "{out}");
         assert!(out.contains("最近 1 条"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn lead_list_threads_tool_reports_the_projects_threads() {
+        use yi_agent_core::Tool;
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ThreadStore::new(dir.path());
+        store.create(&meta("t-a", Some("A"), 10, None)).unwrap();
+        let tool = LeadListThreadsTool::new(dir.path().to_path_buf());
+        assert_eq!(tool.name(), "lead_list_threads");
+        assert!(tool.metadata().read_only);
+        let out = tool.call(serde_json::json!({})).await;
+        assert!(!out.is_error, "{out:?}");
+        let text = tool_text(&out);
+        assert!(text.contains("t-a"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn lead_read_thread_tool_refuses_a_thread_outside_the_project() {
+        use yi_agent_core::Tool;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = LeadReadThreadTool::new(dir.path().to_path_buf());
+        assert_eq!(tool.name(), "lead_read_thread");
+        let out = tool.call(serde_json::json!({ "thread_id": "nope" })).await;
+        assert!(out.is_error, "must refuse an unknown thread: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn lead_read_thread_tool_requires_a_thread_id() {
+        use yi_agent_core::Tool;
+        let dir = tempfile::TempDir::new().unwrap();
+        let tool = LeadReadThreadTool::new(dir.path().to_path_buf());
+        let out = tool.call(serde_json::json!({})).await;
+        assert!(out.is_error);
+    }
+
+    /// 从 `ToolResult` 里取纯文本（与既有测试同款小工具）。
+    fn tool_text(result: &yi_agent_core::ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                yi_agent_core::ContentBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

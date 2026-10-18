@@ -560,6 +560,113 @@ fn only_the_lead_sees_the_memory_tools() {
     );
 }
 
+/// 组长私有的**视野**工具同样只给组长:普通会话一个都看不到。
+///
+/// 与 `only_the_lead_sees_the_memory_tools` 同源同门控(`is_lead_thread`),
+/// 但负臂仍然是重点:两个新工具是**只读**的,若被无条件注册,代价比账本工具低、
+/// 更容易漏看——每个普通会话都能翻别人(甚至别的项目里)的转录。故这里钉:
+/// ① 落过盘但 `role: None` 的会话看不到;② 从未落过盘的会话也看不到;
+/// ③ 负臂会话的工具集非空(`ask_lead` 还在),证明「看不到」不是 registry 空掉。
+///
+/// 判定只看落盘的 `ThreadMeta.role`(唯一权威):正臂走生产的 `ensure_lead_meta`
+/// 造 meta,不手搓一个「像组长」的形状。
+#[test]
+fn only_the_lead_sees_the_view_tools() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let project_root = repo.path().canonicalize().expect("repo path canonicalizes");
+
+    let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
+    store
+        .create(&crate::thread_store::ThreadMeta {
+            thread_id: "thread-plain".to_string(),
+            cwd: cfg.workdir.to_string_lossy().to_string(),
+            model: "test-model".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            title: Some("组长".to_string()), // 标题写着「组长」也不许算组长
+            permission_mode: crate::thread_store::ThreadMode::Normal,
+            pin_seq: None,
+            board_project: None,
+            card_id: None,
+            model_ref: None,
+            reasoning_effort: None,
+            preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
+            role: None,
+            tag: None,
+            extra_roots: Vec::new(),
+        })
+        .expect("a plain meta must persist");
+    // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。
+    let (lead, _created) = crate::lead::ensure_lead_meta(&store, &project_root).expect("lead meta");
+
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    let build = |thread_id: &str| {
+        build_runtime_tooling(
+            &cfg,
+            &root,
+            thread_id,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
+            crate::lead::LeadReplies::new(),
+        )
+        .expect("tooling")
+    };
+
+    let lead_names = build(&lead.thread_id).registry.names();
+    assert!(
+        lead_names.contains(&"lead_list_threads".to_string()),
+        "the lead must see lead_list_threads, got {lead_names:?}"
+    );
+    assert!(
+        lead_names.contains(&"lead_read_thread".to_string()),
+        "the lead must see lead_read_thread, got {lead_names:?}"
+    );
+
+    // 负臂:落过盘的普通会话,以及从未落过盘的会话。
+    for plain in ["thread-plain", "thread-never-persisted"] {
+        let names = build(plain).registry.names();
+        assert!(
+            !names.contains(&"lead_list_threads".to_string()),
+            "{plain} is not the lead and must not see lead_list_threads, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"lead_read_thread".to_string()),
+            "{plain} is not the lead and must not see lead_read_thread, got {names:?}"
+        );
+        // 非空 witnesses:「看不到」必须是真的缺席,而不是整个 registry 空掉。
+        assert!(
+            names.contains(&"ask_lead".to_string()),
+            "{plain} still gets the shared tools, got {names:?}"
+        );
+    }
+}
+
 /// 组长的 cwd 落在 git 仓库的**子目录**时,两个记忆工具仍然必须可见。
 ///
 /// 这是上一条测试抓不到的那一格:那里 thread cwd 就是仓库顶层,「读 role 的

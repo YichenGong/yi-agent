@@ -127,7 +127,7 @@ pub fn search_with_total(
 use serde_json::Value;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
-fn lead_memory_metadata() -> ToolMetadata {
+pub(crate) fn lead_memory_metadata() -> ToolMetadata {
     ToolMetadata {
         source: ToolSource::Plugin {
             name: "lead".to_string(),

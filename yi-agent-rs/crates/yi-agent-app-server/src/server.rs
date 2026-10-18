@@ -1009,6 +1009,14 @@ fn build_runtime_tooling(
         registry.register(Arc::new(crate::lead_memory::LeadRememberTool::new(
             project_root.clone(),
         )));
+        // 只读视野工具（P3-A）：同一份 `project_root`（= thread cwd），与账本
+        // 工具同源。插在 `LeadRecallTool` 之前是因为后者 move 了 `project_root`。
+        registry.register(Arc::new(crate::lead_index::LeadListThreadsTool::new(
+            project_root.clone(),
+        )));
+        registry.register(Arc::new(crate::lead_index::LeadReadThreadTool::new(
+            project_root.clone(),
+        )));
         registry.register(Arc::new(crate::lead_memory::LeadRecallTool::new(
             project_root,
         )));
