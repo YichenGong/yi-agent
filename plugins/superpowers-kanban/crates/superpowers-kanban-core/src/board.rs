@@ -173,7 +173,12 @@ impl Board {
             .iter_mut()
             .find(|card| &card.id == id)
             .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
-        if !card.state.can_transition_to(CardState::Queued) {
+        // 守卫必须严格盯「当前就是 PreQueued」，不能只问转移合法性：
+        // `(Paused, Queued)` 与 `(NeedsYou, Queued)` 都是合法边（那是卡回队列的
+        // 正常通路），拿它们当守卫会让一次 id 搞错的 promote 直接覆写一张真卡的
+        // spec/plan 并把它甩到队尾——静默数据丢失。`Queued` 输入仍然报
+        // `Illegal { from: Queued, to: Queued }`（与非 PreQueued 输入一致）。
+        if card.state != CardState::PreQueued {
             return Err(TransitionError::Illegal {
                 from: card.state,
                 to: CardState::Queued,
@@ -827,9 +832,26 @@ mod tests {
 
     #[test]
     fn promoting_fills_the_paths_keeps_the_id_and_moves_to_the_back() {
-        let mut board = board_with(&["older"]);
-        board.enqueue_prequeued(CardId::new("idea"), "想法".into(), at(1, 5));
+        // 预排队卡**先**入队，竞争者**后**入队——否则被提升的卡本来就排在最后，
+        // 「重排到队尾」这一断言在任何情况下都成立，测不出重排逻辑（原来那个
+        // 版本的 `board_with(&["older"])` 就是这样：删掉 `card.order = order`
+        // 测试照样绿）。
+        let mut board = Board::new();
         let idea = CardId::new("idea");
+        board.enqueue_prequeued(idea.clone(), "想法".into(), at(1, 0));
+        board.enqueue(
+            CardId::new("newer"),
+            "newer.spec.md".into(),
+            "newer.plan.md".into(),
+            at(1, 1),
+        );
+        // 提升前：`idea` 的 order 更小——正是它「本来就排在竞争者之前」的证据。
+        // （不能用 `next_startable` 证：预排队卡压根不参与启动。）
+        let newer_before = board.get(&CardId::new("newer")).unwrap().clone();
+        assert!(
+            board.get(&idea).unwrap().order < newer_before.order,
+            "前提：idea 原本排在竞争者之前"
+        );
         board
             .promote_prequeued(
                 &idea,
@@ -844,9 +866,17 @@ mod tests {
         assert_eq!(card.spec_path, PathBuf::from("docs/idea.spec.md"));
         assert_eq!(card.plan_path, PathBuf::from("docs/idea.plan.md"));
         assert_eq!(card.title.as_deref(), Some("想法"), "未给新标题则保留");
-        // 重排到队尾：`older`(order 0) 之后。
-        assert_eq!(board.next_startable(), Some(CardId::new("older")));
-        assert!(card.order > board.get(&CardId::new("older")).unwrap().order);
+        // 重排到队尾：若 `promote_prequeued` 里删掉 `card.order = order`，`idea`
+        // 会保留 order 0 留在队首，下面两条断言都会失败——这就是本测试的强制点。
+        assert!(
+            card.order > newer_before.order,
+            "提升后必须排到原本在它后面的卡之后"
+        );
+        assert_eq!(
+            board.next_startable(),
+            Some(CardId::new("newer")),
+            "提升后的卡让位于竞争者"
+        );
     }
 
     #[test]
@@ -875,5 +905,66 @@ mod tests {
                 to: CardState::Queued,
             }
         );
+    }
+
+    #[test]
+    fn promoting_a_needs_you_or_paused_card_leaves_it_untouched() {
+        // 这些状态都能合法地转回 `Queued`（见 `can_transition_to` 的
+        // `(Paused, Queued)` / `(NeedsYou, Queued)`）。若 `promote_prequeued`
+        // 拿转移合法性当守卫，一次 id 搞错的提升就会覆写真卡的 spec/plan 并把它
+        // 甩到队尾——静默数据丢失。这里把「拒绝且原封不动」钉死。
+        let mut board = board_with(&["a", "b"]);
+        board.start_due(1); // a -> Running
+        board
+            .transition(&CardId::new("a"), CardState::NeedsYou)
+            .unwrap();
+        let before = board.get(&CardId::new("a")).unwrap().clone();
+
+        let error = board
+            .promote_prequeued(
+                &CardId::new("a"),
+                "docs/hijacked.spec.md".into(),
+                "docs/hijacked.plan.md".into(),
+                Some("劫持".into()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            TransitionError::Illegal {
+                from: CardState::NeedsYou,
+                to: CardState::Queued,
+            }
+        );
+        let after = board.get(&CardId::new("a")).unwrap().clone();
+        assert_eq!(after.state, CardState::NeedsYou, "状态不许被改动");
+        assert_eq!(after.spec_path, before.spec_path, "spec 路径不许被覆写");
+        assert_eq!(after.plan_path, before.plan_path, "plan 路径不许被覆写");
+        assert_eq!(after.title, before.title, "标题不许被覆写");
+        assert_eq!(after.order, before.order, "不许被重排");
+        // 队列秩序不受影响：b 仍是队首。
+        assert_eq!(board.next_startable(), Some(CardId::new("b")));
+
+        // Paused 同样必须被拒（`(Paused, Queued)` 也是合法边）。
+        let mut board = board_with(&["c"]);
+        board.start_due(1); // c -> Running
+        board
+            .transition(&CardId::new("c"), CardState::Paused)
+            .unwrap();
+        let before = board.get(&CardId::new("c")).unwrap().clone();
+        let error = board
+            .promote_prequeued(&CardId::new("c"), "s".into(), "p".into(), None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            TransitionError::Illegal {
+                from: CardState::Paused,
+                to: CardState::Queued,
+            }
+        );
+        let after = board.get(&CardId::new("c")).unwrap();
+        assert_eq!(after.state, CardState::Paused);
+        assert_eq!(after.spec_path, before.spec_path);
+        assert_eq!(after.plan_path, before.plan_path);
+        assert_eq!(after.order, before.order);
     }
 }
