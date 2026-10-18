@@ -831,15 +831,27 @@ impl RuntimeCoordinator {
             )?;
         // The linked roots are a property of the session, snapshotted here at
         // creation. The existing/reattach branch above returns before this
-        // point precisely so a later attach cannot rewrite them.
-        self.repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .set_task_extra_roots(&root_task_id, extra_roots)?;
-        // Seeded beside the row so the supervisor's view and the durable record
-        // agree from the first instant: `start_worker` reads the roots off the
-        // supervisor, and a root whose row said one thing while its worker was
-        // started with another would be the one inconsistency nothing detects.
+        // point precisely so a later attach cannot rewrite them. Guarded on an
+        // empty set like every other durable seeding site: "no linked roots"
+        // and "never wrote the column" are the same state, so an unlinked attach
+        // must not issue `UPDATE tasks SET extra_roots = NULL` — the same rule
+        // `spawn_child_with_objective` follows (see
+        // `a_no_roots_spawn_issues_no_extra_roots_update`).
+        if !extra_roots.is_empty() {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .set_task_extra_roots(&root_task_id, extra_roots)?;
+        }
+        // Left unguarded on purpose, unlike the SQL write above: `set_extra_roots`
+        // with an empty set is exactly the "this root has no linked roots"
+        // normalization (it removes the entry, a no-op for the freshly built
+        // supervisor this branch always holds), so it issues no statement, costs
+        // no branch, and keeps the supervisor's view explicitly equal to the
+        // durable one. Seeded beside the row so the two agree from the first
+        // instant: `start_worker` reads the roots off the supervisor, and a root
+        // whose row said one thing while its worker was started with another
+        // would be the one inconsistency nothing detects.
         supervisor.set_extra_roots(
             &root_task_id,
             extra_roots.iter().map(PathBuf::from).collect(),
@@ -913,20 +925,21 @@ impl RuntimeCoordinator {
                 let mut supervisor =
                     AgentSupervisor::from_hydrated_review_root(hydrated, objective)
                         .with_max_direct_children(self.max_direct_children);
-                // This path seeds NEITHER inheritance field: no
-                // `set_inherited_sandbox` (see the sibling field's absence at the
-                // base commit too) and no `set_extra_roots`. That is deliberate
-                // and pre-existing/symmetric, not an oversight: the only seeding
-                // sites are the `open()` recovery hydration (both the recovered
-                // child and the recovered root), the reattach branch of
-                // `attach_application_root`, that method's create branch, and
-                // `spawn_child_with_objective`. Those cover every task that can
-                // start a worker whose row carries an inherited value; the read
-                // sites (`WorkerStart` assembly) already fall back to "no roots",
-                // so a task reattached here behaves exactly as an un-inherited
-                // session does. Keep the two fields in step: if a future change
-                // starts seeding one of them here, it must seed the other in the
-                // same edit.
+                // A ROOT hydrated here seeds NEITHER inheritance field: no
+                // `set_inherited_sandbox` and no `set_extra_roots`. That is
+                // deliberate, not an oversight: this root was created by
+                // `attach_application_root`, whose create branch writes both the
+                // row and the supervisor, and whose reattach branch reads the
+                // roots back off the durable row. The read sites (`WorkerStart`
+                // assembly) already fall back to "no roots" / "no sandbox", so a
+                // root reaching here behaves exactly as an un-inherited session
+                // does. The CHILD arm below is NOT symmetric with this one: it
+                // seeds BOTH fields from the child's own row, because a child
+                // rehydrated into a live daemon (supervisor reclaimed, daemon not
+                // restarted, so `open()`'s recovery hydration never saw it) has no
+                // other site that could restore them. Keep the two fields in
+                // step: whichever arm seeds one must seed the other in the same
+                // edit.
                 supervisor.set_workspace_mode(&task_id, root_mode);
                 hydrate_completion_report(&mut supervisor, task_id.clone(), completion_report)?;
                 hydrated_supervisor = Some(supervisor);
@@ -949,6 +962,32 @@ impl RuntimeCoordinator {
                 supervisor
                     .insert_hydrated_review_child(hydrated, objective, mode, model)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
+                // A child rehydrated here is one whose supervisor was reclaimed
+                // while the daemon stayed up, so `open()`'s recovery hydration
+                // never saw it: nothing else will restore what its row recorded,
+                // and `start_worker` reads both values off the supervisor when it
+                // assembles `WorkerStart`. Seeding after the insert is required —
+                // `insert_hydrated_review_child` clears any stale entry for the id,
+                // so the durable value must win. Both fields are seeded together
+                // (see the note in the root arm above): a child that kept its
+                // inherited sandbox but lost its roots would be exactly the silent
+                // capability narrowing this feature exists to prevent.
+                let roots = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .task_extra_roots(&task_id)?;
+                if !roots.is_empty() {
+                    supervisor.set_extra_roots(&task_id, roots.iter().map(PathBuf::from).collect());
+                }
+                let inherited_sandbox = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .task_inherited_sandbox(&task_id)?;
+                if let Some(inherited_sandbox) = inherited_sandbox {
+                    supervisor.set_inherited_sandbox(&task_id, inherited_sandbox);
+                }
                 hydrate_completion_report(supervisor, task_id.clone(), completion_report)?;
             }
             if let Some(delivery) = delivered {
@@ -1497,8 +1536,16 @@ impl RuntimeCoordinator {
             None => None,
         };
         // The parent's root set, read before the child row is written so the
-        // inherited value lands with the row's INSERT: there is no intermediate
-        // state in which the child exists but its roots do not.
+        // inherited set can be handed to the seeding sites below as one value.
+        // The value is NOT atomic with the row: `create_child_task_with_attempt_and_objective`
+        // has no `extra_roots` parameter, so the row is INSERTed first and the set
+        // is written by the guarded UPDATE further down. A crash in that window
+        // leaves the child row at `extra_roots = NULL`: the child (and every task
+        // later spawned beneath it, since each spawn reads its own parent's row)
+        // then runs single-rooted. That asymmetry with `inherited_sandbox` (which
+        // rides in the same INSERT) is deliberate here: threading the column
+        // through the INSERT would touch every call site for a window that needs a
+        // crash between two adjacent statements.
         let parent_extra = self
             .repository
             .lock()

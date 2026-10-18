@@ -2530,6 +2530,12 @@ impl RuntimeRepository {
     /// Records a task's linked roots. An empty set is stored as SQL `NULL`, not
     /// as `"[]"`, so a cleared row is indistinguishable from one that predates
     /// the column; both mean "no linked roots".
+    ///
+    /// Deliberately lenient about a MISSING task: the affected-row count is
+    /// ignored, so this returns `Ok` for an unknown id (unlike
+    /// `set_task_thread_id`). A missing row is also read as an empty set by
+    /// [`Self::task_extra_roots`], so the two agree, and every production call
+    /// site runs immediately after the task's INSERT, making this unreachable.
     pub fn set_task_extra_roots(
         &mut self,
         task: &TaskId,

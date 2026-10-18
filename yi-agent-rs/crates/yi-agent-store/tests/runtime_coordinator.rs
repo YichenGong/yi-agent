@@ -4143,3 +4143,154 @@ async fn reattaching_a_root_session_restores_its_linked_roots_on_the_supervisor(
         "a reattach must never rewrite the recorded roots"
     );
 }
+
+/// A supervisor reclaimed while the daemon stays up is rebuilt by
+/// `ensure_application_root_supervisor`, which hydrates the root's CHILDREN as
+/// well as the root. Each hydrated child must read its roots back off its own
+/// durable row: seeding the root alone leaves a child's worker starting
+/// single-rooted, the silent capability narrowing this feature exists to
+/// prevent. The child is deliberately left `queued`, because `open()`'s recovery
+/// hydration only sweeps the `recovery_*` family — so the reopened daemon holds
+/// no supervisor for the session and the child can only come back through
+/// `ensure_application_root_supervisor`.
+#[tokio::test]
+async fn a_reattach_restores_a_hydrated_childs_linked_roots() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, factory, database) = linked_roots_coordinator(&directory);
+    let application_root = directory.path().join("not-a-repo");
+    let linked = vec!["/w/linked-b".to_string()];
+
+    let attached = coordinator
+        .attach_application_root("hydrated-child-project", &application_root, &linked)
+        .await
+        .unwrap();
+    let session = attached.session_id.clone();
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &attached.root_task_id,
+            "child".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_state(&child)
+            .unwrap(),
+        "queued",
+        "the child must stay outside the recovery family for this test to bite"
+    );
+    drop(coordinator);
+
+    let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let reattached = reopened
+        .attach_application_root("hydrated-child-project", &application_root, &[])
+        .await
+        .unwrap();
+    assert_eq!(reattached.session_id, attached.session_id);
+    reopened
+        .start_worker(&reattached.session_id, &child)
+        .await
+        .unwrap();
+
+    let starts = factory.starts.lock().unwrap();
+    let child_start = starts
+        .iter()
+        .find(|start| start.task_id == child)
+        .expect("the reattached child's worker started");
+    assert_eq!(
+        child_start.extra_roots,
+        vec![std::path::PathBuf::from("/w/linked-b")],
+        "a reattached child must restore the roots its own row recorded"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_extra_roots(&child)
+            .unwrap(),
+        linked,
+        "the child's durable row must already carry the inherited set"
+    );
+}
+
+/// An attach that brings no linked roots must issue no `UPDATE tasks SET
+/// extra_roots` at all — the spawn path guards this write and so must the
+/// attach-create path. Counted in SQLite itself (an `AFTER UPDATE OF
+/// extra_roots` trigger), because the redundant statement is invisible to every
+/// read-back assertion: the column ends up `NULL` either way. Phase B is the
+/// live control, proving the trigger sees the statement shape phase A forbids.
+#[tokio::test]
+async fn an_unlinked_attach_issues_no_extra_roots_update() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let application_root = directory.path().join("not-a-repo");
+    std::fs::create_dir(&application_root).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: application_root.clone(),
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+
+    let audit = Connection::open(&database).unwrap();
+    audit
+        .execute_batch(
+            "CREATE TABLE attach_extra_roots_writes (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT);
+             CREATE TRIGGER audit_attach_extra_roots_writes AFTER UPDATE OF extra_roots ON tasks
+             BEGIN INSERT INTO attach_extra_roots_writes (task_id) VALUES (NEW.id); END;",
+        )
+        .unwrap();
+    let writes = |audit: &Connection| -> i64 {
+        audit
+            .query_row(
+                "SELECT COUNT(*) FROM attach_extra_roots_writes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    // Phase A: an attach with no linked roots. The guarded write must not run.
+    assert_eq!(writes(&audit), 0, "the trigger starts from a clean slate");
+    let bare = coordinator
+        .attach_application_root("unlinked-attach-project", &application_root, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        writes(&audit),
+        0,
+        "an unlinked attach must not issue the redundant extra_roots UPDATE"
+    );
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_extra_roots(&bare.root_task_id)
+            .unwrap()
+            .is_empty(),
+        "an unlinked attach still reads back as single-rooted"
+    );
+
+    // Phase B: a second attach that does carry roots. The write must show up,
+    // proving the trigger counts exactly the statement phase A asserted absent.
+    coordinator
+        .attach_application_root(
+            "linked-attach-project",
+            &application_root,
+            &["/w/linked-b".to_string()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        writes(&audit),
+        1,
+        "a linked attach must still record its roots"
+    );
+}
