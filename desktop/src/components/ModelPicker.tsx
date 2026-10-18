@@ -8,6 +8,7 @@ import {
   type ModelRpc,
 } from "../lib/models";
 import { buildEffortOptions, buildModelOptions, entryEffortOf, overrideFromEffective } from "../lib/modelPicker";
+import { Popover } from "../ui/Popover";
 
 /**
  * 宿主注入的模型 RPC 接缝。
@@ -134,23 +135,6 @@ export function ModelPicker({
     };
   }, [open, rpc]);
 
-  // Escape 关闭任一打开的下拉，并把焦点交回**那个**下拉的触发按钮（不是模型按钮）：
-  // 在 effort 菜单里按 Escape 时把焦点甩到模型按钮会让人以为按错了控件。
-  useEffect(() => {
-    if (!open && !effortOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.preventDefault();
-        const restore = effortOpen ? effortTriggerRef.current : triggerRef.current;
-        setOpen(false);
-        setEffortOpen(false);
-        restore?.focus();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [open, effortOpen]);
-
   const options = buildModelOptions(catalog, currentRef, currentModel);
   const current = options.find((o) => o.selected) ?? options[0];
   // 条目默认档由本组件读到的清单现算（与模型下拉同一份 catalog、同一个引用选择
@@ -216,29 +200,36 @@ export function ModelPicker({
         {current.label}
       </button>
 
-      {open && (
-        <>
-          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
-          <div
-            role="menu"
-            className="absolute right-0 bottom-full z-20 mb-1 max-h-64 overflow-y-auto rounded-md border border-line-strong bg-raised py-1 shadow-xl"
-          >
-            {options.map((option) => (
-              <button
-                key={option.value ?? "__default__"}
-                type="button"
-                role="menuitemradio"
-                aria-checked={option.selected}
-                onClick={() => void choose(option.value)}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-              >
-                <span className="w-3 text-fg-muted">{option.selected ? "✓" : ""}</span>
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
+      {/* 下拉的 Escape 关闭由 Popover 负责；onClose 里把焦点交回**那个**下拉的触发
+          按钮（不是模型按钮）：在 effort 菜单里按 Escape 把焦点甩到模型按钮会让人
+          以为按错了控件。两个下拉同开时两个监听按注册顺序触发（模型在前、档位在后），
+          最终落在档位按钮上——与原手写 effect 的 `effortOpen ? … : …` 结论一致。 */}
+      <Popover
+        open={open}
+        onClose={() => {
+          setOpen(false);
+          triggerRef.current?.focus();
+        }}
+      >
+        <div
+          role="menu"
+          className="absolute right-0 bottom-full z-20 mb-1 max-h-64 overflow-y-auto rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+        >
+          {options.map((option) => (
+            <button
+              key={option.value ?? "__default__"}
+              type="button"
+              role="menuitemradio"
+              aria-checked={option.selected}
+              onClick={() => void choose(option.value)}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+            >
+              <span className="w-3 text-fg-muted">{option.selected ? "✓" : ""}</span>
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </Popover>
 
       {error !== null && (
         <p role="alert" className="absolute right-0 bottom-full mb-1 text-xs text-red-400">
@@ -263,29 +254,32 @@ export function ModelPicker({
         {currentEffortOption.label}
       </button>
 
-      {effortOpen && (
-        <>
-          <div className="fixed inset-0 z-10" onClick={() => setEffortOpen(false)} />
-          <div
-            role="menu"
-            className="absolute right-0 bottom-full z-20 mb-1 max-h-64 overflow-y-auto rounded-md border border-line-strong bg-raised py-1 shadow-xl"
-          >
-            {effortOptions.map((option) => (
-              <button
-                key={option.value ?? "__unset__"}
-                type="button"
-                role="menuitemradio"
-                aria-checked={option.selected}
-                onClick={() => void chooseEffort(option.value)}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-              >
-                <span className="w-3 text-fg-muted">{option.selected ? "✓" : ""}</span>
-                {option.label}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
+      <Popover
+        open={effortOpen}
+        onClose={() => {
+          setEffortOpen(false);
+          effortTriggerRef.current?.focus();
+        }}
+      >
+        <div
+          role="menu"
+          className="absolute right-0 bottom-full z-20 mb-1 max-h-64 overflow-y-auto rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+        >
+          {effortOptions.map((option) => (
+            <button
+              key={option.value ?? "__unset__"}
+              type="button"
+              role="menuitemradio"
+              aria-checked={option.selected}
+              onClick={() => void chooseEffort(option.value)}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+            >
+              <span className="w-3 text-fg-muted">{option.selected ? "✓" : ""}</span>
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </Popover>
 
       {effortError !== null && (
         <p role="alert" className="absolute right-0 bottom-full mb-1 text-xs text-red-400">
