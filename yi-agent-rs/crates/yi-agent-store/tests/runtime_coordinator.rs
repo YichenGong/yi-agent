@@ -3758,3 +3758,261 @@ async fn attaching_an_application_root_without_linked_roots_records_nothing() {
         Vec::<String>::new()
     );
 }
+
+/// One setup for the linked-roots tree tests: a non-git application root whose
+/// workspace service resolves any read-only position, plus the recording
+/// factory, so both the durable rows and the `WorkerStart` payloads are
+/// observable.
+fn linked_roots_coordinator(
+    directory: &TempDir,
+) -> (
+    RuntimeCoordinator,
+    Arc<MessageRecordingFactory>,
+    std::path::PathBuf,
+) {
+    let database = directory.path().join("runtime.sqlite");
+    let application_root = directory.path().join("not-a-repo");
+    std::fs::create_dir(&application_root).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: application_root.clone(),
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    (coordinator, factory, database)
+}
+
+/// A child with no roots of its own inherits its parent's linked roots, and a
+/// grandchild inherits them again from the child. The reader never assumes
+/// depth: each spawn reads its own parent's row, so the set survives any number
+/// of levels without the spawner re-forwarding it.
+#[tokio::test]
+async fn a_child_inherits_its_parents_linked_roots_transitively() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, factory, database) = linked_roots_coordinator(&directory);
+    let application_root = directory.path().join("not-a-repo");
+    let linked = vec!["/w/linked-b".to_string(), "/w/linked-c".to_string()];
+
+    let attached = coordinator
+        .attach_application_root("linked-roots-tree", &application_root, &linked)
+        .await
+        .unwrap();
+    let session = attached.session_id.clone();
+    let root = attached.root_task_id.clone();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "child".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let grandchild = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &child,
+            "grandchild".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    coordinator
+        .start_worker(&session, &grandchild)
+        .await
+        .unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert_eq!(repository.task_extra_roots(&root).unwrap(), linked);
+    assert_eq!(
+        repository.task_extra_roots(&child).unwrap(),
+        linked,
+        "an unspecified child inherits its parent's roots"
+    );
+    assert_eq!(
+        repository.task_extra_roots(&grandchild).unwrap(),
+        linked,
+        "a grandchild inherits through its parent, with no re-forwarding"
+    );
+
+    let expected: Vec<std::path::PathBuf> = linked.iter().map(std::path::PathBuf::from).collect();
+    let starts = factory.starts.lock().unwrap();
+    for (task, label) in [
+        (&root, "root"),
+        (&child, "child"),
+        (&grandchild, "grandchild"),
+    ] {
+        let start = starts
+            .iter()
+            .find(|start| start.task_id == *task)
+            .unwrap_or_else(|| panic!("the {label} worker started"));
+        assert_eq!(
+            start.extra_roots, expected,
+            "the {label}'s worker must be handed the root set"
+        );
+    }
+}
+
+/// No linked roots is today's behavior: every worker start carries an empty set
+/// and no row records anything.
+#[tokio::test]
+async fn a_session_without_linked_roots_threads_nothing_to_its_workers() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, factory, database) = linked_roots_coordinator(&directory);
+    let application_root = directory.path().join("not-a-repo");
+
+    let attached = coordinator
+        .attach_application_root("single-root-tree", &application_root, &[])
+        .await
+        .unwrap();
+    let session = attached.session_id.clone();
+    let root = attached.root_task_id.clone();
+    coordinator.start_worker(&session, &root).await.unwrap();
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "child".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    coordinator.start_worker(&session, &child).await.unwrap();
+
+    let repository = RuntimeRepository::open(&database).unwrap();
+    assert!(repository.task_extra_roots(&root).unwrap().is_empty());
+    assert!(repository.task_extra_roots(&child).unwrap().is_empty());
+
+    let starts = factory.starts.lock().unwrap();
+    assert_eq!(starts.len(), 2);
+    assert!(
+        starts.iter().all(|start| start.extra_roots.is_empty()),
+        "an unlinked tree must stay single-root byte for byte"
+    );
+}
+
+/// A restart rehydrates the roots from the durable rows for both a root and its
+/// child, so resuming either one starts its worker with the same root set.
+#[tokio::test]
+async fn recovery_hydration_restores_linked_roots_for_roots_and_children() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let session = RootSessionId::new();
+    let root = yi_agent_core::TaskId::new();
+    let root_attempt = yi_agent_core::AttemptId::new();
+    let child = yi_agent_core::TaskId::new();
+    let child_attempt = yi_agent_core::AttemptId::new();
+    let roots = vec!["/w/linked-b".to_string()];
+    let mut repository = RuntimeRepository::open(&database).unwrap();
+    repository
+        .create_task_with_attempt(&root, &session, &root_attempt, 1, "running")
+        .unwrap();
+    repository.set_task_extra_roots(&root, &roots).unwrap();
+    repository
+        .create_child_task_with_attempt_and_objective(
+            &child,
+            &session,
+            &root,
+            1,
+            &child_attempt,
+            1,
+            "running",
+            "child objective",
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    repository.set_task_extra_roots(&child, &roots).unwrap();
+    repository.recover_inflight_tasks().unwrap();
+    drop(repository);
+
+    let factory = Arc::new(MessageRecordingFactory::default());
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    coordinator.resume_task(&session, &root).await.unwrap();
+    coordinator.resume_task(&session, &child).await.unwrap();
+
+    let expected = vec![std::path::PathBuf::from("/w/linked-b")];
+    let starts = factory.starts.lock().unwrap();
+    let root_start = starts
+        .iter()
+        .find(|start| start.task_id == root)
+        .expect("the recovered root worker started");
+    assert_eq!(root_start.extra_roots, expected);
+    let child_start = starts
+        .iter()
+        .find(|start| start.task_id == child)
+        .expect("the recovered child worker started");
+    assert_eq!(
+        child_start.extra_roots, expected,
+        "a recovered child must not lose the set its row recorded"
+    );
+}
+
+/// A replacement daemon starts with an empty supervisor map. Reconnecting must
+/// read the roots back from the durable row, not trust the (empty) set the
+/// reconnect request carries, or the root's own worker would start without them.
+#[tokio::test]
+async fn reattaching_a_root_session_restores_its_linked_roots_on_the_supervisor() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, factory, database) = linked_roots_coordinator(&directory);
+    let application_root = directory.path().join("not-a-repo");
+    let linked = vec!["/w/linked-b".to_string()];
+
+    let attached = coordinator
+        .attach_application_root("reconnect-project", &application_root, &linked)
+        .await
+        .unwrap();
+    drop(coordinator);
+
+    let reopened = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let reattached = reopened
+        .attach_application_root("reconnect-project", &application_root, &[])
+        .await
+        .unwrap();
+    assert_eq!(reattached.session_id, attached.session_id);
+    reopened
+        .start_worker(&reattached.session_id, &reattached.root_task_id)
+        .await
+        .unwrap();
+
+    let starts = factory.starts.lock().unwrap();
+    let root_start = starts
+        .iter()
+        .find(|start| start.task_id == reattached.root_task_id)
+        .expect("the reattached root worker started");
+    assert_eq!(
+        root_start.extra_roots,
+        vec![std::path::PathBuf::from("/w/linked-b")],
+        "a reattach must restore the recorded roots, not the empty request"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_extra_roots(&reattached.root_task_id)
+            .unwrap(),
+        linked,
+        "a reattach must never rewrite the recorded roots"
+    );
+}

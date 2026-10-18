@@ -154,6 +154,56 @@ fn a_clean_git_project_attaches_activates_delegates_and_detaches() {
     yi_agent_subagent::attach::detach_root(&attached.socket_path, &attached.attached_root);
 }
 
+/// A conversation root carrying linked roots must send them to the daemon, and
+/// the daemon must record them on the session's root row. The unit tests cover
+/// the resolver and the supervisor map; this covers the wire between them.
+#[test]
+fn a_conversation_root_sends_its_linked_roots_to_the_daemon() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let linked = tempfile::TempDir::new().unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+
+    let attached = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime_dir.path().to_path_buf(),
+        &isolated_models_path(repo.path()),
+    )
+    .expect("a clean git project must attach");
+
+    let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
+        yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: attached.socket_path.clone(),
+            workspace_root: attached.workspace_root.clone(),
+            session_id: attached.attached_root.session_id.clone(),
+            task_id: attached.attached_root.task_id.clone(),
+            capability: attached.attached_root.capability.clone(),
+        },
+    );
+    let thread = ThreadRoot::new(
+        Arc::clone(&binding),
+        "thread-linked",
+        repo.path().to_path_buf(),
+        vec![linked.path().to_path_buf()],
+    );
+    thread.attach().expect("the conversation root attaches");
+    let root_task_id = thread.root_task_id().expect("the root is attached");
+
+    let database = runtime_dir.path().join("runtime.sqlite");
+    let stored = yi_agent_store::repository::RuntimeRepository::open(&database)
+        .expect("the daemon's database opens for reading")
+        .task_extra_roots(&root_task_id.parse().expect("the root id is a uuid"))
+        .expect("the root row is readable");
+    assert_eq!(
+        stored,
+        vec![linked.path().to_string_lossy().to_string()],
+        "the conversation's linked roots must reach the daemon's root row"
+    );
+
+    yi_agent_subagent::attach::detach_root(&attached.socket_path, &attached.attached_root);
+}
+
 /// With nothing listening, the runtime must be created rather than reported as
 /// a permanent failure: this is what lets the desktop recover at all.
 #[test]
@@ -242,8 +292,18 @@ fn delegation_tools_act_as_the_conversations_own_root() {
             capability: attached.attached_root.capability.clone(),
         },
     );
-    let thread_a = ThreadRoot::new(Arc::clone(&binding), "thread-a", repo.path().to_path_buf());
-    let thread_b = ThreadRoot::new(Arc::clone(&binding), "thread-b", repo.path().to_path_buf());
+    let thread_a = ThreadRoot::new(
+        Arc::clone(&binding),
+        "thread-a",
+        repo.path().to_path_buf(),
+        Vec::new(),
+    );
+    let thread_b = ThreadRoot::new(
+        Arc::clone(&binding),
+        "thread-b",
+        repo.path().to_path_buf(),
+        Vec::new(),
+    );
     thread_a.attach().expect("conversation A attaches");
     thread_b.attach().expect("conversation B attaches");
 

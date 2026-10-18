@@ -92,6 +92,9 @@ pub struct WorkerStart {
     pub fork_messages: Option<Vec<Message>>,
     /// Per-child model override; empty means inherit the parent's model.
     pub model: String,
+    /// The caller's linked roots (the primary root excluded), inherited at spawn
+    /// time. Empty means single-root behavior, exactly as before this field.
+    pub extra_roots: Vec<PathBuf>,
 }
 
 /// Non-secret evidence recorded when a worker is admitted. The runtime keeps
@@ -151,6 +154,7 @@ impl WorkerStart {
             objective: String::new(),
             fork_messages: None,
             model: String::new(),
+            extra_roots: Vec::new(),
         }
     }
 
@@ -182,6 +186,11 @@ impl WorkerStart {
 
     pub fn maybe_with_inherited_sandbox(mut self, value: Option<InheritedSandbox>) -> Self {
         self.inherited_sandbox = value;
+        self
+    }
+
+    pub fn with_extra_roots(mut self, extra_roots: Vec<PathBuf>) -> Self {
+        self.extra_roots = extra_roots;
         self
     }
 
@@ -251,6 +260,14 @@ mod tests {
         let coding = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
             .with_workspace_mode(ChildWriteMode::Coding);
         assert_eq!(coding.workspace_mode, ChildWriteMode::Coding);
+    }
+
+    #[test]
+    fn worker_start_defaults_to_no_extra_roots() {
+        let start = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new());
+        assert!(start.extra_roots.is_empty());
+        let start = start.with_extra_roots(vec![PathBuf::from("/tmp/x")]);
+        assert_eq!(start.extra_roots, vec![PathBuf::from("/tmp/x")]);
     }
 
     #[test]

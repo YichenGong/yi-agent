@@ -115,6 +115,11 @@ pub struct AgentSupervisor {
     objectives: HashMap<TaskId, String>,
     workspace_modes: HashMap<TaskId, ChildWriteMode>,
     inherited_sandboxes: HashMap<TaskId, InheritedSandbox>,
+    /// The linked roots a task's worker runs with, primary root excluded. Same
+    /// shape as `inherited_sandboxes`: a child that names none of its own
+    /// inherits its parent's set, so a grandchild gets the same roots without
+    /// anyone re-forwarding them per spawn.
+    extra_roots: HashMap<TaskId, Vec<PathBuf>>,
     /// The caller's conversation a forked child should start from, keyed by the
     /// child task. Written after a spawn resolves its fork token and read when
     /// the worker starts. Mirrors the sibling `inherited_sandboxes` field: a
@@ -158,6 +163,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            extra_roots: HashMap::new(),
             fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
@@ -205,6 +211,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            extra_roots: HashMap::new(),
             fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
@@ -261,6 +268,7 @@ impl AgentSupervisor {
             objectives,
             workspace_modes: HashMap::new(),
             inherited_sandboxes: HashMap::new(),
+            extra_roots: HashMap::new(),
             fork_messages: HashMap::new(),
             workdirs: HashMap::new(),
             models: HashMap::new(),
@@ -295,6 +303,7 @@ impl AgentSupervisor {
         self.objectives.insert(task_id.clone(), objective);
         self.workspace_modes.insert(task_id.clone(), workspace_mode);
         self.inherited_sandboxes.remove(&task_id);
+        self.extra_roots.remove(&task_id);
         if let Some(model) = model {
             self.models.insert(task_id.clone(), model);
         }
@@ -387,6 +396,7 @@ impl AgentSupervisor {
         self.objectives.insert(task_id.clone(), objective);
         self.workspace_modes.insert(task_id.clone(), workspace_mode);
         self.inherited_sandboxes.remove(&task_id);
+        self.extra_roots.remove(&task_id);
         if let Some(model) = model {
             self.models.insert(task_id.clone(), model);
         }
@@ -426,6 +436,23 @@ impl AgentSupervisor {
 
     pub fn inherited_sandbox(&self, task_id: &TaskId) -> Option<InheritedSandbox> {
         self.inherited_sandboxes.get(task_id).copied()
+    }
+
+    /// Records the linked roots this task's worker should run with. An empty set
+    /// removes the entry, so "never set" and "explicitly none" are one state and
+    /// a cleared task is indistinguishable from one that never had roots.
+    pub fn set_extra_roots(&mut self, task_id: &TaskId, roots: Vec<PathBuf>) {
+        if roots.is_empty() {
+            self.extra_roots.remove(task_id);
+        } else {
+            self.extra_roots.insert(task_id.clone(), roots);
+        }
+    }
+
+    /// The linked roots recorded for a task, if any. `None` means "no linked
+    /// roots": the worker falls back to its single primary root.
+    pub fn extra_roots(&self, task_id: &TaskId) -> Option<Vec<PathBuf>> {
+        self.extra_roots.get(task_id).cloned()
     }
 
     /// Records the caller's conversation a forked child should start from.
@@ -682,11 +709,13 @@ impl AgentSupervisor {
         let fork_messages = self.take_fork_messages(task_id);
         let workspace_mode = self.workspace_mode(task_id);
         let inherited_sandbox = self.inherited_sandbox(task_id);
+        let extra_roots = self.extra_roots(task_id).unwrap_or_default();
         let model = self.model(task_id).unwrap_or_default().to_string();
         let start = WorkerStart::new(task_id_value, attempt_id, root_session_id)
             .with_objective(objective)
             .with_workspace_mode(workspace_mode)
             .maybe_with_inherited_sandbox(inherited_sandbox)
+            .with_extra_roots(extra_roots)
             .with_model(model)
             .with_message_capability(Uuid::new_v4().to_string())
             .with_initial_user_messages(
@@ -1279,6 +1308,7 @@ impl AgentSupervisor {
         // A child starts with no recorded inheritance; the caller (coordinator)
         // seeds it from the persisted task row before the worker starts.
         self.inherited_sandboxes.remove(&child_id);
+        self.extra_roots.remove(&child_id);
         self.workdirs.insert(child_id.clone(), request.workdir);
         self.mailboxes.insert(child_id.clone(), Mailbox::default());
         self.children
@@ -2389,6 +2419,18 @@ mod tests {
         );
         assert!(supervisor.take_fork_messages(&child).is_none());
         assert!(supervisor.fork_messages(&child).is_none());
+    }
+
+    #[test]
+    fn extra_roots_are_stored_per_task_and_absent_by_default() {
+        let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+        let root = supervisor.root_task_id().clone();
+        assert_eq!(supervisor.extra_roots(&root), None);
+        supervisor.set_extra_roots(&root, vec![PathBuf::from("/tmp/linked")]);
+        assert_eq!(
+            supervisor.extra_roots(&root),
+            Some(vec![PathBuf::from("/tmp/linked")])
+        );
     }
 
     #[tokio::test]

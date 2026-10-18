@@ -449,6 +449,7 @@ impl RuntimeCoordinator {
                 // is moved into the call.
                 let model = repository.task_model(&task.task_id)?;
                 let inherited_sandbox = repository.task_inherited_sandbox(&task.task_id)?;
+                let extra_roots = repository.task_extra_roots(&task.task_id)?;
                 let task_id = task.task_id.clone();
                 let mut supervisor = supervisor.try_lock().map_err(|_| {
                     RuntimeCoordinatorError::Supervisor("recovery hydration is busy".into())
@@ -470,6 +471,10 @@ impl RuntimeCoordinator {
                 // stale entry for the id, so the recovered value must win.
                 if let Some(inherited_sandbox) = inherited_sandbox {
                     supervisor.set_inherited_sandbox(&task_id, inherited_sandbox);
+                }
+                if !extra_roots.is_empty() {
+                    supervisor
+                        .set_extra_roots(&task_id, extra_roots.iter().map(PathBuf::from).collect());
                 }
             } else {
                 // A recovered root must keep the mode persisted at spawn time:
@@ -499,6 +504,11 @@ impl RuntimeCoordinator {
                 supervisor.set_workspace_mode(&root_id, root_mode);
                 if let Some(inherited_sandbox) = repository.task_inherited_sandbox(&root_id)? {
                     supervisor.set_inherited_sandbox(&root_id, inherited_sandbox);
+                }
+                let root_extra = repository.task_extra_roots(&root_id)?;
+                if !root_extra.is_empty() {
+                    supervisor
+                        .set_extra_roots(&root_id, root_extra.iter().map(PathBuf::from).collect());
                 }
                 supervisors.insert(task.session_id, Arc::new(AsyncMutex::new(supervisor)));
             }
@@ -744,6 +754,26 @@ impl RuntimeCoordinator {
                 .expect("runtime application root workspace service mutex poisoned")
                 .insert(existing.root_session_id.clone(), service);
             self.ensure_application_root_supervisor(&existing)?;
+            // The roots are a session property recorded at creation; a
+            // reconnect must read them back off the durable row rather than
+            // trust the request (which may carry none), or a root rehydrated by
+            // a replacement daemon would start its worker single-rooted. The
+            // create branch below keeps the write: an attach never rewrites a
+            // root set, it only restores what is already recorded.
+            let recorded_roots = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .task_extra_roots(&existing.root_task_id)?;
+            if !recorded_roots.is_empty() {
+                self.supervisor(&existing.root_session_id)?
+                    .lock()
+                    .await
+                    .set_extra_roots(
+                        &existing.root_task_id,
+                        recorded_roots.iter().map(PathBuf::from).collect(),
+                    );
+            }
             let capability = existing
                 .capability_secret
                 .clone()
@@ -806,6 +836,14 @@ impl RuntimeCoordinator {
             .lock()
             .expect("runtime repository mutex poisoned")
             .set_task_extra_roots(&root_task_id, extra_roots)?;
+        // Seeded beside the row so the supervisor's view and the durable record
+        // agree from the first instant: `start_worker` reads the roots off the
+        // supervisor, and a root whose row said one thing while its worker was
+        // started with another would be the one inconsistency nothing detects.
+        supervisor.set_extra_roots(
+            &root_task_id,
+            extra_roots.iter().map(PathBuf::from).collect(),
+        );
         Ok(AttachedApplicationRoot {
             session_id,
             root_task_id,
@@ -1444,6 +1482,16 @@ impl RuntimeCoordinator {
             Some(token) => Some(self.take_fork_messages(token, session, parent)?),
             None => None,
         };
+        // The parent's root set, read before the child row is written so the
+        // inherited value lands with the row's INSERT: there is no intermediate
+        // state in which the child exists but its roots do not.
+        let parent_extra = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_extra_roots(parent)
+            .unwrap_or_default();
+        let child_extra = resolve_extra_roots(None, Some(&parent_extra));
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
             let child = supervisor.spawn_with_objective(
@@ -1471,6 +1519,7 @@ impl RuntimeCoordinator {
             if let Some(inherited_sandbox) = inherited_sandbox {
                 supervisor.set_inherited_sandbox(&child, inherited_sandbox);
             }
+            supervisor.set_extra_roots(&child, child_extra.iter().map(PathBuf::from).collect());
             if let Some(fork) = fork_messages {
                 supervisor.set_fork_messages(&child, fork);
             }
@@ -1493,6 +1542,13 @@ impl RuntimeCoordinator {
                 thread_id.as_deref(),
                 inherited_sandbox,
             )?;
+        // Persisted beside the row above: an inherited set that lived only in
+        // memory would be lost on restart while the row survived, and the two
+        // would silently disagree.
+        self.repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .set_task_extra_roots(&child, &child_extra)?;
         // Auto-registration: the parent prepares the directory (`git worktree
         // add`) and hands over its path; the daemon only records that position.
         // A bad path fails the spawn rather than deferring to worker start, so
@@ -3121,6 +3177,17 @@ struct ProviderTurnAdmissions {
     notify: Arc<Notify>,
 }
 
+/// 解析一次 spawn 实际使用的关联根：显式值优先，否则继承父任务。
+///
+/// 逐层转发会随层级增加漏点，所以子任务默认从父任务继承——孙任务因此自动获得
+/// 同一根集，无需 worker 自己再传一遍。
+fn resolve_extra_roots(explicit: Option<&[String]>, parent: Option<&[String]>) -> Vec<String> {
+    match explicit {
+        Some(roots) => roots.to_vec(),
+        None => parent.map(<[String]>::to_vec).unwrap_or_default(),
+    }
+}
+
 fn worker_failure_terminal_json(message: &str) -> Result<String, RuntimeCoordinatorError> {
     const MAX_ERROR_BYTES: usize = 4 * 1024;
     let error = truncate_utf8(message, MAX_ERROR_BYTES);
@@ -4028,6 +4095,27 @@ mod provider_turn_admission_tests {
                 .has_active_lease_prefix(&task, "llm:")
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod extra_roots_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn child_inherits_parent_extra_roots_when_not_given_explicitly() {
+        // 直接测"解析函数"而非整条 daemon 链路（后者由 app-server 的端到端测试覆盖）。
+        let parent_roots = vec!["/tmp/linked".to_string()];
+        let resolved = resolve_extra_roots(None, Some(&parent_roots));
+        assert_eq!(resolved, parent_roots);
+        // 显式给值则用显式值（未来逐 spawn 覆盖的接缝）。
+        let explicit = vec!["/tmp/other".to_string()];
+        assert_eq!(
+            resolve_extra_roots(Some(&explicit), Some(&parent_roots)),
+            explicit
+        );
+        // 父子都没有 → 空。
+        assert!(resolve_extra_roots(None, None).is_empty());
     }
 }
 

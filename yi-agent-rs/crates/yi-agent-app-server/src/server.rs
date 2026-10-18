@@ -328,7 +328,15 @@ pub(crate) fn attach_delegation(
     // The daemon is shared per project, but the root is per conversation: the
     // root is what carries the child budget, so two conversations in one
     // directory must never share it.
-    let root = ThreadRoot::new(Arc::clone(&binding), thread_id, PathBuf::from(cwd));
+    // The same captured set that goes into the thread meta: a conversation's
+    // delegation root must carry the same linked roots the rest of the session
+    // was built with, or the two disagree with no way to notice.
+    let root = ThreadRoot::new(
+        Arc::clone(&binding),
+        thread_id,
+        PathBuf::from(cwd),
+        extra_roots.clone(),
+    );
     if let Err(cause) = root.attach() {
         tracing::warn!(
             stage = "attach_root",
