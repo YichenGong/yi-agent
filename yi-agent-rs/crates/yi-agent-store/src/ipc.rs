@@ -856,6 +856,9 @@ impl Daemon {
         clear_plugin_sockets();
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        // Stays non-blocking: `accept` runs only after the poll reports
+        // readiness, but the peer can disconnect in between, and that must
+        // surface as `WouldBlock` rather than blocking the loop.
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -913,6 +916,20 @@ impl Daemon {
                     }
                     last_schedule_minute = minute;
                 }
+                // Block until a connection arrives or the wait times out. This
+                // keeps `thread_stop` on a fixed cadence without adding the
+                // wait's whole duration to every request, which is what the old
+                // non-blocking-plus-sleep shape did.
+                let ready = match daemon_accept_wait(&listener, DAEMON_ACCEPT_POLL) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        tracing::error!(error = %error, "daemon accept poll failed; retrying");
+                        continue;
+                    }
+                };
+                if !ready {
+                    continue;
+                }
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let database_path = database_path.clone();
@@ -945,9 +962,7 @@ impl Daemon {
                         handlers.retain(|handle| !handle.is_finished());
                         handlers.push(handler);
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => break,
                 }
             }
@@ -996,7 +1011,8 @@ impl Daemon {
 
     fn stop_listener(&mut self) -> Result<(), IpcError> {
         self.stop.store(true, Ordering::Release);
-        // Wake the nonblocking accept loop so shutdown does not wait for its sleep interval.
+        // Wake the accept loop so shutdown does not wait out the poll interval:
+        // the connection makes the listener readable, so `poll` returns at once.
         let _ = UnixStream::connect(&self.socket_path);
         if let Some(listener) = self.listener.take() {
             listener.join().map_err(|_| IpcError::ListenerPanicked)?;
@@ -1451,6 +1467,36 @@ fn write_request(
     stream.flush()?;
     Ok(())
 }
+
+/// Wait until the listener is readable (a connection is pending) or the timeout
+/// elapses; the granularity matches [`DAEMON_ACCEPT_POLL`].
+///
+/// The plugin side does the same: `poll(2)` replaces "non-blocking plus sleep",
+/// so a connection returns immediately rather than adding a blind 0-10ms wait to
+/// every request, while `thread_stop` still gets checked on a fixed cadence.
+fn daemon_accept_wait(listener: &UnixListener, timeout: Duration) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let milliseconds = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: one initialized `pollfd`, so `nfds = 1` matches it; `poll` only
+    // reads `fd`/`events` and writes `revents`. There are no other pointer
+    // arguments.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+    match ready {
+        // Timed out: no connection arrived.
+        0 => Ok(false),
+        // Readable, or hung up: `accept` reports the specific error if so.
+        count if count > 0 => Ok(true),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// accept wait granularity: it only decides how often `thread_stop` is checked,
+/// it is no longer a per-request latency floor.
+const DAEMON_ACCEPT_POLL: Duration = Duration::from_millis(10);
 
 fn handle_client(
     mut stream: UnixStream,
