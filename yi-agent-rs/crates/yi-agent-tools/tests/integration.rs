@@ -37,7 +37,7 @@ async fn read_only_sandbox_omits_mutating_filesystem_tools() {
     let mut registry = ToolRegistry::new();
     register_builtin_tools_with_sandbox(
         &mut registry,
-        tmp.path().to_path_buf(),
+        vec![tmp.path().to_path_buf()],
         SandboxMode::ReadOnly,
         Vec::new(),
     );

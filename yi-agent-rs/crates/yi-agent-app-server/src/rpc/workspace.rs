@@ -1,6 +1,6 @@
 //! `workspace/*` 域的 RPC 处理函数。
 //!
-//! 从 `server.rs` 的 `serve()` dispatch 逐字搬出(Task 3 batch 2)。工作区注册表(list/add/remove):add 存 canonical 路径,remove 同样规范化以保幂等;
+//! 从 `server.rs` 的 `serve()` dispatch 逐字搬出(Task 3 batch 2)。工作区注册表(list/add/remove/link/unlink):add 存 canonical 路径,remove 同样规范化以保幂等;link 把附属根一并 add 进索引(会话发现需要),unlink 同样先规范化再摘关联;
 //!
 //! 臂体保持原样,只有两处改名:主循环局部量改走 [`AppState`] 字段(`hub` ->
 //! `state.hub` 等;字段本身已是引用,故冗余的 `&` 一并去掉),以及 `continue`
@@ -27,11 +27,24 @@ pub(crate) async fn handle(
 ) -> anyhow::Result<Flow> {
     match req.method.as_str() {
         "workspace/list" => {
-            let list: Vec<serde_json::Value> = state
-                .workspaces
-                .list()
-                .into_iter()
-                .map(|p| json!({ "path": p, "exists": Path::new(&p).is_dir() }))
+            let dirs = state.workspaces.list();
+            let list: Vec<serde_json::Value> = dirs
+                .iter()
+                .map(|p| {
+                    // 只在主根仍登记时上报 linked_to：主根被「Remove from
+                    // list」后，附属根自动回到顶层显示（见 spec §7）。
+                    // `links` 记录本身不被 `remove` 抹掉，故主根加回来时
+                    // 关联显示自动恢复（dangling link 自愈）。
+                    let linked_to = state
+                        .workspaces
+                        .linked_to(Path::new(p))
+                        .filter(|primary| dirs.iter().any(|d| d == primary));
+                    json!({
+                        "path": p,
+                        "exists": Path::new(p).is_dir(),
+                        "linked_to": linked_to,
+                    })
+                })
                 .collect();
             write_response(
                 state.hub,
@@ -39,6 +52,69 @@ pub(crate) async fn handle(
                 ok_response(id, json!({ "workspaces": list })),
             )
             .await?;
+        }
+        "workspace/link" => {
+            let primary = req
+                .params
+                .get("primary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let child = req
+                .params
+                .get("child")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            match state.workspaces.link(Path::new(primary), Path::new(child)) {
+                Ok(()) => {
+                    // 附属根也必须进「最近目录」索引：`thread/listAll` 靠
+                    // `workspaces.list()` 发现冷会话，把附属根从 `dirs` 摘掉
+                    // 会让它的会话直接从侧栏消失。「附属根不作为顶层组」是
+                    // **显示层**行为，不是存储层行为（spec §1 关键约束）。
+                    let canonical =
+                        std::fs::canonicalize(child).unwrap_or_else(|_| PathBuf::from(child));
+                    if let Err(e) = state.workspaces.add(&canonical) {
+                        eprintln!(
+                            "[app-server] failed to index linked workspace {}: {e}",
+                            canonical.display()
+                        );
+                    }
+                    write_response(state.hub, state.client, ok_response(id, json!({}))).await?
+                }
+                // 拒绝一律 `-32602` + 面向用户的原因（UI 原样显示），与
+                // `workspace/add` 的非目录拒绝同码。
+                Err(e) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::invalid_params(e.to_string())),
+                    )
+                    .await?
+                }
+            }
+        }
+        "workspace/unlink" => {
+            let child = req
+                .params
+                .get("child")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // 与 `workspace/remove` 同口径：`links` 存的是 canonical，
+            // 故这里也必须规范化，否则符号链接 / 相对路径 / 尾斜杠会静默
+            // no-op。canonicalize 失败（路径已不存在）时回退原始串，保持幂等。
+            let key = std::fs::canonicalize(child).unwrap_or_else(|_| PathBuf::from(child));
+            match state.workspaces.unlink(&key) {
+                Ok(()) => {
+                    write_response(state.hub, state.client, ok_response(id, json!({}))).await?
+                }
+                Err(e) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(e.to_string())),
+                    )
+                    .await?
+                }
+            }
         }
         "workspace/add" => {
             let raw = req

@@ -2638,6 +2638,21 @@ describe("App remote subscription wiring (S2)", () => {
     expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
   });
 
+  it("hydrates the mode chip when the desktop opens a running thread", async () => {
+    // 回归：本卡把「运行中→只读 readItems」提为两种客户端共有后，桌面端点开一个
+    // 运行中的会话不再 resume，而 mode 过去只由 resume 回包/推送写入——于是 chip
+    // 停在未知（"Mode"、禁用）。清单快照本就带 permission_mode，这里钉住它必须在
+    // 这条路径上补上。卡会话跑 YOLO，桌面端点开时必须看得见 YOLO。
+    state.listStatus = "running";
+    state.mode = "yolo";
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />); // no persisted config → desktop
+
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+    // 仍然不打断：running 会话不 resume。
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+  });
+
   it("still resumes a cold idle thread on the desktop build", async () => {
     // 回归护栏：把「运行中才只读」这条边钉住。若有人把 running 判断写错成
     // 「一律不 resume」，冷会话就再也合不进服务端历史（resume 是它唯一的就绪
@@ -3131,6 +3146,91 @@ describe("App 会话详情栏的开合", () => {
     });
     expect(await screen.findByText("t2-diff.txt")).toBeTruthy();
     expect(screen.queryByText("t1-diff.txt")).toBeNull();
+  });
+});
+
+describe("App 关联文件夹接线", () => {
+  /** 打开某个目录分组的右键菜单。 */
+  const openGroupMenu = (ws: string) => {
+    fireEvent.contextMenu(document.querySelector<HTMLElement>(`[data-ws-header="${ws}"]`)!);
+  };
+
+  it("links the picked folder to the group it was invoked from", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.picks = ["/proj/docs"];
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "workspace/link",
+        params: { primary: "/proj", child: "/proj/docs" },
+      }),
+    );
+  });
+
+  it("does nothing when the native picker is cancelled", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.picks = [null];
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await waitFor(() => expect(state.picks).toHaveLength(0));
+    expect(clients[0].requests.some((r) => r.method === "workspace/link")).toBe(false);
+  });
+
+  it("unlinks a folder from its linked-child section menu", async () => {
+    state.groupWorkspaces = ["/proj", "/proj/docs"];
+    state.dataSources["workspace/list"] = () => ({
+      workspaces: [
+        { path: "/proj", exists: true, linked_to: null },
+        { path: "/proj/docs", exists: true, linked_to: "/proj" },
+      ],
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-linked-child="/proj/docs"]')).not.toBeNull(),
+    );
+
+    fireEvent.contextMenu(
+      document.querySelector<HTMLElement>('[data-linked-child="/proj/docs"]')!,
+    );
+    fireEvent.click(screen.getByText("取消关联"));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "workspace/unlink",
+        params: { child: "/proj/docs" },
+      }),
+    );
+  });
+
+  it("surfaces a server-side link rejection instead of pretending it worked", async () => {
+    // 服务端会拒掉成环 / 链式关联（-32602）。吞掉它就等于让用户以为关联成功。
+    state.groupWorkspaces = ["/proj"];
+    state.picks = ["/proj/outer"];
+    state.dataSources["workspace/link"] = () => {
+      throw { code: -32602, message: "主根本身已是附属根" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await screen.findByText("主根本身已是附属根");
   });
 });
 

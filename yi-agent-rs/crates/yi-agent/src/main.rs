@@ -912,9 +912,10 @@ fn build_tui_root_tools(
     caller: crate::tui::subagents::CallerContext,
 ) -> yi_agent_core::ToolRegistry {
     let mut registry = base_registry.clone();
+    // 单根会话：FS 根集与 shell 沙箱可写根分别照原值传入。
     yi_agent_tools::register_builtin_tools_with_sandbox(
         &mut registry,
-        attached_root.workspace.path.clone(),
+        vec![attached_root.workspace.path.clone()],
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
@@ -1209,9 +1210,10 @@ fn run_agent(cli: Cli) -> Result<()> {
     // `base_registry` MUST stay skills-only: `build_tui_root_tools` clones it
     // and adds workspace-rooted builtin tools + subagent tools on top.
     let base_registry = registry.clone();
+    // 单根会话：FS 根集与 shell 沙箱可写根分别照原值传入。
     yi_agent_tools::register_builtin_tools_with_sandbox(
         &mut registry,
-        config.workdir.clone(),
+        vec![config.workdir.clone()],
         config.sandbox,
         config.sandbox_writable_roots.clone(),
     );
@@ -1500,7 +1502,11 @@ fn build_headless_setup_for_workspace(
     naked: bool,
     workspace: std::path::PathBuf,
 ) -> Result<HeadlessSetup> {
-    yi_agent_runtime::bootstrap::build_tool_setup_in(config, naked, &workspace)
+    yi_agent_runtime::bootstrap::build_tool_setup_in(
+        config,
+        naked,
+        std::slice::from_ref(&workspace),
+    )
 }
 
 /// 未配置模型时给 `yi-agent run` 的一句可读指引；就绪则 `None`。

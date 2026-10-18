@@ -33,8 +33,14 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build
+ci: fmt-check lint test build bindings-check
     @echo "CI passed"
+
+# 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
+# `export_bindings` 是 ts-rs 自动生成的测试名前缀，按前缀过滤即可覆盖全部类型。
+bindings-check:
+    cargo test --all-features -p yi-agent-app-server export_bindings
+    git diff --exit-code -- ../desktop/src/lib/generated
 
 # === 真实 LLM 测试(需 API key,默认跳过) ===
 

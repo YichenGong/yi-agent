@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Modal } from "../ui/Modal";
 import type { KeyboardEvent } from "react";
 import type { Theme } from "../lib/theme";
 import { SettingsGeneralTab } from "./SettingsGeneralTab";
@@ -120,16 +121,6 @@ export function SettingsDialog({
     // 关闭（open 转 false）或卸载时把焦点还给来处。
     return () => restoreRef.current?.focus();
   }, [open, isMobile]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (e: globalThis.KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [open, onClose]);
-
   // 手机端进子页后落焦在「返回」：这是该页唯一的导航控件，键盘/读屏用户一进来就能
   // 退回去。桌面端没有返回按钮，该 effect 自然不生效。
   useEffect(() => {
@@ -164,156 +155,155 @@ export function SettingsDialog({
     tabRefs.current[id]?.focus();
   };
 
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div
-        data-settings-backdrop
-        className="absolute inset-0 bg-black/50"
-        onClick={onClose}
-      />
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="设置"
-        className="settings-shell relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
-      >
-        {/*
-          桌面：左侧竖栏 tablist（`aria-orientation="vertical"` + roving tabIndex）。
-          手机：不渲染 tablist——分类列表与子页二选一。手机上留一个隐藏 tablist 会与
-          可见列表争可访问名，读屏会念出两套导航。
-        */}
-        {!isMobile && (
-          <nav
-            role="tablist"
-            aria-orientation="vertical"
-            onKeyDown={onTablistKeyDown}
-            className="settings-nav flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
+    <Modal
+      open={open}
+      onClose={onClose}
+      overlayClassName="fixed inset-0 z-50 flex items-center justify-center"
+      // 该 backdrop 必须留在遮罩内、面板前：手机上由 CSS 隐藏，也是测试的选择器。
+      overlayBackdrop={
+        <div data-settings-backdrop className="absolute inset-0 bg-black/50" onClick={onClose} />
+      }
+      ariaLabel="设置"
+      panelClassName="settings-shell relative flex h-[70vh] w-[70vw] max-w-3xl overflow-hidden rounded-lg border border-line bg-panel text-fg shadow-2xl"
+    >
+      {/*
+        桌面：左侧竖栏 tablist（`aria-orientation="vertical"` + roving tabIndex）。
+        手机：不渲染 tablist——分类列表与子页二选一。手机上留一个隐藏 tablist 会与
+        可见列表争可访问名，读屏会念出两套导航。
+      */}
+      {!isMobile && (
+        <nav
+          role="tablist"
+          aria-orientation="vertical"
+          onKeyDown={onTablistKeyDown}
+          className="settings-nav flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
+        >
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              id={tabId(t.id)}
+              ref={(el) => {
+                tabRefs.current[t.id] = el;
+              }}
+              role="tab"
+              aria-selected={t.id === active}
+              aria-controls={panelId(t.id)}
+              tabIndex={t.id === active ? 0 : -1}
+              onClick={() => setActive(t.id)}
+              className="rounded px-3 py-1.5 text-left text-sm text-fg-muted hover:bg-raised/50 aria-selected:text-fg"
+            >
+              {t.label}
+            </button>
+          ))}
+        </nav>
+      )}
+      {/*
+        手机端要靠 `order` 把标题栏排到 Tab 条之前（DOM 里 nav 是 shell 的第一个
+        子元素，标题栏却嵌在这个包裹层里）；跨层级无法直接重排，故手机端给这一层
+        `display: contents` 让它「消失」，其子元素升为 shell 的 flex item。桌面端
+        该类无任何样式命中，DOM 与观感逐字节不变。
+      */}
+      <div className="settings-body flex min-w-0 flex-1 flex-col">
+        <div className="settings-header flex items-center justify-between border-b border-line px-4 py-2">
+          <div className="flex items-center gap-2">
+            {/* 手机端子页的返回：44px 触控目标，与关闭按钮同一标准。 */}
+            {isMobile && phonePane === "panel" && (
+              <button
+                ref={backRef}
+                type="button"
+                aria-label="返回设置分类"
+                onClick={() => {
+                  // 记下来源分类，等列表挂载后由上面的 effect 落焦。
+                  setPendingFocus(active);
+                  setPhonePane("list");
+                }}
+                className="flex size-11 shrink-0 items-center justify-center rounded text-fg-subtle hover:text-fg"
+              >
+                ‹
+              </button>
+            )}
+            <span className="text-xs text-fg-subtle">设置</span>
+          </div>
+          {/* 手机端给足 44px 触控目标（Apple HIG，与抽屉按钮同一标准）——手机上
+              遮罩被 CSS 隐藏，关闭只能靠这颗按钮或 Escape。桌面沿用原样（`px-2`），
+              保持「桌面逐字节不变」这条硬不变量。 */}
+          <button
+            type="button"
+            aria-label="关闭设置"
+            onClick={onClose}
+            className={`${
+              isMobile ? "flex size-11 shrink-0 items-center justify-center" : "px-2"
+            } rounded text-fg-subtle hover:text-fg`}
           >
+            ×
+          </button>
+        </div>
+        {isMobile && phonePane === "list" ? (
+          // 分类列表：每行一个分类，点进去才渲染面板。
+          <nav className="settings-categories flex min-h-0 flex-1 flex-col">
             {TABS.map((t) => (
               <button
                 key={t.id}
-                id={tabId(t.id)}
                 ref={(el) => {
-                  tabRefs.current[t.id] = el;
+                  categoryRefs.current[t.id] = el;
                 }}
-                role="tab"
-                aria-selected={t.id === active}
-                aria-controls={panelId(t.id)}
-                tabIndex={t.id === active ? 0 : -1}
-                onClick={() => setActive(t.id)}
-                className="rounded px-3 py-1.5 text-left text-sm text-fg-muted hover:bg-raised/50 aria-selected:text-fg"
+                type="button"
+                data-settings-category={t.id}
+                onClick={() => {
+                  setActive(t.id);
+                  setPhonePane("panel");
+                }}
+                className="flex items-center justify-between border-b border-line px-4 text-left text-sm text-fg"
               >
                 {t.label}
+                <span aria-hidden="true" className="text-fg-subtle">
+                  ›
+                </span>
               </button>
             ))}
           </nav>
-        )}
-        {/*
-          手机端要靠 `order` 把标题栏排到 Tab 条之前（DOM 里 nav 是 shell 的第一个
-          子元素，标题栏却嵌在这个包裹层里）；跨层级无法直接重排，故手机端给这一层
-          `display: contents` 让它「消失」，其子元素升为 shell 的 flex item。桌面端
-          该类无任何样式命中，DOM 与观感逐字节不变。
-        */}
-        <div className="settings-body flex min-w-0 flex-1 flex-col">
-          <div className="settings-header flex items-center justify-between border-b border-line px-4 py-2">
-            <div className="flex items-center gap-2">
-              {/* 手机端子页的返回：44px 触控目标，与关闭按钮同一标准。 */}
-              {isMobile && phonePane === "panel" && (
-                <button
-                  ref={backRef}
-                  type="button"
-                  aria-label="返回设置分类"
-                  onClick={() => {
-                    // 记下来源分类，等列表挂载后由上面的 effect 落焦。
-                    setPendingFocus(active);
-                    setPhonePane("list");
-                  }}
-                  className="flex size-11 shrink-0 items-center justify-center rounded text-fg-subtle hover:text-fg"
-                >
-                  ‹
-                </button>
-              )}
-              <span className="text-xs text-fg-subtle">设置</span>
-            </div>
-            {/* 手机端给足 44px 触控目标（Apple HIG，与抽屉按钮同一标准）——手机上
-                遮罩被 CSS 隐藏，关闭只能靠这颗按钮或 Escape。桌面沿用原样（`px-2`），
-                保持「桌面逐字节不变」这条硬不变量。 */}
-            <button
-              type="button"
-              aria-label="关闭设置"
-              onClick={onClose}
-              className={`${
-                isMobile ? "flex size-11 shrink-0 items-center justify-center" : "px-2"
-              } rounded text-fg-subtle hover:text-fg`}
-            >
-              ×
-            </button>
+        ) : (
+          // 一次只渲染选中的面板；id/aria-labelledby 在桌面端与 tablist 成对，
+          // 手机端没有 tablist，故那对属性不再有匹配目标（无害，保留以免两端分叉）。
+          <div
+            role="tabpanel"
+            id={panelId(active)}
+            aria-labelledby={isMobile ? undefined : tabId(active)}
+            className="settings-panel min-h-0 flex-1 overflow-y-auto"
+          >
+            {active === "general" ? (
+              <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
+            ) : active === "remote" ? (
+              <SettingsRemoteTab
+                call={remoteCall}
+                initialRelayUrl={relayUrl}
+                saveRelayUrl={saveRelayUrl}
+              />
+            ) : active === "plugins" ? (
+              <SettingsPluginsTab
+                call={pluginCall}
+                projects={pluginProjects ?? []}
+                defaultProject={pluginDefaultProject}
+              />
+            ) : active === "models" ? (
+              <SettingsModelsTab call={modelCall} isMobile={isMobile} />
+            ) : active === "skills" ? (
+              <SettingsSkillsTab
+                call={skillsCall}
+                projects={skillsProjects ?? []}
+                defaultProject={skillsDefaultProject}
+              />
+            ) : (
+              <SettingsTagsTab
+                tagNames={tagNames ?? DEFAULT_TAG_NAMES}
+                onSave={saveTagName ?? (() => {})}
+              />
+            )}
           </div>
-          {isMobile && phonePane === "list" ? (
-            // 分类列表：每行一个分类，点进去才渲染面板。
-            <nav className="settings-categories flex min-h-0 flex-1 flex-col">
-              {TABS.map((t) => (
-                <button
-                  key={t.id}
-                  ref={(el) => {
-                    categoryRefs.current[t.id] = el;
-                  }}
-                  type="button"
-                  data-settings-category={t.id}
-                  onClick={() => {
-                    setActive(t.id);
-                    setPhonePane("panel");
-                  }}
-                  className="flex items-center justify-between border-b border-line px-4 text-left text-sm text-fg"
-                >
-                  {t.label}
-                  <span aria-hidden="true" className="text-fg-subtle">
-                    ›
-                  </span>
-                </button>
-              ))}
-            </nav>
-          ) : (
-            // 一次只渲染选中的面板；id/aria-labelledby 在桌面端与 tablist 成对，
-            // 手机端没有 tablist，故那对属性不再有匹配目标（无害，保留以免两端分叉）。
-            <div
-              role="tabpanel"
-              id={panelId(active)}
-              aria-labelledby={isMobile ? undefined : tabId(active)}
-              className="settings-panel min-h-0 flex-1 overflow-y-auto"
-            >
-              {active === "general" ? (
-                <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
-              ) : active === "remote" ? (
-                <SettingsRemoteTab
-                  call={remoteCall}
-                  initialRelayUrl={relayUrl}
-                  saveRelayUrl={saveRelayUrl}
-                />
-              ) : active === "plugins" ? (
-                <SettingsPluginsTab
-                  call={pluginCall}
-                  projects={pluginProjects ?? []}
-                  defaultProject={pluginDefaultProject}
-                />
-              ) : active === "models" ? (
-                <SettingsModelsTab call={modelCall} isMobile={isMobile} />
-              ) : active === "skills" ? (
-                <SettingsSkillsTab
-                  call={skillsCall}
-                  projects={skillsProjects ?? []}
-                  defaultProject={skillsDefaultProject}
-                />
-              ) : (
-                <SettingsTagsTab
-                  tagNames={tagNames ?? DEFAULT_TAG_NAMES}
-                  onSave={saveTagName ?? (() => {})}
-                />
-              )}
-            </div>
-          )}
-        </div>
+        )}
       </div>
-    </div>
+    </Modal>
   );
 }

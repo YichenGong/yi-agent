@@ -301,6 +301,10 @@ pub(crate) fn attach_delegation(
     thread_id: &str,
     theme: &crate::theme_tool::ThemeHandle,
     git_diff: &crate::git_diff_tool::GitDiffHandle,
+    // 本次会话的关联根（主根之外），由调用方在 `with_session_extra_roots` 的同一
+    // 作用域内捕获后传入——**不在此处再读槽位**，否则调用点一旦漏设就会静默拿到
+    // 空集（或残留值）。
+    extra_roots: Vec<PathBuf>,
     lead_inbox: &crate::lead::LeadInbox,
     built: BuiltAgent,
 ) -> Activation {
@@ -349,6 +353,7 @@ pub(crate) fn attach_delegation(
         built.yolo.clone(),
         theme.clone(),
         git_diff.clone(),
+        extra_roots,
         // 项目键从本次会话的 cwd 求得(与 `ask_lead` 的投递路由同一来源):
         // 会话给组长留言时,消息必须落到「本目录」的组长信箱。
         crate::thread_store::ThreadStore::new(Path::new(cwd)).project_key(),
@@ -853,6 +858,9 @@ fn build_runtime_tooling(
     yolo: yi_agent_core::autonomy::YoloSwitch,
     theme: crate::theme_tool::ThemeHandle,
     git_diff: crate::git_diff_tool::GitDiffHandle,
+    // 本次会话的关联根（主根之外）。逐调用传入：它同时决定 FS 根集与 shell 沙箱的
+    // 额外可写根，且不得跨会话共享。
+    extra_roots: Vec<PathBuf>,
     // 本会话所属项目的键(见 `ThreadStore::project_key`)与该进程的组长信箱。
     // 两者绑在装配期,与下面的 thread marker 同一理由:模型看不到自己的
     // thread id,也不知道自己在哪个项目,只能由装配期注入。
@@ -862,6 +870,11 @@ fn build_runtime_tooling(
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
     let workspace_root = root.handle()?.workspace_root;
+    // FS 根集 = 主根（工作区）+ 关联根。shell 沙箱的额外可写根由
+    // `build_tool_setup_with_controller` 内部按同一口径推导（`roots[1..]` +
+    // `cfg.sandbox_writable_roots`），故此处不再单独拼一遍。
+    let mut roots = vec![workspace_root.clone()];
+    roots.extend(extra_roots.iter().cloned());
     // One controller, one truth: it backs the root's builtin tools AND the
     // subagent spawn tools, and it reads the thread's live YOLO switch.
     let controller =
@@ -869,7 +882,7 @@ fn build_runtime_tooling(
     let setup = yi_agent_runtime::bootstrap::build_tool_setup_with_controller(
         cfg,
         false,
-        &workspace_root,
+        &roots,
         controller.clone(),
     )
     .map_err(|error| error.to_string())?;
@@ -889,9 +902,8 @@ fn build_runtime_tooling(
         Some(thread_id.to_string()),
         caller.clone(),
     );
-    let permission =
-        yi_agent_runtime::bootstrap::load_permission_checker_with_switch(&workspace_root, yolo)
-            .map_err(|error| error.to_string())?;
+    let permission = yi_agent_runtime::bootstrap::load_permission_checker_with_roots(&roots, yolo)
+        .map_err(|error| error.to_string())?;
     register_theme_tool(&mut registry, theme);
     registry.register(Arc::new(crate::git_diff_tool::ShowGitDiffTool::new(
         git_diff,
@@ -1628,6 +1640,48 @@ fn current_session_reasoning_effort() -> Option<String> {
 }
 
 thread_local! {
+    /// 本次 `build_agent` 调用所属会话的**关联根**（主根之外的附属根）。与
+    /// [`SESSION_MODEL_REF`] 同一理由：工厂闭包签名带不进这个逐会话参数。
+    ///
+    /// **必须逐调用传**：daemon 的 worker factory 按项目目录构建、被同目录多个会话
+    /// 共享，把根集写进共享 `cfg` 会让 A 会话的关联根泄漏给同目录的其它会话（那些
+    /// 会话会凭空拿到不该有的写权限）。故这里走 thread-local，工厂每次克隆 `cfg`
+    /// 时再逐调用写入。
+    static SESSION_EXTRA_ROOTS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// 在调用工厂（`build_agent`）前设定本次会话的关联根，供工厂写入 `thread_cfg`。
+///
+/// 调用返回后恢复调用前的值，故嵌套调用（如 `thread/start` 内再建其它 agent）不会
+/// 泄漏关联根。`thread/start` 取本会话的关联根、`thread/resume` 取
+/// `meta.extra_roots`。
+///
+/// 生产调用点（`thread/start`、`thread/resume` 两个分支）各自捕获本会话的根集
+/// 后传入槽位；`start_thread_core` 与 resume 侧的 `attach_delegation` 收到的都是
+/// 同一个局部量，故槽位与委派路径不可能漂移。
+pub(crate) fn with_session_extra_roots<T>(roots: Vec<PathBuf>, f: impl FnOnce() -> T) -> T {
+    SESSION_EXTRA_ROOTS.with(|slot| {
+        let prev = slot.replace(roots);
+        let out = f();
+        slot.replace(prev);
+        out
+    })
+}
+
+/// 工厂内部读取当前会话的关联根；不在 [`with_session_extra_roots`] 内时为空
+/// （空 = 单根会话，与改动前逐字节一致）。
+///
+/// 可见性与 [`current_session_model_ref`] 一致（同为私有 `fn`）：`mod tests` 是
+/// `server` 的子模块，直接可达父模块私有项，故测试无需放宽可见性。
+///
+/// 读点有两个：生产代码 `production_factory`，以及测试里的记录型工厂
+/// （断言槽位里真正可见的根集）。
+fn current_session_extra_roots() -> Vec<PathBuf> {
+    SESSION_EXTRA_ROOTS.with(|slot| slot.borrow().clone())
+}
+
+thread_local! {
     /// 本次 `build_agent` 调用所属会话的 `preserve_thinking`（跨轮 CoT 保留）。
     /// 与 [`SESSION_REASONING_EFFORT`] 同一理由：工厂闭包签名带不进这个逐会话
     /// 参数，而 `build_agent_config` 只认 `RuntimeConfig`（其中没有该字段）。
@@ -1681,6 +1735,10 @@ pub(crate) fn production_factory(
         let mut thread_cfg = cfg.clone();
         thread_cfg.workdir = cwd.to_path_buf();
         thread_cfg.yolo = mode == crate::thread_store::ThreadMode::Yolo;
+        // 本会话的关联根（逐调用传入，不共享）。空 = 单根会话，与改动前一致。
+        // **不得**把根集留在共享 `cfg` 里：本工厂按项目目录构建、被同目录多个会话
+        // 共享，那样会让 A 会话的关联根泄漏给同目录的其它会话。
+        thread_cfg.sandbox_writable_roots = current_session_extra_roots();
         let model_ref = current_session_model_ref();
         // 取「当前」清单:运行期新增/修改的条目立刻可见(原先持启动快照)。
         let catalog = catalog.current();
@@ -4445,6 +4503,10 @@ where
             &request.workdir,
             crate::thread_store::ThreadMode::Yolo,
             thread_id.clone(),
+            // 看板会话起在卡片 worktree 里，那不是用户登记的「主根」，没有关联根
+            // 可言；空集 = 单根会话（与改动前逐字一致，spec §7「看板项目列表行为
+            // 不变」）。
+            Vec::new(),
             built,
             &hub,
             &client,
@@ -4616,30 +4678,44 @@ where
         //
         // 组长的 meta 刚由 `ensure_lead_meta` 建、尚无 `.jsonl` 时 `load` 回 `None`:
         // 维持现状(空会话),与一次全新 `thread/start` 完全一致。
-        match crate::thread_store::ThreadStore::new(Path::new(&target.cwd)).load(&target.thread_id)
-        {
-            Ok(Some(loaded)) => {
-                let mut restored = yi_agent_core::Session::new();
-                if let Some(usage) = &loaded.usage {
-                    restored.set_last_input_tokens(Some(usage.input_tokens));
+        // 关联根是**会话属性**（建会话时快照，之后不追改），所以这里取该会话自己
+        // meta 里的那份，而**不**现读索引——与 `thread/resume` 同源。组长由
+        // `thread/lead` 懒创建（未经 `thread/start` 的快照路径），故其 meta 里通常
+        // 是空集：这是如实反映"这个会话创建时没有关联根"，不是降级。
+        let lead_extra_roots: Vec<PathBuf> =
+            match crate::thread_store::ThreadStore::new(Path::new(&target.cwd))
+                .load(&target.thread_id)
+            {
+                Ok(Some(loaded)) => {
+                    let roots: Vec<PathBuf> = loaded
+                        .meta
+                        .extra_roots
+                        .iter()
+                        .map(PathBuf::from)
+                        .filter(|p| p.is_dir())
+                        .collect();
+                    let mut restored = yi_agent_core::Session::new();
+                    if let Some(usage) = &loaded.usage {
+                        restored.set_last_input_tokens(Some(usage.input_tokens));
+                    }
+                    restored.replace_messages(loaded.messages);
+                    // `apply_session` 而非 `with_session`:前者就地替换内容、保住 session
+                    // 的 `Arc`,与 `thread/resume` 的重建路径走同一个助手,因此委派工具
+                    // 持有的 `CallerContext` 不会在恢复后指向一个被丢弃的旧会话。
+                    apply_session(&mut built.agent, Some(restored));
+                    roots
                 }
-                restored.replace_messages(loaded.messages);
-                // `apply_session` 而非 `with_session`:前者就地替换内容、保住 session
-                // 的 `Arc`,与 `thread/resume` 的重建路径走同一个助手,因此委派工具
-                // 持有的 `CallerContext` 不会在恢复后指向一个被丢弃的旧会话。
-                apply_session(&mut built.agent, Some(restored));
-            }
-            Ok(None) => {}
-            // 按 `thread/resume` 的口径:读不出来就明确失败,绝不静默地起一个
-            // 失忆的组长。(id 由 `ensure_lead_meta` 铸造,恒合法;`load` 的读错误
-            // 内部已吞成空历史,故此处实际不可达。)
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "could not load the lead's history for {}: {e}",
-                    target.thread_id
-                ));
-            }
-        }
+                Ok(None) => Vec::new(),
+                // 按 `thread/resume` 的口径:读不出来就明确失败,绝不静默地起一个
+                // 失忆的组长。(id 由 `ensure_lead_meta` 铸造,恒合法;`load` 的读错误
+                // 内部已吞成空历史,故此处实际不可达。)
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "could not load the lead's history for {}: {e}",
+                        target.thread_id
+                    ));
+                }
+            };
 
         // 冷启动:走与 `launch_inner` 相同的无帧内核(登记会话 + spawn driver)。
         let hub = Arc::clone(self.hub);
@@ -4655,6 +4731,7 @@ where
             &target.cwd,
             crate::thread_store::ThreadMode::Normal,
             target.thread_id.clone(),
+            lead_extra_roots,
             built,
             &hub,
             &client,
@@ -4802,6 +4879,11 @@ pub(crate) async fn start_thread_core(
     cwd: &str,
     mode: crate::thread_store::ThreadMode,
     thread_id: String,
+    // 本会话的关联根（主根之外的附属根），由调用方在 `with_session_extra_roots`
+    // 的同一作用域内捕获后传入：既写进 meta（快照），也交给 `attach_delegation`
+    // 供委派路径构造多根工具集。**不在此处读槽位**，否则调用点一旦漏设就会静默
+    // 拿到空集（或残留值）。
+    extra_roots: Vec<PathBuf>,
     built: BuiltAgent,
     hub: &Arc<crate::broadcast::Broadcaster>,
     client: &crate::broadcast::ClientId,
@@ -4836,6 +4918,9 @@ pub(crate) async fn start_thread_core(
         &thread_id,
         theme,
         git_diff,
+        // 调用方捕获的同一根集：落进 meta 的与交给委派路径的必须是同一个值，
+        // 否则「meta 说有一根、实际工具集里没有」这类不一致无从察觉。
+        extra_roots.clone(),
         lead_inbox,
         built,
     );
@@ -4873,6 +4958,11 @@ pub(crate) async fn start_thread_core(
         tag: None,
         // 新会话默认开启跨轮保留(与 `ThreadMeta` 的缺省语义一致)。
         preserve_thinking: true,
+        // 从索引快照下来的关联根：运行期不变（后续改索引不追改本会话）。
+        extra_roots: extra_roots
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect(),
         role: None,
     };
     // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
@@ -5373,6 +5463,26 @@ pub(crate) async fn start_turn_core(
         }
     }
     Ok(Some(prepared.thread_id))
+}
+
+/// 解析某主根当前关联的附属根：取索引里的记录，丢掉已不存在的目录。
+///
+/// 静默丢弃（而非报错）是有意的：附属根是能力增量，它消失不该让会话打不开；
+/// `cwd` 本身已删仍照既有行为报错（`resolve_thread_cwd` / resume 的守卫），
+/// 因为那是权威基点。
+///
+/// `WorkspaceIndex::children` 返回的已是 canonical 绝对路径（`link` 写入前
+/// canonicalize 过），故此处无需再规范化。
+///
+/// 可见性:`thread/start` 的臂已搬进 [`crate::rpc::thread`],故与
+/// [`resolve_thread_cwd`] 同样放宽到 `pub(crate)`(只放宽可见性,值/行为不变)。
+pub(crate) fn linked_extra_roots(workspaces: &WorkspaceIndex, cwd: &str) -> Vec<PathBuf> {
+    workspaces
+        .children(Path::new(cwd))
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .collect()
 }
 
 /// 解析 `thread/start` 的目标目录:显式 `params.cwd` 优先,缺省用 `cfg.workdir`。

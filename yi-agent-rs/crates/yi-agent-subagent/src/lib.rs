@@ -289,9 +289,11 @@ impl DaemonAgentWorkerFactory {
 
     fn tool_registry_for_workspace(&self, workspace: PathBuf) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
+        // FS 根集就是这一根；shell 沙箱的额外可写根仍走原来的 `sandbox_writable_roots`
+        // （工作流 2 才会把继承的关联根集接进这两个参数）。
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
-            workspace,
+            vec![workspace],
             self.sandbox,
             self.sandbox_writable_roots.clone(),
         );
@@ -333,9 +335,11 @@ impl DaemonAgentWorkerFactory {
             }
             ChildWriteMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
+        // FS 根集只含该 worker 自己的 worktree；`writable_roots`（含 git 内部目录）
+        // 是 shell 沙箱专属，**不得**混进 FS 根集——否则 FS 工具能写 git 内部目录。
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
-            workspace.path.clone(),
+            vec![workspace.path.clone()],
             sandbox,
             writable_roots,
         );

@@ -14,7 +14,7 @@
 //! 的 `break`(`thread/resume`、`thread/reorderPinned`),目标不变。
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::json;
@@ -25,11 +25,11 @@ use crate::rpc::{AppState, Flow};
 use crate::server::{
     BuiltAgent, ProcessWatch, ThreadCancelOutcome, attach_delegation, cancel_thread_children,
     chunk_items_for_replay, collect_pinned, detach_unused_runtimes, err_response,
-    interrupt_and_wait_for_persist, item_id, ok_response, require_known_thread, require_thread_id,
-    resolve_thread_cwd, run_thread_driver, start_thread_core, store_lookup, thread_summary_json,
-    watch_processes, with_session_model_ref, with_session_preserve_thinking,
-    with_session_reasoning_effort, worktree_json, write_notification, write_notification_await,
-    write_response,
+    interrupt_and_wait_for_persist, item_id, linked_extra_roots, ok_response, require_known_thread,
+    require_thread_id, resolve_thread_cwd, run_thread_driver, start_thread_core, store_lookup,
+    thread_summary_json, watch_processes, with_session_extra_roots, with_session_model_ref,
+    with_session_preserve_thinking, with_session_reasoning_effort, worktree_json,
+    write_notification, write_notification_await, write_response,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
@@ -226,12 +226,21 @@ pub(crate) async fn handle(
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
 
+            // 本次会话的关联根：`thread/start` 从索引快照一次，之后**只**用这个局部量
+            // ——既进工厂槽位（决定沙箱/工具/权限的根集），也进 meta（落盘快照）与
+            // `attach_delegation`（委派路径的根集）。三处必须同源，故不各自重读索引。
+            let extra_roots = linked_extra_roots(state.workspaces, &cwd);
+
             // 本次会话的 `model_ref` 经 thread-local 交给工厂解析 provider /
             // api_url / api_key / model(命中清单默认则用条目,否则回退 cfg)。
+            // 关联根同路经 thread-local 传入:工厂是按目录构建、被同目录多个
+            // 会话共享的,把根集写进共享 `cfg` 会让它泄漏给别的会话。
             let built = match with_session_model_ref(model_ref.clone(), || {
-                with_session_reasoning_effort(None, || {
-                    with_session_preserve_thinking(true, || {
-                        (state.build_agent)(None, Path::new(&cwd), mode)
+                with_session_extra_roots(extra_roots.clone(), || {
+                    with_session_reasoning_effort(None, || {
+                        with_session_preserve_thinking(true, || {
+                            (state.build_agent)(None, Path::new(&cwd), mode)
+                        })
                     })
                 })
             }) {
@@ -276,6 +285,9 @@ pub(crate) async fn handle(
                 &cwd,
                 mode,
                 thread_id.clone(),
+                // 本会话的关联根：上面已捕获的同一个局部量，内核据此写
+                // meta 并传给 `attach_delegation`（不在那里重读槽位）。
+                extra_roots,
                 built,
                 state.hub,
                 state.client,
@@ -445,10 +457,24 @@ pub(crate) async fn handle(
             // cfg.workdir——这正是此前 resume 的隐患所在。
             let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(&cwd)));
 
+            // 附属根从 meta 快照重建（不在 resume 时重读索引：关联是**会话属性**，
+            // 建会话时定了就不再追改，否则同一会话的权限根集会随索引漂移）。
+            // 已删的附属根静默丢弃——它是能力增量，不该让会话打不开；
+            // cwd 已删仍走上方既有报错（那是权威基点）。
+            let extra_roots: Vec<PathBuf> = loaded
+                .meta
+                .extra_roots
+                .iter()
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .collect();
+
             let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
-                with_session_reasoning_effort(loaded.meta.reasoning_effort.clone(), || {
-                    with_session_preserve_thinking(loaded.meta.preserve_thinking, || {
-                        (state.build_agent)(Some(session), Path::new(&cwd), mode)
+                with_session_extra_roots(extra_roots.clone(), || {
+                    with_session_reasoning_effort(loaded.meta.reasoning_effort.clone(), || {
+                        with_session_preserve_thinking(loaded.meta.preserve_thinking, || {
+                            (state.build_agent)(Some(session), Path::new(&cwd), mode)
+                        })
                     })
                 })
             }) {
@@ -488,6 +514,9 @@ pub(crate) async fn handle(
                 &thread_id,
                 state.theme_handle,
                 state.git_diff_handle,
+                // 与工厂槽位**同一个值**：resume 侧的委派路径必须与
+                // 重建 agent 时下发到工厂的根集一致。
+                extra_roots,
                 state.lead_inbox,
                 built,
             );

@@ -91,8 +91,9 @@ export class ThreadStore {
   }
 
   /**
-   * Seeds status and cwd/model from a `thread/listAll` snapshot. **Does not
-   * touch session content** — sessions are accumulated from notifications only.
+   * Seeds status, cwd/model and the permission mode from a `thread/listAll`
+   * snapshot. **Does not touch session content** — sessions are accumulated from
+   * notifications only.
    *
    * The snapshot is a point-in-time read that can be stale: the server writes
    * `turn/completed` *before* it persists the turn and flips the thread back to
@@ -102,6 +103,13 @@ export class ThreadStore {
    * written one, the snapshot must not roll it back. A default `idle` from a
    * merely-created view is not "written by the push stream" — `statusSource`
    * records which it is.
+   *
+   * The mode seed is likewise a fill-in-when-missing: a snapshot that does not
+   * carry the field (an older server, or a thread it no longer lists) leaves the
+   * existing value alone, and can *never* roll a known one back to `null` — that
+   * unconditional overwrite was the bug fixed in `8ef49300`. A push
+   * (`thread/permissionModeChanged`) and the `thread/resume` / `thread/start`
+   * responses stay the higher authority.
    */
   seed(threads: ThreadSummary[]): void {
     for (const t of threads) {
@@ -111,6 +119,10 @@ export class ThreadStore {
         this.statusSource.set(t.thread_id, "snapshot");
       }
       v.info = { cwd: t.cwd, model: t.model, model_ref: t.model_ref ?? null };
+      // 权限模式同样从快照补：只补「未知」，绝不把已确定的值打回 null（`8ef49300`
+      // 修的正是后者）。清单里缺该字段（旧服务端/该会话不在快照中）⇒ 保持未知，
+      // 交给 resume 回包或 `thread/permissionModeChanged` 推送定案。
+      if (t.permission_mode !== undefined) v.mode = t.permission_mode;
     }
   }
 
@@ -128,7 +140,13 @@ export class ThreadStore {
       // 标签显示名是宿主级偏好，无 thread 归属（`thread_key()` = None），
       // 由 App 的通知分支处理；这条提前返回同时也让下方的 `n.params.thread_id`
       // 收窄仍然成立（TS 否则会因该臂无 `thread_id` 而报错）。
-      n.method === "ui/tagNames/updated"
+      n.method === "ui/tagNames/updated" ||
+      // `item/toolCall/approvalResolved` 是**无 thread 归属**的广播：Rust 侧的载荷
+      // 只有 `perm_id` / `by` / `decision`（`protocol.rs` 的
+      // `ToolCallApprovalResolved`）。若任其落到下面的 `n.params.thread_id`，类型上
+      // 会失败，运行期则会把这条广播错记到当前 thread。它不属于任何 transcript，
+      // 显式忽略。
+      n.method === "item/toolCall/approvalResolved"
     ) {
       return;
     }

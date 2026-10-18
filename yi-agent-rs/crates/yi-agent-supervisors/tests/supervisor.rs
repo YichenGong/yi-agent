@@ -1,7 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use yi_agent_supervisors::manifest::SupervisorManifest;
 use yi_agent_supervisors::supervisor::{Layout, Supervisor};
 
 /// Serializes the tests in this file that spawn a child and then wait for it.
@@ -84,13 +85,55 @@ fn write_fake_child(dir: &Path, marker: &Path) -> std::path::PathBuf {
     script
 }
 
-fn write_manifest(dir: &Path, name: &str, command: &Path, switch_key: &str) {
+/// Write a manifest for a fake child. `extra` is appended to the JSON object,
+/// which keeps the pinned tests' shape while letting a caller add fields such as
+/// `query_socket`.
+fn write_manifest_json(dir: &Path, name: &str, command: &Path, switch_key: &str, extra: &str) {
     std::fs::create_dir_all(dir).unwrap();
     let manifest = format!(
-        r#"{{"name":"{name}","command":"{}","args":[],"switch_key":"{switch_key}","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+        r#"{{"name":"{name}","command":"{}","args":[],"switch_key":"{switch_key}","restart_backoff_ms":50,"restart_backoff_max_ms":200{extra}}}"#,
         command.display()
     );
     std::fs::write(dir.join(format!("{name}.json")), manifest).unwrap();
+}
+
+fn write_manifest(dir: &Path, name: &str, command: &Path, switch_key: &str) {
+    write_manifest_json(dir, name, command, switch_key, "");
+}
+
+/// Same as [`write_manifest`], but the manifest also declares `query_socket`, and
+/// the *parsed* manifest is returned so the test can resolve the socket with the
+/// exact same call the supervisor makes (`query_socket_path`) instead of
+/// hand-writing a path the implementation might not probe.
+fn write_manifest_with_query_socket(
+    dir: &Path,
+    name: &str,
+    command: &Path,
+    switch_key: &str,
+    query_socket: &str,
+) -> SupervisorManifest {
+    write_manifest_json(
+        dir,
+        name,
+        command,
+        switch_key,
+        &format!(r#","query_socket":"{query_socket}""#),
+    );
+    let text = std::fs::read_to_string(dir.join(format!("{name}.json"))).unwrap();
+    SupervisorManifest::parse(&text).unwrap()
+}
+
+/// The socket path the supervisor will probe for `manifest` in `layout`.
+///
+/// Deliberately routed through the production resolver: the listener must be
+/// bound exactly where the probe connects, and `query_socket_path` may apply a
+/// length fallback, so a hand-written guess would be able to pass while the
+/// real contract is broken.
+fn probe_path(manifest: &SupervisorManifest, layout: &Layout) -> PathBuf {
+    manifest
+        .query_socket_path(&layout.workdir, &layout.state_dir, &layout.runtime_dir)
+        .expect("manifest declares a query_socket")
+        .expect("tempdir path is short enough to stay as declared")
 }
 
 fn layout_for(workdir: &Path) -> Layout {
@@ -360,4 +403,57 @@ fn a_deep_workdir_publishes_the_path_the_plugin_actually_binds() {
         expected,
         "宿主转发表与插件的规则不一致"
     );
+}
+
+/// A live listener on the declared query socket means an instance already
+/// answers, so the supervisor must not spawn a duplicate.
+///
+/// This is the whole point of probing before spawning: a *healthy orphan* holds
+/// the socket, and without the early return the supervisor would keep adding a
+/// second instance on every reconcile pass. The other tests in this file declare
+/// no `query_socket`, so `query_socket_path` returns `None`, `answers()` is
+/// always `false`, and that branch never runs. Here the socket is bound for
+/// real, so the probe is exercised end to end: the switch is ON and the child
+/// would start were it not for the probe.
+#[test]
+fn a_live_listener_on_the_query_socket_suppresses_the_spawn() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    let manifest = write_manifest_with_query_socket(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "demo_on",
+        "{workdir}/.yi-agent/query.sock",
+    );
+    enable(workdir, "demo_on");
+
+    // Bind exactly where the supervisor probes. Create the parent first: `bind`
+    // does not create directories.
+    let socket = probe_path(&manifest, &layout);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let mut supervisor = Supervisor::new(layout_for(workdir));
+    // Negative check, so no positive condition to poll for. Reconcile repeatedly
+    // over a window far longer than a healthy `/bin/sh` child needs to write its
+    // marker (well under 100ms): a spawn would have landed by now.
+    for _ in 0..12 {
+        supervisor.reconcile();
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        !marker.exists(),
+        "a live listener on the query socket must suppress the spawn, but a child started"
+    );
+    assert_eq!(
+        supervisor.running_count(),
+        0,
+        "nothing may be recorded as running when an instance already answers"
+    );
+    supervisor.stop_all();
 }
