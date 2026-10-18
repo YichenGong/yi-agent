@@ -769,8 +769,10 @@ describe("App send recovery from a status disagreement", () => {
   it("falls back to turn/start when turn/interject answers -32013", async () => {
     seedRunning();
     render(<App />);
+    // 运行中的会话不再走 resume（那会打断在跑的 turn），改用只读 readItems 补齐。
+    // 等它发出即证明 listAll 的 running 状态已落进 store。
     await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
     );
     state.rejectCode = { "turn/interject": -32013 };
 
@@ -811,8 +813,9 @@ describe("App send recovery from a status disagreement", () => {
   it("does not ping-pong when both methods fail, and surfaces the error", async () => {
     seedRunning();
     render(<App />);
+    // 同上：运行中的会话以 readItems 补齐，不再 resume。
     await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
     );
     state.rejectCode = { "turn/interject": -32013, "turn/start": -32012 };
 
@@ -1980,6 +1983,39 @@ describe("App reconnect resilience", () => {
     expect(clients.length).toBe(3);
   });
 
+  it("re-resumes a thread after a crash even though its status was live-running", async () => {
+    // 崩溃前该会话在跑（推送把状态标为 "live" running）。侧车重启后新进程对
+    // 它没有内存 agent，listAll 报 idle。若不清掉那条推送状态，`seed` 不会覆盖
+    // 它 → selectThread 误判"仍在跑" → 跳过 resume → 新进程里 agent 永不重建
+    // → 之后发送撞 -32011 且无法自愈。这条用例钉住"重连后必须重新 resume"。
+    render(<App />);
+    await waitMounted();
+    await flush();
+    // 让 t1 进入 live-running（推送流），并把后续 listAll 改为报 idle。
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "thread/status/updated", params: { thread_id: "t1", status: "running" } });
+      }
+    });
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+
+    // 重连之前：视图确实停在 running。
+    exit();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+
+    // 新客户端上必须出现 thread/resume（而不是被陈旧 running 拦住）。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    expect(
+      clients[1].requests.some((r) => r.method === "thread/resume"),
+    ).toBe(true);
+  });
+
   it("reconnects immediately when the app returns to the foreground", async () => {
     render(<App />);
     await waitMounted();
@@ -2576,6 +2612,40 @@ describe("App remote subscription wiring (S2)", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
     expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
+    expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
+  });
+
+  it("does not interrupt a running thread on the desktop build", async () => {
+    // 桌面端过去没有这层保护（它被 `isRemoteClient()` 关在远端分支里）：点开
+    // 一张正在跑的看板卡会话就会 resume，而 resume 会先中断在跑的 turn。这条
+    // 用例把「看一眼 = 只读」钉死为**两种客户端共有**的不变量。
+    state.listStatus = "running";
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />); // no persisted config → desktop
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) =>
+            r.method === "thread/readItems" &&
+            (r.params as { threadId: string }).threadId === "t1",
+        ),
+      ).toBe(true),
+    );
+    // The defining property: looking at a running thread never resumes it.
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+    // Desktop still never subscribes; that stays remote-only.
+    expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
+  });
+
+  it("still resumes a cold idle thread on the desktop build", async () => {
+    // 回归护栏：把「运行中才只读」这条边钉住。若有人把 running 判断写错成
+    // 「一律不 resume」，冷会话就再也合不进服务端历史（resume 是它唯一的就绪
+    // 途径，turn/start 对冷会话返回 -32011）。
+    render(<App />); // listStatus 默认 idle
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
     expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
   });
 

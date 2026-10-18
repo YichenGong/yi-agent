@@ -213,4 +213,23 @@ export class ThreadStore {
     this.statusSource.delete(id);
     if (this.currentId === id) this.currentId = null;
   }
+
+  /**
+   * 作废所有「来自推送」的运行状态：宿主进程已死，其推送不再成立。
+   *
+   * 侧车退出后新进程对任何会话都不再持有内存 agent（全部退化为冷会话）。
+   * `statusSource` 却会活过这次重连：`seed()` 不覆盖 `"live"` 的值，于是一条
+   * 崩溃前正在跑、`listAll` 现在已报 `idle` 的会话会**一直停在 `running`**。
+   * 后果不只是状态徽标骗人——它会让 `selectThread` 误以为该会话仍活着而跳过
+   * `thread/resume`（本 card 正是为此不再打断运行中的会话），于是新进程里
+   * 那个 agent 永远不会被重建，随后的发送撞上 `-32011 unknown thread` 且无法
+   * 自愈（`sendMethodMismatchCode` 只认 `-32013/-32012`）。
+   *
+   * 清 `statusSource` 而非直接改 `status`：清除后 `seed()` 会按下一份
+   * `listAll` 快照重新落值，真实仍活着的会话也会随之从 `running` 复位——因为
+   * 新进程会把它们真正重建（resume 或首次发送），此后推送再把状态标回 `"live"`。
+   */
+  forgetPushStatuses(): void {
+    this.statusSource.clear();
+  }
 }
