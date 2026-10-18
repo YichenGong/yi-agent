@@ -795,6 +795,58 @@ mod tests {
         assert_eq!(service.list()["cards"][0]["state"], "running");
     }
 
+    /// 线程对象缺 `idle` 时**按「不闲」处理**：唯一安全的默认——把忙当闲会让
+    /// 插件对一台正在跑的会话下结论（例如把 `running` 卡错判成跑完了）。
+    /// 这里用一张不可能被正确判定的卡来钉住这半边：卡是 `merging`，若缺省被当成
+    /// 空闲，`driver_step` 会走 git 复核把卡收尾；按「不闲」则原样不动。
+    #[test]
+    fn driver_next_treats_a_thread_without_idle_as_busy() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let service = service_with_one_card(&project);
+        let state = state_dir(&project);
+
+        // 让 card-1 走到 `merging`（合并轮进行中）：先把它的 source 分支建出来，
+        // 否则 `merge_request` 会因分支缺失而拒绝。
+        let slug = crate::worktree::slugify(&superpowers_kanban_core::card::CardId::new("card-1"));
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&project)
+                .args(["branch", &format!("kanban/{slug}")])
+                .status()
+                .unwrap()
+                .success()
+        );
+        service
+            .mark_running("card-1", "thread-1")
+            .expect("card-1 runs");
+        service
+            .mark_terminal("card-1", "awaiting_merge", None)
+            .unwrap();
+        assert!(matches!(
+            service.merge_request("card-1").unwrap(),
+            crate::service::MergeRequest::Granted { .. }
+        ));
+        assert_eq!(service.list()["cards"][0]["state"], "merging");
+
+        // 会话对象**没有** `idle` 字段：只能按「不闲」理解，卡原样留在 merging。
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [{ "thread_id": "thread-1" }], "results": [] }),
+        )
+        .unwrap();
+        assert_eq!(value["action"], Value::Null, "{value}");
+        assert_eq!(
+            service.list()["cards"][0]["state"],
+            "merging",
+            "缺 `idle` 不得被当成空闲（否则会误判一个还在跑的会话）"
+        );
+    }
+
     /// 缺 `threads` 是调用方的错，必须明确报错而不是静默回一个空拍：
     /// 静默会让宿主以为「插件没事可做」而永远推不动。
     #[test]

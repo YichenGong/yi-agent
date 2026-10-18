@@ -152,6 +152,13 @@ pub struct Card {
     /// 进入终态（done/failed/cancelled）的时刻；供宽限期自动归档判断。
     #[serde(default)]
     pub terminal_at: Option<DateTime<Local>>,
+    /// 这张卡**为什么**落到当前状态：启动失败时就是宿主回报的 `error`
+    /// （spec §4.6「失败 → 卡 `failed`（原因取 `error`）」）。
+    ///
+    /// 落盘并经 `list` 暴露，人才答得出「这张卡为什么失败」——只写日志的话，
+    /// 重启一次就没有任何地方能查。旧状态文件没有此字段 → `None`。
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[cfg(test)]
@@ -164,6 +171,17 @@ mod tests {
         let card: Card = serde_json::from_str(json).unwrap();
         assert!(!card.archived, "旧 board.json 缺字段必须回 false");
         assert_eq!(card.terminal_at, None);
+        assert_eq!(card.detail, None, "旧 board.json 缺 detail 必须回 None");
+    }
+
+    #[test]
+    fn a_detail_survives_a_serialization_round_trip() {
+        // 判词要落盘：daemon 重启后 `list` 仍答得出「这张卡为什么失败」。
+        let json = r#"{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"failed","enqueued_at":"2026-10-01T00:00:00+08:00","order":0,"detail":"worktree not found"}"#;
+        let card: Card = serde_json::from_str(json).unwrap();
+        assert_eq!(card.detail.as_deref(), Some("worktree not found"));
+        let back: Card = serde_json::from_str(&serde_json::to_string(&card).unwrap()).unwrap();
+        assert_eq!(back.detail.as_deref(), Some("worktree not found"));
     }
 
     #[test]

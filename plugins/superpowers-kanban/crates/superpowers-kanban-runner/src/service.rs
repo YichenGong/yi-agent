@@ -92,14 +92,6 @@ pub enum DriverAction {
 }
 
 impl DriverAction {
-    pub fn action_id(&self) -> &str {
-        match self {
-            DriverAction::Launch { action_id, .. } | DriverAction::Append { action_id, .. } => {
-                action_id
-            }
-        }
-    }
-
     /// 跨进程契约：字段名与宿主 `session_driver::parse_action` 逐字对齐（spec §4.3）。
     /// 用 `action_id` 作键而不是直接序列化枚举——枚举的形状是实现细节，不能外泄。
     pub fn to_json(&self) -> Value {
@@ -134,9 +126,12 @@ impl DriverAction {
 
 /// 宿主回传的一次动作结果（spec D12 / §4.2）。
 ///
-/// 字段名与宿主的 `ActionResult` 逐字对齐；`#[serde(default)]` 让视图里的 `idle`
-/// 缺失不至于整条回报反序列化失败——这种形状上的宽容值得（回报丢了比回报格式
-/// 怪要贵得多）。
+/// 字段名与宿主的 `ActionResult` 逐字对齐——这是跨进程契约，改名等于断链。
+/// 三个 `#[serde(default)]` 只覆盖这个结构自己的 `ok` / `thread_id` / `error`：
+/// 宿主回报失败时可以只带 `action_id` + `ok:false`（甚至只带 action_id），
+/// 整条回报不该因为缺字段而反序列化失败——回报丢了比回报格式怪要贵得多。
+/// （会话空闲与否**不在这里**：那是 `driver/next` 请求里的 `threads[].idle`，
+/// 由 `dispatch.rs` 手工解析并缺省为「不闲」。）
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct DriverResult {
     pub action_id: String,
@@ -146,7 +141,10 @@ pub struct DriverResult {
     /// launch 成功时带回的会话 id（D5：插件的映射只能从这里得到）。
     #[serde(default)]
     pub thread_id: Option<String>,
-    /// `ok: false` 时的原因；卡 `failed` 就取它。
+    /// `ok: false` 时的失败原因。
+    ///
+    /// 它不是给日志看的：启动失败时经 `mark_terminal` 落到卡片的 `detail` 上，
+    /// 由 `list` 暴露给人和桌面（spec §4.6「失败 → 卡 `failed`（原因取 `error`）」）。
     #[serde(default)]
     pub error: Option<String>,
 }
@@ -327,12 +325,20 @@ impl BoardService {
                     if idle_of(threads, thread_id) != Some(true) {
                         continue;
                     }
+                    // 判词跟着状态走：`needs_you` 的答案是「会话跑完了但没产出」，
+                    // `awaiting_merge` 的答案是「有产出等验收」。人问的
+                    // 「为什么停在这」在两种情况下都能从 `list` 里读到。
                     let outcome = if has_commits(card) {
                         "awaiting_merge"
                     } else {
                         "needs_you"
                     };
-                    let _ = self.mark_terminal(&card.id.0, outcome, None);
+                    let detail = if outcome == "needs_you" {
+                        Some("session ended without new commits")
+                    } else {
+                        None
+                    };
+                    let _ = self.mark_terminal(&card.id.0, outcome, detail);
                 }
                 CardState::AwaitingMerge | CardState::NeedsYou
                     if idle_of(threads, thread_id) == Some(false) =>
@@ -470,7 +476,8 @@ impl BoardService {
                 }
             },
             // 启动失败：卡 `failed` 并让出名额——失败的启动是可恢复的，
-            // 不是死胡同（旧宿主在 `release` 里做的是同一件事）。
+            // 不是死胡同（旧宿主在 `release` 里做的是同一件事）。原因经
+            // `mark_terminal` 落到卡片上，`list` 读得到（spec §4.6）。
             (PendingKind::Launch, false) => {
                 let reason = result
                     .error
@@ -592,9 +599,13 @@ impl BoardService {
             Err(error) => {
                 // 认领即占槽：建 worktree 失败必须把卡片标为 Failed，
                 // 否则它会卡在 Launching 永远不再被认领。
+                let reason = format!("worktree for {card_id} failed: {error}");
                 let _ = inner.board.transition(&card_id, CardState::Failed);
+                // 这条原因同样要可读：这是全自动路径上最常见的启动失败，
+                // 只写 stderr 的话重启后无处可查（spec §4.6）。
+                let _ = inner.board.set_detail(&card_id, Some(reason.clone()));
                 self.save(&inner);
-                return Err(format!("worktree for {card_id} failed: {error}"));
+                return Err(reason);
             }
         };
         if let Some(base) = effective_head(&workdir) {
@@ -672,18 +683,23 @@ impl BoardService {
             .board
             .set_thread_id(&id, thread_id.to_string())
             .map_err(|error| error.to_string())?;
-        // 会话活着 = 新一轮尝试：上一串合并轮失败的重试账清零。
+        // 会话活着 = 新一轮尝试：上一串合并轮失败的重试账清零，旧判词也不再成立。
         inner.merge_retries.remove(&id);
+        let _ = inner.board.set_detail(&id, None);
         self.save(&inner);
         Ok(())
     }
 
     /// 会话收尾：迁移到某个非终态结果并释放槽位。
+    ///
+    /// `detail` 是这张卡的判词（失败时就是原因）；它落盘并经 `list` 暴露，
+    /// 否则 spec §4.6 要求的「原因取 `error`」在对账通路上就悄悄丢了
+    /// （`running + idle → needs_you` 这一步也用它说明「为什么没人合」）。
     pub fn mark_terminal(
         &self,
         card_id: &str,
         outcome: &str,
-        _detail: Option<&str>,
+        detail: Option<&str>,
     ) -> Result<(), String> {
         let next = match outcome {
             "awaiting_merge" => CardState::AwaitingMerge,
@@ -697,18 +713,26 @@ impl BoardService {
             .board
             .transition(&id, next)
             .map_err(|error| error.to_string())?;
+        inner
+            .board
+            .set_detail(&id, detail.map(str::to_string))
+            .map_err(|error| error.to_string())?;
         inner.leases.remove(&id); // 释放槽位：drop 掉 flock
         self.save(&inner);
         Ok(())
     }
 
-    /// 启动没成：把卡片标为 `Failed` 并释放槽位。
-    pub fn release(&self, card_id: &str, _detail: &str) -> Result<(), String> {
+    /// 启动没成：把卡片标为 `Failed` 并释放槽位。`detail` 是失败原因，同样落盘可读。
+    pub fn release(&self, card_id: &str, detail: &str) -> Result<(), String> {
         let mut inner = self.lock();
         let id = CardId::new(card_id);
         inner
             .board
             .transition(&id, CardState::Failed)
+            .map_err(|error| error.to_string())?;
+        inner
+            .board
+            .set_detail(&id, Some(detail.to_string()))
             .map_err(|error| error.to_string())?;
         inner.leases.remove(&id);
         self.save(&inner);
@@ -929,6 +953,12 @@ impl BoardService {
                 .entry(id.clone())
                 .or_insert((0, String::new()))
                 .1 = format!("source branch '{source}' does not exist");
+            // 判词同样要可读：这张卡卡在 awaiting_merge 的原因就在这里。
+            let _ = inner.board.set_detail(
+                &id,
+                Some(format!("source branch '{source}' does not exist")),
+            );
+            self.save(&inner);
             return Ok(MergeRequest::Denied(format!(
                 "source branch '{source}' does not exist"
             )));
@@ -984,9 +1014,16 @@ impl BoardService {
             .map_err(|error| error.to_string())?;
         inner.leases.remove(&id);
         if next == MergeFinish::Done {
-            // 终态：重试账不再有意义。
+            // 终态：重试账不再有意义，旧判词也不该挂在一张已完成的卡上。
             inner.merge_retries.remove(&id);
+            let _ = inner.board.set_detail(&id, None);
         } else {
+            // git 判否的判词必须可读：人问「这张卡为什么停在这」的答案是
+            // 一条 git 事实，而不是模型的复述（spec D10）。
+            let _ = inner.board.set_detail(
+                &id,
+                Some(format!("git: {source} is not merged into {base}")),
+            );
             // 合并轮失败：记下这是「可自动重试的 needs_you」（spec D9），
             // 由 `driver_step` 数着次数重开合并轮。这里也是唯一的记账点——
             // 不论复核是被 driver 还是被 CLI/桌面触发的。
@@ -1061,6 +1098,7 @@ impl BoardService {
                 "source": card.source_ref,
                 "base": card.base_ref,
                 "origin_card": card.origin_card.as_ref().map(|id| id.0.clone()),
+                "detail": card.detail,
             })).collect::<Vec<_>>(),
         })
     }
@@ -1625,6 +1663,19 @@ mod tests {
             .find(|card| card["id"] == id)
             .map(|card| card["state"].as_str().unwrap().to_string())
             .unwrap_or_else(|| panic!("card {id} not on the board"))
+    }
+
+    /// 读一张卡的判词（经 `list`：这就是「人能读到的地方」）。
+    ///
+    /// 「这张卡为什么失败」必须能从这里问出答案（spec §4.6：失败 → 原因取
+    /// `error`），而不是只活在 daemon 的 stderr 里。
+    fn detail_of(service: &BoardService, id: &str) -> Option<String> {
+        service.list()["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == id)
+            .and_then(|card| card["detail"].as_str().map(str::to_string))
     }
 
     /// 分支已并入 base（分支指向与 main 同一提交）→ 卡落 `done`。
@@ -2259,6 +2310,80 @@ mod tests {
         );
         assert_eq!(state_of(&service, "card-1"), "failed");
         assert_eq!(state_of(&service, "card-2"), "launching");
+        // spec §4.6：「失败 → 卡 `failed`（原因取 `error`）」。原因必须**可读**——
+        // 经 `list` 落到卡片上，而不是只出现在 daemon 的 stderr 里（人问的是
+        // 「这张卡为什么失败」）。
+        assert_eq!(
+            detail_of(&service, "card-1").as_deref(),
+            Some("worktree not found"),
+            "失败原因取回报的 `error`，且经 list 可读"
+        );
+        assert_eq!(
+            detail_of(&service, "card-2"),
+            None,
+            "刚交出去、还在跑的卡不该挂着别人的判词"
+        );
+    }
+
+    /// 回报 `ok:false` 却没带 `error`：仍要有话说（兜底判词），不能留一张
+    /// 「失败了但说不出为什么」的卡。
+    #[test]
+    fn a_launch_failure_without_a_reason_still_records_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            unreachable!()
+        };
+
+        let result = DriverResult {
+            action_id,
+            ok: false,
+            thread_id: None,
+            error: None,
+        };
+        service.driver_step(&[], &[result]).unwrap();
+
+        assert_eq!(state_of(&service, "card-1"), "failed");
+        assert_eq!(
+            detail_of(&service, "card-1").as_deref(),
+            Some("launch failed")
+        );
+    }
+
+    /// `board.release` 是同一处旧缺口（启动没成 → `failed`）：它的 `detail`
+    /// 也必须落到卡片上，否则「为什么失败」在这条通路上照样无人可答。
+    #[test]
+    fn release_records_the_detail_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service
+            .release(&claim.card_id, "thread/start failed")
+            .unwrap();
+        assert_eq!(state_of(&service, "card-1"), "failed");
+        assert_eq!(
+            detail_of(&service, "card-1").as_deref(),
+            Some("thread/start failed")
+        );
+    }
+
+    /// worktree 建不出来时 `next_launch` 自己把卡记为 `failed`：那条原因同样
+    /// 要留下来（这是全自动路径上最常见的失败）。
+    #[test]
+    fn a_worktree_that_cannot_be_created_is_recorded_as_the_failure_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        // 故意不是 git 仓库：`git worktree add` 必然失败。
+        let service = service_with_card(dir.path());
+        let error = match service.next_launch(1, at()) {
+            Err(error) => error,
+            Ok(_) => panic!("不是 git 仓库，worktree 必然建不出来"),
+        };
+        assert!(error.contains("worktree for card-1 failed"), "{error}");
+        assert_eq!(state_of(&service, "card-1"), "failed");
+        let detail = detail_of(&service, "card-1").expect("原因必须可读");
+        assert!(detail.contains("worktree for card-1 failed"), "{detail}");
     }
 
     /// at-least-once：同一条回报重复投递只生效一次，且不重复占名额。
@@ -2379,6 +2504,86 @@ mod tests {
             "首轮 + N 次自动重试，此后不再自动进轮"
         );
         assert_eq!(state_of(&service, "card-1"), "needs_you", "到顶后等人发话");
+    }
+
+    /// spec §8 第 8 条否定那一半的**判词**断言：分支存在但**没**并入 base 时，
+    /// `driver_step` 让 `merge_finish` 跑出来的结论必须真是「git 判否」——
+    /// 卡落到 `needs_you`。
+    ///
+    /// 为什么不能只数 append 次数：`Cleared`（卡不在 `Merging`，不落状态）会让卡
+    /// 停在 `merging`，而计数、最终态可能照样「看起来对」；`merge_retries` 若被
+    /// 重复计数，次数会偏少但终态仍是 `needs_you`。判词要单独钉住。
+    ///
+    /// 判词与「能再次入轮」分两拍看：收尾那一拍的合并轮开局用的是**收尾前**的
+    /// 快照，卡当时还是 `merging`，所以那一拍只落判词、不开新轮——判负的
+    /// `needs_you` 因此是可观察的；下一拍才重新入轮（D9 的可重试）。
+    #[test]
+    fn driver_step_settles_a_git_negative_merge_round_as_needs_you_and_retries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        // 分支存在，但带着 main 没有的提交：git 事实就是「没并入」。
+        git_run(&project, &["checkout", "-q", "-b", &source]);
+        std::fs::write(project.join("x.txt"), "x\n").unwrap();
+        git_run(&project, &["add", "x.txt"]);
+        git_run(&project, &["commit", "-qm", "feat"]);
+        git_run(&project, &["checkout", "-q", "main"]);
+        assert!(
+            !crate::merge::branch_merged_into(&project, &source, "main"),
+            "用例前提：这轮合并的 git 事实必须是「否」"
+        );
+
+        // 第一拍：开出合并轮（卡 merging），拿到这一轮的 action_id。
+        let DriverAction::Append {
+            action_id,
+            card_id,
+            objective,
+            ..
+        } = service
+            .driver_step(&idle(&["thread-1"]), &[])
+            .unwrap()
+            .expect("the merge round opens")
+        else {
+            unreachable!()
+        };
+        assert_eq!(card_id, "card-1");
+        assert!(objective.contains(&source), "{objective}");
+        assert_eq!(state_of(&service, "card-1"), "merging");
+
+        // 第二拍：回合投递成功（`ok: true` 只证明投递过），会话空闲 → 复核。
+        let result = DriverResult {
+            action_id,
+            ok: true,
+            thread_id: Some("thread-1".to_string()),
+            error: None,
+        };
+        assert!(
+            service
+                .driver_step(&idle(&["thread-1"]), &[result])
+                .unwrap()
+                .is_none(),
+            "收尾那一拍只有判词、没有动作"
+        );
+        // 判词：git 判否 → `needs_you`（不是 `Cleared` 留在 `merging`，也不是 `done`）。
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "needs_you",
+            "git 判否的判词必须是 needs_you"
+        );
+
+        // 下一拍这张卡必须能**再入轮**（spec §8 第 8 条的「且能再次入轮」）。
+        let DriverAction::Append {
+            card_id, objective, ..
+        } = service
+            .driver_step(&idle(&["thread-1"]), &[])
+            .unwrap()
+            .expect("a git-negative round is retried")
+        else {
+            unreachable!()
+        };
+        assert_eq!(card_id, "card-1");
+        assert!(objective.contains(&source), "{objective}");
+        assert_eq!(state_of(&service, "card-1"), "merging");
     }
 
     /// 会话自己跑完、没有提交 → `needs_you`。它**不是**合并轮失败，没有产出可合，

@@ -67,6 +67,7 @@ impl Board {
             origin_card: None,
             archived: false,
             terminal_at: None,
+            detail: None,
         });
         &self.cards[index]
     }
@@ -100,6 +101,7 @@ impl Board {
             origin_card: origin,
             archived: false,
             terminal_at: None,
+            detail: None,
         });
         &self.cards[index]
     }
@@ -179,6 +181,24 @@ impl Board {
             .find(|c| &c.id == id)
             .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
         card.base_commit = Some(base_commit);
+        Ok(())
+    }
+
+    /// 记下这张卡**为什么**落到当前状态（启动失败的 `error` 等），供 `list` 读出。
+    ///
+    /// `None` 是显式的「无判词」——进入新一轮尝试或无关结局时清掉，免得旧原因
+    /// 挂在一张状态已经变了的卡上误导人。
+    pub fn set_detail(
+        &mut self,
+        id: &CardId,
+        detail: Option<String>,
+    ) -> Result<(), TransitionError> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|card| &card.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        card.detail = detail;
         Ok(())
     }
 
