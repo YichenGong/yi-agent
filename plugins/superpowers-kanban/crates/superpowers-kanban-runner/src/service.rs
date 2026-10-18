@@ -22,7 +22,7 @@ use superpowers_kanban_core::card::{Card, CardId, CardKind, CardState};
 
 use crate::inbox::{self, InboxOutcome};
 use crate::lease::{self, Lease};
-use crate::merge::{self, MergeOutcome};
+use crate::merge;
 use crate::persist;
 use crate::worktree::{ensure_worktree, slugify};
 
@@ -31,12 +31,6 @@ pub struct LaunchClaim {
     pub card_id: String,
     pub workdir: PathBuf,
     pub title: String,
-}
-
-/// 一次合并尝试的结果：卡片 id 与合并结局。
-pub struct MergeClaim {
-    pub card_id: String,
-    pub outcome: crate::merge::MergeOutcome,
 }
 
 /// 一次名额申请的结果。
@@ -820,77 +814,6 @@ impl BoardService {
         outcomes
     }
 
-    /// 试做下一张合并卡。拿不到每项目合并闸即返回 `None`（本项目已有合并在跑）。
-    ///
-    /// 全程持 `merge.lock`：认领 → 在 base worktree 里 `git merge --no-ff` → 回写终态。
-    /// 合并成功且卡片带 `origin_card` 时，把那张实现卡一并送到 `Done`。
-    pub fn merge_next(&self) -> Result<Option<MergeClaim>, String> {
-        let Some(_gate) = crate::merge_lock::acquire(&self.state_dir) else {
-            return Ok(None);
-        };
-        let mut inner = self.lock();
-        let Some(card_id) = inner.board.claim_next_merge(false) else {
-            return Ok(None);
-        };
-        let card = inner.board.get(&card_id).cloned().expect("just claimed");
-        let source = card.source_ref.clone().unwrap_or_default();
-        let base = card.base_ref.clone().unwrap_or_default();
-        let origin = card.origin_card.clone();
-
-        let finish = |inner: &mut Inner, next: CardState| {
-            let _ = inner.board.transition(&card_id, next);
-            if next == CardState::Done {
-                if let Some(origin) = &origin {
-                    let _ = inner.board.transition(origin, CardState::Done);
-                }
-            }
-        };
-
-        if !merge::source_branch_exists(&self.project_root, &source) {
-            let detail = format!("source branch '{source}' does not exist");
-            finish(&mut inner, CardState::NeedsYou);
-            self.save(&inner);
-            return Ok(Some(MergeClaim {
-                card_id: card_id.0,
-                outcome: MergeOutcome::GitError(detail),
-            }));
-        }
-        let base_wt = match merge::prepare(&self.project_root, &base) {
-            Ok(wt) => wt,
-            Err(detail) => {
-                finish(&mut inner, CardState::NeedsYou);
-                self.save(&inner);
-                return Ok(Some(MergeClaim {
-                    card_id: card_id.0,
-                    outcome: MergeOutcome::GitError(detail),
-                }));
-            }
-        };
-        if merge::is_dirty(&base_wt.path) {
-            let detail = format!("base worktree {} is dirty", base_wt.path.display());
-            merge::cleanup(&base_wt);
-            finish(&mut inner, CardState::NeedsYou);
-            self.save(&inner);
-            return Ok(Some(MergeClaim {
-                card_id: card_id.0,
-                outcome: MergeOutcome::GitError(detail),
-            }));
-        }
-        let outcome = merge::run(&base_wt.path, &source, &base);
-        merge::cleanup(&base_wt);
-        let next = match outcome {
-            MergeOutcome::Merged => CardState::Done,
-            MergeOutcome::Conflict => CardState::NeedsYou,
-            MergeOutcome::GitError(_) => CardState::Failed,
-        };
-        finish(&mut inner, next);
-        self.save(&inner);
-        Ok(Some(MergeClaim {
-            card_id: card_id.0,
-            outcome,
-        }))
-    }
-
     /// 申请一次合并名额。
     ///
     /// 名额的两个来源：`merge.lock`（flock）挡住**同一进程/跨进程同时申请**，
@@ -1523,56 +1446,6 @@ mod tests {
             service.list()["cards"][0]["state"],
             "failed",
             "a Launching zombie must be reaped at startup"
-        );
-    }
-
-    #[test]
-    fn a_merge_card_merges_its_source_and_sends_the_origin_card_to_done() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = project_with_worktree(dir.path());
-        // 造一个 source 分支：feat/x 在 main 之外加一个文件。
-        let git = |args: &[&str]| {
-            assert!(
-                std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(&project)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        };
-        git(&["checkout", "-qb", "feat/x"]);
-        std::fs::write(project.join("x.txt"), "x\n").unwrap();
-        git(&["add", "x.txt"]);
-        git(&["commit", "-qm", "feat"]);
-        git(&["checkout", "-q", "main"]);
-
-        let service = service_with_card(&project);
-        // 加一张实现卡（配对的 origin）与一张合并卡。
-        service.enqueue_merge_card_for_test("m1", "feat/x", "main", Some("card-1"));
-        service.mark_running("card-1", "thread-1").unwrap();
-        service
-            .mark_terminal("card-1", "awaiting_merge", None)
-            .unwrap();
-
-        let claim = service.merge_next().unwrap().expect("a merge claim");
-        assert_eq!(claim.card_id, "m1");
-        let listed = service.list();
-        let cards = listed["cards"].as_array().unwrap();
-        let states: std::collections::HashMap<_, _> = cards
-            .iter()
-            .map(|c| {
-                (
-                    c["id"].as_str().unwrap().to_string(),
-                    c["state"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        assert_eq!(states["m1"], "done");
-        assert_eq!(
-            states["card-1"], "done",
-            "merge success drives the origin card to done"
         );
     }
 
@@ -2631,6 +2504,33 @@ mod tests {
             state_of(&service, "card-1"),
             "awaiting_merge",
             "卡原地等分支"
+        );
+    }
+
+    /// 退役裸 git 自动合并：runner 不再自己认领合并卡去跑 `git merge --no-ff`。
+    ///
+    /// 合并轮已改为**会话里的一回合**（Task 7：`driver_step` 派发 → 模型动手 →
+    /// 插件用 git 复核判词）。所以 runner 侧不得再留下那个认领函数
+    /// （`fn ` + `merge` + `_next`）以及它的调用点；能力本身由
+    /// `merge_request` / `merge_finish` / `merge.lock` / `reconcile_merged` 承载。
+    ///
+    /// 针由拼接构造：若直接把整词写进本测试的字面量或注释，源码文本里就恒有它，
+    /// 断言会变成永假（自指陷阱）。
+    #[test]
+    fn the_daemon_loop_no_longer_claims_a_merge_to_run_git_itself() {
+        let claim_decl = ["fn ", "merge", "_next"].concat();
+        let call_site = ["merge", "_next("].concat();
+
+        let service_src = include_str!("service.rs");
+        let main_src = include_str!("main.rs");
+
+        assert!(
+            !service_src.contains(&claim_decl),
+            "service.rs must no longer declare the bare-git merge claim"
+        );
+        assert!(
+            !main_src.contains(&call_site),
+            "the daemon loop must no longer call the bare-git merge claim"
         );
     }
 }

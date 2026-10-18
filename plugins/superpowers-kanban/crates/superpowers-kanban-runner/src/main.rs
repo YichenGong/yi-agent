@@ -836,15 +836,9 @@ fn run_daemon(args: Args) {
             );
         }
 
-        // 合并与实现共用一个 tick：消费投递后，若本项目没有合并在跑，就做一张。
-        match service.merge_next() {
-            Ok(Some(claim)) => eprintln!(
-                "superpowers-kanban: merged {} ({:?})",
-                claim.card_id, claim.outcome
-            ),
-            Ok(None) => {}
-            Err(error) => eprintln!("superpowers-kanban: merge failed: {error}"),
-        }
+        // 合并轮不再由 runner 认领跑 git：它已是**会话里的一回合**——插件经
+        // `driver_step` 派发、模型动手、插件用 git 复核出判词（见 service 的
+        // `driver_step` 与 `merge_finish`）。这里只留收敛与归档。
 
         // 归档：真终止态过宽限期自动隐藏；awaiting_merge/needs_you 永不自动。
         let swept = service.archive_due(chrono::Local::now());
