@@ -92,7 +92,7 @@ ART="yi-agent_${VERSION}_aarch64.dmg"
 export ART
 DMG_SRC="$HERE/src-tauri/target/release/bundle/dmg/$ART"
 if [ ! -f "$DMG_SRC" ]; then
-  echo "ERROR: 未找到 tauri 产出的 $ART（目录内容如下）" >&2
+  echo "ERROR: 未找到 tauri 产出的 ${ART}（目录内容如下）" >&2
   ls -l "$HERE/src-tauri/target/release/bundle/dmg/" >&2 || true
   exit 1
 fi
@@ -110,7 +110,7 @@ export CLI_ART
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/yi-agent-rs/target}"
 CLI_BIN="$TARGET_DIR/release/yi-agent"
 if [ ! -x "$CLI_BIN" ]; then
-  echo "ERROR: 未找到 sidecar CLI 二进制（$CLI_BIN）" >&2
+  echo "ERROR: 未找到 sidecar CLI 二进制（${CLI_BIN}）" >&2
   exit 1
 fi
 tar -czf "$ROOT/dist/$CLI_ART" -C "$(dirname "$CLI_BIN")" yi-agent
