@@ -35,6 +35,7 @@ use yi_agent_core::{
 };
 use yi_agent_runtime::models::CatalogWatcher;
 use yi_agent_store::schedule::{RetryDecision, RetryFailure, evaluate_retry};
+use yi_agent_store::terminal::text_completion_report;
 
 const DEFAULT_PROVIDER_RETRY_LIMIT: u16 = 3;
 
@@ -286,11 +287,16 @@ impl DaemonAgentWorkerFactory {
         self
     }
 
+    /// Recovery/attestation naming path: the tool *names* a single workspace
+    /// yields, which the inherited root set never changes. The live worker path
+    /// is [`Self::worker_tool_registry`], where the inherited roots do reach
+    /// both the FS root set and the shell sandbox.
     fn tool_registry_for_workspace(&self, workspace: PathBuf) -> ToolRegistry {
         let mut tools = (*self.tools).clone();
+        // FS 根集就是这一根；shell 沙箱的额外可写根仍走原来的 `sandbox_writable_roots`。
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
-            workspace,
+            vec![workspace],
             self.sandbox,
             self.sandbox_writable_roots.clone(),
         );
@@ -302,39 +308,55 @@ impl DaemonAgentWorkerFactory {
         workspace: &WorkerWorkspace,
         workspace_mode: ChildWriteMode,
         inherited: Option<yi_agent_core::InheritedSandbox>,
+        inherited_roots: Vec<PathBuf>,
     ) -> ToolRegistry {
         self.worker_tool_registry_with_base(
             workspace,
             workspace_mode,
             inherited,
+            inherited_roots,
             Arc::clone(&self.tools),
         )
     }
 
     /// 与 [`Self::worker_tool_registry`] 同逻辑，但基准工具集由调用方给出
     /// （刷新路径传入当前清单重建出的那份）。
+    ///
+    /// `inherited_roots` 是父会话传下来的关联根集（主根除外；空集 = 今天的
+    /// 单根行为）。它进**两个**参数：FS 根集（`read`/`write`/`edit`/`glob`/
+    /// `grep` 的路径解析）与 shell 沙箱的可写根集。
     fn worker_tool_registry_with_base(
         &self,
         workspace: &WorkerWorkspace,
         workspace_mode: ChildWriteMode,
         inherited: Option<yi_agent_core::InheritedSandbox>,
+        inherited_roots: Vec<PathBuf>,
         base: Arc<ToolRegistry>,
     ) -> ToolRegistry {
         let mut tools = (*base).clone();
+        // FS 根集与 shell 沙箱可写根是**两个**参数，必须分开算。顺序上自有
+        // worktree 在前：它是这一根 worker 的主根，相对路径与 cwd 都挂在它上面。
+        let mut fs_roots = vec![workspace.path.clone()];
+        fs_roots.extend(inherited_roots.iter().cloned());
         let (sandbox, writable_roots) = match workspace_mode {
             ChildWriteMode::Coding => {
-                let mut writable_roots = vec![workspace.path.clone()];
+                // shell 沙箱的可写位置 = FS 根集 + git 内部目录（后者只属于沙箱）。
+                let mut writable_roots = fs_roots.clone();
                 writable_roots.extend(git_writable_roots_for_worktree(&workspace.path));
                 (
                     resolve_effective_sandbox(self.sandbox, inherited),
                     writable_roots,
                 )
             }
+            // 只读子 agent 继承根集只扩大**读**路径解析；沙箱可写根仍为空。
             ChildWriteMode::ReadOnly => (yi_agent_tools::SandboxMode::ReadOnly, Vec::new()),
         };
+        // `writable_roots`（含 git 内部目录）是 shell 沙箱专属，**不得**混进
+        // FS 根集——否则 FS 工具能写 git 内部目录。`fs_roots` 里只有该 worker
+        // 自己的 worktree 与继承来的关联根。
         yi_agent_tools::register_builtin_tools_with_sandbox(
             &mut tools,
-            workspace.path.clone(),
+            fs_roots,
             sandbox,
             writable_roots,
         );
@@ -741,16 +763,24 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
             }
             ChildWriteMode::ReadOnly => yi_agent_tools::SandboxMode::ReadOnly,
         };
+        // `request.extra_roots` is not `Copy` and `request` is partially moved
+        // further down (`objective`, `initial_user_messages`, `fork_messages`),
+        // so take the root set before those moves.
+        let extra_roots = request.extra_roots.clone();
         let worker_tools = Arc::new(match refreshed.as_ref() {
             Some(parts) => self.worker_tool_registry_with_base(
                 &workspace,
                 workspace_mode,
                 request.inherited_sandbox,
+                extra_roots.clone(),
                 Arc::clone(&parts.tools),
             ),
-            None => {
-                self.worker_tool_registry(&workspace, workspace_mode, request.inherited_sandbox)
-            }
+            None => self.worker_tool_registry(
+                &workspace,
+                workspace_mode,
+                request.inherited_sandbox,
+                extra_roots.clone(),
+            ),
         });
         let mut config = refreshed
             .as_ref()
@@ -1657,12 +1687,31 @@ fn spawn_sandbox(
 /// well under the IPC frame cap so a base64-encoded chunk still fits one frame.
 const FORK_CHUNK_BYTES: usize = 256 * 1024;
 
-/// Resolves the optional `fork` argument for a daemon `spawn_agent` call. Off by
-/// default; an explicit non-boolean value is rejected rather than ignored.
-fn spawn_fork(args: &Value) -> Result<bool, ToolResult> {
+/// Which fork behaviour a `spawn_agent` call asked for.
+///
+/// The distinction matters because the strict contract differs by origin: a
+/// caller that explicitly asked to fork must never silently receive a
+/// contextless child, while the default path must degrade to an unforked spawn
+/// rather than fail a routine delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkChoice {
+    /// `fork` was omitted: fork, but degrade instead of failing.
+    Default,
+    /// `fork: true`: fork, and report a failure if that is impossible.
+    Yes,
+    /// `fork: false`: do not fork at all.
+    No,
+}
+
+/// Resolves the optional `fork` argument for a daemon `spawn_agent` call.
+///
+/// Omitted means fork (the default); an explicit non-boolean value is rejected
+/// rather than ignored.
+fn spawn_fork(args: &Value) -> Result<ForkChoice, ToolResult> {
     match args.get("fork") {
-        None => Ok(false),
-        Some(Value::Bool(value)) => Ok(*value),
+        None => Ok(ForkChoice::Default),
+        Some(Value::Bool(true)) => Ok(ForkChoice::Yes),
+        Some(Value::Bool(false)) => Ok(ForkChoice::No),
         Some(_) => Err(ToolResult::error("fork must be a boolean")),
     }
 }
@@ -1749,9 +1798,14 @@ fn drive_fork_upload(
 /// returns the token the spawn request names.
 ///
 /// The snapshot is taken here, at call time, so the child inherits the caller's
-/// history as of this delegation rather than at tool-assembly time. An unbound
-/// caller is an explicit error: a caller that asked for `fork:true` must never
-/// silently receive a contextless child.
+/// history as of this delegation rather than at tool-assembly time.
+///
+/// Failures here are returned as `Err`; whether they are fatal is decided by the
+/// caller ([`spawn_fork_token`]): a `fork:true` request reports them, while the
+/// default path degrades to an unforked spawn. This function deliberately does
+/// not classify its failures, because the degradation policy is identical for
+/// both cases and the daemon's size cap is env-configurable
+/// (`YI_AGENT_FORK_MAX_BYTES`), so a client-side mirror of it would only drift.
 fn upload_forked_context(
     socket: &Path,
     handle: &crate::binding::RuntimeHandle,
@@ -1793,17 +1847,66 @@ fn abort_unconsumed_fork(socket: &Path, fork_token: &Option<String>) {
     }
 }
 
+/// Turns a spawn response into the tool result both spawn tools return.
+///
+/// Shared because the two tools differ only in which IPC request they send; the
+/// response handling -- the queued payload, the abort of an unconsumed fork on
+/// rejection, and the daemon-unavailable error -- is identical. Keeping it in one
+/// place is what stops the `forked` contract from drifting between them.
+fn spawn_outcome(
+    response: Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>,
+    socket: &Path,
+    fork_token: &Option<String>,
+    objective: &str,
+) -> ToolResult {
+    match response {
+        Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
+            json!({
+                "task_id": task_id,
+                "objective": objective,
+                "status": "queued",
+                "forked": fork_token.is_some(),
+            })
+            .to_string(),
+        ),
+        Ok(other) => {
+            abort_unconsumed_fork(socket, fork_token);
+            ToolResult::error(format_ipc_rejection("spawn request", &other))
+        }
+        Err(error) => {
+            abort_unconsumed_fork(socket, fork_token);
+            ToolResult::error(format!("daemon is unavailable: {error}"))
+        }
+    }
+}
+
 /// Resolves the `fork_token` a spawn request should carry: uploading the
-/// caller's transcript when `fork` is set, and `None` otherwise.
+/// caller's transcript whenever fork is enabled, which it is by default. `None`
+/// means the child gets no inherited context, which happens only for an explicit
+/// `fork: false` or a degraded default.
+///
+/// A [`ForkChoice::Default`] attempt that cannot produce a payload degrades to
+/// `None`; a [`ForkChoice::Yes`] attempt reports the failure, because a caller
+/// that asked for a fork must not silently get a contextless child.
 fn spawn_fork_token(
     args: &Value,
     handle: &crate::binding::RuntimeHandle,
     caller: &CallerContext,
 ) -> Result<Option<String>, ToolResult> {
-    if !spawn_fork(args)? {
-        return Ok(None);
+    match spawn_fork(args)? {
+        ForkChoice::No => Ok(None),
+        ForkChoice::Yes => upload_forked_context(&handle.socket_path, handle, caller).map(Some),
+        ForkChoice::Default => match upload_forked_context(&handle.socket_path, handle, caller) {
+            Ok(token) => Ok(Some(token)),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "default fork is unavailable; spawning without inherited context"
+                );
+                Ok(None)
+            }
+        },
     }
-    upload_forked_context(&handle.socket_path, handle, caller).map(Some)
 }
 
 struct DaemonSpawnAgentTool {
@@ -1827,16 +1930,6 @@ struct DaemonApplicationSpawnAgentTool {
     caller: CallerContext,
 }
 
-/// Extract the child's text report from its stored terminal payload, using the
-/// same `kind` marker the store writes.
-fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
-    let payload = serde_json::from_str::<Value>(terminal_json?).ok()?;
-    (payload.get("kind").and_then(Value::as_str) == Some("text_completion"))
-        .then(|| payload.get("report").and_then(Value::as_str))
-        .flatten()
-        .map(str::to_owned)
-}
-
 struct DaemonInspectAgentTool {
     root: Arc<crate::thread_root::ThreadRoot>,
 }
@@ -1849,6 +1942,43 @@ struct DaemonWaitAgentTool {
     root: Arc<crate::thread_root::ThreadRoot>,
 }
 
+/// `spawn_agent` 面向模型的文案。
+///
+/// 普通 worker（`DaemonSpawnAgentTool`）与应用级子代理
+/// （`DaemonApplicationSpawnAgentTool`）共用这一份，避免文案漂移。
+pub(crate) fn spawn_agent_description() -> &'static str {
+    "Create an asynchronously scheduled direct child agent."
+}
+
+/// `spawn_agent` 的 JSON schema。
+///
+/// 两个 `Daemon*SpawnAgentTool` 共用；两工具的差异只在 `call()` 里沙箱来源
+/// （`self.sandbox` vs `self.controller.effective()`），与 schema 无关。
+pub(crate) fn spawn_agent_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "task": { "type": "string", "description": "Delegated objective." },
+            "mode": {
+                "type": "string",
+                "enum": ["coding", "read_only"],
+                "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
+            },
+            "workdir": {
+                "type": "string",
+                "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
+            },
+            "fork": {
+                "type": "boolean",
+                "default": true,
+                "description": "The child inherits this conversation's history by default. Pass false for an isolated child that should start clean."
+            }
+        },
+        "required": ["task"],
+        "additionalProperties": false
+    })
+}
+
 #[async_trait]
 impl Tool for DaemonApplicationSpawnAgentTool {
     fn name(&self) -> &str {
@@ -1856,32 +1986,11 @@ impl Tool for DaemonApplicationSpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Create an asynchronously scheduled direct child agent."
+        spawn_agent_description()
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task": { "type": "string", "description": "Delegated objective." },
-                "mode": {
-                    "type": "string",
-                    "enum": ["coding", "read_only"],
-                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
-                },
-                "fork": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Fork the caller's current conversation into the child so it inherits context. Off by default: pass true only when the child genuinely needs the history."
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": false
-        })
+        spawn_agent_schema()
     }
 
     async fn call(&self, args: Value) -> ToolResult {
@@ -1933,19 +2042,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 fork_token: fork_token.clone(),
             },
         );
-        match response {
-            Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
-                json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
-            ),
-            Ok(other) => {
-                abort_unconsumed_fork(&handle.socket_path, &fork_token);
-                ToolResult::error(format_ipc_rejection("spawn request", &other))
-            }
-            Err(error) => {
-                abort_unconsumed_fork(&handle.socket_path, &fork_token);
-                ToolResult::error(format!("daemon is unavailable: {error}"))
-            }
-        }
+        spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
     }
 }
 
@@ -2152,32 +2249,11 @@ impl Tool for DaemonSpawnAgentTool {
     }
 
     fn description(&self) -> &str {
-        "Create an asynchronously scheduled direct child agent."
+        spawn_agent_description()
     }
 
     fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task": { "type": "string", "description": "Delegated objective." },
-                "mode": {
-                    "type": "string",
-                    "enum": ["coding", "read_only"],
-                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
-                },
-                "fork": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Fork the caller's current conversation into the child so it inherits context. Off by default: pass true only when the child genuinely needs the history."
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": false
-        })
+        spawn_agent_schema()
     }
 
     async fn call(&self, args: Value) -> ToolResult {
@@ -2226,19 +2302,7 @@ impl Tool for DaemonSpawnAgentTool {
                 fork_token: fork_token.clone(),
             },
         );
-        match response {
-            Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
-                json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
-            ),
-            Ok(other) => {
-                abort_unconsumed_fork(&handle.socket_path, &fork_token);
-                ToolResult::error(format_ipc_rejection("spawn request", &other))
-            }
-            Err(error) => {
-                abort_unconsumed_fork(&handle.socket_path, &fork_token);
-                ToolResult::error(format!("daemon is unavailable: {error}"))
-            }
-        }
+        spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
     }
 }
 
@@ -2340,16 +2404,32 @@ mod tests {
     }
 
     #[test]
-    fn both_spawn_schemas_offer_fork_and_default_to_false() {
+    fn both_spawn_schemas_offer_fork_and_default_to_true() {
         for schema in [application_spawn_schema(), core_spawn_schema()] {
             assert_eq!(schema["properties"]["fork"]["type"], "boolean");
-            assert_eq!(schema["properties"]["fork"]["default"], false);
+            assert_eq!(schema["properties"]["fork"]["default"], true);
             assert_eq!(
                 schema["required"],
                 json!(["task"]),
                 "fork must stay optional"
             );
         }
+    }
+
+    #[test]
+    fn spawn_agent_schema_pins_the_wire_contract() {
+        let schema = spawn_agent_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"], serde_json::json!(["task"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["coding", "read_only"])
+        );
+        assert_eq!(
+            spawn_agent_description(),
+            "Create an asynchronously scheduled direct child agent."
+        );
     }
 
     #[tokio::test]
@@ -2839,6 +2919,113 @@ mod tests {
         ));
     }
 
+    /// A fresh handle over literals, for exercising the fork helpers without a
+    /// live daemon. `test_root` cannot be used here: it is a `ThreadRoot`, not
+    /// the `RuntimeHandle` these helpers take.
+    fn fork_test_handle() -> crate::binding::RuntimeHandle {
+        crate::binding::RuntimeHandle {
+            socket_path: PathBuf::from("/tmp/unused.sock"),
+            workspace_root: PathBuf::from("/tmp/unused-ws"),
+            session_id: "s".into(),
+            task_id: "t".into(),
+            capability: "c".into(),
+        }
+    }
+
+    #[test]
+    fn daemon_spawn_fork_defaults_to_yes_and_parses_both_explicit_spellings() {
+        assert_eq!(
+            spawn_fork(&json!({})).unwrap(),
+            ForkChoice::Default,
+            "an omitted fork must take the new default-on path"
+        );
+        assert_eq!(
+            spawn_fork(&json!({ "fork": true })).unwrap(),
+            ForkChoice::Yes,
+            "an explicit true is a caller requirement"
+        );
+        assert_eq!(
+            spawn_fork(&json!({ "fork": false })).unwrap(),
+            ForkChoice::No,
+            "an explicit false is the escape hatch"
+        );
+
+        let bad = spawn_fork(&json!({ "fork": "yes" })).unwrap_err();
+        assert!(bad.is_error);
+        assert!(matches!(
+            bad.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("fork must be a boolean")
+        ));
+    }
+
+    #[test]
+    fn an_explicit_fork_false_never_attempts_an_upload() {
+        let handle = fork_test_handle();
+        let caller = CallerContext::unbound();
+        // `fork:false` must short-circuit before touching any socket, so the
+        // unreachable path is fine: reaching it would be the failure.
+        let token = spawn_fork_token(&json!({ "fork": false }), &handle, &caller)
+            .expect("fork:false is a clean no-op, not an error");
+        assert_eq!(token, None, "fork:false must not upload anything");
+    }
+
+    /// The caller's transcript being unavailable is fatal only when the caller
+    /// demanded fork. On the default path it degrades: the delegation still
+    /// happens, just without inherited context.
+    #[test]
+    fn an_unbound_caller_degrades_on_the_default_path_but_fails_when_demanded() {
+        let handle = fork_test_handle();
+        let caller = CallerContext::unbound();
+
+        let default_token = spawn_fork_token(&json!({}), &handle, &caller)
+            .expect("the default path must degrade, not fail, when no context is bound");
+        assert_eq!(
+            default_token, None,
+            "a degraded spawn carries no fork token"
+        );
+
+        let demanded = spawn_fork_token(&json!({ "fork": true }), &handle, &caller)
+            .expect_err("an explicit fork:true must report the missing context");
+        assert!(demanded.is_error);
+        assert!(matches!(
+            demanded.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("fork requested but no caller context available")
+        ));
+    }
+
+    /// Every upload failure degrades on the default path, not just the
+    /// "no context" one. A bound caller over an unreachable socket exercises the
+    /// transport-failure class, which is the same class an oversized payload
+    /// lands in (the daemon rejects it at `BeginForkUpload`) -- so this test
+    /// covers the degradation policy without needing a daemon whose size cap is
+    /// settable only through a process-global env var.
+    #[test]
+    fn an_unreachable_daemon_degrades_on_the_default_path_but_fails_when_demanded() {
+        let handle = fork_test_handle();
+        let session = Arc::new(Mutex::new(Session::from_messages(vec![Message::user(
+            "parent history",
+        )])));
+        let caller = CallerContext::new(session);
+
+        let default_token = spawn_fork_token(&json!({}), &handle, &caller)
+            .expect("a transport failure must degrade on the default path");
+        assert_eq!(
+            default_token, None,
+            "a degraded spawn carries no fork token"
+        );
+
+        let demanded = spawn_fork_token(&json!({ "fork": true }), &handle, &caller)
+            .expect_err("an explicit fork:true must report the transport failure");
+        assert!(demanded.is_error);
+        assert!(matches!(
+            demanded.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("daemon is unavailable")
+        ));
+    }
+
     #[derive(Default)]
     pub(crate) struct RecordingProvider {
         requests: Mutex<Vec<ProviderRequest>>,
@@ -3076,6 +3263,18 @@ mod tests {
         }
     }
 
+    /// 与 `sandbox_inheritance_tests::factory_with_sandbox` 同一构造口径，但
+    /// 落在本模块，好和 `worker_workspace` / `initialize_git_repository` 一起用。
+    fn worker_factory(sandbox: yi_agent_tools::SandboxMode) -> DaemonAgentWorkerFactory {
+        DaemonAgentWorkerFactory::new(
+            Arc::new(RecordingProvider::default()),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            std::env::temp_dir().join("runtime.sock"),
+        )
+        .with_sandbox(sandbox, Vec::new())
+    }
+
     #[tokio::test]
     async fn child_worker_registry_allows_git_index_writes_in_its_repository() {
         let repository = TempDir::new().unwrap();
@@ -3111,7 +3310,8 @@ mod tests {
             repository.path().join("runtime.sock"),
         )
         .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
-        let registry = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
+        let registry =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None, Vec::new());
         let write = registry.get("write").expect("write tool");
         assert!(
             !write
@@ -3232,7 +3432,8 @@ mod tests {
             base_commit: String::new(),
         };
 
-        let read_only = factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly, None);
+        let read_only =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::ReadOnly, None, Vec::new());
         let read_only_names: Vec<_> = read_only
             .schemas()
             .into_iter()
@@ -3245,7 +3446,8 @@ mod tests {
             "read-only registry must omit write/edit, got {read_only_names:?}"
         );
 
-        let coding = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
+        let coding =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None, Vec::new());
         let coding_names: Vec<_> = coding
             .schemas()
             .into_iter()
@@ -3255,6 +3457,366 @@ mod tests {
             coding_names.iter().any(|name| name == "write")
                 && coding_names.iter().any(|name| name == "edit"),
             "coding registry must include write/edit, got {coding_names:?}"
+        );
+    }
+
+    /// 用户可见契约（工作流 2）：coding 子 agent 的 FS 工具覆盖「主根 + 继承的
+    /// 关联根」，同时仍然拒绝根集之外的位置。
+    #[tokio::test]
+    async fn coding_worker_gets_fs_tools_over_the_inherited_roots() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let linked = tempfile::TempDir::new().unwrap();
+        std::fs::write(linked.path().join("linked.txt"), "linked content\n").unwrap();
+        let outsider = tempfile::TempDir::new().unwrap();
+        let factory = worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let workspace = worker_workspace(dir.path());
+        let registry = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::Coding,
+            None,
+            vec![linked.path().to_path_buf()],
+        );
+        let names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
+        assert!(names.contains(&"write".to_string()));
+        assert!(names.contains(&"read".to_string()));
+
+        // 继承来的关联根读得到。
+        let read = registry.get("read").expect("read tool");
+        let linked_read = read
+            .call(json!({"path": linked.path().join("linked.txt")}))
+            .await;
+        assert!(
+            !linked_read.is_error,
+            "an inherited root must be readable: {linked_read:?}"
+        );
+
+        // 继承来的关联根也写得到。
+        let write = registry.get("write").expect("write tool");
+        assert!(
+            !write
+                .call(json!({"path": linked.path().join("delivery.txt"), "content": "ready\n"}))
+                .await
+                .is_error,
+            "an inherited root must be writable for a coding child",
+        );
+        assert_eq!(
+            std::fs::read_to_string(linked.path().join("delivery.txt")).unwrap(),
+            "ready\n"
+        );
+
+        // 自带 worktree 仍是主根：相对路径落在它里面，不是关联根里。
+        assert!(
+            !write
+                .call(json!({"path": "own.txt", "content": "own\n"}))
+                .await
+                .is_error
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("own.txt")).unwrap(),
+            "own\n"
+        );
+
+        // 根集之外仍被拒绝：继承根集只加宽，不放宽。
+        assert!(
+            write
+                .call(json!({"path": outsider.path().join("escape.txt"), "content": "no"}))
+                .await
+                .is_error,
+            "a path outside every root must stay refused",
+        );
+        assert!(!outsider.path().join("escape.txt").exists());
+    }
+
+    /// 只读子 agent 继承根集只扩大**读**路径解析：仍然没有 write/edit，
+    /// shell 沙箱也仍是 read-only。
+    #[tokio::test]
+    async fn read_only_worker_inherits_roots_without_write_tools() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let linked = tempfile::TempDir::new().unwrap();
+        std::fs::write(linked.path().join("linked.txt"), "linked content\n").unwrap();
+        let outsider = tempfile::TempDir::new().unwrap();
+        std::fs::write(outsider.path().join("outsider.txt"), "outsider content\n").unwrap();
+        let factory = worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let workspace = worker_workspace(dir.path());
+        let registry = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::ReadOnly,
+            None,
+            vec![linked.path().to_path_buf()],
+        );
+        let names: Vec<String> = registry.schemas().into_iter().map(|s| s.name).collect();
+        assert!(!names.contains(&"write".to_string()));
+        assert!(!names.contains(&"edit".to_string()));
+        assert!(names.contains(&"read".to_string()));
+
+        // 关联根可读。
+        let read = registry.get("read").expect("read tool");
+        assert!(
+            !read
+                .call(json!({"path": linked.path().join("linked.txt")}))
+                .await
+                .is_error,
+            "a read-only child must still read its inherited roots",
+        );
+        // 根集之外仍不可读。
+        assert!(
+            read.call(json!({"path": outsider.path().join("outsider.txt")}))
+                .await
+                .is_error
+        );
+        // 继承不改变只读沙箱。
+        assert!(registry.get("write").is_none());
+        assert_eq!(
+            registry.get("bash").unwrap().sandbox_mode(),
+            Some("read-only")
+        );
+    }
+
+    /// shell 沙箱的可写根集同样含继承的关联根，且仍把别处挡住。
+    #[tokio::test]
+    async fn coding_worker_shell_sandbox_covers_the_inherited_roots() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let linked = tempfile::TempDir::new().unwrap();
+        let outsider = tempfile::TempDir::new().unwrap();
+        let factory = worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let workspace = worker_workspace(dir.path());
+        let registry = factory.worker_tool_registry(
+            &workspace,
+            ChildWriteMode::Coding,
+            None,
+            vec![linked.path().to_path_buf()],
+        );
+        let bash = registry.get("bash").expect("bash tool");
+
+        let linked_probe = linked.path().join("probe.txt");
+        let linked_write = bash
+            .call(json!({"command": format!("touch {}", linked_probe.display())}))
+            .await;
+        assert!(
+            matches!(
+                linked_write.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "the shell sandbox must let a child write its inherited roots: {linked_write:?}"
+        );
+        assert!(linked_probe.exists());
+
+        let outsider_probe = outsider.path().join("probe.txt");
+        let outsider_write = bash
+            .call(json!({"command": format!("touch {}", outsider_probe.display())}))
+            .await;
+        assert!(
+            !matches!(
+                outsider_write.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "the shell sandbox must still refuse paths outside every root: {outsider_write:?}"
+        );
+        assert!(!outsider_probe.exists());
+    }
+
+    /// 两个根集**不许**混：`git_writable_roots_for_worktree` 的 git 内部目录
+    /// 只能进 shell 沙箱，绝不能进 FS 根集，否则 `write` 能直写 git 内部。
+    #[tokio::test]
+    async fn fs_roots_stay_clear_of_the_git_roots_the_shell_sandbox_needs() {
+        let repository = TempDir::new().unwrap();
+        let base_head = initialize_git_repository(repository.path());
+        let child_path = repository.path().join(".worktrees/child");
+        assert!(
+            Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    "feat/yi-agent-fs-root-split",
+                    child_path.to_str().unwrap(),
+                ])
+                .current_dir(repository.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let workspace = WorkerWorkspace {
+            lease_id: WorkspaceLeaseId::new(),
+            repository_root: repository.path().to_path_buf(),
+            path: child_path.clone(),
+            branch: "feat/yi-agent-fs-root-split".into(),
+            parent_branch: "main".into(),
+            base_commit: base_head,
+        };
+        let factory = worker_factory(yi_agent_tools::SandboxMode::WorkspaceWrite);
+        let registry =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None, Vec::new());
+
+        // git 内部目录在 FS 根集之外：`write` 必须写不进去。
+        let config = repository.path().join(".git/config");
+        let before = std::fs::read_to_string(&config).unwrap();
+        let write = registry.get("write").expect("write tool");
+        assert!(
+            write
+                .call(json!({"path": config, "content": "[core]\n\tevil = true\n"}))
+                .await
+                .is_error,
+            "FS tools must not reach the git metadata roots",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            before,
+            "a refused write must not touch the git config",
+        );
+
+        // 同一份 git 根必须仍进 shell 沙箱：`git add` 要能成功。
+        std::fs::write(child_path.join("delivery.txt"), "ready\n").unwrap();
+        let bash = registry.get("bash").expect("bash tool");
+        let add = bash.call(json!({"command": "git add delivery.txt"})).await;
+        assert!(
+            matches!(
+                add.content.as_slice(),
+                [yi_agent_core::ContentBlock::Text(output)] if output.starts_with("exit: 0\n")
+            ),
+            "the shell sandbox must keep the git roots writable: {add:?}"
+        );
+    }
+
+    /// 发一次 `read`（关联根内）+ 一次 `read`（根集外），把结果回灌给 provider。
+    ///
+    /// 用来测 `start_with_provider_turn_gate` 的接线：只测 `worker_tool_registry`
+    /// 会漏掉「`WorkerStart.extra_roots` 没被传下去」这一类缺陷。
+    struct LinkedRootReadProvider {
+        linked_file: String,
+        outsider_file: String,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    #[async_trait]
+    impl Provider for LinkedRootReadProvider {
+        async fn call_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            let events = match turn {
+                0 => vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "read-linked".into(),
+                        name: "read".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "read-linked".into(),
+                        partial_json: json!({"path": self.linked_file}).to_string(),
+                    },
+                    ProviderEvent::ToolUseEnd {
+                        id: "read-linked".into(),
+                    },
+                    ProviderEvent::ToolUseStart {
+                        id: "read-outsider".into(),
+                        name: "read".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "read-outsider".into(),
+                        partial_json: json!({"path": self.outsider_file}).to_string(),
+                    },
+                    ProviderEvent::ToolUseEnd {
+                        id: "read-outsider".into(),
+                    },
+                    ProviderEvent::Stop {
+                        reason: yi_agent_core::StopReason::EndTurn,
+                    },
+                ],
+                _ => vec![ProviderEvent::Stop {
+                    reason: yi_agent_core::StopReason::EndTurn,
+                }],
+            };
+            Ok(futures::stream::iter(events).boxed())
+        }
+    }
+
+    fn tool_results_in(request: &ProviderRequest) -> Vec<(String, bool, String)> {
+        request
+            .messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|block| match block {
+                yi_agent_core::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let text = content
+                        .iter()
+                        .filter_map(|block| match block {
+                            yi_agent_core::ContentBlock::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Some((tool_use_id.clone(), *is_error, text))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 端到端接线：`WorkerStart.extra_roots` 必须真的到达 worker 自己的 FS 工具。
+    #[tokio::test]
+    async fn worker_start_hands_the_inherited_roots_to_its_fs_tools() {
+        let dir = TempDir::new().unwrap();
+        let linked = TempDir::new().unwrap();
+        let outsider = TempDir::new().unwrap();
+        std::fs::write(linked.path().join("linked.txt"), "linked content\n").unwrap();
+        std::fs::write(outsider.path().join("outsider.txt"), "outsider content\n").unwrap();
+        let provider = Arc::new(LinkedRootReadProvider {
+            linked_file: linked
+                .path()
+                .join("linked.txt")
+                .to_string_lossy()
+                .into_owned(),
+            outsider_file: outsider
+                .path()
+                .join("outsider.txt")
+                .to_string_lossy()
+                .into_owned(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let factory = DaemonAgentWorkerFactory::new(
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            AgentConfig::default(),
+            dir.path().join("runtime.sock"),
+        )
+        .with_sandbox(yi_agent_tools::SandboxMode::WorkspaceWrite, Vec::new());
+        let request = WorkerStart::new(TaskId::new(), AttemptId::new(), RootSessionId::new())
+            .with_objective("Read both files.")
+            .with_workspace_mode(ChildWriteMode::Coding)
+            .with_workspace(worker_workspace(dir.path()))
+            .with_extra_roots(vec![linked.path().to_path_buf()]);
+        let handle = factory.start(request).await.unwrap();
+        wait_until(
+            || provider.requests.lock().unwrap().len() >= 2,
+            "the worker to feed its read results back to the provider",
+        )
+        .await;
+        handle.cancel();
+
+        let requests = provider.requests.lock().unwrap();
+        let results = tool_results_in(&requests[1]);
+        let (_, linked_error, linked_text) = results
+            .iter()
+            .find(|(id, ..)| id == "read-linked")
+            .expect("the worker must run the inherited-root read");
+        assert!(
+            !linked_error && linked_text.contains("linked content"),
+            "extra_roots must reach the worker's FS tools: {results:?}"
+        );
+        let (_, outsider_error, _) = results
+            .iter()
+            .find(|(id, ..)| id == "read-outsider")
+            .expect("the worker must run the outside-root read");
+        assert!(
+            *outsider_error,
+            "the inherited root set must not widen the boundary: {results:?}"
         );
     }
 
@@ -4397,6 +4959,7 @@ mod sandbox_inheritance_tests {
             &workspace,
             ChildWriteMode::Coding,
             Some(InheritedSandbox::DangerFullAccess),
+            Vec::new(),
         );
         assert_eq!(
             tools.get("bash").unwrap().sandbox_mode(),
@@ -4409,6 +4972,7 @@ mod sandbox_inheritance_tests {
             &workspace,
             ChildWriteMode::Coding,
             Some(InheritedSandbox::ReadOnly),
+            Vec::new(),
         );
         assert_eq!(
             tools.get("bash").unwrap().sandbox_mode(),
@@ -4416,7 +4980,8 @@ mod sandbox_inheritance_tests {
         );
 
         // No inheritance: the factory's configured mode stands.
-        let tools = factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None);
+        let tools =
+            factory.worker_tool_registry(&workspace, ChildWriteMode::Coding, None, Vec::new());
         assert_eq!(
             tools.get("bash").unwrap().sandbox_mode(),
             Some("workspace-write")
@@ -4427,6 +4992,7 @@ mod sandbox_inheritance_tests {
             &workspace,
             ChildWriteMode::ReadOnly,
             Some(InheritedSandbox::DangerFullAccess),
+            Vec::new(),
         );
         assert_eq!(tools.get("bash").unwrap().sandbox_mode(), Some("read-only"));
     }

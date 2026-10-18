@@ -11,8 +11,9 @@ use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryC
 use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
+use crate::terminal::text_completion_report;
 
-const LATEST_SCHEMA_VERSION: i64 = 14;
+const LATEST_SCHEMA_VERSION: i64 = 15;
 
 /// Hard ceiling on the trace rows a single task may retain. A worker's trace is
 /// observation data, not history: it must stay bounded no matter how long the
@@ -2502,6 +2503,56 @@ impl RuntimeRepository {
         )?)
     }
 
+    /// The linked roots a task's session carries, as canonical absolute paths.
+    ///
+    /// `NULL` (every row written before v15, and every cleared row), a blank
+    /// string, and malformed JSON all read as an empty list. Inheritance is a
+    /// capability increment: a bad value must never keep a task from starting,
+    /// and "no linked roots" has to mean exactly today's single-root behavior.
+    pub fn task_extra_roots(&self, task: &TaskId) -> Result<Vec<String>, RepositoryError> {
+        let stored = self
+            .connection
+            .query_row(
+                "SELECT extra_roots FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        match stored {
+            Some(raw) if !raw.trim().is_empty() => {
+                Ok(serde_json::from_str::<Vec<String>>(&raw).unwrap_or_default())
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Records a task's linked roots. An empty set is stored as SQL `NULL`, not
+    /// as `"[]"`, so a cleared row is indistinguishable from one that predates
+    /// the column; both mean "no linked roots".
+    ///
+    /// Deliberately lenient about a MISSING task: the affected-row count is
+    /// ignored, so this returns `Ok` for an unknown id (unlike
+    /// `set_task_thread_id`). A missing row is also read as an empty set by
+    /// [`Self::task_extra_roots`], so the two agree, and every production call
+    /// site runs immediately after the task's INSERT, making this unreachable.
+    pub fn set_task_extra_roots(
+        &mut self,
+        task: &TaskId,
+        roots: &[String],
+    ) -> Result<(), RepositoryError> {
+        let encoded = if roots.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(roots)?)
+        };
+        self.connection.execute(
+            "UPDATE tasks SET extra_roots = ?1 WHERE id = ?2",
+            params![encoded, task.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// A task's last transition time, used as the idle clock for reclaim.
     ///
     /// Returns `None` for a task with no row, which callers treat as "not idle
@@ -4130,20 +4181,27 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.execute("INSERT INTO schema_migrations (version) VALUES (14)", [])?;
         transaction.commit()?;
     }
-    Ok(())
-}
 
-/// The partial report a text-only worker left in its attempt's terminal JSON.
-///
-/// Mirrors the store's own decoder; kept local so the reclaim path does not
-/// reach across module boundaries for one field.
-fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
-    let payload = serde_json::from_str::<serde_json::Value>(terminal_json?).ok()?;
-    (payload.get("kind").and_then(serde_json::Value::as_str) == Some("text_completion"))
-        .then(|| payload.get("report").and_then(serde_json::Value::as_str))
-        .flatten()
-        .filter(|report| !report.trim().is_empty())
-        .map(str::to_owned)
+    // v15：根会话的关联根。会话创建时快照进根任务行，子任务按父链继承。
+    if current_version < 15 {
+        let transaction = connection.unchecked_transaction()?;
+        let has_column = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'extra_roots'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !has_column {
+            // JSON array of canonical paths. NULL means "no linked roots": the
+            // worker falls back to its single-root behavior, so pre-change rows
+            // keep today's semantics.
+            transaction.execute_batch("ALTER TABLE tasks ADD COLUMN extra_roots TEXT;")?;
+        }
+        transaction.execute("INSERT INTO schema_migrations (version) VALUES (15)", [])?;
+        transaction.commit()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4181,7 +4239,7 @@ mod tests {
             )
             .unwrap();
         assert!(has_thread_id);
-        assert_eq!(LATEST_SCHEMA_VERSION, 14);
+        assert_eq!(LATEST_SCHEMA_VERSION, 15);
     }
 
     #[test]
@@ -4205,7 +4263,7 @@ mod tests {
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 14);
+        assert_eq!(repository.schema_version().unwrap(), 15);
         let connection = repository.connection_for_test();
         assert!(
             connection
@@ -4249,7 +4307,7 @@ mod tests {
         drop(connection);
 
         let repository = RuntimeRepository::open(&path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 14);
+        assert_eq!(repository.schema_version().unwrap(), 15);
         let connection = repository.connection_for_test();
         for (probe, what) in [
             (
@@ -4542,5 +4600,116 @@ mod tests {
             repository.task_thread_id(&unknown),
             Err(RepositoryError::TaskNotFound { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod extra_roots_tests {
+    use super::*;
+
+    fn repository_with_one_task() -> (RuntimeRepository, TaskId, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let task = TaskId::new();
+        repository
+            .create_task_with_attempt(&task, &RootSessionId::new(), &AttemptId::new(), 1, "queued")
+            .unwrap();
+        (repository, task, directory)
+    }
+
+    #[test]
+    fn extra_roots_round_trip_and_default_to_empty() {
+        let (mut repository, task, _directory) = repository_with_one_task();
+        assert_eq!(
+            repository.task_extra_roots(&task).unwrap(),
+            Vec::<String>::new()
+        );
+        repository
+            .set_task_extra_roots(&task, &["/tmp/a".to_string(), "/tmp/b".to_string()])
+            .unwrap();
+        assert_eq!(
+            repository.task_extra_roots(&task).unwrap(),
+            vec!["/tmp/a".to_string(), "/tmp/b".to_string()]
+        );
+    }
+
+    /// `NULL` is what every row written before this change carries, and what a
+    /// cleared root set writes. It must read as "no linked roots", never as an
+    /// error: inheritance is a capability increment, so a bad value must not be
+    /// able to keep a task from starting.
+    #[test]
+    fn null_blank_and_malformed_extra_roots_all_read_as_empty() {
+        let (repository, task, _directory) = repository_with_one_task();
+        for stored in [None, Some(""), Some("   "), Some("not json"), Some("{}")] {
+            repository
+                .connection_for_test()
+                .execute(
+                    "UPDATE tasks SET extra_roots = ?1 WHERE id = ?2",
+                    params![stored, task.to_string()],
+                )
+                .unwrap();
+            assert_eq!(
+                repository.task_extra_roots(&task).unwrap(),
+                Vec::<String>::new(),
+                "stored value {stored:?} must read as an empty root set"
+            );
+        }
+    }
+
+    /// An empty set is stored as SQL `NULL`, so a row written by this code is
+    /// indistinguishable from one that predates the column.
+    #[test]
+    fn setting_no_roots_stores_sql_null() {
+        let (mut repository, task, _directory) = repository_with_one_task();
+        repository
+            .set_task_extra_roots(&task, &["/tmp/a".to_string()])
+            .unwrap();
+        repository.set_task_extra_roots(&task, &[]).unwrap();
+        let stored: Option<String> = repository
+            .connection_for_test()
+            .query_row(
+                "SELECT extra_roots FROM tasks WHERE id = ?1",
+                params![task.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(stored.is_none(), "empty roots must clear the column");
+    }
+
+    #[test]
+    fn schema_version_is_fifteen() {
+        assert_eq!(LATEST_SCHEMA_VERSION, 15);
+    }
+
+    /// The fresh-open tests never exercise the upgrade an existing install
+    /// performs, so roll a database back to exactly the v14 shape and reopen.
+    #[test]
+    fn a_version_fourteen_database_gains_the_extra_roots_column() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("runtime.sqlite");
+        RuntimeRepository::open(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE tasks DROP COLUMN extra_roots;
+                 DELETE FROM schema_migrations WHERE version >= 15;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let repository = RuntimeRepository::open(&path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 15);
+        let connection = repository.connection_for_test();
+        assert!(
+            connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'extra_roots')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap(),
+            "a v14 database must gain tasks.extra_roots"
+        );
     }
 }

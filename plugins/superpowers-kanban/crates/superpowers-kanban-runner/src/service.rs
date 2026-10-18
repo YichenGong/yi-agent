@@ -68,8 +68,10 @@ pub enum MergeFinish {
 }
 
 struct Inner {
-    board: Board,
     /// 已认领卡片持有的槽位租约。`Running` 卡片也仍在这里，直到终态释放。
+    ///
+    /// 这是**进程态**：`flock` fd 只能活在持有它的进程里，因此绝不进
+    /// board.json。看板数据本身是共享态，只在磁盘上有一份真相。
     leases: std::collections::HashMap<CardId, Lease>,
     /// `None` 表示拿不到全局租约目录：`next_launch` 必须报错而不是私自
     /// 造一个目录，否则会和别的进程用两个互不相干的池子、悄悄超配额。
@@ -108,12 +110,10 @@ impl BoardService {
                     .join("leases")
             })
             .or_else(lease::global_leases_dir);
-        let board = persist::load_board(&state_dir.join("board.json"));
         Self {
             state_dir,
             project_root,
             inner: Mutex::new(Inner {
-                board,
                 leases: Default::default(),
                 leases_dir,
                 notified_missing_branch: Default::default(),
@@ -129,14 +129,6 @@ impl BoardService {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn board_path(&self) -> PathBuf {
-        self.state_dir.join("board.json")
-    }
-
-    fn save(&self, inner: &Inner) {
-        let _ = persist::save_board(&self.board_path(), &inner.board);
-    }
-
     /// 自动归档「已到终态且超过宽限期」的卡；返回被归档的 id。
     ///
     /// 宽限期取自项目自己的日历（`archive_grace_hours`，默认 24）。每次 tick 读一次，
@@ -148,12 +140,8 @@ impl BoardService {
         )
         .archive_grace_hours;
         let grace = chrono::Duration::hours(hours.min(24 * 30) as i64);
-        let mut inner = self.lock();
-        let swept = inner.board.archive_due(now, grace);
-        if !swept.is_empty() {
-            self.save(&inner);
-        }
-        swept
+        persist::with_board(&self.state_dir, |board| Ok(board.archive_due(now, grace)))
+            .unwrap_or_default()
     }
 
     /// 认领下一张排队卡：先拿全局槽位租约，再判名额、建 worktree、置 `Launching`。
@@ -174,33 +162,51 @@ impl BoardService {
         let Some(lease) = lease::acquire_in(&dir, limit as usize) else {
             return Ok(None);
         };
+        let project_root = self.project_root.clone();
+        // 建 worktree 失败的错误在这里暂存：`with_board` 在闭包返回 `Err` 时**不
+        // 落盘**，而失败路径必须先落盘 `Failed`，所以闭包必须成功返回、错误留到
+        // 锁外再抛（见下）。这是用户裁决「保当前行为」的落点。
+        let mut worktree_failure: Option<String> = None;
         // 再认领：队空或无名额时把刚拿到的租约原地丢掉（drop 即释放）。
-        let Some(card_id) = inner.board.claim_next_launch(limit) else {
-            return Ok(None);
-        };
-        let branch = format!("kanban/{}", slugify(&card_id));
-        let workdir = match ensure_worktree(&self.project_root, &card_id, &branch) {
-            Ok(path) => path,
-            Err(error) => {
-                // 认领即占槽：建 worktree 失败必须把卡片标为 Failed，
-                // 否则它会卡在 Launching 永远不再被认领。
-                let _ = inner.board.transition(&card_id, CardState::Failed);
-                self.save(&inner);
-                return Err(format!("worktree for {card_id} failed: {error}"));
+        let claimed = persist::with_board(&self.state_dir, |board| {
+            let Some(card_id) = board.claim_next_launch(limit) else {
+                return Ok(None);
+            };
+            let branch = format!("kanban/{}", slugify(&card_id));
+            let workdir = match ensure_worktree(&project_root, &card_id, &branch) {
+                Ok(path) => path,
+                Err(error) => {
+                    // 认领即占槽：建 worktree 失败必须把卡片标为 Failed **并落盘**，
+                    // 否则它会卡在 Launching 永远不再被认领。
+                    //
+                    // 用 `return Ok(None)`（闭包成功）而不是 `return Err(..)`：后者会让
+                    // `with_board` 丢弃上面这次 `transition(Failed)`，卡片就卡死了。
+                    let _ = board.transition(&card_id, CardState::Failed);
+                    worktree_failure = Some(format!("worktree for {card_id} failed: {error}"));
+                    return Ok(None);
+                }
+            };
+            if let Some(base) = effective_head(&workdir) {
+                let _ = board.set_base_commit(&card_id, base);
             }
-        };
-        if let Some(base) = effective_head(&workdir) {
-            let _ = inner.board.set_base_commit(&card_id, base);
+            let _ = board.set_workdir(&card_id, workdir.clone());
+            let title = title_for(board, &card_id);
+            Ok(Some(LaunchClaim {
+                card_id: card_id.0,
+                workdir,
+                title,
+            }))
+        })?;
+        // 建 worktree 失败：状态已落盘为 `Failed`，现在才把错误抛出去（时机见上）。
+        if let Some(error) = worktree_failure {
+            return Err(error);
         }
-        let _ = inner.board.set_workdir(&card_id, workdir.clone());
-        let title = title_for(&inner.board, &card_id);
-        inner.leases.insert(card_id.clone(), lease);
-        self.save(&inner);
-        Ok(Some(LaunchClaim {
-            card_id: card_id.0,
-            workdir,
-            title,
-        }))
+        if let Some(claim) = &claimed {
+            inner
+                .leases
+                .insert(CardId::new(claim.card_id.clone()), lease);
+        }
+        Ok(claimed)
     }
 
     /// 启动时补领本进程既有 `Running` 卡片的全局名额。
@@ -216,8 +222,7 @@ impl BoardService {
         let Some(dir) = inner.leases_dir.clone() else {
             return;
         };
-        let ids: Vec<CardId> = inner
-            .board
+        let ids: Vec<CardId> = persist::read_board(&self.state_dir)
             .cards()
             .iter()
             .filter(|card| card.state == CardState::Running)
@@ -247,25 +252,23 @@ impl BoardService {
     /// 非法迁移，仅刷新 thread id。对账新增的 `awaiting_merge`/`needs_you → running`
     /// 回流正靠这里落地（见 2026-10-03 看板状态误判）。
     pub fn mark_running(&self, card_id: &str, thread_id: &str) -> Result<(), String> {
-        let mut inner = self.lock();
         let id = CardId::new(card_id);
-        let already_running = inner
-            .board
-            .get(&id)
-            .map(|card| card.state == CardState::Running)
-            .unwrap_or(false);
-        if !already_running {
-            inner
-                .board
-                .transition(&id, CardState::Running)
+        let thread_id = thread_id.to_string();
+        persist::with_board(&self.state_dir, |board| {
+            let already_running = board
+                .get(&id)
+                .map(|card| card.state == CardState::Running)
+                .unwrap_or(false);
+            if !already_running {
+                board
+                    .transition(&id, CardState::Running)
+                    .map_err(|error| error.to_string())?;
+            }
+            board
+                .set_thread_id(&id, thread_id)
                 .map_err(|error| error.to_string())?;
-        }
-        inner
-            .board
-            .set_thread_id(&id, thread_id.to_string())
-            .map_err(|error| error.to_string())?;
-        self.save(&inner);
-        Ok(())
+            Ok(())
+        })
     }
 
     /// 会话收尾：迁移到某个非终态结果并释放槽位。
@@ -281,27 +284,25 @@ impl BoardService {
             "failed" => CardState::Failed,
             other => return Err(format!("unknown outcome: {other}")),
         };
-        let mut inner = self.lock();
         let id = CardId::new(card_id);
-        inner
-            .board
-            .transition(&id, next)
-            .map_err(|error| error.to_string())?;
-        inner.leases.remove(&id); // 释放槽位：drop 掉 flock
-        self.save(&inner);
+        persist::with_board(&self.state_dir, |board| {
+            board
+                .transition(&id, next)
+                .map_err(|error| error.to_string())
+        })?;
+        self.lock().leases.remove(&id); // 释放槽位：drop 掉 flock
         Ok(())
     }
 
     /// 启动没成：把卡片标为 `Failed` 并释放槽位。
     pub fn release(&self, card_id: &str, _detail: &str) -> Result<(), String> {
-        let mut inner = self.lock();
         let id = CardId::new(card_id);
-        inner
-            .board
-            .transition(&id, CardState::Failed)
-            .map_err(|error| error.to_string())?;
-        inner.leases.remove(&id);
-        self.save(&inner);
+        persist::with_board(&self.state_dir, |board| {
+            board
+                .transition(&id, CardState::Failed)
+                .map_err(|error| error.to_string())
+        })?;
+        self.lock().leases.remove(&id);
         Ok(())
     }
 
@@ -318,61 +319,69 @@ impl BoardService {
     /// 3. 仍是 `Merging` 的僵尸卡 → `NeedsYou`。崩溃若发生在「置 Merging」之后、
     ///    「回写终态」之前，合并可能只做了一半，需人确认，故不放行也不判死。
     pub fn migrate_legacy_running(&self) {
+        let project_root = self.project_root.clone();
         let mut inner = self.lock();
-        let legacy_running: Vec<CardId> = inner
-            .board
-            .cards()
-            .iter()
-            .filter(|card| {
-                card.state == CardState::Running
-                    && card.thread_id.as_deref().unwrap_or("").is_empty()
-            })
-            .map(|card| card.id.clone())
-            .collect();
-        for id in legacy_running {
-            if inner.board.transition(&id, CardState::NeedsYou).is_ok() {
-                inner.leases.remove(&id);
-            }
-        }
-        let launching_zombies: Vec<CardId> = inner
-            .board
-            .cards()
-            .iter()
-            .filter(|card| card.state == CardState::Launching)
-            .map(|card| card.id.clone())
-            .collect();
-        for id in launching_zombies {
-            if inner.board.transition(&id, CardState::Failed).is_ok() {
-                inner.leases.remove(&id);
-            }
-        }
-        // 崩溃若发生在「置 Merging」之后、「回写终态」之前，会留下 Merging 僵尸。
-        // 合并可能半途，需人确认，故收成 NeedsYou（不是 Failed）。先尽力 abort。
-        let merging: Vec<CardId> = inner
-            .board
-            .cards()
-            .iter()
-            .filter(|card| card.state == CardState::Merging)
-            .map(|card| card.id.clone())
-            .collect();
-        for id in merging {
-            if let Some(card) = inner.board.get(&id).cloned() {
-                if let Some(base) = card.base_ref.as_deref() {
-                    if let Ok(wt) = merge::prepare(&self.project_root, base) {
-                        let _ = std::process::Command::new("git")
-                            .arg("-C")
-                            .arg(&wt.path)
-                            .args(["merge", "--abort"])
-                            .output();
-                        merge::cleanup(&wt);
-                    }
+        let freed: Vec<CardId> = persist::with_board(&self.state_dir, |board| {
+            let mut freed: Vec<CardId> = Vec::new();
+
+            let legacy_running: Vec<CardId> = board
+                .cards()
+                .iter()
+                .filter(|card| {
+                    card.state == CardState::Running
+                        && card.thread_id.as_deref().unwrap_or("").is_empty()
+                })
+                .map(|card| card.id.clone())
+                .collect();
+            for id in legacy_running {
+                if board.transition(&id, CardState::NeedsYou).is_ok() {
+                    freed.push(id);
                 }
             }
-            if inner.board.transition(&id, CardState::NeedsYou).is_ok() {
-                inner.leases.remove(&id);
+
+            let launching_zombies: Vec<CardId> = board
+                .cards()
+                .iter()
+                .filter(|card| card.state == CardState::Launching)
+                .map(|card| card.id.clone())
+                .collect();
+            for id in launching_zombies {
+                if board.transition(&id, CardState::Failed).is_ok() {
+                    freed.push(id);
+                }
             }
+
+            // 崩溃若发生在「置 Merging」之后、「回写终态」之前，会留下 Merging 僵尸。
+            // 合并可能半途，需人确认，故收成 NeedsYou（不是 Failed）。先尽力 abort。
+            let merging: Vec<CardId> = board
+                .cards()
+                .iter()
+                .filter(|card| card.state == CardState::Merging)
+                .map(|card| card.id.clone())
+                .collect();
+            for id in merging {
+                if let Some(card) = board.get(&id).cloned() {
+                    if let Some(base) = card.base_ref.as_deref() {
+                        if let Ok(wt) = merge::prepare(&project_root, base) {
+                            let _ = std::process::Command::new("git")
+                                .arg("-C")
+                                .arg(&wt.path)
+                                .args(["merge", "--abort"])
+                                .output();
+                            merge::cleanup(&wt);
+                        }
+                    }
+                }
+                if board.transition(&id, CardState::NeedsYou).is_ok() {
+                    freed.push(id);
+                }
+            }
+            Ok(freed)
+        })
+        .unwrap_or_default();
+        for id in freed {
+            inner.leases.remove(&id);
         }
-        self.save(&inner);
     }
 
     /// 消费 inbox 把投递排进**内存里的同一份看板**并落盘，返回每张投递的结果。
@@ -380,10 +389,11 @@ impl BoardService {
     /// 推进循环与查询服务共享同一实例，所以这里必须改内存板而不是另 load 一份
     /// `board.json` 再写回——否则会覆盖掉持有 lease 的卡片状态（`Launching`）。
     pub fn consume_inbox(&self, now: DateTime<Local>) -> Vec<InboxOutcome> {
-        let mut inner = self.lock();
-        let outcomes = inbox::consume(&self.state_dir, &mut inner.board, now);
-        self.save(&inner);
-        outcomes
+        let state_dir = self.state_dir.clone();
+        persist::with_board(&state_dir, |board| {
+            Ok(inbox::consume(&state_dir, board, now))
+        })
+        .unwrap_or_default()
     }
 
     /// 试做下一张合并卡。拿不到每项目合并闸即返回 `None`（本项目已有合并在跑）。
@@ -394,63 +404,64 @@ impl BoardService {
         let Some(_gate) = crate::merge_lock::acquire(&self.state_dir) else {
             return Ok(None);
         };
-        let mut inner = self.lock();
-        let Some(card_id) = inner.board.claim_next_merge(false) else {
+        // 1) 锁内认领，读出 source/base/origin（快）。
+        let claimed = persist::with_board(&self.state_dir, |board| {
+            let Some(card_id) = board.claim_next_merge(false) else {
+                return Ok(None);
+            };
+            let card = board.get(&card_id).cloned().expect("just claimed");
+            Ok(Some((
+                card_id,
+                card.source_ref.clone().unwrap_or_default(),
+                card.base_ref.clone().unwrap_or_default(),
+                card.origin_card.clone(),
+            )))
+        })?;
+        let Some((card_id, source, base, origin)) = claimed else {
             return Ok(None);
         };
-        let card = inner.board.get(&card_id).cloned().expect("just claimed");
-        let source = card.source_ref.clone().unwrap_or_default();
-        let base = card.base_ref.clone().unwrap_or_default();
-        let origin = card.origin_card.clone();
-
-        let finish = |inner: &mut Inner, next: CardState| {
-            let _ = inner.board.transition(&card_id, next);
-            if next == CardState::Done {
-                if let Some(origin) = &origin {
-                    let _ = inner.board.transition(origin, CardState::Done);
+        // 2) git 在锁外：这些调用是分钟级，绝不能占着 board.lock。
+        //
+        // 每个结局都带**自己的**目标状态：前三条是「等用户处理」（分支缺失 /
+        // 目录准备失败 / 目录有未提交改动），只有最后「git 真的跑挂了」才是
+        // `Failed`。这与现状逐字一致（`finish(NeedsYou)` 在前、`next` 只对
+        // `merge::run` 的结果做 Done/NeedsYou/Failed 映射），是行为保持的重构。
+        let (outcome, next) = if !merge::source_branch_exists(&self.project_root, &source) {
+            (
+                MergeOutcome::GitError(format!("source branch '{source}' does not exist")),
+                CardState::NeedsYou,
+            )
+        } else {
+            match merge::prepare(&self.project_root, &base) {
+                Err(detail) => (MergeOutcome::GitError(detail), CardState::NeedsYou),
+                Ok(base_wt) => {
+                    if merge::is_dirty(&base_wt.path) {
+                        let detail = format!("base worktree {} is dirty", base_wt.path.display());
+                        merge::cleanup(&base_wt);
+                        (MergeOutcome::GitError(detail), CardState::NeedsYou)
+                    } else {
+                        let outcome = merge::run(&base_wt.path, &source, &base);
+                        merge::cleanup(&base_wt);
+                        let next = match outcome {
+                            MergeOutcome::Merged => CardState::Done,
+                            MergeOutcome::Conflict => CardState::NeedsYou,
+                            MergeOutcome::GitError(_) => CardState::Failed,
+                        };
+                        (outcome, next)
+                    }
                 }
             }
         };
-
-        if !merge::source_branch_exists(&self.project_root, &source) {
-            let detail = format!("source branch '{source}' does not exist");
-            finish(&mut inner, CardState::NeedsYou);
-            self.save(&inner);
-            return Ok(Some(MergeClaim {
-                card_id: card_id.0,
-                outcome: MergeOutcome::GitError(detail),
-            }));
-        }
-        let base_wt = match merge::prepare(&self.project_root, &base) {
-            Ok(wt) => wt,
-            Err(detail) => {
-                finish(&mut inner, CardState::NeedsYou);
-                self.save(&inner);
-                return Ok(Some(MergeClaim {
-                    card_id: card_id.0,
-                    outcome: MergeOutcome::GitError(detail),
-                }));
+        // 3) 锁内回写终态。
+        persist::with_board(&self.state_dir, |board| {
+            let _ = board.transition(&card_id, next);
+            if next == CardState::Done {
+                if let Some(origin) = &origin {
+                    let _ = board.transition(origin, CardState::Done);
+                }
             }
-        };
-        if merge::is_dirty(&base_wt.path) {
-            let detail = format!("base worktree {} is dirty", base_wt.path.display());
-            merge::cleanup(&base_wt);
-            finish(&mut inner, CardState::NeedsYou);
-            self.save(&inner);
-            return Ok(Some(MergeClaim {
-                card_id: card_id.0,
-                outcome: MergeOutcome::GitError(detail),
-            }));
-        }
-        let outcome = merge::run(&base_wt.path, &source, &base);
-        merge::cleanup(&base_wt);
-        let next = match outcome {
-            MergeOutcome::Merged => CardState::Done,
-            MergeOutcome::Conflict => CardState::NeedsYou,
-            MergeOutcome::GitError(_) => CardState::Failed,
-        };
-        finish(&mut inner, next);
-        self.save(&inner);
+            Ok(())
+        })?;
         Ok(Some(MergeClaim {
             card_id: card_id.0,
             outcome,
@@ -476,17 +487,12 @@ impl BoardService {
 
     /// `merge_request` 的临界区（调用方已持名颏锁）。
     fn merge_request_locked(&self, card_id: &str) -> Result<MergeRequest, String> {
-        let mut inner = self.lock();
         let id = CardId::new(card_id);
-        let Some(card) = inner.board.get(&id).cloned() else {
+        // 1) 锁内读卡片并判准入。
+        let snapshot = persist::read_board(&self.state_dir);
+        let Some(card) = snapshot.get(&id) else {
             return Ok(MergeRequest::Denied(format!("unknown card: {card_id}")));
         };
-        // 准入：等待验收、需要用户决定、以及**正在跑**的卡都可以申请名额。
-        // 正在跑也要接受，是因为合并已改为「原会话里发话触发」——用户发话本身
-        // 会让会话变忙，宿主对账随即把卡翻回 running；若这里仍拒绝 running，
-        // 合并就永远申请不到名额（本 bug）。真正的闸是「用户显式发话」
-        // （只有 CLI/skill 会调 merge_request，宿主从不自动调）、source 分支存在、
-        // 以及每项目一把 merge.lock。
         if !matches!(
             card.state,
             CardState::AwaitingMerge | CardState::NeedsYou | CardState::Running
@@ -496,7 +502,6 @@ impl BoardService {
                 card.state
             )));
         }
-        // refs：合并卡自带；实现卡按 id 推导 source、按项目默认分支取 base。
         let (source, base) = match (card.source_ref.clone(), card.base_ref.clone()) {
             (Some(source), Some(base)) => (source, base),
             _ => {
@@ -511,22 +516,22 @@ impl BoardService {
                 )
             }
         };
+        // 2) git 在锁外。
         if !merge::source_branch_exists(&self.project_root, &source) {
             return Ok(MergeRequest::Denied(format!(
                 "source branch '{source}' does not exist"
             )));
         }
-        // 定位执行合并的 base worktree：base 已被检出就复用它（通常是主检出）——
-        // git 不允许同一分支被两个 worktree 同时检出。仅当 base 无人检出时才新建。
         let workdir = match merge::prepare(&self.project_root, &base) {
             Ok(wt) => wt.path,
             Err(error) => return Ok(MergeRequest::Denied(error)),
         };
-        inner
-            .board
-            .transition(&id, CardState::Merging)
-            .map_err(|error| error.to_string())?;
-        self.save(&inner);
+        // 3) 锁内落 `Merging`。
+        persist::with_board(&self.state_dir, |board| {
+            board
+                .transition(&id, CardState::Merging)
+                .map_err(|error| error.to_string())
+        })?;
         Ok(MergeRequest::Granted {
             workdir,
             source,
@@ -539,34 +544,37 @@ impl BoardService {
     /// `source` 已并入 `base` → `done`；否则退回 `needs_you` 等用户发话。
     /// 卡不在 `Merging`（例如已被别处推进）→ `Cleared`，不落状态。
     pub fn merge_finish(&self, card_id: &str) -> Result<MergeFinish, String> {
-        let mut inner = self.lock();
         let id = CardId::new(card_id);
-        let Some(card) = inner.board.get(&id).cloned() else {
-            return Err(format!("unknown card: {card_id}"));
-        };
-        if card.state != CardState::Merging {
-            return Ok(MergeFinish::Cleared);
+        let project_root = self.project_root.clone();
+        let (next, settle) = persist::with_board(&self.state_dir, |board| {
+            let Some(card) = board.get(&id).cloned() else {
+                return Err(format!("unknown card: {card_id}"));
+            };
+            if card.state != CardState::Merging {
+                return Ok((MergeFinish::Cleared, false));
+            }
+            let (source, base) = match (card.source_ref.clone(), card.base_ref.clone()) {
+                (Some(source), Some(base)) => (source, base),
+                _ => (
+                    format!("kanban/{}", crate::worktree::slugify(&card.id)),
+                    merge::default_branch(&project_root),
+                ),
+            };
+            let merged = merge::source_branch_exists(&project_root, &source)
+                && merge::branch_merged_into(&project_root, &source, &base);
+            let (next, state) = if merged {
+                (MergeFinish::Done, CardState::Done)
+            } else {
+                (MergeFinish::NeedsYou, CardState::NeedsYou)
+            };
+            board
+                .transition(&id, state)
+                .map_err(|error| error.to_string())?;
+            Ok((next, true))
+        })?;
+        if settle {
+            self.lock().leases.remove(&id);
         }
-        let (source, base) = match (card.source_ref.clone(), card.base_ref.clone()) {
-            (Some(source), Some(base)) => (source, base),
-            _ => (
-                format!("kanban/{}", crate::worktree::slugify(&card.id)),
-                merge::default_branch(&self.project_root),
-            ),
-        };
-        let merged = merge::source_branch_exists(&self.project_root, &source)
-            && merge::branch_merged_into(&self.project_root, &source, &base);
-        let (next, state) = if merged {
-            (MergeFinish::Done, CardState::Done)
-        } else {
-            (MergeFinish::NeedsYou, CardState::NeedsYou)
-        };
-        inner
-            .board
-            .transition(&id, state)
-            .map_err(|error| error.to_string())?;
-        inner.leases.remove(&id);
-        self.save(&inner);
         Ok(next)
     }
 
@@ -577,47 +585,40 @@ impl BoardService {
     /// 不占任何并发名额——收敛是簿记，`occupies_slot()` 仍只认 `Running`。
     pub fn reconcile_merged(&self) -> Vec<crate::reconcile::Reconcile> {
         use crate::reconcile::{self, RealGit, Reconcile};
-        let mut inner = self.lock();
         let git = RealGit {
             project_root: &self.project_root,
         };
-        // 1) 在共享借用 `inner.board` 内算候选报告；此步不碰去重集（借用规则）。
-        let candidates = reconcile::plan(&inner.board, &git);
-        // 2) 去重缺分支提示：命中即视为已提示，不再上报。
-        let mut reports: Vec<Reconcile> = Vec::new();
-        for report in candidates {
-            match report {
-                Reconcile::MissingBranch { ref id, .. } => {
-                    if inner.notified_missing_branch.insert(id.clone()) {
-                        reports.push(report);
+        let mut inner = self.lock();
+        persist::with_board(&self.state_dir, |board| {
+            // 1) 算候选报告（git 探测在毫秒级）。
+            let candidates = reconcile::plan(board, &git);
+            // 2) 去重缺分支提示。
+            let mut reports: Vec<Reconcile> = Vec::new();
+            for report in candidates {
+                match report {
+                    Reconcile::MissingBranch { ref id, .. } => {
+                        if inner.notified_missing_branch.insert(id.clone()) {
+                            reports.push(report);
+                        }
                     }
+                    other => reports.push(other),
                 }
-                other => reports.push(other),
             }
-        }
-        // 3) 落地 `done`；报告随之裁剪——只有真正迁移成功的卡才留报告。
-        //    否则 tick 会为一张没动的卡打印「auto-converged to done」。
-        let mut changed = false;
-        reports.retain(|report| match report {
-            Reconcile::Converged { id, .. } => {
-                let moved = inner.board.transition(id, CardState::Done).is_ok();
-                changed = changed || moved;
-                moved
-            }
-            // 缺分支提示不动状态，恒留。
-            Reconcile::MissingBranch { .. } => true,
-        });
-        if changed {
-            self.save(&inner);
-        }
-        reports
+            // 3) 落地 `done`；报告随之裁剪——只有真正迁移成功的卡才留报告。
+            reports.retain(|report| match report {
+                Reconcile::Converged { id, .. } => board.transition(id, CardState::Done).is_ok(),
+                Reconcile::MissingBranch { .. } => true,
+            });
+            Ok(reports)
+        })
+        .unwrap_or_default()
     }
 
     /// 看板快照。控制面读的就是这个形状。
     pub fn list(&self) -> Value {
-        let inner = self.lock();
+        let board = persist::read_board(&self.state_dir);
         json!({
-            "cards": inner.board.visible().map(|card| json!({
+            "cards": board.visible().map(|card| json!({
                 "id": card.id.0,
                 "state": card.state,
                 "spec_path": card.spec_path,
@@ -628,14 +629,30 @@ impl BoardService {
                 "source": card.source_ref,
                 "base": card.base_ref,
                 "origin_card": card.origin_card.as_ref().map(|id| id.0.clone()),
+                "title": card.title,
             })).collect::<Vec<_>>(),
         })
     }
 
     /// 看板上未被占用的合并卡 id（供 dispatch / CLI 共用）。
     pub fn next_free_merge_id(&self, source: &str, base: &str) -> String {
-        let inner = self.lock();
-        inner.board.next_free_merge_id(source, base).0
+        persist::read_board(&self.state_dir)
+            .next_free_merge_id(source, base)
+            .0
+    }
+
+    /// 未被占用的预排队卡 id（供 dispatch / CLI 共用）。
+    ///
+    /// 走 core 的合体分配器：它既看看板、也看 `inbox/` 里尚未消费的投递
+    /// （见 `inbox::next_free_prequeued_id` 的注释）。
+    pub fn next_free_prequeued_id(&self, title: &str, now: DateTime<Local>) -> String {
+        superpowers_kanban_core::inbox::next_free_prequeued_id(
+            &persist::read_board(&self.state_dir),
+            &self.state_dir,
+            title,
+            now,
+        )
+        .0
     }
 
     /// 仅测试用：把某张卡片的 `thread_id` 清成 `None`，模拟旧数据。
@@ -644,27 +661,28 @@ impl BoardService {
     /// `&mut Card` 通道（那会为了测试扩大产品 API）。
     #[cfg(test)]
     pub(crate) fn clear_thread_id_for_test(&self, card_id: &str) {
-        let mut inner = self.lock();
-        let Ok(text) = std::fs::read_to_string(self.board_path()) else {
-            return;
-        };
-        let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
-            return;
-        };
-        if let Some(cards) = value.get_mut("cards").and_then(Value::as_array_mut) {
-            for card in cards {
-                if card.get("id").and_then(Value::as_str) == Some(card_id) {
-                    card["thread_id"] = Value::Null;
+        let state_dir = self.state_dir.clone();
+        let _ = persist::with_board(&state_dir, |board| {
+            let Ok(text) = std::fs::read_to_string(state_dir.join("board.json")) else {
+                return Ok(());
+            };
+            let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+                return Ok(());
+            };
+            if let Some(cards) = value.get_mut("cards").and_then(Value::as_array_mut) {
+                for card in cards {
+                    if card.get("id").and_then(Value::as_str) == Some(card_id) {
+                        card["thread_id"] = Value::Null;
+                    }
                 }
             }
-        }
-        if let Ok(board) = serde_json::from_value::<Board>(value) {
-            inner.board = board;
-        }
-        self.save(&inner);
+            if let Ok(reloaded) = serde_json::from_value::<Board>(value) {
+                *board = reloaded;
+            }
+            Ok(())
+        });
     }
 
-    /// 仅测试用：直接往内存 board 排一张合并卡并落盘，绕开 inbox 通路。
     #[cfg(test)]
     pub(crate) fn enqueue_merge_card_for_test(
         &self,
@@ -673,15 +691,16 @@ impl BoardService {
         base: &str,
         origin: Option<&str>,
     ) {
-        let mut inner = self.lock();
-        inner.board.enqueue_merge(
-            CardId::new(id),
-            source.to_string(),
-            base.to_string(),
-            origin.map(CardId::new),
-            chrono::Local::now(),
-        );
-        self.save(&inner);
+        let _ = persist::with_board(&self.state_dir, |board| {
+            board.enqueue_merge(
+                CardId::new(id),
+                source.to_string(),
+                base.to_string(),
+                origin.map(CardId::new),
+                chrono::Local::now(),
+            );
+            Ok(())
+        });
     }
 }
 
@@ -826,6 +845,71 @@ mod tests {
             service.next_launch(1, at()).unwrap().is_none(),
             "slot taken"
         );
+    }
+
+    /// R1：`next_launch` 建 worktree 失败时，卡片必须**落盘**成 `Failed`。
+    ///
+    /// 这是本任务最容易被重新写坏的一处：`with_board` 的契约是「闭包返回 `Err`
+    /// 即不落盘」，而失败路径必须先落盘 `Failed`，所以闭包内必须成功返回
+    /// （`Ok(None)`）并把错误留到锁外再抛。谁若改回 `return Err(..)`，卡片会停在
+    /// `Launching`、永远不再被认领——下面直读 `board.json` 的断言正是钉这一点。
+    ///
+    /// 触发方式：预先占用分支名 `kanban/<slug>`，`git worktree add -b` 必因分支
+    /// 已存在而失败（`worktree.rs` 在该情形返回 `Err`）。
+    #[test]
+    fn next_launch_persists_failed_when_the_worktree_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // service_with_card 的 state_dir / home 落点（与它保持一致）。
+        let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
+        let leases_dir = dir.path().join("home/.yi-agent/superpowers-kanban/leases");
+        let slug = crate::worktree::slugify(&CardId::new("card-1"));
+        let branch = format!("kanban/{slug}");
+        git_run(&project, &["branch", &branch]);
+
+        // (a) 失败必须报出来（消息里带 "worktree for"）。
+        // 用 match 而不是 `expect_err`：`LaunchClaim` 未实现 `Debug`，为一条测试去
+        // 给产品类型加 derive 是扩大产品 API，这里避开即可。
+        let error = match service.next_launch(1, at()) {
+            Err(error) => error,
+            Ok(_) => panic!("a pre-existing branch must fail the worktree creation"),
+        };
+        assert!(error.contains("worktree for"), "{error}");
+
+        // (b) 经 list 看到 failed。
+        assert_eq!(state_of(&service, "card-1"), "failed");
+
+        // (c) 直读磁盘：`Failed` 必须已经落盘，而不是只活在闭包里的内存副本。
+        // （这正是 `return Err(..)` 会静默破坏的那条：闭包失败 → 改动被丢弃。）
+        let on_disk = persist::read_board(&state_dir);
+        assert_eq!(
+            on_disk.get(&CardId::new("card-1")).unwrap().state,
+            CardState::Failed,
+            "worktree failure must be persisted, not merely staged inside the closure"
+        );
+
+        // (d) 名额已释放：认领失败不能泄漏槽位（`claimed` 为 None → 租约就地 drop）。
+        // macOS 上 flock 的释放是异步的，故有界重试而不是裸断言。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match lease::acquire_in(&leases_dir, 1) {
+                Some(lease) => {
+                    drop(lease);
+                    break;
+                }
+                None => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the slot of a failed worktree creation was never released"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+
+        // 失败后队空、名额空闲：下一轮必须如实返回 None（而不是又抢一次槽）。
+        assert!(service.next_launch(1, at()).unwrap().is_none());
     }
 
     #[test]
@@ -1035,6 +1119,40 @@ mod tests {
             states["card-1"], "done",
             "merge success drives the origin card to done"
         );
+    }
+
+    /// R2：合并**前置**失败（source 分支缺失）必须把卡留在 `NeedsYou`（等人处理），
+    /// 而不是 `Failed`。`Failed` 只留给 `merge::run` 真的跑挂。
+    ///
+    /// 最便宜的确定触发：合并卡的 source 分支根本不存在（不建分支即可）。
+    #[test]
+    fn a_pre_merge_failure_keeps_the_card_needs_you_instead_of_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // 合并卡指向一个不存在的 source；origin 配一张已等合并的实现卡。
+        service.enqueue_merge_card_for_test("m1", "feat/x", "main", Some("card-1"));
+        service.mark_running("card-1", "thread-1").unwrap();
+        service
+            .mark_terminal("card-1", "awaiting_merge", None)
+            .unwrap();
+        // 故意不建 feat/x。
+
+        let claim = service.merge_next().unwrap().expect("a merge claim");
+        assert_eq!(claim.card_id, "m1");
+        assert!(
+            matches!(claim.outcome, MergeOutcome::GitError(_)),
+            "{:?}",
+            claim.outcome
+        );
+        assert_eq!(
+            state_of(&service, "m1"),
+            "needs_you",
+            "a missing source branch is a human-actionable pre-merge failure, not a git crash"
+        );
+        assert_ne!(state_of(&service, "m1"), "failed");
+        // origin 卡不受影响：只有真正合并成功才级联 done。
+        assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
     }
 
     /// 崩溃若发生在「置 Merging」之后、「回写终态」之前，board.json 会留下 `Merging`
@@ -1394,6 +1512,36 @@ mod tests {
                 .merge_finish("nope")
                 .unwrap_err()
                 .contains("unknown card")
+        );
+    }
+
+    #[test]
+    fn a_write_through_with_board_is_visible_to_the_service_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        let id = superpowers_kanban_core::card::CardId::new("c1");
+        board.enqueue(
+            id.clone(),
+            "c.spec.md".into(),
+            "c.plan.md".into(),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+        let service = BoardService::new(state_dir.clone(), dir.path().to_path_buf(), None);
+        // 先建好 service（其内不再缓存看板），再由「外部写者」经 with_board 改盘。
+        crate::persist::with_board(&state_dir, |board| {
+            board
+                .transition(&id, superpowers_kanban_core::card::CardState::Running)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            service.list()["cards"][0]["state"],
+            "running",
+            "service 必须读到外部写入，而不是启动时的内存快照"
         );
     }
 

@@ -149,8 +149,7 @@ iOS 从后台切回前台会重建连接并重放整个握手（`App.tsx:1073` `
 `apply` / `upsertItems` **按 item id 就地替换**，缓存项即被权威项覆盖。
 
 **C. 内容层 · 关键缺口：服务端"没有的 item"必须被清掉。**
-缓存里可能存在服务端已不存在的 item（桌面端 `thread/clear` / `compact` / 或被
-裁剪）。收敛规则：
+缓存里可能存在服务端已不存在的 item（桌面端 `thread/clear` / 或被裁剪）。收敛规则：
 
 - 新增 `Session.dropStale(serverIds: Set<string>)`：遍历 `items`，保留
   (a) `local-*` 本地项、(b) `id ∈ serverIds` 的项，其余删除。
@@ -159,6 +158,12 @@ iOS 从后台切回前台会重建连接并重放整个握手（`App.tsx:1073` `
 - resume 响应返回后调用 `session.dropStale(replayIds)`，一次性清掉缓存里服务端
   没有的 item。
 - 三段式：**先显示缓存 → 服务端回放就地覆盖 → 清掉幽灵项**。最终态等于服务端。
+
+> **修正（2026-10-17）**：`compact` **不是**幽灵来源——它落盘时 `items` 为空、
+> 历史 item 分毫未动（`read_log` 跨行拼接）。真正让 item 消失的只有
+> `thread/clear`。且 `clear` 后回放集为空会让本节的 `replayed.size > 0` 守卫
+> 跳过清理，故收敛判据已改为按世代（`content_epoch`）。见
+> `2026-10-17-client-state-negotiation-design.md` §1.2 与 §6。
 
 **D. 远程 running 会话（`thread/readItems` 补尾部）不做删项。**
 `readItems` 只补尾部、不是全量回放，凭它删项会误删缓存里服务端仍存在但本次

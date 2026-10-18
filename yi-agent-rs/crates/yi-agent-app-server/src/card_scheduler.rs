@@ -4,13 +4,18 @@
 //! `run_once` 是调度器的一轮核心：启动（`board.next_launch`）与对账
 //! （`board_cards` + `plan`）。副作用（起会话、读 thread 状态）经依赖注入，
 //! 故无需 serve / spawn 即可单测。
+//!
+//! `run_once_with_snapshot` is the same round with one difference:
+//! reconciliation reads a card snapshot taken in the background instead of doing
+//! the synchronous `board_cards` IPC on the main loop. `run_once` is the
+//! snapshotless entry point and still reads live.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
-use crate::server::{BoardCard, board_cards, board_query};
+use crate::server::{BoardCard, BoardCardSnapshot, board_cards, board_query};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -172,27 +177,81 @@ fn outcome_name(outcome: &Outcome) -> &'static str {
     }
 }
 
-/// 调度器的一轮核心逻辑(依赖注入,可单测)。
+/// The scheduler's core loop for one round (dependency-injected, unit-testable).
 ///
-/// 只做两件事,顺序不可换:
-/// 1. **启动**:反复 `board.next_launch` 直到 null;每张卡起会话成功后
-///    `board.mark_running` 并登记 `tracked`,失败则 `board.release`。
-/// 2. **对账**:先用注入的 `flags` 刷新 `tracked.idle`,再 `board_cards` +
-///    `plan`,把每个 Reconcile 回写插件。对账**保留 tracked**(不摘除):
-///    - 仍在跑的卡空闲 → `board.mark_terminal(awaiting_merge|needs_you|failed)`,
-///      记为 `AwaitingMerge`并继续跟踪(会话可能追问续跑);
-///    - 已判 `awaiting_merge` 的卡所在会话又忙起来 → `board.mark_running`,
-///      让卡片状态跟着会话走;
-///    - `failed` 摘除跟踪。
+/// It does exactly two things, and the order is not swappable:
+/// 1. **Launch**: keep asking `board.next_launch` until it answers null; for each
+///    card, report `board.mark_running` and register it in `tracked` on success,
+///    `board.release` on failure.
+/// 2. **Reconcile**: first refresh `tracked.idle` through the injected `flags`,
+///    then `board_cards` + `plan`, and write every Reconcile back to the plugin.
+///    Reconciliation **keeps** `tracked` (it does not forget entries):
+///    - a still-running card that went idle → `board.mark_terminal(awaiting_merge|needs_you|failed)`,
+///      recorded as `AwaitingMerge` and still tracked (the session may be asked
+///      a follow-up question and start another turn);
+///    - a card already judged `awaiting_merge` whose session is busy again →
+///      `board.mark_running`, so the card follows its session;
+///    - `failed` drops the tracking entry.
 ///
-/// 所有插件访问都走 `board_query` / `board_cards`(绝不直接读 board.json),
-/// 且**不向任何客户端发帧**——起会话的帧副作用被隔离在 `CardLauncher` 之后。
+/// All plugin access goes through `board_query` / `board_cards` (never a direct
+/// read of board.json), and **no frame is sent to any client** — the frame side
+/// effect of starting a session is isolated behind `CardLauncher`.
+///
+/// Reconciliation reads live, exactly as before the prefetch existed; the
+/// snapshot-aware variant is [`run_once_with_snapshot`] (what `serve`'s tick
+/// calls now).
+///
+/// No production caller is left once the tick took the snapshot: this is the
+/// declared live-read entry point, kept as the counterpart of
+/// [`run_once_with_snapshot`] and exercised by the existing scheduler tests.
+#[allow(dead_code)]
 pub(crate) async fn run_once<L: CardLauncher>(
     project: &Path,
     board_dir: &Path,
     tracked: &mut HashMap<String, TrackedThread>,
     launcher: &mut L,
     flags: &(dyn Fn(&str) -> Option<ThreadFlags> + Send + Sync),
+) {
+    run_once_inner(project, board_dir, tracked, launcher, flags, None).await
+}
+
+/// Same as [`run_once`], except that **reconciliation** reads the given card
+/// snapshot instead of doing the synchronous `board_cards` IPC on the main loop.
+///
+/// A project missing from the snapshot (just registered, or the prefetch thread
+/// has not reached it yet) falls back to a live read — a one-off block, same
+/// meaning as before this change. The handle that owns such a snapshot is
+/// [`BoardCardSnapshot`]; the caller locks it and passes the borrowed map.
+pub(crate) async fn run_once_with_snapshot<L: CardLauncher>(
+    project: &Path,
+    board_dir: &Path,
+    tracked: &mut HashMap<String, TrackedThread>,
+    launcher: &mut L,
+    flags: &(dyn Fn(&str) -> Option<ThreadFlags> + Send + Sync),
+    snapshot: &HashMap<PathBuf, Vec<BoardCard>>,
+) {
+    run_once_inner(project, board_dir, tracked, launcher, flags, Some(snapshot)).await
+}
+
+/// A copy of the prefetch snapshot, taken under one short lock.
+///
+/// The tick clones **once per tick** rather than holding the guard: reconciliation
+/// then runs per board from this owned map, so the snapshot mutex is never held
+/// across an `.await` (and the lock is not re-taken per board either).
+pub(crate) fn read_snapshot(snapshot: &BoardCardSnapshot) -> HashMap<PathBuf, Vec<BoardCard>> {
+    snapshot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+async fn run_once_inner<L: CardLauncher>(
+    project: &Path,
+    board_dir: &Path,
+    tracked: &mut HashMap<String, TrackedThread>,
+    launcher: &mut L,
+    flags: &(dyn Fn(&str) -> Option<ThreadFlags> + Send + Sync),
+    snapshot: Option<&HashMap<PathBuf, Vec<BoardCard>>>,
 ) {
     // 1) 启动:把插件交出的每张卡都起成会话,直到它说「没有了」。
     // 插件/daemon 不可用时本轮无法启动(错误即退出循环),留给下一轮重试。
@@ -280,9 +339,15 @@ pub(crate) async fn run_once<L: CardLauncher>(
             entry.needs_you = flags.needs_you;
         }
     }
-    let cards = match board_cards(project, board_dir) {
-        Ok(cards) => cards,
-        Err(_) => return,
+    let canonical = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
+    let cards = match snapshot.and_then(|map| map.get(&canonical)) {
+        Some(cards) => cards.clone(),
+        // No snapshot entry for this project: fall back to a live read (a
+        // one-off block, same meaning as before this change).
+        None => match board_cards(project, board_dir) {
+            Ok(cards) => cards,
+            Err(_) => return,
+        },
     };
     for action in plan(&cards, tracked) {
         let (card_id, thread_id, outcome) = match action {
@@ -612,6 +677,17 @@ mod scheduler_tests {
         }
     }
 
+    /// A launcher that must **never** be called: when `board.next_launch` answers
+    /// null there is no card to start a session for, so reaching `launch` at all
+    /// means the implementation went off the rails.
+    struct NoopLauncher;
+
+    impl CardLauncher for NoopLauncher {
+        async fn launch(&mut self, _request: &LaunchRequest) -> anyhow::Result<String> {
+            unreachable!("no card is handed out, so nothing may be launched")
+        }
+    }
+
     fn thread_flags<'a>(
         idle: impl Fn(&str) -> bool + Send + Sync + 'a,
     ) -> impl Fn(&str) -> Option<ThreadFlags> + Send + Sync + 'a {
@@ -799,5 +875,70 @@ mod scheduler_tests {
                 .unwrap()
                 .contains("build failed")
         );
+    }
+
+    /// When the snapshot has an entry, reconciliation must **not** go through
+    /// `board_cards` (that synchronous IPC). Evidence: the fake board answers
+    /// only `next_launch` (returning null), so if the implementation still
+    /// queried `board_cards`, a `list` call would show up in `calls`.
+    #[tokio::test]
+    async fn reconciliation_uses_the_snapshot_when_present() {
+        let board = FakeBoard::new(vec![], json!({"cards": []}));
+        let mut tracked = HashMap::new();
+        let mut launcher = NoopLauncher;
+
+        let mut snapshot: HashMap<PathBuf, Vec<BoardCard>> = HashMap::new();
+        snapshot.insert(std::fs::canonicalize(&board.project).unwrap(), Vec::new());
+
+        run_once_with_snapshot(
+            &board.project,
+            &board.board_dir,
+            &mut tracked,
+            &mut launcher,
+            &|_| None,
+            &snapshot,
+        )
+        .await;
+
+        let calls = board.calls.lock().unwrap().clone();
+        assert!(
+            !calls.iter().any(|call| call["method"] == "list"),
+            "reconciliation must read the snapshot, not issue a live list: {calls:?}"
+        );
+    }
+
+    /// When the snapshot has no entry for the project (just registered, or the
+    /// prefetch thread has not reached it yet), reconciliation must fall back to
+    /// a live read — otherwise a freshly registered board would be skipped
+    /// forever and none of its cards would ever be reconciled.
+    #[tokio::test]
+    async fn reconciliation_falls_back_to_a_live_read_without_a_snapshot_entry() {
+        let board = FakeBoard::new(
+            Vec::new(),
+            json!({"cards": [
+                {"id": "c1", "state": "running", "thread_id": "thread-1",
+                 "spec_path": "s", "plan_path": "p"}
+            ]}),
+        );
+        let mut tracked = HashMap::new();
+        tracked.insert(
+            "c1".to_string(),
+            tt("thread-1", TrackState::Running, false, false),
+        );
+        let mut launcher = NoopLauncher;
+
+        run_once_with_snapshot(
+            &board.project,
+            &board.board_dir,
+            &mut tracked,
+            &mut launcher,
+            &thread_flags(|_| true),
+            &HashMap::new(),
+        )
+        .await;
+
+        let terminal = board.calls_to("board.mark_terminal");
+        assert_eq!(terminal.len(), 1, "{:?}", board.calls.lock().unwrap());
+        assert_eq!(terminal[0]["params"]["outcome"], "awaiting_merge");
     }
 }

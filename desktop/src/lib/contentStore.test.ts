@@ -73,6 +73,32 @@ describe("selectEvictions", () => {
 });
 
 describe("MemoryContentStore", () => {
+  it("round-trips contentEpoch and leaves a legacy entry undefined", async () => {
+    const store = new MemoryContentStore();
+    await store.write({
+      threadId: "t1",
+      savedAt: 1,
+      lastServerItemId: "i1",
+      contentEpoch: 4,
+      items: [],
+      trimmed: false,
+      bytes: 1,
+    });
+    expect((await store.read("t1"))?.contentEpoch).toBe(4);
+
+    // 老条目（本字段出现前写入）没有该字段：读回 undefined，由调用方解释为
+    // "未知" ⇒ 保守全量（spec §4.3）。
+    await store.write({
+      threadId: "t2",
+      savedAt: 1,
+      lastServerItemId: null,
+      items: [],
+      trimmed: false,
+      bytes: 1,
+    });
+    expect((await store.read("t2"))?.contentEpoch).toBeUndefined();
+  });
+
   it("round-trips an entry, deletes, and lists keys", async () => {
     const store = new MemoryContentStore();
     const entry = {

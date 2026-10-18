@@ -28,25 +28,30 @@ export function kanbanItemFor(workspace: string, boards: string[]): boolean {
 /**
  * 侧栏条目上的摘要。
  *
- * 分批数，且**只数还没落地的卡**：排队（含刚认领）、运行中（含正在合并的一轮）、
- * 待合并（等用户发话）、待处理（要用户回话）。合并卡曾整类落在计数之外——五张卡
- * 卡住时摘要仍显示「0 排队 · 0 运行中」，侧栏看起来什么都没发生。完成/失败/取消
- * 是历史，不进摘要。没有待办时明说「无待办」，而不是显示一排 0。
+ * 分批数，且**只数还没落地的卡**：预排队（最左列，等前面几轮跑完）、排队（含刚
+ * 认领）、运行中（含正在合并的一轮）、待合并（等用户发话）、待处理（要用户回话）。
+ * 合并卡曾整类落在计数之外——五张卡卡住时摘要仍显示「0 排队 · 0 运行中」，侧栏看
+ * 起来什么都没发生；预排队卡也曾如此，于是一块只放预排队卡的看板在侧栏显示「无待
+ * 办」。完成/失败/取消是历史，不进摘要。没有待办时明说「无待办」，而不是显示一排 0。
  */
 export function summarize(cards: { state: string }[]): string {
   if (cards.length === 0) return "空";
+  let preQueued = 0;
   let queued = 0;
   let active = 0;
   let awaitingMerge = 0;
   let needsYou = 0;
   for (const card of cards) {
     const state = card.state.toLowerCase();
-    if (state === "queued" || state === "launching") queued += 1;
+    if (state === "pre_queued") preQueued += 1;
+    else if (state === "queued" || state === "launching") queued += 1;
     else if (state === "running" || state === "merging") active += 1;
     else if (state === "awaiting_merge") awaitingMerge += 1;
     else if (state === "needs_you") needsYou += 1;
   }
   const parts: string[] = [];
+  // 预排队排最前，与看板最左列（PRE-QUEUED）的顺序一致。
+  if (preQueued > 0) parts.push(`${preQueued} 预排队`);
   if (queued > 0) parts.push(`${queued} 排队`);
   if (active > 0) parts.push(`${active} 运行中`);
   if (awaitingMerge > 0) parts.push(`${awaitingMerge} 待合并`);

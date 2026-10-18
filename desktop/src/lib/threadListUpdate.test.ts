@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyTitleChange } from "./threadListUpdate";
+import { applyTagChange, applyTitleChange } from "./threadListUpdate";
 import type { ThreadSummary, WorkspaceGroup } from "./protocol";
 
 function thread(id: string, title: string | null, extra: Partial<ThreadSummary> = {}): ThreadSummary {
@@ -42,5 +42,41 @@ describe("applyTitleChange", () => {
     const out = applyTitleChange(groups, pinned, "nope", "x");
     expect(out.groups).toEqual(groups);
     expect(out.pinned).toBe(pinned);
+  });
+});
+describe("applyTagChange", () => {
+  const groups: WorkspaceGroup[] = [
+    {
+      workspace: "/w",
+      exists: true,
+      threads: [
+        { thread_id: "t1", cwd: "/w", model: "m", created_at: 0, updated_at: 0, title: "one" },
+        { thread_id: "t2", cwd: "/w", model: "m", created_at: 0, updated_at: 0, title: "two" },
+      ],
+    },
+  ];
+
+  it("writes the tag into the matching thread only", () => {
+    const next = applyTagChange(groups, [], "t1", "red");
+    expect(next.groups[0].threads[0].tag).toBe("red");
+    expect(next.groups[0].threads[1].tag).toBeUndefined();
+  });
+
+  it("clears the tag with null", () => {
+    const tagged = applyTagChange(groups, [], "t1", "red");
+    const cleared = applyTagChange(tagged.groups, [], "t1", null);
+    expect(cleared.groups[0].threads[0].tag).toBeNull();
+  });
+
+  it("updates both the group copy and the pinned copy", () => {
+    const pinned = [{ ...groups[0].threads[0], pinned: true }];
+    const next = applyTagChange(groups, pinned, "t1", "blue");
+    expect(next.groups[0].threads[0].tag).toBe("blue");
+    expect(next.pinned[0].tag).toBe("blue");
+  });
+
+  it("is a no-op for an unknown thread", () => {
+    const next = applyTagChange(groups, [], "nope", "red");
+    expect(next.groups).toBe(groups);
   });
 });

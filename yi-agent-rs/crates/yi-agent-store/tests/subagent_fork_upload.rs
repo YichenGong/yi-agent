@@ -129,7 +129,11 @@ async fn attached_root(fork_max_bytes: Option<u64>) -> ForkFixture {
         None => coordinator,
     };
     let attached = coordinator
-        .attach_application_root("fork-upload-fixture", &directory.path().join("project"))
+        .attach_application_root(
+            "fork-upload-fixture",
+            &directory.path().join("project"),
+            &[],
+        )
         .await
         .unwrap();
     ForkFixture {

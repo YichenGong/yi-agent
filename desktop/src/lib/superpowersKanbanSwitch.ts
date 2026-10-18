@@ -1,3 +1,9 @@
+import { KANBAN_PLUGIN } from "./pluginSettings";
+import type { RpcCall } from "./rpcCall";
+import { RPC } from "./routes";
+
+export { KANBAN_PLUGIN };
+
 /** Which layer supplied the effective switch value. */
 export type SwitchSource = "project" | "global" | "default";
 
@@ -32,14 +38,7 @@ export interface BoardCardDto {
   thread_id?: string | null;
 }
 
-export type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
-
-/**
- * The plugin the kanban panel talks to. The host only forwards the query; no
- * board meaning lives above this line, so the plugin can be installed or
- * removed without the app learning a new RPC.
- */
-export const KANBAN_PLUGIN = "superpowers-kanban";
+export type BoardRpc = RpcCall;
 
 /**
  * One query through the generic channel, tagged with the plugin it is meant for
@@ -56,7 +55,7 @@ async function queryPlugin<T>(
   method: string,
   params: unknown,
 ): Promise<T> {
-  return rpc<T>("plugin/query", { plugin: KANBAN_PLUGIN, project, method, params });
+  return rpc<T>(RPC.pluginQuery, { plugin: KANBAN_PLUGIN, project, method, params });
 }
 
 /**
@@ -125,6 +124,34 @@ export async function enqueueBoardCard(
   });
 }
 
+/** 经插件给某项目投递一张预排队卡（只有标题，没有 spec/plan）。 */
+export async function enqueuePrequeuedCard(
+  rpc: BoardRpc,
+  project: string,
+  title: string,
+): Promise<void> {
+  // 与 UI 的处理同口径：空白标题就地拒绝，不发这趟 RPC——插件的
+  // `enqueue_prequeued` 本来也会拒，调用方不该指望 UI 先 trim 好。
+  const trimmed = title.trim();
+  if (trimmed === "") throw new Error("a prequeued card needs a non-empty title");
+  await queryPlugin(rpc, project, "enqueue_prequeued", { title: trimmed });
+}
+
+/** 经插件提升一张预排队卡：补 spec/plan，插件下个 tick 翻成排队卡。 */
+export async function promoteBoardCard(
+  rpc: BoardRpc,
+  project: string,
+  cardId: string,
+  specPath: string,
+  planPath: string,
+): Promise<void> {
+  await queryPlugin(rpc, project, "promote", {
+    id: cardId,
+    spec_path: specPath,
+    plan_path: planPath,
+  });
+}
+
 /**
  * 归一化 `ui/settings/read` 里的 `board_watchman_enabled`。非布尔一律当开：
  * 老配置文件里没有这个键时，用户此前的行为是「一直在跑」，不能因为读不到就
@@ -148,7 +175,7 @@ export function parseBoardWatchman(value: unknown): boolean {
  * 多发这一趟。
  */
 export async function readBoardWatchman(rpc: BoardRpc): Promise<boolean> {
-  const settings = await rpc<{ board_watchman_enabled?: unknown }>("ui/settings/read", {});
+  const settings = await rpc<{ board_watchman_enabled?: unknown }>(RPC.uiSettingsRead, {});
   return parseBoardWatchman(settings.board_watchman_enabled);
 }
 
@@ -160,7 +187,7 @@ export async function writeBoardWatchman(
   rpc: BoardRpc,
   enabled: boolean,
 ): Promise<{ warning?: string | null }> {
-  return rpc<{ warning?: string | null }>("ui/settings/write", {
+  return rpc<{ warning?: string | null }>(RPC.uiSettingsWrite, {
     board_watchman_enabled: enabled,
   });
 }

@@ -40,6 +40,7 @@ use crate::repository::{
     WatchdogTerminal,
 };
 use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
+use crate::terminal::text_completion_report;
 
 /// The largest fork payload a daemon accepts when `YI_AGENT_FORK_MAX_BYTES` is
 /// absent or unparsable.
@@ -448,6 +449,7 @@ impl RuntimeCoordinator {
                 // is moved into the call.
                 let model = repository.task_model(&task.task_id)?;
                 let inherited_sandbox = repository.task_inherited_sandbox(&task.task_id)?;
+                let extra_roots = repository.task_extra_roots(&task.task_id)?;
                 let task_id = task.task_id.clone();
                 let mut supervisor = supervisor.try_lock().map_err(|_| {
                     RuntimeCoordinatorError::Supervisor("recovery hydration is busy".into())
@@ -469,6 +471,10 @@ impl RuntimeCoordinator {
                 // stale entry for the id, so the recovered value must win.
                 if let Some(inherited_sandbox) = inherited_sandbox {
                     supervisor.set_inherited_sandbox(&task_id, inherited_sandbox);
+                }
+                if !extra_roots.is_empty() {
+                    supervisor
+                        .set_extra_roots(&task_id, extra_roots.iter().map(PathBuf::from).collect());
                 }
             } else {
                 // A recovered root must keep the mode persisted at spawn time:
@@ -498,6 +504,11 @@ impl RuntimeCoordinator {
                 supervisor.set_workspace_mode(&root_id, root_mode);
                 if let Some(inherited_sandbox) = repository.task_inherited_sandbox(&root_id)? {
                     supervisor.set_inherited_sandbox(&root_id, inherited_sandbox);
+                }
+                let root_extra = repository.task_extra_roots(&root_id)?;
+                if !root_extra.is_empty() {
+                    supervisor
+                        .set_extra_roots(&root_id, root_extra.iter().map(PathBuf::from).collect());
                 }
                 supervisors.insert(task.session_id, Arc::new(AsyncMutex::new(supervisor)));
             }
@@ -686,6 +697,7 @@ impl RuntimeCoordinator {
         &self,
         idempotency_key: &str,
         requested_workspace: &Path,
+        extra_roots: &[String],
     ) -> Result<AttachedApplicationRoot, RuntimeCoordinatorError> {
         let _attach_guard = self
             .application_root_attach_lock
@@ -742,6 +754,26 @@ impl RuntimeCoordinator {
                 .expect("runtime application root workspace service mutex poisoned")
                 .insert(existing.root_session_id.clone(), service);
             self.ensure_application_root_supervisor(&existing)?;
+            // The roots are a session property recorded at creation; a
+            // reconnect must read them back off the durable row rather than
+            // trust the request (which may carry none), or a root rehydrated by
+            // a replacement daemon would start its worker single-rooted. The
+            // create branch below keeps the write: an attach never rewrites a
+            // root set, it only restores what is already recorded.
+            let recorded_roots = self
+                .repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .task_extra_roots(&existing.root_task_id)?;
+            if !recorded_roots.is_empty() {
+                self.supervisor(&existing.root_session_id)?
+                    .lock()
+                    .await
+                    .set_extra_roots(
+                        &existing.root_task_id,
+                        recorded_roots.iter().map(PathBuf::from).collect(),
+                    );
+            }
             let capability = existing
                 .capability_secret
                 .clone()
@@ -797,6 +829,33 @@ impl RuntimeCoordinator {
                 &capability,
                 &workspace.repository_root.to_string_lossy(),
             )?;
+        // The linked roots are a property of the session, snapshotted here at
+        // creation. The existing/reattach branch above returns before this
+        // point precisely so a later attach cannot rewrite them. Guarded on an
+        // empty set like every other durable seeding site: "no linked roots"
+        // and "never wrote the column" are the same state, so an unlinked attach
+        // must not issue `UPDATE tasks SET extra_roots = NULL` — the same rule
+        // `spawn_child_with_objective` follows (see
+        // `a_no_roots_spawn_issues_no_extra_roots_update`).
+        if !extra_roots.is_empty() {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .set_task_extra_roots(&root_task_id, extra_roots)?;
+        }
+        // Left unguarded on purpose, unlike the SQL write above: `set_extra_roots`
+        // with an empty set is exactly the "this root has no linked roots"
+        // normalization (it removes the entry, a no-op for the freshly built
+        // supervisor this branch always holds), so it issues no statement, costs
+        // no branch, and keeps the supervisor's view explicitly equal to the
+        // durable one. Seeded beside the row so the two agree from the first
+        // instant: `start_worker` reads the roots off the supervisor, and a root
+        // whose row said one thing while its worker was started with another
+        // would be the one inconsistency nothing detects.
+        supervisor.set_extra_roots(
+            &root_task_id,
+            extra_roots.iter().map(PathBuf::from).collect(),
+        );
         Ok(AttachedApplicationRoot {
             session_id,
             root_task_id,
@@ -866,6 +925,21 @@ impl RuntimeCoordinator {
                 let mut supervisor =
                     AgentSupervisor::from_hydrated_review_root(hydrated, objective)
                         .with_max_direct_children(self.max_direct_children);
+                // A ROOT hydrated here seeds NEITHER inheritance field: no
+                // `set_inherited_sandbox` and no `set_extra_roots`. That is
+                // deliberate, not an oversight: this root was created by
+                // `attach_application_root`, whose create branch writes both the
+                // row and the supervisor, and whose reattach branch reads the
+                // roots back off the durable row. The read sites (`WorkerStart`
+                // assembly) already fall back to "no roots" / "no sandbox", so a
+                // root reaching here behaves exactly as an un-inherited session
+                // does. The CHILD arm below is NOT symmetric with this one: it
+                // seeds BOTH fields from the child's own row, because a child
+                // rehydrated into a live daemon (supervisor reclaimed, daemon not
+                // restarted, so `open()`'s recovery hydration never saw it) has no
+                // other site that could restore them. Keep the two fields in
+                // step: whichever arm seeds one must seed the other in the same
+                // edit.
                 supervisor.set_workspace_mode(&task_id, root_mode);
                 hydrate_completion_report(&mut supervisor, task_id.clone(), completion_report)?;
                 hydrated_supervisor = Some(supervisor);
@@ -888,6 +962,32 @@ impl RuntimeCoordinator {
                 supervisor
                     .insert_hydrated_review_child(hydrated, objective, mode, model)
                     .map_err(RuntimeCoordinatorError::Supervisor)?;
+                // A child rehydrated here is one whose supervisor was reclaimed
+                // while the daemon stayed up, so `open()`'s recovery hydration
+                // never saw it: nothing else will restore what its row recorded,
+                // and `start_worker` reads both values off the supervisor when it
+                // assembles `WorkerStart`. Seeding after the insert is required —
+                // `insert_hydrated_review_child` clears any stale entry for the id,
+                // so the durable value must win. Both fields are seeded together
+                // (see the note in the root arm above): a child that kept its
+                // inherited sandbox but lost its roots would be exactly the silent
+                // capability narrowing this feature exists to prevent.
+                let roots = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .task_extra_roots(&task_id)?;
+                if !roots.is_empty() {
+                    supervisor.set_extra_roots(&task_id, roots.iter().map(PathBuf::from).collect());
+                }
+                let inherited_sandbox = self
+                    .repository
+                    .lock()
+                    .expect("runtime repository mutex poisoned")
+                    .task_inherited_sandbox(&task_id)?;
+                if let Some(inherited_sandbox) = inherited_sandbox {
+                    supervisor.set_inherited_sandbox(&task_id, inherited_sandbox);
+                }
                 hydrate_completion_report(supervisor, task_id.clone(), completion_report)?;
             }
             if let Some(delivery) = delivered {
@@ -1435,6 +1535,24 @@ impl RuntimeCoordinator {
             Some(token) => Some(self.take_fork_messages(token, session, parent)?),
             None => None,
         };
+        // The parent's root set, read before the child row is written so the
+        // inherited set can be handed to the seeding sites below as one value.
+        // The value is NOT atomic with the row: `create_child_task_with_attempt_and_objective`
+        // has no `extra_roots` parameter, so the row is INSERTed first and the set
+        // is written by the guarded UPDATE further down. A crash in that window
+        // leaves the child row at `extra_roots = NULL`: the child (and every task
+        // later spawned beneath it, since each spawn reads its own parent's row)
+        // then runs single-rooted. That asymmetry with `inherited_sandbox` (which
+        // rides in the same INSERT) is deliberate here: threading the column
+        // through the INSERT would touch every call site for a window that needs a
+        // crash between two adjacent statements.
+        let parent_extra = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_extra_roots(parent)
+            .unwrap_or_default();
+        let child_extra = resolve_extra_roots(None, Some(&parent_extra));
         let (child, depth, attempt) = {
             let mut supervisor = supervisor.lock().await;
             let child = supervisor.spawn_with_objective(
@@ -1462,6 +1580,13 @@ impl RuntimeCoordinator {
             if let Some(inherited_sandbox) = inherited_sandbox {
                 supervisor.set_inherited_sandbox(&child, inherited_sandbox);
             }
+            // Guarded like every other seeding site: an empty set means the same
+            // as "never set" (`set_extra_roots` would remove the entry anyway),
+            // so skipping the call keeps a no-roots spawn free of any new
+            // in-memory write and of the redundant statement below.
+            if !child_extra.is_empty() {
+                supervisor.set_extra_roots(&child, child_extra.iter().map(PathBuf::from).collect());
+            }
             if let Some(fork) = fork_messages {
                 supervisor.set_fork_messages(&child, fork);
             }
@@ -1484,6 +1609,17 @@ impl RuntimeCoordinator {
                 thread_id.as_deref(),
                 inherited_sandbox,
             )?;
+        // Persisted beside the row above: an inherited set that lived only in
+        // memory would be lost on restart while the row survived, and the two
+        // would silently disagree. Skipped when empty so a no-roots spawn
+        // issues no statement beyond the pre-change ones (the row's column is
+        // already NULL by default) — the baseline stays literally untouched.
+        if !child_extra.is_empty() {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .set_task_extra_roots(&child, &child_extra)?;
+        }
         // Auto-registration: the parent prepares the directory (`git worktree
         // add`) and hands over its path; the daemon only records that position.
         // A bad path fails the spawn rather than deferring to worker start, so
@@ -1771,6 +1907,14 @@ impl RuntimeCoordinator {
         if let Some(workspace) = workspace_assignment.clone() {
             recovery_request = recovery_request.with_workspace(workspace);
         }
+        // The probe used to carry no root set. Populate it from the supervisor so
+        // this request is structurally consistent with the one the worker
+        // actually starts from (`AgentSupervisor`'s assembly): the factory's
+        // `recovery_context_for` sees the same view of the task, and a future
+        // `WorkerStart` field has a defined answer here instead of silently
+        // defaulting.
+        recovery_request =
+            recovery_request.with_extra_roots(supervisor.extra_roots(task).unwrap_or_default());
         let mut recovery_context = self.factory.recovery_context_for(&recovery_request);
         if workspace_assignment.is_none()
             && let Some(workspace) = supervisor
@@ -3112,6 +3256,17 @@ struct ProviderTurnAdmissions {
     notify: Arc<Notify>,
 }
 
+/// 解析一次 spawn 实际使用的关联根：显式值优先，否则继承父任务。
+///
+/// 逐层转发会随层级增加漏点，所以子任务默认从父任务继承——孙任务因此自动获得
+/// 同一根集，无需 worker 自己再传一遍。
+fn resolve_extra_roots(explicit: Option<&[String]>, parent: Option<&[String]>) -> Vec<String> {
+    match explicit {
+        Some(roots) => roots.to_vec(),
+        None => parent.map(<[String]>::to_vec).unwrap_or_default(),
+    }
+}
+
 fn worker_failure_terminal_json(message: &str) -> Result<String, RuntimeCoordinatorError> {
     const MAX_ERROR_BYTES: usize = 4 * 1024;
     let error = truncate_utf8(message, MAX_ERROR_BYTES);
@@ -3156,14 +3311,6 @@ fn budget_exhausted_terminal_json(report: Option<&str>) -> Result<String, Runtim
     }))
     .map_err(RepositoryError::from)
     .map_err(RuntimeCoordinatorError::from)
-}
-
-fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
-    let payload = serde_json::from_str::<serde_json::Value>(terminal_json?).ok()?;
-    (payload.get("kind").and_then(serde_json::Value::as_str) == Some("text_completion"))
-        .then(|| payload.get("report").and_then(serde_json::Value::as_str))
-        .flatten()
-        .map(str::to_owned)
 }
 
 fn hydrate_completion_report(
@@ -4027,6 +4174,27 @@ mod provider_turn_admission_tests {
                 .has_active_lease_prefix(&task, "llm:")
                 .unwrap()
         );
+    }
+}
+
+#[cfg(test)]
+mod extra_roots_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn child_inherits_parent_extra_roots_when_not_given_explicitly() {
+        // 直接测"解析函数"而非整条 daemon 链路（后者由 app-server 的端到端测试覆盖）。
+        let parent_roots = vec!["/tmp/linked".to_string()];
+        let resolved = resolve_extra_roots(None, Some(&parent_roots));
+        assert_eq!(resolved, parent_roots);
+        // 显式给值则用显式值（未来逐 spawn 覆盖的接缝）。
+        let explicit = vec!["/tmp/other".to_string()];
+        assert_eq!(
+            resolve_extra_roots(Some(&explicit), Some(&parent_roots)),
+            explicit
+        );
+        // 父子都没有 → 空。
+        assert!(resolve_extra_roots(None, None).is_empty());
     }
 }
 

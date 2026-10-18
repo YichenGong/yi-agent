@@ -2,6 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
 import { useIsMobile } from "./lib/useIsMobile";
+import { useDiffState } from "./hooks/useDiffState";
+import { useProcessState } from "./hooks/useProcessState";
+import { useBoardState } from "./hooks/useBoardState";
+import { useSessionState } from "./hooks/useSessionState";
+import { useSettingsState } from "./hooks/useSettingsState";
 import { RpcClient, type RequestFn } from "./lib/rpc";
 import { defaultRedeem } from "./pairing";
 import { ThreadStore } from "./lib/threadStore";
@@ -18,22 +23,15 @@ import { ThreadDetailPanel } from "./components/ThreadDetailPanel";
 import { TitleBar } from "./components/TitleBar";
 import type {
   AgentCancelPreviewResult,
-  AgentChildrenListResult,
-  AgentTraceSnapshotResult,
   Item,
   ThreadStatus,
   ThreadSummary,
   TurnStatus,
-  ThreadDiffResult,
-  DiffTextResult,
-  Workspace,
   WorkspaceGroup,
-  ProcessInfo,
-  ProcessListResult,
-  ProcessReadResult,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
-import { applyTitleChange } from "./lib/threadListUpdate";
+import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
+import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
 import {
@@ -52,25 +50,16 @@ import { pickImageFiles } from "./lib/imagePicker";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
 import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSettings";
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
-import { normalizeCard, type BoardCard } from "./lib/superpowersKanbanState";
 import {
-  type SwitchSource,
   enqueueBoardCard,
-  fetchBoard,
+  enqueuePrequeuedCard,
   parseBoardWatchman,
-  pluginIsUnavailable,
-  readBoardSwitch,
+  promoteBoardCard,
   setBoardSwitch,
   writeBoardWatchman,
 } from "./lib/superpowersKanbanSwitch";
-import {
-  type BoardErrorKind,
-  BOARD_SUMMARY_UNREADABLE,
-  boardErrorKind,
-  summarize,
-} from "./lib/boardIndex";
-import { createBoard, listBoards, removeBoard } from "./lib/superpowersKanbanBoards";
-import { makeBoardTick } from "./lib/boardRefresh";
+import { type BoardErrorKind, boardErrorKind } from "./lib/boardIndex";
+import { createBoard, removeBoard } from "./lib/superpowersKanbanBoards";
 import { pluginProjectPaths } from "./lib/pluginSettings";
 import { threadStartParams } from "./lib/threadStart";
 import {
@@ -80,13 +69,14 @@ import {
 } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
 import { estimateCost, formatCost } from "./lib/pricing";
-import { applyTheme, parseTheme, readCachedTheme, type Theme } from "./lib/theme";
+import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
 import { OnboardingWizard, type OnboardingOutcome } from "./components/OnboardingWizard";
 import { onboardingStatus } from "./lib/onboarding";
 import { readListCache, writeListCache } from "./lib/sessionCache";
-import { createContentStore, persistContent, type AsyncContentStore } from "./lib/contentStore";
+import { createContentStore, persistContent, type AsyncContentStore, type ContentEntry } from "./lib/contentStore";
+import { parseSyncPlan, resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 
 /**
  * 看板失败的四种说法。
@@ -167,6 +157,18 @@ export default function App() {
   // the latest one.
   const recoveryRef = useRef<((raw: RequestFn) => Promise<void>) | null>(null);
   const inited = useRef(false);
+  /**
+   * 取当前的 RPC 客户端；未连接即 null。
+   *
+   * 供附属视图的读取（diff）当接缝：拿不到客户端就静默返回——附属视图断线读不到，
+   * 不该在对话里留一条红字，也不该漏出一个没人 catch 的 rejection（故不学
+   * `pluginCall` 那几个接缝的 `Promise.reject`）。只闭合 ref，空依赖即稳定。
+   */
+  const rpc = useCallback(() => clientRef.current, []);
+  // 首屏是否为「缺组长的项目目录」补建过组长。组长是项目级固定入口，一个进程
+  // 只补一次即可：服务端创建幂等，且补过之后该目录的分组里就有组长条目了。
+  // 用 ref 而非 state：它不参与渲染，且需要跨多次握手/重连保持「已补过」。
+  const leadEnsured = useRef(false);
   // Threads whose history has already been replayed (resumed) this session;
   // switching back to them must not replay again.
   const warm = useRef(new Set<string>());
@@ -178,18 +180,14 @@ export default function App() {
   // window bounds how many histories stream live; the rest stay cold and are
   // caught up on demand with `thread/readItems`.
   const subWindow = useRef(new SubscriptionWindow());
+  // 本连接里已为「plan 判 none 的缓存会话」补过尾部只读 readItems 的会话。按**连接**
+  // 记账（`connect()` 建新客户端时清空）：这样任何一次重连——sidecar 重启、或 socket
+  // 掉了但进程还在（经中继的瞬断、切回前台）——都会为这些会话重补一次；而同一连接内
+  // 切回它们不再重复发请求。若改用 `subWindow`（订阅窗口）判定则漏掉后一种重连
+  // （窗口只在 `exited` 时清），正是「warm idle 会话永远停在缓存尾部」的残留缺口。
+  const toppedUp = useRef(new Set<string>());
   // Approvals the user has dismissed from the banner; keyed by approval id.
   const dismissedApprovals = useRef(new Set<string>());
-  const [currentId, setCurrentId] = useState<string | null>(null);
-  // 首启引导：`needed && !dismissed` 时用向导盖住主界面。读失败一律按「不需要」
-  // 处理，绝不因为一个读失败挡住主界面（见 handshake）。
-  const [onboarding, setOnboarding] = useState<{ needed: boolean; reasons: string[] }>({
-    needed: false,
-    reasons: [],
-  });
-  // 部分成功提示（spec §4.7）：`.env` 写成功、但清单未收边时在主界面顶部留一条
-  // 可关闭横幅。`null` = 无提示；关闭即清空。完整成功不设此项。
-  const [onboardingNotice, setOnboardingNotice] = useState<string | null>(null);
   // 每个会话待发送的附件。按会话隔离，与草稿同理：切走时留在原会话、切回时
   // 原样出现，绝不会把 A 的附件发到 B 上。
   const [pending, setPending] = useState<Record<string, PendingAttachment[]>>({});
@@ -198,11 +196,8 @@ export default function App() {
   // `thread/listAll` 回来之前就能画出来。桌面端不读（`null`），初值保持 []，
   // 行为与从前逐字节一致。
   const initialListCache = useRef(isRemoteClient() ? readListCache() : null).current;
-  const [groups, setGroups] = useState<WorkspaceGroup[]>(initialListCache?.groups ?? []);
-  // 服务端排好序的全部置顶会话（从顶到底）。置顶项仍留在各自的分组内，侧栏
-  // 渲染分组时需自行过滤，否则会重复渲染。
-  const [pinned, setPinned] = useState<ThreadSummary[]>(initialListCache?.pinned ?? []);
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  /** 标签显示名（6 键齐全）。默认名来自 threadTags.ts，服务端只给覆盖项。 */
+  const [tagNames, setTagNames] = useState<Record<TagId, string>>(DEFAULT_TAG_NAMES);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
@@ -217,6 +212,10 @@ export default function App() {
   const persistTimers = useRef(new Map<string, number>());
   // 内容来自缓存、尚未被服务端覆盖的会话 → 其 `savedAt`（供离线提示）。
   const cachedAt = useRef(new Map<string, number>());
+  /** 每个会话的缓存元数据（epoch / 游标 / 是否被裁剪），用于组装 hints 与裁决。 */
+  const cacheMetaRef = useRef(new Map<string, ContentEntry>());
+  /** 本连接的 syncPlan（`initialize` 的响应），按 threadId 索引。 */
+  const syncPlanRef = useRef(new Map<string, { action: SyncAction; epoch: number }>());
 
   /**
    * 从内容缓存预填某会话的对话（手机端）。服务端 item 到达后按 id 就地替换，
@@ -232,8 +231,13 @@ export default function App() {
       .read(id)
       .then((entry) => {
         if (!entry || entry.items.length === 0) return;
+        // 记下元数据供 hints 与裁决使用（即使本次不注入内容）。
+        cacheMetaRef.current.set(entry.threadId, entry);
         const v = store.peek(id);
-        if (!v || v.session.items.length > 0) return; // 服务端已经填过
+        if (!v) return;
+        // 已被判过过期（世代变化）⇒ 绝不把旧内容注回（spec §6.4）。
+        if (v.session.epochInvalidated) return;
+        if (v.session.items.length > 0) return; // 服务端已经填过
         v.session.upsertItems(entry.items);
         v.session.lastServerItemId = v.session.lastServerItemId ?? entry.lastServerItemId;
         cachedAt.current.set(id, entry.savedAt);
@@ -243,6 +247,41 @@ export default function App() {
         // 预填是附加能力：读失败保留空态，由 resume 兜底。
       });
   };
+
+  /**
+   * Declare what this client holds, on the very first frame (spec §4.1).
+   * Only remote clients send it; the desktop path stays byte-identical.
+   */
+  const buildResumeHints = () => {
+    const metas = [...cacheMetaRef.current.values()];
+    return metas
+      .sort((a, b) => b.savedAt - a.savedAt)
+      .slice(0, 20)
+      .map((e) => ({
+        threadId: e.threadId,
+        contentEpoch: e.contentEpoch ?? 0,
+        lastItemId: e.lastServerItemId,
+        cachedAt: e.savedAt,
+      }));
+  };
+
+  // 冷启首帧：把缓存里已有的条目读进内存元数据，供首次 initialize 的 hints 使用。
+  // `contentStore.keys()` 已存在；读失败静默跳过（hints 是优化，不能挡住握手）。
+  useEffect(() => {
+    if (!isRemoteClient()) return;
+    const cs = getContentStore();
+    void (async () => {
+      try {
+        for (const id of await cs.keys()) {
+          const entry = await cs.read(id);
+          if (entry) cacheMetaRef.current.set(entry.threadId, entry);
+        }
+      } catch {
+        /* hints 是优化：读失败就按"没有缓存"声明 */
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   /** 节流：内容变更后延迟落盘，避免逐字 delta 每次都写 IndexedDB。 */
   const CONTENT_PERSIST_DEBOUNCE_MS = 800;
   const schedulePersist = (id: string) => {
@@ -270,152 +309,43 @@ export default function App() {
     if (!isRemoteClient()) return;
     void getContentStore().delete(id).catch(() => {});
   };
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  // 打开的详情:进入栈 + 该栈顶任务的轨迹行。栈让"子任务再进入"可退回,
-  // 与 TUI 页签同一语义。
-  const [detailStack, setDetailStack] = useState<string[]>([]);
-  const [traceRows, setTraceRows] = useState<AgentTraceSnapshotResult["rows"]>([]);
-  const openSubagent = detailStack.length > 0 ? detailStack[detailStack.length - 1] : null;
-  // 当前对话的子 agent 行。状态栏入口（数量徽标、是否有内容）与右侧面板共用同一份，
-  // 故在此派生一次，不在 JSX 里重复取。
-  const railRows = currentId ? railStore.get(currentId) : [];
-  // 通知回调在 effect 里注册一次,读不到最新的 state,所以当前打开的任务放在 ref。
-  const openTaskId = useRef<string | null>(null);
-  useEffect(() => {
-    openTaskId.current = openSubagent;
-  }, [openSubagent]);
-  // 通知回调在 `wireClient` 的闭包里只注册一次，读不到渲染期最新的 currentId；
-  // `ui/gitDiff/focus` 允许 threadId 为 null（"聚焦当前会话"），此时必须知道此刻
-  // 选中的是谁，故与 openTaskId 一样放进 ref。
-  const currentIdRef = useRef<string | null>(null);
-  useEffect(() => {
-    currentIdRef.current = currentId;
-  }, [currentId]);
-  // 同上：`thread/titleChanged` 的处理也在 `wireClient` 的一次性闭包里，读不到最新
-  // 的 groups/pinned。标题就地更新需要「当前列表」做底，故各放一个 ref 影子。
-  const groupsRef = useRef<WorkspaceGroup[]>(groups);
-  const pinnedRef = useRef<ThreadSummary[]>(pinned);
-  useEffect(() => {
-    groupsRef.current = groups;
-  }, [groups]);
-  useEffect(() => {
-    pinnedRef.current = pinned;
-  }, [pinned]);
-  // 右侧会话详情栏的开合与当前 Tab。栏由状态栏那颗图标开合；Tab 还受两条外部
-  // 路径驱动——点子 agent 卡片（回到「子 agent」Tab 的轨迹）与模型推送的
-  // `ui/gitDiff/focus`（切到 diff）。
-  const [panelOpen, setPanelOpen] = useState(false);
-  const [detailTab, setDetailTab] = useState<"subagents" | "diff" | "processes">("subagents");
-  // 当前会话的后台进程列表与详情态。列表由 process/list 拉取、process/updated 提示
-  // 重拉；详情打开时以 500ms 增量轮询 process/read（只在详情打开期间）。
-  const [processes, setProcesses] = useState<ProcessInfo[]>([]);
-  const [openProcessId, setOpenProcessId] = useState<string | null>(null);
-  const [processOutput, setProcessOutput] = useState<{
-    stdout: string;
-    stderr: string;
-    truncated: boolean;
-  } | null>(null);
-  // 会话级 diff 快照与它的加载态/提交下钻态，全部由面板消费。
-  const [threadDiff, setThreadDiff] = useState<ThreadDiffResult | null>(null);
-  const [diffLoading, setDiffLoading] = useState(false);
-  const [diffError, setDiffError] = useState<string | null>(null);
-  const [activeCommit, setActiveCommit] = useState<{ sha: string; text: string } | null>(null);
-  // diff 是**有主**的：`threadDiff` / `diffError` / `activeCommit` 都必须配上它们
-  // 属于哪条会话。只为「当前会话」写这些槽还不够——`thread/diff/read` 在途时用户
-  // 可能已经切走，迟到的响应会把别的会话的 diff 画进当前视图。故用两个 ref 兜底：
-  // `diffBase` / `diffNote`（提示语）与快照同属一次推送/一次读取，存成一条记录整体
-  // 替换，读的时候靠 `diffOwnerRef` 认领，不是当前会话的概不渲染。
-  const [diffBase, setDiffBase] = useState<string | null>(null);
-  const [diffNote, setDiffNote] = useState<string | null>(null);
-  const diffOwnerRef = useRef<string | null>(null);
-  // 自增的请求号：只有**最新**那次 `thread/diff/read` 有资格落盘。会话切换不改动它，
-  // 所以「A 的在途响应在切换到 B 之后才回来」会被号数 + 归属两道门同时挡掉。
-  const diffReqRef = useRef(0);
-  // 推送随行提示语（`ui/gitDiff/focus` 的 `note`）的挂起值：提示语解释的是某条会话
-  // 的这一份 diff，不能先于快照落到屏幕上（旧快照 + 新提示语正是一次静默错配），
-  // 故不直接进 state，等读取认领成功后再由 `loadThreadDiff` 摘取。
-  const pendingNoteRef = useRef<string | null>(null);
-  const [boardOn, setBoardOn] = useState(false);
-  const [boardSource, setBoardSource] = useState<SwitchSource>("default");
-  const [boardCards, setBoardCards] = useState<BoardCard[]>([]);
-  // The plugin answers every board question, so an unanswered query means it is
-  // not installed. Distinct from "installed and empty".
-  const [boardPluginMissing, setBoardPluginMissing] = useState(false);
-  // 上一次看板写入的失败：非空即把「为什么没生效」摆在面板上，而不是静默。
-  // 只有下一次写入成功或换了项目才清掉——轮询成功不算，那会让一条刚报出的
-  // 失败在 2 秒内自己消失。
-  const [boardError, setBoardError] = useState<BoardErrorKind | null>(null);
-  // 宿主级「后台值守」：默认开（老配置没有这个键时也当作开，否则会把用户本来
-  // 一直在跑的值守悄悄关掉）。值守管的是宿主的 daemon，与选中的项目无关。
-  const [watchmanEnabled, setWatchmanEnabled] = useState(true);
-  // 上一次值守写入携带的告知（安装/卸载失败原因）。每次写入都以返回值整体覆盖，
-  // 成功时清空——不做乐观更新，那是宿主的状态，得听宿主怎么说。
-  const [watchmanWarning, setWatchmanWarning] = useState<string | null>(null);
 
-  /**
-   * 一行看板状态，2 秒刷新一次。
-   *
-   * 用 ref 指向「最近一次的刷新函数」：副作用只在挂载时注册一次计时器，换项目
-   * 时换掉里面调的闭包，而不是重建计时器（重建会漏掉切换瞬间的竞态，也会让
-   * 两个项目的响应互相覆盖）。
-   */
-  const boardTick = useRef<() => void>(() => {});
-  /** 看板读取的序号，用来丢掉换项目后落地的过期响应。 */
-  const boardSeq = useRef(0);
-  // iOS 首启：没有远端配置时先配对。版本号是「让 transport 重算」的触发器——
-  // 配对落盘后加一，下面那个 effect 才第一次真正建客户端（此前被
-  // `needsPairing` 挡住），这一次读到的是 ws 配置。
-  const [pairingVersion, setPairingVersion] = useState(0);
-  /**
-   * 手机端「重新配对」：true 时全屏呈现配对界面。
-   *
-   * **非破坏性**——不动已存配置，提交成功才覆盖；点「返回」即回原离线态。
-   * 首启配对走 `needsPairing`，与此独立（首启优先）。
-   */
-  const [repairing, setRepairing] = useState(false);
-  /** 自动进入重配时展示的原因（如凭据被移除）；手动进入或返回后清空。 */
-  const [repairNotice, setRepairNotice] = useState<string | null>(null);
-  /**
-   * effect 闭包读不到最新 state，故用 ref 判断「是否已在重配界面」，避免重复进入。
-   * 每次渲染同步一次。
-   */
-  const repairingRef = useRef(false);
-  repairingRef.current = repairing;
-  /**
-   * 用户是否已对"此设备已被移除"这一自动提示做过回答（点了返回）。
-   *
-   * 没有它，「返回」形同虚设：后台退避重连每轮都会再撞上 4401，于是每轮都把
-   * 用户弹回去——用户的决定被反复撤销。握手成功（真的连上了）时重新武装，
-   * 因为那之后凭据若再失效就是一件新事，该再提示一次。
-   */
-  const repairDismissedRef = useRef(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  // 「本机侧车要连的中继地址」：首屏由 ui/settings/read 回填，用户在设置页改后
-  // 经 Tauri `set_relay_url` 落盘并触发侧车重启。
-  const [relayUrl, setRelayUrl] = useState("");
-  // 首屏先用缓存渲染，连上后以 ui/settings/read 的权威值为准。
-  const [theme, setTheme] = useState<Theme>(() => readCachedTheme() ?? "dark");
-  // 挂载后主题是否已被更新的选择触碰过（ui/settings/updated 通知或用户
-  // changeTheme）。首屏 read 在途时若被触碰，read 返回的旧值不得覆盖它。
-  const themeTouchedRef = useRef(false);
-  // 服务端已确认（或首屏 read 采纳）的主题，即「乐观更新可以回退到」的基线。
-  // 用 ref 而非 state：写失败的回调读到的是最新基线，而不是某次调用时刻的
-  // 陈旧闭包值——否则并发写会退回到中间态（见 changeTheme）。
-  const confirmedThemeRef = useRef<Theme>(readCachedTheme() ?? "dark");
-  // 值守同理：一旦用户拨过开关（onToggleWatchman 会写回宿主），后续任何一趟
-  // 在途的 read——尤其是重启后的重放握手——都不得用旧值把它覆盖回去。与主题
-  // 不同，值守没有 ui/settings/updated 通知，所以触碰后只认写入的返回值。
-  const watchmanTouchedRef = useRef(false);
+  /** Write an error onto the current thread's session (if any). */
+  const setCurrentError = (msg: string) => {
+    const s = store.current()?.session;
+    if (s) s.lastError = msg;
+  };
 
-  /** 经 app-server 调 board RPC；未连接时直接失败。 */
-  const boardRpc = useCallback(
-    <T = unknown,>(method: string, params: unknown): Promise<T> => {
-      const c = clientRef.current;
-      if (!c) return Promise.reject(new Error("not connected"));
-      return c.request<T>(method, params);
-    },
-    [],
-  );
+  // 会话关注点（当前会话 id/会话列表与置顶/最近目录/侧栏抽屉/详情栈与右侧
+  // 详情栏开合，连同它们的 ref 影子与读取器）整体搬进 hook，见
+  // `hooks/useSessionState.ts`。跨关注点的编排不在这里：`selectThread`/
+  // `newThread`/`deleteThread`/`send` 那些动作与生命周期 effect 留在 App，
+  // 只把引用改成 `sess.*`。顺序：`sess` 必须排在 `proc`/`diff` 之前——
+  // `proc` 取它的 `currentId`、`diff` 取它的 `currentIdRef`，二者都是「此刻
+  // 选中谁」的判据，而这份状态正是本 hook 持有的。
+  const sess = useSessionState({ rpc, store, force, setCurrentError, railStore, initialListCache });
+  // 会话级后台进程关注点（列表/详情 id/增量输出 + 详情轮询与列表重拉）整体搬进
+  // hook，见 `hooks/useProcessState.ts`。详情 Tab 的开合不在这里：它属会话关注点，
+  // 由下面切 Tab 与 `selectThread` 几处调用点自己收起详情。
+  const proc = useProcessState({ rpc, store, force, currentId: sess.currentId });
+  // 会话级 diff 关注点（快照/加载态/错误/下钻态 + 归属判据）整体搬进 hook，
+  // 见 `hooks/useDiffState.ts`。面板开合不在这里：它属会话关注点，由下面几处
+  // 调用点在重置 diff 的同一现场自己收起。
+  const diff = useDiffState({ rpc, currentIdRef: sess.currentIdRef });
+  // 看板关注点（看板页状态/侧栏登记表与摘要/后台值守）整体搬进 hook，见
+  // `hooks/useBoardState.ts`。跨关注点的编排不在这里：`selectThread`/`newThread`
+  // 的「离开看板」、`onCreateBoard` 等几个动作（要写会话错误位与 force）、以及
+  // 握手后拉登记表与注册 2 秒计时器那两个现场，都留在 App，只把引用改成 `board.*`。
+  const board = useBoardState({ clientRef });
+
+  // 设置关注点（设置页/配对界面开合、首启引导、本机中继地址、主题、重配提示）
+  // 整体搬进 hook，见 `hooks/useSettingsState.ts`。跨关注点的编排不在这里：
+  // 生命周期 effect 里那几处（跟随 `ui/settings/updated`、采纳首屏 read、4401
+  // 进重配、握手成功重新武装提示）与 JSX（`SettingsDialog`/`PairingScreen`/
+  // `OnboardingWizard`，后者的 `onDone` 还要 `restartSidecar`/`modelCall`）都留在
+  // App，只把引用改成 `prefs.*`。`changeTheme` 的写失败要落一条对话红字并强制
+  // 重渲染，故 `force`/`setCurrentError` 作为参数注入。
+  const prefs = useSettingsState({ rpc, force, setCurrentError });
 
   /**
    * 插件 Tab 的宿主接缝。必须稳定：它只闭合 `clientRef`（一个 ref），所以
@@ -446,6 +376,20 @@ export default function App() {
   );
 
   /**
+   * 「技能」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖即稳定；
+   * 若每次渲染换新身份，技能面板的读取 effect 会跟着重跑，把已展开的正文与滚动
+   * 位置一起冲掉。
+   */
+  const skillsCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
    * 图片读取的宿主接缝（`image/read`）。理由同 `pluginCall`：只闭合 `clientRef`，
    * 空依赖即稳定。`ChatView` 把它透传给每个气泡/工具卡的 `useImageData`，而那个
    * effect 依赖 `call`——一旦每次渲染换新函数身份，每张图都会重新分片拉取。
@@ -459,88 +403,7 @@ export default function App() {
     [],
   );
 
-  // 看板 RPC 按项目问话（`project` 进 plugin/query 的参数）。当前在主区域
-  // 展示看板的项目；看板不切换会话，但点某条会话会离开看板（见 selectThread）。
-  const [selectedBoard, setSelectedBoard] = useState<string | null>(null);
-  // done 列是否展开。纯界面状态：每次打开/切换看板都重置为折叠。
-  const [doneExpanded, setDoneExpanded] = useState(false);
-  // 登记了看板的项目（侧栏据此画条目 + 决定右键菜单给创建还是移除）。
-  const [boards, setBoards] = useState<string[]>([]);
-  // 项目路径 → 摘要。挂在侧栏条目上，扫一眼就知道各项目积压多少。
-  const [boardSummaries, setBoardSummaries] = useState<Record<string, string>>({});
-
-  /**
-   * 拉一次「哪些项目有看板」以及各项目的摘要。
-   *
-   * 摘要逐个项目单独读、单独失败：一个项目的 daemon 没起来不该让整张表消失
-   * （条目照画，摘要留空）。整张表读不到才当作没有看板——侧栏据此不画条目。
-   */
-  const refreshBoards = useCallback(async () => {
-    try {
-      const list = await listBoards(boardRpc);
-      setBoards(list);
-      const entries = await Promise.all(
-        list.map(async (path): Promise<[string, string]> => {
-          try {
-            return [path, summarize(await fetchBoard(boardRpc, path))];
-          } catch {
-            // 摘要读不到就明说「无法读取」，别留空：留空和「空看板」长得一样，
-            // 而这两件事对用户是两码事（一个要去看 daemon/插件，一个什么都不用做）。
-            return [path, BOARD_SUMMARY_UNREADABLE];
-          }
-        }),
-      );
-      setBoardSummaries(Object.fromEntries(entries));
-    } catch {
-      setBoards([]);
-      setBoardSummaries({});
-    }
-  }, [boardRpc]);
-
-  /**
-   * 读选中项目的看板。没选中项目就什么都不问，也把面板清空——否则切走之后
-   * 旧项目的卡片会留在屏幕上，看着像新项目的。
-   *
-   * 读取失败不改主流程，也不报错：失败在这里是常态（daemon 没起、插件没装），
-   * 真正需要用户知道的失败是**写入**失败。
-   */
-  const refreshSelectedBoard = useCallback(async () => {
-    if (selectedBoard === null) {
-      setBoardCards([]);
-      setBoardPluginMissing(false);
-      return;
-    }
-    // 每次读领一个号。切项目后旧项目那次读可能还在路上，落地时必须认出自己
-    // 已经过期——否则 A 的卡片会盖在 B 的看板上，看着像 B 的队列。
-    const seq = ++boardSeq.current;
-    try {
-      const [sw, cards] = await Promise.all([
-        readBoardSwitch(boardRpc, selectedBoard),
-        fetchBoard(boardRpc, selectedBoard),
-      ]);
-      if (seq !== boardSeq.current) return;
-      setBoardOn(sw.on);
-      setBoardSource(sw.source);
-      setBoardCards(cards.map(normalizeCard).filter((c): c is BoardCard => c !== null));
-      setBoardPluginMissing(false);
-    } catch (error) {
-      if (seq !== boardSeq.current) return;
-      // 插件不在就明说：那意味着看板根本没有后端，而不是「装好了但没有卡片」。
-      if (pluginIsUnavailable(error)) setBoardPluginMissing(true);
-    }
-  }, [boardRpc, selectedBoard]);
-
-  useEffect(() => {
-    // 计时器只建一次，每次响都走「当前项目」的读法：重建计时器会漏掉切换
-    // 瞬间在途的那一拍。
-    // 一拍要同时刷选中看板与侧栏摘要：摘要若只在握手时读一次，侧栏会一直
-    // 停在旧值，看起来像「什么都没在跑」。
-    boardTick.current = makeBoardTick(refreshSelectedBoard, refreshBoards);
-    // 选中项目一落地就读一次，不等下一拍轮询：否则点开看板会有最多 2 秒的空面板。
-    void refreshSelectedBoard();
-  }, [refreshSelectedBoard, refreshBoards]);
-
-  const current = currentId ? store.view(currentId) : null;
+  const current = sess.currentId ? store.view(sess.currentId) : null;
 
   // 首屏：把缓存里的会话播种进 store（标题/cwd/model/状态徽标），并预填选中会话
   // 的内容。预填**不**置 warm：那会让连上后的 `thread/resume` 被跳过，服务端历史
@@ -553,58 +416,16 @@ export default function App() {
     store.seed([...c.pinned, ...c.groups.flatMap((g) => g.threads)]);
     if (c.selectedId && c.groups.some((g) => g.threads.some((t) => t.thread_id === c.selectedId))) {
       store.select(c.selectedId);
-      setCurrentId(c.selectedId);
+      sess.setCurrentId(c.selectedId);
       void prefillFromCache(c.selectedId);
     }
     force((v) => v + 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 连上即清"内容来自缓存"的标记：此刻起服务端是唯一来源，提示条退场。
-  useEffect(() => {
-    if (status === "connected") cachedAt.current.clear();
-  }, [status]);
-
-  // 进程详情打开期间，以 500ms 增量拉取 stdout/stderr；关闭或终态即停。
-  // 光标是本次订阅的局部量，进程/会话一变就随 effect 重建。
-  useEffect(() => {
-    if (!currentId || !openProcessId) return;
-    const c = clientRef.current;
-    if (!c) return;
-    let cursor = 0;
-    let cancelled = false;
-    let timer: number | undefined;
-
-    const tick = async () => {
-      try {
-        const r = await c.request<ProcessReadResult>("process/read", {
-          thread_id: currentId,
-          process_id: openProcessId,
-          cursor,
-        });
-        if (cancelled) return;
-        cursor = r.next_cursor;
-        setProcessOutput({
-          stdout: r.stdout,
-          stderr: r.stderr,
-          truncated: r.truncated,
-        });
-        // 终态即停:不再有新增输出,退出码已经由列表侧展示。
-        const state = r.status?.state;
-        if (state === "exited" || state === "killed" || state === "failed_to_start") {
-          return;
-        }
-      } catch {
-        // 读失败(例如进程刚被移除):不打断 UI,等下一次 tick 或用户关闭。
-      }
-      if (!cancelled) timer = window.setTimeout(tick, 500);
-    };
-    void tick();
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [currentId, openProcessId]);
+  // 连上即清"内容来自缓存"的标记——已改为在该会话对账完成后按会话清除
+  // （selectThread 的 resume/readItems 收尾），否则另一个仍在显示缓存的会话
+  // 会失去标注（spec §5.3）。
 
   // 页面隐藏 / 卸载时把在途的会话内容立刻写盘：手机切后台后可能很久不再执行
   // 定时器，等着防抖会把最后一段内容丢掉。
@@ -630,228 +451,19 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /** Write an error onto the current thread's session (if any). */
-  const setCurrentError = (msg: string) => {
-    const s = store.current()?.session;
-    if (s) s.lastError = msg;
-  };
-
-  const refreshThreads = async (): Promise<WorkspaceGroup[] | null> => {
-    const c = clientRef.current;
-    if (!c) return null;
-    try {
-      const r = await c.request<{ groups: WorkspaceGroup[]; pinned?: ThreadSummary[] }>(
-        "thread/listAll",
-        {},
-      );
-      setGroups(r.groups);
-      setPinned(r.pinned ?? []);
-      // seed 喂全集：置顶项仍在分组里，所以不会漏；store 的视图与侧栏的分区
-      // 划分无关（状态徽章、未读点都按 thread_id 查 store）。
-      store.seed(r.groups.flatMap((g) => g.threads));
-      if (isRemoteClient()) writeListCache(localStorage, r.groups, r.pinned ?? [], store.currentId);
-      return r.groups;
-    } catch {
-      // 列表刷新失败不打断对话。返回 null 表示"未知":调用方必须把 null
-      // 当作未知处理,不得回退成 normal。注意权限模式不会因此自动恢复——
-      // 它保持未知,直到下一次切换线程时重新从 listAll 回读。
-      return null;
-    }
-  };
-
-  const refreshWorkspaces = async () => {
-    const c = clientRef.current;
-    if (!c) return;
-    try {
-      const r = await c.request<{ workspaces: Workspace[] }>("workspace/list", {});
-      setWorkspaces(r.workspaces);
-    } catch {
-      // 最近目录刷新失败不影响当前对话。
-    }
-  };
-
-  /**
-   * 读取**指定会话**的 Git Diff 快照（工作区 + 与默认分支的差异）。
-   *
-   * 失败即把错误放进面板自己的错误槽，不写会话的 `lastError`：diff 是附属视图，
-   * 读不到不该在对话里留一条红字。`base` 有值即带基准（模型推送时可指定）。
-   *
-   * 两道防串门：认领本次读取（`diffReqRef` 自增，只有最新一次能落盘），以及
-   * 落盘前再确认目标仍是当前会话（`threadId === currentIdRef.current`）。没有
-   * 后者，切走之后迟到的响应仍会把别的会话的 diff 画进当前视图；没有前者，
-   * 同会话内先发的慢响应会盖掉后发的快响应。两者都不成立时连 loading 一起丢，
-   * 免得留下一个永远转不完的加载态。
-   */
-  const loadThreadDiff = async (threadId: string, base?: string | null) => {
-    const c = clientRef.current;
-    if (!c) return;
-    diffReqRef.current += 1;
-    const token = diffReqRef.current;
-    const owned = () => token === diffReqRef.current && threadId === currentIdRef.current;
-    setDiffLoading(true);
-    setDiffError(null);
-    setActiveCommit(null);
-    // 这次读取认领快照：提示语/基准只在它回来时才落，且必须配同一条会话。
-    diffOwnerRef.current = threadId;
-    try {
-      const r = await c.request<ThreadDiffResult>("thread/diff/read", {
-        threadId,
-        ...(base ? { base } : {}),
-      });
-      if (!owned()) return;
-      setThreadDiff(r);
-      setDiffNote(pendingNoteRef.current);
-      setDiffBase(base ?? null);
-    } catch (e) {
-      if (!owned()) return;
-      setDiffError(formatError(e));
-    } finally {
-      if (owned()) setDiffLoading(false);
-    }
-  };
-
-  /**
-   * 设置推送随行提示语的挂起值（见 `pendingNoteRef`）。
-   *
-   * `null` 同样要走这一步：切会话/无提示的聚焦必须能清掉上一条提示，否则它会
-   * 一直挂在下一份快照上。
-   */
-  const setPendingDiffNote = (note: string | null) => {
-    pendingNoteRef.current = note;
-    setDiffNote(null);
-  };
-
-  /**
-   * 下钻到单个 commit：复用 `thread/diff/read` 的 `commit` 分支拿它的 unified diff。
-   *
-   * 与 `loadThreadDiff` 分开：这里不清空 diff（返回按钮要能退回全部改动），也不动
-   * loading（面板已有内容，闪一下"正在计算"反而跳）。仍受归属约束：只有当前会话
-   * 的 commit 能落实，换了会话的在途响应一律丢弃（否则会顶着一个空壳"返回"视图）。
-   */
-  const openCommit = async (threadId: string, sha: string) => {
-    const c = clientRef.current;
-    if (!c) return;
-    try {
-      const r = await c.request<DiffTextResult>("thread/diff/read", { threadId, commit: sha });
-      if (threadId !== currentIdRef.current) return;
-      setActiveCommit({ sha, text: r.unifiedDiff });
-    } catch (e) {
-      if (threadId !== currentIdRef.current) return;
-      setDiffError(formatError(e));
-    }
-  };
-
-  /**
-   * 打开某任务的详情:回灌历史,然后开一条流。
-   *
-   * 关闭(或换任务)时先 unwatch 再开新的,任何时刻只有一路流:否则换任务后
-   * 旧任务的 `agent/trace/event` 仍会到达,把两个任务的轨迹混进一个视图。
-   */
-  const openDetail = async (threadId: string, taskId: string) => {
-    const c = clientRef.current;
-    if (!c) return;
-    // 点卡片即回到右栏：打开栏并把 Tab 拨回「子 agent」（它可能正停在 Git Diff）。
-    setPanelOpen(true);
-    setDetailTab("subagents");
-    setDetailStack([taskId]);
-    setTraceRows([]);
-    try {
-      const snapshot = await c.request<AgentTraceSnapshotResult>("agent/trace/read", {
-        threadId,
-        taskId,
-      });
-      setTraceRows(snapshot.rows);
-      await c.request("agent/trace/watch", { threadId, taskId });
-    } catch (e) {
-      setCurrentError(formatError(e));
-      force((v) => v + 1);
-    }
-  };
-
-  const closeDetail = async (threadId: string) => {
-    setDetailStack([]);
-    setTraceRows([]);
-    try {
-      await clientRef.current?.request("agent/trace/unwatch", { threadId });
-    } catch {
-      // 关闭是本地动作:即使 unwatch 失败也不把详情留在屏幕上。
-    }
-  };
-
-  /**
-   * 取某对话当前的子 agent 列表。
-   *
-   * 失败即放弃:暂留区是附属视图,列表读不到就保持上一次的值(或空),绝不因为
-   * 它把对话打断。daemon 未 attach 时服务端返回空表,这里不会走到 catch。
-   */
-  const refreshSubagents = async (threadId: string) => {
-    const c = clientRef.current;
-    if (!c) return;
-    try {
-      const r = await c.request<AgentChildrenListResult>("agent/children/list", {
-        threadId,
-      });
-      railStore.set(threadId, r.children);
-      force((v) => v + 1);
-    } catch {
-      // 附属视图:读失败不改动已有内容。
-    }
-  };
-
-  /**
-   * 取某对话当前的后台进程列表。
-   *
-   * 失败即放弃:与子 agent 暂留区同类,附属视图读不到就保持上一次的值(或空),
-   * 绝不因为它把对话打断。未知 thread 服务端返回空表,不会走到 catch。
-   */
-  const refreshProcesses = async (threadId: string) => {
-    const c = clientRef.current;
-    if (!c) return;
-    try {
-      const r = await c.request<ProcessListResult>("process/list", { thread_id: threadId });
-      // 只写当前对话:后台 thread 的状态通知不应改到用户正在看的这一列。
-      if (store.currentId === threadId) {
-        setProcesses(r.processes);
-        force((v) => v + 1);
-      }
-    } catch {
-      // 附属视图:读失败不改动已有内容。
-    }
-  };
-
-  /**
-   * 丢掉会话级 diff 的全部状态。
-   *
-   * diff 是**有主**的（属于某条会话），凡是「当前会话变了」或「会话没了」都必须
-   * 走这里，否则新会话会先闪一眼旧 diff。清的不只是快照本身：归属、提示语/基准、
-   * 下钻态、错误一起清——它们都是那一次读取/推送的一部分，留下任何一件都会和
-   * 新会话的快照拼成一张错页。会话切换**不**动 `diffReqRef`：在途响应归号数为准，
-   * 切走即失效，但下一次读取仍能拿到更大的号。
-   */
-  const resetThreadDiff = () => {
-    setPanelOpen(false);
-    setThreadDiff(null);
-    setActiveCommit(null);
-    setDiffError(null);
-    setDiffBase(null);
-    setDiffNote(null);
-    // loading 同样属于那条会话：留着它，下一次打开面板会先闪一句「正在计算」
-    // （在途响应的 finally 因归属已失效而不再替我们清）。
-    setDiffLoading(false);
-    diffOwnerRef.current = null;
-    pendingNoteRef.current = null;
-  };
-
   /**
    * Switch the visible thread. A warm thread (already resumed) only swaps the
    * view — its timeline kept accumulating in the background. A cold thread is
    * resumed once; per-thread isolation means the base session list/sidebar can
    * keep serving other threads in parallel.
    */
-  const selectThread = async (id: string, opts?: { leaveBoard?: boolean }) => {
+  const selectThread = async (
+    id: string,
+    opts?: { leaveBoard?: boolean; forceResume?: boolean },
+  ) => {
     const prevId = store.currentId;
     store.select(id);
-    setCurrentId(id);
+    sess.setCurrentId(id);
     // 冷会话先拿缓存内容垫上（有则显示、无则空），随后 resume/readItems 覆盖。
     // 判据是 warm 与在途 resume，与「是否有缓存」无关：预填**不**置 warm，所以
     // 这里不会因为命中缓存而跳过 resume。这里刻意放在下方的早退分支（running
@@ -864,32 +476,116 @@ export default function App() {
     // 仅当这是「用户切到会话」时才是离场：重连后重放选中的那条会话不代表用户
     // 换了页，此时必须留在看板上（opts.leaveBoard === false），否则一次 sidecar
     // 重启就会把人从看板踢回会话。
-    if (opts?.leaveBoard !== false) setSelectedBoard(null);
+    if (opts?.leaveBoard !== false) board.setSelectedBoard(null);
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
-    if (isMobile) setSidebarOpen(false);
-    resetThreadDiff();
+    if (isMobile) sess.setSidebarOpen(false);
+    sess.setPanelOpen(false);
+    diff.resetThreadDiff();
     force((v) => v + 1);
     // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
-    void refreshSubagents(id);
+    void sess.refreshSubagents(id);
     // 该对话的后台进程:重进对话时重新拉取。
-    void refreshProcesses(id);
+    void proc.refreshProcesses(id);
     // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
-    setOpenProcessId(null);
-    setProcessOutput(null);
-    // Remote-only (S2): keep this thread in the warm subscription window, and
-    // catch up a cold-but-running thread with the read-only `thread/readItems`
-    // instead of `thread/resume` — resume interrupts the in-flight turn, which
-    // is exactly what a passive "look at it" must not do. Desktop (stdio) never
-    // subscribes: its single client receives everything.
+    proc.setOpenProcessId(null);
+    proc.setProcessOutput(null);
+    // 服务端对本次会话的裁决（spec §4.2）。注意 plan 以 threadId 为键直接查：
+    // 被删除的会话不会出现在 listAll 里，靠 summary 反查必然查不到它的 `drop`。
+    // `noneNeedsCatchUp`：裁决为 none 的缓存会话仍**可能落后于服务端尾部**——
+    // none 只表示「缓存不必作废」，不是「已是最新」（spec §4.2）。锁住这一点后
+    // 由下方的只读 readItems 补齐（不打断在途回合），否则会永远停在缓存尾部。
+    let noneNeedsCatchUp = false;
+    if (isRemoteClient()) {
+      const planEntry = syncPlanRef.current.get(id);
+      const cached = cacheMetaRef.current.get(id) ?? null;
+      const view = store.peek(id);
+      if (view) {
+        const summary =
+          sess.pinned.find((t) => t.thread_id === id) ??
+          sess.groups.flatMap((g) => g.threads).find((t) => t.thread_id === id) ??
+          null;
+        // 先取服务端裁决（plan 覆盖该会话时以它为准，否则按 listAll 版本兜底）。
+        const resolved =
+          planEntry?.action ?? resolveSyncPlan({ plan: syncPlanRef.current, summary, cached });
+        // 客户端例外必须在**调用点**再判一次：`resolveSyncPlan` 内部那条同名例外
+        // 会被 `planEntry?.action` 短路掉（plan 覆盖该会话时根本不进那个函数），
+        // 于是「缓存被裁剪过 ⇒ 即使服务端正确地说 none 也要全量补齐头部」就失效，
+        // 用户会静默看到一个被截断的会话（spec §4.2 例外）。这条只依赖客户端自己
+        // 知道的信息（自己有没有裁过），故与 plan 是否覆盖无关。
+        const action: SyncAction =
+          resolved === "none" && cached?.trimmed ? "full" : resolved;
+        // 把缓存条目的已知世代先记为本地已知世代：否则本会话首见时
+        // `session.contentEpoch` 仍是 null，`full`（世代已变）会被 adoptEpoch
+        // 当作"首见"只记录、不作废，幽灵内容留在屏上（spec §4.2）。
+        // 老条目缺 `contentEpoch`（未知）时不播种 ⇒ 保持 null ⇒ 只记录不作废，
+        // 「缺字段=保守」且不误删内容。
+        if (cached?.contentEpoch != null && view.session.contentEpoch === null) {
+          view.session.contentEpoch = cached.contentEpoch;
+        }
+        if (action === "drop") {
+          // 会话已不存在：丢掉本地状态与缓存，回落第一条。
+          store.drop(id);
+          cacheMetaRef.current.delete(id);
+          void getContentStore().delete(id);
+          cachedAt.current.delete(id);
+          if (sess.currentIdRef.current === id) {
+            const first = sess.pinned[0] ?? sess.groups.flatMap((g) => g.threads)[0];
+            if (first) void selectThread(first.thread_id, { leaveBoard: false });
+          }
+          return;
+        }
+        const epoch = planEntry?.epoch ?? summary?.content_epoch ?? 0;
+        if (action === "none" && cached) {
+          // 缓存有效：不必整段重放，但**不表示已是最新**——用户手上的内容很可能
+          // 落后于服务端尾部（两端并存的常态，spec §4.2/§7.2）。置 `warm` 让下方
+          // 的 resume 守卫接管，同时**置位补齐标记**：下方会为它做一次只读
+          // `thread/readItems`（不打断任何在途回合），把落后的尾部补回来。
+          view.session.adoptEpoch(epoch, cached.lastServerItemId);
+          warm.current.add(id);
+          noneNeedsCatchUp = true;
+        } else {
+          // full：按世代作废。epoch 取服务端的权威值（0 仅表示"未知"，用于触发作废）。
+          view.session.adoptEpoch(epoch, null);
+        }
+      }
+    }
+    // **看**一个运行中的会话绝不走 `thread/resume`：resume 会先中断在跑的
+    // turn（服务端 `interrupt_and_wait_for_persist`），而「点开看一眼」是纯
+    // 被动动作，不该有把别人打断的副作用。改用只读的 `thread/readItems` 补齐
+    // 内容，之后靠既有的通知流继续跟新。这对桌面端同样成立——桌面端过去没有
+    // 这层保护（它被 `isRemoteClient()` 关在远端分支里），于是点开一张正在跑
+    // 的看板卡就会把它打断。
+    const curView = store.peek(id);
+    const running =
+      curView?.status === "running" || curView?.status === "awaiting_approval";
+
+    // Remote-only (S2): keep this thread in the warm subscription window.
+    // Desktop (stdio) never subscribes: its single client receives everything.
+    //
+    // `forceResume`（stale_context 重同步）：锚点失效意味着服务端内容已整段变化，
+    // 必须走**全量** resume 重新对账。此前的 warm / 订阅窗口 / running 三道早退都会
+    // 让 resume 永不发生（当前会话必在订阅窗口内），故置位时全部跳过（spec §7.3）。
     if (isRemoteClient()) {
       const inWindow = subWindow.current.has(id);
       const win = subWindow.current.touch(id);
-      const view = store.peek(id);
-      const running = view?.status === "running" || view?.status === "awaiting_approval";
       const c0 = clientRef.current;
       if (c0) {
-        if (!inWindow && running) {
+        void c0.request("thread/subscribe", { threadIds: win }).catch(() => {});
+        // 冷+在跑（原逻辑）：内容确定要被替换，收紧门槛。
+        const catchingUp = !inWindow && running && !opts?.forceResume;
+        // plan 判 none 的缓存会话：服务端已判缓存有效（spec §4.2），落后是正常
+        // 并存形状（§7.2）——故补齐是**静默**的，不挂「正在同步」也不拦发送，
+        // 但仍要补一次尾部，否则用户永远停在缓存尾部却以为内容是最新的。
+        // 每连接每会话只补一次：`toppedUp` 在 `connect()` 建新客户端时清空，故任何
+        // 一次重连都会重补；`forceResume` 例外（那是 stale_context 触发的全量重放，
+        // 另行会发 `thread/resume`，再补一次只读 `readItems` 是多余的）。
+        const silentTopUp =
+          noneNeedsCatchUp && !catchingUp && !toppedUp.current.has(id) && !opts?.forceResume;
+        if (silentTopUp) toppedUp.current.add(id);
+        if (catchingUp || silentTopUp) {
           const after = store.peek(id)?.session.lastServerItemId ?? null;
+          // 对账开始：内容随时可能是旧的，UI 与发送门槛据此收紧（spec §5.1）。
+          if (curView && !silentTopUp) curView.syncState = "syncing";
           void (async () => {
             try {
               const r = await c0.request<{ items: Item[] }>(
@@ -903,17 +599,61 @@ export default function App() {
               }
             } catch {
               // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+            } finally {
+              // 无论成败都必须收敛，否则用户会永久卡在"正在同步"（spec §11 风险 3）。
+              const v = store.peek(id);
+              if (v) {
+                if (!silentTopUp) {
+                  v.syncState = "synced";
+                  // 该会话已与服务端对过账：去掉"这是缓存"的标注（spec §5.3）。
+                  // 静默补齐保留标注：内容仍源自缓存，离线时理应继续标注（§5.3）。
+                  cachedAt.current.delete(id);
+                }
+                force((n) => n + 1);
+              }
             }
           })();
         }
-        void c0.request("thread/subscribe", { threadIds: win }).catch(() => {});
       }
       // Already warm, or caught up via readItems above → view-only swap.
-      if (inWindow || running) return;
+      // `forceResume` 例外：全量重同步必须落到下面的 resume 分支（spec §7.3）。
+      if ((inWindow || running) && !opts?.forceResume) return;
     }
-    if (warm.current.has(id) || inFlightResume.current.has(id)) return; // warm → 只切视图
+    if (running && !isRemoteClient()) {
+      // 桌面端同样成立：**看**一个运行中的会话绝不走 `thread/resume`（resume 会先
+      // 中断在跑的 turn），改用只读的 `thread/readItems` 补齐内容。这不设 `syncing`
+      // 也不挂提示条：桌面端没有缓存，内容恒来自服务端。
+      // （远端 running 已在上面的远端分支内处理并早退；唯一走到这里的远端情形是
+      // `forceResume`——那是 stale_context 触发的全量重放，必须落到 resume。）
+      const c0 = clientRef.current;
+      if (c0) {
+        const after = store.peek(id)?.session.lastServerItemId ?? null;
+        void (async () => {
+          try {
+            const r = await c0.request<{ items: Item[] }>(
+              "thread/readItems",
+              after ? { threadId: id, afterItemId: after } : { threadId: id },
+            );
+            const v = store.peek(id);
+            if (v) {
+              v.session.upsertItems(r.items);
+              force((n) => n + 1);
+            }
+          } catch {
+            // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+          }
+        })();
+      }
+      return;
+    }
+    if ((warm.current.has(id) || inFlightResume.current.has(id)) && !opts?.forceResume) {
+      return; // warm → 只切视图
+    }
     const c = clientRef.current;
     if (!c) return;
+    // 对账开始：全量回放在途，内容随时可能是旧的，UI 与发送门槛据此收紧（spec §5.1）。
+    const coldView = store.peek(id);
+    if (coldView) coldView.syncState = "syncing";
     inFlightResume.current.add(id);
     // 全量回放期间收集服务端 item id；成功后据此删掉缓存里服务端已经没有的项
     // （clear / compact / 裁剪造成的幽灵内容）。readItems 只补尾部，不走这条路径。
@@ -938,6 +678,9 @@ export default function App() {
       const view = store.peek(id);
       if (!view) return;
       warm.current.add(id);
+      // 对账完成：内容已是服务端权威，解禁发送并去掉"这是缓存"的标注（spec §5.1/§5.3）。
+      view.syncState = "synced";
+      cachedAt.current.delete(id);
       void flushContent(id);
       // 响应直接带权威 mode：一次请求即定,不受 listAll 快照的竞态/失败影响
       // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
@@ -952,15 +695,19 @@ export default function App() {
       view.reasoningEffort = typeof resumed.reasoning_effort === "string" ? resumed.reasoning_effort : null;
       // listAll 回读仅作兜底（旧服务端不带该字段时）；缺该 thread 时保留已知值,
       // 不把已确定的模式打回 null。
-      const gs = await refreshThreads();
-      if (gs !== null) view.mode = modeForThread(gs, pinned, id) ?? view.mode;
+      const gs = await sess.refreshThreads();
+      if (gs !== null) view.mode = modeForThread(gs, sess.pinned, id) ?? view.mode;
       force((v) => v + 1);
     } catch (e) {
       replaySession.endReplay();
       // 同样地,失败路径只在视图仍存在时写错误,避免 re-create 一个已被
       // drop 的 ThreadView(无界泄漏 + 残留 warm 条目)。
       const view = store.peek(id);
-      if (view) view.session.lastError = formatError(e);
+      if (view) {
+        view.session.lastError = formatError(e);
+        // 失败也必须收敛，否则用户会永久卡在"正在同步"（spec §11 风险 3）。
+        view.syncState = "synced";
+      }
       force((v) => v + 1);
     } finally {
       inFlightResume.current.delete(id);
@@ -988,11 +735,12 @@ export default function App() {
       // 新会话恒 normal，但以响应字段为准（服务端是权威），缺失时回退 normal。
       store.view(t.thread_id).mode = permissionModeFromResponse(t) ?? "normal";
       store.select(t.thread_id);
-      setCurrentId(t.thread_id);
+      sess.setCurrentId(t.thread_id);
       // 新会话同样是「当前会话变了」：旧 diff 必须退场，否则会挂在新会话上。
-      resetThreadDiff();
+      sess.setPanelOpen(false);
+      diff.resetThreadDiff();
       // 新建会话同样把焦点带回会话页：与点会话一致。
-      setSelectedBoard(null);
+      board.setSelectedBoard(null);
       force((v) => v + 1);
       // Remote-only (S2): register the fresh thread in the subscription window
       // *now*. It picks a new id (not previously warm) and gets `warm` below, so
@@ -1003,10 +751,10 @@ export default function App() {
         const win = subWindow.current.touch(t.thread_id);
         void clientRef.current?.request("thread/subscribe", { threadIds: win }).catch(() => {});
       }
-      const gs = await refreshThreads();
+      const gs = await sess.refreshThreads();
       if (gs !== null) {
         const v = store.view(t.thread_id);
-        v.mode = modeForThread(gs, pinned, t.thread_id) ?? v.mode;
+        v.mode = modeForThread(gs, sess.pinned, t.thread_id) ?? v.mode;
         force((n) => n + 1);
       }
     } catch (e) {
@@ -1022,14 +770,14 @@ export default function App() {
    * 已经建了一半，界面必须与它保持一致，而不是停在「看起来什么都没发生」。
    */
   const onCreateBoard = async (path: string) => {
-    setBoardError(null);
+    board.setBoardError(null);
     try {
-      await createBoard(boardRpc, path);
+      await createBoard(board.boardRpc, path);
     } catch (e) {
       setCurrentError(formatError(e));
       force((v) => v + 1);
     }
-    await refreshBoards();
+    await board.refreshBoards();
   };
 
   /**
@@ -1038,16 +786,16 @@ export default function App() {
    */
   const onRemoveBoard = async (path: string) => {
     if (!window.confirm(`移除看板会删除 ${path} 的队列状态，且不可恢复。继续？`)) return;
-    setBoardError(null);
+    board.setBoardError(null);
     try {
-      await removeBoard(boardRpc, path);
+      await removeBoard(board.boardRpc, path);
     } catch (e) {
       setCurrentError(formatError(e));
       force((v) => v + 1);
     }
     // 正在看的看板被移除了：主区域不能再展示一个已经不存在的看板。
-    if (selectedBoard === path) setSelectedBoard(null);
-    await refreshBoards();
+    if (board.selectedBoard === path) board.setSelectedBoard(null);
+    await board.refreshBoards();
   };
 
   /**
@@ -1058,12 +806,12 @@ export default function App() {
    */
   const onOpenBoard = (path: string) => {
     // 已经在该看板页：纯 no-op，不重读、不清屏。
-    if (path === selectedBoard) return;
+    if (path === board.selectedBoard) return;
     // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
-    setBoardError(null);
-    setBoardCards([]);
-    setDoneExpanded(false); // 换项目 → 新看板从折叠开始
-    setSelectedBoard(path);
+    board.setBoardError(null);
+    board.setBoardCards([]);
+    board.setDoneExpanded(false); // 换项目 → 新看板从折叠开始
+    board.setSelectedBoard(path);
   };
 
   /**
@@ -1073,14 +821,14 @@ export default function App() {
    * `.catch(() => {})` 正是「点了没反应」的来源。
    */
   const onToggleBoardSwitch = async (next: boolean) => {
-    if (selectedBoard === null) return;
-    setBoardError(null);
+    if (board.selectedBoard === null) return;
+    board.setBoardError(null);
     try {
-      await setBoardSwitch(boardRpc, selectedBoard, next);
-      setBoardOn(next);
-      setBoardSource("project");
+      await setBoardSwitch(board.boardRpc, board.selectedBoard, next);
+      board.setBoardOn(next);
+      board.setBoardSource("project");
     } catch (error) {
-      setBoardError(boardErrorKind(error));
+      board.setBoardError(boardErrorKind(error));
     }
   };
 
@@ -1099,20 +847,6 @@ export default function App() {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const picked = await open({ directory: false, multiple: false });
     return typeof picked === "string" ? picked : null;
-  };
-
-  /**
-   * 保存侧车的中继地址（设置页「远程访问」的保存按钮调用）。
-   *
-   * 只有桌面构建有侧车与这条 Tauri 命令；iOS 是纯 ws 客户端，接缝传 undefined
-   * 让保存按钮不可用（与 `pickDirectory` 的守卫同一口径）。落盘由宿主完成，并会
-   * 杀掉侧车让监管循环用新值重启；成功后本地状态跟上，失败原样抛出由组件内联提示。
-   */
-  const saveRelayUrl = async (value: string | null): Promise<void> => {
-    if (isRemoteClient()) throw new Error("远程客户端不支持配置本机侧车");
-    const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("set_relay_url", { url: value });
-    setRelayUrl(value ?? "");
   };
 
   const addWorkspace = async (path: string): Promise<boolean> => {
@@ -1134,7 +868,7 @@ export default function App() {
       // add 失败(-32602 等)时不再建对话,错误已写入 lastError。
       if (!(await addWorkspace(dir))) return;
       await newThread(dir);
-      await refreshWorkspaces();
+      await sess.refreshWorkspaces();
     } catch (e) {
       setCurrentError(formatError(e));
       force((v) => v + 1);
@@ -1146,7 +880,7 @@ export default function App() {
     if (cwd) {
       await newThread(cwd);
       // thread/start 会顺带把该目录写入最近目录索引。
-      await refreshWorkspaces();
+      await sess.refreshWorkspaces();
     } else {
       await onBrowse();
     }
@@ -1162,8 +896,42 @@ export default function App() {
     // 「移除」只是视图操作,不删数据:目录离开索引后 thread/listAll 不再扫描它,
     // 分组随之从侧栏消失,但 <dir>/.yi-agent/ 下的对话文件仍然保留。
     // 失败时也刷新,保证 UI 与服务端状态一致。
-    await refreshThreads();
-    await refreshWorkspaces();
+    await sess.refreshThreads();
+    await sess.refreshWorkspaces();
+  };
+
+  /**
+   * 关联文件夹：原生选目录 → `workspace/link` → 刷新分组与最近目录。
+   *
+   * 关联只在**新建会话时**快照进 `ThreadMeta.extra_roots`，所以这里不需要碰任何
+   * 已在跑的会话：它们的根集在设计上就固定了（改关联只影响之后新建的会话）。
+   */
+  const linkFolder = async (primary: string) => {
+    let child: string | null = null;
+    try {
+      child = await pickDirectory();
+      if (!child) return;
+      await clientRef.current?.request("workspace/link", { primary, child });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+      return;
+    }
+    // 成功后刷新：附属根要从顶层分组挪进主根的嵌套小节，两份数据都得重新拉。
+    await sess.refreshThreads();
+    await sess.refreshWorkspaces();
+  };
+
+  /** 解除关联。失败也刷新，保证 UI 与服务端一致（与 removeWorkspace 同口径）。 */
+  const unlinkFolder = async (child: string) => {
+    try {
+      await clientRef.current?.request("workspace/unlink", { child });
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+    }
+    await sess.refreshThreads();
+    await sess.refreshWorkspaces();
   };
 
   const renameThread = async (id: string, title: string) => {
@@ -1175,7 +943,7 @@ export default function App() {
       setCurrentError(formatError(e));
       force((v) => v + 1);
     }
-    await refreshThreads();
+    await sess.refreshThreads();
   };
 
   const deleteThread = async (id: string) => {
@@ -1244,13 +1012,14 @@ export default function App() {
     deleteCachedContent(id);
     persistTimers.current.delete(id);
     cachedAt.current.delete(id);
-    if (id === currentId) {
-      setCurrentId(null);
+    if (id === sess.currentId) {
+      sess.setCurrentId(null);
       // 没有当前会话了，面板与它的 diff 也必须退场：留着就是一片无主的旧内容。
-      resetThreadDiff();
+      sess.setPanelOpen(false);
+      diff.resetThreadDiff();
     }
     force((v) => v + 1);
-    await refreshThreads();
+    await sess.refreshThreads();
   };
 
   /** 置顶 / 取消置顶；成功后重拉列表，以服务端顺序为权威。 */
@@ -1259,13 +1028,46 @@ export default function App() {
     if (!c) return;
     try {
       await c.request("thread/setPinned", { threadId: id, pinned: next });
-      await refreshThreads();
+      await sess.refreshThreads();
       force((v) => v + 1);
     } catch (e) {
       setCurrentError(formatError(e));
       // 失败也要重拉：本地不做乐观更新，UI 不能停在"看起来置顶了"的状态。
-      await refreshThreads();
+      await sess.refreshThreads();
       force((v) => v + 1);
+    }
+  };
+
+  /** 设置 / 清除某会话的颜色标签；成功后重拉列表，以服务端为权威。 */
+  const onSetTag = async (id: string, tag: TagId | null) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("thread/setTag", { threadId: id, tag });
+      await sess.refreshThreads();
+      force((v) => v + 1);
+    } catch (e) {
+      setCurrentError(formatError(e));
+      // 失败也要重拉：本地不做乐观更新，UI 不能停在「看起来打上了」的状态。
+      await sess.refreshThreads();
+      force((v) => v + 1);
+    }
+  };
+
+  /**
+   * 保存单个颜色标签的显示名。
+   *
+   * 只提交改动的那一个键（服务端按键合并），成功后用**服务端**读回的覆盖项重建
+   * 本地映射——服务端是权威，本端不自行猜测合并结果。广播随后到达，两端一致。
+   */
+  const saveTagName = async (tagId: TagId, name: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("ui/settings/write", { tag_names: { [tagId]: name } });
+      force((v) => v + 1);
+    } catch (e) {
+      setCurrentError(formatError(e));
     }
   };
 
@@ -1273,17 +1075,17 @@ export default function App() {
   const onReorderPinned = async (orderedIds: string[]) => {
     const c = clientRef.current;
     if (!c) return;
-    const prev = pinned;
+    const prev = sess.pinned;
     const byId = new Map(prev.map((t) => [t.thread_id, t]));
     // 乐观：先按落点顺序重排，`pin_seq` 的权威值仍由服务端在重拉时给出。
-    setPinned(orderedIds.map((id) => byId.get(id)).filter((t): t is ThreadSummary => !!t));
+    sess.setPinned(orderedIds.map((id) => byId.get(id)).filter((t): t is ThreadSummary => !!t));
     force((v) => v + 1);
     try {
       await c.request("thread/reorderPinned", { threadIds: orderedIds });
     } catch (e) {
       setCurrentError(formatError(e));
-      setPinned(prev);
-      await refreshThreads();
+      sess.setPinned(prev);
+      await sess.refreshThreads();
       force((v) => v + 1);
     }
   };
@@ -1372,41 +1174,41 @@ export default function App() {
         if (n.method === "ui/settings/updated") {
           // 对话（set_theme 工具）改了主题：跟随它。同时标记已触碰，免得仍在途
           // 的首屏 read 用旧值把它覆盖回去。服务端推来的即权威值，记作回退基线。
-          themeTouchedRef.current = true;
+          prefs.themeTouchedRef.current = true;
           const next = parseTheme(n.params.theme);
-          confirmedThemeRef.current = next;
-          setTheme(next);
+          prefs.confirmedThemeRef.current = next;
+          prefs.setTheme(next);
           return;
         }
         if (n.method === "ui/gitDiff/focus") {
           // 模型通过 `show_git_diff` 工具要求聚焦某会话的 diff：`threadId` 可为
           // null（=当前会话），闭包里读不到最新 state，故回退到 ref。
-          const target = n.params.threadId ?? currentIdRef.current;
+          const target = n.params.threadId ?? sess.currentIdRef.current;
           // 只认当前会话。推送给的是**别人**的 diff 时，直接不产生效果——面板
           // 不打开、Tab 不改、提示语/基准不落，一次 `thread/diff/read` 都不发。
           // 空看总好过错看：没有归属校验时，这条推送会把 `note` 挂到用户正看着
           // 的另一条会话的 diff 上（用户看不到那处改动，却被一段提示指认，是
           // 静默的错配）。`loadThreadDiff` 的归属门挡得住写入，但推送**本身**
           // 不该先劫持当前视图，所以门设在这里。
-          if (target === null || target !== currentIdRef.current) return;
-          setDetailTab("diff");
-          setPanelOpen(true);
+          if (target === null || target !== sess.currentIdRef.current) return;
+          sess.setDetailTab("diff");
+          sess.setPanelOpen(true);
           // 提示语随快照走（见 `pendingNoteRef`）：此行只登记挂起值。
-          setPendingDiffNote(n.params.note ?? null);
-          void loadThreadDiff(target, n.params.base);
+          diff.setPendingDiffNote(n.params.note ?? null);
+          void diff.loadThreadDiff(target, n.params.base);
           return;
         }
         if (n.method === "agent/trace/event") {
           // 只接受当前打开任务的流:换任务时旧流可能还有在途帧,丢弃它们比
           // 把两个任务的轨迹拼在一起安全。
-          setTraceRows((prev) =>
-            n.params.taskId === openTaskId.current ? [...prev, n.params.row] : prev,
+          sess.setTraceRows((prev) =>
+            n.params.taskId === sess.openTaskId.current ? [...prev, n.params.row] : prev,
           );
           return;
         }
         if (n.method === "process/updated") {
           // 通知只是"该重拉了":它不携带权威数据,重拉 process/list 才是。
-          void refreshProcesses(n.params.thread_id);
+          void proc.refreshProcesses(n.params.thread_id);
           return;
         }
         if (n.method === "thread/titleChanged") {
@@ -1414,13 +1216,33 @@ export default function App() {
           // 它写进本地列表的两份（分组 + 置顶）即可——不必再拉一次全量
           // `thread/listAll`，也与 `thread/modelChanged` 同族。
           const next = applyTitleChange(
-            groupsRef.current,
-            pinnedRef.current,
+            sess.groupsRef.current,
+            sess.pinnedRef.current,
             n.params.thread_id,
             n.params.title,
           );
-          setGroups(next.groups);
-          setPinned(next.pinned);
+          sess.setGroups(next.groups);
+          sess.setPinned(next.pinned);
+          force((v) => v + 1);
+          return;
+        }
+        if (n.method === "thread/tagChanged") {
+          // 服务端推来的权威标签（null = 已清除）。就地落笔即可，不必重拉列表。
+          const next = applyTagChange(
+            sess.groupsRef.current,
+            sess.pinnedRef.current,
+            n.params.thread_id,
+            n.params.tag,
+          );
+          sess.setGroups(next.groups);
+          sess.setPinned(next.pinned);
+          force((v) => v + 1);
+          return;
+        }
+        if (n.method === "ui/tagNames/updated") {
+          // 标签显示名变更（全局帧）：合成完整映射后重渲染，色点 title / 菜单
+          // aria-label / 搜索匹配全部随之更新。
+          setTagNames(resolveTagNames(n.params.tag_names));
           force((v) => v + 1);
           return;
         }
@@ -1431,7 +1253,7 @@ export default function App() {
         // （`error` 无归属、由 store 归到当前会话，在此跳过）。其余 `agent/*`、
         // `ui/*` 通知已在上方分支提前返回。
         if ("thread_id" in n.params) schedulePersist(n.params.thread_id);
-        if (n.method === "turn/completed") void refreshThreads();
+        if (n.method === "turn/completed") void sess.refreshThreads();
       });
       client.onApproval((r) => {
         store.setApproval(r);
@@ -1449,11 +1271,11 @@ export default function App() {
         if (
           isRemoteClient() &&
           s.code === 4401 &&
-          !repairingRef.current &&
-          !repairDismissedRef.current
+          !prefs.repairingRef.current &&
+          !prefs.repairDismissedRef.current
         ) {
-          setRepairNotice(REPAIR_REMOVED_TEXT);
-          setRepairing(true);
+          prefs.setRepairNotice(REPAIR_REMOVED_TEXT);
+          prefs.setRepairing(true);
         }
         // sidecar 退出后宿主会自动重启它(bridge 的监管循环)。重连不能依赖用户
         // 重启 App:等新进程起来、状态回到 connecting 时重新握手。断开时清掉
@@ -1467,9 +1289,17 @@ export default function App() {
           // 这次握手已经废了:重新从 base 起算退避(handshake 成功时本就会归零,
           // 这里针对的是"连上后立刻断"——attempt 不能被永久抬到高位)。
           warm.current.clear();
+          // 推送来的运行状态同样不再成立：新进程对任何会话都没有内存 agent。
+          // 不清它的话，一条崩溃前正在跑、而 `listAll` 现已报 `idle` 的会话会
+          // 停在 `running`，`selectThread` 会因此跳过 resume，新进程里那个 agent
+          // 永远不被重建，之后发送撞上 `-32011` 且无法自愈。详见
+          // `ThreadStore.forgetPushStatuses`。
+          store.forgetPushStatuses();
           // 同样的理由:新进程不记得任何订阅,窗口必须清空,否则重连后
           // 返回"看起来还 warm"的会话时不会再发 subscribe,内容通知被静默过滤。
           subWindow.current = new SubscriptionWindow();
+          // 新连接要为「none 缓存会话」重补一次尾部（见 `toppedUp` 的说明）。
+          toppedUp.current.clear();
           scheduleReconnect();
         }
       });
@@ -1478,48 +1308,93 @@ export default function App() {
     // 一次完整握手:任何一次重连都要重放它,因为新进程的记忆是空的。
     const handshake = async (client: RpcClient) => {
       try {
-        await client.request("initialize", {});
+        const initialized = await client.request<Record<string, unknown>>("initialize", {
+          ...(isRemoteClient() ? { resumeHints: buildResumeHints() } : {}),
+        });
+        syncPlanRef.current = parseSyncPlan(initialized);
         const settings = await client.request<{
           theme?: unknown;
           board_watchman_enabled?: unknown;
           relay_url?: unknown;
+          tag_names?: unknown;
         }>("ui/settings/read", {});
         // 中继地址没有「用户正在改」的触碰标记：设置页是模态的，首屏 read 回来
         // 时用户还没法编辑它，直接采纳权威值即可。未配置（null）→ 空串。
-        setRelayUrl(typeof settings.relay_url === "string" ? settings.relay_url : "");
+        prefs.setRelayUrl(typeof settings.relay_url === "string" ? settings.relay_url : "");
         // 只有在此之后没有更新的主题选择时才采纳权威值：read 在途期间用户改了
         // 主题或收到 ui/settings/updated，更新的那个才是当前选择。
-        if (!themeTouchedRef.current) {
+        if (!prefs.themeTouchedRef.current) {
           const authoritative = parseTheme(settings.theme);
-          confirmedThemeRef.current = authoritative;
-          setTheme(authoritative);
+          prefs.confirmedThemeRef.current = authoritative;
+          prefs.setTheme(authoritative);
         }
         // 值守：直接读这份 settings（同一趟请求里就有），不再多发一次
         // `ui/settings/read`。缺省口径由 parseBoardWatchman 与 readBoardWatchman 共享。
         // 同样只在用户还没拨过开关时采纳：重启重放握手时面板已在屏上，read 在途
         // 期间拨下的开关不能被这趟迟到的旧值悄悄覆盖回原样。
-        if (!watchmanTouchedRef.current) {
-          setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
+        if (!board.watchmanTouchedRef.current) {
+          board.setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
         }
+        // 标签显示名：服务端只回用户覆盖项，与默认名合并成完整 6 键。
+        setTagNames(
+          resolveTagNames(
+            settings.tag_names && typeof settings.tag_names === "object"
+              ? (settings.tag_names as Record<string, string>)
+              : null,
+          ),
+        );
         // 首启引导：读不到状态(宿主老、RPC 报错、字段缺失)一律按「不需要」处理，
         // 绝不因为一个读失败弹向导、更不挡住主界面。
         try {
           const status = await onboardingStatus((m, p) =>
             (clientRef.current as RpcClient).request(m, p),
           );
-          setOnboarding({ needed: status.needed && !status.dismissed, reasons: status.reasons });
+          prefs.setOnboarding({ needed: status.needed && !status.dismissed, reasons: status.reasons });
         } catch {
-          setOnboarding({ needed: false, reasons: [] });
+          prefs.setOnboarding({ needed: false, reasons: [] });
         }
-        await refreshWorkspaces();
+        await sess.refreshWorkspaces();
         const list = await client.request<{
           groups: WorkspaceGroup[];
           pinned?: ThreadSummary[];
         }>("thread/listAll", {});
-        setGroups(list.groups);
-        setPinned(list.pinned ?? []);
+        sess.setGroups(list.groups);
+        sess.setPinned(list.pinned ?? []);
         store.seed(list.groups.flatMap((g) => g.threads));
         if (isRemoteClient()) writeListCache(localStorage, list.groups, list.pinned ?? [], store.currentId);
+        // 已有会话的项目目录不会被服务端的 `listAll` 懒创建覆盖（那会改写它既
+        // 有的分组语义），故这类项目的组长入口要靠客户端补：对「一个组长都没
+        // 有」且确实存在的目录组逐个 `thread/lead`，再重取一次列表把新组长带出
+        // 来。**不 await 在首屏关键路径上**——补组长是锦上添花，绝不能推迟首屏
+        // 渲染或扣住后续的 selectThread；失败一律忽略。只在整个进程里补一次
+        // （`leadEnsured`），服务端创建本身幂等。
+        if (!leadEnsured.current) {
+          const needsLead = list.groups.filter(
+            (g) => g.exists && !g.threads.some((t) => t.role === "lead"),
+          );
+          if (needsLead.length > 0) {
+            leadEnsured.current = true;
+            void (async () => {
+              for (const g of needsLead) {
+                try {
+                  await client.request("thread/lead", { cwd: g.workspace });
+                } catch {
+                  // 单个目录补建失败只影响它自己的组长条目，继续下一个。
+                }
+              }
+              try {
+                const patched = await client.request<{
+                  groups: WorkspaceGroup[];
+                  pinned?: ThreadSummary[];
+                }>("thread/listAll", {});
+                sess.setGroups(patched.groups);
+                store.seed(patched.groups.flatMap((g) => g.threads));
+              } catch {
+                // 重取失败就保留首屏那一份：至少侧栏照常可用。
+              }
+            })();
+          }
+        }
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
         // 手机端：握手（含重连/切回前台）不是「用户换了页面」，当前会话——冷启从
         // 缓存恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看
@@ -1530,7 +1405,7 @@ export default function App() {
         // 才回落第一条。桌面端保留原行为（每次选第一条）。
         // （副作用：selectThread 会 resetThreadDiff()，故重连时 diff 面板若开着会
         // 收起——会话未变，属既有行为，且窄屏下 diff 面板本就不渲染。）
-        const keptId = isRemoteClient() ? currentIdRef.current : null;
+        const keptId = isRemoteClient() ? sess.currentIdRef.current : null;
         const kept =
           keptId !== null &&
           list.groups.some((g) => g.threads.some((t) => t.thread_id === keptId));
@@ -1546,11 +1421,11 @@ export default function App() {
         setStatus("connected");
         // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
         // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
-        repairDismissedRef.current = false;
+        prefs.repairDismissedRef.current = false;
         // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
         // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
         // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
-        await refreshBoards();
+        await board.refreshBoards();
       } catch (e) {
         const msg = formatError(e);
         setCurrentError(msg);
@@ -1585,6 +1460,8 @@ export default function App() {
       // twice: an append-only `item/delta` duplicates the streamed text, and it
       // only "converges" because `item/completed` replaces the whole item by id.
       clientRef.current?.dispose();
+      // 新连接 = 新的对账周期：为「none 缓存会话」的静默补齐重新开账（见 `toppedUp`）。
+      toppedUp.current.clear();
       const client = new RpcClient(transportFactory(), (raw) => recoveryRef.current!(raw));
       clientRef.current = client;
       wireClient(client);
@@ -1595,7 +1472,7 @@ export default function App() {
     // 手机/iPad 切回前台时 socket 多半已被系统掐断,而状态不会自己回来。
     document.addEventListener("visibilitychange", onVisibilityChange);
     // 看板内容由 boardTick 每 2 秒刷新选中项目，读失败绝不影响主流程。
-    const boardTimer = window.setInterval(() => boardTick.current(), 2000);
+    const boardTimer = window.setInterval(() => board.boardTick.current(), 2000);
     return () => {
       disposed = true;
       if (restartTimer !== null) window.clearTimeout(restartTimer);
@@ -1603,7 +1480,7 @@ export default function App() {
       window.clearInterval(boardTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pairingVersion]);
+  }, [prefs.pairingVersion]);
 
   /**
    * Run a slash command. Commands never reach the agent: their output is a
@@ -1686,8 +1563,10 @@ export default function App() {
     if (!id || !c) return false;
     // 离线时不发：缓存内容可以看，但不能对着它发消息（服务端根本收不到）。
     // 只提示、保留草稿，交给用户连上后再发——不排队、不自动重发。
-    if (offline) {
-      store.view(id).session.lastError = "正在连接，请稍候";
+    // 同样地，会话尚在对账中（syncing）也不能发：屏上可能还是旧缓存，此刻发出去
+    // 的上下文与服务端实际上下文可能不一致（spec §5.1）。
+    if (offline || store.peek(id)?.syncState === "syncing") {
+      store.view(id).session.lastError = offline ? "正在连接，请稍候" : "正在同步，请稍候";
       force((v) => v + 1);
       return false;
     }
@@ -1735,14 +1614,52 @@ export default function App() {
     const hasFiles = files.length > 0;
     let method: "turn/interject" | "turn/start" =
       !hasFiles && store.peek(id)?.status === "running" ? "turn/interject" : "turn/start";
+    // 上下文锚点（spec §7.1）：客户端声明它以为的会话世代与游标。只在 `turn/start`
+    // 上发（`turn/interject` 是并入在途回合，不重开上下文），且仅手机端发；桌面端
+    // 字节不变。`contentEpoch` 未知（null）时不发——缺字段=保守，服务端就不校验。
+    const withAnchor = (m: "turn/interject" | "turn/start") =>
+      isRemoteClient() && session.contentEpoch !== null && m === "turn/start"
+        ? {
+            ...params,
+            contextAnchor: {
+              contentEpoch: session.contentEpoch,
+              lastItemId: session.lastServerItemId,
+            },
+          }
+        : params;
     let lastError: unknown = null;
     for (let hop = 0; hop < 2; hop += 1) {
       try {
-        await c.request(method, params);
+        await c.request(method, withAnchor(method));
         // 成功才清空该会话的待发附件（本地路径），服务端已把它们落库。
         setPending((prev) => ({ ...prev, [id]: [] }));
         return true;
       } catch (e) {
+        // 锚点已失效（会话在别处被清空）：绝不自动重发——用户的意图不该落到一个
+        // 他没看过的上下文上。置 syncing、清掉两道会挡住重同步的守卫、走全量 resume
+        // （spec §7.3）。先于既有的错误处理，否则会被当成普通失败。
+        if (
+          isRemoteClient() &&
+          (e as { data?: { code?: string } } | undefined)?.data?.code === "stale_context"
+        ) {
+          const v = store.peek(id);
+          if (v) {
+            v.syncState = "syncing";
+            // `0` 只是「强制作废」的哨兵：清掉 warm 后 selectThread 会走 resume 全量
+            // 回放，回放中 upsertItems 会以真实世代覆盖它。
+            v.session.adoptEpoch(0, null);
+          }
+          warm.current.delete(id);
+          inFlightResume.current.delete(id);
+          store.view(id).session.lastError = "会话内容已在别处被清空，正在重新加载";
+          // 发送没有成功：乐观回声必须回滚，否则转录里会留下一条「已发出」的幽灵
+          // 消息（与下方的普通失败路径一致）。草稿与待发附件保留，用户确认后可重发
+          //（spec §7.3「草稿保留」）。
+          session.dropLocalUserMessage(text);
+          force((n) => n + 1);
+          void selectThread(id, { leaveBoard: false, forceResume: true });
+          return false;
+        }
         lastError = e;
         const code = sendMethodMismatchCode(e);
         // 带附件时没有可换的方法：换到 turn/interject 只会丢掉附件。就地失败，
@@ -1958,45 +1875,26 @@ export default function App() {
   const onToggleWatchman = async (next: boolean) => {
     // 先标记已触碰，再发写入（与 changeTheme 对 theme 的做法一致）：此刻若还有
     // 一趟 ui/settings/read 在途（如重启重放的握手），它回来时必须让位。
-    watchmanTouchedRef.current = true;
+    board.watchmanTouchedRef.current = true;
     try {
-      const result = await writeBoardWatchman(boardRpc, next);
-      setWatchmanEnabled(next);
-      setWatchmanWarning(result?.warning ?? null);
+      const result = await writeBoardWatchman(board.boardRpc, next);
+      board.setWatchmanEnabled(next);
+      board.setWatchmanWarning(result?.warning ?? null);
     } catch (error) {
-      setWatchmanWarning(formatError(error));
+      board.setWatchmanWarning(formatError(error));
     }
-  };
-
-  const changeTheme = (next: Theme) => {
-    // 立即生效，再落盘。
-    themeTouchedRef.current = true;
-    setTheme(next);
-    clientRef.current?.request("ui/settings/write", { theme: next }).then(
-      () => {
-        // 服务端已接受：把它记作新的回退基线。
-        confirmedThemeRef.current = next;
-      },
-      (e) => {
-        // 写失败：回退到**最近一次已确认**的主题，而不是本次调用时刻的闭包值。
-        // 并发写时后者会退回到中间态（例如先浅后深都失败，却停在深）。
-        setTheme(confirmedThemeRef.current);
-        setCurrentError(formatError(e));
-        force((v) => v + 1);
-      },
-    );
   };
 
   // Sidebar badges: server-authoritative status per thread + unread marker for
   // threads that finished a turn while the user was looking elsewhere.
   const statuses = new Map<string, ThreadStatus>();
   const unread = new Map<string, TurnStatus>();
-  for (const g of groups)
+  for (const g of sess.groups)
     for (const t of g.threads) {
       const v = store.peek(t.thread_id);
       if (!v) continue;
       statuses.set(t.thread_id, v.status);
-      if (v.unread && t.thread_id !== currentId)
+      if (v.unread && t.thread_id !== sess.currentId)
         unread.set(t.thread_id, v.session.lastStatus ?? "completed");
     }
 
@@ -2004,10 +1902,6 @@ export default function App() {
   const bannerItems = store
     .pendingApprovalsElsewhere()
     .filter((r) => !dismissedApprovals.current.has(r.id));
-
-  useEffect(() => {
-    applyTheme(theme);
-  }, [theme]);
 
   // 首启的 iOS 没有远端配置时先配对：此时 transportFactory 会退回
   // tauriTransport()，而 iOS 上根本没有 Tauri IPC——继续往下渲染就是死路。
@@ -2018,7 +1912,7 @@ export default function App() {
         // PairingScreen 保证这个回调发生在 saveRemoteConfig 之后，所以此刻
         // 存储里已经有 {url, token}；版本号让上面的 effect 重跑，这一次
         // transportFactory 选中的是 ws。
-        onPaired={() => setPairingVersion((v) => v + 1)}
+        onPaired={() => prefs.setPairingVersion((v) => v + 1)}
         redeem={defaultRedeem}
       />
     );
@@ -2026,7 +1920,7 @@ export default function App() {
 
   // 已配对的手机点「重新配对」：同一个界面，多一条返回。非破坏性——提交成功
   // 才覆盖配置，返回即回原离线态继续退避重连。
-  if (repairing) {
+  if (prefs.repairing) {
     return (
       <PairingScreen
         // 预填当前已存地址（用户可改可重扫）；读不到时留空，不影响提交。
@@ -2035,20 +1929,20 @@ export default function App() {
             (globalThis.localStorage as StorageLike | undefined) ?? emptyStorageLike,
           )?.url
         }
-        notice={repairNotice ?? undefined}
+        notice={prefs.repairNotice ?? undefined}
         onCancel={() => {
-          setRepairing(false);
-          setRepairNotice(null);
+          prefs.setRepairing(false);
+          prefs.setRepairNotice(null);
           // 记住"用户已经答过"：退避重连再撞 4401 也不得把他弹回来。
-          repairDismissedRef.current = true;
+          prefs.repairDismissedRef.current = true;
         }}
         onPaired={() => {
           // 已配对过时 `inited.current` 仍是 true，单靠版本号会被守卫挡掉；
           // 必须先放开守卫，让旧 effect 走 cleanup、新 effect 真正建连。
           inited.current = false;
-          setRepairing(false);
-          setRepairNotice(null);
-          setPairingVersion((v) => v + 1);
+          prefs.setRepairing(false);
+          prefs.setRepairNotice(null);
+          prefs.setPairingVersion((v) => v + 1);
         }}
         redeem={defaultRedeem}
       />
@@ -2057,16 +1951,16 @@ export default function App() {
 
   return (
     <>
-      {onboarding.needed && (
+      {prefs.onboarding.needed && (
         <OnboardingWizard
-          reasons={onboarding.reasons}
+          reasons={prefs.onboarding.reasons}
           call={(m, p) => (clientRef.current as RpcClient).request(m, p)}
           onDone={(result?: OnboardingOutcome) => {
-            setOnboarding({ needed: false, reasons: [] });
+            prefs.setOnboarding({ needed: false, reasons: [] });
             // `.env` 已写、清单没收边（部分成功）：主界面顶部留一条可关闭提示，
             // 别让用户在「已保存」与「模型仍不可用」之间一头雾水。
             if (result && !result.imported) {
-              setOnboardingNotice(
+              prefs.setOnboardingNotice(
                 "已保存到 .env，但未纳入模型清单（可稍后在设置里点「导入当前配置」）" +
                   (result.importError ? `：${result.importError}` : ""),
               );
@@ -2082,16 +1976,16 @@ export default function App() {
         <TitleBar />
         {/* 引导部分成功的提示（spec §4.7）：可关闭的顶部横幅，样式与 ApprovalBanner
             一致；关闭即清空状态，不再出现。 */}
-        {onboardingNotice !== null && (
+        {prefs.onboardingNotice !== null && (
           <div
             role="status"
             aria-live="polite"
             className="flex flex-wrap items-center gap-3 border-b border-amber-900/60 bg-amber-950/60 px-3 py-2 text-xs text-amber-100"
           >
-            <span className="min-w-0">{onboardingNotice}</span>
+            <span className="min-w-0">{prefs.onboardingNotice}</span>
             <button
               type="button"
-              onClick={() => setOnboardingNotice(null)}
+              onClick={() => prefs.setOnboardingNotice(null)}
               aria-label="关闭提示"
               className="ml-auto rounded px-1 text-amber-300 hover:text-amber-100"
             >
@@ -2100,11 +1994,11 @@ export default function App() {
           </div>
         )}
         <div className="flex min-h-0 flex-1 flex-row">
-        {isMobile && sidebarOpen && (
+        {isMobile && sess.sidebarOpen && (
           <div
             className="app-sidebar-backdrop"
             aria-hidden="true"
-            onClick={() => setSidebarOpen(false)}
+            onClick={() => sess.setSidebarOpen(false)}
           />
         )}
         {/*
@@ -2118,34 +2012,38 @@ export default function App() {
         <div
           className={
             isMobile
-              ? `app-sidebar flex min-h-0 shrink-0${sidebarOpen ? " sidebar-open" : ""}`
+              ? `app-sidebar flex min-h-0 shrink-0${sess.sidebarOpen ? " sidebar-open" : ""}`
               : "flex min-h-0 shrink-0"
           }
         >
         <ThreadSidebar
-          groups={groups}
-          workspaces={workspaces}
-          currentId={currentId}
-          pinned={pinned}
+          groups={sess.groups}
+          workspaces={sess.workspaces}
+          currentId={sess.currentId}
+          pinned={sess.pinned}
           statuses={statuses}
           unread={unread}
           onSelect={selectThread}
           onRename={renameThread}
           onDelete={deleteThread}
           onTogglePin={onTogglePin}
+          onSetTag={onSetTag}
+          tagNames={tagNames}
           onReorderPinned={onReorderPinned}
           onNew={onNew}
           onRemoveWorkspace={removeWorkspace}
           onBrowse={onBrowse}
-          boards={boards}
-          boardSummaries={boardSummaries}
-          selectedBoard={selectedBoard}
+          boards={board.boards}
+          boardSummaries={board.boardSummaries}
+          selectedBoard={board.selectedBoard}
           onCreateBoard={(path) => void onCreateBoard(path)}
           onRemoveBoard={(path) => void onRemoveBoard(path)}
           onOpenBoard={onOpenBoard}
           isMobile={isMobile}
           statusStale={offline}
-          onOpenSettings={() => setSettingsOpen(true)}
+          onOpenSettings={() => prefs.setSettingsOpen(true)}
+          onLinkFolder={linkFolder}
+          onUnlinkFolder={unlinkFolder}
         />
         </div>
         <div className="app-main relative flex min-w-0 flex-1 flex-col">
@@ -2153,8 +2051,8 @@ export default function App() {
             <button
               type="button"
               aria-label="会话列表"
-              aria-expanded={sidebarOpen}
-              onClick={() => setSidebarOpen(true)}
+              aria-expanded={sess.sidebarOpen}
+              onClick={() => sess.setSidebarOpen(true)}
               // 手机上的唯一会话入口：44px 触控目标（Apple HIG），浮在主列左上角，
               // 不再占一条常驻的左侧竖条——抽屉本身是 fixed 离屏的，收起时聊天区
               // 因此能拿满整宽。顶部让位内边距由 .app-main 提供（见 index.css），
@@ -2169,33 +2067,33 @@ export default function App() {
           {/* 看板是主区域的一个平级页面：选中才出现，问的是被选中那个项目。
               离开看板走「点某条会话」（selectThread/newThread 清 selectedBoard）；
               没有选中时主区域就是原来的对话。 */}
-          {selectedBoard !== null ? (
+          {board.selectedBoard !== null ? (
             <section
               aria-label="Superpowers 看板"
-              className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-neutral-800 bg-neutral-925"
+              className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-line bg-panel"
             >
               {/* 顶栏：项目路径 + 开关/值守 + 入队 + 错误行 */}
               <div className="flex items-center gap-3 px-4 pt-3">
-                <span className="truncate font-mono text-xs text-fg-muted" title={selectedBoard}>
-                  {selectedBoard}
+                <span className="truncate font-mono text-xs text-fg-muted" title={board.selectedBoard}>
+                  {board.selectedBoard}
                 </span>
               </div>
               <SuperpowersKanbanSettings
-                switchOn={boardOn}
-                source={boardSource}
+                switchOn={board.boardOn}
+                source={board.boardSource}
                 onToggle={(next) => void onToggleBoardSwitch(next)}
-                watchmanEnabled={watchmanEnabled}
+                watchmanEnabled={board.watchmanEnabled}
                 onToggleWatchman={(next) => void onToggleWatchman(next)}
-                watchmanWarning={watchmanWarning}
+                watchmanWarning={board.watchmanWarning}
               />
-              {boardError !== null && (
+              {board.boardError !== null && (
                 <div className="flex items-center gap-3 px-4 pb-3 text-xs text-red-400">
-                  <span>{BOARD_ERROR_TEXT[boardError]}</span>
-                  {boardError === "not_created" && (
+                  <span>{BOARD_ERROR_TEXT[board.boardError]}</span>
+                  {board.boardError === "not_created" && (
                     <button
                       type="button"
-                      onClick={() => void onCreateBoard(selectedBoard)}
-                      className="rounded border border-neutral-700 px-2 py-0.5 text-neutral-300 hover:text-neutral-100"
+                      onClick={() => void onCreateBoard(board.selectedBoard!)}
+                      className="rounded border border-line-strong px-2 py-0.5 text-fg-muted hover:text-fg"
                     >
                       创建看板
                     </button>
@@ -2205,34 +2103,66 @@ export default function App() {
               <SuperpowersKanbanEnqueue
                 pickFile={pickFile}
                 enqueue={(spec, plan) =>
-                  enqueueBoardCard(boardRpc, selectedBoard, spec, plan)
+                  enqueueBoardCard(board.boardRpc, board.selectedBoard!, spec, plan)
+                }
+                prequeue={(title) =>
+                  enqueuePrequeuedCard(board.boardRpc, board.selectedBoard!, title)
                 }
               />
               <SuperpowersKanbanView
-                switchOn={boardOn}
-                source={boardSource}
-                cards={boardCards}
-                pluginMissing={boardPluginMissing}
-                expandedDone={doneExpanded}
-                onToggleDone={() => setDoneExpanded((v) => !v)}
+                switchOn={board.boardOn}
+                source={board.boardSource}
+                cards={board.boardCards}
+                pluginMissing={board.boardPluginMissing}
+                expandedDone={board.doneExpanded}
+                onToggleDone={() => board.setDoneExpanded((v) => !v)}
                 onOpenThread={(id) => {
                   // 点卡片上的会话链接 = 切到那个会话、离开看板（spec §4.7）：
                   // 看板是对话的兄弟视图，回去走侧栏，不再盖在会话上。
-                  setSelectedBoard(null);
+                  board.setSelectedBoard(null);
                   void selectThread(id);
+                }}
+                onPromote={(cardId) => {
+                  // 提升要先补上 spec/plan（两下选择器，任一下取消就整个不作数），
+                  // 再让插件下个 tick 把预排队卡翻成排队卡。
+                  void (async () => {
+                    board.setBoardError(null);
+                    try {
+                      const spec = await pickFile();
+                      if (spec === null) return;
+                      const plan = await pickFile();
+                      if (plan === null) return;
+                      await promoteBoardCard(
+                        board.boardRpc,
+                        board.selectedBoard!,
+                        cardId,
+                        spec,
+                        plan,
+                      );
+                      board.refreshBoards();
+                    } catch (error) {
+                      // 与看板其它写入同一条通路：把失败翻成面板上那句可操作的说法。
+                      board.setBoardError(boardErrorKind(error));
+                    }
+                  })();
                 }}
               />
             </section>
           ) : (
             <>
-              {offline && currentId !== null && cachedAt.current.has(currentId) && (
-                <CacheNotice savedAt={cachedAt.current.get(currentId)!} />
-              )}
+              {sess.currentId !== null &&
+                ((offline && cachedAt.current.has(sess.currentId)) ||
+                  store.peek(sess.currentId)?.syncState === "syncing") && (
+                  <CacheNotice
+                    savedAt={cachedAt.current.get(sess.currentId) ?? null}
+                    syncing={!offline && store.peek(sess.currentId)?.syncState === "syncing"}
+                  />
+                )}
               <ChatView
                 items={current?.session.items ?? []}
                 error={current?.session.lastError ?? null}
                 retrying={current?.session.retrying ?? null}
-                threadId={currentId}
+                threadId={sess.currentId}
                 // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
                 // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
                 call={imageCall}
@@ -2247,20 +2177,20 @@ export default function App() {
                 value={current?.draft ?? ""}
                 onDraftChange={changeDraft}
                 // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
-                attachments={currentId ? (pending[currentId] ?? []) : []}
+                attachments={sess.currentId ? (pending[sess.currentId] ?? []) : []}
                 onPickAttachments={() => void pickAttachments()}
                 onRemoveAttachment={removePendingAttachment}
-                threadId={currentId}
+                threadId={sess.currentId}
                 // 稳定的 `imageCall`（见上）：待发图片 chip 的缩略图也经它读取，
                 // 内联箭头会让每张缩略图每次渲染都重拉。
                 call={imageCall}
                 disabled={current === null}
                 isMobile={isMobile}
                 modelPicker={
-                  current !== null && currentId !== null ? (
+                  current !== null && sess.currentId !== null ? (
                     <ModelPicker
                       call={modelCall}
-                      threadId={currentId}
+                      threadId={sess.currentId}
                       currentRef={current.info?.model_ref ?? null}
                       currentModel={current.info?.model ?? null}
                       currentEffort={current.reasoningEffort}
@@ -2289,8 +2219,8 @@ export default function App() {
               offline
                 ? () => {
                     // 手动进入不带自动路径的原因文案（那是另一条路的事）。
-                    setRepairNotice(null);
-                    setRepairing(true);
+                    prefs.setRepairNotice(null);
+                    prefs.setRepairing(true);
                   }
                 : undefined
             }
@@ -2304,27 +2234,27 @@ export default function App() {
              * 撞车（两个同名控件会让人/测试都选不准）。
              */
             actions={
-              currentId && !isMobile ? (
+              sess.currentId && !isMobile ? (
                 <button
                   type="button"
                   aria-label="会话详情面板"
-                  aria-expanded={panelOpen}
-                  title={panelOpen ? "收起会话详情" : "展开会话详情"}
+                  aria-expanded={sess.panelOpen}
+                  title={sess.panelOpen ? "收起会话详情" : "展开会话详情"}
                   onClick={() => {
-                    setPanelOpen((v) => !v);
+                    sess.setPanelOpen((v) => !v);
                     // 每次打开都拿一份当前 diff：面板可能开着很久，快照会过期。
-                    if (!panelOpen) void loadThreadDiff(currentId, diffBase);
+                    if (!sess.panelOpen) void diff.loadThreadDiff(sess.currentId!, diff.diffBase);
                   }}
                   className={`flex items-center gap-1 rounded p-1 hover:bg-raised/50 hover:text-fg ${
-                    railRows.length > 0 ? "text-fg-muted" : "text-fg-subtle"
-                  } ${panelOpen ? "bg-raised/40" : ""}`}
+                    sess.railRows.length > 0 ? "text-fg-muted" : "text-fg-subtle"
+                  } ${sess.panelOpen ? "bg-raised/40" : ""}`}
                 >
                   <svg viewBox="0 0 16 16" className="size-4" fill="currentColor" aria-hidden="true">
                     <path d="M1.5 3.5h5.2v9H1.5v-9Zm1.2 1.2v6.6h2.8V4.7H2.7Z" />
                     <path d="M9.1 5.8 11.3 8 9.1 10.2V5.8Z" />
                     <path d="M12.2 5.8 14.4 8l-2.2 2.2V5.8Z" />
                   </svg>
-                  {railRows.length > 0 && <span className="text-xs">{railRows.length}</span>}
+                  {sess.railRows.length > 0 && <span className="text-xs">{sess.railRows.length}</span>}
                 </button>
               ) : null
             }
@@ -2354,38 +2284,38 @@ export default function App() {
           可见性由状态栏那颗图标管（`panelOpen`）；手机端不渲染（窄屏上它会挤没
           聊天区，与侧栏同一理由）。
         */}
-        {currentId && panelOpen && !isMobile && (
+        {sess.currentId && sess.panelOpen && !isMobile && (
           <ThreadDetailPanel
-            tab={detailTab}
+            tab={sess.detailTab}
             onTabChange={(t) => {
-              setDetailTab(t);
+              sess.setDetailTab(t);
               // 切到 diff 就取一份当前快照；轨迹侧的行由 openDetail/watch 维护。
-              if (t === "diff") void loadThreadDiff(currentId, diffBase);
+              if (t === "diff") void diff.loadThreadDiff(sess.currentId!, diff.diffBase);
               // 切走进程 tab 即离开当前进程详情:留着会让详情盖住别的 tab 的列表。
               if (t !== "processes") {
-                setOpenProcessId(null);
-                setProcessOutput(null);
+                proc.setOpenProcessId(null);
+                proc.setProcessOutput(null);
               }
             }}
             onClose={() => {
-              setPanelOpen(false);
-              void closeDetail(currentId);
+              sess.setPanelOpen(false);
+              void sess.closeDetail(sess.currentId!);
             }}
-            railRows={railStore.get(currentId)}
-            selectedTaskId={openSubagent}
-            onOpenTask={(taskId) => void openDetail(currentId, taskId)}
-            onLeaveTask={() => void closeDetail(currentId)}
+            railRows={railStore.get(sess.currentId)}
+            selectedTaskId={sess.openSubagent}
+            onOpenTask={(taskId) => void sess.openDetail(sess.currentId!, taskId)}
+            onLeaveTask={() => void sess.closeDetail(sess.currentId!)}
             traceProps={
-              openSubagent
+              sess.openSubagent
                 ? {
-                    taskId: openSubagent,
-                    row: railStore.get(currentId).find((r) => r.taskId === openSubagent) ?? null,
-                    children: childrenOf(railStore.get(currentId), openSubagent),
-                    rows: traceRows,
-                    onDrill: (taskId) => void openDetail(currentId, taskId),
+                    taskId: sess.openSubagent,
+                    row: railStore.get(sess.currentId).find((r) => r.taskId === sess.openSubagent) ?? null,
+                    children: childrenOf(railStore.get(sess.currentId), sess.openSubagent),
+                    rows: sess.traceRows,
+                    onDrill: (taskId) => void sess.openDetail(sess.currentId!, taskId),
                     onMessage: async (taskId, message) => {
                       await clientRef.current?.request("agent/message", {
-                        threadId: currentId,
+                        threadId: sess.currentId,
                         taskId,
                         message,
                       });
@@ -2393,11 +2323,11 @@ export default function App() {
                     onCancel: async (taskId) =>
                       await clientRef.current!.request<AgentCancelPreviewResult>(
                         "agent/cancel/preview",
-                        { threadId: currentId, taskId },
+                        { threadId: sess.currentId, taskId },
                       ),
                     onConfirmCancel: async (taskId, token) => {
                       await clientRef.current?.request("agent/cancel", {
-                        threadId: currentId,
+                        threadId: sess.currentId,
                         taskId,
                         confirmationToken: token,
                       });
@@ -2409,38 +2339,38 @@ export default function App() {
               // 只为**本会话**持有的快照发画面（`diffOwnerRef` 是判据，不是
               // `currentId` 的影子）。在途响应回来时人可能已经切走，届时即使
               // state 里还留着上一条，也不许它冒充当前会话的 diff。
-              diff: diffOwnerRef.current === currentId ? threadDiff : null,
-              loading: diffLoading,
+              diff: diff.diffOwnerRef.current === sess.currentId ? diff.threadDiff : null,
+              loading: diff.diffLoading,
               // 错误是**具名**的：服务端文案里没有会话标识，错了会话谁都不知道，
               // 故与快照同门——非本会话的错误宁可不显示。
-              error: diffOwnerRef.current === currentId ? diffError : null,
-              activeCommit,
-              note: diffNote,
-              onRefresh: () => void loadThreadDiff(currentId, diffBase),
-              onOpenCommit: (sha) => void openCommit(currentId, sha),
-              onCloseCommit: () => setActiveCommit(null),
+              error: diff.diffOwnerRef.current === sess.currentId ? diff.diffError : null,
+              activeCommit: diff.activeCommit,
+              note: diff.diffNote,
+              onRefresh: () => void diff.loadThreadDiff(sess.currentId!, diff.diffBase),
+              onOpenCommit: (sha) => void diff.openCommit(sess.currentId!, sha),
+              onCloseCommit: () => diff.setActiveCommit(null),
             }}
             processProps={{
-              processes,
-              selectedProcessId: openProcessId,
+              processes: proc.processes,
+              selectedProcessId: proc.openProcessId,
               onOpenProcess: (processId) => {
-                setOpenProcessId(processId);
-                setProcessOutput(null);
+                proc.setOpenProcessId(processId);
+                proc.setProcessOutput(null);
               },
               onCloseProcess: () => {
-                setOpenProcessId(null);
-                setProcessOutput(null);
+                proc.setOpenProcessId(null);
+                proc.setProcessOutput(null);
               },
-              output: processOutput,
+              output: proc.processOutput,
               onKill: async () => {
                 try {
                   await clientRef.current?.request("process/kill", {
-                    thread_id: currentId,
-                    process_id: openProcessId,
+                    thread_id: sess.currentId,
+                    process_id: proc.openProcessId,
                   });
                 } finally {
                   // 无论成败都重拉:失败时列表会保持原状态,不留下假象。
-                  await refreshProcesses(currentId);
+                  await proc.refreshProcesses(sess.currentId!);
                 }
               },
             }}
@@ -2450,13 +2380,13 @@ export default function App() {
         </div>
       </div>
       <SettingsDialog
-        open={settingsOpen}
+        open={prefs.settingsOpen}
         // 手机端把设置改成全屏页（见 index.css 的 [data-mobile="true"] .settings-shell）。
         // 复用上面已有的 `isMobile`，不在这里新探测。
         isMobile={isMobile}
-        theme={theme}
-        onThemeChange={changeTheme}
-        onClose={() => setSettingsOpen(false)}
+        theme={prefs.theme}
+        onThemeChange={prefs.changeTheme}
+        onClose={() => prefs.setSettingsOpen(false)}
         // 远程访问 Tab 走**当前 transport**（桌面 stdio = Admin），所以能调
         // pair/create、device/revoke；网络客户端会拿到 -32014，Tab 会提示权限。
         remoteCall={(method, params) =>
@@ -2469,14 +2399,22 @@ export default function App() {
         // 模型 Tab 同样走当前 transport（桌面 stdio = Admin），能调 model/*。
         // 用稳定的 `modelCall`（见上），别在这里内联箭头。
         modelCall={modelCall}
+        // 技能三层根同样按项目解析（`<项目>/.yi-agent/skills`），候选与默认值直接
+        // 复用插件那份——两者指的都是「项目目录下的 .yi-agent」，来源分叉会让用户
+        // 在两个面板里看到不同的项目列表。
+        skillsCall={skillsCall}
+        skillsProjects={pluginProjectPaths(sess.workspaces, board.boards)}
+        skillsDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。
-        pluginProjects={pluginProjectPaths(workspaces, boards)}
+        pluginProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         pluginDefaultProject={current?.info?.cwd}
-        relayUrl={relayUrl}
+        relayUrl={prefs.relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
-        saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}
+        saveRelayUrl={isRemoteClient() ? undefined : prefs.saveRelayUrl}
+        tagNames={tagNames}
+        saveTagName={saveTagName}
       />
     </>
   );

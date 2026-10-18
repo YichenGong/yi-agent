@@ -20,12 +20,14 @@
 //! checks share one daemon's lifetime, and splitting them would spawn several
 //! real daemons that race each other.
 
-use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{Value, json};
+
+mod common;
+
+use common::AppServer;
 
 /// The plugin executable a board's daemon supervises. Boards point at the
 /// Homebrew install; the test skips when it is absent (see the module docs).
@@ -51,104 +53,6 @@ fn skip_reason() -> Option<String> {
         return Some(format!("{PLUGIN_BIN} is not installed"));
     }
     None
-}
-
-/// A live `yi-agent app-server` speaking JSONL JSON-RPC on stdio.
-struct AppServer {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<std::process::ChildStdout>,
-    next_id: u64,
-}
-
-impl AppServer {
-    /// Spawn an app-server whose board registry lives under `home`, so nothing
-    /// touches the developer's real `~/.yi-agent`.
-    fn start(bin: &Path, home: &Path) -> AppServer {
-        let mut child = Command::new(bin)
-            .args(["app-server", "--listen", "stdio://"])
-            .env("HOME", home)
-            // Never boot a host LaunchAgent from a test. `board/create` installs
-            // the watchman on first use, and `current_dir("/")` makes `cfg.workdir`
-            // resolve to `/`, so the preference defaults on and the real install
-            // would run `launchctl bootstrap gui/<this uid>` in the developer's
-            // actual launchd domain. The switch degrades production
-            // install/uninstall to no-ops (see `production_watchman_install`).
-            .env("YI_AGENT_DISABLE_WATCHMAN", "1")
-            // A bundled app launches from `/`; mirror that so any accidental
-            // reliance on the cwd shows up here rather than in production.
-            .current_dir("/")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Inherit stderr: cargo captures it, and piping without draining
-            // could block the server if it ever logged enough.
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn yi-agent app-server");
-        let stdin = child.stdin.take().expect("app-server stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("app-server stdout"));
-        AppServer {
-            child,
-            stdin: Some(stdin),
-            stdout,
-            next_id: 0,
-        }
-    }
-
-    /// Send one request and read frames until its matching response arrives.
-    /// Notifications (no `id`) are skipped: the server may emit them freely.
-    fn rpc(&mut self, method: &str, params: Value) -> Value {
-        self.next_id += 1;
-        let id = self.next_id;
-        let request = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let stdin = self.stdin.as_mut().expect("app-server stdin open");
-        writeln!(stdin, "{request}").expect("write request");
-        stdin.flush().expect("flush request");
-        loop {
-            let mut line = String::new();
-            let read = self.stdout.read_line(&mut line).expect("read response");
-            assert!(read > 0, "app-server closed before answering `{method}`");
-            let Ok(value) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if value.get("id") == Some(&json!(id)) {
-                return value;
-            }
-        }
-    }
-
-    /// Send a request, retrying until it answers or `timeout` elapses, so a
-    /// slow cross-process step is not mistaken for a missing answer.
-    fn rpc_within(&mut self, method: &str, params: Value, timeout: Duration) -> Value {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let value = self.rpc(method, params.clone());
-            if value.get("error").is_none() || Instant::now() >= deadline {
-                return value;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    fn initialize(&mut self) {
-        let value = self.rpc("initialize", json!({}));
-        assert!(value.get("error").is_none(), "initialize failed: {value}");
-    }
-
-    /// Close stdin and wait for the process to exit, returning its status.
-    fn shutdown(mut self) -> std::process::ExitStatus {
-        drop(self.stdin.take());
-        self.child.wait().expect("wait for app-server")
-    }
-}
-
-impl Drop for AppServer {
-    fn drop(&mut self) {
-        // Best-effort: a test that panicked mid-sequence still must not leave a
-        // server (and its threads) behind.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 /// Stops the project's board daemon on drop, so a failing assertion cannot leak

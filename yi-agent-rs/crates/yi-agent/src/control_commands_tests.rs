@@ -29,3 +29,8 @@ fn slash_completion_uses_every_control_command_name_from_the_catalog() {
         );
     }
 }
+
+#[test]
+fn agents_usage_matches_the_tui_parser() {
+    assert_eq!(ControlCommand::Agents.spec().usage, "[--all|--active]");
+}

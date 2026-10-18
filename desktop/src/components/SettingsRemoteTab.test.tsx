@@ -72,10 +72,12 @@ describe("SettingsRemoteTab", () => {
     expect(call).toHaveBeenCalledWith("device/list", {});
   });
 
-  it("revokes a device and drops its row", async () => {
+  it("revokes a device and drops its row, reading the server's `revoked` ack", async () => {
+    // 服务端 ack 的真实形状是 `{"revoked": bool}`（`server.rs` 的 `device/revoke`
+    // 分支）。这里必须用它，否则测的是一个不存在的契约、而真实按钮点了没反应。
     const call = rpcStub({
       "device/list": () => ({ devices: DEVICES }),
-      "device/revoke": () => ({ removed: true }),
+      "device/revoke": () => ({ revoked: true }),
     });
     render(<SettingsRemoteTab call={call} />);
 
@@ -86,10 +88,10 @@ describe("SettingsRemoteTab", () => {
     expect(screen.getByText("iPad Air")).toBeTruthy();
   });
 
-  it("keeps the row when the server reports removed:false", async () => {
+  it("keeps the row when the server reports revoked:false", async () => {
     const call = rpcStub({
       "device/list": () => ({ devices: DEVICES }),
-      "device/revoke": () => ({ removed: false }),
+      "device/revoke": () => ({ revoked: false }),
     });
     render(<SettingsRemoteTab call={call} />);
 

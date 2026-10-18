@@ -36,3 +36,29 @@ export function applyTitleChange(
     pinned: pinned.some((t) => t.thread_id === threadId) ? pinned.map(retitle) : pinned,
   };
 }
+/** 把一条 thread 的颜色标签改写进分组与置顶两份列表（`null` = 清除）。 */
+export function applyTagChange(
+  groups: WorkspaceGroup[],
+  pinned: ThreadSummary[],
+  threadId: string,
+  tag: string | null,
+): { groups: WorkspaceGroup[]; pinned: ThreadSummary[] } {
+  const hit =
+    groups.some((g) => g.threads.some((t) => t.thread_id === threadId)) ||
+    pinned.some((t) => t.thread_id === threadId);
+  if (!hit) return { groups, pinned };
+
+  // 置顶项同时存在于分组里（服务端为向后兼容不摘除），故两份都要更新，
+  // 与 applyTitleChange 同理。
+  const retag = (t: ThreadSummary): ThreadSummary =>
+    t.thread_id === threadId ? { ...t, tag } : t;
+
+  return {
+    groups: groups.map((g) =>
+      g.threads.some((t) => t.thread_id === threadId)
+        ? { ...g, threads: g.threads.map(retag) }
+        : g,
+    ),
+    pinned: pinned.some((t) => t.thread_id === threadId) ? pinned.map(retag) : pinned,
+  };
+}

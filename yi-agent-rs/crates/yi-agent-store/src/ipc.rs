@@ -183,6 +183,17 @@ pub enum IpcRequest {
     AttachApplicationRoot {
         idempotency_key: String,
         workspace: PathBuf,
+        /// The root session's linked roots (canonical absolute paths). An older
+        /// client omits the field, which reads as "no linked roots".
+        ///
+        /// Additive and `#[serde(default)]`: a new daemon reads an old client's request
+        /// as "no linked roots", unchanged. The reverse is not compatible: an old daemon
+        /// rejects it as a bare parse error (`Validation`, no message), since
+        /// `deny_unknown_fields` covers this internally-tagged variant (ipc.rs:178). A bump
+        /// would not fix that (the command is parsed before `protocol_version`, 1492-1493)
+        /// and would only force the unrelated plugin crate to bump; no bump, per `fork_token`.
+        #[serde(default)]
+        extra_roots: Vec<String>,
     },
     ActivateApplicationRoot {
         session_id: String,
@@ -856,6 +867,9 @@ impl Daemon {
         clear_plugin_sockets();
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        // Stays non-blocking: `accept` runs only after the poll reports
+        // readiness, but the peer can disconnect in between, and that must
+        // surface as `WouldBlock` rather than blocking the loop.
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -866,6 +880,7 @@ impl Daemon {
         let client_handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         let listener_handlers = Arc::clone(&client_handlers);
         let database_path = database_path.as_ref().to_path_buf();
+        let request_context = Arc::new(RequestContext::new(&database_path)?);
         let cleanup_socket = socket_path.clone();
         let cleanup_lock = lock_path.clone();
         let listener = thread::spawn(move || {
@@ -912,9 +927,24 @@ impl Daemon {
                     }
                     last_schedule_minute = minute;
                 }
+                // Block until a connection arrives or the wait times out. This
+                // keeps `thread_stop` on a fixed cadence without adding the
+                // wait's whole duration to every request, which is what the old
+                // non-blocking-plus-sleep shape did.
+                let ready = match daemon_accept_wait(&listener, DAEMON_ACCEPT_POLL) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        tracing::error!(error = %error, "daemon accept poll failed; retrying");
+                        continue;
+                    }
+                };
+                if !ready {
+                    continue;
+                }
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let database_path = database_path.clone();
+                        let request_context = Arc::clone(&request_context);
                         let stop = Arc::clone(&thread_stop);
                         let coordinator = Arc::clone(&coordinator);
                         let confirmations = Arc::clone(&listener_confirmations);
@@ -922,6 +952,7 @@ impl Daemon {
                             let _ = handle_client(
                                 stream,
                                 &database_path,
+                                &request_context,
                                 &stop,
                                 &coordinator,
                                 &confirmations,
@@ -942,9 +973,7 @@ impl Daemon {
                         handlers.retain(|handle| !handle.is_finished());
                         handlers.push(handler);
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => break,
                 }
             }
@@ -993,7 +1022,8 @@ impl Daemon {
 
     fn stop_listener(&mut self) -> Result<(), IpcError> {
         self.stop.store(true, Ordering::Release);
-        // Wake the nonblocking accept loop so shutdown does not wait for its sleep interval.
+        // Wake the accept loop so shutdown does not wait out the poll interval:
+        // the connection makes the listener readable, so `poll` returns at once.
         let _ = UnixStream::connect(&self.socket_path);
         if let Some(listener) = self.listener.take() {
             listener.join().map_err(|_| IpcError::ListenerPanicked)?;
@@ -1449,9 +1479,40 @@ fn write_request(
     Ok(())
 }
 
+/// Wait until the listener is readable (a connection is pending) or the timeout
+/// elapses; the granularity matches [`DAEMON_ACCEPT_POLL`].
+///
+/// The plugin side does the same: `poll(2)` replaces "non-blocking plus sleep",
+/// so a connection returns immediately rather than adding a blind 0-10ms wait to
+/// every request, while `thread_stop` still gets checked on a fixed cadence.
+fn daemon_accept_wait(listener: &UnixListener, timeout: Duration) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let milliseconds = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: one initialized `pollfd`, so `nfds = 1` matches it; `poll` only
+    // reads `fd`/`events` and writes `revents`. There are no other pointer
+    // arguments.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+    match ready {
+        // Timed out: no connection arrived.
+        0 => Ok(false),
+        // Readable, or hung up: `accept` reports the specific error if so.
+        count if count > 0 => Ok(true),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// accept wait granularity: it only decides how often `thread_stop` is checked,
+/// it is no longer a per-request latency floor.
+const DAEMON_ACCEPT_POLL: Duration = Duration::from_millis(10);
+
 fn handle_client(
     mut stream: UnixStream,
     database_path: &Path,
+    context: &RequestContext,
     stop: &Arc<AtomicBool>,
     coordinator: &Arc<RuntimeCoordinator>,
     confirmations: &Arc<ConfirmationStore>,
@@ -1581,7 +1642,7 @@ fn handle_client(
                     error_response(&error)
                 }
             },
-            request => match respond(database_path, coordinator, request) {
+            request => match respond(context, coordinator, request) {
                 Ok(response) => response,
                 Err(error) => {
                     log_request_failure(&envelope.request_id, &error);
@@ -3091,19 +3152,104 @@ fn forward_plugin_query(
     }
 }
 
+/// 是否该在本次请求里跑一轮 worker 对账。
+///
+/// daemon 的 accept 循环已经每轮跑 [`RuntimeCoordinator::reconcile_worker_events`]，
+/// `respond` 里那次是重复的。窗口只用来合并「几乎同时到达」的请求，保证请求仍能
+/// 观察到已对账状态，而不是把对账从请求路径上彻底删掉。
+fn should_reconcile(last: Option<Instant>, now: Instant, window: Duration) -> bool {
+    match last {
+        Some(previous) => now.duration_since(previous) >= window,
+        None => true,
+    }
+}
+
+/// 每个 daemon 一份的请求执行上下文：复用一个 tokio runtime 与一条 sqlite 连接。
+///
+/// `respond` 原先**每请求**都新建这两样（`Runtime::new` + `RuntimeRepository::open`
+/// 里的两条 PRAGMA 与 `migrate` 的 schema 解析），单次 `Status` 因此要 ~45ms。
+/// `rusqlite::Connection` 是 `!Sync`，故用 `Mutex` 串行持有——daemon 的请求路径
+/// 本就串行，不引入新的并发度。
+pub(crate) struct RequestContext {
+    runtime: tokio::runtime::Runtime,
+    repository: std::sync::Mutex<RuntimeRepository>,
+    reconciled_at: std::sync::Mutex<Option<Instant>>,
+    reconcile_window: Duration,
+}
+
+/// 同一窗口内的并发请求合并成一次对账。
+const RECONCILE_WINDOW: Duration = Duration::from_millis(5);
+
+impl RequestContext {
+    pub(crate) fn new(database_path: &Path) -> Result<Self, IpcError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let repository = RuntimeRepository::open(database_path).map_err(IpcError::from)?;
+        Ok(Self {
+            runtime,
+            repository: std::sync::Mutex::new(repository),
+            reconciled_at: std::sync::Mutex::new(None),
+            reconcile_window: RECONCILE_WINDOW,
+        })
+    }
+
+    /// 借出那条长生命周期连接。调用方在闭包内串行使用它。
+    ///
+    /// `respond` 只有那四个真正读写 sqlite 的 arm 走这里，借还都落在 arm 内，
+    /// 绝不跨 `block_on`（尤其是能永久挂住的 `WaitAgent`）持有——连接的互斥因此
+    /// 不会把一个请求的等待时间转嫁到另一个请求上。
+    pub(crate) fn with_repository<R>(
+        &self,
+        f: impl FnOnce(&mut RuntimeRepository) -> Result<R, IpcError>,
+    ) -> Result<R, IpcError> {
+        let mut repository = self
+            .repository
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut repository)
+    }
+
+    /// 需要时跑一轮对账；窗口内重复调用直接返回。
+    pub(crate) fn reconcile_if_stale(
+        &self,
+        coordinator: &Arc<RuntimeCoordinator>,
+    ) -> Result<(), IpcError> {
+        let now = Instant::now();
+        let last = *self
+            .reconciled_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !should_reconcile(last, now, self.reconcile_window) {
+            return Ok(());
+        }
+        self.runtime
+            .block_on(coordinator.reconcile_worker_events())?;
+        *self
+            .reconciled_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+        Ok(())
+    }
+}
+
 fn respond(
-    database_path: &Path,
+    context: &RequestContext,
     coordinator: &Arc<RuntimeCoordinator>,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(coordinator.reconcile_worker_events())?;
-    let mut repository = RuntimeRepository::open(database_path)?;
+    context.reconcile_if_stale(coordinator)?;
+    // 每条连接一个 handler 线程，所以请求**是**并发的：`respond` 里既有秒级
+    // 的协调器调用，也有能永久挂住的 `WaitAgent`（`timeout_ms: None` 时
+    // `wait_for_children_authorized` 永不返回）。连接因此必须**按需**借、绝不可
+    // 跨这些调用持有：否则一个仍在等待的 `WaitAgent` 会把每个 `Status` 轮询都
+    // 挡在锁后——恰恰是这次改动要修掉的那种「`pwd && ls` 都慢」。真正用到连接
+    // 的只有下面四个 arm，它们都只做一次本地 sqlite 读写，不阻塞。
     match request {
         IpcRequest::Status => Ok(IpcResponse::Status {
-            high_water_event_id: repository.latest_event_id()?,
+            high_water_event_id: context.with_repository(|repository| {
+                repository.latest_event_id().map_err(IpcError::from)
+            })?,
         }),
         IpcRequest::Stop => Ok(IpcResponse::Stopping),
         IpcRequest::CreateSession => {
@@ -3117,12 +3263,16 @@ fn respond(
         IpcRequest::AttachApplicationRoot {
             idempotency_key,
             workspace,
+            extra_roots,
         } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let attached = runtime
-                .block_on(coordinator.attach_application_root(&idempotency_key, &workspace))?;
+            let attached = runtime.block_on(coordinator.attach_application_root(
+                &idempotency_key,
+                &workspace,
+                &extra_roots,
+            ))?;
             Ok(IpcResponse::ApplicationRootAttached {
                 session_id: attached.session_id.to_string(),
                 root_task_id: attached.root_task_id.to_string(),
@@ -3176,14 +3326,18 @@ fn respond(
             let next_run_at = definition.next_run_after(Local::now()).map_err(|error| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
             })?;
-            let schedule = repository.create_schedule(&definition, next_run_at)?;
+            let schedule = context.with_repository(|repository| {
+                repository
+                    .create_schedule(&definition, next_run_at)
+                    .map_err(IpcError::from)
+            })?;
             Ok(IpcResponse::ScheduleCreated {
                 schedule_id: schedule.id,
             })
         }
         IpcRequest::ListSchedules => Ok(IpcResponse::Schedules {
-            schedules: repository
-                .schedules()?
+            schedules: context
+                .with_repository(|repository| repository.schedules().map_err(IpcError::from))?
                 .into_iter()
                 .map(|schedule| IpcSchedule {
                     schedule_id: schedule.id,
@@ -3202,7 +3356,11 @@ fn respond(
             params,
         } => forward_plugin_query(&plugin, &method, params),
         IpcRequest::DeleteSchedule { schedule_id } => {
-            if !repository.delete_schedule(&schedule_id)? {
+            if !context.with_repository(|repository| {
+                repository
+                    .delete_schedule(&schedule_id)
+                    .map_err(IpcError::from)
+            })? {
                 return Err(IpcError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "schedule does not exist",
@@ -3584,7 +3742,9 @@ fn respond(
         }
         IpcRequest::InspectTask { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let detail = repository.task_detail(&task_id)?;
+            let detail = context.with_repository(|repository| {
+                repository.task_detail(&task_id).map_err(IpcError::from)
+            })?;
             Ok(IpcResponse::TaskDetail(IpcTaskDetail {
                 task_id: detail.task_id,
                 session_id: detail.session_id,
@@ -3653,8 +3813,12 @@ fn respond(
                 .as_deref()
                 .map(parse_id::<RootSessionId>)
                 .transpose()?;
-            let tasks = repository
-                .task_summaries(session_id.as_ref(), active_only)?
+            let tasks = context
+                .with_repository(|repository| {
+                    repository
+                        .task_summaries(session_id.as_ref(), active_only)
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(|task| IpcTaskSummary {
                     task_id: task.task_id,
@@ -3671,8 +3835,12 @@ fn respond(
             after_event_id,
         } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let events = repository
-                .event_records_for_task_after(&task_id, after_event_id.unwrap_or(0))?
+            let events = context
+                .with_repository(|repository| {
+                    repository
+                        .event_records_for_task_after(&task_id, after_event_id.unwrap_or(0))
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(ipc_event)
                 .collect();
@@ -3680,8 +3848,12 @@ fn respond(
         }
         IpcRequest::ReadTaskMailbox { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let messages = repository
-                .mailbox_messages_for_task(&task_id)?
+            let messages = context
+                .with_repository(|repository| {
+                    repository
+                        .mailbox_messages_for_task(&task_id)
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(|message| IpcMailboxMessage {
                     message_id: message.message_id,
@@ -3698,7 +3870,9 @@ fn respond(
         }
         IpcRequest::ReadTaskDiff { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let detail = repository.task_detail(&task_id)?;
+            let detail = context.with_repository(|repository| {
+                repository.task_detail(&task_id).map_err(IpcError::from)
+            })?;
             let diff = coordinator.delivery_diff(&task_id).ok().flatten();
             Ok(IpcResponse::TaskDiff {
                 task_id: detail.task_id,
@@ -3708,8 +3882,10 @@ fn respond(
         }
         IpcRequest::ReadTaskTrace { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let rows: Vec<IpcTraceRow> = repository
-                .trace_after(&task_id, 0)?
+            let rows: Vec<IpcTraceRow> = context
+                .with_repository(|repository| {
+                    repository.trace_after(&task_id, 0).map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(ipc_trace_row)
                 .collect();
@@ -3726,7 +3902,11 @@ fn respond(
             after_event_id,
             filters,
         } => {
-            let snapshot = repository.subscription_snapshot(after_event_id)?;
+            let snapshot = context.with_repository(|repository| {
+                repository
+                    .subscription_snapshot(after_event_id)
+                    .map_err(IpcError::from)
+            })?;
             let tasks = snapshot
                 .tasks
                 .into_iter()
@@ -4406,5 +4586,124 @@ mod fork_wire_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod attach_application_root_wire_tests {
+    use super::*;
+
+    /// An older client does not send the field at all, and that must keep
+    /// parsing as "no linked roots" rather than failing the request.
+    #[test]
+    fn attach_application_root_defaults_missing_extra_roots_to_empty() {
+        let raw = r#"{"type":"AttachApplicationRoot","idempotency_key":"k","workspace":"/tmp/w"}"#;
+        let request: IpcRequest = serde_json::from_str(raw).unwrap();
+        match request {
+            IpcRequest::AttachApplicationRoot { extra_roots, .. } => {
+                assert!(
+                    extra_roots.is_empty(),
+                    "missing extra_roots must read as empty"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The linked roots a caller does send must survive the wire verbatim.
+    #[test]
+    fn attach_application_root_carries_extra_roots_over_the_wire() {
+        let request = IpcRequest::AttachApplicationRoot {
+            idempotency_key: "k".into(),
+            workspace: PathBuf::from("/tmp/w"),
+            extra_roots: vec!["/w/linked-b".into(), "/w/linked-c".into()],
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&encoded).unwrap(),
+            request
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use super::*;
+
+    #[test]
+    fn should_reconcile_only_outside_the_window() {
+        let window = Duration::from_millis(5);
+        let base = Instant::now();
+        // 从未对账过：必须跑。
+        assert!(should_reconcile(None, base, window));
+        // 刚跑过：窗口内跳过。
+        assert!(!should_reconcile(
+            Some(base),
+            base + Duration::from_millis(1),
+            window
+        ));
+        // 窗口已过：再跑一次。
+        assert!(should_reconcile(
+            Some(base),
+            base + Duration::from_millis(6),
+            window
+        ));
+    }
+
+    #[test]
+    fn a_request_context_reuses_one_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("runtime.sqlite");
+        let context = RequestContext::new(&database_path).expect("context builds");
+        // 同一个连接可重复使用；两次读取给出同一个 schema 版本。
+        let first = context
+            .with_repository(|repository| repository.schema_version().map_err(IpcError::from))
+            .expect("first read");
+        let second = context
+            .with_repository(|repository| repository.schema_version().map_err(IpcError::from))
+            .expect("second read");
+        assert_eq!(first, second);
+    }
+
+    /// 回归测试：不用仓库的 arm 不得被用仓库的 arm 挡住。
+    ///
+    /// 每条连接一个 handler 线程，请求是并发的。曾经的写法在 `match` 之前就
+    /// `context.repository.lock()` 并跨整个 `match` 持有；那样一个仍在等待的
+    /// `WaitAgent`（`timeout_ms: None` 时永不返回）会把每个 `Status` 轮询都挡在
+    /// 锁后——正是这次要修掉的「`pwd && ls` 都慢」。这里用一个在 sqlite 读期间
+    /// 故意睡 300ms 的持有者模拟慢 arm：`Stop` 根本不碰仓库，正确的按 arm 借还
+    /// 下它会立刻返回；跨 arm 持锁的写法则会让它排队等满那 300ms。
+    #[test]
+    fn an_arm_that_does_not_use_the_repository_is_not_blocked_by_one_that_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("runtime.sqlite");
+        let factory: Arc<dyn AgentWorkerFactory> = Arc::new(UnavailableWorkerFactory);
+        let coordinator =
+            Arc::new(RuntimeCoordinator::open(&database_path, factory).expect("coordinator opens"));
+        let context = Arc::new(RequestContext::new(&database_path).expect("context builds"));
+
+        let slow_context = Arc::clone(&context);
+        let slow = thread::spawn(move || {
+            slow_context
+                .with_repository(|repository| {
+                    thread::sleep(Duration::from_millis(300));
+                    repository.latest_event_id().map_err(IpcError::from)
+                })
+                .expect("slow read");
+        });
+        // 与该持有者争用同一条连接。
+        thread::sleep(Duration::from_millis(50));
+
+        // `Stop` 不碰仓库：它不该被那个持有者挡住。
+        let started = Instant::now();
+        let response = respond(&context, &coordinator, IpcRequest::Stop).expect("stop answers");
+        let elapsed = started.elapsed();
+        slow.join().unwrap();
+
+        assert!(matches!(response, IpcResponse::Stopping));
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "an arm that never touches the repository must not wait behind one that does; waited {elapsed:?}"
+        );
     }
 }

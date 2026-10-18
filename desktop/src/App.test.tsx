@@ -70,6 +70,15 @@ const { clients, state } = vi.hoisted(() => ({
     platformUa: "",
     // `process/list` 返回的进程;默认空,需要时由用例填充。
     processes: [] as Array<Record<string, unknown>>,
+    // 已补建组长的目录（`thread/lead` 被调用过）。`thread/listAll` 据此在这些
+    // 分组里多报一条 `role: "lead"` 的会话——模拟服务端真的落盘了组长 meta。
+    // 默认空：既有用例的分组里没有组长，与改动前逐字节一致。
+    leadCwds: [] as string[],
+    // 让 `thread/lead` 抛错，用于验证「单个目录补建失败不挡首屏」。
+    failLead: false,
+    // 每次 `thread/lead` 调用都记一笔它请求的 cwd——即便失败也记，这样「失败
+    // 路径确实被走到」可被断言，而不是靠「首屏照常」这种两边都成立的弱断言。
+    leadAttempts: [] as string[],
   },
 }));
 
@@ -153,24 +162,43 @@ vi.mock("./lib/rpc", () => ({
           state.threads ??
           [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
         const workspaces = state.groupWorkspaces ?? ["/w"];
+        const leadEntries = (workspace: string) =>
+          state.leadCwds.includes(workspace)
+            ? [
+                {
+                  thread_id: `lead-${workspace}`,
+                  cwd: workspace,
+                  model: "m",
+                  created_at: 0,
+                  updated_at: 0,
+                  title: "组长",
+                  role: "lead",
+                  status: "idle",
+                  pinned: false,
+                },
+              ]
+            : [];
         return {
           groups: workspaces.map((workspace, index) => ({
             workspace,
             exists: true,
             threads:
               index === 0
-                ? seeds.map((t) => ({
-                    thread_id: t.thread_id,
-                    cwd: workspace,
-                    model: "m",
-                    created_at: 0,
-                    updated_at: 0,
-                    title: t.title,
-                    permission_mode: t.permission_mode,
-                    status: state.listStatus,
-                    pinned: state.pinnedIds.includes(t.thread_id),
-                  }))
-                : [],
+                ? [
+                    ...seeds.map((t) => ({
+                      thread_id: t.thread_id,
+                      cwd: workspace,
+                      model: "m",
+                      created_at: 0,
+                      updated_at: 0,
+                      title: t.title,
+                      permission_mode: t.permission_mode,
+                      status: state.listStatus,
+                      pinned: state.pinnedIds.includes(t.thread_id),
+                    })),
+                    ...leadEntries(workspace),
+                  ]
+                : leadEntries(workspace),
           })),
           // 置顶项照旧留在分组里（服务端为向后兼容不摘除），顶层这里只是重排一份。
           pinned: state.pinnedIds.map((id) => ({
@@ -188,6 +216,15 @@ vi.mock("./lib/rpc", () => ({
         };
       }
       if (method === "workspace/list") return { workspaces: [] };
+      if (method === "thread/lead") {
+        const cwd = (params as { cwd?: string } | undefined)?.cwd;
+        if (typeof cwd === "string") state.leadAttempts.push(cwd);
+        if (state.failLead) throw { code: -1, message: "lead failed" };
+        if (typeof cwd === "string" && !state.leadCwds.includes(cwd)) {
+          state.leadCwds.push(cwd);
+        }
+        return { thread_id: `lead-${cwd ?? "default"}`, created: true };
+      }
       if (method === "thread/resume") {
         const { threadId } = params as { threadId: string };
         const seeds = state.threads ?? [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
@@ -289,6 +326,9 @@ beforeEach(() => {
   state.dataSources = {};
   state.platformUa = "";
   state.processes = [];
+  state.leadCwds = [];
+  state.failLead = false;
+  state.leadAttempts = [];
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
@@ -729,8 +769,10 @@ describe("App send recovery from a status disagreement", () => {
   it("falls back to turn/start when turn/interject answers -32013", async () => {
     seedRunning();
     render(<App />);
+    // 运行中的会话不再走 resume（那会打断在跑的 turn），改用只读 readItems 补齐。
+    // 等它发出即证明 listAll 的 running 状态已落进 store。
     await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
     );
     state.rejectCode = { "turn/interject": -32013 };
 
@@ -771,8 +813,9 @@ describe("App send recovery from a status disagreement", () => {
   it("does not ping-pong when both methods fail, and surfaces the error", async () => {
     seedRunning();
     render(<App />);
+    // 同上：运行中的会话以 readItems 补齐，不再 resume。
     await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
     );
     state.rejectCode = { "turn/interject": -32013, "turn/start": -32012 };
 
@@ -927,7 +970,7 @@ describe("App slash commands", () => {
  */
 async function openBoardFor(project: string) {
   // 打开小组右键菜单（与键盘路径同一条处理链）→ 点「看板」条目。
-  const header = document.querySelector<HTMLElement>('div[tabindex][aria-haspopup="menu"]')!;
+  const header = document.querySelector<HTMLElement>("[data-ws-header]")!;
   fireEvent.contextMenu(header);
   await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
   fireEvent.click(screen.getByLabelText("看板"));
@@ -1433,6 +1476,121 @@ describe("App settings & theme wiring", () => {
     );
   });
 
+  it("reflects a thread/tagChanged in the sidebar without re-listing", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    notify("thread/tagChanged", { thread_id: "t1", tag: "red" });
+    await waitFor(() =>
+      expect(document.querySelector('[data-thread-tag="red"]')).toBeTruthy(),
+    );
+    // 就地把权威值落笔，不该为此再拉一次全量 thread/listAll。
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+  });
+
+  it("reflects ui/tagNames/updated in the existing dot's label", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    notify("thread/tagChanged", { thread_id: "t1", tag: "red" });
+    await waitFor(() => expect(document.querySelector('[data-thread-tag="red"]')).toBeTruthy());
+
+    notify("ui/tagNames/updated", { tag_names: { red: "紧急" } });
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-thread-tag="red"]')?.getAttribute("aria-label"),
+      ).toBe("紧急"),
+    );
+  });
+
+  it("does not tag optimistically, and re-lists once thread/setTag resolves", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    // Hold the RPC open so we can observe the UI *before* the server answers.
+    let release: () => void = () => {};
+    state.dataSources["thread/setTag"] = () =>
+      new Promise<void>((resolve) => {
+        release = () => resolve();
+      });
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    fireEvent.contextMenu(container.querySelector('[data-thread-row="t1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/setTag")).toBe(true),
+    );
+    expect(clients[0].requests.find((r) => r.method === "thread/setTag")!.params).toEqual({
+      threadId: "t1",
+      tag: "red",
+    });
+    // 不做乐观更新：回包之前 UI 不能显示色点，也不能为此重拉列表。
+    expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+
+    act(() => release());
+    await waitFor(() => {
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThan(listCallsBefore);
+    });
+  });
+
+  it("surfaces the error and still re-lists when thread/setTag rejects", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.rejectCode["thread/setTag"] = -32011;
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    fireEvent.contextMenu(container.querySelector('[data-thread-row="t1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+
+    await waitFor(() => expect(screen.getByText(/forced -32011/)).toBeTruthy());
+    // 失败同样重拉：本地不假装成功，以服务端为权威。
+    await waitFor(() => {
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThan(listCallsBefore);
+    });
+    expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
+  });
+
+  it("writes only the changed key when a tag name is edited in settings", async () => {
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", tag_names: {} });
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "标签" }));
+    const input = document.querySelector<HTMLInputElement>('[data-tag-name-input="red"]')!;
+    fireEvent.change(input, { target: { value: "紧急" } });
+    fireEvent.blur(input);
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { tag_names: { red: "紧急" } },
+      }),
+    );
+    // 只提交改动的那一个键：其余 5 色不得出现在同一请求里。
+    const write = clients[0].requests.find((r) => r.method === "ui/settings/write")!;
+    expect(Object.keys((write.params as { tag_names: Record<string, string> }).tag_names)).toEqual([
+      "red",
+    ]);
+  });
+
   it("reflects a thread/modelChanged from another client in that thread's picker", async () => {
     render(<App />);
     await settle();
@@ -1823,6 +1981,39 @@ describe("App reconnect resilience", () => {
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(clients.length).toBe(3);
+  });
+
+  it("re-resumes a thread after a crash even though its status was live-running", async () => {
+    // 崩溃前该会话在跑（推送把状态标为 "live" running）。侧车重启后新进程对
+    // 它没有内存 agent，listAll 报 idle。若不清掉那条推送状态，`seed` 不会覆盖
+    // 它 → selectThread 误判"仍在跑" → 跳过 resume → 新进程里 agent 永不重建
+    // → 之后发送撞 -32011 且无法自愈。这条用例钉住"重连后必须重新 resume"。
+    render(<App />);
+    await waitMounted();
+    await flush();
+    // 让 t1 进入 live-running（推送流），并把后续 listAll 改为报 idle。
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "thread/status/updated", params: { thread_id: "t1", status: "running" } });
+      }
+    });
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+
+    // 重连之前：视图确实停在 running。
+    exit();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+
+    // 新客户端上必须出现 thread/resume（而不是被陈旧 running 拦住）。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    expect(
+      clients[1].requests.some((r) => r.method === "thread/resume"),
+    ).toBe(true);
   });
 
   it("reconnects immediately when the app returns to the foreground", async () => {
@@ -2424,6 +2615,55 @@ describe("App remote subscription wiring (S2)", () => {
     expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
   });
 
+  it("does not interrupt a running thread on the desktop build", async () => {
+    // 桌面端过去没有这层保护（它被 `isRemoteClient()` 关在远端分支里）：点开
+    // 一张正在跑的看板卡会话就会 resume，而 resume 会先中断在跑的 turn。这条
+    // 用例把「看一眼 = 只读」钉死为**两种客户端共有**的不变量。
+    state.listStatus = "running";
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />); // no persisted config → desktop
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) =>
+            r.method === "thread/readItems" &&
+            (r.params as { threadId: string }).threadId === "t1",
+        ),
+      ).toBe(true),
+    );
+    // The defining property: looking at a running thread never resumes it.
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+    // Desktop still never subscribes; that stays remote-only.
+    expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
+  });
+
+  it("hydrates the mode chip when the desktop opens a running thread", async () => {
+    // 回归：本卡把「运行中→只读 readItems」提为两种客户端共有后，桌面端点开一个
+    // 运行中的会话不再 resume，而 mode 过去只由 resume 回包/推送写入——于是 chip
+    // 停在未知（"Mode"、禁用）。清单快照本就带 permission_mode，这里钉住它必须在
+    // 这条路径上补上。卡会话跑 YOLO，桌面端点开时必须看得见 YOLO。
+    state.listStatus = "running";
+    state.mode = "yolo";
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />); // no persisted config → desktop
+
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+    // 仍然不打断：running 会话不 resume。
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+  });
+
+  it("still resumes a cold idle thread on the desktop build", async () => {
+    // 回归护栏：把「运行中才只读」这条边钉住。若有人把 running 判断写错成
+    // 「一律不 resume」，冷会话就再也合不进服务端历史（resume 是它唯一的就绪
+    // 途径，turn/start 对冷会话返回 -32011）。
+    render(<App />); // listStatus 默认 idle
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
+  });
+
   it("catches a cold running thread up with readItems instead of resume", async () => {
     asRemote();
     state.threads = [
@@ -2906,6 +3146,91 @@ describe("App 会话详情栏的开合", () => {
     });
     expect(await screen.findByText("t2-diff.txt")).toBeTruthy();
     expect(screen.queryByText("t1-diff.txt")).toBeNull();
+  });
+});
+
+describe("App 关联文件夹接线", () => {
+  /** 打开某个目录分组的右键菜单。 */
+  const openGroupMenu = (ws: string) => {
+    fireEvent.contextMenu(document.querySelector<HTMLElement>(`[data-ws-header="${ws}"]`)!);
+  };
+
+  it("links the picked folder to the group it was invoked from", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.picks = ["/proj/docs"];
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "workspace/link",
+        params: { primary: "/proj", child: "/proj/docs" },
+      }),
+    );
+  });
+
+  it("does nothing when the native picker is cancelled", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.picks = [null];
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await waitFor(() => expect(state.picks).toHaveLength(0));
+    expect(clients[0].requests.some((r) => r.method === "workspace/link")).toBe(false);
+  });
+
+  it("unlinks a folder from its linked-child section menu", async () => {
+    state.groupWorkspaces = ["/proj", "/proj/docs"];
+    state.dataSources["workspace/list"] = () => ({
+      workspaces: [
+        { path: "/proj", exists: true, linked_to: null },
+        { path: "/proj/docs", exists: true, linked_to: "/proj" },
+      ],
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-linked-child="/proj/docs"]')).not.toBeNull(),
+    );
+
+    fireEvent.contextMenu(
+      document.querySelector<HTMLElement>('[data-linked-child="/proj/docs"]')!,
+    );
+    fireEvent.click(screen.getByText("取消关联"));
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "workspace/unlink",
+        params: { child: "/proj/docs" },
+      }),
+    );
+  });
+
+  it("surfaces a server-side link rejection instead of pretending it worked", async () => {
+    // 服务端会拒掉成环 / 链式关联（-32602）。吞掉它就等于让用户以为关联成功。
+    state.groupWorkspaces = ["/proj"];
+    state.picks = ["/proj/outer"];
+    state.dataSources["workspace/link"] = () => {
+      throw { code: -32602, message: "主根本身已是附属根" };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-ws-header="/proj"]')).not.toBeNull(),
+    );
+
+    openGroupMenu("/proj");
+    fireEvent.click(screen.getByText("关联文件夹…"));
+
+    await screen.findByText("主根本身已是附属根");
   });
 });
 
@@ -3433,6 +3758,9 @@ describe("App 远端图片上传", () => {
       );
       expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
         threadId: "t1",
+        // 手机端的 turn/start 现在带上下文锚点（Task 12，spec §7.1）：该会话尚未
+        // 对过账，故 contentEpoch 为初始 0、游标为 null。
+        contextAnchor: { contentEpoch: 0, lastItemId: null },
         input: [{ type: "uploaded_image", uploadId: "u1" }, { type: "text", text: "" }],
       });
     } finally {
@@ -3473,6 +3801,8 @@ describe("App 远端图片上传", () => {
     // 渲染用（桌面端那条 `{type:"image", path}` 一个字都没变）。
     expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
       threadId: "t1",
+      // 手机端 turn/start 携带上下文锚点（Task 12，spec §7.1）。
+      contextAnchor: { contentEpoch: 0, lastItemId: null },
       input: [
         { type: "uploaded_image", uploadId: "u1" },
         { type: "text", text: "看看这个" },
@@ -3743,6 +4073,344 @@ describe("App mobile local cache", () => {
     );
     await waitFor(() => expect(screen.queryByText("one")).toBeNull());
     expect(contentStore.current).toBeNull();
+  });
+
+  it("resumes a thread the server flagged full, and drops the ghost content", async () => {
+    asRemote();
+    // 服务端说这个会话 epoch 变了（期间被 clear 过）。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "full", epoch: 4, reason: "epoch_changed" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "stale content" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // 幽灵内容必须被清掉，而不是留在屏上。
+    await waitFor(() => expect(screen.queryByText("stale content")).toBeNull());
+  });
+
+  it("forces a full resume for a trimmed cache even when the plan says none", async () => {
+    asRemote();
+    // 服务端**正确地说 none**（同世代、锚点仍在日志里）——但本地条目因超 1MB 丢过
+    // 头部。照 none 跳过 resume 会让用户静默看到一个被截断的会话（spec §4.2 例外）。
+    // 这条只依赖客户端自己知道的信息（自己有没有裁过），故 plan 覆盖时也必须生效。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-tail", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-tail", text: "tail only" }],
+      trimmed: true, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+  });
+
+  it("catches up a thread the server marked none so a stale tail is filled", async () => {
+    asRemote();
+    // 服务端说 none：缓存**有效**，但这只表示"不必作废"，**不表示"已是最新"**。
+    // 会话在两轮之间又长了几条，而客户端的锚点仍有效，故服务端不会给 full
+    // （spec §4.2：落后是正常的并存形状，补齐交给常规路径）。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    state.dataSources["thread/readItems"] = () => ({
+      items: [{ type: "agentMessage", id: "i-new", text: "fresh tail" }],
+    });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-old", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-old", text: "cached head" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    // 必须真的补一次尾部（只读 readItems，不打断任何在途回合）——否则用户永远停在
+    // 缓存尾部却以为内容是最新的，而 `turn/start` 又会因"锚点仍在"被放行，正是
+    // 本特性要消除的"拿旧信息操作"。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    await waitFor(() => expect(screen.getByText("fresh tail")).toBeTruthy());
+  });
+
+  it("re-tops-up a none thread after a reconnect (socket died, process survived)", async () => {
+    asRemote();
+    // 场景：socket 被系统掐断但 sidecar 未退出（经中继的瞬断 / 切回前台），
+    // 于是 `exited` 不触发、`subWindow` 不清。此时若只按订阅窗口判定是否补齐，
+    // warm idle 会话会**永远停在缓存尾部**——正是 C2 的残留缺口。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-old", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-old", text: "cached head" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    const first = clients[0].requests.filter((r) => r.method === "thread/readItems").length;
+
+    // 前台唤醒重建客户端（没有 exited）。新连接必须为这个会话**再补一次**。
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+    const last = clients[clients.length - 1];
+    await waitFor(() =>
+      expect(last.requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    // 且**同一连接内**再切回不会重复发（每连接每会话只补一次）。
+    expect(first).toBe(1);
+  });
+
+  it("does not let a late cache read re-inject content judged stale", async () => {
+    asRemote();
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "full", epoch: 4, reason: "epoch_changed" }],
+      });
+    // 缓存读故意延迟到 adoptEpoch 之后才 resolve。只延迟**第二次**读（prefill 的
+    // 那次）：第一次是挂载预热，必须放行，否则 cacheMetaRef 为空、裁决无从播种
+    // 缓存世代，测试就退化成「什么都没验」的空洞用例（曾实测）。读返回**快照**
+    // 而非 resolve 时刻的 store：App 会在读到之前把已清空的会话落盘覆盖 ghost。
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const real = new MemoryContentStore();
+    await real.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "must not come back" }],
+      trimmed: false, bytes: 1,
+    });
+    const ghostSnapshot = (await real.read("t1"))!;
+    let reads = 0;
+    contentStore.current = {
+      read: async (id: string) => {
+        if (id === "t1" && (reads += 1) > 1) await gate;
+        return id === "t1" ? ghostSnapshot : real.read(id);
+      },
+      write: (e) => real.write(e),
+      delete: (id) => real.delete(id),
+      keys: () => real.keys(),
+    };
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // 此刻裁决已判 full 并 adoptEpoch（世代 2→4）。
+    release();
+    // 读回是异步的：给它足够的 tick 走到回调里，否则断言会早于回调求值而空洞通过。
+    await act(async () => { await new Promise((r) => setTimeout(r, 60)); });
+    expect(screen.queryByText("must not come back")).toBeNull();
+  });
+
+  it("blocks sending on a running thread until its catch-up lands", async () => {
+    asRemote();
+    state.listStatus = "running";
+    contentStore.current = new MemoryContentStore();
+    // readItems 挂住：模拟补尾部在途。
+    let release!: (v: unknown) => void;
+    state.dataSources["thread/readItems"] = () =>
+      new Promise((resolve) => { release = resolve; });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+
+    // 同步中：提示条在（文案「正在同步…」，带省略号），且发送被拦（不发出 turn/start）。
+    await waitFor(() => expect(screen.getByText(/正在同步…/)).toBeTruthy());
+    const before = clients[0].requests.filter((r) => r.method === "turn/start").length;
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    expect(clients[0].requests.filter((r) => r.method === "turn/start").length).toBe(before);
+
+    // 补完 ⇒ 解禁，提示条退场，且此时真的发得出去。
+    // 断言用带省略号的提示条文案，而非裸 `/正在同步/`：被拦时写入的错误文案
+    // 「正在同步，请稍候」同样含该子串，会在同步结束后仍留在会话上，裸正则必然
+    // 恒不匹配（计划自带的这条断言在计划自己的实现下不可能通过，已实测确认）。
+    release({ items: [{ type: "agentMessage", id: "a1", text: "done" }] });
+    await waitFor(() => expect(screen.queryByText(/正在同步…/)).toBeNull());
+    const turnsBefore = clients[0].requests.filter(
+      (r) => r.method === "turn/start" || r.method === "turn/interject",
+    ).length;
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter(
+          (r) => r.method === "turn/start" || r.method === "turn/interject",
+        ).length,
+      ).toBe(turnsBefore + 1),
+    );
+  });
+
+  it("converges out of syncing even when the catch-up fails", async () => {
+    asRemote();
+    state.listStatus = "running";
+    contentStore.current = new MemoryContentStore();
+    state.dataSources["thread/readItems"] = () => { throw new Error("boom"); };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    // 失败也必须收敛，否则永久无法发送（spec §11 风险 3）。
+    await waitFor(() => expect(screen.queryByText(/正在同步/)).toBeNull());
+  });
+
+  it("shows no syncing notice on the desktop path", async () => {
+    // 桌面：不调 asRemote()。
+    state.listStatus = "running";
+    render(<App />);
+    // 桌面端 running 会话走只读 readItems（不 resume、不置 syncing），等它落地即可。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    expect(screen.queryByText(/正在同步/)).toBeNull();
+    expect(screen.queryByText(/离线内容/)).toBeNull();
+  });
+
+  it("does not block sending on switching back to a warm idle thread", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // resume 已回放并置 warm；此刻会话 idle 且已在订阅窗口内 —— 切回不应置 syncing
+    // 也绝不能让用户永久无法发送（设计 §11 风险 3）。
+    await waitFor(() => expect(screen.queryByText(/正在同步/)).toBeNull());
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+  });
+
+  it("sends a contextAnchor and does not resend after stale_context", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    // `turn/start` 报 stale_context（顶层方法用 dataSources 而非 rpcError，
+    // 后者只在 plugin/query 的内层分支被读）。
+    state.dataSources["turn/start"] = () => {
+      throw { code: -32026, data: { code: "stale_context" } };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+
+    await waitFor(() => {
+      const turns = clients[0].requests.filter((r) => r.method === "turn/start");
+      expect(turns).toHaveLength(1);
+      expect((turns[0].params as { contextAnchor?: unknown }).contextAnchor).toBeTruthy();
+    });
+
+    // 不自动重发：只提示 + 触发重同步（多一次 thread/resume）。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/resume").length,
+      ).toBeGreaterThan(1),
+    );
+    // 发送没有成功：乐观回声（用户气泡）必须回滚，否则转录里会留下一条「已发出」
+    // 的幽灵消息；草稿必须保留，用户确认后能重发（spec §7.3「草稿保留」）。
+    // 只查**气泡**（用户消息气泡那个 class），不查裸文本：草稿框的值也是 "hello"。
+    await waitFor(() =>
+      expect(document.querySelector(".bg-blue-600.self-end")).toBeNull(),
+    );
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("hello");
+    expect(clients[0].requests.filter((r) => r.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("does not send a contextAnchor from the desktop path", async () => {
+    // 桌面：不调 asRemote()。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    const turn = clients[0].requests.find((r) => r.method === "turn/start");
+    expect((turn?.params as { contextAnchor?: unknown } | undefined)?.contextAnchor).toBeUndefined();
+  });
+
+  it("declares resumeHints on initialize for a remote client", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: 5, lastServerItemId: "i1", contentEpoch: 3,
+      items: [], trimmed: false, bytes: 1,
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    // hints 从缓存元数据组装；缓存是异步读的，故轮询等待那一次 initialize 带上它。
+    await waitFor(() => {
+      const init = clients[0].requests.find((r) => r.method === "initialize");
+      const hints = (init?.params as { resumeHints?: unknown[] } | undefined)?.resumeHints;
+      expect(Array.isArray(hints)).toBe(true);
+    });
+  });
+
+  it("does not send resumeHints from the desktop path", async () => {
+    // 不调 asRemote()：桌面路径。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    const init = clients[0].requests.find((r) => r.method === "initialize");
+    expect((init?.params as { resumeHints?: unknown } | undefined)?.resumeHints).toBeUndefined();
+  });
+
+  it("drops a deleted thread's cached content and its cache entry", async () => {
+    asRemote();
+    // 服务端说这个会话已不存在（被另一端删除）——它因此不会出现在 listAll 里。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "drop", epoch: 0, reason: "deleted" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "deleted transcript" }],
+      trimmed: false, bytes: 1,
+    });
+    render(<App />);
+    // 该会话是当前选中：它会被 drop、缓存被删、屏上不留内容。
+    await waitFor(() => expect(screen.queryByText("deleted transcript")).toBeNull());
+    await waitFor(async () => expect(await contentStore.current!.read("t1")).toBeNull());
   });
 });
 
@@ -4028,5 +4696,37 @@ describe("App 后台进程接线", () => {
         params: { thread_id: "t1", process_id: "proc_1" },
       }),
     );
+  });
+});
+
+describe("App lead entry reachability", () => {
+  it("asks thread/lead for a project group that has no lead, and shows the lead", async () => {
+    render(<App />);
+    // 首屏 listAll 只有普通会话（mock 默认 /w 组含 t1，无 role:"lead"）。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) => r.method === "thread/lead" && (r.params as { cwd?: string }).cwd === "/w",
+        ),
+      ).toBe(true),
+    );
+    // 服务端补建后重取 listAll，随之出现组长条目（mock 的 leadCwds 让它报出来）。
+    await waitFor(() => expect(screen.getByText("组长")).toBeTruthy());
+    // 补建过就不再重复发起：thread/lead 对 /w 只应有一次。
+    expect(
+      clients[0].requests.filter(
+        (r) => r.method === "thread/lead" && (r.params as { cwd?: string }).cwd === "/w",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("still paints the first screen when thread/lead fails", async () => {
+    state.failLead = true;
+    render(<App />);
+    // 补建路径确实被走到了：对 /w 发过 thread/lead（且失败了）。
+    await waitFor(() => expect(state.leadAttempts).toContain("/w"));
+    // 失败不得挡住首屏：既有会话照旧渲染，且没有凭空冒出组长条目。
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    expect(screen.queryByText("组长")).toBeNull();
   });
 });

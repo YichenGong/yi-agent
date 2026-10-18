@@ -5,7 +5,10 @@
  * 翻成 `method` + `params`，并把宿主回包归一成可判定的形状。明文 key 只
  * 单向发送，从不回读。
  */
-export type OnboardingRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
+import type { RpcCall } from "./rpcCall";
+import { RPC } from "./routes";
+
+export type OnboardingRpc = RpcCall;
 
 export type OnboardingStatus = {
   needed: boolean;
@@ -47,7 +50,7 @@ export function reasonLabel(code: string): string {
 
 /** 读引导状态。缺字段一律按「不需要引导」处理，绝不因宿主少发字段就弹向导。 */
 export async function onboardingStatus(rpc: OnboardingRpc): Promise<OnboardingStatus> {
-  const result = await rpc<Partial<OnboardingStatus>>("onboarding/status", {});
+  const result = await rpc<Partial<OnboardingStatus>>(RPC.onboardingStatus, {});
   return {
     needed: result?.needed === true,
     dismissed: result?.dismissed === true,
@@ -60,7 +63,7 @@ export async function applyOnboarding(
   rpc: OnboardingRpc,
   input: ApplyInput,
 ): Promise<ApplyResult> {
-  const result = await rpc<Partial<ApplyResult>>("onboarding/apply", {
+  const result = await rpc<Partial<ApplyResult>>(RPC.onboardingApply, {
     provider: input.provider,
     model: input.model,
     api_url: input.api_url,
@@ -76,7 +79,7 @@ export async function applyOnboarding(
 
 /** 探测连接。失败带可读原因；成功 reason 为 null。 */
 export async function testOnboarding(rpc: OnboardingRpc, input: ApplyInput): Promise<TestResult> {
-  const result = await rpc<{ ok?: unknown; reason?: unknown }>("onboarding/test", {
+  const result = await rpc<{ ok?: unknown; reason?: unknown }>(RPC.onboardingTest, {
     provider: input.provider,
     model: input.model,
     api_url: input.api_url,
@@ -90,5 +93,5 @@ export async function testOnboarding(rpc: OnboardingRpc, input: ApplyInput): Pro
 
 /** 标记引导已结束（完成或「稍后设置」）。 */
 export async function dismissOnboarding(rpc: OnboardingRpc): Promise<void> {
-  await rpc("onboarding/dismiss", {});
+  await rpc(RPC.onboardingDismiss, {});
 }

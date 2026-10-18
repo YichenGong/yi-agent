@@ -198,6 +198,43 @@ impl Relay {
     }
 }
 
+/// 把中继端点拆成「去掉 `session` 的 URL」+「session id」。
+///
+/// 中继客户端（`yi-agent` 的 CLI 与 `yi-agent-app-server`）都要在连接前把
+/// `session` 从 URL 上摘下来，否则 `run_client` 再补一次会出现两个 `session`
+/// 参数。两份实现曾各持一份逐字相同的副本，这里收成单一来源。
+pub fn parse_relay_parts(relay_url: &str) -> anyhow::Result<(String, String)> {
+    let (base, query) = match relay_url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (relay_url, None),
+    };
+    let session = query
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "session")
+        .map(|(_, value)| value.to_string())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "relay endpoint `{relay_url}` is missing `?session=<id>`: \
+                 the phone and the computer must agree on the same session id"
+            )
+        })?;
+
+    let kept: Vec<&str> = query
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("session="))
+        .collect();
+    let url = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", kept.join("&"))
+    };
+    Ok((url, session))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

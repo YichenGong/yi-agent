@@ -128,6 +128,7 @@ fn forked_daemon() -> (ForkDaemon, String, String, String) {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "fork-ipc".into(),
             workspace: project,
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()

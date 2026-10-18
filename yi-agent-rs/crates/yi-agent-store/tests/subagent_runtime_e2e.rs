@@ -228,6 +228,7 @@ fn active_runtime() -> (
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "runtime-e2e-active".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -303,6 +304,7 @@ fn delivery_survives_restart_without_restarting_worker() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "runtime-e2e-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -414,6 +416,7 @@ fn delivered_child_commit_survives_restart_and_is_reported_to_parent() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "runtime-e2e-delivery-report-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()
@@ -473,6 +476,7 @@ fn delivered_child_commit_survives_restart_and_is_reported_to_parent() {
         IpcRequest::AttachApplicationRoot {
             idempotency_key: "runtime-e2e-delivery-report-restart".into(),
             workspace: std::path::PathBuf::from("/tmp/yi-agent-test-project"),
+            extra_roots: Vec::new(),
         },
     )
     .unwrap()

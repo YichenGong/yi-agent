@@ -1,219 +1,50 @@
 /**
  * Wire-protocol types for the `yi-agent app-server` JSON-RPC 2.0 interface.
  *
- * These mirror the Rust definitions in
- * `yi-agent-rs/crates/yi-agent-app-server/src/protocol.rs`. Two conventions
- * matter when reading them:
+ * The shapes that mirror `yi-agent-rs/crates/yi-agent-app-server/src/protocol.rs`
+ * are **generated** by ts-rs into `./generated/`. This module only re-exports
+ * them so existing `from "./lib/protocol"` imports keep working. Do not
+ * hand-edit those — edit the Rust and re-run the bindings export.
  *
- * - All `params` fields are `snake_case` (`thread_id`, `turn_id`, `item_id`,
+ * Two conventions still matter when reading the protocol:
+ *
+ * - Most `params` fields are `snake_case` (`thread_id`, `turn_id`, `item_id`,
  *   `input_tokens`, `output_tokens`), matching serde's default field naming.
  * - The `Item` union is tagged with a camelCase `type` discriminator
- *   (`userMessage` / `agentMessage` / `toolCall`).
+ *   (`userMessage` / `agentMessage` / `toolCall` / `userInterjection` /
+ *   `thinking`).
+ *
+ * Everything below the re-exports has **no** counterpart in `protocol.rs`: those
+ * are either wire shapes the server assembles with `json!` (no Rust type at all)
+ * or types owned by other crates (`yi-agent-core`, `git_diff.rs`,
+ * `yi-agent-tools`). They therefore stay hand-written here.
  *
  * This module is types only — no runtime logic.
  */
 
 import type { ThreadMode } from "./threadPermissionMode";
-
-export type RequestId = number | string;
-
-export interface RpcError {
-  code: number;
-  message: string;
-  data?: unknown;
-}
-
-export type ToolStatus = "running" | "completed" | "failed";
-
-/** 一条消息附带的文档元数据（内容不进协议，agent 用 read_document 读）。 */
-export interface Attachment {
-  name: string;
-  /** 相对工作区根的路径，形如 `.yi-agent/attachments/<thread_id>/<hash>-<name>`。 */
-  path: string;
-  mime?: string;
-  size: number;
-}
-
 /**
- * 一条消息附带的图片引用。**内容不进协议**：只有定位与展示所需的元数据，
- * 字节由 `image/read` 按需分片取。
+ * 下面这三个生成类型虽然只做再导出，但本文件保留下来的手写定义（在 `protocol.rs`
+ * 里没有对应物）仍然**引用**它们，所以还要留一份本地类型绑定，否则那几处会报
+ * `Cannot find name`。
  */
-export interface ImageRef {
-  path: string;
-  media_type: string;
-  /** 图片文件字节数；工具结果里的引用为 0，意为「未知」（非 0 字节）。 */
-  size: number;
-  detail?: string;
-}
+import type { AgentChild } from "./generated/AgentChild";
+import type { AgentTraceRow } from "./generated/AgentTraceRow";
+import type { ThreadStatus } from "./generated/ThreadStatus";
 
-export type Item =
-  | {
-      type: "userMessage";
-      id: string;
-      text: string;
-      attachments?: Attachment[];
-      images?: ImageRef[];
-    }
-  /**
-   * 中途追加的用户消息：属于当前 turn，但作为独立 item 渲染，避免与开启该
-   * turn 的那条消息混为一谈。`id` 是服务端在 RPC 入口铸的 `interjection_id`。
-   */
-  | {
-      type: "user_interjection";
-      id: string;
-      text: string;
-      attachments?: Attachment[];
-      images?: ImageRef[];
-    }
-  | { type: "agentMessage"; id: string; text: string }
-  /**
-   * 一段推理的展示条目（design §6.1 的「思考」卡片）。**不携带凭证**：signature /
-   * encrypted_content 只存在于服务端回传 API 的路径上，绝不下发前端。
-   *
-   * 实时期间前端先用本地 `thread/reasoningDelta` 累积的块保留流式手感，本 item
-   * 一到就**就地接管**（位置不变）；历史回放期则由本 item 直接驱动渲染。
-   */
-  | { type: "thinking"; id: string; text: string; redacted: boolean }
-  | {
-      type: "toolCall";
-      id: string;
-      call_id: string;
-      name: string;
-      input: unknown;
-      status: ToolStatus;
-      result?: string;
-      images?: ImageRef[];
-    };
-
-export type TurnStatus = "completed" | "interrupted" | "failed";
-
-/** thread 级实时状态；服务端权威（`thread/status/updated` / `thread/list(:All)`）。 */
-export type ThreadStatus = "idle" | "running" | "awaiting_approval";
-
-export type Notification =
-  | {
-      method: "thread/started";
-      params: { thread_id: string; cwd: string; model: string; model_ref?: string | null };
-    }
-  | { method: "thread/status/updated"; params: { thread_id: string; status: ThreadStatus } }
-  | { method: "thread/modelChanged"; params: { thread_id: string; model: string } }
-  /**
-   * 该会话的标题已变（LLM 首轮生成成功写入）。与 `thread/modelChanged` 同族：
-   * 会话元数据，列表层恒推，所有客户端据此就地刷新侧栏。**直接携带权威标题**，
-   * 客户端就地落笔，不必再拉一次 `thread/listAll`。
-   */
-  | { method: "thread/titleChanged"; params: { thread_id: string; title: string } }
-  | {
-      method: "thread/permissionModeChanged";
-      params: { thread_id: string; mode: ThreadMode };
-    }
-  /**
-   * 该会话的 reasoning effort 覆盖已切换到 `effort`（或清除）。与
-   * `thread/modelChanged` 同族：会话元数据，列表层恒推，所有客户端的控件据此刷新。
-   * `effort` **缺省即已清除覆盖**（不发送该字段），回落清单条目默认。
-   */
-  | {
-      method: "thread/reasoningEffortChanged";
-      params: { thread_id: string; effort?: string | null };
-    }
-  /**
-   * 运行期告知（通道回退 / effort 降级），状态栏级一行提示。**注意 `level` 是
-   * PascalCase**：core 的 `NoticeLevel` 无 `rename_all`，与同文件其余 snake_case
-   * 参数不同（`protocol.rs:814-832` 钉死了这个线形状）。
-   */
-  | {
-      method: "thread/notice";
-      params: { thread_id: string; level: "Info" | "Warn"; text: string };
-    }
-  /**
-   * 归一化的思维链增量（仅展示，**绝不回灌**后续轮次）。`kind` 同样 PascalCase
-   * （core 的 `ReasoningKind` 无 `rename_all`）。
-   */
-  | {
-      method: "thread/reasoningDelta";
-      params: { thread_id: string; text: string; kind: "Content" | "Summary" };
-    }
-  | { method: "turn/started"; params: { thread_id: string; turn_id: string } }
-  | { method: "item/started"; params: { thread_id: string; item: Item } }
-  | { method: "item/delta"; params: { thread_id: string; item_id: string; delta: string } }
-  | { method: "item/completed"; params: { thread_id: string; item: Item } }
-  | { method: "items/completed"; params: { thread_id: string; items: Item[] } }
-  | {
-      method: "turn/completed";
-      params: { thread_id: string; turn_id: string; status: TurnStatus; error?: string };
-    }
-  | {
-      method: "turn/retry";
-      params: {
-        thread_id: string;
-        turn_id: string;
-        attempt: number;
-        max: number;
-        cause: "idle_stall" | "request_timeout";
-      };
-    }
-  | {
-      method: "thread/tokenUsage/updated";
-      params: {
-        thread_id: string;
-        model: string;
-        input_tokens: number;
-        output_tokens: number;
-        /** 缺省(旧服务端)按 0 处理。 */
-        cache_creation_input_tokens?: number;
-        cache_read_input_tokens?: number;
-      };
-    }
-  | {
-      method: "turn/interjectionsReturned";
-      params: { thread_id: string; turn_id: string; items: string[] };
-    }
-  | {
-      method: "agent/children/updated";
-      params: { threadId: string; children: AgentChild[] };
-    }
-  | {
-      method: "agent/trace/event";
-      params: { threadId: string; taskId: string; row: AgentTraceRow };
-    }
-  /**
-   * 该 thread 的某个受管后台进程状态变了。**不含 Output**：stdout 是高频流，
-   * 只在用户打开详情时经 `process/read` 增量拉取。它只是「该重拉了」的提示，
-   * 权威数据在 `process/list` 的响应里，收到后重拉即可。
-   */
-  | {
-      method: "process/updated";
-      params: { thread_id: string; process_id: string; state: string };
-    }
-  | { method: "ui/settings/updated"; params: { theme: string } }
-  | {
-      method: "ui/gitDiff/focus";
-      params: { threadId: string | null; base: string | null; note: string | null };
-    }
-  | { method: "error"; params: { message: string } };
-
-/**
- * 该对话名下一个子 agent 的列表项。
- *
- * 字段是 camelCase：`agent/*` 是与 `thread/` `turn/` 并列的新命名空间,其参数
- * 由 app-server 直接序列化 `AgentChild`,故不沿用旧命名空间的 snake_case。
- */
-export interface AgentChild {
-  taskId: string;
-  objective?: string;
-  state: string;
-  lastStep?: string;
-  /** 该子任务自己的父任务;顶层子任务缺省。用于下钻时只列出自己的直接子任务。 */
-  parentTaskId?: string;
-}
-
-/** 一条子 agent 轨迹行,原样透传 daemon 的持久化行。 */
-export interface AgentTraceRow {
-  eventId: number;
-  taskId: string;
-  kind: "assistant_text" | "tool_call" | "tool_result" | "state_note" | string;
-  payloadJson: string;
-}
+// Generated mirrors of `protocol.rs` (ts-rs). See the header for why the rest of
+// this file is still hand-written.
+export type { RequestId } from "./generated/RequestId";
+export type { RpcError } from "./generated/RpcError";
+export type { ToolStatus } from "./generated/ToolStatus";
+export type { Attachment } from "./generated/Attachment";
+export type { ImageRef } from "./generated/ImageRef";
+export type { Item } from "./generated/Item";
+export type { TurnStatus } from "./generated/TurnStatus";
+export type { ThreadStatus } from "./generated/ThreadStatus";
+export type { Notification } from "./generated/Notification";
+export type { AgentChild } from "./generated/AgentChild";
+export type { AgentTraceRow } from "./generated/AgentTraceRow";
 
 /** `agent/children/list` 的响应。 */
 export interface AgentChildrenListResult {
@@ -285,6 +116,23 @@ export interface ThreadSummary {
    * 旧服务端不发送此字段，读取时按 `null` 处理。
    */
   model_ref?: string | null;
+  /**
+   * 会话角色。`"lead"` = 该会话是所属项目的组长。缺省 = 普通会话
+   * （旧服务端不发送此字段）。未知取值必须忽略，不得当成组长。
+   */
+  role?: string;
+  /**
+   * 颜色标签 id（`threadTags.ts` 的 `TAG_IDS` 之一）。缺省 / `null` = 无标签。
+   * 旧服务端不发送此字段；读取时先过 `isValidTagId` 再渲染，脏值按无标签处理。
+   */
+  tag?: string | null;
+  /**
+   * 服务端的内容世代。旧服务端不发送此字段：读取时必须按"未知"处理
+   * （保守全量 resume），绝不当作"一致"（spec §4.3）。`null` 与缺省同义。
+   */
+  content_epoch?: number | null;
+  /** 服务端最后一条 item 的 id；`null` = 该会话从未有过 item。 */
+  last_item_id?: string | null;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */
@@ -300,6 +148,8 @@ export interface Usage {
 export interface Workspace {
   path: string;
   exists: boolean;
+  /** 该目录被关联到的主根（canonical 绝对路径）；null / 缺省 = 顶层目录。 */
+  linked_to?: string | null;
 }
 
 /** `thread/listAll` 的一个目录分组。 */

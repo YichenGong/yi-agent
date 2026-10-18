@@ -93,6 +93,33 @@ describe("ThreadStore", () => {
     expect(s.view("a").info).toEqual({ cwd: "/w", model: "m", model_ref: null });
   });
 
+  it("seeds the permission mode from a listing snapshot, without inventing one", () => {
+    const s = new ThreadStore();
+    s.seed([
+      { ...summary("a"), permission_mode: "yolo" },
+      { ...summary("b") },
+    ]);
+    // Present in the snapshot → adopt the authoritative value.
+    expect(s.view("a").mode).toBe("yolo");
+    // Absent from the snapshot → unknown, never fabricated as "normal".
+    expect(s.view("b").mode).toBeNull();
+  });
+
+  it("never lets a listing snapshot clobber a known or push-written mode", () => {
+    const s = new ThreadStore();
+    // The push stream is authoritative and just said YOLO.
+    s.applyNotification({
+      method: "thread/permissionModeChanged",
+      params: { thread_id: "a", mode: "yolo" },
+    });
+    // A snapshot that omits the field (older server) must not erase it.
+    s.seed([summary("a")]);
+    expect(s.view("a").mode).toBe("yolo");
+    // Nor may a snapshot for a thread it no longer lists.
+    s.seed([summary("b")]);
+    expect(s.view("a").mode).toBe("yolo");
+  });
+
   it("does not let a stale listing snapshot roll back a live status", () => {
     const s = new ThreadStore();
     s.seed([summary("a", "running")]);
@@ -154,6 +181,23 @@ describe("ThreadStore", () => {
     s.drop("a");
     expect(s.currentId).toBeNull();
     expect(s.peek("a")).toBeUndefined();
+  });
+
+  it("forgetPushStatuses lets a fresh listing re-seed a stale running status", () => {
+    const s = new ThreadStore();
+    // A turn was running: the push stream marked the status authoritative.
+    s.applyNotification({
+      method: "thread/status/updated",
+      params: { thread_id: "a", status: "running" },
+    });
+    // The sidecar crashes; the new process reports the thread as idle. Without
+    // forgetting the push, `seed` would refuse to overwrite the stale `running`.
+    s.seed([summary("a", "idle")]);
+    expect(s.view("a").status).toBe("running");
+
+    s.forgetPushStatuses();
+    s.seed([summary("a", "idle")]);
+    expect(s.view("a").status).toBe("idle");
   });
 
   it("keeps an unsent draft per thread and returns it on switch-back", () => {
@@ -255,5 +299,10 @@ describe("threadStore reasoning effort", () => {
     });
     s.applyNotification({ method: "thread/reasoningEffortChanged", params: { thread_id: "a" } });
     expect(s.view("a").reasoningEffort).toBeNull();
+  });
+
+  it("defaults syncState to synced so the desktop path is unchanged", () => {
+    const s = new ThreadStore();
+    expect(s.view("t1").syncState).toBe("synced");
   });
 });

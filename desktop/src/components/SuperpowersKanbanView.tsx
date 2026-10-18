@@ -13,6 +13,7 @@ export function SuperpowersKanbanView({
   expandedDone = false,
   onToggleDone,
   onOpenThread,
+  onPromote,
 }: {
   switchOn: boolean;
   source: SwitchSource;
@@ -23,6 +24,8 @@ export function SuperpowersKanbanView({
   onToggleDone?: () => void;
   /** 打开某张卡关联的会话；上层接到既有的 thread/resume 入口。 */
   onOpenThread?: (threadId: string) => void;
+  /** 提升某张预排队卡（补 spec/plan）；上层负责选文件与调 RPC。 */
+  onPromote?: (cardId: string) => void;
 }) {
   if (pluginMissing) {
     return (
@@ -47,6 +50,7 @@ export function SuperpowersKanbanView({
       expandedDone={expandedDone}
       onToggleDone={onToggleDone}
       onOpenThread={onOpenThread}
+      onPromote={onPromote}
     />
   );
 }

@@ -228,6 +228,9 @@ pub fn attach_project_runtime(
         yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
             idempotency_key,
             workspace: cfg.workdir.clone(),
+            // This attach path carries no linked roots, so the root session
+            // stays single-root -- today's behavior, byte for byte.
+            extra_roots: Vec::new(),
         },
     )
     .map_err(|error| AttachFailure::new("attach", error))?;

@@ -3,6 +3,7 @@ import type { BoardColumnKey } from "../lib/superpowersKanbanBoard";
 import { SuperpowersKanbanCard } from "./SuperpowersKanbanCard";
 
 const COLUMN_LABEL: Record<BoardColumnKey, string> = {
+  preQueued: "PRE-QUEUED",
   queued: "QUEUED",
   doing: "DOING",
   needDecision: "NEED DECISION",
@@ -14,6 +15,7 @@ export function SuperpowersKanbanColumn({
   cards,
   totalCount,
   onOpenThread,
+  onPromote,
   doneToggle,
 }: {
   columnKey: BoardColumnKey;
@@ -22,14 +24,20 @@ export function SuperpowersKanbanColumn({
   /** 该列卡片总数；done 列计数含被折叠掉的卡。 */
   totalCount: number;
   onOpenThread?: (threadId: string) => void;
+  /** 透传给卡片：提升某张预排队卡。 */
+  onPromote?: (cardId: string) => void;
   /** 只有 done 列会传：右侧的「展开全部 / 收起」开关。 */
   doneToggle?: { expanded: boolean; onToggle: () => void; hasMore: boolean };
 }) {
   const needsDecision = columnKey === "needDecision";
   return (
+    // `min-w-0`：flex 项默认 `min-width:auto` 会取内容最小宽度，卡片标题是
+    // `truncate`（nowrap），其 min-content 就是整条标题宽——不解除这一项，列会拒绝
+    // 收缩、把整行撑宽（用户报的「左右过宽」）。窄屏堆叠时给个高度下限，让整行走
+    // 上下滚动而不是把各列压成等高的可滚区。
     <section
       aria-label={`看板列 ${COLUMN_LABEL[columnKey]}`}
-      className={`flex min-h-0 flex-1 flex-col rounded border ${
+      className={`flex min-h-0 min-w-0 flex-1 flex-col rounded border max-md:min-h-[16rem] ${
         needsDecision ? "border-red-500/40" : "border-line"
       } bg-surface`}
     >
@@ -56,7 +64,12 @@ export function SuperpowersKanbanColumn({
           <li className="px-1 py-2 text-xs text-fg-subtle">空</li>
         ) : (
           cards.map((card) => (
-            <SuperpowersKanbanCard key={card.id} card={card} onOpenThread={onOpenThread} />
+            <SuperpowersKanbanCard
+              key={card.id}
+              card={card}
+              onOpenThread={onOpenThread}
+              onPromote={onPromote}
+            />
           ))
         )}
       </ul>

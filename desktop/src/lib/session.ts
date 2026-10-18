@@ -1,5 +1,27 @@
 import type { Attachment, Item, Notification, RetryCause, TurnStatus, Usage } from "./protocol";
 
+/**
+ * `Notification` 的 `turn/retry` 载荷里 `cause` 的类型是 `string`——那就是线形状
+ * （`protocol.rs` 发的是普通 `String`，值为 `"idle_stall"` 等）。但 `retrying.cause`
+ * 是前端自己的窄联合 `RetryCause`，而 `ChatView` 的 `RETRY_CAUSE_LABELS` 要拿它查表。
+ *
+ * 所以在这个赋值边界上做一次**真实的**检查（而不是 `as RetryCause` 那种只让编译器
+ * 闭眼的断言）：认得的原因原样透传；认不得的（服务端将来新增原因、前端还没跟上）
+ * 归到 `network_error`，其文案「Provider unreachable」对任何非特定的重试都成立。
+ * 这样最坏情况是文案退化，而不是 `RETRY_CAUSE_LABELS[undefined]` 静默渲染成空标签。
+ */
+const RETRY_CAUSES: readonly RetryCause[] = [
+  "idle_stall",
+  "request_timeout",
+  "rate_limited",
+  "server_error",
+  "network_error",
+];
+
+function toRetryCause(cause: string): RetryCause {
+  return RETRY_CAUSES.includes(cause as RetryCause) ? (cause as RetryCause) : "network_error";
+}
+
 let localSeq = 0;
 const nextLocalId = () => `local-${++localSeq}`;
 
@@ -82,6 +104,22 @@ export class Session {
   lastServerItemId: string | null = null;
 
   /**
+   * The server's content generation for this thread, as last learned from
+   * `syncPlan` / `ThreadSummary`. `null` means we have not learned one yet
+   * (first sighting this session) — which must NOT be treated as "matches"
+   * (spec §4.3): a missing version degrades to the conservative full resume.
+   */
+  contentEpoch: number | null = null;
+
+  /**
+   * True once a full replay was triggered by a generation change. Guards
+   * `prefillFromCache`: an async cache read that resolves *after*
+   * `adoptEpoch` wiped the transcript would otherwise see `items.length === 0`
+   * and inject the very stale content we just judged invalid (spec §6.4).
+   */
+  epochInvalidated = false;
+
+  /**
    * Server item ids seen while a full replay is in flight, or `null` when no
    * replay is being collected. `dropStale` uses the completed set to tell a
    * cached item the server still has from one it no longer has.
@@ -101,6 +139,32 @@ export class Session {
     const ids = this.replayIds;
     this.replayIds = null;
     return ids;
+  }
+
+  /**
+   * Adopt the server's authoritative content generation for this thread.
+   *
+   * When the generation changed, everything we hold is structurally stale —
+   * the server no longer has these items (it was `/clear`ed) — so the whole
+   * transcript is dropped. Returns `true` to tell the caller a full
+   * `thread/resume` is required.
+   *
+   * A same-generation call only advances the cursor: "anchor present but
+   * behind" is the normal shape of two clients coexisting, not an error
+   * (spec §7.2).
+   */
+  adoptEpoch(epoch: number, lastItemId: string | null): boolean {
+    const changed = this.contentEpoch !== null && this.contentEpoch !== epoch;
+    this.contentEpoch = epoch;
+    if (changed) {
+      this.items = [];
+      this.lastServerItemId = null;
+      this.openReasoning = null;
+      this.epochInvalidated = true;
+      return true;
+    }
+    if (lastItemId !== null) this.lastServerItemId = lastItemId;
+    return false;
   }
 
   /**
@@ -146,6 +210,7 @@ export class Session {
     this.returnedInterjections = [];
     this.lastServerItemId = null;
     this.openReasoning = null;
+    this.epochInvalidated = false;
   }
 
   /**
@@ -273,7 +338,7 @@ export class Session {
       // Same normalisation as `apply`: a mid-turn interjection renders as a user
       // bubble, so a cold replay must not introduce a second shape.
       const normalized: Item =
-        item.type === "user_interjection"
+        item.type === "userInterjection"
           ? { type: "userMessage", id: item.id, text: item.text }
           : item;
       const index = this.items.findIndex((i) => i.id === normalized.id);
@@ -335,7 +400,7 @@ export class Session {
         // so the distinction is visible on the wire, not to require a second
         // renderer here.
         const item: Item =
-          incoming.type === "user_interjection"
+          incoming.type === "userInterjection"
             ? { type: "userMessage", id: incoming.id, text: incoming.text }
             : incoming;
         if (this.replayIds !== null) this.replayIds.add(item.id);
@@ -471,7 +536,8 @@ export class Session {
         this.retrying = {
           attempt: notification.params.attempt,
           max: notification.params.max,
-          cause: notification.params.cause,
+          // 线形状是 `string`；这里收窄到 `RetryCause`（见 `toRetryCause` 的注释）。
+          cause: toRetryCause(notification.params.cause),
         };
         break;
       case "thread/tokenUsage/updated":

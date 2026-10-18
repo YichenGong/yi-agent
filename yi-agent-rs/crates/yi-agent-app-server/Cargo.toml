@@ -12,10 +12,16 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+# 线协议类型（`src/protocol.rs`）的 TypeScript 绑定从这里生成，桌面端不再手抄
+# 一份镜像（`desktop/src/lib/generated/`）。`serde-compat` 让生成物跟随
+# `#[serde(...)]` 的大小写/标签约定，即线上 JSON 形状。
+ts-rs = { version = "11", features = ["serde-compat"] }
 yi-agent-core = { workspace = true }
 yi-agent-runtime = { workspace = true }
 yi-agent-store = { workspace = true }
 yi-agent-subagent = { workspace = true }
+# `skill/list` / `skill/read` 枚举与读取三层 skill 根。
+yi-agent-skills = { workspace = true }
 yi-agent-tools = { workspace = true }
 # The embedded relay client (outbound wss) used by `serve_stdio_with_relay`: the
 # desktop and a relay-attached phone must share ONE `serve()` loop.
@@ -26,6 +32,9 @@ yi-agent-boards = { path = "../yi-agent-boards" }
 yi-agent-supervisors = { path = "../yi-agent-supervisors" }
 anyhow.workspace = true
 axum = { workspace = true, features = ["ws"] }
+# `lead::ensure_lead_meta` 给组长 meta 盖创建时间戳(epoch 毫秒)。与
+# `yi-agent-runtime` 同一份工作区依赖,不引入新版本。
+chrono.workspace = true
 async-trait = "0.1"
 # `image/read` 分片回传的是原始字节，base64 只在响应体的 `data` 字段出现。
 base64 = "0.22"

@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use ts_rs::TS;
 
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -11,7 +12,8 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 ///
 /// `Ord` 从弱到强：`Observe < Control < Admin`。新配对设备默认 `Control`
 /// （决策 A）。Task 3 会围绕它扩展配对/设备 RPC。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
     Observe,
@@ -19,30 +21,37 @@ pub enum Scope {
     Admin,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(untagged)]
 pub enum RequestId {
+    // 线上是 JSON 数字,与 `Str` 并列构成 `number | string`。
+    #[ts(type = "number")]
     Num(i64),
     Str(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct RequestEnvelope {
     #[serde(default)]
     pub jsonrpc: Option<String>,
     pub id: RequestId,
     pub method: String,
     #[serde(default)]
+    #[ts(type = "unknown")]
     pub params: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct ResponseEnvelope {
     #[serde(default)]
     pub jsonrpc: Option<String>,
     pub id: RequestId,
     /// 成功响应时省略;与 `error` 互斥。
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown")]
     pub result: Option<Value>,
     /// 错误响应时省略;与 `result` 互斥。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,31 +59,41 @@ pub struct ResponseEnvelope {
 }
 
 /// 客户端 → 服务端、针对反向请求的响应(id 与请求匹配,无 `method`)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct ClientResponse {
     #[serde(default)]
     pub jsonrpc: Option<String>,
     pub id: RequestId,
     #[serde(default)]
+    #[ts(type = "unknown")]
     pub result: Option<Value>,
     #[serde(default)]
+    #[ts(type = "unknown")]
     pub error: Option<Value>,
 }
 
 /// 服务端 → 客户端的反向请求(带 `id`,需要客户端回响应)。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct ReverseRequest<'a> {
     pub jsonrpc: &'a str,
     pub id: String,
     pub method: &'a str,
+    #[ts(type = "unknown")]
     pub params: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct RpcError {
+    // JSON-RPC 错误码,线上是 JSON 数字。
+    #[ts(type = "number")]
     pub code: i64,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    #[ts(type = "unknown")]
     pub data: Option<Value>,
 }
 
@@ -166,6 +185,20 @@ impl RpcError {
         }
     }
 
+    /// 客户端的上下文锚点已失效：该会话在它不知情时被 `/clear`，它手上持有的是
+    /// 服务端**不存在**的内容，其可见上下文与服务端实际上下文结构性不一致。
+    ///
+    /// 与 `board_query` / `model_not_found` 同族：数值码只是粗粒度兜底，
+    /// `data.code` 才是 UI 分支的稳定词汇。注意「锚点落后但仍在」**不是**本错误
+    /// ——落后是两端并存的正常形状（spec §7.2）。
+    pub fn stale_context(thread_id: &str) -> Self {
+        Self {
+            code: -32026,
+            message: format!("context anchor is stale for thread: {thread_id}"),
+            data: Some(serde_json::json!({ "code": "stale_context" })),
+        }
+    }
+
     /// A `model/upsert` payload failed validation (empty name, unknown provider,
     /// empty url/model). Numeric code stays in the `invalid_params` family;
     /// `data.code` gives the caller a stable reason.
@@ -197,7 +230,8 @@ impl RpcError {
 }
 
 /// 服务端 → 客户端通知(无 id)。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(tag = "method", content = "params")]
 pub enum Notification {
     #[serde(rename = "thread/started")]
@@ -231,6 +265,9 @@ pub enum Notification {
     #[serde(rename = "thread/permissionModeChanged")]
     PermissionModeChanged {
         thread_id: String,
+        // `ThreadMode` 在 `thread_store.rs`,不在本模块的导出清单里;这里只标注它
+        // 的线上形状(`#[serde(rename_all = "lowercase")]` 的外部标签)。
+        #[ts(type = "\"normal\" | \"yolo\"")]
         mode: crate::thread_store::ThreadMode,
     },
     /// 该会话的 reasoning effort 覆盖已切换（或清除）。
@@ -262,6 +299,16 @@ pub enum Notification {
     /// 字符串，客户端就地落笔即可，不必再付一次全量 `thread/listAll`。
     #[serde(rename = "thread/titleChanged")]
     TitleChanged { thread_id: String, title: String },
+    /// 该会话的颜色标签已变（`thread/setTag`）。
+    ///
+    /// 与 `thread/titleChanged` 同族：标签是会话元数据，变更后必须让**所有**客户端
+    /// 立即刷新侧栏色点。**直接携带权威值**（`None` = 已清除），客户端就地落笔，
+    /// 不必重拉全量 `thread/listAll`。
+    #[serde(rename = "thread/tagChanged")]
+    TagChanged {
+        thread_id: String,
+        tag: Option<String>,
+    },
     /// 非致命运行期告知（通道回退 / effort 降级），状态栏级一行提示。
     ///
     /// 与 `turn/retry` 同为**内容层**（按 thread 路由）：它描述的是某条会话这一次
@@ -269,6 +316,8 @@ pub enum Notification {
     #[serde(rename = "thread/notice")]
     Notice {
         thread_id: String,
+        // `NoticeLevel` 在 `yi-agent-core`,同上:只标注线上形状(外部标签,原样变体名)。
+        #[ts(type = "\"Info\" | \"Warn\"")]
         level: yi_agent_core::NoticeLevel,
         text: String,
     },
@@ -280,6 +329,8 @@ pub enum Notification {
     ReasoningDelta {
         thread_id: String,
         text: String,
+        // `ReasoningKind` 同上:线上是外部标签的变体名。
+        #[ts(type = "\"Content\" | \"Summary\"")]
         kind: yi_agent_core::ReasoningKind,
     },
     #[serde(rename = "item/started")]
@@ -302,6 +353,7 @@ pub enum Notification {
         turn_id: String,
         status: TurnStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         error: Option<String>,
     },
     /// Mid-turn user messages the server could not consume, handed back so the
@@ -380,6 +432,25 @@ pub enum Notification {
     /// 只由 `ThemeHandle` 的广播触发；客户端收到即把 `data-theme` 换成新值。
     #[serde(rename = "ui/settings/updated")]
     UiSettingsUpdated { theme: String },
+    /// 颜色标签的显示名（颜色 id → 名称）已变。
+    ///
+    /// **全局**帧：标签名是对所有会话生效的宿主级偏好，与任何 thread 上下文无关。
+    /// **携带用户覆盖的权威映射**（可能只含被改的键），客户端与自己的默认名表合并
+    /// 后即可渲染。
+    ///
+    /// 为什么独立成一条而不是挤进 `ui/settings/updated`：后者由主题 watcher 从
+    /// 主题广播通道泵出（`server.rs` 的 `pump_theme_notifications`），语义是「主题
+    /// 变了」；标签名只经 `ui/settings/write` 变更、没有 watcher。塞进去会让该通知
+    /// 时而带 `tag_names` 时而不带（watcher 路径没有它），语义含混。
+    #[serde(rename = "ui/tagNames/updated")]
+    TagNamesUpdated {
+        // ts-rs 默认把 `BTreeMap<String, String>` 渲染成 `{ [key in string]?: string }`
+        // （值可 `undefined`），比线上更宽：serde 序列化该 map 的值恒为字符串，
+        // 线上的形状是 `Record<string, string>`。显式标注复现线上形状（同 §3.2 对
+        // `u64`/`Option` 的处理），否则前端按 `Record<string, string>` 消费会报窄化错误。
+        #[ts(type = "Record<string, string>")]
+        tag_names: std::collections::BTreeMap<String, String>,
+    },
     /// 模型（`show_git_diff` 工具）请求桌面端聚焦 Git Diff 视图。
     #[serde(rename = "ui/gitDiff/focus", rename_all = "camelCase")]
     UiGitDiffFocus {
@@ -403,6 +474,7 @@ impl Notification {
             | Notification::ReasoningEffortChanged { thread_id, .. }
             | Notification::PreserveThinkingChanged { thread_id, .. }
             | Notification::TitleChanged { thread_id, .. }
+            | Notification::TagChanged { thread_id, .. }
             | Notification::Notice { thread_id, .. }
             | Notification::ReasoningDelta { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
@@ -419,6 +491,7 @@ impl Notification {
             Notification::UiGitDiffFocus { thread_id, .. } => thread_id.as_deref(),
             Notification::ToolCallApprovalResolved { .. }
             | Notification::UiSettingsUpdated { .. }
+            | Notification::TagNamesUpdated { .. }
             | Notification::Error { .. } => None,
         }
     }
@@ -452,8 +525,10 @@ impl Notification {
             | Notification::ReasoningEffortChanged { .. }
             | Notification::PreserveThinkingChanged { .. }
             | Notification::TitleChanged { .. }
+            | Notification::TagChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
+            | Notification::TagNamesUpdated { .. }
             | Notification::Error { .. }
             | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,
             _ => Delivery::Content,
@@ -462,7 +537,8 @@ impl Notification {
 }
 
 /// 一条子 agent 的列表项。字段沿用 JSON-RPC 的 camelCase。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentChild {
     pub task_id: String,
@@ -479,9 +555,12 @@ pub struct AgentChild {
 }
 
 /// 一条轨迹行,原样透传 daemon 的 `IpcTraceRow`。
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "camelCase")]
 pub struct AgentTraceRow {
+    // daemon 的持久化行号,线上是 JSON 数字。
+    #[ts(type = "number")]
     pub event_id: i64,
     pub task_id: String,
     pub kind: String,
@@ -492,7 +571,8 @@ pub struct AgentTraceRow {
 ///
 /// `Notification` 自身只带 `method` / `params`,缺 `jsonrpc` 字段;发到线上
 /// 前需经本信封补齐 `"jsonrpc":"2.0"`。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct NotificationEnvelope<'a> {
     pub jsonrpc: &'a str,
     #[serde(flatten)]
@@ -508,7 +588,8 @@ impl<'a> NotificationEnvelope<'a> {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum TurnStatus {
     Completed,
@@ -518,7 +599,8 @@ pub enum TurnStatus {
 
 /// thread 级实时状态。`failed` 刻意缺席：失败是事件不是状态，失败后 thread
 /// 立刻回 `Idle`；"失败未读"由前端从 `turn/completed.params.status` 自行表达。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadStatus {
     Idle,
@@ -530,12 +612,16 @@ pub enum ThreadStatus {
 ///
 /// `path` 相对工作区根，形如 `.yi-agent/attachments/<thread_id>/<hash>-<name>`；
 /// 服务端在起 turn 前把用户选中的文件复制到该位置，工具据此读取。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct Attachment {
     pub name: String,
     pub path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub mime: Option<String>,
+    // 文件字节数;线上是 JSON 数字(远小于 2^53)。
+    #[ts(type = "number")]
     pub size: u64,
 }
 
@@ -544,16 +630,21 @@ pub struct Attachment {
 /// `Item` 会随每条通知下发,而传输帧上限为 1 MiB;内联图片字节日志会把帧撑爆。
 /// 服务端在起 turn 前把用户选中的图片复制到 `.yi-agent/attachments/<thread_id>/
 /// <hash>-<name>`,客户端据此自行读取并渲染。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 pub struct ImageRef {
     pub path: String,
     pub media_type: String,
+    // 图片文件字节数;线上是 JSON 数字(远小于 2^53)。
+    #[ts(type = "number")]
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Item {
     UserMessage {
@@ -572,9 +663,11 @@ pub enum Item {
         id: String,
         call_id: String,
         name: String,
+        #[ts(type = "unknown")]
         input: Value,
         status: ToolStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
         result: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
@@ -601,7 +694,8 @@ pub enum Item {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum ToolStatus {
     Running,
@@ -660,6 +754,47 @@ mod tests {
         let invalid = RpcError::invalid_model("provider must be anthropic or openai");
         assert_eq!(invalid.code, -32602);
         assert_eq!(invalid.data.unwrap()["code"], "invalid_model");
+    }
+
+    /// 客户端上下文锚点失效（该会话在其不知情时被 clear）。数值码取下一个空位，
+    /// UI 只读 `data.code`——与 `board_query` / `model_not_found` 同一约定。
+    #[test]
+    fn stale_context_has_a_stable_numeric_code_and_reason() {
+        let error = RpcError::stale_context("thread-a");
+        assert_eq!(
+            error.code, -32026,
+            "-32026 must stay reserved for stale_context"
+        );
+        assert_eq!(error.data.unwrap()["code"], "stale_context");
+        assert!(
+            error.message.contains("thread-a"),
+            "message must name the thread"
+        );
+    }
+
+    /// 新码不得与既有码撞车。
+    #[test]
+    fn stale_context_does_not_collide_with_existing_codes() {
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::not_initialized().code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::unknown_thread("t").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::turn_in_progress("t").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::model_not_found("m").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::board_query("plugin_rejected", "x").code
+        );
     }
 
     #[test]
@@ -878,6 +1013,54 @@ mod tests {
         assert_eq!(v["params"]["title"], "修复登录报错");
         assert_eq!(n.delivery(), Delivery::List);
         assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// 标签变更通知的 wire 形状：`thread/tagChanged`，参数 snake_case。
+    ///
+    /// 与 `titleChanged` 同族：会话元数据、列表层恒推、按 thread 路由、直接携带
+    /// 权威值（`null` = 已清除）。窗口外会话的标签变更同样要送达，否则手机端
+    /// 「概率性不同步」。
+    #[test]
+    fn tag_changed_notification_carries_method_and_tag() {
+        let n = Notification::TagChanged {
+            thread_id: "t1".into(),
+            tag: Some("red".into()),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/tagChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["tag"], "red");
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    #[test]
+    fn tag_changed_notification_serializes_a_cleared_tag_as_null() {
+        let n = Notification::TagChanged {
+            thread_id: "t1".into(),
+            tag: None,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        // 必须**存在且为 null**，而不是整个键被省略：前者客户端读 `tag === null`
+        // 即知「清除」，后者只能靠 `undefined`，两者在跨端解码里并不等价。
+        assert!(
+            v["params"].as_object().unwrap().contains_key("tag"),
+            "tag 键必须存在: {v}"
+        );
+        assert!(v["params"]["tag"].is_null(), "清除必须是显式 null: {v}");
+    }
+
+    /// 标签显示名变更通知：**全局**帧，不属于任何 thread。
+    #[test]
+    fn tag_names_updated_notification_is_global() {
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("red".to_string(), "紧急".to_string());
+        let n = Notification::TagNamesUpdated { tag_names: names };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "ui/tagNames/updated");
+        assert_eq!(v["params"]["tag_names"]["red"], "紧急");
+        assert_eq!(n.delivery(), Delivery::Global);
+        assert_eq!(n.thread_key(), None);
     }
 
     /// 运行期告知的 wire 形状:`thread/notice`,参数 snake_case,带 level。

@@ -1,6 +1,6 @@
 //! Agent 装配:provider 构造、工具注册、权限通道。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -145,23 +145,26 @@ pub fn build_system_prompt(cfg: &RuntimeConfig) -> String {
 /// **可能读取 stdin** 以询问是否纳入完整 catalog。stdin 非 TTY 的调用方(如
 /// app-server sidecar,其 stdin 是管道)永远不会触发该询问。
 pub fn build_tool_setup(cfg: &RuntimeConfig, naked: bool) -> Result<ToolSetup> {
-    build_tool_setup_in(cfg, naked, &cfg.workdir)
+    build_tool_setup_in(cfg, naked, std::slice::from_ref(&cfg.workdir))
 }
 
-/// 同 [`build_tool_setup`],但内置工具以 `workspace` 为根(子 agent 的 worktree 场景)。
+/// 同 [`build_tool_setup`],但内置工具以 `roots` 为根集(`roots[0]` = 主根)。
 ///
-/// 注意 `workspace` 只影响内置工具与进程工具的根;skills 与 MCP 配置
+/// app-server 的会话可携带关联根:FS 工具层收整集,shell 沙箱的额外可写根只收
+/// `roots[1..]` 加 `cfg.sandbox_writable_roots`(见 [`build_tool_setup_with_controller`])。
+///
+/// 注意 `roots` 只影响内置工具与进程工具的根;skills 与 MCP 配置
 /// (`.yi-agent/mcp.json`)的项目根仍取 `cfg.workdir`——这一不对称是有意保留的,
 /// 与无头路径的历史行为一致。
 pub fn build_tool_setup_in(
     cfg: &RuntimeConfig,
     naked: bool,
-    workspace: &Path,
+    roots: &[PathBuf],
 ) -> Result<ToolSetup> {
     build_tool_setup_with_switch(
         cfg,
         naked,
-        workspace,
+        roots,
         yi_agent_core::autonomy::YoloSwitch::new(cfg.yolo),
     )
 }
@@ -176,22 +179,25 @@ pub fn build_tool_setup_in(
 pub fn build_tool_setup_with_switch(
     cfg: &RuntimeConfig,
     naked: bool,
-    workspace: &Path,
+    roots: &[PathBuf],
     switch: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<ToolSetup> {
     let controller =
         yi_agent_tools::SandboxController::new(switch, cfg.sandbox, cfg.sandbox_promotable);
-    build_tool_setup_with_controller(cfg, naked, workspace, controller)
+    build_tool_setup_with_controller(cfg, naked, roots, controller)
 }
 
 /// Same as [`build_tool_setup_with_switch`], but with an externally-owned
 /// controller so the caller can share one controller with other tools (e.g.
 /// the subagent spawn tools); this keeps the root's sandbox and the spawn
 /// tools reading the same live YOLO switch.
+///
+/// `roots` 为空是配置错误:FS 工具层会退化成拒绝所有路径(Task 3 已定),这里直接
+/// 报错,让「一个会话至少有一个工作区根」这条不变量在装配期就成立。
 pub fn build_tool_setup_with_controller(
     cfg: &RuntimeConfig,
     naked: bool,
-    workspace: &Path,
+    roots: &[PathBuf],
     controller: yi_agent_tools::SandboxController,
 ) -> Result<ToolSetup> {
     if naked {
@@ -207,6 +213,11 @@ pub fn build_tool_setup_with_controller(
         });
     }
 
+    let primary = roots
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("a session needs at least one workspace root"))?;
+
     let mut registry = yi_agent_core::ToolRegistry::new();
 
     let prompt = build_prompt_setup(cfg)?;
@@ -215,18 +226,22 @@ pub fn build_tool_setup_with_controller(
         registry.register(Arc::new(yi_agent_tools::SkillTool::new(svc.clone())));
     }
 
+    // FS 根集含全部关联根;shell 沙箱的可写根只取「关联根 + cfg 配置的额外汇总项」,
+    // 且规范化(排序 + 去重)后交给两条执行路径。
+    let mut sandbox_writable = roots[1..].to_vec();
+    sandbox_writable.extend(cfg.sandbox_writable_roots.iter().cloned());
+    sandbox_writable.sort();
+    sandbox_writable.dedup();
+
     yi_agent_tools::register_builtin_tools_with_controller(
         &mut registry,
-        workspace.to_path_buf(),
+        roots.to_vec(),
         controller.clone(),
-        cfg.sandbox_writable_roots.clone(),
+        sandbox_writable.clone(),
     );
 
-    let process_manager = yi_agent_tools::ProcessManager::with_controller(
-        workspace.to_path_buf(),
-        controller,
-        cfg.sandbox_writable_roots.clone(),
-    );
+    let process_manager =
+        yi_agent_tools::ProcessManager::with_controller(primary, controller, sandbox_writable);
     yi_agent_tools::register_process_tools(&mut registry, Arc::clone(&process_manager));
 
     // MCP 配置是项目级文件(`.yi-agent/mcp.json`,被 gitignore),固定在项目根
@@ -330,8 +345,14 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
     };
     let switch = yi_agent_core::autonomy::YoloSwitch::new(yolo_on);
 
-    let setup = build_tool_setup_with_switch(cfg, false, &cfg.workdir, switch.clone())?;
-    let checker = load_permission_checker_with_switch(&cfg.workdir, switch.clone())?;
+    // 会话根集 = 主根 + `cfg.sandbox_writable_roots`。对主线程而言后者装的就是本次
+    // 会话的关联根(app-server 由 `production_factory` 逐调用写进 `thread_cfg`);
+    // 工具层与权限层必须拿到**同一份**根集,否则 `bash` 能进关联根而 `write` 不能。
+    let mut roots = vec![cfg.workdir.clone()];
+    roots.extend(cfg.sandbox_writable_roots.iter().cloned());
+
+    let setup = build_tool_setup_with_switch(cfg, false, &roots, switch.clone())?;
+    let checker = load_permission_checker_with_roots(&roots, switch.clone())?;
 
     let (decision_tx, decision_rx) =
         tokio::sync::mpsc::channel::<(u64, yi_agent_core::permission::Decision)>(16);
@@ -401,11 +422,31 @@ pub fn load_permission_checker_with_switch(
     workdir: &Path,
     switch: yi_agent_core::autonomy::YoloSwitch,
 ) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
+    load_permission_checker_with_roots(&[workdir.to_path_buf()], switch)
+}
+
+/// 加载权限检查器,前缀解析基点为本会话的**根集**(`roots[0]` = 主根)。
+///
+/// 相对路径白名单按命中的那个根解析(权限层已按根集实现),因此关联根里的 `src/**`
+/// 与主根命中的是同一份白名单。权限配置文件仍只从主根读(与 `PermissionChecker::load`
+/// 的既有口径一致);根集为空时退化为 `"."`,由调用方保证那一态不会出现
+/// (装配期 [`build_tool_setup_with_controller`] 已对空根集报错)。
+pub fn load_permission_checker_with_roots(
+    roots: &[PathBuf],
+    switch: yi_agent_core::autonomy::YoloSwitch,
+) -> Result<Arc<yi_agent_core::permission::PermissionChecker>> {
+    let roots = roots.to_vec();
     let permissions = std::thread::scope(|scope| {
+        let probe = roots.clone();
         scope
-            .spawn(|| {
+            .spawn(move || {
                 let rt = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
-                rt.block_on(yi_agent_core::permission::PermissionChecker::load(workdir))
+                rt.block_on(yi_agent_core::permission::PermissionChecker::load(
+                    probe
+                        .first()
+                        .map(PathBuf::as_path)
+                        .unwrap_or(Path::new(".")),
+                ))
             })
             .join()
     })
@@ -414,12 +455,14 @@ pub fn load_permission_checker_with_switch(
 
     let blocklist_fn: yi_agent_core::permission::BlocklistFn =
         Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(|s| s.to_string()));
-    Ok(Arc::new(yi_agent_core::permission::PermissionChecker::new(
-        permissions,
-        switch,
-        workdir.to_path_buf(),
-        blocklist_fn,
-    )))
+    Ok(Arc::new(
+        yi_agent_core::permission::PermissionChecker::with_roots(
+            permissions,
+            switch,
+            roots,
+            blocklist_fn,
+        ),
+    ))
 }
 
 /// Read the project instructions file at the workdir root.
@@ -707,8 +750,13 @@ mod tests {
             yi_agent_tools::SandboxMode::WorkspaceWrite,
             true,
         );
-        let setup =
-            build_tool_setup_with_controller(&cfg, false, &cfg.workdir, controller).expect("setup");
+        let setup = build_tool_setup_with_controller(
+            &cfg,
+            false,
+            std::slice::from_ref(&cfg.workdir),
+            controller,
+        )
+        .expect("setup");
         let bash = setup.tools.get("bash").expect("bash is registered");
         assert_eq!(
             bash.sandbox_mode(),
@@ -1178,7 +1226,8 @@ mod tests {
         let cfg = sample_config();
         let workspace = std::path::Path::new("/tmp/other-workspace");
 
-        let setup = build_tool_setup_in(&cfg, false, workspace).expect("build setup in workspace");
+        let setup = build_tool_setup_in(&cfg, false, &[workspace.to_path_buf()])
+            .expect("build setup in workspace");
         assert!(
             !setup.tools.is_empty(),
             "non-naked setup registers builtin tools"
@@ -1188,7 +1237,8 @@ mod tests {
             "non-naked setup resolves a system prompt"
         );
 
-        let naked = build_tool_setup_in(&cfg, true, workspace).expect("build naked setup");
+        let naked =
+            build_tool_setup_in(&cfg, true, &[workspace.to_path_buf()]).expect("build naked setup");
         assert!(naked.tools.is_empty());
         assert!(naked.system_prompt.is_none());
     }
@@ -1246,8 +1296,8 @@ mod tests {
 
         // 子 agent 路径:workspace 与 cfg.workdir 不同。把 MCP 根退回 `workspace`
         // 会在此处找不到配置并返回 None。
-        let sub =
-            build_tool_setup_in(&cfg, false, worktree.path()).expect("build setup in worktree");
+        let sub = build_tool_setup_in(&cfg, false, &[worktree.path().to_path_buf()])
+            .expect("build setup in worktree");
         assert!(
             sub.mcp.is_some(),
             "MCP root must be cfg.workdir, not workspace"
