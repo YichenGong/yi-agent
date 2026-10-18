@@ -1071,6 +1071,14 @@ fn build_runtime_tooling(
         registry.register(Arc::new(crate::lead_memory::LeadRememberTool::new(
             project_root.clone(),
         )));
+        // 只读视野工具（P3-A）：同一份 `project_root`（= thread cwd），与账本
+        // 工具同源。插在 `LeadRecallTool` 之前是因为后者 move 了 `project_root`。
+        registry.register(Arc::new(crate::lead_index::LeadListThreadsTool::new(
+            project_root.clone(),
+        )));
+        registry.register(Arc::new(crate::lead_index::LeadReadThreadTool::new(
+            project_root.clone(),
+        )));
         registry.register(Arc::new(crate::lead_memory::LeadRecallTool::new(
             project_root,
         )));
@@ -2423,6 +2431,10 @@ where
     // 组长 I/O 之后。低频是刻意的:唤醒组长要真花钱(见 `LEAD_TICK`)。
     let mut lead_ticker =
         tokio::time::interval_at(tokio::time::Instant::now() + LEAD_TICK, LEAD_TICK);
+    // 上次**已投递**的 digest 文本(键 = project_key)。审批期的重复 tick 会给出
+    // 一模一样的文本,靠它压掉(见 `take_changed_digests`)。纯内存、不落盘:
+    // 重启后重投一次是可接受的代价,比多一个索引文件简单得多。
+    let mut lead_digest_latch: HashMap<String, String> = HashMap::new();
 
     // 主题变化 → ui/settings/updated(全局一条流,与 thread 无关)。经 hub 广播:
     // stdio 的 `local` 与任意 ws 设备都能收到并切 `data-theme`。
@@ -2972,7 +2984,13 @@ where
                 // 「算」与「投」分两步:`lead_tick_once` 只读 `threads` 并返回 owned
                 // 的投递清单,返回时借用已归还,下面才借 `&mut`。投递失败不中断本轮,
                 // 更不能影响主循环处理其它请求。
-                for delivery in lead_tick_once(&mut threads) {
+                //
+                // 再经 `take_changed_digests` 压掉与上次已投递文本相同的项:
+                // 审批期里状态没变的每个 30s tick 都会算出**一模一样**的 digest,
+                // 不过这一层就会把一次审批变成最多 10 个完整 LLM turn。
+                for delivery in
+                    take_changed_digests(lead_tick_once(&mut threads), &mut lead_digest_latch)
+                {
                     let envelope = crate::lead::LeadEnvelope {
                         project_key: delivery.project_key,
                         from_thread_id: LEAD_LOOP_SENDER.to_string(),
@@ -5607,6 +5625,34 @@ fn lead_tick_once(threads: &mut HashMap<String, ThreadSession>) -> Vec<LeadTickD
         });
     }
     deliveries
+}
+
+/// 过滤掉与上次**已投递**文本相同的投递项,并更新闩锁。
+///
+/// 背景:`decide_wake` 对每个 `AwaitingApproval` 无条件产出 `ThreadStuck`,而
+/// `LEAD_TICK = 30s`、`PERMISSION_TIMEOUT = 300s`——一次审批窗会让组长被同一条
+/// 消息唤醒最多 10 次,每次都是带全部上下文的完整 LLM turn(纯噪声 + 真金白银)。
+///
+/// 去重键取**文本本身**(而非 thread_id/原因):不用理解状态机,天然覆盖所有
+/// wake reason;态势仍每轮现算(`render_digest` 照常跑),只是不重复**投递**
+/// 一模一样的文本。内容一变(状态变了 / 新 thread 卡住)即恢复投递。
+///
+/// 这里刻意**先写闩锁再返回**:投递失败的下一轮不该重投同一文本——失败也已经
+/// 花了那一轮的成本,无限重试只会放大(与 `lead_rx` 分支那套 request_id 回滚
+/// 不同,那条路径有请求方在等回信,这条是单向 digest)。
+fn take_changed_digests(
+    deliveries: Vec<LeadTickDelivery>,
+    latch: &mut HashMap<String, String>,
+) -> Vec<LeadTickDelivery> {
+    let mut out = Vec::new();
+    for delivery in deliveries {
+        if latch.get(&delivery.project_key) == Some(&delivery.text) {
+            continue;
+        }
+        latch.insert(delivery.project_key.clone(), delivery.text.clone());
+        out.push(delivery);
+    }
+    out
 }
 
 /// 由项目键反推该项目当前应承载消息的组长。
