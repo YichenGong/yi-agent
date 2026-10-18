@@ -3,6 +3,7 @@ import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup
 import { basename, groupCount, nestLinkedGroups } from "../lib/workspaceGroups";
 import { kanbanItemFor } from "../lib/boardIndex";
 import { useSpinPhase } from "../lib/useSpinPhase";
+import { countRunningSessions, runningSessionsLabel } from "../lib/runningSessions";
 import { supportsWaapi } from "../lib/spinPhase";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
@@ -77,6 +78,41 @@ export const StatusBadge = memo(function StatusBadge({
     />
   );
 }, (prev, next) => prev.status === next.status && prev.stale === next.stale);
+
+/**
+ * footer 里的「此刻有几个会话在跑」读数,紧挨设置齿轮。
+ *
+ * 与 `StatusBadge` 共用 `useSpinPhase`(相位锚定墙钟),避免 CSS 动画在节点重排时
+ * 从头播放的视觉回退。恒为 running 形态:它只在计数 > 0 时出现,不存在
+ * `awaiting_approval` 形态(那种会话根本不计入)。
+ *
+ * 计数为 0 时整个节点不渲染,footer 与改动前逐像素一致。
+ */
+function ActiveSessionCount({ count, stale = false }: { count: number; stale?: boolean }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useSpinPhase(ref, count > 0);
+  if (count === 0) return null;
+  const label = runningSessionsLabel(count);
+  const cssFallback = !supportsWaapi();
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      aria-label={label}
+      title={stale ? `${label}（可能过期）` : label}
+      className={`ml-2 flex min-w-0 items-center gap-1.5 text-xs text-fg-subtle ${
+        stale ? "opacity-40" : ""
+      }`}
+    >
+      <span
+        ref={ref}
+        aria-hidden="true"
+        className={`shrink-0 rounded-full ${cssFallback ? "animate-spin" : ""} size-3 border-2 border-line-strong border-t-fg`}
+      />
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
 
 export function ThreadSidebar({
   groups,
@@ -194,6 +230,7 @@ export function ThreadSidebar({
   // The rename field is a plain text input, so an IME confirm-Enter must not
   // commit the draft (and unmount the field) mid-composition.
   const ime = useImeGuard();
+  const runningCount = countRunningSessions(statuses);
 
   const onHandleDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -1110,6 +1147,7 @@ export function ThreadSidebar({
             <path d="M6.9 1.3a.7.7 0 0 0-.7.6l-.1.9a5.4 5.4 0 0 0-.9.5l-.9-.3a.7.7 0 0 0-.8.3l-.7 1.2a.7.7 0 0 0 .1.9l.7.6a5.5 5.5 0 0 0 0 1l-.7.6a.7.7 0 0 0-.1.9l.7 1.2a.7.7 0 0 0 .8.3l.9-.3c.3.2.6.4.9.5l.1.9a.7.7 0 0 0 .7.6h1.4a.7.7 0 0 0 .7-.6l.1-.9c.3-.1.6-.3.9-.5l.9.3a.7.7 0 0 0 .8-.3l.7-1.2a.7.7 0 0 0-.1-.9l-.7-.6a5.5 5.5 0 0 0 0-1l.7-.6a.7.7 0 0 0 .1-.9l-.7-1.2a.7.7 0 0 0-.8-.3l-.9.3a5.4 5.4 0 0 0-.9-.5l-.1-.9a.7.7 0 0 0-.7-.6H6.9Zm1.1 8a1.6 1.6 0 1 1 0-3.2 1.6 1.6 0 0 1 0 3.2Z" />
           </svg>
         </button>
+        <ActiveSessionCount count={runningCount} stale={statusStale} />
       </div>
       <div
         role="separator"
