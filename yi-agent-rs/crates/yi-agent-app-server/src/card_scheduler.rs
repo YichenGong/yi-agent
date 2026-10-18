@@ -132,11 +132,15 @@ pub(crate) struct ThreadFlags {
 }
 
 /// 一次启动请求:插件交出一张卡,宿主据此起一个可见会话。
+///
+/// 两个归属值用通用名(与 `ThreadMeta.driver_project`/`driver_ref` 同名同义;本文件
+/// 在 Task 6 被 `session_driver.rs` 取代后一并删除)。
 #[derive(Debug, Clone)]
 pub(crate) struct LaunchRequest {
-    pub card_id: String,
-    /// 发起这张卡的项目根（canonical 绝对路径）。落进卡片会话的 meta。
-    pub board_project: String,
+    /// 插件给这张工作单元的不透明句柄(宿主不解释其含义)。
+    pub driver_ref: String,
+    /// 发起这张卡的项目根（canonical 绝对路径）。落进会话的 meta。
+    pub driver_project: String,
     pub workdir: String,
     pub title: String,
     pub objective: String,
@@ -232,8 +236,8 @@ pub(crate) async fn run_once<L: CardLauncher>(
             None => objective_for("", ""),
         };
         let request = LaunchRequest {
-            card_id: card_id.clone(),
-            board_project: std::fs::canonicalize(project)
+            driver_ref: card_id.clone(),
+            driver_project: std::fs::canonicalize(project)
                 .unwrap_or_else(|_| project.to_path_buf())
                 .to_string_lossy()
                 .into_owned(),
@@ -653,7 +657,7 @@ mod scheduler_tests {
 
         assert_eq!(launcher.seen.len(), 1, "exactly one claim is launched");
         let request = &launcher.seen[0];
-        assert_eq!(request.card_id, "c1");
+        assert_eq!(request.driver_ref, "c1");
         assert_eq!(request.workdir, "/w");
         assert_eq!(request.title, "T");
         assert!(
@@ -666,7 +670,7 @@ mod scheduler_tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(
-            request.board_project, expected_project,
+            request.driver_project, expected_project,
             "the launch must carry the project root for grouping"
         );
 

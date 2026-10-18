@@ -42,12 +42,18 @@ pub struct ThreadMeta {
     /// 旧 meta 缺字段时默认 `None`。
     #[serde(default)]
     pub pin_seq: Option<i64>,
-    /// 该会话由看板创建时，它所属的项目根（绝对路径，canonical）。None = 普通会话。
-    #[serde(default)]
-    pub board_project: Option<String>,
-    /// 该会话对应的看板卡 id。None = 普通会话。
-    #[serde(default)]
-    pub card_id: Option<String>,
+    /// 被驱动的会话所属的项目根（绝对路径，canonical）。None = 普通会话。
+    ///
+    /// 字段名通用化自 `board_project`（被动方不再假定「谁」在驱动）。旧 meta 写的
+    /// 是旧键，`alias` 让它们照样读得进来（零迁移：不写盘、不重命名文件）。
+    #[serde(default, alias = "board_project")]
+    pub driver_project: Option<String>,
+    /// 驱动方交给本会话的**不透明**句柄（宿主不解释其含义，只在 worktree 判定时按
+    /// 既有约定使用）。None = 普通会话。
+    ///
+    /// 字段名通用化自 `card_id`；旧键经 `alias` 兼容读取（零迁移，理由同上）。
+    #[serde(default, alias = "card_id")]
+    pub driver_ref: Option<String>,
     /// 会话模型覆盖：清单里的显示名。None = 跟随全局默认模型。
     /// 与 `model` 的区别：`model` 是**当前生效的 model 串**（显示用），
     /// `model_ref` 是用户在清单里选中的**显示名**（选择用）。
@@ -811,8 +817,8 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         title: first_user_text(messages),
         permission_mode: ThreadMode::Normal,
         pin_seq: None,
-        board_project: None,
-        card_id: None,
+        driver_project: None,
+        driver_ref: None,
         model_ref: None,
         reasoning_effort: None,
         // 缺 meta 时从日志重建:无从得知曾经的开关,按默认「保留」解释。
@@ -842,8 +848,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
@@ -1506,8 +1512,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
@@ -1863,15 +1869,15 @@ mod tests {
         );
     }
     #[test]
-    fn a_meta_without_board_fields_defaults_to_none() {
+    fn a_meta_without_driver_fields_defaults_to_none() {
         let json = r#"{"thread_id":"t1","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
         let meta: ThreadMeta = serde_json::from_str(json).unwrap();
-        assert_eq!(meta.board_project, None, "旧 meta 缺字段必须回 None");
-        assert_eq!(meta.card_id, None);
+        assert_eq!(meta.driver_project, None, "旧 meta 缺字段必须回 None");
+        assert_eq!(meta.driver_ref, None);
     }
 
     #[test]
-    fn board_fields_round_trip() {
+    fn driver_fields_round_trip() {
         let meta = ThreadMeta {
             thread_id: "t1".into(),
             cwd: "/w".into(),
@@ -1881,8 +1887,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: Some("/proj".into()),
-            card_id: Some("c1".into()),
+            driver_project: Some("/proj".into()),
+            driver_ref: Some("c1".into()),
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
@@ -1890,8 +1896,57 @@ mod tests {
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
-        assert_eq!(back.board_project.as_deref(), Some("/proj"));
-        assert_eq!(back.card_id.as_deref(), Some("c1"));
+        assert_eq!(back.driver_project.as_deref(), Some("/proj"));
+        assert_eq!(back.driver_ref.as_deref(), Some("c1"));
+    }
+
+    /// 字段名通用化是**零迁移**的:磁盘上按旧键(`board_project`/`card_id`)写的 meta
+    /// 仍必须读进新字段——否则升级后所有既有驱动会话都会失去归属,侧栏归组与
+    /// worktree 判定一并退化。`#[serde(alias = …)]` 是这条保证的唯一实现。
+    #[test]
+    fn legacy_meta_written_with_the_old_keys_loads_into_the_new_fields() {
+        let json = r#"{"thread_id":"t1","cwd":"/w","model":"m","created_at":1,
+            "updated_at":2,"title":null,"board_project":"/proj","card_id":"c1"}"#;
+        let meta: ThreadMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            meta.driver_project.as_deref(),
+            Some("/proj"),
+            "旧键 board_project 必须读进 driver_project"
+        );
+        assert_eq!(
+            meta.driver_ref.as_deref(),
+            Some("c1"),
+            "旧键 card_id 必须读进 driver_ref"
+        );
+    }
+
+    /// 新键是**唯一**的写出形态:不再双写旧键(单一名字,不留两种盘上表示)。
+    #[test]
+    fn the_new_keys_are_the_only_ones_written() {
+        let meta = ThreadMeta {
+            thread_id: "t1".into(),
+            cwd: "/w".into(),
+            model: "m".into(),
+            created_at: 1,
+            updated_at: 2,
+            title: None,
+            permission_mode: ThreadMode::Normal,
+            pin_seq: None,
+            driver_project: Some("/proj".into()),
+            driver_ref: Some("c1".into()),
+            model_ref: None,
+            reasoning_effort: None,
+            preserve_thinking: true,
+            role: None,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert_eq!(value["driver_project"], "/proj");
+        assert_eq!(value["driver_ref"], "c1");
+        assert!(
+            value.get("board_project").is_none() && value.get("card_id").is_none(),
+            "旧键不得再被写出(alias 只用于读): {value}"
+        );
     }
 
     #[test]
@@ -1920,8 +1975,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
@@ -2040,8 +2095,8 @@ mod tests {
             title: None,
             permission_mode: ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
@@ -2073,8 +2128,8 @@ mod tests {
             "title": null,
             "permission_mode": "normal",
             "pin_seq": null,
-            "board_project": null,
-            "card_id": null,
+            "driver_project": null,
+            "driver_ref": null,
             "model_ref": null,
             "reasoning_effort": null,
             "preserve_thinking": true
@@ -2113,8 +2168,8 @@ mod tests {
                     title: None,
                     permission_mode: ThreadMode::Normal,
                     pin_seq: None,
-                    board_project: None,
-                    card_id: None,
+                    driver_project: None,
+                    driver_ref: None,
                     model_ref: None,
                     reasoning_effort: None,
                     preserve_thinking: true,

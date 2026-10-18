@@ -104,7 +104,7 @@ describe("filterThreadTree", () => {
     // 与置顶会话不同：卡片会话不在分组外的独立区段渲染，而由本组的
     // renderBoardThreads 渲染（搜索期间强制展开）。故卡片命中时分组必须保留，
     // 否则 ThreadSidebar 那条「搜索命中折叠小节时自动展开」的行为会被误删。
-    const card = { ...thread("c", "card-a", "/work/projB"), card_id: "k1" };
+    const card = { ...thread("c", "card-a", "/work/projB"), driver_ref: "k1" };
     const normal = thread("n", "normal thing", "/work/projB");
     const g: WorkspaceGroup[] = [
       { workspace: "/work/projB", exists: true, threads: [normal, card] },

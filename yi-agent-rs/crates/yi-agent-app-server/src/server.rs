@@ -21,6 +21,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
+// `CardLauncher` / `LaunchRequest` 只服务过渡期的适配 impl(见 `launch_request`);
+// Task 6 删除 `card_scheduler.rs` 时一并去掉这两个名字。
 use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
 use crate::pairing::PairingState;
 use crate::protocol::{
@@ -31,6 +33,7 @@ use crate::protocol::{
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
 };
+use crate::session_driver::{DriverAction, DriverActionKind, SessionLauncher};
 use crate::translate::Translator;
 use crate::transport::{MessageReader, MessageWriter};
 use crate::workspace_index::WorkspaceIndex;
@@ -3449,7 +3452,7 @@ where
                         // 分组两段式,与抽取前逐字等价,只多一层「归属优先」的折拢:
                         // ① 按索引顺序(最近在前)为**每个**目录建组——含失效目录
                         //   (exists:false、threads 空,不深扫),普通会话留在本目录组;
-                        // ② 带 `board_project` 的卡片会话折进它所属的项目组(项目可不在
+                        // ② 带 `driver_project` 的驱动会话折进它所属的项目组(项目可不在
                         //   索引里,则合成一组);只含卡片会话的目录(卡片 worktree)
                         //   第一段被抑制,不再顶层成组。
                         // **不动索引**:目录仍留在 workspaces 里,冷会话定位靠它。
@@ -3487,7 +3490,7 @@ where
                             // 任何条目的项目也有一个组长入口。失败只记日志——列表查询
                             // 不得因单个目录不可写而整体失败。
                             //
-                            // 为什么限定「没有任何会话」:组长 meta 的 `board_project`
+                            // 为什么限定「没有任何会话」:组长 meta 的 `driver_project`
                             // 是 `None`,一旦写进已有会话的目录,它就会被算作「该目录
                             // 自己的会话」,从而①把「每个目录组恰好一个会话」变成两个、
                             // ②让只含卡片会话的 worktree 不再被抑制成顶层组。两者都是
@@ -3515,7 +3518,7 @@ where
                             }
                             let own: Vec<_> = metas
                                 .iter()
-                                .filter(|m| m.board_project.is_none())
+                                .filter(|m| m.driver_project.is_none())
                                 .collect();
                             // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
                             // 否则它只是卡片 worktree,归拢后被抑制。
@@ -3530,9 +3533,9 @@ where
                                 seen.remove(dir);
                                 order.retain(|d| d != dir);
                             }
-                            // 卡片会话:归入 board_project 指定的组(可为索引外的项目)。
-                            for m in metas.iter().filter(|m| m.board_project.is_some()) {
-                                let target = m.board_project.clone().unwrap();
+                            // 驱动会话:归入 driver_project 指定的组(可为索引外的项目)。
+                            for m in metas.iter().filter(|m| m.driver_project.is_some()) {
+                                let target = m.driver_project.clone().unwrap();
                                 if seen.insert(target.clone()) {
                                     order.push(target.clone());
                                     exists_of.insert(
@@ -4663,15 +4666,15 @@ where
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false);
                         // 卡片会话的 worktree 判定：只读会话自带 meta，不碰插件。
-                        // 顺手把 board_project 拷到局部变量：会话文件随后即被删除，
+                        // 顺手把 driver_project 拷到局部变量：会话文件随后即被删除，
                         // 到执行删除时再 load 只会失败，故必须在此刻留下。
-                        let mut board_project: Option<String> = None;
+                        let mut driver_project: Option<String> = None;
                         let reclaim = match thread_store.load(&thread_id) {
                             Ok(Some(loaded)) => {
-                                board_project = loaded.meta.board_project.clone();
+                                driver_project = loaded.meta.driver_project.clone();
                                 crate::worktree_reclaim::decide(
-                                    loaded.meta.card_id.as_deref(),
-                                    loaded.meta.board_project.as_deref(),
+                                    loaded.meta.driver_ref.as_deref(),
+                                    loaded.meta.driver_project.as_deref(),
                                     Path::new(&loaded.meta.cwd),
                                 )
                             }
@@ -4777,7 +4780,7 @@ where
                         // 拿不到 cwd 也无妨（已落盘的附件由上面 `remove_attachments` 收）。
                         uploads.drop_thread(&thread_id);
                         // 会话文件已摘除：按判定处置 worktree。删除失败只记日志，不阻断会话删除（D9）。
-                        // board_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
+                        // driver_project 已在进分支时留好——此处绝不能再 load（会话文件已不存在）。
                         // 但失败这件事本身必须回报：用户刚被告知该 worktree 会被删掉，此刻会话
                         // 已摘除、应用内再也删不掉它，又按 D10 让卡片上的 thread_id 悬空——
                         // 若默默失败，worktree 就无声滞留、用户永远看不见。故除宿主日志外，
@@ -4789,7 +4792,7 @@ where
                                 path, ..
                             },
                             Some(project),
-                        ) = (&reclaim, board_project.as_deref())
+                        ) = (&reclaim, driver_project.as_deref())
                         {
                             if let Err(error) =
                                 crate::worktree_reclaim::remove(path, Path::new(project), force)
@@ -6113,8 +6116,8 @@ fn thread_summary_json(
         "title": m.title,
         "permission_mode": m.permission_mode,
         "pinned": m.pin_seq.is_some(),
-        "board_project": m.board_project,
-        "card_id": m.card_id,
+        "driver_project": m.driver_project,
+        "driver_ref": m.driver_ref,
         "status": thread_status(threads, &m.thread_id),
     });
     // 只在确实是组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
@@ -7413,7 +7416,15 @@ struct LeadTarget {
     thread_id: String,
 }
 
-impl<F> CardLauncher for ServeLauncher<'_, F>
+/// 通用动作的执行者:插件说「起一个会话」或「往已有会话追加一轮」,这里照做。
+///
+/// 与 `CardLauncher` 的分界就是本任务的核心:**动作由插件给出**(`DriverAction`),
+/// 宿主不认识卡片、不认识队列;`Launch` 建会话、`Append` 复用会话,两者共用同一段
+/// 「准备 + 通知 + 投递」(`prepare_and_deliver`),差别只在 thread 是否已存在。
+///
+/// **一个 RPC 响应帧都不发**:动作不是客户端请求,没有可应答的 id。可发的只有
+/// thread-keyed 通知(`turn/started`、开启项、`thread/status/updated` 的 Running)。
+impl<F> SessionLauncher for ServeLauncher<'_, F>
 where
     F: Fn(
         Option<yi_agent_core::Session>,
@@ -7421,15 +7432,43 @@ where
         crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent>,
 {
-    async fn launch(&mut self, request: &LaunchRequest) -> anyhow::Result<String> {
-        self.launch_inner(request).await.inspect_err(|error| {
-            // 调度器把失败翻成 `board.release`,而插件只记终态、不留 detail;
-            // 不在这里说清原因,一张卡为什么没起来就没有任何线索。
-            eprintln!(
-                "[app-server] could not launch a session for board card {}: {error}",
-                request.card_id
-            );
-        })
+    async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String> {
+        match &action.kind {
+            DriverActionKind::Launch {
+                workdir,
+                title,
+                objective,
+            } => self
+                // 两个归属值都给 `None`:`driver/next` 的 `launch` 应答按 spec §4.3
+                // 只带 `workdir`/`title`/`objective`,不带任何归属信息。`driver_project`
+                // 可由发现环(spec §4.5:宿主本就按**项目**遍历)补上——Task 6 接线时
+                // 传入;`driver_ref` 则此后恒为 `None`(缺口记录在 plan Task 5,归 G2)。
+                .launch_inner(workdir, title, objective, None, None)
+                .await
+                .inspect_err(|error| {
+                    // 插件只把失败记成 `{ok:false, error}`,自己不留日志;不在这里说清
+                    // 原因,「这个会话为什么没起来」就没有任何线索。
+                    eprintln!("[app-server] could not launch a session in {workdir}: {error}");
+                }),
+            DriverActionKind::Append {
+                thread_id,
+                objective,
+            } => {
+                // 会话必须已经在 `threads` 里:append 的语义就是「续跑一个**本进程
+                // 看得见**的会话」,冷会话无从续起(唤醒它要读盘恢复历史,那是另一
+                // 个动作)。故先探一次,把「未知 thread」在**投递之前**判掉——否则
+                // `prepare_turn_core` 会回一个「turn 校验失败」,掩盖真正的病因。
+                if !self.threads.contains_key(thread_id) {
+                    return Err(anyhow::anyhow!("unknown thread: {thread_id}"));
+                }
+                let thread_id = thread_id.clone();
+                self.prepare_and_deliver(&thread_id, objective)
+                    .await
+                    .inspect_err(|error| {
+                        eprintln!("[app-server] could not append a turn to {thread_id}: {error}");
+                    })
+            }
+        }
     }
 }
 
@@ -7441,13 +7480,44 @@ where
         crate::thread_store::ThreadMode,
     ) -> anyhow::Result<BuiltAgent>,
 {
-    async fn launch_inner(&mut self, request: &LaunchRequest) -> anyhow::Result<String> {
-        // 会话与 RPC 起的 thread 完全同型:同一内核、同一 driver、同一侧栏视角。
-        // 唯一的不同是 mode(看板会话跑 Yolo)与「不发任何 RPC 帧」。
+    /// 过渡期适配:看板调度器的 `LaunchRequest` → 本 launcher 的 `launch_inner`。
+    ///
+    /// 存在的唯一理由是 `card_scheduler.rs` 尚未删除(Task 6 才删,那时主循环改调
+    /// `driver_tick`)。它只做装箱:调度器交付的两个归属值原样转给 `launch_inner`,
+    /// 行为与抽取前逐字一致。Task 6 连同 `CardLauncher` 一起删除。
+    async fn launch_request(&mut self, request: &LaunchRequest) -> anyhow::Result<String> {
+        self.launch_inner(
+            &request.workdir,
+            &request.title,
+            &request.objective,
+            Some(&request.driver_project),
+            Some(&request.driver_ref),
+        )
+        .await
+    }
+
+    /// 起一个会话并投递它的首轮。
+    ///
+    /// 会话与 RPC 起的 thread 完全同型:同一内核、同一 driver、同一侧栏视角。唯一的
+    /// 不同是 mode(驱动会话跑 Yolo)与「不发任何 RPC 帧」。
+    ///
+    /// `driver_project` / `driver_ref` 是落进 meta 的两个通用归属值。分两种到达方式:
+    /// - 看板调度器(过渡期,`CardLauncher`)自带项目根与卡片 id,由它转交;
+    /// - 通用驱动动作(`driver/next`)按 spec §4.3 只带 `workdir`/`title`/`objective`,
+    ///   故 `launch` 走 `None`:宿主不认识卡片,`driver_ref` 便无从填起(缺口见 plan
+    ///   归 G2 收口),`driver_project` 则由发现环按项目补入(Task 6 接线)。
+    async fn launch_inner(
+        &mut self,
+        workdir: &str,
+        title: &str,
+        objective: &str,
+        driver_project: Option<&str>,
+        driver_ref: Option<&str>,
+    ) -> anyhow::Result<String> {
         let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
         let built = (self.build_agent)(
             None,
-            Path::new(&request.workdir),
+            Path::new(workdir),
             crate::thread_store::ThreadMode::Yolo,
         )?;
         // 生效串取自实际建出的 agent,与 `thread/start`/`thread/resume` 同口径,避免
@@ -7464,7 +7534,7 @@ where
             self.thread_roots,
             self.models_path,
             self.cfg,
-            &request.workdir,
+            workdir,
             crate::thread_store::ThreadMode::Yolo,
             thread_id.clone(),
             built,
@@ -7477,32 +7547,44 @@ where
             self.theme,
             self.git_diff,
             self.workspaces,
-            // 看板会话不带 model_ref;生效串取自上面实际建出的 agent,与
+            // 驱动会话不带 model_ref;生效串取自上面实际建出的 agent,与
             // `thread/start`/`thread/resume` 同口径。
             model,
             None,
-            Some(&request.board_project),
-            Some(&request.card_id),
+            // 通用化的两个 meta 字段:项目根,以及「驱动方给的不透明句柄」。
+            driver_project,
+            driver_ref,
             self.lead_inbox,
         )
         .await?;
 
         // 侧栏显示的名片:插件给的 `看板 · <spec stem>`。不设的话,这个会话在
         // 首轮落盘前标题为空、用户只看到一串 thread id——「可见会话」就不成立了。
-        // 失败只记日志:标题是展示层信息,不该让一张看板卡起不来。
-        if !request.title.is_empty() {
+        // 失败只记日志:标题是展示层信息,不该让一个会话起不来。
+        if !title.is_empty() {
             if let Some(session) = self.threads.get(&thread_id) {
-                if let Err(error) = session.store.rename(&thread_id, &request.title) {
-                    eprintln!("[app-server] could not title board thread {thread_id}: {error}");
+                if let Err(error) = session.store.rename(&thread_id, title) {
+                    eprintln!("[app-server] could not title driven thread {thread_id}: {error}");
                 }
             }
         }
 
-        // 无帧地占好首个 turn,再自行投递 prompt——`start_turn_core` 会发
-        // `turn/started`/状态/响应,调度器一个都不该发。
+        self.prepare_and_deliver(&thread_id, objective).await
+    }
+
+    /// 准备并投递一轮,**不发任何 RPC 响应帧**。
+    ///
+    /// 首轮(新建会话)与追问轮(已有会话)共用:两者只差 thread 是否已存在——
+    /// 调用方负责保证它存在(首轮刚由 `start_thread_core` 登记,追问轮由调用方先探)。
+    async fn prepare_and_deliver(
+        &mut self,
+        thread_id: &str,
+        objective: &str,
+    ) -> anyhow::Result<String> {
+        let hub = Arc::clone(self.hub);
         let params = json!({
             "threadId": thread_id,
-            "input": [{ "type": "text", "text": request.objective }],
+            "input": [{ "type": "text", "text": objective }],
         });
         let prepared =
             match prepare_turn_core(self.threads, self.pending_activation, self.uploads, &params)
@@ -7511,14 +7593,13 @@ where
                 Ok(prepared) => prepared,
                 Err(error) => {
                     // 准备失败:把占位清掉,否则该 thread 的 `active_turn_id` 永久卡住。
-                    if let Some(session) = self.threads.get_mut(&thread_id) {
+                    if let Some(session) = self.threads.get_mut(thread_id) {
                         session.active_turn_id = None;
                     }
-                    // 把具体原因带上:调度器只把它写进 `board.release` 的 detail,
+                    // 把具体原因带上:调用方只把它写进 `{ok:false, error}`,
                     // 「准备失败」四个字不足以定位(是 thread 不在?还是 turn 撞车?)。
                     return Err(anyhow::anyhow!(
-                        "could not prepare the first turn for {}: {}",
-                        request.card_id,
+                        "could not prepare a turn for {thread_id}: {}",
                         turn_prepare_rpc_error(error).message
                     ));
                 }
@@ -7533,9 +7614,9 @@ where
             ThreadStatus::Running,
         )
         .await;
-        // 照 $18 发本轮的开启项(用户提问=卡片 objective),再投递 prompt。
+        // 照 $18 发本轮的开启项(用户提问=插件给的 objective),再投递 prompt。
         // 这不是「向客户端发 RPC 帧」——它是 thread-keyed 的 content 通知,与
-        // RPC 客户端收到的同一条流;少了它,卡片会话点开后 objective 会像修复前
+        // RPC 客户端收到的同一条流;少了它,会话点开后 objective 会像修复前
         // 那样被迟到追到最底部(见 `opening_user_item`)。
         emit_item(
             &hub,
@@ -7563,11 +7644,11 @@ where
             .is_err()
         {
             return Err(anyhow::anyhow!(
-                "thread driver for {} is gone before its first prompt",
+                "thread driver for {} is gone before its prompt",
                 prepared.thread_id
             ));
         }
-        Ok(thread_id)
+        Ok(prepared.thread_id)
     }
 
     /// 把一条投递给组长的消息转成组长 thread 的一次 turn。
@@ -7575,7 +7656,7 @@ where
     /// 与 `launch_inner` 的三点差异,每一点都是刻意的:
     /// - 复用**已存在的**组长 thread id(不新铸 uuid),因此重复投递落在同一个会话;
     /// - `mode` 用 Normal,而非看板的 Yolo 强制值(组长会话不是看板卡);
-    /// - 不设 `board_project` / `card_id`,组长不是看板卡。
+    /// - 不设 `driver_project` / `driver_ref`,组长不是被驱动的会话。
     ///
     /// **不发任何 RPC 帧**:投递不是客户端请求,没有可应答的 id。唯一可发的是
     /// `thread/status/updated` 这类不带 id 的通知,这里也不发——投递方(某个普通
@@ -7732,6 +7813,28 @@ where
     }
 }
 
+/// 过渡期适配(见 `launch_request` 的说明):Task 6 删除 `card_scheduler.rs` 时,
+/// 连同这个 impl 一起删。
+impl<F> CardLauncher for ServeLauncher<'_, F>
+where
+    F: Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent>,
+{
+    async fn launch(&mut self, request: &LaunchRequest) -> anyhow::Result<String> {
+        self.launch_request(request).await.inspect_err(|error| {
+            // 调度器把失败翻成一次「释放名额」的插件调用,而插件只记终态、
+            // 不留 detail;不在这里说清原因,一张卡为什么没起来就没有任何线索。
+            eprintln!(
+                "[app-server] could not launch a session for board card {}: {error}",
+                request.driver_ref
+            );
+        })
+    }
+}
+
 /// 由项目键反推该项目当前应承载消息的组长。
 ///
 /// 项目键本身就是 `<cwd>/.yi-agent` 的 canonical 路径(见 `ThreadStore::project_key`),
@@ -7838,8 +7941,10 @@ async fn start_thread_core(
     // 并写进 ThreadSession,与 `thread/start`/`thread/resume` 同一来源。
     model: String,
     model_ref: Option<String>,
-    board_project: Option<&str>,
-    card_id: Option<&str>,
+    // 被驱动会话的所属项目根与驱动方给的不透明句柄(通用名;旧名见
+    // `ThreadMeta` 的 `serde(alias)`)。两者都只为 worktree 判定与侧栏归组落盘。
+    driver_project: Option<&str>,
+    driver_ref: Option<&str>,
     // 进程的组长信箱:转交 `attach_delegation`,使本会话的 `ask_lead` 能投递。
     lead_inbox: &crate::lead::LeadInbox,
 ) -> anyhow::Result<()> {
@@ -7888,8 +7993,8 @@ async fn start_thread_core(
         title: None,
         permission_mode: mode,
         pin_seq: None,
-        board_project: board_project.map(str::to_string),
-        card_id: card_id.map(str::to_string),
+        driver_project: driver_project.map(str::to_string),
+        driver_ref: driver_ref.map(str::to_string),
         model_ref,
         reasoning_effort: None,
         // 新会话默认开启跨轮保留(与 `ThreadMeta` 的缺省语义一致)。
@@ -9604,8 +9709,8 @@ mod card_scheduling_tests {
 
     fn request(card_id: &str, workdir: &str) -> LaunchRequest {
         LaunchRequest {
-            card_id: card_id.to_string(),
-            board_project: "/test/project".to_string(),
+            driver_ref: card_id.to_string(),
+            driver_project: "/test/project".to_string(),
             workdir: workdir.to_string(),
             title: format!("看板 · {card_id}"),
             objective: format!("Implement the plan for {card_id}"),
@@ -9634,10 +9739,15 @@ mod card_scheduling_tests {
         let workdir = host.workdir.clone();
         let thread_id = {
             let mut launcher = host.launcher(&build_test_agent);
-            launcher
-                .launch(&request("card-1", &workdir.to_string_lossy()))
-                .await
-                .expect("the launch must succeed for a healthy factory")
+            // 显式限定 `CardLauncher`:过渡期 `ServeLauncher` 同时实现它(为
+            // `card_scheduler` 保留)与 `SessionLauncher`(本任务新增),`launch`
+            // 同名。Task 6 删掉前者后这个限定也随之去掉。
+            CardLauncher::launch(
+                &mut launcher,
+                &request("card-1", &workdir.to_string_lossy()),
+            )
+            .await
+            .expect("the launch must succeed for a healthy factory")
         };
 
         assert_eq!(host.threads.len(), 1, "the board thread is registered");
@@ -9680,10 +9790,12 @@ mod card_scheduling_tests {
         };
         {
             let mut launcher = host.launcher(&build_failure);
-            let error = launcher
-                .launch(&request("card-1", &workdir.to_string_lossy()))
-                .await
-                .expect_err("a factory failure must surface, not be swallowed");
+            let error = CardLauncher::launch(
+                &mut launcher,
+                &request("card-1", &workdir.to_string_lossy()),
+            )
+            .await
+            .expect_err("a factory failure must surface, not be swallowed");
             assert!(error.to_string().contains("no model"), "{error}");
         }
         assert!(host.threads.is_empty(), "a failed launch registers nothing");
@@ -9928,7 +10040,7 @@ mod card_scheduling_tests {
     }
 
     /// 一张卡被起成会话后：它落盘的 meta 与 `thread/listAll` 的条目都必须带
-    /// `board_project`(项目根) 与 `card_id`——这是侧栏归组的唯一依据。
+    /// `driver_project`(项目根) 与 `driver_ref`——这是侧栏归组的唯一依据。
     #[tokio::test(flavor = "multi_thread")]
     async fn a_launched_card_records_its_board_origin() {
         let workdir_dir = tempfile::TempDir::new().unwrap();
@@ -9983,11 +10095,238 @@ mod card_scheduling_tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(
-            metas[0].board_project.as_deref(),
+            metas[0].driver_project.as_deref(),
             Some(expected_project.as_str()),
             "meta must carry the project root"
         );
-        assert_eq!(metas[0].card_id.as_deref(), Some("card-1"));
+        assert_eq!(metas[0].driver_ref.as_deref(), Some("card-1"));
+    }
+
+    // ---------- 通用驱动动作(Task 5):`launch` / `append` ----------
+    //
+    // Task 6 才把 `driver_tick` 接进主循环,故这里直接对真 `ServeLauncher` 构造
+    // `DriverAction` 调用——与 plan 的备选口径一致(整条拉拍循环的单测已由
+    // `session_driver.rs` 的 `driver_step` 测试覆盖)。夹具仍是本文件既有的真
+    // socket `FakeDaemon` + 真 `ThreadStore` + 真会话,假的只有模型。
+
+    /// 构造一个**新建会话**动作,并走真正的 `SessionLauncher` 入口。
+    async fn launch_via_driver<F>(
+        launcher: &mut ServeLauncher<'_, F>,
+        workdir: &str,
+        title: &str,
+        objective: &str,
+    ) -> anyhow::Result<String>
+    where
+        F: Fn(
+            Option<yi_agent_core::Session>,
+            &Path,
+            crate::thread_store::ThreadMode,
+        ) -> anyhow::Result<BuiltAgent>,
+    {
+        SessionLauncher::launch(
+            launcher,
+            &DriverAction {
+                action_id: "act-launch".into(),
+                kind: DriverActionKind::Launch {
+                    workdir: workdir.to_string(),
+                    title: title.to_string(),
+                    objective: objective.to_string(),
+                },
+            },
+        )
+        .await
+    }
+
+    /// **本任务的核心断言**:一次 `append` 动作必须**复用**已有会话——
+    /// 不新建 thread,原 thread 上多出一轮;且因为走的是「无响应帧」路径,
+    /// 只发 thread-keyed 通知。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_append_action_reuses_the_existing_thread() {
+        let mut host = Host::new();
+        let workdir = host.workdir.clone();
+        let workdir = workdir.to_string_lossy().to_string();
+        let mut frames = host
+            .hub
+            .register(crate::broadcast::ClientId::ws(uuid::Uuid::new_v4()));
+
+        // ① 先起一个会话(launch 动作)。
+        let thread_id = {
+            let mut launcher = host.launcher(&build_test_agent);
+            launch_via_driver(
+                &mut launcher,
+                &workdir,
+                "看板 · card-1",
+                "do the first thing",
+            )
+            .await
+            .expect("a healthy factory must start the session")
+        };
+        assert_eq!(
+            host.threads.len(),
+            1,
+            "the launch registers exactly one thread"
+        );
+        assert!(
+            host.threads
+                .get(&thread_id)
+                .is_some_and(|s| s.active_turn_id.is_some()),
+            "the first turn must be占位 before the append"
+        );
+        // 收尾首轮:主循环语义是「收 Finished → 清占位」。不这样做,`append`
+        // 会撞上 `TurnInProgress`,测的就不是 append 了。
+        assert!(
+            host.settle_turn(&thread_id, Duration::from_secs(10)).await,
+            "the first turn must finish before the append"
+        );
+
+        // ② 再追一轮(append 动作):**同一个** thread_id,不新铸 uuid。
+        let appended = {
+            let mut launcher = host.launcher(&build_test_agent);
+            SessionLauncher::launch(
+                &mut launcher,
+                &DriverAction {
+                    action_id: "act-append".into(),
+                    kind: DriverActionKind::Append {
+                        thread_id: thread_id.clone(),
+                        objective: "now merge it".to_string(),
+                    },
+                },
+            )
+            .await
+            .expect("appending to a live thread must succeed")
+        };
+
+        assert_eq!(appended, thread_id, "append must return the same thread");
+        assert_eq!(host.threads.len(), 1, "no second thread may appear");
+        let session = host.threads.get(&thread_id).expect("the session survives");
+        assert!(
+            session.active_turn_id.is_some(),
+            "the existing thread must have received a new (occupied) turn"
+        );
+
+        // 盘上也只有这一个会话:append 没有多写一份 meta。
+        let metas = crate::thread_store::ThreadStore::new(Path::new(&workdir))
+            .list()
+            .unwrap();
+        assert_eq!(
+            metas.len(),
+            1,
+            "append must not create a second session on disk"
+        );
+
+        // ③ 可见性只走 thread-keyed 通知:本轮与首轮一样,开启项是「用户提问」,
+        //    且全程没有任何 RPC 响应帧(响应帧不是 notification,这里只可能看到
+        //    notification envelope)。
+        let mut seen = Vec::new();
+        while let Ok(v) = frames.try_recv() {
+            assert!(
+                v.get("method").is_some(),
+                "the launcher must emit notifications only, never a response frame: {v}"
+            );
+            let item = &v["params"]["item"];
+            seen.push((
+                v["method"].as_str().unwrap_or_default().to_string(),
+                item["text"].as_str().map(str::to_string),
+            ));
+        }
+        assert!(
+            seen.iter().any(|(method, text)| method == "item/started"
+                && text.as_deref() == Some("now merge it")),
+            "the appended objective must open the new turn: {seen:?}"
+        );
+
+        // 收尾这一轮,确认它真的被 driver 消费(而不只是占了个位)。
+        assert!(
+            host.settle_turn(&thread_id, Duration::from_secs(10)).await,
+            "the appended turn must run and finish"
+        );
+        assert!(
+            host.is_idle(&thread_id),
+            "after the appended turn settles the thread is idle again"
+        );
+    }
+
+    /// 未知 thread 的 `append` 必须**明确失败**、且不留下任何副作用:插件据此
+    /// 决定重试或放弃(`{ok:false, error}`),宿主不得替它改写状态。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_append_to_an_unknown_thread_fails_without_side_effects() {
+        let mut host = Host::new();
+        let mut frames = host
+            .hub
+            .register(crate::broadcast::ClientId::ws(uuid::Uuid::new_v4()));
+
+        let mut launcher = host.launcher(&build_test_agent);
+        let error = SessionLauncher::launch(
+            &mut launcher,
+            &DriverAction {
+                action_id: "act-append".into(),
+                kind: DriverActionKind::Append {
+                    thread_id: "thread-does-not-exist".into(),
+                    objective: "merge it".to_string(),
+                },
+            },
+        )
+        .await
+        .expect_err("an unknown thread must not be silently accepted");
+
+        assert_eq!(
+            error.to_string(),
+            "unknown thread: thread-does-not-exist",
+            "the error must name the thread the plugin asked about"
+        );
+        assert!(host.threads.is_empty(), "no session may be created");
+        assert!(
+            frames.try_recv().is_err(),
+            "a refused append must not emit any frame"
+        );
+    }
+
+    /// `driver/next` 的 `launch` 应答只带 `workdir`/`title`/`objective`(spec §4.3),
+    /// 宿主**不认识 card id**——所以走通用动作起的会话,`driver_ref` 必须是 `None`
+    /// (计划已把该填充缺口记给 G2),而 `driver_project` 同样为 `None`(发现环在
+    /// Task 6 接线时才按项目补入)。这里同时钉住「会话仍然可见、首轮仍然投递」,
+    /// 即缺这两个归属值不影响起会话本身。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_launch_action_records_no_driver_origin_and_still_starts_a_turn() {
+        let mut host = Host::new();
+        let workdir = host.workdir.clone();
+        let workdir = workdir.to_string_lossy().to_string();
+        let thread_id = {
+            let mut launcher = host.launcher(&build_test_agent);
+            launch_via_driver(
+                &mut launcher,
+                &workdir,
+                "看板 · card-1",
+                "do the first thing",
+            )
+            .await
+            .expect("a healthy factory must start the session")
+        };
+
+        let metas = crate::thread_store::ThreadStore::new(Path::new(&workdir))
+            .list()
+            .unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(
+            metas[0].driver_ref, None,
+            "the host does not know a card id any more (spec §2 goal 1 / §4.3)"
+        );
+        assert_eq!(metas[0].driver_project, None);
+        assert_eq!(
+            metas[0].title.as_deref(),
+            Some("看板 · card-1"),
+            "the plugin's title still lands in the meta"
+        );
+        assert!(
+            host.threads
+                .get(&thread_id)
+                .is_some_and(|s| s.active_turn_id.is_some()),
+            "the first turn must still be occupied"
+        );
+        assert!(
+            host.settle_turn(&thread_id, Duration::from_secs(10)).await,
+            "the driver must consume the delivered objective"
+        );
     }
 }
 
@@ -14218,8 +14557,8 @@ pub(crate) mod tests {
                 title: None,
                 permission_mode: crate::thread_store::ThreadMode::Normal,
                 pin_seq: None,
-                board_project: None,
-                card_id: None,
+                driver_project: None,
+                driver_ref: None,
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
@@ -15730,8 +16069,8 @@ pub(crate) mod tests {
                 title: None,
                 permission_mode: Default::default(),
                 pin_seq: None,
-                board_project: None,
-                card_id: None,
+                driver_project: None,
+                driver_ref: None,
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
@@ -15836,8 +16175,8 @@ pub(crate) mod tests {
                 title: None,
                 permission_mode: Default::default(),
                 pin_seq: None,
-                board_project: None,
-                card_id: None,
+                driver_project: None,
+                driver_ref: None,
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: false,
@@ -15930,8 +16269,8 @@ pub(crate) mod tests {
                 title: None,
                 permission_mode: Default::default(),
                 pin_seq: None,
-                board_project: None,
-                card_id: None,
+                driver_project: None,
+                driver_ref: None,
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
@@ -17240,8 +17579,8 @@ pub(crate) mod tests {
         dir: &Path,
         id: &str,
         title: &str,
-        board_project: Option<&str>,
-        card_id: Option<&str>,
+        driver_project: Option<&str>,
+        driver_ref: Option<&str>,
     ) {
         let meta = crate::thread_store::ThreadMeta {
             thread_id: id.into(),
@@ -17252,8 +17591,8 @@ pub(crate) mod tests {
             title: Some(title.into()),
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: board_project.map(str::to_string),
-            card_id: card_id.map(str::to_string),
+            driver_project: driver_project.map(str::to_string),
+            driver_ref: driver_ref.map(str::to_string),
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
@@ -17312,7 +17651,7 @@ pub(crate) mod tests {
         path.canonicalize().unwrap()
     }
 
-    /// 卡片会话（cwd 在 worktree、board_project=项目）删除：干净且已并入 → 会话与 worktree 一并消失。
+    /// 卡片会话（cwd 在 worktree、driver_project=项目）删除：干净且已并入 → 会话与 worktree 一并消失。
     #[tokio::test(flavor = "multi_thread")]
     async fn deleting_a_card_session_also_removes_its_worktree() {
         let project_dir = tempfile::TempDir::new().unwrap();
@@ -17527,7 +17866,7 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
-    /// 卡片会话(在 worktree、board_project=项目) 折进项目组；worktree 不再顶层成组。
+    /// 卡片会话(在 worktree、driver_project=项目) 折进项目组；worktree 不再顶层成组。
     #[tokio::test(flavor = "multi_thread")]
     async fn a_board_thread_folds_into_its_project_group() {
         let project_dir = tempfile::TempDir::new().unwrap();
@@ -17584,8 +17923,8 @@ pub(crate) mod tests {
             .iter()
             .find(|t| t["thread_id"] == "t-card")
             .unwrap();
-        assert_eq!(card["card_id"], "card-1", "wire must expose card_id");
-        assert_eq!(card["board_project"], p.as_str());
+        assert_eq!(card["driver_ref"], "card-1", "wire must expose driver_ref");
+        assert_eq!(card["driver_project"], p.as_str());
         h.shutdown().await;
     }
 
@@ -18004,8 +18343,8 @@ pub(crate) mod tests {
                 title: None,
                 permission_mode: crate::thread_store::ThreadMode::Normal,
                 pin_seq: None,
-                board_project: None,
-                card_id: None,
+                driver_project: None,
+                driver_ref: None,
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,
@@ -18111,8 +18450,8 @@ pub(crate) mod tests {
                 title: None,
                 permission_mode: crate::thread_store::ThreadMode::Normal,
                 pin_seq: None,
-                board_project: None,
-                card_id: None,
+                driver_project: None,
+                driver_ref: None,
                 model_ref: None,
                 reasoning_effort: None,
                 preserve_thinking: true,

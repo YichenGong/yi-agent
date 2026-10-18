@@ -590,14 +590,14 @@ export function ThreadSidebar({
   };
 
   /**
-   * 项目组内的「看板会话」小节：只收 `card_id` 非空的会话，默认折叠。
+   * 项目组内的「看板会话」小节：只收 `driver_ref` 非空的会话，默认折叠。
    * 折叠状态独立于项目组（键 `board:${workspace}`），互不牵连。
    *
    * 刻意不依赖看板是否仍登记：看板被移除后（spec §5），卡片会话仍须留在这个
    * 小节里可见，绝不能因为 `kanbanItemFor` 变 null 就整批消失。
    */
   const renderBoardThreads = (g: WorkspaceGroup) => {
-    const cards = g.threads.filter((t) => !t.pinned && t.card_id);
+    const cards = g.threads.filter((t) => !t.pinned && t.driver_ref);
     if (cards.length === 0) return null;
     // 搜索期间一律展开，且**关掉这一小节自身的折叠开关**：此时渲染忽略折叠态，
     // 点了看不到任何反馈，却会悄悄写进 `boardCollapsed`，清空搜索后视图就被改掉了。
@@ -921,7 +921,7 @@ export function ThreadSidebar({
                   {!isCollapsed && renderBoardThreads(g)}
                   {!isCollapsed &&
                     g.threads
-                      .filter((t) => !t.pinned && !t.card_id && t.thread_id !== leadId)
+                      .filter((t) => !t.pinned && !t.driver_ref && t.thread_id !== leadId)
                       .map((t) => renderThread(t, { rowAttr: "group" }))}
                 </div>
               );
