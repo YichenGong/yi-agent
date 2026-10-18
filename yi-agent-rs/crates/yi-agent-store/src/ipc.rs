@@ -866,6 +866,7 @@ impl Daemon {
         let client_handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         let listener_handlers = Arc::clone(&client_handlers);
         let database_path = database_path.as_ref().to_path_buf();
+        let request_context = Arc::new(RequestContext::new(&database_path)?);
         let cleanup_socket = socket_path.clone();
         let cleanup_lock = lock_path.clone();
         let listener = thread::spawn(move || {
@@ -915,6 +916,7 @@ impl Daemon {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let database_path = database_path.clone();
+                        let request_context = Arc::clone(&request_context);
                         let stop = Arc::clone(&thread_stop);
                         let coordinator = Arc::clone(&coordinator);
                         let confirmations = Arc::clone(&listener_confirmations);
@@ -922,6 +924,7 @@ impl Daemon {
                             let _ = handle_client(
                                 stream,
                                 &database_path,
+                                &request_context,
                                 &stop,
                                 &coordinator,
                                 &confirmations,
@@ -1452,6 +1455,7 @@ fn write_request(
 fn handle_client(
     mut stream: UnixStream,
     database_path: &Path,
+    context: &RequestContext,
     stop: &Arc<AtomicBool>,
     coordinator: &Arc<RuntimeCoordinator>,
     confirmations: &Arc<ConfirmationStore>,
@@ -1581,7 +1585,7 @@ fn handle_client(
                     error_response(&error)
                 }
             },
-            request => match respond(database_path, coordinator, request) {
+            request => match respond(context, coordinator, request) {
                 Ok(response) => response,
                 Err(error) => {
                     log_request_failure(&envelope.request_id, &error);
@@ -3091,16 +3095,98 @@ fn forward_plugin_query(
     }
 }
 
+/// 是否该在本次请求里跑一轮 worker 对账。
+///
+/// daemon 的 accept 循环已经每轮跑 [`RuntimeCoordinator::reconcile_worker_events`]，
+/// `respond` 里那次是重复的。窗口只用来合并「几乎同时到达」的请求，保证请求仍能
+/// 观察到已对账状态，而不是把对账从请求路径上彻底删掉。
+fn should_reconcile(last: Option<Instant>, now: Instant, window: Duration) -> bool {
+    match last {
+        Some(previous) => now.duration_since(previous) >= window,
+        None => true,
+    }
+}
+
+/// 每个 daemon 一份的请求执行上下文：复用一个 tokio runtime 与一条 sqlite 连接。
+///
+/// `respond` 原先**每请求**都新建这两样（`Runtime::new` + `RuntimeRepository::open`
+/// 里的两条 PRAGMA 与 `migrate` 的 schema 解析），单次 `Status` 因此要 ~45ms。
+/// `rusqlite::Connection` 是 `!Sync`，故用 `Mutex` 串行持有——daemon 的请求路径
+/// 本就串行，不引入新的并发度。
+pub(crate) struct RequestContext {
+    runtime: tokio::runtime::Runtime,
+    repository: std::sync::Mutex<RuntimeRepository>,
+    reconciled_at: std::sync::Mutex<Option<Instant>>,
+    reconcile_window: Duration,
+}
+
+/// 同一窗口内的并发请求合并成一次对账。
+const RECONCILE_WINDOW: Duration = Duration::from_millis(5);
+
+impl RequestContext {
+    pub(crate) fn new(database_path: &Path) -> Result<Self, IpcError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let repository = RuntimeRepository::open(database_path).map_err(IpcError::from)?;
+        Ok(Self {
+            runtime,
+            repository: std::sync::Mutex::new(repository),
+            reconciled_at: std::sync::Mutex::new(None),
+            reconcile_window: RECONCILE_WINDOW,
+        })
+    }
+
+    /// 借出那条长生命周期连接。调用方在闭包内串行使用它。
+    ///
+    /// 只有测试走这里：`respond` 的分支要反复借用同一条连接，因此它直接持有
+    /// `repository` 守卫。这个入口是 `RequestContext` 的契约（见 task brief 的
+    /// Interfaces），保留它是因为后续按请求取连接的调用方应从它走。
+    #[allow(dead_code)]
+    pub(crate) fn with_repository<R>(
+        &self,
+        f: impl FnOnce(&mut RuntimeRepository) -> Result<R, IpcError>,
+    ) -> Result<R, IpcError> {
+        let mut repository = self
+            .repository
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut repository)
+    }
+
+    /// 需要时跑一轮对账；窗口内重复调用直接返回。
+    pub(crate) fn reconcile_if_stale(
+        &self,
+        coordinator: &Arc<RuntimeCoordinator>,
+    ) -> Result<(), IpcError> {
+        let now = Instant::now();
+        let last = *self
+            .reconciled_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !should_reconcile(last, now, self.reconcile_window) {
+            return Ok(());
+        }
+        self.runtime
+            .block_on(coordinator.reconcile_worker_events())?;
+        *self
+            .reconciled_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+        Ok(())
+    }
+}
+
 fn respond(
-    database_path: &Path,
+    context: &RequestContext,
     coordinator: &Arc<RuntimeCoordinator>,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(coordinator.reconcile_worker_events())?;
-    let mut repository = RuntimeRepository::open(database_path)?;
+    context.reconcile_if_stale(coordinator)?;
+    let mut repository = context
+        .repository
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     match request {
         IpcRequest::Status => Ok(IpcResponse::Status {
             high_water_event_id: repository.latest_event_id()?,
@@ -4406,5 +4492,45 @@ mod fork_wire_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use super::*;
+
+    #[test]
+    fn should_reconcile_only_outside_the_window() {
+        let window = Duration::from_millis(5);
+        let base = Instant::now();
+        // 从未对账过：必须跑。
+        assert!(should_reconcile(None, base, window));
+        // 刚跑过：窗口内跳过。
+        assert!(!should_reconcile(
+            Some(base),
+            base + Duration::from_millis(1),
+            window
+        ));
+        // 窗口已过：再跑一次。
+        assert!(should_reconcile(
+            Some(base),
+            base + Duration::from_millis(6),
+            window
+        ));
+    }
+
+    #[test]
+    fn a_request_context_reuses_one_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("runtime.sqlite");
+        let context = RequestContext::new(&database_path).expect("context builds");
+        // 同一个连接可重复使用；两次读取给出同一个 schema 版本。
+        let first = context
+            .with_repository(|repository| repository.schema_version().map_err(IpcError::from))
+            .expect("first read");
+        let second = context
+            .with_repository(|repository| repository.schema_version().map_err(IpcError::from))
+            .expect("second read");
+        assert_eq!(first, second);
     }
 }
