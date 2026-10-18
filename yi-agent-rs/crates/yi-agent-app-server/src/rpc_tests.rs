@@ -11571,6 +11571,38 @@ async fn thread_rename_updates_title() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn thread_rename_does_not_change_lead_title() {
+    let parent = tempfile::TempDir::new().unwrap();
+    let project = parent.path().join("my-app");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = project.clone();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    initialize(&mut h).await;
+
+    let lead = rpc(&mut h, 2, "thread/lead", json!({})).await;
+    let thread_id = lead["result"]["thread_id"].as_str().unwrap().to_string();
+    let renamed = rpc(
+        &mut h,
+        3,
+        "thread/rename",
+        json!({ "threadId": thread_id, "title": "manual override" }),
+    )
+    .await;
+    assert!(
+        renamed.get("error").is_none(),
+        "rename response stays compatible: {renamed}"
+    );
+
+    let loaded = crate::thread_store::ThreadStore::new(&project)
+        .load(&thread_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.meta.title.as_deref(), Some("my-app 组长"));
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn thread_rename_rejects_empty_title() {
     let mut h = Harness::new();
     let tid = start_thread(&mut h).await;

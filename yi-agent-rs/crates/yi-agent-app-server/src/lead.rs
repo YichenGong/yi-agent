@@ -132,6 +132,15 @@ impl Default for LeadInbox {
     }
 }
 
+/// 生成项目组长固定标题：优先使用项目 cwd 的最后一级目录名。
+pub(crate) fn lead_title_for_cwd(cwd: &Path) -> String {
+    cwd.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("{name} 组长"))
+        .unwrap_or_else(|| "组长".to_string())
+}
+
 /// 确保 `cwd` 目录存在组长 meta,返回它以及本次是否真的建了。
 ///
 /// 只写 meta,不建 agent、不起 driver:调用点之一是 `thread/listAll`,那是纯
@@ -158,7 +167,15 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
         ));
     }
     if let Some(existing) = store.find_lead()? {
-        return Ok((existing, false));
+        let title = lead_title_for_cwd(cwd);
+        if existing.title.as_deref() != Some(title.as_str()) {
+            store.set_lead_title(&existing.thread_id, &title)?;
+        }
+        let normalized = store
+            .load(&existing.thread_id)?
+            .map(|loaded| loaded.meta)
+            .unwrap_or(existing);
+        return Ok((normalized, false));
     }
     // 竞态说明:两个请求同时走到这里会各造一个 meta。`find_lead` 取 `created_at`
     // 最早者,故此后所有读取都收敛到同一个;下面的复读让本次响应也以它为准。
@@ -169,7 +186,7 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
         model: String::new(), // 空 = 跟随全局默认,与「损坏重建」同款兜底
         created_at: now,
         updated_at: now,
-        title: Some("组长".to_string()),
+        title: Some(lead_title_for_cwd(cwd)),
         permission_mode: ThreadMode::Normal,
         pin_seq: None,
         driver_project: None,
@@ -477,10 +494,60 @@ mod tests {
         assert!(!out.is_error, "拿到回信不是错误: {body}");
     }
 
+    #[test]
+    fn ensure_lead_meta_updates_an_existing_lead_title_to_the_project_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("my-app");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = ThreadStore::new(&project);
+        let mut existing = ThreadMeta {
+            thread_id: "thread-existing-lead".into(),
+            cwd: project.display().to_string(),
+            model: String::new(),
+            created_at: 10,
+            updated_at: 11,
+            title: Some("组长".into()),
+            permission_mode: ThreadMode::Normal,
+            pin_seq: Some(7),
+            driver_project: None,
+            driver_ref: None,
+            model_ref: None,
+            reasoning_effort: None,
+            tag: None,
+            preserve_thinking: true,
+            extra_roots: Vec::new(),
+            role: Some(LEAD_ROLE.into()),
+            content_epoch: 0,
+            last_item_id: None,
+            anchor_sha: None,
+        };
+        store.create(&existing).unwrap();
+
+        let (normalized, created) = ensure_lead_meta(&store, &project).unwrap();
+        assert!(!created);
+        assert_eq!(normalized.thread_id, existing.thread_id);
+        assert_eq!(normalized.title.as_deref(), Some("my-app 组长"));
+        assert_eq!(normalized.pin_seq, Some(7));
+        existing.title = Some("my-app 组长".into());
+        let loaded = store.load(&normalized.thread_id).unwrap().unwrap().meta;
+        assert_eq!(loaded.title, existing.title);
+        assert_eq!(loaded.pin_seq, existing.pin_seq);
+    }
+
     /// 看板 worktree 不是项目:`ensure_lead_meta` 必须**拒绝**,绝不落盘组长。
     ///
     /// 真机数据里已有 9 个幽灵组长,全部由卡片会话 `ask_lead` 触发的这条路径
     /// 落盘。落盘侧堵死,这类假组长才不会继续长出来。
+    #[test]
+    fn lead_title_uses_the_project_directory_basename() {
+        assert_eq!(lead_title_for_cwd(Path::new("/work/my-app")), "my-app 组长");
+    }
+
+    #[test]
+    fn lead_title_falls_back_when_the_path_has_no_basename() {
+        assert_eq!(lead_title_for_cwd(Path::new("/")), "组长");
+    }
+
     #[test]
     fn ensure_lead_meta_refuses_a_card_worktree() {
         let dir = tempfile::tempdir().unwrap();
@@ -502,6 +569,7 @@ mod tests {
         let project_store = ThreadStore::new(&project);
         let (meta, created) = ensure_lead_meta(&project_store, &project).expect("lead meta");
         assert!(created);
+        assert_eq!(meta.title.as_deref(), Some("proj 组长"));
         assert_eq!(
             project_store.find_lead().unwrap().unwrap().thread_id,
             meta.thread_id
