@@ -25,6 +25,10 @@ describe("columnForState", () => {
     expect(columnForState("cancelled")).toBe("done");
   });
 
+  it("maps pre_queued to its own column", () => {
+    expect(columnForState("pre_queued")).toBe("preQueued");
+  });
+
   it("sends an unknown state to doing, never to done", () => {
     expect(columnForState("brand_new_state")).toBe("doing");
     expect(columnForState("")).toBe("doing");
@@ -51,6 +55,20 @@ describe("boardColumns", () => {
       card("a", "queued", { order: 1, enqueuedAt: "2026-10-02T00:00:00+08:00" }),
     ]);
     expect(cols.queued.map((c) => c.id)).toEqual(["a", "b"]);
+  });
+
+  it("orders pre-queued by FIFO order ascending", () => {
+    const cols = boardColumns([
+      card("b", "pre_queued", { order: 5 }),
+      card("a", "pre_queued", { order: 1 }),
+    ]);
+    expect(cols.preQueued.map((c) => c.id)).toEqual(["a", "b"]);
+  });
+
+  it("collects pre-queued cards into the preQueued column", () => {
+    const cols = boardColumns([card("p", "pre_queued"), card("q", "queued")]);
+    expect(cols.preQueued.map((c) => c.id)).toEqual(["p"]);
+    expect(cols.queued.map((c) => c.id)).toEqual(["q"]);
   });
 
   it("orders doing by enqueued_at ascending", () => {

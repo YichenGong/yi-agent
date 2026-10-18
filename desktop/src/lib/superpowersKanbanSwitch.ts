@@ -124,6 +124,34 @@ export async function enqueueBoardCard(
   });
 }
 
+/** 经插件给某项目投递一张预排队卡（只有标题，没有 spec/plan）。 */
+export async function enqueuePrequeuedCard(
+  rpc: BoardRpc,
+  project: string,
+  title: string,
+): Promise<void> {
+  // 与 UI 的处理同口径：空白标题就地拒绝，不发这趟 RPC——插件的
+  // `enqueue_prequeued` 本来也会拒，调用方不该指望 UI 先 trim 好。
+  const trimmed = title.trim();
+  if (trimmed === "") throw new Error("a prequeued card needs a non-empty title");
+  await queryPlugin(rpc, project, "enqueue_prequeued", { title: trimmed });
+}
+
+/** 经插件提升一张预排队卡：补 spec/plan，插件下个 tick 翻成排队卡。 */
+export async function promoteBoardCard(
+  rpc: BoardRpc,
+  project: string,
+  cardId: string,
+  specPath: string,
+  planPath: string,
+): Promise<void> {
+  await queryPlugin(rpc, project, "promote", {
+    id: cardId,
+    spec_path: specPath,
+    plan_path: planPath,
+  });
+}
+
 /**
  * 归一化 `ui/settings/read` 里的 `board_watchman_enabled`。非布尔一律当开：
  * 老配置文件里没有这个键时，用户此前的行为是「一直在跑」，不能因为读不到就

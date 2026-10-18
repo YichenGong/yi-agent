@@ -1,11 +1,17 @@
 ---
 name: superpowers-kanban
-description: "Use when the user wants to add work to the Superpowers kanban queue - e.g. \"加到看板\", \"排队这个需求\", \"加入队列\", \"enqueue this\", \"run it later\", or asks what is queued. Enqueues an existing spec+plan pair into the board; it does not write specs or plans."
+description: "Use when the user wants to add work to the Superpowers kanban queue - e.g. \"加到看板\", \"排队这个需求\", \"加入队列\", \"enqueue this\", \"run it later\", or asks what is queued. Enqueues an existing spec+plan pair into the board, or records a pre-queued idea (title only) that is promoted once its spec and plan exist; it does not write specs or plans."
 ---
 
 # Superpowers 看板入队
 
-把一对**已经写好**的 spec + plan 投进看板队列，让插件在限流窗口内按顺序自动开发。
+把需求投进看板队列，让插件在限流窗口内按顺序自动开发。两条路：
+
+- **正式入队**——spec 和 plan 都已经写好，`add <spec> <plan>` 直接排队；
+- **前植入队**——需求已定、spec/plan 还没写，先 `add-prequeued <title>` 记一张预排队
+  卡（最左 `PRE-QUEUED` 列，不占并发槽、不会被起会话），等两份文件写好后
+  `promote <card-id> <spec> <plan>` 提升为正式排队卡。
+
 看板是一个独立插件：它不在主流程里，装了就可用，卸了就消失。
 
 ## 你的职责边界
@@ -19,11 +25,14 @@ description: "Use when the user wants to add work to the Superpowers kanban queu
 - **不要**直接写 `board.json`、`inbox/` 下的文件或 `preferences.json`。
   这些是插件进程的落盘格式，绕过 CLI 写会破坏它的原子性假设。
 
-## 前提：spec 和 plan 必须已经存在
+## 前提：正式入队要 spec 和 plan；没写就先预排队
 
 看板是 Superpowers SDD 流程的**下游**。上游是 `brainstorming` → 写 spec →
-`writing-plans` 写 plan。用户说"这个还没做设计"时，先把他引到 SDD 流程，
-拿到两份文件之后再回来入队。
+`writing-plans` 写 plan。正式入队（`add`）要求两份文件**都已经存在**。
+
+需求已经定了、但 spec/plan 还没写时，**不要**把用户干等在外面，也不要凭空替它写
+spec——先 `add-prequeued` 记一张预排队卡持续追踪，等文件齐了再 `promote` 提升。
+用户说"这个还没做设计、但先记着"时，就是这条路径。
 
 ## 触发时机
 
@@ -72,6 +81,29 @@ superpowers-kanban add <spec> <plan> --state-dir <dir>
 
 `add` **立刻**校验两份文件；校验失败会打印原因并以非零退出码结束。
 把这条错误原样转述给用户，不要重试、不要自我修正路径。
+
+### 2a. 预排队（spec/plan 还没写）
+
+需求已定、两份文件还没写时，先记一张预排队卡：
+
+```bash
+superpowers-kanban add-prequeued "<需求标题>"
+```
+
+成功时打印投递的 `<card-id>`（由标题派生，可在桌面最左 `PRE-QUEUED` 列 / `list` 里
+看到它，卡片状态为 `pre_queued`）。`<title>` 必须非空。
+
+之后设计写完、`<spec>` 与 `<plan>` 落盘，再提升为正式排队卡：
+
+```bash
+superpowers-kanban promote <card-id> <spec> <plan> [--title "<新标题>"]
+```
+
+- 提升**不重算 id**（从预排队到 done 始终是同一张卡），并把卡重排到队尾；给了
+  `--title` 就顺带改标题（不改 id）。
+- `promote` 会先校验两份文件成对，且该卡确实还在预排队态，失败**不落盘**、原样报错。
+- 时机：`add-prequeued` 后要等插件下一次 tick 把卡建出来，`promote` 才找得到它；
+  刚投递就立刻提升会报 `unknown card`（先用 `list` 确认卡已在看板上）。
 
 ### 2b. 把一张实现卡合并进主线（主路径）
 
@@ -136,7 +168,7 @@ source 分支存在；失败原样转述，不要猜分支名、不要重试。
 superpowers-kanban list
 ```
 
-`list` 会打印：
+`list` 会打印（含预排队卡）：
 
 - 排队中的卡（按顺序编号）——看板会依次启动它们；
 - 其他状态的卡（`Running` / `NeedsYou` / `AwaitingMerge` / `Done` / `Failed`），

@@ -97,8 +97,8 @@ fn render_status(status: &BoardStatus) -> Vec<String> {
     }
     if status.daemon_running {
         vec![format!(
-            "本目录的看板已登记，daemon 在跑（排队 {}，运行中 {}）",
-            status.queued, status.running
+            "本目录的看板已登记，daemon 在跑（排队 {}，运行中 {}，预排队 {}）",
+            status.queued, status.running, status.pre_queued
         )]
     } else {
         vec!["本目录的看板已登记，但 daemon 未在跑".to_string()]
@@ -321,6 +321,75 @@ mod tests {
             "{:?}",
             out.lines
         );
+    }
+
+    #[test]
+    fn status_line_carries_all_three_counts() {
+        // 侧栏的 status 行必须把「预排队」也报出来：预排队的卡片已经决定要
+        // 做、只是还没设计，藏起来用户就看不到自己在等的是什么。
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let global = dir.path().join("global");
+        yi_agent_boards::registry::register(&global, &project).unwrap();
+
+        let socket =
+            yi_agent_store::ipc::socket_path_for(&project.join(".yi-agent").join("runtime"))
+                .unwrap();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // `is_running` 探一次 Status，`card_counts` 再问一次 PluginQuery。
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
+                let result = match request["command"]["type"].as_str() {
+                    Some("Status") => serde_json::json!({
+                        "type": "Status",
+                        "high_water_event_id": 0,
+                    }),
+                    Some("PluginQuery") => serde_json::json!({
+                        "type": "PluginResult",
+                        "value": {
+                            "cards": [
+                                { "id": "i", "state": "pre_queued", "title": "一个想法" },
+                                { "id": "q", "state": "queued" },
+                                { "id": "r", "state": "running" },
+                            ],
+                        },
+                    }),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                let reply = serde_json::json!({
+                    "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
+                    "request_id": request["request_id"],
+                    "result": result,
+                });
+                let mut stream = stream;
+                std::io::Write::write_all(&mut stream, reply.to_string().as_bytes()).unwrap();
+                std::io::Write::write_all(&mut stream, b"\n").unwrap();
+            }
+        });
+
+        let out = handle_board(&project, &global, "status");
+        handle.join().unwrap();
+
+        let line = out
+            .lines
+            .iter()
+            .find(|l| l.contains("daemon 在跑"))
+            .unwrap_or_else(|| panic!("应有一行报告 daemon 与计数：{:?}", out.lines));
+        assert!(line.contains("排队 1"), "{line}");
+        assert!(line.contains("运行中 1"), "{line}");
+        assert!(line.contains("预排队 1"), "{line}");
     }
 
     #[test]

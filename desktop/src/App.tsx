@@ -52,7 +52,9 @@ import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSetting
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
 import {
   enqueueBoardCard,
+  enqueuePrequeuedCard,
   parseBoardWatchman,
+  promoteBoardCard,
   setBoardSwitch,
   writeBoardWatchman,
 } from "./lib/superpowersKanbanSwitch";
@@ -2103,6 +2105,9 @@ export default function App() {
                 enqueue={(spec, plan) =>
                   enqueueBoardCard(board.boardRpc, board.selectedBoard!, spec, plan)
                 }
+                prequeue={(title) =>
+                  enqueuePrequeuedCard(board.boardRpc, board.selectedBoard!, title)
+                }
               />
               <SuperpowersKanbanView
                 switchOn={board.boardOn}
@@ -2116,6 +2121,30 @@ export default function App() {
                   // 看板是对话的兄弟视图，回去走侧栏，不再盖在会话上。
                   board.setSelectedBoard(null);
                   void selectThread(id);
+                }}
+                onPromote={(cardId) => {
+                  // 提升要先补上 spec/plan（两下选择器，任一下取消就整个不作数），
+                  // 再让插件下个 tick 把预排队卡翻成排队卡。
+                  void (async () => {
+                    board.setBoardError(null);
+                    try {
+                      const spec = await pickFile();
+                      if (spec === null) return;
+                      const plan = await pickFile();
+                      if (plan === null) return;
+                      await promoteBoardCard(
+                        board.boardRpc,
+                        board.selectedBoard!,
+                        cardId,
+                        spec,
+                        plan,
+                      );
+                      board.refreshBoards();
+                    } catch (error) {
+                      // 与看板其它写入同一条通路：把失败翻成面板上那句可操作的说法。
+                      board.setBoardError(boardErrorKind(error));
+                    }
+                  })();
                 }}
               />
             </section>

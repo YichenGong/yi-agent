@@ -629,6 +629,7 @@ impl BoardService {
                 "source": card.source_ref,
                 "base": card.base_ref,
                 "origin_card": card.origin_card.as_ref().map(|id| id.0.clone()),
+                "title": card.title,
             })).collect::<Vec<_>>(),
         })
     }
@@ -638,6 +639,20 @@ impl BoardService {
         persist::read_board(&self.state_dir)
             .next_free_merge_id(source, base)
             .0
+    }
+
+    /// 未被占用的预排队卡 id（供 dispatch / CLI 共用）。
+    ///
+    /// 走 core 的合体分配器：它既看看板、也看 `inbox/` 里尚未消费的投递
+    /// （见 `inbox::next_free_prequeued_id` 的注释）。
+    pub fn next_free_prequeued_id(&self, title: &str, now: DateTime<Local>) -> String {
+        superpowers_kanban_core::inbox::next_free_prequeued_id(
+            &persist::read_board(&self.state_dir),
+            &self.state_dir,
+            title,
+            now,
+        )
+        .0
     }
 
     /// 仅测试用：把某张卡片的 `thread_id` 清成 `None`，模拟旧数据。

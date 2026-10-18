@@ -1,5 +1,5 @@
 /**
- * 状态 → 四列的映射与列内排序。
+ * 状态 → 五列的映射与列内排序。
  *
  * 纯函数、不碰 React：这些规则会被轮询反复重算（每次都换新对象），做成纯函数
  * 才既便宜又可断言。未知状态一律进 `doing`——把它放进 `done` 会让人误以为
@@ -10,9 +10,10 @@ import type { BoardCard } from "./superpowersKanbanState";
 
 export const DONE_COLLAPSED_LIMIT = 5;
 
-export type BoardColumnKey = "queued" | "doing" | "needDecision" | "done";
+export type BoardColumnKey = "preQueued" | "queued" | "doing" | "needDecision" | "done";
 
 export interface BoardColumns {
+  preQueued: BoardCard[];
   queued: BoardCard[];
   doing: BoardCard[];
   needDecision: BoardCard[];
@@ -21,6 +22,8 @@ export interface BoardColumns {
 
 export function columnForState(state: string): BoardColumnKey {
   switch (state) {
+    case "pre_queued":
+      return "preQueued";
     case "queued":
     case "launching":
     case "paused":
@@ -56,9 +59,16 @@ function descending(left: string | undefined, right: string | undefined): number
 }
 
 export function boardColumns(cards: BoardCard[]): BoardColumns {
-  const columns: BoardColumns = { queued: [], doing: [], needDecision: [], done: [] };
+  const columns: BoardColumns = {
+    preQueued: [],
+    queued: [],
+    doing: [],
+    needDecision: [],
+    done: [],
+  };
   for (const card of cards) columns[columnForState(card.state)].push(card);
 
+  columns.preQueued.sort((l, r) => (l.order ?? 0) - (r.order ?? 0));
   columns.queued.sort((l, r) => (l.order ?? 0) - (r.order ?? 0));
 
   columns.doing.sort((l, r) => ascending(l.enqueuedAt, r.enqueuedAt));

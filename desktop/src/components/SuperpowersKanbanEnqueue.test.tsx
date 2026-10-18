@@ -7,6 +7,9 @@ afterEach(() => {
   cleanup();
 });
 
+/** 这些用例只管「加入看板」那条路；预排队另有专门的用例。 */
+const noopPrequeue = async () => {};
+
 const clickEnqueue = () => fireEvent.click(screen.getByRole("button", { name: "加入看板" }));
 
 describe("SuperpowersKanbanEnqueue", () => {
@@ -17,7 +20,9 @@ describe("SuperpowersKanbanEnqueue", () => {
       .mockResolvedValueOnce("/p/a.plan.md");
     const enqueue = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
 
-    render(<SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} />);
+    render(
+      <SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} prequeue={noopPrequeue} />,
+    );
     clickEnqueue();
 
     await waitFor(() => expect(enqueue).toHaveBeenCalledTimes(1));
@@ -34,7 +39,9 @@ describe("SuperpowersKanbanEnqueue", () => {
       order.push("enqueue");
     });
 
-    render(<SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} />);
+    render(
+      <SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} prequeue={noopPrequeue} />,
+    );
     clickEnqueue();
 
     await waitFor(() => expect(order).toEqual(["pick-1", "pick-2", "enqueue"]));
@@ -44,7 +51,9 @@ describe("SuperpowersKanbanEnqueue", () => {
     const pickFile = vi.fn<() => Promise<string | null>>().mockResolvedValue(null);
     const enqueue = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
 
-    render(<SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} />);
+    render(
+      <SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} prequeue={noopPrequeue} />,
+    );
     clickEnqueue();
 
     await waitFor(() => expect(pickFile).toHaveBeenCalledTimes(1));
@@ -58,7 +67,9 @@ describe("SuperpowersKanbanEnqueue", () => {
       .mockResolvedValueOnce(null);
     const enqueue = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
 
-    render(<SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} />);
+    render(
+      <SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} prequeue={noopPrequeue} />,
+    );
     clickEnqueue();
 
     await waitFor(() => expect(pickFile).toHaveBeenCalledTimes(2));
@@ -74,7 +85,9 @@ describe("SuperpowersKanbanEnqueue", () => {
       .mockResolvedValueOnce("/p/a.plan.md");
     const enqueue = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
 
-    render(<SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} />);
+    render(
+      <SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} prequeue={noopPrequeue} />,
+    );
     clickEnqueue();
 
     await waitFor(() => expect(screen.getByText(/已投递/)).toBeTruthy());
@@ -89,7 +102,9 @@ describe("SuperpowersKanbanEnqueue", () => {
       .fn<() => Promise<void>>()
       .mockRejectedValue({ message: "spec file does not exist: /p/a.spec.md" });
 
-    render(<SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} />);
+    render(
+      <SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} prequeue={noopPrequeue} />,
+    );
     clickEnqueue();
 
     await waitFor(() =>
@@ -115,7 +130,9 @@ describe("SuperpowersKanbanEnqueue", () => {
         }),
     );
 
-    render(<SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} />);
+    render(
+      <SuperpowersKanbanEnqueue pickFile={pickFile} enqueue={enqueue} prequeue={noopPrequeue} />,
+    );
     clickEnqueue();
     clickEnqueue();
 
@@ -123,5 +140,37 @@ describe("SuperpowersKanbanEnqueue", () => {
     release?.();
     await waitFor(() => expect(screen.getByText(/已投递/)).toBeTruthy());
     expect(enqueue).toHaveBeenCalledTimes(1);
+  });
+
+  it("delivers a pre-queued card from the title input", async () => {
+    const calls: string[] = [];
+    render(
+      <SuperpowersKanbanEnqueue
+        pickFile={async () => null}
+        enqueue={async () => {}}
+        prequeue={async (title) => {
+          calls.push(title);
+        }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("预排队标题"), { target: { value: "my idea" } });
+    fireEvent.click(screen.getByRole("button", { name: "预排队" }));
+    expect(calls).toEqual(["my idea"]);
+    expect(await screen.findByText("已投递，等待插件校验")).toBeTruthy();
+  });
+
+  it("ignores an empty pre-queued title", async () => {
+    const calls: string[] = [];
+    render(
+      <SuperpowersKanbanEnqueue
+        pickFile={async () => null}
+        enqueue={async () => {}}
+        prequeue={async (title) => {
+          calls.push(title);
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "预排队" }));
+    expect(calls).toEqual([]);
   });
 });
