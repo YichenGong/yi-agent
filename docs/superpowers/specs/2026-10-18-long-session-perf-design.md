@@ -129,6 +129,9 @@ driver 每收到一个 `ItemCompleted` 置 `checkpoint_dirty`（`server.rs:4451`
 
 - **G1 前端数据层**：`item/delta` / `item/completed` 的定位从 O(N) 降为**摊还 O(1)**，
   不改变任何可见行为与转录顺序。
+  **定位（见 §4）**：G1 是 **G2 的附带项**，不单独占用交付步骤——它的独立收益在
+  G2 落地后几乎不可见（§2.5），但 G2 的冻结前缀需要知道活跃尾部在哪，
+  故位置查找必须一起改。
 - **G2 前端渲染层**：流式期间每帧重渲染的元素数**与历史条数无关**（只重渲染活跃尾部）。
 - **G3 前端 markdown**：流式期间重解析次数**脱离 delta 频率**（按时间节流），
   整轮成本从 O(N²) 降为 O(N²/常数)。
@@ -199,7 +202,7 @@ G2            503        467          502          463         515
 
 ## 3. 设计
 
-### 3.1 前端数据层：末尾快路径 + 位置索引（G1）
+### 3.1 前端数据层：活跃尾部的定位（G1，G2 的附带项）
 
 **为什么不只是"加个 Map 索引"**：`session.ts` 有两条语义约束必须保住——
 
@@ -450,17 +453,29 @@ YAGNI，本 spec 不做；判断依据写在 §6。
 且 `app.rs:7854` 已有一条同型门禁（断言流式 4 token 只重渲染 ≤8 个 cell，
 历史 30 个 cell）。本 spec 的门禁沿用这一范式。
 
-## 4. 交付顺序（每步独立提交、可单独回滚）
+## 4. 交付顺序（按收益/风险排序；每步独立提交、可单独回滚）
 
-| # | 内容 | 依赖 | 主要回归网 |
-|---|---|---|---|
-| 1 | §3.1 第一层：`indexOfItem` 末尾快路径 | — | `session.test.ts` |
-| 2 | §3.2：`ChatItem` memo + 冻结前缀 + `structuralVersion` | 1 | `ChatView.test.tsx`、`App.test.tsx` |
-| 3 | §3.3：流式 markdown 节流 | 2 | `ChatView.test.tsx`、`MarkdownText.test.tsx` |
-| 4 | §3.4：checkpoint 回归保护（**无行为变更**） | — | 新增"不丢东西"用例 + `yi-agent-app-server` 既有 checkpoint 测试 |
-| 5 | §3.5：TUI 脏集合 + 舍弃上限 | — | `history.rs` 计数器测试、`app.rs:7854` 同型门禁 |
+排序原则来自 §2.5 的端到端实测：**先做消掉"随会话增长"的那一项**（G2），
+`G1` 作为它的附带项（G2 本身就要维护位置查找，G1 基本是白送的），
+再做叠在 G2 之上的 G3，然后是同原理的独立站点 G5，最后是零行为变更的 G4。
+**最小可用集 = 1+2（G2+G3）**；3 与 4 可延后，不影响前两项的收益。
 
-第 1、4、5 步彼此独立，可并行；第 2、3 步有先后依赖。
+| # | 内容 | 收益 | 依赖 | 主要回归网 |
+|---|---|---|---|---|
+| 1 | §3.2：`ChatItem` memo + 冻结前缀 + `structuralVersion`，**并顺带做 §3.1 的位置查找**（G1 降为附带项：G2 必须能定位活跃尾部，查找不 O(N) 是它的实现前提） | 回合 7.5s → 0.5s，且不再随会话变长（§2.5） | — | `ChatView.test.tsx`、`App.test.tsx`、`session.test.ts` |
+| 2 | §3.3：流式 markdown 节流 | 在 1 之上 0.51s → 0.05s | 1 | `ChatView.test.tsx`、`MarkdownText.test.tsx` |
+| 3 | §3.5：TUI 脏集合 + 舍弃上限 | 同原理，闭合 `docs/bug-list.md:57` | — | `history.rs` 计数器测试、`app.rs:7854` 同型门禁 |
+| 4 | §3.4：checkpoint 回归保护（**无行为变更**） | 零性能收益；防"不丢东西"被后续改动破坏 | — | 新增"不丢东西"用例 + `yi-agent-app-server` 既有 checkpoint 测试 |
+
+**关于 G1 的定位（明确）**：G1 **不单独占用一个交付步骤**。理由是它的独立收益
+在 G2 落地后几乎不可见（§2.5 的诚实边界），但 G2 的冻结前缀需要"知道活跃尾部
+在哪"，因此位置查找必须一起改——把它并进步骤 1 既能省一次来回，
+也避免"先做 G1 却测不出效果"的空动作。
+若实现时发现 G2 可以用更简单的方式定位尾部（例如直接用 `items.length - 1`
+配合 §3.2 的 `structuralVersion`），则 §3.1 可进一步缩减，只保留 :475 处的必要修正。
+
+第 1、3、4 步彼此独立，可并行；第 2 步依赖第 1 步。
+建议合并顺序：**先 1+2 合并（核心收益）**，再看是否继续 3、4。
 
 ## 5. 风险与缓解
 
@@ -480,7 +495,7 @@ YAGNI，本 spec 不做；判断依据写在 §6。
 
 | 项 | 门禁（可执行） | 判据 |
 |---|---|---|
-| G1 | `cd desktop && npx vitest run src/lib/session.test.ts` | 新增用例：以 O(1) 计数器（探针包住 `findIndex`）断言"主键打到末尾项时扫描次数为常数，与 `items.length` 无关" |
+| G1（步骤 1 的一部分） | `cd desktop && npx vitest run src/lib/session.test.ts` | 新增用例：用计数器断言"流式期间定位活跃尾部的比较次数**与 `items.length` 无关**"（§3.1 的三种策略对照已证明向前 `findIndex` 会退化为 O(N)，该用例必须能捕获这种退化） |
 | G2 | `cd desktop && npx vitest run src/components/ChatView.test.tsx` | 新增用例：4000 项历史 + 1 个流式 delta，断言**历史前缀子树的 render 计数为 0**（React Profiler 或 spy）；并断言"就地修改历史项后 UI 立即更新"（覆盖 §5 风险 1 的三条路径） |
 | G3 | `cd desktop && npx vitest run src/components/ChatView.test.tsx` | 新增用例：同一文本连续 100 个 delta，断言 markdown 渲染（`ReactMarkdown` 调用次数）**远小于** 100，且**流式结束后终值已渲染** |
 | G4 | `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib` | 新增"不丢东西"用例：(a) 含大量 `ItemCompleted` 的 turn 在任意时刻"崩溃"后，`load` + `promote_partial` 恢复出的 items 不少于崩溃前已完成的 items；(b) turn 开始即崩溃也不丢提问；(c) 写入次数不随 item 数线性增长（防抖仍生效）。既有恢复/崩溃用例全绿 |
