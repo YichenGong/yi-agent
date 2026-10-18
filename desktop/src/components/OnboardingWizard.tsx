@@ -13,10 +13,10 @@ type Step = "welcome" | "provider" | "form";
 /**
  * 向导收尾的结果（spec §4.7）。
  *
- * `imported === false` 表示 `.env` 已写、但清单没收边——向导照常关闭进主界面，
- * 由调用方在主界面顶部留一条可关闭提示。`importError` 是可读原因（如有）。
+ * 落盘是单写 `models.json`：要么成功，要么宿主以 RPC 错误抛出（没有「部分成功」态）。
+ * 保留这个类型是为了给将来可能的收尾信息留一个稳定的回调形状。
  */
-export type OnboardingOutcome = { imported: boolean; importError?: string };
+export type OnboardingOutcome = { saved: boolean };
 
 const DEFAULT_URL = {
   anthropic: "https://api.anthropic.com",
@@ -84,11 +84,11 @@ export function OnboardingWizard({
       // `ok:false` 不是抛错，但与抛错同路：不 dismiss、不进主界面，把失败留在
       // 向导里内联显示。否则「没保存成功却看着像完成」会静默丢掉用户的配置。
       if (!result.ok) {
-        setError(result.import_error || "保存失败");
+        setError("保存失败");
         return;
       }
       await dismissOnboarding(call);
-      onDone({ imported: result.imported && result.ok, importError: result.import_error });
+      onDone({ saved: true });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -113,7 +113,7 @@ export function OnboardingWizard({
         {step === "welcome" && (
           <div className="mt-4">
             <p className="text-sm text-fg-muted">
-              配置一个模型就能开始对话。所有信息存在本机，只会写入你的全局 .env。
+              配置一个模型就能开始对话。所有信息存在本机，写入 `~/.yi-agent/models.json`。
             </p>
             {reasons.length > 0 && (
               <ul className="mt-2 list-disc pl-5 text-xs text-fg-subtle">

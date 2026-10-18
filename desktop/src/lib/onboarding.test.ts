@@ -30,7 +30,7 @@ describe("onboardingStatus", () => {
 
 describe("applyOnboarding", () => {
   it("sends the four fields and reports the outcome", async () => {
-    const rpc = vi.fn().mockResolvedValue({ ok: true, env_written: true, imported: false, import_error: "disk" });
+    const rpc = vi.fn().mockResolvedValue({ ok: true, name: "gpt-4o" });
     const result = await applyOnboarding(rpc, {
       provider: "openai",
       model: "gpt-4o",
@@ -43,7 +43,7 @@ describe("applyOnboarding", () => {
       api_url: "",
       api_key: "sk-x",
     });
-    expect(result).toEqual({ ok: true, env_written: true, imported: false, import_error: "disk" });
+    expect(result).toEqual({ ok: true, name: "gpt-4o" });
   });
 });
 

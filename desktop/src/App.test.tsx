@@ -3593,19 +3593,14 @@ describe("App first-run onboarding gate", () => {
     expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull();
   });
 
-  it("leaves a dismissible notice when the apply is a partial success", async () => {
+  it("closes the wizard after a successful apply (models.json only)", async () => {
     state.dataSources["onboarding/status"] = () => ({
       needed: true,
       dismissed: false,
       reasons: ["api_key"],
     });
-    // `.env` 写成功但清单收边失败：宿主回 ok:true + imported:false + 原因。
-    state.dataSources["onboarding/apply"] = () => ({
-      ok: true,
-      env_written: true,
-      imported: false,
-      import_error: "disk",
-    });
+    // 单写清单：宿主回 { ok, name }。没有「部分成功」态，故不该出现任何收尾横幅。
+    state.dataSources["onboarding/apply"] = () => ({ ok: true, name: "gpt-4o" });
     render(<App />);
     // 走完向导：欢迎 → 选格式 → 保存。
     fireEvent.click(await screen.findByRole("button", { name: /开始/ }));
@@ -3614,13 +3609,8 @@ describe("App first-run onboarding gate", () => {
     fireEvent.change(await screen.findByLabelText("API 密钥"), { target: { value: "sk-x" } });
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
 
-    // 部分成功：向导退场，主界面顶部留一条可关闭提示，并带上原因。
-    const notice = await screen.findByText(/未纳入模型清单/);
-    expect(notice.textContent).toContain("disk");
-    expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull();
-
-    // 关闭即清空。
-    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    // 向导退场，且没有遗留的「未纳入模型清单」横幅。
+    await waitFor(() => expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull());
     expect(screen.queryByText(/未纳入模型清单/)).toBeNull();
   });
 });
