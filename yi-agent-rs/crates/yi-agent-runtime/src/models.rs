@@ -274,8 +274,18 @@ impl CatalogWatcher {
 /// （含 warning 日志字段，故**必须**接收 `path`）。
 fn parse_catalog(text: &str, path: &Path) -> Result<ModelCatalog, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(text)?;
+    // 顶层必须是对象。数组 / 标量 / `null` 都是「合法 JSON，但不是清单文档」：
+    // 若当成空清单，调用方会误判「用户没配置」并覆盖掉用户的文件（静默丢失）。
+    // `load_catalog_from` 仍是 Err→空清单（坏文件不阻断启动），故此处报错安全。
+    let Some(object) = value.as_object() else {
+        return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+            "{}: expected a JSON object at the top level",
+            path.display()
+        )));
+    };
     let mut catalog = ModelCatalog::default();
-    if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
+    if let Some(models) = object.get("models").and_then(|v| v.as_array()) {
+        let mut skipped = 0usize;
         for raw in models {
             match serde_json::from_value::<ModelEntry>(raw.clone()) {
                 Ok(mut entry)
@@ -286,14 +296,26 @@ fn parse_catalog(text: &str, path: &Path) -> Result<ModelCatalog, serde_json::Er
                     migrate_openai_api_url(&mut entry);
                     catalog.models.push(entry);
                 }
-                Ok(_) => tracing::warn!(path = %path.display(), "skipping incomplete model entry"),
+                Ok(_) => {
+                    skipped += 1;
+                    tracing::warn!(path = %path.display(), "skipping incomplete model entry")
+                }
                 Err(error) => {
+                    skipped += 1;
                     tracing::warn!(%error, path = %path.display(), "skipping malformed model entry")
                 }
             }
         }
+        // 写了条目却一条都没能留下 = 用户写坏了，绝不能当成「没有配置」：
+        // 否则调用方会导入并整段 rename 掉用户的 `models` 数组。
+        if !models.is_empty() && catalog.models.is_empty() {
+            return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                "{}: all {skipped} model entries were skipped as invalid",
+                path.display()
+            )));
+        }
     }
-    catalog.default_model = value
+    catalog.default_model = object
         .get("default_model")
         .and_then(|v| v.as_str())
         .map(str::to_string);
@@ -309,17 +331,31 @@ pub fn save_catalog(catalog: &ModelCatalog) -> std::io::Result<()> {
 }
 
 /// 写清单：读-改-写，保留 `models.json` 里无关的顶层键，最后原子替换。
+///
+/// 既有文件「读不出来」（损坏 JSON / 非对象）时**报错而不覆盖**：那是用户的配置
+/// 出了岔子，不是「没有配置」。静默重建会把整份清单扔掉（含别的条目的 key）。
+/// 只有文件**不存在**才从空对象起步（真正的首写）。
 pub fn save_catalog_to(path: &Path, catalog: &ModelCatalog) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     // 读-改-写：以既有对象为底，仅覆盖本模块拥有的三个键，其余顶层键原样保留。
-    // 文件缺失 / 损坏 / 非对象时从空对象起步（与 `load_catalog_from` 的容错一致）。
-    let mut object = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
+    let mut object = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} exists but is not a readable JSON object; refusing to overwrite it",
+                        path.display()
+                    ),
+                )
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => return Err(error),
+    };
     let catalog_value = serde_json::to_value(catalog).map_err(std::io::Error::other)?;
     if let serde_json::Value::Object(fields) = catalog_value {
         for (key, value) in fields {
@@ -574,6 +610,48 @@ mod tests {
         assert_eq!(load_catalog_from(&path), catalog);
     }
 
+    /// 写入不得把「读不出来的既有文件」当成空对象从头重建——那会静默丢掉用户
+    /// 的整个 `models.json`。首写（文件不存在）仍必须成功创建。
+    #[test]
+    fn saving_refuses_to_overwrite_a_base_it_cannot_read() {
+        // (a) 文件不存在：确实没有既有内容 → 正常创建。
+        let dir = tempfile::TempDir::new().unwrap();
+        let fresh = dir.path().join("models.json");
+        save_catalog_to(
+            &fresh,
+            &ModelCatalog {
+                models: vec![entry("a")],
+                default_model: Some("a".into()),
+                subagent_model: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(load_catalog_from(&fresh).models.len(), 1);
+
+        // (b) 既有文件是损坏 JSON / 非对象：必须报错并保持文件原样，不得覆盖。
+        for original in ["{ this is not valid json", r#"["not","an","object"]"#] {
+            let path = dir.path().join("models.json");
+            std::fs::write(&path, original).unwrap();
+            let result = save_catalog_to(
+                &path,
+                &ModelCatalog {
+                    models: vec![entry("a")],
+                    default_model: Some("a".into()),
+                    subagent_model: None,
+                },
+            );
+            assert!(
+                result.is_err(),
+                "saving over an unreadable base must fail, not silently rebuild it"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "an unreadable base must be left byte-identical"
+            );
+        }
+    }
+
     #[test]
     fn masks_the_key_leaving_the_tail() {
         assert_eq!(mask_key("sk-secret-1234"), "••••1234");
@@ -736,6 +814,65 @@ mod tests {
 
         // 合法但为空清单：Ok（合法空不等于损坏）。
         std::fs::write(&path, r#"{"models":[]}"#).unwrap();
+        assert!(try_load_catalog_from(&path).is_ok());
+    }
+
+    /// 严格读取必须拒绝「合法 JSON 但根本不是清单文档」（顶层不是对象）。
+    ///
+    /// 这类文件过去被当成 `Ok(空清单)`，于是调用方（迁移）误判「用户没配置」，
+    /// 直接把它 rename 覆盖掉。`Ok(空清单)` 的契约是「**确定**没有配置」，
+    /// 一份合法却非对象的文件显然不满足。
+    #[test]
+    fn try_load_rejects_a_document_that_is_not_a_json_object() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+
+        for document in [
+            r#"["a","b","c"]"#,
+            r#""just a string""#,
+            "42",
+            "null",
+            "true",
+        ] {
+            std::fs::write(&path, document).unwrap();
+            assert!(
+                try_load_catalog_from(&path).is_err(),
+                "{document} is not a catalog document and must not report Ok(empty)"
+            );
+        }
+
+        // 合法的空对象本身仍是「结构上可读」的清单文档 → Ok(空)。
+        std::fs::write(&path, "{}").unwrap();
+        assert!(try_load_catalog_from(&path).is_ok());
+    }
+
+    /// 顶层是对象、但 `models` 里**每条都被跳过**时，也不能谎报 `Ok(空清单)`。
+    ///
+    /// 这代表「用户写了配置、只是写坏了」（例如漏了 `api_url`）。当成空清单，
+    /// 迁移就会导入并整段 rename 掉用户的 `models` 数组——静默数据丢失。
+    #[test]
+    fn try_load_rejects_a_catalog_whose_entries_were_all_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        // 唯一一条缺 `api_url` → 被逐条过滤跳过 → 幸存 0 条。
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"kept-typo","provider":"anthropic","model":"m"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            try_load_catalog_from(&path).is_err(),
+            "all entries skipped means the user wrote something malformed, not 'no config'"
+        );
+
+        // 反过来：只要幸存下一条，就仍是可读清单 → Ok。
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"ok","provider":"anthropic","api_url":"u","model":"m"},"#
+                .to_string()
+                + r#"{"name":"bad","provider":"anthropic","model":"m"}]}"#,
+        )
+        .unwrap();
         assert!(try_load_catalog_from(&path).is_ok());
     }
 
