@@ -45,8 +45,10 @@ impl Layout {
 }
 
 struct RunningChild {
-    child: Child,
+    child: std::process::Child,
     last_started: Instant,
+    /// 当前重启退避。反复失败时 ×2 增长，至清单的 `restart_backoff_max_ms` 封顶。
+    backoff: Duration,
 }
 
 /// 按清单 + 开关键托管子进程。生命周期与 daemon 一致。
@@ -151,19 +153,57 @@ impl Supervisor {
             .collect()
     }
 
+    /// 该清单声明的查询 socket 上是否已有实例在应答。
+    ///
+    /// 用「能否连上」判断：Unix socket 的 `connect` 成功当且仅当有进程在
+    /// `listen`。陈旧 socket 文件（无监听者）会 `ECONNREFUSED`，故不会被误认。
+    fn answers(&self, manifest: &SupervisorManifest) -> bool {
+        match manifest.query_socket_path(
+            &self.layout.workdir,
+            &self.layout.state_dir,
+            &self.layout.runtime_dir,
+        ) {
+            Some(Ok(socket)) => std::os::unix::net::UnixStream::connect(&socket).is_ok(),
+            _ => false,
+        }
+    }
+
+    /// 仅测试用：某托管进程当前的退避值。
+    #[cfg(test)]
+    pub(crate) fn backoff_for_test(&self, name: &str) -> Option<Duration> {
+        self.running.get(name).map(|running| running.backoff)
+    }
+
     fn ensure_running(&mut self, manifest: &SupervisorManifest) {
-        if let Some(running) = self.running.get_mut(&manifest.name) {
-            match running.child.try_wait() {
+        // 幂等：已有实例在 `query_socket` 上应答 → 不重复 spawn。
+        // 这从源头消除「健康孤儿持锁 + 监督器不断补位」的空转循环。
+        if self.answers(manifest) {
+            return;
+        }
+        let initial = Duration::from_millis(manifest.restart_backoff_ms);
+        let max = Duration::from_millis(
+            manifest
+                .restart_backoff_max_ms
+                .max(manifest.restart_backoff_ms),
+        );
+        let backoff = match self.running.get_mut(&manifest.name) {
+            None => initial,
+            Some(running) => match running.child.try_wait() {
                 Ok(None) => return, // 仍在运行
                 Ok(Some(_)) | Err(_) => {
-                    // 已退出：按退避重启。
-                    let backoff = Duration::from_millis(manifest.restart_backoff_ms);
-                    if running.last_started.elapsed() < backoff {
+                    // 已退出：未到当前退避就先等，到了才重试并把退避翻倍。
+                    if running.last_started.elapsed() < running.backoff {
                         return;
                     }
+                    running.backoff.saturating_mul(2).min(max)
                 }
-            }
-        }
+            },
+        };
+        self.spawn_and_track(manifest, backoff);
+    }
+
+    /// spawn 并把新 child 连同退避值记进 `running`。
+    fn spawn_and_track(&mut self, manifest: &SupervisorManifest, backoff: Duration) {
         if self.spawn(manifest).is_ok() {
             if let Some(child) = self.spawned.take() {
                 self.running.insert(
@@ -171,6 +211,7 @@ impl Supervisor {
                     RunningChild {
                         child,
                         last_started: Instant::now(),
+                        backoff,
                     },
                 );
             }
@@ -207,5 +248,50 @@ impl Supervisor {
         for name in names {
             self.stop(&name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 写一份清单到 `<workdir>/.yi-agent/supervisors/<name>.json`。
+    fn write_manifest(workdir: &Path, name: &str, extra: &str) -> SupervisorManifest {
+        let dir = workdir.join(".yi-agent").join("supervisors");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = format!(
+            r#"{{"name":"{name}","command":"/bin/sh","args":["-c","exit 1"],"switch_key":"{name}_on","restart_backoff_ms":40,"restart_backoff_max_ms":160,"stop_when_disabled":false{extra}}}"#
+        );
+        let manifest = SupervisorManifest::parse(&json).unwrap();
+        std::fs::write(dir.join(format!("{name}.json")), &json).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn repeated_failures_grow_the_backoff_up_to_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+        let manifest = write_manifest(workdir, "demo", "");
+        let mut supervisor = Supervisor::new(Layout::for_workdir(workdir));
+
+        // 第一次：初始退避 = restart_backoff_ms。
+        let start = Instant::now();
+        for _ in 0..40 {
+            supervisor.reconcile();
+            if supervisor.running_count() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(supervisor.running_count(), 1, "第一次必须起进程");
+        let _ = start;
+
+        // 记下当前退避，验证它随反复失败增长、且不超过上限。
+        let observed = supervisor.backoff_for_test("demo").expect("tracked");
+        assert!(
+            observed >= Duration::from_millis(40) && observed <= Duration::from_millis(160),
+            "退避必须落在 [restart_backoff_ms, restart_backoff_max_ms] 内，实际 {observed:?}"
+        );
+        let _ = manifest;
     }
 }
