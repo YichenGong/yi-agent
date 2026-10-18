@@ -35,7 +35,9 @@
 >
 > ② **验收 §6.2 的 grep 命令本身不成立**（实测）：
 >    a. 它**大小写敏感**，而代码大量使用 `Board` / `BoardPluginState` /
->       `BoardQueryError` / `BoardLauncher`（实测 48 行匹配 `Board` 但不匹配小写 `board`）
+>       `BoardQueryError` / `BoardLauncher`（实测 44 行匹配 `Board` 但不匹配小写 `board`：
+>       `app-server` 36、`yi-agent`(TUI/CLI) 8、`yi-agent-supervisors` 0；命令
+>       `grep -rn "Board" <crate>/src/ | grep -v board | wc -l`）
 >       ——会**假通过**；
 >    b. 它的排除表漏了 `onboarding`，而 `grep "board"` **会命中** `onboarding` /
 >       `onboarding_rpc` / `onboarding_preferences_path`（仅 `rpc_tests.rs` 就 ≥14 行）
