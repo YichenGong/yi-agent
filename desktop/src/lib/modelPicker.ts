@@ -26,6 +26,13 @@ export type ModelOption = {
  *   的 `model`。
  *
  * 其后的每一项对应清单里的一条，`currentRef` 指向的那条标记为 selected。
+ *
+ * 去重：默认项的模型标识与默认条目的**显示名**是两个字段，可能取到同一个字面量
+ * （用户机器上 `name == model == "HORIZON-DeepSeek"` 即此情形）。此时条目行会渲染
+ * 出与默认项一模一样的文本，看起来是同一个模型出现两次。这两行指向同一模型，故
+ * 合并为一行——丢掉默认条目那一行，只留「跟随全局默认 · X」。只合并**默认条目**：
+ * 非默认条目的显示名撞上这个 X 是另一回事（可能是另一个端点/密钥），合并会真丢掉
+ * 一个可选项，故不碰。
  */
 export function buildModelOptions(
   list: ModelList,
@@ -40,17 +47,28 @@ export function buildModelOptions(
       ? `跟随全局默认 · ${resolvedDefaultModel}`
       : "跟随全局默认";
 
+  // 见上方「去重」说明：默认条目的显示名 == 默认项模型标识时才合并。
+  const collapsedDefault =
+    defaultEntry !== null &&
+    resolvedDefaultModel !== null &&
+    defaultEntry.name === resolvedDefaultModel
+      ? defaultEntry.name
+      : null;
+
   const follow: ModelOption = {
     value: null,
     label: followLabel,
-    selected: currentRef === null,
+    // 会话原本恰好钉在被合并掉的那条上时，默认项要接过选中态，否则合并后一行都不勾。
+    selected: currentRef === null || currentRef === collapsedDefault,
   };
 
-  const entries: ModelOption[] = list.models.map((entry: ModelEntryView) => ({
-    value: entry.name,
-    label: entry.name,
-    selected: entry.name === currentRef,
-  }));
+  const entries: ModelOption[] = list.models
+    .filter((entry: ModelEntryView) => entry.name !== collapsedDefault)
+    .map((entry: ModelEntryView) => ({
+      value: entry.name,
+      label: entry.name,
+      selected: entry.name === currentRef,
+    }));
 
   return [follow, ...entries];
 }

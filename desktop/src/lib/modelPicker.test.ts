@@ -69,6 +69,44 @@ describe("buildModelOptions", () => {
     expect(opts[0].label).toContain("model-a");
     expect(opts[0].label).not.toContain("model-b");
   });
+
+  it("does not render an entry row that reads the same as the follow-default row", () => {
+    // 用户机器上的真实情形：条目显示名 == 模型串，且它就是全局默认。
+    // 此时「跟随全局默认 · X」与条目行「X」是同一个模型，下拉里只应出现一行。
+    const opts = buildModelOptions(
+      list({ models: [entry("HORIZON-DeepSeek", "HORIZON-DeepSeek")], default_model: "HORIZON-DeepSeek" }),
+      null,
+      "HORIZON-DeepSeek",
+    );
+    const duplicated = opts.filter((o) => o.label.includes("HORIZON-DeepSeek"));
+    expect(duplicated).toHaveLength(1);
+    expect(opts.map((o) => o.value)).toEqual([null]);
+  });
+
+  it("marks the single remaining row as selected when the session pins the colliding entry", () => {
+    // 会话显式钉在（默认）条目上：条目行被合并掉了，不能留下「一行都没选中」的空状态。
+    const opts = buildModelOptions(
+      list({ models: [entry("HORIZON-DeepSeek", "HORIZON-DeepSeek")], default_model: "HORIZON-DeepSeek" }),
+      "HORIZON-DeepSeek",
+      "HORIZON-DeepSeek",
+    );
+    expect(opts.map((o) => o.value)).toEqual([null]);
+    expect(opts[0].selected).toBe(true);
+  });
+
+  it("still lists every entry when no row collides with the follow-default label", () => {
+    // 显示名与模型串不同（常态）时不得误删条目：三行都在。
+    const opts = buildModelOptions(
+      list({
+        models: [entry("公司-内网", "claude-sonnet-4-5"), entry("本地", "qwen3")],
+        default_model: "公司-内网",
+      }),
+      null,
+      "claude-sonnet-4-5",
+    );
+    expect(opts.map((o) => o.value)).toEqual([null, "公司-内网", "本地"]);
+    expect(opts[0].selected).toBe(true);
+  });
 });
 
 describe("REASONING_EFFORTS", () => {
