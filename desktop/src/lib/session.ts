@@ -540,6 +540,10 @@ export class Session {
         // 块用一个稳定锚点（openReasoning），而不是「数组末尾」：服务端项会被
         // 插到最后一个服务端项之后，若以末尾为准，本轮的 agentMessage 会把块甩到
         // 它自己的答案后面（design §6.1 要求块位于正文之前）。
+        //
+        // 不变量：`openReasoning` 只可能指向**尾部**（每次落入非推理条目的 push
+        // 都先调 `breakReasoningRun()`），故这里的就地累积不会改到历史前缀，
+        // 无需自增 `structuralVersion`。
         const { text } = notification.params;
         if (this.openReasoning) {
           this.openReasoning.text += text;

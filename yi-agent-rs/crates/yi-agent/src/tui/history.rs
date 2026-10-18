@@ -291,9 +291,9 @@ impl HistoryState {
 
     /// Number of cells dropped from the head of the history so far.
     ///
-    /// The status bar is the intended consumer; until it reads it, the
-    /// accessor is exercised only by tests (same shape as `total_lines`).
-    #[allow(dead_code)]
+    /// The TUI status bar consumes this every frame to render its persistent
+    /// "已略去 N 条更早的历史" segment, so the trim is visible rather than
+    /// silent.
     pub fn dropped_cells(&self) -> usize {
         self.dropped_cells
     }

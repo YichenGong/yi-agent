@@ -408,8 +408,8 @@ export function ChatView({
           same array instance for the whole session, so without a changing input
           the memoized prefix would never rebuild after an in-place slot replace.
           A `key` would rebuild it by *remounting* it, which throws away the
-          local state underneath — an expanded CoT, an open tool card, a
-          half-typed interjection draft — on every item event, and re-issues the
+          local state underneath — an expanded reasoning block and an open tool
+          card — on every item event, and re-issues the
           prefix bubbles' image reads. The prop re-renders in place instead, and
           each `ChatItem` still memoizes, so unchanged messages stay untouched. */}
       <HistoryPrefix
