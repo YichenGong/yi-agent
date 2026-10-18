@@ -4294,3 +4294,156 @@ async fn an_unlinked_attach_issues_no_extra_roots_update() {
         "a linked attach must still record its roots"
     );
 }
+
+/// 一个未 hydrate 的会话（其 supervisor 不在 coordinator 的 map 里）不应
+/// 阻断整轮判定。这回归的是「库全局读 × 进程内部分视图」的结构性错配：
+/// `active_attempt_watchdogs()` 返回库里的全部快照，而
+/// `record_watchdog_terminal` 只认本进程 hydrate 过的会话，未 hydrate 的
+/// 返回 `Err(SessionNotFound)`——它的 `?` 曾让 `evaluate_watchdogs` 整轮返回 Err。
+#[tokio::test]
+async fn an_unhydrated_session_does_not_fail_the_whole_watchdog_sweep() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+
+    // 造 2 条越限快照，分属 2 个会话，且都未 hydrate（与真实库里那批越限
+    // queued 任务同形）。
+    let started = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let limits = WatchdogLimits {
+        max_turns: None,
+        max_wall_time_secs: None,
+        max_idle_time_secs: Some(1), // started 远在过去 → 必然 Stalled
+        ..WatchdogLimits::default()
+    };
+    let usage = WatchdogUsage::default();
+    {
+        let mut repository = RuntimeRepository::open(&database).unwrap();
+        for _ in 0..2 {
+            let session = RootSessionId::new();
+            let task = yi_agent_core::TaskId::new();
+            let attempt = yi_agent_core::AttemptId::new();
+            repository
+                .create_task_with_attempt(&task, &session, &attempt, 1, "queued")
+                .unwrap();
+            repository
+                .save_attempt_watchdog_snapshot(
+                    &task, &attempt, &limits, &usage, None, started, None,
+                )
+                .unwrap();
+        }
+    }
+
+    // 不 hydrate 任何会话：supervisors map 为空。
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+
+    let now = started + ChronoDuration::seconds(3600);
+    let result = coordinator.evaluate_watchdogs(now).await;
+
+    // 修复前：整轮返回 Err(SessionNotFound)。
+    // 修复后：Ok，且 0 条被提交（两条的会话都未 hydrate，各自被隔离跳过）。
+    assert!(
+        result.is_ok(),
+        "an unhydrated session must not fail the whole sweep: {result:?}"
+    );
+    assert_eq!(
+        result.unwrap(),
+        0,
+        "no verdict can be committed for unhydrated sessions, but the sweep must complete"
+    );
+    // 库里也不应出现任何 watchdog 终态（两条都被隔离跳过，而非被误判）。
+    let leftover = RuntimeRepository::open(&database)
+        .unwrap()
+        .event_records_after(0)
+        .unwrap();
+    assert!(
+        !leftover.iter().any(|event| matches!(
+            event.event,
+            RuntimeEvent::TaskStalled
+                | RuntimeEvent::TaskTimedOut
+                | RuntimeEvent::TaskBudgetExhausted
+        )),
+        "no watchdog terminal may be written for an unhydrated session"
+    );
+}
+
+/// 混合：一个会话 hydrate 过、另一个没有。修复前，若未 hydrate 的那条先被
+/// 处理（顺序由 SQL 决定，不可控），已 hydrate 的那条就永远不会被判定。
+/// 断言"已 hydrate 的必然被终止"覆盖了两种顺序。
+#[tokio::test]
+async fn a_hydrated_attempt_is_terminated_even_beside_an_unhydrated_one() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+
+    // 会话 A：走 create_session，因此其 supervisor 已在 map 里。
+    let hydrated = coordinator.create_session().unwrap();
+    let hydrated_root = coordinator.root_task_id(&hydrated).unwrap();
+
+    // 会话 B：手工造一条未 hydrate 的 queued 越限快照。
+    let started = DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let limits = WatchdogLimits {
+        max_turns: None,
+        max_wall_time_secs: None,
+        max_idle_time_secs: Some(1),
+        ..WatchdogLimits::default()
+    };
+    {
+        let mut repository = RuntimeRepository::open(&database).unwrap();
+        let session = RootSessionId::new();
+        let task = yi_agent_core::TaskId::new();
+        let attempt = yi_agent_core::AttemptId::new();
+        repository
+            .create_task_with_attempt(&task, &session, &attempt, 1, "queued")
+            .unwrap();
+        repository
+            .save_attempt_watchdog_snapshot(
+                &task,
+                &attempt,
+                &limits,
+                &WatchdogUsage::default(),
+                None,
+                started,
+                None,
+            )
+            .unwrap();
+        // 让已 hydrate 的那个也越限。
+        let hydrated_attempt: yi_agent_core::AttemptId = Connection::open(&database)
+            .unwrap()
+            .query_row(
+                "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                [hydrated_root.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap();
+        repository
+            .save_attempt_watchdog_snapshot(
+                &hydrated_root,
+                &hydrated_attempt,
+                &limits,
+                &WatchdogUsage::default(),
+                None,
+                started,
+                None,
+            )
+            .unwrap();
+    }
+
+    let now = started + ChronoDuration::seconds(3600);
+    let terminated = coordinator.evaluate_watchdogs(now).await.unwrap();
+    assert!(
+        terminated >= 1,
+        "the hydrated attempt must still be terminated beside an unhydrated sibling"
+    );
+    assert!(
+        matches!(
+            coordinator.task_state(&hydrated_root).unwrap().as_str(),
+            "stalled" | "timed_out" | "budget_exhausted"
+        ),
+        "hydrated attempt must reach a watchdog terminal"
+    );
+}

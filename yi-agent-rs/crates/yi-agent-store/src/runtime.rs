@@ -2251,6 +2251,8 @@ impl RuntimeCoordinator {
         &self,
         now: DateTime<Utc>,
     ) -> Result<usize, RuntimeCoordinatorError> {
+        // 只有「取快照列表」失败才算整轮失败；单条快照处理失败必须隔离，
+        // 否则一个未 hydrate 的会话会让它后面所有 attempt 都逃过判定。
         let watchdogs = self
             .repository
             .lock()
@@ -2279,18 +2281,25 @@ impl RuntimeCoordinator {
                 last_meaningful_event_id: watchdog.snapshot.last_meaningful_event_id,
                 last_meaningful_at: watchdog.snapshot.observation.last_meaningful_at,
                 elapsed_secs,
-                current_wait: watchdog.snapshot.current_wait,
+                current_wait: watchdog.snapshot.current_wait.clone(),
             };
-            if self
+            match self
                 .record_watchdog_terminal(
                     &watchdog.session_id,
                     &watchdog.task_id,
                     terminal,
                     evidence,
                 )
-                .await?
+                .await
             {
-                terminal_count += 1;
+                Ok(true) => terminal_count += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    session = %watchdog.session_id,
+                    task = %watchdog.task_id,
+                    error = %error,
+                    "watchdog verdict could not be applied; other attempts continue"
+                ),
             }
         }
         Ok(terminal_count)
