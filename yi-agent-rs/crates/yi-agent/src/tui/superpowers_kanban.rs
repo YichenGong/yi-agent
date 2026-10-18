@@ -177,8 +177,54 @@ pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOu
                 ]),
             }
         }
+        _ if argument == "add-prequeued" || argument.starts_with("add-prequeued ") => {
+            let title = argument
+                .strip_prefix("add-prequeued")
+                .map(str::trim)
+                .unwrap_or("");
+            if title.is_empty() {
+                plain(vec!["usage: /superpowers-kanban add-prequeued <title>".to_string()])
+            } else {
+                match query_plugin(workdir, "enqueue_prequeued", json!({ "title": title })) {
+                    Ok(value) => {
+                        let id = value.get("id").and_then(Value::as_str).unwrap_or("card");
+                        plain(vec![format!("Superpowers 看板: delivered {id} to inbox")])
+                    }
+                    Err(QueryFailure::PluginMissing) => unavailable(),
+                    Err(QueryFailure::Other(message)) => {
+                        plain(vec![format!("Superpowers 看板: could not deliver: {message}")])
+                    }
+                }
+            }
+        }
+        _ if argument == "promote" || argument.starts_with("promote ") => {
+            let mut parts = argument.split_whitespace();
+            let _verb = parts.next();
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some(id), Some(spec), Some(plan), title) => {
+                    let mut params = json!({ "id": id, "spec_path": spec, "plan_path": plan });
+                    if let Some(title) = title {
+                        params["title"] = json!(title);
+                    }
+                    match query_plugin(workdir, "promote", params) {
+                        Ok(value) => {
+                            let id = value.get("id").and_then(Value::as_str).unwrap_or(id);
+                            plain(vec![format!("Superpowers 看板: delivered promote for {id}")])
+                        }
+                        Err(QueryFailure::PluginMissing) => unavailable(),
+                        Err(QueryFailure::Other(message)) => plain(vec![format!(
+                            "Superpowers 看板: could not deliver: {message}"
+                        )]),
+                    }
+                }
+                _ => plain(vec![
+                    "usage: /superpowers-kanban promote <card-id> <spec> <plan> [<title>]"
+                        .to_string(),
+                ]),
+            }
+        }
         _ => plain(vec![
-            "usage: /superpowers-kanban [on|off|create|remove|status|run|add <spec> <plan>]"
+            "usage: /superpowers-kanban [on|off|create|remove|status|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]"
                 .to_string(),
         ]),
     }
@@ -220,6 +266,8 @@ fn render_board(workdir: &Path, value: &Value) -> Result<Vec<String>, String> {
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty())
             .or_else(|| card.get("plan_path").and_then(Value::as_str))
+            .filter(|path| !path.is_empty())
+            .or_else(|| card.get("title").and_then(Value::as_str))
             .unwrap_or("");
         if where_.is_empty() {
             lines.push(format!("{id} {state}"));
@@ -297,6 +345,8 @@ mod tests {
                 { "id": "card-1", "state": "running", "plan_path": "a.plan.md" }
             ]})),
             "enqueue" => Ok(json!({ "id": "a-spec-a-plan" })),
+            "enqueue_prequeued" => Ok(json!({ "id": "my-idea" })),
+            "promote" => Ok(json!({ "id": params["id"] })),
             "import_plugin" => Ok(json!({ "ok": true })),
             other => Err(format!("unknown method: {other}")),
         }
@@ -480,6 +530,62 @@ mod tests {
                 && params["spec_path"] == "a.spec.md"
                 && params["plan_path"] == "a.plan.md"),
             "saw {queries:?}"
+        );
+    }
+
+    #[test]
+    fn add_prequeued_delivers_through_the_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let log = fake_daemon(dir.path(), installed);
+        let outcome = handle_kanban_with(dir.path(), "add-prequeued my idea", &global);
+        assert!(outcome.lines[0].contains("my-idea"), "{:?}", outcome.lines);
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|(method, params)| method == "enqueue_prequeued"
+                    && params["title"] == "my idea"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn promote_delivers_through_the_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let log = fake_daemon(dir.path(), installed);
+        let outcome = handle_kanban_with(dir.path(), "promote idea a.spec.md a.plan.md", &global);
+        assert!(outcome.lines[0].contains("idea"), "{:?}", outcome.lines);
+        let calls = log.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|(method, params)| method == "promote"
+                && params["id"] == "idea"
+                && params["spec_path"] == "a.spec.md"
+                && params["plan_path"] == "a.plan.md"),
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_board_line_falls_back_to_the_title_when_there_is_no_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        fake_daemon(dir.path(), |method, params| match method {
+            "switch.read" => Ok(json!({ "on": true, "source": "project" })),
+            "list" => Ok(json!({
+                "cards": [{ "id": "idea", "state": "pre_queued", "title": "一个想法" }]
+            })),
+            other => installed(other, params),
+        });
+        let outcome = handle_kanban_with(dir.path(), "", &global);
+        assert!(
+            outcome
+                .lines
+                .iter()
+                .any(|line| line.contains("idea") && line.contains("一个想法")),
+            "{:?}",
+            outcome.lines
         );
     }
 
