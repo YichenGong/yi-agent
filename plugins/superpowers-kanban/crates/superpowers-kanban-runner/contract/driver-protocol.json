@@ -24,7 +24,9 @@
       "kind": "launch",
       "workdir": "/w/card-1",
       "title": "看板 · a.spec",
-      "objective": "do the card"
+      "objective": "do the card",
+      "driver_project": "/proj",
+      "driver_ref": "card-1"
     },
     "append": {
       "action_id": "act-3",
