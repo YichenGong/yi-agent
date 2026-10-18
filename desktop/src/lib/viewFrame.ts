@@ -26,16 +26,23 @@ export interface LogEntry {
 
 /** `git log --oneline` 一类：短 sha + 空格 + 非空描述。与后端 `classify` 同规则。 */
 function looksLikeLog(text: string): boolean {
-  const first = text.split("\n").find((l) => l.trim() !== "");
+  const first = text.split(/\r?\n/).find((l) => l.trim() !== "");
   if (first === undefined) return false;
   // 长度 > 8（7 位 sha + 空格 + 至少一个字符），前 7 位是 ascii 十六进制，第 8 位是空格。
+  // 大小写都收：后端 `classify` 用 `is_ascii_hexdigit`，这里跟它对齐。
   if (first.length <= 8) return false;
-  if (!/^[0-9a-f]{7}/.test(first)) return false;
+  if (!/^[0-9a-fA-F]{7}/.test(first)) return false;
   if (first[7] !== " ") return false;
   return first.slice(8).trim().length > 0;
 }
 
-/** 内容真的像统一 diff 吗：后端只认 `diff --git ` 这一处标志。 */
+/**
+ * 内容真的像统一 diff 吗。
+ *
+ * 只认 `diff --git ` 这一处标志。后端 `classify` 还接受「首行以 `--- ` 开头」这条
+ * 次信号，这里**故意不跟**：少了它只会把真 diff 降级成纯文本，绝不会把普通文本
+ * 误渲染成 diff，方向是安全的。
+ */
 function looksLikeDiff(text: string): boolean {
   return text.includes("diff --git ");
 }
@@ -63,8 +70,9 @@ export function resolveKind(frame: ViewFrame): ViewKind {
 /** 拆 `--oneline` 输出；不匹配的行（装饰、噪声、分隔）直接丢弃。 */
 export function parseLog(text: string): LogEntry[] {
   const entries: LogEntry[] = [];
-  for (const line of text.split("\n")) {
-    const m = /^([0-9a-f]{7,40})\s+(.*)$/.exec(line);
+  // 按 `\r?\n` 切：CRLF 行尾的 `\r` 若留下，`.` 匹配不到它，整行都会失去匹配（面板空白）。
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^([0-9a-fA-F]{7,40})\s+(.*)$/.exec(line);
     if (!m) continue;
     entries.push({ sha: m[1], subject: m[2] });
   }
