@@ -1,7 +1,7 @@
 # 项目组长 Agent（Project Lead）设计
 
 日期：2026-10-17
-状态：P1/P2 已实现并合入，P3 待实现
+状态：P1/P2 已实现并合入；P3-A（视野工具）已实现（见 2026-10-18-project-lead-agent-p3-view-design.md）；P3-B（权限留痕/撤销，§8 前提待重定义）与 P3-C（移动端专用 UI）待实现
 模块：`yi-agent-app-server`、`yi-agent-subagent`、`desktop`、移动端远程
 关联：`docs/project-management/yi-agent-app-server.md`、`docs/project-management/subagent-runtime.md`、
 `docs/project-management/desktop.md`
@@ -384,6 +384,8 @@ IM 里看到并回应；桌面侧栏能看到 lead 条目。
 
 按需拉取工具（`lead_list_threads` / `lead_read_thread` 的完整形态）+ 权限留痕/撤销
 + 移动端远程。
+
+P3-A（视野工具）已实现：见 [2026-10-18-project-lead-agent-p3-view-design.md](./2026-10-18-project-lead-agent-p3-view-design.md)；权限留痕/撤销（P3-B）与移动端专用 UI（P3-C）待实现。
 
 ## 12. 范围外
 
