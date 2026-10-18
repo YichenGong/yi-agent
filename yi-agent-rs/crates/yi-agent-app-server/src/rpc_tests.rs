@@ -15753,6 +15753,8 @@ fn log_outcome_handles_every_variant() {
             reason: "ro".into(),
         },
         env,
+    );
+}
 
 /// 看板卡片会话所在的 worktree **不是项目**,`thread/lead` 不得为它种组长。
 ///
