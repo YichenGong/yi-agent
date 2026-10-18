@@ -1,3 +1,9 @@
+import { KANBAN_PLUGIN } from "./pluginSettings";
+import type { RpcCall } from "./rpcCall";
+import { RPC } from "./routes";
+
+export { KANBAN_PLUGIN };
+
 /** Which layer supplied the effective switch value. */
 export type SwitchSource = "project" | "global" | "default";
 
@@ -32,14 +38,7 @@ export interface BoardCardDto {
   thread_id?: string | null;
 }
 
-export type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
-
-/**
- * The plugin the kanban panel talks to. The host only forwards the query; no
- * board meaning lives above this line, so the plugin can be installed or
- * removed without the app learning a new RPC.
- */
-export const KANBAN_PLUGIN = "superpowers-kanban";
+export type BoardRpc = RpcCall;
 
 /**
  * One query through the generic channel, tagged with the plugin it is meant for
@@ -56,7 +55,7 @@ async function queryPlugin<T>(
   method: string,
   params: unknown,
 ): Promise<T> {
-  return rpc<T>("plugin/query", { plugin: KANBAN_PLUGIN, project, method, params });
+  return rpc<T>(RPC.pluginQuery, { plugin: KANBAN_PLUGIN, project, method, params });
 }
 
 /**
@@ -148,7 +147,7 @@ export function parseBoardWatchman(value: unknown): boolean {
  * 多发这一趟。
  */
 export async function readBoardWatchman(rpc: BoardRpc): Promise<boolean> {
-  const settings = await rpc<{ board_watchman_enabled?: unknown }>("ui/settings/read", {});
+  const settings = await rpc<{ board_watchman_enabled?: unknown }>(RPC.uiSettingsRead, {});
   return parseBoardWatchman(settings.board_watchman_enabled);
 }
 
@@ -160,7 +159,7 @@ export async function writeBoardWatchman(
   rpc: BoardRpc,
   enabled: boolean,
 ): Promise<{ warning?: string | null }> {
-  return rpc<{ warning?: string | null }>("ui/settings/write", {
+  return rpc<{ warning?: string | null }>(RPC.uiSettingsWrite, {
     board_watchman_enabled: enabled,
   });
 }

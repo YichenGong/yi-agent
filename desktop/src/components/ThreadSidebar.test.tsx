@@ -4,6 +4,7 @@ import { render, fireEvent, cleanup, screen, act } from "@testing-library/react"
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import { LONG_PRESS_MS } from "../lib/useLongPress";
+import { DEFAULT_TAG_NAMES, resolveTagNames } from "../lib/threadTags";
 import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import {
   DEFAULT_SIDEBAR_WIDTH,
@@ -17,8 +18,8 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function thread(id: string, title: string, cwd: string): ThreadSummary {
-  return { thread_id: id, cwd, model: "m", created_at: 0, updated_at: 0, title };
+function thread(id: string, title: string, cwd: string, tag?: string): ThreadSummary {
+  return { thread_id: id, cwd, model: "m", created_at: 0, updated_at: 0, title, tag };
 }
 
 function pinnedThread(id: string, title: string): ThreadSummary {
@@ -61,6 +62,8 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onRemoveBoard: vi.fn(),
     onOpenBoard: vi.fn(),
     onOpenSettings: vi.fn(),
+    tagNames: DEFAULT_TAG_NAMES,
+    onSetTag: vi.fn(),
     ...overrides,
   };
   return props;
@@ -156,7 +159,7 @@ describe("ThreadSidebar", () => {
 
   it("opens a group's context menu with the keyboard and closes it on Escape", () => {
     const { container } = renderSidebar();
-    const header = container.querySelectorAll<HTMLElement>("div[tabindex]")[0];
+    const header = container.querySelector<HTMLElement>("[data-ws-header]")!;
     expect(header.getAttribute("aria-expanded")).toBe("false");
 
     fireEvent.keyDown(header, { key: "Enter" });
@@ -173,7 +176,7 @@ describe("ThreadSidebar", () => {
 
   it("does not open the group menu when Enter/Space bubbles from the collapse caret", () => {
     const { container } = renderSidebar();
-    const header = container.querySelectorAll<HTMLElement>("div[tabindex]")[0];
+    const header = container.querySelector<HTMLElement>("[data-ws-header]")!;
     const caret = header.querySelector<HTMLButtonElement>('button[aria-label="Collapse"]')!;
 
     // jsdom does not perform Enter/Space button activation, so a keydown on the
@@ -208,6 +211,94 @@ describe("ThreadSidebar", () => {
     expect(wrappers).toHaveLength(2);
     expect(wrappers[0].parentElement).toBe(wrappers[1].parentElement);
     expect(wrappers[0].parentElement!.className.split(/\s+/)).toContain("space-y-2");
+  });
+
+  it("renders a colour dot for a tagged thread and nothing for an untagged one", () => {
+    const tagged: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("1", "alpha-thread", "/work/projA", "red")],
+      },
+      {
+        workspace: "/work/projB",
+        exists: true,
+        threads: [thread("2", "beta-thread", "/work/projB")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: tagged, tagNames: resolveTagNames({ red: "紧急" }) });
+    const dots = container.querySelectorAll("[data-thread-tag]");
+    expect(dots.length).toBe(1);
+    expect(dots[0].getAttribute("data-thread-tag")).toBe("red");
+    expect(dots[0].getAttribute("aria-label")).toBe("紧急");
+    // 无标签的行不渲染任何色点节点。
+    const row2 = container.querySelector('[data-thread-row="2"]')!;
+    expect(row2.querySelector("[data-thread-tag]")).toBeNull();
+    // 标题仍然渲染（色点不能顶掉标题）。
+    expect(screen.getByText("beta-thread")).toBeTruthy();
+  });
+
+  it("does not render a dot for an invalid tag id", () => {
+    const dirty: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("1", "alpha-thread", "/work/projA", "chartreuse")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: dirty });
+    expect(container.querySelector("[data-thread-tag]")).toBeNull();
+  });
+
+  it("opens the thread menu on right-click and applies a tag", () => {
+    const onSetTag = vi.fn();
+    const { container } = renderSidebar({ onSetTag });
+    const row = container.querySelector<HTMLElement>('[data-thread-row="1"]')!;
+    fireEvent.contextMenu(row);
+    const menu = container.querySelector("[data-thread-menu]");
+    expect(menu).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+    expect(onSetTag).toHaveBeenCalledWith("1", "red");
+  });
+
+  it("clears the tag from the menu", () => {
+    const onSetTag = vi.fn();
+    const { container } = renderSidebar({ onSetTag });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "无标签" }));
+    expect(onSetTag).toHaveBeenCalledWith("1", null);
+  });
+
+  it("marks the current tag as checked", () => {
+    const tagged: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("1", "alpha-thread", "/work/projA", "blue")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: tagged });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
+    expect(screen.getByRole("menuitemradio", { name: "蓝" }).getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("menuitemradio", { name: "红" }).getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByRole("menuitemradio", { name: "无标签" }).getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("still opens the same menu on long-press in mobile", async () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = renderSidebar({ isMobile: true });
+      const row = container.querySelector<HTMLElement>('[data-thread-row="1"]')!;
+      fireEvent.pointerDown(row, { pointerId: 1, button: 0, clientX: 0, clientY: 0 });
+      act(() => {
+        vi.advanceTimersByTime(LONG_PRESS_MS + 10);
+      });
+      expect(container.querySelector("[data-thread-menu]")).toBeTruthy();
+      // 同一份菜单：标签项也在。
+      expect(screen.getByRole("menuitemradio", { name: "红" })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -1164,5 +1255,27 @@ describe("ThreadSidebar 搜索", () => {
     fireEvent.doubleClick(screen.getByText("alpha-thread"));
     expect(container.querySelector("[data-rename-input]")).not.toBeNull();
     expect(container.querySelectorAll("[data-rename-input]")).toHaveLength(1);
+  });
+});
+
+describe("ThreadSidebar lead entry", () => {
+  it("renders the lead entry above the pinned section, and not twice", () => {
+    const lead: ThreadSummary = { ...thread("lead-1", "组长", "/p"), role: "lead" };
+    const pinned: ThreadSummary = pinnedThread("pin-1", "pinned");
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/p", exists: true, threads: [lead] }],
+      pinned: [pinned],
+    });
+
+    const leadRow = container.querySelector<HTMLElement>("[data-lead-row]")!;
+    expect(leadRow).not.toBeNull();
+    const leadTitle = screen.getByText("组长");
+    const pinnedTitle = screen.getByText("pinned");
+    // 组长条目必须排在 Pinned 分区**之前**：它在列表顶部的固定分区里。
+    expect(
+      leadTitle.compareDocumentPosition(pinnedTitle) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // 组长只出现一次：它由专属条目渲染，不再作为普通分组行重复一遍。
+    expect(container.querySelectorAll("[data-group-row]")).toHaveLength(0);
   });
 });

@@ -27,9 +27,13 @@ export function SuperpowersKanbanColumn({
 }) {
   const needsDecision = columnKey === "needDecision";
   return (
+    // `min-w-0`：flex 项默认 `min-width:auto` 会取内容最小宽度，卡片标题是
+    // `truncate`（nowrap），其 min-content 就是整条标题宽——不解除这一项，列会拒绝
+    // 收缩、把整行撑宽（用户报的「左右过宽」）。窄屏堆叠时给个高度下限，让整行走
+    // 上下滚动而不是把四列压成四段等高的可滚区。
     <section
       aria-label={`看板列 ${COLUMN_LABEL[columnKey]}`}
-      className={`flex min-h-0 flex-1 flex-col rounded border ${
+      className={`flex min-h-0 min-w-0 flex-1 flex-col rounded border max-md:min-h-[16rem] ${
         needsDecision ? "border-red-500/40" : "border-line"
       } bg-surface`}
     >

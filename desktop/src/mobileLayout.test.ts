@@ -188,10 +188,10 @@ describe("phone layout CSS", () => {
     expect(rule).toMatch(/user-select:\s*text/);
   });
 
-  it("turns the phone settings into a full-screen page with a top tab bar", () => {
+  it("turns the phone settings into a full-screen page with a category list", () => {
     // 「设置区域过于小」的根因：弹窗 `w-[70vw]` 在 390pt 上只有 273px，左侧竖栏又是
     // 写死的 `w-40`(160px)，占去 59%，内容面板只剩 111px 且横向溢出滚不到。手机端
-    // 必须整屏（`position: fixed` + `inset: 0`）并让导航横排，内容才拿得到全部宽度。
+    // 必须整屏（`position: fixed` + `inset: 0`），导航改横向**列表**才拿得到全部宽度。
     const shell =
       /\[data-mobile="true"\]\s+\.settings-shell\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
     expect(shell).toMatch(/position:\s*fixed/);
@@ -202,21 +202,24 @@ describe("phone layout CSS", () => {
     expect(shell).toMatch(/max-width:\s*none/);
     expect(shell).toMatch(/height:\s*auto/);
 
-    const nav = /\[data-mobile="true"\]\s+\.settings-nav\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
-    expect(nav).toMatch(/flex-direction:\s*row/);
-    // 竖栏那条右边框要撤掉，改由底边框分栏。
-    expect(nav).toMatch(/border-right:\s*0/);
+    // 分类列表：纵向一列、每行满宽，因此不存在横向溢出。
+    const list =
+      /\[data-mobile="true"\]\s+\.settings-categories\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(list).toMatch(/flex-direction:\s*column/);
+    expect(list).toMatch(/overflow-y:\s*auto/);
 
-    const tab =
-      /\[data-mobile="true"\]\s+\.settings-nav\s*>\s*\[role="tab"\]\s*\{([^}]*)\}/.exec(
+    // 每行 44px 触控下限（Apple HIG）：上下各 12px 内边距 + 行高。
+    const row =
+      /\[data-mobile="true"\]\s+\.settings-categories\s*>\s*\[data-settings-category\]\s*\{([^}]*)\}/.exec(
         css(),
       )?.[1] ?? "";
-    // 每格等宽：320pt 上也有 80px，四字标签不折行。
-    expect(tab).toMatch(/flex:\s*1 1 0/);
-    expect(tab).toMatch(/white-space:\s*nowrap/);
-    // 44px 触控下限（Apple HIG）：上下各 12px 内边距 + 行高。
-    expect(tab).toMatch(/padding-top:\s*12px/);
-    expect(tab).toMatch(/padding-bottom:\s*12px/);
+    expect(row).toMatch(/padding-top:\s*12px/);
+    expect(row).toMatch(/padding-bottom:\s*12px/);
+    expect(row).toMatch(/white-space:\s*nowrap/);
+
+    // 旧横条那套规则必须彻底消失：留着它会在手机端重新挤出横向滚动。
+    expect(css()).not.toMatch(/\[data-mobile="true"\]\s+\.settings-nav\s*\{/);
+    expect(css()).not.toMatch(/\[data-mobile="true"\]\s+\.settings-nav\s*>/);
   });
 
   it("hides the settings backdrop on the phone", () => {
@@ -243,34 +246,29 @@ describe("phone layout CSS", () => {
     expect(shell).toMatch(/padding-bottom:\s*0/);
   });
 
-  it("puts the settings header above the tab bar on the phone", () => {
-    // DOM 顺序是 [nav, (header, panel)]，而手机上要的视觉顺序是 [header, nav, panel]。
-    // 标题栏若排在 Tab 条之后：(1) 观感上「设置」标题跑到 Tab 条下面；(2) 更实际的，
-    // 顶部安全区（刘海）内边距挂在 `.settings-header` 上，那段留白会落到屏幕中部，
-    // Tab 条反而紧贴状态栏被压住。跨嵌套层级要靠 `display: contents` 让包裹层「消失」
-    // 再对子元素用 `order`——真机 Chrome 实测修正前 header.y=0 但渲染在 nav 之后。
+  it("keeps the settings header above the panel on the phone", () => {
+    // 手机端不渲染 nav，`.settings-body { display: contents }` 让 header 与 panel 直接
+    // 升为 shell 的 flex item，DOM 顺序即视觉顺序 [header, panel]——不需要 `order`。
+    // 顶部安全区内边距（刘海）仍挂在 header 上，故它必须排在最前，否则那段留白会落到
+    // 屏幕中部、面板顶到状态栏下面。
     const bodyRule =
       /\[data-mobile="true"\]\s+\.settings-body\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
     expect(bodyRule).toMatch(/display:\s*contents/);
 
-    // 同一选择器会有多条规则块（安全区、order…），必须汇总全部声明再断言；
-    // 只取第一条会漏掉 `order`。
-    const blocks = (selector: string) =>
-      [...css().matchAll(new RegExp(`\\[data-mobile="true"\\]\\s+\\${selector}\\s*\\{([^}]*)\\}`, "g"))]
-        .map((m) => m[1])
-        .join("\n");
-
-    const head = blocks(".settings-header");
-    const nav = blocks(".settings-nav");
-    const panel = blocks(".settings-panel");
-
-    const orderOf = (rule: string) => Number(/order:\s*(\d+)/.exec(rule)?.[1] ?? "0");
-    expect(orderOf(head)).toBe(1);
-    expect(orderOf(nav)).toBe(2);
-    expect(orderOf(panel)).toBe(3);
+    // 同一选择器会有多条规则块（顶部安全区、flex-shrink），必须汇总全部声明再断言；
+    // 只取第一条会漏掉 `flex-shrink`。
+    const head = [
+      ...css().matchAll(/\[data-mobile="true"\]\s+\.settings-header\s*\{([^}]*)\}/g),
+    ]
+      .map((m) => m[1])
+      .join("\n");
     // 升为 flex item 后必须锁住高度，否则会被纵向 flex 压缩。
     expect(head).toMatch(/flex-shrink:\s*0/);
+    // 旧机制必须彻底消失：留着 `order` 只会在没有 nav 的页面上造成误解。
+    expect(css()).not.toMatch(/\[data-mobile="true"\]\s+\.settings-header\s*\{[^}]*order:/);
+    expect(css()).not.toMatch(/\[data-mobile="true"\]\s+\.settings-nav\s*\{/);
   });
+
 
   it("keeps the settings inputs at 16px so iOS cannot auto-zoom on focus", () => {
     // 面板里的文本输入框是 14px（`text-sm`），低于 iOS 自动放大阈值 16px。`lockZoom`

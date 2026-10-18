@@ -262,6 +262,16 @@ pub enum Notification {
     /// 字符串，客户端就地落笔即可，不必再付一次全量 `thread/listAll`。
     #[serde(rename = "thread/titleChanged")]
     TitleChanged { thread_id: String, title: String },
+    /// 该会话的颜色标签已变（`thread/setTag`）。
+    ///
+    /// 与 `thread/titleChanged` 同族：标签是会话元数据，变更后必须让**所有**客户端
+    /// 立即刷新侧栏色点。**直接携带权威值**（`None` = 已清除），客户端就地落笔，
+    /// 不必重拉全量 `thread/listAll`。
+    #[serde(rename = "thread/tagChanged")]
+    TagChanged {
+        thread_id: String,
+        tag: Option<String>,
+    },
     /// 非致命运行期告知（通道回退 / effort 降级），状态栏级一行提示。
     ///
     /// 与 `turn/retry` 同为**内容层**（按 thread 路由）：它描述的是某条会话这一次
@@ -380,6 +390,20 @@ pub enum Notification {
     /// 只由 `ThemeHandle` 的广播触发；客户端收到即把 `data-theme` 换成新值。
     #[serde(rename = "ui/settings/updated")]
     UiSettingsUpdated { theme: String },
+    /// 颜色标签的显示名（颜色 id → 名称）已变。
+    ///
+    /// **全局**帧：标签名是对所有会话生效的宿主级偏好，与任何 thread 上下文无关。
+    /// **携带用户覆盖的权威映射**（可能只含被改的键），客户端与自己的默认名表合并
+    /// 后即可渲染。
+    ///
+    /// 为什么独立成一条而不是挤进 `ui/settings/updated`：后者由主题 watcher 从
+    /// 主题广播通道泵出（`server.rs` 的 `pump_theme_notifications`），语义是「主题
+    /// 变了」；标签名只经 `ui/settings/write` 变更、没有 watcher。塞进去会让该通知
+    /// 时而带 `tag_names` 时而不带（watcher 路径没有它），语义含混。
+    #[serde(rename = "ui/tagNames/updated")]
+    TagNamesUpdated {
+        tag_names: std::collections::BTreeMap<String, String>,
+    },
     /// 模型（`show_git_diff` 工具）请求桌面端聚焦 Git Diff 视图。
     #[serde(rename = "ui/gitDiff/focus", rename_all = "camelCase")]
     UiGitDiffFocus {
@@ -403,6 +427,7 @@ impl Notification {
             | Notification::ReasoningEffortChanged { thread_id, .. }
             | Notification::PreserveThinkingChanged { thread_id, .. }
             | Notification::TitleChanged { thread_id, .. }
+            | Notification::TagChanged { thread_id, .. }
             | Notification::Notice { thread_id, .. }
             | Notification::ReasoningDelta { thread_id, .. }
             | Notification::ItemStarted { thread_id, .. }
@@ -419,6 +444,7 @@ impl Notification {
             Notification::UiGitDiffFocus { thread_id, .. } => thread_id.as_deref(),
             Notification::ToolCallApprovalResolved { .. }
             | Notification::UiSettingsUpdated { .. }
+            | Notification::TagNamesUpdated { .. }
             | Notification::Error { .. } => None,
         }
     }
@@ -452,8 +478,10 @@ impl Notification {
             | Notification::ReasoningEffortChanged { .. }
             | Notification::PreserveThinkingChanged { .. }
             | Notification::TitleChanged { .. }
+            | Notification::TagChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
+            | Notification::TagNamesUpdated { .. }
             | Notification::Error { .. }
             | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,
             _ => Delivery::Content,
@@ -878,6 +906,54 @@ mod tests {
         assert_eq!(v["params"]["title"], "修复登录报错");
         assert_eq!(n.delivery(), Delivery::List);
         assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// 标签变更通知的 wire 形状：`thread/tagChanged`，参数 snake_case。
+    ///
+    /// 与 `titleChanged` 同族：会话元数据、列表层恒推、按 thread 路由、直接携带
+    /// 权威值（`null` = 已清除）。窗口外会话的标签变更同样要送达，否则手机端
+    /// 「概率性不同步」。
+    #[test]
+    fn tag_changed_notification_carries_method_and_tag() {
+        let n = Notification::TagChanged {
+            thread_id: "t1".into(),
+            tag: Some("red".into()),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/tagChanged");
+        assert_eq!(v["params"]["thread_id"], "t1");
+        assert_eq!(v["params"]["tag"], "red");
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    #[test]
+    fn tag_changed_notification_serializes_a_cleared_tag_as_null() {
+        let n = Notification::TagChanged {
+            thread_id: "t1".into(),
+            tag: None,
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        // 必须**存在且为 null**，而不是整个键被省略：前者客户端读 `tag === null`
+        // 即知「清除」，后者只能靠 `undefined`，两者在跨端解码里并不等价。
+        assert!(
+            v["params"].as_object().unwrap().contains_key("tag"),
+            "tag 键必须存在: {v}"
+        );
+        assert!(v["params"]["tag"].is_null(), "清除必须是显式 null: {v}");
+    }
+
+    /// 标签显示名变更通知：**全局**帧，不属于任何 thread。
+    #[test]
+    fn tag_names_updated_notification_is_global() {
+        let mut names = std::collections::BTreeMap::new();
+        names.insert("red".to_string(), "紧急".to_string());
+        let n = Notification::TagNamesUpdated { tag_names: names };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "ui/tagNames/updated");
+        assert_eq!(v["params"]["tag_names"]["red"], "紧急");
+        assert_eq!(n.delivery(), Delivery::Global);
+        assert_eq!(n.thread_key(), None);
     }
 
     /// 运行期告知的 wire 形状:`thread/notice`,参数 snake_case,带 level。
