@@ -475,9 +475,28 @@ mod child_log_tests {
 
         // 生产代码（去注释、去测试模块）里不得出现任何插件名。注释可以讲历史，
         // 测试可以举例子，跑起来的代码不行。
-        let production: String = include_str!("supervisor.rs")
+        //
+        // 边界取**测试模块**（`#[cfg(test)] mod tests`），而不是「第一个
+        // `#[cfg(test)]` 属性」：本文件另有 `#[cfg(test)]` 门控的**生产辅助函数**
+        // （`ChildLog::is_active`、`Supervisor::backoff_for_test`），按第一个属性
+        // 截断会把 `impl Supervisor` 整段漏在扫描之外——那正是最需要扫的代码。
+        let region = include_str!("supervisor.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the test module header must exist");
+        // 扫描范围必须真的覆盖生产大块：边界逻辑若再次提前截断，这两条要响，
+        // 而不是让下面的断言空过。
+        assert!(
+            region.contains("impl Supervisor") && region.contains("fn ensure_running"),
+            "the scan must span the Supervisor implementation, not stop early"
+        );
+        // 反向也要成立：测试模块不得混进来（否则测试里的插件名会让它假红）。
+        assert!(
+            !region.contains("mod child_log_tests"),
+            "the scan must exclude the crate's own test modules"
+        );
+        let production: String = region
             .lines()
-            .take_while(|line| !line.trim_start().starts_with("#[cfg(test)]"))
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
