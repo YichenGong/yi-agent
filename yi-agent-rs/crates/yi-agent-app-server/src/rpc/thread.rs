@@ -527,6 +527,9 @@ pub(crate) async fn handle(
                 extra_roots,
                 state.lead_inbox,
                 state.lead_replies,
+                // resume 路径：meta 已在盘上，起点取已落盘的 `anchor_sha`。
+                // 旧会话没有该字段时是 `None`——那表示「无起点」，按方案 1 不回填。
+                loaded.meta.anchor_sha.clone(),
                 built,
             );
             let BuiltAgent {
@@ -1805,7 +1808,7 @@ pub(crate) async fn handle(
                     Some(command) => {
                         crate::git_diff::command_frame(repo, command, None, None).await
                     }
-                    None => crate::git_diff::structured_frame(repo, anchor.as_deref()),
+                    None => crate::git_diff::structured_frame(repo, None, anchor.as_deref()),
                 };
                 // 写回用 CAS，不是无条件覆盖：「读缓存命令」与「写回新帧」之间隔了
                 // 一次 await（最多 `VIEW_TIMEOUT`）。期间别的写入者（另一次 refresh、

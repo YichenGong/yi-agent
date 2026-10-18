@@ -797,6 +797,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         &crate::lead::LeadInbox::new(),
         &crate::lead::LeadReplies::new(),
+        // 这些测试直接调 attach_delegation，不起会话，故无起点。
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
     let second = attach_delegation(
@@ -812,6 +814,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         &crate::lead::LeadInbox::new(),
         &crate::lead::LeadReplies::new(),
+        // 这些测试直接调 attach_delegation，不起会话，故无起点。
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
 
@@ -2354,6 +2358,141 @@ async fn a_later_frame_written_during_a_refresh_is_not_clobbered() {
     assert_eq!(
         v["result"]["stdout"], "LATER\n",
         "the refresh must not clobber a newer frame: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// provider：第一轮调 `show_git_diff`（默认参数），第二轮收尾。
+///
+/// 用它驱动真实 `turn/start` 里的一次工具调用——只有走完整条装配，
+/// 「工具拿到的会话起点」才被真正验证。
+struct GitDiffToolProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for GitDiffToolProvider {
+    async fn call_stream(
+        &self,
+        _req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::provider::{ProviderEvent as E, StopReason};
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let events = if n == 0 {
+            vec![
+                E::ToolUseStart {
+                    id: "g1".into(),
+                    name: "show_git_diff".into(),
+                },
+                E::ToolUseDelta {
+                    id: "g1".into(),
+                    partial_json: "{}".into(),
+                },
+                E::ToolUseEnd { id: "g1".into() },
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]
+        } else {
+            vec![
+                E::TextDelta("done".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]
+        };
+        Ok(futures::stream::iter(events).boxed())
+    }
+}
+
+fn build_git_diff_tool_agent(
+    session: Option<yi_agent_core::Session>,
+    cwd: &std::path::Path,
+    mode: crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent> {
+    build_test_agent_with_provider(
+        Arc::new(GitDiffToolProvider {
+            calls: AtomicUsize::new(0),
+        }),
+        session,
+        cwd,
+        mode,
+    )
+}
+
+/// 新建会话时，`show_git_diff` 的默认基准必须落在**本会话的起点**上。
+///
+/// 只有走真实 `thread/start` 才验得出：起点在 `start_thread_core` 里取（那时
+/// meta 尚未落盘），若 `attach_delegation` 反过来去读盘拿锚点，读到的永远是
+/// `None`——工具默认基准就落到默认分支候选链（`local-default`），与它自己
+/// `description()` 的承诺不符，也和 refresh 路径（用真锚点）分叉。断言
+/// `baseKind == "session"` 正是钉住「先取起点、再交给工具」这个次序。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_session_anchors_the_default_diff_to_its_starting_commit() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    // 一次提交之后再改文件：会话起点应是那次提交，而不是「仅工作区」。
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "add a"]] {
+        assert!(
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let head = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_git_diff_tool_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"show me"}}]}}}}"#
+    ))
+    .await;
+    // 等这一轮收尾：工具跑完，帧已由 watcher 落表。帧的落表是另一条任务，
+    // 故按 id 收敛 + 轮询，不假设「一旦 turn/completed 就一定已落表」。
+    loop {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            break;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    let frame = loop {
+        if let Some(frame) = h.view_frames.lock().await.get(&tid).cloned() {
+            break frame;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the tool must have filed a frame for this session"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        frame.base_kind, "session",
+        "a fresh session's default base must be its starting commit, not a candidate branch: {frame:?}"
+    );
+    assert_eq!(
+        frame.base.as_deref(),
+        Some(head.as_str()),
+        "the base must be the sha captured when the session started: {frame:?}"
     );
     h.shutdown().await;
 }

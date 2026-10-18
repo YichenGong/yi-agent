@@ -366,18 +366,16 @@ pub(crate) fn attach_delegation(
     // 阻塞式 `ask_lead` 的回信登记表。与 `lead_inbox` 必须成对传递:
     // 只传信箱而不传登记表,`await` 侧登记的名字将永远无人回填。
     lead_replies: &crate::lead::LeadReplies,
+    // 本会话的起点 sha(默认 diff 基准)。**由调用方给出,不在本函数里读盘**:
+    // `thread/start` 走到这里时 meta 尚未落盘(`start_thread_core` 先 attach 再
+    // `create`),在这里读只会永远读到 `None`,工具就落不到会话起点上。调用方
+    // 才知道自己在哪个分支——新建取 `session_anchor(cwd)`,resume 取已落盘 meta
+    // 的 `anchor_sha`(旧会话没有该字段时传 `None`,表示「无起点」,不回填)。
+    anchor_sha: Option<String>,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
     thread_cfg.workdir = PathBuf::from(cwd);
-    // 本会话的起点 sha：从落盘的 thread meta 读（与 `rpc/thread.rs` 读锚点同一
-    // 口径）。读不到就是 `None`——那表示「无起点」，工具会落到默认分支候选链，
-    // 而不是假装有起点。
-    let anchor_sha = crate::thread_store::ThreadStore::new(Path::new(cwd))
-        .load(thread_id)
-        .ok()
-        .flatten()
-        .and_then(|l| l.meta.anchor_sha);
     let binding = match attach_cwd_runtime(runtimes, runtime_dir, &thread_cfg, models_path) {
         Ok(binding) => binding,
         Err(cause) => {
@@ -5567,6 +5565,13 @@ pub(crate) async fn start_thread_core(
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
+    // 会话起点（默认 diff 基准）。**必须在 `attach_delegation` 之前算好并传进去**：
+    // 该函数要把起点交给 `show_git_diff`，而 meta 要到本函数后半段才 `create`；
+    // 若让 `attach_delegation` 自己读盘，新建路径永远读到 `None`，工具的默认基准
+    // 就落不到「本次会话起点」，只剩未提交改动——与它自己的描述不符。
+    // 取值口径不变：仍是「建 meta 时取 HEAD」（此后 HEAD 随会话推进）。
+    let anchor_sha = crate::git_diff::session_anchor(std::path::Path::new(cwd));
+
     // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
     // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(Path::new(cwd));
@@ -5585,6 +5590,8 @@ pub(crate) async fn start_thread_core(
         extra_roots.clone(),
         lead_inbox,
         lead_replies,
+        // 新建路径：起点就是刚刚取的 HEAD。
+        anchor_sha.clone(),
         built,
     );
     let BuiltAgent {
@@ -5605,8 +5612,8 @@ pub(crate) async fn start_thread_core(
     let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
 
     let now = crate::thread_store::now_millis();
-    // 会话起点：默认 diff 基准。必须在建 meta 时取，之后 HEAD 会随会话推进。
-    let anchor_sha = crate::git_diff::session_anchor(std::path::Path::new(cwd));
+    // 会话起点已在上面算好并交给 `attach_delegation`（同一个值也落进 meta）：
+    // 两处必须是同一个 sha，否则「meta 里的起点」与「工具用的起点」会分叉。
     let meta = crate::thread_store::ThreadMeta {
         thread_id: thread_id.clone(),
         cwd: cwd.to_string(),
@@ -8007,7 +8014,6 @@ mod git_diff_watcher_tests {
         git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
             thread_id: Some("thread-1".into()),
             command: Some("git log --oneline -1".into()),
-            base: None,
             note: Some("here".into()),
             frame: Some(Box::new(frame("git log --oneline -1"))),
         });
@@ -8042,14 +8048,12 @@ mod git_diff_watcher_tests {
         git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
             thread_id: None,
             command: None,
-            base: None,
             note: None,
             frame: Some(Box::new(frame("git log"))),
         });
         git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
             thread_id: Some("thread-2".into()),
             command: None,
-            base: None,
             note: None,
             frame: None,
         });

@@ -23,8 +23,6 @@ pub struct GitDiffFocus {
     pub thread_id: Option<String>,
     /// 模型请求的命令（`None` = 结构化默认）。
     pub command: Option<String>,
-    /// 模型请求的基准（`None` = 默认）。仅用于展示语义，回执不照抄入参。
-    pub base: Option<String>,
     /// 面向用户的说明，随通知带过去。
     pub note: Option<String>,
     /// 已算好的帧。工具算一次、watcher 写进会话槽，避免在两处各算一遍
@@ -162,7 +160,6 @@ impl Tool for ShowGitDiffTool {
             self.handle.broadcast(GitDiffFocus {
                 thread_id: self.thread_id.clone(),
                 command: Some(command.clone()),
-                base: None,
                 note,
                 frame: Some(Box::new(frame.clone())),
             });
@@ -200,14 +197,23 @@ impl Tool for ShowGitDiffTool {
         }
         let frame = crate::git_diff::structured_frame(
             &self.repo,
-            explicit.as_deref().or(self.anchor.as_deref()),
+            explicit.as_deref(),
+            self.anchor.as_deref(),
         );
+        // `valid_rev` 接受范围表达式（`A..B` 两侧各自可解），但 `resolve_base` 只用
+        // 单个 `ref_exists` 复核显式基准——范围在那里解不开，会静默落到候选链。
+        // 若不说，模型要的是 `A..B`，拿到的是分支 diff，就违反了「校验失败明确报错」。
+        if explicit.is_some() && frame.base_kind != "explicit" {
+            let rev = explicit.as_deref().unwrap_or_default();
+            return ToolResult::error(format!(
+                "`{rev}` is a revision range, not a comparison base; pass a single ref"
+            ));
+        }
         // 基准不进通知：它已由帧（`thread/view/read` 读回）承载，看板只需知道
         // 「聚焦哪个会话」与说什么话。
         self.handle.broadcast(GitDiffFocus {
             thread_id: self.thread_id.clone(),
             command: None,
-            base: explicit.clone(),
             note,
             frame: Some(Box::new(frame.clone())),
         });
@@ -302,6 +308,52 @@ mod tests {
         assert!(
             text_of(&result).contains("trunk"),
             "the receipt still names the base: {:?}",
+            text_of(&result)
+        );
+        // 显式基准必须标成 `explicit`，**不得**被算成「本次会话起点」：帧的
+        // `base_kind` 是回执措辞与前端标签的来源，标错就是 D3 那种不实之词。
+        assert_eq!(
+            focus.frame.as_ref().unwrap().base_kind,
+            "explicit",
+            "an explicit base must not be labelled as the session start"
+        );
+    }
+
+    /// 范围表达式（`A..B`）不是比较基准：`valid_rev` 两侧可解会让它过第一道门，
+    /// 但 `resolve_base` 用单个 `ref_exists` 复核，范围在那里解不开。若不拦，
+    /// 模型要的是 `A..B`、拿到的是某个分支 diff —— 又成了「校验失败却静默回退」。
+    #[tokio::test]
+    async fn a_revision_range_is_rejected_as_a_base() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path());
+        // 两个都能解的可达名字，让 `valid_rev` 放行，从而测到第二道门。
+        for args in [vec!["branch", "other"]] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let tool = ShowGitDiffTool::new(
+            GitDiffHandle::new(),
+            Some("thread-1".into()),
+            dir.path().to_path_buf(),
+            None,
+        );
+        let result = tool
+            .call(serde_json::json!({ "base": "trunk..other" }))
+            .await;
+        assert!(
+            result.is_error,
+            "a range must be rejected, not silently substituted: {:?}",
+            text_of(&result)
+        );
+        assert!(
+            text_of(&result).contains("trunk..other"),
+            "the receipt must name the rejected rev: {:?}",
             text_of(&result)
         );
     }

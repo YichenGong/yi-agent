@@ -101,9 +101,13 @@ pub fn classify(stdout: &str) -> &'static str {
     "text"
 }
 
-/// 结构化默认帧：不跑模型命令，直接算会话锚点 diff。
-pub fn structured_frame(repo: &Path, anchor: Option<&str>) -> ViewFrame {
-    let d = thread_diff(repo, None, anchor);
+/// 结构化帧：不跑模型命令，直接按 `explicit`/`anchor` 算 diff。
+///
+/// `explicit` 与 `anchor` **必须分开传**：两者都走 `resolve_base`，但得到的
+/// `base_kind` 不同（`explicit` vs `session`）。若把显式基准塞进 `anchor` 槽，
+/// 帧会把「模型指定的基准」标成「本次会话起点」——回执就成了 D3 那种不实之词。
+pub fn structured_frame(repo: &Path, explicit: Option<&str>, anchor: Option<&str>) -> ViewFrame {
+    let d = thread_diff(repo, explicit, anchor);
     ViewFrame {
         command: None,
         as_kind: "diff".to_string(),
@@ -1069,7 +1073,7 @@ mod tests {
     fn structured_frame_reports_the_session_anchor() {
         let dir = repo();
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
-        let f = structured_frame(dir.path(), Some("trunk"));
+        let f = structured_frame(dir.path(), None, Some("trunk"));
         assert_eq!(f.command, None, "structured default has no command");
         assert_eq!(f.as_kind, "diff");
         assert_eq!(f.base_kind, "session");

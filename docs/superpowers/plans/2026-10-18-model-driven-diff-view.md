@@ -475,7 +475,8 @@ git commit -m "feat(app-server): run view commands in a read-only sandbox with a
 - Produces:
   - `pub struct ViewFrame`（字段见下，`serde(rename_all = "camelCase")`）
   - `pub fn classify(stdout: &str) -> &'static str`（内容 → `diff`/`log`/`text`）
-  - `pub fn structured_frame(repo: &Path, anchor: Option<&str>) -> ViewFrame`
+  - `pub fn structured_frame(repo: &Path, explicit: Option<&str>, anchor: Option<&str>) -> ViewFrame`
+    （`explicit` 与 `anchor` 必须分开传：塞进同一个槽会把显式基准标成 `session`）
   - RPC `thread/view/read { threadId, refresh? }`
   - 通知 `ui/gitDiff/focus { threadId, note }`（**去掉 `base`**）
 
@@ -496,7 +497,7 @@ git commit -m "feat(app-server): run view commands in a read-only sandbox with a
     fn structured_frame_reports_the_session_anchor() {
         let dir = repo();
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
-        let f = structured_frame(dir.path(), Some("trunk"));
+        let f = structured_frame(dir.path(), None, Some("trunk"));
         assert_eq!(f.command, None, "structured default has no command");
         assert_eq!(f.as_kind, "diff");
         assert_eq!(f.base_kind, "session");
@@ -620,9 +621,13 @@ pub fn classify(stdout: &str) -> &'static str {
     "text"
 }
 
-/// 结构化默认帧：不跑模型命令，直接算会话锚点 diff。
-pub fn structured_frame(repo: &Path, anchor: Option<&str>) -> ViewFrame {
-    let d = thread_diff(repo, None, anchor);
+/// 结构化帧：不跑模型命令，直接按 `explicit`/`anchor` 算 diff。
+///
+/// `explicit` 与 `anchor` **必须分开传**：两者都走 `resolve_base`，但得到的
+/// `base_kind` 不同（`explicit` vs `session`）。若把显式基准塞进 `anchor` 槽，
+/// 帧会把「模型指定的基准」标成「本次会话起点」——回执就成了 D3 那种不实之词。
+pub fn structured_frame(repo: &Path, explicit: Option<&str>, anchor: Option<&str>) -> ViewFrame {
+    let d = thread_diff(repo, explicit, anchor);
     ViewFrame {
         command: None,
         as_kind: "diff".to_string(),
@@ -732,7 +737,7 @@ pub async fn command_frame(
                                 .and_then(|l| l.meta.anchor_sha);
                             let next = match frames.get(&thread_id).and_then(|f| f.command.clone()) {
                                 Some(cmd) => crate::git_diff::command_frame(repo, &cmd, None, None).await,
-                                None => crate::git_diff::structured_frame(repo, anchor.as_deref()),
+                                None => crate::git_diff::structured_frame(repo, None, anchor.as_deref()),
                             };
                             frames.insert(thread_id.clone(), next);
                         }
@@ -968,7 +973,7 @@ pub struct ShowGitDiffTool {
             }
         }
         let frame =
-            crate::git_diff::structured_frame(&self.repo, explicit.as_deref().or(self.anchor.as_deref()));
+            crate::git_diff::structured_frame(&self.repo, explicit.as_deref(), self.anchor.as_deref());
         self.handle.broadcast(GitDiffFocus {
             thread_id: self.thread_id.clone(),
             command: None,
