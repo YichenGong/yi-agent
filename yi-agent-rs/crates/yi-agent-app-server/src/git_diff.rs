@@ -363,11 +363,17 @@ fn parse_numstat(raw: &str) -> Vec<FileStat> {
     out
 }
 
+/// git 自己的二进制判据：前 8000 字节里出现 NUL。与 `files` 里进清单的
+/// `binary` 标志同源，故「清单说它是什么」与「点开后是什么」不会分叉。
+fn looks_binary(bytes: &[u8]) -> bool {
+    bytes.iter().take(8000).any(|&b| b == 0)
+}
+
 fn is_binary(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return false;
     };
-    bytes.iter().take(8000).any(|&b| b == 0)
+    looks_binary(&bytes)
 }
 
 /// 未跟踪文件合成一份「整文件新增」的 unified diff（避免触碰用户索引）。
@@ -383,16 +389,17 @@ fn untracked_diff(root: &Path, paths: &[String]) -> String {
         out.push_str(&format!(
             "diff --git a/{path} b/{path}\nnew file mode 100644\n"
         ));
-        // 无法逐行渲染的文件（含 NUL，或不是合法 UTF-8）按 git 自己的二进制约定
-        // 给一行说明。此前这里是 `read_to_string` 失败就 `continue`，结果是面板
-        // 把该文件列为 `A`/binary、点开却是空白——D1 的另一半，同一类静默空白。
-        let text = match String::from_utf8(bytes) {
-            Ok(t) if !t.as_bytes().iter().take(8000).any(|&b| b == 0) => t,
-            _ => {
-                out.push_str(&format!("Binary files /dev/null and b/{path} differ\n"));
-                continue;
-            }
-        };
+        // 二进制按 git 自己的约定给一行说明。此前这里是 `read_to_string` 失败就
+        // `continue`，结果是面板把该文件列为 `A`、点开却是空白——D1 的另一半。
+        // 判据与 `is_binary` 共用 `looks_binary`，否则会出现「清单标 binary、
+        // 正文却当文本渲染」这类自相矛盾。
+        if looks_binary(&bytes) {
+            out.push_str(&format!("Binary files /dev/null and b/{path} differ\n"));
+            continue;
+        }
+        // 非 UTF-8 但不是二进制（无 NUL）的罕见文件用有损转换渲染，宁可有乱码
+        // 也不留空白。git 自身在这种情况下也是按文本处理的。
+        let text = String::from_utf8_lossy(&bytes);
         out.push_str(&format!("--- /dev/null\n+++ b/{path}\n"));
         let lines: Vec<&str> = text.lines().collect();
         out.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
@@ -559,11 +566,14 @@ pub fn thread_diff(repo: &Path, explicit_base: Option<&str>, anchor: Option<&str
 
 /// 单个提交的 diff。
 ///
-/// `--first-parent`：对**合并提交**这一条是必需的——`git show --format= <merge>`
-/// 按设计输出为空（实测 0 字节），面板会是一片空白；`--first-parent` 给出一份
-/// 连贯的「这次合并带进来了什么」。不采用 `-m`：它把两个父提交的 diff 拼接在
-/// 一起（同一改动列两遍），读起来像重复列举。对非合并提交，两者与裸 `show`
-/// 完全等价。
+/// `--first-parent`：对**合并提交**是必需的。`git show --format= <merge>` 给出的是
+/// 合并提交本身的 diff——干净合并输出为空，有冲突解决的合并则输出**组合 diff**
+/// （`diff --cc` / `@@@`）。两者在面板上都等于空白：前者的文本为空，后者没有任何
+/// `diff --git` 头（前端的 `parseUnifiedDiff` 也不认 `diff --cc`）。`--first-parent`
+/// 给出一份连贯的「这次合并带进来了什么」，且正是解析器认得的普通格式。
+/// 不采用 `-m`：它把两个父提交的 diff 拼接在一起（同一改动列两遍，实测头数是
+/// `--first-parent` 的三倍），读起来像重复列举。对非合并提交，`--first-parent`
+/// 与裸 `show` 输出逐字节相同（实测）。
 pub fn commit_diff(repo: &Path, sha: &str) -> (String, bool) {
     let raw = git_ok(
         repo,
@@ -1262,5 +1272,38 @@ mod tests {
             diff.contains("bin.dat"),
             "the notice must name the file: {diff:?}"
         );
+    }
+
+    /// 「清单说它是二进制」与「点开后的正文」必须一致，且都不能是空白。
+    ///
+    /// 判据若两处不同（`is_binary` 只看 NUL，正文却把非法 UTF-8 也当二进制），
+    /// 就会出现清单标 text、正文说 binary 这类自相矛盾。这里同时钉住两种输入的
+    /// 归属：含 NUL 的走二进制说明；非法 UTF-8 但无 NUL 的按文本有损渲染。
+    #[test]
+    fn the_file_list_and_the_body_agree_on_binary_ness() {
+        let dir = repo();
+        // 含 NUL：清单标 binary，正文给二进制说明。
+        std::fs::write(dir.path().join("nul.dat"), b"a\0b").unwrap();
+        // 非法 UTF-8、无 NUL：清单不标 binary，正文按文本有损渲染（不留空白）。
+        std::fs::write(dir.path().join("latin.dat"), b"caf\xe9\n").unwrap();
+
+        for (path, binary) in [("nul.dat", true), ("latin.dat", false)] {
+            let file = files(dir.path(), dir.path(), Some("trunk"))
+                .into_iter()
+                .find(|f| f.path == path)
+                .unwrap_or_else(|| panic!("{path} must be listed"));
+            assert_eq!(file.binary, binary, "list flag for {path}: {file:?}");
+
+            let (diff, _) = file_diff(dir.path(), Some("trunk"), path);
+            assert!(
+                !diff.trim().is_empty(),
+                "{path} must never open onto a blank body: {diff:?}"
+            );
+            assert_eq!(
+                diff.contains("Binary files"),
+                binary,
+                "body agrees with the list flag for {path}: {diff:?}"
+            );
+        }
     }
 }
