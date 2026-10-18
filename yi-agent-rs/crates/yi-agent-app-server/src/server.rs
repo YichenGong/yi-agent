@@ -5342,11 +5342,19 @@ where
                 workdir,
                 title,
                 objective,
+                driver_project,
+                driver_ref,
             } => self
-                // 两个归属值都给 `None`:`driver/next` 的 `launch` 应答按 spec §4.3
-                // 只带 `workdir`/`title`/`objective`,不带任何归属信息。`driver_ref`
-                // 因此恒为 `None`(缺口见 plan 归 G2 收口)。
-                .launch_inner(workdir, title, objective, None, None)
+                // 归属由插件在动作里给出（`driver_project` 项目根 / `driver_ref` 驱动
+                // 方句柄），宿主原样落进 meta。缺字段（旧插件）时为 `None`，退化成
+                // 「未分组」，与改动前一致——绝不让缺字段把整条动作判废。
+                .launch_inner(
+                    workdir,
+                    title,
+                    objective,
+                    driver_project.as_deref(),
+                    driver_ref.as_deref(),
+                )
                 .await
                 .inspect_err(|error| {
                     // 插件只把失败记成 `{ok:false, error}`,自己不留日志;不在这里说清
@@ -5388,10 +5396,11 @@ where
     /// 会话与 RPC 起的 thread 完全同型:同一内核、同一 driver、同一侧栏视角。唯一的
     /// 不同是 mode(驱动会话跑 Yolo)与「不发任何 RPC 帧」。
     ///
-    /// `driver_project` / `driver_ref` 是落进 meta 的两个通用归属值。通用驱动动作
-    /// (`driver/next`)按 spec §4.3 只带 `workdir`/`title`/`objective`,不带任何归属
-    /// 信息,故 `launch` 两个都传 `None`:宿主不认识卡片,`driver_ref` 便无从填起
-    /// (缺口见 plan 归 G2 收口)。
+    /// `driver_project` / `driver_ref` 是落进 meta 的两个通用归属值,由插件在
+    /// `driver/next` 的 `launch` 动作里给出(spec §5.5:唯一同时知道项目根与驱动
+    /// 方句柄的是插件)。宿主只做透传:`driver_project` 让 `thread/listAll` 把会话折
+    /// 进项目组,`driver_ref` 让桌面侧栏把它归入「驱动会话」小节。旧插件不发时为
+    /// `None`,退化成未分组(与改动前逐字一致)。
     async fn launch_inner(
         &mut self,
         workdir: &str,
@@ -8225,6 +8234,7 @@ mod session_driver_tests {
                 &workdir.to_string_lossy(),
                 "driven · card-1",
                 "Implement the plan for card-1",
+                (None, None),
             )
             .await
             .expect("the launch must succeed for a healthy factory")
@@ -8275,6 +8285,7 @@ mod session_driver_tests {
                 &workdir.to_string_lossy(),
                 "driven · card-1",
                 "Implement the plan for card-1",
+                (None, None),
             )
             .await
             .expect_err("a factory failure must surface, not be swallowed");
@@ -8426,11 +8437,15 @@ mod session_driver_tests {
     }
 
     /// 构造一个**新建会话**动作,并走真正的 `SessionLauncher` 入口。
+    ///
+    /// `origin` 是插件的归属值（`driver_project`, `driver_ref`）；传 `None` 复刻旧
+    /// 插件（不发这两个键）的兼容路径，传 `Some` 复刻新版插件。
     async fn launch_via_driver<F>(
         launcher: &mut ServeLauncher<'_, F>,
         workdir: &str,
         title: &str,
         objective: &str,
+        origin: (Option<&str>, Option<&str>),
     ) -> anyhow::Result<String>
     where
         F: Fn(
@@ -8447,6 +8462,8 @@ mod session_driver_tests {
                     workdir: workdir.to_string(),
                     title: title.to_string(),
                     objective: objective.to_string(),
+                    driver_project: origin.0.map(str::to_string),
+                    driver_ref: origin.1.map(str::to_string),
                 },
             },
         )
@@ -8481,6 +8498,7 @@ mod session_driver_tests {
                 &workdir,
                 "看板 · card-1",
                 "do the first thing",
+                (None, None),
             )
             .await
             .expect("a healthy factory must start the session")
@@ -8645,9 +8663,15 @@ mod session_driver_tests {
         // ① 起一个会话,它的首轮**一直在跑**(slow provider)。
         let thread_id = {
             let mut launcher = host.launcher(&build_slow_agent);
-            launch_via_driver(&mut launcher, &workdir, "看板 · card-1", "run forever")
-                .await
-                .expect("a healthy factory must start the session")
+            launch_via_driver(
+                &mut launcher,
+                &workdir,
+                "看板 · card-1",
+                "run forever",
+                (None, None),
+            )
+            .await
+            .expect("a healthy factory must start the session")
         };
         let live_turn = host
             .threads
@@ -8739,13 +8763,13 @@ mod session_driver_tests {
         );
     }
 
-    /// `driver/next` 的 `launch` 应答只带 `workdir`/`title`/`objective`(spec §4.3),
-    /// 宿主**不认识 card id**——所以走通用动作起的会话,`driver_ref` 必须是 `None`
-    /// (计划已把该填充缺口记给 G2),而 `driver_project` 同样为 `None`(发现环按
-    /// 项目遍历,却仍不填这两个归属值——同一缺口,见 plan 归 G2)。这里同时钉住
-    /// 「会话仍然可见、首轮仍然投递」,即缺这两个归属值不影响起会话本身。
+    /// `driver/next` 的 `launch` 动作带上插件的归属值（`driver_project` 项目根 /
+    /// `driver_ref` 驱动方句柄，spec §5.5），宿主必须把它们**原样落进 meta**：
+    /// 少 `driver_project`，`thread/listAll` 就把它折不出项目组；少 `driver_ref`，
+    /// 桌面侧栏就不收它——这正是「被驱动会话在侧栏不可见」的根因。这里同时钉住
+    /// 「会话仍然可见、首轮仍然投递」。
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_launch_action_records_no_driver_origin_and_still_starts_a_turn() {
+    async fn a_launch_action_records_the_driver_origin_and_still_starts_a_turn() {
         let mut host = Host::new();
         let workdir = host.workdir.clone();
         let workdir = workdir.to_string_lossy().to_string();
@@ -8756,6 +8780,7 @@ mod session_driver_tests {
                 &workdir,
                 "看板 · card-1",
                 "do the first thing",
+                (Some("/proj"), Some("card-1")),
             )
             .await
             .expect("a healthy factory must start the session")
@@ -8766,10 +8791,15 @@ mod session_driver_tests {
             .unwrap();
         assert_eq!(metas.len(), 1);
         assert_eq!(
-            metas[0].driver_ref, None,
-            "the host does not know a card id any more (spec §2 goal 1 / §4.3)"
+            metas[0].driver_ref.as_deref(),
+            Some("card-1"),
+            "归属句柄必须落进 meta，否则桌面侧栏收不到这条会话"
         );
-        assert_eq!(metas[0].driver_project, None);
+        assert_eq!(
+            metas[0].driver_project.as_deref(),
+            Some("/proj"),
+            "归属项目根必须落进 meta，否则 listAll 折不进项目组"
+        );
         assert_eq!(
             metas[0].title.as_deref(),
             Some("看板 · card-1"),

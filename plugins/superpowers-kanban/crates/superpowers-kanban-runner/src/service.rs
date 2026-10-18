@@ -70,12 +70,22 @@ pub enum MergeFinish {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverAction {
     /// 新建会话：宿主在 `workdir` 里起会话，首轮投递 `objective`。
+    ///
+    /// `driver_project` / `driver_ref` 是会话的**归属**，随动作交给宿主落进 meta。
+    /// 必须填：卡片会话的 cwd 是插件自建的 worktree（不是用户项目），宿主
+    /// `thread/listAll` 只有拿 `driver_project` 才能把它折进项目组，而该 worktree
+    /// 自己的目录组会被抑制——两头落空，会话在侧栏**彻底不可见**。宿主不认识看板，
+    /// 唯一同时知道「项目根」与「卡片 id」的就是插件（spec §5.5）。
     Launch {
         action_id: String,
         card_id: String,
         workdir: PathBuf,
         title: String,
         objective: String,
+        /// 会话所属项目根（宿主据此归组）。
+        driver_project: String,
+        /// 驱动方给的不透明句柄（这里是卡片 id；桌面据此归入「看板会话」小节）。
+        driver_ref: String,
     },
     /// 向已有会话追加一轮（合并轮），不新建会话。
     Append {
@@ -96,6 +106,8 @@ impl DriverAction {
                 workdir,
                 title,
                 objective,
+                driver_project,
+                driver_ref,
                 ..
             } => json!({
                 "action_id": action_id,
@@ -103,6 +115,8 @@ impl DriverAction {
                 "workdir": workdir.to_string_lossy(),
                 "title": title,
                 "objective": objective,
+                "driver_project": driver_project,
+                "driver_ref": driver_ref,
             }),
             DriverAction::Append {
                 action_id,
@@ -437,6 +451,11 @@ impl BoardService {
                                 );
                                 DriverAction::Launch {
                                     action_id,
+                                    driver_project: self
+                                        .project_root
+                                        .to_string_lossy()
+                                        .into_owned(),
+                                    driver_ref: card.id.0.clone(),
                                     card_id: card.id.0.clone(),
                                     workdir,
                                     title: String::new(),
@@ -470,6 +489,8 @@ impl BoardService {
                 self.remember_pending(&action_id, &card_id, PendingKind::Launch);
                 Ok(Some(DriverAction::Launch {
                     action_id,
+                    driver_project: self.project_root.to_string_lossy().into_owned(),
+                    driver_ref: claim.card_id.clone(),
                     card_id: claim.card_id,
                     workdir: claim.workdir,
                     title: claim.title,
@@ -2268,6 +2289,31 @@ mod tests {
         assert_eq!(state_of(&service, "card-2"), "queued", "一拍只走一张");
     }
 
+    /// launch 必须带上**归属**（会话所属项目根 + 卡片句柄），否则被驱动会话在
+    /// 侧栏不可见：宿主 `thread/listAll` 只在 `driver_project` 有值时才把会话折进
+    /// 项目组，而卡片 worktree 自己的目录组会被抑制——两头落空就彻底消失，桌面
+    /// 也就拿不到这条会话。宿主不认识看板，唯一同时知道「项目根」与「卡片 id」的
+    /// 就是插件（spec §5.5「由插件侧在 driver/next 的动作里填值」）。
+    #[test]
+    fn a_launch_action_carries_the_project_root_and_the_card_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+
+        let action = service.driver_step(&[], &[]).unwrap().expect("a launch");
+        let value = action.to_json();
+        assert_eq!(value["kind"], "launch");
+        assert_eq!(
+            value["driver_project"],
+            project.to_string_lossy().as_ref(),
+            "launch 必须带上项目根，否则宿主折不进项目组、侧栏看不到这条会话"
+        );
+        assert_eq!(
+            value["driver_ref"], "card-1",
+            "launch 必须带上卡片句柄，桌面才会把它归进「看板会话」小节"
+        );
+    }
+
     /// 名额（复用 `next_launch` 的租约记账）：名额占满时不再交出 launch。
     #[test]
     fn driver_step_stops_launching_at_the_slot_limit() {
@@ -2859,6 +2905,8 @@ mod tests {
             workdir: PathBuf::from("/w/card-1"),
             title: "看板 · a.spec".to_string(),
             objective: "objective".to_string(),
+            driver_project: "/proj".to_string(),
+            driver_ref: "card-1".to_string(),
         };
         let value = launch.to_json();
         assert_eq!(value["action_id"], "act-1");
@@ -2940,6 +2988,8 @@ mod tests {
             workdir: PathBuf::from("/w/card-1"),
             title: "看板 · a.spec".to_string(),
             objective: "do the card".to_string(),
+            driver_project: "/proj".to_string(),
+            driver_ref: "card-1".to_string(),
         };
         assert_eq!(
             launch.to_json(),

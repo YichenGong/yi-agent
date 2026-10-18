@@ -16449,6 +16449,22 @@ async fn list_all_never_treats_a_card_worktree_as_a_project_with_a_lead() {
         "the phantom lead is not a project's session and must not be listed: {all}"
     );
 
+    // 修复的正面判据:卡片会话**必须**折进它所属的项目组(靠 meta 里的
+    // `driver_project`)。少了这一步,它自己的 worktree 组又被上面抑制——两头
+    // 落空,会话在侧栏彻底不可见(这正是用户报的现象)。
+    let project_group = groups
+        .iter()
+        .find(|g| g["workspace"] == p.as_str())
+        .unwrap_or_else(|| panic!("the project root must be a group: {all}"));
+    assert!(
+        project_group["threads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["thread_id"] == serde_json::json!("t-card")),
+        "the card session must fold into its project group, not vanish: {all}"
+    );
+
     h.shutdown().await;
 }
 
