@@ -42,6 +42,18 @@ pub struct TurnPrompt {
     /// `prompt` 是加了清单(送给模型)的那一份;落盘/checkpoint 必须用这一份,
     /// 否则回放里的用户气泡会带上模型才该看到的清单。
     pub display_text: String,
+    /// 本轮是替哪条阻塞式 `ask_lead` 跑的(`LeadEnvelope::request_id`)。
+    ///
+    /// `Some` = 本轮由一次阻塞投递产生,收尾时**只**用它回填那一个等待方;
+    /// `None` = 普通用户 turn、看板卡、单向投递等,与任何等待方无关,收尾时谁都
+    /// 不回填(详见 `settle_pending_lead_replies`)。
+    ///
+    /// 为什么要随 turn 携带而非「按组长 thread 记一个队列、收尾时取队首」:组长可能
+    /// 同时被多个会话阻塞等待,而用户也可能自己往组长会话里打字。只按 thread 记账时,
+    /// 用户那一轮会把队首的 request_id 顶掉——等待方于是收到一条与它的问题无关的
+    /// 回复,比拿不到回复更难排查。把身份钉在产生这一轮的投递上,谁问的谁收,
+    /// 两种错配都不再可能。
+    pub lead_request_id: Option<String>,
 }
 
 /// 一条中途追加的用户消息,投递给该 thread 的 driver。

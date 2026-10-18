@@ -72,6 +72,13 @@ enum TurnEvent {
         /// `None` = 本轮没有可回填的助手文本(失败轮、纯工具轮、写帧失败而中断
         /// 的轮)。这类完成事件**不得**被当成一条空回复回填。
         reply: Option<String>,
+        /// 本轮是替哪条阻塞式 `ask_lead` 跑的(见 [`TurnPrompt::lead_request_id`])。
+        ///
+        /// 收尾时**只**用它回填那一个等待方,故两个会话同时阻塞在同一个组长上时,
+        /// 各自只收到**自己那一轮**的文本(见 [`settle_pending_lead_replies`])。
+        /// `None` = 这一轮与任何等待方无关(普通用户 turn、看板卡、单向投递、失败
+        /// 轮等),收尾时谁都不回填。
+        lead_request_id: Option<String>,
     },
 }
 
@@ -5767,7 +5774,7 @@ where
                 }
             }
             ev = turn_rx.recv() => {
-                if let Some(TurnEvent::Finished { thread_id, turn_id, reply }) = ev {
+                if let Some(TurnEvent::Finished { thread_id, turn_id, reply, lead_request_id }) = ev {
                     if let Some(s) = threads.get_mut(&thread_id) {
                         // 仅当完成的正是当前活跃 turn 时才清除,避免迟到的
                         // 完成事件误清掉已开始的下一个 turn。
@@ -5775,10 +5782,12 @@ where
                             s.active_turn_id = None;
                         }
                     }
-                    // 组长那轮跑完 = 阻塞等待方的收口时刻。回填的文本是**这一轮**
-                    // 的助手文本(由 driver 随事件带上来,与落盘/标题同一条口径)。
+                    // 组长那轮跑完 = 阻塞等待方的收口时刻。只回填**这一轮**替其跑
+                    // 的那个 request_id(身份随事件带上来);这一轮若与任何等待方
+                    // 无关(用户直接对组长说话),则谁都不回填。
                     settle_pending_lead_replies(
                         &thread_id,
+                        lead_request_id,
                         reply,
                         &mut pending_lead_replies,
                         &lead_replies,
@@ -5866,9 +5875,11 @@ where
                     // 回滚上面那条预付的记账:这条投递没有产生任何一轮,等待方
                     // 已从工具那里拿到错误,再留一条待回填只会在下一轮投递时
                     // 张冠李戴(把下一次的回复回填给这一次的 request_id)。
-                    if envelope.request_id.is_some() {
+                    // 摘的是**这一条** id(而非队尾):与收口路径同一口径,不依赖
+                    // 「刚 push 的一定在末尾」这条隐含前提。
+                    if let Some(request_id) = &envelope.request_id {
                         if let Some(ids) = pending_lead_replies.get_mut(&lead_thread_id) {
-                            ids.pop();
+                            ids.retain(|id| id != request_id);
                             if ids.is_empty() {
                                 pending_lead_replies.remove(&lead_thread_id);
                             }
@@ -6276,41 +6287,65 @@ fn parse_client_decision(result: Option<&serde_json::Value>) -> Decision {
 /// `reply` 是本轮的助手回复文本(见 [`lead_reply_text`])。收尾路径传实际取出的
 /// 文本;**中途放弃**的路径(run 失败、写帧失败、客户端断连)传 `None`:那些轮
 /// 没有「组长说了什么」可言,伪造一条空回复会让等待方以为得到了答复。
-fn finished_event(thread_id: &str, turn_id: &str, reply: Option<String>) -> TurnEvent {
+///
+/// `lead_request_id` 是本轮替哪条阻塞式 `ask_lead` 跑的。**只有**由阻塞投递产生的
+/// 那一轮带得出来(见 `deliver_to_lead`),其余构造点一律 `None`:它们产出的轮不能
+/// 回填任何等待方。
+fn finished_event(
+    thread_id: &str,
+    turn_id: &str,
+    reply: Option<String>,
+    lead_request_id: Option<String>,
+) -> TurnEvent {
     TurnEvent::Finished {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         reply,
+        lead_request_id,
     }
 }
 
-/// 把某个 thread 的「待回填队列」收口:取出它的全部 `request_id`,用 `reply` 回填。
+/// 把某个 thread 上**这一轮**负责的那个等待方收口。
 ///
-/// 抽成自由函数而非内联:主循环的 `turn_rx` 分支之外,**还有一个**消费者——
-/// [`interrupt_and_wait_for_persist`]。它为了等落盘会把 `turn_rx` 里的
-/// `Finished` 取走(包括别的 thread 的),那些事件若不经这里收口,对应的
-/// `request_id` 就会一直挂在表上,等下一个 turn 结束时被张冠李戴地回填——等待方
-/// 于是收到一段属于别人那一轮的文本,比超时更难排查。两个消费者共用一份逻辑,
-/// 正是为了不让这条不变量只在一处成立。
+/// 只回填事件自己携带的那一个 `request_id`,并从待回填队列里**只**摘掉它(队列空
+/// 了就把该 lead 的条目整个 drop)。
 ///
-/// `reply` 为 `None`(失败轮/纯工具轮/中途放弃)时只清队列、不回填:伪造一条空
-/// 回复会让等待方以为组长答复了「空话」。
+/// 为什么不能整条队列一次取走:`pending_lead_replies` 是一对多的(同一个组长可能
+/// 同时被多个会话阻塞等待),而组长**一轮只回答一个提问**。整条取走就意味着把那
+/// 一轮的文本同时回填给排队的每一个人——第二个提问人收到的是第一个的答案。用户
+/// 直接往组长会话里打字也会产生一轮(`lead_request_id == None`),那种轮若参与
+/// 回填,就是把用户的对话内容当成对某个等待方的答复。两种错配都在此排除:
+/// **只**认本轮携带的身份,`None` 则谁都不回填。
+///
+/// 不变量:因本轮而产生的那个 id 已在投递**之前**入账(见主循环的 `lead_rx` 分支),
+/// 故这里必然能摘到它;摘不到说明本轮没有任何等待方(或是用户轮),回填是 no-op。
+///
+/// `reply` 为 `None`(失败轮/纯工具轮/中途放弃)时只摘账、不回填:伪造一条空回复
+/// 会让等待方以为组长答复了「空话」。
 fn settle_pending_lead_replies(
     thread_id: &str,
+    lead_request_id: Option<String>,
     reply: Option<String>,
     pending: &mut HashMap<String, Vec<String>>,
     replies: &crate::lead::LeadReplies,
 ) {
-    // 队列整体取走而非只弹一个:本轮之后该组长不会再为这些 id 跑第二轮,留着
-    // 它们只会在下一次投递时张冠李戴。故 `reply` 为 `None` 时也必须取走。
-    if let Some(request_ids) = pending.remove(thread_id) {
-        if let Some(reply) = reply {
-            for request_id in request_ids {
-                // `false` = 等待方已超时(drop 了接收端)或从未登记:不是错误,
-                // 无需日志噪音。
-                let _ = replies.resolve(&request_id, reply.clone());
-            }
+    // 本轮不替任何等待方跑(用户 turn / 看板卡 / 单向投递):队列**保持原样**,
+    // 排队的人继续等它自己那一轮。
+    let Some(request_id) = lead_request_id else {
+        return;
+    };
+    if let Some(ids) = pending.get_mut(thread_id) {
+        // 只摘这一个。该 id 一定在队列里(投递前入账),`retain` 比按位找更抗
+        // 重复投递:即便同一 id 意外入账两次也一并摘干净。
+        ids.retain(|id| id != &request_id);
+        if ids.is_empty() {
+            // 队列空了就把条目整个 drop,免得这张表随会话数无限长胖。
+            pending.remove(thread_id);
         }
+    }
+    if let Some(reply) = reply {
+        // `false` = 等待方已超时(drop 了接收端)或从未登记:不是错误,无需日志噪音。
+        let _ = replies.resolve(&request_id, reply);
     }
 }
 
@@ -6342,6 +6377,7 @@ async fn interrupt_and_wait_for_persist(
             thread_id: done_id,
             turn_id: done_turn,
             reply,
+            lead_request_id,
         }) = turn_rx.recv().await
         {
             if let Some(s) = threads.get_mut(&done_id) {
@@ -6350,7 +6386,14 @@ async fn interrupt_and_wait_for_persist(
                 }
             }
             // 这枚完成事件不会回到主循环了,它的回填机会就在此处(见函数说明)。
-            settle_pending_lead_replies(&done_id, reply, pending_lead_replies, lead_replies);
+            // 同样只认事件自己携带的身份:别的 thread 的那一轮与这里的等待方无关。
+            settle_pending_lead_replies(
+                &done_id,
+                lead_request_id,
+                reply,
+                pending_lead_replies,
+                lead_replies,
+            );
             if done_id == thread_id && done_turn == tid {
                 break;
             }
@@ -6418,6 +6461,9 @@ async fn persist_and_finish_turn(
     user_prompt: Option<&str>,
     user_attachments: &[crate::protocol::Attachment],
     user_image_refs: &[crate::protocol::ImageRef],
+    // 本轮若替某条阻塞式 `ask_lead` 跑,这里是它的 request_id;随 Finished 上报,
+    // 主循环据此只回填那一个等待方(见 `settle_pending_lead_replies`)。
+    lead_request_id: Option<String>,
     agent: &yi_agent_core::Agent,
     completed_items: Vec<crate::protocol::Item>,
     last_usage: Option<crate::thread_store::TurnUsage>,
@@ -6476,9 +6522,15 @@ async fn persist_and_finish_turn(
     let _ = update_status(hub, status, thread_id, ThreadStatus::Idle).await;
     if let Some(turn_id) = turn_id {
         // 回填给等待方的回复:与标题材料同一份文本,故这里复用它而不是再抽一次
-        // (extraction 只有一条口径,见 `lead_reply_text`)。
+        // (extraction 只有一条口径,见 `lead_reply_text`)。身份与文本一起上报:
+        // 收口方只认这一个 request_id(见 `settle_pending_lead_replies`)。
         let _ = turn_tx
-            .send(finished_event(thread_id, turn_id, assistant_text.clone()))
+            .send(finished_event(
+                thread_id,
+                turn_id,
+                assistant_text.clone(),
+                lead_request_id,
+            ))
             .await;
     }
 
@@ -6606,6 +6658,7 @@ async fn apply_session_command(
                 None,
                 &[],
                 &[],
+                None,
                 &agent,
                 Vec::new(),
                 None,
@@ -6647,6 +6700,7 @@ async fn apply_session_command(
                 None,
                 &[],
                 &[],
+                None,
                 &agent,
                 Vec::new(),
                 None,
@@ -6773,6 +6827,7 @@ async fn apply_session_command(
                 None,
                 &[],
                 &[],
+                None,
                 &agent,
                 Vec::new(),
                 None,
@@ -6860,6 +6915,7 @@ async fn run_thread_driver(
             image_blocks,
             image_refs,
             display_text,
+            lead_request_id,
         }) = turn_prompt
         else {
             break; // prompt_rx 关闭:driver 收尾退出
@@ -6954,7 +7010,7 @@ async fn run_thread_driver(
                 // 中途失败没有「组长说了什么」可言:回复传 `None`,绝不伪造一条
                 // 空回复去糊弄等待方(那比拿不到回复更难排查)。
                 let _ = turn_tx
-                    .send(finished_event(&thread_id, &turn_id, None))
+                    .send(finished_event(&thread_id, &turn_id, None, None))
                     .await;
                 // run() 失败即本轮结束:thread 立刻回 Idle(失败是事件不是状态)。
                 let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
@@ -7016,7 +7072,7 @@ async fn run_thread_driver(
                                     tracing::error!("failed to serialize reverse request: {e}");
                                     pending.lock().await.remove(&perm_id);
                                     // 序列化失败即放弃本轮:无回复可回填。
-                                    let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None)).await;
+                                    let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None, None)).await;
                                     // 本轮就此结束：turn-start 写的 checkpoint 必须清掉，
                                     // 否则盘上留一条已结束 turn 的残留，重启后 resume 会
                                     // 把最后这一轮误标为 interrupted。与其它 clear 站点同款：
@@ -7046,7 +7102,7 @@ async fn run_thread_driver(
                                 // 发起客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);
                                 // 客户端断连即放弃本轮:无回复可回填。
-                                let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None)).await;
+                                let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None, None)).await;
                                 // 本轮就此结束（客户端断连，不是崩溃）：清掉 checkpoint，
                                 // 否则重启后会把这一轮误报为 interrupted。与其它站点同款。
                                 if let Err(e) = store.clear_partial(&thread_id) {
@@ -7160,7 +7216,7 @@ async fn run_thread_driver(
                                         // 客户端可能已断开;先上报 Finished,
                                         // 避免 active_turn_id 永久卡住。
                                         // 写帧失败即放弃本轮:无回复可回填。
-                                        let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None)).await;
+                                        let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None, None)).await;
                                         // 本轮就此结束（写失败，不是崩溃）：清掉 checkpoint，
                                         // 否则重启后会把这一轮误报为 interrupted。与其它站点同款。
                                         if let Err(e) = store.clear_partial(&thread_id) {
@@ -7298,11 +7354,14 @@ async fn run_thread_driver(
             let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
             // 本轮的助手文本仍待回填给可能的等待方:命令路径结束的也是一个正常跑完的
             // turn,与下面的常规收尾同一口径(`completed_items` 此刻尚未被 take)。
+            // 身份同样随事件上报:若本轮是替某条阻塞式 `ask_lead` 跑的,等待方收的
+            // 仍是**这一轮**的答案(命令不改变谁在等哪一轮)。
             let _ = turn_tx
                 .send(finished_event(
                     &thread_id,
                     &turn_id,
                     lead_reply_text(&completed_items),
+                    lead_request_id,
                 ))
                 .await;
             // 这条路径不走常规收尾；本轮 checkpoint 同样必须清掉，否则会在盘上
@@ -7320,6 +7379,7 @@ async fn run_thread_driver(
             Some(&user_prompt),
             &user_attachments,
             &user_image_refs,
+            lead_request_id,
             &agent,
             std::mem::take(&mut completed_items),
             last_usage.take(),
@@ -7731,6 +7791,7 @@ where
                 image_blocks: prepared.image_blocks,
                 image_refs: prepared.image_refs,
                 display_text: prepared.display_text,
+                lead_request_id: None,
             })
             .await
             .is_err()
@@ -7794,6 +7855,9 @@ where
                     image_blocks: Vec::new(),
                     image_refs: Vec::new(),
                     display_text: text,
+                    // 唯一会带身份的构造点:本轮就是替这条阻塞投递跑的,收尾时
+                    // 只回填这一个 request_id(见 `settle_pending_lead_replies`)。
+                    lead_request_id: envelope.request_id.clone(),
                 })
                 .await;
             return match send {
@@ -7894,6 +7958,7 @@ where
                 image_blocks: prepared.image_blocks,
                 image_refs: prepared.image_refs,
                 display_text: prepared.display_text,
+                lead_request_id: envelope.request_id.clone(),
             })
             .await
             .is_err()
@@ -8561,6 +8626,7 @@ async fn start_turn_core(
             image_blocks: prepared.image_blocks,
             image_refs: prepared.image_refs,
             display_text: prepared.display_text,
+            lead_request_id: None,
         })
         .await
         .is_err()
@@ -9757,6 +9823,7 @@ mod card_scheduling_tests {
                         thread_id: id,
                         turn_id,
                         reply: _,
+                        lead_request_id: _,
                     })) => {
                         if let Some(session) = self.threads.get_mut(&id) {
                             if session.active_turn_id.as_deref() == Some(turn_id.as_str()) {
@@ -15336,6 +15403,7 @@ pub(crate) mod tests {
                 image_blocks: Vec::new(),
                 image_refs: Vec::new(),
                 display_text: "hi".into(),
+                lead_request_id: None,
             })
             .await
             .unwrap();
@@ -15461,6 +15529,7 @@ pub(crate) mod tests {
                 image_blocks: Vec::new(),
                 image_refs: Vec::new(),
                 display_text: "hi".into(),
+                lead_request_id: None,
             })
             .await
             .unwrap();
@@ -16175,6 +16244,7 @@ pub(crate) mod tests {
             None,
             &[],
             &[],
+            None,
             &agent,
             Vec::new(),
             None,
@@ -16269,6 +16339,7 @@ pub(crate) mod tests {
             None,
             &[],
             &[],
+            None,
             &agent,
             Vec::new(),
             None,
@@ -16490,6 +16561,7 @@ pub(crate) mod tests {
                     image_blocks: Vec::new(),
                     image_refs: Vec::new(),
                     display_text: "hi".into(),
+                    lead_request_id: None,
                 })
                 .await
                 .unwrap();
@@ -17016,6 +17088,7 @@ pub(crate) mod tests {
                 image_blocks: Vec::new(),
                 image_refs: Vec::new(),
                 display_text: "hi".into(),
+                lead_request_id: None,
             })
             .await
             .unwrap();
@@ -18185,6 +18258,267 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 从工具结果里取出文本块(本文件既有的断言都这么取,抽出来只为复用)。
+    fn tool_text(result: &yi_agent_core::ToolResult) -> String {
+        result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                yi_agent_core::ContentBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<String>()
+    }
+
+    /// 迟到的投递之后停留多久(见 [`LeadEchoProvider`])。
+    ///
+    /// 主循环此刻是空闲的 `select` 循环,吃下这条投递只需微秒级;这个窗口只是把
+    /// 「机器忙」从复现条件里排除掉,不承担任何断言强度。
+    const LATE_ASK_WINDOW: Duration = Duration::from_millis(300);
+
+    /// 组长那轮的 provider:回显本轮最后一条用户文本,于是**每一轮的回复天然可
+    /// 辨识**(回复里带着"这一轮在回答谁"的记号)。这是下面两个用例能区分"A 的
+    /// 回复"与"B 的回复"的前提——`MockProvider` 的文本恒为 "hi",两个提问人收到
+    /// 谁的回信都一样,根本钉不住"第二个拿到了第一个的回复"。
+    ///
+    /// 首次对话调用(标题请求不计)时额外做一件事:把一个**阻塞式 `ask_lead`**
+    /// 扔进这一轮的窗口里,再停留 [`LATE_ASK_WINDOW`]。这是复刻"同一组长已经有
+    /// 一轮在跑,另一个会话才阻塞进来"的唯一可靠窗口:投递发生在组长那轮**收尾
+    /// 之前**,而主循环此刻唯一的就绪分支就是这条投递(`turn_rx` 还没有任何事件),
+    /// 故这条 `request_id` 必定与那一轮同时挂在同一组长的待回填队列上。
+    struct LeadEchoProvider {
+        /// 对话调用计数(标题请求不计),让上面那件事只发生一次。
+        conversation_calls: AtomicUsize,
+        /// 首次调用时投递的"迟到提问人"。用例在 harness 建好之后才填进来(它要用
+        /// harness 的共享信箱与登记表),故用 `Mutex` 而非构造期注入。
+        late_asker: std::sync::Mutex<Option<Arc<crate::lead::AskLeadTool>>>,
+        /// 迟到提问人收到的文本。
+        late_reply: Arc<tokio::sync::Mutex<Option<String>>>,
+    }
+
+    impl LeadEchoProvider {
+        fn new(late_reply: Arc<tokio::sync::Mutex<Option<String>>>) -> Self {
+            Self {
+                conversation_calls: AtomicUsize::new(0),
+                late_asker: std::sync::Mutex::new(None),
+                late_reply,
+            }
+        }
+
+        fn set_late_asker(&self, tool: Arc<crate::lead::AskLeadTool>) {
+            *self.late_asker.lock().unwrap_or_else(|p| p.into_inner()) = Some(tool);
+        }
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for LeadEchoProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            use yi_agent_core::message::{ContentBlock, Role};
+
+            if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+                return Ok(Box::pin(futures::stream::iter(vec![
+                    yi_agent_core::provider::ProviderEvent::TextDelta("t".into()),
+                    yi_agent_core::provider::ProviderEvent::Stop {
+                        reason: yi_agent_core::provider::StopReason::EndTurn,
+                    },
+                ])));
+            }
+            if self.conversation_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let late = self
+                    .late_asker
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if let Some(tool) = late {
+                    let slot = Arc::clone(&self.late_reply);
+                    tokio::spawn(async move {
+                        use yi_agent_core::Tool as _;
+                        let result = tool
+                            .call(serde_json::json!({
+                                "message": "要你裁决 A",
+                                "blocking": true,
+                            }))
+                            .await;
+                        *slot.lock().await = Some(tool_text(&result));
+                    });
+                    // 等主循环把这条迟到投递叠进**本轮**组长的待回填队列。
+                    tokio::time::sleep(LATE_ASK_WINDOW).await;
+                }
+            }
+            let text = req
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .and_then(|m| {
+                    m.content.iter().find_map(|block| match block {
+                        ContentBlock::Text(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                })
+                .unwrap_or_default();
+            let events = vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta(text),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// 等迟到提问人的回信落进槽位(失败信息直指"谁没收到回复",而不是一句超时)。
+    async fn await_reply_slot(slot: &Arc<tokio::sync::Mutex<Option<String>>>, who: &str) -> String {
+        let deadline = std::time::Instant::now() + EVENT_WAIT;
+        loop {
+            if let Some(text) = slot.lock().await.clone() {
+                return text;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{who} never received a reply"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 用回显 provider 建一个 harness,并返回 (harness, workdir 持有者, 迟到回信槽位)。
+    ///
+    /// 与 [`isolated_harness`] 的差别只有 provider:后者是 `MockProvider`(文本恒为
+    /// "hi"),无法区分两个提问人收到的回信。
+    async fn echo_lead_harness() -> (
+        Harness,
+        tempfile::TempDir,
+        Arc<LeadEchoProvider>,
+        Arc<tokio::sync::Mutex<Option<String>>>,
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let late_reply = Arc::new(tokio::sync::Mutex::new(None));
+        let provider = Arc::new(LeadEchoProvider::new(Arc::clone(&late_reply)));
+        let factory_provider: Arc<dyn yi_agent_core::Provider> = provider.clone();
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(
+            cfg,
+            move |session, cwd, mode| {
+                build_test_agent_with_provider(Arc::clone(&factory_provider), session, cwd, mode)
+            },
+            PERMISSION_TIMEOUT,
+        );
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h, 1).await;
+        (h, dir, provider, late_reply)
+    }
+
+    /// 建一个指向该 harness 共享信箱/登记表的阻塞式提问人工具。
+    fn ask_lead_tool(h: &Harness, workdir: &Path, from: &str) -> Arc<crate::lead::AskLeadTool> {
+        Arc::new(
+            crate::lead::AskLeadTool::new(
+                h.lead_inbox.clone(),
+                crate::thread_store::ThreadStore::new(workdir).project_key(),
+                from.to_string(),
+            )
+            .with_replies(h.lead_replies.clone(), crate::lead::ASK_LEAD_TIMEOUT),
+        )
+    }
+
+    /// **同一个组长被两个会话同时阻塞等待时,第二个提问人不得收到第一个的回复。**
+    ///
+    /// 复刻:提问人 A 先阻塞,于是组长跑起第一轮;A 那一轮的 provider 在收尾**之前**
+    /// 把提问人 B 也投了进来——组长的待回填队列此刻是 `[A, B]`。那一轮收尾时只该用
+    /// **这一轮**的文本回填 A;B 必须等它自己那一轮,而不是拿到 A 的答案。
+    ///
+    /// 修复前:`settle_pending_lead_replies` 把整条队列一次取走,两个 id 都用 A 那轮
+    /// 的文本回填,B 于是收到 A 的答案(下面的 `assert_ne` / `!contains` 会失败)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_asker_on_the_same_lead_gets_its_own_reply() {
+        use yi_agent_core::Tool as _;
+
+        let (mut h, dir, provider, late_reply) = echo_lead_harness().await;
+        // 与真实路径一致:侧栏点过组长会话(否则投递时才懒建 meta,不影响本用例)。
+        let lead = rpc(&mut h, 2, "thread/lead", json!({})).await;
+        assert!(lead.get("error").is_none(), "{lead}");
+
+        provider.set_late_asker(ask_lead_tool(&h, dir.path(), "thread-asker-B"));
+
+        // 提问人 A 先阻塞:组长因此跑起第一轮;A 那一轮的 provider 会在收尾前把 B
+        // 也投进来,于是两个 request_id 挂在同一个组长的队列上。
+        let asker_a = ask_lead_tool(&h, dir.path(), "thread-asker-A");
+        let first = tokio::spawn({
+            let tool = Arc::clone(&asker_a);
+            async move {
+                tool.call(serde_json::json!({
+                    "message": "要你裁决 A",
+                    "blocking": true,
+                }))
+                .await
+            }
+        });
+        let a_text = tool_text(
+            &tokio::time::timeout(EVENT_WAIT, first)
+                .await
+                .expect("the first asker must be answered by the lead turn, not left hanging")
+                .expect("the first asker's task must not panic"),
+        );
+        let b_text = await_reply_slot(&late_reply, "the second asker").await;
+
+        assert!(
+            a_text.contains("thread-asker-A"),
+            "the first asker must receive the reply of its own turn: {a_text}"
+        );
+        assert!(
+            b_text.contains("thread-asker-B"),
+            "the second asker must receive the reply of its own turn: {b_text}"
+        );
+        assert_ne!(
+            a_text, b_text,
+            "two askers queued on one lead must receive distinct replies"
+        );
+        assert!(
+            !b_text.contains("thread-asker-A"),
+            "the second asker must NOT receive the first asker's reply: {b_text}"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// **一轮不携带 `lead_request_id` 的组长 turn 不得回填任何等待方。**
+    ///
+    /// 复刻:用户单向投递给组长(与 `ask_lead` 的 `blocking: false` 同款,没有
+    /// `request_id`),这一轮的 provider 在收尾前把提问人 A 也投了进来。用户那一轮
+    /// 收尾时不能把自己的文本塞给正在等回信的 A——A 只能等**它自己**那一轮。
+    ///
+    /// 修复前:整条队列被那一轮取走,A 收到用户的话(下面的断言会失败)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lead_turn_without_a_request_id_answers_nobody() {
+        const USER_TEXT: &str = "用户直接问组长";
+
+        let (h, dir, provider, late_reply) = echo_lead_harness().await;
+        provider.set_late_asker(ask_lead_tool(&h, dir.path(), "thread-asker-A"));
+
+        // 用户单向说话:这一轮不含任何 `lead_request_id`。
+        Harness::deliver_lead_message_for_test(&h, dir.path(), "thread-sender-U", USER_TEXT);
+
+        let a_text = await_reply_slot(&late_reply, "the waiting asker").await;
+        assert!(
+            a_text.contains("thread-asker-A"),
+            "the waiting asker must be answered by its own turn: {a_text}"
+        );
+        assert!(
+            !a_text.contains(USER_TEXT),
+            "a lead turn carrying no request_id must not answer a waiting asker: {a_text}"
+        );
+
+        h.shutdown().await;
+    }
+
     fn recording_agent_factory(
         seen: Arc<std::sync::Mutex<Vec<usize>>>,
     ) -> impl Fn(
@@ -18743,6 +19077,7 @@ pub(crate) mod tests {
                 image_blocks: Vec::new(),
                 image_refs: Vec::new(),
                 display_text: "hi".into(),
+                lead_request_id: None,
             })
             .await
             .unwrap();
