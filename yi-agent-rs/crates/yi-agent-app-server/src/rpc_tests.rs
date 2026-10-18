@@ -2290,6 +2290,67 @@ async fn thread_view_read_refresh_reruns_a_command_frame() {
     h.shutdown().await;
 }
 
+/// refresh 重算期间若有更晚的写入者落帧，**不得**被这次 refresh 覆盖回去。
+///
+/// 窗口确实存在：「读缓存命令」与「写回新帧」之间隔了一次 await（重跑命令，
+/// 上限 `VIEW_TIMEOUT`）。老实现无条件覆盖，于是「刚请求的命令」会被一个更晚的
+/// 命令盖掉，面板显示的内容与回执不符——正是 D3 要杜绝的误导。
+///
+/// 用一条会睡 2 秒的命令把窗口撑开，使本测试确定可复现：先让 refresh 读到这条
+/// 慢命令并开始重跑，随后注入一条「更晚的」命令帧。老实现会在慢命令跑完后把
+/// 它盖回去（断言失败）；CAS 实现则让位，返回更晚的那帧。
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_frame_written_during_a_refresh_is_not_clobbered() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    let frame = |command: Option<&str>, stdout: &str| crate::git_diff::ViewFrame {
+        command: command.map(str::to_string),
+        as_kind: "text".to_string(),
+        exit_code: Some(0),
+        stdout: stdout.to_string(),
+        stderr: String::new(),
+        truncated: false,
+        timed_out: false,
+        note: None,
+        base: None,
+        base_kind: String::new(),
+    };
+    {
+        // 播下一条「慢命令」帧：refresh 会读到它、并真的去重跑它。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(tid.clone(), frame(Some("sleep 2"), ""));
+    }
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":13,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    // 给主循环留出「读快照 + 进入重跑」的时间，此时它正卡在 `sleep 2` 上。
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    {
+        // 更晚的写入者（真实场景是另一次 refresh，或 Task 4 的 watcher 写帧）。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(tid.clone(), frame(Some("git log --oneline"), "LATER\n"));
+    }
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(13)) {
+        v = h.read_value().await;
+    }
+    assert_eq!(
+        v["result"]["command"], "git log --oneline",
+        "a later frame must win over the stale refresh: {v}"
+    );
+    assert_eq!(
+        v["result"]["stdout"], "LATER\n",
+        "the refresh must not clobber a newer frame: {v}"
+    );
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn thread_view_read_rejects_unknown_thread() {
     let mut h = Harness::new();

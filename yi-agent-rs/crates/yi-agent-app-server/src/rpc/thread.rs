@@ -1794,26 +1794,33 @@ pub(crate) async fn handle(
                     .and_then(|l| l.meta.anchor_sha);
                 // 分两次短暂持锁，**不**把 guard 跨过 `command_frame` 的 await：
                 // `serve()` 跑在 `tokio::spawn` 里，guard 过 await 会让整个
-                // future 非 `Send`，直接编译不过。代价是「读缓存命令」与「写回
-                // 新帧」之间有一个窗口，两次并发 refresh 可能各跑一遍命令——
-                // 两者结果同源（同一条命令、同一个仓库），后写者胜即可。
+                // future 非 `Send`，直接编译不过。
                 let command = state
                     .view_frames
                     .lock()
                     .await
                     .get(&thread_id)
                     .and_then(|f| f.command.clone());
-                let next = match command {
+                let next = match command.as_deref() {
                     Some(command) => {
-                        crate::git_diff::command_frame(repo, &command, None, None).await
+                        crate::git_diff::command_frame(repo, command, None, None).await
                     }
                     None => crate::git_diff::structured_frame(repo, anchor.as_deref()),
                 };
-                state
-                    .view_frames
-                    .lock()
-                    .await
-                    .insert(thread_id.clone(), next);
+                // 写回用 CAS，不是无条件覆盖：「读缓存命令」与「写回新帧」之间隔了
+                // 一次 await（最多 `VIEW_TIMEOUT`）。期间别的写入者（另一次 refresh、
+                // 或 Task 4 的 watcher）可能已经写了更新的帧；若无条件覆盖，面板就会
+                // 显示与「刚刚请求的命令」不符的内容——正是 D3 要杜绝的误导。
+                // 判定：槽里的命令仍等于我们读到的快照才写。
+                // 不覆盖的情形：同一命令连续两次 refresh 无法区分，但那是同一条命令，
+                // 无害；命令一旦不同，一定让位给更晚的写入者（下面的 result 会读到它）。
+                let mut frames = state.view_frames.lock().await;
+                let unchanged =
+                    frames.get(&thread_id).and_then(|f| f.command.as_deref()) == command.as_deref();
+                if unchanged {
+                    frames.insert(thread_id.clone(), next);
+                }
+                drop(frames);
             }
             let result = state
                 .view_frames
