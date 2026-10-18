@@ -629,6 +629,7 @@ impl BoardService {
                 "source": card.source_ref,
                 "base": card.base_ref,
                 "origin_card": card.origin_card.as_ref().map(|id| id.0.clone()),
+                "title": card.title,
             })).collect::<Vec<_>>(),
         })
     }
@@ -637,6 +638,13 @@ impl BoardService {
     pub fn next_free_merge_id(&self, source: &str, base: &str) -> String {
         persist::read_board(&self.state_dir)
             .next_free_merge_id(source, base)
+            .0
+    }
+
+    /// 看板上未被占用的预排队卡 id（供 dispatch / CLI 共用）。
+    pub fn next_free_prequeued_id(&self, title: &str, now: DateTime<Local>) -> String {
+        persist::read_board(&self.state_dir)
+            .next_free_prequeued_id(title, now)
             .0
     }
 

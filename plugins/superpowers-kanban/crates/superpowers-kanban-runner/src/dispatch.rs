@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 use superpowers_kanban_core::card_id::card_id_for;
-use superpowers_kanban_core::inbox::{deliver_card, deliver_merge_card};
+use superpowers_kanban_core::inbox::{
+    deliver_card, deliver_merge_card, deliver_prequeued_card, deliver_promote_card,
+};
 use superpowers_kanban_core::layout::project_preferences_path;
 use superpowers_kanban_core::promotion::validate_promotion;
 use superpowers_kanban_core::switch::{SwitchValue, read_layer, resolve, write_layer};
@@ -78,6 +80,40 @@ pub fn dispatch_with_service(
             deliver_card(state_dir, &id, spec, plan)
                 .map_err(|error| format!("could not deliver the card: {error}"))?;
             Ok(json!({ "id": id }))
+        }
+        "enqueue_prequeued" => {
+            let title = params
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "enqueue_prequeued needs a `title`".to_string())?;
+            if title.trim().is_empty() {
+                return Err("enqueue_prequeued needs a non-empty `title`".to_string());
+            }
+            let id = service.next_free_prequeued_id(title, chrono::Local::now());
+            deliver_prequeued_card(state_dir, &id, title)
+                .map_err(|error| format!("could not deliver the card: {error}"))?;
+            Ok(json!({ "id": id }))
+        }
+        "promote" => {
+            let card_id = params
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "promote needs an `id`".to_string())?;
+            let spec = params
+                .get("spec_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "promote needs a `spec_path`".to_string())?;
+            let plan = params
+                .get("plan_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "promote needs a `plan_path`".to_string())?;
+            // 校验先做：拒绝的投递必须一个字节都不落盘。
+            validate_promotion(Path::new(spec), Path::new(plan))
+                .map_err(|error| error.to_string())?;
+            let title = params.get("title").and_then(Value::as_str);
+            deliver_promote_card(state_dir, card_id, spec, plan, title)
+                .map_err(|error| format!("could not deliver the promote: {error}"))?;
+            Ok(json!({ "id": card_id }))
         }
         "enqueue_merge" => {
             let source = params
@@ -593,5 +629,132 @@ mod tests {
             dispatch_with_global(&state, None, "merge_finish", &json!({ "card_id": "nope" }))
                 .unwrap_err();
         assert!(error.contains("unknown card"), "{error}");
+    }
+
+    #[test]
+    fn list_reports_a_prequeued_card_with_its_title() {
+        // 本任务产出的另一半契约：`list()` 的每张卡多一个 `title` 字段，
+        // 且 `PreQueued` 状态如实透出（宿主据它画「预排队」列）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue_prequeued(
+            superpowers_kanban_core::card::CardId::new("idea"),
+            "我的想法".into(),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
+
+        let value = dispatch_with_global(dir.path(), None, "list", &json!({})).unwrap();
+        let card = &value["cards"][0];
+        assert_eq!(card["id"], "idea");
+        assert_eq!(card["state"], "pre_queued");
+        assert_eq!(card["title"], "我的想法");
+    }
+
+    #[test]
+    fn enqueue_prequeued_delivers_a_titled_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "my idea" }),
+        )
+        .unwrap();
+        assert_eq!(value["id"], "my-idea");
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let delivery: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(delivery["kind"], "prequeued");
+        assert_eq!(delivery["title"], "my idea");
+    }
+
+    #[test]
+    fn enqueue_prequeued_gives_non_ascii_titles_distinct_ids() {
+        // 中文标题 slug 成空串：必须回退到时间戳 id，且两张卡不同 id。
+        let dir = tempfile::tempdir().unwrap();
+        let first = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "一个想法" }),
+        )
+        .unwrap();
+        assert!(
+            first["id"].as_str().unwrap().starts_with("prequeued-"),
+            "{first}"
+        );
+        let delivery: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                dir.path()
+                    .join("inbox")
+                    .join(format!("{}.json", first["id"].as_str().unwrap())),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            delivery["title"], "一个想法",
+            "id 是 slug 回退，标题仍是原文"
+        );
+    }
+
+    #[test]
+    fn enqueue_prequeued_rejects_an_empty_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "   " }),
+        )
+        .unwrap_err();
+        assert!(error.contains("title"), "{error}");
+        assert!(!dir.path().join("inbox").exists(), "拒绝的投递不落盘");
+    }
+
+    #[test]
+    fn promote_delivers_without_touching_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("a.spec.md");
+        let plan = dir.path().join("a.plan.md");
+        std::fs::write(&spec, "# spec").unwrap();
+        std::fs::write(&plan, "# plan").unwrap();
+        let value = dispatch_with_global(
+            dir.path(),
+            None,
+            "promote",
+            &json!({
+                "id": "idea",
+                "spec_path": spec.to_str().unwrap(),
+                "plan_path": plan.to_str().unwrap(),
+                "title": "新标题",
+            }),
+        )
+        .unwrap();
+        assert_eq!(value["id"], "idea");
+        let text = std::fs::read_to_string(dir.path().join("inbox/idea.promote.json")).unwrap();
+        let delivery: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(delivery["kind"], "promote");
+        assert_eq!(delivery["title"], "新标题");
+    }
+
+    #[test]
+    fn promote_rejects_a_missing_pair_before_any_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("a.plan.md");
+        std::fs::write(&plan, "# plan").unwrap();
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "promote",
+            &json!({
+                "id": "idea",
+                "spec_path": dir.path().join("missing.spec.md").to_str().unwrap(),
+                "plan_path": plan.to_str().unwrap(),
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("spec file does not exist"), "{error}");
+        assert!(!dir.path().join("inbox").exists(), "拒绝的投递不落盘");
     }
 }
