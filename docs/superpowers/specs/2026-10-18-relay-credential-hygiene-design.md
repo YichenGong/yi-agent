@@ -12,25 +12,11 @@
 ### 1.1 现象
 
 真实部署的域名、VPS 公网 IP、以及**当作凭据使用的 `session_id`** 出现在 **git 跟踪**的
-文档里。全文检索（`git grep`，仅跟踪文件）：
+文档里。具体字面值不在本设计文档复述；复核时从原始提交或本机被忽略的部署记录中确认。
+命中位置为 `docs/bug-list.md:115,117` 与 `docs/relay-deploy.md:573`：两条历史排查记录
+含中继连接 URL 与 session，另一处是 `lsof` 排查命令中的公网地址。
 
-```
-$ git grep -n "fe42addbfed257dcd396e7fcc45e2725"
-docs/bug-list.md:115:  … 用修复后二进制指向真实中继
-   wss://relay.yi-agent.top/connect?session=fe42addbfed257dcd396e7fcc45e2725 …
-
-$ git grep -n "101\.47\.76\.100"
-docs/bug-list.md:115   (同上，同一行)
-docs/bug-list.md:117   (第二轮 relay 缺陷的排查记录)
-docs/relay-deploy.md:573:  lsof … | grep 101.47.76.100
-```
-
-引入点可定位到单个提交：
-
-```
-$ git log --oneline -S"fe42addbfed257dcd396e7fcc45e2725" --all
-c02f1319 fix(relay): 显式安装 rustls provider,修手机连不上中继
-```
+引入点可定位到单个提交：`c02f1319 fix(relay): 显式安装 rustls provider,修手机连不上中继`。
 
 ### 1.2 为什么这是 P0（而不是「文档不整洁」）
 
@@ -77,7 +63,7 @@ deploy/relay/.gitignore:6:.relay-local.md  deploy/relay/.relay-local.md
 > 镜像）。真实值写在 `deploy/relay/.relay-local.md`…
 
 并且 57/87/88/202/203 行**本来就用** `relay.example.com` / `<session_id>` /
-`<你的域名>`。整份文件里只有 **573 行**（`lsof … | grep 101.47.76.100` 的排查命令）
+`<你的域名>`。整份文件里只有 **573 行**（`lsof … | grep <公网地址已脱敏>` 的排查命令）
 漏了真实 IP。
 
 **所以本篇要修的跟踪文件泄露点精确为 2 个文件、3 行**：
@@ -108,11 +94,11 @@ deploy/relay/.gitignore:6:.relay-local.md  deploy/relay/.relay-local.md
 
 统一用**示例值**替换，并在触达处保留"这是示例"的语境：
 
-| 类别 | 现值 | 替换为 |
+| 类别 | 原值（本设计不复述） | 替换为 |
 |---|---|---|
-| 域名 | `relay.yi-agent.top` | `relay.example.com` |
-| VPS IP | `101.47.76.100` | `203.0.113.10`（RFC 5737 文档保留段） |
-| session | `fe42addbfed257dcd396e7fcc45e2725` | `<session_id>` |
+| 域名 | `<redacted-relay-host>` | `relay.example.com` |
+| VPS IP | `<redacted-vps-ip>` | `203.0.113.10`（RFC 5737 文档保留段） |
+| session | `<redacted-session-id>` | `<session_id>` |
 
 `docs/relay-deploy.md` 已有先例：该文件 57/87/88/202/203 行**本来就用**示例值
 （`relay.example.com`、`<session_id>` / `<你的 session id>` / `<id>`、`<域名>`），
@@ -206,26 +192,25 @@ report_hits() { # report_hits <label> <git-grep-output>
   done <<< "$hits"
 }
 
-# 1) 已知泄露值的字面量。轮换后若再出现，即为「有人从历史里捞回来」的回归。
+# 1) 类 session 参数中的 32 位十六进制 token 形状。
 set +e
-hits=$(git grep -n -e 'fe42addbfed257dcd396e7fcc45e2725' -- . 2>/dev/null)
+hits=$(git grep -n -E 'session=[0-9a-f]{32}' -- . 2>/dev/null)
 set -e
 if [ -n "$hits" ]; then
-  report_hits "known leaked session id present:" "$hits"
+  report_hits "session-shaped token present:" "$hits"
 fi
 
 # 2) 真实中继域名（示例域名 relay.example.com 不匹配本条）。
 set +e
-hits=$(git grep -n -E 'relay\.yi-agent\.top' -- . 2>/dev/null)
+hits=$(git grep -n -E 'relay\.[[:alnum:].-]+' -- . 2>/dev/null | grep -vF 'relay.example.com' || true)
 set -e
 if [ -n "$hits" ]; then
   report_hits "real relay hostname in tracked file:" "$hits"
 fi
 
-# 3) 非保留段的公网 IP，且处于 ssh/relay 语境。
-#    RFC 5737 保留段（192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）不匹配。
+# 3) relay 的 lsof grep 或 ssh root 语境中的 IPv4 地址；排除 RFC 5737 文档保留段。
 set +e
-hits=$(git grep -n -E '(101\.47\.76\.100)|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . 2>/dev/null)
+hits=$(git grep -n -E '(lsof[^\n]*grep[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3})|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . 2>/dev/null | grep -vE '(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)' || true)
 set -e
 if [ -n "$hits" ]; then
   report_hits "public IP in relay/ssh context:" "$hits"
@@ -253,9 +238,9 @@ high-entropy 规则）在含大量 base64 测试夹具、`encrypted_content` 样
 用 `mktemp -d` + `git init` 造临时仓库，覆盖 4 个 case：
 
 ```
-case 1: 跟踪文件含真实 session        → 脚本 exit 1
+case 1: 跟踪文件含合成 32 位 session 形状 → 脚本 exit 1
 case 2: 只有示例值（example.com/RFC5737）→ 脚本 exit 0
-case 3: 真实值但在未跟踪文件里（.relay-local.md 形态）→ 脚本 exit 0（不误伤）
+case 3: 敏感字段仅在未跟踪文件里（.relay-local.md 形态）→ 脚本 exit 0（不误伤）
 case 4: 跟踪文件含真实域名             → 脚本 exit 1
 ```
 
@@ -264,9 +249,9 @@ case 4: 跟踪文件含真实域名             → 脚本 exit 1
 
 ## 4. 验收判据
 
-- [ ] `git grep -n "fe42addbfed257dcd396e7fcc45e2725"` 在跟踪文件里**零命中**
-- [ ] `git grep -n "101\.47\.76\.100"` 在跟踪文件里**零命中**
-- [ ] `git grep -n "relay\.yi-agent\.top"` 在跟踪文件里**零命中**
+- [ ] `git grep -n -E "session=[0-9a-f]{32}"` 在普通跟踪文件里**零命中**
+- [ ] `git grep -n -E "lsof.*grep[[:space:]]+[0-9]{1,3}(\\.[0-9]{1,3}){3}" | grep -vE "(192\\.0\\.2\\.|198\\.51\\.100\\.|203\\.0\\.113\\.)"` 在跟踪文件里**零命中**
+- [ ] `git grep -n -E "relay\\.[[:alnum:].-]+" | grep -vF "relay.example.com"` 在普通跟踪文件中无命中
 - [ ] `bash scripts/check-secrets.sh` 在当前树 exit 0
 - [ ] 故意在临时分支把 session 写回 `docs/bug-list.md` → `bash scripts/check-secrets.sh` exit 1
 - [ ] `just ci` 通过（含新的 `secret-check` 步骤）
