@@ -2844,6 +2844,51 @@ fn manually_stopped_daemon_releases_its_socket_and_instance_lock() {
     assert!(Daemon::start(&runtime, &database).is_ok());
 }
 
+/// 事故根因：worktree 被 `git worktree remove --force` 删掉后，daemon 仍在服务
+/// 一个不存在的 runtime 目录。socket 因长路径回退落在 `$TMPDIR` 而幸存，所以
+/// 进程不死、每个请求都失败、且现有自愈（只认连接层错误）永不触发。
+#[test]
+fn a_daemon_stops_once_its_runtime_directory_is_gone() {
+    let directory = TempDir::new().unwrap();
+    let deep_slug = "2026-10-17-backend-module-split-design-2026-10-17-backend-module-split";
+    let workdir = directory.path().join(deep_slug);
+    let runtime = workdir.join(".yi-agent/runtime");
+    let database = runtime.join("runtime.sqlite");
+
+    let daemon = Daemon::start(&runtime, &database).unwrap();
+    let socket = daemon.socket_path().to_path_buf();
+
+    assert!(
+        socket.exists(),
+        "precondition: the daemon must have bound its socket"
+    );
+    assert!(
+        !socket.starts_with(&runtime),
+        "precondition: the runtime path must be long enough to push the socket into $TMPDIR. socket={}",
+        socket.display()
+    );
+
+    std::fs::remove_dir_all(&runtime).unwrap();
+
+    let mut stopped = false;
+    for _ in 0..240 {
+        if !socket.exists() {
+            stopped = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let _ = std::fs::remove_file(&socket);
+    assert!(
+        stopped,
+        "the daemon must stop and release its socket once its runtime directory is gone"
+    );
+    assert!(
+        !runtime.exists(),
+        "stopping must not recreate the deleted runtime directory"
+    );
+}
+
 #[test]
 fn daemon_reclaims_a_stale_lock_when_no_socket_is_listening() {
     let directory = TempDir::new().unwrap();
