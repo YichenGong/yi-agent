@@ -35,6 +35,7 @@ node scripts/perf/render.mjs      # §1.1(b)：每 delta 的全量重渲染开�
 node scripts/perf/markdown.mjs    # §1.1(c)：流式 markdown 的平方级退化
 node scripts/perf/wire.mjs        # §1.1(a) 的帧字节放大（第五项的背景数据）
 node scripts/perf/checkpoint.mjs  # §3.4：checkpoint 为何不能减载（"不丢东西"）
+node scripts/perf/turn.mjs        # §2.5：一个回合值多少（含历史深度扫描）
 ```
 
 `checkpoint.mjs` 读的是**这台机器上真实的 `.partial.json`**（沿 cwd 向上找
