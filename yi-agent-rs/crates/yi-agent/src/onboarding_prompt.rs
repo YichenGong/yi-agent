@@ -1,17 +1,21 @@
-//! TUI 首启的终端问答：把引导收敛成 `ModelSettings` 并写全局 `.env`。
+//! TUI 首启的终端问答：把引导收敛成 `ModelSettings` 并写进 `models.json`。
 
 use std::path::Path;
 
 use anyhow::Result;
 
 /// 是否应自动弹引导：未就绪且用户尚未结束过引导。
+///
+/// 就绪判定要看**清单**（模型设置的唯一真相源）：清单里已有可用默认条目就不再弹。
 pub(crate) fn should_offer(env_path: &Path, preferences_path: &Path) -> bool {
     use yi_agent_runtime::onboarding::{Assessment, assess, load_dismissed, read_env_fields};
     if load_dismissed(preferences_path) {
         return false;
     }
     let env = read_env_fields(env_path).unwrap_or_default();
-    matches!(assess(&env, None), Assessment::Needed { .. })
+    let catalog =
+        yi_agent_runtime::models::load_catalog_from(&yi_agent_runtime::models::models_path());
+    matches!(assess(&env, Some(&catalog)), Assessment::Needed { .. })
 }
 
 /// provider 的默认 (api_url, model)，与 `config.rs` 的默认值同源。
@@ -41,8 +45,8 @@ fn read_line_or(prompt: &str, default: &str) -> Result<String> {
     })
 }
 
-/// 跑一次终端问答并写全局 `.env`。用户中断（EOF）即视为「稍后设置」。
-pub(crate) fn run_onboarding_prompt(env_path: &Path, prefs_path: &Path) -> Result<()> {
+/// 跑一次终端问答并把模型写进清单。用户中断（EOF）即视为「稍后设置」。
+pub(crate) fn run_onboarding_prompt(models_path: &Path, prefs_path: &Path) -> Result<()> {
     use yi_agent_runtime::onboarding::{self, ModelSettings, validate_settings};
 
     println!("欢迎使用 yi-agent。先配置一个模型就能开始对话。\n");
@@ -103,9 +107,10 @@ pub(crate) fn run_onboarding_prompt(env_path: &Path, prefs_path: &Path) -> Resul
         }
     }
 
-    onboarding::write_model_settings(env_path, &settings)?;
+    let name = onboarding::import_settings_into_catalog(models_path, &settings)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     onboarding::save_dismissed(prefs_path, true)?;
-    println!("已保存到 {}", env_path.display());
+    println!("已保存模型「{name}」");
     Ok(())
 }
 
@@ -113,8 +118,57 @@ pub(crate) fn run_onboarding_prompt(env_path: &Path, prefs_path: &Path) -> Resul
 mod tests {
     use super::*;
 
+    /// 涉及 `HOME` 的测试必须串行；`models::models_path()` 读的是 `$HOME/.yi-agent`。
+    static HOME_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 把 `HOME` 指到临时家，Drop 时恢复。
+    struct HomeGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn set(path: &Path) -> Self {
+            let original = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", path);
+            }
+            Self { original }
+        }
+
+        fn restore(&mut self) {
+            unsafe {
+                match self.original.take() {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
+
+    /// 写一份含单条可用默认条目的清单到 `$HOME/.yi-agent/models.json`。
+    fn write_catalog(home: &Path) {
+        let dir = home.join(".yi-agent");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("models.json"),
+            r#"{"default_model":"gpt-4o","models":[{"name":"gpt-4o","provider":"openai","api_url":"https://api.openai.com/v1","model":"gpt-4o","api_key":"sk-x","api_style":null,"reasoning_effort":null,"context_length":null}]}"#,
+        )
+        .unwrap();
+    }
+
     #[test]
     fn offers_onboarding_on_a_blank_machine() {
+        let _lock = HOME_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
         let dir = tempfile::TempDir::new().unwrap();
         let env = dir.path().join(".env");
         let prefs = dir.path().join("preferences.json");
@@ -122,15 +176,16 @@ mod tests {
     }
 
     #[test]
-    fn does_not_offer_when_the_env_is_complete() {
+    fn does_not_offer_when_the_catalog_is_complete() {
+        let _lock = HOME_MUTEX
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::TempDir::new().unwrap();
+        let _home = HomeGuard::set(home.path());
+        write_catalog(home.path());
         let dir = tempfile::TempDir::new().unwrap();
         let env = dir.path().join(".env");
         let prefs = dir.path().join("preferences.json");
-        std::fs::write(
-            &env,
-            "YI_AGENT_PROVIDER=openai\nYI_AGENT_MODEL=gpt-4o\nMODEL_API_KEY=sk-x\n",
-        )
-        .unwrap();
         assert!(!should_offer(&env, &prefs));
     }
 
@@ -141,6 +196,30 @@ mod tests {
         let prefs = dir.path().join("preferences.json");
         yi_agent_runtime::onboarding::save_dismissed(&prefs, true).unwrap();
         assert!(!should_offer(&env, &prefs));
+    }
+
+    #[test]
+    fn a_completed_prompt_writes_the_catalog_not_the_env() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models = dir.path().join("models.json");
+
+        // 直接断言共享导入器（`run_onboarding_prompt` 是它的终端封装）：
+        let settings = yi_agent_runtime::onboarding::ModelSettings {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            api_url: "https://api.openai.com/v1".into(),
+            api_key: "sk-x".into(),
+        };
+        let name =
+            yi_agent_runtime::onboarding::import_settings_into_catalog(&models, &settings).unwrap();
+        assert_eq!(name, "gpt-4o");
+
+        let catalog = yi_agent_runtime::models::load_catalog_from(&models);
+        assert_eq!(catalog.default_model.as_deref(), Some("gpt-4o"));
+        assert!(
+            !dir.path().join(".env").exists(),
+            "the prompt must not write .env"
+        );
     }
 
     #[test]

@@ -12314,7 +12314,7 @@ async fn onboarding_status_is_readable_and_reports_needed() {
     assert_eq!(v["result"]["dismissed"], false, "got {v}");
 }
 
-/// `onboarding/apply` 落 `.env` 与清单;随后 `status` 立刻翻成 ready。
+/// `onboarding/apply` 只落清单(不再写 `.env`);随后 `status` 立刻翻成 ready。
 #[tokio::test(flavor = "multi_thread")]
 async fn onboarding_apply_lands_the_env_and_catalog() {
     let mut h = Harness::new();
@@ -12324,8 +12324,10 @@ async fn onboarding_apply_lands_the_env_and_catalog() {
     )
     .await;
     let v = h.read_value().await;
-    assert_eq!(v["result"]["env_written"], true, "got {v}");
-    assert_eq!(v["result"]["imported"], true, "got {v}");
+    assert_eq!(v["result"]["ok"], true, "got {v}");
+    assert!(v["result"].get("name").is_some(), "got {v}");
+    assert!(v["result"].get("env_written").is_none(), "got {v}");
+    assert!(v["result"].get("imported").is_none(), "got {v}");
 
     // 状态随即翻成 ready。
     h.send(r#"{"jsonrpc":"2.0","id":3,"method":"onboarding/status","params":{}}"#)

@@ -265,6 +265,17 @@ pub fn import_settings_into_catalog(
     let Some(provider) = crate::models::ModelProvider::parse(&settings.provider) else {
         return Err(format!("unknown provider: {}", settings.provider));
     };
+    // 空 `api_url` 视为「用 provider 默认地址」：清单条目要求 api_url 非空，
+    // 空串会在读回时被 `parse_catalog` 丢弃（与 `migrate.rs` 同口径）。
+    let default_url = match provider {
+        crate::models::ModelProvider::Openai => "https://api.openai.com/v1",
+        crate::models::ModelProvider::Anthropic => "https://api.anthropic.com",
+    };
+    let api_url = if settings.api_url.trim().is_empty() {
+        default_url.to_string()
+    } else {
+        settings.api_url.trim().to_string()
+    };
     let mut catalog = crate::models::load_catalog_from(models_path);
     let base = settings.model.trim().to_string();
     let mut name = base.clone();
@@ -276,7 +287,7 @@ pub fn import_settings_into_catalog(
     catalog.models.push(crate::models::ModelEntry {
         name: name.clone(),
         provider,
-        api_url: settings.api_url.trim().to_string(),
+        api_url,
         model: settings.model.trim().to_string(),
         api_key: settings.api_key.clone(),
         // 引导固化的是四个字段，通道两项不在此声明 → 保持默认。

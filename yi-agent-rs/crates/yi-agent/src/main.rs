@@ -1187,8 +1187,11 @@ fn run_agent(cli: Cli) -> Result<()> {
         &yi_agent_runtime::models::models_path(),
     );
     yi_agent_runtime::migrate::log_outcome(&migration, &env_path);
+    // 引导写进清单（与 `onboarding/apply` 同一路径）。先算一次清单路径，
+    // 让 should_offer / prompt 与运行期读点一致。
+    let models_path = yi_agent_runtime::models::models_path();
     if onboarding_prompt::should_offer(&env_path, &prefs_path) {
-        if let Err(error) = onboarding_prompt::run_onboarding_prompt(&env_path, &prefs_path) {
+        if let Err(error) = onboarding_prompt::run_onboarding_prompt(&models_path, &prefs_path) {
             eprintln!("引导未完成：{error}");
         }
     }
