@@ -57,7 +57,7 @@ fn query_plugin(workdir: &Path, method: &str, params: Value) -> Result<Value, Qu
     }
 }
 
-/// Handles `/superpowers-kanban [on|off|run|add <spec> <plan>]`.
+/// Handles `/superpowers-kanban [on|off|create|remove|status|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]`.
 ///
 /// The board is *disabled by default*, so an accidental invocation cannot start
 /// a queue. `run` is intentionally refused while disabled: the switch is the
@@ -574,7 +574,10 @@ mod tests {
         fake_daemon(dir.path(), |method, params| match method {
             "switch.read" => Ok(json!({ "on": true, "source": "project" })),
             "list" => Ok(json!({
-                "cards": [{ "id": "idea", "state": "pre_queued", "title": "一个想法" }]
+                "cards": [{
+                    "id": "idea", "state": "pre_queued", "title": "一个想法",
+                    "plan_path": "", "workdir": ""
+                }]
             })),
             other => installed(other, params),
         });
