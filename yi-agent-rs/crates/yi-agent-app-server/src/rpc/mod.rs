@@ -16,6 +16,7 @@
 pub(crate) mod agent;
 pub(crate) mod board;
 pub(crate) mod image;
+pub(crate) mod mcp;
 pub(crate) mod model;
 pub(crate) mod onboarding;
 pub(crate) mod pair;
@@ -175,6 +176,8 @@ pub(crate) enum Domain {
     Turn,
     /// `skill/*`(技能面板:三层技能根枚举 + 按需读正文)。
     Skill,
+    /// `mcp/*`(设置页 MCP 面板:项目级 mcp.json + 工具 schema 缓存的只读视图)。
+    Mcp,
     /// `thread/*`(会话生命周期:列表、建/恢复、改名、模型档、置顶、删除、订阅)。
     Thread,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
@@ -203,6 +206,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("device") => Domain::Pair,
         Some("turn") => Domain::Turn,
         Some("skill") => Domain::Skill,
+        Some("mcp") => Domain::Mcp,
         Some("thread") => Domain::Thread,
         Some("agent") => Domain::Agent,
         _ => Domain::Unknown,

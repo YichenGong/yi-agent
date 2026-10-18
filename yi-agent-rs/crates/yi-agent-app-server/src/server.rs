@@ -2797,6 +2797,16 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::Mcp => {
+                        let mut state = app_state!();
+                        match crate::rpc::mcp::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     crate::rpc::Domain::Thread => {
                         let mut state = app_state!();
                         match crate::rpc::thread::handle(&mut state, &req, id.clone()).await? {
@@ -6864,6 +6874,19 @@ mod plugins_tests {
                 }
             }
             panic!("no response for id {id}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn mcp_list_is_available_at_observe_scope() {
+            let mut h = (Harness::with_scope(Scope::Observe)).await;
+            initialize(&mut h).await;
+            let resp = call(&mut h, 1, "mcp/list", "{}").await;
+            assert!(
+                resp.get("error").is_none(),
+                "observe must list mcp servers: {resp}"
+            );
+            assert!(resp["result"]["servers"].is_array());
+            h.shutdown().await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
