@@ -22,6 +22,7 @@ use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
 use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
+use crate::lead_loop::{ThreadSnapshot, decide_wake, render_digest};
 use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
@@ -46,6 +47,23 @@ pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// brief 的设计约束):整张 `threads` 表是主循环的局部量,重构成可共享结构会
 /// 把改动面扩散到全部 RPC 分支。3s 足够跟上卡片状态流转,又远短于卡片的生命周期。
 const CARD_SCHEDULER_TICK: Duration = Duration::from_secs(3);
+
+/// 组长后台循环的低频兜底 tick。
+///
+/// 与看板调度器刻意分开:**唤醒组长要真的花一次 token**。看板的 3s 是「状态机
+/// 对齐」的节奏,而组长的后台循环主要是**兜底**——真正及时的唤醒来自事件路径
+/// (前台 `ask_lead` 实时投递、`lead_rx` 分支),tick 只负责捞那些事件没覆盖到的
+/// 变化(例如某个 thread 卡在审批上、没有任何新消息)。30s 既能让兜底在一个可
+/// 接受的时间内生效,又不会让它变成「每 3s 烧一次钱」。
+const LEAD_TICK: Duration = Duration::from_secs(30);
+
+/// 后台循环投递时在 `LeadEnvelope.from_thread_id` 里用的标识。
+///
+/// `deliver_to_lead` 会把它渲染成注入文本的前缀 `[来自会话 <id>] ...`。用一
+/// 个**显然不是 thread id** 的固定串(而不是某个真实 thread),是为了让组长一眼
+/// 看出这轮是后台兜底喂进来的、而不是某个具体会话在找它;也避免下游把某个普通
+/// 会话误认成「这条 digest 的来源会话」。
+const LEAD_LOOP_SENDER: &str = "lead-loop";
 
 /// 首轮 LLM 标题生成的超时:超时即回退兜底标题，绝不卡住 turn 收尾。
 const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2351,6 +2369,11 @@ where
         tokio::time::Instant::now() + CARD_SCHEDULER_TICK,
         CARD_SCHEDULER_TICK,
     );
+    // 组长后台循环的兜底 tick:30s 一次,与看板同款「首个 tick 推到门限之后」
+    // ——否则启动瞬间就会先跑一轮组长扫描,把第一个请求排在一整轮(可能落盘的)
+    // 组长 I/O 之后。低频是刻意的:唤醒组长要真花钱(见 `LEAD_TICK`)。
+    let mut lead_ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + LEAD_TICK, LEAD_TICK);
 
     // 主题变化 → ui/settings/updated(全局一条流,与 thread 无关)。经 hub 广播:
     // stdio 的 `local` 与任意 ws 设备都能收到并切 `data-theme`。
@@ -5823,6 +5846,51 @@ where
                 )
                 .await;
             }
+            _ = lead_ticker.tick() => {
+                // 组长后台循环的兜底轮,照看板 tick 内联跑:启动一轮要拿
+                // `&mut threads`(投递走 `deliver_to_lead`),而 `threads` 是主循环
+                // 独占的局部量,`tokio::spawn` 会拆掉这条前提(spec §6.1)。
+                //
+                // 「算」与「投」分两步:`lead_tick_once` 只读 `threads` 并返回 owned
+                // 的投递清单,返回时借用已归还,下面才借 `&mut`。投递失败不中断本轮,
+                // 更不能影响主循环处理其它请求。
+                for delivery in lead_tick_once(&mut threads) {
+                    let envelope = crate::lead::LeadEnvelope {
+                        project_key: delivery.project_key,
+                        from_thread_id: LEAD_LOOP_SENDER.to_string(),
+                        text: delivery.text,
+                        // 后台 digest 是**单向**的:没有请求方在等它的回复。
+                        // `None` 也让 `deliver_to_lead` 构造的 `TurnPrompt` 天然
+                        // 带上 `lead_request_id: None`,不会误挂进阻塞回填表。
+                        request_id: None,
+                    };
+                    let mut launcher = ServeLauncher {
+                        threads: &mut threads,
+                        pending_activation: &mut pending_activation,
+                        process_watches: &mut process_watches,
+                        uploads: &mut uploads,
+                        runtimes: &runtimes,
+                        thread_roots: &thread_roots,
+                        models_path: &models_path,
+                        cfg: &cfg,
+                        hub: &hub,
+                        turn_tx: &turn_tx,
+                        pending: &pending,
+                        permission_timeout,
+                        perm_seq: &perm_seq,
+                        theme: &theme,
+                        git_diff: &git_diff_handle,
+                        workspaces: &workspaces,
+                        build_agent: &build_agent,
+                        lead_inbox: &lead_inbox,
+                        lead_replies: &lead_replies,
+                        lead_target: Some(delivery.lead),
+                    };
+                    if let Err(error) = launcher.deliver_to_lead(&envelope).await {
+                        eprintln!("[app-server] lead background delivery failed: {error}");
+                    }
+                }
+            }
             envelope = lead_rx.recv() => {
                 let Ok(envelope) = envelope else { continue };
                 // 按 project_key 找到该项目的组长。找不到就跳过并记日志:
@@ -7969,6 +8037,129 @@ where
         }
         Ok(target.thread_id)
     }
+}
+
+/// 一轮后台 tick 对**某个项目**要做的一次投递:投给谁、投什么文本。
+///
+/// 用 owned 值而不是借用 `threads`:投递要拿 `&mut threads`(走
+/// `ServeLauncher::deliver_to_lead`),任何未结束的借用都会与之冲突。这也是
+/// 把「算」与「投」分成两步的全部理由。
+struct LeadTickDelivery {
+    project_key: String,
+    lead: LeadTarget,
+    text: String,
+}
+
+/// 算一轮时按项目聚起来的一组中间量。
+struct LeadGroup {
+    project_key: String,
+    /// 该项目的组长;`None` = 还没有组长 → 该组整体跳过(**不创建**)。
+    lead: Option<LeadTarget>,
+    snapshots: Vec<ThreadSnapshot>,
+}
+
+/// 一个会话的机械快照。
+///
+/// 只取**进程内事实**:状态只活在 `ThreadSession.status` 里(磁盘 `ThreadMeta`
+/// 没有 status 字段)。因此「本进程没打开过的 thread」天然不在 `threads` 里,也就
+/// 不会被算成「卡住」——这正是想要的:后台循环不为看不见的会话花钱。
+///
+/// `title` / `last_user_text` / `updated_at` 刻意留空:本轮唯一的判据是 status
+/// (`pending_asks` 恒 0,见 [`lead_tick_once`]),读盘只会把每 30s 一次兜底变成
+/// N 次 IO,而 `render_digest` 也不用这三个字段。
+fn snapshot_of(session: &ThreadSession) -> ThreadSnapshot {
+    ThreadSnapshot {
+        thread_id: session.thread_id.clone(),
+        title: None,
+        status: *session.status.lock().unwrap_or_else(|p| p.into_inner()),
+        last_user_text: None,
+        updated_at: 0,
+    }
+}
+
+/// 由项目键(状态目录 `<项目根>/.yi-agent`)反推项目根,与 `resolve_lead_target`
+/// 同一口径。
+fn project_root_of(project_key: &str) -> Option<String> {
+    Path::new(project_key)
+        .parent()
+        .map(|root| root.display().to_string())
+}
+
+/// 组长后台循环一轮的**纯计算**部分:算出哪些项目的组长该被唤醒、该注入什么文本。
+///
+/// 抽成独立函数是为了**可测**:测试只断言这个返回值,不必观测一次真实的 LLM 轮
+/// (spec §6.1 要的是「后台循环住主循环」,不是「测一次唤醒就得烧 token」)。它
+/// 不落盘、不发帧、不 spawn,主循环的 `select!` 分支只负责把结果逐条投递。
+///
+/// 三条刻意约束:
+/// - **不懒创建组长**:判定「有没有组长」只用 `ThreadStore::find_lead()`(纯读)。
+///   绝不能用 `resolve_lead_target` —— 它内部会 `ensure_lead_meta`,于是每 30s
+///   的兜底都会替每个项目落一个组长 meta,把「谁拉起组长」变成后台循环。没有
+///   组长就是没有:跳过。
+/// - **`pending_asks` 传 0**:阻塞式 `ask_lead` 的投递已由主循环的 `lead_rx`
+///   分支实时处理(那条路径本来就最及时)。这里再报一次「有 ask」只会把同一次
+///   求助变成两轮,既贵又吵。
+/// - **只认本进程已打开的会话**:分组键取自会话自己的 store,快照只含
+///   `status`;磁盘上未被打开的 thread 看不到实时状态,按 Idle 处理(不唤醒)。
+fn lead_tick_once(threads: &mut HashMap<String, ThreadSession>) -> Vec<LeadTickDelivery> {
+    // 阶段一(只读):按项目分组,给每组定出组长与一组 owned 快照。
+    // 先读完再算,`threads` 的借用在本阶段结束时就归还,不会与调用方的 `&mut`
+    // 冲突(与看板 tick 的「先快照成 owned,再借 &mut」是同一手法)。
+    let mut groups: Vec<LeadGroup> = Vec::new();
+    for session in threads.values() {
+        let project_key = session.store.project_key();
+        let Some(root) = project_root_of(&project_key) else {
+            // 项目键没有 parent(理论上不可达):无处找组长,跳过。
+            continue;
+        };
+        let idx = match groups.iter().position(|g| g.project_key == project_key) {
+            Some(idx) => idx,
+            None => {
+                let lead = match session.store.find_lead() {
+                    Ok(Some(meta)) => Some(LeadTarget {
+                        cwd: root,
+                        thread_id: meta.thread_id,
+                    }),
+                    _ => None,
+                };
+                groups.push(LeadGroup {
+                    project_key,
+                    lead,
+                    snapshots: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        // 组长不是「它自己的 thread」:把组长列进去会让每一轮都自我唤醒,
+        // 那等于把低频兜底变成永久烧钱的自激循环。
+        if groups[idx]
+            .lead
+            .as_ref()
+            .is_some_and(|lead| lead.thread_id == session.thread_id)
+        {
+            continue;
+        }
+        groups[idx].snapshots.push(snapshot_of(session));
+    }
+
+    // 阶段二(纯算):每组判一次「要不要起一轮」,要就把注入文本渲出来。
+    let mut deliveries = Vec::new();
+    for group in groups {
+        // 没有组长 → 整组跳过。这里**不创建**组长。
+        let Some(lead) = group.lead else {
+            continue;
+        };
+        let wakes = decide_wake(&group.snapshots, 0);
+        if wakes.is_empty() {
+            continue;
+        }
+        deliveries.push(LeadTickDelivery {
+            project_key: group.project_key,
+            lead,
+            text: render_digest(&group.snapshots, &wakes),
+        });
+    }
+    deliveries
 }
 
 /// 由项目键反推该项目当前应承载消息的组长。
@@ -18132,6 +18323,119 @@ pub(crate) mod tests {
         );
 
         h.shutdown().await;
+    }
+
+    /// 造一个只够后台 tick 用的会话:`store` 指向 `project`(分组键由它算出),
+    /// `status` 由调用方给定。其余字段(通道、进程管理器)只为把 struct 填满,
+    /// tick 一个都不碰。
+    fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> ThreadSession {
+        let (prompt_tx, _prompt_rx) = mpsc::channel(1);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel(1);
+        let (interject_tx, _interject_rx) = mpsc::channel(1);
+        let (session_tx, _session_rx) = mpsc::channel(1);
+        ThreadSession {
+            thread_id: thread_id.to_string(),
+            cwd: project.display().to_string(),
+            model: "test".to_string(),
+            active_turn_id: None,
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            prompt_tx,
+            interrupt_tx,
+            interject_tx,
+            session_tx,
+            store: Arc::new(crate::thread_store::ThreadStore::new(project)),
+            status: Arc::new(StdMutex::new(status)),
+        }
+    }
+
+    /// 后台循环:一个卡住(等待审批)的 thread 必须让组长被唤醒,而且唤醒时注入的
+    /// 文本里**带着这个 thread_id**。
+    ///
+    /// 直接驱动抽出来的 `lead_tick_once`,而不是等 30s 的真实 tick:那条 `select!`
+    /// 分支唯一做的事就是「把 `lead_tick_once` 的结果逐条投递」,断言它的返回值
+    /// 等于断言「组长会被唤醒、收到什么」,不必观测一次真实的 LLM 轮。投递那半
+    /// 由既有用例覆盖(`a_delivered_message_reaches_the_lead_thread` 走的正是同一条
+    /// `deliver_to_lead`)。
+    ///
+    /// 「卡住」用测试后门直接摆出 `status`:状态只活在进程内(`ThreadMeta` 没有
+    /// status 字段),走一次真实审批请求需要拉整条 driver + provider 链路,那是在
+    /// 测 driver,不是测本轮。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_thread_wakes_the_lead_with_a_digest_naming_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().to_path_buf();
+        // 组长必须**先**存在:后台 tick 只认已有组长,绝不懒创建(懒创建是
+        // `thread/lead` 与 `resolve_lead_target` 的职责)。
+        let store = crate::thread_store::ThreadStore::new(&project);
+        let (lead_meta, _) = crate::lead::ensure_lead_meta(&store, &project).expect("lead meta");
+
+        let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+        // 被唤醒者:卡在等待审批上的会话。
+        threads.insert(
+            "thread-stuck".to_string(),
+            tick_test_session(&project, "thread-stuck", ThreadStatus::AwaitingApproval),
+        );
+        // 对照组:同一项目、同样有组长,但它没变化,不许被展开。
+        threads.insert(
+            "thread-idle".to_string(),
+            tick_test_session(&project, "thread-idle", ThreadStatus::Idle),
+        );
+
+        let deliveries = lead_tick_once(&mut threads);
+        assert_eq!(deliveries.len(), 1, "只有一个项目有变化");
+        let delivery = &deliveries[0];
+        assert_eq!(
+            delivery.lead.thread_id, lead_meta.thread_id,
+            "唤醒的必须是该项目的组长"
+        );
+        assert!(
+            delivery.text.contains("thread-stuck"),
+            "注入必须点名那个卡住的 thread:{}",
+            delivery.text
+        );
+        assert!(
+            !delivery.text.contains("thread-idle"),
+            "没变化的 thread 不该出现在注入里:{}",
+            delivery.text
+        );
+
+        // 反向:卡住解除后就不许再唤醒——低频兜底的意义是省钱,不是定时烧 token。
+        *threads
+            .get("thread-stuck")
+            .unwrap()
+            .status
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = ThreadStatus::Idle;
+        assert!(
+            lead_tick_once(&mut threads).is_empty(),
+            "全部 idle 时后台兜底不得唤醒任何人"
+        );
+    }
+
+    /// 后台 tick **绝不**替项目懒创建组长:没有组长就没有投递(落盘也不许冒出
+    /// 一个被兜底顺手造出来的组长)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_background_tick_never_creates_a_lead() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().to_path_buf();
+        let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+        threads.insert(
+            "thread-stuck".to_string(),
+            tick_test_session(&project, "thread-stuck", ThreadStatus::AwaitingApproval),
+        );
+
+        assert!(
+            lead_tick_once(&mut threads).is_empty(),
+            "没有组长时该整组跳过,而不是被兜底顺手造一个"
+        );
+        assert!(
+            crate::thread_store::ThreadStore::new(&project)
+                .find_lead()
+                .unwrap()
+                .is_none(),
+            "落盘上不得出现任何由后台循环创建的组长"
+        );
     }
 
     /// 用 `RecordingProvider` 建 agent,并把每次对话调用看到的 message 数记进 `seen`。
