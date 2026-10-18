@@ -977,7 +977,6 @@ pub struct ShowGitDiffTool {
         self.handle.broadcast(GitDiffFocus {
             thread_id: self.thread_id.clone(),
             command: None,
-            base: explicit.clone(),
             note,
             frame: Some(Box::new(frame.clone())),
         });
@@ -1002,8 +1001,6 @@ pub struct ShowGitDiffTool {
 ```rust
 pub struct GitDiffFocus {
     pub thread_id: Option<String>,
-    /// 模型请求的基准（`None` = 默认）。仅用于回执之外的展示语义。
-    pub base: Option<String>,
     /// 模型请求的命令（`None` = 结构化默认）。
     pub command: Option<String>,
     pub note: Option<String>,
@@ -1025,7 +1022,7 @@ pub struct GitDiffFocus {
         };
 ```
 
-`build_runtime_tooling` 的注册处补两个实参（repo 用 `cfg.workdir`，它与 thread cwd 同源；anchor 从 `thread_store` 读）：
+`build_runtime_tooling` 的注册处补两个实参（repo 用 `cfg.workdir`，它与 thread cwd 同源；`anchor_sha` 由**调用方**传入——见下）：
 
 ```rust
     registry.register(Arc::new(crate::git_diff_tool::ShowGitDiffTool::new(
@@ -1037,6 +1034,8 @@ pub struct GitDiffFocus {
 ```
 
 `build_runtime_tooling` 需要多一个 `anchor_sha: Option<String>` 参数；其 3 处测试调用补 `None`。
+
+**修订（Task 4 修复轮）：`anchor_sha` 不能由 `attach_delegation` 自己读盘。** `start_thread_core` 先调 `attach_delegation`、后 `thread_store.create(&meta)`，新建路径上读盘只会拿到 `None`，工具默认基准就落到候选链（`local-default`）而非会话起点。故 `attach_delegation` 改为接收调用方给的 `anchor_sha`：新建传 `session_anchor(cwd)`（同一值也落进 meta），resume 传已落盘 meta 的 `anchor_sha`。
 
 - [ ] **Step 5: 运行测试确认通过**
 

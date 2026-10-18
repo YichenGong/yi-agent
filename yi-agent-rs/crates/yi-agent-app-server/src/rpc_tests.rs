@@ -2301,6 +2301,93 @@ async fn thread_view_read_refresh_reruns_a_command_frame() {
     h.shutdown().await;
 }
 
+/// refresh 重算结构化帧时必须**保留原基准的来历**：模型用 `base` 指定的帧
+/// (`baseKind == "explicit"`)重算后仍得是 `explicit`。若重算时丢掉那个 base、
+/// 只按会话锚点算，帧就从「跟 X 比」变成「本次会话以来」——回执与面板一起骗人，
+/// 正是 D3 要杜绝的那类误导。
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_preserves_an_explicit_base() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "add a"]] {
+        assert!(
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    // HEAD 之上再造一个可当显式基准的提交。
+    std::fs::write(dir.path().join("a.txt"), "x\ny\n").unwrap();
+    for args in [vec!["commit", "-qam", "edit a"]] {
+        assert!(
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    // 显式基准取**第一个**提交（HEAD 的父），与会话锚点（= thread/start 时的
+    // HEAD）不同：这样 base 与 baseKind 两条断言都能真正区分「保留了原基准」
+    // 与「退化成了会话锚点」。
+    let base = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD~1"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    {
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: None,
+                as_kind: "diff".to_string(),
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: Some(base.clone()),
+                base_kind: "explicit".to_string(),
+            },
+        );
+    }
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":14,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(14)) {
+        v = h.read_value().await;
+    }
+    assert_eq!(
+        v["result"]["baseKind"], "explicit",
+        "a refresh must keep an explicit base explicit: {v}"
+    );
+    assert_eq!(
+        v["result"]["base"], base,
+        "the explicit base must survive: {v}"
+    );
+    h.shutdown().await;
+}
+
 /// refresh 重算期间若有更晚的写入者落帧，**不得**被这次 refresh 覆盖回去。
 ///
 /// 窗口确实存在：「读缓存命令」与「写回新帧」之间隔了一次 await（重跑命令，

@@ -1798,17 +1798,29 @@ pub(crate) async fn handle(
                 // 分两次短暂持锁，**不**把 guard 跨过 `command_frame` 的 await：
                 // `serve()` 跑在 `tokio::spawn` 里，guard 过 await 会让整个
                 // future 非 `Send`，直接编译不过。
-                let command = state
+                // 快照连**基准来历**一起取：结构化帧可能是「模型指定的基准」
+                // (`base_kind == "explicit"`)，重算时必须原样再用那个 base——
+                // 只传 `explicit=None` 会让它退化成会话锚点，帧与回执就从
+                // 「跟 origin/main 比」变成「本次会话以来」，正是 D3 的误导。
+                let snapshot = state
                     .view_frames
                     .lock()
                     .await
                     .get(&thread_id)
-                    .and_then(|f| f.command.clone());
+                    .map(|f| (f.command.clone(), f.base.clone(), f.base_kind.clone()));
+                let command = snapshot.as_ref().and_then(|(c, _, _)| c.clone());
+                let explicit = snapshot.as_ref().and_then(|(_, base, kind)| {
+                    (kind == "explicit").then(|| base.clone()).flatten()
+                });
                 let next = match command.as_deref() {
                     Some(command) => {
                         crate::git_diff::command_frame(repo, command, None, None).await
                     }
-                    None => crate::git_diff::structured_frame(repo, None, anchor.as_deref()),
+                    None => crate::git_diff::structured_frame(
+                        repo,
+                        explicit.as_deref(),
+                        anchor.as_deref(),
+                    ),
                 };
                 // 写回用 CAS，不是无条件覆盖：「读缓存命令」与「写回新帧」之间隔了
                 // 一次 await（最多 `VIEW_TIMEOUT`）。期间别的写入者（另一次 refresh、
