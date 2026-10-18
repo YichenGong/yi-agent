@@ -1740,12 +1740,13 @@ pub(crate) async fn handle(
                 let (unified_diff, truncated) = crate::git_diff::commit_diff(repo, commit);
                 json!({ "unifiedDiff": unified_diff, "truncated": truncated })
             } else if let Some(path) = req.params.get("path").and_then(|v| v.as_str()) {
-                let d = crate::git_diff::thread_diff(repo, base);
+                // 锚点由 Task 2 从 thread meta 接上；本任务先传 `None`（行为不变）。
+                let d = crate::git_diff::thread_diff(repo, base, None);
                 let (unified_diff, truncated) =
                     crate::git_diff::file_diff(repo, d.merge_base.as_deref(), path);
                 json!({ "unifiedDiff": unified_diff, "truncated": truncated })
             } else {
-                serde_json::to_value(crate::git_diff::thread_diff(repo, base))
+                serde_json::to_value(crate::git_diff::thread_diff(repo, base, None))
                     .unwrap_or(json!(null))
             };
             write_response(state.hub, state.client, ok_response(id, result)).await?;

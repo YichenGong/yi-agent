@@ -5566,6 +5566,8 @@ pub(crate) async fn start_thread_core(
     let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
 
     let now = crate::thread_store::now_millis();
+    // 会话起点：默认 diff 基准。必须在建 meta 时取，之后 HEAD 会随会话推进。
+    let anchor_sha = crate::git_diff::session_anchor(std::path::Path::new(cwd));
     let meta = crate::thread_store::ThreadMeta {
         thread_id: thread_id.clone(),
         cwd: cwd.to_string(),
@@ -5590,6 +5592,7 @@ pub(crate) async fn start_thread_core(
         role: None,
         content_epoch: 0,
         last_item_id: None,
+        anchor_sha,
     };
     // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
     // 的 `role: "lead"` 抹掉(本函数的 meta 不带 role),懒创建出来的组长就

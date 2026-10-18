@@ -89,6 +89,12 @@ pub struct ThreadMeta {
     /// 旧 meta 缺字段一律读成 `None`(零迁移)。
     #[serde(default)]
     pub role: Option<String>,
+    /// 会话起点：`thread/start` 时的 `HEAD` sha。默认 diff 基准用它。
+    ///
+    /// `None` = 建会话时不是 git 仓库，或该 meta 早于本字段（**不回填**：读操作
+    /// 不产生写入，也不引入「首次打开时锚点 = 此刻」这种与「会话开始」不同的语义）。
+    #[serde(default)]
+    pub anchor_sha: Option<String>,
     /// 该会话**可见内容集合**的世代。只有会改变服务端 item 集合的操作才递增
     /// ——今天仅 `thread/clear`（`compact` 不递增：它落盘时 items 为空、历史
     /// item 分毫未动，见 spec §1.2）。旧 meta 缺字段必须解释为 0。
@@ -902,6 +908,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         role: None,
         content_epoch: 0,
         last_item_id: None,
+        anchor_sha: None,
     }
 }
 
@@ -936,6 +943,7 @@ mod tests {
             role: None,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
         }
     }
 
@@ -1686,6 +1694,7 @@ mod tests {
             role: None,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
         }
     }
 
@@ -2065,6 +2074,7 @@ mod tests {
             role: None,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -2135,6 +2145,7 @@ mod tests {
             role: None,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -2259,6 +2270,7 @@ mod tests {
             role: Some(LEAD_ROLE.to_string()),
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
         };
         store.create(&lead).unwrap();
         store
@@ -2336,6 +2348,7 @@ mod tests {
                     role: Some(LEAD_ROLE.to_string()),
                     content_epoch: 0,
                     last_item_id: None,
+                    anchor_sha: None,
                 })
                 .unwrap();
             store
@@ -2481,5 +2494,24 @@ mod tests {
         );
         s.set_last_item_id("thread-a", None).unwrap();
         assert_eq!(s.load("thread-a").unwrap().unwrap().meta.last_item_id, None);
+    }
+
+    #[test]
+    fn old_meta_without_anchor_reads_as_none() {
+        let (_dir, s) = store();
+        // 旧 meta 没有 anchor_sha 字段：必须零迁移地读成 None。
+        // 路径用 store 自己的布局（`<root>/<id>.meta.json`），与既有的
+        // `legacy_meta_without_pin_seq_deserializes_unpinned` 同形。
+        std::fs::create_dir_all(&s.root).unwrap();
+        std::fs::write(
+            s.meta_path("thread-old"),
+            r#"{"thread_id":"thread-old","cwd":"/tmp","model":"m","created_at":1,"updated_at":1,
+                "title":null,"permission_mode":"normal","pin_seq":null,"board_project":null,
+                "card_id":null,"model_ref":null,"reasoning_effort":null,"tag":null,
+                "preserve_thinking":true,"extra_roots":[],"role":null}"#,
+        )
+        .unwrap();
+        let loaded = s.load("thread-old").unwrap().expect("meta must parse");
+        assert_eq!(loaded.meta.anchor_sha, None);
     }
 }

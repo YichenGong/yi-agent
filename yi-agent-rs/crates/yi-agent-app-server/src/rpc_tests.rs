@@ -414,6 +414,7 @@ fn only_the_lead_sees_the_memory_tools() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             role: None,
             tag: None,
             extra_roots: Vec::new(),
@@ -4642,6 +4643,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6158,6 +6160,7 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6268,6 +6271,7 @@ async fn a_turn_while_off_persists_without_credentials() {
             preserve_thinking: false,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6367,6 +6371,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7751,6 +7756,7 @@ fn write_meta(
         preserve_thinking: true,
         content_epoch: 0,
         last_item_id: None,
+        anchor_sha: None,
         extra_roots: Vec::new(),
         role: None,
     };
@@ -9275,6 +9281,7 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -9386,6 +9393,7 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })

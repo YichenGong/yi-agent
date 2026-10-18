@@ -65,13 +65,31 @@ fn ref_exists(repo: &Path, r: &str) -> bool {
     git_ok(repo, &["rev-parse", "--verify", "--quiet", r]).is_some()
 }
 
-/// 判定比较基准。显式传入优先；否则按候选顺序找默认分支；都没有则 `None`。
-pub fn resolve_base(repo: &Path, explicit: Option<&str>) -> (Option<String>, &'static str) {
+/// 取会话锚点：当前 `HEAD`。非 git 仓库返回 `None`。
+pub fn session_anchor(repo: &Path) -> Option<String> {
+    git_ok(repo, &["rev-parse", "HEAD"]).map(|s| s.trim().to_string())
+}
+
+/// 判定比较基准。显式传入优先；其次是会话锚点；再次按候选顺序找默认分支；都没有则 `None`。
+///
+/// 锚点不可达（rebase / gc 掉）时**不**降级为「仅工作区」——那会让 diff 突然只剩
+/// 未提交改动，比报错更难理解；此处直接落到默认分支候选链。
+pub fn resolve_base(
+    repo: &Path,
+    explicit: Option<&str>,
+    anchor: Option<&str>,
+) -> (Option<String>, &'static str) {
     if let Some(name) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         if ref_exists(repo, name) {
             return (Some(name.to_string()), "explicit");
         }
     }
+    if let Some(name) = anchor.map(str::trim).filter(|s| !s.is_empty()) {
+        if ref_exists(repo, name) {
+            return (Some(name.to_string()), "session");
+        }
+    }
+    // 以下为既有候选链，逐字保留。
     // `refs/remotes/origin/HEAD` 是「远端默认分支」的权威指针。
     if ref_exists(repo, "refs/remotes/origin/HEAD") {
         return (Some("refs/remotes/origin/HEAD".to_string()), "origin-head");
@@ -280,9 +298,9 @@ fn truncate(diff: String) -> (String, bool) {
     (truncated, true)
 }
 
-pub fn thread_diff(repo: &Path, explicit_base: Option<&str>) -> ThreadDiff {
+pub fn thread_diff(repo: &Path, explicit_base: Option<&str>, anchor: Option<&str>) -> ThreadDiff {
     let root = repo_root(repo);
-    let (base, base_kind) = resolve_base(repo, explicit_base);
+    let (base, base_kind) = resolve_base(repo, explicit_base, anchor);
     let mb = base.as_deref().and_then(|b| merge_base(repo, b));
     let commits = mb.as_deref().map(|m| commits(repo, m)).unwrap_or_default();
     let files = files(repo, &root, mb.as_deref());
@@ -373,7 +391,7 @@ mod tests {
     #[test]
     fn worktree_only_when_no_default_branch_exists() {
         let dir = repo();
-        let (base, kind) = resolve_base(dir.path(), None);
+        let (base, kind) = resolve_base(dir.path(), None, None);
         assert_eq!(base, None);
         assert_eq!(kind, "worktree-only");
     }
@@ -381,7 +399,7 @@ mod tests {
     #[test]
     fn explicit_base_wins_and_reports_kind() {
         let dir = repo();
-        let (base, kind) = resolve_base(dir.path(), Some("trunk"));
+        let (base, kind) = resolve_base(dir.path(), Some("trunk"), None);
         assert_eq!(base.as_deref(), Some("trunk"));
         assert_eq!(kind, "explicit");
     }
@@ -391,7 +409,7 @@ mod tests {
         let dir = repo();
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap(); // 未提交改动
         std::fs::write(dir.path().join("new.txt"), "hello\n").unwrap(); // 未跟踪
-        let d = thread_diff(dir.path(), Some("trunk"));
+        let d = thread_diff(dir.path(), Some("trunk"), None);
         // 在 trunk 上 merge-base == HEAD（自己与自己），diff 只含工作区
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
         assert!(
@@ -418,7 +436,7 @@ mod tests {
     fn worktree_only_includes_tracked_uncommitted_edits() {
         let dir = repo(); // 分支 `trunk`，无 remote ⇒ resolve_base 给出 worktree-only
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap(); // 已跟踪文件的未提交改动
-        let d = thread_diff(dir.path(), None);
+        let d = thread_diff(dir.path(), None, None);
         assert_eq!(d.base_kind, "worktree-only");
         assert_eq!(d.base, None);
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
@@ -457,7 +475,7 @@ mod tests {
                 .success()
         );
         // 只暂存、不再改动：裸 `git diff` 在这里输出为空。
-        let d = thread_diff(dir.path(), None);
+        let d = thread_diff(dir.path(), None, None);
         assert_eq!(d.base_kind, "worktree-only");
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
         assert!(
@@ -493,7 +511,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let d = thread_diff(dir.path(), None);
+        let d = thread_diff(dir.path(), None, None);
         assert_eq!(d.base_kind, "worktree-only");
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(
@@ -522,7 +540,7 @@ mod tests {
                 .success()
         );
         std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").unwrap(); // 暂存后再改
-        let d = thread_diff(dir.path(), None);
+        let d = thread_diff(dir.path(), None, None);
         let a = d.files.iter().find(|f| f.path == "a.txt").unwrap();
         assert_eq!(
             (a.additions, a.deletions),
@@ -586,7 +604,7 @@ mod tests {
         std::fs::write(sub.join("t.txt"), "t\nedit\n").unwrap(); // 已提交文件的未提交改动
         std::fs::write(sub.join("u.txt"), "hello\n").unwrap(); // 子目录里的未跟踪文件
 
-        let d = thread_diff(&sub, None); // thread 的 cwd 是子目录（Task 2 的调用方式）
+        let d = thread_diff(&sub, None, None); // thread 的 cwd 是子目录（Task 2 的调用方式）
         let paths: Vec<_> = d.files.iter().map(|f| f.path.as_str()).collect();
         assert!(
             paths.contains(&"sub/t.txt"),
@@ -635,9 +653,68 @@ mod tests {
                 .success()
         );
         // 以 trunk 为 base 时，feature 引入的提交应被列出
-        let d = thread_diff(dir.path(), Some("trunk"));
+        let d = thread_diff(dir.path(), Some("trunk"), None);
         assert_eq!(d.commits.len(), 1, "commits: {:?}", d.commits);
         assert_eq!(d.commits[0].subject, "feature work");
         assert!(!d.commits[0].short.is_empty());
+    }
+
+    #[test]
+    fn anchor_beats_the_default_branch_candidates() {
+        let dir = repo();
+        std::fs::create_dir_all(dir.path().join(".git/refs/remotes/origin")).unwrap();
+        // 造一个「默认分支」候选，确认锚点仍然压过它。
+        let head = git_ok(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(
+            dir.path().join(".git/refs/remotes/origin/main"),
+            format!("{}\n", head.trim()),
+        )
+        .unwrap();
+        let (base, kind) = resolve_base(dir.path(), None, Some("trunk"));
+        assert_eq!(base.as_deref(), Some("trunk"), "anchor must win");
+        assert_eq!(kind, "session");
+    }
+
+    #[test]
+    fn explicit_beats_the_anchor() {
+        let dir = repo();
+        let (base, kind) = resolve_base(dir.path(), Some("HEAD"), Some("trunk"));
+        assert_eq!(base.as_deref(), Some("HEAD"));
+        assert_eq!(kind, "explicit", "explicit still wins over the anchor");
+    }
+
+    #[test]
+    fn missing_anchor_falls_back_to_the_existing_chain() {
+        let dir = repo();
+        // 无锚点、无默认分支：落回 worktree-only（旧会话的行为不变）。
+        let (base, kind) = resolve_base(dir.path(), None, None);
+        assert_eq!(base, None);
+        assert_eq!(kind, "worktree-only");
+    }
+
+    #[test]
+    fn unreachable_anchor_degrades_to_the_default_branch_chain_not_worktree_only() {
+        let dir = repo();
+        // 锚点已不可达（模拟 rebase / gc 掉）：不得降级为「仅工作区」，
+        // 否则 diff 会突然只剩未提交改动，比报错更难理解。
+        let (base, kind) = resolve_base(dir.path(), None, Some("deadbeefdeadbeef"));
+        assert_eq!(kind, "worktree-only", "no other candidate exists here");
+        assert_eq!(base, None);
+    }
+
+    #[test]
+    fn session_anchor_reads_head() {
+        let dir = repo();
+        let sha = session_anchor(dir.path()).expect("a git repo has an anchor");
+        assert_eq!(
+            sha.trim(),
+            git_ok(dir.path(), &["rev-parse", "HEAD"]).unwrap().trim()
+        );
+    }
+
+    #[test]
+    fn session_anchor_is_none_outside_a_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(session_anchor(dir.path()), None);
     }
 }
