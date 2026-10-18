@@ -122,9 +122,9 @@ pub fn install_with(
     // 先清旧、再装新：中间态只能是「没有值守」，不能是「两个值守」。
     remove_legacy_plist(home, launchctl);
     write_plist(home, &plist_contents(exe, home))?;
-    // bootstrap 是唯一一次调用；若服务已加载（重复安装），launchctl 会报
-    // already bootstrapped，此时目标已达成，按成功处理而不是先 bootout
-    // （否则每次安装都会多一次调用，重装也可能中断正在跑的值守）。
+    // 清旧之后这一次 bootstrap 是**启动**那唯一一次；若服务已加载（重复安装），
+    // launchctl 会报 already bootstrapped，此时目标已达成，按成功处理而不是再
+    // bootout（否则每次安装都会多一次调用，重装也可能中断正在跑的值守）。
     match launchctl(&[
         "bootstrap".into(),
         uid_domain(),
