@@ -48,6 +48,106 @@ pub struct ThreadDiff {
     pub truncated: bool,
 }
 
+/// 模型投递到前端的一帧视图。
+///
+/// 与 [`ThreadDiff`] 的区别：`ThreadDiff` 是「结构化取数」的结果（软件决定看什么），
+/// 本帧是「模型给命令」的结果（模型决定看什么）。两者并存：前者服务单文件懒加载，
+/// 后者服务模型驱动的展示。
+///
+/// 片段化字段名（`asKind` / `exitCode` / `timedOut` / `baseKind`）是前端（Task 7/8）
+/// 逐字消费的线上契约，**不得**改名。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewFrame {
+    /// 执行的命令；`None` = 结构化默认（会话锚点 diff）。
+    pub command: Option<String>,
+    /// `diff` | `log` | `text`。
+    pub as_kind: String,
+    /// `None` = 没跑起来（超时 / 沙箱不可用）。
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
+    pub timed_out: bool,
+    pub note: Option<String>,
+    /// 结构化默认时的实际基准。
+    pub base: Option<String>,
+    /// `session` | `explicit` | `origin-head` | `origin-default` | `local-default` | `worktree-only`
+    pub base_kind: String,
+}
+
+/// 按内容判定渲染原语。判定不出即 `text`（保底永不失手）。
+///
+/// 判定只看内容，不看模型的声明：声明与内容不符时（Task 7 的 `resolveKind` 同样
+/// 会回退），渲染必须落在 `text` 上——把任意文本当 diff 渲染只会把面板画坏。
+pub fn classify(stdout: &str) -> &'static str {
+    let mut lines = stdout.lines().filter(|l| !l.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return "text";
+    };
+    // `diff --git ` 允许出现在首行之外的任何位置（多段 diff 之间可能有噪声行）；
+    // `--- ` 只认首行，否则普通文本里的分隔线会被误判成 diff。
+    if stdout.contains("diff --git ") || first.starts_with("--- ") {
+        return "diff";
+    }
+    // `git log --oneline` 一类：短 sha + 空格 + 非空描述。
+    let looks_like_log = first.len() > 8
+        && first.chars().take(7).all(|c| c.is_ascii_hexdigit())
+        && first.chars().nth(7) == Some(' ')
+        && first[8..].trim().len() > 0;
+    if looks_like_log {
+        return "log";
+    }
+    "text"
+}
+
+/// 结构化默认帧：不跑模型命令，直接算会话锚点 diff。
+pub fn structured_frame(repo: &Path, anchor: Option<&str>) -> ViewFrame {
+    let d = thread_diff(repo, None, anchor);
+    ViewFrame {
+        command: None,
+        as_kind: "diff".to_string(),
+        exit_code: Some(0),
+        stdout: d.unified_diff,
+        stderr: String::new(),
+        truncated: d.truncated,
+        timed_out: false,
+        note: None,
+        base: d.base,
+        base_kind: d.base_kind,
+    }
+}
+
+/// 把模型给的命令跑成帧。`as_hint` 是模型声明的原语（`None` = 自动判定）。
+///
+/// 声明合法时信声明、不覆盖（模型可能知道内容的样子，如带 `--stat` 的 diff）；
+/// 声明非法或缺失时才按内容判定。
+pub async fn command_frame(
+    repo: &Path,
+    command: &str,
+    as_hint: Option<&str>,
+    note: Option<String>,
+) -> ViewFrame {
+    let out = run_view_command(repo, command).await;
+    let as_kind = match as_hint {
+        Some("diff") | Some("log") | Some("text") => as_hint.unwrap_or_default().to_string(),
+        _ => classify(&out.stdout).to_string(),
+    };
+    ViewFrame {
+        command: Some(command.to_string()),
+        as_kind,
+        exit_code: out.exit_code,
+        stdout: out.stdout,
+        stderr: out.stderr,
+        truncated: out.truncated,
+        timed_out: out.timed_out,
+        note,
+        base: None,
+        // 命令帧没有「结构化基准」这一说：基准由模型在命令里自己给出。
+        base_kind: String::new(),
+    }
+}
+
 /// 跑 git 并返回成功时的 stdout 文本。
 ///
 /// 只认 success：`rev-parse --verify` / `merge-base` / `log` 这类命令失败时
@@ -952,5 +1052,63 @@ mod tests {
             out.timed_out,
             "sleep must be killed by the timeout: {out:?}"
         );
+    }
+
+    #[test]
+    fn classify_detects_diff_log_and_text() {
+        assert_eq!(classify("diff --git a/x b/x\n--- a/x\n"), "diff");
+        assert_eq!(
+            classify("abc1234 fix a thing\ndef5678 add another\n"),
+            "log"
+        );
+        assert_eq!(classify("random words\n"), "text");
+        assert_eq!(classify(""), "text");
+    }
+
+    #[test]
+    fn structured_frame_reports_the_session_anchor() {
+        let dir = repo();
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        let f = structured_frame(dir.path(), Some("trunk"));
+        assert_eq!(f.command, None, "structured default has no command");
+        assert_eq!(f.as_kind, "diff");
+        assert_eq!(f.base_kind, "session");
+        assert_eq!(f.base.as_deref(), Some("trunk"));
+        assert!(f.stdout.contains("+two"), "stdout: {}", f.stdout);
+    }
+
+    /// 帧的线协议字段名是前端（Task 7/8）逐字消费的契约：少一个 `asKind`、
+    /// 多一个蛇形名都会让面板读空。这里钉死整份驼峰形状。
+    #[test]
+    fn view_frame_serializes_as_camel_case() {
+        let f = ViewFrame {
+            command: Some("git log --oneline -1".into()),
+            as_kind: "log".into(),
+            exit_code: Some(0),
+            stdout: "abc1234 x\n".into(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: true,
+            note: Some("n".into()),
+            base: Some("trunk".into()),
+            base_kind: "session".into(),
+        };
+        let v = serde_json::to_value(&f).unwrap();
+        let obj = v.as_object().unwrap();
+        for key in [
+            "command",
+            "asKind",
+            "exitCode",
+            "stdout",
+            "stderr",
+            "truncated",
+            "timedOut",
+            "note",
+            "base",
+            "baseKind",
+        ] {
+            assert!(obj.contains_key(key), "missing `{key}` in {v}");
+        }
+        assert_eq!(obj.len(), 10, "no extra/renamed keys: {v}");
     }
 }

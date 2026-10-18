@@ -154,6 +154,13 @@ pub(crate) type ProjectRuntimes =
 /// 一份预算,这正是桌面端「四个就满」的成因。
 pub(crate) type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 
+/// 模型驱动的视图帧表：每会话一帧，**内存态**（不落盘，重启即空）。
+///
+/// 与 `git_diff` 句柄并列为 [`RuntimeAttachments`] 字段，理由同 `theme` /
+/// `lead_inbox`：`thread/view/read` 在主循环里读它，而写帧的 watcher 是另一个
+/// task，自造一份就会读写两张不相干的表。
+pub(crate) type ViewFrames = Arc<tokio::sync::Mutex<HashMap<String, crate::git_diff::ViewFrame>>>;
+
 /// 本进程的 runtime 接线:daemon 按项目共享,root 按会话持有。
 ///
 /// 两者成对传递,调用点无法只更新一半——只换了 daemon 映射、忘了 root 映射,
@@ -201,6 +208,10 @@ pub(crate) struct RuntimeAttachments {
     /// Git Diff 焦点句柄：`show_git_diff` 工具持它广播，watcher 翻译成
     /// `ui/gitDiff/focus` 通知。每个 thread 的工具与 watcher 共用同一实例。
     pub(crate) git_diff: crate::git_diff_tool::GitDiffHandle,
+    /// 模型驱动的视图帧表（每会话一帧，内存态）。与 `git_diff` 句柄并列。可
+    /// 注入的理由同 `lead_inbox`：`thread/view/read` 读它与写它的 watcher 必须
+    /// 是**同一个** `Arc`，测试也要能在主循环之外往同一张表里塞帧。
+    pub(crate) view_frames: ViewFrames,
     /// 安装常驻值守（macOS LaunchAgent）。可注入的理由同 `launcher`：测试里
     /// 绝不能真的调 `launchctl`，也绝不能碰用户真实的 `~/Library/LaunchAgents`。
     pub(crate) watchman_install: WatchmanInstall,
@@ -1576,6 +1587,7 @@ where
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
@@ -1657,6 +1669,7 @@ where
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
@@ -2309,7 +2322,6 @@ async fn pump_git_diff_notifications(
         };
         let n = Notification::UiGitDiffFocus {
             thread_id: focus.thread_id,
-            base: focus.base,
             note: focus.note,
         };
         if write_notification(&hub, &n).await.is_err() {
@@ -2376,6 +2388,7 @@ where
         launcher: board_launcher,
         theme,
         git_diff,
+        view_frames,
         watchman_install,
         watchman_uninstall,
         watchman_home,
@@ -2677,6 +2690,7 @@ where
                             turn_tx: &turn_tx,
                             build_agent: &build_agent,
                             git_diff_handle: &git_diff_handle,
+                            view_frames: &view_frames,
                             skills_home: &skills_home,
                             lead_inbox: &lead_inbox,
                             lead_replies: &lead_replies,

@@ -2921,7 +2921,7 @@ describe("App 会话详情栏的开合", () => {
 
     act(() => {
       for (const cb of state.notifHandlers) {
-        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", base: null, note: "看这里" } });
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: "看这里" } });
       }
     });
 
@@ -2991,7 +2991,7 @@ describe("App 会话详情栏的开合", () => {
 
     act(() => {
       for (const cb of state.notifHandlers) {
-        cb({ method: "ui/gitDiff/focus", params: { threadId: null, base: null, note: null } });
+        cb({ method: "ui/gitDiff/focus", params: { threadId: null, note: null } });
       }
     });
 
@@ -3054,7 +3054,7 @@ describe("App 会话详情栏的开合", () => {
       for (const cb of state.notifHandlers) {
         cb({
           method: "ui/gitDiff/focus",
-          params: { threadId: "t2", base: null, note: "这是 t2 的提示" },
+          params: { threadId: "t2", note: "这是 t2 的提示" },
         });
       }
     });

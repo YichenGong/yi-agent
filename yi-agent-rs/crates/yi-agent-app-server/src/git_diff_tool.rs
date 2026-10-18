@@ -14,8 +14,6 @@ use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 pub struct GitDiffFocus {
     /// 哪个会话的视图；`None` = 客户端按当前会话处理。
     pub thread_id: Option<String>,
-    /// 显式指定的比较基准；`None` = 客户端用默认（分叉点）规则。
-    pub base: Option<String>,
     /// 面向用户的说明，随通知带过去。
     pub note: Option<String>,
 }
@@ -101,9 +99,10 @@ impl Tool for ShowGitDiffTool {
             .base
             .map(|b| b.trim().to_string())
             .filter(|b| !b.is_empty());
+        // 基准不进焦点：它已由帧（`thread/view/read` 读回）承载，看板只需知道
+        // 「聚焦哪个会话」与说什么话。
         self.handle.broadcast(GitDiffFocus {
             thread_id: self.thread_id.clone(),
-            base: base.clone(),
             note: parsed
                 .note
                 .map(|n| n.trim().to_string())
@@ -131,6 +130,15 @@ impl Tool for ShowGitDiffTool {
 mod tests {
     use super::*;
 
+    /// 取 `ToolResult` 的第一段文本（`ToolResult` 没有文本访问器，
+    /// 其 `content` 是 `Vec<ContentBlock>`）。
+    fn text_of(result: &ToolResult) -> String {
+        match result.content.first() {
+            Some(yi_agent_core::ContentBlock::Text(t)) => t.clone(),
+            _ => String::new(),
+        }
+    }
+
     #[tokio::test]
     async fn broadcasting_an_explicit_base_reports_it_back() {
         let handle = GitDiffHandle::new();
@@ -142,8 +150,14 @@ mod tests {
         assert!(!result.is_error);
         let focus = rx.recv().await.unwrap();
         assert_eq!(focus.thread_id.as_deref(), Some("thread-1"));
-        assert_eq!(focus.base.as_deref(), Some("origin/main"));
         assert_eq!(focus.note.as_deref(), Some("review"));
+        // 基准不再是焦点里的字段：它随**帧**（`thread/view/read`）走。回执仍如实
+        // 说明用的是哪个基准（否则模型无从判断该不该解释一句）。
+        assert!(
+            text_of(&result).contains("origin/main"),
+            "the receipt still names the base: {:?}",
+            text_of(&result)
+        );
     }
 
     #[tokio::test]
@@ -154,8 +168,8 @@ mod tests {
         let result = tool.call(serde_json::json!({})).await;
         assert!(!result.is_error);
         let focus = rx.recv().await.unwrap();
-        assert_eq!(focus.base, None);
         assert_eq!(focus.thread_id, None);
+        assert_eq!(focus.note, None);
     }
 
     #[test]

@@ -1193,7 +1193,10 @@ export default function App() {
           sess.setPanelOpen(true);
           // 提示语随快照走（见 `pendingNoteRef`）：此行只登记挂起值。
           diff.setPendingDiffNote(n.params.note ?? null);
-          void diff.loadThreadDiff(target, n.params.base);
+          // 基准不再随通知携带（通知里已没有 `base`）：它现在由**帧**承载
+          // （`thread/view/read` 读回，见 Task 9）。故这里不带 base 读 diff——
+          // 帧到达时面板会用帧自己的 `base`/`baseKind` 显示真实基准。
+          void diff.loadThreadDiff(target);
           return;
         }
         if (n.method === "agent/trace/event") {

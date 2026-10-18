@@ -1404,6 +1404,9 @@ pub(crate) struct Harness {
     /// 与主循环**共享**的回信登记表:测试据此扮演等待方(`AskLeadTool`
     /// 的 `blocking: true`)并断言主循环真的把组长那轮的文本回填了回来。
     pub(crate) lead_replies: crate::lead::LeadReplies,
+    /// 与主循环**共享**的视图帧表:测试据此直接注入帧(模拟 Task 4 的工具写帧),
+    /// 并断言 `thread/view/read` 读的是**同一张**表。自造第二份会读出一张空表。
+    pub(crate) view_frames: crate::server::ViewFrames,
 }
 
 /// 记录到的 watchman 调用:安装为 `true`、卸载为 `false`，附所针对的 home。
@@ -1577,6 +1580,10 @@ impl Harness {
         // 「等待方登记的名字被主循环真的回填了」——自造第二份会得到一个
         // 永远等不到回信的登记表。
         let lead_replies = crate::lead::LeadReplies::new();
+        // 视图帧表:与主循环共享同一 `Arc`(注入进 `RuntimeAttachments`)。测试据此
+        // 直接注入帧,断言 `thread/view/read` 读的是同一张表。
+        let view_frames: crate::server::ViewFrames =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let handle = tokio::spawn(serve_scoped(
             server_r,
             server_w,
@@ -1602,6 +1609,9 @@ impl Harness {
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+                // 与 `Harness::view_frames` 是**同一个** `Arc`(见上方 `lead_inbox`
+                // 的同一手法):自造一份,测试注入的帧就没人读。
+                view_frames: Arc::clone(&view_frames),
                 watchman_install: install,
                 watchman_uninstall: uninstall,
                 watchman_home: watchman_home.path().to_path_buf(),
@@ -1629,6 +1639,7 @@ impl Harness {
             skills_home_dir: skills_home,
             lead_inbox,
             lead_replies,
+            view_frames,
         }
     }
 
@@ -2171,6 +2182,131 @@ async fn thread_diff_read_rejects_unknown_thread() {
     h.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_view_read_returns_null_before_any_frame() {
+    let mut cfg = test_config();
+    cfg.workdir = tempfile::TempDir::new().unwrap().path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"thread/view/read","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(9)) {
+        v = h.read_value().await;
+    }
+    // `result` 必须是**成功响应里的 null**，不是「没有 result 键」——方法与错误
+    // 分支同样给不出 result，只断言 `is_null()` 会把 method_not_found 放过去。
+    assert!(v.get("error").is_none(), "must be a success: {v}");
+    assert!(v.as_object().unwrap().contains_key("result"), "{v}");
+    assert!(
+        v["result"].is_null(),
+        "no frame yet must read back as null: {v}"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_view_read_refresh_produces_a_structured_frame() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "x\ny\n").unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":10,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(10)) {
+        v = h.read_value().await;
+    }
+    // 无帧时 refresh 走结构化默认：应是 diff 原语、基准是会话锚点、含未跟踪内容。
+    assert_eq!(v["result"]["asKind"], "diff", "frame: {v}");
+    assert_eq!(
+        v["result"]["baseKind"], "session",
+        "the session anchor is the base: {v}"
+    );
+    assert_eq!(v["result"]["command"], serde_json::Value::Null);
+    assert!(
+        v["result"]["stdout"].as_str().unwrap().contains("+y"),
+        "frame: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// 第二帧必须**重算**，不能是第一次的缓存：命令帧重跑同一条命令，故新写入的
+/// 内容会出现在重读结果里。没有这条断言，「refresh 只是把缓存又读了一遍」也
+/// 能让上面那条测试全绿。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_view_read_refresh_reruns_a_command_frame() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    {
+        // 帧表与主循环共享同一 `Arc`（`RuntimeAttachments::view_frames` 正是为此
+        // 注入）：这里塞进一条命令帧，模拟 Task 4 的工具写帧 / Task 9 的直接注入。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: Some("git log --oneline".to_string()),
+                as_kind: "text".to_string(),
+                exit_code: Some(0),
+                stdout: "stale\n".to_string(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: None,
+                base_kind: String::new(),
+            },
+        );
+    }
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":12,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(12)) {
+        v = h.read_value().await;
+    }
+    assert_eq!(
+        v["result"]["command"], "git log --oneline",
+        "a command frame keeps its command: {v}"
+    );
+    let stdout = v["result"]["stdout"].as_str().unwrap();
+    assert!(
+        stdout.contains("init"),
+        "the command must have been re-run, not re-read: {stdout:?}"
+    );
+    assert!(!stdout.contains("stale"), "stale frame: {stdout:?}");
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_view_read_rejects_unknown_thread() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":11,"method":"thread/view/read","params":{"threadId":"thread-nope"}}"#)
+        .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(11)) {
+        v = h.read_value().await;
+    }
+    assert_eq!(
+        v["error"]["code"], -32011,
+        "unknown thread uses the shared code"
+    );
+    h.shutdown().await;
+}
+
 /// A message to an unattached conversation fails loudly rather than
 /// pretending to queue: there is no daemon to queue it on.
 #[tokio::test(flavor = "multi_thread")]
@@ -2360,6 +2496,7 @@ async fn unknown_method_returns_method_not_found() {
         ("thread/setTag", Domain::Thread),
         ("thread/start", Domain::Thread),
         ("thread/subscribe", Domain::Thread),
+        ("thread/view/read", Domain::Thread),
         // ---- Agent ----
         ("agent/cancel", Domain::Agent),
         ("agent/cancel/preview", Domain::Agent),
@@ -2574,6 +2711,7 @@ async fn eof_exits_gracefully() {
             launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             // 测试注入:只记录调用,不碰真实 launchd / home。
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -2653,6 +2791,7 @@ async fn agent_factory_failure_returns_internal_error() {
             launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             // 测试注入:只记录调用,不碰真实 launchd / home。
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -2734,6 +2873,7 @@ async fn oversized_frame_returns_err() {
             launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             // 测试注入:只记录调用,不碰真实 launchd / home。
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -14618,6 +14758,7 @@ impl MergedHarness {
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+                view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 // 测试注入:只记账,不碰真实 launchd / home。
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),

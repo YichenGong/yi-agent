@@ -1751,6 +1751,79 @@ pub(crate) async fn handle(
             };
             write_response(state.hub, state.client, ok_response(id, result)).await?;
         }
+        "thread/view/read" => {
+            // 读回**帧**（模型给命令 / 结构化默认），与 `thread/diff/read` 的
+            // 「结构化取数」是两条不同的路径，故是两个方法而不是一个方法的开关。
+            let Some(thread_id) =
+                require_thread_id(state.hub, state.client, &req.params, id.clone()).await?
+            else {
+                return Ok(Flow::Continue);
+            };
+            if !require_known_thread(
+                state.hub,
+                state.client,
+                state.threads,
+                &thread_id,
+                id.clone(),
+            )
+            .await?
+            {
+                return Ok(Flow::Continue);
+            }
+            let refresh = req
+                .params
+                .get("refresh")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if refresh {
+                // 重算这一帧：**分叉**在「这一帧原本是命令帧还是结构化默认」上。
+                // 命令帧重跑同一条命令（模型可重复观察同一视角）；结构化默认则
+                // 重算锚点 diff（工作区在这期间变了，重读必须反映新内容）。
+                let cwd = state
+                    .threads
+                    .get(&thread_id)
+                    .map(|t| t.cwd.clone())
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or_else(|| state.cfg.workdir.display().to_string());
+                let repo = Path::new(&cwd);
+                let anchor = state
+                    .threads
+                    .get(&thread_id)
+                    .map(|t| t.store.load(&thread_id).ok().flatten())
+                    .flatten()
+                    .and_then(|l| l.meta.anchor_sha);
+                // 分两次短暂持锁，**不**把 guard 跨过 `command_frame` 的 await：
+                // `serve()` 跑在 `tokio::spawn` 里，guard 过 await 会让整个
+                // future 非 `Send`，直接编译不过。代价是「读缓存命令」与「写回
+                // 新帧」之间有一个窗口，两次并发 refresh 可能各跑一遍命令——
+                // 两者结果同源（同一条命令、同一个仓库），后写者胜即可。
+                let command = state
+                    .view_frames
+                    .lock()
+                    .await
+                    .get(&thread_id)
+                    .and_then(|f| f.command.clone());
+                let next = match command {
+                    Some(command) => {
+                        crate::git_diff::command_frame(repo, &command, None, None).await
+                    }
+                    None => crate::git_diff::structured_frame(repo, anchor.as_deref()),
+                };
+                state
+                    .view_frames
+                    .lock()
+                    .await
+                    .insert(thread_id.clone(), next);
+            }
+            let result = state
+                .view_frames
+                .lock()
+                .await
+                .get(&thread_id)
+                .map(|f| serde_json::to_value(f).unwrap_or(json!(null)))
+                .unwrap_or(json!(null));
+            write_response(state.hub, state.client, ok_response(id, result)).await?;
+        }
         "thread/subscribe" => {
             // 整体替换该客户端的订阅集合。**不在 ADMIN_METHODS 内**:
             // 任何已初始化客户端都能收窄自己的 feed。未调用过的客户端
