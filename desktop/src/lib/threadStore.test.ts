@@ -156,6 +156,23 @@ describe("ThreadStore", () => {
     expect(s.peek("a")).toBeUndefined();
   });
 
+  it("forgetPushStatuses lets a fresh listing re-seed a stale running status", () => {
+    const s = new ThreadStore();
+    // A turn was running: the push stream marked the status authoritative.
+    s.applyNotification({
+      method: "thread/status/updated",
+      params: { thread_id: "a", status: "running" },
+    });
+    // The sidecar crashes; the new process reports the thread as idle. Without
+    // forgetting the push, `seed` would refuse to overwrite the stale `running`.
+    s.seed([summary("a", "idle")]);
+    expect(s.view("a").status).toBe("running");
+
+    s.forgetPushStatuses();
+    s.seed([summary("a", "idle")]);
+    expect(s.view("a").status).toBe("idle");
+  });
+
   it("keeps an unsent draft per thread and returns it on switch-back", () => {
     const s = new ThreadStore();
     s.select("a");

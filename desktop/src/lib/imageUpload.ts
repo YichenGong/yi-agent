@@ -10,6 +10,7 @@
  */
 
 import { MAX_IMAGE_BYTES } from "./attachmentLimits";
+import { RPC } from "./routes";
 
 /** 与 app-server 的 `image_upload::UPLOAD_CHUNK_BYTES` 保持一致（512 KiB）。 */
 export const UPLOAD_CHUNK_BYTES = 512 * 1024;
@@ -204,7 +205,7 @@ export async function uploadImage(
   if (upload !== file && bytes.length > MAX_IMAGE_BYTES) throw transcodedTooLarge(upload);
 
   const uploadId = readUploadId(
-    await call("image/upload/begin", {
+    await call(RPC.imageUploadBegin, {
       threadId,
       name: upload.name,
       mime: upload.type,
@@ -215,13 +216,13 @@ export async function uploadImage(
   try {
     for (let index = 0, offset = 0; offset < bytes.length; index += 1, offset += UPLOAD_CHUNK_BYTES) {
       const slice = bytes.subarray(offset, offset + UPLOAD_CHUNK_BYTES);
-      await call("image/upload/chunk", { uploadId, index, data: bytesToBase64(slice) });
+      await call(RPC.imageUploadChunk, { uploadId, index, data: bytesToBase64(slice) });
     }
-    const committed = await call("image/upload/commit", { uploadId });
+    const committed = await call(RPC.imageUploadCommit, { uploadId });
     return { uploadId, path: readCommittedPath(committed) };
   } catch (e) {
     try {
-      await call("image/upload/abort", { uploadId });
+      await call(RPC.imageUploadAbort, { uploadId });
     } catch {
       // 尽力而为：收尾失败不能把真正的失败盖掉。
     }

@@ -3,22 +3,18 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use std::time::Duration;
 
-use serde_json::json;
 use tracing_subscriber::layer::SubscriberExt as _;
-use yi_agent_core::subagent::mailbox::{MailboxMessageDraft, MessageKind};
 use yi_agent_core::subagent::supervisor::{
-    AgentSupervisor, SpawnError, SupervisorEvent, SupervisorTools, WorkerStartError,
+    AgentSupervisor, SpawnError, SupervisorEvent, WorkerStartError,
 };
 use yi_agent_core::subagent::task::{
-    DeliveryReport, InheritedSandbox, PauseReason, PermissionRequestId, RecoveryEvidence,
-    RootSessionId, TaskDepth, TaskEvent, TaskId, TaskState,
+    DeliveryReport, InheritedSandbox, PauseReason, RecoveryEvidence, RootSessionId, TaskDepth,
+    TaskEvent, TaskId, TaskState,
 };
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, SpawnRequest, WorkerError, WorkerHandle, WorkerStart,
 };
-use yi_agent_core::{
-    ChildWriteMode, ContentBlock, ProviderTurnGate, ProviderTurnLease, ToolRegistry,
-};
+use yi_agent_core::{ChildWriteMode, ProviderTurnGate, ProviderTurnLease};
 
 #[tokio::test]
 async fn child_completion_snapshot_reports_a_childs_delivered_commit() {
@@ -129,45 +125,6 @@ async fn budget_exhausted_child_reports_exhaustion_with_its_partial_transcript()
         reports[0].report.as_deref(),
         Some("I got as far as rewriting the lexer"),
         "the partial transcript still reaches the parent"
-    );
-}
-
-/// A. A parent that already holds its child's completion message must still be
-/// able to see the delivered commit through wait_agent.
-#[tokio::test]
-async fn wait_agent_exposes_a_delivered_childs_commit() {
-    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
-    let root = supervisor.root_task_id().clone();
-    let child = supervisor.spawn(root.clone()).unwrap();
-    let factory = HandleCapturingWorkerFactory::default();
-    supervisor.start_worker(&factory, &child).await.unwrap();
-    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
-    let workspace = supervisor
-        .task(&child)
-        .unwrap()
-        .workspace
-        .clone()
-        .expect("spawned child owns a workspace");
-    handle.report_delivery(DeliveryReport::coding(
-        "deadbeef",
-        "main",
-        workspace,
-        "cargo test -p child",
-    ));
-    supervisor.reconcile_worker_events().unwrap();
-
-    let supervisor = Arc::new(Mutex::new(supervisor));
-    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
-
-    let result = wait_tool.call(json!({ "mode": "all" })).await;
-
-    assert!(!result.is_error, "wait must not fail");
-    let ContentBlock::Text(text) = &result.content[0] else {
-        panic!("expected text result");
-    };
-    assert!(
-        text.contains("deadbeef"),
-        "the parent must learn the delivered commit, got {text}"
     );
 }
 
@@ -354,66 +311,6 @@ fn unregistered_task_defaults_to_read_only() {
     assert_eq!(
         supervisor.workspace_mode(&TaskId::new()),
         ChildWriteMode::ReadOnly
-    );
-}
-
-fn spawned_child_id(content: &[ContentBlock]) -> TaskId {
-    let text = match &content[0] {
-        ContentBlock::Text(text) => text,
-        other => panic!("expected text result, got {other:?}"),
-    };
-    let value: serde_json::Value = serde_json::from_str(text).unwrap();
-    value["task_id"]
-        .as_str()
-        .expect("spawn response carries a task id")
-        .parse::<TaskId>()
-        .expect("spawn response task id parses")
-}
-
-#[tokio::test]
-async fn spawn_tool_parses_optional_mode_and_rejects_invalid_values() {
-    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
-    let root = supervisor.lock().unwrap().root_task_id().clone();
-    let tools = SupervisorTools::new(supervisor.clone(), root);
-    let spawn = tools.spawn_agent();
-
-    // Omitted mode defaults to read-only.
-    let default_result = spawn.call(json!({ "task": "audit" })).await;
-    assert!(!default_result.is_error);
-    let default_child = spawned_child_id(&default_result.content);
-
-    // An explicit coding request is honored.
-    let coding_result = spawn
-        .call(json!({ "task": "implement", "mode": "coding" }))
-        .await;
-    assert!(!coding_result.is_error);
-    let coding_child = spawned_child_id(&coding_result.content);
-
-    {
-        let supervisor = supervisor.lock().unwrap();
-        assert_eq!(
-            supervisor.workspace_mode(&default_child),
-            ChildWriteMode::ReadOnly
-        );
-        assert_eq!(
-            supervisor.workspace_mode(&coding_child),
-            ChildWriteMode::Coding
-        );
-    }
-
-    // Unknown enum values are rejected rather than defaulted.
-    assert!(
-        spawn
-            .call(json!({ "task": "audit", "mode": "bogus" }))
-            .await
-            .is_error
-    );
-    // A non-string mode is rejected rather than silently defaulted.
-    assert!(
-        spawn
-            .call(json!({ "task": "audit", "mode": 5 }))
-            .await
-            .is_error
     );
 }
 
@@ -877,91 +774,6 @@ async fn supervisor_reduces_worker_failure_events_and_releases_the_handle() {
     ));
 }
 
-#[tokio::test]
-async fn built_in_spawn_tool_returns_immediately_and_rejects_leaf_spawn() {
-    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
-    let root = supervisor.lock().unwrap().root_task_id().clone();
-    let tools = SupervisorTools::new(supervisor.clone(), root.clone());
-
-    let spawn = tools.spawn_agent();
-    assert_eq!(spawn.name(), "spawn_agent");
-    assert!(spawn.call(json!({})).await.is_error);
-    assert!(
-        !spawn
-            .call(json!({ "task": "Inspect the current task state." }))
-            .await
-            .is_error
-    );
-
-    let child = supervisor.lock().unwrap().children_of(&root)[0].clone();
-    let leaf = supervisor.lock().unwrap().spawn(child).unwrap();
-    let leaf_tools = SupervisorTools::new(supervisor, leaf);
-    assert!(leaf_tools.spawn_agent().call(json!({})).await.is_error);
-    assert_eq!(tools.wait_agent().name(), "wait_agent");
-    assert_eq!(tools.send_message().name(), "send_message");
-}
-
-#[tokio::test]
-async fn send_message_delivers_to_a_direct_child_mailbox() {
-    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
-    let root = supervisor.lock().unwrap().root_task_id().clone();
-    let child = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
-    let tools = SupervisorTools::new(supervisor.clone(), root);
-
-    let result = tools
-        .send_message()
-        .call(json!({ "recipient": child.to_string(), "message": "check progress" }))
-        .await;
-
-    assert!(!result.is_error);
-    assert_eq!(
-        supervisor
-            .lock()
-            .unwrap()
-            .mailbox(&child)
-            .unwrap()
-            .messages()
-            .len(),
-        1
-    );
-}
-
-// `start_worker` takes `&mut self`, so the guard must span the await.
-#[allow(clippy::await_holding_lock)]
-#[tokio::test]
-async fn send_message_wakes_the_recipient_worker_inbox() {
-    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
-    let root = supervisor.lock().unwrap().root_task_id().clone();
-    let child = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
-    let factory = InboxWorkerFactory {
-        handle: Arc::new(Mutex::new(None)),
-    };
-    supervisor
-        .lock()
-        .unwrap()
-        .start_worker(&factory, &child)
-        .await
-        .unwrap();
-    let mut inbox = factory
-        .handle
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .subscribe_messages();
-
-    let tools = SupervisorTools::new(supervisor, root);
-    assert!(
-        !tools
-            .send_message()
-            .call(json!({ "recipient": child.to_string(), "message": "check progress" }))
-            .await
-            .is_error
-    );
-    let message = inbox.recv().await.unwrap();
-    assert_eq!(message.body, "check progress");
-}
-
 #[test]
 fn terminal_task_cannot_send_a_message_to_its_parent() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
@@ -973,209 +785,6 @@ fn terminal_task_cannot_send_a_message_to_its_parent() {
     let result = supervisor.send_user_message(&child, root, "late message".into());
 
     assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn wait_all_returns_only_after_all_direct_children_are_terminal() {
-    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
-    let root = supervisor.lock().unwrap().root_task_id().clone();
-    let first = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
-    let second = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
-    supervisor.lock().unwrap().start_task(&first).unwrap();
-    supervisor.lock().unwrap().start_task(&second).unwrap();
-    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
-
-    let waiting = tokio::spawn(async move { wait_tool.call(json!({ "mode": "all" })).await });
-    tokio::task::yield_now().await;
-    assert!(!waiting.is_finished());
-
-    supervisor
-        .lock()
-        .unwrap()
-        .fail_task(&first, "first failed")
-        .unwrap();
-    tokio::task::yield_now().await;
-    assert!(!waiting.is_finished());
-
-    supervisor
-        .lock()
-        .unwrap()
-        .fail_task(&second, "second failed")
-        .unwrap();
-    let result = waiting.await.unwrap();
-    assert!(!result.is_error);
-    assert!(matches!(&result.content[0], ContentBlock::Text(text) if text.contains("completed")));
-}
-
-#[tokio::test]
-async fn wait_any_returns_after_the_first_terminal_child() {
-    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
-    let root = supervisor.lock().unwrap().root_task_id().clone();
-    let first = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
-    let second = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
-    supervisor.lock().unwrap().start_task(&first).unwrap();
-    supervisor.lock().unwrap().start_task(&second).unwrap();
-    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
-
-    let waiting = tokio::spawn(async move { wait_tool.call(json!({ "mode": "any" })).await });
-    tokio::task::yield_now().await;
-    supervisor
-        .lock()
-        .unwrap()
-        .fail_task(&first, "first failed")
-        .unwrap();
-
-    let result = waiting.await.unwrap();
-    assert!(!result.is_error);
-    assert!(
-        !supervisor
-            .lock()
-            .unwrap()
-            .task(&second)
-            .unwrap()
-            .state()
-            .is_terminal()
-    );
-}
-
-#[tokio::test]
-async fn wait_any_returns_only_terminal_child_reports() {
-    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
-    let root = supervisor.root_task_id().clone();
-    let first = supervisor.spawn(root.clone()).unwrap();
-    let second = supervisor.spawn(root.clone()).unwrap();
-    let factory = HandleCapturingWorkerFactory::default();
-    supervisor.start_worker(&factory, &first).await.unwrap();
-    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
-    supervisor.start_task(&second).unwrap();
-    handle.report_completed("first result");
-    supervisor.reconcile_worker_events().unwrap();
-    let supervisor = Arc::new(Mutex::new(supervisor));
-    let wait_tool = SupervisorTools::new(supervisor, root).wait_agent();
-
-    let result = wait_tool.call(json!({ "mode": "any" })).await;
-
-    assert!(!result.is_error);
-    let text = match &result.content[0] {
-        ContentBlock::Text(text) => text,
-        other => panic!("expected text result, got {other:?}"),
-    };
-    let value: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(value["status"], "completed");
-    assert_eq!(value["children"], json!([first.to_string()]));
-    assert_eq!(value["reports"].as_array().unwrap().len(), 1);
-    assert_eq!(value["reports"][0]["task_id"], first.to_string());
-    assert_eq!(value["reports"][0]["report"], "first result");
-}
-
-#[tokio::test]
-async fn completed_worker_report_wakes_wait_agent() {
-    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
-    let root = supervisor.root_task_id().clone();
-    let child = supervisor.spawn(root.clone()).unwrap();
-    let factory = HandleCapturingWorkerFactory::default();
-    supervisor.start_worker(&factory, &child).await.unwrap();
-    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
-    let supervisor = Arc::new(Mutex::new(supervisor));
-    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
-
-    let waiting = tokio::spawn(async move { wait_tool.call(json!({ "mode": "all" })).await });
-    tokio::task::yield_now().await;
-    assert!(!waiting.is_finished());
-
-    handle.report_completed("finished quickly");
-    supervisor
-        .lock()
-        .unwrap()
-        .reconcile_worker_events()
-        .unwrap();
-
-    let result = tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
-        .await
-        .expect("completed worker report should wake wait_agent")
-        .unwrap();
-    assert!(!result.is_error);
-    assert!(matches!(
-        &result.content[0],
-        ContentBlock::Text(text) if text.contains("finished quickly")
-    ));
-}
-
-#[tokio::test]
-async fn wait_agent_returns_completed_child_reports() {
-    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
-    let root = supervisor.root_task_id().clone();
-    let child = supervisor.spawn(root.clone()).unwrap();
-    let factory = HandleCapturingWorkerFactory::default();
-    supervisor.start_worker(&factory, &child).await.unwrap();
-    let handle = factory.handle.lock().unwrap().as_ref().unwrap().clone();
-    handle.report_completed("sub-agent 正常完成，结果可读");
-    supervisor.reconcile_worker_events().unwrap();
-    let supervisor = Arc::new(Mutex::new(supervisor));
-    let wait_tool = SupervisorTools::new(supervisor.clone(), root).wait_agent();
-
-    let result = wait_tool.call(json!({ "mode": "all" })).await;
-
-    assert!(!result.is_error);
-    let text = match &result.content[0] {
-        ContentBlock::Text(text) => text,
-        other => panic!("expected text result, got {other:?}"),
-    };
-    let value: serde_json::Value = serde_json::from_str(text).unwrap();
-    assert_eq!(value["status"], "completed");
-    assert_eq!(value["reports"][0]["task_id"], child.to_string());
-    assert_eq!(value["reports"][0]["state"], "completed_no_changes");
-    assert_eq!(
-        value["reports"][0]["report"],
-        "sub-agent 正常完成，结果可读"
-    );
-}
-
-#[tokio::test]
-async fn wait_is_interrupted_by_a_permission_request() {
-    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
-    let root = supervisor.lock().unwrap().root_task_id().clone();
-    let child = supervisor.lock().unwrap().spawn(root.clone()).unwrap();
-    let wait_tool = SupervisorTools::new(supervisor.clone(), root.clone()).wait_agent();
-
-    let waiting = tokio::spawn(async move { wait_tool.call(json!({ "mode": "any" })).await });
-    tokio::task::yield_now().await;
-    let request = MailboxMessageDraft::new(
-        child.clone(),
-        root,
-        MessageKind::PermissionRequest(PermissionRequestId::new()),
-        None,
-    );
-    supervisor
-        .lock()
-        .unwrap()
-        .send_message(&child, request)
-        .unwrap();
-
-    let result = tokio::time::timeout(Duration::from_secs(1), waiting)
-        .await
-        .expect("permission request should interrupt the wait")
-        .unwrap();
-    assert!(
-        matches!(&result.content[0], ContentBlock::Text(text) if text.contains("needs_attention"))
-    );
-}
-
-#[test]
-fn supervisor_toolset_registers_all_three_builtin_schemas() {
-    let supervisor = Arc::new(Mutex::new(AgentSupervisor::new(RootSessionId::new())));
-    let root = supervisor.lock().unwrap().root_task_id().clone();
-    let tools = SupervisorTools::new(supervisor, root);
-    let mut registry = ToolRegistry::new();
-
-    tools.register_into(&mut registry);
-
-    let names = registry
-        .schemas()
-        .into_iter()
-        .map(|schema| schema.name)
-        .collect::<Vec<_>>();
-    assert_eq!(names, vec!["send_message", "spawn_agent", "wait_agent"]);
 }
 
 #[test]

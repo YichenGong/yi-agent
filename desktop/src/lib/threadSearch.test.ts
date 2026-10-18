@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { filterThreadTree } from "./threadSearch";
+import { resolveTagNames } from "./threadTags";
 import type { ThreadSummary, WorkspaceGroup } from "./protocol";
 
 function thread(id: string, title: string | null, cwd: string): ThreadSummary {
@@ -135,5 +136,51 @@ describe("filterThreadTree", () => {
   it("分组与 pinned 都无命中时 empty 为 true", () => {
     const pin = thread("9", "pinned thing", "/work/projZ");
     expect(filterThreadTree(groups, [pin], "zzz").empty).toBe(true);
+  });
+
+  it("matches a thread by its tag's default name", () => {
+    const withTag: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          { thread_id: "1", cwd: "/work/projA", model: "m", created_at: 0, updated_at: 0, title: "alpha", tag: "red" },
+          { thread_id: "2", cwd: "/work/projA", model: "m", created_at: 0, updated_at: 0, title: "beta", tag: "blue" },
+        ],
+      },
+    ];
+    // 默认名「红」命中，且只命中打了 red 的那条。
+    expect(idsOf(filterThreadTree(withTag, [], "红"))).toEqual(["1"]);
+  });
+
+  it("matches a thread by a customized tag name, not the default", () => {
+    const withTag: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          { thread_id: "1", cwd: "/work/projA", model: "m", created_at: 0, updated_at: 0, title: "alpha", tag: "red" },
+        ],
+      },
+    ];
+    const names = resolveTagNames({ red: "紧急" });
+    expect(idsOf(filterThreadTree(withTag, [], "紧急", names))).toEqual(["1"]);
+    // 改过名后旧名不再命中。
+    expect(filterThreadTree(withTag, [], "红", names).empty).toBe(true);
+  });
+
+  it("ignores an invalid tag when searching", () => {
+    const withTag: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          { thread_id: "1", cwd: "/work/projA", model: "m", created_at: 0, updated_at: 0, title: "alpha", tag: "chartreuse" },
+        ],
+      },
+    ];
+    // 脏 tag 不并入匹配文本，也不崩；按标题仍能命中。
+    expect(idsOf(filterThreadTree(withTag, [], "alpha"))).toEqual(["1"]);
+    expect(filterThreadTree(withTag, [], "chartreuse").empty).toBe(true);
   });
 });
