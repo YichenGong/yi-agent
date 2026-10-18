@@ -4,13 +4,31 @@
 # 只扫 git 跟踪文件（`git grep` 默认只看跟踪内容），因此
 # deploy/relay/.relay-local.md 这类「已忽略的本机私密记录」天然被排除。
 #
-# 退出码：0 = 通过；1 = 发现疑似凭据。
+# 退出码：0 = 通过；1 = 发现疑似凭据；2 = 扫描没能真正执行（基础设施故障）。
+# 「扫不动」必须失败，而不是假绿：非 git 仓库、一个文件都扫不到、
+# `git grep` 自身报错（rc>1，如坏 pathspec）都走 exit 2；`git grep` 无匹配时
+# rc=1，那才是正常的「没有匹配」。
 # 输出以 `::error::` 开头，GitHub Actions 会渲染成注解。
 set -euo pipefail
 
 # 扫描界钉在仓库根，而不是调用者的 cwd：`just` recipe 的 cwd 是
 # `yi-agent-rs/`，若以 cwd 为界则根目录的 `docs/` 等被跳过，门禁会假绿。
-cd "$(git rev-parse --show-toplevel)"
+# 非仓库目录下 `git rev-parse` 会失败，但 macOS 上 `cd ""` 返回 0、`set -e`
+# 兜不住，脚本会「零文件扫描」却报绿 —— 这里显式失败。
+top="$(git rev-parse --show-toplevel 2>/dev/null)" || top=""
+if [ -z "$top" ] || [ ! -d "$top" ]; then
+  echo "::error::secret-check: not inside a git repository - cannot scan"
+  exit 2
+fi
+cd "$top"
+
+# 同一类假绿：一个文件都扫不到时 `git grep` 会「无匹配地成功」，于是
+# 「零文件被扫描」被当成「没有凭据」。unborn HEAD 的空仓库即此形态。
+scannable="$(git ls-files 2>/dev/null)" || scannable=""
+if [ -z "$scannable" ]; then
+  echo "::error::secret-check: nothing to scan (no tracked files) - cannot verify credentials"
+  exit 2
+fi
 
 # 扫描排除项：
 # - `scripts/check-secrets.sh`：本门禁自身必须写出这些字面值（否则无从匹配）；
@@ -47,16 +65,24 @@ report_hits() { # report_hits <label> <git-grep-output>
 
 # 1) 已知泄露值的字面量。轮换后若再出现，即为「有人从历史里捞回来」的回归。
 set +e
-hits=$(git grep -n -e 'fe42addbfed257dcd396e7fcc45e2725' -- . "${EXCLUDES[@]}" 2>/dev/null)
+hits=$(git grep -n -e 'fe42addbfed257dcd396e7fcc45e2725' -- . "${EXCLUDES[@]}" 2>/dev/null); rc=$?
 set -e
+if [ "$rc" -gt 1 ]; then
+  echo "::error::secret-check: git grep failed (rc=$rc) - cannot verify credentials"
+  exit 2
+fi
 if [ -n "$hits" ]; then
   report_hits "known leaked session id present:" "$hits"
 fi
 
 # 2) 真实中继域名（示例域名 relay.example.com 不匹配本条）。
 set +e
-hits=$(git grep -n -E 'relay\.yi-agent\.top' -- . "${EXCLUDES[@]}" 2>/dev/null)
+hits=$(git grep -n -E 'relay\.yi-agent\.top' -- . "${EXCLUDES[@]}" 2>/dev/null); rc=$?
 set -e
+if [ "$rc" -gt 1 ]; then
+  echo "::error::secret-check: git grep failed (rc=$rc) - cannot verify credentials"
+  exit 2
+fi
 if [ -n "$hits" ]; then
   report_hits "real relay hostname in tracked file:" "$hits"
 fi
@@ -64,8 +90,12 @@ fi
 # 3) 非保留段的公网 IP，且处于 ssh/relay 语境。
 #    RFC 5737 保留段（192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）不匹配。
 set +e
-hits=$(git grep -n -E '(101\.47\.76\.100)|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . "${EXCLUDES[@]}" 2>/dev/null)
+hits=$(git grep -n -E '(101\.47\.76\.100)|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . "${EXCLUDES[@]}" 2>/dev/null); rc=$?
 set -e
+if [ "$rc" -gt 1 ]; then
+  echo "::error::secret-check: git grep failed (rc=$rc) - cannot verify credentials"
+  exit 2
+fi
 if [ -n "$hits" ]; then
   report_hits "public IP in relay/ssh context:" "$hits"
 fi

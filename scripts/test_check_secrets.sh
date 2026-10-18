@@ -58,6 +58,20 @@ printf 'nothing to see here\n' > "$r5/src/clean.md"
 git -C "$r5" add leak.md src/clean.md
 ( cd "$r5/src" && bash "$SCRIPT" >/dev/null 2>&1 ); check "invoked from subdir still scans repo root" 1 $?
 
+# --- case 6: 不在 git 仓库里 → 必须 exit 2（扫不动就要红，而不是假绿）
+#     这里刻意不做 `git init`：macOS 上 `cd ""` 返回 0，修复前脚本会一路走到
+#     `secret-check passed` 并 exit 0，即「零文件扫描」被当成「没有凭据」。
+r6="$work/notarepo"; mkdir -p "$r6"
+( cd "$r6" && bash "$SCRIPT" >/dev/null 2>&1 ); check "not a git repository fails (cannot scan)" 2 $?
+
+# --- case 7: 空仓库（unborn HEAD，无提交、索引为空）→ 必须 exit 2
+#     实测：此处 `git grep` 对"无匹配"返回 rc=1，并非 rc=128，所以「零文件被
+#     扫描」不会被 rc 检查抓到，靠的是「一个可扫文件都没有」这道守卫。
+r7="$work/nocommits"; mkdir -p "$r7/docs"
+git -C "$r7" init -q
+printf 'session = fe42addbfed257dcd396e7fcc45e2725\n' > "$r7/docs/a.md"
+( cd "$r7" && bash "$SCRIPT" >/dev/null 2>&1 ); check "repo with nothing tracked fails (cannot verify)" 2 $?
+
 echo
 if [ "$failn" -ne 0 ]; then echo "$failn failed, $pass passed"; exit 1; fi
 echo "$pass passed"
