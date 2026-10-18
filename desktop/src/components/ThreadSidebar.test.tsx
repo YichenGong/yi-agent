@@ -736,17 +736,37 @@ describe("ThreadSidebar 看板", () => {
     expect(onOpenBoard).toHaveBeenCalledWith("/other");
   });
 
-  it("选中的看板条目用与线程一致的底色", () => {
-    const selected = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: "/proj" });
+  it("选中的看板条目用与线程行相同的 token，未选中只有 hover", () => {
+    // 断言的是**语义 token**而不是某个字面色阶：看板条目与线程行的选中态必须
+    // 逐类名一致（`bg-raised`/`text-fg`），否则切到浅色主题时其中一边会失读。
+    // 早先这里比对的是某个字面灰阶类名，把「字面色阶」这一漂移固化进了测试。
+    //
+    // 两组选中态同时成立才有可比性：看板条目由 `selectedBoard` 选中，线程行由
+    // `currentId` 选中——传一个只选中看板，线程行会是未选中态，比较就没有意义。
+    const selected = renderSidebar({
+      groups: boardGroups,
+      boards: ["/proj"],
+      selectedBoard: "/proj",
+      currentId: "b1",
+    });
     const selectedClasses = selected.container
       .querySelector('[aria-label="看板"]')!
       .className.split(/\s+/);
-    expect(selectedClasses).toContain("bg-neutral-800");
+    expect(selectedClasses).toContain("bg-raised");
+    expect(selectedClasses).toContain("text-fg");
+
+    // 线程行用同一套 token——两边同源，改一边而另一边没跟上就会在此失败。
+    const threadRow = selected.container
+      .querySelector('[title="board-thread"]')!
+      .closest("div[tabindex]")!
+      .className.split(/\s+/);
+    expect(threadRow).toContain("bg-raised");
+    expect(threadRow).toContain("text-fg");
 
     const idle = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: null });
     const idleClasses = idle.container.querySelector('[aria-label="看板"]')!.className.split(/\s+/);
-    // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-neutral-800/50 被当选中态。
-    expect(idleClasses).not.toContain("bg-neutral-800");
+    // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-raised/50 被当选中态。
+    expect(idleClasses).not.toContain("bg-raised");
   });
 
   it("把卡片会话收进默认折叠的「看板会话」小节，展开后可见", () => {

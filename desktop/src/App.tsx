@@ -2068,7 +2068,7 @@ export default function App() {
           {board.selectedBoard !== null ? (
             <section
               aria-label="Superpowers 看板"
-              className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-neutral-800 bg-neutral-925"
+              className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-line bg-panel"
             >
               {/* 顶栏：项目路径 + 开关/值守 + 入队 + 错误行 */}
               <div className="flex items-center gap-3 px-4 pt-3">
@@ -2091,7 +2091,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => void onCreateBoard(board.selectedBoard!)}
-                      className="rounded border border-neutral-700 px-2 py-0.5 text-neutral-300 hover:text-neutral-100"
+                      className="rounded border border-line-strong px-2 py-0.5 text-fg-muted hover:text-fg"
                     >
                       创建看板
                     </button>
