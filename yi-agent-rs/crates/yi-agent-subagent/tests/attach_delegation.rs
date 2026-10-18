@@ -204,6 +204,101 @@ fn a_conversation_root_sends_its_linked_roots_to_the_daemon() {
     yi_agent_subagent::attach::detach_root(&attached.socket_path, &attached.attached_root);
 }
 
+/// 根会话带着关联根派生的子任务，必须继承同一根集（跨 Task 1–3 的端到端）。
+///
+/// 覆盖的缺口：既有单测分别钉住「根行记下根集」（`a_conversation_root_sends_its_linked_roots_to_the_daemon`）
+/// 与「协调器逐层继承」；这里钉的是**应用侧真实入口**（`ThreadRoot::attach` → `SpawnApplicationChild`）
+/// 之后，子任务行里确实有根集，而不只是根行有。
+///
+/// 不调 LLM：全程只走 IPC 与 sqlite 读回。
+#[test]
+fn a_spawned_child_inherits_the_conversations_linked_roots() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let linked = tempfile::TempDir::new().unwrap();
+    let runtime_dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+
+    let attached = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime_dir.path().to_path_buf(),
+        &isolated_models_path(repo.path()),
+    )
+    .expect("a clean git project must attach");
+
+    // 根会话携带关联根。
+    let binding = yi_agent_subagent::binding::RuntimeBinding::fixed(
+        yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: attached.socket_path.clone(),
+            workspace_root: attached.workspace_root.clone(),
+            session_id: attached.attached_root.session_id.clone(),
+            task_id: attached.attached_root.task_id.clone(),
+            capability: attached.attached_root.capability.clone(),
+        },
+    );
+    let thread = ThreadRoot::new(
+        Arc::clone(&binding),
+        "thread-linked-spawn",
+        repo.path().to_path_buf(),
+        vec![linked.path().to_path_buf()],
+    );
+    thread.attach().expect("the conversation root attaches");
+    let root_task_id = thread.root_task_id().expect("the root is attached");
+
+    // 父任务必须先激活，子任务才被接纳（与文件内既有 e2e 同序）。
+    thread
+        .activate("investigate the linked roots")
+        .expect("activation must succeed");
+
+    // 全程用本会话自己的 root 句柄，与 app-server 的 driver 同序：
+    // `attach_project_runtime` 起的是应用级 root，而承载关联根的是每个会话自己的
+    // `ThreadRoot`。拿前者去 spawn 会被 capability 检查拒掉（`AuthorityDenied`），
+    // 因为它的 root task id 不是 `thread.attach()` 铸出的那一个。
+    let handle = thread
+        .handle()
+        .expect("the attached conversation resolves a handle");
+    let spawned = yi_agent_store::ipc::send_request(
+        &handle.socket_path,
+        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+            session_id: handle.session_id.clone(),
+            parent_task_id: handle.task_id.clone(),
+            capability: handle.capability.clone(),
+            objective: "a delegated read-only investigation".into(),
+            mode: Some("read_only".into()),
+            model: None,
+            workdir: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+        },
+    )
+    .expect("the runtime socket must accept a delegated child");
+    let yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id: child_id } = spawned else {
+        panic!("a delegated child must be admitted, got {spawned:?}");
+    };
+
+    let database = runtime_dir.path().join("runtime.sqlite");
+    let repository = yi_agent_store::repository::RuntimeRepository::open(&database)
+        .expect("the daemon's database opens for reading");
+    let expected = vec![linked.path().to_string_lossy().to_string()];
+    assert_eq!(
+        repository
+            .task_extra_roots(&root_task_id.parse().expect("the root id is a uuid"))
+            .expect("the root row is readable"),
+        expected,
+        "the root row carries the conversation's linked roots"
+    );
+    assert_eq!(
+        repository
+            .task_extra_roots(&child_id.parse().expect("the child id is a uuid"))
+            .expect("the child row is readable"),
+        expected,
+        "a spawned child must inherit the conversation's linked roots"
+    );
+
+    yi_agent_subagent::attach::detach_root(&attached.socket_path, &attached.attached_root);
+}
+
 /// With nothing listening, the runtime must be created rather than reported as
 /// a permanent failure: this is what lets the desktop recover at all.
 #[test]
