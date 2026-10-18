@@ -7,16 +7,25 @@ pub(crate) mod git_diff;
 pub mod git_diff_tool;
 pub mod image_upload;
 pub mod lead;
+pub(crate) mod lead_loop;
+pub mod lead_memory;
 pub mod model_rpc;
 pub mod onboarding_rpc;
 pub mod pair_uri;
 pub mod pairing;
 pub mod protocol;
+pub(crate) mod rpc;
 pub mod server;
 pub mod session;
 pub(crate) mod session_driver;
 pub mod settings_store;
 pub mod skill_rpc;
+/// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。
+///
+/// 放在 `mod tests` 之外，因为 `#[cfg(test)]` 的 `mod tests` 对其它文件不可见；
+/// 这里同样只在 test 构建下存在，避免生产构建出现 dead_code。
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod theme_tool;
 pub mod thread_store;
 pub mod translate;

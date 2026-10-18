@@ -12,3 +12,12 @@ describe("CacheNotice", () => {
     expect(screen.getByRole("status").textContent).toContain("3m");
   });
 });
+
+describe("CacheNotice syncing", () => {
+  it("says it is syncing instead of showing an offline age", () => {
+    render(<CacheNotice syncing />);
+    const text = screen.getByRole("status").textContent ?? "";
+    expect(text).toContain("正在同步");
+    expect(text).not.toContain("离线内容");
+  });
+});

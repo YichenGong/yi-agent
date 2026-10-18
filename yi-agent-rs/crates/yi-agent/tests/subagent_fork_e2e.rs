@@ -12,8 +12,9 @@
 //!   -> daemon `take_fork_messages` -> `WorkerStart.fork_messages`
 //!   -> the worker seeds its session -> the provider request carries the history.
 //!
-//! A second run omits `fork` entirely and must reach the provider with only the
-//! objective, proving the default stays the old, unforked behavior.
+//! Omitting `fork` now forks by default: the child inherits the caller's
+//! history, and the result reports `forked: true`. An explicit `fork: false` is
+//! the escape hatch that keeps the old, contextless behaviour.
 //!
 //! It is deliberately *not* degraded to a client-only assertion: the child's
 //! provider request is observed, so a break anywhere between the tool and the
@@ -98,6 +99,27 @@ fn texts_of(request: &ProviderRequest) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// Reads the `forked` flag out of a `spawn_agent` result payload.
+///
+/// The tool returns JSON as a text block, so the flag is parsed back out. A
+/// missing flag is a hard failure rather than a defaulted `false`: the whole
+/// point of the field is to tell the caller which path was taken.
+fn fork_flag_of(result: &yi_agent_core::ToolResult) -> bool {
+    let text = result
+        .content
+        .iter()
+        .find_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("a spawn result carries a text block");
+    let payload: serde_json::Value = serde_json::from_str(&text).expect("a spawn result is JSON");
+    payload
+        .get("forked")
+        .and_then(serde_json::Value::as_bool)
+        .expect("a spawn result must report whether the child was forked")
 }
 
 fn init_git_repo(dir: &Path) {
@@ -302,33 +324,55 @@ fn fork_true_spawns_a_child_whose_first_request_carries_the_caller_history() {
     );
 }
 
-/// The regression side of the contract: omitting `fork` keeps today's behavior
-/// -- the child's first request is the objective alone.
+/// The new default: omitting `fork` hands the caller's history to the child,
+/// and the result says so.
 #[test]
-fn an_unforked_spawn_sends_only_the_objective_to_the_child() {
+fn an_omitted_fork_inherits_the_caller_history_by_default() {
     let fixture = ForkFixture::start();
 
-    // `fork` is omitted entirely, which is the default path.
+    // `fork` is omitted entirely, which is now the forking default.
     let result = fixture.spawn(serde_json::json!({ "task": OBJECTIVE }));
     assert!(
         !result.is_error,
-        "an unforked spawn must be accepted: {:?}",
+        "a default spawn must be accepted: {:?}",
+        result.content
+    );
+    assert!(
+        fork_flag_of(&result),
+        "the default path must report forked:true: {:?}",
         result.content
     );
 
     let texts = fixture.first_request_texts();
     assert!(
-        texts.iter().any(|text| text.contains(OBJECTIVE)),
-        "the objective must reach the child: {texts:?}"
+        texts.iter().any(|text| text.contains(PARENT_HISTORY)),
+        "a default child must inherit the caller's history: {texts:?}"
     );
     assert!(
-        !texts.iter().any(|text| text.contains(PARENT_HISTORY)),
-        "an unforked child must not inherit the caller's history: {texts:?}"
+        texts.iter().any(|text| text.contains(OBJECTIVE)),
+        "the objective must still reach the child: {texts:?}"
     );
-    assert_eq!(
-        fixture.first_request_message_count(),
-        1,
-        "an unforked child sends exactly its objective"
+}
+
+/// An explicit `fork:true` means what it always did, and now also reports
+/// `forked:true`.
+#[test]
+fn fork_true_reports_that_the_child_was_forked() {
+    let fixture = ForkFixture::start();
+
+    let result = fixture.spawn(serde_json::json!({
+        "task": OBJECTIVE,
+        "fork": true,
+    }));
+    assert!(
+        !result.is_error,
+        "a forked spawn must be accepted: {:?}",
+        result.content
+    );
+    assert!(
+        fork_flag_of(&result),
+        "fork:true must report forked:true: {:?}",
+        result.content
     );
 }
 
@@ -345,6 +389,11 @@ fn fork_false_matches_the_unforked_path() {
     assert!(
         !result.is_error,
         "a fork:false spawn must be accepted: {:?}",
+        result.content
+    );
+    assert!(
+        !fork_flag_of(&result),
+        "fork:false must report forked:false: {:?}",
         result.content
     );
 

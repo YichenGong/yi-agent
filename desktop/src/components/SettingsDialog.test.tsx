@@ -102,7 +102,7 @@ describe("SettingsDialog", () => {
     expect(await screen.findByText("还没有配置任何模型")).toBeTruthy();
   });
 
-it("shows a 技能 tab backed by the injected skillsCall", async () => {
+  it("shows a 技能 tab backed by the injected skillsCall", async () => {
     const skillsCall = async (method: string) =>
       method === "skill/list"
         ? {
@@ -123,10 +123,28 @@ it("shows a 技能 tab backed by the injected skillsCall", async () => {
     expect(await screen.findByText("user-skill")).toBeTruthy();
   });
 
-  it("lists all five categories on the desktop", () => {
+  it("shows the 标签 tab and forwards a name edit", async () => {
+    const saveTagName = vi.fn();
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        saveTagName={saveTagName}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "标签" }));
+    const input = document.querySelector<HTMLInputElement>('[data-tag-name-input="red"]')!;
+    fireEvent.change(input, { target: { value: "紧急" } });
+    fireEvent.blur(input);
+    expect(saveTagName).toHaveBeenCalledWith("red", "紧急");
+  });
+
+  it("lists all six categories on the desktop", () => {
     render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
     const names = screen.getAllByRole("tab").map((t) => t.textContent);
-    expect(names).toEqual(["通用", "远程访问", "插件", "模型", "技能"]);
+    expect(names).toEqual(["通用", "远程访问", "插件", "模型", "技能", "标签"]);
   });
 });
 
@@ -257,6 +275,7 @@ describe("SettingsDialog phone layout hooks", () => {
       "plugins",
       "models",
       "skills",
+      "tags",
     ]);
   });
 

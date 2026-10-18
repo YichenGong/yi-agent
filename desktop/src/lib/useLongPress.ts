@@ -21,7 +21,9 @@ const SWALLOW_WINDOW_MS = 400;
 /** 长按落点：会话行或工作区分组头（文件夹）。 */
 export type LongPressTarget =
   | { kind: "thread"; id: string; el: HTMLElement }
-  | { kind: "group"; ws: string; el: HTMLElement };
+  | { kind: "group"; ws: string; el: HTMLElement }
+  /** 附属根小节头：菜单只有「取消关联」。 */
+  | { kind: "child"; ws: string; el: HTMLElement };
 
 /** 由调用方把 pointerdown 的目标解析成落点；返回 null 表示这次按下不算长按。 */
 export type ResolveTarget = (e: ReactPointerEvent<HTMLElement>) => LongPressTarget | null;

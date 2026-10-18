@@ -215,6 +215,9 @@ File discovery:
   required.
 
 Subagent integration:
+- A delegated child inherits your current conversation by default, so it already
+  knows what you have read and decided. Pass `fork: false` only when the child
+  must start from a clean slate.
 - A child runs in the `workdir` you pass to `spawn_agent`. When a change needs
   isolation, create that directory yourself first: `git worktree add <path> -b
   <branch>`, then pass `<path>` as the child's `workdir`. When it does not, pass

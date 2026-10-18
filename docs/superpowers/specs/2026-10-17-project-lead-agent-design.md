@@ -1,7 +1,7 @@
 # 项目组长 Agent（Project Lead）设计
 
 日期：2026-10-17
-状态：P1 已实现并合入（见下），P2/P3 待实现
+状态：P1/P2 已实现并合入，P3 待实现
 模块：`yi-agent-app-server`、`yi-agent-subagent`、`desktop`、移动端远程
 关联：`docs/project-management/yi-agent-app-server.md`、`docs/project-management/subagent-runtime.md`、
 `docs/project-management/desktop.md`
@@ -374,6 +374,12 @@ IM 里看到并回应；桌面侧栏能看到 lead 条目。
 **注意**：前后台是全新机制——今天所有 turn 都由用户输入触发。复杂度集中于此。
 `memory.md` 放本期（而非 P3）的理由：P2 的后台循环正是产生「决策与理由」的地方，
 缺了它，P2 一上线就会开始丢过程性记忆（§6.4）。
+
+**状态：已实现**（`docs/superpowers/plans/2026-10-17-project-lead-agent-p2.md`，
+9 任务）。已知限制（本期接受）：`memory.md` **无限增长、不裁剪不归纳压缩**（§7.6；
+`search` 现读现搜、不建索引，规模大了会变慢）。本计划**明确不做**（留 P3 或更后）：
+`lead_list_threads` / `lead_read_thread` 的完整形态、memory 压缩、lead 单独压缩阈值
+（§6.4 配套 3）、权限留痕/可撤销、移动端专用 UI。
 
 ### P3 lead 视野与安全
 

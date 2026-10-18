@@ -33,6 +33,8 @@ pub enum CardKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardState {
+    /// 已决定要做，但 spec/plan 还没写出来；不占槽、不进会话。
+    PreQueued,
     Queued,
     Launching,
     Running,
@@ -74,6 +76,7 @@ impl CardState {
             return true;
         }
         match (self, next) {
+            (PreQueued, Queued) => true,
             (Queued, Running) => true,
             (Queued, Merging) => true,
             (Merging, Done) => true,
@@ -159,6 +162,9 @@ pub struct Card {
     /// 重启一次就没有任何地方能查。旧状态文件没有此字段 → `None`。
     #[serde(default)]
     pub detail: Option<String>,
+    /// 展示标题。预排队卡在创建时定下；正式卡为 `None`（标题由 spec_path 派生）。
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[cfg(test)]
@@ -341,5 +347,28 @@ mod tests {
         assert!(Running.can_transition_to(Merging));
         // 合并阶段绝不回流会话通路。
         assert!(!Merging.can_transition_to(Running));
+    }
+
+    #[test]
+    fn a_pre_queued_card_neither_occupies_a_slot_nor_is_terminal() {
+        assert!(!CardState::PreQueued.occupies_slot());
+        assert!(!CardState::PreQueued.is_terminal());
+    }
+
+    #[test]
+    fn a_pre_queued_card_can_be_promoted_or_cancelled() {
+        use CardState::*;
+        assert!(PreQueued.can_transition_to(Queued));
+        assert!(PreQueued.can_transition_to(Cancelled));
+        // 不能越过排队直接跑，也不能直接进终态。
+        assert!(!PreQueued.can_transition_to(Running));
+        assert!(!PreQueued.can_transition_to(AwaitingMerge));
+    }
+
+    #[test]
+    fn an_old_card_without_a_title_still_deserializes() {
+        let json = r#"{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}"#;
+        let card: Card = serde_json::from_str(json).unwrap();
+        assert_eq!(card.title, None, "旧 board.json 缺 title 必须回 None");
     }
 }

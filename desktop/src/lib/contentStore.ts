@@ -78,6 +78,12 @@ export interface ContentEntry {
   trimmed: boolean;
   /** Estimated serialized size, kept so eviction need not re-serialize. */
   bytes: number;
+  /**
+   * The server content generation this transcript belongs to, or `null`/absent
+   * when unknown (a legacy entry). Absent must be read as "unknown", never as
+   * "matches" — the caller then does a conservative full resume (spec §4.3).
+   */
+  contentEpoch?: number | null;
 }
 
 /**
@@ -187,6 +193,8 @@ export async function evict(
 export interface PersistSource {
   items: (Item | { id: string; type: string })[];
   lastServerItemId: string | null;
+  /** 该会话已知的服务端内容世代；`undefined`/`null` = 未知（保守全量）。(spec §4.3) */
+  contentEpoch?: number | null;
 }
 
 /**
@@ -210,6 +218,7 @@ export async function persistContent(
     items,
     trimmed,
     bytes: estimateItemsBytes(items),
+    contentEpoch: session.contentEpoch,
   });
   await evict(store);
 }

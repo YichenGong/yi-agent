@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Value, json};
 use superpowers_kanban_core::card_id::card_id_for;
-use superpowers_kanban_core::inbox::{deliver_card, deliver_merge_card};
+use superpowers_kanban_core::inbox::{
+    deliver_card, deliver_merge_card, deliver_prequeued_card, deliver_promote_card,
+};
 use superpowers_kanban_core::layout::project_preferences_path;
 use superpowers_kanban_core::promotion::validate_promotion;
 use superpowers_kanban_core::switch::{SwitchValue, read_layer, resolve, write_layer};
@@ -38,6 +40,16 @@ fn service_for(state_dir: &Path) -> Arc<BoardService> {
             ))
         })
         .clone()
+}
+
+/// 卡片 id 的形状守卫：非空、且不含路径分隔符（`.` / `..` 也拒）。
+///
+/// id 正常是 slug，但 IPC 的 `promote` 会把调用方给的 id 直接拼进
+/// `<inbox>/<id>.promote.json`；`"../../x"` 这类 id 会写到 inbox 之外，
+/// 属于「输入即写入」。CLI 走的是「先查看板」，看板里没有这种 id，所以它在
+/// 查板那步就挡住了；IPC 必须显式挡一次，才与 CLI 对同一输入一致。
+fn valid_promote_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\')
 }
 
 /// 处理一条查询。`global` 是全局层开关（由调用方读好传入，测试因此不必碰 `HOME`）。
@@ -78,6 +90,57 @@ pub fn dispatch_with_service(
             deliver_card(state_dir, &id, spec, plan)
                 .map_err(|error| format!("could not deliver the card: {error}"))?;
             Ok(json!({ "id": id }))
+        }
+        "enqueue_prequeued" => {
+            let title = params
+                .get("title")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "enqueue_prequeued needs a `title`".to_string())?;
+            if title.trim().is_empty() {
+                return Err("enqueue_prequeued needs a non-empty `title`".to_string());
+            }
+            let id = service.next_free_prequeued_id(title, chrono::Local::now());
+            deliver_prequeued_card(state_dir, &id, title)
+                .map_err(|error| format!("could not deliver the card: {error}"))?;
+            Ok(json!({ "id": id }))
+        }
+        "promote" => {
+            let card_id = params
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "promote needs an `id`".to_string())?;
+            let spec = params
+                .get("spec_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "promote needs a `spec_path`".to_string())?;
+            let plan = params
+                .get("plan_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "promote needs a `plan_path`".to_string())?;
+            // 校验先做：拒绝的投递必须一个字节都不落盘。
+            validate_promotion(Path::new(spec), Path::new(plan))
+                .map_err(|error| error.to_string())?;
+            // 再做 id 形状守卫与查板——两者都必须在任何投递落盘之前，否则调用方
+            // 给的 `"../../x"` 会先在 inbox 外留下一个杂散文件（见 `valid_promote_id`）。
+            if !valid_promote_id(card_id) {
+                return Err("promote needs a valid card id".to_string());
+            }
+            let board = crate::persist::load_board(&state_dir.join("board.json"));
+            let id = superpowers_kanban_core::card::CardId::new(card_id);
+            match board.get(&id) {
+                None => return Err(format!("unknown card: {card_id}")),
+                Some(card) if card.state != superpowers_kanban_core::card::CardState::PreQueued => {
+                    return Err(format!(
+                        "card {card_id} is not pre-queued (state: {:?})",
+                        card.state
+                    ));
+                }
+                Some(_) => {}
+            }
+            let title = params.get("title").and_then(Value::as_str);
+            deliver_promote_card(state_dir, card_id, spec, plan, title)
+                .map_err(|error| format!("could not deliver the promote: {error}"))?;
+            Ok(json!({ "id": card_id }))
         }
         "enqueue_merge" => {
             let source = params
@@ -856,5 +919,234 @@ mod tests {
         let error = dispatch_with_global(&state, None, "driver/next", &json!({ "results": [] }))
             .unwrap_err();
         assert!(error.contains("threads"), "{error}");
+    }
+    #[test]
+    fn list_reports_a_prequeued_card_with_its_title() {
+        // 本任务产出的另一半契约：`list()` 的每张卡多一个 `title` 字段，
+        // 且 `PreQueued` 状态如实透出（宿主据它画「预排队」列）。
+        let dir = tempfile::tempdir().unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue_prequeued(
+            superpowers_kanban_core::card::CardId::new("idea"),
+            "我的想法".into(),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
+
+        let value = dispatch_with_global(dir.path(), None, "list", &json!({})).unwrap();
+        let card = &value["cards"][0];
+        assert_eq!(card["id"], "idea");
+        assert_eq!(card["state"], "pre_queued");
+        assert_eq!(card["title"], "我的想法");
+    }
+
+    #[test]
+    fn enqueue_prequeued_delivers_a_titled_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "my idea" }),
+        )
+        .unwrap();
+        assert_eq!(value["id"], "my-idea");
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let delivery: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(delivery["kind"], "prequeued");
+        assert_eq!(delivery["title"], "my idea");
+    }
+
+    #[test]
+    fn enqueue_prequeued_gives_non_ascii_titles_distinct_ids() {
+        // 中文标题 slug 成空串：必须回退到时间戳 id，且两张卡不同 id。
+        let dir = tempfile::tempdir().unwrap();
+        let first = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "一个想法" }),
+        )
+        .unwrap();
+        assert!(
+            first["id"].as_str().unwrap().starts_with("prequeued-"),
+            "{first}"
+        );
+        let delivery: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                dir.path()
+                    .join("inbox")
+                    .join(format!("{}.json", first["id"].as_str().unwrap())),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            delivery["title"], "一个想法",
+            "id 是 slug 回退，标题仍是原文"
+        );
+    }
+
+    #[test]
+    fn two_quick_enqueues_in_one_window_get_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "一个想法" }),
+        )
+        .unwrap();
+        let second = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "另一个想法" }),
+        )
+        .unwrap();
+        assert_ne!(first["id"], second["id"], "{first} vs {second}");
+        let inbox = dir.path().join("inbox");
+        let count = std::fs::read_dir(&inbox)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .count();
+        assert_eq!(count, 2, "两次捕获必须都留下投递文件");
+    }
+
+    #[test]
+    fn enqueue_prequeued_rejects_an_empty_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "   " }),
+        )
+        .unwrap_err();
+        assert!(error.contains("title"), "{error}");
+        assert!(!dir.path().join("inbox").exists(), "拒绝的投递不落盘");
+    }
+
+    #[test]
+    fn promote_delivers_for_a_prequeued_card_without_touching_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = dir.path().join("a.spec.md");
+        let plan = dir.path().join("a.plan.md");
+        std::fs::write(&spec, "# spec").unwrap();
+        std::fs::write(&plan, "# plan").unwrap();
+        // promote 现在先查看板：卡必须在板上且是预排队，投递才会落盘。
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue_prequeued(
+            superpowers_kanban_core::card::CardId::new("idea"),
+            "旧标题".to_string(),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
+        let value = dispatch_with_global(
+            dir.path(),
+            None,
+            "promote",
+            &json!({
+                "id": "idea",
+                "spec_path": spec.to_str().unwrap(),
+                "plan_path": plan.to_str().unwrap(),
+                "title": "新标题",
+            }),
+        )
+        .unwrap();
+        assert_eq!(value["id"], "idea");
+        let text = std::fs::read_to_string(dir.path().join("inbox/idea.promote.json")).unwrap();
+        let delivery: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(delivery["kind"], "promote");
+        assert_eq!(delivery["title"], "新标题");
+        // 投递不改看板：翻转由 runner 消费时做。
+        let board = crate::persist::load_board(&dir.path().join("board.json"));
+        assert_eq!(
+            board
+                .get(&superpowers_kanban_core::card::CardId::new("idea"))
+                .unwrap()
+                .state,
+            superpowers_kanban_core::card::CardState::PreQueued,
+        );
+    }
+
+    #[test]
+    fn promote_rejects_a_missing_pair_before_any_disk_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("a.plan.md");
+        std::fs::write(&plan, "# plan").unwrap();
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "promote",
+            &json!({
+                "id": "idea",
+                "spec_path": dir.path().join("missing.spec.md").to_str().unwrap(),
+                "plan_path": plan.to_str().unwrap(),
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("spec file does not exist"), "{error}");
+        assert!(!dir.path().join("inbox").exists(), "拒绝的投递不落盘");
+    }
+
+    #[test]
+    fn promote_rejects_an_unknown_card_id_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        // 板上有一张别的预排队卡：id 不在板上（而不是「板不存在」）也要拒。
+        let mut board = superpowers_kanban_core::board::Board::new();
+        board.enqueue_prequeued(
+            superpowers_kanban_core::card::CardId::new("known"),
+            "标题".to_string(),
+            chrono::Local::now(),
+        );
+        crate::persist::save_board(&dir.path().join("board.json"), &board).unwrap();
+
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "promote",
+            &json!({
+                "id": "ghost",
+                "spec_path": spec,
+                "plan_path": plan,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown card: ghost"), "{error}");
+        assert!(
+            !dir.path().join("inbox").exists(),
+            "板外 id 的投递必须一个字节都不落盘"
+        );
+    }
+
+    #[test]
+    fn promote_rejects_an_id_with_a_separator_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, plan) = write_pair(dir.path());
+        // `../../x` 会被拼进 `<inbox>/<id>.promote.json`，写到 inbox 之外。
+        let error = dispatch_with_global(
+            dir.path(),
+            None,
+            "promote",
+            &json!({
+                "id": "../../x",
+                "spec_path": spec,
+                "plan_path": plan,
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("valid card id"), "{error}");
+        assert!(
+            !dir.path().join("inbox").exists(),
+            "非法 id 的投递必须一个字节都不落盘"
+        );
+        assert!(
+            !dir.path().join("x.promote.json").exists()
+                && !dir.path().parent().unwrap().join("x.promote.json").exists(),
+            "inbox 之外不得出现杂散投递"
+        );
     }
 }

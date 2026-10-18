@@ -11,12 +11,13 @@ function card(id: string, state: string, extra: Partial<BoardCard> = {}): BoardC
 }
 
 describe("SuperpowersKanbanBoard", () => {
-  it("renders the four column headers with counts", () => {
+  it("renders the five column headers with counts", () => {
     render(
       <SuperpowersKanbanBoard
         cards={[card("q", "queued"), card("r", "running"), card("n", "needs_you"), card("d", "done")]}
       />,
     );
+    expect(screen.getByText("PRE-QUEUED · 0")).toBeTruthy();
     expect(screen.getByText("QUEUED · 1")).toBeTruthy();
     expect(screen.getByText("DOING · 1")).toBeTruthy();
     expect(screen.getByText("NEED DECISION · 1")).toBeTruthy();
@@ -71,17 +72,21 @@ describe("SuperpowersKanbanBoard", () => {
     expect(screen.queryByText("thread-1")).toBeNull();
   });
 
-  it("keeps all four columns visible when empty", () => {
+  it("keeps all five columns visible when empty", () => {
     render(<SuperpowersKanbanBoard cards={[]} />);
-    expect(screen.getByText(/queued/i)).toBeTruthy();
-    expect(screen.getByText(/done/i)).toBeTruthy();
+    // 精确匹配表头，`/queued/i` 会同时命中 `PRE-QUEUED` 与 `QUEUED` 两列。
+    expect(screen.getByText("PRE-QUEUED · 0")).toBeTruthy();
+    expect(screen.getByText("QUEUED · 0")).toBeTruthy();
+    expect(screen.getByText("DOING · 0")).toBeTruthy();
+    expect(screen.getByText("NEED DECISION · 0")).toBeTruthy();
+    expect(screen.getByText("DONE · 0")).toBeTruthy();
   });
 });
 
 // 宽度自适应：长标题不能把看板撑出左右滚动条（用户报的「左右过宽」）。
 // jsdom 不做布局计算，这里只能钉住撑宽的两处成因类名——二者缺一即复发：
 // (1) 行容器不得再声明 `overflow-x-auto`（那就是左右滚动本身）；
-// (2) 四个列必须 `min-w-0`，否则 flex 项默认 `min-width:auto` 会取内容最小宽度，
+// (2) 五个列必须 `min-w-0`，否则 flex 项默认 `min-width:auto` 会取内容最小宽度，
 //     卡片标题（`truncate` = `white-space:nowrap`）的 min-content 就是整条标题宽，
 //     列拒绝收缩 → 整行溢出。窄屏则纵向堆叠，让「上下滑动」取代左右滑动。
 describe("SuperpowersKanbanBoard width adapts to the container", () => {
@@ -102,7 +107,7 @@ describe("SuperpowersKanbanBoard width adapts to the container", () => {
 
   it("lets every column shrink so a long title cannot widen it", () => {
     const { container } = render(<SuperpowersKanbanBoard cards={[card("q", "queued")]} />);
-    for (const label of ["QUEUED", "DOING", "NEED DECISION", "DONE"]) {
+    for (const label of ["PRE-QUEUED", "QUEUED", "DOING", "NEED DECISION", "DONE"]) {
       const column = container.querySelector(`[aria-label="看板列 ${label}"]`)!;
       expect(column.className.split(/\s+/)).toContain("min-w-0");
     }

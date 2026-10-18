@@ -3,6 +3,7 @@ use crate::error::ToolsError;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
@@ -55,7 +56,9 @@ impl Tool for GlobTool {
 
         let warn_unbounded_root_glob =
             is_unbounded_root_recursive_scan(args.path.as_deref(), &args.pattern);
+        // 绝对路径按原样解释（可落在根集任一根内）；相对路径一律拼**主根**。
         let base = match &args.path {
+            Some(p) if Path::new(p).is_absolute() => PathBuf::from(p),
             Some(p) => self.ctx.root().join(p),
             None => self.ctx.root().to_path_buf(),
         };
@@ -72,13 +75,16 @@ impl Tool for GlobTool {
             Err(e) => return ToolsError::Glob(e).into(),
         };
 
-        let root = self.ctx.root();
         let mut matches: Vec<String> = Vec::new();
         for entry in paths_iter {
             match entry {
                 Ok(path) => {
-                    let rel = path.strip_prefix(root).unwrap_or(&path);
-                    matches.push(rel.to_string_lossy().to_string());
+                    // 命中哪个根就相对哪个根报，避免副目录的匹配被报成主根下的路径。
+                    let shown = self
+                        .ctx
+                        .relative_to_roots(&path)
+                        .unwrap_or_else(|| path.to_string_lossy().to_string());
+                    matches.push(shown);
                 }
                 Err(_) => continue,
             }
@@ -172,6 +178,30 @@ mod tests {
             assert!(s.contains("[warning: unbounded recursive glob at repository root]"));
             assert!(s.contains("prefer rg --files"));
             assert!(s.contains("README.md"));
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_reports_relative_path_against_the_matching_root() {
+        let primary = TempDir::new().unwrap();
+        let secondary = TempDir::new().unwrap();
+        fs::write(secondary.path().join("sib.rs"), "fn main() {}").unwrap();
+        let ctx = Arc::new(ToolsContext::with_roots(vec![
+            primary.path().to_path_buf(),
+            secondary.path().to_path_buf(),
+        ]));
+        let tool = GlobTool::new(ctx);
+        let result = tool
+            .call(serde_json::json!({
+                "pattern": "sib.rs",
+                "path": secondary.path().to_string_lossy(),
+            }))
+            .await;
+        assert!(!result.is_error);
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            // 必须相对**命中的那个根**（secondary）报路径，而不是绝对路径、
+            // 也不是相对主根。等值断言才拦得住"退回旧行为"的回归。
+            assert_eq!(s, "sib.rs");
         }
     }
 }

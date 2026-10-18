@@ -56,14 +56,14 @@ need systemctl
 
 echo "==> [1/5] 安装中继二进制到 $BIN_DST"
 if [[ ! -f "$BIN_SRC" ]]; then
-  echo "找不到 $BIN_SRC。" >&2
+  echo "找不到 ${BIN_SRC}。" >&2
   echo "它不进仓库（见 deploy/relay/README.md §1）：请先在 Mac 上构建并放到同目录。" >&2
   exit 1
 fi
 install -m 0755 "$BIN_SRC" "$BIN_DST"
 echo "    已安装（静态链接，零依赖）"
 
-echo "==> [2/5] 安装 Caddy（静态二进制，v$CADDY_VERSION）"
+echo "==> [2/5] 安装 Caddy（静态二进制，v${CADDY_VERSION}）"
 if [[ -x "$CADDY_BIN" ]]; then
   echo "    Caddy 已存在，跳过：$("$CADDY_BIN" version)"
 else

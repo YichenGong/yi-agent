@@ -32,6 +32,28 @@ describe("parseBoard", () => {
     expect(cards[0].detail).toBe("/w");
   });
 
+  it("prefers an explicit title over the spec-derived one", () => {
+    const parsed = parseBoard(
+      JSON.stringify({
+        cards: [
+          { id: "idea", state: "pre_queued", title: "一个想法", spec_path: "", plan_path: "" },
+        ],
+      }),
+    );
+    expect(parsed[0].title).toBe("一个想法");
+  });
+
+  it("still falls back to the spec-derived title when none is given", () => {
+    const parsed = parseBoard(
+      JSON.stringify({
+        cards: [
+          { id: "x", state: "queued", spec_path: "/d/2026-10-03-foo.spec.md", plan_path: "/d/p.md" },
+        ],
+      }),
+    );
+    expect(parsed[0].title).toBe("2026-10-03-foo");
+  });
+
   it("falls back to the plan path when workdir is missing", () => {
     const cards = parseBoard(
       JSON.stringify({ cards: [{ id: "a", plan_path: "a.plan.md", state: "Queued", order: 0 }] }),

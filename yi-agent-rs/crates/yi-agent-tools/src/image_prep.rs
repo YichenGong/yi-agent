@@ -4,7 +4,7 @@
 //! 需要逐字一致的行为，所以抽成公共模块，避免两处实现漂移。
 //!
 //! 模块边界：只负责「字节 -> PreparedImage」，不负责根校验。
-//! 路径限根（`path_util::resolve_and_check`）是工具侧的职责。
+//! 路径限根（`path_util::resolve_and_check_roots`）是工具侧的职责。
 
 use crate::error::ToolsError;
 use base64::Engine;

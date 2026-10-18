@@ -4,7 +4,8 @@ import { render, fireEvent, cleanup, screen, act } from "@testing-library/react"
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import { LONG_PRESS_MS } from "../lib/useLongPress";
-import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
+import { DEFAULT_TAG_NAMES, resolveTagNames } from "../lib/threadTags";
+import type { ThreadStatus, ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import {
   DEFAULT_SIDEBAR_WIDTH,
   MIN_SIDEBAR_WIDTH,
@@ -17,8 +18,8 @@ afterEach(() => {
   localStorage.clear();
 });
 
-function thread(id: string, title: string, cwd: string): ThreadSummary {
-  return { thread_id: id, cwd, model: "m", created_at: 0, updated_at: 0, title };
+function thread(id: string, title: string, cwd: string, tag?: string): ThreadSummary {
+  return { thread_id: id, cwd, model: "m", created_at: 0, updated_at: 0, title, tag };
 }
 
 function pinnedThread(id: string, title: string): ThreadSummary {
@@ -61,6 +62,10 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onRemoveBoard: vi.fn(),
     onOpenBoard: vi.fn(),
     onOpenSettings: vi.fn(),
+    onLinkFolder: vi.fn(),
+    onUnlinkFolder: vi.fn(),
+    tagNames: DEFAULT_TAG_NAMES,
+    onSetTag: vi.fn(),
     ...overrides,
   };
   return props;
@@ -156,7 +161,7 @@ describe("ThreadSidebar", () => {
 
   it("opens a group's context menu with the keyboard and closes it on Escape", () => {
     const { container } = renderSidebar();
-    const header = container.querySelectorAll<HTMLElement>("div[tabindex]")[0];
+    const header = container.querySelector<HTMLElement>("[data-ws-header]")!;
     expect(header.getAttribute("aria-expanded")).toBe("false");
 
     fireEvent.keyDown(header, { key: "Enter" });
@@ -173,7 +178,7 @@ describe("ThreadSidebar", () => {
 
   it("does not open the group menu when Enter/Space bubbles from the collapse caret", () => {
     const { container } = renderSidebar();
-    const header = container.querySelectorAll<HTMLElement>("div[tabindex]")[0];
+    const header = container.querySelector<HTMLElement>("[data-ws-header]")!;
     const caret = header.querySelector<HTMLButtonElement>('button[aria-label="Collapse"]')!;
 
     // jsdom does not perform Enter/Space button activation, so a keydown on the
@@ -208,6 +213,130 @@ describe("ThreadSidebar", () => {
     expect(wrappers).toHaveLength(2);
     expect(wrappers[0].parentElement).toBe(wrappers[1].parentElement);
     expect(wrappers[0].parentElement!.className.split(/\s+/)).toContain("space-y-2");
+  });
+
+  it("文件夹名比会话名更大，层级不再倒置", () => {
+    const { container } = renderSidebar();
+    // jsdom 不加载 Tailwind，`getComputedStyle` 拿不到字号，故按类名折算。这里只
+    // 钉住「文件夹名 > 会话名」这一相对关系：此前文件夹头是 `text-xs`(12px)、会话
+    // 行是 `text-sm`(14px)，分组头比它底下的条目还小，层级是反的。
+    const FONT_PX: Record<string, number> = { "text-xs": 12, "text-sm": 14, "text-base": 16 };
+    const px = (el: HTMLElement) => {
+      const cls = el.className.split(/\s+/).find((c) => c in FONT_PX);
+      return cls === undefined ? NaN : FONT_PX[cls];
+    };
+
+    const header = container.querySelector<HTMLElement>("[data-ws-header]")!;
+    const row = container.querySelector<HTMLElement>("[data-group-row]")!;
+    // 两边都得取到字号，否则比较没有意义（NaN > NaN 恒为 false 会误报通过）。
+    expect(Number.isNaN(px(header))).toBe(false);
+    expect(Number.isNaN(px(row))).toBe(false);
+    expect(px(header)).toBeGreaterThan(px(row));
+  });
+
+  it("每个文件夹上方有一条分隔线", () => {
+    const { container } = renderSidebar();
+    const headers = Array.from(container.querySelectorAll<HTMLElement>("[data-ws-header]"));
+    const wrappers = headers.map((h) => h.parentElement!);
+    const list = wrappers[0].parentElement!;
+
+    // 线必须画在**每个分组的上面**（`> * + *` 排除了第一个分组），而不是 `divide-y`
+    // ——后者落在下一个兄弟的下边框上（实测：分组的上边框宽度 0px），线会跑到上一个
+    // 分组的末尾、离文件夹头还隔着一个 8px 的间距，不是"文件夹上方那条线"。
+    // 首个文件夹上方不加线，避免列表顶部多出一条悬空的线。颜色用语义 token。
+    expect(wrappers[1].parentElement).toBe(list);
+    const cls = list.className;
+    expect(cls).toContain("[&>*+*]:border-t");
+    expect(cls).toContain("[&>*+*]:border-line");
+    expect(cls).not.toContain("divide-y");
+  });
+
+  it("renders a colour dot for a tagged thread and nothing for an untagged one", () => {
+    const tagged: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("1", "alpha-thread", "/work/projA", "red")],
+      },
+      {
+        workspace: "/work/projB",
+        exists: true,
+        threads: [thread("2", "beta-thread", "/work/projB")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: tagged, tagNames: resolveTagNames({ red: "紧急" }) });
+    const dots = container.querySelectorAll("[data-thread-tag]");
+    expect(dots.length).toBe(1);
+    expect(dots[0].getAttribute("data-thread-tag")).toBe("red");
+    expect(dots[0].getAttribute("aria-label")).toBe("紧急");
+    // 无标签的行不渲染任何色点节点。
+    const row2 = container.querySelector('[data-thread-row="2"]')!;
+    expect(row2.querySelector("[data-thread-tag]")).toBeNull();
+    // 标题仍然渲染（色点不能顶掉标题）。
+    expect(screen.getByText("beta-thread")).toBeTruthy();
+  });
+
+  it("does not render a dot for an invalid tag id", () => {
+    const dirty: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("1", "alpha-thread", "/work/projA", "chartreuse")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: dirty });
+    expect(container.querySelector("[data-thread-tag]")).toBeNull();
+  });
+
+  it("opens the thread menu on right-click and applies a tag", () => {
+    const onSetTag = vi.fn();
+    const { container } = renderSidebar({ onSetTag });
+    const row = container.querySelector<HTMLElement>('[data-thread-row="1"]')!;
+    fireEvent.contextMenu(row);
+    const menu = container.querySelector("[data-thread-menu]");
+    expect(menu).toBeTruthy();
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+    expect(onSetTag).toHaveBeenCalledWith("1", "red");
+  });
+
+  it("clears the tag from the menu", () => {
+    const onSetTag = vi.fn();
+    const { container } = renderSidebar({ onSetTag });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "无标签" }));
+    expect(onSetTag).toHaveBeenCalledWith("1", null);
+  });
+
+  it("marks the current tag as checked", () => {
+    const tagged: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("1", "alpha-thread", "/work/projA", "blue")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: tagged });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-thread-row="1"]')!);
+    expect(screen.getByRole("menuitemradio", { name: "蓝" }).getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByRole("menuitemradio", { name: "红" }).getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByRole("menuitemradio", { name: "无标签" }).getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("still opens the same menu on long-press in mobile", async () => {
+    vi.useFakeTimers();
+    try {
+      const { container } = renderSidebar({ isMobile: true });
+      const row = container.querySelector<HTMLElement>('[data-thread-row="1"]')!;
+      fireEvent.pointerDown(row, { pointerId: 1, button: 0, clientX: 0, clientY: 0 });
+      act(() => {
+        vi.advanceTimersByTime(LONG_PRESS_MS + 10);
+      });
+      expect(container.querySelector("[data-thread-menu]")).toBeTruthy();
+      // 同一份菜单：标签项也在。
+      expect(screen.getByRole("menuitemradio", { name: "红" })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -481,8 +610,11 @@ describe("ThreadSidebar status", () => {
       const { container, rerender } = render(<ThreadSidebar {...props} />);
       const badge = container.querySelector('[aria-label="Thread status"]')!;
       expect(badge).not.toBeNull();
-      expect(created).toHaveLength(1);
-      const first = created[0].el;
+      // Scope to the badge's own animation: the footer's running-session indicator
+      // spins too (a different element, so its own animation), and this test is
+      // about the badge's timeline surviving a row move.
+      const badgeAnims = created.filter((c) => c.el === badge);
+      expect(badgeAnims).toHaveLength(1);
 
       // The server now returns the other thread first (its `updated_at` bumped).
       rerender(
@@ -501,8 +633,7 @@ describe("ThreadSidebar status", () => {
       // The row was moved (order flipped) but the badge element is the same node
       // and NO new animation was started — the timeline survived the reorder.
       expect(container.querySelector('[aria-label="Thread status"]')).toBe(badge);
-      expect(created).toHaveLength(1);
-      expect(created[0].el).toBe(first);
+      expect(created.filter((c) => c.el === badge)).toHaveLength(1);
     } finally {
       delete (Element.prototype as unknown as { animate?: unknown }).animate;
     }
@@ -607,17 +738,37 @@ describe("ThreadSidebar 看板", () => {
     expect(onOpenBoard).toHaveBeenCalledWith("/other");
   });
 
-  it("选中的看板条目用与线程一致的底色", () => {
-    const selected = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: "/proj" });
+  it("选中的看板条目用与线程行相同的 token，未选中只有 hover", () => {
+    // 断言的是**语义 token**而不是某个字面色阶：看板条目与线程行的选中态必须
+    // 逐类名一致（`bg-raised`/`text-fg`），否则切到浅色主题时其中一边会失读。
+    // 早先这里比对的是某个字面灰阶类名，把「字面色阶」这一漂移固化进了测试。
+    //
+    // 两组选中态同时成立才有可比性：看板条目由 `selectedBoard` 选中，线程行由
+    // `currentId` 选中——传一个只选中看板，线程行会是未选中态，比较就没有意义。
+    const selected = renderSidebar({
+      groups: boardGroups,
+      boards: ["/proj"],
+      selectedBoard: "/proj",
+      currentId: "b1",
+    });
     const selectedClasses = selected.container
       .querySelector('[aria-label="看板"]')!
       .className.split(/\s+/);
-    expect(selectedClasses).toContain("bg-neutral-800");
+    expect(selectedClasses).toContain("bg-raised");
+    expect(selectedClasses).toContain("text-fg");
+
+    // 线程行用同一套 token——两边同源，改一边而另一边没跟上就会在此失败。
+    const threadRow = selected.container
+      .querySelector('[title="board-thread"]')!
+      .closest("div[tabindex]")!
+      .className.split(/\s+/);
+    expect(threadRow).toContain("bg-raised");
+    expect(threadRow).toContain("text-fg");
 
     const idle = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: null });
     const idleClasses = idle.container.querySelector('[aria-label="看板"]')!.className.split(/\s+/);
-    // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-neutral-800/50 被当选中态。
-    expect(idleClasses).not.toContain("bg-neutral-800");
+    // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-raised/50 被当选中态。
+    expect(idleClasses).not.toContain("bg-raised");
   });
 
   it("把卡片会话收进默认折叠的「看板会话」小节，展开后可见", () => {
@@ -803,6 +954,37 @@ describe("ThreadSidebar pinned section", () => {
     renderSidebar({ onOpenSettings });
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     expect(onOpenSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the running-session count beside the settings button", () => {
+    const statuses = new Map<string, ThreadStatus>([
+      ["1", "running"],
+      ["2", "awaiting_approval"],
+      ["3", "running"],
+    ]);
+    renderSidebar({ statuses });
+
+    // 只数 running(2 条),审批中的那条不计。
+    expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.getByText("2 个会话运行中")).toBeTruthy();
+    // 齿轮仍在(新胶囊没有把它挤掉)。
+    expect(screen.getByRole("button", { name: "设置" })).toBeTruthy();
+  });
+
+  it("renders no running-session indicator when nothing is running", () => {
+    renderSidebar({ statuses: new Map([["1", "idle"]]) });
+
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("button", { name: "设置" })).toBeTruthy();
+  });
+
+  it("marks the running-session count as possibly stale when offline", () => {
+    renderSidebar({
+      statuses: new Map([["1", "running"]]),
+      statusStale: true,
+    });
+
+    expect(screen.getByTitle("1 个会话运行中（可能过期）")).toBeTruthy();
   });
 
   it("spawns a ripple at the pointer position on the New-thread button", () => {
@@ -1164,6 +1346,136 @@ describe("ThreadSidebar 搜索", () => {
     fireEvent.doubleClick(screen.getByText("alpha-thread"));
     expect(container.querySelector("[data-rename-input]")).not.toBeNull();
     expect(container.querySelectorAll("[data-rename-input]")).toHaveLength(1);
+  });
+});
+
+describe("ThreadSidebar linked folders", () => {
+  const linkedGroups: WorkspaceGroup[] = [
+    { workspace: "/a", exists: true, threads: [thread("1", "one", "/a")] },
+    { workspace: "/b", exists: true, threads: [thread("2", "two", "/b")] },
+  ];
+  const linkedWorkspaces: Workspace[] = [
+    { path: "/a", exists: true, linked_to: null },
+    { path: "/b", exists: true, linked_to: "/a" },
+  ];
+
+  it("nests a linked folder under its primary and hides it from the top level", () => {
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    // 顶层组头只剩主根一个（附属根不再是顶层组）。
+    expect(container.querySelectorAll("[data-ws-header]")).toHaveLength(1);
+    // 附属根以嵌套小节出现，缩进显示。
+    const child = container.querySelector<HTMLElement>('[data-linked-child="/b"]');
+    expect(child).not.toBeNull();
+    // 缩进发生在小节外层包裹元素上（小节头本身仍与组头同一起点基线）。
+    expect(child!.parentElement!.className).toContain("pl-3");
+    expect(screen.getByText("b")).toBeTruthy();
+  });
+
+  it("offers 关联文件夹 on the group menu and calls onLinkFolder", () => {
+    const props = sidebarProps({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    const { container } = render(<ThreadSidebar {...props} />);
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-ws-header="/a"]')!);
+    fireEvent.click(screen.getByText("关联文件夹…"));
+    expect(props.onLinkFolder).toHaveBeenCalledWith("/a");
+  });
+
+  it("offers 取消关联 on a linked child and calls onUnlinkFolder", () => {
+    const props = sidebarProps({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    const { container } = render(<ThreadSidebar {...props} />);
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-linked-child="/b"]')!);
+    fireEvent.click(screen.getByText("取消关联"));
+    expect(props.onUnlinkFolder).toHaveBeenCalledWith("/b");
+  });
+
+  it("does not offer New thread here for a linked child", () => {
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-linked-child="/b"]')!);
+    expect(screen.queryByText("New thread here")).toBeNull();
+  });
+
+  // 搜索用数据：主根与附属根**同时**命中（两者路径都含 "proj"），主根因此留在
+  // 结果里、附属根也就仍然嵌套（而不是被临时升到顶层）。
+  const searchGroups: WorkspaceGroup[] = [
+    { workspace: "/proj", exists: true, threads: [thread("1", "api", "/proj")] },
+    { workspace: "/proj/docs", exists: true, threads: [thread("2", "guide", "/proj/docs")] },
+  ];
+  const searchWorkspaces: Workspace[] = [
+    { path: "/proj", exists: true, linked_to: null },
+    { path: "/proj/docs", exists: true, linked_to: "/proj" },
+  ];
+
+  it("shows a nested linked child's matching rows while searching", () => {
+    // 搜索时命中行先被抽成扁平列表、再重新归拢到主根之下。若附属根小节在搜索期间
+    // 不渲染（或被折叠状态挡住），用户搜到了却看不见——这条锁住"搜得到也看得见"。
+    const { container } = renderSidebar({
+      groups: searchGroups,
+      workspaces: searchWorkspaces,
+    });
+    fireEvent.change(screen.getByLabelText("搜索会话"), { target: { value: "proj" } });
+    expect(container.querySelector('[data-linked-child="/proj/docs"]')).not.toBeNull();
+    expect(container.textContent).toContain("guide");
+  });
+
+  it("hides New thread here for a linked child that search promoted to the top", () => {
+    // 只命中附属根时它会临时落到顶层：菜单口径必须与嵌套时一致——附属根不能作
+    // cwd。断言菜单真的开了，避免"元素不存在"造成的假通过。
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    fireEvent.change(screen.getByLabelText("搜索会话"), { target: { value: "two" } });
+    fireEvent.contextMenu(container.querySelector<HTMLElement>('[data-linked-child="/b"]')!);
+    expect(screen.getByRole("menu").textContent).toContain("取消关联");
+    expect(screen.queryByText("New thread here")).toBeNull();
+  });
+
+  it("keeps a linked child searchable by its own path after collapsing it", () => {
+    // 折叠状态在搜索期间不应挡住命中行（与置顶分区/项目组同一口径）。
+    const { container } = renderSidebar({
+      groups: searchGroups,
+      workspaces: searchWorkspaces,
+    });
+    fireEvent.click(
+      container.querySelector<HTMLElement>('[data-linked-child="/proj/docs"]')!
+        .querySelector('button[aria-label="Collapse"]')!,
+    );
+    expect(container.textContent).not.toContain("guide");
+    fireEvent.change(screen.getByLabelText("搜索会话"), { target: { value: "proj" } });
+    expect(container.textContent).toContain("guide");
+  });
+
+  it("keeps an unlinked workspace as a top-level group with its full menu", () => {
+    const { container } = renderSidebar();
+    fireEvent.contextMenu(container.querySelectorAll<HTMLElement>("[data-ws-header]")[0]);
+    expect(screen.getByText("New thread here")).toBeTruthy();
+    expect(screen.getByText("关联文件夹…")).toBeTruthy();
+  });
+  it("indents a linked child's thread rows one level deeper than direct rows", () => {
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-group-row]"));
+    const direct = rows.find((r) => r.textContent!.includes("one"))!;
+    const inChild = rows.find((r) => r.textContent!.includes("two"))!;
+    expect(direct.className).toContain("pl-3");
+    expect(inChild.className).toContain("pl-11");
+  });
+
+  it("collapses a linked child section from its own caret", () => {
+    const { container } = renderSidebar({ groups: linkedGroups, workspaces: linkedWorkspaces });
+    const child = container.querySelector<HTMLElement>('[data-linked-child="/b"]')!;
+    fireEvent.click(child.querySelector('button[aria-label="Collapse"]')!);
+    expect(container.textContent).not.toContain("two");
+  });
+
+  it("长按附属根小节头只给取消关联", async () => {
+    vi.useFakeTimers();
+    const props = sidebarProps({ groups: linkedGroups, workspaces: linkedWorkspaces, isMobile: true });
+    const { container } = render(<ThreadSidebar {...props} />);
+
+    const header = container.querySelector<HTMLElement>('[data-linked-child="/b"]')!;
+    await longPress(header);
+
+    const menu = container.querySelector('[role="menu"]');
+    expect(menu!.textContent).toContain("取消关联");
+    expect(menu!.textContent).not.toContain("New thread here");
+    fireEvent.click(screen.getByText("取消关联"));
+    expect(props.onUnlinkFolder).toHaveBeenCalledWith("/b");
   });
 });
 
