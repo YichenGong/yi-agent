@@ -377,13 +377,24 @@ fn is_binary(path: &Path) -> bool {
 fn untracked_diff(root: &Path, paths: &[String]) -> String {
     let mut out = String::new();
     for path in paths {
-        let Ok(content) = std::fs::read_to_string(root.join(path)) else {
+        let Ok(bytes) = std::fs::read(root.join(path)) else {
             continue;
         };
-        let lines: Vec<&str> = content.lines().collect();
         out.push_str(&format!(
-            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n"
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n"
         ));
+        // 无法逐行渲染的文件（含 NUL，或不是合法 UTF-8）按 git 自己的二进制约定
+        // 给一行说明。此前这里是 `read_to_string` 失败就 `continue`，结果是面板
+        // 把该文件列为 `A`/binary、点开却是空白——D1 的另一半，同一类静默空白。
+        let text = match String::from_utf8(bytes) {
+            Ok(t) if !t.as_bytes().iter().take(8000).any(|&b| b == 0) => t,
+            _ => {
+                out.push_str(&format!("Binary files /dev/null and b/{path} differ\n"));
+                continue;
+            }
+        };
+        out.push_str(&format!("--- /dev/null\n+++ b/{path}\n"));
+        let lines: Vec<&str> = text.lines().collect();
         out.push_str(&format!("@@ -0,0 +1,{} @@\n", lines.len()));
         for line in &lines {
             out.push('+');
@@ -1228,6 +1239,28 @@ mod tests {
         assert!(
             diff.trim().is_empty(),
             "a clean tracked file has no diff; nothing may be synthesized: {diff}"
+        );
+    }
+
+    /// 未跟踪的**二进制/非 UTF-8** 文件同样不能是空白：面板会把它列为 `A`，
+    /// 点开却什么都没有就是 D1 的另一半。按 git 自己的约定给一行说明
+    /// （前端 `parseUnifiedDiff` 认得 `Binary files ` 前缀）。
+    #[test]
+    fn an_untracked_binary_file_is_announced_not_blank() {
+        let dir = repo();
+        std::fs::write(dir.path().join("bin.dat"), b"a\0b").unwrap();
+        let (diff, _) = file_diff(dir.path(), Some("trunk"), "bin.dat");
+        assert!(
+            !diff.trim().is_empty(),
+            "a binary untracked file must not render blank: {diff:?}"
+        );
+        assert!(
+            diff.contains("Binary files"),
+            "it must carry git's own binary notice: {diff:?}"
+        );
+        assert!(
+            diff.contains("bin.dat"),
+            "the notice must name the file: {diff:?}"
         );
     }
 }
