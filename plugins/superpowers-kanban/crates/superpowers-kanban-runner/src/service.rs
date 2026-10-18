@@ -2674,6 +2674,153 @@ mod tests {
         assert_eq!(state_of(&service, "merge-1"), "merging");
     }
 
+    /// 合并候选之间的次序：`order` 最小的**合并卡**先拿到这一拍的动作。
+    ///
+    /// 这是 `candidates.sort_by(|a, b| (a.order, &a.id).cmp(&(b.order, &b.id)))`
+    /// （`driver_step` 第 4 段的确定性排序）**唯一**的覆盖点。此前这条次序由
+    /// `merge_cards_are_claimed_in_fifo_order_and_only_once` 守着，Task 9 随裸
+    /// git 通路一并退役了它，而其余合并轮用例都只种**一张**候选
+    /// （`:1722`、`:2584`、`:2697`），`next_startable` 那条 order 用例测的是
+    /// **实现卡**——于是「多张合并卡谁先」成了没人看的行。
+    ///
+    /// 两张卡都 `Queued` + `kind == Merge` + 各自 source 分支存在，故都是合格
+    /// 候选，谁先只由 `order` 决定：**先入队的那张先走**（`order` 更小）。
+    #[test]
+    fn the_lower_order_merge_card_is_handed_back_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        // 两条分支都带着 main 没有的提交：两张卡都是**合格**候选，排序才是唯一变量。
+        for source in ["feature/early", "feature/late"] {
+            let file = format!("{}.txt", source.replace('/', "-"));
+            git_run(&project, &["checkout", "-q", "-b", source]);
+            std::fs::write(project.join(&file), "x\n").unwrap();
+            git_run(&project, &["add", &file]);
+            git_run(&project, &["commit", "-qm", "feat"]);
+            git_run(&project, &["checkout", "-q", "main"]);
+            assert!(
+                !crate::merge::branch_merged_into(&project, source, "main"),
+                "用例前提：{source} 的 git 事实必须是「未并入」"
+            );
+        }
+        // 直接种一份 board（而非经 `enqueue_merge_card_for_test`）：先入队 `merge-a`
+        // （`order` 更大），再把 `merge-b` **插到队首**。这样「按 `order` 排」与
+        // 「按插入次序走」给出**相反**的答案——两张卡都被遍历到时，只有排序才能把
+        // merge-b 提到前面。id 也故意与 `order` 反着起，免得排序退化成按 id 走还能蒙对。
+        let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = superpowers_kanban_core::board::Board::new();
+        for (id, source) in [("merge-a", "feature/late"), ("merge-b", "feature/early")] {
+            board.enqueue_merge(
+                CardId::new(id),
+                source.to_string(),
+                "main".to_string(),
+                None,
+                chrono::Local::now(),
+            );
+        }
+        board.prioritize(&CardId::new("merge-b")).unwrap();
+        persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+        let service = BoardService::new(state_dir, project.clone(), Some(project.join("home")));
+        let order_of = |id: &str| {
+            persist::load_board(&service.state_dir.join("board.json"))
+                .get(&CardId::new(id))
+                .unwrap()
+                .order
+        };
+        assert!(
+            order_of("merge-b") < order_of("merge-a"),
+            "用例前提：merge-b 被插到队首、order 更小（{} vs {}）",
+            order_of("merge-b"),
+            order_of("merge-a")
+        );
+        assert!(
+            persist::load_board(&service.state_dir.join("board.json"))
+                .cards()
+                .last()
+                .map(|card| card.id.0.clone())
+                .as_deref()
+                == Some("merge-b"),
+            "用例前提：merge-b 在列表里排最后，插入次序与 order 次序相反"
+        );
+
+        // 拍 1：两张都合格 → 交出 `order` 更小的那张，另一张原地等（D8：一次
+        // 只跑一个合并——排序正是为这句话服务的）。
+        let DriverAction::Launch {
+            action_id, card_id, ..
+        } = service
+            .driver_step(&[], &[])
+            .unwrap()
+            .expect("两张独立合并卡都在排队，总得开出一轮")
+        else {
+            panic!("无会话的独立合并卡必须 launch")
+        };
+        assert_eq!(
+            card_id, "merge-b",
+            "候选池必须按 order 排序：merge-b 在列表里排最后、遍历更晚，仍要先交"
+        );
+        assert_eq!(state_of(&service, "merge-b"), "merging");
+        assert_eq!(
+            state_of(&service, "merge-a"),
+            "queued",
+            "名额被 merge-b 占着，merge-a 原样排队"
+        );
+
+        // 拍 2：宿主把这一轮的会话报回来（`LaunchForMerge` 只落映射，不碰状态）。
+        assert!(
+            service
+                .driver_step(
+                    &busy(&["thread-merge-b"]),
+                    &[DriverResult {
+                        action_id,
+                        ok: true,
+                        thread_id: Some("thread-merge-b".to_string()),
+                        error: None,
+                    }],
+                )
+                .unwrap()
+                .is_none(),
+            "没有别的合格候选时，这一拍没有动作"
+        );
+        assert_eq!(
+            thread_of(&service, "merge-b").as_deref(),
+            Some("thread-merge-b")
+        );
+        assert_eq!(state_of(&service, "merge-b"), "merging");
+
+        // 拍 3：会话空闲 → 既有 git 复核（D10）判否 → merge-b 退回 `needs_you`。
+        // 而这一拍的动作归**另一张**候选 merge-a：`driver_step` 一拍只用开头那份
+        // 快照（快照里 merge-b 还是 `merging`、不在候选池里），名额随即落到它手上。
+        // 于是两张合格候选各拿到一次动作，先后仍是 merge-b → merge-a（order 序）。
+        let action = service
+            .driver_step(&idle(&["thread-merge-b"]), &[])
+            .unwrap();
+        assert_eq!(
+            state_of(&service, "merge-b"),
+            "needs_you",
+            "判词只由 git 事实给，不采信模型的复述"
+        );
+        assert!(
+            detail_of(&service, "merge-b")
+                .unwrap_or_default()
+                .contains("is not merged into"),
+            "判词要说明这是一条 git 事实"
+        );
+        match action {
+            Some(DriverAction::Launch {
+                card_id: ref other, ..
+            }) => assert_eq!(
+                other, "merge-a",
+                "merge-b 让出名额后，剩下的候选 merge-a 才拿到动作"
+            ),
+            other => panic!("merge-a 该拿到这一轮：{other:?}"),
+        }
+        assert_eq!(
+            state_of(&service, "merge-a"),
+            "merging",
+            "名额是持久载体（D8）：动作落到 merge-a，它就得进 merging"
+        );
+    }
+
     /// launch-for-merge 失败：会话**从没起来**，卡不能永远抱着 `merging` 名额。
     /// 与 `append` 失败同一处置——立刻走一次 git 复核把名额放掉（判否 → `needs_you`，
     /// 之后由 D9 的有界重试接管）。
