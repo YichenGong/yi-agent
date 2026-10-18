@@ -92,6 +92,13 @@ export function useDragDropPaths({
         // 订阅解析回来时组件可能已经卸载：那时直接摘掉，别把监听留在窗口上。
         if (alive) unlisten = fn;
         else fn();
+      })
+      .catch((error) => {
+        // 真实通路上这里会拒：动态 import 取不到 chunk（升级后常见），或
+        // `listen` 因权限/能力回归被拒。不接住就成了未处理的 rejection，
+        // 拖放会静默失效且不留任何痕迹——正是本仓库吃过亏的那一类。
+        // 远端路径压根不会走到这里（上面已 return），故不必再判 `isRemote`。
+        console.error("拖放订阅失败，本窗口的拖入路径功能将不可用", error);
       });
 
     return () => {

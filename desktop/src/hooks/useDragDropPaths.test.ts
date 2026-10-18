@@ -4,7 +4,10 @@ import { renderHook, act, cleanup } from "@testing-library/react";
 import { useRef } from "react";
 import { useDragDropPaths, dragHitsTarget, type DragDropPayload } from "./useDragDropPaths";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 /** 造一个带固定 rect 的元素，模拟 jsdom 里"落在卡片上"的几何。 */
 function elWithRect(rect: { left: number; top: number; right: number; bottom: number }) {
@@ -126,5 +129,25 @@ describe("useDragDropPaths", () => {
     await act(async () => {});
     view.unmount();
     expect(unlisten).toHaveBeenCalled();
+  });
+
+  it("订阅被拒时不抛、不高亮，只记一笔", async () => {
+    const el = elWithRect({ left: 0, top: 0, right: 100, bottom: 100 });
+    // 真实通路上动态 import（升级后 chunk 取不到）和它内部的 listen（权限回归）
+    // 都可能被拒；这里直接喂一个拒绝的订阅，要求它变成一次记录而不是未处理的 rejection。
+    const subscribe = vi.fn(
+      async (_handler: (e: DragDropPayload) => void): Promise<() => void> => {
+        throw new Error("chunk load failed");
+      },
+    );
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const view = renderHook(() => {
+      const ref = useRef<HTMLElement | null>(el);
+      return useDragDropPaths({ subscribe, isRemote: false, targetRef: ref, onDrop: vi.fn() });
+    });
+    await act(async () => {});
+    // 订阅没成，就别声称在拖放中。
+    expect(view.result.current.active).toBe(false);
+    expect(errSpy).toHaveBeenCalled();
   });
 });
