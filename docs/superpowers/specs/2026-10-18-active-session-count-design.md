@@ -148,7 +148,14 @@ export function runningSessionsLabel(n: number): string {
 
 **改 `desktop/src/components/ThreadSidebar.tsx`**
 
-新增一个内部组件 `ActiveSessionCount`，渲染在 footer 里、齿轮的**左侧**（齿轮位置不动）。
+新增一个内部组件 `ActiveSessionCount`，渲染在 footer 里、设置齿轮的**紧右侧**（在齿轮
+`</button>` 之后、footer `</div>` 之前追加，**不加 `ml-auto`**）。「紧挨着」正是需求里
+「设置界面旁边」的字面意思，也让两者在视觉上读作一组（齿轮 = 入口，胶囊 = 它的邻居读数）。
+
+**齿轮本身的位置与样式逐像素不变**——这是硬要求：既有测试
+（`ThreadSidebar.test.tsx:950`）按可访问名 `设置` 定位它，用户也已习惯它的位置，本功能
+不该动它。指示器是新增的邻居，不是重新排布 footer。footer 是 `flex items-center` 且
+不设 `justify-between`，故两个子元素默认左对齐紧邻，无需任何新的对齐类。
 props 只要两个：`count: number`（由 `countRunningSessions(statuses)` 在 `ThreadSidebar`
 函数体内算出）与 `stale?: boolean`（沿用既有 `statusStale`）。
 
@@ -188,8 +195,11 @@ footer 在两端都渲染，故指示器两端都出现。**不特殊对待手�
   的运行状态标记，随后 `thread/listAll` 快照重新落值。数字会随之复位到快照的真相，
   不残留崩溃前的假 `running`。
 - **并发删除会话**：`store.drop(id)` 移除 view，下一轮渲染表里就没有它，计数自动回落。
-- **布局**：`count === 0` 时不渲染，故不存在「0 与 3 之间宽度跳变」；从 0 变 1 时胶囊
-  出现会占据宽度，但 footer 是 `flex`、齿轮在右侧独立定位，齿轮不会被推走。
+- **布局**：`count === 0` 时不渲染，故 0 与「有会话在跑」之间不存在宽度跳变源；从 0 变 1
+  时胶囊出现会占据宽度，但 footer 是 `flex`、齿轮是第一个子元素，**齿轮不会位移**。
+  胶囊文案 `N 个会话运行中` 在两位数（`12`）时可能撑宽 footer，但它与齿轮同处一行且
+  胶囊自身 `shrink-0`；侧栏最窄 200px（`lib/sidebarWidth.ts` 的 `MIN_SIDEBAR_WIDTH`），
+  文案长度远小于该宽度。
 
 ### 3.6 测试
 
