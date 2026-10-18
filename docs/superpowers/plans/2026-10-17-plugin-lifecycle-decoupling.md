@@ -11,6 +11,16 @@
 **Spec:** `docs/superpowers/specs/2026-10-17-plugin-lifecycle-decoupling-design.md`
 **前置：** G1（`2026-10-17-session-driver-decoupling.md`）**先落地**——G1 已删 `card_scheduler` 与 `board_query`，本 plan 再删 `yi-agent-boards` 与 `board/*` RPC，避免两处并行改同一批文件。
 
+## G1 遗留的必须收口项（G2 承接，勿漏）
+
+G1 把「宿主不认识看板」的**决策面**清零，但**留下两处归属缺口**，只有 G2 能收口（G1 的 plan「已知的 G1→G2 过渡缺口」、`docs/bug-list.md` 的对应条与 spec §7 已记录；此处再点明，避免只看本 plan 的 G2 实现者漏做）：
+
+1. **被驱动会话的 `driver_project` / `driver_ref` 恒为 `None`**（`server.rs` 的 `launch_inner(workdir, title, objective, None, None)`）。两条活消费者因此走错分支：
+   - **侧栏不折组**：`thread/listAll` 只在 `driver_project.is_some()` 时把会话折进项目组；被驱动会话落进「本目录自己的会话」桶，以各自 cwd（卡 worktree / 合并会话的项目根）为组键成**未分组顶层项**。
+   - **worktree 永不回收**：`worktree_reclaim::decide` 在 `driver_project` 为 `None` 时判 `Keep`。
+   - **G2 修法**：引入 spec §5/§9 的通用字段 `managed_worktree`（会话 meta 的可选通用字段），由**插件侧在 `driver/next` 的动作里填值**；`worktree_reclaim::decide` 改为从 worktree 自身读分支、不再靠 `driver_ref` 推 `kanban/<slug>`；侧栏按 `managed_worktree` 归组。注意：G1 的宿主测试 `a_launch_action_records_no_driver_origin_and_still_starts_a_turn` 现断言 `driver_project == None`，G2 落地时需一并更新该断言。
+2. **宿主重启后卡滞留 + `Merging` 卡持有合并闸**：G1 删了 `recover_orphan_cards`，且 `DriverState` 是宿主内存，重启后插件收到空 `threads`，`Running`/`Launching`/`Merging` 卡无人结算；停在 `Merging` 的卡会让 `any_merging()` 恒真、该项目再无合并启动。**G2 必须确认收口**：插件侧应对「宿主未上报且无在途动作」的卡做保守恢复（结算为 `needs_you` 并释放合并闸），G2 需验证该恢复在生命周期改造后仍生效，并把仍无主的边界写进验收。
+
 ## Global Constraints
 
 - 宿主非测试代码中不得出现看板语义：`kanban` / `board` / `卡片`（通用插件机制除外）。
