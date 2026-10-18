@@ -13,6 +13,7 @@ import { formatRelativeTime } from "../lib/relativeTime";
 import { filterThreadTree } from "../lib/threadSearch";
 import { Popover } from "../ui/Popover";
 import { findLeadThread } from "../lib/leadThread";
+import { LeadAvatar } from "./LeadAvatar";
 import { TAG_DOT_CLASS, TAG_IDS, isValidTagId, tagLabel, type TagId } from "../lib/threadTags";
 
 function unreadDotClass(status: TurnStatus): string {
@@ -781,6 +782,7 @@ export function ThreadSidebar({
           active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
         } cursor-pointer`}
       >
+        <LeadAvatar />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
             <StatusBadge status={st} stale={statusStale} />
