@@ -1447,10 +1447,37 @@ git commit -m "feat(desktop): render model-driven frames and fix the diff summar
   });
 
   it("单文件懒加载在文件正文缺失时补一次带 path 的 thread/diff/read", async () => {
-    // 面板交互在 jsdom 里难以触达时，退化为两步断言：
-    // 1) 组件级：GitDiffView 的 onLoadFile 被点击时带正确 path 触发（Task 8 覆盖）；
-    // 2) App 级：onLoadFile 的实现确实发出带 path 的 `thread/diff/read`。
-    // 目标语义只有一个：正文缺失的文件展开时，会为该 path 取一次正文。
+    // 文件列在 files[] 里但正文被截断：展开它必须为该 path 取一次正文。
+    // 组件级先把 onLoadFile 的契约钉死（带正确 path），App 级再钉「它真的发了请求」。
+    state.dataSources["thread/diff/read"] = () => ({
+      base: "origin/main",
+      baseKind: "origin-default",
+      mergeBase: "abc1234",
+      commits: [],
+      files: [{ path: "a.txt", status: "M", additions: 1, deletions: 1, binary: false }],
+      unifiedDiff: "", // 正文缺失（截断的后果）
+      truncated: true,
+    });
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: null } });
+      }
+    });
+    await screen.findByLabelText("会话详情");
+
+    // 展开该文件（它落在默认展开窗口内时无需点击，故兼容两种情形）。
+    const fileButton = screen.getByRole("button", { name: /a\.txt/ });
+    fireEvent.click(fileButton); // 折叠
+    fireEvent.click(fileButton); // 再展开，触发懒加载
+
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/diff/read",
+        params: { threadId: "t1", path: "a.txt" },
+      }),
+    );
   });
 ```
 
