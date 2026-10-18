@@ -133,6 +133,7 @@ struct MessageRecordingFactory {
     starts: Arc<Mutex<Vec<WorkerStart>>>,
     handles: Arc<Mutex<Vec<WorkerHandle>>>,
     recovery_preflights: Arc<Mutex<Vec<WorkerRecoveryPreflight>>>,
+    recovery_probes: Arc<Mutex<Vec<WorkerStart>>>,
     workspace_service: Option<Arc<dyn WorkerWorkspaceProvider>>,
     workspace_registry: Option<Arc<dyn WorkerWorkspaceRegistry>>,
 }
@@ -140,6 +141,15 @@ struct MessageRecordingFactory {
 impl AgentWorkerFactory for MessageRecordingFactory {
     fn recovery_context(&self) -> WorkerRecoveryContext {
         durable_context()
+    }
+
+    /// Recorded so a test can compare the probe a factory inspects against the
+    /// request the worker actually starts from. Returning
+    /// `self.recovery_context()` is the trait's own default body, so this adds
+    /// observability without changing what any factory computes.
+    fn recovery_context_for(&self, request: &WorkerStart) -> WorkerRecoveryContext {
+        self.recovery_probes.lock().unwrap().push(request.clone());
+        self.recovery_context()
     }
 
     fn preflight_recovery(
@@ -3666,6 +3676,108 @@ async fn one_supervisors_failure_does_not_discard_another_sessions_completion() 
     );
 }
 
+/// A spawn that inherits nothing must issue no `UPDATE tasks SET extra_roots`
+/// at all — not merely write the same value. The redundant write is invisible to
+/// every read-back assertion (the column ends up `NULL` either way), so this
+/// counts the statements in SQLite itself with an `AFTER UPDATE OF extra_roots`
+/// trigger. Phase B is the live control: it proves the trigger does see the
+/// very statement shape phase A forbids, so phase A cannot pass vacuously.
+#[tokio::test]
+async fn a_no_roots_spawn_issues_no_extra_roots_update() {
+    let directory = TempDir::new().unwrap();
+    let (coordinator, _factory, database) = linked_roots_coordinator(&directory);
+    let application_root = directory.path().join("not-a-repo");
+
+    let attached = coordinator
+        .attach_application_root("audit-project", &application_root, &[])
+        .await
+        .unwrap();
+    let session = attached.session_id.clone();
+    let root = attached.root_task_id.clone();
+
+    let audit = Connection::open(&database).unwrap();
+    audit
+        .execute_batch(
+            "CREATE TABLE extra_roots_writes (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT);
+             CREATE TRIGGER audit_extra_roots_writes AFTER UPDATE OF extra_roots ON tasks
+             BEGIN INSERT INTO extra_roots_writes (task_id) VALUES (NEW.id); END;",
+        )
+        .unwrap();
+    let writes = |audit: &Connection| -> i64 {
+        audit
+            .query_row("SELECT COUNT(*) FROM extra_roots_writes", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    };
+
+    // Phase A: parent has no roots, so the child inherits none. The guarded
+    // write must not run — before the guard this UPDATE existed.
+    assert_eq!(writes(&audit), 0, "the trigger starts from a clean slate");
+    let bare = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "bare child".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        writes(&audit),
+        0,
+        "a no-roots spawn must not issue the redundant extra_roots UPDATE"
+    );
+
+    // Phase B: give the root a set, then spawn again. Both the direct
+    // repository write and the child's inherited write must show up, proving
+    // the trigger counts exactly the statement phase A asserted absent.
+    RuntimeRepository::open(&database)
+        .unwrap()
+        .set_task_extra_roots(&root, &["/w/linked-b".to_string()])
+        .unwrap();
+    assert_eq!(writes(&audit), 1, "the trigger observes a direct write");
+
+    let linked = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "linked child".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        writes(&audit),
+        2,
+        "a child that inherits a set must still record it"
+    );
+    assert_eq!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_extra_roots(&linked)
+            .unwrap(),
+        vec!["/w/linked-b".to_string()]
+    );
+    assert!(
+        RuntimeRepository::open(&database)
+            .unwrap()
+            .task_extra_roots(&bare)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 fn non_git_coordinator(
     directory: &TempDir,
 ) -> (RuntimeCoordinator, std::path::PathBuf, std::path::PathBuf) {
@@ -3968,6 +4080,21 @@ async fn recovery_hydration_restores_linked_roots_for_roots_and_children() {
         child_start.extra_roots, expected,
         "a recovered child must not lose the set its row recorded"
     );
+    // The recovery probe the factory inspects must carry the same roots as the
+    // request the worker starts from. The probe was the one `WorkerStart`
+    // construction site that used to be left at the constructor default, so a
+    // future field would have gone missing here silently.
+    let probes = factory.recovery_probes.lock().unwrap();
+    for (task, label) in [(&root, "root"), (&child, "child")] {
+        let probe = probes
+            .iter()
+            .find(|probe| probe.task_id == *task)
+            .unwrap_or_else(|| panic!("the {label}'s recovery probe was taken"));
+        assert_eq!(
+            probe.extra_roots, expected,
+            "the {label}'s recovery probe must see the same root set as its start request"
+        );
+    }
 }
 
 /// A replacement daemon starts with an empty supervisor map. Reconnecting must

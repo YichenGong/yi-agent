@@ -913,6 +913,20 @@ impl RuntimeCoordinator {
                 let mut supervisor =
                     AgentSupervisor::from_hydrated_review_root(hydrated, objective)
                         .with_max_direct_children(self.max_direct_children);
+                // This path seeds NEITHER inheritance field: no
+                // `set_inherited_sandbox` (see the sibling field's absence at the
+                // base commit too) and no `set_extra_roots`. That is deliberate
+                // and pre-existing/symmetric, not an oversight: the only seeding
+                // sites are the `open()` recovery hydration (both the recovered
+                // child and the recovered root), the reattach branch of
+                // `attach_application_root`, that method's create branch, and
+                // `spawn_child_with_objective`. Those cover every task that can
+                // start a worker whose row carries an inherited value; the read
+                // sites (`WorkerStart` assembly) already fall back to "no roots",
+                // so a task reattached here behaves exactly as an un-inherited
+                // session does. Keep the two fields in step: if a future change
+                // starts seeding one of them here, it must seed the other in the
+                // same edit.
                 supervisor.set_workspace_mode(&task_id, root_mode);
                 hydrate_completion_report(&mut supervisor, task_id.clone(), completion_report)?;
                 hydrated_supervisor = Some(supervisor);
@@ -1519,7 +1533,13 @@ impl RuntimeCoordinator {
             if let Some(inherited_sandbox) = inherited_sandbox {
                 supervisor.set_inherited_sandbox(&child, inherited_sandbox);
             }
-            supervisor.set_extra_roots(&child, child_extra.iter().map(PathBuf::from).collect());
+            // Guarded like every other seeding site: an empty set means the same
+            // as "never set" (`set_extra_roots` would remove the entry anyway),
+            // so skipping the call keeps a no-roots spawn free of any new
+            // in-memory write and of the redundant statement below.
+            if !child_extra.is_empty() {
+                supervisor.set_extra_roots(&child, child_extra.iter().map(PathBuf::from).collect());
+            }
             if let Some(fork) = fork_messages {
                 supervisor.set_fork_messages(&child, fork);
             }
@@ -1544,11 +1564,15 @@ impl RuntimeCoordinator {
             )?;
         // Persisted beside the row above: an inherited set that lived only in
         // memory would be lost on restart while the row survived, and the two
-        // would silently disagree.
-        self.repository
-            .lock()
-            .expect("runtime repository mutex poisoned")
-            .set_task_extra_roots(&child, &child_extra)?;
+        // would silently disagree. Skipped when empty so a no-roots spawn
+        // issues no statement beyond the pre-change ones (the row's column is
+        // already NULL by default) — the baseline stays literally untouched.
+        if !child_extra.is_empty() {
+            self.repository
+                .lock()
+                .expect("runtime repository mutex poisoned")
+                .set_task_extra_roots(&child, &child_extra)?;
+        }
         // Auto-registration: the parent prepares the directory (`git worktree
         // add`) and hands over its path; the daemon only records that position.
         // A bad path fails the spawn rather than deferring to worker start, so
@@ -1836,6 +1860,14 @@ impl RuntimeCoordinator {
         if let Some(workspace) = workspace_assignment.clone() {
             recovery_request = recovery_request.with_workspace(workspace);
         }
+        // The probe used to carry no root set. Populate it from the supervisor so
+        // this request is structurally consistent with the one the worker
+        // actually starts from (`AgentSupervisor`'s assembly): the factory's
+        // `recovery_context_for` sees the same view of the task, and a future
+        // `WorkerStart` field has a defined answer here instead of silently
+        // defaulting.
+        recovery_request =
+            recovery_request.with_extra_roots(supervisor.extra_roots(task).unwrap_or_default());
         let mut recovery_context = self.factory.recovery_context_for(&recovery_request);
         if workspace_assignment.is_none()
             && let Some(workspace) = supervisor
