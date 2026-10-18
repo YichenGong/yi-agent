@@ -515,24 +515,23 @@ mod tests {
         assert_eq!(sent[0]["threads"][1]["thread_id"], "done");
     }
 
-    /// 宿主与插件共用的 `driver/next` 线协议契约（**与插件 `service.rs` 的测试
-    /// 读的是同一份文件**，插件侧用 `include_str!`）。
+    /// 宿主与插件共用的 `driver/next` 线协议契约（**与插件 `service.rs` 的测试读的是
+    /// 同一份文件**，两侧都用 `include_str!`，与 `plugin-socket.json` 同一套做法）。
     ///
     /// 契约此前只存在于两侧手写的 JSON 字面量里：改一侧的字段名，两边测试照样全绿，
     /// 而生产上宿主 `parse_action` 悄悄回 `None`（这一拍什么都不做）、插件的
     /// `DriverResult` 反序列化失败（卡永远停在 `launching`）。这里把两侧钉到同一份
     /// 检出文件上。
     ///
-    /// 运行时读取而非 `include_str!`：插件是可独立安装/卸载的，宿主单独 checkout
-    /// 时这个目录可能不存在，编译期依赖会让宿主构建直接失败（与
-    /// `yi-agent-supervisors` 读 socket 契约同一取舍）。文件缺失就跳过——本测试锁的
-    /// 是「monorepo 内两侧一致」，不是宿主的构建前提。
-    fn driver_contract() -> Option<Value> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../../../plugins/superpowers-kanban/crates/superpowers-kanban-runner/contract/driver-protocol.json",
-        );
-        let text = std::fs::read_to_string(path).ok()?;
-        Some(serde_json::from_str(&text).expect("契约必须是合法 JSON"))
+    /// `include_str!` 而非运行时读取：编译期依赖能同时钉住「文件还在不在」——契约
+    /// 被改名/删除时**编译**就失败，运行时读取会静默跳过而失去意义。它只作用于
+    /// `#[cfg(test)]`，`cargo build` 不受影响。
+    const DRIVER_CONTRACT: &str = include_str!(
+        "../../../../plugins/superpowers-kanban/crates/superpowers-kanban-runner/contract/driver-protocol.json"
+    );
+
+    fn driver_contract() -> Value {
+        serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON")
     }
 
     /// 契约里插件那三种应答的字面量，宿主都必须解析得出来（`launch` / `append`
@@ -540,9 +539,7 @@ mod tests {
     /// 认的键名，这条就红。
     #[test]
     fn the_contract_answers_parse_into_the_actions_the_host_expects() {
-        let Some(contract) = driver_contract() else {
-            return; // 宿主单独 checkout：没有插件目录，无从对照。
-        };
+        let contract = driver_contract();
         let answers = &contract["answers"];
 
         let launch = parse_action(&answers["launch"]).expect("launch 字面量必须解析得出");
@@ -584,9 +581,7 @@ mod tests {
     /// 又由宿主手工编 JSON——两侧改名都不会有编译错误，只有这条对照会发现。
     #[tokio::test]
     async fn the_contract_request_matches_what_the_host_actually_sends() {
-        let Some(contract) = driver_contract() else {
-            return;
-        };
+        let contract = driver_contract();
         let mut threads = vec![DriverThread {
             thread_id: "thread-1".into(),
         }];
