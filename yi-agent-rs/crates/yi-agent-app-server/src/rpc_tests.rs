@@ -2322,16 +2322,14 @@ async fn refresh_preserves_an_explicit_base() {
     }
     // HEAD 之上再造一个可当显式基准的提交。
     std::fs::write(dir.path().join("a.txt"), "x\ny\n").unwrap();
-    for args in [vec!["commit", "-qam", "edit a"]] {
-        assert!(
-            std::process::Command::new("git")
-                .args(&args)
-                .current_dir(dir.path())
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
+    assert!(
+        std::process::Command::new("git")
+            .args(["commit", "-qam", "edit a"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
     // 显式基准取**第一个**提交（HEAD 的父），与会话锚点（= thread/start 时的
     // HEAD）不同：这样 base 与 baseKind 两条断言都能真正区分「保留了原基准」
     // 与「退化成了会话锚点」。

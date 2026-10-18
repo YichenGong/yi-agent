@@ -1792,8 +1792,7 @@ pub(crate) async fn handle(
                 let anchor = state
                     .threads
                     .get(&thread_id)
-                    .map(|t| t.store.load(&thread_id).ok().flatten())
-                    .flatten()
+                    .and_then(|t| t.store.load(&thread_id).ok().flatten())
                     .and_then(|l| l.meta.anchor_sha);
                 // 分两次短暂持锁，**不**把 guard 跨过 `command_frame` 的 await：
                 // `serve()` 跑在 `tokio::spawn` 里，guard 过 await 会让整个

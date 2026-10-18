@@ -94,7 +94,7 @@ pub fn classify(stdout: &str) -> &'static str {
     let looks_like_log = first.len() > 8
         && first.chars().take(7).all(|c| c.is_ascii_hexdigit())
         && first.chars().nth(7) == Some(' ')
-        && first[8..].trim().len() > 0;
+        && !first[8..].trim().is_empty();
     if looks_like_log {
         return "log";
     }

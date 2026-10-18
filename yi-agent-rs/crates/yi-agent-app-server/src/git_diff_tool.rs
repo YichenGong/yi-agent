@@ -327,16 +327,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path());
         // 两个都能解的可达名字，让 `valid_rev` 放行，从而测到第二道门。
-        for args in [vec!["branch", "other"]] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(&args)
-                    .current_dir(dir.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
+        assert!(
+            std::process::Command::new("git")
+                .args(["branch", "other"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let tool = ShowGitDiffTool::new(
             GitDiffHandle::new(),
             Some("thread-1".into()),
