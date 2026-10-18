@@ -14,10 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Local};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use superpowers_kanban_core::board::Board;
-use superpowers_kanban_core::card::{CardId, CardKind, CardState};
+use superpowers_kanban_core::card::{Card, CardId, CardKind, CardState};
 
 use crate::inbox::{self, InboxOutcome};
 use crate::lease::{self, Lease};
@@ -67,6 +68,89 @@ pub enum MergeFinish {
     Cleared,
 }
 
+/// 插件交给宿主的**通用**动作（spec D4）。宿主不认识看板：它只执行、不解释。
+///
+/// `card_id` 是插件内部的记账键（D5：`card_id → thread_id` 映射由插件持有），
+/// **不进 JSON**——宿主只认 `action_id`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriverAction {
+    /// 新建会话：宿主在 `workdir` 里起会话，首轮投递 `objective`。
+    Launch {
+        action_id: String,
+        card_id: String,
+        workdir: PathBuf,
+        title: String,
+        objective: String,
+    },
+    /// 向已有会话追加一轮（合并轮），不新建会话。
+    Append {
+        action_id: String,
+        card_id: String,
+        thread_id: String,
+        objective: String,
+    },
+}
+
+impl DriverAction {
+    pub fn action_id(&self) -> &str {
+        match self {
+            DriverAction::Launch { action_id, .. } | DriverAction::Append { action_id, .. } => {
+                action_id
+            }
+        }
+    }
+
+    /// 跨进程契约：字段名与宿主 `session_driver::parse_action` 逐字对齐（spec §4.3）。
+    /// 用 `action_id` 作键而不是直接序列化枚举——枚举的形状是实现细节，不能外泄。
+    pub fn to_json(&self) -> Value {
+        match self {
+            DriverAction::Launch {
+                action_id,
+                workdir,
+                title,
+                objective,
+                ..
+            } => json!({
+                "action_id": action_id,
+                "kind": "launch",
+                "workdir": workdir.to_string_lossy(),
+                "title": title,
+                "objective": objective,
+            }),
+            DriverAction::Append {
+                action_id,
+                thread_id,
+                objective,
+                ..
+            } => json!({
+                "action_id": action_id,
+                "kind": "append",
+                "thread_id": thread_id,
+                "objective": objective,
+            }),
+        }
+    }
+}
+
+/// 宿主回传的一次动作结果（spec D12 / §4.2）。
+///
+/// 字段名与宿主的 `ActionResult` 逐字对齐；`#[serde(default)]` 让视图里的 `idle`
+/// 缺失不至于整条回报反序列化失败——这种形状上的宽容值得（回报丢了比回报格式
+/// 怪要贵得多）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct DriverResult {
+    pub action_id: String,
+    /// 动作是否执行成功（启动失败、会话忙等）。
+    #[serde(default)]
+    pub ok: bool,
+    /// launch 成功时带回的会话 id（D5：插件的映射只能从这里得到）。
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// `ok: false` 时的原因；卡 `failed` 就取它。
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 struct Inner {
     board: Board,
     /// 已认领卡片持有的槽位租约。`Running` 卡片也仍在这里，直到终态释放。
@@ -77,6 +161,37 @@ struct Inner {
     /// 已提示过「分支缺失」的卡：同一 daemon 生命周期内每卡至多提示一次。
     /// 纯内存、不落盘——重启后重发一次是可接受的（该提示要求人工动作）。
     notified_missing_branch: std::collections::HashSet<CardId>,
+    /// 已交给宿主、还没收到回报的动作，按 `action_id` 索引。
+    ///
+    /// 两副担子：① 它是 `card_id → thread_id` 映射的另一半——`thread_id` 只由
+    /// 回报带回（spec D5），所以「哪个动作属于哪张卡」必须记在这里；
+    /// ② 它是 at-least-once 的幂等账——回报一到就摘除条目，宿主重复投递的那份
+    /// 找不到条目、直接忽略，因而不会重复生效。
+    pending_actions: std::collections::HashMap<String, PendingAction>,
+    /// **合并轮失败**退回来的卡：已用掉的自动重试次数 + 最近一次失败原因（spec D9）。
+    ///
+    /// 只记「合并轮失败」，不记会话自己跑完落下的 `needs_you`：后者没有产出
+    /// 可合，自动进合并轮会把它悄悄判成 `done`（分支与 base 同点，
+    /// `merge-base --is-ancestor` 恒真）。
+    merge_retries: std::collections::HashMap<CardId, (u32, String)>,
+    /// 动作 id 序号，配合 `action_nonce` 保证跨进程不撞名：重启后序号从 1 再来，
+    /// 若 id 只有序号，上一进程遗留的回报会被误认成本进程的动作。
+    next_action_seq: u64,
+    action_nonce: String,
+}
+
+/// 一个已交出、等回报的动作。
+struct PendingAction {
+    card_id: CardId,
+    kind: PendingKind,
+}
+
+/// 动作种类。回报的处置因种类而异：`launch` 靠 `thread_id` 让卡进入 `running`；
+/// `append`（合并轮）只说明回合已投递，成不成要等会话空闲后由 git 复核裁定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    Launch,
+    Append,
 }
 
 pub struct BoardService {
@@ -117,6 +232,14 @@ impl BoardService {
                 leases: Default::default(),
                 leases_dir,
                 notified_missing_branch: Default::default(),
+                pending_actions: Default::default(),
+                merge_retries: Default::default(),
+                next_action_seq: 0,
+                action_nonce: format!(
+                    "{}-{}",
+                    std::process::id(),
+                    chrono::Local::now().timestamp_millis()
+                ),
             }),
         }
     }
@@ -135,6 +258,291 @@ impl BoardService {
 
     fn save(&self, inner: &Inner) {
         let _ = persist::save_board(&self.board_path(), &inner.board);
+    }
+
+    /// 一次合并轮自动重试的上限（spec D9 的「可自动重试」要有界）。
+    ///
+    /// 每次重试都是一个真实的模型回合（分钟级、要花钱），而失败若来自环境
+    /// （分支没建出来、冲突解决不了），重试只会烧钱。到顶后卡停在 `needs_you`
+    /// 等人发话——人工介入后 `merge_retries` 计数随会话重新跑起来而清零。
+    const MAX_MERGE_RETRIES: u32 = 3;
+
+    /// 本插件**唯一**的推进入口（spec D1 / §4.6）。
+    ///
+    /// 宿主每 tick 调一次；这里回**至多一个**通用动作（`Launch` / `Append`），
+    /// 无事可做回 `None`。宿主不认识看板：队列顺序、并发名额、卡片状态迁移、
+    /// objective 文案，全都在这里定。
+    ///
+    /// 一拍内的固定次序：**回报 → 合并轮收尾 → 对账 → 合并轮开局 → 启动**。
+    /// 「对账」与「合并轮开局」在同一拍互斥：一张卡若在这一拍刚从 `running`
+    /// 落到 `awaiting_merge`，它的合并轮要等下一拍——刚跑完的下一步是等验收，
+    /// 不是立刻又塞一个回合进去（spec 风险表也接受最多晚一拍）。
+    pub fn driver_step(
+        &self,
+        threads: &[(String, bool)],
+        results: &[DriverResult],
+    ) -> Result<Option<DriverAction>, String> {
+        // 前置检查必须**早于**消费回报：拿不到全局租约目录时 `next_launch` 只会
+        // 整拍报错，而错误会让宿主把这批回报当作「没送到」重发；可回报已经消费
+        // 掉了，重发的那份会被当成陌生动作丢弃，那次状态迁移就永久丢了。
+        if self.lock().leases_dir.is_none() {
+            return Err("no lease directory".into());
+        }
+        // 一拍一份快照：下面的判断都基于同一份账，免得边决策边被别处改状态。
+        let cards = self.locked_cards();
+
+        // 1) 回报：宿主上一拍执行的结果在这里落账（`card_id → thread_id` 映射
+        //    只有这一个来源，spec D5）。重复投递的回报找不到待办条目 → 忽略。
+        self.consume_results(results);
+
+        // 2) 合并轮收尾：`merging` 卡的会话再次空闲 → 交既有的 git 复核
+        //    （`merge_finish`）裁定，绝不信模型自述。
+        for card in cards.iter().filter(|card| card.state == CardState::Merging) {
+            let Some(thread_id) = card.thread_id.as_deref() else {
+                continue;
+            };
+            if idle_of(threads, thread_id) != Some(true) {
+                continue;
+            }
+            // 刚交出的合并回合还没回报 → 不抢着收尾：那会儿宿主可能连 turn 都
+            // 还没起来，复核会把一个还没跑的合并判成失败。
+            if self.pending_kind(&card.id) == Some(PendingKind::Append) {
+                continue;
+            }
+            let _ = self.merge_finish(&card.id.0);
+        }
+
+        // 3) 对账：`running` 且会话空闲 → 有提交等验收、无提交等人发话；
+        //    停在验收/等人态而会话又忙起来 → 卡跟着会话翻回 `running`
+        //    （2026-10-03 看板状态误判的回归锁）。对账本身**不交动作**。
+        for card in cards
+            .iter()
+            .filter(|card| card.kind == CardKind::Implementation)
+        {
+            let Some(thread_id) = card.thread_id.as_deref() else {
+                continue;
+            };
+            match card.state {
+                CardState::Running => {
+                    if idle_of(threads, thread_id) != Some(true) {
+                        continue;
+                    }
+                    let outcome = if has_commits(card) {
+                        "awaiting_merge"
+                    } else {
+                        "needs_you"
+                    };
+                    let _ = self.mark_terminal(&card.id.0, outcome, None);
+                }
+                CardState::AwaitingMerge | CardState::NeedsYou
+                    if idle_of(threads, thread_id) == Some(false) =>
+                {
+                    let _ = self.mark_running(&card.id.0, thread_id);
+                }
+                _ => {}
+            }
+        }
+
+        // 4) 合并轮开局：一次只跑一个合并（spec D8）。已有卡在 `merging`——它是
+        //    名额的**持久载体**（`merge.lock` 只在临界区里活着）——就不开局；
+        //    第二张 `awaiting_merge` 卡原地等它释放。
+        if !self.any_merging() {
+            let mut candidates: Vec<&Card> = cards
+                .iter()
+                .filter(|card| match card.state {
+                    CardState::AwaitingMerge => true,
+                    // `needs_you` 只有**合并轮失败**退回来的才可自动重试（D9）。
+                    // 会话自己跑完落下的 `needs_you` 没有产出可合（spec §4.6），
+                    // 自动进合并轮会把它悄悄判成 `done`——分支与 base 同点，
+                    // `merge-base --is-ancestor` 恒真。
+                    CardState::NeedsYou => {
+                        (1..=Self::MAX_MERGE_RETRIES).contains(&self.merge_retry_count(&card.id))
+                    }
+                    _ => false,
+                })
+                .collect();
+            // 确定性：同 `order`（旧数据）时按 id 排，免得每拍挑中不同的卡。
+            candidates.sort_by(|a, b| (a.order, &a.id).cmp(&(b.order, &b.id)));
+            for card in candidates {
+                let Some(thread_id) = card.thread_id.clone() else {
+                    // 没有会话就没有「最后一轮」可追加（合并卡的裸 git 通路属
+                    // Task 8 退役的范围）。
+                    continue;
+                };
+                if idle_of(threads, &thread_id) != Some(true) {
+                    continue;
+                }
+                match self.merge_request(&card.id.0) {
+                    Ok(MergeRequest::Granted {
+                        workdir,
+                        source,
+                        base,
+                    }) => {
+                        let action_id = self.mint_action_id();
+                        self.remember_pending(&action_id, &card.id, PendingKind::Append);
+                        return Ok(Some(DriverAction::Append {
+                            action_id,
+                            card_id: card.id.0.clone(),
+                            thread_id,
+                            objective: crate::tick::merge_objective(&source, &base, &workdir),
+                        }));
+                    }
+                    // `Busy`（本进程/别的进程正持着 `merge.lock`）与 `Denied`
+                    // （分支缺失等）都不是整拍失败：换下一张，或等下一拍。
+                    Ok(_) | Err(_) => continue,
+                }
+            }
+        }
+
+        // 5) 启动：队首、有名额、日历放行 → 交出 `launch`。名额/租约/worktree
+        //    的既有记账全在 `next_launch` 里，这里不重造（brief 规则 2）。
+        let limit = superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
+            &self.state_dir,
+        )
+        .limit_at(chrono::Local::now());
+        match self.next_launch(limit, chrono::Local::now()) {
+            Ok(Some(claim)) => {
+                let objective = cards
+                    .iter()
+                    .find(|card| card.id.0 == claim.card_id)
+                    .map(crate::tick::engagement_objective)
+                    .unwrap_or_else(|| crate::tick::engagement_objective_for_paths("", ""));
+                let action_id = self.mint_action_id();
+                let card_id = CardId::new(claim.card_id.clone());
+                self.remember_pending(&action_id, &card_id, PendingKind::Launch);
+                Ok(Some(DriverAction::Launch {
+                    action_id,
+                    card_id: claim.card_id,
+                    workdir: claim.workdir,
+                    title: claim.title,
+                    objective,
+                }))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                // worktree 建不出来时 `next_launch` 已经把卡记为 `failed`，所以
+                // 这只是「本拍没有动作」，**不是**查询失败——回报的账已经记完，
+                // 返回 Err 会诱使宿主重发那批回报。
+                eprintln!("superpowers-kanban: launch failed: {error}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// 消费宿主回报的动作结果（spec D12）。
+    ///
+    /// 一律按 `action_id` 取出**待办条目**：取不到（重复投递、跨进程遗留、不认识
+    /// 的 id）就整条忽略。这就是 at-least-once 的幂等实现——宿主重复投递同一
+    /// `action_id` 不会二次生效，也不会重复记账名额。
+    ///
+    /// 摘除条目本身就是判重：第二条同 id 的回报从此查无此条。
+    fn consume_results(&self, results: &[DriverResult]) {
+        for result in results {
+            let Some(pending) = self.take_pending(&result.action_id) else {
+                continue;
+            };
+            // 迁移失败不再把条目放回：能失败的都是**不会再成功**的那种
+            // （卡不存在、当前状态不接受该迁移），重试只是原地打转；真正还要
+            // 推进的卡，下一拍的对账会重新看到它。
+            if let Err(error) = self.apply_result(&pending, result) {
+                eprintln!(
+                    "superpowers-kanban: could not apply result for {}: {error}",
+                    pending.card_id
+                );
+            }
+        }
+    }
+
+    /// 把一条已认领的回报落到看板上。
+    fn apply_result(&self, pending: &PendingAction, result: &DriverResult) -> Result<(), String> {
+        match (pending.kind, result.ok) {
+            (PendingKind::Launch, true) => match result.thread_id.as_deref() {
+                // 映射落地：`running` + 记下 thread id。
+                Some(thread_id) => self.mark_running(&pending.card_id.0, thread_id),
+                // `ok` 却没有 thread id：无从记账，只能不落状态（会话确实起了，
+                // 但它不在宿主的 `threads` 里，谁也对不上）。
+                None => {
+                    eprintln!(
+                        "superpowers-kanban: launch of {} reported ok without a thread_id",
+                        pending.card_id
+                    );
+                    Ok(())
+                }
+            },
+            // 启动失败：卡 `failed` 并让出名额——失败的启动是可恢复的，
+            // 不是死胡同（旧宿主在 `release` 里做的是同一件事）。
+            (PendingKind::Launch, false) => {
+                let reason = result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "launch failed".to_string());
+                self.mark_terminal(&pending.card_id.0, "failed", Some(&reason))
+            }
+            // 合并回合：结局一律由 git 复核裁定（D10），不采信回报里的成败。
+            // `ok: true` 只说明这一轮投递出去了——会话还没跑完，什么都不做；
+            // `ok: false`（会话正忙等）立刻走一次复核把名额放掉：分支若恰好已
+            // 并入就是 `done`，否则退回 `needs_you` 走重试（D9）。
+            (PendingKind::Append, true) => Ok(()),
+            (PendingKind::Append, false) => {
+                let _ = self.merge_finish(&pending.card_id.0);
+                Ok(())
+            }
+        }
+    }
+
+    /// 看板快照（克隆）：一次决策取一份，避免边决策边读到漂移的状态。
+    fn locked_cards(&self) -> Vec<Card> {
+        self.lock().board.cards().to_vec()
+    }
+
+    /// 是否已有卡在合并中——名额的持久载体（`merge.lock` 只在临界区活着）。
+    fn any_merging(&self) -> bool {
+        self.lock()
+            .board
+            .cards()
+            .iter()
+            .any(|card| card.state == CardState::Merging)
+    }
+
+    /// 这张卡因**合并轮失败**退回 `needs_you` 的次数（`0` 表示不是那么退回来的）。
+    fn merge_retry_count(&self, id: &CardId) -> u32 {
+        self.lock()
+            .merge_retries
+            .get(id)
+            .map(|(count, _)| *count)
+            .unwrap_or(0)
+    }
+
+    /// 新动作 id。带 `action_nonce`（pid + 时间戳）才不会与上一进程遗留的
+    /// 动作撞击：若 id 只是本进程内的序号，重启后旧回报会被误认成新动作。
+    fn mint_action_id(&self) -> String {
+        let mut inner = self.lock();
+        inner.next_action_seq += 1;
+        format!("act-{}-{}", inner.action_nonce, inner.next_action_seq)
+    }
+
+    fn remember_pending(&self, action_id: &str, card_id: &CardId, kind: PendingKind) {
+        self.lock().pending_actions.insert(
+            action_id.to_string(),
+            PendingAction {
+                card_id: card_id.clone(),
+                kind,
+            },
+        );
+    }
+
+    /// 取出并摘除待办条目：摘除即「这条回报已生效」，重复投递自然落空。
+    fn take_pending(&self, action_id: &str) -> Option<PendingAction> {
+        self.lock().pending_actions.remove(action_id)
+    }
+
+    /// 该卡是否有一个还没回报的动作（及其种类）。
+    fn pending_kind(&self, card_id: &CardId) -> Option<PendingKind> {
+        self.lock()
+            .pending_actions
+            .values()
+            .find(|pending| &pending.card_id == card_id)
+            .map(|pending| pending.kind)
     }
 
     /// 自动归档「已到终态且超过宽限期」的卡；返回被归档的 id。
@@ -264,6 +672,8 @@ impl BoardService {
             .board
             .set_thread_id(&id, thread_id.to_string())
             .map_err(|error| error.to_string())?;
+        // 会话活着 = 新一轮尝试：上一串合并轮失败的重试账清零。
+        inner.merge_retries.remove(&id);
         self.save(&inner);
         Ok(())
     }
@@ -512,6 +922,13 @@ impl BoardService {
             }
         };
         if !merge::source_branch_exists(&self.project_root, &source) {
+            // 同理，把「分支缺失」记进重试账：合并轮还没跑，卡仍是 awaiting_merge，
+            // 自动重试只会在同一个坑里循环，该让 `needs_you` 的处置被看见。
+            inner
+                .merge_retries
+                .entry(id.clone())
+                .or_insert((0, String::new()))
+                .1 = format!("source branch '{source}' does not exist");
             return Ok(MergeRequest::Denied(format!(
                 "source branch '{source}' does not exist"
             )));
@@ -566,6 +983,22 @@ impl BoardService {
             .transition(&id, state)
             .map_err(|error| error.to_string())?;
         inner.leases.remove(&id);
+        if next == MergeFinish::Done {
+            // 终态：重试账不再有意义。
+            inner.merge_retries.remove(&id);
+        } else {
+            // 合并轮失败：记下这是「可自动重试的 needs_you」（spec D9），
+            // 由 `driver_step` 数着次数重开合并轮。这里也是唯一的记账点——
+            // 不论复核是被 driver 还是被 CLI/桌面触发的。
+            //
+            // 之前记的原因保留：复核失败（分支未并入）是模糊事实，说不出具体
+            // 缘故，带着上一轮的 git 错误更有用（例如「source 分支不存在」）。
+            let entry = inner
+                .merge_retries
+                .entry(id.clone())
+                .or_insert((0, String::new()));
+            entry.0 = entry.0.saturating_add(1);
+        }
         self.save(&inner);
         Ok(next)
     }
@@ -664,6 +1097,19 @@ impl BoardService {
         self.save(&inner);
     }
 
+    /// 仅测试用：再排一张排队卡进内存 board 并落盘，供队列/名额用例搭台。
+    #[cfg(test)]
+    pub(crate) fn enqueue_card_for_test(&self, id: &str) {
+        let mut inner = self.lock();
+        inner.board.enqueue(
+            CardId::new(id),
+            PathBuf::from(format!("{id}.spec.md")),
+            PathBuf::from(format!("{id}.plan.md")),
+            chrono::Local::now(),
+        );
+        self.save(&inner);
+    }
+
     /// 仅测试用：直接往内存 board 排一张合并卡并落盘，绕开 inbox 通路。
     #[cfg(test)]
     pub(crate) fn enqueue_merge_card_for_test(
@@ -682,6 +1128,34 @@ impl BoardService {
             chrono::Local::now(),
         );
         self.save(&inner);
+    }
+}
+
+/// 宿主报的这条会话闲不闲；`None` = 宿主账上没有这台会话，判不了。
+fn idle_of(threads: &[(String, bool)], thread_id: &str) -> Option<bool> {
+    threads
+        .iter()
+        .find(|(id, _)| id == thread_id)
+        .map(|(_, idle)| *idle)
+}
+
+/// 这张卡启动后**有没有新提交**——`awaiting_merge`（有）与 `needs_you`（无）的唯一区别。
+///
+/// 对照基线是启动时记下的 `base_commit`，事实取自 worktree 当前的 HEAD。
+/// 没有基线（迁移来的旧卡）或读不到 HEAD（worktree 没了）时保守取「有提交」：
+/// 判成 `awaiting_merge` 还会经 git 复核，判错只多一个回合；
+/// 而把真做完的会话判成「没产出」会让它干等人发话。
+fn has_commits(card: &Card) -> bool {
+    let Some(workdir) = card.workdir.as_deref() else {
+        return true;
+    };
+    let Some(head) = effective_head(workdir) else {
+        // worktree 没了：无从判断，保守取「有提交」。
+        return true;
+    };
+    match card.base_commit.as_deref() {
+        Some(base) => base != head,
+        None => true,
     }
 }
 
@@ -761,6 +1235,33 @@ mod tests {
         persist::save_board(&state_dir.join("board.json"), &board).unwrap();
         // home 指到临时目录，让 lease 落在隔离目录，不污染真实 HOME。
         BoardService::new(state_dir, dir.to_path_buf(), Some(dir.join("home")))
+    }
+
+    /// 再加一张排队卡（走内存 board + 落盘，与 `service_with_card` 同一份）。
+    fn idle(ids: &[&str]) -> Vec<(String, bool)> {
+        ids.iter().map(|id| (id.to_string(), true)).collect()
+    }
+
+    /// 宿主说这些会话都还忙着。
+    fn busy(ids: &[&str]) -> Vec<(String, bool)> {
+        ids.iter().map(|id| (id.to_string(), false)).collect()
+    }
+
+    /// 一拍 `driver_step`，断言它交出了一个 launch 并把它交出来。
+    fn launched(service: &BoardService) -> DriverAction {
+        service
+            .driver_step(&[], &[])
+            .unwrap()
+            .expect("a launch action")
+    }
+
+    /// 把并发配额钉成 1（写进项目日历），用来验「名额限制」。
+    fn one_slot_only(service: &BoardService) {
+        let calendar = superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 1,
+            ..Default::default()
+        };
+        calendar.save(&service.state_dir).unwrap();
     }
 
     #[test]
@@ -1411,5 +1912,520 @@ mod tests {
         let board = persist::load_board(&service.state_dir.join("board.json"));
         let card = board.get(&CardId::new("card-1")).unwrap();
         assert!(!card.state.occupies_slot());
+    }
+
+    /// 队列里两张 `queued` 卡：`driver_step` 只交出 `order` 最小的那张 launch，
+    /// 且至多一个动作（spec D1）。
+    #[test]
+    fn driver_step_launches_the_head_of_the_queue_when_a_slot_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_card_for_test("card-2");
+
+        let action = service.driver_step(&[], &[]).unwrap().expect("a launch");
+        match action {
+            DriverAction::Launch {
+                card_id,
+                workdir,
+                objective,
+                ..
+            } => {
+                assert_eq!(card_id, "card-1", "队首（order 最小）先走");
+                assert!(workdir.join(".git").exists(), "worktree 由插件建好");
+                // objective 由插件给出，措辞是契约（宿主不再复刻）。
+                assert!(objective.contains("a.plan.md"), "{objective}");
+                assert!(objective.contains("a.spec.md"), "{objective}");
+                assert!(objective.contains("Never merge yourself"), "{objective}");
+            }
+            other => panic!("expected a launch, got {other:?}"),
+        }
+        assert_eq!(state_of(&service, "card-1"), "launching");
+        assert_eq!(state_of(&service, "card-2"), "queued", "一拍只走一张");
+    }
+
+    /// 名额（复用 `next_launch` 的租约记账）：名额占满时不再交出 launch。
+    #[test]
+    fn driver_step_stops_launching_at_the_slot_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_card_for_test("card-2");
+        one_slot_only(&service);
+
+        let action = service
+            .driver_step(&[], &[])
+            .unwrap()
+            .expect("the head launches");
+        assert!(matches!(action, DriverAction::Launch { ref card_id, .. } if card_id == "card-1"));
+        // 第一张还持着名额（`Launching` 也占租约）→ 第二张不出。
+        assert!(
+            service.driver_step(&[], &[]).unwrap().is_none(),
+            "no slot -> no launch"
+        );
+        assert_eq!(state_of(&service, "card-2"), "queued");
+    }
+
+    /// 卡 `running` + 它的会话 `idle` → 状态变 `awaiting_merge`（对账本身不交动作）。
+    #[test]
+    fn driver_step_marks_a_running_card_awaiting_merge_when_its_session_goes_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        // 会话在 worktree 里留下一个提交：有产出 → 等验收。
+        std::fs::write(claim.workdir.join("x.txt"), "x\n").unwrap();
+        git_run(&claim.workdir, &["add", "-A"]);
+        git_run(&claim.workdir, &["commit", "-qm", "feat"]);
+
+        let action = service.driver_step(&idle(&["thread-1"]), &[]).unwrap();
+        assert!(action.is_none(), "对账不向宿主交动作：{:?}", action);
+        assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
+    }
+
+    /// 会话跑完但没有提交 → `needs_you`（等人发话），不是 `awaiting_merge`（spec §4.6）。
+    #[test]
+    fn driver_step_marks_a_running_card_needs_you_when_its_session_ended_without_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        // 不提交：worktree 仍停在启动基线。
+
+        let action = service.driver_step(&idle(&["thread-1"]), &[]).unwrap();
+        assert!(action.is_none(), "{action:?}");
+        assert_eq!(state_of(&service, "card-1"), "needs_you");
+    }
+
+    /// 宿主说会话还忙、或这台会话压根不在宿主账上：都不下结论（宿主只报 `idle`）。
+    #[test]
+    fn driver_step_leaves_a_running_card_alone_while_its_session_is_not_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let claim = service.next_launch(1, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        std::fs::write(claim.workdir.join("x.txt"), "x\n").unwrap();
+
+        assert!(
+            service
+                .driver_step(&busy(&["thread-1"]), &[])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state_of(&service, "card-1"), "running", "还忙就不动它");
+        assert!(service.driver_step(&[], &[]).unwrap().is_none());
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "running",
+            "宿主不认识的会话不动它"
+        );
+    }
+
+    /// 停在验收态而会话又忙起来（追问/续跑）→ 卡必须翻回 `running`：
+    /// 否则看板会长期停在错误的状态（2026-10-03 看板状态误判）。
+    #[test]
+    fn driver_step_revives_an_awaiting_merge_card_whose_session_is_busy_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_awaiting_card(&project);
+
+        let action = service.driver_step(&busy(&["thread-1"]), &[]).unwrap();
+        assert!(action.is_none(), "{action:?}");
+        assert_eq!(state_of(&service, "card-1"), "running");
+    }
+
+    /// 卡 `awaiting_merge` + 其会话空闲 → 交出 `append`（objective 指名 source 与 base），
+    /// 且卡转 `merging`（名额的持久载体是卡片状态）。
+    #[test]
+    fn driver_step_emits_an_append_for_a_card_awaiting_merge_once_the_gate_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+
+        let action = service
+            .driver_step(&idle(&["thread-1"]), &[])
+            .unwrap()
+            .expect("an append for the merge turn");
+        match action {
+            DriverAction::Append {
+                card_id,
+                thread_id,
+                objective,
+                ..
+            } => {
+                assert_eq!(card_id, "card-1");
+                assert_eq!(thread_id, "thread-1", "追加回原会话，不新建");
+                assert!(
+                    objective.contains(&source),
+                    "objective 要指名 source：{objective}"
+                );
+                assert!(
+                    objective.contains("main"),
+                    "objective 要指名 base：{objective}"
+                );
+                assert!(
+                    !objective.contains("Never merge yourself"),
+                    "合并轮要明确要求执行合并：{objective}"
+                );
+            }
+            other => panic!("expected an append, got {other:?}"),
+        }
+        assert_eq!(state_of(&service, "card-1"), "merging");
+    }
+
+    /// 已有卡在 `merging`（名额被占）→ 第二张 `awaiting_merge` 卡不出 `append`。
+    #[test]
+    fn driver_step_does_not_append_twice_while_a_merge_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_card_for_test("card-2");
+        // card-1：走真实路径进合并轮（名额被占）。
+        let slug = crate::worktree::slugify(&CardId::new("card-1"));
+        let source = format!("kanban/{slug}");
+        git_run(&project, &["branch", &source]);
+        service.mark_running("card-1", "thread-1").unwrap();
+        service
+            .mark_terminal("card-1", "awaiting_merge", None)
+            .unwrap();
+        assert!(matches!(
+            service.merge_request("card-1").unwrap(),
+            MergeRequest::Granted { .. }
+        ));
+        // card-2：也停在 awaiting_merge，会话空闲，够资格合并。
+        service.mark_running("card-2", "thread-2").unwrap();
+        service
+            .mark_terminal("card-2", "awaiting_merge", None)
+            .unwrap();
+
+        // card-1 的会话仍忙（合并进行中）；card-2 空闲。
+        let action = service
+            .driver_step(
+                &[
+                    ("thread-1".to_string(), false),
+                    ("thread-2".to_string(), true),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert!(action.is_none(), "一次只跑一个合并：{action:?}");
+        assert_eq!(state_of(&service, "card-1"), "merging");
+        assert_eq!(
+            state_of(&service, "card-2"),
+            "awaiting_merge",
+            "第二张原地等名额"
+        );
+    }
+
+    /// 合并轮收尾：`merging` 卡的会话再次空闲 → 插件代调 `merge_finish`，
+    /// 以 git 事实裁定（分支已并入 → `done`）。
+    #[test]
+    fn driver_step_settles_a_merging_card_with_the_git_verified_merge_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        assert!(matches!(
+            service.merge_request("card-1").unwrap(),
+            MergeRequest::Granted { .. }
+        ));
+
+        let action = service.driver_step(&idle(&["thread-1"]), &[]).unwrap();
+        assert!(action.is_none(), "{action:?}");
+        assert_eq!(state_of(&service, "card-1"), "done", "以 git 事实收尾");
+    }
+
+    /// 本拍刚交出的合并轮：回报还没回来时不得抢着收尾——那时 turn 可能尚未真
+    /// 正启动，`merge_finish` 会把一个还没跑的合并判成失败。
+    #[test]
+    fn driver_step_does_not_settle_a_merge_turn_it_just_dispatched() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+
+        let action = service
+            .driver_step(&idle(&["thread-1"]), &[])
+            .unwrap()
+            .expect("an append");
+        let DriverAction::Append { action_id, .. } = action else {
+            panic!("expected an append")
+        };
+        // 下一拍：会话快照仍空闲（turn 尚未登记），但回报未到 → 不收尾。
+        assert!(
+            service
+                .driver_step(&idle(&["thread-1"]), &[])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "merging",
+            "不能抢在 turn 之前收尾"
+        );
+        // 回报到了（turn 确实被投递）→ 会话空闲即可收尾。
+        let result = DriverResult {
+            action_id,
+            ok: true,
+            thread_id: Some("thread-1".to_string()),
+            error: None,
+        };
+        assert!(
+            service
+                .driver_step(&idle(&["thread-1"]), &[result])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state_of(&service, "card-1"), "done");
+    }
+
+    /// 宿主账上没有这台会话 → 判不了它跑完没有，不动（与宿主旧 `plan()` 同型）。
+    #[test]
+    fn driver_step_leaves_an_untracked_merging_card_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        assert!(matches!(
+            service.merge_request("card-1").unwrap(),
+            MergeRequest::Granted { .. }
+        ));
+
+        assert!(service.driver_step(&[], &[]).unwrap().is_none());
+        assert_eq!(state_of(&service, "card-1"), "merging");
+    }
+
+    /// D12/D5：launch 结果带回 `thread_id` → `mark_running`（映射由插件持有）。
+    #[test]
+    fn driver_step_marks_the_card_running_from_a_launch_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            unreachable!()
+        };
+        assert_eq!(state_of(&service, "card-1"), "launching");
+
+        let result = DriverResult {
+            action_id,
+            ok: true,
+            thread_id: Some("thread-1".to_string()),
+            error: None,
+        };
+        assert!(
+            service
+                .driver_step(&busy(&["thread-1"]), &[result])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state_of(&service, "card-1"), "running");
+        assert_eq!(
+            service.list()["cards"][0]["thread_id"],
+            "thread-1",
+            "thread_id 由结果回报带回"
+        );
+    }
+
+    /// launch 失败回报 → 卡 `failed`（原因取 `error`）**并让出名额**：
+    /// 失败的启动是可恢复的，不是死胡同。
+    #[test]
+    fn driver_step_fails_the_card_when_a_launch_result_reports_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_card_for_test("card-2");
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            unreachable!()
+        };
+
+        let result = DriverResult {
+            action_id,
+            ok: false,
+            thread_id: None,
+            error: Some("worktree not found".to_string()),
+        };
+        // 同一拍就把名额让出来给队里下一张：失败的启动不是死胡同。
+        let next = service
+            .driver_step(&[], &[result])
+            .unwrap()
+            .expect("the freed slot goes to the next card");
+        assert!(
+            matches!(next, DriverAction::Launch { ref card_id, .. } if card_id == "card-2"),
+            "{next:?}"
+        );
+        assert_eq!(state_of(&service, "card-1"), "failed");
+        assert_eq!(state_of(&service, "card-2"), "launching");
+    }
+
+    /// at-least-once：同一条回报重复投递只生效一次，且不重复占名额。
+    #[test]
+    fn driver_step_ignores_a_redelivered_launch_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_card_for_test("card-2");
+        one_slot_only(&service);
+        let DriverAction::Launch { action_id, .. } = launched(&service) else {
+            unreachable!()
+        };
+
+        let result = DriverResult {
+            action_id,
+            ok: true,
+            thread_id: Some("thread-1".to_string()),
+            error: None,
+        };
+        assert!(
+            service
+                .driver_step(&[], std::slice::from_ref(&result))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state_of(&service, "card-1"), "running");
+        // 重复投递：不报错、不改状态、不多占一个名额。
+        assert!(
+            service
+                .driver_step(&[], std::slice::from_ref(&result))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(state_of(&service, "card-1"), "running");
+        assert_eq!(
+            service.list()["cards"][0]["thread_id"],
+            "thread-1",
+            "重复上报只刷新，不添乱"
+        );
+        assert!(
+            service.next_launch(1, at()).unwrap().is_none(),
+            "名额仍只有一个被占着"
+        );
+    }
+
+    /// 交出的动作 JSON 就是跨进程契约：字段名与宿主逐字对齐，且**不含** `card_id`
+    /// （宿主不认识看板，spec D3）。
+    #[test]
+    fn the_driver_action_json_uses_the_agreed_field_names() {
+        let launch = DriverAction::Launch {
+            action_id: "act-1".to_string(),
+            card_id: "card-1".to_string(),
+            workdir: PathBuf::from("/w/card-1"),
+            title: "看板 · a.spec".to_string(),
+            objective: "objective".to_string(),
+        };
+        let value = launch.to_json();
+        assert_eq!(value["action_id"], "act-1");
+        assert_eq!(value["kind"], "launch");
+        assert_eq!(value["workdir"], "/w/card-1");
+        assert_eq!(value["title"], "看板 · a.spec");
+        assert_eq!(value["objective"], "objective");
+        assert!(value.get("card_id").is_none(), "{value}");
+
+        let append = DriverAction::Append {
+            action_id: "act-2".to_string(),
+            card_id: "card-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            objective: "objective".to_string(),
+        };
+        let value = append.to_json();
+        assert_eq!(value["action_id"], "act-2");
+        assert_eq!(value["kind"], "append");
+        assert_eq!(value["thread_id"], "thread-1");
+        assert_eq!(value["objective"], "objective");
+        assert!(value.get("card_id").is_none(), "{value}");
+    }
+
+    /// 合并轮失败（分支未并入）→ 卡退回 `needs_you`，但它是**可自动重试**的
+    /// （spec D9）；重试有界，免得环境性失败一直烧模型回合。旧行为是「无入口的
+    /// 死胡同」，这条用例同时锁住「能自动再入轮」与「有上限」两面。
+    #[test]
+    fn driver_step_retries_a_failed_merge_round_but_only_a_bounded_number_of_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        // 分支存在但**没**并入 main：每轮复核都判失败。
+        git_run(&project, &["checkout", "-q", "-b", &source]);
+        std::fs::write(project.join("x.txt"), "x\n").unwrap();
+        git_run(&project, &["add", "x.txt"]);
+        git_run(&project, &["commit", "-qm", "feat"]);
+        git_run(&project, &["checkout", "-q", "main"]);
+
+        let mut appends = 0;
+        let mut pending: Option<DriverResult> = None;
+        // 跑足够多拍：每轮合并都要「开局 → 回报 → 空闲复核判失败 → 再开局」，
+        // 不在首次 None 上就停（收尾那一拍本来就没有动作可交）。
+        for _ in 0..30 {
+            let results: Vec<DriverResult> = pending.take().into_iter().collect();
+            match service.driver_step(&idle(&["thread-1"]), &results).unwrap() {
+                Some(DriverAction::Append { action_id, .. }) => {
+                    appends += 1;
+                    pending = Some(DriverResult {
+                        action_id,
+                        ok: true,
+                        thread_id: Some("thread-1".to_string()),
+                        error: None,
+                    });
+                }
+                Some(other) => panic!("unexpected action: {other:?}"),
+                None => {}
+            }
+        }
+        assert_eq!(
+            appends,
+            BoardService::MAX_MERGE_RETRIES as usize + 1,
+            "首轮 + N 次自动重试，此后不再自动进轮"
+        );
+        assert_eq!(state_of(&service, "card-1"), "needs_you", "到顶后等人发话");
+    }
+
+    /// 会话自己跑完、没有提交 → `needs_you`。它**不是**合并轮失败，没有产出可合，
+    /// 绝不能被自动拖进合并轮：分支与 base 同点时 `merge-base --is-ancestor` 恒真，
+    /// 那会把一张什么都没做的卡悄悄判成 `done`（D9 的自动重试只限合并轮失败）。
+    #[test]
+    fn driver_step_never_drags_a_session_ended_needs_you_card_into_a_merge_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        // 分支与 main 同点：一旦被自动合，复核会判「已并入」→ done（错）。
+        let slug = crate::worktree::slugify(&CardId::new("card-1"));
+        git_run(&project, &["branch", &format!("kanban/{slug}")]);
+        service.mark_running("card-1", "thread-1").unwrap();
+        service.mark_terminal("card-1", "needs_you", None).unwrap();
+
+        assert!(
+            service
+                .driver_step(&idle(&["thread-1"]), &[])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "needs_you",
+            "等人发话，不被自动合掉"
+        );
+    }
+
+    /// 缺分支的卡申请不到合并名额（`Denied`）：不是整拍失败，也不该卡住别的卡。
+    #[test]
+    fn driver_step_skips_a_merge_candidate_whose_source_branch_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, _source) = service_with_awaiting_card(&project);
+        // 不建分支 → merge_request 拒绝。
+
+        assert!(
+            service
+                .driver_step(&idle(&["thread-1"]), &[])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "awaiting_merge",
+            "卡原地等分支"
+        );
     }
 }
