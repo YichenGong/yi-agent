@@ -702,7 +702,7 @@ pub async fn command_frame(
     pub(crate) view_frames: Arc<tokio::sync::Mutex<std::collections::HashMap<String, crate::git_diff::ViewFrame>>>,
 ```
 
-**全部构造点都要补这一条字段（共 10 处）**：生产与测试各半，漏掉任一处都是编译错误（结构体字面量不做默认填充）——
+**全部构造点都要补这一条字段（共 9 处）**：生产与测试各半，漏掉任一处都是编译错误（结构体字面量不做默认填充）——
 `server.rs:1563`、`server.rs:1644`、`server.rs:2366`（解构，需加 `view_frames,`）、`ws.rs:114`、`rpc_tests.rs:1587`、`:2562`、`:2641`、`:2722`、`:14599`。
 测试夹具各自新建一份 `Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))`；`serve` 里同理。
 
@@ -721,7 +721,9 @@ pub async fn command_frame(
                             continue;
                         }
                         let refresh = req.params.get("refresh").and_then(|v| v.as_bool()).unwrap_or(false);
-                        let mut frames = view_frames.lock().await;
+                        // 注意：**不**在这里先取 `frames` guard——下面 refresh 分支要
+                        // `.await` 重算，guard 跨 await 会让 future 非 `Send`（`serve()`
+                        // 跑在 `tokio::spawn` 里），编译不过。故每次用时短暂持锁。
                         if refresh {
                             // 重跑：结构化默认用锚点重算，命令帧重跑同一条命令。
                             let cwd = threads
@@ -735,17 +737,41 @@ pub async fn command_frame(
                                 .map(|t| t.store.load(&thread_id).ok().flatten())
                                 .flatten()
                                 .and_then(|l| l.meta.anchor_sha);
-                            let next = match frames.get(&thread_id).and_then(|f| f.command.clone()) {
-                                Some(cmd) => crate::git_diff::command_frame(repo, &cmd, None, None).await,
-                                None => crate::git_diff::structured_frame(repo, None, anchor.as_deref()),
+                            // 分两次短暂持锁：**不**把 guard 跨过 `command_frame` 的
+                            // await，否则 future 非 `Send`、编译不过（`serve()` 在
+                            // `tokio::spawn` 里）。快照连基准来历一起取，重算时保留。
+                            let snapshot = view_frames
+                                .lock()
+                                .await
+                                .get(&thread_id)
+                                .map(|f| (f.command.clone(), f.base.clone(), f.base_kind.clone()));
+                            let command = snapshot.as_ref().and_then(|(c, _, _)| c.clone());
+                            let explicit = snapshot.as_ref().and_then(|(_, base, kind)| {
+                                (kind == "explicit").then(|| base.clone()).flatten()
+                            });
+                            let next = match command.as_deref() {
+                                Some(cmd) => crate::git_diff::command_frame(repo, cmd, None, None).await,
+                                None => crate::git_diff::structured_frame(repo, explicit.as_deref(), anchor.as_deref()),
                             };
-                            frames.insert(thread_id.clone(), next);
+                            // 写回用 CAS，不是无条件覆盖：读→算之间隔了一次 await，
+                            // 期间别的写入者可能已经落了更新的帧。（判据只有 `command`，
+                            // 故它只对命令帧有区分力——两条都是结构化帧时覆盖无害。）
+                            let mut frames = view_frames.lock().await;
+                            let unchanged = frames
+                                .get(&thread_id)
+                                .and_then(|f| f.command.as_deref())
+                                == command.as_deref();
+                            if unchanged {
+                                frames.insert(thread_id.clone(), next);
+                            }
+                            drop(frames);
                         }
-                        let result = frames
+                        let result = view_frames
+                            .lock()
+                            .await
                             .get(&thread_id)
                             .map(|f| serde_json::to_value(f).unwrap_or(json!(null)))
                             .unwrap_or(json!(null));
-                        drop(frames);
                         write_response(&hub, &client, ok_response(id, result)).await?;
                     }
 ```
@@ -753,7 +779,7 @@ pub async fn command_frame(
 - [ ] **Step 7: 运行测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server 2>&1 | tail -20`
-Expected: 全绿（含既有全部测试，证明 10 处 `RuntimeAttachments` 构造点与监听点改动无回归）。
+Expected: 全绿（含既有全部测试，证明 9 处 `RuntimeAttachments` 构造点与监听点改动无回归）。
 
 - [ ] **Step 8: 重新生成 TS 绑定**
 
@@ -1033,7 +1059,7 @@ pub struct GitDiffFocus {
     )));
 ```
 
-`build_runtime_tooling` 需要多一个 `anchor_sha: Option<String>` 参数；其 3 处测试调用补 `None`。
+`build_runtime_tooling` 需要多一个 `anchor_sha: Option<String>` 参数；`rpc_tests.rs` 的 9 处测试调用全部补 `None`（另有 `server.rs:415` 的生产调用点）。
 
 **修订（Task 4 修复轮）：`anchor_sha` 不能由 `attach_delegation` 自己读盘。** `start_thread_core` 先调 `attach_delegation`、后 `thread_store.create(&meta)`，新建路径上读盘只会拿到 `None`，工具默认基准就落到候选链（`local-default`）而非会话起点。故 `attach_delegation` 改为接收调用方给的 `anchor_sha`：新建传 `session_anchor(cwd)`（同一值也落进 meta），resume 传已落盘 meta 的 `anchor_sha`。
 

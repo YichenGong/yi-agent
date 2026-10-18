@@ -1827,8 +1827,11 @@ pub(crate) async fn handle(
                 // 或 Task 4 的 watcher）可能已经写了更新的帧；若无条件覆盖，面板就会
                 // 显示与「刚刚请求的命令」不符的内容——正是 D3 要杜绝的误导。
                 // 判定：槽里的命令仍等于我们读到的快照才写。
-                // 不覆盖的情形：同一命令连续两次 refresh 无法区分，但那是同一条命令，
-                // 无害；命令一旦不同，一定让位给更晚的写入者（下面的 result 会读到它）。
+                // 边界（如实记下）：判据只有 `command`，故它只对**命令帧**有区分力
+                // ——命令一旦不同必让位给更晚的写入者（下面的 result 会读到它）。
+                // 两条都是结构化帧（`command == None`）时这里区分不出先后，更晚的
+                // 结构化写入者仍可能被本次覆盖；那种情况下两边都是刚算出的自洽帧，
+                // 后果仅是多算一遍，不产生错标。
                 let mut frames = state.view_frames.lock().await;
                 let unchanged =
                     frames.get(&thread_id).and_then(|f| f.command.as_deref()) == command.as_deref();
