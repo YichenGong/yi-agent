@@ -2137,6 +2137,7 @@ export default function App() {
                 // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
                 // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
                 call={imageCall}
+                structuralVersion={current?.session.structuralVersion ?? 0}
               />
               <MessageInput
                 turnActive={current?.session.turnActive ?? false}

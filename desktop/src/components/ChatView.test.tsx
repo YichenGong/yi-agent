@@ -6,7 +6,7 @@ import type { NoticeItem } from "../lib/session";
 
 // Count how often the settled tool card's component body runs. A streamed delta
 // on the trailing agent message must not touch items that cannot have changed.
-const calls = vi.hoisted(() => ({ tool: 0 }));
+const calls = vi.hoisted(() => ({ tool: 0, text: 0 }));
 
 vi.mock("./ToolCallCard", () => ({
   ToolCallCard: ({ item }: { item: { name: string } }) => {
@@ -16,7 +16,12 @@ vi.mock("./ToolCallCard", () => ({
 }));
 
 vi.mock("./MarkdownText", () => ({
-  AgentMessage: ({ text }: { text: string }) => <div>{text}</div>,
+  AgentMessage: ({ text }: { text: string }) => {
+    // Counted so a streamed delta on the tail cannot hide a re-render of the
+    // settled messages above it.
+    calls.text += 1;
+    return <div>{text}</div>;
+  },
 }));
 
 // 图片字节由 `image/read` 另取（见 useImageData），此处只验证气泡把 hook 给出的
@@ -30,6 +35,7 @@ import { ChatView } from "./ChatView";
 afterEach(() => {
   cleanup();
   calls.tool = 0;
+  calls.text = 0;
 });
 
 function items(): Item[] {
@@ -70,10 +76,14 @@ describe("ChatView streaming", () => {
 
   it("still re-renders a tool card whose status changed", () => {
     const list = items();
-    const { getByTestId, rerender } = render(<ChatView items={list} />);
+    // `Session.apply` replaces the slot with a new item object on item/completed.
+    // The card sits in the prefix (the streaming agent message is the tail), and
+    // an in-place slot replace is invisible to the prefix's identity checks —
+    // which is exactly why `Session` bumps `structuralVersion` there. Driving the
+    // same pair here is what a real completed tool call looks like to `ChatView`.
+    const { getByTestId, rerender } = render(<ChatView items={list} structuralVersion={1} />);
     expect(getByTestId("tool").textContent).toBe("bash");
 
-    // `Session.apply` replaces the slot with a new item object on item/completed.
     list[1] = {
       type: "toolCall",
       id: "tc1",
@@ -83,7 +93,7 @@ describe("ChatView streaming", () => {
       status: "failed",
       result: "boom",
     };
-    rerender(<ChatView items={list} />);
+    rerender(<ChatView items={list} structuralVersion={2} />);
     expect(calls.tool).toBe(2);
   });
 
@@ -316,5 +326,45 @@ describe("ChatView retry banner", () => {
       expect(text).toContain(`retrying ${retrying!.attempt}/${retrying!.max}`);
       unmount();
     }
+  });
+});
+
+describe("ChatView frozen prefix", () => {
+  it("does not re-render history above the streaming tail", () => {
+    const history: Item[] = [];
+    for (let i = 0; i < 200; i += 1) {
+      history.push({ type: "agentMessage", id: `h${i}`, text: `history ${i}` });
+    }
+    const tail = { type: "agentMessage", id: "tail", text: "" } as Item;
+    const list = [...history, tail];
+
+    const { rerender } = render(<ChatView items={list} />);
+    const settled = calls.text;
+    expect(settled).toBe(201); // every item rendered once on mount
+
+    // Stream 5 deltas *in place*, exactly like `Session.apply` does.
+    for (let i = 1; i <= 5; i += 1) {
+      (tail as { text: string }).text = "chunk ".repeat(i);
+      rerender(<ChatView items={list} />);
+    }
+
+    // Only the tail may have re-rendered. The 200 history items must not have.
+    expect(calls.text - settled).toBeLessThanOrEqual(5);
+  });
+
+  it("re-renders history when structuralVersion changes", () => {
+    const history: Item[] = [
+      { type: "agentMessage", id: "h1", text: "old" },
+      { type: "agentMessage", id: "tail", text: "streaming" },
+    ];
+    const { rerender } = render(<ChatView items={history} structuralVersion={1} />);
+    const before = calls.text;
+
+    // An `item/completed` replace: same index, new object, new text.
+    history[0] = { type: "agentMessage", id: "h1", text: "settled" };
+    rerender(<ChatView items={history} structuralVersion={2} />);
+
+    expect(calls.text).toBeGreaterThan(before);
+    expect(screen.getByText("settled")).toBeTruthy();
   });
 });

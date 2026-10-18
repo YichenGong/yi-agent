@@ -926,3 +926,51 @@ describe("Session.adoptEpoch", () => {
     expect(s.epochInvalidated).toBe(false);
   });
 });
+
+describe("Session structuralVersion", () => {
+  it("does not change when streamed text is appended in place", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    const before = s.structuralVersion;
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "x" } });
+    // A pure append mutates `item.text` in place: the history prefix above it
+    // has not moved, so the frozen subtree must stay frozen.
+    expect(s.structuralVersion).toBe(before);
+  });
+
+  it("changes when an item is replaced in place on item/completed", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "hi" } },
+    });
+    const before = s.structuralVersion;
+    s.apply({
+      method: "item/completed",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "hi there" } },
+    });
+    expect(s.structuralVersion).toBeGreaterThan(before);
+  });
+
+  it("changes when a reasoning block is taken over by a server item", () => {
+    const s = new Session();
+    s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text: "think", kind: "Content" } });
+    const before = s.structuralVersion;
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "thinking", id: "th1", text: "think", redacted: false } },
+    });
+    expect(s.structuralVersion).toBeGreaterThan(before);
+  });
+
+  it("changes when a locally minted bubble is dropped", () => {
+    const s = new Session();
+    s.addUserMessage("oops");
+    const before = s.structuralVersion;
+    s.dropLocalUserMessage("oops");
+    expect(s.structuralVersion).toBeGreaterThan(before);
+  });
+});
