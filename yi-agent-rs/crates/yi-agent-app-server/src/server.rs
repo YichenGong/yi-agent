@@ -909,10 +909,17 @@ fn build_runtime_tooling(
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
     let workspace_root = root.handle()?.workspace_root;
-    // 本会话的 thread store(与 `attach_delegation` 里 `ThreadStore::new(Path::new(cwd))`
-    // 同源:workspace_root 就是该 thread 的 cwd)。装配期用它读落盘的 `role`,
+    // 本会话的 thread store。根取 `cfg.workdir`,它在**此处就是 thread cwd**:
+    // `attach_delegation` 在调用本函数之前先做了
+    // `thread_cfg.workdir = PathBuf::from(cwd)`(冷启动、resume 两条生产路径同形)。
+    //
+    // 刻意**不**用上面的 `workspace_root`:那是 daemon 回传的 git **toplevel**
+    // (`rev-parse --show-toplevel`),而组长的 meta 落在 `<cwd>/.yi-agent/threads`。
+    // 会话 cwd 是仓库子目录时两者分叉,按 toplevel 去找子目录里的组长只会 `load` 回
+    // `Ok(None)`,真组长静默丢掉两个工具。用 cwd 也让工具读的 store 与
+    // `thread/lead`、冷启动写 meta 的那一份**同源**。装配期用它读落盘的 `role`,
     // 判定「本 thread 是不是组长」——这是唯一权威。
-    let store = crate::thread_store::ThreadStore::new(Path::new(&workspace_root));
+    let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
     // One controller, one truth: it backs the root's builtin tools AND the
     // subagent spawn tools, and it reads the thread's live YOLO switch.
     let controller =
@@ -962,12 +969,17 @@ fn build_runtime_tooling(
     // 落盘的 `ThreadMeta.role`(唯一权威),不靠标题/名字/cwd 猜——判定函数见
     // `lead_memory::is_lead_thread`。
     //
-    // `project_root` 取 `workspace_root`:它就是本 thread 的 workspace 根(= cwd 的
-    // canonical 形态),而组长的 cwd 就是项目根(组长不由 `.worktrees/` 承载)。
-    // 不拿 `cfg.workdir` 兜底:那会让「工具绑的项目根」与「thread 所属项目」在
-    // 会话 cwd 不同于进程 workdir 时脱钩。
+    // `project_root` 取 `cfg.workdir`(= thread cwd),理由与上面的 store 同根:
+    // ① meta 落在 `<cwd>/.yi-agent/threads`,故账本也必须落在 `<cwd>/.yi-agent`
+    //    下,两者才是同一个「项目」;
+    // ② 本功能其余部分对「组长的项目」的定义就是 cwd —— Task 6 的后台 tick 用
+    //    `session.store.project_key()`(= `<cwd>/.yi-agent`)枚举组长,
+    //    `project_root_of(project_key)` 即其 parent = cwd;
+    // ③ 若留成 git toplevel,`<repo>` 与 `<repo>/sub` 两个不同 project_key(两个
+    //    不同组长)会共用同一份 `<repo>/.yi-agent/lead_memory/memory.md`,跨项目
+    //    账本串味。
     if crate::lead_memory::is_lead_thread(&store, thread_id) {
-        let project_root = Path::new(&workspace_root).to_path_buf();
+        let project_root = cfg.workdir.clone();
         registry.register(Arc::new(crate::lead_memory::LeadRememberTool::new(
             project_root.clone(),
         )));
@@ -10905,9 +10917,10 @@ pub(crate) mod tests {
             )
             .expect("a clean git repo must attach"),
         );
-        // `build_runtime_tooling` 取的是 `root.handle()?.workspace_root`;组长不使用
-        // `.worktrees/`,故它就是项目根。这条断言把「project_root 取自
-        // workspace_root 且 workspace_root 就是项目根」这个前提钉在测试里。
+        // `build_runtime_tooling` 取的是 `root.handle()?.workspace_root`,而工具的
+        // `project_root` 取 `cfg.workdir`(= thread cwd)。本测试里 thread cwd 就是
+        // 仓库顶层,故二者重合(这也是把 store 根绑错也照样绿的原因——分歧情形由
+        // `a_lead_in_a_repo_subdirectory_sees_the_memory_tools` 覆盖)。
         // 注意形态:workspace_root 是 cwd 的 **canonical** 形态(macOS 上
         // `/var` → `/private/var`),与项目根是同一个目录,不是另一个路径。
         let project_root = repo.path().canonicalize().expect("repo path canonicalizes");
@@ -10918,7 +10931,7 @@ pub(crate) mod tests {
         // 两种拼写必须指向同一份 store:生产里 thread 的 cwd 走的是
         // `resolve_thread_cwd` 的**非 canonical**(显式 cwd 才 canonicalize),
         // 而 workspace_root 是 canonical 的。若二者不是同一个目录,下面「用
-        // workspace_root 建 store、用 cfg.workdir 建 meta」就会各写各的,
+        // cfg.workdir 建 store、也用 cfg.workdir 建 meta」就会各写各的,
         // 判定便永远读不到 role——本断言先把这个前提钉死。
         assert_eq!(
             std::fs::canonicalize(cfg.workdir.as_path()).expect("workdir canonicalizes"),
@@ -10926,11 +10939,11 @@ pub(crate) mod tests {
             "cfg.workdir and the attached workspace root must be the same directory"
         );
 
-        // 组装 store 时**刻意用生产那种拼写**(`cfg.workdir`,即 `cwd`,非
-        // canonical),而不是上面那个 canonical 形态:装配里的
-        // `ThreadStore::new(Path::new(&workspace_root))` 用的是 canonical。
-        // 两条拼写必须落到同一份 `<项目根>/.yi-agent/threads`,否则本测试会
-        // 读不到自己写的 meta,「组长看到工具」的断言就永远不会绿。
+        // 组装 store 时用生产那种拼写(`cfg.workdir`,即 `cwd`,非 canonical),
+        // 装配里读 role 的 store 现在也取 `cfg.workdir`,两侧同源。而
+        // `workspace_root` 是 canonical 形态,故上面那条断言仍把「两种拼写指向
+        // 同一个物理目录」钉死:若二者不是同一目录,本测试会读不到自己写的
+        // meta,「组长看到工具」的断言就永远不会绿。
         let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
         store
             .create(&crate::thread_store::ThreadMeta {
@@ -11027,6 +11040,125 @@ pub(crate) mod tests {
         assert!(
             crate::lead_memory::memory_path(&project_root).exists(),
             "the ledger must land under the project root, not somewhere else"
+        );
+    }
+
+    /// 组长的 cwd 落在 git 仓库的**子目录**时,两个记忆工具仍然必须可见。
+    ///
+    /// 这是上一条测试抓不到的那一格:那里 thread cwd 就是仓库顶层,「读 role 的
+    /// store 根」与「meta 的落盘处」恰好重合,于是把 store 根绑错成 git toplevel
+    /// 也照样绿。生产里两者**会**分叉:`attach_project_runtime` 回传的
+    /// `workspace_root` 是 daemon 的 `git rev-parse --show-toplevel`(root 以
+    /// `ChildWriteMode::ReadOnly` 就地运行,位置取 `repository_root`),而组长 meta
+    /// 写在 `<cwd>/.yi-agent/threads`。按 toplevel 去找子目录里的组长,`load` 回
+    /// `Ok(None)`,真组长便静默丢掉两个工具。
+    #[test]
+    fn a_lead_in_a_repo_subdirectory_sees_the_memory_tools() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let subdir = repo.path().join("sub");
+        std::fs::create_dir_all(&subdir).expect("the subdirectory must exist");
+        // 进程 workdir 仍是仓库顶层(生产的 `cfg.workdir` 是进程级 workdir),
+        // 而**本会话的 cwd** 是子目录——分叉就发生在这里。
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+
+        let attached = Arc::new(
+            yi_agent_subagent::attach::attach_project_runtime(
+                &cfg,
+                runtime.path().to_path_buf(),
+                &isolated_models_path(runtime.path()),
+            )
+            .expect("a clean git repo must attach"),
+        );
+        // 这两条断言是本测试有效性的前提:attach 回来的 `workspace_root` 是 git
+        // **顶层**,与会话 cwd(子目录)不是同一个目录。若它们不成立,本测试只是又
+        // 踩了一遍「两条路径重合」的情形,对「读错 store」毫无分辨力。
+        let toplevel = repo.path().canonicalize().expect("repo path canonicalizes");
+        assert_eq!(
+            attached.workspace_root, toplevel,
+            "the attached workspace root must be the git toplevel"
+        );
+        assert_ne!(
+            std::fs::canonicalize(&subdir).expect("the subdirectory canonicalizes"),
+            attached.workspace_root,
+            "the thread cwd must diverge from the attached workspace root"
+        );
+
+        // 组长 meta 落在**子目录**的 store 里,走生产的落盘路径,而不是手搓字段。
+        let cwd_store = crate::thread_store::ThreadStore::new(&subdir);
+        let (lead, _created) =
+            crate::lead::ensure_lead_meta(&cwd_store, &subdir).expect("lead meta");
+        assert_eq!(
+            lead.cwd,
+            subdir.to_string_lossy().to_string(),
+            "the lead's cwd must be the subdirectory, not the toplevel"
+        );
+        // 分歧路径的见证:按 toplevel 去找,**读不到**这个组长(修复前的读法)。
+        // 这条一旦为真,下面的「工具可见」就不可能是靠 toplevel store 侥幸凑出来的。
+        assert!(
+            !crate::lead_memory::is_lead_thread(
+                &crate::thread_store::ThreadStore::new(&toplevel),
+                &lead.thread_id
+            ),
+            "the toplevel store must not hold this lead, otherwise this test would not \
+             exercise the divergent path"
+        );
+
+        // 与 `attach_delegation` 同形:先把 thread cfg 的 workdir 设成 thread cwd,
+        // 再装配。这正是生产里 `cfg.workdir` 与会话 cwd 同源的那一步。
+        let mut thread_cfg = cfg.clone();
+        thread_cfg.workdir = subdir.clone();
+        let binding = RuntimeBinding::managed(
+            &cfg,
+            runtime.path().to_path_buf(),
+            isolated_models_path(runtime.path()),
+            Arc::clone(&attached),
+        );
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+        let tooling = build_runtime_tooling(
+            &thread_cfg,
+            &root,
+            &lead.thread_id,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
+            crate::lead::LeadReplies::new(),
+        )
+        .expect("tooling");
+        let names = tooling.registry.names();
+        assert!(
+            names.contains(&"lead_remember".to_string()),
+            "a lead whose cwd is a repo subdirectory must still see lead_remember, got {names:?}"
+        );
+        assert!(
+            names.contains(&"lead_recall".to_string()),
+            "a lead whose cwd is a repo subdirectory must still see lead_recall, got {names:?}"
+        );
+
+        // 账本必须与组长的 meta 落在**同一个** `.yi-agent` 下(即子目录),而不是
+        // toplevel:把 `project_root` 留在 toplevel,会让两个不同 project_key 的组长
+        // (`<repo>` 与 `<repo>/sub`)共用一份 `lead_memory/memory.md` —— 跨项目串味。
+        let remember = tooling
+            .registry
+            .get("lead_remember")
+            .expect("the lead's registry must hold lead_remember");
+        let block_on = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = block_on.block_on(remember.call(serde_json::json!({ "text": "子目录组长" })));
+        assert!(!out.is_error, "lead_remember must succeed: {out:?}");
+        assert!(
+            crate::lead_memory::memory_path(&subdir).exists(),
+            "the ledger must land in the subdirectory's .yi-agent, next to the lead's meta"
+        );
+        assert!(
+            !crate::lead_memory::memory_path(&toplevel).exists(),
+            "the ledger must not land at the toplevel: that key belongs to another project"
         );
     }
 
