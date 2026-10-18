@@ -168,6 +168,7 @@ impl Tool for BashTool {
         let mut child = match Command::new(program)
             .args(command_args)
             .current_dir(&cwd)
+            .envs(self.ctx.session_env().iter().cloned())
             .process_group(0) // 自成进程组（pgid == 子进程 pid），与 yi-agent 隔离
             // Dropping the agent's tool future must not leave the shell running.
             .kill_on_drop(true)
@@ -1163,5 +1164,45 @@ mod tests {
         .await;
         // 只要能拿到结果，就说明调用方（本测试进程）没被信号带走。
         assert!(result.is_ok(), "caller must survive a self group-kill");
+    }
+
+    #[tokio::test]
+    async fn bash_injects_the_session_env_into_the_child() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = Arc::new(ToolsContext::with_roots_and_env(
+            vec![tmp.path().to_path_buf()],
+            vec![("YI_AGENT_THREAD_ID".to_string(), "thread-abc".to_string())],
+        ));
+        let tool = BashTool::new(ctx);
+        let result = tool
+            .call(serde_json::json!({"command": "echo $YI_AGENT_THREAD_ID"}))
+            .await;
+        assert!(!result.is_error);
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            assert!(
+                s.contains("thread-abc"),
+                "child must see the injected env: {s}"
+            );
+        } else {
+            panic!("expected text block");
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_without_a_session_env_leaves_the_variable_unset() {
+        let tmp = TempDir::new().unwrap();
+        let tool = make_tool(&tmp);
+        let result = tool
+            .call(serde_json::json!({"command": "echo \"[$YI_AGENT_THREAD_ID]\""}))
+            .await;
+        assert!(!result.is_error);
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            assert!(
+                s.contains("[]"),
+                "no session env means an empty expansion: {s}"
+            );
+        } else {
+            panic!("expected text block");
+        }
     }
 }
