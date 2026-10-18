@@ -6269,30 +6269,9 @@ pub(crate) fn extract_prompt(params: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod board_rpc_tests {
     use super::*;
-
-    async fn rpc(
-        h: &mut tests::Harness,
-        id: u64,
-        method: &str,
-        params: serde_json::Value,
-    ) -> serde_json::Value {
-        h.send(
-            &json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            })
-            .to_string(),
-        )
-        .await;
-        loop {
-            let value = h.read_value().await;
-            if value.get("id") == Some(&json!(id)) {
-                return value;
-            }
-        }
-    }
+    // 请求/应答泵住在 `test_support`（与 `resident_rpc_tests` 共用同一份），
+    // 别名保持下面各调用点原样。
+    use crate::test_support::rpc_over_stdio as rpc;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn board_create_then_remove_lists_the_project_between_the_two() {
@@ -6532,30 +6511,8 @@ mod board_rpc_tests {
 #[cfg(test)]
 mod resident_rpc_tests {
     use super::*;
-
-    async fn rpc(
-        h: &mut tests::Harness,
-        id: u64,
-        method: &str,
-        params: serde_json::Value,
-    ) -> serde_json::Value {
-        h.send(
-            &json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            })
-            .to_string(),
-        )
-        .await;
-        loop {
-            let value = h.read_value().await;
-            if value.get("id") == Some(&json!(id)) {
-                return value;
-            }
-        }
-    }
+    // 与 `board_rpc_tests` 共用同一份泵（原先两边各抄了一份）。
+    use crate::test_support::rpc_over_stdio as rpc;
 
     /// `resident/list` 走完整 dispatch（域路由 + handler + 线格式），插进
     /// **已有**的登记目录，故 harness 的隔离 tempdir 就是数据源。
