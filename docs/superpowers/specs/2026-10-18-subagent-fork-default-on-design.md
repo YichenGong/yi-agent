@@ -73,17 +73,28 @@ enum ForkChoice { Default, Yes, No }
 该错误；`ForkChoice::Default` 返回 `Ok(None)` 并 `tracing::warn!`。
 
 **(b) fork 载荷超上限。** 上限是 `DEFAULT_FORK_MAX_BYTES = 32 MiB`
-（`yi-agent-store/src/runtime.rs:47`），超限时 daemon 以 `ForkTooLarge` 拒绝整个
-spawn（`runtime.rs:960`）。
+（`yi-agent-store/src/runtime.rs:47`）。超限由 daemon 在 `begin_fork_upload`
+（`runtime.rs:961` 的 `ForkTooLarge`）拒绝，它发生在**第一个 `BeginForkUpload`
+请求**上——不是 spawn 请求。今天 `drive_fork_upload`（lib.rs:1713-1727）把该响应
+转成 `Err`，于是 `spawn_fork_token` 报错、spawn 请求根本不会发出。
 
-**保守实现（不重发请求）：** 在**建 fork 上传之前**就先用 `caller.snapshot()`
-序列化并在本地量字节数；若超限且为 `ForkChoice::Default`，直接走无 fork 路径，
-**不产生第一次 `BeginForkUpload`**。
+**默认路径的降级规则（统一一条）：** fork 尝试的任何失败，在 `ForkChoice::Default`
+下都降级为「无 fork」，`ForkChoice::Yes` 下一律保持今天的报错。
 
-选这个形态而不是「发 spawn、收到 `ForkTooLarge` 再重发」的理由：重发是**第二次
-spawn 请求**，其幂等性需要额外论证；本地量长度只多一次序列化（`fork:true` 路径本来
-也要序列化），且不依赖任何 spawn 幂等假设。显式 `fork: true` 超限时仍走 daemon 的
-`ForkTooLarge` 硬失败，语义不变。
+这条规则刻意**不做错误分类**（不解析 `ForkTooLarge`、不区分拒绝与传输故障），
+理由有二：
+
+1. **不需要本地镜像 daemon 的上限。** 上限是 daemon 策略、可经
+   `YI_AGENT_FORK_MAX_BYTES` 环境变量覆盖（`runtime.rs:49-50,536-539`），客户端
+   硬编码一个 32 MiB 副本必然漂移。超限由 daemon 在第一个 `BeginForkUpload` 拒绝，
+   且**拒绝发生在分配 token 之前**（`runtime.rs:955-965`），所以没有字节流动、没有
+   token 泄漏、也无需 abort。
+2. **不需要重发 spawn，也就不依赖 spawn 幂等性。** fork 上传发生在 spawn 请求
+   **之前**（lib.rs:1927 取 token，1932 才发 spawn），降级只是把 `fork_token` 置为
+   `None` 再发 spawn——spawn 请求**总共只发一次**。
+
+「默认路径掩盖真实故障」的担忧不成立：降级后紧接着就是同一个 socket 上的 spawn
+请求，daemon 若真的坏了，那次调用会立刻报 `daemon is unavailable`。
 
 ### 2.3 文案（A + B）
 
@@ -153,8 +164,11 @@ spawn 请求**，其幂等性需要额外论证；本地量长度只多一次序
 2. `fork: false` → 只含 objective，返回 `forked: false`（既有测试已覆盖行为，
    补 `forked` 字段断言）。
 3. caller 未绑定 + 省略 fork → spawn **成功**，返回 `forked: false`（降级，不报错）。
-4. 载荷超上限 + 省略 fork → spawn **成功**，返回 `forked: false`，且**未发生**
-   `BeginForkUpload`（断言保守路径，见 §2.2）。
+4. 载荷超限 / 传输故障 + 省略 fork → spawn **成功**，返回 `forked: false`（降级）。
+   实现上不专门构造「超 1 MiB 载荷」的 daemon（其上限只能经进程级环境变量
+   `YI_AGENT_FORK_MAX_BYTES` 设置，在并行测试中不安全），而是用一个「已绑定 caller +
+   不可达 socket」的单元测试覆盖**同一类**失败——daemon 在第一个 `BeginForkUpload`
+   拒绝超限载荷时，走的正是这条 `Err` 通道。
 
 **验证命令：**
 
