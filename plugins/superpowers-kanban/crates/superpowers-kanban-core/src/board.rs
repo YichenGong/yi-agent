@@ -140,12 +140,7 @@ impl Board {
     /// `prequeued`：那会让每张中文卡的 id 撞成一个（`slugify` 再把它压成 `card`），
     /// worktree 分支名与追踪线一起废掉。
     pub fn next_free_prequeued_id(&self, title: &str, now: DateTime<Local>) -> CardId {
-        let slug = crate::card_id::slug(title);
-        let base = if slug.is_empty() {
-            format!("prequeued-{}", now.format("%Y%m%d%H%M%S"))
-        } else {
-            slug
-        };
+        let base = prequeued_id_base(title, now);
         if !self.contains(&base) {
             return CardId::new(base);
         }
@@ -463,6 +458,21 @@ impl Board {
     /// 未归档的卡（`list` 与宿主默认只看这些）。
     pub fn visible(&self) -> impl Iterator<Item = &Card> {
         self.cards.iter().filter(|card| !card.archived)
+    }
+}
+
+/// 预排队卡 id 的基名：`slug(title)`；slug 为空（非 ASCII 标题）回退
+/// `prequeued-<YYYYMMDDHHMMSS>`。
+///
+/// 基名单独抽出来，是因为「未占用」的判据不止看板一处：投递要等下一个 tick 才
+/// 入队，`inbox::next_free_prequeued_id` 必须在同一套基名上再避开 inbox 里尚未
+/// 消费的投递。两处各写一份推导就会漂移。
+pub fn prequeued_id_base(title: &str, now: DateTime<Local>) -> String {
+    let slug = crate::card_id::slug(title);
+    if slug.is_empty() {
+        format!("prequeued-{}", now.format("%Y%m%d%H%M%S"))
+    } else {
+        slug
     }
 }
 

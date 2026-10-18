@@ -228,12 +228,7 @@ pub enum CardState {
     /// `prequeued`：那会让每张中文卡的 id 撞成一个（`slugify` 再把它压成 `card`），
     /// worktree 分支名与追踪线一起废掉。
     pub fn next_free_prequeued_id(&self, title: &str, now: DateTime<Local>) -> CardId {
-        let slug = crate::card_id::slug(title);
-        let base = if slug.is_empty() {
-            format!("prequeued-{}", now.format("%Y%m%d%H%M%S"))
-        } else {
-            slug
-        };
+        let base = prequeued_id_base(title, now);
         if !self.contains(&base) {
             return CardId::new(base);
         }
@@ -245,7 +240,28 @@ pub enum CardState {
         }
         unreachable!("u32 suffix space exhausted")
     }
+```
 
+基名单独抽出来，因为「未占用」的判据不止看板一处：投递要等下一个 tick 才入队，
+`inbox::next_free_prequeued_id`（Task 2）必须在同一套基名上再避开 inbox 里尚未消费
+的投递。两处各写一份推导就会漂移。放在 `impl Board` 之外：
+
+```rust
+/// 预排队卡 id 的基名：`slug(title)`；slug 为空（非 ASCII 标题）回退
+/// `prequeued-<YYYYMMDDHHMMSS>`。
+pub fn prequeued_id_base(title: &str, now: DateTime<Local>) -> String {
+    let slug = crate::card_id::slug(title);
+    if slug.is_empty() {
+        format!("prequeued-{}", now.format("%Y%m%d%H%M%S"))
+    } else {
+        slug
+    }
+}
+```
+
+再回到 `impl Board`，`promote_prequeued` 保持原样：
+
+```rust
     /// 提升一张预排队卡：补 spec/plan、可换标题、翻 `Queued`、**重排到队尾**。
     /// id 不变——这是「追踪不断线」的核心保障。
     pub fn promote_prequeued(
@@ -304,10 +320,36 @@ git commit -m "feat(kanban): add PreQueued state, card title, and promote on the
   - `inbox::promote_path(state_dir: &Path, id: &str) -> PathBuf`（`<state_dir>/inbox/<id>.promote.json`）
   - `inbox::deliver_prequeued_card(state_dir: &Path, id: &str, title: &str) -> std::io::Result<()>`
   - `inbox::deliver_promote_card(state_dir: &Path, id: &str, spec: &str, plan: &str, title: Option<&str>) -> std::io::Result<()>`
+  - `inbox::next_free_prequeued_id(board: &Board, state_dir: &Path, title: &str, now: DateTime<Local>) -> CardId`（**唯一**的预排队 id 分配器：看板 + inbox 尚未消费的投递一起避开。IPC 与 CLI 都走它）
 
 - [ ] **Step 1: 写失败测试（inbox.rs 的 `mod tests` 末尾追加）**
 
 ```rust
+    #[test]
+    fn a_pending_delivery_blocks_its_id_so_two_quick_captures_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = Board::new();
+        let now = Local.with_ymd_and_hms(2026, 10, 18, 17, 7, 29).unwrap();
+        // 两个不同的中文标题在同一秒：基名相同，第二个必须换 id。
+        let first = next_free_prequeued_id(&board, dir.path(), "一个想法", now);
+        deliver_prequeued_card(dir.path(), &first.0, "一个想法").unwrap();
+        let second = next_free_prequeued_id(&board, dir.path(), "另一个想法", now);
+        assert_ne!(first, second, "同一窗口的第二次捕获必须换 id");
+        assert!(dir.path().join(format!("inbox/{}.json", first.0)).exists());
+    }
+
+    #[test]
+    fn a_pending_delivery_with_the_same_title_gets_a_suffix_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = Board::new();
+        let now = Local.with_ymd_and_hms(2026, 10, 18, 17, 7, 29).unwrap();
+        let first = next_free_prequeued_id(&board, dir.path(), "idea", now);
+        assert_eq!(first.0, "idea");
+        deliver_prequeued_card(dir.path(), &first.0, "idea").unwrap();
+        let second = next_free_prequeued_id(&board, dir.path(), "idea", now);
+        assert_eq!(second.0, "idea-2");
+    }
+
     #[test]
     fn delivers_a_prequeued_card_with_its_kind_and_title() {
         let dir = tempfile::tempdir().unwrap();
@@ -395,6 +437,36 @@ pub fn deliver_promote_card(
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, &path)
+}
+
+/// 尚未被占用的预排队卡 id：既避开看板上已有的卡，也避开 `<state_dir>/inbox`
+/// 里**尚未被 runner 消费**的投递。
+///
+/// 只看看板是不够的：投递要等下一个 tick 才入队，在此之前同一窗口内的第二次
+/// `enqueue_prequeued` 会算出同一个 id，而 `deliver_prequeued_card` 写的是同一个
+/// `<id>.json`（temp+rename 覆盖），后一张卡会静默吃掉前一张。
+///
+/// IPC 与 CLI 都必须走这里，不能各自 `Board::next_free_prequeued_id`——那正是
+/// 上面这个洞的来源。
+pub fn next_free_prequeued_id(
+    board: &Board,
+    state_dir: &Path,
+    title: &str,
+    now: DateTime<Local>,
+) -> crate::card::CardId {
+    let base = crate::board::prequeued_id_base(title, now);
+    let taken =
+        |candidate: &str| board.contains(candidate) || enqueue_path(state_dir, candidate).exists();
+    if !taken(&base) {
+        return crate::card::CardId::new(base);
+    }
+    for n in 2u32.. {
+        let candidate = format!("{base}-{n}");
+        if !taken(&candidate) {
+            return crate::card::CardId::new(candidate);
+        }
+    }
+    unreachable!("u32 suffix space exhausted")
 }
 ```
 
@@ -754,7 +826,7 @@ git commit -m "feat(kanban): consume prequeued and promote deliveries in two pas
 - Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/service.rs`
 
 **Interfaces:**
-- Consumes: Task 1 的 `Board::next_free_prequeued_id`；Task 2 的 `deliver_prequeued_card` / `deliver_promote_card`。
+- Consumes: Task 2 的 `deliver_prequeued_card` / `deliver_promote_card`（以及 Task 2 的合体 id 分配器 `inbox::next_free_prequeued_id`；Task 1 的 `Board::next_free_prequeued_id` 只是板内构件，**IPC 不再直接用它**）。
 - Produces:
   - IPC `enqueue_prequeued`（params `{"title": String}` → `{"id": String}`）
   - IPC `promote`（params `{"id","spec_path","plan_path"[,"title"]}` → `{"id": String}`）
@@ -806,6 +878,33 @@ git commit -m "feat(kanban): consume prequeued and promote deliveries in two pas
         )
         .unwrap();
         assert_eq!(delivery["title"], "一个想法", "id 是 slug 回退，标题仍是原文");
+    }
+
+    #[test]
+    fn two_quick_enqueues_in_one_window_get_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "一个想法" }),
+        )
+        .unwrap();
+        let second = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "另一个想法" }),
+        )
+        .unwrap();
+        assert_ne!(first["id"], second["id"], "{first} vs {second}");
+        let inbox = dir.path().join("inbox");
+        let count = std::fs::read_dir(&inbox)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .count();
+        assert_eq!(count, 2, "两次捕获必须都留下投递文件");
     }
 
     #[test]
@@ -926,11 +1025,18 @@ use superpowers_kanban_core::inbox::{deliver_card, deliver_merge_card, deliver_p
 在 `next_free_merge_id` 旁边加：
 
 ```rust
-    /// 看板上未被占用的预排队卡 id（供 dispatch / CLI 共用）。
+    /// 未被占用的预排队卡 id（供 dispatch / CLI 共用）。
+    ///
+    /// 走 core 的合体分配器：它既看看板、也看 `inbox/` 里尚未消费的投递
+    /// （见 `inbox::next_free_prequeued_id` 的注释）。
     pub fn next_free_prequeued_id(&self, title: &str, now: DateTime<Local>) -> String {
-        persist::read_board(&self.state_dir)
-            .next_free_prequeued_id(title, now)
-            .0
+        superpowers_kanban_core::inbox::next_free_prequeued_id(
+            &persist::read_board(&self.state_dir),
+            &self.state_dir,
+            title,
+            now,
+        )
+        .0
     }
 ```
 
@@ -960,7 +1066,7 @@ git commit -m "feat(kanban): expose enqueue_prequeued/promote over IPC and list 
 - Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/main.rs`
 
 **Interfaces:**
-- Consumes: Task 2 的投递函数；Task 1 的 `Board::next_free_prequeued_id` / `CardState::PreQueued`。
+- Consumes: Task 2 的投递函数与 `inbox::next_free_prequeued_id`（id 必须走这个合体分配器，只看看板的 `Board::next_free_prequeued_id` 会让同秒的第二次捕获撞 id 并覆盖 inbox 里的前一张卡）；Task 1 的 `CardState::PreQueued`。
 - Produces: CLI 子命令 `add-prequeued <title>`、`promote <id> <spec> <plan> [--title <t>]`。
 
 - [ ] **Step 1: 写失败测试（main.rs 的 `mod tests` 末尾追加解析测试）**
@@ -1107,7 +1213,13 @@ fn command_prequeued(state_dir: &std::path::Path, title: &str) -> Result<String,
         return Err("add-prequeued needs a non-empty title".to_string());
     }
     let board = superpowers_kanban_runner::persist::load_board(&state_dir.join("board.json"));
-    let id = board.next_free_prequeued_id(title, chrono::Local::now()).0;
+    let id = superpowers_kanban_core::inbox::next_free_prequeued_id(
+        &board,
+        state_dir,
+        title,
+        chrono::Local::now(),
+    )
+    .0;
     superpowers_kanban_core::inbox::deliver_prequeued_card(state_dir, &id, title)
         .map_err(|error| format!("could not deliver the card: {error}"))?;
     Ok(format!(

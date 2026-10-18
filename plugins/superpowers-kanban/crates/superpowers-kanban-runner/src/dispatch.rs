@@ -699,6 +699,33 @@ mod tests {
     }
 
     #[test]
+    fn two_quick_enqueues_in_one_window_get_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "一个想法" }),
+        )
+        .unwrap();
+        let second = dispatch_with_global(
+            dir.path(),
+            None,
+            "enqueue_prequeued",
+            &json!({ "title": "另一个想法" }),
+        )
+        .unwrap();
+        assert_ne!(first["id"], second["id"], "{first} vs {second}");
+        let inbox = dir.path().join("inbox");
+        let count = std::fs::read_dir(&inbox)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .count();
+        assert_eq!(count, 2, "两次捕获必须都留下投递文件");
+    }
+
+    #[test]
     fn enqueue_prequeued_rejects_an_empty_title() {
         let dir = tempfile::tempdir().unwrap();
         let error = dispatch_with_global(
