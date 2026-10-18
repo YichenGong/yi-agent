@@ -185,6 +185,14 @@ pub enum IpcRequest {
         workspace: PathBuf,
         /// The root session's linked roots (canonical absolute paths). An older
         /// client omits the field, which reads as "no linked roots".
+        ///
+        /// Deliberately no `PROTOCOL_VERSION` bump, unlike the additive
+        /// `PluginQuery` *variant* that bumped 1 → 2: an additive, optional,
+        /// `#[serde(default)]` field on an *existing* variant parses
+        /// compatibly in both directions (an old daemon ignores the unknown
+        /// field; a new daemon defaults it), so no version disagreement is
+        /// observable. Same shape as the `fork_token` fields added to the two
+        /// spawn requests without a bump.
         #[serde(default)]
         extra_roots: Vec<String>,
     },
