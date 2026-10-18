@@ -661,6 +661,16 @@ Expected: FAIL（未实现）
   `ThreadSidebar.test.tsx` 的 5 处 fixture、`threadSearch.ts/.test.ts` 同步。
   桌面「看板会话」小节的**文案**不改（属 G2 的桌面面），只改它据以分组的键。
 
+**已知的 G1→G2 过渡缺口（必须显式记录，不得默默留下）**：Task 6 把主循环换成
+`driver_tick` 之后，宿主**不再知道 card id**（这正是 G1 的目标：宿主不认识卡片），
+而 `driver/next` 的 `launch` 应答按 spec §4.3 只带 `workdir`/`title`/`objective`，
+**不带任何 ref**。因此驱动会话的 meta 里 `driver_ref` 会是 `None`，`worktree_reclaim::decide`
+对它们走安全侧分支（不删 worktree）。这不是本任务引入的疏漏，而是 spec §7 明确把
+`worktree_reclaim.rs` 的语义重写划给 G2 的结果：G2 将改为通用
+`managed_worktree`（会话 meta 里的可选通用字段，spec §5/§9）并由插件侧填值。
+**要求**：Task 5 只做改名与兼容读取，**不得**顺手改写 `decide` 的判定语义；
+在 Task 9 的收口里把该缺口写进 `docs/bug-list.md` 或 G2 spec 的承接条目。
+
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p yi-agent-app-server`
