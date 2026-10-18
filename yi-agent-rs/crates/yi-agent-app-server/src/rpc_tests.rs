@@ -4,6 +4,67 @@ use std::time::Duration;
 use crate::rpc::{Domain, domain_for};
 use crate::test_support::{EVENT_WAIT, isolated_models_path};
 
+/// detach 的前提：这两个域的状态必须是 `Send + Sync + 'static`，否则
+/// `tokio::spawn` 编译不过。这条断言就是「它们能脱离主循环执行」的编译期证明
+/// ——主循环是单 task，内联 `await` 会串行堵住所有 thread 的 RPC。
+#[test]
+fn board_and_plugin_shared_state_is_owned_and_send() {
+    fn assert_spawnable<T: Send + Sync + 'static>() {}
+    assert_spawnable::<crate::rpc::BoardPluginState>();
+}
+
+/// Task 4 的致命通道是**唯一**回到主循环的信号，故单独钉一次:detached handler
+/// 向已死的 stdio `local` 写响应失败时，`write_or_fatal` 必须把 `Err` 送上
+/// fatal 通道，而不是像对 ws 客户端那样吞掉。搬移前这条 `Err` 由内联
+/// `await ...?` 直接传播到主循环（`driver_reports_finished_when_writer_fails`
+/// 钉死），故本测试就是 detach 后的等价性证明。
+#[tokio::test]
+async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
+    use std::path::{Path, PathBuf};
+
+    let hub = crate::broadcast::Broadcaster::new();
+    let local = crate::broadcast::ClientId::local();
+    let _rx = hub.register(local.clone());
+    // 出口泵已死:对 `local` 的后续写入必然失败(与
+    // `write_response_to_a_gone_ws_client_is_not_fatal` 的反面同款)。
+    hub.unregister(&local);
+
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
+    let state = crate::rpc::BoardPluginState {
+        hub: std::sync::Arc::new(hub),
+        client: local,
+        board_dir: PathBuf::new(),
+        resident_dir: PathBuf::new(),
+        plugin_command: PathBuf::new(),
+        theme_handle: crate::theme_tool::ThemeHandle::new(std::env::temp_dir()),
+        watchman_home: PathBuf::new(),
+        watchman_install: std::sync::Arc::new(|_exe: &Path, _home: &Path| -> Result<(), String> {
+            Ok(())
+        }),
+        watchman_uninstall: std::sync::Arc::new(|_home: &Path| -> Result<(), String> { Ok(()) }),
+        board_launcher: std::sync::Arc::new(|_project: &Path| -> Result<bool, String> {
+            Ok(false)
+        }),
+        fatal_tx,
+    };
+
+    crate::rpc::write_or_fatal(
+        &state,
+        crate::protocol::RequestId::Num(1),
+        crate::server::ok_response(crate::protocol::RequestId::Num(1), serde_json::json!({})),
+    )
+    .await;
+
+    let error = tokio::time::timeout(EVENT_WAIT, fatal_rx.recv())
+        .await
+        .expect("a failed local write must report on the fatal channel, not be swallowed")
+        .expect("the fatal channel must carry the error");
+    assert!(
+        error.to_string().contains("disconnected"),
+        "the reported error must be write_response's local-disconnect error: {error}"
+    );
+}
+
 /// 单轮逻辑是共享的 `watch::once`(Task 3 已在其自身 crate 内测过);这里只
 /// 断言 app-server 用的是同名同款:读登记 → 把登记项目交给 ensurer。
 #[test]

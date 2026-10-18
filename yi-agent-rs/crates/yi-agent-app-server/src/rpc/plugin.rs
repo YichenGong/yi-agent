@@ -5,14 +5,18 @@
 //! 等),臂内的 `method.as_str()` 改成 `req.method.as_str()`(本模块的形参不再
 //! 叫 `method`),以及 `continue` 换成 `return Ok(Flow::Continue)`——后者的语义由
 //! `serve()` 翻回 `continue`,与搬移前逐字一致。
+//!
+//! Task 4 起本域**脱离主循环**执行:`serve()` 把处理搬进 `tokio::spawn`,故状态改为
+//! [`crate::rpc::BoardPluginState`](全是 owned/`Arc`,可 move),应答改写
+//! [`crate::rpc::write_or_fatal`]——写失败不再能靠 `?` 传播,改由 fatal 通道上报。
 
 use serde_json::json;
 
 use crate::protocol::{RequestEnvelope, RequestId, RpcError};
-use crate::rpc::{AppState, Flow};
+use crate::rpc::{BoardPluginState, Flow, write_or_fatal};
 use crate::server::{
     err_response, list_installed_plugins, ok_response, plugin_query, plugin_query_self,
-    plugin_scope, project_arg, write_response,
+    plugin_scope, project_arg,
 };
 
 /// 处理本域的一个 RPC 请求。
@@ -20,8 +24,8 @@ use crate::server::{
 /// 返回 [`Flow::Continue`] 表示「本域已应答,主循环回到下一轮」(等价于搬移前臂
 /// 里的 `continue`);[`Flow::Unknown`] 表示方法不在本域内,交回 `serve()` 的原始
 /// dispatch(走既有的 `method_not_found`),响应形状与搬移前一致。
-pub(crate) async fn handle(
-    state: &mut AppState<'_>,
+pub(crate) async fn handle_shared(
+    state: &BoardPluginState,
     req: &RequestEnvelope,
     id: RequestId,
 ) -> anyhow::Result<Flow> {
@@ -31,12 +35,12 @@ pub(crate) async fn handle(
             // server's cwd: the whole point of the RPC is to reach
             // a board that lives under another project's daemon.
             let Some(project) = project_arg(&req.params) else {
-                write_response(
-                    state.hub,
-                    state.client,
+                write_or_fatal(
+                    state,
+                    id.clone(),
                     err_response(id, RpcError::invalid_params("missing or empty project")),
                 )
-                .await?;
+                .await;
                 return Ok(Flow::Continue);
             };
             let plugin = req
@@ -54,17 +58,15 @@ pub(crate) async fn handle(
                 .get("params")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            match plugin_query(&project, state.board_dir, method, plugin, params) {
-                Ok(value) => {
-                    write_response(state.hub, state.client, ok_response(id, value)).await?
-                }
+            match plugin_query(&project, &state.board_dir, method, plugin, params) {
+                Ok(value) => write_or_fatal(state, id.clone(), ok_response(id, value)).await,
                 Err(error) => {
-                    write_response(
-                        state.hub,
-                        state.client,
+                    write_or_fatal(
+                        state,
+                        id.clone(),
                         err_response(id, RpcError::board_query(error.code, error.message)),
                     )
-                    .await?
+                    .await
                 }
             }
         }
@@ -83,12 +85,12 @@ pub(crate) async fn handle(
                     })
                 })
                 .collect();
-            write_response(
-                state.hub,
-                state.client,
+            write_or_fatal(
+                state,
+                id.clone(),
                 ok_response(id, json!({ "plugins": plugins })),
             )
-            .await?;
+            .await;
         }
         "plugin/settings/read" => {
             let workdir = state.theme_handle.workdir().to_path_buf();
@@ -100,16 +102,14 @@ pub(crate) async fn handle(
                 .unwrap_or("")
                 .to_string();
             match plugin_query_self(&scope, &plugin, "settings.read", json!({})) {
-                Ok(value) => {
-                    write_response(state.hub, state.client, ok_response(id, value)).await?
-                }
+                Ok(value) => write_or_fatal(state, id.clone(), ok_response(id, value)).await,
                 Err(error) => {
-                    write_response(
-                        state.hub,
-                        state.client,
+                    write_or_fatal(
+                        state,
+                        id.clone(),
                         err_response(id, RpcError::board_query(error.code, error.message)),
                     )
-                    .await?
+                    .await
                 }
             }
         }
@@ -129,16 +129,14 @@ pub(crate) async fn handle(
                 "settings.write",
                 json!({ "settings": settings }),
             ) {
-                Ok(value) => {
-                    write_response(state.hub, state.client, ok_response(id, value)).await?
-                }
+                Ok(value) => write_or_fatal(state, id.clone(), ok_response(id, value)).await,
                 Err(error) => {
-                    write_response(
-                        state.hub,
-                        state.client,
+                    write_or_fatal(
+                        state,
+                        id.clone(),
                         err_response(id, RpcError::board_query(error.code, error.message)),
                     )
-                    .await?
+                    .await
                 }
             }
         }

@@ -226,15 +226,15 @@ pub(crate) struct RuntimeAttachments {
 }
 
 /// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
-type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
+pub(crate) type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
 
 /// Installs the resident watchman (macOS LaunchAgent) for `exe` under `home`;
 /// see [`yi_agent_boards::watchman::install`].
-type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
+pub(crate) type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
 
 /// Removes the resident watchman under `home`; see
 /// [`yi_agent_boards::watchman::uninstall`].
-type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+pub(crate) type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
 /// 生产环境的 `$HOME`。未设置时回退空路径——与 `board_dir` 同一策略：宁可把
 /// 值守装进一个无人读取的目录，也不要因为环境缺失让整个服务起不来。
@@ -1515,6 +1515,80 @@ fn spawn_board_watchman_loop(resident_dir: PathBuf) {
     });
 }
 
+/// The card snapshot the prefetch thread publishes: project root (canonical) to
+/// that project's cards.
+///
+/// Defined here rather than in `card_scheduler` because the thread that fills it
+/// lives in this file; `card_scheduler` imports it.
+pub(crate) type BoardCardSnapshot = Arc<StdMutex<HashMap<PathBuf, Vec<BoardCard>>>>;
+
+/// How often the prefetch thread re-reads every registered board. Shorter than
+/// the board tick (3s) so reconciliation has slack in freshness.
+const PREFETCH_INTERVAL: Duration = Duration::from_millis(1000);
+/// How many consecutive failures clear a project's snapshot entry.
+const PREFETCH_FAILURE_LIMIT: u32 = 5;
+
+/// Prefetch registered projects' cards in the background, for the board tick's
+/// reconciliation to read.
+///
+/// A `std::thread` rather than `tokio::spawn`: `board_cards` goes through the
+/// synchronous `send_request`, which would block a worker if done in an async
+/// task. The shape matches the plugin side's `start_query_server`.
+///
+/// The snapshot lock is taken for one map operation at a time — never across the
+/// `board_cards` IPC above it nor across the sleep below it, so the tick's read
+/// is never queued behind this thread's work.
+///
+/// After [`PREFETCH_FAILURE_LIMIT`] consecutive failures the project's entry is
+/// removed, so reconciliation falls back to a live read — otherwise a daemon
+/// that stays down for a long time would pin the snapshot to stale cards
+/// forever.
+fn spawn_board_cards_prefetch(board_dir: PathBuf) -> BoardCardSnapshot {
+    let snapshot: BoardCardSnapshot = Arc::new(StdMutex::new(HashMap::new()));
+    let published = Arc::clone(&snapshot);
+    std::thread::Builder::new()
+        .name("board-cards-prefetch".into())
+        .spawn(move || {
+            let mut failures: HashMap<PathBuf, u32> = HashMap::new();
+            loop {
+                if let Ok(projects) = yi_agent_boards::registry::list(&board_dir) {
+                    for board in projects {
+                        let key = std::fs::canonicalize(&board.project)
+                            .unwrap_or_else(|_| board.project.clone());
+                        match board_cards(&board.project, &board_dir) {
+                            Ok(cards) => {
+                                failures.remove(&key);
+                                published
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .insert(key, cards);
+                            }
+                            Err(error) => {
+                                let count = failures.entry(key.clone()).or_insert(0);
+                                *count += 1;
+                                eprintln!(
+                                    "[app-server] board card prefetch failed for {} ({count}): {error}",
+                                    board.project.display()
+                                );
+                                if *count >= PREFETCH_FAILURE_LIMIT {
+                                    // Drop the entry so reconciliation reads live
+                                    // again instead of serving these stale cards.
+                                    published
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .remove(&key);
+                                }
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(PREFETCH_INTERVAL);
+            }
+        })
+        .expect("board card prefetch thread must start");
+    snapshot
+}
+
 /// app-server 入口:在 stdio(或任意读写流)上跑 JSON-RPC 主循环。
 ///
 /// `cfg` 同时用于 `config/read` 响应与(每个 thread 的)`bootstrap_agent`。
@@ -2382,9 +2456,16 @@ where
         lead_inbox,
         lead_replies,
     } = attachments;
+    // The board tick reconciles from this snapshot instead of doing the
+    // synchronous `board_cards` IPC inline (see `spawn_board_cards_prefetch`).
+    // Started after `board_dir` is known and lives for the rest of `serve`.
+    let board_cards_snapshot = spawn_board_cards_prefetch(board_dir.clone());
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
+    // detach 出去的 board/plugin handler 唯一需要回到主循环的信号：stdio
+    // `local` 写失败是致命的（`?` 语义从前由内联 await 直接传播）。
+    let (fatal_tx, mut fatal_rx) = mpsc::channel::<anyhow::Error>(1);
 
     // 反向权限请求的等待登记表:key 为 `perm-<seq>`,value 为向 driver
     // 回传决定的 oneshot 端。主循环在读到客户端响应时据此路由。
@@ -2641,8 +2722,7 @@ where
                     () => {
                         // 字段名逐项写出(而非位置参数):`models_path` /
                         // `onboarding_env_path` / `onboarding_preferences_path` /
-                        // `board_dir` / `resident_dir` / `plugin_command` /
-                        // `watchman_home` 七个相邻字段同为 `&Path`,位置一旦
+                        // `watchman_home` 四个相邻字段同为 `&Path`,位置一旦
                         // 写错照样编译通过、却会静默把机器级路径接错。
                         crate::rpc::AppState {
                             hub: &hub,
@@ -2653,13 +2733,9 @@ where
                             models_path: &models_path,
                             onboarding_env_path: &onboarding_env_path,
                             onboarding_preferences_path: &onboarding_preferences_path,
-                            board_dir: &board_dir,
-                            resident_dir: &resident_dir,
-                            plugin_command: &plugin_command,
                             watchman_home: &watchman_home,
                             watchman_install: &watchman_install,
                             watchman_uninstall: &watchman_uninstall,
-                            board_launcher: &board_launcher,
                             uploads: &mut uploads,
                             threads: &mut threads,
                             workspaces: &workspaces,
@@ -2715,25 +2791,55 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
-                    crate::rpc::Domain::Board => {
-                        let mut state = app_state!();
-                        match crate::rpc::board::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Plugin => {
-                        let mut state = app_state!();
-                        match crate::rpc::plugin::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
+                    crate::rpc::Domain::Board | crate::rpc::Domain::Plugin => {
+                        // 门禁（initialize / scope）已在上面同步做完；这里只把
+                        // **处理** detach 出去。主循环是单 task，内联 await 会串行
+                        // 堵住所有 thread 的 RPC；主 runtime 是多线程的，故
+                        // `tokio::spawn` 让它在别的 worker 上跑、主循环立刻回到
+                        // `select!`。（`spawn_blocking(..).await` 做不到：主 task
+                        // 仍要 await 它返回。）
+                        let state = std::sync::Arc::new(crate::rpc::BoardPluginState {
+                            hub: std::sync::Arc::clone(&hub),
+                            client: client.clone(),
+                            board_dir: board_dir.clone(),
+                            resident_dir: resident_dir.clone(),
+                            plugin_command: plugin_command.clone(),
+                            theme_handle: theme_handle.clone(),
+                            watchman_home: watchman_home.clone(),
+                            watchman_install: std::sync::Arc::clone(&watchman_install),
+                            watchman_uninstall: std::sync::Arc::clone(&watchman_uninstall),
+                            board_launcher: std::sync::Arc::clone(&board_launcher),
+                            fatal_tx: fatal_tx.clone(),
+                        });
+                        let domain = crate::rpc::domain_for(method.as_str());
+                        let req = req.clone();
+                        let id = id.clone();
+                        tokio::spawn(async move {
+                            let result = match domain {
+                                crate::rpc::Domain::Board => {
+                                    crate::rpc::board::handle_shared(&state, &req, id.clone()).await
+                                }
+                                _ => {
+                                    crate::rpc::plugin::handle_shared(&state, &req, id.clone()).await
+                                }
+                            };
+                            match result {
+                                Ok(crate::rpc::Flow::Continue) => {}
+                                // 域内兜底：与搬移前的原始 dispatch 逐字一致。
+                                Ok(crate::rpc::Flow::Unknown) => {
+                                    crate::rpc::write_or_fatal(
+                                        &state,
+                                        id.clone(),
+                                        err_response(id, RpcError::method_not_found(&req.method)),
+                                    )
+                                    .await;
+                                }
+                                Err(error) => {
+                                    let _ = state.fatal_tx.send(error).await;
+                                }
+                            }
+                        });
+                        continue;
                     }
                     crate::rpc::Domain::Image => {
                         let mut state = app_state!();
@@ -2911,12 +3017,18 @@ where
                     );
                 }
             }
+            Some(error) = fatal_rx.recv() => return Err(error),
             _ = card_ticker.tick() => {
                 // 看板调度器内联跑一轮:启动(queued → 起可见会话)与对账
                 // (会话结束 → 卡片终态)。所有局部量按顺序借用,不与 RPC 分支
                 // 并发,故 `threads` 无需改成共享状态(见 Task 6c brief)。
+                // The snapshot is cloned under one short lock, before the tick
+                // awaits: the guard must never be held across an `.await`.
+                let board_cards_snapshot_map =
+                    crate::card_scheduler::read_snapshot(&board_cards_snapshot);
                 card_scheduler_tick(
                     &board_dir,
+                    &board_cards_snapshot_map,
                     &mut tracked,
                     &mut threads,
                     &mut pending_activation,
@@ -4793,9 +4905,15 @@ pub(crate) fn item_id(item: &crate::protocol::Item) -> Option<&str> {
 ///
 /// 单个项目的失败(daemon 掉线、坏看板)只记日志:一台项目的 daemon 不可用
 /// 不得影响其它项目,更不得影响 RPC。
+///
+/// `cards_snapshot` 是预取线程发布的卡片快照(项目根 → 卡片),由调用方在
+/// **进入本函数前**加一次锁 clone 好:对账据此读卡,不再在主循环里做同步
+/// `board_cards` IPC;快照缺某个项目时 `run_once_with_snapshot` 自行退回实时
+/// 读取。锁绝不跨这里的 `.await`。
 #[allow(clippy::too_many_arguments)]
 async fn card_scheduler_tick<F>(
     board_dir: &Path,
+    cards_snapshot: &HashMap<PathBuf, Vec<BoardCard>>,
     tracked: &mut HashMap<String, TrackedThread>,
     threads: &mut HashMap<String, ThreadSession>,
     pending_activation: &mut HashMap<String, Option<Arc<ThreadRoot>>>,
@@ -4880,8 +4998,15 @@ async fn card_scheduler_tick<F>(
             // 该 launcher 只负责起看板会话。
             lead_target: None,
         };
-        crate::card_scheduler::run_once(&board.project, board_dir, tracked, &mut launcher, &flags)
-            .await;
+        crate::card_scheduler::run_once_with_snapshot(
+            &board.project,
+            board_dir,
+            tracked,
+            &mut launcher,
+            &flags,
+            cards_snapshot,
+        )
+        .await;
     }
 }
 
