@@ -21,6 +21,7 @@ const SCRIPTS = [
   ["wire.mjs", "§8.1     frame bytes per delta (funnel item background)"],
   ["checkpoint.mjs", "§3.4     why the turn checkpoint must not be thinned"],
   ["turn.mjs", "§6       what the remaining changes buy, per turn"],
+  ["mutation-trap.mjs", "§3.2     the in-place-mutation memo trap (with reverse check)"],
 ];
 
 for (const [script, title] of SCRIPTS) {

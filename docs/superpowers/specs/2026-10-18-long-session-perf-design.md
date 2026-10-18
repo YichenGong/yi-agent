@@ -313,15 +313,35 @@ React 的 `memo` 挡不住它，因为：
 
 **做法**：
 
-1. **`ChatItem` 提为 memo 边界**，比较器**显式比对会变的 primitive**
-   （`item` 引用 + `item.text`；对 `toolCall` 类比对 `state`/`expanded`），
-   而不是对象身份——这正是叶子组件 `MarkdownText` 现在的手法
-   （`MarkdownText.tsx:66`），把同一手法上提一层。
+1. **`ChatItem` 提为 memo 边界，但比较器不能读 `item.text`**。
+   这是一个**会导致流式冻结的陷阱**：`Session.apply` 是**先就地改**
+   `item.text += delta`，**再**让 React 渲染；因此 memo 比较器里的
+   `prev.item` 与 `next.item` 是**同一个对象**，读 `item.text` 等于拿当前值
+   和自己比——永远"相等"，尾部那条**永不更新**。
+   **正确做法**：把会变的文本**作为独立 primitive prop 传下去**
+   （`<ChatItem item={it} text={it.text} />`），比较器比对
+   `p.item === n.item && p.text === n.text`。
+   这正是叶子组件 `AgentMessage` / `MarkdownText` 现在的手法
+   （`MarkdownText.tsx:66`、`:84`），把同一手法上提一层。
+
+   **实测（脚本 `desktop/scripts/perf/mutation-trap.mjs`，复现真实就地修改语义）**：
+
+   ```
+   trap: 比较器读 item.text、无前缀    per-delta=6.30 ms   尾部存活：NO（冻结！）
+   ok:   text 作独立 prop、无前缀       per-delta=5.58 ms   尾部存活：yes
+   ok:   text 作独立 prop + 冻结前缀    per-delta=0.04 ms   尾部存活：yes
+   ```
+
+   该脚本**同时断言陷阱会冻结**——一个测不出 bug 的测试没有价值，
+   所以这条证据自带反向验证。
+
 2. **前缀冻结**：把"历史项"与"活跃尾部"拆成两个子树。历史前缀由一个
    **props 在流式期间稳定**的 memo 组件承载（项数组的**长度**不变、
    元素引用不变 ⇒ 整棵子树跳过重建），活跃尾部（通常是最后 1 条）单独渲染。
    冻结边界 = `items.length - 1` 且"尾部项正在流式"；非流式时整表照旧渲染
    （此时本来就不需要优化）。
+   **注意**：前缀子树内部仍需给每个 `ChatItem` 传 `text`，否则它自己的比较器
+   无从判断（虽然流式期间前缀 `text` 不变、注定命中）。
 3. **冻结边界的正确性约束**：凡会**改动历史项**的路径都必须让边界失效，
    否则历史会显示陈旧内容。已清点出三类：
    - `item/completed` / `items/completed` 就地替换历史项（`session.ts:430`、`:333`）；
@@ -521,11 +541,12 @@ YAGNI，本 spec 不做；判断依据写在 §6。
 | `session.mjs` | §1.1(a)：目标在末尾时的 per-delta 查找开销 |
 | `index-lookup.mjs` | §3.1：三种查找策略的对照（**推翻第一版设计的证据**） |
 | `render.mjs` | §1.1(b) 与 §3.2：每 delta 重渲染 + 三种渲染形态对比 |
+| `mutation-trap.mjs` | §3.2：就地修改语义下的"比较器读 `item.text` 会冻结"陷阱（**含反向验证**） |
 | `markdown.mjs` | §1.1(c)：流式 markdown 的单次解析与整轮平方级 |
 | `wire.mjs` | §8.1：每帧字节放大（第五项的背景数据） |
 | `checkpoint.mjs` | §3.4：真实 `.partial.json` 的字节构成与写入成本（**"不丢东西"的依据**） |
 | `turn.mjs` | §2.5：端到端"一个回合值多少"，含历史深度扫描（**复现用户症状**） |
-| `run.mjs` | 依次跑全部上面七项 |
+| `run.mjs` | 依次跑全部上面八项 |
 
 运行：
 
