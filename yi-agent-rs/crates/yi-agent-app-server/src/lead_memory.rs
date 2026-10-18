@@ -88,20 +88,40 @@ pub fn read_entries(project_root: &Path) -> std::io::Result<Vec<MemoryEntry>> {
 
 /// 朴素子串检索（ASCII 不区分大小写），按时间升序返回至多 `limit` 条。
 ///
+/// 截断取**最近**的 `limit` 条（丢掉最旧的）：账本装的是「决策与理由」，同一
+/// thread 先后两次决策时最新那条才是权威；返回被推翻的旧理由比返回空更难排查
+/// （上级设计 §7.3 的可审计目的）。返回顺序仍是时间升序，只是窗口落在尾部。
+///
 /// 不做索引、不做分词：`memory.md` 本期无界增长是已知限制（spec §7.6），
 /// 现在给它加索引是过早优化。
 pub fn search(project_root: &Path, query: &str, limit: usize) -> std::io::Result<Vec<MemoryEntry>> {
+    Ok(search_with_total(project_root, query, limit)?.0)
+}
+
+/// 同 [`search`]，但**同时**返回匹配总数——供工具披露「匹配 N 条，显示最近 M 条」。
+///
+/// 不披露截断会让组长以为「账本里只有这几条」，从而误判自己记得比别人少。
+pub fn search_with_total(
+    project_root: &Path,
+    query: &str,
+    limit: usize,
+) -> std::io::Result<(Vec<MemoryEntry>, usize)> {
     let needle = query.to_lowercase();
     if needle.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let mut hits: Vec<MemoryEntry> = read_entries(project_root)?
         .into_iter()
         .filter(|e| e.text.to_lowercase().contains(&needle))
         .collect();
     hits.sort_by_key(|e| e.timestamp_ms);
-    hits.truncate(limit);
-    Ok(hits)
+    let total = hits.len();
+    // 从尾部取窗口：`split_off` 留下的是前半段，丢弃它即得最近 limit 条。
+    if total > limit {
+        let keep_from = total - limit;
+        hits = hits.split_off(keep_from);
+    }
+    Ok((hits, total))
 }
 
 use serde_json::Value;
@@ -237,10 +257,19 @@ impl Tool for LeadRecallTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
         };
-        match search(&self.project_root, &parsed.query, parsed.limit) {
-            Ok(entries) if entries.is_empty() => ToolResult::text("账本里没有匹配的条目。"),
-            Ok(entries) => {
+        match search_with_total(&self.project_root, &parsed.query, parsed.limit) {
+            Ok((entries, _total)) if entries.is_empty() => {
+                ToolResult::text("账本里没有匹配的条目。")
+            }
+            Ok((entries, total)) => {
                 let mut out = String::new();
+                // 截断必须说出口：不披露会让组长以为账本里只有这几条。
+                if total > entries.len() {
+                    out.push_str(&format!(
+                        "匹配 {total} 条，显示最近 {} 条：\n",
+                        entries.len()
+                    ));
+                }
                 for e in entries {
                     out.push_str(&format!(
                         "- [{}] ({}) {}\n",
@@ -329,6 +358,58 @@ mod tests {
 
         let capped = search(dir.path(), "打回", 1).expect("search");
         assert_eq!(capped.len(), 1);
+        // 取最近一条（时间升序返回，但窗口在尾部）。
+        assert_eq!(capped[0].timestamp_ms, 2);
+    }
+
+    #[test]
+    fn search_prefers_the_most_recent_entries_when_capped() {
+        // 账本装的是「决策与理由」：同一 thread 先后两次决策时，**最新那条才是
+        // 权威**。截断必须从最旧的一端丢，否则组长会拿到已被推翻的旧理由——
+        // 比拿不到更难排查。
+        let dir = temp_project();
+        for (ms, text) in [
+            (1, "打回 thread A：第一版理由（已推翻）"),
+            (2, "打回 thread A：第二版理由（当前）"),
+            (3, "打回 thread A：第三版理由（最新）"),
+        ] {
+            append_entry(
+                dir.path(),
+                &MemoryEntry {
+                    timestamp_ms: ms,
+                    source: "s".into(),
+                    text: text.into(),
+                },
+            )
+            .expect("append");
+        }
+        let hits = search(dir.path(), "打回 thread A", 2).expect("search");
+        assert_eq!(hits.len(), 2);
+        // 升序返回，但窗口落在**尾部**：给的是第 2、3 条，不是第 1、2 条。
+        assert_eq!(hits[0].timestamp_ms, 2);
+        assert_eq!(hits[1].timestamp_ms, 3);
+    }
+
+    #[test]
+    fn search_with_total_reports_every_match_not_just_the_window() {
+        let dir = temp_project();
+        for (ms, text) in [(1, "命中"), (2, "命中"), (3, "命中"), (4, "无关")] {
+            append_entry(
+                dir.path(),
+                &MemoryEntry {
+                    timestamp_ms: ms,
+                    source: "s".into(),
+                    text: text.into(),
+                },
+            )
+            .expect("append");
+        }
+        let (hits, total) = search_with_total(dir.path(), "命中", 2).expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            total, 3,
+            "must report every match, not just the returned window"
+        );
     }
 
     #[test]
