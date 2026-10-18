@@ -20,13 +20,13 @@
 | permission | 9 / 9 | [详情](./permission.md) |
 | ci-cd | 11 / 13 | [详情](./ci-cd.md) |
 | tooling | 3 / 3 | [详情](./tooling.md) |
-| yi-agent-mcp | 1 / 1 | [详情](./yi-agent-mcp.md) |
+| yi-agent-mcp | 3 / 3 | [详情](./yi-agent-mcp.md) |
 | yi-agent-store | 5 / 5 | [详情](./yi-agent-store.md) |
 | yi-agent-runtime | 16 / 16 | [详情](./yi-agent-runtime.md) |
 | yi-agent-subagent | 8 / 8 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 52 / 52 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 42 / 49 | [详情](./subagent-runtime.md) |
-| desktop | 66 / 78 | [详情](./desktop.md) |
+| desktop | 67 / 79 | [详情](./desktop.md) |
 
 ## 已知问题
 

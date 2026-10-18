@@ -2942,6 +2942,8 @@ async fn unknown_method_returns_method_not_found() {
         // ---- Skill(技能面板:三层技能根) ----
         ("skill/list", Domain::Skill),
         ("skill/read", Domain::Skill),
+        // ---- Mcp(设置页 MCP 面板:项目级 mcp.json + schema 缓存) ----
+        ("mcp/list", Domain::Mcp),
         // ---- Thread ----
         ("thread/clear", Domain::Thread),
         ("thread/compact", Domain::Thread),
