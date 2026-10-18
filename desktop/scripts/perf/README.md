@@ -48,6 +48,9 @@ node scripts/perf/checkpoint.mjs  # §3.4：checkpoint 为何不能减载（"不
 
 - 前端数字跑在 **node + jsdom** 下，不是 WebKit。**绝对数值不可等同于真机**；
   可信的是**增长趋势**（O(N) / O(N²)），它与实现一一对应。
+- `checkpoint.mjs` 读的是**这台机器上真实的 `.partial.json`**，因此它的
+  "字节构成"随你本地的会话而变。它找不到快照时**如实报告并退出 0**，
+  不会构造假数据。
 - TUI（§1.1(e)、§3.5）不在这里复现——它由 Rust 侧的
   `lines_call_count` / `rebuild_count` 计数器测试覆盖（见 spec §6），
   那是更合适的载体。
