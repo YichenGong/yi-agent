@@ -1697,17 +1697,13 @@ pub(crate) struct Harness {
     /// 与主循环**共享**的回信登记表:测试据此扮演等待方(`AskLeadTool`
     /// 的 `blocking: true`)并断言主循环真的把组长那轮的文本回填了回来。
     pub(crate) lead_replies: crate::lead::LeadReplies,
-    /// 与主循环**共享**的组长写通道:Task 5 的测试据此直接投递写指令,
+    /// 与主循环**共享**的组长写通道:集成测试据此直接投递写指令,
     /// 断言主循环真的把它转成了对目标 thread 的动作。
     ///
-    /// 这两个字段与 `lead_inbox` 同一手法(接进 `Harness` 的 `RuntimeAttachments`),
-    /// 但**读者是 Task 5 的集成测试**,尚未落地,故这里仍判成 dead_code。allow 的
-    /// 归属人是 **Task 5**:其测试落地后必须删掉下面两行 allow。
-    #[allow(dead_code)]
+    /// 这两个字段与 `lead_inbox` 同一手法(接进 `Harness` 的 `RuntimeAttachments`)。
     pub(crate) lead_control: crate::lead_control::LeadControlInbox,
     /// 与主循环**共享**的写结果登记表,同一手法:测试据此扮演组长工具,
     /// 断言主循环执行完真的回填了结果。
-    #[allow(dead_code)]
     pub(crate) lead_control_replies: crate::lead_control::LeadControlReplies,
     /// 与主循环**共享**的视图帧表:测试据此直接注入帧(模拟 Task 4 的工具写帧),
     /// 并断言 `thread/view/read` 读的是**同一张**表。自造第二份会读出一张空表。
@@ -16704,4 +16700,121 @@ fn the_lead_does_not_get_ask_lead() {
         plain_names.contains(&"ask_lead".to_string()),
         "a plain session keeps ask_lead, got {plain_names:?}"
     );
+}
+
+/// 打回到 idle 目标：起一轮，目标转录里出现打回文本。
+///
+/// 扮演组长：直接往**与主循环共享**的写通道投递一条 `Reject`，绕过组长工具本身，
+/// 单测主循环的执行路径（工具侧已由 `lead_control` 的单测覆盖）。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reject_to_an_idle_thread_starts_a_turn_that_carries_the_reason() {
+    let (mut h, dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    let target = start_thread(&mut h).await;
+
+    let project_key = crate::thread_store::ThreadStore::new(dir.path()).project_key();
+    let request_id = "ctl-1".to_string();
+    let rx = h.lead_control_replies.register(request_id.clone());
+    assert!(
+        h.lead_control.send(crate::lead_control::LeadControlCmd {
+            project_key,
+            kind: crate::lead_control::LeadControlKind::Reject,
+            thread_id: target.clone(),
+            reason: "redo with tests".to_string(),
+            request_id,
+        }),
+        "the main loop must be subscribed"
+    );
+
+    let outcome = tokio::time::timeout(EVENT_WAIT, rx)
+        .await
+        .expect("the main loop must answer")
+        .expect("the replies table hands back an outcome");
+    assert!(
+        outcome.is_ok(),
+        "a reject to a live thread must succeed: {outcome:?}"
+    );
+
+    // 目标转录里出现打回文本（经注入落盘为新轮的用户条目）。注入是**异步**的：
+    // `apply_lead_control` 只把 prompt 投给 driver 就返回了，用户条目落盘在目标那轮
+    // 真正开始时才发生。故这里按 `EVENT_WAIT` 有界轮询，而不是读一次就断言（读一次
+    // 会与落盘赛跑，稳定地读到空 items）。
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    let mut landed = false;
+    while tokio::time::Instant::now() < deadline {
+        let read = rpc(
+            &mut h,
+            2,
+            "thread/readItems",
+            serde_json::json!({ "threadId": target }),
+        )
+        .await;
+        if read.to_string().contains("redo with tests") {
+            landed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        landed,
+        "the rejection must land in the target transcript within {EVENT_WAIT:?}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 打回到不在场的冷会话：回错，不起轮。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reject_to_an_unknown_thread_is_an_error() {
+    let (mut h, dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    let project_key = crate::thread_store::ThreadStore::new(dir.path()).project_key();
+    let request_id = "ctl-2".to_string();
+    let rx = h.lead_control_replies.register(request_id.clone());
+    assert!(h.lead_control.send(crate::lead_control::LeadControlCmd {
+        project_key,
+        kind: crate::lead_control::LeadControlKind::Reject,
+        thread_id: "thread-does-not-exist".to_string(),
+        reason: "x".to_string(),
+        request_id,
+    }));
+    let outcome = tokio::time::timeout(EVENT_WAIT, rx)
+        .await
+        .expect("the main loop must answer")
+        .expect("an outcome");
+    assert!(outcome.is_err(), "an unreachable target must be an error");
+    h.shutdown().await;
+}
+
+/// 打断无活跃轮的目标：回错（不静默 no-op）。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupt_without_an_active_turn_is_an_error() {
+    let (mut h, dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    let target = start_thread(&mut h).await;
+    let project_key = crate::thread_store::ThreadStore::new(dir.path()).project_key();
+    let request_id = "ctl-3".to_string();
+    let rx = h.lead_control_replies.register(request_id.clone());
+    assert!(h.lead_control.send(crate::lead_control::LeadControlCmd {
+        project_key,
+        kind: crate::lead_control::LeadControlKind::Interrupt,
+        thread_id: target,
+        reason: "stop".to_string(),
+        request_id,
+    }));
+    let outcome = tokio::time::timeout(EVENT_WAIT, rx)
+        .await
+        .expect("the main loop must answer")
+        .expect("an outcome");
+    assert!(
+        outcome.is_err(),
+        "no active turn must be an error, not a silent no-op"
+    );
+    h.shutdown().await;
 }
