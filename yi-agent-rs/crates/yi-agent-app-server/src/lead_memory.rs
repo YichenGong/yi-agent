@@ -27,6 +27,24 @@ pub fn memory_path(project_root: &Path) -> PathBuf {
         .join("memory.md")
 }
 
+/// 该 thread 是不是组长。
+///
+/// **唯一权威**是落盘的 `ThreadMeta.role == Some(LEAD_ROLE)`:标题、cwd、名字都能
+/// 被人为凑出组长的样子,而 role 只有 `lead::ensure_lead_meta` 会写。读不到
+/// (`load` 报错 / 没有 meta)一律视为非组长——装配期放行一个非组长去写项目账本,
+/// 比拒绝一个真组长严重得多,故缺证据时不授予。
+///
+/// 组长 meta 是**懒创建**的:刚落盘、还没跑过一轮的组长没有 `.jsonl`,但
+/// `ThreadStore::load` 对 meta-only 也返回 `Some`,所以新建的组长照样能被认出。
+pub fn is_lead_thread(store: &crate::thread_store::ThreadStore, thread_id: &str) -> bool {
+    store
+        .load(thread_id)
+        .ok()
+        .flatten()
+        .map(|l| l.meta.role.as_deref() == Some(crate::thread_store::LEAD_ROLE))
+        .unwrap_or(false)
+}
+
 /// 追加一条。目录不存在则创建。只 `append`，不做读-改-写。
 pub fn append_entry(project_root: &Path, entry: &MemoryEntry) -> std::io::Result<()> {
     let path = memory_path(project_root);
@@ -427,5 +445,68 @@ mod tests {
                 .metadata()
                 .read_only
         );
+    }
+
+    fn lead_test_meta(id: &str, role: Option<&str>) -> crate::thread_store::ThreadMeta {
+        crate::thread_store::ThreadMeta {
+            thread_id: id.into(),
+            cwd: "/tmp".into(),
+            model: "m".into(),
+            created_at: 1,
+            updated_at: 1,
+            title: None,
+            permission_mode: crate::thread_store::ThreadMode::Normal,
+            pin_seq: None,
+            board_project: None,
+            card_id: None,
+            model_ref: None,
+            reasoning_effort: None,
+            preserve_thinking: true,
+            role: role.map(str::to_string),
+        }
+    }
+
+    /// 判定的正臂:落盘 `role == Some(LEAD_ROLE)` 就是组长——meta-only 也算。
+    #[test]
+    fn a_persisted_lead_role_is_recognised() {
+        let dir = temp_project();
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        store
+            .create(&lead_test_meta(
+                "lead-1",
+                Some(crate::thread_store::LEAD_ROLE),
+            ))
+            .expect("create");
+        assert!(is_lead_thread(&store, "lead-1"));
+    }
+
+    /// 判定的负臂:每一种「像组长但不是」都必须为假,否则普通会话会拿到账本写权限。
+    #[test]
+    fn only_a_persisted_lead_role_counts() {
+        let dir = temp_project();
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        // ① role 为 None(普通会话,尽管 cwd 指向同一项目根)。
+        store
+            .create(&lead_test_meta("plain", None))
+            .expect("create");
+        // ② 别的字符串冒充 role。
+        store
+            .create(&lead_test_meta("impostor", Some("Lead")))
+            .expect("create");
+        // ③ 从未落盘。
+        for id in ["plain", "impostor", "ghost"] {
+            assert!(
+                !is_lead_thread(&store, id),
+                "{id} must not count as the lead"
+            );
+        }
+    }
+
+    /// 非法 thread id 让 `load` 报错,此时必须**拒绝**而不是放行(缺证据不授予)。
+    #[test]
+    fn an_unreadable_thread_id_is_not_the_lead() {
+        let dir = temp_project();
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        assert!(!is_lead_thread(&store, "../escape"));
     }
 }

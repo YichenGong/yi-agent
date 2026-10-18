@@ -909,6 +909,10 @@ fn build_runtime_tooling(
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
     let workspace_root = root.handle()?.workspace_root;
+    // 本会话的 thread store(与 `attach_delegation` 里 `ThreadStore::new(Path::new(cwd))`
+    // 同源:workspace_root 就是该 thread 的 cwd)。装配期用它读落盘的 `role`,
+    // 判定「本 thread 是不是组长」——这是唯一权威。
+    let store = crate::thread_store::ThreadStore::new(Path::new(&workspace_root));
     // One controller, one truth: it backs the root's builtin tools AND the
     // subagent spawn tools, and it reads the thread's live YOLO switch.
     let controller =
@@ -954,6 +958,23 @@ fn build_runtime_tooling(
             // 两个 2 分钟各自漂移时,「等待方超时」与「组长还有多久回来」会脱钩。
             .with_replies(lead_replies, crate::lead::ASK_LEAD_TIMEOUT),
     ));
+    // lead_memory 只给组长:普通会话与子 worker 一律看不到(spec §7.5)。判定用
+    // 落盘的 `ThreadMeta.role`(唯一权威),不靠标题/名字/cwd 猜——判定函数见
+    // `lead_memory::is_lead_thread`。
+    //
+    // `project_root` 取 `workspace_root`:它就是本 thread 的 workspace 根(= cwd 的
+    // canonical 形态),而组长的 cwd 就是项目根(组长不由 `.worktrees/` 承载)。
+    // 不拿 `cfg.workdir` 兜底:那会让「工具绑的项目根」与「thread 所属项目」在
+    // 会话 cwd 不同于进程 workdir 时脱钩。
+    if crate::lead_memory::is_lead_thread(&store, thread_id) {
+        let project_root = Path::new(&workspace_root).to_path_buf();
+        registry.register(Arc::new(crate::lead_memory::LeadRememberTool::new(
+            project_root.clone(),
+        )));
+        registry.register(Arc::new(crate::lead_memory::LeadRecallTool::new(
+            project_root,
+        )));
+    }
     Ok(RuntimeTooling {
         registry: Arc::new(registry),
         permission,
@@ -10856,6 +10877,157 @@ pub(crate) mod tests {
             "the waiting thread must receive the reply resolved for its request_id: {text}"
         );
         let _ = attached;
+    }
+
+    /// 组长私有的记忆工具只给组长:普通会话一个都看不到。
+    ///
+    /// 负臂是本测试的重点。只断言「组长看得到」会漏掉最危险的接法——把判定写成
+    /// 「有 meta 就是组长」或干脆无条件注册;那样组长那条断言照样绿,而每个普通
+    /// 会话都悄悄拿到了写项目账本的权限。故这里同时钉:
+    /// ① 落过盘但 `role: None` 的会话看不到;② 从未落过盘的会话也看不到;
+    /// ③ 负臂会话的工具集非空(`ask_lead` 还在),证明「看不到」不是 registry 整体空掉。
+    ///
+    /// 判定只看落盘的 `ThreadMeta.role`(唯一权威):测试里的正臂就走生产的
+    /// `ensure_lead_meta` 造 meta,不手搓一个「像组长」的形状。
+    #[test]
+    fn only_the_lead_sees_the_memory_tools() {
+        let repo = tempfile::TempDir::new().unwrap();
+        let runtime = tempfile::TempDir::new().unwrap();
+        init_git_repo(repo.path());
+        let mut cfg = test_config();
+        cfg.workdir = repo.path().to_path_buf();
+
+        let attached = Arc::new(
+            yi_agent_subagent::attach::attach_project_runtime(
+                &cfg,
+                runtime.path().to_path_buf(),
+                &isolated_models_path(runtime.path()),
+            )
+            .expect("a clean git repo must attach"),
+        );
+        // `build_runtime_tooling` 取的是 `root.handle()?.workspace_root`;组长不使用
+        // `.worktrees/`,故它就是项目根。这条断言把「project_root 取自
+        // workspace_root 且 workspace_root 就是项目根」这个前提钉在测试里。
+        // 注意形态:workspace_root 是 cwd 的 **canonical** 形态(macOS 上
+        // `/var` → `/private/var`),与项目根是同一个目录,不是另一个路径。
+        let project_root = repo.path().canonicalize().expect("repo path canonicalizes");
+        assert_eq!(
+            attached.workspace_root, project_root,
+            "the thread's workspace root must be the project root"
+        );
+        // 两种拼写必须指向同一份 store:生产里 thread 的 cwd 走的是
+        // `resolve_thread_cwd` 的**非 canonical**(显式 cwd 才 canonicalize),
+        // 而 workspace_root 是 canonical 的。若二者不是同一个目录,下面「用
+        // workspace_root 建 store、用 cfg.workdir 建 meta」就会各写各的,
+        // 判定便永远读不到 role——本断言先把这个前提钉死。
+        assert_eq!(
+            std::fs::canonicalize(cfg.workdir.as_path()).expect("workdir canonicalizes"),
+            attached.workspace_root,
+            "cfg.workdir and the attached workspace root must be the same directory"
+        );
+
+        // 组装 store 时**刻意用生产那种拼写**(`cfg.workdir`,即 `cwd`,非
+        // canonical),而不是上面那个 canonical 形态:装配里的
+        // `ThreadStore::new(Path::new(&workspace_root))` 用的是 canonical。
+        // 两条拼写必须落到同一份 `<项目根>/.yi-agent/threads`,否则本测试会
+        // 读不到自己写的 meta,「组长看到工具」的断言就永远不会绿。
+        let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: "thread-plain".to_string(),
+                cwd: cfg.workdir.to_string_lossy().to_string(),
+                model: "test-model".to_string(),
+                created_at: 1,
+                updated_at: 1,
+                title: Some("组长".to_string()), // 标题写着「组长」也不许算组长
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+                board_project: None,
+                card_id: None,
+                model_ref: None,
+                reasoning_effort: None,
+                preserve_thinking: true,
+                role: None,
+            })
+            .expect("a plain meta must persist");
+        // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。
+        let (lead, _created) =
+            crate::lead::ensure_lead_meta(&store, &project_root).expect("lead meta");
+        assert_eq!(
+            lead.role.as_deref(),
+            Some(crate::thread_store::LEAD_ROLE),
+            "the production lead path must persist the role"
+        );
+
+        let binding = RuntimeBinding::managed(
+            &cfg,
+            runtime.path().to_path_buf(),
+            isolated_models_path(runtime.path()),
+            Arc::clone(&attached),
+        );
+        let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+        let build = |thread_id: &str| {
+            build_runtime_tooling(
+                &cfg,
+                &root,
+                thread_id,
+                yi_agent_core::autonomy::YoloSwitch::new(false),
+                test_theme(),
+                crate::git_diff_tool::GitDiffHandle::new(),
+                "proj-test".to_string(),
+                crate::lead::LeadInbox::new(),
+                crate::lead::LeadReplies::new(),
+            )
+            .expect("tooling")
+        };
+
+        let lead_names = build(&lead.thread_id).registry.names();
+        assert!(
+            lead_names.contains(&"lead_remember".to_string()),
+            "the lead must see lead_remember, got {lead_names:?}"
+        );
+        assert!(
+            lead_names.contains(&"lead_recall".to_string()),
+            "the lead must see lead_recall, got {lead_names:?}"
+        );
+
+        // 负臂:落过盘的普通会话,以及从未落过盘的会话。
+        for plain in ["thread-plain", "thread-never-persisted"] {
+            let names = build(plain).registry.names();
+            assert!(
+                !names.contains(&"lead_remember".to_string()),
+                "{plain} is not the lead and must not see lead_remember, got {names:?}"
+            );
+            assert!(
+                !names.contains(&"lead_recall".to_string()),
+                "{plain} is not the lead and must not see lead_recall, got {names:?}"
+            );
+            // 非空 witnesses:「看不到」必须是真的缺席,而不是整个 registry 空掉。
+            assert!(
+                names.contains(&"ask_lead".to_string()),
+                "{plain} still gets the shared tools, got {names:?}"
+            );
+        }
+
+        // `project_root` 绑定必须是真的项目根:跑一次工具,账本要落在
+        // `<项目根>/.yi-agent/lead_memory/memory.md`。名字对了但路径绑错
+        // (例如绑到 `.yi-agent/threads/..`)会在这里露出来。
+        let lead_tooling = build(&lead.thread_id);
+        let remember = lead_tooling
+            .registry
+            .get("lead_remember")
+            .expect("the lead's registry must hold lead_remember");
+        let block_on = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = block_on.block_on(remember.call(serde_json::json!({ "text": "项目根绑定检查" })));
+        assert!(!out.is_error, "lead_remember must succeed: {out:?}");
+        assert!(
+            crate::lead_memory::memory_path(&project_root).exists(),
+            "the ledger must land under the project root, not somewhere else"
+        );
     }
 
     /// A plain directory has no checkout to move into, so the root runs in
