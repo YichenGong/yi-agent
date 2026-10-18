@@ -428,6 +428,56 @@ mod tests {
         );
     }
 
+    /// 迁移同样不得覆盖「合法 JSON 但不是清单文档」的 `models.json`。
+    ///
+    /// 与上面的损坏文件是**同一类**丢失（用户文件被 rename 掉），只是入口不同：
+    /// 顶层非对象的合法 JSON 曾被当成空清单，于是 `migrate` 往里导入并覆盖。
+    #[test]
+    fn a_non_object_catalog_is_never_clobbered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models = dir.path().join("models.json");
+        let original = r#"["something","the","user","wrote"]"#;
+        std::fs::write(&models, original).unwrap();
+        let env_text = "MODEL_API_KEY=sk-x\n";
+        let env = write_env(dir.path(), env_text);
+
+        match migrate_model_keys(&env, &models) {
+            MigrationOutcome::CatalogNotWritable { .. } => {}
+            other => panic!("expected CatalogNotWritable, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&models).unwrap(),
+            original,
+            "a non-object models.json must be left byte-identical"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&env).unwrap(),
+            env_text,
+            ".env must be untouched: the key must not be commented out"
+        );
+    }
+
+    /// 迁移不得覆盖「条目全被跳过」的 `models.json`（同类丢失的第二个入口）。
+    #[test]
+    fn an_all_entries_skipped_catalog_is_never_clobbered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models = dir.path().join("models.json");
+        let original = r#"{"models":[{"name":"kept-typo","provider":"anthropic","model":"m"}]}"#;
+        std::fs::write(&models, original).unwrap();
+        let env_text = "MODEL_API_KEY=sk-x\n";
+        let env = write_env(dir.path(), env_text);
+
+        match migrate_model_keys(&env, &models) {
+            MigrationOutcome::CatalogNotWritable { .. } => {}
+            other => panic!("expected CatalogNotWritable, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&models).unwrap(),
+            original,
+            "a catalog whose entries were all skipped must be left byte-identical"
+        );
+    }
+
     #[test]
     fn a_provider_named_anthropic_key_is_imported_not_stranded() {
         let dir = tempfile::TempDir::new().unwrap();
