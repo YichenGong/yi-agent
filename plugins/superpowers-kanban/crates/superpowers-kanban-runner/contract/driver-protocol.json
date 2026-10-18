@@ -1,5 +1,5 @@
 {
-  "_comment": "宿主 `session_driver` 与插件 `driver/next` 共用的线协议契约。宿主侧测试运行时按相对路径读它、插件侧用 include_str! 读它——同一份文件、两端各自断言。任一侧改了字段名而没同步这里，那一侧的测试就红。",
+  "_comment": "宿主 `session_driver` 与插件 `driver/next` 共用的线协议契约。两侧的测试都用 include_str! 读它（编译期依赖，改名/删除也会红）——同一份文件、两端各自断言。任一侧改了字段名而没同步这里，那一侧的测试就红。",
   "request": {
     "_comment": "宿主 → 插件：`driver/next` 的参数形状（宿主 `threads_payload` / `driver_step` 发出，插件 `dispatch.rs` 手工解析）。",
     "threads": [
