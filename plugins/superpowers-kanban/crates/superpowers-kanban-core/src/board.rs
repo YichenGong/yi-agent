@@ -60,6 +60,7 @@ impl Board {
             workdir: None,
             task_id: None,
             thread_id: None,
+            origin_thread_id: None,
             base_commit: None,
             kind: CardKind::Implementation,
             source_ref: None,
@@ -95,6 +96,7 @@ impl Board {
             workdir: None,
             task_id: None,
             thread_id: None,
+            origin_thread_id: None,
             base_commit: None,
             kind: CardKind::Merge,
             source_ref: Some(source),
@@ -109,7 +111,14 @@ impl Board {
     }
 
     /// 排入一张预排队卡：无 spec/plan，只有一个标题；id 由调用方定死。
-    pub fn enqueue_prequeued(&mut self, id: CardId, title: String, now: DateTime<Local>) -> &Card {
+    /// `origin_thread_id` 是提出它的讨论会话（拿不到时为 `None`）。
+    pub fn enqueue_prequeued(
+        &mut self,
+        id: CardId,
+        title: String,
+        origin_thread_id: Option<String>,
+        now: DateTime<Local>,
+    ) -> &Card {
         let order = self.next_order;
         self.next_order += 1;
         let index = self.cards.len();
@@ -123,6 +132,7 @@ impl Board {
             workdir: None,
             task_id: None,
             thread_id: None,
+            origin_thread_id,
             base_commit: None,
             kind: CardKind::Implementation,
             source_ref: None,
@@ -774,7 +784,7 @@ mod tests {
     #[test]
     fn a_pre_queued_card_is_queued_nowhere_near_a_slot() {
         let mut board = Board::new();
-        board.enqueue_prequeued(CardId::new("idea"), "一个想法".into(), at(1, 0));
+        board.enqueue_prequeued(CardId::new("idea"), "一个想法".into(), None, at(1, 0));
         let card = board.get(&CardId::new("idea")).unwrap();
         assert_eq!(card.state, CardState::PreQueued);
         assert_eq!(card.title.as_deref(), Some("一个想法"));
@@ -803,7 +813,7 @@ mod tests {
         );
         let other = board.next_free_prequeued_id("另一个想法", at(1, 1));
         assert_ne!(fallback, other, "两张中文标题的卡必须拿到不同 id");
-        board.enqueue_prequeued(CardId::new("idea"), "idea".into(), at(1, 0));
+        board.enqueue_prequeued(CardId::new("idea"), "idea".into(), None, at(1, 0));
         assert_eq!(
             board.next_free_prequeued_id("idea", at(1, 1)),
             CardId::new("idea-2")
@@ -818,7 +828,7 @@ mod tests {
         // 测试照样绿）。
         let mut board = Board::new();
         let idea = CardId::new("idea");
-        board.enqueue_prequeued(idea.clone(), "想法".into(), at(1, 0));
+        board.enqueue_prequeued(idea.clone(), "想法".into(), None, at(1, 0));
         board.enqueue(
             CardId::new("newer"),
             "newer.spec.md".into(),
@@ -863,7 +873,12 @@ mod tests {
     fn promoting_with_a_new_title_overwrites_it_but_not_the_id() {
         let mut board = Board::new();
         let idea = CardId::new("idea");
-        board.enqueue_prequeued(idea.clone(), "旧标题".into(), at(1, 0));
+        board.enqueue_prequeued(
+            idea.clone(),
+            "旧标题".into(),
+            Some("thread-x".into()),
+            at(1, 0),
+        );
         board
             .promote_prequeued(&idea, "s".into(), "p".into(), Some("新标题".into()))
             .unwrap();
@@ -946,5 +961,55 @@ mod tests {
         assert_eq!(after.spec_path, before.spec_path);
         assert_eq!(after.plan_path, before.plan_path);
         assert_eq!(after.order, before.order);
+    }
+
+    #[test]
+    fn a_prequeued_card_keeps_the_discussion_session_it_was_captured_in() {
+        let mut board = Board::new();
+        board.enqueue_prequeued(
+            CardId::new("idea"),
+            "一个想法".into(),
+            Some("thread-discuss-1".into()),
+            at(1, 0),
+        );
+        let card = board.get(&CardId::new("idea")).unwrap();
+        assert_eq!(card.origin_thread_id.as_deref(), Some("thread-discuss-1"));
+    }
+
+    #[test]
+    fn a_prequeued_card_without_a_discussion_session_has_none() {
+        let mut board = Board::new();
+        board.enqueue_prequeued(CardId::new("idea"), "一个想法".into(), None, at(1, 0));
+        assert_eq!(
+            board.get(&CardId::new("idea")).unwrap().origin_thread_id,
+            None
+        );
+    }
+
+    #[test]
+    fn implementation_and_merge_cards_have_no_origin_thread() {
+        // 只有预排队卡记录讨论会话；实现卡/合并卡的该字段为空。
+        let mut board = Board::new();
+        board.enqueue(
+            CardId::new("impl"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            at(1, 0),
+        );
+        board.enqueue_merge(
+            CardId::new("merge"),
+            "kanban/a".into(),
+            "main".into(),
+            None,
+            at(1, 0),
+        );
+        assert_eq!(
+            board.get(&CardId::new("impl")).unwrap().origin_thread_id,
+            None
+        );
+        assert_eq!(
+            board.get(&CardId::new("merge")).unwrap().origin_thread_id,
+            None
+        );
     }
 }

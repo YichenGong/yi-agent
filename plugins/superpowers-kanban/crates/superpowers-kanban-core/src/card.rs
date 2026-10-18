@@ -134,6 +134,11 @@ pub struct Card {
     /// 卡片会话在 app-server 里的 thread id。启动后回填。
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// 提出这张卡的**讨论会话**。与 `thread_id`（跑这张卡的执行会话）语义不同，
+    /// 故不复用后者：`thread_id` 会被调度器的 `mark_running` 覆写成执行会话，
+    /// 复用它会让溯源线在提升/开跑时断掉。旧 board.json 缺此字段 → `None`。
+    #[serde(default)]
+    pub origin_thread_id: Option<String>,
     /// 启动时 worktree 的 HEAD，供对账判断「有无新提交」。
     #[serde(default)]
     pub base_commit: Option<String>,
@@ -370,5 +375,13 @@ mod tests {
         let json = r#"{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}"#;
         let card: Card = serde_json::from_str(json).unwrap();
         assert_eq!(card.title, None, "旧 board.json 缺 title 必须回 None");
+    }
+
+    #[test]
+    fn an_old_card_without_an_origin_thread_still_deserializes() {
+        // 旧 board.json 没有 origin_thread_id：必须回 None，不得整份解析失败。
+        let json = r#"{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}"#;
+        let card: Card = serde_json::from_str(json).unwrap();
+        assert_eq!(card.origin_thread_id, None);
     }
 }

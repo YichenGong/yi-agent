@@ -276,7 +276,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut board = Board::new();
         let now = Local.with_ymd_and_hms(2026, 10, 18, 17, 7, 29).unwrap();
-        board.enqueue_prequeued(crate::card::CardId::new("idea"), "idea".into(), now);
+        board.enqueue_prequeued(crate::card::CardId::new("idea"), "idea".into(), None, now);
         assert_eq!(
             next_free_prequeued_id(&board, dir.path(), "idea", now).0,
             "idea-2"
