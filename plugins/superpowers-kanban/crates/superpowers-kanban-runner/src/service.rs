@@ -2432,6 +2432,87 @@ mod tests {
         assert!(value.get("card_id").is_none(), "{value}");
     }
 
+    /// 宿主与插件共用的 `driver/next` 契约（**与宿主 `session_driver.rs` 的测试读
+    /// 同一份文件**，宿主侧按相对路径运行时读）。
+    ///
+    /// 这里钉住插件这一侧的两件事：① `DriverAction::to_json` 交出的形状与契约字面量
+    /// **按值**相等（键序不是契约，故比较解析后的 `Value`）；② 契约里的 `results[]`
+    /// 条目能反序列化成 `DriverResult`。插件若改字段名，这两条就红——否则宿主
+    /// `parse_action` 会悄悄回 `None`，或插件的 `DriverResult` 反序列化失败。
+    const DRIVER_CONTRACT: &str = include_str!("../contract/driver-protocol.json");
+
+    /// 契约里的**请求**字段名，插件手工解析 `driver/next` 参数时认的就是它们
+    /// （`dispatch.rs`）。宿主改了发出侧的名字，这条会红。
+    #[test]
+    fn the_driver_contract_request_uses_the_field_names_the_plugin_parses() {
+        let contract: Value = serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON");
+        let threads = contract["request"]["threads"]
+            .as_array()
+            .expect("契约必须钉住 threads[] 条目形状");
+        assert!(
+            threads
+                .iter()
+                .all(|thread| thread.get("thread_id").is_some() && thread.get("idle").is_some()),
+            "threads[] 条目只由 `thread_id` + `idle` 构成：{threads:?}"
+        );
+        let results = contract["request"]["results"]
+            .as_array()
+            .expect("契约必须钉住 results[] 条目形状");
+        for entry in results {
+            for key in ["action_id", "ok", "thread_id", "error"] {
+                assert!(
+                    entry.get(key).is_some(),
+                    "results[] 条目必须带 `{key}`：{entry}"
+                );
+            }
+        }
+        // 契约的 results[] 条目就是插件 `DriverResult` 认的形状。
+        let parsed: Vec<DriverResult> =
+            serde_json::from_value(contract["request"]["results"].clone())
+                .expect("契约的 results[] 必须能反序列化成 DriverResult");
+        assert_eq!(parsed[0].action_id, "act-1");
+        assert!(parsed[0].ok);
+        assert_eq!(parsed[0].thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(parsed[0].error, None);
+    }
+
+    /// 插件**交出**的动作形状与契约字面量按值相等：宿主 `parse_action` 认的就是这份
+    /// 契约里的键名（`launch` 的 workdir/title/objective，`append` 的 thread_id/
+    /// objective）。改一侧的名字而没同步契约，这条就红。
+    #[test]
+    fn the_driver_contract_answers_match_what_the_plugin_emits() {
+        let contract: Value = serde_json::from_str(DRIVER_CONTRACT).expect("契约必须是合法 JSON");
+        let answers = &contract["answers"];
+
+        let launch = DriverAction::Launch {
+            action_id: "act-2".to_string(),
+            card_id: "card-1".to_string(),
+            workdir: PathBuf::from("/w/card-1"),
+            title: "看板 · a.spec".to_string(),
+            objective: "do the card".to_string(),
+        };
+        assert_eq!(
+            launch.to_json(),
+            answers["launch"],
+            "launch 的字段名与契约必须一致"
+        );
+
+        let append = DriverAction::Append {
+            action_id: "act-3".to_string(),
+            card_id: "card-1".to_string(),
+            thread_id: "thread-1".to_string(),
+            objective: "merge it".to_string(),
+        };
+        assert_eq!(
+            append.to_json(),
+            answers["append"],
+            "append 的字段名与契约必须一致"
+        );
+
+        // 「无事可做」的契约形状：`{"action": null}`。
+        assert_eq!(answers["nothing"], serde_json::json!({ "action": null }));
+    }
+
     /// 合并轮失败（分支未并入）→ 卡退回 `needs_you`，但它是**可自动重试**的
     /// （spec D9）；重试有界，免得环境性失败一直烧模型回合。旧行为是「无入口的
     /// 死胡同」，这条用例同时锁住「能自动再入轮」与「有上限」两面。
