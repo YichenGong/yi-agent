@@ -120,4 +120,21 @@ mod tests {
         let body = std::fs::read_to_string(path).unwrap();
         assert!(body.contains("show_git_diff"), "skill must name the tool");
     }
+
+    #[test]
+    fn the_git_diff_skill_teaches_commands_not_just_a_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_system_skills(tmp.path()).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("git-diff-review/SKILL.md")).unwrap();
+        assert!(body.contains("show_git_diff"), "skill must name the tool");
+        assert!(
+            body.contains("command"),
+            "the tool now takes a command: {body}"
+        );
+        assert!(body.contains("git log"), "skill must give a log example");
+        assert!(
+            body.contains("read-only") || body.contains("只读"),
+            "skill must warn about the sandbox"
+        );
+    }
 }
