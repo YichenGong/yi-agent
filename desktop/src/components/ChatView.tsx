@@ -231,8 +231,8 @@ const ChatItem = memo(
  * The settled history above the streaming tail.
  *
  * Its whole purpose is to *not* re-render while only the tail grows. It bails
- * out whenever `items`, `count` and `threadId`/`call` are all unchanged; a pure
- * text append touches none of them, so a long session performs no work
+ * out whenever `items`, `count` and `structuralVersion` are all unchanged; a
+ * pure text append touches none of them, so a long session performs no work
  * proportional to its length per delta. (`items` is mutated in place, so the
  * array identity never changes and this memo is what makes the prefix a frozen
  * subtree rather than a re-rendered one.)
@@ -240,6 +240,16 @@ const ChatItem = memo(
  * `count` is explicit because `items` is mutated in place: its length changes
  * without the array identity changing, so the memo cannot rely on the array
  * reference alone to notice that a new item appeared.
+ *
+ * `structuralVersion` is a **prop, not a `key`**: it only has to make this
+ * component re-render *in place*. Keying it would remount the subtree instead
+ * and wipe the local state of every child — a CoT the user expanded
+ * (`ReasoningBlock`), a tool card they opened (`ToolCallCard`), a half-typed
+ * interjection draft — on every `item/started` / `item/completed` / tool event,
+ * and would re-issue each prefix bubble's image read. Re-rendering in place is
+ * also cheaper: each `ChatItem` still memoizes on its own `item` (and `text`),
+ * so only the items that actually moved re-render, whereas a remount re-parses
+ * every prefix message's markdown.
  */
 const HistoryPrefix = memo(
   function HistoryPrefix({
@@ -252,6 +262,12 @@ const HistoryPrefix = memo(
     count: number;
     threadId: string | null;
     call: ImageReadCall;
+    /**
+     * Not read by the component body — it exists so the memo comparator below
+     * can see the bump and re-render this subtree in place. It is a prop rather
+     * than a `key` for the reasons in the doc comment above.
+     */
+    structuralVersion: number;
   }) {
     const out = [];
     for (let i = 0; i < count; i += 1) {
@@ -272,6 +288,7 @@ const HistoryPrefix = memo(
   (prev, next) =>
     prev.items === next.items &&
     prev.count === next.count &&
+    prev.structuralVersion === next.structuralVersion &&
     prev.threadId === next.threadId &&
     prev.call === next.call,
 );
@@ -306,8 +323,9 @@ export function ChatView({
   call?: ImageReadCall;
   /**
    * Bumped by `Session` when the transcript's *structure* changes (a slot is
-   * replaced, an item inserted or removed). Passed into the frozen prefix so a
-   * structural change rebuilds it while a pure text append skips it entirely.
+   * replaced, an item inserted or removed). Passed into the frozen prefix as a
+   * prop so a structural change re-renders it **in place** while a pure text
+   * append skips it entirely; a `key` would remount it and wipe child state.
    */
   structuralVersion?: number;
 }) {
@@ -339,13 +357,18 @@ export function ChatView({
       ref={scrollRef}
       className="flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-3"
     >
-      {/* Re-keying on `structuralVersion` is what makes the structure change
-          reach the frozen prefix: `items` is the same array instance forever,
-          so without a changing prop the prefix would never rebuild. */}
+      {/* `structuralVersion` travels as a **prop**, not a `key`. `items` is the
+          same array instance for the whole session, so without a changing input
+          the memoized prefix would never rebuild after an in-place slot replace.
+          A `key` would rebuild it by *remounting* it, which throws away the
+          local state underneath — an expanded CoT, an open tool card, a
+          half-typed interjection draft — on every item event, and re-issues the
+          prefix bubbles' image reads. The prop re-renders in place instead, and
+          each `ChatItem` still memoizes, so unchanged messages stay untouched. */}
       <HistoryPrefix
-        key={structuralVersion}
         items={items}
         count={items.length - 1}
+        structuralVersion={structuralVersion}
         threadId={threadId}
         call={effectiveCall}
       />

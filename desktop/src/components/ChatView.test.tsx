@@ -368,6 +368,35 @@ describe("ChatView frozen prefix", () => {
     expect(calls.text).toBeGreaterThan(before);
     expect(screen.getByText("settled")).toBeTruthy();
   });
+
+  it("keeps a prefix reasoning block expanded across a structural change", () => {
+    // A structural bump must re-render the prefix **in place**, not remount it.
+    // `ReasoningBlock`'s expanded flag and `ToolCallCard`'s open flag are local
+    // state: remounting silently collapses a CoT the user opened, and re-issues
+    // every prefix bubble's image read. Structural bumps are frequent during a
+    // turn (`item/started` / `item/completed` / tool events), so a `key` here
+    // means such a block can never stay open while the session is live.
+    const history = [
+      { type: "userMessage", id: "u1", text: "hi" },
+      { type: "reasoning", id: "r1", text: "deep thought" },
+      { type: "agentMessage", id: "tail", text: "streaming" },
+    ] as unknown as (Item | NoticeItem)[];
+    const { rerender } = render(<ChatView items={history} structuralVersion={1} />);
+
+    const toggle = screen.getByRole("button", { name: /思考/ });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("deep thought")).toBeTruthy();
+
+    // A structural change elsewhere in the prefix: same index, new object —
+    // exactly what `Session` does on `item/completed`.
+    history[0] = { type: "userMessage", id: "u1", text: "hi again" } as unknown as Item;
+    rerender(<ChatView items={history} structuralVersion={2} />);
+
+    expect(screen.getByText("hi again")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /思考/ }).getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("deep thought")).toBeTruthy();
+  });
 });
 
 describe("ChatView live tail", () => {
