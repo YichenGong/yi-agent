@@ -8415,6 +8415,35 @@ async fn the_background_tick_never_creates_a_lead() {
     );
 }
 
+/// 同一段 digest 文本不许被投递两次——审批期的重复 tick 必须被压掉。
+///
+/// 背景:`decide_wake` 对每个 `AwaitingApproval` **无条件**产出 `ThreadStuck`,而
+/// `LEAD_TICK = 30s`、`PERMISSION_TIMEOUT = 300s`——一次审批窗会让组长被同一条文本
+/// 唤醒最多 10 次,每次都是带全部上下文的完整 LLM turn(纯噪声 + 真金白银)。
+/// 去重键取**文本本身**:不用理解状态机就天然覆盖所有 wake reason;态势每轮照常现算
+/// (`lead_tick_once` 不动),只是不重复**投递**一模一样的文本。
+#[test]
+fn identical_digests_are_not_delivered_twice() {
+    let mut latch = HashMap::new();
+    let mk = |text: &str| LeadTickDelivery {
+        project_key: "/p".to_string(),
+        lead: LeadTarget {
+            cwd: "/p".to_string(),
+            thread_id: "lead-1".to_string(),
+        },
+        text: text.to_string(),
+    };
+    // 第一轮：投递。
+    let first = take_changed_digests(vec![mk("卡住:thread-a")], &mut latch);
+    assert_eq!(first.len(), 1);
+    // 第二轮：同样的文本 → 不再投递（审批期的 10 次重复从此消失）。
+    let second = take_changed_digests(vec![mk("卡住:thread-a")], &mut latch);
+    assert!(second.is_empty(), "同一文本不得二次投递");
+    // 第三轮：内容变了（新 thread 卡住）→ 恢复投递。
+    let third = take_changed_digests(vec![mk("卡住:thread-a, thread-b")], &mut latch);
+    assert_eq!(third.len(), 1);
+}
+
 /// 用 `RecordingProvider` 建 agent,并把每次对话调用看到的 message 数记进 `seen`。
 /// 与 `build_test_agent_with_provider` 同一夹具,只是把 provider 换成记账的那款。
 /// 组长那轮的回复文本必须是**本条纯函数**取出的那条助手消息。
