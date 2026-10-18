@@ -7,6 +7,7 @@ pub(crate) mod git_diff;
 pub mod git_diff_tool;
 pub mod image_upload;
 pub mod lead;
+pub(crate) mod lead_control;
 pub(crate) mod lead_loop;
 pub mod lead_memory;
 pub mod mcp_rpc;
