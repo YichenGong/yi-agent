@@ -475,10 +475,17 @@ Ensure `use std::os::unix::io::AsRawFd;` is imported in this file. No new depend
 
 - [ ] **Step 2: Replace the sleep with the poll gate**
 
-In the daemon accept loop, replace the `match listener.accept()` block's wait behaviour:
+In the daemon accept loop, replace the `match listener.accept()` block's wait behaviour. **Note:** the enclosing `thread::spawn(move || { ... })` closure returns `()` and contains no `?` — so the wait result must be handled explicitly, not with `?`:
 
 ```rust
-                if !daemon_accept_wait(&listener, DAEMON_ACCEPT_POLL)? {
+                let ready = match daemon_accept_wait(&listener, DAEMON_ACCEPT_POLL) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        tracing::error!(error = %error, "daemon accept poll failed; retrying");
+                        continue;
+                    }
+                };
+                if !ready {
                     continue;
                 }
                 match listener.accept() {
@@ -532,39 +539,19 @@ git commit -m "perf(daemon): poll for connections instead of sleeping 10ms"
 Add to `yi-agent-rs/crates/yi-agent-app-server/src/rpc_tests.rs`:
 
 ```rust
-/// detach 的前提：这两个域的状态必须是 `Send`，否则 `tokio::spawn` 编译不过。
-/// 这条断言就是「它们能脱离主循环执行」的编译期证明——主循环是单 task，
-/// 内联 `await` 会串行堵住所有 thread 的 RPC。
+/// detach 的前提：这两个域的状态必须是 `Send + Sync + 'static`，否则
+/// `tokio::spawn` 编译不过。这条断言就是「它们能脱离主循环执行」的编译期证明
+/// ——主循环是单 task，内联 `await` 会串行堵住所有 thread 的 RPC。
 #[test]
-fn board_and_plugin_shared_state_is_send() {
-    fn assert_send<T: Send + 'static>() {}
-    assert_send::<crate::rpc::BoardPluginState>();
-}
-```
-
-Additionally assert the handlers are callable without any `&mut` main-loop state, by naming their signatures (this fails to compile until Task 4's signatures land):
-
-```rust
-/// handler 只借 `BoardPluginState`（无 `&mut AppState`），故可被 spawn 的任务
-/// 独占调用。这里通过函数指针类型钉住签名。
-#[test]
-fn board_and_plugin_handlers_take_only_shared_state() {
-    let _board: fn(
-        &crate::rpc::BoardPluginState,
-        &crate::protocol::RequestEnvelope,
-        crate::protocol::RequestId,
-    ) -> _ = |state, req, id| crate::rpc::board::handle_shared(state, req, id);
-    let _plugin: fn(
-        &crate::rpc::BoardPluginState,
-        &crate::protocol::RequestEnvelope,
-        crate::protocol::RequestId,
-    ) -> _ = |state, req, id| crate::rpc::plugin::handle_shared(state, req, id);
+fn board_and_plugin_shared_state_is_owned_and_send() {
+    fn assert_spawnable<T: Send + Sync + 'static>() {}
+    assert_spawnable::<crate::rpc::BoardPluginState>();
 }
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib board_and_plugin_shared_state_is_send`
+Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib board_and_plugin_shared_state_is_owned_and_send`
 Expected: FAIL to compile — `cannot find type BoardPluginState in crate::rpc`.
 
 - [ ] **Step 3: Widen the three type aliases, then add `BoardPluginState` and the write helper**
@@ -713,7 +700,7 @@ In the main `select!` (`:2479`), add a branch (place it before the `card_ticker`
 - [ ] **Step 7: Run the tests**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib`
-Expected: PASS, including `board_and_plugin_shared_state_is_send` and `board_and_plugin_handlers_take_only_shared_state`, all `board_*` tests (`board_create_then_remove_lists_the_project_between_the_two`, `board/list` flows), `write_response_to_a_gone_ws_client_is_not_fatal`, and `driver_reports_finished_when_writer_fails`.
+Expected: PASS, including `board_and_plugin_shared_state_is_owned_and_send`, all `board_*` tests (`board_create_then_remove_lists_the_project_between_the_two`, `board/list` flows), `write_response_to_a_gone_ws_client_is_not_fatal`, and `driver_reports_finished_when_writer_fails`.
 
 - [ ] **Step 8: Format and commit**
 
