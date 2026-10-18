@@ -122,8 +122,14 @@ if (isRemoteClient()) { /* running → readItems, return */ }
 为避免与函数内已有的 `const view = store.peek(id)` 重复声明，新引入的视图读取
 用独立名字 `curView`，运行标志用 `running`。
 
-**取舍**：纯"看"运行中会话时不再预热 agent（mode/effort 要等发消息才恢复）。
-这与 iOS 现有行为一致，且 iOS 已用测试固化（`App.test.tsx` 的
+**取舍**：纯"看"运行中会话时不再预热 agent，且**发送也不会补齐**——运行中会话的发送
+走 `turn/interject`（`App.tsx`），永不 `resume`（C1 保证的 `resume` 只发生在冷会话）。
+故这两项须分别对待：**权限模式**可从已在手的 `thread/listAll` 快照重新推出（快照恒带
+`permission_mode`；`ThreadStore.seed` 只补「未知」、绝不覆盖已知值），chip 在 readItems
+路径上照常正确；**reasoning effort** 在清单条目里没有对应字段，也没有读取它的 RPC
+（本卡不改服务端、不新增 RPC），故此路径上它只能显示为「未设置（继承 X）」，直到该会话
+下一次经 `resume`（被重新冷选中，或本轮结束后）才落定——这是**已接受的限制**。
+纯"看"不预热与 iOS 现有行为一致，且 iOS 已用测试固化（`App.test.tsx` 的
 `catches a cold running thread up with readItems instead of resume`）。
 
 ### 4.2 `ThreadStore.forgetPushStatuses`：作废崩溃前推送的运行状态
@@ -207,5 +213,5 @@ forgetPushStatuses(): void { this.statusSource.clear(); }
 | 风险 | 缓解 |
 |---|---|
 | 与 `frontend-architecture` 卡冲突（它计划把 `selectThread` 搬进 `useSessionState` hook） | 该卡截至目前**未执行** Task 4（worktree 无 `desktop/src/hooks/`，`App.tsx` 仍有 12 处 `selectThread`）。本卡改动集中在 `selectThread` 内的一个 `if` 块 + `ThreadStore` 新增方法；plan 里写前置检查，若届时函数已搬走，按同一逻辑所在处落点 |
-| 纯"看"运行中会话不再预热 agent | 与 iOS 现有行为一致；发送时仍会经 `turn/start`/`resume` 补齐（C1 保证冷会话必须先 resume，plan 里以回归测试钉住） |
+| 纯"看"运行中会话不再预热 agent | 与 iOS 现有行为一致；权限模式由已在手的 `thread/listAll` 快照补回（`ThreadStore.seed` 只补「未知」、绝不覆盖已知值），故 chip 在 readItems 路径上正确；reasoning effort 该路径上不可得（清单无此字段、无读取 RPC），显示为「未设置」直到该会话下次经 `resume`——此为已接受的限制。发送**不会**补齐：运行中会话走 `turn/interject`，永不 `resume`（C1 保证的 `resume` 只在冷会话上） |
 | 陈旧状态清过头，把真实活着的会话也标成 idle | 状态随即由下一份 `listAll` 快照与服务端推送重新落值；plan 中以集成测试钉住"重连后仍能 resume" |

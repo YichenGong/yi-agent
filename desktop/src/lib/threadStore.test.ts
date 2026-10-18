@@ -93,6 +93,33 @@ describe("ThreadStore", () => {
     expect(s.view("a").info).toEqual({ cwd: "/w", model: "m", model_ref: null });
   });
 
+  it("seeds the permission mode from a listing snapshot, without inventing one", () => {
+    const s = new ThreadStore();
+    s.seed([
+      { ...summary("a"), permission_mode: "yolo" },
+      { ...summary("b") },
+    ]);
+    // Present in the snapshot → adopt the authoritative value.
+    expect(s.view("a").mode).toBe("yolo");
+    // Absent from the snapshot → unknown, never fabricated as "normal".
+    expect(s.view("b").mode).toBeNull();
+  });
+
+  it("never lets a listing snapshot clobber a known or push-written mode", () => {
+    const s = new ThreadStore();
+    // The push stream is authoritative and just said YOLO.
+    s.applyNotification({
+      method: "thread/permissionModeChanged",
+      params: { thread_id: "a", mode: "yolo" },
+    });
+    // A snapshot that omits the field (older server) must not erase it.
+    s.seed([summary("a")]);
+    expect(s.view("a").mode).toBe("yolo");
+    // Nor may a snapshot for a thread it no longer lists.
+    s.seed([summary("b")]);
+    expect(s.view("a").mode).toBe("yolo");
+  });
+
   it("does not let a stale listing snapshot roll back a live status", () => {
     const s = new ThreadStore();
     s.seed([summary("a", "running")]);
