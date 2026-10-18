@@ -261,19 +261,28 @@ cd yi-agent-rs && cargo test -p yi-agent-subagent --lib an_unreachable_daemon_de
 ```
 Expected: 四个都 PASS。
 
-- [ ] **Step 8: 跑整个 crate，记录既有失败**
+- [ ] **Step 8: 跑整个 crate，确认范围内的既有测试未被打破**
 
 Run:
 ```bash
 cd yi-agent-rs && cargo test -p yi-agent-subagent --lib 2>&1 | tail -30
 ```
-Expected: 会有既有测试因默认值翻转而失败，**记录下它们的名字**，这些在 Task 2、Task 3 修：
-- `both_spawn_schemas_offer_fork_and_default_to_false`（Task 2）
-- 其它与 fork 默认值相关的项
+Expected: **全绿**。`--lib` 范围内没有任何既有测试以「省略 `fork`」的方式调用 spawn 工具
+（唯一的工具级调用是 `fork_requested_without_a_bound_caller_fails_explicitly`
+（lib.rs:2362 附近），它显式传 `fork: true`，走 `ForkChoice::Yes` 路径，行为未变）。
+schema 断言 `both_spawn_schemas_offer_fork_and_default_to_false` 此时仍应 **PASS**：
+Task 1 只改 `spawn_fork`/`spawn_fork_token`，**没有**改 schema 默认值（那在 Task 2）。
 
-关键：`fork_requested_without_a_bound_caller_fails_explicitly`（lib.rs:2371 附近，显式传 `fork: true`）此时应仍 **PASS**——它测的是 `ForkChoice::Yes` 路径。若它失败，说明 Step 5 的 `Yes` 分支写错了。
+关键：若 `fork_requested_without_a_bound_caller_fails_explicitly` 失败，说明 Step 5 的
+`Yes` 分支写错了（把该报的错吞成了降级）。
 
-若出现与 fork 无关的失败，停下来先查。
+**已知且刻意为之的红**：跨 crate 的 e2e 测试
+`yi-agent-rs/crates/yi-agent/tests/subagent_fork_e2e.rs` 里的
+`an_unforked_spawn_sends_only_the_objective_to_the_child` 会在本任务后失败——它断言
+「省略 fork ⇒ 不继承」，正是本次要反转的语义。**Task 1 不跑、也不修它**；Task 3
+会用带 `forked:true` 断言的新版本替换它。不要为了让它变绿而提前改动。
+
+若出现上述两条以外的失败，停下来先查。
 
 - [ ] **Step 9: Commit**
 
@@ -368,16 +377,18 @@ tools, so the root and worker paths change together."
 
 ---
 
-### Task 3: 系统提示词规则（B）与 `forked` 返回字段
+### Task 3: 系统提示词规则（B）、共用响应 helper 与 `forked` 返回字段
 
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent-core/src/agent.rs:217-225`（`default_system_prompt()` 的 "Subagent integration" 段）
-- Modify: `yi-agent-rs/crates/yi-agent-subagent/src/lib.rs:1948-1950` 与 `:2220-2222`（两处 `TaskSpawned` payload）
+- Modify: `yi-agent-rs/crates/yi-agent-subagent/src/lib.rs`：新增 `spawn_outcome()` helper，并把两个 `call()` 的响应处理块（`:1947-1959`、`:2219-2231`）替换为对它的调用
 - Modify: `yi-agent-rs/crates/yi-agent/tests/subagent_fork_e2e.rs`（文件头 doc、`an_unforked_spawn_sends_only_the_objective_to_the_child`、`fork_false_matches_the_unforked_path`、新增 helper）
 
 **Interfaces:**
 - Consumes: Task 1 的 `spawn_fork_token`（`Option<String>` 的 `Some`/`None` 决定 `forked`）；Task 2 的 schema 默认值。
-- Produces: `spawn_agent` 成功返回的 JSON 含 `"forked": bool`；`default_system_prompt()` 含一条 fork 规则。Task 4 的文档描述依赖这两者。
+- Produces:
+  - `fn spawn_outcome(response: Result<IpcResponse, IpcError>, socket: &Path, fork_token: &Option<String>, objective: &str) -> ToolResult` —— 两个 spawn 工具共用的响应处理；成功时返回含 `"forked": fork_token.is_some()` 的 JSON。
+  - `spawn_agent` 成功返回的 JSON 含 `"forked": bool`；`default_system_prompt()` 含一条 fork 规则。Task 4 的文档描述依赖这两者。
 
 - [ ] **Step 1: 加 `fork_flag_of` helper**
 
@@ -507,23 +518,64 @@ cd yi-agent-rs && cargo test -p yi-agent --test subagent_fork_e2e an_omitted_for
 ```
 Expected: FAIL —— 默认路径此时已经会 fork（Task 1 已改），历史断言会通过，但 `fork_flag_of` 找不到 `forked` 字段而 panic（`a spawn result must report whether the child was forked`）。这证明 `forked` 字段确实缺失。
 
-- [ ] **Step 7: 给两处 `TaskSpawned` payload 加 `forked`**
+- [ ] **Step 7: 抽出共用响应 helper `spawn_outcome`**
 
-在 `yi-agent-rs/crates/yi-agent-subagent/src/lib.rs`，把 `:1948-1950` 与 `:2220-2222` **两处**（内容相同）分别替换为：
+两个 spawn 工具的响应处理块逐字节相同（main 上就已如此），本任务要给它们都加
+`forked` 字段——只写一处才不会漂移。在 `yi-agent-rs/crates/yi-agent-subagent/src/lib.rs`
+的 `abort_unconsumed_fork`（约 1790 行）之后插入：
 
 ```rust
-            Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
-                json!({
-                    "task_id": task_id,
-                    "objective": task,
-                    "status": "queued",
-                    "forked": fork_token.is_some(),
-                })
-                .to_string(),
-            ),
+/// Turns a spawn response into the tool result both spawn tools return.
+///
+/// Shared because the two tools differ only in which IPC request they send; the
+/// response handling -- the queued payload, the abort of an unconsumed fork on
+/// rejection, and the daemon-unavailable error -- is identical. Keeping it in one
+/// place is what stops the `forked` contract from drifting between them.
+fn spawn_outcome(
+    response: Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>,
+    socket: &Path,
+    fork_token: &Option<String>,
+    objective: &str,
+) -> ToolResult {
+    match response {
+        Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
+            json!({
+                "task_id": task_id,
+                "objective": objective,
+                "status": "queued",
+                "forked": fork_token.is_some(),
+            })
+            .to_string(),
+        ),
+        Ok(other) => {
+            abort_unconsumed_fork(socket, fork_token);
+            ToolResult::error(format_ipc_rejection("spawn request", &other))
+        }
+        Err(error) => {
+            abort_unconsumed_fork(socket, fork_token);
+            ToolResult::error(format!("daemon is unavailable: {error}"))
+        }
+    }
+}
 ```
 
-注意：`fork_token` 在同一函数里是 `Option<String>`（`let fork_token = match spawn_fork_token(...)`），在这两处 `TaskSpawned` 分支内仍在作用域内且未被移动（只有 `fork_token.clone()` 进了请求）。
+然后把 `DaemonSpawnAgentTool::call`（`:1947-1959`）的整段 `match response { ... }`
+替换为：
+
+```rust
+        spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
+```
+
+把 `DaemonApplicationSpawnAgentTool::call`（`:2219-2231`）的整段 `match response { ... }`
+替换为同样一行：
+
+```rust
+        spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
+```
+
+注意：两处调用点上方都有 `let objective = task.to_string();`，所以 `&objective` 在
+作用域内。`response` 是 `let response = yi_agent_store::ipc::send_request(...)` 的结果，
+按值传给它即可（此后不再使用）。
 
 - [ ] **Step 8: 跑 e2e 确认通过**
 
