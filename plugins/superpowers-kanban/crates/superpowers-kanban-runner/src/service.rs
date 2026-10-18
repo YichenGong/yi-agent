@@ -179,11 +179,15 @@ struct PendingAction {
 }
 
 /// 动作种类。回报的处置因种类而异：`launch` 靠 `thread_id` 让卡进入 `running`；
-/// `append`（合并轮）只说明回合已投递，成不成要等会话空闲后由 git 复核裁定。
+/// `append`（合并轮）只说明回合已投递，成不成要等会话空闲后由 git 复核裁定；
+/// `launch-for-merge` 是「为一张**没有会话的独立合并卡**开合并会话」，回报只落
+/// `card_id → thread_id` 映射——那张卡已由 `merge_request` 置成 `merging`，
+/// 绝不能像 `launch` 那样再翻成 `running`（`merging → running` 是刻意非法的）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingKind {
     Launch,
     Append,
+    LaunchForMerge,
 }
 
 pub struct BoardService {
@@ -351,6 +355,11 @@ impl BoardService {
                 .iter()
                 .filter(|card| match card.state {
                     CardState::AwaitingMerge => true,
+                    // 出生即排队的**独立合并卡**（`add-merge` / `enqueue_merge` 的
+                    // 产物：`Queued` + `kind == Merge`，没有会话）。它没有会话可
+                    // 追加，合并轮为它开一个（此前的裸 git 通路随 Task 8 退役）。
+                    // 排队中的**实现卡**不在此列：它必须走 `next_launch`。
+                    CardState::Queued => card.kind == CardKind::Merge,
                     // `needs_you` 只有**合并轮失败**退回来的才可自动重试（D9）。
                     // 会话自己跑完落下的 `needs_you` 没有产出可合（spec §4.6），
                     // 自动进合并轮会把它悄悄判成 `done`——分支与 base 同点，
@@ -364,14 +373,17 @@ impl BoardService {
             // 确定性：同 `order`（旧数据）时按 id 排，免得每拍挑中不同的卡。
             candidates.sort_by(|a, b| (a.order, &a.id).cmp(&(b.order, &b.id)));
             for card in candidates {
-                let Some(thread_id) = card.thread_id.clone() else {
-                    // 没有会话就没有「最后一轮」可追加（合并卡的裸 git 通路属
-                    // Task 8 退役的范围）。
-                    continue;
+                // 会话的门：有会话的卡要等它 idle 才有「上一轮」；独立合并卡还没有
+                // 会话，没有 idle 可言（它这一拍要的正是把会话开出来）。
+                let thread_id = match card.thread_id.clone() {
+                    Some(thread_id) => {
+                        if idle_of(threads, &thread_id) != Some(true) {
+                            continue;
+                        }
+                        Some(thread_id)
+                    }
+                    None => None,
                 };
-                if idle_of(threads, &thread_id) != Some(true) {
-                    continue;
-                }
                 match self.merge_request(&card.id.0) {
                     Ok(MergeRequest::Granted {
                         workdir,
@@ -379,12 +391,36 @@ impl BoardService {
                         base,
                     }) => {
                         let action_id = self.mint_action_id();
-                        self.remember_pending(&action_id, &card.id, PendingKind::Append);
-                        return Ok(Some(DriverAction::Append {
-                            action_id,
-                            card_id: card.id.0.clone(),
-                            thread_id,
-                            objective: crate::tick::merge_objective(&source, &base, &workdir),
+                        let objective = crate::tick::merge_objective(&source, &base, &workdir);
+                        return Ok(Some(match thread_id {
+                            // 有会话：合并轮就是往它里面追加一回合。
+                            Some(thread_id) => {
+                                self.remember_pending(&action_id, &card.id, PendingKind::Append);
+                                DriverAction::Append {
+                                    action_id,
+                                    card_id: card.id.0.clone(),
+                                    thread_id,
+                                    objective,
+                                }
+                            }
+                            // 没有会话：为这一轮合并**开一个新会话**。`workdir`
+                            // 是 `merge_request` 给的 base 工作树（合并必须在一棵
+                            // 检出 base 的树里做），title 留空——合并卡没有清单文件，
+                            // 宿主对空 title 有缺省（交错契约见 spec §4.3）。
+                            None => {
+                                self.remember_pending(
+                                    &action_id,
+                                    &card.id,
+                                    PendingKind::LaunchForMerge,
+                                );
+                                DriverAction::Launch {
+                                    action_id,
+                                    card_id: card.id.0.clone(),
+                                    workdir,
+                                    title: String::new(),
+                                    objective,
+                                }
+                            }
                         }));
                     }
                     // `Busy`（本进程/别的进程正持着 `merge.lock`）与 `Denied`
@@ -485,6 +521,37 @@ impl BoardService {
             // 并入就是 `done`，否则退回 `needs_you` 走重试（D9）。
             (PendingKind::Append, true) => Ok(()),
             (PendingKind::Append, false) => {
+                let _ = self.merge_finish(&pending.card_id.0);
+                Ok(())
+            }
+            // 为独立合并卡开出的会话回来了：**只**落 `card_id → thread_id`
+            // 映射（D5），不碰状态——这张卡已由 `merge_request` 置成 `merging`，
+            // 再走 `mark_running` 会把它翻回会话通路，而 `merging → running`
+            // 在状态机里是刻意非法的（合并期间名额不能被对账拿走）。
+            // 回报没带 thread id 就无从记账，维持原样（与 `Launch` 同型）。
+            (PendingKind::LaunchForMerge, true) => match result.thread_id.as_deref() {
+                Some(thread_id) => {
+                    let mut inner = self.lock();
+                    inner
+                        .board
+                        .set_thread_id(&pending.card_id, thread_id.to_string())
+                        .map_err(|error| error.to_string())?;
+                    self.save(&inner);
+                    Ok(())
+                }
+                None => {
+                    eprintln!(
+                        "superpowers-kanban: merge launch of {} reported ok without a thread_id",
+                        pending.card_id
+                    );
+                    Ok(())
+                }
+            },
+            // 会话**从没起来**：卡抱着 `merging`（名额的持久载体）却没有会话，
+            // 那个名额会永远是死的。与合并轮失败同一处置——立刻走一次 git 复核
+            // 把名额放掉：判否 → `needs_you`，随后由 D9 的有界重试接管；
+            // 判词仍只由 git 事实给，不采信回报里的成败。
+            (PendingKind::LaunchForMerge, false) => {
                 let _ = self.merge_finish(&pending.card_id.0);
                 Ok(())
             }
@@ -844,10 +911,17 @@ impl BoardService {
         // 合并就永远申请不到名额（本 bug）。真正的闸是「用户显式发话」
         // （只有 CLI/skill 会调 merge_request，宿主从不自动调）、source 分支存在、
         // 以及每项目一把 merge.lock。
+        //
+        // 另收一类：**出生即排队的独立合并卡**（`kind == Merge`、`Queued`、
+        // 没有会话）。它没有会话可等，`Queued → Merging` 由状态机直接放行
+        // （`card.rs:78`），这条迁移就是它的准入。排队中的**实现卡**仍被拒——
+        // 它必须走 `next_launch` 的会话通路，不能经合并轮偷偷落地。
+        let queued_merge_card = card.state == CardState::Queued && card.kind == CardKind::Merge;
         if !matches!(
             card.state,
             CardState::AwaitingMerge | CardState::NeedsYou | CardState::Running
-        ) {
+        ) && !queued_merge_card
+        {
             return Ok(MergeRequest::Denied(format!(
                 "card {card_id} is {:?}, not awaiting_merge/needs_you/running",
                 card.state
@@ -1198,6 +1272,16 @@ mod tests {
         BoardService::new(state_dir, dir.to_path_buf(), Some(dir.join("home")))
     }
 
+    /// 空看板的 service：独立合并卡的用例不想要 `service_with_card` 那张实现卡来
+    /// 抢镜头（它排在最前，会先在拍 5 被 `launch` 出去）。
+    fn service_without_cards(dir: &std::path::Path) -> BoardService {
+        let state_dir = dir.join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let board = superpowers_kanban_core::board::Board::new();
+        persist::save_board(&state_dir.join("board.json"), &board).unwrap();
+        BoardService::new(state_dir, dir.to_path_buf(), Some(dir.join("home")))
+    }
+
     /// 再加一张排队卡（走内存 board + 落盘，与 `service_with_card` 同一份）。
     fn idle(ids: &[&str]) -> Vec<(String, bool)> {
         ids.iter().map(|id| (id.to_string(), true)).collect()
@@ -1538,8 +1622,20 @@ mod tests {
             .unwrap_or_else(|| panic!("card {id} not on the board"))
     }
 
-    /// 读一张卡的判词（经 `list`：这就是「人能读到的地方」）。
-    ///
+    /// 读一张卡记下的 `card_id → thread_id` 映射（解析结果，不是原始文本）。
+    /// 用 `list` 的口径：映射由插件持有（D5），`null` 就是「还没有会话」。
+    fn thread_of(service: &BoardService, id: &str) -> Option<String> {
+        service.list()["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["id"] == id)
+            .unwrap_or_else(|| panic!("card {id} not on the board"))["thread_id"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// 读一张卡的判词（经 `list`：这就是「人能读到的地方」）。    ///
     /// 「这张卡为什么失败」必须能从这里问出答案（spec §4.6：失败 → 原因取
     /// `error`），而不是只活在 daemon 的 stderr 里。
     fn detail_of(service: &BoardService, id: &str) -> Option<String> {
@@ -2457,6 +2553,173 @@ mod tests {
         assert_eq!(card_id, "card-1");
         assert!(objective.contains(&source), "{objective}");
         assert_eq!(state_of(&service, "card-1"), "merging");
+    }
+
+    /// 独立合并卡——`add-merge`（main.rs）/ `enqueue_merge`（dispatch.rs）的产物：
+    /// 出生即 `Queued`、`kind == Merge`、**没有** `thread_id`——必须能接进会话合并轮。
+    ///
+    /// 这是回归锁：`claim_next_merge` 随裸 git 通路退役后，合并轮一度只认「追加到
+    /// 已有会话」，这类卡的四条路全断（`next_startable` 排除非实现卡、收敛扫描只认
+    /// 实现卡、`merge_request` 拒 `Queued`、CLI `done` 要求 `awaiting_merge`），
+    /// 只能永远停在队列里。
+    ///
+    /// 三拍走完一整轮：开轮（`launch` 新会话）→ 回报 thread（**仍** `merging`）
+    /// → 会话空闲 → git 复核判否 → `needs_you`，且下一拍仍能再入轮（D9）。
+    #[test]
+    fn a_standalone_merge_card_runs_as_a_session_merge_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_without_cards(&project);
+        // 分支存在，但带着 main 没有的提交：这一轮的 git 事实就是「没并入」。
+        let source = "feature/x";
+        git_run(&project, &["checkout", "-q", "-b", source]);
+        std::fs::write(project.join("x.txt"), "x\n").unwrap();
+        git_run(&project, &["add", "x.txt"]);
+        git_run(&project, &["commit", "-qm", "feat"]);
+        git_run(&project, &["checkout", "-q", "main"]);
+        assert!(
+            !crate::merge::branch_merged_into(&project, source, "main"),
+            "用例前提：这条分支的 git 事实必须是「未并入」"
+        );
+        service.enqueue_merge_card_for_test("merge-1", source, "main", None);
+
+        // 拍 1：没有会话可追加 → 开一**个新会话**（`launch`）；卡随之 `merging`。
+        let DriverAction::Launch {
+            action_id,
+            card_id,
+            workdir,
+            objective,
+            ..
+        } = service
+            .driver_step(&[], &[])
+            .unwrap()
+            .expect("无会话的独立合并卡必须开出一轮合并会话")
+        else {
+            panic!("没有 thread_id 就没有「上一轮」可追加，必须 launch")
+        };
+        assert_eq!(card_id, "merge-1");
+        assert!(
+            objective.contains(source) && objective.contains("main"),
+            "objective 必须是合并轮文案（指名 source/base）：{objective}"
+        );
+        assert!(
+            !objective.contains("Never merge yourself"),
+            "合并轮绝不能带实现轮那句「不要自己合」：{objective}"
+        );
+        assert!(
+            workdir.starts_with(std::fs::canonicalize(&project).unwrap()),
+            "合并轮的 workdir 必须落在项目里：{}",
+            workdir.display()
+        );
+        assert_eq!(
+            state_of(&service, "merge-1"),
+            "merging",
+            "merge_request 的准入迁移本身就是名额的持久载体（D8）"
+        );
+
+        // 拍 2：宿主把会话 id 报回来 → 只落 `card_id → thread_id` 映射（D5）。
+        // 卡**必须仍是** `merging`：`mark_running` 会把刚钉住的名额翻回会话通路，
+        // 而 `merging → running` 在状态机里是刻意非法的。
+        let result = DriverResult {
+            action_id,
+            ok: true,
+            thread_id: Some("thread-merge-1".to_string()),
+            error: None,
+        };
+        assert!(
+            service
+                .driver_step(&busy(&["thread-merge-1"]), &[result])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state_of(&service, "merge-1"),
+            "merging",
+            "launch-for-merge 的回报只记映射，不得把卡翻回 running"
+        );
+        assert_eq!(
+            thread_of(&service, "merge-1").as_deref(),
+            Some("thread-merge-1")
+        );
+
+        // 拍 3：会话空闲 → 既有 git 复核（D10）收尾：git 判否 → `needs_you`。
+        assert!(
+            service
+                .driver_step(&idle(&["thread-merge-1"]), &[])
+                .unwrap()
+                .is_none(),
+            "收尾那一拍只有判词、没有动作"
+        );
+        assert_eq!(
+            state_of(&service, "merge-1"),
+            "needs_you",
+            "判词必须来自 git 事实，而不是模型的复述"
+        );
+        assert!(
+            detail_of(&service, "merge-1")
+                .unwrap_or_default()
+                .contains("is not merged into"),
+            "判词要说明这是一条 git 事实"
+        );
+
+        // 拍 4：git 判否的合并轮可自动重试（D9）；会话已在，故这一轮是 `append`。
+        let retry = service
+            .driver_step(&idle(&["thread-merge-1"]), &[])
+            .unwrap()
+            .expect("git 判否的合并轮要被自动重试");
+        assert!(
+            matches!(retry, DriverAction::Append { ref card_id, .. } if card_id == "merge-1"),
+            "{retry:?}"
+        );
+        assert_eq!(state_of(&service, "merge-1"), "merging");
+    }
+
+    /// launch-for-merge 失败：会话**从没起来**，卡不能永远抱着 `merging` 名额。
+    /// 与 `append` 失败同一处置——立刻走一次 git 复核把名额放掉（判否 → `needs_you`，
+    /// 之后由 D9 的有界重试接管）。
+    #[test]
+    fn a_failed_launch_for_a_standalone_merge_card_releases_the_merge_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_without_cards(&project);
+        // 分支存在，但带着 main 没有的提交：复核的 git 事实是「否」（若与 base
+        // 同点，复核会判「已并入」——那是另一条通路，这里要测的是失败释放名额）。
+        let source = "feature/x";
+        git_run(&project, &["checkout", "-q", "-b", source]);
+        std::fs::write(project.join("x.txt"), "x\n").unwrap();
+        git_run(&project, &["add", "x.txt"]);
+        git_run(&project, &["commit", "-qm", "feat"]);
+        git_run(&project, &["checkout", "-q", "main"]);
+        assert!(
+            !crate::merge::branch_merged_into(&project, source, "main"),
+            "用例前提：这条分支的 git 事实必须是「未并入」"
+        );
+        service.enqueue_merge_card_for_test("merge-1", source, "main", None);
+
+        let DriverAction::Launch { action_id, .. } = service
+            .driver_step(&[], &[])
+            .unwrap()
+            .expect("the merge round opens with a launch")
+        else {
+            unreachable!()
+        };
+        assert_eq!(state_of(&service, "merge-1"), "merging");
+
+        let result = DriverResult {
+            action_id,
+            ok: false,
+            thread_id: None,
+            error: Some("launcher down".to_string()),
+        };
+        service.driver_step(&[], &[result]).unwrap();
+
+        assert_ne!(
+            state_of(&service, "merge-1"),
+            "merging",
+            "会话没起来，`merging` 这个持久名额不能被永远占着"
+        );
+        assert_eq!(state_of(&service, "merge-1"), "needs_you");
+        assert_eq!(thread_of(&service, "merge-1"), None);
     }
 
     /// 会话自己跑完、没有提交 → `needs_you`。它**不是**合并轮失败，没有产出可合，
