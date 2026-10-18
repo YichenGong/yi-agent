@@ -844,8 +844,8 @@ export function ThreadSidebar({
           }}
           className={
             isChild
-              ? "flex items-center gap-1 px-2 py-1 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
-              : "flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
+              ? "flex items-center gap-1 px-2 py-1 text-base font-medium text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
+              : "flex items-center gap-1 px-2 py-1.5 text-base font-medium text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
           }
         >
           <button
@@ -1085,8 +1085,14 @@ export function ThreadSidebar({
           )}
           {/* 分组之间留一档空档：无间距时上一条会话与下一个文件夹头紧贴，多个文件夹
               连成一整列、看不出边界。`space-y-2` 只作用于兄弟之间，故首个分组之前
-              不多出空白，也不动置顶分区与组之间既有的留白。 */}
-          <div className="space-y-2">
+              不多出空白，也不动置顶分区与组之间既有的留白。
+              辅助线画在**每个分组的上面**（`> * + *` 排除了第一个分组）：文件夹名升到
+              text-base 之后，仅靠间距仍不够一眼分清"这条会话属于上面那个文件夹还是
+              下面那个"，一条线把归属切断。用上边框而非 `divide-y`——后者画在下一个
+              兄弟的**下边框**上，线会落在上一个分组的末尾、离文件夹头还有 8px（实测
+              上边框宽度 0px），不是"文件夹上方那条线"。颜色用语义 token `border-line`，
+              跟随主题。 */}
+          <div className="space-y-2 [&>*+*]:border-t [&>*+*]:border-line">
             {nested.top.map(({ group: g, children }) => renderGroupNode(g, children, 0))}
           </div>
         </div>
