@@ -1589,6 +1589,18 @@ pub(crate) struct Harness {
     /// 与主循环**共享**的回信登记表:测试据此扮演等待方(`AskLeadTool`
     /// 的 `blocking: true`)并断言主循环真的把组长那轮的文本回填了回来。
     pub(crate) lead_replies: crate::lead::LeadReplies,
+    /// 与主循环**共享**的组长写通道:Task 5 的测试据此直接投递写指令,
+    /// 断言主循环真的把它转成了对目标 thread 的动作。
+    ///
+    /// 本 Task 只把它接进 `Harness` 的 `RuntimeAttachments`(与 `lead_inbox` 同一
+    /// 手法),读者是 Task 5 的测试;接线前 clippy 会判成 dead_code,故暂放行——
+    /// **Task 5 落地后必须删掉下面两行 allow**。
+    #[allow(dead_code)]
+    pub(crate) lead_control: crate::lead_control::LeadControlInbox,
+    /// 与主循环**共享**的写结果登记表,同一手法:测试据此扮演组长工具,
+    /// 断言主循环执行完真的回填了结果。
+    #[allow(dead_code)]
+    pub(crate) lead_control_replies: crate::lead_control::LeadControlReplies,
     /// 与主循环**共享**的视图帧表:测试据此直接注入帧(模拟 Task 4 的工具写帧),
     /// 并断言 `thread/view/read` 读的是**同一张**表。自造第二份会读出一张空表。
     pub(crate) view_frames: crate::server::ViewFrames,
@@ -1765,6 +1777,10 @@ impl Harness {
         // 「等待方登记的名字被主循环真的回填了」——自造第二份会得到一个
         // 永远等不到回信的登记表。
         let lead_replies = crate::lead::LeadReplies::new();
+        // 组长写通道 + 结果登记表:同一手法(各 clone 进 `serve`,原件留在
+        // `Harness` 上),供 Task 5 的写指令集成测试直接投递并断言回填。
+        let lead_control = crate::lead_control::LeadControlInbox::new();
+        let lead_control_replies = crate::lead_control::LeadControlReplies::new();
         // 视图帧表:与主循环共享同一 `Arc`(注入进 `RuntimeAttachments`)。测试据此
         // 直接注入帧,断言 `thread/view/read` 读的是同一张表。
         let view_frames: crate::server::ViewFrames =
@@ -1805,6 +1821,8 @@ impl Harness {
                 // 收到,自造第二份会投进没人听的通道。
                 lead_inbox: lead_inbox.clone(),
                 lead_replies: lead_replies.clone(),
+                lead_control: lead_control.clone(),
+                lead_control_replies: lead_control_replies.clone(),
             },
             build,
             scope,
@@ -1824,6 +1842,8 @@ impl Harness {
             skills_home_dir: skills_home,
             lead_inbox,
             lead_replies,
+            lead_control,
+            lead_control_replies,
             view_frames,
         }
     }
@@ -3186,6 +3206,8 @@ async fn eof_exits_gracefully() {
             watchman_home: PathBuf::new(),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
+            lead_control: crate::lead_control::LeadControlInbox::new(),
+            lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
         build_test_agent,
     ));
@@ -3266,6 +3288,8 @@ async fn agent_factory_failure_returns_internal_error() {
             watchman_home: PathBuf::new(),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
+            lead_control: crate::lead_control::LeadControlInbox::new(),
+            lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
         |_s: Option<yi_agent_core::Session>,
          _cwd: &std::path::Path,
@@ -3348,6 +3372,8 @@ async fn oversized_frame_returns_err() {
             watchman_home: PathBuf::new(),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
+            lead_control: crate::lead_control::LeadControlInbox::new(),
+            lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
         build_test_agent,
     ));
@@ -15267,6 +15293,8 @@ impl MergedHarness {
                 watchman_home: PathBuf::new(),
                 lead_inbox: crate::lead::LeadInbox::new(),
                 lead_replies: crate::lead::LeadReplies::new(),
+                lead_control: crate::lead_control::LeadControlInbox::new(),
+                lead_control_replies: crate::lead_control::LeadControlReplies::new(),
             },
             build_test_agent,
             Scope::Admin,
