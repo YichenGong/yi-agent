@@ -147,6 +147,15 @@ impl Default for LeadInbox {
 /// `find_lead` 选的是另一个组长,而客户端还记着刚才那个。以 `find_lead` 的
 /// 结论为唯一出口,分歧就只在落盘内存在(见 `ThreadStore::find_lead` 的注释)。
 pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(ThreadMeta, bool)> {
+    // 卡片 worktree 不是项目:它没有组长,也绝不能有。堵在**落盘侧**是唯一
+    // 能止住幽灵组长的地方——真机上已经落错的那些(`role:"lead"` 且
+    // `board_project: None`,只有路径这条线索)由 `is_lead_meta` 在读时过滤。
+    if crate::thread_store::is_card_worktree(cwd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is a card worktree, not a project", cwd.display()),
+        ));
+    }
     if let Some(existing) = store.find_lead()? {
         return Ok((existing, false));
     }
@@ -464,5 +473,36 @@ mod tests {
         let body = format!("{out:?}");
         assert!(body.contains("先别动"), "must carry the reply: {body}");
         assert!(!out.is_error, "拿到回信不是错误: {body}");
+    }
+
+    /// 看板 worktree 不是项目:`ensure_lead_meta` 必须**拒绝**,绝不落盘组长。
+    ///
+    /// 真机数据里已有 9 个幽灵组长,全部由卡片会话 `ask_lead` 触发的这条路径
+    /// 落盘。落盘侧堵死,这类假组长才不会继续长出来。
+    #[test]
+    fn ensure_lead_meta_refuses_a_card_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join(".worktrees/kanban/card-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = ThreadStore::new(&worktree);
+        assert!(
+            ensure_lead_meta(&store, &worktree).is_err(),
+            "a card worktree is not a project and must not get a lead"
+        );
+        assert!(
+            store.find_lead().unwrap().is_none(),
+            "nothing may be persisted inside a card worktree"
+        );
+
+        // 普通项目目录照旧:拒绝的是**路径**,不是功能。
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_store = ThreadStore::new(&project);
+        let (meta, created) = ensure_lead_meta(&project_store, &project).expect("lead meta");
+        assert!(created);
+        assert_eq!(
+            project_store.find_lead().unwrap().unwrap().thread_id,
+            meta.thread_id
+        );
     }
 }

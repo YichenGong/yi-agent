@@ -984,13 +984,23 @@ fn build_runtime_tooling(
     // 普通会话用它给组长留言。`from_thread_id` 绑在装配期,与
     // `register_attached_root_tools_in_thread` 的 thread marker 同理由:
     // 模型看不到自己的 thread id,只能由装配期注入。
-    registry.register(Arc::new(
-        crate::lead::AskLeadTool::new(lead_inbox, project_key, thread_id.to_string())
-            // 回信能力**必须**在这里接上:漏掉它没有编译错误,`blocking: true`
-            // 只会静默退化成 P1 的显式拒绝。超时用共享常量,不写裸字面量——
-            // 两个 2 分钟各自漂移时,「等待方超时」与「组长还有多久回来」会脱钩。
-            .with_replies(lead_replies, crate::lead::ASK_LEAD_TIMEOUT),
-    ));
+    //
+    // 卡片会话(项目键落在 `.worktrees/kanban/` 下)**不注册**:它所在的那个
+    // worktree 不是项目、没有组长,`ask_lead` 只会把消息投进一个空邮箱,并在主
+    // 循环里经 `resolve_lead_target` 给 worktree 造一个假组长(真机已有 9 例)。
+    // 与 `find_lead`/`is_lead_meta` 同一判定来源(`project_key` 就是
+    // `<cwd>/.yi-agent` 的 canonical 串,去掉末段即 cwd)。
+    let state_dir = Path::new(&project_key);
+    let session_cwd = state_dir.parent().unwrap_or(state_dir);
+    if !crate::thread_store::is_card_worktree(session_cwd) {
+        registry.register(Arc::new(
+            crate::lead::AskLeadTool::new(lead_inbox, project_key, thread_id.to_string())
+                // 回信能力**必须**在这里接上:漏掉它没有编译错误,`blocking: true`
+                // 只会静默退化成 P1 的显式拒绝。超时用共享常量,不写裸字面量——
+                // 两个 2 分钟各自漂移时,「等待方超时」与「组长还有多久回来」会脱钩。
+                .with_replies(lead_replies, crate::lead::ASK_LEAD_TIMEOUT),
+        ));
+    }
     // lead_memory 只给组长:普通会话与子 worker 一律看不到(spec §7.5)。判定用
     // 落盘的 `ThreadMeta.role`(唯一权威),不靠标题/名字/cwd 猜——判定函数见
     // `lead_memory::is_lead_thread`。
@@ -3605,9 +3615,11 @@ pub(crate) fn thread_summary_json(
         "content_epoch": m.content_epoch,
         "last_item_id": m.last_item_id,
     });
-    // 只在确实是组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
-    // 的字节比对与快照测试失效,而我们只需要一个新值。
-    if m.role.as_deref() == Some(crate::thread_store::LEAD_ROLE) {
+    // 只在**合法**组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
+    // 的字节比对与快照测试失效,而我们只需要一个新值。卡片 worktree 里的
+    // `role:"lead"` 是误落盘的假组长(那个目录不是项目),绝不能经这条 wire 暴露,
+    // 否则侧栏会为它渲染出一条「组长」行。
+    if crate::thread_store::is_lead_meta(m) {
         value["role"] = json!("lead");
     }
     value
