@@ -47,14 +47,13 @@ use crate::workspace_index::WorkspaceIndex;
 use yi_agent_subagent::binding::RuntimeBinding;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
-/// 值守安装句柄。与 `server.rs` 里的私有 `type WatchmanInstall` 是**同一个**
-/// 类型(同一个 `Arc<dyn Fn ..>`),在对齐处互换无碍——故这里重声明一份,省下
-/// 「为搬移改 `server.rs` 的可见性」这一步。
+/// 值守安装句柄。与 `server.rs` 里的 `pub(crate) type WatchmanInstall` 是**同一个**
+/// 类型(同一个 `Arc<dyn Fn ..>`),在对齐处互换无碍。`ui/*` 与 `board/*` 都从那
+/// 一份类型走(本模块不再重复声明 `BoardLauncher`,它只被 detach 后的
+/// [`BoardPluginState`] 用到,直接引 `crate::server::BoardLauncher`)。
 pub(crate) type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
 /// 值守卸载句柄,同 [`WatchmanInstall`]。
 pub(crate) type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
-/// 看板守护进程启动器句柄,同 [`WatchmanInstall`]。
-pub(crate) type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
 
 /// 项目的共享 runtime 登记表(按 canonical cwd 键)。与 `server.rs` 里的私有
 /// `type ProjectRuntimes` 是**同一个**类型(同一个 `Arc<StdMutex<HashMap<..>>>`),
@@ -102,6 +101,47 @@ pub(crate) enum Flow {
     Continue,
     /// 方法不属于本域,交回 `serve()` 的原始 dispatch。
     Unknown,
+}
+
+/// [`Domain::Board`] 与 [`Domain::Plugin`] 的 handler 所需的全部状态。
+///
+/// 与 [`AppState`] 的**关键区别**：这里没有一个 `&mut`，全是 owned/`Arc`，故整份
+/// 可 move 进 `tokio::spawn` 的任务。这两个域因此可以脱离主循环执行（主循环是
+/// 单 task，内联 `await` 会串行堵住所有 thread 的 RPC）。
+pub(crate) struct BoardPluginState {
+    pub(crate) hub: std::sync::Arc<crate::broadcast::Broadcaster>,
+    pub(crate) client: crate::broadcast::ClientId,
+    pub(crate) board_dir: std::path::PathBuf,
+    pub(crate) resident_dir: std::path::PathBuf,
+    pub(crate) plugin_command: std::path::PathBuf,
+    pub(crate) theme_handle: crate::theme_tool::ThemeHandle,
+    pub(crate) watchman_home: std::path::PathBuf,
+    pub(crate) watchman_install: crate::server::WatchmanInstall,
+    /// 卸载句柄。本域无方法卸载值守(`board/remove` 只停守护进程),故当前无处
+    /// 读它——但它是 brief 声明的接口字段,与安装句柄成对,保留以免日后加
+    /// 「卸载值守」方法时又要动 `BoardPluginState` 的形状。与 `BoardCard` 的
+    /// `kind` / `source` / `base` 同一手法。
+    #[allow(dead_code)]
+    pub(crate) watchman_uninstall: crate::server::WatchmanUninstall,
+    pub(crate) board_launcher: crate::server::BoardLauncher,
+    /// detach 之后唯一需要回到主循环的信号：stdio `local` 写失败是致命的
+    /// （`driver_reports_finished_when_writer_fails` 钉死），而 detached 任务
+    /// 无法用 `?` 把它抛回去。
+    pub(crate) fatal_tx: tokio::sync::mpsc::Sender<anyhow::Error>,
+}
+
+/// 写一条响应；写失败（仅 stdio `local` 会失败）经 `fatal_tx` 上报主循环。
+///
+/// `_id` 保留在签名里（brief 的接口），但回包 `resp` 自身已携带 request id，
+/// 故函数体无需读它。
+pub(crate) async fn write_or_fatal(
+    state: &BoardPluginState,
+    _id: crate::protocol::RequestId,
+    resp: crate::protocol::ResponseEnvelope,
+) {
+    if let Err(error) = crate::server::write_response(&state.hub, &state.client, resp).await {
+        let _ = state.fatal_tx.send(error).await;
+    }
 }
 
 /// 一个 RPC 方法所属的域。`serve()` 先按它选模块,再由模块内的
@@ -180,9 +220,14 @@ pub(crate) fn domain_for(method: &str) -> Domain {
 /// 主循环的可变局部量(按域分批搬入,见 `batch 3` 一节)与 `batch 4` 新增的
 /// 宿主路径 / 组长信箱一组。三层里已全部有主:域 handler 需要的量都已在结构里
 /// 就位。唯一的构造点是 `serve()` 里的 `app_state!()` 宏,它按**字段名**逐项写出
-/// 34 个字段(见 [`AppState`] 各字段的注释),故加一个字段只需改该宏一处;同类型
-/// 的相邻字段因逐名写出而不会错位 —— 七个相邻的 `&Path`(`models_path` 到
-/// `watchman_home`)尤其需要这条保证。
+/// 32 个字段(见 [`AppState`] 各字段的注释),故加一个字段只需改该宏一处;同类型
+/// 的相邻字段因逐名写出而不会错位 —— 四个相邻的 `&Path`(`models_path` 到
+/// `onboarding_preferences_path`)尤其需要这条保证。
+///
+/// Task 4 把 `board/*` 与 `plugin/*` detach 出主循环后,这两域不再经本结构借
+/// 主循环局部量:原来只被它们读的 `board_dir` / `resident_dir` / `plugin_command` /
+/// `board_launcher` 已随处理搬进 [`BoardPluginState`],故从本结构移除(留着就是
+/// 死字段)。
 pub(crate) struct AppState<'a> {
     // ---- 响应出口与调用方 ----
     /// 广播出口:handler 用它定向回包(`write_response`)与做订阅
@@ -198,7 +243,7 @@ pub(crate) struct AppState<'a> {
     // ---- 路径与宿主偏好(共享只读) ----
     /// 生效的运行时配置。搬移前臂里的 `cfg`。
     pub(crate) cfg: &'a RuntimeConfig,
-    /// 主题句柄:`ui/settings/*` 读写它,`board/create` 用它取 workdir。
+    /// 主题句柄:`ui/settings/*` 读写它,`plugin/*` 用它取 workdir。
     /// 搬移前臂里的 `theme_handle`。
     pub(crate) theme_handle: &'a ThemeHandle,
     /// 机器级模型清单路径(`~/.yi-agent/models.json`)。搬移前臂里的
@@ -210,23 +255,14 @@ pub(crate) struct AppState<'a> {
     /// 引导是否已关闭的标记文件路径。搬移前臂里的
     /// `onboarding_preferences_path`。
     pub(crate) onboarding_preferences_path: &'a Path,
-    /// 看板注册表目录。搬移前臂里的 `board_dir`。
-    pub(crate) board_dir: &'a Path,
-    /// 常驻守护注册表目录。搬移前臂里的 `resident_dir`。
-    pub(crate) resident_dir: &'a Path,
-    /// 写进各项目 supervisor 清单的 `superpowers-kanban` 可执行文件路径。
-    /// 搬移前臂里的 `plugin_command`。
-    pub(crate) plugin_command: &'a Path,
     /// 值守安装/卸载所针对的 home。搬移前臂里的 `watchman_home`。
     pub(crate) watchman_home: &'a Path,
 
     // ---- 注入句柄(测试可替身) ----
     /// 安装常驻值守。搬移前臂里的 `watchman_install`。
     pub(crate) watchman_install: &'a WatchmanInstall,
-    /// 卸载常驻值守。搬移前臂里的 `watchman_uninstall`。
+    /// 卸载常驻值守。`ui/*` 的卸载臂用它。搬移前臂里的 `watchman_uninstall`。
     pub(crate) watchman_uninstall: &'a WatchmanUninstall,
-    /// 如何为项目拉起看板守护进程。搬移前臂里的 `board_launcher`。
-    pub(crate) board_launcher: &'a BoardLauncher,
 
     // ---- 主循环的可变局部量(按域逐批搬入) ----
     /// 分片上传登记表(`image/upload/*`)。搬移前臂里的 `uploads`,按 `&mut` 借用
@@ -302,4 +338,14 @@ pub(crate) struct AppState<'a> {
     /// (后者转交给组长工具集),故与 [`AppState::runtimes`] 同路按 `&` 借用。
     /// 搬移前臂里的 `lead_inbox`。
     pub(crate) lead_inbox: &'a crate::lead::LeadInbox,
+    /// 阻塞式 `ask_lead` 的回信登记表。`thread/start` 与 `thread/resume` 各把它
+    /// 交给 `start_thread_core` / `attach_delegation`(转交给 `AskLeadTool`),
+    /// 与 [`AppState::lead_inbox`] 同一实例、同一理由,故同样按 `&` 借用。
+    /// 搬移前臂里的 `lead_replies`。
+    pub(crate) lead_replies: &'a crate::lead::LeadReplies,
+    /// 待回填的阻塞式 `ask_lead` 登记表(按组长 thread_id 归组 request_id)。
+    /// `thread/resume` 与 `thread/delete` 经 `interrupt_and_wait_for_persist`
+    /// 消费 `turn_rx` 时替主循环收口,故与 [`AppState::turn_rx`] 同路按 `&mut`
+    /// 借用。搬移前臂里的 `pending_lead_replies`。
+    pub(crate) pending_lead_replies: &'a mut HashMap<String, Vec<String>>,
 }

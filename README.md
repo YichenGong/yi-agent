@@ -260,12 +260,12 @@ yi-agent --provider openai --model gpt-4o
 | ci-cd | 12 / 14 | [详情](docs/project-management/ci-cd.md) |
 | tooling | 3 / 3 | [详情](docs/project-management/tooling.md) |
 | yi-agent-mcp | 1 / 1 | [详情](docs/project-management/yi-agent-mcp.md) |
-| yi-agent-store | 6 / 7 | [详情](docs/project-management/yi-agent-store.md) |
+| yi-agent-store | 7 / 8 | [详情](docs/project-management/yi-agent-store.md) |
 | yi-agent-runtime | 13 / 13 | [详情](docs/project-management/yi-agent-runtime.md) |
 | yi-agent-subagent | 9 / 9 | [详情](docs/project-management/yi-agent-subagent.md) |
-| yi-agent-app-server | 43 / 43 | [详情](docs/project-management/yi-agent-app-server.md) |
+| yi-agent-app-server | 47 / 47 | [详情](docs/project-management/yi-agent-app-server.md) |
 | subagent-runtime | 44 / 52 | [详情](docs/project-management/subagent-runtime.md) |
-| desktop | 56 / 68 | [详情](docs/project-management/desktop.md) |
+| desktop | 59 / 71 | [详情](docs/project-management/desktop.md) |
 
 </details>
 

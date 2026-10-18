@@ -57,6 +57,21 @@ describe("summarize", () => {
     expect(summarize([{ state: "done" }, { state: "failed" }])).toBe("无待办");
   });
 
+  it("只有预排队的看板也算有待办", () => {
+    // 预排队是最左列，侧栏摘要却整类漏掉它：一块只放预排队卡的看板会显示
+    // 「无待办」，预排队追踪等于白做。
+    const cards = [{ state: "pre_queued" }];
+    const summary = summarize(cards);
+    expect(summary).not.toBe("无待办");
+    expect(summary).toContain("预排队");
+    expect(summary).toBe("1 预排队");
+  });
+
+  it("预排队排在摘要最前，与最左列的顺序一致", () => {
+    const cards = [{ state: "pre_queued" }, { state: "queued" }];
+    expect(summarize(cards)).toBe("1 预排队 · 1 排队");
+  });
+
   it("大小写不敏感（服务端可能回大写）", () => {
     expect(summarize([{ state: "QUEUED" }, { state: "Running" }])).toBe("1 排队 · 1 运行中");
   });

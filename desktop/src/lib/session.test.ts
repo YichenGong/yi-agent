@@ -872,3 +872,57 @@ describe("Session", () => {
     });
   });
 });
+
+describe("Session.adoptEpoch", () => {
+  it("drops the whole transcript when the epoch changed", () => {
+    const s = new Session();
+    s.adoptEpoch(1, "item-1");
+    s.items.push({ type: "agentMessage", id: "item-1", text: "old" });
+    s.lastServerItemId = "item-1";
+
+    const invalidated = s.adoptEpoch(2, null);
+
+    expect(invalidated).toBe(true);
+    expect(s.items).toEqual([]);
+    expect(s.lastServerItemId).toBeNull();
+    expect(s.contentEpoch).toBe(2);
+  });
+
+  it("only advances the cursor when the epoch matches", () => {
+    const s = new Session();
+    s.adoptEpoch(1, "item-1");
+    s.items.push({ type: "agentMessage", id: "item-1", text: "keep" });
+
+    const invalidated = s.adoptEpoch(1, "item-2");
+
+    expect(invalidated).toBe(false);
+    expect(s.items).toHaveLength(1);
+    expect(s.lastServerItemId).toBe("item-2");
+  });
+
+  it("records the epoch without invalidating on the first sighting", () => {
+    const s = new Session();
+    s.items.push({ type: "agentMessage", id: "item-1", text: "live" });
+
+    const invalidated = s.adoptEpoch(3, "item-1");
+
+    expect(invalidated).toBe(false);
+    expect(s.items).toHaveLength(1);
+    expect(s.contentEpoch).toBe(3);
+  });
+
+  it("sets epochInvalidated so a late cache read cannot re-inject stale items", () => {
+    const s = new Session();
+    s.adoptEpoch(1, "item-1");
+    s.adoptEpoch(2, null);
+    expect(s.epochInvalidated).toBe(true);
+  });
+
+  it("clears epochInvalidated on reset", () => {
+    const s = new Session();
+    s.adoptEpoch(1, "item-1");
+    s.adoptEpoch(2, null);
+    s.reset();
+    expect(s.epochInvalidated).toBe(false);
+  });
+});

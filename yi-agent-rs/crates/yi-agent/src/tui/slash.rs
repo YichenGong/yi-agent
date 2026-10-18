@@ -140,7 +140,9 @@ impl SlashCommand {
             // `default` 同 `/model` 是保留字（清空本会话覆盖、回落条目默认）。
             SlashCommand::Effort => Some("[none|minimal|low|medium|high|xhigh|max|default]"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
-            SlashCommand::Kanban => Some("[on|off|create|remove|status|run|add <spec> <plan>]"),
+            SlashCommand::Kanban => Some(
+                "[on|off|create|remove|status|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]",
+            ),
             SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
             // 其余变体的 usage 由 `control_spec()` 提供；没有 usage 的返回 `None`。
             _ => None,

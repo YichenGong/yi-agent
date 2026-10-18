@@ -4,6 +4,67 @@ use std::time::Duration;
 use crate::rpc::{Domain, domain_for};
 use crate::test_support::{EVENT_WAIT, isolated_models_path};
 
+/// detach 的前提：这两个域的状态必须是 `Send + Sync + 'static`，否则
+/// `tokio::spawn` 编译不过。这条断言就是「它们能脱离主循环执行」的编译期证明
+/// ——主循环是单 task，内联 `await` 会串行堵住所有 thread 的 RPC。
+#[test]
+fn board_and_plugin_shared_state_is_owned_and_send() {
+    fn assert_spawnable<T: Send + Sync + 'static>() {}
+    assert_spawnable::<crate::rpc::BoardPluginState>();
+}
+
+/// Task 4 的致命通道是**唯一**回到主循环的信号，故单独钉一次:detached handler
+/// 向已死的 stdio `local` 写响应失败时，`write_or_fatal` 必须把 `Err` 送上
+/// fatal 通道，而不是像对 ws 客户端那样吞掉。搬移前这条 `Err` 由内联
+/// `await ...?` 直接传播到主循环（`driver_reports_finished_when_writer_fails`
+/// 钉死），故本测试就是 detach 后的等价性证明。
+#[tokio::test]
+async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
+    use std::path::{Path, PathBuf};
+
+    let hub = crate::broadcast::Broadcaster::new();
+    let local = crate::broadcast::ClientId::local();
+    let _rx = hub.register(local.clone());
+    // 出口泵已死:对 `local` 的后续写入必然失败(与
+    // `write_response_to_a_gone_ws_client_is_not_fatal` 的反面同款)。
+    hub.unregister(&local);
+
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
+    let state = crate::rpc::BoardPluginState {
+        hub: std::sync::Arc::new(hub),
+        client: local,
+        board_dir: PathBuf::new(),
+        resident_dir: PathBuf::new(),
+        plugin_command: PathBuf::new(),
+        theme_handle: crate::theme_tool::ThemeHandle::new(std::env::temp_dir()),
+        watchman_home: PathBuf::new(),
+        watchman_install: std::sync::Arc::new(|_exe: &Path, _home: &Path| -> Result<(), String> {
+            Ok(())
+        }),
+        watchman_uninstall: std::sync::Arc::new(|_home: &Path| -> Result<(), String> { Ok(()) }),
+        board_launcher: std::sync::Arc::new(|_project: &Path| -> Result<bool, String> {
+            Ok(false)
+        }),
+        fatal_tx,
+    };
+
+    crate::rpc::write_or_fatal(
+        &state,
+        crate::protocol::RequestId::Num(1),
+        crate::server::ok_response(crate::protocol::RequestId::Num(1), serde_json::json!({})),
+    )
+    .await;
+
+    let error = tokio::time::timeout(EVENT_WAIT, fatal_rx.recv())
+        .await
+        .expect("a failed local write must report on the fatal channel, not be swallowed")
+        .expect("the fatal channel must carry the error");
+    assert!(
+        error.to_string().contains("disconnected"),
+        "the reported error must be write_response's local-disconnect error: {error}"
+    );
+}
+
 /// 单轮逻辑是共享的 `watch::once`(Task 3 已在其自身 crate 内测过);这里只
 /// 断言 app-server 用的是同名同款:读登记 → 把登记项目交给 ensurer。
 #[test]
@@ -83,6 +144,7 @@ fn a_git_project_gets_the_delegation_tools() {
         Vec::new(),
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -163,6 +225,7 @@ fn a_git_project_gets_the_show_git_diff_tool() {
         Vec::new(),
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
     )
     .expect("tooling")
     .registry
@@ -215,6 +278,7 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         Vec::new(),
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
     )
     .expect("tooling");
     let bash = tooling.registry.get("bash").expect("bash is registered");
@@ -231,6 +295,387 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         bash.sandbox_mode(),
         Some("danger-full-access"),
         "flipping the thread YOLO switch must escalate the root bash sandbox"
+    );
+}
+
+/// 生产装配必须把**同一个** `LeadReplies` 接进 `AskLeadTool`。
+///
+/// 这是本任务里唯一一处「漏了也没有编译错误」的接点:字段漏传、或忘了
+/// `.with_replies(..)`,`blocking: true` 只会静默退化成 P1 的显式拒绝
+/// (「not implemented」)。所以断言必须打在**装配出来的工具**上——它是
+/// 唯一能把「登记表真的接上了」与「登记表只是建出来放在别处」分开的观测点。
+#[test]
+fn the_assembly_hands_the_reply_registry_to_ask_lead() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+    let inbox = crate::lead::LeadInbox::new();
+    let replies = crate::lead::LeadReplies::new();
+
+    let tooling = build_runtime_tooling(
+        &cfg,
+        &root,
+        "thread-test",
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        "proj-test".to_string(),
+        inbox.clone(),
+        replies.clone(),
+    )
+    .expect("tooling");
+
+    // 扮演主循环:订阅信箱、取出投递携带的 `request_id`、按它回填。
+    // 这条路径只用到公开 API,故它同时钉住「装配接上了」与「登记表是同一个」。
+    let mut lead_rx = inbox.subscribe();
+    let block_on = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let text = block_on.block_on(async move {
+        let ask_lead = tooling
+            .registry
+            .get("ask_lead")
+            .expect("ask_lead must be registered");
+        let call = ask_lead.call(serde_json::json!({
+            "message": "需要你裁决 X",
+            "blocking": true,
+        }));
+        tokio::pin!(call);
+        let result = tokio::select! {
+            // 装配漏接时 `call` 立刻返回(P1 的显式拒绝),这一分支先就绪,
+            // 下面的断言据此报出真相,而不是干等 2 分钟超时。
+            result = &mut call => result,
+            envelope = lead_rx.recv() => {
+                let envelope = envelope.expect("the tool must deliver to the lead inbox");
+                let request_id = envelope
+                    .request_id
+                    .clone()
+                    .expect("blocking delivery must carry a request_id");
+                assert!(envelope.request_id.is_some(), "blocking delivery keeps its id");
+                assert!(
+                    replies.resolve(&request_id, "先别动".to_string()),
+                    "the registry the tool registered into must be the injected one"
+                );
+                // 回填后在同一个运行时里等工具收口(有界:回信已投递)。
+                tokio::time::timeout(Duration::from_secs(5), call)
+                    .await
+                    .expect("the tool must return once its request_id is resolved")
+            }
+        };
+        result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                yi_agent_core::ContentBlock::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<String>()
+    });
+
+    assert!(
+        !text.contains("not implemented"),
+        "the assembly must wire the reply registry instead of falling back to \
+         the P1 refusal: {text}"
+    );
+    assert!(
+        text.contains("先别动"),
+        "the waiting thread must receive the reply resolved for its request_id: {text}"
+    );
+    let _ = attached;
+}
+
+/// 组长私有的记忆工具只给组长:普通会话一个都看不到。
+///
+/// 负臂是本测试的重点。只断言「组长看得到」会漏掉最危险的接法——把判定写成
+/// 「有 meta 就是组长」或干脆无条件注册;那样组长那条断言照样绿,而每个普通
+/// 会话都悄悄拿到了写项目账本的权限。故这里同时钉:
+/// ① 落过盘但 `role: None` 的会话看不到;② 从未落过盘的会话也看不到;
+/// ③ 负臂会话的工具集非空(`ask_lead` 还在),证明「看不到」不是 registry 整体空掉。
+///
+/// 判定只看落盘的 `ThreadMeta.role`(唯一权威):测试里的正臂就走生产的
+/// `ensure_lead_meta` 造 meta,不手搓一个「像组长」的形状。
+#[test]
+fn only_the_lead_sees_the_memory_tools() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    // `build_runtime_tooling` 取的是 `root.handle()?.workspace_root`,而工具的
+    // `project_root` 取 `cfg.workdir`(= thread cwd)。本测试里 thread cwd 就是
+    // 仓库顶层,故二者重合(这也是把 store 根绑错也照样绿的原因——分歧情形由
+    // `a_lead_in_a_repo_subdirectory_sees_the_memory_tools` 覆盖)。
+    // 注意形态:workspace_root 是 cwd 的 **canonical** 形态(macOS 上
+    // `/var` → `/private/var`),与项目根是同一个目录,不是另一个路径。
+    let project_root = repo.path().canonicalize().expect("repo path canonicalizes");
+    assert_eq!(
+        attached.workspace_root, project_root,
+        "the thread's workspace root must be the project root"
+    );
+    // 两种拼写必须指向同一份 store:生产里 thread 的 cwd 走的是
+    // `resolve_thread_cwd` 的**非 canonical**(显式 cwd 才 canonicalize),
+    // 而 workspace_root 是 canonical 的。若二者不是同一个目录,下面「用
+    // cfg.workdir 建 store、也用 cfg.workdir 建 meta」就会各写各的,
+    // 判定便永远读不到 role——本断言先把这个前提钉死。
+    assert_eq!(
+        std::fs::canonicalize(cfg.workdir.as_path()).expect("workdir canonicalizes"),
+        attached.workspace_root,
+        "cfg.workdir and the attached workspace root must be the same directory"
+    );
+
+    // 组装 store 时用生产那种拼写(`cfg.workdir`,即 `cwd`,非 canonical),
+    // 装配里读 role 的 store 现在也取 `cfg.workdir`,两侧同源。而
+    // `workspace_root` 是 canonical 形态,故上面那条断言仍把「两种拼写指向
+    // 同一个物理目录」钉死:若二者不是同一目录,本测试会读不到自己写的
+    // meta,「组长看到工具」的断言就永远不会绿。
+    let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
+    store
+        .create(&crate::thread_store::ThreadMeta {
+            thread_id: "thread-plain".to_string(),
+            cwd: cfg.workdir.to_string_lossy().to_string(),
+            model: "test-model".to_string(),
+            created_at: 1,
+            updated_at: 1,
+            title: Some("组长".to_string()), // 标题写着「组长」也不许算组长
+            permission_mode: crate::thread_store::ThreadMode::Normal,
+            pin_seq: None,
+            board_project: None,
+            card_id: None,
+            model_ref: None,
+            reasoning_effort: None,
+            preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
+            role: None,
+            tag: None,
+            extra_roots: Vec::new(),
+        })
+        .expect("a plain meta must persist");
+    // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。
+    let (lead, _created) = crate::lead::ensure_lead_meta(&store, &project_root).expect("lead meta");
+    assert_eq!(
+        lead.role.as_deref(),
+        Some(crate::thread_store::LEAD_ROLE),
+        "the production lead path must persist the role"
+    );
+
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    let build = |thread_id: &str| {
+        build_runtime_tooling(
+            &cfg,
+            &root,
+            thread_id,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
+            crate::lead::LeadReplies::new(),
+        )
+        .expect("tooling")
+    };
+
+    let lead_names = build(&lead.thread_id).registry.names();
+    assert!(
+        lead_names.contains(&"lead_remember".to_string()),
+        "the lead must see lead_remember, got {lead_names:?}"
+    );
+    assert!(
+        lead_names.contains(&"lead_recall".to_string()),
+        "the lead must see lead_recall, got {lead_names:?}"
+    );
+
+    // 负臂:落过盘的普通会话,以及从未落过盘的会话。
+    for plain in ["thread-plain", "thread-never-persisted"] {
+        let names = build(plain).registry.names();
+        assert!(
+            !names.contains(&"lead_remember".to_string()),
+            "{plain} is not the lead and must not see lead_remember, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"lead_recall".to_string()),
+            "{plain} is not the lead and must not see lead_recall, got {names:?}"
+        );
+        // 非空 witnesses:「看不到」必须是真的缺席,而不是整个 registry 空掉。
+        assert!(
+            names.contains(&"ask_lead".to_string()),
+            "{plain} still gets the shared tools, got {names:?}"
+        );
+    }
+
+    // `project_root` 绑定必须是真的项目根:跑一次工具,账本要落在
+    // `<项目根>/.yi-agent/lead_memory/memory.md`。名字对了但路径绑错
+    // (例如绑到 `.yi-agent/threads/..`)会在这里露出来。
+    let lead_tooling = build(&lead.thread_id);
+    let remember = lead_tooling
+        .registry
+        .get("lead_remember")
+        .expect("the lead's registry must hold lead_remember");
+    let block_on = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let out = block_on.block_on(remember.call(serde_json::json!({ "text": "项目根绑定检查" })));
+    assert!(!out.is_error, "lead_remember must succeed: {out:?}");
+    assert!(
+        crate::lead_memory::memory_path(&project_root).exists(),
+        "the ledger must land under the project root, not somewhere else"
+    );
+}
+
+/// 组长的 cwd 落在 git 仓库的**子目录**时,两个记忆工具仍然必须可见。
+///
+/// 这是上一条测试抓不到的那一格:那里 thread cwd 就是仓库顶层,「读 role 的
+/// store 根」与「meta 的落盘处」恰好重合,于是把 store 根绑错成 git toplevel
+/// 也照样绿。生产里两者**会**分叉:`attach_project_runtime` 回传的
+/// `workspace_root` 是 daemon 的 `git rev-parse --show-toplevel`(root 以
+/// `ChildWriteMode::ReadOnly` 就地运行,位置取 `repository_root`),而组长 meta
+/// 写在 `<cwd>/.yi-agent/threads`。按 toplevel 去找子目录里的组长,`load` 回
+/// `Ok(None)`,真组长便静默丢掉两个工具。
+#[test]
+fn a_lead_in_a_repo_subdirectory_sees_the_memory_tools() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let subdir = repo.path().join("sub");
+    std::fs::create_dir_all(&subdir).expect("the subdirectory must exist");
+    // 进程 workdir 仍是仓库顶层(生产的 `cfg.workdir` 是进程级 workdir),
+    // 而**本会话的 cwd** 是子目录——分叉就发生在这里。
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    // 这两条断言是本测试有效性的前提:attach 回来的 `workspace_root` 是 git
+    // **顶层**,与会话 cwd(子目录)不是同一个目录。若它们不成立,本测试只是又
+    // 踩了一遍「两条路径重合」的情形,对「读错 store」毫无分辨力。
+    let toplevel = repo.path().canonicalize().expect("repo path canonicalizes");
+    assert_eq!(
+        attached.workspace_root, toplevel,
+        "the attached workspace root must be the git toplevel"
+    );
+    assert_ne!(
+        std::fs::canonicalize(&subdir).expect("the subdirectory canonicalizes"),
+        attached.workspace_root,
+        "the thread cwd must diverge from the attached workspace root"
+    );
+
+    // 组长 meta 落在**子目录**的 store 里,走生产的落盘路径,而不是手搓字段。
+    let cwd_store = crate::thread_store::ThreadStore::new(&subdir);
+    let (lead, _created) = crate::lead::ensure_lead_meta(&cwd_store, &subdir).expect("lead meta");
+    assert_eq!(
+        lead.cwd,
+        subdir.to_string_lossy().to_string(),
+        "the lead's cwd must be the subdirectory, not the toplevel"
+    );
+    // 分歧路径的见证:按 toplevel 去找,**读不到**这个组长(修复前的读法)。
+    // 这条一旦为真,下面的「工具可见」就不可能是靠 toplevel store 侥幸凑出来的。
+    assert!(
+        !crate::lead_memory::is_lead_thread(
+            &crate::thread_store::ThreadStore::new(&toplevel),
+            &lead.thread_id
+        ),
+        "the toplevel store must not hold this lead, otherwise this test would not \
+         exercise the divergent path"
+    );
+
+    // 与 `attach_delegation` 同形:先把 thread cfg 的 workdir 设成 thread cwd,
+    // 再装配。这正是生产里 `cfg.workdir` 与会话 cwd 同源的那一步。
+    let mut thread_cfg = cfg.clone();
+    thread_cfg.workdir = subdir.clone();
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+    let tooling = build_runtime_tooling(
+        &thread_cfg,
+        &root,
+        &lead.thread_id,
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        "proj-test".to_string(),
+        crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
+    )
+    .expect("tooling");
+    let names = tooling.registry.names();
+    assert!(
+        names.contains(&"lead_remember".to_string()),
+        "a lead whose cwd is a repo subdirectory must still see lead_remember, got {names:?}"
+    );
+    assert!(
+        names.contains(&"lead_recall".to_string()),
+        "a lead whose cwd is a repo subdirectory must still see lead_recall, got {names:?}"
+    );
+
+    // 账本必须与组长的 meta 落在**同一个** `.yi-agent` 下(即子目录),而不是
+    // toplevel:把 `project_root` 留在 toplevel,会让两个不同 project_key 的组长
+    // (`<repo>` 与 `<repo>/sub`)共用一份 `lead_memory/memory.md` —— 跨项目串味。
+    let remember = tooling
+        .registry
+        .get("lead_remember")
+        .expect("the lead's registry must hold lead_remember");
+    let block_on = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let out = block_on.block_on(remember.call(serde_json::json!({ "text": "子目录组长" })));
+    assert!(!out.is_error, "lead_remember must succeed: {out:?}");
+    assert!(
+        crate::lead_memory::memory_path(&subdir).exists(),
+        "the ledger must land in the subdirectory's .yi-agent, next to the lead's meta"
+    );
+    assert!(
+        !crate::lead_memory::memory_path(&toplevel).exists(),
+        "the ledger must not land at the toplevel: that key belongs to another project"
     );
 }
 
@@ -273,6 +718,7 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
         Vec::new(),
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
     )
     .expect("tooling")
     .registry
@@ -403,6 +849,7 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         &crate::git_diff_tool::GitDiffHandle::new(),
         Vec::new(),
         &crate::lead::LeadInbox::new(),
+        &crate::lead::LeadReplies::new(),
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
     let second = attach_delegation(
@@ -417,6 +864,7 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         &crate::git_diff_tool::GitDiffHandle::new(),
         Vec::new(),
         &crate::lead::LeadInbox::new(),
+        &crate::lead::LeadReplies::new(),
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
 
@@ -1013,6 +1461,9 @@ pub(crate) struct Harness {
     /// 与主循环**共享**的组长信箱:测试据此直接投递,验证主循环真的把它
     /// 转成了组长 thread 的一次输入。
     pub(crate) lead_inbox: crate::lead::LeadInbox,
+    /// 与主循环**共享**的回信登记表:测试据此扮演等待方(`AskLeadTool`
+    /// 的 `blocking: true`)并断言主循环真的把组长那轮的文本回填了回来。
+    pub(crate) lead_replies: crate::lead::LeadReplies,
 }
 
 /// 记录到的 watchman 调用:安装为 `true`、卸载为 `false`，附所针对的 home。
@@ -1182,6 +1633,10 @@ impl Harness {
         let models_dir = tempfile::TempDir::new().unwrap();
         // 组长信箱:先造一份,clone 进 `serve`,原件留在 `Harness` 上。
         let lead_inbox = crate::lead::LeadInbox::new();
+        // 回信登记表:同一手法(与主循环共享同一实例)。测试据此断言
+        // 「等待方登记的名字被主循环真的回填了」——自造第二份会得到一个
+        // 永远等不到回信的登记表。
+        let lead_replies = crate::lead::LeadReplies::new();
         let handle = tokio::spawn(serve_scoped(
             server_r,
             server_w,
@@ -1214,6 +1669,7 @@ impl Harness {
                 // sender):测试经 `lead_inbox` 直接投递的消息必须被主循环
                 // 收到,自造第二份会投进没人听的通道。
                 lead_inbox: lead_inbox.clone(),
+                lead_replies: lead_replies.clone(),
             },
             build,
             scope,
@@ -1232,6 +1688,7 @@ impl Harness {
             _watchman_home: watchman_home,
             skills_home_dir: skills_home,
             lead_inbox,
+            lead_replies,
         }
     }
 
@@ -1277,6 +1734,7 @@ impl Harness {
                 project_key: crate::thread_store::ThreadStore::new(workdir).project_key(),
                 from_thread_id: from_thread_id.to_string(),
                 text: text.to_string(),
+                request_id: None,
             })
             .expect("deliver");
     }
@@ -2181,6 +2639,7 @@ async fn eof_exits_gracefully() {
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
             lead_inbox: crate::lead::LeadInbox::new(),
+            lead_replies: crate::lead::LeadReplies::new(),
         },
         build_test_agent,
     ));
@@ -2259,6 +2718,7 @@ async fn agent_factory_failure_returns_internal_error() {
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
             lead_inbox: crate::lead::LeadInbox::new(),
+            lead_replies: crate::lead::LeadReplies::new(),
         },
         |_s: Option<yi_agent_core::Session>,
          _cwd: &std::path::Path,
@@ -2339,6 +2799,7 @@ async fn oversized_frame_returns_err() {
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
             lead_inbox: crate::lead::LeadInbox::new(),
+            lead_replies: crate::lead::LeadReplies::new(),
         },
         build_test_agent,
     ));
@@ -4240,6 +4701,8 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -5045,6 +5508,7 @@ async fn driver_ignores_interrupt_tagged_with_other_turn() {
             image_blocks: Vec::new(),
             image_refs: Vec::new(),
             display_text: "hi".into(),
+            lead_request_id: None,
         })
         .await
         .unwrap();
@@ -5170,6 +5634,7 @@ async fn driver_reports_finished_when_writer_fails() {
             image_blocks: Vec::new(),
             image_refs: Vec::new(),
             display_text: "hi".into(),
+            lead_request_id: None,
         })
         .await
         .unwrap();
@@ -5752,6 +6217,8 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -5860,6 +6327,8 @@ async fn a_turn_while_off_persists_without_credentials() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: false,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -5888,6 +6357,7 @@ async fn a_turn_while_off_persists_without_credentials() {
         None,
         &[],
         &[],
+        None,
         &agent,
         Vec::new(),
         None,
@@ -5956,6 +6426,8 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -5984,6 +6456,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
         None,
         &[],
         &[],
+        None,
         &agent,
         Vec::new(),
         None,
@@ -6205,6 +6678,7 @@ async fn driver_uses_unique_item_ids_across_turns() {
                 image_blocks: Vec::new(),
                 image_refs: Vec::new(),
                 display_text: "hi".into(),
+                lead_request_id: None,
             })
             .await
             .unwrap();
@@ -6727,6 +7201,7 @@ async fn stale_interrupt_does_not_cancel_turn_during_approval() {
             image_blocks: Vec::new(),
             image_refs: Vec::new(),
             display_text: "hi".into(),
+            lead_request_id: None,
         })
         .await
         .unwrap();
@@ -7237,6 +7712,66 @@ async fn list_all(h: &mut Harness) -> serde_json::Value {
     panic!("thread/listAll must respond");
 }
 
+/// 从 `thread/listAll` 响应里取某 thread 的 `content_epoch`。
+fn content_epoch_of(list: &serde_json::Value, thread_id: &str) -> u64 {
+    let row = find_listed(list, thread_id);
+    row["content_epoch"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("content_epoch must be present: {row}"))
+}
+
+/// 从 `thread/listAll` 响应里取某 thread 的 `last_item_id`（缺省/`null` → None）。
+fn last_item_id_of(list: &serde_json::Value, thread_id: &str) -> Option<String> {
+    find_listed(list, thread_id)["last_item_id"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// 在 groups 与 pinned 里查找某 thread 的 summary（两处都可能出现）。
+fn find_listed<'a>(list: &'a serde_json::Value, thread_id: &str) -> &'a serde_json::Value {
+    let in_groups = list["result"]["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|g| g["threads"].as_array().into_iter().flatten());
+    let in_pinned = list["result"]["pinned"].as_array().into_iter().flatten();
+    in_groups
+        .chain(in_pinned)
+        .find(|t| t["thread_id"] == serde_json::json!(thread_id))
+        .unwrap_or_else(|| panic!("thread {thread_id} must be listed: {list}"))
+}
+
+/// 列表必须携带版本字段，客户端才能自判「我是否落后」而不必逐个读日志。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_carries_content_epoch_and_last_item_id() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let listed = list_all(&mut h).await;
+    assert_eq!(
+        content_epoch_of(&listed, &tid),
+        0,
+        "a fresh thread must be listed at epoch 0: {listed}"
+    );
+    assert_eq!(
+        last_item_id_of(&listed, &tid),
+        None,
+        "a fresh thread has no items yet: {listed}"
+    );
+
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+
+    let listed = list_all(&mut h).await;
+    assert!(
+        last_item_id_of(&listed, &tid).is_some(),
+        "a persisted turn must record last_item_id: {listed}"
+    );
+    h.shutdown().await;
+}
+
 async fn add_workspace(h: &mut Harness, id: u64, path: &str) {
     h.send(
         &serde_json::json!({"jsonrpc":"2.0","id":id,"method":"workspace/add",
@@ -7275,6 +7810,8 @@ fn write_meta(
         reasoning_effort: None,
         tag: None,
         preserve_thinking: true,
+        content_epoch: 0,
+        last_item_id: None,
         extra_roots: Vec::new(),
         role: None,
     };
@@ -7765,8 +8302,784 @@ async fn a_delivered_message_reaches_the_lead_thread() {
     h.shutdown().await;
 }
 
+/// 造一个只够后台 tick 用的会话:`store` 指向 `project`(分组键由它算出),
+/// `status` 由调用方给定。其余字段(通道、进程管理器)只为把 struct 填满,
+/// tick 一个都不碰。
+fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> ThreadSession {
+    let (prompt_tx, _prompt_rx) = mpsc::channel(1);
+    let (interrupt_tx, _interrupt_rx) = mpsc::channel(1);
+    let (interject_tx, _interject_rx) = mpsc::channel(1);
+    let (session_tx, _session_rx) = mpsc::channel(1);
+    ThreadSession {
+        thread_id: thread_id.to_string(),
+        cwd: project.display().to_string(),
+        model: "test".to_string(),
+        active_turn_id: None,
+        yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+        process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        prompt_tx,
+        interrupt_tx,
+        interject_tx,
+        session_tx,
+        store: Arc::new(crate::thread_store::ThreadStore::new(project)),
+        status: Arc::new(StdMutex::new(status)),
+    }
+}
+
+/// 后台循环:一个卡住(等待审批)的 thread 必须让组长被唤醒,而且唤醒时注入的
+/// 文本里**带着这个 thread_id**。
+///
+/// 直接驱动抽出来的 `lead_tick_once`,而不是等 30s 的真实 tick:那条 `select!`
+/// 分支唯一做的事就是「把 `lead_tick_once` 的结果逐条投递」,断言它的返回值
+/// 等于断言「组长会被唤醒、收到什么」,不必观测一次真实的 LLM 轮。投递那半
+/// 由既有用例覆盖(`a_delivered_message_reaches_the_lead_thread` 走的正是同一条
+/// `deliver_to_lead`)。
+///
+/// 「卡住」用测试后门直接摆出 `status`:状态只活在进程内(`ThreadMeta` 没有
+/// status 字段),走一次真实审批请求需要拉整条 driver + provider 链路,那是在
+/// 测 driver,不是测本轮。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stuck_thread_wakes_the_lead_with_a_digest_naming_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().to_path_buf();
+    // 组长必须**先**存在:后台 tick 只认已有组长,绝不懒创建(懒创建是
+    // `thread/lead` 与 `resolve_lead_target` 的职责)。
+    let store = crate::thread_store::ThreadStore::new(&project);
+    let (lead_meta, _) = crate::lead::ensure_lead_meta(&store, &project).expect("lead meta");
+
+    let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+    // 被唤醒者:卡在等待审批上的会话。
+    threads.insert(
+        "thread-stuck".to_string(),
+        tick_test_session(&project, "thread-stuck", ThreadStatus::AwaitingApproval),
+    );
+    // 对照组:同一项目、同样有组长,但它没变化,不许被展开。
+    threads.insert(
+        "thread-idle".to_string(),
+        tick_test_session(&project, "thread-idle", ThreadStatus::Idle),
+    );
+
+    let deliveries = lead_tick_once(&mut threads);
+    assert_eq!(deliveries.len(), 1, "只有一个项目有变化");
+    let delivery = &deliveries[0];
+    assert_eq!(
+        delivery.lead.thread_id, lead_meta.thread_id,
+        "唤醒的必须是该项目的组长"
+    );
+    assert!(
+        delivery.text.contains("thread-stuck"),
+        "注入必须点名那个卡住的 thread:{}",
+        delivery.text
+    );
+    assert!(
+        !delivery.text.contains("thread-idle"),
+        "没变化的 thread 不该出现在注入里:{}",
+        delivery.text
+    );
+
+    // 反向:卡住解除后就不许再唤醒——低频兜底的意义是省钱,不是定时烧 token。
+    *threads
+        .get("thread-stuck")
+        .unwrap()
+        .status
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = ThreadStatus::Idle;
+    assert!(
+        lead_tick_once(&mut threads).is_empty(),
+        "全部 idle 时后台兜底不得唤醒任何人"
+    );
+}
+
+/// 后台 tick **绝不**替项目懒创建组长:没有组长就没有投递(落盘也不许冒出
+/// 一个被兜底顺手造出来的组长)。
+#[tokio::test(flavor = "multi_thread")]
+async fn the_background_tick_never_creates_a_lead() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().to_path_buf();
+    let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+    threads.insert(
+        "thread-stuck".to_string(),
+        tick_test_session(&project, "thread-stuck", ThreadStatus::AwaitingApproval),
+    );
+
+    assert!(
+        lead_tick_once(&mut threads).is_empty(),
+        "没有组长时该整组跳过,而不是被兜底顺手造一个"
+    );
+    assert!(
+        crate::thread_store::ThreadStore::new(&project)
+            .find_lead()
+            .unwrap()
+            .is_none(),
+        "落盘上不得出现任何由后台循环创建的组长"
+    );
+}
+
 /// 用 `RecordingProvider` 建 agent,并把每次对话调用看到的 message 数记进 `seen`。
 /// 与 `build_test_agent_with_provider` 同一夹具,只是把 provider 换成记账的那款。
+/// 组长那轮的回复文本必须是**本条纯函数**取出的那条助手消息。
+///
+/// 这是阻塞式 `ask_lead` 的最后一环:登记表(`LeadReplies`)按 `request_id`
+/// 收口,而收口时回填的正是这里的返回值。抽取逻辑本身复用
+/// `completed_items_agent_text`(与标题生成同口径),故本用例同时钉住
+/// 「抽出来的就是本轮助手文本」与「它能被回填到对应 request_id」。
+#[tokio::test]
+async fn a_registered_request_id_receives_the_leads_reply_text() {
+    let items = vec![
+        crate::protocol::Item::UserMessage {
+            id: "u1".to_string(),
+            text: "[来自会话 thread-sender-1] 需要你裁决 X".to_string(),
+            attachments: Vec::new(),
+            images: Vec::new(),
+        },
+        crate::protocol::Item::AgentMessage {
+            id: "a1".to_string(),
+            text: "先别动".to_string(),
+        },
+    ];
+
+    let replies = crate::lead::LeadReplies::new();
+    let rx = replies.register("lead-ask-x".to_string());
+    let reply = lead_reply_text(&items).expect("本轮有非空助手消息,必须取出它的文本作为组长的回复");
+    assert_eq!(reply, "先别动");
+
+    assert!(
+        replies.resolve("lead-ask-x", reply.clone()),
+        "登记过的 request_id 必须能被回填"
+    );
+    assert_eq!(
+        rx.await.expect("回填后回信通道不应关闭"),
+        reply,
+        "等待方收到的必须正是组长那轮的助手文本"
+    );
+}
+
+/// 没有助手消息的一轮(纯工具轮 / 失败轮)不得凭空造出一条回复。
+#[test]
+fn lead_reply_text_is_none_without_an_agent_message() {
+    let only_user = vec![crate::protocol::Item::UserMessage {
+        id: "u1".to_string(),
+        text: "需要你裁决 X".to_string(),
+        attachments: Vec::new(),
+        images: Vec::new(),
+    }];
+    assert!(
+        lead_reply_text(&only_user).is_none(),
+        "只有用户提问的一轮没有可回填的回复"
+    );
+
+    // 空白助手消息视同不存在:与 `completed_items_agent_text` 同口径,
+    // 否则等待方会收到一条空回复,比超时更难排查。
+    let blank = vec![crate::protocol::Item::AgentMessage {
+        id: "a1".to_string(),
+        text: "   ".to_string(),
+    }];
+    assert!(
+        lead_reply_text(&blank).is_none(),
+        "空文本的助手消息不算回复"
+    );
+}
+
+/// 阻塞式 `ask_lead` 的整条生产链路:工具投递 → 主循环转成组长的一轮 →
+/// 组长那轮收尾时把回复按 `request_id` 回填给等待中的 thread。
+///
+/// 刻意走**真的** `AskLeadTool` + `Harness::lead_repliers`(与主循环共享同一
+/// 实例):装配漏掉 `with_replies` 时,这里会退化成 P1 的显式拒绝而非静默
+/// 超时,故本用例同时钉住「装配接上了」与「主循环回填了」两件事。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocking_ask_lead_receives_the_lead_reply() {
+    use yi_agent_core::Tool as _;
+
+    let (mut h, dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    // 先确保项目里有组长(与真实用户路径一致:侧栏点过组长会话)。
+    let _ = rpc(&mut h, 2, "thread/lead", serde_json::json!({})).await;
+
+    let tool = crate::lead::AskLeadTool::new(
+        h.lead_inbox.clone(),
+        crate::thread_store::ThreadStore::new(dir.path()).project_key(),
+        "thread-sender-1".to_string(),
+    )
+    .with_replies(h.lead_replies.clone(), crate::lead::ASK_LEAD_TIMEOUT);
+
+    // 等待方就是这条工具调用本身:它内部 `timeout(ASK_LEAD_TIMEOUT, rx)`
+    // 之外再套一层更短的看门狗,失败时给出「没收到回复」而非挂满 2 分钟。
+    let result = tokio::time::timeout(
+        EVENT_WAIT,
+        tool.call(serde_json::json!({
+            "message": "需要你裁决 X",
+            "blocking": true,
+        })),
+    )
+    .await
+    .expect("blocking ask_lead must be answered by the lead turn, not left hanging");
+
+    let text = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            yi_agent_core::ContentBlock::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert!(!result.is_error, "blocking ask_lead must not fail: {text}");
+    assert!(
+        text.contains("组长回复："),
+        "must be the reply path, not the one-way delivery: {text}"
+    );
+    // `MockProvider` 的助手文本恒为 "hi":断言回填的确实是**组长那轮**的文本。
+    assert!(
+        text.contains("hi"),
+        "the waiting thread must receive the lead turn's own reply: {text}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 从工具结果里取出文本块(本文件既有的断言都这么取,抽出来只为复用)。
+fn tool_text(result: &yi_agent_core::ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            yi_agent_core::ContentBlock::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect::<String>()
+}
+
+/// 迟到的投递之后停留多久(见 [`LeadEchoProvider`])。
+///
+/// 主循环此刻是空闲的 `select` 循环,吃下这条投递只需微秒级;这个窗口只是把
+/// 「机器忙」从复现条件里排除掉,不承担任何断言强度。
+const LATE_ASK_WINDOW: Duration = Duration::from_millis(300);
+
+/// 组长那轮的 provider:回显本轮最后一条用户文本,于是**每一轮的回复天然可
+/// 辨识**(回复里带着"这一轮在回答谁"的记号)。这是下面两个用例能区分"A 的
+/// 回复"与"B 的回复"的前提——`MockProvider` 的文本恒为 "hi",两个提问人收到
+/// 谁的回信都一样,根本钉不住"第二个拿到了第一个的回复"。
+///
+/// 首次对话调用(标题请求不计)时额外做一件事:把一个**阻塞式 `ask_lead`**
+/// 扔进这一轮的窗口里,再停留 [`LATE_ASK_WINDOW`]。这是复刻"同一组长已经有
+/// 一轮在跑,另一个会话才阻塞进来"的唯一可靠窗口:投递发生在组长那轮**收尾
+/// 之前**,而主循环此刻唯一的就绪分支就是这条投递(`turn_rx` 还没有任何事件),
+/// 故这条 `request_id` 必定与那一轮同时挂在同一组长的待回填队列上。
+struct LeadEchoProvider {
+    /// 对话调用计数(标题请求不计),让上面那件事只发生一次。
+    conversation_calls: AtomicUsize,
+    /// 首次调用时投递的"迟到提问人"。用例在 harness 建好之后才填进来(它要用
+    /// harness 的共享信箱与登记表),故用 `Mutex` 而非构造期注入。
+    late_asker: std::sync::Mutex<Option<Arc<crate::lead::AskLeadTool>>>,
+    /// 迟到提问人收到的文本。
+    late_reply: Arc<tokio::sync::Mutex<Option<String>>>,
+}
+
+impl LeadEchoProvider {
+    fn new(late_reply: Arc<tokio::sync::Mutex<Option<String>>>) -> Self {
+        Self {
+            conversation_calls: AtomicUsize::new(0),
+            late_asker: std::sync::Mutex::new(None),
+            late_reply,
+        }
+    }
+
+    fn set_late_asker(&self, tool: Arc<crate::lead::AskLeadTool>) {
+        *self.late_asker.lock().unwrap_or_else(|p| p.into_inner()) = Some(tool);
+    }
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for LeadEchoProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::message::{ContentBlock, Role};
+
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(Box::pin(futures::stream::iter(vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("t".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])));
+        }
+        if self.conversation_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            let late = self
+                .late_asker
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone();
+            if let Some(tool) = late {
+                let slot = Arc::clone(&self.late_reply);
+                tokio::spawn(async move {
+                    use yi_agent_core::Tool as _;
+                    let result = tool
+                        .call(serde_json::json!({
+                            "message": "要你裁决 A",
+                            "blocking": true,
+                        }))
+                        .await;
+                    *slot.lock().await = Some(tool_text(&result));
+                });
+                // 等主循环把这条迟到投递叠进**本轮**组长的待回填队列。
+                tokio::time::sleep(LATE_ASK_WINDOW).await;
+            }
+        }
+        let text = req
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .and_then(|m| {
+                m.content.iter().find_map(|block| match block {
+                    ContentBlock::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default();
+        let events = vec![
+            yi_agent_core::provider::ProviderEvent::TextDelta(text),
+            yi_agent_core::provider::ProviderEvent::Stop {
+                reason: yi_agent_core::provider::StopReason::EndTurn,
+            },
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// 等迟到提问人的回信落进槽位(失败信息直指"谁没收到回复",而不是一句超时)。
+async fn await_reply_slot(slot: &Arc<tokio::sync::Mutex<Option<String>>>, who: &str) -> String {
+    let deadline = std::time::Instant::now() + EVENT_WAIT;
+    loop {
+        if let Some(text) = slot.lock().await.clone() {
+            return text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{who} never received a reply"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 用回显 provider 建一个 harness,并返回 (harness, workdir 持有者, 迟到回信槽位)。
+///
+/// 与 [`isolated_harness`] 的差别只有 provider:后者是 `MockProvider`(文本恒为
+/// "hi"),无法区分两个提问人收到的回信。
+async fn echo_lead_harness() -> (
+    Harness,
+    tempfile::TempDir,
+    Arc<LeadEchoProvider>,
+    Arc<tokio::sync::Mutex<Option<String>>>,
+) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let late_reply = Arc::new(tokio::sync::Mutex::new(None));
+    let provider = Arc::new(LeadEchoProvider::new(Arc::clone(&late_reply)));
+    let factory_provider: Arc<dyn yi_agent_core::Provider> = provider.clone();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(Arc::clone(&factory_provider), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    (h, dir, provider, late_reply)
+}
+
+/// 建一个指向该 harness 共享信箱/登记表的阻塞式提问人工具。
+fn ask_lead_tool(h: &Harness, workdir: &Path, from: &str) -> Arc<crate::lead::AskLeadTool> {
+    Arc::new(
+        crate::lead::AskLeadTool::new(
+            h.lead_inbox.clone(),
+            crate::thread_store::ThreadStore::new(workdir).project_key(),
+            from.to_string(),
+        )
+        .with_replies(h.lead_replies.clone(), crate::lead::ASK_LEAD_TIMEOUT),
+    )
+}
+
+/// **同一个组长被两个会话同时阻塞等待时,第二个提问人不得收到第一个的回复。**
+///
+/// 复刻:提问人 A 先阻塞,于是组长跑起第一轮;A 那一轮的 provider 在收尾**之前**
+/// 把提问人 B 也投了进来——组长的待回填队列此刻是 `[A, B]`。那一轮收尾时只该用
+/// **这一轮**的文本回填 A;B 必须等它自己那一轮,而不是拿到 A 的答案。
+///
+/// 修复前:`settle_pending_lead_replies` 把整条队列一次取走,两个 id 都用 A 那轮
+/// 的文本回填,B 于是收到 A 的答案(下面的 `assert_ne` / `!contains` 会失败)。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_asker_on_the_same_lead_gets_its_own_reply() {
+    use yi_agent_core::Tool as _;
+
+    let (mut h, dir, provider, late_reply) = echo_lead_harness().await;
+    // 与真实路径一致:侧栏点过组长会话(否则投递时才懒建 meta,不影响本用例)。
+    let lead = rpc(&mut h, 2, "thread/lead", json!({})).await;
+    assert!(lead.get("error").is_none(), "{lead}");
+
+    provider.set_late_asker(ask_lead_tool(&h, dir.path(), "thread-asker-B"));
+
+    // 提问人 A 先阻塞:组长因此跑起第一轮;A 那一轮的 provider 会在收尾前把 B
+    // 也投进来,于是两个 request_id 挂在同一个组长的队列上。
+    let asker_a = ask_lead_tool(&h, dir.path(), "thread-asker-A");
+    let first = tokio::spawn({
+        let tool = Arc::clone(&asker_a);
+        async move {
+            tool.call(serde_json::json!({
+                "message": "要你裁决 A",
+                "blocking": true,
+            }))
+            .await
+        }
+    });
+    let a_text = tool_text(
+        &tokio::time::timeout(EVENT_WAIT, first)
+            .await
+            .expect("the first asker must be answered by the lead turn, not left hanging")
+            .expect("the first asker's task must not panic"),
+    );
+    let b_text = await_reply_slot(&late_reply, "the second asker").await;
+
+    assert!(
+        a_text.contains("thread-asker-A"),
+        "the first asker must receive the reply of its own turn: {a_text}"
+    );
+    assert!(
+        b_text.contains("thread-asker-B"),
+        "the second asker must receive the reply of its own turn: {b_text}"
+    );
+    assert_ne!(
+        a_text, b_text,
+        "two askers queued on one lead must receive distinct replies"
+    );
+    assert!(
+        !b_text.contains("thread-asker-A"),
+        "the second asker must NOT receive the first asker's reply: {b_text}"
+    );
+
+    h.shutdown().await;
+}
+
+/// **一轮不携带 `lead_request_id` 的组长 turn 不得回填任何等待方。**
+///
+/// 复刻:用户单向投递给组长(与 `ask_lead` 的 `blocking: false` 同款,没有
+/// `request_id`),这一轮的 provider 在收尾前把提问人 A 也投了进来。用户那一轮
+/// 收尾时不能把自己的文本塞给正在等回信的 A——A 只能等**它自己**那一轮。
+///
+/// 修复前:整条队列被那一轮取走,A 收到用户的话(下面的断言会失败)。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lead_turn_without_a_request_id_answers_nobody() {
+    const USER_TEXT: &str = "用户直接问组长";
+
+    let (h, dir, provider, late_reply) = echo_lead_harness().await;
+    provider.set_late_asker(ask_lead_tool(&h, dir.path(), "thread-asker-A"));
+
+    // 用户单向说话:这一轮不含任何 `lead_request_id`。
+    Harness::deliver_lead_message_for_test(&h, dir.path(), "thread-sender-U", USER_TEXT);
+
+    let a_text = await_reply_slot(&late_reply, "the waiting asker").await;
+    assert!(
+        a_text.contains("thread-asker-A"),
+        "the waiting asker must be answered by its own turn: {a_text}"
+    );
+    assert!(
+        !a_text.contains(USER_TEXT),
+        "a lead turn carrying no request_id must not answer a waiting asker: {a_text}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 闸门式 provider:第 1 次**对话**调用挂起在闸门上(模拟"后台的 LLM 调用
+/// 已在飞、响应还没回来"的窗口),放行后吐一个工具调用;第 2 次对话调用把收到
+/// 的消息原样记下来再收尾。
+///
+/// 标题生成(`system == TITLE_INSTRUCTIONS`)不是对话轮次,立刻答:否则它会把
+/// 闸门的第 1 次让掉,测试就永远等不到「后台正在跑」这个落点。
+struct GatedToolProvider {
+    conversation_calls: AtomicUsize,
+    /// 后台已进入第 1 次对话调用(后台 turn 确实在跑)。
+    entered: Arc<tokio::sync::Notify>,
+    /// 放行第 1 次调用(测试用它把「后台的模型调用在飞」这一段精确框出来)。
+    release: Arc<tokio::sync::Notify>,
+    /// 第 2 次及以后每次对话调用收到的完整消息列表。
+    later_messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>>,
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for GatedToolProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::provider::{ProviderEvent as E, StopReason};
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(futures::stream::iter(vec![
+                E::TextDelta("t".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ])
+            .boxed());
+        }
+        if self.conversation_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // 后台这一轮停在"模型调用在飞"的窗口里,直到测试放行。
+            self.entered.notify_one();
+            self.release.notified().await;
+            return Ok(futures::stream::iter(vec![
+                E::ToolUseStart {
+                    id: "c1".into(),
+                    name: "glob".into(),
+                },
+                E::ToolUseDelta {
+                    id: "c1".into(),
+                    partial_json: r#"{"pattern":"*.md"}"#.into(),
+                },
+                E::ToolUseEnd { id: "c1".into() },
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ])
+            .boxed());
+        }
+        self.later_messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(req.messages.clone());
+        Ok(futures::stream::iter(vec![
+            E::TextDelta("background done".into()),
+            E::Stop {
+                reason: StopReason::EndTurn,
+            },
+        ])
+        .boxed())
+    }
+}
+
+fn gated_lead_factory(
+    provider: Arc<GatedToolProvider>,
+) -> impl Fn(
+    Option<yi_agent_core::Session>,
+    &Path,
+    crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent>
++ Send
++ Sync
++ 'static {
+    let provider: Arc<dyn yi_agent_core::Provider> = provider;
+    move |session, cwd, mode| {
+        build_test_agent_with_provider(Arc::clone(&provider), session, cwd, mode)
+    }
+}
+
+/// **前台请求让后台 turn 在工具边界让位**(spec §6.3;计划 Task 8)。
+///
+/// 复刻:组长的一轮**后台** turn 正在跑(provider 已进入第 1 次对话调用、还
+/// 没回来——即"后台的 LLM 调用在飞"),此刻前台来一条请求。断言四件事:
+///
+/// 1. 前台请求**当场被接受**(`turn/interject` 立刻返回 `turn_id` +
+///    `interjection_id`),不必等后台那次模型调用回来;
+/// 2. 投影(`thread/list`)在这期间照常秒回——它读同一份状态,不等后台的 LLM
+///    调用(spec §6.3 第三条「前台是投影」);
+/// 3. 放行后台的模型调用后,它在**工具边界**(ACT 之后、下一次 THINK 之前)
+///    折叠前台文本(`inject_pending`),文本带 `INTERJECTION_PREFIX` 进了同一
+///    turn 的下一次请求,且**已完成那一轮的进度不丢**(工具结果仍在上下文里);
+/// 4. 这一切都发生在**同一个 turn** 里(收尾的 `turn_id` 与前台请求拿到的
+///    `turn_id` 相同),前台文本也**没有**被退回给客户端。
+///
+/// 这一整条链**只用既有原语**:driver 的 `select!` 在 turn 运行期间就轮询
+/// `interject_rx`(`server.rs` 的 driver 内层 select),消息进 core 的 inbox,
+/// 由 `inject_pending` 在边界折叠。故本任务零 core 改动。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_foreground_request_makes_the_background_turn_yield() {
+    const BACKGROUND: &str = "后台自己找的活";
+    const FOREGROUND: &str = "用户刚说的话";
+    /// `INTERJECTION_PREFIX` 里稳定的一段:证明文本是**折叠**进来的,而不是
+    /// 被当成一个全新 prompt 重放。
+    const PREFIX_MARKER: &str = "Fold it into the current task";
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let provider = Arc::new(GatedToolProvider {
+        conversation_calls: AtomicUsize::new(0),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+        later_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
+    });
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(
+        cfg,
+        gated_lead_factory(Arc::clone(&provider)),
+        PERMISSION_TIMEOUT,
+    );
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    // 组长 meta 先落盘(真实用户路径:侧栏点过组长会话)。此刻它**还没有**
+    // driver,故下面的投递走冷启动路径——`prepare_turn_core` 会占住
+    // `active_turn_id`,这正是前台请求能被路由到**这一轮**的凭据。
+    let lead = rpc(&mut h, 2, "thread/lead", json!({})).await;
+    let lead_id = lead["result"]["thread_id"]
+        .as_str()
+        .expect("thread/lead must answer with a thread_id")
+        .to_string();
+
+    // ---- 后台 turn 起来:真走生产投递路径(lead_inbox → 主循环 → 组长 driver)----
+    Harness::deliver_lead_message_for_test(&h, dir.path(), "thread-sender-1", BACKGROUND);
+
+    // 等后台这一轮真的跑起来(provider 已进入第 1 次对话调用、尚未返回)。
+    tokio::time::timeout(EVENT_WAIT, provider.entered.notified())
+        .await
+        .expect("the background lead turn must reach its provider call");
+
+    // ---- 前台请求:后台还在跑(模型调用在飞)时就投,必须当场被接受 ----
+    let accepted_at = std::time::Instant::now();
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/interject","params":{{"threadId":"{lead_id}","input":[{{"type":"text","text":"{FOREGROUND}"}}]}}}}"#
+    ))
+    .await;
+    let interjected = read_response(&mut h, 3).await;
+    assert!(
+        interjected.get("error").is_none(),
+        "a foreground request must be accepted while the background turn runs: {interjected}"
+    );
+    let turn_id = interjected["result"]["turn_id"]
+        .as_str()
+        .expect("an accepted interjection must name its turn")
+        .to_string();
+    assert!(
+        interjected["result"]["interjection_id"].as_str().is_some(),
+        "expected an interjection_id: {interjected}"
+    );
+    assert!(
+        accepted_at.elapsed() < Duration::from_secs(5),
+        "accepting a foreground request must not wait for the background LLM call: took {:?}",
+        accepted_at.elapsed()
+    );
+
+    // ---- 投影:「前台是投影」——读同一份状态的 RPC 此刻照常秒回 ----
+    let projected_at = std::time::Instant::now();
+    h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/list","params":{}}"#)
+        .await;
+    let listed = read_response(&mut h, 4).await;
+    assert!(
+        listed["result"]["threads"].is_array(),
+        "thread/list must answer while the background turn is running: {listed}"
+    );
+    assert!(
+        projected_at.elapsed() < Duration::from_secs(5),
+        "the projection must not wait for the background turn: took {:?}",
+        projected_at.elapsed()
+    );
+    // 后台那一轮此刻仍卡在它的模型调用上——上面的「秒回」才有意义。
+    assert!(
+        provider
+            .later_messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "the background turn must still be blocked in its provider call here"
+    );
+
+    // ---- 放行后台的模型调用:它做完工具调用后,在下一次 THINK 前折叠前台文本 ----
+    provider.release.notify_one();
+
+    let mut completed: Option<serde_json::Value> = None;
+    let mut folded_item: Option<serde_json::Value> = None;
+    let mut returned: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..200 {
+        let v = h.read_value().await;
+        match v.get("method").and_then(|m| m.as_str()) {
+            Some("item/started") | Some("item/completed") => {
+                let item = &v["params"]["item"];
+                if item["type"] == "userInterjection" {
+                    folded_item = Some(item.clone());
+                }
+            }
+            Some("turn/interjectionsReturned") => returned.push(v.clone()),
+            Some("turn/completed") => {
+                completed = Some(v);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let completed = completed.expect("the background turn must finish after its tool round");
+    assert_eq!(
+        completed["params"]["status"], "completed",
+        "the background turn must run to completion after yielding, not be killed: {completed}"
+    );
+    assert_eq!(
+        completed["params"]["turn_id"].as_str().unwrap(),
+        turn_id,
+        "the foreground request must be folded into the SAME turn the background was running"
+    );
+    assert_eq!(
+        completed["params"]["thread_id"].as_str().unwrap(),
+        lead_id,
+        "the yield must happen on the lead thread: {completed}"
+    );
+    assert!(
+        returned.is_empty(),
+        "an accepted foreground request must not be handed back to the client: {returned:?}"
+    );
+    let folded =
+        folded_item.expect("the folded foreground request must surface as a userInterjection");
+    assert_eq!(
+        folded["text"], FOREGROUND,
+        "the folded item carries the user's own words, not the prefixed copy: {folded}"
+    );
+
+    // ---- 让位不丢进度 + 文本确实折叠进了同一轮的下一次请求 ----
+    let later = provider
+        .later_messages
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let second = later
+        .last()
+        .expect("the turn must reach another THINK after its tool round")
+        .clone();
+    let injected = second
+        .iter()
+        .find(|m| {
+            m.content.iter().any(
+                |b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t.contains(FOREGROUND)),
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("the folded foreground text must reach the next request: {second:?}")
+        });
+    assert!(
+        injected.content.iter().any(
+            |b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t.contains(PREFIX_MARKER))
+        ),
+        "the folded text must carry the mid-turn prefix (folded, not replayed as a new prompt): {injected:?}"
+    );
+    assert!(
+        second.iter().any(|m| m
+            .content
+            .iter()
+            .any(|b| matches!(b, yi_agent_core::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "c1"))),
+        "the completed tool round must survive the yield (checkpoint semantics: 让位不丢进度): {second:?}"
+    );
+
+    h.shutdown().await;
+}
+
 fn recording_agent_factory(
     seen: Arc<std::sync::Mutex<Vec<usize>>>,
 ) -> impl Fn(
@@ -8021,6 +9334,8 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -8130,6 +9445,8 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
+            content_epoch: 0,
+            last_item_id: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -8329,6 +9646,7 @@ async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_appr
             image_blocks: Vec::new(),
             image_refs: Vec::new(),
             display_text: "hi".into(),
+            lead_request_id: None,
         })
         .await
         .unwrap();
@@ -8633,6 +9951,223 @@ async fn thread_clear_empties_the_context_and_resume_does_not_revive_it() {
     h.shutdown().await;
 }
 
+/// 跑一轮，并等到它**真正落盘**。
+///
+/// 落盘发生在 `turn/completed` **之后**（见
+/// `thread_clear_empties_the_context_and_resume_does_not_revive_it` 的注释），
+/// 所以不能只读到 `turn/completed` 就认为盘上有了：必须轮询 `.jsonl`。
+/// 随后把 `turn/completed` 排空，免得它污染后续断言。
+///
+/// 后续任务（clear 世代、listAll 版本字段、锚点校验）都复用它。
+async fn run_a_turn_and_wait_for_persist(
+    h: &mut Harness,
+    workdir: &std::path::Path,
+    tid: &str,
+    text: &str,
+) {
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 700, "method": "turn/start",
+            "params": { "threadId": tid, "input": [{ "type": "text", "text": text }] },
+        })
+        .to_string(),
+    )
+    .await;
+    let log = workdir
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.jsonl"));
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    let mut persisted = false;
+    while tokio::time::Instant::now() < deadline {
+        if std::fs::read_to_string(&log).is_ok_and(|t| !t.trim().is_empty()) {
+            persisted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(persisted, "turn for {tid} must reach disk");
+    for _ in 0..60 {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            return;
+        }
+    }
+    panic!("turn/completed never arrived for {tid}");
+}
+
+/// `/clear` 是**唯一**的世代递增点：它让服务端 item 集合从"有"变"无"，
+/// 客户端手上的内容就此结构性不一致。断言直接读 meta 文件，故本用例不依赖
+/// `thread/listAll` 是否已携带 `content_epoch`。
+#[tokio::test(flavor = "multi_thread")]
+async fn clearing_a_thread_bumps_its_content_epoch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    let store = crate::thread_store::ThreadStore::new(dir.path());
+
+    assert_eq!(
+        store.load(&tid).unwrap().unwrap().meta.content_epoch,
+        0,
+        "a fresh thread must start at epoch 0"
+    );
+
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    assert_eq!(
+        store.load(&tid).unwrap().unwrap().meta.content_epoch,
+        1,
+        "clear must bump the content epoch"
+    );
+    h.shutdown().await;
+}
+
+/// 不带锚点（桌面 / 老客户端）→ 不做任何校验。这是零回归门禁。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_without_a_context_anchor_is_not_validated() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    // epoch 被 clear 推到 1，但客户端不带锚点 ⇒ 照常准入（服务端不做推断）。
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    let resp = rpc(
+        &mut h,
+        71,
+        "turn/start",
+        json!({ "threadId": tid, "input": [{ "type": "text", "text": "hi" }] }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "no anchor must mean no validation: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 锚点世代已失效（会话在客户端不知情时被 clear）→ 拒绝。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_with_a_stale_epoch_is_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    let resp = rpc(
+        &mut h,
+        72,
+        "turn/start",
+        json!({
+            "threadId": tid,
+            "input": [{ "type": "text", "text": "hi" }],
+            "contextAnchor": { "contentEpoch": 0 },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32026),
+        "must be stale_context: {resp}"
+    );
+    assert_eq!(resp["error"]["data"]["code"], json!("stale_context"));
+    h.shutdown().await;
+}
+
+/// **关键正向用例**：锚点仍在但落后于末条 → 放行。
+/// 落后是两端并存的正常形状；拒绝它会破坏父 spec 的核心场景。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_with_an_anchor_behind_the_tail_is_accepted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "first").await;
+
+    // 取一个早期的 item 作为"落后"的锚点。
+    let read = rpc(&mut h, 73, "thread/readItems", json!({ "threadId": tid })).await;
+    let early = read["result"]["items"][0]["id"]
+        .as_str()
+        .expect("the first turn must have items")
+        .to_string();
+
+    // 落盘发生在 turn/completed 之后：收尾窗口内 turn/start 会被 -32012 拒。
+    // 锚点校验的正向用例不该被这个无关竞态判红，故重试。
+    let mut resp = json!(null);
+    for attempt in 0..20 {
+        resp = rpc(
+            &mut h,
+            74,
+            "turn/start",
+            json!({
+                "threadId": tid,
+                "input": [{ "type": "text", "text": "second" }],
+                "contextAnchor": { "contentEpoch": 0, "lastItemId": early },
+            }),
+        )
+        .await;
+        if resp["error"]["code"] != json!(-32012) {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let _ = attempt;
+    }
+    assert!(
+        resp.get("error").is_none(),
+        "a behind-but-present anchor must pass: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 锚点在世代相同的会话里已不在日志中 → 拒绝。
+/// 这是 `anchor_gone` 分支的正向钉：只钉「世代不符」会漏掉同世代的失效锚点。
+/// 用全新会话（epoch 0、无 item）直接构造：任何 lastItemId 都不存在，
+/// 且不必先跑一轮（避免撞上 turn 收尾窗口的 `-32012`）。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_start_with_a_same_epoch_but_absent_anchor_is_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let resp = rpc(
+        &mut h,
+        75,
+        "turn/start",
+        json!({
+            "threadId": tid,
+            "input": [{ "type": "text", "text": "second" }],
+            "contextAnchor": { "contentEpoch": 0, "lastItemId": "item-does-not-exist" },
+        }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32026),
+        "an absent anchor must be stale_context: {resp}"
+    );
+    assert_eq!(resp["error"]["data"]["code"], json!("stale_context"));
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn thread_clear_rejects_an_unknown_thread() {
     let mut h = Harness::new();
@@ -8711,6 +10246,53 @@ async fn thread_compact_reports_compacted_when_history_shrinks() {
     assert_eq!(
         v["result"]["status"], "compacted",
         "expected compaction: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// `compact` **不得**抹掉 `last_item_id`。
+///
+/// 机制：`compact` 走的 `persist_and_finish_turn` 传空 prompt + 空 items，
+/// 且它刻意**不**递增 epoch、也**不**删除日志里既有的 item 行（读取时按行
+/// 拼接）。若空 items 的落盘把游标写成 `None`，`thread/listAll` 就会把一个
+/// 「仍有 items」的会话报成「从未有过 item」——客户端据此会认为本地锚点毫无
+/// 意义，`listAll` 的「是否落后」信号被永久削弱。故空落盘必须**不**覆盖游标。
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_does_not_erase_last_item_id() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, compactable_factory, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    // 先跑一轮真实 turn，让日志里真的落进 item（游标由此被写上）。
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+
+    let before = list_all(&mut h).await;
+    let anchor = last_item_id_of(&before, &tid);
+    assert!(
+        anchor.is_some(),
+        "a persisted turn must record last_item_id before compact: {before}"
+    );
+    let epoch = content_epoch_of(&before, &tid);
+
+    let v = compact_thread(&mut h, &tid).await;
+    assert_eq!(
+        v["result"]["status"], "compacted",
+        "compaction must actually happen, else this test proves nothing: {v}"
+    );
+
+    let after = list_all(&mut h).await;
+    assert_eq!(
+        last_item_id_of(&after, &tid),
+        anchor,
+        "compact must NOT erase last_item_id: the items are still there \
+         (compact appends an empty line and never deletes the log): {after}"
+    );
+    assert_eq!(
+        content_epoch_of(&after, &tid),
+        epoch,
+        "compact is deliberately not an epoch bump: {after}"
     );
     h.shutdown().await;
 }
@@ -12255,6 +13837,7 @@ fn delegation_tooling_carries_the_theme_tool() {
         Vec::new(),
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
     )
     .expect("tooling");
     assert!(
@@ -12754,6 +14337,7 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         Vec::new(),
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
     )
     .expect("tooling");
     // Taken *before* the rebuild: a clone shares the caller slot the tools
@@ -13092,6 +14676,7 @@ impl MergedHarness {
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
                 watchman_home: PathBuf::new(),
                 lead_inbox: crate::lead::LeadInbox::new(),
+                lead_replies: crate::lead::LeadReplies::new(),
             },
             build_test_agent,
             Scope::Admin,
@@ -13347,6 +14932,315 @@ async fn merged_loop_fans_out_permission_mode_change_to_ws_client() {
     );
     assert_eq!(notif["params"]["mode"].as_str(), Some("yolo"));
     h.shutdown().await;
+}
+/// 裁决是纯函数：给定 hints 与服务端每会话的 (epoch, 锚点是否仍在)，
+/// 产出每个 hint 的动作、诊断原因、以及服务端 epoch。四条判定按优先级
+/// 短路（spec §4.2）。`server` 返回 `None` 表示该 thread 已不存在。
+#[test]
+fn plan_sync_covers_the_four_verdicts() {
+    let hint = |id: &str, e: u64, anchor: Option<&str>| SyncHint {
+        thread_id: id.to_string(),
+        content_epoch: e,
+        last_item_id: anchor.map(str::to_string),
+    };
+    let server = |id: &str| -> Option<(u64, bool)> {
+        match id {
+            "t-deleted" => None,
+            "t-stale" => Some((5, true)),
+            "t-lost" => Some((3, false)),
+            "t-ok" => Some((3, true)),
+            "t-behind" => Some((3, true)),
+            _ => None,
+        }
+    };
+    let hints = vec![
+        hint("t-deleted", 1, Some("a")),
+        hint("t-stale", 3, Some("a")),
+        hint("t-lost", 3, Some("gone")),
+        hint("t-ok", 3, Some("a")),
+        hint("t-behind", 3, Some("older")),
+    ];
+
+    let plan = plan_sync(&hints, &server);
+    let row = |id: &str| {
+        plan.iter()
+            .find(|(t, _, _, _)| t == id)
+            .map(|(_, a, r, e)| (*a, *r, *e))
+    };
+    assert_eq!(row("t-deleted"), Some((SyncAction::Drop, "deleted", 0)));
+    assert_eq!(row("t-stale"), Some((SyncAction::Full, "epoch_changed", 5)));
+    assert_eq!(row("t-lost"), Some((SyncAction::Full, "anchor_missing", 3)));
+    assert_eq!(row("t-ok"), Some((SyncAction::None, "match", 3)));
+    // 「落后」不是失败：锚点仍在 → 缓存有效，补齐交给常规路径（spec §7.2）。
+    assert_eq!(row("t-behind"), Some((SyncAction::None, "match", 3)));
+    // 顺序必须与 hints 一一对应：调用方按序写回 syncPlan，错位即张冠李戴。
+    assert_eq!(
+        plan.iter().map(|(t, ..)| t.as_str()).collect::<Vec<_>>(),
+        vec!["t-deleted", "t-stale", "t-lost", "t-ok", "t-behind"],
+        "plan must preserve the hint order"
+    );
+}
+
+/// 空 hints（桌面端 / 老客户端）→ 空 plan。这是零回归的门禁。
+#[test]
+fn plan_sync_is_empty_for_no_hints() {
+    assert!(plan_sync(&[], &|_| panic!("must not be called")).is_empty());
+}
+
+/// `lastItemId` 为 None（会话从未有过 item）时不得当成"锚点缺失"而误判全量。
+#[test]
+fn plan_sync_treats_a_null_anchor_as_present_when_epochs_match() {
+    let hints = vec![SyncHint {
+        thread_id: "t".into(),
+        content_epoch: 0,
+        last_item_id: None,
+    }];
+    let plan = plan_sync(&hints, &|_| Some((0, true)));
+    assert_eq!(plan[0].1, SyncAction::None);
+}
+
+/// 会话删除后，hints 里对它的条目必须判 `drop` —— 端到端跑一遍：
+/// `thread/delete` 真的把会话从盘上抹掉，随后拿**生产用的那个查询**
+/// （`ThreadStore::load`）当 `plan_sync` 的 `server` 回调，断言 `Drop` /
+/// `"deleted"` / epoch 0。
+///
+/// 相对纯函数里的 stub 用例，这里额外钉住的是「删除在 service 层真的可见，
+/// 且 `load` 的 `None` 与 `plan_sync` 约定的 `None` 同义」：stub 只证明算法，
+/// 证明不了是哪个查询在喂它。
+#[tokio::test(flavor = "multi_thread")]
+async fn plan_sync_drops_a_deleted_thread_end_to_end() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    let store = crate::thread_store::ThreadStore::new(dir.path());
+
+    // 删除前该会话存在：epoch 0，锚点视为仍在（从未有过 item）。
+    let hints = vec![SyncHint {
+        thread_id: tid.clone(),
+        content_epoch: 0,
+        last_item_id: None,
+    }];
+    let live = |id: &str| {
+        store
+            .load(id)
+            .unwrap()
+            .map(|t| (t.meta.content_epoch, true))
+    };
+    assert_eq!(
+        plan_sync(&hints, &live)[0].1,
+        SyncAction::None,
+        "a live thread must not be dropped"
+    );
+
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 12, "method": "thread/delete",
+            "params": { "threadId": tid },
+        })
+        .to_string(),
+    )
+    .await;
+    let deleted = read_response(&mut h, 12).await;
+    assert!(
+        deleted.get("error").is_none(),
+        "delete must succeed: {deleted}"
+    );
+
+    assert!(
+        store.load(&tid).unwrap().is_none(),
+        "delete must remove the thread"
+    );
+    // 同一条 hint：会话消失后必须整条 drop，而不是静默留一个空缓存。
+    assert_eq!(
+        plan_sync(&hints, &live)[0],
+        (tid.clone(), SyncAction::Drop, "deleted", 0),
+        "a deleted thread must be dropped"
+    );
+    h.shutdown().await;
+}
+
+/// 无 hints（桌面端 / 老客户端）→ 空 plan，其余字段不变。桌面零回归门禁。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_without_hints_reports_an_empty_sync_plan() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    // `initialize` 助手的响应在流里，重新发一次带 id 的以便断言。
+    let resp = rpc(&mut h, 61, "initialize", json!({})).await;
+    assert_eq!(
+        resp["result"]["syncPlan"],
+        json!([]),
+        "no hints → empty plan: {resp}"
+    );
+    assert!(
+        resp["result"]["serverInfo"].is_object(),
+        "existing fields must survive: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 带 hints 时按 §4.2 裁决：clear 过的会话被判 full（epoch 变了）。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_a_full_resync_for_a_cleared_thread() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    // 客户端手上有 epoch 0 的缓存，但服务端已经是 1。
+    let resp = rpc(
+        &mut h,
+        62,
+        "initialize",
+        json!({ "resumeHints": [{ "threadId": tid, "contentEpoch": 0 }] }),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"]
+        .as_array()
+        .unwrap_or_else(|| panic!("syncPlan must be an array: {resp}"));
+    assert_eq!(plan.len(), 1, "one hint must yield one entry: {resp}");
+    assert_eq!(plan[0]["threadId"], json!(tid));
+    assert_eq!(plan[0]["action"], json!("full"));
+    assert_eq!(plan[0]["reason"], json!("epoch_changed"));
+    assert_eq!(
+        plan[0]["epoch"],
+        json!(1),
+        "the entry must carry the server epoch"
+    );
+    h.shutdown().await;
+}
+
+/// epoch 一致且锚点仍在 → none（缓存有效，不必重同步）。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_nothing_when_the_hint_matches() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+    let listed = list_all(&mut h).await;
+    let anchor = last_item_id_of(&listed, &tid).expect("a turn must record an anchor");
+
+    let resp = rpc(
+        &mut h,
+        63,
+        "initialize",
+        json!({ "resumeHints": [{
+            "threadId": tid, "contentEpoch": 0, "lastItemId": anchor,
+        }]}),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"].as_array().unwrap();
+    assert_eq!(plan[0]["action"], json!("none"));
+    assert_eq!(plan[0]["reason"], json!("match"));
+    h.shutdown().await;
+}
+
+/// 会话存在但**从未有过 item**（hint 不带 `lastItemId`）→ none。锚点为 null 时
+/// 不得当成"锚点缺失"去查盘或判全量：那会把"还没有内容"误读成"缓存失效"。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_nothing_for_a_thread_that_has_no_anchor() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let resp = rpc(
+        &mut h,
+        65,
+        "initialize",
+        json!({ "resumeHints": [{ "threadId": tid, "contentEpoch": 0 }] }),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"].as_array().unwrap();
+    assert_eq!(plan[0]["epoch"], json!(0), "epoch must come from the store");
+    assert_eq!(plan[0]["action"], json!("none"));
+    assert_eq!(plan[0]["reason"], json!("match"));
+    h.shutdown().await;
+}
+
+/// 锚点已被抹掉（clear 过内容但 epoch 未变的极端形状）→ full / anchor_missing，
+/// 证明 `lastItemId` 确实拿去查了真实 jsonl，而不是被忽略或凭 meta 断言。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_a_full_resync_when_the_anchor_is_gone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let resp = rpc(
+        &mut h,
+        66,
+        "initialize",
+        json!({ "resumeHints": [{
+            "threadId": tid, "contentEpoch": 0, "lastItemId": "item-never-existed",
+        }]}),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"].as_array().unwrap();
+    assert_eq!(plan[0]["action"], json!("full"));
+    assert_eq!(plan[0]["reason"], json!("anchor_missing"));
+    h.shutdown().await;
+}
+
+/// 不存在的会话 → drop。
+#[tokio::test(flavor = "multi_thread")]
+async fn initialize_plans_a_drop_for_a_deleted_thread() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    let resp = rpc(
+        &mut h,
+        64,
+        "initialize",
+        json!({ "resumeHints": [{ "threadId": "thread-gone", "contentEpoch": 0 }] }),
+    )
+    .await;
+    let plan = resp["result"]["syncPlan"].as_array().unwrap();
+    assert_eq!(plan[0]["action"], json!("drop"));
+    assert_eq!(plan[0]["reason"], json!("deleted"));
+    h.shutdown().await;
+}
+
+/// `parse_resume_hints` 是纯函数：畸形条目静默跳过，上限 20 条按 cachedAt 最新优先。
+#[test]
+fn parse_resume_hints_is_bounded_and_skips_malformed() {
+    let raw = json!([
+        { "threadId": "t1", "contentEpoch": 2, "lastItemId": "i1", "cachedAt": 5 },
+        { "contentEpoch": 9 },                       // 缺 threadId → 跳过
+        { "threadId": "t2", "cachedAt": 50 },        // 缺 epoch → 0
+        "not-an-object",                             // 畸形 → 跳过
+    ]);
+    let hints = parse_resume_hints(Some(&raw));
+    assert_eq!(
+        hints.len(),
+        2,
+        "malformed entries must be skipped: {hints:?}"
+    );
+    assert_eq!(hints[0].thread_id, "t2", "newest cachedAt must come first");
+    assert_eq!(hints[0].content_epoch, 0);
+    assert_eq!(hints[1].thread_id, "t1");
+    assert_eq!(hints[1].last_item_id.as_deref(), Some("i1"));
+
+    // 上限 20：造 25 条，取 cachedAt 最大的 20 条。
+    let many: Vec<serde_json::Value> = (0..25)
+        .map(|i| json!({ "threadId": format!("t{i}"), "cachedAt": i }))
+        .collect();
+    let hints = parse_resume_hints(Some(&json!(many)));
+    assert_eq!(hints.len(), 20);
+    assert_eq!(hints[0].thread_id, "t24", "the newest must be kept");
+
+    assert!(parse_resume_hints(None).is_empty());
+    assert!(parse_resume_hints(Some(&json!("nope"))).is_empty());
 }
 
 /// 记录型工厂：把每次 `build_agent` 时**槽位里实际可见**的关联根记下来。

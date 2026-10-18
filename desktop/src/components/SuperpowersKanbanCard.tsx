@@ -9,9 +9,12 @@ function middleEllipsis(text: string, head = 14, tail = 10): string {
 export function SuperpowersKanbanCard({
   card,
   onOpenThread,
+  onPromote,
 }: {
   card: BoardCard;
   onOpenThread?: (threadId: string) => void;
+  /** 预排队卡专用：补上 spec/plan，把卡提升成排队卡。 */
+  onPromote?: (cardId: string) => void;
 }) {
   const needsYou = card.state === "needs_you";
   return (
@@ -45,6 +48,15 @@ export function SuperpowersKanbanCard({
           className="mt-1 block max-w-full cursor-pointer truncate text-left font-mono text-xs text-fg-muted hover:text-fg hover:underline"
         >
           {card.threadId}
+        </button>
+      ) : null}
+      {card.state === "pre_queued" && onPromote ? (
+        <button
+          type="button"
+          onClick={() => onPromote(card.id)}
+          className="mt-1 text-xs text-fg-muted hover:text-fg"
+        >
+          补 spec/plan 提升
         </button>
       ) : null}
     </li>

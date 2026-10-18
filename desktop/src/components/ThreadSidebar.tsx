@@ -3,6 +3,7 @@ import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup
 import { basename, groupCount, nestLinkedGroups } from "../lib/workspaceGroups";
 import { kanbanItemFor } from "../lib/boardIndex";
 import { useSpinPhase } from "../lib/useSpinPhase";
+import { countRunningSessions, runningSessionsLabel } from "../lib/runningSessions";
 import { supportsWaapi } from "../lib/spinPhase";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
@@ -77,6 +78,41 @@ export const StatusBadge = memo(function StatusBadge({
     />
   );
 }, (prev, next) => prev.status === next.status && prev.stale === next.stale);
+
+/**
+ * footer 里的「此刻有几个会话在跑」读数,紧挨设置齿轮。
+ *
+ * 与 `StatusBadge` 共用 `useSpinPhase`(相位锚定墙钟),避免 CSS 动画在节点重排时
+ * 从头播放的视觉回退。恒为 running 形态:它只在计数 > 0 时出现,不存在
+ * `awaiting_approval` 形态(那种会话根本不计入)。
+ *
+ * 计数为 0 时整个节点不渲染,footer 与改动前逐像素一致。
+ */
+function ActiveSessionCount({ count, stale = false }: { count: number; stale?: boolean }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useSpinPhase(ref, count > 0);
+  if (count === 0) return null;
+  const label = runningSessionsLabel(count);
+  const cssFallback = !supportsWaapi();
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      aria-label={label}
+      title={stale ? `${label}（可能过期）` : label}
+      className={`ml-2 flex min-w-0 items-center gap-1.5 text-xs text-fg-subtle ${
+        stale ? "opacity-40" : ""
+      }`}
+    >
+      <span
+        ref={ref}
+        aria-hidden="true"
+        className={`shrink-0 rounded-full ${cssFallback ? "animate-spin" : ""} size-3 border-2 border-line-strong border-t-fg`}
+      />
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
 
 export function ThreadSidebar({
   groups,
@@ -194,6 +230,7 @@ export function ThreadSidebar({
   // The rename field is a plain text input, so an IME confirm-Enter must not
   // commit the draft (and unmount the field) mid-composition.
   const ime = useImeGuard();
+  const runningCount = countRunningSessions(statuses);
 
   const onHandleDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -671,13 +708,13 @@ export function ThreadSidebar({
           onOpenBoard(workspace);
         }}
         className={`flex cursor-pointer items-center gap-2 px-3 py-2 text-sm ${
-          active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
+          active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
         }`}
       >
         <span className="shrink-0">看板</span>
         {/* 摘要是这一眼要看的全部：排队几件、在跑几件。 */}
         {boardSummaries[workspace] ? (
-          <span className="truncate text-xs text-neutral-500">{boardSummaries[workspace]}</span>
+          <span className="truncate text-xs text-fg-subtle">{boardSummaries[workspace]}</span>
         ) : null}
       </div>
     );
@@ -844,8 +881,8 @@ export function ThreadSidebar({
           }}
           className={
             isChild
-              ? "flex items-center gap-1 px-2 py-1 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
-              : "flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
+              ? "flex items-center gap-1 px-2 py-1 text-base font-medium text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
+              : "flex items-center gap-1 px-2 py-1.5 text-base font-medium text-fg-subtle hover:bg-raised/50 focus:bg-raised/50 focus:outline-none"
           }
         >
           <button
@@ -897,7 +934,7 @@ export function ThreadSidebar({
                   if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
                   else onCreateBoard(g.workspace);
                 }}
-                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
+                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
               >
                 {kanbanItemFor(g.workspace, boards) ? "移除看板" : "创建 Superpowers 看板"}
               </button>
@@ -1085,8 +1122,14 @@ export function ThreadSidebar({
           )}
           {/* 分组之间留一档空档：无间距时上一条会话与下一个文件夹头紧贴，多个文件夹
               连成一整列、看不出边界。`space-y-2` 只作用于兄弟之间，故首个分组之前
-              不多出空白，也不动置顶分区与组之间既有的留白。 */}
-          <div className="space-y-2">
+              不多出空白，也不动置顶分区与组之间既有的留白。
+              辅助线画在**每个分组的上面**（`> * + *` 排除了第一个分组）：文件夹名升到
+              text-base 之后，仅靠间距仍不够一眼分清"这条会话属于上面那个文件夹还是
+              下面那个"，一条线把归属切断。用上边框而非 `divide-y`——后者画在下一个
+              兄弟的**下边框**上，线会落在上一个分组的末尾、离文件夹头还有 8px（实测
+              上边框宽度 0px），不是"文件夹上方那条线"。颜色用语义 token `border-line`，
+              跟随主题。 */}
+          <div className="space-y-2 [&>*+*]:border-t [&>*+*]:border-line">
             {nested.top.map(({ group: g, children }) => renderGroupNode(g, children, 0))}
           </div>
         </div>
@@ -1104,6 +1147,7 @@ export function ThreadSidebar({
             <path d="M6.9 1.3a.7.7 0 0 0-.7.6l-.1.9a5.4 5.4 0 0 0-.9.5l-.9-.3a.7.7 0 0 0-.8.3l-.7 1.2a.7.7 0 0 0 .1.9l.7.6a5.5 5.5 0 0 0 0 1l-.7.6a.7.7 0 0 0-.1.9l.7 1.2a.7.7 0 0 0 .8.3l.9-.3c.3.2.6.4.9.5l.1.9a.7.7 0 0 0 .7.6h1.4a.7.7 0 0 0 .7-.6l.1-.9c.3-.1.6-.3.9-.5l.9.3a.7.7 0 0 0 .8-.3l.7-1.2a.7.7 0 0 0-.1-.9l-.7-.6a5.5 5.5 0 0 0 0-1l.7-.6a.7.7 0 0 0 .1-.9l-.7-1.2a.7.7 0 0 0-.8-.3l-.9.3a5.4 5.4 0 0 0-.9-.5l-.1-.9a.7.7 0 0 0-.7-.6H6.9Zm1.1 8a1.6 1.6 0 1 1 0-3.2 1.6 1.6 0 0 1 0 3.2Z" />
           </svg>
         </button>
+        <ActiveSessionCount count={runningCount} stale={statusStale} />
       </div>
       <div
         role="separator"

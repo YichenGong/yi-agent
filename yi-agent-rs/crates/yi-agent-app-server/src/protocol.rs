@@ -185,6 +185,20 @@ impl RpcError {
         }
     }
 
+    /// 客户端的上下文锚点已失效：该会话在它不知情时被 `/clear`，它手上持有的是
+    /// 服务端**不存在**的内容，其可见上下文与服务端实际上下文结构性不一致。
+    ///
+    /// 与 `board_query` / `model_not_found` 同族：数值码只是粗粒度兜底，
+    /// `data.code` 才是 UI 分支的稳定词汇。注意「锚点落后但仍在」**不是**本错误
+    /// ——落后是两端并存的正常形状（spec §7.2）。
+    pub fn stale_context(thread_id: &str) -> Self {
+        Self {
+            code: -32026,
+            message: format!("context anchor is stale for thread: {thread_id}"),
+            data: Some(serde_json::json!({ "code": "stale_context" })),
+        }
+    }
+
     /// A `model/upsert` payload failed validation (empty name, unknown provider,
     /// empty url/model). Numeric code stays in the `invalid_params` family;
     /// `data.code` gives the caller a stable reason.
@@ -740,6 +754,47 @@ mod tests {
         let invalid = RpcError::invalid_model("provider must be anthropic or openai");
         assert_eq!(invalid.code, -32602);
         assert_eq!(invalid.data.unwrap()["code"], "invalid_model");
+    }
+
+    /// 客户端上下文锚点失效（该会话在其不知情时被 clear）。数值码取下一个空位，
+    /// UI 只读 `data.code`——与 `board_query` / `model_not_found` 同一约定。
+    #[test]
+    fn stale_context_has_a_stable_numeric_code_and_reason() {
+        let error = RpcError::stale_context("thread-a");
+        assert_eq!(
+            error.code, -32026,
+            "-32026 must stay reserved for stale_context"
+        );
+        assert_eq!(error.data.unwrap()["code"], "stale_context");
+        assert!(
+            error.message.contains("thread-a"),
+            "message must name the thread"
+        );
+    }
+
+    /// 新码不得与既有码撞车。
+    #[test]
+    fn stale_context_does_not_collide_with_existing_codes() {
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::not_initialized().code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::unknown_thread("t").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::turn_in_progress("t").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::model_not_found("m").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::board_query("plugin_rejected", "x").code
+        );
     }
 
     #[test]
