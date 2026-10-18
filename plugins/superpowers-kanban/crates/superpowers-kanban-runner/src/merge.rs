@@ -132,16 +132,6 @@ pub fn prepare(project_root: &Path, base: &str) -> Result<BaseWorktree, String> 
     })
 }
 
-pub fn is_dirty(wt: &Path) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(wt)
-        .args(["status", "--porcelain"])
-        .output()
-        .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
-        .unwrap_or(true)
-}
-
 pub fn run(wt: &Path, source: &str, base: &str) -> MergeOutcome {
     let message = format!("merge {source} into {base} (kanban)");
     let out = Command::new("git")
@@ -211,6 +201,21 @@ mod tests {
         std::fs::write(dir.join("f.txt"), "base\n").unwrap();
         git(&["add", "f.txt"]);
         git(&["commit", "-qm", "seed"]);
+    }
+
+    /// base worktree 是否干净（`git status --porcelain` 有输出即脏）。
+    ///
+    /// 它是**测试专用**的：生产代码里没有任何调用点——合并的前置校验（base 脏）
+    /// 已随「合并在会话里由模型执行」一并删除（spec D11），故这里不再对外暴露。
+    /// 留着它只为下面两条断言：合并/冲突中止之后 base worktree 必须干净可重试。
+    fn is_dirty(wt: &Path) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["status", "--porcelain"])
+            .output()
+            .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+            .unwrap_or(true)
     }
 
     #[test]

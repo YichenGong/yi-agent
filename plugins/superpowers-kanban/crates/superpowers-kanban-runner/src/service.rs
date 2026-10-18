@@ -864,6 +864,16 @@ impl BoardService {
     }
 
     /// 启动没成：把卡片标为 `Failed` 并释放槽位。`detail` 是失败原因，同样落盘可读。
+    ///
+    /// **保留（不退役）**：它只经 `board.release` 这一个 IPC 方法到达
+    /// （`dispatch.rs:207`），而宿主的驱动器已不再调任何 `board.*` 方法——但这不构成
+    /// 退役理由。spec §6 明确把 `next_launch` / `mark_running` / `mark_terminal` /
+    /// `release` **保留为插件内部函数**，由 `driver/next` 的决策逻辑调用；`board.release`
+    /// 是插件查询面上仍在的方法（与 `board.mark_terminal` 同一组），CLI/桌面/后续
+    /// 调试都可经它把一次启动失败落成「`failed` + 可读原因」。它也不是
+    /// `mark_terminal(.., "failed", ..)` 的同义词：`release` 是**专用**契约
+    /// （`Detail` 必填、语义就是「启动没成」），而 `mark_terminal` 收三种结果。
+    /// 退役它会连带删掉一个 spec 保留的 IPC 面，收益只是少一个函数——不值得。
     pub fn release(&self, card_id: &str, detail: &str) -> Result<(), String> {
         let mut inner = self.lock();
         let id = CardId::new(card_id);
@@ -1303,8 +1313,13 @@ mod tests {
     /// 建一个真实的最小 git 仓库，作为 project_root 与 worktree 的来源。
     ///
     /// 一并提交 `.gitignore`（忽略 `.yi-agent/`、`.worktrees/`），与真实项目一致：
-    /// 看板的状态目录就落在项目根下的 `.yi-agent/`，若不忽略，项目主检出会被
-    /// 自己的运行时状态显示成「脏」，合并前置校验（`merge::is_dirty`）会误判。
+    /// 看板的状态目录就落在项目根下的 `.yi-agent/`，若不忽略，主检出会被插件
+    /// 自己的运行时状态弄「脏」。合并用的 base worktree 就是这棵主检出
+    /// （`merge::prepare` 在它已被检出时复用，不再新开一棵），故这棵树的干净是
+    /// 「git 事实可信」的前提——测试 fixture 必须复刻生产项目的这一布置。
+    ///
+    /// （曾经的合并前置校验 `merge::is_dirty` 已随「合并在会话里执行」退役，
+    /// 见 `merge.rs` 测试模块里的同名助手。）
     fn project_with_worktree(dir: &std::path::Path) -> PathBuf {
         let out = std::process::Command::new("git")
             .args(["init", "-q", "-b", "main"])
@@ -2542,8 +2557,9 @@ mod tests {
         );
     }
 
-    /// `board.release` 是同一处旧缺口（启动没成 → `failed`）：它的 `detail`
-    /// 也必须落到卡片上，否则「为什么失败」在这条通路上照样无人可答。
+    /// `board.release` 与 CMD 启动通路是同一处旧缺口（启动没成 → `failed`）：它的
+    /// `detail` 也必须落到卡片上，否则「为什么失败」在这条通路上照样无人可答。
+    /// （该方法的去留见 `BoardService::release` 上的说明：spec §6 保留它。）
     #[test]
     fn release_records_the_detail_it_was_given() {
         let dir = tempfile::tempdir().unwrap();
