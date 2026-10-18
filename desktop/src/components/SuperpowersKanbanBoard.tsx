@@ -12,11 +12,14 @@ export function SuperpowersKanbanBoard({
   expandedDone = false,
   onToggleDone,
   onOpenThread,
+  onPromote,
 }: {
   cards: BoardCard[];
   expandedDone?: boolean;
   onToggleDone?: () => void;
   onOpenThread?: (threadId: string) => void;
+  /** 透传给卡片：提升某张预排队卡。 */
+  onPromote?: (cardId: string) => void;
 }) {
   const columns = boardColumns(cards);
   const visibleDone = collapseDone(columns.done, expandedDone);
@@ -37,6 +40,7 @@ export function SuperpowersKanbanBoard({
             cards={shown}
             totalCount={all.length}
             onOpenThread={onOpenThread}
+            onPromote={onPromote}
             doneToggle={
               key === "done"
                 ? {

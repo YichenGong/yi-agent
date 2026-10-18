@@ -15,6 +15,7 @@ export function SuperpowersKanbanColumn({
   cards,
   totalCount,
   onOpenThread,
+  onPromote,
   doneToggle,
 }: {
   columnKey: BoardColumnKey;
@@ -23,6 +24,8 @@ export function SuperpowersKanbanColumn({
   /** 该列卡片总数；done 列计数含被折叠掉的卡。 */
   totalCount: number;
   onOpenThread?: (threadId: string) => void;
+  /** 透传给卡片：提升某张预排队卡。 */
+  onPromote?: (cardId: string) => void;
   /** 只有 done 列会传：右侧的「展开全部 / 收起」开关。 */
   doneToggle?: { expanded: boolean; onToggle: () => void; hasMore: boolean };
 }) {
@@ -61,7 +64,12 @@ export function SuperpowersKanbanColumn({
           <li className="px-1 py-2 text-xs text-fg-subtle">空</li>
         ) : (
           cards.map((card) => (
-            <SuperpowersKanbanCard key={card.id} card={card} onOpenThread={onOpenThread} />
+            <SuperpowersKanbanCard
+              key={card.id}
+              card={card}
+              onOpenThread={onOpenThread}
+              onPromote={onPromote}
+            />
           ))
         )}
       </ul>
