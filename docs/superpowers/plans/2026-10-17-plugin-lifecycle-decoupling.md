@@ -40,6 +40,41 @@ G1 之后宿主结构变了，初稿的文件路径与依赖面已过时；实�
    是看板名的子命令 `yi-agent boards watch`，且 `supervisors::Layout::for_workdir`
    硬编码 `.yi-agent/superpowers-kanban`——不同批改，验收的 grep 与 plist 都会坏。
 
+## 2026-10-18 刷新说明（第二次：main 前进 98 提交后）
+
+本 worktree 已把 main 最新（`bf6e1971`）并入（领先首版所据的 `9d885fb9` 共 98 提交，
+**合并无冲突**；`cargo build --workspace` 合后仍绿）。逐条实测校正如下：
+
+8. **Task 1 已完成**：`19bc06f5`（通用 `resident/list` + 摘门控）与 `5a201c49`
+   （把重复的 stdio 泵抽进 `crate::test_support::rpc_over_stdio`）。
+   评审 + 复审均干净。**Task 1 的 Step 1–5 视为已执行**，本节以下步骤保留为记录。
+9. **`plugin_query` 已去门控**：现签名 `plugin_query(project, method, plugin, params)`；
+   `registry::contains` 那段与 `global` 形参已不存在。故 Task 6 里「`protocol.rs` 的
+   `board_not_created` 整支删除」现在**只剩 `protocol.rs` 一处**要动（`server.rs` 的
+   门控测试已在 Task 1 改过）。实测现状：`protocol.rs:161`（码位映射）、`:156`（doc）、
+   `:738`（`board_query_numbers_each_reason_without_renumbering` 里的断言）。
+10. **主循环的函数与行号已漂移**（Task 3/6 的引用按此更新）：
+    - `spawn_board_watchman_loop` 在 `server.rs:1456`，调用点在 `:1496` 与 `:1581`；
+    - `ensure_watchman_installed` 在 `server.rs:288`，调用点在 `rpc/board.rs:54`；
+    - 偏好键 `board_watchman_enabled` 现散在 `settings_store.rs:99,109`（读
+      `yi_agent_boards::watchman::PREFERENCE_KEY`）、`rpc/ui.rs`（2 处）、
+      `theme_tool.rs:44`、`server.rs:6474`、`rpc_tests.rs:13886`；`settings_store.rs` 的
+      相关测试在 `:377,393,784,807`。
+    - CLI：`Command::Boards` / `BoardsAction` 在 `config.rs:188-201`（注释「常驻值守」），
+      `main.rs:81-84` 分发、`main.rs:238` `run_boards_watch`、`main.rs:4705` 一条 CLI 测试。
+    - `tui/app.rs` 的 `global_dir()` 调用点在 **`:2751`**（初稿写 2745）。
+11. **Task 6 的 `rpc_tests.rs` 面**：Board 方法表在 `rpc_tests.rs:2911-2913`
+    （`("board/create", Domain::Board)` 等）；另有 `board_dir` 隔离目录（`:1564,1569,1737,
+    1789`）。Task 1 已把该文件从 70 条表里 +2 行（`resident/*`）。
+12. **`yi-agent-supervisors` 新增 `Layout::logs_dir()`**（main `080fa293`）：Task 3 去
+    专有名时**只动 `state_dir`**，保留 `logs_dir()` / `ChildLog`（见 spec §5.6 注）。
+13. **main 新引入 `is_kanban_worktree`**（`e222f2b3`/`9882faf8`，`server.rs`→
+    `thread_store.rs:139`）：按物理路径约定 `.worktrees/kanban/` 识别插件 worktree，
+    不读 board registry。**Task 6/7 的 grep 归零必须先裁定它的归属**（spec §5.2 三选一）。
+14. **验收 grep 命令本身要改**（spec §6.2 已给出新命令）：初稿那条**大小写敏感**会
+    假通过（漏 `Board*`），且**未排除 `onboarding`** 而 `grep "board"` 命中
+    `onboarding*`，**永不归零**。Task 7 用 spec §6.2 的 `-i` + `onboarding` 版。
+
 ## Global Constraints
 
 - 宿主非测试代码中不得出现看板语义：`kanban` / `board` / `卡片`（通用插件机制除外）。
@@ -53,6 +88,12 @@ G1 之后宿主结构变了，初稿的文件路径与依赖面已过时；实�
 ---
 
 ### Task 1: 宿主通用面——`resident/list` RPC，并摘掉 `plugin_query` 的看板门控
+
+> **状态：已完成**（`19bc06f5` + 修复 `5a201c49`；评审与复审均干净）。
+> 下列 Step 1–5 保留为已执行记录。产出：`rpc/resident.rs`（`resident/list`）、
+> `rpc/mod.rs` 的 `Domain::Resident`、`server.rs` 的 `plugin_query` 去门控与 `global` 形参、
+> `yi-agent-store/src/resident.rs` 的 `entries(dir)`；重复的 stdio 泵抽进
+> `crate::test_support::rpc_over_stdio`。测试：`-p yi-agent-app-server --lib` 784 通过 / 0 失败。
 
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent-app-server/src/server.rs`（`plugin_query` 去门控）
@@ -506,7 +547,7 @@ git commit -m "refactor(desktop): create and remove boards through the plugin ch
 - Delete: `yi-agent-rs/crates/yi-agent-app-server/src/rpc/board.rs`；`rpc/mod.rs` 的
   `Domain::Board` 与 `BoardPluginState` 的 `board_dir`/`board_launcher`
 - Delete: `yi-agent-rs/crates/yi-agent-boards/`（整 crate）
-- Modify: `yi-agent-app-server/src/{server.rs, protocol.rs, settings_store.rs, rpc/ui.rs, ws.rs, lib.rs, Cargo.toml, rpc_tests.rs}`
+- Modify: `yi-agent-app-server/src/{server.rs, protocol.rs, settings_store.rs, rpc/ui.rs, ws.rs, lib.rs, Cargo.toml, rpc_tests.rs, thread_store.rs, rpc/thread.rs, worktree_reclaim.rs, theme_tool.rs}`
 - Modify: `yi-agent-rs/Cargo.toml`（workspace members）
 - Modify: `yi-agent/src/{main.rs, config.rs, tui/board.rs, tui/superpowers_kanban.rs, tui/app.rs, Cargo.toml}`
 - Modify: `yi-agent/tests/{board_e2e.rs, board_watchman_e2e.rs}`
@@ -519,6 +560,12 @@ git commit -m "refactor(desktop): create and remove boards through the plugin ch
   （`board_watchman_enabled` → `resident_daemon_watchman_enabled`，旧键兼容读）。
 
 - [ ] **Step 1: 写失败测试**
+
+> **实测漂移（刷新 10/12）**：`tui/app.rs` 的 `global_dir()` 调用点在 **`:2751`**（非 2745）；
+> `Layout` 去专有名时**保留 `logs_dir()`**（main `080fa293` 新增，托管子进程日志落点）。
+> `board_watchman_enabled` 的现存落点：`settings_store.rs:99,109`（经
+> `yi_agent_boards::watchman::PREFERENCE_KEY`）、`rpc/ui.rs`（2 处）、`theme_tool.rs:44`、
+> `server.rs:6474`、`rpc_tests.rs:13886`；`settings_store.rs` 的读写测试在 `:377,393,784,807`。
 
 ```rust
     #[test]
@@ -545,22 +592,35 @@ Expected: FAIL
   （Task 1 已摘门控，宿主不再有「这个项目没有看板」这个回答），其余码位换算为通用名
   （`daemon_unavailable` / `plugin_unavailable` / `plugin_not_installed` /
   `plugin_rejected` 本已通用，保留；数值码 `-32021..-32024` 保持不动）。
-  `protocol.rs` 的 `board_query_numbers_each_reason_without_renumbering` 与
-  `server.rs` 的 `a_query_without_a_registered_board_is_refused_with_its_own_code`、
-  `the_rpc_maps_a_missing_board_to_its_own_code_in_data` 三条测试同步更新
-  （前两条随码删除，第三条改为断言通用码）。
+  `protocol.rs` 的 `board_query_numbers_each_reason_without_renumbering`（`protocol.rs:723`，
+  `board_not_created` 断言在 `:738`）同步更新（随码删除）。
+  > **Task 1 已改过的**：`a_query_without_a_registered_board_is_refused_with_its_own_code`
+  > 已删、`the_rpc_maps_a_missing_board_to_its_own_code_in_data` 已更名为
+  > `the_rpc_reports_a_missing_daemon_in_data_for_an_unregistered_project` 并改断言
+  > `daemon_unavailable`（`server.rs:6736`/`:6749` 是 Task 1 新写的门控测试）。**本任务
+  > 不要再按初稿的旧测试名去找**。
 - `settings_store.rs` + `rpc/ui.rs`：偏好键改名 + 旧键兼容读；`ui/settings/read|write`
-  的字段名同步（桌面 Task 5 已改）。
+  的字段名同步（桌面 Task 5 已改）。实测落点：`settings_store.rs:99,109`（现读
+  `yi_agent_boards::watchman::PREFERENCE_KEY`）、`rpc/ui.rs`（2 处）、`theme_tool.rs:44`、
+  `server.rs:6474`、`rpc_tests.rs:13886`；`settings_store.rs` 的读写测试在 `:377,393,784,807`。
 - `ws.rs`：去 `board_dir` 注入；`plugin_command` 注入按 §4.4 裁定处理。
-- `server.rs`：删 `ensure_watchman_installed` 的看板调用点（或其通用化落点）、
-  `board_dir` 局部量、`board_launcher` 句柄；`spawn_board_watchman_loop` 更名
+- `server.rs`：删 `ensure_watchman_installed`（`server.rs:288`，调用点 `rpc/board.rs:54`）
+  的看板调用点（或其通用化落点）、`board_dir` 局部量、`board_launcher` 句柄；
+  `spawn_board_watchman_loop`（`server.rs:1456`，调用点 `:1496`/`:1581`）更名
   （`spawn_resident_watch_loop`）并改调 `yi_agent_supervisors::watch`。
+- **`is_kanban_worktree` 归属裁定**（spec §5.2 三选一，见刷新 13）：
+  `thread_store.rs:139`（另见 `:161` 与 `rpc/thread.rs`、`worktree_reclaim.rs`）按物理路径
+  `.worktrees/kanban/` 识别插件 worktree。**这是 main `e222f2b3`/`9882faf8` 新引入的既有面**：
+  要么保留为通用「插件 worktree 前缀」约定（只中性化命名）、要么改读 §5.5 的通用
+  `managed_worktree` 标记、要么由插件侧声明前缀。**不定归属则 Task 7 的 grep 不可能归零**。
+  同处的 `board_project`/`card_id` meta **旧键别名**（`thread_store.rs:56-58`）保留兼容读。
 - 删 `Cargo.toml` 的 `yi-agent-boards` 依赖（app-server 与 `yi-agent` 两处）、
   `lib.rs` 相关 `use`、workspace members 一行。
 - `yi-agent`(TUI/CLI)：`tui/board.rs` 改走插件通道（或改为提示）；
   `tui/superpowers_kanban.rs` 不再读 registry（改读 `resident::list`）；
-  `tui/app.rs:2745` 去掉 `global_dir()`；`main.rs`/`config.rs` 的 `resident watch`
-  已在 Task 3 落地，此处删残留的 `yi_agent_boards` 引用。
+  `tui/app.rs:2751` 去掉 `global_dir()`；`main.rs`/`config.rs` 的 `resident watch`
+  已在 Task 3 落地，此处删残留的 `yi_agent_boards` 引用（`main.rs:81-84` 分发、
+  `main.rs:238` `run_boards_watch`、`config.rs:188-201`、CLI 测试 `main.rs:4705`）。
 - `tests/board_{e2e,watchman_e2e}.rs`：改断言新通道/新子命令（仍受
   `YI_AGENT_BOARD_E2E` 闸保护）。
 
@@ -604,13 +664,20 @@ Expected: 全绿
 
 - [ ] **Step 3: grep 归零核对**
 
-Run:
+Run（**必须用 `-i` 并排除 `onboarding`**，见刷新 14 / spec §6.2）:
 ```bash
-grep -rn "kanban\|board" yi-agent-rs/crates/yi-agent-app-server/src/ \
-  yi-agent-rs/crates/yi-agent-supervisors/src/ yi-agent-rs/crates/yi-agent/src/ \
-  --include=*.rs | grep -viE "keyboard|clipboard|test|//" | head
+grep -rni "kanban\|board\|卡片" \
+  yi-agent-rs/crates/yi-agent-app-server/src/ \
+  yi-agent-rs/crates/yi-agent-supervisors/src/ \
+  yi-agent-rs/crates/yi-agent/src/ --include=*.rs \
+  | grep -viE "keyboard|clipboard|onboarding|test|//|#\[cfg\(test\)\]"
 ```
-Expected: 无命中（仅允许注释中的历史说明与通用插件机制）
+Expected: 无命中（仅允许注释中的历史说明与通用插件机制）。
+
+> 初稿那条命令有两处错（实测）：① 大小写敏感会漏 `Board` / `BoardPluginState` /
+> `BoardQueryError` / `BoardLauncher`（**假通过**，实测 48 行）；② 未排除 `onboarding`
+> 而 `grep "board"` 命中 `onboarding*`（**永不归零**，仅 `rpc_tests.rs` 就 ≥14 行）。
+> 跑之前先落实 Task 6 的 `is_kanban_worktree` 归属裁定（刷新 13）。
 
 - [ ] **Step 4: 更新 Spec 4 状态**
 
@@ -640,4 +707,7 @@ git commit -m "docs: note that the plugin lifecycle decoupling completes spec 4"
 - **顺序依赖**：Task 1 → 2 → 3 → 4 → 5 → 6 → 7；Task 1 是 Task 5/6 的前提
   （`resident/list` 先于删 `board/list`）；Task 3 的 plist/CLI 与 Task 6 的 crate 删除
   必须分两次落地（先迁后删），但 plist 的子命令字符串不允许中间态指向不存在的命令。
+- **刷新（第二次，main +98 提交后）**：Task 1 已完成；Task 3/6/7 的行号与引用已按
+  `bf6e1971` 实测更新；验收 grep 命令已修正（`-i` + 排 `onboarding`）；
+  新引入的 `is_kanban_worktree` 需先定归属（Task 6）。详见顶部「第二次刷新说明」。
 - **未决**：Task 4 的 create 半程待 spec §4.4 裁定（方案 A/B/C）。
