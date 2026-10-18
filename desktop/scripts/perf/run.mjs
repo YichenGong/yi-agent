@@ -19,6 +19,7 @@ const SCRIPTS = [
   ["render.mjs", "§1.1(b)  per-delta re-render + the three render shapes"],
   ["markdown.mjs", "§1.1(c)  streaming markdown, quadratic over a turn"],
   ["wire.mjs", "§8.1     frame bytes per delta (funnel item background)"],
+  ["checkpoint.mjs", "§3.4     why the turn checkpoint must not be thinned"],
 ];
 
 for (const [script, title] of SCRIPTS) {

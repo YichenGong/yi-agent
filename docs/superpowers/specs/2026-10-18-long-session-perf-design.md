@@ -87,12 +87,19 @@ final= 20000 chars  wall=1883 ms
 final= 40000 chars  wall=8035 ms
 ```
 
-**(d) 服务端：checkpoint 每 500ms 整份重写**
+**(d) 服务端：checkpoint 整份重写——实测后判定**不是**瓶颈**
 
-driver 每收到一个 `ItemCompleted` 置 `checkpoint_dirty`（`server.rs:4452`），
+driver 每收到一个 `ItemCompleted` 置 `checkpoint_dirty`（`server.rs:4451`），
 500ms tick 触发 `checkpoint`（`server.rs:4334`、`:4557`），经
 `write_partial` → `write_atomic`（`thread_store.rs:659`、`:833`）**原子重写整份
 快照**，其中 `messages`（`build_partial`，`server.rs:3679`）随会话线性增长。
+
+第一版设计把它当成热点并提出降频。**实测推翻了这一点**：真实 checkpoint 最大
+1224 KiB，单次写入（序列化 + `write_atomic`）约 **9.3 ms**，每 500ms 最多一次
+（不足 driver 墙钟的 2%），且它在**该 thread 自己的 driver task** 里、
+不在共享主循环上。它正是"崩溃后能看到已产出内容"的保证——用户明确要求
+「崩溃后还是每次都能看到，不要丢东西」。故 **§3.4 已撤回优化，改为回归保护**；
+这里保留证据以免读者以为漏查。
 
 **(e) TUI：流式期间每帧全表指纹扫描 + tail 重解析**
 
@@ -108,10 +115,13 @@ driver 每收到一个 `ItemCompleted` 置 `checkpoint_dirty`（`server.rs:4452`
 
 ### 1.2 为什么这值得一份 spec
 
-四项症状同源（"每帧做与全会话成正比的工作"），但落在**四个不同模块**，
-且其中两处（前端数据层 / 渲染层）**互相依赖**：只修数据层，渲染层仍每帧 O(N)；
+三项症状同源（"每帧做与全会话成正比的工作"），落在**三个不同模块**，
+其中两处（前端数据层 / 渲染层）**互相依赖**：只修数据层，渲染层仍每帧 O(N)；
 只修渲染层，`item/delta` 的**就地修改**会让 memo 永远命中、界面直接冻住（见 §3.1）。
 所以它们必须一起设计、一起验收。
+
+第四项（服务端 checkpoint）**经实测判定不是瓶颈**，已从优化目标降级为回归保护
+（§3.4）——它对应的是用户的另一条要求「崩溃后还是每次都能看到，不要丢东西」。
 
 ## 2. 目标与非目标
 
@@ -122,12 +132,18 @@ driver 每收到一个 `ItemCompleted` 置 `checkpoint_dirty`（`server.rs:4452`
 - **G2 前端渲染层**：流式期间每帧重渲染的元素数**与历史条数无关**（只重渲染活跃尾部）。
 - **G3 前端 markdown**：流式期间重解析次数**脱离 delta 频率**（按时间节流），
   整轮成本从 O(N²) 降为 O(N²/常数)。
-- **G4 服务端 checkpoint**：不再"每 500ms 无条件重写整份快照"，
-  且随会话线性增长的那部分（`messages`）降频；**持久化格式与崩溃恢复语义不动**。
+- **G4 服务端 checkpoint：不许退化（非优化目标）**。实测 checkpoint**本来就不是瓶颈**
+  （见 §3.4），且它正是"崩溃后每次都能看到已产出内容"的保证。故本项**不做降频、
+  不做减载**，只加**回归保护**：用测试钉死"每个已完成 item 都会被写入 checkpoint"
+  与"崩溃恢复能看到全部已完成内容"这两条现有行为，防止后续优化（包括本 spec 的部分）
+  把它弄丢。
 - **G5 TUI**：流式期间每帧的 cell 遍历不随历史长度增长；新增**历史舍弃**上限，
   闭合 `docs/bug-list.md:57`。
 - **G6 零语义回归**：协议不变、线路上字节不变、转录内容与顺序不变、
   持久化格式不变。（帧的**数量/时序**也不变——见非目标。）
+- **G7 崩溃恢复不丢东西（用户硬要求）**：任何改动都**不得**减少崩溃后可恢复的内容。
+  现状是"每个已完成的 item 都落 checkpoint、turn 开始即落提问"，这一行为必须
+  **原样保留**并被测试钉死。本 spec 明确**不**为性能牺牲恢复完整度（见 §3.4）。
 
 ### 非目标
 
@@ -301,33 +317,61 @@ O(N²/常数)（实测 40k 字符整轮 8035ms 量级，按 60ms 窗口估算可
 **注意**：这不是把平方变线性——若要做到线性需引入增量 markdown 解析，
 YAGNI，本 spec 不做；判断依据写在 §6。
 
-### 3.4 服务端：checkpoint 降频与减载（G4）
+### 3.4 服务端：checkpoint 不做优化，改为回归保护（G4）
 
-**约束（用户选中"不改格式"）**：不改 `PartialTurn` 的结构、不改
-`write_atomic` 的原子语义、不改 `clear_partial`/`promote_partial` 的恢复判据。
+**本节是对第一版设计的撤回。** 第一版提出"把随会话增长的 `messages` 降频"，
+以此降低写入成本。用户的否决是：「**我希望崩溃后还是每次都能看到。不要丢东西**」。
+实测后确认该否决完全成立，且原方案在技术上也站不住。
 
-**做法**（三步，均不触碰格式）：
+**实测（用仓库里的真实 checkpoint 文件，非构造数据；脚本
+`desktop/scripts/perf/checkpoint.mjs`）**：
 
-1. **去掉无条件周期写**。现在 `checkpoint_tick`（`server.rs:4330-4334`）
-   每 500ms 触发，靠 `checkpoint_dirty` 门控（`:4557`）。这个门控**已经是对的**——
-   问题在于 tick 间隔固定、且一个长 turn 里 `checkpoint_dirty` 会被反复置位
-   （每个 `ItemCompleted`，`:4452`），于是写频率 ≈ 2 次/秒，**与内容量无关**。
-   改为**尾沿防抖**：最后一次脏标记之后静默 `CHECKPOINT_IDLE_MS`（建议 1500ms）
-   才写一次，且**上限**为"每 `CHECKPOINT_MAX_MS`（建议 10s）必写一次"
-   （避免长 turn 里永不稳定、崩溃丢太多）。
-2. **`messages` 降频**。`build_partial`（`server.rs:3679`）每次都克隆整个
-   `agent.session().messages()`，这才是随会话线性增长的那部分。改为
-   **items 每次写、messages 按更长周期写**（建议每 `CHECKPOINT_MAX_MS` 写一次），
-   因为：崩溃恢复的**用户可见内容**由 items 承载，而 messages 只影响
-   "恢复后模型还记得多少上下文"。
-   **诚实说明**：这**确实**会在极端情况下（崩溃于两次 messages 写之间）
-   让恢复出的上下文比 items 少一点。这是**用「崩溃恢复的上下文完整度」换写入成本**
-   的取舍，必须写进代码注释与 §6 验收说明，不能默默做。
-3. **只在 `checkpoint_dirty` 时写、写完立刻落 `clear` 路径不变**：现有
-   "turn 结束时 `clear_partial`"（`:4314` 等）**不动**——它是正确性的一部分。
+```
+6 个真实 partial：231 KiB ~ 1224 KiB
+  字节占比差异很大：有的 items 74~77%、messages 21~22%；
+                    有的 items 仅 9~10%、messages 74~83%
+最大那个（1224 KiB）：序列化 3.31 ms + write_atomic(tmp+fsync+rename) 5.96 ms
+                     ≈ 9.3 ms / 次，每 500 ms 最多一次 ≈ driver 墙钟的 1.9%
+```
 
-**为什么不做增量 append 格式**：那要重新设计"checkpoint 与正式 turn 如何区分"，
-是独立的持久化正确性问题，风险面与"越用越慢"不同（用户已确认属非目标）。
+三条结论：
+
+1. **checkpoint 不是瓶颈。** 最坏约 9.3ms / 每 500ms 一次（不足 driver 墙钟 2%），
+   且它在**该 thread 自己的 driver task** 里（`store: Arc<ThreadStore>`，
+   `server.rs:4170`），不在共享主循环上。与其他四项（每帧 O(N)、整轮 O(N²)）不同量级。
+2. **"降频 messages 省不到多少"这个说法不成立——但结论反而是"更不能动它"。**
+   占比因会话而异：有的快照 messages 占 74~83%，在那种会话里降频 messages
+   *确实*能省下大头。**可见性上省得少、有的会话省得多，正是它危险的地方**：
+   收益不确定，而代价确定——**崩溃后模型少记得一段上下文**。
+   用户明确要求「崩溃后还是每次都能看到，不要丢东西」，故不做。
+3. **现有行为正是用户要的。** 真实 partial 里已有上百条 `agentMessage` +
+   `toolCall`，说明流式产出确实逐条落盘、崩溃后确实能恢复。
+   用户的要求不是"改"，是"**别弄坏**"。
+
+**因此本节的做法是：不改行为，只加保护。** 具体：
+
+- **不动** `checkpoint_tick` 的 500ms 间隔与 `checkpoint_dirty` 门控——它是
+  "长 turn 里每个 item 都同步写一次"与"崩溃丢太多"之间的现有折中，实际成本最坏
+  约 9.3ms/500ms（不足 driver 墙钟 2%），不构成瓶颈。
+- **不动** `messages` 的写入频率。`agent.session().messages().to_vec()`
+  （`server.rs:4283`、`:4565`）是对 `agent.rs:629`
+  `self.session.lock().clone()` 的全量克隆——它**看起来**浪费，且在某些会话里
+  确实占大头（实测最高 93% 字节），但**省它就要牺牲恢复完整度**，
+  而用户的要求是"不要丢东西"。若将来要动，应作为**独立的**"减少每 tick 克隆"
+  议题评估（例如只在内容真变时克隆），而不是夹在这份 spec 里顺手改。
+- **不动** `clear_partial` / `promote_partial` 的恢复判据
+  （`thread_store.rs:691`、`partial_is_committed` `:273`）——它们是正确性核心。
+
+**新增回归保护**（这是本节唯一的交付）：
+
+1. **"逐条落盘"不变量**：测试断言一个含 N 个 `ItemCompleted` 的 turn，在任意
+   时序下崩溃，`load` + `promote_partial` 恢复出的 items **不少于**
+   崩溃前已完成的 items（即"不丢东西"）。
+2. **"提问必落"不变量**：turn 开始即写一次 checkpoint（`server.rs:4275`），
+   断言"这一轮随后立刻崩溃也不丢提问"——现有注释如此声明，但缺测试钉住。
+3. **频率上限保护**：断言 checkpoint 写入次数**不随 item 数线性增长**
+   （即 500ms 防抖继续生效）。这条是防止有人日后改成"每个 item 写一次"。
+   注意：它**不是**要求"写得更少"，而是要求"别变多"。
 
 ### 3.5 TUI：脏 cell 集合 + 历史舍弃上限（G5）
 
@@ -373,7 +417,7 @@ YAGNI，本 spec 不做；判断依据写在 §6。
 | 1 | §3.1 第一层：`indexOfItem` 末尾快路径 | — | `session.test.ts` |
 | 2 | §3.2：`ChatItem` memo + 冻结前缀 + `structuralVersion` | 1 | `ChatView.test.tsx`、`App.test.tsx` |
 | 3 | §3.3：流式 markdown 节流 | 2 | `ChatView.test.tsx`、`MarkdownText.test.tsx` |
-| 4 | §3.4：checkpoint 尾沿防抖 + messages 降频 | — | `yi-agent-app-server` 既有 checkpoint 测试 |
+| 4 | §3.4：checkpoint 回归保护（**无行为变更**） | — | 新增"不丢东西"用例 + `yi-agent-app-server` 既有 checkpoint 测试 |
 | 5 | §3.5：TUI 脏集合 + 舍弃上限 | — | `history.rs` 计数器测试、`app.rs:7854` 同型门禁 |
 
 第 1、4、5 步彼此独立，可并行；第 2、3 步有先后依赖。
@@ -384,7 +428,7 @@ YAGNI，本 spec 不做；判断依据写在 §6。
 |---|---|---|
 | 1 | 冻结前缀导致历史项**不更新**（就地修改被 memo 吞掉） | `structuralVersion` 只对三类结构性变更自增（§3.2）；**必须**有测试覆盖推理块就地接管、`item/completed` 替换、`dropLocalUserMessage` 三条路径下历史仍更新 |
 | 2 | markdown 节流吞掉**终值** | 节流窗口尾沿必须补发；流式结束（`turn/completed` / `item/completed`）必须立即渲染终值（§3.3） |
-| 3 | checkpoint messages 降频 → 崩溃恢复上下文变少 | 显式取舍（§3.4.2），写进注释与验收说明；items 仍每次写，**用户可见内容不丢** |
+| 3 | ~~checkpoint messages 降频 → 崩溃恢复上下文变少~~ | **已消除**：该优化已撤回（§3.4）。用户要求「崩溃后还是每次都能看到」，故 checkpoint 行为**完全不动**，只加回归保护 |
 | 4 | TUI 舍弃历史后滚动位置错乱 | 复用既有 anchor/reconcile 路径；新增测试断言舍弃后 `scroll_offset` 收敛 |
 | 5 | 前端状态字段（`structuralVersion`）与 React 渲染时序不一致（异步 batch） | 只把它当**重置键**用（结构变即重建），不参与任何内容计算 |
 | 6 | `App.tsx` 是新架构热点文件，与其它在途卡片冲突 | 本 spec 对 `App.tsx` 的改动**限于** §3.2 的接线与 `structuralVersion` 透传；已确认 `perf/ipc-responsiveness` 改的是 `server.rs` 主循环与 crate 树，**文件不重叠** |
@@ -399,7 +443,7 @@ YAGNI，本 spec 不做；判断依据写在 §6。
 | G1 | `cd desktop && npx vitest run src/lib/session.test.ts` | 新增用例：以 O(1) 计数器（探针包住 `findIndex`）断言"主键打到末尾项时扫描次数为常数，与 `items.length` 无关" |
 | G2 | `cd desktop && npx vitest run src/components/ChatView.test.tsx` | 新增用例：4000 项历史 + 1 个流式 delta，断言**历史前缀子树的 render 计数为 0**（React Profiler 或 spy）；并断言"就地修改历史项后 UI 立即更新"（覆盖 §5 风险 1 的三条路径） |
 | G3 | `cd desktop && npx vitest run src/components/ChatView.test.tsx` | 新增用例：同一文本连续 100 个 delta，断言 markdown 渲染（`ReactMarkdown` 调用次数）**远小于** 100，且**流式结束后终值已渲染** |
-| G4 | `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib` | 新增用例：模拟长 turn（大量 `ItemCompleted`），断言 checkpoint 写入次数**不随 item 数线性增长**（计数器）；既有恢复/崩溃用例全绿 |
+| G4 | `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib` | 新增"不丢东西"用例：(a) 含大量 `ItemCompleted` 的 turn 在任意时刻"崩溃"后，`load` + `promote_partial` 恢复出的 items 不少于崩溃前已完成的 items；(b) turn 开始即崩溃也不丢提问；(c) 写入次数不随 item 数线性增长（防抖仍生效）。既有恢复/崩溃用例全绿 |
 | G5 | `cd yi-agent-rs && cargo test -p yi-agent --bin yi-agent` | 沿用 `lines_call_count` / `rebuild_count` 范式：断言流式 N 个 token 的 cell 重渲染数与 `cells.len()` 无关；断言超出上限后 cells 收敛且滚动位置正确 |
 | 全局 | `cd desktop && npx vitest run && npx tsc --noEmit` + 各 crate 测试 | 无回归 |
 
@@ -410,7 +454,8 @@ YAGNI，本 spec 不做；判断依据写在 §6。
 **判断依据（何时需要后续 spec）**：
 - 若 §3.2 落地后真机单帧仍 >4ms → 虚拟化（另开 spec）。
 - 若 §3.3 落地后长回复仍呈明显平方感 → 增量 markdown 解析（另开 spec）。
-- 若 §3.4 的 messages 降频被证明影响恢复体验 → 增量 checkpoint 格式（另开 spec）。
+- 若另有数据表明 checkpoint 写入成为真实瓶颈（当前实测最坏 9.3ms/500ms，
+  不足 driver 墙钟 2%）→ 那时再单独开 spec，且**必须同时保证"崩溃后不丢东西"**。
 
 ## 7. 复现脚本（本次实测所用，已入库）
 
@@ -423,7 +468,8 @@ YAGNI，本 spec 不做；判断依据写在 §6。
 | `render.mjs` | §1.1(b) 与 §3.2：每 delta 重渲染 + 三种渲染形态对比 |
 | `markdown.mjs` | §1.1(c)：流式 markdown 的单次解析与整轮平方级 |
 | `wire.mjs` | §8.1：每帧字节放大（第五项的背景数据） |
-| `run.mjs` | 依次跑全部上面五项 |
+| `checkpoint.mjs` | §3.4：真实 `.partial.json` 的字节构成与写入成本（**"不丢东西"的依据**） |
+| `run.mjs` | 依次跑全部上面六项 |
 
 运行：
 

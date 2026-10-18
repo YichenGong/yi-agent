@@ -34,7 +34,12 @@ node scripts/perf/index-lookup.mjs # §3.1：三种查找策略的对照（关�
 node scripts/perf/render.mjs      # §1.1(b)：每 delta 的全量重渲染开销
 node scripts/perf/markdown.mjs    # §1.1(c)：流式 markdown 的平方级退化
 node scripts/perf/wire.mjs        # §1.1(a) 的帧字节放大（第五项的背景数据）
+node scripts/perf/checkpoint.mjs  # §3.4：checkpoint 为何不能减载（"不丢东西"）
 ```
+
+`checkpoint.mjs` 读的是**这台机器上真实的 `.partial.json`**（沿 cwd 向上找
+`.yi-agent/threads`，再试 `$HOME`）；找不到任何快照时它**如实报告"没有可测的
+数据"并退出 0**，而不是构造假数据冒充基准。
 
 `run.mjs` 会把 `session.ts` 打包到系统临时目录（`os.tmpdir()`）下的
 `yi-agent-perf/`，不写入仓库。
