@@ -19127,6 +19127,287 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    /// 闸门式 provider:第 1 次**对话**调用挂起在闸门上(模拟"后台的 LLM 调用
+    /// 已在飞、响应还没回来"的窗口),放行后吐一个工具调用;第 2 次对话调用把收到
+    /// 的消息原样记下来再收尾。
+    ///
+    /// 标题生成(`system == TITLE_INSTRUCTIONS`)不是对话轮次,立刻答:否则它会把
+    /// 闸门的第 1 次让掉,测试就永远等不到「后台正在跑」这个落点。
+    struct GatedToolProvider {
+        conversation_calls: AtomicUsize,
+        /// 后台已进入第 1 次对话调用(后台 turn 确实在跑)。
+        entered: Arc<tokio::sync::Notify>,
+        /// 放行第 1 次调用(测试用它把「后台的模型调用在飞」这一段精确框出来)。
+        release: Arc<tokio::sync::Notify>,
+        /// 第 2 次及以后每次对话调用收到的完整消息列表。
+        later_messages: Arc<std::sync::Mutex<Vec<Vec<yi_agent_core::Message>>>>,
+    }
+
+    #[async_trait]
+    impl yi_agent_core::Provider for GatedToolProvider {
+        async fn call_stream(
+            &self,
+            req: yi_agent_core::provider::ProviderRequest,
+        ) -> Result<
+            futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+            yi_agent_core::provider::ProviderError,
+        > {
+            use yi_agent_core::provider::{ProviderEvent as E, StopReason};
+            if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+                return Ok(futures::stream::iter(vec![
+                    E::TextDelta("t".into()),
+                    E::Stop {
+                        reason: StopReason::EndTurn,
+                    },
+                ])
+                .boxed());
+            }
+            if self.conversation_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                // 后台这一轮停在"模型调用在飞"的窗口里,直到测试放行。
+                self.entered.notify_one();
+                self.release.notified().await;
+                return Ok(futures::stream::iter(vec![
+                    E::ToolUseStart {
+                        id: "c1".into(),
+                        name: "glob".into(),
+                    },
+                    E::ToolUseDelta {
+                        id: "c1".into(),
+                        partial_json: r#"{"pattern":"*.md"}"#.into(),
+                    },
+                    E::ToolUseEnd { id: "c1".into() },
+                    E::Stop {
+                        reason: StopReason::EndTurn,
+                    },
+                ])
+                .boxed());
+            }
+            self.later_messages
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(req.messages.clone());
+            Ok(futures::stream::iter(vec![
+                E::TextDelta("background done".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ])
+            .boxed())
+        }
+    }
+
+    fn gated_lead_factory(
+        provider: Arc<GatedToolProvider>,
+    ) -> impl Fn(
+        Option<yi_agent_core::Session>,
+        &Path,
+        crate::thread_store::ThreadMode,
+    ) -> anyhow::Result<BuiltAgent>
+    + Send
+    + Sync
+    + 'static {
+        let provider: Arc<dyn yi_agent_core::Provider> = provider;
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(Arc::clone(&provider), session, cwd, mode)
+        }
+    }
+
+    /// **前台请求让后台 turn 在工具边界让位**(spec §6.3;计划 Task 8)。
+    ///
+    /// 复刻:组长的一轮**后台** turn 正在跑(provider 已进入第 1 次对话调用、还
+    /// 没回来——即"后台的 LLM 调用在飞"),此刻前台来一条请求。断言四件事:
+    ///
+    /// 1. 前台请求**当场被接受**(`turn/interject` 立刻返回 `turn_id` +
+    ///    `interjection_id`),不必等后台那次模型调用回来;
+    /// 2. 投影(`thread/list`)在这期间照常秒回——它读同一份状态,不等后台的 LLM
+    ///    调用(spec §6.3 第三条「前台是投影」);
+    /// 3. 放行后台的模型调用后,它在**工具边界**(ACT 之后、下一次 THINK 之前)
+    ///    折叠前台文本(`inject_pending`),文本带 `INTERJECTION_PREFIX` 进了同一
+    ///    turn 的下一次请求,且**已完成那一轮的进度不丢**(工具结果仍在上下文里);
+    /// 4. 这一切都发生在**同一个 turn** 里(收尾的 `turn_id` 与前台请求拿到的
+    ///    `turn_id` 相同),前台文本也**没有**被退回给客户端。
+    ///
+    /// 这一整条链**只用既有原语**:driver 的 `select!` 在 turn 运行期间就轮询
+    /// `interject_rx`(`server.rs` 的 driver 内层 select),消息进 core 的 inbox,
+    /// 由 `inject_pending` 在边界折叠。故本任务零 core 改动。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_foreground_request_makes_the_background_turn_yield() {
+        const BACKGROUND: &str = "后台自己找的活";
+        const FOREGROUND: &str = "用户刚说的话";
+        /// `INTERJECTION_PREFIX` 里稳定的一段:证明文本是**折叠**进来的,而不是
+        /// 被当成一个全新 prompt 重放。
+        const PREFIX_MARKER: &str = "Fold it into the current task";
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let provider = Arc::new(GatedToolProvider {
+            conversation_calls: AtomicUsize::new(0),
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            later_messages: Arc::new(std::sync::Mutex::new(Vec::new())),
+        });
+        let mut cfg = test_config();
+        cfg.workdir = dir.path().to_path_buf();
+        let mut h = Harness::with_config(
+            cfg,
+            gated_lead_factory(Arc::clone(&provider)),
+            PERMISSION_TIMEOUT,
+        );
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+            .await;
+        let _ = read_response(&mut h, 1).await;
+        // 组长 meta 先落盘(真实用户路径:侧栏点过组长会话)。此刻它**还没有**
+        // driver,故下面的投递走冷启动路径——`prepare_turn_core` 会占住
+        // `active_turn_id`,这正是前台请求能被路由到**这一轮**的凭据。
+        let lead = rpc(&mut h, 2, "thread/lead", json!({})).await;
+        let lead_id = lead["result"]["thread_id"]
+            .as_str()
+            .expect("thread/lead must answer with a thread_id")
+            .to_string();
+
+        // ---- 后台 turn 起来:真走生产投递路径(lead_inbox → 主循环 → 组长 driver)----
+        Harness::deliver_lead_message_for_test(&h, dir.path(), "thread-sender-1", BACKGROUND);
+
+        // 等后台这一轮真的跑起来(provider 已进入第 1 次对话调用、尚未返回)。
+        tokio::time::timeout(EVENT_WAIT, provider.entered.notified())
+            .await
+            .expect("the background lead turn must reach its provider call");
+
+        // ---- 前台请求:后台还在跑(模型调用在飞)时就投,必须当场被接受 ----
+        let accepted_at = std::time::Instant::now();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"turn/interject","params":{{"threadId":"{lead_id}","input":[{{"type":"text","text":"{FOREGROUND}"}}]}}}}"#
+        ))
+        .await;
+        let interjected = read_response(&mut h, 3).await;
+        assert!(
+            interjected.get("error").is_none(),
+            "a foreground request must be accepted while the background turn runs: {interjected}"
+        );
+        let turn_id = interjected["result"]["turn_id"]
+            .as_str()
+            .expect("an accepted interjection must name its turn")
+            .to_string();
+        assert!(
+            interjected["result"]["interjection_id"].as_str().is_some(),
+            "expected an interjection_id: {interjected}"
+        );
+        assert!(
+            accepted_at.elapsed() < Duration::from_secs(5),
+            "accepting a foreground request must not wait for the background LLM call: took {:?}",
+            accepted_at.elapsed()
+        );
+
+        // ---- 投影:「前台是投影」——读同一份状态的 RPC 此刻照常秒回 ----
+        let projected_at = std::time::Instant::now();
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/list","params":{}}"#)
+            .await;
+        let listed = read_response(&mut h, 4).await;
+        assert!(
+            listed["result"]["threads"].is_array(),
+            "thread/list must answer while the background turn is running: {listed}"
+        );
+        assert!(
+            projected_at.elapsed() < Duration::from_secs(5),
+            "the projection must not wait for the background turn: took {:?}",
+            projected_at.elapsed()
+        );
+        // 后台那一轮此刻仍卡在它的模型调用上——上面的「秒回」才有意义。
+        assert!(
+            provider
+                .later_messages
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "the background turn must still be blocked in its provider call here"
+        );
+
+        // ---- 放行后台的模型调用:它做完工具调用后,在下一次 THINK 前折叠前台文本 ----
+        provider.release.notify_one();
+
+        let mut completed: Option<serde_json::Value> = None;
+        let mut folded_item: Option<serde_json::Value> = None;
+        let mut returned: Vec<serde_json::Value> = Vec::new();
+        for _ in 0..200 {
+            let v = h.read_value().await;
+            match v.get("method").and_then(|m| m.as_str()) {
+                Some("item/started") | Some("item/completed") => {
+                    let item = &v["params"]["item"];
+                    if item["type"] == "userInterjection" {
+                        folded_item = Some(item.clone());
+                    }
+                }
+                Some("turn/interjectionsReturned") => returned.push(v.clone()),
+                Some("turn/completed") => {
+                    completed = Some(v);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        let completed = completed.expect("the background turn must finish after its tool round");
+        assert_eq!(
+            completed["params"]["status"], "completed",
+            "the background turn must run to completion after yielding, not be killed: {completed}"
+        );
+        assert_eq!(
+            completed["params"]["turn_id"].as_str().unwrap(),
+            turn_id,
+            "the foreground request must be folded into the SAME turn the background was running"
+        );
+        assert_eq!(
+            completed["params"]["thread_id"].as_str().unwrap(),
+            lead_id,
+            "the yield must happen on the lead thread: {completed}"
+        );
+        assert!(
+            returned.is_empty(),
+            "an accepted foreground request must not be handed back to the client: {returned:?}"
+        );
+        let folded =
+            folded_item.expect("the folded foreground request must surface as a userInterjection");
+        assert_eq!(
+            folded["text"], FOREGROUND,
+            "the folded item carries the user's own words, not the prefixed copy: {folded}"
+        );
+
+        // ---- 让位不丢进度 + 文本确实折叠进了同一轮的下一次请求 ----
+        let later = provider
+            .later_messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let second = later
+            .last()
+            .expect("the turn must reach another THINK after its tool round")
+            .clone();
+        let injected = second
+            .iter()
+            .find(|m| {
+                m.content.iter().any(
+                    |b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t.contains(FOREGROUND)),
+                )
+            })
+            .unwrap_or_else(|| {
+                panic!("the folded foreground text must reach the next request: {second:?}")
+            });
+        assert!(
+            injected.content.iter().any(
+                |b| matches!(b, yi_agent_core::ContentBlock::Text(t) if t.contains(PREFIX_MARKER))
+            ),
+            "the folded text must carry the mid-turn prefix (folded, not replayed as a new prompt): {injected:?}"
+        );
+        assert!(
+            second.iter().any(|m| m
+                .content
+                .iter()
+                .any(|b| matches!(b, yi_agent_core::ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == "c1"))),
+            "the completed tool round must survive the yield (checkpoint semantics: 让位不丢进度): {second:?}"
+        );
+
+        h.shutdown().await;
+    }
+
     fn recording_agent_factory(
         seen: Arc<std::sync::Mutex<Vec<usize>>>,
     ) -> impl Fn(
