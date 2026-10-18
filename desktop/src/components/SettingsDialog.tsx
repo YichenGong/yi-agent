@@ -7,6 +7,8 @@ import { SettingsPluginsTab } from "./SettingsPluginsTab";
 import { SettingsModelsTab } from "./SettingsModelsTab";
 import { SettingsSkillsTab } from "./SettingsSkillsTab";
 import type { SkillsCall } from "../lib/skills";
+import { SettingsTagsTab } from "./SettingsTagsTab";
+import { DEFAULT_TAG_NAMES, type TagId } from "../lib/threadTags";
 
 /** 左侧 Tab 栏。加一个 Tab 只需往这张表里加项，再在下面渲染它的面板。 */
 const TABS = [
@@ -15,6 +17,7 @@ const TABS = [
   { id: "plugins", label: "插件" },
   { id: "models", label: "模型" },
   { id: "skills", label: "技能" },
+  { id: "tags", label: "标签" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -39,6 +42,8 @@ export function SettingsDialog({
   pluginDefaultProject,
   relayUrl,
   saveRelayUrl,
+  tagNames,
+  saveTagName,
 }: {
   open: boolean;
   /**
@@ -76,6 +81,10 @@ export function SettingsDialog({
    * `set_relay_url`）。缺省时保存按钮不可用（iOS 构建没有该 Tauri 命令）。
    */
   saveRelayUrl?: (value: string | null) => Promise<void>;
+  /** 已解析的标签显示名（6 键齐全）。缺省时「标签」Tab 只读回退默认名。 */
+  tagNames?: Record<TagId, string>;
+  /** 「标签」Tab 保存单个颜色显示名的接缝（写 ui/settings/write）。 */
+  saveTagName?: (tagId: TagId, name: string) => Promise<void> | void;
 }) {
   /**
    * 手机端的两级导航位置。桌面端恒为 `"panel"`（从不渲染分类列表）。
@@ -289,11 +298,16 @@ export function SettingsDialog({
                 />
               ) : active === "models" ? (
                 <SettingsModelsTab call={modelCall} isMobile={isMobile} />
-              ) : (
+              ) : active === "skills" ? (
                 <SettingsSkillsTab
                   call={skillsCall}
                   projects={skillsProjects ?? []}
                   defaultProject={skillsDefaultProject}
+                />
+              ) : (
+                <SettingsTagsTab
+                  tagNames={tagNames ?? DEFAULT_TAG_NAMES}
+                  onSave={saveTagName ?? (() => {})}
                 />
               )}
             </div>

@@ -50,6 +50,10 @@ const CARD_SCHEDULER_TICK: Duration = Duration::from_secs(3);
 /// 首轮 LLM 标题生成的超时:超时即回退兜底标题，绝不卡住 turn 收尾。
 const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 标签显示名的长度上限。必须与前端 `desktop/src/lib/threadTags.ts` 的
+/// `TAG_NAME_MAX_LEN` 一致——超出会撑破菜单。
+const TAG_NAME_MAX_LEN: usize = 24;
+
 /// `image/read` 每次回传的原始字节上限。传输帧上限 1 MiB,base64 膨胀 4/3 后
 /// 512 KiB 的原始块约 683 KiB,连同其它字段仍在单帧之内。
 pub(crate) const IMAGE_READ_CHUNK_BYTES: u64 = 512 * 1024;
@@ -2531,6 +2535,9 @@ where
                         // preferences.json，故一并从同一个 workdir 读。未配置即
                         // `null`，桌面首屏据此回填空串。
                         let relay_url = crate::settings_store::load_relay_url(workdir);
+                        // 标签显示名：与 theme/值守/中继同处一个 preferences.json，
+                        // 故同样从 workdir 读。只回**用户覆盖项**，默认名由前端持有。
+                        let tag_names = crate::settings_store::load_tag_names(workdir);
                         write_response(
                             &hub,
                             &client,
@@ -2540,6 +2547,7 @@ where
                                     "theme": theme.as_str(),
                                     "board_watchman_enabled": watchman_enabled,
                                     "relay_url": relay_url,
+                                    "tag_names": tag_names,
                                 }),
                             ),
                         )
@@ -2613,6 +2621,80 @@ where
                             None
                         };
 
+                        // 标签显示名：键必须是 6 色之一，值 trim 后非空且不超 24 字符。
+                        // 校验先于落盘——非法名字不该把一次有效的 relay_url 写了一半。
+                        let tag_updates: Option<
+                            std::collections::BTreeMap<String, String>,
+                        > = match req.params.get("tag_names") {
+                            None => None,
+                            Some(value) => {
+                                let Some(object) = value.as_object() else {
+                                    write_response(
+                                        &hub,
+                                        &client,
+                                        err_response(
+                                            id,
+                                            RpcError::invalid_params(
+                                                "tag_names must be an object of color id -> name",
+                                            ),
+                                        ),
+                                    )
+                                    .await?;
+                                    continue;
+                                };
+                                let mut updates = std::collections::BTreeMap::new();
+                                let mut error: Option<String> = None;
+                                for (key, value) in object {
+                                    if !crate::thread_store::is_valid_tag(key) {
+                                        error = Some(format!("unknown tag id '{key}'"));
+                                        break;
+                                    }
+                                    let Some(name) = value.as_str() else {
+                                        error = Some(format!("tag name for '{key}' must be a string"));
+                                        break;
+                                    };
+                                    let name = name.trim();
+                                    if name.is_empty() {
+                                        error = Some(format!("tag name for '{key}' must not be blank"));
+                                        break;
+                                    }
+                                    if name.chars().count() > TAG_NAME_MAX_LEN {
+                                        error = Some(format!(
+                                            "tag name for '{key}' exceeds {TAG_NAME_MAX_LEN} characters"
+                                        ));
+                                        break;
+                                    }
+                                    updates.insert(key.clone(), name.to_string());
+                                }
+                                match error {
+                                    Some(message) => {
+                                        write_response(
+                                            &hub,
+                                            &client,
+                                            err_response(id, RpcError::invalid_params(message)),
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                                    None => Some(updates),
+                                }
+                            }
+                        };
+                        if let Some(updates) = &tag_updates {
+                            let workdir = theme_handle.workdir();
+                            if let Err(error) =
+                                crate::settings_store::save_tag_names(workdir, updates)
+                            {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::internal(error.to_string())),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        }
+
                         // `relay_url`（桌面设置页）：与 theme 各写各的键，共处一个
                         // 文件，故两条路径都走 settings_store 的读-改-写。
                         // `null` / 空 / 空白 → 清除该键。非串非 null（客户端写错
@@ -2639,6 +2721,19 @@ where
                         }
                         write_response(&hub, &client, ok_response(id, json!({ "ok": true })))
                             .await?;
+                        // 名字落盘成功后广播权威覆盖映射（全局帧），让其它设备
+                        // 立即刷新菜单与搜索。放在最后：主题/中继的写入都已生效，
+                        // 且响应已先入队——读响应的一方必先见到 id，再见到通知。
+                        if tag_updates.is_some() {
+                            let names = crate::settings_store::load_tag_names(
+                                theme_handle.workdir(),
+                            );
+                            let _ = write_notification(
+                                &hub,
+                                &Notification::TagNamesUpdated { tag_names: names },
+                            )
+                            .await;
+                        }
                     }
                     "plugin/query" => {
                         // `project` names the project being queried, not the
@@ -4532,6 +4627,75 @@ where
                             }
                         }
                     }
+                    "thread/setTag" => {
+                        let Some(thread_id) =
+                            require_thread_id(&hub, &client, &req.params, id.clone()).await?
+                        else {
+                            continue;
+                        };
+                        // 参数校验先于 thread 存在性：非法颜色一律 `-32602`，
+                        // 与 setPinned 的「非布尔先报错」同一顺序。
+                        let raw = req
+                            .params
+                            .get("tag")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let tag: Option<String> = match raw {
+                            serde_json::Value::Null => None,
+                            serde_json::Value::String(s)
+                                if crate::thread_store::is_valid_tag(&s) =>
+                            {
+                                Some(s)
+                            }
+                            other => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(
+                                        id,
+                                        RpcError::invalid_params(format!(
+                                            "tag must be null or one of the 6 palette ids, got {other}"
+                                        )),
+                                    ),
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        match store_lookup(&threads, &workspaces, &cfg, &thread_id)
+                            .set_tag(&thread_id, tag.as_deref())
+                        {
+                            Ok(true) => {
+                                write_response(&hub, &client, ok_response(id, json!({}))).await?;
+                                // 广播给所有客户端（含本端）：列表层恒推，就在地
+                                // 更新色点，无需各自重拉 thread/listAll。
+                                let _ = write_notification(
+                                    &hub,
+                                    &Notification::TagChanged {
+                                        thread_id: thread_id.clone(),
+                                        tag: tag.clone(),
+                                    },
+                                )
+                                .await;
+                            }
+                            Ok(false) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::unknown_thread(&thread_id)),
+                                )
+                                .await?;
+                            }
+                            Err(e) => {
+                                write_response(
+                                    &hub,
+                                    &client,
+                                    err_response(id, RpcError::internal(e.to_string())),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
                     "thread/reorderPinned" => {
                         let arr = match req.params.get("threadIds").and_then(|v| v.as_array()) {
                             Some(a) => a,
@@ -6115,6 +6279,7 @@ fn thread_summary_json(
         "pinned": m.pin_seq.is_some(),
         "board_project": m.board_project,
         "card_id": m.card_id,
+        "tag": m.tag,
         "status": thread_status(threads, &m.thread_id),
     });
     // 只在确实是组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
@@ -7892,6 +8057,7 @@ async fn start_thread_core(
         card_id: card_id.map(str::to_string),
         model_ref,
         reasoning_effort: None,
+        tag: None,
         // 新会话默认开启跨轮保留(与 `ThreadMeta` 的缺省语义一致)。
         preserve_thinking: true,
         role: None,
@@ -14222,6 +14388,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
                 role: None,
             })
@@ -15734,6 +15901,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
                 role: None,
             })
@@ -15840,6 +16008,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: false,
                 role: None,
             })
@@ -15934,6 +16103,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
                 role: None,
             })
@@ -17256,6 +17426,7 @@ pub(crate) mod tests {
             card_id: card_id.map(str::to_string),
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             role: None,
         };
@@ -18008,6 +18179,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
                 role: None,
             })
@@ -18115,6 +18287,7 @@ pub(crate) mod tests {
                 card_id: None,
                 model_ref: None,
                 reasoning_effort: None,
+                tag: None,
                 preserve_thinking: true,
                 role: None,
             })
@@ -20220,6 +20393,117 @@ pub(crate) mod tests {
         h.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_tag_persists_and_reports_in_list() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        let set = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/setTag",
+            "params":{"threadId": tid, "tag": "red"}});
+        h.send(&set.to_string()).await;
+        let resp = read_response(&mut h, 3).await;
+        assert!(resp.get("error").is_none(), "setTag 应成功: {resp}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        let me = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap().iter())
+            .find(|t| t["thread_id"].as_str() == Some(tid.as_str()))
+            .expect("in group");
+        assert_eq!(me["tag"], "red");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_tag_null_clears() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        for (id, tag) in [
+            (3u64, serde_json::json!("green")),
+            (4, serde_json::Value::Null),
+        ] {
+            let req = serde_json::json!({"jsonrpc":"2.0","id": id, "method":"thread/setTag",
+                "params":{"threadId": tid, "tag": tag}});
+            h.send(&req.to_string()).await;
+            let resp = read_response(&mut h, id).await;
+            assert!(resp.get("error").is_none(), "setTag 应成功: {resp}");
+        }
+
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/listAll","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 5).await;
+        let me = v["result"]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["threads"].as_array().unwrap().iter())
+            .find(|t| t["thread_id"].as_str() == Some(tid.as_str()))
+            .expect("in group");
+        assert!(me["tag"].is_null(), "清除后应为 null: {me}");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_tag_rejects_unknown_color_and_unknown_thread() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        // 先校验颜色：非法值一律 -32602，无论 thread 是否存在。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/setTag","params":{"threadId":"thread-x","tag":"chartreuse"}}"#).await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/setTag","params":{"threadId":"thread-x","tag":"red"}}"#).await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(
+            v["error"]["code"],
+            serde_json::json!(-32011),
+            "合法颜色 + 未知 thread 应为 unknown_thread: {v}"
+        );
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_tag_broadcasts_tag_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+            .await;
+        let tid = read_thread_start_response(&mut h, 2).await;
+
+        let set = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/setTag",
+            "params":{"threadId": tid, "tag": "purple"}});
+        h.send(&set.to_string()).await;
+        let _ = read_response(&mut h, 3).await;
+
+        let ev = read_until_method(&mut h, "thread/tagChanged").await;
+        assert_eq!(ev["params"]["thread_id"], tid);
+        assert_eq!(ev["params"]["tag"], "purple");
+        h.shutdown().await;
+    }
+
     /// 手机（`Control`）必须能删除会话：长按菜单的「删除」与重命名/置顶同档，
     /// 且 `thread/rename` 早已是 `Control` 放行。原先把 `thread/delete` 卡在
     /// `Admin` 让手机长按菜单的删除项结构性必然报 `-32014`。
@@ -21835,6 +22119,187 @@ pub(crate) mod tests {
         assert!(responded, "ui/settings/write must respond");
         let n = notified.expect("theme change must push ui/settings/updated");
         assert_eq!(n["params"]["theme"], "light");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_read_returns_tag_names_overrides() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        // 先写 1 个覆盖，再读回：应恰有这 1 个键（默认名不由后端补齐）。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"tag_names":{"red":"紧急"}}}"#).await;
+        let _ = read_response(&mut h, 2).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 3).await;
+        let names = v["result"]["tag_names"]
+            .as_object()
+            .expect("tag_names 必须是对象");
+        assert_eq!(names.len(), 1, "只回用户覆盖项: {v}");
+        assert_eq!(names["red"], "紧急");
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_rejects_invalid_tag_name_key_and_empty_value() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        // 非法颜色 id。
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"tag_names":{"gray":"灰"}}}"#).await;
+        let v = read_response(&mut h, 2).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+
+        // 空白名字。
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"tag_names":{"red":"   "}}}"#).await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+
+        // 超长名字（>24）。
+        let long = "长".repeat(25);
+        let req = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"ui/settings/write",
+            "params":{"tag_names":{"red": long}}});
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 4).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+        h.shutdown().await;
+    }
+
+    /// 上限 `TAG_NAME_MAX_LEN` 按**字符**而非**字节**计。
+    ///
+    /// 这是一个可判别的钉子:每个 CJK 字符占 3 字节,故 9 个字符(27 字节)与
+    /// 恰好 24 个字符(72 字节)都必须被接受——若实现退化成 `name.len()` 字节
+    /// 计数,这两条会双双被误拒而失败。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_tag_name_length_counts_characters_not_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        // 9 个 CJK 字符 = 27 字节:字节计数会误拒的最小反例。
+        let nine = "字".repeat(9);
+        assert_eq!(nine.chars().count(), 9);
+        assert_eq!(nine.len(), 27);
+        let req = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"ui/settings/write",
+            "params":{"tag_names":{"green": nine}}});
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 2).await;
+        assert!(
+            v.get("error").is_none(),
+            "9 个 CJK 字符(27 字节)必须被接受: {v}"
+        );
+
+        // 恰好 24 个 CJK 字符 = 72 字节:边界上必须接受,字节计数会误拒。
+        let max = "字".repeat(TAG_NAME_MAX_LEN);
+        assert_eq!(max.chars().count(), TAG_NAME_MAX_LEN);
+        assert_eq!(max.len(), 72);
+        let req = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"ui/settings/write",
+            "params":{"tag_names":{"blue": max}}});
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 3).await;
+        assert!(
+            v.get("error").is_none(),
+            "恰好 {TAG_NAME_MAX_LEN} 个 CJK 字符(72 字节)必须被接受: {v}"
+        );
+
+        // 回读确认确实落盘(而非只是"没报错")。
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 4).await;
+        let names = v["result"]["tag_names"]
+            .as_object()
+            .expect("tag_names 必须是对象");
+        assert_eq!(names["green"], nine.as_str(), "{v}");
+        assert_eq!(names["blue"], max.as_str(), "{v}");
+
+        // 边界另一侧:25 个字符必须被拒。
+        let too_long = "字".repeat(TAG_NAME_MAX_LEN + 1);
+        assert_eq!(too_long.chars().count(), 25);
+        let req = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"ui/settings/write",
+            "params":{"tag_names":{"red": too_long}}});
+        h.send(&req.to_string()).await;
+        let v = read_response(&mut h, 5).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_write_broadcasts_tag_names_updated() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"tag_names":{"blue":"参考"}}}"#).await;
+        let v = read_response(&mut h, 2).await;
+        assert!(v.get("error").is_none(), "{v}");
+
+        let ev = read_until_method(&mut h, "ui/tagNames/updated").await;
+        assert_eq!(ev["params"]["tag_names"]["blue"], "参考");
+        h.shutdown().await;
+    }
+
+    /// 校验先于落盘：非法标签名不得把同一次请求里有效的 `relay_url` 写了一半。
+    /// 同时定住另外两条语义：**缺** `tag_names` 键是「不动」，`{}` 是空合并
+    /// （按键合并保留既有覆盖），广播出去的是落盘后读回的**权威**映射。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ui_settings_tag_name_validation_precedes_the_disk_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = pin_test_config(dir.path());
+        let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+        initialize(&mut h).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"tag_names":{"red":"紧急"}}}"#).await;
+        let _ = read_response(&mut h, 2).await;
+
+        // 非法名字与有效 relay_url 同请求：整体失败，磁盘一字未动。
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"relay_url":"wss://r/connect?session=x","tag_names":{"gray":"灰"}}}"#).await;
+        let v = read_response(&mut h, 3).await;
+        assert_eq!(v["error"]["code"], serde_json::json!(-32602), "{v}");
+        assert_eq!(
+            crate::settings_store::load_relay_url(dir.path()),
+            None,
+            "被拒的标签名不得把 relay_url 写了一半"
+        );
+
+        // `{}`：合法空合并，既有覆盖原样保留；广播回读的权威映射。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/write","params":{"tag_names":{}}}"#,
+        )
+        .await;
+        let v = read_response(&mut h, 4).await;
+        assert!(v.get("error").is_none(), "{v}");
+        let ev = read_until_method(&mut h, "ui/tagNames/updated").await;
+        assert_eq!(
+            ev["params"]["tag_names"],
+            serde_json::json!({ "red": "紧急" }),
+            "广播必须是落盘后读回的合并映射: {ev}"
+        );
+
+        // 缺 `tag_names`（只写 theme）：名字不动。
+        h.send(
+            r#"{"jsonrpc":"2.0","id":5,"method":"ui/settings/write","params":{"theme":"light"}}"#,
+        )
+        .await;
+        let _ = read_response(&mut h, 5).await;
+
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"ui/settings/read","params":{}}"#)
+            .await;
+        let v = read_response(&mut h, 6).await;
+        assert_eq!(v["result"]["tag_names"]["red"], "紧急", "{v}");
+        assert_eq!(
+            v["result"]["tag_names"].as_object().unwrap().len(),
+            1,
+            "缺键不清除、空对象不清除: {v}"
+        );
         h.shutdown().await;
     }
 

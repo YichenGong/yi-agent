@@ -33,7 +33,8 @@ import type {
   ProcessReadResult,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
-import { applyTitleChange } from "./lib/threadListUpdate";
+import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
+import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
 import {
@@ -206,6 +207,8 @@ export default function App() {
   // 服务端排好序的全部置顶会话（从顶到底）。置顶项仍留在各自的分组内，侧栏
   // 渲染分组时需自行过滤，否则会重复渲染。
   const [pinned, setPinned] = useState<ThreadSummary[]>(initialListCache?.pinned ?? []);
+  /** 标签显示名（6 键齐全）。默认名来自 threadTags.ts，服务端只给覆盖项。 */
+  const [tagNames, setTagNames] = useState<Record<TagId, string>>(DEFAULT_TAG_NAMES);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
@@ -1287,6 +1290,39 @@ export default function App() {
     }
   };
 
+  /** 设置 / 清除某会话的颜色标签；成功后重拉列表，以服务端为权威。 */
+  const onSetTag = async (id: string, tag: TagId | null) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("thread/setTag", { threadId: id, tag });
+      await refreshThreads();
+      force((v) => v + 1);
+    } catch (e) {
+      setCurrentError(formatError(e));
+      // 失败也要重拉：本地不做乐观更新，UI 不能停在「看起来打上了」的状态。
+      await refreshThreads();
+      force((v) => v + 1);
+    }
+  };
+
+  /**
+   * 保存单个颜色标签的显示名。
+   *
+   * 只提交改动的那一个键（服务端按键合并），成功后用**服务端**读回的覆盖项重建
+   * 本地映射——服务端是权威，本端不自行猜测合并结果。广播随后到达，两端一致。
+   */
+  const saveTagName = async (tagId: TagId, name: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("ui/settings/write", { tag_names: { [tagId]: name } });
+      force((v) => v + 1);
+    } catch (e) {
+      setCurrentError(formatError(e));
+    }
+  };
+
   /** 置顶分区内拖拽排序落盘；乐观更新 + 失败回滚重拉。 */
   const onReorderPinned = async (orderedIds: string[]) => {
     const c = clientRef.current;
@@ -1442,6 +1478,26 @@ export default function App() {
           force((v) => v + 1);
           return;
         }
+        if (n.method === "thread/tagChanged") {
+          // 服务端推来的权威标签（null = 已清除）。就地落笔即可，不必重拉列表。
+          const next = applyTagChange(
+            groupsRef.current,
+            pinnedRef.current,
+            n.params.thread_id,
+            n.params.tag,
+          );
+          setGroups(next.groups);
+          setPinned(next.pinned);
+          force((v) => v + 1);
+          return;
+        }
+        if (n.method === "ui/tagNames/updated") {
+          // 标签显示名变更（全局帧）：合成完整映射后重渲染，色点 title / 菜单
+          // aria-label / 搜索匹配全部随之更新。
+          setTagNames(resolveTagNames(n.params.tag_names));
+          force((v) => v + 1);
+          return;
+        }
         // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
         store.applyNotification(n);
         force((v) => v + 1);
@@ -1501,6 +1557,7 @@ export default function App() {
           theme?: unknown;
           board_watchman_enabled?: unknown;
           relay_url?: unknown;
+          tag_names?: unknown;
         }>("ui/settings/read", {});
         // 中继地址没有「用户正在改」的触碰标记：设置页是模态的，首屏 read 回来
         // 时用户还没法编辑它，直接采纳权威值即可。未配置（null）→ 空串。
@@ -1519,6 +1576,14 @@ export default function App() {
         if (!watchmanTouchedRef.current) {
           setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
         }
+        // 标签显示名：服务端只回用户覆盖项，与默认名合并成完整 6 键。
+        setTagNames(
+          resolveTagNames(
+            settings.tag_names && typeof settings.tag_names === "object"
+              ? (settings.tag_names as Record<string, string>)
+              : null,
+          ),
+        );
         // 首启引导：读不到状态(宿主老、RPC 报错、字段缺失)一律按「不需要」处理，
         // 绝不因为一个读失败弹向导、更不挡住主界面。
         try {
@@ -2184,6 +2249,8 @@ export default function App() {
           onRename={renameThread}
           onDelete={deleteThread}
           onTogglePin={onTogglePin}
+          onSetTag={onSetTag}
+          tagNames={tagNames}
           onReorderPinned={onReorderPinned}
           onNew={onNew}
           onRemoveWorkspace={removeWorkspace}
@@ -2534,6 +2601,8 @@ export default function App() {
         relayUrl={relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
         saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}
+        tagNames={tagNames}
+        saveTagName={saveTagName}
       />
     </>
   );

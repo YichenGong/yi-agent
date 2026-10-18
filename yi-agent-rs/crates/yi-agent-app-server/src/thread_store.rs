@@ -25,6 +25,15 @@ pub enum ThreadMode {
     Yolo,
 }
 
+/// 合法的颜色标签 id。顺序即 UI 菜单顺序，**不含灰色**（深色主题下与「无标签」
+/// 难以区分）。
+pub const TAG_IDS: [&str; 6] = ["red", "orange", "yellow", "green", "blue", "purple"];
+
+/// 该字符串是否是合法的颜色标签 id。
+pub fn is_valid_tag(id: &str) -> bool {
+    TAG_IDS.contains(&id)
+}
+
 /// thread 元数据(`.meta.json` 的内容)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadMeta {
@@ -57,6 +66,10 @@ pub struct ThreadMeta {
     /// 「未设置＝不发该字段」）。旧 meta 缺字段时默认 None，零迁移。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 会话的颜色标签 id（`TAG_IDS` 之一）。`None` = 无标签。
+    /// 旧 meta 缺字段时默认 `None`（零迁移）。
+    #[serde(default)]
+    pub tag: Option<String>,
     /// 是否跨轮保留思考块（Anthropic thinking / Responses encrypted_content 等）。
     ///
     /// `true`（默认）= 历史轮的推理凭证原样回传与落盘；`false` = 请求前剥离历史轮、
@@ -446,6 +459,17 @@ impl ThreadStore {
         Ok(self.update_meta(id, |meta| meta.pin_seq = seq)?.is_some())
     }
 
+    /// 写入会话的颜色标签（`None` = 清除）。
+    ///
+    /// 有意**不**刷新 `updated_at`：打标签是用户视图标记而非 thread 活动，不应把
+    /// 会话顶到「最近更新」最前面（与 `set_pin_seq` / `set_permission_mode` 同理）。
+    /// 返回 false 表示 thread 不存在或 meta 不可读。
+    pub fn set_tag(&self, id: &str, tag: Option<&str>) -> io::Result<bool> {
+        Ok(self
+            .update_meta(id, |meta| meta.tag = tag.map(str::to_string))?
+            .is_some())
+    }
+
     /// 更新该 thread 的模型覆盖选择（清单里的显示名），保留其余 meta 字段。
     ///
     /// 走与 `rename` / `set_permission_mode` 相同的 `update_meta` 读-改-写锁与
@@ -815,6 +839,7 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         card_id: None,
         model_ref: None,
         reasoning_effort: None,
+        tag: None,
         // 缺 meta 时从日志重建:无从得知曾经的开关,按默认「保留」解释。
         preserve_thinking: true,
         role: None,
@@ -846,6 +871,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             role: None,
         }
@@ -1428,6 +1454,88 @@ mod tests {
     }
 
     #[test]
+    fn set_tag_sets_value_without_bumping_updated_at() {
+        let (_d, s) = store();
+        let mut m = meta("thread-a");
+        m.updated_at = 7;
+        s.create(&m).unwrap();
+        assert!(s.set_tag("thread-a", Some("red")).unwrap());
+        let got = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(got.tag.as_deref(), Some("red"));
+        assert_eq!(got.updated_at, 7, "打标签不得刷新 updated_at");
+    }
+
+    #[test]
+    fn set_tag_none_clears_it() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.set_tag("thread-a", Some("blue")).unwrap();
+        assert!(s.set_tag("thread-a", None).unwrap());
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.tag, None);
+    }
+
+    #[test]
+    fn set_tag_unknown_id_returns_false() {
+        let (_d, s) = store();
+        assert!(!s.set_tag("nope", Some("red")).unwrap());
+    }
+
+    #[test]
+    fn legacy_meta_without_tag_deserializes_to_none() {
+        // 严格解析：直接对 **类型** `ThreadMeta` 断言，**绕过** `load()`。
+        //
+        // 为什么不能只靠下方的盘上往返断言：`load()` 反序列化失败时会回落
+        // `rebuild_meta`，而后者硬编码 `tag: None`。任何使 `from_str::<ThreadMeta>`
+        // 失败的变化都会让 `load()` 悄悄改走兜底路径，「读回 tag == None」照旧成立
+        // —— 该断言对反序列化回归完全失明。已用探针证实：把必填的 `model` 挖掉后，
+        // 严格解析报错，而 `load(...).meta.tag` 仍为 `None`。
+        //
+        // 这份 JSON 省略**全部** `#[serde(default)]` 字段，即最严苛的「旧 meta」形状。
+        let legacy_json = r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
+        let legacy: ThreadMeta = serde_json::from_str(legacy_json)
+            .expect("旧 meta（缺所有后加字段）必须能被 ThreadMeta 直接反序列化");
+        assert_eq!(legacy.tag, None, "旧 meta 缺 tag 字段必须回 None（零迁移）");
+
+        // 对照断言：下面两个字段**没有** serde 对 `Option` 的隐式兜底，其
+        // `#[serde(default)]` 是真能失败的 ——
+        //   * `permission_mode: ThreadMode`（非 `Option`）：摘掉属性后上面这句
+        //     `from_str` 直接报 `missing field permission_mode`；
+        //   * `preserve_thinking: bool` 用了 `default = "default_true"`：删掉属性会
+        //     静默变 `false`，本断言随即可失败。
+        // 已实证：摘掉 `permission_mode` 的 `#[serde(default)]` 后本测试失败；而 `tag`
+        // 那条（`Option`）断言不会失败 —— serde derive 的 `missing_field` 对缺字段的
+        // `Option<T>` 直接给 `None`（serde-1.0.229 `src/private/de.rs`）。
+        assert_eq!(
+            legacy.permission_mode,
+            ThreadMode::Normal,
+            "旧 meta 缺 permission_mode 必须回 Normal（零迁移）"
+        );
+        assert!(
+            legacy.preserve_thinking,
+            "旧 meta 缺 preserve_thinking 必须回 true（零迁移）"
+        );
+
+        // 互补属性（保留）：同一份旧 JSON 落盘后经 `load()` 读回仍为 None。
+        let (_d, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        // 旧格式：没有 tag 字段。
+        let legacy = r#"{"thread_id":"thread-a","cwd":"/tmp","model":"m",
+            "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal"}"#;
+        std::fs::write(s.meta_path("thread-a"), legacy).unwrap();
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.tag, None);
+    }
+
+    #[test]
+    fn is_valid_tag_accepts_the_six_ids_only() {
+        for id in TAG_IDS {
+            assert!(is_valid_tag(id), "{id} 必须是合法标签");
+        }
+        assert!(!is_valid_tag("gray"), "不含灰色");
+        assert!(!is_valid_tag("RED"), "大小写敏感");
+        assert!(!is_valid_tag(""));
+    }
+
+    #[test]
     fn legacy_meta_without_pin_seq_deserializes_unpinned() {
         let (_d, s) = store();
         std::fs::create_dir_all(&s.root).unwrap();
@@ -1510,6 +1618,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             role: None,
         }
@@ -1885,6 +1994,7 @@ mod tests {
             card_id: Some("c1".into()),
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             role: None,
         };
@@ -1924,6 +2034,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             role: None,
         };
@@ -2044,6 +2155,7 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             role: Some(LEAD_ROLE.to_string()),
         };
@@ -2117,6 +2229,7 @@ mod tests {
                     card_id: None,
                     model_ref: None,
                     reasoning_effort: None,
+                    tag: None,
                     preserve_thinking: true,
                     role: Some(LEAD_ROLE.to_string()),
                 })

@@ -111,6 +111,7 @@ pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(Thr
         card_id: None,
         model_ref: None,
         reasoning_effort: None,
+        tag: None,
         preserve_thinking: true,
         role: Some(LEAD_ROLE.to_string()),
     };

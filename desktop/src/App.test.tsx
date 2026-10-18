@@ -967,7 +967,7 @@ describe("App slash commands", () => {
  */
 async function openBoardFor(project: string) {
   // 打开小组右键菜单（与键盘路径同一条处理链）→ 点「看板」条目。
-  const header = document.querySelector<HTMLElement>('div[tabindex][aria-haspopup="menu"]')!;
+  const header = document.querySelector<HTMLElement>("[data-ws-header]")!;
   fireEvent.contextMenu(header);
   await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
   fireEvent.click(screen.getByLabelText("看板"));
@@ -1471,6 +1471,121 @@ describe("App settings & theme wiring", () => {
     expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
       listCallsBefore,
     );
+  });
+
+  it("reflects a thread/tagChanged in the sidebar without re-listing", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    notify("thread/tagChanged", { thread_id: "t1", tag: "red" });
+    await waitFor(() =>
+      expect(document.querySelector('[data-thread-tag="red"]')).toBeTruthy(),
+    );
+    // 就地把权威值落笔，不该为此再拉一次全量 thread/listAll。
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+  });
+
+  it("reflects ui/tagNames/updated in the existing dot's label", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    notify("thread/tagChanged", { thread_id: "t1", tag: "red" });
+    await waitFor(() => expect(document.querySelector('[data-thread-tag="red"]')).toBeTruthy());
+
+    notify("ui/tagNames/updated", { tag_names: { red: "紧急" } });
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-thread-tag="red"]')?.getAttribute("aria-label"),
+      ).toBe("紧急"),
+    );
+  });
+
+  it("does not tag optimistically, and re-lists once thread/setTag resolves", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    // Hold the RPC open so we can observe the UI *before* the server answers.
+    let release: () => void = () => {};
+    state.dataSources["thread/setTag"] = () =>
+      new Promise<void>((resolve) => {
+        release = () => resolve();
+      });
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    fireEvent.contextMenu(container.querySelector('[data-thread-row="t1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/setTag")).toBe(true),
+    );
+    expect(clients[0].requests.find((r) => r.method === "thread/setTag")!.params).toEqual({
+      threadId: "t1",
+      tag: "red",
+    });
+    // 不做乐观更新：回包之前 UI 不能显示色点，也不能为此重拉列表。
+    expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+
+    act(() => release());
+    await waitFor(() => {
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThan(listCallsBefore);
+    });
+  });
+
+  it("surfaces the error and still re-lists when thread/setTag rejects", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.rejectCode["thread/setTag"] = -32011;
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    fireEvent.contextMenu(container.querySelector('[data-thread-row="t1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+
+    await waitFor(() => expect(screen.getByText(/forced -32011/)).toBeTruthy());
+    // 失败同样重拉：本地不假装成功，以服务端为权威。
+    await waitFor(() => {
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThan(listCallsBefore);
+    });
+    expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
+  });
+
+  it("writes only the changed key when a tag name is edited in settings", async () => {
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", tag_names: {} });
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "标签" }));
+    const input = document.querySelector<HTMLInputElement>('[data-tag-name-input="red"]')!;
+    fireEvent.change(input, { target: { value: "紧急" } });
+    fireEvent.blur(input);
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { tag_names: { red: "紧急" } },
+      }),
+    );
+    // 只提交改动的那一个键：其余 5 色不得出现在同一请求里。
+    const write = clients[0].requests.find((r) => r.method === "ui/settings/write")!;
+    expect(Object.keys((write.params as { tag_names: Record<string, string> }).tag_names)).toEqual([
+      "red",
+    ]);
   });
 
   it("reflects a thread/modelChanged from another client in that thread's picker", async () => {
