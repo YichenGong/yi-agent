@@ -226,15 +226,15 @@ pub(crate) struct RuntimeAttachments {
 }
 
 /// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
-type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
+pub(crate) type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
 
 /// Installs the resident watchman (macOS LaunchAgent) for `exe` under `home`;
 /// see [`yi_agent_boards::watchman::install`].
-type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
+pub(crate) type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
 
 /// Removes the resident watchman under `home`; see
 /// [`yi_agent_boards::watchman::uninstall`].
-type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+pub(crate) type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
 /// 生产环境的 `$HOME`。未设置时回退空路径——与 `board_dir` 同一策略：宁可把
 /// 值守装进一个无人读取的目录，也不要因为环境缺失让整个服务起不来。
@@ -2385,6 +2385,9 @@ where
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
+    // detach 出去的 board/plugin handler 唯一需要回到主循环的信号：stdio
+    // `local` 写失败是致命的（`?` 语义从前由内联 await 直接传播）。
+    let (fatal_tx, mut fatal_rx) = mpsc::channel::<anyhow::Error>(1);
 
     // 反向权限请求的等待登记表:key 为 `perm-<seq>`,value 为向 driver
     // 回传决定的 oneshot 端。主循环在读到客户端响应时据此路由。
@@ -2641,8 +2644,7 @@ where
                     () => {
                         // 字段名逐项写出(而非位置参数):`models_path` /
                         // `onboarding_env_path` / `onboarding_preferences_path` /
-                        // `board_dir` / `resident_dir` / `plugin_command` /
-                        // `watchman_home` 七个相邻字段同为 `&Path`,位置一旦
+                        // `watchman_home` 四个相邻字段同为 `&Path`,位置一旦
                         // 写错照样编译通过、却会静默把机器级路径接错。
                         crate::rpc::AppState {
                             hub: &hub,
@@ -2653,13 +2655,9 @@ where
                             models_path: &models_path,
                             onboarding_env_path: &onboarding_env_path,
                             onboarding_preferences_path: &onboarding_preferences_path,
-                            board_dir: &board_dir,
-                            resident_dir: &resident_dir,
-                            plugin_command: &plugin_command,
                             watchman_home: &watchman_home,
                             watchman_install: &watchman_install,
                             watchman_uninstall: &watchman_uninstall,
-                            board_launcher: &board_launcher,
                             uploads: &mut uploads,
                             threads: &mut threads,
                             workspaces: &workspaces,
@@ -2715,25 +2713,55 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
-                    crate::rpc::Domain::Board => {
-                        let mut state = app_state!();
-                        match crate::rpc::board::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
-                    }
-                    crate::rpc::Domain::Plugin => {
-                        let mut state = app_state!();
-                        match crate::rpc::plugin::handle(&mut state, &req, id.clone()).await? {
-                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
-                            // `continue`)。
-                            crate::rpc::Flow::Continue => continue,
-                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
-                            crate::rpc::Flow::Unknown => {}
-                        }
+                    crate::rpc::Domain::Board | crate::rpc::Domain::Plugin => {
+                        // 门禁（initialize / scope）已在上面同步做完；这里只把
+                        // **处理** detach 出去。主循环是单 task，内联 await 会串行
+                        // 堵住所有 thread 的 RPC；主 runtime 是多线程的，故
+                        // `tokio::spawn` 让它在别的 worker 上跑、主循环立刻回到
+                        // `select!`。（`spawn_blocking(..).await` 做不到：主 task
+                        // 仍要 await 它返回。）
+                        let state = std::sync::Arc::new(crate::rpc::BoardPluginState {
+                            hub: std::sync::Arc::clone(&hub),
+                            client: client.clone(),
+                            board_dir: board_dir.clone(),
+                            resident_dir: resident_dir.clone(),
+                            plugin_command: plugin_command.clone(),
+                            theme_handle: theme_handle.clone(),
+                            watchman_home: watchman_home.clone(),
+                            watchman_install: std::sync::Arc::clone(&watchman_install),
+                            watchman_uninstall: std::sync::Arc::clone(&watchman_uninstall),
+                            board_launcher: std::sync::Arc::clone(&board_launcher),
+                            fatal_tx: fatal_tx.clone(),
+                        });
+                        let domain = crate::rpc::domain_for(method.as_str());
+                        let req = req.clone();
+                        let id = id.clone();
+                        tokio::spawn(async move {
+                            let result = match domain {
+                                crate::rpc::Domain::Board => {
+                                    crate::rpc::board::handle_shared(&state, &req, id.clone()).await
+                                }
+                                _ => {
+                                    crate::rpc::plugin::handle_shared(&state, &req, id.clone()).await
+                                }
+                            };
+                            match result {
+                                Ok(crate::rpc::Flow::Continue) => {}
+                                // 域内兜底：与搬移前的原始 dispatch 逐字一致。
+                                Ok(crate::rpc::Flow::Unknown) => {
+                                    crate::rpc::write_or_fatal(
+                                        &state,
+                                        id.clone(),
+                                        err_response(id, RpcError::method_not_found(&req.method)),
+                                    )
+                                    .await;
+                                }
+                                Err(error) => {
+                                    let _ = state.fatal_tx.send(error).await;
+                                }
+                            }
+                        });
+                        continue;
                     }
                     crate::rpc::Domain::Image => {
                         let mut state = app_state!();
@@ -2911,6 +2939,7 @@ where
                     );
                 }
             }
+            Some(error) = fatal_rx.recv() => return Err(error),
             _ = card_ticker.tick() => {
                 // 看板调度器内联跑一轮:启动(queued → 起可见会话)与对账
                 // (会话结束 → 卡片终态)。所有局部量按顺序借用,不与 RPC 分支

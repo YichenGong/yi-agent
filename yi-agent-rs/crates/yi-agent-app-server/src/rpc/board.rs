@@ -5,44 +5,46 @@
 //! 等),臂内的 `method.as_str()` 改成 `req.method.as_str()`(本模块的形参不再
 //! 叫 `method`),以及 `continue` 换成 `return Ok(Flow::Continue)`——后者的语义由
 //! `serve()` 翻回 `continue`,与搬移前逐字一致。
+//!
+//! Task 4 起本域**脱离主循环**执行:`serve()` 把处理搬进 `tokio::spawn`,故状态改为
+//! [`BoardPluginState`](全是 owned/`Arc`,可 move),应答改写 [`write_or_fatal`]——
+//! 写失败不再能靠 `?` 传播,改由 fatal 通道上报主循环。
 
 use std::path::Path;
 
 use serde_json::json;
 
 use crate::protocol::{RequestEnvelope, RequestId, RpcError};
-use crate::rpc::{AppState, Flow};
-use crate::server::{
-    ensure_watchman_installed, err_response, ok_response, project_arg, to_json, write_response,
-};
+use crate::rpc::{BoardPluginState, Flow, write_or_fatal};
+use crate::server::{ensure_watchman_installed, err_response, ok_response, project_arg, to_json};
 
 /// 处理本域的一个 RPC 请求。
 ///
 /// 返回 [`Flow::Continue`] 表示「本域已应答,主循环回到下一轮」(等价于搬移前臂
 /// 里的 `continue`);[`Flow::Unknown`] 表示方法不在本域内,交回 `serve()` 的原始
 /// dispatch(走既有的 `method_not_found`),响应形状与搬移前一致。
-pub(crate) async fn handle(
-    state: &mut AppState<'_>,
+pub(crate) async fn handle_shared(
+    state: &BoardPluginState,
     req: &RequestEnvelope,
     id: RequestId,
 ) -> anyhow::Result<Flow> {
     match req.method.as_str() {
         "board/create" => {
             let Some(project) = project_arg(&req.params) else {
-                write_response(
-                    state.hub,
-                    state.client,
+                write_or_fatal(
+                    state,
+                    id.clone(),
                     err_response(id, RpcError::invalid_params("missing or empty project")),
                 )
-                .await?;
+                .await;
                 return Ok(Flow::Continue);
             };
             let mut launcher = |project: &Path| (state.board_launcher)(project);
             match yi_agent_boards::lifecycle::create_with_project(
                 &project,
-                state.board_dir,
-                state.resident_dir,
-                state.plugin_command,
+                &state.board_dir,
+                &state.resident_dir,
+                &state.plugin_command,
                 &mut launcher,
             ) {
                 Ok(status) => {
@@ -51,54 +53,51 @@ pub(crate) async fn handle(
                     // 「创建成功」变成失败（前端已拿到看板）。
                     ensure_watchman_installed(
                         state.theme_handle.workdir(),
-                        state.watchman_home,
-                        state.watchman_install,
+                        &state.watchman_home,
+                        &state.watchman_install,
                     );
-                    write_response(state.hub, state.client, ok_response(id, to_json(&status)))
-                        .await?
+                    write_or_fatal(state, id.clone(), ok_response(id, to_json(&status))).await
                 }
                 Err(message) => {
-                    write_response(
-                        state.hub,
-                        state.client,
+                    write_or_fatal(
+                        state,
+                        id.clone(),
                         err_response(id, RpcError::internal(message)),
                     )
-                    .await?
+                    .await
                 }
             }
         }
         "board/remove" => {
             let Some(project) = project_arg(&req.params) else {
-                write_response(
-                    state.hub,
-                    state.client,
+                write_or_fatal(
+                    state,
+                    id.clone(),
                     err_response(id, RpcError::invalid_params("missing or empty project")),
                 )
-                .await?;
+                .await;
                 return Ok(Flow::Continue);
             };
             match yi_agent_boards::lifecycle::remove_in(
                 &project,
-                state.board_dir,
-                state.resident_dir,
+                &state.board_dir,
+                &state.resident_dir,
             ) {
-                Ok(()) => {
-                    write_response(state.hub, state.client, ok_response(id, json!({}))).await?
-                }
+                Ok(()) => write_or_fatal(state, id.clone(), ok_response(id, json!({}))).await,
                 Err(message) => {
-                    write_response(
-                        state.hub,
-                        state.client,
+                    write_or_fatal(
+                        state,
+                        id.clone(),
                         err_response(id, RpcError::internal(message)),
                     )
-                    .await?
+                    .await
                 }
             }
         }
         "board/list" => {
             // The registry is the whole answer: the sidebar decides
             // which projects get a board entry from exactly this.
-            match yi_agent_boards::registry::list(state.board_dir) {
+            match yi_agent_boards::registry::list(&state.board_dir) {
                 Ok(boards) => {
                     let boards: Vec<serde_json::Value> = boards
                         .into_iter()
@@ -109,26 +108,26 @@ pub(crate) async fn handle(
                                 "status": to_json(
                                     &yi_agent_boards::lifecycle::status_with(
                                         &board.project,
-                                        state.board_dir,
+                                        &state.board_dir,
                                     ),
                                 ),
                             })
                         })
                         .collect();
-                    write_response(
-                        state.hub,
-                        state.client,
+                    write_or_fatal(
+                        state,
+                        id.clone(),
                         ok_response(id, json!({ "boards": boards })),
                     )
-                    .await?
+                    .await
                 }
                 Err(message) => {
-                    write_response(
-                        state.hub,
-                        state.client,
+                    write_or_fatal(
+                        state,
+                        id.clone(),
                         err_response(id, RpcError::internal(message.to_string())),
                     )
-                    .await?
+                    .await
                 }
             }
         }
