@@ -570,7 +570,7 @@ initialize、pair、以及两端同 store 的一致性。
 
 ```bash
 # 电脑上：中继桥进程应持有到中继 443 的 ESTABLISHED 连接
-lsof -nP -p "$(pgrep -f 'app-server.*--relay' | head -1)" | grep 101.47.76.100
+lsof -nP -p "$(pgrep -f 'app-server.*--relay' | head -1)" | grep 203.0.113.10
 # 空 = 桥没挂上
 ```
 
