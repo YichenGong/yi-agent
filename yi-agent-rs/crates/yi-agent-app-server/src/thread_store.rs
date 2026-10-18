@@ -13,6 +13,9 @@ use yi_agent_core::{ContentBlock, Message, Role};
 
 use crate::protocol::Item;
 
+/// 组长角色的 `ThreadMeta.role` 取值。一个项目目录至多一个。
+pub const LEAD_ROLE: &str = "lead";
+
 /// 线程的自主权模式。持久化到 `.meta.json`,重开 app 后恢复。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -20,6 +23,15 @@ pub enum ThreadMode {
     #[default]
     Normal,
     Yolo,
+}
+
+/// 合法的颜色标签 id。顺序即 UI 菜单顺序，**不含灰色**（深色主题下与「无标签」
+/// 难以区分）。
+pub const TAG_IDS: [&str; 6] = ["red", "orange", "yellow", "green", "blue", "purple"];
+
+/// 该字符串是否是合法的颜色标签 id。
+pub fn is_valid_tag(id: &str) -> bool {
+    TAG_IDS.contains(&id)
 }
 
 /// thread 元数据(`.meta.json` 的内容)。
@@ -54,6 +66,10 @@ pub struct ThreadMeta {
     /// 「未设置＝不发该字段」）。旧 meta 缺字段时默认 None，零迁移。
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// 会话的颜色标签 id（`TAG_IDS` 之一）。`None` = 无标签。
+    /// 旧 meta 缺字段时默认 `None`（零迁移）。
+    #[serde(default)]
+    pub tag: Option<String>,
     /// 是否跨轮保留思考块（Anthropic thinking / Responses encrypted_content 等）。
     ///
     /// `true`（默认）= 历史轮的推理凭证原样回传与落盘；`false` = 请求前剥离历史轮、
@@ -69,6 +85,10 @@ pub struct ThreadMeta {
     /// 单根会话（`Vec` 的内建默认即空，无需 `default_true` 那样的显式默认）。
     #[serde(default)]
     pub extra_roots: Vec<String>,
+    /// 会话角色标记。`Some("lead")` = 该会话是所属项目目录的组长;`None` = 普通会话。
+    /// 旧 meta 缺字段一律读成 `None`(零迁移)。
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 /// `#[serde(default = "…")]` 的显式默认：`bool` 的内建默认是 `false`，而本开关
@@ -325,6 +345,39 @@ impl ThreadStore {
         Ok(out)
     }
 
+    /// 组长归属键:项目状态目录 `<cwd>/.yi-agent` 的 canonical 字符串。
+    ///
+    /// 用 canonical 路径而非 cwd 原串,是因为同一个目录可以有多种写法(尾斜杠、
+    /// 符号链接、相对路径),原串比较会让同一项目被判成两个项目、造出两个组长。
+    /// canonicalize 失败(目录尚未创建)时退回原串:此时也还没有任何会话,
+    /// 键取什么都只会被用一次。
+    pub fn project_key(&self) -> String {
+        let state_dir = self
+            .root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.root.clone());
+        state_dir
+            .canonicalize()
+            .unwrap_or(state_dir)
+            .display()
+            .to_string()
+    }
+
+    /// 本目录的组长,按 `created_at` 升序取第一个。
+    ///
+    /// 取「最早创建」而非「最新」,是为了让懒创建幂等:并发/重复调用无论如何
+    /// 都收敛到同一个组长,而不是每次挑一个不同的。
+    pub fn find_lead(&self) -> io::Result<Option<ThreadMeta>> {
+        let mut leads: Vec<ThreadMeta> = self
+            .list()?
+            .into_iter()
+            .filter(|meta| meta.role.as_deref() == Some(LEAD_ROLE))
+            .collect();
+        leads.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        Ok(leads.into_iter().next())
+    }
+
     /// 在 store 锁内对 meta 做读-改-写。`Ok(None)` 表示 thread 不存在或 meta 不可读。
     ///
     /// 锁保证 `touch`(driver)与 `rename`(请求循环)不会互相覆盖对方的改动。
@@ -411,6 +464,17 @@ impl ThreadStore {
     /// 返回 false 表示 thread 不存在或 meta 不可读。
     pub fn set_pin_seq(&self, id: &str, seq: Option<i64>) -> io::Result<bool> {
         Ok(self.update_meta(id, |meta| meta.pin_seq = seq)?.is_some())
+    }
+
+    /// 写入会话的颜色标签（`None` = 清除）。
+    ///
+    /// 有意**不**刷新 `updated_at`：打标签是用户视图标记而非 thread 活动，不应把
+    /// 会话顶到「最近更新」最前面（与 `set_pin_seq` / `set_permission_mode` 同理）。
+    /// 返回 false 表示 thread 不存在或 meta 不可读。
+    pub fn set_tag(&self, id: &str, tag: Option<&str>) -> io::Result<bool> {
+        Ok(self
+            .update_meta(id, |meta| meta.tag = tag.map(str::to_string))?
+            .is_some())
     }
 
     /// 更新该 thread 的模型覆盖选择（清单里的显示名），保留其余 meta 字段。
@@ -782,9 +846,11 @@ fn rebuild_meta(id: &str, log: &Path, messages: &[Message]) -> ThreadMeta {
         card_id: None,
         model_ref: None,
         reasoning_effort: None,
+        tag: None,
         // 缺 meta 时从日志重建:无从得知曾经的开关,按默认「保留」解释。
         preserve_thinking: true,
         extra_roots: Vec::new(),
+        role: None,
     }
 }
 
@@ -813,8 +879,10 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             extra_roots: Vec::new(),
+            role: None,
         }
     }
 
@@ -950,6 +1018,7 @@ mod tests {
             );
             let bad_meta = ThreadMeta {
                 thread_id: bad.into(),
+                role: None,
                 ..meta("placeholder")
             };
             assert!(
@@ -1394,6 +1463,88 @@ mod tests {
     }
 
     #[test]
+    fn set_tag_sets_value_without_bumping_updated_at() {
+        let (_d, s) = store();
+        let mut m = meta("thread-a");
+        m.updated_at = 7;
+        s.create(&m).unwrap();
+        assert!(s.set_tag("thread-a", Some("red")).unwrap());
+        let got = s.load("thread-a").unwrap().unwrap().meta;
+        assert_eq!(got.tag.as_deref(), Some("red"));
+        assert_eq!(got.updated_at, 7, "打标签不得刷新 updated_at");
+    }
+
+    #[test]
+    fn set_tag_none_clears_it() {
+        let (_d, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.set_tag("thread-a", Some("blue")).unwrap();
+        assert!(s.set_tag("thread-a", None).unwrap());
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.tag, None);
+    }
+
+    #[test]
+    fn set_tag_unknown_id_returns_false() {
+        let (_d, s) = store();
+        assert!(!s.set_tag("nope", Some("red")).unwrap());
+    }
+
+    #[test]
+    fn legacy_meta_without_tag_deserializes_to_none() {
+        // 严格解析：直接对 **类型** `ThreadMeta` 断言，**绕过** `load()`。
+        //
+        // 为什么不能只靠下方的盘上往返断言：`load()` 反序列化失败时会回落
+        // `rebuild_meta`，而后者硬编码 `tag: None`。任何使 `from_str::<ThreadMeta>`
+        // 失败的变化都会让 `load()` 悄悄改走兜底路径，「读回 tag == None」照旧成立
+        // —— 该断言对反序列化回归完全失明。已用探针证实：把必填的 `model` 挖掉后，
+        // 严格解析报错，而 `load(...).meta.tag` 仍为 `None`。
+        //
+        // 这份 JSON 省略**全部** `#[serde(default)]` 字段，即最严苛的「旧 meta」形状。
+        let legacy_json = r#"{"thread_id":"t","cwd":"/w","model":"m","created_at":1,"updated_at":2,"title":null}"#;
+        let legacy: ThreadMeta = serde_json::from_str(legacy_json)
+            .expect("旧 meta（缺所有后加字段）必须能被 ThreadMeta 直接反序列化");
+        assert_eq!(legacy.tag, None, "旧 meta 缺 tag 字段必须回 None（零迁移）");
+
+        // 对照断言：下面两个字段**没有** serde 对 `Option` 的隐式兜底，其
+        // `#[serde(default)]` 是真能失败的 ——
+        //   * `permission_mode: ThreadMode`（非 `Option`）：摘掉属性后上面这句
+        //     `from_str` 直接报 `missing field permission_mode`；
+        //   * `preserve_thinking: bool` 用了 `default = "default_true"`：删掉属性会
+        //     静默变 `false`，本断言随即可失败。
+        // 已实证：摘掉 `permission_mode` 的 `#[serde(default)]` 后本测试失败；而 `tag`
+        // 那条（`Option`）断言不会失败 —— serde derive 的 `missing_field` 对缺字段的
+        // `Option<T>` 直接给 `None`（serde-1.0.229 `src/private/de.rs`）。
+        assert_eq!(
+            legacy.permission_mode,
+            ThreadMode::Normal,
+            "旧 meta 缺 permission_mode 必须回 Normal（零迁移）"
+        );
+        assert!(
+            legacy.preserve_thinking,
+            "旧 meta 缺 preserve_thinking 必须回 true（零迁移）"
+        );
+
+        // 互补属性（保留）：同一份旧 JSON 落盘后经 `load()` 读回仍为 None。
+        let (_d, s) = store();
+        std::fs::create_dir_all(&s.root).unwrap();
+        // 旧格式：没有 tag 字段。
+        let legacy = r#"{"thread_id":"thread-a","cwd":"/tmp","model":"m",
+            "created_at":1,"updated_at":1,"title":null,"permission_mode":"normal"}"#;
+        std::fs::write(s.meta_path("thread-a"), legacy).unwrap();
+        assert_eq!(s.load("thread-a").unwrap().unwrap().meta.tag, None);
+    }
+
+    #[test]
+    fn is_valid_tag_accepts_the_six_ids_only() {
+        for id in TAG_IDS {
+            assert!(is_valid_tag(id), "{id} 必须是合法标签");
+        }
+        assert!(!is_valid_tag("gray"), "不含灰色");
+        assert!(!is_valid_tag("RED"), "大小写敏感");
+        assert!(!is_valid_tag(""));
+    }
+
+    #[test]
     fn legacy_meta_without_pin_seq_deserializes_unpinned() {
         let (_d, s) = store();
         std::fs::create_dir_all(&s.root).unwrap();
@@ -1476,8 +1627,10 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             extra_roots: Vec::new(),
+            role: None,
         }
     }
 
@@ -1851,8 +2004,10 @@ mod tests {
             card_id: Some("c1".into()),
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             extra_roots: Vec::new(),
+            role: None,
         };
         let text = serde_json::to_string(&meta).unwrap();
         let back: ThreadMeta = serde_json::from_str(&text).unwrap();
@@ -1917,8 +2072,10 @@ mod tests {
             card_id: None,
             model_ref: None,
             reasoning_effort: None,
+            tag: None,
             preserve_thinking: true,
             extra_roots: Vec::new(),
+            role: None,
         };
         store.create(&meta).unwrap();
         store.set_model_ref("t", Some("B")).unwrap();
@@ -2016,5 +2173,140 @@ mod tests {
             .set_preserve_thinking("ghost", false)
             .expect_err("an unknown thread must not be silently accepted");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// 组长标记必须能在落盘后读回,且旧 meta(无 `role`)读取为 `None`。
+    #[test]
+    fn role_round_trips_and_legacy_meta_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+
+        let lead = ThreadMeta {
+            thread_id: "thread-lead-1".into(),
+            cwd: dir.path().display().to_string(),
+            model: "m".into(),
+            created_at: 1,
+            updated_at: 1,
+            title: None,
+            permission_mode: ThreadMode::Normal,
+            pin_seq: None,
+            board_project: None,
+            card_id: None,
+            model_ref: None,
+            reasoning_effort: None,
+            tag: None,
+            preserve_thinking: true,
+            extra_roots: Vec::new(),
+            role: Some(LEAD_ROLE.to_string()),
+        };
+        store.create(&lead).unwrap();
+        store
+            .append_turn(
+                "thread-lead-1",
+                &TurnLine::Turn {
+                    items: Vec::new(),
+                    usage: None,
+                    messages: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let found = store.find_lead().unwrap().expect("lead must be found");
+        assert_eq!(found.thread_id, "thread-lead-1");
+        assert_eq!(found.role.as_deref(), Some(LEAD_ROLE));
+
+        // 旧 meta:手工写一份不含 `role` 的 JSON,必须读成 None 且不被 find_lead 选中。
+        let raw = serde_json::json!({
+            "thread_id": "thread-old-1",
+            "cwd": dir.path().display().to_string(),
+            "model": "m",
+            "created_at": 2,
+            "updated_at": 2,
+            "title": null,
+            "permission_mode": "normal",
+            "pin_seq": null,
+            "board_project": null,
+            "card_id": null,
+            "model_ref": null,
+            "reasoning_effort": null,
+            "preserve_thinking": true
+        });
+        std::fs::write(
+            dir.path().join(".yi-agent/threads/thread-old-1.meta.json"),
+            serde_json::to_vec_pretty(&raw).unwrap(),
+        )
+        .unwrap();
+        let loaded = store.load("thread-old-1").unwrap().unwrap();
+        assert_eq!(
+            loaded.meta.role, None,
+            "legacy meta must read as a plain thread"
+        );
+        // 组长仍只有那一个。
+        assert_eq!(
+            store.find_lead().unwrap().unwrap().thread_id,
+            "thread-lead-1"
+        );
+    }
+
+    /// 多个组长并存(理论上的异常态)时 `find_lead` 必须稳定返回最早创建的那个,
+    /// 使懒创建幂等:并发两次调用不会在第二次又造一个新组长。
+    #[test]
+    fn find_lead_is_stable_when_more_than_one_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ThreadStore::new(dir.path());
+        for (id, created) in [("thread-lead-b", 20i64), ("thread-lead-a", 10i64)] {
+            store
+                .create(&ThreadMeta {
+                    thread_id: id.into(),
+                    cwd: dir.path().display().to_string(),
+                    model: "m".into(),
+                    created_at: created,
+                    updated_at: created,
+                    title: None,
+                    permission_mode: ThreadMode::Normal,
+                    pin_seq: None,
+                    board_project: None,
+                    card_id: None,
+                    model_ref: None,
+                    reasoning_effort: None,
+                    tag: None,
+                    preserve_thinking: true,
+                    extra_roots: Vec::new(),
+                    role: Some(LEAD_ROLE.to_string()),
+                })
+                .unwrap();
+            store
+                .append_turn(
+                    id,
+                    &TurnLine::Turn {
+                        items: Vec::new(),
+                        usage: None,
+                        messages: Vec::new(),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.find_lead().unwrap().unwrap().thread_id,
+            "thread-lead-a"
+        );
+        assert_eq!(
+            store.find_lead().unwrap().unwrap().thread_id,
+            "thread-lead-a"
+        );
+    }
+
+    /// 项目键必须是 `<cwd>/.yi-agent` 的 canonical 路径:同一 cwd 的两种写法
+    /// (含符号链接)必须得到同一个键,否则会造出两个组长。
+    #[test]
+    fn project_key_is_canonical_and_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        let store = ThreadStore::new(&real);
+        assert_eq!(
+            store.project_key(),
+            real.join(".yi-agent").display().to_string()
+        );
+        assert_eq!(store.project_key(), store.project_key());
     }
 }

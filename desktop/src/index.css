@@ -308,12 +308,22 @@ html[data-mobile="true"] {
   }
 }
 /*
- * 侧栏搜索框的字号下限：iOS 在聚焦字号 < 16px 的输入框时会自动放大页面，而
+ * 手机端侧栏搜索框：三条都是手机专属，桌面端不匹配 `[data-mobile]`，逐字节不变。
+ *
+ * `font-size: 16px`——iOS 在聚焦字号 < 16px 的输入框时会自动放大页面，而
  * `useIsMobile` 的 `lockZoom` 只能禁用用户的手动捏合缩放，挡不住这条自动放大。
- * 16px 是 iOS 不触发自动放大的下限。桌面端不匹配 `[data-mobile]`，逐字节不变。
+ * 16px 是 iOS 不触发自动放大的下限。
+ * `min-height: 44px`——手机上搜索框是高频点击控件，触控目标按 Apple HIG 的 44px
+ * （输入框原约 34px = 20px 行高 + 12px 内边距 + 2px 边框）。
+ * `margin-top: 0.5rem`——补回移入滚动容器后丢失的顶部 8px 间距：那是「+ New thread」
+ * 区块 `p-2` 的下内边距，桌面端仍在，手机端因换了父节点而丢失，输入框贴上了容器顶边。
+ * 用输入框自身的 margin，而不是包裹层的 padding——包裹层 `relative px-2 pb-2` 是两端
+ * 共用的 DOM，没有可用的样式钩子，改它会连带改掉桌面端。
  */
 [data-mobile="true"] .app-sidebar input[type="search"] {
   font-size: 16px;
+  min-height: 44px;
+  margin-top: 0.5rem;
 }
 
 /*
@@ -343,23 +353,23 @@ html[data-mobile="true"] {
 }
 
 /*
- * 导航：左侧竖栏 → 顶部横条，每格等宽。实测 320/360/375/390/430pt 五档
- * `tablist.scrollWidth == clientWidth`（零溢出）；最窄的 320pt 上每格仍有 80px，
- * 最长的「远程访问」四字单行放得下。
+ * 手机端设置首页：分类列表（纵向一列，每行满宽）。
+ *
+ * 取代原先的等宽横条——分类到 5 个时 320pt 每格只剩 64px，「远程访问」四字会溢出。
+ * 列表把横向宽度从约束里彻底摘掉，以后加分类不必再调尺寸。
  */
-[data-mobile="true"] .settings-nav {
-  flex-direction: row;
-  width: auto;
-  flex-shrink: 0;
-  border-right: 0;
-  border-bottom: 1px solid var(--line);
+[data-mobile="true"] .settings-categories {
+  flex-direction: column;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
-[data-mobile="true"] .settings-nav > [role="tab"] {
-  flex: 1 1 0;
-  white-space: nowrap;
-  text-align: center;
+[data-mobile="true"] .settings-categories > [data-settings-category] {
+  /* 单行 ≈ 44px：上下各 12px 内边距 + 行高，达到 Apple HIG 触控下限。
+     `min-height` 兜住大字号设置下的极端情况。 */
+  min-height: 44px;
   padding-top: 12px;
-  padding-bottom: 12px; /* 单格高 ≈ 44px，达到 Apple HIG 触控下限 */
+  padding-bottom: 12px;
+  white-space: nowrap;
 }
 
 /*
@@ -396,31 +406,22 @@ html[data-mobile="true"] {
 }
 
 /*
- * 手机端的层级重排：DOM 顺序是 [nav, (header, panel)]，而手机上要的视觉顺序是
- * [header, nav, panel]——标题栏必须在 Tab 条**之上**，否则：(1) 观感上「设置」标题
- * 跑到了 Tab 条下面；(2) 更实际的，顶部安全区（刘海）内边距挂在 `.settings-header`
- * 上，标题栏一旦排在后面，那段留白就落到了屏幕中部，Tab 条反而紧贴刘海/状态栏，
- * 真机上会被状态栏压住。
+ * 手机端的层级：手机端不渲染 nav，DOM 里只剩 [header, panel]（都在这个包裹层里），
+ * 顺序本就是想要的。让包裹层 `display: contents`「消失」（它本身没有边框/背景/
+ * 内边距，只是布局容器），其子元素直接升为 shell 的 flex item，因此**不再需要
+ * `order`**——先在 nav 还在时用 order 排过序，nav 移除后那套顺序规则已无对象。
  *
- * 跨嵌套层级无法用 `order` 直接重排，故让中间那层包裹 div `display: contents`
- * 「消失」（它本身没有边框/背景/内边距，只是布局容器），其子元素升为 shell 的直接
- * flex item，order 随即可用。桌面端不匹配该选择器，DOM 与观感逐字节不变。
+ * 保留 `display: contents` 的理由：不这样做的话 header/panel 嵌在一层普通 div 里，
+ * header 的顶部安全区（刘海）内边距与面板的滚动容器不再直接受 shell 的纵向 flex
+ * 管辖。桌面端不匹配该选择器，DOM 与观感逐字节不变。
  */
 [data-mobile="true"] .settings-body {
   display: contents;
 }
 [data-mobile="true"] .settings-header {
-  order: 1;
   /* 升为 flex item 后必须锁住自身高度，否则会被纵向 flex 压缩。 */
   flex-shrink: 0;
 }
-[data-mobile="true"] .settings-nav {
-  order: 2;
-}
-[data-mobile="true"] .settings-panel {
-  order: 3;
-}
-
 /*
  * 设置面板内的输入控件字号下限：面板里的输入框是 `text-sm`（14px），而 iOS 在聚焦
  * 字号 < 16px 的输入框时会自动放大页面——`lockZoom` 只能禁掉用户的手动捏合缩放，

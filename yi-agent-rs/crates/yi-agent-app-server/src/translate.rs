@@ -421,6 +421,9 @@ impl Translator {
                     cause: match cause {
                         yi_agent_core::RetryCause::IdleStall => "idle_stall".to_string(),
                         yi_agent_core::RetryCause::RequestTimeout => "request_timeout".to_string(),
+                        yi_agent_core::RetryCause::RateLimited => "rate_limited".to_string(),
+                        yi_agent_core::RetryCause::ServerError => "server_error".to_string(),
+                        yi_agent_core::RetryCause::NetworkError => "network_error".to_string(),
                     },
                 });
             }

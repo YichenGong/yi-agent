@@ -10,7 +10,8 @@ use yi_agent_core::ProviderError;
 /// | 429               | `RateLimited`                |
 /// | 400, 422          | `InvalidRequest`             |
 /// | 500..=599         | `Server`                     |
-/// | other             | `Server` (unexpected status) |
+/// | other 4xx         | `InvalidRequest` (deterministic) |
+/// | other 5xx         | `Server`                     |
 pub async fn map_status_error(resp: reqwest::Response) -> ProviderError {
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
@@ -25,7 +26,9 @@ pub fn map_status_error_from(status: u16, body: &str) -> ProviderError {
         429 => ProviderError::RateLimited,
         400 | 422 => ProviderError::InvalidRequest(format!("{}: {}", status, body)),
         500..=599 => ProviderError::Server(format!("{}: {}", status, body)),
-        _ => ProviderError::Server(format!("unexpected status {}: {}", status, body)),
+        // 其余 4xx 是确定性的客户端错误（404 路由/模型不存在、413 请求过大……）：
+        // 归为 `Server` 会被重投逻辑误当成可重试的 5xx，故按 `InvalidRequest` 归类。
+        _ => ProviderError::InvalidRequest(format!("unexpected status {}: {}", status, body)),
     }
 }
 
@@ -77,7 +80,41 @@ pub fn is_effort_rejection(status: u16, body: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_effort_rejection, is_transient_gateway_rejection};
+    use super::{is_effort_rejection, is_transient_gateway_rejection, map_status_error_from};
+    use yi_agent_core::ProviderError;
+
+    #[test]
+    fn retryable_and_deterministic_statuses_are_classified_apart() {
+        // 429/5xx are capacity faults: the retry logic may resend them.
+        assert_eq!(map_status_error_from(429, ""), ProviderError::RateLimited);
+        assert!(matches!(
+            map_status_error_from(500, "boom"),
+            ProviderError::Server(_)
+        ));
+        assert!(matches!(
+            map_status_error_from(503, "boom"),
+            ProviderError::Server(_)
+        ));
+        // Auth never resolves by waiting.
+        assert!(matches!(
+            map_status_error_from(401, "nope"),
+            ProviderError::Auth(_)
+        ));
+    }
+
+    #[test]
+    fn an_unlisted_4xx_is_deterministic_not_a_server_error() {
+        // 404 (route/model not found) and 413 (payload too large) must NOT be
+        // classified as `Server`: that variant is retryable, and resending a
+        // request the gateway will never accept only triples the latency.
+        for status in [404, 405, 413, 415, 418] {
+            let mapped = map_status_error_from(status, "unexpected status");
+            assert!(
+                matches!(mapped, ProviderError::InvalidRequest(_)),
+                "{status} must be a deterministic InvalidRequest, got {mapped:?}"
+            );
+        }
+    }
 
     /// 线上真实形态（外层内层都是 JSON，内层被转义成字符串）。
     const REAL_MAAS_BODY: &str = concat!(

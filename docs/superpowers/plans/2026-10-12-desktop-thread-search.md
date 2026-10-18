@@ -47,7 +47,7 @@ worktree 的 `desktop/node_modules` 已软链到主仓库。
   与 `filterThreadTree(groups: WorkspaceGroup[], pinned: ThreadSummary[], query: string): ThreadSearchResult`。
   Task 2 只依赖这两个导出。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 Create `desktop/src/lib/threadSearch.test.ts`:
 
@@ -161,12 +161,12 @@ describe("filterThreadTree", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadSearch.test.ts`
 Expected: FAIL — `Failed to resolve import "./threadSearch"`。
 
-- [ ] **Step 3: 实现最小代码**
+- [x] **Step 3: 实现最小代码**
 
 Create `desktop/src/lib/threadSearch.ts`:
 
@@ -243,12 +243,12 @@ export function filterThreadTree(
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadSearch.test.ts`
 Expected: PASS（14 个用例）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/lib/threadSearch.test.ts
@@ -270,7 +270,7 @@ git commit -m "feat(desktop): add the pure sidebar thread-search filter"
   清除按钮 `[aria-label="清除搜索"]`、无匹配提示文本 `无匹配会话`、重命名输入框标记 `[data-rename-input]`。
   Task 3 只读 `index.css`，不依赖本任务的 DOM。
 
-- [ ] **Step 1: 改既有 6 处裸 `input` 选择器（先改测试，此时应失败）**
+- [x] **Step 1: 改既有 6 处裸 `input` 选择器（先改测试，此时应失败）**
 
 `desktop/src/components/ThreadSidebar.test.tsx` 的 4 处：
 
@@ -287,7 +287,7 @@ git commit -m "feat(desktop): add the pure sidebar thread-search filter"
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx src/App.test.tsx`
 Expected: FAIL — 属性尚不存在，`querySelector` 返回 null。
 
-- [ ] **Step 2: 给重命名输入框加标记属性**
+- [x] **Step 2: 给重命名输入框加标记属性**
 
 `desktop/src/components/ThreadSidebar.tsx` 的 `<input autoFocus value={draft}` 起那段，加一行属性：
 
@@ -301,7 +301,7 @@ Expected: FAIL — 属性尚不存在，`querySelector` 返回 null。
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx src/App.test.tsx`
 Expected: PASS（既有用例全绿，回到基线 939 个）。
 
-- [ ] **Step 3: 写搜索栏的失败测试**
+- [x] **Step 3: 写搜索栏的失败测试**
 
 在 `desktop/src/components/ThreadSidebar.test.tsx` 末尾追加：
 
@@ -407,12 +407,12 @@ describe("ThreadSidebar 搜索", () => {
 注意：`newThreadTrigger`、`boardGroups`、`renderSidebar` 都是该文件里已有的 helper，直接复用；
 第一条用例里 `searchBox` 与 `rows` 的 `compareDocumentPosition` 断言用的是 DOM 顺序，不依赖像素。
 
-- [ ] **Step 4: 跑测试确认失败**
+- [x] **Step 4: 跑测试确认失败**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 Expected: FAIL — `Unable to find a label with the text of: 搜索会话`。
 
-- [ ] **Step 5: 实现搜索状态与过滤渲染**
+- [x] **Step 5: 实现搜索状态与过滤渲染**
 
 `desktop/src/components/ThreadSidebar.tsx`，四处改动：
 
@@ -499,18 +499,18 @@ import { filterThreadTree } from "../lib/threadSearch";
      const isBoardCollapsed = searching ? false : !boardCollapsed.has(g.workspace);
    ```
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 Expected: PASS（原有 62 个 + 新增 10 个 = 72 个）。
 
-- [ ] **Step 7: 全量回归 + 类型检查**
+- [x] **Step 7: 全量回归 + 类型检查**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit`
 Expected: 全部通过（82 个测试文件 + 新增 1 个 = 83；用例 939 + 14（Task 1）+ 10（本任务）= 963；
 Task 3 再加 1 例 → 964），tsc 无输出。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add desktop/src/components/ThreadSidebar.tsx desktop/src/components/ThreadSidebar.test.tsx desktop/src/App.test.tsx
@@ -529,7 +529,7 @@ git commit -m "feat(desktop): filter the sidebar thread tree by a search box"
 - Consumes: Task 2 产出的搜索框（`input[type="search"]` 位于 `.app-sidebar` 内）。
 - Produces: 无后续任务依赖。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `desktop/src/mobileLayout.test.ts` 的 `describe("phone layout CSS")` 内追加：
 
@@ -546,12 +546,12 @@ git commit -m "feat(desktop): filter the sidebar thread tree by a search box"
   });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/mobileLayout.test.ts`
 Expected: FAIL — 正则匹配不到规则，`rule` 为空字符串。
 
-- [ ] **Step 3: 加 CSS**
+- [x] **Step 3: 加 CSS**
 
 `desktop/src/index.css` 末尾（`[data-mobile="true"] .app-sidebar [data-ws-header]` 那条之后）追加：
 
@@ -566,12 +566,12 @@ Expected: FAIL — 正则匹配不到规则，`rule` 为空字符串。
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/mobileLayout.test.ts`
 Expected: PASS（原有 15 个 + 新增 1 个）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add desktop/src/index.css desktop/src/mobileLayout.test.ts
@@ -590,7 +590,7 @@ git commit -m "fix(desktop): keep the phone search box at 16px so iOS will not a
 - Consumes: Task 1–3 的实际代码位置与验证命令。
 - Produces: 无后续任务依赖。
 
-- [ ] **Step 1: 记录基线计数**
+- [x] **Step 1: 记录基线计数**
 
 Run:
 
@@ -605,7 +605,7 @@ grep -n '^| desktop |' README.md
 注意 `README.md` 第 265 行**已经滞后**于模块文件——它写的是 `| desktop | 42 / 54 |`，比模块文件少 3 条。
 本次一并同步（见 Step 3），不要照抄 README 的旧数字。
 
-- [ ] **Step 2: 在 `docs/project-management/desktop.md` 追加一条已完成条目**
+- [x] **Step 2: 在 `docs/project-management/desktop.md` 追加一条已完成条目**
 
 追加到文件里既有 `[x]` 条目之后（与「手机端侧栏长按」等同级的位置），按该文件既有风格写成一行，
 必须带**代码位置**与**可执行判据**：
@@ -624,7 +624,7 @@ grep -n '^| desktop |' README.md
   判据：`cd desktop && npx vitest run src/lib/threadSearch.test.ts src/components/ThreadSidebar.test.tsx src/mobileLayout.test.ts src/App.test.tsx && npx tsc --noEmit`
 ```
 
-- [ ] **Step 3: 更新 README 索引计数**
+- [x] **Step 3: 更新 README 索引计数**
 
 `README.md` 第 265 行的 `| desktop | 42 / 54 | [详情](docs/project-management/desktop.md) |` 改为
 `| desktop | 46 / 58 | [详情](docs/project-management/desktop.md) |`。
@@ -633,7 +633,7 @@ grep -n '^| desktop |' README.md
 **同时修掉 README 既有 3 条滞后**：它原本写 42/54，比模块文件少 3 条。
 若 Step 1 实测基线与上面不同，则以「实测基线 +1、并与模块文件完全一致」为准。
 
-- [ ] **Step 4: 更新 desktop.md 末尾的「验证命令」计数**
+- [x] **Step 4: 更新 desktop.md 末尾的「验证命令」计数**
 
 `docs/project-management/desktop.md` 末尾那段 `**验证命令：**` 里列了逐文件用例数与总数（现为 930/81）。
 跑一遍拿到新数字并同步：
@@ -643,7 +643,7 @@ Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run --re
 把 `（930 个前端单测 / 81 个测试文件：…）` 里的总数、文件数，以及 `ThreadSidebar.test.tsx 62`、
 `mobileLayout.test.ts 15` 两个分项，改成实测值，并补上 `lib/threadSearch.test.ts 14` 一项。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs/project-management/desktop.md README.md
@@ -666,7 +666,7 @@ git commit -m "docs: record the sidebar thread search bar in the desktop module"
 - Consumes: Task 2 定义的 `searchBar` 元素、`isMobile` prop（`ThreadSidebar.tsx:81`，默认 `false`）。
 - Produces: 无后续任务依赖。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `desktop/src/components/ThreadSidebar.test.tsx` 的 `describe("ThreadSidebar 搜索")` 内
 （`const searchBox = () => screen.getByLabelText("搜索会话") as HTMLInputElement;` 之后）追加：
@@ -709,7 +709,7 @@ git commit -m "docs: record the sidebar thread search bar in the desktop module"
   });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 
@@ -721,7 +721,7 @@ Expected: **前 2 条失败**（手机端搜索框此时还在滚动容器之外
 搜索 `true` → 清空 `false`。**若第 3 条反而失败**，说明现有折叠逻辑与我的判断不符，
 **停下来查清原因再继续**，不要改测试去迁就代码。
 
-- [ ] **Step 3: 实现（按平台两处渲染）**
+- [x] **Step 3: 实现（按平台两处渲染）**
 
 在 `desktop/src/components/ThreadSidebar.tsx` 中，把：
 
@@ -747,13 +747,13 @@ Expected: **前 2 条失败**（手机端搜索框此时还在滚动容器之外
 - 手机端 16px 字号规则是**后代选择器** `[data-mobile="true"] .app-sidebar input[type="search"]`，
   移入容器后依然命中，**CSS 无需改动**。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 
 Expected: PASS，`74 + 3 = 77` 个用例。
 
-- [ ] **Step 5: 全量回归 + 类型检查**
+- [x] **Step 5: 全量回归 + 类型检查**
 
 Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit`
 
@@ -761,11 +761,107 @@ Expected: 全绿，`tsc` 无输出。**特别确认既有 `搜索栏在 New thre
 ——其"之后/之前"用的是 `compareDocumentPosition` 文档顺序，手机端把搜索框移入容器后，
 它仍排在第一个会话行之前，故该断言两端都成立。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add desktop/src/components/ThreadSidebar.tsx desktop/src/components/ThreadSidebar.test.tsx
 git commit -m "feat(desktop): let the phone search bar scroll with the thread list"
+```
+
+---
+
+### Task 6: 手机端搜索框的间距与触控高度（观感修订）
+
+> 追加任务（2026-10-17）：手机端搜索框移入滚动容器后贴上顶边，且实测高度约 34px，
+> 低于本项目在手机上采用的 Apple HIG 44px 触控目标。spec 见
+> `docs/superpowers/specs/2026-10-12-desktop-thread-search-design.md`「修订记录」第三条。
+
+**Files:**
+- Modify: `desktop/src/index.css`（扩展已有那条 `[data-mobile="true"] .app-sidebar input[type="search"]` 规则）
+- Test: `desktop/src/mobileLayout.test.ts`（扩展已有那条 16px 用例）
+
+**Interfaces:**
+- Consumes: Task 5 的把搜索框放进手机端滚动容器的布局；Task 3 建立的同一条手机端 CSS 规则。
+- Produces: 无后续任务依赖。
+
+- [ ] **Step 1: 扩展失败的测试**
+
+把 `desktop/src/mobileLayout.test.ts` 里现有的那条用例
+`keeps the search box at 16px so iOS cannot auto-zoom on focus` **整体替换**为：
+
+```ts
+  it("keeps the phone search box big enough to tap and clears the scroller's top edge", () => {
+    // 字号 16px：WKWebView 对字号 < 16px 的输入框会在聚焦时自动放大页面，而 `lockZoom`
+    // 只能禁掉用户的手动捏合缩放，挡不住这条自动放大——放大后页面不再贴合屏幕，
+    // 每次滑动变成两轴平移，正是「缩放之后就需要拖拽」的同一个症状。
+    // 44px：手机上搜索框是高频点击控件，本项目的触控目标按 Apple HIG 的 44px
+    // （原约 34px = 20px 行高 + 12px 内边距 + 2px 边框）。
+    // margin-top 8px：补回移入滚动容器后丢失的顶部间距（原由「+ New thread」区块的
+    // `p-2` 下内边距提供，换父节点后归零，输入框因此贴上容器顶边）。
+    const rule =
+      /\[data-mobile="true"\]\s+\.app-sidebar\s+input\[type="search"\]\s*\{([^}]*)\}/.exec(
+        css(),
+      )?.[1] ?? "";
+    expect(rule).toMatch(/font-size:\s*16px/);
+    expect(rule).toMatch(/min-height:\s*44px/);
+    expect(rule).toMatch(/margin-top:\s*0\.5rem/);
+  });
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/mobileLayout.test.ts`
+
+Expected: FAIL —— 规则里目前只有 `font-size: 16px`，`min-height` 与 `margin-top` 两条断言失败
+（`font-size` 那条仍通过）。
+
+- [ ] **Step 3: 扩展 CSS 规则**
+
+把 `desktop/src/index.css` 里这条规则及其注释替换为：
+
+```css
+/*
+ * 手机端侧栏搜索框：三条都是手机专属，桌面端不匹配 `[data-mobile]`，逐字节不变。
+ *
+ * `font-size: 16px`——iOS 在聚焦字号 < 16px 的输入框时会自动放大页面，而
+ * `useIsMobile` 的 `lockZoom` 只能禁用用户的手动捏合缩放，挡不住这条自动放大。
+ * 16px 是 iOS 不触发自动放大的下限。
+ * `min-height: 44px`——手机上搜索框是高频点击控件，触控目标按 Apple HIG 的 44px
+ * （输入框原约 34px = 20px 行高 + 12px 内边距 + 2px 边框）。
+ * `margin-top: 0.5rem`——补回移入滚动容器后丢失的顶部 8px 间距：那是「+ New thread」
+ * 区块 `p-2` 的下内边距，桌面端仍在，手机端因换了父节点而丢失，输入框贴上了容器顶边。
+ * 用输入框自身的 margin，而不是包裹层的 padding——包裹层 `relative px-2 pb-2` 是两端
+ * 共用的 DOM，没有可用的样式钩子，改它会连带改掉桌面端。
+ */
+[data-mobile="true"] .app-sidebar input[type="search"] {
+  font-size: 16px;
+  min-height: 44px;
+  margin-top: 0.5rem;
+}
+```
+
+**不要**改任何 JSX/DOM，也**不要**动 `ThreadSidebar.tsx`：搜索框的选择器
+`input[type="search"]` 早已存在且稳定，无需新增钩子属性；DOM 不变则桌面端逐字节不变、
+`ThreadSidebar.test.tsx` 无需改动。
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run src/mobileLayout.test.ts`
+
+Expected: PASS（22 个用例，条数不变——是扩展既有用例而非新增）。
+
+- [ ] **Step 5: 全量回归 + 类型检查**
+
+Run: `export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit`
+
+Expected: 全绿，`tsc` 无输出。**特别确认既有 `手机端：搜索框与会话行同属滚动容器` 用例仍通过**
+——本次只加样式，不改 DOM 结构，那个断言不受影响。
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add desktop/src/index.css desktop/src/mobileLayout.test.ts
+git commit -m "fix(desktop): give the phone search box a 44px touch height and its top gap"
 ```
 
 ---
@@ -776,9 +872,10 @@ git commit -m "feat(desktop): let the phone search bar scroll with the thread li
 export PATH="/opt/homebrew/bin:$PATH" && cd desktop && npx vitest run && npx tsc --noEmit
 ```
 
-对着 spec §6 的 8 条验收标准逐条核对；第 1、7 条（两端都有搜索栏、手机端聚焦不放大）与
-**第 2 条（手机端搜索框随列表滚动、Mac 固定）**需要人工在 Mac 应用与手机端各点一遍确认。
+对着 spec §6 的 8 条验收标准逐条核对；第 1、7 条（两端都有搜索栏、手机端聚焦不放大 +
+触控高度与顶边间距）与**第 2 条（手机端搜索框随列表滚动、Mac 固定）**需要人工在 Mac 应用与
+手机端各点一遍确认。
 
-> 注：原 Task 4（同步 `docs/project-management/desktop.md` 与 `README.md` 索引）**尚未执行**
-> （`README.md:265` 仍为 `| desktop | 42 / 54 |`，模块文件里也还没有搜索栏条目）。
-> 若之后执行，请把手机端「随列表滚动、Mac 固定」这一行为一并写进该条目。
+> 注：原 Task 4（同步 `docs/project-management/desktop.md` 与 `README.md` 索引）**已执行完毕**
+> （提交 `49df68e9`：模块文件已加搜索栏条目，末尾验证计数与逐文件清单已按实测重建为 1112/89，
+> README 的 `desktop` 行同步为 `50 / 62`）。

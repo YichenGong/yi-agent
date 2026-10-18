@@ -10,6 +10,8 @@ import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
 import { resolveSidebarPressTarget } from "../lib/sidebarPress";
 import { formatRelativeTime } from "../lib/relativeTime";
 import { filterThreadTree } from "../lib/threadSearch";
+import { findLeadThread } from "../lib/leadThread";
+import { TAG_DOT_CLASS, TAG_IDS, isValidTagId, tagLabel, type TagId } from "../lib/threadTags";
 
 function unreadDotClass(status: TurnStatus): string {
   if (status === "failed") return "bg-red-400";
@@ -87,6 +89,8 @@ export function ThreadSidebar({
   onDelete,
   onTogglePin,
   onReorderPinned,
+  onSetTag,
+  tagNames,
   onNew,
   onRemoveWorkspace,
   onBrowse,
@@ -117,6 +121,10 @@ export function ThreadSidebar({
   onTogglePin: (id: string, pinned: boolean) => void;
   /** 置顶分区拖拽落点：新的从顶到底顺序。 */
   onReorderPinned: (orderedIds: string[]) => void;
+  /** 给会话打 / 清颜色标签（`TagId` 或 null=清除）。 */
+  onSetTag: (id: string, tag: TagId | null) => void;
+  /** 已解析的标签显示名（6 键齐全，由 App 经 `resolveTagNames` 得到）。 */
+  tagNames: Record<TagId, string>;
   /** No cwd → App opens the picker; with cwd → create in that dir. */
   onNew: (cwd?: string) => void;
   onRemoveWorkspace: (cwd: string) => void;
@@ -439,6 +447,28 @@ export function ThreadSidebar({
           if (e.detail > 1) return;
           onSelect(t.thread_id);
         }}
+        onContextMenu={(e) => {
+          // 桌面端打标签的入口：右键会话行打开与手机长按**同一份**菜单。
+          e.preventDefault();
+          if (editingId === t.thread_id) return;
+          setNewMenuOpen(false);
+          setMenu({ kind: "thread", id: t.thread_id });
+        }}
+        tabIndex={0}
+        aria-haspopup="menu"
+        aria-expanded={menu?.kind === "thread" && menu.id === t.thread_id}
+        onKeyDown={(e) => {
+          // 键盘等价于右键：Enter/Space 开关本行的菜单。
+          if (e.target !== e.currentTarget) return;
+          if (e.key !== "Enter" && e.key !== " ") return;
+          e.preventDefault();
+          setNewMenuOpen(false);
+          setMenu((cur) =>
+            cur?.kind === "thread" && cur.id === t.thread_id
+              ? null
+              : { kind: "thread", id: t.thread_id },
+          );
+        }}
         className={`group relative flex items-center justify-between gap-1 ${indent} py-2 text-sm ${
           dragId === t.thread_id ? "opacity-50" : ""
         } ${active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"} cursor-pointer`}
@@ -474,6 +504,14 @@ export function ThreadSidebar({
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <StatusBadge status={st} stale={statusStale} />
+                {isValidTagId(t.tag) && (
+                  <span
+                    data-thread-tag={t.tag}
+                    aria-label={tagLabel(t.tag, tagNames)}
+                    title={tagLabel(t.tag, tagNames)}
+                    className={`size-2 shrink-0 rounded-full ${TAG_DOT_CLASS[t.tag]}`}
+                  />
+                )}
                 <div
                   className="truncate"
                   title={t.title ?? t.thread_id}
@@ -543,6 +581,45 @@ export function ThreadSidebar({
               onClick={(e) => e.stopPropagation()}
               className="absolute top-full left-3 z-20 mt-0.5 min-w-32 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
             >
+              <div
+                role="group"
+                aria-label="标签"
+                className="flex items-center gap-1.5 border-b border-line px-2 py-1.5"
+              >
+                {TAG_IDS.map((id) => {
+                  const active = t.tag === id;
+                  const name = tagLabel(id, tagNames);
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={active}
+                      aria-label={name}
+                      title={name}
+                      onClick={() => {
+                        closeMenus();
+                        onSetTag(t.thread_id, id);
+                      }}
+                      className={`size-3.5 rounded-full ${TAG_DOT_CLASS[id]} ${
+                        active ? "ring-2 ring-fg ring-offset-1 ring-offset-raised" : ""
+                      }`}
+                    />
+                  );
+                })}
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={!isValidTagId(t.tag)}
+                  onClick={() => {
+                    closeMenus();
+                    onSetTag(t.thread_id, null);
+                  }}
+                  className="ml-auto px-1 text-xs whitespace-nowrap text-fg-muted hover:text-fg"
+                >
+                  无标签
+                </button>
+              </div>
               <button
                 type="button"
                 role="menuitem"
@@ -616,7 +693,7 @@ export function ThreadSidebar({
    * 小节里可见，绝不能因为 `kanbanItemFor` 变 null 就整批消失。
    */
   const renderBoardThreads = (g: WorkspaceGroup) => {
-    const cards = g.threads.filter((t) => !t.pinned && t.card_id);
+    const cards = g.threads.filter((t) => !t.pinned && t.card_id && t.thread_id !== leadId);
     if (cards.length === 0) return null;
     // 搜索期间一律展开，且**关掉这一小节自身的折叠开关**：此时渲染忽略折叠态，
     // 点了看不到任何反馈，却会悄悄写进 `boardCollapsed`，清空搜索后视图就被改掉了。
@@ -639,9 +716,58 @@ export function ThreadSidebar({
     );
   };
 
+  // 组长条目：该项目若有 `role === "lead"` 的会话，它固定渲染在列表最顶部
+  // （Pinned 分区之上），并且**不再**作为普通分组行出现——同一条会话出现两次
+  // 会让人以为是两个入口。判定规则与服务端 `ThreadStore::find_lead` 一致
+  // （`role === "lead"` 且 `created_at` 最小），未知 role 一律忽略。
+  const lead = findLeadThread(groups.flatMap((g) => g.threads));
+  const leadId = lead?.thread_id ?? null;
+
+  // 组长行：与普通会话行同构（同样的状态徽标、标题、相对时间、未读点、点击选
+  // 中），只多一个 `data-lead-row` 标记并去掉图钉/删除按钮——组长是项目级的固
+  // 定入口，置顶与删除对它没有意义。带 `data-thread-row` 以便移动端长按与既有
+  // 样式规则照旧生效。
+  const renderLeadRow = (t: ThreadSummary) => {
+    const active = t.thread_id === currentId;
+    const st = statuses.get(t.thread_id) ?? "idle";
+    const un = unread.get(t.thread_id);
+    return (
+      <div
+        key={t.thread_id}
+        data-lead-row=""
+        data-thread-row={t.thread_id}
+        onClick={(e) => {
+          if (editingId) return;
+          if (e.detail > 1) return;
+          onSelect(t.thread_id);
+        }}
+        className={`group relative flex items-center justify-between gap-1 pl-3 py-2 text-sm ${
+          active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
+        } cursor-pointer`}
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <StatusBadge status={st} stale={statusStale} />
+            <div className="truncate" title={t.title ?? t.thread_id}>
+              {t.title ?? "(untitled)"}
+            </div>
+          </div>
+          <div className="text-xs text-fg-faint">{formatRelativeTime(t.updated_at)}</div>
+        </div>
+        {un && !active && (
+          <span
+            aria-label="Unread"
+            title="Unread result"
+            className={`size-2 shrink-0 rounded-full ${unreadDotClass(un)}`}
+          />
+        )}
+      </div>
+    );
+  };
+
   // 渲染时过滤：不持有第二份列表副本，服务端刷新后自动跟随。
   const searching = query.trim() !== "";
-  const filtered = filterThreadTree(groups, pinned, query);
+  const filtered = filterThreadTree(groups, pinned, query, tagNames);
   // 过滤之后再按 linked_to 归拢：搜索 / 置顶 / 看板会话三个既有分支都不受影响。
   // 搜索期间不复用归拢结果——`filterThreadTree` 只留下命中的组，附属根会临时回到
   // 顶层；渲染时用下面的 isLinkedChild 兜住"顶层但其实是附属根"这一情形。
@@ -656,6 +782,17 @@ export function ThreadSidebar({
   }, [workspaces]);
   // 搜索期间忽略折叠状态；三个 Set 全程不被写入，清空后原样恢复。
   const pinnedCollapsedNow = searching ? false : pinnedCollapsed;
+
+  // 组长行与搜索结果同口径：复用 `filterThreadTree` 的匹配规则（同一份
+  // haystack：标题 + 目录名 + 完整路径），避免出现「搜到了组内会话、组长却
+  // 凭空消失」或反之的分歧。无查询时 `filterThreadTree` 原样返回，恒可见。
+  const leadVisible =
+    lead !== null &&
+    filterThreadTree(
+      [{ workspace: lead.cwd, exists: true, threads: [lead] }],
+      [],
+      query,
+    ).groups.length > 0;
 
   const clearQuery = () => setQuery("");
 
@@ -818,7 +955,8 @@ export function ThreadSidebar({
         {!isCollapsed && renderBoardThreads(g)}
         {!isCollapsed &&
           g.threads
-            .filter((t) => !t.pinned && !t.card_id)
+            // 组长行单独渲染在列表最顶部（见 renderLeadRow），组内不再重复一条。
+            .filter((t) => !t.pinned && !t.card_id && t.thread_id !== leadId)
             .map((t) => renderThread(t, { rowAttr: "group", indentLevel: isChild ? 2 : 0 }))}
         {children.map((child) => renderGroupNode(child, [], 1))}
       </div>
@@ -933,6 +1071,7 @@ export function ThreadSidebar({
           {searching && filtered.empty && (
             <p className="px-3 py-2 text-xs text-fg-faint">无匹配会话</p>
           )}
+          {leadVisible && lead && <div>{renderLeadRow(lead)}</div>}
           {filtered.pinned.length > 0 && (
             <div>
               <div className="flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle">
@@ -952,7 +1091,12 @@ export function ThreadSidebar({
                 filtered.pinned.map((t, i) => renderThread(t, { rowAttr: "pinned", dragIndex: i }))}
             </div>
           )}
-          {nested.top.map(({ group: g, children }) => renderGroupNode(g, children, 0))}
+          {/* 分组之间留一档空档：无间距时上一条会话与下一个文件夹头紧贴，多个文件夹
+              连成一整列、看不出边界。`space-y-2` 只作用于兄弟之间，故首个分组之前
+              不多出空白，也不动置顶分区与组之间既有的留白。 */}
+          <div className="space-y-2">
+            {nested.top.map(({ group: g, children }) => renderGroupNode(g, children, 0))}
+          </div>
         </div>
       </div>
       <div className="mt-auto flex items-center border-t border-line p-2">

@@ -33,7 +33,8 @@ import type {
   ProcessReadResult,
 } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
-import { applyTitleChange } from "./lib/threadListUpdate";
+import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
+import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
 import { SubscriptionWindow } from "./lib/subscriptionWindow";
 import { formatError } from "./lib/errorMessage";
 import {
@@ -167,6 +168,10 @@ export default function App() {
   // the latest one.
   const recoveryRef = useRef<((raw: RequestFn) => Promise<void>) | null>(null);
   const inited = useRef(false);
+  // 首屏是否为「缺组长的项目目录」补建过组长。组长是项目级固定入口，一个进程
+  // 只补一次即可：服务端创建幂等，且补过之后该目录的分组里就有组长条目了。
+  // 用 ref 而非 state：它不参与渲染，且需要跨多次握手/重连保持「已补过」。
+  const leadEnsured = useRef(false);
   // Threads whose history has already been replayed (resumed) this session;
   // switching back to them must not replay again.
   const warm = useRef(new Set<string>());
@@ -202,6 +207,8 @@ export default function App() {
   // 服务端排好序的全部置顶会话（从顶到底）。置顶项仍留在各自的分组内，侧栏
   // 渲染分组时需自行过滤，否则会重复渲染。
   const [pinned, setPinned] = useState<ThreadSummary[]>(initialListCache?.pinned ?? []);
+  /** 标签显示名（6 键齐全）。默认名来自 threadTags.ts，服务端只给覆盖项。 */
+  const [tagNames, setTagNames] = useState<Record<TagId, string>>(DEFAULT_TAG_NAMES);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
@@ -437,6 +444,20 @@ export default function App() {
    * 编辑冲掉。
    */
   const modelCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
+   * 「技能」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖即稳定；
+   * 若每次渲染换新身份，技能面板的读取 effect 会跟着重跑，把已展开的正文与滚动
+   * 位置一起冲掉。
+   */
+  const skillsCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
       if (!c) return Promise.reject(new Error("not connected"));
@@ -876,40 +897,50 @@ export default function App() {
     // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
     setOpenProcessId(null);
     setProcessOutput(null);
-    // Remote-only (S2): keep this thread in the warm subscription window, and
-    // catch up a cold-but-running thread with the read-only `thread/readItems`
-    // instead of `thread/resume` — resume interrupts the in-flight turn, which
-    // is exactly what a passive "look at it" must not do. Desktop (stdio) never
-    // subscribes: its single client receives everything.
+    // **看**一个运行中的会话绝不走 `thread/resume`：resume 会先中断在跑的
+    // turn（服务端 `interrupt_and_wait_for_persist`），而「点开看一眼」是纯
+    // 被动动作，不该有把别人打断的副作用。改用只读的 `thread/readItems` 补齐
+    // 内容，之后靠既有的通知流继续跟新。这对桌面端同样成立——桌面端过去没有
+    // 这层保护（它被 `isRemoteClient()` 关在远端分支里），于是点开一张正在跑
+    // 的看板卡就会把它打断。
+    const curView = store.peek(id);
+    const running =
+      curView?.status === "running" || curView?.status === "awaiting_approval";
+
+    // Remote-only (S2): keep this thread in the warm subscription window.
+    // Desktop (stdio) never subscribes: its single client receives everything.
+    let inWindow = false;
     if (isRemoteClient()) {
-      const inWindow = subWindow.current.has(id);
+      inWindow = subWindow.current.has(id);
       const win = subWindow.current.touch(id);
-      const view = store.peek(id);
-      const running = view?.status === "running" || view?.status === "awaiting_approval";
+      void clientRef.current
+        ?.request("thread/subscribe", { threadIds: win })
+        .catch(() => {});
+      // Already warm → view-only swap.
+      if (inWindow) return;
+    }
+
+    if (running) {
       const c0 = clientRef.current;
       if (c0) {
-        if (!inWindow && running) {
-          const after = store.peek(id)?.session.lastServerItemId ?? null;
-          void (async () => {
-            try {
-              const r = await c0.request<{ items: Item[] }>(
-                "thread/readItems",
-                after ? { threadId: id, afterItemId: after } : { threadId: id },
-              );
-              const v = store.peek(id);
-              if (v) {
-                v.session.upsertItems(r.items);
-                force((n) => n + 1);
-              }
-            } catch {
-              // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+        const after = store.peek(id)?.session.lastServerItemId ?? null;
+        void (async () => {
+          try {
+            const r = await c0.request<{ items: Item[] }>(
+              "thread/readItems",
+              after ? { threadId: id, afterItemId: after } : { threadId: id },
+            );
+            const v = store.peek(id);
+            if (v) {
+              v.session.upsertItems(r.items);
+              force((n) => n + 1);
             }
-          })();
-        }
-        void c0.request("thread/subscribe", { threadIds: win }).catch(() => {});
+          } catch {
+            // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+          }
+        })();
       }
-      // Already warm, or caught up via readItems above → view-only swap.
-      if (inWindow || running) return;
+      return;
     }
     if (warm.current.has(id) || inFlightResume.current.has(id)) return; // warm → 只切视图
     const c = clientRef.current;
@@ -1303,6 +1334,39 @@ export default function App() {
     }
   };
 
+  /** 设置 / 清除某会话的颜色标签；成功后重拉列表，以服务端为权威。 */
+  const onSetTag = async (id: string, tag: TagId | null) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("thread/setTag", { threadId: id, tag });
+      await refreshThreads();
+      force((v) => v + 1);
+    } catch (e) {
+      setCurrentError(formatError(e));
+      // 失败也要重拉：本地不做乐观更新，UI 不能停在「看起来打上了」的状态。
+      await refreshThreads();
+      force((v) => v + 1);
+    }
+  };
+
+  /**
+   * 保存单个颜色标签的显示名。
+   *
+   * 只提交改动的那一个键（服务端按键合并），成功后用**服务端**读回的覆盖项重建
+   * 本地映射——服务端是权威，本端不自行猜测合并结果。广播随后到达，两端一致。
+   */
+  const saveTagName = async (tagId: TagId, name: string) => {
+    const c = clientRef.current;
+    if (!c) return;
+    try {
+      await c.request("ui/settings/write", { tag_names: { [tagId]: name } });
+      force((v) => v + 1);
+    } catch (e) {
+      setCurrentError(formatError(e));
+    }
+  };
+
   /** 置顶分区内拖拽排序落盘；乐观更新 + 失败回滚重拉。 */
   const onReorderPinned = async (orderedIds: string[]) => {
     const c = clientRef.current;
@@ -1458,6 +1522,26 @@ export default function App() {
           force((v) => v + 1);
           return;
         }
+        if (n.method === "thread/tagChanged") {
+          // 服务端推来的权威标签（null = 已清除）。就地落笔即可，不必重拉列表。
+          const next = applyTagChange(
+            groupsRef.current,
+            pinnedRef.current,
+            n.params.thread_id,
+            n.params.tag,
+          );
+          setGroups(next.groups);
+          setPinned(next.pinned);
+          force((v) => v + 1);
+          return;
+        }
+        if (n.method === "ui/tagNames/updated") {
+          // 标签显示名变更（全局帧）：合成完整映射后重渲染，色点 title / 菜单
+          // aria-label / 搜索匹配全部随之更新。
+          setTagNames(resolveTagNames(n.params.tag_names));
+          force((v) => v + 1);
+          return;
+        }
         // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
         store.applyNotification(n);
         force((v) => v + 1);
@@ -1501,6 +1585,12 @@ export default function App() {
           // 这次握手已经废了:重新从 base 起算退避(handshake 成功时本就会归零,
           // 这里针对的是"连上后立刻断"——attempt 不能被永久抬到高位)。
           warm.current.clear();
+          // 推送来的运行状态同样不再成立：新进程对任何会话都没有内存 agent。
+          // 不清它的话，一条崩溃前正在跑、而 `listAll` 现已报 `idle` 的会话会
+          // 停在 `running`，`selectThread` 会因此跳过 resume，新进程里那个 agent
+          // 永远不被重建，之后发送撞上 `-32011` 且无法自愈。详见
+          // `ThreadStore.forgetPushStatuses`。
+          store.forgetPushStatuses();
           // 同样的理由:新进程不记得任何订阅,窗口必须清空,否则重连后
           // 返回"看起来还 warm"的会话时不会再发 subscribe,内容通知被静默过滤。
           subWindow.current = new SubscriptionWindow();
@@ -1517,6 +1607,7 @@ export default function App() {
           theme?: unknown;
           board_watchman_enabled?: unknown;
           relay_url?: unknown;
+          tag_names?: unknown;
         }>("ui/settings/read", {});
         // 中继地址没有「用户正在改」的触碰标记：设置页是模态的，首屏 read 回来
         // 时用户还没法编辑它，直接采纳权威值即可。未配置（null）→ 空串。
@@ -1535,6 +1626,14 @@ export default function App() {
         if (!watchmanTouchedRef.current) {
           setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
         }
+        // 标签显示名：服务端只回用户覆盖项，与默认名合并成完整 6 键。
+        setTagNames(
+          resolveTagNames(
+            settings.tag_names && typeof settings.tag_names === "object"
+              ? (settings.tag_names as Record<string, string>)
+              : null,
+          ),
+        );
         // 首启引导：读不到状态(宿主老、RPC 报错、字段缺失)一律按「不需要」处理，
         // 绝不因为一个读失败弹向导、更不挡住主界面。
         try {
@@ -1554,6 +1653,39 @@ export default function App() {
         setPinned(list.pinned ?? []);
         store.seed(list.groups.flatMap((g) => g.threads));
         if (isRemoteClient()) writeListCache(localStorage, list.groups, list.pinned ?? [], store.currentId);
+        // 已有会话的项目目录不会被服务端的 `listAll` 懒创建覆盖（那会改写它既
+        // 有的分组语义），故这类项目的组长入口要靠客户端补：对「一个组长都没
+        // 有」且确实存在的目录组逐个 `thread/lead`，再重取一次列表把新组长带出
+        // 来。**不 await 在首屏关键路径上**——补组长是锦上添花，绝不能推迟首屏
+        // 渲染或扣住后续的 selectThread；失败一律忽略。只在整个进程里补一次
+        // （`leadEnsured`），服务端创建本身幂等。
+        if (!leadEnsured.current) {
+          const needsLead = list.groups.filter(
+            (g) => g.exists && !g.threads.some((t) => t.role === "lead"),
+          );
+          if (needsLead.length > 0) {
+            leadEnsured.current = true;
+            void (async () => {
+              for (const g of needsLead) {
+                try {
+                  await client.request("thread/lead", { cwd: g.workspace });
+                } catch {
+                  // 单个目录补建失败只影响它自己的组长条目，继续下一个。
+                }
+              }
+              try {
+                const patched = await client.request<{
+                  groups: WorkspaceGroup[];
+                  pinned?: ThreadSummary[];
+                }>("thread/listAll", {});
+                setGroups(patched.groups);
+                store.seed(patched.groups.flatMap((g) => g.threads));
+              } catch {
+                // 重取失败就保留首屏那一份：至少侧栏照常可用。
+              }
+            })();
+          }
+        }
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
         // 手机端：握手（含重连/切回前台）不是「用户换了页面」，当前会话——冷启从
         // 缓存恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看
@@ -2167,6 +2299,8 @@ export default function App() {
           onRename={renameThread}
           onDelete={deleteThread}
           onTogglePin={onTogglePin}
+          onSetTag={onSetTag}
+          tagNames={tagNames}
           onReorderPinned={onReorderPinned}
           onNew={onNew}
           onRemoveWorkspace={removeWorkspace}
@@ -2505,6 +2639,12 @@ export default function App() {
         // 模型 Tab 同样走当前 transport（桌面 stdio = Admin），能调 model/*。
         // 用稳定的 `modelCall`（见上），别在这里内联箭头。
         modelCall={modelCall}
+        // 技能三层根同样按项目解析（`<项目>/.yi-agent/skills`），候选与默认值直接
+        // 复用插件那份——两者指的都是「项目目录下的 .yi-agent」，来源分叉会让用户
+        // 在两个面板里看到不同的项目列表。
+        skillsCall={skillsCall}
+        skillsProjects={pluginProjectPaths(workspaces, boards)}
+        skillsDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。
@@ -2513,6 +2653,8 @@ export default function App() {
         relayUrl={relayUrl}
         // 桌面（当前 transport 有侧车及其宿主）才给保存接缝；iOS 是个 ws 客户端。
         saveRelayUrl={isRemoteClient() ? undefined : saveRelayUrl}
+        tagNames={tagNames}
+        saveTagName={saveTagName}
       />
     </>
   );

@@ -11,6 +11,7 @@ use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryC
 use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 
 use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
+use crate::terminal::text_completion_report;
 
 const LATEST_SCHEMA_VERSION: i64 = 14;
 
@@ -4131,19 +4132,6 @@ fn migrate(connection: &Connection) -> Result<(), RepositoryError> {
         transaction.commit()?;
     }
     Ok(())
-}
-
-/// The partial report a text-only worker left in its attempt's terminal JSON.
-///
-/// Mirrors the store's own decoder; kept local so the reclaim path does not
-/// reach across module boundaries for one field.
-fn text_completion_report(terminal_json: Option<&str>) -> Option<String> {
-    let payload = serde_json::from_str::<serde_json::Value>(terminal_json?).ok()?;
-    (payload.get("kind").and_then(serde_json::Value::as_str) == Some("text_completion"))
-        .then(|| payload.get("report").and_then(serde_json::Value::as_str))
-        .flatten()
-        .filter(|report| !report.trim().is_empty())
-        .map(str::to_owned)
 }
 
 #[cfg(test)]

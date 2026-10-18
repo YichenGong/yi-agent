@@ -32,3 +32,26 @@ describe("SuperpowersKanbanCard", () => {
     expect(screen.queryByRole("button")).toBeNull();
   });
 });
+
+// 宽度自适应：卡片与标题行必须能收缩，标题的 `truncate` 才会生效；长会话链接
+// 也要截断，否则它会把卡片（进而整列）撑宽——正是「左右过宽」的成因。
+// jsdom 不布局，只能钉住这几处约束类名。
+describe("SuperpowersKanbanCard shrinks under long content", () => {
+  it("lets the card and its title row shrink", () => {
+    const { container } = render(
+      <SuperpowersKanbanCard card={card({ title: "x".repeat(200) })} />,
+    );
+    const li = container.firstElementChild as HTMLElement;
+    expect(li.className.split(/\s+/)).toContain("min-w-0");
+    const row = li.firstElementChild as HTMLElement;
+    expect(row.className.split(/\s+/)).toContain("min-w-0");
+  });
+
+  it("truncates a long thread link instead of widening the card", () => {
+    render(<SuperpowersKanbanCard card={card({ threadId: "t".repeat(120) })} />);
+    const link = screen.getByRole("button");
+    const classes = link.className.split(/\s+/);
+    expect(classes).toContain("truncate");
+    expect(classes).toContain("max-w-full");
+  });
+});

@@ -13,7 +13,8 @@ use yi_agent_core::ProviderError;
 /// | 429               | `RateLimited`                |
 /// | 400, 422          | `InvalidRequest`             |
 /// | 500..=599         | `Server`                     |
-/// | other             | `Server` (unexpected status) |
+/// | other 4xx         | `InvalidRequest` (deterministic) |
+/// | other 5xx         | `Server`                     |
 pub async fn map_status_error(resp: reqwest::Response) -> ProviderError {
     let status = resp.status().as_u16();
     let body = resp.text().await.unwrap_or_default();
@@ -23,7 +24,9 @@ pub async fn map_status_error(resp: reqwest::Response) -> ProviderError {
         429 => ProviderError::RateLimited,
         400 | 422 => ProviderError::InvalidRequest(format!("{}: {}", status, body)),
         500..=599 => ProviderError::Server(format!("{}: {}", status, body)),
-        _ => ProviderError::Server(format!("unexpected status {}: {}", status, body)),
+        // 其余 4xx 是确定性的客户端错误（404 路由/模型不存在、413 请求过大……）：
+        // 归为 `Server` 会被重投逻辑误当成可重试的 5xx，故按 `InvalidRequest` 归类。
+        _ => ProviderError::InvalidRequest(format!("unexpected status {}: {}", status, body)),
     }
 }
 

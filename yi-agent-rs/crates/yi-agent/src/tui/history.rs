@@ -843,6 +843,15 @@ impl HistoryState {
                     RetryCause::RequestTimeout => {
                         format!("Provider request timed out — retrying {attempt}/{max}")
                     }
+                    RetryCause::RateLimited => {
+                        format!("Provider rate limited (429) — retrying {attempt}/{max}")
+                    }
+                    RetryCause::ServerError => {
+                        format!("Provider server error (5xx) — retrying {attempt}/{max}")
+                    }
+                    RetryCause::NetworkError => {
+                        format!("Provider unreachable (network error) — retrying {attempt}/{max}")
+                    }
                 };
                 self.cells
                     .push(HistoryCell::Separator { label: Some(label) });

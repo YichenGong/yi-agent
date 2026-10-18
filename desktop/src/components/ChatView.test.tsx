@@ -293,3 +293,28 @@ describe("ChatView server notices", () => {
     expect(warnClass).toContain("amber");
   });
 });
+
+describe("ChatView retry banner", () => {
+  afterEach(cleanup);
+
+  it("names every retry cause so a capacity fault is not misreported as a stall", () => {
+    // The banner is the only place a user learns why the turn is waiting. Each
+    // cause must render its own wording: a 429 is not a stall, and an
+    // unreachable provider is neither.
+    const cases: Array<[Parameters<typeof ChatView>[0]["retrying"], string]> = [
+      [{ attempt: 1, max: 3, cause: "idle_stall" }, "Provider stalled"],
+      [{ attempt: 2, max: 3, cause: "request_timeout" }, "Provider request timed out"],
+      [{ attempt: 1, max: 3, cause: "rate_limited" }, "Provider rate limited (429)"],
+      [{ attempt: 1, max: 3, cause: "server_error" }, "Provider server error (5xx)"],
+      [{ attempt: 1, max: 3, cause: "network_error" }, "Provider unreachable"],
+    ];
+
+    for (const [retrying, expected] of cases) {
+      const { container, unmount } = render(<ChatView items={[]} retrying={retrying} />);
+      const text = container.textContent ?? "";
+      expect(text).toContain(expected);
+      expect(text).toContain(`retrying ${retrying!.attempt}/${retrying!.max}`);
+      unmount();
+    }
+  });
+});

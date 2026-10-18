@@ -6,16 +6,19 @@
  * 一个 daemon），插件不知道也不该知道别人登记了什么。
  */
 
-type BoardRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
+import type { RpcCall } from "./rpcCall";
+import { RPC } from "./routes";
+
+type BoardRpc = RpcCall;
 
 /** 登记一个项目的看板（幂等：已有则只把它拉起来）。 */
 export async function createBoard(rpc: BoardRpc, project: string): Promise<void> {
-  await rpc("board/create", { project });
+  await rpc(RPC.boardCreate, { project });
 }
 
 /** 撤销登记并删掉该项目的队列状态。不可逆，调用方必须先二次确认。 */
 export async function removeBoard(rpc: BoardRpc, project: string): Promise<void> {
-  await rpc("board/remove", { project });
+  await rpc(RPC.boardRemove, { project });
 }
 
 /**
@@ -26,7 +29,7 @@ export async function removeBoard(rpc: BoardRpc, project: string): Promise<void>
  * 决定画不画条目，读不出来只能是「没有」，绝不能因此让整页崩掉。
  */
 export async function listBoards(rpc: BoardRpc): Promise<string[]> {
-  const result = await rpc<unknown>("board/list", {});
+  const result = await rpc<unknown>(RPC.boardList, {});
   return projectPaths(result);
 }
 

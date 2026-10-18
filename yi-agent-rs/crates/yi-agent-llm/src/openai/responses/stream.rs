@@ -1,6 +1,6 @@
 //! `/v1/responses` 的 SSE 解析。
 //!
-//! 与 `openai/stream.rs` 同形：自带私有的 `SseLineParser` + `SseFrame`，按行累积
+//! 使用共享的 `crate::sse` 内核（`SseStreamCore`）切分并解析 SSE 帧，按行累积
 //! `data:` 负载。区别在于 responses 流同时下发 `event:` 行——那些行一律忽略，
 //! 分派只看 JSON 里的 `type` 字段。
 
@@ -9,80 +9,16 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde_json::Value;
 
 use yi_agent_core::provider::TokenUsage;
 use yi_agent_core::{ProviderError, ProviderEvent, ReasoningKind, StopReason};
 
-struct SseFrame {
-    data: String,
-    /// 非 `None` 表示该帧在行解析阶段就已损坏（如非法 UTF-8）。
-    parse_error: Option<String>,
-}
-
-struct SseLineParser {
-    buf: Vec<u8>,
-    current_data_lines: Vec<String>,
-}
-
-impl SseLineParser {
-    fn new() -> Self {
-        Self {
-            buf: Vec::new(),
-            current_data_lines: Vec::new(),
-        }
-    }
-
-    fn feed(&mut self, chunk: &[u8]) -> Vec<SseFrame> {
-        self.buf.extend_from_slice(chunk);
-        let mut frames = Vec::new();
-
-        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
-            let line_bytes: Vec<u8> = self.buf.drain(..=nl).collect();
-            let line_bytes = &line_bytes[..line_bytes.len().saturating_sub(1)];
-
-            let mut line = match std::str::from_utf8(line_bytes) {
-                Ok(s) => s.to_string(),
-                Err(e) => {
-                    self.current_data_lines.clear();
-                    frames.push(SseFrame {
-                        data: String::new(),
-                        parse_error: Some(format!("invalid UTF-8 in SSE line: {e}")),
-                    });
-                    continue;
-                }
-            };
-
-            if line.ends_with('\r') {
-                line.pop();
-            }
-
-            if line.is_empty() {
-                if !self.current_data_lines.is_empty() {
-                    let data = std::mem::take(&mut self.current_data_lines).join("\n");
-                    frames.push(SseFrame {
-                        data,
-                        parse_error: None,
-                    });
-                }
-                continue;
-            }
-
-            if let Some(rest) = line.strip_prefix("data:") {
-                self.current_data_lines.push(rest.trim().to_string());
-            }
-            // `event:` / `id:` / `retry:` 与 `:` 注释行一律忽略。
-        }
-
-        frames
-    }
-}
+use crate::sse::{SseFrame, SseStreamCore};
 
 pub struct ResponsesStream<S> {
-    line_parser: SseLineParser,
-    inner: S,
-    pending_frames: VecDeque<SseFrame>,
+    core: SseStreamCore<S>,
     pending_events: VecDeque<ProviderEvent>,
     /// `output_item.added` 记录的 item id → call id。
     ///
@@ -99,9 +35,7 @@ where
 {
     pub fn new(inner: S) -> Self {
         Self {
-            line_parser: SseLineParser::new(),
-            inner,
-            pending_frames: VecDeque::new(),
+            core: SseStreamCore::new(inner),
             pending_events: VecDeque::new(),
             call_ids: HashMap::new(),
             stopped: false,
@@ -109,10 +43,6 @@ where
     }
 
     fn parse_frame(&mut self, frame: SseFrame) -> Result<Vec<ProviderEvent>, ProviderError> {
-        if let Some(msg) = frame.parse_error {
-            return Err(ProviderError::Stream(msg));
-        }
-
         let data: Value = match serde_json::from_str(&frame.data) {
             Ok(v) => v,
             Err(e) => {
@@ -227,7 +157,16 @@ where
                         {
                             events.push(ProviderEvent::ThinkingBlock {
                                 text: String::new(),
-                                token: yi_agent_core::ThinkingToken::Encrypted(enc.to_string()),
+                                token: yi_agent_core::ThinkingToken::Encrypted {
+                                    encrypted_content: enc.to_string(),
+                                    // 逐字带走上游 `summary`（缺失/非数组时落为空 Vec），
+                                    // 供下一轮回放——回放时该字段必须显式在场。
+                                    summary: item
+                                        .get("summary")
+                                        .and_then(Value::as_array)
+                                        .cloned()
+                                        .unwrap_or_default(),
+                                },
                             });
                         }
                     }
@@ -313,41 +252,19 @@ where
                 return Poll::Ready(Some(Ok(event)));
             }
 
-            while let Some(frame) = self.pending_frames.pop_front() {
-                match self.parse_frame(frame) {
+            match self.core.poll_next_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(Some(Ok(frame))) => match self.parse_frame(frame) {
                     Ok(events) => {
                         if events.is_empty() {
                             continue;
                         }
-                        for ev in events {
-                            self.pending_events.push_back(ev);
-                        }
-                        break;
+                        self.pending_events.extend(events);
                     }
                     Err(e) => return Poll::Ready(Some(Err(e))),
-                }
-            }
-
-            if !self.pending_events.is_empty() {
-                continue;
-            }
-
-            match self.inner.poll_next_unpin(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Ready(Some(Err(e))) => {
-                    // 与 chat 流一致：只有超时算可重试的 Network，其余传输中断归 Stream。
-                    let error = if e.is_timeout() {
-                        ProviderError::Network(format!("stream error: timed out: {e}"))
-                    } else {
-                        ProviderError::Stream(format!("stream error: {e}"))
-                    };
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Poll::Ready(Some(Ok(chunk))) => {
-                    let frames = self.line_parser.feed(&chunk);
-                    self.pending_frames.extend(frames);
-                }
+                },
             }
         }
     }
@@ -585,10 +502,68 @@ mod tests {
             matches!(
                 e,
                 ProviderEvent::ThinkingBlock { token, .. }
-                    if *token == yi_agent_core::ThinkingToken::Encrypted("enc-blob".into())
+                    if *token == yi_agent_core::ThinkingToken::Encrypted {
+                        encrypted_content: "enc-blob".into(),
+                        summary: vec![],
+                    }
             )
         });
         assert!(found, "reasoning item must surface its encrypted_content");
+    }
+
+    #[tokio::test]
+    async fn reasoning_item_done_captures_summary_verbatim() {
+        // B 方案内核：捕获端必须把上游 `summary` 原样存进凭证，供下一轮回放。
+        let body = "event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc-blob\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thought\"}]}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_chunks(&[bytes.as_slice()])
+            .await
+            .into_iter()
+            .collect();
+
+        let found = events.iter().any(|e| {
+            matches!(
+                e,
+                ProviderEvent::ThinkingBlock { token, .. }
+                    if *token == yi_agent_core::ThinkingToken::Encrypted {
+                        encrypted_content: "enc-blob".into(),
+                        summary: vec![serde_json::json!({"type": "summary_text", "text": "thought"})],
+                    }
+            )
+        });
+        assert!(
+            found,
+            "reasoning item must capture its summary verbatim: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_item_done_captures_an_empty_summary_as_an_empty_vec() {
+        // 上游 `summary` 常见为 `[]`；捕获端须落为空 Vec（回放时仍显式发出）。
+        let body = "event: response.output_item.done\n\
+             data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"enc-blob\",\"summary\":[]}}\n\n\
+             event: response.completed\n\
+             data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_chunks(&[bytes.as_slice()])
+            .await
+            .into_iter()
+            .collect();
+
+        let found = events.iter().any(|e| {
+            matches!(
+                e,
+                ProviderEvent::ThinkingBlock { token, .. }
+                    if *token == yi_agent_core::ThinkingToken::Encrypted {
+                        encrypted_content: "enc-blob".into(),
+                        summary: vec![],
+                    }
+            )
+        });
+        assert!(found, "empty summary must be captured as an empty vec");
     }
 
     // ---- 以下为超出 brief 的防御性用例 ----

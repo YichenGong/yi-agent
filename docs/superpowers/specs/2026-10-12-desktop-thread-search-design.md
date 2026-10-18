@@ -21,6 +21,30 @@
 - 两端都加 sticky 吸附：滚动时常驻可见，与"上滑看不到搜索框"的需求相反。
 - 搜索框自动聚焦（打开抽屉即弹键盘）：用户明确不做，理由见 §5。
 
+**2026-10-17（三）· 手机端搜索框的间距与触控高度**
+
+上一处修订把手机端搜索框移进滚动容器后，它上方原有的 8px 间距消失了——那是「+ New thread」
+区块 `p-2` 的下内边距，桌面端仍在，手机端因为换了父节点而丢失，输入框贴在了容器顶边。
+同时量得输入框实际高度约 34px（20px 行高 + 12px 内边距 + 2px 边框），低于本项目在手机上
+一贯采用的 Apple HIG 44px 触控目标（见 `App.tsx` 抽屉入口按钮那条注释）。本次一并处理。
+
+作法（**不改任何 JSX/DOM**，因此桌面端逐字节不变、`ThreadSidebar.test.tsx` 无需改动）：
+
+- 直接扩展既有那条手机端规则 `<input type="search">`，加 `min-height: 44px` 与
+  `margin-top: 0.5rem`。搜索框的选择器 `input[type="search"]` 早已存在且稳定，无需新增
+  钩子属性。
+- 顶边间距用**输入框自身的 `margin-top`**，不用包裹层的 `padding-top`：包裹层
+  `<div className="relative px-2 pb-2">` 是两端共用的 DOM，没有可用的样式钩子，硬改会
+  把桌面端一起改掉。间距随列表一起滚动，与「跟随列表」的预期一致。
+- `box-sizing: border-box` 来自 Tailwind preflight，故 `min-height: 44px` 是含边框的
+  44px 触摸高。
+
+被否备选（仅记录）：给包裹层加手机端钩子属性再写 `padding-top`——要在 JSX 里加条件属性，
+多一个移动部件，而搜索框选择器本就够用；只补间距不动高度——手机上高频点击的控件 34px 偏小。
+
+**本次不做**（避免范围蔓延）：清除按钮（`×`）的点击区域偏小（`px-1`），属另一个控件、
+另一次决定；包裹层内边距与行右侧 `pr-4` 对齐保持不动。
+
 ---
 
 ## 1. 需求与已核实事实
@@ -170,17 +194,27 @@ export function filterThreadTree(
 
 ### 3.3 `index.css`
 
-新增一条手机端专属规则，放在既有 `[data-mobile="true"]` 分组内：
+一条手机端专属规则，放在既有 `[data-mobile="true"]` 分组内（2026-10-17 修订：由单条
+`font-size` 扩展为下面三条）：
 
 ```css
 [data-mobile="true"] .app-sidebar input[type="search"] {
   font-size: 16px;
+  min-height: 44px;
+  margin-top: 0.5rem;
 }
 ```
 
-原因：iOS 在聚焦字号 < 16px 的输入框时会自动放大页面，而 `useIsMobile.ts` 的 `lockZoom`
-只能禁用用户的**手动**捏合缩放，挡不住这条自动放大。桌面端不匹配 `[data-mobile]`，
-逐字节无影响。
+三条各自的原因：
+
+- `font-size: 16px`：iOS 在聚焦字号 < 16px 的输入框时会自动放大页面，而 `useIsMobile.ts`
+  的 `lockZoom` 只能禁用用户的**手动**捏合缩放，挡不住这条自动放大。
+- `min-height: 44px`：手机上搜索框是高频点击控件，本项目的触控目标按 Apple HIG 的 44px
+  （输入框原约 34px）。
+- `margin-top: 0.5rem`：补回移入滚动容器后丢失的顶部 8px 间距（原由「+ New thread」区块的
+  `p-2` 下内边距提供）。
+
+桌面端不匹配 `[data-mobile]`，三条全部对桌面逐字节无影响。
 
 ### 3.4 测试
 
@@ -222,9 +256,10 @@ export function filterThreadTree(
 **既有断言**：`ThreadSidebar.test.tsx` 全部现有用例不得改动且必须通过（尤其
 `div[tabindex]`、`button[aria-haspopup="menu"]`、`[role="separator"]` 三个选择器契约）。
 
-**`mobileLayout.test.ts` 新增一条**：真实 `index.css` 中存在
-`[data-mobile="true"] .app-sidebar input[type="search"]` 的 `font-size: 16px` 规则，
-锁住 iOS 聚焦自动放大不回归。
+**`mobileLayout.test.ts` 新增一条**（2026-10-17 修订：扩展为同时覆盖三条）：真实 `index.css` 中
+`[data-mobile="true"] .app-sidebar input[type="search"]` 规则须同时含 `font-size: 16px`
+（锁住 iOS 聚焦自动放大不回归）、`min-height: 44px`（触控目标）与 `margin-top: 0.5rem`
+（顶边间距）。
 
 ## 4. 边界情况
 
@@ -269,6 +304,8 @@ export function filterThreadTree(
 5. 搜索期间命中行所在的折叠分组**与「看板会话」小节**自动展开；清空查询后恢复原有折叠视图。
 6. 搜索栏具备 `type="search"`、`aria-label="搜索会话"`、`aria-label="清除搜索"` 的清除按钮、
    `Escape` 清空；无匹配时显示 `无匹配会话`。
-7. 手机端聚焦搜索框时页面**不**自动放大（`[data-mobile="true"]` 下 16px 规则生效）。
+7. 手机端聚焦搜索框时页面**不**自动放大（`[data-mobile="true"]` 下 16px 规则生效）；
+   搜索框在手机端触控高度 ≥ 44px，且与滚动容器顶边留有 8px 间距（`margin-top`）——两者
+   都只作用于手机，桌面端逐字节不变。
 8. `desktop/` 下 `npm test` 全绿：`threadSearch.test.ts` 新用例、`ThreadSidebar.test.tsx`
    新用例与**全部既有用例**、`mobileLayout.test.ts` 新断言。

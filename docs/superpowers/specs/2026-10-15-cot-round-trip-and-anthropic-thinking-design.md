@@ -581,6 +581,140 @@ no-op（`Option::None` 分支）——回传与否都只影响 summary，这与�
 DeepSeek 的 Anthropic 兼容实现可能比官方宽松。此局限如实登记，不影响本分支代码正确性
 （请求/回传形状已由单测 + 兼容端点双重钉住）。
 
+### 8.2 chat vs responses 通道的实测对照（2026-10-17，续）
+
+本分支把 CoT 回传做成了「两个通道对称」的实现。在 `llmapi.horizon.auto` 上把同一网关
+的 chat 与 responses 两条通道逐项对照后，发现**同一份代码在两条通道上的实际收益并不对称**。
+以下为实测记录；**结论只对本网关成立**，不推广到其它网关。
+
+**A. DeepSeek 系：chat 有真凭证、responses 没有**
+
+| 模型 | 通道 | reasoning 回传载体 | 是否可回传 |
+|---|---|---|---|
+| `HORIZON-DeepSeek` | chat | `reasoning_content`（文本） | **是**（流式 30 帧中 21 帧带该字段） |
+| `HORIZON-DeepSeek` | responses | reasoning item 仅 `{id,status,summary,type}` | **否**（无 `encrypted_content`） |
+| `HORIZON-DeepSeek-Pro` | chat | `reasoning_content` | 是 |
+| `HORIZON-DeepSeek-Pro` | responses | 仅 `summary`，无 `encrypted_content` | 否 |
+
+即：**对 DeepSeek 系，唯一能真正回传凭证的是 chat 通道**。responses 通道上本设计的
+「捕获 `encrypted_content`、有则回传」退化为 no-op（`Option::None` 分支），回传与否只
+影响 summary——这与 §8.1「responses 回传无可观测收益」互为印证。
+
+**B. OG 系（Luna / Sol）：与 DeepSeek 相反，responses 有真凭证、chat 没有**
+
+| 模型 | 通道 | 是否返回凭证 |
+|---|---|---|
+| `HORIZON-OG-Luna` / `HORIZON-OG-Sol` | responses | **是**，reasoning item 含 `encrypted_content`（长度 1656），且第二轮带该 item 回传 **200** |
+| `HORIZON-OG-Luna` | chat | 否（message 只有 `{role, content}`，无 `reasoning_content`） |
+
+**因此两代模型不能被同一条 `api_style` 策略覆盖**：DeepSeek 系应走 chat（拿到可回传的
+`reasoning_content`），OG 系必须留在 responses/auto（否则丢掉本可回传的 `encrypted_content`）。
+「把网关下所有模型统一切成 chat」是错误做法。
+
+**C. chat 通道回传 `reasoning_content` 的量化收益（多轮工具历史，各 10 采样）**
+
+构造工具调用回合（assistant 带 `tool_calls` + 后续 `tool` 结果），第二轮对比回传与否：
+
+| 变体 | `reasoning_tokens` 样本 | 中位 | 输出总 token 中位 | prompt token |
+|---|---|---|---|---|
+| 不回传 | 250,140,152,146,98,261,53,157,125,224 | **149** | 222 | 430 |
+| 回传 | 61,83,72,85,114,37,52,63,37,59 | **62** | 110 | 482 |
+
+**结论**：本网关 chat 通道**不校验**是否回传（两种均 200），但**不回传会触发模型从头重推**
+（reasoning token 中位 149 vs 回传 62，约 **2.4×**；输出总量同步翻倍）。故对 chat 通道，
+回传是**强烈推荐的效果优化**（非报错必需）。
+
+**D. 官方直连 vs 本网关（补充 §8.1 未决 4）**
+
+官方 `api.deepseek.com` 的 chat 通道对工具循环**硬校验**：不回传 `reasoning_content` 即
+**400**（`The reasoning_content in the thinking mode must be passed back to the API.`）；
+本网关为 200。同一份 §5.3 代码在两端点都正确。
+
+**E. 图像理解：chat 与 responses 两通道对本网关均可用**
+
+用项目**真实** `OpenaiProvider` 两条通道各发一张三色竖条 PNG（chat 走 `image_url` +
+data URL，responses 走 `input_image` + data URL）：
+
+| 通道 | 小图（64px，b64 16.5 KB） | 大图（1024px，b64 ~4.2 MB） |
+|---|---|---|
+| chat | 正确识别「左蓝/中白/右黄竖条」 | 正确 |
+| responses | 正确 | 正确 |
+
+真实 chat 请求体捕获：`content_shape=[['text','image_url']]`、`image_url.detail=high`、
+`url=data:image/png;base64,…`。故**用 chat 通道不会损失图像理解**。
+
+**F. 编码不对称（低影响，登记备查）**
+
+chat 侧发 `detail`（`openai/types.rs` 的 `image_part`，取 `ImageDetail::as_wire_str()`
+→ `"high"`/`"original"`）；**responses 侧不发 `detail`**（`openai/responses/types.rs` 的
+`image_url_part` 只序列化 `{"type":"input_image","image_url":url}`）。实测在本网关上二者
+答案一致（含「左上角红方块」这类细节敏感问句），故暂不作为缺陷修；若后续接入对 `detail`
+敏感的端点需补齐 responses 侧。
+
+**G. `api_style` 的生效范围与一处接线修复**
+
+`models.json` 条目的 `api_style` **只经 `resolve_effective` 生效**（该函数把条目的
+`api_style` 解析进 `RuntimeConfig.api_style`）。据此：
+
+- **生效路径**：桌面 app-server（`server.rs` 每会话 `resolve_effective`）、subagent worker、
+  TUI 内 `/model` 切换。
+- **修复**：**TUI/CLI 启动**原先**忽略**清单的 `api_style`。`main.rs` 的
+  `startup_config_from_catalog` 注释写着「Deliberately only handles the **effort** field」，
+  启动时 `RuntimeConfig.api_style` 恒为 `load_inner` 硬编码的 `Auto`（未知网关默认选
+  **Responses**），故给条目设 `api_style:"chat"` 后 CLI/TUI 启动仍打到 `/responses`
+  （实测：代理观察到 `POST /responses`），而桌面端走 chat。这与 §8.1 记录的 effort 缺陷
+  （Task 8 评审 R2）**同类**——「`/model`/`/effort` 报告的条目」必须就是「请求实际使用的
+  条目」。已把 `api_style` 一并纳入 `startup_config_from_catalog`（条目静默时保留启动默认
+  `Auto`，零回归），并加单测 `startup_adopts_the_entries_api_style` 钉住。
+- **仍不生效（有意）**：headless `run` 子命令。其 root provider 刻意只取 CLI/env、与清单
+  无关（`tests/model_catalog_live_reload_e2e.rs` 明确记录并守护此不变量：清单被改坏时 root
+  仍须能启动）。故 `yi-agent run ...` 不会采纳清单的 `api_style`；需 chat 通道时用
+  `--api-style`（若后续补该 flag）或改走桌面/TUI。
+
+### 8.3 Responses reasoning item 回放缺 `summary`（缺陷 + 修复，2026-10-17）
+
+**现象**：`HORIZON-OG-Luna`（`gpt-6-luna`）走 responses 通道时，**只要 agent 用工具，
+第二轮必定 400**；裸模型（`--naked`）与单轮对话都正常，故表现为「时好时坏」。
+
+**报错**（逐字）：
+```
+400 {"error":{"message":"{\n  \"error\": {\n    \"message\": \"Missing required parameter: 'input[1].summary'.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"input[1].summary\",\n    \"code\": \"missing_required_parameter\"\n  }\n}","type":"upstream_error"}}
+```
+
+**根因**：客户端在收到工具结果后重放对话历史时，reasoning item **只发了
+`encrypted_content`、漏了上游必需的 `summary`**（`openai/responses/types.rs`）。触发条件
+是**第 2 轮及以后**（首轮无历史可重放），故单轮/裸模型都不出错。由 `bcf9b6be` 引入，与
+base_url 的 `/v1` 改动无关。
+
+**真实往返实测**（`gpt-6-luna`，捕获真实 `encrypted_content` 再重放）：
+
+| 重放形态 | 结果 |
+|---|---|
+| `reasoning` + `encrypted_content`，**无 `summary`**（修复前行为） | **400 `Missing required parameter: 'input[1].summary'`** |
+| `reasoning` + `encrypted_content` + `summary:[]` | 200 |
+| `reasoning` + `encrypted_content` + 非空 `summary:[{type,text}]` | 200 |
+| `summary` 传字符串而非数组 | 400（必须是对象数组） |
+| 丢弃 reasoning item | 200 |
+
+上游 reasoning item 形状为 `{id, type, content, encrypted_content, summary}`，`summary`
+常见为 `[]`，但**必须显式发这个空数组，不能省略字段**。
+
+**修复（B 方案 / 完整）**：让凭证携带 `summary` 原文——`ThinkingToken::Encrypted` 从
+`Encrypted(String)` 改为 `Encrypted { encrypted_content, summary }`；流式解析
+（`responses/stream.rs`）逐字捕获上游 `summary`；回放（`responses/types.rs`）逐字带上。
+`summary` 与 `encrypted_content` 同属回放必需字段，空数组也必须显式在场。旧 transcript
+的字符串形态 `{"Encrypted":"..."}` 经 `serde(from)` 中转形态仍可反序列化（缺省 `summary`
+为空数组），向后兼容。
+
+**端到端验证**：真实客户端经记录代理跑「带工具的第 2 轮」，捕获到实际的第二轮请求体
+（修复前必 400）：
+
+```json
+{"type":"reasoning","encrypted_content":"gAAAAABq04RQJR4D...(1336 chars)","summary":[]}
+```
+
+该回合正常完成（工具执行 + 模型作答），修复前同一场景第二轮 400。
+
 ## 9. 交付顺序建议
 
 1. **数据模型**（§3）+ 编译期强制补齐所有 match → 独立可提交，行为零变化。
