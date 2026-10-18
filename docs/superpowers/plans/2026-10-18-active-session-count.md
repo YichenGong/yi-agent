@@ -131,7 +131,7 @@ export function runningSessionsLabel(n: number): string {
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/runningSessions.test.ts`
-Expected: PASS — 7 个用例全绿(0 空表 / 0 全 idle / 0 全审批 / 混合=2 / 全 running=3 / 两条文案)。
+Expected: PASS — 6 个用例全绿(0 空表 / 0 全 idle / 0 全审批 / 混合=2 / 全 running=3 / 文案两条断言)。
 
 - [ ] **Step 5: 提交**
 
@@ -327,7 +327,7 @@ Expected: `tsc && vite build` 成功,产出 `dist/`。
 `[x]` + 代码位置 + 判据命令 + 设计链接):
 
 ```markdown
-- [x] 侧栏「运行中会话数」指示器 — footer 里、设置齿轮右侧显示全局正在运行的会话数（`3 个会话运行中`），严格只数 `status === "running"`（`awaiting_approval` 不计：会话在等人，没在干活）；计数 0 时整个节点不渲染，footer 与改动前逐像素一致；复用 `useSpinPhase` 相位锚定墙钟，手机端离线经 `statusStale` 降透明并标「可能过期」。纯函数 `desktop/src/lib/runningSessions.ts:14`（`countRunningSessions` 只认 `running`）/ `:26`（`runningSessionsLabel` 单点持有文案）；组件 `desktop/src/components/ThreadSidebar.tsx`（内部 `ActiveSessionCount`，`role="status"` + `aria-live="polite"`，恒 running 形态）/ footer 接线（齿轮 `</button>` 之后，不加 `ml-auto`、不动齿轮位置）；**零协议、零 Rust、零新增 prop**。判据：`cd desktop && npx vitest run src/lib/runningSessions.test.ts src/components/ThreadSidebar.test.tsx && npx tsc --noEmit` — [设计](../superpowers/specs/2026-10-18-active-session-count-design.md)
+- [x] 侧栏「运行中会话数」指示器 — footer 里、设置齿轮右侧显示全局正在运行的会话数（`3 个会话运行中`），严格只数 `status === "running"`（`awaiting_approval` 不计：会话在等人，没在干活）；计数 0 时整个节点不渲染，footer 与改动前逐像素一致；复用 `useSpinPhase` 相位锚定墙钟，手机端离线经 `statusStale` 降透明并标「可能过期」。纯函数 `desktop/src/lib/runningSessions.ts:12`（`countRunningSessions` 只认 `running`）/ `:22`（`runningSessionsLabel` 单点持有文案）；组件 `desktop/src/components/ThreadSidebar.tsx`（内部 `ActiveSessionCount`，`role="status"` + `aria-live="polite"`，恒 running 形态）/ footer 接线（齿轮 `</button>` 之后，不加 `ml-auto`、不动齿轮位置）；**零协议、零 Rust、零新增 prop**。判据：`cd desktop && npx vitest run src/lib/runningSessions.test.ts src/components/ThreadSidebar.test.tsx && npx tsc --noEmit` — [设计](../superpowers/specs/2026-10-18-active-session-count-design.md)
 ```
 
 - [ ] **Step 4: 修正并更新两份索引的 desktop 计数**
