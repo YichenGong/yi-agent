@@ -5023,36 +5023,33 @@ mod watchdog_tick_tests {
     /// 一个未 hydrate 的会话不得阻断整轮扫描。
     ///
     /// 这是 Task 1 契约的驱动路径形式：tick 跑完（`Ok`）、未 hydrate 的那条被
-    /// **跳过而非判定**（状态不变、无终态事件），同时 hydrate 的兄弟仍被终止
-    /// ——后者证明扫描越过了那条坏记录（无论 SQL 返回顺序如何）。
+    /// **跳过而非判定**（状态不变、无终态事件），同时 hydrate 的兄弟仍被终止。
+    ///
+    /// 覆盖的是**坏记录先被扫描到**这一顺序（见下方「先写坏记录」的说明），
+    /// 也正因为如此它才能区分「逐条隔离」是否还在。顺序无关的保证由 Task 1 的
+    /// 直接测试 `an_unhydrated_session_does_not_fail_the_whole_watchdog_sweep`
+    /// 负责（那里不依赖扫描顺序）。
     #[test]
     fn one_unhydrated_session_does_not_stop_the_tick_from_terminating_another() {
         let directory = tempfile::TempDir::new().unwrap();
         let database = directory.path().join("runtime.sqlite");
         let daemon = start_daemon(&database);
 
-        let session = daemon.coordinator.create_session().unwrap();
-        let hydrated_root = daemon.coordinator.root_task_id(&session).unwrap();
-        let hydrated_attempt = active_attempt_id(&database, &hydrated_root);
+        let started = ancient_start();
 
         // 未 hydrate 的兄弟：手工造一条 queued 越限快照，其会话不在 map 里。
+        //
+        // 必须**先于** `create_session()` 写入：`create_session` 会在
+        // `insert_attempt` 里替它的根 attempt 插一行 `attempt_watchdogs`，而
+        // `active_attempt_watchdogs()` 没有 `ORDER BY`，扫描顺序即 rowid 顺序。
+        // 先写坏记录，才能保证这一轮扫描**先撞上**那条未 hydrate 的记录——只有
+        // 这个顺序才真正区分「逐条隔离」是否还在：隔离被移除时，扫描在第 1 条
+        // （坏记录）就中止，后面已 hydrate 的兄弟永远等不到判定，本测试即失败。
         let unhydrated_session = RootSessionId::new();
         let unhydrated_task = TaskId::new();
         let unhydrated_attempt = yi_agent_core::AttemptId::new();
-        let started = ancient_start();
         {
             let mut repository = RuntimeRepository::open(&database).unwrap();
-            repository
-                .save_attempt_watchdog_snapshot(
-                    &hydrated_root,
-                    &hydrated_attempt,
-                    &over_budget_limits(),
-                    &WatchdogUsage::default(),
-                    None,
-                    started,
-                    None,
-                )
-                .unwrap();
             repository
                 .create_task_with_attempt(
                     &unhydrated_task,
@@ -5066,6 +5063,25 @@ mod watchdog_tick_tests {
                 .save_attempt_watchdog_snapshot(
                     &unhydrated_task,
                     &unhydrated_attempt,
+                    &over_budget_limits(),
+                    &WatchdogUsage::default(),
+                    None,
+                    started,
+                    None,
+                )
+                .unwrap();
+        }
+
+        // 再 hydrate 一个会话，并给它写一条同样越限的快照。
+        let session = daemon.coordinator.create_session().unwrap();
+        let hydrated_root = daemon.coordinator.root_task_id(&session).unwrap();
+        let hydrated_attempt = active_attempt_id(&database, &hydrated_root);
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .save_attempt_watchdog_snapshot(
+                    &hydrated_root,
+                    &hydrated_attempt,
                     &over_budget_limits(),
                     &WatchdogUsage::default(),
                     None,
