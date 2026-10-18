@@ -45,6 +45,24 @@ pub fn acquire(state_dir: &Path) -> Option<InstanceLock> {
     }
 }
 
+/// 有界让位：在 `budget` 内反复重试取锁，拿不到就返回 `None`。
+///
+/// `budget` 为 0 表示只试一次、立即让位。用轮询而非阻塞 `flock`：调用方需要
+/// 在超时后打印一行原因并退出，阻塞式 `flock` 拿不到这个「放弃」的时机。
+pub fn acquire_within(state_dir: &Path, budget: std::time::Duration) -> Option<InstanceLock> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(lock) = acquire(state_dir) {
+            return Some(lock);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(200)));
+    }
+}
+
 /// 连续失联计数：达到阈值就该退出，一次成功即清零。
 ///
 /// 用「连续」而不是累计，是因为 daemon 短暂卡顿不该把插件赶走；只有一直探不到
@@ -166,6 +184,33 @@ mod tests {
         let _lock = acquire(Path::new(&dir)).expect("holder must take the lock");
         println!("LOCK-HELD");
         std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn acquire_within_gives_up_after_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = acquire(dir.path()).expect("first instance takes the lock");
+        let start = std::time::Instant::now();
+        let outcome = acquire_within(dir.path(), Duration::from_millis(300));
+        assert!(outcome.is_none(), "被占用时必须在预算内放弃");
+        assert!(
+            start.elapsed() >= Duration::from_millis(250),
+            "必须真的等够预算，而不是立刻返回"
+        );
+        drop(held);
+        // 释放后同一预算内应能拿到。
+        let got = acquire_within(dir.path(), Duration::from_secs(2));
+        assert!(got.is_some(), "释放后必须能取到");
+    }
+
+    #[test]
+    fn acquire_within_zero_budget_tries_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = acquire(dir.path()).expect("first instance takes the lock");
+        assert!(
+            acquire_within(dir.path(), Duration::ZERO).is_none(),
+            "预算为 0 表示不等待、只试一次"
+        );
     }
 
     #[test]

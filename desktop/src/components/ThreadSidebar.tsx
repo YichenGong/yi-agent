@@ -10,6 +10,7 @@ import { useLongPress, type LongPressTarget } from "../lib/useLongPress";
 import { resolveSidebarPressTarget } from "../lib/sidebarPress";
 import { formatRelativeTime } from "../lib/relativeTime";
 import { filterThreadTree } from "../lib/threadSearch";
+import { Popover } from "../ui/Popover";
 import { findLeadThread } from "../lib/leadThread";
 import { TAG_DOT_CLASS, TAG_IDS, isValidTagId, tagLabel, type TagId } from "../lib/threadTags";
 
@@ -316,17 +317,6 @@ export function ThreadSidebar({
     setNewMenuOpen((v) => !v);
   };
 
-  // Escape closes whichever menu is open, regardless of what inside it (or the
-  // trigger) currently has focus.
-  useEffect(() => {
-    if (!newMenuOpen && menu === null) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeMenus();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [newMenuOpen, menu, closeMenus]);
-
   const commit = (id: string) => {
     const title = draft.trim();
     if (title) onRename(id, title);
@@ -545,98 +535,106 @@ export function ThreadSidebar({
             </button>
           </>
         )}
-        {menu?.kind === "thread" && menu.id === t.thread_id && (
-          <>
+        {/*
+          三个菜单互斥（见 `menu` 联合类型的注释），任何时刻至多一个 Popover 生效，
+          故 Escape 的关闭条件与原手写 effect 完全一致。
+
+          `data-thread-menu-overlay` 是 useLongPress 吞 click 的白名单、也是测试的
+          选择器；`backdropProps` 最后展开，故这里必须自己给 onClick——且要先
+          stopPropagation，否则行自身的 onClick 会顺手把这次点击当成选中会话。
+        */}
+        <Popover
+          open={menu?.kind === "thread" && menu.id === t.thread_id}
+          onClose={closeMenus}
+          backdropProps={{
+            "data-thread-menu-overlay": "",
+            onClick: (e) => {
+              e.stopPropagation();
+              closeMenus();
+            },
+          }}
+        >
+          <div
+            role="menu"
+            data-thread-menu=""
+            onClick={(e) => e.stopPropagation()}
+            className="absolute top-full left-3 z-20 mt-0.5 min-w-32 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+          >
             <div
-              data-thread-menu-overlay=""
-              className="fixed inset-0 z-10"
-              onClick={(e) => {
-                e.stopPropagation();
-                closeMenus();
-              }}
-            />
-            <div
-              role="menu"
-              data-thread-menu=""
-              onClick={(e) => e.stopPropagation()}
-              className="absolute top-full left-3 z-20 mt-0.5 min-w-32 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+              role="group"
+              aria-label="标签"
+              className="flex items-center gap-1.5 border-b border-line px-2 py-1.5"
             >
-              <div
-                role="group"
-                aria-label="标签"
-                className="flex items-center gap-1.5 border-b border-line px-2 py-1.5"
-              >
-                {TAG_IDS.map((id) => {
-                  const active = t.tag === id;
-                  const name = tagLabel(id, tagNames);
-                  return (
-                    <button
-                      key={id}
-                      type="button"
-                      role="menuitemradio"
-                      aria-checked={active}
-                      aria-label={name}
-                      title={name}
-                      onClick={() => {
-                        closeMenus();
-                        onSetTag(t.thread_id, id);
-                      }}
-                      className={`size-3.5 rounded-full ${TAG_DOT_CLASS[id]} ${
-                        active ? "ring-2 ring-fg ring-offset-1 ring-offset-raised" : ""
-                      }`}
-                    />
-                  );
-                })}
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={!isValidTagId(t.tag)}
-                  onClick={() => {
-                    closeMenus();
-                    onSetTag(t.thread_id, null);
-                  }}
-                  className="ml-auto px-1 text-xs whitespace-nowrap text-fg-muted hover:text-fg"
-                >
-                  无标签
-                </button>
-              </div>
+              {TAG_IDS.map((id) => {
+                const active = t.tag === id;
+                const name = tagLabel(id, tagNames);
+                return (
+                  <button
+                    key={id}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={active}
+                    aria-label={name}
+                    title={name}
+                    onClick={() => {
+                      closeMenus();
+                      onSetTag(t.thread_id, id);
+                    }}
+                    className={`size-3.5 rounded-full ${TAG_DOT_CLASS[id]} ${
+                      active ? "ring-2 ring-fg ring-offset-1 ring-offset-raised" : ""
+                    }`}
+                  />
+                );
+              })}
               <button
                 type="button"
-                role="menuitem"
+                role="menuitemradio"
+                aria-checked={!isValidTagId(t.tag)}
                 onClick={() => {
                   closeMenus();
-                  setEditingId(t.thread_id);
-                  setDraft(t.title ?? "");
+                  onSetTag(t.thread_id, null);
                 }}
-                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                className="ml-auto px-1 text-xs whitespace-nowrap text-fg-muted hover:text-fg"
               >
-                重命名
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  closeMenus();
-                  onTogglePin(t.thread_id, !isPinned);
-                }}
-                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-              >
-                {isPinned ? "取消置顶" : "置顶"}
-              </button>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={() => {
-                  closeMenus();
-                  onDelete(t.thread_id);
-                }}
-                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-              >
-                删除
+                无标签
               </button>
             </div>
-          </>
-        )}
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                closeMenus();
+                setEditingId(t.thread_id);
+                setDraft(t.title ?? "");
+              }}
+              className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+            >
+              重命名
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                closeMenus();
+                onTogglePin(t.thread_id, !isPinned);
+              }}
+              className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+            >
+              {isPinned ? "取消置顶" : "置顶"}
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                closeMenus();
+                onDelete(t.thread_id);
+              }}
+              className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+            >
+              删除
+            </button>
+          </div>
+        </Popover>
       </div>
     );
   };
@@ -820,47 +818,44 @@ export function ThreadSidebar({
           ))}
           <span className="relative">+ New thread</span>
         </button>
-        {newMenuOpen && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={closeMenus} />
-            <div
-              role="menu"
-              className="absolute right-2 left-2 top-full z-20 -mt-1 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
-            >
-              {workspaces.map((w) => (
-                <button
-                  key={w.path}
-                  type="button"
-                  role="menuitem"
-                  disabled={!w.exists}
-                  title={w.path}
-                  onClick={() => {
-                    closeMenus();
-                    onNew(w.path);
-                  }}
-                  className={`block w-full truncate px-3 py-1.5 text-left text-xs ${
-                    w.exists
-                      ? "text-fg hover:bg-raised"
-                      : "cursor-not-allowed text-fg-faint"
-                  }`}
-                >
-                  {basename(w.path)}
-                </button>
-              ))}
+        <Popover open={newMenuOpen} onClose={closeMenus}>
+          <div
+            role="menu"
+            className="absolute right-2 left-2 top-full z-20 -mt-1 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+          >
+            {workspaces.map((w) => (
               <button
+                key={w.path}
                 type="button"
                 role="menuitem"
+                disabled={!w.exists}
+                title={w.path}
                 onClick={() => {
                   closeMenus();
-                  onBrowse();
+                  onNew(w.path);
                 }}
-                className="block w-full px-3 py-1.5 text-left text-xs text-fg-muted hover:bg-raised"
+                className={`block w-full truncate px-3 py-1.5 text-left text-xs ${
+                  w.exists
+                    ? "text-fg hover:bg-raised"
+                    : "cursor-not-allowed text-fg-faint"
+                }`}
               >
-                Browse…
+                {basename(w.path)}
               </button>
-            </div>
-          </>
-        )}
+            ))}
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                closeMenus();
+                onBrowse();
+              }}
+              className="block w-full px-3 py-1.5 text-left text-xs text-fg-muted hover:bg-raised"
+            >
+              Browse…
+            </button>
+          </div>
+        </Popover>
       </div>
       {!isMobile && searchBar}
       <div className="flex-1 overflow-y-auto">
@@ -947,52 +942,52 @@ export function ThreadSidebar({
                       {!g.exists && " (missing)"}
                     </div>
                   </div>
-                  {menu?.kind === "group" && menu.ws === g.workspace && (
-                    <>
-                      <div className="fixed inset-0 z-10" onClick={closeMenus} />
-                      <div
-                        role="menu"
-                        className="absolute top-7 left-4 z-20 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+                  <Popover
+                    open={menu?.kind === "group" && menu.ws === g.workspace}
+                    onClose={closeMenus}
+                  >
+                    <div
+                      role="menu"
+                      className="absolute top-7 left-4 z-20 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+                    >
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          closeMenus();
+                          onNew(g.workspace);
+                        }}
+                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
                       >
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            closeMenus();
-                            onNew(g.workspace);
-                          }}
-                          className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-                        >
-                          New thread here
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            closeMenus();
-                            if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
-                            else onCreateBoard(g.workspace);
-                          }}
-                          className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
-                        >
-                          {kanbanItemFor(g.workspace, boards)
-                            ? "移除看板"
-                            : "创建 Superpowers 看板"}
-                        </button>
-                        <button
-                          type="button"
-                          role="menuitem"
-                          onClick={() => {
-                            closeMenus();
-                            onRemoveWorkspace(g.workspace);
-                          }}
-                          className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
-                        >
-                          Remove from list
-                        </button>
-                      </div>
-                    </>
-                  )}
+                        New thread here
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          closeMenus();
+                          if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
+                          else onCreateBoard(g.workspace);
+                        }}
+                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
+                      >
+                        {kanbanItemFor(g.workspace, boards)
+                          ? "移除看板"
+                          : "创建 Superpowers 看板"}
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          closeMenus();
+                          onRemoveWorkspace(g.workspace);
+                        }}
+                        className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                      >
+                        Remove from list
+                      </button>
+                    </div>
+                  </Popover>
                   {!isCollapsed && !searching && kanbanItemFor(g.workspace, boards) && renderBoardEntry(g.workspace)}
                   {!isCollapsed && renderBoardThreads(g)}
                   {!isCollapsed &&

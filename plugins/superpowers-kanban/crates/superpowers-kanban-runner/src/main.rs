@@ -531,19 +531,7 @@ fn command_done(
     project_root: &std::path::Path,
 ) -> Result<String, String> {
     use superpowers_kanban_core::card::{CardId, CardState};
-    let path = state_dir.join("board.json");
-    let mut board = superpowers_kanban_runner::persist::load_board(&path);
     let id = CardId::new(card_id);
-    match board.get(&id) {
-        None => return Err(format!("unknown card: {card_id}")),
-        Some(card) if card.state != CardState::AwaitingMerge => {
-            return Err(format!(
-                "card {card_id} is {:?}, not awaiting_merge",
-                card.state
-            ));
-        }
-        Some(_) => {}
-    }
     // 核对：推导分支并判是否已并入 base（分支可能已被删除——那时只能采信人工确认）。
     let source = format!(
         "kanban/{}",
@@ -558,10 +546,22 @@ fn command_done(
     } else {
         "not-merged"
     };
-    board
-        .transition(&id, CardState::Done)
-        .map_err(|e| e.to_string())?;
-    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    // 状态变更在锁内落盘：daemon 在跑也不会覆盖（它下个 tick 读到的是新文件）。
+    superpowers_kanban_runner::persist::with_board(state_dir, |board| {
+        match board.get(&id) {
+            None => return Err(format!("unknown card: {card_id}")),
+            Some(card) if card.state != CardState::AwaitingMerge => {
+                return Err(format!(
+                    "card {card_id} is {:?}, not awaiting_merge",
+                    card.state
+                ));
+            }
+            Some(_) => {}
+        }
+        board
+            .transition(&id, CardState::Done)
+            .map_err(|e| e.to_string())
+    })?;
     Ok(format!(
         "card {card_id} -> done ({verdict}); auto-archives in 24h — \
          `superpowers-kanban archive {card_id}` to hide it now"
@@ -575,26 +575,25 @@ fn command_archive(
     all_terminal: bool,
 ) -> Result<String, String> {
     use superpowers_kanban_core::card::CardId;
-    let path = state_dir.join("board.json");
-    let mut board = superpowers_kanban_runner::persist::load_board(&path);
-    let archived = if all_terminal {
-        let due: Vec<CardId> = board
-            .cards()
-            .iter()
-            .filter(|card| card.state.is_terminal() && !card.archived)
-            .map(|card| card.id.clone())
-            .collect();
-        let count = due.len();
-        for id in due {
+    let archived = superpowers_kanban_runner::persist::with_board(state_dir, |board| {
+        if all_terminal {
+            let due: Vec<CardId> = board
+                .cards()
+                .iter()
+                .filter(|card| card.state.is_terminal() && !card.archived)
+                .map(|card| card.id.clone())
+                .collect();
+            let count = due.len();
+            for id in due {
+                board.archive(&id).map_err(|e| e.to_string())?;
+            }
+            Ok(count)
+        } else {
+            let id = CardId::new(card_id.expect("parse guarantees an id or --all-terminal"));
             board.archive(&id).map_err(|e| e.to_string())?;
+            Ok(1)
         }
-        count
-    } else {
-        let id = CardId::new(card_id.expect("parse guarantees an id or --all-terminal"));
-        board.archive(&id).map_err(|e| e.to_string())?;
-        1
-    };
-    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    })?;
     Ok(format!("archived {archived} card(s)"))
 }
 
@@ -605,16 +604,15 @@ fn command_purge(
     all_archived: bool,
 ) -> Result<String, String> {
     use superpowers_kanban_core::card::CardId;
-    let path = state_dir.join("board.json");
-    let mut board = superpowers_kanban_runner::persist::load_board(&path);
-    let removed = if all_archived {
-        board.purge_archived()
-    } else {
-        let id = CardId::new(card_id.expect("parse guarantees an id or --all-archived"));
-        board.purge(&id).map_err(|e| e.to_string())?;
-        1
-    };
-    superpowers_kanban_runner::persist::save_board(&path, &board).map_err(|e| e.to_string())?;
+    let removed = superpowers_kanban_runner::persist::with_board(state_dir, |board| {
+        if all_archived {
+            Ok(board.purge_archived())
+        } else {
+            let id = CardId::new(card_id.expect("parse guarantees an id or --all-archived"));
+            board.purge(&id).map_err(|e| e.to_string())?;
+            Ok(1)
+        }
+    })?;
     Ok(format!("purged {removed} card(s)"))
 }
 
@@ -727,6 +725,34 @@ impl superpowers_kanban_ipc::server::Dispatch for QueryDispatch {
     }
 }
 
+/// 清一个候选路径上的陈旧 socket：连得上就保留，连不上就删。
+///
+/// 「连不上」是「绑定进程已不在」的可靠证据（Unix socket 语义）；不用 mtime/
+/// 存在性——那些会被无关操作扰动。
+fn sweep_one_socket(path: &std::path::Path) {
+    if !path.exists() {
+        return;
+    }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        return; // 有活实例，绝不误删。
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// 清理本插件派生出的两个确定路径上的死 socket。
+///
+/// 只碰这两条确定路径（直连 + 回退），**不扫 `$TMPDIR`**——那里其它
+/// `plugin-*.sock` 属于别的项目/别的 state_dir，无法证明归属。
+fn sweep_stale_sockets(state_dir: &std::path::Path) {
+    let direct = state_dir.join("superpowers-kanban.sock");
+    sweep_one_socket(&direct);
+    if let Ok(resolved) = superpowers_kanban_ipc::server::socket_path(state_dir) {
+        if resolved != direct {
+            sweep_one_socket(&resolved);
+        }
+    }
+}
+
 /// 起查询服务线程。跑在自己的线程里，慢客户端不能拖住推进循环；
 /// 进程退出即随之消失，不需要显式 join。
 fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -> Arc<AtomicBool> {
@@ -762,19 +788,23 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 /// 这里**不再创建会话**：认领（`board.next_launch`）、起会话、回写终态都由宿主
 /// 调度器负责（plan Task 5/6）。插件只负责消费 inbox 把卡排进队列，并落盘。
 fn run_daemon(args: Args) {
-    // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到就等旧实例让位——
-    // 旧实例要么正常退出，要么靠 daemon 失联探测自行退出。用轮询避免忙等。
+    let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
+    // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到锁就在有界预算内
+    // 重试，超时即让位退出——旧的无限等待会留下永不推进也不退出的空转进程。
     // 锁必须在函数存活期间一直持有：`_lock` 绑在这里，函数结束才 drop。
-    let _lock = loop {
-        if let Some(lock) = superpowers_kanban_runner::single_instance::acquire(&args.state_dir) {
-            break lock;
-        }
-        eprintln!(
-            "superpowers-kanban: another instance holds the lock at {}; waiting",
-            args.state_dir.join("plugin.lock").display()
-        );
-        std::thread::sleep(Duration::from_millis(500));
-    };
+    let wait = Duration::from_secs(calendar.instance_wait_secs as u64);
+    let _lock =
+        match superpowers_kanban_runner::single_instance::acquire_within(&args.state_dir, wait) {
+            Some(lock) => lock,
+            None => {
+                eprintln!(
+                    "superpowers-kanban: another instance holds the lock at {}; exiting after {}s",
+                    args.state_dir.join("plugin.lock").display(),
+                    wait.as_secs()
+                );
+                std::process::exit(0);
+            }
+        };
 
     // daemon 存活探测的地址。取不到（runtime 目录不可用）就没有可探的目标，此后
     // 的探测一律当作「已失联」——孤儿必须能有界退出。
@@ -783,7 +813,6 @@ fn run_daemon(args: Args) {
         .map(BoardDaemon::new)
         .map(Arc::new);
 
-    let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
     // 推进循环与查询服务共享同一实例，槽位租约与看板状态因此只有一份真相。
     let service = Arc::new(BoardService::new(
         args.state_dir.clone(),
@@ -797,6 +826,8 @@ fn run_daemon(args: Args) {
     service.migrate_legacy_running();
     service.adopt_running_leases(calendar.limit_at(chrono::Local::now()));
 
+    // 清理上一次运行遗留的死 socket（当前实例尚未 bind，不会误删自己）。
+    sweep_stale_sockets(&args.state_dir);
     // 查询通道与推进循环互不阻塞：宿主问状态时队列照常在动。
     let _query_server = start_query_server(Arc::clone(&service), &args.state_dir);
 
@@ -864,7 +895,8 @@ mod tests {
     use super::{
         Duration, Subcommand, command_add, command_add_merge, command_archive, command_done,
         command_list, command_merge_finish, command_merge_request, command_purge,
-        command_set_switch, effective_interval, parse_subcommand,
+        command_set_switch, effective_interval, parse_subcommand, sweep_one_socket,
+        sweep_stale_sockets,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -1329,5 +1361,106 @@ mod tests {
             effective_interval(None, dir.path()),
             Duration::from_secs(10)
         );
+    }
+
+    #[test]
+    fn two_concurrent_transactions_both_land_on_disk() {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::CardId;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = Board::new();
+        for id in ["a", "b"] {
+            board.enqueue(
+                CardId::new(id),
+                format!("{id}.spec.md").into(),
+                format!("{id}.plan.md").into(),
+                chrono::Local::now(),
+            );
+        }
+        superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
+            .unwrap();
+
+        let a_dir = state_dir.clone();
+        let b_dir = state_dir.clone();
+        let a = std::thread::spawn(move || {
+            superpowers_kanban_runner::persist::with_board(&a_dir, |board| {
+                board
+                    .transition(
+                        &CardId::new("a"),
+                        superpowers_kanban_core::card::CardState::Running,
+                    )
+                    .map_err(|e| e.to_string())
+            })
+        });
+        let b = std::thread::spawn(move || {
+            superpowers_kanban_runner::persist::with_board(&b_dir, |board| {
+                board
+                    .transition(
+                        &CardId::new("b"),
+                        superpowers_kanban_core::card::CardState::Running,
+                    )
+                    .map_err(|e| e.to_string())
+            })
+        });
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+
+        let final_board = superpowers_kanban_runner::persist::read_board(&state_dir);
+        assert_eq!(
+            final_board.get(&CardId::new("a")).unwrap().state,
+            superpowers_kanban_core::card::CardState::Running,
+            "a 的写入必须留下"
+        );
+        assert_eq!(
+            final_board.get(&CardId::new("b")).unwrap().state,
+            superpowers_kanban_core::card::CardState::Running,
+            "b 的写入必须留下——锁内 load 才能做到"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_a_dead_socket_and_keeps_a_live_one() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // 死 socket：建了监听再关掉，文件留下但没人应答。
+        let dead = state_dir.join("superpowers-kanban.sock");
+        {
+            let listener = UnixListener::bind(&dead).unwrap();
+            drop(listener);
+        }
+        // 关掉监听后，内核对这条刚关闭 socket 的拆除不是瞬时的：紧接着 connect 有
+        // 概率仍然成功（本机并行实测约 1/3），会让「死」socket 看着还活着。必须等到
+        // connect 真的被拒，这才是产品判据 `sweep_one_socket` 判定「死」的同一个条件；
+        // 不等就断言，等于在赌内核的拆除时序（单线程跑总是过，并行就偶发红）。
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&dead).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "前置：关掉的 socket 必须在预算内变成连不上"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            dead.exists(),
+            "前置：死 socket 文件必须存在（没人应答但文件还在）"
+        );
+
+        // 活 socket：监听者活着。
+        let live_dir = dir.path().join("live");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let live = live_dir.join("superpowers-kanban.sock");
+        let _listener = UnixListener::bind(&live).unwrap();
+
+        sweep_stale_sockets(&state_dir);
+        assert!(!dead.exists(), "连不上的死 socket 必须被清掉");
+
+        // 直接对 live 路径调一次（绕过 state_dir 推导），确认活 socket 不被删。
+        sweep_one_socket(&live);
+        assert!(live.exists(), "有活实例应答的 socket 绝不删");
     }
 }
