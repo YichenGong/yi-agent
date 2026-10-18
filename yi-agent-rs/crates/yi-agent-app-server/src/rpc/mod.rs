@@ -16,6 +16,7 @@
 pub(crate) mod agent;
 pub(crate) mod board;
 pub(crate) mod image;
+pub(crate) mod mcp;
 pub(crate) mod model;
 pub(crate) mod onboarding;
 pub(crate) mod pair;
@@ -178,6 +179,8 @@ pub(crate) enum Domain {
     Turn,
     /// `skill/*`(技能面板:三层技能根枚举 + 按需读正文)。
     Skill,
+    /// `mcp/*`(设置页 MCP 面板:项目级 mcp.json + 工具 schema 缓存的只读视图)。
+    Mcp,
     /// `thread/*`(会话生命周期:列表、建/恢复、改名、模型档、置顶、删除、订阅)。
     Thread,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
@@ -207,6 +210,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("device") => Domain::Pair,
         Some("turn") => Domain::Turn,
         Some("skill") => Domain::Skill,
+        Some("mcp") => Domain::Mcp,
         Some("thread") => Domain::Thread,
         Some("agent") => Domain::Agent,
         _ => Domain::Unknown,
@@ -333,6 +337,10 @@ pub(crate) struct AppState<'a> {
     /// Git Diff 焦点句柄。与 [`AppState::theme_handle`] 同路,交给会话的工具集。
     /// 搬移前臂里的 `git_diff_handle`。
     pub(crate) git_diff_handle: &'a crate::git_diff_tool::GitDiffHandle,
+    /// 模型驱动的视图帧表(每会话一帧,内存态)。`thread/view/read` 读它、按需
+    /// 重算后写回。与 [`AppState::git_diff_handle`] 同一注入理由:测试要在主循环
+    /// 之外往**同一张**表里塞帧。
+    pub(crate) view_frames: &'a crate::server::ViewFrames,
 
     // ---- batch 4:`skill/*` 与 `thread/*`(组长)新增的宿主路径与信箱 ----
     /// 技能根解析所针对的 home(生产为 `home_dir()`,`skills_home()` 可替身)。

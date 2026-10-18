@@ -280,6 +280,12 @@ pub fn help_text(target: Option<&str>) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiConfigSnapshot {
     pub provider: String,
+    /// 本进程的模型整包是否注入（`RuntimeConfig::model_injected`）。
+    ///
+    /// `/effort` 需要它来选择生效条目：注入存在时清单默认不生效，请求体不带
+    /// `reasoning_effort`，上报也必须同口径（否则「上报 != 实际发出」）。
+    /// 必须**如实**取自真实配置，绝不能拿清单反推。
+    pub model_injected: bool,
     pub workdir: std::path::PathBuf,
     pub sandbox: String,
     pub yolo: bool,
@@ -1116,6 +1122,7 @@ mod tests {
     fn config_snapshot_renders_key_fields_without_secrets() {
         let snap = TuiConfigSnapshot {
             provider: "anthropic".into(),
+            model_injected: false,
             workdir: std::path::PathBuf::from("/tmp/proj"),
             sandbox: "workspace-write".into(),
             yolo: false,

@@ -62,6 +62,32 @@ superpowers-kanban: usage: superpowers-kanban <run|add|list|on|off|workdir> [...
 
 若报 `command not found`，说明没进 `PATH`，回到上一步。
 
+### 2a. 升级：覆盖二进制后，让 `run` 进程重启
+
+`install` 覆盖二进制会写入**新的 inode**；而已经在跑的 `superpowers-kanban run`
+仍持有旧 inode，会继续用**旧代码**运行——监督器只检查「查询 socket 是否有人应答」，
+不会发现二进制换了（unix 语义下这也是合法的）。
+
+症状：升级后投递被静默拒绝，卡片不出现。
+
+处理：让 `run` 进程退出一次，监督器会按清单的 `restart_backoff_ms` 拉起新的：
+
+```bash
+pkill -f "superpowers-kanban run"   # 监督器 1s 内拉起新进程
+```
+
+确认新进程用的是磁盘上的二进制：
+
+```bash
+lsof -p "$(pgrep -f 'superpowers-kanban run' | head -1)" | awk '$4=="txt" && /superpowers-kanban/ {print $7}'
+stat -f %i "$(command -v superpowers-kanban)"
+```
+
+两个 inode 一致即已同步。
+
+（第 0 节那句「装完不需要重启 daemon」说的是**新装**：daemon 会发现该守护的新清单。
+升级的场景不同，需要重启的是 `run` 子进程，不是 daemon。）
+
 ---
 
 ## 3. 安装 skill
@@ -270,6 +296,35 @@ superpowers-kanban list
 | `spec file does not exist` | 路径不对 | 相对路径是相对**当前目录**，不是项目根 |
 | 卡进 `inbox/rejected/` | 两份文件不成对或相同 | 看 `inbox/rejected/` 里的原因文件 |
 | 重启后看板不动 | 宿主值守没装（app 没开过 / 开关是关的） | 打开桌面「后台值守」开关；`launchctl print gui/$(id -u)/ai.yi-agent.board-watchman` |
+
+### 插件说了什么？看项目日志
+
+被托管进程的 **stderr** 不再是黑洞，落在：
+
+```
+<项目根>/.yi-agent/logs/<清单 name>.log      # 本插件即 superpowers-kanban.log
+```
+
+两种行：监督器写的事件带 `YYYY-MM-DDTHH:MM:SS` 时间戳前缀，插件自己打印的行原样落盘
+（插件不打时间戳）。例如：
+
+```
+2026-10-18T21:03:09 started superpowers-kanban (pid 41207)
+superpowers-kanban: query socket at /var/folders/…/plugin-504fba94ad6c5e6b.sock
+superpowers-kanban: rejected my-card (spec file does not exist: )
+2026-10-18T21:03:11 stopped superpowers-kanban (switch off)
+```
+
+监督器会记的事件：`started <name> (pid …)`、`could not start <name>: …`、
+`exited <name>; retrying in …`、`stopped <name> (manifest removed|switch off|supervisor shutting down)`。
+
+`rejected` 说明投递被插件拒了；被拒的文件留在
+`<项目根>/.yi-agent/superpowers-kanban/inbox/rejected/`。先读日志里的括号原因，
+再看那个文件的实际内容。
+
+> 只接了 **stderr**，stdout 仍被丢弃——长驻的 `run` 全程用 stderr 报告，
+> stdout 留给一次性命令（`add`/`list`/`on`/`off`）的结果通道。
+> 日志按 append 写，不轮转（这类日志量极小）。
 
 ---
 

@@ -154,6 +154,13 @@ pub(crate) type ProjectRuntimes =
 /// 一份预算,这正是桌面端「四个就满」的成因。
 pub(crate) type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 
+/// 模型驱动的视图帧表：每会话一帧，**内存态**（不落盘，重启即空）。
+///
+/// 与 `git_diff` 句柄并列为 [`RuntimeAttachments`] 字段，理由同 `theme` /
+/// `lead_inbox`：`thread/view/read` 在主循环里读它，而写帧的 watcher 是另一个
+/// task，自造一份就会读写两张不相干的表。
+pub(crate) type ViewFrames = Arc<tokio::sync::Mutex<HashMap<String, crate::git_diff::ViewFrame>>>;
+
 /// 本进程的 runtime 接线:daemon 按项目共享,root 按会话持有。
 ///
 /// 两者成对传递,调用点无法只更新一半——只换了 daemon 映射、忘了 root 映射,
@@ -201,6 +208,10 @@ pub(crate) struct RuntimeAttachments {
     /// Git Diff 焦点句柄：`show_git_diff` 工具持它广播，watcher 翻译成
     /// `ui/gitDiff/focus` 通知。每个 thread 的工具与 watcher 共用同一实例。
     pub(crate) git_diff: crate::git_diff_tool::GitDiffHandle,
+    /// 模型驱动的视图帧表（每会话一帧，内存态）。与 `git_diff` 句柄并列。可
+    /// 注入的理由同 `lead_inbox`：`thread/view/read` 读它与写它的 watcher 必须
+    /// 是**同一个** `Arc`，测试也要能在主循环之外往同一张表里塞帧。
+    pub(crate) view_frames: ViewFrames,
     /// 安装常驻值守（macOS LaunchAgent）。可注入的理由同 `launcher`：测试里
     /// 绝不能真的调 `launchctl`，也绝不能碰用户真实的 `~/Library/LaunchAgents`。
     pub(crate) watchman_install: WatchmanInstall,
@@ -355,6 +366,12 @@ pub(crate) fn attach_delegation(
     // 阻塞式 `ask_lead` 的回信登记表。与 `lead_inbox` 必须成对传递:
     // 只传信箱而不传登记表,`await` 侧登记的名字将永远无人回填。
     lead_replies: &crate::lead::LeadReplies,
+    // 本会话的起点 sha(默认 diff 基准)。**由调用方给出,不在本函数里读盘**:
+    // `thread/start` 走到这里时 meta 尚未落盘(`start_thread_core` 先 attach 再
+    // `create`),在这里读只会永远读到 `None`,工具就落不到会话起点上。调用方
+    // 才知道自己在哪个分支——新建取 `session_anchor(cwd)`,resume 取已落盘 meta
+    // 的 `anchor_sha`(旧会话没有该字段时传 `None`,表示「无起点」,不回填)。
+    anchor_sha: Option<String>,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -416,6 +433,7 @@ pub(crate) fn attach_delegation(
         crate::thread_store::ThreadStore::new(Path::new(cwd)).project_key(),
         lead_inbox.clone(),
         lead_replies.clone(),
+        anchor_sha,
     ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
@@ -946,6 +964,9 @@ fn build_runtime_tooling(
     // 回信登记表与超时:两者一起决定 `blocking: true` 是否真的有界往返
     // (只有登记表而没有超时来源,或反之,都会让契约半途而废)。
     lead_replies: crate::lead::LeadReplies,
+    // 本会话的起点 sha：`show_git_diff` 默认按它算 diff，并在回执里如实报出。
+    // 与 project_key 同理——模型看不到会话元数据，装配期注入是唯一来源。
+    anchor_sha: Option<String>,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
@@ -975,6 +996,7 @@ fn build_runtime_tooling(
         false,
         &roots,
         controller.clone(),
+        vec![("YI_AGENT_THREAD_ID".to_string(), thread_id.to_string())],
     )
     .map_err(|error| error.to_string())?;
     let mut registry = (*setup.tools).clone();
@@ -999,6 +1021,10 @@ fn build_runtime_tooling(
     registry.register(Arc::new(crate::git_diff_tool::ShowGitDiffTool::new(
         git_diff,
         Some(thread_id.to_string()),
+        // 仓库取 `cfg.workdir`,与上面的 `store` 同源:此处它就是 thread cwd,
+        // 而不是 daemon 回传的 toplevel(见上文的注释)。
+        cfg.workdir.clone(),
+        anchor_sha,
     )));
     // 普通会话用它给组长留言。`from_thread_id` 绑在装配期,与
     // `register_attached_root_tools_in_thread` 的 thread marker 同理由:
@@ -1018,7 +1044,7 @@ fn build_runtime_tooling(
     let is_lead = crate::lead_memory::is_lead_thread(&store, thread_id);
     let state_dir = Path::new(&project_key);
     let session_cwd = state_dir.parent().unwrap_or(state_dir);
-    if !is_lead && !crate::thread_store::is_card_worktree(session_cwd) {
+    if !is_lead && !crate::thread_store::is_kanban_worktree(session_cwd) {
         registry.register(Arc::new(
             crate::lead::AskLeadTool::new(lead_inbox, project_key, thread_id.to_string())
                 // 回信能力**必须**在这里接上:漏掉它没有编译错误,`blocking: true`
@@ -1475,6 +1501,8 @@ where
     // 清单按指纹跟随 `models.json`:运行期改条目,新建 thread 立刻用上新值。
     let catalog =
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
+    // 启动期把存量 `.env` 模型键收边进清单（一次性、幂等）。
+    migrate_legacy_model_keys_on_startup();
     serve_stdio(
         reader,
         writer,
@@ -1499,6 +1527,7 @@ where
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
@@ -1555,6 +1584,8 @@ where
     // 与 `run` 一致:清单按指纹跟随 `models.json`,工厂逐会话取当前值。
     let catalog =
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
+    // 与 `run` 一致:启动期做一次性 `.env` → 清单迁移。
+    migrate_legacy_model_keys_on_startup();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     serve_scoped_core(
         reader,
@@ -1580,6 +1611,7 @@ where
             launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
@@ -1839,6 +1871,23 @@ where
 
 fn parse_relay_url(relay_url: &str) -> anyhow::Result<(String, String)> {
     yi_agent_relay::parse_relay_parts(relay_url)
+}
+
+/// 生产启动期的一次性 `.env` → 清单迁移，供两个生产入口（`run` 与
+/// `serve_stdio_with_relay`）共用。
+///
+/// 只在生产入口调用：测试用 `Harness` 注入隔离路径，绝不能在这里产生副作用。
+/// `HOME` 缺失时 `resolve_global_env_path` 为 `None`，此时不迁移（避免在一个
+/// 凭空拼出的路径上写文件）。清单路径与 `RuntimeAttachments` 用的是同一个
+/// `models_path()`，保证迁移落点与运行期读点是同一个文件。
+fn migrate_legacy_model_keys_on_startup() {
+    if let Some(env_path) = yi_agent_runtime::config::resolve_global_env_path() {
+        let outcome = yi_agent_runtime::migrate::migrate_model_keys(
+            &env_path,
+            &yi_agent_runtime::models::models_path(),
+        );
+        yi_agent_runtime::migrate::log_outcome(&outcome, &env_path);
+    }
 }
 
 /// 与 [`serve_stdio`] 逐字节相同,只多一个 `client_scope`。
@@ -2220,6 +2269,9 @@ async fn pump_theme_notifications(
 async fn pump_git_diff_notifications(
     mut rx: tokio::sync::broadcast::Receiver<crate::git_diff_tool::GitDiffFocus>,
     hub: Arc<crate::broadcast::Broadcaster>,
+    // 会话帧表。watcher 与 `thread/view/read` 必须写读**同一张**表,否则面板
+    // 读到的永远是空的;帧由工具算好随广播带来,这里只负责落表。
+    view_frames: ViewFrames,
 ) {
     loop {
         let focus = match rx.recv().await {
@@ -2230,9 +2282,13 @@ async fn pump_git_diff_notifications(
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
+        // 先落帧再发通知:通知到达前端时,前端随后的 `thread/view/read` 必须已经
+        // 能读到这一帧,否则面板会先画一次旧帧(甚至空帧)。
+        if let (Some(thread_id), Some(frame)) = (focus.thread_id.clone(), focus.frame) {
+            view_frames.lock().await.insert(thread_id, *frame);
+        }
         let n = Notification::UiGitDiffFocus {
             thread_id: focus.thread_id,
-            base: focus.base,
             note: focus.note,
         };
         if write_notification(&hub, &n).await.is_err() {
@@ -2299,6 +2355,7 @@ where
         launcher: board_launcher,
         theme,
         git_diff,
+        view_frames,
         watchman_install,
         watchman_uninstall,
         watchman_home,
@@ -2371,6 +2428,7 @@ where
     tokio::spawn(pump_git_diff_notifications(
         git_diff.subscribe(),
         Arc::clone(&hub),
+        Arc::clone(&view_frames),
     ));
     // 建 thread 的工具仍需该句柄(与 watcher 同一实例,故通知不落空)。
     let git_diff_handle = git_diff.clone();
@@ -2593,6 +2651,7 @@ where
                             turn_tx: &turn_tx,
                             build_agent: &build_agent,
                             git_diff_handle: &git_diff_handle,
+                            view_frames: &view_frames,
                             skills_home: &skills_home,
                             lead_inbox: &lead_inbox,
                             lead_replies: &lead_replies,
@@ -2751,6 +2810,16 @@ where
                     crate::rpc::Domain::Skill => {
                         let mut state = app_state!();
                         match crate::rpc::skill::handle(&mut state, &req, id.clone()).await? {
+                            // 已搬移的域在应答后一律回下一轮(等价于搬移前的
+                            // `continue`)。
+                            crate::rpc::Flow::Continue => continue,
+                            // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    crate::rpc::Domain::Mcp => {
+                        let mut state = app_state!();
+                        match crate::rpc::mcp::handle(&mut state, &req, id.clone()).await? {
                             // 已搬移的域在应答后一律回下一轮(等价于搬移前的
                             // `continue`)。
                             crate::rpc::Flow::Continue => continue,
@@ -5612,6 +5681,13 @@ pub(crate) async fn start_thread_core(
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
+    // 会话起点（默认 diff 基准）。**必须在 `attach_delegation` 之前算好并传进去**：
+    // 该函数要把起点交给 `show_git_diff`，而 meta 要到本函数后半段才 `create`；
+    // 若让 `attach_delegation` 自己读盘，新建路径永远读到 `None`，工具的默认基准
+    // 就落不到「本次会话起点」，只剩未提交改动——与它自己的描述不符。
+    // 取值口径不变：仍是「建 meta 时取 HEAD」（此后 HEAD 随会话推进）。
+    let anchor_sha = crate::git_diff::session_anchor(std::path::Path::new(cwd));
+
     // 委派是可选能力:项目 runtime 起不来就保留原 agent,只记 trace。
     // 接线刻意放在这里(而非 `threads` 守卫之内),避免与其可变借用冲突。
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(Path::new(cwd));
@@ -5630,6 +5706,8 @@ pub(crate) async fn start_thread_core(
         extra_roots.clone(),
         lead_inbox,
         lead_replies,
+        // 新建路径：起点就是刚刚取的 HEAD。
+        anchor_sha.clone(),
         built,
     );
     let BuiltAgent {
@@ -5650,6 +5728,8 @@ pub(crate) async fn start_thread_core(
     let (session_tx, session_rx) = mpsc::channel::<SessionCommand>(8);
 
     let now = crate::thread_store::now_millis();
+    // 会话起点已在上面算好并交给 `attach_delegation`（同一个值也落进 meta）：
+    // 两处必须是同一个 sha，否则「meta 里的起点」与「工具用的起点」会分叉。
     let meta = crate::thread_store::ThreadMeta {
         thread_id: thread_id.clone(),
         cwd: cwd.to_string(),
@@ -5674,6 +5754,7 @@ pub(crate) async fn start_thread_core(
         role: None,
         content_epoch: 0,
         last_item_id: None,
+        anchor_sha,
     };
     // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
     // 的 `role: "lead"` 抹掉(本函数的 meta 不带 role),懒创建出来的组长就
@@ -6885,6 +6966,19 @@ mod plugins_tests {
                 }
             }
             panic!("no response for id {id}");
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn mcp_list_is_available_at_observe_scope() {
+            let mut h = (Harness::with_scope(Scope::Observe)).await;
+            initialize(&mut h).await;
+            let resp = call(&mut h, 1, "mcp/list", "{}").await;
+            assert!(
+                resp.get("error").is_none(),
+                "observe must list mcp servers: {resp}"
+            );
+            assert!(resp["result"]["servers"].is_array());
+            h.shutdown().await;
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -8406,7 +8500,6 @@ mod session_driver_tests {
 // `mod rpc_tests;` 则路径会变成 `server::rpc_tests`,测试名全变)。
 #[path = "rpc_tests.rs"]
 pub(crate) mod tests;
-
 /// 主题守望者的回归测试。
 ///
 /// 这些测试直接驱动生产里的 [`pump_theme_notifications`],不再照抄一份循环体:
@@ -8608,5 +8701,104 @@ mod theme_watcher_tests {
         .await
         .unwrap();
         assert!(rx.try_recv().is_err(), "订阅 t1 不该收到 t2 的内容帧");
+    }
+}
+
+/// Git Diff 守望者的回归测试。
+///
+/// 与上面的主题守望者同理:直接驱动生产里的 [`pump_git_diff_notifications`]。
+/// 新增的写帧表尤其必须这样测——工具在模型侧算好的帧能不能到 `thread/view/read`
+/// 手里,全取决于这段循环里那次 `insert`。
+#[cfg(test)]
+mod git_diff_watcher_tests {
+    use super::*;
+
+    fn frame(command: &str) -> crate::git_diff::ViewFrame {
+        crate::git_diff::ViewFrame {
+            command: Some(command.to_string()),
+            as_kind: "log".to_string(),
+            exit_code: Some(0),
+            stdout: "cafe123 subject\n".to_string(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: false,
+            note: None,
+            base: None,
+            base_kind: String::new(),
+        }
+    }
+
+    /// D3 的另一半:工具报的「我给你看了什么」必须与面板真读到的帧一致。
+    /// 工具算帧、watcher 落表,谁漏了这一步,面板都会显示旧帧(或空帧),
+    /// 而回执照样声称展示了命令输出——正是要杜绝的误导。
+    #[tokio::test]
+    async fn the_watcher_files_the_frame_under_its_thread() {
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        let frames: ViewFrames = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let git_diff = crate::git_diff_tool::GitDiffHandle::new();
+        let pump = tokio::spawn(pump_git_diff_notifications(
+            git_diff.subscribe(),
+            Arc::clone(&hub),
+            Arc::clone(&frames),
+        ));
+
+        git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
+            thread_id: Some("thread-1".into()),
+            command: Some("git log --oneline -1".into()),
+            note: Some("here".into()),
+            frame: Some(Box::new(frame("git log --oneline -1"))),
+        });
+
+        let mut filed = None;
+        for _ in 0..200 {
+            if let Some(f) = frames.lock().await.get("thread-1").cloned() {
+                filed = Some(f);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        pump.abort();
+        let filed = filed.expect("the watcher must file the frame the tool computed");
+        assert_eq!(filed.command.as_deref(), Some("git log --oneline -1"));
+        assert_eq!(filed.as_kind, "log");
+    }
+
+    /// 无 thread 的焦点(前端按当前会话处理)不进表:键都没有,写进去只会有个
+    /// 取不出来的孤儿条目。
+    #[tokio::test]
+    async fn a_frameless_or_threadless_focus_files_nothing() {
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        let frames: ViewFrames = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let git_diff = crate::git_diff_tool::GitDiffHandle::new();
+        let pump = tokio::spawn(pump_git_diff_notifications(
+            git_diff.subscribe(),
+            Arc::clone(&hub),
+            Arc::clone(&frames),
+        ));
+
+        git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
+            thread_id: None,
+            command: None,
+            note: None,
+            frame: Some(Box::new(frame("git log"))),
+        });
+        git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
+            thread_id: Some("thread-2".into()),
+            command: None,
+            note: None,
+            frame: None,
+        });
+        // 让守望者把两条都处理完,再断言表是空的。
+        let mut drained = false;
+        for _ in 0..200 {
+            if git_diff.subscribe().try_recv().is_err() && frames.lock().await.is_empty() {
+                drained = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        pump.abort();
+        assert!(drained, "the frame table must stay empty");
+        assert!(frames.lock().await.is_empty());
     }
 }

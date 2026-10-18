@@ -1195,6 +1195,7 @@ impl BoardService {
                 "plan_path": card.plan_path,
                 "workdir": card.workdir,
                 "thread_id": card.thread_id,
+                "origin_thread_id": card.origin_thread_id,
                 "kind": card.kind,
                 "source": card.source_ref,
                 "base": card.base_ref,

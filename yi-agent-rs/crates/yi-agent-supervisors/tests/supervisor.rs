@@ -457,3 +457,212 @@ fn a_live_listener_on_the_query_socket_suppresses_the_spawn() {
     );
     supervisor.stop_all();
 }
+
+// --- 子进程日志（`Layout::logs_dir` / `ChildLog`） ---
+
+#[test]
+fn a_childs_stderr_lands_in_its_log_file() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    // 子进程往 **stderr** 写一个独特标记，另往 stdout 写一个，用来证明只有
+    // stderr 被接进日志（stdout 仍被吞掉）。
+    let child = workdir.join("noisy.sh");
+    std::fs::write(
+        &child,
+        "#!/bin/sh\nprintf 'child-stdout-marker\\n'\nprintf 'child-stderr-marker\\n' 1>&2\nsleep 30\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&child).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&child, perms).unwrap();
+    }
+    let layout = layout_for(workdir);
+    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
+    enable(workdir, "demo_on");
+
+    let mut supervisor = Supervisor::new(layout.clone());
+    supervisor.reconcile();
+
+    let log = layout.logs_dir().join("demo.log");
+    assert!(
+        wait_until(
+            || std::fs::read_to_string(&log)
+                .map(|text| text.contains("child-stderr-marker"))
+                .unwrap_or(false),
+            "the child's stderr line to reach its log file"
+        ),
+        "a child's stderr must be recorded, not discarded"
+    );
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !text.contains("child-stdout-marker"),
+        "stdout must stay swallowed: only stderr is a reporting channel, got: {text:?}"
+    );
+    supervisor.stop_all();
+}
+
+#[test]
+fn the_supervisor_records_when_it_starts_a_child() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
+    enable(workdir, "demo_on");
+
+    let mut supervisor = Supervisor::new(layout.clone());
+    supervisor.reconcile();
+
+    let log = layout.logs_dir().join("demo.log");
+    assert!(
+        wait_until(
+            || std::fs::read_to_string(&log)
+                .map(|text| text.contains("started demo") && text.contains("pid"))
+                .unwrap_or(false),
+            "the supervisor's start event to reach the log"
+        ),
+        "the log must record the start, including the pid"
+    );
+    supervisor.stop_all();
+}
+
+#[test]
+fn removing_a_manifest_records_why_the_child_stopped() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
+    enable(workdir, "demo_on");
+
+    let mut supervisor = Supervisor::new(layout.clone());
+    supervisor.reconcile();
+    assert!(wait_for_pid_marker(&marker), "child should start");
+
+    // 清单消失（插件被卸载）→ 必须记下是**这个**原因，而不是"开关关闭"。
+    std::fs::remove_file(layout.manifests_dir().join("demo.json")).unwrap();
+    supervisor.reconcile();
+
+    let log = layout.logs_dir().join("demo.log");
+    assert!(
+        wait_until(
+            || std::fs::read_to_string(&log)
+                .map(|text| text.contains("manifest removed"))
+                .unwrap_or(false),
+            "the stop reason to reach the log"
+        ),
+        "a stop caused by a removed manifest must say so"
+    );
+}
+
+#[test]
+fn switching_off_records_a_different_reason_than_removing_the_manifest() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
+    let prefs = workdir.join(".yi-agent/preferences.json");
+    enable(workdir, "demo_on");
+
+    let mut supervisor = Supervisor::new(layout.clone());
+    supervisor.reconcile();
+    assert!(wait_for_pid_marker(&marker), "child should start");
+
+    std::fs::write(&prefs, r#"{"demo_on":false}"#).unwrap();
+    supervisor.reconcile();
+
+    let log = layout.logs_dir().join("demo.log");
+    assert!(
+        wait_until(
+            || std::fs::read_to_string(&log)
+                .map(|text| text.contains("switch off"))
+                .unwrap_or(false),
+            "the switch-off reason to reach the log"
+        ),
+        "a stop caused by the switch must be distinguishable from a removed manifest"
+    );
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        !text.contains("manifest removed"),
+        "the manifest is still there; the reason must not be misattributed: {text:?}"
+    );
+}
+
+#[test]
+fn a_childs_exit_is_recorded_once_not_once_per_tick() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let child = workdir.join("crash.sh");
+    std::fs::write(&child, "#!/bin/sh\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&child).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&child, perms).unwrap();
+    }
+    let layout = layout_for(workdir);
+    std::fs::create_dir_all(layout.manifests_dir()).unwrap();
+    // 长退避：整个观察窗口都落在退避里，于是每次 reconcile 都观察到「已退出」。
+    std::fs::write(
+        layout.manifests_dir().join("demo.json"),
+        format!(
+            r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":2000,"restart_backoff_max_ms":2000}}"#,
+            child.display()
+        ),
+    )
+    .unwrap();
+    enable(workdir, "demo_on");
+
+    let mut supervisor = Supervisor::new(layout.clone());
+    // 20 拍 x 50ms 约 1s，全程 < 2000ms 退避：同一退出事实被观察约 20 次。
+    for _ in 0..20 {
+        supervisor.reconcile();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let log = layout.logs_dir().join("demo.log");
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    let count = text.matches("exited demo").count();
+    assert_eq!(
+        count, 1,
+        "the same exit must be recorded once, not once per tick: {text:?}"
+    );
+    supervisor.stop_all();
+}
+
+#[test]
+fn an_unwritable_log_does_not_stop_the_child_from_starting() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
+    enable(workdir, "demo_on");
+
+    // 让日志路径不可用：`logs` 处放一个**文件**而不是目录，`create_dir_all` 必失败。
+    // 守护子进程是本职，记日志是附加——这条路径绝不能阻断 spawn。
+    std::fs::write(layout.logs_dir(), "not a directory").unwrap();
+
+    let mut supervisor = Supervisor::new(layout);
+    supervisor.reconcile();
+
+    assert!(
+        wait_for_pid_marker(&marker),
+        "an unusable log path must never stop the child from starting"
+    );
+    supervisor.stop_all();
+}

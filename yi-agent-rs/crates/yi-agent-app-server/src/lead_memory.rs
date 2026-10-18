@@ -468,6 +468,7 @@ mod tests {
             role: role.map(str::to_string),
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
         }
     }
 

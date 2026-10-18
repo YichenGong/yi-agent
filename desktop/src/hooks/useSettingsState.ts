@@ -10,7 +10,7 @@ import type { RpcClient } from "../lib/rpc";
  * 归属判据是「这是**哪台**客户端的设置」——答案只有一个：本机。所以这批状态
  * 没有会话维度，也不随切会话重置：`settingsOpen` 是模态开合；`relayUrl`/`theme`
  * 是本机偏好（权威在服务端 `preferences.json`，localStorage 只是首屏缓存）；
- * `onboarding`/`onboardingNotice` 是首启一次性的引导与其部分成功提示；
+ * `onboarding` 是首启一次性的引导；
  * `pairingVersion`/`repairing`/`repairNotice` 是「这台设备还能不能用」的配对态。
  *
  * `rpc` 是 4a-4d 那条「取客户端」的 getter：未连接时返回 null。`changeTheme`
@@ -49,9 +49,6 @@ export function useSettingsState({
     needed: false,
     reasons: [],
   });
-  // 部分成功提示（spec §4.7）：`.env` 写成功、但清单未收边时在主界面顶部留一条
-  // 可关闭横幅。`null` = 无提示；关闭即清空。完整成功不设此项。
-  const [onboardingNotice, setOnboardingNotice] = useState<string | null>(null);
   // iOS 首启：没有远端配置时先配对。版本号是「让 transport 重算」的触发器——
   // 配对落盘后加一，下面那个 effect 才第一次真正建客户端（此前被
   // `needsPairing` 挡住），这一次读到的是 ws 配置。
@@ -133,7 +130,6 @@ export function useSettingsState({
   return {
     // state：设置/配对 JSX 与生命周期 effect 直接消费。
     onboarding,
-    onboardingNotice,
     pairingVersion,
     repairing,
     repairNotice,
@@ -143,7 +139,6 @@ export function useSettingsState({
     // setters：JSX 与生命周期 effect 直接写（跟随推送主题、采纳首屏权威值、
     // 进/出重配、开合设置页、回填中继地址）。
     setOnboarding,
-    setOnboardingNotice,
     setPairingVersion,
     setRepairing,
     setRepairNotice,

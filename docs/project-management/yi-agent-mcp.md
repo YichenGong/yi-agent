@@ -32,3 +32,7 @@ yi-agent 的 Model Context Protocol（MCP）客户端 crate。目标是连接 MC
   - 接线：`manager.rs` 的 `connect()` 按 `Transport` 分派 `TokioChildProcess` / `StreamableHttpClientTransport`
   - 指纹：`cache.rs` 缓存指纹扩展为覆盖 `kind`/`url`/`headers`（排除 `enabled`）
   - 验证：`cargo test -p yi-agent-mcp --test http_transport`（wiremock 往返）+ `-- --ignored`（真实 horizon 端点）
+- [x] 设置页只读接缝
+  - 公开视图：`yi-agent-rs/crates/yi-agent-mcp/src/lib.rs:29` 的 `McpCacheEntry` 与 `:40` 的 `cached_tools_for`（只回名字/描述/read_only，不带 `input_schema`；指纹不匹配回 `None`）
+  - RPC：`mcp/list`（`yi-agent-rs/crates/yi-agent-app-server/src/mcp_rpc.rs`），`Observe` 档，读 `.yi-agent/mcp.json` + `.yi-agent/mcp-cache.json`；面板见 [desktop](./desktop.md)
+  - 验证：`cargo test -p yi-agent-app-server --lib mcp_rpc`、`cargo test -p yi-agent-app-server mcp_list_is_available_at_observe_scope`

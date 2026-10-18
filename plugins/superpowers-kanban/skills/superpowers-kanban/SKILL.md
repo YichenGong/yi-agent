@@ -93,6 +93,9 @@ superpowers-kanban add-prequeued "<需求标题>"
 成功时打印投递的 `<card-id>`（由标题派生，可在桌面最左 `PRE-QUEUED` 列 / `list` 里
 看到它，卡片状态为 `pre_queued`）。`<title>` 必须非空。
 
+在会话里投递时，插件会自动把**当前会话**记为这张卡的来源（宿主经
+`YI_AGENT_THREAD_ID` 注入），无需额外参数；桌面看板上可点击跳回那次讨论。
+
 之后设计写完、`<spec>` 与 `<plan>` 落盘，再提升为正式排队卡：
 
 ```bash

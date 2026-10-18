@@ -72,11 +72,14 @@ import { estimateCost, formatCost } from "./lib/pricing";
 import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
-import { OnboardingWizard, type OnboardingOutcome } from "./components/OnboardingWizard";
+import { OnboardingWizard } from "./components/OnboardingWizard";
 import { onboardingStatus } from "./lib/onboarding";
 import { readListCache, writeListCache } from "./lib/sessionCache";
 import { createContentStore, persistContent, type AsyncContentStore, type ContentEntry } from "./lib/contentStore";
 import { parseSyncPlan, resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
+import { useDragDropPaths } from "./hooks/useDragDropPaths";
+import { subscribeDragDrop } from "./lib/dragDropSubscribe";
+import { insertDroppedPaths } from "./lib/droppedPaths";
 
 /**
  * 看板失败的四种说法。
@@ -381,6 +384,20 @@ export default function App() {
    * 位置一起冲掉。
    */
   const skillsCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
+   * 「MCP」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖即稳定；
+   * 若每次渲染换新身份，MCP 面板的读取 effect 会跟着重跑，把已展开的工具清单与
+   * 折叠状态一起冲掉。
+   */
+  const mcpCall = useCallback(
     (method: string, params: unknown): Promise<unknown> => {
       const c = clientRef.current;
       if (!c) return Promise.reject(new Error("not connected"));
@@ -1195,7 +1212,15 @@ export default function App() {
           sess.setPanelOpen(true);
           // 提示语随快照走（见 `pendingNoteRef`）：此行只登记挂起值。
           diff.setPendingDiffNote(n.params.note ?? null);
-          void diff.loadThreadDiff(target, n.params.base);
+          // 基准不再随通知携带（通知里已没有 `base`）：它现在由**帧**承载。
+          // 两条都取，各司其职：
+          //  - `loadViewFrame` 拿**模型给的命令帧**（`thread/view/read`）——focus 的
+          //    主角，头部命令条与三种原语都来自它；
+          //  - `loadThreadDiff` 仍拿结构化快照——它给的是 `commits/files` 列表与
+          //    汇总行的 `+X −Y`，也是**无帧**时的正文兜底（旧会话、纯结构化推送）。
+          // 帧到了就由帧渲染正文（`GitDiffView`），没到就退回这份快照。
+          void diff.loadViewFrame(target);
+          void diff.loadThreadDiff(target);
           return;
         }
         if (n.method === "agent/trace/event") {
@@ -1841,6 +1866,41 @@ export default function App() {
   };
 
   /**
+   * 拖入的路径落点：光标位置（不驱动渲染，故用 ref）与最近一次定位请求。
+   *
+   * `caret` 记用户最后一次移动光标的位置，拖入时用它决定插在哪；`seek` 是给
+   * `MessageInput` 的"把光标放到这里"请求，用自增 `seq` 让同位置连拖也能各生效一次。
+   */
+  const composerCaret = useRef(0);
+  const seekSeq = useRef(0);
+  const [caretSeek, setCaretSeek] = useState<{ seq: number; pos: number } | null>(null);
+  const composerCardRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * 把拖入的路径插进**当前会话**的草稿。
+   *
+   * 与 `changeDraft` 同一条通路（写 `view(id).draft` + `force`）：草稿属于会话，
+   * 所以切走再切回，路径仍在原会话的输入框里。没有当前会话时无处可放，忽略——
+   * 与输入框的 `disabled` 护栏一致，不留"拖进去却静默丢路径"的死路。
+   */
+  const dropPathsIntoDraft = (paths: string[]): void => {
+    const id = store.currentId;
+    if (!id) return;
+    const { text, caret } = insertDroppedPaths(store.view(id).draft, composerCaret.current, paths);
+    store.setDraft(id, text);
+    composerCaret.current = caret;
+    setCaretSeek({ seq: ++seekSeq.current, pos: caret });
+    force((v) => v + 1);
+  };
+
+  const dragDrop = useDragDropPaths({
+    subscribe: subscribeDragDrop,
+    isRemote: isRemoteClient(),
+    targetRef: composerCardRef,
+    onDrop: dropPathsIntoDraft,
+  });
+
+  /**
    * 记下某会话下拉写入成功后的模型结果。
    *
    * 只更新**那个**会话的 `info.model_ref` / `info.model`：写的是哪个会话，就更新
@@ -1955,16 +2015,8 @@ export default function App() {
         <OnboardingWizard
           reasons={prefs.onboarding.reasons}
           call={(m, p) => (clientRef.current as RpcClient).request(m, p)}
-          onDone={(result?: OnboardingOutcome) => {
+          onDone={() => {
             prefs.setOnboarding({ needed: false, reasons: [] });
-            // `.env` 已写、清单没收边（部分成功）：主界面顶部留一条可关闭提示，
-            // 别让用户在「已保存」与「模型仍不可用」之间一头雾水。
-            if (result && !result.imported) {
-              prefs.setOnboardingNotice(
-                "已保存到 .env，但未纳入模型清单（可稍后在设置里点「导入当前配置」）" +
-                  (result.importError ? `：${result.importError}` : ""),
-              );
-            }
             // 新配置要重启侧车才生效（cfg/清单在启动时读入）。宿主重启后会经
             // 既有 exited → 重新握手路径刷回来；顺带尽力刷一次模型清单。
             void restartSidecar();
@@ -1974,25 +2026,6 @@ export default function App() {
       )}
       <div className="app-shell flex h-screen flex-col bg-surface text-fg">
         <TitleBar />
-        {/* 引导部分成功的提示（spec §4.7）：可关闭的顶部横幅，样式与 ApprovalBanner
-            一致；关闭即清空状态，不再出现。 */}
-        {prefs.onboardingNotice !== null && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="flex flex-wrap items-center gap-3 border-b border-amber-900/60 bg-amber-950/60 px-3 py-2 text-xs text-amber-100"
-          >
-            <span className="min-w-0">{prefs.onboardingNotice}</span>
-            <button
-              type="button"
-              onClick={() => prefs.setOnboardingNotice(null)}
-              aria-label="关闭提示"
-              className="ml-auto rounded px-1 text-amber-300 hover:text-amber-100"
-            >
-              ✕
-            </button>
-          </div>
-        )}
         <div className="flex min-h-0 flex-1 flex-row">
         {isMobile && sess.sidebarOpen && (
           <div
@@ -2106,7 +2139,12 @@ export default function App() {
                   enqueueBoardCard(board.boardRpc, board.selectedBoard!, spec, plan)
                 }
                 prequeue={(title) =>
-                  enqueuePrequeuedCard(board.boardRpc, board.selectedBoard!, title)
+                  enqueuePrequeuedCard(
+                    board.boardRpc,
+                    board.selectedBoard!,
+                    title,
+                    sess.currentId,
+                  )
                 }
               />
               <SuperpowersKanbanView
@@ -2177,6 +2215,12 @@ export default function App() {
                 onSlashCommand={(name, args) => void onSlashCommand(name, args)}
                 value={current?.draft ?? ""}
                 onDraftChange={changeDraft}
+                cardRef={composerCardRef}
+                dropActive={dragDrop.active}
+                caretSeek={caretSeek}
+                onCaretChange={(caret) => {
+                  composerCaret.current = caret;
+                }}
                 // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
                 attachments={sess.currentId ? (pending[sess.currentId] ?? []) : []}
                 onPickAttachments={() => void pickAttachments()}
@@ -2347,9 +2391,17 @@ export default function App() {
               error: diff.diffOwnerRef.current === sess.currentId ? diff.diffError : null,
               activeCommit: diff.activeCommit,
               note: diff.diffNote,
-              onRefresh: () => void diff.loadThreadDiff(sess.currentId!, diff.diffBase),
+              // 帧与快照同门：非本会话的帧不许冒充当前视图（`viewOwnerRef` 是判据）。
+              frame: diff.viewOwnerRef.current === sess.currentId ? diff.viewFrame : null,
+              onRefresh: () => {
+                // 刷新要两样都重取：帧重跑模型那条命令，快照重算 commits/files。
+                void diff.loadViewFrame(sess.currentId!, true);
+                void diff.loadThreadDiff(sess.currentId!, diff.diffBase);
+              },
               onOpenCommit: (sha) => void diff.openCommit(sess.currentId!, sha),
               onCloseCommit: () => diff.setActiveCommit(null),
+              // D1 单文件懒加载：正文缺席时按 path 取一次正文并并进快照。
+              onLoadFile: (path) => void diff.loadFile(sess.currentId!, path),
             }}
             processProps={{
               processes: proc.processes,
@@ -2406,6 +2458,12 @@ export default function App() {
         skillsCall={skillsCall}
         skillsProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         skillsDefaultProject={current?.info?.cwd}
+        // MCP 的配置也是项目级文件（<项目>/.yi-agent/mcp.json），候选与默认值直接
+        // 复用插件/技能那份——三者指的都是「项目目录下的 .yi-agent」，来源分叉会让
+        // 用户在三个面板里看到不同的项目列表。
+        mcpCall={mcpCall}
+        mcpProjects={pluginProjectPaths(sess.workspaces, board.boards)}
+        mcpDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。

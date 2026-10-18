@@ -13,7 +13,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_runtime::models::{
-    ModelCatalog, ModelEntry, ModelProvider, effective_entry, load_catalog_from, mask_key,
+    ModelCatalog, ModelEntry, ModelProvider, effective_entry_for, load_catalog_from, mask_key,
     models_path, save_catalog_to,
 };
 
@@ -54,13 +54,19 @@ pub fn handle_model_request_at(
     }
 }
 
-/// 当前默认实际解析到哪里：命中清单条目就用条目，否则回退 cfg（`.env`）。
+/// 当前默认实际解析到哪里：命中条目就用条目，否则回退 cfg（`.env`）。
 /// key 一律只出掩码——与 [`entry_view`] 同一条安全约定。
+///
+/// 条目选择走 [`effective_entry_for`]（而非无注入语境的 `effective_entry`）：
+/// app-server 可能被整包注入（provider + key 由外部管道送进来），此时进程**实际
+/// 运行**的是注入包，清单默认不生效——上报必须同口径（spec §1.5 目标 4
+/// 「上报 == 实际运行」）。注入时 `effective_entry_for` 返回 `None`，落到的正是
+/// `"source": "env"` 那支，即注入包本身。
 ///
 /// `api_style` / `reasoning_effort` 同 `resolve_effective` 的语义：命中条目即
 /// 取条目的值（缺省 = 未设置），否则回退 cfg。二者是「生效值」，UI 据此回显。
 fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
-    match effective_entry(catalog, None) {
+    match effective_entry_for(cfg, catalog, None) {
         Some(entry) => json!({
             "source": "catalog",
             "model_ref": entry.name,
@@ -163,6 +169,7 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
         api_key,
         api_style,
         reasoning_effort,
+        context_length: None,
     };
     match existing {
         Some(i) => catalog.models[i] = entry,
@@ -256,6 +263,7 @@ fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
         // 兜底层 cfg 的通道选择随条目固化（与 upsert 的默认语义一致）。
         api_style: Some(cfg.api_style.as_str().to_string()),
         reasoning_effort: cfg.reasoning_effort.clone(),
+        context_length: None,
     });
     catalog.default_model = Some(name.clone());
     save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
@@ -372,6 +380,8 @@ mod tests {
             workdir: std::path::PathBuf::from("/tmp/import-env-test"),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
@@ -380,6 +390,7 @@ mod tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
+            model_injected: false,
         }
     }
 
@@ -615,6 +626,7 @@ mod tests {
             api_key: String::new(),
             api_style: None,
             reasoning_effort: None,
+            context_length: None,
         });
         catalog.default_model = Some("gone".to_string());
         yi_agent_runtime::models::save_catalog_to(&path, &catalog).unwrap();
@@ -730,6 +742,38 @@ mod tests {
         assert_eq!(out["effective"]["source"], "env");
         assert_eq!(out["effective"]["api_style"], "auto");
         assert!(out["effective"]["reasoning_effort"].is_null());
+    }
+
+    /// Task 3 review fix round 1 (Finding 3, spec §1.5 goal 4 「上报 == 实际运行」):
+    /// an **injected** process must not report the catalog as its effective source.
+    ///
+    /// The app-server is handed the injected package (provider + key piped in), yet
+    /// `effective_view` called the injection-unaware `effective_entry`, so
+    /// `model/list` answered `source: "catalog"` with the *default entry's* masked
+    /// key while the process actually ran the injected package. The entry selection
+    /// must be `effective_entry_for(cfg, catalog, None)`: under injection it returns
+    /// `None`, which is exactly the `source: "env"` shape — the injected package.
+    #[test]
+    fn an_injected_process_reports_env_not_catalog() {
+        let (_dir, path) = catalog_path();
+        // A catalog with a default entry that WOULD win without injection.
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        call(&path, "model/setDefault", json!({ "name": "A" })).unwrap();
+
+        let mut cfg = fallback_cfg();
+        cfg.model_injected = true;
+        let out = handle_model_request_at(&path, "model/list", &json!({}), &cfg).unwrap();
+
+        assert_eq!(
+            out["effective"]["source"], "env",
+            "an injected process runs the injected package, so it must not report the catalog"
+        );
+        assert!(out["effective"]["model_ref"].is_null());
+        assert_eq!(out["effective"]["model"], "env-model");
+        assert_eq!(out["effective"]["provider"], "openai");
+        assert_eq!(out["effective"]["api_key_masked"], "••••9999");
+        // The catalog default entry's key must NOT be presented as effective.
+        assert!(!out["effective"].to_string().contains("••••1234"));
     }
 
     #[test]

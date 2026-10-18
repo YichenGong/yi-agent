@@ -452,10 +452,12 @@ pub enum Notification {
         tag_names: std::collections::BTreeMap<String, String>,
     },
     /// 模型（`show_git_diff` 工具）请求桌面端聚焦 Git Diff 视图。
+    ///
+    /// 不再携带 `base`：基准现在由**帧**承载（`thread/view/read` 读回），
+    /// 前端不必自己解析基准。
     #[serde(rename = "ui/gitDiff/focus", rename_all = "camelCase")]
     UiGitDiffFocus {
         thread_id: Option<String>,
-        base: Option<String>,
         note: Option<String>,
     },
     #[serde(rename = "error")]

@@ -4996,6 +4996,7 @@ dependencies = [
  "wiremock",
  "yi-agent-boards",
  "yi-agent-core",
+ "yi-agent-mcp",
  "yi-agent-relay",
  "yi-agent-runtime",
  "yi-agent-skills",
@@ -5174,6 +5175,7 @@ dependencies = [
 name = "yi-agent-supervisors"
 version = "0.1.6"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -5225,6 +5227,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "yi-agent-runtime",
 ]
 
 [[package]]

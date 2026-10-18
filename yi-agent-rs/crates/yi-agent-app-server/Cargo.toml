@@ -23,6 +23,8 @@ yi-agent-subagent = { workspace = true }
 # `skill/list` / `skill/read` 枚举与读取三层 skill 根。
 yi-agent-skills = { workspace = true }
 yi-agent-tools = { workspace = true }
+# `mcp/list` 读项目级 `.yi-agent/mcp.json` 与工具 schema 缓存。
+yi-agent-mcp = { workspace = true }
 # The embedded relay client (outbound wss) used by `serve_stdio_with_relay`: the
 # desktop and a relay-attached phone must share ONE `serve()` loop.
 yi-agent-relay = { workspace = true }

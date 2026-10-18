@@ -25,4 +25,4 @@ cause: string, } } | { "method": "thread/tokenUsage/updated", "params": { thread
  * `ProcessStatus` 的 serde 标签：starting / running / ready / exited /
  * killed / failed_to_start。
  */
-state: string, } } | { "method": "item/toolCall/approvalResolved", "params": { perm_id: string, by: string, decision: string, } } | { "method": "ui/settings/updated", "params": { theme: string, } } | { "method": "ui/tagNames/updated", "params": { tag_names: Record<string, string>, } } | { "method": "ui/gitDiff/focus", "params": { threadId: string | null, base: string | null, note: string | null, } } | { "method": "error", "params": { message: string, } });
+state: string, } } | { "method": "item/toolCall/approvalResolved", "params": { perm_id: string, by: string, decision: string, } } | { "method": "ui/settings/updated", "params": { theme: string, } } | { "method": "ui/tagNames/updated", "params": { tag_names: Record<string, string>, } } | { "method": "ui/gitDiff/focus", "params": { threadId: string | null, note: string | null, } } | { "method": "error", "params": { message: string, } });

@@ -437,10 +437,17 @@ fn command_add(state_dir: &std::path::Path, spec: &str, plan: &str) -> Result<St
 }
 
 /// `add-prequeued`：只给标题，投递一张预排队卡，id 在这里定死。
+///
+/// 会话内的 agent 经 bash 调用本命令时，宿主已在装配期把当前 thread id 注入
+/// 环境变量 `YI_AGENT_THREAD_ID`（模型看不到自己的 thread id，只能由装配期注入）。
+/// 读不到（会话外手动调用、TUI 本地会话）就留空——关联是尽力而为，不阻断投递。
 fn command_prequeued(state_dir: &std::path::Path, title: &str) -> Result<String, String> {
     if title.trim().is_empty() {
         return Err("add-prequeued needs a non-empty title".to_string());
     }
+    let origin_thread_id = std::env::var("YI_AGENT_THREAD_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let board = superpowers_kanban_runner::persist::load_board(&state_dir.join("board.json"));
     let id = superpowers_kanban_core::inbox::next_free_prequeued_id(
         &board,
@@ -449,8 +456,13 @@ fn command_prequeued(state_dir: &std::path::Path, title: &str) -> Result<String,
         chrono::Local::now(),
     )
     .0;
-    superpowers_kanban_core::inbox::deliver_prequeued_card(state_dir, &id, title)
-        .map_err(|error| format!("could not deliver the card: {error}"))?;
+    superpowers_kanban_core::inbox::deliver_prequeued_card(
+        state_dir,
+        &id,
+        title,
+        origin_thread_id.as_deref(),
+    )
+    .map_err(|error| format!("could not deliver the card: {error}"))?;
     Ok(format!(
         "delivered {id} to {}\n{title}",
         superpowers_kanban_core::inbox::inbox_dir(state_dir).display()
@@ -1643,6 +1655,7 @@ mod tests {
         board.enqueue_prequeued(
             CardId::new(card_id),
             "一个想法".to_string(),
+            None,
             chrono::Local::now(),
         );
         superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
@@ -1733,5 +1746,74 @@ mod tests {
             "校验失败时不得投递任何东西"
         );
         drop(dir);
+    }
+
+    /// 涉及进程级环境变量的测试必须串行，否则并行跑时互相干扰。
+    static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 记录原值并在 drop 时还原，确保断言失败也不会把环境变量留给别的测试。
+    struct EnvVarGuard {
+        name: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(name);
+            // SAFETY: 递归持有 ENV_TEST_MUTEX，进程内无人并发读写该变量。
+            unsafe { std::env::set_var(name, value) };
+            Self { name, original }
+        }
+
+        fn unset(name: &'static str) -> Self {
+            let original = std::env::var_os(name);
+            // SAFETY: 同上。
+            unsafe { std::env::remove_var(name) };
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: 同上。
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    #[test]
+    fn add_prequeued_reads_the_thread_id_from_the_environment() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::set("YI_AGENT_THREAD_ID", "thread-abc");
+        let dir = tempfile::tempdir().unwrap();
+        command_prequeued(dir.path(), "my idea").unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["origin_thread_id"], "thread-abc");
+    }
+
+    #[test]
+    fn add_prequeued_without_the_env_var_still_delivers() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::unset("YI_AGENT_THREAD_ID");
+        let dir = tempfile::tempdir().unwrap();
+        command_prequeued(dir.path(), "my idea").unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(value.get("origin_thread_id").is_none());
+    }
+
+    #[test]
+    fn add_prequeued_ignores_a_blank_thread_id() {
+        // 空/空白 env 视为没有（宿主不该注入空串，但别让它污染数据）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::set("YI_AGENT_THREAD_ID", "   ");
+        let dir = tempfile::tempdir().unwrap();
+        command_prequeued(dir.path(), "my idea").unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(value.get("origin_thread_id").is_none());
     }
 }

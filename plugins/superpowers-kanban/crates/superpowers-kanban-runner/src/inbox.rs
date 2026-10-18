@@ -31,6 +31,9 @@ struct RawDelivery {
     /// 预排队卡的标题 / 提升时的新标题。
     #[serde(default)]
     title: Option<String>,
+    /// 预排队卡的来源讨论会话（可选）。
+    #[serde(default)]
+    origin_thread_id: Option<String>,
 }
 
 /// 消费 `<state_dir>/inbox` 下的全部投递。
@@ -154,7 +157,7 @@ fn apply_delivery(
                 result: Err("prequeued delivery needs a non-empty title".to_string()),
             };
         }
-        board.enqueue_prequeued(id, title, now);
+        board.enqueue_prequeued(id, title, delivery.origin_thread_id.clone(), now);
         let _ = std::fs::remove_file(path);
         return InboxOutcome {
             id: delivery.id.clone(),
@@ -633,5 +636,40 @@ mod tests {
         assert_eq!(board.len(), 0);
         assert!(inbox.join("rejected/idea.json").exists());
         assert!(!inbox.join("idea.json").exists());
+    }
+
+    #[test]
+    fn a_prequeued_delivery_carries_its_origin_thread_onto_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("inbox")).unwrap();
+        std::fs::write(
+            dir.path().join("inbox/idea.json"),
+            r#"{"kind":"prequeued","id":"idea","title":"my idea","origin_thread_id":"thread-abc"}"#,
+        )
+        .unwrap();
+        let mut board = Board::new();
+        let outcomes = consume(dir.path(), &mut board, Local::now());
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].result, Ok(()));
+        let card = board.get(&CardId::new("idea")).unwrap();
+        assert_eq!(card.origin_thread_id.as_deref(), Some("thread-abc"));
+    }
+
+    #[test]
+    fn a_prequeued_delivery_without_an_origin_thread_still_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("inbox")).unwrap();
+        std::fs::write(
+            dir.path().join("inbox/idea.json"),
+            r#"{"kind":"prequeued","id":"idea","title":"my idea"}"#,
+        )
+        .unwrap();
+        let mut board = Board::new();
+        let outcomes = consume(dir.path(), &mut board, Local::now());
+        assert_eq!(outcomes[0].result, Ok(()));
+        assert_eq!(
+            board.get(&CardId::new("idea")).unwrap().origin_thread_id,
+            None
+        );
     }
 }

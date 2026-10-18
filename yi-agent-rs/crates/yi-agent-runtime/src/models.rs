@@ -74,6 +74,9 @@ pub struct ModelEntry {
     /// 非字符串值按「未设置」处理，不让整条被跳过（见 `de_optional_string`）。
     #[serde(default, deserialize_with = "de_optional_string")]
     pub reasoning_effort: Option<String>,
+    /// 该条目的上下文窗口（tokens）；`None` = 沿用 cfg 的既有阈值。
+    #[serde(default)]
+    pub context_length: Option<u32>,
 }
 
 /// 反序列化时把非字符串值当作「未设置」（None），避免一个手写值让整条被跳过。
@@ -377,12 +380,14 @@ pub fn mask_key(key: &str) -> String {
 
 /// 会话覆盖 → 全局默认 → 原 cfg 三级解析，返回改写了 provider/api_url/api_key/model
 /// 以及 `api_style` / `reasoning_effort` 的 cfg 克隆，其余字段保持原值。
+///
+/// 条目选择走 [`effective_entry_for`]：会话覆盖 > 整包注入 > 清单默认。
 pub fn resolve_effective(
     cfg: &RuntimeConfig,
     catalog: &ModelCatalog,
     session_override: Option<&str>,
 ) -> RuntimeConfig {
-    match effective_entry(catalog, session_override) {
+    match effective_entry_for(cfg, catalog, session_override) {
         Some(entry) => {
             let mut out = cfg.clone();
             out.provider = entry.provider.as_str().to_string();
@@ -395,21 +400,60 @@ pub fn resolve_effective(
                 .map(ApiStyle::parse)
                 .unwrap_or(RuntimeConfig::default_api_style());
             out.reasoning_effort = entry.reasoning_effort.clone();
+            // `context_length` 来自手写 `models.json`，是外部输入：饱和乘法挡住 `length * ratio`
+            // 的溢出（debug 会 panic、release 会静默回绕）；`0` 视为"未声明"，否则
+            // `compact_threshold == 0` 会让每一轮都触发压缩。静默条目保持 cfg 阈值原样。
+            if let Some(length) = entry.context_length {
+                if length > 0 {
+                    out.compact_threshold = length.saturating_mul(out.compact_ratio) / 100;
+                }
+            }
             out
         }
         None => cfg.clone(),
     }
 }
 
-/// 会话覆盖命中则用它；否则全局默认；都命中不了返回 None（调用方回退 cfg）。
+/// 条目选择的**唯一**规则：会话覆盖 > 整包注入 > 清单默认。
+///
+/// `model_injected` 由调用方从真实配置取（[`RuntimeConfig::model_injected`]）。这条
+/// 规则单独开一个入口，是给**拿不到完整 `RuntimeConfig`** 的调用方用的（TUI `/effort`
+/// 手上只有快照里的几个字段）：让它们复用同一条规则，而不是各自再推导一遍——
+/// 「上报 == 实际发出」正是靠这一点成立的。`resolve_effective` 与 TUI 都落到这里。
+pub fn effective_entry_with_injection<'a>(
+    catalog: &'a ModelCatalog,
+    session_override: Option<&str>,
+    model_injected: bool,
+) -> Option<&'a ModelEntry> {
+    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
+    if let Some(entry) = session_override.and_then(by_name) {
+        return Some(entry);
+    }
+    if model_injected {
+        return None;
+    }
+    catalog.default_model.as_deref().and_then(by_name)
+}
+
+/// 解析 `cfg` 与清单得到本次生效条目。优先级：会话覆盖 > 整包注入 > 清单默认。
+///
+/// 注入存在时**不看**清单默认：用户显式给的一整包压过持久化的默认值，
+/// 这正是「改了没反应」那个病的解药。
+pub fn effective_entry_for<'a>(
+    cfg: &RuntimeConfig,
+    catalog: &'a ModelCatalog,
+    session_override: Option<&str>,
+) -> Option<&'a ModelEntry> {
+    effective_entry_with_injection(catalog, session_override, cfg.model_injected)
+}
+
+/// 无注入语境下的条目解析（启动期、`onboarding` 评估等）。等价于
+/// [`effective_entry_with_injection`] 且注入标记为 `false`。
 pub fn effective_entry<'a>(
     catalog: &'a ModelCatalog,
     session_override: Option<&str>,
 ) -> Option<&'a ModelEntry> {
-    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
-    session_override
-        .and_then(by_name)
-        .or_else(|| catalog.default_model.as_deref().and_then(by_name))
+    effective_entry_with_injection(catalog, session_override, false)
 }
 
 /// 子 agent 条目：`subagent_model` → 全局默认 → None（调用方回退 cfg）。
@@ -435,6 +479,7 @@ mod tests {
             api_key: "sk-secret-1234".into(),
             api_style: None,
             reasoning_effort: None,
+            context_length: None,
         }
     }
 
@@ -819,6 +864,8 @@ mod resolve_tests {
             workdir: std::path::PathBuf::from("."),
             system_prompt: None,
             compact_threshold: 1000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 100,
             compact_tool_budget_tokens: 100,
             yolo: false,
@@ -827,6 +874,7 @@ mod resolve_tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 0,
             skills_catalog_budget_explicit: false,
+            model_injected: false,
         }
     }
 
@@ -841,6 +889,7 @@ mod resolve_tests {
                     api_key: "key-a".into(),
                     api_style: None,
                     reasoning_effort: None,
+                    context_length: None,
                 },
                 ModelEntry {
                     name: "B".into(),
@@ -850,6 +899,7 @@ mod resolve_tests {
                     api_key: "key-b".into(),
                     api_style: None,
                     reasoning_effort: None,
+                    context_length: None,
                 },
             ],
             default_model: Some("A".into()),
@@ -870,6 +920,24 @@ mod resolve_tests {
     fn a_dangling_override_falls_back_to_the_default() {
         let out = resolve_effective(&cfg(), &catalog(), Some("gone"));
         assert_eq!(out.model, "model-a");
+    }
+
+    #[test]
+    fn an_injection_beats_the_catalog_default() {
+        let mut base = cfg();
+        base.model_injected = true;
+        base.model = "injected-model".into();
+        let out = resolve_effective(&base, &catalog(), None);
+        assert_eq!(out.model, "injected-model");
+    }
+
+    #[test]
+    fn a_session_override_still_beats_an_injection() {
+        let mut base = cfg();
+        base.model_injected = true;
+        base.model = "injected-model".into();
+        let out = resolve_effective(&base, &catalog(), Some("B"));
+        assert_eq!(out.model, "model-b");
     }
 
     #[test]
@@ -916,5 +984,46 @@ mod resolve_tests {
         let out = resolve_effective(&cfg(), &catalog(), Some("A"));
         assert_eq!(out.reasoning_effort, None);
         assert_eq!(out.api_style.as_str(), "auto");
+    }
+
+    #[test]
+    fn an_entrys_context_length_recomputes_the_compact_threshold() {
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(100_000);
+        // cfg() defaults to compact_ratio 80.
+        let out = resolve_effective(&cfg(), &cat, Some("B"));
+        assert_eq!(out.compact_threshold, 80_000);
+    }
+
+    #[test]
+    fn a_silent_context_length_leaves_the_threshold_alone() {
+        let base = cfg();
+        let out = resolve_effective(&base, &catalog(), Some("A"));
+        assert_eq!(out.compact_threshold, base.compact_threshold);
+    }
+
+    /// `context_length: 0` 是手写 `models.json` 里可达的输入。它必须被当成"未声明"：
+    /// 阈值保持 cfg 原值，否则 `compact_threshold == 0` 会让每一轮都触发压缩。
+    #[test]
+    fn a_zero_context_length_is_treated_as_silent() {
+        let base = cfg();
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(0);
+        let out = resolve_effective(&base, &cat, Some("B"));
+        assert_eq!(out.compact_threshold, base.compact_threshold);
+    }
+
+    /// 一个被误写成原始窗口/字符数的超大值不能在 `length * ratio` 上溢出：
+    /// debug 构建会 panic（会话启动路径），release 会静默回绕。饱和乘法必须让它算完。
+    #[test]
+    fn a_huge_context_length_saturates_instead_of_overflowing() {
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(1_000_000_000);
+        // cfg() 的 compact_ratio 为 80（非零），正是会溢出的倍数。
+        let out = resolve_effective(&cfg(), &cat, Some("B"));
+        assert_eq!(
+            out.compact_threshold,
+            1_000_000_000u32.saturating_mul(80) / 100
+        );
     }
 }
