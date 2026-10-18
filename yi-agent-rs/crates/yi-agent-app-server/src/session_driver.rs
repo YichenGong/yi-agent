@@ -59,6 +59,20 @@ pub(crate) fn parse_action(value: &Value) -> Option<DriverAction> {
     Some(DriverAction { action_id, kind })
 }
 
+/// 插件有没有**明确**答「这一拍无事可做」（契约形状 `{"action": null}`）。
+///
+/// 它必须与「解析不出动作」分得开：`parse_action` 对两者都返回 `None`，可它们的
+/// 日志价值完全相反——前者是正常空闲（每 3s 都会发生，记下来只会淹没日志），
+/// 后者是真的断链（字段漂移、插件比宿主新、应答不是约定形状）。没有这个判据，
+/// 宿主只能「`None` 就当没事」，那正是静默停摆的现场。
+///
+/// 只认契约形状（见 `contract/driver-protocol.json` 的 `answers.nothing`）：
+/// 裸 `null`、`{}`、或 `action` 存在但非 null 都不是约定形状，一律算「说不清」，
+/// 由调用方记一行。
+pub(crate) fn is_explicit_no_action(value: &Value) -> bool {
+    matches!(value.get("action"), Some(Value::Null))
+}
+
 /// 宿主为本插件启动或追加过的会话（宿主自身的通用记账）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DriverThread {
@@ -249,6 +263,25 @@ mod tests {
     #[test]
     fn a_missing_action_id_is_ignored() {
         assert!(parse_action(&json!({ "kind": "launch", "workdir": "/w" })).is_none());
+    }
+
+    /// 「插件明确答了无事可做」必须与「宿主解析不出动作」分得开：前者是正常空闲，
+    /// 后者要留一行日志（否则每 3s 一次的断链在日志里与空闲同型）。
+    #[test]
+    fn only_the_contract_null_answer_counts_as_deliberately_idle() {
+        assert!(is_explicit_no_action(&json!({ "action": null })));
+        // 解析不出动作的几种「说不清」形状都不是约定的空闲形状。
+        for value in [
+            json!(null),
+            json!({}),
+            json!({ "kind": "reboot", "action_id": "a1" }),
+            json!({ "action": { "kind": "reboot" } }),
+        ] {
+            assert!(
+                !is_explicit_no_action(&value),
+                "{value} 不是约定的 `{{\"action\": null}}`，应当留痕"
+            );
+        }
     }
 
     #[derive(Default)]

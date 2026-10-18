@@ -7255,20 +7255,35 @@ async fn driver_tick<F>(
             let scope = project.clone();
             let log_project = project.clone();
             let log_plugin = plugin.clone();
-            let query = move |params: &serde_json::Value| {
-                plugin_query_self(&scope, &plugin, "driver/next", params.clone()).map_err(|error| {
-                    // `driver_step` 把查询失败整体吞成「这一拍不推进」(`Err(_) =>
-                    // return None`),它的签名与语义是插件契约的一部分,这里不改。
-                    // 但失败必须留痕:否则「问了、没打通」与「问了、插件说无事可做」
-                    // 在日志里完全同型,坏清单/daemon 掉线就成了无声停摆。
-                    eprintln!(
-                        "[app-server] driver tick: could not reach {} for {}: {}",
-                        log_plugin,
-                        log_project.display(),
-                        error.message
-                    );
-                    error.message
-                })
+            // 本拍插件的**原样应答**。`driver_step` 把「解析不出动作」与「插件说
+            // 无事可做」都压成 `None`,故要分辨第三种无声失败(问通了、字面能读、
+            // 但对不上契约)只能由调用方自己留一份原答——见下面 `None` 分支的日志。
+            // 闭包按引用捕获它(`driver_step` 只借 `&dyn Fn`,无 `'static` 要求),
+            // 故本拍结束即可读回,不必用线程局部量或全局状态。
+            let last_answer: StdMutex<Option<serde_json::Value>> = StdMutex::new(None);
+            let query = |params: &serde_json::Value| {
+                match plugin_query_self(&scope, &plugin, "driver/next", params.clone()) {
+                    Ok(answer) => {
+                        *last_answer
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(answer.clone());
+                        Ok(answer)
+                    }
+                    Err(error) => {
+                        // `driver_step` 把查询失败整体吞成「这一拍不推进」(`Err(_) =>
+                        // return None`),它的签名与语义是插件契约的一部分,这里不改。
+                        // 但失败必须留痕:否则「问了、没打通」与「问了、插件说无事可做」
+                        // 在日志里完全同型,坏清单/daemon 掉线就成了无声停摆。
+                        eprintln!(
+                            "[app-server] driver tick: could not reach {} for {}: {}",
+                            log_plugin,
+                            log_project.display(),
+                            error.message
+                        );
+                        Err(error.message)
+                    }
+                }
             };
             let outcome = crate::session_driver::driver_step(
                 &query,
@@ -7284,6 +7299,36 @@ async fn driver_tick<F>(
             // 结果就先被问下一步。
             if let Some(result) = outcome {
                 state.results.push(result);
+            } else if state.results.is_empty() {
+                // 第三种无声失败:查询**成功了**,但宿主解析不出动作(字段漂移、
+                // 插件比宿主新、应答根本不是约定形状)。它在 `driver_step` 里与
+                // 「插件说无事可做」同型(都回 `None`),不在这里分辨的话,断链就
+                // 每 3s 无声重复一次。前两种失败(没人可问 / 问不通)已各有日志,
+                // 这里补第三处。
+                //
+                // 两个前提使它不误报:本拍 `results` 为空——非空就说明至少交出了
+                // 一个动作,或上一拍的动作还在等回报;且只认契约形状
+                // `{"action": null}` 为「正常空闲」(见 driver-protocol.json 的
+                // `answers.nothing`),那是唯一能合法回 `None` 的稀有情形。
+                // 剩下仍回 `None` 的,只能是对不上契约的应答。
+                let answer = last_answer
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                if let Some(answer) = answer {
+                    if !crate::session_driver::is_explicit_no_action(&answer) {
+                        let keys = match answer.as_object() {
+                            Some(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
+                            None => "<not a JSON object>".to_string(),
+                        };
+                        eprintln!(
+                            "[app-server] driver tick: {log_plugin} for {} answered driver/next \
+                             with a shape the host cannot parse (top-level keys: {keys}), so this \
+                             tick did nothing",
+                            log_project.display()
+                        );
+                    }
+                }
             }
         }
     }
@@ -9714,6 +9759,78 @@ mod session_driver_tests {
                 && logs.contains(DRIVER_PLUGIN)
                 && logs.contains("/project:"),
             "a failed query must name the plugin and the project: {logs}"
+        );
+    }
+
+    /// 探针(默认跳过):查询**成功**、字面也读得出来,但对不上契约——键名漂移
+    /// (`type` 而非契约里的 `kind`)。一拍 tick。
+    #[test]
+    #[ignore]
+    fn probe_a_driver_answer_the_host_cannot_parse() {
+        let daemon = FakeDaemon::bind(|_project, _method, _params| {
+            Ok(json!({ "action_id": "a1", "type": "launch", "workdir": "/w" }))
+        });
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        install_driver_plugin(&daemon.project, resident_dir.path(), DRIVER_PLUGIN);
+        let mut host = Host::new();
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(host.tick(resident_dir.path(), &mut drivers, &build_test_agent));
+    }
+
+    /// 探针(默认跳过):插件答契约里的 `{"action": null}`——正常空闲。
+    #[test]
+    #[ignore]
+    fn probe_a_driver_that_answers_the_contract_null() {
+        let daemon = FakeDaemon::bind(|_project, _method, _params| Ok(json!({ "action": null })));
+        let resident_dir = tempfile::TempDir::new().unwrap();
+        install_driver_plugin(&daemon.project, resident_dir.path(), DRIVER_PLUGIN);
+        let mut host = Host::new();
+        let mut drivers: HashMap<(PathBuf, String), DriverState> = HashMap::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(host.tick(resident_dir.path(), &mut drivers, &build_test_agent));
+    }
+
+    /// 第三种无声失败:查询**成功**、字面可读,却是宿主解析不出的形状。它与
+    /// 「插件说无事可做」在 `driver_step` 里同型(都回 `None`),不在这里分辨就每
+    /// 3s 无声重复一次。日志须点名插件、项目,并带上原答的顶层键供人看漂移。
+    #[test]
+    fn an_unparseable_driver_answer_leaves_a_log_line() {
+        let logs = logs_of_ignored_probe(
+            "server::session_driver_tests::probe_a_driver_answer_the_host_cannot_parse",
+        );
+        assert!(
+            logs.contains("cannot parse")
+                && logs.contains(DRIVER_PLUGIN)
+                && logs.contains("/project answered driver/next")
+                && logs.contains("action_id")
+                && logs.contains("type"),
+            "an unparseable answer must name the plugin, the project and the keys: {logs}"
+        );
+        assert!(
+            !logs.contains("could not reach"),
+            "答案读得出来,这不是「问不通」那一类: {logs}"
+        );
+    }
+
+    /// 反向对照:契约的 `{"action": null}` 是**正常空闲**,不得被当成断链。
+    ///
+    /// 这条与上一条互为闸门:若把「说不清」与「无事可做」混为一谈(例如去掉
+    /// `is_explicit_no_action` 判定),上一条仍会通过而这一条会因每拍一行噪音而红。
+    #[test]
+    fn a_contract_null_answer_is_not_reported_as_drift() {
+        let logs = logs_of_ignored_probe(
+            "server::session_driver_tests::probe_a_driver_that_answers_the_contract_null",
+        );
+        assert!(
+            !logs.contains("cannot parse"),
+            "契约的空闲形状是正常态,不该被打成断链: {logs}"
         );
     }
 
