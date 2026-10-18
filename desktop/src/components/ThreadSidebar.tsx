@@ -671,13 +671,13 @@ export function ThreadSidebar({
           onOpenBoard(workspace);
         }}
         className={`flex cursor-pointer items-center gap-2 px-3 py-2 text-sm ${
-          active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
+          active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
         }`}
       >
         <span className="shrink-0">看板</span>
         {/* 摘要是这一眼要看的全部：排队几件、在跑几件。 */}
         {boardSummaries[workspace] ? (
-          <span className="truncate text-xs text-neutral-500">{boardSummaries[workspace]}</span>
+          <span className="truncate text-xs text-fg-subtle">{boardSummaries[workspace]}</span>
         ) : null}
       </div>
     );
@@ -897,7 +897,7 @@ export function ThreadSidebar({
                   if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
                   else onCreateBoard(g.workspace);
                 }}
-                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
+                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
               >
                 {kanbanItemFor(g.workspace, boards) ? "移除看板" : "创建 Superpowers 看板"}
               </button>
