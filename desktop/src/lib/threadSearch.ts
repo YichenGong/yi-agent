@@ -63,7 +63,7 @@ export function filterThreadTree(
     const threads = g.threads.filter((t) =>
       tokens.every((tok) => haystack(t, g.workspace, tagNames).includes(tok)),
     );
-    // 分组自身**只**渲染非置顶会话（ThreadSidebar 的 `.filter((t) => !t.pinned && !t.card_id)`）：
+    // 分组自身**只**渲染非置顶会话（ThreadSidebar 的 `.filter((t) => !t.pinned && !t.driver_ref)`）：
     // 置顶会话在 Pinned 区渲染，且按约定仍留在本分组的 `threads` 里。故只有置顶
     // 会话命中时本组一行都渲染不出来，必须连表头一起移除。卡片会话不在此列——
     // 它们由本组自己的「看板会话」小节渲染（搜索期间强制展开，见 renderBoardThreads），

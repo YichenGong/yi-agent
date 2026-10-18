@@ -468,8 +468,8 @@ fn only_the_lead_sees_the_memory_tools() {
             title: Some("组长".to_string()), // 标题写着「组长」也不许算组长
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             preserve_thinking: true,
@@ -1451,7 +1451,7 @@ fn build_test_agent_with_provider(
     })
 }
 
-fn build_slow_agent(
+pub(crate) fn build_slow_agent(
     session: Option<yi_agent_core::Session>,
     _cwd: &std::path::Path,
     _mode: crate::thread_store::ThreadMode,
@@ -1555,8 +1555,8 @@ pub(crate) struct Harness {
     /// 真实的 `~/.yi-agent/models.json`。字段仅用于持有 tempdir。
     pub(crate) _models_dir: tempfile::TempDir,
     /// 隔离的常驻登记目录,理由同 `board_dir`:board/create|remove 不得写
-    /// 真的 `$HOME/.yi-agent`。字段仅用于持有 tempdir。
-    _resident_dir: tempfile::TempDir,
+    /// 真的 `$HOME/.yi-agent`;驱动器测试还要往里注册插件,故 `pub(crate)`。
+    pub(crate) resident_dir: tempfile::TempDir,
     /// 与主循环**共享**的配对状态:测试经 [`Harness::pairing`] 直接 `redeem`,
     /// 所得设备必须能被同一主循环的 `device/list` 看见。
     pairing: Arc<PairingState>,
@@ -1794,7 +1794,7 @@ impl Harness {
             _index_dir: index_dir,
             board_dir,
             _models_dir: models_dir,
-            _resident_dir: resident_dir,
+            resident_dir,
             pairing,
             hub,
             watchman_calls: calls,
@@ -4808,8 +4808,8 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             title: None,
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -6324,8 +6324,8 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             title: None,
             permission_mode: Default::default(),
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -6434,8 +6434,8 @@ async fn a_turn_while_off_persists_without_credentials() {
             title: None,
             permission_mode: Default::default(),
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -6533,8 +6533,8 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             title: None,
             permission_mode: Default::default(),
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -7905,8 +7905,8 @@ fn write_meta(
     dir: &Path,
     id: &str,
     title: &str,
-    board_project: Option<&str>,
-    card_id: Option<&str>,
+    driver_project: Option<&str>,
+    driver_ref: Option<&str>,
 ) {
     let meta = crate::thread_store::ThreadMeta {
         thread_id: id.into(),
@@ -7917,8 +7917,8 @@ fn write_meta(
         title: Some(title.into()),
         permission_mode: crate::thread_store::ThreadMode::Normal,
         pin_seq: None,
-        board_project: board_project.map(str::to_string),
-        card_id: card_id.map(str::to_string),
+        driver_project: driver_project.map(str::to_string),
+        driver_ref: driver_ref.map(str::to_string),
         model_ref: None,
         reasoning_effort: None,
         tag: None,
@@ -7981,7 +7981,7 @@ fn git_kanban_worktree(project: &Path, card_id: &str) -> PathBuf {
     path.canonicalize().unwrap()
 }
 
-/// 卡片会话（cwd 在 worktree、board_project=项目）删除：干净且已并入 → 会话与 worktree 一并消失。
+/// 驱动会话（cwd 在 worktree、driver_project=项目）删除：干净且已并入 → 会话与 worktree 一并消失。
 #[tokio::test(flavor = "multi_thread")]
 async fn deleting_a_card_session_also_removes_its_worktree() {
     let project_dir = tempfile::TempDir::new().unwrap();
@@ -8188,7 +8188,7 @@ async fn deleting_a_card_session_reports_a_failed_worktree_removal() {
     h.shutdown().await;
 }
 
-/// 卡片会话(在 worktree、board_project=项目) 折进项目组；worktree 不再顶层成组。
+/// 驱动会话(在 worktree、driver_project=项目) 折进项目组；worktree 不再顶层成组。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_board_thread_folds_into_its_project_group() {
     let project_dir = tempfile::TempDir::new().unwrap();
@@ -8245,8 +8245,8 @@ async fn a_board_thread_folds_into_its_project_group() {
         .iter()
         .find(|t| t["thread_id"] == "t-card")
         .unwrap();
-    assert_eq!(card["card_id"], "card-1", "wire must expose card_id");
-    assert_eq!(card["board_project"], p.as_str());
+    assert_eq!(card["driver_ref"], "card-1", "wire must expose driver_ref");
+    assert_eq!(card["driver_project"], p.as_str());
     h.shutdown().await;
 }
 
@@ -9441,8 +9441,8 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             title: None,
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
@@ -9552,8 +9552,8 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             title: None,
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,

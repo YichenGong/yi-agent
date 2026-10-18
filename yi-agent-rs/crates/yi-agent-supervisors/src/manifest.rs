@@ -47,6 +47,15 @@ pub struct SupervisorManifest {
     /// field names no plugin and the daemon attaches no meaning to the answers.
     /// `None` means "not queryable", so an older manifest keeps loading.
     pub query_socket: Option<String>,
+    /// Whether this process drives conversations: the host asks it (via the
+    /// plugin query channel) for the next generic session action to perform.
+    /// Generic on purpose -- it names no plugin and the host attaches no
+    /// meaning to the action's contents beyond `launch`/`append`/`null`.
+    /// Defaults to `false`, so an older manifest keeps loading.
+    ///
+    /// The default is enforced where the JSON is actually read, on
+    /// [`RawManifest::session_driver`]; this struct is not itself a serde type.
+    pub session_driver: bool,
 }
 
 const DEFAULT_BACKOFF_MS: u64 = 1000;
@@ -70,6 +79,8 @@ struct RawManifest {
     #[serde(default = "default_stop_when_disabled")]
     stop_when_disabled: bool,
     query_socket: Option<String>,
+    #[serde(default)]
+    session_driver: bool,
 }
 
 impl SupervisorManifest {
@@ -93,6 +104,7 @@ impl SupervisorManifest {
             restart_backoff_max_ms: raw.restart_backoff_max_ms.unwrap_or(DEFAULT_BACKOFF_MAX_MS),
             stop_when_disabled: raw.stop_when_disabled,
             query_socket: raw.query_socket,
+            session_driver: raw.session_driver,
         })
     }
 
@@ -398,5 +410,36 @@ mod tests {
                 .query_socket_path(Path::new("/w"), Path::new("/s"), Path::new("/r"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn session_driver_defaults_to_false_for_a_manifest_without_the_field() {
+        let json = r#"{
+            "name": "demo",
+            "command": "/bin/demo",
+            "args": [],
+            "switch_key": "demo",
+            "restart_backoff_ms": 1000,
+            "restart_backoff_max_ms": 30000,
+            "stop_when_disabled": false
+        }"#;
+        let manifest = SupervisorManifest::parse(json).unwrap();
+        assert!(!manifest.session_driver);
+    }
+
+    #[test]
+    fn session_driver_is_read_when_present() {
+        let json = r#"{
+            "name": "demo",
+            "command": "/bin/demo",
+            "args": [],
+            "switch_key": "demo",
+            "restart_backoff_ms": 1000,
+            "restart_backoff_max_ms": 30000,
+            "stop_when_disabled": false,
+            "session_driver": true
+        }"#;
+        let manifest = SupervisorManifest::parse(json).unwrap();
+        assert!(manifest.session_driver);
     }
 }

@@ -320,8 +320,9 @@ lead 起的 thread 必须遵守项目纪律（本项目即「开始任何动作�
 
 - lead 在侧栏是一个独立条目（IM 式头像），点开是一个与普通 thread 同构的对话框
   （复用 `desktop/src/components/ChatView.tsx`、`ThreadSidebar.tsx`）。
-- lead 名下 thread 的分组：`thread/listAll` 已有「按目录分组 + `board_project`
-  跨目录折拢」的先例（`server.rs:3388`），lead 归属沿用同一形状。
+- lead 名下 thread 的分组：`thread/listAll` 已有「按目录分组 + `driver_project`
+  跨目录折拢」的先例（`server.rs:3388`；字段原名 `board_project`，G1 已通用化为
+  `driver_project`，旧 meta 靠 serde alias 读入），lead 归属沿用同一形状。
 - wire 侧 `thread_summary_json`（`server.rs:5943`）新增 `role` 与 `created_by` 字段。
 
 ### 9.2 移动端远程

@@ -570,8 +570,24 @@ git commit -m "feat(app-server): discover plugins that drive sessions"
 
 ### Task 5: 宿主真实 launcher —— 支持 `append` 到已有会话
 
+> **范围裁决（2026-10-18，人类已批准）**：本任务的 **Files 比下面字面清单更宽**。
+> `worktree_reclaim::decide`（`worktree_reclaim.rs:114`，唯一调用点 `server.rs:4672`）
+> 是这两个 meta 字段**唯一**的语义消费方：它用 `card_id` 推导分支
+> `kanban/<slugify(card_id)>`（`worktree_reclaim.rs:137`）。因此「删 `card_id`」在
+> 技术上绕不开它——只改 `server.rs` + `thread_store.rs` 会让本步的要求落不了地。
+> 裁决：G1 内做**字段名通用化**（`board_project` → `driver_project`、`card_id` → 通用名），
+> 并同步改 `worktree_reclaim` 的**入参名与读法**；`kanban/<slug>` 的**路径与分支约定
+> 保持不变**，其语义重写仍归 G2（spec §7）。依据：spec §2 目标 1「宿主……无
+> `card_id`/`board_project` 专属字段」是 G1 自己的目标；spec §7 只把 `worktree_reclaim.rs`
+> 的 **`card_id`/`kanban` 语义**划给 G2。（旁证：本 plan Task 7 字面写的
+> `DriverAction { … card_id … }` 实际由 Task 2 实现为**不含** `card_id` 的通用版并已过审，
+> 说明把 `card_id` 从宿主面剔除本就是本轮方向。）
+
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent-app-server/src/server.rs`（`ServeLauncher` → `SessionLauncher`）
+- Modify: `yi-agent-rs/crates/yi-agent-app-server/src/thread_store.rs`（`ThreadMeta` 字段名）
+- Modify: `yi-agent-rs/crates/yi-agent-app-server/src/worktree_reclaim.rs`（`decide` 入参名与读法）
+- Modify: `desktop/src/lib/protocol.ts` + `desktop/src/components/ThreadSidebar.tsx`（+ 其 `*.test.tsx` 5 处）
 - Test: `yi-agent-rs/crates/yi-agent-app-server/src/server.rs`（`mod tests`）
 
 **Interfaces:**
@@ -631,11 +647,29 @@ Expected: FAIL（未实现）
 - `DriverActionKind::Append { thread_id, objective }` → 直接 `prepare_and_deliver`；
   thread 不存在 → `Err("unknown thread: {thread_id}")`（回报 `ok:false`，由插件决定重试）。
 
-`launch_inner` 的 meta 落盘字段名去掉 `card_id`/`board_project`：
-- `card_id` → 删（宿主不认识卡片）。
-- `board_project` → 通用 `driver_project`（本插件作用的项目根）。
-- `thread_store` 的 meta 结构若为此需要改，则一并改（`thread_store.rs`），并保留
-  旧字段的**兼容读取**（旧会话仍能被读出）。
+`launch_inner` 的 meta 落盘字段名通用化（**改名，不是删除**）：
+- `board_project` → `driver_project`（被驱动会话所属的项目根）。
+- `card_id` → `driver_ref`（插件给这张工作单元的**不透明**句柄；宿主不解释其含义，
+  只在 worktree 判定时按既有约定使用）。**不得删除**：`worktree_reclaim` 需要它推导
+  `kanban/<slug>` 分支（`worktree_reclaim.rs:137`），而**该语义重写归 G2**（见本任务
+  开头的范围裁决）。删掉它等于把 G2 的工作（改为从 worktree 自身读分支）提前到 G1。
+- `thread_store` 的 meta 结构随之改名，并对旧名保留**兼容读取**：新字段加
+  `#[serde(alias = "board_project")]` / `#[serde(alias = "card_id")]`，使磁盘上的旧
+  meta 仍能被正确读出（本文件既有「零迁移」做法，参见 `preserve_thinking`）。
+- `thread_summary_json`（`server.rs:6116-6117`）与 `desktop/src/lib/protocol.ts:280/282`
+  的**有线键同步改名**（单一名字，不保留双写）；`ThreadSidebar.tsx:600/924` 与
+  `ThreadSidebar.test.tsx` 的 5 处 fixture、`threadSearch.ts/.test.ts` 同步。
+  桌面「看板会话」小节的**文案**不改（属 G2 的桌面面），只改它据以分组的键。
+
+**已知的 G1→G2 过渡缺口（必须显式记录，不得默默留下）**：Task 6 把主循环换成
+`driver_tick` 之后，宿主**不再知道 card id**（这正是 G1 的目标：宿主不认识卡片），
+而 `driver/next` 的 `launch` 应答按 spec §4.3 只带 `workdir`/`title`/`objective`，
+**不带任何 ref**。因此驱动会话的 meta 里 `driver_ref` 会是 `None`，`worktree_reclaim::decide`
+对它们走安全侧分支（不删 worktree）。这不是本任务引入的疏漏，而是 spec §7 明确把
+`worktree_reclaim.rs` 的语义重写划给 G2 的结果：G2 将改为通用
+`managed_worktree`（会话 meta 里的可选通用字段，spec §5/§9）并由插件侧填值。
+**要求**：Task 5 只做改名与兼容读取，**不得**顺手改写 `decide` 的判定语义；
+在 Task 9 的收口里把该缺口写进 `docs/bug-list.md` 或 G2 spec 的承接条目。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -818,6 +852,41 @@ Expected: PASS；`grep -rn "merge_next" plugins/` 无命中
 ```bash
 git add plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/
 git commit -m "refactor(kanban): retire the plugin's bare-git auto merge"
+```
+
+- [ ] **Step 6: 接回独立合并卡（范围裁决，2026-10-18 人类已批准）**
+
+**问题**：`claim_next_merge` 是唯一会给合并卡置 `Merging`/`thread_id` 的地方，随本任务删除后，
+`CardKind::Merge` 的卡失去了执行者。`driver_step` 的合并轮对无会话的卡在第 366-370 行直接
+`continue`，于是 `add-merge`（`main.rs:382`）/ `enqueue_merge`（`dispatch.rs:82`）产出的卡
+（出生即 `Queued`、`thread_id: None`）永久停在队列里：`next_startable` 排除非实现卡、
+`converge::candidates` 只认实现卡、`merge_request` 拒绝 `Queued`、CLI `done` 要求
+`awaiting_merge`——四条路全断，退路只有手改 `board.json`。
+
+**为何必须修**：commit `ffd6e8f7`（2026-10-08）退役**自动派生**合并卡时逐字写明「保留
+merge_next/claim_next_merge/add-merge 与 CardKind::Merge——**存量独立合并卡仍按原逻辑收尾**」。
+即这是一条**刻意保留**的通路，本任务删 `claim_next_merge` 掐断了它唯一的执行者，属回归。
+另：spec §8 第 11 条验收原文「投两张实现卡 + **两张合并卡**」可能正指独立合并卡，
+故不得改为「退役产卡端」。
+
+**修法**（裁决：把独立合并卡接进会话合并轮；不新增宿主原语，只用 `launch`/`append`）：
+1. 合并轮候选集纳入 `Queued` + `CardKind::Merge`（今日只收 `AwaitingMerge`/`NeedsYou`）。
+2. `merge_request` 对 `kind == Merge` 的 `Queued` 卡放行（它没有会话，不需要 idle 门）。
+3. `driver_step` 第 366-370 行改为：有 `thread_id` → `Append`（现状）；**无 `thread_id` → `Launch`**，
+   `workdir` 取 `Granted.workdir`、`objective` 取 `tick::merge_objective(source, base, workdir)`。
+4. 需要一个「launch-for-merge」的 `PendingKind`：结果回报只 `set_thread_id` 落映射，
+   **不得**把已是 `Merging` 的卡翻回 `running`（`Queued → Merging` 已被状态机允许，见
+   `card.rs:78`）。
+
+**Step 6 的测试**：一张 `Queued` 的 `kind == Merge` 卡（无 thread）→ `driver_step` 交出
+`Launch`（workdir/objective 断言）、卡转 `Merging`；下一拍回传 `ok:true` + `thread_id` →
+卡仍是 `Merging` 且记下了 thread；再下一拍 idle → 走 `merge_finish` 复核（真/假两支）。
+
+**Step 6 的提交**：
+
+```bash
+git add plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/
+git commit -m "feat(kanban): drive a standalone merge card through a session merge round"
 ```
 
 ---
