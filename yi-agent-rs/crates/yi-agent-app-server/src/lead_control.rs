@@ -79,6 +79,10 @@ impl Default for LeadControlInbox {
     }
 }
 
+/// 等待中的写结果回填端：`request_id` → 结果。抽成别名是为了满足
+/// `clippy::type_complexity`（裸的嵌套泛型超过阈值）。
+type Waiting = Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>;
+
 /// 写结果的登记表。形状照抄 `lead::LeadReplies`：投递方登记 `oneshot` 后 await，
 /// 主循环执行完回填 `Ok(执行摘要)` 或 `Err(失败原因)`。
 ///
@@ -86,7 +90,7 @@ impl Default for LeadControlInbox {
 /// 失败必须让组长看到，不能伪装成成功。
 #[derive(Clone, Default)]
 pub struct LeadControlReplies {
-    waiting: Arc<Mutex<HashMap<String, oneshot::Sender<Result<String, String>>>>>,
+    waiting: Waiting,
 }
 
 impl LeadControlReplies {

@@ -7,6 +7,12 @@ pub(crate) mod git_diff;
 pub mod git_diff_tool;
 pub mod image_upload;
 pub mod lead;
+// 本模块的类型是**契约里预留、消费方尚未接线**的(见 spec §6.1 的分期):
+// Task 2 的两个组长工具、Task 3 的主循环 `apply_lead_control` 才会用到它们,
+// 接线前 clippy 会把整个模块判成 dead_code,故在此放行。
+// **Task 2/3 合入后必须删掉这行 allow**——那时模块内已无未接线项,留着会
+// 掩盖真实的死代码。
+#[allow(dead_code)]
 pub(crate) mod lead_control;
 pub(crate) mod lead_loop;
 pub mod lead_memory;
