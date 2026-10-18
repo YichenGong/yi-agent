@@ -83,7 +83,7 @@
     #[test]
     fn a_pre_queued_id_falls_back_and_gets_a_suffix_on_collision() {
         let mut board = Board::new();
-        assert_eq!(board.next_free_prequeued_id("idea"), CardId::new("idea"));
+        assert_eq!(board.next_free_prequeued_id("idea", at(1, 0)), CardId::new("idea"));
         // `slug()` 只保留 ASCII 字母数字，中文标题会 slug 成空串——此时回退到
         // 带时间戳的 id，绝不能全部塌成同一个 `prequeued`（否则每张卡同 id，
         // 追踪就废了，且 worktree 分支名会互撞）。
@@ -95,7 +95,7 @@
         let other = board.next_free_prequeued_id("另一个想法", at(1, 1));
         assert_ne!(fallback, other, "两张中文标题的卡必须拿到不同 id");
         board.enqueue_prequeued(CardId::new("idea"), "idea".into(), at(1, 0));
-        assert_eq!(board.next_free_prequeued_id("idea"), CardId::new("idea-2"));
+        assert_eq!(board.next_free_prequeued_id("idea", at(1, 1)), CardId::new("idea-2"));
     }
 
     #[test]
