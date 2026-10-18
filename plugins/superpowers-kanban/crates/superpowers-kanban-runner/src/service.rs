@@ -291,6 +291,26 @@ impl BoardService {
         //    只有这一个来源，spec D5）。重复投递的回报找不到待办条目 → 忽略。
         self.consume_results(results);
 
+        // 1.5) 找回「宿主不认的会话」：让重启不再把在飞卡片永久搁浅。
+        //
+        // `DriverState`（含它记的 `threads`）只活在宿主的**内存**里；`thread_id`
+        // 又是**只**经 `results` 回到插件的。宿主一重启，它给插件的 `threads` 就是
+        // 空数组，`idle_of` 对每张卡都回 `None`，而下面所有落定路径都要求
+        // `Some(true)`——`Running`/`Launching`/`Merging` 的卡就再无出路。最坏的是
+        // `Merging`：`merge.lock` 只在那张卡是 `Merging` 时被占着（合并在跑），
+        // 它搁浅就等于这个项目的**唯一合并名额**永远不释放，此后任何合并都悄无声息
+        // 地开不了局。
+        //
+        // 规则（保守、有界）：一张卡**有** `thread_id`、宿主在 `threads` 里**完全
+        // 没有**报它，且它**没有在飞的动作**（`results` 已消费、回报已落账——
+        // 说明宿主不是「还没轮到答」，而是这一轮根本没答、也不记得它），就把它收成
+        // `NeedsYou` 并写明判词、释放名额。
+        //
+        // 为何是 `NeedsYou` 而不是自动重启会话：重启可能造出第二个会话来跑同一张卡
+        // （重复干活、重复花模型钱），而把事实摆到人面前是诚实的，且立刻终止「永远
+        // 卡住」这个无声状态。有在飞动作的卡**绝不**动——它正在等这一拍的回报。
+        self.recover_cards_the_host_forgot(threads);
+
         // 2) 合并轮收尾：`merging` 卡的会话再次空闲 → 交既有的 git 复核
         //    （`merge_finish`）裁定，绝不信模型自述。
         for card in cards.iter().filter(|card| card.state == CardState::Merging) {
@@ -611,6 +631,66 @@ impl BoardService {
             .values()
             .find(|pending| &pending.card_id == card_id)
             .map(|pending| pending.kind)
+    }
+
+    /// 该卡是否有**任一**还没回报的在飞动作。
+    ///
+    /// 与 `pending_kind` 同源，但这里问的是**存在性**：恢复规则只关心「这张卡此刻
+    /// 有没有动作在等宿主回话」，不关心它是什么动作。
+    fn has_pending(&self, card_id: &CardId) -> bool {
+        self.lock()
+            .pending_actions
+            .values()
+            .any(|pending| &pending.card_id == card_id)
+    }
+
+    /// 收殓「宿主已遗忘的会话」：卡片带着 `thread_id`，宿主这一拍的 `threads`
+    /// 里却完全没有它——宿主重启后 `DriverState` 清空，插件手里的映射还在，两边
+    /// 就此失联；插件侧的落定路径全要 `Some(true)`，卡片便永久搁浅。
+    ///
+    /// 只在**没有在飞动作**（`has_pending` 为假）时收殓：有在飞动作的卡正等这一
+    /// 拍的回报，宿主「这一拍还没轮到答」与「根本不记得」在插件看来同型，误收会把
+    /// 一次正常在飞的启动判死。收成 `NeedsYou`（带判词）而不是自动重开会话：重开
+    /// 可能造出第二个会话重复跑同一张卡，把事实摆到人面前才是诚实的收场。
+    ///
+    /// `Merging` 卡一并收殓：它是合并名额（`merge.lock`）的持久载体，搁浅即名额
+    /// 永不释放——这个项目的后续合并在无声中全部开不了局。
+    fn recover_cards_the_host_forgot(&self, threads: &[(String, bool)]) {
+        let stranded: Vec<(CardId, String)> = self
+            .locked_cards()
+            .into_iter()
+            .filter(|card| matches!(card.state, CardState::Running | CardState::Merging))
+            .filter_map(|card| {
+                let thread_id = card.thread_id.clone().filter(|id| !id.is_empty())?;
+                (idle_of(threads, &thread_id).is_none()).then_some((card.id, thread_id))
+            })
+            .filter(|(card_id, _)| !self.has_pending(card_id))
+            .collect();
+        for (card_id, thread_id) in stranded {
+            if let Err(error) = self.mark_needs_you(
+                &card_id.0,
+                &format!(
+                    "host no longer tracks session {thread_id}; the session is gone after a \
+                     restart, so this card needs a fresh look"
+                ),
+            ) {
+                eprintln!(
+                    "superpowers-kanban: could not recover {}: {error}",
+                    card_id.0
+                );
+            }
+        }
+    }
+
+    /// 把一张卡收成 `NeedsYou` 并写上判词（「这张卡为什么停在这」的可读答案）。
+    ///
+    /// `mark_terminal` 只认 `awaiting_merge`/`needs_you`/`failed` 三种结果，而
+    /// `Merging → NeedsYou` 时它顺带清掉 `merge_retries`（那张卡已不在**可自动
+    /// 重试的合并失败**这条路上——它是被找回的孤儿，不该被有界重试悄悄拖回合并轮）。
+    fn mark_needs_you(&self, card_id: &str, detail: &str) -> Result<(), String> {
+        let id = CardId::new(card_id);
+        self.lock().merge_retries.remove(&id);
+        self.mark_terminal(card_id, "needs_you", Some(detail))
     }
 
     /// 自动归档「已到终态且超过宽限期」的卡；返回被归档的 id。
@@ -2036,11 +2116,14 @@ mod tests {
                 .is_none()
         );
         assert_eq!(state_of(&service, "card-1"), "running", "还忙就不动它");
+        // 宿主**完全没报**这台会话（重启后它不记得任何 thread）：不再「不动它」，
+        // 而是按恢复规则收成 `needs_you`（见
+        // `driver_step_recovers_cards_whose_session_the_host_no_longer_reports`）。
         assert!(service.driver_step(&[], &[]).unwrap().is_none());
         assert_eq!(
             state_of(&service, "card-1"),
-            "running",
-            "宿主不认识的会话不动它"
+            "needs_you",
+            "宿主不认的会话必须被找回，不再无声搁浅"
         );
     }
 
@@ -2203,9 +2286,14 @@ mod tests {
         assert_eq!(state_of(&service, "card-1"), "done");
     }
 
-    /// 宿主账上没有这台会话 → 判不了它跑完没有，不动（与宿主旧 `plan()` 同型）。
+    /// 宿主账上没有这台会话，而这张 `merging` 卡**没有任何在飞动作** → 收成
+    /// `needs_you`（恢复规则），不再永久搁浅。
+    ///
+    /// `merging` 是合并名额的持久载体：它搁浅等于本项目再也不能开局合并。搁浅的
+    /// 合并会话查不出 git 事实（合并可能只做了一半），故判词只陈述「宿主不再跟踪
+    /// 这台会话」，不冒充 git 复核的结论。
     #[test]
-    fn driver_step_leaves_an_untracked_merging_card_alone() {
+    fn driver_step_recovers_an_untracked_merging_card_instead_of_stranding_it() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_with_worktree(dir.path());
         let (service, source) = service_with_awaiting_card(&project);
@@ -2216,7 +2304,141 @@ mod tests {
         ));
 
         assert!(service.driver_step(&[], &[]).unwrap().is_none());
+        assert_eq!(state_of(&service, "card-1"), "needs_you");
+        let detail = detail_of(&service, "card-1").expect("判词必须可读");
+        assert!(
+            detail.contains("thread-1") && detail.contains("no longer tracks"),
+            "判词要点名失联的会话：{detail}"
+        );
+        // 名额随之释放，且**不**被记成「合并轮失败退回来的 needs_you」——
+        // 否则有界重试会把它悄悄拖回合并轮。
+        assert_eq!(service.merge_retry_count(&CardId::new("card-1")), 0);
+    }
+
+    /// 直接摆一张卡的 `state` 与 `thread_id`（绕过正常通路）。
+    ///
+    /// 恢复规则要逐一验三种在飞状态，而正常通路里每张卡都有自己的前提
+    /// （分支、会话、动作回报），逐个复刻只会把规则本身淹掉。
+    fn seed_card(service: &BoardService, id: &str, state: CardState, thread_id: &str) {
+        let card_id = CardId::new(id);
+        let mut inner = service.lock();
+        inner.board.enqueue(
+            card_id.clone(),
+            PathBuf::from(format!("{id}.spec.md")),
+            PathBuf::from(format!("{id}.plan.md")),
+            chrono::Local::now(),
+        );
+        // 三态都能从 `Queued` 一步到达（`card.rs` 的迁移表）。
+        inner
+            .board
+            .transition(&card_id, state)
+            .expect("queued → state 必须合法");
+        inner
+            .board
+            .set_thread_id(&card_id, thread_id.to_string())
+            .unwrap();
+        service.save(&inner);
+    }
+
+    /// 宿主重启后 `DriverState`（含它记的 `threads`）清空，而插件手里的
+    /// `thread_id` 还在：`idle_of` 对每张卡都回 `None`，所有落定路径又都要求
+    /// `Some(true)`——`Running`/`Merging` 的卡就此永久搁浅。
+    ///
+    /// 规则：宿主**完全没报**这台会话、且**没有在飞动作**（回报已消费——宿主不是
+    /// 「还没轮到答」而是根本不记得）→ 收成 `NeedsYou` 并写明判词。
+    ///
+    /// 这里顺带钉住最坏的那一面：搁浅的 `Merging` 卡占着本项目**唯一**的合并名额
+    /// （`any_merging()`），它被收走之后，另一张本来合格的合并卡必须**在同一拍**
+    /// 拿到名额——否则「这个项目从此再也合不了并」会一直无声下去。
+    #[test]
+    fn driver_step_recovers_cards_whose_session_the_host_no_longer_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_without_cards(&project);
+        seed_card(&service, "run-1", CardState::Running, "thread-run");
+        seed_card(&service, "merge-1", CardState::Merging, "thread-merge");
+        // 一张本来合格的独立合并卡：它在等被搁浅的 merge-1 让出名额。
+        git_run(&project, &["branch", "kanban/wait-source"]);
+        service.enqueue_merge_card_for_test("wait-1", "kanban/wait-source", "main", None);
+
+        // 宿主重启后的第一拍：threads 是空的（它谁都不认识），results 也是空的。
+        let action = service.driver_step(&[], &[]).unwrap();
+
+        for (id, thread) in [("run-1", "thread-run"), ("merge-1", "thread-merge")] {
+            assert_eq!(
+                state_of(&service, id),
+                "needs_you",
+                "宿主不认的会话必须被找回：{id}"
+            );
+            let detail = detail_of(&service, id).expect("判词必须可读");
+            assert!(
+                detail.contains(thread) && detail.contains("no longer tracks"),
+                "判词要点名失联的会话：{detail}"
+            );
+        }
+        assert!(
+            state_of(&service, "merge-1") != "merging",
+            "搁浅的 `merging` 卡不能继续占着本项目唯一的合并名额"
+        );
+        // 名额确实到手了：同拍的合并轮开局把它交给了等待中的那张卡。
+        assert_eq!(
+            state_of(&service, "wait-1"),
+            "merging",
+            "释放的名额被下一张合格卡接手"
+        );
+        let action = action.expect("名额释放后，等待中的合并卡应当在同一拍拿到它");
+        assert!(
+            matches!(&action, DriverAction::Launch { card_id, .. } if card_id == "wait-1"),
+            "沉默的名额必须立刻被下一张合格卡接手：{action:?}"
+        );
+    }
+
+    /// 上一条的**反向闸门**：有在飞动作的卡绝不能被动。
+    ///
+    /// 宿主「这一拍还没轮到答」与「根本不记得」在插件看来同型；若把前者也收掉，
+    /// 一个刚投递、正在跑的合并回合会被判死。这里的卡 `merging`（名额的持久载体）
+    /// 且刚交出一个 `append`，`results` 里还没有它的回报。
+    #[test]
+    fn driver_step_does_not_recover_a_card_with_an_action_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        let action = service
+            .driver_step(&idle(&["thread-1"]), &[])
+            .unwrap()
+            .expect("an append");
+        let DriverAction::Append { action_id, .. } = action else {
+            panic!("expected an append")
+        };
         assert_eq!(state_of(&service, "card-1"), "merging");
+
+        // 宿主重启后的第一拍：空 threads、空 results，可动作还在飞 → 不找回。
+        assert!(service.driver_step(&[], &[]).unwrap().is_none());
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "merging",
+            "这一轮的回报还没到，绝不能判死"
+        );
+
+        // 回报到了（回合确已投递），宿主的账却仍没有这台会话 → 这就不再是
+        // 「还没轮到答」，而是宿主真的忘了它 → 此时才找回。
+        service
+            .driver_step(
+                &[],
+                &[DriverResult {
+                    action_id,
+                    ok: true,
+                    thread_id: Some("thread-1".to_string()),
+                    error: None,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "needs_you",
+            "回报已消费而宿主仍不认这台会话，才算失联"
+        );
     }
 
     /// D12/D5：launch 结果带回 `thread_id` → `mark_running`（映射由插件持有）。
@@ -2356,6 +2578,10 @@ mod tests {
     }
 
     /// at-least-once：同一条回报重复投递只生效一次，且不重复占名额。
+    ///
+    /// 宿主**仍认得**这台会话（它把 `thread-1` 报了回来且报「忙」），故恢复规则
+    /// 不介入（那一类见 `driver_step_does_not_recover_a_card_with_an_action_in_flight`）；
+    /// 本用例只管回报的幂等：第二条同 id 的回报找不到待办条目、原地落空。
     #[test]
     fn driver_step_ignores_a_redelivered_launch_result() {
         let dir = tempfile::tempdir().unwrap();
@@ -2375,7 +2601,7 @@ mod tests {
         };
         assert!(
             service
-                .driver_step(&[], std::slice::from_ref(&result))
+                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result))
                 .unwrap()
                 .is_none()
         );
@@ -2383,7 +2609,7 @@ mod tests {
         // 重复投递：不报错、不改状态、不多占一个名额。
         assert!(
             service
-                .driver_step(&[], std::slice::from_ref(&result))
+                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result))
                 .unwrap()
                 .is_none()
         );
