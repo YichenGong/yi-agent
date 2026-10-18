@@ -7592,10 +7592,22 @@ where
             {
                 Ok(prepared) => prepared,
                 Err(error) => {
-                    // 准备失败:把占位清掉,否则该 thread 的 `active_turn_id` 永久卡住。
-                    if let Some(session) = self.threads.get_mut(thread_id) {
-                        session.active_turn_id = None;
-                    }
+                    // **绝不在这里碰 `active_turn_id`**(曾有一版在此清占位,是错的)。
+                    //
+                    // `prepare_turn_core` 只在**最后一步**(复制附件成功之后)才写占位
+                    // (`server.rs` 的「占位(复制成功之后)」),而它所有失败返回
+                    // (`UnknownThread` / `TurnInProgress` / `InvalidAttachment` /
+                    // `InvalidImage` …)都在那之前,之后没有任何可能失败的步骤。所以
+                    // 走到这里意味着**本次调用从未设定过占位**:该 thread 上的
+                    // `active_turn_id` 只可能属于**另一个正在跑的 turn**——追问轮撞上
+                    // 忙会话的 TOCTOU(spec §10)。
+                    //
+                    // 清零它就是把那个活 turn 变成无主:`turn/cancel` 静默失效、
+                    // `interrupt_and_wait_for_persist` 立即返回(`thread/delete` 于是可能
+                    // 拆掉一个还在跑的会话)、`is_idle` 谎报空闲(下一拍驱动会收到假的
+                    // 「这轮已结束」)。spec §10 对本行的处置只有一条:干净地回报
+                    // `ok:false`,对既有会话零副作用。
+                    //
                     // 把具体原因带上:调用方只把它写进 `{ok:false, error}`,
                     // 「准备失败」四个字不足以定位(是 thread 不在?还是 turn 撞车?)。
                     return Err(anyhow::anyhow!(
@@ -7604,6 +7616,20 @@ where
                     ));
                 }
             };
+        // 照 spec §4.4 的可见性要求:两个动作(首轮与追问轮)都发 `turn/started`,
+        // 且与 `turn/start` 的 RPC 路径同序——它是该轮的第一帧。这是 thread-keyed
+        // 的**内容通知**,不是 RPC 响应帧(不引入任何 `write_response`):桌面
+        // `desktop/src/lib/session.ts` 用它断开 reasoning run 并置 `turnActive`,
+        // 少了它,被驱动会话在侧栏里「运行中」的标志就只剩余额更弱的
+        // `thread/status/updated`。
+        write_notification(
+            &hub,
+            &Notification::TurnStarted {
+                thread_id: prepared.thread_id.clone(),
+                turn_id: prepared.turn_id.clone(),
+            },
+        )
+        .await?;
         // 状态走 `thread/status/updated`(通知),不是向某个 client 的响应,故可发:
         // 侧栏据此看到该会话正在跑。用 prepared 的句柄,保证与 `active_turn_id`
         // 的占位来自同一个 session。
@@ -9442,7 +9468,7 @@ mod plugins_tests {
 #[cfg(test)]
 mod card_scheduling_tests {
     use super::*;
-    use crate::server::tests::{build_test_agent, test_config};
+    use crate::server::tests::{build_slow_agent, build_test_agent, test_config};
     use crate::server::tests_support::isolated_models_path;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
@@ -10148,6 +10174,14 @@ mod card_scheduling_tests {
         let mut frames = host
             .hub
             .register(crate::broadcast::ClientId::ws(uuid::Uuid::new_v4()));
+        // launcher 的客户端身份就是 `ClientId::local()`(`launch_inner` 里构造),而
+        // **响应帧**经 `hub.reply(client, …)` 定向投递——**未登记的 client 会被直接
+        // 丢弃**(`Broadcaster::reply` 对未知 id 返回 `Closed`)。所以只注册一个 ws
+        // client 的旧版断言,只能证明「广播里没有响应帧」,证明不了「宿主没发响应帧」。
+        // 把 local 也登记进来,响应帧才会落进一个真正被观察的队列。
+        let mut local_frames = host
+            .hub
+            .register_reliable(crate::broadcast::ClientId::local());
 
         // ① 先起一个会话(launch 动作)。
         let thread_id = {
@@ -10214,9 +10248,10 @@ mod card_scheduling_tests {
             "append must not create a second session on disk"
         );
 
-        // ③ 可见性只走 thread-keyed 通知:本轮与首轮一样,开启项是「用户提问」,
-        //    且全程没有任何 RPC 响应帧(响应帧不是 notification,这里只可能看到
-        //    notification envelope)。
+        // ③ 可见性走 thread-keyed 通知(spec §4.4):append 轮必须与首轮一样,发出
+        //    `turn/started`(桌面用它断开 reasoning run 并置 `turnActive`)以及开启项
+        //    (用户提问=插件给的 objective)。`turn/started` 是**内容通知**,不是 RPC
+        //    响应帧——它经 `broadcast` 扇出,而非 `reply` 定向应答。
         let mut seen = Vec::new();
         while let Ok(v) = frames.try_recv() {
             assert!(
@@ -10234,6 +10269,44 @@ mod card_scheduling_tests {
                 && text.as_deref() == Some("now merge it")),
             "the appended objective must open the new turn: {seen:?}"
         );
+        assert!(
+            seen.iter().any(|(method, _)| method == "turn/started"),
+            "the append must announce the turn it starts (spec §4.4 visibility): {seen:?}"
+        );
+
+        // ④ 现在这个断言才真的能证明「没有响应帧」:launcher 的客户端身份是
+        //    `ClientId::local()`,上面已把它登记进 hub。**响应帧**经 `hub.reply`
+        //    定向投递,未登记的 client 会被静默丢弃——旧版只注册 ws client,响应帧
+        //    根本不会出现在任何被观察的队列里,那句断言其实只覆盖了广播。
+        //
+        //    这里对 local 队列用「有没有 `id`」来判:响应信封(`ResponseEnvelope`)
+        //    必带 `id` 且无 `method`,通知信封反之。local 同时也会收到广播,所以不能
+        //    断言它「空」——但可以断言它里面**没有一帧是响应**。
+        let mut local_seen = Vec::new();
+        while let Ok(v) = local_frames.try_recv() {
+            local_seen.push(v);
+        }
+        assert!(
+            local_seen.iter().all(|v| v.get("id").is_none()),
+            "the launcher must not answer any RPC client: a response frame reached local: {local_seen:?}"
+        );
+
+        // 正向对照(判别力证明):这条观察通道**确实**看得见响应帧。手工写一帧响应
+        // 给 local,它必须落到同一个队列里——否则上面的断言就是在断言「没观察」。
+        write_response(
+            &host.hub,
+            &crate::broadcast::ClientId::local(),
+            ok_response(RequestId::Num(1), json!({})),
+        )
+        .await
+        .expect("the observed local client is registered, so the reply must land");
+        let probe = local_frames
+            .try_recv()
+            .expect("a written response must land in the observed local queue");
+        assert!(
+            probe.get("id").is_some() && probe.get("method").is_none(),
+            "the control frame must look like a response, not a notification: {probe}"
+        );
 
         // 收尾这一轮,确认它真的被 driver 消费(而不只是占了个位)。
         assert!(
@@ -10243,6 +10316,85 @@ mod card_scheduling_tests {
         assert!(
             host.is_idle(&thread_id),
             "after the appended turn settles the thread is idle again"
+        );
+    }
+
+    /// **追问轮撞上忙会话**(spec §10 的 append TOCTOU 行):宿主必须干净地拒绝,
+    /// 且**不得碰**那个活 turn 的任何记账。
+    ///
+    /// 这是 Finding 1 的回归测试。旧实现在 `prepare_and_deliver` 的失败分支里清
+    /// `active_turn_id`,而 `prepare_turn_core` 只在**最后一步**才写占位——失败返回
+    /// 全都发生在那之前,故那次清零只能清掉**别人的**占位:这里的活 turn 会因此
+    /// 变成无主 turn(`turn/cancel` 静默失效、`is_idle` 谎报空闲),与 spec §10
+    /// 「`ok:false`、零副作用」相悖。
+    ///
+    /// 用 `build_slow_agent`:`SlowProvider` 的 delta 流不收敛,首轮**永不结束**,
+    /// 于是「有活 turn」是这一条测试真实造出来的状态(而非靠手写占位)。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_append_into_a_busy_thread_fails_without_touching_the_live_turn() {
+        let mut host = Host::new();
+        let workdir = host.workdir.clone();
+        let workdir = workdir.to_string_lossy().to_string();
+
+        // ① 起一个会话,它的首轮**一直在跑**(slow provider)。
+        let thread_id = {
+            let mut launcher = host.launcher(&build_slow_agent);
+            launch_via_driver(&mut launcher, &workdir, "看板 · card-1", "run forever")
+                .await
+                .expect("a healthy factory must start the session")
+        };
+        let live_turn = host
+            .threads
+            .get(&thread_id)
+            .and_then(|s| s.active_turn_id.clone())
+            .expect("the slow first turn must be占位");
+        assert!(
+            !host.is_idle(&thread_id),
+            "a thread with a live turn must not be reported idle"
+        );
+
+        // ② 现在对它做一次 `append`:必须失败,而且是「turn 撞车」这个具体原因。
+        let error = {
+            let mut launcher = host.launcher(&build_slow_agent);
+            SessionLauncher::launch(
+                &mut launcher,
+                &DriverAction {
+                    action_id: "act-append".into(),
+                    kind: DriverActionKind::Append {
+                        thread_id: thread_id.clone(),
+                        objective: "a second round".to_string(),
+                    },
+                },
+            )
+            .await
+            .expect_err("an append into a busy thread must be refused, not queued")
+        };
+        assert!(
+            error.to_string().contains("turn already in progress"),
+            "the plugin must learn the real reason (busy, not unknown thread): {error}"
+        );
+
+        // ③ **本测试的核心**:那个活 turn 的记账原封不动。
+        let session = host.threads.get(&thread_id).expect("the session survives");
+        assert_eq!(
+            session.active_turn_id.as_deref(),
+            Some(live_turn.as_str()),
+            "a refused prepare must not untrack the live turn it never owned"
+        );
+        assert!(
+            !host.is_idle(&thread_id),
+            "the busy session must still be reported busy afterwards"
+        );
+        assert_eq!(host.threads.len(), 1, "no session may be created or lost");
+
+        // ④ 被拒的那次调用**没有**为该 thread 开新的一轮(没有第二个占位)。
+        //    只此一处活跃 turn id,且仍是原来那个。
+        assert_eq!(
+            host.threads
+                .get(&thread_id)
+                .map(|s| s.active_turn_id.clone()),
+            Some(Some(live_turn)),
+            "exactly the original live turn remains"
         );
     }
 
@@ -11301,7 +11453,11 @@ pub(crate) mod tests {
         })
     }
 
-    fn build_slow_agent(
+    /// 一个**永不结束**的 turn 的工厂(`SlowProvider` 的 delta 流不收敛)。
+    ///
+    /// `pub(crate)` 是为了让同文件里的 `card_scheduling_tests` 也能造出「活 turn」
+    /// ——追问轮撞上忙会话的那条路径(Finding 1 回归)需要一个真的跑着不结束的会话。
+    pub(crate) fn build_slow_agent(
         session: Option<yi_agent_core::Session>,
         _cwd: &std::path::Path,
         _mode: crate::thread_store::ThreadMode,
