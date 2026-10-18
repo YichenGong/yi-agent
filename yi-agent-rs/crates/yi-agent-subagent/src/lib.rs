@@ -1822,6 +1822,39 @@ fn abort_unconsumed_fork(socket: &Path, fork_token: &Option<String>) {
     }
 }
 
+/// Turns a spawn response into the tool result both spawn tools return.
+///
+/// Shared because the two tools differ only in which IPC request they send; the
+/// response handling -- the queued payload, the abort of an unconsumed fork on
+/// rejection, and the daemon-unavailable error -- is identical. Keeping it in one
+/// place is what stops the `forked` contract from drifting between them.
+fn spawn_outcome(
+    response: Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>,
+    socket: &Path,
+    fork_token: &Option<String>,
+    objective: &str,
+) -> ToolResult {
+    match response {
+        Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
+            json!({
+                "task_id": task_id,
+                "objective": objective,
+                "status": "queued",
+                "forked": fork_token.is_some(),
+            })
+            .to_string(),
+        ),
+        Ok(other) => {
+            abort_unconsumed_fork(socket, fork_token);
+            ToolResult::error(format_ipc_rejection("spawn request", &other))
+        }
+        Err(error) => {
+            abort_unconsumed_fork(socket, fork_token);
+            ToolResult::error(format!("daemon is unavailable: {error}"))
+        }
+    }
+}
+
 /// Resolves the `fork_token` a spawn request should carry: uploading the
 /// caller's transcript when `fork` is set, and `None` otherwise.
 ///
@@ -1982,19 +2015,7 @@ impl Tool for DaemonApplicationSpawnAgentTool {
                 fork_token: fork_token.clone(),
             },
         );
-        match response {
-            Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
-                json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
-            ),
-            Ok(other) => {
-                abort_unconsumed_fork(&handle.socket_path, &fork_token);
-                ToolResult::error(format_ipc_rejection("spawn request", &other))
-            }
-            Err(error) => {
-                abort_unconsumed_fork(&handle.socket_path, &fork_token);
-                ToolResult::error(format!("daemon is unavailable: {error}"))
-            }
-        }
+        spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
     }
 }
 
@@ -2254,19 +2275,7 @@ impl Tool for DaemonSpawnAgentTool {
                 fork_token: fork_token.clone(),
             },
         );
-        match response {
-            Ok(yi_agent_store::ipc::IpcResponse::TaskSpawned { task_id }) => ToolResult::text(
-                json!({ "task_id": task_id, "objective": task, "status": "queued" }).to_string(),
-            ),
-            Ok(other) => {
-                abort_unconsumed_fork(&handle.socket_path, &fork_token);
-                ToolResult::error(format_ipc_rejection("spawn request", &other))
-            }
-            Err(error) => {
-                abort_unconsumed_fork(&handle.socket_path, &fork_token);
-                ToolResult::error(format!("daemon is unavailable: {error}"))
-            }
-        }
+        spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
     }
 }
 
