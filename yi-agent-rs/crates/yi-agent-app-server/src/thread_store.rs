@@ -121,25 +121,29 @@ fn default_true() -> bool {
     true
 }
 
-/// 看板卡片 worktree 的**约定落点**:`<vcs 根>/.worktrees/kanban/<slug>`。
+/// 看板（kanban 插件）预建的 worktree 的**约定落点**，即 `.worktrees/kanban*`
+/// 这一段下的所有目录：卡片会话的 `.worktrees/kanban/<slug>`，以及合并轮把 base
+/// 检出到 `.worktrees/kanban-merge/<slug>`（仅当 base 未被任何 worktree 检出时）。
 ///
-/// 卡片会话的 cwd 就是这里(插件 `worktree::worktree_path` 与宿主
-/// `worktree_reclaim::decide` 用的是同一条路径)。这类目录**不是一个项目**:
-/// 它没有组长,也不该出现在侧栏的顶层目录组里。
+/// 卡片会话的 cwd 是前者（插件 `worktree::worktree_path` 与宿主
+/// `worktree_reclaim::decide` 用的是同一条路径）；独立合并卡的新会话起在后者
+/// （插件 `merge::prepare`）。两类目录**都不是一个项目**：它们没有组长，也不该
+/// 出现在侧栏的顶层目录组里——它们是看板替用户划出来的临时领地。
 ///
-/// 为什么按「路径里含 `.worktrees/kanban` 这一段」判,而不是按 meta 的
-/// `board_project`/`card_id`:判定要能作用于**任意**一条 meta,包括真机里已经
-/// 落错的那些幽灵组长(`role:"lead"` 且 `board_project: None`)——它们只有路径
-/// 这条线索。反过来,一个恰好带 `card_id` 的会话若 cwd 不在该约定之下,便不是
-/// 卡片 worktree,照旧当普通会话。
-pub fn is_card_worktree(cwd: &Path) -> bool {
+/// 为什么按「路径里含 `.worktrees/kanban*` 这一段」判，而不是按 meta 的
+/// `driver_project`/`driver_ref`：判定要能作用于**任意**一条 meta，包括真机里
+/// 已经落错的那些幽灵组长（`role:"lead"` 且 `driver_project: None`）——它们只有
+/// 路径这条线索。反过来，一个恰好带 `driver_ref` 的会话若 cwd 不在该约定之下，
+/// 便不是看板 worktree，照旧当普通会话。用户自己的 `.worktrees/<branch>` 也不在
+/// 领地内（只认 `.worktrees` 之后紧跟的那一段）。
+pub fn is_kanban_worktree(cwd: &Path) -> bool {
     let mut saw_worktrees = false;
     for part in cwd.components() {
         let std::path::Component::Normal(part) = part else {
             continue;
         };
         let part = part.to_string_lossy();
-        if part == "kanban" && saw_worktrees {
+        if saw_worktrees && (part == "kanban" || part.starts_with("kanban-")) {
             return true;
         }
         saw_worktrees = part == ".worktrees";
@@ -147,14 +151,14 @@ pub fn is_card_worktree(cwd: &Path) -> bool {
     false
 }
 
-/// 一条 meta 是否是**合法**组长:带组长角色,且不在卡片 worktree 里。
+/// 一条 meta 是否是**合法**组长:带组长角色,且不在看板 worktree 里。
 ///
-/// 卡片 worktree 不是项目,那里的 `role:"lead"` 只可能是误落盘(真机已有 9 例:
+/// 看板 worktree 不是项目,那里的 `role:"lead"` 只可能是误落盘(真机已有 9 例:
 /// 卡片会话 `ask_lead` → `resolve_lead_target` 懒创建)。把它当作非法,是为了让
 /// 「谁是组长」在这一个函数里只有一种答案:`find_lead`、wire 上的 `role`、
 /// `is_lead_thread`、`listAll` 的分组全部引用它。
 pub fn is_lead_meta(meta: &ThreadMeta) -> bool {
-    meta.role.as_deref() == Some(LEAD_ROLE) && !is_card_worktree(Path::new(&meta.cwd))
+    meta.role.as_deref() == Some(LEAD_ROLE) && !is_kanban_worktree(Path::new(&meta.cwd))
 }
 
 /// 一次 turn 的 token 用量。
@@ -2481,15 +2485,25 @@ mod tests {
         assert_eq!(store.project_key(), store.project_key());
     }
 
-    /// 看板 worktree 的路径必须被认出来:`<vcs 根>/.worktrees/kanban/<slug>`。
-    /// 排除的是这一条**约定路径**,不是「任何带 worktree 字样的目录」。
+    /// 看板 worktree 的路径必须被认出来:`<vcs 根>/.worktrees/kanban/<slug>`
+    /// 与合并轮的 `<vcs 根>/.worktrees/kanban-merge/<slug>`。
+    /// 排除的是这两条**约定路径**,不是「任何带 worktree 字样的目录」。
     #[test]
-    fn card_worktree_paths_are_recognised() {
-        assert!(is_card_worktree(Path::new("/p/.worktrees/kanban/card-1")));
-        assert!(is_card_worktree(Path::new("/p/.worktrees/kanban")));
-        assert!(!is_card_worktree(Path::new("/p")));
-        assert!(!is_card_worktree(Path::new("/p/.worktrees/other/x")));
-        assert!(!is_card_worktree(Path::new("/p/kanban/x")));
+    fn kanban_worktree_paths_are_recognised() {
+        assert!(is_kanban_worktree(Path::new("/p/.worktrees/kanban/card-1")));
+        assert!(is_kanban_worktree(Path::new("/p/.worktrees/kanban")));
+        // 合并轮把 base 检出到 `.worktrees/kanban-merge/<slug>`(base 未被任何
+        // worktree 检出时),那里的会话同样是看板产生的、同样没有项目可言。
+        assert!(is_kanban_worktree(Path::new(
+            "/p/.worktrees/kanban-merge/main"
+        )));
+        assert!(is_kanban_worktree(Path::new("/p/.worktrees/kanban-merge")));
+        assert!(!is_kanban_worktree(Path::new("/p")));
+        assert!(!is_kanban_worktree(Path::new("/p/.worktrees/other/x")));
+        assert!(!is_kanban_worktree(Path::new("/p/kanban/x")));
+        // 用户自己的 `.worktrees/<branch>` 不是插件划的领地,照旧当普通目录。
+        assert!(!is_kanban_worktree(Path::new("/p/.worktrees/feature-x")));
+        assert!(!is_kanban_worktree(Path::new("/p/.worktrees/kanbanx/x")));
     }
 
     /// 看板 worktree 不是「项目」:它里面**没有**组长。

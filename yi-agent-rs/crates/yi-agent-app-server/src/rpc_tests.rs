@@ -16328,6 +16328,66 @@ fn a_card_session_does_not_get_ask_lead() {
     );
 }
 
+/// 合并轮会话（项目键落在 `.worktrees/kanban-merge/` 下）同样不该拿到 `ask_lead`。
+///
+/// 合并轮把 base 检出到 `<项目>/.worktrees/kanban-merge/<slug>`（仅当 base 未被
+/// 任何 worktree 检出时），独立合并卡的新会话就起在那里——与卡片会话同属「看板
+/// 产生的会话」，那个目录同样不是一个项目。判定若只认 `.worktrees/kanban`，
+/// 合并轮会话就会被注册 `ask_lead`，重蹈卡片会话的覆辙（投空邮箱 + 在主循环里给
+/// `kanban-merge` 造一个假组长）。
+#[test]
+fn a_merge_round_session_does_not_get_ask_lead() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    // 一个真实的合并轮会话项目键:<kanban-merge worktree>/.yi-agent。
+    let merge_key = repo
+        .path()
+        .join(".worktrees/kanban-merge/main")
+        .join(".yi-agent")
+        .display()
+        .to_string();
+    let names = build_runtime_tooling(
+        &cfg,
+        &root,
+        "thread-merge",
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        merge_key,
+        crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
+        None,
+    )
+    .expect("tooling")
+    .registry
+    .names();
+    assert!(
+        !names.contains(&"ask_lead".to_string()),
+        "a merge round session has no lead to ask, got {names:?}"
+    );
+}
+
 /// 组长**不该**拿到 `ask_lead`:它自己就是那个收件人,投递等于自问自答。
 ///
 /// 根因:装配期只排除了卡片 worktree(见上一条测试),而组长的项目键就是它自己
