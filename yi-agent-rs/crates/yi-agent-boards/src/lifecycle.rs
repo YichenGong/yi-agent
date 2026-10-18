@@ -41,6 +41,8 @@ pub struct BoardStatus {
     pub queued: usize,
     /// Cards occupying a slot.
     pub running: usize,
+    /// Cards decided on but not yet designed (no spec/plan).
+    pub pre_queued: usize,
 }
 
 /// Where a project keeps its board: the queue *and* the manifest the switch
@@ -202,6 +204,7 @@ pub fn create_with_project(
         daemon_running,
         queued: 0,
         running: 0,
+        pre_queued: 0,
     })
 }
 
@@ -241,16 +244,17 @@ pub fn remove_with(
 pub fn status_with(project: &Path, global: &Path) -> BoardStatus {
     let registered = registry::contains(global, project).unwrap_or(false);
     let daemon_running = board_daemon::is_running(project);
-    let (queued, running) = if daemon_running {
-        card_counts(project).unwrap_or((0, 0))
+    let (queued, running, pre_queued) = if daemon_running {
+        card_counts(project).unwrap_or((0, 0, 0))
     } else {
-        (0, 0)
+        (0, 0, 0)
     };
     BoardStatus {
         registered,
         daemon_running,
         queued,
         running,
+        pre_queued,
     }
 }
 
@@ -260,9 +264,9 @@ pub fn status_with(project: &Path, global: &Path) -> BoardStatus {
 /// `<project>/.yi-agent/superpowers-kanban/board.json` directly: the daemon is
 /// the only thing that tracks which plugins are actually running, and it keeps
 /// its answer and its socket consistent. The host still does not interpret the
-/// board beyond "how many are queued, how many are running" — the counts the
-/// sidebar badge needs.
-fn card_counts(project: &Path) -> Option<(usize, usize)> {
+/// board beyond "how many are queued, how many are running, how many are
+/// pre-queued" — the counts the sidebar badge needs.
+fn card_counts(project: &Path) -> Option<(usize, usize, usize)> {
     let socket = runtime_socket(project)?;
     let response = yi_agent_store::ipc::send_request(
         &socket,
@@ -279,17 +283,22 @@ fn card_counts(project: &Path) -> Option<(usize, usize)> {
     let cards = value.get("cards")?.as_array()?;
     let mut queued = 0;
     let mut running = 0;
+    let mut pre_queued = 0;
     for card in cards {
         match card.get("state").and_then(serde_json::Value::as_str) {
             Some("queued") => queued += 1,
             Some("running") => running += 1,
+            // Pre-queued cards are waiting on design, not on a slot, so they
+            // are counted apart: a badge that lumped them into `queued` would
+            // promise work that is not ready to run yet.
+            Some("pre_queued") => pre_queued += 1,
             // Every other state (done, failed, awaiting_merge, …) is neither
             // waiting for a slot nor holding one, which is exactly what the
             // badge summarises.
             _ => {}
         }
     }
-    Some((queued, running))
+    Some((queued, running, pre_queued))
 }
 
 #[cfg(test)]
@@ -627,6 +636,65 @@ mod tests {
     }
 
     #[test]
+    fn status_counts_pre_queued_cards_too() {
+        // 预排队的卡片已经排队（决定要做），只是还没设计，所以侧栏的
+        // 「预排队 N」必须单独数出来：它和 queued 是两种不同的等待。
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let global = dir.path().join("global");
+        crate::registry::register(&global, &project).unwrap();
+
+        let socket = runtime_socket(&project).unwrap();
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let request: serde_json::Value =
+                    serde_json::from_str(&line).unwrap_or(serde_json::Value::Null);
+                let result = match request["command"]["type"].as_str() {
+                    Some("Status") => serde_json::json!({
+                        "type": "Status",
+                        "high_water_event_id": 0,
+                    }),
+                    Some("PluginQuery") => serde_json::json!({
+                        "type": "PluginResult",
+                        "value": {
+                            "cards": [
+                                { "id": "i", "state": "pre_queued", "title": "一个想法" },
+                                { "id": "q", "state": "queued" },
+                            ],
+                        },
+                    }),
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                let reply = serde_json::json!({
+                    "protocol_version": yi_agent_store::ipc::PROTOCOL_VERSION,
+                    "request_id": request["request_id"],
+                    "result": result,
+                });
+                let mut stream = stream;
+                std::io::Write::write_all(&mut stream, reply.to_string().as_bytes()).unwrap();
+                std::io::Write::write_all(&mut stream, b"\n").unwrap();
+            }
+        });
+
+        let reported = status_with(&project, &global);
+        handle.join().unwrap();
+
+        assert_eq!(reported.pre_queued, 1, "{reported:?}");
+        assert_eq!(reported.queued, 1, "{reported:?}");
+    }
+
+    #[test]
     fn create_reuses_a_daemon_that_is_already_answering() {
         // 项目下已经有 daemon 时（例如用户先在这里开过线程）create 必须复用它，
         // 而不是再起一个：同项目两个 daemon 会争同一个 runtime 锁。用一个假的
@@ -701,6 +769,7 @@ mod tests {
                 "daemon_running": true,
                 "queued": 0,
                 "running": 0,
+                "pre_queued": 0,
             })
         );
     }
