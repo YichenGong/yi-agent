@@ -79,7 +79,7 @@ pub(crate) async fn handle(
             // ① 按索引顺序(最近在前)为**每个**目录建组——含失效目录
             //   (exists:false、threads 空,不深扫),普通会话留在本目录组;
             // ② 带 `driver_project` 的驱动会话折进它所属的项目组(项目可不在
-            //   索引里,则合成一组);只含卡片会话的目录(卡片 worktree)
+            //   索引里,则合成一组);只含看板会话的目录(卡片/合并 worktree)
             //   第一段被抑制,不再顶层成组。
             // **不动索引**:目录仍留在 workspaces 里,冷会话定位靠它。
             let dirs = state.workspaces.list();
@@ -123,10 +123,11 @@ pub(crate) async fn handle(
                 // (`thread/lead`)或某个会话给组长留言(`resolve_lead_target`)。
                 //
                 // 读失败的目录(`read_ok == false`)不写:读不到就不该有副作用。
-                // 卡片 worktree(`.worktrees/kanban/<slug>`)不是项目:它没有组长,
-                // 绝不能在这里被种一个——真机上 9 个幽灵组长正是这条懒创建路径
-                // (经卡片会话 `ask_lead` → `resolve_lead_target`)落下的。
-                if read_ok && metas.is_empty() && !crate::thread_store::is_card_worktree(path) {
+                // 看板 worktree(`.worktrees/kanban/<slug>` 与 `.worktrees/kanban-merge/<slug>`)
+                // 不是项目:它没有组长,绝不能在这里被种一个——真机上 9 个幽灵组长
+                // 正是这条懒创建路径(经卡片会话 `ask_lead` → `resolve_lead_target`)
+                // 落下的。判定按整个 `.worktrees/kanban*` 领地,合并轮一并覆盖。
+                if read_ok && metas.is_empty() && !crate::thread_store::is_kanban_worktree(path) {
                     if let Err(e) = crate::lead::ensure_lead_meta(
                         &crate::thread_store::ThreadStore::new(path),
                         path,
@@ -146,14 +147,14 @@ pub(crate) async fn handle(
                     .iter()
                     .filter(|m| m.driver_project.is_none())
                     .collect();
-                // 卡片 worktree(`.worktrees/kanban/<slug>`)不是项目:它永不顶层成组,
-                // 也不贡献「自己的会话」。真机上这类目录里还躺着一个误落盘的幽灵组长
+                // 看板 worktree(`.worktrees/kanban*`)不是项目:它永不顶层成组,也不贡献
+                // 「自己的会话」。真机上这类目录里还躺着一个误落盘的幽灵组长
                 // (`role:"lead"`,`driver_project: None`)——若照旧把它算进 `own`,该
                 // worktree 就会在侧栏里变成一个带「组长」行的顶层项目组(用户报的现象)。
-                let card_worktree = crate::thread_store::is_card_worktree(path);
+                let kanban_worktree = crate::thread_store::is_kanban_worktree(path);
                 // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
-                // 否则它只是卡片 worktree,归拢后被抑制。
-                if !card_worktree && (!own.is_empty() || metas.is_empty()) {
+                // 否则它只是个看板 worktree,归拢后被抑制。
+                if !kanban_worktree && (!own.is_empty() || metas.is_empty()) {
                     for m in own {
                         plain
                             .entry(dir.clone())
@@ -161,7 +162,7 @@ pub(crate) async fn handle(
                             .push(thread_summary_json(m, state.threads));
                     }
                 } else {
-                    // 只含卡片会话:抑制顶层空组(稍后不产出)。
+                    // 只含看板会话(或误落盘的幽灵组长):抑制顶层空组(稍后不产出)。
                     seen.remove(dir);
                     order.retain(|d| d != dir);
                 }
@@ -380,7 +381,7 @@ pub(crate) async fn handle(
                     .await?;
                 }
                 Err(e) => {
-                    // 卡片 worktree 之类的「不是项目」是调用方问错了目录(InvalidInput),
+                    // 看板 worktree 之类的「不是项目」是调用方问错了目录(InvalidInput),
                     // 按参数错误回;真正的 I/O 故障仍是 internal。
                     let rpc_error = if e.kind() == std::io::ErrorKind::InvalidInput {
                         RpcError::invalid_params(e.to_string())

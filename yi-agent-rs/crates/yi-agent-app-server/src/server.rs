@@ -1044,7 +1044,7 @@ fn build_runtime_tooling(
     let is_lead = crate::lead_memory::is_lead_thread(&store, thread_id);
     let state_dir = Path::new(&project_key);
     let session_cwd = state_dir.parent().unwrap_or(state_dir);
-    if !is_lead && !crate::thread_store::is_card_worktree(session_cwd) {
+    if !is_lead && !crate::thread_store::is_kanban_worktree(session_cwd) {
         registry.register(Arc::new(
             crate::lead::AskLeadTool::new(lead_inbox, project_key, thread_id.to_string())
                 // 回信能力**必须**在这里接上:漏掉它没有编译错误,`blocking: true`

@@ -147,13 +147,14 @@ impl Default for LeadInbox {
 /// `find_lead` 选的是另一个组长,而客户端还记着刚才那个。以 `find_lead` 的
 /// 结论为唯一出口,分歧就只在落盘内存在(见 `ThreadStore::find_lead` 的注释)。
 pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(ThreadMeta, bool)> {
-    // 卡片 worktree 不是项目:它没有组长,也绝不能有。堵在**落盘侧**是唯一
-    // 能止住幽灵组长的地方——真机上已经落错的那些(`role:"lead"` 且
-    // `board_project: None`,只有路径这条线索)由 `is_lead_meta` 在读时过滤。
-    if crate::thread_store::is_card_worktree(cwd) {
+    // 看板 worktree(卡片 `.worktrees/kanban/<slug>` 与合并 `.worktrees/kanban-merge/<slug>`)
+    // 不是项目:它没有组长,也绝不能有。堵在**落盘侧**是唯一能止住幽灵组长的
+    // 地方——真机上已经落错的那些(`role:"lead"` 且 `driver_project: None`,只有
+    // 路径这条线索)由 `is_lead_meta` 在读时过滤。
+    if crate::thread_store::is_kanban_worktree(cwd) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{} is a card worktree, not a project", cwd.display()),
+            format!("{} is a kanban worktree, not a project", cwd.display()),
         ));
     }
     if let Some(existing) = store.find_lead()? {
@@ -488,11 +489,11 @@ mod tests {
         let store = ThreadStore::new(&worktree);
         assert!(
             ensure_lead_meta(&store, &worktree).is_err(),
-            "a card worktree is not a project and must not get a lead"
+            "a kanban worktree is not a project and must not get a lead"
         );
         assert!(
             store.find_lead().unwrap().is_none(),
-            "nothing may be persisted inside a card worktree"
+            "nothing may be persisted inside a kanban worktree"
         );
 
         // 普通项目目录照旧:拒绝的是**路径**,不是功能。
@@ -504,6 +505,24 @@ mod tests {
         assert_eq!(
             project_store.find_lead().unwrap().unwrap().thread_id,
             meta.thread_id
+        );
+    }
+
+    /// 合并轮的 worktree(`.worktrees/kanban-merge/<slug>`)与卡片 worktree 同属
+    /// 「看板产生的目录」,`ensure_lead_meta` 同样必须拒绝。
+    #[test]
+    fn ensure_lead_meta_refuses_a_merge_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join(".worktrees/kanban-merge/main");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = ThreadStore::new(&worktree);
+        assert!(
+            ensure_lead_meta(&store, &worktree).is_err(),
+            "a merge worktree is not a project and must not get a lead"
+        );
+        assert!(
+            store.find_lead().unwrap().is_none(),
+            "nothing may be persisted inside a merge worktree"
         );
     }
 }
