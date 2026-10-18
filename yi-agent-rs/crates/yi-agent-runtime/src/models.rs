@@ -414,6 +414,27 @@ pub fn resolve_effective(
     }
 }
 
+/// 条目选择的**唯一**规则：会话覆盖 > 整包注入 > 清单默认。
+///
+/// `model_injected` 由调用方从真实配置取（[`RuntimeConfig::model_injected`]）。这条
+/// 规则单独开一个入口，是给**拿不到完整 `RuntimeConfig`** 的调用方用的（TUI `/effort`
+/// 手上只有快照里的几个字段）：让它们复用同一条规则，而不是各自再推导一遍——
+/// 「上报 == 实际发出」正是靠这一点成立的。`resolve_effective` 与 TUI 都落到这里。
+pub fn effective_entry_with_injection<'a>(
+    catalog: &'a ModelCatalog,
+    session_override: Option<&str>,
+    model_injected: bool,
+) -> Option<&'a ModelEntry> {
+    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
+    if let Some(entry) = session_override.and_then(by_name) {
+        return Some(entry);
+    }
+    if model_injected {
+        return None;
+    }
+    catalog.default_model.as_deref().and_then(by_name)
+}
+
 /// 解析 `cfg` 与清单得到本次生效条目。优先级：会话覆盖 > 整包注入 > 清单默认。
 ///
 /// 注入存在时**不看**清单默认：用户显式给的一整包压过持久化的默认值，
@@ -423,26 +444,16 @@ pub fn effective_entry_for<'a>(
     catalog: &'a ModelCatalog,
     session_override: Option<&str>,
 ) -> Option<&'a ModelEntry> {
-    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
-    if let Some(entry) = session_override.and_then(by_name) {
-        return Some(entry);
-    }
-    if cfg.model_injected {
-        return None;
-    }
-    catalog.default_model.as_deref().and_then(by_name)
+    effective_entry_with_injection(catalog, session_override, cfg.model_injected)
 }
 
 /// 无注入语境下的条目解析（启动期、`onboarding` 评估等）。等价于
-/// `effective_entry_for` 且 `cfg` 无注入标记。
+/// [`effective_entry_with_injection`] 且注入标记为 `false`。
 pub fn effective_entry<'a>(
     catalog: &'a ModelCatalog,
     session_override: Option<&str>,
 ) -> Option<&'a ModelEntry> {
-    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
-    session_override
-        .and_then(by_name)
-        .or_else(|| catalog.default_model.as_deref().and_then(by_name))
+    effective_entry_with_injection(catalog, session_override, false)
 }
 
 /// 子 agent 条目：`subagent_model` → 全局默认 → None（调用方回退 cfg）。
