@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
-import { describe, expect, it, afterEach } from "vitest";
-import { render, cleanup, screen } from "@testing-library/react";
+import { describe, expect, it, afterEach, vi } from "vitest";
+import { render, cleanup, screen, fireEvent } from "@testing-library/react";
 import type { BoardCard } from "../lib/superpowersKanbanState";
 import { SuperpowersKanbanCard } from "./SuperpowersKanbanCard";
 
@@ -53,5 +53,39 @@ describe("SuperpowersKanbanCard shrinks under long content", () => {
     const classes = link.className.split(/\s+/);
     expect(classes).toContain("truncate");
     expect(classes).toContain("max-w-full");
+  });
+});
+
+describe("SuperpowersKanbanCard session link", () => {
+  it("shows the discussion session while the card is only pre-queued", () => {
+    const onOpenThread = vi.fn();
+    render(
+      <SuperpowersKanbanCard
+        card={card({ id: "idea", state: "pre_queued", originThreadId: "thread-abc", threadId: null })}
+        onOpenThread={onOpenThread}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "thread-abc" });
+    fireEvent.click(button);
+    expect(onOpenThread).toHaveBeenCalledWith("thread-abc");
+  });
+
+  it("prefers the execution session once the card is running", () => {
+    render(
+      <SuperpowersKanbanCard
+        card={card({ id: "c1", state: "running", threadId: "thread-exec", originThreadId: "thread-abc" })}
+      />,
+    );
+    expect(screen.getByRole("button", { name: "thread-exec" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "thread-abc" })).toBeNull();
+  });
+
+  it("renders no session button when neither session is known", () => {
+    render(
+      <SuperpowersKanbanCard
+        card={card({ id: "idea", state: "pre_queued", threadId: null, originThreadId: null })}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /thread-/ })).toBeNull();
   });
 });
