@@ -101,11 +101,31 @@ const ToolCallRow = memo(ToolCallCard);
 const NO_CALL: ImageReadCall = () => Promise.reject(new Error("image/read unavailable"));
 
 /**
- * One transcript item.
+ * The text an item renders, lifted out as a primitive.
  *
- * The original `item.text` reads are preserved for the item-owned branches
- * (notice / reasoning / thinking / user bubble): those items are never mutated
- * in place, so reading them here stays correct.
+ * For a prefix item this is the written-once value and it never moves again.
+ * For the tail it is re-read on every render from the very object `Session`
+ * mutates in place — and it is what `ChatItem`'s comparator compares, and what
+ * the agent-message branch renders. The comparator must never read
+ * `item.text`; see `ChatItem` for why.
+ */
+function itemText(item: Item | NoticeItem | ReasoningItem): string {
+  switch (item.type) {
+    case "agentMessage":
+    case "userMessage":
+    case "reasoning":
+    // `display:"omitted"` 的 thinking 明文是空串，呈现由 `redacted` 决定；text 仍
+    // 要照传，好让就地追加能被比较器看见。
+    case "thinking":
+      return item.text;
+    default:
+      // `toolCall` 无 text；`notice` 的正文由上面的 notice 分支单独渲染。
+      return "";
+  }
+}
+
+/**
+ * One transcript item.
  *
  * `text` is passed as its own primitive prop on purpose. `item/delta` mutates
  * the trailing agent message **in place**, so `prev.item === next.item` always
@@ -113,6 +133,15 @@ const NO_CALL: ImageReadCall = () => Promise.reject(new Error("image/read unavai
  * value against itself and the streamed reply would freeze. Comparing the
  * `text` prop instead lets the comparator notice the change while leaving every
  * other message untouched.
+ *
+ * The tail is handed `itemText(tail)` for every item type, not just an agent
+ * message: `thread/reasoningDelta` also appends in place, so a CoT block that
+ * is still growing at the tail needs the same treatment (`item.text` alone
+ * would compare against itself and the block would stop updating). A settled
+ * prefix item never sees a changing `text`, so this costs it nothing.
+ *
+ * The item-owned branches (notice / user bubble / tool call) read `item`
+ * directly: those are replaced object-first, never mutated in place.
  *
  * `threadId` / `call` are the image-read seam (see `App`'s `imageCall`); both are
  * stable, so they do not affect that memoization.
@@ -231,7 +260,7 @@ const HistoryPrefix = memo(
         <ChatItem
           key={it.id ?? i}
           item={it}
-          text={it.type === "agentMessage" ? it.text : ""}
+          text={itemText(it)}
           threadId={threadId}
           call={call}
         />,
@@ -293,6 +322,9 @@ export function ChatView({
   const lastText = lastItem && lastItem.type === "agentMessage" ? lastItem.text : "";
   // The live tail is rendered outside the frozen prefix. `tail` is `undefined`
   // for an empty transcript, which is how the prefix's `count` of -1 is guarded.
+  // The tail's text is re-read below on every render (via `itemText`): it is the
+  // item `Session` appends to in place, so the memo inside `ChatItem` would
+  // otherwise never see it move.
   const tail = items.length > 0 ? items[items.length - 1] : undefined;
   const effectiveCall = call ?? NO_CALL;
 
@@ -321,7 +353,7 @@ export function ChatView({
         <ChatItem
           key={tail.id ?? "tail"}
           item={tail}
-          text={tail.type === "agentMessage" ? tail.text : ""}
+          text={tail ? itemText(tail) : ""}
           threadId={threadId}
           call={effectiveCall}
         />

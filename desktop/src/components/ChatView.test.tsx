@@ -3,6 +3,7 @@ import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, cleanup, screen, fireEvent } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
 import type { NoticeItem } from "../lib/session";
+import { Session } from "../lib/session";
 
 // Count how often the settled tool card's component body runs. A streamed delta
 // on the trailing agent message must not touch items that cannot have changed.
@@ -366,5 +367,66 @@ describe("ChatView frozen prefix", () => {
 
     expect(calls.text).toBeGreaterThan(before);
     expect(screen.getByText("settled")).toBeTruthy();
+  });
+});
+
+describe("ChatView live tail", () => {
+  // The tail is not always the streaming agent message: `Session` pushes a
+  // reasoning block at the end when CoT resumes after the answer has started,
+  // which displaces the still-streaming message into the frozen prefix. These
+  // drive the real `Session` so the shape cannot drift from `apply`.
+  const listOf = (s: Session) => s.items as unknown as (Item | NoticeItem)[];
+
+  it("keeps streaming text live when CoT resumes and pushes it into the prefix", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "first " } });
+    // CoT resumes after the text started: the block lands at the tail and the
+    // streaming agent message is now the second-to-last item.
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: "hmm", kind: "Content" },
+    });
+    expect(s.items.map((i) => i.type)).toEqual(["agentMessage", "reasoning"]);
+
+    const view = (session: Session) => (
+      <ChatView items={listOf(session)} structuralVersion={session.structuralVersion} />
+    );
+    const { rerender, container } = render(view(s));
+    expect(container.textContent).toContain("first");
+
+    // A plain append, exactly like `Session.apply` does it.
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "second " } });
+    // The append is in place, so nothing `ChatView` compares by identity has
+    // moved; `Session` flags the displaced target instead so the prefix rebuilds.
+    rerender(view(s));
+
+    // The reply must not freeze just because a CoT block moved in behind it.
+    expect(container.textContent).toContain("first second");
+  });
+
+  it("keeps appended CoT visible while the reasoning block is the tail", () => {
+    const s = new Session();
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: "think", kind: "Content" },
+    });
+    const view = (session: Session) => (
+      <ChatView items={listOf(session)} structuralVersion={session.structuralVersion} />
+    );
+    const { rerender, container } = render(view(s));
+    fireEvent.click(screen.getByRole("button", { name: /思考/ })); // expand
+    expect(container.textContent).toContain("think");
+
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: " MORE", kind: "Content" },
+    });
+    rerender(view(s));
+
+    expect(container.textContent).toContain("think MORE");
   });
 });

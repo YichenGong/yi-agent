@@ -966,6 +966,27 @@ describe("Session structuralVersion", () => {
     expect(s.structuralVersion).toBeGreaterThan(before);
   });
 
+  it("changes when an in-place delta targets an item that is no longer the tail", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "first " } });
+    // The delta above targeted the tail, so the frozen prefix stayed valid.
+    expect(s.structuralVersion).toBe(1);
+    // CoT resumes: the block lands at the tail and the still-streaming message
+    // is displaced to `length - 2`. `ChatView` only lifts the tail item's text
+    // out as a prop, so the displaced one needs the prefix rebuilt.
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: "hmm", kind: "Content" },
+    });
+    const afterBlock = s.structuralVersion;
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "second " } });
+    expect(s.structuralVersion).toBeGreaterThan(afterBlock);
+  });
+
   it("changes when a locally minted bubble is dropped", () => {
     const s = new Session();
     s.addUserMessage("oops");

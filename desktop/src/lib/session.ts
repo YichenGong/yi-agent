@@ -521,6 +521,12 @@ export class Session {
         } else if (this.items[index].type === "agentMessage") {
           const item = this.items[index] as { type: "agentMessage"; id: string; text: string };
           item.text += delta;
+          // The append is in place, so the frozen prefix cannot see it through
+          // `items`. `ChatView` lifts the *tail* item's text out as a prop on
+          // every render, so only a non-tail target needs the prefix rebuilt:
+          // that is exactly the case where a CoT block moved in behind the
+          // still-streaming reply and pushed it off the tail.
+          if (index !== this.items.length - 1) this.structuralVersion += 1;
         }
         // else: delta for a non-agent item (e.g. streamed tool output) — ignore
         // in the baseline UI.
