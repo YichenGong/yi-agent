@@ -11,6 +11,8 @@ export interface BoardCard {
   progress: string | null;
   detail: string;
   threadId: string | null;
+  /** 提出这张卡的讨论会话（pre-queued 卡）。插件未提供则为 null。 */
+  originThreadId: string | null;
   /** 标题：显式 `title` 优先；否则 spec 文件名去扩展名，无 spec_path 时回退 id。 */
   title?: string;
   specPath?: string;
@@ -66,6 +68,10 @@ export function normalizeCard(raw: unknown): BoardCard | null {
     typeof record.thread_id === "string" && record.thread_id !== ""
       ? record.thread_id
       : null;
+  const originThreadId =
+    typeof record.origin_thread_id === "string" && record.origin_thread_id !== ""
+      ? record.origin_thread_id
+      : null;
 
   const detail =
     workdir !== ""
@@ -82,6 +88,7 @@ export function normalizeCard(raw: unknown): BoardCard | null {
     progress: null,
     detail,
     threadId,
+    originThreadId,
     title:
       typeof record.title === "string" && record.title !== ""
         ? record.title
