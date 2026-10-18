@@ -69,22 +69,66 @@ G1 之后宿主结构变了，初稿的文件路径与依赖面已过时；实�
 
 - [ ] **Step 1: 写失败测试**
 
+测试放在 `src/rpc/resident.rs` 的 `mod tests`：直接调该模块的 handler，**用注入的临时目录**
+（不要读真实 `$HOME`）。`resident/list` 的 handler 因此应接受一个已解析好的 registry 目录
+参数（与 `rpc/ui.rs` 的 handler 收 `&AppState` 同一手法：`AppState` 已有的
+`resident_dir` 就是那个注入点——`RuntimeAttachments.resident_dir`，
+测试里 `Harness` 已经把它指到 tempdir）。
+
 ```rust
     /// 通用登记列举：不依赖任何看板概念，也不依赖 daemon。
-    #[tokio::test]
-    async fn resident_list_reports_registered_projects() {
-        // 搭台：resident::require(tempdir, "/p", "some-plugin")；
-        // 断言 resident/list 回 {projects:[{project:"/p", required_by:["some-plugin"]}]}。
-        // 反向断言：空的/损坏的 registry → {"projects":[]}（不报错、不崩）。
+    #[test]
+    fn resident_list_reports_registered_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        yi_agent_store::resident::require(
+            dir.path(), Path::new("/p"), "some-plugin",
+        ).unwrap();
+        let value = something_that_serializes_the_registry(dir.path());
+        assert_eq!(value["projects"][0]["project"], "/p");
+        assert_eq!(value["projects"][0]["required_by"][0], "some-plugin");
     }
 
-    /// 通用转发不再按「这个项目有没有看板」拒答。
+    /// 空的或损坏的登记表一律回空表：读侧宽容，绝不因一份坏文件让侧栏起不来。
     #[test]
-    fn plugin_query_does_not_gate_on_the_board_registry() {
-        // 一个未在 boards.json 里（且 boards.json 根本不存在）的项目，
-        // 调 plugin_query 必须走到「拨 socket」而不是回 board_not_created。
+    fn an_absent_or_corrupt_registry_lists_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(entries(dir.path()).is_empty(), "absent");
+        std::fs::write(
+            yi_agent_store::resident::registry_path(dir.path()), "{ not json",
+        ).unwrap();
+        assert!(entries(dir.path()).is_empty(), "corrupt");
     }
 ```
+
+在 `src/server.rs` 的 `mod tests` 里另加一条（该文件的测试已有 `tempfile` 与
+`fake_daemon` helper）：
+
+```rust
+    /// 通用转发不再按「这个项目有没有看板」拒答。
+    ///
+    /// 反向断言的是**具体错误码**，不是「有没有报错」：摘掉门控后，一个
+    /// 未登记的项目会走到「拨 socket」，于是失败码是 `daemon_unavailable`
+    /// （socket 不在），**不再**是 `board_not_created`。
+    #[test]
+    fn a_query_is_not_gated_on_the_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        // 不放 boards.json，也不要 nonce：这个项目从未登记过。
+        let error = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap_err();
+        assert_eq!(error.code, "daemon_unavailable", "{error}");
+        assert_ne!(error.code, "board_not_created", "{error}");
+    }
+```
+
+> **必须一并改的既有测试**（它们钉的是被摘掉的门控，改完要仍然断言得有意义）：
+> - `a_query_without_a_registered_board_is_refused_with_its_own_code`（`server.rs`）
+>   —— 删掉，它的断言正是「有 `board_not_created` 这个码」。
+> - `the_rpc_maps_a_missing_board_to_its_own_code_in_data`（`server.rs`）—— 同样以
+>   `board_not_created` + `-32020` 为断言。**本任务先把它改为断言
+>   `daemon_unavailable` + `-32021`**（Task 6 再据最终码表收口）。
+> - `project_and_registry(dir, register)` helper 的 `register` 参数在摘掉门控后
+>   只影响「有没有 boards.json」，不再影响行为；保留不影响，但别再用它表达门控语义。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -426,8 +470,15 @@ export async function removeBoard(rpc: BoardRpc, project: string): Promise<void>
   （裸数组 / `items` / `projects`），不认识时回空表。
 - `routes.ts`：`boardCreate`/`boardRemove`/`boardList` 换成 `residentList: "resident/list"`
   （前两个不再是 RPC 名，故不必留在表里）；`routes.test.ts` 同步。
-- `boardIndex.ts` 的 `boardErrorKind`：码名同步 Task 6 的新码
-  （`board_not_created` → `resident_not_registered`），message 退路一并更新。
+- `boardIndex.ts` 的 `boardErrorKind`：**删掉 `not_created` 那一支**。Task 1 摘掉门控后，
+  宿主不会再发「这个项目没有看板」这个码（`plugin_query` 不再按登记表拒答），
+  故「未创建」不再是一个**凭证读到的错误**，而是由 `listBoards` 的结果表达的事实。
+  与之配套：`App.tsx` 面板里那个由 `boardError === "not_created"` 触发的「创建看板」
+  按钮删掉——创建入口保留侧栏项目右键菜单那一条
+  （`ThreadSidebar` 按 `kanbanItemFor(g.workspace, boards)` 决定显示「创建」还是「移除」，
+  见 `components/ThreadSidebar.tsx:939`，那条路本来就不依赖这个错误码）。
+  `BOARD_ERROR_TEXT` 的 `not_created` 一句与 `App.test.tsx` 里两条以
+  `board_not_created` 驱动的用例同步删除/改写。
 - 文件头注释更新：生命周期现在**归插件**（受众从「宿主」改为「插件」），
   `plugin/query` 是通用通道、宿主只转发；列举走通用 `resident/list`。
 - `App.test.tsx` 的 mock：`board/list` → `resident/list`；`board/create` 断言 →
@@ -490,8 +541,14 @@ Expected: FAIL
 
 - 删 `rpc/board.rs` 整文件与 `Domain::Board`（`domain_for` 去掉 `board` 臂、
   `serve()` 的 detach 分支只留 `Plugin`）；`rpc_tests.rs` 的 Board 方法表删掉。
-- `protocol.rs`：`board_query` 一族码名去看板化（`board_not_created` →
-  `resident_not_registered`；数值码 `-32020..-32024` 保持不动）。
+- `protocol.rs`：`board_query` 一族码名去看板化。**`board_not_created` 整支删除**
+  （Task 1 已摘门控，宿主不再有「这个项目没有看板」这个回答），其余码位换算为通用名
+  （`daemon_unavailable` / `plugin_unavailable` / `plugin_not_installed` /
+  `plugin_rejected` 本已通用，保留；数值码 `-32021..-32024` 保持不动）。
+  `protocol.rs` 的 `board_query_numbers_each_reason_without_renumbering` 与
+  `server.rs` 的 `a_query_without_a_registered_board_is_refused_with_its_own_code`、
+  `the_rpc_maps_a_missing_board_to_its_own_code_in_data` 三条测试同步更新
+  （前两条随码删除，第三条改为断言通用码）。
 - `settings_store.rs` + `rpc/ui.rs`：偏好键改名 + 旧键兼容读；`ui/settings/read|write`
   的字段名同步（桌面 Task 5 已改）。
 - `ws.rs`：去 `board_dir` 注入；`plugin_command` 注入按 §4.4 裁定处理。

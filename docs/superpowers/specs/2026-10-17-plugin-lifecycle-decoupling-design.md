@@ -118,7 +118,7 @@ daemon / 拉起插件」这件事**没有随之通用化。
 | D8 | 迁移 | 旧 `boards.json` 首次运行时一次性导入 `resident` 登记，随后只读新源 |
 | D9 | crate 归宿 | `yi-agent-boards` 中通用部分（watch / launchd / daemon 生命周期）迁入 `yi-agent-supervisors`；看板专属部分删除 |
 | D10 | 建盘引导 | 见 §4.4（**待用户裁定**） |
-| D11 | 错误码 | 宿主 `board_query` 一族码名去看板化（`resident_not_registered` 取代 `board_not_created`），桌面同步 |
+| D11 | 错误码 | 宿主 `board_query` 一族码名去看板化：**删除 `board_not_created` 整支**（§5.2 摘掉门控后宿主不再有「这个项目没有看板」这个回答），其余码名本已通用、数值码不动；桌面端相应删掉「未创建」这支错误展示与面板内「创建看板」按钮，创建入口保留侧栏右键菜单 |
 
 ## 4. 架构与数据流
 
@@ -215,8 +215,12 @@ install_manifest`，其唯一调用者是 `lifecycle::create_with_project`，即
 - `rpc/ui.rs`：同上，读写走通用键；`ui/settings/read|write` 的字段名同步。
 - `ws.rs`：去掉 `board_dir` 注入；`plugin_command` 注入若随 scheme A 保留，改为通用
   「按插件名解析」的形态。
-- `protocol.rs`：`board_query` 一族码名去看板化（`board_not_created` →
-  `resident_not_registered`），数值码不动（-32020..-32024 保持），桌面同步。
+- `protocol.rs`：`board_query` 一族码名去看板化。**`board_not_created` 整支删除**
+  ——§5.2 摘掉 `plugin_query` 的登记表门控后，宿主不会再回答「这个项目没有看板」；
+  其余码名（`daemon_unavailable` / `plugin_unavailable` / `plugin_not_installed` /
+  `plugin_rejected`）本已通用，保留，数值码 `-32021..-32024` 不动。
+  桌面端同步删掉 `boardErrorKind` 的 `not_created` 支与面板内「创建看板」按钮
+  （创建入口保留侧栏项目右键菜单 `ThreadSidebar.tsx:939` 那一条）。
 - `lib.rs` / `Cargo.toml`：移除 `yi-agent-boards` 依赖（以「编译期不存在该 crate」为验收，
   与 Spec 4 §7 第 3 条同型）。
 
