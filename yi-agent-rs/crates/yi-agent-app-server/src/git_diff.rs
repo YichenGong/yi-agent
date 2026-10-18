@@ -5,8 +5,13 @@
 //! 见 [`resolve_base`]；全不可用时退化为「仅工作区改动」。
 
 use std::path::Path;
+use std::time::Duration;
 
 pub const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+/// 视图命令的超时。与 bash 的「预期运行时长」无关：这里是展示用命令，
+/// 只读且应当很快；挂住比失败更糟（面板会一直转）。
+pub const VIEW_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -296,6 +301,112 @@ fn truncate(diff: String) -> (String, bool) {
     let mut truncated = diff[..boundary].to_owned();
     truncated.push_str("\n... diff truncated\n");
     (truncated, true)
+}
+
+/// 一次视图命令的结果。退出码是 `None` 表示**没跑起来**（如沙箱不可用）。
+#[derive(Debug, Clone)]
+pub struct ViewCommandOutput {
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub truncated: bool,
+    pub timed_out: bool,
+}
+
+/// 该校验该字符串能否作为 git rev / 范围表达式使用。
+///
+/// 单个 ref 走 `rev-parse --verify --quiet`；范围（含 `..` / `...`）两侧分别校验
+/// ——因为 `rev-parse --verify` **不认**范围表达式（实测 `A..B` 直接失败）。
+/// 以 `-` 开头的一律拒绝：那是选项，不是 rev，放过去就给了 `--output=` 之类
+/// 的注入面。
+pub fn valid_rev(repo: &Path, spec: &str) -> bool {
+    let spec = spec.trim();
+    if spec.is_empty() || spec.starts_with('-') {
+        return false;
+    }
+    // `...` 先于 `..` 匹配，否则三点会被拆成两段错误的结果。
+    if let Some((left, right)) = spec.split_once("...").or_else(|| spec.split_once("..")) {
+        return ref_exists(repo, left.trim()) && ref_exists(repo, right.trim());
+    }
+    ref_exists(repo, spec)
+}
+
+/// 在只读沙箱内跑一条视图命令。
+///
+/// 两道防护互补，不是冗余：
+/// - 沙箱挡住**任何**实际写入（含 shell 重定向 `> f`，那是 `--end-of-options` 管不到的）；
+/// - `bash -lc` 前不做拼接，命令整条交给 `sh -c`，故 `--end-of-options` 的职责
+///   落在命令**内部**（模型自己写的 git 参数由 git 解析，写不进去因为沙箱）。
+///
+/// 沙箱不可用（如 Linux 无 bwrap）当作失败返回，而不是无沙箱裸跑。
+pub async fn run_view_command(repo: &Path, command: &str) -> ViewCommandOutput {
+    let sandbox =
+        yi_agent_tools::SandboxPolicy::new(yi_agent_tools::SandboxMode::ReadOnly, repo, Vec::new());
+    let (program, args) = match sandbox.command(command, repo) {
+        Ok(v) => v,
+        Err(e) => {
+            return ViewCommandOutput {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("sandbox unavailable: {e}"),
+                truncated: false,
+                timed_out: false,
+            };
+        }
+    };
+    let child = match tokio::process::Command::new(&program)
+        .args(&args)
+        .current_dir(repo)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return ViewCommandOutput {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("failed to spawn: {e}"),
+                truncated: false,
+                timed_out: false,
+            };
+        }
+    };
+
+    let output = match tokio::time::timeout(VIEW_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            return ViewCommandOutput {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("failed to read output: {e}"),
+                truncated: false,
+                timed_out: false,
+            };
+        }
+        Err(_) => {
+            // `kill_on_drop` 已在 drop 时杀掉整个进程组；这里只需如实报 timeout。
+            return ViewCommandOutput {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: format!("command timed out after {}s", VIEW_TIMEOUT.as_secs()),
+                truncated: false,
+                timed_out: true,
+            };
+        }
+    };
+
+    let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_raw = String::from_utf8_lossy(&output.stderr).to_string();
+    let (stdout, truncated) = truncate(stdout_raw);
+    ViewCommandOutput {
+        exit_code: output.status.code(),
+        stdout,
+        stderr: stderr_raw,
+        truncated,
+        timed_out: false,
+    }
 }
 
 pub fn thread_diff(repo: &Path, explicit_base: Option<&str>, anchor: Option<&str>) -> ThreadDiff {
@@ -749,5 +860,83 @@ mod tests {
     fn session_anchor_is_none_outside_a_git_repo() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(session_anchor(dir.path()), None);
+    }
+
+    #[test]
+    fn valid_rev_accepts_refs_and_ranges_and_rejects_junk() {
+        let dir = repo();
+        // `HEAD~1` 要有两个提交才存在，而 `repo()` 只有一个（别的测试依赖那个
+        // 「只有一条 log」的前提，故不改 fixture，只在本测试里补一个提交）。
+        // 少了这一步，左侧就解不开，也就测不出「范围两侧都要校验」这一性质。
+        std::fs::write(dir.path().join("b.txt"), "two\n").unwrap();
+        assert!(git_ok(dir.path(), &["add", "."]).is_some());
+        assert!(git_ok(dir.path(), &["commit", "-q", "-m", "second"]).is_some());
+        assert!(valid_rev(dir.path(), "HEAD"));
+        assert!(valid_rev(dir.path(), "trunk"));
+        assert!(valid_rev(dir.path(), "HEAD~1..HEAD"));
+        assert!(valid_rev(dir.path(), "trunk...HEAD"));
+        assert!(
+            !valid_rev(dir.path(), "bogus..HEAD"),
+            "unresolvable side must fail"
+        );
+        assert!(!valid_rev(dir.path(), ""), "empty is not a rev");
+        assert!(
+            !valid_rev(dir.path(), "--output=/tmp/x"),
+            "options are not revs"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_command_rejects_an_output_option_that_would_write() {
+        let dir = repo();
+        let probe = dir.path().join("probe.txt");
+        let out = run_view_command(
+            dir.path(),
+            &format!("git diff --no-color --numstat --output={}", probe.display()),
+        )
+        .await;
+        assert!(
+            !probe.exists(),
+            "sandbox/end-of-options must prevent the write"
+        );
+        assert!(
+            out.exit_code != Some(0),
+            "it must not report success: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_command_reports_read_output() {
+        let dir = repo();
+        let out = run_view_command(dir.path(), "git log --oneline -1").await;
+        assert_eq!(out.exit_code, Some(0));
+        assert!(out.stdout.contains("init"), "stdout: {}", out.stdout);
+        assert!(!out.timed_out);
+    }
+
+    #[tokio::test]
+    async fn view_command_denies_writes_in_read_only_mode() {
+        let dir = repo();
+        // 写 .git/index 必须被拒（ReadOnly 沙箱）。
+        let out = run_view_command(dir.path(), "git add -A").await;
+        assert!(out.exit_code != Some(0), "git add must be denied: {out:?}");
+        // 仓库状态不变。
+        assert_eq!(
+            git_ok(dir.path(), &["log", "--oneline"])
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn view_command_times_out_instead_of_hanging() {
+        let dir = repo();
+        let out = run_view_command(dir.path(), "sleep 60").await;
+        assert!(
+            out.timed_out,
+            "sleep must be killed by the timeout: {out:?}"
+        );
     }
 }
