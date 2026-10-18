@@ -370,6 +370,14 @@ pub(crate) fn attach_delegation(
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
     thread_cfg.workdir = PathBuf::from(cwd);
+    // 本会话的起点 sha：从落盘的 thread meta 读（与 `rpc/thread.rs` 读锚点同一
+    // 口径）。读不到就是 `None`——那表示「无起点」，工具会落到默认分支候选链，
+    // 而不是假装有起点。
+    let anchor_sha = crate::thread_store::ThreadStore::new(Path::new(cwd))
+        .load(thread_id)
+        .ok()
+        .flatten()
+        .and_then(|l| l.meta.anchor_sha);
     let binding = match attach_cwd_runtime(runtimes, runtime_dir, &thread_cfg, models_path) {
         Ok(binding) => binding,
         Err(cause) => {
@@ -419,6 +427,7 @@ pub(crate) fn attach_delegation(
         crate::thread_store::ThreadStore::new(Path::new(cwd)).project_key(),
         lead_inbox.clone(),
         lead_replies.clone(),
+        anchor_sha,
     ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
@@ -930,6 +939,9 @@ fn build_runtime_tooling(
     // 回信登记表与超时:两者一起决定 `blocking: true` 是否真的有界往返
     // (只有登记表而没有超时来源,或反之,都会让契约半途而废)。
     lead_replies: crate::lead::LeadReplies,
+    // 本会话的起点 sha：`show_git_diff` 默认按它算 diff，并在回执里如实报出。
+    // 与 project_key 同理——模型看不到会话元数据，装配期注入是唯一来源。
+    anchor_sha: Option<String>,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
@@ -983,6 +995,10 @@ fn build_runtime_tooling(
     registry.register(Arc::new(crate::git_diff_tool::ShowGitDiffTool::new(
         git_diff,
         Some(thread_id.to_string()),
+        // 仓库取 `cfg.workdir`,与上面的 `store` 同源:此处它就是 thread cwd,
+        // 而不是 daemon 回传的 toplevel(见上文的注释)。
+        cfg.workdir.clone(),
+        anchor_sha,
     )));
     // 普通会话用它给组长留言。`from_thread_id` 绑在装配期,与
     // `register_attached_root_tools_in_thread` 的 thread marker 同理由:
@@ -2310,6 +2326,9 @@ async fn pump_theme_notifications(
 async fn pump_git_diff_notifications(
     mut rx: tokio::sync::broadcast::Receiver<crate::git_diff_tool::GitDiffFocus>,
     hub: Arc<crate::broadcast::Broadcaster>,
+    // 会话帧表。watcher 与 `thread/view/read` 必须写读**同一张**表,否则面板
+    // 读到的永远是空的;帧由工具算好随广播带来,这里只负责落表。
+    view_frames: ViewFrames,
 ) {
     loop {
         let focus = match rx.recv().await {
@@ -2320,6 +2339,11 @@ async fn pump_git_diff_notifications(
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         };
+        // 先落帧再发通知:通知到达前端时,前端随后的 `thread/view/read` 必须已经
+        // 能读到这一帧,否则面板会先画一次旧帧(甚至空帧)。
+        if let (Some(thread_id), Some(frame)) = (focus.thread_id.clone(), focus.frame) {
+            view_frames.lock().await.insert(thread_id, *frame);
+        }
         let n = Notification::UiGitDiffFocus {
             thread_id: focus.thread_id,
             note: focus.note,
@@ -2464,6 +2488,7 @@ where
     tokio::spawn(pump_git_diff_notifications(
         git_diff.subscribe(),
         Arc::clone(&hub),
+        Arc::clone(&view_frames),
     ));
     // 建 thread 的工具仍需该句柄(与 watcher 同一实例,故通知不落空)。
     let git_diff_handle = git_diff.clone();
@@ -7938,5 +7963,107 @@ mod theme_watcher_tests {
         .await
         .unwrap();
         assert!(rx.try_recv().is_err(), "订阅 t1 不该收到 t2 的内容帧");
+    }
+}
+
+/// Git Diff 守望者的回归测试。
+///
+/// 与上面的主题守望者同理:直接驱动生产里的 [`pump_git_diff_notifications`]。
+/// 新增的写帧表尤其必须这样测——工具在模型侧算好的帧能不能到 `thread/view/read`
+/// 手里,全取决于这段循环里那次 `insert`。
+#[cfg(test)]
+mod git_diff_watcher_tests {
+    use super::*;
+
+    fn frame(command: &str) -> crate::git_diff::ViewFrame {
+        crate::git_diff::ViewFrame {
+            command: Some(command.to_string()),
+            as_kind: "log".to_string(),
+            exit_code: Some(0),
+            stdout: "cafe123 subject\n".to_string(),
+            stderr: String::new(),
+            truncated: false,
+            timed_out: false,
+            note: None,
+            base: None,
+            base_kind: String::new(),
+        }
+    }
+
+    /// D3 的另一半:工具报的「我给你看了什么」必须与面板真读到的帧一致。
+    /// 工具算帧、watcher 落表,谁漏了这一步,面板都会显示旧帧(或空帧),
+    /// 而回执照样声称展示了命令输出——正是要杜绝的误导。
+    #[tokio::test]
+    async fn the_watcher_files_the_frame_under_its_thread() {
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        let frames: ViewFrames = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let git_diff = crate::git_diff_tool::GitDiffHandle::new();
+        let pump = tokio::spawn(pump_git_diff_notifications(
+            git_diff.subscribe(),
+            Arc::clone(&hub),
+            Arc::clone(&frames),
+        ));
+
+        git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
+            thread_id: Some("thread-1".into()),
+            command: Some("git log --oneline -1".into()),
+            base: None,
+            note: Some("here".into()),
+            frame: Some(Box::new(frame("git log --oneline -1"))),
+        });
+
+        let mut filed = None;
+        for _ in 0..200 {
+            if let Some(f) = frames.lock().await.get("thread-1").cloned() {
+                filed = Some(f);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        pump.abort();
+        let filed = filed.expect("the watcher must file the frame the tool computed");
+        assert_eq!(filed.command.as_deref(), Some("git log --oneline -1"));
+        assert_eq!(filed.as_kind, "log");
+    }
+
+    /// 无 thread 的焦点(前端按当前会话处理)不进表:键都没有,写进去只会有个
+    /// 取不出来的孤儿条目。
+    #[tokio::test]
+    async fn a_frameless_or_threadless_focus_files_nothing() {
+        let hub = Arc::new(crate::broadcast::Broadcaster::new());
+        let frames: ViewFrames = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let git_diff = crate::git_diff_tool::GitDiffHandle::new();
+        let pump = tokio::spawn(pump_git_diff_notifications(
+            git_diff.subscribe(),
+            Arc::clone(&hub),
+            Arc::clone(&frames),
+        ));
+
+        git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
+            thread_id: None,
+            command: None,
+            base: None,
+            note: None,
+            frame: Some(Box::new(frame("git log"))),
+        });
+        git_diff.broadcast(crate::git_diff_tool::GitDiffFocus {
+            thread_id: Some("thread-2".into()),
+            command: None,
+            base: None,
+            note: None,
+            frame: None,
+        });
+        // 让守望者把两条都处理完,再断言表是空的。
+        let mut drained = false;
+        for _ in 0..200 {
+            if git_diff.subscribe().try_recv().is_err() && frames.lock().await.is_empty() {
+                drained = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        pump.abort();
+        assert!(drained, "the frame table must stay empty");
+        assert!(frames.lock().await.is_empty());
     }
 }

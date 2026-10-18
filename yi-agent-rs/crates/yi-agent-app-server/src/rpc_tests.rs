@@ -84,6 +84,7 @@ fn a_git_project_gets_the_delegation_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -165,6 +166,7 @@ fn a_git_project_gets_the_show_git_diff_tool() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling")
     .registry
@@ -218,6 +220,7 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     let bash = tooling.registry.get("bash").expect("bash is registered");
@@ -280,6 +283,7 @@ fn the_assembly_hands_the_reply_registry_to_ask_lead() {
         "proj-test".to_string(),
         inbox.clone(),
         replies.clone(),
+        None,
     )
     .expect("tooling");
 
@@ -448,6 +452,7 @@ fn only_the_lead_sees_the_memory_tools() {
             "proj-test".to_string(),
             crate::lead::LeadInbox::new(),
             crate::lead::LeadReplies::new(),
+            None,
         )
         .expect("tooling")
     };
@@ -584,6 +589,7 @@ fn a_lead_in_a_repo_subdirectory_sees_the_memory_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -659,6 +665,7 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling")
     .registry
@@ -13986,6 +13993,7 @@ fn delegation_tooling_carries_the_theme_tool() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     assert!(
@@ -14486,6 +14494,7 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     // Taken *before* the rebuild: a clone shares the caller slot the tools
