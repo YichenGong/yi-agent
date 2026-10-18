@@ -35,7 +35,7 @@
   - `Card.origin_thread_id: Option<String>`（serde 键 `origin_thread_id`，`#[serde(default)]`）；
   - `Board::enqueue_prequeued(&mut self, id: CardId, title: String, origin_thread_id: Option<String>, now: DateTime<Local>) -> &Card`（**新增第 3 个参数**，插在 `title` 与 `now` 之间）。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `card.rs` 的 `mod tests` 末尾追加（该文件已有 `use super::*;`）：
 
@@ -100,12 +100,12 @@
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core --lib`
 Expected: 编译失败，报 `no field origin_thread_id` / `this function takes 4 arguments but 5 were supplied`。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 `card.rs` 的 `Card` 结构体，在 `pub thread_id: Option<String>,` 之后插入：
 
@@ -145,21 +145,21 @@ Expected: 编译失败，报 `no field origin_thread_id` / `this function takes 
             origin_thread_id,
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core --lib`
 Expected: 仍会编译失败——**core 内部既有调用点**（`board.rs` 的 `a_pre_queued_card_is_queued_nowhere_near_a_slot`、`a_pre_queued_id_falls_back_and_gets_a_suffix_on_collision`、`promoting_a_card_that_is_not_pre_queued_is_rejected`、`a_promote_can_overwrite_the_title` 等，以及 `inbox.rs` 测试）都调用 `enqueue_prequeued(...)`，需要补参数。
 
-- [ ] **Step 5: 修 core 内部既有调用点**
+- [x] **Step 5: 修 core 内部既有调用点**
 
 `board.rs` 与 `inbox.rs` 的 `mod tests` 里逐个 `enqueue_prequeued(...)` 调用在 `title` 与 `now` 之间补 `None`；在要断言溯源保留的用例（`promote` 系列）传 `Some("thread-x".into())`。**用编译器报错逐个定位，不猜**（已知位置：`board.rs:807/836/851/896`、`inbox.rs:279`）。
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core --lib`
 Expected: PASS，0 failures。（`-p` 只编译 core 一方，故 `superpowers-kanban-runner` 的调用点此处不会报错——那归 Task 3。）
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd plugins/superpowers-kanban && cargo fmt --all
@@ -178,7 +178,7 @@ git commit -m "feat(kanban-core): add origin_thread_id to cards"
 - Consumes: Task 1 的 `Card.origin_thread_id`。
 - Produces: `deliver_prequeued_card(state_dir: &Path, id: &str, title: &str, origin_thread_id: Option<&str>) -> std::io::Result<()>`（**新增第 4 个参数**）。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `inbox.rs` 的 `mod tests` 里，把既有 `delivers_a_prequeued_card_with_its_kind_and_title` 更新为带会话的版本，并追加两个测试：
 
@@ -206,12 +206,12 @@ git commit -m "feat(kanban-core): add origin_thread_id to cards"
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core --lib`
 Expected: 编译失败，`deliver_prequeued_card` 参数个数不符。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```rust
 /// 投递一张预排队卡：`{"kind":"prequeued","id","title"[,"origin_thread_id"]}`。
@@ -236,7 +236,7 @@ pub fn deliver_prequeued_card(
 }
 ```
 
-- [ ] **Step 4: 写 `promote` 保留溯源的测试**
+- [x] **Step 4: 写 `promote` 保留溯源的测试**
 
 在 `board.rs` 的 `mod tests` 追加：
 
@@ -265,12 +265,12 @@ pub fn deliver_prequeued_card(
     }
 ```
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core --lib`
 Expected: PASS。`promote_prequeued` 本身无需改动（它不触碰该字段）；若测试失败说明实现里误改了，回查。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd plugins/superpowers-kanban && cargo fmt --all
@@ -295,7 +295,7 @@ git commit -m "feat(kanban-core): carry origin_thread_id through prequeued deliv
   - IPC `enqueue_prequeued` 接受可选 params 字段 `origin_thread_id`；
   - `list` 每张卡 JSON 输出键 `origin_thread_id`。
 
-- [ ] **Step 1: 写失败的测试（消费侧）**
+- [x] **Step 1: 写失败的测试（消费侧）**
 
 在 `inbox.rs` 的 `mod tests` 追加：
 
@@ -336,12 +336,12 @@ git commit -m "feat(kanban-core): carry origin_thread_id through prequeued deliv
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib`
 Expected: 编译失败（`RawDelivery` 无 `origin_thread_id`；`enqueue_prequeued` 参数不符）。
 
-- [ ] **Step 3: 最小实现（消费侧）**
+- [x] **Step 3: 最小实现（消费侧）**
 
 `RawDelivery` 在 `title` 字段后加：
 
@@ -360,12 +360,12 @@ Expected: 编译失败（`RawDelivery` 无 `origin_thread_id`；`enqueue_prequeu
 
 （以该分支现有变量名为准调整；`title` 已在上一行解出。）
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib`
 Expected: 新增两个测试 PASS。
 
-- [ ] **Step 5: 写失败的测试（CLI 读 env）**
+- [x] **Step 5: 写失败的测试（CLI 读 env）**
 
 **关键：环境变量是进程级的，必须用互斥锁串行，并在结尾还原。** 本仓库既有范式见
 `yi-agent-runtime/src/config.rs` 的 `ENV_TEST_MUTEX` + `EnvVarGuard`。在 `main.rs`
@@ -444,12 +444,12 @@ Expected: 新增两个测试 PASS。
 
 （若这些测试与同模块既有测试共用 `ENV_TEST_MUTEX` 名字冲突，改名或提到模块顶部共用一份。）
 
-- [ ] **Step 6: 跑测试确认失败**
+- [x] **Step 6: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib add_prequeued`
 Expected: FAIL（`origin_thread_id` 缺失）。
 
-- [ ] **Step 7: 最小实现（CLI）**
+- [x] **Step 7: 最小实现（CLI）**
 
 ```rust
 /// `add-prequeued`：只给标题，投递一张预排队卡，id 在这里定死。
@@ -486,12 +486,12 @@ fn command_prequeued(state_dir: &std::path::Path, title: &str) -> Result<String,
 }
 ```
 
-- [ ] **Step 8: 跑测试确认通过**
+- [x] **Step 8: 跑测试确认通过**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib add_prequeued`
 Expected: PASS。
 
-- [ ] **Step 9: 写失败的测试（dispatch 与 list）**
+- [x] **Step 9: 写失败的测试（dispatch 与 list）**
 
 在 `dispatch.rs` 测试模块追加：
 
@@ -541,12 +541,12 @@ Expected: PASS。
     }
 ```
 
-- [ ] **Step 10: 跑测试确认失败**
+- [x] **Step 10: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner --lib`
 Expected: FAIL（`enqueue_prequeued` 未读 `origin_thread_id`；`list` 无该键）。
 
-- [ ] **Step 11: 最小实现（dispatch 与 list）**
+- [x] **Step 11: 最小实现（dispatch 与 list）**
 
 `dispatch.rs` 的 `"enqueue_prequeued"` 分支改为：
 
@@ -582,12 +582,12 @@ Expected: FAIL（`enqueue_prequeued` 未读 `origin_thread_id`；`list` 无该�
 - `main.rs:1646`（测试内，补 `None`）；
 - `inbox.rs:157` 已在 Step 3 改过。
 
-- [ ] **Step 12: 跑测试确认通过**
+- [x] **Step 12: 跑测试确认通过**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core -p superpowers-kanban-runner`
 Expected: PASS，0 failures。
 
-- [ ] **Step 13: 提交**
+- [x] **Step 13: 提交**
 
 ```bash
 cd plugins/superpowers-kanban && cargo fmt --all
@@ -614,7 +614,7 @@ git commit -m "feat(kanban-runner): plumb origin_thread_id through cli, ipc and 
   - `register_builtin_tools_with_controller_and_env(registry: &mut ToolRegistry, roots: Vec<PathBuf>, controller: SandboxController, sandbox_writable_roots: Vec<PathBuf>, session_env: Vec<(String, String)>)`；
   - 既有 `register_builtin_tools_with_controller` 与 `register_builtin_tools_with_sandbox` 签名**不变**，内部委托并传空 env。
 
-- [ ] **Step 1: 写失败的测试（context）**
+- [x] **Step 1: 写失败的测试（context）**
 
 在 `context.rs` 的 `mod tests` 追加：
 
@@ -638,12 +638,12 @@ git commit -m "feat(kanban-runner): plumb origin_thread_id through cli, ipc and 
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-tools --lib context`
 Expected: 编译失败（无 `session_env` / `with_roots_and_env`）。
 
-- [ ] **Step 3: 最小实现（context）**
+- [x] **Step 3: 最小实现（context）**
 
 ```rust
 pub struct ToolsContext {
@@ -678,12 +678,12 @@ pub struct ToolsContext {
     }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-tools --lib context`
 Expected: PASS。
 
-- [ ] **Step 5: 写失败的测试（bash 注入）**
+- [x] **Step 5: 写失败的测试（bash 注入）**
 
 在 `shell/bash.rs` 的 `mod tests` 追加：
 
@@ -723,12 +723,12 @@ Expected: PASS。
     }
 ```
 
-- [ ] **Step 6: 跑测试确认失败**
+- [x] **Step 6: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-tools --lib bash_`
 Expected: 第一个测试 FAIL（子进程看不到变量）。
 
-- [ ] **Step 7: 最小实现（bash 注入）**
+- [x] **Step 7: 最小实现（bash 注入）**
 
 `bash.rs` 的 `Command::new(program)` 链上加一行（放在 `.current_dir(&cwd)` 之后）：
 
@@ -736,12 +736,12 @@ Expected: 第一个测试 FAIL（子进程看不到变量）。
             .envs(self.ctx.session_env().iter().cloned())
 ```
 
-- [ ] **Step 8: 跑测试确认通过**
+- [x] **Step 8: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-tools --lib`
 Expected: PASS（含新增 2 个测试与既有 bash 测试）。
 
-- [ ] **Step 9: 写失败的测试（注册入口带 env）**
+- [x] **Step 9: 写失败的测试（注册入口带 env）**
 
 在 `lib.rs` 的 `mod tests` 追加：
 
@@ -778,12 +778,12 @@ Expected: PASS（含新增 2 个测试与既有 bash 测试）。
 而非 `tempfile::tempdir()`，与同模块既有测试一致。用 `#[tokio::test]`——同 crate 的
 `bash.rs` 已在用，tokio 的 test macro 可用。）
 
-- [ ] **Step 10: 跑测试确认失败**
+- [x] **Step 10: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-tools --lib the_env_carrying_registration`
 Expected: 编译失败（无该函数）。
 
-- [ ] **Step 11: 最小实现（注册入口）**
+- [x] **Step 11: 最小实现（注册入口）**
 
 `lib.rs` 里保持既有 `register_builtin_tools_with_controller` 签名字面不变，内部改为委托：
 
@@ -819,12 +819,12 @@ pub fn register_builtin_tools_with_controller_and_env(
 
 把既有函数体的内容整体搬进新函数，只把 `ToolsContext::with_roots(roots)` 换成上面这行。
 
-- [ ] **Step 12: 跑测试确认通过**
+- [x] **Step 12: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-tools`
 Expected: PASS（lib + tests/ 全绿，既有 7 个 `register_builtin_tools_with_sandbox` 调用点一行未改）。
 
-- [ ] **Step 13: 提交**
+- [x] **Step 13: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -844,7 +844,7 @@ git commit -m "feat(tools): inject session env into shell children"
 - Consumes: Task 4 的 `register_builtin_tools_with_controller_and_env`。
 - Produces: `build_tool_setup_with_controller(cfg: &RuntimeConfig, naked: bool, roots: &[PathBuf], controller: SandboxController, session_env: Vec<(String, String)>) -> Result<ToolSetup>`（**新增第 5 个参数**）。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `bootstrap.rs` 的 `mod tests` 里，把既有 `build_tool_setup_with_controller_tracks_the_live_switch` 的调用补一个 `Vec::new()` 参数，并追加：
 
@@ -889,12 +889,12 @@ git commit -m "feat(tools): inject session env into shell children"
 `cfg.workdir` 是 `/tmp/test-workdir`，`sample_config` 的沙箱是 `WorkspaceWrite`，
 `echo` 读取变量不受写入限制。）
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib build_tool_setup`
 Expected: 编译失败（参数个数不符）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 `build_tool_setup_with_controller` 签名加第 5 个参数 `session_env: Vec<(String, String)>`，内部调用改为：
 
@@ -910,12 +910,12 @@ Expected: 编译失败（参数个数不符）。
 
 `:187` 的 `build_tool_setup_with_switch` 委托处补 `Vec::new()`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-runtime --lib`
 Expected: PASS。
 
-- [ ] **Step 5: 接线 app-server**
+- [x] **Step 5: 接线 app-server**
 
 `server.rs:954` 的调用改为传入本会话的 thread id：
 
@@ -933,12 +933,12 @@ Expected: PASS。
 （`thread_id` 是本函数已有的形参，无需新增来源；与下方 `ShowGitDiffTool`/`AskLeadTool`
 的注入同源。）
 
-- [ ] **Step 6: 跑测试确认通过**
+- [x] **Step 6: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib`
 Expected: PASS。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -963,7 +963,7 @@ git commit -m "feat(app-server): inject this thread's id into bash children"
   - `BoardCard.originThreadId: string | null`；
   - `enqueuePrequeuedCard(rpc: BoardRpc, project: string, title: string, originThreadId: string | null): Promise<void>`（**新增第 4 个参数**）。
 
-- [ ] **Step 1: 写失败的测试（normalizeCard）**
+- [x] **Step 1: 写失败的测试（normalizeCard）**
 
 在 `superpowersKanbanState.test.ts` 的 `describe("normalizeCard")` 内追加：
 
@@ -983,12 +983,12 @@ git commit -m "feat(app-server): inject this thread's id into bash children"
   });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/superpowersKanbanState.test.ts`
 Expected: FAIL（`originThreadId` 为 `undefined`）。
 
-- [ ] **Step 3: 最小实现（数据层）**
+- [x] **Step 3: 最小实现（数据层）**
 
 `superpowersKanbanState.ts` 的 `BoardCard` 接口，在 `threadId: string | null;` 之后加：
 
@@ -1008,7 +1008,7 @@ Expected: FAIL（`originThreadId` 为 `undefined`）。
 
 并在返回对象里 `threadId,` 之后加 `originThreadId,`。
 
-- [ ] **Step 3b: 修既有测试 helper（必做，否则 tsc 挂）**
+- [x] **Step 3b: 修既有测试 helper（必做，否则 tsc 挂）**
 
 `originThreadId` 是必填字段，四个既有文件的 `card()` helper 必须补上，否则
 `cd desktop && npm run build`（`tsc`）与 vitest 都编译失败：
@@ -1022,12 +1022,12 @@ Expected: FAIL（`originThreadId` 为 `undefined`）。
 
 用 `cd desktop && npx tsc --noEmit` 逐个定位漏改处。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx tsc --noEmit && npx vitest run src/lib/superpowersKanbanState.test.ts`
 Expected: PASS。
 
-- [ ] **Step 5: 写失败的测试（投递带会话）**
+- [x] **Step 5: 写失败的测试（投递带会话）**
 
 在 `superpowersKanbanSwitch.test.ts` 追加：
 
@@ -1055,12 +1055,12 @@ Expected: PASS。
   });
 ```
 
-- [ ] **Step 6: 跑测试确认失败**
+- [x] **Step 6: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/superpowersKanbanSwitch.test.ts`
 Expected: FAIL（参数未生效）。
 
-- [ ] **Step 7: 最小实现（switch）与接线**
+- [x] **Step 7: 最小实现（switch）与接线**
 
 `superpowersKanbanSwitch.ts` 的 `BoardCardDto` 加：
 
@@ -1106,12 +1106,12 @@ export async function enqueuePrequeuedCard(
 
 并同步修既有调用点（若有其它 `enqueuePrequeuedCard(...)` 调用，补第 4 个参数）。
 
-- [ ] **Step 8: 跑测试确认通过**
+- [x] **Step 8: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/superpowersKanbanSwitch.test.ts src/lib/superpowersKanbanState.test.ts`
 Expected: PASS。
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 cd desktop && npx prettier --write src/lib/superpowersKanbanState.ts src/lib/superpowersKanbanSwitch.ts src/App.tsx
@@ -1131,7 +1131,7 @@ git commit -m "feat(desktop): carry the discussion session when pre-queuing"
 - Consumes: Task 6 的 `BoardCard.originThreadId`。
 - Produces: 无（叶子节点）。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `SuperpowersKanbanCard.test.tsx` 追加（该文件已有 `card(extra: Partial<BoardCard>)`
 helper 与 `render`/`cleanup`/`screen`；本步新增的 `fireEvent` 需并入文件顶部
@@ -1174,12 +1174,12 @@ helper 与 `render`/`cleanup`/`screen`；本步新增的 `fireEvent` 需并入�
 本文件顶部需 `import { vi } from "vitest";`（若既有 import 行未含 `vi`，补上）。
 `card()` helper 的 `originThreadId: null` 由 Task 6 Step 3b 已补。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/components/SuperpowersKanbanCard.test.tsx`
 Expected: 第一个测试 FAIL（pre-queued 卡没有按钮）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 在 `SuperpowersKanbanCard.tsx` 组件函数体开头（`const needsYou = ...` 附近）加：
 
@@ -1217,12 +1217,12 @@ Expected: 第一个测试 FAIL（pre-queued 卡没有按钮）。
       ) : null}
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/components/SuperpowersKanbanCard.test.tsx`
 Expected: PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd desktop && npx prettier --write src/components/SuperpowersKanbanCard.tsx
@@ -1244,7 +1244,7 @@ git commit -m "feat(desktop): fall back to the discussion session on pre-queued 
 - Consumes: Task 1-7 的全部行为。
 - Produces: 无。
 
-- [ ] **Step 1: 改插件 README**
+- [x] **Step 1: 改插件 README**
 
 在预排队（pre-queued）一节补一段（与既有行文风格一致，中文）：
 
@@ -1256,7 +1256,7 @@ add-prequeued "<标题>"` 时，宿主已把当前会话 id 注入环境变量 `
 TUI 本地会话）时该字段为空，**不阻断**投递。
 ```
 
-- [ ] **Step 2: 改 skill**
+- [x] **Step 2: 改 skill**
 
 在 `SKILL.md` 的预排队（`### 2a`）一节补一句：
 
@@ -1265,7 +1265,7 @@ TUI 本地会话）时该字段为空，**不阻断**投递。
 `YI_AGENT_THREAD_ID` 注入），无需额外参数；桌面看板上可点击跳回那次讨论。
 ```
 
-- [ ] **Step 3: 改项目状态文件**
+- [x] **Step 3: 改项目状态文件**
 
 按 `docs/project-management/README.md` 末尾的「维护规则」更新三处：`desktop.md`
 （卡片字段 `originThreadId` 与按钮回退）、`yi-agent-app-server.md`（装配期向 bash 子
@@ -1273,7 +1273,7 @@ TUI 本地会话）时该字段为空，**不阻断**投递。
 `BashTool` 注入）。每条带可验证判据（`file.rs:line` 或可执行命令），状态只用
 `[x]`/`[ ]`/`[-]`。若计数变化，同步 `README.md` 的模块索引表。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add plugins/superpowers-kanban/README.md plugins/superpowers-kanban/skills/superpowers-kanban/SKILL.md docs/project-management
@@ -1284,9 +1284,9 @@ git commit -m "docs(kanban): document the origin session of pre-queued cards"
 
 ## 验收（全部任务完成后）
 
-- [ ] `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core -p superpowers-kanban-runner` 全绿。
-- [ ] `cd yi-agent-rs && cargo test -p yi-agent-tools -p yi-agent-runtime -p yi-agent-app-server` 全绿。
-- [ ] `cd desktop && npm test` 全绿。
-- [ ] `cd yi-agent-rs && cargo fmt --all --check` 与插件侧 `cargo fmt --all --check` 通过。
-- [ ] 手工：会话内 `superpowers-kanban add-prequeued "示例需求"` → 桌面 PRE-QUEUED 卡出现讨论会话链接 → 点击跳回 → `promote` 后链接仍在 → 卡开跑后链接切为执行会话。
-- [ ] 回归：旧 `board.json`（无 `origin_thread_id`）仍可读；会话外 `add-prequeued` 仍成功且字段为空。
+- [x] `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core -p superpowers-kanban-runner` 全绿。
+- [x] `cd yi-agent-rs && cargo test -p yi-agent-tools -p yi-agent-runtime -p yi-agent-app-server` 全绿。
+- [x] `cd desktop && npm test` 全绿。
+- [x] `cd yi-agent-rs && cargo fmt --all --check` 与插件侧 `cargo fmt --all --check` 通过。
+- [x] 手工：会话内 `superpowers-kanban add-prequeued "示例需求"` → 桌面 PRE-QUEUED 卡出现讨论会话链接 → 点击跳回 → `promote` 后链接仍在 → 卡开跑后链接切为执行会话。
+- [x] 回归：旧 `board.json`（无 `origin_thread_id`）仍可读；会话外 `add-prequeued` 仍成功且字段为空。
