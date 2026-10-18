@@ -307,7 +307,13 @@ install_manifest`，其唯一调用者是 `lifecycle::create_with_project`，即
 
 G1（`2026-10-17-session-driver-decoupling-design.md`）把宿主里的看板**决策面**清零，但留下两处只有本 spec（G2）能修的缺口；`docs/bug-list.md`、G1 plan 的「已知的 G1→G2 过渡缺口」与 §7 已记录，此处再点明以免只看本 spec 的实现者漏做：
 
-- **被驱动会话的 `driver_project` / `driver_ref` 恒为 `None`**：`thread/listAll` 只在 `driver_project.is_some()` 时把会话折进项目组，被驱动会话因此以各自 cwd 为组键成**未分组顶层项**（不是折进其项目）；且 `worktree_reclaim::decide` 在 `driver_project` 为 `None` 时判 `Keep`，被驱动会话的 worktree **永不回收**。修法：引入通用字段 `managed_worktree`（会话 meta 的可选通用字段），由**插件侧在 `driver/next` 的动作里填值**；`worktree_reclaim::decide` 改为从 worktree 自身读分支；侧栏按 `managed_worktree` 归组。G1 的宿主测试 `a_launch_action_records_no_driver_origin_and_still_starts_a_turn` 现断言 `driver_project == None`，落地时需一并更新该断言。
+- **被驱动会话的 `driver_project` / `driver_ref` 恒为 `None`**：`thread/listAll` 只在
+  `driver_project.is_some()` 时把会话折进项目组，被驱动会话因此以各自 cwd 为组键成**未分组顶层项**（不是折进其项目）；且 `worktree_reclaim::decide` 在 `driver_project` 为 `None` 时判 `Keep`，被驱动会话的 worktree **永不回收**。修法：引入通用字段 `managed_worktree`（会话 meta 的可选通用字段），由**插件侧在 `driver/next` 的动作里填值**；`worktree_reclaim::decide` 改为从 worktree 自身读分支；侧栏按 `managed_worktree` 归组。G1 的宿主测试 `a_launch_action_records_no_driver_origin_and_still_starts_a_turn` 现断言 `driver_project == None`，落地时需一并更新该断言。
+  > **已由 main `95c488eb`（`27b63e01` 合入）落地（2026-10-19 实测）**：插件在 launch 动作里
+  > 填 `driver_project` / `driver_ref`，`session_driver.rs` 据此写入会话归属，`thread/listAll`
+  > 折进项目组。注意**实际采用的字段名是 `driver_project`（不是本文初稿提的 `managed_worktree`）**
+  > ——`managed_worktree` 在 `yi-agent-rs/crates/` 里零命中。故 G2 **不再需要**动这一处，
+  > 只需在验收时确认它仍然成立（Task 7）。
 - **宿主重启后卡滞留 / `Merging` 卡持有合并闸**：G1 删了 `recover_orphan_cards` 而 `DriverState` 是宿主内存，重启后插件收到空 `threads`，`Running`/`Launching`/`Merging` 卡无人结算，停在 `Merging` 的卡会让 `any_merging()` 恒真、该项目再无合并启动。本 spec 需确认插件侧对「宿主未上报且无在途动作」的卡做保守恢复（结算为 `needs_you` 并释放合并闸）在生命周期改造后仍生效。
 
 ### 5.6 CLI / TUI（刷新新增：`yi-agent` crate 的收口面）
