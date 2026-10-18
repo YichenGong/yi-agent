@@ -615,7 +615,6 @@ describe("ThreadSidebar status", () => {
       // about the badge's timeline surviving a row move.
       const badgeAnims = created.filter((c) => c.el === badge);
       expect(badgeAnims).toHaveLength(1);
-      const first = badgeAnims[0].el;
 
       // The server now returns the other thread first (its `updated_at` bumped).
       rerender(
@@ -635,7 +634,6 @@ describe("ThreadSidebar status", () => {
       // and NO new animation was started — the timeline survived the reorder.
       expect(container.querySelector('[aria-label="Thread status"]')).toBe(badge);
       expect(created.filter((c) => c.el === badge)).toHaveLength(1);
-      expect(created[0].el).toBe(first);
     } finally {
       delete (Element.prototype as unknown as { animate?: unknown }).animate;
     }

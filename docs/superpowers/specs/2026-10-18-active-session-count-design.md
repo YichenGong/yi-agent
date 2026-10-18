@@ -113,7 +113,7 @@ thread/listAll 快照的 status 字段 ───────────┼─�
 ```
 
 没有任何新数据源：指示器读的就是徽标读的那张表。因此有一条**可断言的不变量**：
-指示器的数字恒等于 `statuses` 里值为 `"running"` 的条目数，即侧栏里正在转圈的徽标数。
+指示器的数字恒等于 `statuses` 里值为 `"running"` 的条目数。
 
 ### 3.3 组件与落点
 
@@ -155,7 +155,8 @@ export function runningSessionsLabel(n: number): string {
 **齿轮本身的位置与样式逐像素不变**——这是硬要求：既有测试
 （`ThreadSidebar.test.tsx:950`）按可访问名 `设置` 定位它，用户也已习惯它的位置，本功能
 不该动它。指示器是新增的邻居，不是重新排布 footer。footer 是 `flex items-center` 且
-不设 `justify-between`，故两个子元素默认左对齐紧邻，无需任何新的对齐类。
+不设 `justify-between`，故两个子元素默认左对齐；指示器自己带一个 `ml-2` 的小间距
+（不加 `ml-auto`，齿轮的位置因此不变）。
 props 只要两个：`count: number`（由 `countRunningSessions(statuses)` 在 `ThreadSidebar`
 函数体内算出）与 `stale?: boolean`（沿用既有 `statusStale`）。
 
@@ -197,8 +198,9 @@ footer 在两端都渲染，故指示器两端都出现。**不特殊对待手�
 - **并发删除会话**：`store.drop(id)` 移除 view，下一轮渲染表里就没有它，计数自动回落。
 - **布局**：`count === 0` 时不渲染，故 0 与「有会话在跑」之间不存在宽度跳变源；从 0 变 1
   时胶囊出现会占据宽度，但 footer 是 `flex`、齿轮是第一个子元素，**齿轮不会位移**。
-  胶囊文案 `N 个会话运行中` 在两位数（`12`）时可能撑宽 footer，但它与齿轮同处一行且
-  胶囊自身 `shrink-0`；侧栏最窄 200px（`lib/sidebarWidth.ts` 的 `MIN_SIDEBAR_WIDTH`），
+  胶囊文案 `N 个会话运行中` 在两位数（`12`）时可能变长，但不会把 footer 撑破：胶囊容器
+  `min-w-0`、文案 `truncate`，过长即被截断；`shrink-0` 只加在旋转小环上，齿轮作为
+  first child 保持原位；侧栏最窄 200px（`lib/sidebarWidth.ts` 的 `MIN_SIDEBAR_WIDTH`），
   文案长度远小于该宽度。
 
 ### 3.6 测试
