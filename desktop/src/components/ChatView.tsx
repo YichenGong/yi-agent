@@ -4,6 +4,7 @@ import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
 import { useStickToBottom } from "../lib/useStickToBottom";
+import { useThrottledText } from "../lib/useThrottledText";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { ToolCallCard } from "./ToolCallCard";
@@ -228,6 +229,52 @@ const ChatItem = memo(
 );
 
 /**
+ * The live tail: the one item still being appended to in place, rendered with
+ * the streaming *agent message's* markdown throttled.
+ *
+ * **Why this is a separate component and not a hook call inside `ChatView`.**
+ * A throttle is stateful, and that state must not outlive the message it
+ * belongs to. Called directly in `ChatView`, the hook is shared by whichever
+ * item happens to be the tail, so when a *new* message takes the tail over
+ * inside the same window, the hook still holds the *previous* message's text
+ * and hands it to the new one: the next reply briefly renders as a copy of the
+ * last one (observed: the second turn's message showed `answer-one`), and the
+ * authoritative text only lands when the window elapses. `ChatView` re-renders
+ * between those points, but the hook's `pending`/`shown` are keyed on nothing.
+ * Keying this component by the tail's id remounts the throttle whenever the
+ * tail changes hands, so it starts from the new message's own text — which is
+ * also exactly the correct leading-edge render.
+ *
+ * Only the `agentMessage` tail is throttled. A non-agent tail (a
+ * reasoning/thinking block) keeps flowing through `itemText(item)` unthrottled:
+ * its whole text is a single block replaced per delta, throttling it buys
+ * nothing, and freezing it would re-break the CoT-tail liveness that `0865bc6a`
+ * deliberately fixed. The hook is still *called* unconditionally (rules of
+ * hooks) but fed a constant `""` there, so it is inert — no timers, no state
+ * churn — for a non-agent tail.
+ */
+function LiveTail({
+  item,
+  threadId,
+  call,
+}: {
+  item: Item | NoticeItem | ReasoningItem;
+  threadId: string | null;
+  call: ImageReadCall;
+}) {
+  const streamingAgent = item.type === "agentMessage";
+  const throttled = useThrottledText(streamingAgent ? item.text : "");
+  return (
+    <ChatItem
+      item={item}
+      text={streamingAgent ? throttled : itemText(item)}
+      threadId={threadId}
+      call={call}
+    />
+  );
+}
+
+/**
  * The settled history above the streaming tail.
  *
  * Its whole purpose is to *not* re-render while only the tail grows. It bails
@@ -373,10 +420,9 @@ export function ChatView({
         call={effectiveCall}
       />
       {tail && (
-        <ChatItem
+        <LiveTail
           key={tail.id ?? "tail"}
           item={tail}
-          text={tail ? itemText(tail) : ""}
           threadId={threadId}
           call={effectiveCall}
         />

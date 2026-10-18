@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, cleanup, screen, fireEvent } from "@testing-library/react";
+import { render, cleanup, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
 import type { NoticeItem } from "../lib/session";
 import { Session } from "../lib/session";
@@ -457,5 +457,54 @@ describe("ChatView live tail", () => {
     rerender(view(s));
 
     expect(container.textContent).toContain("think MORE");
+  });
+});
+
+describe("ChatView streaming markdown throttle", () => {
+  it("re-parses far fewer times than there are deltas, and still shows the final text", async () => {
+    const list: Item[] = [{ type: "agentMessage", id: "a1", text: "" } as Item];
+    const { container, rerender } = render(<ChatView items={list} />);
+    const settled = calls.text;
+
+    for (let i = 1; i <= 100; i += 1) {
+      (list[0] as { text: string }).text = "tok ".repeat(i);
+      rerender(<ChatView items={list} />);
+    }
+
+    // Far fewer than 100: the window collapses them.
+    expect(calls.text - settled).toBeLessThan(50);
+
+    // And the terminal value is visible — a throttle must not swallow it. The
+    // trailing edge defers by up to one window, so await it (a synchronous
+    // assertion here would fail for ANY correct throttle).
+    (list[0] as { text: string }).text = "FINAL";
+    rerender(<ChatView items={list} />);
+    await waitFor(() => expect(container.textContent).toContain("FINAL"));
+  });
+});
+
+describe("ChatView tail handover", () => {
+  it("does not leak the previous tail's throttled text into the next message", () => {
+    // A throttle is stateful; that state must not outlive the message it
+    // belongs to. Streaming deltas mutate the tail in place, so the *tail
+    // identity* is what changes when a turn ends and the next message starts —
+    // the throttle has to restart with it. Sharing one throttle across whoever
+    // is the tail makes the new reply render as a copy of the previous one
+    // until the old window elapses.
+    const first = { type: "agentMessage", id: "a1", text: "" } as Item;
+    const list: Item[] = [first];
+    const { container, rerender } = render(<ChatView items={list} />);
+
+    (first as { text: string }).text = "answer-one";
+    rerender(<ChatView items={list} />);
+
+    // Second turn starts inside the same throttle window.
+    const second = { type: "agentMessage", id: "a2", text: "answer-two" } as Item;
+    list.push(second);
+    rerender(<ChatView items={list} />);
+
+    expect(container.textContent).toContain("answer-two");
+    // The previous message stays rendered exactly once, in the frozen prefix.
+    expect(container.textContent?.match(/answer-one/g)).toHaveLength(1);
   });
 });
