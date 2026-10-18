@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type Ref } from "react";
 import { AttachmentChips } from "./AttachmentChips";
 import { ModeChip } from "./ModeChip";
 import { SlashPopup } from "./SlashPopup";
@@ -25,6 +25,10 @@ export function MessageInput({
   call,
   disabled = false,
   modelPicker,
+  cardRef,
+  dropActive = false,
+  caretSeek = null,
+  onCaretChange,
 }: {
   turnActive: boolean;
   onSend: (text: string) => Promise<boolean>;
@@ -81,6 +85,28 @@ export function MessageInput({
    * App 传入会话级模型下拉；`MessageInput` 不关心它是什么，只负责给它一个位置。
    */
   modelPicker?: ReactNode;
+  /**
+   * 卡片元素本身的 ref：上层（`App` 的拖放落点判定）需要卡片的矩形来算"拖到这里
+   * 才算数"。DOM 归属仍在本组件，故由本组件挂到卡片上，而不是让上层去查 DOM。
+   */
+  cardRef?: Ref<HTMLDivElement>;
+  /**
+   * 拖拽悬停在卡片上：整卡加一圈高亮，让"这里可以放"一眼可见。
+   *
+   * 用 `ring`（box-shadow）而非换 `border-*` 类：基础类里的 `border-line-strong`
+   * 是本卡边框的唯一来源（既有测试逐字节断言它），再叠一条 `border-*` 谁生效取决于
+   * 生成样式顺序，不可靠。
+   */
+  dropActive?: boolean;
+  /**
+   * 请求把光标放到 `pos`。带 `seq` 是为了让**连续两次落在同一位置**也能各生效一次
+   * ——否则两次拖入的参数对象相等，effect 依赖判不出变化。
+   */
+  caretSeek?: { seq: number; pos: number } | null;
+  /**
+   * 用户当前的光标位置，报给上层。上层记着它，拖入时才知道该往哪里插。
+   */
+  onCaretChange?: (caret: number) => void;
 }) {
   const [sending, setSending] = useState(false);
   // Latch: whether the popup should currently be offered. Escape clears it to
@@ -106,6 +132,16 @@ export function MessageInput({
   useEffect(() => {
     setSelected(0);
   }, [text]);
+
+  // 上层插入路径后请求把光标放回插入点：受控 textarea 的文本由父级换掉，光标
+  // 会跳到末尾，不这样摆一次，用户就得手动点回来。
+  useEffect(() => {
+    if (caretSeek === null) return;
+    const el = inputRef.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(caretSeek.pos, caretSeek.pos);
+  }, [caretSeek]);
 
   const handleSend = async () => {
     // 附件本身就是一条消息：只要有文字**或**至少一个附件就可以发；两者都空时
@@ -162,7 +198,12 @@ export function MessageInput({
        * 一列散在框外的控件。
        */}
       <div
-        className="rounded-lg border border-line-strong bg-surface transition-colors focus-within:border-fg-subtle"
+        ref={cardRef}
+        data-drop-active={dropActive ? "" : undefined}
+        className={
+          "rounded-lg border border-line-strong bg-surface transition-colors focus-within:border-fg-subtle" +
+          (dropActive ? " ring-2 ring-blue-500" : "")
+        }
         data-testid="composer-card"
       >
         <AttachmentChips
@@ -193,6 +234,9 @@ export function MessageInput({
             onCompositionStart={ime.onCompositionStart}
             onCompositionEnd={ime.onCompositionEnd}
             onBlur={ime.resetComposition}
+            onSelect={(e) => onCaretChange?.(e.currentTarget.selectionStart)}
+            onClick={(e) => onCaretChange?.(e.currentTarget.selectionStart)}
+            onKeyUp={(e) => onCaretChange?.(e.currentTarget.selectionStart)}
             onKeyDown={(e) => {
               if (isImeEnter(e, ime.composing.current)) return;
               if (showPopup && options.length > 0) {

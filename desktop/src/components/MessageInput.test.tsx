@@ -630,3 +630,44 @@ describe("MessageInput", () => {
     });
   });
 });
+
+describe("拖入高亮与光标", () => {
+  it("dropActive 为真时卡片加高亮 ring 并带 data-drop-active 标记", () => {
+    renderInput({ dropActive: true });
+    const card = screen.getByTestId("composer-card");
+    expect(card.getAttribute("data-drop-active")).not.toBeNull();
+    expect(card.className).toContain("ring-2");
+    expect(card.className).toContain("ring-blue-500");
+  });
+
+  it("默认（无拖拽）时没有高亮、没有标记，基础类逐字节不变", () => {
+    renderInput();
+    const card = screen.getByTestId("composer-card");
+    expect(card.getAttribute("data-drop-active")).toBeNull();
+    expect(card.className).not.toContain("ring-2");
+    expect(card.className).toContain("rounded-lg");
+    expect(card.className).toContain("border-line-strong");
+  });
+
+  it("用户移动光标时把位置报给上层", () => {
+    const onCaretChange = vi.fn();
+    renderInput({ value: "hello", onCaretChange });
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    textarea.setSelectionRange(3, 3);
+    fireEvent.select(textarea);
+    expect(onCaretChange).toHaveBeenCalledWith(3);
+  });
+
+  it("caretSeek 提供时把光标放到指定位置", () => {
+    renderInput({ value: "hello world", caretSeek: { seq: 1, pos: 6 } });
+    const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(textarea.selectionStart).toBe(6);
+    expect(textarea.selectionEnd).toBe(6);
+  });
+
+  it("cardRef 落到卡片元素上", () => {
+    const ref: { current: HTMLDivElement | null } = { current: null };
+    renderInput({ cardRef: ref });
+    expect(ref.current).toBe(screen.getByTestId("composer-card"));
+  });
+});
