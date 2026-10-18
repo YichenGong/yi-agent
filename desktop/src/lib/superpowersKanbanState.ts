@@ -11,7 +11,7 @@ export interface BoardCard {
   progress: string | null;
   detail: string;
   threadId: string | null;
-  /** 标题：spec 文件名去扩展名；无 spec_path 时回退 id。 */
+  /** 标题：显式 `title` 优先；否则 spec 文件名去扩展名，无 spec_path 时回退 id。 */
   title?: string;
   specPath?: string;
   planPath?: string;
@@ -82,7 +82,10 @@ export function normalizeCard(raw: unknown): BoardCard | null {
     progress: null,
     detail,
     threadId,
-    title: deriveTitle(specPath, id),
+    title:
+      typeof record.title === "string" && record.title !== ""
+        ? record.title
+        : deriveTitle(specPath, id),
     specPath: specPath !== "" ? specPath : undefined,
     planPath: planPath !== "" ? planPath : undefined,
     workdir: workdir !== "" ? workdir : undefined,

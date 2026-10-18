@@ -20,11 +20,11 @@ export function SuperpowersKanbanBoard({
 }) {
   const columns = boardColumns(cards);
   const visibleDone = collapseDone(columns.done, expandedDone);
-  const order: BoardColumnKey[] = ["queued", "doing", "needDecision", "done"];
+  const order: BoardColumnKey[] = ["preQueued", "queued", "doing", "needDecision", "done"];
 
   return (
     // 宽度自适应：行容器**不再**声明 `overflow-x-auto`（那就是左右滚动本身）。
-    // 宽屏（`md` 起）四列并排、各自 `flex-1 min-w-0` 均分宽度，长标题在卡内截断；
+    // 宽屏（`md` 起）五列并排（最左常驻 PRE-QUEUED）、各自 `flex-1 min-w-0` 均分宽度，长标题在卡内截断；
     // 窄屏纵向堆叠、整行上下滚动——宁可上下滑，不要左右滑。
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3 md:flex-row">
       {order.map((key) => {

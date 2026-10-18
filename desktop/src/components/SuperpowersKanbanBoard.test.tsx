@@ -11,12 +11,13 @@ function card(id: string, state: string, extra: Partial<BoardCard> = {}): BoardC
 }
 
 describe("SuperpowersKanbanBoard", () => {
-  it("renders the four column headers with counts", () => {
+  it("renders the five column headers with counts", () => {
     render(
       <SuperpowersKanbanBoard
         cards={[card("q", "queued"), card("r", "running"), card("n", "needs_you"), card("d", "done")]}
       />,
     );
+    expect(screen.getByText("PRE-QUEUED · 0")).toBeTruthy();
     expect(screen.getByText("QUEUED · 1")).toBeTruthy();
     expect(screen.getByText("DOING · 1")).toBeTruthy();
     expect(screen.getByText("NEED DECISION · 1")).toBeTruthy();
@@ -71,10 +72,14 @@ describe("SuperpowersKanbanBoard", () => {
     expect(screen.queryByText("thread-1")).toBeNull();
   });
 
-  it("keeps all four columns visible when empty", () => {
+  it("keeps all five columns visible when empty", () => {
     render(<SuperpowersKanbanBoard cards={[]} />);
-    expect(screen.getByText(/queued/i)).toBeTruthy();
-    expect(screen.getByText(/done/i)).toBeTruthy();
+    // 精确匹配表头，`/queued/i` 会同时命中 `PRE-QUEUED` 与 `QUEUED` 两列。
+    expect(screen.getByText("PRE-QUEUED · 0")).toBeTruthy();
+    expect(screen.getByText("QUEUED · 0")).toBeTruthy();
+    expect(screen.getByText("DOING · 0")).toBeTruthy();
+    expect(screen.getByText("NEED DECISION · 0")).toBeTruthy();
+    expect(screen.getByText("DONE · 0")).toBeTruthy();
   });
 });
 
