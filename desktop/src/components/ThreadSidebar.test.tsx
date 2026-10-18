@@ -5,7 +5,7 @@ import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import { LONG_PRESS_MS } from "../lib/useLongPress";
 import { DEFAULT_TAG_NAMES, resolveTagNames } from "../lib/threadTags";
-import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
+import type { ThreadStatus, ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import {
   DEFAULT_SIDEBAR_WIDTH,
   MIN_SIDEBAR_WIDTH,
@@ -610,8 +610,12 @@ describe("ThreadSidebar status", () => {
       const { container, rerender } = render(<ThreadSidebar {...props} />);
       const badge = container.querySelector('[aria-label="Thread status"]')!;
       expect(badge).not.toBeNull();
-      expect(created).toHaveLength(1);
-      const first = created[0].el;
+      // Scope to the badge's own animation: the footer's running-session indicator
+      // spins too (a different element, so its own animation), and this test is
+      // about the badge's timeline surviving a row move.
+      const badgeAnims = created.filter((c) => c.el === badge);
+      expect(badgeAnims).toHaveLength(1);
+      const first = badgeAnims[0].el;
 
       // The server now returns the other thread first (its `updated_at` bumped).
       rerender(
@@ -630,7 +634,7 @@ describe("ThreadSidebar status", () => {
       // The row was moved (order flipped) but the badge element is the same node
       // and NO new animation was started — the timeline survived the reorder.
       expect(container.querySelector('[aria-label="Thread status"]')).toBe(badge);
-      expect(created).toHaveLength(1);
+      expect(created.filter((c) => c.el === badge)).toHaveLength(1);
       expect(created[0].el).toBe(first);
     } finally {
       delete (Element.prototype as unknown as { animate?: unknown }).animate;
@@ -952,6 +956,37 @@ describe("ThreadSidebar pinned section", () => {
     renderSidebar({ onOpenSettings });
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     expect(onOpenSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the running-session count beside the settings button", () => {
+    const statuses = new Map<string, ThreadStatus>([
+      ["1", "running"],
+      ["2", "awaiting_approval"],
+      ["3", "running"],
+    ]);
+    renderSidebar({ statuses });
+
+    // 只数 running(2 条),审批中的那条不计。
+    expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.getByText("2 个会话运行中")).toBeTruthy();
+    // 齿轮仍在(新胶囊没有把它挤掉)。
+    expect(screen.getByRole("button", { name: "设置" })).toBeTruthy();
+  });
+
+  it("renders no running-session indicator when nothing is running", () => {
+    renderSidebar({ statuses: new Map([["1", "idle"]]) });
+
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("button", { name: "设置" })).toBeTruthy();
+  });
+
+  it("marks the running-session count as possibly stale when offline", () => {
+    renderSidebar({
+      statuses: new Map([["1", "running"]]),
+      statusStale: true,
+    });
+
+    expect(screen.getByTitle("1 个会话运行中（可能过期）")).toBeTruthy();
   });
 
   it("spawns a ripple at the pointer position on the New-thread button", () => {
