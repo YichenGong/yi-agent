@@ -53,6 +53,9 @@ unifiedDiff 原始大小                       2,335,164 字节 → 被 MAX_DIFF
 | 命令的权威性 | 命令与退出码**随帧下发**并显示在视图头部，用户可自行复核。 |
 | 帧是否落盘 | **不落盘**。与既有 diff 一致，现算。「刷新」= 重跑同一条命令。 |
 | 注入防护 | 所有拼接模型字符串的 git 调用加 `--end-of-options`，并对 ref/命令做校验。 |
+| 工具 vs skill 的边界 | **工具保持为工具**（`show_git_diff`），skill 只管「何时/怎么用」。skill 无执行能力，无法广播或切换前端 Tab。 |
+| 工具的来源归类 | `ToolSource` 从 `Plugin { name: "ui" }` 改为 `Builtin`（与 `bash` 同级；它由 app-server 实现并注册，不是插件）。 |
+| 判断知识的位置 | 移进 `git-diff-review` skill（命令样例集），工具保持薄执行器。 |
 | 旧会话锚点 | **不回填**（方案 1）。无锚点的会话维持既有行为；不回填、不读时写入。 |
 | 合并提交的展示 | `commit_diff` 改用 `--first-parent`。 |
 
@@ -79,6 +82,7 @@ unifiedDiff 原始大小                       2,335,164 字节 → 被 MAX_DIFF
 - 不做 side-by-side、word-level 高亮、行批注。
 - 不改「子 agent」「后台进程」两个 Tab 的既有行为。
 - 不做会话内「按 turn 划分改动」。锚点是会话级近似，多任务会话仍会混在一起（§6 已列为已知限制）。
+- 不把工具改成 skill（skill 无执行能力，见 §5.9）。
 
 ## 4. 架构
 
@@ -139,7 +143,7 @@ git diff --no-color --end-of-options HEAD~1..HEAD              → 正常输出 
 | `session_anchor` | `git_diff.rs` | 取 `rev-parse HEAD`;校验 ref/范围;`--end-of-options` 封装;超时执行 |
 | `ViewFrame` | `git_diff.rs` | 帧类型 + 按 threadId 的内存快照 |
 | `thread/view/read` | `server.rs` | RPC：取该会话的当前帧 |
-| `show_git_diff` 扩展 | `git_diff_tool.rs` | 接受 `command`/`as`;执行并回执**实际**结果 |
+| `show_git_diff` 扩展 | `git_diff_tool.rs` | 接受 `command`/`as`;执行并回执**实际**结果;来源归类改 `Builtin` |
 | `ui/gitDiff/focus` | `protocol.rs` + `server.rs` | 通知（沿用既有方法名，去掉 `base` 字段——帧已承载基准） |
 | 渲染原语 | `desktop/src/lib/viewFrame.ts` | 原语判定与解析（`diff` 复用 `gitDiff.ts`,`log` 新增,`text` 纯展示） |
 | `GitDiffView` 扩展 | `desktop/src/components/` | 按原语渲染 + 命令条 + 懒加载（D1 修复） |
@@ -162,7 +166,35 @@ git diff --no-color --end-of-options HEAD~1..HEAD              → 正常输出 
 - **ref / 范围校验**：单 ref 走 `rev-parse --verify --quiet`；范围表达式（含 `..` / `...`）走 `rev-parse --verify` 的**范围形式校验**（实测 `rev-parse --verify 'A..B'` 会失败，故范围需按 `..` 拆成两端分别校验，两侧都必须可解析）。
 - **超时**：默认 10s（`VIEW_TIMEOUT`）。超时即失败帧，回执如实报 timeout。
 - **输出上限**：`MAX_VIEW_BYTES = 256 * 1024`（沿用现值），超出置 `truncated`。
-- **沙箱**：`SandboxPolicy::new(SandboxMode::ReadOnly, cwd, vec![])`，`app-server` 已依赖 `yi-agent-tools`，直接复用。ReadOnly 下写操作被拒——模型即使给恶意命令也落不了盘。
+- **沙箱**：`SandboxPolicy::new(SandboxMode::ReadOnly, cwd, vec![])`，`app-server` 已依赖 `yi-agent-tools`，直接复用。
+
+**ReadOnly 沙箱实测（macOS `sandbox-exec`，git 2.50.1，策略与 `sandbox.rs:153` 同源）**：
+
+读命令全部可用：
+
+```
+git log --oneline -3            → OK
+git diff HEAD~1..HEAD --stat    → OK
+git status --short              → OK
+git show HEAD --stat            → OK
+git rev-parse HEAD              → OK
+```
+
+写路径全部被拒：
+
+```
+git stash push -m probe                      → 拒绝 rc=1   「could not write index」
+git commit --allow-empty -m probe            → 拒绝 rc=128 「Unable to create '.git/index.lock'」
+git add .                                    → 拒绝 rc=128 「Unable to create '.git/index.lock'」
+git diff --numstat --output=/tmp/probe.txt   → 拒绝 rc=128 「could not open for writing」
+git log -3 > /tmp/probe.txt                  → 拒绝 rc=1   「Operation not permitted」
+```
+
+事后确认：两个探针文件都不存在，仓库提交数不变。
+
+**一个重要的次要收益**：ReadOnly 沙箱是比 `--end-of-options` **更强**的第二道防线——它连带挡住 shell 重定向（`> file`）这类 `--end-of-options` 管不到的面。所以 §5.2 的两道防护是互补的，不是冗余：`--end-of-options` 挡「把 `--output=` 当 ref 传给 git」，沙箱挡「任何实际写入」。
+
+**一个必须接受的取舍**：`git stash` 系列在视图通道里不可用（它需要写 `.git/index`）。`git diff stash@{0}` 这类**读取** stash 的命令可用，但 `git stash push` 不行。设计上接受这一点：视图通道定位是「展示」，不是「改状态」；模型要改状态应走 `bash`（而 `bash` 同样受沙箱管辖，这是既有语义）。
 
 ### 5.3 L2 + L3：命令即接口
 
@@ -232,6 +264,21 @@ pub struct ViewFrame {
 - `baseKind` 渲染为可读标签（`session` → 「本次会话」），不再直接打印原始 ref。
 - 有 `command` 时头部显示命令原文与退出码。
 
+### 5.9 工具与 skill 的分工（甲方案）
+
+**工具 `show_git_diff` 保持为工具**，理由：skill 是一段写给模型看的 Markdown，**没有执行能力**——不能广播通知、不能切换前端 Tab。改成 skill 等于删掉这个能力。
+
+两处修正：
+
+1. **来源归类**：`ToolSource::Plugin { name: "ui" }` → `ToolSource::Builtin`。它与 `bash` 同级（app-server 实现并注册），不是插件。当前 `ToolSource` 只作标注来源（不影响权限与可用性，见消费点核查），但归类错了。
+2. **`git-diff-review` skill 大改**：现有 SKILL.md 是围绕「选 `base`」写的，新方向下改为教模型**写命令 + 选原语**，含命令样例集：
+   - 探规模（避免一开口就拉 2MB）：`git diff --stat`、`git diff --numstat`；
+   - 看提交：`git log --oneline -10`；
+   - 看未提交：`git diff HEAD`；
+   - 看某目录/某文件：`git diff <base> -- <path>`；
+   - 何时该请人 review、何时不该打扰。
+   skill 里明确写清：**命令在只读沙箱内跑**，所以别写会改状态的命令（如 `git stash push`），改了也只会得到一个拒绝。
+
 ## 6. 错误与边界
 
 | 情形 | 表现 |
@@ -239,11 +286,12 @@ pub struct ViewFrame {
 | 非 git 目录 | 结构化默认返回 `worktree-only`；命令执行返回退出码非 0 的失败帧 |
 | 锚点不可达（rebase / gc 掉） | 降级到默认分支候选链，**不**降级到「仅工作区」（后者会让 diff 突然只剩未提交改动，比报错更难理解） |
 | 命令超时 | 失败帧，回执报 timeout |
-| 沙箱拒绝写 | 命令失败，退出码非 0，stderr 随帧可见 |
+| 沙箱拒绝写 | 命令失败，退出码非 0，stderr 随帧可见（如 `git stash push` 被拒：「could not write index」） |
 | 输出超长 | 截断 + `truncated`，文件列表不受影响 |
 | 原语判定错 | 回退 `text` |
 | 无帧 | 空态文案 |
 | 会话内多个任务 | **已知限制**：锚点是会话级，多任务会话的改动会混在一起。不做按 turn 划分。 |
+| 非 git 仓库 + 模型给了 command | 命令失败帧（git 自身报 exit 128），stderr 随帧可见，而非空面板 |
 
 ## 7. 测试
 
@@ -256,6 +304,9 @@ pub struct ViewFrame {
 - `file_diff`：未跟踪文件有正文。
 - `commit_diff`：merge 有正文，非 merge 与旧行为等价。
 - 回执：报实际 base，而非入参。
+- 沙箱：写路径被拒（`git stash push` / `git add`），读路径可用；`--output=` 与 shell 重定向都落不了盘。
+- `ToolSource`：`show_git_diff` 报 `Builtin`。
+- skill：`install_system_skills` 装出的 `git-diff-review/SKILL.md` 含命令样例。
 - 帧：每个会话一帧；`thread/view/read` 取到；无帧返回 null。
 
 **TS**
@@ -274,3 +325,5 @@ pub struct ViewFrame {
 4. **模型不可靠**：命令写错 → 空或错内容。缓解是命令可见 + 退出码随帧 + `text` 保底，但不消除。
 5. **旧会话仍难看**：无锚点的既有会话维持旧行为。
 6. **放宽了命令面**：模型能跑 git 命令，防护靠只读沙箱 + 超时 + 输出上限，而非白名单。
+7. **`git stash` 系列在视图通道不可用**：写 `.git/index` 被只读沙箱拒（实测）。视图通道定位是「展示」而非「改状态」；要改状态走 `bash`。
+8. **skill 不能替代工具**：skill 是提示词，无执行能力。它能教模型怎么写命令，但不能广播或切换 Tab。
