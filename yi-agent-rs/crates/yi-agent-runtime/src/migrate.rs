@@ -7,10 +7,21 @@ use crate::config::MODEL_ENV_KEYS;
 #[derive(Debug, PartialEq, Eq)]
 pub enum MigrationOutcome {
     NothingToDo,
-    Migrated { entry: String },
+    Migrated {
+        entry: String,
+    },
     AlreadyCategorized,
-    EnvNotWritable { reason: String },
-    CatalogNotWritable { reason: String },
+    EnvNotWritable {
+        reason: String,
+    },
+    CatalogNotWritable {
+        reason: String,
+    },
+    /// `.env` 里的 `YI_AGENT_PROVIDER` 认不出来（用户输入错误）。一行都没写：
+    /// 既没落清单，也没注释 `.env`，用户可以改正后重跑。
+    InvalidProvider {
+        reason: String,
+    },
 }
 
 fn is_model_key(key: &str) -> bool {
@@ -114,8 +125,11 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
                 declared
             }
         };
+        // 无法识别的 provider 是**用户 .env 里的输入错误**，不是存储故障：
+        // 此时一行都还没写。用 `CatalogNotWritable` 描述它会让 Task 6 的
+        // `log_outcome` 报出一个并不存在的「清单不可写」，掩盖真正的原因。
         let Some(parsed) = crate::models::ModelProvider::parse(&provider) else {
-            return MigrationOutcome::CatalogNotWritable {
+            return MigrationOutcome::InvalidProvider {
                 reason: format!("unknown provider: {provider}"),
             };
         };
@@ -231,6 +245,12 @@ pub fn log_outcome(outcome: &MigrationOutcome, env_path: &Path) {
             path = %env_path.display(),
             %reason,
             "could not migrate the legacy model keys; .env was left untouched"
+        ),
+        MigrationOutcome::InvalidProvider { reason } => tracing::warn!(
+            path = %env_path.display(),
+            %reason,
+            "could not migrate the legacy model keys: YI_AGENT_PROVIDER in .env names an \
+             unknown provider; .env was left untouched"
         ),
     }
 }
@@ -506,5 +526,59 @@ mod tests {
         );
         let catalog = crate::models::load_catalog_from(&models);
         assert_eq!(catalog.models[0].api_key, "sk-ant-x");
+    }
+
+    /// 认不出的 provider 是 `.env` 的输入错误，不是存储故障：结果必须是
+    /// `InvalidProvider`（而不是谎报「清单不可写」），且一行都没写。
+    #[test]
+    fn an_unknown_provider_is_reported_as_such_and_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env_text = "YI_AGENT_PROVIDER=azure\nMODEL_API_KEY=sk-x\n";
+        let env = write_env(dir.path(), env_text);
+        let models = dir.path().join("models.json");
+
+        match migrate_model_keys(&env, &models) {
+            MigrationOutcome::InvalidProvider { reason } => {
+                assert!(reason.contains("azure"), "got {reason}");
+            }
+            other => panic!("expected InvalidProvider, got {other:?}"),
+        }
+        // 没落清单（否则会造出一个 anthropic 默认值的假条目）……
+        assert!(
+            !models.exists(),
+            "an unparsable provider must not create a catalog"
+        );
+        // ……也没动 .env：用户可以改正 provider 后重跑。
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), env_text);
+    }
+
+    /// 设计 §6 点名的丢 key 场景：清单所在目录不可写 → 绝不注释 `.env`。
+    /// （已有的 `a_corrupt_catalog_is_never_clobbered` 覆盖「文件坏」，
+    /// 这条覆盖「写不下去」。）
+    #[test]
+    fn a_read_only_catalog_dir_leaves_the_env_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir_all(&ro).unwrap();
+        let models = ro.join("models.json");
+        let env_text = "MODEL_API_KEY=sk-x\nYI_AGENT_MAX_TURNS=20\n";
+        let env = write_env(dir.path(), env_text);
+        let mut perms = std::fs::metadata(&ro).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&ro, perms).unwrap();
+
+        match migrate_model_keys(&env, &models) {
+            MigrationOutcome::CatalogNotWritable { .. } => {}
+            other => panic!("expected CatalogNotWritable, got {other:?}"),
+        }
+        // 顺序规则的要害：清单没落成 → `.env` 逐字节不动，用户的 key 不丢。
+        assert_eq!(std::fs::read_to_string(&env).unwrap(), env_text);
+        assert!(!models.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 }

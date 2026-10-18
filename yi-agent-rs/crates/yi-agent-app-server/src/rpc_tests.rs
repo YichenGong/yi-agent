@@ -15734,7 +15734,7 @@ fn startup_migrates_legacy_model_keys_into_the_catalog() {
     );
 }
 
-/// `log_outcome` 必须对五种结果都不 panic（日志措辞由 tracing 承接）。
+/// `log_outcome` 必须对每一种结果都不 panic（日志措辞由 tracing 承接）。
 #[test]
 fn log_outcome_handles_every_variant() {
     use yi_agent_runtime::migrate::{MigrationOutcome, log_outcome};
@@ -15751,6 +15751,12 @@ fn log_outcome_handles_every_variant() {
     log_outcome(
         &MigrationOutcome::CatalogNotWritable {
             reason: "ro".into(),
+        },
+        env,
+    );
+    log_outcome(
+        &MigrationOutcome::InvalidProvider {
+            reason: "unknown provider: azure".into(),
         },
         env,
     );
