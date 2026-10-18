@@ -1662,12 +1662,31 @@ fn spawn_sandbox(
 /// well under the IPC frame cap so a base64-encoded chunk still fits one frame.
 const FORK_CHUNK_BYTES: usize = 256 * 1024;
 
-/// Resolves the optional `fork` argument for a daemon `spawn_agent` call. Off by
-/// default; an explicit non-boolean value is rejected rather than ignored.
-fn spawn_fork(args: &Value) -> Result<bool, ToolResult> {
+/// Which fork behaviour a `spawn_agent` call asked for.
+///
+/// The distinction matters because the strict contract differs by origin: a
+/// caller that explicitly asked to fork must never silently receive a
+/// contextless child, while the default path must degrade to an unforked spawn
+/// rather than fail a routine delegation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkChoice {
+    /// `fork` was omitted: fork, but degrade instead of failing.
+    Default,
+    /// `fork: true`: fork, and report a failure if that is impossible.
+    Yes,
+    /// `fork: false`: do not fork at all.
+    No,
+}
+
+/// Resolves the optional `fork` argument for a daemon `spawn_agent` call.
+///
+/// Omitted means fork (the default); an explicit non-boolean value is rejected
+/// rather than ignored.
+fn spawn_fork(args: &Value) -> Result<ForkChoice, ToolResult> {
     match args.get("fork") {
-        None => Ok(false),
-        Some(Value::Bool(value)) => Ok(*value),
+        None => Ok(ForkChoice::Default),
+        Some(Value::Bool(true)) => Ok(ForkChoice::Yes),
+        Some(Value::Bool(false)) => Ok(ForkChoice::No),
         Some(_) => Err(ToolResult::error("fork must be a boolean")),
     }
 }
@@ -1754,9 +1773,14 @@ fn drive_fork_upload(
 /// returns the token the spawn request names.
 ///
 /// The snapshot is taken here, at call time, so the child inherits the caller's
-/// history as of this delegation rather than at tool-assembly time. An unbound
-/// caller is an explicit error: a caller that asked for `fork:true` must never
-/// silently receive a contextless child.
+/// history as of this delegation rather than at tool-assembly time.
+///
+/// Failures here are returned as `Err`; whether they are fatal is decided by the
+/// caller ([`spawn_fork_token`]): a `fork:true` request reports them, while the
+/// default path degrades to an unforked spawn. This function deliberately does
+/// not classify its failures, because the degradation policy is identical for
+/// both cases and the daemon's size cap is env-configurable
+/// (`YI_AGENT_FORK_MAX_BYTES`), so a client-side mirror of it would only drift.
 fn upload_forked_context(
     socket: &Path,
     handle: &crate::binding::RuntimeHandle,
@@ -1800,15 +1824,29 @@ fn abort_unconsumed_fork(socket: &Path, fork_token: &Option<String>) {
 
 /// Resolves the `fork_token` a spawn request should carry: uploading the
 /// caller's transcript when `fork` is set, and `None` otherwise.
+///
+/// A [`ForkChoice::Default`] attempt that cannot produce a payload degrades to
+/// `None`; a [`ForkChoice::Yes`] attempt reports the failure, because a caller
+/// that asked for a fork must not silently get a contextless child.
 fn spawn_fork_token(
     args: &Value,
     handle: &crate::binding::RuntimeHandle,
     caller: &CallerContext,
 ) -> Result<Option<String>, ToolResult> {
-    if !spawn_fork(args)? {
-        return Ok(None);
+    match spawn_fork(args)? {
+        ForkChoice::No => Ok(None),
+        ForkChoice::Yes => upload_forked_context(&handle.socket_path, handle, caller).map(Some),
+        ForkChoice::Default => match upload_forked_context(&handle.socket_path, handle, caller) {
+            Ok(token) => Ok(Some(token)),
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    "default fork is unavailable; spawning without inherited context"
+                );
+                Ok(None)
+            }
+        },
     }
-    upload_forked_context(&handle.socket_path, handle, caller).map(Some)
 }
 
 struct DaemonSpawnAgentTool {
@@ -2839,6 +2877,113 @@ mod tests {
         assert!(matches!(
             non_string.content.as_slice(),
             [yi_agent_core::ContentBlock::Text(text)] if text.contains("mode must be a string")
+        ));
+    }
+
+    /// A fresh handle over literals, for exercising the fork helpers without a
+    /// live daemon. `test_root` cannot be used here: it is a `ThreadRoot`, not
+    /// the `RuntimeHandle` these helpers take.
+    fn fork_test_handle() -> crate::binding::RuntimeHandle {
+        crate::binding::RuntimeHandle {
+            socket_path: PathBuf::from("/tmp/unused.sock"),
+            workspace_root: PathBuf::from("/tmp/unused-ws"),
+            session_id: "s".into(),
+            task_id: "t".into(),
+            capability: "c".into(),
+        }
+    }
+
+    #[test]
+    fn daemon_spawn_fork_defaults_to_yes_and_parses_both_explicit_spellings() {
+        assert_eq!(
+            spawn_fork(&json!({})).unwrap(),
+            ForkChoice::Default,
+            "an omitted fork must take the new default-on path"
+        );
+        assert_eq!(
+            spawn_fork(&json!({ "fork": true })).unwrap(),
+            ForkChoice::Yes,
+            "an explicit true is a caller requirement"
+        );
+        assert_eq!(
+            spawn_fork(&json!({ "fork": false })).unwrap(),
+            ForkChoice::No,
+            "an explicit false is the escape hatch"
+        );
+
+        let bad = spawn_fork(&json!({ "fork": "yes" })).unwrap_err();
+        assert!(bad.is_error);
+        assert!(matches!(
+            bad.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("fork must be a boolean")
+        ));
+    }
+
+    #[test]
+    fn an_explicit_fork_false_never_attempts_an_upload() {
+        let handle = fork_test_handle();
+        let caller = CallerContext::unbound();
+        // `fork:false` must short-circuit before touching any socket, so the
+        // unreachable path is fine: reaching it would be the failure.
+        let token = spawn_fork_token(&json!({ "fork": false }), &handle, &caller)
+            .expect("fork:false is a clean no-op, not an error");
+        assert_eq!(token, None, "fork:false must not upload anything");
+    }
+
+    /// The caller's transcript being unavailable is fatal only when the caller
+    /// demanded fork. On the default path it degrades: the delegation still
+    /// happens, just without inherited context.
+    #[test]
+    fn an_unbound_caller_degrades_on_the_default_path_but_fails_when_demanded() {
+        let handle = fork_test_handle();
+        let caller = CallerContext::unbound();
+
+        let default_token = spawn_fork_token(&json!({}), &handle, &caller)
+            .expect("the default path must degrade, not fail, when no context is bound");
+        assert_eq!(
+            default_token, None,
+            "a degraded spawn carries no fork token"
+        );
+
+        let demanded = spawn_fork_token(&json!({ "fork": true }), &handle, &caller)
+            .expect_err("an explicit fork:true must report the missing context");
+        assert!(demanded.is_error);
+        assert!(matches!(
+            demanded.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("fork requested but no caller context available")
+        ));
+    }
+
+    /// Every upload failure degrades on the default path, not just the
+    /// "no context" one. A bound caller over an unreachable socket exercises the
+    /// transport-failure class, which is the same class an oversized payload
+    /// lands in (the daemon rejects it at `BeginForkUpload`) -- so this test
+    /// covers the degradation policy without needing a daemon whose size cap is
+    /// settable only through a process-global env var.
+    #[test]
+    fn an_unreachable_daemon_degrades_on_the_default_path_but_fails_when_demanded() {
+        let handle = fork_test_handle();
+        let session = Arc::new(Mutex::new(Session::from_messages(vec![Message::user(
+            "parent history",
+        )])));
+        let caller = CallerContext::new(session);
+
+        let default_token = spawn_fork_token(&json!({}), &handle, &caller)
+            .expect("a transport failure must degrade on the default path");
+        assert_eq!(
+            default_token, None,
+            "a degraded spawn carries no fork token"
+        );
+
+        let demanded = spawn_fork_token(&json!({ "fork": true }), &handle, &caller)
+            .expect_err("an explicit fork:true must report the transport failure");
+        assert!(demanded.is_error);
+        assert!(matches!(
+            demanded.content.as_slice(),
+            [yi_agent_core::ContentBlock::Text(text)]
+                if text.contains("daemon is unavailable")
         ));
     }
 
