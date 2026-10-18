@@ -98,27 +98,11 @@ impl SlashCommand {
             SlashCommand::Cost => "cost",
             SlashCommand::Compact => "compact",
             SlashCommand::Config => "config",
-            SlashCommand::Help => "help",
-            SlashCommand::Agents => "agents",
-            SlashCommand::Agent => "agent",
-            SlashCommand::Events => "events",
-            SlashCommand::Diff => "diff",
-            SlashCommand::Mailbox => "mailbox",
-            SlashCommand::Message => "message",
-            SlashCommand::Pause => "pause",
-            SlashCommand::Resume => "resume",
-            SlashCommand::Cancel => "cancel",
-            SlashCommand::Retry => "retry",
-            SlashCommand::Priority => "priority",
-            SlashCommand::Approve => "approve",
-            SlashCommand::Deny => "deny",
-            SlashCommand::Review => "review",
-            SlashCommand::Budget => "budget",
-            SlashCommand::Daemon => "daemon",
-            SlashCommand::Mcp => "mcp",
             SlashCommand::Runtime => "runtime",
             SlashCommand::Kanban => "superpowers-kanban",
             SlashCommand::Plugins => "plugins",
+            // 其余变体都由上面的 `control_spec()` 提前返回。
+            _ => unreachable!("control commands return their name from the catalog"),
         }
     }
 
@@ -135,27 +119,11 @@ impl SlashCommand {
             SlashCommand::Cost => "显示 token 使用量",
             SlashCommand::Compact => "压缩对话历史",
             SlashCommand::Config => "显示当前配置",
-            SlashCommand::Help => "显示帮助信息",
-            SlashCommand::Agents => "显示当前 session 的 agent 任务树",
-            SlashCommand::Agent => "显示单个 agent 详情 (需要任务 ID)",
-            SlashCommand::Events => "查看任务事件 (需要任务 ID)",
-            SlashCommand::Diff => "查看任务 diff (需要任务 ID)",
-            SlashCommand::Mailbox => "查看任务 mailbox (需要任务 ID)",
-            SlashCommand::Message => "向相邻 agent 发送消息",
-            SlashCommand::Pause => "暂停任务",
-            SlashCommand::Resume => "恢复任务",
-            SlashCommand::Cancel => "取消任务",
-            SlashCommand::Retry => "创建新的重试 attempt",
-            SlashCommand::Priority => "调整任务优先级",
-            SlashCommand::Approve => "批准权限请求",
-            SlashCommand::Deny => "拒绝权限请求",
-            SlashCommand::Review => "查看 delivery 审查",
-            SlashCommand::Budget => "查看或收窄任务预算",
-            SlashCommand::Daemon => "管理本地 runtime daemon",
-            SlashCommand::Mcp => "管理 MCP server 开关",
             SlashCommand::Runtime => "查看或设置子 Agent runtime 偏好",
             SlashCommand::Kanban => "Superpowers 看板：查看 / 开关 / 创建 / 移除本目录的看板",
             SlashCommand::Plugins => "列出已安装插件 / 查看与设置插件配置",
+            // 其余变体都由上面的 `control_spec()` 提前返回。
+            _ => unreachable!("control commands return their name from the catalog"),
         }
     }
 
@@ -165,25 +133,16 @@ impl SlashCommand {
             return (!spec.usage.is_empty()).then_some(spec.usage);
         }
         match self {
-            SlashCommand::Agents => Some("[--all|--active]"),
             // `default` 是保留字（清空会话覆盖、回落清单 default_model），因此
             // 清单里同名的条目永远无法通过 `/model` 选中（见
             // `handle_model_command` 与未知名提示文案）。
             SlashCommand::Model => Some("[<name>|default]"),
             // `default` 同 `/model` 是保留字（清空本会话覆盖、回落条目默认）。
             SlashCommand::Effort => Some("[none|minimal|low|medium|high|xhigh|max|default]"),
-            SlashCommand::Agent => Some("<task-id>"),
-            SlashCommand::Events | SlashCommand::Diff | SlashCommand::Mailbox => Some("<task-id>"),
-            SlashCommand::Message => Some("<task-id> <text>"),
-            SlashCommand::Cancel => Some("<task-id> [--recursive] [--confirm <token>]"),
-            SlashCommand::Pause | SlashCommand::Resume | SlashCommand::Retry => Some("<task-id>"),
-            SlashCommand::Priority => Some("<task-id> <level>"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
             SlashCommand::Kanban => Some("[on|off|create|remove|status|run|add <spec> <plan>]"),
             SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
-            SlashCommand::Approve => Some("<request-id> [once|task]"),
-            SlashCommand::Deny => Some("<request-id>"),
-            SlashCommand::Review => Some("<task-id>"),
+            // 其余变体的 usage 由 `control_spec()` 提供；没有 usage 的返回 `None`。
             _ => None,
         }
     }

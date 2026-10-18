@@ -6,7 +6,10 @@
  * 一句可判定的谓词。形状取宿主 JSON-RPC 的线格式（`snake_case`），桌面端
  * 其余代码按字段直用，不做二次映射。
  */
-export type ModelRpc = <T = unknown>(method: string, params: unknown) => Promise<T>;
+import type { RpcCall } from "./rpcCall";
+import { RPC } from "./routes";
+
+export type ModelRpc = RpcCall;
 
 /** 模型清单里的一条，与宿主 `model/list` 返回的条目形状一致（key 只回掩码）。 */
 export type ModelEntryView = {
@@ -62,7 +65,7 @@ export type ModelList = {
  * 不该因为宿主少发一个字段就整页崩掉。
  */
 export async function listModels(rpc: ModelRpc): Promise<ModelList> {
-  const result = await rpc<Partial<ModelList>>("model/list", {});
+  const result = await rpc<Partial<ModelList>>(RPC.modelList, {});
   return {
     models: Array.isArray(result?.models) ? result.models : [],
     default_model: result?.default_model ?? null,
@@ -78,7 +81,7 @@ export async function listModels(rpc: ModelRpc): Promise<ModelList> {
  * 半途失败留下半截状态。回包给出新条目名；缺字段回空串，视图只需一个可显示的值。
  */
 export async function importEnvModel(rpc: ModelRpc): Promise<{ name: string }> {
-  const result = await rpc<{ name?: unknown }>("model/importEnv", {});
+  const result = await rpc<{ name?: unknown }>(RPC.modelImportEnv, {});
   return { name: typeof result?.name === "string" ? result.name : "" };
 }
 
@@ -114,22 +117,22 @@ export async function upsertModel(rpc: ModelRpc, input: ModelUpsertInput): Promi
   // 字段时（`undefined`），写入不携带它们，既有条目因此零改动。
   if (input.api_style !== undefined) params.api_style = input.api_style;
   if (input.reasoning_effort !== undefined) params.reasoning_effort = input.reasoning_effort;
-  await rpc("model/upsert", params);
+  await rpc(RPC.modelUpsert, params);
 }
 
 /** 按名字删除一条模型；宿主会一并清掉指向它的默认/子代理引用。 */
 export async function deleteModel(rpc: ModelRpc, name: string): Promise<void> {
-  await rpc("model/delete", { name });
+  await rpc(RPC.modelDelete, { name });
 }
 
 /** 设全局默认模型；`null` 清除（回落到宿主配置的兜底）。 */
 export async function setDefaultModel(rpc: ModelRpc, name: string | null): Promise<void> {
-  await rpc("model/setDefault", { name });
+  await rpc(RPC.modelSetDefault, { name });
 }
 
 /** 设子代理模型；`null` 清除。 */
 export async function setSubagentModel(rpc: ModelRpc, name: string | null): Promise<void> {
-  await rpc("model/setSubagent", { name });
+  await rpc(RPC.modelSetSubagent, { name });
 }
 
 /**
@@ -148,7 +151,7 @@ export async function setThreadModel(
   threadId: string,
   name: string | null,
 ): Promise<{ model: string }> {
-  const result = await rpc<{ model?: unknown }>("thread/setModel", { threadId, name });
+  const result = await rpc<{ model?: unknown }>(RPC.threadSetModel, { threadId, name });
   return { model: typeof result?.model === "string" ? result.model : "" };
 }
 
@@ -166,7 +169,7 @@ export async function setThreadReasoningEffort(
   threadId: string,
   effort: string | null,
 ): Promise<ThreadEffortResult> {
-  const result = await rpc<{ effort?: unknown }>("thread/setReasoningEffort", {
+  const result = await rpc<{ effort?: unknown }>(RPC.threadSetReasoningEffort, {
     threadId,
     effort,
   });
@@ -191,7 +194,7 @@ export async function testModel(
   };
   if (input.api_key !== undefined) params.api_key = input.api_key;
   else if (input.name !== undefined) params.name = input.name;
-  const result = await rpc<{ ok?: unknown; reason?: unknown }>("model/test", params);
+  const result = await rpc<{ ok?: unknown; reason?: unknown }>(RPC.modelTest, params);
   return {
     ok: result?.ok === true,
     reason: typeof result?.reason === "string" ? result.reason : null,

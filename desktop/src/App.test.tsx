@@ -70,6 +70,15 @@ const { clients, state } = vi.hoisted(() => ({
     platformUa: "",
     // `process/list` 返回的进程;默认空,需要时由用例填充。
     processes: [] as Array<Record<string, unknown>>,
+    // 已补建组长的目录（`thread/lead` 被调用过）。`thread/listAll` 据此在这些
+    // 分组里多报一条 `role: "lead"` 的会话——模拟服务端真的落盘了组长 meta。
+    // 默认空：既有用例的分组里没有组长，与改动前逐字节一致。
+    leadCwds: [] as string[],
+    // 让 `thread/lead` 抛错，用于验证「单个目录补建失败不挡首屏」。
+    failLead: false,
+    // 每次 `thread/lead` 调用都记一笔它请求的 cwd——即便失败也记，这样「失败
+    // 路径确实被走到」可被断言，而不是靠「首屏照常」这种两边都成立的弱断言。
+    leadAttempts: [] as string[],
   },
 }));
 
@@ -153,24 +162,43 @@ vi.mock("./lib/rpc", () => ({
           state.threads ??
           [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
         const workspaces = state.groupWorkspaces ?? ["/w"];
+        const leadEntries = (workspace: string) =>
+          state.leadCwds.includes(workspace)
+            ? [
+                {
+                  thread_id: `lead-${workspace}`,
+                  cwd: workspace,
+                  model: "m",
+                  created_at: 0,
+                  updated_at: 0,
+                  title: "组长",
+                  role: "lead",
+                  status: "idle",
+                  pinned: false,
+                },
+              ]
+            : [];
         return {
           groups: workspaces.map((workspace, index) => ({
             workspace,
             exists: true,
             threads:
               index === 0
-                ? seeds.map((t) => ({
-                    thread_id: t.thread_id,
-                    cwd: workspace,
-                    model: "m",
-                    created_at: 0,
-                    updated_at: 0,
-                    title: t.title,
-                    permission_mode: t.permission_mode,
-                    status: state.listStatus,
-                    pinned: state.pinnedIds.includes(t.thread_id),
-                  }))
-                : [],
+                ? [
+                    ...seeds.map((t) => ({
+                      thread_id: t.thread_id,
+                      cwd: workspace,
+                      model: "m",
+                      created_at: 0,
+                      updated_at: 0,
+                      title: t.title,
+                      permission_mode: t.permission_mode,
+                      status: state.listStatus,
+                      pinned: state.pinnedIds.includes(t.thread_id),
+                    })),
+                    ...leadEntries(workspace),
+                  ]
+                : leadEntries(workspace),
           })),
           // 置顶项照旧留在分组里（服务端为向后兼容不摘除），顶层这里只是重排一份。
           pinned: state.pinnedIds.map((id) => ({
@@ -188,6 +216,15 @@ vi.mock("./lib/rpc", () => ({
         };
       }
       if (method === "workspace/list") return { workspaces: [] };
+      if (method === "thread/lead") {
+        const cwd = (params as { cwd?: string } | undefined)?.cwd;
+        if (typeof cwd === "string") state.leadAttempts.push(cwd);
+        if (state.failLead) throw { code: -1, message: "lead failed" };
+        if (typeof cwd === "string" && !state.leadCwds.includes(cwd)) {
+          state.leadCwds.push(cwd);
+        }
+        return { thread_id: `lead-${cwd ?? "default"}`, created: true };
+      }
       if (method === "thread/resume") {
         const { threadId } = params as { threadId: string };
         const seeds = state.threads ?? [{ thread_id: "t1", title: "one", permission_mode: state.mode }];
@@ -289,6 +326,9 @@ beforeEach(() => {
   state.dataSources = {};
   state.platformUa = "";
   state.processes = [];
+  state.leadCwds = [];
+  state.failLead = false;
+  state.leadAttempts = [];
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
@@ -729,8 +769,10 @@ describe("App send recovery from a status disagreement", () => {
   it("falls back to turn/start when turn/interject answers -32013", async () => {
     seedRunning();
     render(<App />);
+    // 运行中的会话不再走 resume（那会打断在跑的 turn），改用只读 readItems 补齐。
+    // 等它发出即证明 listAll 的 running 状态已落进 store。
     await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
     );
     state.rejectCode = { "turn/interject": -32013 };
 
@@ -771,8 +813,9 @@ describe("App send recovery from a status disagreement", () => {
   it("does not ping-pong when both methods fail, and surfaces the error", async () => {
     seedRunning();
     render(<App />);
+    // 同上：运行中的会话以 readItems 补齐，不再 resume。
     await waitFor(() =>
-      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
     );
     state.rejectCode = { "turn/interject": -32013, "turn/start": -32012 };
 
@@ -927,7 +970,7 @@ describe("App slash commands", () => {
  */
 async function openBoardFor(project: string) {
   // 打开小组右键菜单（与键盘路径同一条处理链）→ 点「看板」条目。
-  const header = document.querySelector<HTMLElement>('div[tabindex][aria-haspopup="menu"]')!;
+  const header = document.querySelector<HTMLElement>("[data-ws-header]")!;
   fireEvent.contextMenu(header);
   await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
   fireEvent.click(screen.getByLabelText("看板"));
@@ -1433,6 +1476,121 @@ describe("App settings & theme wiring", () => {
     );
   });
 
+  it("reflects a thread/tagChanged in the sidebar without re-listing", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    notify("thread/tagChanged", { thread_id: "t1", tag: "red" });
+    await waitFor(() =>
+      expect(document.querySelector('[data-thread-tag="red"]')).toBeTruthy(),
+    );
+    // 就地把权威值落笔，不该为此再拉一次全量 thread/listAll。
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+  });
+
+  it("reflects ui/tagNames/updated in the existing dot's label", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+
+    notify("thread/tagChanged", { thread_id: "t1", tag: "red" });
+    await waitFor(() => expect(document.querySelector('[data-thread-tag="red"]')).toBeTruthy());
+
+    notify("ui/tagNames/updated", { tag_names: { red: "紧急" } });
+    await waitFor(() =>
+      expect(
+        document.querySelector('[data-thread-tag="red"]')?.getAttribute("aria-label"),
+      ).toBe("紧急"),
+    );
+  });
+
+  it("does not tag optimistically, and re-lists once thread/setTag resolves", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    // Hold the RPC open so we can observe the UI *before* the server answers.
+    let release: () => void = () => {};
+    state.dataSources["thread/setTag"] = () =>
+      new Promise<void>((resolve) => {
+        release = () => resolve();
+      });
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    fireEvent.contextMenu(container.querySelector('[data-thread-row="t1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/setTag")).toBe(true),
+    );
+    expect(clients[0].requests.find((r) => r.method === "thread/setTag")!.params).toEqual({
+      threadId: "t1",
+      tag: "red",
+    });
+    // 不做乐观更新：回包之前 UI 不能显示色点，也不能为此重拉列表。
+    expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
+    expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+      listCallsBefore,
+    );
+
+    act(() => release());
+    await waitFor(() => {
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThan(listCallsBefore);
+    });
+  });
+
+  it("surfaces the error and still re-lists when thread/setTag rejects", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    state.rejectCode["thread/setTag"] = -32011;
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    fireEvent.contextMenu(container.querySelector('[data-thread-row="t1"]')!);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "红" }));
+
+    await waitFor(() => expect(screen.getByText(/forced -32011/)).toBeTruthy());
+    // 失败同样重拉：本地不假装成功，以服务端为权威。
+    await waitFor(() => {
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/listAll").length,
+      ).toBeGreaterThan(listCallsBefore);
+    });
+    expect(document.querySelector('[data-thread-tag="red"]')).toBeNull();
+  });
+
+  it("writes only the changed key when a tag name is edited in settings", async () => {
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", tag_names: {} });
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "标签" }));
+    const input = document.querySelector<HTMLInputElement>('[data-tag-name-input="red"]')!;
+    fireEvent.change(input, { target: { value: "紧急" } });
+    fireEvent.blur(input);
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "ui/settings/write",
+        params: { tag_names: { red: "紧急" } },
+      }),
+    );
+    // 只提交改动的那一个键：其余 5 色不得出现在同一请求里。
+    const write = clients[0].requests.find((r) => r.method === "ui/settings/write")!;
+    expect(Object.keys((write.params as { tag_names: Record<string, string> }).tag_names)).toEqual([
+      "red",
+    ]);
+  });
+
   it("reflects a thread/modelChanged from another client in that thread's picker", async () => {
     render(<App />);
     await settle();
@@ -1823,6 +1981,39 @@ describe("App reconnect resilience", () => {
       await vi.advanceTimersByTimeAsync(1);
     });
     expect(clients.length).toBe(3);
+  });
+
+  it("re-resumes a thread after a crash even though its status was live-running", async () => {
+    // 崩溃前该会话在跑（推送把状态标为 "live" running）。侧车重启后新进程对
+    // 它没有内存 agent，listAll 报 idle。若不清掉那条推送状态，`seed` 不会覆盖
+    // 它 → selectThread 误判"仍在跑" → 跳过 resume → 新进程里 agent 永不重建
+    // → 之后发送撞 -32011 且无法自愈。这条用例钉住"重连后必须重新 resume"。
+    render(<App />);
+    await waitMounted();
+    await flush();
+    // 让 t1 进入 live-running（推送流），并把后续 listAll 改为报 idle。
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "thread/status/updated", params: { thread_id: "t1", status: "running" } });
+      }
+    });
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+
+    // 重连之前：视图确实停在 running。
+    exit();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+
+    // 新客户端上必须出现 thread/resume（而不是被陈旧 running 拦住）。
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(nextReconnectDelay(0));
+    });
+    await flush();
+    expect(
+      clients[1].requests.some((r) => r.method === "thread/resume"),
+    ).toBe(true);
   });
 
   it("reconnects immediately when the app returns to the foreground", async () => {
@@ -2421,6 +2612,40 @@ describe("App remote subscription wiring (S2)", () => {
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
     );
     expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
+    expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
+  });
+
+  it("does not interrupt a running thread on the desktop build", async () => {
+    // 桌面端过去没有这层保护（它被 `isRemoteClient()` 关在远端分支里）：点开
+    // 一张正在跑的看板卡会话就会 resume，而 resume 会先中断在跑的 turn。这条
+    // 用例把「看一眼 = 只读」钉死为**两种客户端共有**的不变量。
+    state.listStatus = "running";
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />); // no persisted config → desktop
+
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) =>
+            r.method === "thread/readItems" &&
+            (r.params as { threadId: string }).threadId === "t1",
+        ),
+      ).toBe(true),
+    );
+    // The defining property: looking at a running thread never resumes it.
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+    // Desktop still never subscribes; that stays remote-only.
+    expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
+  });
+
+  it("still resumes a cold idle thread on the desktop build", async () => {
+    // 回归护栏：把「运行中才只读」这条边钉住。若有人把 running 判断写错成
+    // 「一律不 resume」，冷会话就再也合不进服务端历史（resume 是它唯一的就绪
+    // 途径，turn/start 对冷会话返回 -32011）。
+    render(<App />); // listStatus 默认 idle
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
     expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(false);
   });
 
@@ -4028,5 +4253,37 @@ describe("App 后台进程接线", () => {
         params: { thread_id: "t1", process_id: "proc_1" },
       }),
     );
+  });
+});
+
+describe("App lead entry reachability", () => {
+  it("asks thread/lead for a project group that has no lead, and shows the lead", async () => {
+    render(<App />);
+    // 首屏 listAll 只有普通会话（mock 默认 /w 组含 t1，无 role:"lead"）。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) => r.method === "thread/lead" && (r.params as { cwd?: string }).cwd === "/w",
+        ),
+      ).toBe(true),
+    );
+    // 服务端补建后重取 listAll，随之出现组长条目（mock 的 leadCwds 让它报出来）。
+    await waitFor(() => expect(screen.getByText("组长")).toBeTruthy());
+    // 补建过就不再重复发起：thread/lead 对 /w 只应有一次。
+    expect(
+      clients[0].requests.filter(
+        (r) => r.method === "thread/lead" && (r.params as { cwd?: string }).cwd === "/w",
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("still paints the first screen when thread/lead fails", async () => {
+    state.failLead = true;
+    render(<App />);
+    // 补建路径确实被走到了：对 /w 发过 thread/lead（且失败了）。
+    await waitFor(() => expect(state.leadAttempts).toContain("/w"));
+    // 失败不得挡住首屏：既有会话照旧渲染，且没有凭空冒出组长条目。
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    expect(screen.queryByText("组长")).toBeNull();
   });
 });

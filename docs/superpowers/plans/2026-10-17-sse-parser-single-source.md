@@ -19,7 +19,7 @@
 - **不改**三个 provider 的 `parse_frame` 事件解析逻辑（只删其中的合成错误解码分支）。
 - **不改** provider 的 client/retry/transport 层。
 - 对外行为不变：`anthropic/stream.rs`、`openai/stream.rs`、`responses/stream.rs` 的既有 `#[tokio::test]` 必须原样通过。
-- 不在 `sse.rs` 里引入 `reqwest`/`serde_json` 之外的新依赖；`sse.rs` 只用 `std`/`bytes`/`futures`/`yi_agent_core::ProviderError`。
+- `sse.rs` **不引入任何新依赖**：允许引用本 crate 既有的 crate（`std`/`bytes`/`futures`/`yi_agent_core`，以及 `SseStreamCore` 约束里的 `reqwest::Error`——`reqwest`/`serde_json` 本就是 `yi-agent-llm` 的既有依赖）；不新增任何 crate。
 
 ---
 
@@ -151,7 +151,8 @@ impl SseLineParser {
 ///
 /// 分类必须在 `is_timeout()` 上做：一个 reqwest deadline 的 `Display` 是
 /// "error decoding response body"，不含 "timed out" 文本，只有 `is_timeout()`
-/// 会回溯 source 链；且要在 `is_decode()` 之前判定——后者也会匹配到它。
+/// 会回溯 source 链。因此这里**禁止**改用 `is_decode()`（或任何解码分支判定）来分类：
+/// 请求 deadline 的 `Display` 同样会匹配它，会把可重试的超时误判成不可重试的传输中断。
 pub struct SseStreamCore<S> {
     line_parser: SseLineParser,
     inner: S,
@@ -199,6 +200,7 @@ where
                     // 回到循环：若这一批 feed 还有残留帧则先发完，否则返回 None。
                 }
                 Poll::Ready(Some(Err(e))) => {
+                    // `Network`（超时）分支由 tests/integration.rs 的 request_timeout_is_a_total_deadline_not_an_idle_timeout 端到端覆盖。
                     let error = if e.is_timeout() {
                         ProviderError::Network(format!("stream error: timed out: {e}"))
                     } else {
@@ -504,9 +506,13 @@ Expected: 与 Step 1 相同数量（或更多）的测试全部 PASS。
 
 - [ ] **Step 9: 运行新测试确认通过**
 
-Run: `cd yi-agent-rs && export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && export TMPDIR=/Users/gongyichen/.yi-agent-tmp && cargo test -p yi-agent-llm --offline anthropic::surfaces_invalid_utf8 2>&1 | tail -8`
+Run: `cd yi-agent-rs && export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && export TMPDIR=/Users/gongyichen/.yi-agent-tmp && cargo test -p yi-agent-llm --offline --lib surfaces_invalid_utf8 2>&1 | tail -8`
 
-Expected: PASS。
+Expected: PASS。注意 `cargo test` 的过滤串是**全路径子串**匹配，而测试的全路径是
+`anthropic::stream::tests::surfaces_invalid_utf8_as_a_stream_error`，所以过滤串必须用有区分度的叶子名
+`surfaces_invalid_utf8`（写成 `anthropic::surfaces_invalid_utf8` 会切掉中间的 `stream::tests::` 段、匹配到 0 个测试而打印
+`test result: ok. 0 passed` 的假绿）。该叶子名会一并覆盖 Task 1 的 `sse::tests::surfaces_invalid_utf8_as_an_error_frame`；
+Task 3 的 openai 同名测试此时尚未创建。
 
 - [ ] **Step 10: fmt + commit**
 
@@ -635,9 +641,12 @@ Expected: 与 Step 1 相同数量（或更多）的测试全部 PASS。
 
 - [ ] **Step 9: 运行新测试**
 
-Run: `cd yi-agent-rs && export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && export TMPDIR=/Users/gongyichen/.yi-agent-tmp && cargo test -p yi-agent-llm --offline openai::stream::surfaces_invalid_utf8 2>&1 | tail -8`
+Run: `cd yi-agent-rs && export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH" && export TMPDIR=/Users/gongyichen/.yi-agent-tmp && cargo test -p yi-agent-llm --offline --lib surfaces_invalid_utf8 2>&1 | tail -8`
 
-Expected: PASS。
+Expected: PASS。理由同 Task 2 Step 9：过滤串是全路径子串匹配，测试全路径为
+`openai::stream::tests::surfaces_invalid_utf8_as_a_stream_error`，因此必须用有区分度的叶子名 `surfaces_invalid_utf8`
+（`openai::stream::surfaces_invalid_utf8` 会切掉 `tests::` 段，匹配 0 个测试）。该叶子名会覆盖三处同类测试：本 Task 新增的
+openai 测试、Task 1 的 `sse::tests::surfaces_invalid_utf8_as_an_error_frame` 与 Task 2 的 anthropic 测试。
 
 - [ ] **Step 10: fmt + commit**
 

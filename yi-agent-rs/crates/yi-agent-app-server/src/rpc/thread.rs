@@ -8,10 +8,10 @@
 //! 臂体保持原样,只有三处语言强制的改名:主循环局部量改走 [`AppState`] 字段
 //! (`hub` -> `state.hub` 等;字段本身已是引用,故冗余的 `&` 一并去掉)、`continue`
 //! 换成 `return Ok(Flow::Continue)`(语义由 `serve()` 翻回 `continue`),以及
-//! 模块自身的 `match` 键改用 `req.method`。54 处回主循环的 `continue` 换成了返回值
-//! (53 处独占一行,`thread/start` 内联 1 处),另有 1 处残留的臂**内层**
-//! `continue`(`thread/listAll` 的 `for dir in &dirs`)与 3 处臂**内层**的
-//! `break`(`thread/resume`、`thread/reorderPinned`),目标不变。
+//! 模块自身的 `match` 键改用 `req.method`。57 处回主循环的 `continue` 换成了返回值
+//! (55 处独占一行,`thread/start` 与 `thread/lead` 各内联 1 处),另有 1 处残留的
+//! 臂**内层** `continue`(`thread/listAll` 的 `for dir in &dirs`)与 3 处臂**内层**
+//! 的 `break`(`thread/resume`、`thread/reorderPinned`),目标不变。
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -101,13 +101,44 @@ pub(crate) async fn handle(
                 }
                 // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
                 // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
-                let metas = match crate::thread_store::ThreadStore::new(path).list() {
+                let mut read_ok = true;
+                let mut metas = match crate::thread_store::ThreadStore::new(path).list() {
                     Ok(metas) => metas,
                     Err(e) => {
                         eprintln!("[app-server] thread/listAll failed to list {dir}: {e}");
+                        read_ok = false;
                         Vec::new()
                     }
                 };
+                // 每个被列举的**空**项目目录都确保有组长,让侧栏里本就没有
+                // 任何条目的项目也有一个组长入口。失败只记日志——列表查询
+                // 不得因单个目录不可写而整体失败。
+                //
+                // 为什么限定「没有任何会话」:组长 meta 的 `board_project`
+                // 是 `None`,一旦写进已有会话的目录,它就会被算作「该目录
+                // 自己的会话」,从而①把「每个目录组恰好一个会话」变成两个、
+                // ②让只含卡片会话的 worktree 不再被抑制成顶层组。两者都是
+                // `listAll` 既有行为的一部分,列表查询不得改写它。已有会话的
+                // 项目仍是懒创建的目标,只是触发点更准:用户点组长入口
+                // (`thread/lead`)或某个会话给组长留言(`resolve_lead_target`)。
+                //
+                // 读失败的目录(`read_ok == false`)不写:读不到就不该有副作用。
+                if read_ok && metas.is_empty() {
+                    if let Err(e) = crate::lead::ensure_lead_meta(
+                        &crate::thread_store::ThreadStore::new(path),
+                        path,
+                    ) {
+                        eprintln!(
+                            "[app-server] thread/listAll could not ensure a lead for {dir}: {e}"
+                        );
+                    }
+                    // 新落的组长 meta 并入本轮列举结果,否则「本目录的
+                    // 会话」是懒创建**之前**的快照,刚种下的组长在这一
+                    // 次响应里就不可见(要等下一次刷新才出现)。
+                    if let Ok(fresh) = crate::thread_store::ThreadStore::new(path).list() {
+                        metas = fresh;
+                    }
+                }
                 let own: Vec<_> = metas.iter().filter(|m| m.board_project.is_none()).collect();
                 // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
                 // 否则它只是卡片 worktree,归拢后被抑制。
@@ -259,6 +290,7 @@ pub(crate) async fn handle(
                 model_ref.clone(),
                 None,
                 None,
+                state.lead_inbox,
             )
             .await?;
 
@@ -291,6 +323,47 @@ pub(crate) async fn handle(
                 ),
             )
             .await?;
+        }
+        "thread/lead" => {
+            // 组长归属当前请求的项目根。与 `thread/start` 同源,保证
+            // 「用户在哪个项目里问组长」与「组长管哪个项目」一致。
+            let cwd = match resolve_thread_cwd(
+                &req.params,
+                state.cfg,
+                state.hub,
+                state.client,
+                id.clone(),
+            )
+            .await?
+            {
+                Some(c) => c,
+                None => return Ok(Flow::Continue),
+            };
+            let store = crate::thread_store::ThreadStore::new(Path::new(&cwd));
+            match crate::lead::ensure_lead_meta(&store, Path::new(&cwd)) {
+                Ok((meta, created)) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        ok_response(
+                            id,
+                            json!({
+                                "thread_id": meta.thread_id,
+                                "created": created,
+                            }),
+                        ),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(e.to_string())),
+                    )
+                    .await?;
+                }
+            }
         }
         "thread/resume" => {
             let Some(thread_id) =
@@ -415,6 +488,7 @@ pub(crate) async fn handle(
                 &thread_id,
                 state.theme_handle,
                 state.git_diff_handle,
+                state.lead_inbox,
                 built,
             );
             let BuiltAgent {
@@ -1117,6 +1191,71 @@ pub(crate) async fn handle(
             {
                 Ok(true) => {
                     write_response(state.hub, state.client, ok_response(id, json!({}))).await?;
+                }
+                Ok(false) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::unknown_thread(&thread_id)),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(e.to_string())),
+                    )
+                    .await?;
+                }
+            }
+        }
+        "thread/setTag" => {
+            let Some(thread_id) =
+                require_thread_id(state.hub, state.client, &req.params, id.clone()).await?
+            else {
+                return Ok(Flow::Continue);
+            };
+            // 参数校验先于 thread 存在性：非法颜色一律 `-32602`，
+            // 与 setPinned 的「非布尔先报错」同一顺序。
+            let raw = req
+                .params
+                .get("tag")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let tag: Option<String> = match raw {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) if crate::thread_store::is_valid_tag(&s) => Some(s),
+                other => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(
+                            id,
+                            RpcError::invalid_params(format!(
+                                "tag must be null or one of the 6 palette ids, got {other}"
+                            )),
+                        ),
+                    )
+                    .await?;
+                    return Ok(Flow::Continue);
+                }
+            };
+            match store_lookup(state.threads, state.workspaces, state.cfg, &thread_id)
+                .set_tag(&thread_id, tag.as_deref())
+            {
+                Ok(true) => {
+                    write_response(state.hub, state.client, ok_response(id, json!({}))).await?;
+                    // 广播给所有客户端（含本端）：列表层恒推，就在地
+                    // 更新色点，无需各自重拉 thread/listAll。
+                    let _ = write_notification(
+                        state.hub,
+                        &Notification::TagChanged {
+                            thread_id: thread_id.clone(),
+                            tag: tag.clone(),
+                        },
+                    )
+                    .await;
                 }
                 Ok(false) => {
                     write_response(

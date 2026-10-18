@@ -1,7 +1,7 @@
 //! RPC 方法到域 handler 的分派。每个域一个子模块,`server.rs` 只留 transport
 //! 与主循环。
 //!
-//! 背景:`serve()` 里的 `match method.as_str()` 曾把 58 个域方法的内联臂全部
+//! 背景:`serve()` 里的 `match method.as_str()` 曾把 62 个域方法的内联臂全部
 //! 堆在一个 3,000 余行的函数里,新 handler 无处可放。Task 3 把这些臂按域搬进
 //! 本模块的子模块,**逐字搬移**(只改状态的取名路径),`serve()` 只保留
 //! `initialize`、transport 与兜底 `_ =>`。
@@ -21,6 +21,7 @@ pub(crate) mod onboarding;
 pub(crate) mod pair;
 pub(crate) mod plugin;
 pub(crate) mod process;
+pub(crate) mod skill;
 pub(crate) mod thread;
 pub(crate) mod turn;
 pub(crate) mod ui;
@@ -69,7 +70,7 @@ pub(crate) type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 /// 会话 agent 工厂:`serve()` 的 `build_agent` 参数。`thread/start`(建新 agent)与
 /// `thread/resume`(按历史重建)两个臂各调用一次。
 ///
-/// 存的是**裸 trait 对象引用**而非 `&F`:AppState 刻意不带泛型参数(12 个域的
+/// 存的是**裸 trait 对象引用**而非 `&F`:AppState 刻意不带泛型参数(13 个域的
 /// `handle` 签名必须一致),而 `&F` 恰好在 `app_state!()` 那一个调用点自动 unsize
 /// 成 `&dyn Fn(..)` —— 同一个工厂、同一个调用,中间没有转接层。
 pub(crate) type BuildAgent<'a> = &'a (
@@ -132,6 +133,8 @@ pub(crate) enum Domain {
     Pair,
     /// `turn/*`。
     Turn,
+    /// `skill/*`(技能面板:三层技能根枚举 + 按需读正文)。
+    Skill,
     /// `thread/*`(会话生命周期:列表、建/恢复、改名、模型档、置顶、删除、订阅)。
     Thread,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
@@ -159,6 +162,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("pair") => Domain::Pair,
         Some("device") => Domain::Pair,
         Some("turn") => Domain::Turn,
+        Some("skill") => Domain::Skill,
         Some("thread") => Domain::Thread,
         Some("agent") => Domain::Agent,
         _ => Domain::Unknown,
@@ -173,11 +177,12 @@ pub(crate) fn domain_for(method: &str) -> Domain {
 /// 新的共享状态。
 ///
 /// 字段分三层:响应出口与调用方、路径与宿主偏好(共享只读)、注入句柄,外加
-/// 主循环的可变局部量(按域分批搬入,见 `batch 3` 一节)。三层里已全部有主:
-/// 域 handler 需要的量都已在结构里就位。唯一的构造点是 `serve()` 里的
-/// `app_state!()` 宏,它按**字段名**逐项写出 32 个字段(见 [`AppState`] 各字段
-/// 的注释),故加一个字段只需改该宏一处;同类型的相邻字段因逐名写出而不会错位
-/// —— 七个相邻的 `&Path`(`models_path` 到 `watchman_home`)尤其需要这条保证。
+/// 主循环的可变局部量(按域分批搬入,见 `batch 3` 一节)与 `batch 4` 新增的
+/// 宿主路径 / 组长信箱一组。三层里已全部有主:域 handler 需要的量都已在结构里
+/// 就位。唯一的构造点是 `serve()` 里的 `app_state!()` 宏,它按**字段名**逐项写出
+/// 34 个字段(见 [`AppState`] 各字段的注释),故加一个字段只需改该宏一处;同类型
+/// 的相邻字段因逐名写出而不会错位 —— 七个相邻的 `&Path`(`models_path` 到
+/// `watchman_home`)尤其需要这条保证。
 pub(crate) struct AppState<'a> {
     // ---- 响应出口与调用方 ----
     /// 广播出口:handler 用它定向回包(`write_response`)与做订阅
@@ -285,4 +290,16 @@ pub(crate) struct AppState<'a> {
     /// Git Diff 焦点句柄。与 [`AppState::theme_handle`] 同路,交给会话的工具集。
     /// 搬移前臂里的 `git_diff_handle`。
     pub(crate) git_diff_handle: &'a crate::git_diff_tool::GitDiffHandle,
+
+    // ---- batch 4:`skill/*` 与 `thread/*`(组长)新增的宿主路径与信箱 ----
+    /// 技能根解析所针对的 home(生产为 `home_dir()`,`skills_home()` 可替身)。
+    /// `skill/*` 经它枚举三层技能根,故与 [`AppState::cfg`] 同属宿主级只读输入;
+    /// AppState 刻意不带泛型参数(13 个域的 `handle` 签名必须一致),故自带一份
+    /// 引用而非依赖注入的 trait。搬移前臂里的 `skills_home`。
+    pub(crate) skills_home: &'a Path,
+    /// 组长信箱:会话给组长留言经 [`crate::lead::LeadInbox`] 投递。`thread/start`
+    /// 与 `thread/resume` 各把它交给 `start_thread_core` / `attach_delegation`
+    /// (后者转交给组长工具集),故与 [`AppState::runtimes`] 同路按 `&` 借用。
+    /// 搬移前臂里的 `lead_inbox`。
+    pub(crate) lead_inbox: &'a crate::lead::LeadInbox,
 }

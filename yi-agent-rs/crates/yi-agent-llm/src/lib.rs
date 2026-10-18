@@ -5,6 +5,7 @@
 
 pub mod anthropic;
 pub mod openai;
+pub mod sse;
 
 pub use anthropic::client::AnthropicProvider;
 pub use anthropic::client::AnthropicProviderOpts;

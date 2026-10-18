@@ -8,9 +8,11 @@
 
 use serde_json::json;
 
-use crate::protocol::{RequestEnvelope, RequestId, RpcError};
+use crate::protocol::{Notification, RequestEnvelope, RequestId, RpcError};
 use crate::rpc::{AppState, Flow};
-use crate::server::{err_response, ok_response, write_response};
+use crate::server::{
+    TAG_NAME_MAX_LEN, err_response, ok_response, write_notification, write_response,
+};
 
 /// 处理本域的一个 RPC 请求。
 ///
@@ -43,6 +45,9 @@ pub(crate) async fn handle(
             // preferences.json，故一并从同一个 workdir 读。未配置即
             // `null`，桌面首屏据此回填空串。
             let relay_url = crate::settings_store::load_relay_url(workdir);
+            // 标签显示名：与 theme/值守/中继同处一个 preferences.json，
+            // 故同样从 workdir 读。只回**用户覆盖项**，默认名由前端持有。
+            let tag_names = crate::settings_store::load_tag_names(workdir);
             write_response(
                 state.hub,
                 state.client,
@@ -52,6 +57,7 @@ pub(crate) async fn handle(
                         "theme": theme.as_str(),
                         "board_watchman_enabled": watchman_enabled,
                         "relay_url": relay_url,
+                        "tag_names": tag_names,
                     }),
                 ),
             )
@@ -128,6 +134,77 @@ pub(crate) async fn handle(
                 None
             };
 
+            // 标签显示名：键必须是 6 色之一，值 trim 后非空且不超 24 字符。
+            // 校验先于落盘——非法名字不该把一次有效的 relay_url 写了一半。
+            let tag_updates: Option<std::collections::BTreeMap<String, String>> =
+                match req.params.get("tag_names") {
+                    None => None,
+                    Some(value) => {
+                        let Some(object) = value.as_object() else {
+                            write_response(
+                                state.hub,
+                                state.client,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params(
+                                        "tag_names must be an object of color id -> name",
+                                    ),
+                                ),
+                            )
+                            .await?;
+                            return Ok(Flow::Continue);
+                        };
+                        let mut updates = std::collections::BTreeMap::new();
+                        let mut error: Option<String> = None;
+                        for (key, value) in object {
+                            if !crate::thread_store::is_valid_tag(key) {
+                                error = Some(format!("unknown tag id '{key}'"));
+                                break;
+                            }
+                            let Some(name) = value.as_str() else {
+                                error = Some(format!("tag name for '{key}' must be a string"));
+                                break;
+                            };
+                            let name = name.trim();
+                            if name.is_empty() {
+                                error = Some(format!("tag name for '{key}' must not be blank"));
+                                break;
+                            }
+                            if name.chars().count() > TAG_NAME_MAX_LEN {
+                                error = Some(format!(
+                                    "tag name for '{key}' exceeds {TAG_NAME_MAX_LEN} characters"
+                                ));
+                                break;
+                            }
+                            updates.insert(key.clone(), name.to_string());
+                        }
+                        match error {
+                            Some(message) => {
+                                write_response(
+                                    state.hub,
+                                    state.client,
+                                    err_response(id, RpcError::invalid_params(message)),
+                                )
+                                .await?;
+                                return Ok(Flow::Continue);
+                            }
+                            None => Some(updates),
+                        }
+                    }
+                };
+            if let Some(updates) = &tag_updates {
+                let workdir = state.theme_handle.workdir();
+                if let Err(error) = crate::settings_store::save_tag_names(workdir, updates) {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(error.to_string())),
+                    )
+                    .await?;
+                    return Ok(Flow::Continue);
+                }
+            }
+
             // `relay_url`（桌面设置页）：与 theme 各写各的键，共处一个
             // 文件，故两条路径都走 settings_store 的读-改-写。
             // `null` / 空 / 空白 → 清除该键。非串非 null（客户端写错
@@ -158,6 +235,17 @@ pub(crate) async fn handle(
                 ok_response(id, json!({ "ok": true })),
             )
             .await?;
+            // 名字落盘成功后广播权威覆盖映射（全局帧），让其它设备
+            // 立即刷新菜单与搜索。放在最后：主题/中继的写入都已生效，
+            // 且响应已先入队——读响应的一方必先见到 id，再见到通知。
+            if tag_updates.is_some() {
+                let names = crate::settings_store::load_tag_names(state.theme_handle.workdir());
+                let _ = write_notification(
+                    state.hub,
+                    &Notification::TagNamesUpdated { tag_names: names },
+                )
+                .await;
+            }
         }
         // 域内兜底:本模块只实现上面列出的方法。若 `domain_for` 把别的同前缀
         // 方法也划给本域,交回 `serve()` 原始 dispatch,而不是在这里自行编造响应。

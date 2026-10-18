@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use async_trait::async_trait;
-use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -24,7 +21,6 @@ use super::worker::{
 };
 use crate::agent::ProviderTurnGate;
 use crate::message::Message;
-use crate::tool::{Tool, ToolRegistry, ToolResult};
 
 pub const MAX_DIRECT_CHILDREN: usize = 4;
 
@@ -1972,215 +1968,6 @@ fn task_state_label(state: &TaskState) -> &'static str {
     }
 }
 
-/// The per-task built-in tool set. Tool calls delegate to the Supervisor; they
-/// never create worker state independently.
-#[derive(Clone)]
-pub struct SupervisorTools {
-    supervisor: Arc<Mutex<AgentSupervisor>>,
-    caller: TaskId,
-    updates: watch::Receiver<u64>,
-}
-
-impl SupervisorTools {
-    pub fn new(supervisor: Arc<Mutex<AgentSupervisor>>, caller: TaskId) -> Self {
-        let updates = supervisor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .subscribe_updates();
-        Self {
-            supervisor,
-            caller,
-            updates,
-        }
-    }
-
-    pub fn spawn_agent(&self) -> Arc<dyn Tool> {
-        Arc::new(SpawnAgentTool {
-            tools: self.clone(),
-        })
-    }
-
-    pub fn wait_agent(&self) -> Arc<dyn Tool> {
-        Arc::new(WaitAgentTool {
-            tools: self.clone(),
-        })
-    }
-
-    pub fn send_message(&self) -> Arc<dyn Tool> {
-        Arc::new(SendMessageTool {
-            tools: self.clone(),
-        })
-    }
-
-    pub fn register_into(&self, registry: &mut ToolRegistry) {
-        registry.register(self.spawn_agent());
-        registry.register(self.wait_agent());
-        registry.register(self.send_message());
-    }
-}
-
-struct SpawnAgentTool {
-    tools: SupervisorTools,
-}
-
-#[async_trait]
-impl Tool for SpawnAgentTool {
-    fn name(&self) -> &str {
-        "spawn_agent"
-    }
-
-    fn description(&self) -> &str {
-        "Create an asynchronously scheduled direct child agent."
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task": { "type": "string", "description": "Delegated objective." },
-                "mode": {
-                    "type": "string",
-                    "enum": ["coding", "read_only"],
-                    "description": "Use 'coding' only when the child must change files. Defaults to 'read_only'."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
-                }
-            },
-            "required": ["task"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn call(&self, args: Value) -> ToolResult {
-        let Some(task) = args.get("task").and_then(Value::as_str) else {
-            return ToolResult::error("task is required");
-        };
-        if task.trim().is_empty() {
-            return ToolResult::error("task must not be empty");
-        }
-        let mode = match args.get("mode") {
-            None => ChildWriteMode::ReadOnly,
-            Some(Value::String(value)) => match ChildWriteMode::parse(value) {
-                Some(mode) => mode,
-                None => return ToolResult::error("mode must be 'coding' or 'read_only'"),
-            },
-            Some(_) => return ToolResult::error("mode must be a string"),
-        };
-        let workdir = match args.get("workdir") {
-            None => None,
-            Some(Value::String(value)) if !value.trim().is_empty() => Some(PathBuf::from(value)),
-            Some(Value::String(_)) => return ToolResult::error("workdir must not be blank"),
-            Some(_) => return ToolResult::error("workdir must be a string"),
-        };
-        let mut supervisor = self
-            .tools
-            .supervisor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let request = SpawnRequest::new(task.to_string(), mode, workdir);
-        match supervisor.spawn_with_objective(self.tools.caller.clone(), request) {
-            Ok(task_id) => ToolResult::text(
-                json!({ "task_id": task_id.to_string(), "status": "queued" }).to_string(),
-            ),
-            Err(error) => ToolResult::error(error.to_string()),
-        }
-    }
-}
-
-struct WaitAgentTool {
-    tools: SupervisorTools,
-}
-
-#[async_trait]
-impl Tool for WaitAgentTool {
-    fn name(&self) -> &str {
-        "wait_agent"
-    }
-
-    fn description(&self) -> &str {
-        "Wait for one, all, or any direct child to report a terminal result."
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "mode": { "type": "string", "enum": ["one", "all", "any"] } },
-            "required": ["mode"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn call(&self, args: Value) -> ToolResult {
-        let mode = match args.get("mode").and_then(Value::as_str) {
-            Some("one" | "any") => WaitMode::Any,
-            Some("all") => WaitMode::All,
-            _ => return ToolResult::error("mode must be one, any, or all"),
-        };
-        let mut updates = self.tools.updates.clone();
-        loop {
-            let status = {
-                let supervisor = self
-                    .tools
-                    .supervisor
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                supervisor
-                    .wait_outcome(&self.tools.caller, mode)
-                    .map(|outcome| match outcome {
-                        WaitOutcome::NeedsAttention { reports } => (
-                            "needs_attention",
-                            Vec::new(),
-                            reports
-                                .into_iter()
-                                .map(|report| {
-                                    json!({
-                                        "task_id": report.task_id.to_string(),
-                                        "state": report.state,
-                                        "report": report.report,
-                                        "delivery": report.delivery,
-                                    })
-                                })
-                                .collect::<Vec<_>>(),
-                        ),
-                        WaitOutcome::Completed { children, reports } => (
-                            "completed",
-                            children
-                                .into_iter()
-                                .map(|child| child.to_string())
-                                .collect(),
-                            reports
-                                .into_iter()
-                                .map(|report| {
-                                    json!({
-                                        "task_id": report.task_id.to_string(),
-                                        "state": report.state,
-                                        "report": report.report,
-                                        "delivery": report.delivery,
-                                    })
-                                })
-                                .collect(),
-                        ),
-                    })
-            };
-            if let Some((status, children, reports)) = status {
-                return ToolResult::text(
-                    json!({ "status": status, "children": children, "reports": reports })
-                        .to_string(),
-                );
-            }
-            if updates.changed().await.is_err() {
-                return ToolResult::error("supervisor is no longer available");
-            }
-        }
-    }
-}
-
-struct SendMessageTool {
-    tools: SupervisorTools,
-}
-
 // This focused test intentionally sits beside the provider-turn routing API.
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
@@ -2292,63 +2079,11 @@ mod provider_turn_priority_tests {
     }
 }
 
-#[async_trait]
-impl Tool for SendMessageTool {
-    fn name(&self) -> &str {
-        "send_message"
-    }
-
-    fn description(&self) -> &str {
-        "Send a structured message to a direct parent or child task."
-    }
-
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "recipient": { "type": "string" },
-                "message": { "type": "string" }
-            },
-            "required": ["recipient", "message"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn call(&self, args: Value) -> ToolResult {
-        let recipient = match args
-            .get("recipient")
-            .and_then(Value::as_str)
-            .and_then(|id| TaskId::from_str(id).ok())
-        {
-            Some(recipient) => recipient,
-            None => return ToolResult::error("recipient must be a task UUID"),
-        };
-        let message = match args.get("message").and_then(Value::as_str) {
-            Some(message) if !message.trim().is_empty() => message,
-            _ => return ToolResult::error("message must be a non-empty string"),
-        };
-        let draft = MailboxMessageDraft::new(
-            self.tools.caller.clone(),
-            recipient,
-            MessageKind::UserInstruction(UserInstruction(message.to_owned())),
-            None,
-        );
-        let mut supervisor = self
-            .tools
-            .supervisor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match supervisor.send_message(&self.tools.caller, draft) {
-            Ok(()) => ToolResult::text("message delivered"),
-            Err(error) => ToolResult::error(error.to_string()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     #[test]
     fn set_workdir_binds_a_directory_to_the_root() {

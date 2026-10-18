@@ -9,3 +9,4 @@ pub mod repository;
 pub mod resident;
 pub mod runtime;
 pub mod schedule;
+pub mod terminal;
