@@ -8,9 +8,7 @@
 export const RPC = {
   pluginQuery: "plugin/query",
   pluginsList: "plugins/list",
-  boardCreate: "board/create",
-  boardRemove: "board/remove",
-  boardList: "board/list",
+  residentList: "resident/list",
   onboardingStatus: "onboarding/status",
   onboardingApply: "onboarding/apply",
   onboardingTest: "onboarding/test",

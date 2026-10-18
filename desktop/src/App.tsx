@@ -82,13 +82,13 @@ import { subscribeDragDrop } from "./lib/dragDropSubscribe";
 import { insertDroppedPaths } from "./lib/droppedPaths";
 
 /**
- * 看板失败的四种说法。
+ * 看板失败的三种说法。
  *
- * 三种可操作的状态各自点名下一步：没建看板就点「创建看板」，进程不可达就说
- * 明是连接问题而不是插件问题，插件没装才让用户去装。`other` 不猜原因。
+ * 两种可操作的状态各自点名下一步：进程不可达就说明是连接问题而不是插件问题，
+ * 插件没装才让用户去装。`other` 不猜原因。**没有「未创建」这一支**：宿主不再
+ * 发这个码——「有没有看板」由登记表（`resident/list`）表达，不是一个错误。
  */
 const BOARD_ERROR_TEXT: Record<BoardErrorKind, string> = {
-  not_created: "该项目尚未创建看板",
   daemon_down: "看板进程不可达",
   plugin_missing: "插件未安装",
   other: "看板读写失败",
@@ -1447,7 +1447,7 @@ export default function App() {
         // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
         // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
         prefs.repairDismissedRef.current = false;
-        // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
+        // 看板登记表要等握手完成后再拉：`resident/list` 是普通请求，服务端在
         // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
         // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
         await board.refreshBoards();
@@ -2122,15 +2122,6 @@ export default function App() {
               {board.boardError !== null && (
                 <div className="flex items-center gap-3 px-4 pb-3 text-xs text-red-400">
                   <span>{BOARD_ERROR_TEXT[board.boardError]}</span>
-                  {board.boardError === "not_created" && (
-                    <button
-                      type="button"
-                      onClick={() => void onCreateBoard(board.selectedBoard!)}
-                      className="rounded border border-line-strong px-2 py-0.5 text-fg-muted hover:text-fg"
-                    >
-                      创建看板
-                    </button>
-                  )}
                 </div>
               )}
               <SuperpowersKanbanEnqueue

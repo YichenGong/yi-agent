@@ -45,7 +45,7 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // that is itself an array models a **multi-select** `open()` (the document
     // picker in Task 10), which returns every chosen path in one call.
     picks: [] as (string | string[] | null)[],
-    // Per-project 看板 (Task 7): what `board/list` reports as registered, and
+    // Per-project 看板 (Task 7): what `resident/list` reports as registered, and
     // what the plugin's `list` answers with.
     boards: [] as unknown,
     cards: [] as unknown[],
@@ -269,7 +269,7 @@ vi.mock("./lib/rpc", () => ({
         };
       }
       if (method === "process/kill") return { ok: true };
-      if (method === "board/list") return { boards: state.boards };
+      if (method === "resident/list") return { projects: state.boards };
       if (method === "plugin/query") {
         const inner = (params as { method?: string }).method ?? "";
         const failure = state.hostError[inner] ?? state.rpcError[inner];
@@ -1056,14 +1056,14 @@ describe("App 主区域看板", () => {
     expect(queries.map((r) => (r.params as { method?: string }).method)).toContain("list");
   });
 
-  it("开关写入失败会显示错误，而不是静默（该项目尚未创建看板）", async () => {
+  it("开关写入失败会显示错误，而不是静默", async () => {
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
-    // 宿主在 Task 4 之后把语义码放在 data.code 里，message 只剩人话。
+    // 宿主把语义码放在 data.code 里，message 只剩人话。
     state.hostError["switch.write"] = {
       code: -32603,
-      message: "这个项目还没有看板",
-      data: { code: "board_not_created" },
+      message: "看板读写失败",
+      data: { code: "some_other_failure" },
     };
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
@@ -1071,7 +1071,7 @@ describe("App 主区域看板", () => {
 
     fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
 
-    expect(await screen.findByText(/该项目尚未创建看板/)).toBeTruthy();
+    expect(await screen.findByText(/看板读写失败/)).toBeTruthy();
   });
 
   it("开关写入失败：daemon 不可达与插件没装各有各的说法", async () => {
@@ -1105,7 +1105,7 @@ describe("App 主区域看板", () => {
     expect(await screen.findByText(/插件未安装/)).toBeTruthy();
   });
 
-  it("「该项目尚未创建看板」给一条出路：直接创建", async () => {
+  it("旧 board_not_created 码不再给「创建看板」按钮（创建入口只在侧栏右键菜单）", async () => {
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
     state.hostError["switch.write"] = {
@@ -1117,14 +1117,35 @@ describe("App 主区域看板", () => {
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
     await openBoardFor("/proj");
     fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
-    await screen.findByText(/该项目尚未创建看板/);
 
-    fireEvent.click(screen.getByRole("button", { name: "创建看板" }));
+    // 摘掉门控后宿主不再发这个码；即便收到，也只当一次说不清的失败，
+    // 面板不再提供那条专属出路（创建入口保留在侧栏项目右键菜单）。
+    await screen.findByText(/看板读写失败/);
+    expect(screen.queryByRole("button", { name: "创建看板" })).toBeNull();
+  });
+
+  it("侧栏「创建」入口建盘走通用 plugin/query（不是看板专属 RPC）", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.boards = [];
+    render(<App />);
+    const header = await waitFor(() => {
+      const h = document.querySelector<HTMLElement>('[data-ws-header="/proj"]');
+      expect(h).not.toBeNull();
+      return h!;
+    });
+    fireEvent.contextMenu(header);
+
+    fireEvent.click(screen.getByText("创建 Superpowers 看板"));
 
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
-        method: "board/create",
-        params: { project: "/proj" },
+        method: "plugin/query",
+        params: {
+          plugin: "superpowers-kanban",
+          project: "/proj",
+          method: "lifecycle/create",
+          params: { project: "/proj" },
+        },
       }),
     );
   });
