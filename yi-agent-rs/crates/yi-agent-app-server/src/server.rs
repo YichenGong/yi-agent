@@ -21,6 +21,7 @@ use yi_agent_core::permission::Decision;
 use yi_agent_runtime::config::RuntimeConfig;
 
 use crate::card_scheduler::{CardLauncher, LaunchRequest, ThreadFlags, TrackedThread};
+use crate::lead_loop::{ThreadSnapshot, decide_wake, render_digest};
 use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
@@ -45,6 +46,23 @@ pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// 把改动面扩散到全部 RPC 分支。3s 足够跟上卡片状态流转,又远短于卡片的生命周期。
 const CARD_SCHEDULER_TICK: Duration = Duration::from_secs(3);
 
+/// 组长后台循环的低频兜底 tick。
+///
+/// 与看板调度器刻意分开:**唤醒组长要真的花一次 token**。看板的 3s 是「状态机
+/// 对齐」的节奏,而组长的后台循环主要是**兜底**——真正及时的唤醒来自事件路径
+/// (前台 `ask_lead` 实时投递、`lead_rx` 分支),tick 只负责捞那些事件没覆盖到的
+/// 变化(例如某个 thread 卡在审批上、没有任何新消息)。30s 既能让兜底在一个可
+/// 接受的时间内生效,又不会让它变成「每 3s 烧一次钱」。
+const LEAD_TICK: Duration = Duration::from_secs(30);
+
+/// 后台循环投递时在 `LeadEnvelope.from_thread_id` 里用的标识。
+///
+/// `deliver_to_lead` 会把它渲染成注入文本的前缀 `[来自会话 <id>] ...`。用一
+/// 个**显然不是 thread id** 的固定串(而不是某个真实 thread),是为了让组长一眼
+/// 看出这轮是后台兜底喂进来的、而不是某个具体会话在找它;也避免下游把某个普通
+/// 会话误认成「这条 digest 的来源会话」。
+const LEAD_LOOP_SENDER: &str = "lead-loop";
+
 /// 首轮 LLM 标题生成的超时:超时即回退兜底标题，绝不卡住 turn 收尾。
 const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -65,7 +83,26 @@ pub(crate) const IMAGE_READ_MAX_BYTES: u64 = 20 * 1024 * 1024;
 
 /// driver task → 主循环的完成事件。
 pub(crate) enum TurnEvent {
-    Finished { thread_id: String, turn_id: String },
+    Finished {
+        thread_id: String,
+        turn_id: String,
+        /// 本轮的助手回复文本(取法见 [`lead_reply_text`])。
+        ///
+        /// 主循环必须在这一刻拿到它:阻塞式 `ask_lead` 的等待方按 `request_id`
+        /// 收口,而收口用的正是这串文本。收尾之后 `items` 已 move 进落盘记录,
+        /// 再想取就得回读磁盘(还会被 compact 丢锚点),故随事件带上来。
+        ///
+        /// `None` = 本轮没有可回填的助手文本(失败轮、纯工具轮、写帧失败而中断
+        /// 的轮)。这类完成事件**不得**被当成一条空回复回填。
+        reply: Option<String>,
+        /// 本轮是替哪条阻塞式 `ask_lead` 跑的(见 [`TurnPrompt::lead_request_id`])。
+        ///
+        /// 收尾时**只**用它回填那一个等待方,故两个会话同时阻塞在同一个组长上时,
+        /// 各自只收到**自己那一轮**的文本(见 [`settle_pending_lead_replies`])。
+        /// `None` = 这一轮与任何等待方无关(普通用户 turn、看板卡、单向投递、失败
+        /// 轮等),收尾时谁都不回填。
+        lead_request_id: Option<String>,
+    },
 }
 
 /// 工厂产出的 agent 及其重建所需的部件。
@@ -177,6 +214,15 @@ pub(crate) struct RuntimeAttachments {
     /// `select!` 分支消费它。与 `theme`/`git_diff` 同样的注入理由——测试要在
     /// 主循环之外拿到**同一个**实例投递,自造一份会投进没人听的通道。
     pub(crate) lead_inbox: crate::lead::LeadInbox,
+    /// 阻塞式 `ask_lead` 的回信登记表:普通会话登记 `request_id` 后 await,
+    /// 主循环在组长那轮收尾时按 id 回填。
+    ///
+    /// 必须与 [`Self::lead_inbox`] 同一注入理由,且**必须真的传进装配**
+    /// (`attach_delegation` → `build_runtime_tooling` → `AskLeadTool::with_replies`):
+    /// 漏传一个字段没有任何编译错误,`blocking: true` 只是静默退化成 P1 的显式
+    /// 拒绝——这正是本任务最危险的一处,故测试用 `Harness::lead_repliers` 驱动
+    /// 真实装配(见 `a_blocking_ask_lead_receives_the_lead_reply`)。
+    pub(crate) lead_replies: crate::lead::LeadReplies,
 }
 
 /// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
@@ -306,6 +352,9 @@ pub(crate) fn attach_delegation(
     // 空集（或残留值）。
     extra_roots: Vec<PathBuf>,
     lead_inbox: &crate::lead::LeadInbox,
+    // 阻塞式 `ask_lead` 的回信登记表。与 `lead_inbox` 必须成对传递:
+    // 只传信箱而不传登记表,`await` 侧登记的名字将永远无人回填。
+    lead_replies: &crate::lead::LeadReplies,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -358,6 +407,7 @@ pub(crate) fn attach_delegation(
         // 会话给组长留言时,消息必须落到「本目录」的组长信箱。
         crate::thread_store::ThreadStore::new(Path::new(cwd)).project_key(),
         lead_inbox.clone(),
+        lead_replies.clone(),
     ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
@@ -866,6 +916,9 @@ fn build_runtime_tooling(
     // thread id,也不知道自己在哪个项目,只能由装配期注入。
     project_key: String,
     lead_inbox: crate::lead::LeadInbox,
+    // 回信登记表与超时:两者一起决定 `blocking: true` 是否真的有界往返
+    // (只有登记表而没有超时来源,或反之,都会让契约半途而废)。
+    lead_replies: crate::lead::LeadReplies,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
@@ -875,6 +928,17 @@ fn build_runtime_tooling(
     // `cfg.sandbox_writable_roots`），故此处不再单独拼一遍。
     let mut roots = vec![workspace_root.clone()];
     roots.extend(extra_roots.iter().cloned());
+    // 本会话的 thread store。根取 `cfg.workdir`,它在**此处就是 thread cwd**:
+    // `attach_delegation` 在调用本函数之前先做了
+    // `thread_cfg.workdir = PathBuf::from(cwd)`(冷启动、resume 两条生产路径同形)。
+    //
+    // 刻意**不**用上面的 `workspace_root`:那是 daemon 回传的 git **toplevel**
+    // (`rev-parse --show-toplevel`),而组长的 meta 落在 `<cwd>/.yi-agent/threads`。
+    // 会话 cwd 是仓库子目录时两者分叉,按 toplevel 去找子目录里的组长只会 `load` 回
+    // `Ok(None)`,真组长静默丢掉两个工具。用 cwd 也让工具读的 store 与
+    // `thread/lead`、冷启动写 meta 的那一份**同源**。装配期用它读落盘的 `role`,
+    // 判定「本 thread 是不是组长」——这是唯一权威。
+    let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
     // One controller, one truth: it backs the root's builtin tools AND the
     // subagent spawn tools, and it reads the thread's live YOLO switch.
     let controller =
@@ -912,11 +976,35 @@ fn build_runtime_tooling(
     // 普通会话用它给组长留言。`from_thread_id` 绑在装配期,与
     // `register_attached_root_tools_in_thread` 的 thread marker 同理由:
     // 模型看不到自己的 thread id,只能由装配期注入。
-    registry.register(Arc::new(crate::lead::AskLeadTool::new(
-        lead_inbox,
-        project_key,
-        thread_id.to_string(),
-    )));
+    registry.register(Arc::new(
+        crate::lead::AskLeadTool::new(lead_inbox, project_key, thread_id.to_string())
+            // 回信能力**必须**在这里接上:漏掉它没有编译错误,`blocking: true`
+            // 只会静默退化成 P1 的显式拒绝。超时用共享常量,不写裸字面量——
+            // 两个 2 分钟各自漂移时,「等待方超时」与「组长还有多久回来」会脱钩。
+            .with_replies(lead_replies, crate::lead::ASK_LEAD_TIMEOUT),
+    ));
+    // lead_memory 只给组长:普通会话与子 worker 一律看不到(spec §7.5)。判定用
+    // 落盘的 `ThreadMeta.role`(唯一权威),不靠标题/名字/cwd 猜——判定函数见
+    // `lead_memory::is_lead_thread`。
+    //
+    // `project_root` 取 `cfg.workdir`(= thread cwd),理由与上面的 store 同根:
+    // ① meta 落在 `<cwd>/.yi-agent/threads`,故账本也必须落在 `<cwd>/.yi-agent`
+    //    下,两者才是同一个「项目」;
+    // ② 本功能其余部分对「组长的项目」的定义就是 cwd —— Task 6 的后台 tick 用
+    //    `session.store.project_key()`(= `<cwd>/.yi-agent`)枚举组长,
+    //    `project_root_of(project_key)` 即其 parent = cwd;
+    // ③ 若留成 git toplevel,`<repo>` 与 `<repo>/sub` 两个不同 project_key(两个
+    //    不同组长)会共用同一份 `<repo>/.yi-agent/lead_memory/memory.md`,跨项目
+    //    账本串味。
+    if crate::lead_memory::is_lead_thread(&store, thread_id) {
+        let project_root = cfg.workdir.clone();
+        registry.register(Arc::new(crate::lead_memory::LeadRememberTool::new(
+            project_root.clone(),
+        )));
+        registry.register(Arc::new(crate::lead_memory::LeadRecallTool::new(
+            project_root,
+        )));
+    }
     Ok(RuntimeTooling {
         registry: Arc::new(registry),
         permission,
@@ -1493,6 +1581,9 @@ where
             watchman_home: home_dir(),
             // 进程一条组长信箱,由 `serve` 的主循环消费。
             lead_inbox: crate::lead::LeadInbox::new(),
+            // 回信登记表与信箱同一实例范围:`blocking: true` 的 await 侧登记
+            // 在这里,回填由同一个 `serve` 主循环做。
+            lead_replies: crate::lead::LeadReplies::new(),
         },
         production_factory(cfg, theme_for_factory, catalog),
     )
@@ -1571,6 +1662,9 @@ where
             watchman_home: home_dir(),
             // 进程一条组长信箱,由 `serve` 的主循环消费。
             lead_inbox: crate::lead::LeadInbox::new(),
+            // 回信登记表与信箱同一实例范围:`blocking: true` 的 await 侧登记
+            // 在这里,回填由同一个 `serve` 主循环做。
+            lead_replies: crate::lead::LeadReplies::new(),
         },
         production_factory(cfg, theme_for_factory, catalog),
         // 桌面 = Admin(与 `run`/`serve_stdio` 的 stdio 注册完全一致)。
@@ -2286,6 +2380,7 @@ where
         watchman_uninstall,
         watchman_home,
         lead_inbox,
+        lead_replies,
     } = attachments;
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
@@ -2337,6 +2432,11 @@ where
         tokio::time::Instant::now() + CARD_SCHEDULER_TICK,
         CARD_SCHEDULER_TICK,
     );
+    // 组长后台循环的兜底 tick:30s 一次,与看板同款「首个 tick 推到门限之后」
+    // ——否则启动瞬间就会先跑一轮组长扫描,把第一个请求排在一整轮(可能落盘的)
+    // 组长 I/O 之后。低频是刻意的:唤醒组长要真花钱(见 `LEAD_TICK`)。
+    let mut lead_ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + LEAD_TICK, LEAD_TICK);
 
     // 主题变化 → ui/settings/updated(全局一条流,与 thread 无关)。经 hub 广播:
     // stdio 的 `local` 与任意 ws 设备都能收到并切 `data-theme`。
@@ -2362,6 +2462,14 @@ where
     // 到 `tokio::spawn` 需要 `'static` 或共享可变状态,两者都会拆掉「一个主循环
     // 串行拥有 threads」这条前提(与看板调度器同一约束)。
     let mut lead_rx = lead_inbox.subscribe();
+    // 「哪条阻塞请求正等着哪个组长的本轮结束」。key 是组长 thread id、value 是
+    // 待回填的 `request_id` 队列:同一个组长可能同时被多个会话阻塞等待(它自己
+    // 串行跑 turn,但投递可以叠队),所以是一对多而非一对一。
+    //
+    // 在主循环本地而非 `LeadReplies` 内部记账:登记表只认 `request_id`,不知道
+    // 「谁在等哪一轮」;把「等哪一轮」也塞进它,就会让一个纯登记表长出路由知识。
+    // 与 `threads` 同属主循环局部量,同样串行访问,故无需加锁。
+    let mut pending_lead_replies: HashMap<String, Vec<String>> = HashMap::new();
 
     loop {
         // 上传登记表的 TTL 清理：每轮循环开头收走超时的 staging 会话。放在这里
@@ -2571,6 +2679,8 @@ where
                             git_diff_handle: &git_diff_handle,
                             skills_home: &skills_home,
                             lead_inbox: &lead_inbox,
+                            lead_replies: &lead_replies,
+                            pending_lead_replies: &mut pending_lead_replies,
                         }
                     };
                 }
@@ -2737,7 +2847,7 @@ where
                 }
             }
             ev = turn_rx.recv() => {
-                if let Some(TurnEvent::Finished { thread_id, turn_id }) = ev {
+                if let Some(TurnEvent::Finished { thread_id, turn_id, reply, lead_request_id }) = ev {
                     if let Some(s) = threads.get_mut(&thread_id) {
                         // 仅当完成的正是当前活跃 turn 时才清除,避免迟到的
                         // 完成事件误清掉已开始的下一个 turn。
@@ -2745,6 +2855,16 @@ where
                             s.active_turn_id = None;
                         }
                     }
+                    // 组长那轮跑完 = 阻塞等待方的收口时刻。只回填**这一轮**替其跑
+                    // 的那个 request_id(身份随事件带上来);这一轮若与任何等待方
+                    // 无关(用户直接对组长说话),则谁都不回填。
+                    settle_pending_lead_replies(
+                        &thread_id,
+                        lead_request_id,
+                        reply,
+                        &mut pending_lead_replies,
+                        &lead_replies,
+                    );
                 }
             }
             _ = card_ticker.tick() => {
@@ -2772,8 +2892,54 @@ where
                     &workspaces,
                     &build_agent,
                     &lead_inbox,
+                    &lead_replies,
                 )
                 .await;
+            }
+            _ = lead_ticker.tick() => {
+                // 组长后台循环的兜底轮,照看板 tick 内联跑:启动一轮要拿
+                // `&mut threads`(投递走 `deliver_to_lead`),而 `threads` 是主循环
+                // 独占的局部量,`tokio::spawn` 会拆掉这条前提(spec §6.1)。
+                //
+                // 「算」与「投」分两步:`lead_tick_once` 只读 `threads` 并返回 owned
+                // 的投递清单,返回时借用已归还,下面才借 `&mut`。投递失败不中断本轮,
+                // 更不能影响主循环处理其它请求。
+                for delivery in lead_tick_once(&mut threads) {
+                    let envelope = crate::lead::LeadEnvelope {
+                        project_key: delivery.project_key,
+                        from_thread_id: LEAD_LOOP_SENDER.to_string(),
+                        text: delivery.text,
+                        // 后台 digest 是**单向**的:没有请求方在等它的回复。
+                        // `None` 也让 `deliver_to_lead` 构造的 `TurnPrompt` 天然
+                        // 带上 `lead_request_id: None`,不会误挂进阻塞回填表。
+                        request_id: None,
+                    };
+                    let mut launcher = ServeLauncher {
+                        threads: &mut threads,
+                        pending_activation: &mut pending_activation,
+                        process_watches: &mut process_watches,
+                        uploads: &mut uploads,
+                        runtimes: &runtimes,
+                        thread_roots: &thread_roots,
+                        models_path: &models_path,
+                        cfg: &cfg,
+                        hub: &hub,
+                        turn_tx: &turn_tx,
+                        pending: &pending,
+                        permission_timeout,
+                        perm_seq: &perm_seq,
+                        theme: &theme,
+                        git_diff: &git_diff_handle,
+                        workspaces: &workspaces,
+                        build_agent: &build_agent,
+                        lead_inbox: &lead_inbox,
+                        lead_replies: &lead_replies,
+                        lead_target: Some(delivery.lead),
+                    };
+                    if let Err(error) = launcher.deliver_to_lead(&envelope).await {
+                        eprintln!("[app-server] lead background delivery failed: {error}");
+                    }
+                }
             }
             envelope = lead_rx.recv() => {
                 let Ok(envelope) = envelope else { continue };
@@ -2789,6 +2955,17 @@ where
                         continue;
                     }
                 };
+                // 记账必须在投递**之前**:组长那轮可能在 `deliver_to_lead` 返回前
+                // 就跑完并发出 Finished(空会话 + 快 provider 是常态),那时若还没
+                // 记下 request_id,这枚完成事件就会被当成「无人等待」丢掉,等待方
+                // 只能干等到超时。投递失败时再回滚(见下方 `Err` 分支)。
+                let lead_thread_id = target.thread_id.clone();
+                if let Some(request_id) = &envelope.request_id {
+                    pending_lead_replies
+                        .entry(lead_thread_id.clone())
+                        .or_default()
+                        .push(request_id.clone());
+                }
                 let mut launcher = ServeLauncher {
                     threads: &mut threads,
                     pending_activation: &mut pending_activation,
@@ -2808,10 +2985,24 @@ where
                     workspaces: &workspaces,
                     build_agent: &build_agent,
                     lead_inbox: &lead_inbox,
+                    lead_replies: &lead_replies,
                     lead_target: Some(target),
                 };
                 if let Err(error) = launcher.deliver_to_lead(&envelope).await {
                     eprintln!("[app-server] lead delivery failed: {error}");
+                    // 回滚上面那条预付的记账:这条投递没有产生任何一轮,等待方
+                    // 已从工具那里拿到错误,再留一条待回填只会在下一轮投递时
+                    // 张冠李戴(把下一次的回复回填给这一次的 request_id)。
+                    // 摘的是**这一条** id(而非队尾):与收口路径同一口径,不依赖
+                    // 「刚 push 的一定在末尾」这条隐含前提。
+                    if let Some(request_id) = &envelope.request_id {
+                        if let Some(ids) = pending_lead_replies.get_mut(&lead_thread_id) {
+                            ids.retain(|id| id != request_id);
+                            if ids.is_empty() {
+                                pending_lead_replies.remove(&lead_thread_id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -3215,10 +3406,69 @@ fn parse_client_decision(result: Option<&serde_json::Value>) -> Decision {
 }
 
 /// 构造一个 `TurnEvent::Finished`,避免在 driver 里重复拼字段。
-fn finished_event(thread_id: &str, turn_id: &str) -> TurnEvent {
+///
+/// `reply` 是本轮的助手回复文本(见 [`lead_reply_text`])。收尾路径传实际取出的
+/// 文本;**中途放弃**的路径(run 失败、写帧失败、客户端断连)传 `None`:那些轮
+/// 没有「组长说了什么」可言,伪造一条空回复会让等待方以为得到了答复。
+///
+/// `lead_request_id` 是本轮替哪条阻塞式 `ask_lead` 跑的。**只有**由阻塞投递产生的
+/// 那一轮带得出来(见 `deliver_to_lead`),其余构造点一律 `None`:它们产出的轮不能
+/// 回填任何等待方。
+fn finished_event(
+    thread_id: &str,
+    turn_id: &str,
+    reply: Option<String>,
+    lead_request_id: Option<String>,
+) -> TurnEvent {
     TurnEvent::Finished {
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
+        reply,
+        lead_request_id,
+    }
+}
+
+/// 把某个 thread 上**这一轮**负责的那个等待方收口。
+///
+/// 只回填事件自己携带的那一个 `request_id`,并从待回填队列里**只**摘掉它(队列空
+/// 了就把该 lead 的条目整个 drop)。
+///
+/// 为什么不能整条队列一次取走:`pending_lead_replies` 是一对多的(同一个组长可能
+/// 同时被多个会话阻塞等待),而组长**一轮只回答一个提问**。整条取走就意味着把那
+/// 一轮的文本同时回填给排队的每一个人——第二个提问人收到的是第一个的答案。用户
+/// 直接往组长会话里打字也会产生一轮(`lead_request_id == None`),那种轮若参与
+/// 回填,就是把用户的对话内容当成对某个等待方的答复。两种错配都在此排除:
+/// **只**认本轮携带的身份,`None` 则谁都不回填。
+///
+/// 不变量:因本轮而产生的那个 id 已在投递**之前**入账(见主循环的 `lead_rx` 分支),
+/// 故这里必然能摘到它;摘不到说明本轮没有任何等待方(或是用户轮),回填是 no-op。
+///
+/// `reply` 为 `None`(失败轮/纯工具轮/中途放弃)时只摘账、不回填:伪造一条空回复
+/// 会让等待方以为组长答复了「空话」。
+fn settle_pending_lead_replies(
+    thread_id: &str,
+    lead_request_id: Option<String>,
+    reply: Option<String>,
+    pending: &mut HashMap<String, Vec<String>>,
+    replies: &crate::lead::LeadReplies,
+) {
+    // 本轮不替任何等待方跑(用户 turn / 看板卡 / 单向投递):队列**保持原样**,
+    // 排队的人继续等它自己那一轮。
+    let Some(request_id) = lead_request_id else {
+        return;
+    };
+    if let Some(ids) = pending.get_mut(thread_id) {
+        // 只摘这一个。该 id 一定在队列里(投递前入账),`retain` 比按位找更抗
+        // 重复投递:即便同一 id 意外入账两次也一并摘干净。
+        ids.retain(|id| id != &request_id);
+        if ids.is_empty() {
+            // 队列空了就把条目整个 drop,免得这张表随会话数无限长胖。
+            pending.remove(thread_id);
+        }
+    }
+    if let Some(reply) = reply {
+        // `false` = 等待方已超时(drop 了接收端)或从未登记:不是错误,无需日志噪音。
+        let _ = replies.resolve(&request_id, reply);
     }
 }
 
@@ -3231,6 +3481,10 @@ pub(crate) async fn interrupt_and_wait_for_persist(
     threads: &mut HashMap<String, ThreadSession>,
     turn_rx: &mut mpsc::Receiver<TurnEvent>,
     thread_id: &str,
+    // 本函数会把 `turn_rx` 里的 `Finished` 取走(包括别的 thread 的),故也必须
+    // 替主循环把这些事件的待回填队列收口,否则它们会悬到下一次投递。
+    pending_lead_replies: &mut HashMap<String, Vec<String>>,
+    lead_replies: &crate::lead::LeadReplies,
 ) {
     let Some(tid) = threads
         .get(thread_id)
@@ -3245,6 +3499,8 @@ pub(crate) async fn interrupt_and_wait_for_persist(
         while let Some(TurnEvent::Finished {
             thread_id: done_id,
             turn_id: done_turn,
+            reply,
+            lead_request_id,
         }) = turn_rx.recv().await
         {
             if let Some(s) = threads.get_mut(&done_id) {
@@ -3252,6 +3508,15 @@ pub(crate) async fn interrupt_and_wait_for_persist(
                     s.active_turn_id = None;
                 }
             }
+            // 这枚完成事件不会回到主循环了,它的回填机会就在此处(见函数说明)。
+            // 同样只认事件自己携带的身份:别的 thread 的那一轮与这里的等待方无关。
+            settle_pending_lead_replies(
+                &done_id,
+                lead_request_id,
+                reply,
+                pending_lead_replies,
+                lead_replies,
+            );
             if done_id == thread_id && done_turn == tid {
                 break;
             }
@@ -3319,6 +3584,9 @@ async fn persist_and_finish_turn(
     user_prompt: Option<&str>,
     user_attachments: &[crate::protocol::Attachment],
     user_image_refs: &[crate::protocol::ImageRef],
+    // 本轮若替某条阻塞式 `ask_lead` 跑,这里是它的 request_id;随 Finished 上报,
+    // 主循环据此只回填那一个等待方(见 `settle_pending_lead_replies`)。
+    lead_request_id: Option<String>,
     agent: &yi_agent_core::Agent,
     completed_items: Vec<crate::protocol::Item>,
     last_usage: Option<crate::thread_store::TurnUsage>,
@@ -3376,7 +3644,17 @@ async fn persist_and_finish_turn(
     // TITLE_TIMEOUT——若排在它前面，会让收尾凭空多出 5 秒延迟。
     let _ = update_status(hub, status, thread_id, ThreadStatus::Idle).await;
     if let Some(turn_id) = turn_id {
-        let _ = turn_tx.send(finished_event(thread_id, turn_id)).await;
+        // 回填给等待方的回复:与标题材料同一份文本,故这里复用它而不是再抽一次
+        // (extraction 只有一条口径,见 `lead_reply_text`)。身份与文本一起上报:
+        // 收口方只认这一个 request_id(见 `settle_pending_lead_replies`)。
+        let _ = turn_tx
+            .send(finished_event(
+                thread_id,
+                turn_id,
+                assistant_text.clone(),
+                lead_request_id,
+            ))
+            .await;
     }
 
     // 仅首轮生成标题：拿 touch 写入的兜底截断值作 CAS 凭据，尝试用 LLM 标题覆盖。
@@ -3449,6 +3727,19 @@ fn completed_items_agent_text(items: &[crate::protocol::Item]) -> Option<String>
     })
 }
 
+/// 组长那轮要回填给等待方 thread 的文本。
+///
+/// 与落盘/标题生成**同一条口径**:直接复用 [`completed_items_agent_text`],不另立
+/// 一套抽取逻辑。两处若各写一遍,「标题取的文本」与「回填给等待方的文本」会在
+/// 今后任何一次口径变更(例如改成取最后一条)里悄悄分叉,而后者分叉的表现是
+/// 等待方收到一段与组长实际回复无关的文字——比拿不到回复更难排查。
+///
+/// `None` = 本轮没有可回填的助手文本(失败轮、纯工具轮、写帧失败而中断的轮):
+/// 调用方**不得**把它当成一条空回复回填,那会让等待方以为组长回了话。
+fn lead_reply_text(items: &[crate::protocol::Item]) -> Option<String> {
+    completed_items_agent_text(items)
+}
+
 /// 在**没有 turn 在跑**的时刻执行一条会话命令，返回（可能被重建过的）agent。
 ///
 /// 清空与压缩都**就地**替换会话内容(`set_session_messages`),不换 `Arc`:同一
@@ -3490,6 +3781,7 @@ async fn apply_session_command(
                 None,
                 &[],
                 &[],
+                None,
                 &agent,
                 Vec::new(),
                 None,
@@ -3531,6 +3823,7 @@ async fn apply_session_command(
                 None,
                 &[],
                 &[],
+                None,
                 &agent,
                 Vec::new(),
                 None,
@@ -3657,6 +3950,7 @@ async fn apply_session_command(
                 None,
                 &[],
                 &[],
+                None,
                 &agent,
                 Vec::new(),
                 None,
@@ -3744,6 +4038,7 @@ pub(crate) async fn run_thread_driver(
             image_blocks,
             image_refs,
             display_text,
+            lead_request_id,
         }) = turn_prompt
         else {
             break; // prompt_rx 关闭:driver 收尾退出
@@ -3835,7 +4130,11 @@ pub(crate) async fn run_thread_driver(
                 for n in translator.on_event(yi_agent_core::AgentEvent::Error(e)) {
                     let _ = write_notification(&hub, &n).await;
                 }
-                let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                // 中途失败没有「组长说了什么」可言:回复传 `None`,绝不伪造一条
+                // 空回复去糊弄等待方(那比拿不到回复更难排查)。
+                let _ = turn_tx
+                    .send(finished_event(&thread_id, &turn_id, None, None))
+                    .await;
                 // run() 失败即本轮结束:thread 立刻回 Idle(失败是事件不是状态)。
                 let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
                 // 本轮已结束（失败）：turn 开始写的 checkpoint 必须清掉，否则盘上会
@@ -3895,7 +4194,8 @@ pub(crate) async fn run_thread_driver(
                                 Err(e) => {
                                     tracing::error!("failed to serialize reverse request: {e}");
                                     pending.lock().await.remove(&perm_id);
-                                    let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                    // 序列化失败即放弃本轮:无回复可回填。
+                                    let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None, None)).await;
                                     // 本轮就此结束：turn-start 写的 checkpoint 必须清掉，
                                     // 否则盘上留一条已结束 turn 的残留，重启后 resume 会
                                     // 把最后这一轮误标为 interrupted。与其它 clear 站点同款：
@@ -3924,7 +4224,8 @@ pub(crate) async fn run_thread_driver(
                             if !hub.is_connected(&client) {
                                 // 发起客户端已断开:与旧语义一致(写失败即收尾)。
                                 pending.lock().await.remove(&perm_id);
-                                let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                // 客户端断连即放弃本轮:无回复可回填。
+                                let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None, None)).await;
                                 // 本轮就此结束（客户端断连，不是崩溃）：清掉 checkpoint，
                                 // 否则重启后会把这一轮误报为 interrupted。与其它站点同款。
                                 if let Err(e) = store.clear_partial(&thread_id) {
@@ -4037,7 +4338,8 @@ pub(crate) async fn run_thread_driver(
                                     if write_notification(&hub, &out).await.is_err() {
                                         // 客户端可能已断开;先上报 Finished,
                                         // 避免 active_turn_id 永久卡住。
-                                        let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+                                        // 写帧失败即放弃本轮:无回复可回填。
+                                        let _ = turn_tx.send(finished_event(&thread_id, &turn_id, None, None)).await;
                                         // 本轮就此结束（写失败，不是崩溃）：清掉 checkpoint，
                                         // 否则重启后会把这一轮误报为 interrupted。与其它站点同款。
                                         if let Err(e) = store.clear_partial(&thread_id) {
@@ -4173,7 +4475,18 @@ pub(crate) async fn run_thread_driver(
             // 命令路径已 append 过最终状态;这里只需为这个 turn 发 Finished 让主循环清
             // active_turn_id,且**不要**再 append 一次(否则会用 turn 前的 session 覆盖)。
             let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
-            let _ = turn_tx.send(finished_event(&thread_id, &turn_id)).await;
+            // 本轮的助手文本仍待回填给可能的等待方:命令路径结束的也是一个正常跑完的
+            // turn,与下面的常规收尾同一口径(`completed_items` 此刻尚未被 take)。
+            // 身份同样随事件上报:若本轮是替某条阻塞式 `ask_lead` 跑的,等待方收的
+            // 仍是**这一轮**的答案(命令不改变谁在等哪一轮)。
+            let _ = turn_tx
+                .send(finished_event(
+                    &thread_id,
+                    &turn_id,
+                    lead_reply_text(&completed_items),
+                    lead_request_id,
+                ))
+                .await;
             // 这条路径不走常规收尾；本轮 checkpoint 同样必须清掉，否则会在盘上
             // 留一条已结束 turn 的残留，重启后被 resume 当成待恢复 turn。
             if let Err(e) = store.clear_partial(&thread_id) {
@@ -4189,6 +4502,7 @@ pub(crate) async fn run_thread_driver(
             Some(&user_prompt),
             &user_attachments,
             &user_image_refs,
+            lead_request_id,
             &agent,
             std::mem::take(&mut completed_items),
             last_usage.take(),
@@ -4330,6 +4644,7 @@ async fn card_scheduler_tick<F>(
     workspaces: &WorkspaceIndex,
     build_agent: &F,
     lead_inbox: &crate::lead::LeadInbox,
+    lead_replies: &crate::lead::LeadReplies,
 ) where
     F: Fn(
         Option<yi_agent_core::Session>,
@@ -4386,6 +4701,7 @@ async fn card_scheduler_tick<F>(
             workspaces,
             build_agent,
             lead_inbox,
+            lead_replies,
             // 看板调度器从不对组长投递:`LeadTarget` 的解析会**落盘**一个组长
             // meta(见 `resolve_lead_target`),而调度器每 3s 就要为本进程的每个
             // 看板项目构造一次 launcher——在这里解析会让每次 tick 都替所有项目
@@ -4432,6 +4748,9 @@ struct ServeLauncher<'a, F> {
     /// 组长信箱:普通会话经 `ask_lead` 投递的消息从这里被消费。与主循环共享
     /// 同一个实例(见 `serve` 的注入),自造一份会投进没人听的通道。
     lead_inbox: &'a crate::lead::LeadInbox,
+    /// 阻塞式 `ask_lead` 的回信登记表:与 `lead_inbox` 同一实例、同一理由。
+    /// 它经 `start_thread_core` 一路进 `AskLeadTool::with_replies`。
+    lead_replies: &'a crate::lead::LeadReplies,
     /// 该 launcher 对应项目的组长 thread id 与 cwd,由消费方在调用前解析。
     /// 用 owned 值而非从 `threads` 反查:组长可能尚未被打开,不在 `threads` 里。
     /// `None` = 该 launcher 不承载组长投递(目前只有看板调度器,见其构造点)。
@@ -4524,6 +4843,7 @@ where
             Some(&request.board_project),
             Some(&request.card_id),
             self.lead_inbox,
+            self.lead_replies,
         )
         .await?;
 
@@ -4598,6 +4918,7 @@ where
                 image_blocks: prepared.image_blocks,
                 image_refs: prepared.image_refs,
                 display_text: prepared.display_text,
+                lead_request_id: None,
             })
             .await
             .is_err()
@@ -4661,6 +4982,9 @@ where
                     image_blocks: Vec::new(),
                     image_refs: Vec::new(),
                     display_text: text,
+                    // 唯一会带身份的构造点:本轮就是替这条阻塞投递跑的,收尾时
+                    // 只回填这一个 request_id(见 `settle_pending_lead_replies`)。
+                    lead_request_id: envelope.request_id.clone(),
                 })
                 .await;
             return match send {
@@ -4747,6 +5071,7 @@ where
             None,
             None,
             self.lead_inbox,
+            self.lead_replies,
         )
         .await?;
 
@@ -4775,6 +5100,7 @@ where
                 image_blocks: prepared.image_blocks,
                 image_refs: prepared.image_refs,
                 display_text: prepared.display_text,
+                lead_request_id: envelope.request_id.clone(),
             })
             .await
             .is_err()
@@ -4785,6 +5111,129 @@ where
         }
         Ok(target.thread_id)
     }
+}
+
+/// 一轮后台 tick 对**某个项目**要做的一次投递:投给谁、投什么文本。
+///
+/// 用 owned 值而不是借用 `threads`:投递要拿 `&mut threads`(走
+/// `ServeLauncher::deliver_to_lead`),任何未结束的借用都会与之冲突。这也是
+/// 把「算」与「投」分成两步的全部理由。
+struct LeadTickDelivery {
+    project_key: String,
+    lead: LeadTarget,
+    text: String,
+}
+
+/// 算一轮时按项目聚起来的一组中间量。
+struct LeadGroup {
+    project_key: String,
+    /// 该项目的组长;`None` = 还没有组长 → 该组整体跳过(**不创建**)。
+    lead: Option<LeadTarget>,
+    snapshots: Vec<ThreadSnapshot>,
+}
+
+/// 一个会话的机械快照。
+///
+/// 只取**进程内事实**:状态只活在 `ThreadSession.status` 里(磁盘 `ThreadMeta`
+/// 没有 status 字段)。因此「本进程没打开过的 thread」天然不在 `threads` 里,也就
+/// 不会被算成「卡住」——这正是想要的:后台循环不为看不见的会话花钱。
+///
+/// `title` / `last_user_text` / `updated_at` 刻意留空:本轮唯一的判据是 status
+/// (`pending_asks` 恒 0,见 [`lead_tick_once`]),读盘只会把每 30s 一次兜底变成
+/// N 次 IO,而 `render_digest` 也不用这三个字段。
+fn snapshot_of(session: &ThreadSession) -> ThreadSnapshot {
+    ThreadSnapshot {
+        thread_id: session.thread_id.clone(),
+        title: None,
+        status: *session.status.lock().unwrap_or_else(|p| p.into_inner()),
+        last_user_text: None,
+        updated_at: 0,
+    }
+}
+
+/// 由项目键(状态目录 `<项目根>/.yi-agent`)反推项目根,与 `resolve_lead_target`
+/// 同一口径。
+fn project_root_of(project_key: &str) -> Option<String> {
+    Path::new(project_key)
+        .parent()
+        .map(|root| root.display().to_string())
+}
+
+/// 组长后台循环一轮的**纯计算**部分:算出哪些项目的组长该被唤醒、该注入什么文本。
+///
+/// 抽成独立函数是为了**可测**:测试只断言这个返回值,不必观测一次真实的 LLM 轮
+/// (spec §6.1 要的是「后台循环住主循环」,不是「测一次唤醒就得烧 token」)。它
+/// 不落盘、不发帧、不 spawn,主循环的 `select!` 分支只负责把结果逐条投递。
+///
+/// 三条刻意约束:
+/// - **不懒创建组长**:判定「有没有组长」只用 `ThreadStore::find_lead()`(纯读)。
+///   绝不能用 `resolve_lead_target` —— 它内部会 `ensure_lead_meta`,于是每 30s
+///   的兜底都会替每个项目落一个组长 meta,把「谁拉起组长」变成后台循环。没有
+///   组长就是没有:跳过。
+/// - **`pending_asks` 传 0**:阻塞式 `ask_lead` 的投递已由主循环的 `lead_rx`
+///   分支实时处理(那条路径本来就最及时)。这里再报一次「有 ask」只会把同一次
+///   求助变成两轮,既贵又吵。
+/// - **只认本进程已打开的会话**:分组键取自会话自己的 store,快照只含
+///   `status`;磁盘上未被打开的 thread 看不到实时状态,按 Idle 处理(不唤醒)。
+fn lead_tick_once(threads: &mut HashMap<String, ThreadSession>) -> Vec<LeadTickDelivery> {
+    // 阶段一(只读):按项目分组,给每组定出组长与一组 owned 快照。
+    // 先读完再算,`threads` 的借用在本阶段结束时就归还,不会与调用方的 `&mut`
+    // 冲突(与看板 tick 的「先快照成 owned,再借 &mut」是同一手法)。
+    let mut groups: Vec<LeadGroup> = Vec::new();
+    for session in threads.values() {
+        let project_key = session.store.project_key();
+        let Some(root) = project_root_of(&project_key) else {
+            // 项目键没有 parent(理论上不可达):无处找组长,跳过。
+            continue;
+        };
+        let idx = match groups.iter().position(|g| g.project_key == project_key) {
+            Some(idx) => idx,
+            None => {
+                let lead = match session.store.find_lead() {
+                    Ok(Some(meta)) => Some(LeadTarget {
+                        cwd: root,
+                        thread_id: meta.thread_id,
+                    }),
+                    _ => None,
+                };
+                groups.push(LeadGroup {
+                    project_key,
+                    lead,
+                    snapshots: Vec::new(),
+                });
+                groups.len() - 1
+            }
+        };
+        // 组长不是「它自己的 thread」:把组长列进去会让每一轮都自我唤醒,
+        // 那等于把低频兜底变成永久烧钱的自激循环。
+        if groups[idx]
+            .lead
+            .as_ref()
+            .is_some_and(|lead| lead.thread_id == session.thread_id)
+        {
+            continue;
+        }
+        groups[idx].snapshots.push(snapshot_of(session));
+    }
+
+    // 阶段二(纯算):每组判一次「要不要起一轮」,要就把注入文本渲出来。
+    let mut deliveries = Vec::new();
+    for group in groups {
+        // 没有组长 → 整组跳过。这里**不创建**组长。
+        let Some(lead) = group.lead else {
+            continue;
+        };
+        let wakes = decide_wake(&group.snapshots, 0);
+        if wakes.is_empty() {
+            continue;
+        }
+        deliveries.push(LeadTickDelivery {
+            project_key: group.project_key,
+            lead,
+            text: render_digest(&group.snapshots, &wakes),
+        });
+    }
+    deliveries
 }
 
 /// 由项目键反推该项目当前应承载消息的组长。
@@ -4902,6 +5351,9 @@ pub(crate) async fn start_thread_core(
     card_id: Option<&str>,
     // 进程的组长信箱:转交 `attach_delegation`,使本会话的 `ask_lead` 能投递。
     lead_inbox: &crate::lead::LeadInbox,
+    // 进程的回信登记表:与信箱同路转交,使本会话的 `ask_lead blocking: true`
+    // 真的能等到回信(`attach_delegation` 把它接进 `AskLeadTool::with_replies`)。
+    lead_replies: &crate::lead::LeadReplies,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -4922,6 +5374,7 @@ pub(crate) async fn start_thread_core(
         // 否则「meta 说有一根、实际工具集里没有」这类不一致无从察觉。
         extra_roots.clone(),
         lead_inbox,
+        lead_replies,
         built,
     );
     let BuiltAgent {
@@ -5452,6 +5905,7 @@ pub(crate) async fn start_turn_core(
             image_blocks: prepared.image_blocks,
             image_refs: prepared.image_refs,
             display_text: prepared.display_text,
+            lead_request_id: None,
         })
         .await
         .is_err()
@@ -6579,6 +7033,8 @@ mod card_scheduling_tests {
         models_path: PathBuf,
         /// 该 launcher 的组长信箱。测试不投递,故用一份空信箱即可。
         lead_inbox: crate::lead::LeadInbox,
+        /// 该 launcher 的回信登记表,与信箱同一理由:测试不投递,空表即可。
+        lead_replies: crate::lead::LeadReplies,
         _workdir_dir: tempfile::TempDir,
         _theme_dir: tempfile::TempDir,
         _workspace_dir: tempfile::TempDir,
@@ -6610,6 +7066,7 @@ mod card_scheduling_tests {
                 workdir,
                 models_path: isolated_models_path(theme_dir.path()),
                 lead_inbox: crate::lead::LeadInbox::new(),
+                lead_replies: crate::lead::LeadReplies::new(),
                 _workdir_dir: workdir_dir,
                 _theme_dir: theme_dir,
                 _workspace_dir: workspace_dir,
@@ -6626,6 +7083,7 @@ mod card_scheduling_tests {
         {
             ServeLauncher {
                 lead_inbox: &self.lead_inbox,
+                lead_replies: &self.lead_replies,
                 lead_target: None,
                 threads: &mut self.threads,
                 pending_activation: &mut self.pending_activation,
@@ -6663,6 +7121,8 @@ mod card_scheduling_tests {
                     Ok(Some(TurnEvent::Finished {
                         thread_id: id,
                         turn_id,
+                        reply: _,
+                        lead_request_id: _,
                     })) => {
                         if let Some(session) = self.threads.get_mut(&id) {
                             if session.active_turn_id.as_deref() == Some(turn_id.as_str()) {
