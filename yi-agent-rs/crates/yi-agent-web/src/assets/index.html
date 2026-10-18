@@ -251,6 +251,7 @@
 
 <h1>yi-agent 配置</h1>
 <div class="env-path" id="envPath">加载中...</div>
+<p class="desc">模型请在桌面端「设置 → 模型」中配置（写入 <code>~/.yi-agent/models.json</code>）。此页面只管理非模型设置。</p>
 
 <div class="layout">
   <div class="sidebar" id="sidebar"></div>
@@ -268,19 +269,7 @@
   let allVars = [];
   let originalValues = {};
   let currentValues = {};
-  let activeTab = 'Model Provider';
-  let collapsedSections = { 'Provider Credentials': true };
-
-  // 定义 sections：仅 Model Provider tab 使用
-  const modelProviderSections = [
-    { name: 'General', vars: ['YI_AGENT_PROVIDER', 'YI_AGENT_MODEL', 'YI_AGENT_MODEL_CONTEXT_LENGTH', 'MODEL_API_KEY', 'MODEL_API_URL'] },
-    { name: 'Provider Credentials', dynamic: true },
-  ];
-
-  function getProviderCredentialVars(provider) {
-    if (provider === 'openai') return ['OPENAI_API_KEY', 'OPENAI_BASE_URL'];
-    return ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'];
-  }
+  let activeTab = 'Agent';
 
   function sourceLabel(source) {
     if (source === 'local') return '<span class="source-label source-local">本地</span>';
@@ -312,7 +301,7 @@
   function renderSidebar() {
     const sidebar = document.getElementById('sidebar');
     sidebar.innerHTML = '';
-    const tabs = ['Model Provider', 'Agent', 'Tools', 'Real LLM Tests'];
+    const tabs = ['Agent', 'Tools', 'Real LLM Tests'];
     for (const tab of tabs) {
       const btn = document.createElement('button');
       btn.className = 'tab' + (tab === activeTab ? ' active' : '');
@@ -330,9 +319,7 @@
     const main = document.getElementById('main');
     main.innerHTML = '';
 
-    if (activeTab === 'Model Provider') {
-      renderModelProviderTab(main);
-    } else if (activeTab === 'Real LLM Tests') {
+    if (activeTab === 'Real LLM Tests') {
       renderRealLlmTestsTab(main);
     } else {
       renderFlatTab(main, activeTab);
@@ -365,48 +352,6 @@
     const clear = document.createElement('button'); clear.className = 'toggle-btn'; clear.textContent = 'Clear API Key';
     clear.onclick = async () => { if (!confirm('Clear the saved real-test API key?')) return; const response = await fetch('/api/real-llm-test-config/api-key', {method:'DELETE', headers:{'Content-Type':'application/json'}, body:JSON.stringify({confirm:true})}); showToast(response.ok ? 'API key cleared' : (await response.json()).error, !response.ok); if (response.ok) renderRealLlmTestsTab(main); };
     const actions = document.createElement('div'); actions.className = 'actions'; actions.append(save, validate, clear); group.appendChild(actions); main.appendChild(group);
-  }
-
-  function renderModelProviderTab(main) {
-    const groupEl = document.createElement('div');
-    groupEl.className = 'group';
-    groupEl.innerHTML = '<h2>Model Provider</h2>';
-
-    for (const section of modelProviderSections) {
-      const sectionEl = document.createElement('div');
-      sectionEl.className = 'section' + (collapsedSections[section.name] ? ' collapsed' : '');
-      sectionEl.dataset.section = section.name;
-
-      const header = document.createElement('div');
-      header.className = 'section-header';
-      header.innerHTML = `<span class="section-arrow">▼</span> ${section.name}`;
-      header.addEventListener('click', () => {
-        collapsedSections[section.name] = !collapsedSections[section.name];
-        sectionEl.classList.toggle('collapsed');
-      });
-
-      const body = document.createElement('div');
-      body.className = 'section-body';
-
-      let varsToRender;
-      if (section.dynamic) {
-        const provider = currentValues['YI_AGENT_PROVIDER'] || 'anthropic';
-        varsToRender = getProviderCredentialVars(provider);
-      } else {
-        varsToRender = section.vars;
-      }
-
-      for (const key of varsToRender) {
-        const v = allVars.find(x => x.key === key);
-        if (v) renderField(body, v);
-      }
-
-      sectionEl.appendChild(header);
-      sectionEl.appendChild(body);
-      groupEl.appendChild(sectionEl);
-    }
-
-    main.appendChild(groupEl);
   }
 
   function renderFlatTab(main, tabName) {
@@ -502,10 +447,6 @@
       e.target.classList.remove('modified');
     }
 
-    // 若 provider 变化，重渲染 Model Provider tab 的 credentials section
-    if (key === 'YI_AGENT_PROVIDER') {
-      renderMain();
-    }
 
     updateSaveButton();
   }

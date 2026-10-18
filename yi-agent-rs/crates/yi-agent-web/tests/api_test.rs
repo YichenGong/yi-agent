@@ -181,12 +181,26 @@ async fn get_config_returns_all_groups() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     let groups = json["groups"].as_array().unwrap();
-    // 当前仍是 3 组 / 16 个变量；Task 9 从 env 编辑器移除 9 个模型键后变为 2 组 / 7。
+    assert_eq!(groups.len(), 2); // Agent, Tools —— 模型键已迁到 models.json
+
     let total_vars: usize = groups
         .iter()
         .map(|g| g["vars"].as_array().unwrap().len())
         .sum();
-    assert_eq!(total_vars, 16);
+    assert_eq!(total_vars, 7);
+
+    // 9 个模型键绝不出现在 env 编辑器里（不再有绕过清单的写入口）。
+    for key in yi_agent_runtime::config::MODEL_ENV_KEYS {
+        for group in groups {
+            for var in group["vars"].as_array().unwrap() {
+                assert_ne!(
+                    var["key"].as_str(),
+                    Some(*key),
+                    "{key} must not be editable here"
+                );
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -232,7 +246,7 @@ async fn put_config_writes_updates() {
 
     let body = json!({
         "updates": [
-            { "key": "YI_AGENT_MODEL", "value": "test-model-123" }
+            { "key": "YI_AGENT_MAX_TURNS", "value": "123" }
         ]
     });
     let request = Request::builder()
@@ -247,7 +261,7 @@ async fn put_config_writes_updates() {
 
     // 验证文件写入
     let content = std::fs::read_to_string(&env_path).unwrap();
-    assert!(content.contains("YI_AGENT_MODEL=test-model-123"));
+    assert!(content.contains("YI_AGENT_MAX_TURNS=123"));
 }
 
 #[tokio::test]

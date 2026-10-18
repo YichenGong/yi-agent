@@ -175,31 +175,32 @@ mod tests {
         for var in ALL_VARS {
             assert!(content.contains(var.key), "missing {} in output", var.key);
         }
-        assert!(content.contains("# === Model Provider ==="));
         assert!(content.contains("# === Agent ==="));
+        assert!(content.contains("# === Tools ==="));
+        assert!(!content.contains("# === Model Provider ==="));
     }
 
     #[test]
     fn write_merges_updates() {
         let tmp = NamedTempFile::new().unwrap();
         let mut current = HashMap::new();
-        current.insert("YI_AGENT_MODEL".to_string(), "old-model".to_string());
+        current.insert("BOCHA_API_KEY".to_string(), "old-key".to_string());
 
         write(
             tmp.path(),
             &current,
-            &[("YI_AGENT_MODEL".to_string(), "new-model".to_string())],
+            &[("BOCHA_API_KEY".to_string(), "new-key".to_string())],
         )
         .unwrap();
         let map = read(tmp.path()).unwrap();
-        assert_eq!(map.get("YI_AGENT_MODEL").unwrap(), "new-model");
+        assert_eq!(map.get("BOCHA_API_KEY").unwrap(), "new-key");
     }
 
     #[test]
     fn write_preserves_unupdated_values() {
         let tmp = NamedTempFile::new().unwrap();
         let mut current = HashMap::new();
-        current.insert("YI_AGENT_MODEL".to_string(), "keep-this".to_string());
+        current.insert("BOCHA_API_KEY".to_string(), "keep-this".to_string());
 
         write(
             tmp.path(),
@@ -208,7 +209,7 @@ mod tests {
         )
         .unwrap();
         let map = read(tmp.path()).unwrap();
-        assert_eq!(map.get("YI_AGENT_MODEL").unwrap(), "keep-this");
+        assert_eq!(map.get("BOCHA_API_KEY").unwrap(), "keep-this");
         assert_eq!(map.get("YI_AGENT_MAX_TURNS").unwrap(), "50");
     }
 
