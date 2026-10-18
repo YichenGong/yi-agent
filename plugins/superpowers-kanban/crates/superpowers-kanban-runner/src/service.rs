@@ -904,9 +904,18 @@ impl BoardService {
 
     /// 这台宿主的管路里，请求常驻 daemon 的名字。写进登记文件的 `required_by`。
     ///
-    /// 是一个**磁盘契约字符串**：宿主的 `Lifecycle` 用同一个名字读写，改它要
-    /// 同时改宿主侧的 `resident::import_legacy_projects(…, requester)` 参数。
+    /// 是一个**磁盘契约字符串**：宿主侧用同一个名字读写（`yi-agent-store` 的
+    /// `resident::import_legacy_projects(…, requester)` 参数就是这个值），改它要
+    /// 两边同改。
     const REQUESTER: &'static str = "superpowers-kanban";
+
+    /// 本插件的状态目录落点：`<project>/.yi-agent/superpowers-kanban`。
+    ///
+    /// 与 `main.rs` 的 `default_state_dir` 和清单的 `--state-dir` 同一个落点。
+    /// 只写一处，create 与 remove 就不可能各算各的。
+    fn state_dir_for(project: &Path) -> PathBuf {
+        project.join(".yi-agent").join(Self::REQUESTER)
+    }
 
     /// 建盘（生命周期归插件，Spec 4 §4.2）：建自己的状态目录 + 登记常驻。
     ///
@@ -924,7 +933,7 @@ impl BoardService {
             .ok_or_else(|| "cannot locate the resident registry: HOME is unset".to_string())?;
         // 状态目录落点与 `main.rs` 的 `default_state_dir`/清单的 `--state-dir` 一致：
         // `<项目>/.yi-agent/superpowers-kanban`。
-        let state_dir = project.join(".yi-agent").join(Self::REQUESTER);
+        let state_dir = Self::state_dir_for(project);
         std::fs::create_dir_all(&state_dir).map_err(|error| {
             format!(
                 "could not create the board state dir {}: {error}",
@@ -950,7 +959,7 @@ impl BoardService {
             .ok_or_else(|| "cannot locate the resident registry: HOME is unset".to_string())?;
         resident::release(&resident_dir, project, Self::REQUESTER)
             .map_err(|error| format!("could not release the project: {error}"))?;
-        let state_dir = project.join(".yi-agent").join(Self::REQUESTER);
+        let state_dir = Self::state_dir_for(project);
         match std::fs::remove_dir_all(&state_dir) {
             Ok(()) => Ok(()),
             // 本就不在 = 目标已达成。
@@ -3553,22 +3562,38 @@ mod lifecycle_tests {
         let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        // 生产入口：dispatch 自己解析 state_dir 对应的 service。
-        let created = crate::dispatch::dispatch(
+        // 走注入版分派：生产入口 `dispatch()` 里的 `service_for` 用 `home = None`，
+        // 那会落到**真实** `$HOME/.yi-agent`——测试绝不能写用户的真登记表
+        // （失败时会把临时目录的登记永久漏进去）。
+        let service = BoardService::new(
+            state_dir.clone(),
+            project.clone(),
+            Some(dir.path().join("home")),
+        );
+
+        let created = crate::dispatch::dispatch_with_service(
+            &service,
             &state_dir,
+            None,
             "lifecycle/create",
             &serde_json::json!({ "project": project.to_string_lossy() }),
         )
         .unwrap();
         assert_eq!(created["ok"], true);
 
-        let removed = crate::dispatch::dispatch(
+        let removed = crate::dispatch::dispatch_with_service(
+            &service,
             &state_dir,
+            None,
             "lifecycle/remove",
             &serde_json::json!({ "project": project.to_string_lossy() }),
         )
         .unwrap();
         assert_eq!(removed["ok"], true);
+
+        // 登记写在注入的 home 下，真实 `$HOME` 未被碰过。
+        assert!(registry(dir.path()).exists());
+        assert!(resident::list(&dir.path().join("home/.yi-agent")).is_empty());
     }
 
     #[test]
@@ -3577,17 +3602,18 @@ mod lifecycle_tests {
         let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
         std::fs::create_dir_all(&state_dir).unwrap();
 
-        // 缺 project：给一条说清楚的错，而不是静默 no-op。
-        let error =
-            crate::dispatch::dispatch(&state_dir, "lifecycle/create", &serde_json::json!({}))
-                .unwrap_err();
-        assert!(error.contains("project"), "{error}");
-        let error = crate::dispatch::dispatch(
-            &state_dir,
-            "lifecycle/create",
-            &serde_json::json!({ "project": "" }),
-        )
-        .unwrap_err();
-        assert!(error.contains("project"), "{error}");
+        // 缺 project：给一条说清楚的错，而不是静默 no-op。create 与 remove 都要挡。
+        for method in ["lifecycle/create", "lifecycle/remove"] {
+            let error =
+                crate::dispatch::dispatch(&state_dir, method, &serde_json::json!({})).unwrap_err();
+            assert!(error.contains("project"), "{method}: {error}");
+            let error = crate::dispatch::dispatch(
+                &state_dir,
+                method,
+                &serde_json::json!({ "project": "" }),
+            )
+            .unwrap_err();
+            assert!(error.contains("project"), "{method}: {error}");
+        }
     }
 }
