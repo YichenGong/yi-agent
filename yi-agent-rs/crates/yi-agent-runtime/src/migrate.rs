@@ -85,7 +85,18 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
     }
 
     // 1) 先落清单：只有清单为空时才导入，绝不覆盖用户既有配置。
-    let existing = crate::models::load_catalog_from(models_path);
+    //
+    // 用严格读取区分「文件不存在」（= 确定没配置，可安全导入）与
+    // 「文件在但读不出来 / 解析不了」（= 用户有配置、只是坏了一次）。宽容的
+    // `load_catalog_from` 把后者也当成空清单，会让 `save_catalog_to` 的 rename
+    // 直接盖掉用户整份清单——数据丢失，且毫无提示。
+    let existing = match crate::models::try_load_catalog_from(models_path) {
+        Ok(catalog) => catalog,
+        Err(reason) => {
+            // 清单不可安全写入 → 绝不注释 .env（否则用户的 key 凭空丢失）。
+            return MigrationOutcome::CatalogNotWritable { reason };
+        }
+    };
     let outcome = if existing.models.is_empty() {
         let get = |key: &str| {
             active
@@ -94,17 +105,40 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         };
+        // provider 必须先定：下面的同名键回退要按「最终 provider」选键。
+        let provider = {
+            let declared = get("YI_AGENT_PROVIDER");
+            if declared.trim().is_empty() {
+                "anthropic".to_string()
+            } else {
+                declared
+            }
+        };
+        let Some(parsed) = crate::models::ModelProvider::parse(&provider) else {
+            return MigrationOutcome::CatalogNotWritable {
+                reason: format!("unknown provider: {provider}"),
+            };
+        };
+        // provider 专属键：仅按已解析的 provider 选，不按「哪个键存在」推断 provider。
+        let (named_key, named_url) = match parsed {
+            crate::models::ModelProvider::Openai => ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+            crate::models::ModelProvider::Anthropic => ("ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"),
+        };
+        // 通用键优先；缺失 / 空 → 回退到 provider 专属键（否则这些键会被注释掉却收不进清单）。
+        let first_non_empty = |candidates: [&str; 2]| {
+            candidates
+                .into_iter()
+                .map(get)
+                .find(|value| !value.trim().is_empty())
+                .unwrap_or_default()
+        };
         let settings = crate::onboarding::ModelSettings {
-            provider: get("YI_AGENT_PROVIDER"),
+            provider,
             model: get("YI_AGENT_MODEL"),
-            api_url: get("MODEL_API_URL"),
-            api_key: get("MODEL_API_KEY"),
+            api_url: first_non_empty(["MODEL_API_URL", named_url]),
+            api_key: first_non_empty(["MODEL_API_KEY", named_key]),
         };
-        let provider = if settings.provider.trim().is_empty() {
-            "anthropic".to_string()
-        } else {
-            settings.provider.clone()
-        };
+        let provider = settings.provider.clone();
         let mut catalog = existing.clone();
         let name = {
             let base = if settings.model.trim().is_empty() {
@@ -119,11 +153,6 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
                 n += 1;
             }
             candidate
-        };
-        let Some(parsed) = crate::models::ModelProvider::parse(&provider) else {
-            return MigrationOutcome::CatalogNotWritable {
-                reason: format!("unknown provider: {provider}"),
-            };
         };
         let default_url = match parsed {
             crate::models::ModelProvider::Openai => "https://api.openai.com/v1",
@@ -321,5 +350,130 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    #[test]
+    fn a_corrupt_catalog_is_never_clobbered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models = dir.path().join("models.json");
+        let garbage = "{ this is not valid json";
+        std::fs::write(&models, garbage).unwrap();
+        let env_text = "MODEL_API_KEY=sk-x\nYI_AGENT_MAX_TURNS=20\n";
+        let env = write_env(dir.path(), env_text);
+
+        match migrate_model_keys(&env, &models) {
+            MigrationOutcome::CatalogNotWritable { .. } => {}
+            other => panic!("expected CatalogNotWritable, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&models).unwrap(),
+            garbage,
+            "a corrupt models.json must be left byte-identical (never renamed over)"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&env).unwrap(),
+            env_text,
+            ".env must be untouched: the key must not be commented out"
+        );
+    }
+
+    #[test]
+    fn a_provider_named_anthropic_key_is_imported_not_stranded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = write_env(
+            dir.path(),
+            "ANTHROPIC_API_KEY=sk-ant-x\nANTHROPIC_BASE_URL=https://anthropic-proxy.example\n",
+        );
+        let models = dir.path().join("models.json");
+        assert_eq!(
+            migrate_model_keys(&env, &models),
+            MigrationOutcome::Migrated {
+                entry: "anthropic".into()
+            }
+        );
+
+        let catalog = crate::models::load_catalog_from(&models);
+        assert_eq!(catalog.models[0].api_key, "sk-ant-x");
+        assert_eq!(catalog.models[0].api_url, "https://anthropic-proxy.example");
+        assert!(
+            std::fs::read_to_string(&env)
+                .unwrap()
+                .contains("# MIGRATED: ANTHROPIC_API_KEY=sk-ant-x")
+        );
+    }
+
+    #[test]
+    fn a_provider_named_openai_key_is_imported_not_stranded() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = write_env(
+            dir.path(),
+            "YI_AGENT_PROVIDER=openai\nOPENAI_API_KEY=sk-oai-x\nOPENAI_BASE_URL=https://openai-proxy.example/v1\n",
+        );
+        let models = dir.path().join("models.json");
+        assert_eq!(
+            migrate_model_keys(&env, &models),
+            MigrationOutcome::Migrated {
+                entry: "openai".into()
+            }
+        );
+
+        let catalog = crate::models::load_catalog_from(&models);
+        assert_eq!(catalog.models[0].api_key, "sk-oai-x");
+        assert_eq!(catalog.models[0].api_url, "https://openai-proxy.example/v1");
+    }
+
+    #[test]
+    fn an_empty_openai_provider_key_is_not_substituted_by_the_anthropic_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // provider 走 `openai`，但 .env 里只有 anthropic 同名键：按 provider 选键，
+        // 不做「哪个键存在就用哪个」的推断。
+        let env = write_env(
+            dir.path(),
+            "YI_AGENT_PROVIDER=openai\nANTHROPIC_API_KEY=sk-ant-x\n",
+        );
+        let models = dir.path().join("models.json");
+        assert_eq!(
+            migrate_model_keys(&env, &models),
+            MigrationOutcome::Migrated {
+                entry: "openai".into()
+            }
+        );
+        let catalog = crate::models::load_catalog_from(&models);
+        assert_eq!(catalog.models[0].api_key, "");
+        assert_eq!(catalog.models[0].api_url, "https://api.openai.com/v1");
+    }
+
+    #[test]
+    fn the_generic_keys_win_over_the_provider_named_ones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = write_env(
+            dir.path(),
+            "MODEL_API_KEY=sk-generic\nANTHROPIC_API_KEY=sk-ant-x\nMODEL_API_URL=https://generic.example\nANTHROPIC_BASE_URL=https://anthropic-proxy.example\n",
+        );
+        let models = dir.path().join("models.json");
+        assert_eq!(
+            migrate_model_keys(&env, &models),
+            MigrationOutcome::Migrated {
+                entry: "anthropic".into()
+            }
+        );
+        let catalog = crate::models::load_catalog_from(&models);
+        assert_eq!(catalog.models[0].api_key, "sk-generic");
+        assert_eq!(catalog.models[0].api_url, "https://generic.example");
+    }
+
+    #[test]
+    fn an_empty_generic_key_falls_back_to_the_provider_named_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = write_env(dir.path(), "MODEL_API_KEY=\nANTHROPIC_API_KEY=sk-ant-x\n");
+        let models = dir.path().join("models.json");
+        assert_eq!(
+            migrate_model_keys(&env, &models),
+            MigrationOutcome::Migrated {
+                entry: "anthropic".into()
+            }
+        );
+        let catalog = crate::models::load_catalog_from(&models);
+        assert_eq!(catalog.models[0].api_key, "sk-ant-x");
     }
 }
