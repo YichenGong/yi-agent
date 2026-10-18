@@ -303,6 +303,7 @@ pub(crate) async fn handle(
                 None,
                 None,
                 state.lead_inbox,
+                state.lead_replies,
             )
             .await?;
 
@@ -411,7 +412,14 @@ pub(crate) async fn handle(
             // 若该 thread 仍在内存且有活跃 turn,先请求中断,再等待 driver
             // 落盘完成,否则紧随 turn/completed 的 resume 会读到尚未写入
             // 的历史。详见 `interrupt_and_wait_for_persist`。
-            interrupt_and_wait_for_persist(state.threads, state.turn_rx, &thread_id).await;
+            interrupt_and_wait_for_persist(
+                state.threads,
+                state.turn_rx,
+                &thread_id,
+                state.pending_lead_replies,
+                state.lead_replies,
+            )
+            .await;
 
             let loaded = match thread_store.load(&thread_id) {
                 Ok(Some(l)) => l,
@@ -518,6 +526,7 @@ pub(crate) async fn handle(
                 // 重建 agent 时下发到工厂的根集一致。
                 extra_roots,
                 state.lead_inbox,
+                state.lead_replies,
                 built,
             );
             let BuiltAgent {
@@ -1498,7 +1507,14 @@ pub(crate) async fn handle(
             // (`create(true)`)会把 `<id>.jsonl` 复活,导致删除后
             // `store.exists` 仍为真、`thread/resume` 能把已删 thread 拉回。
             // 故复用 resume 的等待模式,等落盘后再删。
-            interrupt_and_wait_for_persist(state.threads, state.turn_rx, &thread_id).await;
+            interrupt_and_wait_for_persist(
+                state.threads,
+                state.turn_rx,
+                &thread_id,
+                state.pending_lead_replies,
+                state.lead_replies,
+            )
+            .await;
             // 落盘已结束:现在从内存移除(drop prompt_tx 让 driver 收尾)并删文件。
             state.threads.remove(&thread_id);
             state.pending_activation.remove(&thread_id);

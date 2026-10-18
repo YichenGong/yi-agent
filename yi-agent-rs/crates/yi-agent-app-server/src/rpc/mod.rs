@@ -302,4 +302,14 @@ pub(crate) struct AppState<'a> {
     /// (后者转交给组长工具集),故与 [`AppState::runtimes`] 同路按 `&` 借用。
     /// 搬移前臂里的 `lead_inbox`。
     pub(crate) lead_inbox: &'a crate::lead::LeadInbox,
+    /// 阻塞式 `ask_lead` 的回信登记表。`thread/start` 与 `thread/resume` 各把它
+    /// 交给 `start_thread_core` / `attach_delegation`(转交给 `AskLeadTool`),
+    /// 与 [`AppState::lead_inbox`] 同一实例、同一理由,故同样按 `&` 借用。
+    /// 搬移前臂里的 `lead_replies`。
+    pub(crate) lead_replies: &'a crate::lead::LeadReplies,
+    /// 待回填的阻塞式 `ask_lead` 登记表(按组长 thread_id 归组 request_id)。
+    /// `thread/resume` 与 `thread/delete` 经 `interrupt_and_wait_for_persist`
+    /// 消费 `turn_rx` 时替主循环收口,故与 [`AppState::turn_rx`] 同路按 `&mut`
+    /// 借用。搬移前臂里的 `pending_lead_replies`。
+    pub(crate) pending_lead_replies: &'a mut HashMap<String, Vec<String>>,
 }
