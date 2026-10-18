@@ -153,6 +153,179 @@ pub fn classify_target(
     ControlTarget::Session
 }
 
+use serde::Deserialize;
+use serde_json::Value;
+use yi_agent_core::{Tool, ToolMetadata, ToolResult};
+
+/// 两个写工具共用的参数形状。
+#[derive(Deserialize)]
+struct LeadControlArgs {
+    thread_id: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// 两个写工具共用的执行骨架：校验 → 投递 → 等主循环回填结果。
+///
+/// 抽出来是为了让「校验 + 投递 + 有界等待 + 错误归一」只有一份；两个工具的差别
+/// 仅在 `kind` 与文案。
+async fn run_control(
+    inbox: &LeadControlInbox,
+    replies: &LeadControlReplies,
+    project_key: &str,
+    kind: LeadControlKind,
+    args: Value,
+) -> ToolResult {
+    let parsed: LeadControlArgs = match serde_json::from_value(args) {
+        Ok(a) => a,
+        Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
+    };
+    let thread_id = parsed.thread_id.trim().to_string();
+    if thread_id.is_empty() {
+        return ToolResult::error("thread_id must not be empty");
+    }
+    let reason = parsed.reason.trim().to_string();
+    if reason.is_empty() {
+        return ToolResult::error("reason must not be empty");
+    }
+    let request_id = format!("lead-ctl-{}", uuid::Uuid::new_v4());
+    let rx = replies.register(request_id.clone());
+    let delivered = inbox.send(LeadControlCmd {
+        project_key: project_key.to_string(),
+        kind,
+        thread_id,
+        reason,
+        request_id,
+    });
+    if !delivered {
+        // 主循环不在听：这条写动作不会发生，如实报错（不静默成功）。
+        return ToolResult::error("组长写通道当前无人接收（主循环未在运行），本条指令未下达。");
+    }
+    // 有界等待：主循环是本进程内一步操作，毫秒级；给 5s 兜底，避免主循环卡死时
+    // 工具永久挂住（与 `ask_lead blocking` 的有界收口同一原则）。
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(Ok(summary))) => ToolResult::text(summary),
+        Ok(Ok(Err(reason))) => ToolResult::error(format!("指令未能执行：{reason}")),
+        Ok(Err(_)) => ToolResult::error("组长写通道已关闭。"),
+        Err(_) => ToolResult::error("等待主循环执行超时（5s）。"),
+    }
+}
+
+/// 两个写工具的元数据：与 `lead_remember` 同源（`ToolSource::Plugin { name: "lead" }`），
+/// `requires_confirmation: false`（后台无人值守时若需批准，功能就废了，spec §6）。
+/// **不设** `read_only`——它们是写动作。
+fn lead_control_metadata() -> ToolMetadata {
+    crate::lead_memory::lead_memory_metadata()
+}
+
+/// 打断目标 thread 的当前活跃轮。**只由组长使用**（注册点见 `build_runtime_tooling`）。
+pub struct LeadInterruptTool {
+    inbox: LeadControlInbox,
+    replies: LeadControlReplies,
+    project_key: String,
+}
+
+impl LeadInterruptTool {
+    pub fn new(inbox: LeadControlInbox, replies: LeadControlReplies, project_key: String) -> Self {
+        Self {
+            inbox,
+            replies,
+            project_key,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for LeadInterruptTool {
+    fn name(&self) -> &str {
+        "lead_interrupt_thread"
+    }
+
+    fn description(&self) -> &str {
+        "Interrupt the current in-flight turn of another thread in this project (same effect as the user pressing Esc). Fails if that thread has no active turn — it never silently no-ops. Use it to stop a thread that has gone off track mid-turn; to correct a thread without stopping it, use lead_reject_thread instead."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thread_id": { "type": "string", "description": "The thread whose current turn to interrupt (must be in this project)." },
+                "reason": { "type": "string", "description": "Why you are interrupting. Recorded so the user can audit it." }
+            },
+            "required": ["thread_id", "reason"]
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        run_control(
+            &self.inbox,
+            &self.replies,
+            &self.project_key,
+            LeadControlKind::Interrupt,
+            args,
+        )
+        .await
+    }
+
+    fn metadata(&self) -> ToolMetadata {
+        lead_control_metadata()
+    }
+}
+
+/// 打回目标 thread：投递一条「组长指令 + 理由」。**只由组长使用**。
+pub struct LeadRejectTool {
+    inbox: LeadControlInbox,
+    replies: LeadControlReplies,
+    project_key: String,
+}
+
+impl LeadRejectTool {
+    pub fn new(inbox: LeadControlInbox, replies: LeadControlReplies, project_key: String) -> Self {
+        Self {
+            inbox,
+            replies,
+            project_key,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for LeadRejectTool {
+    fn name(&self) -> &str {
+        "lead_reject_thread"
+    }
+
+    fn description(&self) -> &str {
+        "Send a correcting instruction to another thread in this project. If that thread is mid-turn the instruction is folded into the current turn (like a user interjection); if it is idle a fresh turn is started so the correction takes effect. To retract an earlier rejection, send another one that says so — the transcript is the ledger. Use it to steer a thread that is heading the wrong way."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "thread_id": { "type": "string", "description": "The thread to reject (must be in this project)." },
+                "reason": { "type": "string", "description": "The correcting instruction plus why. It lands verbatim in that thread's transcript, so write it for the thread to act on." }
+            },
+            "required": ["thread_id", "reason"]
+        })
+    }
+
+    async fn call(&self, args: Value) -> ToolResult {
+        run_control(
+            &self.inbox,
+            &self.replies,
+            &self.project_key,
+            LeadControlKind::Reject,
+            args,
+        )
+        .await
+    }
+
+    fn metadata(&self) -> ToolMetadata {
+        lead_control_metadata()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +397,86 @@ mod tests {
     async fn resolving_an_unknown_request_is_a_noop() {
         let replies = LeadControlReplies::default();
         assert!(!replies.resolve("nope", Ok("x".into())));
+    }
+
+    use yi_agent_core::Tool;
+
+    #[tokio::test]
+    async fn interrupt_reports_an_empty_reason_as_an_error() {
+        let tool = LeadInterruptTool::new(
+            LeadControlInbox::new(),
+            LeadControlReplies::default(),
+            "/a/.yi-agent".into(),
+        );
+        let out = tool
+            .call(serde_json::json!({ "thread_id": "t1", "reason": "   " }))
+            .await;
+        assert!(out.is_error, "a blank reason must be rejected");
+    }
+
+    #[tokio::test]
+    async fn interrupt_fails_when_no_one_is_listening() {
+        // 无订阅者 = 主循环不在听：绝不能报成功。
+        let tool = LeadInterruptTool::new(
+            LeadControlInbox::new(),
+            LeadControlReplies::default(),
+            "/a/.yi-agent".into(),
+        );
+        let out = tool
+            .call(serde_json::json!({ "thread_id": "t1", "reason": "stop" }))
+            .await;
+        assert!(out.is_error, "no subscriber must be an error, got {out:?}");
+    }
+
+    #[tokio::test]
+    async fn interrupt_returns_the_main_loop_outcome() {
+        let inbox = LeadControlInbox::new();
+        let replies = LeadControlReplies::default();
+        let mut rx = inbox.subscribe();
+        let tool = LeadInterruptTool::new(inbox, replies.clone(), "/a/.yi-agent".into());
+        // 扮演主循环：收到指令后回填失败（目标无活跃轮）。
+        let outcome = tokio::spawn(async move {
+            let cmd = rx.recv().await.unwrap();
+            assert_eq!(cmd.kind, LeadControlKind::Interrupt);
+            assert_eq!(cmd.thread_id, "t1");
+            replies.resolve(&cmd.request_id, Err("目标没有活跃轮".into()));
+        });
+        let out = tool
+            .call(serde_json::json!({ "thread_id": "t1", "reason": "stop" }))
+            .await;
+        outcome.await.unwrap();
+        assert!(
+            out.is_error,
+            "a failed interruption must surface as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_carries_the_reason_to_the_main_loop() {
+        let inbox = LeadControlInbox::new();
+        let replies = LeadControlReplies::default();
+        let mut rx = inbox.subscribe();
+        let tool = LeadRejectTool::new(inbox, replies.clone(), "/a/.yi-agent".into());
+        let outcome = tokio::spawn(async move {
+            let cmd = rx.recv().await.unwrap();
+            assert_eq!(cmd.kind, LeadControlKind::Reject);
+            assert_eq!(cmd.reason, "redo with tests");
+            replies.resolve(&cmd.request_id, Ok("已打回".into()));
+        });
+        let out = tool
+            .call(serde_json::json!({ "thread_id": "t2", "reason": "redo with tests" }))
+            .await;
+        outcome.await.unwrap();
+        assert!(
+            !out.is_error,
+            "a successful reject must not be an error: {out:?}"
+        );
+        assert!(
+            format!("{out:?}").contains("已打回")
+                || serde_json::to_string(&out.content)
+                    .unwrap()
+                    .contains("已打回"),
+            "the outcome must reach the tool result: {out:?}"
+        );
     }
 }

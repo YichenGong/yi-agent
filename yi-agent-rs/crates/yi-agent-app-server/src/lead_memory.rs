@@ -108,7 +108,7 @@ pub fn search(project_root: &Path, query: &str, limit: usize) -> std::io::Result
 use serde_json::Value;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
-fn lead_memory_metadata() -> ToolMetadata {
+pub(crate) fn lead_memory_metadata() -> ToolMetadata {
     ToolMetadata {
         source: ToolSource::Plugin {
             name: "lead".to_string(),
