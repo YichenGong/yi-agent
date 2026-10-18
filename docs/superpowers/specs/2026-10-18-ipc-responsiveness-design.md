@@ -235,6 +235,6 @@ tick 独立于 RPC，且 `ServeLauncher` 真需要 `&mut threads` 来 launch 会
 
 - 除 `board/*` 与 `plugin/*` 外的域，若将来引入同步 IPC，同样按 D 的做法卸载。
 - daemon 每请求 reconcile 的彻底消除（推模型而非拉模型）。
-- subagent worker 线程放大（`subagent/src/lib.rs:843`）。
-- relay invalid-token 重连风暴（`ws.rs:248` + `backoff.rs`「成功即重置」）。
+- subagent worker 线程放大（`subagent/src/lib.rs:847`）。
+- relay invalid-token 重连风暴（`ws.rs:288` 的 `ws connection rejected`）。
 - desktop 从 2s 轮询改为服务端推送（`ui/board/updated` 通知）。
