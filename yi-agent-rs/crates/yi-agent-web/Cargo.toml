@@ -19,3 +19,4 @@ serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+yi-agent-runtime = { path = "../yi-agent-runtime" }

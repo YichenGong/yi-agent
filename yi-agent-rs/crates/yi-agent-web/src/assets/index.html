@@ -251,12 +251,6 @@
 
 <h1>yi-agent 配置</h1>
 <div class="env-path" id="envPath">加载中...</div>
-<div class="env-path" id="globalEnvPath" style="display:none;"></div>
-
-<div class="scope-toggle" id="scopeToggle">
-  <button id="scopeGlobal" class="active">全局</button>
-  <button id="scopeLocal">本地</button>
-</div>
 
 <div class="layout">
   <div class="sidebar" id="sidebar"></div>
@@ -276,8 +270,6 @@
   let currentValues = {};
   let activeTab = 'Model Provider';
   let collapsedSections = { 'Provider Credentials': true };
-  let currentScope = 'global'; // 'local' or 'global'
-  let hasGlobal = false; // whether global path is available
 
   // 定义 sections：仅 Model Provider tab 使用
   const modelProviderSections = [
@@ -300,22 +292,7 @@
   async function loadConfig() {
     const resp = await fetch('/api/config');
     const data = await resp.json();
-    document.getElementById('envPath').textContent = '本地: ' + data.envPath;
-
-    hasGlobal = !!data.globalEnvPath;
-    const globalEl = document.getElementById('globalEnvPath');
-    const scopeToggle = document.getElementById('scopeToggle');
-    if (hasGlobal) {
-      globalEl.textContent = '全局: ' + data.globalEnvPath;
-      globalEl.style.display = '';
-      scopeToggle.style.display = '';
-    } else {
-      currentScope = 'local';
-      document.getElementById('scopeLocal').classList.add('active');
-      document.getElementById('scopeGlobal').classList.remove('active');
-      globalEl.style.display = 'none';
-      scopeToggle.style.display = 'none';
-    }
+    document.getElementById('envPath').textContent = '配置文件: ' + data.envPath;
 
     // 扁平化所有变量
     allVars = [];
@@ -565,7 +542,7 @@
     const resp = await fetch('/api/config', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ scope: currentScope, updates }),
+      body: JSON.stringify({ updates }),
     });
 
     if (resp.ok) {
@@ -585,19 +562,6 @@
   }
 
   document.getElementById('saveBtn').addEventListener('click', save);
-
-  document.getElementById('scopeLocal').addEventListener('click', () => {
-    currentScope = 'local';
-    document.getElementById('scopeLocal').classList.add('active');
-    document.getElementById('scopeGlobal').classList.remove('active');
-  });
-
-  document.getElementById('scopeGlobal').addEventListener('click', () => {
-    if (!hasGlobal) return;
-    currentScope = 'global';
-    document.getElementById('scopeGlobal').classList.add('active');
-    document.getElementById('scopeLocal').classList.remove('active');
-  });
 
   loadConfig();
 </script>

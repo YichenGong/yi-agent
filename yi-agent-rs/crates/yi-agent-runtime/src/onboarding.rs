@@ -255,6 +255,40 @@ pub fn write_model_settings(path: &Path, settings: &ModelSettings) -> std::io::R
 /// `preferences.json` 里「引导已结束」的键：完成或用户选「稍后设置」都置位。
 pub const DISMISSED_KEY: &str = "onboarding_dismissed";
 
+/// 把一组模型设置落成清单里的一条并设为默认。重名自动加 `-2`/`-3` 后缀。
+///
+/// CLI 的终端引导与 app-server 的 `onboarding/apply` 共用它，保证两条写路径同源。
+pub fn import_settings_into_catalog(
+    models_path: &Path,
+    settings: &ModelSettings,
+) -> Result<String, String> {
+    let Some(provider) = crate::models::ModelProvider::parse(&settings.provider) else {
+        return Err(format!("unknown provider: {}", settings.provider));
+    };
+    let mut catalog = crate::models::load_catalog_from(models_path);
+    let base = settings.model.trim().to_string();
+    let mut name = base.clone();
+    let mut n = 2u32;
+    while catalog.models.iter().any(|m| m.name == name) {
+        name = format!("{base}-{n}");
+        n += 1;
+    }
+    catalog.models.push(crate::models::ModelEntry {
+        name: name.clone(),
+        provider,
+        api_url: settings.api_url.trim().to_string(),
+        model: settings.model.trim().to_string(),
+        api_key: settings.api_key.clone(),
+        // 引导固化的是四个字段，通道两项不在此声明 → 保持默认。
+        api_style: None,
+        reasoning_effort: None,
+        context_length: None,
+    });
+    catalog.default_model = Some(name.clone());
+    crate::models::save_catalog_to(models_path, &catalog).map_err(|e| e.to_string())?;
+    Ok(name)
+}
+
 /// 读结束标记。缺文件 / 不可读 / 损坏一律回 `false`（照常可能弹引导），
 /// 坏偏好绝不阻断启动——与 `settings_store` 的既有约定一致。
 pub fn load_dismissed(preferences_path: &Path) -> bool {
@@ -521,6 +555,42 @@ mod tests {
             api_url: api_url.into(),
             api_key: api_key.into(),
         }
+    }
+
+    #[test]
+    fn importing_settings_suffixes_on_a_name_collision() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models = dir.path().join("models.json");
+        let settings = ModelSettings {
+            provider: "openai".into(),
+            model: "dup".into(),
+            api_url: "https://gw/v1".into(),
+            api_key: "sk-a".into(),
+        };
+        assert_eq!(
+            import_settings_into_catalog(&models, &settings).unwrap(),
+            "dup"
+        );
+        assert_eq!(
+            import_settings_into_catalog(&models, &settings).unwrap(),
+            "dup-2"
+        );
+        // 冲突条目必须真的落盘（两条重名条目 + 默认指向最新）。
+        let catalog = crate::models::load_catalog_from(&models);
+        assert_eq!(catalog.models.len(), 2);
+        assert_eq!(catalog.default_model.as_deref(), Some("dup-2"));
+    }
+
+    #[test]
+    fn importing_rejects_an_unknown_provider() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = ModelSettings {
+            provider: "bogus".into(),
+            model: "m".into(),
+            api_url: "https://x".into(),
+            api_key: "k".into(),
+        };
+        assert!(import_settings_into_catalog(&dir.path().join("models.json"), &settings).is_err());
     }
 
     #[test]

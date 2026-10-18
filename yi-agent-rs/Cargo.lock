@@ -5225,6 +5225,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tower",
+ "yi-agent-runtime",
 ]
 
 [[package]]

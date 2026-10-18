@@ -49,22 +49,16 @@ fn main() -> Result<()> {
         Some(Command::Web { ref host, ref port }) => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(async {
-                let env_path = config::resolve_env_path(&cli);
-                let global_env_path = if config::is_workdir_explicit(&cli) {
-                    None
-                } else {
-                    config::resolve_global_env_path()
-                };
-                // 与 `run_agent` 同一迁移：web 也是用户面向入口。显式 workdir 时
-                // `global_env_path` 为 `None`（该项目不读全局配置），此时不迁移。
-                if let Some(ref global_env_path) = global_env_path {
-                    let migration = yi_agent_runtime::migrate::migrate_model_keys(
-                        global_env_path,
-                        &yi_agent_runtime::models::models_path(),
-                    );
-                    yi_agent_runtime::migrate::log_outcome(&migration, global_env_path);
-                }
-                yi_agent_web::serve(host, *port, env_path, global_env_path).await
+                // 唯一 `.env`：全局 `~/.yi-agent/.env`，无 HOME 时退回本地 `.yi-agent/.env`。
+                let env_path = config::resolve_global_env_path()
+                    .unwrap_or_else(|| std::path::PathBuf::from(".yi-agent").join(".env"));
+                // 与 `run_agent` 同一迁移：web 也是用户面向入口。
+                let migration = yi_agent_runtime::migrate::migrate_model_keys(
+                    &env_path,
+                    &yi_agent_runtime::models::models_path(),
+                );
+                yi_agent_runtime::migrate::log_outcome(&migration, &env_path);
+                yi_agent_web::serve(host, *port, env_path).await
             })
         }
         Some(Command::Run {
@@ -1183,8 +1177,8 @@ fn run_agent(cli: Cli) -> Result<()> {
     // 首启引导发生在 `config::load` 之前：此时还没有配置，加载器会直接报错。
     // 落点是全局 `~/.yi-agent/.env`——与桌面 / app-server(`resolve_global_env_path`)
     // 一致；只有在没有 HOME 时才退回到 workdir 内的本地路径。
-    let env_path =
-        config::resolve_global_env_path().unwrap_or_else(|| config::resolve_env_path(&cli));
+    let env_path = config::resolve_global_env_path()
+        .unwrap_or_else(|| std::path::PathBuf::from(".yi-agent").join(".env"));
     let prefs_path = env_path.with_file_name("preferences.json");
     // 一次性迁移必须在引导与 `config::load` 之前：`.env` 里的存量模型键要在被
     // 「忽略」之前先收边进清单。清单优先落盘、`.env` 后注释，任一步失败都只降级。

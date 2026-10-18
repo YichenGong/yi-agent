@@ -160,39 +160,12 @@ fn parse_sandbox_mode(value: &str) -> Option<yi_agent_tools::SandboxMode> {
     }
 }
 
-/// 解析 .env 文件路径:优先 workdir 覆盖项,否则 YI_AGENT_WORKDIR 环境变量,否则当前目录。
-/// 所有路径均使用 `.yi-agent/.env` 子目录结构,避免与项目自身的 .env 冲突。
-pub fn resolve_env_path(overrides: &ConfigOverrides) -> std::path::PathBuf {
-    overrides
-        .workdir
-        .as_ref()
-        .map(|w| w.join(".yi-agent").join(".env"))
-        .or_else(|| {
-            std::env::var("YI_AGENT_WORKDIR")
-                .ok()
-                .map(PathBuf::from)
-                .map(|p| p.join(".yi-agent").join(".env"))
-        })
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".yi-agent")
-                .join(".env")
-        })
-}
-
-/// 加载 .env 文件到进程环境变量(不覆盖已存在的)。
+/// 加载全局 `.env` 到进程环境变量(不覆盖已存在的)。文件不存在则静默跳过。
 ///
-/// - `local_path`: 本地 .env 路径(必填,不存在则静默跳过)
-/// - `global_path`: 全局 .env 路径(可选,None 表示跳过全局)
-///
-/// 加载顺序:先 local 后 global。dotenvy 默认不覆盖已存在的环境变量,
-/// 因此真实环境变量 > local > global。
-pub(crate) fn load_env_files(local_path: &Path, global_path: Option<&Path>) {
-    load_one_env(local_path);
-    if let Some(global) = global_path {
-        load_one_env(global);
-    }
+/// 「全局」是唯一的 `.env`：模型设置已迁到 `models.json`，其余键（轮次、压缩、
+/// 沙箱等）只从 `~/.yi-agent/.env` 读，不再叠加项目级 `.env`。
+pub(crate) fn load_env_files(path: &Path) {
+    load_one_env(path);
 }
 
 /// 加载单个 .env 文件,不存在则静默跳过,其他错误打印警告。
@@ -214,15 +187,6 @@ pub fn resolve_global_env_path() -> Option<PathBuf> {
         .ok()
         .map(PathBuf::from)
         .map(|h| h.join(".yi-agent").join(".env"))
-}
-
-/// 判断是否为显式指定 workdir(覆盖项或环境变量)
-pub fn is_workdir_explicit(overrides: &ConfigOverrides) -> bool {
-    overrides.workdir.is_some()
-        || std::env::var("YI_AGENT_WORKDIR")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some()
 }
 
 /// Resolve the effective workdir without loading provider configuration.
@@ -257,9 +221,8 @@ impl RuntimeConfig {
 
     /// 从覆盖项 + 环境变量加载配置。
     ///
-    /// 优先级:覆盖项 > 环境变量 > 默认值。
-    /// .env 加载:显式指定 workdir 时只加载指定目录,fallback 模式合并全局兜底。
-    /// fallback 模式下只读取已存在的 `.yi-agent/.env`,不主动创建目录。
+    /// 优先级:覆盖项 > 真实进程环境变量 > 全局 `.env`（仅非模型键） > 默认值。
+    /// `.env` 只有一处:`$HOME/.yi-agent/.env`,不主动创建目录。
     pub fn load(overrides: &ConfigOverrides) -> Result<Self> {
         Self::load_inner(overrides, false)
     }
@@ -275,13 +238,11 @@ impl RuntimeConfig {
     fn load_inner(overrides: &ConfigOverrides, allow_missing_key: bool) -> Result<Self> {
         // 快照必须早于任何 .env 加载（见 `ModelEnvSnapshot` 的文档）。
         let model_env = ModelEnvSnapshot::take();
-        let local_env_path = resolve_env_path(overrides);
-        let global_env_path = if is_workdir_explicit(overrides) {
-            None
-        } else {
-            resolve_global_env_path()
-        };
-        load_env_files(&local_env_path, global_env_path.as_deref());
+        // 唯一的 `.env` 是全局 `~/.yi-agent/.env`；没有 HOME 时退回到 workdir 内的
+        // 本地路径（与 `models_path` 同口径），不再有项目级 `.env` 概念。
+        let env_path =
+            resolve_global_env_path().unwrap_or_else(|| PathBuf::from(".yi-agent").join(".env"));
+        load_env_files(&env_path);
         prune_dotenv_model_keys(&model_env);
 
         let injected_provider = overrides
@@ -580,6 +541,7 @@ mod tests {
 
     fn isolated_config_env() -> EnvVarGuard {
         let mut env = EnvVarGuard::new([
+            "HOME",
             "MODEL_API_KEY",
             "MODEL_API_URL",
             "YI_AGENT_PROVIDER",
@@ -598,6 +560,14 @@ mod tests {
             "YI_AGENT_MAX_RESIDENT_SUBAGENTS",
             "YI_AGENT_MAX_DIRECT_CHILDREN",
         ]);
+        // 唯一 `.env` 是 `$HOME/.yi-agent/.env`。测试必须把 HOME 指到一个不存在
+        // 的位置，否则会读到开发者机器上的真实 `.env`（其非模型键会污染默认值断言）。
+        env.set(
+            "HOME",
+            std::env::temp_dir()
+                .join(format!("yi-agent-config-test-home-{}", std::process::id()))
+                .as_os_str(),
+        );
         for key in [
             "MODEL_API_KEY",
             "MODEL_API_URL",
@@ -1047,7 +1017,7 @@ mod tests {
 
     /// `.env` 仍会被加载（非模型键需要它），但它**不再是模型 key 的来源**。
     ///
-    /// 这是 Task 2 的语义翻转：同一个 `MODEL_API_KEY=...` 仍写进 `<dir>/.yi-agent/.env`，
+    /// 这是 Task 2 的语义翻转：同一个 `MODEL_API_KEY=...` 写进 `$HOME/.yi-agent/.env`，
     /// 但整包注入只认「真实进程环境 + CLI 覆盖」，故它既不进 config，也不残留在进程
     /// 环境里（`prune_dotenv_model_keys` 已剔除），更不会泄漏给子进程。
     #[test]
@@ -1055,13 +1025,18 @@ mod tests {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _env = isolated_config_env();
-        // 创建临时目录和 .yi-agent/.env 文件
-        let temp_dir = std::env::temp_dir().join(".env_test_dotenv_dir");
-        let yi_agent_dir = temp_dir.join(".yi-agent");
+        let mut env = isolated_config_env();
+        // 唯一 `.env` 在 `$HOME/.yi-agent/.env`：把 HOME 指向本次测试的临时家。
+        let home = tempfile::TempDir::new().unwrap();
+        env.set("HOME", home.path());
+        let yi_agent_dir = home.path().join(".yi-agent");
         std::fs::create_dir_all(&yi_agent_dir).unwrap();
         let env_path = yi_agent_dir.join(".env");
-        std::fs::write(&env_path, "MODEL_API_KEY=from-dotenv-file\n").unwrap();
+        std::fs::write(
+            &env_path,
+            "MODEL_API_KEY=from-dotenv-file\nYI_AGENT_MAX_TURNS=123\n",
+        )
+        .unwrap();
 
         let overrides = ConfigOverrides {
             provider: None,
@@ -1069,7 +1044,7 @@ mod tests {
             api_key: None,
             model: None,
             max_turns: None,
-            workdir: Some(temp_dir.clone()),
+            workdir: Some(home.path().to_path_buf()),
             system_prompt: None,
             model_context_length: None,
             compact_ratio: None,
@@ -1086,67 +1061,14 @@ mod tests {
         assert_eq!(config.api_key, "", "dotenv must not supply the model key");
         assert!(!config.model_injected);
         assert_eq!(
+            config.max_turns, 123,
+            "non-model keys still come from the .env"
+        );
+        assert_eq!(
             std::env::var("MODEL_API_KEY").ok(),
             None,
             "the key dotenvy injected must be pruned from the process env"
         );
-
-        std::fs::remove_dir_all(&temp_dir).ok();
-    }
-
-    #[test]
-    fn resolve_env_path_uses_yi_agent_subdir_for_workdir() {
-        let overrides = ConfigOverrides {
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            workdir: Some(PathBuf::from("/tmp/my-project")),
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-        };
-        let path = resolve_env_path(&overrides);
-        assert_eq!(path, PathBuf::from("/tmp/my-project/.yi-agent/.env"));
-    }
-
-    #[test]
-    fn resolve_env_path_uses_yi_agent_subdir_for_env_var() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["YI_AGENT_WORKDIR"]);
-        env.set("YI_AGENT_WORKDIR", "/tmp/my-env-dir");
-        let overrides = ConfigOverrides {
-            provider: None,
-            api_url: None,
-            api_key: None,
-            model: None,
-            max_turns: None,
-            workdir: None,
-            system_prompt: None,
-            model_context_length: None,
-            compact_ratio: None,
-            compact_keep_turns: None,
-            compact_user_budget_tokens: None,
-            compact_tool_budget_tokens: None,
-            yolo: false,
-            sandbox: None,
-            sandbox_writable_roots: Vec::new(),
-            skip_permissions: false,
-            skills_catalog_budget: None,
-        };
-        let path = resolve_env_path(&overrides);
-        assert_eq!(path, PathBuf::from("/tmp/my-env-dir/.yi-agent/.env"));
     }
 
     #[test]
@@ -1154,17 +1076,17 @@ mod tests {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = tempfile::TempDir::new().unwrap();
-        // `.env` 必须落在 `resolve_env_path` 会读的位置：<dir>/.yi-agent/.env。
-        let env_dir = dir.path().join(".yi-agent");
+        let home = tempfile::TempDir::new().unwrap();
+        // `.env` 必须落在唯一读取点：`$HOME/.yi-agent/.env`。
+        let env_dir = home.path().join(".yi-agent");
         std::fs::create_dir_all(&env_dir).unwrap();
         std::fs::write(env_dir.join(".env"), "MODEL_API_KEY=from-dotenv\n").unwrap();
 
         let mut env = isolated_config_env();
-        env.set("YI_AGENT_WORKDIR", dir.path());
+        env.set("HOME", home.path());
 
         let cfg = RuntimeConfig::load_lenient(&ConfigOverrides {
-            workdir: Some(dir.path().to_path_buf()),
+            workdir: Some(home.path().to_path_buf()),
             ..Default::default()
         })
         .unwrap();
@@ -1247,89 +1169,48 @@ mod tests {
     }
 
     #[test]
-    fn load_env_files_loads_global_when_no_local() {
+    fn load_env_files_loads_the_single_path() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        // local 不存在,global 存在 → 应该加载 global
-        let temp = std::env::temp_dir().join(".env_test_global_only");
-        let local_path = temp.join("local/.yi-agent/.env");
-        let global_path = temp.join("global/.yi-agent/.env");
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
+        let temp = std::env::temp_dir().join(".env_test_single_path");
+        let path = temp.join(".yi-agent/.env");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "MODEL_API_KEY=from-file\n").unwrap();
 
         env.remove("MODEL_API_KEY");
-        load_env_files(&local_path, Some(&global_path));
+        load_env_files(&path);
 
-        assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-global");
+        assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-file");
 
         std::fs::remove_dir_all(&temp).ok();
     }
 
     #[test]
-    fn load_env_files_local_overrides_global() {
+    fn load_env_files_missing_path_is_silent() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        // local 和 global 都存在 → local 覆盖 global
-        let temp = std::env::temp_dir().join(".env_test_local_overrides");
-        let local_path = temp.join("local/.yi-agent/.env");
-        let global_path = temp.join("global/.yi-agent/.env");
-        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
-        std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
-
         env.remove("MODEL_API_KEY");
-        load_env_files(&local_path, Some(&global_path));
-
-        assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-local");
-
-        std::fs::remove_dir_all(&temp).ok();
+        load_env_files(std::path::Path::new("/nonexistent/yi-agent/.env"));
+        assert_eq!(std::env::var("MODEL_API_KEY").ok(), None);
     }
 
     #[test]
-    fn load_env_files_skips_global_when_none() {
+    fn load_env_files_real_env_overrides_the_file() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        // global_path = None → 不加载 global(显式指定 --workdir 的场景)
-        let temp = std::env::temp_dir().join(".env_test_no_global");
-        let local_path = temp.join("local/.yi-agent/.env");
-        let global_path = temp.join("global/.yi-agent/.env");
-        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
-        std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
-
-        env.remove("MODEL_API_KEY");
-        load_env_files(&local_path, None);
-
-        assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-local");
-
-        std::fs::remove_dir_all(&temp).ok();
-    }
-
-    #[test]
-    fn load_env_files_real_env_overrides_all() {
-        let _lock = ENV_TEST_MUTEX
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut env = EnvVarGuard::new(["MODEL_API_KEY"]);
-        // 真实环境变量 > local > global
         let temp = std::env::temp_dir().join(".env_test_real_env");
-        let local_path = temp.join("local/.yi-agent/.env");
-        let global_path = temp.join("global/.yi-agent/.env");
-        std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(global_path.parent().unwrap()).unwrap();
-        std::fs::write(&local_path, "MODEL_API_KEY=from-local\n").unwrap();
-        std::fs::write(&global_path, "MODEL_API_KEY=from-global\n").unwrap();
+        let path = temp.join(".yi-agent/.env");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "MODEL_API_KEY=from-file\n").unwrap();
 
         env.set("MODEL_API_KEY", "from-real-env");
-        load_env_files(&local_path, Some(&global_path));
+        load_env_files(&path);
 
         assert_eq!(std::env::var("MODEL_API_KEY").unwrap(), "from-real-env");
 
