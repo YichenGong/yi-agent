@@ -145,6 +145,7 @@ fn a_git_project_gets_the_delegation_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -226,6 +227,7 @@ fn a_git_project_gets_the_show_git_diff_tool() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling")
     .registry
@@ -279,6 +281,7 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     let bash = tooling.registry.get("bash").expect("bash is registered");
@@ -341,6 +344,7 @@ fn the_assembly_hands_the_reply_registry_to_ask_lead() {
         "proj-test".to_string(),
         inbox.clone(),
         replies.clone(),
+        None,
     )
     .expect("tooling");
 
@@ -475,6 +479,7 @@ fn only_the_lead_sees_the_memory_tools() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             role: None,
             tag: None,
             extra_roots: Vec::new(),
@@ -508,6 +513,7 @@ fn only_the_lead_sees_the_memory_tools() {
             "proj-test".to_string(),
             crate::lead::LeadInbox::new(),
             crate::lead::LeadReplies::new(),
+            None,
         )
         .expect("tooling")
     };
@@ -644,6 +650,7 @@ fn a_lead_in_a_repo_subdirectory_sees_the_memory_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -719,6 +726,7 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling")
     .registry
@@ -850,6 +858,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         &crate::lead::LeadInbox::new(),
         &crate::lead::LeadReplies::new(),
+        // 这些测试直接调 attach_delegation，不起会话，故无起点。
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
     let second = attach_delegation(
@@ -865,6 +875,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         &crate::lead::LeadInbox::new(),
         &crate::lead::LeadReplies::new(),
+        // 这些测试直接调 attach_delegation，不起会话，故无起点。
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
 
@@ -1577,6 +1589,9 @@ pub(crate) struct Harness {
     /// 与主循环**共享**的回信登记表:测试据此扮演等待方(`AskLeadTool`
     /// 的 `blocking: true`)并断言主循环真的把组长那轮的文本回填了回来。
     pub(crate) lead_replies: crate::lead::LeadReplies,
+    /// 与主循环**共享**的视图帧表:测试据此直接注入帧(模拟 Task 4 的工具写帧),
+    /// 并断言 `thread/view/read` 读的是**同一张**表。自造第二份会读出一张空表。
+    pub(crate) view_frames: crate::server::ViewFrames,
 }
 
 /// 记录到的 watchman 调用:安装为 `true`、卸载为 `false`，附所针对的 home。
@@ -1750,6 +1765,10 @@ impl Harness {
         // 「等待方登记的名字被主循环真的回填了」——自造第二份会得到一个
         // 永远等不到回信的登记表。
         let lead_replies = crate::lead::LeadReplies::new();
+        // 视图帧表:与主循环共享同一 `Arc`(注入进 `RuntimeAttachments`)。测试据此
+        // 直接注入帧,断言 `thread/view/read` 读的是同一张表。
+        let view_frames: crate::server::ViewFrames =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let handle = tokio::spawn(serve_scoped(
             server_r,
             server_w,
@@ -1775,6 +1794,9 @@ impl Harness {
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+                // 与 `Harness::view_frames` 是**同一个** `Arc`(见上方 `lead_inbox`
+                // 的同一手法):自造一份,测试注入的帧就没人读。
+                view_frames: Arc::clone(&view_frames),
                 watchman_install: install,
                 watchman_uninstall: uninstall,
                 watchman_home: watchman_home.path().to_path_buf(),
@@ -1802,6 +1824,7 @@ impl Harness {
             skills_home_dir: skills_home,
             lead_inbox,
             lead_replies,
+            view_frames,
         }
     }
 
@@ -2344,6 +2367,412 @@ async fn thread_diff_read_rejects_unknown_thread() {
     h.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_view_read_returns_null_before_any_frame() {
+    let mut cfg = test_config();
+    cfg.workdir = tempfile::TempDir::new().unwrap().path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"thread/view/read","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(9)) {
+        v = h.read_value().await;
+    }
+    // `result` 必须是**成功响应里的 null**，不是「没有 result 键」——方法与错误
+    // 分支同样给不出 result，只断言 `is_null()` 会把 method_not_found 放过去。
+    assert!(v.get("error").is_none(), "must be a success: {v}");
+    assert!(v.as_object().unwrap().contains_key("result"), "{v}");
+    assert!(
+        v["result"].is_null(),
+        "no frame yet must read back as null: {v}"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_view_read_refresh_produces_a_structured_frame() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "x\ny\n").unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":10,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(10)) {
+        v = h.read_value().await;
+    }
+    // 无帧时 refresh 走结构化默认：应是 diff 原语、基准是会话锚点、含未跟踪内容。
+    assert_eq!(v["result"]["asKind"], "diff", "frame: {v}");
+    assert_eq!(
+        v["result"]["baseKind"], "session",
+        "the session anchor is the base: {v}"
+    );
+    assert_eq!(v["result"]["command"], serde_json::Value::Null);
+    assert!(
+        v["result"]["stdout"].as_str().unwrap().contains("+y"),
+        "frame: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// 第二帧必须**重算**，不能是第一次的缓存：命令帧重跑同一条命令，故新写入的
+/// 内容会出现在重读结果里。没有这条断言，「refresh 只是把缓存又读了一遍」也
+/// 能让上面那条测试全绿。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_view_read_refresh_reruns_a_command_frame() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    {
+        // 帧表与主循环共享同一 `Arc`（`RuntimeAttachments::view_frames` 正是为此
+        // 注入）：这里塞进一条命令帧，模拟 Task 4 的工具写帧 / Task 9 的直接注入。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: Some("git log --oneline".to_string()),
+                as_kind: "text".to_string(),
+                exit_code: Some(0),
+                stdout: "stale\n".to_string(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: None,
+                base_kind: String::new(),
+            },
+        );
+    }
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":12,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(12)) {
+        v = h.read_value().await;
+    }
+    assert_eq!(
+        v["result"]["command"], "git log --oneline",
+        "a command frame keeps its command: {v}"
+    );
+    let stdout = v["result"]["stdout"].as_str().unwrap();
+    assert!(
+        stdout.contains("init"),
+        "the command must have been re-run, not re-read: {stdout:?}"
+    );
+    assert!(!stdout.contains("stale"), "stale frame: {stdout:?}");
+    h.shutdown().await;
+}
+
+/// refresh 重算结构化帧时必须**保留原基准的来历**：模型用 `base` 指定的帧
+/// (`baseKind == "explicit"`)重算后仍得是 `explicit`。若重算时丢掉那个 base、
+/// 只按会话锚点算，帧就从「跟 X 比」变成「本次会话以来」——回执与面板一起骗人，
+/// 正是 D3 要杜绝的那类误导。
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_preserves_an_explicit_base() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "add a"]] {
+        assert!(
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    // HEAD 之上再造一个可当显式基准的提交。
+    std::fs::write(dir.path().join("a.txt"), "x\ny\n").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["commit", "-qam", "edit a"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    // 显式基准取**第一个**提交（HEAD 的父），与会话锚点（= thread/start 时的
+    // HEAD）不同：这样 base 与 baseKind 两条断言都能真正区分「保留了原基准」
+    // 与「退化成了会话锚点」。
+    let base = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD~1"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    {
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: None,
+                as_kind: "diff".to_string(),
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: Some(base.clone()),
+                base_kind: "explicit".to_string(),
+            },
+        );
+    }
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":14,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(14)) {
+        v = h.read_value().await;
+    }
+    assert_eq!(
+        v["result"]["baseKind"], "explicit",
+        "a refresh must keep an explicit base explicit: {v}"
+    );
+    assert_eq!(
+        v["result"]["base"], base,
+        "the explicit base must survive: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// refresh 重算期间若有更晚的写入者落帧，**不得**被这次 refresh 覆盖回去。
+///
+/// 窗口确实存在：「读缓存命令」与「写回新帧」之间隔了一次 await（重跑命令，
+/// 上限 `VIEW_TIMEOUT`）。老实现无条件覆盖，于是「刚请求的命令」会被一个更晚的
+/// 命令盖掉，面板显示的内容与回执不符——正是 D3 要杜绝的误导。
+///
+/// 用一条会睡 2 秒的命令把窗口撑开，使本测试确定可复现：先让 refresh 读到这条
+/// 慢命令并开始重跑，随后注入一条「更晚的」命令帧。老实现会在慢命令跑完后把
+/// 它盖回去（断言失败）；CAS 实现则让位，返回更晚的那帧。
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_later_frame_written_during_a_refresh_is_not_clobbered() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    let frame = |command: Option<&str>, stdout: &str| crate::git_diff::ViewFrame {
+        command: command.map(str::to_string),
+        as_kind: "text".to_string(),
+        exit_code: Some(0),
+        stdout: stdout.to_string(),
+        stderr: String::new(),
+        truncated: false,
+        timed_out: false,
+        note: None,
+        base: None,
+        base_kind: String::new(),
+    };
+    {
+        // 播下一条「慢命令」帧：refresh 会读到它、并真的去重跑它。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(tid.clone(), frame(Some("sleep 2"), ""));
+    }
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":13,"method":"thread/view/read","params":{{"threadId":"{tid}","refresh":true}}}}"#
+    ))
+    .await;
+    // 给主循环留出「读快照 + 进入重跑」的时间，此时它正卡在 `sleep 2` 上。
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    {
+        // 更晚的写入者（真实场景是另一次 refresh，或 Task 4 的 watcher 写帧）。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(tid.clone(), frame(Some("git log --oneline"), "LATER\n"));
+    }
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(13)) {
+        v = h.read_value().await;
+    }
+    assert_eq!(
+        v["result"]["command"], "git log --oneline",
+        "a later frame must win over the stale refresh: {v}"
+    );
+    assert_eq!(
+        v["result"]["stdout"], "LATER\n",
+        "the refresh must not clobber a newer frame: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// provider：第一轮调 `show_git_diff`（默认参数），第二轮收尾。
+///
+/// 用它驱动真实 `turn/start` 里的一次工具调用——只有走完整条装配，
+/// 「工具拿到的会话起点」才被真正验证。
+struct GitDiffToolProvider {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for GitDiffToolProvider {
+    async fn call_stream(
+        &self,
+        _req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::provider::{ProviderEvent as E, StopReason};
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let events = if n == 0 {
+            vec![
+                E::ToolUseStart {
+                    id: "g1".into(),
+                    name: "show_git_diff".into(),
+                },
+                E::ToolUseDelta {
+                    id: "g1".into(),
+                    partial_json: "{}".into(),
+                },
+                E::ToolUseEnd { id: "g1".into() },
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]
+        } else {
+            vec![
+                E::TextDelta("done".into()),
+                E::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]
+        };
+        Ok(futures::stream::iter(events).boxed())
+    }
+}
+
+fn build_git_diff_tool_agent(
+    session: Option<yi_agent_core::Session>,
+    cwd: &std::path::Path,
+    mode: crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent> {
+    build_test_agent_with_provider(
+        Arc::new(GitDiffToolProvider {
+            calls: AtomicUsize::new(0),
+        }),
+        session,
+        cwd,
+        mode,
+    )
+}
+
+/// 新建会话时，`show_git_diff` 的默认基准必须落在**本会话的起点**上。
+///
+/// 只有走真实 `thread/start` 才验得出：起点在 `start_thread_core` 里取（那时
+/// meta 尚未落盘），若 `attach_delegation` 反过来去读盘拿锚点，读到的永远是
+/// `None`——工具默认基准就落到默认分支候选链（`local-default`），与它自己
+/// `description()` 的承诺不符，也和 refresh 路径（用真锚点）分叉。断言
+/// `baseKind == "session"` 正是钉住「先取起点、再交给工具」这个次序。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_session_anchors_the_default_diff_to_its_starting_commit() {
+    let dir = tempfile::TempDir::new().unwrap();
+    init_git_repo(dir.path());
+    // 一次提交之后再改文件：会话起点应是那次提交，而不是「仅工作区」。
+    std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-q", "-m", "add a"]] {
+        assert!(
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let head = String::from_utf8(
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_git_diff_tool_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"show me"}}]}}}}"#
+    ))
+    .await;
+    // 等这一轮收尾：工具跑完，帧已由 watcher 落表。帧的落表是另一条任务，
+    // 故按 id 收敛 + 轮询，不假设「一旦 turn/completed 就一定已落表」。
+    loop {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            break;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    let frame = loop {
+        if let Some(frame) = h.view_frames.lock().await.get(&tid).cloned() {
+            break frame;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the tool must have filed a frame for this session"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        frame.base_kind, "session",
+        "a fresh session's default base must be its starting commit, not a candidate branch: {frame:?}"
+    );
+    assert_eq!(
+        frame.base.as_deref(),
+        Some(head.as_str()),
+        "the base must be the sha captured when the session started: {frame:?}"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_view_read_rejects_unknown_thread() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":11,"method":"thread/view/read","params":{"threadId":"thread-nope"}}"#)
+        .await;
+    let mut v = h.read_value().await;
+    while v.get("id") != Some(&serde_json::json!(11)) {
+        v = h.read_value().await;
+    }
+    assert_eq!(
+        v["error"]["code"], -32011,
+        "unknown thread uses the shared code"
+    );
+    h.shutdown().await;
+}
+
 /// A message to an unattached conversation fails loudly rather than
 /// pretending to queue: there is no daemon to queue it on.
 #[tokio::test(flavor = "multi_thread")]
@@ -2533,6 +2962,7 @@ async fn unknown_method_returns_method_not_found() {
         ("thread/setTag", Domain::Thread),
         ("thread/start", Domain::Thread),
         ("thread/subscribe", Domain::Thread),
+        ("thread/view/read", Domain::Thread),
         // ---- Agent ----
         ("agent/cancel", Domain::Agent),
         ("agent/cancel/preview", Domain::Agent),
@@ -2747,6 +3177,7 @@ async fn eof_exits_gracefully() {
             launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             // 测试注入:只记录调用,不碰真实 launchd / home。
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -2826,6 +3257,7 @@ async fn agent_factory_failure_returns_internal_error() {
             launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             // 测试注入:只记录调用,不碰真实 launchd / home。
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -2907,6 +3339,7 @@ async fn oversized_frame_returns_err() {
             launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+            view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             // 测试注入:只记录调用,不碰真实 launchd / home。
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -4816,6 +5249,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6332,6 +6766,7 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6442,6 +6877,7 @@ async fn a_turn_while_off_persists_without_credentials() {
             preserve_thinking: false,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -6541,6 +6977,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7925,6 +8362,7 @@ fn write_meta(
         preserve_thinking: true,
         content_epoch: 0,
         last_item_id: None,
+        anchor_sha: None,
         extra_roots: Vec::new(),
         role: None,
     };
@@ -7954,6 +8392,7 @@ fn write_lead_meta(dir: &Path, id: &str) {
         last_item_id: None,
         extra_roots: Vec::new(),
         role: Some(crate::thread_store::LEAD_ROLE.to_string()),
+        anchor_sha: None,
     };
     crate::thread_store::ThreadStore::new(dir)
         .create(&meta)
@@ -9476,6 +9915,7 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -9587,6 +10027,7 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             preserve_thinking: true,
             content_epoch: 0,
             last_item_id: None,
+            anchor_sha: None,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -13978,6 +14419,7 @@ fn delegation_tooling_carries_the_theme_tool() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     assert!(
@@ -14478,6 +14920,7 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling");
     // Taken *before* the rebuild: a clone shares the caller slot the tools
@@ -14811,6 +15254,7 @@ impl MergedHarness {
                 launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+                view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 // 测试注入:只记账,不碰真实 launchd / home。
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
@@ -15851,6 +16295,7 @@ fn a_card_session_does_not_get_ask_lead() {
         card_key,
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling")
     .registry
@@ -15872,6 +16317,7 @@ fn a_card_session_does_not_get_ask_lead() {
         repo.path().join(".yi-agent").display().to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        None,
     )
     .expect("tooling")
     .registry
@@ -15940,6 +16386,7 @@ fn the_lead_does_not_get_ask_lead() {
             project_root.join(".yi-agent").display().to_string(),
             crate::lead::LeadInbox::new(),
             crate::lead::LeadReplies::new(),
+            None,
         )
         .expect("tooling")
     };
@@ -15980,6 +16427,7 @@ fn the_lead_does_not_get_ask_lead() {
         role: None,
         content_epoch: 0,
         last_item_id: None,
+        anchor_sha: None,
     };
     store.create(&plain).expect("a plain meta must persist");
     let plain_names = build("thread-plain").registry.names();

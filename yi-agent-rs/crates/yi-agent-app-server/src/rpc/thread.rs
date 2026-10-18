@@ -540,6 +540,9 @@ pub(crate) async fn handle(
                 extra_roots,
                 state.lead_inbox,
                 state.lead_replies,
+                // resume 路径：meta 已在盘上，起点取已落盘的 `anchor_sha`。
+                // 旧会话没有该字段时是 `None`——那表示「无起点」，按方案 1 不回填。
+                loaded.meta.anchor_sha.clone(),
                 built,
             );
             let BuiltAgent {
@@ -1753,14 +1756,109 @@ pub(crate) async fn handle(
                 let (unified_diff, truncated) = crate::git_diff::commit_diff(repo, commit);
                 json!({ "unifiedDiff": unified_diff, "truncated": truncated })
             } else if let Some(path) = req.params.get("path").and_then(|v| v.as_str()) {
-                let d = crate::git_diff::thread_diff(repo, base);
+                // 锚点由 Task 2 从 thread meta 接上；本任务先传 `None`（行为不变）。
+                let d = crate::git_diff::thread_diff(repo, base, None);
                 let (unified_diff, truncated) =
                     crate::git_diff::file_diff(repo, d.merge_base.as_deref(), path);
                 json!({ "unifiedDiff": unified_diff, "truncated": truncated })
             } else {
-                serde_json::to_value(crate::git_diff::thread_diff(repo, base))
+                serde_json::to_value(crate::git_diff::thread_diff(repo, base, None))
                     .unwrap_or(json!(null))
             };
+            write_response(state.hub, state.client, ok_response(id, result)).await?;
+        }
+        "thread/view/read" => {
+            // 读回**帧**（模型给命令 / 结构化默认），与 `thread/diff/read` 的
+            // 「结构化取数」是两条不同的路径，故是两个方法而不是一个方法的开关。
+            let Some(thread_id) =
+                require_thread_id(state.hub, state.client, &req.params, id.clone()).await?
+            else {
+                return Ok(Flow::Continue);
+            };
+            if !require_known_thread(
+                state.hub,
+                state.client,
+                state.threads,
+                &thread_id,
+                id.clone(),
+            )
+            .await?
+            {
+                return Ok(Flow::Continue);
+            }
+            let refresh = req
+                .params
+                .get("refresh")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if refresh {
+                // 重算这一帧：**分叉**在「这一帧原本是命令帧还是结构化默认」上。
+                // 命令帧重跑同一条命令（模型可重复观察同一视角）；结构化默认则
+                // 重算锚点 diff（工作区在这期间变了，重读必须反映新内容）。
+                let cwd = state
+                    .threads
+                    .get(&thread_id)
+                    .map(|t| t.cwd.clone())
+                    .filter(|c| !c.is_empty())
+                    .unwrap_or_else(|| state.cfg.workdir.display().to_string());
+                let repo = Path::new(&cwd);
+                let anchor = state
+                    .threads
+                    .get(&thread_id)
+                    .and_then(|t| t.store.load(&thread_id).ok().flatten())
+                    .and_then(|l| l.meta.anchor_sha);
+                // 分两次短暂持锁，**不**把 guard 跨过 `command_frame` 的 await：
+                // `serve()` 跑在 `tokio::spawn` 里，guard 过 await 会让整个
+                // future 非 `Send`，直接编译不过。
+                // 快照连**基准来历**一起取：结构化帧可能是「模型指定的基准」
+                // (`base_kind == "explicit"`)，重算时必须原样再用那个 base——
+                // 只传 `explicit=None` 会让它退化成会话锚点，帧与回执就从
+                // 「跟 origin/main 比」变成「本次会话以来」，正是 D3 的误导。
+                let snapshot = state
+                    .view_frames
+                    .lock()
+                    .await
+                    .get(&thread_id)
+                    .map(|f| (f.command.clone(), f.base.clone(), f.base_kind.clone()));
+                let command = snapshot.as_ref().and_then(|(c, _, _)| c.clone());
+                let explicit = snapshot.as_ref().and_then(|(_, base, kind)| {
+                    (kind == "explicit").then(|| base.clone()).flatten()
+                });
+                let next = match command.as_deref() {
+                    Some(command) => {
+                        crate::git_diff::command_frame(repo, command, None, None).await
+                    }
+                    None => crate::git_diff::structured_frame(
+                        repo,
+                        explicit.as_deref(),
+                        anchor.as_deref(),
+                    ),
+                };
+                // 写回用 CAS，不是无条件覆盖：「读缓存命令」与「写回新帧」之间隔了
+                // 一次 await（最多 `VIEW_TIMEOUT`）。期间别的写入者（另一次 refresh、
+                // 或 Task 4 的 watcher）可能已经写了更新的帧；若无条件覆盖，面板就会
+                // 显示与「刚刚请求的命令」不符的内容——正是 D3 要杜绝的误导。
+                // 判定：槽里的命令仍等于我们读到的快照才写。
+                // 边界（如实记下）：判据只有 `command`，故它只对**命令帧**有区分力
+                // ——命令一旦不同必让位给更晚的写入者（下面的 result 会读到它）。
+                // 两条都是结构化帧（`command == None`）时这里区分不出先后，更晚的
+                // 结构化写入者仍可能被本次覆盖；那种情况下两边都是刚算出的自洽帧，
+                // 后果仅是多算一遍，不产生错标。
+                let mut frames = state.view_frames.lock().await;
+                let unchanged =
+                    frames.get(&thread_id).and_then(|f| f.command.as_deref()) == command.as_deref();
+                if unchanged {
+                    frames.insert(thread_id.clone(), next);
+                }
+                drop(frames);
+            }
+            let result = state
+                .view_frames
+                .lock()
+                .await
+                .get(&thread_id)
+                .map(|f| serde_json::to_value(f).unwrap_or(json!(null)))
+                .unwrap_or(json!(null));
             write_response(state.hub, state.client, ok_response(id, result)).await?;
         }
         "thread/subscribe" => {

@@ -1195,7 +1195,15 @@ export default function App() {
           sess.setPanelOpen(true);
           // 提示语随快照走（见 `pendingNoteRef`）：此行只登记挂起值。
           diff.setPendingDiffNote(n.params.note ?? null);
-          void diff.loadThreadDiff(target, n.params.base);
+          // 基准不再随通知携带（通知里已没有 `base`）：它现在由**帧**承载。
+          // 两条都取，各司其职：
+          //  - `loadViewFrame` 拿**模型给的命令帧**（`thread/view/read`）——focus 的
+          //    主角，头部命令条与三种原语都来自它；
+          //  - `loadThreadDiff` 仍拿结构化快照——它给的是 `commits/files` 列表与
+          //    汇总行的 `+X −Y`，也是**无帧**时的正文兜底（旧会话、纯结构化推送）。
+          // 帧到了就由帧渲染正文（`GitDiffView`），没到就退回这份快照。
+          void diff.loadViewFrame(target);
+          void diff.loadThreadDiff(target);
           return;
         }
         if (n.method === "agent/trace/event") {
@@ -2347,9 +2355,17 @@ export default function App() {
               error: diff.diffOwnerRef.current === sess.currentId ? diff.diffError : null,
               activeCommit: diff.activeCommit,
               note: diff.diffNote,
-              onRefresh: () => void diff.loadThreadDiff(sess.currentId!, diff.diffBase),
+              // 帧与快照同门：非本会话的帧不许冒充当前视图（`viewOwnerRef` 是判据）。
+              frame: diff.viewOwnerRef.current === sess.currentId ? diff.viewFrame : null,
+              onRefresh: () => {
+                // 刷新要两样都重取：帧重跑模型那条命令，快照重算 commits/files。
+                void diff.loadViewFrame(sess.currentId!, true);
+                void diff.loadThreadDiff(sess.currentId!, diff.diffBase);
+              },
               onOpenCommit: (sha) => void diff.openCommit(sess.currentId!, sha),
               onCloseCommit: () => diff.setActiveCommit(null),
+              // D1 单文件懒加载：正文缺席时按 path 取一次正文并并进快照。
+              onLoadFile: (path) => void diff.loadFile(sess.currentId!, path),
             }}
             processProps={{
               processes: proc.processes,

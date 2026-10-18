@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { formatError } from "../lib/errorMessage";
 import { type DiffTextResult, type ThreadDiffResult } from "../lib/protocol";
+import type { ViewFrame } from "../lib/viewFrame";
 import type { RpcClient } from "../lib/rpc";
 
 /**
@@ -44,6 +45,11 @@ export function useDiffState({
   // 自增的请求号：只有**最新**那次 `thread/diff/read` 有资格落盘。会话切换不改动它，
   // 所以「A 的在途响应在切换到 B 之后才回来」会被号数 + 归属两道门同时挡掉。
   const diffReqRef = useRef(0);
+  // 模型给的视图帧（`thread/view/read`）：**独立**于上面那份结构化快照，有自己的
+  // 请求号与归属判据（见 `loadViewFrame`）。
+  const [viewFrame, setViewFrame] = useState<ViewFrame | null>(null);
+  const viewReqRef = useRef(0);
+  const viewOwnerRef = useRef<string | null>(null);
   // 推送随行提示语（`ui/gitDiff/focus` 的 `note`）的挂起值：提示语解释的是某条会话
   // 的这一份 diff，不能先于快照落到屏幕上（旧快照 + 新提示语正是一次静默错配），
   // 故不直接进 state，等读取认领成功后再由 `loadThreadDiff` 摘取。
@@ -121,6 +127,67 @@ export function useDiffState({
   };
 
   /**
+   * 读取**指定会话**的模型视图帧（`thread/view/read`）。
+   *
+   * 帧是「模型给的一条命令的输出」（或结构化默认），与 `threadDiff` 是**两份**快照：
+   * 面板优先渲染帧，无帧才退回结构化 diff（`GitDiffView`）。因此这里有自己的一套
+   * 归属门（`viewReqRef` + `viewOwnerRef`），与 diff 的那套互不干扰——两条请求会
+   * 并发在途（focus 两条都发），任一方迟到都不得画进别的会话。
+   *
+   * 与 `loadThreadDiff` 的两点不同：
+   * - **不清结构化快照**（`threadDiff`）。帧覆盖的是正文，无帧时面板仍要那张快照
+   *   兜底；清掉它会在帧到达前后闪一次「尚无 diff 数据」。
+   * - **失败静默**：帧服务端没有就是 `null`（非错误），断线读不到也不该在对话里留
+   *   红字——与 diff 一致，故不写 `diffError`。
+   *
+   * `refresh` 为真时请服务端重跑帧里的命令（或重算结构化默认）。
+   */
+  const loadViewFrame = async (threadId: string, refresh = false) => {
+    const c = rpc();
+    if (!c) return;
+    viewReqRef.current += 1;
+    const token = viewReqRef.current;
+    const owned = () => token === viewReqRef.current && threadId === currentIdRef.current;
+    viewOwnerRef.current = threadId;
+    try {
+      const r = await c.request<ViewFrame | null>("thread/view/read", {
+        threadId,
+        ...(refresh ? { refresh: true } : {}),
+      });
+      if (!owned()) return;
+      setViewFrame(r ?? null);
+    } catch {
+      // 静默：帧是附属视图，读不到就退回结构化快照，不留红字（同 `loadThreadDiff`
+      // 断线静默的理由）。
+    }
+  };
+
+  /**
+   * 单文件正文懒加载（D1）：文件被截断、正文缺席时，为该 path 取一次正文。
+   *
+   * 复用 `thread/diff/read` 的 `path` 分支（既有 RPC，未删）。取到就把它**并进**
+   * 当前结构化快照的 `unifiedDiff`：`GitDiffView` 从快照的 `unifiedDiff` 解析正文，
+   * 不并进去等于白取。归属仍按当前会话判：切走了就丢。
+   */
+  const loadFile = async (threadId: string, path: string) => {
+    const c = rpc();
+    if (!c) return;
+    try {
+      const r = await c.request<DiffTextResult>("thread/diff/read", { threadId, path });
+      if (threadId !== currentIdRef.current) return;
+      setThreadDiff((prev) => {
+        // 只并进**本会话**的快照；没有快照（还没有结构化数据）时无从并入。
+        if (!prev || diffOwnerRef.current !== threadId) return prev;
+        if (r.unifiedDiff === "") return prev;
+        return { ...prev, unifiedDiff: `${prev.unifiedDiff}\n${r.unifiedDiff}` };
+      });
+    } catch (e) {
+      if (threadId !== currentIdRef.current) return;
+      setDiffError(formatError(e));
+    }
+  };
+
+  /**
    * 丢掉会话级 diff 的全部状态。
    *
    * diff 是**有主**的（属于某条会话），凡是「当前会话变了」或「会话没了」都必须
@@ -140,25 +207,34 @@ export function useDiffState({
     setDiffLoading(false);
     diffOwnerRef.current = null;
     pendingNoteRef.current = null;
+    // 帧与结构化快照是两份快照，一起复位：只清一份会让新会话先闪一眼旧帧
+    // （或旧快照）——不过期的视图冒充当前会话，正是这里的头号风险。
+    setViewFrame(null);
+    viewOwnerRef.current = null;
   };
 
   return {
-    // state：面板直接消费的六项。
+    // state：面板直接消费的七项。
     threadDiff,
     diffLoading,
     diffError,
     activeCommit,
     diffBase,
     diffNote,
+    viewFrame,
     // actions。
     setActiveCommit,
     loadThreadDiff,
+    loadViewFrame,
+    loadFile,
     setPendingDiffNote,
     openCommit,
     resetThreadDiff,
     // refs：App 的 JSX 与生命周期 effect 直接读（归属判据与在途请求号）。
     diffOwnerRef,
     diffReqRef,
+    viewOwnerRef,
+    viewReqRef,
     pendingNoteRef,
   };
 }

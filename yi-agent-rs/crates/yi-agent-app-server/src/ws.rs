@@ -128,6 +128,7 @@ where
                 launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
+                view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 watchman_install: crate::server::production_watchman_install(),
                 watchman_uninstall: crate::server::production_watchman_uninstall(),
                 watchman_home: crate::server::home_dir(),
