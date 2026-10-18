@@ -154,4 +154,32 @@ describe("GitDiffView 模型帧", () => {
     expect(screen.getByText(/正文已截断|未加载/)).toBeTruthy();
     expect(onLoadFile).toHaveBeenCalledWith("a.txt");
   });
+
+  it("结构化快照为空（0 files / 0 commits）但有帧时，帧仍然渲染", () => {
+    // 「没有改动」空态不能盖掉帧：模型可能就是让我们看 `git log`（与结构化 diff 无关）。
+    render(
+      <GitDiffView
+        {...baseProps}
+        diff={{ ...diff, files: [], commits: [], unifiedDiff: "" }}
+        frame={frame({ command: "git log --oneline -1", asKind: "log", stdout: "abc1234 fix a\n" })}
+      />,
+    );
+    expect(screen.getByText("fix a")).toBeTruthy();
+    expect(screen.queryByText(/没有改动/)).toBeNull();
+  });
+
+  it("空壳帧（command 为 undefined、stdout 为空）不顶掉结构化正文", () => {
+    // `{command: undefined}` 是训练里见过的坏形状：`!== null` 会放行它，一个空壳帧
+    // 会把整份结构化正文换成空白。判据收严成「非空字符串」后它必须退回旧路径。
+    render(
+      <GitDiffView
+        {...baseProps}
+        diff={diff}
+        frame={{ ...frame(), command: undefined as unknown as string | null, stdout: "" }}
+      />,
+    );
+    // 旧路径仍可见（文件名与提交都在），也没有出现空白的帧正文。
+    expect(screen.getByText("a.txt")).toBeTruthy();
+    expect(screen.getByText("add feature")).toBeTruthy();
+  });
 });
