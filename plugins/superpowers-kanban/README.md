@@ -60,6 +60,12 @@ superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop
 进入真终止态（`done`/`failed`/`cancelled`）的卡超过宽限期（`archive_grace_hours`，默认 24h，
 `0` = 立即）会自动归档；`awaiting_merge`/`needs_you` 永不自动归档。
 
+`board.json` 是看板的**唯一真相源**：daemon 与一次性 CLI 都在同一把 `board.lock`
+（flock）内「读-改-写」，因此 daemon 在跑时 CLI 的 `done`/`archive`/`purge` 不会被
+覆盖；daemon 缺席时同一条路径照常工作。`run` 拿不到 `plugin.lock` 时按
+`instance_wait_secs`（默认 10 秒）有界等待后退出，不再无限空转。启动时还会清掉
+本插件确定路径上连不上的死 socket。
+
 ## 开关
 `superpowers-kanban on|off` 写**项目层**（`<项目>/.yi-agent/preferences.json`）。
 全局层在 `~/.yi-agent/preferences.json`，需自行设置。

@@ -2638,6 +2638,21 @@ describe("App remote subscription wiring (S2)", () => {
     expect(clients[0].requests.some((r) => r.method === "thread/subscribe")).toBe(false);
   });
 
+  it("hydrates the mode chip when the desktop opens a running thread", async () => {
+    // 回归：本卡把「运行中→只读 readItems」提为两种客户端共有后，桌面端点开一个
+    // 运行中的会话不再 resume，而 mode 过去只由 resume 回包/推送写入——于是 chip
+    // 停在未知（"Mode"、禁用）。清单快照本就带 permission_mode，这里钉住它必须在
+    // 这条路径上补上。卡会话跑 YOLO，桌面端点开时必须看得见 YOLO。
+    state.listStatus = "running";
+    state.mode = "yolo";
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    render(<App />); // no persisted config → desktop
+
+    await waitFor(() => expect(modeTrigger().textContent).toContain("YOLO"));
+    // 仍然不打断：running 会话不 resume。
+    expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(0);
+  });
+
   it("still resumes a cold idle thread on the desktop build", async () => {
     // 回归护栏：把「运行中才只读」这条边钉住。若有人把 running 判断写错成
     // 「一律不 resume」，冷会话就再也合不进服务端历史（resume 是它唯一的就绪
