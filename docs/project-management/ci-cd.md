@@ -27,6 +27,7 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - [x] CI/CD 设计文档 — [设计](../plans/2026-07-19-ci-cd-design.md)
 - [x] CI/CD 实现计划 — [实现](../plans/2026-07-19-ci-cd-impl.md)
 - [x] justfile 与 rust-toolchain.toml — `yi-agent-rs/justfile` + `rust-toolchain.toml` 存在；其中 `bindings-check`（ts-rs 生成物漂移门禁）已并入 `ci: fmt-check lint test build bindings-check`，故 GitHub PR / GitLab push / GitLab MR 三条路径都跑该门禁
+- [x] release workflow 环境门禁 — `.github/workflows/release.yml` 不再硬编码 `/Users/agenticlabs/...`：PATH 与 `CARGO_TARGET_DIR` 改由 `$HOME` 推导后写入 `GITHUB_PATH` / `GITHUB_ENV`，并新增 rustup 自愈与 `rustup update stable`；`yi-agent-rs/scripts/test_release_workflow_env.sh`（7 例）钉住「无写死家目录 / target 目录 $HOME 推导 / PATH 含 $HOME 工具目录 / 必须 update stable / 三平台 target 齐全」，已并入 `ci` 的 `release-env-check`。判据：`cd yi-agent-rs && just release-env-check`（7 passed；回退 workflow 即 4 条失败）
 - [x] npm 版本同步门禁 — `yi-agent-rs/scripts/sync-npm-versions.sh` + `scripts/test_sync_npm_versions.sh`；`npm-pack` 调用它同步主包、子包与 `optionalDependencies`，并自检 `platforms/*` 与依赖表逐一对应；`just npm-version-check` 已并入 `ci`。判据：`cd yi-agent-rs && just npm-version-check`（22 passed）
 - [x] npm 包结构 — `yi-agent-rs/yi-agent-cli/` 主包 + 平台子包
 - [x] Homebrew tap 自动更新脚本 — 发布脚本存在
