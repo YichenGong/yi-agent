@@ -431,3 +431,28 @@ OpenAI 侧的判别直接复用 `yi_agent_llm::openai::error::is_effort_rejectio
 6. **P6 三端 UI**：设置页、会话控件、TUI。
 
 P1–P4 单独可交付（能力可查、可探测），P5 开始改变行为，P6 收口 UI。
+## 12. 实现状态
+
+截至 2026-10-19，P1–P6 全部落地，53 个计划步骤全部完成。
+
+| 阶段 | 落点 | 判据 |
+|---|---|---|
+| P1 数据模型 | `yi-agent-runtime/src/models.rs:91` / `:105` / `:79` | `cargo test -p yi-agent-runtime --lib reasoning_capabilities` |
+| P2 裸探测 | `yi-agent-llm/src/probe.rs:65` / `:148` / `:42` | `cargo test -p yi-agent-llm --lib probe::tests`（11） |
+| P3 探测编排 | `yi-agent-runtime/src/reasoning_probe.rs:54` | `cargo test -p yi-agent-runtime --lib reasoning_probe`（4） |
+| P4 接线 | `yi-agent-app-server/src/model_rpc.rs:75` / `:90` / `:120`、`src/rpc/model.rs:169` / `:216`、`src/protocol.rs:309` | `cargo test -p yi-agent-app-server --lib model_probe_`（3）+ `an_upsert_with_a_new_connection_starts_a_probe` / `an_upsert_that_only_changes_the_key_does_not_reprobe` |
+| P5 约束 | `yi-agent-runtime/src/models.rs:610`（运行期过滤）、`yi-agent-app-server/src/rpc/thread.rs:973`（写入期校验） | `cargo test -p yi-agent-app-server --lib set_reasoning_effort_`（4） |
+| P6 桌面 | `desktop/src/lib/modelPicker.ts:111` / `:149`、`SettingsModelsTab.tsx:96` / `:317`、`ModelPicker.tsx:177` | `cd desktop && npx vitest run`（1417） |
+| P6 TUI | `yi-agent/src/tui/slash.rs:371`、`yi-agent/src/tui/app.rs:2436` / `:2397` | `cargo test -p yi-agent --bins effort`（21） |
+
+全量回归：`cargo test -p yi-agent-runtime --lib`（179）、`-p yi-agent-llm --lib`（125）、
+`-p yi-agent-app-server --lib`（879，4 ignored）、`-p yi-agent --bins`（654）。
+
+**实现期偏离设计的两处（均为收紧，未放宽约束）**：
+
+1. 状态行「可用」列表与 `/effort` 放行集合**同源**（`render_effort_status` 收
+   `supported` 参数）。设计只要求拒绝不支持的档位，但如果状态行仍平铺七档，
+   用户会照着一份点不动的清单去敲，等于把拒绝藏到下一次交互里。
+2. `model/capabilitiesChanged` 在桌面端 `threadStore` 里被**显式忽略**。它携带的
+   是机器级事实（某模型支持哪些档位），没有 `threadKey`，若落进会话通知分支会
+   往 `undefined` 会话写正文。

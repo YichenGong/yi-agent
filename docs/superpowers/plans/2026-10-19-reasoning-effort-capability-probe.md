@@ -67,7 +67,7 @@
   - `ModelEntry.reasoning_capabilities: Option<ReasoningCapabilities>`
   - `pub const REASONING_TIERS: [&str; 7]`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `models.rs` 的 `mod tests` 末尾加：
 
@@ -114,14 +114,14 @@ fn bad_capabilities_values_degrade_to_unknown_without_dropping_the_entry() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-runtime --lib reasoning_capabilities_roundtrip
 ```
 Expected: 编译失败，`ReasoningCapabilities` 不存在。
 
-- [ ] **Step 3: 实现类型与容错反序列化**
+- [x] **Step 3: 实现类型与容错反序列化**
 
 在 `models.rs` 的 `ModelEntry` 之前插入：
 
@@ -270,21 +270,21 @@ where
 `grep -rn "ModelEntry {" yi-agent-rs/crates --include=*.rs` 找到全部构造点，统一加
 `reasoning_capabilities: None,`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-runtime --lib reasoning_capabilities bad_capabilities
 ```
 Expected: 两个测试 PASS。
 
-- [ ] **Step 5: 跑该 crate 全量测试确认无回归**
+- [x] **Step 5: 跑该 crate 全量测试确认无回归**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-runtime
 ```
 Expected: 全绿。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-agent-rs/Cargo.toml && git add -A && git commit -m "feat(runtime): 模型条目记录各通道的 reasoning effort 能力"
@@ -303,7 +303,7 @@ cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-ag
 - Produces:
   - `fn connection_fields_changed(old: &ModelEntry, new_provider: ModelProvider, api_url: &str, model: &str, api_style: Option<&str>, api_key: &str) -> bool`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `model_rpc.rs` 的 `mod tests` 末尾加：
 
@@ -372,14 +372,14 @@ fn upsert_clears_capabilities_when_connection_fields_change() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-app-server --lib upsert_keeps_capabilities
 ```
 Expected: FAIL —— 现有 `upsert` 直接构造新 `ModelEntry`，能力被清空。
 
-- [ ] **Step 3: 实现保留/清空**
+- [x] **Step 3: 实现保留/清空**
 
 在 `model_rpc.rs` 的 `upsert` 中，把 `let entry = ModelEntry { ... }` 改成：
 
@@ -416,14 +416,14 @@ Expected: FAIL —— 现有 `upsert` 直接构造新 `ModelEntry`，能力被�
 
 **注意**：`api_key` 变化**不**清空能力（换密钥不影响模型支持哪些档位）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-app-server --lib upsert_
 ```
 Expected: 两个新测试 + 既有 upsert 测试全绿。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-agent-rs/Cargo.toml && git add -A && git commit -m "feat(app-server): upsert 保留未失效的 effort 能力数据"
@@ -448,7 +448,7 @@ cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-ag
   - `pub async fn detect_openai_channel(base_url: &str, api_key: &str, model: &str, timeout: Duration) -> Result<ProbeChannel, String>`
   - `pub fn probe_tools() -> Vec<yi_agent_core::ToolSchema>`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 新建 `probe.rs`，先只放测试与最小骨架声明（编译不过即为红）：
 
@@ -593,14 +593,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-llm --lib probe::tests
 ```
 Expected: 编译失败（类型/函数未定义）。
 
-- [ ] **Step 3: 实现探测**
+- [x] **Step 3: 实现探测**
 
 在 `probe.rs` 顶部（测试模块之前）写：
 
@@ -811,28 +811,28 @@ pub fn is_effort_rejection(status: u16, body: &str) -> bool {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-llm --lib probe::tests
 ```
 Expected: 9 个测试全 PASS。
 
-- [ ] **Step 5: 判别性验证（证明探测绕开了兜底）**
+- [x] **Step 5: 判别性验证（证明探测绕开了兜底）**
 
 临时把 `probe_effort` 的实现改成调用 `OpenaiProvider::call_stream`（或用
 `git stash` 保存后改），跑 `an_effort_naming_400_means_unsupported`：
 Expected: FAIL（`call_stream` 剥离重投后返回成功，判成 `Supported`）。
 确认后恢复实现。
 
-- [ ] **Step 6: 跑该 crate 全量测试**
+- [x] **Step 6: 跑该 crate 全量测试**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-llm
 ```
 Expected: 全绿。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-agent-rs/Cargo.toml && git add -A && git commit -m "feat(llm): 裸 HTTP 的 effort 能力探测，绕开剥离重投兜底"
@@ -855,7 +855,7 @@ cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-ag
   - `pub const PROBE_REQUEST_TIMEOUT: Duration`（10s）
   - `pub const PROBE_TOTAL_BUDGET: Duration`（30s）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 新建 `reasoning_probe.rs`，先只放测试：
 
@@ -974,14 +974,14 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-runtime --lib reasoning_probe::tests
 ```
 Expected: 编译失败。
 
-- [ ] **Step 3: 实现编排**
+- [x] **Step 3: 实现编排**
 
 在 `reasoning_probe.rs` 顶部（测试模块之前）写：
 
@@ -1128,21 +1128,21 @@ pub async fn probe_entry(
 
 在 `lib.rs` 加 `pub mod reasoning_probe;`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-runtime --lib reasoning_probe::tests
 ```
 Expected: 4 个测试全 PASS。
 
-- [ ] **Step 5: 跑该 crate 全量测试**
+- [x] **Step 5: 跑该 crate 全量测试**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-runtime
 ```
 Expected: 全绿。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-agent-rs/Cargo.toml && git add -A && git commit -m "feat(runtime): effort 探测编排（基线 + 7 档、预算控制）"
@@ -1168,7 +1168,7 @@ cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-ag
   - `pub fn apply_probe_result(path: &Path, name: &str, fingerprint: &str, outcome: ProbeOutcome) -> bool`
   - `Notification::ModelCapabilitiesChanged { name: String, reasoning_capabilities: Option<ReasoningCapabilities> }`
 
-- [ ] **Step 1: 写失败测试（协议形状）**
+- [x] **Step 1: 写失败测试（协议形状）**
 
 在 `protocol.rs` 的 `mod tests` 加：
 
@@ -1195,7 +1195,7 @@ fn model_capabilities_changed_notification_carries_method_and_payload() {
 }
 ```
 
-- [ ] **Step 2: 写失败测试（写回防覆盖）**
+- [x] **Step 2: 写失败测试（写回防覆盖）**
 
 在 `model_rpc.rs` 的 `mod tests` 加：
 
@@ -1261,14 +1261,14 @@ fn apply_probe_result_on_a_deleted_entry_is_a_no_op() {
 }
 ```
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-app-server --lib model_capabilities_changed apply_probe_result
 ```
 Expected: 编译失败。
 
-- [ ] **Step 4: 实现协议、指纹与写回**
+- [x] **Step 4: 实现协议、指纹与写回**
 
 `protocol.rs`：在 `Notification` 枚举里（`Notice` 之后）加：
 
@@ -1370,7 +1370,7 @@ impl ProbeRegistry {
 }
 ```
 
-- [ ] **Step 5: 实现 `model/probe` 分发**
+- [x] **Step 5: 实现 `model/probe` 分发**
 
 `model_rpc.rs` 的 `handle_model_request_at` 中，`model/list` 分支前加：
 
@@ -1491,7 +1491,7 @@ impl ProbeRegistry {
 `AppState` 增加 `pub(crate) probes: &'a crate::model_rpc::ProbeRegistry`，并在
 `serve()` 构造 `AppState` 的地方传入一个进程级 `ProbeRegistry::default()`。
 
-- [ ] **Step 6: `model/upsert` 自动触发**
+- [x] **Step 6: `model/upsert` 自动触发**
 
 `rpc/model.rs` 的 `model/upsert` 分支在成功回包**之后**（不阻塞响应）比较指纹：
 
@@ -1517,14 +1517,14 @@ impl ProbeRegistry {
 把「后台探测」抽成 `pub(crate) fn spawn_probe(hub, probes, path, name, entry)`，
 `model/probe` 与 `model/upsert` 都调它，避免两份 tokio::spawn。
 
-- [ ] **Step 7: 跑测试确认通过**
+- [x] **Step 7: 跑测试确认通过**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-app-server --lib model_capabilities_changed apply_probe_result model_
 ```
 Expected: 全绿。
 
-- [ ] **Step 8: 加集成用例（探测去重 + 广播）**
+- [x] **Step 8: 加集成用例（探测去重 + 广播）**
 
 在 `rpc_tests.rs` 加（照现有 `model/*` 用例的 harness）：
 
@@ -1545,7 +1545,7 @@ async fn model_probe_broadcasts_capabilities_changed() {
 具体 harness 调用照抄同文件里相邻的 `model/upsert` 用例（`serve_scoped_with_loopback`
 或 `serve_stdio` 的现有写法），只替换方法与断言。
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-agent-rs/Cargo.toml && git add -A && git commit -m "feat(app-server): model/probe RPC、能力广播与 upsert 自动触发"
@@ -1567,7 +1567,7 @@ cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-ag
   - `pub fn supported_efforts(entry: &ModelEntry) -> Option<Vec<String>>`
   - `pub fn effort_is_allowed(entry: &ModelEntry, effort: &str) -> bool`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `models.rs` 的 `mod tests` 加：
 
@@ -1621,14 +1621,14 @@ fn an_unknown_capability_keeps_the_default_effort() {
 `models.rs` 的测试模块里加一个同样的私有辅助函数（逐字段显式构造），命名为
 `test_config()`。不要给 `RuntimeConfig` 新增 `Default`（会掩盖漏配字段）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-runtime --lib unsupported_default_effort
 ```
 Expected: FAIL。
 
-- [ ] **Step 3: 实现能力查询与运行期过滤**
+- [x] **Step 3: 实现能力查询与运行期过滤**
 
 `models.rs` 加：
 
@@ -1694,7 +1694,7 @@ pub fn effort_is_allowed(entry: &ModelEntry, effort: &str) -> bool {
             }
 ```
 
-- [ ] **Step 4: 服务端写入校验**
+- [x] **Step 4: 服务端写入校验**
 
 `rpc/thread.rs` 的 `thread/setReasoningEffort` 白名单校验之后加：
 
@@ -1734,14 +1734,14 @@ pub fn effort_is_allowed(entry: &ModelEntry, effort: &str) -> bool {
 
 （`model_ref` 从该 thread 的 meta 取；若拿不到就跳过校验，保持宽松。）
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent-runtime --lib effort && cargo test -p yi-agent-app-server --lib set_reasoning_effort
 ```
 Expected: 全绿。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-agent-rs/Cargo.toml && git add -A && git commit -m "feat: 运行期与写入期按能力集合约束 effort"
@@ -1768,7 +1768,7 @@ cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-ag
   - `entrySupportedEfforts(list: ModelList, ref: string | null): string[] | null`
   - `probeModel(rpc: ModelRpc, name: string): Promise<{ started: boolean }>`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `desktop/src/lib/modelPicker.test.ts` 加：
 
@@ -1846,14 +1846,14 @@ it("renders the probed tiers and offers a re-probe", async () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/desktop && npx vitest run src/lib/modelPicker.test.ts src/components/SettingsModelsTab.test.tsx
 ```
 Expected: FAIL。
 
-- [ ] **Step 3: 实现类型与纯函数**
+- [x] **Step 3: 实现类型与纯函数**
 
 `models.ts` 加：
 
@@ -1937,7 +1937,7 @@ export function entrySupportedEfforts(
 }
 ```
 
-- [ ] **Step 4: 接线到两个组件**
+- [x] **Step 4: 接线到两个组件**
 
 `ModelPicker.tsx`：
 
@@ -2000,14 +2000,14 @@ const supported = draftSupportedEfforts(draft, catalog);
 `reprobe` 调 `probeModel(rpc, name)`，成功则按钮短暂显示「探测中…」（本地
 `Set<string>` 状态），收到 `model/capabilitiesChanged` 后由宿主刷新清单。
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/desktop && npx vitest run src/lib/modelPicker.test.ts src/components/SettingsModelsTab.test.tsx src/components/ModelPicker.test.tsx && npx tsc --noEmit
 ```
 Expected: 全绿。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && git add -A && git commit -m "feat(desktop): effort 下拉只列模型支持的档位"
@@ -2026,7 +2026,7 @@ cd .worktrees/feat-reasoning-capability && git add -A && git commit -m "feat(des
 - Consumes: Task 6 的 `supported_efforts`
 - Produces: `pub fn parse_effort_args_with_caps(args: &str, supported: Option<&[String]>) -> Result<EffortAction, String>`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
 #[test]
@@ -2040,14 +2040,14 @@ fn effort_rejects_a_tier_the_model_does_not_support() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent --lib effort_rejects_a_tier
 ```
 Expected: FAIL。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 ```rust
 /// 与 [`parse_effort_args`] 相同，但额外按模型能力集合校验档位。
@@ -2077,14 +2077,14 @@ pub fn parse_effort_args_with_caps(
 `app.rs` 的调用点改为先用 `models::supported_efforts(entry)` 取集合（条目选择
 复用现有 `effective_entry_with_injection`），再调 `parse_effort_args_with_caps`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 ```bash
 cd .worktrees/feat-reasoning-capability/yi-agent-rs && cargo test -p yi-agent --lib effort
 ```
 Expected: 全绿。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-agent-rs/Cargo.toml && git add -A && git commit -m "feat(tui): /effort 按模型能力集合校验"
@@ -2101,7 +2101,7 @@ cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-ag
 - Modify: `docs/project-management/desktop.md`
 - Modify: `docs/project-management/README.md`（若计数变化）
 
-- [ ] **Step 1: 按三态规则登记**
+- [x] **Step 1: 按三态规则登记**
 
 每个模块文件加一条 `[x]`，并写可验证判据（文件 + 行或命令）。例如：
 
@@ -2112,11 +2112,11 @@ cd .worktrees/feat-reasoning-capability && cargo fmt --all --manifest-path yi-ag
   验证：`cargo test -p yi-agent-runtime --lib reasoning_capabilities`
 ```
 
-- [ ] **Step 2: 更新 README 计数**
+- [x] **Step 2: 更新 README 计数**
 
 按 `docs/project-management/README.md` 的索引表更新「完成 / 总计」。
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 cd .worktrees/feat-reasoning-capability && git add -A && git commit -m "docs: 登记 effort 能力探测的实现状态"
