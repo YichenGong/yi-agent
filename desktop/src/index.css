@@ -457,11 +457,14 @@ html[data-mobile="true"] {
  * 状态栏用量数字的翻滚窗口。
  *
  * `.rolling-digit` 是只露出一行高的裁切窗口，`.rolling-strip` 是竖向数字带；
- * 位移由组件内联的 `transform` 驱动，这里只管几何：一个字符宽、一个字符高。
+ * 位移由组件内联的 `transform` 驱动，这里只管几何：一个字符宽、一个行盒高。
  * `tabular-nums` 保证等宽，窗口不会随数字宽度抖动。
  *
- * `line-height: 1em` 是硬约束：组件的位移单位是 `em`，一条数字必须正好占 1em，
- * 否则窗口里会露出相邻行的边。用 `em` 而不是 `1`，是为了不受按钮继承行高的影响。
+ * 高度与位移都用 `lh`（= 自己所在行盒的高度），**不能用 `em`**：`1em` 是字号
+ * 12px，比字形本身的约 14px 还矮，只能靠「12px 窗口在 16px 行盒里居中」把这个
+ * 差补回来——而那个抵消依赖行盒正好 16px、居中正好取整。WKWebView 下按钮行盒
+ * 实测 15px，居中落在半像素上，数字与 `in /` 就错开了（用户报的「没有对齐」）。
+ * `1lh` 让窗口、格子与相邻文本共用同一套行盒规则，不再依赖居中抵消。
  */
 .rolling-number {
   display: inline-flex;
@@ -473,9 +476,8 @@ html[data-mobile="true"] {
   position: relative;
   display: inline-block;
   width: 1ch;
-  height: 1em;
+  height: 1lh;
   overflow: hidden;
-  vertical-align: middle;
 }
 
 .rolling-strip {
@@ -486,7 +488,7 @@ html[data-mobile="true"] {
 
 .rolling-strip > span {
   display: block;
-  height: 1em;
-  line-height: 1em;
+  height: 1lh;
+  line-height: inherit;
   text-align: center;
 }

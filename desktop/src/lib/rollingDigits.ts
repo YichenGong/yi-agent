@@ -58,7 +58,12 @@ export function digitDelayMs(indexFromRight: number): number {
   return Math.min(indexFromRight * STAGGER_MS, MAX_STAGGER_MS);
 }
 
-/** 数字带在位置 `pos` 处的位移。每行一个字符高，故 1 位 = 1em。 */
+/**
+ * 数字带在位置 `pos` 处的位移。每行占一个行盒，故 1 位 = 1lh。
+ *
+ * 单位必须与裁切窗口的高度一致（`index.css` 的 `.rolling-digit` 也是 `1lh`）。
+ * 改回 `em` 会按字号（12px）而非继承行高（16px）换算，滚到中途就会露出相邻行。
+ */
 export function stripY(pos: number): string {
-  return `translateY(-${pos}em)`;
+  return `translateY(-${pos}lh)`;
 }

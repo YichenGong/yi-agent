@@ -78,7 +78,9 @@ describe("digitDelayMs", () => {
 });
 
 describe("stripY", () => {
-  it("translates by one line per position", () => {
-    expect(stripY(10)).toBe("translateY(-10em)");
+  it("translates by one line box per position", () => {
+    // 位置单位必须跟着窗口走：窗口是 `1lh`，位移就只能是 `lh`。用 `em` 会按
+    // 12px 而非继承行高（16px）换算，滚到底时窗口里露出相邻行的半截。
+    expect(stripY(10)).toBe("translateY(-10lh)");
   });
 });
