@@ -512,7 +512,7 @@ mod tests {
             outcome.lines
         );
         let queries = log.lock().unwrap();
-        let (method, params) = queries
+        let (_, params) = queries
             .iter()
             .find(|(method, _)| method == "lifecycle/create")
             .unwrap_or_else(|| panic!("create must reach the plugin, saw {queries:?}"));
