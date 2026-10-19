@@ -22,7 +22,7 @@ use super::worker::{
 use crate::agent::ProviderTurnGate;
 use crate::message::Message;
 
-pub const MAX_DIRECT_CHILDREN: usize = 4;
+pub const MAX_DIRECT_CHILDREN: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorEvent {

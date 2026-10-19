@@ -71,7 +71,7 @@ pub const RESIDENT_SUBAGENTS_DEFAULT: u16 = 64;
 /// Default direct-child limit, mirrored by
 /// `AgentWorkerFactory::max_direct_children`'s default so a factory that does
 /// not override it and a config that does not set it agree.
-pub const DIRECT_CHILDREN_DEFAULT: u16 = 4;
+pub const DIRECT_CHILDREN_DEFAULT: u16 = 8;
 
 /// 运行时配置,由调用方覆盖项和环境变量合并而来。
 #[derive(Debug, Clone)]
@@ -1565,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn max_direct_children_defaults_to_four_and_reads_the_env() {
+    fn max_direct_children_defaults_to_eight_and_reads_the_env() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1579,11 +1579,11 @@ mod tests {
         };
         let config = RuntimeConfig::load(&overrides).expect("config loads");
         assert_eq!(config.max_direct_children, DIRECT_CHILDREN_DEFAULT);
-        assert_eq!(DIRECT_CHILDREN_DEFAULT, 4);
+        assert_eq!(DIRECT_CHILDREN_DEFAULT, 8);
 
-        env.set("YI_AGENT_MAX_DIRECT_CHILDREN", "8");
+        env.set("YI_AGENT_MAX_DIRECT_CHILDREN", "3");
         let config = RuntimeConfig::load(&overrides).expect("config loads");
-        assert_eq!(config.max_direct_children, 8);
+        assert_eq!(config.max_direct_children, 3);
     }
 
     #[test]

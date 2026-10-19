@@ -9,6 +9,7 @@ use futures::{FutureExt, future::BoxFuture};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use yi_agent_core::subagent::supervisor::MAX_DIRECT_CHILDREN;
 use yi_agent_core::subagent::task::{MessageId, PermissionRequestId, WorkspaceLeaseId};
 use yi_agent_core::subagent::worker::{
     AgentWorkerFactory, WorkerError, WorkerHandle, WorkerRecoveryContext, WorkerStart,
@@ -1523,7 +1524,7 @@ fn application_root_can_spawn_second_child_while_first_is_running() {
 }
 
 #[test]
-fn application_root_rejects_more_than_four_direct_children() {
+fn application_root_rejects_more_than_the_direct_child_limit() {
     let directory = TempDir::new().unwrap();
     let database = directory.path().join("runtime.sqlite");
     let (daemon, _starts) = application_root_daemon(&directory, &database);
@@ -1545,7 +1546,7 @@ fn application_root_rejects_more_than_four_direct_children() {
         panic!("expected attachment");
     };
 
-    for index in 0..4 {
+    for index in 0..MAX_DIRECT_CHILDREN {
         assert!(matches!(
             send_request(
                 daemon.socket_path(),
@@ -1588,7 +1589,11 @@ fn application_root_rejects_more_than_four_direct_children() {
         panic!("expected direct child limit error, got {response:?}");
     };
     assert_eq!(code, yi_agent_store::ipc::IpcErrorCode::InvalidState);
-    assert!(message.unwrap().contains("at most 4 direct children"));
+    assert!(
+        message
+            .unwrap()
+            .contains(&format!("at most {MAX_DIRECT_CHILDREN} direct children"))
+    );
 }
 
 #[test]
@@ -1617,7 +1622,7 @@ fn application_root_reuses_direct_child_slots_after_terminal_reports() {
         panic!("expected attachment");
     };
 
-    for index in 0..4 {
+    for index in 0..MAX_DIRECT_CHILDREN {
         assert!(matches!(
             send_request(
                 daemon.socket_path(),
@@ -5418,8 +5423,8 @@ fn inherited_sandbox_is_persisted_and_recovered() {
 
 /// Two conversations on one daemon must never share a root, must not reach
 /// across, and must not split one child budget. This is the invariant the
-/// desktop app depends on: "four subagents" is four *per conversation*, not
-/// four per project.
+/// desktop app depends on: the direct-child limit is a budget *per
+/// conversation*, not one shared budget per project.
 #[test]
 fn two_conversation_roots_do_not_share_children_or_reach_across() {
     let directory = TempDir::new().unwrap();
@@ -5491,8 +5496,8 @@ fn two_conversation_roots_do_not_share_children_or_reach_across() {
     );
 
     // Each root has its own budget: while A holds one child, B still admits its
-    // own four. Under the old shared-root behaviour B would run out here.
-    for index in 0..4 {
+    // own full budget. Under the old shared-root behaviour B would run out here.
+    for index in 0..MAX_DIRECT_CHILDREN {
         assert!(
             matches!(
                 send_request(
@@ -5513,10 +5518,10 @@ fn two_conversation_roots_do_not_share_children_or_reach_across() {
                 .unwrap(),
                 IpcResponse::TaskSpawned { .. }
             ),
-            "B must still admit its own four children while A holds one"
+            "B must still admit its own full budget while A holds one"
         );
         // Complete B's children as they are admitted, so its own slots free up
-        // and the loop proves four is a budget, not a lucky race.
+        // and the loop proves the limit is a budget, not a lucky race.
         let handle = factory
             .handles
             .lock()

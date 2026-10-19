@@ -220,7 +220,7 @@ pub(crate) type ProjectRuntimes =
 ///
 /// runtime(daemon)按项目共享,是 G2;root 按会话独立,是这次改动的核心——
 /// 一个 root 才是一份 `MAX_DIRECT_CHILDREN` 预算,两个会话共用一个 root 就会共用
-/// 一份预算,这正是桌面端「四个就满」的成因。
+/// 一份预算,这正是桌面端「一个会话满了、全目录都满」的成因。
 pub(crate) type ThreadRoots = Arc<StdMutex<HashMap<String, Arc<ThreadRoot>>>>;
 
 /// 模型驱动的视图帧表：每会话一帧，**内存态**（不落盘，重启即空）。
