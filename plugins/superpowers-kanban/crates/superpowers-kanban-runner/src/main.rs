@@ -1944,4 +1944,83 @@ mod tests {
              on every field except `command`"
         );
     }
+
+    /// 随固件一起发布的 skill：它教模型怎么用这个 CLI，所以两者**不能各自漂移**。
+    ///
+    /// 这个测试是回归锁：新增/改名一个动词却忘了改 SKILL.md 时，模型会拿着
+    /// 过时的命令面去调（或者干脆不知道新能力），而这在运行期完全静默。
+    const SKILL: &str = include_str!("../../../skills/superpowers-kanban/SKILL.md");
+
+    /// CLI 的全部动词，**从 `USAGE` 里读**，不另维护一份清单——否则这张表本身
+    /// 就会成为下一个漂移点。
+    fn usage_verbs() -> Vec<String> {
+        let inside = crate::USAGE
+            .split_once('<')
+            .and_then(|(_, rest)| rest.split_once('>'))
+            .map(|(inside, _)| inside)
+            .expect("USAGE must list the verbs between < and >");
+        inside.split('|').map(str::to_string).collect()
+    }
+
+    #[test]
+    fn the_skill_documents_every_cli_verb() {
+        let verbs = usage_verbs();
+        assert!(verbs.len() > 10, "sanity: parsed verbs = {verbs:?}");
+        for verb in verbs {
+            let call = format!("superpowers-kanban {verb}");
+            assert!(
+                SKILL.contains(&call),
+                "SKILL.md never shows `{call}`: the model cannot use what it cannot read"
+            );
+        }
+    }
+
+    /// `list` 打印的是 `CardState` 的 Debug 名。技能必须把每个状态都解释一遍，
+    /// 否则模型看到一个从没见过的词只能瞎猜（历史上 `needs_you` 就被误读成失败）。
+    /// 状态名从**枚举定义**里读，新增一个变体忘记写进技能时这里直接红。
+    #[test]
+    fn the_skill_names_every_card_state_that_list_can_print() {
+        let source = include_str!("../../superpowers-kanban-core/src/card.rs");
+        let body = source
+            .split_once("pub enum CardState {")
+            .and_then(|(_, rest)| rest.split_once("\n}"))
+            .map(|(body, _)| body)
+            .expect("CardState must stay a plain enum for this test to read it");
+        let variants: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("///"))
+            .filter_map(|line| line.split('(').next())
+            .filter_map(|line| line.strip_suffix(','))
+            .collect();
+        assert!(variants.len() > 8, "sanity: parsed variants = {variants:?}");
+        for variant in variants {
+            assert!(
+                SKILL.contains(variant),
+                "SKILL.md never explains the `{variant}` state that `list` prints"
+            );
+        }
+    }
+
+    /// 技能的触发面由 frontmatter `description` 决定：它只写"入队"时，
+    /// "合并这张卡"这类说法根本不会加载本 skill（正文写得再全也用不上）。
+    #[test]
+    fn the_skill_description_covers_merge_and_status_work_too() {
+        let description = SKILL
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .and_then(|(frontmatter, _)| {
+                frontmatter
+                    .lines()
+                    .find_map(|line| line.strip_prefix("description:"))
+            })
+            .expect("the skill needs a `description` in its frontmatter");
+        for intent in ["enqueue", "promote", "merge", "status"] {
+            assert!(
+                description.contains(intent),
+                "the skill's description never mentions `{intent}`: that intent \
+                 will not load the skill at all"
+            );
+        }
+    }
 }
