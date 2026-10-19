@@ -680,3 +680,118 @@ fn an_unwritable_log_does_not_stop_the_child_from_starting() {
     );
     supervisor.stop_all();
 }
+
+// --- 转发表对「健康孤儿」的登记（daemon 重启后仍可查询） ---
+
+/// daemon 重启后，上一代 daemon 留下的插件进程仍活着并在 socket 上应答。
+///
+/// `ensure_running` 见到应答就**故意不 spawn**（避免两个实例抢锁），因此它不会
+/// 进入 `running`。若转发表只按 `running` 过滤，这条唯一能回答查询的路由就会被
+/// 漏掉，`plugin/query` 会一直回 `plugin_unavailable`，直到那个进程碰巧退出。
+#[test]
+fn a_live_orphan_that_answers_is_published_after_a_daemon_restart() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    let manifest = write_manifest_with_query_socket(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "demo_on",
+        "{workdir}/.yi-agent/query.sock",
+    );
+    enable(workdir, "demo_on");
+
+    // 模拟「上一代 daemon 已经把它拉起来过」：在探测位置真的 bind。
+    let socket = probe_path(&manifest, &layout);
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+    let mut supervisor = Supervisor::new(layout_for(workdir));
+    supervisor.reconcile();
+
+    assert_eq!(
+        supervisor.running_count(),
+        0,
+        "the healthy orphan must not be spawned again"
+    );
+    assert!(
+        !marker.exists(),
+        "no child may be started when the orphan already answers"
+    );
+
+    let sockets = supervisor.query_sockets();
+    let (name, path) = sockets
+        .iter()
+        .find(|(name, _)| name == "demo")
+        .unwrap_or_else(|| {
+            panic!("a live orphan must stay queryable after a daemon restart: {sockets:?}")
+        });
+    assert_eq!(name, "demo");
+    assert_eq!(path, &socket);
+    supervisor.stop_all();
+}
+
+/// 声明了查询通道、但没人在听：不该进转发表。
+///
+/// 路由的唯一意义是「能连上」；把连不上的路径登进去只会让查询等到超时。
+#[test]
+fn a_declared_socket_with_no_listener_is_not_published() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let child = write_fake_child(workdir, &workdir.join("child.pid"));
+    let layout = layout_for(workdir);
+    // 开关关着，故 reconcile 不会起子进程；socket 也没人 bind。
+    let _manifest = write_manifest_with_query_socket(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "demo_on",
+        "{workdir}/.yi-agent/query.sock",
+    );
+
+    let mut supervisor = Supervisor::new(layout_for(workdir));
+    supervisor.reconcile();
+
+    assert!(
+        supervisor.query_sockets().is_empty(),
+        "a socket nobody listens on must not be published"
+    );
+    supervisor.stop_all();
+}
+
+/// 清单没声明查询通道：即使那个路径上碰巧有人在听，也不该登记。
+///
+/// 路由来自清单的**声明**，不是来自「某个文件恰好存在」——否则宿主就变成了
+/// 任意本地 socket 的代理。
+#[test]
+fn a_manifest_without_a_query_socket_is_never_published() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
+    enable(workdir, "demo_on");
+
+    // 在常见位置放一个真在监听的 socket。
+    let stray = workdir.join(".yi-agent").join("query.sock");
+    std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(&stray).unwrap();
+
+    let mut supervisor = Supervisor::new(layout_for(workdir));
+    supervisor.reconcile();
+    assert!(wait_for_pid_marker(&marker), "the child should be running");
+
+    assert!(
+        supervisor.query_sockets().is_empty(),
+        "a manifest that declares no query channel must never be published: {:?}",
+        supervisor.query_sockets()
+    );
+    supervisor.stop_all();
+}

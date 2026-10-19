@@ -207,15 +207,31 @@ impl Supervisor {
         }
     }
 
-    /// 当前可被查询的插件：清单声明了 socket，且进程正在运行。
+    /// 当前可被查询的插件：清单声明了 socket，且**它的查询通道现在真的可用**。
     ///
     /// 这是「插件是否有查询通道」的唯一判据——daemon 只认这份列表，不会接受
     /// 请求方传来的任意 socket 路径。停止或未声明的插件下一轮就会消失。
+    ///
+    /// 两个条件取「或」而不是只看 `running`：`ensure_running` 在查询 socket 已有
+    /// 应答时**故意不 spawn**（健康的孤儿进程持有 socket，重复拉起会两个实例抢锁）。
+    /// 那样的进程不在 `running` 里，却恰恰是唯一能回答查询的那一个。只按
+    /// `running` 过滤会让它在**每次 daemon 重启后**都被漏登记：插件明明活着、
+    /// socket 明明在应答，`plugin/query` 却一直回 `plugin_unavailable`，直到这个
+    /// 进程碰巧退出、被重新拉起为止。
+    ///
+    /// 反过来，清单声明了 socket 但没人在听（刚 spawn、还没 bind，或进程已死）
+    /// 时，`answers` 为假且 `running` 里若也没有它，就不该登记——转发表里的每条
+    /// 路由都应当能连上。
+    ///
+    /// 注意「或」也覆盖了开关刚被关掉、而进程是上一代 daemon 留下的孤儿的情况：
+    /// 监督器只杀得掉自己 spawn 的子进程，杀不掉那个孤儿；只要它仍在应答，这条
+    /// 路由就是**真的可用**的，如实登记比假装它不在更好——查询通道正是它报告状态
+    /// 并把开关重新打开的唯一途径。
     pub fn query_sockets(&self) -> Vec<(String, PathBuf)> {
         let manifests = load_manifests(&self.layout.manifests_dir());
         manifests
             .into_iter()
-            .filter(|manifest| self.running.contains_key(&manifest.name))
+            .filter(|manifest| self.running.contains_key(&manifest.name) || self.answers(manifest))
             .filter_map(|manifest| {
                 match manifest.query_socket_path(
                     &self.layout.workdir,
