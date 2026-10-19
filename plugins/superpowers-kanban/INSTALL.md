@@ -112,16 +112,43 @@ head -3 ~/.yi-agent/skills/superpowers-kanban/SKILL.md
 > 也可以装到项目层 `<项目>/.yi-agent/skills/superpowers-kanban/`，
 > 只对该项目生效。三层优先级：项目 > 用户 > 系统。
 
+### 3a. 升级：skill 也要重新复制
+
+skill 是**独立的文件副本**，不会跟着二进制一起更新。升级插件后必须重跑一次第 3 步的
+`cp`，否则模型仍按旧命令面干活（例如不知道新增的 `promote` / `merge-request`），
+表现为"插件明明支持、模型却说不会"。
+
+复制后同样要**开新会话**才生效。核对两边是否一致：
+
+```bash
+diff <插件目录>/skills/superpowers-kanban/SKILL.md \
+     ~/.yi-agent/skills/superpowers-kanban/SKILL.md && echo in-sync
+```
+
+预期：无差异输出并打印 `in-sync`。
+
 ---
 
 ## 4. 安装 supervisor 清单（每个项目一次）
 
 清单告诉 daemon：开关打开时该拉起哪个进程。
 
+首选**让宿主装**（推荐）：桌面 app / app-server 的通用 `plugin/install` 会先执行
+`superpowers-kanban manifest` 拿到本插件自述的清单，校验后写到
+`<项目>/.yi-agent/supervisors/superpowers-kanban.json` 并打开开关——校验失败则**什么都不写**，
+不会留下半个安装。宿主源码里不含任何插件专属名字，走的全是通用路径。
+
+手工装（无宿主时）等价于下面两步：
+
 ```bash
 mkdir -p <项目>/.yi-agent/supervisors
 cp <插件目录>/supervisors/superpowers-kanban.json <项目>/.yi-agent/supervisors/superpowers-kanban.json
 ```
+
+清单里除 `command` 外的内容由插件自述保证与代码一致（有测试钉住
+`superpowers-kanban manifest` 的输出与随包发布的
+`supervisors/superpowers-kanban.json` 逐字段相等），所以**优先用 `manifest` 的输出**，
+不要在手工复制后手改其它字段。
 
 **若二进制不在 `PATH` 上**，把清单里的 `command` 改成绝对路径：
 
