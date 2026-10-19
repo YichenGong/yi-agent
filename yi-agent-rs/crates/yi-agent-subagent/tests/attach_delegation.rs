@@ -364,8 +364,8 @@ fn ensure_owned_reuses_a_healthy_daemon() {
 }
 
 /// A daemon shared by several conversations, each with its own root: this is the
-/// desktop app's shape, and the reason it must not be capped at four children in
-/// total. One conversation's root must never reach another's child.
+/// desktop app's shape, and the reason the child budget must not be shared
+/// project-wide. One conversation's root must never reach another's child.
 #[test]
 fn delegation_tools_act_as_the_conversations_own_root() {
     let repo = tempfile::TempDir::new().unwrap();

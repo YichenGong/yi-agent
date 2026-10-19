@@ -205,7 +205,7 @@ fn a_caller_only_reaches_its_own_descendants() {
 }
 
 #[test]
-fn spawn_enforces_depth_two_and_four_direct_children() {
+fn spawn_enforces_depth_two_and_the_direct_child_limit() {
     let mut supervisor = AgentSupervisor::new(RootSessionId::new());
     let root = supervisor.root_task_id().clone();
 
@@ -217,12 +217,13 @@ fn spawn_enforces_depth_two_and_four_direct_children() {
         Err(SpawnError::MaximumDepthReached)
     ));
 
-    for _ in 0..3 {
+    let limit = yi_agent_core::subagent::supervisor::MAX_DIRECT_CHILDREN;
+    for _ in 1..limit {
         supervisor.spawn(root.clone()).unwrap();
     }
     assert!(matches!(
         supervisor.spawn(root),
-        Err(SpawnError::DirectChildLimitReached { limit: 4 })
+        Err(SpawnError::DirectChildLimitReached { limit: reached }) if reached == limit
     ));
 }
 

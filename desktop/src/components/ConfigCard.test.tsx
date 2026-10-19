@@ -13,7 +13,7 @@ const sample: Record<string, unknown> = {
   model: "claude-sonnet-4",
   max_turns: 20,
   max_resident_subagents: 8,
-  max_direct_children: 4,
+  max_direct_children: 8,
   workdir: "/Users/me/a/very/long/project/path",
   sandbox: "WorkspaceWrite",
   sandbox_promotable: true,
