@@ -935,9 +935,6 @@ mod tests {
         assert_eq!(load_catalog_from(&path), catalog);
     }
 
-    /// 写入不得把「读不出来的既有文件」当成空对象从头重建——那会静默丢掉用户
-    /// 的整个 `models.json`。首写（文件不存在）仍必须成功创建。
-    #[test]
     /// 两个写者交错时，后写的那个必须基于**前一个已经落盘**的清单，否则
     /// 一方的修改会被静默丢掉。
     ///
@@ -1046,6 +1043,9 @@ mod tests {
         );
     }
 
+    /// 写入不得把「读不出来的既有文件」当成空对象从头重建——那会静默丢掉用户
+    /// 的整个 `models.json`。首写（文件不存在）仍必须成功创建。
+    #[test]
     fn saving_refuses_to_overwrite_a_base_it_cannot_read() {
         // (a) 文件不存在：确实没有既有内容 → 正常创建。
         let dir = tempfile::TempDir::new().unwrap();

@@ -63,5 +63,8 @@ release:macos-dmg:
   # 同一 tag 不并发发布（重跑安全，脚本内已做建/改 Release 的分支）
   resource_group: release-macos-dmg
   interruptible: false
+  variables:
+    # 构建期版本标识需要 tag 与历史；GitLab 默认浅克隆会把它判成 nogit。
+    GIT_DEPTH: "0"
   script:
     - bash desktop/scripts/release-dmg.sh
