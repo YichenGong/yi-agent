@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   STRIP_BASE,
   type Direction,
@@ -48,7 +48,8 @@ export function RollingNumber({
 }) {
   const prev = useRef({ value, usageKey });
   const [states, setStates] = useState<DigitState[]>(() => initialState(value));
-  const digits = splitDigits(value);
+  // `digits` 进依赖数组，必须在值不变时保持同一身份，否则每次渲染都会空转一次 effect。
+  const digits = useMemo(() => splitDigits(value), [value]);
 
   useEffect(() => {
     const previous = prev.current;
@@ -118,7 +119,6 @@ export function RollingNumber({
           <span key={index} className="rolling-digit">
             <span
               className="rolling-strip"
-              data-index={index}
               onTransitionEnd={() => settle(index)}
               style={{
                 transform: stripY(state.pos),
