@@ -554,7 +554,7 @@ fn a_process_that_owns_the_daemon_supervises_its_plugins() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut routable = false;
     while Instant::now() < deadline {
-        if yi_agent_store::ipc::plugin_socket_for("demo").is_some() {
+        if yi_agent_store::ipc::plugin_socket_for(runtime_dir.path(), "demo").is_some() {
             routable = true;
             break;
         }

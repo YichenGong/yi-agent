@@ -718,7 +718,7 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
             // `daemon start` detaches this subcommand with its stderr on
             // `/dev/null`, but a directly invoked `serve` owns the terminal and
             // so keeps the historical line.
-            let supervisor = yi_agent_runtime::supervise::serve(&workdir);
+            let supervisor = yi_agent_runtime::supervise::serve(&workdir, &runtime_dir);
             report_reclaimed_orphans_to_stderr(daemon.reclaimed_orphans());
             let result = daemon
                 .wait()
@@ -1136,6 +1136,7 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
             embedded_daemon,
             supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
                 &config.workdir,
+                &runtime_dir,
                 owns_daemon,
             ),
         },
@@ -3299,7 +3300,10 @@ mod tests {
         )
         .unwrap();
 
-        let handle = yi_agent_runtime::supervise::serve(workdir);
+        // 转发表按 daemon 的 runtime 目录分区；这条测试不起 daemon，给一个
+        // 项目内路径即可，与生产侧 `Layout::for_workdir` 的推导一致。
+        let runtime_dir = workdir.join(".yi-agent/runtime");
+        let handle = yi_agent_runtime::supervise::serve(workdir, &runtime_dir);
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut started = false;
         while Instant::now() < deadline {

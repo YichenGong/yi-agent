@@ -59,8 +59,20 @@ impl Drop for SuperviseHandle {
 ///
 /// 规则只有一条：`owns_daemon` 为真才监督。两个内嵌路径（TUI、桌面）共用它，
 /// 免得各自的 `if` 有一天漂移成两种语义。
-pub fn for_daemon_ownership(workdir: &Path, owns_daemon: bool) -> SuperviseHandle {
-    if owns_daemon { serve(workdir) } else { idle() }
+///
+/// `runtime_dir` 必须是**那个 daemon 实际用的**目录，而不是这里再推导一次：
+/// 路由按 runtime 目录分区，推导结果一旦与 daemon 不同，监督线程就会把路由
+/// 发布到一个没人读取的分区，表现为"插件在跑却查不到"。
+pub fn for_daemon_ownership(
+    workdir: &Path,
+    runtime_dir: &Path,
+    owns_daemon: bool,
+) -> SuperviseHandle {
+    if owns_daemon {
+        serve(workdir, runtime_dir)
+    } else {
+        idle()
+    }
 }
 
 /// 一个"不监督"的占位句柄——用在借用了别人 daemon 的路径上。
@@ -79,10 +91,16 @@ pub fn idle() -> SuperviseHandle {
 ///
 /// 生命周期与调用它的那个 daemon 一致：daemon 在，监督在；`stop()` 之后
 /// 转发表被清空、子进程被停止。
-pub fn serve(workdir: &Path) -> SuperviseHandle {
+///
+/// `runtime_dir` 由调用方给出（daemon 建在哪儿就传哪儿），因为转发表按它分区。
+pub fn serve(workdir: &Path, runtime_dir: &Path) -> SuperviseHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let layout = Layout::for_workdir(workdir);
+    // 路由按项目分区：daemon 用它的 runtime 目录作为身份，监督线程必须发布到
+    // 同一个 key 下。同一个进程可能同时监督多个项目（桌面 app-server 就是如此），
+    // 所以这里的数据结构不能再假定"一个进程只有一个 daemon"。
+    let scope = runtime_dir.to_path_buf();
     let join = std::thread::spawn(move || {
         // 监督线程的 panic 不得拖垮宿主（TUI/桌面）——记录后结束，
         // `stop()` 仍能安全 join 到这个已结束的线程。
@@ -91,18 +109,19 @@ pub fn serve(workdir: &Path) -> SuperviseHandle {
             while !flag.load(Ordering::SeqCst) {
                 supervisor.reconcile();
                 // 转发表只有运行中的、且声明了 query_socket 的插件才该出现；
-                // 每轮整体替换，停止或未声明的插件自然消失。
-                yi_agent_store::ipc::register_plugin_sockets(supervisor.query_sockets());
+                // 每轮整体替换**本项目的分区**，停止或未声明的插件自然消失，
+                // 其他项目的路由不受影响。
+                yi_agent_store::ipc::register_plugin_sockets(&scope, supervisor.query_sockets());
                 std::thread::sleep(RECONCILE_INTERVAL);
             }
             // 已经没有在跑的东西了，也就不该留下任何可转发的路由。
-            yi_agent_store::ipc::clear_plugin_sockets();
+            yi_agent_store::ipc::clear_plugin_sockets(&scope);
             supervisor.stop_all();
         }));
         if outcome.is_err() {
             tracing::error!("plugin supervision loop panicked; plugins are no longer supervised");
             // 表里可能还留着本进程登记过的路由，清掉免得指向死 socket。
-            yi_agent_store::ipc::clear_plugin_sockets();
+            yi_agent_store::ipc::clear_plugin_sockets(&scope);
         }
     });
     SuperviseHandle {
@@ -121,9 +140,12 @@ mod tests {
 
     /// The forwarding table is one process-wide static, and every `serve()` in
     /// this module publishes to it. Running these tests in parallel would let
-    /// one supervisor's round overwrite another's, so they take turns. In
-    /// production there is one daemon per process, so the shared table is not a
-    /// problem there — it is only a test-isolation concern.
+    /// one supervisor's round overwrite another's, so they take turns.
+    ///
+    /// In production several supervisors **do** share the process (the desktop
+    /// app-server hosts one daemon per project), which is exactly why the table
+    /// is partitioned by project: publications from one project cannot reach
+    /// another's routes. The lock here only isolates assertions.
     static TABLE: Mutex<()> = Mutex::new(());
 
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
@@ -181,20 +203,25 @@ mod tests {
         false
     }
 
+    /// 本项目在转发表里的分区 key：与 `serve` 发布时用的是同一个值。
+    fn scope_of(workdir: &Path) -> PathBuf {
+        Layout::for_workdir(workdir).runtime_dir
+    }
+
     /// 清掉可能由别的测试留下的路由，让断言只反映本次监督。
-    fn clear_table() {
-        yi_agent_store::ipc::clear_plugin_sockets();
+    fn clear_table(workdir: &Path) {
+        yi_agent_store::ipc::clear_plugin_sockets(&scope_of(workdir));
     }
 
     #[test]
     fn a_served_project_starts_its_switched_on_child() {
         let _guard = exclusive();
-        clear_table();
         let dir = tempfile::tempdir().unwrap();
+        clear_table(dir.path());
         let marker = dir.path().join("child.pid");
         armed_project(dir.path(), &marker);
 
-        let handle = serve(dir.path());
+        let handle = serve(dir.path(), &scope_of(dir.path()));
         assert!(handle.is_supervising());
         assert!(
             wait_for(&marker, Duration::from_secs(3)),
@@ -206,24 +233,24 @@ mod tests {
     #[test]
     fn stopping_clears_the_forwarding_table() {
         let _guard = exclusive();
-        clear_table();
         let dir = tempfile::tempdir().unwrap();
+        clear_table(dir.path());
         let marker = dir.path().join("child.pid");
         armed_project(dir.path(), &marker);
 
-        let handle = serve(dir.path());
+        let handle = serve(dir.path(), &scope_of(dir.path()));
         assert!(wait_for(&marker, Duration::from_secs(3)));
         // 运行中：清单声明了 query_socket 且进程在跑，路由必须出现。
         // （先证明"表里本来有东西"，否则"停后被清空"是句空话。）
         let registered = {
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline {
-                if yi_agent_store::ipc::plugin_socket_for("demo").is_some() {
+                if yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_some() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            yi_agent_store::ipc::plugin_socket_for("demo")
+            yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo")
         };
         assert!(
             registered.is_some(),
@@ -234,7 +261,7 @@ mod tests {
 
         // 停止后不得留下任何可转发的路由：否则请求会打到已死的 socket。
         assert!(
-            yi_agent_store::ipc::plugin_socket_for("demo").is_none(),
+            yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_none(),
             "the table must be empty after the supervisor stops"
         );
     }
@@ -242,8 +269,8 @@ mod tests {
     #[test]
     fn an_idle_handle_does_not_supervise() {
         let _guard = exclusive();
-        clear_table();
         let dir = tempfile::tempdir().unwrap();
+        clear_table(dir.path());
         let marker = dir.path().join("child.pid");
         armed_project(dir.path(), &marker);
 
@@ -263,13 +290,13 @@ mod tests {
     #[test]
     fn the_rule_supervises_only_what_this_process_started() {
         let _guard = exclusive();
-        clear_table();
         let owned_dir = tempfile::tempdir().unwrap();
+        clear_table(owned_dir.path());
         let owned_marker = owned_dir.path().join("child.pid");
         armed_project(owned_dir.path(), &owned_marker);
 
         // 我起的 daemon → 我监督，子进程起来。
-        let owned = for_daemon_ownership(owned_dir.path(), true);
+        let owned = for_daemon_ownership(owned_dir.path(), &scope_of(owned_dir.path()), true);
         assert!(owned.is_supervising());
         assert!(
             wait_for(&owned_marker, Duration::from_secs(3)),
@@ -278,11 +305,13 @@ mod tests {
         owned.stop();
 
         let borrowed_dir = tempfile::tempdir().unwrap();
+        clear_table(borrowed_dir.path());
         let borrowed_marker = borrowed_dir.path().join("child.pid");
         armed_project(borrowed_dir.path(), &borrowed_marker);
 
         // 借用的 daemon → 不监督，什么也不起（监督者应是那个真正拥有 daemon 的进程）。
-        let borrowed = for_daemon_ownership(borrowed_dir.path(), false);
+        let borrowed =
+            for_daemon_ownership(borrowed_dir.path(), &scope_of(borrowed_dir.path()), false);
         assert!(!borrowed.is_supervising());
         std::thread::sleep(Duration::from_millis(200));
         assert!(
@@ -295,24 +324,24 @@ mod tests {
     #[test]
     fn dropping_the_handle_stops_supervision() {
         let _guard = exclusive();
-        clear_table();
         let dir = tempfile::tempdir().unwrap();
+        clear_table(dir.path());
         let marker = dir.path().join("child.pid");
         armed_project(dir.path(), &marker);
 
         {
-            let handle = serve(dir.path());
+            let handle = serve(dir.path(), &scope_of(dir.path()));
             assert!(wait_for(&marker, Duration::from_secs(3)));
             // 路由在每轮对账末尾登记，与子进程写 marker 有竞态，所以轮询等它出现，
             // 而不是假定"子进程一起来路由就到"。
             let deadline = Instant::now() + Duration::from_secs(3);
             while Instant::now() < deadline
-                && yi_agent_store::ipc::plugin_socket_for("demo").is_none()
+                && yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_none()
             {
                 std::thread::sleep(Duration::from_millis(20));
             }
             assert!(
-                yi_agent_store::ipc::plugin_socket_for("demo").is_some(),
+                yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_some(),
                 "the route should be registered while the supervisor runs"
             );
             drop(handle); // 不调用 stop()，只靠 Drop
@@ -320,7 +349,7 @@ mod tests {
 
         // Drop 之后转发表必须已被清空：生命周期不依赖调用点的纪律。
         assert!(
-            yi_agent_store::ipc::plugin_socket_for("demo").is_none(),
+            yi_agent_store::ipc::plugin_socket_for(&scope_of(dir.path()), "demo").is_none(),
             "dropping the handle must clear the forwarding table"
         );
     }
@@ -328,13 +357,64 @@ mod tests {
     #[test]
     fn a_project_without_manifests_is_harmless() {
         let _guard = exclusive();
-        clear_table();
         let dir = tempfile::tempdir().unwrap();
+        clear_table(dir.path());
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
 
-        let handle = serve(dir.path());
+        let handle = serve(dir.path(), &scope_of(dir.path()));
         assert!(handle.is_supervising());
         std::thread::sleep(Duration::from_millis(150));
         handle.stop();
+    }
+
+    /// 真实故障场景的回归：一个进程同时监督多个项目。
+    ///
+    /// 桌面 app-server 会为它碰过的每个项目起一个 daemon 和一个监督线程，而
+    /// 只有装了插件的那个项目有清单，其余项目每 500ms 发布一次空表。这些空表
+    /// 曾是**全局**替换，把看板的路由反复抹掉，于是查询在"能读到"和"插件未
+    /// 运行"之间抖动。
+    ///
+    /// 这里让两个项目真正并发跑满多轮：有插件的那个必须自始至终可路由。
+    #[test]
+    fn a_bare_project_supervising_beside_a_plugin_project_keeps_the_route() {
+        let _guard = exclusive();
+        let plugin_project = tempfile::tempdir().unwrap();
+        let bare_project = tempfile::tempdir().unwrap();
+        clear_table(plugin_project.path());
+        clear_table(bare_project.path());
+
+        let marker = plugin_project.path().join("child.pid");
+        armed_project(plugin_project.path(), &marker);
+        // 没有 `.yi-agent/supervisors`：与桌面端那些从未装过插件的项目一致。
+        std::fs::create_dir_all(bare_project.path().join(".yi-agent")).unwrap();
+
+        let plugin_scope = scope_of(plugin_project.path());
+        let with_plugin = serve(plugin_project.path(), &plugin_scope);
+        let bare = serve(bare_project.path(), &scope_of(bare_project.path()));
+
+        // 等到路由出现，然后跨过好几个对账周期持续观察：只要有任意一拍被
+        // 抹掉，就说明空表仍然在越权清别人的分区。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline
+            && yi_agent_store::ipc::plugin_socket_for(&plugin_scope, "demo").is_none()
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            yi_agent_store::ipc::plugin_socket_for(&plugin_scope, "demo").is_some(),
+            "the plugin project must be routable"
+        );
+
+        let watched = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < watched {
+            assert!(
+                yi_agent_store::ipc::plugin_socket_for(&plugin_scope, "demo").is_some(),
+                "a neighbouring project's empty reconcile must not erase this route"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        bare.stop();
+        with_plugin.stop();
     }
 }
