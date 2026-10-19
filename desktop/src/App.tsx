@@ -2299,6 +2299,8 @@ export default function App() {
                 : undefined
             }
             usage={current?.session.usage ?? null}
+            // 切换会话时数字直接跳终值，不从上一个会话滚过来。
+            usageId={sess.currentId}
             /*
              * 右侧详情栏（子 agent + Git Diff）的**常驻**入口：收起动作够不着的
              * 地方必须留一条回去的路，否则收起就成了单向操作。常驻图标在收起后
