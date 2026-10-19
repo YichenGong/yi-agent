@@ -98,10 +98,25 @@ echo "$pass passed"
 chmod +x scripts/test_check_secrets.sh
 ```
 
+在上述 7 个基础用例后补充 11 个独立断言，使自测共 18 项：
+
+```bash
+# 1: 已知/合成 session 命中；2: session=<session_id> 示例放行。
+# 3: relay.example.com 放行；4: URL 百分号编码的 relay.example.com 放行。
+# 5: relay.other.example 命中；6: relay.example.com.evil 命中。
+# 7: ssh -n -o BatchMode=yes root@198.51.101.7 命中。
+# 8: ssh -n -o BatchMode=yes root@198.51.100.7 放行（RFC 5737）。
+# 9: lsof -nP -iTCP | grep 198.51.101.8 命中。
+# 10: lsof -nP -iTCP | grep 198.51.100.8 放行（RFC 5737）。
+# 11: 同一诊断行同时含 RFC 地址和公网地址仍命中。
+```
+
+每项使用隔离临时仓库、跟踪夹具文件，并通过既有 `check <name> <expected_exit> <actual_exit>` helper 断言真实退出码；不得启用 `set -e`。
+
 - [ ] **Step 2: 跑自测，确认它失败**
 
 Run: `bash scripts/test_check_secrets.sh`
-Expected: FAIL —— 首行输出 `FAIL: /…/scripts/check-secrets.sh not executable`（被测脚本还不存在），退出码 1。
+Expected: FAIL —— 被测脚本还不存在时先报告不可执行；新增结构边界自测必须在实现前呈现至少一个规则缺口。
 
 - [ ] **Step 3: 写最小实现**
 
@@ -175,6 +190,9 @@ fi
 echo "secret-check passed"
 ```
 
+规则必须同时实现：known leaked session 字面值；`session=` 后 32 个大小写不敏感十六进制字符；拦截非示例 `relay.*` 并精确放行 `relay.example.com`（包括 URL 中 `%3A` / `%2E` 分隔符语境，但不放行 `relay.example.com.evil`）；扫描 `ssh … root@IPv4`（含 `-n`、`-o` 参数）及 `lsof … | grep IPv4` 行。仅放行 RFC 5737 三个示例网段，不得因同一行有 RFC 地址而漏掉该行另一个公网 IP。扫描失败返回 `2`、发现命中返回 `1`、无命中返回 `0`；保留 tracked-only、仓库根扫描和 fail-closed 守卫。
+
+
 再让它可执行：
 
 ```bash
@@ -184,7 +202,7 @@ chmod +x scripts/check-secrets.sh
 - [ ] **Step 4: 跑自测，确认它通过**
 
 Run: `bash scripts/test_check_secrets.sh`
-Expected: PASS —— 输出 4 个 `ok - …` 与最后的 `4 passed`，退出码 0。
+Expected: PASS —— 18 个 `ok - …` 与最后的 `18 passed`，退出码 0。
 
 - [ ] **Step 5: 在当前仓库上跑一次，确认它现在**红**（这是 TDD 的红：真凭据还在）**
 
@@ -436,7 +454,7 @@ git commit -m "docs: 记录中继 session 轮换（不含值）"
 
 ## 收尾：合并前的验证清单
 
-- [ ] `bash scripts/test_check_secrets.sh` → 4 passed
+- [ ] `bash scripts/test_check_secrets.sh` → 18 passed
 - [ ] `bash scripts/check-secrets.sh` → passed（exit 0）
 - [ ] `git grep` 三次（session / IP / 域名）在跟踪文件零命中
 - [ ] `cd yi-agent-rs && just --dry-run ci` 输出含 `check-secrets.sh`
