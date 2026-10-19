@@ -4,6 +4,7 @@ import {
   importEnvModel,
   isModelNotFound,
   listModels,
+  looksMissingV1,
   setDefaultModel,
   setSubagentModel,
   probeModel,
@@ -66,8 +67,9 @@ const FOLLOW_GLOBAL = "";
  * 含 `/v1` 前缀（如 `/openai/v1`）即视为无虞，无法判断的（如 `/api`）宁可少提示。
  */
 function suspectsMissingV1(entry: ModelEntryView): boolean {
-  if (entry.provider !== "openai") return false;
-  return !entry.api_url.trimEnd().replace(/\/+$/, "").endsWith("/v1");
+  // 清单条目要求 api_url 非空（`model/upsert` 拒绝空串），所以这里的空白
+  // 分支在生产中不可达；保留它只是让共享函数对两种入口都安全。
+  return looksMissingV1(entry.provider, entry.api_url);
 }
 
 /** 把写失败翻成一句给人看的话；「模型不存在」单列，因为它对应的是「被删了」。 */

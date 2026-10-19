@@ -256,3 +256,21 @@ export function isModelNotFound(error: unknown): boolean {
   const text = error instanceof Error ? error.message : String(error ?? "");
   return text.includes("model_not_found");
 }
+
+/**
+ * OpenAI 兼容接口的地址通常以 `/v1` 结尾。
+ *
+ * 只做启发式提醒，不下硬结论：`/openai/v1` 这类带前缀的地址同样满足，
+ * 因此判定用「去尾部空白与斜杠后是否以 `/v1` 结尾」，而不是「路径里含 /v1」。
+ * 写错的后果是 404，而宿主会把它翻成「模型标识不被该地址接受」——这条
+ * 提示会误导用户去改模型名，所以必须在保存前提醒。
+ *
+ * 空白 url **不**提示：它的语义是"用 provider 默认地址"（落盘时补
+ * `https://api.openai.com/v1`），报警告只会制造噪音。
+ */
+export function looksMissingV1(provider: string, apiUrl: string): boolean {
+  if (provider !== "openai") return false;
+  const trimmed = apiUrl.trim();
+  if (trimmed === "") return false;
+  return !trimmed.replace(/\/+$/, "").endsWith("/v1");
+}

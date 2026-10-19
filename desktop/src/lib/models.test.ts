@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   deleteModel,
+  looksMissingV1,
   importEnvModel,
   isModelNotFound,
   listModels,
@@ -246,5 +247,29 @@ describe("isModelNotFound", () => {
 
   it("also recognises the textual fallback", () => {
     expect(isModelNotFound(new Error("model_not_found: nope"))).toBe(true);
+  });
+});
+
+describe("looksMissingV1", () => {
+  it("flags an openai-compatible url without a /v1 suffix", () => {
+    expect(looksMissingV1("openai", "https://api.example.com")).toBe(true);
+    expect(looksMissingV1("openai", "https://api.example.com/openai")).toBe(true);
+  });
+
+  it("accepts a url that ends with /v1, with or without a trailing slash", () => {
+    expect(looksMissingV1("openai", "https://api.example.com/v1")).toBe(false);
+    expect(looksMissingV1("openai", "https://api.example.com/v1/")).toBe(false);
+    expect(looksMissingV1("openai", "  https://api.example.com/v1  ")).toBe(false);
+  });
+
+  // 空白 url 的语义是「用 provider 默认地址」（`import_settings_into_catalog`
+  // 会补 `https://api.openai.com/v1`）。对它报警告是纯噪音：用户什么都没写错。
+  it("stays silent on a blank url, which means the provider default", () => {
+    expect(looksMissingV1("openai", "")).toBe(false);
+    expect(looksMissingV1("openai", "   ")).toBe(false);
+  });
+
+  it("never flags a non-openai provider", () => {
+    expect(looksMissingV1("anthropic", "https://api.anthropic.com")).toBe(false);
   });
 });
