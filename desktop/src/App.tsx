@@ -68,6 +68,7 @@ import {
   type ThreadMode,
 } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
+import { configReadParams } from "./lib/configRequest";
 import { estimateCost, formatCost } from "./lib/pricing";
 import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -1575,7 +1576,11 @@ export default function App() {
         break;
       case "config":
         try {
-          const cfg = await c.request<Record<string, unknown>>("config/read", {});
+          // 传当前会话 id：进程级快照的 workdir/model/provider 与会话无关。
+          const cfg = await c.request<Record<string, unknown>>(
+            "config/read",
+            configReadParams(id),
+          );
           session.noticeConfig(cfg);
         } catch (e) {
           session.noticeConfig(null, formatError(e));

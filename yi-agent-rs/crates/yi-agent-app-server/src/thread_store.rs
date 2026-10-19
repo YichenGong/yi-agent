@@ -412,6 +412,36 @@ impl ThreadStore {
         Ok(leads.into_iter().next())
     }
 
+    /// 只读一份 meta(不解析 jsonl 历史)。
+    ///
+    /// 与 [`load`](Self::load) 的区别:`load` 会把整份对话日志读进来,而只需要
+    /// meta 字段(如 `config/read` 冷会话的 `model_ref` / `permission_mode`)的
+    /// 调用方不该为此付 O(历史长度) 的代价。
+    pub fn read_meta(&self, id: &str) -> io::Result<Option<ThreadMeta>> {
+        if !valid_id(id) {
+            return Err(invalid_id(id));
+        }
+        let _guard = self
+            .meta_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let raw = match std::fs::read_to_string(self.meta_path(id)) {
+            Ok(text) => text,
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                eprintln!("[app-server] failed to read thread meta ({id}): {e}");
+                return Ok(None);
+            }
+        };
+        match serde_json::from_str::<ThreadMeta>(&raw) {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) => {
+                eprintln!("[app-server] skipping unreadable thread meta ({id}): {e}");
+                Ok(None)
+            }
+        }
+    }
+
     /// 在 store 锁内对 meta 做读-改-写。`Ok(None)` 表示 thread 不存在或 meta 不可读。
     ///
     /// 锁保证 `touch`(driver)与 `rename`(请求循环)不会互相覆盖对方的改动。
@@ -1155,6 +1185,26 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = ThreadStore::new(&dir.path().join("does-not-exist"));
         assert!(s.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_meta_returns_the_meta_without_parsing_the_log() {
+        let (_dir, s) = store();
+        s.create(&meta("thread-a")).unwrap();
+        s.set_model("thread-a", Some("Session Only"), "deepseek-x")
+            .unwrap();
+        s.set_permission_mode("thread-a", ThreadMode::Yolo).unwrap();
+
+        let read = s.read_meta("thread-a").unwrap().expect("meta must exist");
+        assert_eq!(read.model_ref.as_deref(), Some("Session Only"));
+        assert_eq!(read.model, "deepseek-x");
+        assert_eq!(read.permission_mode, ThreadMode::Yolo);
+
+        assert!(s.read_meta("thread-missing").unwrap().is_none());
+        assert!(
+            s.read_meta("../escape").is_err(),
+            "invalid ids must not touch the fs"
+        );
     }
 
     #[test]

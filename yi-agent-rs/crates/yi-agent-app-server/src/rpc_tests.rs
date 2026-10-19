@@ -3359,6 +3359,147 @@ async fn config_read_returns_redacted_view() {
     h.shutdown().await;
 }
 
+/// `/config` 是「当前会话的配置」，不是 sidecar 进程启动时的快照。
+///
+/// 桌面端一个 sidecar 服务多个会话：每个会话有自己的 cwd、模型覆盖与权限档。
+/// 用进程快照（workdir = sidecar 启动目录、model = 清单默认、yolo = 启动 flag）
+/// 回答 `/config`，会在卡片里摊出用户没选过的 provider / 模型 / 工作目录。
+#[tokio::test(flavor = "multi_thread")]
+async fn config_read_with_thread_id_reports_that_session_config() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = dir.path().canonicalize().unwrap();
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(
+        &serde_json::json!({"jsonrpc":"2.0","id":2,"method":"thread/start",
+            "params":{"cwd": cwd.to_string_lossy()}})
+        .to_string(),
+    )
+    .await;
+    let started = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    let thread_id = started["result"]["thread_id"]
+        .as_str()
+        .expect("thread/start must return a thread id")
+        .to_string();
+
+    h.send(
+        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"config/read",
+            "params":{"threadId": thread_id}})
+        .to_string(),
+    )
+    .await;
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(3)))
+        .await;
+    assert_eq!(
+        v["result"]["workdir"],
+        serde_json::json!(cwd.to_string_lossy()),
+        "workdir must be the session's cwd, not the sidecar's startup cwd: {v}"
+    );
+    assert_eq!(
+        v["result"]["model"],
+        serde_json::json!(crate::test_support::TEST_MODEL),
+        "model must be the session's effective model: {v}"
+    );
+    assert_eq!(
+        v["result"]["yolo"],
+        serde_json::json!(false),
+        "yolo must be the session's permission mode: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// 换了会话模型后，卡片必须跟着换 —— 这是用户最初看到的错误：
+/// 会话跑 HORIZON-DeepSeek，卡片却报进程默认的 claude-sonnet-4。
+#[tokio::test(flavor = "multi_thread")]
+async fn config_read_follows_the_session_model_override() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"model/upsert","params":{"name":"Session Only","provider":"openai","api_url":"https://llm.example/v1","model":"deepseek-x","api_key":"sk-secret-1234"}}"#,
+    )
+    .await;
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    assert_eq!(v["result"]["ok"], true, "upsert must land: {v}");
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/start","params":{}}"#)
+        .await;
+    let started = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(3)))
+        .await;
+    let thread_id = started["result"]["thread_id"]
+        .as_str()
+        .expect("thread/start must return a thread id")
+        .to_string();
+
+    // 运行期切到该条目：这是用户真正会做的动作（模型选择器）。
+    h.send(
+        &serde_json::json!({"jsonrpc":"2.0","id":4,"method":"thread/setModel",
+            "params":{"threadId": thread_id, "name":"Session Only"}})
+        .to_string(),
+    )
+    .await;
+    let switched = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(4)))
+        .await;
+    assert_eq!(
+        switched["result"]["model"], "deepseek-x",
+        "the session must actually run the override: {switched}"
+    );
+
+    h.send(
+        &serde_json::json!({"jsonrpc":"2.0","id":5,"method":"config/read",
+            "params":{"threadId": thread_id}})
+        .to_string(),
+    )
+    .await;
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(5)))
+        .await;
+    assert_eq!(
+        v["result"]["model"], "deepseek-x",
+        "card must show the session model: {v}"
+    );
+    assert_eq!(
+        v["result"]["provider"], "openai",
+        "card must show the session provider: {v}"
+    );
+    assert_eq!(
+        v["result"]["api_url"], "https://llm.example/v1",
+        "card must show the session endpoint: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// 未知 `threadId` 必须显式报错，绝不静默回退成进程快照。
+#[tokio::test(flavor = "multi_thread")]
+async fn config_read_rejects_an_unknown_thread_instead_of_the_process_snapshot() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(
+        &serde_json::json!({"jsonrpc":"2.0","id":2,"method":"config/read",
+            "params":{"threadId":"thread-does-not-exist"}})
+        .to_string(),
+    )
+    .await;
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    assert!(
+        v.get("error").is_some(),
+        "unknown thread must be an error: {v}"
+    );
+    assert!(
+        v.get("result").is_none(),
+        "must not answer with the process snapshot: {v}"
+    );
+    h.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_add_list_remove_round_trip() {
     let dir = tempfile::TempDir::new().unwrap();

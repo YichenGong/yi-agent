@@ -433,19 +433,39 @@ impl RuntimeConfig {
     }
 
     /// 返回给 GUI 的安全配置视图:api_key 脱敏,其余字段原样。
+    ///
+    /// 这是**进程启动时**的配置快照。桌面端一个 app-server 服务多个会话,每个
+    /// 会话各有 cwd / 模型覆盖 / 权限档,故按会话展示时必须走
+    /// [`redacted_view_for_session`](Self::redacted_view_for_session),否则卡片
+    /// 会摊出用户没选过的 provider / 模型 / 工作目录。
     pub fn redacted_view(&self) -> serde_json::Value {
+        self.redacted_view_for_session(&self.workdir, &self.model, self.yolo)
+    }
+
+    /// 与 [`redacted_view`](Self::redacted_view) 同一形状,但三处按**会话**覆盖:
+    /// `workdir` / `model` / `yolo`。
+    ///
+    /// `provider` / `api_url` / `api_key` / `compact_threshold` 仍取自 `self`:
+    /// 调用方应先用 [`models::resolve_effective`](crate::models::resolve_effective)
+    /// 把本会话的模型覆盖解析进来,再调用本方法。
+    pub fn redacted_view_for_session(
+        &self,
+        workdir: &std::path::Path,
+        model: &str,
+        yolo: bool,
+    ) -> serde_json::Value {
         serde_json::json!({
             "provider": self.provider,
             "api_url": self.api_url,
             "api_key": if self.api_key.is_empty() { "" } else { "***" },
-            "model": self.model,
+            "model": model,
             "max_turns": self.max_turns,
             "max_resident_subagents": self.max_resident_subagents,
             "max_direct_children": self.max_direct_children,
-            "workdir": self.workdir.display().to_string(),
+            "workdir": workdir.display().to_string(),
             "sandbox": format!("{:?}", self.sandbox),
             "sandbox_promotable": self.sandbox_promotable,
-            "yolo": self.yolo,
+            "yolo": yolo,
             "compact_threshold": self.compact_threshold,
         })
     }

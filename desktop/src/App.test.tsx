@@ -913,6 +913,10 @@ describe("App slash commands", () => {
     await screen.findByTestId("config-card");
     expect(screen.getByText("当前配置")).toBeTruthy();
     expect(screen.getByText("workspace-write")).toBeTruthy();
+    // 读的是**当前会话**的生效配置，不是 sidecar 进程启动时的快照：
+    // 进程快照的 workdir/model/provider 与用户正在用的会话无关。
+    const read = clients[0].requests.find((r) => r.method === "config/read");
+    expect(read?.params).toEqual({ threadId: "t1" });
     expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
   });
 
