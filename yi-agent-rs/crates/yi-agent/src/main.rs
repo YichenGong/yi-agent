@@ -1210,7 +1210,9 @@ fn run_agent(cli: Cli) -> Result<()> {
     let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
     // 一台既没有配置、也拿不到 key 的机器，给出与 `run_headless` 同一条指引，
     // 而不是加载器那句干巴巴的 "API key required"。
-    if let Some(line) = unconfigured_guidance(!config.api_key.trim().is_empty()) {
+    if let Some(line) =
+        unconfigured_guidance(!config.api_key.trim().is_empty() && !config.model.trim().is_empty())
+    {
         eprintln!("{line}");
         std::process::exit(1);
     }
@@ -1545,8 +1547,8 @@ pub(crate) fn unconfigured_guidance(configured: bool) -> Option<String> {
         None
     } else {
         Some(
-            "尚未配置模型：请运行 `yi-agent` 完成初始化，或设置 `MODEL_API_KEY` \
-             （如 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`）或使用 `--api-key`。"
+            "尚未配置模型：请运行 `yi-agent` 完成初始化，或在设置中配置模型条目\
+             （也可用 `--provider`/`--model`/`--api-key` 显式指定）。"
                 .to_string(),
         )
     }
@@ -1563,7 +1565,9 @@ fn run_headless(
     subagents: bool,
 ) -> Result<()> {
     let config = config::load_lenient(&cli)?;
-    if let Some(line) = unconfigured_guidance(!config.api_key.trim().is_empty()) {
+    if let Some(line) =
+        unconfigured_guidance(!config.api_key.trim().is_empty() && !config.model.trim().is_empty())
+    {
         eprintln!("{line}");
         std::process::exit(1);
     }
@@ -2537,9 +2541,12 @@ mod tests {
         let strict = ["config::load(", "&cli)"].concat();
         let catalog = ["models::load_catalog", "()"].concat();
         let resolve = ["models::resolve_effective(&config, &catalog", ", None)"].concat();
-        let guide = [
-            "unconfigured_guidance(",
-            "!config.api_key.trim().is_empty())",
+        // 判据被 rustfmt 折行，故分成两条 needle：调用存在 + 条件同时要求
+        // key 与 model 非空。少任何一项，CI 都会在这里失败。
+        let guide_call = ["unconfigured_guidance", "("].concat();
+        let guide_condition = [
+            "!config.api_key.trim().is_empty()",
+            " && !config.model.trim().is_empty()",
         ]
         .concat();
         let offer_at = body.find(&offer).expect("run_agent must offer onboarding");
@@ -2566,8 +2573,9 @@ mod tests {
             "the catalog must be loaded before resolve_effective consumes it"
         );
         assert!(
-            body.contains(&guide),
-            "a machine with neither a key nor a catalog entry must get the guidance line"
+            body.contains(&guide_call) && body.contains(&guide_condition),
+            "a machine with neither a key nor a catalog entry must get the guidance line, \
+             and the check must require a non-empty model as well as a key"
         );
         assert!(
             body.contains(&global),
@@ -2592,7 +2600,9 @@ mod tests {
     fn guidance_is_returned_when_the_env_has_no_model() {
         let line = unconfigured_guidance(false).expect("must report an unconfigured machine");
         assert!(line.contains("尚未配置模型"), "got {line}");
-        assert!(line.contains("ANTHROPIC_API_KEY"), "got {line}");
+        // 文案必须点名"模型"，否则用户会以为只要填了 key 就能用——那正是
+        // 本次修复前的隐式假设。
+        assert!(line.contains("模型条目"), "got {line}");
     }
 
     #[test]

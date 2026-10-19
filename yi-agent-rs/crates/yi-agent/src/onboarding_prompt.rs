@@ -62,17 +62,23 @@ pub(crate) fn run_onboarding_prompt(models_path: &Path, prefs_path: &Path) -> Re
         println!("请输入 anthropic 或 openai。");
     };
 
-    let (default_url, default_model) = provider_defaults(&provider);
+    // 只取 URL 默认值。model 仍由 `provider_defaults` 提供(那个函数与既有测试
+    // 保持不动),但**不再**作为输入默认值——它是一个没被确认过的猜测。
+    let (default_url, _default_model) = provider_defaults(&provider);
     let api_key = read_line("API 密钥: ")?;
     if api_key.is_empty() {
         println!("未填密钥，稍后可在设置里补。");
         onboarding::save_dismissed(prefs_path, true)?;
         return Ok(());
     }
-    let model = read_line_or(
-        &format!("模型标识（默认 {default_model}）: "),
-        default_model,
-    )?;
+    let model = loop {
+        let value = read_line("模型标识: ")?;
+        if value.is_empty() {
+            println!("模型标识不能为空（例如 claude-sonnet-4-20250514 或 gpt-4o）。");
+            continue;
+        }
+        break value;
+    };
     let api_url = read_line_or(&format!("API 地址（默认 {default_url}）: "), default_url)?;
 
     let settings = ModelSettings {
@@ -87,25 +93,20 @@ pub(crate) fn run_onboarding_prompt(models_path: &Path, prefs_path: &Path) -> Re
         return Ok(());
     }
 
-    let test = read_line_or("是否测试连接？[Y/n]（默认 Y）: ", "y")?;
-    if !test.eq_ignore_ascii_case("n") {
-        println!("正在测试连接…");
-        let runtime = tokio::runtime::Runtime::new()?;
-        match runtime.block_on(onboarding::test_connection(&settings)) {
-            outcome if outcome.ok => println!("连接正常。"),
-            outcome => {
-                let reason = outcome.reason.unwrap_or_else(|| "未知原因".into());
-                let save = read_line_or(
-                    &format!("连接失败：{reason}。仍然保存？[Y/n]（默认 Y）: "),
-                    "y",
-                )?;
-                if save.eq_ignore_ascii_case("n") {
-                    onboarding::save_dismissed(prefs_path, true)?;
-                    return Ok(());
-                }
-            }
-        }
+    // 连接测试不可跳过：没验证过的配置落盘，只会在第一次对话时变成
+    // 一个难懂的错误，而子 agent 还会继承这组错误配置。
+    println!("正在测试连接…");
+    let runtime = tokio::runtime::Runtime::new()?;
+    let outcome = runtime.block_on(onboarding::test_connection(&settings));
+    if !outcome.ok {
+        let reason = outcome.reason.unwrap_or_else(|| "未知原因".into());
+        println!("连接失败：{reason}");
+        println!("没有保存任何配置。请检查密钥、地址与模型标识后重新运行。");
+        // 注意:**不**写 `save_dismissed`。写了它,下次启动 `should_offer` 直接
+        // 返回 false,用户再也见不到引导,只能自己找到设置页——这正是要避免的死角。
+        return Ok(());
     }
+    println!("连接正常。");
 
     let name = onboarding::import_settings_into_catalog(models_path, &settings)
         .map_err(|error| anyhow::anyhow!("{error}"))?;
