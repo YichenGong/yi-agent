@@ -423,16 +423,18 @@ G1（`2026-10-17-session-driver-decoupling-design.md`）把宿主里的看板**�
    >
    > | 落点 | 行数 | 性质 | 为什么不能消掉 |
    > |---|---|---|---|
-   > | `legacy_compat.rs` | 10 | 旧格式解析 | `boards.json` 的形状、旧目录 `$HOME/.yi-agent/superpowers-kanban`、迁移写入的 `required_by` 值。全部集中在这一个模块，宿主别处不再拼这些字符串 |
-   > | `server.rs:1949,1972` | 2 | 迁移调用点 | 只引用上面的常量／函数，不自己持有字面量 |
+   > | `legacy_compat.rs` | 13 | 旧格式解析 | `boards.json` 的形状、旧目录 `$HOME/.yi-agent/superpowers-kanban`、迁移写入的 `required_by` 值。全部集中在这一个模块，宿主别处不再拼这些字符串（行号 20,28,39,40,44,48,53,54,59,60,88,91,95） |
+   > | `server.rs:2041,2064` | 2 | 迁移调用点 | 只引用上面的常量／函数，不自己持有字面量 |
    > | `settings_store.rs:101` | 1 | 旧偏好键 | 老机器上写下的「关掉登录自启」必须仍生效（§6.8） |
    > | `thread_store.rs:58` | 1 | 旧 meta 键别名 | G1 遗留的兼容读，spec 原文已允许 |
    > | `watchman.rs:22` | 1 | 旧 launchd 标签 | 不清理会在老机器上同时跑两个值守 |
    > | `plugin_worktree.rs:39` | 1 | 插件 worktree 命名空间 | §5.2 方案 (a)：纯路径判据要认出「这是插件划的领地」，宿主必须知道保留名；真机已有 9 例幽灵组长 |
-   > | `tui/superpowers_kanban.rs` | 19 | 用户可见命令 `/superpowers-kanban` 与其文案 | §5.6 明确允许「保留为提示」；改名等于改用户可见行为（§6.9） |
+   > | `tui/superpowers_kanban.rs` | 19 | 用户可见命令 `/superpowers-kanban` + 薄转发层 + 文案 | §5.6 明确允许「保留为提示」；这里的 19 行既有命令名与文案，也有 `render_board` 与 `on\|off\|run\|add\|promote` 的动词分发——它们是**薄转发层**，内部走通用插件通道，不是宿主在实现看板语义。改名/删命令等于改用户可见行为（§6.9） |
    > | `tui/slash.rs` | 8 | 同上（命令注册与 `kanban` 过渡别名） | 同上 |
    > | `tui/app.rs` | 4 | 同上（分发与更名提示） | 同上 |
    > | `tui/mod.rs:18` | 1 | 模块名 | 与上面的命令同源 |
+   >
+   > 合计 **51**（13+2+1+1+1+1+19+8+4+1），与脚本实测一致。
    >
    > **判定标准**：宿主是否**理解**看板语义。它不再理解——建/删走 `plugin/query`，
    > 列举走 `resident/list`，装插件走 `plugin/install`，且 `plugin/install` 里没有
