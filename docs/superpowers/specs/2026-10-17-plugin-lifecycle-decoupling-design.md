@@ -158,7 +158,7 @@ daemon / 拉起插件」这件事**没有随之通用化。
 | D7 | 桌面 | `superpowersKanbanBoards.ts` 改调 `plugin/query`（`plugin: "superpowers-kanban"`） |
 | D8 | 迁移 | 旧 `boards.json` 首次运行时一次性导入 `resident` 登记，随后只读新源 |
 | D9 | crate 归宿 | `yi-agent-boards` 中通用部分（watch / launchd / daemon 生命周期）迁入 `yi-agent-supervisors`；看板专属部分删除 |
-| D10 | 建盘引导 | 见 §4.4（**待用户裁定**） |
+| D10 | 建盘引导 | 见 §4.4（**已裁定 A**：宿主通用 `plugin/install` + 开开关；B/C 被 §6.9 与安装方式排除） |
 | D11 | 错误码 | 宿主 `board_query` 一族码名去看板化：**删除 `board_not_created` 整支**（§5.2 摘掉门控后宿主不再有「这个项目没有看板」这个回答），其余码名本已通用、数值码不动；桌面端相应删掉「未创建」这支错误展示与面板内「创建看板」按钮，创建入口保留侧栏右键菜单 |
 
 ## 4. 架构与数据流
@@ -177,12 +177,14 @@ daemon / 拉起插件」这件事**没有随之通用化。
 
 | 旧 | 新 |
 |---|---|
-| 桌面 `board/create {project}` → 宿主 `lifecycle::create_with_project` | 桌面 `plugin/query {plugin:"superpowers-kanban", method:"lifecycle/create", params:{project}}` → 插件：建自己的状态目录 + 写自己的清单 + `resident::require(project, "superpowers-kanban")` |
+| 桌面 `board/create {project}` → 宿主 `lifecycle::create_with_project` | 桌面先发**通用** `plugin/install {project, plugin}`（宿主：写清单 + 开开关 + 起 daemon，见 §4.4），再发 `plugin/query {plugin:"superpowers-kanban", method:"lifecycle/create", params:{project}}` → 插件：建自己的状态目录 + `resident::require(project, "superpowers-kanban")` |
 | 桌面 `board/remove {project}` | 同上，`lifecycle/remove` → 插件：停 daemon、删状态目录、`resident::release` |
 | 桌面 `board/list` → 宿主读 `boards.json` | 桌面调**通用** `resident/list`（宿主通用 RPC，回已登记项目），不再有看板专属列举 |
 
-关键点：**建/删看板 = 插件的事**（它要建自己的状态目录、写自己的清单）；
-宿主只提供通用的「登记一个项目需要常驻 daemon」与「转发一条插件方法」。
+关键点：**建/删看板 = 插件的事**（它要建/删自己的状态目录）；
+**装插件 = 宿主的通用能力**（它要在插件被拉起之前把清单和开关写好，见 §4.4）；
+宿主只提供通用的「装一个插件进一个项目」「登记一个项目需要常驻 daemon」
+「转发一条插件方法」，三者都不认识看板。
 
 ### 4.3 一次性迁移
 
@@ -199,7 +201,7 @@ daemon / 拉起插件」这件事**没有随之通用化。
 > 理由：① `store` 不认识看板格式，只接受「已解析出的项目列表」，保持通用；
 > ② 插件侧不认识 `boards.json`（那是宿主的旧格式），且插件不依赖 `yi-agent-*`。
 
-### 4.4 建盘引导：鸡生蛋（**待用户裁定**）
+### 4.4 建盘引导：鸡生蛋（**已裁定：A**）
 
 原 §4.2 让插件「写自己的清单」。但插件要被调用，前提是：清单已就位
 （`<项目>/.yi-agent/supervisors/`）→ daemon 已拾取并拉起插件 → 插件才在自己的
@@ -208,22 +210,53 @@ install_manifest`，其唯一调用者是 `lifecycle::create_with_project`，即
 `board/create`——正是本 spec 要删掉的那条路。于是：
 
 - 若 create 直接改走 `plugin/query`，**全新项目**的 create 必然失败
-  （`plugin_query` 的门控会回 `board_not_created`，即便摘掉门控，也拨不到
-  尚未被拉起的插件 socket）；
+  （即便摘掉门控，也拨不到尚未被拉起的插件 socket）；
 - 验收 §6.9「桌面『新建看板』仍能建」因此不成立。
 
-**裁定提案（待确认）**：
+**裁定：方案 A。** 这不是在三个方案里挑偏好，而是本 spec 自己的约束把 B、C 排除了：
 
-| 方案 | 内容 | 代价 |
-|---|---|---|
-| **A（提案）** | 把「把某个插件装进某个项目」提升为**宿主通用能力**：`yi-agent-supervisors` 新增通用 `install_manifest_for(project, plugin_name, manifest_json)`；宿主新增通用 RPC `plugin/install {project, plugin}`——按 `plugin` 名在 PATH 上解析可执行文件（通用，不再硬编码 `superpowers-kanban`），执行 `<plugin> manifest` 取该插件**自述**的通用清单，写入 `<项目>/.yi-agent/supervisors/<plugin>.json`、打开清单里的 `switch_key`、并确保项目 daemon 在跑。随后桌面再发 `lifecycle/create`。宿主全程不认识看板（清单内容来自插件自述）。 | 插件需新增 `manifest` CLI 动词；宿主新增 1 条通用 RPC；多一跳 |
-| B | create 仍保留**宿主通用半程**（装清单 + 开开关 + 起 daemon），看板专属半程（状态目录 + resident）交插件。清单内容来自插件**随包分发**的 `supervisors/<name>.json`，宿主按 `plugin` 名解析路径。 | 宿主仍需知道「清单文件放哪找」的约定；插件随包文件与项目内清单可能漂移 |
-| C | 只把桌面 create 改成「先 `plugin/install`（通用），再 `plugin/query lifecycle/create`」，其余不动；接受「插件未装则 create 明确失败并提示装插件」 | 行为有一处可见变化（未装插件时不再自动装） |
+| 方案 | 为什么被排除 / 被选 |
+|---|---|
+| **C** | 与验收 §6.9「**与今日行为一致**」直接冲突。今天任何项目一键建板都能成（宿主替它写清单），C 会让未装插件的项目失败。§2 目标 5 也写死「用户可见行为不变」。 |
+| **B** | 在今天的安装方式下**不可实现**：`plugins/superpowers-kanban/INSTALL.md:46` 只把**二进制**装到 `~/.cargo/bin/`，清单留在源码树 `supervisors/superpowers-kanban.json`；已安装的二进制与源码树文件之间没有可推导关系（实测：`include_str!` 未嵌入清单，只有 `driver-protocol.json` 与 `superpowers-kanban.toml` 被嵌入）。要让它成立只能把清单嵌进二进制再吐出来——那就是 A，只是换了传输方式。 |
+| **A（选定）** | 唯一同时满足 §6.9 与「宿主不认识看板」的形态。且它的难点（按插件名通用解析可执行文件）**已经建好**：`app-server/src/server.rs:243` → `plugin_worktree::resolve_plugin_command(name)`；`rpc/mod.rs:119` 也已把 `plugin_command` 记为「§4.4 落地时的接缝，必须保留」。 |
 
-**倾向 A**：它在保持「宿主不认识看板」的同时，把「装插件」这件事本身也通用化，
-且不引入全局插件目录（仍按项目安装），与 D5、§2 非目标一致。
+**A 的落地形状**：
 
-> **未裁定前，Task 4/5 的 create 半程不开工**；Task 1/2/3/6/7 不受影响。
+1. `yi-agent-supervisors` 新增通用 `install_manifest_for(project, plugin_name, manifest_json)`；
+2. 宿主新增通用 RPC `plugin/install {project, plugin}`：按 `plugin` 名在 PATH 上解析
+   可执行文件（不硬编码任何插件名），执行 `<plugin> manifest` 取该插件**自述**的
+   通用清单，写入 `<项目>/.yi-agent/supervisors/<plugin>.json`；
+3. **打开清单里的 `switch_key`**（见下「开关」）；
+4. 确保项目 daemon 在跑（复用 `yi-agent-supervisors::daemon::ensure_running`）；
+5. 桌面 create 改为「先 `plugin/install`，再 `plugin/query lifecycle/create`」。
+
+宿主全程不认识看板：清单内容来自插件自述，宿主只搬字节。
+
+#### 4.4.1 开关（初稿遗漏的一半）
+
+`create_with_project` 当年做了**两件**事，`install_manifest` 只是其一：
+
+```rust
+scaffold::install_manifest(project, plugin_command)?;  // 写清单
+scaffold::enable_switch(project)?;                    // preferences.json: superpowers_kanban = true
+```
+
+第二件在 A/B/C 三个方案里**都没提**，但缺了它行为不等价：
+
+- 开关默认**关**（`superpowers-kanban-core/src/switch.rs:26-31`，测试
+  `both_layers_missing_defaults_to_disabled`）；
+- 插件的推进循环整体被它门控（`runner/src/main.rs:976`：
+  `if !board_switch(...).is_enabled() { sleep; continue; }`）；
+- 新的 `lifecycle_create`（`service.rs:950`）**不写**开关，桌面 `createBoard` 也只发
+  `lifecycle/create`（`setBoardSwitch` 只在用户手动拨动时调用，`App.tsx:844`）。
+
+后果：清单装好、插件也起来了，但队列**永不推进**——直接违反 §6.9 的「队列可推进」。
+
+**处置**：`plugin/install` 在写完清单后，把清单声明的 `switch_key` 写成 `true`（项目层
+`<项目>/.yi-agent/preferences.json`，与宿主 `Supervisor::project_preferences_path()`、
+插件 `project_preferences_path()` 同一个落点）。这一步是 A 的**必要组成部分**，不是
+新方案；它由宿主执行而不是插件，理由与清单相同——插件在开关打开前不会被拉起。
 
 ## 5. 改动明细
 
@@ -297,11 +330,28 @@ install_manifest`，其唯一调用者是 `lifecycle::create_with_project`，即
 ### 5.4 插件
 
 - `dispatch.rs`：新增 `lifecycle/create` / `lifecycle/remove`（与既有 `merge_request` 平行）。
-- 插件获得「写自己的清单 + 登记 resident」的能力（今日由 `yi-agent-boards::scaffold`/
-  `lifecycle` 代劳）。
+- 插件获得「建/删自己的状态目录 + 登记 resident」的能力（今日由 `yi-agent-boards::lifecycle`
+  代劳）。**清单不归插件**（§4.4 已裁定 A）：插件在清单就位前起不来，写不了它。
 - 插件**不依赖** `yi-agent-store`：resident 登记文件格式（`project` + `required_by`）
   是**两侧共享的通用文件契约**，插件按格式自行读写并在测试里覆盖。
-- 若采纳 §4.4 方案 A：新增 `manifest` CLI 动词，打印插件自述的通用清单 JSON。
+- **新增 `manifest` CLI 动词**（§4.4 方案 A）：stdout 打印插件自述的通用清单 JSON，
+  `command` 填该可执行文件自身的绝对路径（`std::env::current_exe()`），其余字段与
+  `supervisors/superpowers-kanban.json` 一致。宿主 `plugin/install` 直接消费这段 stdout，
+  因此**这份自述是清单的唯一真相源**；随包分发的 `.json` 退化为「文档/安装脚本的参考」，
+  两者漂移时以二进制自述为准（§4.4 已说明 B 不可行的原因）。
+
+### 5.4.1 宿主：`plugin/install`（§4.4 方案 A）
+
+- `yi-agent-supervisors`：新增通用 `install_manifest_for(project, plugin_name, manifest_json)`
+  与 `enable_switch(project, switch_key)`（从已删的 `scaffold.rs` 迁出，去掉看板名）。
+- `app-server`：新增通用 RPC `plugin/install {project, plugin}`：
+  1. `plugin_worktree::resolve_plugin_command(plugin)` 解析可执行文件（已存在，
+     `server.rs:243` 的接缝就用它）；
+  2. 跑 `<plugin> manifest` 取 stdout，校验是 JSON 对象且含 `name`/`switch_key`；
+  3. `install_manifest_for` 写 `<项目>/.yi-agent/supervisors/<plugin>.json`；
+  4. `enable_switch` 把 `switch_key` 写成 `true`（§4.4.1）；
+  5. `daemon::ensure_running(project)`。
+  宿主**不解释**清单里的任何插件语义，只按名搬运与开开关。
 
 ### 5.5 G1 遗留的归属缺口（本 spec 必须收口）
 
@@ -364,10 +414,25 @@ G1（`2026-10-17-session-driver-decoupling-design.md`）把宿主里的看板**�
    > 保留 `test` / `//` 的排除。归零前须先裁定顶部刷新 ③ 的
    > `is_kanban_worktree`（物理路径约定 `.worktrees/kanban/`）归属。
 3. `board/create` / `board/remove` / `board/list` 三个 RPC 不再存在（`Domain::Board` 删除）。
+3a. **通用 `plugin/install {project, plugin}`**（§4.4 方案 A）：
+   - 按 `plugin` 名在 PATH 上解析可执行文件，**宿主源码里不出现任何具体插件名**；
+   - 执行 `<plugin> manifest`，把 stdout 原样写入
+     `<项目>/.yi-agent/supervisors/<plugin>.json`（宿主不解析清单语义，只校验是 JSON 对象）；
+   - 把清单声明的 `switch_key` 写成 `true`（项目层 `preferences.json`），
+     **保留无关键**（与 `runtime_prefs` 的 read-modify-write + tmp/rename 同型）；
+   - 确保项目 daemon 在跑（复用 `yi-agent-supervisors::daemon::ensure_running`）；
+   - 幂等：重复调用不重复写、不重置用户后来关掉的开关之外的状态
+     （开关按「安装即开启」写入，与今日 `enable_switch` 一致）。
+3b. **开关这半程不得丢失**（§4.4.1）：新建的看板在**无人工干预**下队列可推进
+   （即 `switch.read` 回 `on: true`，`source: "project"`）。
 
 **插件（Rust）**
 
-4. `lifecycle/create`：写清单 + `resident::require`；重复调用幂等。
+4. `lifecycle/create`：建状态目录 + `resident::require`（**不写清单**，清单归宿主的
+   `plugin/install`，见 §4.4）；重复调用幂等。
+4a. 插件新增 `manifest` 动词：stdout 输出**自述清单**（与
+   `plugins/superpowers-kanban/supervisors/superpowers-kanban.json` 同构，
+   `command` 为该可执行文件自身路径），退出码 0。
 5. `lifecycle/remove`：停 daemon、删状态、`resident::release`；重复调用安全。
 
 **迁移（Rust）**
@@ -410,7 +475,7 @@ G1（`2026-10-17-session-driver-decoupling-design.md`）把宿主里的看板**�
 |---|---|
 | 迁移遗漏导致「看板消失」（旧 `boards.json` 未导入） | 迁移幂等 + 单测覆盖「旧环境首启」+ **必须有调用点**（§4.3）；`boards.json.migrated` 留证 |
 | 删 crate 牵动 app-server 与 `yi-agent`（TUI/CLI）大量编译错误 | 分步：先加通用替代（resident 路径 + 通用 CLI 子命令），再切调用点，最后删依赖；§5.6 与 §5.1 的 plist 必须同批 |
-| 建盘引导鸡生蛋（§4.4）导致「全新项目建不了看板」 | **待用户裁定**后方开工 Task 4/5；未裁定前先做 Task 1/2/3/6/7 |
+| 建盘引导鸡生蛋（§4.4）导致「全新项目建不了看板」 | **已裁定 A**（§4.4）：宿主通用 `plugin/install` 写清单 + 开开关 + 起 daemon，桌面再发 `lifecycle/create`。开关这半程初稿遗漏，见 §4.4.1 |
 | 桌面对新通道的错误形态不识别 | 复用 `pluginIsUnavailable` / `boardErrorKind` 既有判定；码名去看板化（D11）时同步桌面文案与 `routes.test.ts` |
 | 「每项目一个 daemon」的语义在通用化后变模糊 | 保留 10-02 规则原文：**谁成功启动 daemon，谁负责监督** |
 | 与 G1 并行改同一批文件（`server.rs` / 插件 dispatch） | 排序：**先 G1 后 G2**（G1 已落地，本 spec 已据其刷新） |

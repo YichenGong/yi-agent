@@ -357,9 +357,12 @@ git commit -m "refactor(supervisors): move the generic resident-daemon machinery
 
 ### Task 4: 插件实现 `lifecycle/create` 与 `lifecycle/remove`
 
-> **前置裁定**：本任务的 **create 半程** 依赖 spec §4.4 的方案裁定（全新项目的清单
-> 由谁安装）。方案 A 下，宿主另有一条通用 `plugin/install`；插件额外提供
-> `manifest` 动词。**裁定前不开工本任务**；确需并行可先做 `remove` 半程。
+> **裁定已定（spec §4.4 方案 A）**：清单归宿主的通用 `plugin/install`，插件不写清单。
+> 本任务的 create 半程因此只做「建状态目录 + `resident::require`」。
+>
+> **状态（2026-10-19）**：`lifecycle/create` 与 `lifecycle/remove` 已落地并过评审
+> （`c62f36b2`、`58de81f8`）。**本任务剩余的是 Step 1b 的 `manifest` 动词**，
+> 它原先挂在「方案 A」下，现随裁定生效——见下方 Step 1b。
 
 **Files:**
 - Modify: `plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/dispatch.rs`
@@ -375,7 +378,7 @@ git commit -m "refactor(supervisors): move the generic resident-daemon machinery
   （`project` + `required_by`）是**两侧共享的通用契约**，插件按格式自行读写，
   并在测试里覆盖。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**（已落地，`c62f36b2`/`58de81f8`）
 
 ```rust
     #[test]
@@ -395,6 +398,35 @@ git commit -m "refactor(supervisors): move the generic resident-daemon machinery
     }
 ```
 
+- [ ] **Step 1b: `manifest` 动词（§4.4 方案 A 的插件侧）**
+
+```rust
+    #[test]
+    fn manifest_prints_a_self_describing_manifest() {
+        // 跑 `manifest` 子命令 → stdout 是可解析的 JSON 对象；
+        //   name/switch_key/args 与 supervisors/superpowers-kanban.json 一致；
+        //   command 是当前可执行文件的绝对路径（不是裸名）。
+    }
+```
+
+Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner manifest_ -- --nocapture`
+Expected: FAIL
+
+实现要点：
+
+- `main.rs` 的 `parse_subcommand` 加 `"manifest"` 臂；`usage` 字符串同步。
+- 输出的清单**以二进制为准**：`command` 用 `std::env::current_exe()` 的绝对路径
+  （宿主解析到的裸名在 `PATH` 与守护进程的 `PATH` 不一致时会起不来，这正是当年
+  `scaffold.rs` 注释里记的那条坑）。
+- 其余字段与 `plugins/superpowers-kanban/supervisors/superpowers-kanban.json` 逐字一致
+  （`args` 里的 `{runtime_dir}`/`{state_dir}`/`{workdir}` 占位符由 supervisor 展开，
+  原样输出即可）。
+- 不加新依赖（插件对主程序零依赖；`serde_json` 已有）。
+
+> **为何以二进制自述为准**：`INSTALL.md:46` 只装二进制，源码树里的
+> `supervisors/superpowers-kanban.json` 在已安装环境里不可达（spec §4.4 已论证方案 B
+> 因此不可行）。随包 `.json` 退化为参考文档；两者漂移时以 `manifest` 输出为准。
+
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner lifecycle_ -- --nocapture`
@@ -407,7 +439,7 @@ Expected: FAIL
   原子写 tmp+rename，读侧宽容；注释指明「这是两侧共享的通用文件契约」）。
 - `dispatch.rs` 加两个分支；`service.rs` 加 `lifecycle_create(project)` /
   `lifecycle_remove(project)`（复用现有目录创建逻辑与 `plugin_command()`；
-  create 若按方案 A 不再写清单，则只建自己的状态目录 + `require`）。
+  create **不写清单**（§4.4 已裁定 A），只建自己的状态目录 + `require`）。
 - `remove` 的「停 daemon」：插件不能直接停宿主的 per-project daemon
   （那是宿主/监督者的事）；改为 `resident::release` + 删自己的状态目录，
   由宿主/监督者观察到登记消失后停进程。**在注释里写明这条分工**，并在测试里断言
@@ -423,6 +455,115 @@ Expected: PASS
 ```bash
 git add plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/
 git commit -m "feat(kanban): expose lifecycle create/remove over the plugin channel"
+```
+
+---
+
+### Task 4b: 宿主通用 `plugin/install`（§4.4 方案 A 的宿主侧）
+
+> **为什么单列一任务**：它是「全新项目建不了看板」的唯一正解（spec §4.4 已裁定 A），
+> 且**与 Task 6 的删面互相独立**——Task 6 删 `yi-agent-boards`，本任务把其中
+> `scaffold` 的通用能力（写清单 + 开开关）搬到宿主通用侧。先做本任务，
+> Task 6 才有地方可迁，否则删完就出现「没人装清单」的空洞。
+
+**Files:**
+- Create/Modify: `yi-agent-rs/crates/yi-agent-supervisors/src/install.rs`（通用安装：写清单 + 开开关）
+- Modify: `yi-agent-rs/crates/yi-agent-supervisors/src/lib.rs`
+- Modify: `yi-agent-rs/crates/yi-agent-app-server/src/rpc/plugin.rs`（新增 `plugin/install` 分支）
+- Modify: `yi-agent-rs/crates/yi-agent-app-server/src/rpc/mod.rs`（`PluginChannelState` 用上
+  已有的 `plugin_command` 接缝；**不要**再新增一个按名解析的重复实现）
+- Test: `yi-agent-supervisors/src/install.rs` 的 `mod tests`；
+  `yi-agent-app-server/src/rpc_tests.rs` 的 `plugin_install_*`
+
+**Interfaces:**
+- Consumes: `plugin_worktree::resolve_plugin_command(name)`（已存在，`server.rs:243`）、
+  `daemon::ensure_running(project)`（已存在）、`yi_agent_store::resident`（不需要）。
+- Produces:
+  - `yi_agent_supervisors::install::install_manifest_for(project, plugin_name, manifest_json) -> io::Result<PathBuf>`
+  - `yi_agent_supervisors::install::enable_switch(project, switch_key) -> io::Result<()>`
+  - RPC `plugin/install {project, plugin}` → `{ installed: true, manifest: <path> }`
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+    #[test]
+    fn installing_writes_the_manifest_under_the_projects_supervisors_dir() {
+        // install_manifest_for(tmp, "demo", json) →
+        //   <tmp>/.yi-agent/supervisors/demo.json 内容逐字等于 json。
+    }
+
+    #[test]
+    fn installing_twice_overwrites_instead_of_duplicating() {
+        // 同名两次、内容不同 → 文件只有一个，内容是第二次的。
+    }
+
+    #[test]
+    fn enabling_the_switch_preserves_unrelated_keys() {
+        // preferences.json 已有 {"subagent_runtime":"x"} →
+        //   enable_switch(project, "demo_on") 后两键都在，demo_on == true。
+    }
+```
+
+RPC 层：
+
+```rust
+    #[test]
+    fn plugin_install_resolves_the_command_and_writes_what_the_plugin_describes() {
+        // 临时 PATH 上放一个 shell 脚本冒充插件，`manifest` 打印一份 JSON →
+        //   plugin/install 后 <项目>/.yi-agent/supervisors/<plugin>.json 存在且等于那段 JSON，
+        //   且 preferences.json 里该清单的 switch_key 为 true。
+    }
+
+    #[test]
+    fn plugin_install_reports_a_missing_plugin_without_writing_anything() {
+        // PATH 上没有该名字 → 结构化错误（plugin_not_installed），
+        //   supervisors/ 与 preferences.json 都未被创建/修改。
+    }
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors install_ -- --nocapture`
+Expected: FAIL（模块不存在）
+
+- [ ] **Step 3: 实现**
+
+- `install.rs`：从已删的 `yi-agent-boards/src/scaffold.rs`（`git show <T6 base>:...`）迁出
+  两个纯函数，**去掉所有看板名**：
+  - `install_manifest_for(project, plugin_name, manifest_json)`：`create_dir_all`
+    `<project>/.yi-agent/supervisors`，写 `<plugin_name>.json`。文件名来自参数，
+    不来自清单内容（清单里的 `name` 只用来校验一致，不一致就报错）。
+  - `enable_switch(project, switch_key)`：read-modify-write
+    `<project>/.yi-agent/preferences.json`，只置 `switch_key: true`，
+    其余键原样保留；tmp + rename（照抄 `runtime_prefs::save` 的写法）。
+- `rpc/plugin.rs`：`"plugin/install"` 分支：
+  1. `project_arg(&req.params)`（已存在的 helper，会 canonicalize）；
+  2. `plugin` 名非空；
+  3. `resolve_plugin_command(plugin)` → 无则 `plugin_not_installed`；
+  4. `Command::new(exe).arg("manifest").output()` → 非 0 或非 JSON 对象则
+     `plugin_rejected`（带 stderr 首行）；
+  5. 校验 `manifest["name"] == plugin`，否则 `plugin_rejected`；
+  6. `install_manifest_for` + `enable_switch(project, manifest["switch_key"])`；
+  7. `daemon::ensure_running(project)`（失败只记录、不回滚：清单已装好，
+     下一轮 watch 会再拉起）。
+- **宿主源码里不得出现具体插件名**：本分支只读 `plugin` 形参，验收 §6.2 的 grep 因此
+  不受影响。
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors && cargo test -p yi-agent-app-server plugin_install`
+Expected: PASS
+
+- [ ] **Step 5: 提交**
+
+```bash
+cd yi-agent-rs && cargo fmt --all && cd ..
+git add yi-agent-rs/crates/yi-agent-supervisors/src/install.rs \
+        yi-agent-rs/crates/yi-agent-supervisors/src/lib.rs \
+        yi-agent-rs/crates/yi-agent-app-server/src/rpc/plugin.rs \
+        yi-agent-rs/crates/yi-agent-app-server/src/rpc/mod.rs \
+        yi-agent-rs/crates/yi-agent-app-server/src/rpc_tests.rs
+git commit -m "feat(app-server): install a plugin into a project generically"
 ```
 
 ---
@@ -704,10 +845,16 @@ git commit -m "docs: note that the plugin lifecycle decoupling completes spec 4"
   两侧一致；`resident/list` 的形状在 Task 1（产出）/Task 5（消费）一致。
 - **依赖裁定**：插件**不依赖** `yi-agent-store`（保持零依赖），resident 文件格式作为
   两侧共享的通用契约，各自实现并在测试中覆盖——这是本 plan 唯一需要评审认同的取舍。
-- **顺序依赖**：Task 1 → 2 → 3 → 4 → 5 → 6 → 7；Task 1 是 Task 5/6 的前提
+- **顺序依赖**：Task 1 → 2 → 3 → 4 → **4b** → 5 → 6 → 7；Task 1 是 Task 5/6 的前提
   （`resident/list` 先于删 `board/list`）；Task 3 的 plist/CLI 与 Task 6 的 crate 删除
   必须分两次落地（先迁后删），但 plist 的子命令字符串不允许中间态指向不存在的命令。
 - **刷新（第二次，main +98 提交后）**：Task 1 已完成；Task 3/6/7 的行号与引用已按
   `bf6e1971` 实测更新；验收 grep 命令已修正（`-i` + 排 `onboarding`）；
   新引入的 `is_kanban_worktree` 需先定归属（Task 6）。详见顶部「第二次刷新说明」。
-- **未决**：Task 4 的 create 半程待 spec §4.4 裁定（方案 A/B/C）。
+- **§4.4 已裁定（2026-10-19）**：取方案 A。理由不是偏好，而是约束排除：
+  C 违反验收 §6.9「与今日行为一致」；B 在「只装二进制」的安装方式下不可实现
+  （清单留在源码树，二进制与它无可推导关系）。故新增 **Task 4b**（宿主通用
+  `plugin/install`）与 Task 4 的 **Step 1b**（插件 `manifest` 动词）。
+- **§4.4.1 开关（初稿遗漏）**：`create_with_project` 当年写清单**和**开关；
+  开关默认关且门控插件推进循环，故 `plugin/install` 必须一并 `enable_switch`，
+  否则「看板建了、队列永不推进」，违反 §6.9。已在 Task 4b 与验收 §6.3a/3b 落项。
