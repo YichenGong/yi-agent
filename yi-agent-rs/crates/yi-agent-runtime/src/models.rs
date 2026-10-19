@@ -504,6 +504,147 @@ pub fn save_catalog(catalog: &ModelCatalog) -> std::io::Result<()> {
     save_catalog_to(&models_path(), catalog)
 }
 
+/// 在清单文件上做一次「读-改-写」，全程持锁。
+///
+/// **为什么需要它**：`models.json` 的每次写都是「读全文 → 改 → rename」，
+/// 而进程内至少有三个会并发写它的来源——`model/upsert`、`model/setDefault`
+/// 这类 RPC，以及保存模型后**后台**跑的探测写回。两者交错时，探测那一轮
+/// 读到的旧快照会把同时在落盘的 `default_model` 覆盖回去（表现为「设了默认
+/// 却读回兜底 cfg」，而且只在探测恰好同时完成时出现，极难复现）。
+///
+/// 锁分两层：
+/// - **进程内**：`CATALOG_WRITE_LOCK` 覆盖同一进程里所有写者；
+/// - **跨进程**：同目录下的 `.models.json.lock` 文件锁，覆盖 CLI / app-server
+///   等多个进程（桌面的 sidecar 与 TUI 会同时开着同一份清单）。
+///
+/// 回调拿到的是**持锁后重新读到**的清单，因此基于它做的修改不会覆盖别的写者。
+/// 读不出来的既有文件照旧报错（不静默重建），语义与 [`save_catalog_to`] 一致。
+pub fn update_catalog<T>(
+    path: &Path,
+    f: impl FnOnce(&mut ModelCatalog) -> T,
+) -> std::io::Result<T> {
+    update_catalog_inner(path, |catalog| Some(f(catalog)))
+        .map(|out| out.expect("the closure always returns Some"))
+}
+
+/// 同 [`update_catalog`]，但回调返回 `None` 表示「无事可做」：**不落盘**并原样
+/// 返回 `None`。
+///
+/// 用于「写前复核后放弃」的场景（例如探测结果因条目已被改而过期）。区别不只是
+/// 省一次写：无谓的 `rename` 会推进 mtime，让所有盯着这份清单的 watcher 白重读
+/// 一次。
+pub fn update_catalog_if<T>(
+    path: &Path,
+    f: impl FnOnce(&mut ModelCatalog) -> Option<T>,
+) -> std::io::Result<Option<T>> {
+    update_catalog_inner(path, f)
+}
+
+fn update_catalog_inner<T>(
+    path: &Path,
+    f: impl FnOnce(&mut ModelCatalog) -> Option<T>,
+) -> std::io::Result<Option<T>> {
+    let _guard = CATALOG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = FileLock::acquire(path)?;
+    let mut catalog = try_load_for_update(path)?;
+    let out = f(&mut catalog);
+    if out.is_some() {
+        save_catalog_to(path, &catalog)?;
+    }
+    Ok(out)
+}
+
+/// 进程内串行化清单写入。回收 poisoned：一次 panic 不该让后续写永久失败
+/// （写的是完整快照，不存在「写了一半的内存状态」）。
+static CATALOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 跨进程的清单文件锁，drop 时解锁并清掉锁文件。
+///
+/// 用 `create_new` 轮询而不是 `flock`：不需要引入新依赖，且行为在 macOS /
+/// Linux 上一致。持锁时间只有一次读 + 一次 rename，轮询间隔足够小。
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    fn acquire(models_path: &Path) -> std::io::Result<Self> {
+        let path = lock_path(models_path);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // 超过这个时间就放弃：调用方会收到错误，而不是无声地永远卡住。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 残留锁文件（持锁进程崩了）不能永久阻塞：文件比
+                    // `STALE_LOCK_AGE` 更旧就当作可回收。
+                    if lock_is_stale(&path) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "timed out waiting for the catalog lock at {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 锁文件与清单同目录，名字由清单名派生（`.models.json.lock`）。
+fn lock_path(models_path: &Path) -> PathBuf {
+    let file = models_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "models.json".to_string());
+    models_path.with_file_name(format!(".{file}.lock"))
+}
+
+/// 持锁进程崩溃留下的锁文件：超过这个年龄即视为可回收。
+const STALE_LOCK_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn lock_is_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|modified| {
+            modified
+                .elapsed()
+                .map(|age| age > STALE_LOCK_AGE)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// 为更新而读：严格读取，坏文件报错（与 [`save_catalog_to`] 的「不覆盖读不出来的
+/// 文件」同一不变量）。文件不存在由 `try_load_catalog_from` 自己回空清单——
+/// 那是真正的首写。
+fn try_load_for_update(path: &Path) -> std::io::Result<ModelCatalog> {
+    try_load_catalog_from(path)
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+}
+
 /// 写清单：读-改-写，保留 `models.json` 里无关的顶层键，最后原子替换。
 ///
 /// 既有文件「读不出来」（损坏 JSON / 非对象）时**报错而不覆盖**：那是用户的配置
@@ -800,6 +941,114 @@ mod tests {
     /// 写入不得把「读不出来的既有文件」当成空对象从头重建——那会静默丢掉用户
     /// 的整个 `models.json`。首写（文件不存在）仍必须成功创建。
     #[test]
+    /// 两个写者交错时，后写的那个必须基于**前一个已经落盘**的清单，否则
+    /// 一方的修改会被静默丢掉。
+    ///
+    /// 这里模拟的正是真实故障：后台探测写回能力的同时，另一个 RPC 设了
+    /// `default_model`。裸「读-改-写」下后者会消失（表现为「设了默认却读回
+    /// 兜底 cfg」，且只在两者恰好同时完成时出现）。
+    #[test]
+    fn concurrent_updates_do_not_lose_each_others_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        save_catalog_to(
+            &path,
+            &ModelCatalog {
+                models: vec![entry("a"), entry("b")],
+                default_model: None,
+                subagent_model: None,
+            },
+        )
+        .unwrap();
+
+        // 先在锁外各读一份旧快照（这正是裸写路径拿到的东西）。
+        let stale_a = load_catalog_from(&path);
+        let stale_b = load_catalog_from(&path);
+
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let writer_a = std::thread::spawn(move || {
+            update_catalog(&path_a, |catalog| {
+                let target = catalog.models.iter_mut().find(|m| m.name == "a").unwrap();
+                target.reasoning_capabilities = Some(ReasoningCapabilities {
+                    chat: Some(ChannelCapability {
+                        supported: vec!["low".into()],
+                        probed_at: 7,
+                        error: None,
+                    }),
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+            drop(stale_a);
+        });
+        let writer_b = std::thread::spawn(move || {
+            update_catalog(&path_b, |catalog| {
+                catalog.default_model = Some("b".into());
+            })
+            .unwrap();
+            drop(stale_b);
+        });
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+
+        let landed = load_catalog_from(&path);
+        assert_eq!(
+            landed.default_model.as_deref(),
+            Some("b"),
+            "the default written by one writer must survive the other writer"
+        );
+        assert_eq!(
+            landed.models[0]
+                .reasoning_capabilities
+                .as_ref()
+                .and_then(|c| c.chat.as_ref())
+                .map(|c| c.supported.clone()),
+            Some(vec!["low".to_string()]),
+            "the capabilities written by the other writer must survive too"
+        );
+    }
+
+    /// 回调返回 `None`（写前复核判定放弃）时**不落盘**：mtime 不动，盯着清单的
+    /// watcher 不会白重读一次。
+    #[test]
+    fn an_abandoned_update_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        save_catalog_to(
+            &path,
+            &ModelCatalog {
+                models: vec![entry("a")],
+                default_model: Some("a".into()),
+                subagent_model: None,
+            },
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let applied: Option<()> = update_catalog_if(&path, |_| None).unwrap();
+        assert!(applied.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "an abandoned update must not rewrite the file"
+        );
+    }
+
+    /// 读不出来的既有文件：`update_catalog` 与 `save_catalog_to` 同样拒绝覆盖。
+    #[test]
+    fn update_refuses_an_unreadable_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let result = update_catalog(&path, |catalog| catalog.models.push(entry("a")));
+        assert!(result.is_err(), "an unreadable base must not be clobbered");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not valid json"
+        );
+    }
+
     fn saving_refuses_to_overwrite_a_base_it_cannot_read() {
         // (a) 文件不存在：确实没有既有内容 → 正常创建。
         let dir = tempfile::TempDir::new().unwrap();

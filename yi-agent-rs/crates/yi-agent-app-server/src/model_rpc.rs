@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_runtime::models::{
     ModelCatalog, ModelEntry, ModelProvider, effective_entry_for, load_catalog_from, mask_key,
-    models_path, save_catalog_to,
+    models_path, update_catalog, update_catalog_if,
 };
 use yi_agent_runtime::reasoning_probe::ProbeOutcome;
 
@@ -93,23 +93,22 @@ pub fn apply_probe_result(
     fingerprint: &str,
     outcome: ProbeOutcome,
 ) -> bool {
-    let mut catalog = load_catalog_from(path);
-    let Some(entry) = catalog.models.iter_mut().find(|m| m.name == name) else {
-        return false;
-    };
-    if entry_fingerprint(entry) != fingerprint {
-        return false;
-    }
-    let Some(slot) = entry
-        .reasoning_capabilities
-        .get_or_insert_with(Default::default)
-        .channel_mut(&outcome.channel)
-    else {
+    // 必须走 `update_catalog_if`：探测在后台跑，写回时可能正有 RPC 在改同一份
+    // 清单。裸的「读-改-写」会把并发的 `model/setDefault` 覆盖回去。
+    update_catalog_if(path, |catalog| {
+        let entry = catalog.models.iter_mut().find(|m| m.name == name)?;
+        if entry_fingerprint(entry) != fingerprint {
+            return None;
+        }
         // 未知通道名：宁可丢弃，也不把数据写到错误的槽位。
-        return false;
-    };
-    *slot = Some(outcome.capability);
-    save_catalog_to(path, &catalog).is_ok()
+        let slot = entry
+            .reasoning_capabilities
+            .get_or_insert_with(Default::default)
+            .channel_mut(&outcome.channel)?;
+        *slot = Some(outcome.capability);
+        Some(())
+    })
+    .is_ok_and(|applied| applied.is_some())
 }
 
 /// 正在探测的条目名集合（进程内）。
@@ -240,52 +239,55 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
         }
     }
 
-    let mut catalog = load_catalog_from(path);
     // Key semantics: absent (or `null`) keeps the stored value; `""` clears it;
     // any other string overwrites. A brand-new entry with no key is keyless.
-    let existing = catalog.models.iter().position(|m| m.name == name);
-    let api_key = match key_field(params)? {
-        KeyInput::Keep => existing
-            .map(|i| catalog.models[i].api_key.clone())
-            .unwrap_or_default(),
-        KeyInput::Clear => String::new(),
-        KeyInput::Set(key) => key,
-    };
+    let key_input = key_field(params)?;
+    // 读与写必须在同一把锁里：后台探测可能同时在写回能力，分开做会互相覆盖。
+    update_catalog(path, |catalog| {
+        let existing = catalog.models.iter().position(|m| m.name == name);
+        let api_key = match key_input {
+            KeyInput::Keep => existing
+                .map(|i| catalog.models[i].api_key.clone())
+                .unwrap_or_default(),
+            KeyInput::Clear => String::new(),
+            KeyInput::Set(key) => key,
+        };
 
-    // 能力结果只在「连接字段未变」时保留；任一变化都说明旧探测不再可信。
-    // `api_key` 不参与判定：换密钥不影响模型支持哪些档位。
-    let reasoning_capabilities = match existing {
-        Some(i) => {
-            let old = &catalog.models[i];
-            let changed = old.provider != provider
-                || old.api_url != api_url
-                || old.model != model
-                || old.api_style != api_style;
-            if changed {
-                None
-            } else {
-                old.reasoning_capabilities.clone()
+        // 能力结果只在「连接字段未变」时保留；任一变化都说明旧探测不再可信。
+        // `api_key` 不参与判定：换密钥不影响模型支持哪些档位。
+        let reasoning_capabilities = match existing {
+            Some(i) => {
+                let old = &catalog.models[i];
+                let changed = old.provider != provider
+                    || old.api_url != api_url
+                    || old.model != model
+                    || old.api_style != api_style;
+                if changed {
+                    None
+                } else {
+                    old.reasoning_capabilities.clone()
+                }
             }
-        }
-        None => None,
-    };
+            None => None,
+        };
 
-    let entry = ModelEntry {
-        name,
-        provider,
-        api_url,
-        model,
-        api_key,
-        api_style,
-        reasoning_effort,
-        reasoning_capabilities,
-        context_length: None,
-    };
-    match existing {
-        Some(i) => catalog.models[i] = entry,
-        None => catalog.models.push(entry),
-    }
-    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
+        let entry = ModelEntry {
+            name: name.clone(),
+            provider,
+            api_url,
+            model,
+            api_key,
+            api_style,
+            reasoning_effort,
+            reasoning_capabilities,
+            context_length: None,
+        };
+        match existing {
+            Some(i) => catalog.models[i] = entry,
+            None => catalog.models.push(entry),
+        }
+    })
+    .map_err(|error| RpcError::internal(error.to_string()))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -293,18 +295,21 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
 /// 一并清掉，否则会留下悬空引用（解析时静默回退，用户看不见）。
 fn delete(path: &Path, params: &Value) -> Result<Value, RpcError> {
     let name = string_field(params, "name").unwrap_or_default();
-    let mut catalog = load_catalog_from(path);
-    if !catalog.models.iter().any(|m| m.name == name) {
-        return Err(RpcError::model_not_found(&name));
-    }
-    catalog.models.retain(|m| m.name != name);
-    if catalog.default_model.as_deref() == Some(name.as_str()) {
-        catalog.default_model = None;
-    }
-    if catalog.subagent_model.as_deref() == Some(name.as_str()) {
-        catalog.subagent_model = None;
-    }
-    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
+    update_catalog_if(path, |catalog| {
+        if !catalog.models.iter().any(|m| m.name == name) {
+            return None;
+        }
+        catalog.models.retain(|m| m.name != name);
+        if catalog.default_model.as_deref() == Some(name.as_str()) {
+            catalog.default_model = None;
+        }
+        if catalog.subagent_model.as_deref() == Some(name.as_str()) {
+            catalog.subagent_model = None;
+        }
+        Some(())
+    })
+    .map_err(|error| RpcError::internal(error.to_string()))?
+    .ok_or_else(|| RpcError::model_not_found(&name))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -317,23 +322,32 @@ enum Reference {
 /// `model/setDefault` / `model/setSubagent`：`null` 或缺失 → 清除；否则必须
 /// 命中已存在条目，否则 `model_not_found`（且零落盘）。
 fn set_reference(path: &Path, params: &Value, which: Reference) -> Result<Value, RpcError> {
-    let mut catalog = load_catalog_from(path);
-    let target = match params.get("name") {
+    // 参数形状错误在碰盘之前就判掉（零落盘）。
+    let requested = match params.get("name") {
         None | Some(Value::Null) => None,
-        Some(Value::String(name)) => {
-            if !catalog.models.iter().any(|m| &m.name == name) {
-                return Err(RpcError::model_not_found(name));
-            }
-            Some(name.clone())
-        }
+        Some(Value::String(name)) => Some(name.clone()),
         Some(_) => return Err(RpcError::invalid_model("name must be a string or null")),
     };
-    match which {
-        Reference::Default => catalog.default_model = target,
-        Reference::Subagent => catalog.subagent_model = target,
+    let outcome = update_catalog_if(path, |catalog| {
+        if let Some(name) = &requested {
+            // 存在性也在锁内判：判完到落盘之间不许有别的写者把它删掉。
+            if !catalog.models.iter().any(|m| &m.name == name) {
+                return None;
+            }
+        }
+        match which {
+            Reference::Default => catalog.default_model = requested.clone(),
+            Reference::Subagent => catalog.subagent_model = requested.clone(),
+        }
+        Some(())
+    })
+    .map_err(|error| RpcError::internal(error.to_string()))?;
+    match (outcome, requested) {
+        (Some(_), _) => Ok(json!({ "ok": true })),
+        (None, Some(name)) => Err(RpcError::model_not_found(&name)),
+        // 只有 `None` 请求+外部改文件才会到这里：按成功处理。
+        (None, None) => Ok(json!({ "ok": true })),
     }
-    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
-    Ok(json!({ "ok": true }))
 }
 
 /// `model/importEnv`：把兜底层 `cfg`（`.env`）当前的 provider/api_url/api_key/model
@@ -355,29 +369,32 @@ fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
         )));
     };
 
-    let mut catalog = load_catalog_from(path);
-    let base = cfg.model.trim().to_string();
-    // 重名自动加后缀，静默成功（收边是「零摩擦固化」，不该被重名卡住）。
-    let mut name = base.clone();
-    let mut n = 2u32;
-    while catalog.models.iter().any(|m| m.name == name) {
-        name = format!("{base}-{n}");
-        n += 1;
-    }
-    catalog.models.push(ModelEntry {
-        name: name.clone(),
-        provider,
-        api_url: cfg.api_url.clone(),
-        model: cfg.model.clone(),
-        api_key: cfg.api_key.clone(),
-        // 兜底层 cfg 的通道选择随条目固化（与 upsert 的默认语义一致）。
-        api_style: Some(cfg.api_style.as_str().to_string()),
-        reasoning_effort: cfg.reasoning_effort.clone(),
-        reasoning_capabilities: None,
-        context_length: None,
-    });
-    catalog.default_model = Some(name.clone());
-    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
+    // 加后缀 + 落盘必须原子：否则并发两次导入会挑到同一个名字。
+    let name = update_catalog(path, |catalog| {
+        let base = cfg.model.trim().to_string();
+        // 重名自动加后缀，静默成功（收边是「零摩擦固化」，不该被重名卡住）。
+        let mut name = base.clone();
+        let mut n = 2u32;
+        while catalog.models.iter().any(|m| m.name == name) {
+            name = format!("{base}-{n}");
+            n += 1;
+        }
+        catalog.models.push(ModelEntry {
+            name: name.clone(),
+            provider,
+            api_url: cfg.api_url.clone(),
+            model: cfg.model.clone(),
+            api_key: cfg.api_key.clone(),
+            // 兜底层 cfg 的通道选择随条目固化（与 upsert 的默认语义一致）。
+            api_style: Some(cfg.api_style.as_str().to_string()),
+            reasoning_effort: cfg.reasoning_effort.clone(),
+            reasoning_capabilities: None,
+            context_length: None,
+        });
+        catalog.default_model = Some(name.clone());
+        name
+    })
+    .map_err(|error| RpcError::internal(error.to_string()))?;
     Ok(json!({ "ok": true, "name": name, "default_model": name }))
 }
 
@@ -521,21 +538,22 @@ mod tests {
     }
 
     fn set_capabilities(path: &Path, name: &str) {
-        let mut catalog = load_catalog_from(path);
-        let entry = catalog
-            .models
-            .iter_mut()
-            .find(|m| m.name == name)
-            .expect("entry must exist");
-        entry.reasoning_capabilities = Some(yi_agent_runtime::models::ReasoningCapabilities {
-            anthropic: Some(yi_agent_runtime::models::ChannelCapability {
-                supported: vec!["low".into(), "high".into()],
-                probed_at: 42,
-                error: None,
-            }),
-            ..Default::default()
-        });
-        save_catalog_to(path, &catalog).unwrap();
+        update_catalog(path, |catalog| {
+            let entry = catalog
+                .models
+                .iter_mut()
+                .find(|m| m.name == name)
+                .expect("entry must exist");
+            entry.reasoning_capabilities = Some(yi_agent_runtime::models::ReasoningCapabilities {
+                anthropic: Some(yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["low".into(), "high".into()],
+                    probed_at: 42,
+                    error: None,
+                }),
+                ..Default::default()
+            });
+        })
+        .unwrap();
     }
 
     fn capabilities_of(
@@ -684,6 +702,113 @@ mod tests {
         assert_eq!(caps.chat.unwrap().supported, vec!["low"]);
         assert_eq!(caps.responses.unwrap().supported, vec!["high"]);
         assert!(caps.anthropic.is_none());
+    }
+
+    /// 探测写回不得吃掉同时发生的 `default_model` 修改。
+    ///
+    /// 真实场景：保存模型后后台立刻起了一轮探测（最长 30s），用户在设置页
+    /// 顺手设了默认模型。裸「读-改-写」下探测会用自己那份旧快照把默认值
+    /// 覆盖回去——症状是「设了默认，读回来却是兜底 cfg」，而且只在两者恰好
+    /// 同时完成时出现。
+    #[test]
+    fn a_probe_write_back_keeps_a_concurrent_default_change() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"anthropic","api_url":"https://a","model":"m"}),
+        )
+        .unwrap();
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"B","provider":"anthropic","api_url":"https://b","model":"m"}),
+        )
+        .unwrap();
+
+        let entry = load_catalog_from(&path)
+            .models
+            .into_iter()
+            .find(|m| m.name == "A")
+            .expect("entry must exist");
+        let fingerprint = entry_fingerprint(&entry);
+
+        // 探测结果在锁外准备好（模拟它跑了几十秒），期间另一个写者落盘。
+        call(&path, "model/setDefault", json!({"name":"B"})).unwrap();
+        assert!(apply_probe_result(
+            &path,
+            "A",
+            &fingerprint,
+            ProbeOutcome {
+                channel: "anthropic".into(),
+                capability: yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["low".into(), "high".into()],
+                    probed_at: 1,
+                    error: None,
+                },
+            },
+        ));
+
+        let landed = load_catalog_from(&path);
+        assert_eq!(
+            landed.default_model.as_deref(),
+            Some("B"),
+            "the probe write-back must not resurrect a stale default_model"
+        );
+        assert_eq!(
+            landed
+                .models
+                .iter()
+                .find(|m| m.name == "A")
+                .and_then(|m| m.reasoning_capabilities.as_ref())
+                .and_then(|c| c.anthropic.as_ref())
+                .map(|c| c.supported.clone()),
+            Some(vec!["low".to_string(), "high".to_string()]),
+            "the probed capability must still land"
+        );
+    }
+
+    /// 探测期间条目被改过（指纹不符）：结果丢弃，且**不重写文件**。
+    #[test]
+    fn a_stale_probe_result_is_dropped_without_rewriting() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"anthropic","api_url":"https://a","model":"m"}),
+        )
+        .unwrap();
+        let stale = entry_fingerprint(&load_catalog_from(&path).models.into_iter().next().unwrap());
+        // 连接字段变了：旧指纹作废。
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"anthropic","api_url":"https://moved","model":"m"}),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            !apply_probe_result(
+                &path,
+                "A",
+                &stale,
+                ProbeOutcome {
+                    channel: "anthropic".into(),
+                    capability: yi_agent_runtime::models::ChannelCapability {
+                        supported: vec![],
+                        probed_at: 1,
+                        error: None,
+                    },
+                },
+            ),
+            "a result from a superseded connection must be refused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a refused result must not rewrite the file"
+        );
     }
 
     #[test]

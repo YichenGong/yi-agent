@@ -1756,6 +1756,16 @@ pub(crate) fn default_config() -> RuntimeConfig {
 pub(crate) struct Harness {
     client_w: tokio::io::DuplexStream,
     client_r: BufReader<tokio::io::DuplexStream>,
+    /// 已读、但还没被任何断言消费的帧。
+    ///
+    /// 后台任务（首当其冲是 `model/upsert` 自动起的能力探测）会在**任意时刻**
+    /// 插一帧广播进来。`read_value` 每次直接读下一帧时，这类帧会被当成「下一个
+    /// 响应」交给调用方，于是 `initialize` 的「第一帧必须是 id 1」偶发失败——
+    /// 与实现对不对无关，只取决于探测那一刻有没有恰好跑完。
+    ///
+    /// 因此所有读取一律先看这里：找指定 id / method 的读法把不匹配的帧放回队列，
+    /// 真正的乱序破坏才会暴露，而后台广播只影响时序、不影响语义。
+    pending: std::collections::VecDeque<serde_json::Value>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     /// 隔离的全局目录索引;持有它保证 tempdir 存活到 harness 结束。
     _index_dir: tempfile::TempDir,
@@ -2024,6 +2034,7 @@ impl Harness {
         Self {
             client_w,
             client_r: BufReader::new(client_r),
+            pending: std::collections::VecDeque::new(),
             handle,
             _index_dir: index_dir,
             board_dir,
@@ -2090,6 +2101,14 @@ impl Harness {
     }
 
     pub(crate) async fn read_value(&mut self) -> serde_json::Value {
+        if let Some(v) = self.pending.pop_front() {
+            return v;
+        }
+        self.read_value_from_wire().await
+    }
+
+    /// 真的从线上读一帧（不看 `pending`）。只有找特定 id/method 的读法需要它。
+    async fn read_value_from_wire(&mut self) -> serde_json::Value {
         let mut buf = String::new();
         let n = tokio::time::timeout(EVENT_WAIT, self.client_r.read_line(&mut buf))
             .await
@@ -2097,6 +2116,39 @@ impl Harness {
             .expect("read_line failed");
         assert!(n > 0, "unexpected EOF while waiting for a message");
         serde_json::from_str(buf.trim()).expect("server wrote invalid JSON")
+    }
+
+    /// 读到第一条满足 `want` 的帧，顺序读过的帧按下面的规则处理。
+    ///
+    /// **带 `id` 的响应帧放回队列**：它是对另一个请求的答复，丢掉会让等它的人
+    /// 永远等不到。**通知帧直接丢弃**：与改动前逐帧读的语义一致——通知是
+    /// fire-and-forget，测试关心的那条仍会由 `want` 命中。
+    ///
+    /// 这条区分正是为了容纳后台广播（`model/capabilitiesChanged` 之类）：
+    /// 它可以插在任意两帧之间，只影响时序、不影响语义。
+    pub(crate) async fn read_matching(
+        &mut self,
+        limit: usize,
+        mut want: impl FnMut(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        // 先扫已在队列里的：调用方可能已经读过几帧。
+        for _ in 0..self.pending.len() {
+            let v = self.pending.pop_front().expect("length checked");
+            if want(&v) {
+                return v;
+            }
+            self.pending.push_back(v);
+        }
+        for _ in 0..limit {
+            let v = self.read_value_from_wire().await;
+            if want(&v) {
+                return v;
+            }
+            if v.get("id").is_some() {
+                self.pending.push_back(v);
+            }
+        }
+        panic!("no matching frame in {limit} frames");
     }
 
     /// 读一帧，超时（或无帧）返回 `None`。用于断言「此后不该再有帧」。
@@ -2136,8 +2188,14 @@ impl Harness {
 pub(crate) async fn initialize(h: &mut Harness) {
     h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
-    let v = h.read_value().await;
-    assert_eq!(v["id"], 1, "initialize must respond with the request id");
+    // 用「找 id」而不是「读第一帧」：后台能力探测的广播可以插在中间。
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(1)))
+        .await;
+    assert!(
+        v.get("result").is_some() || v.get("error").is_some(),
+        "initialize must respond with the request id: {v}"
+    );
 }
 
 /// `initialize` + `thread/start`,返回新建 thread 的 id。
@@ -2145,14 +2203,11 @@ async fn start_thread(h: &mut Harness) -> String {
     initialize(h).await;
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
         .await;
-    // 依次读到 thread/started 通知与 thread/start 响应,取响应里的 thread_id。
-    for _ in 0..4 {
-        let v = h.read_value().await;
-        if v.get("id") == Some(&serde_json::json!(2)) {
-            return v["result"]["thread_id"].as_str().unwrap().to_string();
-        }
-    }
-    panic!("no thread/start response");
+    // 取响应里的 thread_id；中间的 `thread/started` 通知与后台广播一律不丢。
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    v["result"]["thread_id"].as_str().unwrap().to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2273,13 +2328,8 @@ async fn a_completed_turn_removes_its_checkpoint() {
 /// Task 5 之后,进程状态守望者会随时把 `process/updated` 插进同一路流里,
 /// 请求响应不再保证是紧接着的下一帧,故按 id 收敛而非"读一帧就当响应"。
 async fn read_response(h: &mut Harness, want: u64) -> serde_json::Value {
-    for _ in 0..16 {
-        let v = h.read_value().await;
-        if v.get("id") == Some(&serde_json::json!(want)) {
-            return v;
-        }
-    }
-    panic!("no response with id {want}");
+    h.read_matching(64, |v| v.get("id") == Some(&serde_json::json!(want)))
+        .await
 }
 
 /// 把一帧回放通知展平为其携带的 items：**兼容**逐条 `item/completed` 与批量
@@ -13000,13 +13050,10 @@ async fn model_list_over_dispatch_masks_the_key() {
 
 /// 读到指定 `method` 的通知为止(最多 20 帧),丢弃中间穿插的其它帧。
 async fn read_notification(h: &mut Harness, method: &str) -> serde_json::Value {
-    for _ in 0..20 {
-        let v = h.read_value().await;
-        if v.get("method").and_then(|m| m.as_str()) == Some(method) {
-            return v;
-        }
-    }
-    panic!("notification {method} never arrived");
+    h.read_matching(64, |v| {
+        v.get("method").and_then(|m| m.as_str()) == Some(method)
+    })
+    .await
 }
 
 /// `model/probe` 的后台探测：先回 `started`，完成后把权威能力写进清单并广播。
