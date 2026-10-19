@@ -13516,6 +13516,119 @@ async fn thread_set_reasoning_effort_persists_and_broadcasts() {
     h.shutdown().await;
 }
 
+/// 直接写隔离清单的能力数据（绕过 upsert，避免它触发后台探测与测试竞态）。
+fn seed_capabilities(models_path: &std::path::Path, name: &str, supported: &[&str]) {
+    use yi_agent_runtime::models::{
+        ChannelCapability, ModelEntry, ModelProvider, ReasoningCapabilities, load_catalog_from,
+        save_catalog_to,
+    };
+    let mut catalog = load_catalog_from(models_path);
+    catalog.models.push(ModelEntry {
+        name: name.to_string(),
+        provider: ModelProvider::Openai,
+        api_url: "https://seed.example".into(),
+        model: "m".into(),
+        api_key: "k".into(),
+        api_style: Some("chat".into()),
+        reasoning_effort: None,
+        reasoning_capabilities: Some(ReasoningCapabilities {
+            chat: Some(ChannelCapability {
+                supported: supported.iter().map(|s| s.to_string()).collect(),
+                probed_at: 1,
+                error: None,
+            }),
+            ..Default::default()
+        }),
+        context_length: None,
+    });
+    catalog.default_model = Some(name.to_string());
+    save_catalog_to(models_path, &catalog).unwrap();
+}
+
+/// 能力可信时不支持的档位必须被拒，且零副作用（不落盘、不广播）。
+#[tokio::test(flavor = "multi_thread")]
+async fn set_reasoning_effort_rejects_a_tier_the_model_does_not_support() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    seed_capabilities(
+        &h._models_dir.path().join("models.json"),
+        "L",
+        &["low", "medium"],
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"high"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 20).await;
+    assert_eq!(v["error"]["code"], -32602, "got {v}");
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("low, medium"),
+        "the error must name what IS supported: {message}"
+    );
+
+    let loaded = crate::thread_store::ThreadStore::new(dir.path())
+        .load(&tid)
+        .expect("load must not fail")
+        .expect("thread persists");
+    assert_eq!(
+        loaded.meta.reasoning_effort, None,
+        "a rejected tier must not be persisted"
+    );
+    h.shutdown().await;
+}
+
+/// 能力可信且档位在列表内：正常落盘。
+#[tokio::test(flavor = "multi_thread")]
+async fn set_reasoning_effort_accepts_a_supported_tier() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    seed_capabilities(
+        &h._models_dir.path().join("models.json"),
+        "L",
+        &["low", "medium"],
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"medium"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 20).await;
+    assert_eq!(v["result"]["ok"], true, "got {v}");
+
+    let loaded = crate::thread_store::ThreadStore::new(dir.path())
+        .load(&tid)
+        .expect("load must not fail")
+        .expect("thread persists");
+    assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("medium"));
+    h.shutdown().await;
+}
+
+/// 能力未知（没有探测记录）时保持宽松：七档仍然都能设。
+#[tokio::test(flavor = "multi_thread")]
+async fn set_reasoning_effort_stays_permissive_when_capabilities_are_unknown() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"max"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 20).await;
+    assert_eq!(v["result"]["ok"], true, "got {v}");
+    h.shutdown().await;
+}
+
 /// 与 `thread/setModel` 同档:切 effort 会改推理行为(计费/能力面),
 /// `Observe` 客户端必须被拒 `-32014`。
 #[tokio::test(flavor = "multi_thread")]

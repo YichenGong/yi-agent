@@ -140,37 +140,53 @@ impl ReasoningCapabilities {
     }
 }
 
+/// 条目实际会走的通道键：`chat` / `responses` / `anthropic`。
+///
+/// `auto` 必须选一条：`OpenaiProvider` 运行期先试 `/responses`、缺失才回退
+/// chat，故能力也按同一优先级取——两条都有可信记录时以 `responses` 为准，只有
+/// chat 可信时才落到 chat。这个函数与 [`supported_efforts`] 必须同源，否则
+/// 「UI 展示的档位」和「运行期校验的档位」会来自不同通道。
+pub fn effective_channel(entry: &ModelEntry) -> &'static str {
+    match entry.provider {
+        ModelProvider::Anthropic => "anthropic",
+        ModelProvider::Openai => match entry.api_style.as_deref() {
+            Some("chat") => "chat",
+            Some("responses") => "responses",
+            _ => {
+                let caps = entry.reasoning_capabilities.as_ref();
+                let trustworthy =
+                    |c: &Option<ChannelCapability>| c.as_ref().is_some_and(|c| c.error.is_none());
+                match caps {
+                    Some(c) if trustworthy(&c.chat) && !trustworthy(&c.responses) => "chat",
+                    _ => "responses",
+                }
+            }
+        },
+    }
+}
+
 /// 该条目在**生效通道**上被证实可用的档位；`None` = 能力未知。
 ///
 /// 「未知」与「空集」是两件事：前者表示没探测过（或探测出错），调用方应保持
 /// 宽松（平铺七档、运行期靠剥离重投兜底）；后者表示探测明确得出结论——七档
 /// 全被拒。把两者混为一谈会让「探测失败的模型」在 UI 上一个档位都没有。
-///
-/// 通道判定与 provider 实际走线一致：
-/// - `anthropic` → `anthropic` 槽位；
-/// - `openai + api_style = chat/responses` → 对应槽位；
-/// - `openai + auto` → 两条都可能，优先 `responses`（`OpenaiProvider` 的默认
-///   落点），取第一条「可信」记录。
 pub fn supported_efforts(entry: &ModelEntry) -> Option<Vec<String>> {
     let caps = entry.reasoning_capabilities.as_ref()?;
-    let candidate = match entry.provider {
-        ModelProvider::Anthropic => caps.anthropic.as_ref(),
-        ModelProvider::Openai => match entry.api_style.as_deref() {
-            Some("chat") => caps.chat.as_ref(),
-            Some("responses") => caps.responses.as_ref(),
-            _ => caps
-                .responses
-                .as_ref()
-                .filter(|c| c.error.is_none())
-                .or_else(|| caps.chat.as_ref().filter(|c| c.error.is_none())),
-        },
-    }?;
-    if candidate.error.is_some() {
+    let cap = caps.get(effective_channel(entry))?;
+    if cap.error.is_some() {
         // 这一轮没结论（鉴权失败、超时、基线被拒）：按未知处理，不要谎报
         // 「零个档位可用」。
         return None;
     }
-    Some(candidate.supported.clone())
+    Some(cap.supported.clone())
+}
+
+/// 某档位是否可以发给该模型。能力未知时恒为 `true`（保持探测功能上线前的
+/// 行为：靠「被拒剥离重投」兜底）。
+pub fn effort_is_allowed(entry: &ModelEntry, effort: &str) -> bool {
+    supported_efforts(entry)
+        .map(|list| list.iter().any(|s| s == effort))
+        .unwrap_or(true)
 }
 
 /// 只保留白名单内的档位，并按白名单顺序排序去重。坏值读作空表。
@@ -594,6 +610,18 @@ pub fn resolve_effective(
                 .map(ApiStyle::parse)
                 .unwrap_or(RuntimeConfig::default_api_style());
             out.reasoning_effort = entry.reasoning_effort.clone();
+            // 能力可信且该档不在支持列表里 → 按「未发送」处理：发出去必然被拒，
+            // 只会让 provider 白跑一轮「剥离字段重投」。`None`（能力未知）不受影响。
+            if let Some(effort) = out.reasoning_effort.clone() {
+                if !effort_is_allowed(entry, &effort) {
+                    tracing::info!(
+                        model = %entry.name,
+                        %effort,
+                        "configured reasoning effort is not supported; dropping it"
+                    );
+                    out.reasoning_effort = None;
+                }
+            }
             // `context_length` 来自手写 `models.json`，是外部输入：饱和乘法挡住 `length * ratio`
             // 的溢出（debug 会 panic、release 会静默回绕）；`0` 视为"未声明"，否则
             // `compact_threshold == 0` 会让每一轮都触发压缩。静默条目保持 cfg 阈值原样。
@@ -1238,6 +1266,158 @@ mod resolve_tests {
             skills_catalog_budget_explicit: false,
             model_injected: false,
         }
+    }
+
+    fn openai_entry(api_style: Option<&str>, effort: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            name: "L".into(),
+            provider: ModelProvider::Openai,
+            api_url: "https://l".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            api_style: api_style.map(str::to_string),
+            reasoning_effort: effort.map(str::to_string),
+            reasoning_capabilities: None,
+            context_length: None,
+        }
+    }
+
+    fn caps(
+        chat: Option<(&[&str], Option<&str>)>,
+        responses: Option<(&[&str], Option<&str>)>,
+    ) -> ReasoningCapabilities {
+        let conv = |v: Option<(&[&str], Option<&str>)>| {
+            v.map(|(tiers, err)| ChannelCapability {
+                supported: tiers.iter().map(|s| s.to_string()).collect(),
+                probed_at: 1,
+                error: err.map(str::to_string),
+            })
+        };
+        ReasoningCapabilities {
+            chat: conv(chat),
+            responses: conv(responses),
+            anthropic: None,
+        }
+    }
+
+    #[test]
+    fn an_unsupported_default_effort_is_dropped_at_resolve_time() {
+        let catalog = ModelCatalog {
+            models: vec![ModelEntry {
+                reasoning_capabilities: Some(caps(Some((&["low"], None)), None)),
+                ..openai_entry(Some("chat"), Some("high"))
+            }],
+            default_model: Some("L".into()),
+            subagent_model: None,
+        };
+        let out = resolve_effective(&cfg(), &catalog, None);
+        assert_eq!(
+            out.reasoning_effort, None,
+            "an unsupported tier must not be sent at all"
+        );
+    }
+
+    #[test]
+    fn a_supported_default_effort_survives_resolution() {
+        let catalog = ModelCatalog {
+            models: vec![ModelEntry {
+                reasoning_capabilities: Some(caps(Some((&["low", "high"], None)), None)),
+                ..openai_entry(Some("chat"), Some("high"))
+            }],
+            default_model: Some("L".into()),
+            subagent_model: None,
+        };
+        assert_eq!(
+            resolve_effective(&cfg(), &catalog, None).reasoning_effort,
+            Some("high".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unknown_capability_keeps_the_default_effort() {
+        let entry = openai_entry(Some("chat"), Some("high"));
+        assert!(effort_is_allowed(&entry, "high"), "unknown must not block");
+        assert_eq!(supported_efforts(&entry), None);
+    }
+
+    #[test]
+    fn a_probe_error_is_treated_as_unknown_not_as_zero_tiers() {
+        let entry = ModelEntry {
+            reasoning_capabilities: Some(caps(None, Some((&[], Some("HTTP 401"))))),
+            ..openai_entry(Some("responses"), Some("high"))
+        };
+        assert_eq!(
+            supported_efforts(&entry),
+            None,
+            "an errored probe says nothing about which tiers work"
+        );
+        assert!(effort_is_allowed(&entry, "high"));
+    }
+
+    /// 明确的「七档全被拒」是结论而非未知：UI 该显示零个档位，运行期必须拦下。
+    #[test]
+    fn an_empty_but_trustworthy_list_blocks_every_tier() {
+        let entry = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&[], None)), None)),
+            ..openai_entry(Some("chat"), Some("high"))
+        };
+        assert_eq!(supported_efforts(&entry), Some(Vec::new()));
+        assert!(!effort_is_allowed(&entry, "high"));
+    }
+
+    #[test]
+    fn auto_prefers_responses_but_falls_back_to_a_trustworthy_chat() {
+        let both = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&["low"], None)), Some((&["high"], None)))),
+            ..openai_entry(None, None)
+        };
+        assert_eq!(effective_channel(&both), "responses");
+        assert_eq!(supported_efforts(&both), Some(vec!["high".to_string()]));
+
+        let chat_only = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&["low"], None)), None)),
+            ..openai_entry(None, None)
+        };
+        assert_eq!(effective_channel(&chat_only), "chat");
+        assert_eq!(supported_efforts(&chat_only), Some(vec!["low".to_string()]));
+
+        // chat 有记录但出错、responses 没有 → 仍是 responses（未知），
+        // 不能把「chat 那轮失败」当成 chat 支持集合。
+        let errored_chat = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&[], Some("boom"))), None)),
+            ..openai_entry(None, None)
+        };
+        assert_eq!(effective_channel(&errored_chat), "responses");
+        assert_eq!(supported_efforts(&errored_chat), None);
+    }
+
+    #[test]
+    fn an_explicit_api_style_pins_the_channel() {
+        let entry = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&["low"], None)), Some((&["high"], None)))),
+            ..openai_entry(Some("chat"), None)
+        };
+        assert_eq!(effective_channel(&entry), "chat");
+        assert_eq!(supported_efforts(&entry), Some(vec!["low".to_string()]));
+    }
+
+    #[test]
+    fn an_anthropic_entry_only_looks_at_the_anthropic_slot() {
+        let entry = ModelEntry {
+            reasoning_capabilities: Some(ReasoningCapabilities {
+                chat: Some(ChannelCapability {
+                    supported: vec!["low".into()],
+                    probed_at: 1,
+                    error: None,
+                }),
+                ..Default::default()
+            }),
+            ..openai_entry(None, None)
+        };
+        let mut entry = entry;
+        entry.provider = ModelProvider::Anthropic;
+        assert_eq!(effective_channel(&entry), "anthropic");
+        assert_eq!(supported_efforts(&entry), None);
     }
 
     fn catalog() -> ModelCatalog {

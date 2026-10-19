@@ -950,6 +950,50 @@ pub(crate) async fn handle(
                     return Ok(Flow::Continue);
                 }
             };
+            // 条目有能力数据时只接受它支持的档位。能力未知（未探测/探测失败）
+            // 时保持七档白名单——与探测功能上线前的行为一致，不能因为「还没测」
+            // 就把用户挡在门外。
+            //
+            // `model_ref` 取该会话自己的覆盖：`thread/setModel` 落了什么，这里
+            // 就校验什么。拿不到 ref（冷 thread 的手写 meta、或跟随全局默认）
+            // 时回退到全局默认条目——那正是这次设置会生效到的那一条。
+            if let Some(effort) = effort.as_deref() {
+                let store = store_lookup(state.threads, state.workspaces, state.cfg, &thread_id);
+                let model_ref = store
+                    .load(&thread_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|loaded| loaded.meta.model_ref);
+                let catalog = yi_agent_runtime::models::load_catalog_from(state.models_path);
+                if let Some(entry) = yi_agent_runtime::models::effective_entry_for(
+                    state.cfg,
+                    &catalog,
+                    model_ref.as_deref(),
+                ) {
+                    if let Some(allowed) = yi_agent_runtime::models::supported_efforts(entry) {
+                        if !allowed.iter().any(|s| s == effort) {
+                            let supported = if allowed.is_empty() {
+                                "(none)".to_string()
+                            } else {
+                                allowed.join(", ")
+                            };
+                            write_response(
+                                state.hub,
+                                state.client,
+                                err_response(
+                                    id,
+                                    RpcError::invalid_params(format!(
+                                        "reasoning effort '{effort}' is not supported by this \
+                                         model; supported: {supported}"
+                                    )),
+                                ),
+                            )
+                            .await?;
+                            return Ok(Flow::Continue);
+                        }
+                    }
+                }
+            }
             // 先让在场 driver 用新 effort 重建 agent（复用当前 provider——
             // effort 不烤进 URL/key），成功后再落盘。铁律「上报/落盘 == 实际
             // 运行」同 setModel:若重建失败,agent 仍跑旧档位,此时落盘就会让
