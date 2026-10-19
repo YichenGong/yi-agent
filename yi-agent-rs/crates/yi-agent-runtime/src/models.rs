@@ -730,6 +730,24 @@ pub fn mask_key(key: &str) -> String {
 /// 以及 `api_style` / `reasoning_effort` 的 cfg 克隆，其余字段保持原值。
 ///
 /// 条目选择走 [`effective_entry_for`]：会话覆盖 > 整包注入 > 清单默认。
+/// 该配置是否「足以发起一次对话」：key 与 model 都非空。
+///
+/// 供 CLI 的「尚未配置模型」引导复用。**必须作用在 `resolve_effective` 的结果上**：
+/// 只看 `load_lenient` 的裸配置会把「模型只存在于 `models.json`」的机器误判成
+/// 未配置——那正是设置页配好模型、却没设任何环境变量的常见状态。
+pub fn is_usable(cfg: &RuntimeConfig) -> bool {
+    !cfg.api_key.trim().is_empty() && !cfg.model.trim().is_empty()
+}
+
+/// 在**给定清单**下这台机器是否足以发起一次对话。
+///
+/// 这是 CLI 两个入口（TUI 与 `run`）共用的唯一判定点。把它单独拎出来的原因：
+/// 判定必须在 `resolve_effective` **之后**做，否则「模型只存在于 `models.json`」
+/// 的机器（设置页配好、但没设环境变量）会被误判成未配置。
+pub fn is_configured(cfg: &RuntimeConfig, catalog: &ModelCatalog) -> bool {
+    is_usable(&resolve_effective(cfg, catalog, None))
+}
+
 pub fn resolve_effective(
     cfg: &RuntimeConfig,
     catalog: &ModelCatalog,
@@ -1512,6 +1530,44 @@ mod resolve_tests {
             skills_catalog_budget_explicit: false,
             model_injected: false,
         }
+    }
+
+    /// 只有 `models.json`、没有任何环境变量/CLI 参数时，`run` 必须能起得来。
+    ///
+    /// `run_agent`（TUI）一直先 `resolve_effective` 再判定，而 `run_headless`
+    /// 曾经直接拿裸配置判定——于是「按设置页配好模型、但没设环境变量」的机器上
+    /// `yi-agent run` 误报「尚未配置模型」，TUI 用同一份清单却正常。
+    /// `is_configured` 是两个入口唯一的判定点，这条测试钉住它的语义。
+    #[test]
+    fn a_catalog_only_model_counts_as_configured() {
+        let mut base = cfg();
+        base.api_key.clear();
+        let empty = ModelCatalog::default();
+
+        assert!(
+            !is_configured(&base, &empty),
+            "a bare config with no key and an empty catalog must be unusable"
+        );
+
+        let catalog = ModelCatalog {
+            models: vec![ModelEntry {
+                name: "catalog-only".into(),
+                provider: ModelProvider::Openai,
+                api_url: "https://example.invalid/v1".into(),
+                model: "catalog-only-model".into(),
+                api_key: "sk-from-catalog".into(),
+                api_style: None,
+                reasoning_effort: None,
+                reasoning_capabilities: None,
+                context_length: None,
+            }],
+            default_model: Some("catalog-only".into()),
+            subagent_model: None,
+        };
+        assert!(
+            is_configured(&base, &catalog),
+            "a model that exists only in models.json must count as configured"
+        );
     }
 
     fn openai_entry(api_style: Option<&str>, effort: Option<&str>) -> ModelEntry {

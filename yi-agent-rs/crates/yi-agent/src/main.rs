@@ -1214,9 +1214,7 @@ fn run_agent(cli: Cli) -> Result<()> {
     let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
     // 一台既没有配置、也拿不到 key 的机器，给出与 `run_headless` 同一条指引，
     // 而不是加载器那句干巴巴的 "API key required"。
-    if let Some(line) =
-        unconfigured_guidance(!config.api_key.trim().is_empty() && !config.model.trim().is_empty())
-    {
+    if let Some(line) = unconfigured_guidance(yi_agent_runtime::models::is_usable(&config)) {
         eprintln!("{line}");
         std::process::exit(1);
     }
@@ -1546,8 +1544,13 @@ fn build_headless_setup_for_workspace(
 ///
 /// 判定基于 `run` 实际加载出的配置（含全局 `.env`、进程环境变量与 CLI 覆盖），
 /// 避免「桌面/环境变量已配好却被拦下」的误判。
-pub(crate) fn unconfigured_guidance(configured: bool) -> Option<String> {
-    if configured {
+/// `usable` 为真表示配置足以发起一次对话；为假时给出可操作的指引。
+///
+/// 参数名刻意用 `usable` 而不是 `configured`：调用点应传入
+/// `models::is_usable(&config)` 的**原值**。写成 `!is_usable(..)` 会把判断整个
+/// 反转——曾经就是这样，导致「清单里配好模型」的机器反而报未配置。
+pub(crate) fn unconfigured_guidance(usable: bool) -> Option<String> {
+    if usable {
         None
     } else {
         Some(
@@ -1569,9 +1572,12 @@ fn run_headless(
     subagents: bool,
 ) -> Result<()> {
     let config = config::load_lenient(&cli)?;
-    if let Some(line) =
-        unconfigured_guidance(!config.api_key.trim().is_empty() && !config.model.trim().is_empty())
-    {
+    // 与 TUI 同一条解析链：先让 `models.json` 的默认条目补上 provider/model/key，
+    // 再判断是否可发起对话。只拿裸配置判定会把「模型只在清单里」的机器误判成
+    // 未配置——那是设置页配好模型、却没设任何环境变量的常见状态。
+    let catalog = yi_agent_runtime::models::load_catalog();
+    let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
+    if let Some(line) = unconfigured_guidance(yi_agent_runtime::models::is_usable(&config)) {
         eprintln!("{line}");
         std::process::exit(1);
     }
@@ -2545,14 +2551,10 @@ mod tests {
         let strict = ["config::load(", "&cli)"].concat();
         let catalog = ["models::load_catalog", "()"].concat();
         let resolve = ["models::resolve_effective(&config, &catalog", ", None)"].concat();
-        // 判据被 rustfmt 折行，故分成两条 needle：调用存在 + 条件同时要求
-        // key 与 model 非空。少任何一项，CI 都会在这里失败。
+        // 判定收敛到 `models::is_usable`:必须作用在 `resolve_effective` 之后，
+        // 且传原值(不是取反)。少任何一项，CI 都会在这里失败。
         let guide_call = ["unconfigured_guidance", "("].concat();
-        let guide_condition = [
-            "!config.api_key.trim().is_empty()",
-            " && !config.model.trim().is_empty()",
-        ]
-        .concat();
+        let guide_condition = "unconfigured_guidance(yi_agent_runtime::models::is_usable(&config))";
         let offer_at = body.find(&offer).expect("run_agent must offer onboarding");
         let load_at = body
             .find(&load)
@@ -2612,6 +2614,60 @@ mod tests {
     #[test]
     fn no_guidance_when_the_env_is_complete() {
         assert!(unconfigured_guidance(true).is_none());
+    }
+
+    /// 两个入口都必须把「可用的原值」传给 `unconfigured_guidance`。
+    ///
+    /// 该函数曾经叫 `configured`，而调用点写成 `!is_usable(..)`——极性反了，
+    /// 于是清单里配好模型、却没有环境变量的机器上 `yi-agent run` 直接报
+    /// 「尚未配置模型」。这个断言挡住同类笔误再溜进来。
+    #[test]
+    fn every_entry_point_passes_the_usable_value_through_unchanged() {
+        let source = include_str!("main.rs");
+        for (needle, why) in [
+            (
+                [
+                    "unconfigured_guidance(!",
+                    "yi_agent_runtime::models::is_usable(&config)",
+                ]
+                .concat(),
+                "call sites must not invert is_usable",
+            ),
+            (
+                [
+                    "if let Some(line) = unconfigured_guidance(",
+                    "yi_agent_runtime::models::is_usable(&config)) {",
+                ]
+                .concat(),
+                "call sites must pass is_usable(&config) directly",
+            ),
+        ] {
+            if why.contains("must not invert") {
+                assert!(!source.contains(&needle), "{why}");
+            } else {
+                assert_eq!(
+                    source.matches(&needle).count(),
+                    2,
+                    "both `run` and the TUI entry must check usability ({why})"
+                );
+            }
+        }
+    }
+
+    /// `run` 必须让清单的默认条目补全配置后再判定，否则「模型只在 models.json」
+    /// 的机器会被误判成未配置。
+    #[test]
+    fn run_headless_resolves_the_catalog_before_deciding() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn run_headless(")
+            .nth(1)
+            .expect("run_headless must exist");
+        let body = &body[..body.find("// Resolve prompt").expect("prompt marker")];
+        assert!(
+            body.contains("resolve_effective(&config, &catalog, None)"),
+            "run_headless must resolve the catalog default before the unconfigured check"
+        );
     }
 
     #[test]
