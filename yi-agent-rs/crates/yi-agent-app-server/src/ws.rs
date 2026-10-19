@@ -129,6 +129,8 @@ where
                 watchman_install: crate::server::production_watchman_install(),
                 watchman_uninstall: crate::server::production_watchman_uninstall(),
                 watchman_home: crate::server::home_dir(),
+                resolve_plugin: std::sync::Arc::new(crate::plugin_worktree::resolve_plugin_command),
+                ensure_daemon: std::sync::Arc::new(yi_agent_supervisors::daemon::ensure_running),
                 lead_inbox: crate::lead::LeadInbox::new(),
                 lead_replies: crate::lead::LeadReplies::new(),
             },

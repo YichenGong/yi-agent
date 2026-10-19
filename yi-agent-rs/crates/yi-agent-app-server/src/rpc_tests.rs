@@ -40,6 +40,8 @@ async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
         watchman_install: std::sync::Arc::new(|_exe: &Path, _home: &Path| -> Result<(), String> {
             Ok(())
         }),
+        resolve_plugin: std::sync::Arc::new(|_name: &str| -> Option<PathBuf> { None }),
+        ensure_daemon: std::sync::Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
         watchman_uninstall: std::sync::Arc::new(|_home: &Path| -> Result<(), String> { Ok(()) }),
         fatal_tx,
     };
@@ -1696,10 +1698,19 @@ pub(crate) struct Harness {
     /// 与主循环**共享**的视图帧表:测试据此直接注入帧(模拟 Task 4 的工具写帧),
     /// 并断言 `thread/view/read` 读的是**同一张**表。自造第二份会读出一张空表。
     pub(crate) view_frames: crate::server::ViewFrames,
+    /// 假的插件目录:每个文件是一个 `sh` 脚本,冒充「已安装的插件」。
+    /// 持有 tempdir,并把目录名交给注入的解析器。
+    pub(crate) plugins_dir: tempfile::TempDir,
+    /// 注入的 daemon 拉起记录器:`plugin/install` 不该真的 `spawn` 进程。
+    pub(crate) daemon_calls: DaemonCalls,
 }
 
 /// 记录到的 watchman 调用:安装为 `true`、卸载为 `false`，附所针对的 home。
 pub(crate) type WatchmanCalls = Arc<StdMutex<Vec<(bool, PathBuf)>>>;
+
+/// 记录到的 daemon 拉起调用(`plugin/install` 的最后一步)。测试据此断言
+/// 「安装完真的会去拉起 daemon」,同时不真的拉起任何进程。
+pub(crate) type DaemonCalls = Arc<StdMutex<Vec<PathBuf>>>;
 
 impl Harness {
     pub(crate) fn new() -> Self {
@@ -1857,6 +1868,23 @@ impl Harness {
         // 值守的 home 也落在隔离目录里:安装/卸载经调用方注入的闭包,绝不
         // 触碰真实的 `~/Library/LaunchAgents`。
         let watchman_home = tempfile::TempDir::new().unwrap();
+        // 假的插件可执行目录:注入的解析器只在它里面找名字,故既不依赖本机
+        // 装了什么插件,也不必改动进程级 `PATH`(那会污染同进程的并行用例)。
+        let plugins_dir = tempfile::TempDir::new().unwrap();
+        let plugins_root = plugins_dir.path().to_path_buf();
+        let resolve_plugin: crate::server::ResolvePlugin = Arc::new(move |name: &str| {
+            let candidate = plugins_root.join(name);
+            candidate.is_file().then_some(candidate)
+        });
+        let daemon_calls: DaemonCalls = Arc::new(StdMutex::new(Vec::new()));
+        let daemon_log = Arc::clone(&daemon_calls);
+        let ensure_daemon: crate::server::EnsureDaemon = Arc::new(move |project: &Path| {
+            daemon_log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(project.to_path_buf());
+            Ok(true)
+        });
         // skill 根同样落在隔离目录里:`skill/list` 不得枚举开发者真实的
         // `~/.yi-agent/skills`。
         let skills_home = tempfile::TempDir::new().unwrap();
@@ -1900,6 +1928,10 @@ impl Harness {
                 watchman_install: install,
                 watchman_uninstall: uninstall,
                 watchman_home: watchman_home.path().to_path_buf(),
+                // 假插件目录 + 记账式 daemon 拉起:安装路径可测,且绝不真的
+                // `spawn` 一个 detached `daemon serve`。
+                resolve_plugin,
+                ensure_daemon,
                 // 与主循环**共享**同一份信箱(clone 共用同一个 broadcast
                 // sender):测试经 `lead_inbox` 直接投递的消息必须被主循环
                 // 收到,自造第二份会投进没人听的通道。
@@ -1924,6 +1956,8 @@ impl Harness {
             lead_inbox,
             lead_replies,
             view_frames,
+            plugins_dir,
+            daemon_calls,
         }
     }
 
@@ -3008,6 +3042,7 @@ async fn unknown_method_returns_method_not_found() {
         ("resident/list", Domain::Resident),
         // ---- Plugin(`plugin/*` 与 `plugins/*`) ----
         ("plugin/query", Domain::Plugin),
+        ("plugin/install", Domain::Plugin),
         ("plugin/settings/read", Domain::Plugin),
         ("plugin/settings/write", Domain::Plugin),
         ("plugins/list", Domain::Plugin),
@@ -3279,6 +3314,10 @@ async fn eof_exits_gracefully() {
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
+            // 测试注入:绝不为一次安装真的拉起 detached daemon(那会拿测试
+            // 二进制当 daemon、并白等 10s)。
+            resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
+            ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
         },
@@ -3357,6 +3396,10 @@ async fn agent_factory_failure_returns_internal_error() {
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
+            // 测试注入:绝不为一次安装真的拉起 detached daemon(那会拿测试
+            // 二进制当 daemon、并白等 10s)。
+            resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
+            ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
         },
@@ -3437,6 +3480,10 @@ async fn oversized_frame_returns_err() {
             watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
             watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
             watchman_home: PathBuf::new(),
+            // 测试注入:绝不为一次安装真的拉起 detached daemon(那会拿测试
+            // 二进制当 daemon、并白等 10s)。
+            resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
+            ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
         },
@@ -15391,6 +15438,9 @@ impl MergedHarness {
                 watchman_install: Arc::new(|_exe: &Path, _home: &Path| Ok(())),
                 watchman_uninstall: Arc::new(|_home: &Path| Ok(())),
                 watchman_home: PathBuf::new(),
+                // 测试注入:同上,不拉起真实 daemon。
+                resolve_plugin: Arc::new(|_name: &str| -> Option<PathBuf> { None }),
+                ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
                 lead_inbox: crate::lead::LeadInbox::new(),
                 lead_replies: crate::lead::LeadReplies::new(),
             },
@@ -16697,4 +16747,288 @@ fn the_lead_does_not_get_ask_lead() {
         plain_names.contains(&"ask_lead".to_string()),
         "a plain session keeps ask_lead, got {plain_names:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// `plugin/install`:宿主把一个插件装进一个项目（spec §4.4 方案 A 的宿主侧）。
+//
+// 全新项目没有 `.yi-agent/supervisors/<plugin>.json`，故它的插件不会被拉起，
+// `plugin/query` 也就够不着它——这个循环只能由宿主从外面打破。安装 = 让插件
+// 自述清单 + 写盘 + 打开开关，缺一都会得到一个「注册了、起来了、却永不推进」
+// 的插件。
+// ---------------------------------------------------------------------------
+
+/// 在 harness 的假插件目录里放一个可执行的 `sh` 脚本，冒充「已安装的插件」。
+///
+/// 脚本的行为由 `body` 决定，故成功与各种拒绝（非 0 退出、非 JSON、名字不符）
+/// 走的是**同一条**真实代码路径——解析、`Command::output()`、stdout 解析都
+/// 真的执行了，只有「从哪儿找可执行文件」是注入的。
+fn write_fake_plugin(h: &Harness, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = h.plugins_dir.path().join(name);
+    std::fs::write(&path, body).unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    path
+}
+
+/// 发一条 `plugin/install`。路径经 `json!` 序列化，故含引号/反斜杠的临时目录
+/// 也不会拼出坏 JSON。
+async fn send_install(h: &mut Harness, id: u64, project: &std::path::Path, plugin: &str) {
+    let params = serde_json::json!({
+        "project": project.to_string_lossy(),
+        "plugin": plugin,
+    });
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "plugin/install",
+            "params": params,
+        })
+        .to_string(),
+    )
+    .await;
+}
+
+/// 一个会打印指定清单的假插件。
+fn fake_plugin_printing(h: &Harness, name: &str, manifest: &str) -> std::path::PathBuf {
+    // 清单里含引号与换行，故用 `cat <<'EOF'`，避免 shell 再解释一遍。
+    write_fake_plugin(
+        h,
+        name,
+        &format!("#!/bin/sh\ncat <<'MANIFEST_EOF'\n{manifest}\nMANIFEST_EOF\n"),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_resolves_the_command_and_writes_what_the_plugin_describes() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    let manifest = serde_json::json!({
+        "name": "demo-plugin",
+        "command": "/bin/true",
+        "args": ["run"],
+        "switch_key": "demo_plugin_on",
+    });
+    fake_plugin_printing(&h, "demo-plugin", &manifest.to_string());
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_none(),
+        "installing a well-formed plugin must succeed: {response}"
+    );
+    assert_eq!(response["result"]["installed"], true);
+
+    // `project_arg` 会 canonicalize（macOS 上 `/var` → `/private/var`），故期望
+    // 路径也必须先规范化，否则比的是同一个目录的两种写法。
+    let written = std::fs::canonicalize(project.path())
+        .unwrap()
+        .join(".yi-agent")
+        .join("supervisors")
+        .join("demo-plugin.json");
+    assert_eq!(
+        response["result"]["manifest"].as_str(),
+        Some(written.to_string_lossy().as_ref()),
+        "the response must name the file it wrote"
+    );
+    let text = std::fs::read_to_string(&written)
+        .expect("the manifest must be written under the project's supervisors dir");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+        manifest,
+        "the manifest must be installed verbatim, not reinterpreted by the host"
+    );
+
+    // 3b（spec §4.4.1）：清单只让 supervisor 拉起进程，开关才决定它要不要干活。
+    // 只写清单会得到一个「起来了但队列永不推进」的插件，故这一步必须钉死。
+    let preferences =
+        std::fs::read_to_string(project.path().join(".yi-agent").join("preferences.json"))
+            .expect("installing must also create the project's preferences file");
+    let preferences: serde_json::Value = serde_json::from_str(&preferences).unwrap();
+    assert_eq!(
+        preferences["demo_plugin_on"], true,
+        "the manifest's switch_key must be on: a registered plugin that never advances is not installed"
+    );
+
+    // 最后一步：装完要把项目 daemon 拉起来（否则没有进程去读这份清单）。
+    let daemons = h
+        .daemon_calls
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    assert_eq!(
+        daemons,
+        vec![std::fs::canonicalize(project.path()).unwrap()],
+        "plugin/install must ask for the project's daemon once the manifest is durable"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_reports_a_missing_plugin_without_writing_anything() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    send_install(&mut h, 9, project.path(), "not-installed-anywhere").await;
+    let response = h.read_value().await;
+    assert_eq!(
+        response["error"]["code"], -32023,
+        "a name that resolves to nothing is `plugin_not_installed`: {response}"
+    );
+    assert_eq!(response["error"]["data"]["code"], "plugin_not_installed");
+
+    // 失败必须**什么都没写**：留下半个安装（有清单、无开关）比干净失败更难收拾。
+    assert!(
+        !project.path().join(".yi-agent").exists(),
+        "a failed install must not create the project's .yi-agent directory"
+    );
+    assert!(
+        h.daemon_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "a failed install must not start a daemon"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_rejects_a_manifest_that_describes_another_plugin() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    // 名字对不上：落盘会写出 `demo-plugin.json`，内容却说自己是别人。
+    // 宿主不解释插件的语义，但这种自述它无法安全使用。
+    fake_plugin_printing(
+        &h,
+        "demo-plugin",
+        &serde_json::json!({
+            "name": "somebody-else",
+            "command": "/bin/true",
+            "switch_key": "demo_plugin_on",
+        })
+        .to_string(),
+    );
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert_eq!(response["error"]["code"], -32024, "{response}");
+    assert_eq!(response["error"]["data"]["code"], "plugin_rejected");
+    assert!(
+        !project.path().join(".yi-agent").exists(),
+        "a rejected manifest must leave nothing behind"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_rejects_a_manifest_without_a_switch_key() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    // 没有 switch_key 就无法打开开关；装进去会得到一个永不推进的插件，
+    // 故必须在落盘前拒绝。
+    fake_plugin_printing(
+        &h,
+        "demo-plugin",
+        &serde_json::json!({ "name": "demo-plugin", "command": "/bin/true" }).to_string(),
+    );
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert_eq!(
+        response["error"]["data"]["code"], "plugin_rejected",
+        "{response}"
+    );
+    assert!(!project.path().join(".yi-agent").exists());
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_reports_a_plugin_that_fails_to_describe_itself() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    write_fake_plugin(
+        &h,
+        "demo-plugin",
+        "#!/bin/sh\necho 'no manifest for you' >&2\nexit 3\n",
+    );
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert_eq!(
+        response["error"]["data"]["code"], "plugin_rejected",
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no manifest for you"),
+        "the error must carry the plugin's own first stderr line: {response}"
+    );
+    assert!(!project.path().join(".yi-agent").exists());
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_rejects_non_json_and_requires_a_project() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    write_fake_plugin(&h, "demo-plugin", "#!/bin/sh\necho 'not json at all'\n");
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert_eq!(
+        response["error"]["data"]["code"], "plugin_rejected",
+        "{response}"
+    );
+    assert!(!project.path().join(".yi-agent").exists());
+
+    // 缺 `project` / 缺 `plugin` 是调用方参数错误，不是插件问题。
+    for (id, params) in [
+        (10_u64, serde_json::json!({ "plugin": "demo-plugin" })),
+        (
+            11,
+            serde_json::json!({ "project": project.path().to_string_lossy() }),
+        ),
+        (
+            12,
+            serde_json::json!({ "project": project.path().to_string_lossy(), "plugin": "" }),
+        ),
+        (
+            13,
+            serde_json::json!({ "project": project.path().to_string_lossy(), "plugin": "../escape" }),
+        ),
+    ] {
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"plugin/install","params":{params}}}"#
+        ))
+        .await;
+        let response = h.read_value().await;
+        assert_eq!(response["id"], id);
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "invalid params: {response}"
+        );
+    }
+
+    h.shutdown().await;
 }

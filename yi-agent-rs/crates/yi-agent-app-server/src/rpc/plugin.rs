@@ -70,6 +70,261 @@ pub(crate) async fn handle_shared(
                 }
             }
         }
+        "plugin/install" => {
+            // 把一个插件装进一个项目：让它自述清单，宿主落盘并打开它的开关。
+            //
+            // 为什么必须由宿主做：插件要能被调起来，前提是清单已在
+            // `<项目>/.yi-agent/supervisors/<name>.json`；而「被调起来」正是它写
+            // 清单的前提。全新项目没有清单，这个循环只能由宿主从外面打破。
+            //
+            // 顺序是「先校验、后落盘」：任何一步失败都**什么都没写**，用户重试
+            // 不会留下半个安装。
+            let Some(project) = project_arg(&req.params) else {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(id, RpcError::invalid_params("missing or empty project")),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            };
+            let plugin = req
+                .params
+                .get("plugin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !yi_agent_supervisors::install::is_valid_plugin_name(&plugin) {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(
+                        id,
+                        RpcError::invalid_params("missing or unusable plugin name"),
+                    ),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            }
+            // **按请求里的名字解析**，不读 `state.plugin_command`：那个字段是启动
+            // 时按一个具体插件名解析好的单一路径，用它等于把插件名写死进宿主。
+            let Some(exe) = (state.resolve_plugin)(&plugin) else {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(
+                        id,
+                        RpcError::plugin_query_error(
+                            "plugin_not_installed",
+                            format!("{plugin} is not installed: not found on PATH"),
+                        ),
+                    ),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            };
+            // `<plugin> manifest` 是阻塞子进程调用；放进 blocking 池，别让一次
+            // 安装卡住一个 async worker。
+            let described = {
+                let exe = exe.clone();
+                tokio::task::spawn_blocking(move || {
+                    std::process::Command::new(&exe).arg("manifest").output()
+                })
+                .await
+            };
+            let output = match described {
+                Ok(Ok(output)) => output,
+                Ok(Err(error)) => {
+                    write_or_fatal(
+                        state,
+                        id.clone(),
+                        err_response(
+                            id,
+                            RpcError::plugin_query_error(
+                                "plugin_rejected",
+                                format!("could not run `{plugin} manifest`: {error}"),
+                            ),
+                        ),
+                    )
+                    .await;
+                    return Ok(Flow::Continue);
+                }
+                Err(error) => {
+                    write_or_fatal(
+                        state,
+                        id.clone(),
+                        err_response(
+                            id,
+                            RpcError::internal(format!("the manifest task failed: {error}")),
+                        ),
+                    )
+                    .await;
+                    return Ok(Flow::Continue);
+                }
+            };
+            let reject = |message: String| RpcError::plugin_query_error("plugin_rejected", message);
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let first = stderr.lines().next().unwrap_or("").trim();
+                let detail = if first.is_empty() {
+                    format!("`{plugin} manifest` exited with {}", output.status)
+                } else {
+                    format!("`{plugin} manifest` failed: {first}")
+                };
+                write_or_fatal(state, id.clone(), err_response(id, reject(detail))).await;
+                return Ok(Flow::Continue);
+            }
+            // 清单原样写盘（逐字保留插件给的格式），故这里只做「能不能安全使用」
+            // 的校验，不解释插件的语义。
+            let manifest_json = match String::from_utf8(output.stdout) {
+                Ok(text) => text,
+                Err(_) => {
+                    write_or_fatal(
+                        state,
+                        id.clone(),
+                        err_response(
+                            id,
+                            reject(format!("`{plugin} manifest` did not print UTF-8")),
+                        ),
+                    )
+                    .await;
+                    return Ok(Flow::Continue);
+                }
+            };
+            let manifest: serde_json::Value = match serde_json::from_str(&manifest_json) {
+                Ok(value) => value,
+                Err(error) => {
+                    write_or_fatal(
+                        state,
+                        id.clone(),
+                        err_response(
+                            id,
+                            reject(format!("`{plugin} manifest` did not print JSON: {error}")),
+                        ),
+                    )
+                    .await;
+                    return Ok(Flow::Continue);
+                }
+            };
+            let Some(object) = manifest.as_object() else {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(
+                        id,
+                        reject(format!("`{plugin} manifest` is not a JSON object")),
+                    ),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            };
+            let described_name = object.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if described_name != plugin {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(
+                        id,
+                        reject(format!(
+                            "`{plugin} manifest` describes {described_name:?}, not {plugin:?}"
+                        )),
+                    ),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            }
+            let switch_key = object
+                .get("switch_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if switch_key.is_empty() {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(
+                        id,
+                        reject(format!("`{plugin} manifest` declares no switch_key")),
+                    ),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            }
+
+            // 先清单、后开关：清单让 supervisor 拉起进程，开关决定它要不要干活。
+            // 两者缺一都会得到一个「注册了、起来了、却永不推进」的插件，
+            // 故它们是一次安装的两半（spec §4.4.1）。
+            if let Err(error) = yi_agent_supervisors::install::install_manifest_for(
+                &project,
+                &plugin,
+                &manifest_json,
+            ) {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(
+                        id,
+                        RpcError::internal(format!(
+                            "could not install the {plugin} manifest: {error}"
+                        )),
+                    ),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            }
+            if let Err(error) = yi_agent_supervisors::install::enable_switch(&project, switch_key) {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(
+                        id,
+                        RpcError::internal(format!(
+                            "installed the {plugin} manifest but could not enable {switch_key}: {error}"
+                        )),
+                    ),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            }
+            // 拉起 daemon 是 best-effort：清单与开关已经落盘，常驻监视线程每
+            // ~30s 会再扫一遍。这里失败只是「这次没立刻起来」，不该让一次已经
+            // 成功的安装回滚成失败。
+            let ensure = std::sync::Arc::clone(&state.ensure_daemon);
+            let daemon_project = project.clone();
+            match tokio::task::spawn_blocking(move || ensure(&daemon_project)).await {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => tracing::warn!(
+                    project = %project.display(),
+                    plugin = %plugin,
+                    "installed the plugin but its daemon did not become ready; the resident watch will retry"
+                ),
+                Ok(Err(error)) => tracing::warn!(
+                    project = %project.display(),
+                    plugin = %plugin,
+                    "installed the plugin but could not start its daemon: {error}"
+                ),
+                Err(error) => tracing::warn!(
+                    project = %project.display(),
+                    plugin = %plugin,
+                    "the daemon-start task failed: {error}"
+                ),
+            }
+            write_or_fatal(
+                state,
+                id.clone(),
+                ok_response(
+                    id,
+                    json!({
+                        "installed": true,
+                        // `PathBuf` 的 `Serialize` 在非 UTF-8 路径上会直接报错；
+                        // 回包里的路径是给客户端看的，lossy 比整条响应失败好。
+                        "manifest": yi_agent_supervisors::install::manifests_dir(&project)
+                            .join(format!("{plugin}.json"))
+                            .to_string_lossy(),
+                    }),
+                ),
+            )
+            .await;
+        }
         "plugins/list" => {
             let workdir = state.theme_handle.workdir();
             // 清单按项目安装，故作用域可由调用方的 `project` 指定；

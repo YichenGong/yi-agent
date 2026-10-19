@@ -116,10 +116,10 @@ pub(crate) enum Flow {
 /// `watchman_install`）在 `board/*` 域删除后**暂时没有读者**：它们原先只被
 /// `board/create`（写清单 + 登记常驻 + 装值守）读。之所以保留而不是删掉：
 ///
-/// 1. `plugin_command` 是 §4.4 的宿主侧 `plugin/install` 落地时要用的**接缝**
-///    （spec §5.2 明确要求「`plugin_command` 注入若保留，改为通用按插件名解析」，
-///    本任务的 Step 5 也点名**不要删**这个接缝）。删掉它等于把已经做好的通用解析
-///    再拆一遍。
+/// 1. `plugin_command` 是启动时按**一个**插件名解析出的路径；`plugin/install`
+///    没有用它，而是按请求里的名字经 [`Self::resolve_plugin`] 逐次解析（见下）。
+///    之所以仍保留而不是此处删掉：它是 Task 6 的清理面，与本次安装能力互为独立，
+///    混在一起删会让「谁在用什么」更难追溯。
 /// 2. `resident_dir` 是通用常驻登记目录，`watchman_*` 是通用值守句柄——`ui/*` 的
 ///    开关臂已经在用同一对句柄（经 [`AppState`]），它们的通用性不依赖看板。
 ///
@@ -130,7 +130,8 @@ pub(crate) struct PluginChannelState {
     /// 通用常驻登记目录。见结构文档：`board/*` 删除后暂无读者。
     #[allow(dead_code)]
     pub(crate) resident_dir: std::path::PathBuf,
-    /// 按插件名解析出的可执行路径。见结构文档：**§4.4 的接缝，必须保留**。
+    /// 启动时按一个插件名解析出的可执行路径。`plugin/install` 不走它（它只认识
+    /// 一个插件名），改走 [`Self::resolve_plugin`]；见结构文档。
     #[allow(dead_code)]
     pub(crate) plugin_command: std::path::PathBuf,
     pub(crate) theme_handle: crate::theme_tool::ThemeHandle,
@@ -140,6 +141,15 @@ pub(crate) struct PluginChannelState {
     /// 安装句柄。见结构文档：`board/*` 删除后暂无读者。
     #[allow(dead_code)]
     pub(crate) watchman_install: crate::server::WatchmanInstall,
+    /// 按名字解析插件可执行文件（`plugin/install` 的第二步）。见
+    /// [`crate::server::ResolvePlugin`]。
+    pub(crate) resolve_plugin: crate::server::ResolvePlugin,
+    /// 保证项目 daemon 在跑（`plugin/install` 的最后一步）。
+    ///
+    /// **必须可注入**：生产实现会 `spawn` 一个 detached `daemon serve` 并最多等
+    /// 10s 就绪；测试若走生产实现，会拿**测试二进制**当 daemon 拉起来、白等
+    /// 10s，还会在项目目录里留下 runtime socket。
+    pub(crate) ensure_daemon: crate::server::EnsureDaemon,
     /// 卸载句柄。本域无方法卸载值守,故当前无处读它——但它是 brief 声明的接口
     /// 字段,与安装句柄成对,保留以免日后加「卸载值守」方法时又要动本结构的形状。
     #[allow(dead_code)]

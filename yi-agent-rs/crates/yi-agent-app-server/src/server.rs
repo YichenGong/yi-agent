@@ -211,6 +211,12 @@ pub(crate) struct RuntimeAttachments {
     /// 它是「往哪个 `Library/LaunchAgents` 写」与「读哪个 plist 判已装」的
     /// 唯一来源，抽出来测试才不会误判真实 home 里的安装状态。
     pub(crate) watchman_home: PathBuf,
+    /// 按名字解析插件可执行文件（`plugin/install` 的第二步）。可注入的理由
+    /// 见 [`ResolvePlugin`]：靠改 `PATH` 来测会在并行用例间互相污染。
+    pub(crate) resolve_plugin: ResolvePlugin,
+    /// 拉起项目 daemon（`plugin/install` 的最后一步）。可注入的理由同
+    /// `watchman_install`：生产实现会真的 `spawn` 一个 detached 进程。
+    pub(crate) ensure_daemon: EnsureDaemon,
     /// 组长信箱:普通会话经 `ask_lead` 投递的消息进这里,主循环的
     /// `select!` 分支消费它。与 `theme`/`git_diff` 同样的注入理由——测试要在
     /// 主循环之外拿到**同一个**实例投递,自造一份会投进没人听的通道。
@@ -233,6 +239,23 @@ pub(crate) type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String>
 /// Removes the resident watchman under `home`; see
 /// [`yi_agent_supervisors::watchman::uninstall`].
 pub(crate) type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
+
+/// 按插件名解析可执行文件；生产即
+/// [`crate::plugin_worktree::resolve_plugin_command`]。
+///
+/// 之所以是做成一等可注入句柄、而不是让 handler 直接调那个函数：它的实现读
+/// `PATH`，而测「按请求里的名字解析」就必须让某个名字可解析。若靠改进程级
+/// `PATH`，同进程里并行跑的其它用例会在一小段窗口里看到假的 `PATH`（它们
+/// 可能正在 `spawn` 子进程）——那是**偶发**失败，不是确定性的证据。注入之后
+/// 测试完全不需要碰进程环境。
+pub(crate) type ResolvePlugin = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// 保证某个项目有活着的 daemon；见
+/// [`yi_agent_supervisors::daemon::ensure_running`]。
+///
+/// 可注入的理由同 `watchman_install`：生产实现会 `spawn` 一个 detached 的
+/// `daemon serve` 并等待它就绪，测试里绝不能真的拉起进程。
+pub(crate) type EnsureDaemon = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
 
 /// 宿主生产入口注入的插件命令：按插件名在 `PATH` 上解析。
 ///
@@ -1517,6 +1540,8 @@ where
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
+            resolve_plugin: Arc::new(crate::plugin_worktree::resolve_plugin_command),
+            ensure_daemon: Arc::new(yi_agent_supervisors::daemon::ensure_running),
             // 进程一条组长信箱,由 `serve` 的主循环消费。
             lead_inbox: crate::lead::LeadInbox::new(),
             // 回信登记表与信箱同一实例范围:`blocking: true` 的 await 侧登记
@@ -1600,6 +1625,8 @@ where
             watchman_install: production_watchman_install(),
             watchman_uninstall: production_watchman_uninstall(),
             watchman_home: home_dir(),
+            resolve_plugin: Arc::new(crate::plugin_worktree::resolve_plugin_command),
+            ensure_daemon: Arc::new(yi_agent_supervisors::daemon::ensure_running),
             // 进程一条组长信箱,由 `serve` 的主循环消费。
             lead_inbox: crate::lead::LeadInbox::new(),
             // 回信登记表与信箱同一实例范围:`blocking: true` 的 await 侧登记
@@ -2636,6 +2663,8 @@ where
         watchman_install,
         watchman_uninstall,
         watchman_home,
+        resolve_plugin,
+        ensure_daemon,
         lead_inbox,
         lead_replies,
     } = attachments;
@@ -2994,6 +3023,8 @@ where
                             watchman_home: watchman_home.clone(),
                             watchman_install: std::sync::Arc::clone(&watchman_install),
                             watchman_uninstall: std::sync::Arc::clone(&watchman_uninstall),
+                            resolve_plugin: std::sync::Arc::clone(&resolve_plugin),
+                            ensure_daemon: std::sync::Arc::clone(&ensure_daemon),
                             fatal_tx: fatal_tx.clone(),
                         });
                         let req = req.clone();
