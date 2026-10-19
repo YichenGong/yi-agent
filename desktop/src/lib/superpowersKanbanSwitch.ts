@@ -161,13 +161,40 @@ export async function promoteBoardCard(
 }
 
 /**
- * 归一化 `ui/settings/read` 里的 `board_watchman_enabled`。非布尔一律当开：
- * 老配置文件里没有这个键时，用户此前的行为是「一直在跑」，不能因为读不到就
- * 把它关掉。App 直接在握手时套用（那趟 read 已经拿到了整个 settings），
- * `readBoardWatchman` 也用它，保证桌面端只有一处缺省口径。
+ * `ui/settings/read` 里的值守开关字段名。通用化之后的正式名。
+ *
+ * 与宿主 `settings_store::WATCHMAN_KEY` 必须逐字一致：宿主只回这个名字（回旧名
+ * 等于把看板语义留在宿主源码里），桌面若仍读旧名就会永远读不到值。
+ */
+export const WATCHMAN_KEY = "resident_daemon_watchman_enabled";
+
+/**
+ * 通用化之前的旧字段名。只读兼容：旧版宿主仍只回它。
+ *
+ * 读写方向是「新名优先、旧名兜底」，与宿主 `ui/settings/write` 同时认两个名字的
+ * 策略对称。
+ */
+export const LEGACY_WATCHMAN_KEY = "board_watchman_enabled";
+
+/**
+ * 归一化值守开关的值。非布尔一律当开：老配置文件里没有这个键时，用户此前的
+ * 行为是「一直在跑」，不能因为读不到就把它关掉。App 直接在握手时套用（那趟
+ * read 已经拿到了整个 settings），`readBoardWatchman` 也用它，保证桌面端只有
+ * 一处缺省口径。
  */
 export function parseBoardWatchman(value: unknown): boolean {
   return typeof value === "boolean" ? value : true;
+}
+
+/**
+ * 从一整份 `ui/settings/read` 应答里取值：新名优先，缺失才看旧名。
+ *
+ * 单独成函数而不是让每个调用方各写一遍 `??`：读序一旦漂移，就会回到「用户关掉
+ * 的开关重启后显示成开」的老 bug。
+ */
+export function watchmanFromSettings(settings: Record<string, unknown>): boolean {
+  const value = settings[WATCHMAN_KEY] ?? settings[LEGACY_WATCHMAN_KEY];
+  return parseBoardWatchman(value);
 }
 
 /**
@@ -183,8 +210,8 @@ export function parseBoardWatchman(value: unknown): boolean {
  * 多发这一趟。
  */
 export async function readBoardWatchman(rpc: BoardRpc): Promise<boolean> {
-  const settings = await rpc<{ board_watchman_enabled?: unknown }>(RPC.uiSettingsRead, {});
-  return parseBoardWatchman(settings.board_watchman_enabled);
+  const settings = await rpc<Record<string, unknown>>(RPC.uiSettingsRead, {});
+  return watchmanFromSettings(settings);
 }
 
 /**
@@ -196,6 +223,6 @@ export async function writeBoardWatchman(
   enabled: boolean,
 ): Promise<{ warning?: string | null }> {
   return rpc<{ warning?: string | null }>(RPC.uiSettingsWrite, {
-    board_watchman_enabled: enabled,
+    [WATCHMAN_KEY]: enabled,
   });
 }

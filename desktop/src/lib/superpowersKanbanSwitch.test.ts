@@ -192,27 +192,44 @@ describe("background watchman settings", () => {
   it("reads through the host channel, with no project and no plugin", async () => {
     // 宿主级设置：直接走 ui/settings/read。若误走 plugin/query，就会带上 project
     // 去问某个项目的插件——那是另一个问题。
-    const inner = vi.fn(async () => ({ board_watchman_enabled: true }));
+    const inner = vi.fn(async () => ({ resident_daemon_watchman_enabled: true }));
     const on = await readBoardWatchman(asRpc(inner));
     expect(inner).toHaveBeenCalledWith("ui/settings/read", {});
     expect(on).toBe(true);
+  });
+
+  it("falls back to the legacy field name an older host still returns", async () => {
+    // 旧宿主只回旧名。读不到新名时若直接套缺省，用户关掉的值守会翻回开。
+    expect(
+      await readBoardWatchman(asRpc(vi.fn(async () => ({ board_watchman_enabled: false })))),
+    ).toBe(false);
+    // 两个都在时以新名为准：新名一旦写下，旧名就是过期的影子。
+    expect(
+      await readBoardWatchman(
+        asRpc(vi.fn(async () => ({ resident_daemon_watchman_enabled: false, board_watchman_enabled: true }))),
+      ),
+    ).toBe(false);
   });
 
   it("defaults to on when the key is unset or not a boolean", async () => {
     // 老配置没有这个键：缺省为开，否则会把用户本来一直在跑的值守悄悄关掉。
     expect(await readBoardWatchman(asRpc(vi.fn(async () => ({}))))).toBe(true);
     expect(
-      await readBoardWatchman(asRpc(vi.fn(async () => ({ board_watchman_enabled: "yes" })))),
+      await readBoardWatchman(asRpc(vi.fn(async () => ({ resident_daemon_watchman_enabled: "yes" })))),
     ).toBe(true);
     expect(
-      await readBoardWatchman(asRpc(vi.fn(async () => ({ board_watchman_enabled: false })))),
+      await readBoardWatchman(asRpc(vi.fn(async () => ({ resident_daemon_watchman_enabled: false })))),
     ).toBe(false);
   });
 
-  it("writes the requested value to ui/settings/write and passes the warning back", async () => {
+  it("writes the generic field name the host reads", async () => {
     const inner = vi.fn(async () => ({ warning: "未能在登录项中安装值守" }));
     const result = await writeBoardWatchman(asRpc(inner), false);
-    expect(inner).toHaveBeenCalledWith("ui/settings/write", { board_watchman_enabled: false });
+    // 宿主只把新名当正式字段（旧名仅兼容读）。写旧名会让「拨开关」在升级后的
+    // 宿主上变成写进一个影子键。
+    expect(inner).toHaveBeenCalledWith("ui/settings/write", {
+      resident_daemon_watchman_enabled: false,
+    });
     expect(result.warning).toBe("未能在登录项中安装值守");
   });
 });

@@ -53,9 +53,9 @@ import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue"
 import {
   enqueueBoardCard,
   enqueuePrequeuedCard,
-  parseBoardWatchman,
   promoteBoardCard,
   setBoardSwitch,
+  watchmanFromSettings,
   writeBoardWatchman,
 } from "./lib/superpowersKanbanSwitch";
 import { type BoardErrorKind, boardErrorKind } from "./lib/boardIndex";
@@ -1353,6 +1353,8 @@ export default function App() {
         syncPlanRef.current = parseSyncPlan(initialized);
         const settings = await client.request<{
           theme?: unknown;
+          resident_daemon_watchman_enabled?: unknown;
+          /** 通用化之前的旧字段名：旧宿主仍只回它。 */
           board_watchman_enabled?: unknown;
           relay_url?: unknown;
           tag_names?: unknown;
@@ -1368,11 +1370,12 @@ export default function App() {
           prefs.setTheme(authoritative);
         }
         // 值守：直接读这份 settings（同一趟请求里就有），不再多发一次
-        // `ui/settings/read`。缺省口径由 parseBoardWatchman 与 readBoardWatchman 共享。
+        // `ui/settings/read`。读序（新名优先、旧名兜底）与缺省口径都在
+        // `watchmanFromSettings` 里，与 readBoardWatchman 共用同一份实现。
         // 同样只在用户还没拨过开关时采纳：重启重放握手时面板已在屏上，read 在途
         // 期间拨下的开关不能被这趟迟到的旧值悄悄覆盖回原样。
         if (!board.watchmanTouchedRef.current) {
-          board.setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
+          board.setWatchmanEnabled(watchmanFromSettings(settings as Record<string, unknown>));
         }
         // 标签显示名：服务端只回用户覆盖项，与默认名合并成完整 6 键。
         setTagNames(

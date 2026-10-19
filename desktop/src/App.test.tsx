@@ -250,7 +250,7 @@ vi.mock("./lib/rpc", () => ({
         const id = `new-${this.requests.length}`;
         return { thread_id: id, cwd: "/w", model: "m", permission_mode: "normal" };
       }
-      if (method === "ui/settings/read") return { theme: "dark", board_watchman_enabled: true };
+      if (method === "ui/settings/read") return { theme: "dark", resident_daemon_watchman_enabled: true };
       if (method === "ui/settings/write") return { ok: true };
       if (method === "thread/setPermissionMode") {
         if (state.failSet) throw { code: -32011, message: "unknown thread" };
@@ -1699,7 +1699,7 @@ describe("App settings & theme wiring", () => {
 
   /** Defer `ui/settings/read` so a test can interleave a newer choice (theme 或值守). */
   function deferRead() {
-    type ReadValue = { theme?: unknown; board_watchman_enabled?: unknown };
+    type ReadValue = { theme?: unknown; resident_daemon_watchman_enabled?: unknown };
     let resolveRead: (v: ReadValue) => void = () => {};
     state.dataSources["ui/settings/read"] = () =>
       new Promise((resolve) => {
@@ -1779,13 +1779,13 @@ describe("App settings & theme wiring", () => {
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
   });
 
-  it("reads board_watchman_enabled and writes it back when the panel toggles it", async () => {
+  it("reads resident_daemon_watchman_enabled and writes it back when the panel toggles it", async () => {
     // 值守是宿主级设置，与主题同走 ui/settings/*（而不是带 project 的
     // plugin/query）：这里只是把这趟 read 的值 stub 成 false；默认口径其实是开
     // （配置里没这个键也当开），点一下要写回 true。
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
-    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", board_watchman_enabled: false });
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", resident_daemon_watchman_enabled: false });
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
     await openBoardFor("/proj");
@@ -1796,19 +1796,33 @@ describe("App settings & theme wiring", () => {
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
         method: "ui/settings/write",
-        params: { board_watchman_enabled: true },
+        params: { resident_daemon_watchman_enabled: true },
       }),
     );
+  });
+
+  it("reads the legacy watchman field when an older host only returns that one", async () => {
+    // 新旧宿主未必同批升级：旧宿主只回旧字段名。读不到新名时必须回退到旧名，
+    // 否则用户关掉的值守会被 parseBoardWatchman 的缺省（开）悄悄翻回开。
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", board_watchman_enabled: false });
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+    await openBoardFor("/proj");
+
+    const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
+    expect(box.checked).toBe(false);
   });
 
   it("surfaces the watchman warning ui/settings/write returns", async () => {
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
-    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", board_watchman_enabled: true });
+    state.dataSources["ui/settings/read"] = () => ({ theme: "dark", resident_daemon_watchman_enabled: true });
     // 写入落盘了，但宿主没能装上登录项：它把原因放在 warning 里，面板必须原样
     // 摆出来，而不是静默让人以为已经生效。
     state.dataSources["ui/settings/write"] = (params: unknown) =>
-      (params as { board_watchman_enabled?: boolean }).board_watchman_enabled === false
+      (params as { resident_daemon_watchman_enabled?: boolean }).resident_daemon_watchman_enabled === false
         ? { warning: "未能在登录项中安装值守" }
         : {};
     render(<App />);
@@ -1823,7 +1837,7 @@ describe("App settings & theme wiring", () => {
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
         method: "ui/settings/write",
-        params: { board_watchman_enabled: false },
+        params: { resident_daemon_watchman_enabled: false },
       }),
     );
   });
@@ -1836,7 +1850,7 @@ describe("App settings & theme wiring", () => {
     render(<App />);
     await settle();
     // 首屏 read 在途，面板还没法开——先把 handshake 放过去把面板拿到屏上。
-    await resolveRead({ theme: "dark", board_watchman_enabled: true });
+    await resolveRead({ theme: "dark", resident_daemon_watchman_enabled: true });
     await openBoardFor("/proj");
     const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
     expect(box.checked).toBe(true);
@@ -1856,7 +1870,7 @@ describe("App settings & theme wiring", () => {
     await waitFor(() =>
       expect(clients[1].requests).toContainEqual({
         method: "ui/settings/write",
-        params: { board_watchman_enabled: false },
+        params: { resident_daemon_watchman_enabled: false },
       }),
     );
     await waitFor(() =>
@@ -1866,7 +1880,7 @@ describe("App settings & theme wiring", () => {
     );
 
     // 迟到的权威 read 带回旧值 true，必须被忽略：用户的选择才是当前选择。
-    await resolveStale({ theme: "dark", board_watchman_enabled: true });
+    await resolveStale({ theme: "dark", resident_daemon_watchman_enabled: true });
     expect((screen.getByLabelText("后台值守（开机自启）开关") as HTMLInputElement).checked).toBe(
       false,
     );
