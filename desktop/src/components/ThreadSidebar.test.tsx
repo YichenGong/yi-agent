@@ -1499,4 +1499,25 @@ describe("ThreadSidebar lead entry", () => {
     // 组长只出现一次：它由专属条目渲染，不再作为普通分组行重复一遍。
     expect(container.querySelectorAll("[data-group-row]")).toHaveLength(0);
   });
+
+  it("renders a lead avatar on the lead row", () => {
+    const lead: ThreadSummary = { ...thread("lead-1", "组长", "/p"), role: "lead" };
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/p", exists: true, threads: [lead] }],
+    });
+
+    // 断言存在性（querySelector）而非样式：头像的具体配色属于呈现细节，不是契约。
+    const avatar = container.querySelector("[data-lead-row] [data-lead-avatar]");
+    expect(avatar).not.toBeNull();
+    // 头像在组长行左侧、标题之前。
+    const title = screen.getByText("组长");
+    expect(
+      avatar!.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("does not render a lead avatar on a normal thread row", () => {
+    const { container } = renderSidebar();
+    expect(container.querySelector("[data-lead-avatar]")).toBeNull();
+  });
 });

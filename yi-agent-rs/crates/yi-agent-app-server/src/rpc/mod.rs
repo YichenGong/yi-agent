@@ -380,4 +380,9 @@ pub(crate) struct AppState<'a> {
     /// 消费 `turn_rx` 时替主循环收口,故与 [`AppState::turn_rx`] 同路按 `&mut`
     /// 借用。搬移前臂里的 `pending_lead_replies`。
     pub(crate) pending_lead_replies: &'a mut HashMap<String, Vec<String>>,
+    /// 组长写通道与结果登记表。`thread/start` 与 `thread/resume` 各把前者交给
+    /// `start_thread_core` / `attach_delegation`（转交给组长写工具）。与
+    /// [`AppState::lead_inbox`] 同一理由，按 `&` 借用。
+    pub(crate) lead_control: &'a crate::lead_control::LeadControlInbox,
+    pub(crate) lead_control_replies: &'a crate::lead_control::LeadControlReplies,
 }

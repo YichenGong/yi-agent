@@ -143,6 +143,8 @@ fn a_git_project_gets_the_delegation_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -225,6 +227,8 @@ fn a_git_project_gets_the_show_git_diff_tool() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -279,6 +283,8 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -342,6 +348,8 @@ fn the_assembly_hands_the_reply_registry_to_ask_lead() {
         "proj-test".to_string(),
         inbox.clone(),
         replies.clone(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -511,6 +519,8 @@ fn only_the_lead_sees_the_memory_tools() {
             "proj-test".to_string(),
             crate::lead::LeadInbox::new(),
             crate::lead::LeadReplies::new(),
+            crate::lead_control::LeadControlInbox::new(),
+            crate::lead_control::LeadControlReplies::new(),
             None,
         )
         .expect("tooling")
@@ -564,16 +574,6 @@ fn only_the_lead_sees_the_memory_tools() {
     );
 }
 
-/// 组长私有的**视野**工具同样只给组长:普通会话一个都看不到。
-///
-/// 与 `only_the_lead_sees_the_memory_tools` 同源同门控(`is_lead_thread`),
-/// 但负臂仍然是重点:两个新工具是**只读**的,若被无条件注册,代价比账本工具低、
-/// 更容易漏看——每个普通会话都能翻别人(甚至别的项目里)的转录。故这里钉:
-/// ① 落过盘但 `role: None` 的会话看不到;② 从未落过盘的会话也看不到;
-/// ③ 负臂会话的工具集非空(`ask_lead` 还在),证明「看不到」不是 registry 空掉。
-///
-/// 判定只看落盘的 `ThreadMeta.role`(唯一权威):正臂走生产的 `ensure_lead_meta`
-/// 造 meta,不手搓一个「像组长」的形状。
 #[test]
 fn only_the_lead_sees_the_view_tools() {
     let repo = tempfile::TempDir::new().unwrap();
@@ -639,6 +639,8 @@ fn only_the_lead_sees_the_view_tools() {
             "proj-test".to_string(),
             crate::lead::LeadInbox::new(),
             crate::lead::LeadReplies::new(),
+            crate::lead_control::LeadControlInbox::new(),
+            crate::lead_control::LeadControlReplies::new(),
             None,
         )
         .expect("tooling")
@@ -671,6 +673,85 @@ fn only_the_lead_sees_the_view_tools() {
             "{plain} still gets the shared tools, got {names:?}"
         );
     }
+}
+
+#[test]
+fn only_the_lead_sees_the_control_tools() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    // 两个写工具是组长写通道的消费侧:装配期注入一对独立实例即可(本测试只断言
+    // 「注册表里有没有」,不发指令;发指令的集成测试是 Task 5 的事)。
+    let build = |thread_id: &str| {
+        build_runtime_tooling(
+            &cfg,
+            &root,
+            thread_id,
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            test_theme(),
+            crate::git_diff_tool::GitDiffHandle::new(),
+            Vec::new(),
+            "proj-test".to_string(),
+            crate::lead::LeadInbox::new(),
+            crate::lead::LeadReplies::new(),
+            crate::lead_control::LeadControlInbox::new(),
+            crate::lead_control::LeadControlReplies::new(),
+            None,
+        )
+        .expect("tooling")
+    };
+
+    // 负臂:从未落过盘的普通会话。
+    let plain_names = build("thread-never-persisted").registry.names();
+    assert!(
+        !plain_names.contains(&"lead_interrupt_thread".to_string())
+            && !plain_names.contains(&"lead_reject_thread".to_string()),
+        "a plain thread must not see the control tools, got {plain_names:?}"
+    );
+    // 非空 witness:缺席是真的缺席,而不是整个 registry 空掉。
+    assert!(
+        plain_names.contains(&"ask_lead".to_string()),
+        "a plain thread still gets the shared tools, got {plain_names:?}"
+    );
+
+    // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。`project_root` 取
+    // `canonicalize()` 形态(与 `only_the_lead_sees_the_memory_tools` 同一手法);
+    // store 仍用生产拼写(`cfg.workdir`,非 canonical),与装配里读 role 的那份同源。
+    let project_root = repo.path().canonicalize().expect("repo path canonicalizes");
+    let store = crate::thread_store::ThreadStore::new(&cfg.workdir);
+    let (lead_meta, _created) = crate::lead::ensure_lead_meta(&store, &project_root)
+        .expect("the production lead path must persist a lead meta");
+    assert_eq!(
+        lead_meta.role.as_deref(),
+        Some(crate::thread_store::LEAD_ROLE),
+        "the production lead path must persist the role"
+    );
+
+    let lead_names = build(&lead_meta.thread_id).registry.names();
+    assert!(
+        lead_names.contains(&"lead_interrupt_thread".to_string())
+            && lead_names.contains(&"lead_reject_thread".to_string()),
+        "the lead must see both control tools, got {lead_names:?}"
+    );
 }
 
 /// 组长的 cwd 落在 git 仓库的**子目录**时,两个记忆工具仍然必须可见。
@@ -757,6 +838,8 @@ fn a_lead_in_a_repo_subdirectory_sees_the_memory_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -833,6 +916,8 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -965,6 +1050,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         &crate::lead::LeadInbox::new(),
         &crate::lead::LeadReplies::new(),
+        &crate::lead_control::LeadControlInbox::new(),
+        &crate::lead_control::LeadControlReplies::new(),
         // 这些测试直接调 attach_delegation，不起会话，故无起点。
         None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
@@ -982,6 +1069,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         Vec::new(),
         &crate::lead::LeadInbox::new(),
         &crate::lead::LeadReplies::new(),
+        &crate::lead_control::LeadControlInbox::new(),
+        &crate::lead_control::LeadControlReplies::new(),
         // 这些测试直接调 attach_delegation，不起会话，故无起点。
         None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
@@ -1694,6 +1783,14 @@ pub(crate) struct Harness {
     /// 与主循环**共享**的回信登记表:测试据此扮演等待方(`AskLeadTool`
     /// 的 `blocking: true`)并断言主循环真的把组长那轮的文本回填了回来。
     pub(crate) lead_replies: crate::lead::LeadReplies,
+    /// 与主循环**共享**的组长写通道:集成测试据此直接投递写指令,
+    /// 断言主循环真的把它转成了对目标 thread 的动作。
+    ///
+    /// 这两个字段与 `lead_inbox` 同一手法(接进 `Harness` 的 `RuntimeAttachments`)。
+    pub(crate) lead_control: crate::lead_control::LeadControlInbox,
+    /// 与主循环**共享**的写结果登记表,同一手法:测试据此扮演组长工具,
+    /// 断言主循环执行完真的回填了结果。
+    pub(crate) lead_control_replies: crate::lead_control::LeadControlReplies,
     /// 与主循环**共享**的视图帧表:测试据此直接注入帧(模拟 Task 4 的工具写帧),
     /// 并断言 `thread/view/read` 读的是**同一张**表。自造第二份会读出一张空表。
     pub(crate) view_frames: crate::server::ViewFrames,
@@ -1896,6 +1993,10 @@ impl Harness {
         // 「等待方登记的名字被主循环真的回填了」——自造第二份会得到一个
         // 永远等不到回信的登记表。
         let lead_replies = crate::lead::LeadReplies::new();
+        // 组长写通道 + 结果登记表:同一手法(各 clone 进 `serve`,原件留在
+        // `Harness` 上),供 Task 5 的写指令集成测试直接投递并断言回填。
+        let lead_control = crate::lead_control::LeadControlInbox::new();
+        let lead_control_replies = crate::lead_control::LeadControlReplies::new();
         // 视图帧表:与主循环共享同一 `Arc`(注入进 `RuntimeAttachments`)。测试据此
         // 直接注入帧,断言 `thread/view/read` 读的是同一张表。
         let view_frames: crate::server::ViewFrames =
@@ -1935,6 +2036,8 @@ impl Harness {
                 // 收到,自造第二份会投进没人听的通道。
                 lead_inbox: lead_inbox.clone(),
                 lead_replies: lead_replies.clone(),
+                lead_control: lead_control.clone(),
+                lead_control_replies: lead_control_replies.clone(),
             },
             build,
             scope,
@@ -1953,6 +2056,8 @@ impl Harness {
             skills_home_dir: skills_home,
             lead_inbox,
             lead_replies,
+            lead_control,
+            lead_control_replies,
             view_frames,
             plugins_dir,
             daemon_calls,
@@ -3317,6 +3422,8 @@ async fn eof_exits_gracefully() {
             ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
+            lead_control: crate::lead_control::LeadControlInbox::new(),
+            lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
         build_test_agent,
     ));
@@ -3398,6 +3505,8 @@ async fn agent_factory_failure_returns_internal_error() {
             ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
+            lead_control: crate::lead_control::LeadControlInbox::new(),
+            lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
         |_s: Option<yi_agent_core::Session>,
          _cwd: &std::path::Path,
@@ -3481,6 +3590,8 @@ async fn oversized_frame_returns_err() {
             ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
             lead_inbox: crate::lead::LeadInbox::new(),
             lead_replies: crate::lead::LeadReplies::new(),
+            lead_control: crate::lead_control::LeadControlInbox::new(),
+            lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
         build_test_agent,
     ));
@@ -11595,6 +11706,38 @@ async fn thread_rename_updates_title() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn thread_rename_does_not_change_lead_title() {
+    let parent = tempfile::TempDir::new().unwrap();
+    let project = parent.path().join("my-app");
+    std::fs::create_dir_all(&project).unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = project.clone();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    initialize(&mut h).await;
+
+    let lead = rpc(&mut h, 2, "thread/lead", json!({})).await;
+    let thread_id = lead["result"]["thread_id"].as_str().unwrap().to_string();
+    let renamed = rpc(
+        &mut h,
+        3,
+        "thread/rename",
+        json!({ "threadId": thread_id, "title": "manual override" }),
+    )
+    .await;
+    assert!(
+        renamed.get("error").is_none(),
+        "rename response stays compatible: {renamed}"
+    );
+
+    let loaded = crate::thread_store::ThreadStore::new(&project)
+        .load(&thread_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.meta.title.as_deref(), Some("my-app 组长"));
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn thread_rename_rejects_empty_title() {
     let mut h = Harness::new();
     let tid = start_thread(&mut h).await;
@@ -14596,6 +14739,8 @@ fn delegation_tooling_carries_the_theme_tool() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -15099,6 +15244,8 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         "proj-test".to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling");
@@ -15437,6 +15584,8 @@ impl MergedHarness {
                 ensure_daemon: Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
                 lead_inbox: crate::lead::LeadInbox::new(),
                 lead_replies: crate::lead::LeadReplies::new(),
+                lead_control: crate::lead_control::LeadControlInbox::new(),
+                lead_control_replies: crate::lead_control::LeadControlReplies::new(),
             },
             build_test_agent,
             Scope::Admin,
@@ -16541,6 +16690,8 @@ fn a_card_session_does_not_get_ask_lead() {
         card_key,
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -16563,6 +16714,8 @@ fn a_card_session_does_not_get_ask_lead() {
         repo.path().join(".yi-agent").display().to_string(),
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -16623,6 +16776,8 @@ fn a_merge_round_session_does_not_get_ask_lead() {
         merge_key,
         crate::lead::LeadInbox::new(),
         crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
         None,
     )
     .expect("tooling")
@@ -16692,6 +16847,8 @@ fn the_lead_does_not_get_ask_lead() {
             project_root.join(".yi-agent").display().to_string(),
             crate::lead::LeadInbox::new(),
             crate::lead::LeadReplies::new(),
+            crate::lead_control::LeadControlInbox::new(),
+            crate::lead_control::LeadControlReplies::new(),
             None,
         )
         .expect("tooling")
@@ -17145,5 +17302,121 @@ async fn plugin_install_rejects_non_json_and_requires_a_project() {
         );
     }
 
+    h.shutdown().await;
+}
+/// 打回到 idle 目标：起一轮，目标转录里出现打回文本。
+///
+/// 扮演组长：直接往**与主循环共享**的写通道投递一条 `Reject`，绕过组长工具本身，
+/// 单测主循环的执行路径（工具侧已由 `lead_control` 的单测覆盖）。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reject_to_an_idle_thread_starts_a_turn_that_carries_the_reason() {
+    let (mut h, dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    let target = start_thread(&mut h).await;
+
+    let project_key = crate::thread_store::ThreadStore::new(dir.path()).project_key();
+    let request_id = "ctl-1".to_string();
+    let rx = h.lead_control_replies.register(request_id.clone());
+    assert!(
+        h.lead_control.send(crate::lead_control::LeadControlCmd {
+            project_key,
+            kind: crate::lead_control::LeadControlKind::Reject,
+            thread_id: target.clone(),
+            reason: "redo with tests".to_string(),
+            request_id,
+        }),
+        "the main loop must be subscribed"
+    );
+
+    let outcome = tokio::time::timeout(EVENT_WAIT, rx)
+        .await
+        .expect("the main loop must answer")
+        .expect("the replies table hands back an outcome");
+    assert!(
+        outcome.is_ok(),
+        "a reject to a live thread must succeed: {outcome:?}"
+    );
+
+    // 目标转录里出现打回文本（经注入落盘为新轮的用户条目）。注入是**异步**的：
+    // `apply_lead_control` 只把 prompt 投给 driver 就返回了，用户条目落盘在目标那轮
+    // 真正开始时才发生。故这里按 `EVENT_WAIT` 有界轮询，而不是读一次就断言（读一次
+    // 会与落盘赛跑，稳定地读到空 items）。
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    let mut landed = false;
+    while tokio::time::Instant::now() < deadline {
+        let read = rpc(
+            &mut h,
+            2,
+            "thread/readItems",
+            serde_json::json!({ "threadId": target }),
+        )
+        .await;
+        if read.to_string().contains("redo with tests") {
+            landed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        landed,
+        "the rejection must land in the target transcript within {EVENT_WAIT:?}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 打回到不在场的冷会话：回错，不起轮。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reject_to_an_unknown_thread_is_an_error() {
+    let (mut h, dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    let project_key = crate::thread_store::ThreadStore::new(dir.path()).project_key();
+    let request_id = "ctl-2".to_string();
+    let rx = h.lead_control_replies.register(request_id.clone());
+    assert!(h.lead_control.send(crate::lead_control::LeadControlCmd {
+        project_key,
+        kind: crate::lead_control::LeadControlKind::Reject,
+        thread_id: "thread-does-not-exist".to_string(),
+        reason: "x".to_string(),
+        request_id,
+    }));
+    let outcome = tokio::time::timeout(EVENT_WAIT, rx)
+        .await
+        .expect("the main loop must answer")
+        .expect("an outcome");
+    assert!(outcome.is_err(), "an unreachable target must be an error");
+    h.shutdown().await;
+}
+
+/// 打断无活跃轮的目标：回错（不静默 no-op）。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupt_without_an_active_turn_is_an_error() {
+    let (mut h, dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    let target = start_thread(&mut h).await;
+    let project_key = crate::thread_store::ThreadStore::new(dir.path()).project_key();
+    let request_id = "ctl-3".to_string();
+    let rx = h.lead_control_replies.register(request_id.clone());
+    assert!(h.lead_control.send(crate::lead_control::LeadControlCmd {
+        project_key,
+        kind: crate::lead_control::LeadControlKind::Interrupt,
+        thread_id: target,
+        reason: "stop".to_string(),
+        request_id,
+    }));
+    let outcome = tokio::time::timeout(EVENT_WAIT, rx)
+        .await
+        .expect("the main loop must answer")
+        .expect("an outcome");
+    assert!(
+        outcome.is_err(),
+        "no active turn must be an error, not a silent no-op"
+    );
     h.shutdown().await;
 }

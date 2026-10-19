@@ -208,6 +208,10 @@ openssl rand -hex 16     # 例如 3f7a...c1
 > **`session_id` 本身就是凭据**——知道它的人（在任何网络）就能连上你电脑的会话。
 > 务必将 `session_id` 与地址**按秘密保管**，不要提交进公开仓库、不要贴在公开渠道。
 > 泄露即换：改电脑侧 `relay_url` 与新 session，重启 Mac app 即可。
+>
+> **门禁**：`just secret-check`（随 `just ci` 执行）会扫描全部 git 跟踪文件，
+> 真实域名/IP/session 一旦出现即让 CI 失败。示例值用 `relay.example.com` 与
+> `203.0.113.10`。本机真实值仍写在 `deploy/relay/.relay-local.md`（已忽略）。
 
 **服务自检**：
 
@@ -570,7 +574,7 @@ initialize、pair、以及两端同 store 的一致性。
 
 ```bash
 # 电脑上：中继桥进程应持有到中继 443 的 ESTABLISHED 连接
-lsof -nP -p "$(pgrep -f 'app-server.*--relay' | head -1)" | grep 101.47.76.100
+lsof -nP -p "$(pgrep -f 'app-server.*--relay' | head -1)" | grep 203.0.113.10
 # 空 = 桥没挂上
 ```
 

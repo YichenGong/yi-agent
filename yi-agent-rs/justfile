@@ -33,7 +33,7 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check
+ci: fmt-check lint test build bindings-check secret-check
     @echo "CI passed"
 
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
@@ -41,6 +41,11 @@ ci: fmt-check lint test build bindings-check
 bindings-check:
     cargo test --all-features -p yi-agent-app-server export_bindings
     git diff --exit-code -- ../desktop/src/lib/generated
+
+# 凭据卫生：挡住真实部署凭据进入跟踪文件。
+# 只扫 git 跟踪文件，故 deploy/relay/.relay-local.md 这类已忽略文件不参与。
+secret-check:
+    bash ../scripts/check-secrets.sh
 
 # === 真实 LLM 测试(需 API key,默认跳过) ===
 

@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
@@ -376,7 +376,7 @@ export function ChatView({
    */
   structuralVersion?: number;
 }) {
-  const { ref: scrollRef, scrollToBottom } = useStickToBottom();
+  const { ref: scrollRef, scrollToBottom, followIfAtBottom } = useStickToBottom();
 
   // `items` is `session.items` — the same array instance for the whole session,
   // mutated in place (push / items[i] = x). React compares deps with Object.is,
@@ -393,11 +393,40 @@ export function ChatView({
   const tail = items.length > 0 ? items[items.length - 1] : undefined;
   const effectiveCall = call ?? NO_CALL;
 
-  // 新内容 / 流式文本变化时贴底。`scrollToBottom` 是稳定引用（useCallback []），
-  // 放进依赖数组不会引入额外触发。
+  // 新内容 / 流式文本变化时跟随，但**只在用户仍贴底时**。用户上翻历史后，
+  // 每个 delta 都强制贴底会让他在整个生成期间反复被拽回底部，根本读不到上面的内容。
+  // 真正需要强制到底的只有两种**明确意图**：用户自己发出了消息、切换了会话。
+  const prevThreadRef = useRef(threadId);
+  const prevCountRef = useRef(items.length);
+  const prevErrorRef = useRef(error ?? null);
+  const didMountRef = useRef(false);
   useEffect(() => {
-    scrollToBottom();
-  }, [items.length, lastText, error, scrollToBottom]);
+    // 首次挂载：打开一个已有历史的会话必须落在最新内容上。不能交给
+    // `followIfAtBottom`——hook 的 `scroll` 监听此时已把意图读成「不贴底」
+    // （新挂载的元素 `scrollTop` 为 0）。
+    const firstRun = !didMountRef.current;
+    didMountRef.current = true;
+
+    const threadChanged = prevThreadRef.current !== threadId;
+    const grew = items.length > prevCountRef.current;
+    // 错误横幅是一次性的「必须看到」事件，不是流式增长：保留原来的强制贴底。
+    const newError = error != null && error !== prevErrorRef.current;
+    prevThreadRef.current = threadId;
+    prevCountRef.current = items.length;
+    prevErrorRef.current = error ?? null;
+
+    // 刚发出的用户消息是本地乐观回声（`local-*` id）。它出现在末尾说明是用户
+    // 自己按了发送——这条新内容理应可见。
+    const newest = items[items.length - 1];
+    const sentByUser =
+      grew &&
+      newest?.type === "userMessage" &&
+      typeof newest.id === "string" &&
+      newest.id.startsWith("local-");
+
+    if (firstRun || threadChanged || sentByUser || newError) scrollToBottom();
+    else followIfAtBottom();
+  }, [items.length, lastText, error, threadId, scrollToBottom, followIfAtBottom]);
 
   return (
     <div

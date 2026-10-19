@@ -7,6 +7,9 @@ pub(crate) mod git_diff;
 pub mod git_diff_tool;
 pub mod image_upload;
 pub mod lead;
+// 组长的写通道（lead→thread 的「取消 / 打回」），完全由 `build_runtime_tooling`
+// 注册的两个组长工具与主循环的 `select!` 消费分支接线。
+pub(crate) mod lead_control;
 pub(crate) mod lead_index;
 pub(crate) mod lead_loop;
 pub mod lead_memory;

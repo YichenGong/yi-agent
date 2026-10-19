@@ -586,10 +586,20 @@ git commit -m "feat(app-server): install a plugin into a project generically"
 - [ ] **Step 1: 写失败测试**
 
 ```ts
-it("creates a board through the plugin channel", async () => {
-  const rpc = vi.fn().mockResolvedValue({});
+it("installs the plugin before creating a board", async () => {
+  const calls: string[] = [];
+  const rpc = vi.fn(async (method: string) => {
+    calls.push(method);
+    return {};
+  });
   await createBoard(rpc, "/proj");
-  expect(rpc).toHaveBeenCalledWith("plugin/query", {
+  // 顺序是契约：没有清单，宿主不会拉起插件，plugin/query 无处可拨。
+  expect(calls).toEqual(["plugin/install", "plugin/query"]);
+  expect(rpc).toHaveBeenNthCalledWith(1, "plugin/install", {
+    project: "/proj",
+    plugin: "superpowers-kanban",
+  });
+  expect(rpc).toHaveBeenNthCalledWith(2, "plugin/query", {
     plugin: "superpowers-kanban",
     project: "/proj",
     method: "lifecycle/create",
@@ -630,6 +640,11 @@ Expected: FAIL（仍断言 `board/create` 等）
 const KANBAN_PLUGIN = "superpowers-kanban";
 
 export async function createBoard(rpc: BoardRpc, project: string): Promise<void> {
+  // **先装插件，再建盘**（§4.4 方案 A）。全新项目没有 supervisor 清单，宿主
+  // 就不会拉起它的插件 daemon，`plugin/query` 也就无处可拨。`plugin/install`
+  // 还会打开清单声明的开关——只装清单不开开关，会得到一个「已登记、已拉起、
+  // 永不推进」的看板。
+  await rpc("plugin/install", { project, plugin: KANBAN_PLUGIN });
   await rpc("plugin/query", {
     plugin: KANBAN_PLUGIN,
     project,
@@ -647,6 +662,10 @@ export async function removeBoard(rpc: BoardRpc, project: string): Promise<void>
   });
 }
 ```
+
+> 初稿漏了 `plugin/install` 这一步：它假定「插件已经装了」，而 §4.4 的整个
+> 存在理由就是**全新项目**没有清单。没有这一步，桌面上「新建看板」在空白
+> 项目里必然失败（`plugin_not_installed` 或 `plugin_unavailable`）。
 
 - `listBoards` 改调 `RPC.residentList`（`"resident/list"`），保留既有的形状容忍
   （裸数组 / `items` / `projects`），不认识时回空表。

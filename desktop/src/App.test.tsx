@@ -3,7 +3,13 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
 
 type Mode = "normal" | "yolo";
-type ThreadSeed = { thread_id: string; title: string | null; permission_mode: Mode };
+type ThreadSeed = {
+  thread_id: string;
+  title: string | null;
+  permission_mode: Mode;
+  driver_project?: string;
+  driver_ref?: string;
+};
 
 const { clients, state, dragDrop } = vi.hoisted(() => ({
   clients: [] as Array<{
@@ -197,6 +203,8 @@ vi.mock("./lib/rpc", () => ({
                       permission_mode: t.permission_mode,
                       status: state.listStatus,
                       pinned: state.pinnedIds.includes(t.thread_id),
+                      driver_project: t.driver_project,
+                      driver_ref: t.driver_ref,
                     })),
                     ...leadEntries(workspace),
                   ]
@@ -997,6 +1005,42 @@ async function openBoardFor(project: string) {
   fireEvent.click(screen.getByLabelText("看板"));
   return project;
 }
+
+describe("App driven-session sidebar refresh", () => {
+  it("lists a newly started running card session before its turn completes", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.threads = [{ thread_id: "t1", title: "discussion", permission_mode: "normal" }];
+    render(<App />);
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((request) => request.method === "thread/resume")).toBe(true),
+    );
+
+    // The driver creates a card thread directly in the server while its turn
+    // starts; only the running status notification tells the desktop about it.
+    // `thread/listAll` knows about it after that notification refreshes groups.
+    state.threads.push({
+      thread_id: "card-thread",
+      title: "看板 · card-1",
+      permission_mode: "yolo",
+      driver_project: "/proj",
+      driver_ref: "card-1",
+    });
+    state.listStatus = "running";
+    act(() => {
+      for (const notify of state.notifHandlers) {
+        notify({
+          method: "thread/status/updated",
+          params: { thread_id: "card-thread", status: "running" },
+        });
+      }
+    });
+
+    await waitFor(() => expect(screen.getByText("看板会话 (1)")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("看板会话"));
+    expect(screen.getByText("看板 · card-1")).toBeTruthy();
+  });
+});
 
 describe("App 主区域看板", () => {
   it("未选中看板时不渲染看板面板，也没有全局左列", async () => {

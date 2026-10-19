@@ -508,3 +508,106 @@ describe("ChatView tail handover", () => {
     expect(container.textContent?.match(/answer-one/g)).toHaveLength(1);
   });
 });
+
+describe("ChatView auto-scroll", () => {
+  /** jsdom 没有布局引擎：给滚动容器装上可读写的滚动度量。 */
+  function installMetrics(
+    el: HTMLElement,
+    init: { scrollHeight: number; clientHeight: number; scrollTop?: number },
+  ) {
+    const state = {
+      scrollHeight: init.scrollHeight,
+      clientHeight: init.clientHeight,
+      scrollTop: init.scrollTop ?? 0,
+    };
+    Object.defineProperty(el, "scrollHeight", {
+      configurable: true,
+      get: () => state.scrollHeight,
+    });
+    Object.defineProperty(el, "clientHeight", {
+      configurable: true,
+      get: () => state.clientHeight,
+    });
+    Object.defineProperty(el, "scrollTop", {
+      configurable: true,
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        state.scrollTop = v;
+      },
+    });
+    return state;
+  }
+
+  function setup(init: { scrollTop?: number } = {}) {
+    const list = items();
+    const { container, rerender } = render(<ChatView items={list} threadId="t1" />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: init.scrollTop ?? 600,
+    });
+    fireEvent.scroll(scroller);
+    return { list, container, rerender, scroller, state };
+  }
+
+  it("leaves the reading position alone while the agent streams", () => {
+    // 用户上翻历史时，每来一个 delta 都不能把视口拽回底部——那会让用户
+    // 在生成期间反复手动上滑，等于无法浏览上面的内容。
+    const { list, rerender, state } = setup({ scrollTop: 100 });
+    for (let i = 1; i <= 5; i += 1) {
+      setText(list, "chunk ".repeat(i));
+      state.scrollHeight = 1000 + i * 100; // content grew below
+      rerender(<ChatView items={list} threadId="t1" />);
+    }
+    expect(state.scrollTop).toBe(100);
+  });
+
+  it("keeps following the stream while the user is at the bottom", () => {
+    const { list, rerender, state } = setup({ scrollTop: 600 });
+    setText(list, "hello");
+    state.scrollHeight = 1100;
+    rerender(<ChatView items={list} threadId="t1" />);
+    expect(state.scrollTop).toBe(1100);
+  });
+
+  it("jumps to a new error banner even when the user scrolled up", () => {
+    // 错误横幅是一次性事件，用户必须看到；它不能被「上翻历史」吞掉。
+    const { list, rerender, state } = setup({ scrollTop: 100 });
+    state.scrollHeight = 1040;
+    rerender(<ChatView items={list} threadId="t1" error="boom" />);
+    expect(state.scrollTop).toBe(1040);
+  });
+
+  it("opens a thread with history at the newest content", () => {
+    // 首次挂载时元素还没有滚动位置（scrollTop 为 0），贴底意图会被读成 false；
+    // 打开会话必须仍然落在最新内容上，而不是让用户自己滑到底。
+    const proto = HTMLElement.prototype;
+    const state = { scrollTop: 0 };
+    Object.defineProperty(proto, "scrollHeight", { configurable: true, get: () => 1000 });
+    Object.defineProperty(proto, "clientHeight", { configurable: true, get: () => 400 });
+    Object.defineProperty(proto, "scrollTop", {
+      configurable: true,
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        state.scrollTop = v;
+      },
+    });
+    try {
+      render(<ChatView items={items()} threadId="t1" />);
+      expect(state.scrollTop).toBe(1000);
+    } finally {
+      delete (proto as unknown as Record<string, unknown>).scrollHeight;
+      delete (proto as unknown as Record<string, unknown>).clientHeight;
+      delete (proto as unknown as Record<string, unknown>).scrollTop;
+    }
+  });
+
+  it("jumps to the newest content when the thread changes", () => {
+    // 切会话是明确意图：要看到这个会话的最新内容，而不是沿用上一个会话
+    // 的阅读位置（更不能因为上一个会话上翻过就停在中途）。
+    const { list, rerender, state } = setup({ scrollTop: 100 });
+    rerender(<ChatView items={list} threadId="t2" />);
+    expect(state.scrollTop).toBe(1000);
+  });
+});

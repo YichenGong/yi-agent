@@ -3576,11 +3576,19 @@ mod tests {
     #[test]
     fn a_failed_runtime_bring_up_is_reported_rather_than_raised() {
         // `attach_tui_runtime` only reads the non-subcommand fields, so the
-        // default command line is enough to exercise bring-up — plus a key, so
-        // this test does not depend on the machine exporting `MODEL_API_KEY`.
+        // default command line is enough to exercise bring-up — plus a full
+        // model injection (`--provider` and `--api-key` together), so this test
+        // neither depends on the machine exporting `MODEL_API_KEY` nor trips the
+        // "half an injection is an error" guard before bring-up is attempted.
         // The bring-up must fail for the uncreatable workdir, not for a missing
         // key, which is what makes the reported-not-raised path reachable.
-        let cli = <Cli as clap::Parser>::parse_from(["yi-agent", "--api-key", "test-key"]);
+        let cli = <Cli as clap::Parser>::parse_from([
+            "yi-agent",
+            "--provider",
+            "anthropic",
+            "--api-key",
+            "test-key",
+        ]);
         let mut config = test_config();
         // A path no process can create the runtime directory under, so bring-up
         // fails regardless of the machine's `$TMPDIR` or permissions.

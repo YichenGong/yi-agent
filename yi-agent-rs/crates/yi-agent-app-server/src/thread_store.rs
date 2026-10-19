@@ -449,13 +449,27 @@ impl ThreadStore {
         Ok(Some(meta))
     }
 
+    /// 仅更新合法组长标题。复用 `update_meta` 的锁与原子写路径，拒绝误把普通 thread 改成组长标题。
+    pub(crate) fn set_lead_title(&self, id: &str, title: &str) -> io::Result<bool> {
+        let mut updated = false;
+        self.update_meta(id, |meta| {
+            if is_lead_meta(meta) && meta.title.as_deref() != Some(title) {
+                meta.title = Some(title.to_string());
+                updated = true;
+            }
+        })?;
+        Ok(updated)
+    }
+
     /// 只重写 meta 的 `title` + `updated_at`。
     /// 返回 false 表示 thread 不存在或 meta 不可读。
     pub fn rename(&self, id: &str, title: &str) -> io::Result<bool> {
         Ok(self
             .update_meta(id, |meta| {
-                meta.title = Some(title.to_string());
-                meta.updated_at = now_millis();
+                if !is_lead_meta(meta) {
+                    meta.title = Some(title.to_string());
+                    meta.updated_at = now_millis();
+                }
             })?
             .is_some())
     }
@@ -470,7 +484,7 @@ impl ThreadStore {
         // 替换；`Ok(None)`（未知 id / meta 不可读）时闭包未执行，`replaced` 保持 false。
         let mut replaced = false;
         self.update_meta(id, |meta| {
-            if meta.title.as_deref() == Some(expected) {
+            if !is_lead_meta(meta) && meta.title.as_deref() == Some(expected) {
                 meta.title = Some(new.to_string());
                 meta.updated_at = now_millis();
                 replaced = true;
@@ -626,7 +640,7 @@ impl ThreadStore {
         let mut wrote = false;
         self.update_meta(id, |meta| {
             meta.updated_at = now_millis();
-            if meta.title.is_none() {
+            if !is_lead_meta(meta) && meta.title.is_none() {
                 if let Some(hint) = title_hint {
                     let t = title_from(hint);
                     if !t.is_empty() {
@@ -1141,6 +1155,77 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let s = ThreadStore::new(&dir.path().join("does-not-exist"));
         assert!(s.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn set_lead_title_does_not_change_a_regular_thread() {
+        let (_dir, s) = store();
+        let mut regular = meta("thread-regular-title");
+        regular.title = Some("regular title".into());
+        s.create(&regular).unwrap();
+
+        assert!(
+            !s.set_lead_title("thread-regular-title", "forced lead title")
+                .unwrap()
+        );
+        assert_eq!(
+            s.load("thread-regular-title")
+                .unwrap()
+                .unwrap()
+                .meta
+                .title
+                .as_deref(),
+            Some("regular title")
+        );
+    }
+
+    #[test]
+    fn lead_title_write_entry_points_preserve_the_project_title() {
+        let (dir, s) = store();
+        let basename = dir.path().file_name().unwrap().to_str().unwrap();
+        let title = format!("{basename} 组长");
+        let mut lead = meta("thread-lead-title");
+        lead.cwd = dir.path().display().to_string();
+        lead.title = Some(title.clone());
+        lead.role = Some(LEAD_ROLE.to_string());
+        s.create(&lead).unwrap();
+
+        assert!(!s.touch("thread-lead-title", Some("prompt")).unwrap());
+        // The expected value deliberately matches the stored lead title: the role guard,
+        // not just the ordinary CAS mismatch, must prevent the LLM title write.
+        assert!(
+            !s.set_title_if_unchanged("thread-lead-title", &title, "LLM title")
+                .unwrap()
+        );
+        assert!(s.rename("thread-lead-title", "manual title").unwrap());
+        assert_eq!(
+            s.load("thread-lead-title")
+                .unwrap()
+                .unwrap()
+                .meta
+                .title
+                .as_deref(),
+            Some(title.as_str())
+        );
+    }
+
+    #[test]
+    fn lead_touch_does_not_fill_an_empty_title_from_the_prompt() {
+        let (dir, s) = store();
+        let mut lead = meta("thread-lead-empty-title");
+        lead.cwd = dir.path().display().to_string();
+        lead.role = Some(LEAD_ROLE.to_string());
+        s.create(&lead).unwrap();
+
+        assert!(!s.touch("thread-lead-empty-title", Some("prompt")).unwrap());
+        assert_eq!(
+            s.load("thread-lead-empty-title")
+                .unwrap()
+                .unwrap()
+                .meta
+                .title,
+            None
+        );
     }
 
     #[test]

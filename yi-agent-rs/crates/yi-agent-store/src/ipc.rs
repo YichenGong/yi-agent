@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use chrono::{Local, Timelike, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -941,25 +941,7 @@ impl Daemon {
                     .with_second(0)
                     .and_then(|value| value.with_nanosecond(0));
                 if minute != last_schedule_minute {
-                    let _ = coordinator.evaluate_schedules(now);
-                    // Trace retention is cleanup, not work: a failure here must
-                    // never wedge the accept loop, but a wedged database must be
-                    // visible rather than silent.
-                    match coordinator.prune_terminal_traces(Utc::now()) {
-                        Ok(pruned) => tracing::debug!(pruned, "pruned terminal task traces"),
-                        Err(error) => tracing::warn!(
-                            error = %error,
-                            "terminal trace pruning failed; retrying next minute"
-                        ),
-                    }
-                    // Abandoned fork uploads are the other per-minute leak: a
-                    // client that dies mid-upload leaves state a later client
-                    // may never claim. Reaping is pure in-memory bookkeeping,
-                    // so it shares the trace sweep's non-wedging shape.
-                    let expired_uploads = coordinator.prune_expired_fork_uploads(Instant::now());
-                    if expired_uploads > 0 {
-                        tracing::debug!(expired_uploads, "pruned expired fork uploads");
-                    }
+                    Daemon::run_minute_maintenance(&runtime, &coordinator, now);
                     last_schedule_minute = minute;
                 }
                 // Block until a connection arrives or the wait times out. This
@@ -1035,6 +1017,47 @@ impl Daemon {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// 每分钟的周期维护。抽成方法是为了让测试能驱动**线程每分会调用的同一条
+    /// 路径**，而不是等墙上时钟走到下一个整分（否则测试只能绕过驱动路径
+    /// 直调各方法，那正好测不到「接线」本身）。
+    fn run_minute_maintenance(
+        runtime: &tokio::runtime::Runtime,
+        coordinator: &RuntimeCoordinator,
+        now: DateTime<Local>,
+    ) {
+        let _ = coordinator.evaluate_schedules(now);
+        // 看门狗决定任务生死（终止越限 attempt 并释放其租约），所以它的失败
+        // 不能像 prune 那样静默：一个失败的 tick 意味着越限的任务又活了一分钟。
+        // `evaluate_watchdogs` 是 async（要拿 supervisor 的 async 锁），用
+        // current-thread runtime 的 block_on 驱动——与 `reconcile_worker_events`
+        // 在 accept 循环里的调用方式一致。
+        match runtime.block_on(coordinator.evaluate_watchdogs(Utc::now())) {
+            Ok(terminated) if terminated > 0 => {
+                tracing::info!(terminated, "watchdog terminated over-budget attempts")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                error = %error,
+                "watchdog evaluation failed; over-budget attempts survive until the next tick"
+            ),
+        }
+        // Trace retention is cleanup, not work: a failure here must never wedge
+        // the accept loop, but a wedged database must be visible rather than silent.
+        match coordinator.prune_terminal_traces(Utc::now()) {
+            Ok(pruned) => tracing::debug!(pruned, "pruned terminal task traces"),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "terminal trace pruning failed; retrying next minute"
+            ),
+        }
+        // Abandoned fork uploads are the other per-minute leak: a client that
+        // dies mid-upload leaves state a later client may never claim.
+        let expired_uploads = coordinator.prune_expired_fork_uploads(Instant::now());
+        if expired_uploads > 0 {
+            tracing::debug!(expired_uploads, "pruned expired fork uploads");
+        }
     }
 
     /// How many orphaned tasks this daemon's startup sweep reclaimed.
@@ -4842,6 +4865,272 @@ mod request_context_tests {
         assert!(
             elapsed < Duration::from_millis(150),
             "an arm that never touches the repository must not wait behind one that does; waited {elapsed:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tick_tests {
+    //! spec §3.3 的「驱动路径」回归：从 daemon 线程每分调用的那条路径证明
+    //! 越限 attempt 真的会被终止。
+    //!
+    //! 缺陷形状是「看门狗从不运行」：`evaluate_watchdogs` 判定逻辑本身没问题，
+    //! 只是没有任何生产调用者，于是越限的任务永远活着。直调
+    //! `evaluate_watchdogs` 的测试发现不了这件事——把接线拆掉它照样绿。所以这
+    //! 里驱动的是 `Daemon::run_minute_maintenance`（Task 3 落地的生产调用者）。
+    //!
+    //! 终止断言要求任务所在会话在 daemon 进程内已 hydrate：`record_watchdog_terminal`
+    //! 通过 `supervisor(session)` 取 supervisor，未 hydrate 的会话拿不到，Task 1
+    //! 让 `evaluate_watchdogs` 恰恰隔离了这个错误（warn 后继续）。所以「终止」
+    //! 用 hydrated 会话验，「隔离」用 hydrated + unhydrated 并置验。
+
+    use super::*;
+    use crate::repository::{PersistedEvent, RuntimeEvent};
+    use crate::schedule::{WatchdogLimits, WatchdogUsage};
+    use rusqlite::Connection;
+
+    /// idle 超过 1 秒即判 `Stalled`。`evaluate_watchdogs` 内部用真实
+    /// `Utc::now()`，所以只要 `last_meaningful_at` 足够久远就一定越限。
+    fn over_budget_limits() -> WatchdogLimits {
+        WatchdogLimits {
+            max_turns: None,
+            max_wall_time_secs: None,
+            max_idle_time_secs: Some(1),
+            ..WatchdogLimits::default()
+        }
+    }
+
+    fn ancient_start() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn active_attempt_id(database: &Path, task: &TaskId) -> yi_agent_core::AttemptId {
+        Connection::open(database)
+            .unwrap()
+            .query_row(
+                "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                [task.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn recorded_watchdog_terminal(events: &[PersistedEvent], task: &TaskId) -> bool {
+        events.iter().any(|event| {
+            event.task_id == *task
+                && matches!(
+                    event.event,
+                    RuntimeEvent::TaskStalled
+                        | RuntimeEvent::TaskTimedOut
+                        | RuntimeEvent::TaskBudgetExhausted
+                )
+        })
+    }
+
+    /// 与 daemon 线程完全相同的调用形状：current-thread runtime + block_on。
+    fn drive_one_minute_maintenance(daemon: &Daemon, now: DateTime<Local>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("minute maintenance runtime must initialize");
+        Daemon::run_minute_maintenance(&runtime, &daemon.coordinator, now);
+    }
+
+    fn start_daemon(database: &Path) -> Daemon {
+        let runtime_dir = database
+            .parent()
+            .expect("database lives in a directory")
+            .join("runtime");
+        Daemon::start_with_factory(runtime_dir, database, Arc::new(UnavailableWorkerFactory))
+            .expect("daemon starts")
+    }
+
+    /// 越限 attempt 会被一次分钟维护 tick 终止，并释放它的租约。
+    ///
+    /// 回归缺陷：看门狗没有生产调用者。把 `run_minute_maintenance` 里的
+    /// `evaluate_watchdogs` 调用去掉，本测试失败（状态停在 `queued`）。
+    #[test]
+    fn a_minute_maintenance_tick_terminates_an_over_budget_attempt() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon = start_daemon(&database);
+
+        // hydrate：create_session 把 supervisor 放进进程内的 map，只有这类会话
+        // 的 attempt 才可能被判定终止。
+        let session = daemon.coordinator.create_session().unwrap();
+        let root = daemon.coordinator.root_task_id(&session).unwrap();
+        let attempt = active_attempt_id(&database, &root);
+        let started = ancient_start();
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .save_attempt_watchdog_snapshot(
+                    &root,
+                    &attempt,
+                    &over_budget_limits(),
+                    &WatchdogUsage::default(),
+                    None,
+                    started,
+                    None,
+                )
+                .unwrap();
+            // 一条真实活跃租约，让「释放租约」这条断言真的被走到。
+            repository
+                .record_recovery_context(
+                    &root,
+                    &attempt,
+                    "workspace:watchdog",
+                    "worktree:watchdog",
+                    r#"{"git_head":"test"}"#,
+                    r#"{"state":"available"}"#,
+                )
+                .unwrap();
+        }
+        assert!(
+            RuntimeRepository::open(&database)
+                .unwrap()
+                .has_active_lease_prefix(&root, "")
+                .unwrap(),
+            "precondition: the attempt holds an active lease"
+        );
+
+        drive_one_minute_maintenance(
+            &daemon,
+            (started + chrono::Duration::seconds(10)).with_timezone(&Local),
+        );
+
+        let repository = RuntimeRepository::open(&database).unwrap();
+        let state = repository.task_state(&root).unwrap();
+        assert!(
+            matches!(state.as_str(), "stalled" | "timed_out" | "budget_exhausted"),
+            "over-budget attempt must be terminated by the tick, got {state}"
+        );
+        let events = repository.event_records_after(0).unwrap();
+        assert!(
+            recorded_watchdog_terminal(&events, &root),
+            "a watchdog terminal event must be recorded"
+        );
+        assert!(
+            !repository.has_active_lease_prefix(&root, "").unwrap(),
+            "the attempt's leases must be released"
+        );
+    }
+
+    /// 一个未 hydrate 的会话不得阻断整轮扫描。
+    ///
+    /// 这是 Task 1 契约的驱动路径形式：tick 跑完（`Ok`）、未 hydrate 的那条被
+    /// **跳过而非判定**（状态不变、无终态事件），同时 hydrate 的兄弟仍被终止。
+    ///
+    /// 覆盖的是**坏记录先被扫描到**这一顺序（见下方「先写坏记录」的说明），
+    /// 也正因为如此它才能区分「逐条隔离」是否还在。顺序无关的保证由 Task 1 的
+    /// 直接测试 `an_unhydrated_session_does_not_fail_the_whole_watchdog_sweep`
+    /// 负责（那里不依赖扫描顺序）。
+    #[test]
+    fn one_unhydrated_session_does_not_stop_the_tick_from_terminating_another() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon = start_daemon(&database);
+
+        let started = ancient_start();
+
+        // 未 hydrate 的兄弟：手工造一条 queued 越限快照，其会话不在 map 里。
+        //
+        // 必须**先于** `create_session()` 写入：`create_session` 会在
+        // `insert_attempt` 里替它的根 attempt 插一行 `attempt_watchdogs`，而
+        // `active_attempt_watchdogs()` 没有 `ORDER BY`，扫描顺序即 rowid 顺序。
+        // 先写坏记录，才能保证这一轮扫描**先撞上**那条未 hydrate 的记录——只有
+        // 这个顺序才真正区分「逐条隔离」是否还在：隔离被移除时，扫描在第 1 条
+        // （坏记录）就中止，后面已 hydrate 的兄弟永远等不到判定，本测试即失败。
+        let unhydrated_session = RootSessionId::new();
+        let unhydrated_task = TaskId::new();
+        let unhydrated_attempt = yi_agent_core::AttemptId::new();
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .create_task_with_attempt(
+                    &unhydrated_task,
+                    &unhydrated_session,
+                    &unhydrated_attempt,
+                    1,
+                    "queued",
+                )
+                .unwrap();
+            repository
+                .save_attempt_watchdog_snapshot(
+                    &unhydrated_task,
+                    &unhydrated_attempt,
+                    &over_budget_limits(),
+                    &WatchdogUsage::default(),
+                    None,
+                    started,
+                    None,
+                )
+                .unwrap();
+        }
+
+        // 再 hydrate 一个会话，并给它写一条同样越限的快照。
+        let session = daemon.coordinator.create_session().unwrap();
+        let hydrated_root = daemon.coordinator.root_task_id(&session).unwrap();
+        let hydrated_attempt = active_attempt_id(&database, &hydrated_root);
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .save_attempt_watchdog_snapshot(
+                    &hydrated_root,
+                    &hydrated_attempt,
+                    &over_budget_limits(),
+                    &WatchdogUsage::default(),
+                    None,
+                    started,
+                    None,
+                )
+                .unwrap();
+        }
+
+        // 前提：两条越限快照都真的进了本轮扫描——否则「未 hydrate 被跳过」这条
+        // 断言就是空的（它可能压根没被看过）。
+        assert_eq!(
+            RuntimeRepository::open(&database)
+                .unwrap()
+                .active_attempt_watchdogs()
+                .unwrap()
+                .len(),
+            2,
+            "precondition: both over-budget attempts must be in the sweep"
+        );
+
+        drive_one_minute_maintenance(
+            &daemon,
+            (started + chrono::Duration::seconds(10)).with_timezone(&Local),
+        );
+
+        let repository = RuntimeRepository::open(&database).unwrap();
+        let hydrated_state = repository.task_state(&hydrated_root).unwrap();
+        assert!(
+            matches!(
+                hydrated_state.as_str(),
+                "stalled" | "timed_out" | "budget_exhausted"
+            ),
+            "the hydrated sibling must still be terminated: the sweep has to survive the \
+             unhydrated entry, got {hydrated_state}"
+        );
+        let events = repository.event_records_after(0).unwrap();
+        assert!(
+            recorded_watchdog_terminal(&events, &hydrated_root),
+            "the hydrated sibling must record a watchdog terminal event"
+        );
+        assert_eq!(
+            repository.task_state(&unhydrated_task).unwrap(),
+            "queued",
+            "an unhydrated session's attempt must be skipped, not judged"
+        );
+        assert!(
+            !recorded_watchdog_terminal(&events, &unhydrated_task),
+            "no watchdog terminal event may be recorded for an unhydrated session"
         );
     }
 }

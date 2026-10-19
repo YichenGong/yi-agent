@@ -1182,6 +1182,20 @@ export default function App() {
     // 这些回调必须随新客户端重新登记(旧客户端的 transport 已随管道断开)。
     const wireClient = (client: RpcClient) => {
       client.onNotification((n) => {
+        // A driven session is created outside the desktop's thread/start RPC, so
+        // it may not exist in the cached groups when its first Running status
+        // arrives. Pull the authoritative list once for an unknown thread; waiting
+        // for turn/completed leaves running board cards invisible for the whole run.
+        if (
+          n.method === "thread/status/updated" &&
+          n.params.status === "running" &&
+          !sess.groupsRef.current.some((g) =>
+            g.threads.some((t) => t.thread_id === n.params.thread_id),
+          ) &&
+          !sess.pinnedRef.current.some((t) => t.thread_id === n.params.thread_id)
+        ) {
+          void sess.refreshThreads();
+        }
         // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
         if (n.method === "agent/children/updated") {
           railStore.applyNotification(n.params.threadId, n.params.children);
