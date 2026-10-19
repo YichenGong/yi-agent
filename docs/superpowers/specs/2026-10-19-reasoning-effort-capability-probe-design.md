@@ -445,8 +445,13 @@ P1–P4 单独可交付（能力可查、可探测），P5 开始改变行为，
 | P6 桌面 | `desktop/src/lib/modelPicker.ts:111` / `:149`、`SettingsModelsTab.tsx:96` / `:317`、`ModelPicker.tsx:177` | `cd desktop && npx vitest run`（1417） |
 | P6 TUI | `yi-agent/src/tui/slash.rs:371`、`yi-agent/src/tui/app.rs:2436` / `:2397` | `cargo test -p yi-agent --bins effort`（21） |
 
-全量回归：`cargo test -p yi-agent-runtime --lib`（179）、`-p yi-agent-llm --lib`（125）、
-`-p yi-agent-app-server --lib`（879，4 ignored）、`-p yi-agent --bins`（654）。
+全量回归：`cargo test -p yi-agent-runtime --lib`（182）、`-p yi-agent-llm --lib`（125）、
+`-p yi-agent-app-server --lib`（881，4 ignored）、`-p yi-agent --bins`（654）。
+
+落地后另修的一处并发缺陷（不属于本设计的探测逻辑，但由后台写回引入）：
+`models.json` 的读改写原先无互斥，探测写回会覆盖同时落盘的 `default_model`
+等修改。见 `docs/bug-list.md` 对应条目与 `models.rs` 的
+`update_catalog` / `update_catalog_if`。
 
 **实现期偏离设计的两处（均为收紧，未放宽约束）**：
 
