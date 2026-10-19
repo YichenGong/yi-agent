@@ -46,7 +46,7 @@ pub fn handle_onboarding_request_at(
     }
 }
 
-fn missing_name(missing: yi_agent_runtime::onboarding::Missing) -> &'static str {
+pub(crate) fn missing_name(missing: yi_agent_runtime::onboarding::Missing) -> &'static str {
     use yi_agent_runtime::onboarding::Missing;
     match missing {
         Missing::Provider => "provider",
@@ -78,6 +78,10 @@ fn apply(
     params: &Value,
     _fallback: &RuntimeConfig,
 ) -> Result<Value, RpcError> {
+    // 注意:这里**只做校验 + 写盘**,不做连接探测。
+    // 探测是 async 的,必须由 `rpc/onboarding.rs` 的 async 分支负责:
+    // 同步函数里 `block_on` 会在 tokio worker 上 panic,而且会和 RPC 层
+    // 各探一次、白发一轮请求。客户端只能经 RPC 到达这里,门禁不会漏。
     let settings = settings_from_params(params)?;
     // 单写清单：`.env` 不再承载模型键，`imported` / `import_error` / `env_written`
     // 这些「双写」时代的字段一并消失。写失败即整个 apply 失败（无半成品）。

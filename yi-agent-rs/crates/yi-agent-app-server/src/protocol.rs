@@ -215,6 +215,34 @@ impl RpcError {
         }
     }
 
+    /// 保存模型前的一次连接测试失败。
+    ///
+    /// 与 `invalid_model` 共用 `-32602` 族(都属于"调用方给的配置不能用"),
+    /// 但 `data.code` 是 UI 分支用的稳定词汇:它要把"连通性失败"和"字段非法"
+    /// 说成两件事,否则用户会被引导去改字段而不是查网络/密钥。
+    pub fn model_test_failed(reason: impl Into<String>) -> Self {
+        Self {
+            code: -32602,
+            message: format!("connection test failed: {}", reason.into()),
+            data: Some(serde_json::json!({ "code": "model_test_failed" })),
+        }
+    }
+
+    /// 整台机器还没有可用模型(清单无默认条目,也没有显式注入)。
+    ///
+    /// 数值码自成一族:这不是参数错误,UI 应把用户导向设置/引导,而不是让他
+    /// 去改当前这次调用的参数。
+    pub fn model_not_configured(reasons: &[String]) -> Self {
+        Self {
+            code: -32027,
+            message: "no model is configured; finish model setup first".to_string(),
+            data: Some(serde_json::json!({
+                "code": "model_not_configured",
+                "reasons": reasons,
+            })),
+        }
+    }
+
     /// One `turn/start` image input could not be turned into a content block
     /// (an explicit `{type:"image", path}` that is missing, undecodable,
     /// oversized or not a regular file).

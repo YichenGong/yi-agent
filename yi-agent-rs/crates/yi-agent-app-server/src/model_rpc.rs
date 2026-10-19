@@ -243,7 +243,7 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
     // any other string overwrites. A brand-new entry with no key is keyless.
     let key_input = key_field(params)?;
     // 读与写必须在同一把锁里：后台探测可能同时在写回能力，分开做会互相覆盖。
-    update_catalog(path, |catalog| {
+    let default_model = update_catalog(path, |catalog| {
         let existing = catalog.models.iter().position(|m| m.name == name);
         let api_key = match key_input {
             KeyInput::Keep => existing
@@ -286,9 +286,15 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
             Some(i) => catalog.models[i] = entry,
             None => catalog.models.push(entry),
         }
+        // 第一个条目成为默认：否则"新增了模型却仍然报未配置"会让人无从理解。
+        // 已有默认时不抢：用户显式设过的选择必须保持。
+        if catalog.default_model.is_none() {
+            catalog.default_model = Some(name.clone());
+        }
+        catalog.default_model.clone()
     })
     .map_err(|error| RpcError::internal(error.to_string()))?;
-    Ok(json!({ "ok": true }))
+    Ok(json!({ "ok": true, "default_model": default_model }))
 }
 
 /// `model/delete`：命中才删；同时把指向它的 `default_model`/`subagent_model`
@@ -568,6 +574,39 @@ mod tests {
     }
 
     #[test]
+    /// 第一个条目成为默认：否则"新增了模型却仍然报未配置"会让人无从理解。
+    #[test]
+    fn upsert_makes_the_first_entry_the_default() {
+        let (dir, path) = catalog_path();
+        super::upsert(
+            &path,
+            &json!({"name":"A","provider":"anthropic","api_url":"https://a.example","model":"m","api_key":"k"}),
+        )
+        .unwrap();
+        let catalog = yi_agent_runtime::models::load_catalog_from(&path);
+        assert_eq!(catalog.default_model.as_deref(), Some("A"));
+        drop(dir);
+    }
+
+    /// 已有默认时不抢：用户显式设过的选择必须保持。
+    #[test]
+    fn upsert_does_not_steal_an_existing_default() {
+        let (dir, path) = catalog_path();
+        super::upsert(
+            &path,
+            &json!({"name":"A","provider":"anthropic","api_url":"https://a.example","model":"m","api_key":"k"}),
+        )
+        .unwrap();
+        super::upsert(
+            &path,
+            &json!({"name":"B","provider":"anthropic","api_url":"https://b.example","model":"m","api_key":"k"}),
+        )
+        .unwrap();
+        let catalog = yi_agent_runtime::models::load_catalog_from(&path);
+        assert_eq!(catalog.default_model.as_deref(), Some("A"));
+        drop(dir);
+    }
+
     fn upsert_keeps_capabilities_when_connection_fields_are_unchanged() {
         let (_dir, path) = catalog_path();
         call(&path, "model/upsert", entry_json("A")).unwrap();

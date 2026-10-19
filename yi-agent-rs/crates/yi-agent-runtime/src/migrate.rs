@@ -22,6 +22,9 @@ pub enum MigrationOutcome {
     InvalidProvider {
         reason: String,
     },
+    /// 旧 `.env` 里有 provider 与 key，但没有模型标识：无从得知用户想用哪个
+    /// 模型。不落清单、不改 `.env`，留给引导去问。
+    MissingModel,
 }
 
 fn is_model_key(key: &str) -> bool {
@@ -152,14 +155,15 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
             api_url: first_non_empty(["MODEL_API_URL", named_url]),
             api_key: first_non_empty(["MODEL_API_KEY", named_key]),
         };
-        let provider = settings.provider.clone();
+        // 没有模型标识就没有可落盘的条目：`parse_catalog` 会丢弃 model 为空的
+        // 条目，硬写只会得到"清单看似写了、读回却是空的"。也绝不猜一个名字——
+        // 那正是本次要修的问题。
+        if settings.model.trim().is_empty() {
+            return MigrationOutcome::MissingModel;
+        }
         let mut catalog = existing.clone();
         let name = {
-            let base = if settings.model.trim().is_empty() {
-                provider.clone()
-            } else {
-                settings.model.trim().to_string()
-            };
+            let base = settings.model.trim().to_string();
             let mut candidate = base.clone();
             let mut n = 2u32;
             while catalog.models.iter().any(|m| m.name == candidate) {
@@ -177,14 +181,8 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
         } else {
             settings.api_url.clone()
         };
-        let model = if settings.model.trim().is_empty() {
-            match parsed {
-                crate::models::ModelProvider::Openai => "gpt-4o".to_string(),
-                crate::models::ModelProvider::Anthropic => "claude-sonnet-4-20250514".to_string(),
-            }
-        } else {
-            settings.model.clone()
-        };
+        // 上面已保证非空：这里只做去空白，不再有"猜一个默认名"的分支。
+        let model = settings.model.trim().to_string();
         let context_length = get("YI_AGENT_MODEL_CONTEXT_LENGTH").parse::<u32>().ok();
         catalog.models.push(crate::models::ModelEntry {
             name: name.clone(),
@@ -247,6 +245,11 @@ pub fn log_outcome(outcome: &MigrationOutcome, env_path: &Path) {
             %reason,
             "could not migrate the legacy model keys; .env was left untouched"
         ),
+        MigrationOutcome::MissingModel => tracing::warn!(
+            path = %env_path.display(),
+            "legacy model keys in .env have no YI_AGENT_MODEL; .env was left untouched — \
+             finish model setup to create a catalog entry"
+        ),
         MigrationOutcome::InvalidProvider { reason } => tracing::warn!(
             path = %env_path.display(),
             %reason,
@@ -287,6 +290,26 @@ mod tests {
         let path = dir.join(".env");
         std::fs::write(&path, text).unwrap();
         path
+    }
+
+    /// 旧 `.env` 有 provider 和 key、却没有模型标识时，绝不能猜一个名字：
+    /// 猜出来的条目会让 `subagent` 之类"看起来已配置"的路径拿到一个用户
+    /// 从未确认过的模型。这里也不动 `.env`，用户还能补上模型标识后重跑。
+    #[test]
+    fn a_model_less_env_is_not_turned_into_an_invented_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let env = write_env(dir.path(), "YI_AGENT_PROVIDER=openai\nMODEL_API_KEY=sk-x\n");
+        let models = dir.path().join("models.json");
+        assert_eq!(
+            migrate_model_keys(&env, &models),
+            MigrationOutcome::MissingModel
+        );
+        assert!(!models.exists(), "nothing may be written without a model");
+        let text = std::fs::read_to_string(&env).unwrap();
+        assert!(
+            text.contains("MODEL_API_KEY=sk-x"),
+            "the key must stay put so the user can finish setup: {text}"
+        );
     }
 
     #[test]
@@ -365,7 +388,10 @@ mod tests {
     #[test]
     fn migration_is_idempotent() {
         let dir = tempfile::TempDir::new().unwrap();
-        let env = write_env(dir.path(), "MODEL_API_KEY=sk-x\n");
+        let env = write_env(
+            dir.path(),
+            "YI_AGENT_PROVIDER=openai\nYI_AGENT_MODEL=gpt-4o\nMODEL_API_KEY=sk-x\n",
+        );
         let models = dir.path().join("models.json");
         migrate_model_keys(&env, &models);
         assert_eq!(
@@ -381,7 +407,10 @@ mod tests {
         // 所以只 chmod 文件本身测不出来）。models.json 留在可写的根目录。
         let ro = dir.path().join("ro");
         std::fs::create_dir_all(&ro).unwrap();
-        let env = write_env(&ro, "MODEL_API_KEY=sk-x\n");
+        let env = write_env(
+            &ro,
+            "YI_AGENT_PROVIDER=anthropic\nYI_AGENT_MODEL=m\nMODEL_API_KEY=sk-x\n",
+        );
         let models = dir.path().join("models.json");
         let mut perms = std::fs::metadata(&ro).unwrap().permissions();
         perms.set_readonly(true);
@@ -411,7 +440,7 @@ mod tests {
         let models = dir.path().join("models.json");
         let garbage = "{ this is not valid json";
         std::fs::write(&models, garbage).unwrap();
-        let env_text = "MODEL_API_KEY=sk-x\nYI_AGENT_MAX_TURNS=20\n";
+        let env_text = "YI_AGENT_PROVIDER=anthropic\nYI_AGENT_MODEL=m\nMODEL_API_KEY=sk-x\nYI_AGENT_MAX_TURNS=20\n";
         let env = write_env(dir.path(), env_text);
 
         match migrate_model_keys(&env, &models) {
@@ -485,14 +514,12 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let env = write_env(
             dir.path(),
-            "ANTHROPIC_API_KEY=sk-ant-x\nANTHROPIC_BASE_URL=https://anthropic-proxy.example\n",
+            "YI_AGENT_MODEL=m\nANTHROPIC_API_KEY=sk-ant-x\nANTHROPIC_BASE_URL=https://anthropic-proxy.example\n",
         );
         let models = dir.path().join("models.json");
         assert_eq!(
             migrate_model_keys(&env, &models),
-            MigrationOutcome::Migrated {
-                entry: "anthropic".into()
-            }
+            MigrationOutcome::Migrated { entry: "m".into() }
         );
 
         let catalog = crate::models::load_catalog_from(&models);
@@ -510,13 +537,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let env = write_env(
             dir.path(),
-            "YI_AGENT_PROVIDER=openai\nOPENAI_API_KEY=sk-oai-x\nOPENAI_BASE_URL=https://openai-proxy.example/v1\n",
+            "YI_AGENT_PROVIDER=openai\nYI_AGENT_MODEL=gpt-4o\nOPENAI_API_KEY=sk-oai-x\nOPENAI_BASE_URL=https://openai-proxy.example/v1\n",
         );
         let models = dir.path().join("models.json");
         assert_eq!(
             migrate_model_keys(&env, &models),
             MigrationOutcome::Migrated {
-                entry: "openai".into()
+                entry: "gpt-4o".into()
             }
         );
 
@@ -532,13 +559,13 @@ mod tests {
         // 不做「哪个键存在就用哪个」的推断。
         let env = write_env(
             dir.path(),
-            "YI_AGENT_PROVIDER=openai\nANTHROPIC_API_KEY=sk-ant-x\n",
+            "YI_AGENT_PROVIDER=openai\nYI_AGENT_MODEL=gpt-4o\nANTHROPIC_API_KEY=sk-ant-x\n",
         );
         let models = dir.path().join("models.json");
         assert_eq!(
             migrate_model_keys(&env, &models),
             MigrationOutcome::Migrated {
-                entry: "openai".into()
+                entry: "gpt-4o".into()
             }
         );
         let catalog = crate::models::load_catalog_from(&models);
@@ -551,14 +578,12 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let env = write_env(
             dir.path(),
-            "MODEL_API_KEY=sk-generic\nANTHROPIC_API_KEY=sk-ant-x\nMODEL_API_URL=https://generic.example\nANTHROPIC_BASE_URL=https://anthropic-proxy.example\n",
+            "YI_AGENT_MODEL=m\nMODEL_API_KEY=sk-generic\nANTHROPIC_API_KEY=sk-ant-x\nMODEL_API_URL=https://generic.example\nANTHROPIC_BASE_URL=https://anthropic-proxy.example\n",
         );
         let models = dir.path().join("models.json");
         assert_eq!(
             migrate_model_keys(&env, &models),
-            MigrationOutcome::Migrated {
-                entry: "anthropic".into()
-            }
+            MigrationOutcome::Migrated { entry: "m".into() }
         );
         let catalog = crate::models::load_catalog_from(&models);
         assert_eq!(catalog.models[0].api_key, "sk-generic");
@@ -568,13 +593,14 @@ mod tests {
     #[test]
     fn an_empty_generic_key_falls_back_to_the_provider_named_one() {
         let dir = tempfile::TempDir::new().unwrap();
-        let env = write_env(dir.path(), "MODEL_API_KEY=\nANTHROPIC_API_KEY=sk-ant-x\n");
+        let env = write_env(
+            dir.path(),
+            "YI_AGENT_MODEL=m\nMODEL_API_KEY=\nANTHROPIC_API_KEY=sk-ant-x\n",
+        );
         let models = dir.path().join("models.json");
         assert_eq!(
             migrate_model_keys(&env, &models),
-            MigrationOutcome::Migrated {
-                entry: "anthropic".into()
-            }
+            MigrationOutcome::Migrated { entry: "m".into() }
         );
         let catalog = crate::models::load_catalog_from(&models);
         assert_eq!(catalog.models[0].api_key, "sk-ant-x");
@@ -613,7 +639,7 @@ mod tests {
         let ro = dir.path().join("ro");
         std::fs::create_dir_all(&ro).unwrap();
         let models = ro.join("models.json");
-        let env_text = "MODEL_API_KEY=sk-x\nYI_AGENT_MAX_TURNS=20\n";
+        let env_text = "YI_AGENT_PROVIDER=anthropic\nYI_AGENT_MODEL=m\nMODEL_API_KEY=sk-x\nYI_AGENT_MAX_TURNS=20\n";
         let env = write_env(dir.path(), env_text);
         let mut perms = std::fs::metadata(&ro).unwrap().permissions();
         perms.set_readonly(true);

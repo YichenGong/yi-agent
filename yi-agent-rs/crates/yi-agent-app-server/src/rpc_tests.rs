@@ -3269,6 +3269,50 @@ async fn unknown_method_returns_method_not_found() {
     h.shutdown().await;
 }
 
+/// 清单为空且无显式注入时，新建会话必须给出可识别的"未配置模型"错误，
+/// 而不是拿一个猜测的名字去发请求。
+///
+/// **必须显式把 `cfg.model` 置空**：`test_config()` 的 model 是
+/// `TEST_MODEL`（`test_support.rs:10,57`，非空），默认 Harness 永远不会
+/// 触发拦截——那样这个测试会"通过"却什么都没验证。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_start_reports_a_missing_model_configuration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    cfg.model = String::new();
+    let mut h = Harness::with_cfg(cfg).await;
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    // `thread/started` 是同一轮里的广播帧,可能与响应交错;按 id 取。
+    let v = read_response(&mut h, 2).await;
+    assert_eq!(v["error"]["code"], -32027, "got {v}");
+    assert_eq!(
+        v["error"]["data"]["code"], "model_not_configured",
+        "got {v}"
+    );
+}
+
+/// 整包注入（--model + --api-key）时即使清单为空也必须能开会话：
+/// 这条路径不经过清单条目，拦截只能看 `cfg.model` 是否为空。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_start_accepts_an_explicit_injection_without_a_catalog() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    // Harness 本来就注入隔离的 models_path（空清单）；这里只补注入标记。
+    cfg.model = "claude-injected".to_string();
+    cfg.api_key = "sk-injected".to_string();
+    cfg.model_injected = true;
+    let mut h = Harness::with_cfg(cfg).await;
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 2).await;
+    assert!(v.get("error").is_none(), "got {v}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn thread_start_emits_thread_started_and_responds() {
     let mut h = Harness::new();
@@ -13294,32 +13338,10 @@ async fn onboarding_status_is_readable_and_reports_needed() {
     assert_eq!(v["result"]["dismissed"], false, "got {v}");
 }
 
-/// `onboarding/apply` 只落清单(不再写 `.env`);随后 `status` 立刻翻成 ready。
-#[tokio::test(flavor = "multi_thread")]
-async fn onboarding_apply_lands_the_env_and_catalog() {
-    let mut h = Harness::new();
-    initialize(&mut h).await;
-    h.send(
-        r#"{"jsonrpc":"2.0","id":2,"method":"onboarding/apply","params":{"provider":"openai","model":"gpt-4o","api_url":"","api_key":"sk-x"}}"#,
-    )
-    .await;
-    let v = h.read_value().await;
-    assert_eq!(v["result"]["ok"], true, "got {v}");
-    assert!(v["result"].get("name").is_some(), "got {v}");
-    assert!(v["result"].get("env_written").is_none(), "got {v}");
-    assert!(v["result"].get("imported").is_none(), "got {v}");
-
-    // 状态随即翻成 ready。
-    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"onboarding/status","params":{}}"#)
-        .await;
-    let v = h.read_value().await;
-    assert_eq!(v["result"]["needed"], false, "got {v}");
-}
-
-/// `onboarding/test` 用注入的临时 provider 真发一次最小请求。桩必须回
-/// **SSE** 流(`text/event-stream`)——provider 消费的是流,不是一次性 JSON。
-#[tokio::test(flavor = "multi_thread")]
-async fn onboarding_test_probes_the_endpoint() {
+/// 一个能通过 anthropic provider 探测的最小 SSE 端点。
+///
+/// 探测消费的是流而不是一次性 JSON,所以桩必须回 `text/event-stream`。
+async fn anthropic_sse_server() -> wiremock::MockServer {
     use wiremock::matchers::{method as wm_method, path as wm_path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
@@ -13346,6 +13368,59 @@ async fn onboarding_test_probes_the_endpoint() {
         )
         .mount(&server)
         .await;
+    server
+}
+
+/// `onboarding/apply` 在连接测试失败时必须零写入并给出稳定错误码。
+#[tokio::test(flavor = "multi_thread")]
+async fn onboarding_apply_refuses_when_the_probe_fails() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    // 端口 1 上没有监听者:连接被立即拒绝,不会等满 15s 超时。
+    h.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"onboarding/apply","params":{"provider":"anthropic","model":"m","api_url":"http://127.0.0.1:1","api_key":"k"}}"#,
+    )
+    .await;
+    let v = h.read_value().await;
+    assert_eq!(v["error"]["data"]["code"], "model_test_failed", "got {v}");
+    assert_eq!(v["error"]["code"], -32602, "got {v}");
+
+    // 清单没有被写进去,状态仍是 needed。
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"onboarding/status","params":{}}"#)
+        .await;
+    let v = h.read_value().await;
+    assert_eq!(v["result"]["needed"], true, "got {v}");
+}
+
+/// `onboarding/apply` 只落清单(不再写 `.env`);探测通过后 `status` 立刻翻成 ready。
+#[tokio::test(flavor = "multi_thread")]
+async fn onboarding_apply_lands_the_catalog_after_a_passing_probe() {
+    let server = anthropic_sse_server().await;
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    let req = serde_json::json!({
+        "jsonrpc":"2.0","id":2,"method":"onboarding/apply",
+        "params":{"provider":"anthropic","model":"m","api_url":server.uri(),"api_key":"sk-x"}
+    });
+    h.send(&req.to_string()).await;
+    let v = h.read_value().await;
+    assert_eq!(v["result"]["ok"], true, "got {v}");
+    assert!(v["result"].get("name").is_some(), "got {v}");
+    assert!(v["result"].get("env_written").is_none(), "got {v}");
+    assert!(v["result"].get("imported").is_none(), "got {v}");
+
+    // 状态随即翻成 ready。
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"onboarding/status","params":{}}"#)
+        .await;
+    let v = h.read_value().await;
+    assert_eq!(v["result"]["needed"], false, "got {v}");
+}
+
+/// `onboarding/test` 用注入的临时 provider 真发一次最小请求。桩必须回
+/// **SSE** 流(`text/event-stream`)——provider 消费的是流,不是一次性 JSON。
+#[tokio::test(flavor = "multi_thread")]
+async fn onboarding_test_probes_the_endpoint() {
+    let server = anthropic_sse_server().await;
 
     let mut h = Harness::new();
     initialize(&mut h).await;
@@ -16831,7 +16906,7 @@ fn startup_migrates_legacy_model_keys_into_the_catalog() {
     let env_path = dir.path().join(".env");
     std::fs::write(
         &env_path,
-        "YI_AGENT_PROVIDER=openai\nMODEL_API_KEY=sk-old\n",
+        "YI_AGENT_PROVIDER=openai\nYI_AGENT_MODEL=gpt-4o\nMODEL_API_KEY=sk-old\n",
     )
     .unwrap();
     let models_path = dir.path().join("models.json");
@@ -16867,6 +16942,7 @@ fn log_outcome_handles_every_variant() {
         },
         env,
     );
+    log_outcome(&MigrationOutcome::MissingModel, env);
     log_outcome(
         &MigrationOutcome::InvalidProvider {
             reason: "unknown provider: azure".into(),

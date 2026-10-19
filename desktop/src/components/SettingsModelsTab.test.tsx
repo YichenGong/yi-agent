@@ -176,6 +176,17 @@ describe("SettingsModelsTab", () => {
     await waitFor(() => expect(callsTo(call, "model/list").length).toBe(2));
   });
 
+  it("warns when entries exist but no default is set, and can set one", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload({ default_model: null }) : { ok: true },
+    );
+    render(<SettingsModelsTab call={call} />);
+    // 有条目却没有默认 -> 新建会话会直接被门禁拦下，必须在这里给出出路。
+    expect(await screen.findByText(/还没有设置默认模型/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /设为默认/ }));
+    await waitFor(() => expect(call).toHaveBeenCalledWith("model/setDefault", { name: "A" }));
+  });
+
   it("sets and clears the global default", async () => {
     const call = vi.fn(async (method: string, _params: unknown) =>
       method === "model/list" ? payload({ default_model: null }) : { ok: true },

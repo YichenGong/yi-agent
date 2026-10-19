@@ -34,6 +34,32 @@ use crate::server::{
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
 };
+/// 模型未配置时返回可分支的错误；配置可用时返回 `None`。
+///
+/// 判据只看「解析后的生效 model 是否为空」，不看清单是否为空：整包注入
+/// （`--model` + `--api-key`）绕开清单，`cfg.model` 非空就是合法配置。
+/// `cfg.model` 在"既无条目又无注入"时由 `RuntimeConfig::load` 留空，
+/// 于是这一个判据同时覆盖两条来源。
+fn missing_model_error(state: &AppState<'_>, session_model_ref: Option<&str>) -> Option<RpcError> {
+    let catalog = yi_agent_runtime::models::load_catalog_from(state.models_path);
+    let effective =
+        yi_agent_runtime::models::resolve_effective(state.cfg, &catalog, session_model_ref);
+    if !effective.model.trim().is_empty() {
+        return None;
+    }
+    // 原因列表留给 UI 展示"还差哪几项"，与 `onboarding/status` 同源。
+    let env = yi_agent_runtime::onboarding::read_env_fields(state.onboarding_env_path)
+        .unwrap_or_default();
+    let reasons = match yi_agent_runtime::onboarding::assess(&env, Some(&catalog)) {
+        yi_agent_runtime::onboarding::Assessment::Needed { reasons } => reasons
+            .into_iter()
+            .map(|m| crate::onboarding_rpc::missing_name(m).to_string())
+            .collect(),
+        yi_agent_runtime::onboarding::Assessment::Ready { .. } => Vec::new(),
+    };
+    Some(RpcError::model_not_configured(&reasons))
+}
+
 /// 处理本域的一个 RPC 请求。
 ///
 /// 返回 [`Flow::Continue`] 表示「本域已应答,主循环回到下一轮」(等价于搬移前臂里
@@ -243,6 +269,19 @@ pub(crate) async fn handle(
             // ——既进工厂槽位（决定沙箱/工具/权限的根集），也进 meta（落盘快照）与
             // `attach_delegation`（委派路径的根集）。三处必须同源，故不各自重读索引。
             let extra_roots = linked_extra_roots(state.workspaces, &cwd);
+
+            // 模型可用性在**建 agent 之前**判:建 agent 会做大量装配,失败信息会被
+            // 压成 internal;这里直接给 UI 一个可分支的错误码。
+            //
+            // 判据是「解析后的生效 model 是否为空」,而不是「有没有清单条目」:
+            // `effective_entry_for` 在整包注入时返回 `None`(表示注入压过清单),
+            // 那条路径的 model 来自 `cfg.model`,非空就是合法配置。Task 4 已保证
+            // 「无条目且无注入」时 `cfg.model == ""`,所以一个判据覆盖三种情况:
+            //   有条目 -> 条目.model;无条目+注入 -> cfg.model;两者都无 -> 空串。
+            if let Some(error) = missing_model_error(state, model_ref.as_deref()) {
+                write_response(state.hub, state.client, err_response(id, error)).await?;
+                return Ok(Flow::Continue);
+            }
 
             // 本次会话的 `model_ref` 经 thread-local 交给工厂解析 provider /
             // api_url / api_key / model(命中清单默认则用条目,否则回退 cfg)。
@@ -493,6 +532,13 @@ pub(crate) async fn handle(
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
                 .collect();
+
+            // 与 `thread/start` 同一道门禁:老会话的 meta 可能指向一个已被删除
+            // 的条目,重建 agent 同样不该拿到空模型。
+            if let Some(error) = missing_model_error(state, loaded.meta.model_ref.as_deref()) {
+                write_response(state.hub, state.client, err_response(id, error)).await?;
+                return Ok(Flow::Continue);
+            }
 
             let built = match with_session_model_ref(loaded.meta.model_ref.clone(), || {
                 with_session_extra_roots(extra_roots.clone(), || {

@@ -283,12 +283,11 @@ impl RuntimeConfig {
             "openai" => "https://api.openai.com/v1",
             _ => "https://api.anthropic.com",
         };
-        let default_model = match provider.as_str() {
-            "openai" => "gpt-4o",
-            _ => "claude-sonnet-4-20250514",
-        };
         let api_url = injected_url.unwrap_or_else(|| default_api_url.to_string());
-        let model = injected_model.unwrap_or_else(|| default_model.to_string());
+        // 模型名没有客观默认值:猜一个名字发出去只会得到 404,而且这个猜测会一路
+        // 传播到子 agent(`subagent_model` -> `default_model` -> `cfg`)。空串是
+        // "未配置"的唯一诚实表示,由 RPC 入口与 CLI 给出可操作的指引。
+        let model = injected_model.unwrap_or_default();
         let api_key = match injected_key {
             Some(key) => key,
             _ if allow_missing_key => String::new(),
@@ -804,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn load_defaults_api_url_and_model() {
+    fn load_defaults_the_url_but_not_a_model() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -830,7 +829,9 @@ mod tests {
         };
         let config = RuntimeConfig::load(&overrides).unwrap();
         assert_eq!(config.api_url, "https://api.anthropic.com");
-        assert_eq!(config.model, "claude-sonnet-4-20250514");
+        // 地址有客观默认值,模型名没有:没有显式注入就必须是空串,由调用方
+        // 自己判断"未配置"并报可识别的错误,而不是凭空猜一个名字发出去。
+        assert_eq!(config.model, "");
         assert_eq!(
             config.max_turns, 200,
             "an interactive session must not be capped at a turn count a real \
@@ -1012,7 +1013,7 @@ mod tests {
         let config = RuntimeConfig::load(&overrides).unwrap();
         assert_eq!(config.provider, "openai");
         assert_eq!(config.api_url, "https://api.openai.com/v1");
-        assert_eq!(config.model, "gpt-4o");
+        assert_eq!(config.model, "", "no default model name may be invented");
     }
 
     /// `.env` 仍会被加载（非模型键需要它），但它**不再是模型 key 的来源**。
