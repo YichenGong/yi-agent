@@ -40,8 +40,9 @@ pub const NAMESPACE: &str = "kanban";
 
 /// 合并轮把 base 检出到的**兄弟**命名空间：`.worktrees/<NAMESPACE>-merge/<slug>`。
 ///
-/// 与 [`NAMESPACE`] 同属保留领地，同样不是项目。它是 `"<NAMESPACE>-"` 前缀族的
-/// 一员，判定里按前缀收（见 [`is_plugin_worktree`]）。
+/// 与 [`NAMESPACE`] 同属保留领地，同样不是项目。判定里**整段精确匹配**
+/// （见 [`is_reserved_namespace`]）：按 `kanban-` 前缀收会把用户自己的
+/// `.worktrees/kanban-experiment` 也当成插件领地。
 const MERGE_NAMESPACE_SUFFIX: &str = "-merge";
 
 /// `<project>/.worktrees`：所有 worktree 的父目录。
@@ -84,9 +85,10 @@ pub fn is_plugin_worktree(cwd: &Path) -> bool {
 
 /// `.worktrees` 之后那一段是否是一个保留命名空间。
 fn is_reserved_namespace(part: &str) -> bool {
-    part == NAMESPACE
-        || part == format!("{NAMESPACE}{MERGE_NAMESPACE_SUFFIX}")
-        || part.starts_with(&format!("{NAMESPACE}-"))
+    // 只认这两个**精确**段。前缀匹配（`kanban-*`）会把用户自己的
+    // `.worktrees/kanban-experiment` 误判成插件领地：那里的组会被当成幽灵
+    // 组长过滤掉、`ensure_lead_meta` 也会拒绝。插件只创建这两个目录。
+    part == NAMESPACE || part == format!("{NAMESPACE}{MERGE_NAMESPACE_SUFFIX}")
 }
 
 /// 按**名字**在 `PATH` 上解析一个插件可执行文件。
@@ -132,8 +134,15 @@ mod tests {
         assert!(!is_plugin_worktree(Path::new("/p/.worktrees/feature-x")));
         // 只有 `.worktrees` 之后**紧跟**的那一段才算：目录名碰巧叫 kanban 不算。
         assert!(!is_plugin_worktree(Path::new("/p/kanban/x")));
-        // 前缀必须整段匹配，`kanbanx` 不是保留名的 `-` 前缀族成员。
+        // 前缀必须整段匹配，`kanbanx` 不是保留名。
         assert!(!is_plugin_worktree(Path::new("/p/.worktrees/kanbanx/x")));
+        // 只有一个 `-merge` 兄弟：`kanban-` 前缀族里的别的名字是用户的。
+        assert!(!is_plugin_worktree(Path::new(
+            "/p/.worktrees/kanban-experiment"
+        )));
+        assert!(!is_plugin_worktree(Path::new(
+            "/p/.worktrees/kanban-merge-x/card-1"
+        )));
     }
 
     /// 解析不到就回 `None`，不 panic：某个插件没装不该让宿主起不来。
