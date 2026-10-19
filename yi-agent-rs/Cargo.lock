@@ -4957,7 +4957,6 @@ dependencies = [
  "url",
  "uuid",
  "yi-agent-app-server",
- "yi-agent-boards",
  "yi-agent-core",
  "yi-agent-mcp",
  "yi-agent-relay",
@@ -4994,7 +4993,6 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
- "yi-agent-boards",
  "yi-agent-core",
  "yi-agent-mcp",
  "yi-agent-relay",
@@ -5004,18 +5002,6 @@ dependencies = [
  "yi-agent-subagent",
  "yi-agent-supervisors",
  "yi-agent-tools",
-]
-
-[[package]]
-name = "yi-agent-boards"
-version = "0.1.7"
-dependencies = [
- "chrono",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "yi-agent-store",
 ]
 
 [[package]]
@@ -5176,11 +5162,13 @@ name = "yi-agent-supervisors"
 version = "0.1.7"
 dependencies = [
  "chrono",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tracing",
+ "yi-agent-store",
 ]
 
 [[package]]

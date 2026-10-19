@@ -85,10 +85,28 @@ pub fn save(workdir: &Path, theme: Theme) -> std::io::Result<()> {
     )
 }
 
+/// 后台值守（常驻 watchman / 登录自启）开关的偏好键。**这是磁盘契约**：
+/// 写在 `<workdir>/.yi-agent/preferences.json` 里，与桌面设置页共用。
+///
+/// 通用化自看板时代的 [`LEGACY_WATCHMAN_KEY`]：值守服务的是任意「登记在册的项目」，
+/// 不特指任何插件，键名里不该出现某个插件的名字。
+pub const WATCHMAN_KEY: &str = "resident_daemon_watchman_enabled";
+
+/// 通用化之前的旧键。**只读**兼容：老机器上写下的值必须仍生效，否则升级后
+/// 用户明确关掉的登录自启会静默复位成「开」。写路径只写新键，故旧键不会长期
+/// 与新键并存——它在下一次写入后就成为过期的影子。
+///
+/// 为什么留着一个含 `board` 的字面量：它是磁盘上的既成事实，删掉字符串等于删掉
+/// 兼容（验收 §6.8 要求旧键仍被读到）。这是**必须保留的兼容**，不是漏改。
+pub const LEGACY_WATCHMAN_KEY: &str = "board_watchman_enabled";
+
 /// 后台值守（常驻 watchman / 登录自启）开关。缺省 `true`——用户没表态时按
 /// 期望行为走，而不是静默地什么都不做。
 ///
 /// 坏文件 / 缺键一律回退 `true`，与 [`load`] 对主题的容错策略一致。
+///
+/// 读序：新键优先，缺失才看旧键。两个键都在时以新键为准（新键一旦写下，旧键
+/// 就是过期的影子）。
 pub fn load_watchman_enabled(workdir: &Path) -> bool {
     let path = preferences_path(workdir);
     std::fs::read_to_string(&path)
@@ -96,19 +114,18 @@ pub fn load_watchman_enabled(workdir: &Path) -> bool {
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|value| {
             value
-                .get(yi_agent_boards::watchman::PREFERENCE_KEY)
+                .get(WATCHMAN_KEY)
+                .or_else(|| value.get(LEGACY_WATCHMAN_KEY))
                 .and_then(|v| v.as_bool())
         })
         .unwrap_or(true)
 }
 
 /// 写开关：与 [`save`] 同一约定——读-改-写、保留无关键、原子替换。
+///
+/// 只写 [`WATCHMAN_KEY`]：旧键是只读兼容。
 pub fn save_watchman_enabled(workdir: &Path, enabled: bool) -> std::io::Result<()> {
-    set_object_value(
-        workdir,
-        yi_agent_boards::watchman::PREFERENCE_KEY,
-        serde_json::Value::Bool(enabled),
-    )
+    set_object_value(workdir, WATCHMAN_KEY, serde_json::Value::Bool(enabled))
 }
 
 /// `preferences.json` 里侧车中继地址的键名。
@@ -284,7 +301,7 @@ fn temp_path_for(dir: &Path, seq: u64) -> PathBuf {
 /// 中继地址偏好（`relay_url`）的读写测试。
 ///
 /// 该键是桌面设置页与侧车之间的唯一落点：侧车启动时经 `load_relay_url` 读它。
-/// 与 `theme`/`board_watchman_enabled` 同处一个文件，故同样断言写不覆盖无关键。
+/// 与 `theme`/值守开关同处一个文件，故同样断言写不覆盖无关键。
 #[cfg(test)]
 mod relay_tests {
     use super::*;
@@ -367,14 +384,14 @@ mod relay_tests {
         assert_eq!(load_relay_url(dir.path()), None);
     }
 
-    /// 与 `theme`/`board_watchman_enabled` 同处一个文件：三方写路径不得互相覆盖。
+    /// 与 `theme`/值守开关同处一个文件：三方写路径不得互相覆盖。
     #[test]
     fn saving_the_relay_url_preserves_unrelated_keys() {
         let dir = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         std::fs::write(
             preferences_path(dir.path()),
-            r#"{"theme":"light","board_watchman_enabled":false,"subagent_runtime":"never"}"#,
+            format!(r#"{{"theme":"light","{WATCHMAN_KEY}":false,"subagent_runtime":"never"}}"#),
         )
         .unwrap();
         save_relay_url(
@@ -390,7 +407,7 @@ mod relay_tests {
             "wss://relay.example.com/connect?session=x"
         );
         assert_eq!(value["theme"], "light");
-        assert_eq!(value["board_watchman_enabled"], false);
+        assert_eq!(value[WATCHMAN_KEY], false);
         assert_eq!(value["subagent_runtime"], "never");
 
         // 反向：theme 的写不得抹掉 relay_url。
@@ -759,7 +776,7 @@ mod warning_tests {
     }
 }
 
-/// 值守偏好（`board_watchman_enabled`）的读写测试。与 `theme` 同处一个
+/// 值守偏好（[`WATCHMAN_KEY`]）的读写测试。与 `theme` 同处一个
 /// `preferences.json`，所以这里同样断言两条写路径互不覆盖。
 #[cfg(test)]
 mod watchman_tests {
@@ -780,14 +797,14 @@ mod watchman_tests {
     #[test]
     fn the_watchman_preference_falls_back_to_on_for_broken_files() {
         for body in [
-            "not json",
-            "{\"board_watchman_enabled\":\"yes\"}",
-            "[]",
-            "{}",
+            "not json".to_string(),
+            format!(r#"{{"{WATCHMAN_KEY}":"yes"}}"#),
+            "[]".to_string(),
+            "{}".to_string(),
         ] {
             let dir = tempfile::TempDir::new().unwrap();
             std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
-            std::fs::write(preferences_path(dir.path()), body).unwrap();
+            std::fs::write(preferences_path(dir.path()), &body).unwrap();
             assert!(load_watchman_enabled(dir.path()), "body: {body}");
         }
     }
@@ -804,8 +821,60 @@ mod watchman_tests {
         save_watchman_enabled(dir.path(), false).unwrap();
         let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert_eq!(value["board_watchman_enabled"], false);
+        assert_eq!(value[WATCHMAN_KEY], false);
         assert_eq!(value["theme"], "light");
         assert_eq!(value["subagent_runtime"], "never");
+    }
+
+    /// 旧键（看板时代的 `board_watchman_enabled`）仍要读得到。
+    ///
+    /// 老机器上已经写下的值若读不到，升级后开关会静默复位成「开」——用户明确
+    /// 关掉的登录自启会自己回来，且没有任何提示。
+    #[test]
+    fn the_legacy_watchman_preference_key_still_reads() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            format!(r#"{{"{LEGACY_WATCHMAN_KEY}":false}}"#),
+        )
+        .unwrap();
+        assert!(
+            !load_watchman_enabled(dir.path()),
+            "the legacy key must still be honoured"
+        );
+    }
+
+    /// 两键并存时以新键为准：新键一旦写下，旧键就是过期的影子。
+    #[test]
+    fn the_generic_watchman_preference_key_wins_over_the_legacy_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            format!(r#"{{"{WATCHMAN_KEY}":true,"{LEGACY_WATCHMAN_KEY}":false}}"#),
+        )
+        .unwrap();
+        assert!(
+            load_watchman_enabled(dir.path()),
+            "the generic key must win over the legacy one"
+        );
+    }
+
+    /// 写只写新键：旧键是**只读**兼容，不再被刷新（否则两个键会长期并存）。
+    #[test]
+    fn saving_writes_only_the_generic_key() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            preferences_path(dir.path()),
+            format!(r#"{{"{LEGACY_WATCHMAN_KEY}":true}}"#),
+        )
+        .unwrap();
+        save_watchman_enabled(dir.path(), false).unwrap();
+        let text = std::fs::read_to_string(preferences_path(dir.path())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value[WATCHMAN_KEY], false);
+        assert!(!load_watchman_enabled(dir.path()));
     }
 }

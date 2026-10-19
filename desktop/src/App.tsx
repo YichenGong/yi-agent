@@ -53,9 +53,9 @@ import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue"
 import {
   enqueueBoardCard,
   enqueuePrequeuedCard,
-  parseBoardWatchman,
   promoteBoardCard,
   setBoardSwitch,
+  watchmanFromSettings,
   writeBoardWatchman,
 } from "./lib/superpowersKanbanSwitch";
 import { type BoardErrorKind, boardErrorKind } from "./lib/boardIndex";
@@ -84,13 +84,13 @@ import type { ReasoningCapabilities } from "./lib/models";
 import { insertDroppedPaths } from "./lib/droppedPaths";
 
 /**
- * 看板失败的四种说法。
+ * 看板失败的三种说法。
  *
- * 三种可操作的状态各自点名下一步：没建看板就点「创建看板」，进程不可达就说
- * 明是连接问题而不是插件问题，插件没装才让用户去装。`other` 不猜原因。
+ * 两种可操作的状态各自点名下一步：进程不可达就说明是连接问题而不是插件问题，
+ * 插件没装才让用户去装。`other` 不猜原因。**没有「未创建」这一支**：宿主不再
+ * 发这个码——「有没有看板」由登记表（`resident/list`）表达，不是一个错误。
  */
 const BOARD_ERROR_TEXT: Record<BoardErrorKind, string> = {
-  not_created: "该项目尚未创建看板",
   daemon_down: "看板进程不可达",
   plugin_missing: "插件未安装",
   other: "看板读写失败",
@@ -1368,6 +1368,8 @@ export default function App() {
         syncPlanRef.current = parseSyncPlan(initialized);
         const settings = await client.request<{
           theme?: unknown;
+          resident_daemon_watchman_enabled?: unknown;
+          /** 通用化之前的旧字段名：旧宿主仍只回它。 */
           board_watchman_enabled?: unknown;
           relay_url?: unknown;
           tag_names?: unknown;
@@ -1383,11 +1385,12 @@ export default function App() {
           prefs.setTheme(authoritative);
         }
         // 值守：直接读这份 settings（同一趟请求里就有），不再多发一次
-        // `ui/settings/read`。缺省口径由 parseBoardWatchman 与 readBoardWatchman 共享。
+        // `ui/settings/read`。读序（新名优先、旧名兜底）与缺省口径都在
+        // `watchmanFromSettings` 里，与 readBoardWatchman 共用同一份实现。
         // 同样只在用户还没拨过开关时采纳：重启重放握手时面板已在屏上，read 在途
         // 期间拨下的开关不能被这趟迟到的旧值悄悄覆盖回原样。
         if (!board.watchmanTouchedRef.current) {
-          board.setWatchmanEnabled(parseBoardWatchman(settings.board_watchman_enabled));
+          board.setWatchmanEnabled(watchmanFromSettings(settings as Record<string, unknown>));
         }
         // 标签显示名：服务端只回用户覆盖项，与默认名合并成完整 6 键。
         setTagNames(
@@ -1476,7 +1479,7 @@ export default function App() {
         // 真的连上了：重新武装"凭据被移除"的自动提示。此前用户可能已点过返回
         // （那次拒绝的对象是旧凭据）；此后凭据若再失效，是一件新事，该再提示一次。
         prefs.repairDismissedRef.current = false;
-        // 看板登记表要等握手完成后再拉：`board/list` 是普通请求，服务端在
+        // 看板登记表要等握手完成后再拉：`resident/list` 是普通请求，服务端在
         // `initialize` 之前一律以 not_initialized 拒绝。早拉一次会被拒、把
         // boards 清空，而登记表只在这里拉一次，于是整场会话侧栏都没有看板条目。
         await board.refreshBoards();
@@ -2151,15 +2154,6 @@ export default function App() {
               {board.boardError !== null && (
                 <div className="flex items-center gap-3 px-4 pb-3 text-xs text-red-400">
                   <span>{BOARD_ERROR_TEXT[board.boardError]}</span>
-                  {board.boardError === "not_created" && (
-                    <button
-                      type="button"
-                      onClick={() => void onCreateBoard(board.selectedBoard!)}
-                      className="rounded border border-line-strong px-2 py-0.5 text-fg-muted hover:text-fg"
-                    >
-                      创建看板
-                    </button>
-                  )}
                 </div>
               )}
               <SuperpowersKanbanEnqueue

@@ -24,6 +24,7 @@ use crate::inbox::{self, InboxOutcome};
 use crate::lease::{self, Lease};
 use crate::merge;
 use crate::persist;
+use crate::resident;
 use crate::worktree::{ensure_worktree, slugify};
 
 /// 一次成功认领：卡片 id、它的 worktree、以及给会话用的标题。
@@ -209,6 +210,9 @@ enum PendingKind {
 pub struct BoardService {
     state_dir: PathBuf,
     project_root: PathBuf,
+    /// 通用常驻登记目录（`$HOME/.yi-agent`）。`home` 注入时为 `<home>/.yi-agent`，
+    /// 于是测试不必碰真实 `$HOME`（与 `leases_dir` 同一手法）。
+    resident_dir: Option<PathBuf>,
     inner: Mutex<Inner>,
 }
 
@@ -228,6 +232,11 @@ pub fn effective_head(workdir: &Path) -> Option<String> {
 
 impl BoardService {
     pub fn new(state_dir: PathBuf, project_root: PathBuf, home: Option<PathBuf>) -> Self {
+        // 先按借用算 resident_dir，再让 leases_dir 的 `map` 消费 `home`。
+        let resident_dir = home
+            .as_ref()
+            .map(|home| home.join(".yi-agent"))
+            .or_else(resident::default_dir);
         let leases_dir = home
             .map(|home| {
                 home.join(".yi-agent")
@@ -238,6 +247,7 @@ impl BoardService {
         Self {
             state_dir,
             project_root,
+            resident_dir,
             inner: Mutex::new(Inner {
                 leases: Default::default(),
                 leases_dir,
@@ -911,6 +921,75 @@ impl BoardService {
         })?;
         self.lock().leases.remove(&id);
         Ok(())
+    }
+
+    /// 这台宿主的管路里，请求常驻 daemon 的名字。写进登记文件的 `required_by`。
+    ///
+    /// 是一个**磁盘契约字符串**：宿主侧用同一个名字读写（`yi-agent-store` 的
+    /// `resident::import_legacy_projects(…, requester)` 参数就是这个值），改它要
+    /// 两边同改。
+    const REQUESTER: &'static str = "superpowers-kanban";
+
+    /// 本插件的状态目录落点：`<project>/.yi-agent/superpowers-kanban`。
+    ///
+    /// 与 `main.rs` 的 `default_state_dir` 和清单的 `--state-dir` 同一个落点。
+    /// 只写一处，create 与 remove 就不可能各算各的。
+    fn state_dir_for(project: &Path) -> PathBuf {
+        project.join(".yi-agent").join(Self::REQUESTER)
+    }
+
+    /// 建盘（生命周期归插件，Spec 4 §4.2）：建自己的状态目录 + 登记常驻。
+    ///
+    /// **不写清单**。清单（`<项目>/.yi-agent/supervisors/<name>.json`）由**宿主**
+    /// 安装——「把某个插件装进某个项目」是宿主通用能力，插件在清单就位前根本
+    /// 起不来，写不了它（spec §4.4 的鸡生蛋）。因此本方法只做插件自己那份：
+    /// 建状态目录、登记「这个项目要常驻」。
+    ///
+    /// 幂等：重复调用两次不产生重复的 `required_by`（`resident::require` 的
+    /// 并集语义），状态目录的创建也是幂等的。
+    pub fn lifecycle_create(&self, project: &Path) -> Result<(), String> {
+        let resident_dir = self
+            .resident_dir
+            .clone()
+            .ok_or_else(|| "cannot locate the resident registry: HOME is unset".to_string())?;
+        // 状态目录落点与 `main.rs` 的 `default_state_dir`/清单的 `--state-dir` 一致：
+        // `<项目>/.yi-agent/superpowers-kanban`。
+        let state_dir = Self::state_dir_for(project);
+        std::fs::create_dir_all(&state_dir).map_err(|error| {
+            format!(
+                "could not create the board state dir {}: {error}",
+                state_dir.display()
+            )
+        })?;
+        resident::require(&resident_dir, project, Self::REQUESTER)
+            .map_err(|error| format!("could not register the project as resident: {error}"))
+    }
+
+    /// 删盘：撤销常驻登记 + 删自己的状态目录。
+    ///
+    /// **分工**：插件**不**去停宿主的 per-project daemon——那是宿主/监督者的事
+    /// （谁成功启动 daemon，谁负责监督）。插件只说「我不再需要它了」，宿主观察到
+    /// 登记消失后停进程。所以这里的验收是「release 已发生 + 状态目录已删」，
+    /// 而不是「进程已停」。
+    ///
+    /// 可重复调用：登记本已不在、目录本已不在，都当成功。
+    pub fn lifecycle_remove(&self, project: &Path) -> Result<(), String> {
+        let resident_dir = self
+            .resident_dir
+            .clone()
+            .ok_or_else(|| "cannot locate the resident registry: HOME is unset".to_string())?;
+        resident::release(&resident_dir, project, Self::REQUESTER)
+            .map_err(|error| format!("could not release the project: {error}"))?;
+        let state_dir = Self::state_dir_for(project);
+        match std::fs::remove_dir_all(&state_dir) {
+            Ok(()) => Ok(()),
+            // 本就不在 = 目标已达成。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "could not remove the board state dir {}: {error}",
+                state_dir.display()
+            )),
+        }
     }
 
     /// 启动迁移：把两类「重启后已死」的卡片收干净，启动时调用一次。
@@ -3444,5 +3523,147 @@ mod tests {
             !main_src.contains(&call_site),
             "the daemon loop must no longer call the bare-git merge claim"
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    /// 建一个把 `home` 指到临时目录的 service（登记与租约都不碰真实 HOME）。
+    fn service(dir: &Path) -> BoardService {
+        let state_dir = dir.join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        BoardService::new(state_dir, dir.to_path_buf(), Some(dir.join("home")))
+    }
+
+    fn registry(dir: &Path) -> PathBuf {
+        dir.join("home/.yi-agent/resident-daemons.json")
+    }
+
+    #[test]
+    fn lifecycle_create_registers_the_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service(dir.path());
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        service.lifecycle_create(&project).unwrap();
+
+        // 登记落在宿主读的那个文件里，形状与宿主契约一致。
+        let text = std::fs::read_to_string(registry(dir.path())).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["projects"][0]["project"],
+            project.to_string_lossy().as_ref()
+        );
+        assert_eq!(value["projects"][0]["required_by"][0], "superpowers-kanban");
+        // 插件自己的状态目录也建出来了。
+        assert!(project.join(".yi-agent/superpowers-kanban").is_dir());
+    }
+
+    #[test]
+    fn lifecycle_create_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service(dir.path());
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        service.lifecycle_create(&project).unwrap();
+        service.lifecycle_create(&project).unwrap();
+
+        let text = std::fs::read_to_string(registry(dir.path())).unwrap();
+        assert_eq!(text.matches("superpowers-kanban").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn lifecycle_remove_unregisters_and_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service(dir.path());
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        service.lifecycle_create(&project).unwrap();
+
+        service.lifecycle_remove(&project).unwrap();
+
+        // 「不再登记」+「状态目录已删」——不是「进程已停」（那是宿主的活）。
+        let projects = resident::list(&dir.path().join("home/.yi-agent"));
+        assert!(projects.is_empty(), "{projects:?}");
+        assert!(!project.join(".yi-agent/superpowers-kanban").exists());
+    }
+
+    #[test]
+    fn lifecycle_remove_is_safe_to_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = service(dir.path());
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+
+        // 从未 create 过也能 remove（幂等），再来一次也安全。
+        service.lifecycle_remove(&project).unwrap();
+        service.lifecycle_remove(&project).unwrap();
+    }
+
+    #[test]
+    fn the_dispatch_channel_exposes_lifecycle_create_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // 走注入版分派：生产入口 `dispatch()` 里的 `service_for` 用 `home = None`，
+        // 那会落到**真实** `$HOME/.yi-agent`——测试绝不能写用户的真登记表
+        // （失败时会把临时目录的登记永久漏进去）。
+        let service = BoardService::new(
+            state_dir.clone(),
+            project.clone(),
+            Some(dir.path().join("home")),
+        );
+
+        let created = crate::dispatch::dispatch_with_service(
+            &service,
+            &state_dir,
+            None,
+            "lifecycle/create",
+            &serde_json::json!({ "project": project.to_string_lossy() }),
+        )
+        .unwrap();
+        assert_eq!(created["ok"], true);
+
+        let removed = crate::dispatch::dispatch_with_service(
+            &service,
+            &state_dir,
+            None,
+            "lifecycle/remove",
+            &serde_json::json!({ "project": project.to_string_lossy() }),
+        )
+        .unwrap();
+        assert_eq!(removed["ok"], true);
+
+        // 登记写在注入的 home 下，真实 `$HOME` 未被碰过。
+        assert!(registry(dir.path()).exists());
+        assert!(resident::list(&dir.path().join("home/.yi-agent")).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_needs_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join(".yi-agent/superpowers-kanban");
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        // 缺 project：给一条说清楚的错，而不是静默 no-op。create 与 remove 都要挡。
+        for method in ["lifecycle/create", "lifecycle/remove"] {
+            let error =
+                crate::dispatch::dispatch(&state_dir, method, &serde_json::json!({})).unwrap_err();
+            assert!(error.contains("project"), "{method}: {error}");
+            let error = crate::dispatch::dispatch(
+                &state_dir,
+                method,
+                &serde_json::json!({ "project": "" }),
+            )
+            .unwrap_err();
+            assert!(error.contains("project"), "{method}: {error}");
+        }
     }
 }

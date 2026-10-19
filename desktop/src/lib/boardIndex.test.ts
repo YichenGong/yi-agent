@@ -78,19 +78,23 @@ describe("summarize", () => {
 });
 
 describe("boardErrorKind", () => {
-  it("区分「没建看板」与「插件没装」", () => {
-    expect(boardErrorKind(new Error("board_not_created"))).toBe("not_created");
+  it("区分「进程不可达」与「插件没装」", () => {
     expect(boardErrorKind(new Error("daemon_unavailable"))).toBe("daemon_down");
     expect(boardErrorKind(new Error("plugin superpowers-kanban is not available"))).toBe("plugin_missing");
     expect(boardErrorKind(new Error("boom"))).toBe("other");
   });
 
+  it("旧 board_not_created 码不再是一支：它只当一次说不清的失败", () => {
+    // 摘掉登记表门控后宿主不再发这个码；万一收到，也不该被当成「可以再建一次」。
+    expect(boardErrorKind(new Error("board_not_created"))).toBe("other");
+    expect(
+      boardErrorKind({ code: -32603, message: "看板不存在", data: { code: "board_not_created" } }),
+    ).toBe("other");
+  });
+
   it("读得到结构化错误码：desktop 的 RpcClient 抛的是整个 RpcError 对象", () => {
     // RpcError = { code: number, message: string, data?: unknown }，看板语义的
     // 码放在 data.code 里。message 是人话，顺带带上码，两条路都要能认。
-    expect(
-      boardErrorKind({ code: -32603, message: "看板不存在", data: { code: "board_not_created" } }),
-    ).toBe("not_created");
     expect(boardErrorKind({ code: -32603, message: "连不上", data: { code: "daemon_unavailable" } }))
       .toBe("daemon_down");
     expect(boardErrorKind({ code: -32603, message: "没有这个插件", data: { code: "plugin_unavailable" } }))

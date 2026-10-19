@@ -318,6 +318,24 @@ pub fn dispatch_with_service(
             };
             Ok(json!({ "status": status }))
         }
+        "lifecycle/create" => {
+            let project = params
+                .get("project")
+                .and_then(Value::as_str)
+                .filter(|project| !project.is_empty())
+                .ok_or_else(|| "lifecycle/create needs a `project` path".to_string())?;
+            service.lifecycle_create(Path::new(project))?;
+            Ok(json!({ "ok": true }))
+        }
+        "lifecycle/remove" => {
+            let project = params
+                .get("project")
+                .and_then(Value::as_str)
+                .filter(|project| !project.is_empty())
+                .ok_or_else(|| "lifecycle/remove needs a `project` path".to_string())?;
+            service.lifecycle_remove(Path::new(project))?;
+            Ok(json!({ "ok": true }))
+        }
         "settings.read" => {
             let calendar =
                 superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(

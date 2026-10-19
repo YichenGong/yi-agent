@@ -156,14 +156,14 @@ pub(crate) fn lead_title_for_cwd(cwd: &Path) -> String {
 /// `find_lead` 选的是另一个组长,而客户端还记着刚才那个。以 `find_lead` 的
 /// 结论为唯一出口,分歧就只在落盘内存在(见 `ThreadStore::find_lead` 的注释)。
 pub fn ensure_lead_meta(store: &ThreadStore, cwd: &Path) -> std::io::Result<(ThreadMeta, bool)> {
-    // 看板 worktree(卡片 `.worktrees/kanban/<slug>` 与合并 `.worktrees/kanban-merge/<slug>`)
-    // 不是项目:它没有组长,也绝不能有。堵在**落盘侧**是唯一能止住幽灵组长的
-    // 地方——真机上已经落错的那些(`role:"lead"` 且 `driver_project: None`,只有
-    // 路径这条线索)由 `is_lead_meta` 在读时过滤。
-    if crate::thread_store::is_kanban_worktree(cwd) {
+    // 插件 worktree(见 [`crate::plugin_worktree`])不是项目:它没有组长,也绝不能
+    // 有。堵在**落盘侧**是唯一能止住幽灵组长的地方——真机上已经落错的那些
+    // (`role:"lead"` 且 `driver_project: None`,只有路径这条线索)由 `is_lead_meta`
+    // 在读时过滤。
+    if crate::plugin_worktree::is_plugin_worktree(cwd) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{} is a kanban worktree, not a project", cwd.display()),
+            format!("{} is a plugin worktree, not a project", cwd.display()),
         ));
     }
     if let Some(existing) = store.find_lead()? {

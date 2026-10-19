@@ -8,36 +8,52 @@ use crate::manifest::{SupervisorManifest, load_manifests};
 use crate::switch::{read_bool_key, resolve_bool};
 
 /// 监督运行所需的目录布局。目录名对外固定，方便清单的占位展开。
+///
+/// 本 crate **不认识任何插件**，因此不写死任何插件的目录名：项目级状态根是
+/// `<workdir>/.yi-agent`，某个插件的状态目录由**它的清单名**派生
+/// （[`Layout::state_dir`]）。对清单名 `superpowers-kanban` 来说，派生结果仍是
+/// `<workdir>/.yi-agent/superpowers-kanban`——与磁盘上的既有契约逐字一致，
+/// 故不需要迁移。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Layout {
     pub workdir: PathBuf,
-    pub state_dir: PathBuf,
+    /// 项目级状态根：`<workdir>/.yi-agent`。
+    pub state_base: PathBuf,
     pub runtime_dir: PathBuf,
 }
 
 impl Layout {
     pub fn for_workdir(workdir: &Path) -> Self {
-        let state_dir = workdir.join(".yi-agent").join("superpowers-kanban");
-        let runtime_dir = workdir.join(".yi-agent").join("runtime");
+        let state_base = workdir.join(".yi-agent");
+        let runtime_dir = state_base.join("runtime");
         Self {
             workdir: workdir.to_path_buf(),
-            state_dir,
+            state_base,
             runtime_dir,
         }
     }
 
+    /// 交给清单 `name` 的状态目录：`<state_base>/<name>`。
+    ///
+    /// 由清单名派生而不是写死：这正是「监督器不认识具体插件」的落点。改名会
+    /// 换目录，所以清单名是磁盘契约的一部分（插件侧
+    /// `superpowers-kanban-core::layout` 从 `state_dir` 反推项目根与偏好路径）。
+    pub fn state_dir(&self, name: &str) -> PathBuf {
+        self.state_base.join(name)
+    }
+
     pub fn manifests_dir(&self) -> PathBuf {
-        self.workdir.join(".yi-agent").join("supervisors")
+        self.state_base.join("supervisors")
     }
 
     /// Where supervised children's logs land: one file per manifest name.
     ///
-    /// Beside the other project-scoped state rather than in `state_dir`: this
-    /// crate supervises whatever the manifests name and knows nothing about any
-    /// particular plugin, so it must not write inside a directory whose name is
-    /// owned by one.
+    /// Beside the other project-scoped state rather than in a plugin's
+    /// `state_dir`: this crate supervises whatever the manifests name and knows
+    /// nothing about any particular plugin, so it must not write inside a
+    /// directory whose name is owned by one.
     pub fn logs_dir(&self) -> PathBuf {
-        self.workdir.join(".yi-agent").join("logs")
+        self.state_base.join("logs")
     }
 
     fn global_preferences_path(&self) -> Option<PathBuf> {
@@ -191,19 +207,35 @@ impl Supervisor {
         }
     }
 
-    /// 当前可被查询的插件：清单声明了 socket，且进程正在运行。
+    /// 当前可被查询的插件：清单声明了 socket，且**它的查询通道现在真的可用**。
     ///
     /// 这是「插件是否有查询通道」的唯一判据——daemon 只认这份列表，不会接受
     /// 请求方传来的任意 socket 路径。停止或未声明的插件下一轮就会消失。
+    ///
+    /// 两个条件取「或」而不是只看 `running`：`ensure_running` 在查询 socket 已有
+    /// 应答时**故意不 spawn**（健康的孤儿进程持有 socket，重复拉起会两个实例抢锁）。
+    /// 那样的进程不在 `running` 里，却恰恰是唯一能回答查询的那一个。只按
+    /// `running` 过滤会让它在**每次 daemon 重启后**都被漏登记：插件明明活着、
+    /// socket 明明在应答，`plugin/query` 却一直回 `plugin_unavailable`，直到这个
+    /// 进程碰巧退出、被重新拉起为止。
+    ///
+    /// 反过来，清单声明了 socket 但没人在听（刚 spawn、还没 bind，或进程已死）
+    /// 时，`answers` 为假且 `running` 里若也没有它，就不该登记——转发表里的每条
+    /// 路由都应当能连上。
+    ///
+    /// 注意「或」也覆盖了开关刚被关掉、而进程是上一代 daemon 留下的孤儿的情况：
+    /// 监督器只杀得掉自己 spawn 的子进程，杀不掉那个孤儿；只要它仍在应答，这条
+    /// 路由就是**真的可用**的，如实登记比假装它不在更好——查询通道正是它报告状态
+    /// 并把开关重新打开的唯一途径。
     pub fn query_sockets(&self) -> Vec<(String, PathBuf)> {
         let manifests = load_manifests(&self.layout.manifests_dir());
         manifests
             .into_iter()
-            .filter(|manifest| self.running.contains_key(&manifest.name))
+            .filter(|manifest| self.running.contains_key(&manifest.name) || self.answers(manifest))
             .filter_map(|manifest| {
                 match manifest.query_socket_path(
                     &self.layout.workdir,
-                    &self.layout.state_dir,
+                    &self.layout.state_dir(&manifest.name),
                     &self.layout.runtime_dir,
                 ) {
                     Some(Ok(path)) => Some((manifest.name.clone(), path)),
@@ -230,7 +262,7 @@ impl Supervisor {
     fn answers(&self, manifest: &SupervisorManifest) -> bool {
         match manifest.query_socket_path(
             &self.layout.workdir,
-            &self.layout.state_dir,
+            &self.layout.state_dir(&manifest.name),
             &self.layout.runtime_dir,
         ) {
             Some(Ok(socket)) => std::os::unix::net::UnixStream::connect(&socket).is_ok(),
@@ -312,7 +344,7 @@ impl Supervisor {
     fn spawn(&mut self, manifest: &SupervisorManifest) -> std::io::Result<()> {
         let args = manifest.expand_args(
             &self.layout.workdir,
-            &self.layout.state_dir,
+            &self.layout.state_dir(&manifest.name),
             &self.layout.runtime_dir,
         );
         // The log is best effort: `ChildLog::open` never fails outright, it just
@@ -418,6 +450,75 @@ mod child_log_tests {
             layout.logs_dir(),
             PathBuf::from("/tmp/project/.yi-agent/logs"),
             "the log directory is derived from the workdir, not configured"
+        );
+    }
+
+    /// `logs_dir` writes outside every plugin-owned directory on purpose: this
+    /// crate supervises whatever the manifests name and owns no plugin's name.
+    /// A change that moved logs into `state_dir` would put generic-crate output
+    /// inside a plugin's directory.
+    #[test]
+    fn the_logs_dir_is_not_a_plugin_state_dir() {
+        let layout = Layout::for_workdir(Path::new("/tmp/project"));
+        assert!(
+            !layout
+                .logs_dir()
+                .starts_with(layout.state_dir("superpowers-kanban"))
+        );
+    }
+
+    /// The generic crate must not own a plugin's directory name: the per-plugin
+    /// state dir is derived from the manifest name, so this workspace never
+    /// hardcodes `superpowers-kanban` in the code that runs in production.
+    #[test]
+    fn no_plugin_name_is_hardcoded_in_the_layout() {
+        // 路径由**清单名**派生：两个不同的名字必得两个不同的目录，且都等于
+        // `<state_base>/<name>`。这条比字符串扫描有力——它证明的是行为。
+        let layout = Layout::for_workdir(Path::new("/tmp/project"));
+        let kanban = layout.state_dir("superpowers-kanban");
+        let other = layout.state_dir("some-other-plugin");
+        assert_ne!(kanban, other, "the state dir must follow the manifest name");
+        assert_eq!(
+            kanban,
+            PathBuf::from("/tmp/project/.yi-agent/superpowers-kanban")
+        );
+        assert_eq!(
+            other,
+            PathBuf::from("/tmp/project/.yi-agent/some-other-plugin")
+        );
+        // 项目级根与具体插件无关。
+        assert_eq!(layout.state_base, PathBuf::from("/tmp/project/.yi-agent"));
+
+        // 生产代码（去注释、去测试模块）里不得出现任何插件名。注释可以讲历史，
+        // 测试可以举例子，跑起来的代码不行。
+        //
+        // 边界取**测试模块**（`#[cfg(test)] mod tests`），而不是「第一个
+        // `#[cfg(test)]` 属性」：本文件另有 `#[cfg(test)]` 门控的**生产辅助函数**
+        // （`ChildLog::is_active`、`Supervisor::backoff_for_test`），按第一个属性
+        // 截断会把 `impl Supervisor` 整段漏在扫描之外——那正是最需要扫的代码。
+        let region = include_str!("supervisor.rs")
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("the test module header must exist");
+        // 扫描范围必须真的覆盖生产大块：边界逻辑若再次提前截断，这两条要响，
+        // 而不是让下面的断言空过。
+        assert!(
+            region.contains("impl Supervisor") && region.contains("fn ensure_running"),
+            "the scan must span the Supervisor implementation, not stop early"
+        );
+        // 反向也要成立：测试模块不得混进来（否则测试里的插件名会让它假红）。
+        assert!(
+            !region.contains("mod child_log_tests"),
+            "the scan must exclude the crate's own test modules"
+        );
+        let production: String = region
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !production.contains("superpowers-kanban"),
+            "the supervisor crate's production code must not name a plugin"
         );
     }
 

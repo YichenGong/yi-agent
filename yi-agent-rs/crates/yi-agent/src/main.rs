@@ -23,7 +23,7 @@ use yi_agent_core::Provider;
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 use crate::config::{
-    AgentAction, BoardsAction, Cli, Command, DaemonAction, PairAction, ScheduleAction,
+    AgentAction, Cli, Command, DaemonAction, PairAction, ResidentAction, ScheduleAction,
 };
 
 fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
@@ -78,10 +78,10 @@ fn main() -> Result<()> {
         Some(Command::AppServer { .. }) => run_app_server(cli),
         Some(Command::Completions { shell }) => print_completion(shell),
         Some(Command::Pair { ref action }) => run_pair(action),
-        Some(Command::Boards { ref action }) => match action {
+        Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
-            BoardsAction::Watch { interval_secs } => {
-                run_boards_watch(*interval_secs);
+            ResidentAction::Watch { interval_secs } => {
+                run_resident_watch(*interval_secs);
                 Ok(())
             }
         },
@@ -235,15 +235,18 @@ fn run_pair(action: &PairAction) -> Result<()> {
 }
 
 /// 常驻值守循环。由 launchd 托管，KeepAlive 负责它自己的存活。
-fn run_boards_watch(interval_secs: u64) {
+///
+/// 通用：读通用常驻登记，保证登记在册的项目各有一个活着的 daemon。见
+/// `yi_agent_supervisors::watch`（同一份逻辑也被 app-server 内循环调用）。
+fn run_resident_watch(interval_secs: u64) {
     let Some(resident_dir) = yi_agent_store::resident::default_dir() else {
-        eprintln!("yi-agent: cannot watch boards: HOME is not set");
+        eprintln!("yi-agent: cannot run the resident watch: HOME is not set");
         std::process::exit(1);
     };
     let interval = std::time::Duration::from_secs(interval_secs);
     loop {
-        yi_agent_boards::watch::once(&resident_dir, &mut |projects| {
-            yi_agent_boards::watch::ensure_daemons(projects);
+        yi_agent_supervisors::watch::once(&resident_dir, &mut |projects| {
+            yi_agent_supervisors::watch::ensure_daemons(projects);
         });
         std::thread::sleep(interval);
     }
@@ -4711,18 +4714,37 @@ mod tests {
     }
 
     #[test]
-    fn boards_watch_parses_with_a_default_interval() {
-        let cli = Cli::try_parse_from(["yi-agent", "boards", "watch"]).unwrap();
+    fn resident_watch_parses_with_a_default_interval() {
+        let cli = Cli::try_parse_from(["yi-agent", "resident", "watch"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Boards {
-                action: BoardsAction::Watch { interval_secs: 30 }
+            Some(Command::Resident {
+                action: ResidentAction::Watch { interval_secs: 30 }
+            })
+        ));
+    }
+
+    /// 旧别名 `boards` 已随看板面删除。这是个**有意的**破坏性变更：一台尚未
+    /// 重装 launchd plist 的机器仍会跑 `boards watch`，它将在下次登录时解析
+    /// 失败（直到重装值守）。现代替品是通用子命令 `resident watch`。
+    #[test]
+    fn the_legacy_boards_alias_is_gone() {
+        assert!(
+            Cli::try_parse_from(["yi-agent", "boards", "watch"]).is_err(),
+            "the board-named alias must not come back"
+        );
+        // 通用子命令仍在，且是唯一入口。
+        let cli = Cli::try_parse_from(["yi-agent", "resident", "watch"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Resident {
+                action: ResidentAction::Watch { interval_secs: 30 }
             })
         ));
     }
 
     #[test]
-    fn boards_watch_once_ensures_every_registered_project() {
+    fn resident_watch_once_ensures_every_registered_project() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a");
         let b = dir.path().join("b");
@@ -4730,7 +4752,7 @@ mod tests {
         yi_agent_store::resident::require(dir.path(), &b, "superpowers-kanban").unwrap();
 
         let mut seen: Vec<PathBuf> = Vec::new();
-        let count = yi_agent_boards::watch::once(dir.path(), &mut |projects: &[PathBuf]| {
+        let count = yi_agent_supervisors::watch::once(dir.path(), &mut |projects: &[PathBuf]| {
             seen.extend_from_slice(projects)
         });
         assert_eq!(count, 2);

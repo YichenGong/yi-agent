@@ -13,8 +13,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = "0.10"
-# 日志行的时间戳。workspace 已 pin，`yi-agent-boards` 同样在用；不手抄日历算法。
+# 日志行的时间戳。workspace 已 pin；不手抄日历算法。
 chrono = { workspace = true }
+# 常驻登记（watch 读它）与 per-project daemon 的 socket IPC。
+yi-agent-store = { workspace = true }
+# `daemon` 用 setsid 让子进程脱离会话；`watchman` 读 uid 拼 launchd 域名。
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

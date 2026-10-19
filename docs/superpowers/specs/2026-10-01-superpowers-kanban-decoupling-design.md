@@ -41,6 +41,18 @@
 - **删除** `yi-agent-rs/crates/yi-agent-board-ui`（其 29 个测试随之迁入插件侧或改写）。
 - 开关读写同样经插件（插件拥有 `preferences.json` 的两层解析语义）。
 
+> **已由 [`2026-10-17-plugin-lifecycle-decoupling-design.md`](./2026-10-17-plugin-lifecycle-decoupling-design.md) 落地（2026-10-19）。**
+> 本 spec 只写到了「`plugin/query` 取代 `board/*`」，没有覆盖剩下的两件事：谁写清单
+> （宿主）与谁开开关（宿主）——那半程被
+> [`2026-10-17-session-driver-decoupling-design.md`](./2026-10-17-session-driver-decoupling-design.md)
+> 与上述 spec 一起收口。现在宿主源代码里没有任何具体插件名：建/删走
+> `plugin/query {plugin, method: "lifecycle/create"|"lifecycle/remove"}`，列举走
+> `resident/list`，安装走 `plugin/install {project, plugin}`（宿主写清单 + 开开关 +
+> 起 daemon，最多等 5s 让插件查询 socket 就绪，回包带 `queryable`）。
+> `yi-agent-boards` crate、`board/*` RPC、`Domain::Board`、`board_watchman_enabled`
+> 偏好键均已删除；旧 `boards.json` 的迁移集中在 `app-server/src/legacy_compat.rs`
+> 并有三个真实调用点。
+
 ## 6. 代价与风险（如实记录）
 
 - 动的是**核心 IPC**（TUI / 桌面 / daemon 共用），是本轮风险最高的一项。
