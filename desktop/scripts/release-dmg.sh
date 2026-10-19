@@ -173,18 +173,37 @@ DESCRIPTION="$(cat <<EOF
 
 未签名产物；首次打开如被拦，到 System Settings → Privacy & Security 点 "Open Anyway"。
 
-## 命令行版 yi-agent（可选）
+## 终端版（TUI）
 
-只想在终端用 CLI、不装 App 的话，下载 \`$CLI_ART\`：
+App 内已内置同一份 CLI，安装脚本会自动建好入口，**不需要另下产物**：
 
-\`\`\`bash
-tar -xzf $CLI_ART
-sudo install -m 755 yi-agent /usr/local/bin/yi-agent
+\`\`\`
+/usr/local/bin/yi-agent -> /Applications/yi-agent.app/Contents/MacOS/yi-agent
 \`\`\`
 
-校验（可选）：\`shasum -a 256 $CLI_ART\` 的输出应与 \`$CLI_ART.sha256\` 的内容一致。
+装完后 \`cd\` 到项目目录直接运行 \`yi-agent\`。配置与 App 共用
+\`~/.yi-agent/.env\`，只写一次。
 
-（桌面 App 已内置同一份 CLI，装了 App 就无需再装这个。）
+若安装器提示 \`/usr/local/bin\` 不可写，它会退到 \`~/.local/bin\` 并打印需要添加的
+PATH 行；不会修改你的 shell 配置。
+
+## 升级
+
+下载新 dmg 后重跑同一条命令：
+
+\`\`\`bash
+bash install.sh ./yi-agent_<新版本>_aarch64.dmg
+\`\`\`
+
+安装器会：自动退出正在运行的 App → 停止旧版 runtime daemon（若正在跑子 agent
+任务会先询问）→ 原子替换 App → 重建命令行入口。配置与历史都会保留。
+
+- 安装位置固定为 \`/Applications\`；非管理员账户请用 \`sudo bash install.sh ...\`
+- 不支持降级：数据库 schema 只升不降，回退旧版本可能读到不兼容数据
+- 安装器会处理 \`ai.yi-agent.*\` 的 LaunchAgent，但只动「指向本 App 且原本已加载」
+  的那份；指向开发构建的会被跳过并告警
+
+校验（可选）：\`shasum -a 256 $ART\` 的输出应与 \`$ART.sha256\` 的内容一致。
 EOF
 )"
 

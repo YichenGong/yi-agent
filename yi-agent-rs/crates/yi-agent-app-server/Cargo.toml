@@ -28,8 +28,6 @@ yi-agent-mcp = { workspace = true }
 # The embedded relay client (outbound wss) used by `serve_stdio_with_relay`: the
 # desktop and a relay-attached phone must share ONE `serve()` loop.
 yi-agent-relay = { workspace = true }
-# The board RPCs read the global registry and drive the board lifecycle.
-yi-agent-boards = { path = "../yi-agent-boards" }
 # `plugins/list` reads the plugin manifests under `<workdir>/.yi-agent/supervisors`.
 yi-agent-supervisors = { path = "../yi-agent-supervisors" }
 anyhow.workspace = true

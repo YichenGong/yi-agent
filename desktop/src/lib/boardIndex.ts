@@ -59,28 +59,28 @@ export function summarize(cards: { state: string }[]): string {
   return parts.length > 0 ? parts.join(" · ") : "无待办";
 }
 
-/** 看板读写失败后 UI 能采取的三条路，外加「说不清」。 */
-export type BoardErrorKind = "not_created" | "daemon_down" | "plugin_missing" | "other";
+/** 看板读写失败后 UI 能采取的两条路，外加「说不清」。 */
+export type BoardErrorKind = "daemon_down" | "plugin_missing" | "other";
 
 /**
- * 把一次看板 RPC 的失败分到三种可操作的状态。
+ * 把一次看板 RPC 的失败分到两种可操作的状态。
  *
  * 结构化码优先：desktop 的 `RpcClient` 抛的是整个 `RpcError` 对象，看板语义
- * 的码在 `data.code` 里，比 message 稳定。message 匹配作为退路——宿主在
- * Task 4 之前根本不发码，只有人话。
+ * 的码在 `data.code` 里，比 message 稳定。message 匹配作为退路。
  *
- * 两种「连不上」必须分开：`daemon_unavailable` 是项目还没建看板（可以点
- * 「创建看板」解决），插件没装则要用户去装插件；把后者说成前者会让用户
- * 反复点一个永远不成功的按钮。
+ * **没有「未创建」这一支**：宿主已经不再回答「这个项目没有看板」（摘掉登记表
+ * 门控后没有这个码）。「一个项目有没有看板」现在由 `listBoards` 的结果表达
+ * 事实，不是一次读到的错误。
+ *
+ * 两种「连不上」必须分开：`daemon_unavailable` 是那个项目的 daemon 拨不通，
+ * 插件没装则要用户去装插件；把后者说成前者会让用户反复点一个永远不成功的按钮。
  */
 export function boardErrorKind(error: unknown): BoardErrorKind {
   const code = (error as { data?: { code?: string } } | null)?.data?.code;
-  if (code === "board_not_created") return "not_created";
   if (code === "daemon_unavailable") return "daemon_down";
   if (code === "plugin_unavailable") return "plugin_missing";
 
   const text = error instanceof Error ? error.message : String(error ?? "");
-  if (text.includes("board_not_created")) return "not_created";
   if (text.includes("daemon_unavailable") || text.includes("daemon is unavailable")) {
     return "daemon_down";
   }

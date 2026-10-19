@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, type FormEvent } from "react";
 import { type PairedDevice, defaultRedeem } from "../pairing";
 import { parsePairUri } from "../lib/pairUri";
 import { QrScanner } from "./QrScanner";
+import { ErrorBoundary } from "../ui/ErrorBoundary";
 import { isIos } from "../lib/platform";
 import {
   type StorageLike,
@@ -282,26 +283,38 @@ export function PairingScreen({
             aria-label="扫描二维码"
             className="fixed inset-0 z-50 flex flex-col bg-black"
           >
-            <div className="flex items-center justify-between px-4 py-3">
+            {/*
+              头部补安全区（见 index.css 的 `.scan-overlay-bar`）：覆盖层是
+              `fixed inset-0`，脱离 `body` 的安全区内边距，刘海/灵动岛会压住
+              唯一的出口——用户此前看不到、也点不到它。
+            */}
+            <div className="scan-overlay-bar flex items-center justify-between gap-3 px-4 pb-3">
               <span className="text-xs text-white/70">对准桌面端显示的二维码</span>
               <button
                 type="button"
                 onClick={() => setScanning(false)}
-                className="rounded px-2 py-1 text-xs text-white/80 hover:text-white"
+                // 明确的出口，且触控目标 ≥44px：12px 的「取消」在手机上又小又靠边。
+                className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded px-3 text-sm text-white/90 hover:text-white"
               >
-                取消
+                返回
               </button>
             </div>
             <div className="relative min-h-0 flex-1">
-              {scan ? (
-                <ScanHost scan={scan} onText={handleScanText} onError={handleScanError} />
-              ) : (
-                <QrScanner onText={handleScanText} onError={handleScanError} />
-              )}
+              {/*
+                相机取流的一切失败都被就地收敛：此前 `navigator.mediaDevices` 不存在
+                时同步 TypeError 会逃逸出 effect、React 卸载整棵树 = 黑屏。
+              */}
+              <ErrorBoundary onError={handleScanError}>
+                {scan ? (
+                  <ScanHost scan={scan} onText={handleScanText} onError={handleScanError} />
+                ) : (
+                  <QrScanner onText={handleScanText} onError={handleScanError} />
+                )}
+              </ErrorBoundary>
               {error !== null && (
                 <p
                   role="alert"
-                  className="absolute inset-x-0 bottom-6 mx-auto w-fit rounded bg-black/70 px-3 py-1 text-xs text-red-300"
+                  className="scan-overlay-alert absolute inset-x-0 mx-auto w-fit rounded bg-black/70 px-3 py-1 text-xs text-red-300"
                 >
                   {error}
                 </p>

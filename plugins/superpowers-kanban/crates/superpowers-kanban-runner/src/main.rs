@@ -7,6 +7,7 @@
 //! - `superpowers-kanban list [--state-dir <d>]`——打印队列与待消费的投递
 //! - `superpowers-kanban on|off [--state-dir <d>]`——写项目层开关
 //! - `superpowers-kanban workdir [--state-dir <d>]`——打印该状态目录对应的项目根（skill 用）
+//! - `superpowers-kanban manifest`——打印本插件的 supervisor 清单（宿主 `plugin/install` 用）
 //!
 //! `run` 只做一件事：周期性推进队列。安装 = 放这个二进制；卸载 = 删掉它。
 
@@ -121,10 +122,15 @@ enum Subcommand {
         card_id: Option<String>,
         all_archived: bool,
     },
+    /// 打印本插件的 supervisor 清单（自述），供宿主的通用 `plugin/install` 安装。
+    ///
+    /// 不接受任何参数：清单里除 `command` 外的内容都不依赖运行环境，
+    /// `command` 取**当前可执行文件**的绝对路径。
+    Manifest,
 }
 
 const USAGE: &str =
-    "usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir> [...]
+    "usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir|manifest> [...]
   run            --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
   add            <spec> <plan> [--state-dir <d>]
   add-prequeued  <title> [--state-dir <d>]
@@ -137,7 +143,8 @@ const USAGE: &str =
   purge         <card-id>|--all-archived [--state-dir <d>]
   list          [--all] [--state-dir <d>]
   on|off        [--state-dir <d>]
-  workdir       [--state-dir <d>]";
+  workdir       [--state-dir <d>]
+  manifest      打印本插件的 supervisor 清单（宿主的通用 plugin/install 消费）";
 
 /// Parsed from an explicit iterator so tests can drive it without a process.
 ///
@@ -306,6 +313,10 @@ where
                 },
             })
         }
+        Some("manifest") => {
+            ensure_no_leftovers(&args.collect::<Vec<_>>())?;
+            Ok(Subcommand::Manifest)
+        }
         Some(other) => Err(format!("unknown subcommand: {other}\n{USAGE}")),
         None => Err(USAGE.to_string()),
     }
@@ -420,6 +431,60 @@ fn board_switch(state_dir: &std::path::Path) -> BoardSwitch {
     let global = global_preferences_path().as_deref().and_then(read_layer);
     let project = read_layer(&project_preferences_path(state_dir));
     resolve(global, project)
+}
+
+/// 本插件在 supervisor 清单里的名字。也是 `plugin/query` 用它拨 socket 的名字。
+const MANIFEST_NAME: &str = "superpowers-kanban";
+
+/// 自述的 supervisor 清单（spec §4.4 方案 A 的插件侧）。
+///
+/// 宿主不再知道「看板」是什么，也不该知道本插件的清单长什么样：它跑
+/// `superpowers-kanban manifest`，把 stdout 原样写进
+/// `<项目>/.yi-agent/supervisors/<name>.json`。因此**这份自述是清单的真相源**，
+/// 随包分发的 `supervisors/superpowers-kanban.json` 退化为参考文档
+/// （测试会比对两者，漂移即红）。
+///
+/// `command` 必须是**当前可执行文件**的绝对路径，不能是裸名：supervisor 用 daemon
+/// 的 `PATH` 拉起子进程，而用户把插件装到了哪（`~/.cargo/bin`、`/opt/homebrew/bin`、
+/// 或某个 `cargo build` 的 `target/`）与那个 `PATH` 不保证一致。宿主安装插件时
+/// 就是执行这个子命令把绝对路径写进清单的，别再退化成裸名。
+///
+/// 其余字段的取值见 [`manifest_json`]；`args` 里的 `{runtime_dir}` / `{state_dir}` /
+/// `{workdir}` 是 supervisor 展开的占位符，必须原样输出。
+fn manifest_json(command: &std::path::Path) -> serde_json::Value {
+    serde_json::json!({
+        "name": MANIFEST_NAME,
+        "command": command.to_string_lossy(),
+        "args": [
+            "run",
+            "--runtime-dir",
+            "{runtime_dir}",
+            "--state-dir",
+            "{state_dir}",
+            "--project-root",
+            "{workdir}"
+        ],
+        "switch_key": "superpowers_kanban",
+        // 关掉开关只该停止推进，不该让插件消失：查询通道就是通过它把开关拨回来的，
+        // 停掉进程等于把「怎么重新打开」一起删了。
+        "stop_when_disabled": false,
+        // 宿主只通过这个通用字段发现「该问哪个插件下一步动作」。
+        "session_driver": true,
+        "restart_backoff_ms": 1000,
+        "restart_backoff_max_ms": 30000,
+        "query_socket": "{state_dir}/superpowers-kanban.sock"
+    })
+}
+
+/// `manifest`：把自述清单打印到 stdout。
+///
+/// stdout 是这条命令的结果通道（与 `list`/`workdir` 一致）——宿主直接消费它，
+/// 所以这里**不能**夹带任何别的东西；诊断信息走 stderr。
+fn command_manifest() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("could not locate this executable: {error}"))?;
+    serde_json::to_string_pretty(&manifest_json(&exe))
+        .map_err(|error| format!("could not serialize the manifest: {error}"))
 }
 
 /// `add`：先校验成对（存在且互不相同），再投递。校验在这一步做，是为了让调用方
@@ -813,6 +878,7 @@ fn main() {
             card_id,
             all_archived,
         } => command_purge(&state_dir, card_id.as_deref(), all_archived),
+        Subcommand::Manifest => command_manifest(),
     };
     match outcome {
         Ok(message) => {
@@ -1019,9 +1085,9 @@ fn run_daemon(args: Args) {
 mod tests {
     use super::{
         Duration, Subcommand, command_add, command_add_merge, command_archive, command_done,
-        command_list, command_merge_finish, command_merge_request, command_prequeued,
-        command_promote, command_purge, command_set_switch, effective_interval, parse_subcommand,
-        sweep_one_socket, sweep_stale_sockets,
+        command_list, command_manifest, command_merge_finish, command_merge_request,
+        command_prequeued, command_promote, command_purge, command_set_switch, effective_interval,
+        manifest_json, parse_subcommand, sweep_one_socket, sweep_stale_sockets,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -1815,5 +1881,67 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(value.get("origin_thread_id").is_none());
+    }
+
+    #[test]
+    fn manifest_takes_no_arguments() {
+        assert!(matches!(parse(&["manifest"]), Ok(Subcommand::Manifest)));
+        assert!(
+            parse(&["manifest", "--state-dir", "/s"]).is_err(),
+            "the manifest does not depend on a state dir; accepting one would imply it does"
+        );
+    }
+
+    /// 宿主直接消费这段 stdout：它必须是可解析的 JSON 对象，且 `command` 是绝对路径。
+    #[test]
+    fn manifest_names_the_running_executable_by_absolute_path() {
+        let text = command_manifest().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(value["name"], "superpowers-kanban");
+        let command = value["command"].as_str().unwrap();
+        assert!(
+            std::path::Path::new(command).is_absolute(),
+            "a bare name would be resolved against the daemon's PATH, not the user's: {command}"
+        );
+    }
+
+    /// 自述清单与随包分发的参考文件不得漂移。
+    ///
+    /// `command` 是唯一允许不同的字段（自述填绝对路径，参考文件填裸名）；
+    /// 其余任何字段不同都说明两份真相源已经分叉，而宿主装的是自述那份。
+    #[test]
+    fn the_self_described_manifest_matches_the_shipped_reference() {
+        let shipped = include_str!("../../../supervisors/superpowers-kanban.json");
+        let shipped: serde_json::Value = serde_json::from_str(shipped).unwrap();
+        let described = manifest_json(std::path::Path::new("/abs/superpowers-kanban"));
+
+        let mut shipped = shipped.as_object().unwrap().clone();
+        let mut described = described.as_object().unwrap().clone();
+        assert!(shipped.remove("command").is_some());
+        assert!(described.remove("command").is_some());
+
+        // 两个语义上承重的字段单独钉住。上面的比较是「两侧都改了也照样通过」
+        // ——把 `session_driver` 从代码和参考文件里一起删掉，测试仍会绿，而缺了
+        // 它的清单会让看板静默停推。这里让它们不依赖那份可编辑的参考文件。
+        assert_eq!(
+            described.get("session_driver").and_then(|v| v.as_bool()),
+            Some(true),
+            "the manifest must drive sessions, or cards silently stop being dispatched"
+        );
+        assert_eq!(
+            described
+                .get("stop_when_disabled")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "the query channel must survive switch-off, or `off` becomes a one-way door"
+        );
+
+        assert_eq!(
+            serde_json::Value::Object(described),
+            serde_json::Value::Object(shipped),
+            "the binary's self-description and the shipped reference must agree \
+             on every field except `command`"
+        );
     }
 }

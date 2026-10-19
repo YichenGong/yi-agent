@@ -1,0 +1,274 @@
+#!/usr/bin/env bash
+# install.sh 的单元测试。不碰 /Applications，不调真实 launchctl。
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALLER="$HERE/../packaging/install.sh"
+PASS=0
+FAIL=0
+
+ok()   { PASS=$((PASS + 1)); printf 'ok   - %s\n' "$1"; }
+fail() { FAIL=$((FAIL + 1)); printf 'FAIL - %s\n' "$1" >&2; }
+
+assert_eq() { # assert_eq <name> <expected> <actual>
+  if [ "$2" = "$3" ]; then ok "$1"; else fail "$1 (expected [$2], got [$3])"; fi
+}
+
+# shellcheck source=../packaging/install.sh
+. "$INSTALLER"
+
+assert_eq "app_path honors override" \
+  "/tmp/fake/yi-agent.app" \
+  "$(YI_AGENT_APP_PATH=/tmp/fake/yi-agent.app app_path)"
+
+assert_eq "app_path defaults to /Applications" \
+  "/Applications/yi-agent.app" \
+  "$(app_path)"
+
+TMPROOT="$(mktemp -d)"
+trap 'rm -rf "$TMPROOT"' EXIT
+
+mk_app() { # mk_app <dir> <version> [cli-exit-code]
+  local dir="$1" version="$2" code="${3:-0}"
+  mkdir -p "$dir/Contents/MacOS"
+  cat > "$dir/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleShortVersionString</key><string>$version</string>
+</dict></plist>
+PLIST
+  cat > "$dir/Contents/MacOS/yi-agent" <<CLI
+#!/bin/sh
+echo "yi-agent $version"
+exit $code
+CLI
+  chmod +x "$dir/Contents/MacOS/yi-agent"
+}
+
+APP="$TMPROOT/Fake.app"
+mk_app "$APP" "1.2.3"
+
+assert_eq "app_version reads plist" "1.2.3" "$(app_version "$APP")"
+assert_eq "cli_version runs binary" "yi-agent 1.2.3" "$(cli_version "$APP")"
+assert_eq "app_version missing plist is empty" "" \
+  "$(app_version "$TMPROOT/NoSuch.app" 2>/dev/null)"
+
+assert_eq "version_banner first install" \
+  "已安装 yi-agent 1.2.3" \
+  "$(version_banner "" "1.2.3")"
+assert_eq "version_banner upgrade" \
+  "检测到已安装版本 1.2.2 → 升级到 1.2.3" \
+  "$(version_banner "1.2.2" "1.2.3")"
+
+# --- pick_bin_dir ---
+BIN1="$TMPROOT/bin-a"; BIN2="$TMPROOT/bin-b"
+mkdir -p "$BIN1" "$BIN2"
+assert_eq "pick_bin_dir prefers first writable" \
+  "$BIN1" \
+  "$(YI_AGENT_BIN_DIRS=$BIN1:$BIN2 pick_bin_dir)"
+
+NOPERM="$TMPROOT/bin-noperm"
+mkdir -p "$NOPERM"; chmod 500 "$NOPERM"
+assert_eq "pick_bin_dir skips unwritable" \
+  "$BIN2" \
+  "$(YI_AGENT_BIN_DIRS=$NOPERM:$BIN2 pick_bin_dir)"
+
+# 注意：这条断言必须在恢复权限之前跑，否则目录又可写了。
+assert_eq "pick_bin_dir fails when none writable" \
+  "rc=1" \
+  "$(YI_AGENT_BIN_DIRS=$NOPERM pick_bin_dir >/dev/null 2>&1; echo "rc=$?")"
+chmod 700 "$NOPERM"
+
+# 覆盖为空串表示「一个候选都没有」，不回落默认目录。
+if [ "$(id -u)" -ne 0 ]; then
+  assert_eq "pick_bin_dir fails on empty list" \
+    "rc=1" "$(YI_AGENT_BIN_DIRS="" pick_bin_dir >/dev/null 2>&1; echo "rc=$?")"
+fi
+
+# --- link_cli ---
+LINKDIR="$TMPROOT/linkbin"; mkdir -p "$LINKDIR"
+link_cli "$APP" "$LINKDIR"
+assert_eq "link_cli creates symlink to app cli" \
+  "$APP/Contents/MacOS/yi-agent" \
+  "$(readlink "$LINKDIR/yi-agent")"
+# command -v 走的是当前 PATH，必须把测试目录放进去才能命中。
+assert_eq "link_status reports ok" \
+  "ok" "$(PATH="$LINKDIR:$PATH" link_status "$APP" "$LINKDIR")"
+
+assert_eq "link_cli fails without cli" \
+  "rc=1" "$(link_cli "$TMPROOT/NoSuch.app" "$LINKDIR" >/dev/null 2>&1; echo "rc=$?")"
+
+# 模拟 PATH 里更靠前的同名程序
+SHADOW="$TMPROOT/shadow"; mkdir -p "$SHADOW"
+printf '#!/bin/sh\nexit 0\n' > "$SHADOW/yi-agent"; chmod +x "$SHADOW/yi-agent"
+assert_eq "link_status detects shadowing" \
+  "shadowed:$SHADOW/yi-agent" \
+  "$(PATH="$SHADOW:$LINKDIR:$PATH" link_status "$APP" "$LINKDIR")"
+
+# --- replace_app ---
+SRC="$TMPROOT/Src.app"; mk_app "$SRC" "2.0.0"
+DST="$TMPROOT/Dst.app";  mk_app "$DST" "1.0.0"
+
+replace_app "$SRC" "$DST"
+assert_eq "replace_app installs new version" "2.0.0" "$(app_version "$DST")"
+assert_eq "replace_app leaves no staging dir" "absent" \
+  "$([ -e "$DST.new" ] && echo present || echo absent)"
+assert_eq "replace_app leaves no backup dir" "absent" \
+  "$([ -e "$DST.old" ] && echo present || echo absent)"
+
+# 模拟拷贝失败：必须保留旧版本
+FAILSRC="$TMPROOT/Fail.app"; mk_app "$FAILSRC" "3.0.0"
+assert_eq "replace_app reports failure" \
+  "rc=1" "$(YI_AGENT_COPY_CMD=false replace_app "$FAILSRC" "$DST" >/dev/null 2>&1; echo "rc=$?")"
+assert_eq "replace_app keeps old version on failure" "2.0.0" "$(app_version "$DST")"
+assert_eq "replace_app cleans staging on failure" "absent" \
+  "$([ -e "$DST.new" ] && echo present || echo absent)"
+
+# --- gui_pids ---
+APPDIR="/tmp/FakeHome/Applications/yi-agent.app"
+PS_FIXTURE="$TMPROOT/ps.txt"
+cat > "$PS_FIXTURE" <<EOF
+  111 $APPDIR/Contents/MacOS/desktop
+  222 $APPDIR/Contents/MacOS/yi-agent app-server --listen stdio://
+  333 /Users/dev/proj/.worktrees/x/target/debug/yi-agent daemon serve
+  444 /Users/dev/proj/.worktrees/x/target/debug/yi-agent resident watch
+EOF
+assert_eq "gui_pids finds only the GUI" "111" \
+  "$(YI_AGENT_PS_CMD="cat $PS_FIXTURE" gui_pids "/tmp/FakeHome/Applications/yi-agent.app" | tr '\n' ' ' | sed 's/ $//')"
+
+# --- quit_gui：osascript 成功时不应再 kill ---
+# 注入的 kill 命令写成文件，便于断言「有没有被调用」。
+KILLLOG="$TMPROOT/killelog.txt"
+assert_eq "quit_gui succeeds via osascript" "rc=0" \
+  "$(YI_AGENT_OSASCRIPT_CMD=true \
+      YI_AGENT_KILL_CMD="echo \$1 >> $KILLLOG" \
+      YI_AGENT_PID_ALIVE_CMD=false \
+      quit_gui 111 "/tmp/FakeHome/Applications/yi-agent.app" >/dev/null 2>&1; echo "rc=$?")"
+assert_eq "quit_gui does not kill when osascript worked" "absent" \
+  "$([ -e "$KILLLOG" ] && echo present || echo absent)"
+
+# osascript 失败且进程一直存活时，必须走到 SIGTERM
+assert_eq "quit_gui falls back to kill" "rc=1" \
+  "$(YI_AGENT_OSASCRIPT_CMD=false \
+      YI_AGENT_KILL_CMD="echo \$1 >> $KILLLOG" \
+      YI_AGENT_PID_ALIVE_CMD=true \
+      YI_AGENT_SLEEP_CMD=true \
+      quit_gui 222 "/tmp/FakeHome/Applications/yi-agent.app" >/dev/null 2>&1; echo "rc=$?")"
+assert_eq "quit_gui killed the stubborn pid" "222" "$(cat "$KILLLOG" 2>/dev/null)"
+
+# --- is_argv_daemon_serve ---
+assert_eq "daemon serve matches" "yes" \
+  "$(is_argv_daemon_serve "/x/yi-agent daemon serve" && echo yes || echo no)"
+assert_eq "TUI does not match" "no" \
+  "$(is_argv_daemon_serve "/x/yi-agent" && echo yes || echo no)"
+assert_eq "app-server does not match" "no" \
+  "$(is_argv_daemon_serve "/x/yi-agent app-server --listen stdio://" && echo yes || echo no)"
+assert_eq "boards watch does not match" "no" \
+  "$(is_argv_daemon_serve "/x/yi-agent boards watch" && echo yes || echo no)"
+
+# --- daemon_pids ---
+APPDIR2="/Applications/yi-agent.app"
+PS2="$TMPROOT/ps2.txt"
+cat > "$PS2" <<EOF
+  501 $APPDIR2/Contents/MacOS/yi-agent daemon serve
+  502 $APPDIR2/Contents/MacOS/yi-agent app-server --listen stdio://
+  503 /Users/dev/proj/.worktrees/x/target/debug/yi-agent daemon serve
+  504 $APPDIR2/Contents/MacOS/yi-agent
+EOF
+LSOF2="$TMPROOT/lsof2.txt"
+cat > "$LSOF2" <<'EOF'
+COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+yi-agent 501 u txt REG 1,15 42 100 /Applications/yi-agent.app/Contents/MacOS/yi-agent
+yi-agent 503 u txt REG 1,15 42 101 /Users/dev/proj/.worktrees/x/target/debug/yi-agent
+EOF
+assert_eq "daemon_pids keeps only app-owned daemon" "501" \
+  "$(YI_AGENT_PS_CMD="cat $PS2" \
+     YI_AGENT_LSOF_CMD="cat $LSOF2" \
+     daemon_pids "$APPDIR2" | tr '\n' ' ' | sed 's/ $//')"
+
+# 软链启动：comm 是软链路径，但 lsof 给出真实 inode 路径
+LSOF3="$TMPROOT/lsof3.txt"
+cat > "$LSOF3" <<'EOF'
+COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+yi-agent 601 u txt REG 1,15 42 100 /Applications/yi-agent.app/Contents/MacOS/yi-agent
+EOF
+PS3="$TMPROOT/ps3.txt"
+cat > "$PS3" <<'EOF'
+  601 /usr/local/bin/yi-agent daemon serve
+EOF
+assert_eq "daemon_pids follows symlinked exe" "601" \
+  "$(YI_AGENT_PS_CMD="cat $PS3" \
+     YI_AGENT_LSOF_CMD="cat $LSOF3" \
+     daemon_pids "$APPDIR2" | tr '\n' ' ' | sed 's/ $//')"
+
+# --- plist 解析与加载状态 ---
+LA="$TMPROOT/LaunchAgents"; mkdir -p "$LA"
+mk_plist() { # mk_plist <file> <label> <exe>
+  cat > "$1" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>$2</string>
+<key>ProgramArguments</key><array>
+<string>$3</string><string>boards</string><string>watch</string>
+</array>
+</dict></plist>
+PLIST
+}
+P_OWN="$LA/ai.yi-agent.board-watchman.plist"
+mk_plist "$P_OWN" "ai.yi-agent.board-watchman" "/Applications/yi-agent.app/Contents/MacOS/yi-agent"
+
+assert_eq "plist_label" "ai.yi-agent.board-watchman" "$(plist_label "$P_OWN")"
+assert_eq "plist_exe" "/Applications/yi-agent.app/Contents/MacOS/yi-agent" "$(plist_exe "$P_OWN")"
+
+assert_eq "is_loaded true when launchctl exits 0" "yes" \
+  "$(YI_AGENT_LAUNCHCTL_CMD=true is_loaded x && echo yes || echo no)"
+assert_eq "is_loaded false when launchctl exits non-zero" "no" \
+  "$(YI_AGENT_LAUNCHCTL_CMD="false" is_loaded x && echo yes || echo no)"
+
+assert_eq "watchman_plists lists only yi-agent labels" \
+  "ai.yi-agent.board-watchman" \
+  "$(YI_AGENT_LAUNCH_AGENTS_DIR="$LA" watchman_plists | while read -r p; do plist_label "$p"; done | tr '\n' ' ' | sed 's/ $//')"
+
+# --- dead_plists：三重失效才删 ---
+mk_plist "$LA/ai.yi-agent.gone.plist" "ai.yi-agent.gone" "/nowhere/yi-agent"
+mk_plist "$LA/ai.yi-agent.dev.plist"  "ai.yi-agent.dev"  "$TMPROOT/devbin"
+mkdir -p "$TMPROOT/devbin"; printf '#!/bin/sh\n' > "$TMPROOT/devbin/yi-agent"; chmod +x "$TMPROOT/devbin/yi-agent"
+
+assert_eq "dead_plists removes only fully-dead entries" \
+  "ai.yi-agent.gone" \
+  "$(YI_AGENT_LAUNCH_AGENTS_DIR="$LA" YI_AGENT_LAUNCHCTL_CMD=false \
+     dead_plists "/Applications/yi-agent.app" | while read -r p; do plist_label "$p"; done | tr '\n' ' ' | sed 's/ $//')"
+
+# --- confirm_stop（纯函数，便于测） ---
+assert_eq "confirm_stop true when nothing to stop" "yes" \
+  "$(confirm_stop 0 "" && echo yes || echo no)"
+assert_eq "confirm_stop true on default yes" "yes" \
+  "$(confirm_stop 2 "y" && echo yes || echo no)"
+assert_eq "confirm_stop true on empty answer" "yes" \
+  "$(confirm_stop 2 "" && echo yes || echo no)"
+assert_eq "confirm_stop false on n" "no" \
+  "$(confirm_stop 2 "n" && echo yes || echo no)"
+assert_eq "confirm_stop false on N" "no" \
+  "$(confirm_stop 2 "N" && echo yes || echo no)"
+
+# --- stop_daemons ---
+STOPPS="$TMPROOT/ps-stop.txt"
+cat > "$STOPPS" <<EOF
+  701 $APPDIR2/Contents/MacOS/yi-agent daemon serve
+  702 /Users/dev/x/target/debug/yi-agent daemon serve
+EOF
+STOPLSOF="$TMPROOT/lsof-stop.txt"
+cat > "$STOPLSOF" <<'EOF'
+yi-agent 701 u txt REG 1,15 42 100 /Applications/yi-agent.app/Contents/MacOS/yi-agent
+yi-agent 702 u txt REG 1,15 42 101 /Users/dev/x/target/debug/yi-agent
+EOF
+STOPLOG="$TMPROOT/stop.log"
+YI_AGENT_PS_CMD="cat $STOPPS" \
+YI_AGENT_LSOF_CMD="cat $STOPLSOF" \
+YI_AGENT_KILL_CMD="echo \$1 >> $STOPLOG" \
+YI_AGENT_PID_ALIVE_CMD=false \
+stop_daemons "$APPDIR2" >/dev/null 2>&1
+assert_eq "stop_daemons stops only the app daemon" "701" "$(cat "$STOPLOG" 2>/dev/null)"
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

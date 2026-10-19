@@ -433,3 +433,60 @@ html[data-mobile="true"] {
 [data-mobile="true"] .settings-panel select {
   font-size: 16px;
 }
+
+/*
+ * 扫码覆盖层（`PairingScreen` 的「扫码」全屏层）。
+ *
+ * 它是 `fixed inset-0`，脱离 `body` 的安全区内边距——与上面 `.settings-shell`
+ * 完全同一理由（fixed 元素不落在 body 的 padding 盒里）。头部若不自己补
+ * `safe-area-inset-top`，里面唯一的出口（「返回」）就会落到刘海/灵动岛底下，
+ * 看不见也点不到；这正是用户报的「扫码过程中没有返回按钮」。
+ * `max(..., 12px)` 兜住没有安全区的设备（横屏时安全区在左右两侧）。
+ *
+ * 提示条此前用 `bottom-6`（24px）贴底，同样会被 Home Indicator 压住，故也按
+ * 安全区抬一次。桌面端不匹配 `[data-mobile]`，逐字节不变。
+ */
+[data-mobile="true"] .scan-overlay-bar {
+  padding-top: max(env(safe-area-inset-top, 0px), 12px);
+}
+[data-mobile="true"] .scan-overlay-alert {
+  bottom: max(env(safe-area-inset-bottom, 0px), 24px);
+}
+
+/*
+ * 状态栏用量数字的翻滚窗口。
+ *
+ * `.rolling-digit` 是只露出一行高的裁切窗口，`.rolling-strip` 是竖向数字带；
+ * 位移由组件内联的 `transform` 驱动，这里只管几何：一个字符宽、一个字符高。
+ * `tabular-nums` 保证等宽，窗口不会随数字宽度抖动。
+ *
+ * `line-height: 1em` 是硬约束：组件的位移单位是 `em`，一条数字必须正好占 1em，
+ * 否则窗口里会露出相邻行的边。用 `em` 而不是 `1`，是为了不受按钮继承行高的影响。
+ */
+.rolling-number {
+  display: inline-flex;
+  align-items: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.rolling-digit {
+  position: relative;
+  display: inline-block;
+  width: 1ch;
+  height: 1em;
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+.rolling-strip {
+  display: flex;
+  flex-direction: column;
+  will-change: transform;
+}
+
+.rolling-strip > span {
+  display: block;
+  height: 1em;
+  line-height: 1em;
+  text-align: center;
+}

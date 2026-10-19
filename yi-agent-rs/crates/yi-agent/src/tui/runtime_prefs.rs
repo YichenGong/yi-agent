@@ -149,7 +149,8 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         std::fs::write(
             preferences_path(dir.path()),
-            // The legacy key still resolves during the migration window.
+            // An unrelated key (in this case the board-era switch) must survive
+            // a runtime-preference write.
             r#"{"superpowers_board":true}"#,
         )
         .unwrap();

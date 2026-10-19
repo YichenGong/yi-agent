@@ -21,6 +21,8 @@ export function QrScanner({ onText, onError, deps }: QrScannerProps) {
     <video
       ref={videoRef}
       aria-label="相机预览"
+      autoPlay
+      muted
       playsInline
       className="h-full w-full object-cover"
     />

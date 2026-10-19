@@ -1,10 +1,13 @@
-//! Per-project board daemon lifecycle: start it in its own session so it
+//! Per-project runtime daemon lifecycle: start it in its own session so it
 //! outlives the desktop app, probe whether it answers, and stop it.
 //!
-//! Decision 4 of the plan is "the board keeps running after the desktop app
+//! Decision 4 of the plan is "the daemon keeps running after the desktop app
 //! quits". That holds only if the child leaves the app's session *and* process
 //! group; a group signal aimed at the app would otherwise take the daemon down
 //! with it. [`spawn_detached`] therefore calls `setsid` in the child.
+//!
+//! Nothing here names a plugin: the daemon serves whatever manifests the
+//! project declares.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -18,7 +21,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// quiet before giving up.
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The per-project runtime directory whose socket the board daemon owns.
+/// How long [`ensure_running`] waits for a freshly spawned daemon to answer.
+/// Generous enough for a cold plugin load, short enough that a wedged start
+/// does not look like a hung UI.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The per-project runtime directory whose socket the daemon owns.
 fn runtime_dir(project: &Path) -> PathBuf {
     project.join(".yi-agent").join("runtime")
 }
@@ -28,11 +36,33 @@ fn socket_for(project: &Path) -> Result<PathBuf, yi_agent_store::ipc::IpcError> 
     socket_path_for(&runtime_dir(project))
 }
 
+/// Make sure `project` has a live daemon: reuse the one already answering,
+/// otherwise spawn one detached and wait for it to come up.
+///
+/// Generic and idempotent, so the app-server, the CLI watch loop, and the RPC
+/// paths all get the same behaviour from one implementation: a project that
+/// already has a live daemon (perhaps because a thread was opened there first)
+/// keeps it — two daemons on one project would fight over the runtime lock.
+///
+/// Returns whether a daemon answers at the end. That is the convention every
+/// caller relies on, so it is part of this function's contract rather than of
+/// any particular launcher.
+pub fn ensure_running(project: &Path) -> Result<bool, String> {
+    if is_running(project) {
+        return Ok(true);
+    }
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot locate this executable to start the daemon: {error}"))?;
+    spawn_detached(&exe, project)
+        .map_err(|error| format!("could not start the daemon: {error}"))?;
+    Ok(wait_ready(project, READY_TIMEOUT))
+}
+
 /// Spawn `exe daemon serve` for `project` in a new session, detached from the
 /// caller's process group, with every stdio stream on `/dev/null`.
 ///
 /// Returns the child's pid. The child deliberately outlives the caller: the
-/// desktop app must be able to quit without stopping the board.
+/// desktop app must be able to quit without its projects' daemons going down.
 pub fn spawn_detached(exe: &Path, project: &Path) -> std::io::Result<u32> {
     let mut command = std::process::Command::new(exe);
     command
@@ -91,7 +121,7 @@ pub fn is_running(project: &Path) -> bool {
 pub fn stop(project: &Path) -> Result<(), String> {
     let socket = socket_for(project).map_err(|error| {
         format!(
-            "cannot resolve the board daemon socket for {}: {error}",
+            "cannot resolve the daemon socket for {}: {error}",
             project.display()
         )
     })?;
@@ -103,7 +133,7 @@ pub fn stop(project: &Path) -> Result<(), String> {
                 return Ok(());
             }
             return Err(format!(
-                "could not tell the board daemon for {} to stop: {error}",
+                "could not tell the daemon for {} to stop: {error}",
                 project.display()
             ));
         }
@@ -117,7 +147,7 @@ pub fn stop(project: &Path) -> Result<(), String> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(format!(
-                "board daemon for {} did not stop within {STOP_TIMEOUT:?}",
+                "the daemon for {} did not stop within {STOP_TIMEOUT:?}",
                 project.display()
             ));
         }

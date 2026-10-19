@@ -149,16 +149,21 @@ impl RpcError {
     pub fn insufficient_scope(required: Scope) -> Self {
         Self::new(-32014, format!("insufficient scope: requires {required:?}"))
     }
-    /// A board query that reached no answer.
+    /// A plugin-channel query that reached no answer.
     ///
     /// The numeric code is only a coarse fallback for clients that read nothing
     /// else; `data.code` carries the stable vocabulary
-    /// (`board_not_created` / `daemon_unavailable` / `plugin_unavailable` /
+    /// (`daemon_unavailable` / `plugin_unavailable` /
     /// `plugin_not_installed` / `plugin_rejected`) the UI branches on, so a new
     /// reason can be added without renumbering.
-    pub fn board_query(code: &'static str, message: impl Into<String>) -> Self {
+    ///
+    /// **Generic on purpose.** The family used to be named after boards
+    /// (`board_query`) and carried a `board_not_created` arm, from when the host
+    /// gated the channel on "does this project have a board". The host no longer
+    /// knows what a board is: whether an answer exists is the daemon's business,
+    /// so "there is nothing here" is not an error the host can produce.
+    pub fn plugin_query_error(code: &'static str, message: impl Into<String>) -> Self {
         let numeric = match code {
-            "board_not_created" => -32020,
             "daemon_unavailable" => -32021,
             "plugin_unavailable" => -32022,
             "plugin_not_installed" => -32023,
@@ -174,7 +179,7 @@ impl RpcError {
 
     /// A `model/*` write named a model the catalog does not contain.
     ///
-    /// Same shape as [`RpcError::board_query`]: the numeric code is a coarse
+    /// Same shape as [`RpcError::plugin_query_error`]: the numeric code is a coarse
     /// fallback, `data.code = "model_not_found"` is the stable vocabulary the
     /// UI branches on (`desktop/src/lib/models.ts`).
     pub fn model_not_found(name: &str) -> Self {
@@ -188,7 +193,7 @@ impl RpcError {
     /// 客户端的上下文锚点已失效：该会话在它不知情时被 `/clear`，它手上持有的是
     /// 服务端**不存在**的内容，其可见上下文与服务端实际上下文结构性不一致。
     ///
-    /// 与 `board_query` / `model_not_found` 同族：数值码只是粗粒度兜底，
+    /// 与 `plugin_query_error` / `model_not_found` 同族：数值码只是粗粒度兜底，
     /// `data.code` 才是 UI 分支的稳定词汇。注意「锚点落后但仍在」**不是**本错误
     /// ——落后是两端并存的正常形状（spec §7.2）。
     pub fn stale_context(thread_id: &str) -> Self {
@@ -773,26 +778,37 @@ mod tests {
 
     /// `plugin_rejected` is a new reason alongside `plugin_not_installed`; it
     /// gets its own numeric fallback while every existing mapping stays put.
+    ///
+    /// The family lost its `board_not_created` arm when the host stopped gating
+    /// the channel on a board registry: the host can no longer answer "there is
+    /// nothing here". No surviving code was renumbered, so `-32020` is simply
+    /// retired rather than reused — reusing it would let an old client read a
+    /// new reason as "no board".
     #[test]
-    fn board_query_numbers_each_reason_without_renumbering() {
-        assert_eq!(RpcError::board_query("plugin_rejected", "no").code, -32024);
+    fn plugin_query_error_numbers_each_reason_without_renumbering() {
         assert_eq!(
-            RpcError::board_query("plugin_not_installed", "no").code,
+            RpcError::plugin_query_error("plugin_rejected", "no").code,
+            -32024
+        );
+        assert_eq!(
+            RpcError::plugin_query_error("plugin_not_installed", "no").code,
             -32023
         );
         assert_eq!(
-            RpcError::board_query("plugin_unavailable", "no").code,
+            RpcError::plugin_query_error("plugin_unavailable", "no").code,
             -32022
         );
         assert_eq!(
-            RpcError::board_query("daemon_unavailable", "no").code,
+            RpcError::plugin_query_error("daemon_unavailable", "no").code,
             -32021
         );
+        // The retired board reason must not come back through the catch-all.
         assert_eq!(
-            RpcError::board_query("board_not_created", "no").code,
-            -32020
+            RpcError::plugin_query_error("board_not_created", "no").code,
+            -32603,
+            "the retired reason must not keep a dedicated numeric code"
         );
-        let unknown = RpcError::board_query("something_else", "no");
+        let unknown = RpcError::plugin_query_error("something_else", "no");
         assert_eq!(unknown.code, -32603);
         assert_eq!(unknown.data.unwrap()["code"], "something_else");
     }
@@ -838,7 +854,7 @@ mod tests {
     }
 
     /// 客户端上下文锚点失效（该会话在其不知情时被 clear）。数值码取下一个空位，
-    /// UI 只读 `data.code`——与 `board_query` / `model_not_found` 同一约定。
+    /// UI 只读 `data.code`——与 `plugin_query_error` / `model_not_found` 同一约定。
     #[test]
     fn stale_context_has_a_stable_numeric_code_and_reason() {
         let error = RpcError::stale_context("thread-a");
@@ -874,7 +890,7 @@ mod tests {
         );
         assert_ne!(
             RpcError::stale_context("t").code,
-            RpcError::board_query("plugin_rejected", "x").code
+            RpcError::plugin_query_error("plugin_rejected", "x").code
         );
     }
 

@@ -186,14 +186,21 @@ pub enum Command {
         action: PairAction,
     },
     /// 常驻值守：保证登记在册的项目各自有一个活着的 daemon。
-    Boards {
+    ///
+    /// 通用子命令：它只读通用常驻登记，不认识任何插件。
+    ///
+    /// **注意（一版风险）**：这里曾经有个隐藏别名 `boards`，是为「已经装过旧
+    /// launchd plist 的机器」留的过渡期兼容。别名已随看板面删除——若某台机器的
+    /// plist 尚未重装（仍跑 `boards watch`），它会在下一次登录时解析失败。
+    /// 复原办法是重装值守（`ui/settings/write` 开关一次，或重装 app）。
+    Resident {
         #[command(subcommand)]
-        action: BoardsAction,
+        action: ResidentAction,
     },
 }
 
 #[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
-pub enum BoardsAction {
+pub enum ResidentAction {
     /// 值守循环：按登记表确保各项目 daemon 存活（由 launchd 常驻托管）。
     Watch {
         #[arg(long, default_value_t = 30)]

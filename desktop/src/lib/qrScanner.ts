@@ -35,6 +35,28 @@ function defaultGrabFrame(video: HTMLVideoElement): ImageData | null {
   return ctx.getImageData(0, 0, w, h);
 }
 
+/**
+ * 默认取流，**永不抛异常**（同步也不抛）。
+ *
+ * `MediaDevices` 在 WebIDL 里标了 `[SecureContext]`：上下文不安全时（iOS 的
+ * WKWebView + 自定义 scheme）整个 `navigator.mediaDevices` 会**消失**，于是
+ * `navigator.mediaDevices.getUserMedia` 是同步 TypeError，而不是 promise rejection
+ * ——挂在 promise 链上的 `.catch` 接不住它。它又发生在 `QrScanner` 的 `useEffect`
+ * 里，会冒泡成 React 的整树卸载（黑屏）。故这里把它压成 rejected promise，
+ * 统一交给 `onError` 处理，让失败退化为「可手输」而不是崩溃。
+ */
+function defaultGetUserMedia(c: MediaStreamConstraints): Promise<MediaStream> {
+  try {
+    const md = navigator.mediaDevices;
+    if (!md || typeof md.getUserMedia !== "function") {
+      return Promise.reject(new Error("mediaDevices unavailable (insecure context?)"));
+    }
+    return md.getUserMedia(c);
+  } catch (e) {
+    return Promise.reject(e);
+  }
+}
+
 /** 默认解码：`jsQR`（npm `jsqr`，导入名 `jsQR`）。 */
 function defaultDecode(data: ImageData): string | null {
   const r = jsQR(data.data, data.width, data.height, { inversionAttempts: "dontInvert" });
@@ -44,6 +66,9 @@ function defaultDecode(data: ImageData): string | null {
 /**
  * 打开相机并逐帧解码，命中即调 `onResult` 并停止。返回 `stop()` 用于清理。
  * `getUserMedia` 失败时调 `onError` 且不启动循环（表单仍可手输）。
+ *
+ * 取流与 `play()` 都**不会**同步抛：任何失败一律走 `onError`，调用方（React effect）
+ * 因此不会因为一个异常而连累整棵树。
  */
 export function startCameraScan(
   video: HTMLVideoElement,
@@ -54,8 +79,7 @@ export function startCameraScan(
   const intervalMs = deps.intervalMs ?? SCAN_INTERVAL_MS;
   const grabFrame = deps.grabFrame ?? defaultGrabFrame;
   const decode = deps.decode ?? defaultDecode;
-  const getUserMedia =
-    deps.getUserMedia ?? ((c: MediaStreamConstraints) => navigator.mediaDevices.getUserMedia(c));
+  const getUserMedia = deps.getUserMedia ?? defaultGetUserMedia;
 
   let timer: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
@@ -71,7 +95,16 @@ export function startCameraScan(
     stream?.getTracks().forEach((t) => t.stop());
   };
 
-  getUserMedia({ video: { facingMode: "environment" } })
+  /** 接入取流：注入的实现可能同步抛，故连同调用一起包住，同步异常也归到 onError。 */
+  const requestStream = (): Promise<MediaStream> => {
+    try {
+      return Promise.resolve(getUserMedia({ video: { facingMode: "environment" } }));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
+
+  requestStream()
     .then((s) => {
       if (stopped) {
         s.getTracks().forEach((t) => t.stop());
@@ -79,7 +112,12 @@ export function startCameraScan(
       }
       stream = s;
       video.srcObject = s;
-      void video.play();
+      // `play()` 的失败也要上报：iOS 上元数据未就绪时它可能 reject，此前被 `void`
+      // 丢弃，于是预览停在第一帧（黑屏）而用户得不到任何反馈。
+      Promise.resolve(video.play()).catch((e) => {
+        stop();
+        onError(e);
+      });
       timer = setInterval(() => {
         if (stopped) return;
         const frame = grabFrame(video);

@@ -289,4 +289,16 @@ describe("phone layout CSS", () => {
     const src = readFileSync(`${dir}/components/SettingsDialog.tsx`, "utf8");
     expect(src).toMatch(/isMobile\s*\?\s*"flex size-11[^"]*"\s*:\s*"px-2"/);
   });
+
+  it("keeps the scan overlay's exit inside the safe area", () => {
+    // 扫码覆盖层是 `fixed inset-0`，头部（含唯一的「返回」按钮）若不自己补安全区，
+    // 就会落到刘海/灵动岛底下——用户报的「扫码过程中没有返回按钮」。提示条同理
+    // （`bottom-6` 贴底会被 Home Indicator 压住）。
+    const bar =
+      /\[data-mobile="true"\]\s+\.scan-overlay-bar\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(bar).toMatch(/padding-top:\s*max\(env\(safe-area-inset-top/);
+    const alert =
+      /\[data-mobile="true"\]\s+\.scan-overlay-alert\s*\{([^}]*)\}/.exec(css())?.[1] ?? "";
+    expect(alert).toMatch(/bottom:\s*max\(env\(safe-area-inset-bottom/);
+  });
 });

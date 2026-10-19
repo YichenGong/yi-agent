@@ -2756,25 +2756,10 @@ fn execute_slash_command(
                     width,
                 );
             }
-            // 生命周期子命令（create/remove/status）由宿主直接管本目录的看板
-            // （走 `yi_agent_boards::lifecycle`）；其余（on/off/run/add/无参）
-            // 仍走插件通道。`global_dir()` 是宿主唯一的全局登记目录来源。
-            // 多个词（如 `create garbage`）不当成生命周期：那更可能是打错子命令，
-            // 而 create 会真起一个 daemon——宁可给用法，也不静默执行。
+            // 全部子命令（含 create/remove/status）都经**通用插件通道**：宿主
+            // 已不再有看板登记表或看板生命周期，创建/移除是插件自己的动作。
             let args = args.as_deref().unwrap_or("");
-            let mut words = args.split_whitespace();
-            let first = words.next();
-            let extra = words.next().is_some();
-            let lifecycle_word = if extra { None } else { first };
-            let lines = match lifecycle_word {
-                Some(word @ ("create" | "remove" | "status")) => {
-                    match yi_agent_boards::global_dir() {
-                        Ok(global) => crate::tui::board::handle_board(workdir, &global, word).lines,
-                        Err(error) => vec![format!("无法定位看板登记目录: {error}")],
-                    }
-                }
-                _ => crate::tui::superpowers_kanban::handle_kanban(workdir, args).lines,
-            };
+            let lines = crate::tui::superpowers_kanban::handle_kanban(workdir, args).lines;
             for line in lines {
                 history.push(HistoryCell::Separator { label: Some(line) }, width);
             }
@@ -5766,9 +5751,10 @@ mod tests {
     }
 
     #[test]
-    fn kanban_create_is_dispatched_to_the_board_lifecycle() {
+    fn kanban_create_is_dispatched_through_the_plugin_channel() {
         // 用一个「不是目录」的 workdir 让 create 在起 daemon 之前就被拒：既不
-        // 碰真实 $HOME 登记表，也钉住 create 确实被派给了生命周期。
+        // 碰真实 $HOME 登记，也钉住 create 确实被派给了**插件通道**（宿主已不再
+        // 自己管看板生命周期）。
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("not-a-dir");
         std::fs::write(&file, "x").unwrap();
@@ -5800,8 +5786,8 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::None);
         let labels = separator_labels(&history);
         assert!(
-            labels.iter().any(|l| l.contains("看板创建失败")),
-            "create 必须走生命周期并如实报告失败：{labels:?}"
+            labels.iter().any(|l| l.contains("create 失败")),
+            "create 必须走通用插件通道并如实报告失败：{labels:?}"
         );
     }
 

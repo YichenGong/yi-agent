@@ -48,6 +48,39 @@ where
     assert_eq!(v["id"], 1, "initialize must respond with the request id");
 }
 
+/// 经 stdio 的 `Harness` 发一条请求，读回**请求 id 相符**的那条响应。
+///
+/// 与 [`initialize`] 的分工：那条走 websocket 连接，这条走 `Harness` 的 JSONL
+/// 双工流。两者都要跨文件复用（`server.rs` 的 `board_rpc_tests` 与
+/// `resident_rpc_tests` 都要先发握手再发被测方法），故同住 `test_support`；
+/// 名字带上 `over_stdio` 就是为了不与那条 ws 版混淆。
+///
+/// 读回时按 id 匹配并丢弃其它帧：server 会顺带推送通知（`broadcast` 的
+/// 事件帧），不匹配的话断言会拿到通知而不是应答。
+pub(crate) async fn rpc_over_stdio(
+    h: &mut crate::server::tests::Harness,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> serde_json::Value {
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        })
+        .to_string(),
+    )
+    .await;
+    loop {
+        let value = h.read_value().await;
+        if value.get("id") == Some(&serde_json::json!(id)) {
+            return value;
+        }
+    }
+}
+
 /// 一份无凭据、无网络的测试配置；provider 只是占位字符串。
 pub(crate) fn test_config() -> RuntimeConfig {
     RuntimeConfig {
