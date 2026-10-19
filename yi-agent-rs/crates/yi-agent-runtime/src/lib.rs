@@ -5,4 +5,5 @@ pub mod config;
 pub mod migrate;
 pub mod models;
 pub mod onboarding;
+pub mod reasoning_probe;
 pub mod supervise;
