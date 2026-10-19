@@ -1,7 +1,9 @@
 # 插件生命周期去耦合（宿主不认识「看板」这个概念）Design
 
 日期：2026-10-17
-状态：设计已确认（对话中拍板：与 G1 一并全量还债），待用户 review 本文件后进入 writing-plans。
+状态：**已落地**（2026-10-19）。宿主侧看板面已删净，插件侧 `manifest`/`lifecycle/*` 已就位，
+端到端四条验收已实测（见 §6 末尾「落地记录」）。
+原状态：设计已确认（对话中拍板：与 G1 一并全量还债）。
 范围：宿主（`yi-agent-rs/crates/yi-agent-boards/`、`yi-agent-app-server/`、`yi-agent/`）、
 桌面（`desktop/`）。
 关联：Spec 4（`2026-10-01-superpowers-kanban-decoupling-design.md`，本 spec 是其迟到的收尾）、
@@ -515,6 +517,25 @@ G1（`2026-10-17-session-driver-decoupling-design.md`）把宿主里的看板**�
 
 9. 桌面上「新建看板」 → 侧栏出现看板、插件被拉起、队列可推进（与今日行为一致）。
 10. 「删除看板」 → 队列消失、daemon 停、登记表不再含该项目。
+
+### 落地记录（2026-10-19）
+
+| 验收 | 证据 |
+|---|---|
+| 1. 依赖删净 | `grep -rn "yi-agent-boards" yi-agent-rs/crates/*/Cargo.toml` 无命中；crate 目录已删（`1dcababe`） |
+| 2. 宿主 grep | 复核脚本（上方）实测 **51** 行，逐文件与 §6.2 表一致 |
+| 3. board RPC 消失 | `grep -rn "Domain::Board\|board/create\|board/remove\|board/list" yi-agent-rs/crates --include=*.rs` 只剩 5 行注释里的历史说明（`server.rs:366,9263`、`rpc/plugin.rs:364`、`rpc_tests.rs:17026`、`tests/common/mod.rs:292`），无代码引用 |
+| 3a. `plugin/install` | `app-server/src/rpc/plugin.rs`；`rpc_tests.rs` 的 `plugin_install_*` 九条 |
+| 3b. 开关半程 | `plugin/install` 调 `enable_switch`；`switch.read` 回 `on:true, source:"project"`（真实二进制 e2e） |
+| 4/4a/5. 插件动词 | `superpowers-kanban` 的 `manifest` / `lifecycle/create` / `lifecycle/remove`；`main.rs` 测试 |
+| 6. 旧 `boards.json` 迁移 | `app-server/src/server.rs` 两个 stdio 入口 + `ws::serve_ws`；`legacy_compat.rs` 解析 |
+| 7/8. 桌面 | 108 files / 1399 tests；`createBoard`/`removeBoard` 走 `plugin/query`，`listBoards` 走 `resident/list` |
+| 9/10. 端到端 | 真实二进制：`plugin/install` → `lifecycle/create` → `switch.read on` → `resident/list` 含该项目 → `lifecycle/remove` → 登记表清空 |
+
+新增缺陷（本 spec 之外的既有问题，一并修掉）：daemon 重启后，上一代留下的健康插件
+进程不进 `running`，其查询路由从不登记 → `plugin/query` 恒回 `-32022`。修于
+`yi-agent-supervisors/src/supervisor.rs::query_sockets`（`running` **或** 当前应答），
+三个测试钉住（`3a62c78d`）。
 
 ## 7. 涉及文件
 

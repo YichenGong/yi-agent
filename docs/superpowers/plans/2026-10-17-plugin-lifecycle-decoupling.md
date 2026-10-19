@@ -108,7 +108,7 @@ G1 之后宿主结构变了，初稿的文件路径与依赖面已过时；实�
     纯文件读取（registry 缺失/损坏 → 空表，与 `resident::list` 同口径）。
   - `plugin_query(project, method, plugin, params)`——**去掉 `global` 形参与看板门控**。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 测试放在 `src/rpc/resident.rs` 的 `mod tests`：直接调该模块的 handler，**用注入的临时目录**
 （不要读真实 `$HOME`）。`resident/list` 的 handler 因此应接受一个已解析好的 registry 目录
@@ -171,12 +171,12 @@ G1 之后宿主结构变了，初稿的文件路径与依赖面已过时；实�
 > - `project_and_registry(dir, register)` helper 的 `register` 参数在摘掉门控后
 >   只影响「有没有 boards.json」，不再影响行为；保留不影响，但别再用它表达门控语义。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p yi-agent-app-server resident_list_reports plugin_query_does_not_gate -- --nocapture`
 Expected: FAIL（`resident/list` 不存在；`plugin_query` 仍门控）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 - `plugin_query` 删掉 `match yi_agent_boards::registry::contains(global, project) { ... }`
   整段与 `global: &Path` 形参；调用点同步（`src/rpc/plugin.rs`）。
@@ -188,12 +188,12 @@ Expected: FAIL（`resident/list` 不存在；`plugin_query` 仍门控）
   （只读 `$HOME`），或在需要注入的测试里走 `resident_dir`——若为可测性需要注入，
   复用已有的 `resident_dir` 注入点（`RuntimeAttachments` 里已有）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p yi-agent-app-server`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-app-server/src/ yi-agent-rs/crates/yi-agent-store/src/
@@ -229,7 +229,7 @@ git commit -m "feat(app-server): add the generic resident/list RPC and drop the 
   故此处解析**不要**依赖 `yi_agent_boards`——直接读 JSON 的 `boards[].project`
   （几十行），以免迁移代码随 crate 一起被删。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
     #[test]
@@ -259,24 +259,24 @@ git commit -m "feat(app-server): add the generic resident/list RPC and drop the 
 app-server 侧另加一条：**启动路径真的会调它**（把「旧环境首启」钉在接线处，
 而不只是钉在纯函数上）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p yi-agent-store import_legacy -- --nocapture`
 Expected: FAIL
 
-- [ ] **Step 3: 写实现 + 接线**
+- [x] **Step 3: 写实现 + 接线**
 
 - `resident.rs` 加 `import_legacy_projects`（见上）。
 - app-server 启动处（`run` / `serve` 的入口，与 `spawn_board_watchman_loop` 同一段
   初始化）调用一次：解析 `<board_dir>/boards.json` → `import_legacy_projects`。
   失败只记 `tracing::warn!`，**不得**阻断启动（迁移是便利，不是前置）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p yi-agent-store && cargo test -p yi-agent-app-server`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add yi-agent-rs/crates/yi-agent-store/src/ yi-agent-rs/crates/yi-agent-app-server/src/
@@ -303,7 +303,7 @@ git commit -m "feat(store): import legacy board registrations into the resident 
   `yi-agent-supervisors::daemon`（`spawn_detached` / `wait_ready` / `is_running` / `stop`）。
 - CLI：`yi-agent resident watch --interval-secs <n>`（取代 `yi-agent boards watch`）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
     #[test]
@@ -320,12 +320,12 @@ git commit -m "feat(store): import legacy board registrations into the resident 
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p yi-agent-supervisors the_watchman_plist the_supervisor_layout -- --nocapture`
 Expected: FAIL（模块尚不存在）
 
-- [ ] **Step 3: 搬迁**
+- [x] **Step 3: 搬迁**
 
 - `git mv` 三文件；改 `lib.rs` 导出；supervisors 需要的 `yi-agent-store`
   （watch 读 `resident`、daemon 用 `store::ipc`）加进 `Cargo.toml`。
@@ -341,12 +341,12 @@ Expected: FAIL（模块尚不存在）
   `Command::Resident`/`ResidentAction::Watch`，`run_boards_watch` → `run_resident_watch`
   （改读通用登记，逻辑不变）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p yi-agent-supervisors -p yi-agent-boards -p yi-agent`
 Expected: PASS（三 crate 全绿）
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add -A yi-agent-rs/crates/yi-agent-supervisors yi-agent-rs/crates/yi-agent-boards yi-agent-rs/crates/yi-agent yi-agent-rs/Cargo.toml
@@ -398,7 +398,7 @@ git commit -m "refactor(supervisors): move the generic resident-daemon machinery
     }
 ```
 
-- [ ] **Step 1b: `manifest` 动词（§4.4 方案 A 的插件侧）**
+- [x] **Step 1b: `manifest` 动词（§4.4 方案 A 的插件侧）**
 
 ```rust
     #[test]
@@ -427,12 +427,12 @@ Expected: FAIL
 > `supervisors/superpowers-kanban.json` 在已安装环境里不可达（spec §4.4 已论证方案 B
 > 因此不可行）。随包 `.json` 退化为参考文档；两者漂移时以 `manifest` 输出为准。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner lifecycle_ -- --nocapture`
 Expected: FAIL
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 - 新增 runner `resident.rs`（最小读写：`require` / `release` / `list`，格式与
   `yi-agent-store::resident` 一致——`{"projects":[{"project":...,"required_by":[...]}]}`，
@@ -445,12 +445,12 @@ Expected: FAIL
   由宿主/监督者观察到登记消失后停进程。**在注释里写明这条分工**，并在测试里断言
   「release 已发生 + 状态目录已删」而不是「进程已停」。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add plugins/superpowers-kanban/crates/superpowers-kanban-runner/src/
@@ -483,7 +483,7 @@ git commit -m "feat(kanban): expose lifecycle create/remove over the plugin chan
   - `yi_agent_supervisors::install::enable_switch(project, switch_key) -> io::Result<()>`
   - RPC `plugin/install {project, plugin}` → `{ installed: true, manifest: <path> }`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
     #[test]
@@ -521,12 +521,12 @@ RPC 层：
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors install_ -- --nocapture`
 Expected: FAIL（模块不存在）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 - `install.rs`：从已删的 `yi-agent-boards/src/scaffold.rs`（`git show <T6 base>:...`）迁出
   两个纯函数，**去掉所有看板名**：
@@ -549,12 +549,12 @@ Expected: FAIL（模块不存在）
 - **宿主源码里不得出现具体插件名**：本分支只读 `plugin` 形参，验收 §6.2 的 grep 因此
   不受影响。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-supervisors && cargo test -p yi-agent-app-server plugin_install`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ..
@@ -583,7 +583,7 @@ git commit -m "feat(app-server): install a plugin into a project generically"
 - Produces: `createBoard` / `removeBoard` 走 `plugin/query`（`plugin: "superpowers-kanban"`）；
   `listBoards` 走**通用** `resident/list`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```ts
 it("installs the plugin before creating a board", async () => {
@@ -629,12 +629,12 @@ it("lists registered projects from the generic resident registry", async () => {
 > 与 `params.project`（插件据此知道给哪个项目建盘）是两件事，**都要带**——
 > 与 `superpowersKanbanSwitch.ts` 的 `queryPlugin` 同形。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `npx vitest run desktop/src/lib/superpowersKanbanBoards.test.ts`
 Expected: FAIL（仍断言 `board/create` 等）
 
-- [ ] **Step 3: 改实现**
+- [x] **Step 3: 改实现**
 
 ```ts
 const KANBAN_PLUGIN = "superpowers-kanban";
@@ -685,12 +685,12 @@ export async function removeBoard(rpc: BoardRpc, project: string): Promise<void>
 - `App.test.tsx` 的 mock：`board/list` → `resident/list`；`board/create` 断言 →
   `plugin/query`。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `npx vitest run desktop/src/lib/superpowersKanbanBoards.test.ts desktop/src/lib/routes.test.ts desktop/src/App.test.tsx`
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add desktop/src/lib/superpowersKanbanBoards.ts desktop/src/lib/superpowersKanbanBoards.test.ts \
@@ -719,7 +719,7 @@ git commit -m "refactor(desktop): create and remove boards through the plugin ch
   `board/*` RPC 不存在；偏好键通用化
   （`board_watchman_enabled` → `resident_daemon_watchman_enabled`，旧键兼容读）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 > **实测漂移（刷新 10/12）**：`tui/app.rs` 的 `global_dir()` 调用点在 **`:2751`**（非 2745）；
 > `Layout` 去专有名时**保留 `logs_dir()`**（main `080fa293` 新增，托管子进程日志落点）。
@@ -739,12 +739,12 @@ git commit -m "refactor(desktop): create and remove boards through the plugin ch
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cargo test -p yi-agent-app-server the_legacy_watchman -- --nocapture`
 Expected: FAIL
 
-- [ ] **Step 3: 删除与改名**
+- [x] **Step 3: 删除与改名**
 
 - 删 `rpc/board.rs` 整文件与 `Domain::Board`（`domain_for` 去掉 `board` 臂、
   `serve()` 的 detach 分支只留 `Plugin`）；`rpc_tests.rs` 的 Board 方法表删掉。
@@ -784,12 +784,12 @@ Expected: FAIL
 - `tests/board_{e2e,watchman_e2e}.rs`：改断言新通道/新子命令（仍受
   `YI_AGENT_BOARD_E2E` 闸保护）。
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cargo test -p yi-agent-app-server && cargo test -p yi-agent && cargo build --workspace`
 Expected: PASS；`grep -rn "yi-agent-boards\|yi_agent_boards" yi-agent-rs/crates/ --include=*.rs` 无命中
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add -A yi-agent-rs/
@@ -810,19 +810,19 @@ git commit -m "refactor(app-server): drop the board crate, RPCs and preference k
 - Consumes: Task 1–6 全部。
 - Produces: 宿主侧 grep 归零的可复核证据。
 
-- [ ] **Step 1: 写验收清单（人可验证）**
+- [x] **Step 1: 写验收清单（人可验证）**
 
 - 桌面「新建看板」→ 侧栏出现看板、插件被拉起、队列可推进。
 - 桌面「删除看板」→ 队列消失、daemon 停、登记表不再含该项目。
 - 旧环境（含 `boards.json`）首启 → 该看板仍出现（迁移生效）。
 - 卸载插件 → 桌面不再显示看板条目，且无崩溃。
 
-- [ ] **Step 2: 跑全量测试**
+- [x] **Step 2: 跑全量测试**
 
 Run: `cargo test --workspace --jobs 2 && npx vitest run`
 Expected: 全绿
 
-- [ ] **Step 3: grep 归零核对**
+- [x] **Step 3: grep 归零核对**
 
 Run（**必须用 `-i` 并排除 `onboarding`**，见刷新 14 / spec §6.2）:
 ```bash
@@ -839,17 +839,45 @@ Expected: 无命中（仅允许注释中的历史说明与通用插件机制）�
 > 而 `grep "board"` 命中 `onboarding*`（**永不归零**，仅 `rpc_tests.rs` 就 ≥14 行）。
 > 跑之前先落实 Task 6 的 `is_kanban_worktree` 归属裁定（刷新 13）。
 
-- [ ] **Step 4: 更新 Spec 4 状态**
+- [x] **Step 4: 更新 Spec 4 状态**
 
 在 `2026-10-01-superpowers-kanban-decoupling-design.md` 的 §5 迁移第 1 条下补一行：
 「已由 `2026-10-17-plugin-lifecycle-decoupling-design.md` 落地」。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs/
 git commit -m "docs: note that the plugin lifecycle decoupling completes spec 4"
 ```
+
+
+**执行记录（2026-10-19）**
+
+- Step 1：四条验收全部实测。创建/删除走真实二进制（`plugin/install` → `lifecycle/create`
+  → `switch.read {on:true, source:"project"}` → `resident/list` 含项目 → `lifecycle/remove`
+  → 登记表清空）；旧 `boards.json` 迁移与「卸载插件后不崩」由
+  `cargo test -p yi-agent-app-server --lib` 的迁移/插件用例覆盖。
+- Step 2：`cargo test` 按 crate 跑（workspace 全量会 OOM，见 AGENTS.md）：
+  app-server 898 passed / 4 ignored，supervisors 51 + 18，store 93，`yi-agent` 642 +
+  各 e2e；desktop `npx vitest run` 108 files / 1399 tests，`npx tsc --noEmit` clean。
+- Step 3：上面的 `grep | grep -v` 版命令按字面执行会得到 225 行，因为它只能滤掉
+  **行内含 `test` 字样**的行，滤不掉整个 `#[cfg(test)] mod tests { … }` 块。改用 spec
+  §6.2 末尾附的脚本（剥离测试模块与注释行），实测 **51**，逐文件与表一致。
+- Step 4：已补进 `2026-10-01-superpowers-kanban-decoupling-design.md` §5。
+- Step 5：与本节文档改动同批提交。
+
+### 追加任务（执行中发现的缺口，均已落地）
+
+- **Task 8: 完整评审与真实二进制 e2e 暴露的六项修复**（`ab5d98dd` 桌面读新键 /
+  `5c4a4364` 安装后装登录自启 / `674bb15b` `plugin/install` 等插件查询 socket 并回
+  `queryable`（上限 5s，超时不算失败）/ `e9e5f31f` 保留名收窄为 `kanban` 与
+  `kanban-merge` / `2eb93ce6` `ws::serve_ws` 生产入口补启动工作 / `4117dd62` spec 表
+  与 TUI 描述改正）。
+- **Task 9: 两处 supervisor/host 缺口**（`3a62c78d` daemon 重启后把仍应答的插件
+  登记进转发表——`plugin/query` 不再恒回 `-32022`；D2「失败的重复安装会删掉可用
+  清单」经核实已由 `48dd028b` 修好，未再改生产代码，只补一条钉住「失败安装不得
+  留下已开启的开关」的断言 `17d35ef3`）。
 
 ---
 
