@@ -33,7 +33,7 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check
+ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check build-env-check
     @echo "CI passed"
 
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
@@ -56,6 +56,18 @@ npm-version-check:
 # 三平台 target）：任一被破坏，tag 触发的发布会在构建第一步秒挂。
 release-env-check:
     bash scripts/test_release_workflow_env.sh
+
+# 构建环境门禁自测：PATH 必须让 rustup 的 Rust 优先于 Homebrew 的 Rust，
+# 否则交叉编译会以 E0463 "can't find crate for core" 秒挂（实测 0.5~3 秒），
+# 正是 v0.1.4~v0.1.7 每次 release 的失败形态；另外要抬高文件描述符上限。
+build-env-check:
+    bash scripts/test_setup_build_env.sh
+
+# 在当前 shell 装好构建环境（重排 PATH、抬高 fd、校验三平台 std 与 zig）。
+# 用法：`source <(just --evaluate ...)` 不适用，直接 source 脚本：
+#   source scripts/setup-build-env.sh
+build-env:
+    bash scripts/setup-build-env.sh --check
 
 # === 真实 LLM 测试(需 API key,默认跳过) ===
 
@@ -149,6 +161,9 @@ target-dir := env_var_or_default("CARGO_TARGET_DIR", "target")
 build-target target:
     #!/usr/bin/env bash
     set -e
+    # 先确认工具链可用：PATH 里若有 Homebrew 的 Rust 抢在 rustup 前面，
+    # 这里会立即失败并说明原因，而不是让 cargo 报出难懂的 E0463。
+    SETUP_BUILD_ENV_TARGETS="{{ target }}" source scripts/setup-build-env.sh
     if echo "{{ target }}" | grep -q "linux"; then
         cargo zigbuild --release --target {{ target }}
     else

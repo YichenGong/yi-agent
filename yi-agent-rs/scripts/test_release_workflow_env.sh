@@ -20,7 +20,19 @@
 #      是带 `rustup update stable` 的。0.1.4 引入的依赖把构建图的最高 MSRV
 #      抬到了 1.88（time/zip/rmcp/lopdf），0.1.7 又抬到 1.89（aes 0.9.3）。
 #
-# 这个脚本是静态门禁：把两条不变量钉死，避免再次「本地能编、CI 秒挂」。
+#   3. （真机复现后补充）PATH 顺序让 Homebrew 的 rust 抢占了 rustup 的 rust。
+#      runner 上 /opt/homebrew/bin/cargo 指向 Cellar/rust/1.98.1，而
+#      GITHUB_PATH 是「后写的在前」：workflow 先写 $HOME/.cargo/bin、
+#      再写 /opt/homebrew/bin，结果 brew 排在前面。brew 的 cargo 看不见
+#      rustup 装在 ~/.rustup/toolchains 下的跨平台 std，交叉编译立刻报
+#      `error[E0463]: can't find crate for 'core'`——实测 0.5~3 秒失败，
+#      与 CI 观测耗时完全吻合。同一台机器把 $HOME/.cargo/bin 提到最前，
+#      同一 target 1m05s 构建成功。
+#   4. （真机复现后补充）launchd 的 maxfiles 是 256。14 核并行链接
+#      x86_64-unknown-linux-gnu 时撞上
+#      `ProcessFdQuotaExceeded`。抬到 65536 后 1m06s 成功。
+#
+# 这个脚本是静态门禁：把这几条不变量钉死，避免再次「本地能编、CI 秒挂」。
 set -uo pipefail
 
 WORKFLOW="$(cd "$(dirname "$0")/../.." && pwd)/.github/workflows/release.yml"
@@ -74,7 +86,43 @@ else
   bad "workflow must run 'rustup update stable' (default alone never upgrades)"
 fi
 
-# 5) 目标平台必须装齐三平台，否则 package-all 里会缺产物。
+# 5) GITHUB_PATH 的写入顺序：/opt/homebrew/bin 必须先于 $HOME/.cargo/bin。
+#    GITHUB_PATH 是后写优先，所以「先 brew 后 cargo」最终让 rustup 胜出。
+#    顺序反了会让 Homebrew 的 rust 抢到 cargo，交叉编译以 E0463 秒挂。
+brew_line="$(printf '%s\n' "$config" | grep -n 'GITHUB_PATH' | grep -F '/opt/homebrew/bin' | head -1 | cut -d: -f1)"
+cargo_line="$(printf '%s\n' "$config" | grep -n 'GITHUB_PATH' | grep -F 'HOME/.cargo/bin' | head -1 | cut -d: -f1)"
+if [ -n "$brew_line" ] && [ -n "$cargo_line" ] && [ "$brew_line" -lt "$cargo_line" ]; then
+  ok "GITHUB_PATH adds /opt/homebrew/bin before \$HOME/.cargo/bin (rustup wins)"
+else
+  bad "GITHUB_PATH must add /opt/homebrew/bin BEFORE \$HOME/.cargo/bin (lines: brew=${brew_line:-none} cargo=${cargo_line:-none})"
+fi
+
+# 6) 构建步骤必须显式装好构建环境（重排 PATH、抬高 fd 上限）。
+if printf '%s\n' "$config" | grep -qF 'source scripts/setup-build-env.sh'; then
+  ok "build step sources scripts/setup-build-env.sh"
+else
+  bad "build step must source scripts/setup-build-env.sh before building"
+fi
+
+# 7) 环境脚本本身必须存在，并且真的处理了 fd 上限。
+ENV_SCRIPT="$(cd "$(dirname "$0")" && pwd)/setup-build-env.sh"
+if [ -f "$ENV_SCRIPT" ]; then
+  ok "scripts/setup-build-env.sh exists"
+  if grep -q 'ulimit -n 65536' "$ENV_SCRIPT"; then
+    ok "setup-build-env.sh raises the file descriptor limit"
+  else
+    bad "setup-build-env.sh must raise the fd limit (launchd defaults to 256)"
+  fi
+  if grep -q 'shadowing rustup' "$ENV_SCRIPT"; then
+    ok "setup-build-env.sh rejects Homebrew's Rust shadowing rustup"
+  else
+    bad "setup-build-env.sh must reject Homebrew's cargo shadowing rustup"
+  fi
+else
+  bad "scripts/setup-build-env.sh is missing"
+fi
+
+# 8) 目标平台必须装齐三平台，否则 package-all 里会缺产物。
 for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu; do
   if printf '%s\n' "$config" | grep -qF "$target"; then
     ok "workflow covers target $target"
