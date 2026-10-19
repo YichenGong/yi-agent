@@ -40,7 +40,60 @@ pub(crate) async fn handle(
                 }
             }
         }
-        "onboarding/apply" | "onboarding/dismiss" => {
+        "onboarding/apply" => {
+            if state.client_scope < Scope::Control {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            let settings = match crate::onboarding_rpc::settings_from_params(&req.params) {
+                Ok(s) => s,
+                Err(error) => {
+                    write_response(state.hub, state.client, err_response(id, error)).await?;
+                    return Ok(Flow::Continue);
+                }
+            };
+            // 门禁在服务端:任何客户端都不能绕过"测试通过"。
+            // 空 api_url 在这里补成 provider 默认地址——与落盘同一个解析函数,
+            // 否则向导留空唯一合法的配置会被判成失败。
+            let resolved = settings.with_default_url();
+            let outcome = yi_agent_runtime::onboarding::test_connection(&resolved).await;
+            if !outcome.ok {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(
+                        id,
+                        RpcError::model_test_failed(
+                            outcome.reason.unwrap_or_else(|| "连接测试未通过".into()),
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            // 探测已通过,这里只剩校验 + 写盘:同步入口不再发第二次网络请求。
+            match crate::onboarding_rpc::handle_onboarding_request_at(
+                state.onboarding_env_path,
+                state.onboarding_preferences_path,
+                state.models_path,
+                "onboarding/apply",
+                &req.params,
+                state.cfg,
+            ) {
+                Ok(value) => {
+                    write_response(state.hub, state.client, ok_response(id, value)).await?
+                }
+                Err(error) => {
+                    write_response(state.hub, state.client, err_response(id, error)).await?
+                }
+            }
+        }
+        "onboarding/dismiss" => {
             if state.client_scope < Scope::Control {
                 write_response(
                     state.hub,
@@ -54,7 +107,7 @@ pub(crate) async fn handle(
                 state.onboarding_env_path,
                 state.onboarding_preferences_path,
                 state.models_path,
-                req.method.as_str(),
+                "onboarding/dismiss",
                 &req.params,
                 state.cfg,
             ) {
@@ -85,7 +138,9 @@ pub(crate) async fn handle(
                     return Ok(Flow::Continue);
                 }
             };
-            let outcome = yi_agent_runtime::onboarding::test_connection(&settings).await;
+            // 与 apply 同一份解析:留空 URL 时探测的必须是真正会落盘的地址。
+            let outcome =
+                yi_agent_runtime::onboarding::test_connection(&settings.with_default_url()).await;
             let value = serde_json::json!({
                 "ok": outcome.ok,
                 "reason": outcome.reason,
