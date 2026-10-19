@@ -391,7 +391,7 @@ mod relay_tests {
         std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
         std::fs::write(
             preferences_path(dir.path()),
-            &format!(r#"{{"theme":"light","{WATCHMAN_KEY}":false,"subagent_runtime":"never"}}"#),
+            format!(r#"{{"theme":"light","{WATCHMAN_KEY}":false,"subagent_runtime":"never"}}"#),
         )
         .unwrap();
         save_relay_url(

@@ -9218,9 +9218,12 @@ mod watchman_install_tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// 假安装闭包记下的调用：`(exe, home)`，按发生顺序。
+    type InstallCalls = Arc<Mutex<Vec<(PathBuf, PathBuf)>>>;
+
     /// 记录调用的假安装闭包；不碰真实 launchd。
-    fn recorder() -> (WatchmanInstall, Arc<Mutex<Vec<(PathBuf, PathBuf)>>>) {
-        let calls: Arc<Mutex<Vec<(PathBuf, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+    fn recorder() -> (WatchmanInstall, InstallCalls) {
+        let calls: InstallCalls = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&calls);
         let install: WatchmanInstall = Arc::new(move |exe: &Path, home: &Path| {
             seen.lock()
@@ -9397,10 +9400,8 @@ mod plugin_ready_tests {
         std::fs::create_dir_all(dir.path().join("state")).unwrap();
         // 清单用 `{state_dir}` 指向真实目录，但那里没有监听者。
         let manifest = {
-            let json = format!(
-                r#"{{"name":"demo","command":"/bin/true","switch_key":"demo_on","query_socket":"{{state_dir}}/demo.sock"}}"#
-            );
-            yi_agent_supervisors::manifest::SupervisorManifest::parse(&json).unwrap()
+            let json = r#"{"name":"demo","command":"/bin/true","switch_key":"demo_on","query_socket":"{state_dir}/demo.sock"}"#;
+            yi_agent_supervisors::manifest::SupervisorManifest::parse(json).unwrap()
         };
         let started = std::time::Instant::now();
         let ready =
