@@ -124,5 +124,37 @@ assert_eq "replace_app keeps old version on failure" "2.0.0" "$(app_version "$DS
 assert_eq "replace_app cleans staging on failure" "absent" \
   "$([ -e "$DST.new" ] && echo present || echo absent)"
 
+# --- gui_pids ---
+APPDIR="/tmp/FakeHome/Applications/yi-agent.app"
+PS_FIXTURE="$TMPROOT/ps.txt"
+cat > "$PS_FIXTURE" <<EOF
+  111 $APPDIR/Contents/MacOS/desktop
+  222 $APPDIR/Contents/MacOS/yi-agent app-server --listen stdio://
+  333 /Users/dev/proj/.worktrees/x/target/debug/yi-agent daemon serve
+  444 /Users/dev/proj/.worktrees/x/target/debug/yi-agent resident watch
+EOF
+assert_eq "gui_pids finds only the GUI" "111" \
+  "$(YI_AGENT_PS_CMD="cat $PS_FIXTURE" gui_pids "/tmp/FakeHome/Applications/yi-agent.app" | tr '\n' ' ' | sed 's/ $//')"
+
+# --- quit_gui：osascript 成功时不应再 kill ---
+# 注入的 kill 命令写成文件，便于断言「有没有被调用」。
+KILLLOG="$TMPROOT/killelog.txt"
+assert_eq "quit_gui succeeds via osascript" "rc=0" \
+  "$(YI_AGENT_OSASCRIPT_CMD=true \
+      YI_AGENT_KILL_CMD="echo \$1 >> $KILLLOG" \
+      YI_AGENT_PID_ALIVE_CMD=false \
+      quit_gui 111 "/tmp/FakeHome/Applications/yi-agent.app" >/dev/null 2>&1; echo "rc=$?")"
+assert_eq "quit_gui does not kill when osascript worked" "absent" \
+  "$([ -e "$KILLLOG" ] && echo present || echo absent)"
+
+# osascript 失败且进程一直存活时，必须走到 SIGTERM
+assert_eq "quit_gui falls back to kill" "rc=1" \
+  "$(YI_AGENT_OSASCRIPT_CMD=false \
+      YI_AGENT_KILL_CMD="echo \$1 >> $KILLLOG" \
+      YI_AGENT_PID_ALIVE_CMD=true \
+      YI_AGENT_SLEEP_CMD=true \
+      quit_gui 222 "/tmp/FakeHome/Applications/yi-agent.app" >/dev/null 2>&1; echo "rc=$?")"
+assert_eq "quit_gui killed the stubborn pid" "222" "$(cat "$KILLLOG" 2>/dev/null)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

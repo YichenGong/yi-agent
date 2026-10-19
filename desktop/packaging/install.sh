@@ -148,6 +148,90 @@ main() {
   echo "当前安装器版本：$(basename "$dmg")"
 }
 
+
+ps_lines() {
+  if [ -n "${YI_AGENT_PS_CMD:-}" ]; then
+    eval "$YI_AGENT_PS_CMD"
+  else
+    ps -Aw -o pid=,command=
+  fi
+}
+
+# 匹配 Contents/MacOS/desktop（GUI 可执行文件名由 Cargo 包名决定）。
+# 不用 pgrep、不用 comm：两者在本机均不可靠，见 spec「关键事实」。
+gui_pids() {
+  local app="$1"
+  ps_lines | awk -v want="$app/Contents/MacOS/desktop" '{
+    pid = $1
+    sub(/^[ \t]+/, "", $0)
+    cmd = $0
+    sub(/^[0-9]+[ \t]+/, "", cmd)
+    if (cmd == want || index(cmd, want " ") == 1) print pid
+  }'
+}
+
+# 下面几个包装器都支持「注入带参数的命令」，故用 eval。
+# 生产路径下它们分别等价于 `osascript -e ...`、`kill <pid>`。
+osascript_cmd() {
+  printf '%s\n' "${YI_AGENT_OSASCRIPT_CMD:-}"
+}
+
+sleep_cmd() {
+  printf '%s\n' "${YI_AGENT_SLEEP_CMD:-}"
+}
+
+kill_pid() {
+  local pid="$1"
+  if [ -n "${YI_AGENT_KILL_CMD:-}" ]; then
+    eval "$YI_AGENT_KILL_CMD"
+  else
+    kill "$pid" 2>/dev/null || true
+  fi
+}
+
+# 等待 <seconds>；测试可置空以跳过真实 sleep。
+wait_seconds() {
+  local seconds="$1"
+  if [ -n "$(sleep_cmd)" ]; then
+    eval "$(sleep_cmd)"
+  else
+    sleep "$seconds"
+  fi
+}
+
+pid_alive() {
+  local pid="$1"
+  if [ -n "${YI_AGENT_PID_ALIVE_CMD:-}" ]; then
+    eval "$YI_AGENT_PID_ALIVE_CMD"
+  else
+    kill -0 "$pid" 2>/dev/null
+  fi
+}
+
+# 先请求 GUI 自己退出，等 5 秒；仍在则 SIGTERM，再等 2 秒。
+quit_gui() {
+  local pid="$1"
+  if [ -n "$(osascript_cmd)" ]; then
+    eval "$(osascript_cmd)" || true
+  else
+    osascript -e 'tell application "yi-agent" to quit' >/dev/null 2>&1 || true
+  fi
+
+  local i
+  for i in $(seq 1 25); do
+    pid_alive "$pid" || return 0
+    wait_seconds 0.2
+  done
+
+  kill_pid "$pid"
+  for i in $(seq 1 10); do
+    pid_alive "$pid" || return 0
+    wait_seconds 0.2
+  done
+  echo "ERROR: GUI 进程 $pid 未能退出" >&2
+  return 1
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -euo pipefail
   main "$@"
