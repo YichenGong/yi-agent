@@ -75,29 +75,58 @@ if [ -n "$hits" ]; then
   report_hits "known leaked session id present:" "$hits"
 fi
 
-# 2) 真实中继域名（示例域名 relay.example.com 不匹配本条）。
+# 2) 任何 session= 后紧跟 32 位十六进制的值都是凭据；占位符不匹配。
 set +e
-hits=$(git grep -n -E 'relay\.yi-agent\.top' -- . "${EXCLUDES[@]}" 2>/dev/null); rc=$?
+hits=$(git grep -n -E 'session=[0-9A-Fa-f]{32}([^0-9A-Fa-f]|$)' -- . "${EXCLUDES[@]}" 2>/dev/null); rc=$?
 set -e
 if [ "$rc" -gt 1 ]; then
   echo "::error::secret-check: git grep failed (rc=$rc) - cannot verify credentials"
   exit 2
 fi
 if [ -n "$hits" ]; then
-  report_hits "real relay hostname in tracked file:" "$hits"
+  report_hits "session-shaped credential present:" "$hits"
 fi
 
-# 3) 非保留段的公网 IP，且处于 ssh/relay 语境。
-#    RFC 5737 保留段（192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）不匹配。
+# 3) relay.* 主机不允许入库；示例主机 relay.example.com（含 URL 编码语境）放行。
 set +e
-hits=$(git grep -n -E '(101\.47\.76\.100)|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . "${EXCLUDES[@]}" 2>/dev/null); rc=$?
+hits=$(git grep -n -E 'relay(\.|%3[aA])[[:alnum:]-]+(\.|%2[eE])[[:alnum:].-]+' -- . "${EXCLUDES[@]}" 2>/dev/null); rc=$?
 set -e
 if [ "$rc" -gt 1 ]; then
   echo "::error::secret-check: git grep failed (rc=$rc) - cannot verify credentials"
   exit 2
 fi
 if [ -n "$hits" ]; then
-  report_hits "public IP in relay/ssh context:" "$hits"
+  filtered="$(printf '%s\n' "$hits" | grep -v -E 'relay(\.|%3[aA])example(\.|%2[eE])com([^[:alnum:].-]|$)' || true)"
+  if [ -n "$filtered" ]; then
+    report_hits "non-example relay hostname in tracked file:" "$filtered"
+  fi
+fi
+
+# 4) SSH/lsof 排查语境中的公网 IPv4。RFC 5737 示例段不命中。
+set +e
+hits=$(git grep -n -E 'ssh.*root@[0-9]{1,3}(\.[0-9]{1,3}){3}|lsof.*grep.*[0-9]{1,3}(\.[0-9]{1,3}){3}' -- . "${EXCLUDES[@]}" 2>/dev/null); rc=$?
+set -e
+if [ "$rc" -gt 1 ]; then
+  echo "::error::secret-check: git grep failed (rc=$rc) - cannot verify credentials"
+  exit 2
+fi
+if [ -n "$hits" ]; then
+  public_hits=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    ips="$(printf '%s\n' "$line" | grep -Eo '[0-9]{1,3}(\.[0-9]{1,3}){3}' || true)"
+    while IFS= read -r ip; do
+      [ -n "$ip" ] || continue
+      case "$ip" in
+        192.0.2.*|198.51.100.*|203.0.113.*) ;;
+        *) public_hits="${public_hits}${line}\n"; break ;;
+      esac
+    done <<< "$ips"
+  done <<< "$hits"
+  if [ -n "$public_hits" ]; then
+    public_hits="$(printf '%b' "$public_hits")"
+    report_hits "public IP in relay/ssh context:" "$public_hits"
+  fi
 fi
 
 if [ "$fail" -ne 0 ]; then

@@ -2,444 +2,194 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把已进入 git 跟踪文件的真实中继凭据（session/域名/IP）脱敏，并加一道能在 CI 挡住同类问题的机械门禁。
+**Goal:** 在现有凭据卫生门禁中补齐结构化规则回归覆盖，使脚本、自测和设计 spec 一致，并锁定规则边界。
 
-**Architecture:** 三步。先加**会失败的门禁脚本及其自测**（TDD：先看它红），再脱敏让门禁转绿，最后轮换凭据使历史里的旧值作废。门禁只扫 `git ls-files`（跟踪文件），因此天然不误伤已忽略的 `deploy/relay/.relay-local.md`。
+**Architecture:** 先为 session、relay 主机和 SSH/lsof IP 规则补正反例，确认测试能暴露现有行为缺口；再修改 `scripts/check-secrets.sh` 使规则通过，同时保留仓库根扫描和 fail-closed 行为；最后同步设计 spec 与本计划的规则、退出码和验收描述。不重复实现已完成的 CI 接线、历史值脱敏或凭据轮换流程。
 
-**Tech Stack:** bash（零外部依赖）、just（挂进既有 `ci` recipe）。不引入 gitleaks 等外部二进制。
-
-**Spec:** `docs/superpowers/specs/2026-10-18-relay-credential-hygiene-design.md`
+**Tech Stack:** Bash（零外部依赖）、Git 临时仓库夹具；文档为 Markdown。
 
 ## Global Constraints
 
-- 环境：`export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"`；`export TMPDIR=/Users/gongyichen/.yi-agent-tmp`；cargo 一律加 `--offline`。
-- **macOS 的 BSD `sed` 不支持 `\b`**，需要正则替换时用 `perl -pi -e` 或 python3。
+- 只扫描当前 Git 仓库中已跟踪的文件；运行目录可为仓库根或其子目录。
+- 脚本退出码：`0` = 检查通过，`1` = 检出疑似凭据，`2` = 扫描无法可靠执行。
+- 真实 session 结构规则只匹配 `session=` 后紧跟 32 位十六进制值；`<session_id>` 等占位符放行。
+- `relay.example.com`（包括分隔符以常见 `%3A` / `%2E` 百分号编码形式出现的 URL 语境）放行；结构规则拦截其他 `relay.*` 主机名，且 `relay.example.com.evil` 不属于豁免项。
+- 对 `ssh` 命令中的公网 IPv4 地址进行检查，包括 `-n`、`-o` 等参数形式；RFC 5737 的 `192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24` 示例段放行。
+- 对 `lsof … | grep <IPv4>` 排查命令检查公网 IPv4；RFC 5737 示例段放行。
+- 不改 `docs/bug-list.md` 里排查记录的结论；只在规则文档对齐所需范围内更新 spec 和本计划。
+- 本任务不改 `deploy/relay/.relay-local.md`、CI 接线、已完成的文档脱敏内容或人工轮换状态；不合并、不推送。
 - 只显式 `git add <path>`，不要 `git add -A` / `git add .`。
-- `justfile` 位于 `yi-agent-rs/`，其 recipe 的 cwd 是 `yi-agent-rs/`，因此脚本路径写 `../scripts/...`。
-- **不要改 `docs/bug-list.md` 里排查记录的结论**，只替换字面值（域名/IP/session）。
-- 本卡**不碰** `deploy/relay/.relay-local.md`（未跟踪，机制正确）。
-- 本卡**不碰** `model-driven-diff-view` 相关文件（`git_diff.rs` / `protocol.rs` / 前端 diff），那是另一张卡的范围。
 
 ---
 
-### Task 1: 门禁脚本 + 自测（先让它红）
+### Task 1: 为结构化凭据规则补充红测
 
 **Files:**
-- Create: `scripts/check-secrets.sh`
-- Create: `scripts/test_check_secrets.sh`
-- Test: `scripts/test_check_secrets.sh`（自测即测试）
+- Modify: `scripts/test_check_secrets.sh`
+- Test: `scripts/test_check_secrets.sh`
 
 **Interfaces:**
-- Produces: 可执行脚本 `scripts/check-secrets.sh`，**退出码语义**——`0` = 通过，`1` = 发现疑似凭据。输出 `::error::…` 前缀（GitHub Actions 会把它们渲染成注解；其它 CI 当普通 stderr）。`scripts/test_check_secrets.sh` 同样以 `0`/`1` 表示自测通过与否。
-- Consumes: 无（Task 3 的 justfile 会消费它）。
+- Consumes: 当前 `scripts/check-secrets.sh`，其退出码 `0`/`1`/`2` 分别代表通过/命中/无法扫描。
+- Produces: 对 session、relay 主机和 SSH/lsof IP 规则正反边界的可执行回归覆盖。
 
-- [ ] **Step 1: 写自测脚本（此刻必失败，因为被测脚本还不存在）**
+- [ ] **Step 1: 在现有自测脚本结尾、汇总输出前添加结构规则夹具**
 
-创建 `scripts/test_check_secrets.sh`：
-
-```bash
-#!/usr/bin/env bash
-# 自测 scripts/check-secrets.sh：确认它在「有真实凭据」时变红、
-# 在「只有示例值」或「值在未跟踪文件里」时保持绿。
-# 不用 `set -e`：本脚本要故意触发被测脚本的「非零退出」，那些非零是
-# 期望结果，不能被 -e 当成致命错误。
-set -uo pipefail
-
-SCRIPT="$(cd "$(dirname "$0")" && pwd)/check-secrets.sh"
-[ -x "$SCRIPT" ] || { echo "FAIL: $SCRIPT not executable"; exit 1; }
-
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-
-pass=0
-failn=0
-check() { # check <name> <expected_exit> <actual_exit>
-  if [ "$2" = "$3" ]; then echo "ok   - $1"; pass=$((pass+1));
-  else echo "FAIL - $1 (expected exit $2, got $3)"; failn=$((failn+1)); fi
-}
-
-# --- case 1: 真实 session 在跟踪文件里 → 必须 exit 1
-r1="$work/leaked"; mkdir -p "$r1/docs"
-git -C "$r1" init -q
-printf 'see wss://relay.yi-agent.top/connect?session=fe42addbfed257dcd396e7fcc45e2725\n' > "$r1/docs/a.md"
-git -C "$r1" add docs/a.md
-( cd "$r1" && bash "$SCRIPT" >/dev/null 2>&1 ); check "real session in tracked file fails" 1 $?
-
-# --- case 2: 只有示例值 → 必须 exit 0
-r2="$work/clean"; mkdir -p "$r2/docs"
-git -C "$r2" init -q
-printf 'see wss://relay.example.com/connect?session=<session_id>\n' > "$r2/docs/a.md"
-printf 'lsof -nP -p "$(pgrep -f app-server)" | grep 203.0.113.10\n' >> "$r2/docs/a.md"
-git -C "$r2" add docs/a.md
-( cd "$r2" && bash "$SCRIPT" >/dev/null 2>&1 ); check "example values pass" 0 $?
-
-# --- case 3: 真实值但文件未被跟踪 → 必须 exit 0（不误伤 .relay-local.md 范式）
-r3="$work/untracked"; mkdir -p "$r3/deploy"
-git -C "$r3" init -q
-printf 'session = fe42addbfed257dcd396e7fcc45e2725\nip = 101.47.76.100\n' > "$r3/deploy/local.md"
-printf 'x\n' > "$r3/keep.md"; git -C "$r3" add keep.md
-( cd "$r3" && bash "$SCRIPT" >/dev/null 2>&1 ); check "untracked file is ignored" 0 $?
-
-# --- case 4: 真实域名在跟踪文件里 → 必须 exit 1
-r4="$work/host"; mkdir -p "$r4/docs"
-git -C "$r4" init -q
-printf 'connect to wss://relay.yi-agent.top/ws\n' > "$r4/docs/a.md"
-git -C "$r4" add docs/a.md
-( cd "$r4" && bash "$SCRIPT" >/dev/null 2>&1 ); check "real hostname in tracked file fails" 1 $?
-
-echo
-if [ "$failn" -ne 0 ]; then echo "$failn failed, $pass passed"; exit 1; fi
-echo "$pass passed"
-```
-
-再让它可执行：
+继续使用脚本已有的 `work` 临时目录和 `check <name> <expected_exit> <actual_exit>` helper。每个 case 建立独立临时 Git 仓库，写入并 `git add` 一个夹具文件，再从该仓库运行 `bash "$SCRIPT"`。在现有 7 个 case 后添加以下 11 个独立断言（共 18 个）：
 
 ```bash
-chmod +x scripts/test_check_secrets.sh
+# 1: session=<32位hex> → exit 1；2: session=<session_id> → exit 0。
+# 3: relay.example.com → exit 0；4: URL 百分号编码的 relay.example.com → exit 0。
+# 5: relay.other.example → exit 1；6: relay.example.com.evil → exit 1。
+# 7: ssh -n -o BatchMode=yes root@198.51.101.7 → exit 1。
+# 8: ssh -n -o BatchMode=yes root@198.51.100.7 → exit 0（RFC 5737 保留段）。
+# 9: lsof -nP -iTCP | grep 198.51.101.8 → exit 1。
+# 10: lsof -nP -iTCP | grep 198.51.100.8 → exit 0（RFC 5737 保留段）。
+# 11: 同一行含 203.0.113.7 和 198.51.101.9 → 仍 exit 1。
 ```
 
-- [ ] **Step 2: 跑自测，确认它失败**
+每条断言都单独调用现有 `fixture <name> <file-content>` helper 建仓、写 `fixture.txt`、执行 `git add`，然后运行 `bash "$SCRIPT"` 并把 `$?` 原样传给 `check`。helper 必须在 `local` 声明中先取得参数，再单独设置依赖 `$name` 的仓库路径；不要让 fixture 内容当作 shell 命令执行。
+
+- [ ] **Step 2: 运行自测确认新结构用例在当前实现上失败**
 
 Run: `bash scripts/test_check_secrets.sh`
-Expected: FAIL —— 首行输出 `FAIL: /…/scripts/check-secrets.sh not executable`（被测脚本还不存在），退出码 1。
+Expected: 基线实现中结构化 `session=`、非示例 `relay.*`（包括域名近似值）、带参数 SSH 公网 IP 与 lsof/grep 公网 IP 负例失败；占位符、精确示例域名及 RFC 5737 保留段通过。旧有 known-session、已知域名、tracked-only、root-scan 与 fail-closed 用例继续通过。
 
-- [ ] **Step 3: 写最小实现**
-
-创建 `scripts/check-secrets.sh`：
+- [ ] **Step 3: Commit 红测**
 
 ```bash
-#!/usr/bin/env bash
-# 挡住「真实部署凭据进跟踪文件」这类缺陷。
-#
-# 只扫 git 跟踪文件（`git grep` 默认只看跟踪内容），因此
-# deploy/relay/.relay-local.md 这类「已忽略的本机私密记录」天然被排除。
-#
-# 退出码：0 = 通过；1 = 发现疑似凭据。
-# 输出以 `::error::` 开头，GitHub Actions 会渲染成注解。
-set -euo pipefail
-
-fail=0
-
-report() { # report <message>
-  echo "::error::$1"
-  fail=1
-}
-
-# 命中行常常是一整段文档；只报「文件:行号」加前 160 字符的片段，
-# 否则 ::error:: 注解会长到无法阅读。
-report_hits() { # report_hits <label> <git-grep-output>
-  local label="$1" hits="$2"
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    local loc snippet
-    loc="${line%%:*}"                       # 文件路径
-    local rest="${line#*:}"
-    loc="$loc:${rest%%:*}"                  # 加上行号 -> 文件:行
-    snippet="$(printf '%s' "$rest" | cut -c1-160)"   # rest 不含 "文件:行:" 前缀
-    report "$label ($loc): $snippet"
-  done <<< "$hits"
-}
-
-# 1) 已知泄露值的字面量。轮换后若再出现，即为「有人从历史里捞回来」的回归。
-set +e
-hits=$(git grep -n -e 'fe42addbfed257dcd396e7fcc45e2725' -- . 2>/dev/null)
-set -e
-if [ -n "$hits" ]; then
-  report_hits "known leaked session id present:" "$hits"
-fi
-
-# 2) 真实中继域名（示例域名 relay.example.com 不匹配本条）。
-set +e
-hits=$(git grep -n -E 'relay\.yi-agent\.top' -- . 2>/dev/null)
-set -e
-if [ -n "$hits" ]; then
-  report_hits "real relay hostname in tracked file:" "$hits"
-fi
-
-# 3) 非保留段的公网 IP，且处于 ssh/relay 语境。
-#    RFC 5737 保留段（192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）不匹配。
-set +e
-hits=$(git grep -n -E '(101\.47\.76\.100)|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . 2>/dev/null)
-set -e
-if [ -n "$hits" ]; then
-  report_hits "public IP in relay/ssh context:" "$hits"
-fi
-
-if [ "$fail" -ne 0 ]; then
-  echo
-  echo "凭据卫生检查失败。示例值请用 relay.example.com 与 RFC 5737 保留段（如 203.0.113.10）；"
-  echo "真实值请写在被忽略的文件里（范式见 deploy/relay/.relay-local.md）。"
-  exit 1
-fi
-
-echo "secret-check passed"
+git add scripts/test_check_secrets.sh
+git commit -m "test(secret-check): 覆盖结构规则边界"
 ```
 
-再让它可执行：
+---
 
-```bash
-chmod +x scripts/check-secrets.sh
-```
+### Task 2: 实现结构规则并让自测转绿
 
-- [ ] **Step 4: 跑自测，确认它通过**
+**Files:**
+- Modify: `scripts/check-secrets.sh`
+- Test: `scripts/test_check_secrets.sh`
+
+**Interfaces:**
+- Consumes: Task 1 中定义的可执行边界用例。
+- Produces: `scripts/check-secrets.sh` 在命中时返回 `1`，扫描故障时返回 `2`，通过时返回 `0`；结构规则覆盖上述全部正反例。
+
+- [ ] **Step 1: 运行新增自测，确认红测证据仍可复现**
 
 Run: `bash scripts/test_check_secrets.sh`
-Expected: PASS —— 输出 4 个 `ok - …` 与最后的 `4 passed`，退出码 0。
+Expected: 至少一个新增结构规则 case 失败，非零退出；这一步验证 Task 1 的测试确实能检测现有缺口。
 
-- [ ] **Step 5: 在当前仓库上跑一次，确认它现在**红**（这是 TDD 的红：真凭据还在）**
+- [ ] **Step 2: 更新检查规则**
 
-Run: `bash scripts/check-secrets.sh; echo "exit=$?"`
-Expected: 打印若干 `::error::…`（命中 `docs/bug-list.md:115`、`:117`、`docs/relay-deploy.md:573`）与 `exit=1`。**这正是 Task 2 要消除的红。**
+在脚本现有 known-session、真实 relay host 和 IP 检查基础上实现以下明确语义：
 
-- [ ] **Step 6: Commit**
+1. 保留已知 session 字面值回归检查，并新增 `session=` 加 32 位十六进制值的结构检查；使用大小写不敏感的十六进制字符集 `[0-9A-Fa-f]`。
+2. relay host 规则拦截 `relay.` 后不是 `example.com` 的主机名；示例主机 `relay.example.com` 必须通过。边界应避免把 `relay.example.com.evil` 当作示例域名。
+3. SSH IP 规则应匹配一行中 `ssh` 命令后至 `root@IPv4` 之间的参数文本，不能因 `ssh -n` 或 `ssh -o BatchMode=yes` 漏检；不得使用 Bash 风格的 `[^\\n]` 作为 grep 的跨行/非换行表达式。
+4. `lsof` IP 规则匹配一行同时含有 `lsof`、`grep` 和 IPv4 的排查命令。
+5. SSH/lsof 语境中的 IPv4 命中不得是 RFC 5737 的 `192.0.2.*`、`198.51.100.*`、`203.0.113.*` 文档示例地址。不要误把规则扩大成对仓库所有普通 IPv4 的无条件拦截。
+6. 保留仓库根扫描、空扫描拒绝、`git grep` 错误返回 `2`、tracked-only 扫描和现有自测排除项；任何规则命令执行失败仍返回 `2`，不能假绿。
+
+若使用多个 grep 查询，统一复用脚本当前的错误码处理模式：`git grep` 返回 `1` 表示无匹配，`>1` 表示扫描错误并退出 `2`。每类命中继续通过 `report_hits` 报出位置。
+
+- [ ] **Step 3: 运行门禁自测确认绿**
+
+Run: `bash scripts/test_check_secrets.sh`
+Expected: 所有原有与新增 case 均显示 `ok`，最后报告总通过数，退出码 `0`。
+
+- [ ] **Step 4: 在当前仓库根和 Rust 子目录分别运行门禁**
+
+Run:
+```bash
+bash scripts/check-secrets.sh
+(cd yi-agent-rs && bash ../scripts/check-secrets.sh)
+```
+Expected: 两次均输出 `secret-check passed` 并返回 `0`，证明扫描范围固定于仓库根。
+
+- [ ] **Step 5: 检查 shell 语法并提交实现**
+
+Run:
+```bash
+bash -n scripts/check-secrets.sh scripts/test_check_secrets.sh
+git diff --check
+```
+Expected: 两条命令均退出 `0`。
 
 ```bash
 git add scripts/check-secrets.sh scripts/test_check_secrets.sh
-git commit -m "ci: 加凭据卫生门禁脚本与自测（当前对已知泄露值报红）"
+git commit -m "fix(secret-check): 对齐结构化凭据规则"
 ```
 
 ---
 
-### Task 2: 脱敏，让门禁转绿
+### Task 3: 让设计 spec 与实施计划精确对齐
 
 **Files:**
-- Modify: `docs/bug-list.md:115`（与 `:117` 里的 IP）
-- Modify: `docs/relay-deploy.md:573`
+- Modify: `docs/superpowers/specs/2026-10-18-relay-credential-hygiene-design.md`
+- Modify: `docs/superpowers/plans/2026-10-18-relay-credential-hygiene.md`
 
 **Interfaces:**
-- Consumes: Task 1 的 `scripts/check-secrets.sh`（作为绿的判据）。
-- Produces: 无新接口；仓库进入「门禁绿」状态。
+- Consumes: Task 2 已验证的脚本规则与退出码语义。
+- Produces: 文档中精确、相互一致的规则定义、边界样例和验收判据。
 
-- [ ] **Step 1: 先看清要改的确切文本（别改错行）**
+- [ ] **Step 1: 对照脚本与自测更新 spec 的门禁规则段**
+
+更新 spec §3.3、测试 case、误报面和验收判据，明确：
+
+- 已知泄露值规则之外，结构 session 模式为 `session=` 后 32 位十六进制；占位符放行。
+- relay host 的规则是 `relay.*`，显式豁免精确示例主机 `relay.example.com`。
+- SSH 命令参数中 `root@IPv4` 可含 `-n`、`-o` 等参数；lsof/grep 排查行也检查公网 IPv4。
+- RFC 5737 三个文档保留段在这些语境中通过；普通公网 IPv4 在对应语境中失败。
+- 检查通过、凭据命中、扫描故障的返回码分别为 `0`、`1`、`2`；非仓库、无 tracked 文件及 grep 扫描错误不得报告通过。
+- 自测覆盖已有 known session/域名/tracked-only/root-scan/fail-closed cases，以及本计划 Task 1 列出的结构边界。
+
+删除或改写与当前实现不一致的旧描述，特别是只列 4 个旧 case 的验收文字；不能声称存在尚未由自测验证的规则。
+
+- [ ] **Step 2: 更新计划的完成态上下文和收尾验收**
+
+本计划开头应说明这是对已实现门禁的结构规则补充，不再包含初始脚本创建、文档脱敏、CI 接线或轮换任务。计划中的夹具说明和自测验收数量须与 `scripts/test_check_secrets.sh` 当前 18 个断言一致，包括 URL 编码示例域名正例、`198.51.100.0/24` 的 RFC 保留段正例，以及同一行的混合 IP 负例。收尾验收应要求：
+
+```bash
+bash scripts/test_check_secrets.sh
+bash scripts/check-secrets.sh
+(cd yi-agent-rs && bash ../scripts/check-secrets.sh)
+bash -n scripts/check-secrets.sh scripts/test_check_secrets.sh
+git diff --check
+```
+
+验收期望依次为：全部自测通过；两种 cwd 扫描均通过；shell 语法和 diff whitespace 检查通过。保留 cargo fmt 仅在工作树确有 Rust 变更时适用的说明；本计划不含 Rust 代码变更。
+
+- [ ] **Step 3: 自审 spec/plan 对齐**
 
 Run:
 ```bash
-grep -n 'fe42addbfed257dcd396e7fcc45e2725\|101\.47\.76\.100\|relay\.yi-agent\.top' docs/bug-list.md docs/relay-deploy.md
+rg -n '4 passed|四个 case|只有 4|退出码|session=|relay\\\.\*|RFC 5737|exit 2|ssh -n|lsof' docs/superpowers/specs/2026-10-18-relay-credential-hygiene-design.md docs/superpowers/plans/2026-10-18-relay-credential-hygiene.md
 ```
-Expected: 命中 `docs/bug-list.md` 的 115、117 行与 `docs/relay-deploy.md` 的 573 行。记下每行里的**字面值出现位置**。
+Expected: 搜索结果中的规则、退出码和样例与脚本、自测一致；不保留声称只有四例的旧验收标准。
 
-- [ ] **Step 2: 用 perl 就地替换（三处字面值）**
-
-Run:
-```bash
-# 域名 → 示例域名
-perl -pi -e 's/relay\.yi-agent\.top/relay.example.com/g' docs/bug-list.md
-# session → 占位符
-perl -pi -e 's/fe42addbfed257dcd396e7fcc45e2725/<session_id>/g' docs/bug-list.md
-# VPS IP → RFC 5737 保留地址
-perl -pi -e 's/101\.47\.76\.100/203.0.113.10/g' docs/bug-list.md docs/relay-deploy.md
-```
-
-- [ ] **Step 3: 人工复核 diff —— 只许字面值变，结论不许变**
-
-Run: `git diff -- docs/bug-list.md docs/relay-deploy.md`
-Expected: 每一处改动都只是上面的三个字面值互换。**逐行确认**没有段落被删、没有结论被改写（例如「修复前无 `agent connected`、修复后有」这类因果描述必须原样在）。
-
-- [ ] **Step 4: 跑门禁，确认转绿**
-
-Run: `bash scripts/check-secrets.sh; echo "exit=$?"`
-Expected: `secret-check passed` 与 `exit=0`。
-
-- [ ] **Step 5: 确认跟踪文件里再无真实值**
-
-Run:
-```bash
-git grep -n 'fe42addbfed257dcd396e7fcc45e2725' ; echo "session hits=$?"
-git grep -n '101\.47\.76\.100' ; echo "ip hits=$?"
-git grep -n 'relay\.yi-agent\.top' ; echo "host hits=$?"
-```
-Expected: 三条 `git grep` **都无输出**，各自的 `echo` 打印 `=1`（grep 无匹配的退出码）。
-
-- [ ] **Step 6: Commit**
+再运行 Task 3 Step 2 的全部命令，并检查：
 
 ```bash
-git add docs/bug-list.md docs/relay-deploy.md
-git commit -m "docs: 脱敏文档里的真实中继域名/IP/session"
+git diff --check
+git diff -- scripts/check-secrets.sh scripts/test_check_secrets.sh docs/superpowers/specs/2026-10-18-relay-credential-hygiene-design.md docs/superpowers/plans/2026-10-18-relay-credential-hygiene.md
+```
+
+Expected: diff 仅包含本计划规定的结构规则实现、自测和两份文档对齐；没有误改原有脱敏结论、CI 接线或人工轮换状态。
+
+- [ ] **Step 4: Commit spec 与计划**
+
+```bash
+git add docs/superpowers/specs/2026-10-18-relay-credential-hygiene-design.md docs/superpowers/plans/2026-10-18-relay-credential-hygiene.md
+git commit -m "docs(secret-check): 对齐规则 spec 与实施计划"
 ```
 
 ---
 
-### Task 3: 把门禁挂进 `just ci`
+## 收尾：验证清单
 
-**Files:**
-- Modify: `yi-agent-rs/justfile`（`ci` recipe 一行；新增 `secret-check` recipe）
-
-**Interfaces:**
-- Consumes: `scripts/check-secrets.sh`（Task 1）。
-- Produces: `just secret-check` recipe 名（CI 路径统一经 `just ci` 调用它）。
-
-- [ ] **Step 1: 确认当前 `ci` recipe 的确切内容**
-
-Run: `grep -n -A2 '^ci:' yi-agent-rs/justfile`
-Expected: `ci: fmt-check lint test build bindings-check`。
-
-- [ ] **Step 2: 改 `ci` 依赖 + 加 recipe**
-
-把 `yi-agent-rs/justfile` 里的
-
-```
-ci: fmt-check lint test build bindings-check
-    @echo "CI passed"
-```
-
-改成
-
-```
-ci: fmt-check lint test build bindings-check secret-check
-    @echo "CI passed"
-```
-
-并在其**紧后面**（`bindings-check` recipe 之后）插入：
-
-```
-# 凭据卫生：挡住真实部署凭据进入跟踪文件。
-# 只扫 git 跟踪文件，故 deploy/relay/.relay-local.md 这类已忽略文件不参与。
-secret-check:
-    bash ../scripts/check-secrets.sh
-```
-
-- [ ] **Step 3: 验证 recipe 能被 just 识别且真的执行**
-
-Run: `cd yi-agent-rs && just secret-check; echo "exit=$?"`
-Expected: `secret-check passed` 与 `exit=0`（依赖 Task 2 已完成）。
-
-- [ ] **Step 4: 验证它确实挂在 `ci` 的依赖图里**
-
-Run: `cd yi-agent-rs && just --dry-run ci`
-Expected: 输出里包含 `bash ../scripts/check-secrets.sh`（证明 `secret-check` 是 `ci` 的一步，而不是孤立 recipe）。
-
-- [ ] **Step 5: 验证门禁在失败时能挡住（故意引入一次泄露）**
-
-Run:
-```bash
-printf '\nleak: fe42addbfed257dcd396e7fcc45e2725\n' >> docs/bug-list.md
-cd yi-agent-rs && just secret-check; echo "exit=$?" ; cd ..
-git checkout -- docs/bug-list.md
-```
-Expected: `just secret-check` 打印 `::error::known leaked session id present: …` 且 `exit=1`；随后 `git checkout` 把文件还原。**这一步证明门禁不是"写了但永远绿"。**
-
-- [ ] **Step 6: 跑完整的 `just ci` 确认无回归**
-
-Run: `cd yi-agent-rs && just ci`
-Expected: 通过（`CI passed`）。注意：这一步会跑 `cargo test --all-features --workspace`，按 CLAUDE.md 的叮嘱**先确认没有其它 cargo 进程在跑**（`ps aux | grep cargo`），且本机内存足够。若全量太吃资源，可退化为逐 crate 跑，但**必须**至少让 `fmt-check` / `lint` / `bindings-check` / `secret-check` 全绿。
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add yi-agent-rs/justfile
-git commit -m "ci: 把凭据卫生门禁挂进 just ci（三条 CI 路径统一生效）"
-```
-
----
-
-### Task 4: 更新文档，把「靠人遵守」换成「有门禁」
-
-**Files:**
-- Modify: `deploy/relay/README.md`（安全提醒段落）
-- Modify: `docs/relay-deploy.md`（§2.6 与 §7 的「凭据保管」条目）
-
-**Interfaces:**
-- Consumes: `just secret-check`（Task 3）。
-- Produces: 无代码接口。
-
-- [ ] **Step 1: 在 `deploy/relay/README.md` 的安全提醒里加上门禁的存在**
-
-找到 `> **安全提醒**：中继按 `session` 配对转发，**不鉴权**——`session_id` 本身就是凭据。`
-那一段（在文件开头的说明里），在该段末尾追加一句：
-
-```
-> 仓库已加机械门禁（`just secret-check`，随 `just ci` 执行）：真实域名/IP/session
-> 出现在 git 跟踪文件里会直接让 CI 失败。示例值统一用 `relay.example.com` 与
-> RFC 5737 保留段（如 `203.0.113.10`）。
-```
-
-- [ ] **Step 2: 在 `docs/relay-deploy.md` 的 §2.6 末尾补同样一句**
-
-在 §2.6 那句「泄露即换：改电脑侧 `relay_url` 与新 session，重启 Mac app 即可。」之后追加：
-
-```
-> **门禁**：`just secret-check`（随 `just ci` 执行）会扫描全部 git 跟踪文件，
-> 真实域名/IP/session 一旦出现即让 CI 失败。示例值用 `relay.example.com` 与
-> `203.0.113.10`。本机真实值仍写在 `deploy/relay/.relay-local.md`（已忽略）。
-```
-
-- [ ] **Step 3: 确认文档改完门禁仍绿**
-
-Run: `bash scripts/check-secrets.sh; echo "exit=$?"`
-Expected: `secret-check passed` 与 `exit=0`（新写的文字用的是示例值）。
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add deploy/relay/README.md docs/relay-deploy.md
-git commit -m "docs: 说明凭据卫生门禁，示例值统一用保留段"
-```
-
----
-
-### Task 5: 轮换凭据（人工操作，写进 PR 描述）
-
-**Files:**
-- 无代码改动。产出是 PR 描述里的一段**已验证的操作记录**。
-
-**Interfaces:**
-- Consumes: 无。
-- Produces: 作废的旧 session（`fe42addbfed257dcd396e7fcc45e2725`）与记录在 PR 里的验证证据。
-
-> **这是人工步骤，不是 agent 能代替的**：它需要在 Mac 上改配置、在手机上改地址、
-> 并在 VPS 上查日志。agent 的职责是**把步骤与验证命令写清楚**，并在用户执行后
-> 把结果记录到 PR 描述里。
-
-- [ ] **Step 1: 生成新 session**
-
-Run: `openssl rand -hex 16`
-Expected: 一个 32 位十六进制串（新 session）。**不要**把它写进任何跟踪文件。
-
-- [ ] **Step 2: 电脑侧改用新 session 并重启**
-
-改 `~/.yi-agent/preferences.json` 的 `relay_url`（或设环境变量 `YI_AGENT_RELAY`，优先级更高）：
-
-```
-wss://relay.example.com/connect?session=<新 session>
-```
-
-然后重启 Mac 上的 yi-agent app。
-
-- [ ] **Step 3: 手机侧改用新 session**
-
-iOS 配对页地址填 `wss://relay.example.com/ws?session=<新 session>`。
-
-- [ ] **Step 4: 在 VPS 上验证新 session 已配对**
-
-Run: `ssh <vps> 'journalctl -u yi-agent-relay -n 100 | grep "agent connected"'`
-Expected: 出现**新 session** 的 `agent connected` 行。
-
-- [ ] **Step 5: 验证旧 session 已作废**
-
-Run: `ssh <vps> 'journalctl -u yi-agent-relay --since "5 min ago" | grep "fe42addbfed257dcd396e7fcc45e2725"'`
-Expected: **无输出**（旧 session 不再有任何连接；即使有人拿旧值来连，也不会与你的电脑配对）。
-
-- [ ] **Step 6: 把上面两步的输出粘进 PR 描述，并 Commit 一个空记录（可选）**
-
-若团队习惯把轮换记录留档，在 `docs/relay-deploy.md` 的 §2.6 追加一行**不含值**的记录：
-
-```
-| 上一次轮换 | 2026-10-18（因 session 曾进入跟踪文件；旧值已作废） |
-```
-
-```bash
-git add docs/relay-deploy.md
-git commit -m "docs: 记录中继 session 轮换（不含值）"
-```
-
----
-
-## 收尾：合并前的验证清单
-
-- [ ] `bash scripts/test_check_secrets.sh` → 4 passed
-- [ ] `bash scripts/check-secrets.sh` → passed（exit 0）
-- [ ] `git grep` 三次（session / IP / 域名）在跟踪文件零命中
-- [ ] `cd yi-agent-rs && just --dry-run ci` 输出含 `check-secrets.sh`
-- [ ] `cd yi-agent-rs && just ci` 通过
-- [ ] 轮换的 VPS 日志证据已贴进 PR 描述（Task 5 Step 4/5）
-- [ ] `cargo fmt --all`（在 `yi-agent-rs/` 下）——本卡无 Rust 改动，但按仓库规范提交前照跑
+- [ ] `bash scripts/test_check_secrets.sh`：18 个自测断言全部通过。
+- [ ] `bash scripts/check-secrets.sh`：通过（exit `0`）。
+- [ ] `(cd yi-agent-rs && bash ../scripts/check-secrets.sh)`：通过（exit `0`）。
+- [ ] `bash -n scripts/check-secrets.sh scripts/test_check_secrets.sh`：通过。
+- [ ] `git diff --check`：通过。
+- [ ] spec 与计划的规则、边界、自测和退出码语义一致。
+- [ ] 不执行 merge、push 或源分支删除。

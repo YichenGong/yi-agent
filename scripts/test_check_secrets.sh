@@ -72,6 +72,60 @@ git -C "$r7" init -q
 printf 'session = fe42addbfed257dcd396e7fcc45e2725\n' > "$r7/docs/a.md"
 ( cd "$r7" && bash "$SCRIPT" >/dev/null 2>&1 ); check "repo with nothing tracked fails (cannot verify)" 2 $?
 
+# Helper for one-file tracked repositories used by the structural rules below.
+fixture() { # fixture <name> <file-content>
+  local name="$1" content="$2" repo
+  repo="$work/$name"
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  printf '%s\n' "$content" > "$repo/fixture.txt"
+  git -C "$repo" add fixture.txt
+}
+
+# --- case 8: arbitrary 32-hex session structure → exit 1
+fixture session-structure 'relay session=0123456789abcdef0123456789abcdef'
+( cd "$work/session-structure" && bash "$SCRIPT" >/dev/null 2>&1 ); check "32-hex session structure fails" 1 $?
+
+# --- case 9: session placeholder → exit 0
+fixture session-placeholder 'relay session=<session_id>'
+( cd "$work/session-placeholder" && bash "$SCRIPT" >/dev/null 2>&1 ); check "session placeholder passes" 0 $?
+
+# --- case 10: relay.example.com → exit 0
+fixture example-host 'connect to relay.example.com'
+( cd "$work/example-host" && bash "$SCRIPT" >/dev/null 2>&1 ); check "relay.example.com passes" 0 $?
+
+# --- case 10b: URL percent-encoded relay.example.com → exit 0
+fixture encoded-example-host 'relay=wss%3A%2F%2Frelay.example.com%2Fws%3Fsession%3Dabc'
+( cd "$work/encoded-example-host" && bash "$SCRIPT" >/dev/null 2>&1 ); check "encoded relay.example.com passes" 0 $?
+
+# --- case 11: other relay.* host → exit 1
+fixture other-relay-host 'connect to relay.other.example'
+( cd "$work/other-relay-host" && bash "$SCRIPT" >/dev/null 2>&1 ); check "other relay hostname fails" 1 $?
+
+# --- case 12: relay.example.com.evil is not the example hostname → exit 1
+fixture lookalike-host 'connect to relay.example.com.evil'
+( cd "$work/lookalike-host" && bash "$SCRIPT" >/dev/null 2>&1 ); check "relay.example.com lookalike fails" 1 $?
+
+# --- case 13: ssh options before root@public IPv4 → exit 1
+fixture ssh-public-ip 'ssh -n -o BatchMode=yes root@198.51.101.7'
+( cd "$work/ssh-public-ip" && bash "$SCRIPT" >/dev/null 2>&1 ); check "ssh options with public IP fail" 1 $?
+
+# --- case 14: ssh RFC 5737 address → exit 0
+fixture ssh-doc-ip 'ssh -n -o BatchMode=yes root@198.51.100.7'
+( cd "$work/ssh-doc-ip" && bash "$SCRIPT" >/dev/null 2>&1 ); check "ssh RFC 5737 address passes" 0 $?
+
+# --- case 15: lsof/grep public IPv4 context → exit 1
+fixture lsof-public-ip 'lsof -nP -iTCP | grep 198.51.101.8'
+( cd "$work/lsof-public-ip" && bash "$SCRIPT" >/dev/null 2>&1 ); check "lsof grep public IP fails" 1 $?
+
+# --- case 16: lsof/grep RFC 5737 address → exit 0
+fixture lsof-doc-ip 'lsof -nP -iTCP | grep 198.51.100.8'
+( cd "$work/lsof-doc-ip" && bash "$SCRIPT" >/dev/null 2>&1 ); check "lsof grep RFC 5737 address passes" 0 $?
+
+# --- case 17: same diagnostic line has RFC example and public IP → still exit 1
+fixture mixed-ip-line 'ssh root@203.0.113.7; ssh root@198.51.101.9'
+( cd "$work/mixed-ip-line" && bash "$SCRIPT" >/dev/null 2>&1 ); check "public IP is not hidden by RFC address on same line" 1 $?
+
 echo
 if [ "$failn" -ne 0 ]; then echo "$failn failed, $pass passed"; exit 1; fi
 echo "$pass passed"

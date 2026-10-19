@@ -171,105 +171,34 @@ session 是**可选**参数；中继本身不做 session 白名单（不然就�
 ci: fmt-check lint test build bindings-check secret-check
 ```
 
-实现（放在仓库根的 `scripts/check-secrets.sh`，便于 CI 与本机共用）：
+实现位于仓库根 `scripts/check-secrets.sh`。扫描边界固定在 Git 仓库根，仅检查 tracked 文件；门禁脚本、自测夹具以及本设计/计划文档从凭据扫描中排除。仓库定位失败、没有 tracked 文件、或 `git grep` 返回大于 1 的错误时，检查必须失败关闭。
 
-```bash
-#!/usr/bin/env bash
-# 挡住「真实部署凭据进跟踪文件」这类缺陷。
-#
-# 只扫 git 跟踪文件（`git grep` 默认只看跟踪内容），因此
-# deploy/relay/.relay-local.md 这类「已忽略的本机私密记录」天然被排除。
-#
-# 退出码：0 = 通过；1 = 发现疑似凭据。
-# 输出以 `::error::` 开头，GitHub Actions 会渲染成注解。
-set -euo pipefail
+规则按以下语义执行：
 
-fail=0
+1. **已知泄露值**：精确拦截已泄露 session 字面值，防止从 git 历史回贴。
+2. **结构化 session**：拦截 `session=` 后紧跟 32 个十六进制字符（`[0-9A-Fa-f]`）的值；`<session_id>` 等占位符放行。
+3. **relay 主机名**：拦截 `relay.*` 主机名，仅精确示例主机 `relay.example.com` 放行；常见 URL 编码的分隔符 `%3A` / `%2E` 形式也识别为示例；例如 `relay.example.com.evil` 不能因前缀相同而豁免。
+4. **SSH/lsof 公网地址**：在含 `ssh … root@<IPv4>`（包括 `-n`、`-o` 等参数）或 `lsof … | grep <IPv4>` 的同一行检查 IPv4。RFC 5737 的 `192.0.2.0/24`、`198.51.100.0/24` 和 `203.0.113.0/24` 保留段放行；该语境中的其它公网 IPv4 拦截，不对普通文本里的所有 IPv4 做全局拦截。
 
-report() { # report <message>
-  echo "::error::$1"
-  fail=1
-}
+**退出码：** `0` 表示检查通过，`1` 表示发现疑似凭据，`2` 表示扫描无法可靠完成。扫描失败不能当作「无命中」处理。
 
-# 命中行常常是一整段文档；只报「文件:行号」加前 160 字符的片段，
-# 否则 ::error:: 注解会长到无法阅读。
-report_hits() { # report_hits <label> <git-grep-output>
-  local label="$1" hits="$2"
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    local loc snippet
-    loc="${line%%:*}"                       # 文件路径
-    local rest="${line#*:}"
-    loc="$loc:${rest%%:*}"                  # 加上行号 -> 文件:行
-    snippet="$(printf '%s' "$rest" | cut -c1-160)"   # rest 不含 "文件:行:" 前缀
-    report "$label ($loc): $snippet"
-  done <<< "$hits"
-}
+检测输出以 `::error::` 开头，便于 GitHub Actions 渲染注解；其它 CI 将其当作普通输出。
 
-# 1) 已知泄露值的字面量。轮换后若再出现，即为「有人从历史里捞回来」的回归。
-set +e
-hits=$(git grep -n -e 'fe42addbfed257dcd396e7fcc45e2725' -- . 2>/dev/null)
-set -e
-if [ -n "$hits" ]; then
-  report_hits "known leaked session id present:" "$hits"
-fi
+**为什么是「已知值 + 结构规则」而不是通用熵检测**：通用熵扫描（gitleaks 的 high-entropy 规则）在含大量 base64 测试夹具、`encrypted_content` 样例的仓库里误报率极高（本仓 `yi-agent-llm` 的测试里就有成串 base64）。精确规则针对已发生过的泄露形态，成本低且边界可回归；未来升级熵扫描时，`secret-check` 这个落点不变。
 
-# 2) 真实中继域名（示例域名 relay.example.com 不匹配本条）。
-set +e
-hits=$(git grep -n -E 'relay\.yi-agent\.top' -- . 2>/dev/null)
-set -e
-if [ -n "$hits" ]; then
-  report_hits "real relay hostname in tracked file:" "$hits"
-fi
+**门禁自测**位于 `scripts/test_check_secrets.sh`（纯 Bash，无 Rust 测试依赖），使用 `mktemp -d` 和 `git init` 创建临时仓库。当前覆盖 18 个断言，包括：已知 session 与域名命中、RFC/示例值通过、未跟踪文件排除、从子目录运行仍扫描仓库根、非仓库和无 tracked 文件返回 `2`、结构化 session、精确 relay 示例域名（含 URL 百分号编码）与近似域名、带参数 SSH IP，以及 lsof/grep IP 语境。公网 IPv4 负例与 RFC 5737 保留段正例都分别验证；同一行同时含 RFC 示例地址和公网地址时仍必须命中。
 
-# 3) 非保留段的公网 IP，且处于 ssh/relay 语境。
-#    RFC 5737 保留段（192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）不匹配。
-set +e
-hits=$(git grep -n -E '(101\.47\.76\.100)|(ssh[^\n]*root@[0-9]{1,3}(\.[0-9]{1,3}){3})' -- . 2>/dev/null)
-set -e
-if [ -n "$hits" ]; then
-  report_hits "public IP in relay/ssh context:" "$hits"
-fi
-
-if [ "$fail" -ne 0 ]; then
-  echo
-  echo "凭据卫生检查失败。示例值请用 relay.example.com 与 RFC 5737 保留段（如 203.0.113.10）；"
-  echo "真实值请写在被忽略的文件里（范式见 deploy/relay/.relay-local.md）。"
-  exit 1
-fi
-
-echo "secret-check passed"
-```
-
-**为什么是"已知值 + 结构规则"而不是通用熵检测**：通用熵扫描（gitleaks 的
-high-entropy 规则）在含大量 base64 测试夹具、`encrypted_content` 样例的仓库里
-误报率极高（本仓 `yi-agent-llm` 的测试里就有成串 base64）。先用精确规则把
-**已经发生过的形态**钉死，是成本最低且零误报的起点；未来要升级为熵扫描时，
-`secret-check` 这个落点不变。
-
-**测试这道门禁自身**（TDD，避免"门禁写了但从不失败"）：
-
-落点确定为 `scripts/test_check_secrets.sh`（纯 bash 自测，不引入 Rust 测试依赖），
-用 `mktemp -d` + `git init` 造临时仓库，覆盖 4 个 case：
-
-```
-case 1: 跟踪文件含真实 session        → 脚本 exit 1
-case 2: 只有示例值（example.com/RFC5737）→ 脚本 exit 0
-case 3: 真实值但在未跟踪文件里（.relay-local.md 形态）→ 脚本 exit 0（不误伤）
-case 4: 跟踪文件含真实域名             → 脚本 exit 1
-```
-
-（自测脚本本身**不能**用 `set -e`：它要故意触发被测脚本的非零退出，那些非零是
-期望结果。实测已踩到这一点。）
+自测脚本本身不能启用 `set -e`：它必须捕获被测脚本预期的非零退出码。
 
 ## 4. 验收判据
 
-- [ ] `git grep -n "fe42addbfed257dcd396e7fcc45e2725"` 在跟踪文件里**零命中**
-- [ ] `git grep -n "101\.47\.76\.100"` 在跟踪文件里**零命中**
-- [ ] `git grep -n "relay\.yi-agent\.top"` 在跟踪文件里**零命中**
-- [ ] `bash scripts/check-secrets.sh` 在当前树 exit 0
-- [ ] 故意在临时分支把 session 写回 `docs/bug-list.md` → `bash scripts/check-secrets.sh` exit 1
-- [ ] `just ci` 通过（含新的 `secret-check` 步骤）
+- [ ] `bash scripts/test_check_secrets.sh`：18 个自测断言全部通过（结构化 session、relay host、SSH/lsof IP、公网/RFC 示例边界、同一行混合地址和 fail-closed 场景均覆盖）
+- [ ] `bash scripts/check-secrets.sh` 在仓库根 exit 0
+- [ ] `(cd yi-agent-rs && bash ../scripts/check-secrets.sh)` exit 0（从子目录仍扫描整个仓库）
+- [ ] 自测中非仓库目录、无 tracked 文件两例均 exit 2；跟踪文件疑似凭据为 exit 1
+- [ ] 故意在临时仓库 tracked 文件放入 `session=<32位hex>`、非示例 `relay.*` 或 SSH/lsof 公网 IP → 脚本 exit 1
+- [ ] RFC 5737 三个文档保留段与 `relay.example.com` / `<session_id>` 示例均由自测证明通过
+- [ ] `just ci` 通过（含 `secret-check` 步骤）
 - [ ] 轮换后 VPS journal 出现新 session 的 `agent connected`（人工验证，记录在 PR 描述）
 
 ## 5. 取舍与风险
@@ -288,9 +217,7 @@ case 4: 跟踪文件含真实域名             → 脚本 exit 1
 
 ### 5.3 误报面
 
-第 3 条规则的 `ssh .*root@<IP>` 形态可能误伤文档里的示例。缓解：只匹配**非保留段**
-且带 `ssh`/`root@` 语境；若仍误报，把该处改为 `203.0.113.10` 即可（这本身就是我们
-希望的写法）。
+SSH/lsof 规则只处理对应排查命令行中的 IPv4，不扫描无关上下文里的普通 IP；`ssh -n`、`ssh -o BatchMode=yes` 等参数不会中断对后续 `root@IPv4` 的检查。RFC 5737 的三个文档保留段全部放行。relay 规则只豁免精确示例域名 `relay.example.com`，相似域名（如 `relay.example.com.evil`）仍会被拦截。若门禁报告其它有效示例，应将 IP 替换为 RFC 5737 保留段，并为新边界增加自测后再调整规则。
 
 ### 5.4 为什么不做 git 历史重写
 
