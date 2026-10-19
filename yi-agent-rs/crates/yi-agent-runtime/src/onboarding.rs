@@ -99,6 +99,33 @@ pub struct ModelSettings {
     pub api_key: String,
 }
 
+impl ModelSettings {
+    /// 把「空 `api_url`」解析成该 provider 的默认地址。
+    ///
+    /// 探测与落盘必须共用这一份解析：否则用户留空时，探测打的是空串、
+    /// 落盘写的是默认地址，两条路径验证的根本不是同一个配置。
+    pub fn with_default_url(&self) -> Self {
+        let provider = crate::models::ModelProvider::parse(&self.provider);
+        let default_url = match provider {
+            Some(crate::models::ModelProvider::Openai) => "https://api.openai.com/v1",
+            Some(crate::models::ModelProvider::Anthropic) => "https://api.anthropic.com",
+            // provider 非法时留给 `validate_settings` 报错，这里不动。
+            None => "",
+        };
+        let api_url = if self.api_url.trim().is_empty() {
+            default_url.to_string()
+        } else {
+            self.api_url.trim().to_string()
+        };
+        Self {
+            provider: self.provider.clone(),
+            model: self.model.trim().to_string(),
+            api_url,
+            api_key: self.api_key.clone(),
+        }
+    }
+}
+
 /// 写入前的校验失败。`EmptyField` 携带字段名（`"provider"` / `"model"` / `"api_key"`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SettingsError {
@@ -192,15 +219,8 @@ pub fn import_settings_into_catalog(
     };
     // 空 `api_url` 视为「用 provider 默认地址」：清单条目要求 api_url 非空，
     // 空串会在读回时被 `parse_catalog` 丢弃（与 `migrate.rs` 同口径）。
-    let default_url = match provider {
-        crate::models::ModelProvider::Openai => "https://api.openai.com/v1",
-        crate::models::ModelProvider::Anthropic => "https://api.anthropic.com",
-    };
-    let api_url = if settings.api_url.trim().is_empty() {
-        default_url.to_string()
-    } else {
-        settings.api_url.trim().to_string()
-    };
+    // 解析收敛在 `with_default_url`，保证探测与落盘同源。
+    let api_url = settings.with_default_url().api_url;
     let mut catalog = crate::models::load_catalog_from(models_path);
     let base = settings.model.trim().to_string();
     let mut name = base.clone();
@@ -271,6 +291,9 @@ pub struct ConnectionOutcome {
 /// **只探测，不写任何文件**。明文 key 只在此处进请求头，绝不进日志或返回值。
 pub async fn test_connection(settings: &ModelSettings) -> ConnectionOutcome {
     use yi_agent_core::{GenParams, Message, Provider, ProviderRequest};
+
+    // 与落盘同一份解析：用户留空 URL 时探测的必须是真正会写进清单的地址。
+    let settings = settings.with_default_url();
 
     let provider: std::sync::Arc<dyn Provider> = match settings.provider.as_str() {
         "openai" => match yi_agent_llm::OpenaiProvider::new(yi_agent_llm::OpenaiProviderOpts {
@@ -380,6 +403,42 @@ mod tests {
             default_model: Some(name.into()),
             subagent_model: None,
         }
+    }
+
+    #[test]
+    fn an_empty_url_resolves_to_the_provider_default() {
+        let openai = ModelSettings {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            api_url: String::new(),
+            api_key: "sk-x".into(),
+        };
+        assert_eq!(
+            openai.with_default_url().api_url,
+            "https://api.openai.com/v1"
+        );
+
+        let anthropic = ModelSettings {
+            provider: "anthropic".into(),
+            model: "m".into(),
+            api_url: "  ".into(),
+            api_key: "sk-x".into(),
+        };
+        assert_eq!(
+            anthropic.with_default_url().api_url,
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn an_explicit_url_is_kept_and_trimmed() {
+        let settings = ModelSettings {
+            provider: "openai".into(),
+            model: "m".into(),
+            api_url: "  https://gw.example/v1  ".into(),
+            api_key: "k".into(),
+        };
+        assert_eq!(settings.with_default_url().api_url, "https://gw.example/v1");
     }
 
     #[test]
@@ -517,6 +576,27 @@ mod tests {
         let catalog = crate::models::load_catalog_from(&models);
         assert_eq!(catalog.models.len(), 2);
         assert_eq!(catalog.default_model.as_deref(), Some("dup-2"));
+    }
+
+    /// 探测与落盘必须打出同一个地址：用户留空 URL 时，若两条路径各解析一次，
+    /// 很容易一条用空串、一条用默认值——于是"测试通过"的配置落盘后却不可用。
+    #[test]
+    fn importing_writes_the_same_url_the_probe_would_use() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let models = dir.path().join("models.json");
+        let settings = ModelSettings {
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            api_url: String::new(),
+            api_key: "sk-a".into(),
+        };
+        import_settings_into_catalog(&models, &settings).unwrap();
+        let catalog = crate::models::load_catalog_from(&models);
+        assert_eq!(
+            catalog.models[0].api_url,
+            settings.with_default_url().api_url
+        );
+        assert_eq!(catalog.models[0].api_url, "https://api.openai.com/v1");
     }
 
     #[test]
