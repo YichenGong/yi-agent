@@ -291,6 +291,29 @@ pub(crate) fn production_watchman_uninstall() -> WatchmanUninstall {
     Arc::new(yi_agent_supervisors::watchman::uninstall)
 }
 
+/// 确保「后台值守」的登录项在装：开关为开、且 plist 未指向**当前**可执行文件时
+/// 装一次。
+///
+/// 这是 `board/create` 时代那段逻辑的通用化落点：它只读通用偏好键、只比较 plist
+/// 里的 exe 路径，不解释任何插件语义，故任何「装了一个需要常驻的插件」的路径都能
+/// 调它。当前调用点是 `plugin/install` 成功之后。
+///
+/// best-effort：装不上值守不该让一次已经成功的安装回滚成失败，故只记 warn。
+pub(crate) fn ensure_watchman_installed(workdir: &Path, home: &Path, install: &WatchmanInstall) {
+    if !crate::settings_store::load_watchman_enabled(workdir) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    if yi_agent_supervisors::watchman::is_installed_for(home, &exe) {
+        return;
+    }
+    if let Err(error) = install(&exe, home) {
+        tracing::warn!(%error, "failed to install the resident daemon watchman");
+    }
+}
+
 /// The key that identifies one project directory across this process.
 ///
 /// Runtime attach and every later lookup must agree on this value, so it is
@@ -9066,5 +9089,93 @@ mod git_diff_watcher_tests {
         pump.abort();
         assert!(drained, "the frame table must stay empty");
         assert!(frames.lock().await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod watchman_install_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 记录调用的假安装闭包；不碰真实 launchd。
+    fn recorder() -> (WatchmanInstall, Arc<Mutex<Vec<(PathBuf, PathBuf)>>>) {
+        let calls: Arc<Mutex<Vec<(PathBuf, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let install: WatchmanInstall = Arc::new(move |exe: &Path, home: &Path| {
+            seen.lock()
+                .unwrap()
+                .push((exe.to_path_buf(), home.to_path_buf()));
+            Ok(())
+        });
+        (install, calls)
+    }
+
+    fn write_switch(workdir: &Path, enabled: bool) {
+        std::fs::create_dir_all(workdir.join(".yi-agent")).unwrap();
+        std::fs::write(
+            crate::settings_store::preferences_path(workdir),
+            format!(r#"{{"{}":{enabled}}}"#, crate::settings_store::WATCHMAN_KEY),
+        )
+        .unwrap();
+    }
+
+    /// 开关关着就什么都不做：用户明确关掉的登录自启不得被安装路径悄悄打开。
+    #[test]
+    fn does_nothing_while_the_switch_is_off() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        write_switch(dir.path(), false);
+        let (install, calls) = recorder();
+
+        ensure_watchman_installed(dir.path(), home.path(), &install);
+
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// 开关开着、plist 缺失 → 装。这是 `board/create` 时代那段行为的通用落点：
+    /// 全新安装后用户应当得到登录自启。
+    #[test]
+    fn installs_when_the_switch_is_on_and_no_plist_points_at_this_exe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        write_switch(dir.path(), true);
+        let (install, calls) = recorder();
+
+        ensure_watchman_installed(dir.path(), home.path(), &install);
+
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    /// 已经指向当前 exe 就不再装：重复 bootstrap 会打断正在跑的值守。
+    #[test]
+    fn does_not_reinstall_when_the_plist_already_points_at_this_exe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        write_switch(dir.path(), true);
+        let exe = std::env::current_exe().unwrap();
+        let plist = yi_agent_supervisors::watchman::plist_path(home.path());
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(
+            &plist,
+            yi_agent_supervisors::watchman::plist_contents(&exe, home.path()),
+        )
+        .unwrap();
+        let (install, calls) = recorder();
+
+        ensure_watchman_installed(dir.path(), home.path(), &install);
+
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// 装失败不 panic、不外抛：best-effort 的语义就是「记一笔，继续」。
+    #[test]
+    fn a_failing_install_is_swallowed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        write_switch(dir.path(), true);
+        let install: WatchmanInstall =
+            Arc::new(|_exe: &Path, _home: &Path| Err("launchctl bootstrap failed".to_string()));
+
+        ensure_watchman_installed(dir.path(), home.path(), &install);
     }
 }

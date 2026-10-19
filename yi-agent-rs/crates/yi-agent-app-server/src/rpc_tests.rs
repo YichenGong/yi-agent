@@ -17018,6 +17018,19 @@ async fn plugin_install_resolves_the_command_and_writes_what_the_plugin_describe
         "plugin/install must ask for the project's daemon once the manifest is durable"
     );
 
+    // 登录自启：`board/create` 时代由建板路径 best-effort 安装，那条路径随域
+    // 删除后必须有通用替代落点，否则全新安装不再有登录自启、旧 plist 也无人清理。
+    let watchman = h
+        .watchman_calls
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    assert_eq!(
+        watchman,
+        vec![(true, h._watchman_home.path().to_path_buf())],
+        "a successful plugin install must ensure the resident watchman is installed"
+    );
+
     h.shutdown().await;
 }
 

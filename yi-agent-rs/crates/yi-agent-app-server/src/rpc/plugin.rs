@@ -330,6 +330,24 @@ pub(crate) async fn handle_shared(
                     "the daemon-start task failed: {error}"
                 ),
             }
+            // 值守的登录项：`board/create` 时代由建板路径 best-effort 安装，那
+            // 条路径随域删除后没有替代落点。安装一个需要常驻的插件正是它的通用
+            // 对应物——开关为开、plist 未指向当前 exe 时装一次。
+            //
+            // 放在安装收尾：`launchctl` 是同步子进程，别让一次安装卡住 async worker。
+            // 失败只 warn：清单与开关已经落盘，登录自启装不上不该把成功改成失败。
+            {
+                let workdir = state.theme_handle.workdir().to_path_buf();
+                let home = state.watchman_home.clone();
+                let install = std::sync::Arc::clone(&state.watchman_install);
+                if let Err(error) = tokio::task::spawn_blocking(move || {
+                    crate::server::ensure_watchman_installed(&workdir, &home, &install)
+                })
+                .await
+                {
+                    tracing::warn!(%error, "the watchman-install task failed");
+                }
+            }
             write_or_fatal(
                 state,
                 id.clone(),

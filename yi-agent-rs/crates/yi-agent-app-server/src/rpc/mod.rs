@@ -117,10 +117,10 @@ pub(crate) enum Flow {
 /// `plugin_command` 字段因此无人读，已删除：一个只写不读的字段只是把「宿主认识
 /// 某个插件」这件事藏起来，而不是消掉它。
 ///
-/// 其余字段（`resident_dir` / `watchman_home` / `watchman_install`）在 `board/*`
-/// 域删除后**暂时没有读者**：它们原先只被 `board/create` 读。保留是因为它们是
-/// 通用常驻登记目录与通用值守句柄，`ui/*` 的开关臂经 [`AppState`] 也在用同一对
-/// 句柄，其通用性不依赖看板。
+/// 其余字段（`resident_dir` / `watchman_home` / `watchman_install`）：`resident_dir`
+/// 在 `board/*` 删除后暂时没有读者，保留因为它是通用常驻登记目录；`watchman_home`
+/// 与 `watchman_install` 由 `plugin/install` 的收尾读取（通用值守登录项）。
+/// `ui/*` 的开关臂经 [`AppState`] 也在用同一对句柄，其通用性不依赖看板。
 pub(crate) struct PluginChannelState {
     pub(crate) hub: std::sync::Arc<crate::broadcast::Broadcaster>,
     pub(crate) client: crate::broadcast::ClientId,
@@ -128,11 +128,9 @@ pub(crate) struct PluginChannelState {
     #[allow(dead_code)]
     pub(crate) resident_dir: std::path::PathBuf,
     pub(crate) theme_handle: crate::theme_tool::ThemeHandle,
-    /// 值守安装/卸载所针对的 home。见结构文档：`board/*` 删除后暂无读者。
-    #[allow(dead_code)]
+    /// 值守安装所针对的 home。由 `plugin/install` 的收尾读取。
     pub(crate) watchman_home: std::path::PathBuf,
-    /// 安装句柄。见结构文档：`board/*` 删除后暂无读者。
-    #[allow(dead_code)]
+    /// 安装句柄。由 `plugin/install` 的收尾读取。
     pub(crate) watchman_install: crate::server::WatchmanInstall,
     /// 按名字解析插件可执行文件（`plugin/install` 的第二步）。见
     /// [`crate::server::ResolvePlugin`]。
