@@ -863,8 +863,9 @@ impl Daemon {
         drop(repository);
         let coordinator = Arc::new(RuntimeCoordinator::open(database_path.as_ref(), factory)?);
         // A fresh daemon starts with no plugin routes; the supervisor republishes
-        // them as soon as it reconciles.
-        clear_plugin_sockets();
+        // them as soon as it reconciles. Only this project's routes are dropped:
+        // another project's daemon in the same process keeps serving.
+        clear_plugin_sockets(runtime_dir);
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
         // Record the socket node's identity so the exit path can tell our node
@@ -889,7 +890,7 @@ impl Daemon {
         let client_handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         let listener_handlers = Arc::clone(&client_handlers);
         let database_path = database_path.as_ref().to_path_buf();
-        let request_context = Arc::new(RequestContext::new(&database_path)?);
+        let request_context = Arc::new(RequestContext::new(runtime_dir, &database_path)?);
         let watched_runtime_dir = runtime_dir.to_path_buf();
         let cleanup_socket = socket_path.clone();
         let cleanup_lock = lock_path.clone();
@@ -3137,36 +3138,67 @@ const PLUGIN_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// about manifests or plugin names. An entry exists only while its process is
 /// actually running and its manifest declared a socket, so a request can never
 /// name an arbitrary path on the machine.
-static PLUGIN_SOCKETS: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+///
+/// The table is keyed by **project** (its runtime directory), not just by plugin
+/// name. One process can host several daemons: the desktop app-server attaches a
+/// runtime per project it touches, each with its own supervisor thread. Those
+/// threads publish independently, and a project with no manifests publishes an
+/// empty list. With a single flat table that empty publish erased every other
+/// project's routes, so a plugin query flipped between "served" and "plugin is
+/// not running" on the reconcile interval. Keying by scope makes each project's
+/// publication affect only that project.
+static PLUGIN_SOCKETS: Mutex<Vec<(PathBuf, Vec<(String, PathBuf)>)>> = Mutex::new(Vec::new());
 
-/// Replace the forwarding table. Called on every supervisor reconcile, so a
-/// stopped or undeclared plugin disappears from the table by omission.
-pub fn register_plugin_sockets(entries: Vec<(String, PathBuf)>) {
-    *PLUGIN_SOCKETS.lock().expect("plugin socket table poisoned") = entries;
+/// The identity of one project's daemon: its runtime directory.
+///
+/// Canonicalized when the directory exists so a supervisor and the daemon it
+/// feeds agree on the key even if one side spells the path differently
+/// (symlinks, a relative `YI_AGENT_RUNTIME_DIR`). A path that does not exist yet
+/// is kept verbatim: the daemon creates it before serving, and the supervisor
+/// derives the same value.
+fn scope_key(scope: &Path) -> PathBuf {
+    std::fs::canonicalize(scope).unwrap_or_else(|_| scope.to_path_buf())
 }
 
-/// Drop every entry. Called when a daemon starts so a previous process in the
-/// same address space cannot leave a stale route behind.
-pub fn clear_plugin_sockets() {
-    register_plugin_sockets(Vec::new());
+/// Replace this project's forwarding table. Called on every supervisor
+/// reconcile, so a stopped or undeclared plugin disappears from the table by
+/// omission — while another project's routes are untouched.
+pub fn register_plugin_sockets(scope: &Path, entries: Vec<(String, PathBuf)>) {
+    let scope = scope_key(scope);
+    let mut table = PLUGIN_SOCKETS.lock().expect("plugin socket table poisoned");
+    match table.iter_mut().find(|(key, _)| *key == scope) {
+        Some((_, routes)) => *routes = entries,
+        None => table.push((scope, entries)),
+    }
 }
 
-/// The socket currently registered for `plugin`, if any.
+/// Drop every route belonging to this project. Called when its daemon starts so
+/// a previous process in the same address space cannot leave a stale route
+/// behind. Other projects' routes are left alone.
+pub fn clear_plugin_sockets(scope: &Path) {
+    let scope = scope_key(scope);
+    let mut table = PLUGIN_SOCKETS.lock().expect("plugin socket table poisoned");
+    table.retain(|(key, _)| *key != scope);
+}
+
+/// The socket currently registered for `plugin` in `scope`, if any.
 ///
 /// The read side of the forwarding table. It exists so a caller can assert that
 /// a route is present (or gone) without issuing a request — the supervision
 /// contract says a stopped supervisor leaves no routes behind, and that has to
 /// be checkable from outside this module.
-pub fn plugin_socket_for(plugin: &str) -> Option<PathBuf> {
-    plugin_socket(plugin)
+pub fn plugin_socket_for(scope: &Path, plugin: &str) -> Option<PathBuf> {
+    plugin_socket(scope, plugin)
 }
 
-fn plugin_socket(plugin: &str) -> Option<PathBuf> {
+fn plugin_socket(scope: &Path, plugin: &str) -> Option<PathBuf> {
+    let scope = scope_key(scope);
     PLUGIN_SOCKETS
         .lock()
         .expect("plugin socket table poisoned")
         .iter()
-        .find(|(name, _)| name == plugin)
+        .find(|(key, _)| *key == scope)
+        .and_then(|(_, routes)| routes.iter().find(|(name, _)| name == plugin))
         .map(|(_, path)| path.clone())
 }
 
@@ -3176,11 +3208,12 @@ fn plugin_socket(plugin: &str) -> Option<PathBuf> {
 /// accepting a caller-supplied path would turn this into a proxy for any local
 /// socket. Unknown, undeclared, or not-running plugins are a structured error.
 fn forward_plugin_query(
+    scope: &Path,
     plugin: &str,
     method: &str,
     params: serde_json::Value,
 ) -> Result<IpcResponse, IpcError> {
-    let Some(socket) = plugin_socket(plugin) else {
+    let Some(socket) = plugin_socket(scope, plugin) else {
         return Err(IpcError::PluginUnavailable {
             plugin: plugin.to_string(),
         });
@@ -3262,13 +3295,16 @@ pub(crate) struct RequestContext {
     repository: std::sync::Mutex<RuntimeRepository>,
     reconciled_at: std::sync::Mutex<Option<Instant>>,
     reconcile_window: Duration,
+    /// 本 daemon 的项目身份：它的 runtime 目录。插件路由按它分区，因为同一个
+    /// 进程可能替多个项目各起一个 daemon（桌面 app-server 就是如此）。
+    scope: PathBuf,
 }
 
 /// 同一窗口内的并发请求合并成一次对账。
 const RECONCILE_WINDOW: Duration = Duration::from_millis(5);
 
 impl RequestContext {
-    pub(crate) fn new(database_path: &Path) -> Result<Self, IpcError> {
+    pub(crate) fn new(scope: &Path, database_path: &Path) -> Result<Self, IpcError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
@@ -3276,6 +3312,7 @@ impl RequestContext {
         Ok(Self {
             runtime,
             repository: std::sync::Mutex::new(repository),
+            scope: scope.to_path_buf(),
             reconciled_at: std::sync::Mutex::new(None),
             reconcile_window: RECONCILE_WINDOW,
         })
@@ -3441,7 +3478,7 @@ fn respond(
             plugin,
             method,
             params,
-        } => forward_plugin_query(&plugin, &method, params),
+        } => forward_plugin_query(&context.scope, &plugin, &method, params),
         IpcRequest::DeleteSchedule { schedule_id } => {
             if !context.with_repository(|repository| {
                 repository
@@ -4593,8 +4630,9 @@ mod plugin_query_tests {
     #[test]
     fn an_undeclared_plugin_is_a_structured_error_not_a_panic() {
         let _guard = exclusive();
-        clear_plugin_sockets();
-        let error = forward_plugin_query("nobody", "list", serde_json::json!({}))
+        let scope = tempfile::tempdir().unwrap();
+        clear_plugin_sockets(scope.path());
+        let error = forward_plugin_query(scope.path(), "nobody", "list", serde_json::json!({}))
             .expect_err("an unknown plugin must not be forwarded to");
         assert!(matches!(error, IpcError::PluginUnavailable { .. }));
         assert_eq!(ipc_error_code(&error), IpcErrorCode::NotFound);
@@ -4609,11 +4647,12 @@ mod plugin_query_tests {
             socket.clone(),
             r#"{"type":"plugin.result","value":{"cards":[{"id":"a"}]}}"#,
         );
-        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+        register_plugin_sockets(dir.path(), vec![("demo".to_string(), socket)]);
 
         // The daemon adds no interpretation: whatever the plugin put in `value`
         // comes back verbatim, including nested objects it knows nothing about.
-        let response = forward_plugin_query("demo", "list", serde_json::json!({"x": 1})).unwrap();
+        let response =
+            forward_plugin_query(dir.path(), "demo", "list", serde_json::json!({"x": 1})).unwrap();
         match response {
             IpcResponse::PluginResult { value } => {
                 assert_eq!(value["cards"][0]["id"], "a");
@@ -4621,7 +4660,7 @@ mod plugin_query_tests {
             other => panic!("expected a plugin result, got {other:?}"),
         }
         handle.join().unwrap();
-        clear_plugin_sockets();
+        clear_plugin_sockets(dir.path());
     }
 
     #[test]
@@ -4642,15 +4681,21 @@ mod plugin_query_tests {
                 let _ = stream.write_all(b"{\"type\":\"plugin.result\",\"value\":1}\n");
             }
         });
-        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+        register_plugin_sockets(dir.path(), vec![("demo".to_string(), socket)]);
 
-        forward_plugin_query("demo", "switch.write", serde_json::json!({"on": true})).unwrap();
+        forward_plugin_query(
+            dir.path(),
+            "demo",
+            "switch.write",
+            serde_json::json!({"on": true}),
+        )
+        .unwrap();
         handle.join().unwrap();
 
         let sent: serde_json::Value = serde_json::from_str(seen.lock().unwrap().trim()).unwrap();
         assert_eq!(sent["method"], "switch.write");
         assert_eq!(sent["params"]["on"], true);
-        clear_plugin_sockets();
+        clear_plugin_sockets(dir.path());
     }
 
     #[test]
@@ -4667,13 +4712,13 @@ mod plugin_query_tests {
                 let _ = reader.read_line(&mut line);
             }
         });
-        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+        register_plugin_sockets(dir.path(), vec![("demo".to_string(), socket)]);
 
-        let error = forward_plugin_query("demo", "list", serde_json::json!({}))
+        let error = forward_plugin_query(dir.path(), "demo", "list", serde_json::json!({}))
             .expect_err("a silent plugin must not look like success");
         assert!(matches!(error, IpcError::PluginRefused { .. }));
         handle.join().unwrap();
-        clear_plugin_sockets();
+        clear_plugin_sockets(dir.path());
     }
 
     #[test]
@@ -4682,13 +4727,13 @@ mod plugin_query_tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("plugin.sock");
         let handle = serve_once(socket.clone(), r#"{"type":"plugin.error"}"#);
-        register_plugin_sockets(vec![("demo".to_string(), socket)]);
+        register_plugin_sockets(dir.path(), vec![("demo".to_string(), socket)]);
 
-        let error = forward_plugin_query("demo", "enqueue", serde_json::json!({}))
+        let error = forward_plugin_query(dir.path(), "demo", "enqueue", serde_json::json!({}))
             .expect_err("a plugin-side refusal is not a result");
         assert_eq!(ipc_error_code(&error), IpcErrorCode::Validation);
         handle.join().unwrap();
-        clear_plugin_sockets();
+        clear_plugin_sockets(dir.path());
     }
 
     #[test]
@@ -4697,23 +4742,86 @@ mod plugin_query_tests {
         // Republishing with an empty list is how a stop is expressed.
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("plugin.sock");
-        register_plugin_sockets(vec![("demo".to_string(), socket)]);
-        assert!(plugin_socket("demo").is_some());
-        register_plugin_sockets(vec![]);
-        assert!(plugin_socket("demo").is_none());
+        register_plugin_sockets(dir.path(), vec![("demo".to_string(), socket)]);
+        assert!(plugin_socket(dir.path(), "demo").is_some());
+        register_plugin_sockets(dir.path(), vec![]);
+        assert!(plugin_socket(dir.path(), "demo").is_none());
+    }
+
+    /// 回归测试：桌面 app-server 在**一个进程**里跑多个项目的 daemon，每个项目
+    /// 各有自己的监督线程。只有装了插件的那个项目才有清单，其余项目的
+    /// reconcile 发布的是空表。空表不得抹掉别的项目的路由，否则看板查询会以
+    /// 约 0.4s 的周期在"能读到"和"插件未运行"之间抖动。
+    #[test]
+    fn an_empty_publish_from_one_project_does_not_erase_another_projects_route() {
+        let _guard = exclusive();
+        let kanban = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let socket = PathBuf::from("/tmp/kanban.sock");
+
+        register_plugin_sockets(kanban.path(), vec![("demo".to_string(), socket.clone())]);
+        // The other project has no manifests, so its supervisor publishes nothing.
+        register_plugin_sockets(other.path(), Vec::new());
+
+        assert_eq!(
+            plugin_socket(kanban.path(), "demo"),
+            Some(socket.clone()),
+            "another project's empty reconcile must not erase this route"
+        );
+        assert_eq!(
+            plugin_socket(other.path(), "demo"),
+            None,
+            "routes must not leak across projects"
+        );
+        clear_plugin_sockets(kanban.path());
+    }
+
+    /// 一个项目的 daemon 退出只清自己的路由；别的项目的 daemon 仍在服务。
+    #[test]
+    fn clearing_one_project_leaves_another_projects_routes_alone() {
+        let _guard = exclusive();
+        let kanban = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        register_plugin_sockets(
+            kanban.path(),
+            vec![("demo".to_string(), PathBuf::from("/tmp/a.sock"))],
+        );
+        register_plugin_sockets(
+            other.path(),
+            vec![("demo".to_string(), PathBuf::from("/tmp/b.sock"))],
+        );
+
+        clear_plugin_sockets(kanban.path());
+
+        assert_eq!(plugin_socket(kanban.path(), "demo"), None);
+        assert_eq!(
+            plugin_socket(other.path(), "demo"),
+            Some(PathBuf::from("/tmp/b.sock"))
+        );
+        clear_plugin_sockets(other.path());
     }
 
     #[test]
     fn plugin_query_positions_a_verified_socket_are_not_reused_across_plugins() {
         let _guard = exclusive();
-        register_plugin_sockets(vec![
-            ("a".to_string(), PathBuf::from("/tmp/a.sock")),
-            ("b".to_string(), PathBuf::from("/tmp/b.sock")),
-        ]);
-        assert_eq!(plugin_socket("a"), Some(PathBuf::from("/tmp/a.sock")));
-        assert_eq!(plugin_socket("b"), Some(PathBuf::from("/tmp/b.sock")));
-        assert_eq!(plugin_socket("c"), None);
-        clear_plugin_sockets();
+        let dir = tempfile::tempdir().unwrap();
+        register_plugin_sockets(
+            dir.path(),
+            vec![
+                ("a".to_string(), PathBuf::from("/tmp/a.sock")),
+                ("b".to_string(), PathBuf::from("/tmp/b.sock")),
+            ],
+        );
+        assert_eq!(
+            plugin_socket(dir.path(), "a"),
+            Some(PathBuf::from("/tmp/a.sock"))
+        );
+        assert_eq!(
+            plugin_socket(dir.path(), "b"),
+            Some(PathBuf::from("/tmp/b.sock"))
+        );
+        assert_eq!(plugin_socket(dir.path(), "c"), None);
+        clear_plugin_sockets(dir.path());
     }
 }
 
@@ -4815,7 +4923,7 @@ mod request_context_tests {
     fn a_request_context_reuses_one_repository() {
         let dir = tempfile::tempdir().unwrap();
         let database_path = dir.path().join("runtime.sqlite");
-        let context = RequestContext::new(&database_path).expect("context builds");
+        let context = RequestContext::new(dir.path(), &database_path).expect("context builds");
         // 同一个连接可重复使用；两次读取给出同一个 schema 版本。
         let first = context
             .with_repository(|repository| repository.schema_version().map_err(IpcError::from))
@@ -4841,7 +4949,8 @@ mod request_context_tests {
         let factory: Arc<dyn AgentWorkerFactory> = Arc::new(UnavailableWorkerFactory);
         let coordinator =
             Arc::new(RuntimeCoordinator::open(&database_path, factory).expect("coordinator opens"));
-        let context = Arc::new(RequestContext::new(&database_path).expect("context builds"));
+        let context =
+            Arc::new(RequestContext::new(dir.path(), &database_path).expect("context builds"));
 
         let slow_context = Arc::clone(&context);
         let slow = thread::spawn(move || {

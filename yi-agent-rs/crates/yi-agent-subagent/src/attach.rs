@@ -256,7 +256,11 @@ pub fn attach_project_runtime(
             workspace,
         },
         embedded_daemon,
-        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(&cfg.workdir, owns_daemon),
+        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+            &cfg.workdir,
+            &runtime_dir,
+            owns_daemon,
+        ),
     })
 }
 
