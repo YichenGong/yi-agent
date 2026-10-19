@@ -123,6 +123,26 @@ describe("SettingsDialog", () => {
     expect(await screen.findByText("user-skill")).toBeTruthy();
   });
 
+  it("shows a MCP tab backed by the injected mcpCall", async () => {
+    const mcpCall = async () => ({
+      configured: true,
+      path: "/p/.yi-agent/mcp.json",
+      enabled: true,
+      servers: [{ name: "horizon-websearch", kind: "http", url: "https://x/mcp", tools: null }],
+    });
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        mcpCall={mcpCall}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "MCP" }));
+    expect(await screen.findByText("horizon-websearch")).toBeTruthy();
+  });
+
   it("shows the 标签 tab and forwards a name edit", async () => {
     const saveTagName = vi.fn();
     render(
@@ -141,10 +161,10 @@ describe("SettingsDialog", () => {
     expect(saveTagName).toHaveBeenCalledWith("red", "紧急");
   });
 
-  it("lists all six categories on the desktop", () => {
+  it("lists all seven categories on the desktop", () => {
     render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
     const names = screen.getAllByRole("tab").map((t) => t.textContent);
-    expect(names).toEqual(["通用", "远程访问", "插件", "模型", "技能", "标签"]);
+    expect(names).toEqual(["通用", "远程访问", "插件", "模型", "技能", "MCP", "标签"]);
   });
 });
 
@@ -275,6 +295,7 @@ describe("SettingsDialog phone layout hooks", () => {
       "plugins",
       "models",
       "skills",
+      "mcp",
       "tags",
     ]);
   });

@@ -89,6 +89,42 @@ describe("ModelPicker", () => {
     expect(trigger.textContent).toContain("model-a");
   });
 
+  it("renders one row, not two, when an entry's display name matches the default's model string", async () => {
+    // 用户机器上的真实情形：条目显示名 == 模型串 == 全局默认（HORIZON-DeepSeek）。
+    // 展开下拉时，模型标识不得出现两次。
+    const colliding: ModelList = {
+      models: [
+        {
+          name: "HORIZON-DeepSeek",
+          provider: "openai",
+          api_url: "https://llmapi.horizon.auto",
+          model: "HORIZON-DeepSeek",
+          has_key: true,
+          api_key_masked: "••••",
+        },
+      ],
+      default_model: "HORIZON-DeepSeek",
+      subagent_model: "HORIZON-DeepSeek",
+      effective: null,
+    };
+    const { call } = seam({ catalog: colliding });
+    render(
+      <ModelPicker
+        call={call}
+        threadId="t1"
+        currentRef={null}
+        currentModel="HORIZON-DeepSeek"
+        onChanged={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /模型/ }));
+    const rows = screen
+      .getAllByRole("menuitemradio")
+      .filter((el) => (el.textContent ?? "").includes("HORIZON-DeepSeek"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toContain("跟随全局默认");
+  });
+
   it("sends thread/setModel with the picked entry and reports the server's model for that thread", async () => {
     const { call, calls } = seam({ effective: "model-b" });
     const onChanged = vi.fn();

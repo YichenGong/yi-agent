@@ -62,22 +62,36 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
 - [x] 端到端装配契约 — `tests/attach_delegation.rs`：干净 git 项目 attach → 激活两次
   （证明幂等）→ 注册的委派工具存在 → `SpawnApplicationChild` 被 daemon 接纳并返回
   child task id → detach；这是 TUI 与 app-server 共用的那条链路的可执行说明
-- [x] `spawn_agent` 的 `fork` 参数与调用者上下文 fork — 两个 spawn 工具新增 `fork`
-  （`boolean`，`default:false`，`required` 仍只有 `task`，显式非布尔值报错而非忽略）；
-  `CallerContext`（`src/lib.rs:1296`）持调用者会话的**活 `Arc<Mutex<Session>>`**，
-  每次调用经 `snapshot()` 读取「此刻」的 `forkable_messages`（协议有效性裁剪，末位悬空
-  `tool_use` 丢弃），故 Agent 重建/compact 不会让工具读到陈旧转录；`fork:true` 时
-  `upload_forked_context`（`src/lib.rs:1564`）把 JSON 历史按 256 KiB 原始切片（`FORK_CHUNK_BYTES`）
-  base64 后逐块 `BeginForkUpload`/`AppendForkChunk`，返回的 `fork_token` 填进
-  `SpawnApplicationChild`；`fork:false`（或省略）逐字节走原路径、不建上传。任何
-  begin 之后的失败都 `abort_fork_upload` 回收 token（避免 daemon 进程内泄漏载荷）；
-  无绑定 caller 却要 fork 时显式报错 `fork requested but no caller context available`，
-  绝不静默回退。worker 侧 `start_with_provider_turn_gate`（`src/lib.rs:658`）在
+- [x] `spawn_agent` 的 `fork` 参数与调用者上下文 fork — `fork` 现在**默认开启**
+  （schema `default:true`，描述改为「子 agent 默认继承你的对话历史，`fork:false`
+  是从零开始的逃生口」；`required` 仍只有 `task`，显式非布尔值报错而非忽略），
+  省略即 fork；`CallerContext` 持调用者会话的**活
+  `Arc<Mutex<Session>>`**，每次调用经 `snapshot()` 读取「此刻」的 `forkable_messages`
+  （协议有效性裁剪，末位悬空 `tool_use` 丢弃），故 Agent 重建/compact 不会让工具读到
+  陈旧转录；fork 时 `upload_forked_context`（`src/lib.rs:1784`）把 JSON 历史按
+  256 KiB 原始切片（`FORK_CHUNK_BYTES`）base64 后逐块
+  `BeginForkUpload`/`AppendForkChunk`，返回的 `fork_token` 填进 `SpawnApplicationChild`；
+  任何 begin 之后的失败都 `abort_fork_upload` 回收 token（避免 daemon 进程内泄漏载荷）。
+  **降级语义按来源区分**（`ForkChoice`，`src/lib.rs:1672`）：显式 `fork:true`
+  遇 fork 不可行仍报错（无绑定 caller → `fork requested but no caller context available`）；
+  默认路径（省略 `fork`）遇到任何 fork 失败都 `tracing::warn!` 后回落无 fork，
+  spawn 照常成功并返回 `forked:false`。注意 `forked:false` 同时覆盖「显式
+  `fork:false`」与「默认路径降级」两种情形（字段只证明子 agent 无继承上下文，
+  不区分原因，原因只在客户端 `tracing::warn!` 里）。降级**不分类错误、不镜像 daemon 上限**：
+  上限是 daemon 策略、可经 `YI_AGENT_FORK_MAX_BYTES` 覆盖，客户端硬编码会漂移；
+  且超限在第一个 `BeginForkUpload` 就被拒（分配 token 之前），而 fork 上传发生在
+  spawn 请求之前，故降级只需把 `fork_token` 置 `None`，spawn 总共只发一次。
+  worker 侧 `start_with_provider_turn_gate`（`src/lib.rs:721`）在
   `with_session(Session::from_messages(fork))` **之后** `worker_caller.bind(session_handle())`，
-  把子 worker 自己的委派工具绑到其实时会话（顺带支持子 agent fork 自己）。验证：
-  `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent --test subagent_fork_e2e`
-  （后者经**真实注册工具 + 真实 daemon + 真实 worker 工厂**，断言子 worker 首个 provider
-  请求含父历史且 objective 居后，省略 `fork` 时只含 objective）— [设计](../superpowers/specs/2026-10-02-subagent-context-fork-design.md)
+  把子 worker 自己的委派工具绑到其实时会话（顺带支持子 agent fork 自己）。模型面对
+  的规则写在**两处**：工具 schema 的 `fork` 描述，以及系统提示词
+  `AgentConfig::default_system_prompt()` 的 "Subagent integration" 段
+  （`yi-agent-core/src/agent.rs:218`）。验证：
+  `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent-core --lib`、
+  `cargo test -p yi-agent --test subagent_fork_e2e`（后者经**真实注册工具 + 真实
+  daemon + 真实 worker 工厂**，断言省略 `fork` 时子 worker 首个 provider 请求含父历史、
+  `fork:false` 时只含 objective，且两种结果分别报 `forked:true`/`false`）
+  — [设计](../superpowers/specs/2026-10-18-subagent-fork-default-on-design.md)
 - [x] worker 工厂按 `subagent_model` 解析 provider/model — `worker_factory`（`src/attach.rs:88`）从**调用方注入的**机器级清单路径（新增 `models_path: &Path` 形参，经 `load_catalog_from` 读取；不再自取 `$HOME`）取 `subagent_entry`（缺省回退全局默认、再无则回退进程 cfg），经 `resolve_effective`（`src/attach.rs:113`）得到该条目的 provider/api_url/api_key/model 去 `build_provider`；改完 `subagent_model` 下次项目 daemon 重启生效。该路径经 `attach_project_runtime` / `ensure_owned_runtime` / `RuntimeBinding::managed` 从 app-server 的 `RuntimeAttachments.models_path` 与 CLI 的 `yi_agent_runtime::models::models_path()` 一路传入，使委派链路可被隔离测试（见 `docs/bug-list.md`「委派 worker 工厂重读 $HOME」条）。验证 `cargo test -p yi-agent-subagent --lib the_worker_uses_the_subagent_model_entry`、`cargo test -p yi-agent-subagent --lib the_worker_falls_back_to_the_global_default`、`cargo test -p yi-agent-subagent --lib the_public_worker_factory_reads_the_injected_catalog the_public_worker_factory_never_falls_back_to_home`
 
 **边界（两端口一致，故记在这里）：** attach 与工具注册**不看**项目是不是 git 仓库（非
@@ -87,6 +101,8 @@ app-server 侧的钉法是 `cargo test -p yi-agent-app-server
 a_non_git_cwd_attaches_in_place_with_the_delegation_tools`。
 
 - [x] daemon 工厂按指纹跟随模型清单（运行期热重载）— `DaemonAgentWorkerFactory::with_catalog_watcher(cfg, watcher)`（`src/lib.rs:231`）装一个 `WorkerRefresh`（`:121`）；worker start 时先用 `EffectiveKey::of`（`:98`，`resolve_effective` 覆盖的 6 字段）比对缓存，命中则复用，未命中则 `WorkerParts::rebuild`（`:55`）按当前清单重建 provider/tools/config/sandbox（装配口径与 `attach::build_worker_factory` 一致：skills-only 注册表 + 同一组 `bootstrap` 构造函数）；重建失败保留上一次可用派生件。**`new()` 签名逐字节不变**，未装刷新器的 22 处既有构造点行为不变（零回归）；`worker_config_model` 仅在无刷新器时生效，有刷新器时模型名来自当前清单条目。生产装配在 `attach.rs:156`（`build_worker_factory` 新增 `models_path` 形参后 `.with_catalog_watcher(cfg.clone(), CatalogWatcher::new(models_path))`）。验证：`cargo test -p yi-agent-subagent`（65 lib + 5 e2e，含 `a_watcher_backed_factory_follows_a_changed_subagent_model`、`a_factory_without_a_watcher_keeps_its_static_config`、`the_attached_worker_factory_follows_a_changed_catalog`、`the_attached_worker_factory_survives_a_corrupt_catalog`）；真机三步判据见 `yi-agent/tests/model_catalog_live_reload_e2e.rs` — [设计](../superpowers/specs/2026-10-17-model-catalog-live-reload-design.md)
+
+- [x] worker 工具注册的根集参数 + 「FS 根集 ≠ 沙箱可写根」 — `DaemonAgentWorkerFactory::worker_tool_registry`（`src/lib.rs:306`）/ `worker_tool_registry_with_base`（`src/lib.rs:328`）新增第 4 个参数 `inherited_roots: Vec<PathBuf>`（父会话下发的关联根，主根除外；空集即今天的单根 worker），把它并进 **FS 根集** `fs_roots = [worktree] + inherited_roots`（`src/lib.rs:339`）。**两个根集刻意分开**：`fs_roots` 进 FS 工具（`read`/`write`/`edit`/`glob`/`grep` 的多根校验），而 `git_writable_roots_for_worktree`（`src/lib.rs:1239`）产出的 git 内部目录**只**并入 shell 沙箱的额外可写根 `writable_roots`（`src/lib.rs:345`），**绝不**进 FS 根集——否则 `write` 能直写 `.git`（该约束写在 `src/lib.rs:355` 的注释里）。接线：`WorkerStart.extra_roots`（`yi-agent-rs/crates/yi-agent-core/src/subagent/worker.rs:97`）在 `start_with_provider_turn_gate` 里被取出并下传给注册函数（`src/lib.rs:766`）。ReadOnly 子任务只扩读、不注册写工具。验证：`cargo test -p yi-agent-subagent --lib coding_worker_gets_fs_tools_over_the_inherited_roots`、`--lib read_only_worker_inherits_roots_without_write_tools`、`--lib coding_worker_shell_sandbox_covers_the_inherited_roots`、`--lib fs_roots_stay_clear_of_the_git_roots_the_shell_sandbox_needs`、`--lib worker_start_hands_the_inherited_roots_to_its_fs_tools`（分别钉住 FS 工具覆盖关联根、只读不扩写、沙箱覆盖关联根、两集不混、`WorkerStart` 真到达 FS 工具）— [设计](../superpowers/specs/2026-10-17-linked-workspace-roots-design.md)
 
 **验证命令：** `cargo test -p yi-agent-subagent`（含 `binding::` 单测与
 `application_tools_share_one_binding`；依赖真 socket 的 `probe_reports_healthy_on_status`

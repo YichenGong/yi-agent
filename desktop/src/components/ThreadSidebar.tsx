@@ -3,6 +3,7 @@ import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup
 import { basename, groupCount, nestLinkedGroups } from "../lib/workspaceGroups";
 import { kanbanItemFor } from "../lib/boardIndex";
 import { useSpinPhase } from "../lib/useSpinPhase";
+import { countRunningSessions, runningSessionsLabel } from "../lib/runningSessions";
 import { supportsWaapi } from "../lib/spinPhase";
 import { clampSidebarWidth, loadSidebarWidth, saveSidebarWidth } from "../lib/sidebarWidth";
 import { isImeEnter, useImeGuard } from "../lib/imeEnter";
@@ -12,6 +13,7 @@ import { formatRelativeTime } from "../lib/relativeTime";
 import { filterThreadTree } from "../lib/threadSearch";
 import { Popover } from "../ui/Popover";
 import { findLeadThread } from "../lib/leadThread";
+import { LeadAvatar } from "./LeadAvatar";
 import { TAG_DOT_CLASS, TAG_IDS, isValidTagId, tagLabel, type TagId } from "../lib/threadTags";
 
 function unreadDotClass(status: TurnStatus): string {
@@ -77,6 +79,41 @@ export const StatusBadge = memo(function StatusBadge({
     />
   );
 }, (prev, next) => prev.status === next.status && prev.stale === next.stale);
+
+/**
+ * footer 里的「此刻有几个会话在跑」读数,紧挨设置齿轮。
+ *
+ * 与 `StatusBadge` 共用 `useSpinPhase`(相位锚定墙钟),避免 CSS 动画在节点重排时
+ * 从头播放的视觉回退。恒为 running 形态:它只在计数 > 0 时出现,不存在
+ * `awaiting_approval` 形态(那种会话根本不计入)。
+ *
+ * 计数为 0 时整个节点不渲染,footer 与改动前逐像素一致。
+ */
+function ActiveSessionCount({ count, stale = false }: { count: number; stale?: boolean }) {
+  const ref = useRef<HTMLSpanElement>(null);
+  useSpinPhase(ref, count > 0);
+  if (count === 0) return null;
+  const label = runningSessionsLabel(count);
+  const cssFallback = !supportsWaapi();
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      aria-label={label}
+      title={stale ? `${label}（可能过期）` : label}
+      className={`ml-2 flex min-w-0 items-center gap-1.5 text-xs text-fg-subtle ${
+        stale ? "opacity-40" : ""
+      }`}
+    >
+      <span
+        ref={ref}
+        aria-hidden="true"
+        className={`shrink-0 rounded-full ${cssFallback ? "animate-spin" : ""} size-3 border-2 border-line-strong border-t-fg`}
+      />
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
 
 export function ThreadSidebar({
   groups,
@@ -194,6 +231,7 @@ export function ThreadSidebar({
   // The rename field is a plain text input, so an IME confirm-Enter must not
   // commit the draft (and unmount the field) mid-composition.
   const ime = useImeGuard();
+  const runningCount = countRunningSessions(statuses);
 
   const onHandleDown = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -671,27 +709,27 @@ export function ThreadSidebar({
           onOpenBoard(workspace);
         }}
         className={`flex cursor-pointer items-center gap-2 px-3 py-2 text-sm ${
-          active ? "bg-neutral-800 text-neutral-100" : "text-neutral-400 hover:bg-neutral-800/50"
+          active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
         }`}
       >
         <span className="shrink-0">看板</span>
         {/* 摘要是这一眼要看的全部：排队几件、在跑几件。 */}
         {boardSummaries[workspace] ? (
-          <span className="truncate text-xs text-neutral-500">{boardSummaries[workspace]}</span>
+          <span className="truncate text-xs text-fg-subtle">{boardSummaries[workspace]}</span>
         ) : null}
       </div>
     );
   };
 
   /**
-   * 项目组内的「看板会话」小节：只收 `card_id` 非空的会话，默认折叠。
+   * 项目组内的「看板会话」小节：只收 `driver_ref` 非空的会话，默认折叠。
    * 折叠状态独立于项目组（键 `board:${workspace}`），互不牵连。
    *
    * 刻意不依赖看板是否仍登记：看板被移除后（spec §5），卡片会话仍须留在这个
    * 小节里可见，绝不能因为 `kanbanItemFor` 变 null 就整批消失。
    */
   const renderBoardThreads = (g: WorkspaceGroup) => {
-    const cards = g.threads.filter((t) => !t.pinned && t.card_id && t.thread_id !== leadId);
+    const cards = g.threads.filter((t) => !t.pinned && t.driver_ref && t.thread_id !== leadId);
     if (cards.length === 0) return null;
     // 搜索期间一律展开，且**关掉这一小节自身的折叠开关**：此时渲染忽略折叠态，
     // 点了看不到任何反馈，却会悄悄写进 `boardCollapsed`，清空搜索后视图就被改掉了。
@@ -723,8 +761,9 @@ export function ThreadSidebar({
 
   // 组长行：与普通会话行同构（同样的状态徽标、标题、相对时间、未读点、点击选
   // 中），只多一个 `data-lead-row` 标记并去掉图钉/删除按钮——组长是项目级的固
-  // 定入口，置顶与删除对它没有意义。带 `data-thread-row` 以便移动端长按与既有
-  // 样式规则照旧生效。
+  // 定入口，置顶与删除对它没有意义。仍带 `data-thread-row`（选中逻辑与样式
+  // 规则要用），但 `resolveSidebarPressTarget` 会因 `data-lead-row` 先返回 null，
+  // 故手机长按组长行**不会**弹出会话菜单。
   const renderLeadRow = (t: ThreadSummary) => {
     const active = t.thread_id === currentId;
     const st = statuses.get(t.thread_id) ?? "idle";
@@ -743,6 +782,7 @@ export function ThreadSidebar({
           active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
         } cursor-pointer`}
       >
+        <LeadAvatar />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1.5">
             <StatusBadge status={st} stale={statusStale} />
@@ -897,7 +937,7 @@ export function ThreadSidebar({
                   if (kanbanItemFor(g.workspace, boards)) onRemoveBoard(g.workspace);
                   else onCreateBoard(g.workspace);
                 }}
-                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-neutral-200 hover:bg-neutral-700"
+                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
               >
                 {kanbanItemFor(g.workspace, boards) ? "移除看板" : "创建 Superpowers 看板"}
               </button>
@@ -951,7 +991,7 @@ export function ThreadSidebar({
         {!isCollapsed &&
           g.threads
             // 组长行单独渲染在列表最顶部（见 renderLeadRow），组内不再重复一条。
-            .filter((t) => !t.pinned && !t.card_id && t.thread_id !== leadId)
+            .filter((t) => !t.pinned && !t.driver_ref && t.thread_id !== leadId)
             .map((t) => renderThread(t, { rowAttr: "group", indentLevel: isChild ? 2 : 0 }))}
         {children.map((child) => renderGroupNode(child, [], 1))}
       </div>
@@ -1110,6 +1150,7 @@ export function ThreadSidebar({
             <path d="M6.9 1.3a.7.7 0 0 0-.7.6l-.1.9a5.4 5.4 0 0 0-.9.5l-.9-.3a.7.7 0 0 0-.8.3l-.7 1.2a.7.7 0 0 0 .1.9l.7.6a5.5 5.5 0 0 0 0 1l-.7.6a.7.7 0 0 0-.1.9l.7 1.2a.7.7 0 0 0 .8.3l.9-.3c.3.2.6.4.9.5l.1.9a.7.7 0 0 0 .7.6h1.4a.7.7 0 0 0 .7-.6l.1-.9c.3-.1.6-.3.9-.5l.9.3a.7.7 0 0 0 .8-.3l.7-1.2a.7.7 0 0 0-.1-.9l-.7-.6a5.5 5.5 0 0 0 0-1l.7-.6a.7.7 0 0 0 .1-.9l-.7-1.2a.7.7 0 0 0-.8-.3l-.9.3a5.4 5.4 0 0 0-.9-.5l-.1-.9a.7.7 0 0 0-.7-.6H6.9Zm1.1 8a1.6 1.6 0 1 1 0-3.2 1.6 1.6 0 0 1 0 3.2Z" />
           </svg>
         </button>
+        <ActiveSessionCount count={runningCount} stale={statusStale} />
       </div>
       <div
         role="separator"

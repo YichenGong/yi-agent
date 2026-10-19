@@ -1,7 +1,7 @@
 # 项目组长 Agent（Project Lead）设计
 
 日期：2026-10-17
-状态：P1/P2 已实现并合入，P3 待实现
+状态：P1/P2 已实现并合入；P3-A（视野工具）已实现（见 2026-10-18-project-lead-agent-p3-view-design.md）；P3-B（写动作：取消/打回）与 P3-C（移动端缺口）已实现（见 2026-10-18-project-lead-agent-p3-control-design.md）
 模块：`yi-agent-app-server`、`yi-agent-subagent`、`desktop`、移动端远程
 关联：`docs/project-management/yi-agent-app-server.md`、`docs/project-management/subagent-runtime.md`、
 `docs/project-management/desktop.md`
@@ -320,8 +320,9 @@ lead 起的 thread 必须遵守项目纪律（本项目即「开始任何动作�
 
 - lead 在侧栏是一个独立条目（IM 式头像），点开是一个与普通 thread 同构的对话框
   （复用 `desktop/src/components/ChatView.tsx`、`ThreadSidebar.tsx`）。
-- lead 名下 thread 的分组：`thread/listAll` 已有「按目录分组 + `board_project`
-  跨目录折拢」的先例（`server.rs:3388`），lead 归属沿用同一形状。
+- lead 名下 thread 的分组：`thread/listAll` 已有「按目录分组 + `driver_project`
+  跨目录折拢」的先例（`server.rs:3388`；字段原名 `board_project`，G1 已通用化为
+  `driver_project`，旧 meta 靠 serde alias 读入），lead 归属沿用同一形状。
 - wire 侧 `thread_summary_json`（`server.rs:5943`）新增 `role` 与 `created_by` 字段。
 
 ### 9.2 移动端远程
@@ -384,6 +385,38 @@ IM 里看到并回应；桌面侧栏能看到 lead 条目。
 
 按需拉取工具（`lead_list_threads` / `lead_read_thread` 的完整形态）+ 权限留痕/撤销
 + 移动端远程。
+
+P3 拆成三块，**它们之间没有硬依赖**，可各自独立开发、独立验证、独立合并：
+
+- **P3-A 视野工具**（`lead_list_threads` / `lead_read_thread`，纯磁盘派）。
+  设计见 `docs/superpowers/specs/2026-10-18-project-lead-agent-p3-view-design.md`。
+  **完全独立**：纯新增只读工具，零 core 改动，不依赖 B / C。
+  **状态：已实现**（`docs/superpowers/plans/2026-10-18-project-lead-agent-p3-view.md`）。
+- **P3-B 权限留痕/可撤销**（§8 的写动作：取消 / 打回 / 改 objective）。
+  它的阻塞点**不是 A 或 C**，而是 §8 自身的前提已经失效：§8 要求写动作走
+  `review_agent` 强制 feedback、`accept` 只由 Git ancestry 观察完成，但当前代码里
+  `review_agent` **被测试强制不得注册**（`yi-agent-subagent/src/lib.rs:2343`：交付即完成，
+  验收是父自己的 git 动作）。因此 B 须先**重新定义「无 review 世界里的『打回』」**，
+  属高风险，单独一轮 spec。**已另开设计**：
+  `docs/superpowers/specs/2026-10-18-project-lead-agent-p3-control-design.md`
+  （`lead_interrupt_thread` / `lead_reject_thread`，独立反向通道 + 主循环消费）。
+- **P3-C 移动端（iOS）**。主体已随共用前端天然成立（侧栏 lead 行不按平台门控，
+  `desktop/src/components/ThreadSidebar.tsx:1103`）。真正缺口只有两点：①lead 行带
+  `data-thread-row`，手机长按会弹出「重命名 / 置顶 / 删除」菜单（后两项对组长无意义）；
+  ②§9.1 的「IM 式头像」所需的 `created_by` 字段不存在（`thread_store.rs` 只有 `role`）。
+  **与 A / B 无关**，属独立小修。**已并入上条 P3-B/C 设计**（同一份 spec 的 P3-C 节）。
+
+**软顺序（非硬前置）**：A 可最先落地；B 若做「打回」，会**顺手复用** A 的
+`lead_read_thread`（打回前先读转录）——是 nice-to-have，不是编译期或语义上的依赖；
+C 随时可插队。
+
+**唯一的真实耦合是文档级**：三块都要改同一批计数/状态行（根 `README.md`、
+`docs/project-management/README.md`、本 spec 的状态行），会在**合并时**产生冲突，
+谁后合谁解——但不是逻辑依赖。
+
+**P3-A 计划内部的顺序**（对比上面三块之间的无序）：`Task 3`（`lead_index.rs` 纯函数）
+→ `Task 4`（两个工具消费它）→ `Task 5`（收口验证）是一条**硬依赖链**；`Task 1`（`lead_memory`）
+与 `Task 2`（后台 tick 去重）彼此独立，仅因都改 `server.rs` 而**文件级重叠**。
 
 ## 12. 范围外
 

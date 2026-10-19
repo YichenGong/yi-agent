@@ -74,6 +74,183 @@ pub struct ModelEntry {
     /// 非字符串值按「未设置」处理，不让整条被跳过（见 `de_optional_string`）。
     #[serde(default, deserialize_with = "de_optional_string")]
     pub reasoning_effort: Option<String>,
+    /// 各通道的 effort 探测结果；`None` = 从未探测。坏值按「未探测」处理。
+    #[serde(default, deserialize_with = "de_optional_capabilities")]
+    pub reasoning_capabilities: Option<ReasoningCapabilities>,
+    /// 该条目的上下文窗口（tokens）；`None` = 沿用 cfg 的既有阈值。
+    #[serde(default)]
+    pub context_length: Option<u32>,
+}
+
+/// 七档白名单，顺序即 UI 顺序（与 `desktop/src/lib/modelPicker.ts` 的
+/// `REASONING_EFFORTS` 逐字一致）。
+pub const REASONING_TIERS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// 某条目在某条通道上的 effort 探测结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelCapability {
+    /// 探测为支持的档位，按 [`REASONING_TIERS`] 顺序、已去重。
+    #[serde(default, deserialize_with = "de_supported_tiers")]
+    pub supported: Vec<String>,
+    /// 探测完成时间（Unix 秒）。坏值读作 0。
+    #[serde(default, deserialize_with = "de_u64_lossy")]
+    pub probed_at: u64,
+    /// 非空 = 该通道探测未能完成（鉴权/网络/网关异常），`supported` 不可信。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub error: Option<String>,
+}
+
+/// 三条通道各一份结果。未探测的通道为 `None`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningCapabilities {
+    #[serde(default, deserialize_with = "de_optional_capability")]
+    pub chat: Option<ChannelCapability>,
+    #[serde(default, deserialize_with = "de_optional_capability")]
+    pub responses: Option<ChannelCapability>,
+    #[serde(default, deserialize_with = "de_optional_capability")]
+    pub anthropic: Option<ChannelCapability>,
+}
+
+impl ReasoningCapabilities {
+    /// 通道键（`chat` / `responses` / `anthropic`）对应的槽位。
+    pub fn channel_mut(&mut self, channel: &str) -> Option<&mut Option<ChannelCapability>> {
+        match channel {
+            "chat" => Some(&mut self.chat),
+            "responses" => Some(&mut self.responses),
+            "anthropic" => Some(&mut self.anthropic),
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, channel: &str) -> Option<&ChannelCapability> {
+        match channel {
+            "chat" => self.chat.as_ref(),
+            "responses" => self.responses.as_ref(),
+            "anthropic" => self.anthropic.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// 是否存在任一「可信」结果（有记录且 `error` 为空）。
+    pub fn has_trustworthy(&self) -> bool {
+        [&self.chat, &self.responses, &self.anthropic]
+            .into_iter()
+            .flatten()
+            .any(|c| c.error.is_none())
+    }
+}
+
+/// 条目实际会走的通道键：`chat` / `responses` / `anthropic`。
+///
+/// `auto` 必须选一条：`OpenaiProvider` 运行期先试 `/responses`、缺失才回退
+/// chat，故能力也按同一优先级取——两条都有可信记录时以 `responses` 为准，只有
+/// chat 可信时才落到 chat。这个函数与 [`supported_efforts`] 必须同源，否则
+/// 「UI 展示的档位」和「运行期校验的档位」会来自不同通道。
+pub fn effective_channel(entry: &ModelEntry) -> &'static str {
+    match entry.provider {
+        ModelProvider::Anthropic => "anthropic",
+        ModelProvider::Openai => match entry.api_style.as_deref() {
+            Some("chat") => "chat",
+            Some("responses") => "responses",
+            _ => {
+                let caps = entry.reasoning_capabilities.as_ref();
+                let trustworthy =
+                    |c: &Option<ChannelCapability>| c.as_ref().is_some_and(|c| c.error.is_none());
+                match caps {
+                    Some(c) if trustworthy(&c.chat) && !trustworthy(&c.responses) => "chat",
+                    _ => "responses",
+                }
+            }
+        },
+    }
+}
+
+/// 该条目在**生效通道**上被证实可用的档位；`None` = 能力未知。
+///
+/// 「未知」与「空集」是两件事：前者表示没探测过（或探测出错），调用方应保持
+/// 宽松（平铺七档、运行期靠剥离重投兜底）；后者表示探测明确得出结论——七档
+/// 全被拒。把两者混为一谈会让「探测失败的模型」在 UI 上一个档位都没有。
+pub fn supported_efforts(entry: &ModelEntry) -> Option<Vec<String>> {
+    let caps = entry.reasoning_capabilities.as_ref()?;
+    let cap = caps.get(effective_channel(entry))?;
+    if cap.error.is_some() {
+        // 这一轮没结论（鉴权失败、超时、基线被拒）：按未知处理，不要谎报
+        // 「零个档位可用」。
+        return None;
+    }
+    Some(cap.supported.clone())
+}
+
+/// 某档位是否可以发给该模型。能力未知时恒为 `true`（保持探测功能上线前的
+/// 行为：靠「被拒剥离重投」兜底）。
+pub fn effort_is_allowed(entry: &ModelEntry, effort: &str) -> bool {
+    supported_efforts(entry)
+        .map(|list| list.iter().any(|s| s == effort))
+        .unwrap_or(true)
+}
+
+/// 只保留白名单内的档位，并按白名单顺序排序去重。坏值读作空表。
+fn de_supported_tiers<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(items) = value.and_then(|v| v.as_array().cloned()) else {
+        return Ok(Vec::new());
+    };
+    let mut kept: Vec<String> = items
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| REASONING_TIERS.contains(s))
+        .map(str::to_string)
+        .collect();
+    kept.sort_by_key(|s| {
+        REASONING_TIERS
+            .iter()
+            .position(|t| t == s)
+            .unwrap_or(usize::MAX)
+    });
+    kept.dedup();
+    Ok(kept)
+}
+
+/// 非对象 / `null` → `None`；对象 → `Some(ChannelCapability)`。
+fn de_optional_capability<'de, D>(deserializer: D) -> Result<Option<ChannelCapability>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Object(_)) => serde_json::from_value(value.unwrap())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+/// 非数字 → 0。
+fn de_u64_lossy<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+/// 非对象 / `null` → `None`；对象 → `Some(ReasoningCapabilities)`。
+fn de_optional_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<Option<ReasoningCapabilities>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Object(_)) => serde_json::from_value(value.unwrap())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
 }
 
 /// 反序列化时把非字符串值当作「未设置」（None），避免一个手写值让整条被跳过。
@@ -271,8 +448,18 @@ impl CatalogWatcher {
 /// （含 warning 日志字段，故**必须**接收 `path`）。
 fn parse_catalog(text: &str, path: &Path) -> Result<ModelCatalog, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(text)?;
+    // 顶层必须是对象。数组 / 标量 / `null` 都是「合法 JSON，但不是清单文档」：
+    // 若当成空清单，调用方会误判「用户没配置」并覆盖掉用户的文件（静默丢失）。
+    // `load_catalog_from` 仍是 Err→空清单（坏文件不阻断启动），故此处报错安全。
+    let Some(object) = value.as_object() else {
+        return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+            "{}: expected a JSON object at the top level",
+            path.display()
+        )));
+    };
     let mut catalog = ModelCatalog::default();
-    if let Some(models) = value.get("models").and_then(|v| v.as_array()) {
+    if let Some(models) = object.get("models").and_then(|v| v.as_array()) {
+        let mut skipped = 0usize;
         for raw in models {
             match serde_json::from_value::<ModelEntry>(raw.clone()) {
                 Ok(mut entry)
@@ -283,14 +470,26 @@ fn parse_catalog(text: &str, path: &Path) -> Result<ModelCatalog, serde_json::Er
                     migrate_openai_api_url(&mut entry);
                     catalog.models.push(entry);
                 }
-                Ok(_) => tracing::warn!(path = %path.display(), "skipping incomplete model entry"),
+                Ok(_) => {
+                    skipped += 1;
+                    tracing::warn!(path = %path.display(), "skipping incomplete model entry")
+                }
                 Err(error) => {
+                    skipped += 1;
                     tracing::warn!(%error, path = %path.display(), "skipping malformed model entry")
                 }
             }
         }
+        // 写了条目却一条都没能留下 = 用户写坏了，绝不能当成「没有配置」：
+        // 否则调用方会导入并整段 rename 掉用户的 `models` 数组。
+        if !models.is_empty() && catalog.models.is_empty() {
+            return Err(<serde_json::Error as serde::de::Error>::custom(format!(
+                "{}: all {skipped} model entries were skipped as invalid",
+                path.display()
+            )));
+        }
     }
-    catalog.default_model = value
+    catalog.default_model = object
         .get("default_model")
         .and_then(|v| v.as_str())
         .map(str::to_string);
@@ -305,18 +504,173 @@ pub fn save_catalog(catalog: &ModelCatalog) -> std::io::Result<()> {
     save_catalog_to(&models_path(), catalog)
 }
 
+/// 在清单文件上做一次「读-改-写」，全程持锁。
+///
+/// **为什么需要它**：`models.json` 的每次写都是「读全文 → 改 → rename」，
+/// 而进程内至少有三个会并发写它的来源——`model/upsert`、`model/setDefault`
+/// 这类 RPC，以及保存模型后**后台**跑的探测写回。两者交错时，探测那一轮
+/// 读到的旧快照会把同时在落盘的 `default_model` 覆盖回去（表现为「设了默认
+/// 却读回兜底 cfg」，而且只在探测恰好同时完成时出现，极难复现）。
+///
+/// 锁分两层：
+/// - **进程内**：`CATALOG_WRITE_LOCK` 覆盖同一进程里所有写者；
+/// - **跨进程**：同目录下的 `.models.json.lock` 文件锁，覆盖 CLI / app-server
+///   等多个进程（桌面的 sidecar 与 TUI 会同时开着同一份清单）。
+///
+/// 回调拿到的是**持锁后重新读到**的清单，因此基于它做的修改不会覆盖别的写者。
+/// 读不出来的既有文件照旧报错（不静默重建），语义与 [`save_catalog_to`] 一致。
+pub fn update_catalog<T>(
+    path: &Path,
+    f: impl FnOnce(&mut ModelCatalog) -> T,
+) -> std::io::Result<T> {
+    update_catalog_inner(path, |catalog| Some(f(catalog)))
+        .map(|out| out.expect("the closure always returns Some"))
+}
+
+/// 同 [`update_catalog`]，但回调返回 `None` 表示「无事可做」：**不落盘**并原样
+/// 返回 `None`。
+///
+/// 用于「写前复核后放弃」的场景（例如探测结果因条目已被改而过期）。区别不只是
+/// 省一次写：无谓的 `rename` 会推进 mtime，让所有盯着这份清单的 watcher 白重读
+/// 一次。
+pub fn update_catalog_if<T>(
+    path: &Path,
+    f: impl FnOnce(&mut ModelCatalog) -> Option<T>,
+) -> std::io::Result<Option<T>> {
+    update_catalog_inner(path, f)
+}
+
+fn update_catalog_inner<T>(
+    path: &Path,
+    f: impl FnOnce(&mut ModelCatalog) -> Option<T>,
+) -> std::io::Result<Option<T>> {
+    let _guard = CATALOG_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _file_lock = FileLock::acquire(path)?;
+    let mut catalog = try_load_for_update(path)?;
+    let out = f(&mut catalog);
+    if out.is_some() {
+        save_catalog_to(path, &catalog)?;
+    }
+    Ok(out)
+}
+
+/// 进程内串行化清单写入。回收 poisoned：一次 panic 不该让后续写永久失败
+/// （写的是完整快照，不存在「写了一半的内存状态」）。
+static CATALOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 跨进程的清单文件锁，drop 时解锁并清掉锁文件。
+///
+/// 用 `create_new` 轮询而不是 `flock`：不需要引入新依赖，且行为在 macOS /
+/// Linux 上一致。持锁时间只有一次读 + 一次 rename，轮询间隔足够小。
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    fn acquire(models_path: &Path) -> std::io::Result<Self> {
+        let path = lock_path(models_path);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        // 超过这个时间就放弃：调用方会收到错误，而不是无声地永远卡住。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // 残留锁文件（持锁进程崩了）不能永久阻塞：文件比
+                    // `STALE_LOCK_AGE` 更旧就当作可回收。
+                    if lock_is_stale(&path) {
+                        let _ = std::fs::remove_file(&path);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "timed out waiting for the catalog lock at {}",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// 锁文件与清单同目录，名字由清单名派生（`.models.json.lock`）。
+fn lock_path(models_path: &Path) -> PathBuf {
+    let file = models_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "models.json".to_string());
+    models_path.with_file_name(format!(".{file}.lock"))
+}
+
+/// 持锁进程崩溃留下的锁文件：超过这个年龄即视为可回收。
+const STALE_LOCK_AGE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn lock_is_stale(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|modified| {
+            modified
+                .elapsed()
+                .map(|age| age > STALE_LOCK_AGE)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// 为更新而读：严格读取，坏文件报错（与 [`save_catalog_to`] 的「不覆盖读不出来的
+/// 文件」同一不变量）。文件不存在由 `try_load_catalog_from` 自己回空清单——
+/// 那是真正的首写。
+fn try_load_for_update(path: &Path) -> std::io::Result<ModelCatalog> {
+    try_load_catalog_from(path)
+        .map_err(|reason| std::io::Error::new(std::io::ErrorKind::InvalidData, reason))
+}
+
 /// 写清单：读-改-写，保留 `models.json` 里无关的顶层键，最后原子替换。
+///
+/// 既有文件「读不出来」（损坏 JSON / 非对象）时**报错而不覆盖**：那是用户的配置
+/// 出了岔子，不是「没有配置」。静默重建会把整份清单扔掉（含别的条目的 key）。
+/// 只有文件**不存在**才从空对象起步（真正的首写）。
 pub fn save_catalog_to(path: &Path, catalog: &ModelCatalog) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     // 读-改-写：以既有对象为底，仅覆盖本模块拥有的三个键，其余顶层键原样保留。
-    // 文件缺失 / 损坏 / 非对象时从空对象起步（与 `load_catalog_from` 的容错一致）。
-    let mut object = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
+    let mut object = match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{} exists but is not a readable JSON object; refusing to overwrite it",
+                        path.display()
+                    ),
+                )
+            })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+        Err(error) => return Err(error),
+    };
     let catalog_value = serde_json::to_value(catalog).map_err(std::io::Error::other)?;
     if let serde_json::Value::Object(fields) = catalog_value {
         for (key, value) in fields {
@@ -377,12 +731,14 @@ pub fn mask_key(key: &str) -> String {
 
 /// 会话覆盖 → 全局默认 → 原 cfg 三级解析，返回改写了 provider/api_url/api_key/model
 /// 以及 `api_style` / `reasoning_effort` 的 cfg 克隆，其余字段保持原值。
+///
+/// 条目选择走 [`effective_entry_for`]：会话覆盖 > 整包注入 > 清单默认。
 pub fn resolve_effective(
     cfg: &RuntimeConfig,
     catalog: &ModelCatalog,
     session_override: Option<&str>,
 ) -> RuntimeConfig {
-    match effective_entry(catalog, session_override) {
+    match effective_entry_for(cfg, catalog, session_override) {
         Some(entry) => {
             let mut out = cfg.clone();
             out.provider = entry.provider.as_str().to_string();
@@ -395,21 +751,72 @@ pub fn resolve_effective(
                 .map(ApiStyle::parse)
                 .unwrap_or(RuntimeConfig::default_api_style());
             out.reasoning_effort = entry.reasoning_effort.clone();
+            // 能力可信且该档不在支持列表里 → 按「未发送」处理：发出去必然被拒，
+            // 只会让 provider 白跑一轮「剥离字段重投」。`None`（能力未知）不受影响。
+            if let Some(effort) = out.reasoning_effort.clone() {
+                if !effort_is_allowed(entry, &effort) {
+                    tracing::info!(
+                        model = %entry.name,
+                        %effort,
+                        "configured reasoning effort is not supported; dropping it"
+                    );
+                    out.reasoning_effort = None;
+                }
+            }
+            // `context_length` 来自手写 `models.json`，是外部输入：饱和乘法挡住 `length * ratio`
+            // 的溢出（debug 会 panic、release 会静默回绕）；`0` 视为"未声明"，否则
+            // `compact_threshold == 0` 会让每一轮都触发压缩。静默条目保持 cfg 阈值原样。
+            if let Some(length) = entry.context_length {
+                if length > 0 {
+                    out.compact_threshold = length.saturating_mul(out.compact_ratio) / 100;
+                }
+            }
             out
         }
         None => cfg.clone(),
     }
 }
 
-/// 会话覆盖命中则用它；否则全局默认；都命中不了返回 None（调用方回退 cfg）。
+/// 条目选择的**唯一**规则：会话覆盖 > 整包注入 > 清单默认。
+///
+/// `model_injected` 由调用方从真实配置取（[`RuntimeConfig::model_injected`]）。这条
+/// 规则单独开一个入口，是给**拿不到完整 `RuntimeConfig`** 的调用方用的（TUI `/effort`
+/// 手上只有快照里的几个字段）：让它们复用同一条规则，而不是各自再推导一遍——
+/// 「上报 == 实际发出」正是靠这一点成立的。`resolve_effective` 与 TUI 都落到这里。
+pub fn effective_entry_with_injection<'a>(
+    catalog: &'a ModelCatalog,
+    session_override: Option<&str>,
+    model_injected: bool,
+) -> Option<&'a ModelEntry> {
+    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
+    if let Some(entry) = session_override.and_then(by_name) {
+        return Some(entry);
+    }
+    if model_injected {
+        return None;
+    }
+    catalog.default_model.as_deref().and_then(by_name)
+}
+
+/// 解析 `cfg` 与清单得到本次生效条目。优先级：会话覆盖 > 整包注入 > 清单默认。
+///
+/// 注入存在时**不看**清单默认：用户显式给的一整包压过持久化的默认值，
+/// 这正是「改了没反应」那个病的解药。
+pub fn effective_entry_for<'a>(
+    cfg: &RuntimeConfig,
+    catalog: &'a ModelCatalog,
+    session_override: Option<&str>,
+) -> Option<&'a ModelEntry> {
+    effective_entry_with_injection(catalog, session_override, cfg.model_injected)
+}
+
+/// 无注入语境下的条目解析（启动期、`onboarding` 评估等）。等价于
+/// [`effective_entry_with_injection`] 且注入标记为 `false`。
 pub fn effective_entry<'a>(
     catalog: &'a ModelCatalog,
     session_override: Option<&str>,
 ) -> Option<&'a ModelEntry> {
-    let by_name = |name: &str| catalog.models.iter().find(|m| m.name == name);
-    session_override
-        .and_then(by_name)
-        .or_else(|| catalog.default_model.as_deref().and_then(by_name))
+    effective_entry_with_injection(catalog, session_override, false)
 }
 
 /// 子 agent 条目：`subagent_model` → 全局默认 → None（调用方回退 cfg）。
@@ -435,6 +842,8 @@ mod tests {
             api_key: "sk-secret-1234".into(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
+            context_length: None,
         }
     }
 
@@ -527,6 +936,156 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw.get("future_key"), Some(&serde_json::json!(42)));
         assert_eq!(load_catalog_from(&path), catalog);
+    }
+
+    /// 写入不得把「读不出来的既有文件」当成空对象从头重建——那会静默丢掉用户
+    /// 的整个 `models.json`。首写（文件不存在）仍必须成功创建。
+    #[test]
+    /// 两个写者交错时，后写的那个必须基于**前一个已经落盘**的清单，否则
+    /// 一方的修改会被静默丢掉。
+    ///
+    /// 这里模拟的正是真实故障：后台探测写回能力的同时，另一个 RPC 设了
+    /// `default_model`。裸「读-改-写」下后者会消失（表现为「设了默认却读回
+    /// 兜底 cfg」，且只在两者恰好同时完成时出现）。
+    #[test]
+    fn concurrent_updates_do_not_lose_each_others_changes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        save_catalog_to(
+            &path,
+            &ModelCatalog {
+                models: vec![entry("a"), entry("b")],
+                default_model: None,
+                subagent_model: None,
+            },
+        )
+        .unwrap();
+
+        // 先在锁外各读一份旧快照（这正是裸写路径拿到的东西）。
+        let stale_a = load_catalog_from(&path);
+        let stale_b = load_catalog_from(&path);
+
+        let path_a = path.clone();
+        let path_b = path.clone();
+        let writer_a = std::thread::spawn(move || {
+            update_catalog(&path_a, |catalog| {
+                let target = catalog.models.iter_mut().find(|m| m.name == "a").unwrap();
+                target.reasoning_capabilities = Some(ReasoningCapabilities {
+                    chat: Some(ChannelCapability {
+                        supported: vec!["low".into()],
+                        probed_at: 7,
+                        error: None,
+                    }),
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+            drop(stale_a);
+        });
+        let writer_b = std::thread::spawn(move || {
+            update_catalog(&path_b, |catalog| {
+                catalog.default_model = Some("b".into());
+            })
+            .unwrap();
+            drop(stale_b);
+        });
+        writer_a.join().unwrap();
+        writer_b.join().unwrap();
+
+        let landed = load_catalog_from(&path);
+        assert_eq!(
+            landed.default_model.as_deref(),
+            Some("b"),
+            "the default written by one writer must survive the other writer"
+        );
+        assert_eq!(
+            landed.models[0]
+                .reasoning_capabilities
+                .as_ref()
+                .and_then(|c| c.chat.as_ref())
+                .map(|c| c.supported.clone()),
+            Some(vec!["low".to_string()]),
+            "the capabilities written by the other writer must survive too"
+        );
+    }
+
+    /// 回调返回 `None`（写前复核判定放弃）时**不落盘**：mtime 不动，盯着清单的
+    /// watcher 不会白重读一次。
+    #[test]
+    fn an_abandoned_update_writes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        save_catalog_to(
+            &path,
+            &ModelCatalog {
+                models: vec![entry("a")],
+                default_model: Some("a".into()),
+                subagent_model: None,
+            },
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let applied: Option<()> = update_catalog_if(&path, |_| None).unwrap();
+        assert!(applied.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "an abandoned update must not rewrite the file"
+        );
+    }
+
+    /// 读不出来的既有文件：`update_catalog` 与 `save_catalog_to` 同样拒绝覆盖。
+    #[test]
+    fn update_refuses_an_unreadable_base() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let result = update_catalog(&path, |catalog| catalog.models.push(entry("a")));
+        assert!(result.is_err(), "an unreadable base must not be clobbered");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ this is not valid json"
+        );
+    }
+
+    fn saving_refuses_to_overwrite_a_base_it_cannot_read() {
+        // (a) 文件不存在：确实没有既有内容 → 正常创建。
+        let dir = tempfile::TempDir::new().unwrap();
+        let fresh = dir.path().join("models.json");
+        save_catalog_to(
+            &fresh,
+            &ModelCatalog {
+                models: vec![entry("a")],
+                default_model: Some("a".into()),
+                subagent_model: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(load_catalog_from(&fresh).models.len(), 1);
+
+        // (b) 既有文件是损坏 JSON / 非对象：必须报错并保持文件原样，不得覆盖。
+        for original in ["{ this is not valid json", r#"["not","an","object"]"#] {
+            let path = dir.path().join("models.json");
+            std::fs::write(&path, original).unwrap();
+            let result = save_catalog_to(
+                &path,
+                &ModelCatalog {
+                    models: vec![entry("a")],
+                    default_model: Some("a".into()),
+                    subagent_model: None,
+                },
+            );
+            assert!(
+                result.is_err(),
+                "saving over an unreadable base must fail, not silently rebuild it"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                original,
+                "an unreadable base must be left byte-identical"
+            );
+        }
     }
 
     #[test]
@@ -694,6 +1253,65 @@ mod tests {
         assert!(try_load_catalog_from(&path).is_ok());
     }
 
+    /// 严格读取必须拒绝「合法 JSON 但根本不是清单文档」（顶层不是对象）。
+    ///
+    /// 这类文件过去被当成 `Ok(空清单)`，于是调用方（迁移）误判「用户没配置」，
+    /// 直接把它 rename 覆盖掉。`Ok(空清单)` 的契约是「**确定**没有配置」，
+    /// 一份合法却非对象的文件显然不满足。
+    #[test]
+    fn try_load_rejects_a_document_that_is_not_a_json_object() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+
+        for document in [
+            r#"["a","b","c"]"#,
+            r#""just a string""#,
+            "42",
+            "null",
+            "true",
+        ] {
+            std::fs::write(&path, document).unwrap();
+            assert!(
+                try_load_catalog_from(&path).is_err(),
+                "{document} is not a catalog document and must not report Ok(empty)"
+            );
+        }
+
+        // 合法的空对象本身仍是「结构上可读」的清单文档 → Ok(空)。
+        std::fs::write(&path, "{}").unwrap();
+        assert!(try_load_catalog_from(&path).is_ok());
+    }
+
+    /// 顶层是对象、但 `models` 里**每条都被跳过**时，也不能谎报 `Ok(空清单)`。
+    ///
+    /// 这代表「用户写了配置、只是写坏了」（例如漏了 `api_url`）。当成空清单，
+    /// 迁移就会导入并整段 rename 掉用户的 `models` 数组——静默数据丢失。
+    #[test]
+    fn try_load_rejects_a_catalog_whose_entries_were_all_skipped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("models.json");
+        // 唯一一条缺 `api_url` → 被逐条过滤跳过 → 幸存 0 条。
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"kept-typo","provider":"anthropic","model":"m"}]}"#,
+        )
+        .unwrap();
+        assert!(
+            try_load_catalog_from(&path).is_err(),
+            "all entries skipped means the user wrote something malformed, not 'no config'"
+        );
+
+        // 反过来：只要幸存下一条，就仍是可读清单 → Ok。
+        std::fs::write(
+            &path,
+            r#"{"models":[{"name":"ok","provider":"anthropic","api_url":"u","model":"m"},"#
+                .to_string()
+                + r#"{"name":"bad","provider":"anthropic","model":"m"}]}"#,
+        )
+        .unwrap();
+        assert!(try_load_catalog_from(&path).is_ok());
+    }
+
     /// 指纹未变时必须复用同一个 `Arc`——用 `ptr_eq` 证明「零重读」，而不是
     /// 只看值相等（值相等无法区分「重读后恰好相同」与「根本没读」）。
     #[test]
@@ -776,6 +1394,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reasoning_capabilities_roundtrip_and_drop_unknown_tiers() {
+        let json = r#"{
+            "models":[{
+                "name":"A","provider":"openai","api_url":"https://a","model":"m",
+                "reasoning_capabilities":{
+                    "chat":{"supported":["none","bogus","low"],"probed_at":123},
+                    "responses":{"supported":["high"],"probed_at":456,"error":"401"}
+                }
+            }]
+        }"#;
+        let catalog = parse_catalog(json, Path::new("x")).unwrap();
+        let caps = catalog.models[0].reasoning_capabilities.as_ref().unwrap();
+        assert_eq!(caps.chat.as_ref().unwrap().supported, vec!["none", "low"]);
+        assert_eq!(caps.chat.as_ref().unwrap().probed_at, 123);
+        assert_eq!(
+            caps.responses.as_ref().unwrap().error.as_deref(),
+            Some("401")
+        );
+        assert!(caps.anthropic.is_none());
+    }
+
+    #[test]
+    fn bad_capabilities_values_degrade_to_unknown_without_dropping_the_entry() {
+        // 整份能力数据不是对象 → 视作未探测。
+        for raw in [r#""nope""#, r#"[]"#, r#"42"#] {
+            let json = format!(
+                r#"{{"models":[{{"name":"A","provider":"openai","api_url":"https://a","model":"m","reasoning_capabilities":{raw}}}]}}"#
+            );
+            let catalog = parse_catalog(&json, Path::new("x")).unwrap();
+            assert_eq!(catalog.models.len(), 1, "entry must survive: {raw}");
+            assert!(
+                catalog.models[0].reasoning_capabilities.is_none(),
+                "non-object capabilities must read as unknown: {raw}"
+            );
+        }
+
+        // 单条通道不是对象 → 该通道视作未探测，其它通道不受影响。
+        let json = r#"{"models":[{"name":"A","provider":"openai","api_url":"https://a","model":"m",
+            "reasoning_capabilities":{"chat":"nope","responses":{"supported":["low"]}}}]}"#;
+        let catalog = parse_catalog(json, Path::new("x")).unwrap();
+        let caps = catalog.models[0].reasoning_capabilities.as_ref().unwrap();
+        assert!(
+            caps.chat.is_none(),
+            "non-object channel must read as unknown"
+        );
+        assert_eq!(caps.responses.as_ref().unwrap().supported, vec!["low"]);
+
+        // 通道内字段类型错误 → 该字段降级（空表 / 0），通道本身仍存在。
+        let json = r#"{"models":[{"name":"A","provider":"openai","api_url":"https://a","model":"m",
+            "reasoning_capabilities":{"chat":{"supported":"nope","probed_at":"x"}}}]}"#;
+        let catalog = parse_catalog(json, Path::new("x")).unwrap();
+        let chat = catalog.models[0]
+            .reasoning_capabilities
+            .as_ref()
+            .unwrap()
+            .chat
+            .as_ref()
+            .unwrap();
+        assert!(
+            chat.supported.is_empty(),
+            "bad supported must read as empty"
+        );
+        assert_eq!(chat.probed_at, 0, "bad probed_at must read as 0");
+    }
+
     /// `from_catalog` 是固定快照：即便磁盘变了也不重读（测试与「本就持有清单」的调用方用它）。
     #[test]
     fn from_catalog_is_a_fixed_snapshot() {
@@ -819,6 +1503,8 @@ mod resolve_tests {
             workdir: std::path::PathBuf::from("."),
             system_prompt: None,
             compact_threshold: 1000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 100,
             compact_tool_budget_tokens: 100,
             yolo: false,
@@ -827,7 +1513,160 @@ mod resolve_tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 0,
             skills_catalog_budget_explicit: false,
+            model_injected: false,
         }
+    }
+
+    fn openai_entry(api_style: Option<&str>, effort: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            name: "L".into(),
+            provider: ModelProvider::Openai,
+            api_url: "https://l".into(),
+            model: "m".into(),
+            api_key: "k".into(),
+            api_style: api_style.map(str::to_string),
+            reasoning_effort: effort.map(str::to_string),
+            reasoning_capabilities: None,
+            context_length: None,
+        }
+    }
+
+    fn caps(
+        chat: Option<(&[&str], Option<&str>)>,
+        responses: Option<(&[&str], Option<&str>)>,
+    ) -> ReasoningCapabilities {
+        let conv = |v: Option<(&[&str], Option<&str>)>| {
+            v.map(|(tiers, err)| ChannelCapability {
+                supported: tiers.iter().map(|s| s.to_string()).collect(),
+                probed_at: 1,
+                error: err.map(str::to_string),
+            })
+        };
+        ReasoningCapabilities {
+            chat: conv(chat),
+            responses: conv(responses),
+            anthropic: None,
+        }
+    }
+
+    #[test]
+    fn an_unsupported_default_effort_is_dropped_at_resolve_time() {
+        let catalog = ModelCatalog {
+            models: vec![ModelEntry {
+                reasoning_capabilities: Some(caps(Some((&["low"], None)), None)),
+                ..openai_entry(Some("chat"), Some("high"))
+            }],
+            default_model: Some("L".into()),
+            subagent_model: None,
+        };
+        let out = resolve_effective(&cfg(), &catalog, None);
+        assert_eq!(
+            out.reasoning_effort, None,
+            "an unsupported tier must not be sent at all"
+        );
+    }
+
+    #[test]
+    fn a_supported_default_effort_survives_resolution() {
+        let catalog = ModelCatalog {
+            models: vec![ModelEntry {
+                reasoning_capabilities: Some(caps(Some((&["low", "high"], None)), None)),
+                ..openai_entry(Some("chat"), Some("high"))
+            }],
+            default_model: Some("L".into()),
+            subagent_model: None,
+        };
+        assert_eq!(
+            resolve_effective(&cfg(), &catalog, None).reasoning_effort,
+            Some("high".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unknown_capability_keeps_the_default_effort() {
+        let entry = openai_entry(Some("chat"), Some("high"));
+        assert!(effort_is_allowed(&entry, "high"), "unknown must not block");
+        assert_eq!(supported_efforts(&entry), None);
+    }
+
+    #[test]
+    fn a_probe_error_is_treated_as_unknown_not_as_zero_tiers() {
+        let entry = ModelEntry {
+            reasoning_capabilities: Some(caps(None, Some((&[], Some("HTTP 401"))))),
+            ..openai_entry(Some("responses"), Some("high"))
+        };
+        assert_eq!(
+            supported_efforts(&entry),
+            None,
+            "an errored probe says nothing about which tiers work"
+        );
+        assert!(effort_is_allowed(&entry, "high"));
+    }
+
+    /// 明确的「七档全被拒」是结论而非未知：UI 该显示零个档位，运行期必须拦下。
+    #[test]
+    fn an_empty_but_trustworthy_list_blocks_every_tier() {
+        let entry = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&[], None)), None)),
+            ..openai_entry(Some("chat"), Some("high"))
+        };
+        assert_eq!(supported_efforts(&entry), Some(Vec::new()));
+        assert!(!effort_is_allowed(&entry, "high"));
+    }
+
+    #[test]
+    fn auto_prefers_responses_but_falls_back_to_a_trustworthy_chat() {
+        let both = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&["low"], None)), Some((&["high"], None)))),
+            ..openai_entry(None, None)
+        };
+        assert_eq!(effective_channel(&both), "responses");
+        assert_eq!(supported_efforts(&both), Some(vec!["high".to_string()]));
+
+        let chat_only = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&["low"], None)), None)),
+            ..openai_entry(None, None)
+        };
+        assert_eq!(effective_channel(&chat_only), "chat");
+        assert_eq!(supported_efforts(&chat_only), Some(vec!["low".to_string()]));
+
+        // chat 有记录但出错、responses 没有 → 仍是 responses（未知），
+        // 不能把「chat 那轮失败」当成 chat 支持集合。
+        let errored_chat = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&[], Some("boom"))), None)),
+            ..openai_entry(None, None)
+        };
+        assert_eq!(effective_channel(&errored_chat), "responses");
+        assert_eq!(supported_efforts(&errored_chat), None);
+    }
+
+    #[test]
+    fn an_explicit_api_style_pins_the_channel() {
+        let entry = ModelEntry {
+            reasoning_capabilities: Some(caps(Some((&["low"], None)), Some((&["high"], None)))),
+            ..openai_entry(Some("chat"), None)
+        };
+        assert_eq!(effective_channel(&entry), "chat");
+        assert_eq!(supported_efforts(&entry), Some(vec!["low".to_string()]));
+    }
+
+    #[test]
+    fn an_anthropic_entry_only_looks_at_the_anthropic_slot() {
+        let entry = ModelEntry {
+            reasoning_capabilities: Some(ReasoningCapabilities {
+                chat: Some(ChannelCapability {
+                    supported: vec!["low".into()],
+                    probed_at: 1,
+                    error: None,
+                }),
+                ..Default::default()
+            }),
+            ..openai_entry(None, None)
+        };
+        let mut entry = entry;
+        entry.provider = ModelProvider::Anthropic;
+        assert_eq!(effective_channel(&entry), "anthropic");
+        assert_eq!(supported_efforts(&entry), None);
     }
 
     fn catalog() -> ModelCatalog {
@@ -841,6 +1680,8 @@ mod resolve_tests {
                     api_key: "key-a".into(),
                     api_style: None,
                     reasoning_effort: None,
+                    reasoning_capabilities: None,
+                    context_length: None,
                 },
                 ModelEntry {
                     name: "B".into(),
@@ -850,6 +1691,8 @@ mod resolve_tests {
                     api_key: "key-b".into(),
                     api_style: None,
                     reasoning_effort: None,
+                    reasoning_capabilities: None,
+                    context_length: None,
                 },
             ],
             default_model: Some("A".into()),
@@ -870,6 +1713,24 @@ mod resolve_tests {
     fn a_dangling_override_falls_back_to_the_default() {
         let out = resolve_effective(&cfg(), &catalog(), Some("gone"));
         assert_eq!(out.model, "model-a");
+    }
+
+    #[test]
+    fn an_injection_beats_the_catalog_default() {
+        let mut base = cfg();
+        base.model_injected = true;
+        base.model = "injected-model".into();
+        let out = resolve_effective(&base, &catalog(), None);
+        assert_eq!(out.model, "injected-model");
+    }
+
+    #[test]
+    fn a_session_override_still_beats_an_injection() {
+        let mut base = cfg();
+        base.model_injected = true;
+        base.model = "injected-model".into();
+        let out = resolve_effective(&base, &catalog(), Some("B"));
+        assert_eq!(out.model, "model-b");
     }
 
     #[test]
@@ -916,5 +1777,46 @@ mod resolve_tests {
         let out = resolve_effective(&cfg(), &catalog(), Some("A"));
         assert_eq!(out.reasoning_effort, None);
         assert_eq!(out.api_style.as_str(), "auto");
+    }
+
+    #[test]
+    fn an_entrys_context_length_recomputes_the_compact_threshold() {
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(100_000);
+        // cfg() defaults to compact_ratio 80.
+        let out = resolve_effective(&cfg(), &cat, Some("B"));
+        assert_eq!(out.compact_threshold, 80_000);
+    }
+
+    #[test]
+    fn a_silent_context_length_leaves_the_threshold_alone() {
+        let base = cfg();
+        let out = resolve_effective(&base, &catalog(), Some("A"));
+        assert_eq!(out.compact_threshold, base.compact_threshold);
+    }
+
+    /// `context_length: 0` 是手写 `models.json` 里可达的输入。它必须被当成"未声明"：
+    /// 阈值保持 cfg 原值，否则 `compact_threshold == 0` 会让每一轮都触发压缩。
+    #[test]
+    fn a_zero_context_length_is_treated_as_silent() {
+        let base = cfg();
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(0);
+        let out = resolve_effective(&base, &cat, Some("B"));
+        assert_eq!(out.compact_threshold, base.compact_threshold);
+    }
+
+    /// 一个被误写成原始窗口/字符数的超大值不能在 `length * ratio` 上溢出：
+    /// debug 构建会 panic（会话启动路径），release 会静默回绕。饱和乘法必须让它算完。
+    #[test]
+    fn a_huge_context_length_saturates_instead_of_overflowing() {
+        let mut cat = catalog();
+        cat.models[1].context_length = Some(1_000_000_000);
+        // cfg() 的 compact_ratio 为 80（非零），正是会溢出的倍数。
+        let out = resolve_effective(&cfg(), &cat, Some("B"));
+        assert_eq!(
+            out.compact_threshold,
+            1_000_000_000u32.saturating_mul(80) / 100
+        );
     }
 }

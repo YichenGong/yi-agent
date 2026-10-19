@@ -1,9 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   enqueueBoardCard,
+  enqueuePrequeuedCard,
   fetchBoard,
   formatSwitch,
   pluginIsUnavailable,
+  promoteBoardCard,
   readBoardSwitch,
   readBoardWatchman,
   resolveSwitch,
@@ -102,6 +104,61 @@ describe("board RPC wrappers", () => {
       project: "/proj",
       method: "enqueue",
       params: { spec_path: "a.spec.md", plan_path: "a.plan.md" },
+    });
+  });
+
+  it("enqueuePrequeuedCard sends the trimmed title as enqueue_prequeued", async () => {
+    const inner = vi.fn(async () => ({ id: "prequeued-1" }));
+    await enqueuePrequeuedCard(asRpc(inner), "/proj", "  先记个标题  ", null);
+    expect(inner).toHaveBeenCalledWith("plugin/query", {
+      plugin: "superpowers-kanban",
+      project: "/proj",
+      method: "enqueue_prequeued",
+      params: { title: "先记个标题" },
+    });
+  });
+
+  it("enqueuePrequeuedCard sends the discussion session when given", async () => {
+    const inner = vi.fn(async () => ({ id: "prequeued-1" }));
+    await enqueuePrequeuedCard(asRpc(inner), "/proj", "先记个标题", "thread-abc");
+    expect(inner).toHaveBeenCalledWith("plugin/query", {
+      plugin: "superpowers-kanban",
+      project: "/proj",
+      method: "enqueue_prequeued",
+      params: { title: "先记个标题", origin_thread_id: "thread-abc" },
+    });
+  });
+
+  it("enqueuePrequeuedCard omits the session when there is none", async () => {
+    const inner = vi.fn(async () => ({ id: "prequeued-1" }));
+    await enqueuePrequeuedCard(asRpc(inner), "/proj", "先记个标题", null);
+    expect(inner).toHaveBeenCalledWith("plugin/query", {
+      plugin: "superpowers-kanban",
+      project: "/proj",
+      method: "enqueue_prequeued",
+      params: { title: "先记个标题" },
+    });
+  });
+
+  it("enqueuePrequeuedCard refuses a blank title without sending a request", async () => {
+    // 插件也会拒，但调用方不该指望 UI 先 trim 好：空白标题在客户端就地挡下。
+    for (const title of ["", "   ", "\t\n"]) {
+      const inner = vi.fn(async () => ({ id: "prequeued-1" }));
+      await expect(
+        enqueuePrequeuedCard(asRpc(inner), "/proj", title, null),
+      ).rejects.toThrow();
+      expect(inner).not.toHaveBeenCalled();
+    }
+  });
+
+  it("promoteBoardCard passes id and both paths through the channel", async () => {
+    const inner = vi.fn(async () => ({ id: "c1" }));
+    await promoteBoardCard(asRpc(inner), "/proj", "c1", "a.spec.md", "a.plan.md");
+    expect(inner).toHaveBeenCalledWith("plugin/query", {
+      plugin: "superpowers-kanban",
+      project: "/proj",
+      method: "promote",
+      params: { id: "c1", spec_path: "a.spec.md", plan_path: "a.plan.md" },
     });
   });
 

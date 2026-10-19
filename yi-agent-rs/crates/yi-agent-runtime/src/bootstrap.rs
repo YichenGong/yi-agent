@@ -184,7 +184,7 @@ pub fn build_tool_setup_with_switch(
 ) -> Result<ToolSetup> {
     let controller =
         yi_agent_tools::SandboxController::new(switch, cfg.sandbox, cfg.sandbox_promotable);
-    build_tool_setup_with_controller(cfg, naked, roots, controller)
+    build_tool_setup_with_controller(cfg, naked, roots, controller, Vec::new())
 }
 
 /// Same as [`build_tool_setup_with_switch`], but with an externally-owned
@@ -199,6 +199,7 @@ pub fn build_tool_setup_with_controller(
     naked: bool,
     roots: &[PathBuf],
     controller: yi_agent_tools::SandboxController,
+    session_env: Vec<(String, String)>,
 ) -> Result<ToolSetup> {
     if naked {
         // 空 root 的 manager:与空 registry 配套,保证结构体总是自洽。
@@ -233,11 +234,12 @@ pub fn build_tool_setup_with_controller(
     sandbox_writable.sort();
     sandbox_writable.dedup();
 
-    yi_agent_tools::register_builtin_tools_with_controller(
+    yi_agent_tools::register_builtin_tools_with_controller_and_env(
         &mut registry,
         roots.to_vec(),
         controller.clone(),
         sandbox_writable.clone(),
+        session_env,
     );
 
     let process_manager =
@@ -755,6 +757,7 @@ mod tests {
             false,
             std::slice::from_ref(&cfg.workdir),
             controller,
+            Vec::new(),
         )
         .expect("setup");
         let bash = setup.tools.get("bash").expect("bash is registered");
@@ -771,6 +774,45 @@ mod tests {
             Some("danger-full-access"),
             "a live YOLO flip must escalate the root bash sandbox"
         );
+    }
+
+    #[test]
+    fn build_tool_setup_threads_the_session_env_into_bash() {
+        let mut cfg = sample_config();
+        // `sample_config` 的 workdir 是 `/tmp/test-workdir`,不一定存在;
+        // 真实调用 bash 要求 cwd 可进,故就地给一个临时工作区。
+        let workdir = tempfile::TempDir::new().unwrap();
+        cfg.workdir = workdir.path().to_path_buf();
+        let switch = yi_agent_core::autonomy::YoloSwitch::new(false);
+        let controller = yi_agent_tools::SandboxController::new(
+            switch,
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            true,
+        );
+        let setup = build_tool_setup_with_controller(
+            &cfg,
+            false,
+            std::slice::from_ref(&cfg.workdir),
+            controller,
+            vec![("YI_AGENT_THREAD_ID".to_string(), "thread-abc".to_string())],
+        )
+        .expect("setup");
+        // bash 拿到该 env：用一次真实调用验证（沿用本文件既有 `rt.block_on(tool.call(...))` 范式）。
+        let bash = setup.tools.get("bash").expect("bash is registered");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(bash.call(serde_json::json!({
+            "command": "echo $YI_AGENT_THREAD_ID",
+        })));
+        assert!(
+            !result.is_error,
+            "bash through the registry failed: {:?}",
+            result.content
+        );
+        if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
+            assert!(s.contains("thread-abc"), "env must reach the child: {s}");
+        } else {
+            panic!("expected text block");
+        }
     }
 
     #[test]

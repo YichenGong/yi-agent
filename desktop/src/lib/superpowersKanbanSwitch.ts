@@ -36,6 +36,8 @@ export interface BoardCardDto {
   detail: string;
   /** 该卡关联的会话；插件可能尚未起会话，故可为 null/缺省。 */
   thread_id?: string | null;
+  /** 该卡关联的讨论会话（pre-queued 卡）。 */
+  origin_thread_id?: string | null;
 }
 
 export type BoardRpc = RpcCall;
@@ -119,6 +121,40 @@ export async function enqueueBoardCard(
   planPath: string,
 ): Promise<void> {
   await queryPlugin(rpc, project, "enqueue", {
+    spec_path: specPath,
+    plan_path: planPath,
+  });
+}
+
+/** 经插件给某项目投递一张预排队卡（只有标题，没有 spec/plan）。 */
+export async function enqueuePrequeuedCard(
+  rpc: BoardRpc,
+  project: string,
+  title: string,
+  originThreadId: string | null,
+): Promise<void> {
+  // 与 UI 的处理同口径：空白标题就地拒绝，不发这趟 RPC——插件的
+  // `enqueue_prequeued` 本来也会拒，调用方不该指望 UI 先 trim 好。
+  const trimmed = title.trim();
+  if (trimmed === "") throw new Error("a prequeued card needs a non-empty title");
+  const params: Record<string, unknown> = { title: trimmed };
+  // 来源会话是尽力而为：没有（尚未开会话 / 会话外）就不带这个键。
+  if (originThreadId !== null && originThreadId.trim() !== "") {
+    params.origin_thread_id = originThreadId;
+  }
+  await queryPlugin(rpc, project, "enqueue_prequeued", params);
+}
+
+/** 经插件提升一张预排队卡：补 spec/plan，插件下个 tick 翻成排队卡。 */
+export async function promoteBoardCard(
+  rpc: BoardRpc,
+  project: string,
+  cardId: string,
+  specPath: string,
+  planPath: string,
+): Promise<void> {
+  await queryPlugin(rpc, project, "promote", {
+    id: cardId,
     spec_path: specPath,
     plan_path: planPath,
   });

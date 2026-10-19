@@ -25,9 +25,8 @@ export type ApplyInput = {
 
 export type ApplyResult = {
   ok: boolean;
-  env_written: boolean;
-  imported: boolean;
-  import_error?: string;
+  /** 落成的清单条目名（`onboarding/apply` 单写清单后的唯一产物）。 */
+  name?: string;
 };
 
 export type TestResult = { ok: boolean; reason: string | null };
@@ -58,7 +57,7 @@ export async function onboardingStatus(rpc: OnboardingRpc): Promise<OnboardingSt
   };
 }
 
-/** 写 `.env` 并尝试收边到清单。部分成功（imported=false）也返回 `ok`。 */
+/** 单写模型清单。失败由宿主以 RPC 错误抛出（无「部分成功」态）。 */
 export async function applyOnboarding(
   rpc: OnboardingRpc,
   input: ApplyInput,
@@ -71,9 +70,7 @@ export async function applyOnboarding(
   });
   return {
     ok: result?.ok === true,
-    env_written: result?.env_written === true,
-    imported: result?.imported === true,
-    import_error: typeof result?.import_error === "string" ? result.import_error : undefined,
+    name: typeof result?.name === "string" ? result.name : undefined,
   };
 }
 

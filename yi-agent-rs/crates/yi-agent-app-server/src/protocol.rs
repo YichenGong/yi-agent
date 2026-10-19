@@ -185,6 +185,20 @@ impl RpcError {
         }
     }
 
+    /// 客户端的上下文锚点已失效：该会话在它不知情时被 `/clear`，它手上持有的是
+    /// 服务端**不存在**的内容，其可见上下文与服务端实际上下文结构性不一致。
+    ///
+    /// 与 `board_query` / `model_not_found` 同族：数值码只是粗粒度兜底，
+    /// `data.code` 才是 UI 分支的稳定词汇。注意「锚点落后但仍在」**不是**本错误
+    /// ——落后是两端并存的正常形状（spec §7.2）。
+    pub fn stale_context(thread_id: &str) -> Self {
+        Self {
+            code: -32026,
+            message: format!("context anchor is stale for thread: {thread_id}"),
+            data: Some(serde_json::json!({ "code": "stale_context" })),
+        }
+    }
+
     /// A `model/upsert` payload failed validation (empty name, unknown provider,
     /// empty url/model). Numeric code stays in the `invalid_params` family;
     /// `data.code` gives the caller a stable reason.
@@ -274,6 +288,30 @@ pub enum Notification {
     /// 旧值。它只带布尔开关、不带正文。
     #[serde(rename = "thread/preserveThinkingChanged")]
     PreserveThinkingChanged { thread_id: String, preserve: bool },
+    /// 某模型条目的 reasoning effort 能力探测完成。
+    ///
+    /// 与 `thread/*` 那族**不同**：能力是机器级清单属性（`models.json`），不属于
+    /// 任何一条会话，故 `thread_key()` 恒为 `None`，所有客户端都要刷新——否则
+    /// 一端刚探测完、另一端仍按旧能力平铺档位。
+    ///
+    /// **直接携带权威结果**：能力就是几个短字符串，客户端就地落笔即可，不必再付
+    /// 一次全量 `model/list`。`None` = 条目已删或探测结果作废。
+    ///
+    /// 线上形状见 `desktop/src/lib/models.ts` 的 `ReasoningCapabilities`：
+    ///
+    /// ```jsonc
+    /// { "chat": { "supported": ["low"], "probed_at": 1, "error": null } }
+    /// ```
+    ///
+    /// 用 `#[ts(type = "unknown")]` 而不是导入 runtime 类型：`ReasoningCapabilities`
+    /// 定义在 `yi-agent-runtime`，那里不依赖 ts-rs，协议层也不该为它引入反向依赖。
+    #[serde(rename = "model/capabilitiesChanged")]
+    ModelCapabilitiesChanged {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "unknown")]
+        reasoning_capabilities: Option<yi_agent_runtime::models::ReasoningCapabilities>,
+    },
     /// 该会话的标题已变（LLM 首轮生成成功写入）。
     ///
     /// 与 `thread/modelChanged` 同族：标题是会话元数据，变更后必须让**所有**
@@ -438,10 +476,12 @@ pub enum Notification {
         tag_names: std::collections::BTreeMap<String, String>,
     },
     /// 模型（`show_git_diff` 工具）请求桌面端聚焦 Git Diff 视图。
+    ///
+    /// 不再携带 `base`：基准现在由**帧**承载（`thread/view/read` 读回），
+    /// 前端不必自己解析基准。
     #[serde(rename = "ui/gitDiff/focus", rename_all = "camelCase")]
     UiGitDiffFocus {
         thread_id: Option<String>,
-        base: Option<String>,
         note: Option<String>,
     },
     #[serde(rename = "error")]
@@ -478,6 +518,7 @@ impl Notification {
             Notification::ToolCallApprovalResolved { .. }
             | Notification::UiSettingsUpdated { .. }
             | Notification::TagNamesUpdated { .. }
+            | Notification::ModelCapabilitiesChanged { .. }
             | Notification::Error { .. } => None,
         }
     }
@@ -515,6 +556,7 @@ impl Notification {
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::TagNamesUpdated { .. }
+            | Notification::ModelCapabilitiesChanged { .. }
             | Notification::Error { .. }
             | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,
             _ => Delivery::Content,
@@ -730,6 +772,31 @@ mod tests {
     /// `model_not_found` gets its own numeric code without renumbering the
     /// board/plugin vocabulary; the UI only reads `data.code`.
     #[test]
+    fn model_capabilities_changed_notification_carries_method_and_payload() {
+        let n = Notification::ModelCapabilitiesChanged {
+            name: "A".into(),
+            reasoning_capabilities: Some(yi_agent_runtime::models::ReasoningCapabilities {
+                chat: Some(yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["low".into()],
+                    probed_at: 7,
+                    error: None,
+                }),
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "model/capabilitiesChanged");
+        assert_eq!(v["params"]["name"], "A");
+        assert_eq!(
+            v["params"]["reasoning_capabilities"]["chat"]["supported"][0],
+            "low"
+        );
+        // 机器级清单属性：无 thread 键，恒推。
+        assert!(n.thread_key().is_none());
+        assert!(matches!(n.delivery(), Delivery::Global));
+    }
+
+    #[test]
     fn model_not_found_has_a_stable_numeric_code_and_reason() {
         let error = RpcError::model_not_found("A");
         assert_eq!(error.code, -32025);
@@ -740,6 +807,47 @@ mod tests {
         let invalid = RpcError::invalid_model("provider must be anthropic or openai");
         assert_eq!(invalid.code, -32602);
         assert_eq!(invalid.data.unwrap()["code"], "invalid_model");
+    }
+
+    /// 客户端上下文锚点失效（该会话在其不知情时被 clear）。数值码取下一个空位，
+    /// UI 只读 `data.code`——与 `board_query` / `model_not_found` 同一约定。
+    #[test]
+    fn stale_context_has_a_stable_numeric_code_and_reason() {
+        let error = RpcError::stale_context("thread-a");
+        assert_eq!(
+            error.code, -32026,
+            "-32026 must stay reserved for stale_context"
+        );
+        assert_eq!(error.data.unwrap()["code"], "stale_context");
+        assert!(
+            error.message.contains("thread-a"),
+            "message must name the thread"
+        );
+    }
+
+    /// 新码不得与既有码撞车。
+    #[test]
+    fn stale_context_does_not_collide_with_existing_codes() {
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::not_initialized().code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::unknown_thread("t").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::turn_in_progress("t").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::model_not_found("m").code
+        );
+        assert_ne!(
+            RpcError::stale_context("t").code,
+            RpcError::board_query("plugin_rejected", "x").code
+        );
     }
 
     #[test]

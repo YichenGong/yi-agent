@@ -228,6 +228,9 @@ pub fn attach_project_runtime(
         yi_agent_store::ipc::IpcRequest::AttachApplicationRoot {
             idempotency_key,
             workspace: cfg.workdir.clone(),
+            // This attach path carries no linked roots, so the root session
+            // stays single-root -- today's behavior, byte for byte.
+            extra_roots: Vec::new(),
         },
     )
     .map_err(|error| AttachFailure::new("attach", error))?;
@@ -457,6 +460,8 @@ mod tests {
             workdir: workdir.to_path_buf(),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
@@ -465,6 +470,7 @@ mod tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: true,
+            model_injected: false,
         }
     }
 
@@ -635,6 +641,8 @@ mod tests {
             workdir: directory.path().to_path_buf(),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
@@ -643,6 +651,7 @@ mod tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: true,
+            model_injected: false,
         };
         let socket = directory.path().join("runtime.sock");
 
@@ -679,6 +688,8 @@ mod tests {
             workdir: directory.path().to_path_buf(),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
@@ -687,6 +698,7 @@ mod tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: true,
+            model_injected: false,
         };
         let socket = directory.path().join("runtime.sock");
 

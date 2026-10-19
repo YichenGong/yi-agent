@@ -27,6 +27,9 @@ pub struct ThreadRoot {
     binding: Arc<RuntimeBinding>,
     thread_id: String,
     project_dir: PathBuf,
+    /// This conversation's linked roots (the primary root excluded). Fixed when
+    /// the root is created and re-sent verbatim on every re-attach.
+    extra_roots: Vec<PathBuf>,
     /// The cached root triple together with the runtime generation it was minted
     /// against. The generation and the triple are stored as one value so the two
     /// can never be read apart: a root is only ever paired with the runtime that
@@ -56,11 +59,13 @@ impl ThreadRoot {
         binding: Arc<RuntimeBinding>,
         thread_id: impl Into<String>,
         project_dir: PathBuf,
+        extra_roots: Vec<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             binding,
             thread_id: thread_id.into(),
             project_dir,
+            extra_roots,
             cached: Mutex::new(None),
         })
     }
@@ -74,7 +79,10 @@ impl ThreadRoot {
     pub fn from_handle(binding: Arc<RuntimeBinding>, root: AttachedRoot) -> Arc<Self> {
         let thread_id = root.session_id.clone();
         let project_dir = root.workspace.path.clone();
-        let thread_root = Self::new(binding, thread_id, project_dir);
+        // The TUI and the daemon's own workers are single-root by design: they
+        // were handed one already-attached root, and there is no second root to
+        // re-send.
+        let thread_root = Self::new(binding, thread_id, project_dir, Vec::new());
         *thread_root.lock_cached() = Some(CachedRoot {
             generation: 0,
             root,
@@ -130,6 +138,15 @@ impl ThreadRoot {
                 .send_with_generation(|_handle| IpcRequest::AttachApplicationRoot {
                     idempotency_key: application_root_key(&self.thread_id),
                     workspace: self.project_dir.clone(),
+                    // Re-sent on every attach, including a reconnect after a
+                    // daemon replacement: the daemon records them on creation
+                    // and restores them on adoption, so the session's root set
+                    // cannot be lost by a retry.
+                    extra_roots: self
+                        .extra_roots
+                        .iter()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .collect(),
                 })?;
         let IpcResponse::ApplicationRootAttached {
             session_id,
@@ -287,7 +304,12 @@ mod tests {
 
     #[test]
     fn a_repaired_runtime_drops_the_root_minted_before_it() {
-        let root_handle = ThreadRoot::new(fixed_binding(), "thread-a", PathBuf::from("/tmp/p"));
+        let root_handle = ThreadRoot::new(
+            fixed_binding(),
+            "thread-a",
+            PathBuf::from("/tmp/p"),
+            Vec::new(),
+        );
         *root_handle.lock_cached() = Some(CachedRoot {
             generation: 0,
             root: root("session-before", "root-before"),
@@ -315,7 +337,12 @@ mod tests {
     fn attach_is_a_no_op_while_a_live_root_is_cached() {
         // The binding points at a socket nothing listens on, so any real IPC
         // would fail. A live cached root must short-circuit before touching it.
-        let thread_root = ThreadRoot::new(fixed_binding(), "thread-a", PathBuf::from("/tmp/p"));
+        let thread_root = ThreadRoot::new(
+            fixed_binding(),
+            "thread-a",
+            PathBuf::from("/tmp/p"),
+            Vec::new(),
+        );
         *thread_root.lock_cached() = Some(CachedRoot {
             generation: 0,
             root: root("s", "adopted-root"),

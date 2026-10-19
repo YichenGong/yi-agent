@@ -1,12 +1,13 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, cleanup, screen, fireEvent } from "@testing-library/react";
+import { render, cleanup, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
 import type { NoticeItem } from "../lib/session";
+import { Session } from "../lib/session";
 
 // Count how often the settled tool card's component body runs. A streamed delta
 // on the trailing agent message must not touch items that cannot have changed.
-const calls = vi.hoisted(() => ({ tool: 0 }));
+const calls = vi.hoisted(() => ({ tool: 0, text: 0 }));
 
 vi.mock("./ToolCallCard", () => ({
   ToolCallCard: ({ item }: { item: { name: string } }) => {
@@ -16,7 +17,12 @@ vi.mock("./ToolCallCard", () => ({
 }));
 
 vi.mock("./MarkdownText", () => ({
-  AgentMessage: ({ text }: { text: string }) => <div>{text}</div>,
+  AgentMessage: ({ text }: { text: string }) => {
+    // Counted so a streamed delta on the tail cannot hide a re-render of the
+    // settled messages above it.
+    calls.text += 1;
+    return <div>{text}</div>;
+  },
 }));
 
 // 图片字节由 `image/read` 另取（见 useImageData），此处只验证气泡把 hook 给出的
@@ -30,6 +36,7 @@ import { ChatView } from "./ChatView";
 afterEach(() => {
   cleanup();
   calls.tool = 0;
+  calls.text = 0;
 });
 
 function items(): Item[] {
@@ -70,10 +77,14 @@ describe("ChatView streaming", () => {
 
   it("still re-renders a tool card whose status changed", () => {
     const list = items();
-    const { getByTestId, rerender } = render(<ChatView items={list} />);
+    // `Session.apply` replaces the slot with a new item object on item/completed.
+    // The card sits in the prefix (the streaming agent message is the tail), and
+    // an in-place slot replace is invisible to the prefix's identity checks —
+    // which is exactly why `Session` bumps `structuralVersion` there. Driving the
+    // same pair here is what a real completed tool call looks like to `ChatView`.
+    const { getByTestId, rerender } = render(<ChatView items={list} structuralVersion={1} />);
     expect(getByTestId("tool").textContent).toBe("bash");
 
-    // `Session.apply` replaces the slot with a new item object on item/completed.
     list[1] = {
       type: "toolCall",
       id: "tc1",
@@ -83,7 +94,7 @@ describe("ChatView streaming", () => {
       status: "failed",
       result: "boom",
     };
-    rerender(<ChatView items={list} />);
+    rerender(<ChatView items={list} structuralVersion={2} />);
     expect(calls.tool).toBe(2);
   });
 
@@ -316,5 +327,287 @@ describe("ChatView retry banner", () => {
       expect(text).toContain(`retrying ${retrying!.attempt}/${retrying!.max}`);
       unmount();
     }
+  });
+});
+
+describe("ChatView frozen prefix", () => {
+  it("does not re-render history above the streaming tail", () => {
+    const history: Item[] = [];
+    for (let i = 0; i < 200; i += 1) {
+      history.push({ type: "agentMessage", id: `h${i}`, text: `history ${i}` });
+    }
+    const tail = { type: "agentMessage", id: "tail", text: "" } as Item;
+    const list = [...history, tail];
+
+    const { rerender } = render(<ChatView items={list} />);
+    const settled = calls.text;
+    expect(settled).toBe(201); // every item rendered once on mount
+
+    // Stream 5 deltas *in place*, exactly like `Session.apply` does.
+    for (let i = 1; i <= 5; i += 1) {
+      (tail as { text: string }).text = "chunk ".repeat(i);
+      rerender(<ChatView items={list} />);
+    }
+
+    // Only the tail may have re-rendered. The 200 history items must not have.
+    expect(calls.text - settled).toBeLessThanOrEqual(5);
+  });
+
+  it("re-renders history when structuralVersion changes", () => {
+    const history: Item[] = [
+      { type: "agentMessage", id: "h1", text: "old" },
+      { type: "agentMessage", id: "tail", text: "streaming" },
+    ];
+    const { rerender } = render(<ChatView items={history} structuralVersion={1} />);
+    const before = calls.text;
+
+    // An `item/completed` replace: same index, new object, new text.
+    history[0] = { type: "agentMessage", id: "h1", text: "settled" };
+    rerender(<ChatView items={history} structuralVersion={2} />);
+
+    expect(calls.text).toBeGreaterThan(before);
+    expect(screen.getByText("settled")).toBeTruthy();
+  });
+
+  it("keeps a prefix reasoning block expanded across a structural change", () => {
+    // A structural bump must re-render the prefix **in place**, not remount it.
+    // `ReasoningBlock`'s expanded flag and `ToolCallCard`'s open flag are local
+    // state: remounting silently collapses a CoT the user opened, and re-issues
+    // every prefix bubble's image read. Structural bumps are frequent during a
+    // turn (`item/started` / `item/completed` / tool events), so a `key` here
+    // means such a block can never stay open while the session is live.
+    const history = [
+      { type: "userMessage", id: "u1", text: "hi" },
+      { type: "reasoning", id: "r1", text: "deep thought" },
+      { type: "agentMessage", id: "tail", text: "streaming" },
+    ] as unknown as (Item | NoticeItem)[];
+    const { rerender } = render(<ChatView items={history} structuralVersion={1} />);
+
+    const toggle = screen.getByRole("button", { name: /思考/ });
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("deep thought")).toBeTruthy();
+
+    // A structural change elsewhere in the prefix: same index, new object —
+    // exactly what `Session` does on `item/completed`.
+    history[0] = { type: "userMessage", id: "u1", text: "hi again" } as unknown as Item;
+    rerender(<ChatView items={history} structuralVersion={2} />);
+
+    expect(screen.getByText("hi again")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /思考/ }).getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("deep thought")).toBeTruthy();
+  });
+});
+
+describe("ChatView live tail", () => {
+  // The tail is not always the streaming agent message: `Session` pushes a
+  // reasoning block at the end when CoT resumes after the answer has started,
+  // which displaces the still-streaming message into the frozen prefix. These
+  // drive the real `Session` so the shape cannot drift from `apply`.
+  const listOf = (s: Session) => s.items as unknown as (Item | NoticeItem)[];
+
+  it("keeps streaming text live when CoT resumes and pushes it into the prefix", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "first " } });
+    // CoT resumes after the text started: the block lands at the tail and the
+    // streaming agent message is now the second-to-last item.
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: "hmm", kind: "Content" },
+    });
+    expect(s.items.map((i) => i.type)).toEqual(["agentMessage", "reasoning"]);
+
+    const view = (session: Session) => (
+      <ChatView items={listOf(session)} structuralVersion={session.structuralVersion} />
+    );
+    const { rerender, container } = render(view(s));
+    expect(container.textContent).toContain("first");
+
+    // A plain append, exactly like `Session.apply` does it.
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "second " } });
+    // The append is in place, so nothing `ChatView` compares by identity has
+    // moved; `Session` flags the displaced target instead so the prefix rebuilds.
+    rerender(view(s));
+
+    // The reply must not freeze just because a CoT block moved in behind it.
+    expect(container.textContent).toContain("first second");
+  });
+
+  it("keeps appended CoT visible while the reasoning block is the tail", () => {
+    const s = new Session();
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: "think", kind: "Content" },
+    });
+    const view = (session: Session) => (
+      <ChatView items={listOf(session)} structuralVersion={session.structuralVersion} />
+    );
+    const { rerender, container } = render(view(s));
+    fireEvent.click(screen.getByRole("button", { name: /思考/ })); // expand
+    expect(container.textContent).toContain("think");
+
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: " MORE", kind: "Content" },
+    });
+    rerender(view(s));
+
+    expect(container.textContent).toContain("think MORE");
+  });
+});
+
+describe("ChatView streaming markdown throttle", () => {
+  it("re-parses far fewer times than there are deltas, and still shows the final text", async () => {
+    const list: Item[] = [{ type: "agentMessage", id: "a1", text: "" } as Item];
+    const { container, rerender } = render(<ChatView items={list} />);
+    const settled = calls.text;
+
+    for (let i = 1; i <= 100; i += 1) {
+      (list[0] as { text: string }).text = "tok ".repeat(i);
+      rerender(<ChatView items={list} />);
+    }
+
+    // Far fewer than 100: the window collapses them.
+    expect(calls.text - settled).toBeLessThan(50);
+
+    // And the terminal value is visible — a throttle must not swallow it. The
+    // trailing edge defers by up to one window, so await it (a synchronous
+    // assertion here would fail for ANY correct throttle).
+    (list[0] as { text: string }).text = "FINAL";
+    rerender(<ChatView items={list} />);
+    await waitFor(() => expect(container.textContent).toContain("FINAL"));
+  });
+});
+
+describe("ChatView tail handover", () => {
+  it("does not leak the previous tail's throttled text into the next message", () => {
+    // A throttle is stateful; that state must not outlive the message it
+    // belongs to. Streaming deltas mutate the tail in place, so the *tail
+    // identity* is what changes when a turn ends and the next message starts —
+    // the throttle has to restart with it. Sharing one throttle across whoever
+    // is the tail makes the new reply render as a copy of the previous one
+    // until the old window elapses.
+    const first = { type: "agentMessage", id: "a1", text: "" } as Item;
+    const list: Item[] = [first];
+    const { container, rerender } = render(<ChatView items={list} />);
+
+    (first as { text: string }).text = "answer-one";
+    rerender(<ChatView items={list} />);
+
+    // Second turn starts inside the same throttle window.
+    const second = { type: "agentMessage", id: "a2", text: "answer-two" } as Item;
+    list.push(second);
+    rerender(<ChatView items={list} />);
+
+    expect(container.textContent).toContain("answer-two");
+    // The previous message stays rendered exactly once, in the frozen prefix.
+    expect(container.textContent?.match(/answer-one/g)).toHaveLength(1);
+  });
+});
+
+describe("ChatView auto-scroll", () => {
+  /** jsdom 没有布局引擎：给滚动容器装上可读写的滚动度量。 */
+  function installMetrics(
+    el: HTMLElement,
+    init: { scrollHeight: number; clientHeight: number; scrollTop?: number },
+  ) {
+    const state = {
+      scrollHeight: init.scrollHeight,
+      clientHeight: init.clientHeight,
+      scrollTop: init.scrollTop ?? 0,
+    };
+    Object.defineProperty(el, "scrollHeight", {
+      configurable: true,
+      get: () => state.scrollHeight,
+    });
+    Object.defineProperty(el, "clientHeight", {
+      configurable: true,
+      get: () => state.clientHeight,
+    });
+    Object.defineProperty(el, "scrollTop", {
+      configurable: true,
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        state.scrollTop = v;
+      },
+    });
+    return state;
+  }
+
+  function setup(init: { scrollTop?: number } = {}) {
+    const list = items();
+    const { container, rerender } = render(<ChatView items={list} threadId="t1" />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, {
+      scrollHeight: 1000,
+      clientHeight: 400,
+      scrollTop: init.scrollTop ?? 600,
+    });
+    fireEvent.scroll(scroller);
+    return { list, container, rerender, scroller, state };
+  }
+
+  it("leaves the reading position alone while the agent streams", () => {
+    // 用户上翻历史时，每来一个 delta 都不能把视口拽回底部——那会让用户
+    // 在生成期间反复手动上滑，等于无法浏览上面的内容。
+    const { list, rerender, state } = setup({ scrollTop: 100 });
+    for (let i = 1; i <= 5; i += 1) {
+      setText(list, "chunk ".repeat(i));
+      state.scrollHeight = 1000 + i * 100; // content grew below
+      rerender(<ChatView items={list} threadId="t1" />);
+    }
+    expect(state.scrollTop).toBe(100);
+  });
+
+  it("keeps following the stream while the user is at the bottom", () => {
+    const { list, rerender, state } = setup({ scrollTop: 600 });
+    setText(list, "hello");
+    state.scrollHeight = 1100;
+    rerender(<ChatView items={list} threadId="t1" />);
+    expect(state.scrollTop).toBe(1100);
+  });
+
+  it("jumps to a new error banner even when the user scrolled up", () => {
+    // 错误横幅是一次性事件，用户必须看到；它不能被「上翻历史」吞掉。
+    const { list, rerender, state } = setup({ scrollTop: 100 });
+    state.scrollHeight = 1040;
+    rerender(<ChatView items={list} threadId="t1" error="boom" />);
+    expect(state.scrollTop).toBe(1040);
+  });
+
+  it("opens a thread with history at the newest content", () => {
+    // 首次挂载时元素还没有滚动位置（scrollTop 为 0），贴底意图会被读成 false；
+    // 打开会话必须仍然落在最新内容上，而不是让用户自己滑到底。
+    const proto = HTMLElement.prototype;
+    const state = { scrollTop: 0 };
+    Object.defineProperty(proto, "scrollHeight", { configurable: true, get: () => 1000 });
+    Object.defineProperty(proto, "clientHeight", { configurable: true, get: () => 400 });
+    Object.defineProperty(proto, "scrollTop", {
+      configurable: true,
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        state.scrollTop = v;
+      },
+    });
+    try {
+      render(<ChatView items={items()} threadId="t1" />);
+      expect(state.scrollTop).toBe(1000);
+    } finally {
+      delete (proto as unknown as Record<string, unknown>).scrollHeight;
+      delete (proto as unknown as Record<string, unknown>).clientHeight;
+      delete (proto as unknown as Record<string, unknown>).scrollTop;
+    }
+  });
+
+  it("jumps to the newest content when the thread changes", () => {
+    // 切会话是明确意图：要看到这个会话的最新内容，而不是沿用上一个会话
+    // 的阅读位置（更不能因为上一个会话上翻过就停在中途）。
+    const { list, rerender, state } = setup({ scrollTop: 100 });
+    rerender(<ChatView items={list} threadId="t2" />);
+    expect(state.scrollTop).toBe(1000);
   });
 });

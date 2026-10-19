@@ -328,20 +328,9 @@ impl From<&Cli> for yi_agent_runtime::config::ConfigOverrides {
     }
 }
 
-/// 解析 .env 文件路径:优先 workdir CLI 参数,否则 YI_AGENT_WORKDIR 环境变量,否则当前目录。
-/// 所有路径均使用 `.yi-agent/.env` 子目录结构,避免与项目自身的 .env 冲突。
-pub fn resolve_env_path(cli: &Cli) -> std::path::PathBuf {
-    yi_agent_runtime::config::resolve_env_path(&cli.into())
-}
-
 /// 解析全局 .env 路径:~/.yi-agent/.env
 pub fn resolve_global_env_path() -> Option<PathBuf> {
     yi_agent_runtime::config::resolve_global_env_path()
-}
-
-/// 判断是否为显式指定 workdir(CLI 参数或环境变量)
-pub fn is_workdir_explicit(cli: &Cli) -> bool {
-    yi_agent_runtime::config::is_workdir_explicit(&cli.into())
 }
 
 /// Resolve the effective workdir without loading provider configuration.

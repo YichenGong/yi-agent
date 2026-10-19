@@ -214,6 +214,7 @@ impl EventSource for CrosstermEventSource {
 fn snapshot_for_tests() -> TuiConfigSnapshot {
     TuiConfigSnapshot {
         provider: "anthropic".into(),
+        model_injected: false,
         workdir: std::path::PathBuf::from("/tmp/proj"),
         sandbox: "workspace-write".into(),
         yolo: false,
@@ -572,6 +573,10 @@ fn run_loop<B: Backend, E: EventSource>(
             .iter()
             .filter(|snapshot| is_active_managed_process(&snapshot.status))
             .count();
+        // Read the dropped-cell count *outside* the draw closure: the closure
+        // already borrows `history` immutably, so this keeps that borrow simple
+        // and the count is a plain copy.
+        let trimmed_history = history.dropped_cells();
         terminal.draw(|f| {
             let chunks = layout.chunks.clone();
 
@@ -594,6 +599,7 @@ fn run_loop<B: Backend, E: EventSource>(
                 &statusbar_state,
                 &task_registry,
                 active_process_count,
+                trimmed_history,
                 &current_model,
                 chunks[2].width,
             );
@@ -758,6 +764,7 @@ fn run_loop<B: Backend, E: EventSource>(
                     effort_override.as_deref(),
                     catalog,
                     current_model_ref.as_deref(),
+                    config.model_injected,
                 );
                 match handle_key(
                     key,
@@ -2348,34 +2355,38 @@ impl EffortSource {
 
 /// Resolve the effective effort and its source from the live session state.
 ///
-/// Precedence mirrors the app-server (`thread_store` override > catalog entry
-/// `reasoning_effort` > unset): a session override always wins; without one, the
-/// selected catalog entry's value applies; with neither, the field is not sent.
+/// Precedence mirrors the app-server and the startup resolver exactly: a session
+/// override always wins; with no override, an **injected** package means no
+/// catalog entry applies (the request carries no field); otherwise the selected
+/// entry — `current_model_ref`, else the catalog's `default_model` — supplies
+/// the value, and with none of those the field is not sent.
 ///
 /// `current_model_ref` is the user-selected display name, and an absent one
-/// means "follow the catalog's `default_model`". This is the **same**
-/// entry-selection rule `startup_config_from_catalog` and the app-server's
-/// `effective_entry` use, so the effort `/effort` reports is the one the request
-/// carries — the cross-check is
-/// `main::tests::startup_sends_the_effort_the_tui_reports`.
+/// means "follow the catalog's `default_model`". `model_injected` comes from the
+/// real config (`RuntimeConfig::model_injected`) via [`TuiConfigSnapshot`]; it
+/// must be truthful, never synthesized from the catalog, or this reports a
+/// catalog tier the request will not carry.
+///
+/// The entry selection is `models::effective_entry_with_injection` — the *same*
+/// function `models::resolve_effective` drives the startup/send path with, so
+/// the effort `/effort` reports is the one the request carries (design §4.2
+/// level 2). The cross-checks are
+/// `main::tests::startup_sends_the_effort_the_tui_reports` and
+/// `main::tests::an_injected_startup_reports_the_effort_it_sends`.
 pub(crate) fn resolve_effort_state(
     session_effort: Option<&str>,
     catalog: &yi_agent_runtime::models::ModelCatalog,
     current_model_ref: Option<&str>,
+    model_injected: bool,
 ) -> (Option<String>, EffortSource) {
     if let Some(tier) = session_effort {
         return (Some(tier.to_string()), EffortSource::Session);
     }
-    let entry = current_model_ref
-        .and_then(|name| catalog.models.iter().find(|m| m.name == name))
-        .or_else(|| {
-            // 与 `yi_agent_runtime::models::effective_entry` 同口径:没有会话
-            // 覆盖时跟随清单 `default_model`。
-            catalog
-                .default_model
-                .as_deref()
-                .and_then(|name| catalog.models.iter().find(|m| m.name == name))
-        });
+    let entry = yi_agent_runtime::models::effective_entry_with_injection(
+        catalog,
+        current_model_ref,
+        model_injected,
+    );
     match entry.and_then(|e| e.reasoning_effort.as_deref()) {
         Some(tier) => (Some(tier.to_string()), EffortSource::Entry),
         None => (None, EffortSource::Unset),
@@ -2383,20 +2394,29 @@ pub(crate) fn resolve_effort_state(
 }
 
 /// Render the current effective effort and its source for `/effort` (no args).
-fn render_effort_status(effort: Option<&str>, source: EffortSource) -> String {
+fn render_effort_status(
+    effort: Option<&str>,
+    source: EffortSource,
+    supported: Option<&[String]>,
+) -> String {
+    // 状态行显示的「可用」必须与 `/effort <tier>` 实际放行的集合一致，否则用户
+    // 会照着一份点不动的清单去敲。能力未知时回落到七档（与放行口径同源）。
+    let available = match supported {
+        Some(list) if !list.is_empty() => list.join(" | "),
+        Some(_) => "（该模型不支持显式档位，仅 default 清覆盖）".to_string(),
+        None => crate::tui::slash::REASONING_EFFORT_TIERS.join(" | "),
+    };
     match effort {
         Some(tier) => format!(
             "当前推理档: {tier}（来源: {}）\n\
-             可用: {} | default\n\
+             可用: {available} | default\n\
              `/effort <档位>` 设置本会话覆盖，`/effort default` 清覆盖并回落条目默认。",
             source.label(),
-            crate::tui::slash::REASONING_EFFORT_TIERS.join(" | ")
         ),
         None => format!(
             "当前推理档: {}（即不发 `reasoning_effort` 字段，由模型自行决定）\n\
-             可用: {} | default",
+             可用: {available} | default",
             EffortSource::Unset.label(),
-            crate::tui::slash::REASONING_EFFORT_TIERS.join(" | ")
         ),
     }
 }
@@ -2417,12 +2437,14 @@ fn handle_effort_command(
     arg: Option<&str>,
     current_effort: Option<&str>,
     source: EffortSource,
+    // 该模型实测支持的档位；`None` = 能力未知（按七档放行）。
+    supported: Option<&[String]>,
     history: &mut HistoryState,
     width: u16,
 ) -> Option<crate::DriverControl> {
-    match crate::tui::slash::parse_effort_args(arg.unwrap_or("")) {
+    match crate::tui::slash::parse_effort_args_with_caps(arg.unwrap_or(""), supported) {
         Ok(crate::tui::slash::EffortAction::Status) => {
-            let text = render_effort_status(current_effort, source);
+            let text = render_effort_status(current_effort, source, supported);
             history.push(HistoryCell::Markdown { text }, width);
             None
         }
@@ -2604,10 +2626,19 @@ fn execute_slash_command(
             // 与 `/model` 同形状：清单相关的判定（当前条目默认档）已经由
             // run_loop 解析成 `current_effort`/`effort_source` 传进来，
             // 这里只负责校验 + 下发 + 打印状态。
+            // 条目选择与 `current_effort` 同一条规则：会话覆盖 > 注入 > 清单默认。
+            // 能力未知（`None`）时 `handle_effort_command` 沿用七档白名单。
+            let supported = yi_agent_runtime::models::effective_entry_with_injection(
+                catalog,
+                current_model_ref,
+                config.model_injected,
+            )
+            .and_then(yi_agent_runtime::models::supported_efforts);
             if let Some(command) = handle_effort_command(
                 args.as_deref(),
                 current_effort,
                 effort_source,
+                supported.as_deref(),
                 history,
                 width,
             ) {
@@ -9356,6 +9387,8 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
+            context_length: None,
         };
         ModelCatalog {
             models: vec![
@@ -9412,14 +9445,77 @@ mod tests {
     fn effort_command_sets_the_session_override() {
         let mut history = HistoryState::new();
 
-        let command =
-            handle_effort_command(Some("high"), None, EffortSource::Unset, &mut history, 80);
+        let command = handle_effort_command(
+            Some("high"),
+            None,
+            EffortSource::Unset,
+            None,
+            &mut history,
+            80,
+        );
         assert_eq!(
             command,
             Some(crate::DriverControl::SetReasoningEffort(Some(
                 "high".into()
             )))
         );
+    }
+
+    /// 端到端形状：能力已知时，`/effort <不支持档>` 只打印错误、**不下发**任何
+    /// 控制命令——否则 driver 会白跑一次必然失败的重建。
+    #[test]
+    fn effort_command_rejects_an_unsupported_tier_without_sending_it() {
+        let catalog = effort_catalog_for_tests();
+        let mut history = HistoryState::new();
+        let supported = vec!["low".to_string(), "medium".to_string()];
+
+        let command = handle_effort_command(
+            Some("max"),
+            Some("low"),
+            EffortSource::Session,
+            Some(&supported),
+            &mut history,
+            80,
+        );
+        assert!(
+            command.is_none(),
+            "an unsupported tier must not be sent to the driver"
+        );
+
+        // 支持的那一档照常下发。
+        let command = handle_effort_command(
+            Some("medium"),
+            Some("low"),
+            EffortSource::Session,
+            Some(&supported),
+            &mut history,
+            80,
+        );
+        assert_eq!(
+            command,
+            Some(crate::DriverControl::SetReasoningEffort(Some(
+                "medium".into()
+            )))
+        );
+        let _ = &catalog;
+    }
+
+    /// 状态行展示的「可用」集合必须与校验放行的集合一致，否则用户会照着点不动的
+    /// 清单去敲命令。
+    #[test]
+    fn effort_status_lists_only_the_supported_tiers() {
+        let supported = vec!["low".to_string(), "high".to_string()];
+        let text = render_effort_status(Some("low"), EffortSource::Session, Some(&supported));
+        assert!(text.contains("low | high"), "got: {text}");
+        assert!(
+            !text.contains("max"),
+            "an unsupported tier must not be advertised: {text}"
+        );
+
+        // 七档全被拒时给出明确的替代路径，而不是一行空白。
+        let none: Vec<String> = Vec::new();
+        let text = render_effort_status(None, EffortSource::Unset, Some(&none));
+        assert!(text.contains("仅 default"), "got: {text}");
     }
 
     #[test]
@@ -9431,6 +9527,7 @@ mod tests {
             Some("default"),
             Some("high"),
             EffortSource::Session,
+            None,
             &mut history,
             80,
         );
@@ -9450,8 +9547,14 @@ mod tests {
     fn effort_command_without_args_reports_the_effective_value_and_source() {
         let mut history = HistoryState::new();
 
-        let command =
-            handle_effort_command(None, Some("low"), EffortSource::Entry, &mut history, 80);
+        let command = handle_effort_command(
+            None,
+            Some("low"),
+            EffortSource::Entry,
+            None,
+            &mut history,
+            80,
+        );
 
         assert!(command.is_none(), "status must not send a control command");
         let text = markdown_bodies(&history);
@@ -9468,7 +9571,8 @@ mod tests {
     #[test]
     fn effort_command_without_args_reports_unset_as_unset() {
         let mut history = HistoryState::new();
-        let command = handle_effort_command(None, None, EffortSource::Unset, &mut history, 80);
+        let command =
+            handle_effort_command(None, None, EffortSource::Unset, None, &mut history, 80);
         assert!(command.is_none());
         let text = markdown_bodies(&history);
         assert!(
@@ -9481,8 +9585,14 @@ mod tests {
     #[test]
     fn effort_command_rejects_an_unknown_tier_with_a_usage_line() {
         let mut history = HistoryState::new();
-        let command =
-            handle_effort_command(Some("bogus"), None, EffortSource::Unset, &mut history, 80);
+        let command = handle_effort_command(
+            Some("bogus"),
+            None,
+            EffortSource::Unset,
+            None,
+            &mut history,
+            80,
+        );
         assert!(command.is_none(), "an unknown tier must not be sent");
         let labels = separator_labels(&history);
         assert!(
@@ -9497,22 +9607,22 @@ mod tests {
         let catalog = effort_catalog_for_tests();
 
         assert_eq!(
-            resolve_effort_state(Some("max"), &catalog, Some("A")),
+            resolve_effort_state(Some("max"), &catalog, Some("A"), false),
             (Some("max".into()), EffortSource::Session)
         );
         assert_eq!(
-            resolve_effort_state(None, &catalog, Some("A")),
+            resolve_effort_state(None, &catalog, Some("A"), false),
             (Some("low".into()), EffortSource::Entry),
             "no override: the selected entry's own default applies"
         );
         assert_eq!(
-            resolve_effort_state(None, &catalog, Some("B")),
+            resolve_effort_state(None, &catalog, Some("B"), false),
             (None, EffortSource::Unset),
             "entry B declares no effort"
         );
         // 无选中显示名 = 跟随清单 default_model(A, low)。
         assert_eq!(
-            resolve_effort_state(None, &catalog, None),
+            resolve_effort_state(None, &catalog, None, false),
             (Some("low".into()), EffortSource::Entry)
         );
     }

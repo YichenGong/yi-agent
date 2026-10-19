@@ -1,0 +1,41 @@
+{
+  "_comment": "宿主 `session_driver` 与插件 `driver/next` 共用的线协议契约。两侧的测试都用 include_str! 读它（编译期依赖，改名/删除也会红）——同一份文件、两端各自断言。任一侧改了字段名而没同步这里，那一侧的测试就红。",
+  "request": {
+    "_comment": "宿主 → 插件：`driver/next` 的参数形状（宿主 `threads_payload` / `driver_step` 发出，插件 `dispatch.rs` 手工解析）。",
+    "threads": [
+      {
+        "thread_id": "thread-1",
+        "idle": true
+      }
+    ],
+    "results": [
+      {
+        "action_id": "act-1",
+        "ok": true,
+        "thread_id": "thread-1",
+        "error": null
+      }
+    ]
+  },
+  "answers": {
+    "_comment": "插件 → 宿主：`driver/next` 的三种应答形状。前两种由宿主 `parse_action` 解析成动作，最后一种表示这一拍无事可做。",
+    "launch": {
+      "action_id": "act-2",
+      "kind": "launch",
+      "workdir": "/w/card-1",
+      "title": "看板 · a.spec",
+      "objective": "do the card",
+      "driver_project": "/proj",
+      "driver_ref": "card-1"
+    },
+    "append": {
+      "action_id": "act-3",
+      "kind": "append",
+      "thread_id": "thread-1",
+      "objective": "merge it"
+    },
+    "nothing": {
+      "action": null
+    }
+  }
+}

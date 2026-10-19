@@ -52,7 +52,9 @@ import { SuperpowersKanbanSettings } from "./components/SuperpowersKanbanSetting
 import { SuperpowersKanbanEnqueue } from "./components/SuperpowersKanbanEnqueue";
 import {
   enqueueBoardCard,
+  enqueuePrequeuedCard,
   parseBoardWatchman,
+  promoteBoardCard,
   setBoardSwitch,
   writeBoardWatchman,
 } from "./lib/superpowersKanbanSwitch";
@@ -70,10 +72,16 @@ import { estimateCost, formatCost } from "./lib/pricing";
 import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
-import { OnboardingWizard, type OnboardingOutcome } from "./components/OnboardingWizard";
+import { OnboardingWizard } from "./components/OnboardingWizard";
 import { onboardingStatus } from "./lib/onboarding";
 import { readListCache, writeListCache } from "./lib/sessionCache";
-import { createContentStore, persistContent, type AsyncContentStore } from "./lib/contentStore";
+import { createContentStore, persistContent, type AsyncContentStore, type ContentEntry } from "./lib/contentStore";
+import { parseSyncPlan, resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
+import { useDragDropPaths } from "./hooks/useDragDropPaths";
+import { subscribeDragDrop } from "./lib/dragDropSubscribe";
+import { notifyModelCapabilitiesChanged } from "./lib/modelCapabilitiesBus";
+import type { ReasoningCapabilities } from "./lib/models";
+import { insertDroppedPaths } from "./lib/droppedPaths";
 
 /**
  * 看板失败的四种说法。
@@ -177,6 +185,12 @@ export default function App() {
   // window bounds how many histories stream live; the rest stay cold and are
   // caught up on demand with `thread/readItems`.
   const subWindow = useRef(new SubscriptionWindow());
+  // 本连接里已为「plan 判 none 的缓存会话」补过尾部只读 readItems 的会话。按**连接**
+  // 记账（`connect()` 建新客户端时清空）：这样任何一次重连——sidecar 重启、或 socket
+  // 掉了但进程还在（经中继的瞬断、切回前台）——都会为这些会话重补一次；而同一连接内
+  // 切回它们不再重复发请求。若改用 `subWindow`（订阅窗口）判定则漏掉后一种重连
+  // （窗口只在 `exited` 时清），正是「warm idle 会话永远停在缓存尾部」的残留缺口。
+  const toppedUp = useRef(new Set<string>());
   // Approvals the user has dismissed from the banner; keyed by approval id.
   const dismissedApprovals = useRef(new Set<string>());
   // 每个会话待发送的附件。按会话隔离，与草稿同理：切走时留在原会话、切回时
@@ -203,6 +217,10 @@ export default function App() {
   const persistTimers = useRef(new Map<string, number>());
   // 内容来自缓存、尚未被服务端覆盖的会话 → 其 `savedAt`（供离线提示）。
   const cachedAt = useRef(new Map<string, number>());
+  /** 每个会话的缓存元数据（epoch / 游标 / 是否被裁剪），用于组装 hints 与裁决。 */
+  const cacheMetaRef = useRef(new Map<string, ContentEntry>());
+  /** 本连接的 syncPlan（`initialize` 的响应），按 threadId 索引。 */
+  const syncPlanRef = useRef(new Map<string, { action: SyncAction; epoch: number }>());
 
   /**
    * 从内容缓存预填某会话的对话（手机端）。服务端 item 到达后按 id 就地替换，
@@ -218,8 +236,13 @@ export default function App() {
       .read(id)
       .then((entry) => {
         if (!entry || entry.items.length === 0) return;
+        // 记下元数据供 hints 与裁决使用（即使本次不注入内容）。
+        cacheMetaRef.current.set(entry.threadId, entry);
         const v = store.peek(id);
-        if (!v || v.session.items.length > 0) return; // 服务端已经填过
+        if (!v) return;
+        // 已被判过过期（世代变化）⇒ 绝不把旧内容注回（spec §6.4）。
+        if (v.session.epochInvalidated) return;
+        if (v.session.items.length > 0) return; // 服务端已经填过
         v.session.upsertItems(entry.items);
         v.session.lastServerItemId = v.session.lastServerItemId ?? entry.lastServerItemId;
         cachedAt.current.set(id, entry.savedAt);
@@ -229,6 +252,41 @@ export default function App() {
         // 预填是附加能力：读失败保留空态，由 resume 兜底。
       });
   };
+
+  /**
+   * Declare what this client holds, on the very first frame (spec §4.1).
+   * Only remote clients send it; the desktop path stays byte-identical.
+   */
+  const buildResumeHints = () => {
+    const metas = [...cacheMetaRef.current.values()];
+    return metas
+      .sort((a, b) => b.savedAt - a.savedAt)
+      .slice(0, 20)
+      .map((e) => ({
+        threadId: e.threadId,
+        contentEpoch: e.contentEpoch ?? 0,
+        lastItemId: e.lastServerItemId,
+        cachedAt: e.savedAt,
+      }));
+  };
+
+  // 冷启首帧：把缓存里已有的条目读进内存元数据，供首次 initialize 的 hints 使用。
+  // `contentStore.keys()` 已存在；读失败静默跳过（hints 是优化，不能挡住握手）。
+  useEffect(() => {
+    if (!isRemoteClient()) return;
+    const cs = getContentStore();
+    void (async () => {
+      try {
+        for (const id of await cs.keys()) {
+          const entry = await cs.read(id);
+          if (entry) cacheMetaRef.current.set(entry.threadId, entry);
+        }
+      } catch {
+        /* hints 是优化：读失败就按"没有缓存"声明 */
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   /** 节流：内容变更后延迟落盘，避免逐字 delta 每次都写 IndexedDB。 */
   const CONTENT_PERSIST_DEBOUNCE_MS = 800;
   const schedulePersist = (id: string) => {
@@ -337,6 +395,20 @@ export default function App() {
   );
 
   /**
+   * 「MCP」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖即稳定；
+   * 若每次渲染换新身份，MCP 面板的读取 effect 会跟着重跑，把已展开的工具清单与
+   * 折叠状态一起冲掉。
+   */
+  const mcpCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
    * 图片读取的宿主接缝（`image/read`）。理由同 `pluginCall`：只闭合 `clientRef`，
    * 空依赖即稳定。`ChatView` 把它透传给每个气泡/工具卡的 `useImageData`，而那个
    * effect 依赖 `call`——一旦每次渲染换新函数身份，每张图都会重新分片拉取。
@@ -370,10 +442,9 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 连上即清"内容来自缓存"的标记：此刻起服务端是唯一来源，提示条退场。
-  useEffect(() => {
-    if (status === "connected") cachedAt.current.clear();
-  }, [status]);
+  // 连上即清"内容来自缓存"的标记——已改为在该会话对账完成后按会话清除
+  // （selectThread 的 resume/readItems 收尾），否则另一个仍在显示缓存的会话
+  // 会失去标注（spec §5.3）。
 
   // 页面隐藏 / 卸载时把在途的会话内容立刻写盘：手机切后台后可能很久不再执行
   // 定时器，等着防抖会把最后一段内容丢掉。
@@ -405,7 +476,10 @@ export default function App() {
    * resumed once; per-thread isolation means the base session list/sidebar can
    * keep serving other threads in parallel.
    */
-  const selectThread = async (id: string, opts?: { leaveBoard?: boolean }) => {
+  const selectThread = async (
+    id: string,
+    opts?: { leaveBoard?: boolean; forceResume?: boolean },
+  ) => {
     const prevId = store.currentId;
     store.select(id);
     sess.setCurrentId(id);
@@ -434,6 +508,66 @@ export default function App() {
     // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
     proc.setOpenProcessId(null);
     proc.setProcessOutput(null);
+    // 服务端对本次会话的裁决（spec §4.2）。注意 plan 以 threadId 为键直接查：
+    // 被删除的会话不会出现在 listAll 里，靠 summary 反查必然查不到它的 `drop`。
+    // `noneNeedsCatchUp`：裁决为 none 的缓存会话仍**可能落后于服务端尾部**——
+    // none 只表示「缓存不必作废」，不是「已是最新」（spec §4.2）。锁住这一点后
+    // 由下方的只读 readItems 补齐（不打断在途回合），否则会永远停在缓存尾部。
+    let noneNeedsCatchUp = false;
+    if (isRemoteClient()) {
+      const planEntry = syncPlanRef.current.get(id);
+      const cached = cacheMetaRef.current.get(id) ?? null;
+      const view = store.peek(id);
+      if (view) {
+        const summary =
+          sess.pinned.find((t) => t.thread_id === id) ??
+          sess.groups.flatMap((g) => g.threads).find((t) => t.thread_id === id) ??
+          null;
+        // 先取服务端裁决（plan 覆盖该会话时以它为准，否则按 listAll 版本兜底）。
+        const resolved =
+          planEntry?.action ?? resolveSyncPlan({ plan: syncPlanRef.current, summary, cached });
+        // 客户端例外必须在**调用点**再判一次：`resolveSyncPlan` 内部那条同名例外
+        // 会被 `planEntry?.action` 短路掉（plan 覆盖该会话时根本不进那个函数），
+        // 于是「缓存被裁剪过 ⇒ 即使服务端正确地说 none 也要全量补齐头部」就失效，
+        // 用户会静默看到一个被截断的会话（spec §4.2 例外）。这条只依赖客户端自己
+        // 知道的信息（自己有没有裁过），故与 plan 是否覆盖无关。
+        const action: SyncAction =
+          resolved === "none" && cached?.trimmed ? "full" : resolved;
+        // 把缓存条目的已知世代先记为本地已知世代：否则本会话首见时
+        // `session.contentEpoch` 仍是 null，`full`（世代已变）会被 adoptEpoch
+        // 当作"首见"只记录、不作废，幽灵内容留在屏上（spec §4.2）。
+        // 老条目缺 `contentEpoch`（未知）时不播种 ⇒ 保持 null ⇒ 只记录不作废，
+        // 「缺字段=保守」且不误删内容。
+        if (cached?.contentEpoch != null && view.session.contentEpoch === null) {
+          view.session.contentEpoch = cached.contentEpoch;
+        }
+        if (action === "drop") {
+          // 会话已不存在：丢掉本地状态与缓存，回落第一条。
+          store.drop(id);
+          cacheMetaRef.current.delete(id);
+          void getContentStore().delete(id);
+          cachedAt.current.delete(id);
+          if (sess.currentIdRef.current === id) {
+            const first = sess.pinned[0] ?? sess.groups.flatMap((g) => g.threads)[0];
+            if (first) void selectThread(first.thread_id, { leaveBoard: false });
+          }
+          return;
+        }
+        const epoch = planEntry?.epoch ?? summary?.content_epoch ?? 0;
+        if (action === "none" && cached) {
+          // 缓存有效：不必整段重放，但**不表示已是最新**——用户手上的内容很可能
+          // 落后于服务端尾部（两端并存的常态，spec §4.2/§7.2）。置 `warm` 让下方
+          // 的 resume 守卫接管，同时**置位补齐标记**：下方会为它做一次只读
+          // `thread/readItems`（不打断任何在途回合），把落后的尾部补回来。
+          view.session.adoptEpoch(epoch, cached.lastServerItemId);
+          warm.current.add(id);
+          noneNeedsCatchUp = true;
+        } else {
+          // full：按世代作废。epoch 取服务端的权威值（0 仅表示"未知"，用于触发作废）。
+          view.session.adoptEpoch(epoch, null);
+        }
+      }
+    }
     // **看**一个运行中的会话绝不走 `thread/resume`：resume 会先中断在跑的
     // turn（服务端 `interrupt_and_wait_for_persist`），而「点开看一眼」是纯
     // 被动动作，不该有把别人打断的副作用。改用只读的 `thread/readItems` 补齐
@@ -446,18 +580,70 @@ export default function App() {
 
     // Remote-only (S2): keep this thread in the warm subscription window.
     // Desktop (stdio) never subscribes: its single client receives everything.
-    let inWindow = false;
+    //
+    // `forceResume`（stale_context 重同步）：锚点失效意味着服务端内容已整段变化，
+    // 必须走**全量** resume 重新对账。此前的 warm / 订阅窗口 / running 三道早退都会
+    // 让 resume 永不发生（当前会话必在订阅窗口内），故置位时全部跳过（spec §7.3）。
     if (isRemoteClient()) {
-      inWindow = subWindow.current.has(id);
+      const inWindow = subWindow.current.has(id);
       const win = subWindow.current.touch(id);
-      void clientRef.current
-        ?.request("thread/subscribe", { threadIds: win })
-        .catch(() => {});
-      // Already warm → view-only swap.
-      if (inWindow) return;
+      const c0 = clientRef.current;
+      if (c0) {
+        void c0.request("thread/subscribe", { threadIds: win }).catch(() => {});
+        // 冷+在跑（原逻辑）：内容确定要被替换，收紧门槛。
+        const catchingUp = !inWindow && running && !opts?.forceResume;
+        // plan 判 none 的缓存会话：服务端已判缓存有效（spec §4.2），落后是正常
+        // 并存形状（§7.2）——故补齐是**静默**的，不挂「正在同步」也不拦发送，
+        // 但仍要补一次尾部，否则用户永远停在缓存尾部却以为内容是最新的。
+        // 每连接每会话只补一次：`toppedUp` 在 `connect()` 建新客户端时清空，故任何
+        // 一次重连都会重补；`forceResume` 例外（那是 stale_context 触发的全量重放，
+        // 另行会发 `thread/resume`，再补一次只读 `readItems` 是多余的）。
+        const silentTopUp =
+          noneNeedsCatchUp && !catchingUp && !toppedUp.current.has(id) && !opts?.forceResume;
+        if (silentTopUp) toppedUp.current.add(id);
+        if (catchingUp || silentTopUp) {
+          const after = store.peek(id)?.session.lastServerItemId ?? null;
+          // 对账开始：内容随时可能是旧的，UI 与发送门槛据此收紧（spec §5.1）。
+          if (curView && !silentTopUp) curView.syncState = "syncing";
+          void (async () => {
+            try {
+              const r = await c0.request<{ items: Item[] }>(
+                "thread/readItems",
+                after ? { threadId: id, afterItemId: after } : { threadId: id },
+              );
+              const v = store.peek(id);
+              if (v) {
+                v.session.upsertItems(r.items);
+                force((n) => n + 1);
+              }
+            } catch {
+              // 补齐是附加能力:读失败就保留已有内容,不改动会话状态。
+            } finally {
+              // 无论成败都必须收敛，否则用户会永久卡在"正在同步"（spec §11 风险 3）。
+              const v = store.peek(id);
+              if (v) {
+                if (!silentTopUp) {
+                  v.syncState = "synced";
+                  // 该会话已与服务端对过账：去掉"这是缓存"的标注（spec §5.3）。
+                  // 静默补齐保留标注：内容仍源自缓存，离线时理应继续标注（§5.3）。
+                  cachedAt.current.delete(id);
+                }
+                force((n) => n + 1);
+              }
+            }
+          })();
+        }
+      }
+      // Already warm, or caught up via readItems above → view-only swap.
+      // `forceResume` 例外：全量重同步必须落到下面的 resume 分支（spec §7.3）。
+      if ((inWindow || running) && !opts?.forceResume) return;
     }
-
-    if (running) {
+    if (running && !isRemoteClient()) {
+      // 桌面端同样成立：**看**一个运行中的会话绝不走 `thread/resume`（resume 会先
+      // 中断在跑的 turn），改用只读的 `thread/readItems` 补齐内容。这不设 `syncing`
+      // 也不挂提示条：桌面端没有缓存，内容恒来自服务端。
+      // （远端 running 已在上面的远端分支内处理并早退；唯一走到这里的远端情形是
+      // `forceResume`——那是 stale_context 触发的全量重放，必须落到 resume。）
       const c0 = clientRef.current;
       if (c0) {
         const after = store.peek(id)?.session.lastServerItemId ?? null;
@@ -479,9 +665,14 @@ export default function App() {
       }
       return;
     }
-    if (warm.current.has(id) || inFlightResume.current.has(id)) return; // warm → 只切视图
+    if ((warm.current.has(id) || inFlightResume.current.has(id)) && !opts?.forceResume) {
+      return; // warm → 只切视图
+    }
     const c = clientRef.current;
     if (!c) return;
+    // 对账开始：全量回放在途，内容随时可能是旧的，UI 与发送门槛据此收紧（spec §5.1）。
+    const coldView = store.peek(id);
+    if (coldView) coldView.syncState = "syncing";
     inFlightResume.current.add(id);
     // 全量回放期间收集服务端 item id；成功后据此删掉缓存里服务端已经没有的项
     // （clear / compact / 裁剪造成的幽灵内容）。readItems 只补尾部，不走这条路径。
@@ -506,6 +697,9 @@ export default function App() {
       const view = store.peek(id);
       if (!view) return;
       warm.current.add(id);
+      // 对账完成：内容已是服务端权威，解禁发送并去掉"这是缓存"的标注（spec §5.1/§5.3）。
+      view.syncState = "synced";
+      cachedAt.current.delete(id);
       void flushContent(id);
       // 响应直接带权威 mode：一次请求即定,不受 listAll 快照的竞态/失败影响
       // （「手机上打开会话时 YOLO 概率性没同步过来」的修复点）。
@@ -528,7 +722,11 @@ export default function App() {
       // 同样地,失败路径只在视图仍存在时写错误,避免 re-create 一个已被
       // drop 的 ThreadView(无界泄漏 + 残留 warm 条目)。
       const view = store.peek(id);
-      if (view) view.session.lastError = formatError(e);
+      if (view) {
+        view.session.lastError = formatError(e);
+        // 失败也必须收敛，否则用户会永久卡在"正在同步"（spec §11 风险 3）。
+        view.syncState = "synced";
+      }
       force((v) => v + 1);
     } finally {
       inFlightResume.current.delete(id);
@@ -986,6 +1184,20 @@ export default function App() {
     // 这些回调必须随新客户端重新登记(旧客户端的 transport 已随管道断开)。
     const wireClient = (client: RpcClient) => {
       client.onNotification((n) => {
+        // A driven session is created outside the desktop's thread/start RPC, so
+        // it may not exist in the cached groups when its first Running status
+        // arrives. Pull the authoritative list once for an unknown thread; waiting
+        // for turn/completed leaves running board cards invisible for the whole run.
+        if (
+          n.method === "thread/status/updated" &&
+          n.params.status === "running" &&
+          !sess.groupsRef.current.some((g) =>
+            g.threads.some((t) => t.thread_id === n.params.thread_id),
+          ) &&
+          !sess.pinnedRef.current.some((t) => t.thread_id === n.params.thread_id)
+        ) {
+          void sess.refreshThreads();
+        }
         // 子 agent 的通知不进 ThreadStore:它们是对话的附属视图,不是对话本身。
         if (n.method === "agent/children/updated") {
           railStore.applyNotification(n.params.threadId, n.params.children);
@@ -999,6 +1211,19 @@ export default function App() {
           const next = parseTheme(n.params.theme);
           prefs.confirmedThemeRef.current = next;
           prefs.setTheme(next);
+          return;
+        }
+        if (n.method === "model/capabilitiesChanged") {
+          // 宿主探测完成的权威结果。桌面端没有全局模型清单 store（设置页与输入区
+          // 的模型下拉各自持有一份），所以这里只把「哪条变了」广播出去，由各自
+          // 重读 `model/list`。协议字段在生成物里是 `unknown`（runtime 类型没有
+          // TS 绑定），这里按线上形状断言一次。
+          notifyModelCapabilitiesChanged({
+            name: n.params.name,
+            capabilities:
+              (n.params
+                .reasoning_capabilities as ReasoningCapabilities | null | undefined) ?? null,
+          });
           return;
         }
         if (n.method === "ui/gitDiff/focus") {
@@ -1016,7 +1241,15 @@ export default function App() {
           sess.setPanelOpen(true);
           // 提示语随快照走（见 `pendingNoteRef`）：此行只登记挂起值。
           diff.setPendingDiffNote(n.params.note ?? null);
-          void diff.loadThreadDiff(target, n.params.base);
+          // 基准不再随通知携带（通知里已没有 `base`）：它现在由**帧**承载。
+          // 两条都取，各司其职：
+          //  - `loadViewFrame` 拿**模型给的命令帧**（`thread/view/read`）——focus 的
+          //    主角，头部命令条与三种原语都来自它；
+          //  - `loadThreadDiff` 仍拿结构化快照——它给的是 `commits/files` 列表与
+          //    汇总行的 `+X −Y`，也是**无帧**时的正文兜底（旧会话、纯结构化推送）。
+          // 帧到了就由帧渲染正文（`GitDiffView`），没到就退回这份快照。
+          void diff.loadViewFrame(target);
+          void diff.loadThreadDiff(target);
           return;
         }
         if (n.method === "agent/trace/event") {
@@ -1119,6 +1352,8 @@ export default function App() {
           // 同样的理由:新进程不记得任何订阅,窗口必须清空,否则重连后
           // 返回"看起来还 warm"的会话时不会再发 subscribe,内容通知被静默过滤。
           subWindow.current = new SubscriptionWindow();
+          // 新连接要为「none 缓存会话」重补一次尾部（见 `toppedUp` 的说明）。
+          toppedUp.current.clear();
           scheduleReconnect();
         }
       });
@@ -1127,7 +1362,10 @@ export default function App() {
     // 一次完整握手:任何一次重连都要重放它,因为新进程的记忆是空的。
     const handshake = async (client: RpcClient) => {
       try {
-        await client.request("initialize", {});
+        const initialized = await client.request<Record<string, unknown>>("initialize", {
+          ...(isRemoteClient() ? { resumeHints: buildResumeHints() } : {}),
+        });
+        syncPlanRef.current = parseSyncPlan(initialized);
         const settings = await client.request<{
           theme?: unknown;
           board_watchman_enabled?: unknown;
@@ -1276,6 +1514,8 @@ export default function App() {
       // twice: an append-only `item/delta` duplicates the streamed text, and it
       // only "converges" because `item/completed` replaces the whole item by id.
       clientRef.current?.dispose();
+      // 新连接 = 新的对账周期：为「none 缓存会话」的静默补齐重新开账（见 `toppedUp`）。
+      toppedUp.current.clear();
       const client = new RpcClient(transportFactory(), (raw) => recoveryRef.current!(raw));
       clientRef.current = client;
       wireClient(client);
@@ -1377,8 +1617,10 @@ export default function App() {
     if (!id || !c) return false;
     // 离线时不发：缓存内容可以看，但不能对着它发消息（服务端根本收不到）。
     // 只提示、保留草稿，交给用户连上后再发——不排队、不自动重发。
-    if (offline) {
-      store.view(id).session.lastError = "正在连接，请稍候";
+    // 同样地，会话尚在对账中（syncing）也不能发：屏上可能还是旧缓存，此刻发出去
+    // 的上下文与服务端实际上下文可能不一致（spec §5.1）。
+    if (offline || store.peek(id)?.syncState === "syncing") {
+      store.view(id).session.lastError = offline ? "正在连接，请稍候" : "正在同步，请稍候";
       force((v) => v + 1);
       return false;
     }
@@ -1426,14 +1668,52 @@ export default function App() {
     const hasFiles = files.length > 0;
     let method: "turn/interject" | "turn/start" =
       !hasFiles && store.peek(id)?.status === "running" ? "turn/interject" : "turn/start";
+    // 上下文锚点（spec §7.1）：客户端声明它以为的会话世代与游标。只在 `turn/start`
+    // 上发（`turn/interject` 是并入在途回合，不重开上下文），且仅手机端发；桌面端
+    // 字节不变。`contentEpoch` 未知（null）时不发——缺字段=保守，服务端就不校验。
+    const withAnchor = (m: "turn/interject" | "turn/start") =>
+      isRemoteClient() && session.contentEpoch !== null && m === "turn/start"
+        ? {
+            ...params,
+            contextAnchor: {
+              contentEpoch: session.contentEpoch,
+              lastItemId: session.lastServerItemId,
+            },
+          }
+        : params;
     let lastError: unknown = null;
     for (let hop = 0; hop < 2; hop += 1) {
       try {
-        await c.request(method, params);
+        await c.request(method, withAnchor(method));
         // 成功才清空该会话的待发附件（本地路径），服务端已把它们落库。
         setPending((prev) => ({ ...prev, [id]: [] }));
         return true;
       } catch (e) {
+        // 锚点已失效（会话在别处被清空）：绝不自动重发——用户的意图不该落到一个
+        // 他没看过的上下文上。置 syncing、清掉两道会挡住重同步的守卫、走全量 resume
+        // （spec §7.3）。先于既有的错误处理，否则会被当成普通失败。
+        if (
+          isRemoteClient() &&
+          (e as { data?: { code?: string } } | undefined)?.data?.code === "stale_context"
+        ) {
+          const v = store.peek(id);
+          if (v) {
+            v.syncState = "syncing";
+            // `0` 只是「强制作废」的哨兵：清掉 warm 后 selectThread 会走 resume 全量
+            // 回放，回放中 upsertItems 会以真实世代覆盖它。
+            v.session.adoptEpoch(0, null);
+          }
+          warm.current.delete(id);
+          inFlightResume.current.delete(id);
+          store.view(id).session.lastError = "会话内容已在别处被清空，正在重新加载";
+          // 发送没有成功：乐观回声必须回滚，否则转录里会留下一条「已发出」的幽灵
+          // 消息（与下方的普通失败路径一致）。草稿与待发附件保留，用户确认后可重发
+          //（spec §7.3「草稿保留」）。
+          session.dropLocalUserMessage(text);
+          force((n) => n + 1);
+          void selectThread(id, { leaveBoard: false, forceResume: true });
+          return false;
+        }
         lastError = e;
         const code = sendMethodMismatchCode(e);
         // 带附件时没有可换的方法：换到 turn/interject 只会丢掉附件。就地失败，
@@ -1615,6 +1895,41 @@ export default function App() {
   };
 
   /**
+   * 拖入的路径落点：光标位置（不驱动渲染，故用 ref）与最近一次定位请求。
+   *
+   * `caret` 记用户最后一次移动光标的位置，拖入时用它决定插在哪；`seek` 是给
+   * `MessageInput` 的"把光标放到这里"请求，用自增 `seq` 让同位置连拖也能各生效一次。
+   */
+  const composerCaret = useRef(0);
+  const seekSeq = useRef(0);
+  const [caretSeek, setCaretSeek] = useState<{ seq: number; pos: number } | null>(null);
+  const composerCardRef = useRef<HTMLDivElement | null>(null);
+
+  /**
+   * 把拖入的路径插进**当前会话**的草稿。
+   *
+   * 与 `changeDraft` 同一条通路（写 `view(id).draft` + `force`）：草稿属于会话，
+   * 所以切走再切回，路径仍在原会话的输入框里。没有当前会话时无处可放，忽略——
+   * 与输入框的 `disabled` 护栏一致，不留"拖进去却静默丢路径"的死路。
+   */
+  const dropPathsIntoDraft = (paths: string[]): void => {
+    const id = store.currentId;
+    if (!id) return;
+    const { text, caret } = insertDroppedPaths(store.view(id).draft, composerCaret.current, paths);
+    store.setDraft(id, text);
+    composerCaret.current = caret;
+    setCaretSeek({ seq: ++seekSeq.current, pos: caret });
+    force((v) => v + 1);
+  };
+
+  const dragDrop = useDragDropPaths({
+    subscribe: subscribeDragDrop,
+    isRemote: isRemoteClient(),
+    targetRef: composerCardRef,
+    onDrop: dropPathsIntoDraft,
+  });
+
+  /**
    * 记下某会话下拉写入成功后的模型结果。
    *
    * 只更新**那个**会话的 `info.model_ref` / `info.model`：写的是哪个会话，就更新
@@ -1729,16 +2044,8 @@ export default function App() {
         <OnboardingWizard
           reasons={prefs.onboarding.reasons}
           call={(m, p) => (clientRef.current as RpcClient).request(m, p)}
-          onDone={(result?: OnboardingOutcome) => {
+          onDone={() => {
             prefs.setOnboarding({ needed: false, reasons: [] });
-            // `.env` 已写、清单没收边（部分成功）：主界面顶部留一条可关闭提示，
-            // 别让用户在「已保存」与「模型仍不可用」之间一头雾水。
-            if (result && !result.imported) {
-              prefs.setOnboardingNotice(
-                "已保存到 .env，但未纳入模型清单（可稍后在设置里点「导入当前配置」）" +
-                  (result.importError ? `：${result.importError}` : ""),
-              );
-            }
             // 新配置要重启侧车才生效（cfg/清单在启动时读入）。宿主重启后会经
             // 既有 exited → 重新握手路径刷回来；顺带尽力刷一次模型清单。
             void restartSidecar();
@@ -1748,25 +2055,6 @@ export default function App() {
       )}
       <div className="app-shell flex h-screen flex-col bg-surface text-fg">
         <TitleBar />
-        {/* 引导部分成功的提示（spec §4.7）：可关闭的顶部横幅，样式与 ApprovalBanner
-            一致；关闭即清空状态，不再出现。 */}
-        {prefs.onboardingNotice !== null && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="flex flex-wrap items-center gap-3 border-b border-amber-900/60 bg-amber-950/60 px-3 py-2 text-xs text-amber-100"
-          >
-            <span className="min-w-0">{prefs.onboardingNotice}</span>
-            <button
-              type="button"
-              onClick={() => prefs.setOnboardingNotice(null)}
-              aria-label="关闭提示"
-              className="ml-auto rounded px-1 text-amber-300 hover:text-amber-100"
-            >
-              ✕
-            </button>
-          </div>
-        )}
         <div className="flex min-h-0 flex-1 flex-row">
         {isMobile && sess.sidebarOpen && (
           <div
@@ -1844,7 +2132,7 @@ export default function App() {
           {board.selectedBoard !== null ? (
             <section
               aria-label="Superpowers 看板"
-              className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-neutral-800 bg-neutral-925"
+              className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-line bg-panel"
             >
               {/* 顶栏：项目路径 + 开关/值守 + 入队 + 错误行 */}
               <div className="flex items-center gap-3 px-4 pt-3">
@@ -1867,7 +2155,7 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => void onCreateBoard(board.selectedBoard!)}
-                      className="rounded border border-neutral-700 px-2 py-0.5 text-neutral-300 hover:text-neutral-100"
+                      className="rounded border border-line-strong px-2 py-0.5 text-fg-muted hover:text-fg"
                     >
                       创建看板
                     </button>
@@ -1878,6 +2166,14 @@ export default function App() {
                 pickFile={pickFile}
                 enqueue={(spec, plan) =>
                   enqueueBoardCard(board.boardRpc, board.selectedBoard!, spec, plan)
+                }
+                prequeue={(title) =>
+                  enqueuePrequeuedCard(
+                    board.boardRpc,
+                    board.selectedBoard!,
+                    title,
+                    sess.currentId,
+                  )
                 }
               />
               <SuperpowersKanbanView
@@ -1893,13 +2189,42 @@ export default function App() {
                   board.setSelectedBoard(null);
                   void selectThread(id);
                 }}
+                onPromote={(cardId) => {
+                  // 提升要先补上 spec/plan（两下选择器，任一下取消就整个不作数），
+                  // 再让插件下个 tick 把预排队卡翻成排队卡。
+                  void (async () => {
+                    board.setBoardError(null);
+                    try {
+                      const spec = await pickFile();
+                      if (spec === null) return;
+                      const plan = await pickFile();
+                      if (plan === null) return;
+                      await promoteBoardCard(
+                        board.boardRpc,
+                        board.selectedBoard!,
+                        cardId,
+                        spec,
+                        plan,
+                      );
+                      board.refreshBoards();
+                    } catch (error) {
+                      // 与看板其它写入同一条通路：把失败翻成面板上那句可操作的说法。
+                      board.setBoardError(boardErrorKind(error));
+                    }
+                  })();
+                }}
               />
             </section>
           ) : (
             <>
-              {offline && sess.currentId !== null && cachedAt.current.has(sess.currentId) && (
-                <CacheNotice savedAt={cachedAt.current.get(sess.currentId)!} />
-              )}
+              {sess.currentId !== null &&
+                ((offline && cachedAt.current.has(sess.currentId)) ||
+                  store.peek(sess.currentId)?.syncState === "syncing") && (
+                  <CacheNotice
+                    savedAt={cachedAt.current.get(sess.currentId) ?? null}
+                    syncing={!offline && store.peek(sess.currentId)?.syncState === "syncing"}
+                  />
+                )}
               <ChatView
                 items={current?.session.items ?? []}
                 error={current?.session.lastError ?? null}
@@ -1908,6 +2233,7 @@ export default function App() {
                 // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
                 // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
                 call={imageCall}
+                structuralVersion={current?.session.structuralVersion ?? 0}
               />
               <MessageInput
                 turnActive={current?.session.turnActive ?? false}
@@ -1918,6 +2244,12 @@ export default function App() {
                 onSlashCommand={(name, args) => void onSlashCommand(name, args)}
                 value={current?.draft ?? ""}
                 onDraftChange={changeDraft}
+                cardRef={composerCardRef}
+                dropActive={dragDrop.active}
+                caretSeek={caretSeek}
+                onCaretChange={(caret) => {
+                  composerCaret.current = caret;
+                }}
                 // 待发附件按会话取：切会话时 chip 行随当前会话变，绝不会串。
                 attachments={sess.currentId ? (pending[sess.currentId] ?? []) : []}
                 onPickAttachments={() => void pickAttachments()}
@@ -2088,9 +2420,17 @@ export default function App() {
               error: diff.diffOwnerRef.current === sess.currentId ? diff.diffError : null,
               activeCommit: diff.activeCommit,
               note: diff.diffNote,
-              onRefresh: () => void diff.loadThreadDiff(sess.currentId!, diff.diffBase),
+              // 帧与快照同门：非本会话的帧不许冒充当前视图（`viewOwnerRef` 是判据）。
+              frame: diff.viewOwnerRef.current === sess.currentId ? diff.viewFrame : null,
+              onRefresh: () => {
+                // 刷新要两样都重取：帧重跑模型那条命令，快照重算 commits/files。
+                void diff.loadViewFrame(sess.currentId!, true);
+                void diff.loadThreadDiff(sess.currentId!, diff.diffBase);
+              },
               onOpenCommit: (sha) => void diff.openCommit(sess.currentId!, sha),
               onCloseCommit: () => diff.setActiveCommit(null),
+              // D1 单文件懒加载：正文缺席时按 path 取一次正文并并进快照。
+              onLoadFile: (path) => void diff.loadFile(sess.currentId!, path),
             }}
             processProps={{
               processes: proc.processes,
@@ -2147,6 +2487,12 @@ export default function App() {
         skillsCall={skillsCall}
         skillsProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         skillsDefaultProject={current?.info?.cwd}
+        // MCP 的配置也是项目级文件（<项目>/.yi-agent/mcp.json），候选与默认值直接
+        // 复用插件/技能那份——三者指的都是「项目目录下的 .yi-agent」，来源分叉会让
+        // 用户在三个面板里看到不同的项目列表。
+        mcpCall={mcpCall}
+        mcpProjects={pluginProjectPaths(sess.workspaces, board.boards)}
+        mcpDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页
         // 必须把「要配置的项目」传下去。候选 = 最近目录 + 已登记看板；默认 = 当前
         // 对话的工作目录（没有对话时由面板回落到第一个候选，仍空则回落宿主 workdir）。

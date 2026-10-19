@@ -104,6 +104,33 @@ export class Session {
   lastServerItemId: string | null = null;
 
   /**
+   * Bumped only when the **structure** of `items` changes: a slot is replaced,
+   * an item is inserted or removed, a reasoning block is taken over. A pure
+   * text append (`item.text += delta`) does NOT bump it.
+   *
+   * `ChatView` uses this as the reset key for its frozen history prefix. It is
+   * deliberately a counter and not a snapshot: the prefix only needs to know
+   * "did anything above me move?", which is exactly what this answers.
+   */
+  structuralVersion = 0;
+
+  /**
+   * The server's content generation for this thread, as last learned from
+   * `syncPlan` / `ThreadSummary`. `null` means we have not learned one yet
+   * (first sighting this session) — which must NOT be treated as "matches"
+   * (spec §4.3): a missing version degrades to the conservative full resume.
+   */
+  contentEpoch: number | null = null;
+
+  /**
+   * True once a full replay was triggered by a generation change. Guards
+   * `prefillFromCache`: an async cache read that resolves *after*
+   * `adoptEpoch` wiped the transcript would otherwise see `items.length === 0`
+   * and inject the very stale content we just judged invalid (spec §6.4).
+   */
+  epochInvalidated = false;
+
+  /**
    * Server item ids seen while a full replay is in flight, or `null` when no
    * replay is being collected. `dropStale` uses the completed set to tell a
    * cached item the server still has from one it no longer has.
@@ -123,6 +150,32 @@ export class Session {
     const ids = this.replayIds;
     this.replayIds = null;
     return ids;
+  }
+
+  /**
+   * Adopt the server's authoritative content generation for this thread.
+   *
+   * When the generation changed, everything we hold is structurally stale —
+   * the server no longer has these items (it was `/clear`ed) — so the whole
+   * transcript is dropped. Returns `true` to tell the caller a full
+   * `thread/resume` is required.
+   *
+   * A same-generation call only advances the cursor: "anchor present but
+   * behind" is the normal shape of two clients coexisting, not an error
+   * (spec §7.2).
+   */
+  adoptEpoch(epoch: number, lastItemId: string | null): boolean {
+    const changed = this.contentEpoch !== null && this.contentEpoch !== epoch;
+    this.contentEpoch = epoch;
+    if (changed) {
+      this.items = [];
+      this.lastServerItemId = null;
+      this.openReasoning = null;
+      this.epochInvalidated = true;
+      return true;
+    }
+    if (lastItemId !== null) this.lastServerItemId = lastItemId;
+    return false;
   }
 
   /**
@@ -168,6 +221,7 @@ export class Session {
     this.returnedInterjections = [];
     this.lastServerItemId = null;
     this.openReasoning = null;
+    this.epochInvalidated = false;
   }
 
   /**
@@ -216,6 +270,26 @@ export class Session {
    * up trailing its own answer (design §6.1: 位于正文之前). Local echoes and
    * notices are still not anchors — the server transcript is the authority.
    */
+  /**
+   * Resolve the index of `id`, biased to the tail.
+   *
+   * During a turn the mutating target is always near the end — the trailing
+   * agent message, or that message displaced by one when a reasoning block
+   * resumes after it (`this.items.push(block)` in the reasoning arm). Scanning
+   * **backwards** therefore hits in a bounded number of steps.
+   *
+   * Do NOT "optimise" this to a tail check plus `Array.prototype.findIndex`:
+   * the fallback scans forward from the head, so whenever the target sits at
+   * `length - 2` it walks the entire history on every delta. Measured (see
+   * `desktop/scripts/perf/index-lookup.mjs`): 400420 comparisons vs 420.
+   */
+  private indexOfItem(id: string): number {
+    for (let i = this.items.length - 1; i >= 0; i -= 1) {
+      if (this.items[i].id === id) return i;
+    }
+    return -1;
+  }
+
   private insertAfterLastServerItem(item: Item): void {
     // 任何服务端项一旦插到推理块之后，就该由**它**来承载这一轮的正文：推理块
     // 到此为止（下一段 CoT 另起一块）。不打断的话，`reasoning[上一轮]` 会一直
@@ -229,8 +303,13 @@ export class Session {
         break;
       }
     }
-    if (last < 0) this.items.push(item);
-    else this.items.splice(last + 1, 0, item);
+    if (last < 0) {
+      this.items.push(item);
+      this.structuralVersion += 1;
+    } else {
+      this.items.splice(last + 1, 0, item);
+      this.structuralVersion += 1;
+    }
   }
 
   /**
@@ -276,7 +355,10 @@ export class Session {
     const index = this.items.findIndex(
       (i) => Session.isLocalId(i.id) && i.type === "userMessage" && i.text === text,
     );
-    if (index >= 0) this.items.splice(index, 1);
+    if (index >= 0) {
+      this.items.splice(index, 1);
+      this.structuralVersion += 1;
+    }
   }
 
   /**
@@ -301,6 +383,7 @@ export class Session {
       const index = this.items.findIndex((i) => i.id === normalized.id);
       if (index >= 0) {
         this.items[index] = normalized;
+        this.structuralVersion += 1;
       } else if (normalized.type === "userMessage") {
         // 回放里还没有这条用户气泡:先把本地乐观回声就地换成服务端项,再去重。
         // 否则「本地用户气泡 + 服务端同一条」会被渲染两次。
@@ -309,6 +392,7 @@ export class Session {
         );
         if (local >= 0) {
           this.items[local] = normalized;
+          this.structuralVersion += 1;
           reconciledLocalEcho = true;
         } else {
           this.insertAfterLastServerItem(normalized);
@@ -377,6 +461,7 @@ export class Session {
           const held = this.items.findIndex((i) => i.id === this.openReasoning!.id);
           if (held >= 0) {
             this.items[held] = item;
+            this.structuralVersion += 1;
             this.lastServerItemId = item.id;
             this.breakReasoningRun();
             break;
@@ -387,6 +472,7 @@ export class Session {
         const index = this.items.findIndex((i) => i.id === item.id);
         if (index >= 0) {
           this.items[index] = item;
+          this.structuralVersion += 1;
         } else if (
           item.type === "userMessage" &&
           this.items.some((i) => Session.isLocalId(i.id))
@@ -429,12 +515,18 @@ export class Session {
         // 正文增量同样打断推理块：一旦 agent 文本开始流，当前 CoT 块就结束了，
         // 块不会因此移位（正文会插到它之后）。
         this.breakReasoningRun();
-        const index = this.items.findIndex((i) => i.id === item_id);
+        const index = this.indexOfItem(item_id);
         if (index < 0) {
           this.insertAfterLastServerItem({ type: "agentMessage", id: item_id, text: delta });
         } else if (this.items[index].type === "agentMessage") {
           const item = this.items[index] as { type: "agentMessage"; id: string; text: string };
           item.text += delta;
+          // The append is in place, so the frozen prefix cannot see it through
+          // `items`. `ChatView` lifts the *tail* item's text out as a prop on
+          // every render, so only a non-tail target needs the prefix rebuilt:
+          // that is exactly the case where a CoT block moved in behind the
+          // still-streaming reply and pushed it off the tail.
+          if (index !== this.items.length - 1) this.structuralVersion += 1;
         }
         // else: delta for a non-agent item (e.g. streamed tool output) — ignore
         // in the baseline UI.
@@ -448,6 +540,10 @@ export class Session {
         // 块用一个稳定锚点（openReasoning），而不是「数组末尾」：服务端项会被
         // 插到最后一个服务端项之后，若以末尾为准，本轮的 agentMessage 会把块甩到
         // 它自己的答案后面（design §6.1 要求块位于正文之前）。
+        //
+        // 不变量：`openReasoning` 只可能指向**尾部**（每次落入非推理条目的 push
+        // 都先调 `breakReasoningRun()`），故这里的就地累积不会改到历史前缀，
+        // 无需自增 `structuralVersion`。
         const { text } = notification.params;
         if (this.openReasoning) {
           this.openReasoning.text += text;

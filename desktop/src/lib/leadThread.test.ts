@@ -37,4 +37,31 @@ describe("findLeadThread", () => {
     const newer = thread({ thread_id: "lead-new", role: "lead", created_at: 20 });
     expect(findLeadThread([newer, older])?.thread_id).toBe("lead-old");
   });
+
+  it("ignores a lead inside a kanban card worktree (它不是项目,没有组长)", () => {
+    const phantom = thread({
+      thread_id: "lead-phantom",
+      role: "lead",
+      cwd: "/p/.worktrees/kanban/card-1",
+    });
+    // 服务端已不再为这类目录发 `role`,这里再兜一层:两份实现必须同口径
+    // (`ThreadStore::is_lead_meta`)。
+    expect(findLeadThread([phantom])).toBeNull();
+    // 同一批里真正的项目根组长照旧胜出。
+    const real = thread({ thread_id: "lead-real", role: "lead", cwd: "/p", created_at: 99 });
+    expect(findLeadThread([phantom, real])?.thread_id).toBe("lead-real");
+  });
+
+  it("ignores a lead inside the merge round's worktree (它同样不是项目)", () => {
+    // 合并轮把 base 检出到 `.worktrees/kanban-merge/<slug>`;那里的会话也是看板
+    // 产生的,同样没有组长。判定若只认 `kanban` 段,这一条就会漏。
+    const phantom = thread({
+      thread_id: "lead-merge-phantom",
+      role: "lead",
+      cwd: "/p/.worktrees/kanban-merge/main",
+    });
+    expect(findLeadThread([phantom])).toBeNull();
+    const real = thread({ thread_id: "lead-real", role: "lead", cwd: "/p", created_at: 99 });
+    expect(findLeadThread([phantom, real])?.thread_id).toBe("lead-real");
+  });
 });

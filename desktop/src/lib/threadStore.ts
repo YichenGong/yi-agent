@@ -27,6 +27,13 @@ export interface ThreadView {
    * 纯客户端、纯 UI：不上协议，服务端不知道它的存在。
    */
   draft: string;
+  /**
+   * Whether this thread's transcript has been reconciled with the server on
+   * this connection. `syncing` means the catch-up (resume / readItems) is in
+   * flight: the content on screen may be the cached one, so the UI must say so
+   * and must not let the user send against it (spec §5).
+   */
+  syncState: "syncing" | "synced";
 }
 
 /**
@@ -57,6 +64,7 @@ export class ThreadStore {
       mode: null,
       reasoningEffort: null,
       draft: "",
+      syncState: "synced",
     };
   }
 
@@ -180,6 +188,12 @@ export class ThreadStore {
       // 这条通道，手机上的 chip 只能靠打开会话那一刻的 listAll 快照，桌面之后改
       // 的 YOLO 就永远同步不过来。
       this.view(n.params.thread_id).mode = n.params.mode;
+      return;
+    }
+    if (n.method === "model/capabilitiesChanged") {
+      // 机器级清单属性，不属于任何 thread（App 另有一条总线把它分发给模型相关
+      // 组件）。在这里必须显式吞掉：下面那行按 `n.params.thread_id` 取会话，
+      // 该变体没有这个字段，落进兜底分支会往 `undefined` 这个假会话里写正文。
       return;
     }
     if (n.method === "error") {

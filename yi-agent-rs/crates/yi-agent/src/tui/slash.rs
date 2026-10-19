@@ -140,7 +140,9 @@ impl SlashCommand {
             // `default` 同 `/model` 是保留字（清空本会话覆盖、回落条目默认）。
             SlashCommand::Effort => Some("[none|minimal|low|medium|high|xhigh|max|default]"),
             SlashCommand::Runtime => Some("[ask|always|never]"),
-            SlashCommand::Kanban => Some("[on|off|create|remove|status|run|add <spec> <plan>]"),
+            SlashCommand::Kanban => Some(
+                "[on|off|create|remove|status|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]",
+            ),
             SlashCommand::Plugins => Some("[<name> [set <key> <value>]]"),
             // 其余变体的 usage 由 `control_spec()` 提供；没有 usage 的返回 `None`。
             _ => None,
@@ -278,6 +280,12 @@ pub fn help_text(target: Option<&str>) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiConfigSnapshot {
     pub provider: String,
+    /// 本进程的模型整包是否注入（`RuntimeConfig::model_injected`）。
+    ///
+    /// `/effort` 需要它来选择生效条目：注入存在时清单默认不生效，请求体不带
+    /// `reasoning_effort`，上报也必须同口径（否则「上报 != 实际发出」）。
+    /// 必须**如实**取自真实配置，绝不能拿清单反推。
+    pub model_injected: bool,
     pub workdir: std::path::PathBuf,
     pub sandbox: String,
     pub yolo: bool,
@@ -353,6 +361,31 @@ pub fn parse_effort_args(args: &str) -> Result<EffortAction, String> {
             REASONING_EFFORT_TIERS.join("|")
         )),
     }
+}
+
+/// 与 [`parse_effort_args`] 相同，但额外按模型能力集合校验档位。
+///
+/// `supported = None` 表示能力未知（没探测过 / 探测失败）：沿用七档白名单，
+/// 与探测功能上线前的行为一致。只有**有可信结论**时才收窄——把「还没测」当成
+/// 「一档都不支持」会把用户挡在一个本来可用的功能外面。
+pub fn parse_effort_args_with_caps(
+    args: &str,
+    supported: Option<&[String]>,
+) -> Result<EffortAction, String> {
+    let action = parse_effort_args(args)?;
+    if let (EffortAction::Set(tier), Some(list)) = (&action, supported) {
+        if !list.iter().any(|s| s == tier) {
+            return Err(format!(
+                "该模型不支持 {tier}（支持：{}）",
+                if list.is_empty() {
+                    "无，仅 `default`".to_string()
+                } else {
+                    list.join(" | ")
+                }
+            ));
+        }
+    }
+    Ok(action)
 }
 
 /// A parsed `/mcp` action.
@@ -890,6 +923,50 @@ mod tests {
     }
 
     #[test]
+    fn effort_rejects_a_tier_the_model_does_not_support() {
+        let supported = vec!["low".to_string(), "high".to_string()];
+        let err = parse_effort_args_with_caps("max", Some(&supported)).unwrap_err();
+        assert!(
+            err.contains("low") && err.contains("high"),
+            "error must list the supported tiers: {err}"
+        );
+        assert_eq!(
+            parse_effort_args_with_caps("high", Some(&supported)),
+            Ok(EffortAction::Set("high".into()))
+        );
+        // 能力未知时行为不变。
+        assert_eq!(
+            parse_effort_args_with_caps("max", None),
+            Ok(EffortAction::Set("max".into()))
+        );
+    }
+
+    #[test]
+    fn effort_clear_and_status_ignore_the_capability_list() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            parse_effort_args_with_caps("default", Some(&none)),
+            Ok(EffortAction::Clear),
+            "clearing an override must stay possible even when no tier works"
+        );
+        assert_eq!(
+            parse_effort_args_with_caps("", Some(&none)),
+            Ok(EffortAction::Status)
+        );
+    }
+
+    #[test]
+    fn effort_rejects_every_tier_when_the_model_supports_none() {
+        let none: Vec<String> = Vec::new();
+        let err = parse_effort_args_with_caps("low", Some(&none)).unwrap_err();
+        assert!(err.contains("不支持"), "got: {err}");
+        assert!(
+            err.contains("default"),
+            "must point at the escape hatch: {err}"
+        );
+    }
+
+    #[test]
     fn parse_effort_args_rejects_unknown_tier_and_extra_tokens() {
         let usage = format!(
             "用法: /effort [{}|default]",
@@ -1114,6 +1191,7 @@ mod tests {
     fn config_snapshot_renders_key_fields_without_secrets() {
         let snap = TuiConfigSnapshot {
             provider: "anthropic".into(),
+            model_injected: false,
             workdir: std::path::PathBuf::from("/tmp/proj"),
             sandbox: "workspace-write".into(),
             yolo: false,

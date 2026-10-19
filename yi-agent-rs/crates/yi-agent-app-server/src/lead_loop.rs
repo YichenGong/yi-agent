@@ -9,6 +9,10 @@
 
 use crate::protocol::ThreadStatus;
 
+// 三种唤醒理由是**契约里预留、判据尚未接线**的取值(见 spec §6.1 的分期):
+// `decide_wake` 目前只构造 `AskLead` / `ThreadStuck`,但它们必须存在,否则
+// 后续接 `ThreadFinished` / `UserSpoke` / `FallbackTick` 时要改公共类型。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeReason {
     /// 有 thread 调了 `ask_lead`。
@@ -23,6 +27,9 @@ pub enum WakeReason {
     FallbackTick,
 }
 
+// `title` / `last_user_text` 是给后续 digest 用的展示字段:`snapshot_of` 目前
+// 刻意留空(见其文档),故暂无读者;保留字段以免接线时改结构体。
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ThreadSnapshot {
     pub thread_id: String,

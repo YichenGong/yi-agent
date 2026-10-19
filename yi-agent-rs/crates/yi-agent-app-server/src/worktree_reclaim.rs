@@ -1,8 +1,13 @@
-//! 卡片会话 worktree 的判定与删除。
+//! 被驱动会话的 worktree 判定与删除。
 //!
-//! 判定只吃 git 事实：`decide` 读「是否看板 worktree / 是否干净 / 分支状态」，
-//! 分类抽成纯函数 `classify` 以便脱 git 单测。只服务卡片会话（`card_id` 非空）；
-//! 普通会话的 cwd 是用户项目目录，任何情况都不删。
+//! 判定只吃 git 事实：`decide` 读「是否 `kanban/` worktree / 是否干净 / 分支状态」，
+//! 分类抽成纯函数 `classify` 以便脱 git 单测。只服务带 `driver_ref` 的会话
+//! （驱动方给了不透明句柄的那些）；普通会话的 cwd 是用户项目目录，任何情况都不删。
+//!
+//! **本任务的边界（范围裁决 2026-10-18）**：这里只把入参名与读法随 meta 字段通用化
+//! （`card_id` → `driver_ref`、`board_project` → `driver_project`），判定逻辑、
+//! `kanban/<slug>` 路径与分支约定、`slugify` 一字未动——那部分语义重写是 G2 的
+//! （spec §7）。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,10 +17,12 @@ use std::process::Command;
 /// 只保留 ASCII 字母数字（小写化），其余折叠为单个 `-`，首尾 `-` 去掉；
 /// 全空时退化为 `card`。不一致会让宿主演化出与插件不同的分支名，
 /// 从而把"已并入"误判为"分支缺失"（安全侧失败，但会漏删）。
-pub fn slugify(card_id: &str) -> String {
+///
+/// 入参名随 meta 字段通用化；**算法与「全空退化为 `card`」的约定不变**（G2 才重写）。
+pub fn slugify(driver_ref: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
-    for ch in card_id.chars() {
+    for ch in driver_ref.chars() {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
             last_dash = false;
@@ -110,13 +117,20 @@ pub fn classify(
     WorktreeReclaim::DestructiveDelete { path, reason }
 }
 
-/// git 探针：判定一张卡片会话的 worktree 该删、该确认、还是该留。
-pub fn decide(card_id: Option<&str>, board_project: Option<&str>, cwd: &Path) -> WorktreeReclaim {
-    let Some(card_id) = card_id.filter(|id| !id.is_empty()) else {
+/// git 探针：判定一个被驱动会话的 worktree 该删、该确认、还是该留。
+///
+/// 入参名沿用通用元字段（旧名 `card_id`/`board_project`）：`driver_ref` 是驱动方给的
+/// **不透明**句柄，宿主只按既有约定拿它推导分支名，不解释它的含义。
+pub fn decide(
+    driver_ref: Option<&str>,
+    driver_project: Option<&str>,
+    cwd: &Path,
+) -> WorktreeReclaim {
+    let Some(driver_ref) = driver_ref.filter(|id| !id.is_empty()) else {
         return WorktreeReclaim::None;
     };
-    let Some(project) = board_project.filter(|p| !p.is_empty()) else {
-        // 卡片会话必然有项目根；缺失时无从判定，安全侧保留。
+    let Some(project) = driver_project.filter(|p| !p.is_empty()) else {
+        // 被驱动会话必然有项目根；缺失时无从判定，安全侧保留。
         return WorktreeReclaim::Keep {
             path: cwd.to_path_buf(),
             reason: "会话未记录所属项目根，拒绝删除".to_string(),
@@ -134,7 +148,7 @@ pub fn decide(card_id: Option<&str>, board_project: Option<&str>, cwd: &Path) ->
         .unwrap_or_default()
         .trim()
         .is_empty();
-    let branch = format!("kanban/{}", slugify(card_id));
+    let branch = format!("kanban/{}", slugify(driver_ref));
     let base = default_branch(project_path);
     let branch_state = if !git_ok(
         project_path,

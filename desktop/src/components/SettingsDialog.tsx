@@ -7,6 +7,8 @@ import { SettingsRemoteTab, type RemoteCall } from "./SettingsRemoteTab";
 import { SettingsPluginsTab } from "./SettingsPluginsTab";
 import { SettingsModelsTab } from "./SettingsModelsTab";
 import { SettingsSkillsTab } from "./SettingsSkillsTab";
+import { SettingsMcpTab } from "./SettingsMcpTab";
+import type { McpCall } from "../lib/mcp";
 import type { SkillsCall } from "../lib/skills";
 import { SettingsTagsTab } from "./SettingsTagsTab";
 import { DEFAULT_TAG_NAMES, type TagId } from "../lib/threadTags";
@@ -18,6 +20,7 @@ const TABS = [
   { id: "plugins", label: "插件" },
   { id: "models", label: "模型" },
   { id: "skills", label: "技能" },
+  { id: "mcp", label: "MCP" },
   { id: "tags", label: "标签" },
 ] as const;
 
@@ -39,6 +42,9 @@ export function SettingsDialog({
   skillsCall,
   skillsProjects,
   skillsDefaultProject,
+  mcpCall,
+  mcpProjects,
+  mcpDefaultProject,
   pluginProjects,
   pluginDefaultProject,
   relayUrl,
@@ -75,6 +81,12 @@ export function SettingsDialog({
   pluginProjects?: string[];
   /** 「插件」Tab 首选项目（当前对话的工作目录）。 */
   pluginDefaultProject?: string;
+  /** 「MCP」Tab 的宿主 RPC 接缝（mcp/list）。 */
+  mcpCall?: McpCall;
+  /** 「MCP」Tab 可选的配置项目（绝对路径）。 */
+  mcpProjects?: string[];
+  /** 「MCP」Tab 首选项目（当前对话的工作目录）。 */
+  mcpDefaultProject?: string;
   /** 中继地址预填。 */
   relayUrl?: string;
   /**
@@ -294,6 +306,12 @@ export function SettingsDialog({
                 call={skillsCall}
                 projects={skillsProjects ?? []}
                 defaultProject={skillsDefaultProject}
+              />
+            ) : active === "mcp" ? (
+              <SettingsMcpTab
+                call={mcpCall}
+                projects={mcpProjects ?? []}
+                defaultProject={mcpDefaultProject}
               />
             ) : (
               <SettingsTagsTab

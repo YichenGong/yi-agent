@@ -60,6 +60,7 @@ impl Board {
             workdir: None,
             task_id: None,
             thread_id: None,
+            origin_thread_id: None,
             base_commit: None,
             kind: CardKind::Implementation,
             source_ref: None,
@@ -67,6 +68,8 @@ impl Board {
             origin_card: None,
             archived: false,
             terminal_at: None,
+            detail: None,
+            title: None,
         });
         &self.cards[index]
     }
@@ -93,6 +96,7 @@ impl Board {
             workdir: None,
             task_id: None,
             thread_id: None,
+            origin_thread_id: None,
             base_commit: None,
             kind: CardKind::Merge,
             source_ref: Some(source),
@@ -100,8 +104,103 @@ impl Board {
             origin_card: origin,
             archived: false,
             terminal_at: None,
+            detail: None,
+            title: None,
         });
         &self.cards[index]
+    }
+
+    /// 排入一张预排队卡：无 spec/plan，只有一个标题；id 由调用方定死。
+    /// `origin_thread_id` 是提出它的讨论会话（拿不到时为 `None`）。
+    pub fn enqueue_prequeued(
+        &mut self,
+        id: CardId,
+        title: String,
+        origin_thread_id: Option<String>,
+        now: DateTime<Local>,
+    ) -> &Card {
+        let order = self.next_order;
+        self.next_order += 1;
+        let index = self.cards.len();
+        self.cards.push(Card {
+            id,
+            spec_path: PathBuf::new(),
+            plan_path: PathBuf::new(),
+            state: CardState::PreQueued,
+            enqueued_at: now,
+            order,
+            workdir: None,
+            task_id: None,
+            thread_id: None,
+            origin_thread_id,
+            base_commit: None,
+            kind: CardKind::Implementation,
+            source_ref: None,
+            base_ref: None,
+            origin_card: None,
+            archived: false,
+            terminal_at: None,
+            detail: None,
+            title: Some(title),
+        });
+        &self.cards[index]
+    }
+
+    /// 未占用的预排队卡 id。
+    ///
+    /// `slug(title)` 只保留 ASCII 字母数字，中文标题会 slug 成空串——此时用
+    /// `prequeued-<YYYYMMDDHHMMSS>` 回退。**绝不**把所有非 ASCII 标题塌成同一个
+    /// `prequeued`：那会让每张中文卡的 id 撞成一个（`slugify` 再把它压成 `card`），
+    /// worktree 分支名与追踪线一起废掉。
+    pub fn next_free_prequeued_id(&self, title: &str, now: DateTime<Local>) -> CardId {
+        let base = prequeued_id_base(title, now);
+        if !self.contains(&base) {
+            return CardId::new(base);
+        }
+        for n in 2u32.. {
+            let candidate = format!("{base}-{n}");
+            if !self.contains(&candidate) {
+                return CardId::new(candidate);
+            }
+        }
+        unreachable!("u32 suffix space exhausted")
+    }
+
+    /// 提升一张预排队卡：补 spec/plan、可换标题、翻 `Queued`、**重排到队尾**。
+    /// id 不变——这是「追踪不断线」的核心保障。
+    pub fn promote_prequeued(
+        &mut self,
+        id: &CardId,
+        spec: PathBuf,
+        plan: PathBuf,
+        title: Option<String>,
+    ) -> Result<(), TransitionError> {
+        let order = self.next_order;
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|card| &card.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        // 守卫必须严格盯「当前就是 PreQueued」，不能只问转移合法性：
+        // `(Paused, Queued)` 与 `(NeedsYou, Queued)` 都是合法边（那是卡回队列的
+        // 正常通路），拿它们当守卫会让一次 id 搞错的 promote 直接覆写一张真卡的
+        // spec/plan 并把它甩到队尾——静默数据丢失。`Queued` 输入仍然报
+        // `Illegal { from: Queued, to: Queued }`（与非 PreQueued 输入一致）。
+        if card.state != CardState::PreQueued {
+            return Err(TransitionError::Illegal {
+                from: card.state,
+                to: CardState::Queued,
+            });
+        }
+        card.spec_path = spec;
+        card.plan_path = plan;
+        if let Some(title) = title {
+            card.title = Some(title);
+        }
+        card.order = order;
+        card.state = CardState::Queued;
+        self.next_order += 1;
+        Ok(())
     }
 
     pub fn get(&self, id: &CardId) -> Option<&Card> {
@@ -182,7 +281,26 @@ impl Board {
         Ok(())
     }
 
-    /// 只认领实现卡的会话通路：合并卡另有 `claim_next_merge`，绝不能经这里启动。
+    /// 记下这张卡**为什么**落到当前状态（启动失败的 `error` 等），供 `list` 读出。
+    ///
+    /// `None` 是显式的「无判词」——进入新一轮尝试或无关结局时清掉，免得旧原因
+    /// 挂在一张状态已经变了的卡上误导人。
+    pub fn set_detail(
+        &mut self,
+        id: &CardId,
+        detail: Option<String>,
+    ) -> Result<(), TransitionError> {
+        let card = self
+            .cards
+            .iter_mut()
+            .find(|card| &card.id == id)
+            .ok_or_else(|| TransitionError::UnknownCard(id.clone()))?;
+        card.detail = detail;
+        Ok(())
+    }
+
+    /// 只认领实现卡的会话通路：合并卡走的是合并轮（`driver_step` 的候选集，
+    /// 见 `superpowers_kanban_runner`），绝不能经这里启动。
     pub fn claim_next_launch(&mut self, limit: u16) -> Option<CardId> {
         if self.free_slots(limit) == 0 {
             return None;
@@ -201,23 +319,6 @@ impl Board {
             .filter(|card| card.state == CardState::Queued && card.kind == CardKind::Implementation)
             .min_by_key(|card| card.order)
             .map(|card| card.id.clone())
-    }
-
-    /// 队首可做合并的卡：`merge_busy` 为真（本项目已有合并在跑）时不出手。
-    pub fn claim_next_merge(&mut self, merge_busy: bool) -> Option<CardId> {
-        if merge_busy {
-            return None;
-        }
-        let next = self
-            .cards
-            .iter()
-            .filter(|card| card.state == CardState::Queued && card.kind == CardKind::Merge)
-            .min_by_key(|card| card.order)
-            .map(|card| card.id.clone())?;
-        if let Some(card) = self.cards.iter_mut().find(|c| c.id == next) {
-            card.state = CardState::Merging;
-        }
-        Some(next)
     }
 
     /// 看板上是否已有该 id（含终态），用于合并卡 id 去重。
@@ -372,6 +473,21 @@ impl Board {
     /// 未归档的卡（`list` 与宿主默认只看这些）。
     pub fn visible(&self) -> impl Iterator<Item = &Card> {
         self.cards.iter().filter(|card| !card.archived)
+    }
+}
+
+/// 预排队卡 id 的基名：`slug(title)`；slug 为空（非 ASCII 标题）回退
+/// `prequeued-<YYYYMMDDHHMMSS>`。
+///
+/// 基名单独抽出来，是因为「未占用」的判据不止看板一处：投递要等下一个 tick 才
+/// 入队，`inbox::next_free_prequeued_id` 必须在同一套基名上再避开 inbox 里尚未
+/// 消费的投递。两处各写一份推导就会漂移。
+pub fn prequeued_id_base(title: &str, now: DateTime<Local>) -> String {
+    let slug = crate::card_id::slug(title);
+    if slug.is_empty() {
+        format!("prequeued-{}", now.format("%Y%m%d%H%M%S"))
+    } else {
+        slug
     }
 }
 
@@ -637,41 +753,6 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_merge_gate_yields_nothing() {
-        let mut board = Board::new();
-        board.enqueue_merge(CardId::new("m1"), "s".into(), "main".into(), None, at(1, 0));
-        assert_eq!(board.claim_next_merge(true), None);
-        assert_eq!(board.claim_next_merge(false), Some(CardId::new("m1")));
-        assert_eq!(
-            board.get(&CardId::new("m1")).unwrap().state,
-            CardState::Merging
-        );
-    }
-
-    #[test]
-    fn merge_cards_are_claimed_in_fifo_order_and_only_once() {
-        let mut board = Board::new();
-        // FIFO 是看板的排序键 `order`：m1 先入队（order 更小）、m2 后入队。
-        board.enqueue_merge(
-            CardId::new("m1"),
-            "s1".into(),
-            "main".into(),
-            None,
-            at(1, 1),
-        );
-        board.enqueue_merge(
-            CardId::new("m2"),
-            "s2".into(),
-            "main".into(),
-            None,
-            at(1, 2),
-        );
-        assert_eq!(board.claim_next_merge(false), Some(CardId::new("m1")));
-        assert_eq!(board.claim_next_merge(false), Some(CardId::new("m2")));
-        assert_eq!(board.claim_next_merge(false), None);
-    }
-
-    #[test]
     fn a_used_merge_id_gets_a_numeric_suffix() {
         let mut board = Board::new();
         board.enqueue_merge(
@@ -698,5 +779,260 @@ mod tests {
         let json = r#"{"cards":[{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}],"next_order":1}"#;
         let board: Board = serde_json::from_str(json).unwrap();
         assert_eq!(board.get(&CardId::new("a")).unwrap().workdir, None);
+    }
+
+    #[test]
+    fn a_pre_queued_card_is_queued_nowhere_near_a_slot() {
+        let mut board = Board::new();
+        board.enqueue_prequeued(CardId::new("idea"), "一个想法".into(), None, at(1, 0));
+        let card = board.get(&CardId::new("idea")).unwrap();
+        assert_eq!(card.state, CardState::PreQueued);
+        assert_eq!(card.title.as_deref(), Some("一个想法"));
+        assert!(card.spec_path.as_os_str().is_empty());
+        assert!(card.plan_path.as_os_str().is_empty());
+        // 不占槽、不会被 claim 起来跑（它压根不是 Queued）。
+        assert_eq!(board.running_count(), 0);
+        assert_eq!(board.next_startable(), None);
+        assert_eq!(board.claim_next_launch(3), None);
+    }
+
+    #[test]
+    fn a_pre_queued_id_falls_back_and_gets_a_suffix_on_collision() {
+        let mut board = Board::new();
+        assert_eq!(
+            board.next_free_prequeued_id("idea", at(1, 0)),
+            CardId::new("idea")
+        );
+        // `slug()` 只保留 ASCII 字母数字，中文标题会 slug 成空串——此时回退到
+        // 带时间戳的 id，绝不能全部塌成同一个 `prequeued`（否则每张卡同 id，
+        // 追踪就废了，且 worktree 分支名会互撞）。
+        let fallback = board.next_free_prequeued_id("我的想法", at(1, 0));
+        assert!(
+            fallback.0.starts_with("prequeued-"),
+            "非 ASCII slug 回退到带时间戳的 id: {fallback:?}"
+        );
+        let other = board.next_free_prequeued_id("另一个想法", at(1, 1));
+        assert_ne!(fallback, other, "两张中文标题的卡必须拿到不同 id");
+        board.enqueue_prequeued(CardId::new("idea"), "idea".into(), None, at(1, 0));
+        assert_eq!(
+            board.next_free_prequeued_id("idea", at(1, 1)),
+            CardId::new("idea-2")
+        );
+    }
+
+    #[test]
+    fn promoting_fills_the_paths_keeps_the_id_and_moves_to_the_back() {
+        // 预排队卡**先**入队，竞争者**后**入队——否则被提升的卡本来就排在最后，
+        // 「重排到队尾」这一断言在任何情况下都成立，测不出重排逻辑（原来那个
+        // 版本的 `board_with(&["older"])` 就是这样：删掉 `card.order = order`
+        // 测试照样绿）。
+        let mut board = Board::new();
+        let idea = CardId::new("idea");
+        board.enqueue_prequeued(idea.clone(), "想法".into(), None, at(1, 0));
+        board.enqueue(
+            CardId::new("newer"),
+            "newer.spec.md".into(),
+            "newer.plan.md".into(),
+            at(1, 1),
+        );
+        // 提升前：`idea` 的 order 更小——正是它「本来就排在竞争者之前」的证据。
+        // （不能用 `next_startable` 证：预排队卡压根不参与启动。）
+        let newer_before = board.get(&CardId::new("newer")).unwrap().clone();
+        assert!(
+            board.get(&idea).unwrap().order < newer_before.order,
+            "前提：idea 原本排在竞争者之前"
+        );
+        board
+            .promote_prequeued(
+                &idea,
+                "docs/idea.spec.md".into(),
+                "docs/idea.plan.md".into(),
+                None,
+            )
+            .unwrap();
+        let card = board.get(&idea).unwrap();
+        assert_eq!(card.id, idea, "id 绝不重算");
+        assert_eq!(card.state, CardState::Queued);
+        assert_eq!(card.spec_path, PathBuf::from("docs/idea.spec.md"));
+        assert_eq!(card.plan_path, PathBuf::from("docs/idea.plan.md"));
+        assert_eq!(card.title.as_deref(), Some("想法"), "未给新标题则保留");
+        // 重排到队尾：若 `promote_prequeued` 里删掉 `card.order = order`，`idea`
+        // 会保留 order 0 留在队首，下面两条断言都会失败——这就是本测试的强制点。
+        assert!(
+            card.order > newer_before.order,
+            "提升后必须排到原本在它后面的卡之后"
+        );
+        assert_eq!(
+            board.next_startable(),
+            Some(CardId::new("newer")),
+            "提升后的卡让位于竞争者"
+        );
+    }
+
+    #[test]
+    fn promoting_a_prequeued_card_keeps_its_origin_thread() {
+        // 提升不重算 id、也不动溯源：讨论会话随卡走到 Queued。
+        let mut board = Board::new();
+        board.enqueue_prequeued(
+            CardId::new("idea"),
+            "一个想法".into(),
+            Some("thread-discuss-1".into()),
+            at(1, 0),
+        );
+        board
+            .promote_prequeued(
+                &CardId::new("idea"),
+                "a.spec.md".into(),
+                "a.plan.md".into(),
+                None,
+            )
+            .unwrap();
+        let card = board.get(&CardId::new("idea")).unwrap();
+        assert_eq!(card.state, CardState::Queued);
+        assert_eq!(card.origin_thread_id.as_deref(), Some("thread-discuss-1"));
+    }
+
+    #[test]
+    fn promoting_with_a_new_title_overwrites_it_but_not_the_id() {
+        let mut board = Board::new();
+        let idea = CardId::new("idea");
+        board.enqueue_prequeued(
+            idea.clone(),
+            "旧标题".into(),
+            Some("thread-x".into()),
+            at(1, 0),
+        );
+        board
+            .promote_prequeued(&idea, "s".into(), "p".into(), Some("新标题".into()))
+            .unwrap();
+        let card = board.get(&idea).unwrap();
+        assert_eq!(card.title.as_deref(), Some("新标题"));
+        assert_eq!(card.id, idea);
+    }
+
+    #[test]
+    fn promoting_a_card_that_is_not_pre_queued_is_rejected() {
+        let mut board = board_with(&["a"]); // a 已是 Queued
+        let error = board
+            .promote_prequeued(&CardId::new("a"), "s".into(), "p".into(), None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            TransitionError::Illegal {
+                from: CardState::Queued,
+                to: CardState::Queued,
+            }
+        );
+    }
+
+    #[test]
+    fn promoting_a_needs_you_or_paused_card_leaves_it_untouched() {
+        // 这些状态都能合法地转回 `Queued`（见 `can_transition_to` 的
+        // `(Paused, Queued)` / `(NeedsYou, Queued)`）。若 `promote_prequeued`
+        // 拿转移合法性当守卫，一次 id 搞错的提升就会覆写真卡的 spec/plan 并把它
+        // 甩到队尾——静默数据丢失。这里把「拒绝且原封不动」钉死。
+        let mut board = board_with(&["a", "b"]);
+        board.start_due(1); // a -> Running
+        board
+            .transition(&CardId::new("a"), CardState::NeedsYou)
+            .unwrap();
+        let before = board.get(&CardId::new("a")).unwrap().clone();
+
+        let error = board
+            .promote_prequeued(
+                &CardId::new("a"),
+                "docs/hijacked.spec.md".into(),
+                "docs/hijacked.plan.md".into(),
+                Some("劫持".into()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            TransitionError::Illegal {
+                from: CardState::NeedsYou,
+                to: CardState::Queued,
+            }
+        );
+        let after = board.get(&CardId::new("a")).unwrap().clone();
+        assert_eq!(after.state, CardState::NeedsYou, "状态不许被改动");
+        assert_eq!(after.spec_path, before.spec_path, "spec 路径不许被覆写");
+        assert_eq!(after.plan_path, before.plan_path, "plan 路径不许被覆写");
+        assert_eq!(after.title, before.title, "标题不许被覆写");
+        assert_eq!(after.order, before.order, "不许被重排");
+        // 队列秩序不受影响：b 仍是队首。
+        assert_eq!(board.next_startable(), Some(CardId::new("b")));
+
+        // Paused 同样必须被拒（`(Paused, Queued)` 也是合法边）。
+        let mut board = board_with(&["c"]);
+        board.start_due(1); // c -> Running
+        board
+            .transition(&CardId::new("c"), CardState::Paused)
+            .unwrap();
+        let before = board.get(&CardId::new("c")).unwrap().clone();
+        let error = board
+            .promote_prequeued(&CardId::new("c"), "s".into(), "p".into(), None)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            TransitionError::Illegal {
+                from: CardState::Paused,
+                to: CardState::Queued,
+            }
+        );
+        let after = board.get(&CardId::new("c")).unwrap();
+        assert_eq!(after.state, CardState::Paused);
+        assert_eq!(after.spec_path, before.spec_path);
+        assert_eq!(after.plan_path, before.plan_path);
+        assert_eq!(after.order, before.order);
+    }
+
+    #[test]
+    fn a_prequeued_card_keeps_the_discussion_session_it_was_captured_in() {
+        let mut board = Board::new();
+        board.enqueue_prequeued(
+            CardId::new("idea"),
+            "一个想法".into(),
+            Some("thread-discuss-1".into()),
+            at(1, 0),
+        );
+        let card = board.get(&CardId::new("idea")).unwrap();
+        assert_eq!(card.origin_thread_id.as_deref(), Some("thread-discuss-1"));
+    }
+
+    #[test]
+    fn a_prequeued_card_without_a_discussion_session_has_none() {
+        let mut board = Board::new();
+        board.enqueue_prequeued(CardId::new("idea"), "一个想法".into(), None, at(1, 0));
+        assert_eq!(
+            board.get(&CardId::new("idea")).unwrap().origin_thread_id,
+            None
+        );
+    }
+
+    #[test]
+    fn implementation_and_merge_cards_have_no_origin_thread() {
+        // 只有预排队卡记录讨论会话；实现卡/合并卡的该字段为空。
+        let mut board = Board::new();
+        board.enqueue(
+            CardId::new("impl"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            at(1, 0),
+        );
+        board.enqueue_merge(
+            CardId::new("merge"),
+            "kanban/a".into(),
+            "main".into(),
+            None,
+            at(1, 0),
+        );
+        assert_eq!(
+            board.get(&CardId::new("impl")).unwrap().origin_thread_id,
+            None
+        );
+        assert_eq!(
+            board.get(&CardId::new("merge")).unwrap().origin_thread_id,
+            None
+        );
     }
 }

@@ -168,12 +168,14 @@ pub fn format_thousands(n: u64) -> String {
 /// Layout (left to right):
 ///   `● <tool> <elapsed>`  (only when foreground tasks are running)
 ///   `N proc running`  (only when managed background processes are active)
+///   `已略去 N 条更早的历史`  (only when history cells were dropped at the cap)
 ///   `prefill <n>  decode <m>`
 ///   `<model>`
 pub fn render_statusbar<'a>(
     state: &'a StatusBarState,
     tasks: &'a RunningTaskRegistry,
     active_process_count: usize,
+    trimmed_history: usize,
     model: &'a str,
     width: u16,
 ) -> Line<'a> {
@@ -220,6 +222,20 @@ pub fn render_statusbar<'a>(
         push(
             &mut spans,
             Span::raw(format!("{active_process_count} proc running  ")),
+            &mut used,
+        );
+    }
+
+    // Persistent notice that the scrollback was trimmed at `MAX_HISTORY_CELLS`.
+    // It rides the same width budget as every other segment, so the one-line
+    // invariant holds; it is omitted entirely while nothing has been dropped.
+    if trimmed_history > 0 {
+        push(
+            &mut spans,
+            Span::styled(
+                format!("已略去 {trimmed_history} 条更早的历史  "),
+                Style::new().fg(Color::DarkGray),
+            ),
             &mut used,
         );
     }
@@ -323,7 +339,54 @@ mod tests {
         state.set_token_target(123_456, 7_890);
         let tasks = RunningTaskRegistry::new();
         for width in [20u16, 40, 80] {
-            let line = render_statusbar(&state, &tasks, 0, "claude-opus-4-with-a-long-name", width);
+            let line = render_statusbar(
+                &state,
+                &tasks,
+                0,
+                0,
+                "claude-opus-4-with-a-long-name",
+                width,
+            );
+            let w: usize = line
+                .spans
+                .iter()
+                .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            assert!(w <= width as usize, "width {width}: status bar is {w} cols");
+        }
+    }
+
+    /// The history cap trims the scrollback; the status bar must say so
+    /// persistently instead of dropping cells silently. The notice rides the
+    /// same width budget as every other segment, so a narrow terminal must
+    /// never end up with a clipped (over-wide) status row.
+    #[test]
+    fn statusbar_reports_trimmed_history_within_the_width_budget() {
+        let mut state = StatusBarState::default();
+        state.set_token_target(123_456, 7_890);
+        let tasks = RunningTaskRegistry::new();
+
+        let line = render_statusbar(&state, &tasks, 0, 3, "claude-opus-4", 80);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("已略去"), "notice must be labelled: {text:?}");
+        assert!(text.contains('3'), "dropped count must be shown: {text:?}");
+        assert!(
+            text.contains("历史"),
+            "notice must mention history: {text:?}"
+        );
+
+        // Nothing dropped yet → the segment must be entirely absent.
+        let clean = render_statusbar(&state, &tasks, 0, 0, "claude-opus-4", 80);
+        let clean_text: String = clean.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !clean_text.contains("历史"),
+            "zero dropped cells must stay silent: {clean_text:?}"
+        );
+
+        // The one-line width invariant still holds, including when the notice
+        // is the only segment that fits.
+        for width in [20u16, 24, 40, 80] {
+            let line = render_statusbar(&state, &tasks, 0, 3, "claude-opus-4", width);
             let w: usize = line
                 .spans
                 .iter()
@@ -337,7 +400,7 @@ mod tests {
     fn statusbar_keeps_the_model_name_when_it_fits() {
         let state = StatusBarState::default();
         let tasks = RunningTaskRegistry::new();
-        let line = render_statusbar(&state, &tasks, 0, "model", 80);
+        let line = render_statusbar(&state, &tasks, 0, 0, "model", 80);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("model"), "model name was dropped: {text:?}");
     }
@@ -355,7 +418,7 @@ mod tests {
     fn test_render_statusbar_empty_state() {
         let state = StatusBarState::default();
         let tasks = RunningTaskRegistry::new();
-        let line = render_statusbar(&state, &tasks, 0, "claude-opus-4", 80);
+        let line = render_statusbar(&state, &tasks, 0, 0, "claude-opus-4", 80);
         let text: String = line
             .spans
             .iter()
@@ -373,7 +436,7 @@ mod tests {
         let mut tasks = RunningTaskRegistry::new();
         tasks.on_tool_call("t1", "bash", "ls", 120);
         let state = StatusBarState::default();
-        let line = render_statusbar(&state, &tasks, 0, "model", 80);
+        let line = render_statusbar(&state, &tasks, 0, 0, "model", 80);
         let text: String = line
             .spans
             .iter()
@@ -387,7 +450,7 @@ mod tests {
     fn test_render_statusbar_omits_inactive_managed_processes() {
         let state = StatusBarState::default();
         let tasks = RunningTaskRegistry::new();
-        let line = render_statusbar(&state, &tasks, 0, "model", 80);
+        let line = render_statusbar(&state, &tasks, 0, 0, "model", 80);
         let text: String = line
             .spans
             .iter()
@@ -403,7 +466,7 @@ mod tests {
     fn test_render_statusbar_shows_managed_process_count_without_duration() {
         let state = StatusBarState::default();
         let tasks = RunningTaskRegistry::new();
-        let line = render_statusbar(&state, &tasks, 2, "model", 80);
+        let line = render_statusbar(&state, &tasks, 2, 0, "model", 80);
         let text: String = line
             .spans
             .iter()
@@ -424,7 +487,7 @@ mod tests {
         let mut tasks = RunningTaskRegistry::new();
         tasks.on_tool_call("bash-1", "bash", "sleep 10", 120);
         let state = StatusBarState::default();
-        let line = render_statusbar(&state, &tasks, 1, "model", 80);
+        let line = render_statusbar(&state, &tasks, 1, 0, "model", 80);
         let text: String = line
             .spans
             .iter()

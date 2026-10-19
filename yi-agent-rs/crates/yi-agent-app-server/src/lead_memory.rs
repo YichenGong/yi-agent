@@ -29,10 +29,11 @@ pub fn memory_path(project_root: &Path) -> PathBuf {
 
 /// 该 thread 是不是组长。
 ///
-/// **唯一权威**是落盘的 `ThreadMeta.role == Some(LEAD_ROLE)`:标题、cwd、名字都能
-/// 被人为凑出组长的样子,而 role 只有 `lead::ensure_lead_meta` 会写。读不到
-/// (`load` 报错 / 没有 meta)一律视为非组长——装配期放行一个非组长去写项目账本,
-/// 比拒绝一个真组长严重得多,故缺证据时不授予。
+/// **唯一权威**是落盘的 `ThreadMeta.role == Some(LEAD_ROLE)`,且不在卡片 worktree
+/// 里(见 `ThreadStore::is_lead_meta`):标题、cwd、名字都能被人为凑出组长的样子,
+/// 而 role 只有 `lead::ensure_lead_meta` 会写;卡片 worktree 里的那份则是误落盘的
+/// 假组长(真机已有 9 例)。读不到(`load` 报错 / 没有 meta)一律视为非组长——
+/// 装配期放行一个非组长去写项目账本,比拒绝一个真组长严重得多,故缺证据时不授予。
 ///
 /// 组长 meta 是**懒创建**的:刚落盘、还没跑过一轮的组长没有 `.jsonl`,但
 /// `ThreadStore::load` 对 meta-only 也返回 `Some`,所以新建的组长照样能被认出。
@@ -41,7 +42,7 @@ pub fn is_lead_thread(store: &crate::thread_store::ThreadStore, thread_id: &str)
         .load(thread_id)
         .ok()
         .flatten()
-        .map(|l| l.meta.role.as_deref() == Some(crate::thread_store::LEAD_ROLE))
+        .map(|l| crate::thread_store::is_lead_meta(&l.meta))
         .unwrap_or(false)
 }
 
@@ -88,26 +89,46 @@ pub fn read_entries(project_root: &Path) -> std::io::Result<Vec<MemoryEntry>> {
 
 /// 朴素子串检索（ASCII 不区分大小写），按时间升序返回至多 `limit` 条。
 ///
+/// 截断取**最近**的 `limit` 条（丢掉最旧的）：账本装的是「决策与理由」，同一
+/// thread 先后两次决策时最新那条才是权威；返回被推翻的旧理由比返回空更难排查
+/// （上级设计 §7.3 的可审计目的）。返回顺序仍是时间升序，只是窗口落在尾部。
+///
 /// 不做索引、不做分词：`memory.md` 本期无界增长是已知限制（spec §7.6），
 /// 现在给它加索引是过早优化。
 pub fn search(project_root: &Path, query: &str, limit: usize) -> std::io::Result<Vec<MemoryEntry>> {
+    Ok(search_with_total(project_root, query, limit)?.0)
+}
+
+/// 同 [`search`]，但**同时**返回匹配总数——供工具披露「匹配 N 条，显示最近 M 条」。
+///
+/// 不披露截断会让组长以为「账本里只有这几条」，从而误判自己记得比别人少。
+pub fn search_with_total(
+    project_root: &Path,
+    query: &str,
+    limit: usize,
+) -> std::io::Result<(Vec<MemoryEntry>, usize)> {
     let needle = query.to_lowercase();
     if needle.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let mut hits: Vec<MemoryEntry> = read_entries(project_root)?
         .into_iter()
         .filter(|e| e.text.to_lowercase().contains(&needle))
         .collect();
     hits.sort_by_key(|e| e.timestamp_ms);
-    hits.truncate(limit);
-    Ok(hits)
+    let total = hits.len();
+    // 从尾部取窗口：`split_off` 留下的是前半段，丢弃它即得最近 limit 条。
+    if total > limit {
+        let keep_from = total - limit;
+        hits = hits.split_off(keep_from);
+    }
+    Ok((hits, total))
 }
 
 use serde_json::Value;
 use yi_agent_core::{Tool, ToolMetadata, ToolResult, ToolSource};
 
-fn lead_memory_metadata() -> ToolMetadata {
+pub(crate) fn lead_memory_metadata() -> ToolMetadata {
     ToolMetadata {
         source: ToolSource::Plugin {
             name: "lead".to_string(),
@@ -237,10 +258,19 @@ impl Tool for LeadRecallTool {
             Ok(a) => a,
             Err(e) => return ToolResult::error(format!("invalid arguments: {e}")),
         };
-        match search(&self.project_root, &parsed.query, parsed.limit) {
-            Ok(entries) if entries.is_empty() => ToolResult::text("账本里没有匹配的条目。"),
-            Ok(entries) => {
+        match search_with_total(&self.project_root, &parsed.query, parsed.limit) {
+            Ok((entries, _total)) if entries.is_empty() => {
+                ToolResult::text("账本里没有匹配的条目。")
+            }
+            Ok((entries, total)) => {
                 let mut out = String::new();
+                // 截断必须说出口：不披露会让组长以为账本里只有这几条。
+                if total > entries.len() {
+                    out.push_str(&format!(
+                        "匹配 {total} 条，显示最近 {} 条：\n",
+                        entries.len()
+                    ));
+                }
                 for e in entries {
                     out.push_str(&format!(
                         "- [{}] ({}) {}\n",
@@ -329,6 +359,58 @@ mod tests {
 
         let capped = search(dir.path(), "打回", 1).expect("search");
         assert_eq!(capped.len(), 1);
+        // 取最近一条（时间升序返回，但窗口在尾部）。
+        assert_eq!(capped[0].timestamp_ms, 2);
+    }
+
+    #[test]
+    fn search_prefers_the_most_recent_entries_when_capped() {
+        // 账本装的是「决策与理由」：同一 thread 先后两次决策时，**最新那条才是
+        // 权威**。截断必须从最旧的一端丢，否则组长会拿到已被推翻的旧理由——
+        // 比拿不到更难排查。
+        let dir = temp_project();
+        for (ms, text) in [
+            (1, "打回 thread A：第一版理由（已推翻）"),
+            (2, "打回 thread A：第二版理由（当前）"),
+            (3, "打回 thread A：第三版理由（最新）"),
+        ] {
+            append_entry(
+                dir.path(),
+                &MemoryEntry {
+                    timestamp_ms: ms,
+                    source: "s".into(),
+                    text: text.into(),
+                },
+            )
+            .expect("append");
+        }
+        let hits = search(dir.path(), "打回 thread A", 2).expect("search");
+        assert_eq!(hits.len(), 2);
+        // 升序返回，但窗口落在**尾部**：给的是第 2、3 条，不是第 1、2 条。
+        assert_eq!(hits[0].timestamp_ms, 2);
+        assert_eq!(hits[1].timestamp_ms, 3);
+    }
+
+    #[test]
+    fn search_with_total_reports_every_match_not_just_the_window() {
+        let dir = temp_project();
+        for (ms, text) in [(1, "命中"), (2, "命中"), (3, "命中"), (4, "无关")] {
+            append_entry(
+                dir.path(),
+                &MemoryEntry {
+                    timestamp_ms: ms,
+                    source: "s".into(),
+                    text: text.into(),
+                },
+            )
+            .expect("append");
+        }
+        let (hits, total) = search_with_total(dir.path(), "命中", 2).expect("search");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            total, 3,
+            "must report every match, not just the returned window"
+        );
     }
 
     #[test]
@@ -457,14 +539,17 @@ mod tests {
             title: None,
             permission_mode: crate::thread_store::ThreadMode::Normal,
             pin_seq: None,
-            board_project: None,
-            card_id: None,
+            driver_project: None,
+            driver_ref: None,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
             preserve_thinking: true,
             extra_roots: Vec::new(),
             role: role.map(str::to_string),
+            content_epoch: 0,
+            last_item_id: None,
+            anchor_sha: None,
         }
     }
 
@@ -510,5 +595,23 @@ mod tests {
         let dir = temp_project();
         let store = crate::thread_store::ThreadStore::new(dir.path());
         assert!(!is_lead_thread(&store, "../escape"));
+    }
+
+    /// 看板 worktree 里的 `role:"lead"` 不是组长——判定必须与 `find_lead` 同口径,
+    /// 否则一个假会长到项目账本写权限(真机数据里已有 9 个这样的假组长)。
+    #[test]
+    fn a_lead_in_a_card_worktree_is_not_the_lead() {
+        let dir = temp_project();
+        let worktree = dir.path().join(".worktrees/kanban/card-1");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let store = crate::thread_store::ThreadStore::new(&worktree);
+        let mut phantom = lead_test_meta("lead-1", Some(crate::thread_store::LEAD_ROLE));
+        phantom.cwd = worktree.display().to_string();
+        store.create(&phantom).expect("create");
+
+        assert!(
+            !is_lead_thread(&store, "lead-1"),
+            "a card worktree has no lead, so its ledger tools must stay unregistered"
+        );
     }
 }

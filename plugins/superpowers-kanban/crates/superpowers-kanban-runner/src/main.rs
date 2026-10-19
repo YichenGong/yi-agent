@@ -28,7 +28,8 @@ use superpowers_kanban_runner::service::BoardService;
 #[derive(Debug)]
 struct Args {
     /// supervisor 清单仍传 `--runtime-dir`，所以 CLI 必须继续接受它；但插件已不再
-    /// 直连 daemon 建会话（改由宿主调度器驱动 `board.*`），此字段暂无用途。
+    /// 直连 daemon 建会话（改由宿主的通用驱动器每 tick 问插件 `driver/next`），
+    /// 此字段暂无用途。
     #[allow(dead_code)]
     runtime_dir: PathBuf,
     state_dir: PathBuf,
@@ -71,6 +72,17 @@ enum Subcommand {
         spec: String,
         plan: String,
     },
+    AddPrequeued {
+        state_dir: PathBuf,
+        title: String,
+    },
+    Promote {
+        state_dir: PathBuf,
+        card_id: String,
+        spec: String,
+        plan: String,
+        title: Option<String>,
+    },
     List {
         state_dir: PathBuf,
         all: bool,
@@ -112,10 +124,12 @@ enum Subcommand {
 }
 
 const USAGE: &str =
-    "usage: superpowers-kanban <run|add|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir> [...]
-  run           --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
-  add           <spec> <plan> [--state-dir <d>]
-  add-merge     <source> [--base <ref>] [--state-dir <d>]
+    "usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir> [...]
+  run            --runtime-dir <d> --state-dir <d> [--project-root <d>] [--interval-secs N]
+  add            <spec> <plan> [--state-dir <d>]
+  add-prequeued  <title> [--state-dir <d>]
+  promote        <card-id> <spec> <plan> [--title <t>] [--state-dir <d>]
+  add-merge      <source> [--base <ref>] [--state-dir <d>]
   merge-request <card-id> [--state-dir <d>]
   merge-finish  <card-id> [--state-dir <d>]
   done          <card-id> [--state-dir <d>]
@@ -154,6 +168,50 @@ where
                 state_dir,
                 spec,
                 plan,
+            })
+        }
+        Some("add-prequeued") => {
+            let (state_dir, rest) = parse_state_dir(args)?;
+            let mut rest = rest.into_iter();
+            let title = rest
+                .next()
+                .ok_or_else(|| format!("add-prequeued needs a title\n{USAGE}"))?;
+            if let Some(extra) = rest.next() {
+                return Err(format!(
+                    "add-prequeued takes one title, got an extra: {extra}"
+                ));
+            }
+            Ok(Subcommand::AddPrequeued { state_dir, title })
+        }
+        Some("promote") => {
+            let (state_dir, rest) = parse_state_dir(args)?;
+            let mut rest = rest.into_iter();
+            let card_id = rest
+                .next()
+                .ok_or_else(|| format!("promote needs a card id\n{USAGE}"))?;
+            let spec = rest
+                .next()
+                .ok_or_else(|| format!("promote needs a spec path\n{USAGE}"))?;
+            let plan = rest
+                .next()
+                .ok_or_else(|| format!("promote needs a plan path\n{USAGE}"))?;
+            let mut title = None;
+            while let Some(token) = rest.next() {
+                if token == "--title" {
+                    title = Some(
+                        rest.next()
+                            .ok_or_else(|| "--title needs a value".to_string())?,
+                    );
+                } else {
+                    return Err(format!("unexpected argument: {token}"));
+                }
+            }
+            Ok(Subcommand::Promote {
+                state_dir,
+                card_id,
+                spec,
+                plan,
+                title,
             })
         }
         Some("add-merge") => {
@@ -374,6 +432,69 @@ fn command_add(state_dir: &std::path::Path, spec: &str, plan: &str) -> Result<St
         .map_err(|error| format!("could not deliver the card: {error}"))?;
     Ok(format!(
         "delivered {id} to {}\n{spec}\n{plan}",
+        superpowers_kanban_core::inbox::inbox_dir(state_dir).display()
+    ))
+}
+
+/// `add-prequeued`：只给标题，投递一张预排队卡，id 在这里定死。
+///
+/// 会话内的 agent 经 bash 调用本命令时，宿主已在装配期把当前 thread id 注入
+/// 环境变量 `YI_AGENT_THREAD_ID`（模型看不到自己的 thread id，只能由装配期注入）。
+/// 读不到（会话外手动调用、TUI 本地会话）就留空——关联是尽力而为，不阻断投递。
+fn command_prequeued(state_dir: &std::path::Path, title: &str) -> Result<String, String> {
+    if title.trim().is_empty() {
+        return Err("add-prequeued needs a non-empty title".to_string());
+    }
+    let origin_thread_id = std::env::var("YI_AGENT_THREAD_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let board = superpowers_kanban_runner::persist::load_board(&state_dir.join("board.json"));
+    let id = superpowers_kanban_core::inbox::next_free_prequeued_id(
+        &board,
+        state_dir,
+        title,
+        chrono::Local::now(),
+    )
+    .0;
+    superpowers_kanban_core::inbox::deliver_prequeued_card(
+        state_dir,
+        &id,
+        title,
+        origin_thread_id.as_deref(),
+    )
+    .map_err(|error| format!("could not deliver the card: {error}"))?;
+    Ok(format!(
+        "delivered {id} to {}\n{title}",
+        superpowers_kanban_core::inbox::inbox_dir(state_dir).display()
+    ))
+}
+
+/// `promote`：校验成对 + 卡确为 pre-queued（早报错），再投递提升。
+fn command_promote(
+    state_dir: &std::path::Path,
+    card_id: &str,
+    spec: &str,
+    plan: &str,
+    title: Option<&str>,
+) -> Result<String, String> {
+    validate_promotion(std::path::Path::new(spec), std::path::Path::new(plan))
+        .map_err(|error| error.to_string())?;
+    let board = superpowers_kanban_runner::persist::load_board(&state_dir.join("board.json"));
+    let id = superpowers_kanban_core::card::CardId::new(card_id);
+    match board.get(&id) {
+        None => return Err(format!("unknown card: {card_id}")),
+        Some(card) if card.state != superpowers_kanban_core::card::CardState::PreQueued => {
+            return Err(format!(
+                "card {card_id} is not pre-queued (state: {:?})",
+                card.state
+            ));
+        }
+        Some(_) => {}
+    }
+    superpowers_kanban_core::inbox::deliver_promote_card(state_dir, card_id, spec, plan, title)
+        .map_err(|error| format!("could not deliver the promote: {error}"))?;
+    Ok(format!(
+        "delivered promote for {card_id} to {}\n{spec}\n{plan}",
         superpowers_kanban_core::inbox::inbox_dir(state_dir).display()
     ))
 }
@@ -653,6 +774,14 @@ fn main() {
             spec,
             plan,
         } => command_add(&state_dir, &spec, &plan),
+        Subcommand::AddPrequeued { state_dir, title } => command_prequeued(&state_dir, &title),
+        Subcommand::Promote {
+            state_dir,
+            card_id,
+            spec,
+            plan,
+            title,
+        } => command_promote(&state_dir, &card_id, &spec, &plan, title.as_deref()),
         Subcommand::AddMerge {
             state_dir,
             source,
@@ -785,8 +914,9 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 
 /// 周期性推进队列，直到进程被杀。
 ///
-/// 这里**不再创建会话**：认领（`board.next_launch`）、起会话、回写终态都由宿主
-/// 调度器负责（plan Task 5/6）。插件只负责消费 inbox 把卡排进队列，并落盘。
+/// 这里**不再创建会话**：宿主每 tick 问一次 `driver/next`，由插件在 `driver_step`
+/// 里认领队首卡并交出通用动作（起会话 / 追加一轮），宿主只负责执行。插件在这里
+/// 只消费 inbox 把卡排进队列、收敛已并入的分支、归档终点卡，并落盘。
 fn run_daemon(args: Args) {
     let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
     // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到锁就在有界预算内
@@ -850,7 +980,8 @@ fn run_daemon(args: Args) {
         }
 
         // 插件在这里只做一件事：把 inbox 里的投递排进共享看板并落盘。认领与
-        // 会话推进全部交给宿主调度器经 `board.*` 驱动。
+        // 会话推进都由宿主每 tick 经 `driver/next` 问出来，插件在 `driver_step`
+        // 里决定——宿主不认看板，也不调任何 `board.*` 方法。
         for outcome in service.consume_inbox(chrono::Local::now()) {
             match outcome.result {
                 Ok(()) => eprintln!("superpowers-kanban: enqueued {}", outcome.id),
@@ -867,15 +998,9 @@ fn run_daemon(args: Args) {
             );
         }
 
-        // 合并与实现共用一个 tick：消费投递后，若本项目没有合并在跑，就做一张。
-        match service.merge_next() {
-            Ok(Some(claim)) => eprintln!(
-                "superpowers-kanban: merged {} ({:?})",
-                claim.card_id, claim.outcome
-            ),
-            Ok(None) => {}
-            Err(error) => eprintln!("superpowers-kanban: merge failed: {error}"),
-        }
+        // 合并轮不再由 runner 认领跑 git：它已是**会话里的一回合**——插件经
+        // `driver_step` 派发、模型动手、插件用 git 复核出判词（见 service 的
+        // `driver_step` 与 `merge_finish`）。这里只留收敛与归档。
 
         // 归档：真终止态过宽限期自动隐藏；awaiting_merge/needs_you 永不自动。
         let swept = service.archive_due(chrono::Local::now());
@@ -894,9 +1019,9 @@ fn run_daemon(args: Args) {
 mod tests {
     use super::{
         Duration, Subcommand, command_add, command_add_merge, command_archive, command_done,
-        command_list, command_merge_finish, command_merge_request, command_purge,
-        command_set_switch, effective_interval, parse_subcommand, sweep_one_socket,
-        sweep_stale_sockets,
+        command_list, command_merge_finish, command_merge_request, command_prequeued,
+        command_promote, command_purge, command_set_switch, effective_interval, parse_subcommand,
+        sweep_one_socket, sweep_stale_sockets,
     };
     use superpowers_kanban_core::switch::SwitchValue;
 
@@ -1462,5 +1587,233 @@ mod tests {
         // 直接对 live 路径调一次（绕过 state_dir 推导），确认活 socket 不被删。
         sweep_one_socket(&live);
         assert!(live.exists(), "有活实例应答的 socket 绝不删");
+    }
+
+    #[test]
+    fn parses_add_prequeued_and_promote() {
+        assert!(matches!(
+            parse(&["add-prequeued", "一个想法"]),
+            Ok(Subcommand::AddPrequeued { title, .. }) if title == "一个想法"
+        ));
+        assert!(matches!(
+            parse(&["promote", "idea", "a.spec.md", "a.plan.md"]),
+            Ok(Subcommand::Promote { card_id, spec, plan, title: None, .. })
+                if card_id == "idea" && spec == "a.spec.md" && plan == "a.plan.md"
+        ));
+        assert!(matches!(
+            parse(&["promote", "idea", "a.spec.md", "a.plan.md", "--title", "新标题"]),
+            Ok(Subcommand::Promote { title: Some(t), .. }) if t == "新标题"
+        ));
+    }
+
+    #[test]
+    fn add_prequeued_and_promote_reject_missing_arguments() {
+        assert!(parse(&["add-prequeued"]).is_err());
+        assert!(parse(&["promote", "idea"]).is_err());
+        assert!(parse(&["promote", "idea", "a.spec.md"]).is_err());
+    }
+
+    /// 同一秒的两次捕获必须拿到两个 id：只看看板的分配器会让第二次覆盖第一张卡在
+    /// `inbox/` 里的投递文件（本分支修掉的数据丢失）。
+    #[test]
+    fn add_prequeued_allocates_against_pending_deliveries() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = command_prequeued(dir.path(), "一个想法").unwrap();
+        let second = command_prequeued(dir.path(), "一个想法").unwrap();
+        assert!(first.contains("delivered"), "{first}");
+        assert!(second.contains("delivered"), "{second}");
+        let inbox = superpowers_kanban_core::inbox::inbox_dir(dir.path());
+        let delivered = std::fs::read_dir(&inbox).unwrap().count();
+        assert_eq!(
+            delivered, 2,
+            "两次捕获必须各留下一份投递文件，第二次不得覆盖第一次"
+        );
+    }
+
+    #[test]
+    fn add_prequeued_refuses_a_blank_title() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(command_prequeued(dir.path(), "   ").is_err());
+        assert!(!dir.path().join("inbox").exists(), "空标题不得投递任何东西");
+    }
+
+    /// 一张 `PreQueued` 卡 + 一对合法的 spec/plan。
+    fn prequeued_card(
+        card_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::CardId;
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = Board::new();
+        board.enqueue_prequeued(
+            CardId::new(card_id),
+            "一个想法".to_string(),
+            None,
+            chrono::Local::now(),
+        );
+        superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
+            .unwrap();
+        let spec = dir.path().join("a.spec.md");
+        let plan = dir.path().join("a.plan.md");
+        std::fs::write(&spec, "# spec").unwrap();
+        std::fs::write(&plan, "# plan").unwrap();
+        (dir, state_dir, spec, plan)
+    }
+
+    #[test]
+    fn promote_delivers_for_a_prequeued_card() {
+        let (dir, state_dir, spec, plan) = prequeued_card("idea");
+        let message = command_promote(
+            &state_dir,
+            "idea",
+            &spec.to_string_lossy(),
+            &plan.to_string_lossy(),
+            Some("新标题"),
+        )
+        .unwrap();
+        assert!(message.contains("delivered promote for idea"), "{message}");
+        let path = superpowers_kanban_core::inbox::promote_path(&state_dir, "idea");
+        let body: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(body["kind"], "promote");
+        assert_eq!(body["id"], "idea");
+        assert_eq!(body["title"], "新标题");
+        drop(dir);
+    }
+
+    #[test]
+    fn promote_refuses_a_card_that_is_not_prequeued() {
+        use superpowers_kanban_core::board::Board;
+        use superpowers_kanban_core::card::{CardId, CardState};
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let mut board = Board::new();
+        board.enqueue(
+            CardId::new("idea"),
+            "a.spec.md".into(),
+            "a.plan.md".into(),
+            chrono::Local::now(),
+        );
+        board
+            .transition(&CardId::new("idea"), CardState::Running)
+            .unwrap();
+        superpowers_kanban_runner::persist::save_board(&state_dir.join("board.json"), &board)
+            .unwrap();
+        let spec = dir.path().join("a.spec.md");
+        let plan = dir.path().join("a.plan.md");
+        std::fs::write(&spec, "# spec").unwrap();
+        std::fs::write(&plan, "# plan").unwrap();
+
+        let error = command_promote(
+            &state_dir,
+            "idea",
+            &spec.to_string_lossy(),
+            &plan.to_string_lossy(),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("not pre-queued"), "{error}");
+        assert!(
+            !superpowers_kanban_core::inbox::promote_path(&state_dir, "idea").exists(),
+            "被拒绝的提升不得留下投递文件"
+        );
+        drop(dir);
+    }
+
+    #[test]
+    fn promote_refuses_a_missing_spec_before_touching_the_inbox() {
+        let (dir, state_dir, spec, plan) = prequeued_card("idea");
+        std::fs::remove_file(&spec).unwrap();
+        let error = command_promote(
+            &state_dir,
+            "idea",
+            &spec.to_string_lossy(),
+            &plan.to_string_lossy(),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("a.spec.md"), "{error}");
+        assert!(
+            !state_dir.join("inbox").exists(),
+            "校验失败时不得投递任何东西"
+        );
+        drop(dir);
+    }
+
+    /// 涉及进程级环境变量的测试必须串行，否则并行跑时互相干扰。
+    static ENV_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// 记录原值并在 drop 时还原，确保断言失败也不会把环境变量留给别的测试。
+    struct EnvVarGuard {
+        name: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(name);
+            // SAFETY: 递归持有 ENV_TEST_MUTEX，进程内无人并发读写该变量。
+            unsafe { std::env::set_var(name, value) };
+            Self { name, original }
+        }
+
+        fn unset(name: &'static str) -> Self {
+            let original = std::env::var_os(name);
+            // SAFETY: 同上。
+            unsafe { std::env::remove_var(name) };
+            Self { name, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: 同上。
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                None => unsafe { std::env::remove_var(self.name) },
+            }
+        }
+    }
+
+    #[test]
+    fn add_prequeued_reads_the_thread_id_from_the_environment() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::set("YI_AGENT_THREAD_ID", "thread-abc");
+        let dir = tempfile::tempdir().unwrap();
+        command_prequeued(dir.path(), "my idea").unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["origin_thread_id"], "thread-abc");
+    }
+
+    #[test]
+    fn add_prequeued_without_the_env_var_still_delivers() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::unset("YI_AGENT_THREAD_ID");
+        let dir = tempfile::tempdir().unwrap();
+        command_prequeued(dir.path(), "my idea").unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(value.get("origin_thread_id").is_none());
+    }
+
+    #[test]
+    fn add_prequeued_ignores_a_blank_thread_id() {
+        // 空/空白 env 视为没有（宿主不该注入空串，但别让它污染数据）。
+        let _lock = ENV_TEST_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvVarGuard::set("YI_AGENT_THREAD_ID", "   ");
+        let dir = tempfile::tempdir().unwrap();
+        command_prequeued(dir.path(), "my idea").unwrap();
+        let text = std::fs::read_to_string(dir.path().join("inbox/my-idea.json")).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(value.get("origin_thread_id").is_none());
     }
 }

@@ -3,9 +3,15 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, cleanup, act, within } from "@testing-library/react";
 
 type Mode = "normal" | "yolo";
-type ThreadSeed = { thread_id: string; title: string | null; permission_mode: Mode };
+type ThreadSeed = {
+  thread_id: string;
+  title: string | null;
+  permission_mode: Mode;
+  driver_project?: string;
+  driver_ref?: string;
+};
 
-const { clients, state } = vi.hoisted(() => ({
+const { clients, state, dragDrop } = vi.hoisted(() => ({
   clients: [] as Array<{
     requests: { method: string; params: unknown }[];
     // The recovery hook the App injects as `RpcClient`'s 2nd constructor arg.
@@ -80,6 +86,8 @@ const { clients, state } = vi.hoisted(() => ({
     // 路径确实被走到」可被断言，而不是靠「首屏照常」这种两边都成立的弱断言。
     leadAttempts: [] as string[],
   },
+  // 捕获 `@tauri-apps/api/webview` 注册的拖放 handler，供用例驱动事件。
+  dragDrop: { fn: null as null | ((event: unknown) => void) },
 }));
 
 // 内容缓存模块级替换：每个用例一份内存实现。App 在首次远端渲染时才懒建，故用
@@ -195,6 +203,8 @@ vi.mock("./lib/rpc", () => ({
                       permission_mode: t.permission_mode,
                       status: state.listStatus,
                       pinned: state.pinnedIds.includes(t.thread_id),
+                      driver_project: t.driver_project,
+                      driver_ref: t.driver_ref,
                     })),
                     ...leadEntries(workspace),
                   ]
@@ -281,6 +291,24 @@ vi.mock("./lib/rpc", () => ({
   },
 }));
 
+// 拖放订阅走动态 import 的 `@tauri-apps/api/webview`；在模块边界桩掉它，
+// 并把注册的 handler 记在 `dragDrop.fn` 上。Tauri 交来的是事件对象
+// （`{ payload }`），故这里回放时也要包一层——`App` 的 subscribe 只转发 payload。
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: async (handler: (event: unknown) => void) => {
+      dragDrop.fn = handler;
+      return () => {};
+    },
+  }),
+}));
+
+/** jsdom 的 rect 恒为 0，落点判定需要一个真矩形。 */
+function stubRect(el: HTMLElement, r: { left: number; top: number; right: number; bottom: number }) {
+  el.getBoundingClientRect = () =>
+    ({ ...r, width: r.right - r.left, height: r.bottom - r.top, x: r.left, y: r.top, toJSON: () => ({}) }) as DOMRect;
+}
+
 vi.mock("./transportFactory", () => ({ transportFactory: () => ({}) }));
 
 // iOS-vs-desktop 的唯一判定入口。只换掉 `isIos`：其余（`isRemoteClient` 等）
@@ -329,6 +357,7 @@ beforeEach(() => {
   state.leadCwds = [];
   state.failLead = false;
   state.leadAttempts = [];
+  dragDrop.fn = null;
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
   // 主题是全局 DOM 状态，用例间必须清掉，否则首例会污染后续。
@@ -976,6 +1005,42 @@ async function openBoardFor(project: string) {
   fireEvent.click(screen.getByLabelText("看板"));
   return project;
 }
+
+describe("App driven-session sidebar refresh", () => {
+  it("lists a newly started running card session before its turn completes", async () => {
+    state.groupWorkspaces = ["/proj"];
+    state.threads = [{ thread_id: "t1", title: "discussion", permission_mode: "normal" }];
+    render(<App />);
+
+    await waitFor(() =>
+      expect(clients[0].requests.some((request) => request.method === "thread/resume")).toBe(true),
+    );
+
+    // The driver creates a card thread directly in the server while its turn
+    // starts; only the running status notification tells the desktop about it.
+    // `thread/listAll` knows about it after that notification refreshes groups.
+    state.threads.push({
+      thread_id: "card-thread",
+      title: "看板 · card-1",
+      permission_mode: "yolo",
+      driver_project: "/proj",
+      driver_ref: "card-1",
+    });
+    state.listStatus = "running";
+    act(() => {
+      for (const notify of state.notifHandlers) {
+        notify({
+          method: "thread/status/updated",
+          params: { thread_id: "card-thread", status: "running" },
+        });
+      }
+    });
+
+    await waitFor(() => expect(screen.getByText("看板会话 (1)")).toBeTruthy());
+    fireEvent.click(screen.getByLabelText("看板会话"));
+    expect(screen.getByText("看板 · card-1")).toBeTruthy();
+  });
+});
 
 describe("App 主区域看板", () => {
   it("未选中看板时不渲染看板面板，也没有全局左列", async () => {
@@ -2921,7 +2986,7 @@ describe("App 会话详情栏的开合", () => {
 
     act(() => {
       for (const cb of state.notifHandlers) {
-        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", base: null, note: "看这里" } });
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: "看这里" } });
       }
     });
 
@@ -2936,6 +3001,126 @@ describe("App 会话详情栏的开合", () => {
     );
     // 推送里带来的提示语渲染在 diff 视图里。
     expect(await screen.findByText("看这里")).toBeTruthy();
+  });
+
+  it("ui/gitDiff/focus 同时取该会话的视图帧，并渲染模型给的命令输出", async () => {
+    // 结构化快照给得出 commits/files（汇总行要它），但正文由**帧**说了算。
+    state.dataSources["thread/diff/read"] = () => ({
+      base: "origin/main",
+      baseKind: "origin-default",
+      mergeBase: "abc1234",
+      commits: [],
+      files: [{ path: "a.txt", status: "M", additions: 1, deletions: 1, binary: false }],
+      unifiedDiff: "",
+      truncated: false,
+    });
+    state.dataSources["thread/view/read"] = () => ({
+      command: "git log --oneline -2",
+      asKind: "log",
+      exitCode: 0,
+      stdout: "abc1234 fix a\ndef5678 add b\n",
+      stderr: "",
+      truncated: false,
+      timedOut: false,
+      note: null,
+      base: null,
+      baseKind: "",
+    });
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: null } });
+      }
+    });
+
+    await screen.findByLabelText("会话详情");
+    // 帧被真的取了。
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/view/read",
+        params: { threadId: "t1" },
+      }),
+    );
+    // 命令条（命令 + 退出码）与 log 原语（提交列表）都画出来了。
+    expect(await screen.findByText(/git log --oneline -2/)).toBeTruthy();
+    expect(await screen.findByText("fix a")).toBeTruthy();
+    expect(screen.getByText("add b")).toBeTruthy();
+  });
+
+  it("只有帧、没有结构化快照时，帧仍然渲染（不回落到空态）", async () => {
+    // 帧路径与结构化快照是两条独立请求：这一条钉死「快照缺席不得吞掉帧」——
+    // 否则 Task 8 的整条帧渲染路径在真实接线里永远走不到。
+    state.dataSources["thread/diff/read"] = () => {
+      throw { code: -1, message: "no structured diff" };
+    };
+    state.dataSources["thread/view/read"] = () => ({
+      command: "git diff --stat",
+      asKind: "text",
+      exitCode: 0,
+      stdout: " a.txt | 2 +-\n",
+      stderr: "",
+      truncated: false,
+      timedOut: false,
+      note: null,
+      base: null,
+      baseKind: "",
+    });
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: null } });
+      }
+    });
+
+    // 帧的文本原样可见，且不是「尚无 diff 数据」的空态。
+    expect(await screen.findByText(/a\.txt \| 2 \+-/)).toBeTruthy();
+    expect(screen.queryByText(/尚无 diff 数据/)).toBeNull();
+  });
+
+  it("单文件正文缺席时点标注补一次带 path 的 thread/diff/read（D1）", async () => {
+    state.dataSources["thread/view/read"] = () => null; // 无帧：走结构化路径
+    state.dataSources["thread/diff/read"] = (params) => {
+      const p = params as { threadId: string; path?: string };
+      if (p.path) {
+        // 懒加载的 path 分支：给该文件的正文。
+        return {
+          unifiedDiff: "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n",
+          truncated: false,
+        };
+      }
+      // 会话级快照：文件列在 files[] 里，但正文被截断（unifiedDiff 空）。
+      return {
+        base: "origin/main",
+        baseKind: "origin-default",
+        mergeBase: "abc1234",
+        commits: [],
+        files: [{ path: "a.txt", status: "M", additions: 1, deletions: 1, binary: false }],
+        unifiedDiff: "",
+        truncated: true,
+      };
+    };
+    render(<App />);
+    await screen.findByLabelText("会话详情面板");
+
+    act(() => {
+      for (const cb of state.notifHandlers) {
+        cb({ method: "ui/gitDiff/focus", params: { threadId: "t1", note: null } });
+      }
+    });
+    await screen.findByLabelText("会话详情");
+
+    // 正文缺席 -> 标注可点；点它触发一次带 path 的懒加载。
+    fireEvent.click(await screen.findByRole("button", { name: /正文已截断/ }));
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "thread/diff/read",
+        params: { threadId: "t1", path: "a.txt" },
+      }),
+    );
   });
 
   it("点子 agent 卡片在栏内下钻到轨迹，可返回列表", async () => {
@@ -2991,7 +3176,7 @@ describe("App 会话详情栏的开合", () => {
 
     act(() => {
       for (const cb of state.notifHandlers) {
-        cb({ method: "ui/gitDiff/focus", params: { threadId: null, base: null, note: null } });
+        cb({ method: "ui/gitDiff/focus", params: { threadId: null, note: null } });
       }
     });
 
@@ -3054,7 +3239,7 @@ describe("App 会话详情栏的开合", () => {
       for (const cb of state.notifHandlers) {
         cb({
           method: "ui/gitDiff/focus",
-          params: { threadId: "t2", base: null, note: "这是 t2 的提示" },
+          params: { threadId: "t2", note: "这是 t2 的提示" },
         });
       }
     });
@@ -3593,19 +3778,14 @@ describe("App first-run onboarding gate", () => {
     expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull();
   });
 
-  it("leaves a dismissible notice when the apply is a partial success", async () => {
+  it("closes the wizard after a successful apply (models.json only)", async () => {
     state.dataSources["onboarding/status"] = () => ({
       needed: true,
       dismissed: false,
       reasons: ["api_key"],
     });
-    // `.env` 写成功但清单收边失败：宿主回 ok:true + imported:false + 原因。
-    state.dataSources["onboarding/apply"] = () => ({
-      ok: true,
-      env_written: true,
-      imported: false,
-      import_error: "disk",
-    });
+    // 单写清单：宿主回 { ok, name }。没有「部分成功」态，故不该出现任何收尾横幅。
+    state.dataSources["onboarding/apply"] = () => ({ ok: true, name: "gpt-4o" });
     render(<App />);
     // 走完向导：欢迎 → 选格式 → 保存。
     fireEvent.click(await screen.findByRole("button", { name: /开始/ }));
@@ -3614,13 +3794,8 @@ describe("App first-run onboarding gate", () => {
     fireEvent.change(await screen.findByLabelText("API 密钥"), { target: { value: "sk-x" } });
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
 
-    // 部分成功：向导退场，主界面顶部留一条可关闭提示，并带上原因。
-    const notice = await screen.findByText(/未纳入模型清单/);
-    expect(notice.textContent).toContain("disk");
-    expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull();
-
-    // 关闭即清空。
-    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    // 向导退场，且没有遗留的「未纳入模型清单」横幅。
+    await waitFor(() => expect(screen.queryByText("欢迎使用 Yi-Agent")).toBeNull());
     expect(screen.queryByText(/未纳入模型清单/)).toBeNull();
   });
 });
@@ -3758,6 +3933,9 @@ describe("App 远端图片上传", () => {
       );
       expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
         threadId: "t1",
+        // 手机端的 turn/start 现在带上下文锚点（Task 12，spec §7.1）：该会话尚未
+        // 对过账，故 contentEpoch 为初始 0、游标为 null。
+        contextAnchor: { contentEpoch: 0, lastItemId: null },
         input: [{ type: "uploaded_image", uploadId: "u1" }, { type: "text", text: "" }],
       });
     } finally {
@@ -3798,6 +3976,8 @@ describe("App 远端图片上传", () => {
     // 渲染用（桌面端那条 `{type:"image", path}` 一个字都没变）。
     expect(clients[0].requests.find((r) => r.method === "turn/start")?.params).toEqual({
       threadId: "t1",
+      // 手机端 turn/start 携带上下文锚点（Task 12，spec §7.1）。
+      contextAnchor: { contentEpoch: 0, lastItemId: null },
       input: [
         { type: "uploaded_image", uploadId: "u1" },
         { type: "text", text: "看看这个" },
@@ -4068,6 +4248,344 @@ describe("App mobile local cache", () => {
     );
     await waitFor(() => expect(screen.queryByText("one")).toBeNull());
     expect(contentStore.current).toBeNull();
+  });
+
+  it("resumes a thread the server flagged full, and drops the ghost content", async () => {
+    asRemote();
+    // 服务端说这个会话 epoch 变了（期间被 clear 过）。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "full", epoch: 4, reason: "epoch_changed" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "stale content" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // 幽灵内容必须被清掉，而不是留在屏上。
+    await waitFor(() => expect(screen.queryByText("stale content")).toBeNull());
+  });
+
+  it("forces a full resume for a trimmed cache even when the plan says none", async () => {
+    asRemote();
+    // 服务端**正确地说 none**（同世代、锚点仍在日志里）——但本地条目因超 1MB 丢过
+    // 头部。照 none 跳过 resume 会让用户静默看到一个被截断的会话（spec §4.2 例外）。
+    // 这条只依赖客户端自己知道的信息（自己有没有裁过），故 plan 覆盖时也必须生效。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-tail", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-tail", text: "tail only" }],
+      trimmed: true, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+  });
+
+  it("catches up a thread the server marked none so a stale tail is filled", async () => {
+    asRemote();
+    // 服务端说 none：缓存**有效**，但这只表示"不必作废"，**不表示"已是最新"**。
+    // 会话在两轮之间又长了几条，而客户端的锚点仍有效，故服务端不会给 full
+    // （spec §4.2：落后是正常的并存形状，补齐交给常规路径）。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    state.dataSources["thread/readItems"] = () => ({
+      items: [{ type: "agentMessage", id: "i-new", text: "fresh tail" }],
+    });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-old", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-old", text: "cached head" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    // 必须真的补一次尾部（只读 readItems，不打断任何在途回合）——否则用户永远停在
+    // 缓存尾部却以为内容是最新的，而 `turn/start` 又会因"锚点仍在"被放行，正是
+    // 本特性要消除的"拿旧信息操作"。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    await waitFor(() => expect(screen.getByText("fresh tail")).toBeTruthy());
+  });
+
+  it("re-tops-up a none thread after a reconnect (socket died, process survived)", async () => {
+    asRemote();
+    // 场景：socket 被系统掐断但 sidecar 未退出（经中继的瞬断 / 切回前台），
+    // 于是 `exited` 不触发、`subWindow` 不清。此时若只按订阅窗口判定是否补齐，
+    // warm idle 会话会**永远停在缓存尾部**——正是 C2 的残留缺口。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "none", epoch: 3, reason: "match" }],
+      });
+    state.dataSources["thread/readItems"] = () => ({ items: [] });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "i-old", contentEpoch: 3,
+      items: [{ type: "agentMessage", id: "i-old", text: "cached head" }],
+      trimmed: false, bytes: 1,
+    });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    const first = clients[0].requests.filter((r) => r.method === "thread/readItems").length;
+
+    // 前台唤醒重建客户端（没有 exited）。新连接必须为这个会话**再补一次**。
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    act(() => document.dispatchEvent(new Event("visibilitychange")));
+    await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+    const last = clients[clients.length - 1];
+    await waitFor(() =>
+      expect(last.requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    // 且**同一连接内**再切回不会重复发（每连接每会话只补一次）。
+    expect(first).toBe(1);
+  });
+
+  it("does not let a late cache read re-inject content judged stale", async () => {
+    asRemote();
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "full", epoch: 4, reason: "epoch_changed" }],
+      });
+    // 缓存读故意延迟到 adoptEpoch 之后才 resolve。只延迟**第二次**读（prefill 的
+    // 那次）：第一次是挂载预热，必须放行，否则 cacheMetaRef 为空、裁决无从播种
+    // 缓存世代，测试就退化成「什么都没验」的空洞用例（曾实测）。读返回**快照**
+    // 而非 resolve 时刻的 store：App 会在读到之前把已清空的会话落盘覆盖 ghost。
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const real = new MemoryContentStore();
+    await real.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "must not come back" }],
+      trimmed: false, bytes: 1,
+    });
+    const ghostSnapshot = (await real.read("t1"))!;
+    let reads = 0;
+    contentStore.current = {
+      read: async (id: string) => {
+        if (id === "t1" && (reads += 1) > 1) await gate;
+        return id === "t1" ? ghostSnapshot : real.read(id);
+      },
+      write: (e) => real.write(e),
+      delete: (id) => real.delete(id),
+      keys: () => real.keys(),
+    };
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // 此刻裁决已判 full 并 adoptEpoch（世代 2→4）。
+    release();
+    // 读回是异步的：给它足够的 tick 走到回调里，否则断言会早于回调求值而空洞通过。
+    await act(async () => { await new Promise((r) => setTimeout(r, 60)); });
+    expect(screen.queryByText("must not come back")).toBeNull();
+  });
+
+  it("blocks sending on a running thread until its catch-up lands", async () => {
+    asRemote();
+    state.listStatus = "running";
+    contentStore.current = new MemoryContentStore();
+    // readItems 挂住：模拟补尾部在途。
+    let release!: (v: unknown) => void;
+    state.dataSources["thread/readItems"] = () =>
+      new Promise((resolve) => { release = resolve; });
+
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+
+    // 同步中：提示条在（文案「正在同步…」，带省略号），且发送被拦（不发出 turn/start）。
+    await waitFor(() => expect(screen.getByText(/正在同步…/)).toBeTruthy());
+    const before = clients[0].requests.filter((r) => r.method === "turn/start").length;
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    expect(clients[0].requests.filter((r) => r.method === "turn/start").length).toBe(before);
+
+    // 补完 ⇒ 解禁，提示条退场，且此时真的发得出去。
+    // 断言用带省略号的提示条文案，而非裸 `/正在同步/`：被拦时写入的错误文案
+    // 「正在同步，请稍候」同样含该子串，会在同步结束后仍留在会话上，裸正则必然
+    // 恒不匹配（计划自带的这条断言在计划自己的实现下不可能通过，已实测确认）。
+    release({ items: [{ type: "agentMessage", id: "a1", text: "done" }] });
+    await waitFor(() => expect(screen.queryByText(/正在同步…/)).toBeNull());
+    const turnsBefore = clients[0].requests.filter(
+      (r) => r.method === "turn/start" || r.method === "turn/interject",
+    ).length;
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter(
+          (r) => r.method === "turn/start" || r.method === "turn/interject",
+        ).length,
+      ).toBe(turnsBefore + 1),
+    );
+  });
+
+  it("converges out of syncing even when the catch-up fails", async () => {
+    asRemote();
+    state.listStatus = "running";
+    contentStore.current = new MemoryContentStore();
+    state.dataSources["thread/readItems"] = () => { throw new Error("boom"); };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    // 失败也必须收敛，否则永久无法发送（spec §11 风险 3）。
+    await waitFor(() => expect(screen.queryByText(/正在同步/)).toBeNull());
+  });
+
+  it("shows no syncing notice on the desktop path", async () => {
+    // 桌面：不调 asRemote()。
+    state.listStatus = "running";
+    render(<App />);
+    // 桌面端 running 会话走只读 readItems（不 resume、不置 syncing），等它落地即可。
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/readItems")).toBe(true),
+    );
+    expect(screen.queryByText(/正在同步/)).toBeNull();
+    expect(screen.queryByText(/离线内容/)).toBeNull();
+  });
+
+  it("does not block sending on switching back to a warm idle thread", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    // resume 已回放并置 warm；此刻会话 idle 且已在订阅窗口内 —— 切回不应置 syncing
+    // 也绝不能让用户永久无法发送（设计 §11 风险 3）。
+    await waitFor(() => expect(screen.queryByText(/正在同步/)).toBeNull());
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hi" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+  });
+
+  it("sends a contextAnchor and does not resend after stale_context", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    // `turn/start` 报 stale_context（顶层方法用 dataSources 而非 rpcError，
+    // 后者只在 plugin/query 的内层分支被读）。
+    state.dataSources["turn/start"] = () => {
+      throw { code: -32026, data: { code: "stale_context" } };
+    };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+
+    await waitFor(() => {
+      const turns = clients[0].requests.filter((r) => r.method === "turn/start");
+      expect(turns).toHaveLength(1);
+      expect((turns[0].params as { contextAnchor?: unknown }).contextAnchor).toBeTruthy();
+    });
+
+    // 不自动重发：只提示 + 触发重同步（多一次 thread/resume）。
+    await waitFor(() =>
+      expect(
+        clients[0].requests.filter((r) => r.method === "thread/resume").length,
+      ).toBeGreaterThan(1),
+    );
+    // 发送没有成功：乐观回声（用户气泡）必须回滚，否则转录里会留下一条「已发出」
+    // 的幽灵消息；草稿必须保留，用户确认后能重发（spec §7.3「草稿保留」）。
+    // 只查**气泡**（用户消息气泡那个 class），不查裸文本：草稿框的值也是 "hello"。
+    await waitFor(() =>
+      expect(document.querySelector(".bg-blue-600.self-end")).toBeNull(),
+    );
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("hello");
+    expect(clients[0].requests.filter((r) => r.method === "turn/start")).toHaveLength(1);
+  });
+
+  it("does not send a contextAnchor from the desktop path", async () => {
+    // 桌面：不调 asRemote()。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "hello" } });
+    fireEvent.click(screen.getByRole("button", { name: /^(send|stop)$/i }));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(true),
+    );
+    const turn = clients[0].requests.find((r) => r.method === "turn/start");
+    expect((turn?.params as { contextAnchor?: unknown } | undefined)?.contextAnchor).toBeUndefined();
+  });
+
+  it("declares resumeHints on initialize for a remote client", async () => {
+    asRemote();
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: 5, lastServerItemId: "i1", contentEpoch: 3,
+      items: [], trimmed: false, bytes: 1,
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    // hints 从缓存元数据组装；缓存是异步读的，故轮询等待那一次 initialize 带上它。
+    await waitFor(() => {
+      const init = clients[0].requests.find((r) => r.method === "initialize");
+      const hints = (init?.params as { resumeHints?: unknown[] } | undefined)?.resumeHints;
+      expect(Array.isArray(hints)).toBe(true);
+    });
+  });
+
+  it("does not send resumeHints from the desktop path", async () => {
+    // 不调 asRemote()：桌面路径。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    const init = clients[0].requests.find((r) => r.method === "initialize");
+    expect((init?.params as { resumeHints?: unknown } | undefined)?.resumeHints).toBeUndefined();
+  });
+
+  it("drops a deleted thread's cached content and its cache entry", async () => {
+    asRemote();
+    // 服务端说这个会话已不存在（被另一端删除）——它因此不会出现在 listAll 里。
+    state.dataSources["initialize"] = () =>
+      Promise.resolve({
+        serverInfo: {}, protocolVersion: 1, capabilities: {},
+        syncPlan: [{ threadId: "t1", action: "drop", epoch: 0, reason: "deleted" }],
+      });
+    contentStore.current = new MemoryContentStore();
+    await contentStore.current.write({
+      threadId: "t1", savedAt: Date.now(), lastServerItemId: "ghost", contentEpoch: 2,
+      items: [{ type: "agentMessage", id: "ghost", text: "deleted transcript" }],
+      trimmed: false, bytes: 1,
+    });
+    render(<App />);
+    // 该会话是当前选中：它会被 drop、缓存被删、屏上不留内容。
+    await waitFor(() => expect(screen.queryByText("deleted transcript")).toBeNull());
+    await waitFor(async () => expect(await contentStore.current!.read("t1")).toBeNull());
   });
 });
 
@@ -4385,5 +4903,64 @@ describe("App lead entry reachability", () => {
     // 失败不得挡住首屏：既有会话照旧渲染，且没有凭空冒出组长条目。
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
     expect(screen.queryByText("组长")).toBeNull();
+  });
+});
+
+describe("拖入路径", () => {
+  it("drop 落在输入卡片上时把路径写进当前会话草稿", async () => {
+    render(<App />);
+    // 首屏自动 resume 第一条会话后，输入框才不是 disabled。
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    expect(ta.value).toBe('"/Users/me/My Docs"');
+    // 光标必须落在插入块的末尾：App 把 `caretSeek` 交给 MessageInput，由它
+    // `setSelectionRange`。含空格的路径带引号后长 19，故 19。
+    expect(ta.selectionStart).toBe(19);
+    expect(ta.selectionEnd).toBe(19);
+  });
+
+  it("连续两次 drop 都把光标放在新插入块的末尾", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    const ta = screen.getByRole("textbox") as HTMLTextAreaElement;
+    // 第一次：空草稿 → 19 个字符，光标 19。
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    expect(ta.value).toBe('"/Users/me/My Docs"');
+    expect(ta.selectionStart).toBe(19);
+    // 第二次前把光标挪回行首（走组件自己的 onSelect 通路，与用户点一下行首同路）。
+    // 这一步是这条用例能否证伪的关键：jsdom 在 `value` 被赋值时会把选区挪到**全文
+    // 末尾**，所以「插在末尾」的第二次插入无论 caretSeek 在不在，选区都恰好等于
+    // 插入块末尾（19 → 39），证伪不了任何东西。只有让第二次插入落在文本**中间**，
+    // 「插入块末尾」(19) 与「全文末尾」(38) 才分开，而把光标放到 19 只能靠
+    // caretSeek 这条 App→MessageInput 通路。
+    ta.setSelectionRange(0, 0);
+    fireEvent.select(ta);
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/Users/me/My Docs"], position: { x: 10, y: 10 } } });
+    });
+    // 行首插入不加前导空格（needsSpace 只在光标前有内容且不以空白结尾时成立）。
+    expect(ta.value).toBe('"/Users/me/My Docs""/Users/me/My Docs"');
+    expect(ta.selectionStart).toBe(19);
+    expect(ta.selectionEnd).toBe(19);
+  });
+
+  it("drop 落在卡片之外时不改草稿", async () => {
+    render(<App />);
+    await waitFor(() => expect(screen.getByRole("textbox")).toBeTruthy());
+    const card = screen.getByTestId("composer-card");
+    stubRect(card, { left: 0, top: 0, right: 400, bottom: 120 });
+    await act(async () => {
+      dragDrop.fn?.({ payload: { type: "drop", paths: ["/a"], position: { x: 900, y: 900 } } });
+    });
+    expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   });
 });

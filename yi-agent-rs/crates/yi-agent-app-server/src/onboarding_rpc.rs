@@ -73,67 +73,17 @@ pub fn settings_from_params(
 }
 
 fn apply(
-    env_path: &Path,
+    _env_path: &Path,
     models_path: &Path,
     params: &Value,
     _fallback: &RuntimeConfig,
 ) -> Result<Value, RpcError> {
     let settings = settings_from_params(params)?;
-
-    // 1) 写全局 .env（行级保留式、原子）。
-    yi_agent_runtime::onboarding::write_model_settings(env_path, &settings)
-        .map_err(|e| RpcError::internal(e.to_string()))?;
-
-    // 2) 尝试收边到清单。失败不吞：如实回包 imported=false + 原因。
-    let import_result = import_into_catalog(models_path, &settings);
-    match import_result {
-        Ok(name) => Ok(json!({
-            "ok": true,
-            "env_written": true,
-            "imported": true,
-            "name": name,
-        })),
-        Err(error) => Ok(json!({
-            "ok": true,
-            "env_written": true,
-            "imported": false,
-            "import_error": error,
-        })),
-    }
-}
-
-/// 把配置落成清单里的一条并设为默认；重名自动加后缀。语义与
-/// `model_rpc::import_env` 一致，但入参是引导收敛出的 settings。
-fn import_into_catalog(
-    models_path: &Path,
-    settings: &yi_agent_runtime::onboarding::ModelSettings,
-) -> Result<String, String> {
-    use yi_agent_runtime::models::{ModelCatalog, ModelEntry, ModelProvider, save_catalog_to};
-
-    let Some(provider) = ModelProvider::parse(&settings.provider) else {
-        return Err("unknown provider".to_string());
-    };
-    let mut catalog: ModelCatalog = yi_agent_runtime::models::load_catalog_from(models_path);
-    let base = settings.model.trim().to_string();
-    let mut name = base.clone();
-    let mut n = 2u32;
-    while catalog.models.iter().any(|m| m.name == name) {
-        name = format!("{base}-{n}");
-        n += 1;
-    }
-    catalog.models.push(ModelEntry {
-        name: name.clone(),
-        provider,
-        api_url: settings.api_url.clone(),
-        model: settings.model.clone(),
-        api_key: settings.api_key.clone(),
-        // 引导固化的是 .env 的四个字段，通道两项不在此声明 → 保持默认。
-        api_style: None,
-        reasoning_effort: None,
-    });
-    catalog.default_model = Some(name.clone());
-    save_catalog_to(models_path, &catalog).map_err(|e| e.to_string())?;
-    Ok(name)
+    // 单写清单：`.env` 不再承载模型键，`imported` / `import_error` / `env_written`
+    // 这些「双写」时代的字段一并消失。写失败即整个 apply 失败（无半成品）。
+    let name = yi_agent_runtime::onboarding::import_settings_into_catalog(models_path, &settings)
+        .map_err(RpcError::internal)?;
+    Ok(json!({ "ok": true, "name": name }))
 }
 
 fn string_field(params: &Value, field: &str) -> Option<String> {
@@ -183,6 +133,8 @@ mod tests {
             workdir: PathBuf::from("/tmp/onboarding-rpc-test"),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
@@ -191,6 +143,7 @@ mod tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
+            model_injected: false,
         }
     }
 
@@ -209,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn status_reports_ready_when_the_env_is_complete() {
+    fn status_reports_ready_once_the_catalog_is_complete() {
         let p = paths();
         call(
             &p,
@@ -222,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_writes_the_env_and_lands_the_catalog_entry() {
+    fn apply_writes_the_catalog_and_never_the_env() {
         let p = paths();
         let out = call(
             &p,
@@ -231,12 +184,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out["ok"], true);
-        assert_eq!(out["env_written"], true);
-        assert_eq!(out["imported"], true);
+        assert!(out.get("name").is_some());
+        assert!(out.get("env_written").is_none());
+        assert!(out.get("imported").is_none());
+        assert!(out.get("import_error").is_none());
 
-        let text = std::fs::read_to_string(&p.env).unwrap();
-        assert!(text.contains("YI_AGENT_PROVIDER=openai"));
-        assert!(text.contains("MODEL_API_KEY=sk-x"));
+        assert!(
+            !p.env.exists()
+                || !std::fs::read_to_string(&p.env)
+                    .unwrap()
+                    .contains("MODEL_API_KEY"),
+            "apply must not write model keys into .env"
+        );
 
         let catalog = yi_agent_runtime::models::load_catalog_from(&p.models);
         assert_eq!(catalog.default_model.as_deref(), Some("gpt-4o"));

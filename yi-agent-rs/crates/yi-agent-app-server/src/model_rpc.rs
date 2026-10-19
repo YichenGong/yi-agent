@@ -8,14 +8,17 @@
 //! 生产入口 [`handle_model_request`] 用 `models_path()`（`$HOME/.yi-agent/`）。
 //! 之所以不让测试改 `HOME`：cargo 并行跑测试，进程全局变量会让用例互相竞态。
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_runtime::models::{
-    ModelCatalog, ModelEntry, ModelProvider, effective_entry, load_catalog_from, mask_key,
-    models_path, save_catalog_to,
+    ModelCatalog, ModelEntry, ModelProvider, effective_entry_for, load_catalog_from, mask_key,
+    models_path, update_catalog, update_catalog_if,
 };
+use yi_agent_runtime::reasoning_probe::ProbeOutcome;
 
 use crate::protocol::RpcError;
 
@@ -45,6 +48,16 @@ pub fn handle_model_request_at(
                 "effective": effective_view(&catalog, fallback),
             }))
         }
+        // 只做条目存在性校验；真正的探测在 app-server 的 async 分支里跑
+        // （它要发网络请求，不能放在这个同步纯函数里）。
+        "model/probe" => {
+            let name = string_field(params, "name").unwrap_or_default();
+            let catalog = load_catalog_from(path);
+            match catalog.models.iter().find(|m| m.name == name) {
+                Some(_) => Ok(json!({ "ok": true })),
+                None => Err(RpcError::model_not_found(&name)),
+            }
+        }
         "model/upsert" => upsert(path, params),
         "model/delete" => delete(path, params),
         "model/setDefault" => set_reference(path, params, Reference::Default),
@@ -54,13 +67,90 @@ pub fn handle_model_request_at(
     }
 }
 
-/// 当前默认实际解析到哪里：命中清单条目就用条目，否则回退 cfg（`.env`）。
+/// 条目「连接身份」的指纹：探测期间它变了，结果就不可信。
+///
+/// **不含 `api_key`**：换密钥不影响模型支持哪些档位。与 `upsert` 里判定
+/// 「能力是否仍有效」用的是同一组字段，两处必须同步，否则会出现「upsert 认为
+/// 能力还有效、探测结果却被指纹判为过期」的死角。
+pub fn entry_fingerprint(entry: &ModelEntry) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        entry.provider.as_str(),
+        entry.api_url,
+        entry.model,
+        entry.api_style.as_deref().unwrap_or("auto")
+    )
+}
+
+/// 把一次探测结果写回清单。返回是否真的写入。
+///
+/// 写前**重读并核对指纹**：一轮探测可能跑几十秒，期间条目可能被改、被删，
+/// 或者被另一个客户端改成了完全不同的模型。直接拿探测开始时的内存副本落盘
+/// 会覆盖掉这些并发修改。
+pub fn apply_probe_result(
+    path: &Path,
+    name: &str,
+    fingerprint: &str,
+    outcome: ProbeOutcome,
+) -> bool {
+    // 必须走 `update_catalog_if`：探测在后台跑，写回时可能正有 RPC 在改同一份
+    // 清单。裸的「读-改-写」会把并发的 `model/setDefault` 覆盖回去。
+    update_catalog_if(path, |catalog| {
+        let entry = catalog.models.iter_mut().find(|m| m.name == name)?;
+        if entry_fingerprint(entry) != fingerprint {
+            return None;
+        }
+        // 未知通道名：宁可丢弃，也不把数据写到错误的槽位。
+        let slot = entry
+            .reasoning_capabilities
+            .get_or_insert_with(Default::default)
+            .channel_mut(&outcome.channel)?;
+        *slot = Some(outcome.capability);
+        Some(())
+    })
+    .is_ok_and(|applied| applied.is_some())
+}
+
+/// 正在探测的条目名集合（进程内）。
+///
+/// 用途是**去重**：用户连点两下「重新探测」不该打出两倍请求。它只是内存态，
+/// 崩溃/重启即清空——那正是我们想要的，残留的「探测中」标记比重复探测更糟。
+#[derive(Clone, Default)]
+pub struct ProbeRegistry(Arc<Mutex<HashSet<String>>>);
+
+impl ProbeRegistry {
+    /// 登记一次探测。返回 `false` 表示同名条目已在探测中。
+    pub fn try_begin(&self, name: &str) -> bool {
+        self.0
+            .lock()
+            .map(|mut set| set.insert(name.to_string()))
+            .unwrap_or(false)
+    }
+
+    pub fn finish(&self, name: &str) {
+        if let Ok(mut set) = self.0.lock() {
+            set.remove(name);
+        }
+    }
+
+    pub fn is_running(&self, name: &str) -> bool {
+        self.0.lock().map(|set| set.contains(name)).unwrap_or(false)
+    }
+}
+
+/// 当前默认实际解析到哪里：命中条目就用条目，否则回退 cfg（`.env`）。
 /// key 一律只出掩码——与 [`entry_view`] 同一条安全约定。
+///
+/// 条目选择走 [`effective_entry_for`]（而非无注入语境的 `effective_entry`）：
+/// app-server 可能被整包注入（provider + key 由外部管道送进来），此时进程**实际
+/// 运行**的是注入包，清单默认不生效——上报必须同口径（spec §1.5 目标 4
+/// 「上报 == 实际运行」）。注入时 `effective_entry_for` 返回 `None`，落到的正是
+/// `"source": "env"` 那支，即注入包本身。
 ///
 /// `api_style` / `reasoning_effort` 同 `resolve_effective` 的语义：命中条目即
 /// 取条目的值（缺省 = 未设置），否则回退 cfg。二者是「生效值」，UI 据此回显。
 fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
-    match effective_entry(catalog, None) {
+    match effective_entry_for(cfg, catalog, None) {
         Some(entry) => json!({
             "source": "catalog",
             "model_ref": entry.name,
@@ -69,6 +159,7 @@ fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
             "model": entry.model,
             "api_style": entry.api_style,
             "reasoning_effort": entry.reasoning_effort,
+            "reasoning_capabilities": entry.reasoning_capabilities,
             "has_key": !entry.api_key.is_empty(),
             "api_key_masked": mask_key(&entry.api_key),
         }),
@@ -80,6 +171,8 @@ fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
             "model": cfg.model,
             "api_style": cfg.api_style.as_str(),
             "reasoning_effort": cfg.reasoning_effort,
+            // env 来源没有能力数据：只有清单条目才有探测记录。
+            "reasoning_capabilities": Value::Null,
             "has_key": !cfg.api_key.is_empty(),
             "api_key_masked": mask_key(&cfg.api_key),
         }),
@@ -96,6 +189,9 @@ fn entry_view(entry: &ModelEntry) -> Value {
         "model": entry.model,
         "api_style": entry.api_style,
         "reasoning_effort": entry.reasoning_effort,
+        // `None` = 未探测（或探测失败到无法归因）：UI 据此平铺全部档位，
+        // 与探测功能上线前的行为一致。
+        "reasoning_capabilities": entry.reasoning_capabilities,
         "has_key": !entry.api_key.is_empty(),
         "api_key_masked": mask_key(&entry.api_key),
     })
@@ -143,32 +239,55 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
         }
     }
 
-    let mut catalog = load_catalog_from(path);
     // Key semantics: absent (or `null`) keeps the stored value; `""` clears it;
     // any other string overwrites. A brand-new entry with no key is keyless.
-    let existing = catalog.models.iter().position(|m| m.name == name);
-    let api_key = match key_field(params)? {
-        KeyInput::Keep => existing
-            .map(|i| catalog.models[i].api_key.clone())
-            .unwrap_or_default(),
-        KeyInput::Clear => String::new(),
-        KeyInput::Set(key) => key,
-    };
+    let key_input = key_field(params)?;
+    // 读与写必须在同一把锁里：后台探测可能同时在写回能力，分开做会互相覆盖。
+    update_catalog(path, |catalog| {
+        let existing = catalog.models.iter().position(|m| m.name == name);
+        let api_key = match key_input {
+            KeyInput::Keep => existing
+                .map(|i| catalog.models[i].api_key.clone())
+                .unwrap_or_default(),
+            KeyInput::Clear => String::new(),
+            KeyInput::Set(key) => key,
+        };
 
-    let entry = ModelEntry {
-        name,
-        provider,
-        api_url,
-        model,
-        api_key,
-        api_style,
-        reasoning_effort,
-    };
-    match existing {
-        Some(i) => catalog.models[i] = entry,
-        None => catalog.models.push(entry),
-    }
-    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
+        // 能力结果只在「连接字段未变」时保留；任一变化都说明旧探测不再可信。
+        // `api_key` 不参与判定：换密钥不影响模型支持哪些档位。
+        let reasoning_capabilities = match existing {
+            Some(i) => {
+                let old = &catalog.models[i];
+                let changed = old.provider != provider
+                    || old.api_url != api_url
+                    || old.model != model
+                    || old.api_style != api_style;
+                if changed {
+                    None
+                } else {
+                    old.reasoning_capabilities.clone()
+                }
+            }
+            None => None,
+        };
+
+        let entry = ModelEntry {
+            name: name.clone(),
+            provider,
+            api_url,
+            model,
+            api_key,
+            api_style,
+            reasoning_effort,
+            reasoning_capabilities,
+            context_length: None,
+        };
+        match existing {
+            Some(i) => catalog.models[i] = entry,
+            None => catalog.models.push(entry),
+        }
+    })
+    .map_err(|error| RpcError::internal(error.to_string()))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -176,18 +295,21 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
 /// 一并清掉，否则会留下悬空引用（解析时静默回退，用户看不见）。
 fn delete(path: &Path, params: &Value) -> Result<Value, RpcError> {
     let name = string_field(params, "name").unwrap_or_default();
-    let mut catalog = load_catalog_from(path);
-    if !catalog.models.iter().any(|m| m.name == name) {
-        return Err(RpcError::model_not_found(&name));
-    }
-    catalog.models.retain(|m| m.name != name);
-    if catalog.default_model.as_deref() == Some(name.as_str()) {
-        catalog.default_model = None;
-    }
-    if catalog.subagent_model.as_deref() == Some(name.as_str()) {
-        catalog.subagent_model = None;
-    }
-    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
+    update_catalog_if(path, |catalog| {
+        if !catalog.models.iter().any(|m| m.name == name) {
+            return None;
+        }
+        catalog.models.retain(|m| m.name != name);
+        if catalog.default_model.as_deref() == Some(name.as_str()) {
+            catalog.default_model = None;
+        }
+        if catalog.subagent_model.as_deref() == Some(name.as_str()) {
+            catalog.subagent_model = None;
+        }
+        Some(())
+    })
+    .map_err(|error| RpcError::internal(error.to_string()))?
+    .ok_or_else(|| RpcError::model_not_found(&name))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -200,23 +322,32 @@ enum Reference {
 /// `model/setDefault` / `model/setSubagent`：`null` 或缺失 → 清除；否则必须
 /// 命中已存在条目，否则 `model_not_found`（且零落盘）。
 fn set_reference(path: &Path, params: &Value, which: Reference) -> Result<Value, RpcError> {
-    let mut catalog = load_catalog_from(path);
-    let target = match params.get("name") {
+    // 参数形状错误在碰盘之前就判掉（零落盘）。
+    let requested = match params.get("name") {
         None | Some(Value::Null) => None,
-        Some(Value::String(name)) => {
-            if !catalog.models.iter().any(|m| &m.name == name) {
-                return Err(RpcError::model_not_found(name));
-            }
-            Some(name.clone())
-        }
+        Some(Value::String(name)) => Some(name.clone()),
         Some(_) => return Err(RpcError::invalid_model("name must be a string or null")),
     };
-    match which {
-        Reference::Default => catalog.default_model = target,
-        Reference::Subagent => catalog.subagent_model = target,
+    let outcome = update_catalog_if(path, |catalog| {
+        if let Some(name) = &requested {
+            // 存在性也在锁内判：判完到落盘之间不许有别的写者把它删掉。
+            if !catalog.models.iter().any(|m| &m.name == name) {
+                return None;
+            }
+        }
+        match which {
+            Reference::Default => catalog.default_model = requested.clone(),
+            Reference::Subagent => catalog.subagent_model = requested.clone(),
+        }
+        Some(())
+    })
+    .map_err(|error| RpcError::internal(error.to_string()))?;
+    match (outcome, requested) {
+        (Some(_), _) => Ok(json!({ "ok": true })),
+        (None, Some(name)) => Err(RpcError::model_not_found(&name)),
+        // 只有 `None` 请求+外部改文件才会到这里：按成功处理。
+        (None, None) => Ok(json!({ "ok": true })),
     }
-    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
-    Ok(json!({ "ok": true }))
 }
 
 /// `model/importEnv`：把兜底层 `cfg`（`.env`）当前的 provider/api_url/api_key/model
@@ -238,27 +369,32 @@ fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
         )));
     };
 
-    let mut catalog = load_catalog_from(path);
-    let base = cfg.model.trim().to_string();
-    // 重名自动加后缀，静默成功（收边是「零摩擦固化」，不该被重名卡住）。
-    let mut name = base.clone();
-    let mut n = 2u32;
-    while catalog.models.iter().any(|m| m.name == name) {
-        name = format!("{base}-{n}");
-        n += 1;
-    }
-    catalog.models.push(ModelEntry {
-        name: name.clone(),
-        provider,
-        api_url: cfg.api_url.clone(),
-        model: cfg.model.clone(),
-        api_key: cfg.api_key.clone(),
-        // 兜底层 cfg 的通道选择随条目固化（与 upsert 的默认语义一致）。
-        api_style: Some(cfg.api_style.as_str().to_string()),
-        reasoning_effort: cfg.reasoning_effort.clone(),
-    });
-    catalog.default_model = Some(name.clone());
-    save_catalog_to(path, &catalog).map_err(|error| RpcError::internal(error.to_string()))?;
+    // 加后缀 + 落盘必须原子：否则并发两次导入会挑到同一个名字。
+    let name = update_catalog(path, |catalog| {
+        let base = cfg.model.trim().to_string();
+        // 重名自动加后缀，静默成功（收边是「零摩擦固化」，不该被重名卡住）。
+        let mut name = base.clone();
+        let mut n = 2u32;
+        while catalog.models.iter().any(|m| m.name == name) {
+            name = format!("{base}-{n}");
+            n += 1;
+        }
+        catalog.models.push(ModelEntry {
+            name: name.clone(),
+            provider,
+            api_url: cfg.api_url.clone(),
+            model: cfg.model.clone(),
+            api_key: cfg.api_key.clone(),
+            // 兜底层 cfg 的通道选择随条目固化（与 upsert 的默认语义一致）。
+            api_style: Some(cfg.api_style.as_str().to_string()),
+            reasoning_effort: cfg.reasoning_effort.clone(),
+            reasoning_capabilities: None,
+            context_length: None,
+        });
+        catalog.default_model = Some(name.clone());
+        name
+    })
+    .map_err(|error| RpcError::internal(error.to_string()))?;
     Ok(json!({ "ok": true, "name": name, "default_model": name }))
 }
 
@@ -372,6 +508,8 @@ mod tests {
             workdir: std::path::PathBuf::from("/tmp/import-env-test"),
             system_prompt: None,
             compact_threshold: 160_000,
+            compact_ratio: 80,
+            model_context_length: None,
             compact_user_budget_tokens: 20_000,
             compact_tool_budget_tokens: 12_000,
             yolo: false,
@@ -380,6 +518,7 @@ mod tests {
             sandbox_writable_roots: Vec::new(),
             skills_catalog_budget: 8192,
             skills_catalog_budget_explicit: false,
+            model_injected: false,
         }
     }
 
@@ -396,6 +535,316 @@ mod tests {
             "model": "m",
             "api_key": "sk-secret-1234",
         })
+    }
+
+    fn set_capabilities(path: &Path, name: &str) {
+        update_catalog(path, |catalog| {
+            let entry = catalog
+                .models
+                .iter_mut()
+                .find(|m| m.name == name)
+                .expect("entry must exist");
+            entry.reasoning_capabilities = Some(yi_agent_runtime::models::ReasoningCapabilities {
+                anthropic: Some(yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["low".into(), "high".into()],
+                    probed_at: 42,
+                    error: None,
+                }),
+                ..Default::default()
+            });
+        })
+        .unwrap();
+    }
+
+    fn capabilities_of(
+        path: &Path,
+        name: &str,
+    ) -> Option<yi_agent_runtime::models::ReasoningCapabilities> {
+        load_catalog_from(path)
+            .models
+            .into_iter()
+            .find(|m| m.name == name)
+            .and_then(|m| m.reasoning_capabilities)
+    }
+
+    #[test]
+    fn upsert_keeps_capabilities_when_connection_fields_are_unchanged() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        set_capabilities(&path, "A");
+
+        // 只改 key（key 不参与能力有效性判定）。
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"anthropic","api_url":"https://a","model":"m","api_key":"sk-new-9999"}),
+        )
+        .unwrap();
+
+        let caps = capabilities_of(&path, "A").expect("capabilities must survive a key change");
+        assert_eq!(caps.anthropic.unwrap().supported, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn upsert_clears_capabilities_when_connection_fields_change() {
+        for change in [
+            json!({"provider":"openai"}),
+            json!({"api_url":"https://b"}),
+            json!({"model":"m2"}),
+            json!({"api_style":"chat"}),
+        ] {
+            let (_dir, path) = catalog_path();
+            call(&path, "model/upsert", entry_json("A")).unwrap();
+            set_capabilities(&path, "A");
+
+            let mut payload = json!({
+                "name":"A","provider":"anthropic","api_url":"https://a","model":"m"
+            });
+            for (k, v) in change.as_object().unwrap() {
+                payload[k] = v.clone();
+            }
+            call(&path, "model/upsert", payload).unwrap();
+
+            assert!(
+                capabilities_of(&path, "A").is_none(),
+                "changing {change} must clear capabilities"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_result_is_dropped_when_the_fingerprint_is_stale() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let fingerprint = entry_fingerprint(&load_catalog_from(&path).models[0]);
+
+        let stale = ProbeOutcome {
+            channel: "anthropic".into(),
+            capability: yi_agent_runtime::models::ChannelCapability {
+                supported: vec!["low".into()],
+                probed_at: 1,
+                error: None,
+            },
+        };
+        assert!(!apply_probe_result(&path, "A", "stale", stale));
+        assert!(
+            load_catalog_from(&path).models[0]
+                .reasoning_capabilities
+                .is_none(),
+            "a stale result must not be written"
+        );
+
+        let fresh = ProbeOutcome {
+            channel: "anthropic".into(),
+            capability: yi_agent_runtime::models::ChannelCapability {
+                supported: vec!["low".into(), "high".into()],
+                probed_at: 2,
+                error: None,
+            },
+        };
+        assert!(apply_probe_result(&path, "A", &fingerprint, fresh));
+        let caps = load_catalog_from(&path).models[0]
+            .reasoning_capabilities
+            .clone()
+            .unwrap();
+        assert_eq!(caps.anthropic.unwrap().supported, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn probe_result_on_a_deleted_entry_is_a_no_op() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let fingerprint = entry_fingerprint(&load_catalog_from(&path).models[0]);
+        call(&path, "model/delete", json!({"name":"A"})).unwrap();
+        let outcome = ProbeOutcome {
+            channel: "anthropic".into(),
+            capability: yi_agent_runtime::models::ChannelCapability::default(),
+        };
+        assert!(!apply_probe_result(&path, "A", &fingerprint, outcome));
+    }
+
+    /// 探测结果只覆盖命中的通道槽位，不碰其它通道。
+    #[test]
+    fn applying_a_result_leaves_other_channels_untouched() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let fingerprint = entry_fingerprint(&load_catalog_from(&path).models[0]);
+        apply_probe_result(
+            &path,
+            "A",
+            &fingerprint,
+            ProbeOutcome {
+                channel: "chat".into(),
+                capability: yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["low".into()],
+                    probed_at: 1,
+                    error: None,
+                },
+            },
+        );
+        apply_probe_result(
+            &path,
+            "A",
+            &fingerprint,
+            ProbeOutcome {
+                channel: "responses".into(),
+                capability: yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["high".into()],
+                    probed_at: 2,
+                    error: None,
+                },
+            },
+        );
+        let caps = load_catalog_from(&path).models[0]
+            .reasoning_capabilities
+            .clone()
+            .unwrap();
+        assert_eq!(caps.chat.unwrap().supported, vec!["low"]);
+        assert_eq!(caps.responses.unwrap().supported, vec!["high"]);
+        assert!(caps.anthropic.is_none());
+    }
+
+    /// 探测写回不得吃掉同时发生的 `default_model` 修改。
+    ///
+    /// 真实场景：保存模型后后台立刻起了一轮探测（最长 30s），用户在设置页
+    /// 顺手设了默认模型。裸「读-改-写」下探测会用自己那份旧快照把默认值
+    /// 覆盖回去——症状是「设了默认，读回来却是兜底 cfg」，而且只在两者恰好
+    /// 同时完成时出现。
+    #[test]
+    fn a_probe_write_back_keeps_a_concurrent_default_change() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"anthropic","api_url":"https://a","model":"m"}),
+        )
+        .unwrap();
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"B","provider":"anthropic","api_url":"https://b","model":"m"}),
+        )
+        .unwrap();
+
+        let entry = load_catalog_from(&path)
+            .models
+            .into_iter()
+            .find(|m| m.name == "A")
+            .expect("entry must exist");
+        let fingerprint = entry_fingerprint(&entry);
+
+        // 探测结果在锁外准备好（模拟它跑了几十秒），期间另一个写者落盘。
+        call(&path, "model/setDefault", json!({"name":"B"})).unwrap();
+        assert!(apply_probe_result(
+            &path,
+            "A",
+            &fingerprint,
+            ProbeOutcome {
+                channel: "anthropic".into(),
+                capability: yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["low".into(), "high".into()],
+                    probed_at: 1,
+                    error: None,
+                },
+            },
+        ));
+
+        let landed = load_catalog_from(&path);
+        assert_eq!(
+            landed.default_model.as_deref(),
+            Some("B"),
+            "the probe write-back must not resurrect a stale default_model"
+        );
+        assert_eq!(
+            landed
+                .models
+                .iter()
+                .find(|m| m.name == "A")
+                .and_then(|m| m.reasoning_capabilities.as_ref())
+                .and_then(|c| c.anthropic.as_ref())
+                .map(|c| c.supported.clone()),
+            Some(vec!["low".to_string(), "high".to_string()]),
+            "the probed capability must still land"
+        );
+    }
+
+    /// 探测期间条目被改过（指纹不符）：结果丢弃，且**不重写文件**。
+    #[test]
+    fn a_stale_probe_result_is_dropped_without_rewriting() {
+        let (_dir, path) = catalog_path();
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"anthropic","api_url":"https://a","model":"m"}),
+        )
+        .unwrap();
+        let stale = entry_fingerprint(&load_catalog_from(&path).models.into_iter().next().unwrap());
+        // 连接字段变了：旧指纹作废。
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"anthropic","api_url":"https://moved","model":"m"}),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            !apply_probe_result(
+                &path,
+                "A",
+                &stale,
+                ProbeOutcome {
+                    channel: "anthropic".into(),
+                    capability: yi_agent_runtime::models::ChannelCapability {
+                        supported: vec![],
+                        probed_at: 1,
+                        error: None,
+                    },
+                },
+            ),
+            "a result from a superseded connection must be refused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a refused result must not rewrite the file"
+        );
+    }
+
+    #[test]
+    fn model_list_reports_capabilities_per_entry() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        set_capabilities(&path, "A");
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(
+            list["models"][0]["reasoning_capabilities"]["anthropic"]["supported"],
+            json!(["low", "high"])
+        );
+    }
+
+    #[test]
+    fn probe_requires_a_known_entry() {
+        let (_dir, path) = catalog_path();
+        let err = call(&path, "model/probe", json!({"name":"nope"})).unwrap_err();
+        assert_eq!(err.data.unwrap()["code"], "model_not_found");
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        assert_eq!(
+            call(&path, "model/probe", json!({"name":"A"})).unwrap(),
+            json!({"ok": true})
+        );
+    }
+
+    #[test]
+    fn the_probe_registry_deduplicates_by_name() {
+        let reg = ProbeRegistry::default();
+        assert!(reg.try_begin("A"));
+        assert!(!reg.try_begin("A"), "second request must be rejected");
+        assert!(reg.is_running("A"));
+        assert!(reg.try_begin("B"), "other names are independent");
+        reg.finish("A");
+        assert!(!reg.is_running("A"));
+        assert!(reg.try_begin("A"), "after finishing it can run again");
     }
 
     #[test]
@@ -615,6 +1064,8 @@ mod tests {
             api_key: String::new(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
+            context_length: None,
         });
         catalog.default_model = Some("gone".to_string());
         yi_agent_runtime::models::save_catalog_to(&path, &catalog).unwrap();
@@ -730,6 +1181,38 @@ mod tests {
         assert_eq!(out["effective"]["source"], "env");
         assert_eq!(out["effective"]["api_style"], "auto");
         assert!(out["effective"]["reasoning_effort"].is_null());
+    }
+
+    /// Task 3 review fix round 1 (Finding 3, spec §1.5 goal 4 「上报 == 实际运行」):
+    /// an **injected** process must not report the catalog as its effective source.
+    ///
+    /// The app-server is handed the injected package (provider + key piped in), yet
+    /// `effective_view` called the injection-unaware `effective_entry`, so
+    /// `model/list` answered `source: "catalog"` with the *default entry's* masked
+    /// key while the process actually ran the injected package. The entry selection
+    /// must be `effective_entry_for(cfg, catalog, None)`: under injection it returns
+    /// `None`, which is exactly the `source: "env"` shape — the injected package.
+    #[test]
+    fn an_injected_process_reports_env_not_catalog() {
+        let (_dir, path) = catalog_path();
+        // A catalog with a default entry that WOULD win without injection.
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        call(&path, "model/setDefault", json!({ "name": "A" })).unwrap();
+
+        let mut cfg = fallback_cfg();
+        cfg.model_injected = true;
+        let out = handle_model_request_at(&path, "model/list", &json!({}), &cfg).unwrap();
+
+        assert_eq!(
+            out["effective"]["source"], "env",
+            "an injected process runs the injected package, so it must not report the catalog"
+        );
+        assert!(out["effective"]["model_ref"].is_null());
+        assert_eq!(out["effective"]["model"], "env-model");
+        assert_eq!(out["effective"]["provider"], "openai");
+        assert_eq!(out["effective"]["api_key_masked"], "••••9999");
+        // The catalog default entry's key must NOT be presented as effective.
+        assert!(!out["effective"].to_string().contains("••••1234"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ export const RPC = {
   threadSetModel: "thread/setModel",
   threadSetReasoningEffort: "thread/setReasoningEffort",
   modelTest: "model/test",
+  modelProbe: "model/probe",
   pluginSettingsRead: "plugin/settings/read",
   pluginSettingsWrite: "plugin/settings/write",
   uiSettingsRead: "ui/settings/read",

@@ -25,11 +25,10 @@ pub struct ClearRealLlmTestKeyRequest {
 use crate::config_meta::{ALL_VARS, VarType, groups};
 use crate::env_file;
 
-/// 共享状态：.env 文件路径
+/// 共享状态：.env 文件路径（唯一）
 #[derive(Clone)]
 pub struct AppState {
     pub env_path: PathBuf,
-    pub global_env_path: Option<PathBuf>,
     /// User-scoped, dedicated real-regression credentials; never the project config path.
     pub real_test_env_path: PathBuf,
 }
@@ -175,25 +174,16 @@ fn validate_real_config(
     Ok(())
 }
 
-/// GET /api/config — 返回所有变量元数据 + 合并后的值(local 覆盖 global)
+/// GET /api/config — 返回所有变量元数据 + 值
 pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
-    // 读 global(可选)和 local,合并:local 覆盖 global
-    let global_vars = state
-        .global_env_path
-        .as_ref()
-        .map(|p| env_file::read(p).unwrap_or_default())
-        .unwrap_or_default();
     let local_vars = env_file::read(&state.env_path).unwrap_or_default();
 
     let mut group_list: Vec<Value> = Vec::new();
     for group_name in groups() {
         let mut var_list: Vec<Value> = Vec::new();
         for var in ALL_VARS.iter().filter(|v| v.group == group_name) {
-            // 确定 source:local 优先,然后 global,再 default
             let (raw_value, source) = if let Some(v) = local_vars.get(var.key) {
                 (v.clone(), "local")
-            } else if let Some(v) = global_vars.get(var.key) {
-                (v.clone(), "global")
             } else {
                 (String::new(), "default")
             };
@@ -215,19 +205,19 @@ pub async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
                 "source": source,
             }));
         }
+        if var_list.is_empty() {
+            continue;
+        }
         group_list.push(json!({
             "name": group_name,
             "vars": var_list,
         }));
     }
 
-    let mut response = json!({
+    let response = json!({
         "groups": group_list,
         "envPath": state.env_path.display().to_string(),
     });
-    if let Some(g) = &state.global_env_path {
-        response["globalEnvPath"] = json!(g.display().to_string());
-    }
 
     (StatusCode::OK, Json(response))
 }
@@ -246,26 +236,11 @@ pub struct PutConfigRequest {
 }
 
 /// PUT /api/config — 接收部分更新，写入 .env
-/// scope: "local"(默认) 写本地, "global" 写全局
 pub async fn put_config(
     State(state): State<AppState>,
     Json(req): Json<PutConfigRequest>,
 ) -> impl IntoResponse {
-    let scope = req.scope.as_deref().unwrap_or("local");
-    let target_path = match scope {
-        "global" => match &state.global_env_path {
-            Some(p) => p.clone(),
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(
-                        json!({ "error": "global scope not available (no global path configured)" }),
-                    ),
-                );
-            }
-        },
-        _ => state.env_path.clone(),
-    };
+    let target_path = state.env_path.clone();
 
     let current = match env_file::read(&target_path) {
         Ok(v) => v,

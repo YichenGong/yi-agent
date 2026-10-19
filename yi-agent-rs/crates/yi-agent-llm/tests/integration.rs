@@ -249,19 +249,18 @@ async fn returns_auth_error_when_no_api_key() {
     assert!(matches!(result, Err(ProviderError::Auth(_))));
 }
 
-#[tokio::test]
-async fn reads_api_key_from_env() {
+#[test]
+fn new_does_not_fall_back_to_the_anthropic_env_var() {
     let _guard = ENV_LOCK.lock().unwrap();
+    // 第三层已删除：key 只能经 RuntimeConfig 单点流入。
     unsafe {
-        std::env::set_var("ANTHROPIC_API_KEY", "env-key");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-from-env");
     }
-    let provider =
-        AnthropicProvider::new(AnthropicProviderOpts::default()).expect("env key picked up");
+    let result = AnthropicProvider::new(AnthropicProviderOpts::default());
     unsafe {
         std::env::remove_var("ANTHROPIC_API_KEY");
     }
-    // Sanity check: provider was constructed successfully with the env key.
-    let _ = provider;
+    assert!(result.is_err(), "the env var must no longer be consulted");
 }
 
 #[tokio::test]

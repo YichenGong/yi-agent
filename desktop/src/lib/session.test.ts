@@ -872,3 +872,126 @@ describe("Session", () => {
     });
   });
 });
+
+describe("Session.adoptEpoch", () => {
+  it("drops the whole transcript when the epoch changed", () => {
+    const s = new Session();
+    s.adoptEpoch(1, "item-1");
+    s.items.push({ type: "agentMessage", id: "item-1", text: "old" });
+    s.lastServerItemId = "item-1";
+
+    const invalidated = s.adoptEpoch(2, null);
+
+    expect(invalidated).toBe(true);
+    expect(s.items).toEqual([]);
+    expect(s.lastServerItemId).toBeNull();
+    expect(s.contentEpoch).toBe(2);
+  });
+
+  it("only advances the cursor when the epoch matches", () => {
+    const s = new Session();
+    s.adoptEpoch(1, "item-1");
+    s.items.push({ type: "agentMessage", id: "item-1", text: "keep" });
+
+    const invalidated = s.adoptEpoch(1, "item-2");
+
+    expect(invalidated).toBe(false);
+    expect(s.items).toHaveLength(1);
+    expect(s.lastServerItemId).toBe("item-2");
+  });
+
+  it("records the epoch without invalidating on the first sighting", () => {
+    const s = new Session();
+    s.items.push({ type: "agentMessage", id: "item-1", text: "live" });
+
+    const invalidated = s.adoptEpoch(3, "item-1");
+
+    expect(invalidated).toBe(false);
+    expect(s.items).toHaveLength(1);
+    expect(s.contentEpoch).toBe(3);
+  });
+
+  it("sets epochInvalidated so a late cache read cannot re-inject stale items", () => {
+    const s = new Session();
+    s.adoptEpoch(1, "item-1");
+    s.adoptEpoch(2, null);
+    expect(s.epochInvalidated).toBe(true);
+  });
+
+  it("clears epochInvalidated on reset", () => {
+    const s = new Session();
+    s.adoptEpoch(1, "item-1");
+    s.adoptEpoch(2, null);
+    s.reset();
+    expect(s.epochInvalidated).toBe(false);
+  });
+});
+
+describe("Session structuralVersion", () => {
+  it("does not change when streamed text is appended in place", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    const before = s.structuralVersion;
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "x" } });
+    // A pure append mutates `item.text` in place: the history prefix above it
+    // has not moved, so the frozen subtree must stay frozen.
+    expect(s.structuralVersion).toBe(before);
+  });
+
+  it("changes when an item is replaced in place on item/completed", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "hi" } },
+    });
+    const before = s.structuralVersion;
+    s.apply({
+      method: "item/completed",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "hi there" } },
+    });
+    expect(s.structuralVersion).toBeGreaterThan(before);
+  });
+
+  it("changes when a reasoning block is taken over by a server item", () => {
+    const s = new Session();
+    s.apply({ method: "thread/reasoningDelta", params: { thread_id: "t", text: "think", kind: "Content" } });
+    const before = s.structuralVersion;
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "thinking", id: "th1", text: "think", redacted: false } },
+    });
+    expect(s.structuralVersion).toBeGreaterThan(before);
+  });
+
+  it("changes when an in-place delta targets an item that is no longer the tail", () => {
+    const s = new Session();
+    s.apply({
+      method: "item/started",
+      params: { thread_id: "t", item: { type: "agentMessage", id: "a1", text: "" } },
+    });
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "first " } });
+    // The delta above targeted the tail, so the frozen prefix stayed valid.
+    expect(s.structuralVersion).toBe(1);
+    // CoT resumes: the block lands at the tail and the still-streaming message
+    // is displaced to `length - 2`. `ChatView` only lifts the tail item's text
+    // out as a prop, so the displaced one needs the prefix rebuilt.
+    s.apply({
+      method: "thread/reasoningDelta",
+      params: { thread_id: "t", text: "hmm", kind: "Content" },
+    });
+    const afterBlock = s.structuralVersion;
+    s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "second " } });
+    expect(s.structuralVersion).toBeGreaterThan(afterBlock);
+  });
+
+  it("changes when a locally minted bubble is dropped", () => {
+    const s = new Session();
+    s.addUserMessage("oops");
+    const before = s.structuralVersion;
+    s.dropLocalUserMessage("oops");
+    expect(s.structuralVersion).toBeGreaterThan(before);
+  });
+});

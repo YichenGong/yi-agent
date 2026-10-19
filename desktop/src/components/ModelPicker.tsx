@@ -7,7 +7,14 @@ import {
   type ModelList,
   type ModelRpc,
 } from "../lib/models";
-import { buildEffortOptions, buildModelOptions, entryEffortOf, overrideFromEffective } from "../lib/modelPicker";
+import {
+  buildEffortOptions,
+  buildModelOptions,
+  entryEffortOf,
+  entrySupportedEfforts,
+  overrideFromEffective,
+} from "../lib/modelPicker";
+import { onModelCapabilitiesChanged } from "../lib/modelCapabilitiesBus";
 import { Popover } from "../ui/Popover";
 
 /**
@@ -135,6 +142,27 @@ export function ModelPicker({
     };
   }, [open, rpc]);
 
+  // 宿主探测完成时重读清单：能力是**后台**异步得出的，挂载时那份多半还没有。
+  // 不订阅的话，下拉会一直按「未知」平铺七档，即使设置页里刚显示过探测结果。
+  useEffect(() => {
+    if (!rpc) return;
+    let cancelled = false;
+    const off = onModelCapabilitiesChanged(() => {
+      void (async () => {
+        try {
+          const next = await listModels(rpc);
+          if (!cancelled) setCatalog(next);
+        } catch {
+          // 读失败就保留现状：能力刷新不该打断对话。
+        }
+      })();
+    });
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, [rpc]);
+
   const options = buildModelOptions(catalog, currentRef, currentModel);
   const current = options.find((o) => o.selected) ?? options[0];
   // 条目默认档由本组件读到的清单现算（与模型下拉同一份 catalog、同一个引用选择
@@ -145,7 +173,9 @@ export function ModelPicker({
   // 本身就是覆盖值，若它也恰好等于条目默认，同样按「无覆盖」显示——两种情形在
   // 控件上等价（「继承 X」的 X 与生效值同字面）。
   const effortOverride = overrideFromEffective(currentEffort, entryDefault);
-  const effortOptions = buildEffortOptions(effortOverride, entryDefault);
+  // 只列该模型实测支持的档位；能力未知（`null`）时平铺七档。
+  const supportedEfforts = entrySupportedEfforts(catalog, currentRef);
+  const effortOptions = buildEffortOptions(effortOverride, entryDefault, supportedEfforts);
   const currentEffortOption = effortOptions.find((o) => o.selected) ?? effortOptions[0];
 
   const choose = async (value: string | null) => {

@@ -2,14 +2,18 @@
 
 pub mod attachments;
 pub mod broadcast;
-pub(crate) mod card_scheduler;
 pub mod device_store;
 pub(crate) mod git_diff;
 pub mod git_diff_tool;
 pub mod image_upload;
 pub mod lead;
+// 组长的写通道（lead→thread 的「取消 / 打回」），完全由 `build_runtime_tooling`
+// 注册的两个组长工具与主循环的 `select!` 消费分支接线。
+pub(crate) mod lead_control;
+pub(crate) mod lead_index;
 pub(crate) mod lead_loop;
 pub mod lead_memory;
+pub mod mcp_rpc;
 pub mod model_rpc;
 pub mod onboarding_rpc;
 pub mod pair_uri;
@@ -18,6 +22,7 @@ pub mod protocol;
 pub(crate) mod rpc;
 pub mod server;
 pub mod session;
+pub(crate) mod session_driver;
 pub mod settings_store;
 pub mod skill_rpc;
 /// 跨传输复用的测试夹具（`ws.rs` 的 E2E 与 `mod tests` 共用）。

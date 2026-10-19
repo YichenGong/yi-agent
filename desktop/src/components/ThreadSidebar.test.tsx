@@ -5,7 +5,7 @@ import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import { LONG_PRESS_MS } from "../lib/useLongPress";
 import { DEFAULT_TAG_NAMES, resolveTagNames } from "../lib/threadTags";
-import type { ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
+import type { ThreadStatus, ThreadSummary, Workspace, WorkspaceGroup } from "../lib/protocol";
 import {
   DEFAULT_SIDEBAR_WIDTH,
   MIN_SIDEBAR_WIDTH,
@@ -610,8 +610,11 @@ describe("ThreadSidebar status", () => {
       const { container, rerender } = render(<ThreadSidebar {...props} />);
       const badge = container.querySelector('[aria-label="Thread status"]')!;
       expect(badge).not.toBeNull();
-      expect(created).toHaveLength(1);
-      const first = created[0].el;
+      // Scope to the badge's own animation: the footer's running-session indicator
+      // spins too (a different element, so its own animation), and this test is
+      // about the badge's timeline surviving a row move.
+      const badgeAnims = created.filter((c) => c.el === badge);
+      expect(badgeAnims).toHaveLength(1);
 
       // The server now returns the other thread first (its `updated_at` bumped).
       rerender(
@@ -630,8 +633,7 @@ describe("ThreadSidebar status", () => {
       // The row was moved (order flipped) but the badge element is the same node
       // and NO new animation was started — the timeline survived the reorder.
       expect(container.querySelector('[aria-label="Thread status"]')).toBe(badge);
-      expect(created).toHaveLength(1);
-      expect(created[0].el).toBe(first);
+      expect(created.filter((c) => c.el === badge)).toHaveLength(1);
     } finally {
       delete (Element.prototype as unknown as { animate?: unknown }).animate;
     }
@@ -736,17 +738,37 @@ describe("ThreadSidebar 看板", () => {
     expect(onOpenBoard).toHaveBeenCalledWith("/other");
   });
 
-  it("选中的看板条目用与线程一致的底色", () => {
-    const selected = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: "/proj" });
+  it("选中的看板条目用与线程行相同的 token，未选中只有 hover", () => {
+    // 断言的是**语义 token**而不是某个字面色阶：看板条目与线程行的选中态必须
+    // 逐类名一致（`bg-raised`/`text-fg`），否则切到浅色主题时其中一边会失读。
+    // 早先这里比对的是某个字面灰阶类名，把「字面色阶」这一漂移固化进了测试。
+    //
+    // 两组选中态同时成立才有可比性：看板条目由 `selectedBoard` 选中，线程行由
+    // `currentId` 选中——传一个只选中看板，线程行会是未选中态，比较就没有意义。
+    const selected = renderSidebar({
+      groups: boardGroups,
+      boards: ["/proj"],
+      selectedBoard: "/proj",
+      currentId: "b1",
+    });
     const selectedClasses = selected.container
       .querySelector('[aria-label="看板"]')!
       .className.split(/\s+/);
-    expect(selectedClasses).toContain("bg-neutral-800");
+    expect(selectedClasses).toContain("bg-raised");
+    expect(selectedClasses).toContain("text-fg");
+
+    // 线程行用同一套 token——两边同源，改一边而另一边没跟上就会在此失败。
+    const threadRow = selected.container
+      .querySelector('[title="board-thread"]')!
+      .closest("div[tabindex]")!
+      .className.split(/\s+/);
+    expect(threadRow).toContain("bg-raised");
+    expect(threadRow).toContain("text-fg");
 
     const idle = renderSidebar({ groups: boardGroups, boards: ["/proj"], selectedBoard: null });
     const idleClasses = idle.container.querySelector('[aria-label="看板"]')!.className.split(/\s+/);
-    // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-neutral-800/50 被当选中态。
-    expect(idleClasses).not.toContain("bg-neutral-800");
+    // 未选中只有 hover 底色；按 token 比较，免得 hover:bg-raised/50 被当选中态。
+    expect(idleClasses).not.toContain("bg-raised");
   });
 
   it("把卡片会话收进默认折叠的「看板会话」小节，展开后可见", () => {
@@ -756,7 +778,7 @@ describe("ThreadSidebar 看板", () => {
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -778,7 +800,7 @@ describe("ThreadSidebar 看板", () => {
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -805,7 +827,7 @@ describe("ThreadSidebar 看板", () => {
         workspace: "/proj",
         exists: true,
         threads: [
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -932,6 +954,37 @@ describe("ThreadSidebar pinned section", () => {
     renderSidebar({ onOpenSettings });
     fireEvent.click(screen.getByRole("button", { name: "设置" }));
     expect(onOpenSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the running-session count beside the settings button", () => {
+    const statuses = new Map<string, ThreadStatus>([
+      ["1", "running"],
+      ["2", "awaiting_approval"],
+      ["3", "running"],
+    ]);
+    renderSidebar({ statuses });
+
+    // 只数 running(2 条),审批中的那条不计。
+    expect(screen.getByRole("status")).toBeTruthy();
+    expect(screen.getByText("2 个会话运行中")).toBeTruthy();
+    // 齿轮仍在(新胶囊没有把它挤掉)。
+    expect(screen.getByRole("button", { name: "设置" })).toBeTruthy();
+  });
+
+  it("renders no running-session indicator when nothing is running", () => {
+    renderSidebar({ statuses: new Map([["1", "idle"]]) });
+
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("button", { name: "设置" })).toBeTruthy();
+  });
+
+  it("marks the running-session count as possibly stale when offline", () => {
+    renderSidebar({
+      statuses: new Map([["1", "running"]]),
+      statusStale: true,
+    });
+
+    expect(screen.getByTitle("1 个会话运行中（可能过期）")).toBeTruthy();
   });
 
   it("spawns a ripple at the pointer position on the New-thread button", () => {
@@ -1142,7 +1195,7 @@ describe("ThreadSidebar 搜索", () => {
         workspace: "/proj",
         exists: true,
         threads: [
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -1251,7 +1304,7 @@ describe("ThreadSidebar 搜索", () => {
         exists: true,
         threads: [
           thread("t-plain", "plain-thread", "/proj"),
-          { ...thread("t-card", "看板 · card-1", "/proj"), card_id: "card-1", board_project: "/proj" },
+          { ...thread("t-card", "看板 · card-1", "/proj"), driver_ref: "card-1", driver_project: "/proj" },
         ],
       },
     ];
@@ -1445,5 +1498,26 @@ describe("ThreadSidebar lead entry", () => {
     ).toBeTruthy();
     // 组长只出现一次：它由专属条目渲染，不再作为普通分组行重复一遍。
     expect(container.querySelectorAll("[data-group-row]")).toHaveLength(0);
+  });
+
+  it("renders a lead avatar on the lead row", () => {
+    const lead: ThreadSummary = { ...thread("lead-1", "组长", "/p"), role: "lead" };
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/p", exists: true, threads: [lead] }],
+    });
+
+    // 断言存在性（querySelector）而非样式：头像的具体配色属于呈现细节，不是契约。
+    const avatar = container.querySelector("[data-lead-row] [data-lead-avatar]");
+    expect(avatar).not.toBeNull();
+    // 头像在组长行左侧、标题之前。
+    const title = screen.getByText("组长");
+    expect(
+      avatar!.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("does not render a lead avatar on a normal thread row", () => {
+    const { container } = renderSidebar();
+    expect(container.querySelector("[data-lead-avatar]")).toBeNull();
   });
 });

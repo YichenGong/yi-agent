@@ -6,6 +6,7 @@ import {
   listModels,
   setDefaultModel,
   setSubagentModel,
+  probeModel,
   testModel,
   upsertModel,
   type EffectiveModel,
@@ -14,7 +15,8 @@ import {
   type ModelRpc,
   type ModelUpsertInput,
 } from "../lib/models";
-import { REASONING_EFFORTS } from "../lib/modelPicker";
+import { REASONING_EFFORTS, supportedEffortsOf } from "../lib/modelPicker";
+import { onModelCapabilitiesChanged } from "../lib/modelCapabilitiesBus";
 
 /**
  * 宿主注入的模型 RPC 接缝。
@@ -86,6 +88,26 @@ function effectiveKeyLabel(effective: EffectiveModel): string {
 }
 
 /**
+ * 清单行/卡片上的能力摘要。
+ *
+ * 只显示**生效通道**上的结论（与下拉、运行期同源），不把三条通道都摊开：用户
+ * 关心的是「这个模型现在能选哪几档」，而不是探测实现细节。
+ */
+function capabilitiesSummary(entry: ModelEntryView): string {
+  const supported = supportedEffortsOf(entry);
+  if (supported === null) {
+    // 有记录但出错 → 同样是「未知」，但要让人知道试过了。
+    const caps = entry.reasoning_capabilities;
+    const attempted = caps
+      ? (["chat", "responses", "anthropic"] as const).some((ch) => caps[ch] != null)
+      : false;
+    return attempted ? "未探测成功" : "未探测";
+  }
+  if (supported.length === 0) return "不支持显式档位";
+  return supported.join(" · ");
+}
+
+/**
  * 桌面「模型」设置页。
  *
  * 机器级模型清单（`~/.yi-agent/models.json`）的增删改，外加两个全局引用
@@ -121,6 +143,11 @@ export function SettingsModelsTab({
   const [testing, setTesting] = useState(false);
   /** 「▸ 高级」折叠区：默认收起，普通用户无需展开。 */
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  /**
+   * 正在探测的条目名。宿主只回「已启动」，结果经全局通知异步到达；这份本地集合
+   * 让按钮能显示「探测中…」，并在收到该条目的通知（或兜底超时）后自行清空。
+   */
+  const [probing, setProbing] = useState<ReadonlySet<string>>(() => new Set());
 
   // 接缝在运行时不变（宿主用稳定函数、测试用同一个 vi.fn），但 effect 只认它的
   // 身份：换身份才重读，避免用户没保存的草稿被无关重渲染冲掉。
@@ -160,6 +187,36 @@ export function SettingsModelsTab({
       setLoadError("无法读取模型清单");
     }
   };
+
+  // 探测在后台跑完时会推 `model/capabilitiesChanged`。收到后重读清单（能力权威
+  // 值只在清单里），并清掉「探测中」标记——否则按钮会永远停在那三个字上。
+  useEffect(() => {
+    if (!rpc) return;
+    let cancelled = false;
+    const off = onModelCapabilitiesChanged((change) => {
+      setProbing((current) => {
+        if (!current.has(change.name)) return current;
+        const next = new Set(current);
+        next.delete(change.name);
+        return next;
+      });
+      void (async () => {
+        try {
+          const next = await listModels(rpc);
+          if (!cancelled) {
+            setCatalog(next);
+            setLoadError(null);
+          }
+        } catch {
+          // 读失败保留现状：下一次手动操作还会重读。
+        }
+      })();
+    });
+    return () => {
+      cancelled = true;
+      off();
+    };
+  }, [rpc]);
 
   const patch = (fields: Partial<Draft>) =>
     setDraft((current) => (current ? { ...current, ...fields } : current));
@@ -251,6 +308,28 @@ export function SettingsModelsTab({
     }
   };
 
+  /**
+   * 重新探测某条模型。只启动；结果经 `model/capabilitiesChanged` 回来。
+   *
+   * `started:false`（已有同名探测在跑）不报错：用户连点两下时，第一轮的结果
+   * 仍会到达并刷新这一行。
+   */
+  const reprobe = async (name: string) => {
+    if (!rpc) return;
+    setActionError(null);
+    setProbing((current) => new Set(current).add(name));
+    try {
+      await probeModel(rpc, name);
+    } catch (error) {
+      setProbing((current) => {
+        const next = new Set(current);
+        next.delete(name);
+        return next;
+      });
+      setActionError(saveErrorText(error));
+    }
+  };
+
   const remove = async (name: string) => {
     if (!rpc) return;
     setBusy(true);
@@ -314,6 +393,27 @@ export function SettingsModelsTab({
   };
 
   /**
+   * 草稿可选的档位：新建条目还没有能力数据（`null` → 七档全列），编辑既有条目
+   * 时按**草稿里当前填的连接字段**去清单找同名条目 —— 用户刚把 provider 从
+   * anthropic 改成 openai，下拉就该跟着换到 openai 那条通道的结论，而不是沿用
+   * 打开表单时的旧结果。
+   */
+  const draftEffortTiers: readonly string[] = (() => {
+    if (!draft) return REASONING_EFFORTS;
+    const existing =
+      draft.original !== null
+        ? catalog.models.find((m) => m.name === draft.original)
+        : undefined;
+    if (!existing) return REASONING_EFFORTS;
+    const supported = supportedEffortsOf({
+      ...existing,
+      provider: draft.provider,
+      api_style: draft.api_style === UNSET ? null : draft.api_style,
+    });
+    return supported ?? REASONING_EFFORTS;
+  })();
+
+  /**
    * 清单的一行/一张卡片要展示哪些字段。**只定义一次**，两种形态共用：
    * 表格把它映射成 `<td>`，卡片映射成 `<dt>/<dd>`。字段逻辑（`/v1` 启发式提示、
    * 密钥只显掩码）因此只有一份，不会出现「改了一处漏了另一处」。
@@ -342,6 +442,13 @@ export function SettingsModelsTab({
       label: "密钥",
       // key 只以掩码示人：原始值从不经过桌面端。
       value: (entry) => (entry.has_key ? entry.api_key_masked : "未设置"),
+    },
+    {
+      label: "推理档位",
+      // 只读摘要：完整档位清单在「编辑」表单的下拉里（那里才是选择的地方）。
+      // 明确区分「未探测」与「探测过但一档都不支持」——前者该保持宽松，后者是
+      // 一个真实的结论。
+      value: (entry) => capabilitiesSummary(entry),
     },
   ];
 
@@ -388,6 +495,15 @@ export function SettingsModelsTab({
                 className="rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
               >
                 编辑
+              </button>
+              <button
+                type="button"
+                aria-label={`重新探测 ${entry.name}`}
+                onClick={() => void reprobe(entry.name)}
+                disabled={probing.has(entry.name)}
+                className="ml-1 rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg disabled:opacity-50"
+              >
+                {probing.has(entry.name) ? "探测中…" : "重新探测"}
               </button>
               <button
                 type="button"
@@ -444,6 +560,15 @@ export function SettingsModelsTab({
               className="rounded border border-line-strong px-3 py-2 text-sm text-fg-muted hover:text-fg"
             >
               编辑
+            </button>
+            <button
+              type="button"
+              aria-label={`重新探测 ${entry.name}`}
+              onClick={() => void reprobe(entry.name)}
+              disabled={probing.has(entry.name)}
+              className="rounded border border-line-strong px-3 py-2 text-sm text-fg-muted hover:text-fg disabled:opacity-50"
+            >
+              {probing.has(entry.name) ? "探测中…" : "重新探测"}
             </button>
             <button
               type="button"
@@ -602,11 +727,19 @@ export function SettingsModelsTab({
                 className="rounded border border-line bg-surface px-2 py-1 text-sm text-fg"
               >
                 <option value={UNSET}>未设置</option>
-                {REASONING_EFFORTS.map((tier) => (
+                {draftEffortTiers.map((tier) => (
                   <option key={tier} value={tier}>
                     {tier}
                   </option>
                 ))}
+                {/* 已保存的档位后来变得不支持（模型换了/能力重新探测过）：仍然列出
+                    并标注，否则 select 会显示成「未设置」，与磁盘上的值不一致。 */}
+                {draft.reasoning_effort !== UNSET &&
+                  !draftEffortTiers.includes(draft.reasoning_effort) && (
+                    <option value={draft.reasoning_effort}>
+                      {draft.reasoning_effort}（该模型不支持）
+                    </option>
+                  )}
               </select>
             </label>
             <label className="flex flex-col gap-1 text-xs text-fg-muted">

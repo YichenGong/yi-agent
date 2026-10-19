@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use chrono::{Local, Timelike, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -183,6 +183,17 @@ pub enum IpcRequest {
     AttachApplicationRoot {
         idempotency_key: String,
         workspace: PathBuf,
+        /// The root session's linked roots (canonical absolute paths). An older
+        /// client omits the field, which reads as "no linked roots".
+        ///
+        /// Additive and `#[serde(default)]`: a new daemon reads an old client's request
+        /// as "no linked roots", unchanged. The reverse is not compatible: an old daemon
+        /// rejects it as a bare parse error (`Validation`, no message), since
+        /// `deny_unknown_fields` covers this internally-tagged variant (ipc.rs:178). A bump
+        /// would not fix that (the command is parsed before `protocol_version`, 1492-1493)
+        /// and would only force the unrelated plugin crate to bump; no bump, per `fork_token`.
+        #[serde(default)]
+        extra_roots: Vec<String>,
     },
     ActivateApplicationRoot {
         session_id: String,
@@ -856,6 +867,18 @@ impl Daemon {
         clear_plugin_sockets();
         let listener = UnixListener::bind(&socket_path)?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        // Record the socket node's identity so the exit path can tell our node
+        // apart from a replacement bound at the same path after this directory
+        // was rebuilt.
+        let socket_identity = {
+            use std::os::unix::fs::MetadataExt;
+            fs::symlink_metadata(&socket_path)
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .ok()
+        };
+        // Stays non-blocking: `accept` runs only after the poll reports
+        // readiness, but the peer can disconnect in between, and that must
+        // surface as `WouldBlock` rather than blocking the loop.
         listener.set_nonblocking(true)?;
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -866,8 +889,11 @@ impl Daemon {
         let client_handlers = Arc::new(Mutex::new(Vec::<JoinHandle<()>>::new()));
         let listener_handlers = Arc::clone(&client_handlers);
         let database_path = database_path.as_ref().to_path_buf();
+        let request_context = Arc::new(RequestContext::new(&database_path)?);
+        let watched_runtime_dir = runtime_dir.to_path_buf();
         let cleanup_socket = socket_path.clone();
         let cleanup_lock = lock_path.clone();
+        let cleanup_socket_identity = socket_identity;
         let listener = thread::spawn(move || {
             // Worker facts arrive independently of client traffic. Reconcile
             // them here so a parent blocked in wait_agent is always woken.
@@ -876,7 +902,31 @@ impl Daemon {
                 .build()
                 .expect("daemon reconciliation runtime must initialize");
             let mut last_schedule_minute = None;
+            let mut last_runtime_dir_check: Option<Instant> = None;
             while !thread_stop.load(Ordering::Acquire) {
+                // The directory this daemon serves can be removed underneath it
+                // -- `git worktree remove --force` on the project does exactly
+                // that, and the socket survives in $TMPDIR when the runtime path
+                // is too long for `sun_path`. Every later request then fails to
+                // open a database that no longer exists, while the socket stays
+                // alive, so nothing upstream recognises the daemon as dead and it
+                // retries forever. A missing runtime directory is terminal: say
+                // why, then stop so the socket dies and the normal repair path
+                // can take over.
+                if last_runtime_dir_check
+                    .map(|last| last.elapsed() >= DAEMON_RUNTIME_DIR_CHECK)
+                    .unwrap_or(true)
+                {
+                    last_runtime_dir_check = Some(Instant::now());
+                    if !watched_runtime_dir.exists() {
+                        tracing::warn!(
+                            runtime_dir = %watched_runtime_dir.display(),
+                            "runtime directory disappeared; stopping this daemon so its socket can be replaced"
+                        );
+                        thread_stop.store(true, Ordering::Release);
+                        break;
+                    }
+                }
                 // Worker facts arrive independently of client traffic. A failure
                 // here used to vanish, so a wedged repository looked like a
                 // healthy daemon: keep listening, but say what broke.
@@ -891,30 +941,27 @@ impl Daemon {
                     .with_second(0)
                     .and_then(|value| value.with_nanosecond(0));
                 if minute != last_schedule_minute {
-                    let _ = coordinator.evaluate_schedules(now);
-                    // Trace retention is cleanup, not work: a failure here must
-                    // never wedge the accept loop, but a wedged database must be
-                    // visible rather than silent.
-                    match coordinator.prune_terminal_traces(Utc::now()) {
-                        Ok(pruned) => tracing::debug!(pruned, "pruned terminal task traces"),
-                        Err(error) => tracing::warn!(
-                            error = %error,
-                            "terminal trace pruning failed; retrying next minute"
-                        ),
-                    }
-                    // Abandoned fork uploads are the other per-minute leak: a
-                    // client that dies mid-upload leaves state a later client
-                    // may never claim. Reaping is pure in-memory bookkeeping,
-                    // so it shares the trace sweep's non-wedging shape.
-                    let expired_uploads = coordinator.prune_expired_fork_uploads(Instant::now());
-                    if expired_uploads > 0 {
-                        tracing::debug!(expired_uploads, "pruned expired fork uploads");
-                    }
+                    Daemon::run_minute_maintenance(&runtime, &coordinator, now);
                     last_schedule_minute = minute;
+                }
+                // Block until a connection arrives or the wait times out. This
+                // keeps `thread_stop` on a fixed cadence without adding the
+                // wait's whole duration to every request, which is what the old
+                // non-blocking-plus-sleep shape did.
+                let ready = match daemon_accept_wait(&listener, DAEMON_ACCEPT_POLL) {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        tracing::error!(error = %error, "daemon accept poll failed; retrying");
+                        continue;
+                    }
+                };
+                if !ready {
+                    continue;
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let database_path = database_path.clone();
+                        let request_context = Arc::clone(&request_context);
                         let stop = Arc::clone(&thread_stop);
                         let coordinator = Arc::clone(&coordinator);
                         let confirmations = Arc::clone(&listener_confirmations);
@@ -922,6 +969,7 @@ impl Daemon {
                             let _ = handle_client(
                                 stream,
                                 &database_path,
+                                &request_context,
                                 &stop,
                                 &coordinator,
                                 &confirmations,
@@ -942,9 +990,7 @@ impl Daemon {
                         handlers.retain(|handle| !handle.is_finished());
                         handlers.push(handler);
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => break,
                 }
             }
@@ -956,7 +1002,7 @@ impl Daemon {
             for handler in handlers {
                 let _ = handler.join();
             }
-            let _ = remove_if_exists(&cleanup_socket);
+            remove_socket_if_same_inode(&cleanup_socket, cleanup_socket_identity);
             let _ = remove_if_exists(&cleanup_lock);
         });
         Ok(Self {
@@ -971,6 +1017,47 @@ impl Daemon {
 
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// 每分钟的周期维护。抽成方法是为了让测试能驱动**线程每分会调用的同一条
+    /// 路径**，而不是等墙上时钟走到下一个整分（否则测试只能绕过驱动路径
+    /// 直调各方法，那正好测不到「接线」本身）。
+    fn run_minute_maintenance(
+        runtime: &tokio::runtime::Runtime,
+        coordinator: &RuntimeCoordinator,
+        now: DateTime<Local>,
+    ) {
+        let _ = coordinator.evaluate_schedules(now);
+        // 看门狗决定任务生死（终止越限 attempt 并释放其租约），所以它的失败
+        // 不能像 prune 那样静默：一个失败的 tick 意味着越限的任务又活了一分钟。
+        // `evaluate_watchdogs` 是 async（要拿 supervisor 的 async 锁），用
+        // current-thread runtime 的 block_on 驱动——与 `reconcile_worker_events`
+        // 在 accept 循环里的调用方式一致。
+        match runtime.block_on(coordinator.evaluate_watchdogs(Utc::now())) {
+            Ok(terminated) if terminated > 0 => {
+                tracing::info!(terminated, "watchdog terminated over-budget attempts")
+            }
+            Ok(_) => {}
+            Err(error) => tracing::error!(
+                error = %error,
+                "watchdog evaluation failed; over-budget attempts survive until the next tick"
+            ),
+        }
+        // Trace retention is cleanup, not work: a failure here must never wedge
+        // the accept loop, but a wedged database must be visible rather than silent.
+        match coordinator.prune_terminal_traces(Utc::now()) {
+            Ok(pruned) => tracing::debug!(pruned, "pruned terminal task traces"),
+            Err(error) => tracing::warn!(
+                error = %error,
+                "terminal trace pruning failed; retrying next minute"
+            ),
+        }
+        // Abandoned fork uploads are the other per-minute leak: a client that
+        // dies mid-upload leaves state a later client may never claim.
+        let expired_uploads = coordinator.prune_expired_fork_uploads(Instant::now());
+        if expired_uploads > 0 {
+            tracing::debug!(expired_uploads, "pruned expired fork uploads");
+        }
     }
 
     /// How many orphaned tasks this daemon's startup sweep reclaimed.
@@ -993,7 +1080,8 @@ impl Daemon {
 
     fn stop_listener(&mut self) -> Result<(), IpcError> {
         self.stop.store(true, Ordering::Release);
-        // Wake the nonblocking accept loop so shutdown does not wait for its sleep interval.
+        // Wake the accept loop so shutdown does not wait out the poll interval:
+        // the connection makes the listener readable, so `poll` returns at once.
         let _ = UnixStream::connect(&self.socket_path);
         if let Some(listener) = self.listener.take() {
             listener.join().map_err(|_| IpcError::ListenerPanicked)?;
@@ -1150,6 +1238,29 @@ fn remove_if_exists(path: &Path) -> Result<(), std::io::Error> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// Removes a socket node only if it is still the one we bound.
+///
+/// The daemon's exit path unlinks its socket by path. Between a runtime
+/// directory being removed and rebuilt -- which is exactly what a kanban retry
+/// does -- a replacement daemon can bind the same path first, and the outgoing
+/// daemon would then unlink *its* socket, stranding the replacement the same way
+/// this whole design exists to prevent. Comparing `(dev, ino)` deletes only the
+/// node this daemon bound.
+fn remove_socket_if_same_inode(path: &Path, expected: Option<(u64, u64)>) {
+    use std::os::unix::fs::MetadataExt;
+    // No recorded identity means we cannot tell our node from someone else's, so
+    // leave the path alone rather than risk unlinking a live daemon's socket.
+    let Some(expected) = expected else {
+        return;
+    };
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if (metadata.dev(), metadata.ino()) == expected {
+        let _ = remove_if_exists(path);
     }
 }
 
@@ -1449,9 +1560,46 @@ fn write_request(
     Ok(())
 }
 
+/// Wait until the listener is readable (a connection is pending) or the timeout
+/// elapses; the granularity matches [`DAEMON_ACCEPT_POLL`].
+///
+/// The plugin side does the same: `poll(2)` replaces "non-blocking plus sleep",
+/// so a connection returns immediately rather than adding a blind 0-10ms wait to
+/// every request, while `thread_stop` still gets checked on a fixed cadence.
+fn daemon_accept_wait(listener: &UnixListener, timeout: Duration) -> std::io::Result<bool> {
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let milliseconds = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: one initialized `pollfd`, so `nfds = 1` matches it; `poll` only
+    // reads `fd`/`events` and writes `revents`. There are no other pointer
+    // arguments.
+    let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+    match ready {
+        // Timed out: no connection arrived.
+        0 => Ok(false),
+        // Readable, or hung up: `accept` reports the specific error if so.
+        count if count > 0 => Ok(true),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// accept wait granularity: it only decides how often `thread_stop` is checked,
+/// it is no longer a per-request latency floor.
+const DAEMON_ACCEPT_POLL: Duration = Duration::from_millis(10);
+
+/// How often the accept loop asks whether the runtime directory it serves still
+/// exists. A missing runtime directory is terminal and unrecoverable -- this
+/// daemon's database lives there -- so the check is deliberately coarse: the
+/// 10ms accept poll would stat a directory every tick for nothing.
+const DAEMON_RUNTIME_DIR_CHECK: Duration = Duration::from_secs(1);
+
 fn handle_client(
     mut stream: UnixStream,
     database_path: &Path,
+    context: &RequestContext,
     stop: &Arc<AtomicBool>,
     coordinator: &Arc<RuntimeCoordinator>,
     confirmations: &Arc<ConfirmationStore>,
@@ -1581,7 +1729,7 @@ fn handle_client(
                     error_response(&error)
                 }
             },
-            request => match respond(database_path, coordinator, request) {
+            request => match respond(context, coordinator, request) {
                 Ok(response) => response,
                 Err(error) => {
                     log_request_failure(&envelope.request_id, &error);
@@ -3091,19 +3239,104 @@ fn forward_plugin_query(
     }
 }
 
+/// 是否该在本次请求里跑一轮 worker 对账。
+///
+/// daemon 的 accept 循环已经每轮跑 [`RuntimeCoordinator::reconcile_worker_events`]，
+/// `respond` 里那次是重复的。窗口只用来合并「几乎同时到达」的请求，保证请求仍能
+/// 观察到已对账状态，而不是把对账从请求路径上彻底删掉。
+fn should_reconcile(last: Option<Instant>, now: Instant, window: Duration) -> bool {
+    match last {
+        Some(previous) => now.duration_since(previous) >= window,
+        None => true,
+    }
+}
+
+/// 每个 daemon 一份的请求执行上下文：复用一个 tokio runtime 与一条 sqlite 连接。
+///
+/// `respond` 原先**每请求**都新建这两样（`Runtime::new` + `RuntimeRepository::open`
+/// 里的两条 PRAGMA 与 `migrate` 的 schema 解析），单次 `Status` 因此要 ~45ms。
+/// `rusqlite::Connection` 是 `!Sync`，故用 `Mutex` 串行持有——daemon 的请求路径
+/// 本就串行，不引入新的并发度。
+pub(crate) struct RequestContext {
+    runtime: tokio::runtime::Runtime,
+    repository: std::sync::Mutex<RuntimeRepository>,
+    reconciled_at: std::sync::Mutex<Option<Instant>>,
+    reconcile_window: Duration,
+}
+
+/// 同一窗口内的并发请求合并成一次对账。
+const RECONCILE_WINDOW: Duration = Duration::from_millis(5);
+
+impl RequestContext {
+    pub(crate) fn new(database_path: &Path) -> Result<Self, IpcError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let repository = RuntimeRepository::open(database_path).map_err(IpcError::from)?;
+        Ok(Self {
+            runtime,
+            repository: std::sync::Mutex::new(repository),
+            reconciled_at: std::sync::Mutex::new(None),
+            reconcile_window: RECONCILE_WINDOW,
+        })
+    }
+
+    /// 借出那条长生命周期连接。调用方在闭包内串行使用它。
+    ///
+    /// `respond` 只有那四个真正读写 sqlite 的 arm 走这里，借还都落在 arm 内，
+    /// 绝不跨 `block_on`（尤其是能永久挂住的 `WaitAgent`）持有——连接的互斥因此
+    /// 不会把一个请求的等待时间转嫁到另一个请求上。
+    pub(crate) fn with_repository<R>(
+        &self,
+        f: impl FnOnce(&mut RuntimeRepository) -> Result<R, IpcError>,
+    ) -> Result<R, IpcError> {
+        let mut repository = self
+            .repository
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut repository)
+    }
+
+    /// 需要时跑一轮对账；窗口内重复调用直接返回。
+    pub(crate) fn reconcile_if_stale(
+        &self,
+        coordinator: &Arc<RuntimeCoordinator>,
+    ) -> Result<(), IpcError> {
+        let now = Instant::now();
+        let last = *self
+            .reconciled_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !should_reconcile(last, now, self.reconcile_window) {
+            return Ok(());
+        }
+        self.runtime
+            .block_on(coordinator.reconcile_worker_events())?;
+        *self
+            .reconciled_at
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+        Ok(())
+    }
+}
+
 fn respond(
-    database_path: &Path,
+    context: &RequestContext,
     coordinator: &Arc<RuntimeCoordinator>,
     request: IpcRequest,
 ) -> Result<IpcResponse, IpcError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(coordinator.reconcile_worker_events())?;
-    let mut repository = RuntimeRepository::open(database_path)?;
+    context.reconcile_if_stale(coordinator)?;
+    // 每条连接一个 handler 线程，所以请求**是**并发的：`respond` 里既有秒级
+    // 的协调器调用，也有能永久挂住的 `WaitAgent`（`timeout_ms: None` 时
+    // `wait_for_children_authorized` 永不返回）。连接因此必须**按需**借、绝不可
+    // 跨这些调用持有：否则一个仍在等待的 `WaitAgent` 会把每个 `Status` 轮询都
+    // 挡在锁后——恰恰是这次改动要修掉的那种「`pwd && ls` 都慢」。真正用到连接
+    // 的只有下面四个 arm，它们都只做一次本地 sqlite 读写，不阻塞。
     match request {
         IpcRequest::Status => Ok(IpcResponse::Status {
-            high_water_event_id: repository.latest_event_id()?,
+            high_water_event_id: context.with_repository(|repository| {
+                repository.latest_event_id().map_err(IpcError::from)
+            })?,
         }),
         IpcRequest::Stop => Ok(IpcResponse::Stopping),
         IpcRequest::CreateSession => {
@@ -3117,12 +3350,16 @@ fn respond(
         IpcRequest::AttachApplicationRoot {
             idempotency_key,
             workspace,
+            extra_roots,
         } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?;
-            let attached = runtime
-                .block_on(coordinator.attach_application_root(&idempotency_key, &workspace))?;
+            let attached = runtime.block_on(coordinator.attach_application_root(
+                &idempotency_key,
+                &workspace,
+                &extra_roots,
+            ))?;
             Ok(IpcResponse::ApplicationRootAttached {
                 session_id: attached.session_id.to_string(),
                 root_task_id: attached.root_task_id.to_string(),
@@ -3176,14 +3413,18 @@ fn respond(
             let next_run_at = definition.next_run_after(Local::now()).map_err(|error| {
                 IpcError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
             })?;
-            let schedule = repository.create_schedule(&definition, next_run_at)?;
+            let schedule = context.with_repository(|repository| {
+                repository
+                    .create_schedule(&definition, next_run_at)
+                    .map_err(IpcError::from)
+            })?;
             Ok(IpcResponse::ScheduleCreated {
                 schedule_id: schedule.id,
             })
         }
         IpcRequest::ListSchedules => Ok(IpcResponse::Schedules {
-            schedules: repository
-                .schedules()?
+            schedules: context
+                .with_repository(|repository| repository.schedules().map_err(IpcError::from))?
                 .into_iter()
                 .map(|schedule| IpcSchedule {
                     schedule_id: schedule.id,
@@ -3202,7 +3443,11 @@ fn respond(
             params,
         } => forward_plugin_query(&plugin, &method, params),
         IpcRequest::DeleteSchedule { schedule_id } => {
-            if !repository.delete_schedule(&schedule_id)? {
+            if !context.with_repository(|repository| {
+                repository
+                    .delete_schedule(&schedule_id)
+                    .map_err(IpcError::from)
+            })? {
                 return Err(IpcError::Io(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "schedule does not exist",
@@ -3584,7 +3829,9 @@ fn respond(
         }
         IpcRequest::InspectTask { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let detail = repository.task_detail(&task_id)?;
+            let detail = context.with_repository(|repository| {
+                repository.task_detail(&task_id).map_err(IpcError::from)
+            })?;
             Ok(IpcResponse::TaskDetail(IpcTaskDetail {
                 task_id: detail.task_id,
                 session_id: detail.session_id,
@@ -3653,8 +3900,12 @@ fn respond(
                 .as_deref()
                 .map(parse_id::<RootSessionId>)
                 .transpose()?;
-            let tasks = repository
-                .task_summaries(session_id.as_ref(), active_only)?
+            let tasks = context
+                .with_repository(|repository| {
+                    repository
+                        .task_summaries(session_id.as_ref(), active_only)
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(|task| IpcTaskSummary {
                     task_id: task.task_id,
@@ -3671,8 +3922,12 @@ fn respond(
             after_event_id,
         } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let events = repository
-                .event_records_for_task_after(&task_id, after_event_id.unwrap_or(0))?
+            let events = context
+                .with_repository(|repository| {
+                    repository
+                        .event_records_for_task_after(&task_id, after_event_id.unwrap_or(0))
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(ipc_event)
                 .collect();
@@ -3680,8 +3935,12 @@ fn respond(
         }
         IpcRequest::ReadTaskMailbox { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let messages = repository
-                .mailbox_messages_for_task(&task_id)?
+            let messages = context
+                .with_repository(|repository| {
+                    repository
+                        .mailbox_messages_for_task(&task_id)
+                        .map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(|message| IpcMailboxMessage {
                     message_id: message.message_id,
@@ -3698,7 +3957,9 @@ fn respond(
         }
         IpcRequest::ReadTaskDiff { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let detail = repository.task_detail(&task_id)?;
+            let detail = context.with_repository(|repository| {
+                repository.task_detail(&task_id).map_err(IpcError::from)
+            })?;
             let diff = coordinator.delivery_diff(&task_id).ok().flatten();
             Ok(IpcResponse::TaskDiff {
                 task_id: detail.task_id,
@@ -3708,8 +3969,10 @@ fn respond(
         }
         IpcRequest::ReadTaskTrace { task_id } => {
             let task_id = parse_id::<TaskId>(&task_id)?;
-            let rows: Vec<IpcTraceRow> = repository
-                .trace_after(&task_id, 0)?
+            let rows: Vec<IpcTraceRow> = context
+                .with_repository(|repository| {
+                    repository.trace_after(&task_id, 0).map_err(IpcError::from)
+                })?
                 .into_iter()
                 .map(ipc_trace_row)
                 .collect();
@@ -3726,7 +3989,11 @@ fn respond(
             after_event_id,
             filters,
         } => {
-            let snapshot = repository.subscription_snapshot(after_event_id)?;
+            let snapshot = context.with_repository(|repository| {
+                repository
+                    .subscription_snapshot(after_event_id)
+                    .map_err(IpcError::from)
+            })?;
             let tasks = snapshot
                 .tasks
                 .into_iter()
@@ -3937,6 +4204,80 @@ mod socket_path_tests {
         let second = socket_path_for(shared).expect("resolves");
 
         assert_eq!(first, second);
+    }
+}
+
+#[cfg(test)]
+mod socket_identity_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixListener;
+
+    fn identity(path: &Path) -> (u64, u64) {
+        let metadata = fs::symlink_metadata(path).expect("node must exist");
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[test]
+    fn a_socket_node_we_still_own_is_removed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("own.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let recorded = identity(&path);
+
+        remove_socket_if_same_inode(&path, Some(recorded));
+
+        assert!(!path.exists(), "our own socket node must be cleaned up");
+        drop(listener);
+    }
+
+    #[test]
+    fn a_replacement_socket_at_the_same_path_is_left_alone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("reused.sock");
+        let first = UnixListener::bind(&path).unwrap();
+        let stale_identity = identity(&path);
+        // 换掉节点：unlink 后重新 bind，拿到一个 (dev, ino) 不同的新节点。
+        // 注意 drop(listener) 本身**不会** unlink 文件——必须先显式删。
+        drop(first);
+        std::fs::remove_file(&path).unwrap();
+        let _replacement = UnixListener::bind(&path).unwrap();
+        assert_ne!(
+            stale_identity,
+            identity(&path),
+            "precondition: rebinding the same path must yield a new inode"
+        );
+
+        remove_socket_if_same_inode(&path, Some(stale_identity));
+
+        assert!(
+            path.exists(),
+            "a socket node bound by a replacement daemon must survive the outgoing daemon's cleanup"
+        );
+    }
+
+    #[test]
+    fn an_unknown_identity_removes_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("unknown.sock");
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        remove_socket_if_same_inode(&path, None);
+
+        assert!(
+            path.exists(),
+            "without a recorded identity the cleanup must not guess"
+        );
+    }
+
+    #[test]
+    fn a_vanished_node_is_not_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("absent.sock");
+
+        remove_socket_if_same_inode(&path, Some((0, 0)));
+
+        assert!(!path.exists());
     }
 }
 
@@ -4406,5 +4747,390 @@ mod fork_wire_tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod attach_application_root_wire_tests {
+    use super::*;
+
+    /// An older client does not send the field at all, and that must keep
+    /// parsing as "no linked roots" rather than failing the request.
+    #[test]
+    fn attach_application_root_defaults_missing_extra_roots_to_empty() {
+        let raw = r#"{"type":"AttachApplicationRoot","idempotency_key":"k","workspace":"/tmp/w"}"#;
+        let request: IpcRequest = serde_json::from_str(raw).unwrap();
+        match request {
+            IpcRequest::AttachApplicationRoot { extra_roots, .. } => {
+                assert!(
+                    extra_roots.is_empty(),
+                    "missing extra_roots must read as empty"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    /// The linked roots a caller does send must survive the wire verbatim.
+    #[test]
+    fn attach_application_root_carries_extra_roots_over_the_wire() {
+        let request = IpcRequest::AttachApplicationRoot {
+            idempotency_key: "k".into(),
+            workspace: PathBuf::from("/tmp/w"),
+            extra_roots: vec!["/w/linked-b".into(), "/w/linked-c".into()],
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<IpcRequest>(&encoded).unwrap(),
+            request
+        );
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use super::*;
+
+    #[test]
+    fn should_reconcile_only_outside_the_window() {
+        let window = Duration::from_millis(5);
+        let base = Instant::now();
+        // 从未对账过：必须跑。
+        assert!(should_reconcile(None, base, window));
+        // 刚跑过：窗口内跳过。
+        assert!(!should_reconcile(
+            Some(base),
+            base + Duration::from_millis(1),
+            window
+        ));
+        // 窗口已过：再跑一次。
+        assert!(should_reconcile(
+            Some(base),
+            base + Duration::from_millis(6),
+            window
+        ));
+    }
+
+    #[test]
+    fn a_request_context_reuses_one_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("runtime.sqlite");
+        let context = RequestContext::new(&database_path).expect("context builds");
+        // 同一个连接可重复使用；两次读取给出同一个 schema 版本。
+        let first = context
+            .with_repository(|repository| repository.schema_version().map_err(IpcError::from))
+            .expect("first read");
+        let second = context
+            .with_repository(|repository| repository.schema_version().map_err(IpcError::from))
+            .expect("second read");
+        assert_eq!(first, second);
+    }
+
+    /// 回归测试：不用仓库的 arm 不得被用仓库的 arm 挡住。
+    ///
+    /// 每条连接一个 handler 线程，请求是并发的。曾经的写法在 `match` 之前就
+    /// `context.repository.lock()` 并跨整个 `match` 持有；那样一个仍在等待的
+    /// `WaitAgent`（`timeout_ms: None` 时永不返回）会把每个 `Status` 轮询都挡在
+    /// 锁后——正是这次要修掉的「`pwd && ls` 都慢」。这里用一个在 sqlite 读期间
+    /// 故意睡 300ms 的持有者模拟慢 arm：`Stop` 根本不碰仓库，正确的按 arm 借还
+    /// 下它会立刻返回；跨 arm 持锁的写法则会让它排队等满那 300ms。
+    #[test]
+    fn an_arm_that_does_not_use_the_repository_is_not_blocked_by_one_that_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("runtime.sqlite");
+        let factory: Arc<dyn AgentWorkerFactory> = Arc::new(UnavailableWorkerFactory);
+        let coordinator =
+            Arc::new(RuntimeCoordinator::open(&database_path, factory).expect("coordinator opens"));
+        let context = Arc::new(RequestContext::new(&database_path).expect("context builds"));
+
+        let slow_context = Arc::clone(&context);
+        let slow = thread::spawn(move || {
+            slow_context
+                .with_repository(|repository| {
+                    thread::sleep(Duration::from_millis(300));
+                    repository.latest_event_id().map_err(IpcError::from)
+                })
+                .expect("slow read");
+        });
+        // 与该持有者争用同一条连接。
+        thread::sleep(Duration::from_millis(50));
+
+        // `Stop` 不碰仓库：它不该被那个持有者挡住。
+        let started = Instant::now();
+        let response = respond(&context, &coordinator, IpcRequest::Stop).expect("stop answers");
+        let elapsed = started.elapsed();
+        slow.join().unwrap();
+
+        assert!(matches!(response, IpcResponse::Stopping));
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "an arm that never touches the repository must not wait behind one that does; waited {elapsed:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tick_tests {
+    //! spec §3.3 的「驱动路径」回归：从 daemon 线程每分调用的那条路径证明
+    //! 越限 attempt 真的会被终止。
+    //!
+    //! 缺陷形状是「看门狗从不运行」：`evaluate_watchdogs` 判定逻辑本身没问题，
+    //! 只是没有任何生产调用者，于是越限的任务永远活着。直调
+    //! `evaluate_watchdogs` 的测试发现不了这件事——把接线拆掉它照样绿。所以这
+    //! 里驱动的是 `Daemon::run_minute_maintenance`（Task 3 落地的生产调用者）。
+    //!
+    //! 终止断言要求任务所在会话在 daemon 进程内已 hydrate：`record_watchdog_terminal`
+    //! 通过 `supervisor(session)` 取 supervisor，未 hydrate 的会话拿不到，Task 1
+    //! 让 `evaluate_watchdogs` 恰恰隔离了这个错误（warn 后继续）。所以「终止」
+    //! 用 hydrated 会话验，「隔离」用 hydrated + unhydrated 并置验。
+
+    use super::*;
+    use crate::repository::{PersistedEvent, RuntimeEvent};
+    use crate::schedule::{WatchdogLimits, WatchdogUsage};
+    use rusqlite::Connection;
+
+    /// idle 超过 1 秒即判 `Stalled`。`evaluate_watchdogs` 内部用真实
+    /// `Utc::now()`，所以只要 `last_meaningful_at` 足够久远就一定越限。
+    fn over_budget_limits() -> WatchdogLimits {
+        WatchdogLimits {
+            max_turns: None,
+            max_wall_time_secs: None,
+            max_idle_time_secs: Some(1),
+            ..WatchdogLimits::default()
+        }
+    }
+
+    fn ancient_start() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-08-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn active_attempt_id(database: &Path, task: &TaskId) -> yi_agent_core::AttemptId {
+        Connection::open(database)
+            .unwrap()
+            .query_row(
+                "SELECT active_attempt_id FROM tasks WHERE id = ?1",
+                [task.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn recorded_watchdog_terminal(events: &[PersistedEvent], task: &TaskId) -> bool {
+        events.iter().any(|event| {
+            event.task_id == *task
+                && matches!(
+                    event.event,
+                    RuntimeEvent::TaskStalled
+                        | RuntimeEvent::TaskTimedOut
+                        | RuntimeEvent::TaskBudgetExhausted
+                )
+        })
+    }
+
+    /// 与 daemon 线程完全相同的调用形状：current-thread runtime + block_on。
+    fn drive_one_minute_maintenance(daemon: &Daemon, now: DateTime<Local>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("minute maintenance runtime must initialize");
+        Daemon::run_minute_maintenance(&runtime, &daemon.coordinator, now);
+    }
+
+    fn start_daemon(database: &Path) -> Daemon {
+        let runtime_dir = database
+            .parent()
+            .expect("database lives in a directory")
+            .join("runtime");
+        Daemon::start_with_factory(runtime_dir, database, Arc::new(UnavailableWorkerFactory))
+            .expect("daemon starts")
+    }
+
+    /// 越限 attempt 会被一次分钟维护 tick 终止，并释放它的租约。
+    ///
+    /// 回归缺陷：看门狗没有生产调用者。把 `run_minute_maintenance` 里的
+    /// `evaluate_watchdogs` 调用去掉，本测试失败（状态停在 `queued`）。
+    #[test]
+    fn a_minute_maintenance_tick_terminates_an_over_budget_attempt() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon = start_daemon(&database);
+
+        // hydrate：create_session 把 supervisor 放进进程内的 map，只有这类会话
+        // 的 attempt 才可能被判定终止。
+        let session = daemon.coordinator.create_session().unwrap();
+        let root = daemon.coordinator.root_task_id(&session).unwrap();
+        let attempt = active_attempt_id(&database, &root);
+        let started = ancient_start();
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .save_attempt_watchdog_snapshot(
+                    &root,
+                    &attempt,
+                    &over_budget_limits(),
+                    &WatchdogUsage::default(),
+                    None,
+                    started,
+                    None,
+                )
+                .unwrap();
+            // 一条真实活跃租约，让「释放租约」这条断言真的被走到。
+            repository
+                .record_recovery_context(
+                    &root,
+                    &attempt,
+                    "workspace:watchdog",
+                    "worktree:watchdog",
+                    r#"{"git_head":"test"}"#,
+                    r#"{"state":"available"}"#,
+                )
+                .unwrap();
+        }
+        assert!(
+            RuntimeRepository::open(&database)
+                .unwrap()
+                .has_active_lease_prefix(&root, "")
+                .unwrap(),
+            "precondition: the attempt holds an active lease"
+        );
+
+        drive_one_minute_maintenance(
+            &daemon,
+            (started + chrono::Duration::seconds(10)).with_timezone(&Local),
+        );
+
+        let repository = RuntimeRepository::open(&database).unwrap();
+        let state = repository.task_state(&root).unwrap();
+        assert!(
+            matches!(state.as_str(), "stalled" | "timed_out" | "budget_exhausted"),
+            "over-budget attempt must be terminated by the tick, got {state}"
+        );
+        let events = repository.event_records_after(0).unwrap();
+        assert!(
+            recorded_watchdog_terminal(&events, &root),
+            "a watchdog terminal event must be recorded"
+        );
+        assert!(
+            !repository.has_active_lease_prefix(&root, "").unwrap(),
+            "the attempt's leases must be released"
+        );
+    }
+
+    /// 一个未 hydrate 的会话不得阻断整轮扫描。
+    ///
+    /// 这是 Task 1 契约的驱动路径形式：tick 跑完（`Ok`）、未 hydrate 的那条被
+    /// **跳过而非判定**（状态不变、无终态事件），同时 hydrate 的兄弟仍被终止。
+    ///
+    /// 覆盖的是**坏记录先被扫描到**这一顺序（见下方「先写坏记录」的说明），
+    /// 也正因为如此它才能区分「逐条隔离」是否还在。顺序无关的保证由 Task 1 的
+    /// 直接测试 `an_unhydrated_session_does_not_fail_the_whole_watchdog_sweep`
+    /// 负责（那里不依赖扫描顺序）。
+    #[test]
+    fn one_unhydrated_session_does_not_stop_the_tick_from_terminating_another() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let database = directory.path().join("runtime.sqlite");
+        let daemon = start_daemon(&database);
+
+        let started = ancient_start();
+
+        // 未 hydrate 的兄弟：手工造一条 queued 越限快照，其会话不在 map 里。
+        //
+        // 必须**先于** `create_session()` 写入：`create_session` 会在
+        // `insert_attempt` 里替它的根 attempt 插一行 `attempt_watchdogs`，而
+        // `active_attempt_watchdogs()` 没有 `ORDER BY`，扫描顺序即 rowid 顺序。
+        // 先写坏记录，才能保证这一轮扫描**先撞上**那条未 hydrate 的记录——只有
+        // 这个顺序才真正区分「逐条隔离」是否还在：隔离被移除时，扫描在第 1 条
+        // （坏记录）就中止，后面已 hydrate 的兄弟永远等不到判定，本测试即失败。
+        let unhydrated_session = RootSessionId::new();
+        let unhydrated_task = TaskId::new();
+        let unhydrated_attempt = yi_agent_core::AttemptId::new();
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .create_task_with_attempt(
+                    &unhydrated_task,
+                    &unhydrated_session,
+                    &unhydrated_attempt,
+                    1,
+                    "queued",
+                )
+                .unwrap();
+            repository
+                .save_attempt_watchdog_snapshot(
+                    &unhydrated_task,
+                    &unhydrated_attempt,
+                    &over_budget_limits(),
+                    &WatchdogUsage::default(),
+                    None,
+                    started,
+                    None,
+                )
+                .unwrap();
+        }
+
+        // 再 hydrate 一个会话，并给它写一条同样越限的快照。
+        let session = daemon.coordinator.create_session().unwrap();
+        let hydrated_root = daemon.coordinator.root_task_id(&session).unwrap();
+        let hydrated_attempt = active_attempt_id(&database, &hydrated_root);
+        {
+            let mut repository = RuntimeRepository::open(&database).unwrap();
+            repository
+                .save_attempt_watchdog_snapshot(
+                    &hydrated_root,
+                    &hydrated_attempt,
+                    &over_budget_limits(),
+                    &WatchdogUsage::default(),
+                    None,
+                    started,
+                    None,
+                )
+                .unwrap();
+        }
+
+        // 前提：两条越限快照都真的进了本轮扫描——否则「未 hydrate 被跳过」这条
+        // 断言就是空的（它可能压根没被看过）。
+        assert_eq!(
+            RuntimeRepository::open(&database)
+                .unwrap()
+                .active_attempt_watchdogs()
+                .unwrap()
+                .len(),
+            2,
+            "precondition: both over-budget attempts must be in the sweep"
+        );
+
+        drive_one_minute_maintenance(
+            &daemon,
+            (started + chrono::Duration::seconds(10)).with_timezone(&Local),
+        );
+
+        let repository = RuntimeRepository::open(&database).unwrap();
+        let hydrated_state = repository.task_state(&hydrated_root).unwrap();
+        assert!(
+            matches!(
+                hydrated_state.as_str(),
+                "stalled" | "timed_out" | "budget_exhausted"
+            ),
+            "the hydrated sibling must still be terminated: the sweep has to survive the \
+             unhydrated entry, got {hydrated_state}"
+        );
+        let events = repository.event_records_after(0).unwrap();
+        assert!(
+            recorded_watchdog_terminal(&events, &hydrated_root),
+            "the hydrated sibling must record a watchdog terminal event"
+        );
+        assert_eq!(
+            repository.task_state(&unhydrated_task).unwrap(),
+            "queued",
+            "an unhydrated session's attempt must be skipped, not judged"
+        );
+        assert!(
+            !recorded_watchdog_terminal(&events, &unhydrated_task),
+            "no watchdog terminal event may be recorded for an unhydrated session"
+        );
     }
 }

@@ -27,6 +27,6 @@ jobs:
         run: just ci
 
       # 生成的 TypeScript 绑定（ts-rs）漂移门禁现由 `just ci` 内部执行 —— 见
-      # yi-agent-rs/justfile 的 `ci: fmt-check lint test build bindings-check`。
-      # GitHub PR / GitLab push / GitLab MR 三条路径统一走 `just ci`，故此处不再单列
-      # 一步，否则同一条门禁在 GitHub 路径上会跑两遍。
+      # yi-agent-rs/justfile 的 `ci` recipe 依赖列表（不再内联，避免漏列而漂移，
+      # 例如新挂的 secret-check）。GitHub PR / GitLab push / GitLab MR 三条路径
+      # 统一走 `just ci`，故此处不再单列一步，否则同一条门禁在 GitHub 路径上会跑两遍。

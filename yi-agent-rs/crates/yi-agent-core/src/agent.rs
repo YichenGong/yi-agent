@@ -215,6 +215,9 @@ File discovery:
   required.
 
 Subagent integration:
+- A delegated child inherits your current conversation by default, so it already
+  knows what you have read and decided. Pass `fork: false` only when the child
+  must start from a clean slate.
 - A child runs in the `workdir` you pass to `spawn_agent`. When a change needs
   isolation, create that directory yourself first: `git worktree add <path> -b
   <branch>`, then pass `<path>` as the child's `workdir`. When it does not, pass
@@ -2531,7 +2534,11 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    /// The default (current-thread) runtime is load-bearing: `run()` spawns the
+    /// loop, and the spawned task only advances when this task yields. A
+    /// multi-thread runtime let the loop reach its first inbox drain before the
+    /// cancel below landed, turning the pin into a scheduling race.
+    #[tokio::test]
     async fn cancel_returns_unconsumed_interjections_before_cancelled() {
         let provider = Arc::new(StallOnceThenSucceedProvider::new());
         let mut agent = Agent::new(provider, Arc::new(ToolRegistry::new()), fast_stall_config());

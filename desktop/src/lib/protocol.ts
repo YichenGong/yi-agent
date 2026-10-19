@@ -107,10 +107,13 @@ export interface ThreadSummary {
   status?: ThreadStatus;
   /** 是否置于侧栏顶部的 Pinned 分区。旧服务端缺省视为 false。 */
   pinned?: boolean;
-  /** 由看板创建时，该会话所属的项目根（绝对路径）。旧服务端缺省视为普通会话。 */
-  board_project?: string;
-  /** 由看板创建时，该会话对应的卡 id。旧服务端缺省视为普通会话。 */
-  card_id?: string;
+  /** 由驱动方创建时，该会话所属的项目根（绝对路径）。旧服务端缺省视为普通会话。 */
+  driver_project?: string;
+  /**
+   * 由驱动方创建时，驱动方给该会话的**不透明**句柄（宿主不解释其含义）。
+   * 旧服务端缺省视为普通会话。
+   */
+  driver_ref?: string;
   /**
    * 该会话的模型引用（模型清单里的 `name`）。缺省/`null` = 跟随全局默认。
    * 旧服务端不发送此字段，读取时按 `null` 处理。
@@ -126,6 +129,13 @@ export interface ThreadSummary {
    * 旧服务端不发送此字段；读取时先过 `isValidTagId` 再渲染，脏值按无标签处理。
    */
   tag?: string | null;
+  /**
+   * 服务端的内容世代。旧服务端不发送此字段：读取时必须按"未知"处理
+   * （保守全量 resume），绝不当作"一致"（spec §4.3）。`null` 与缺省同义。
+   */
+  content_epoch?: number | null;
+  /** 服务端最后一条 item 的 id；`null` = 该会话从未有过 item。 */
+  last_item_id?: string | null;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */

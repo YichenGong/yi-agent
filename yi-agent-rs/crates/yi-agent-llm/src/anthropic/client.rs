@@ -1,6 +1,5 @@
 //! AnthropicProvider and Provider trait implementation.
 
-use std::env;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -31,8 +30,11 @@ mod tests {
 ///
 /// All fields optional — resolved with the following priority:
 /// 1. Explicit value here
-/// 2. Environment variable (`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`)
-/// 3. Built-in default
+/// 2. Built-in default
+///
+/// The process environment is never consulted: model configuration has exactly
+/// one source of truth (`~/.yi-agent/models.json` resolved through
+/// `RuntimeConfig`).
 #[derive(Default)]
 pub struct AnthropicProviderOpts {
     pub base_url: Option<String>,
@@ -62,18 +64,15 @@ impl std::fmt::Debug for AnthropicProvider {
 impl AnthropicProvider {
     /// Construct a provider.
     ///
-    /// `api_key` resolution: `opts.api_key` > `ANTHROPIC_API_KEY` env var > error.
+    /// `api_key` comes only from `opts.api_key`; when absent the call fails with
+    /// [`ProviderError::Auth`]. The process environment is never consulted.
     pub fn new(opts: AnthropicProviderOpts) -> Result<Self, ProviderError> {
-        let api_key = opts
-            .api_key
-            .or_else(|| env::var("ANTHROPIC_API_KEY").ok())
-            .ok_or_else(|| {
-                ProviderError::Auth("ANTHROPIC_API_KEY not set and no api_key provided".into())
-            })?;
+        let api_key = opts.api_key.ok_or_else(|| {
+            ProviderError::Auth("no api key provided: configure a model entry in settings".into())
+        })?;
 
         let base_url = opts
             .base_url
-            .or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
             .trim_end_matches('/')
             .to_string();

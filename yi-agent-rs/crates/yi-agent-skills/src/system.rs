@@ -120,4 +120,36 @@ mod tests {
         let body = std::fs::read_to_string(path).unwrap();
         assert!(body.contains("show_git_diff"), "skill must name the tool");
     }
+
+    #[test]
+    fn the_git_diff_skill_teaches_commands_not_just_a_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_system_skills(tmp.path()).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("git-diff-review/SKILL.md")).unwrap();
+        assert!(body.contains("show_git_diff"), "skill must name the tool");
+        assert!(
+            body.contains("command"),
+            "the tool now takes a command: {body}"
+        );
+        assert!(body.contains("git log"), "skill must give a log example");
+        // 旧版 skill 里也出现过「只读」二字（「只读探查」），故光看这个词是空的：
+        // 必须点名的是**沙箱**这条硬约束，模型照它才不去写 `git stash push` 之类。
+        assert!(
+            body.contains("read-only") || body.contains("只读沙箱"),
+            "skill must warn about the read-only SANDBOX, not merely use the word"
+        );
+        // 三个渲染原语是 `show_git_diff({ as })` 的合法取值，模型得知道可以声明；
+        // 少了这条，将来删掉整个 `as` 段落也不会有测试报警。
+        for kind in ["diff", "log", "text"] {
+            assert!(
+                body.contains(kind),
+                "the `as` primitives must be documented, missing {kind}"
+            );
+        }
+        // 命令样例是「命令即接口」的全部价值所在，一条都不给等于没教。
+        assert!(
+            body.contains("git diff"),
+            "skill must give a diff command example"
+        );
+    }
 }

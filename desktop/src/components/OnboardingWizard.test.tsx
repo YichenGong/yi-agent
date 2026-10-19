@@ -27,9 +27,7 @@ describe("OnboardingWizard", () => {
 
   it("applies the config and finishes", async () => {
     const call = vi.fn(async (method: string) =>
-      method === "onboarding/apply"
-        ? { ok: true, env_written: true, imported: true }
-        : { ok: true },
+      method === "onboarding/apply" ? { ok: true, name: "gpt-4o" } : { ok: true },
     );
     const { onDone } = renderWizard(call);
     fireEvent.click(screen.getByRole("button", { name: /开始/ }));
@@ -39,8 +37,8 @@ describe("OnboardingWizard", () => {
     fireEvent.change(screen.getByLabelText("模型标识"), { target: { value: "gpt-4o" } });
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
     await waitFor(() => expect(onDone).toHaveBeenCalled());
-    // 收尾结果随回调上抛：完整成功 = imported:true、无 importError。
-    expect(onDone).toHaveBeenCalledWith({ imported: true, importError: undefined });
+    // 收尾结果随回调上抛：单写清单成功。
+    expect(onDone).toHaveBeenCalledWith({ saved: true });
     expect(call).toHaveBeenCalledWith("onboarding/apply", {
       provider: "openai",
       model: "gpt-4o",
@@ -49,12 +47,10 @@ describe("OnboardingWizard", () => {
     });
   });
 
-  it("reports a partial success to onDone when the catalog import fails", async () => {
-    // `.env` 写成功但清单收边失败：宿主回 ok:true + imported:false + 原因。
+  it("stays on the form without dismissing when the apply fails", async () => {
+    // 单写清单：失败由宿主以 RPC 错误抛出。向导内联显示，不前进、不发 dismiss。
     const call = vi.fn(async (method: string) => {
-      if (method === "onboarding/apply") {
-        return { ok: true, env_written: true, imported: false, import_error: "disk" };
-      }
+      if (method === "onboarding/apply") throw new Error("写入失败");
       return { ok: true };
     });
     const { onDone } = renderWizard(call);
@@ -63,24 +59,6 @@ describe("OnboardingWizard", () => {
     fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
     fireEvent.change(await screen.findByLabelText("API 密钥"), { target: { value: "sk-x" } });
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
-    await waitFor(() =>
-      expect(onDone).toHaveBeenCalledWith({ imported: false, importError: "disk" }),
-    );
-  });
-
-  it("stays on the form without dismissing when apply returns ok:false", async () => {
-    const call = vi.fn(async (method: string) =>
-      method === "onboarding/apply"
-        ? { ok: false, env_written: false, imported: false, import_error: "写入失败" }
-        : { ok: true },
-    );
-    const { onDone } = renderWizard(call);
-    fireEvent.click(screen.getByRole("button", { name: /开始/ }));
-    fireEvent.click(screen.getByRole("button", { name: "openai" }));
-    fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
-    fireEvent.change(await screen.findByLabelText("API 密钥"), { target: { value: "sk-x" } });
-    fireEvent.click(screen.getByRole("button", { name: /保存/ }));
-    // 失败内联显示，向导不前进，也不发 dismiss。
     expect(await screen.findByText("写入失败")).toBeTruthy();
     expect(onDone).not.toHaveBeenCalled();
     expect(call).not.toHaveBeenCalledWith("onboarding/dismiss", {});
@@ -89,7 +67,7 @@ describe("OnboardingWizard", () => {
   it("offers 'save anyway' after a failed connection test", async () => {
     const call = vi.fn(async (method: string) => {
       if (method === "onboarding/test") return { ok: false, reason: "无法连接 API 地址" };
-      return { ok: true, env_written: true, imported: true };
+      return { ok: true, name: "gpt-4o" };
     });
     const { onDone } = renderWizard(call);
     fireEvent.click(screen.getByRole("button", { name: /开始/ }));

@@ -50,6 +50,11 @@ pub(crate) async fn handle(
                 .await?;
                 return Ok(Flow::Continue);
             }
+            // upsert 可能让旧能力失效（连接字段变了 → 清空），需要在**写之前**
+            // 拿一份旧清单做对比。其它方法不碰能力，不必付这次读盘。
+            let is_upsert = req.method == "model/upsert";
+            let before =
+                is_upsert.then(|| yi_agent_runtime::models::load_catalog_from(state.models_path));
             match crate::model_rpc::handle_model_request_at(
                 state.models_path,
                 req.method.as_str(),
@@ -57,12 +62,67 @@ pub(crate) async fn handle(
                 state.cfg,
             ) {
                 Ok(value) => {
-                    write_response(state.hub, state.client, ok_response(id, value)).await?
+                    write_response(state.hub, state.client, ok_response(id, value)).await?;
+                    if let Some(before) = before {
+                        maybe_probe_after_upsert(state, &req.params, &before);
+                    }
                 }
                 Err(error) => {
                     write_response(state.hub, state.client, err_response(id, error)).await?
                 }
             }
+        }
+        // 能力探测：后台跑（一轮最长 30s），先回 `started` 再广播结果。
+        // 与 `model/test` 同档（触及密钥，需 `Control`），因 async 而单独开分支。
+        "model/probe" => {
+            if state.client_scope < Scope::Control {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            let name = req
+                .params
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let catalog = yi_agent_runtime::models::load_catalog_from(state.models_path);
+            let Some(entry) = catalog.models.iter().find(|m| m.name == name) else {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::model_not_found(&name)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            };
+            // 已在探测中：直接回 false，不打第二轮请求。
+            if !state.probes.try_begin(&name) {
+                write_response(
+                    state.hub,
+                    state.client,
+                    ok_response(id, serde_json::json!({ "started": false })),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            spawn_probe(
+                state.hub,
+                state.probes,
+                state.models_path,
+                name,
+                entry.clone(),
+            );
+            write_response(
+                state.hub,
+                state.client,
+                ok_response(id, serde_json::json!({ "started": true })),
+            )
+            .await?;
         }
         // 探测只发一次最小请求、**不落盘**：与 `onboarding/test` 同档
         // （触及密钥，需 Control），且因探测是 async 而单独开分支。
@@ -98,4 +158,97 @@ pub(crate) async fn handle(
     // 臂体走完而**没有** `continue` 的路径,在搬移前同样落到本轮 dispatch 的
     // 末尾、回到主循环下一轮 —— 即与 `continue` 等价,故统一在此收束。
     Ok(Flow::Continue)
+}
+
+/// 探测后写回并广播。**不阻塞**调用方：一轮探测最长 30s，放在 RPC 的
+/// await 链上会把整个连接（以及同一 task 上的其它请求）堵死。
+///
+/// `ProbeRegistry` 用 clone 而非引用移进 task：`AppState` 里的 `&ProbeRegistry`
+/// 活不过这个函数，而 `tokio::spawn` 要求 `'static`。内部是 `Arc<Mutex<..>>`，
+/// clone 仍指向同一张表。
+pub(crate) fn spawn_probe(
+    hub: &std::sync::Arc<crate::broadcast::Broadcaster>,
+    probes: &crate::model_rpc::ProbeRegistry,
+    path: &std::path::Path,
+    name: String,
+    entry: yi_agent_runtime::models::ModelEntry,
+) {
+    let hub = std::sync::Arc::clone(hub);
+    let probes = probes.clone();
+    let path = path.to_path_buf();
+    let fingerprint = crate::model_rpc::entry_fingerprint(&entry);
+    tokio::spawn(async move {
+        let outcome = yi_agent_runtime::reasoning_probe::probe_entry(
+            entry.provider,
+            &entry.api_url,
+            &entry.api_key,
+            &entry.model,
+            entry.api_style.as_deref(),
+        )
+        .await;
+        let applied = crate::model_rpc::apply_probe_result(&path, &name, &fingerprint, outcome);
+        probes.finish(&name);
+        if !applied {
+            // 条目删了、或探测期间连接字段被改：旧结果作废，不广播。
+            return;
+        }
+        let caps = yi_agent_runtime::models::load_catalog_from(&path)
+            .models
+            .into_iter()
+            .find(|m| m.name == name)
+            .and_then(|m| m.reasoning_capabilities);
+        let _ = crate::server::write_notification(
+            &hub,
+            &crate::protocol::Notification::ModelCapabilitiesChanged {
+                name,
+                reasoning_capabilities: caps,
+            },
+        )
+        .await;
+    });
+}
+
+/// upsert 成功后的探测判定。
+///
+/// 触发条件只有两种：**新建条目**（能力必为空），或**连接字段变了**（旧能力
+/// 已被 upsert 清空）。只改密钥、只改 `reasoning_effort` 都不该重测——前者不
+/// 影响档位支持，后者是用户偏好而非模型能力。
+fn maybe_probe_after_upsert(
+    state: &crate::rpc::AppState<'_>,
+    params: &serde_json::Value,
+    before: &yi_agent_runtime::models::ModelCatalog,
+) {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return;
+    }
+    let after = yi_agent_runtime::models::load_catalog_from(state.models_path);
+    let Some(entry) = after.models.iter().find(|m| m.name == name) else {
+        return;
+    };
+    let fingerprint_changed = match before.models.iter().find(|m| m.name == name) {
+        Some(old) => {
+            crate::model_rpc::entry_fingerprint(old) != crate::model_rpc::entry_fingerprint(entry)
+        }
+        None => true,
+    };
+    let no_capabilities = entry.reasoning_capabilities.is_none();
+    if !(fingerprint_changed || no_capabilities) {
+        return;
+    }
+    // 已经在探测（比如用户刚点了「重新探测」）：别插队，那一轮结果对本条目的
+    // 连接字段仍然有效，upsert 没有改动它们。
+    if !state.probes.try_begin(name) {
+        return;
+    }
+    spawn_probe(
+        state.hub,
+        state.probes,
+        state.models_path,
+        name.to_string(),
+        entry.clone(),
+    );
 }
