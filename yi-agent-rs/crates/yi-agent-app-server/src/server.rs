@@ -1581,7 +1581,7 @@ pub(crate) fn to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
 ///
 /// 它是通用的:登记表里**任何**要求常驻的项目都会被确保有一个活着的进程,
 /// 与是哪个插件无关。
-fn spawn_resident_watch_loop(resident_dir: PathBuf) {
+pub(crate) fn spawn_resident_watch_loop(resident_dir: PathBuf) {
     tokio::spawn(async move {
         loop {
             yi_agent_supervisors::watch::once(&resident_dir, &mut |projects| {
@@ -2009,7 +2009,7 @@ fn parse_relay_url(relay_url: &str) -> anyhow::Result<(String, String)> {
 /// `HOME` 缺失时 `resolve_global_env_path` 为 `None`，此时不迁移（避免在一个
 /// 凭空拼出的路径上写文件）。清单路径与 `RuntimeAttachments` 用的是同一个
 /// `models_path()`，保证迁移落点与运行期读点是同一个文件。
-fn migrate_legacy_model_keys_on_startup() {
+pub(crate) fn migrate_legacy_model_keys_on_startup() {
     if let Some(env_path) = yi_agent_runtime::config::resolve_global_env_path() {
         let outcome = yi_agent_runtime::migrate::migrate_model_keys(
             &env_path,
@@ -2037,7 +2037,7 @@ fn migrate_legacy_model_keys_on_startup() {
 /// （与看板时代那个 registry crate 的同名函数逐字同一条规则）。这一步是必须的：
 /// 删掉那个 crate 却只删依赖，迁移就会在一个空目录里找文件，老环境的项目静默
 /// 全部丢失。`HOME` 缺失时无从查找，直接跳过（与常驻登记自身的策略一致）。
-fn migrate_legacy_resident_requests_on_startup(resident_dir: &Path) {
+pub(crate) fn migrate_legacy_resident_requests_on_startup(resident_dir: &Path) {
     let Some(legacy_file) = crate::legacy_compat::legacy_board_registry_path() else {
         return;
     };
@@ -2204,9 +2204,10 @@ mod legacy_migration_tests {
     }
 
     /// 真实调用点:纯函数测得再细,没有调用者时验收 §6.6 仍不成立。
-    /// 两个生产入口(`run` 与 `serve_stdio_with_relay`)都必须调它。
+    /// 三个生产入口(`run`、`serve_stdio_with_relay`、`ws::serve_ws`)
+    /// 都必须调它——ws 是第三条入口，漏了它 `--listen ws://` 的首次运行就不迁移。
     #[test]
-    fn both_production_entries_run_the_migration_at_startup() {
+    fn every_production_entry_runs_the_migration_at_startup() {
         let production = production_source();
         let call = "migrate_legacy_resident_requests_on_startup(&resident_dir)".to_string();
         assert_eq!(
@@ -2214,6 +2215,64 @@ mod legacy_migration_tests {
             2,
             "`run` and `serve_stdio_with_relay` must each run the migration once"
         );
+
+        // ws 的调用在另一个文件里：本文件里数不到，必须单独看它。
+        let ws = include_str!("ws.rs");
+        let ws_production = ws
+            .split("#[cfg(test)]")
+            .next()
+            .expect("ws.rs must have a production part");
+        assert_eq!(
+            ws_production.matches(&call).count(),
+            1,
+            "`ws::serve_ws` is the third production entry and must migrate too"
+        );
+
+        // 会话期自愈循环同理：三条入口都要起，否则 ws 模式没有常驻兜底。
+        // 按**调用形态**收，别按函数名收——函数定义本身也含那个前缀。
+        assert_eq!(
+            production
+                .matches("spawn_resident_watch_loop(resident_dir.clone())")
+                .count(),
+            2
+        );
+        assert_eq!(
+            ws_production
+                .matches("spawn_resident_watch_loop(resident_dir)")
+                .count(),
+            1
+        );
+    }
+
+    /// 启动工作**不得**落在测试接缝 (`serve_ws_body`) 里。
+    ///
+    /// 接缝跑在 libtest 二进制内,`ensure_running` 会以 `current_exe() daemon
+    /// serve` 拉起子进程——那等于让每个 ws 测试把自己当 daemon 递归跑起来
+    /// (实测每个子进程 200% CPU,还会写用户真实的 `~/.yi-agent`)。
+    #[test]
+    fn the_ws_test_seam_does_no_startup_work() {
+        let ws = include_str!("ws.rs");
+        let production = ws
+            .split("#[cfg(test)]")
+            .next()
+            .expect("ws.rs must have a production part");
+        let seam = production
+            .split("pub(crate) async fn serve_ws_body(")
+            .nth(1)
+            .expect("the seam must exist")
+            .split("let resident_dir")
+            .nth(1)
+            .unwrap_or("");
+        for call in [
+            "migrate_legacy_model_keys_on_startup",
+            "migrate_legacy_resident_requests_on_startup",
+            "spawn_resident_watch_loop",
+        ] {
+            assert!(
+                !seam.contains(call),
+                "`serve_ws_body` is the test seam; `{call}` belongs in the production entry"
+            );
+        }
     }
 
     /// 迁移代码**不得**依赖那个已删的看板 registry crate:否则它会随它

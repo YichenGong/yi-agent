@@ -50,6 +50,31 @@ pub async fn serve_ws(
     workspaces: Arc<WorkspaceIndex>,
     pairing: Arc<PairingState>,
 ) -> anyhow::Result<()> {
+    // 启动期一次性工作。ws 是第三条生产入口,与 `run` / `serve_stdio_with_relay`
+    // 同构:漏了它,`app-server --listen ws://`(以及 `--relay` 的环回桥)的首次
+    // 运行就不迁移旧登记表,也没有会话期自愈循环——验收 §6.6 在这条路径上不成立。
+    //
+    // **放在这里而不是 `serve_ws_inner`**:后者是测试接缝,和 `serve_stdio` 同一
+    // 角色。测试跑在 libtest 二进制里,`current_exe()` 指向那个二进制,而
+    // `ensure_running` 会以 `current_exe() daemon serve` 拉起子进程——接缝里起
+    // 常驻循环,等于让每个 ws 测试递归地把自己当 daemon 跑起来(实测 200% CPU/
+    // 个,并写用户真实的 `~/.yi-agent`)。`run` 与 `serve_stdio` 的分工正是这样:
+    // 启动工作只在生产入口做。
+    let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
+    crate::server::migrate_legacy_model_keys_on_startup();
+    crate::server::migrate_legacy_resident_requests_on_startup(&resident_dir);
+    crate::server::spawn_resident_watch_loop(resident_dir);
+    serve_ws_body(listener, cfg, workspaces, pairing).await
+}
+
+/// [`serve_ws`] 去掉启动期工作的本体:可被测试直接调用(测试入参是隔离
+/// tempdir,不该迁移真实 `$HOME` 的登记表,更不该拉起真实 daemon)。
+pub(crate) async fn serve_ws_body(
+    listener: tokio::net::TcpListener,
+    cfg: RuntimeConfig,
+    workspaces: Arc<WorkspaceIndex>,
+    pairing: Arc<PairingState>,
+) -> anyhow::Result<()> {
     // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用,
     // 与 stdio 路径同构——工厂闭包是 `'static`,拿不到 `serve_ws_inner` 里的
     // `theme`,故先克隆一份专供工厂。
@@ -96,6 +121,11 @@ where
     // 反向依赖成环。
     let device_clients = install_device_registry(Arc::new(std::sync::Mutex::new(HashMap::new())));
 
+    // 启动期工作不在这里做:本函数是测试接缝(见 [`serve_ws`] 的说明),真起
+    // 常驻循环会让 libtest 二进制把 `current_exe()` 当 daemon 拉起来。`resident_dir`
+    // 仍在此解析,供主循环的常驻登记 RPC 使用。
+    let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
+
     let serve_hub = Arc::clone(&hub);
     // 主循环用克隆出的 config(抽取后 router 不再需要 cfg)。
     let serve_cfg = cfg.clone();
@@ -120,7 +150,7 @@ where
                 onboarding_preferences_path: crate::server::home_dir()
                     .join(".yi-agent")
                     .join("preferences.json"),
-                resident_dir: yi_agent_store::resident::default_dir().unwrap_or_default(),
+                resident_dir: resident_dir.clone(),
                 skills_home: crate::server::home_dir(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
@@ -573,7 +603,12 @@ mod tests {
         let (_device, token) = pairing.seed_device("test-phone", scope);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(serve_ws(listener, cfg, workspaces, Arc::clone(&pairing)));
+        let handle = tokio::spawn(serve_ws_body(
+            listener,
+            cfg,
+            workspaces,
+            Arc::clone(&pairing),
+        ));
         WsFixture {
             addr,
             token,
@@ -897,7 +932,7 @@ mod tests {
         )));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(serve_ws(listener, cfg, workspaces, Arc::clone(&relay)));
+        let handle = tokio::spawn(serve_ws_body(listener, cfg, workspaces, Arc::clone(&relay)));
 
         // 手机用桌面铸出的码连接 ws 兑换,必须成功拿到 token。
         let (mut ws, _) = tokio_tungstenite::connect_async(format!(
