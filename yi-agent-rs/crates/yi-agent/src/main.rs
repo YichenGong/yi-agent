@@ -1,5 +1,6 @@
 //! yi-agent CLI 入口。
 
+mod build_info;
 mod config;
 mod control_commands;
 mod llm_prefix;

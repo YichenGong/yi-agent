@@ -24,7 +24,12 @@ jobs:
       # cargo 连 target 目录都建不出来，构建 1~3 秒即失败。
       CARGO_TERM_COLOR: always
     steps:
+      # fetch-depth: 0 是必须的：构建期版本标识靠 `git describe --tags`
+      # 判定 release/dev，浅克隆里没有 tag，二进制会被标成 `+nogit`，
+      # 流水线末尾的门禁会拒绝发布。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Prepare runner environment
         run: |
@@ -106,6 +111,21 @@ jobs:
           # 避免把「环境不对」伪装成「代码编译错误」。
           source scripts/setup-build-env.sh
           just package-all
+
+      - name: Verify the binary reports the release version
+        working-directory: yi-agent-rs
+        run: |
+          source "$HOME/.cargo/env"
+          # 交叉编译的另两个 target 在本机跑不起来；版本串由同一份源码、
+          # 同一次 git 状态生成，检查 host target 即可代表全部产物。
+          HOST=$(rustc -vV | sed -n 's/^host: //p')
+          BIN="${CARGO_TARGET_DIR:-target}/$HOST/release/yi-agent"
+          if [ ! -x "$BIN" ]; then
+            echo "ERROR: expected the host binary at $BIN"
+            exit 1
+          fi
+          bash scripts/check-release-version.sh "${{ steps.version.outputs.version }}" \
+            "$("$BIN" --version | awk '{print $2}')"
 
       - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2

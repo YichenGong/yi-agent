@@ -25,7 +25,7 @@ pub struct Layout {
 impl Layout {
     pub fn for_workdir(workdir: &Path) -> Self {
         let state_base = workdir.join(".yi-agent");
-        let runtime_dir = state_base.join("runtime");
+        let runtime_dir = crate::daemon::runtime_dir(workdir);
         Self {
             workdir: workdir.to_path_buf(),
             state_base,
@@ -57,13 +57,7 @@ impl Layout {
     }
 
     fn global_preferences_path(&self) -> Option<PathBuf> {
-        std::env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .map(|home| {
-                PathBuf::from(home)
-                    .join(".yi-agent")
-                    .join("preferences.json")
-            })
+        yi_agent_store::paths::home_join("preferences.json")
     }
 
     fn project_preferences_path(&self) -> PathBuf {

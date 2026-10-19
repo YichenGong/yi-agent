@@ -13,7 +13,7 @@ pub type Config = yi_agent_runtime::config::RuntimeConfig;
 
 /// clap CLI 参数定义。
 #[derive(clap::Parser, Debug)]
-#[command(name = "yi-agent", version, about = "Interactive AI agent CLI")]
+#[command(name = "yi-agent", version = crate::build_info::CLAP_VERSION, about = "Interactive AI agent CLI")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

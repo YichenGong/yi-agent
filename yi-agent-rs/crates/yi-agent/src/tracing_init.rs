@@ -56,6 +56,8 @@ pub fn init(debug: bool) -> tracing_appender::non_blocking::WorkerGuard {
     tracing::info!(
         trace_file = %filepath.display(),
         stderr_level = %std::env::var("YI_LOG").unwrap_or_else(|_| "(off)".to_string()),
+        version = crate::build_info::VERSION,
+        build_kind = crate::build_info::BUILD_KIND,
         "tracing initialized"
     );
 
@@ -74,8 +76,7 @@ fn file_filter(debug: bool) -> &'static str {
 }
 
 fn trace_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".yi-agent").join("trace")
+    yi_agent_store::paths::trace_dir().unwrap_or_else(|| PathBuf::from(".yi-agent").join("trace"))
 }
 
 /// 生成本地时间戳字符串 `YYYYMMDD-HHMMSS`。

@@ -35,12 +35,10 @@ pub struct WorkspaceIndex {
     lock: Mutex<()>,
 }
 
-/// 全局索引默认路径:`$HOME/.yi-agent/workspaces.json`。
+/// 全局索引默认路径：`<instance_home>/workspaces.json`。
 pub fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".yi-agent").join("workspaces.json")
+    yi_agent_store::paths::home_join("workspaces.json")
+        .unwrap_or_else(|| PathBuf::from(".yi-agent").join("workspaces.json"))
 }
 
 impl WorkspaceIndex {

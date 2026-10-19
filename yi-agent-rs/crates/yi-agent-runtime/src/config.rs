@@ -181,12 +181,9 @@ fn load_one_env(path: &Path) {
     }
 }
 
-/// 解析全局 .env 路径:~/.yi-agent/.env
+/// 解析全局 .env 路径：`<instance_home>/.env`
 pub fn resolve_global_env_path() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .map(|h| h.join(".yi-agent").join(".env"))
+    yi_agent_store::paths::home_join(".env")
 }
 
 /// Resolve the effective workdir without loading provider configuration.

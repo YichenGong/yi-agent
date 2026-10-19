@@ -5216,6 +5216,7 @@ dependencies = [
  "tokio",
  "tower",
  "yi-agent-runtime",
+ "yi-agent-store",
 ]
 
 [[package]]

@@ -330,9 +330,85 @@ pub(crate) type EnsureDaemon = Arc<dyn Fn(&Path) -> Result<bool, String> + Send 
 /// 生产环境的 `$HOME`。未设置时回退空路径——与 `resident_dir` 同一策略：宁可把
 /// 值守装进一个无人读取的目录，也不要因为环境缺失让整个服务起不来。
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    watchman_home_from(std::env::var_os("HOME").as_deref())
+}
+
+pub(crate) fn watchman_home_from(home: Option<&std::ffi::OsStr>) -> PathBuf {
+    home.map(PathBuf::from).unwrap_or_default()
+}
+
+/// 实例状态根。preferences、skills 等随实例走。
+pub(crate) fn instance_home_dir() -> PathBuf {
+    skills_home_from(
+        std::env::var_os("YI_AGENT_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// `skill/*` 需要一个「home 形状」的目录（它自己会拼 `.yi-agent/skills`）。
+/// 传实例状态根的父目录，结果与 `paths::skills_dir()` 一致。
+pub(crate) fn skills_home_dir() -> PathBuf {
+    yi_agent_store::paths::instance_root().unwrap_or_default()
+}
+
+/// 注入版：把 `YI_AGENT_HOME` 归一化成实例状态根。
+pub(crate) fn skills_home_from(
+    override_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(dir) = override_home.filter(|v| !v.is_empty()) {
+        let dir = PathBuf::from(dir);
+        return if dir.file_name() == Some(std::ffi::OsStr::new(".yi-agent")) {
+            dir
+        } else {
+            dir.join(".yi-agent")
+        };
+    }
+    home.map(|h| PathBuf::from(h).join(".yi-agent"))
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod path_semantics_tests {
+    use super::*;
+
+    #[test]
+    fn watchman_home_is_the_real_home_not_the_instance_home() {
+        assert_eq!(
+            watchman_home_from(Some(std::ffi::OsStr::new("/Users/me"))),
+            PathBuf::from("/Users/me")
+        );
+    }
+
+    #[test]
+    fn skills_home_follows_the_instance_override_and_normalizes_it() {
+        assert_eq!(
+            skills_home_from(
+                Some(std::ffi::OsStr::new("/tmp/dev-a")),
+                Some(std::ffi::OsStr::new("/Users/me"))
+            ),
+            PathBuf::from("/tmp/dev-a/.yi-agent")
+        );
+    }
+
+    #[test]
+    fn skills_home_falls_back_to_the_real_home_layout() {
+        assert_eq!(
+            skills_home_from(None, Some(std::ffi::OsStr::new("/Users/me"))),
+            PathBuf::from("/Users/me/.yi-agent")
+        );
+    }
+
+    #[test]
+    fn an_empty_override_falls_back_to_the_real_home_layout() {
+        assert_eq!(
+            skills_home_from(
+                Some(std::ffi::OsStr::new("")),
+                Some(std::ffi::OsStr::new("/Users/me"))
+            ),
+            PathBuf::from("/Users/me/.yi-agent")
+        );
+    }
 }
 
 /// 生产的安装闭包：设置 `YI_AGENT_DISABLE_WATCHMAN` 时退化成 no-op。
@@ -1638,9 +1714,9 @@ where
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
                 .unwrap_or_default(),
-            onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
+            onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
-            skills_home: home_dir(),
+            skills_home: skills_home_dir(),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1724,9 +1800,9 @@ where
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
                 .unwrap_or_default(),
-            onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
+            onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
-            skills_home: home_dir(),
+            skills_home: skills_home_dir(),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

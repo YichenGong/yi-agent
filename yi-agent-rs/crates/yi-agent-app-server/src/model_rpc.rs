@@ -573,7 +573,6 @@ mod tests {
             .and_then(|m| m.reasoning_capabilities)
     }
 
-    #[test]
     /// 第一个条目成为默认：否则"新增了模型却仍然报未配置"会让人无从理解。
     #[test]
     fn upsert_makes_the_first_entry_the_default() {
@@ -607,6 +606,8 @@ mod tests {
         drop(dir);
     }
 
+    /// 连接字段没变时，重新 upsert 不得清掉已探测到的能力。
+    #[test]
     fn upsert_keeps_capabilities_when_connection_fields_are_unchanged() {
         let (_dir, path) = catalog_path();
         call(&path, "model/upsert", entry_json("A")).unwrap();

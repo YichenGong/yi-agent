@@ -8,11 +8,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// 宿主通用目录：`$HOME/.yi-agent`。`HOME` 缺失返回 `None`。
+/// 宿主实例目录：`YI_AGENT_HOME` 或 `$HOME/.yi-agent`。
 pub fn default_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(".yi-agent"))
+    crate::paths::instance_home()
 }
 
 pub fn registry_path(dir: &Path) -> PathBuf {
