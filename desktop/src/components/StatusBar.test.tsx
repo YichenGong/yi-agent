@@ -42,4 +42,33 @@ describe("StatusBar", () => {
     fireEvent.click(screen.getByRole("button", { name: "重新配对" }));
     expect(onRepair).toHaveBeenCalledTimes(1);
   });
+
+  it("shows the usage through rolling digits plus one screen-reader sentence", () => {
+    const { container } = render(
+      <StatusBar
+        cwd="/w"
+        status="connected"
+        usage={{ model: "m", input: 1234, output: 5678, cacheRead: 0, cacheWrite: 0 }}
+        usageId="thread-1"
+      />,
+    );
+    // 可见的数字是翻滚窗口（aria-hidden），完整文本必须另有一份。
+    expect(container.querySelectorAll(".rolling-number")).toHaveLength(2);
+    const sentence = container.querySelector(".sr-only");
+    expect(sentence?.textContent).toBe("1234 in / 5678 out");
+    expect(screen.getByRole("button", { name: "Token usage details" })).toBeTruthy();
+  });
+
+  it("opens the usage panel on click", () => {
+    render(
+      <StatusBar
+        cwd="/w"
+        status="connected"
+        usage={{ model: "m", input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }}
+        usageId="thread-1"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Token usage details" }));
+    expect(screen.getByRole("dialog")).toBeTruthy();
+  });
 });

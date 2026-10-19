@@ -1,17 +1,24 @@
 import { useState, type ReactNode } from "react";
 import type { Usage } from "../lib/protocol";
+import { RollingNumber } from "./RollingNumber";
 import { UsagePanel } from "./UsagePanel";
 
 export function StatusBar({
   cwd,
   status,
   usage,
+  usageId,
   actions,
   onRepair,
 }: {
   cwd: string | null;
   status: string;
   usage: Usage | null;
+  /**
+   * 当前会话标识。变化时用量数字直接跳到终值——那是换成另一份数据，
+   * 不该从上一个会话的数字滚动过来。
+   */
+  usageId?: string | null;
   /**
    * 追加在右端的控件（用量之后）。给「重新打开某个可收起面板」这类常驻入口用：
    * 入口若跟着面板一起收起，就再也没有东西能把它打开。
@@ -40,13 +47,25 @@ export function StatusBar({
         {usage && (
           <button
             type="button"
-            className="cursor-pointer font-mono hover:text-fg"
+            className="inline-flex cursor-pointer items-center gap-1 font-mono hover:text-fg"
             aria-expanded={showUsage}
             aria-controls="usage-panel"
             aria-label="Token usage details"
             onClick={() => setShowUsage((v) => !v)}
           >
-            {usage.input} in / {usage.output} out
+            {/*
+             * 机械数字对读屏没有意义（每一位都是整条 0-9），故整块 `aria-hidden`
+             * 并另给一句完整文本：读屏与文本查询拿到的仍是「1234 in / 5678 out」。
+             */}
+            <span className="sr-only">
+              {usage.input} in / {usage.output} out
+            </span>
+            <span aria-hidden="true" className="inline-flex items-center gap-1">
+              <RollingNumber value={usage.input} usageKey={usageId} />
+              <span>in /</span>
+              <RollingNumber value={usage.output} usageKey={usageId} />
+              <span>out</span>
+            </span>
           </button>
         )}
         {onRepair && (

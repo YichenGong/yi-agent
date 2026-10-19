@@ -433,3 +433,41 @@ html[data-mobile="true"] {
 [data-mobile="true"] .settings-panel select {
   font-size: 16px;
 }
+
+/*
+ * 状态栏用量数字的翻滚窗口。
+ *
+ * `.rolling-digit` 是只露出一行高的裁切窗口，`.rolling-strip` 是竖向数字带；
+ * 位移由组件内联的 `transform` 驱动，这里只管几何：一个字符宽、一个字符高。
+ * `tabular-nums` 保证等宽，窗口不会随数字宽度抖动。
+ *
+ * `line-height: 1em` 是硬约束：组件的位移单位是 `em`，一条数字必须正好占 1em，
+ * 否则窗口里会露出相邻行的边。用 `em` 而不是 `1`，是为了不受按钮继承行高的影响。
+ */
+.rolling-number {
+  display: inline-flex;
+  align-items: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.rolling-digit {
+  position: relative;
+  display: inline-block;
+  width: 1ch;
+  height: 1em;
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+.rolling-strip {
+  display: flex;
+  flex-direction: column;
+  will-change: transform;
+}
+
+.rolling-strip > span {
+  display: block;
+  height: 1em;
+  line-height: 1em;
+  text-align: center;
+}
