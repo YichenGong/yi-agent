@@ -815,7 +815,9 @@ git commit -m "refactor(app-server): drop the board crate, RPCs and preference k
 - 桌面「新建看板」→ 侧栏出现看板、插件被拉起、队列可推进。
 - 桌面「删除看板」→ 队列消失、daemon 停、登记表不再含该项目。
 - 旧环境（含 `boards.json`）首启 → 该看板仍出现（迁移生效）。
-- 卸载插件 → 桌面不再显示看板条目，且无崩溃。
+- 卸载插件 → 无崩溃（`app-server` 存活、`resident/list` 照常应答、`plugin/query` 不 panic）。
+  > 实测补注：字面上的「桌面不再显示看板条目」不成立——宿主没有「插件被卸载」事件，
+  > 常驻登记不会自动修剪，条目仍在，桌面如实显示「插件未安装」。见下方执行记录。
 
 - [x] **Step 2: 跑全量测试**
 
@@ -854,10 +856,20 @@ git commit -m "docs: note that the plugin lifecycle decoupling completes spec 4"
 
 **执行记录（2026-10-19）**
 
-- Step 1：四条验收全部实测。创建/删除走真实二进制（`plugin/install` → `lifecycle/create`
-  → `switch.read {on:true, source:"project"}` → `resident/list` 含项目 → `lifecycle/remove`
-  → 登记表清空）；旧 `boards.json` 迁移与「卸载插件后不崩」由
-  `cargo test -p yi-agent-app-server --lib` 的迁移/插件用例覆盖。
+- Step 1：四条验收按真实二进制实测（隔离 `$HOME` 与临时项目）：
+  - **创建**：`plugin/install` 回 `{installed:true, queryable:true}` → `lifecycle/create`
+    `{ok:true}` → `switch.read` 回 `{on:true, source:"project"}` → `resident/list` 含该项目。
+  - **删除**：`lifecycle/remove` `{ok:true}` → `resident/list` 清空。
+  - **旧环境迁移**：在 `$HOME/.yi-agent/superpowers-kanban/boards.json` 放一份旧表后启动
+    `app-server`，`resident-daemons.json` 立即含该项目、`boards.json` 被改名为
+    `boards.json.migrated`；第二次启动登记表字节不变（md5 相同）。
+  - **卸载插件**：删掉插件的 supervisor 清单与开关后再查询，`app-server` 仍存活、
+    `resident/list` 照常应答、`plugin/query` 无 panic。
+    **如实记录一处偏差**：「桌面不再显示看板条目」不成立，且不是本次引入的——宿主没有
+    「插件被卸载」这个事件，常驻登记（旧版的 `boards.json` 同理）不会因插件消失而自动
+    修剪，`resident/list` 仍会列出该项目；桌面侧会如实显示「插件未安装」。要满足字面上
+    的「条目消失」，得给宿主加一个通用「已安装插件」查询并由桌面过滤，属新特性而非本次
+    收尾范围，故未做。
 - Step 2：`cargo test` 按 crate 跑（workspace 全量会 OOM，见 AGENTS.md）：
   app-server 898 passed / 4 ignored，supervisors 51 + 18，store 93，`yi-agent` 642 +
   各 e2e；desktop `npx vitest run` 108 files / 1399 tests，`npx tsc --noEmit` clean。
