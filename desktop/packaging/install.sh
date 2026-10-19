@@ -360,6 +360,50 @@ $(watchman_plists)
 EOF
 }
 
+ask_answer() {
+  if [ -n "${YI_AGENT_ANSWER:-}" ]; then
+    printf '%s\n' "$YI_AGENT_ANSWER"
+    return 0
+  fi
+  local answer
+  printf '继续？[Y/n] ' >&2
+  read -r answer || answer=""
+  printf '%s\n' "$answer"
+}
+
+confirm_stop() {
+  local count="$1" answer="$2"
+  [ "$count" -eq 0 ] && return 0
+  # 显式拒绝优先于「非交互默认继续」，否则 `YI_AGENT_ANSWER=n`
+  # 或手工输入 n 会被静默忽略。
+  case "$answer" in
+    n|N|no|NO) return 1 ;;
+  esac
+  # 非交互环境不阻塞等待，默认继续。
+  if [ -z "${YI_AGENT_NONINTERACTIVE:-}" ] && [ ! -t 0 ] && [ -z "${YI_AGENT_ANSWER:-}" ]; then
+    return 0
+  fi
+  return 0
+}
+
+# SIGTERM 每个属于本 App 的 daemon；返回仍未退出的数量。
+stop_daemons() {
+  local app="$1"
+  local pid remaining=0
+  for pid in $(daemon_pids "$app"); do
+    kill_pid "$pid"
+  done
+  for pid in $(daemon_pids "$app"); do
+    local i
+    for i in $(seq 1 25); do
+      pid_alive "$pid" || break
+      sleep 0.2
+    done
+    pid_alive "$pid" && remaining=$((remaining + 1))
+  done
+  printf '%s\n' "$remaining"
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -euo pipefail
   main "$@"

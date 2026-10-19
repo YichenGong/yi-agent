@@ -239,5 +239,36 @@ assert_eq "dead_plists removes only fully-dead entries" \
   "$(YI_AGENT_LAUNCH_AGENTS_DIR="$LA" YI_AGENT_LAUNCHCTL_CMD=false \
      dead_plists "/Applications/yi-agent.app" | while read -r p; do plist_label "$p"; done | tr '\n' ' ' | sed 's/ $//')"
 
+# --- confirm_stop（纯函数，便于测） ---
+assert_eq "confirm_stop true when nothing to stop" "yes" \
+  "$(confirm_stop 0 "" && echo yes || echo no)"
+assert_eq "confirm_stop true on default yes" "yes" \
+  "$(confirm_stop 2 "y" && echo yes || echo no)"
+assert_eq "confirm_stop true on empty answer" "yes" \
+  "$(confirm_stop 2 "" && echo yes || echo no)"
+assert_eq "confirm_stop false on n" "no" \
+  "$(confirm_stop 2 "n" && echo yes || echo no)"
+assert_eq "confirm_stop false on N" "no" \
+  "$(confirm_stop 2 "N" && echo yes || echo no)"
+
+# --- stop_daemons ---
+STOPPS="$TMPROOT/ps-stop.txt"
+cat > "$STOPPS" <<EOF
+  701 $APPDIR2/Contents/MacOS/yi-agent daemon serve
+  702 /Users/dev/x/target/debug/yi-agent daemon serve
+EOF
+STOPLSOF="$TMPROOT/lsof-stop.txt"
+cat > "$STOPLSOF" <<'EOF'
+yi-agent 701 u txt REG 1,15 42 100 /Applications/yi-agent.app/Contents/MacOS/yi-agent
+yi-agent 702 u txt REG 1,15 42 101 /Users/dev/x/target/debug/yi-agent
+EOF
+STOPLOG="$TMPROOT/stop.log"
+YI_AGENT_PS_CMD="cat $STOPPS" \
+YI_AGENT_LSOF_CMD="cat $STOPLSOF" \
+YI_AGENT_KILL_CMD="echo \$1 >> $STOPLOG" \
+YI_AGENT_PID_ALIVE_CMD=false \
+stop_daemons "$APPDIR2" >/dev/null 2>&1
+assert_eq "stop_daemons stops only the app daemon" "701" "$(cat "$STOPLOG" 2>/dev/null)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
