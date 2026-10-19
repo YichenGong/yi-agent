@@ -161,7 +161,6 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
         if settings.model.trim().is_empty() {
             return MigrationOutcome::MissingModel;
         }
-        let provider = settings.provider.clone();
         let mut catalog = existing.clone();
         let name = {
             let base = settings.model.trim().to_string();
