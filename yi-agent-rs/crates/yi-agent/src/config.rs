@@ -187,9 +187,12 @@ pub enum Command {
     },
     /// 常驻值守：保证登记在册的项目各自有一个活着的 daemon。
     ///
-    /// 通用子命令。`boards` 是它的旧名（launchd plist 装过旧名），过渡期保留为
-    /// 隐藏别名；Task 6 删 `yi-agent-boards` 时一并移除。
-    #[command(alias = "boards")]
+    /// 通用子命令：它只读通用常驻登记，不认识任何插件。
+    ///
+    /// **注意（一版风险）**：这里曾经有个隐藏别名 `boards`，是为「已经装过旧
+    /// launchd plist 的机器」留的过渡期兼容。别名已随看板面删除——若某台机器的
+    /// plist 尚未重装（仍跑 `boards watch`），它会在下一次登录时解析失败。
+    /// 复原办法是重装值守（`ui/settings/write` 开关一次，或重装 app）。
     Resident {
         #[command(subcommand)]
         action: ResidentAction,

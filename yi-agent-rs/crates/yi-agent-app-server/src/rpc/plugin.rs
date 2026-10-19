@@ -7,13 +7,13 @@
 //! `serve()` 翻回 `continue`,与搬移前逐字一致。
 //!
 //! Task 4 起本域**脱离主循环**执行:`serve()` 把处理搬进 `tokio::spawn`,故状态改为
-//! [`crate::rpc::BoardPluginState`](全是 owned/`Arc`,可 move),应答改写
+//! [`crate::rpc::PluginChannelState`](全是 owned/`Arc`,可 move),应答改写
 //! [`crate::rpc::write_or_fatal`]——写失败不再能靠 `?` 传播,改由 fatal 通道上报。
 
 use serde_json::json;
 
 use crate::protocol::{RequestEnvelope, RequestId, RpcError};
-use crate::rpc::{BoardPluginState, Flow, write_or_fatal};
+use crate::rpc::{Flow, PluginChannelState, write_or_fatal};
 use crate::server::{
     err_response, list_installed_plugins, ok_response, plugin_query, plugin_query_self,
     plugin_scope, project_arg,
@@ -25,15 +25,15 @@ use crate::server::{
 /// 里的 `continue`);[`Flow::Unknown`] 表示方法不在本域内,交回 `serve()` 的原始
 /// dispatch(走既有的 `method_not_found`),响应形状与搬移前一致。
 pub(crate) async fn handle_shared(
-    state: &BoardPluginState,
+    state: &PluginChannelState,
     req: &RequestEnvelope,
     id: RequestId,
 ) -> anyhow::Result<Flow> {
     match req.method.as_str() {
         "plugin/query" => {
-            // `project` names the project being queried, not the
-            // server's cwd: the whole point of the RPC is to reach
-            // a board that lives under another project's daemon.
+            // `project` names the project being queried, not the server's cwd:
+            // the whole point of the RPC is to reach a plugin that lives under
+            // another project's daemon.
             let Some(project) = project_arg(&req.params) else {
                 write_or_fatal(
                     state,
@@ -64,7 +64,7 @@ pub(crate) async fn handle_shared(
                     write_or_fatal(
                         state,
                         id.clone(),
-                        err_response(id, RpcError::board_query(error.code, error.message)),
+                        err_response(id, RpcError::plugin_query_error(error.code, error.message)),
                     )
                     .await
                 }
@@ -107,7 +107,7 @@ pub(crate) async fn handle_shared(
                     write_or_fatal(
                         state,
                         id.clone(),
-                        err_response(id, RpcError::board_query(error.code, error.message)),
+                        err_response(id, RpcError::plugin_query_error(error.code, error.message)),
                     )
                     .await
                 }
@@ -134,7 +134,7 @@ pub(crate) async fn handle_shared(
                     write_or_fatal(
                         state,
                         id.clone(),
-                        err_response(id, RpcError::board_query(error.code, error.message)),
+                        err_response(id, RpcError::plugin_query_error(error.code, error.message)),
                     )
                     .await
                 }

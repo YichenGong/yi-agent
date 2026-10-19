@@ -168,11 +168,7 @@ pub(crate) type ViewFrames = Arc<tokio::sync::Mutex<HashMap<String, crate::git_d
 pub(crate) struct RuntimeAttachments {
     pub(crate) runtimes: ProjectRuntimes,
     pub(crate) thread_roots: ThreadRoots,
-    /// Where the board registry lives. Injectable for the same reason
-    /// `WorkspaceIndex` is: the `board/*` RPCs must be testable without
-    /// touching the developer's real `~/.yi-agent`.
-    pub(crate) board_dir: PathBuf,
-    /// Where `models.json` lives. Injectable for the same reason `board_dir`
+    /// Where `models.json` lives. Injectable for the same reason `resident_dir`
     /// is: `model/*` must be testable without writing the developer's real
     /// machine-level catalog (and its API keys).
     pub(crate) models_path: PathBuf,
@@ -185,23 +181,17 @@ pub(crate) struct RuntimeAttachments {
     /// first-run guide must never touch the developer's real preferences file.
     pub(crate) onboarding_preferences_path: PathBuf,
     /// Where the generic resident-daemon registry lives (`$HOME/.yi-agent`).
-    /// Injectable for the same reason `board_dir` is: `board/create` must be
-    /// testable without writing the developer's real resident registry.
+    /// Injectable: `resident/*` must be testable without writing the
+    /// developer's real resident registry.
     pub(crate) resident_dir: PathBuf,
-    /// 拼 skill 根目录用的「家目录」。Injectable for the same reason `board_dir`
-    /// is: `skill/list` / `skill/read` must be testable without reading the
-    /// developer's real `~/.yi-agent/skills`.
+    /// 拼 skill 根目录用的「家目录」。Injectable for the same reason
+    /// `resident_dir` is: `skill/list` / `skill/read` must be testable without
+    /// reading the developer's real `~/.yi-agent/skills`.
     pub(crate) skills_home: PathBuf,
-    /// The absolute path of the `superpowers-kanban` executable written into
-    /// each project's supervisor manifest. Injectable for the same reason
-    /// `board_dir` is: `board/create` must be testable without the plugin being
-    /// installed on the machine.
+    /// The absolute path of a plugin executable, resolved by name from `PATH`.
+    /// Generic: names no plugin and is only ever handed to the plugin channel.
+    /// Injectable so a test never depends on the machine's installation.
     pub(crate) plugin_command: PathBuf,
-    /// How `board/create` starts a project's daemon. Injectable for the same
-    /// reason `board_dir` is: a test must not spawn a real detached process,
-    /// and the app's production launcher is what an integration test would
-    /// otherwise have to reproduce.
-    pub(crate) launcher: BoardLauncher,
     /// 桌面主题句柄：`ui/settings/read|write` 维护它，每个 thread 的
     /// `set_theme` 工具也持同一实例，故任一路径改主题都会落盘 + 广播。
     pub(crate) theme: crate::theme_tool::ThemeHandle,
@@ -236,18 +226,26 @@ pub(crate) struct RuntimeAttachments {
     pub(crate) lead_replies: crate::lead::LeadReplies,
 }
 
-/// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
-pub(crate) type BoardLauncher = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
-
 /// Installs the resident watchman (macOS LaunchAgent) for `exe` under `home`;
-/// see [`yi_agent_boards::watchman::install`].
+/// see [`yi_agent_supervisors::watchman::install`].
 pub(crate) type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
 
 /// Removes the resident watchman under `home`; see
-/// [`yi_agent_boards::watchman::uninstall`].
+/// [`yi_agent_supervisors::watchman::uninstall`].
 pub(crate) type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
 
-/// 生产环境的 `$HOME`。未设置时回退空路径——与 `board_dir` 同一策略：宁可把
+/// 宿主生产入口注入的插件命令：按插件名在 `PATH` 上解析。
+///
+/// 名字是宿主的**配置**，不是宿主的语义：`plugin_command` 只是交给通用插件通道的
+/// 一个绝对路径。解析不到时回退空路径——宿主不该因为某个插件没装就起不来（与
+/// `resident_dir` 同一策略）。
+pub(crate) fn default_plugin_command() -> Option<PathBuf> {
+    crate::plugin_worktree::resolve_plugin_command(
+        crate::legacy_compat::SUPERPOWERS_KANBAN_REQUESTER,
+    )
+}
+
+/// 生产环境的 `$HOME`。未设置时回退空路径——与 `resident_dir` 同一策略：宁可把
 /// 值守装进一个无人读取的目录，也不要因为环境缺失让整个服务起不来。
 pub(crate) fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -257,18 +255,18 @@ pub(crate) fn home_dir() -> PathBuf {
 
 /// 生产的安装闭包：设置 `YI_AGENT_DISABLE_WATCHMAN` 时退化成 no-op。
 ///
-/// 这个开关是为那个**驱动真实二进制**的 e2e（`yi-agent/tests/board_e2e.rs`）而设：
-/// 它以 `YI_AGENT_BOARD_E2E` 为闸、跑的是生产接线，于是 `board/create` 里的
-/// 「首次创建时装值守」会走到这里。不拦的话它会在开发机真实的 launchd 域里执行
-/// `launchctl bootstrap gui/<uid>`，并往真实的 `~/Library/LaunchAgents` 写 plist——
-/// 测试绝不能碰宿主 launchd。为此 e2e 置该环境变量即可让安装/卸载变成空操作。
+/// 这个开关是为那些**驱动真实二进制**的 e2e 而设：它们跑的是生产接线，于是
+/// `ui/settings/write` 的「打开开关时装值守」会走到这里。不拦的话它会在开发机
+/// 真实的 launchd 域里执行 `launchctl bootstrap gui/<uid>`，并往真实的
+/// `~/Library/LaunchAgents` 写 plist——测试绝不能碰宿主 launchd。为此 e2e 置该
+/// 环境变量即可让安装/卸载变成空操作。
 ///
 /// 只影响生产接线：测试用的 harness 各自注入记账闭包（见 `Harness`），不经过这里。
 pub(crate) fn production_watchman_install() -> WatchmanInstall {
     if std::env::var_os("YI_AGENT_DISABLE_WATCHMAN").is_some() {
         return Arc::new(|_exe: &Path, _home: &Path| Ok(()));
     }
-    Arc::new(yi_agent_boards::watchman::install)
+    Arc::new(yi_agent_supervisors::watchman::install)
 }
 
 /// 生产的卸载闭包；`YI_AGENT_DISABLE_WATCHMAN` 开关同
@@ -277,27 +275,7 @@ pub(crate) fn production_watchman_uninstall() -> WatchmanUninstall {
     if std::env::var_os("YI_AGENT_DISABLE_WATCHMAN").is_some() {
         return Arc::new(|_home: &Path| Ok(()));
     }
-    Arc::new(yi_agent_boards::watchman::uninstall)
-}
-
-/// 开关为开、且现有 plist 未指向当前可执行文件时安装值守。
-///
-/// best-effort：安装失败只记日志。调用方是 `board/create`，创建一个看板不该
-/// 因为装不上开机自启而整体失败。`EXE` 换位置也要重装（升级后常见），故判据是
-/// [`yi_agent_boards::watchman::is_installed_for`] 而非「plist 是否存在」。
-pub(crate) fn ensure_watchman_installed(workdir: &Path, home: &Path, install: &WatchmanInstall) {
-    if !crate::settings_store::load_watchman_enabled(workdir) {
-        return;
-    }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    if yi_agent_boards::watchman::is_installed_for(home, &exe) {
-        return;
-    }
-    if let Err(error) = install(&exe, home) {
-        tracing::warn!(%error, "failed to install the board watchman");
-    }
+    Arc::new(yi_agent_supervisors::watchman::uninstall)
 }
 
 /// The key that identifies one project directory across this process.
@@ -1044,7 +1022,7 @@ fn build_runtime_tooling(
     let is_lead = crate::lead_memory::is_lead_thread(&store, thread_id);
     let state_dir = Path::new(&project_key);
     let session_cwd = state_dir.parent().unwrap_or(state_dir);
-    if !is_lead && !crate::thread_store::is_kanban_worktree(session_cwd) {
+    if !is_lead && !crate::plugin_worktree::is_plugin_worktree(session_cwd) {
         registry.register(Arc::new(
             crate::lead::AskLeadTool::new(lead_inbox, project_key, thread_id.to_string())
                 // 回信能力**必须**在这里接上:漏掉它没有编译错误,`blocking: true`
@@ -1210,18 +1188,19 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
     }
 }
 
-/// Why a board query produced no answer.
+/// Why a plugin-channel query produced no answer.
 ///
-/// `code` is the stable string the UI branches on: "there is no board here" is
-/// a different remedy from "the daemon is down" and from "the plugin is not
-/// installed", and a bare message collapsed all three into one.
+/// `code` is the stable string the UI branches on: "the daemon is down" is a
+/// different remedy from "the plugin is not installed", and a bare message
+/// collapsed the reasons into one. The host attaches no board meaning here —
+/// whether any given answer exists is the daemon's business.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BoardQueryError {
+pub(crate) struct PluginQueryError {
     pub(crate) code: &'static str,
     pub(crate) message: String,
 }
 
-impl BoardQueryError {
+impl PluginQueryError {
     fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -1230,7 +1209,7 @@ impl BoardQueryError {
     }
 }
 
-impl std::fmt::Display for BoardQueryError {
+impl std::fmt::Display for PluginQueryError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}: {}", self.code, self.message)
     }
@@ -1238,9 +1217,9 @@ impl std::fmt::Display for BoardQueryError {
 
 /// Ask a supervised plugin a question and return its answer verbatim.
 ///
-/// The host attaches no meaning to `method` or `params`, and unwraps no board
-/// shape here: this is a generic channel, so the UI (not the server) owns what a
-/// card or a switch field means.
+/// The host attaches no meaning to `method` or `params`, and unwraps no shape
+/// here: this is a generic channel, so the UI (not the server) owns what any
+/// particular field means.
 ///
 /// `project` is both where the plugin is installed and where its daemon runs:
 /// the manifest lives at `<project>/.yi-agent/supervisors/`, the socket at
@@ -1249,28 +1228,28 @@ impl std::fmt::Display for BoardQueryError {
 /// (or none) — the "clicked and nothing happened" bug.
 ///
 /// Deliberately **not** gated on any registry: whether an answer exists is the
-/// socket's business, not the host's. Gating it on "does this project have a
-/// board" made the generic channel refuse projects the plugin could have served,
-/// and left the host knowing what a board is.
+/// socket's business, not the host's. Gating it on a project-level registry made
+/// the generic channel refuse projects the plugin could have served, and left the
+/// host owning plugin-specific vocabulary.
 pub(crate) fn plugin_query(
     project: &Path,
     method: &str,
     plugin: &str,
     params: serde_json::Value,
-) -> Result<serde_json::Value, BoardQueryError> {
+) -> Result<serde_json::Value, PluginQueryError> {
     if plugin.is_empty() {
-        return Err(BoardQueryError::new(
+        return Err(PluginQueryError::new(
             "invalid_params",
             "plugin/query needs a `plugin` name",
         ));
     }
     // The daemon that runs the plugin lives at the project root, which is also
-    // what `board_daemon` dials.
+    // what the supervised daemon dials.
     // 复用共享 helper 而不是手写 `.yi-agent/runtime`：它先认 `YI_AGENT_RUNTIME_DIR`，
     // 与工作区其它地方对「runtime socket 在哪」保持同一个定义。
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(project);
     let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| {
-        BoardQueryError::new(
+        PluginQueryError::new(
             "daemon_unavailable",
             format!("daemon is unavailable: {error}"),
         )
@@ -1284,7 +1263,7 @@ pub(crate) fn plugin_query(
         },
     )
     .map_err(|error| {
-        BoardQueryError::new(
+        PluginQueryError::new(
             "daemon_unavailable",
             format!("daemon is unavailable: {error}"),
         )
@@ -1294,14 +1273,14 @@ pub(crate) fn plugin_query(
         // A daemon that is up but has no answer for this plugin is the plugin's
         // absence, not the daemon's: the wording keeps the shape the desktop's
         // `pluginIsUnavailable` matches on.
-        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(BoardQueryError::new(
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(PluginQueryError::new(
             "plugin_unavailable",
             format!(
                 "the plugin rejected the query: {code:?} {}",
                 message.unwrap_or_default()
             ),
         )),
-        other => Err(BoardQueryError::new(
+        other => Err(PluginQueryError::new(
             "plugin_unavailable",
             format!("daemon returned an unexpected response: {other:?}"),
         )),
@@ -1323,9 +1302,9 @@ pub(crate) fn plugin_query_self(
     plugin: &str,
     method: &str,
     params: serde_json::Value,
-) -> Result<serde_json::Value, BoardQueryError> {
+) -> Result<serde_json::Value, PluginQueryError> {
     if plugin.is_empty() {
-        return Err(BoardQueryError::new(
+        return Err(PluginQueryError::new(
             "invalid_params",
             "plugin/settings needs a `plugin` name",
         ));
@@ -1334,20 +1313,20 @@ pub(crate) fn plugin_query_self(
         .into_iter()
         .find(|summary| summary.name == plugin);
     let Some(summary) = summary else {
-        return Err(BoardQueryError::new(
+        return Err(PluginQueryError::new(
             "plugin_not_installed",
             format!("plugin {plugin} is not installed"),
         ));
     };
     if !summary.queryable {
-        return Err(BoardQueryError::new(
+        return Err(PluginQueryError::new(
             "plugin_unavailable",
             format!("plugin {plugin} does not declare a query socket"),
         ));
     }
     let runtime_dir = yi_agent_subagent::attach::project_runtime_directory(scope);
     let socket = yi_agent_store::ipc::socket_path_for(&runtime_dir).map_err(|error| {
-        BoardQueryError::new(
+        PluginQueryError::new(
             "plugin_unavailable",
             format!("daemon is unavailable: {error}"),
         )
@@ -1361,7 +1340,7 @@ pub(crate) fn plugin_query_self(
         },
     )
     .map_err(|error| {
-        BoardQueryError::new(
+        PluginQueryError::new(
             "plugin_unavailable",
             format!("daemon is unavailable: {error}"),
         )
@@ -1373,14 +1352,14 @@ pub(crate) fn plugin_query_self(
         // the plugin being gone: `plugin_rejected` keeps the reason apart from
         // the two genuine unavailability arms above, so the desktop can show
         // the plugin's message instead of "插件未运行".
-        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(BoardQueryError::new(
+        yi_agent_store::ipc::IpcResponse::Error { code, message } => Err(PluginQueryError::new(
             "plugin_rejected",
             format!(
                 "the plugin rejected the query: {code:?} {}",
                 message.unwrap_or_default()
             ),
         )),
-        other => Err(BoardQueryError::new(
+        other => Err(PluginQueryError::new(
             "plugin_unavailable",
             format!("daemon returned an unexpected response: {other:?}"),
         )),
@@ -1458,14 +1437,17 @@ pub(crate) fn to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
 
 /// 后台自愈循环:app 打开期间每 ~30s 一次,与常驻 watchman 重叠也无害(幂等)。
 ///
-/// 单轮逻辑复用 `yi_agent_boards::watch::once`(读通用登记 → 交给 `ensure`),
+/// 单轮逻辑复用 `yi_agent_supervisors::watch::once`(读通用登记 → 交给 `ensure`),
 /// **不再另写一份**「读登记 → 拉起」的胶水;`ensure_daemons` 同样是 CLI 与
 /// watchman 共用的那一份。`resident_dir` 由调用方传入,循环内不重读 `HOME`。
-fn spawn_board_watchman_loop(resident_dir: PathBuf) {
+///
+/// 它是通用的:登记表里**任何**要求常驻的项目都会被确保有一个活着的进程,
+/// 与是哪个插件无关。
+fn spawn_resident_watch_loop(resident_dir: PathBuf) {
     tokio::spawn(async move {
         loop {
-            yi_agent_boards::watch::once(&resident_dir, &mut |projects| {
-                yi_agent_boards::watch::ensure_daemons(projects);
+            yi_agent_supervisors::watch::once(&resident_dir, &mut |projects| {
+                yi_agent_supervisors::watch::ensure_daemons(projects);
             });
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
@@ -1490,18 +1472,14 @@ where
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
     let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
     // A fallback, not a policy: resolution failing (unset HOME) would otherwise
-    // make the whole server fail to start. Board RPCs called in that state
-    // register into a directory nobody lists from, which is the same as having
-    // no board — better than losing every unrelated RPC.
-    let board_dir = yi_agent_boards::global_dir().unwrap_or_default();
-    // Same fallback policy as `board_dir`: an unset HOME must not stop the
-    // server. Resident RPCs then register where nobody lists from, which is the
-    // same as having no resident need.
+    // make the whole server fail to start. Resident RPCs then register into a
+    // directory nobody lists from, which is the same as having no resident need
+    // — better than losing every unrelated RPC.
     let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
     // 会话期自愈:app 打开期间后台每 ~30s 重新确保每个登记项目都有活着的 daemon,
     // 与 launchd watchman 互补。只在生产入口启动;`serve_stdio`/`serve_scoped` 不装,
     // 故单元测试永远不会拉起真实进程。传入已算好的 `resident_dir`,循环内不重读 HOME。
-    spawn_board_watchman_loop(resident_dir.clone());
+    spawn_resident_watch_loop(resident_dir.clone());
     // 主题句柄:`ui/settings/read|write` 与每个 thread 的 `set_theme` 工具共用。
     // 工厂闭包 `'static`,拿不到主循环里的 `theme`;先克隆一份专供工厂。
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
@@ -1511,8 +1489,8 @@ where
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
     // 启动期把存量 `.env` 模型键收边进清单（一次性、幂等）。
     migrate_legacy_model_keys_on_startup();
-    // 启动期把旧看板登记表导入通用常驻登记（一次性、幂等；失败只 warn）。
-    migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+    // 启动期把旧登记表导入通用常驻登记（一次性、幂等；失败只 warn）。
+    migrate_legacy_resident_requests_on_startup(&resident_dir);
     serve_stdio(
         reader,
         writer,
@@ -1524,17 +1502,15 @@ where
         RuntimeAttachments {
             runtimes,
             thread_roots,
-            board_dir,
             models_path: yi_agent_runtime::models::models_path(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
-            // 注入隔离 tempdir。HOME 缺失回退空路径,与 `board_dir` 同一策略。
+            // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
                 .unwrap_or_default(),
             onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
             skills_home: home_dir(),
-            plugin_command: yi_agent_boards::scaffold::default_plugin_command().unwrap_or_default(),
-            launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
+            plugin_command: default_plugin_command().unwrap_or_default(),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1584,11 +1560,10 @@ where
     )));
     let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
     let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
-    let board_dir = yi_agent_boards::global_dir().unwrap_or_default();
     let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
     // 与 `run` 一致:本函数是合一模式的生产入口,故同样在会话期自愈地确保
     // 各登记项目有一枚活着的 daemon(桌面经 `--relay` 启动时不应丢掉该保障)。
-    spawn_board_watchman_loop(resident_dir.clone());
+    spawn_resident_watch_loop(resident_dir.clone());
     let theme = crate::theme_tool::ThemeHandle::new(cfg.workdir.clone());
     let theme_for_factory = theme.clone();
     // 与 `run` 一致:清单按指纹跟随 `models.json`,工厂逐会话取当前值。
@@ -1596,8 +1571,8 @@ where
         yi_agent_runtime::models::CatalogWatcher::new(yi_agent_runtime::models::models_path());
     // 与 `run` 一致:启动期做一次性 `.env` → 清单迁移。
     migrate_legacy_model_keys_on_startup();
-    // 与 `run` 一致:启动期把旧看板登记表导入通用常驻登记(一次性、幂等)。
-    migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+    // 与 `run` 一致:启动期把旧登记表导入通用常驻登记(一次性、幂等)。
+    migrate_legacy_resident_requests_on_startup(&resident_dir);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     serve_scoped_core(
         reader,
@@ -1610,17 +1585,15 @@ where
         RuntimeAttachments {
             runtimes,
             thread_roots,
-            board_dir,
             models_path: yi_agent_runtime::models::models_path(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
-            // 注入隔离 tempdir。HOME 缺失回退空路径,与 `board_dir` 同一策略。
+            // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
                 .unwrap_or_default(),
             onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
             skills_home: home_dir(),
-            plugin_command: yi_agent_boards::scaffold::default_plugin_command().unwrap_or_default(),
-            launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
+            plugin_command: default_plugin_command().unwrap_or_default(),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1902,15 +1875,14 @@ fn migrate_legacy_model_keys_on_startup() {
     }
 }
 
-/// 旧看板登记表里登记的项目路径，按 `{"boards":[{"project":"<abs>"}]}` 解析。
+/// 旧常驻登记表（看板时代）里登记的项目路径，按 `{"boards":[{"project":"<abs>"}]}` 解析。
 ///
-/// 这里**故意不依赖 `yi_agent_boards`**：Task 6 会删掉那整个 crate，而迁移代码
-/// 必须活下来（它是旧环境能否保住看板的唯一路径）。旧格式只有 `boards[].project`
-/// 一个字段有意义，故几十行本地解析比引一个即将消失的依赖更安全。
+/// 这里**故意不依赖任何生产代码**：旧格式只有 `boards[].project` 一个字段有意义，
+/// 故几十行本地解析比引依赖更稳——它是老环境能否保住自己那些项目的**唯一**路径。
 ///
-/// 读侧宽容，且**故意不**在损坏时改名：一份手改坏的 `boards.json` 若被当成
-/// 「空表」然后改名取证，用户就再也拿不回里面的项目了。损坏 → 返回 `None`、
-/// 文件原地不动，由调用方记一条 warn；缺文件 → 空列表（没什么可迁的）。
+/// 读侧宽容，且**故意不**在损坏时改名：一份手改坏的旧登记表若被当成「空表」然后
+/// 改名取证，用户就再也拿不回里面的项目了。损坏 → 返回 `None`、文件原地不动，由
+/// 调用方记一条 warn；缺文件 → 空列表（没什么可迁的）。
 fn parse_legacy_board_projects(legacy_file: &Path) -> Option<Vec<PathBuf>> {
     let text = match std::fs::read_to_string(legacy_file) {
         Ok(text) => text,
@@ -1946,18 +1918,31 @@ fn parse_legacy_board_projects(legacy_file: &Path) -> Option<Vec<PathBuf>> {
     }
 }
 
-/// 生产启动期的一次性迁移：旧看板登记表 → 通用常驻登记。
+/// 生产启动期的一次性迁移：旧常驻登记表 → 通用常驻登记。
 ///
 /// 只在生产入口（`run` / `serve_stdio_with_relay`）调用一次，与
 /// [`migrate_legacy_model_keys_on_startup`] 同一段初始化。**任何失败都只记 warn，
 /// 绝不阻断启动**——迁移是便利，不是前置：登记表读不动时宿主照样要能起来。
 ///
-/// 请求者名用字面量而非 `yi_agent_boards::lifecycle::REQUESTER`：那个 crate 会被
-/// Task 6 删掉，而写进 `resident-daemons.json` 的 `required_by` 是**磁盘契约**，
-/// 迁移时写下的名字必须与看板插件此后读写的一致。
-fn migrate_legacy_board_requests_on_startup(board_dir: &Path, resident_dir: &Path) {
-    let legacy_file = board_dir.join("boards.json");
-    let Some(projects) = parse_legacy_board_projects(&legacy_file) else {
+/// 旧文件的**目录来源**由 [`crate::legacy_compat::legacy_board_registry_path`] 给出
+/// （与看板时代那个 registry crate 的同名函数逐字同一条规则）。这一步是必须的：
+/// 删掉那个 crate 却只删依赖，迁移就会在一个空目录里找文件，老环境的项目静默
+/// 全部丢失。`HOME` 缺失时无从查找，直接跳过（与常驻登记自身的策略一致）。
+fn migrate_legacy_resident_requests_on_startup(resident_dir: &Path) {
+    let Some(legacy_file) = crate::legacy_compat::legacy_board_registry_path() else {
+        return;
+    };
+    migrate_legacy_registry_file(&legacy_file, resident_dir);
+}
+
+/// 迁移的**核心**：把一份旧登记表导入通用常驻登记。文件路径由调用方给出，
+/// 故生产用解析出的路径、测试用 tempdir——同一个函数，同一条逻辑。
+///
+/// 请求者名是**磁盘契约**（写进 `resident-daemons.json` 的 `required_by`）：迁移时
+/// 写下的名字必须与那个插件此后读写的一致，否则它认不出这是「自己要常驻的项目」，
+/// 下一次读取就会把登记当成别人的。
+fn migrate_legacy_registry_file(legacy_file: &Path, resident_dir: &Path) {
+    let Some(projects) = parse_legacy_board_projects(legacy_file) else {
         return;
     };
     if projects.is_empty() {
@@ -1965,25 +1950,25 @@ fn migrate_legacy_board_requests_on_startup(board_dir: &Path, resident_dir: &Pat
     }
     match yi_agent_store::resident::import_legacy_projects(
         &projects,
-        &legacy_file,
+        legacy_file,
         resident_dir,
-        "superpowers-kanban",
+        crate::legacy_compat::SUPERPOWERS_KANBAN_REQUESTER,
     ) {
         Ok(imported) => tracing::info!(
             imported,
             path = %legacy_file.display(),
-            "imported legacy board registrations into the resident registry"
+            "imported legacy resident registrations into the generic registry"
         ),
         Err(error) => tracing::warn!(
             %error,
             path = %legacy_file.display(),
-            "could not import the legacy board registry; it is left in place for the next run"
+            "could not import the legacy registry; it is left in place for the next run"
         ),
     }
 }
 
 #[cfg(test)]
-mod legacy_board_migration_tests {
+mod legacy_migration_tests {
     use super::*;
 
     /// 旧格式只有 `boards[].project` 有意义;读出来的顺序即文件顺序。
@@ -2039,7 +2024,7 @@ mod legacy_board_migration_tests {
         let legacy = board_dir.join("boards.json");
         std::fs::write(&legacy, r#"{"boards":[{"project":"/p/a"}]}"#).unwrap();
 
-        migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+        migrate_legacy_registry_file(&legacy, &resident_dir);
 
         assert_eq!(
             yi_agent_store::resident::list(&resident_dir),
@@ -2067,10 +2052,10 @@ mod legacy_board_migration_tests {
         )
         .unwrap();
 
-        migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+        migrate_legacy_registry_file(&board_dir.join("boards.json"), &resident_dir);
         let after_first = yi_agent_store::resident::list(&resident_dir);
 
-        migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+        migrate_legacy_registry_file(&board_dir.join("boards.json"), &resident_dir);
 
         assert_eq!(yi_agent_store::resident::list(&resident_dir), after_first);
         assert!(!board_dir.join("boards.json").exists());
@@ -2086,7 +2071,7 @@ mod legacy_board_migration_tests {
         std::fs::write(board_dir.join("boards.json"), "{ not json").unwrap();
 
         // 返回 `()` 本身就是断言:没有 `Result` 可传播,也就没有失败路径。
-        migrate_legacy_board_requests_on_startup(&board_dir, &resident_dir);
+        migrate_legacy_registry_file(&board_dir.join("boards.json"), &resident_dir);
 
         assert!(!board_dir.join("boards.json.migrated").exists());
     }
@@ -2099,7 +2084,7 @@ mod legacy_board_migration_tests {
     fn production_source() -> String {
         let source = include_str!("server.rs");
         let production = source
-            .split("#[cfg(test)]\nmod legacy_board_migration_tests")
+            .split("#[cfg(test)]\nmod legacy_migration_tests")
             .next()
             .expect("this module must exist");
         production
@@ -2114,11 +2099,7 @@ mod legacy_board_migration_tests {
     #[test]
     fn both_production_entries_run_the_migration_at_startup() {
         let production = production_source();
-        let call = [
-            "migrate_legacy_board_requests",
-            "_on_startup(&board_dir, &resident_dir)",
-        ]
-        .concat();
+        let call = "migrate_legacy_resident_requests_on_startup(&resident_dir)".to_string();
         assert_eq!(
             production.matches(&call).count(),
             2,
@@ -2126,13 +2107,13 @@ mod legacy_board_migration_tests {
         );
     }
 
-    /// 迁移代码**不得**依赖即将被删的 `yi_agent_boards`(Task 6):否则它会随那个
+    /// 迁移代码**不得**依赖那个已删的看板 registry crate:否则它会随它
     /// crate 一起消失,旧环境的看板就没人来迁了。
     #[test]
     fn the_migration_does_not_depend_on_the_boards_crate() {
         let production = production_source();
-        // 只取两个迁移函数本体,到下一个顶层函数为止:文件别处(**生产入口**也)
-        // 还有 `yi_agent_boards` 的引用,那些是 Task 6 的事,不该算进这里。
+        // 只取迁移那一族函数本体,到下一个顶层函数为止:文件别处(**生产入口**也)
+        // 还有别的代码,那些是 Task 6 的事,不该算进这里。
         let body = production
             .split("fn parse_legacy_board_projects(")
             .nth(1)
@@ -2142,6 +2123,48 @@ mod legacy_board_migration_tests {
         assert!(
             !body.contains(&needle),
             "the migration path must stay independent of the boards crate"
+        );
+    }
+
+    /// **Task 6 的关键回归**：迁移的目录来源换了一个实现，但必须仍指向
+    /// `$HOME/.yi-agent/<插件目录>/boards.json`。以前那条路径来自
+    /// 那个看板 registry crate 的 `global_dir()`；只删依赖而不换来源，迁移会在空目录里
+    /// 找文件，老环境的项目静默全部丢失。
+    ///
+    /// 这里钉的是**启动路径**用的那个函数（不是测试注入的路径）：
+    /// `migrate_legacy_resident_requests_on_startup` 自己解析目录，故给定一个假的
+    /// `HOME` 就应当能迁到其中那份旧表。
+    #[test]
+    fn the_startup_path_still_finds_the_legacy_file_under_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let resident_dir = dir.path().join("resident");
+        // 造一个假的 `$HOME`，把旧表放到启动路径会去找的位置。
+        let home = dir.path().join("home");
+        let legacy_dir = home.join(".yi-agent").join("superpowers-kanban");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("boards.json"),
+            r#"{"boards":[{"project":"/p/old"}]}"#,
+        )
+        .unwrap();
+
+        // 直接钉住「目录来源」这条规则（不进程级改 `HOME`：与并行测试互不干扰）。
+        let resolved = crate::legacy_compat::legacy_board_dir_from(Some(std::ffi::OsStr::new(
+            home.to_str().unwrap(),
+        )))
+        .expect("a set HOME must resolve");
+        assert_eq!(
+            resolved, legacy_dir,
+            "the startup path must look in $HOME/.yi-agent/superpowers-kanban, \
+             the same place the deleted crate used"
+        );
+
+        // 走一遍同一个核心：给定启动路径会解析出的文件，登记表里必须出现它。
+        migrate_legacy_registry_file(&resolved.join("boards.json"), &resident_dir);
+        assert_eq!(
+            yi_agent_store::resident::list(&resident_dir),
+            vec![PathBuf::from("/p/old")],
+            "a legacy environment must keep its projects across the upgrade"
         );
     }
 }
@@ -2601,14 +2624,12 @@ where
     let RuntimeAttachments {
         runtimes,
         thread_roots,
-        board_dir,
         models_path,
         onboarding_env_path,
         onboarding_preferences_path,
         resident_dir,
         skills_home,
         plugin_command,
-        launcher: board_launcher,
         theme,
         git_diff,
         view_frames,
@@ -2621,7 +2642,7 @@ where
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
-    // detach 出去的 board/plugin handler 唯一需要回到主循环的信号：stdio
+    // detach 出去的 plugin handler 唯一需要回到主循环的信号：stdio
     // `local` 写失败是致命的（`?` 语义从前由内联 await 直接传播）。
     let (fatal_tx, mut fatal_rx) = mpsc::channel::<anyhow::Error>(1);
 
@@ -2957,38 +2978,29 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
-                    crate::rpc::Domain::Board | crate::rpc::Domain::Plugin => {
+                    crate::rpc::Domain::Plugin => {
                         // 门禁（initialize / scope）已在上面同步做完；这里只把
                         // **处理** detach 出去。主循环是单 task，内联 await 会串行
                         // 堵住所有 thread 的 RPC；主 runtime 是多线程的，故
                         // `tokio::spawn` 让它在别的 worker 上跑、主循环立刻回到
                         // `select!`。（`spawn_blocking(..).await` 做不到：主 task
                         // 仍要 await 它返回。）
-                        let state = std::sync::Arc::new(crate::rpc::BoardPluginState {
+                        let state = std::sync::Arc::new(crate::rpc::PluginChannelState {
                             hub: std::sync::Arc::clone(&hub),
                             client: client.clone(),
-                            board_dir: board_dir.clone(),
                             resident_dir: resident_dir.clone(),
                             plugin_command: plugin_command.clone(),
                             theme_handle: theme_handle.clone(),
                             watchman_home: watchman_home.clone(),
                             watchman_install: std::sync::Arc::clone(&watchman_install),
                             watchman_uninstall: std::sync::Arc::clone(&watchman_uninstall),
-                            board_launcher: std::sync::Arc::clone(&board_launcher),
                             fatal_tx: fatal_tx.clone(),
                         });
-                        let domain = crate::rpc::domain_for(method.as_str());
                         let req = req.clone();
                         let id = id.clone();
                         tokio::spawn(async move {
-                            let result = match domain {
-                                crate::rpc::Domain::Board => {
-                                    crate::rpc::board::handle_shared(&state, &req, id.clone()).await
-                                }
-                                _ => {
-                                    crate::rpc::plugin::handle_shared(&state, &req, id.clone()).await
-                                }
-                            };
+                            let result =
+                                crate::rpc::plugin::handle_shared(&state, &req, id.clone()).await;
                             match result {
                                 Ok(crate::rpc::Flow::Continue) => {}
                                 // 域内兜底：与搬移前的原始 dispatch 逐字一致。
@@ -6644,254 +6656,6 @@ pub(crate) fn extract_prompt(params: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// The `board/*` RPCs, driven through the real stdio loop.
-///
-/// They are side-effecting commands (a temp dir on disk) rather than pure
-/// functions, so the seam under test is the dispatch itself: request in, frame
-/// out. The harness points the registry at a temp dir, so these never touch the
-/// developer's real `~/.yi-agent`.
-#[cfg(test)]
-mod board_rpc_tests {
-    use super::*;
-    // 请求/应答泵住在 `test_support`（与 `resident_rpc_tests` 共用同一份），
-    // 别名保持下面各调用点原样。
-    use crate::test_support::rpc_over_stdio as rpc;
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn board_create_then_remove_lists_the_project_between_the_two() {
-        let mut h = tests::Harness::new();
-        tests::initialize(&mut h).await;
-        let project = tempfile::TempDir::new().unwrap();
-        let project_path = project
-            .path()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .to_string();
-
-        let created = rpc(
-            &mut h,
-            2,
-            "board/create",
-            json!({ "project": project_path }),
-        )
-        .await;
-        assert!(created.get("error").is_none(), "{created}");
-        assert_eq!(created["result"]["registered"], true, "{created}");
-
-        let listed = rpc(&mut h, 3, "board/list", json!({})).await;
-        let boards = listed["result"]["boards"].as_array().unwrap();
-        assert_eq!(boards.len(), 1, "登记表必须恰好一条:{listed}");
-        assert_eq!(boards[0]["project"], project_path);
-        assert_eq!(boards[0]["status"]["registered"], true, "{listed}");
-
-        let removed = rpc(
-            &mut h,
-            4,
-            "board/remove",
-            json!({ "project": project_path }),
-        )
-        .await;
-        assert!(removed.get("error").is_none(), "{removed}");
-
-        let listed = rpc(&mut h, 5, "board/list", json!({})).await;
-        assert_eq!(
-            listed["result"]["boards"].as_array().unwrap().len(),
-            0,
-            "移除后不得再出现在登记表:{listed}"
-        );
-        h.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_board_created_through_the_rpc_is_written_to_the_injected_registry() {
-        // 侧栏按登记表决定给哪些项目画看板条目,所以「写进注入的那个目录」
-        // 本身就是契约:写错地方等于点创建没反应。
-        let mut h = tests::Harness::new();
-        tests::initialize(&mut h).await;
-        let project = tempfile::TempDir::new().unwrap();
-        let project_path = project.path().canonicalize().unwrap();
-
-        rpc(
-            &mut h,
-            2,
-            "board/create",
-            json!({ "project": project_path.to_string_lossy() }),
-        )
-        .await;
-
-        let boards = yi_agent_boards::registry::list(h.board_dir.path()).unwrap();
-        assert_eq!(boards.len(), 1, "登记表必须落在注入的目录里");
-        assert_eq!(boards[0].project, project_path);
-        h.shutdown().await;
-    }
-
-    /// 开关为开（缺省）时，首次 `board/create` 确保值守已装：装的是当前 exe、
-    /// 针对注入的 home。
-    #[tokio::test(flavor = "multi_thread")]
-    async fn creating_a_board_ensures_the_watchman_is_installed() {
-        // 自带 workdir，避免与其它测试共享的默认目录里的偏好互相干扰。
-        let workdir = tempfile::TempDir::new().unwrap();
-        let mut cfg = tests::default_config();
-        cfg.workdir = workdir.path().to_path_buf();
-        let mut h = tests::Harness::with_cfg(cfg).await;
-        tests::initialize(&mut h).await;
-        let calls = Arc::clone(&h.watchman_calls);
-        let home = h._watchman_home.path().to_path_buf();
-        let project = tempfile::TempDir::new().unwrap();
-
-        let created = rpc(
-            &mut h,
-            2,
-            "board/create",
-            json!({ "project": project.path().canonicalize().unwrap().to_string_lossy() }),
-        )
-        .await;
-        assert!(created.get("error").is_none(), "{created}");
-
-        let recorded = calls.lock().unwrap().clone();
-        assert_eq!(
-            recorded.len(),
-            1,
-            "开关为开时创建看板要装一次值守: {recorded:?}"
-        );
-        assert!(recorded[0].0, "是安装而不是卸载");
-        assert_eq!(recorded[0].1, home, "必须针对注入的 home");
-        h.shutdown().await;
-    }
-
-    /// 开关为关时 `board/create` 不得装值守：用户明确关掉了开机自启。
-    #[tokio::test(flavor = "multi_thread")]
-    async fn creating_a_board_leaves_the_watchman_alone_when_the_switch_is_off() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let mut cfg = tests::default_config();
-        cfg.workdir = dir.path().to_path_buf();
-        let mut h = tests::Harness::with_cfg(cfg).await;
-        tests::initialize(&mut h).await;
-        let calls = Arc::clone(&h.watchman_calls);
-
-        let off = rpc(
-            &mut h,
-            2,
-            "ui/settings/write",
-            json!({ "board_watchman_enabled": false }),
-        )
-        .await;
-        assert_eq!(off["result"]["ok"], true, "{off}");
-
-        let project = tempfile::TempDir::new().unwrap();
-        let created = rpc(
-            &mut h,
-            3,
-            "board/create",
-            json!({ "project": project.path().canonicalize().unwrap().to_string_lossy() }),
-        )
-        .await;
-        assert!(created.get("error").is_none(), "{created}");
-
-        let recorded = calls.lock().unwrap().clone();
-        assert!(
-            recorded.iter().all(|(installed, _)| !installed),
-            "关掉后只应有卸载，不应有安装: {recorded:?}"
-        );
-        h.shutdown().await;
-    }
-
-    /// 值守安装失败不得让 `board/create` 失败：看板本身已经建好。
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_failing_watchman_install_does_not_fail_board_creation() {
-        let workdir = tempfile::TempDir::new().unwrap();
-        let mut cfg = tests::default_config();
-        cfg.workdir = workdir.path().to_path_buf();
-        let mut h = tests::Harness::with_watchman(
-            cfg,
-            Arc::new(|_exe: &Path, _home: &Path| Err("launchctl is unavailable".to_string())),
-            Arc::new(|_home: &Path| Ok(())),
-        )
-        .await;
-        tests::initialize(&mut h).await;
-        let project = tempfile::TempDir::new().unwrap();
-
-        let created = rpc(
-            &mut h,
-            2,
-            "board/create",
-            json!({ "project": project.path().canonicalize().unwrap().to_string_lossy() }),
-        )
-        .await;
-        assert!(
-            created.get("error").is_none(),
-            "装值守失败不该拖垮创建:{created}"
-        );
-        assert_eq!(created["result"]["registered"], true, "{created}");
-        h.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn board_list_of_an_empty_registry_answers_with_no_boards() {
-        let mut h = tests::Harness::new();
-        tests::initialize(&mut h).await;
-        let listed = rpc(&mut h, 2, "board/list", json!({})).await;
-        assert_eq!(listed["result"]["boards"], json!([]));
-        h.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn board_create_without_a_project_is_invalid_params() {
-        // `project` 是必填参数。空串会被当成当前目录，凭空给调用方开一块
-        // 谁都认不出的看板；缺参数必须是 invalid_params，与其它 RPC 一致。
-        let mut h = tests::Harness::new();
-        tests::initialize(&mut h).await;
-        let response = rpc(&mut h, 2, "board/create", json!({})).await;
-        assert_eq!(response["error"]["code"], -32602, "{response}");
-        assert!(
-            yi_agent_boards::registry::list(h.board_dir.path())
-                .unwrap()
-                .is_empty(),
-            "缺参数的请求不得登记任何东西"
-        );
-        h.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn board_remove_without_a_project_is_invalid_params() {
-        let mut h = tests::Harness::new();
-        tests::initialize(&mut h).await;
-        let response = rpc(&mut h, 2, "board/remove", json!({})).await;
-        assert_eq!(response["error"]["code"], -32602, "{response}");
-        h.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn board_create_for_a_missing_directory_reports_an_error_and_registers_nothing() {
-        // 侧栏按登记表画条目，所以「拒绝」必须同时意味着「没登记」：否则
-        // 点一次创建会多出一条点开什么都没有的看板。
-        let mut h = tests::Harness::new();
-        tests::initialize(&mut h).await;
-        let dir = tempfile::TempDir::new().unwrap();
-        let missing = dir.path().join("does-not-exist");
-        let response = rpc(
-            &mut h,
-            2,
-            "board/create",
-            json!({ "project": missing.to_string_lossy() }),
-        )
-        .await;
-        assert!(response.get("error").is_some(), "{response}");
-        assert!(
-            yi_agent_boards::registry::list(h.board_dir.path())
-                .unwrap()
-                .is_empty(),
-            "被拒绝的创建不得登记"
-        );
-        h.shutdown().await;
-    }
-}
-
-/// `resident/*`（通用常驻登记）与通用转发的 stdio 用例。
-///
-/// 与 `board/*` 无关：数据源是通用常驻登记（harness 已把它指向隔离 tempdir），
-/// 故这些用例**不随看板域退役**——它们钉的正是「宿主只提供通用面」这件事。
 #[cfg(test)]
 mod resident_rpc_tests {
     use super::*;
@@ -6943,7 +6707,9 @@ mod resident_rpc_tests {
     async fn plugin_query_answers_for_a_project_that_never_registered() {
         let mut h = tests::Harness::new();
         tests::initialize(&mut h).await;
-        let project = h.board_dir.path().join("never-registered");
+        // 未登记的目录也得能在磁盘上存在；用隔离 tempdir 造一个。
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let project = project_dir.path().join("never-registered");
         std::fs::create_dir_all(&project).unwrap();
 
         let response = rpc(
@@ -7181,13 +6947,14 @@ mod plugin_query_tests {
     /// the wire together.
     ///
     /// 摘掉登记表门控后，未登记的项目会走到「拨 socket」而不是被拒，故这条
-    /// 断言的是 `daemon_unavailable` + `-32021`：`board_not_created`（-32020）
-    /// 已不存在——宿主不再有「这个项目没有看板」这个回答。
+    /// 断言的是 `daemon_unavailable` + `-32021`。宿主不再有「这个项目没登记」
+    /// 这个回答，故那个码位已退休（见 `protocol.rs` 的 `plugin_query_error`）。
     #[tokio::test(flavor = "multi_thread")]
     async fn the_rpc_reports_a_missing_daemon_in_data_for_an_unregistered_project() {
         let mut h = tests::Harness::new();
         tests::initialize(&mut h).await;
-        let project = h.board_dir.path().join("unregistered");
+        let project_dir = tempfile::TempDir::new().unwrap();
+        let project = project_dir.path().join("unregistered");
         std::fs::create_dir_all(&project).unwrap();
 
         h.send(

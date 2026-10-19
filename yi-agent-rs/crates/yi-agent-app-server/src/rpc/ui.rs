@@ -55,7 +55,10 @@ pub(crate) async fn handle(
                     id,
                     json!({
                         "theme": theme.as_str(),
-                        "board_watchman_enabled": watchman_enabled,
+                        // 通用键名（旧名见 `settings_store::LEGACY_WATCHMAN_KEY`）。
+                        // 桌面同时读旧名做兼容，但宿主只回新名——回旧名等于把
+                        // 看板语义留在宿主源码里（验收 §6.2）。
+                        crate::settings_store::WATCHMAN_KEY: watchman_enabled,
                         "relay_url": relay_url,
                         "tag_names": tag_names,
                     }),
@@ -64,9 +67,13 @@ pub(crate) async fn handle(
             .await?;
         }
         "ui/settings/write" => {
+            // 新键优先，旧键兼容读：老客户端仍发旧键名，而一台机器上的桌面与
+            // app-server 未必同批升级，故两条都要认。旧键名的字面量只留在
+            // `settings_store` 一处（它是磁盘契约，不是这里的拼写）。
             if let Some(enabled) = req
                 .params
-                .get("board_watchman_enabled")
+                .get(crate::settings_store::WATCHMAN_KEY)
+                .or_else(|| req.params.get(crate::settings_store::LEGACY_WATCHMAN_KEY))
                 .and_then(|v| v.as_bool())
             {
                 let workdir = state.theme_handle.workdir();
@@ -93,7 +100,7 @@ pub(crate) async fn handle(
                 };
                 let warning = outcome.err();
                 if let Some(warning) = &warning {
-                    tracing::warn!(%warning, enabled, "board watchman switch did not take effect");
+                    tracing::warn!(%warning, enabled, "watchman switch did not take effect");
                 }
                 write_response(
                     state.hub,

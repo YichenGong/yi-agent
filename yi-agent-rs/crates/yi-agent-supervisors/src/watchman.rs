@@ -5,14 +5,20 @@
 
 use std::path::{Path, PathBuf};
 
-/// 值守开关的偏好键。**这是磁盘契约**（写在 `preferences.json` 里），
-/// 通用化改名连同旧键兼容读由 Task 6 落地，本任务只动 plist。
-pub const PREFERENCE_KEY: &str = "board_watchman_enabled";
+/// 本 crate 装的 LaunchAgent 标签。通用：不含任何插件名。
 pub const LABEL: &str = "ai.yi-agent.resident-daemon-watchman";
 
-/// 通用化之前的标签。*过渡期*：安装时顺手清掉它，否则一台已经装过旧 plist 的
-/// 机器上会同时跑两个值守（旧 plist 走的 `boards watch` 仍被 CLI 当别名接受）。
-/// Task 6 起旧 plist 的兼容窗口关闭后，这个常量可删。
+/// 通用化之前的标签（看板时代的名字）。
+///
+/// **必要兼容，必须保留。** 装过旧版的机器上，这个 plist 仍被 launchd 加载着，
+/// 而它的 `ProgramArguments` 是旧子命令 `yi-agent boards watch`——那个别名已删
+/// （见 `yi-agent/src/config.rs` 的 `Resident` 注释），故该 plist 现在每次登录都会
+/// 拉起一个**立刻失败的**进程。安装/卸载时顺手 bootout 并删掉它，是唯一能让老机器
+/// 收敛的地方。
+///
+/// 留着一条坏掉的 launchd 条目，比让源码里出现一个带插件名的字符串**更糟**：前者
+/// 用户看不见也修不好，后者只是验收 grep 的一行豁免（见 Task 6 报告的 allowlist）。
+/// 值本身是**磁盘/系统上的既成事实**，改一个字面量就等于改掉要清理的对象。
 pub const LEGACY_LABEL: &str = "ai.yi-agent.board-watchman";
 
 pub fn plist_path(home: &Path) -> PathBuf {
@@ -99,9 +105,9 @@ fn uid_domain() -> String {
 
 /// 清掉通用化之前装的那个 plist（best effort）。
 ///
-/// 关键在**不留下两个值守**：旧 plist 跑的是 `boards watch`，而 CLI 在过渡期
-/// 仍把它当 `resident watch` 的别名接受，于是两台「常驻值守」会各跑各的循环。
-/// bootout 失败（本来就没加载）不算错；目标是「最终没有它」。
+/// 旧 plist 的 `ProgramArguments` 是已删掉的旧子命令，故它每次登录都会拉起一个
+/// 立刻失败的进程——用户看不见、也修不好。bootout 失败（本来就没加载）不算错；
+/// 目标是「最终没有它」。
 fn remove_legacy_plist(home: &Path, launchctl: &mut dyn FnMut(&[String]) -> Result<(), String>) {
     let _ = launchctl(&[
         "bootout".into(),

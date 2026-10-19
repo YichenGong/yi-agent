@@ -8,9 +8,9 @@ use crate::test_support::{EVENT_WAIT, isolated_models_path};
 /// `tokio::spawn` 编译不过。这条断言就是「它们能脱离主循环执行」的编译期证明
 /// ——主循环是单 task，内联 `await` 会串行堵住所有 thread 的 RPC。
 #[test]
-fn board_and_plugin_shared_state_is_owned_and_send() {
+fn plugin_channel_shared_state_is_owned_and_send() {
     fn assert_spawnable<T: Send + Sync + 'static>() {}
-    assert_spawnable::<crate::rpc::BoardPluginState>();
+    assert_spawnable::<crate::rpc::PluginChannelState>();
 }
 
 /// Task 4 的致命通道是**唯一**回到主循环的信号，故单独钉一次:detached handler
@@ -30,10 +30,9 @@ async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
     hub.unregister(&local);
 
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
-    let state = crate::rpc::BoardPluginState {
+    let state = crate::rpc::PluginChannelState {
         hub: std::sync::Arc::new(hub),
         client: local,
-        board_dir: PathBuf::new(),
         resident_dir: PathBuf::new(),
         plugin_command: PathBuf::new(),
         theme_handle: crate::theme_tool::ThemeHandle::new(std::env::temp_dir()),
@@ -42,9 +41,6 @@ async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
             Ok(())
         }),
         watchman_uninstall: std::sync::Arc::new(|_home: &Path| -> Result<(), String> { Ok(()) }),
-        board_launcher: std::sync::Arc::new(|_project: &Path| -> Result<bool, String> {
-            Ok(false)
-        }),
         fatal_tx,
     };
 
@@ -73,8 +69,9 @@ fn the_app_side_loop_ensures_every_registered_project() {
     let a = dir.path().join("a");
     yi_agent_store::resident::require(dir.path(), &a, "superpowers-kanban").unwrap();
     let mut seen: Vec<std::path::PathBuf> = Vec::new();
-    let count =
-        yi_agent_boards::watch::once(dir.path(), &mut |projects| seen.extend_from_slice(projects));
+    let count = yi_agent_supervisors::watch::once(dir.path(), &mut |projects| {
+        seen.extend_from_slice(projects)
+    });
     assert_eq!(count, 1);
     assert_eq!(seen, vec![a]);
 }
@@ -1670,13 +1667,11 @@ pub(crate) struct Harness {
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     /// 隔离的全局目录索引;持有它保证 tempdir 存活到 harness 结束。
     _index_dir: tempfile::TempDir,
-    /// 隔离的看板登记表目录,理由同上:board/* RPC 不得写真的 `~/.yi-agent`。
-    pub(crate) board_dir: tempfile::TempDir,
-    /// 隔离的模型清单目录,理由同 `board_dir`:`model/*` RPC 不得写开发者
+    /// 隔离的模型清单目录,理由同 `resident_dir`:`model/*` RPC 不得写开发者
     /// 真实的 `~/.yi-agent/models.json`。字段仅用于持有 tempdir。
     pub(crate) _models_dir: tempfile::TempDir,
-    /// 隔离的常驻登记目录,理由同 `board_dir`:board/create|remove 不得写
-    /// 真的 `$HOME/.yi-agent`;驱动器测试还要往里注册插件,故 `pub(crate)`。
+    /// 隔离的常驻登记目录:`plugin/query` 与驱动器测试不得写真的
+    /// `$HOME/.yi-agent`;驱动器测试还要往里注册插件,故 `pub(crate)`。
     pub(crate) resident_dir: tempfile::TempDir,
     /// 与主循环**共享**的配对状态:测试经 [`Harness::pairing`] 直接 `redeem`,
     /// 所得设备必须能被同一主循环的 `device/list` 看见。
@@ -1842,8 +1837,8 @@ impl Harness {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let index_dir = tempfile::TempDir::new().unwrap();
-        let board_dir = tempfile::TempDir::new().unwrap();
-        // 常驻登记也落在隔离目录里:`board/create` 不得写真的 `~/.yi-agent`。
+        // 常驻登记落在隔离目录里:`plugin/query` 与驱动器测试不得写真的
+        // `~/.yi-agent`。
         let resident_dir = tempfile::TempDir::new().unwrap();
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
@@ -1889,18 +1884,14 @@ impl Harness {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
-                board_dir: board_dir.path().to_path_buf(),
                 models_path: models_dir.path().join("models.json"),
                 // 引导的 .env / preferences 也落在隔离目录里:onboarding/*
                 // 不得写开发者真实的 `~/.yi-agent`。
                 onboarding_env_path: index_dir.path().join(".env"),
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
-                // 测试里不起真进程:`board/create` 走注入的启动器,
-                // 与 board_dir 注入同一个理由。
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
                 plugin_command: PathBuf::from("/nonexistent/superpowers-kanban"),
-                launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 // 与 `Harness::view_frames` 是**同一个** `Arc`(见上方 `lead_inbox`
@@ -1923,7 +1914,6 @@ impl Harness {
             client_r: BufReader::new(client_r),
             handle,
             _index_dir: index_dir,
-            board_dir,
             _models_dir: models_dir,
             resident_dir,
             pairing,
@@ -3016,10 +3006,6 @@ async fn unknown_method_returns_method_not_found() {
         ("onboarding/test", Domain::Onboarding),
         // ---- Resident(通用常驻登记) ----
         ("resident/list", Domain::Resident),
-        // ---- Board ----
-        ("board/create", Domain::Board),
-        ("board/list", Domain::Board),
-        ("board/remove", Domain::Board),
         // ---- Plugin(`plugin/*` 与 `plugins/*`) ----
         ("plugin/query", Domain::Plugin),
         ("plugin/settings/read", Domain::Plugin),
@@ -3279,7 +3265,6 @@ async fn eof_exits_gracefully() {
         RuntimeAttachments {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
-            board_dir: PathBuf::new(),
             models_path: PathBuf::new(),
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
@@ -3287,7 +3272,6 @@ async fn eof_exits_gracefully() {
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
             plugin_command: PathBuf::new(),
-            launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3359,7 +3343,6 @@ async fn agent_factory_failure_returns_internal_error() {
         RuntimeAttachments {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
-            board_dir: PathBuf::new(),
             models_path: PathBuf::new(),
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
@@ -3367,7 +3350,6 @@ async fn agent_factory_failure_returns_internal_error() {
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
             plugin_command: PathBuf::new(),
-            launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3441,7 +3423,6 @@ async fn oversized_frame_returns_err() {
         RuntimeAttachments {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
-            board_dir: PathBuf::new(),
             models_path: PathBuf::new(),
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
@@ -3449,7 +3430,6 @@ async fn oversized_frame_returns_err() {
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
             plugin_command: PathBuf::new(),
-            launcher: Arc::new(|_project: &Path| Ok(true)),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -14021,7 +14001,11 @@ async fn ui_settings_read_and_write_round_trip() {
         .await;
     let v = read_response(&mut h, 2).await;
     assert_eq!(v["result"]["theme"], "dark", "default before any write");
-    assert_eq!(v["result"]["board_watchman_enabled"], true, "缺省为开:{v}");
+    assert_eq!(
+        v["result"][crate::settings_store::WATCHMAN_KEY],
+        true,
+        "缺省为开:{v}"
+    );
 
     h.send(r#"{"jsonrpc":"2.0","id":3,"method":"ui/settings/write","params":{"theme":"light"}}"#)
         .await;
@@ -14431,7 +14415,8 @@ async fn ui_settings_tag_name_validation_precedes_the_disk_write() {
     h.shutdown().await;
 }
 
-/// `board_watchman_enabled` 的写路径:`false` 卸载、`true` 安装,均经注入的
+/// 值守开关（[`crate::settings_store::WATCHMAN_KEY`]，兼容读旧键）的写路径:
+/// `false` 卸载、`true` 安装,均经注入的
 /// 记录器;偏好落盘且读回一致。
 #[tokio::test(flavor = "multi_thread")]
 async fn writing_the_watchman_setting_installs_or_uninstalls_it() {
@@ -14443,6 +14428,8 @@ async fn writing_the_watchman_setting_installs_or_uninstalls_it() {
     let calls = Arc::clone(&h.watchman_calls);
     let home = h._watchman_home.path().to_path_buf();
 
+    // 这里故意用**旧键**发写请求：一台机器上的桌面与 app-server 未必同批升级，
+    // 老客户端仍发旧键名，宿主必须照样认（兼容读）。
     h.send(
         r#"{"jsonrpc":"2.0","id":2,"method":"ui/settings/write","params":{"board_watchman_enabled":false}}"#,
     )
@@ -14480,7 +14467,11 @@ async fn writing_the_watchman_setting_installs_or_uninstalls_it() {
     h.send(r#"{"jsonrpc":"2.0","id":4,"method":"ui/settings/read","params":{}}"#)
         .await;
     let v = read_response(&mut h, 4).await;
-    assert_eq!(v["result"]["board_watchman_enabled"], true, "{v}");
+    assert_eq!(
+        v["result"][crate::settings_store::WATCHMAN_KEY],
+        true,
+        "{v}"
+    );
     h.shutdown().await;
 }
 
@@ -15348,8 +15339,6 @@ struct MergedHarness {
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     /// 隔离的全局索引;持有它保证 tempdir 活到 harness 结束。
     _index_dir: tempfile::TempDir,
-    /// 隔离的看板登记表目录,理由同 [`Harness::board_dir`]。
-    _board_dir: tempfile::TempDir,
 }
 
 impl MergedHarness {
@@ -15366,7 +15355,6 @@ impl MergedHarness {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let index_dir = tempfile::TempDir::new().unwrap();
-        let board_dir = tempfile::TempDir::new().unwrap();
         let workspaces = Arc::new(WorkspaceIndex::new(
             index_dir.path().join("workspaces.json"),
         ));
@@ -15389,7 +15377,6 @@ impl MergedHarness {
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
-                board_dir: board_dir.path().to_path_buf(),
                 models_path: PathBuf::new(),
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
@@ -15397,7 +15384,6 @@ impl MergedHarness {
                 // 空路径 = 不读真实 home；这些用例不查 skill。
                 skills_home: PathBuf::new(),
                 plugin_command: PathBuf::new(),
-                launcher: Arc::new(|_project: &Path| Ok(true)),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -15423,7 +15409,6 @@ impl MergedHarness {
             hub,
             handle,
             _index_dir: index_dir,
-            _board_dir: board_dir,
         }
     }
 

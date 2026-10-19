@@ -4711,11 +4711,17 @@ mod tests {
         ));
     }
 
-    /// 过渡期兼容：已装的 launchd plist 仍跑 `boards watch`，删掉这个别名会让
-    /// 那些机器上的值守静默失效，直到 app-server 重装 plist。
+    /// 旧别名 `boards` 已随看板面删除。这是个**有意的**破坏性变更：一台尚未
+    /// 重装 launchd plist 的机器仍会跑 `boards watch`，它将在下次登录时解析
+    /// 失败（直到重装值守）。现代替品是通用子命令 `resident watch`。
     #[test]
-    fn the_legacy_boards_watch_alias_still_parses() {
-        let cli = Cli::try_parse_from(["yi-agent", "boards", "watch"]).unwrap();
+    fn the_legacy_boards_alias_is_gone() {
+        assert!(
+            Cli::try_parse_from(["yi-agent", "boards", "watch"]).is_err(),
+            "the board-named alias must not come back"
+        );
+        // 通用子命令仍在，且是唯一入口。
+        let cli = Cli::try_parse_from(["yi-agent", "resident", "watch"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Resident {

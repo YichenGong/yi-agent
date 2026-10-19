@@ -127,7 +127,8 @@ pub(crate) async fn handle(
                 // 不是项目:它没有组长,绝不能在这里被种一个——真机上 9 个幽灵组长
                 // 正是这条懒创建路径(经卡片会话 `ask_lead` → `resolve_lead_target`)
                 // 落下的。判定按整个 `.worktrees/kanban*` 领地,合并轮一并覆盖。
-                if read_ok && metas.is_empty() && !crate::thread_store::is_kanban_worktree(path) {
+                if read_ok && metas.is_empty() && !crate::plugin_worktree::is_plugin_worktree(path)
+                {
                     if let Err(e) = crate::lead::ensure_lead_meta(
                         &crate::thread_store::ThreadStore::new(path),
                         path,
@@ -151,10 +152,10 @@ pub(crate) async fn handle(
                 // 「自己的会话」。真机上这类目录里还躺着一个误落盘的幽灵组长
                 // (`role:"lead"`,`driver_project: None`)——若照旧把它算进 `own`,该
                 // worktree 就会在侧栏里变成一个带「组长」行的顶层项目组(用户报的现象)。
-                let kanban_worktree = crate::thread_store::is_kanban_worktree(path);
+                let plugin_worktree = crate::plugin_worktree::is_plugin_worktree(path);
                 // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
                 // 否则它只是个看板 worktree,归拢后被抑制。
-                if !kanban_worktree && (!own.is_empty() || metas.is_empty()) {
+                if !plugin_worktree && (!own.is_empty() || metas.is_empty()) {
                     for m in own {
                         plain
                             .entry(dir.clone())

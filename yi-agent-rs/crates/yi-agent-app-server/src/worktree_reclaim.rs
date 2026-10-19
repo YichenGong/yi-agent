@@ -1,18 +1,16 @@
 //! 被驱动会话的 worktree 判定与删除。
 //!
-//! 判定只吃 git 事实：`decide` 读「是否 `kanban/` worktree / 是否干净 / 分支状态」，
+//! 判定只吃 git 事实：`decide` 读「是否在插件 worktree 领地 / 是否干净 / 分支状态」，
 //! 分类抽成纯函数 `classify` 以便脱 git 单测。只服务带 `driver_ref` 的会话
 //! （驱动方给了不透明句柄的那些）；普通会话的 cwd 是用户项目目录，任何情况都不删。
 //!
-//! **本任务的边界（范围裁决 2026-10-18）**：这里只把入参名与读法随 meta 字段通用化
-//! （`card_id` → `driver_ref`、`board_project` → `driver_project`），判定逻辑、
-//! `kanban/<slug>` 路径与分支约定、`slugify` 一字未动——那部分语义重写是 G2 的
-//! （spec §7）。
+//! 路径与分支的**约定落点**住在 [`crate::plugin_worktree`]（含命名空间的归属裁定
+//! 与理由）；本模块只消费它，不再自己拼字符串。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// `kanban/<slug>` 的 slug：与插件 `worktree::slugify` 逐字一致。
+/// worktree slug：与插件 `worktree::slugify` 逐字一致。
 ///
 /// 只保留 ASCII 字母数字（小写化），其余折叠为单个 `-`，首尾 `-` 去掉；
 /// 全空时退化为 `card`。不一致会让宿主演化出与插件不同的分支名，
@@ -62,7 +60,7 @@ pub fn default_branch(project: &Path) -> String {
 /// 源分支相对默认分支的状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchState {
-    /// `kanban/<slug>` 不存在：无法判定是否已并入。
+    /// 源分支不存在：无法判定是否已并入。
     Missing,
     /// 存在且已并入默认分支。
     Merged,
@@ -85,11 +83,11 @@ pub enum WorktreeReclaim {
 
 /// 纯分类：只吃布尔事实与分支状态，便于脱 git 单测。
 ///
-/// 顺序即优先级：非卡片会话 → 先排除；不是看板 worktree → 硬保留；
+/// 顺序即优先级：非驱动会话 → 先排除；不在插件 worktree 领地 → 硬保留；
 /// 干净且已并入 → 可删；其余（脏/未并入/分支缺失）→ 破坏性。
 pub fn classify(
     is_card_session: bool,
-    under_kanban_dir: bool,
+    under_plugin_worktree_dir: bool,
     in_worktree_list: bool,
     dirty: bool,
     branch: BranchState,
@@ -98,10 +96,10 @@ pub fn classify(
     if !is_card_session {
         return WorktreeReclaim::None;
     }
-    if !under_kanban_dir || !in_worktree_list {
+    if !under_plugin_worktree_dir || !in_worktree_list {
         return WorktreeReclaim::Keep {
             path,
-            reason: "cwd 不是本项目登记在册的看板 worktree，拒绝删除".to_string(),
+            reason: "cwd 不是本项目登记在册的插件 worktree，拒绝删除".to_string(),
         };
     }
     if !dirty && branch == BranchState::Merged {
@@ -120,7 +118,8 @@ pub fn classify(
 /// git 探针：判定一个被驱动会话的 worktree 该删、该确认、还是该留。
 ///
 /// 入参名沿用通用元字段（旧名 `card_id`/`board_project`）：`driver_ref` 是驱动方给的
-/// **不透明**句柄，宿主只按既有约定拿它推导分支名，不解释它的含义。
+/// **不透明**句柄，宿主只按既有约定拿它推导分支名（见
+/// [`crate::plugin_worktree::branch_name`]），不解释它的含义。
 pub fn decide(
     driver_ref: Option<&str>,
     driver_project: Option<&str>,
@@ -138,17 +137,17 @@ pub fn decide(
     };
     let project_path = Path::new(project);
     let cwd_canon = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let kanban_dir = project_path.join(".worktrees").join("kanban");
-    let kanban_canon = kanban_dir
+    let worktree_dir = crate::plugin_worktree::worktree_dir(project_path);
+    let worktree_dir_canon = worktree_dir
         .canonicalize()
-        .unwrap_or_else(|_| kanban_dir.clone());
-    let under = cwd_canon.starts_with(&kanban_canon);
+        .unwrap_or_else(|_| worktree_dir.clone());
+    let under = cwd_canon.starts_with(&worktree_dir_canon);
     let in_list = worktree_list_contains(project_path, &cwd_canon);
     let dirty = !git_ok(cwd, &["status", "--porcelain"])
         .unwrap_or_default()
         .trim()
         .is_empty();
-    let branch = format!("kanban/{}", slugify(driver_ref));
+    let branch = crate::plugin_worktree::branch_name(&slugify(driver_ref));
     let base = default_branch(project_path);
     let branch_state = if !git_ok(
         project_path,
@@ -266,12 +265,13 @@ mod tests {
         dir.canonicalize().unwrap()
     }
 
-    /// 在 `<project>/.worktrees/kanban/<slug>` 建一块真 worktree，分支 `kanban/<slug>`。
-    fn add_kanban_worktree(project: &Path, card_id: &str) -> PathBuf {
+    /// 在插件 worktree 领地（`<project>/.worktrees/<ns>/<slug>`）建一块真
+    /// worktree，分支取 [`crate::plugin_worktree::branch_name`]。
+    fn add_plugin_worktree(project: &Path, card_id: &str) -> PathBuf {
         let slug = slugify(card_id);
-        let path = project.join(".worktrees/kanban").join(&slug);
+        let path = crate::plugin_worktree::worktree_dir(project).join(&slug);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let branch = format!("kanban/{slug}");
+        let branch = crate::plugin_worktree::branch_name(&slug);
         assert!(
             Command::new("git")
                 .arg("-C")
@@ -322,13 +322,13 @@ mod tests {
     }
 
     #[test]
-    fn classify_keeps_when_not_a_kanban_worktree() {
+    fn classify_keeps_when_not_a_plugin_worktree() {
         // 在 worktree list 里但不是看板 worktree 路径 → 硬保留。
         assert!(matches!(
             classify(true, false, true, false, BranchState::Merged, wt()),
             Reclaim::Keep { .. }
         ));
-        // 在 kanban 目录下但 git 不认它是 worktree → 也硬保留。
+        // 在插件 worktree 目录下但 git 不认它是 worktree → 也硬保留。
         assert!(matches!(
             classify(true, true, false, false, BranchState::Merged, wt()),
             Reclaim::Keep { .. }
@@ -364,7 +364,7 @@ mod tests {
     fn decide_deletes_a_clean_merged_card_worktree() {
         let dir = tempfile::TempDir::new().unwrap();
         let project = init_repo(&dir.path().join("proj").tap_mkdir());
-        let wt = add_kanban_worktree(&project, "card-1");
+        let wt = add_plugin_worktree(&project, "card-1");
         let p = project.to_string_lossy().to_string();
         let got = decide(Some("card-1"), Some(&p), &wt);
         assert!(matches!(got, Reclaim::Delete { .. }), "{got:?}");
@@ -375,7 +375,7 @@ mod tests {
     fn decide_flags_a_dirty_card_worktree() {
         let dir = tempfile::TempDir::new().unwrap();
         let project = init_repo(&dir.path().join("proj").tap_mkdir());
-        let wt = add_kanban_worktree(&project, "card-1");
+        let wt = add_plugin_worktree(&project, "card-1");
         std::fs::write(wt.join("scratch.txt"), "wip").unwrap();
         let p = project.to_string_lossy().to_string();
         let got = decide(Some("card-1"), Some(&p), &wt);
@@ -392,7 +392,7 @@ mod tests {
     fn decide_flags_an_unmerged_branch() {
         let dir = tempfile::TempDir::new().unwrap();
         let project = init_repo(&dir.path().join("proj").tap_mkdir());
-        let wt = add_kanban_worktree(&project, "card-1");
+        let wt = add_plugin_worktree(&project, "card-1");
         // 分支上多一个未并入 main 的提交。
         std::fs::write(wt.join("more.txt"), "x").unwrap();
         git(&wt, &["add", "-A"]);
@@ -422,7 +422,7 @@ mod tests {
     fn remove_deletes_a_linked_worktree() {
         let dir = tempfile::TempDir::new().unwrap();
         let project = init_repo(&dir.path().join("proj").tap_mkdir());
-        let wt = add_kanban_worktree(&project, "card-1");
+        let wt = add_plugin_worktree(&project, "card-1");
         remove(&wt, &project, false).expect("clean removal succeeds");
         assert!(!wt.exists(), "worktree dir is gone");
         assert!(

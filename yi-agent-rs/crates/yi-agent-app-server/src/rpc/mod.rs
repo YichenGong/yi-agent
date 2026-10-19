@@ -14,7 +14,6 @@
 
 // 域子模块:每个模块承载一个域,臂体逐字搬移自 `serve()` 的 dispatch。
 pub(crate) mod agent;
-pub(crate) mod board;
 pub(crate) mod image;
 pub(crate) mod mcp;
 pub(crate) mod model;
@@ -50,9 +49,7 @@ use yi_agent_subagent::binding::RuntimeBinding;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
 /// 值守安装句柄。与 `server.rs` 里的 `pub(crate) type WatchmanInstall` 是**同一个**
-/// 类型(同一个 `Arc<dyn Fn ..>`),在对齐处互换无碍。`ui/*` 与 `board/*` 都从那
-/// 一份类型走(本模块不再重复声明 `BoardLauncher`,它只被 detach 后的
-/// [`BoardPluginState`] 用到,直接引 `crate::server::BoardLauncher`)。
+/// 类型(同一个 `Arc<dyn Fn ..>`),在对齐处互换无碍。`ui/*` 从那一份类型走。
 pub(crate) type WatchmanInstall = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
 /// 值守卸载句柄,同 [`WatchmanInstall`]。
 pub(crate) type WatchmanUninstall = Arc<dyn Fn(&Path) -> Result<(), String> + Send + Sync>;
@@ -105,27 +102,48 @@ pub(crate) enum Flow {
     Unknown,
 }
 
-/// [`Domain::Board`] 与 [`Domain::Plugin`] 的 handler 所需的全部状态。
+/// [`Domain::Plugin`] 的 handler 所需的全部状态。
 ///
 /// 与 [`AppState`] 的**关键区别**：这里没有一个 `&mut`，全是 owned/`Arc`，故整份
-/// 可 move 进 `tokio::spawn` 的任务。这两个域因此可以脱离主循环执行（主循环是
+/// 可 move 进 `tokio::spawn` 的任务。本域因此可以脱离主循环执行（主循环是
 /// 单 task，内联 `await` 会串行堵住所有 thread 的 RPC）。
-pub(crate) struct BoardPluginState {
+///
+/// 名字与字段都是通用的：本结构**不认识任何插件**，字段是「通用插件通道」需要
+/// 的宿主侧输入。原来的 `board_dir` / `board_launcher`（看板登记表与看板 daemon
+/// 的启动器）已随 `board/*` 域删除——通用通道不需要知道「看板」是什么。
+///
+/// 下面四个字段（`resident_dir` / `plugin_command` / `watchman_home` /
+/// `watchman_install`）在 `board/*` 域删除后**暂时没有读者**：它们原先只被
+/// `board/create`（写清单 + 登记常驻 + 装值守）读。之所以保留而不是删掉：
+///
+/// 1. `plugin_command` 是 §4.4 的宿主侧 `plugin/install` 落地时要用的**接缝**
+///    （spec §5.2 明确要求「`plugin_command` 注入若保留，改为通用按插件名解析」，
+///    本任务的 Step 5 也点名**不要删**这个接缝）。删掉它等于把已经做好的通用解析
+///    再拆一遍。
+/// 2. `resident_dir` 是通用常驻登记目录，`watchman_*` 是通用值守句柄——`ui/*` 的
+///    开关臂已经在用同一对句柄（经 [`AppState`]），它们的通用性不依赖看板。
+///
+/// 故这里显式记账为「接口字段、暂未读」，而不是让它们变成无人认领的 dead field。
+pub(crate) struct PluginChannelState {
     pub(crate) hub: std::sync::Arc<crate::broadcast::Broadcaster>,
     pub(crate) client: crate::broadcast::ClientId,
-    pub(crate) board_dir: std::path::PathBuf,
+    /// 通用常驻登记目录。见结构文档：`board/*` 删除后暂无读者。
+    #[allow(dead_code)]
     pub(crate) resident_dir: std::path::PathBuf,
+    /// 按插件名解析出的可执行路径。见结构文档：**§4.4 的接缝，必须保留**。
+    #[allow(dead_code)]
     pub(crate) plugin_command: std::path::PathBuf,
     pub(crate) theme_handle: crate::theme_tool::ThemeHandle,
+    /// 值守安装/卸载所针对的 home。见结构文档：`board/*` 删除后暂无读者。
+    #[allow(dead_code)]
     pub(crate) watchman_home: std::path::PathBuf,
+    /// 安装句柄。见结构文档：`board/*` 删除后暂无读者。
+    #[allow(dead_code)]
     pub(crate) watchman_install: crate::server::WatchmanInstall,
-    /// 卸载句柄。本域无方法卸载值守(`board/remove` 只停守护进程),故当前无处
-    /// 读它——但它是 brief 声明的接口字段,与安装句柄成对,保留以免日后加
-    /// 「卸载值守」方法时又要动 `BoardPluginState` 的形状。与 `BoardCard` 的
-    /// `kind` / `source` / `base` 同一手法。
+    /// 卸载句柄。本域无方法卸载值守,故当前无处读它——但它是 brief 声明的接口
+    /// 字段,与安装句柄成对,保留以免日后加「卸载值守」方法时又要动本结构的形状。
     #[allow(dead_code)]
     pub(crate) watchman_uninstall: crate::server::WatchmanUninstall,
-    pub(crate) board_launcher: crate::server::BoardLauncher,
     /// detach 之后唯一需要回到主循环的信号：stdio `local` 写失败是致命的
     /// （`driver_reports_finished_when_writer_fails` 钉死），而 detached 任务
     /// 无法用 `?` 把它抛回去。
@@ -137,7 +155,7 @@ pub(crate) struct BoardPluginState {
 /// `_id` 保留在签名里（brief 的接口），但回包 `resp` 自身已携带 request id，
 /// 故函数体无需读它。
 pub(crate) async fn write_or_fatal(
-    state: &BoardPluginState,
+    state: &PluginChannelState,
     _id: crate::protocol::RequestId,
     resp: crate::protocol::ResponseEnvelope,
 ) {
@@ -163,8 +181,6 @@ pub(crate) enum Domain {
     Onboarding,
     /// `resident/*`(通用常驻登记:哪些项目要常驻 daemon)。
     Resident,
-    /// `board/*`。
-    Board,
     /// `plugin/*` 与 `plugins/*`。
     Plugin,
     /// `image/*`(含分片上传)。
@@ -201,7 +217,6 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("model") => Domain::Model,
         Some("onboarding") => Domain::Onboarding,
         Some("resident") => Domain::Resident,
-        Some("board") => Domain::Board,
         Some("plugin") | Some("plugins") => Domain::Plugin,
         Some("image") => Domain::Image,
         Some("workspace") => Domain::Workspace,
@@ -232,10 +247,9 @@ pub(crate) fn domain_for(method: &str) -> Domain {
 /// 的相邻字段因逐名写出而不会错位 —— 四个相邻的 `&Path`(`models_path` 到
 /// `onboarding_preferences_path`)尤其需要这条保证。
 ///
-/// Task 4 把 `board/*` 与 `plugin/*` detach 出主循环后,这两域不再经本结构借
-/// 主循环局部量:原来只被它们读的 `board_dir` / `resident_dir` / `plugin_command` /
-/// `board_launcher` 已随处理搬进 [`BoardPluginState`],故从本结构移除(留着就是
-/// 死字段)。
+/// Task 4 把 `plugin/*` detach 出主循环后,该域不再经本结构借主循环局部量:
+/// 原来只被它读的 `resident_dir` / `plugin_command` 已随处理搬进
+/// [`PluginChannelState`],故从本结构移除(留着就是死字段)。
 pub(crate) struct AppState<'a> {
     // ---- 响应出口与调用方 ----
     /// 广播出口:handler 用它定向回包(`write_response`)与做订阅

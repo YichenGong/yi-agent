@@ -114,7 +114,6 @@ where
             RuntimeAttachments {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
-                board_dir: yi_agent_boards::global_dir().unwrap_or_default(),
                 models_path: yi_agent_runtime::models::models_path(),
                 onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
                     .unwrap_or_default(),
@@ -123,9 +122,7 @@ where
                     .join("preferences.json"),
                 resident_dir: yi_agent_store::resident::default_dir().unwrap_or_default(),
                 skills_home: crate::server::home_dir(),
-                plugin_command: yi_agent_boards::scaffold::default_plugin_command()
-                    .unwrap_or_default(),
-                launcher: Arc::new(yi_agent_boards::lifecycle::launch_if_absent),
+                plugin_command: crate::server::default_plugin_command().unwrap_or_default(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

@@ -57,24 +57,34 @@ fn query_plugin(workdir: &Path, method: &str, params: Value) -> Result<Value, Qu
     }
 }
 
-/// Handles `/superpowers-kanban [on|off|create|remove|status|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]`.
+/// Handles `/superpowers-kanban [on|off|run|add <spec> <plan>|add-prequeued <title>|promote <id> <spec> <plan> [<title>]]`.
 ///
 /// The board is *disabled by default*, so an accidental invocation cannot start
 /// a queue. `run` is intentionally refused while disabled: the switch is the
 /// user's explicit consent to let the board act.
+///
+/// `create`/`remove` are **not** handled here: the host used to drive them
+/// itself (writing a registry, launching a daemon), and that host-side board
+/// surface is gone. Asking the plugin is the only remaining route, so those two
+/// verbs are forwarded over the same generic channel as everything else — see
+/// [`handle_kanban_with`].
 pub fn handle_kanban(workdir: &Path, args: &str) -> KanbanOutcome {
-    let global = yi_agent_boards::global_dir().unwrap_or_default();
-    handle_kanban_with(workdir, args, &global)
+    let resident_dir = yi_agent_store::resident::default_dir().unwrap_or_default();
+    handle_kanban_with(workdir, args, &resident_dir)
 }
 
-/// 与 [`handle_kanban`] 相同，但把**全局看板登记目录**注入进来。
+/// 与 [`handle_kanban`] 相同，但把**通用常驻登记目录**注入进来。
 ///
-/// daemon 对「插件没装」和「本目录压根没建看板」回的话可以一样，只有登记表
+/// daemon 对「插件没装」和「本目录压根没建看板」回的话可以一样，只有登记
 /// 能把两者分开。所以看板读不出来时要拿它来分辨：未登记的目录要说「用
 /// /superpowers-kanban create 创建」，而不是甩一句 `daemon is unavailable`
 /// 的连接错误——那句话对用户毫无下一步可言。生产入口 [`handle_kanban`] 传
-/// [`yi_agent_boards::global_dir`]；注入形参只为让测试不碰真实 `$HOME`。
-pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOutcome {
+/// [`yi_agent_store::resident::default_dir`]；注入形参只为让测试不碰真实 `$HOME`。
+///
+/// 登记**是通用的**：宿主只问「这个项目有没有被任何请求者要求常驻」，不认识
+/// 看板。[`yi_agent_store::resident::entries`] 对缺文件/坏文件同样宽容地回空表，
+/// 故它不会因为一份坏文件把这里变成一条误导性的 create 指引。
+pub fn handle_kanban_with(workdir: &Path, args: &str, resident_dir: &Path) -> KanbanOutcome {
     let argument = args.trim();
     let plain = |lines: Vec<String>| KanbanOutcome {
         lines,
@@ -85,20 +95,13 @@ pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOu
             "Superpowers 看板插件未安装。看板由插件提供，装上它这里才有卡片。".to_string(),
         ])
     };
-    // 看板读不出来（daemon 不可达、插件拒绝、协议错）时的说法。
-    //
-    // 登记表损坏或缺失都会被读成「空」——对整个过程是好事，但对我这三选一就不是：
-    // 「空」不能同时表示「没有看板」和「登记表坏了」。所以要先把损坏问出来，否则
-    // 一个坏掉的登记表会把我引向 create，而 create 会把它当空表覆盖，抹掉别的项目。
+    // 看板读不出来（daemon 不可达、插件拒绝、协议错）时的说法：登记里有没有这个
+    // 项目，决定是「真故障」还是「还没建」。
     let unreadable = |message: String| {
-        plain(vec![if yi_agent_boards::registry::is_corrupt(global) {
-            // 用注入的 global 拼路径，不写死 `~`：测试传的是临时目录，写死会
-            // 指错地方，而这里恰恰是要让用户找到那个文件。
-            format!(
-                "看板登记表已损坏（{}）；请修复后重试。",
-                global.join("boards.json").display()
-            )
-        } else if yi_agent_boards::registry::contains(global, workdir).unwrap_or(false) {
+        let registered = yi_agent_store::resident::list(resident_dir)
+            .iter()
+            .any(|project| project == workdir);
+        plain(vec![if registered {
             format!("无法读取看板: {message}")
         } else {
             "本目录尚未创建看板；用 /superpowers-kanban create 创建。".to_string()
@@ -114,6 +117,37 @@ pub fn handle_kanban_with(workdir: &Path, args: &str, global: &Path) -> KanbanOu
             Err(QueryFailure::PluginMissing) => unavailable(),
             Err(QueryFailure::Other(message)) => unreadable(message),
         },
+        // 创建/移除是**插件自己的**动作（它按通用契约登记常驻、建/删自己的
+        // 状态目录）。宿主已不再有看板登记表，故这两条经通用通道转给插件，
+        // 与 on/off/run/add 走的是同一条路。
+        "create" | "remove" => {
+            let method = if argument == "create" {
+                "lifecycle/create"
+            } else {
+                "lifecycle/remove"
+            };
+            match query_plugin(workdir, method, json!({ "project": workdir.to_string_lossy() })) {
+                Ok(_) => plain(vec![if argument == "create" {
+                    "Superpowers 看板: 已创建（插件已登记本目录的常驻需求）".to_string()
+                } else {
+                    "Superpowers 看板: 已移除（插件已释放本目录的常驻需求）".to_string()
+                }]),
+                Err(QueryFailure::PluginMissing) => unavailable(),
+                Err(QueryFailure::Other(message)) => {
+                    plain(vec![format!("Superpowers 看板 {argument} 失败: {message}")])
+                }
+            }
+        }
+        "status" => {
+            let registered = yi_agent_store::resident::list(resident_dir)
+                .iter()
+                .any(|project| project == workdir);
+            plain(vec![if registered {
+                "本目录的看板已登记；插件进程由常驻值守维护。".to_string()
+            } else {
+                "本目录尚未创建看板；用 /superpowers-kanban create 创建。".to_string()
+            }])
+        }
         "on" | "off" => {
             let on = argument == "on";
             match query_plugin(workdir, "switch.write", json!({ "on": on })) {
@@ -344,6 +378,9 @@ mod tests {
             "list" => Ok(json!({ "cards": [
                 { "id": "card-1", "state": "running", "plan_path": "a.plan.md" }
             ]})),
+            // 插件自己的生命周期动作：宿主只转发，不认识结果形状。
+            "lifecycle/create" => Ok(json!({ "project": params["project"], "registered": true })),
+            "lifecycle/remove" => Ok(json!({ "project": params["project"], "registered": false })),
             "enqueue" => Ok(json!({ "id": "a-spec-a-plan" })),
             "enqueue_prequeued" => Ok(json!({ "id": "my-idea" })),
             "promote" => Ok(json!({ "id": params["id"] })),
@@ -377,12 +414,12 @@ mod tests {
         // 所以即便本目录没登记，也不能改口成创建指引（既有测试也钉死这一点）。
         // 只有「连不上 / 插件拒绝」这类读不到，才轮到登记表分辨。
         let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("global");
+        let resident_dir = dir.path().join("resident");
         let workdir = dir.path().join("proj");
         std::fs::create_dir_all(&workdir).unwrap();
         fake_daemon(&workdir, runtime_up_plugin_down);
 
-        let outcome = handle_kanban_with(&workdir, "", &global);
+        let outcome = handle_kanban_with(&workdir, "", &resident_dir);
         assert!(
             outcome.lines[0].contains("插件未安装"),
             "expected the uninstalled notice, got {:?}",
@@ -396,11 +433,11 @@ mod tests {
         // 以前这里甩一句 `daemon is unavailable` 的连接错误，用户没有下一步；
         // 现在给创建指引。故意不起 fake_daemon：连接失败本身就是这个场景。
         let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("global");
+        let resident_dir = dir.path().join("resident");
         let workdir = dir.path().join("proj");
         std::fs::create_dir_all(&workdir).unwrap();
 
-        let outcome = handle_kanban_with(&workdir, "", &global);
+        let outcome = handle_kanban_with(&workdir, "", &resident_dir);
         assert_eq!(outcome.toggled_to, None);
         assert!(
             outcome.lines[0].contains("未创建"),
@@ -419,12 +456,14 @@ mod tests {
         // 反向：本目录**已登记**看板，读不出来就是真故障（daemon 挂了 / 插件
         // 拒绝），必须报错而不是让用户去 create 一个已经存在的看板。
         let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("global");
+        let resident_dir = dir.path().join("resident");
         let workdir = dir.path().join("proj");
         std::fs::create_dir_all(&workdir).unwrap();
-        yi_agent_boards::registry::register(&global, &workdir).unwrap();
+        // 通用的常驻登记：本项目已被某个请求者要求常驻。宿主只问「有没有」，
+        // 不认识是哪个插件。
+        yi_agent_store::resident::require(&resident_dir, &workdir, "superpowers-kanban").unwrap();
 
-        let outcome = handle_kanban_with(&workdir, "", &global);
+        let outcome = handle_kanban_with(&workdir, "", &resident_dir);
         assert!(
             outcome.lines[0].contains("无法读取看板"),
             "a registered board's read failure must be reported: {:?}",
@@ -433,32 +472,69 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_registry_is_reported_instead_of_advising_create() {
-        // 登记表坏了 + 本目录连不上：旧的二态判断只看得到「空」，会建议用户
-        // create，而 create 会把坏表当空表覆盖，抹掉其它项目的登记。坏表必须
-        // 单独说出来。
+    fn a_corrupt_resident_registry_reads_as_empty_and_points_at_create() {
+        // 通用登记目录对坏文件是**宽容读**（回空表），与常驻值守的读法一致：
+        // 一份坏文件不该让值守者崩掉，也不该在这里变成一条误导性的错误。
+        // 于是「读不到 + 登记为空」就是「本目录还没建」，给创建指引。
         let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("global");
+        let resident_dir = dir.path().join("resident");
         let workdir = dir.path().join("proj");
         std::fs::create_dir_all(&workdir).unwrap();
-        std::fs::create_dir_all(&global).unwrap();
-        std::fs::write(global.join("boards.json"), "{ not json").unwrap();
+        std::fs::create_dir_all(&resident_dir).unwrap();
+        std::fs::write(resident_dir.join("resident-daemons.json"), "{ not json").unwrap();
 
-        let outcome = handle_kanban_with(&workdir, "", &global);
+        let outcome = handle_kanban_with(&workdir, "", &resident_dir);
         assert!(
-            outcome.lines[0].contains("损坏"),
-            "a corrupt registry must be named as such: {:?}",
+            outcome.lines[0].contains("尚未创建"),
+            "a lenient empty read is 'not created yet': {:?}",
             outcome.lines
         );
         assert!(
-            outcome.lines[0].contains(&global.join("boards.json").display().to_string()),
-            "the message must point at the real registry file: {:?}",
+            !outcome.lines[0].contains("损坏"),
+            "the generic registry is read leniently, not reported as corrupt: {:?}",
             outcome.lines
         );
+    }
+
+    /// `create`/`remove` 经**通用通道**转给插件：宿主不再自己写登记表。
+    #[test]
+    fn create_and_remove_are_forwarded_to_the_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let resident_dir = dir.path().join("resident");
+
+        // 只起一个假 daemon：同一个 workdir 的 socket 只能 bind 一次。
+        let log = fake_daemon(dir.path(), installed);
+        let outcome = handle_kanban_with(dir.path(), "create", &resident_dir);
+        assert_eq!(outcome.toggled_to, None);
         assert!(
-            !outcome.lines[0].contains("尚未创建"),
-            "must not advise create against a corrupt registry: {:?}",
+            outcome.lines[0].contains("已创建"),
+            "create must be acknowledged: {:?}",
             outcome.lines
+        );
+        let queries = log.lock().unwrap();
+        let (method, params) = queries
+            .iter()
+            .find(|(method, _)| method == "lifecycle/create")
+            .unwrap_or_else(|| panic!("create must reach the plugin, saw {queries:?}"));
+        assert_eq!(
+            params["project"],
+            json!(dir.path().to_string_lossy()),
+            "the plugin acts on `params.project`"
+        );
+        drop(queries);
+
+        let outcome = handle_kanban_with(dir.path(), "remove", &resident_dir);
+        assert!(
+            outcome.lines[0].contains("已移除"),
+            "remove must be acknowledged: {:?}",
+            outcome.lines
+        );
+        let queries = log.lock().unwrap();
+        assert!(
+            queries
+                .iter()
+                .any(|(method, _)| method == "lifecycle/remove"),
+            "remove must reach the plugin, saw {queries:?}"
         );
     }
 
@@ -536,9 +612,9 @@ mod tests {
     #[test]
     fn add_prequeued_delivers_through_the_plugin() {
         let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("global");
+        let resident_dir = dir.path().join("resident");
         let log = fake_daemon(dir.path(), installed);
-        let outcome = handle_kanban_with(dir.path(), "add-prequeued my idea", &global);
+        let outcome = handle_kanban_with(dir.path(), "add-prequeued my idea", &resident_dir);
         assert!(outcome.lines[0].contains("my-idea"), "{:?}", outcome.lines);
         let calls = log.lock().unwrap().clone();
         assert!(
@@ -553,9 +629,13 @@ mod tests {
     #[test]
     fn promote_delivers_through_the_plugin() {
         let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("global");
+        let resident_dir = dir.path().join("resident");
         let log = fake_daemon(dir.path(), installed);
-        let outcome = handle_kanban_with(dir.path(), "promote idea a.spec.md a.plan.md", &global);
+        let outcome = handle_kanban_with(
+            dir.path(),
+            "promote idea a.spec.md a.plan.md",
+            &resident_dir,
+        );
         assert!(outcome.lines[0].contains("idea"), "{:?}", outcome.lines);
         let calls = log.lock().unwrap().clone();
         assert!(
@@ -570,7 +650,7 @@ mod tests {
     #[test]
     fn a_board_line_falls_back_to_the_title_when_there_is_no_plan() {
         let dir = tempfile::tempdir().unwrap();
-        let global = dir.path().join("global");
+        let resident_dir = dir.path().join("resident");
         fake_daemon(dir.path(), |method, params| match method {
             "switch.read" => Ok(json!({ "on": true, "source": "project" })),
             "list" => Ok(json!({
@@ -581,7 +661,7 @@ mod tests {
             })),
             other => installed(other, params),
         });
-        let outcome = handle_kanban_with(dir.path(), "", &global);
+        let outcome = handle_kanban_with(dir.path(), "", &resident_dir);
         assert!(
             outcome
                 .lines
