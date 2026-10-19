@@ -140,6 +140,39 @@ impl ReasoningCapabilities {
     }
 }
 
+/// 该条目在**生效通道**上被证实可用的档位；`None` = 能力未知。
+///
+/// 「未知」与「空集」是两件事：前者表示没探测过（或探测出错），调用方应保持
+/// 宽松（平铺七档、运行期靠剥离重投兜底）；后者表示探测明确得出结论——七档
+/// 全被拒。把两者混为一谈会让「探测失败的模型」在 UI 上一个档位都没有。
+///
+/// 通道判定与 provider 实际走线一致：
+/// - `anthropic` → `anthropic` 槽位；
+/// - `openai + api_style = chat/responses` → 对应槽位；
+/// - `openai + auto` → 两条都可能，优先 `responses`（`OpenaiProvider` 的默认
+///   落点），取第一条「可信」记录。
+pub fn supported_efforts(entry: &ModelEntry) -> Option<Vec<String>> {
+    let caps = entry.reasoning_capabilities.as_ref()?;
+    let candidate = match entry.provider {
+        ModelProvider::Anthropic => caps.anthropic.as_ref(),
+        ModelProvider::Openai => match entry.api_style.as_deref() {
+            Some("chat") => caps.chat.as_ref(),
+            Some("responses") => caps.responses.as_ref(),
+            _ => caps
+                .responses
+                .as_ref()
+                .filter(|c| c.error.is_none())
+                .or_else(|| caps.chat.as_ref().filter(|c| c.error.is_none())),
+        },
+    }?;
+    if candidate.error.is_some() {
+        // 这一轮没结论（鉴权失败、超时、基线被拒）：按未知处理，不要谎报
+        // 「零个档位可用」。
+        return None;
+    }
+    Some(candidate.supported.clone())
+}
+
 /// 只保留白名单内的档位，并按白名单顺序排序去重。坏值读作空表。
 fn de_supported_tiers<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where

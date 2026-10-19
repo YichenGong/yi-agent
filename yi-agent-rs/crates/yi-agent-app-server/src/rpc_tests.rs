@@ -12998,6 +12998,191 @@ async fn model_list_over_dispatch_masks_the_key() {
     h.shutdown().await;
 }
 
+/// 读到指定 `method` 的通知为止(最多 20 帧),丢弃中间穿插的其它帧。
+async fn read_notification(h: &mut Harness, method: &str) -> serde_json::Value {
+    for _ in 0..20 {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some(method) {
+            return v;
+        }
+    }
+    panic!("notification {method} never arrived");
+}
+
+/// `model/probe` 的后台探测：先回 `started`，完成后把权威能力写进清单并广播。
+///
+/// 上游用 wiremock 模拟「所有档位都接受」。断言两条主线：
+/// 1. 响应立即返回（不阻塞 30s 的探测）；
+/// 2. `model/capabilitiesChanged` 带上的正是落盘后的能力。
+#[tokio::test(flavor = "multi_thread")]
+async fn model_probe_records_capabilities_and_broadcasts_them() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+        .mount(&server)
+        .await;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"model/upsert","params":{{"name":"A","provider":"openai","api_url":"{}","model":"m","api_key":"k","api_style":"chat"}}}}"#,
+        server.uri()
+    ))
+    .await;
+    assert_eq!(read_response(&mut h, 9).await["result"]["ok"], true);
+
+    // upsert 已经自动起了一轮探测；先收下它的结果，再测显式触发的那一轮
+    // （否则显式请求会被去重表判成重复，测不到 `started:true` 这条路径）。
+    let first = read_notification(&mut h, "model/capabilitiesChanged").await;
+    assert_eq!(first["params"]["name"], "A");
+
+    h.send(r#"{"jsonrpc":"2.0","id":10,"method":"model/probe","params":{"name":"A"}}"#)
+        .await;
+    let v = read_response(&mut h, 10).await;
+    assert_eq!(v["result"]["started"], true, "probe must start: {v}");
+
+    let n = read_notification(&mut h, "model/capabilitiesChanged").await;
+    assert_eq!(n["params"]["name"], "A");
+    assert_eq!(
+        n["params"]["reasoning_capabilities"]["chat"]["supported"],
+        serde_json::json!(["none", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "the broadcast must carry the persisted result: {n}"
+    );
+
+    // 落盘一致：`model/list` 读到的就是广播出去的那份。
+    h.send(r#"{"jsonrpc":"2.0","id":11,"method":"model/list","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 11).await;
+    assert_eq!(
+        v["result"]["models"][0]["reasoning_capabilities"]["chat"]["supported"],
+        serde_json::json!(["none", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "persisted capabilities must match the broadcast: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// 同名条目的探测不得并发跑两轮：第二次请求直接回 `started:false`。
+#[tokio::test(flavor = "multi_thread")]
+async fn model_probe_is_deduplicated_while_one_is_running() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(150))
+                .set_body_string("data: [DONE]\n\n"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"model/upsert","params":{{"name":"A","provider":"openai","api_url":"{}","model":"m","api_key":"k","api_style":"chat"}}}}"#,
+        server.uri()
+    ))
+    .await;
+    assert_eq!(read_response(&mut h, 9).await["result"]["ok"], true);
+
+    // upsert 自动起的那一轮先跑完，去重表才会空出来。
+    read_notification(&mut h, "model/capabilitiesChanged").await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":10,"method":"model/probe","params":{"name":"A"}}"#)
+        .await;
+    h.send(r#"{"jsonrpc":"2.0","id":11,"method":"model/probe","params":{"name":"A"}}"#)
+        .await;
+    let first = read_response(&mut h, 10).await;
+    let second = read_response(&mut h, 11).await;
+    assert_eq!(first["result"]["started"], true, "{first}");
+    assert_eq!(
+        second["result"]["started"], false,
+        "a second concurrent probe must be rejected: {second}"
+    );
+
+    // 让这一轮跑完，避免 harness 结束时留下悬挂任务。
+    read_notification(&mut h, "model/capabilitiesChanged").await;
+    h.shutdown().await;
+}
+
+/// 探测未知条目回结构化 `model_not_found`，不是内部错误。
+#[tokio::test(flavor = "multi_thread")]
+async fn model_probe_on_an_unknown_entry_is_a_structured_error() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":9,"method":"model/probe","params":{"name":"nope"}}"#)
+        .await;
+    let v = read_response(&mut h, 9).await;
+    assert_eq!(v["error"]["data"]["code"], "model_not_found", "{v}");
+    h.shutdown().await;
+}
+
+/// upsert 新建条目后自动探测，不阻塞 upsert 的响应。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upsert_with_a_new_connection_starts_a_probe() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+        .mount(&server)
+        .await;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"model/upsert","params":{{"name":"A","provider":"openai","api_url":"{}","model":"m","api_key":"k","api_style":"chat"}}}}"#,
+        server.uri()
+    ))
+    .await;
+    assert_eq!(read_response(&mut h, 9).await["result"]["ok"], true);
+
+    let n = read_notification(&mut h, "model/capabilitiesChanged").await;
+    assert_eq!(n["params"]["name"], "A");
+    assert!(
+        n["params"]["reasoning_capabilities"]["chat"]["supported"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "upsert must trigger a probe and broadcast its result: {n}"
+    );
+    h.shutdown().await;
+}
+
+/// 只改密钥不触发重测：能力与连接字段都未变，重测是纯浪费。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upsert_that_only_changes_the_key_does_not_reprobe() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+        .mount(&server)
+        .await;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    let upsert = |id: u64, key: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"model/upsert","params":{{"name":"A","provider":"openai","api_url":"{}","model":"m","api_key":"{key}","api_style":"chat"}}}}"#,
+            server.uri()
+        )
+    };
+    h.send(&upsert(9, "k1")).await;
+    assert_eq!(read_response(&mut h, 9).await["result"]["ok"], true);
+    read_notification(&mut h, "model/capabilitiesChanged").await;
+
+    h.send(&upsert(10, "k2")).await;
+    assert_eq!(read_response(&mut h, 10).await["result"]["ok"], true);
+    // 短窗口负等待：不该有第二轮探测广播。
+    assert!(
+        h.try_read_value(Duration::from_millis(600))
+            .await
+            .map(|v| v.get("method").and_then(|m| m.as_str()) != Some("model/capabilitiesChanged"))
+            .unwrap_or(true),
+        "changing only the key must not re-probe"
+    );
+    h.shutdown().await;
+}
+
 /// An `Observe`-only client may read the (masked) catalog but must be refused
 /// every write. Production stdio is `Admin`; a paired phone defaults to
 /// `Control`, which is *allowed* to write, so this uses the lowest tier.

@@ -8,7 +8,9 @@
 //! 生产入口 [`handle_model_request`] 用 `models_path()`（`$HOME/.yi-agent/`）。
 //! 之所以不让测试改 `HOME`：cargo 并行跑测试，进程全局变量会让用例互相竞态。
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use yi_agent_runtime::config::RuntimeConfig;
@@ -16,6 +18,7 @@ use yi_agent_runtime::models::{
     ModelCatalog, ModelEntry, ModelProvider, effective_entry_for, load_catalog_from, mask_key,
     models_path, save_catalog_to,
 };
+use yi_agent_runtime::reasoning_probe::ProbeOutcome;
 
 use crate::protocol::RpcError;
 
@@ -45,12 +48,94 @@ pub fn handle_model_request_at(
                 "effective": effective_view(&catalog, fallback),
             }))
         }
+        // 只做条目存在性校验；真正的探测在 app-server 的 async 分支里跑
+        // （它要发网络请求，不能放在这个同步纯函数里）。
+        "model/probe" => {
+            let name = string_field(params, "name").unwrap_or_default();
+            let catalog = load_catalog_from(path);
+            match catalog.models.iter().find(|m| m.name == name) {
+                Some(_) => Ok(json!({ "ok": true })),
+                None => Err(RpcError::model_not_found(&name)),
+            }
+        }
         "model/upsert" => upsert(path, params),
         "model/delete" => delete(path, params),
         "model/setDefault" => set_reference(path, params, Reference::Default),
         "model/setSubagent" => set_reference(path, params, Reference::Subagent),
         "model/importEnv" => import_env(path, fallback),
         _ => Err(RpcError::method_not_found(method)),
+    }
+}
+
+/// 条目「连接身份」的指纹：探测期间它变了，结果就不可信。
+///
+/// **不含 `api_key`**：换密钥不影响模型支持哪些档位。与 `upsert` 里判定
+/// 「能力是否仍有效」用的是同一组字段，两处必须同步，否则会出现「upsert 认为
+/// 能力还有效、探测结果却被指纹判为过期」的死角。
+pub fn entry_fingerprint(entry: &ModelEntry) -> String {
+    format!(
+        "{}|{}|{}|{}",
+        entry.provider.as_str(),
+        entry.api_url,
+        entry.model,
+        entry.api_style.as_deref().unwrap_or("auto")
+    )
+}
+
+/// 把一次探测结果写回清单。返回是否真的写入。
+///
+/// 写前**重读并核对指纹**：一轮探测可能跑几十秒，期间条目可能被改、被删，
+/// 或者被另一个客户端改成了完全不同的模型。直接拿探测开始时的内存副本落盘
+/// 会覆盖掉这些并发修改。
+pub fn apply_probe_result(
+    path: &Path,
+    name: &str,
+    fingerprint: &str,
+    outcome: ProbeOutcome,
+) -> bool {
+    let mut catalog = load_catalog_from(path);
+    let Some(entry) = catalog.models.iter_mut().find(|m| m.name == name) else {
+        return false;
+    };
+    if entry_fingerprint(entry) != fingerprint {
+        return false;
+    }
+    let Some(slot) = entry
+        .reasoning_capabilities
+        .get_or_insert_with(Default::default)
+        .channel_mut(&outcome.channel)
+    else {
+        // 未知通道名：宁可丢弃，也不把数据写到错误的槽位。
+        return false;
+    };
+    *slot = Some(outcome.capability);
+    save_catalog_to(path, &catalog).is_ok()
+}
+
+/// 正在探测的条目名集合（进程内）。
+///
+/// 用途是**去重**：用户连点两下「重新探测」不该打出两倍请求。它只是内存态，
+/// 崩溃/重启即清空——那正是我们想要的，残留的「探测中」标记比重复探测更糟。
+#[derive(Clone, Default)]
+pub struct ProbeRegistry(Arc<Mutex<HashSet<String>>>);
+
+impl ProbeRegistry {
+    /// 登记一次探测。返回 `false` 表示同名条目已在探测中。
+    pub fn try_begin(&self, name: &str) -> bool {
+        self.0
+            .lock()
+            .map(|mut set| set.insert(name.to_string()))
+            .unwrap_or(false)
+    }
+
+    pub fn finish(&self, name: &str) {
+        if let Ok(mut set) = self.0.lock() {
+            set.remove(name);
+        }
+    }
+
+    pub fn is_running(&self, name: &str) -> bool {
+        self.0.lock().map(|set| set.contains(name)).unwrap_or(false)
     }
 }
 
@@ -75,6 +160,7 @@ fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
             "model": entry.model,
             "api_style": entry.api_style,
             "reasoning_effort": entry.reasoning_effort,
+            "reasoning_capabilities": entry.reasoning_capabilities,
             "has_key": !entry.api_key.is_empty(),
             "api_key_masked": mask_key(&entry.api_key),
         }),
@@ -86,6 +172,8 @@ fn effective_view(catalog: &ModelCatalog, cfg: &RuntimeConfig) -> Value {
             "model": cfg.model,
             "api_style": cfg.api_style.as_str(),
             "reasoning_effort": cfg.reasoning_effort,
+            // env 来源没有能力数据：只有清单条目才有探测记录。
+            "reasoning_capabilities": Value::Null,
             "has_key": !cfg.api_key.is_empty(),
             "api_key_masked": mask_key(&cfg.api_key),
         }),
@@ -102,6 +190,9 @@ fn entry_view(entry: &ModelEntry) -> Value {
         "model": entry.model,
         "api_style": entry.api_style,
         "reasoning_effort": entry.reasoning_effort,
+        // `None` = 未探测（或探测失败到无法归因）：UI 据此平铺全部档位，
+        // 与探测功能上线前的行为一致。
+        "reasoning_capabilities": entry.reasoning_capabilities,
         "has_key": !entry.api_key.is_empty(),
         "api_key_masked": mask_key(&entry.api_key),
     })
@@ -501,6 +592,134 @@ mod tests {
                 "changing {change} must clear capabilities"
             );
         }
+    }
+
+    #[test]
+    fn probe_result_is_dropped_when_the_fingerprint_is_stale() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let fingerprint = entry_fingerprint(&load_catalog_from(&path).models[0]);
+
+        let stale = ProbeOutcome {
+            channel: "anthropic".into(),
+            capability: yi_agent_runtime::models::ChannelCapability {
+                supported: vec!["low".into()],
+                probed_at: 1,
+                error: None,
+            },
+        };
+        assert!(!apply_probe_result(&path, "A", "stale", stale));
+        assert!(
+            load_catalog_from(&path).models[0]
+                .reasoning_capabilities
+                .is_none(),
+            "a stale result must not be written"
+        );
+
+        let fresh = ProbeOutcome {
+            channel: "anthropic".into(),
+            capability: yi_agent_runtime::models::ChannelCapability {
+                supported: vec!["low".into(), "high".into()],
+                probed_at: 2,
+                error: None,
+            },
+        };
+        assert!(apply_probe_result(&path, "A", &fingerprint, fresh));
+        let caps = load_catalog_from(&path).models[0]
+            .reasoning_capabilities
+            .clone()
+            .unwrap();
+        assert_eq!(caps.anthropic.unwrap().supported, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn probe_result_on_a_deleted_entry_is_a_no_op() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let fingerprint = entry_fingerprint(&load_catalog_from(&path).models[0]);
+        call(&path, "model/delete", json!({"name":"A"})).unwrap();
+        let outcome = ProbeOutcome {
+            channel: "anthropic".into(),
+            capability: yi_agent_runtime::models::ChannelCapability::default(),
+        };
+        assert!(!apply_probe_result(&path, "A", &fingerprint, outcome));
+    }
+
+    /// 探测结果只覆盖命中的通道槽位，不碰其它通道。
+    #[test]
+    fn applying_a_result_leaves_other_channels_untouched() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        let fingerprint = entry_fingerprint(&load_catalog_from(&path).models[0]);
+        apply_probe_result(
+            &path,
+            "A",
+            &fingerprint,
+            ProbeOutcome {
+                channel: "chat".into(),
+                capability: yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["low".into()],
+                    probed_at: 1,
+                    error: None,
+                },
+            },
+        );
+        apply_probe_result(
+            &path,
+            "A",
+            &fingerprint,
+            ProbeOutcome {
+                channel: "responses".into(),
+                capability: yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["high".into()],
+                    probed_at: 2,
+                    error: None,
+                },
+            },
+        );
+        let caps = load_catalog_from(&path).models[0]
+            .reasoning_capabilities
+            .clone()
+            .unwrap();
+        assert_eq!(caps.chat.unwrap().supported, vec!["low"]);
+        assert_eq!(caps.responses.unwrap().supported, vec!["high"]);
+        assert!(caps.anthropic.is_none());
+    }
+
+    #[test]
+    fn model_list_reports_capabilities_per_entry() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        set_capabilities(&path, "A");
+        let list = call(&path, "model/list", json!({})).unwrap();
+        assert_eq!(
+            list["models"][0]["reasoning_capabilities"]["anthropic"]["supported"],
+            json!(["low", "high"])
+        );
+    }
+
+    #[test]
+    fn probe_requires_a_known_entry() {
+        let (_dir, path) = catalog_path();
+        let err = call(&path, "model/probe", json!({"name":"nope"})).unwrap_err();
+        assert_eq!(err.data.unwrap()["code"], "model_not_found");
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        assert_eq!(
+            call(&path, "model/probe", json!({"name":"A"})).unwrap(),
+            json!({"ok": true})
+        );
+    }
+
+    #[test]
+    fn the_probe_registry_deduplicates_by_name() {
+        let reg = ProbeRegistry::default();
+        assert!(reg.try_begin("A"));
+        assert!(!reg.try_begin("A"), "second request must be rejected");
+        assert!(reg.is_running("A"));
+        assert!(reg.try_begin("B"), "other names are independent");
+        reg.finish("A");
+        assert!(!reg.is_running("A"));
+        assert!(reg.try_begin("A"), "after finishing it can run again");
     }
 
     #[test]
