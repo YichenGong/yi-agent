@@ -46,7 +46,7 @@ pub fn handle_onboarding_request_at(
     }
 }
 
-fn missing_name(missing: yi_agent_runtime::onboarding::Missing) -> &'static str {
+pub(crate) fn missing_name(missing: yi_agent_runtime::onboarding::Missing) -> &'static str {
     use yi_agent_runtime::onboarding::Missing;
     match missing {
         Missing::Provider => "provider",
