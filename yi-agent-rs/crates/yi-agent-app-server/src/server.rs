@@ -1935,41 +1935,6 @@ fn migrate_legacy_model_keys_on_startup() {
 /// 读侧宽容，且**故意不**在损坏时改名：一份手改坏的旧登记表若被当成「空表」然后
 /// 改名取证，用户就再也拿不回里面的项目了。损坏 → 返回 `None`、文件原地不动，由
 /// 调用方记一条 warn；缺文件 → 空列表（没什么可迁的）。
-fn parse_legacy_board_projects(legacy_file: &Path) -> Option<Vec<PathBuf>> {
-    let text = match std::fs::read_to_string(legacy_file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                path = %legacy_file.display(),
-                "could not read the legacy board registry; leaving it in place"
-            );
-            return None;
-        }
-    };
-    #[derive(serde::Deserialize)]
-    struct Legacy {
-        #[serde(default)]
-        boards: Vec<LegacyBoard>,
-    }
-    #[derive(serde::Deserialize)]
-    struct LegacyBoard {
-        project: PathBuf,
-    }
-    match serde_json::from_str::<Legacy>(&text) {
-        Ok(registry) => Some(registry.boards.into_iter().map(|b| b.project).collect()),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                path = %legacy_file.display(),
-                "the legacy board registry is corrupt; leaving it in place"
-            );
-            None
-        }
-    }
-}
-
 /// 生产启动期的一次性迁移：旧常驻登记表 → 通用常驻登记。
 ///
 /// 只在生产入口（`run` / `serve_stdio_with_relay`）调用一次，与
@@ -1994,7 +1959,7 @@ fn migrate_legacy_resident_requests_on_startup(resident_dir: &Path) {
 /// 写下的名字必须与那个插件此后读写的一致，否则它认不出这是「自己要常驻的项目」，
 /// 下一次读取就会把登记当成别人的。
 fn migrate_legacy_registry_file(legacy_file: &Path, resident_dir: &Path) {
-    let Some(projects) = parse_legacy_board_projects(legacy_file) else {
+    let Some(projects) = crate::legacy_compat::parse_legacy_registry(legacy_file) else {
         return;
     };
     if projects.is_empty() {
@@ -2035,7 +2000,7 @@ mod legacy_migration_tests {
         .unwrap();
 
         assert_eq!(
-            parse_legacy_board_projects(&legacy),
+            crate::legacy_compat::parse_legacy_registry(&legacy),
             Some(vec![PathBuf::from("/p/a"), PathBuf::from("/p/b")])
         );
     }
@@ -2045,7 +2010,7 @@ mod legacy_migration_tests {
     fn an_absent_legacy_registry_is_nothing_to_migrate() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            parse_legacy_board_projects(&dir.path().join("boards.json")),
+            crate::legacy_compat::parse_legacy_registry(&dir.path().join("boards.json")),
             Some(Vec::new())
         );
     }
@@ -2058,7 +2023,7 @@ mod legacy_migration_tests {
         let legacy = dir.path().join("boards.json");
         std::fs::write(&legacy, "{ not json").unwrap();
 
-        assert_eq!(parse_legacy_board_projects(&legacy), None);
+        assert_eq!(crate::legacy_compat::parse_legacy_registry(&legacy), None);
         assert_eq!(
             std::fs::read_to_string(&legacy).unwrap(),
             "{ not json",
@@ -2163,17 +2128,16 @@ mod legacy_migration_tests {
     /// crate 一起消失,旧环境的看板就没人来迁了。
     #[test]
     fn the_migration_does_not_depend_on_the_boards_crate() {
-        let production = production_source();
-        // 只取迁移那一族函数本体,到下一个顶层函数为止:文件别处(**生产入口**也)
-        // 还有别的代码,那些是 Task 6 的事,不该算进这里。
-        let body = production
-            .split("fn parse_legacy_board_projects(")
-            .nth(1)
-            .and_then(|rest| rest.split("\npub(crate) async fn serve_scoped").next())
-            .expect("the migration functions must sit just before `serve_scoped`");
+        // 旧格式的解析已经收进 `legacy_compat`（那是**唯一**该知道 `boards.json`
+        // 长什么样的地方），故这里检查那个文件，而不是本文件的片段。
+        let source = include_str!("legacy_compat.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("legacy_compat must have a production part");
         let needle = ["yi_agent", "_boards"].concat();
         assert!(
-            !body.contains(&needle),
+            !production.contains(&needle),
             "the migration path must stay independent of the boards crate"
         );
     }

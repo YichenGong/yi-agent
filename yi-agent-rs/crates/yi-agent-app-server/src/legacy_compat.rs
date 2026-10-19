@@ -60,6 +60,50 @@ pub fn legacy_board_registry_path_of(dir: &Path) -> PathBuf {
     dir.join(LEGACY_BOARD_REGISTRY)
 }
 
+/// 读一份旧登记表，返回其中的项目路径。
+///
+/// `{"boards":[{"project":"…"}, …]}` 是那个已删 crate 的磁盘格式；本文件是
+/// **唯一**知道它长什么样的地方。文件不存在视为「没有旧数据」（`Some(vec![])`），
+/// 读不动或解析失败返回 `None` —— 调用方据此**保留原文件**，下次启动再试，
+/// 而不是把用户的数据当成空表抹掉。
+///
+/// 返回 `Option` 而不是 `Result`：调用方（启动迁移）对这三类失败的处理完全一样，
+/// 都是「记一条 warn，别动文件，照常启动」。
+pub fn parse_legacy_registry(legacy_file: &Path) -> Option<Vec<PathBuf>> {
+    let text = match std::fs::read_to_string(legacy_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %legacy_file.display(),
+                "could not read the legacy registry; leaving it in place"
+            );
+            return None;
+        }
+    };
+    #[derive(serde::Deserialize)]
+    struct Legacy {
+        #[serde(default)]
+        boards: Vec<LegacyBoard>,
+    }
+    #[derive(serde::Deserialize)]
+    struct LegacyBoard {
+        project: PathBuf,
+    }
+    match serde_json::from_str::<Legacy>(&text) {
+        Ok(registry) => Some(registry.boards.into_iter().map(|b| b.project).collect()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %legacy_file.display(),
+                "the legacy registry is corrupt; leaving it in place"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -413,6 +413,69 @@ G1（`2026-10-17-session-driver-decoupling-design.md`）把宿主里的看板**�
    > 假通过）；**排除 `onboarding`**（`grep "board"` 会匹配 `onboarding*`，不排则永不归零）；
    > 保留 `test` / `//` 的排除。归零前须先裁定顶部刷新 ③ 的
    > `is_kanban_worktree`（物理路径约定 `.worktrees/kanban/`）归属。
+   > **裁决（2026-10-19 实测，51 行残留，逐项允许）**
+   >
+   > 初稿的「归零」在字面上不可达，且**不该**可达：剩下的每一行要么是磁盘／系统上
+   > 的既成事实（删掉就破坏老环境），要么是用户可见的命令名（删掉就违反 §6.9）。
+   > 下面这份清单就是上面那句「通用插件机制除外」的具体化，实现在
+   > `app-server/src/legacy_compat.rs` 与 `app-server/src/plugin_worktree.rs`
+   > 两处的模块文档里逐条说明了理由。
+   >
+   > | 落点 | 行数 | 性质 | 为什么不能消掉 |
+   > |---|---|---|---|
+   > | `legacy_compat.rs` | 10 | 旧格式解析 | `boards.json` 的形状、旧目录 `$HOME/.yi-agent/superpowers-kanban`、迁移写入的 `required_by` 值。全部集中在这一个模块，宿主别处不再拼这些字符串 |
+   > | `server.rs:1949,1972` | 2 | 迁移调用点 | 只引用上面的常量／函数，不自己持有字面量 |
+   > | `settings_store.rs:101` | 1 | 旧偏好键 | 老机器上写下的「关掉登录自启」必须仍生效（§6.8） |
+   > | `thread_store.rs:58` | 1 | 旧 meta 键别名 | G1 遗留的兼容读，spec 原文已允许 |
+   > | `watchman.rs:22` | 1 | 旧 launchd 标签 | 不清理会在老机器上同时跑两个值守 |
+   > | `plugin_worktree.rs:39` | 1 | 插件 worktree 命名空间 | §5.2 方案 (a)：纯路径判据要认出「这是插件划的领地」，宿主必须知道保留名；真机已有 9 例幽灵组长 |
+   > | `tui/superpowers_kanban.rs` | 19 | 用户可见命令 `/superpowers-kanban` 与其文案 | §5.6 明确允许「保留为提示」；改名等于改用户可见行为（§6.9） |
+   > | `tui/slash.rs` | 8 | 同上（命令注册与 `kanban` 过渡别名） | 同上 |
+   > | `tui/app.rs` | 4 | 同上（分发与更名提示） | 同上 |
+   > | `tui/mod.rs:18` | 1 | 模块名 | 与上面的命令同源 |
+   >
+   > **判定标准**：宿主是否**理解**看板语义。它不再理解——建/删走 `plugin/query`，
+   > 列举走 `resident/list`，装插件走 `plugin/install`，且 `plugin/install` 里没有
+   > 任何具体插件名。上表全是「认出一个既成的名字」而不是「实现一个看板功能」。
+   >
+   > 复核命令（排除测试模块与注释后应为 51 行，且逐行能对到上表）：
+   > ```bash
+   > python3 - <<'EOF'
+   > import re, pathlib
+   > roots=["yi-agent-rs/crates/yi-agent-app-server/src",
+   >        "yi-agent-rs/crates/yi-agent-supervisors/src",
+   >        "yi-agent-rs/crates/yi-agent/src"]
+   > files=[p for r in roots for p in pathlib.Path(r).rglob("*.rs")]
+   > pat=re.compile(r"kanban|board|卡片",re.I)
+   > excl=re.compile(r"keyboard|clipboard|onboarding|//|#\[cfg\(test\)\]",re.I)
+   > def inside(lines):
+   >     ins=set(); i=0
+   >     while i<len(lines):
+   >         if re.match(r"\s*#\[cfg\(test\)\]",lines[i]):
+   >             j=i
+   >             while j<len(lines) and "{" not in lines[j]: j+=1
+   >             if j<len(lines):
+   >                 d=0
+   >                 for k in range(j,len(lines)):
+   >                     d+=lines[k].count("{")-lines[k].count("}")
+   >                     ins.add(k+1)
+   >                     if d<=0: break
+   >         i+=1
+   >     return ins
+   > n=0
+   > for p in files:
+   >     t=p.name.endswith("_tests.rs") or "/tests/" in str(p)
+   >     lines=p.read_text(errors="replace").splitlines()
+   >     skip=inside(lines) if not t else set(range(1,len(lines)+1))
+   >     for i,l in enumerate(lines,1):
+   >         if pat.search(l) and not excl.search(l) and i not in skip: n+=1
+   > print(n)
+   > EOF
+   > ```
+   > 之所以附上这条脚本而不是 spec 原命令：`grep -v test` 只能滤掉**行内含 test
+   > 字样**的行，滤不掉整个 `#[cfg(test)] mod tests { … }` 块（实测 `server.rs`
+   > 就有 40+ 行测试代码被算进「生产」）。
+
 3. `board/create` / `board/remove` / `board/list` 三个 RPC 不再存在（`Domain::Board` 删除）。
 3a. **通用 `plugin/install {project, plugin}`**（§4.4 方案 A）：
    - 按 `plugin` 名在 PATH 上解析可执行文件，**宿主源码里不出现任何具体插件名**；
