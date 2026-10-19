@@ -26,12 +26,36 @@ pub(crate) async fn handle(
 ) -> anyhow::Result<Flow> {
     match req.method.as_str() {
         "config/read" => {
-            write_response(
-                state.hub,
-                state.client,
-                ok_response(id, state.cfg.redacted_view()),
-            )
-            .await?;
+            let response = match req.params.get("threadId").and_then(|v| v.as_str()) {
+                // 桌面端传当前会话:卡片要的是**这个会话**生效的配置,而不是
+                // sidecar 启动快照(workdir = sidecar cwd、model = 清单默认、
+                // yolo = 启动 flag)。
+                Some(thread_id) => {
+                    match crate::server::thread_cwd(
+                        state.threads,
+                        state.workspaces,
+                        state.cfg,
+                        thread_id,
+                    ) {
+                        Some(cwd) => {
+                            let view = crate::rpc::thread_config_view(
+                                state.cfg,
+                                state.threads,
+                                state.workspaces,
+                                state.models_path,
+                                thread_id,
+                                &cwd,
+                            );
+                            ok_response(id, view)
+                        }
+                        // 未知 thread 绝不静默回退成进程快照:那等于用一个与
+                        // 会话无关的配置冒充「当前配置」。
+                        None => err_response(id, RpcError::unknown_thread(thread_id)),
+                    }
+                }
+                None => ok_response(id, state.cfg.redacted_view()),
+            };
+            write_response(state.hub, state.client, response).await?;
         }
         "ui/settings/read" => {
             // 以共享句柄的当前值为权威（与 `set_theme` 工具同一实例）;

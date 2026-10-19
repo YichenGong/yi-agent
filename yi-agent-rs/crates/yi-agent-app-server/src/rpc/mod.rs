@@ -45,6 +45,67 @@ use crate::protocol::Scope;
 use crate::session::ThreadSession;
 use crate::theme_tool::ThemeHandle;
 use crate::workspace_index::WorkspaceIndex;
+
+/// 某个会话的生效配置的脱敏视图(`config/read` 带 `threadId` 时的响应)。
+///
+/// 解析顺序与建 agent 时一致:会话模型覆盖(活会话以 `ThreadSession.model` 为准,
+/// 冷会话按 meta 的 `model_ref`)→ 整包注入 → 清单默认;`workdir` 取会话 cwd;
+/// `yolo` 取会话的权限档(活会话看运行期开关,冷会话看落盘的 `permission_mode`)。
+///
+/// 这样卡片显示的 provider / model / api_url / workdir / yolo 就是该会话**实际
+/// 会用**的那些,而不是 sidecar 启动快照。
+pub(crate) fn thread_config_view(
+    cfg: &RuntimeConfig,
+    threads: &HashMap<String, ThreadSession>,
+    workspaces: &WorkspaceIndex,
+    models_path: &Path,
+    thread_id: &str,
+    cwd: &Path,
+) -> serde_json::Value {
+    let catalog = yi_agent_runtime::models::load_catalog_from(models_path);
+    let store = crate::server::store_lookup(threads, workspaces, cfg, thread_id);
+    // 只读 meta：这里不需要对话历史，`load` 会把整份 jsonl 解析一遍。
+    let meta = store.read_meta(thread_id).ok().flatten();
+    let session = threads.get(thread_id);
+
+    let model_ref = meta.as_ref().and_then(|m| m.model_ref.clone());
+    let mut effective =
+        yi_agent_runtime::models::resolve_effective(cfg, &catalog, model_ref.as_deref());
+    let live_model = session
+        .map(|s| s.model.as_str())
+        .filter(|model| !model.is_empty());
+
+    // 活会话的 `model` 是**实际在跑**的串(`thread/start`/`thread/setModel` 都以
+    // `agent.config().model` 回填)。它与按 meta 解析出的串不一致时,以实际模型
+    // 为准并重新按「模型串匹配的条目」解析 provider / api_url,避免出现
+    // 「model 是 A 家的、api_url 是 B 家的」这种自相矛盾的卡片。
+    let model = match live_model {
+        Some(model) => {
+            if model != effective.model {
+                if let Some(entry) = catalog.models.iter().find(|entry| entry.model == model) {
+                    effective = yi_agent_runtime::models::resolve_effective(
+                        cfg,
+                        &catalog,
+                        Some(entry.name.as_str()),
+                    );
+                }
+            }
+            model.to_string()
+        }
+        None if !effective.model.is_empty() => effective.model.clone(),
+        None => meta.as_ref().map(|m| m.model.clone()).unwrap_or_default(),
+    };
+
+    let yolo = match session {
+        Some(s) => s.yolo.get(),
+        None => meta
+            .as_ref()
+            .is_some_and(|m| m.permission_mode == crate::thread_store::ThreadMode::Yolo),
+    };
+
+    effective.redacted_view_for_session(cwd, &model, yolo)
+}
+
 use yi_agent_subagent::binding::RuntimeBinding;
 use yi_agent_subagent::thread_root::ThreadRoot;
 
