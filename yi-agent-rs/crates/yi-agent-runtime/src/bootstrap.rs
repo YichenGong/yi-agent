@@ -9,6 +9,12 @@ use crate::config::RuntimeConfig;
 
 /// 根据配置构造 LLM provider。
 pub fn build_provider(cfg: &RuntimeConfig) -> Result<Arc<dyn yi_agent_core::Provider>> {
+    // 模型名是唯一没有客观默认值的字段。放空串过去只会在第一次请求时变成
+    // 一个难懂的 404/400，而且子 agent 会继承同一个空串——不如在这里就
+    // 说清楚"还没配置"，让调用方把用户导向设置/引导。
+    if cfg.model.trim().is_empty() {
+        anyhow::bail!("模型未配置：请在设置中完成模型配置");
+    }
     match cfg.provider.as_str() {
         "anthropic" => Ok(Arc::new(yi_agent_llm::AnthropicProvider::new(
             yi_agent_llm::AnthropicProviderOpts {
@@ -616,6 +622,17 @@ fn prompt_include_all(total: usize, default: usize) -> bool {
 mod tests {
     use super::*;
     use crate::config::sample_config;
+
+    #[test]
+    fn build_provider_rejects_an_empty_model() {
+        let mut cfg = sample_config();
+        cfg.model = String::new();
+        let err = match build_provider(&cfg) {
+            Ok(_) => panic!("an empty model must not build a provider"),
+            Err(error) => error.to_string(),
+        };
+        assert!(err.contains("模型未配置"), "got {err}");
+    }
 
     fn write_skills(dir: &std::path::Path, count: usize, desc_len: usize) {
         for i in 0..count {
