@@ -32,9 +32,13 @@ jobs:
           # cargo 创建 target 目录失败会立刻退出，所以这里先建好并验证可写。
           echo "CARGO_TARGET_DIR=$HOME/cargo-target/github" >> "$GITHUB_ENV"
           mkdir -p "$HOME/.local/bin" "$HOME/cargo-target/github"
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # GITHUB_PATH 是「后写的在前」，所以这里先写 /opt/homebrew/bin，
+          # 再写 $HOME/.cargo/bin，保证 rustup 的 shim 最终排在 Homebrew 之前。
+          # 顺序反了会让 Homebrew 的 rust 抢到 cargo，交叉编译以
+          # E0463 "can't find crate for core" 秒挂（实测 0.5~3 秒）。
           echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "CARGO_TARGET_DIR=$HOME/cargo-target/github"
           ls -ld "$HOME/cargo-target/github"
 
@@ -96,7 +100,11 @@ jobs:
       - name: Build & package all platforms
         working-directory: yi-agent-rs
         run: |
-          source "$HOME/.cargo/env"
+          # setup-build-env.sh 会重排 PATH（rustup 优先）、抬高文件描述符上限
+          # （launchd 默认 256，并行链接 Linux 目标会 ProcessFdQuotaExceeded），
+          # 并校验三平台 std 与 zig/zigbuild 真的可用。任一不满足即失败，
+          # 避免把「环境不对」伪装成「代码编译错误」。
+          source scripts/setup-build-env.sh
           just package-all
 
       - name: Upload artifacts to GitHub Release
