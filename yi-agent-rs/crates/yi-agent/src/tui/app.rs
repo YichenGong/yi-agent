@@ -9367,6 +9367,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
             context_length: None,
         };
         ModelCatalog {

@@ -218,6 +218,7 @@ pub fn import_settings_into_catalog(
         // 引导固化的是四个字段，通道两项不在此声明 → 保持默认。
         api_style: None,
         reasoning_effort: None,
+        reasoning_capabilities: None,
         context_length: None,
     });
     catalog.default_model = Some(name.clone());
@@ -373,6 +374,7 @@ mod tests {
                 api_key: api_key.into(),
                 api_style: None,
                 reasoning_effort: None,
+                reasoning_capabilities: None,
                 context_length: None,
             }],
             default_model: Some(name.into()),

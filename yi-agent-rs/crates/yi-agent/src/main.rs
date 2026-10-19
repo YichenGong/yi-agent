@@ -2802,6 +2802,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            reasoning_capabilities: None,
             context_length: None,
         };
         // `/model Y`: Y declares no effort of its own.
@@ -2913,6 +2914,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            reasoning_capabilities: None,
             context_length: None,
         };
         let catalog = ModelCatalog {
@@ -3000,6 +3002,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            reasoning_capabilities: None,
             context_length: None,
         };
         let make_catalog = |default: &str| ModelCatalog {
@@ -3063,6 +3066,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: None,
             reasoning_effort: effort.map(str::to_string),
+            reasoning_capabilities: None,
             context_length: None,
         };
         let catalog = ModelCatalog {
@@ -3132,6 +3136,7 @@ mod tests {
             api_key: "sk-secret".into(),
             api_style: style.map(str::to_string),
             reasoning_effort: None,
+            reasoning_capabilities: None,
             context_length: None,
         };
         let catalog = |default: &str| ModelCatalog {

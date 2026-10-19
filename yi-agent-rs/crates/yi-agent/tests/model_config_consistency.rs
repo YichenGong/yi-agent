@@ -74,6 +74,7 @@ fn catalog_with_default() -> ModelCatalog {
             api_key: "sk-shared".into(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
             context_length: None,
         }],
         default_model: Some("shared".into()),

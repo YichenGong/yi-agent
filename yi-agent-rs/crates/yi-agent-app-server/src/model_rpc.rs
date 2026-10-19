@@ -263,6 +263,7 @@ fn import_env(path: &Path, cfg: &RuntimeConfig) -> Result<Value, RpcError> {
         // 兜底层 cfg 的通道选择随条目固化（与 upsert 的默认语义一致）。
         api_style: Some(cfg.api_style.as_str().to_string()),
         reasoning_effort: cfg.reasoning_effort.clone(),
+        reasoning_capabilities: None,
         context_length: None,
     });
     catalog.default_model = Some(name.clone());
@@ -626,6 +627,7 @@ mod tests {
             api_key: String::new(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
             context_length: None,
         });
         catalog.default_model = Some("gone".to_string());

@@ -14873,6 +14873,7 @@ fn model_catalog_entries(default_model: Option<&str>) -> yi_agent_runtime::model
                 api_key: "key-a".into(),
                 api_style: None,
                 reasoning_effort: None,
+                reasoning_capabilities: None,
                 context_length: None,
             },
             ModelEntry {
@@ -14883,6 +14884,7 @@ fn model_catalog_entries(default_model: Option<&str>) -> yi_agent_runtime::model
                 api_key: "key-b".into(),
                 api_style: None,
                 reasoning_effort: None,
+                reasoning_capabilities: None,
                 context_length: None,
             },
         ],

@@ -74,9 +74,134 @@ pub struct ModelEntry {
     /// 非字符串值按「未设置」处理，不让整条被跳过（见 `de_optional_string`）。
     #[serde(default, deserialize_with = "de_optional_string")]
     pub reasoning_effort: Option<String>,
+    /// 各通道的 effort 探测结果；`None` = 从未探测。坏值按「未探测」处理。
+    #[serde(default, deserialize_with = "de_optional_capabilities")]
+    pub reasoning_capabilities: Option<ReasoningCapabilities>,
     /// 该条目的上下文窗口（tokens）；`None` = 沿用 cfg 的既有阈值。
     #[serde(default)]
     pub context_length: Option<u32>,
+}
+
+/// 七档白名单，顺序即 UI 顺序（与 `desktop/src/lib/modelPicker.ts` 的
+/// `REASONING_EFFORTS` 逐字一致）。
+pub const REASONING_TIERS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// 某条目在某条通道上的 effort 探测结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelCapability {
+    /// 探测为支持的档位，按 [`REASONING_TIERS`] 顺序、已去重。
+    #[serde(default, deserialize_with = "de_supported_tiers")]
+    pub supported: Vec<String>,
+    /// 探测完成时间（Unix 秒）。坏值读作 0。
+    #[serde(default, deserialize_with = "de_u64_lossy")]
+    pub probed_at: u64,
+    /// 非空 = 该通道探测未能完成（鉴权/网络/网关异常），`supported` 不可信。
+    #[serde(default, deserialize_with = "de_optional_string")]
+    pub error: Option<String>,
+}
+
+/// 三条通道各一份结果。未探测的通道为 `None`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningCapabilities {
+    #[serde(default, deserialize_with = "de_optional_capability")]
+    pub chat: Option<ChannelCapability>,
+    #[serde(default, deserialize_with = "de_optional_capability")]
+    pub responses: Option<ChannelCapability>,
+    #[serde(default, deserialize_with = "de_optional_capability")]
+    pub anthropic: Option<ChannelCapability>,
+}
+
+impl ReasoningCapabilities {
+    /// 通道键（`chat` / `responses` / `anthropic`）对应的槽位。
+    pub fn channel_mut(&mut self, channel: &str) -> Option<&mut Option<ChannelCapability>> {
+        match channel {
+            "chat" => Some(&mut self.chat),
+            "responses" => Some(&mut self.responses),
+            "anthropic" => Some(&mut self.anthropic),
+            _ => None,
+        }
+    }
+
+    pub fn get(&self, channel: &str) -> Option<&ChannelCapability> {
+        match channel {
+            "chat" => self.chat.as_ref(),
+            "responses" => self.responses.as_ref(),
+            "anthropic" => self.anthropic.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// 是否存在任一「可信」结果（有记录且 `error` 为空）。
+    pub fn has_trustworthy(&self) -> bool {
+        [&self.chat, &self.responses, &self.anthropic]
+            .into_iter()
+            .flatten()
+            .any(|c| c.error.is_none())
+    }
+}
+
+/// 只保留白名单内的档位，并按白名单顺序排序去重。坏值读作空表。
+fn de_supported_tiers<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(items) = value.and_then(|v| v.as_array().cloned()) else {
+        return Ok(Vec::new());
+    };
+    let mut kept: Vec<String> = items
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter(|s| REASONING_TIERS.contains(s))
+        .map(str::to_string)
+        .collect();
+    kept.sort_by_key(|s| {
+        REASONING_TIERS
+            .iter()
+            .position(|t| t == s)
+            .unwrap_or(usize::MAX)
+    });
+    kept.dedup();
+    Ok(kept)
+}
+
+/// 非对象 / `null` → `None`；对象 → `Some(ChannelCapability)`。
+fn de_optional_capability<'de, D>(deserializer: D) -> Result<Option<ChannelCapability>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Object(_)) => serde_json::from_value(value.unwrap())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
+}
+
+/// 非数字 → 0。
+fn de_u64_lossy<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
+/// 非对象 / `null` → `None`；对象 → `Some(ReasoningCapabilities)`。
+fn de_optional_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<Option<ReasoningCapabilities>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Object(_)) => serde_json::from_value(value.unwrap())
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Ok(None),
+    }
 }
 
 /// 反序列化时把非字符串值当作「未设置」（None），避免一个手写值让整条被跳过。
@@ -515,6 +640,7 @@ mod tests {
             api_key: "sk-secret-1234".into(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
             context_length: None,
         }
     }
@@ -958,6 +1084,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reasoning_capabilities_roundtrip_and_drop_unknown_tiers() {
+        let json = r#"{
+            "models":[{
+                "name":"A","provider":"openai","api_url":"https://a","model":"m",
+                "reasoning_capabilities":{
+                    "chat":{"supported":["none","bogus","low"],"probed_at":123},
+                    "responses":{"supported":["high"],"probed_at":456,"error":"401"}
+                }
+            }]
+        }"#;
+        let catalog = parse_catalog(json, Path::new("x")).unwrap();
+        let caps = catalog.models[0].reasoning_capabilities.as_ref().unwrap();
+        assert_eq!(caps.chat.as_ref().unwrap().supported, vec!["none", "low"]);
+        assert_eq!(caps.chat.as_ref().unwrap().probed_at, 123);
+        assert_eq!(
+            caps.responses.as_ref().unwrap().error.as_deref(),
+            Some("401")
+        );
+        assert!(caps.anthropic.is_none());
+    }
+
+    #[test]
+    fn bad_capabilities_values_degrade_to_unknown_without_dropping_the_entry() {
+        // 整份能力数据不是对象 → 视作未探测。
+        for raw in [r#""nope""#, r#"[]"#, r#"42"#] {
+            let json = format!(
+                r#"{{"models":[{{"name":"A","provider":"openai","api_url":"https://a","model":"m","reasoning_capabilities":{raw}}}]}}"#
+            );
+            let catalog = parse_catalog(&json, Path::new("x")).unwrap();
+            assert_eq!(catalog.models.len(), 1, "entry must survive: {raw}");
+            assert!(
+                catalog.models[0].reasoning_capabilities.is_none(),
+                "non-object capabilities must read as unknown: {raw}"
+            );
+        }
+
+        // 单条通道不是对象 → 该通道视作未探测，其它通道不受影响。
+        let json = r#"{"models":[{"name":"A","provider":"openai","api_url":"https://a","model":"m",
+            "reasoning_capabilities":{"chat":"nope","responses":{"supported":["low"]}}}]}"#;
+        let catalog = parse_catalog(json, Path::new("x")).unwrap();
+        let caps = catalog.models[0].reasoning_capabilities.as_ref().unwrap();
+        assert!(
+            caps.chat.is_none(),
+            "non-object channel must read as unknown"
+        );
+        assert_eq!(caps.responses.as_ref().unwrap().supported, vec!["low"]);
+
+        // 通道内字段类型错误 → 该字段降级（空表 / 0），通道本身仍存在。
+        let json = r#"{"models":[{"name":"A","provider":"openai","api_url":"https://a","model":"m",
+            "reasoning_capabilities":{"chat":{"supported":"nope","probed_at":"x"}}}]}"#;
+        let catalog = parse_catalog(json, Path::new("x")).unwrap();
+        let chat = catalog.models[0]
+            .reasoning_capabilities
+            .as_ref()
+            .unwrap()
+            .chat
+            .as_ref()
+            .unwrap();
+        assert!(
+            chat.supported.is_empty(),
+            "bad supported must read as empty"
+        );
+        assert_eq!(chat.probed_at, 0, "bad probed_at must read as 0");
+    }
+
     /// `from_catalog` 是固定快照：即便磁盘变了也不重读（测试与「本就持有清单」的调用方用它）。
     #[test]
     fn from_catalog_is_a_fixed_snapshot() {
@@ -1026,6 +1218,7 @@ mod resolve_tests {
                     api_key: "key-a".into(),
                     api_style: None,
                     reasoning_effort: None,
+                    reasoning_capabilities: None,
                     context_length: None,
                 },
                 ModelEntry {
@@ -1036,6 +1229,7 @@ mod resolve_tests {
                     api_key: "key-b".into(),
                     api_style: None,
                     reasoning_effort: None,
+                    reasoning_capabilities: None,
                     context_length: None,
                 },
             ],
