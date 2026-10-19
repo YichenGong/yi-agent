@@ -34,7 +34,6 @@ async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
         hub: std::sync::Arc::new(hub),
         client: local,
         resident_dir: PathBuf::new(),
-        plugin_command: PathBuf::new(),
         theme_handle: crate::theme_tool::ThemeHandle::new(std::env::temp_dir()),
         watchman_home: PathBuf::new(),
         watchman_install: std::sync::Arc::new(|_exe: &Path, _home: &Path| -> Result<(), String> {
@@ -1919,7 +1918,6 @@ impl Harness {
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
-                plugin_command: PathBuf::from("/nonexistent/superpowers-kanban"),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 // 与 `Harness::view_frames` 是**同一个** `Arc`(见上方 `lead_inbox`
@@ -3306,7 +3304,6 @@ async fn eof_exits_gracefully() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
-            plugin_command: PathBuf::new(),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3388,7 +3385,6 @@ async fn agent_factory_failure_returns_internal_error() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
-            plugin_command: PathBuf::new(),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -3472,7 +3468,6 @@ async fn oversized_frame_returns_err() {
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
             skills_home: PathBuf::new(),
-            plugin_command: PathBuf::new(),
             theme: test_theme(),
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -15430,7 +15425,6 @@ impl MergedHarness {
                 resident_dir: PathBuf::new(),
                 // 空路径 = 不读真实 home；这些用例不查 skill。
                 skills_home: PathBuf::new(),
-                plugin_command: PathBuf::new(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -16952,6 +16946,83 @@ async fn plugin_install_rejects_a_manifest_without_a_switch_key() {
         "{response}"
     );
     assert!(!project.path().join(".yi-agent").exists());
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_rejects_a_manifest_the_supervisor_would_silently_skip() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    // 缺 `command`：宿主若只看「是 JSON 对象 + 有 name + 有 switch_key」就会
+    // 安装成功，而 supervisor 的 `SupervisorManifest::parse` 会因缺 command 失败、
+    // 只记一条 warn 后**跳过**这份清单。用户会拿到 `installed: true`，插件却
+    // 永远不会启动——症状与「没装」一模一样，且没有任何界面错误可查。
+    fake_plugin_printing(
+        &h,
+        "demo-plugin",
+        &serde_json::json!({ "name": "demo-plugin", "switch_key": "demo_plugin_on" }).to_string(),
+    );
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert_eq!(
+        response["error"]["data"]["code"], "plugin_rejected",
+        "a manifest the supervisor cannot load must be rejected, not installed: {response}"
+    );
+    assert!(
+        !project.path().join(".yi-agent").exists(),
+        "a rejected manifest must leave nothing behind"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_rolls_the_manifest_back_when_the_switch_cannot_be_written() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    fake_plugin_printing(
+        &h,
+        "demo-plugin",
+        &serde_json::json!({
+            "name": "demo-plugin",
+            "command": "/bin/true",
+            "switch_key": "demo_plugin_on",
+        })
+        .to_string(),
+    );
+
+    // 让 `preferences.json` 的落点无法写入：把一个**目录**放到该文件名上。
+    // 清单已经能写、开关却写不了——这正是「半安装」的触发条件。
+    let yi_agent = project.path().join(".yi-agent");
+    std::fs::create_dir_all(yi_agent.join("preferences.json")).unwrap();
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_some(),
+        "a switch that cannot be written must fail the install: {response}"
+    );
+    assert!(
+        !yi_agent
+            .join("supervisors")
+            .join("demo-plugin.json")
+            .exists(),
+        "the manifest must be rolled back: a manifest with a closed switch is a plugin that is \
+         launched and never advances"
+    );
+    assert!(
+        h.daemon_calls
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty(),
+        "no daemon may be started for an install that did not complete"
+    );
 
     h.shutdown().await;
 }

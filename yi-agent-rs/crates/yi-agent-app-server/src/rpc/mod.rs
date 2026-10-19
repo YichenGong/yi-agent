@@ -112,28 +112,21 @@ pub(crate) enum Flow {
 /// 的宿主侧输入。原来的 `board_dir` / `board_launcher`（看板登记表与看板 daemon
 /// 的启动器）已随 `board/*` 域删除——通用通道不需要知道「看板」是什么。
 ///
-/// 下面四个字段（`resident_dir` / `plugin_command` / `watchman_home` /
-/// `watchman_install`）在 `board/*` 域删除后**暂时没有读者**：它们原先只被
-/// `board/create`（写清单 + 登记常驻 + 装值守）读。之所以保留而不是删掉：
+/// `plugin/install` **不读**任何「启动时解析好的单一路径」——那样等于把某个插件名
+/// 写死进宿主。它按请求里的名字经 [`Self::resolve_plugin`] 逐次解析。原先的
+/// `plugin_command` 字段因此无人读，已删除：一个只写不读的字段只是把「宿主认识
+/// 某个插件」这件事藏起来，而不是消掉它。
 ///
-/// 1. `plugin_command` 是启动时按**一个**插件名解析出的路径；`plugin/install`
-///    没有用它，而是按请求里的名字经 [`Self::resolve_plugin`] 逐次解析（见下）。
-///    之所以仍保留而不是此处删掉：它是 Task 6 的清理面，与本次安装能力互为独立，
-///    混在一起删会让「谁在用什么」更难追溯。
-/// 2. `resident_dir` 是通用常驻登记目录，`watchman_*` 是通用值守句柄——`ui/*` 的
-///    开关臂已经在用同一对句柄（经 [`AppState`]），它们的通用性不依赖看板。
-///
-/// 故这里显式记账为「接口字段、暂未读」，而不是让它们变成无人认领的 dead field。
+/// 其余字段（`resident_dir` / `watchman_home` / `watchman_install`）在 `board/*`
+/// 域删除后**暂时没有读者**：它们原先只被 `board/create` 读。保留是因为它们是
+/// 通用常驻登记目录与通用值守句柄，`ui/*` 的开关臂经 [`AppState`] 也在用同一对
+/// 句柄，其通用性不依赖看板。
 pub(crate) struct PluginChannelState {
     pub(crate) hub: std::sync::Arc<crate::broadcast::Broadcaster>,
     pub(crate) client: crate::broadcast::ClientId,
     /// 通用常驻登记目录。见结构文档：`board/*` 删除后暂无读者。
     #[allow(dead_code)]
     pub(crate) resident_dir: std::path::PathBuf,
-    /// 启动时按一个插件名解析出的可执行路径。`plugin/install` 不走它（它只认识
-    /// 一个插件名），改走 [`Self::resolve_plugin`]；见结构文档。
-    #[allow(dead_code)]
-    pub(crate) plugin_command: std::path::PathBuf,
     pub(crate) theme_handle: crate::theme_tool::ThemeHandle,
     /// 值守安装/卸载所针对的 home。见结构文档：`board/*` 删除后暂无读者。
     #[allow(dead_code)]
@@ -258,8 +251,8 @@ pub(crate) fn domain_for(method: &str) -> Domain {
 /// `onboarding_preferences_path`)尤其需要这条保证。
 ///
 /// Task 4 把 `plugin/*` detach 出主循环后,该域不再经本结构借主循环局部量:
-/// 原来只被它读的 `resident_dir` / `plugin_command` 已随处理搬进
-/// [`PluginChannelState`],故从本结构移除(留着就是死字段)。
+/// 原来只被它读的 `resident_dir` 已随处理搬进 [`PluginChannelState`],故从本结构
+/// 移除(留着就是死字段)。
 pub(crate) struct AppState<'a> {
     // ---- 响应出口与调用方 ----
     /// 广播出口:handler 用它定向回包(`write_response`)与做订阅

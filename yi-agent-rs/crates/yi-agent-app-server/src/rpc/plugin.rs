@@ -106,8 +106,8 @@ pub(crate) async fn handle_shared(
                 .await;
                 return Ok(Flow::Continue);
             }
-            // **按请求里的名字解析**，不读 `state.plugin_command`：那个字段是启动
-            // 时按一个具体插件名解析好的单一路径，用它等于把插件名写死进宿主。
+            // **按请求里的名字解析**：宿主源码里不出现任何具体插件名，也不存在
+            // 「启动时为某个插件预先解析好的路径」这种东西。
             let Some(exe) = (state.resolve_plugin)(&plugin) else {
                 write_or_fatal(
                     state,
@@ -206,7 +206,7 @@ pub(crate) async fn handle_shared(
                     return Ok(Flow::Continue);
                 }
             };
-            let Some(object) = manifest.as_object() else {
+            if !manifest.is_object() {
                 write_or_fatal(
                     state,
                     id.clone(),
@@ -217,38 +217,43 @@ pub(crate) async fn handle_shared(
                 )
                 .await;
                 return Ok(Flow::Continue);
-            };
-            let described_name = object.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if described_name != plugin {
+            }
+            // 光看「是不是对象」不够：supervisor 用 `SupervisorManifest::parse`
+            // 加载清单，缺 `command` 之类会被它 warn 后**静默跳过**。那会得到一个
+            // 「安装成功、开关开着、进程永不启动」的假成功——比直接报错更难查。
+            // 这个校验是通用的：它只检查所有插件都要有的字段，不解释插件语义。
+            let parsed =
+                match yi_agent_supervisors::manifest::SupervisorManifest::parse(&manifest_json) {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        write_or_fatal(
+                            state,
+                            id.clone(),
+                            err_response(
+                                id,
+                                reject(format!("`{plugin} manifest` is unusable: {error}")),
+                            ),
+                        )
+                        .await;
+                        return Ok(Flow::Continue);
+                    }
+                };
+            if parsed.name != plugin {
                 write_or_fatal(
                     state,
                     id.clone(),
                     err_response(
                         id,
                         reject(format!(
-                            "`{plugin} manifest` describes {described_name:?}, not {plugin:?}"
+                            "`{plugin} manifest` describes {:?}, not {plugin:?}",
+                            parsed.name
                         )),
                     ),
                 )
                 .await;
                 return Ok(Flow::Continue);
             }
-            let switch_key = object
-                .get("switch_key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if switch_key.is_empty() {
-                write_or_fatal(
-                    state,
-                    id.clone(),
-                    err_response(
-                        id,
-                        reject(format!("`{plugin} manifest` declares no switch_key")),
-                    ),
-                )
-                .await;
-                return Ok(Flow::Continue);
-            }
+            let switch_key = parsed.switch_key.as_str();
 
             // 先清单、后开关：清单让 supervisor 拉起进程，开关决定它要不要干活。
             // 两者缺一都会得到一个「注册了、起来了、却永不推进」的插件，
@@ -272,13 +277,26 @@ pub(crate) async fn handle_shared(
                 return Ok(Flow::Continue);
             }
             if let Err(error) = yi_agent_supervisors::install::enable_switch(&project, switch_key) {
+                // 开关打不开就撤回清单。留下的清单会被 supervisor 拉起，而插件
+                // 因开关关着永不推进——正是 §4.4.1 要防的半安装态，且用户无从
+                // 从界面上分辨「没装」和「装了但死的」。
+                if let Err(rollback) =
+                    yi_agent_supervisors::install::remove_manifest(&project, &plugin)
+                {
+                    tracing::warn!(
+                        project = %project.display(),
+                        plugin = %plugin,
+                        %rollback,
+                        "could not roll back a manifest whose switch failed to enable"
+                    );
+                }
                 write_or_fatal(
                     state,
                     id.clone(),
                     err_response(
                         id,
                         RpcError::internal(format!(
-                            "installed the {plugin} manifest but could not enable {switch_key}: {error}"
+                            "could not enable {switch_key} for {plugin}: {error}"
                         )),
                     ),
                 )

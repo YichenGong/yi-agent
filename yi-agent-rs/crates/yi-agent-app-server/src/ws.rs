@@ -122,7 +122,6 @@ where
                     .join("preferences.json"),
                 resident_dir: yi_agent_store::resident::default_dir().unwrap_or_default(),
                 skills_home: crate::server::home_dir(),
-                plugin_command: crate::server::default_plugin_command().unwrap_or_default(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),

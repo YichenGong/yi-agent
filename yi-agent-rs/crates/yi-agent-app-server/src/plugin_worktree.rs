@@ -91,16 +91,15 @@ fn is_reserved_namespace(part: &str) -> bool {
 
 /// 按**名字**在 `PATH` 上解析一个插件可执行文件。
 ///
-/// 通用：调用方给插件名，宿主不知道那个插件是干什么的。它的用途是给
-/// `RuntimeAttachments::plugin_command` 一个**绝对路径**——supervisor 的清单里
-/// `command` 需要一条能在它的 `PATH` 下解析的命令，而裸插件名未必能。
+/// 通用：调用方给插件名（`plugin/install` 的请求参数），宿主不知道那个插件是
+/// 干什么的。之所以要绝对路径：supervisor 清单里的 `command` 需要一条能解析的
+/// 命令，而裸插件名未必能。
 ///
-/// 解析规则（与已删的那个看板 registry crate 的 `default_plugin_command()` 逐字
-/// 一致，故插件装在哪儿都不受影响）：Homebrew 前缀
-/// (`/opt/homebrew/bin/<name>`) 优先，其次 `PATH` 上第一个存在的同名可执行文件。
+/// 解析规则（与已删的那个看板 registry crate 的同名逻辑逐字一致，故插件装在哪儿
+/// 都不受影响）：Homebrew 前缀 (`/opt/homebrew/bin/<name>`) 优先，其次 `PATH` 上
+/// 第一个存在的同名可执行文件。
 ///
-/// 解析不到**不是错误**：宿主不该因为某个插件没装就起不来。调用方按需处理
-/// `None`（缺省空路径，与 `resident_dir` 同一策略）。
+/// 解析不到**不是错误**：调用方回 `plugin_not_installed`，宿主自己照常运行。
 pub fn resolve_plugin_command(name: &str) -> Option<PathBuf> {
     let homebrew = PathBuf::from("/opt/homebrew/bin").join(name);
     if homebrew.is_file() {

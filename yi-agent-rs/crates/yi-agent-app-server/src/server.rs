@@ -188,10 +188,6 @@ pub(crate) struct RuntimeAttachments {
     /// `resident_dir` is: `skill/list` / `skill/read` must be testable without
     /// reading the developer's real `~/.yi-agent/skills`.
     pub(crate) skills_home: PathBuf,
-    /// The absolute path of a plugin executable, resolved by name from `PATH`.
-    /// Generic: names no plugin and is only ever handed to the plugin channel.
-    /// Injectable so a test never depends on the machine's installation.
-    pub(crate) plugin_command: PathBuf,
     /// 桌面主题句柄：`ui/settings/read|write` 维护它，每个 thread 的
     /// `set_theme` 工具也持同一实例，故任一路径改主题都会落盘 + 广播。
     pub(crate) theme: crate::theme_tool::ThemeHandle,
@@ -256,17 +252,6 @@ pub(crate) type ResolvePlugin = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Syn
 /// 可注入的理由同 `watchman_install`：生产实现会 `spawn` 一个 detached 的
 /// `daemon serve` 并等待它就绪，测试里绝不能真的拉起进程。
 pub(crate) type EnsureDaemon = Arc<dyn Fn(&Path) -> Result<bool, String> + Send + Sync>;
-
-/// 宿主生产入口注入的插件命令：按插件名在 `PATH` 上解析。
-///
-/// 名字是宿主的**配置**，不是宿主的语义：`plugin_command` 只是交给通用插件通道的
-/// 一个绝对路径。解析不到时回退空路径——宿主不该因为某个插件没装就起不来（与
-/// `resident_dir` 同一策略）。
-pub(crate) fn default_plugin_command() -> Option<PathBuf> {
-    crate::plugin_worktree::resolve_plugin_command(
-        crate::legacy_compat::SUPERPOWERS_KANBAN_REQUESTER,
-    )
-}
 
 /// 生产环境的 `$HOME`。未设置时回退空路径——与 `resident_dir` 同一策略：宁可把
 /// 值守装进一个无人读取的目录，也不要因为环境缺失让整个服务起不来。
@@ -1533,7 +1518,6 @@ where
             onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
             skills_home: home_dir(),
-            plugin_command: default_plugin_command().unwrap_or_default(),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1618,7 +1602,6 @@ where
             onboarding_preferences_path: home_dir().join(".yi-agent").join("preferences.json"),
             resident_dir,
             skills_home: home_dir(),
-            plugin_command: default_plugin_command().unwrap_or_default(),
             theme,
             git_diff: crate::git_diff_tool::GitDiffHandle::new(),
             view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -2656,7 +2639,6 @@ where
         onboarding_preferences_path,
         resident_dir,
         skills_home,
-        plugin_command,
         theme,
         git_diff,
         view_frames,
@@ -3018,7 +3000,6 @@ where
                             hub: std::sync::Arc::clone(&hub),
                             client: client.clone(),
                             resident_dir: resident_dir.clone(),
-                            plugin_command: plugin_command.clone(),
                             theme_handle: theme_handle.clone(),
                             watchman_home: watchman_home.clone(),
                             watchman_install: std::sync::Arc::clone(&watchman_install),

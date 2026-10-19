@@ -57,8 +57,12 @@ pub fn is_valid_plugin_name(name: &str) -> bool {
 /// 若拿它决定落点，一个自述 `name: "../x"` 的插件就能写到目录外。清单里的
 /// `name` 与请求名是否一致由调用方校验（那是策略，不是本函数的职责）。
 ///
-/// 覆盖写：重复安装是幂等的，且以**新**内容为准——这正是「插件升级后
-/// 清单也跟着更新」的路径。
+/// 覆盖写：重复安装是幂等的，且以**新**内容为准——重装会刷新磁盘上的清单，
+/// 但**不会**让正在跑的进程立刻换用新内容：supervisor 见 socket 仍有应答就
+/// 直接返回，新清单要等该进程退出或失联、被重新拉起时才生效。
+///
+/// 写入是原子的（同目录 `tmp` + `rename`）：截断的清单会被 supervisor 当成
+/// 坏清单**静默跳过**（只记一条 warn），那等于插件凭空消失，比安装失败更难查。
 pub fn install_manifest_for(
     project: &Path,
     plugin_name: &str,
@@ -73,8 +77,53 @@ pub fn install_manifest_for(
     let dir = manifests_dir(project);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{plugin_name}.json"));
-    std::fs::write(&path, manifest_json)?;
+    write_atomic(&dir, &format!("{plugin_name}.json"), manifest_json)?;
     Ok(path)
+}
+
+/// 删掉一个已安装的清单；不存在也算成功。
+///
+/// 给「安装进行到一半失败」用：清单已落盘、开关却没打开时必须撤回，否则留下
+/// 的正是「注册了、被拉起了、永不推进」的半安装态（spec §4.4.1 要防的病）。
+pub fn remove_manifest(project: &Path, plugin_name: &str) -> std::io::Result<()> {
+    if !is_valid_plugin_name(plugin_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("`{plugin_name}` is not a usable plugin name"),
+        ));
+    }
+    match std::fs::remove_file(manifests_dir(project).join(format!("{plugin_name}.json"))) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// 进程内递增序号，给每次写入的临时文件一个不同的后缀。
+///
+/// 与 `app-server` 的 `settings_store` / `thread_store` 同一约定：固定临时名
+/// 会让同一目录的**并发写者**互相截断（A 写 tmp、B 用 `fs::write` 把同一个 tmp
+/// 截断、A 把它 rename 成目标文件——最终文件就是半份内容）。
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `dir` 下逐次唯一的临时文件名：`<file>.<pid>.<seq>.tmp`。
+fn temp_path(dir: &Path, file: &str, seq: u64) -> PathBuf {
+    dir.join(format!("{file}.{}.{}.tmp", std::process::id(), seq))
+}
+
+/// 同目录 `tmp` + `rename` 的原子写。
+fn write_atomic(dir: &Path, file: &str, contents: &str) -> std::io::Result<()> {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = temp_path(dir, file, seq);
+    if let Err(error) = std::fs::write(&tmp_path, contents) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp_path, dir.join(file)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// 把 `switch_key` 置为 `true`，保留 `preferences.json` 里的其它键。
@@ -103,9 +152,10 @@ pub fn enable_switch(project: &Path, switch_key: &str) -> std::io::Result<()> {
     object.insert(switch_key.to_string(), serde_json::Value::Bool(true));
     let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
         .map_err(std::io::Error::other)?;
-    let tmp_path = dir.join("preferences.json.tmp");
-    std::fs::write(&tmp_path, &text)?;
-    std::fs::rename(&tmp_path, &path)
+    // 临时名逐次唯一：`preferences.json` 是多写者共享文件（运行时偏好、各插件
+    // 开关），固定名会让并发写者互相截断，最终文件可能整份坏掉。
+    write_atomic(&dir, "preferences.json", &text)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -194,12 +244,66 @@ mod tests {
     fn enabling_leaves_no_temp_file_behind() {
         let dir = tempfile::tempdir().unwrap();
         enable_switch(dir.path(), "demo_on").unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path().join(".yi-agent"))
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// 临时名必须逐次唯一。
+    ///
+    /// `preferences.json` 是**多写者共享**的（运行时偏好、各插件开关）：固定名
+    /// 会让并发写者互相截断——A 写 tmp，B 用 `fs::write` 把同一个 tmp 截断，A 再
+    /// 把它 rename 成目标文件，最终文件就是半份内容，所有键一起坏掉。
+    #[test]
+    fn each_write_uses_a_unique_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = temp_path(dir.path(), "preferences.json", 0);
+        let second = temp_path(dir.path(), "preferences.json", 1);
+        assert_ne!(first, second);
+        assert!(
+            first
+                .to_string_lossy()
+                .contains(&std::process::id().to_string())
+        );
+    }
+
+    /// 清单写入是原子的：覆盖写不会留下截断的旧文件。
+    ///
+    /// 截断的清单会被 supervisor 当成坏清单静默跳过，那等于插件凭空消失。
+    #[test]
+    fn reinstalling_replaces_the_manifest_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
+        let updated = r#"{"name":"demo","command":"/bin/false","switch_key":"demo_on"}"#;
+        let path = install_manifest_for(dir.path(), "demo", updated).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
+        // 覆盖写走 tmp + rename，故目录里只剩最终文件。
+        let names: Vec<_> = std::fs::read_dir(dir.path().join(".yi-agent").join("supervisors"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["demo.json".to_string()]);
+    }
+
+    /// 回滚只删清单，不动项目里的其它东西。
+    #[test]
+    fn removing_a_manifest_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
+        remove_manifest(dir.path(), "demo").unwrap();
         assert!(
             !dir.path()
                 .join(".yi-agent")
-                .join("preferences.json.tmp")
+                .join("supervisors")
+                .join("demo.json")
                 .exists()
         );
+        // 再删一次不算错：回滚可能被重试。
+        remove_manifest(dir.path(), "demo").unwrap();
     }
 
     /// 名字会被拼进路径，故含分隔符或 `..` 的名字必须在落盘前拒绝。
