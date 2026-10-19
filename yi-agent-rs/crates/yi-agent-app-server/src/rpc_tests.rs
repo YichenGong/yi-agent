@@ -17198,6 +17198,13 @@ async fn plugin_install_rolls_the_manifest_back_when_the_switch_cannot_be_writte
             .is_empty(),
         "no daemon may be started for an install that did not complete"
     );
+    // 第 3 条：清单被撤回后，不能留下一个「已开启」的开关。开关只由
+    // `enable_switch` 写，而它正是失败的那一步——所以 `preferences.json` 必须
+    // 仍是那个挡路的目录，没有被任何一次开关写入替换成文件。
+    assert!(
+        yi_agent.join("preferences.json").is_dir(),
+        "a failed install must not leave the plugin's switch written"
+    );
 
     h.shutdown().await;
 }
