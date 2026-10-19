@@ -27,8 +27,19 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The per-project runtime directory whose socket the daemon owns.
-fn runtime_dir(project: &Path) -> PathBuf {
-    project.join(".yi-agent").join("runtime")
+///
+/// `YI_AGENT_RUNTIME_DIR` overrides it, which is what lets a development
+/// instance run beside a stable one in the same worktree: the instance lock and
+/// socket live in the runtime directory, so two daemons must not share it.
+pub(crate) fn runtime_dir(project: &Path) -> PathBuf {
+    runtime_dir_from(std::env::var_os("YI_AGENT_RUNTIME_DIR").as_deref(), project)
+}
+
+fn runtime_dir_from(override_dir: Option<&std::ffi::OsStr>, project: &Path) -> PathBuf {
+    override_dir
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| project.join(".yi-agent").join("runtime"))
 }
 
 /// Resolve the project's daemon socket path.
@@ -239,5 +250,22 @@ mod tests {
         unsafe {
             libc::kill(pid as i32, libc::SIGKILL);
         }
+    }
+
+    #[test]
+    fn the_daemon_runtime_dir_honours_the_override() {
+        let workdir = std::path::Path::new("/proj/a");
+        assert_eq!(
+            super::runtime_dir_from(Some(std::ffi::OsStr::new("/tmp/inst/runtime")), workdir),
+            std::path::PathBuf::from("/tmp/inst/runtime")
+        );
+        assert_eq!(
+            super::runtime_dir_from(None, workdir),
+            std::path::PathBuf::from("/proj/a/.yi-agent/runtime")
+        );
+        assert_eq!(
+            super::runtime_dir_from(Some(std::ffi::OsStr::new("")), workdir),
+            std::path::PathBuf::from("/proj/a/.yi-agent/runtime")
+        );
     }
 }

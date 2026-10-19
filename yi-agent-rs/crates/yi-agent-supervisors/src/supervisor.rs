@@ -25,7 +25,7 @@ pub struct Layout {
 impl Layout {
     pub fn for_workdir(workdir: &Path) -> Self {
         let state_base = workdir.join(".yi-agent");
-        let runtime_dir = state_base.join("runtime");
+        let runtime_dir = crate::daemon::runtime_dir(workdir);
         Self {
             workdir: workdir.to_path_buf(),
             state_base,
