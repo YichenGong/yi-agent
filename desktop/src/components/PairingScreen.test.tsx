@@ -256,12 +256,49 @@ describe("PairingScreen QR scan", () => {
     render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
 
     fireEvent.click(screen.getByRole("button", { name: "扫码" }));
-    expect(screen.getByRole("button", { name: "取消" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "返回" })).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    fireEvent.click(screen.getByRole("button", { name: "返回" }));
 
-    await waitFor(() => expect(screen.queryByRole("button", { name: "取消" })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole("button", { name: "返回" })).toBeNull());
     expect(screen.getByLabelText("配对码")).toBeTruthy(); // 回到可编辑表单
+  });
+
+  it("keeps the scanner's exit inside the phone safe area", () => {
+    // 覆盖层是 `fixed inset-0`，脱离 `body` 的安全区内边距（仓库在 index.css 里
+    // 反复记过这条）。头部若不自己补 `env(safe-area-inset-top)`，唯一的出口就会
+    // 落在刘海/灵动岛底下——用户报的「扫码过程中没有返回按钮」。
+    const scan = () => () => {};
+    render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
+    fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+
+    const dialog = screen.getByRole("dialog", { name: "扫描二维码" });
+    const bar = dialog.querySelector(".scan-overlay-bar");
+    expect(bar).toBeTruthy(); // CSS 在 [data-mobile] 下给它补 padding-top: max(env(safe-area-inset-top…))
+    expect(bar?.contains(screen.getByRole("button", { name: "返回" }))).toBe(true);
+  });
+
+  it("returns to the form instead of blanking the app when the scanner throws", async () => {
+    // 相机在 iOS 上的失败方式很杂；任何一条变成渲染期异常，React 19 都会卸载整棵树
+    // ——手机 body 底色是深色，呈现出来就是「黑屏」。ErrorBoundary 必须把它就地
+    // 收敛成「回表单 + 说明原因」。
+    const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const scan = () => {
+        throw new Error("camera exploded");
+      };
+      render(<PairingScreen enableScan scan={scan} redeem={vi.fn()} storage={storages()} />);
+
+      fireEvent.click(screen.getByRole("button", { name: "扫码" }));
+
+      await waitFor(() =>
+        expect(screen.getByRole("alert").textContent).toBe("无法访问相机，可手输配对码"),
+      );
+      expect(screen.queryByRole("dialog", { name: "扫描二维码" })).toBeNull();
+      expect(screen.getByLabelText("配对码")).toBeTruthy();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("shows the invalid-QR message over the scanner (not hidden behind it)", async () => {
@@ -279,7 +316,7 @@ describe("PairingScreen QR scan", () => {
     );
     const dialog = screen.getByRole("dialog", { name: "扫描二维码" });
     expect(dialog.contains(screen.getByRole("alert"))).toBe(true);
-    expect(screen.getByRole("button", { name: "取消" })).toBeTruthy(); // 扫描器仍开着
+    expect(screen.getByRole("button", { name: "返回" })).toBeTruthy(); // 扫描器仍开着
   });
 });
 

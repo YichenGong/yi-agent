@@ -273,7 +273,7 @@ yi-agent --provider openai --api-key sk-... --model gpt-4o
 | yi-agent-subagent | 9 / 9 | [详情](docs/project-management/yi-agent-subagent.md) |
 | yi-agent-app-server | 55 / 55 | [详情](docs/project-management/yi-agent-app-server.md) |
 | subagent-runtime | 44 / 52 | [详情](docs/project-management/subagent-runtime.md) |
-| desktop | 69 / 81 | [详情](docs/project-management/desktop.md) |
+| desktop | 72 / 84 | [详情](docs/project-management/desktop.md) |
 
 </details>
 
