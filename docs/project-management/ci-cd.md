@@ -27,6 +27,7 @@ yi-agent 的自动化构建、测试、发布流水线。基于 justfile 作为�
 - [x] CI/CD 设计文档 — [设计](../plans/2026-07-19-ci-cd-design.md)
 - [x] CI/CD 实现计划 — [实现](../plans/2026-07-19-ci-cd-impl.md)
 - [x] justfile 与 rust-toolchain.toml — `yi-agent-rs/justfile` + `rust-toolchain.toml` 存在；其中 `bindings-check`（ts-rs 生成物漂移门禁）已并入 `ci: fmt-check lint test build bindings-check`，故 GitHub PR / GitLab push / GitLab MR 三条路径都跑该门禁
+- [x] npm 版本同步门禁 — `yi-agent-rs/scripts/sync-npm-versions.sh` + `scripts/test_sync_npm_versions.sh`；`npm-pack` 调用它同步主包、子包与 `optionalDependencies`，并自检 `platforms/*` 与依赖表逐一对应；`just npm-version-check` 已并入 `ci`。判据：`cd yi-agent-rs && just npm-version-check`（22 passed）
 - [x] npm 包结构 — `yi-agent-rs/yi-agent-cli/` 主包 + 平台子包
 - [x] Homebrew tap 自动更新脚本 — 发布脚本存在
 - [x] GitLab CI 配置 — `.gitlab-ci.yml` 存在
