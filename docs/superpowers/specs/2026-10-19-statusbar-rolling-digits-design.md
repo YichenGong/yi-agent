@@ -67,7 +67,7 @@
 
 ### 数字带与位置归一
 
-- 数字带渲染 `0-9` 三份（30 个字符），窗口高 `1em`、宽 `1ch`。
+- 数字带渲染 `0-9` 三份（30 个字符），窗口高 `1lh`、宽 `1ch`。
 - 位置以「带内字符索引」表示，初始放在第二份的对应位（`10 + digit`），向上、
   向下各留 9 步余量。
 - 每次过渡结束后把位置归一到 `[10, 19]`（同一字符，视觉零变化），并把该位的
@@ -103,8 +103,16 @@
   `"{input} in / {output} out"`，读屏与文本查询拿到的仍是完整数字。
 - 按钮原有的 `aria-label="Token usage details"`、`aria-expanded`、
   `aria-controls` 与点击行为保持不变。
-- 数字窗口高 `1em`、宽 `1ch`，配合按钮的 `inline-flex items-center` 对齐；
-  状态栏行高与高度不变。
+- 数字窗口高 `1lh`（= 自己所在行盒的高度）、宽 `1ch`。
+  **不能用 `1em`**：状态栏文字是 12px、行高 16px，而字体墨迹约 14px——`1em`
+  只有 12px，比字形还矮，只能靠「窗口在行盒里垂直居中」把差补回来。这个抵消
+  依赖两个巧合：行盒正好 16px、居中正好取整到 2px。Chrome 恰好满足，WKWebView
+  （Tauri 用的引擎）下按钮行盒实测 15px，居中落在 1.5px 上，数字窗口停在
+  半像素（9.5–21.5），与 `in /` 的 8–23 错开——就是用户报的「数字和 in / out
+  没有对齐」。`1lh` 让窗口、格子与相邻文本共用同一套行盒规则，不依赖居中抵消。
+- 组件位移单位与窗口高度必须一致：`stripY` 输出 `translateY(-Nlh)`。写成 `em`
+  会按 12px 而非 16px 换算，滚到中途就露出相邻行。
+- 状态栏行高与高度不变。
 - 手机端既有规则 `[data-mobile="true"] .app-statusbar { white-space: nowrap }`
   继续生效；数字轮自身不产生空白，不会引入折行。
 
@@ -113,6 +121,9 @@
 - `desktop/src/lib/rollingDigits.test.ts`：拆位、进退位步数、时长上下限、错峰延迟上限。
 - `desktop/src/components/RollingNumber.test.tsx`：终值渲染、未变化的位不移动、
   递减方向正确、`usageKey` 变化不带动画、减少动态效果时时长为 0。
+- `desktop/src/rollingDigitsCss.test.ts`：静态门禁，直接读真实的 `index.css`，
+  断言 `.rolling-digit` 与 `.rolling-strip > span` 的高度都是 `1lh` 且不再是
+  `1em`。这条测试锁的是「窗口 = 行盒」，回退到 `em` 会立刻失败。
 - `desktop/src/components/StatusBar.test.tsx`：用量仍渲染为完整文本，按钮语义不变。
 
 验证命令：
