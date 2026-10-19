@@ -17,6 +17,29 @@ bin_candidates() {
   printf '%s\n' "$HOME/.local/bin"
 }
 
+# 读 App 的 CFBundleShortVersionString；失败时打印空串（调用方据此判断）。
+app_version() {
+  local plist="$1/Contents/Info.plist"
+  [ -f "$plist" ] || return 0
+  plutil -extract CFBundleShortVersionString raw -o - "$plist" 2>/dev/null || true
+}
+
+# 跑内置 CLI 的 --version；失败时打印空串。
+cli_version() {
+  local cli="$1/Contents/MacOS/yi-agent"
+  [ -x "$cli" ] || return 0
+  "$cli" --version 2>/dev/null | head -1 || true
+}
+
+version_banner() {
+  local old="$1" new="$2"
+  if [ -z "$old" ]; then
+    printf '已安装 yi-agent %s\n' "$new"
+  else
+    printf '检测到已安装版本 %s → 升级到 %s\n' "$old" "$new"
+  fi
+}
+
 main() {
   set -euo pipefail
 
