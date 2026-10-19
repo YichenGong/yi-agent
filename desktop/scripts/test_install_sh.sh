@@ -105,5 +105,24 @@ assert_eq "link_status detects shadowing" \
   "shadowed:$SHADOW/yi-agent" \
   "$(PATH="$SHADOW:$LINKDIR:$PATH" link_status "$APP" "$LINKDIR")"
 
+# --- replace_app ---
+SRC="$TMPROOT/Src.app"; mk_app "$SRC" "2.0.0"
+DST="$TMPROOT/Dst.app";  mk_app "$DST" "1.0.0"
+
+replace_app "$SRC" "$DST"
+assert_eq "replace_app installs new version" "2.0.0" "$(app_version "$DST")"
+assert_eq "replace_app leaves no staging dir" "absent" \
+  "$([ -e "$DST.new" ] && echo present || echo absent)"
+assert_eq "replace_app leaves no backup dir" "absent" \
+  "$([ -e "$DST.old" ] && echo present || echo absent)"
+
+# 模拟拷贝失败：必须保留旧版本
+FAILSRC="$TMPROOT/Fail.app"; mk_app "$FAILSRC" "3.0.0"
+assert_eq "replace_app reports failure" \
+  "rc=1" "$(YI_AGENT_COPY_CMD=false replace_app "$FAILSRC" "$DST" >/dev/null 2>&1; echo "rc=$?")"
+assert_eq "replace_app keeps old version on failure" "2.0.0" "$(app_version "$DST")"
+assert_eq "replace_app cleans staging on failure" "absent" \
+  "$([ -e "$DST.new" ] && echo present || echo absent)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

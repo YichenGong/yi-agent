@@ -75,6 +75,40 @@ link_status() {
   fi
 }
 
+# 注入的拷贝命令可能带参数，故用 eval。
+copy_runner() {
+  local src="$1" dest="$2"
+  if [ -n "${YI_AGENT_COPY_CMD:-}" ]; then
+    eval "$YI_AGENT_COPY_CMD \"$src\" \"$dest\""
+  else
+    ditto "$src" "$dest"
+  fi
+}
+
+# 原子替换：先拷到 <dest>.new，成功后才替换。任何一步失败都保留旧目录。
+replace_app() {
+  local src="$1" dest="$2"
+  local stage="$dest.new"
+  local backup="$dest.old"
+
+  rm -rf "$stage" "$backup"
+  if ! copy_runner "$src" "$stage"; then
+    echo "ERROR: 拷贝到暂存目录失败，已保留原版本" >&2
+    rm -rf "$stage"
+    return 1
+  fi
+  if [ -e "$dest" ]; then
+    mv "$dest" "$backup" || { rm -rf "$stage"; return 1; }
+  fi
+  if ! mv "$stage" "$dest"; then
+    echo "ERROR: 替换失败，正在恢复原版本" >&2
+    [ -e "$backup" ] && mv "$backup" "$dest"
+    rm -rf "$stage"
+    return 1
+  fi
+  rm -rf "$backup"
+}
+
 # 读 App 的 CFBundleShortVersionString；失败时打印空串（调用方据此判断）。
 app_version() {
   local plist="$1/Contents/Info.plist"
