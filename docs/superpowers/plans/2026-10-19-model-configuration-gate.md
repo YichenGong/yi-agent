@@ -678,9 +678,17 @@ git commit -m "fix(runtime): build_provider 拒绝空模型"
 ```rust
 /// 清单为空且无显式注入时，新建会话必须给出可识别的"未配置模型"错误，
 /// 而不是拿一个猜测的名字去发请求。
+///
+/// **必须显式把 `cfg.model` 置空**：`test_config()` 的 model 是
+/// `TEST_MODEL`（`test_support.rs:10,57`，非空），默认 Harness 永远不会
+/// 触发拦截——那样这个测试会"通过"却什么都没验证。
 #[tokio::test(flavor = "multi_thread")]
 async fn thread_start_reports_a_missing_model_configuration() {
-    let mut h = Harness::new();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    cfg.model = String::new();
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
         .await;
@@ -703,22 +711,15 @@ Expected: FAIL（当前返回 `-32603` 或成功）。
 // 模型可用性在**建 agent 之前**判：建 agent 会做大量装配，失败信息会被
 // 压成 internal；这里直接给 UI 一个可分支的错误码。
 //
-// 判据必须看「有没有条目」，不能只看 model 是否为空串：`resolve_effective`
-// 在无条目时**原样回退 `cfg`**（`models.rs:770-773`），而 `cfg.model` 在
-// 整包注入时可以非空。只有「条目解析不出来」才等同于「未配置」。
+// 判据是「解析后的生效 model 是否为空」，而不是「有没有清单条目」：
+// `effective_entry_for` 在整包注入时返回 `None`（表示注入压过清单），
+// 那条路径的 model 来自 `cfg.model`，非空就是合法配置。Task 4 已保证
+// 「无条目且无注入」时 `cfg.model == ""`，所以一个判据覆盖三种情况：
+//   有条目 → 条目.model；无条目+注入 → cfg.model；两者都无 → 空串。
 let catalog = yi_agent_runtime::models::load_catalog_from(state.models_path);
-let missing = match yi_agent_runtime::models::effective_entry_for(
-    state.cfg,
-    &catalog,
-    model_ref.as_deref(),
-) {
-    // 条目存在但模型名为空：手写的 models.json 可达（`parse_catalog` 会丢弃，
-    // 但 `try_load_catalog_from` 的另一条路径可能留下空串），一并挡住。
-    Some(entry) if entry.model.trim().is_empty() => true,
-    Some(_) => false,
-    None => true,
-};
-if missing {
+let effective_model =
+    yi_agent_runtime::models::resolve_effective(state.cfg, &catalog, model_ref.as_deref()).model;
+if effective_model.trim().is_empty() {
     let env = yi_agent_runtime::onboarding::read_env_fields(state.onboarding_env_path)
         .unwrap_or_default();
     let reasons = match yi_agent_runtime::onboarding::assess(&env, Some(&catalog)) {
@@ -738,7 +739,7 @@ if missing {
 }
 ```
 
-把 `onboarding_rpc.rs` 的 `missing_name` 从私有改为 `pub(crate)`。
+`missing_name` 需要从私有改为 `pub(crate)`（它在 `onboarding_rpc.rs:49`）。
 
 `"thread/resume"` 分支同理：在 `let built = match with_session_model_ref(...)` 之前插入同一段校验，把 `model_ref` 换成 `loaded.meta.model_ref.as_deref()`。注意此时 `loaded` 已就绪（`thread.rs:440`），且必须放在 `let built` 之前、`loaded` 之后。
 
@@ -751,10 +752,17 @@ Expected: PASS
 
 ```rust
 /// 整包注入（--model + --api-key）时即使清单为空也必须能开会话：
-/// 这条路径不经过清单条目，空 model 才是唯一的拦截信号。
+/// 这条路径不经过清单条目，拦截只能看 `cfg.model` 是否为空。
 #[tokio::test(flavor = "multi_thread")]
 async fn thread_start_accepts_an_explicit_injection_without_a_catalog() {
-    let mut h = Harness::new_with_injected_model();
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    // Harness 本来就注入隔离的 models_path（空清单）；这里只补注入标记。
+    cfg.model = "claude-injected".to_string();
+    cfg.api_key = "sk-injected".to_string();
+    cfg.model_injected = true;
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
         .await;
@@ -763,7 +771,7 @@ async fn thread_start_accepts_an_explicit_injection_without_a_catalog() {
 }
 ```
 
-若 `Harness` 没有现成的注入构造器，就用既有的 `RuntimeConfig` 注入方式（`config.rs:1108` 的测试展示了 `model_injected == true` 的构造）；本步允许只加 `#[ignore]` 的说明性测试，但**不得**跳过 Step 4 的拦截测试。
+（`Harness::with_cfg` 是既有构造器，`rpc_tests.rs:1822`；没有 `new_with_injected_model`，不要凭空调用。）
 
 - [ ] **Step 6: 跑既有 thread 测试确认无回归**
 
