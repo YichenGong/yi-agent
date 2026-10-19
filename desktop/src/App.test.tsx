@@ -1124,7 +1124,7 @@ describe("App 主区域看板", () => {
     expect(screen.queryByRole("button", { name: "创建看板" })).toBeNull();
   });
 
-  it("侧栏「创建」入口建盘走通用 plugin/query（不是看板专属 RPC）", async () => {
+  it("侧栏「创建」入口先装插件、再走通用 plugin/query 建盘", async () => {
     state.groupWorkspaces = ["/proj"];
     state.boards = [];
     render(<App />);
@@ -1139,15 +1139,24 @@ describe("App 主区域看板", () => {
 
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({
-        method: "plugin/query",
-        params: {
-          plugin: "superpowers-kanban",
-          project: "/proj",
-          method: "lifecycle/create",
-          params: { project: "/proj" },
-        },
+        method: "plugin/install",
+        params: { project: "/proj", plugin: "superpowers-kanban" },
       }),
     );
+    expect(clients[0].requests).toContainEqual({
+      method: "plugin/query",
+      params: {
+        plugin: "superpowers-kanban",
+        project: "/proj",
+        method: "lifecycle/create",
+        params: { project: "/proj" },
+      },
+    });
+    // 顺序是契约：全新项目没有清单，宿主不会拉起插件，plugin/query 无处可拨。
+    const lifecycle = clients[0].requests.filter(
+      (r) => r.method === "plugin/install" || r.method === "plugin/query",
+    );
+    expect(lifecycle.map((r) => r.method)).toEqual(["plugin/install", "plugin/query"]);
   });
 
   it("切回同一个看板不会重读（选中同一个不算换项目）", async () => {

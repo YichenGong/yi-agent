@@ -4,15 +4,36 @@ import { createBoard, listBoards, removeBoard } from "./superpowersKanbanBoards"
 type Rpc = Parameters<typeof listBoards>[0];
 
 describe("board lifecycle RPCs", () => {
-  it("createBoard 走通用 plugin/query（路由 project 与 params.project 都带）", async () => {
-    const inner = vi.fn(async () => ({}));
+  it("createBoard 先装插件、再走通用 plugin/query 建盘", async () => {
+    const calls: string[] = [];
+    const inner = vi.fn(async (method: string) => {
+      calls.push(method);
+      return {};
+    });
     await createBoard(inner as unknown as Rpc, "/proj");
-    expect(inner).toHaveBeenCalledWith("plugin/query", {
+    // 顺序是契约：没有清单，宿主根本不知道要拉起这个项目的插件，
+    // plugin/query 也就无处可拨。
+    expect(calls).toEqual(["plugin/install", "plugin/query"]);
+    expect(inner).toHaveBeenNthCalledWith(1, "plugin/install", {
+      project: "/proj",
+      plugin: "superpowers-kanban",
+    });
+    expect(inner).toHaveBeenNthCalledWith(2, "plugin/query", {
       plugin: "superpowers-kanban",
       project: "/proj",
       method: "lifecycle/create",
       params: { project: "/proj" },
     });
+  });
+
+  it("安装失败就不建盘：不能留下一个永远无法推进的看板", async () => {
+    const inner = vi.fn(async () => {
+      throw new Error("plugin_not_installed");
+    });
+    await expect(createBoard(inner as unknown as Rpc, "/proj")).rejects.toThrow(
+      "plugin_not_installed",
+    );
+    expect(inner).toHaveBeenCalledTimes(1);
   });
 
   it("removeBoard 走通用 plugin/query", async () => {
