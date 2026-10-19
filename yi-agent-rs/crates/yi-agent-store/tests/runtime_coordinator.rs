@@ -997,9 +997,12 @@ async fn a_delivered_child_reconciles_directly_to_completed() {
 }
 
 fn git_output(directory: &Path, args: &[&str]) -> Result<String, WorkerError> {
+    // Tests assert on git's stderr below, so pin the message language: a
+    // gettext-enabled git (e.g. Homebrew's) localizes it from the host locale.
     let output = Command::new("git")
         .args(args)
         .current_dir(directory)
+        .env("LC_ALL", "C")
         .output()
         .map_err(|error| WorkerError::Startup(format!("Git workspace error: {error}")))?;
     if !output.status.success() {
