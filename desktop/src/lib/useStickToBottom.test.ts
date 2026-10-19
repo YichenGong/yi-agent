@@ -35,7 +35,7 @@ const flushRaf = () => {
   cbs.forEach((cb) => cb(0));
 };
 
-let api: { scrollToBottom: () => void } | null = null;
+let api: { scrollToBottom: () => void; followIfAtBottom: () => void } | null = null;
 
 beforeEach(() => {
   observers = [];
@@ -61,8 +61,8 @@ afterEach(() => {
 function Harness() {
   const stick = useStickToBottom();
   useEffect(() => {
-    api = { scrollToBottom: stick.scrollToBottom };
-  }, [stick.scrollToBottom]);
+    api = { scrollToBottom: stick.scrollToBottom, followIfAtBottom: stick.followIfAtBottom };
+  }, [stick.scrollToBottom, stick.followIfAtBottom]);
   return createElement("div", { ref: stick.ref, "data-testid": "scroller" }, "x");
 }
 
@@ -137,6 +137,42 @@ describe("useStickToBottom", () => {
     fireResize(300);
     act(() => flushRaf());
     expect(state.scrollTop).toBe(100);
+  });
+
+  it("does not follow content growth once the user scrolled up", () => {
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installMetrics(el, { scrollHeight: 1000, clientHeight: 400, scrollTop: 100 });
+    fireEvent.scroll(el); // user is reading history
+    // Content grew (a streamed delta): the viewport must stay put.
+    state.scrollHeight = 1200;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(100);
+  });
+
+  it("follows content growth while the user is still at the bottom", () => {
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installMetrics(el, { scrollHeight: 1000, clientHeight: 400, scrollTop: 600 });
+    fireEvent.scroll(el); // user is at the bottom
+    state.scrollHeight = 1200;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(1200);
+  });
+
+  it("forces the bottom even when the user scrolled up (explicit intent)", () => {
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installMetrics(el, { scrollHeight: 1000, clientHeight: 400, scrollTop: 100 });
+    fireEvent.scroll(el); // user is reading history
+    // Sending a message / switching threads is an explicit request to see the
+    // newest content, so the command must override the scrolled-up state.
+    act(() => api!.scrollToBottom());
+    expect(state.scrollTop).toBe(1000);
+    // ...and the next growth keeps following without another explicit call.
+    state.scrollHeight = 1200;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(1200);
   });
 
   it("exposes a command that pins to the bottom immediately", () => {

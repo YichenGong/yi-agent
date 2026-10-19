@@ -19,8 +19,20 @@ export function isAtBottom(
 
 export interface StickToBottom {
   ref: RefObject<HTMLDivElement | null>;
-  /** 立即贴底（供流式追加时调用）。 */
+  /**
+   * 强制贴底，并重新表明「贴底意图」。
+   *
+   * 用于**用户明确要看到最新内容**的动作：发出消息、切换会话、点「回到底部」。
+   * 即使用户此刻正在上翻历史，也照做——这是用户主动要求的。
+   */
   scrollToBottom: () => void;
+  /**
+   * 内容增长时的可选跟随：用户仍在底部才贴底，已上翻历史则原地不动。
+   *
+   * 与 `scrollToBottom` 的区别只有一点——是否尊重用户的上翻意图。流式生成期间
+   * 必须用这个：每个 delta 都强制贴底会让用户永远读不到上面的内容。
+   */
+  followIfAtBottom: () => void;
 }
 
 /**
@@ -37,8 +49,13 @@ export interface StickToBottom {
  * 注意 `clientHeight`（含 padding）与 `entry.contentRect.height`（内容盒）相差一个常量；
  * 后者只用作**变化信号**，贴底判定一律直接读元素自身的三个度量，避免两套坐标混淆。
  *
- * `ResizeObserver` 缺失时（如 jsdom）退化为「只提供 `scrollToBottom`」，不建立观察，
+ * `ResizeObserver` 缺失时（如 jsdom）退化为「只提供两个贴底命令」，不建立观察，
  * 也不抛错。
+ *
+ * **贴底意图**（`atBottomRef`）是这里唯一的用户状态：`scroll` 事件写入它，
+ * `followIfAtBottom` 读取它。流式增长必须走 `followIfAtBottom`，否则用户上翻
+ * 历史后每个 delta 都会被拽回底部；`scrollToBottom` 是显式意图（发消息 / 切会话），
+ * 会重置该状态。
  */
 export function useStickToBottom(): StickToBottom {
   const ref = useRef<HTMLDivElement>(null);
@@ -49,6 +66,20 @@ export function useStickToBottom(): StickToBottom {
   const scrollToBottom = useCallback(() => {
     const el = ref.current;
     if (!el) return;
+    // 显式贴底同时重置「贴底意图」：用户刚发了消息 / 刚切会话 / 刚点了回到底部，
+    // 接下来流式增长应当继续跟随。
+    atBottomRef.current = true;
+    el.scrollTop = el.scrollHeight;
+  }, []);
+
+  /**
+   * 内容增长时的跟随。**只依赖记住的意图**，不在调用时重算 `isAtBottom`：
+   * 新内容已经让 `scrollHeight` 变大，此刻再算必然判成「不贴底」，于是永远不会跟随。
+   * 意图由 `scroll` 事件维护——用户上翻的瞬间就会写入 `false`。
+   */
+  const followIfAtBottom = useCallback(() => {
+    const el = ref.current;
+    if (!el || !atBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
   }, []);
 
@@ -103,5 +134,5 @@ export function useStickToBottom(): StickToBottom {
     };
   }, []);
 
-  return { ref, scrollToBottom };
+  return { ref, scrollToBottom, followIfAtBottom };
 }
