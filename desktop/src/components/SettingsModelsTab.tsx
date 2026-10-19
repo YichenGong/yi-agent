@@ -608,7 +608,24 @@ export function SettingsModelsTab({
         <p role="alert" className="mt-3 text-xs text-red-400">
           {loadError}
         </p>
-      ) : catalog.models.length === 0 ? (
+      ) : (
+        <>
+          {catalog.models.length > 0 && catalog.default_model === null && (
+            // 有条目却没有默认：新建会话会直接报「未配置模型」，用户很难自己
+            // 关联到"只是没设默认"。`role="status"` 而非 `alert`——它与保存
+            // 失败是两件事，不该争用同一个可访问性角色。
+            <div role="status" className="mt-3 text-xs text-amber-400">
+              还没有设置默认模型：新建会话会提示「未配置模型」。
+              <button
+                type="button"
+                onClick={() => void changeDefault(catalog.models[0].name)}
+                className="ml-2 underline"
+              >
+                把「{catalog.models[0].name}」设为默认
+              </button>
+            </div>
+          )}
+          {catalog.models.length === 0 ? (
         // 清单空不等于「没模型可用」：env 兜底在生效时下面那行会说清实际在用哪个，
         // 这里再说「还没有配置任何模型」就成了自相矛盾的假话。
         catalog.effective?.source === "env" ? (
@@ -616,8 +633,12 @@ export function SettingsModelsTab({
         ) : (
           <p className="mt-3 text-sm text-fg-muted">还没有配置任何模型</p>
         )
+      ) : isMobile ? (
+        renderCatalogCards()
       ) : (
-        isMobile ? renderCatalogCards() : renderCatalogTable()
+        renderCatalogTable()
+      )}
+        </>
       )}
 
       {/* 生效来源：无论清单是否为空都要如实告知现在到底在用哪个模型。 */}
