@@ -135,6 +135,7 @@ version_banner() {
 main() {
   set -euo pipefail
 
+  local dest; dest="$(app_path)"
   local dmg="${1:-}"
   if [ -z "$dmg" ]; then
     dmg="$(ls -t "$HOME/Downloads/"yi-agent_*_aarch64.dmg 2>/dev/null | head -1 || true)"
@@ -145,7 +146,125 @@ main() {
     return 1
   fi
 
-  echo "当前安装器版本：$(basename "$dmg")"
+  # 1. 位置校验：不降级，避免 App 路径变成不确定事实。
+  local app_parent; app_parent="$(dirname "$dest")"
+  if [ ! -w "$app_parent" ]; then
+    echo "ERROR: 无法写入 $app_parent（当前用户无权限）。" >&2
+    echo "请用管理员权限重跑：" >&2
+    echo "    sudo bash install.sh $dmg" >&2
+    echo "不要改安装目录：LaunchAgent、命令行入口与升级流程都绑定 $dest。" >&2
+    return 1
+  fi
+
+  local old_version; old_version="$(app_version "$dest")"
+
+  # 2. 挂载并确定源目录。
+  # 注意：cleanup 在 EXIT 时才跑，那时 main 的 local 已销毁；
+  # 故这几个变量必须放全局（前置下划线表明仅供 trap 使用）。
+  _CLEANUP_MOUNT="$(mktemp -d /tmp/yi-agent-dmg.XXXXXX)"
+  _CLEANUP_DEST="$dest"
+  _CLEANUP_STAGE=1
+  local mount; mount="$_CLEANUP_MOUNT"
+  cleanup() {
+    hdiutil detach "${_CLEANUP_MOUNT:-}" >/dev/null 2>&1 || true
+    rm -rf "${_CLEANUP_MOUNT:-}"
+    if [ "${_CLEANUP_STAGE:-0}" = 1 ]; then
+      rm -rf "${_CLEANUP_DEST:-}.new" "${_CLEANUP_DEST:-}.old"
+    fi
+  }
+  trap cleanup EXIT
+  echo "挂载 $dmg ..."
+  hdiutil attach "$dmg" -mountpoint "$mount" -nobrowse -quiet
+  if [ ! -d "$mount/$APP_NAME" ]; then
+    echo "ERROR: dmg 内未找到 $APP_NAME" >&2
+    return 1
+  fi
+  local new_version; new_version="$(app_version "$mount/$APP_NAME")"
+  version_banner "$old_version" "$new_version"
+
+  # 3. 先停值守，再用 SIGTERM 停旧 daemon（顺序不可交换）。
+  restart_own_watchman "$dest" || true
+
+  local pids_count; pids_count="$(daemon_pids "$dest" | wc -l | tr -d ' ')"
+  if [ "$pids_count" -gt 0 ]; then
+    local answer; answer="$(ask_answer)"
+    if ! confirm_stop "$pids_count" "$answer"; then
+      echo "已取消，未做任何改动。" >&2
+      return 1
+    fi
+    stop_daemons "$dest" >/dev/null
+  fi
+
+  # 4. 退出 GUI（其 sidecar 靠 stdin EOF 自行退出）。
+  local gui; gui="$(gui_pids "$dest" | head -1)"
+  if [ -n "$gui" ]; then
+    echo "正在退出 yi-agent（pid $gui）..."
+    if ! quit_gui "$gui" "$dest"; then
+      echo "ERROR: 无法退出 App，已保留现有版本。请手动退出后重跑。" >&2
+      return 1
+    fi
+  fi
+
+  # 5. 原子替换 + 清 quarantine。
+  echo "安装到 $dest ..."
+  replace_app "$mount/$APP_NAME" "$dest"
+  xattr -dr com.apple.quarantine "$dest" 2>/dev/null || true
+  _CLEANUP_STAGE=0
+
+  # 6. CLI 入口。
+  local bin_dir=""
+  if bin_dir="$(pick_bin_dir)"; then
+    if link_cli "$dest" "$bin_dir"; then
+      echo "命令行入口：$bin_dir/yi-agent -> $dest/Contents/MacOS/yi-agent"
+      local status; status="$(link_status "$dest" "$bin_dir")"
+      case "$status" in
+        ok) ;;
+        missing)
+          echo "提示：$bin_dir 不在当前 PATH。加到 shell 配置：" >&2
+          echo "    export PATH=\"$bin_dir:\$PATH\"" >&2
+          ;;
+        shadowed:*)
+          local hit="${status#shadowed:}"
+          echo "WARN: 当前 'yi-agent' 命中的是 $hit，不是刚安装的这条。" >&2
+          echo "      PATH 中更靠前的目录有同名程序（常见于 brew / npm 全局安装）。" >&2
+          ;;
+      esac
+    fi
+  else
+    echo "WARN: 没有可写的 PATH 目录，跳过命令行入口。" >&2
+    echo "      手动执行：sudo ln -sf \"$dest/Contents/MacOS/yi-agent\" /usr/local/bin/yi-agent" >&2
+  fi
+
+  # 7. 清理死配置。
+  local dead
+  while IFS= read -r dead; do
+    [ -n "$dead" ] || continue
+    rm -f "$dead" && echo "已清理失效的 LaunchAgent：$dead"
+  done <<EOF
+$(dead_plists "$dest")
+EOF
+
+  # 8. 校验。
+  local got; got="$(cli_version "$dest")"
+  if [ -z "$got" ]; then
+    echo "ERROR: 安装后内置 CLI 无法执行" >&2
+    return 1
+  fi
+  echo "校验通过：$(basename "$dest") 的 CLI 输出 $got"
+
+  cat <<'EOF'
+
+配置：App 与 TUI 共用 ~/.yi-agent/.env，只需写一次。
+
+  mkdir -p ~/.yi-agent
+  echo 'MODEL_API_KEY=sk-ant-...' >> ~/.yi-agent/.env
+
+GUI：从「启动台 / 应用程序」打开 yi-agent。
+TUI：cd 到项目目录后直接运行 yi-agent。
+
+若首次打开提示「无法验证开发者」：
+  System Settings → Privacy & Security → 点 "Open Anyway"。
+EOF
 }
 
 
