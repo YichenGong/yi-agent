@@ -29,6 +29,33 @@ export type ModelEntryView = {
    * `reasoning_effort`，由模型自行决定。
    */
   reasoning_effort?: string | null;
+  /**
+   * 该条目在各通道上**实测**支持哪些档位（加模型/改连接后由宿主后台探测）。
+   *
+   * **缺省/null = 能力未知**（还没测、或整轮探测失败）。未知时必须平铺七档——
+   * 这与探测功能上线前的行为一致；把它当成「零个档位」会让用户无从下手。
+   */
+  reasoning_capabilities?: ReasoningCapabilities | null;
+};
+
+/**
+ * 单条通道的探测结论。
+ *
+ * `error` 非空 = 这一轮没得出可归因的结论（鉴权失败、超时、基线被拒），此时
+ * `supported` 没有意义，读取方一律按「未知」处理。
+ */
+export type ChannelCapability = {
+  supported: string[];
+  /** epoch 秒。`0` = 老数据/坏数据，只用于展示，不参与判定。 */
+  probed_at: number;
+  error?: string | null;
+};
+
+/** 三个通道各自的能力；缺省 = 该通道没测过。 */
+export type ReasoningCapabilities = {
+  chat?: ChannelCapability | null;
+  responses?: ChannelCapability | null;
+  anthropic?: ChannelCapability | null;
 };
 
 /**
@@ -199,6 +226,21 @@ export async function testModel(
     ok: result?.ok === true,
     reason: typeof result?.reason === "string" ? result.reason : null,
   };
+}
+
+/**
+ * 启动某个模型条目的能力探测。
+ *
+ * 只**启动**：宿主立即回 `started`，真实结果最长 30 秒后经
+ * `model/capabilitiesChanged` 广播。`started: false` = 同名条目已有一轮在跑
+ * （去重），此时等广播即可，不必重试。
+ */
+export async function probeModel(
+  rpc: ModelRpc,
+  name: string,
+): Promise<{ started: boolean }> {
+  const result = await rpc<{ started?: unknown }>(RPC.modelProbe, { name });
+  return { started: result?.started === true };
 }
 
 /**

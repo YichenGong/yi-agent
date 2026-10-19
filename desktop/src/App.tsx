@@ -79,6 +79,8 @@ import { createContentStore, persistContent, type AsyncContentStore, type Conten
 import { parseSyncPlan, resolveSyncPlan, type SyncAction } from "./lib/syncPlan";
 import { useDragDropPaths } from "./hooks/useDragDropPaths";
 import { subscribeDragDrop } from "./lib/dragDropSubscribe";
+import { notifyModelCapabilitiesChanged } from "./lib/modelCapabilitiesBus";
+import type { ReasoningCapabilities } from "./lib/models";
 import { insertDroppedPaths } from "./lib/droppedPaths";
 
 /**
@@ -1209,6 +1211,19 @@ export default function App() {
           const next = parseTheme(n.params.theme);
           prefs.confirmedThemeRef.current = next;
           prefs.setTheme(next);
+          return;
+        }
+        if (n.method === "model/capabilitiesChanged") {
+          // 宿主探测完成的权威结果。桌面端没有全局模型清单 store（设置页与输入区
+          // 的模型下拉各自持有一份），所以这里只把「哪条变了」广播出去，由各自
+          // 重读 `model/list`。协议字段在生成物里是 `unknown`（runtime 类型没有
+          // TS 绑定），这里按线上形状断言一次。
+          notifyModelCapabilitiesChanged({
+            name: n.params.name,
+            capabilities:
+              (n.params
+                .reasoning_capabilities as ReasoningCapabilities | null | undefined) ?? null,
+          });
           return;
         }
         if (n.method === "ui/gitDiff/focus") {
