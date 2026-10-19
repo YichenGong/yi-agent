@@ -234,6 +234,11 @@ pub(crate) struct RuntimeAttachments {
     /// 拒绝——这正是本任务最危险的一处,故测试用 `Harness::lead_repliers` 驱动
     /// 真实装配(见 `a_blocking_ask_lead_receives_the_lead_reply`)。
     pub(crate) lead_replies: crate::lead::LeadReplies,
+    /// 组长写通道:组长工具投递「取消 / 打回」,主循环消费。与 `lead_inbox` 相对、
+    /// 同一注入理由——测试要在主循环之外拿同一个实例投递。
+    pub(crate) lead_control: crate::lead_control::LeadControlInbox,
+    /// 组长写结果登记表:工具侧登记 `request_id`,主循环执行完回填。
+    pub(crate) lead_control_replies: crate::lead_control::LeadControlReplies,
 }
 
 /// Starts a project's board daemon; see [`yi_agent_boards::lifecycle::create_with_project`].
@@ -366,6 +371,12 @@ pub(crate) fn attach_delegation(
     // 阻塞式 `ask_lead` 的回信登记表。与 `lead_inbox` 必须成对传递:
     // 只传信箱而不传登记表,`await` 侧登记的名字将永远无人回填。
     lead_replies: &crate::lead::LeadReplies,
+    // 组长写通道与结果登记表:转交 `build_runtime_tooling`,使本会话若判定为组长
+    // 便能注册那两个写工具。与 `lead_inbox` 相对(那个是 thread→lead,这个是
+    // lead→thread)、同一注入理由:必须与主循环共享同一实例,自造一份就投进
+    // 没人听的通道。
+    lead_control: &crate::lead_control::LeadControlInbox,
+    lead_control_replies: &crate::lead_control::LeadControlReplies,
     // 本会话的起点 sha(默认 diff 基准)。**由调用方给出,不在本函数里读盘**:
     // `thread/start` 走到这里时 meta 尚未落盘(`start_thread_core` 先 attach 再
     // `create`),在这里读只会永远读到 `None`,工具就落不到会话起点上。调用方
@@ -433,6 +444,8 @@ pub(crate) fn attach_delegation(
         crate::thread_store::ThreadStore::new(Path::new(cwd)).project_key(),
         lead_inbox.clone(),
         lead_replies.clone(),
+        lead_control.clone(),
+        lead_control_replies.clone(),
         anchor_sha,
     ) {
         Ok(tooling) => Activation {
@@ -964,6 +977,11 @@ fn build_runtime_tooling(
     // 回信登记表与超时:两者一起决定 `blocking: true` 是否真的有界往返
     // (只有登记表而没有超时来源,或反之,都会让契约半途而废)。
     lead_replies: crate::lead::LeadReplies,
+    // 组长写通道与结果登记表:组长的两个写工具经它们把「取消 / 打回」送到主循环。
+    // 与 `lead_inbox`/`lead_replies` 同一注入理由(装配期绑,否则工具投进没人听的
+    // 通道),只是方向相反——那是 thread→lead,这是 lead→thread。
+    lead_control: crate::lead_control::LeadControlInbox,
+    lead_control_replies: crate::lead_control::LeadControlReplies,
     // 本会话的起点 sha：`show_git_diff` 默认按它算 diff，并在回执里如实报出。
     // 与 project_key 同理——模型看不到会话元数据，装配期注入是唯一来源。
     anchor_sha: Option<String>,
@@ -1046,7 +1064,10 @@ fn build_runtime_tooling(
     let session_cwd = state_dir.parent().unwrap_or(state_dir);
     if !is_lead && !crate::thread_store::is_kanban_worktree(session_cwd) {
         registry.register(Arc::new(
-            crate::lead::AskLeadTool::new(lead_inbox, project_key, thread_id.to_string())
+            // `project_key` 克隆而非 move:下面的 `if is_lead` 分支也要用它,而借用
+            // 检查器不做「两分支互斥」的路径分析,任何一侧 move 都会让另一侧报
+            // use-after-move。普通会话是常态,故把那次克隆放在这里(组长分支另算)。
+            crate::lead::AskLeadTool::new(lead_inbox, project_key.clone(), thread_id.to_string())
                 // 回信能力**必须**在这里接上:漏掉它没有编译错误,`blocking: true`
                 // 只会静默退化成 P1 的显式拒绝。超时用共享常量,不写裸字面量——
                 // 两个 2 分钟各自漂移时,「等待方超时」与「组长还有多久回来」会脱钩。
@@ -1081,6 +1102,23 @@ fn build_runtime_tooling(
         )));
         registry.register(Arc::new(crate::lead_memory::LeadRecallTool::new(
             project_root,
+        )));
+        // 两个写工具:组长对「项目里别的 thread」的写能力(spec §3)。
+        // 与账本工具同门控——`is_lead` 的唯一权威是落盘 `ThreadMeta.role`,普通会话
+        // 与子 worker 一律看不到。
+        //
+        // `project_key` 在**上面的** `if !is_lead` 分支里已被 `AskLeadTool::new`
+        // move 过一次(那条分支传的是克隆;见彼处注释),故这里拿到的是同一个
+        // owned 串:第一个工具克隆一份,第二个 move 出去。
+        registry.register(Arc::new(crate::lead_control::LeadInterruptTool::new(
+            lead_control.clone(),
+            lead_control_replies.clone(),
+            project_key.clone(),
+        )));
+        registry.register(Arc::new(crate::lead_control::LeadRejectTool::new(
+            lead_control,
+            lead_control_replies,
+            project_key,
         )));
     }
     Ok(RuntimeTooling {
@@ -1553,6 +1591,8 @@ where
             // 回信登记表与信箱同一实例范围:`blocking: true` 的 await 侧登记
             // 在这里,回填由同一个 `serve` 主循环做。
             lead_replies: crate::lead::LeadReplies::new(),
+            lead_control: crate::lead_control::LeadControlInbox::new(),
+            lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
         production_factory(cfg, theme_for_factory, catalog),
     )
@@ -1637,6 +1677,8 @@ where
             // 回信登记表与信箱同一实例范围:`blocking: true` 的 await 侧登记
             // 在这里,回填由同一个 `serve` 主循环做。
             lead_replies: crate::lead::LeadReplies::new(),
+            lead_control: crate::lead_control::LeadControlInbox::new(),
+            lead_control_replies: crate::lead_control::LeadControlReplies::new(),
         },
         production_factory(cfg, theme_for_factory, catalog),
         // 桌面 = Admin(与 `run`/`serve_stdio` 的 stdio 注册完全一致)。
@@ -2378,6 +2420,8 @@ where
         watchman_home,
         lead_inbox,
         lead_replies,
+        lead_control,
+        lead_control_replies,
     } = attachments;
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
@@ -2461,6 +2505,9 @@ where
     // 到 `tokio::spawn` 需要 `'static` 或共享可变状态,两者都会拆掉「一个主循环
     // 串行拥有 threads」这条前提(与通用会话驱动器同一约束)。
     let mut lead_rx = lead_inbox.subscribe();
+    // 组长写通道的消费端。与 `lead_rx` 同一理由:订阅要在投递之前建立,
+    // 且消费必须留在本循环的 `select!`(`threads` 是本函数独占的 `&mut`)。
+    let mut lead_control_rx = lead_control.subscribe();
     // 「哪条阻塞请求正等着哪个组长的本轮结束」。key 是组长 thread id、value 是
     // 待回填的 `request_id` 队列:同一个组长可能同时被多个会话阻塞等待(它自己
     // 串行跑 turn,但投递可以叠队),所以是一对多而非一对一。
@@ -2675,6 +2722,8 @@ where
                             skills_home: &skills_home,
                             lead_inbox: &lead_inbox,
                             lead_replies: &lead_replies,
+                            lead_control: &lead_control,
+                            lead_control_replies: &lead_control_replies,
                             pending_lead_replies: &mut pending_lead_replies,
                         }
                     };
@@ -2973,6 +3022,8 @@ where
                     &build_agent,
                     &lead_inbox,
                     &lead_replies,
+                    &lead_control,
+                    &lead_control_replies,
                 )
                 .await;
             }
@@ -3020,6 +3071,8 @@ where
                         build_agent: &build_agent,
                         lead_inbox: &lead_inbox,
                         lead_replies: &lead_replies,
+                        lead_control: &lead_control,
+                        lead_control_replies: &lead_control_replies,
                         lead_target: Some(delivery.lead),
                     };
                     if let Err(error) = launcher.deliver_to_lead(&envelope).await {
@@ -3072,6 +3125,8 @@ where
                     build_agent: &build_agent,
                     lead_inbox: &lead_inbox,
                     lead_replies: &lead_replies,
+                    lead_control: &lead_control,
+                    lead_control_replies: &lead_control_replies,
                     lead_target: Some(target),
                 };
                 if let Err(error) = launcher.deliver_to_lead(&envelope).await {
@@ -3090,6 +3145,40 @@ where
                         }
                     }
                 }
+            }
+            cmd = lead_control_rx.recv() => {
+                let Ok(cmd) = cmd else { continue };
+                // 照着 `lead_rx` 分支的形状构造 launcher（每个分支都得自带一份，
+                // 因为 `threads` 是 `&mut`，不能跨分支共享）。
+                let mut launcher = ServeLauncher {
+                    threads: &mut threads,
+                    pending_activation: &mut pending_activation,
+                    process_watches: &mut process_watches,
+                    uploads: &mut uploads,
+                    runtimes: &runtimes,
+                    thread_roots: &thread_roots,
+                    models_path: &models_path,
+                    cfg: &cfg,
+                    hub: &hub,
+                    turn_tx: &turn_tx,
+                    pending: &pending,
+                    permission_timeout,
+                    perm_seq: &perm_seq,
+                    theme: &theme,
+                    git_diff: &git_diff_handle,
+                    workspaces: &workspaces,
+                    build_agent: &build_agent,
+                    lead_inbox: &lead_inbox,
+                    lead_replies: &lead_replies,
+                    lead_control: &lead_control,
+                    lead_control_replies: &lead_control_replies,
+                    // 写指令不投递给组长，故没有 lead target。
+                    lead_target: None,
+                };
+                let request_id = cmd.request_id.clone();
+                let outcome = launcher.apply_lead_control(cmd).await;
+                // 回填结果：工具侧按 request_id 收口。无人等待（已超时）是安全的。
+                lead_control_replies.resolve(&request_id, outcome);
             }
         }
     }
@@ -4867,6 +4956,8 @@ async fn driver_tick<F>(
     build_agent: &F,
     lead_inbox: &crate::lead::LeadInbox,
     lead_replies: &crate::lead::LeadReplies,
+    lead_control: &crate::lead_control::LeadControlInbox,
+    lead_control_replies: &crate::lead_control::LeadControlReplies,
 ) where
     F: Fn(
         Option<yi_agent_core::Session>,
@@ -4927,6 +5018,9 @@ async fn driver_tick<F>(
                 lead_inbox,
                 // 驱动器从不对组长投递,故回信登记表原样借入即可(签名要求)。
                 lead_replies,
+                // 写通道与结果登记表同理:驱动器不执行写指令,只为满足 launcher 签名。
+                lead_control,
+                lead_control_replies,
                 // 驱动器从不对组长投递:`LeadTarget` 的解析会**落盘**一个组长
                 // meta(见 `resolve_lead_target`),而驱动器每 3s 就要为每个
                 // (项目, 插件) 构造一次 launcher——在这里解析会让每次 tick 都
@@ -5060,6 +5154,16 @@ struct ServeLauncher<'a, F> {
     /// `None` = 该 launcher 不承载组长投递(目前只有 `driver_tick` 构造的
     /// launcher,见其构造点)。
     lead_target: Option<LeadTarget>,
+    /// 组长写通道：工具侧把「取消 / 打回」投进这里，主循环消费它去动 `threads`。
+    /// 与 `lead_inbox` 相对（那个是 thread→lead，这个是 lead→thread），同一实例、
+    /// 同一注入理由——自造一份就投进没人听的通道。
+    ///
+    /// 它经 `start_thread_core` / `attach_delegation` 一路进 `build_runtime_tooling`，
+    /// 在装配期注册两个写工具（与上面 `lead_replies` 同一条通路）。
+    lead_control: &'a crate::lead_control::LeadControlInbox,
+    /// 写结果登记表：与 `lead_control` 成对转交（工具侧登记 `request_id`，主循环
+    /// 执行完回填）。只传通道而不传登记表，组长那侧将永远等不到结果。
+    lead_control_replies: &'a crate::lead_control::LeadControlReplies,
 }
 
 /// 一次组长投递的目标:该项目当前应承载消息的组长 thread。
@@ -5208,6 +5312,8 @@ where
             driver_ref,
             self.lead_inbox,
             self.lead_replies,
+            self.lead_control,
+            self.lead_control_replies,
         )
         .await?;
 
@@ -5223,6 +5329,79 @@ where
         }
 
         self.prepare_and_deliver(&thread_id, objective).await
+    }
+
+    /// 执行一条组长写指令。
+    ///
+    /// 只有主循环能调：它持有 `&mut self.threads`。工具侧永远够不到这条路径
+    /// （它们只往 `lead_control` 投递），这就是「守住 §6.1 独占」的落点。
+    pub(crate) async fn apply_lead_control(
+        &mut self,
+        cmd: crate::lead_control::LeadControlCmd,
+    ) -> Result<String, String> {
+        use crate::lead_control::{ControlTarget, LeadControlKind, classify_target};
+
+        // 目标 thread 所属的项目键：从它的 store 现取（每个 thread 有自己的
+        // `cwd` → store，`threads` 里可能有多个项目的 thread）。取不到 = 目标不在场。
+        let target_project_key = self
+            .threads
+            .get(&cmd.thread_id)
+            .map(|s| s.store.project_key());
+        let target = classify_target(
+            &cmd.project_key,
+            target_project_key.as_deref().unwrap_or(""),
+            target_project_key.is_some(),
+        );
+        if target == ControlTarget::NotOpen {
+            return Err(format!(
+                "目标会话 {} 当前未打开（或不属于本项目），无法下达指令",
+                cmd.thread_id
+            ));
+        }
+
+        match cmd.kind {
+            LeadControlKind::Interrupt => {
+                let Some(session) = self.threads.get(&cmd.thread_id) else {
+                    return Err("目标会话不在场".to_string());
+                };
+                let Some(turn_id) = session.active_turn_id.clone() else {
+                    // 无活跃轮：报错，不静默 no-op（spec §3.2）。
+                    return Err("目标当前没有活跃轮，无法打断".to_string());
+                };
+                // 与 `turn/interrupt` 逐字同源：幂等 level 信号 + try_send 不阻塞。
+                let _ = session.interrupt_tx.try_send(turn_id);
+                Ok(format!("已打断 {} 的当前轮", cmd.thread_id))
+            }
+            LeadControlKind::Reject => {
+                let text = format!("[组长打回] {}", cmd.reason);
+                // 有活跃轮 → 走 interjection（与用户中途打字同一路径）；
+                // 无活跃轮 → 起一轮（spec §3.1）。
+                if let Some(session) = self.threads.get(&cmd.thread_id) {
+                    if let Some(turn_id) = session.active_turn_id.clone() {
+                        let interjection_id =
+                            format!("interject-{}-{}", turn_id, uuid::Uuid::new_v4());
+                        if session
+                            .interject_tx
+                            .send(crate::session::InterjectionRequest {
+                                turn_id,
+                                interjection_id,
+                                text,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return Err("目标 driver 已退出".to_string());
+                        }
+                        return Ok(format!("已把打回指令并入 {} 的当前轮", cmd.thread_id));
+                    }
+                }
+                // 无活跃轮（或目标刚转为 idle）：起一轮，走 prepare_and_deliver。
+                self.prepare_and_deliver(&cmd.thread_id, &text)
+                    .await
+                    .map(|tid| format!("已向 {tid} 投递打回指令（起了新的一轮）"))
+                    .map_err(|e| e.to_string())
+            }
+        }
     }
 
     /// 准备并投递一轮,**不发任何 RPC 响应帧**。
@@ -5472,6 +5651,8 @@ where
             None,
             self.lead_inbox,
             self.lead_replies,
+            self.lead_control,
+            self.lead_control_replies,
         )
         .await?;
 
@@ -5734,6 +5915,12 @@ pub(crate) async fn start_thread_core(
     // 进程的回信登记表:与信箱同路转交,使本会话的 `ask_lead blocking: true`
     // 真的能等到回信(`attach_delegation` 把它接进 `AskLeadTool::with_replies`)。
     lead_replies: &crate::lead::LeadReplies,
+    // 组长写通道与结果登记表:与 `lead_inbox`/`lead_replies` 同路转交(经
+    // `attach_delegation` 进 `build_runtime_tooling`),使本会话若判定为组长便能
+    // 注册那两个写工具。必须是主循环共享的同一实例——自造一份只会投进没人听的
+    // 通道。
+    lead_control: &crate::lead_control::LeadControlInbox,
+    lead_control_replies: &crate::lead_control::LeadControlReplies,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -5762,6 +5949,8 @@ pub(crate) async fn start_thread_core(
         extra_roots.clone(),
         lead_inbox,
         lead_replies,
+        lead_control,
+        lead_control_replies,
         // 新建路径：起点就是刚刚取的 HEAD。
         anchor_sha.clone(),
         built,
@@ -7418,6 +7607,10 @@ mod session_driver_tests {
         lead_inbox: crate::lead::LeadInbox,
         /// 该 launcher 的回信登记表,与信箱同一理由:测试不投递,空表即可。
         lead_replies: crate::lead::LeadReplies,
+        /// 该 launcher 的组长写通道,同上:测试不投递,空信箱即可。
+        lead_control: crate::lead_control::LeadControlInbox,
+        /// 该 launcher 的写结果登记表,同一理由:测试不投递,空表即可。
+        lead_control_replies: crate::lead_control::LeadControlReplies,
         _workdir_dir: tempfile::TempDir,
         _theme_dir: tempfile::TempDir,
         _workspace_dir: tempfile::TempDir,
@@ -7450,6 +7643,8 @@ mod session_driver_tests {
                 models_path: isolated_models_path(theme_dir.path()),
                 lead_inbox: crate::lead::LeadInbox::new(),
                 lead_replies: crate::lead::LeadReplies::new(),
+                lead_control: crate::lead_control::LeadControlInbox::new(),
+                lead_control_replies: crate::lead_control::LeadControlReplies::new(),
                 _workdir_dir: workdir_dir,
                 _theme_dir: theme_dir,
                 _workspace_dir: workspace_dir,
@@ -7467,6 +7662,8 @@ mod session_driver_tests {
             ServeLauncher {
                 lead_inbox: &self.lead_inbox,
                 lead_replies: &self.lead_replies,
+                lead_control: &self.lead_control,
+                lead_control_replies: &self.lead_control_replies,
                 lead_target: None,
                 threads: &mut self.threads,
                 pending_activation: &mut self.pending_activation,
@@ -7571,6 +7768,8 @@ mod session_driver_tests {
                 build_agent,
                 &self.lead_inbox,
                 &self.lead_replies,
+                &self.lead_control,
+                &self.lead_control_replies,
             )
             .await;
         }

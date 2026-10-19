@@ -134,6 +134,8 @@ where
                 watchman_home: crate::server::home_dir(),
                 lead_inbox: crate::lead::LeadInbox::new(),
                 lead_replies: crate::lead::LeadReplies::new(),
+                lead_control: crate::lead_control::LeadControlInbox::new(),
+                lead_control_replies: crate::lead_control::LeadControlReplies::new(),
             },
             build_agent,
             serve_scopes,
