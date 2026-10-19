@@ -254,6 +254,9 @@ pub(crate) async fn handle_shared(
                 return Ok(Flow::Continue);
             }
             let switch_key = parsed.switch_key.as_str();
+            // 就绪等待要把它 move 进 blocking 池，故先克隆一份；`switch_key` 仍
+            // 借自 `parsed`，在安装阶段还要用。
+            let ready_manifest = parsed.clone();
 
             // 先清单、后开关：清单让 supervisor 拉起进程，开关决定它要不要干活。
             // 两者缺一都会得到一个「注册了、起来了、却永不推进」的插件，
@@ -330,6 +333,34 @@ pub(crate) async fn handle_shared(
                     "the daemon-start task failed: {error}"
                 ),
             }
+            // 等插件自己的查询通道就绪。只等 daemon 的 `Status` 不够：转发表由
+            // daemon 的监督循环每 500ms 登记一次，插件还要 bind socket；调用方
+            // （桌面建看板）紧接着就发 `plugin/query`。
+            //
+            // 阻塞轮询放进 blocking 池。超时不算失败：清单与开关已落盘，常驻
+            // 监督会继续重试；回包用 `queryable` 如实告诉调用方。
+            let queryable = {
+                let ready_project = project.clone();
+                let manifest = ready_manifest;
+                match tokio::task::spawn_blocking(move || {
+                    crate::server::wait_for_plugin_query_socket(&ready_project, &manifest)
+                })
+                .await
+                {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        tracing::warn!(%error, "the plugin-readiness task failed");
+                        true
+                    }
+                }
+            };
+            if !queryable {
+                tracing::warn!(
+                    project = %project.display(),
+                    plugin = %plugin,
+                    "installed the plugin but its query channel was not ready in time; the resident watch will retry"
+                );
+            }
             // 值守的登录项：`board/create` 时代由建板路径 best-effort 安装，那
             // 条路径随域删除后没有替代落点。安装一个需要常驻的插件正是它的通用
             // 对应物——开关为开、plist 未指向当前 exe 时装一次。
@@ -355,6 +386,10 @@ pub(crate) async fn handle_shared(
                     id,
                     json!({
                         "installed": true,
+                        // 装完这一刻插件能不能被查询。调用方据此决定是立刻发
+                        // `plugin/query`，还是先等监督补上（超时为 false，但安装
+                        // 本身是成功的）。
+                        "queryable": queryable,
                         // `PathBuf` 的 `Serialize` 在非 UTF-8 路径上会直接报错；
                         // 回包里的路径是给客户端看的，lossy 比整条响应失败好。
                         "manifest": yi_agent_supervisors::install::manifests_dir(&project)

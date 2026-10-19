@@ -73,6 +73,75 @@ const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// (测试模块经 `use super::*` 也取同一份)。
 pub(crate) const TAG_NAME_MAX_LEN: usize = 24;
 
+/// `plugin/install` 等插件查询通道就绪的上限。
+///
+/// 装完清单、开了开关、拉起 daemon 之后，插件进程还要过两关才可查：daemon 的
+/// 监督循环（500ms 一轮）把它登记进转发表，插件自己要 bind 查询 socket。只等
+/// daemon 的 `Status` 就回包，调用方紧接着发 `plugin/query` 会撞上
+/// `plugin_unavailable`——桌面「建看板」正是这个顺序。
+///
+/// 5s 覆盖「冷启动 + 一轮监督 + bind」，又短到一次失败的安装不会看起来像挂死。
+pub(crate) const PLUGIN_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 轮询间隔。50ms 足够细，不会让就绪多等一整个监督周期。
+pub(crate) const PLUGIN_READY_POLL: Duration = Duration::from_millis(50);
+
+/// 插件清单声明的查询 socket 现在是否有人监听。
+///
+/// 判据只有一条：能不能 `connect` 上。Unix socket 的 `connect` 成功当且仅当有
+/// 进程在 `listen`；陈旧 socket 文件会 `ECONNREFUSED`，故不会被误认。
+///
+/// 纯路径/清单输入，不含任何插件名：宿主只说「这份清单声明的通道通不通」。
+pub(crate) fn plugin_query_socket_ready(
+    project: &Path,
+    manifest: &yi_agent_supervisors::manifest::SupervisorManifest,
+    connect: &dyn Fn(&Path) -> bool,
+) -> bool {
+    let layout = yi_agent_supervisors::supervisor::Layout::for_workdir(project);
+    match manifest.query_socket_path(
+        &layout.workdir,
+        &layout.state_dir(&manifest.name),
+        &layout.runtime_dir,
+    ) {
+        Some(Ok(socket)) => connect(&socket),
+        // 没声明查询通道：对调用方来说就是「立刻可查」——没有东西要等。
+        None => true,
+        // 路径深到回退后仍放不下：插件不会在那个位置 bind，等下去只会白等。
+        Some(Err(_)) => true,
+    }
+}
+
+/// 等插件查询通道就绪，最多 [`PLUGIN_READY_TIMEOUT`]。
+///
+/// 阻塞调用（含 sleep），调用方放进 blocking 池。返回是否在期限内就绪；
+/// 超时**不是错误**——清单与开关已落盘，常驻监督会继续重试。
+pub(crate) fn wait_for_plugin_query_socket(
+    project: &Path,
+    manifest: &yi_agent_supervisors::manifest::SupervisorManifest,
+) -> bool {
+    wait_for_plugin_query_socket_within(project, manifest, PLUGIN_READY_TIMEOUT)
+}
+
+/// 带显式期限的版本：生产常量走上一层，测试用它把「永不就绪」压到毫秒级。
+pub(crate) fn wait_for_plugin_query_socket_within(
+    project: &Path,
+    manifest: &yi_agent_supervisors::manifest::SupervisorManifest,
+    timeout: Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if plugin_query_socket_ready(project, manifest, &|socket| {
+            std::os::unix::net::UnixStream::connect(socket).is_ok()
+        }) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(PLUGIN_READY_POLL);
+    }
+}
+
 /// `image/read` 每次回传的原始字节上限。传输帧上限 1 MiB,base64 膨胀 4/3 后
 /// 512 KiB 的原始块约 683 KiB,连同其它字段仍在单帧之内。
 pub(crate) const IMAGE_READ_CHUNK_BYTES: u64 = 512 * 1024;
@@ -9177,5 +9246,118 @@ mod watchman_install_tests {
             Arc::new(|_exe: &Path, _home: &Path| Err("launchctl bootstrap failed".to_string()));
 
         ensure_watchman_installed(dir.path(), home.path(), &install);
+    }
+}
+
+#[cfg(test)]
+mod plugin_ready_tests {
+    use super::*;
+
+    fn manifest(query_socket: Option<&str>) -> yi_agent_supervisors::manifest::SupervisorManifest {
+        let socket = query_socket
+            .map(|value| format!(r#","query_socket":"{value}""#))
+            .unwrap_or_default();
+        yi_agent_supervisors::manifest::SupervisorManifest::parse(&format!(
+            r#"{{"name":"demo","command":"/bin/true","switch_key":"demo_on"{socket}}}"#
+        ))
+        .unwrap()
+    }
+
+    /// 没有查询通道的清单立刻算就绪：没有东西要等。
+    #[test]
+    fn a_manifest_without_a_query_socket_is_ready_at_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let ready = plugin_query_socket_ready(dir.path(), &manifest(None), &|_socket| {
+            probes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            false
+        });
+        assert!(ready);
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing to wait for means no connect attempt"
+        );
+    }
+
+    /// 深路径走回退规则：探测的必须是回退后的短路径，而不是插件 bind 不上的长路径。
+    /// 两边（supervisor 与插件）用同一条规则，这里钉的是「宿主探的就是插件会 bind 的」。
+    #[test]
+    fn a_deep_socket_path_is_probed_at_the_fallback_location() {
+        let deep = std::path::PathBuf::from("/tmp")
+            .join("x".repeat(120))
+            .join("proj");
+        let manifest = manifest(Some("{state_dir}/demo.sock"));
+        let probed = std::sync::Mutex::new(None::<std::path::PathBuf>);
+        plugin_query_socket_ready(&deep, &manifest, &|socket| {
+            *probed.lock().unwrap() = Some(socket.to_path_buf());
+            true
+        });
+        let probed = probed
+            .into_inner()
+            .unwrap()
+            .expect("the deep path must still be probed");
+        assert!(
+            probed.as_os_str().len() <= yi_agent_supervisors::manifest::MAX_SOCKET_PATH_BYTES,
+            "must probe the fallback, got {}",
+            probed.display()
+        );
+    }
+
+    /// 晚到的监听者必须被观察到：这正是 install 后立刻 query 的那个竞态。
+    #[test]
+    fn a_listener_that_appears_late_is_observed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // 与 supervisor 的布局规则一致：`{state_dir}` = `<workdir>/.yi-agent/<name>`。
+        let state_dir = dir.path().join(".yi-agent").join("demo");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let socket = state_dir.join("demo.sock");
+        let manifest = manifest(Some("{state_dir}/demo.sock"));
+        let project = dir.path().to_path_buf();
+
+        // 插件进程「稍后才 bind」：先让等待方开始轮询，再起监听者。
+        let late_socket = socket.clone();
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            let listener = std::os::unix::net::UnixListener::bind(&late_socket).unwrap();
+            // 保持监听直到等待方已经连上；随后释放。
+            std::thread::sleep(Duration::from_millis(600));
+            drop(listener);
+        });
+
+        let started = std::time::Instant::now();
+        let ready =
+            wait_for_plugin_query_socket_within(&project, &manifest, Duration::from_secs(3));
+        late.join().unwrap();
+
+        assert!(ready, "a listener that appeared late must be observed");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "must return as soon as it connects, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 真的轮询：socket 文件一直是陈旧的（无监听者），必须在期限内回 false 而不是挂住。
+    #[test]
+    fn a_never_appearing_listener_times_out_without_hanging() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        // 清单用 `{state_dir}` 指向真实目录，但那里没有监听者。
+        let manifest = {
+            let json = format!(
+                r#"{{"name":"demo","command":"/bin/true","switch_key":"demo_on","query_socket":"{{state_dir}}/demo.sock"}}"#
+            );
+            yi_agent_supervisors::manifest::SupervisorManifest::parse(&json).unwrap()
+        };
+        let started = std::time::Instant::now();
+        let ready =
+            wait_for_plugin_query_socket_within(dir.path(), &manifest, Duration::from_millis(150));
+        assert!(!ready);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait must be bounded, took {:?}",
+            started.elapsed()
+        );
     }
 }

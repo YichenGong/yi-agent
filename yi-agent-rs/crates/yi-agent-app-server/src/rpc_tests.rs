@@ -16974,6 +16974,11 @@ async fn plugin_install_resolves_the_command_and_writes_what_the_plugin_describe
         "installing a well-formed plugin must succeed: {response}"
     );
     assert_eq!(response["result"]["installed"], true);
+    // 这份清单没声明 `query_socket`，故没有通道要等：安装返回时就是「可查询」的。
+    assert_eq!(
+        response["result"]["queryable"], true,
+        "a manifest without a query channel is queryable at once"
+    );
 
     // `project_arg` 会 canonicalize（macOS 上 `/var` → `/private/var`），故期望
     // 路径也必须先规范化，否则比的是同一个目录的两种写法。
@@ -17237,6 +17242,42 @@ async fn a_failed_reinstall_does_not_destroy_a_working_installation() {
         serde_json::from_str::<serde_json::Value>(&restored).unwrap(),
         serde_json::from_str::<serde_json::Value>(&original).unwrap()
     );
+
+    h.shutdown().await;
+}
+
+/// 清单声明了查询通道，但插件一直没 bind：到期也要**安装成功**，只是如实回
+/// `queryable: false`。把超时变成失败会把一次已经落盘的安装回滚成「没装」。
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_install_succeeds_but_reports_not_queryable_when_the_socket_never_appears() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    let manifest = serde_json::json!({
+        "name": "demo-plugin",
+        "command": "/bin/true",
+        "switch_key": "demo_plugin_on",
+        "query_socket": "{state_dir}/demo.sock",
+    });
+    fake_plugin_printing(&h, "demo-plugin", &manifest.to_string());
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_none(),
+        "a socket that never appears must not fail the install: {response}"
+    );
+    assert_eq!(response["result"]["installed"], true);
+    assert_eq!(response["result"]["queryable"], false);
+
+    // 清单与开关仍然在盘上：超时只是「这次还不能查」，不是回滚。
+    let written = std::fs::canonicalize(project.path())
+        .unwrap()
+        .join(".yi-agent")
+        .join("supervisors")
+        .join("demo-plugin.json");
+    assert!(written.is_file(), "the manifest must stay installed");
 
     h.shutdown().await;
 }
