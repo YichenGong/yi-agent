@@ -56,6 +56,8 @@ pub fn init(debug: bool) -> tracing_appender::non_blocking::WorkerGuard {
     tracing::info!(
         trace_file = %filepath.display(),
         stderr_level = %std::env::var("YI_LOG").unwrap_or_else(|_| "(off)".to_string()),
+        version = crate::build_info::VERSION,
+        build_kind = crate::build_info::BUILD_KIND,
         "tracing initialized"
     );
 
