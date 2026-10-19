@@ -526,11 +526,11 @@ fn resolve_system_prompt(user: Option<String>, workdir: &Path) -> Option<String>
 fn build_skills_service(
     cfg: &RuntimeConfig,
 ) -> Result<Option<Arc<yi_agent_skills::SkillsService>>> {
-    let Some(home) = dirs::home_dir() else {
-        tracing::warn!("skills: could not determine home directory, skipping");
+    let Some(skills_root) = yi_agent_store::paths::skills_dir() else {
+        tracing::warn!("skills: could not determine the skills directory, skipping");
         return Ok(None);
     };
-    let system_root = home.join(".yi-agent/skills/.system");
+    let system_root = skills_root.join(".system");
 
     // Install bundled skills; failure is non-fatal
     if let Err(e) = yi_agent_skills::install_system_skills(&system_root) {
@@ -542,14 +542,8 @@ fn build_skills_service(
             cfg.workdir.join(".yi-agent/skills"),
             yi_agent_skills::SkillScope::Project,
         ),
-        (
-            home.join(".yi-agent/skills"),
-            yi_agent_skills::SkillScope::User,
-        ),
-        (
-            home.join(".yi-agent/skills/.system"),
-            yi_agent_skills::SkillScope::System,
-        ),
+        (skills_root.clone(), yi_agent_skills::SkillScope::User),
+        (system_root, yi_agent_skills::SkillScope::System),
     ];
 
     let service = Arc::new(yi_agent_skills::SkillsService::new(roots));

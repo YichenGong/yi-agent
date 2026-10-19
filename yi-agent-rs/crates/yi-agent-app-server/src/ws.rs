@@ -147,11 +147,10 @@ where
                 models_path: yi_agent_runtime::models::models_path(),
                 onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
                     .unwrap_or_default(),
-                onboarding_preferences_path: crate::server::home_dir()
-                    .join(".yi-agent")
+                onboarding_preferences_path: crate::server::instance_home_dir()
                     .join("preferences.json"),
                 resident_dir: resident_dir.clone(),
-                skills_home: crate::server::home_dir(),
+                skills_home: crate::server::skills_home_dir(),
                 theme,
                 git_diff: crate::git_diff_tool::GitDiffHandle::new(),
                 view_frames: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
