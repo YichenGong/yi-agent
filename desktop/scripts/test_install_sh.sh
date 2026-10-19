@@ -201,5 +201,43 @@ assert_eq "daemon_pids follows symlinked exe" "601" \
      YI_AGENT_LSOF_CMD="cat $LSOF3" \
      daemon_pids "$APPDIR2" | tr '\n' ' ' | sed 's/ $//')"
 
+# --- plist 解析与加载状态 ---
+LA="$TMPROOT/LaunchAgents"; mkdir -p "$LA"
+mk_plist() { # mk_plist <file> <label> <exe>
+  cat > "$1" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>$2</string>
+<key>ProgramArguments</key><array>
+<string>$3</string><string>boards</string><string>watch</string>
+</array>
+</dict></plist>
+PLIST
+}
+P_OWN="$LA/ai.yi-agent.board-watchman.plist"
+mk_plist "$P_OWN" "ai.yi-agent.board-watchman" "/Applications/yi-agent.app/Contents/MacOS/yi-agent"
+
+assert_eq "plist_label" "ai.yi-agent.board-watchman" "$(plist_label "$P_OWN")"
+assert_eq "plist_exe" "/Applications/yi-agent.app/Contents/MacOS/yi-agent" "$(plist_exe "$P_OWN")"
+
+assert_eq "is_loaded true when launchctl exits 0" "yes" \
+  "$(YI_AGENT_LAUNCHCTL_CMD=true is_loaded x && echo yes || echo no)"
+assert_eq "is_loaded false when launchctl exits non-zero" "no" \
+  "$(YI_AGENT_LAUNCHCTL_CMD="false" is_loaded x && echo yes || echo no)"
+
+assert_eq "watchman_plists lists only yi-agent labels" \
+  "ai.yi-agent.board-watchman" \
+  "$(YI_AGENT_LAUNCH_AGENTS_DIR="$LA" watchman_plists | while read -r p; do plist_label "$p"; done | tr '\n' ' ' | sed 's/ $//')"
+
+# --- dead_plists：三重失效才删 ---
+mk_plist "$LA/ai.yi-agent.gone.plist" "ai.yi-agent.gone" "/nowhere/yi-agent"
+mk_plist "$LA/ai.yi-agent.dev.plist"  "ai.yi-agent.dev"  "$TMPROOT/devbin"
+mkdir -p "$TMPROOT/devbin"; printf '#!/bin/sh\n' > "$TMPROOT/devbin/yi-agent"; chmod +x "$TMPROOT/devbin/yi-agent"
+
+assert_eq "dead_plists removes only fully-dead entries" \
+  "ai.yi-agent.gone" \
+  "$(YI_AGENT_LAUNCH_AGENTS_DIR="$LA" YI_AGENT_LAUNCHCTL_CMD=false \
+     dead_plists "/Applications/yi-agent.app" | while read -r p; do plist_label "$p"; done | tr '\n' ' ' | sed 's/ $//')"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -276,6 +276,90 @@ daemon_pids() {
   done
 }
 
+# 注入的命令可能带参数，故用 eval；生产路径等价于 `launchctl <args...>`。
+launchctl_run() {
+  if [ -n "${YI_AGENT_LAUNCHCTL_CMD:-}" ]; then
+    eval "$YI_AGENT_LAUNCHCTL_CMD \"$*\""
+  else
+    launchctl "$@"
+  fi
+}
+
+launch_agents_dir() {
+  printf '%s\n' "${YI_AGENT_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+}
+
+plist_label() {
+  plutil -extract Label raw -o - "$1" 2>/dev/null || true
+}
+
+plist_exe() {
+  plutil -extract ProgramArguments.0 raw -o - "$1" 2>/dev/null || true
+}
+
+# launchctl print 成功（exit 0）表示该服务已加载；实测未加载为 113。
+is_loaded() {
+  local label="$1"
+  launchctl_run print "gui/$(id -u)/$label" >/dev/null 2>&1
+}
+
+watchman_plists() {
+  local dir plist label
+  dir="$(launch_agents_dir)"
+  [ -d "$dir" ] || return 0
+  for plist in "$dir"/*.plist; do
+    [ -f "$plist" ] || continue
+    label="$(plist_label "$plist")"
+    case "$label" in
+      ai.yi-agent.*) printf '%s\n' "$plist" ;;
+    esac
+  done
+}
+
+# 只处理「指向本 App 且原本已加载」的那一份。未加载的不替你开服务。
+restart_own_watchman() {
+  local app="$1"
+  local want="$app/Contents/MacOS/yi-agent"
+  local plist label loaded
+  while IFS= read -r plist; do
+    [ "$(plist_exe "$plist")" = "$want" ] || continue
+    label="$(plist_label "$plist")"
+    loaded=no
+    is_loaded "$label" && loaded=yes
+    if [ "$loaded" = no ]; then
+      echo "提示：$label 未加载，本次不改动。" >&2
+      continue
+    fi
+    launchctl_run bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || \
+      echo "WARN: bootout $label 失败，继续" >&2
+    # plist 内容不变（exe 路径固定），重写只是为了确保文件是最新格式。
+    if launchctl_run bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
+      echo "已重启常驻值守：$label"
+    else
+      echo "WARN: 重新加载 $label 失败；该服务当前未运行" >&2
+    fi
+  done <<EOF
+$(watchman_plists)
+EOF
+}
+
+# 三重失效才删：未加载 + 不指向本 App + 指向的可执行文件不存在。
+dead_plists() {
+  local app="$1"
+  local want="$app/Contents/MacOS/yi-agent"
+  local plist label exe
+  while IFS= read -r plist; do
+    label="$(plist_label "$plist")"
+    is_loaded "$label" && continue
+    exe="$(plist_exe "$plist")"
+    [ "$exe" = "$want" ] && continue
+    [ -n "$exe" ] && [ -x "$exe" ] && continue
+    printf '%s\n' "$plist"
+  done <<EOF
+$(watchman_plists)
+EOF
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -euo pipefail
   main "$@"
