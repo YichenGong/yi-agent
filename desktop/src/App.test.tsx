@@ -3786,12 +3786,17 @@ describe("App first-run onboarding gate", () => {
     });
     // 单写清单：宿主回 { ok, name }。没有「部分成功」态，故不该出现任何收尾横幅。
     state.dataSources["onboarding/apply"] = () => ({ ok: true, name: "gpt-4o" });
+    // 门禁：保存按钮只有在连接测试通过后才可点。
+    state.dataSources["onboarding/test"] = () => ({ ok: true, reason: null });
     render(<App />);
-    // 走完向导：欢迎 → 选格式 → 保存。
+    // 走完向导：欢迎 → 选格式 → 填必填项 → 测试通过 → 保存。
     fireEvent.click(await screen.findByRole("button", { name: /开始/ }));
     fireEvent.click(screen.getByRole("button", { name: "openai" }));
     fireEvent.click(screen.getByRole("button", { name: /下一步/ }));
     fireEvent.change(await screen.findByLabelText("API 密钥"), { target: { value: "sk-x" } });
+    fireEvent.change(screen.getByLabelText("模型标识"), { target: { value: "gpt-4o" } });
+    fireEvent.click(screen.getByRole("button", { name: /测试连接/ }));
+    await screen.findByText("连接正常");
     fireEvent.click(screen.getByRole("button", { name: /保存/ }));
 
     // 向导退场，且没有遗留的「未纳入模型清单」横幅。

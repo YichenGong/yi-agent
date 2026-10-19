@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { looksMissingV1 } from "../lib/models";
 import {
   applyOnboarding,
   dismissOnboarding,
@@ -22,10 +23,13 @@ const DEFAULT_URL = {
   anthropic: "https://api.anthropic.com",
   openai: "https://api.openai.com/v1",
 } as const;
-const DEFAULT_MODEL = {
-  anthropic: "claude-sonnet-4-20250514",
-  openai: "gpt-4o",
-} as const;
+/**
+ * 连接测试的状态机。
+ *
+ * `passed` 是保存的唯一通行证；任一端点字段变化都把它打回 `untested`——
+ * 否则用户测的是 A 配置、存进去的却是 B 配置。
+ */
+type TestState = "untested" | "testing" | "passed" | "failed";
 
 export function OnboardingWizard({
   call,
@@ -41,6 +45,7 @@ export function OnboardingWizard({
   const [apiKey, setApiKey] = useState("");
   const [model, setModel] = useState("");
   const [apiUrl, setApiUrl] = useState("");
+  const [testState, setTestState] = useState<TestState>("untested");
   const [testReason, setTestReason] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,22 +58,40 @@ export function OnboardingWizard({
     }
   };
 
+  // 模型不回填默认值：它是一个没被确认过的猜测。地址留空则交由宿主补
+  // provider 默认值（`import_settings_into_catalog` / `test_connection` 同源）。
   const input = (): ApplyInput => ({
     provider,
-    model: model.trim() || DEFAULT_MODEL[provider],
-    api_url: apiUrl.trim() || DEFAULT_URL[provider],
+    model: model.trim(),
+    api_url: apiUrl.trim(),
     api_key: apiKey,
   });
+
+  /** 任一端点字段变化都作废已有的测试结论。 */
+  const invalidateTest = () => {
+    if (testState !== "untested") setTestState("untested");
+    setTestReason(null);
+  };
+
+  const fieldsReady = model.trim() !== "" && apiKey.trim() !== "";
+  const canSave = fieldsReady && testState === "passed";
 
   const runTest = async () => {
     if (!call) return;
     setBusy(true);
+    setTestState("testing");
     setTestReason(null);
     setError(null);
     try {
       const result = await testOnboarding(call, input());
-      setTestReason(result.ok ? null : result.reason ?? "连接失败");
+      if (result.ok) {
+        setTestState("passed");
+      } else {
+        setTestState("failed");
+        setTestReason(result.reason ?? "连接失败");
+      }
     } catch (e) {
+      setTestState("failed");
       setTestReason(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
@@ -140,7 +163,10 @@ export function OnboardingWizard({
                 <button
                   key={p}
                   type="button"
-                  onClick={() => setProvider(p)}
+                  onClick={() => {
+                    setProvider(p);
+                    invalidateTest();
+                  }}
                   aria-pressed={provider === p}
                   className={`rounded-md border px-3 py-1.5 text-sm ${
                     provider === p ? "border-line-strong text-fg" : "border-line text-fg-muted"
@@ -166,17 +192,25 @@ export function OnboardingWizard({
               API 密钥
               <input
                 type="password"
+                aria-required="true"
                 value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
+                onChange={(e) => {
+                  setApiKey(e.target.value);
+                  invalidateTest();
+                }}
                 className="rounded border border-line bg-surface px-2 py-1 text-sm text-fg"
               />
             </label>
             <label className="flex flex-col gap-1 text-xs text-fg-muted">
               模型标识
               <input
+                aria-required="true"
                 value={model}
-                placeholder={DEFAULT_MODEL[provider]}
-                onChange={(e) => setModel(e.target.value)}
+                placeholder="例如 claude-sonnet-4-20250514 或 gpt-4o"
+                onChange={(e) => {
+                  setModel(e.target.value);
+                  invalidateTest();
+                }}
                 className="rounded border border-line bg-surface px-2 py-1 text-sm text-fg"
               />
             </label>
@@ -185,12 +219,25 @@ export function OnboardingWizard({
               <input
                 value={apiUrl}
                 placeholder={DEFAULT_URL[provider]}
-                onChange={(e) => setApiUrl(e.target.value)}
+                onChange={(e) => {
+                  setApiUrl(e.target.value);
+                  invalidateTest();
+                }}
                 className="rounded border border-line bg-surface px-2 py-1 text-sm text-fg"
               />
+              {looksMissingV1(provider, apiUrl) && (
+                <p role="status" className="text-xs text-amber-400">
+                  OpenAI 兼容接口的地址通常以 /v1 结尾，请确认地址是否正确。
+                </p>
+              )}
             </label>
 
-            {testReason !== null && (
+            {testState === "passed" && (
+              <p role="status" className="text-xs text-emerald-400">
+                连接正常
+              </p>
+            )}
+            {testState === "failed" && testReason !== null && (
               <p role="alert" className="text-xs text-red-400">
                 {testReason}
               </p>
@@ -201,11 +248,15 @@ export function OnboardingWizard({
               </p>
             )}
 
+            <p className="text-xs text-fg-subtle">
+              API 密钥与模型标识为必填；本次只验证地址、密钥与模型标识，必须测试通过才能保存。
+            </p>
+
             <div className="flex items-center gap-2">
               <button
                 type="button"
                 onClick={() => void runTest()}
-                disabled={busy || !call}
+                disabled={busy || !call || !fieldsReady}
                 className="rounded-md border border-line px-3 py-1.5 text-sm text-fg-muted hover:text-fg disabled:opacity-50"
               >
                 测试连接
@@ -213,10 +264,10 @@ export function OnboardingWizard({
               <button
                 type="button"
                 onClick={() => void save()}
-                disabled={busy || !call}
+                disabled={busy || !call || !canSave}
                 className="rounded-md border border-line-strong px-3 py-1.5 text-sm hover:text-fg disabled:opacity-50"
               >
-                {testReason !== null ? "仍然保存" : "保存"}
+                保存
               </button>
             </div>
           </div>
