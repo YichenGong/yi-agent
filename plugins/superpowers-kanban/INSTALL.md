@@ -141,12 +141,12 @@ cat <项目>/.yi-agent/supervisors/superpowers-kanban.json
 ### 4.1 后台值守（开机自启，仅 macOS）
 
 清单让 daemon 守护插件；但 **daemon 自己没人守护**——桌面 app 关着时机器重启或
-`yi-agent boards watch` 崩溃，看板就停了。所以**宿主**（桌面 app / app-server）会装一个
-LaunchAgent 兜底：`~/Library/LaunchAgents/ai.yi-agent.board-watchman.plist`，开机自启 +
-崩溃自动拉起，跑宿主子命令 `yi-agent boards watch`，日志在 `~/.yi-agent/logs/board-watchman.log`。
+daemon 崩溃，看板就停了。所以**宿主**（桌面 app / app-server）会装一个
+LaunchAgent 兜底：`~/Library/LaunchAgents/ai.yi-agent.resident-daemon-watchman.plist`，开机自启 +
+崩溃自动拉起，跑宿主子命令 `yi-agent resident watch`，日志在 `~/.yi-agent/logs/resident-daemon-watchman.log`。
 
-- **它是宿主装的，不是这一步装的**：在桌面/TUI 里**创建看板**时自动装，受宿主级开关
-  `board_watchman_enabled`（默认开）控制。
+- **它是宿主装的，不是这一步装的**：通用 `plugin/install` 收尾时自动装，受宿主级开关
+  `resident_daemon_watchman_enabled`（默认开，旧键 `board_watchman_enabled` 兜底）控制。
 - **开关**：桌面「看板设置 → 后台值守（开机自启）」。关掉即卸（`launchctl bootout` + 删 plist）。
   注意它和 `superpowers_kanban` 是两件事：前者管「重启后看板还活着吗」，后者管「要不要推进队列」。
 - **不想让它动 launchd**：以 `YI_AGENT_DISABLE_WATCHMAN=1` 启动宿主。
@@ -154,7 +154,7 @@ LaunchAgent 兜底：`~/Library/LaunchAgents/ai.yi-agent.board-watchman.plist`�
 验证（装了的话）：
 
 ```bash
-launchctl print gui/$(id -u)/ai.yi-agent.board-watchman >/dev/null && echo installed || echo not-installed
+launchctl print gui/$(id -u)/ai.yi-agent.resident-daemon-watchman >/dev/null && echo installed || echo not-installed
 ```
 
 ---
@@ -271,8 +271,8 @@ rm -f ~/.cargo/bin/superpowers-kanban
 卸掉它。要一并停掉，先在桌面「看板设置」里关掉「后台值守」开关，或：
 
 ```bash
-launchctl bootout gui/$(id -u)/ai.yi-agent.board-watchman 2>/dev/null
-rm -f ~/Library/LaunchAgents/ai.yi-agent.board-watchman.plist
+launchctl bootout gui/$(id -u)/ai.yi-agent.resident-daemon-watchman 2>/dev/null
+rm -f ~/Library/LaunchAgents/ai.yi-agent.resident-daemon-watchman.plist
 ```
 
 验证：
@@ -295,7 +295,7 @@ superpowers-kanban list
 | 模型不知道"加到看板" | skill 没装，或会话是装之前开的 | 第 3 步；开新会话 |
 | `spec file does not exist` | 路径不对 | 相对路径是相对**当前目录**，不是项目根 |
 | 卡进 `inbox/rejected/` | 两份文件不成对或相同 | 看 `inbox/rejected/` 里的原因文件 |
-| 重启后看板不动 | 宿主值守没装（app 没开过 / 开关是关的） | 打开桌面「后台值守」开关；`launchctl print gui/$(id -u)/ai.yi-agent.board-watchman` |
+| 重启后看板不动 | 宿主值守没装（app 没开过 / 开关是关的） | 打开桌面「后台值守」开关；`launchctl print gui/$(id -u)/ai.yi-agent.resident-daemon-watchman` |
 
 ### 插件说了什么？看项目日志
 

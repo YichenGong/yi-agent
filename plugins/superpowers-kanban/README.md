@@ -105,17 +105,18 @@ superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop
 ## 后台值守（开机自启，仅 macOS）
 
 插件进程（`superpowers-kanban run`）由项目 daemon 守护，但 **daemon 本身没人守护**：
-桌面 app 关着时机器重启或 `yi-agent boards watch` 崩溃，看板就停了。为此**宿主**
+桌面 app 关着时机器重启或 daemon 崩溃，看板就停了。为此**宿主**
 （桌面 app / app-server）会装一个 macOS LaunchAgent 兜底：
 
-- **装的是什么**：`~/Library/LaunchAgents/ai.yi-agent.board-watchman.plist`，
-  `RunAtLoad` + `KeepAlive`，跑的是宿主子命令 `yi-agent boards watch`（只读通用常驻
-  登记，不认识看板）。日志：`~/.yi-agent/logs/board-watchman.log`。
-- **何时装**：`board/create`（在桌面/TUI 里创建看板）时，若宿主级开关
-  `board_watchman_enabled` 为真（**默认开**）就装；可执行文件换位置（升级）会重装。
-  best-effort——装不上不影响看板创建。
+- **装的是什么**：`~/Library/LaunchAgents/ai.yi-agent.resident-daemon-watchman.plist`，
+  `RunAtLoad` + `KeepAlive`，跑的是宿主子命令 `yi-agent resident watch`（只读通用常驻
+  登记，不认识看板）。日志：`~/.yi-agent/logs/resident-daemon-watchman.log`。
+- **何时装**：通用 `plugin/install` 收尾时，若宿主级开关
+  `resident_daemon_watchman_enabled` 为真（**默认开**）就装；可执行文件换位置（升级）会重装。
+  best-effort——装不上不影响插件安装。
 - **怎么开关**：桌面「看板设置」里的「后台值守（开机自启）」开关，即宿主级偏好
-  `board_watchman_enabled`（写在 `<工作目录>/.yi-agent/preferences.json`）。关掉即卸载
+  `resident_daemon_watchman_enabled`（写在 `<工作目录>/.yi-agent/preferences.json`；
+  老机器上读旧键 `board_watchman_enabled` 作兜底）。关掉即卸载
   （`launchctl bootout` + 删 plist）。它与上面的插件级 `superpowers_kanban` 开关是
   **两件事**：前者管「机器重启后看板还活着吗」，后者管「要不要推进队列」。
 - **不想让它碰 launchd**：以 `YI_AGENT_DISABLE_WATCHMAN=1` 启动宿主，装/卸一律退化成
@@ -123,7 +124,11 @@ superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop
 
 这是**宿主**能力，不是插件二进制的能力——`superpowers-kanban` 没有值守子命令，
 删掉本插件也不会自动删这个 LaunchAgent。要删就关掉那个开关，或
-`launchctl bootout gui/$(id -u)/ai.yi-agent.board-watchman` 后删 plist。
+`launchctl bootout gui/$(id -u)/ai.yi-agent.resident-daemon-watchman` 后删 plist。
+
+装过旧版的机器上还留着 `ai.yi-agent.board-watchman` 这个旧标签，它的
+`ProgramArguments` 是已删除的 `yi-agent boards watch`——每次登录都会拉起一个立刻
+失败的进程。宿主在安装/卸载值守时会顺手 bootout 并删掉它。
 
 ## 迁移说明（旧名 → 新名）
 旧布局仍被**读取**，不会被修改或删除：

@@ -446,8 +446,8 @@ const MANIFEST_NAME: &str = "superpowers-kanban";
 ///
 /// `command` 必须是**当前可执行文件**的绝对路径，不能是裸名：supervisor 用 daemon
 /// 的 `PATH` 拉起子进程，而用户把插件装到了哪（`~/.cargo/bin`、`/opt/homebrew/bin`、
-/// 或某个 `cargo build` 的 `target/`）与那个 `PATH` 不保证一致。历史上
-/// `yi-agent-boards::scaffold` 正是为这个坑在安装时把裸名替换成绝对路径。
+/// 或某个 `cargo build` 的 `target/`）与那个 `PATH` 不保证一致。宿主安装插件时
+/// 就是执行这个子命令把绝对路径写进清单的，别再退化成裸名。
 ///
 /// 其余字段的取值见 [`manifest_json`]；`args` 里的 `{runtime_dir}` / `{state_dir}` /
 /// `{workdir}` 是 supervisor 展开的占位符，必须原样输出。
