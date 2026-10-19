@@ -274,11 +274,14 @@ mkdir -p "$NOPERM"; chmod 500 "$NOPERM"
 assert_eq "pick_bin_dir skips unwritable" \
   "$BIN2" \
   "$(YI_AGENT_BIN_DIRS=$NOPERM:$BIN2 pick_bin_dir)"
-chmod 700 "$NOPERM"
 
+# 注意：这条断言必须在恢复权限之前跑，否则目录又可写了。
 assert_eq "pick_bin_dir fails when none writable" \
   "rc=1" \
   "$(YI_AGENT_BIN_DIRS=$NOPERM pick_bin_dir >/dev/null 2>&1; echo "rc=$?")"
+chmod 700 "$NOPERM"
+
+# 覆盖为空串表示「一个候选都没有」，不回落默认目录。
 if [ "$(id -u)" -ne 0 ]; then
   assert_eq "pick_bin_dir fails on empty list" \
     "rc=1" "$(YI_AGENT_BIN_DIRS="" pick_bin_dir >/dev/null 2>&1; echo "rc=$?")"
@@ -290,8 +293,9 @@ link_cli "$APP" "$LINKDIR"
 assert_eq "link_cli creates symlink to app cli" \
   "$APP/Contents/MacOS/yi-agent" \
   "$(readlink "$LINKDIR/yi-agent")"
+# command -v 走的是当前 PATH，必须把测试目录放进去才能命中。
 assert_eq "link_status reports ok" \
-  "ok" "$(link_status "$APP" "$LINKDIR")"
+  "ok" "$(PATH="$LINKDIR:$PATH" link_status "$APP" "$LINKDIR")"
 
 assert_eq "link_cli fails without cli" \
   "rc=1" "$(link_cli "$TMPROOT/NoSuch.app" "$LINKDIR" >/dev/null 2>&1; echo "rc=$?")"
@@ -315,8 +319,12 @@ Expected: FAIL，`pick_bin_dir: command not found`。
 
 ```bash
 # 候选目录：测试可经 YI_AGENT_BIN_DIRS（冒号分隔）覆盖。
+# 用 ${VAR+set} 判断「是否设置」而非「是否非空」，这样置空即表示无候选。
 bin_candidates() {
-  if [ -n "${YI_AGENT_BIN_DIRS:-}" ]; then
+  if [ -n "${YI_AGENT_BIN_DIRS+set}" ]; then
+    case "$YI_AGENT_BIN_DIRS" in
+      "") return 0 ;;
+    esac
     printf '%s\n' "$YI_AGENT_BIN_DIRS" | tr ':' '\n'
     return 0
   fi
@@ -398,7 +406,7 @@ git commit -m "feat(installer): link bundled CLI into PATH"
 - Consumes: `app_path()`
 - Produces:
   - `replace_app <src-app> <dest-app>` → 原子替换；失败时保留原目录并返回 1
-  - `copy_cmd` → 可经 `YI_AGENT_COPY_CMD` 覆盖，默认 `ditto`
+  - `copy_runner <src> <dest>` → 可经 `YI_AGENT_COPY_CMD` 覆盖，默认 `ditto`
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -435,8 +443,14 @@ Expected: FAIL，`replace_app: command not found`。
 插入到 `link_status()` 之后：
 
 ```bash
-copy_cmd() {
-  printf '%s\n' "${YI_AGENT_COPY_CMD:-ditto}"
+# 注入的拷贝命令可能带参数，故用 eval。
+copy_runner() {
+  local src="$1" dest="$2"
+  if [ -n "${YI_AGENT_COPY_CMD:-}" ]; then
+    eval "$YI_AGENT_COPY_CMD \"$src\" \"$dest\""
+  else
+    ditto "$src" "$dest"
+  fi
 }
 
 # 原子替换：先拷到 <dest>.new，成功后才替换。任何一步失败都保留旧目录。
@@ -446,7 +460,7 @@ replace_app() {
   local backup="$dest.old"
 
   rm -rf "$stage" "$backup"
-  if ! "$(copy_cmd)" "$src" "$stage"; then
+  if ! copy_runner "$src" "$stage"; then
     echo "ERROR: 拷贝到暂存目录失败，已保留原版本" >&2
     rm -rf "$stage"
     return 1
@@ -623,7 +637,7 @@ quit_gui() {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `bash desktop/scripts/test_install_sh.sh`
-Expected: `23 passed, 0 failed`。
+Expected: `26 passed, 0 failed`。
 
 - [ ] **Step 5: 提交**
 
@@ -753,7 +767,7 @@ daemon_pids() {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `bash desktop/scripts/test_install_sh.sh`
-Expected: `29 passed, 0 failed`。
+Expected: `32 passed, 0 failed`。
 
 - [ ] **Step 5: 提交**
 
@@ -778,7 +792,7 @@ git commit -m "feat(installer): identify daemons owned by this install"
   - `watchman_plists` → 每行一个 Label 以 `ai.yi-agent.` 开头的 plist
   - `restart_own_watchman <app>` → 停、重写、仅在原本已加载时重新加载
   - `dead_plists <app>` → 三重失效的 plist
-  - `launchctl_cmd` → 可用 `YI_AGENT_LAUNCHCTL_CMD` 注入
+  - `launchctl_run <args...>` → 可用 `YI_AGENT_LAUNCHCTL_CMD` 注入
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -830,8 +844,13 @@ Expected: FAIL，`plist_label: command not found`。
 - [ ] **Step 3: 实现**
 
 ```bash
-launchctl_cmd() {
-  printf '%s\n' "${YI_AGENT_LAUNCHCTL_CMD:-launchctl}"
+# 注入的命令可能带参数，故用 eval；生产路径等价于 `launchctl <args...>`。
+launchctl_run() {
+  if [ -n "${YI_AGENT_LAUNCHCTL_CMD:-}" ]; then
+    eval "$YI_AGENT_LAUNCHCTL_CMD \"$*\""
+  else
+    launchctl "$@"
+  fi
 }
 
 launch_agents_dir() {
@@ -849,7 +868,7 @@ plist_exe() {
 # launchctl print 成功（exit 0）表示该服务已加载；实测未加载为 113。
 is_loaded() {
   local label="$1"
-  "$(launchctl_cmd)" print "gui/$(id -u)/$label" >/dev/null 2>&1
+  launchctl_run print "gui/$(id -u)/$label" >/dev/null 2>&1
 }
 
 watchman_plists() {
@@ -879,10 +898,10 @@ restart_own_watchman() {
       echo "提示：$label 未加载，本次不改动。" >&2
       continue
     fi
-    "$(launchctl_cmd)" bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || \
+    launchctl_run bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || \
       echo "WARN: bootout $label 失败，继续" >&2
     # plist 内容不变（exe 路径固定），重写只是为了确保文件是最新格式。
-    if "$(launchctl_cmd)" bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
+    if launchctl_run bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; then
       echo "已重启常驻值守：$label"
     else
       echo "WARN: 重新加载 $label 失败；该服务当前未运行" >&2
@@ -913,7 +932,7 @@ EOF
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `bash desktop/scripts/test_install_sh.sh`
-Expected: `35 passed, 0 failed`。
+Expected: `38 passed, 0 failed`。
 
 - [ ] **Step 5: 提交**
 
@@ -994,14 +1013,16 @@ ask_answer() {
 confirm_stop() {
   local count="$1" answer="$2"
   [ "$count" -eq 0 ] && return 0
-  #
+  # 显式拒绝优先于「非交互默认继续」，否则 `YI_AGENT_ANSWER=n`
+  # 或手工输入 n 会被静默忽略。
+  case "$answer" in
+    n|N|no|NO) return 1 ;;
+  esac
+  # 非交互环境不阻塞等待，默认继续。
   if [ -z "${YI_AGENT_NONINTERACTIVE:-}" ] && [ ! -t 0 ] && [ -z "${YI_AGENT_ANSWER:-}" ]; then
     return 0
   fi
-  case "$answer" in
-    n|N|no|NO) return 1 ;;
-    *) return 0 ;;
-  esac
+  return 0
 }
 
 # SIGTERM 每个属于本 App 的 daemon；返回仍未退出的数量。
@@ -1026,7 +1047,7 @@ stop_daemons() {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `bash desktop/scripts/test_install_sh.sh`
-Expected: `41 passed, 0 failed`。
+Expected: `44 passed, 0 failed`。
 
 - [ ] **Step 5: 提交**
 
@@ -1187,7 +1208,7 @@ Expected: 无输出，退出码 0。
 - [ ] **Step 3: 跑单测**
 
 Run: `bash desktop/scripts/test_install_sh.sh`
-Expected: `41 passed, 0 failed`。
+Expected: `44 passed, 0 failed`。
 
 - [ ] **Step 4: shellcheck（若可用）**
 
@@ -1291,7 +1312,7 @@ EOF
 在 `docs/project-management/desktop.md` 的 Features 列表末尾追加：
 
 ```markdown
-- [x] 安装器建 CLI 软链 + 原地升级 + daemon 协调 — `desktop/packaging/install.sh`（`pick_bin_dir` / `link_cli` / `replace_app` / `gui_pids` / `daemon_pids` / `restart_own_watchman` / `dead_plists` / `confirm_stop`）；Release 文案见 `desktop/scripts/release-dmg.sh:163`；验证：`bash desktop/scripts/test_install_sh.sh` 全绿（41 passed），且本机执行 `bash desktop/packaging/install.sh <dmg>` 后 `yi-agent --version` 与 dmg 版本一致 — [设计](../superpowers/specs/2026-10-19-install-cli-link-design.md)
+- [x] 安装器建 CLI 软链 + 原地升级 + daemon 协调 — `desktop/packaging/install.sh`（`pick_bin_dir` / `link_cli` / `replace_app` / `gui_pids` / `daemon_pids` / `restart_own_watchman` / `dead_plists` / `confirm_stop`）；Release 文案见 `desktop/scripts/release-dmg.sh:163`；验证：`bash desktop/scripts/test_install_sh.sh` 全绿（44 passed），且本机执行 `bash desktop/packaging/install.sh <dmg>` 后 `yi-agent --version` 与 dmg 版本一致 — [设计](../superpowers/specs/2026-10-19-install-cli-link-design.md)
 ```
 
 - [ ] **Step 3: 更新 CI/CD 模块文档**
