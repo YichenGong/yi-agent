@@ -10,11 +10,8 @@ use anyhow::Result;
 use axum::routing::{delete, get, post};
 
 fn user_real_test_env_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".yi-agent")
-        .join(".env")
+    yi_agent_store::paths::home_join(".env")
+        .unwrap_or_else(|| PathBuf::from(".yi-agent").join(".env"))
 }
 
 /// 启动 Web 配置服务器。

@@ -114,6 +114,29 @@ mod tests {
         assert_eq!(from::<OsStr>(None, None), None);
     }
 
+    /// 未设环境变量时，每个消费者拿到的路径都不许变。
+    #[test]
+    fn consumers_keep_the_legacy_layout_without_overrides() {
+        if std::env::var_os("YI_AGENT_HOME").is_some() {
+            return; // 进程环境被外部污染时跳过，避免误报
+        }
+        let home = std::env::var_os("HOME").expect("test needs HOME");
+        let want = PathBuf::from(&home).join(".yi-agent");
+        assert_eq!(instance_home(), Some(want));
+    }
+
+    #[test]
+    fn trace_dir_sits_under_the_instance_home() {
+        if std::env::var_os("YI_AGENT_HOME").is_some() {
+            return;
+        }
+        let home = std::env::var_os("HOME").expect("test needs HOME");
+        assert_eq!(
+            trace_dir(),
+            Some(PathBuf::from(&home).join(".yi-agent").join("trace"))
+        );
+    }
+
     #[test]
     fn the_instance_root_is_the_parent_of_the_state_root() {
         // skill_rpc 会在这个父目录后拼 `.yi-agent/skills`。

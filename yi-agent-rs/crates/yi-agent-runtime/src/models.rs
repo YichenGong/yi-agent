@@ -282,14 +282,11 @@ pub struct ModelCatalog {
     pub subagent_model: Option<String>,
 }
 
-/// `<HOME>/.yi-agent/models.json`；HOME 缺失回退当前目录，与 `resolve_global_env_path` 同口径。
+/// `<instance_home>/models.json`；实例目录不可解析时回退 `.yi-agent/models.json`，
+/// 与改动前的回退口径逐字一致。
 pub fn models_path() -> PathBuf {
-    std::env::var("HOME")
-        .ok()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".yi-agent")
-        .join("models.json")
+    yi_agent_store::paths::home_join("models.json")
+        .unwrap_or_else(|| PathBuf::from(".yi-agent").join("models.json"))
 }
 
 /// 读清单。缺失 / 不可读 / 不可解析 → 空清单（坏文件绝不阻断启动）。

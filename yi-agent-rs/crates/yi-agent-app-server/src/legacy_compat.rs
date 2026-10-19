@@ -36,6 +36,8 @@ pub const SUPERPOWERS_KANBAN_REQUESTER: &str = "superpowers-kanban";
 ///
 /// `HOME` 未设置时返回 `None` 而不是猜一个目录：往凭空的路径上写文件比失败更糟
 /// （与 [`yi_agent_store::resident::default_dir`] 同一策略）。
+/// 故意读真实 `$HOME` 而不是实例目录：这是**旧布局**的迁移来源，
+/// 跟随 `YI_AGENT_HOME` 会让开发实例迁移不到稳定版的旧登记表。
 pub fn legacy_board_dir() -> Option<PathBuf> {
     legacy_board_dir_from(std::env::var_os("HOME").as_deref())
 }

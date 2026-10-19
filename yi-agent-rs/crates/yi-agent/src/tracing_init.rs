@@ -74,8 +74,7 @@ fn file_filter(debug: bool) -> &'static str {
 }
 
 fn trace_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".yi-agent").join("trace")
+    yi_agent_store::paths::trace_dir().unwrap_or_else(|| PathBuf::from(".yi-agent").join("trace"))
 }
 
 /// 生成本地时间戳字符串 `YYYYMMDD-HHMMSS`。

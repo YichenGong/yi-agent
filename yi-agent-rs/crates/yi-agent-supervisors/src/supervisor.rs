@@ -57,13 +57,7 @@ impl Layout {
     }
 
     fn global_preferences_path(&self) -> Option<PathBuf> {
-        std::env::var_os("HOME")
-            .filter(|value| !value.is_empty())
-            .map(|home| {
-                PathBuf::from(home)
-                    .join(".yi-agent")
-                    .join("preferences.json")
-            })
+        yi_agent_store::paths::home_join("preferences.json")
     }
 
     fn project_preferences_path(&self) -> PathBuf {

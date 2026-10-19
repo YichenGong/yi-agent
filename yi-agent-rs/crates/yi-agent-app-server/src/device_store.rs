@@ -48,10 +48,8 @@ pub struct DeviceStore {
 }
 
 pub fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".yi-agent").join("devices.json")
+    yi_agent_store::paths::home_join("devices.json")
+        .unwrap_or_else(|| PathBuf::from(".yi-agent").join("devices.json"))
 }
 
 impl DeviceStore {
