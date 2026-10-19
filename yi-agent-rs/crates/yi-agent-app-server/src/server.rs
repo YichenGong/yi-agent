@@ -1566,13 +1566,6 @@ pub(crate) fn plugin_scope(workdir: &Path, params: &serde_json::Value) -> PathBu
         .unwrap_or_else(|| workdir.to_path_buf())
 }
 
-/// Serialize a board value for the wire. A value that cannot serialize is the
-/// null case rather than a hang: these shapes are plain data, so this never
-/// fires in practice, but an RPC must always write *some* response.
-pub(crate) fn to_json<T: serde::Serialize>(value: &T) -> serde_json::Value {
-    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
-}
-
 /// 后台自愈循环:app 打开期间每 ~30s 一次,与常驻 watchman 重叠也无害(幂等)。
 ///
 /// 单轮逻辑复用 `yi_agent_supervisors::watch::once`(读通用登记 → 交给 `ensure`),
