@@ -615,10 +615,12 @@ fn a_childs_exit_is_recorded_once_not_once_per_tick() {
     let layout = layout_for(workdir);
     std::fs::create_dir_all(layout.manifests_dir()).unwrap();
     // 长退避：整个观察窗口都落在退避里，于是每次 reconcile 都观察到「已退出」。
+    // 60s 远大于下面 20 拍的墙钟耗时——CI 上被负载拖慢时 20 x 50ms 可能已经
+    // 跑了几秒，2s 的窗口会让子进程合法重启，把这条断言变成时序竞态。
     std::fs::write(
         layout.manifests_dir().join("demo.json"),
         format!(
-            r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":2000,"restart_backoff_max_ms":2000}}"#,
+            r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":60000,"restart_backoff_max_ms":60000}}"#,
             child.display()
         ),
     )
@@ -626,7 +628,7 @@ fn a_childs_exit_is_recorded_once_not_once_per_tick() {
     enable(workdir, "demo_on");
 
     let mut supervisor = Supervisor::new(layout.clone());
-    // 20 拍 x 50ms 约 1s，全程 < 2000ms 退避：同一退出事实被观察约 20 次。
+    // 20 拍 x 50ms 约 1s，全程 < 60s 退避：同一退出事实被观察约 20 次。
     for _ in 0..20 {
         supervisor.reconcile();
         std::thread::sleep(Duration::from_millis(50));
