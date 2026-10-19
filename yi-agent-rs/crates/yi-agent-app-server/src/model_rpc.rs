@@ -161,6 +161,24 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
         KeyInput::Set(key) => key,
     };
 
+    // 能力结果只在「连接字段未变」时保留；任一变化都说明旧探测不再可信。
+    // `api_key` 不参与判定：换密钥不影响模型支持哪些档位。
+    let reasoning_capabilities = match existing {
+        Some(i) => {
+            let old = &catalog.models[i];
+            let changed = old.provider != provider
+                || old.api_url != api_url
+                || old.model != model
+                || old.api_style != api_style;
+            if changed {
+                None
+            } else {
+                old.reasoning_capabilities.clone()
+            }
+        }
+        None => None,
+    };
+
     let entry = ModelEntry {
         name,
         provider,
@@ -169,6 +187,7 @@ fn upsert(path: &Path, params: &Value) -> Result<Value, RpcError> {
         api_key,
         api_style,
         reasoning_effort,
+        reasoning_capabilities,
         context_length: None,
     };
     match existing {
@@ -408,6 +427,80 @@ mod tests {
             "model": "m",
             "api_key": "sk-secret-1234",
         })
+    }
+
+    fn set_capabilities(path: &Path, name: &str) {
+        let mut catalog = load_catalog_from(path);
+        let entry = catalog
+            .models
+            .iter_mut()
+            .find(|m| m.name == name)
+            .expect("entry must exist");
+        entry.reasoning_capabilities = Some(yi_agent_runtime::models::ReasoningCapabilities {
+            anthropic: Some(yi_agent_runtime::models::ChannelCapability {
+                supported: vec!["low".into(), "high".into()],
+                probed_at: 42,
+                error: None,
+            }),
+            ..Default::default()
+        });
+        save_catalog_to(path, &catalog).unwrap();
+    }
+
+    fn capabilities_of(
+        path: &Path,
+        name: &str,
+    ) -> Option<yi_agent_runtime::models::ReasoningCapabilities> {
+        load_catalog_from(path)
+            .models
+            .into_iter()
+            .find(|m| m.name == name)
+            .and_then(|m| m.reasoning_capabilities)
+    }
+
+    #[test]
+    fn upsert_keeps_capabilities_when_connection_fields_are_unchanged() {
+        let (_dir, path) = catalog_path();
+        call(&path, "model/upsert", entry_json("A")).unwrap();
+        set_capabilities(&path, "A");
+
+        // 只改 key（key 不参与能力有效性判定）。
+        call(
+            &path,
+            "model/upsert",
+            json!({"name":"A","provider":"anthropic","api_url":"https://a","model":"m","api_key":"sk-new-9999"}),
+        )
+        .unwrap();
+
+        let caps = capabilities_of(&path, "A").expect("capabilities must survive a key change");
+        assert_eq!(caps.anthropic.unwrap().supported, vec!["low", "high"]);
+    }
+
+    #[test]
+    fn upsert_clears_capabilities_when_connection_fields_change() {
+        for change in [
+            json!({"provider":"openai"}),
+            json!({"api_url":"https://b"}),
+            json!({"model":"m2"}),
+            json!({"api_style":"chat"}),
+        ] {
+            let (_dir, path) = catalog_path();
+            call(&path, "model/upsert", entry_json("A")).unwrap();
+            set_capabilities(&path, "A");
+
+            let mut payload = json!({
+                "name":"A","provider":"anthropic","api_url":"https://a","model":"m"
+            });
+            for (k, v) in change.as_object().unwrap() {
+                payload[k] = v.clone();
+            }
+            call(&path, "model/upsert", payload).unwrap();
+
+            assert!(
+                capabilities_of(&path, "A").is_none(),
+                "changing {change} must clear capabilities"
+            );
+        }
     }
 
     #[test]
