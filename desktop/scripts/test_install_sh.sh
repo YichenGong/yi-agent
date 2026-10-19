@@ -60,5 +60,50 @@ assert_eq "version_banner upgrade" \
   "检测到已安装版本 1.2.2 → 升级到 1.2.3" \
   "$(version_banner "1.2.2" "1.2.3")"
 
+# --- pick_bin_dir ---
+BIN1="$TMPROOT/bin-a"; BIN2="$TMPROOT/bin-b"
+mkdir -p "$BIN1" "$BIN2"
+assert_eq "pick_bin_dir prefers first writable" \
+  "$BIN1" \
+  "$(YI_AGENT_BIN_DIRS=$BIN1:$BIN2 pick_bin_dir)"
+
+NOPERM="$TMPROOT/bin-noperm"
+mkdir -p "$NOPERM"; chmod 500 "$NOPERM"
+assert_eq "pick_bin_dir skips unwritable" \
+  "$BIN2" \
+  "$(YI_AGENT_BIN_DIRS=$NOPERM:$BIN2 pick_bin_dir)"
+
+# 注意：这条断言必须在恢复权限之前跑，否则目录又可写了。
+assert_eq "pick_bin_dir fails when none writable" \
+  "rc=1" \
+  "$(YI_AGENT_BIN_DIRS=$NOPERM pick_bin_dir >/dev/null 2>&1; echo "rc=$?")"
+chmod 700 "$NOPERM"
+
+# 覆盖为空串表示「一个候选都没有」，不回落默认目录。
+if [ "$(id -u)" -ne 0 ]; then
+  assert_eq "pick_bin_dir fails on empty list" \
+    "rc=1" "$(YI_AGENT_BIN_DIRS="" pick_bin_dir >/dev/null 2>&1; echo "rc=$?")"
+fi
+
+# --- link_cli ---
+LINKDIR="$TMPROOT/linkbin"; mkdir -p "$LINKDIR"
+link_cli "$APP" "$LINKDIR"
+assert_eq "link_cli creates symlink to app cli" \
+  "$APP/Contents/MacOS/yi-agent" \
+  "$(readlink "$LINKDIR/yi-agent")"
+# command -v 走的是当前 PATH，必须把测试目录放进去才能命中。
+assert_eq "link_status reports ok" \
+  "ok" "$(PATH="$LINKDIR:$PATH" link_status "$APP" "$LINKDIR")"
+
+assert_eq "link_cli fails without cli" \
+  "rc=1" "$(link_cli "$TMPROOT/NoSuch.app" "$LINKDIR" >/dev/null 2>&1; echo "rc=$?")"
+
+# 模拟 PATH 里更靠前的同名程序
+SHADOW="$TMPROOT/shadow"; mkdir -p "$SHADOW"
+printf '#!/bin/sh\nexit 0\n' > "$SHADOW/yi-agent"; chmod +x "$SHADOW/yi-agent"
+assert_eq "link_status detects shadowing" \
+  "shadowed:$SHADOW/yi-agent" \
+  "$(PATH="$SHADOW:$LINKDIR:$PATH" link_status "$APP" "$LINKDIR")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
