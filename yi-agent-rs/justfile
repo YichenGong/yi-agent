@@ -33,7 +33,7 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check secret-check npm-version-check
+ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check
     @echo "CI passed"
 
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
@@ -51,6 +51,11 @@ secret-check:
 # 且 platforms/ 目录与依赖表逐一对应。依赖表脱节会让用户装到旧版平台包。
 npm-version-check:
     bash scripts/test_sync_npm_versions.sh
+
+# release workflow 的环境假设（$HOME 推导 target 目录、rustup update、
+# 三平台 target）：任一被破坏，tag 触发的发布会在构建第一步秒挂。
+release-env-check:
+    bash scripts/test_release_workflow_env.sh
 
 # === 真实 LLM 测试(需 API key,默认跳过) ===
 
