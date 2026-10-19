@@ -5,6 +5,7 @@
 //! 在本 crate 内实现。
 
 pub mod ipc;
+pub mod paths;
 pub mod repository;
 pub mod resident;
 pub mod runtime;
