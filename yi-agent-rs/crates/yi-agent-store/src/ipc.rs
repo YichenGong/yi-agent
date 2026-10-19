@@ -3147,7 +3147,13 @@ const PLUGIN_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 /// project's routes, so a plugin query flipped between "served" and "plugin is
 /// not running" on the reconcile interval. Keying by scope makes each project's
 /// publication affect only that project.
-static PLUGIN_SOCKETS: Mutex<Vec<(PathBuf, Vec<(String, PathBuf)>)>> = Mutex::new(Vec::new());
+/// One project's forwarding routes: `(plugin name, socket path)` pairs.
+type PluginRoutes = Vec<(String, PathBuf)>;
+
+/// The whole table: one entry per project scope.
+type PluginSocketTable = Vec<(PathBuf, PluginRoutes)>;
+
+static PLUGIN_SOCKETS: Mutex<PluginSocketTable> = Mutex::new(Vec::new());
 
 /// The identity of one project's daemon: its runtime directory.
 ///
@@ -3163,7 +3169,7 @@ fn scope_key(scope: &Path) -> PathBuf {
 /// Replace this project's forwarding table. Called on every supervisor
 /// reconcile, so a stopped or undeclared plugin disappears from the table by
 /// omission — while another project's routes are untouched.
-pub fn register_plugin_sockets(scope: &Path, entries: Vec<(String, PathBuf)>) {
+pub fn register_plugin_sockets(scope: &Path, entries: PluginRoutes) {
     let scope = scope_key(scope);
     let mut table = PLUGIN_SOCKETS.lock().expect("plugin socket table poisoned");
     match table.iter_mut().find(|(key, _)| *key == scope) {

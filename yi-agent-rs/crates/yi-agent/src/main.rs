@@ -2580,7 +2580,7 @@ mod tests {
             "the catalog must be loaded before resolve_effective consumes it"
         );
         assert!(
-            body.contains(&guide_call) && body.contains(&guide_condition),
+            body.contains(&guide_call) && body.contains(guide_condition),
             "a machine with neither a key nor a catalog entry must get the guidance line, \
              and the check must require a non-empty model as well as a key"
         );
