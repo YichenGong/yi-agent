@@ -1918,8 +1918,24 @@ mod tests {
 
         let mut shipped = shipped.as_object().unwrap().clone();
         let mut described = described.as_object().unwrap().clone();
-        assert_eq!(shipped.remove("command").is_some(), true);
-        assert_eq!(described.remove("command").is_some(), true);
+        assert!(shipped.remove("command").is_some());
+        assert!(described.remove("command").is_some());
+
+        // 两个语义上承重的字段单独钉住。上面的比较是「两侧都改了也照样通过」
+        // ——把 `session_driver` 从代码和参考文件里一起删掉，测试仍会绿，而缺了
+        // 它的清单会让看板静默停推。这里让它们不依赖那份可编辑的参考文件。
+        assert_eq!(
+            described.get("session_driver").and_then(|v| v.as_bool()),
+            Some(true),
+            "the manifest must drive sessions, or cards silently stop being dispatched"
+        );
+        assert_eq!(
+            described
+                .get("stop_when_disabled")
+                .and_then(|v| v.as_bool()),
+            Some(false),
+            "the query channel must survive switch-off, or `off` becomes a one-way door"
+        );
 
         assert_eq!(
             serde_json::Value::Object(described),

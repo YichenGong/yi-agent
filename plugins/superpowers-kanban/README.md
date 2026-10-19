@@ -75,8 +75,9 @@ superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop
 ```
 
 ## 命令行
-`superpowers-kanban <run|add|add-prequeued|promote|add-merge|done|archive|purge|list|on|off|workdir>`——`run` 是 daemon 守护的推进循环，
-其余是一次性查询/写入。`workdir` 报告状态目录对应的项目根。
+`superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir|manifest>`——`run` 是 daemon 守护的推进循环，
+其余是一次性查询/写入。`workdir` 报告状态目录对应的项目根；`manifest` 把本二进制的
+监督清单打到 stdout（宿主 `plugin/install` 读它，不写盘）。
 `run` 每 tick 除消费看板投递外，还会认领一张待合并卡并执行合并（本项目同一时刻只有一张）。
 
 `done <card-id>` 把一张 `awaiting_merge` 的卡结算为 `done`（人工合并后的登记通路，会核对

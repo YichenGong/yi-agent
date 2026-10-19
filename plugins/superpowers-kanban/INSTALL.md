@@ -57,7 +57,7 @@ superpowers-kanban
 预期：打印用法并以退出码 2 结束（没有子命令即用法错误，这是正常的）：
 
 ```
-superpowers-kanban: usage: superpowers-kanban <run|add|list|on|off|workdir> [...]
+superpowers-kanban: usage: superpowers-kanban <run|add|add-prequeued|promote|add-merge|merge-request|merge-finish|done|archive|purge|list|on|off|workdir|manifest> [...]
 ```
 
 若报 `command not found`，说明没进 `PATH`，回到上一步。
