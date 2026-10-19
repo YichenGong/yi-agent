@@ -63,11 +63,14 @@ pub fn is_valid_plugin_name(name: &str) -> bool {
 ///
 /// 写入是原子的（同目录 `tmp` + `rename`）：截断的清单会被 supervisor 当成
 /// 坏清单**静默跳过**（只记一条 warn），那等于插件凭空消失，比安装失败更难查。
+///
+/// 返回的 [`ManifestSnapshot`] 记录安装**之前**那份清单的样子（或「本来没有」），
+/// 供调用方在后续步骤失败时恢复——见 [`ManifestSnapshot::restore`]。
 pub fn install_manifest_for(
     project: &Path,
     plugin_name: &str,
     manifest_json: &str,
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<(PathBuf, ManifestSnapshot)> {
     if !is_valid_plugin_name(plugin_name) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -76,54 +79,119 @@ pub fn install_manifest_for(
     }
     let dir = manifests_dir(project);
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{plugin_name}.json"));
-    write_atomic(&dir, &format!("{plugin_name}.json"), manifest_json)?;
-    Ok(path)
+    let file = format!("{plugin_name}.json");
+    let path = dir.join(&file);
+    let previous = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    write_atomic(&dir, &file, manifest_json)?;
+    Ok((path.clone(), ManifestSnapshot { path, previous }))
 }
 
-/// 删掉一个已安装的清单；不存在也算成功。
+/// 安装前的清单快照，用来在安装后半程失败时**恢复原状**。
 ///
-/// 给「安装进行到一半失败」用：清单已落盘、开关却没打开时必须撤回，否则留下
-/// 的正是「注册了、被拉起了、永不推进」的半安装态（spec §4.4.1 要防的病）。
-pub fn remove_manifest(project: &Path, plugin_name: &str) -> std::io::Result<()> {
-    if !is_valid_plugin_name(plugin_name) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("`{plugin_name}` is not a usable plugin name"),
-        ));
-    }
-    match std::fs::remove_file(manifests_dir(project).join(format!("{plugin_name}.json"))) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+/// 为什么不是「失败就删清单」：重装一个**本来就能用**的插件时，若开关这一步恰好
+/// 写不进去（磁盘满、权限、并发占位），删掉清单等于把一次失败的升级变成一次
+/// 卸载——比原来那个半安装态更糟。只有原本没有清单时才应该删。
+#[derive(Debug)]
+pub struct ManifestSnapshot {
+    path: PathBuf,
+    previous: Option<Vec<u8>>,
+}
+
+impl ManifestSnapshot {
+    /// 撤回这次安装：原本有清单就写回原字节，原本没有就删掉。
+    ///
+    /// 恢复也走 `create_new` + `rename`，故不会与并发写者互相截断。
+    pub fn restore(self) -> std::io::Result<()> {
+        match self.previous {
+            Some(bytes) => {
+                let dir = self.path.parent().unwrap_or(Path::new("."));
+                let file = self
+                    .path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                match std::str::from_utf8(&bytes) {
+                    Ok(text) => write_atomic(dir, &file, text),
+                    // 原清单不是 UTF-8：按字节写回，别做任何转码。
+                    Err(_) => {
+                        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let tmp = dir.join(format!(
+                            "{file}.{TEMP_WRITER}.{}.{seq}.tmp",
+                            std::process::id()
+                        ));
+                        std::fs::write(&tmp, &bytes)?;
+                        std::fs::rename(&tmp, &self.path)
+                    }
+                }
+            }
+            None => match std::fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        }
     }
 }
 
-/// 进程内递增序号，给每次写入的临时文件一个不同的后缀。
+/// 本模块在临时文件名里留的写者标记。
 ///
-/// 与 `app-server` 的 `settings_store` / `thread_store` 同一约定：固定临时名
-/// 会让同一目录的**并发写者**互相截断（A 写 tmp、B 用 `fs::write` 把同一个 tmp
-/// 截断、A 把它 rename 成目标文件——最终文件就是半份内容）。
+/// 不能只靠进程内计数器：`settings_store` 也写同一个 `preferences.json`，而它
+/// 自己有一个从 0 开始的计数器。两边格式若都是 `<file>.<pid>.<seq>.tmp`，同一
+/// 进程里两个模块的**第一次**写入会算出**同一个路径**——那正是固定临时名的毛病，
+/// 只是换了个样子。写者标记把两边分开。
+const TEMP_WRITER: &str = "install";
+
+/// 进程内递增序号，用来在写者标记之后再加一层区分。
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `dir` 下逐次唯一的临时文件名：`<file>.<pid>.<seq>.tmp`。
-fn temp_path(dir: &Path, file: &str, seq: u64) -> PathBuf {
-    dir.join(format!("{file}.{}.{}.tmp", std::process::id(), seq))
-}
-
 /// 同目录 `tmp` + `rename` 的原子写。
+///
+/// 临时文件用 `create_new` 取得：唯一性由文件系统裁决，而不是由进程内计数器
+/// 推断。即使另一个模块（或另一个进程）碰巧算出同样的名字，也只会得到
+/// `AlreadyExists` 并换下一个序号，而不会把别人正在写的文件截断。
 fn write_atomic(dir: &Path, file: &str, contents: &str) -> std::io::Result<()> {
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = temp_path(dir, file, seq);
-    if let Err(error) = std::fs::write(&tmp_path, contents) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(error);
+    use std::io::Write;
+
+    let mut attempt = 0_u32;
+    loop {
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = dir.join(format!(
+            "{file}.{TEMP_WRITER}.{}.{seq}.tmp",
+            std::process::id()
+        ));
+        let mut handle = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(handle) => handle,
+            // 名字被占用：换下一个序号。真撞上几十次说明目录里有异常堆积，
+            // 那时失败比无限重试好。
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 32 => {
+                attempt += 1;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = handle
+            .write_all(contents.as_bytes())
+            .and_then(|()| handle.sync_all())
+        {
+            drop(handle);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+        drop(handle);
+        if let Err(error) = std::fs::rename(&tmp_path, dir.join(file)) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+        return Ok(());
     }
-    if let Err(error) = std::fs::rename(&tmp_path, dir.join(file)) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(error);
-    }
-    Ok(())
 }
 
 /// 把 `switch_key` 置为 `true`，保留 `preferences.json` 里的其它键。
@@ -167,7 +235,7 @@ mod tests {
     #[test]
     fn installing_writes_the_manifest_under_the_projects_supervisors_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let path = install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
+        let (path, _) = install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
 
         assert_eq!(
             path,
@@ -184,7 +252,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
         let second = r#"{"name":"demo","command":"/bin/false","switch_key":"demo_on"}"#;
-        install_manifest_for(dir.path(), "demo", second).unwrap();
+        let _ = install_manifest_for(dir.path(), "demo", second).unwrap();
 
         let entries: Vec<_> = std::fs::read_dir(manifests_dir(dir.path()))
             .unwrap()
@@ -252,22 +320,50 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
-    /// 临时名必须逐次唯一。
+    /// 临时名不得与 `settings_store` 的写法重合。
     ///
-    /// `preferences.json` 是**多写者共享**的（运行时偏好、各插件开关）：固定名
-    /// 会让并发写者互相截断——A 写 tmp，B 用 `fs::write` 把同一个 tmp 截断，A 再
-    /// 把它 rename 成目标文件，最终文件就是半份内容，所有键一起坏掉。
+    /// `preferences.json` 是**多写者共享**的（运行时偏好、各插件开关），而
+    /// `settings_store` 也有一个从 0 开始的计数器。若两边格式相同，同一进程里
+    /// 两个模块的第一次写入会算出同一个临时路径，互相截断。写者标记保证两边
+    /// 永远落在不同文件上。
     #[test]
-    fn each_write_uses_a_unique_temp_name() {
+    fn the_temp_name_cannot_collide_with_another_writer() {
         let dir = tempfile::tempdir().unwrap();
-        let first = temp_path(dir.path(), "preferences.json", 0);
-        let second = temp_path(dir.path(), "preferences.json", 1);
-        assert_ne!(first, second);
-        assert!(
-            first
-                .to_string_lossy()
-                .contains(&std::process::id().to_string())
-        );
+        write_atomic(dir.path(), "preferences.json", "{}").unwrap();
+        assert_eq!(TEMP_WRITER, "install");
+        // 另一个写者（同进程、同序号、同格式）会算出这个路径；两者必须不同。
+        let other = dir
+            .path()
+            .join(format!("preferences.json.{}.{}.tmp", std::process::id(), 0));
+        let ours = dir.path().join(format!(
+            "preferences.json.{TEMP_WRITER}.{}.{}.tmp",
+            std::process::id(),
+            0
+        ));
+        assert_ne!(ours, other);
+    }
+
+    /// 并发写同一个 preferences 文件不会互相截断。
+    #[test]
+    fn concurrent_switch_writes_leave_a_complete_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    enable_switch(&root, &format!("switch_{index}")).unwrap();
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let text = std::fs::read_to_string(project_preferences_path(&root)).unwrap();
+        // 每个写者都做 read-modify-write，具体活下来几个键取决于写入顺序；
+        // 关键是文件必须始终是**完整**的 JSON，绝不能是半份。
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(!value.as_object().unwrap().is_empty());
     }
 
     /// 清单写入是原子的：覆盖写不会留下截断的旧文件。
@@ -278,7 +374,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
         let updated = r#"{"name":"demo","command":"/bin/false","switch_key":"demo_on"}"#;
-        let path = install_manifest_for(dir.path(), "demo", updated).unwrap();
+        let (path, _) = install_manifest_for(dir.path(), "demo", updated).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), updated);
         // 覆盖写走 tmp + rename，故目录里只剩最终文件。
         let names: Vec<_> = std::fs::read_dir(dir.path().join(".yi-agent").join("supervisors"))
@@ -289,21 +385,34 @@ mod tests {
         assert_eq!(names, vec!["demo.json".to_string()]);
     }
 
-    /// 回滚只删清单，不动项目里的其它东西。
+    /// 回滚：原本没有清单时删掉。
     #[test]
-    fn removing_a_manifest_is_idempotent() {
+    fn a_snapshot_of_nothing_restores_to_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
-        remove_manifest(dir.path(), "demo").unwrap();
-        assert!(
-            !dir.path()
-                .join(".yi-agent")
-                .join("supervisors")
-                .join("demo.json")
-                .exists()
+        let (_, snapshot) = install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
+        snapshot.restore().unwrap();
+        assert!(!manifests_dir(dir.path()).join("demo.json").exists());
+    }
+
+    /// 回滚：原本有清单时写回**原字节**，而不是删掉。
+    ///
+    /// 重装一个本来能用的插件、开关那一步却失败时，删清单等于把失败的升级变成
+    /// 卸载——比半安装态更糟。
+    #[test]
+    fn a_snapshot_of_a_previous_manifest_restores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
+        let (_, snapshot) = install_manifest_for(
+            dir.path(),
+            "demo",
+            r#"{"name":"demo","command":"/bin/false","switch_key":"demo_on"}"#,
+        )
+        .unwrap();
+        snapshot.restore().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(manifests_dir(dir.path()).join("demo.json")).unwrap(),
+            MANIFEST
         );
-        // 再删一次不算错：回滚可能被重试。
-        remove_manifest(dir.path(), "demo").unwrap();
     }
 
     /// 名字会被拼进路径，故含分隔符或 `..` 的名字必须在落盘前拒绝。

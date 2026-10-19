@@ -17028,6 +17028,50 @@ async fn plugin_install_rolls_the_manifest_back_when_the_switch_cannot_be_writte
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_failed_reinstall_does_not_destroy_a_working_installation() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    let original = serde_json::json!({
+        "name": "demo-plugin",
+        "command": "/bin/true",
+        "switch_key": "demo_plugin_on",
+    })
+    .to_string();
+    fake_plugin_printing(&h, "demo-plugin", &original);
+
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(response.get("error").is_none(), "{response}");
+
+    // 现在让开关写不进去，再装一次。失败必须把**原来那份清单**写回去——
+    // 删掉它等于把一次失败的升级变成一次卸载。
+    let preferences = project.path().join(".yi-agent").join("preferences.json");
+    std::fs::remove_file(&preferences).unwrap();
+    std::fs::create_dir_all(&preferences).unwrap();
+
+    send_install(&mut h, 10, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(response.get("error").is_some(), "{response}");
+
+    let restored = std::fs::read_to_string(
+        project
+            .path()
+            .join(".yi-agent")
+            .join("supervisors")
+            .join("demo-plugin.json"),
+    )
+    .expect("a failed reinstall must leave the previous manifest in place");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&restored).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&original).unwrap()
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn plugin_install_reports_a_plugin_that_fails_to_describe_itself() {
     let mut h = Harness::new();
     initialize(&mut h).await;

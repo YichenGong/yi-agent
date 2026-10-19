@@ -258,36 +258,40 @@ pub(crate) async fn handle_shared(
             // 先清单、后开关：清单让 supervisor 拉起进程，开关决定它要不要干活。
             // 两者缺一都会得到一个「注册了、起来了、却永不推进」的插件，
             // 故它们是一次安装的两半（spec §4.4.1）。
-            if let Err(error) = yi_agent_supervisors::install::install_manifest_for(
+            let snapshot = match yi_agent_supervisors::install::install_manifest_for(
                 &project,
                 &plugin,
                 &manifest_json,
             ) {
-                write_or_fatal(
-                    state,
-                    id.clone(),
-                    err_response(
-                        id,
-                        RpcError::internal(format!(
-                            "could not install the {plugin} manifest: {error}"
-                        )),
-                    ),
-                )
-                .await;
-                return Ok(Flow::Continue);
-            }
+                Ok((_, snapshot)) => snapshot,
+                Err(error) => {
+                    write_or_fatal(
+                        state,
+                        id.clone(),
+                        err_response(
+                            id,
+                            RpcError::internal(format!(
+                                "could not install the {plugin} manifest: {error}"
+                            )),
+                        ),
+                    )
+                    .await;
+                    return Ok(Flow::Continue);
+                }
+            };
             if let Err(error) = yi_agent_supervisors::install::enable_switch(&project, switch_key) {
-                // 开关打不开就撤回清单。留下的清单会被 supervisor 拉起，而插件
-                // 因开关关着永不推进——正是 §4.4.1 要防的半安装态，且用户无从
-                // 从界面上分辨「没装」和「装了但死的」。
-                if let Err(rollback) =
-                    yi_agent_supervisors::install::remove_manifest(&project, &plugin)
-                {
+                // 开关打不开就恢复到安装前的样子。留下的清单会被 supervisor
+                // 拉起，而插件因开关关着永不推进——正是 §4.4.1 要防的半安装态，
+                // 且用户无从从界面上分辨「没装」和「装了但死的」。
+                //
+                // 是**恢复**而不是一律删掉：重装一个本来能用的插件时，开关这一步
+                // 恰好写不进去，删清单就把失败的升级变成了卸载。
+                if let Err(rollback) = snapshot.restore() {
                     tracing::warn!(
                         project = %project.display(),
                         plugin = %plugin,
                         %rollback,
-                        "could not roll back a manifest whose switch failed to enable"
+                        "could not restore the previous manifest after the switch failed to enable"
                     );
                 }
                 write_or_fatal(
