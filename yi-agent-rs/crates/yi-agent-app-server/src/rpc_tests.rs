@@ -1756,6 +1756,16 @@ pub(crate) fn default_config() -> RuntimeConfig {
 pub(crate) struct Harness {
     client_w: tokio::io::DuplexStream,
     client_r: BufReader<tokio::io::DuplexStream>,
+    /// 已读、但还没被任何断言消费的帧。
+    ///
+    /// 后台任务（首当其冲是 `model/upsert` 自动起的能力探测）会在**任意时刻**
+    /// 插一帧广播进来。`read_value` 每次直接读下一帧时，这类帧会被当成「下一个
+    /// 响应」交给调用方，于是 `initialize` 的「第一帧必须是 id 1」偶发失败——
+    /// 与实现对不对无关，只取决于探测那一刻有没有恰好跑完。
+    ///
+    /// 因此所有读取一律先看这里：找指定 id / method 的读法把不匹配的帧放回队列，
+    /// 真正的乱序破坏才会暴露，而后台广播只影响时序、不影响语义。
+    pending: std::collections::VecDeque<serde_json::Value>,
     handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     /// 隔离的全局目录索引;持有它保证 tempdir 存活到 harness 结束。
     _index_dir: tempfile::TempDir,
@@ -2024,6 +2034,7 @@ impl Harness {
         Self {
             client_w,
             client_r: BufReader::new(client_r),
+            pending: std::collections::VecDeque::new(),
             handle,
             _index_dir: index_dir,
             board_dir,
@@ -2090,6 +2101,14 @@ impl Harness {
     }
 
     pub(crate) async fn read_value(&mut self) -> serde_json::Value {
+        if let Some(v) = self.pending.pop_front() {
+            return v;
+        }
+        self.read_value_from_wire().await
+    }
+
+    /// 真的从线上读一帧（不看 `pending`）。只有找特定 id/method 的读法需要它。
+    async fn read_value_from_wire(&mut self) -> serde_json::Value {
         let mut buf = String::new();
         let n = tokio::time::timeout(EVENT_WAIT, self.client_r.read_line(&mut buf))
             .await
@@ -2097,6 +2116,39 @@ impl Harness {
             .expect("read_line failed");
         assert!(n > 0, "unexpected EOF while waiting for a message");
         serde_json::from_str(buf.trim()).expect("server wrote invalid JSON")
+    }
+
+    /// 读到第一条满足 `want` 的帧，顺序读过的帧按下面的规则处理。
+    ///
+    /// **带 `id` 的响应帧放回队列**：它是对另一个请求的答复，丢掉会让等它的人
+    /// 永远等不到。**通知帧直接丢弃**：与改动前逐帧读的语义一致——通知是
+    /// fire-and-forget，测试关心的那条仍会由 `want` 命中。
+    ///
+    /// 这条区分正是为了容纳后台广播（`model/capabilitiesChanged` 之类）：
+    /// 它可以插在任意两帧之间，只影响时序、不影响语义。
+    pub(crate) async fn read_matching(
+        &mut self,
+        limit: usize,
+        mut want: impl FnMut(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        // 先扫已在队列里的：调用方可能已经读过几帧。
+        for _ in 0..self.pending.len() {
+            let v = self.pending.pop_front().expect("length checked");
+            if want(&v) {
+                return v;
+            }
+            self.pending.push_back(v);
+        }
+        for _ in 0..limit {
+            let v = self.read_value_from_wire().await;
+            if want(&v) {
+                return v;
+            }
+            if v.get("id").is_some() {
+                self.pending.push_back(v);
+            }
+        }
+        panic!("no matching frame in {limit} frames");
     }
 
     /// 读一帧，超时（或无帧）返回 `None`。用于断言「此后不该再有帧」。
@@ -2136,8 +2188,14 @@ impl Harness {
 pub(crate) async fn initialize(h: &mut Harness) {
     h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
-    let v = h.read_value().await;
-    assert_eq!(v["id"], 1, "initialize must respond with the request id");
+    // 用「找 id」而不是「读第一帧」：后台能力探测的广播可以插在中间。
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(1)))
+        .await;
+    assert!(
+        v.get("result").is_some() || v.get("error").is_some(),
+        "initialize must respond with the request id: {v}"
+    );
 }
 
 /// `initialize` + `thread/start`,返回新建 thread 的 id。
@@ -2145,14 +2203,11 @@ async fn start_thread(h: &mut Harness) -> String {
     initialize(h).await;
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
         .await;
-    // 依次读到 thread/started 通知与 thread/start 响应,取响应里的 thread_id。
-    for _ in 0..4 {
-        let v = h.read_value().await;
-        if v.get("id") == Some(&serde_json::json!(2)) {
-            return v["result"]["thread_id"].as_str().unwrap().to_string();
-        }
-    }
-    panic!("no thread/start response");
+    // 取响应里的 thread_id；中间的 `thread/started` 通知与后台广播一律不丢。
+    let v = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    v["result"]["thread_id"].as_str().unwrap().to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2273,13 +2328,8 @@ async fn a_completed_turn_removes_its_checkpoint() {
 /// Task 5 之后,进程状态守望者会随时把 `process/updated` 插进同一路流里,
 /// 请求响应不再保证是紧接着的下一帧,故按 id 收敛而非"读一帧就当响应"。
 async fn read_response(h: &mut Harness, want: u64) -> serde_json::Value {
-    for _ in 0..16 {
-        let v = h.read_value().await;
-        if v.get("id") == Some(&serde_json::json!(want)) {
-            return v;
-        }
-    }
-    panic!("no response with id {want}");
+    h.read_matching(64, |v| v.get("id") == Some(&serde_json::json!(want)))
+        .await
 }
 
 /// 把一帧回放通知展平为其携带的 items：**兼容**逐条 `item/completed` 与批量
@@ -12998,6 +13048,188 @@ async fn model_list_over_dispatch_masks_the_key() {
     h.shutdown().await;
 }
 
+/// 读到指定 `method` 的通知为止(最多 20 帧),丢弃中间穿插的其它帧。
+async fn read_notification(h: &mut Harness, method: &str) -> serde_json::Value {
+    h.read_matching(64, |v| {
+        v.get("method").and_then(|m| m.as_str()) == Some(method)
+    })
+    .await
+}
+
+/// `model/probe` 的后台探测：先回 `started`，完成后把权威能力写进清单并广播。
+///
+/// 上游用 wiremock 模拟「所有档位都接受」。断言两条主线：
+/// 1. 响应立即返回（不阻塞 30s 的探测）；
+/// 2. `model/capabilitiesChanged` 带上的正是落盘后的能力。
+#[tokio::test(flavor = "multi_thread")]
+async fn model_probe_records_capabilities_and_broadcasts_them() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+        .mount(&server)
+        .await;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"model/upsert","params":{{"name":"A","provider":"openai","api_url":"{}","model":"m","api_key":"k","api_style":"chat"}}}}"#,
+        server.uri()
+    ))
+    .await;
+    assert_eq!(read_response(&mut h, 9).await["result"]["ok"], true);
+
+    // upsert 已经自动起了一轮探测；先收下它的结果，再测显式触发的那一轮
+    // （否则显式请求会被去重表判成重复，测不到 `started:true` 这条路径）。
+    let first = read_notification(&mut h, "model/capabilitiesChanged").await;
+    assert_eq!(first["params"]["name"], "A");
+
+    h.send(r#"{"jsonrpc":"2.0","id":10,"method":"model/probe","params":{"name":"A"}}"#)
+        .await;
+    let v = read_response(&mut h, 10).await;
+    assert_eq!(v["result"]["started"], true, "probe must start: {v}");
+
+    let n = read_notification(&mut h, "model/capabilitiesChanged").await;
+    assert_eq!(n["params"]["name"], "A");
+    assert_eq!(
+        n["params"]["reasoning_capabilities"]["chat"]["supported"],
+        serde_json::json!(["none", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "the broadcast must carry the persisted result: {n}"
+    );
+
+    // 落盘一致：`model/list` 读到的就是广播出去的那份。
+    h.send(r#"{"jsonrpc":"2.0","id":11,"method":"model/list","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 11).await;
+    assert_eq!(
+        v["result"]["models"][0]["reasoning_capabilities"]["chat"]["supported"],
+        serde_json::json!(["none", "minimal", "low", "medium", "high", "xhigh", "max"]),
+        "persisted capabilities must match the broadcast: {v}"
+    );
+    h.shutdown().await;
+}
+
+/// 同名条目的探测不得并发跑两轮：第二次请求直接回 `started:false`。
+#[tokio::test(flavor = "multi_thread")]
+async fn model_probe_is_deduplicated_while_one_is_running() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(150))
+                .set_body_string("data: [DONE]\n\n"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"model/upsert","params":{{"name":"A","provider":"openai","api_url":"{}","model":"m","api_key":"k","api_style":"chat"}}}}"#,
+        server.uri()
+    ))
+    .await;
+    assert_eq!(read_response(&mut h, 9).await["result"]["ok"], true);
+
+    // upsert 自动起的那一轮先跑完，去重表才会空出来。
+    read_notification(&mut h, "model/capabilitiesChanged").await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":10,"method":"model/probe","params":{"name":"A"}}"#)
+        .await;
+    h.send(r#"{"jsonrpc":"2.0","id":11,"method":"model/probe","params":{"name":"A"}}"#)
+        .await;
+    let first = read_response(&mut h, 10).await;
+    let second = read_response(&mut h, 11).await;
+    assert_eq!(first["result"]["started"], true, "{first}");
+    assert_eq!(
+        second["result"]["started"], false,
+        "a second concurrent probe must be rejected: {second}"
+    );
+
+    // 让这一轮跑完，避免 harness 结束时留下悬挂任务。
+    read_notification(&mut h, "model/capabilitiesChanged").await;
+    h.shutdown().await;
+}
+
+/// 探测未知条目回结构化 `model_not_found`，不是内部错误。
+#[tokio::test(flavor = "multi_thread")]
+async fn model_probe_on_an_unknown_entry_is_a_structured_error() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":9,"method":"model/probe","params":{"name":"nope"}}"#)
+        .await;
+    let v = read_response(&mut h, 9).await;
+    assert_eq!(v["error"]["data"]["code"], "model_not_found", "{v}");
+    h.shutdown().await;
+}
+
+/// upsert 新建条目后自动探测，不阻塞 upsert 的响应。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upsert_with_a_new_connection_starts_a_probe() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+        .mount(&server)
+        .await;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":9,"method":"model/upsert","params":{{"name":"A","provider":"openai","api_url":"{}","model":"m","api_key":"k","api_style":"chat"}}}}"#,
+        server.uri()
+    ))
+    .await;
+    assert_eq!(read_response(&mut h, 9).await["result"]["ok"], true);
+
+    let n = read_notification(&mut h, "model/capabilitiesChanged").await;
+    assert_eq!(n["params"]["name"], "A");
+    assert!(
+        n["params"]["reasoning_capabilities"]["chat"]["supported"]
+            .as_array()
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "upsert must trigger a probe and broadcast its result: {n}"
+    );
+    h.shutdown().await;
+}
+
+/// 只改密钥不触发重测：能力与连接字段都未变，重测是纯浪费。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upsert_that_only_changes_the_key_does_not_reprobe() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+        .mount(&server)
+        .await;
+
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    let upsert = |id: u64, key: &str| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"model/upsert","params":{{"name":"A","provider":"openai","api_url":"{}","model":"m","api_key":"{key}","api_style":"chat"}}}}"#,
+            server.uri()
+        )
+    };
+    h.send(&upsert(9, "k1")).await;
+    assert_eq!(read_response(&mut h, 9).await["result"]["ok"], true);
+    read_notification(&mut h, "model/capabilitiesChanged").await;
+
+    h.send(&upsert(10, "k2")).await;
+    assert_eq!(read_response(&mut h, 10).await["result"]["ok"], true);
+    // 短窗口负等待：不该有第二轮探测广播。
+    assert!(
+        h.try_read_value(Duration::from_millis(600))
+            .await
+            .map(|v| v.get("method").and_then(|m| m.as_str()) != Some("model/capabilitiesChanged"))
+            .unwrap_or(true),
+        "changing only the key must not re-probe"
+    );
+    h.shutdown().await;
+}
+
 /// An `Observe`-only client may read the (masked) catalog but must be refused
 /// every write. Production stdio is `Admin`; a paired phone defaults to
 /// `Control`, which is *allowed* to write, so this uses the lowest tier.
@@ -13328,6 +13560,119 @@ async fn thread_set_reasoning_effort_persists_and_broadcasts() {
         .expect("load must not fail")
         .expect("setReasoningEffort must persist meta");
     assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("high"));
+    h.shutdown().await;
+}
+
+/// 直接写隔离清单的能力数据（绕过 upsert，避免它触发后台探测与测试竞态）。
+fn seed_capabilities(models_path: &std::path::Path, name: &str, supported: &[&str]) {
+    use yi_agent_runtime::models::{
+        ChannelCapability, ModelEntry, ModelProvider, ReasoningCapabilities, load_catalog_from,
+        save_catalog_to,
+    };
+    let mut catalog = load_catalog_from(models_path);
+    catalog.models.push(ModelEntry {
+        name: name.to_string(),
+        provider: ModelProvider::Openai,
+        api_url: "https://seed.example".into(),
+        model: "m".into(),
+        api_key: "k".into(),
+        api_style: Some("chat".into()),
+        reasoning_effort: None,
+        reasoning_capabilities: Some(ReasoningCapabilities {
+            chat: Some(ChannelCapability {
+                supported: supported.iter().map(|s| s.to_string()).collect(),
+                probed_at: 1,
+                error: None,
+            }),
+            ..Default::default()
+        }),
+        context_length: None,
+    });
+    catalog.default_model = Some(name.to_string());
+    save_catalog_to(models_path, &catalog).unwrap();
+}
+
+/// 能力可信时不支持的档位必须被拒，且零副作用（不落盘、不广播）。
+#[tokio::test(flavor = "multi_thread")]
+async fn set_reasoning_effort_rejects_a_tier_the_model_does_not_support() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    seed_capabilities(
+        &h._models_dir.path().join("models.json"),
+        "L",
+        &["low", "medium"],
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"high"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 20).await;
+    assert_eq!(v["error"]["code"], -32602, "got {v}");
+    let message = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("low, medium"),
+        "the error must name what IS supported: {message}"
+    );
+
+    let loaded = crate::thread_store::ThreadStore::new(dir.path())
+        .load(&tid)
+        .expect("load must not fail")
+        .expect("thread persists");
+    assert_eq!(
+        loaded.meta.reasoning_effort, None,
+        "a rejected tier must not be persisted"
+    );
+    h.shutdown().await;
+}
+
+/// 能力可信且档位在列表内：正常落盘。
+#[tokio::test(flavor = "multi_thread")]
+async fn set_reasoning_effort_accepts_a_supported_tier() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    seed_capabilities(
+        &h._models_dir.path().join("models.json"),
+        "L",
+        &["low", "medium"],
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"medium"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 20).await;
+    assert_eq!(v["result"]["ok"], true, "got {v}");
+
+    let loaded = crate::thread_store::ThreadStore::new(dir.path())
+        .load(&tid)
+        .expect("load must not fail")
+        .expect("thread persists");
+    assert_eq!(loaded.meta.reasoning_effort.as_deref(), Some("medium"));
+    h.shutdown().await;
+}
+
+/// 能力未知（没有探测记录）时保持宽松：七档仍然都能设。
+#[tokio::test(flavor = "multi_thread")]
+async fn set_reasoning_effort_stays_permissive_when_capabilities_are_unknown() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":20,"method":"thread/setReasoningEffort","params":{{"threadId":"{tid}","effort":"max"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 20).await;
+    assert_eq!(v["result"]["ok"], true, "got {v}");
     h.shutdown().await;
 }
 
@@ -14873,6 +15218,7 @@ fn model_catalog_entries(default_model: Option<&str>) -> yi_agent_runtime::model
                 api_key: "key-a".into(),
                 api_style: None,
                 reasoning_effort: None,
+                reasoning_capabilities: None,
                 context_length: None,
             },
             ModelEntry {
@@ -14883,6 +15229,7 @@ fn model_catalog_entries(default_model: Option<&str>) -> yi_agent_runtime::model
                 api_key: "key-b".into(),
                 api_style: None,
                 reasoning_effort: None,
+                reasoning_capabilities: None,
                 context_length: None,
             },
         ],

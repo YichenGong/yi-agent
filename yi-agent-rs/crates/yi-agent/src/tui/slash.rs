@@ -363,6 +363,31 @@ pub fn parse_effort_args(args: &str) -> Result<EffortAction, String> {
     }
 }
 
+/// 与 [`parse_effort_args`] 相同，但额外按模型能力集合校验档位。
+///
+/// `supported = None` 表示能力未知（没探测过 / 探测失败）：沿用七档白名单，
+/// 与探测功能上线前的行为一致。只有**有可信结论**时才收窄——把「还没测」当成
+/// 「一档都不支持」会把用户挡在一个本来可用的功能外面。
+pub fn parse_effort_args_with_caps(
+    args: &str,
+    supported: Option<&[String]>,
+) -> Result<EffortAction, String> {
+    let action = parse_effort_args(args)?;
+    if let (EffortAction::Set(tier), Some(list)) = (&action, supported) {
+        if !list.iter().any(|s| s == tier) {
+            return Err(format!(
+                "该模型不支持 {tier}（支持：{}）",
+                if list.is_empty() {
+                    "无，仅 `default`".to_string()
+                } else {
+                    list.join(" | ")
+                }
+            ));
+        }
+    }
+    Ok(action)
+}
+
 /// A parsed `/mcp` action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpAction {
@@ -895,6 +920,50 @@ mod tests {
                 "tier {tier} must parse"
             );
         }
+    }
+
+    #[test]
+    fn effort_rejects_a_tier_the_model_does_not_support() {
+        let supported = vec!["low".to_string(), "high".to_string()];
+        let err = parse_effort_args_with_caps("max", Some(&supported)).unwrap_err();
+        assert!(
+            err.contains("low") && err.contains("high"),
+            "error must list the supported tiers: {err}"
+        );
+        assert_eq!(
+            parse_effort_args_with_caps("high", Some(&supported)),
+            Ok(EffortAction::Set("high".into()))
+        );
+        // 能力未知时行为不变。
+        assert_eq!(
+            parse_effort_args_with_caps("max", None),
+            Ok(EffortAction::Set("max".into()))
+        );
+    }
+
+    #[test]
+    fn effort_clear_and_status_ignore_the_capability_list() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            parse_effort_args_with_caps("default", Some(&none)),
+            Ok(EffortAction::Clear),
+            "clearing an override must stay possible even when no tier works"
+        );
+        assert_eq!(
+            parse_effort_args_with_caps("", Some(&none)),
+            Ok(EffortAction::Status)
+        );
+    }
+
+    #[test]
+    fn effort_rejects_every_tier_when_the_model_supports_none() {
+        let none: Vec<String> = Vec::new();
+        let err = parse_effort_args_with_caps("low", Some(&none)).unwrap_err();
+        assert!(err.contains("不支持"), "got: {err}");
+        assert!(
+            err.contains("default"),
+            "must point at the escape hatch: {err}"
+        );
     }
 
     #[test]

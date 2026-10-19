@@ -194,6 +194,7 @@ pub fn migrate_model_keys(env_path: &Path, models_path: &Path) -> MigrationOutco
             api_key: settings.api_key.clone(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
             context_length,
         });
         catalog.default_model = Some(name.clone());
@@ -341,6 +342,7 @@ mod tests {
             api_key: "sk-keep".into(),
             api_style: None,
             reasoning_effort: None,
+            reasoning_capabilities: None,
             context_length: None,
         });
         crate::models::save_catalog_to(&models, &catalog).unwrap();

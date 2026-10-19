@@ -190,6 +190,12 @@ export class ThreadStore {
       this.view(n.params.thread_id).mode = n.params.mode;
       return;
     }
+    if (n.method === "model/capabilitiesChanged") {
+      // 机器级清单属性，不属于任何 thread（App 另有一条总线把它分发给模型相关
+      // 组件）。在这里必须显式吞掉：下面那行按 `n.params.thread_id` 取会话，
+      // 该变体没有这个字段，落进兜底分支会往 `undefined` 这个假会话里写正文。
+      return;
+    }
     if (n.method === "error") {
       // 无 thread 归属的全局错误归当前 thread。
       this.current()?.session.apply(n);

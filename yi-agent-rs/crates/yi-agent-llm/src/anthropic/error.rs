@@ -30,6 +30,21 @@ pub async fn map_status_error(resp: reqwest::Response) -> ProviderError {
     }
 }
 
+/// 网关是否在点名「effort / output_config」拒绝该请求。
+///
+/// 与 OpenAI 侧 [`crate::openai::error::is_effort_rejection`] 同形：只看
+/// 400/422，且 body 必须同时点名字段与「不支持」语义，避免把普通参数错误
+/// 误判成档位不支持。
+pub fn is_effort_rejection(status: u16, body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    matches!(status, 400 | 422)
+        && (lower.contains("output_config") || lower.contains("effort"))
+        && (lower.contains("unsupported")
+            || lower.contains("does not support")
+            || lower.contains("not supported")
+            || lower.contains("invalid"))
+}
+
 #[cfg(test)]
 mod tests {
     // Unit testing map_status_error directly requires constructing a reqwest::Response,

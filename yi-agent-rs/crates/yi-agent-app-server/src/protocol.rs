@@ -288,6 +288,30 @@ pub enum Notification {
     /// 旧值。它只带布尔开关、不带正文。
     #[serde(rename = "thread/preserveThinkingChanged")]
     PreserveThinkingChanged { thread_id: String, preserve: bool },
+    /// 某模型条目的 reasoning effort 能力探测完成。
+    ///
+    /// 与 `thread/*` 那族**不同**：能力是机器级清单属性（`models.json`），不属于
+    /// 任何一条会话，故 `thread_key()` 恒为 `None`，所有客户端都要刷新——否则
+    /// 一端刚探测完、另一端仍按旧能力平铺档位。
+    ///
+    /// **直接携带权威结果**：能力就是几个短字符串，客户端就地落笔即可，不必再付
+    /// 一次全量 `model/list`。`None` = 条目已删或探测结果作废。
+    ///
+    /// 线上形状见 `desktop/src/lib/models.ts` 的 `ReasoningCapabilities`：
+    ///
+    /// ```jsonc
+    /// { "chat": { "supported": ["low"], "probed_at": 1, "error": null } }
+    /// ```
+    ///
+    /// 用 `#[ts(type = "unknown")]` 而不是导入 runtime 类型：`ReasoningCapabilities`
+    /// 定义在 `yi-agent-runtime`，那里不依赖 ts-rs，协议层也不该为它引入反向依赖。
+    #[serde(rename = "model/capabilitiesChanged")]
+    ModelCapabilitiesChanged {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "unknown")]
+        reasoning_capabilities: Option<yi_agent_runtime::models::ReasoningCapabilities>,
+    },
     /// 该会话的标题已变（LLM 首轮生成成功写入）。
     ///
     /// 与 `thread/modelChanged` 同族：标题是会话元数据，变更后必须让**所有**
@@ -494,6 +518,7 @@ impl Notification {
             Notification::ToolCallApprovalResolved { .. }
             | Notification::UiSettingsUpdated { .. }
             | Notification::TagNamesUpdated { .. }
+            | Notification::ModelCapabilitiesChanged { .. }
             | Notification::Error { .. } => None,
         }
     }
@@ -531,6 +556,7 @@ impl Notification {
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::TagNamesUpdated { .. }
+            | Notification::ModelCapabilitiesChanged { .. }
             | Notification::Error { .. }
             | Notification::ToolCallApprovalResolved { .. } => Delivery::Global,
             _ => Delivery::Content,
@@ -745,6 +771,31 @@ mod tests {
 
     /// `model_not_found` gets its own numeric code without renumbering the
     /// board/plugin vocabulary; the UI only reads `data.code`.
+    #[test]
+    fn model_capabilities_changed_notification_carries_method_and_payload() {
+        let n = Notification::ModelCapabilitiesChanged {
+            name: "A".into(),
+            reasoning_capabilities: Some(yi_agent_runtime::models::ReasoningCapabilities {
+                chat: Some(yi_agent_runtime::models::ChannelCapability {
+                    supported: vec!["low".into()],
+                    probed_at: 7,
+                    error: None,
+                }),
+                ..Default::default()
+            }),
+        };
+        let v = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "model/capabilitiesChanged");
+        assert_eq!(v["params"]["name"], "A");
+        assert_eq!(
+            v["params"]["reasoning_capabilities"]["chat"]["supported"][0],
+            "low"
+        );
+        // 机器级清单属性：无 thread 键，恒推。
+        assert!(n.thread_key().is_none());
+        assert!(matches!(n.delivery(), Delivery::Global));
+    }
+
     #[test]
     fn model_not_found_has_a_stable_numeric_code_and_reason() {
         let error = RpcError::model_not_found("A");

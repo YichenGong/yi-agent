@@ -70,12 +70,15 @@ pub fn is_transient_gateway_rejection(status: u16, body: &str) -> bool {
 /// 并伴随 `Supported value` / `does not support` / `not supported` / `unsupported`
 /// 之一。要求状态码与两个特征同时命中，避免把无关的 400 误判成 effort 拒绝。
 pub fn is_effort_rejection(status: u16, body: &str) -> bool {
+    // 大小写不敏感：不同网关对 "Unsupported value" / "unsupported value" 的
+    // 拼法不一致，而语义完全相同。字段名保持原样匹配（它总是小写）。
+    let lower = body.to_ascii_lowercase();
     matches!(status, 400 | 422)
         && (body.contains("\"reasoning_effort\"") || body.contains("reasoning.effort"))
-        && (body.contains("Supported value")
-            || body.contains("does not support")
-            || body.contains("not supported")
-            || body.contains("unsupported"))
+        && (lower.contains("supported value")
+            || lower.contains("does not support")
+            || lower.contains("not supported")
+            || lower.contains("unsupported"))
 }
 
 #[cfg(test)]

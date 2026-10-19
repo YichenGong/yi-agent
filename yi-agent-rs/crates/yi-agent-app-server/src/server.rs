@@ -2423,6 +2423,9 @@ where
         lead_control,
         lead_control_replies,
     } = attachments;
+    // 进程级探测去重表：整个主循环共用一份，`model/probe` 与 `model/upsert`
+    // 的后台探测都从这里 `try_begin`。只活在内存里，重启即清空。
+    let probes = crate::model_rpc::ProbeRegistry::default();
     // driver task 会 clone 该 sender 上报 turn 完成事件;主循环持有它,
     // 保证 `turn_rx` 不会提前关闭。
     let (turn_tx, mut turn_rx) = mpsc::channel::<TurnEvent>(64);
@@ -2696,6 +2699,7 @@ where
                             cfg: &cfg,
                             theme_handle: &theme_handle,
                             models_path: &models_path,
+                            probes: &probes,
                             onboarding_env_path: &onboarding_env_path,
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
