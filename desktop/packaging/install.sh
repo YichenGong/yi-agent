@@ -232,6 +232,50 @@ quit_gui() {
   return 1
 }
 
+lsof_for_pid() {
+  local pid="$1"
+  if [ -n "${YI_AGENT_LSOF_CMD:-}" ]; then
+    eval "$YI_AGENT_LSOF_CMD" | awk -v p="$pid" '$2 == p'
+  else
+    lsof -p "$pid" 2>/dev/null
+  fi
+}
+
+# argv 里第二个词必须是 daemon、第三个必须是 serve。
+# 用 shell 分词即可：命令行由内核给出，不含需要引号解析的语法。
+is_argv_daemon_serve() {
+  # shellcheck disable=SC2086
+  set -- $1
+  [ $# -ge 3 ] || return 1
+  # $1 是可执行文件
+  shift
+  [ "$1" = "daemon" ] && [ "$2" = "serve" ]
+}
+
+# 真实可执行文件（inode 路径）。软链启动时 comm 只显示软链路径，
+# 故必须走 lsof 的 txt 行。
+real_exe() {
+  local pid="$1"
+  lsof_for_pid "$pid" |
+    awk '$4 == "txt" && $NF ~ /\/yi-agent$/ {print $NF; exit}'
+}
+
+# 属于 <app> 的 runtime daemon。
+# 两个条件同时满足才返回：argv 是 daemon serve；真实 exe 是该 App 的内置 CLI。
+daemon_pids() {
+  local app="$1"
+  local want="$app/Contents/MacOS/yi-agent"
+  local pid cmd
+  ps_lines | while read -r pid cmd; do
+    [ -n "$pid" ] || continue
+    is_argv_daemon_serve "$cmd" || continue
+    local exe
+    exe="$(real_exe "$pid")"
+    [ "$exe" = "$want" ] || continue
+    printf '%s\n' "$pid"
+  done
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -euo pipefail
   main "$@"

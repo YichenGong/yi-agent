@@ -156,5 +156,50 @@ assert_eq "quit_gui falls back to kill" "rc=1" \
       quit_gui 222 "/tmp/FakeHome/Applications/yi-agent.app" >/dev/null 2>&1; echo "rc=$?")"
 assert_eq "quit_gui killed the stubborn pid" "222" "$(cat "$KILLLOG" 2>/dev/null)"
 
+# --- is_argv_daemon_serve ---
+assert_eq "daemon serve matches" "yes" \
+  "$(is_argv_daemon_serve "/x/yi-agent daemon serve" && echo yes || echo no)"
+assert_eq "TUI does not match" "no" \
+  "$(is_argv_daemon_serve "/x/yi-agent" && echo yes || echo no)"
+assert_eq "app-server does not match" "no" \
+  "$(is_argv_daemon_serve "/x/yi-agent app-server --listen stdio://" && echo yes || echo no)"
+assert_eq "boards watch does not match" "no" \
+  "$(is_argv_daemon_serve "/x/yi-agent boards watch" && echo yes || echo no)"
+
+# --- daemon_pids ---
+APPDIR2="/Applications/yi-agent.app"
+PS2="$TMPROOT/ps2.txt"
+cat > "$PS2" <<EOF
+  501 $APPDIR2/Contents/MacOS/yi-agent daemon serve
+  502 $APPDIR2/Contents/MacOS/yi-agent app-server --listen stdio://
+  503 /Users/dev/proj/.worktrees/x/target/debug/yi-agent daemon serve
+  504 $APPDIR2/Contents/MacOS/yi-agent
+EOF
+LSOF2="$TMPROOT/lsof2.txt"
+cat > "$LSOF2" <<'EOF'
+COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+yi-agent 501 u txt REG 1,15 42 100 /Applications/yi-agent.app/Contents/MacOS/yi-agent
+yi-agent 503 u txt REG 1,15 42 101 /Users/dev/proj/.worktrees/x/target/debug/yi-agent
+EOF
+assert_eq "daemon_pids keeps only app-owned daemon" "501" \
+  "$(YI_AGENT_PS_CMD="cat $PS2" \
+     YI_AGENT_LSOF_CMD="cat $LSOF2" \
+     daemon_pids "$APPDIR2" | tr '\n' ' ' | sed 's/ $//')"
+
+# 软链启动：comm 是软链路径，但 lsof 给出真实 inode 路径
+LSOF3="$TMPROOT/lsof3.txt"
+cat > "$LSOF3" <<'EOF'
+COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+yi-agent 601 u txt REG 1,15 42 100 /Applications/yi-agent.app/Contents/MacOS/yi-agent
+EOF
+PS3="$TMPROOT/ps3.txt"
+cat > "$PS3" <<'EOF'
+  601 /usr/local/bin/yi-agent daemon serve
+EOF
+assert_eq "daemon_pids follows symlinked exe" "601" \
+  "$(YI_AGENT_PS_CMD="cat $PS3" \
+     YI_AGENT_LSOF_CMD="cat $LSOF3" \
+     daemon_pids "$APPDIR2" | tr '\n' ' ' | sed 's/ $//')"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
