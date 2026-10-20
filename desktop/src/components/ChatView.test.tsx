@@ -274,12 +274,12 @@ describe("ChatView notices", () => {
         type: "notice",
         id: "n5",
         text: "",
-        body: { kind: "help", target: "cost", error: null },
+        body: { kind: "help", target: "usage", error: null },
       },
     ] as unknown as (Item | NoticeItem)[];
     render(<ChatView items={list} />);
-    expect(screen.getByText("命令 /cost")).toBeTruthy();
-    expect(screen.getByText("显示 token 使用量")).toBeTruthy();
+    expect(screen.getByText("命令 /usage")).toBeTruthy();
+    expect(screen.getByText("查看 token 用量与上下文占用")).toBeTruthy();
   });
 });
 

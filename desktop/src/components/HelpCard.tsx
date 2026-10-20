@@ -15,7 +15,7 @@ import { HELP_GROUPS, SLASH_COMMANDS, type SlashCommandSpec } from "../lib/slash
 
 const EM_DASH = "—";
 
-/** `/help /cost` 与 `/help cost` 等价；`/` 归一化后是空名。 */
+/** `/help /usage` 与 `/help usage` 等价；`/` 归一化后是空名。 */
 function normalizeTarget(target?: string | null): string {
   return (target ?? "").trim().replace(/^\//, "");
 }

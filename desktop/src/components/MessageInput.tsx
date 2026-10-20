@@ -168,7 +168,7 @@ export function MessageInput({
   /**
    * Send 按钮的点击处理。
    *
-   * 桌面端就是 `handleSend`。手机端回车已让给换行，命令（`/cost` 等）的入口必须补
+   * 桌面端就是 `handleSend`。手机端回车已让给换行，命令（`/usage` 等）的入口必须补
    * 到 Send 上：草稿解析为命令就先执行它。裸 `/`（`parsed.kind === "none"` 但弹窗
    * 开着）按桌面端回车的既有语义处理为 inert——弹窗默认高亮是破坏性的 `/clear`，
    * 未经用户选择不得执行。
@@ -281,7 +281,7 @@ export function MessageInput({
                   if (parsed.kind !== "command" && selected === 0) return;
                   // A space closes the popup (name-mode only), so no arguments can
                   // be pending here: accepting the highlighted row is exactly what
-                  // "complete and run" means (`/cos` -> `/cost`). Fully typed
+                  // "complete and run" means (`/us` -> `/usage`). Fully typed
                   // commands — arguments and unknowns included — reach the
                   // no-popup branch below with `parsed` intact.
                   const picked = options[Math.min(selected, options.length - 1)];

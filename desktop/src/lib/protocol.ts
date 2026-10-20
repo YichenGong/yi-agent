@@ -147,6 +147,32 @@ export interface Usage {
   cacheWrite: number;
 }
 
+/**
+ * `thread/readItems` / `thread/resume` 回包里持久化的上一轮用量（snake_case）。
+ *
+ * 与实时通知 `thread/tokenUsage/updated` 是同一份数据的两种来源：通知代表
+ * 「当前这一轮」，这个字段代表「最后一轮落盘」。
+ */
+export interface WireUsage {
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens?: number;
+  cache_read_input_tokens?: number;
+}
+
+/** 线形状 → 客户端形状。缺失 cache 字段按 0 处理（与通知路径同一口径）。 */
+export function wireUsageToUsage(u: WireUsage | null | undefined): Usage | null {
+  if (!u) return null;
+  return {
+    model: u.model,
+    input: u.input_tokens,
+    output: u.output_tokens,
+    cacheRead: u.cache_read_input_tokens ?? 0,
+    cacheWrite: u.cache_creation_input_tokens ?? 0,
+  };
+}
+
 /** `workspace/list` 的单项。 */
 export interface Workspace {
   path: string;

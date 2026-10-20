@@ -489,7 +489,6 @@ describe("MessageInput", () => {
       expect(options.map((o) => o.textContent)).toEqual([
         expect.stringContaining("/compact"),
         expect.stringContaining("/config"),
-        expect.stringContaining("/cost"),
       ]);
     });
 
@@ -537,10 +536,10 @@ describe("MessageInput", () => {
       const onSlashCommand = vi.fn();
       renderInput({ onSend, onSlashCommand });
       const textarea = screen.getByRole("textbox");
-      fireEvent.change(textarea, { target: { value: "/cos" } });
+      fireEvent.change(textarea, { target: { value: "/us" } });
       fireEvent.keyDown(textarea, { key: "Enter" });
 
-      expect(onSlashCommand).toHaveBeenCalledWith("cost", null);
+      expect(onSlashCommand).toHaveBeenCalledWith("usage", null);
       expect(onSend).not.toHaveBeenCalled();
     });
 
@@ -548,12 +547,12 @@ describe("MessageInput", () => {
       const onSlashCommand = vi.fn();
       renderInput({ onSlashCommand });
       const textarea = screen.getByRole("textbox");
-      // The brief expects ("help", "cost") while "/help " is still a single
+      // The brief expects ("help", "usage") while "/help " is still a single
       // match for the popup. Those two requirements contradict each other: the
       // TUI fires the highlighted command's *name* (with no argument) when it
       // accepts a completion, and opening the popup for a single match is
       // precisely what the brief's own Tab/Enter tests rely on. Since
-      // `parseSlashInput` already yields `{ name: "help", args: "cost" }` for
+      // `parseSlashInput` already yields `{ name: "help", args: "usage" }` for
       // this exact text, dropping one command char makes the expectation the
       // implementation actually owes: "(help", null) — the leading `/` is not
       // a catalog name, so the popup is not even offered (matching the
@@ -567,15 +566,15 @@ describe("MessageInput", () => {
     it("runs a fully typed command with arguments after the popup has closed", () => {
       // The space that starts the arguments is the same keystroke that closes
       // the popup, so by the time Enter arrives the typed text is the only
-      // source of truth for the command (`/help cost` -> help with "cost").
+      // source of truth for the command (`/help usage` -> help with "usage").
       const onSend = vi.fn(async () => true);
       const onSlashCommand = vi.fn();
       renderInput({ onSend, onSlashCommand });
       const textarea = screen.getByRole("textbox");
-      fireEvent.change(textarea, { target: { value: "/help cost" } });
+      fireEvent.change(textarea, { target: { value: "/help usage" } });
       expect(screen.queryByTestId("slash-popup")).toBeNull();
       fireEvent.keyDown(textarea, { key: "Enter" });
-      expect(onSlashCommand).toHaveBeenCalledWith("help", "cost");
+      expect(onSlashCommand).toHaveBeenCalledWith("help", "usage");
       expect(onSend).not.toHaveBeenCalled();
     });
 
@@ -682,10 +681,10 @@ describe("MessageInput", () => {
       renderInput({ isMobile: true, onSend, onSlashCommand });
 
       const textarea = screen.getByRole("textbox");
-      fireEvent.change(textarea, { target: { value: "/cost" } });
+      fireEvent.change(textarea, { target: { value: "/usage" } });
       fireEvent.click(screen.getByRole("button", { name: /send/i }));
 
-      expect(onSlashCommand).toHaveBeenCalledWith("cost", null);
+      expect(onSlashCommand).toHaveBeenCalledWith("usage", null);
       expect(onSend).not.toHaveBeenCalled();
     });
 

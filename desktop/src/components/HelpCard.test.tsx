@@ -29,10 +29,10 @@ describe("HelpCard", () => {
   });
 
   it("describes one command when given a target", () => {
-    render(<HelpCard target="cost" />);
-    expect(screen.getByText("命令 /cost")).toBeTruthy();
+    render(<HelpCard target="usage" />);
+    expect(screen.getByText("命令 /usage")).toBeTruthy();
     expect(screen.getByText("说明")).toBeTruthy();
-    expect(screen.getByText("显示 token 使用量")).toBeTruthy();
+    expect(screen.getByText("查看 token 用量与上下文占用")).toBeTruthy();
     // 单条详情不该把整份清单也铺出来。
     expect(screen.queryByText("清空对话上下文")).toBeNull();
   });
@@ -44,9 +44,9 @@ describe("HelpCard", () => {
   });
 
   it("shows — instead of 用法 for a command with no argument", () => {
-    // `/cost` 不接受参数：标签仍在，值用破折号表示「没有」，而不是整行消失
+    // `/usage` 不接受参数：标签仍在，值用破折号表示「没有」，而不是整行消失
     // （那样用户会以为卡片漏渲染了）。
-    render(<HelpCard target="cost" />);
+    render(<HelpCard target="usage" />);
     expect(screen.getByText("用法")).toBeTruthy();
     expect(screen.getByText("—")).toBeTruthy();
   });

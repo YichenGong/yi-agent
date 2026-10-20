@@ -1053,11 +1053,11 @@ describe("App slash commands", () => {
     );
 
     const textarea = screen.getByRole("textbox");
-    fireEvent.change(textarea, { target: { value: "/help cost" } });
+    fireEvent.change(textarea, { target: { value: "/help usage" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    await screen.findByText("命令 /cost");
-    expect(screen.getByText("显示 token 使用量")).toBeTruthy();
+    await screen.findByText("命令 /usage");
+    expect(screen.getByText("查看 token 用量与上下文占用")).toBeTruthy();
     expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
   });
 
@@ -1075,6 +1075,59 @@ describe("App slash commands", () => {
     await screen.findByTestId("help-card");
     expect(screen.getByText("未知命令: /nope")).toBeTruthy();
     expect(screen.getByText("清空对话上下文")).toBeTruthy();
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("says the thread has no usage yet instead of a vague 'no data'", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/usage" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByText(/本会话还没有用量记录/);
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("renders the live usage with context occupancy from the session config", async () => {
+    state.dataSources["config/read"] = () => ({
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      compact_threshold: 160_000,
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    act(() => {
+      state.notifHandlers[0]({
+        method: "thread/tokenUsage/updated",
+        params: {
+          thread_id: "t1",
+          model: "claude-sonnet-4",
+          input_tokens: 12_345,
+          output_tokens: 678,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 10_000,
+        },
+      });
+    });
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/usage" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByText(/上下文: 12,345 \/ 160,000 \(7\.7%\)/);
+    // `getByText` 会把连续空白折叠成一个，故这里按单空格断言。
+    expect(screen.getByText(/input: 12,345 output: 678/)).toBeTruthy();
+    // 读的是当前会话的阈值,不是进程级快照。
+    expect(clients[0].requests.find((r) => r.method === "config/read")?.params).toEqual({
+      threadId: "t1",
+    });
     expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
   });
 

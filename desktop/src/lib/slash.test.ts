@@ -12,7 +12,7 @@ describe("slash command catalog", () => {
       "clear",
       "compact",
       "config",
-      "cost",
+      "usage",
       "help",
       "model",
     ]);
@@ -29,8 +29,8 @@ describe("slash command catalog", () => {
   });
 
   it("filters by prefix, not fuzzy match", () => {
-    expect(filterCommands("co").map((c) => c.name)).toEqual(["compact", "config", "cost"]);
-    expect(filterCommands("cost").map((c) => c.name)).toEqual(["cost"]);
+    expect(filterCommands("co").map((c) => c.name)).toEqual(["compact", "config"]);
+    expect(filterCommands("us").map((c) => c.name)).toEqual(["usage"]);
     expect(filterCommands("xyz")).toEqual([]);
   });
 
@@ -41,14 +41,14 @@ describe("slash command catalog", () => {
 
 describe("parseSlashInput", () => {
   it("parses a bare command with no args", () => {
-    expect(parseSlashInput("/cost")).toEqual({ kind: "command", name: "cost", args: null });
+    expect(parseSlashInput("/usage")).toEqual({ kind: "command", name: "usage", args: null });
   });
 
   it("parses a command with args, trimmed", () => {
-    expect(parseSlashInput("/help   cost  ")).toEqual({
+    expect(parseSlashInput("/help   usage  ")).toEqual({
       kind: "command",
       name: "help",
-      args: "cost",
+      args: "usage",
     });
   });
 

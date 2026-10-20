@@ -27,8 +27,10 @@ import type {
   ThreadStatus,
   ThreadSummary,
   TurnStatus,
+  WireUsage,
   WorkspaceGroup,
 } from "./lib/protocol";
+import { wireUsageToUsage } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
 import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
@@ -68,7 +70,7 @@ import {
   type ThreadMode,
 } from "./lib/threadPermissionMode";
 import { configReadParams } from "./lib/configRequest";
-import { estimateCost, formatCost } from "./lib/pricing";
+import { formatUsage } from "./lib/usageCommand";
 import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
@@ -637,13 +639,16 @@ export default function App() {
           if (curView && !silentTopUp) curView.syncState = "syncing";
           void (async () => {
             try {
-              const r = await c0.request<{ items: Item[] }>(
+              const r = await c0.request<{ items: Item[]; usage?: WireUsage | null }>(
                 "thread/readItems",
                 after ? { threadId: id, afterItemId: after } : { threadId: id },
               );
               const v = store.peek(id);
               if (v) {
                 v.session.upsertItems(r.items);
+                // 这条路径上不会有 live 用量通知（会话在跑、只读补齐、不 resume）：
+                // 不垫上服务端回传的上一轮快照，`/usage` 就永远显示「没有用量」。
+                v.session.adoptPersistedUsage(wireUsageToUsage(r.usage));
                 force((n) => n + 1);
               }
             } catch {
@@ -679,13 +684,15 @@ export default function App() {
         const after = store.peek(id)?.session.lastServerItemId ?? null;
         void (async () => {
           try {
-            const r = await c0.request<{ items: Item[] }>(
+            const r = await c0.request<{ items: Item[]; usage?: WireUsage | null }>(
               "thread/readItems",
               after ? { threadId: id, afterItemId: after } : { threadId: id },
             );
             const v = store.peek(id);
             if (v) {
               v.session.upsertItems(r.items);
+              // 同远端分支：这是运行中会话唯一的数据来源。
+              v.session.adoptPersistedUsage(wireUsageToUsage(r.usage));
               force((n) => n + 1);
             }
           } catch {
@@ -1620,21 +1627,26 @@ export default function App() {
         // 目录/详情由 `HelpCard` 呈现；`text` 留空，卡片就是输出。
         session.noticeBody({ kind: "help", target: args, error: null });
         break;
-      case "cost": {
+      case "usage": {
         const u = session.usage;
         if (!u) {
-          session.notice("暂无用量数据");
+          session.notice("本会话还没有用量记录");
           break;
         }
-        const cost = estimateCost(u);
-        session.notice(
-          [
-            `model: ${u.model}`,
-            `input: ${u.input}  output: ${u.output}`,
-            `cache read: ${u.cacheRead}  cache write: ${u.cacheWrite}`,
-            `估算成本: ${formatCost(cost)}`,
-          ].join("\n"),
-        );
+        // 上下文上限按**当前会话**取（与 `/config` 同一条路）：进程级快照的
+        // compact_threshold 来自 sidecar 启动配置，与这个会话实际生效的模型无关。
+        let threshold: number | null = null;
+        try {
+          const cfg = await c.request<Record<string, unknown>>(
+            "config/read",
+            configReadParams(id),
+          );
+          const v = cfg.compact_threshold;
+          threshold = typeof v === "number" && v > 0 ? v : null;
+        } catch {
+          // 读配置失败不该吞掉用量：分母未知就只显示 token 数。
+        }
+        session.notice(formatUsage(u, { compactThreshold: threshold }));
         break;
       }
       case "model":
