@@ -14,7 +14,16 @@ pub struct FlagDef {
     pub default: bool,
 }
 
-pub const REGISTRY: &[FlagDef] = &[];
+/// 组长（lead agent）的总开关。名字一旦发布就是 `flags.json` 的键，不能改。
+pub const LEAD_AGENT_FLAG: &str = "lead_agent";
+
+pub const REGISTRY: &[FlagDef] = &[FlagDef {
+    name: LEAD_AGENT_FLAG,
+    summary: "组长：项目级常驻会话，负责分派与回收子任务",
+    owner: "yichen",
+    expires_on: "2027-01-31",
+    default: false,
+}];
 
 /// 按名字查注册表。
 pub fn find(name: &str) -> Option<&'static FlagDef> {
@@ -27,7 +36,6 @@ pub(crate) mod registry_test_support {
     /// 测试里唯一被承认的 flag 名。
     pub(crate) const KNOWN: &str = "known";
 }
-
 /// 测试里承认的名字。生产代码永远返回 `false`（`cfg(test)` 之外不存在）。
 #[cfg(test)]
 pub(crate) fn is_test_known(name: &str) -> bool {
@@ -42,6 +50,20 @@ pub(crate) fn is_test_known(_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lead_agent_flag_is_registered() {
+        let def = find("lead_agent").expect("lead_agent must be in the registry");
+        assert!(!def.default, "the lead agent must default to off");
+        assert!(
+            !def.summary.is_empty(),
+            "a summary is what the settings page shows"
+        );
+        assert!(
+            !def.owner.is_empty(),
+            "an expired flag needs someone to ask"
+        );
+    }
 
     #[test]
     fn every_flag_defaults_to_off() {
