@@ -1313,6 +1313,12 @@ export default function App() {
           force((v) => v + 1);
           return;
         }
+        if (n.method === "thread/groupsChanged") {
+          // 分组变更：通知只带 workspace（组表可能很大），重拉列表即可。
+          // 与 tag/title 的「就地落笔」不同——这里没有比整份组表更小的权威值。
+          void sess.refreshThreads();
+          return;
+        }
         if (n.method === "ui/tagNames/updated") {
           // 标签显示名变更（全局帧）：合成完整映射后重渲染，色点 title / 菜单
           // aria-label / 搜索匹配全部随之更新。
@@ -2143,6 +2149,11 @@ export default function App() {
           onDelete={deleteThread}
           onTogglePin={onTogglePin}
           onSetTag={onSetTag}
+          onCreateGroup={sess.createGroup}
+          onUpdateGroup={sess.updateGroup}
+          onSetGroupMembers={sess.setGroupMembers}
+          onDeleteGroup={sess.deleteGroup}
+          onError={setCurrentError}
           tagNames={tagNames}
           onReorderPinned={onReorderPinned}
           onNew={onNew}

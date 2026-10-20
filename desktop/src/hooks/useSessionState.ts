@@ -192,6 +192,46 @@ export function useSessionState({
     }
   };
 
+  /**
+   * 分组写操作。四个动作的失败处理一致：写进会话错误并强制重渲染，返回
+   * `false` 让调用方（侧栏的就地编辑器）知道该保留输入框。
+   *
+   * 成功路径**不**就地改本地 `groups`：服务端紧接着广播 `thread/groupsChanged`，
+   * `App` 收到后重拉列表。就地改一份、再被重拉覆盖，会让输入框在两次数据之间
+   * 闪一下。
+   */
+  const groupCall = async (method: string, params: Record<string, unknown>): Promise<boolean> => {
+    const c = rpc();
+    if (!c) return false;
+    try {
+      await c.request(method, params);
+      return true;
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+      return false;
+    }
+  };
+
+  const createGroup = (
+    workspace: string,
+    name: string,
+    description: string,
+    threadIds: string[],
+  ) => groupCall("thread/group/create", { workspace, name, description, threadIds });
+
+  const updateGroup = (
+    workspace: string,
+    groupId: string,
+    patch: { name?: string; description?: string },
+  ) => groupCall("thread/group/update", { workspace, groupId, ...patch });
+
+  const setGroupMembers = (workspace: string, groupId: string, threadIds: string[]) =>
+    groupCall("thread/group/setMembers", { workspace, groupId, threadIds });
+
+  const deleteGroup = (workspace: string, groupId: string) =>
+    groupCall("thread/group/delete", { workspace, groupId });
+
   return {
     // state：会话 JSX、`selectThread`/`newThread` 等编排者与生命周期 effect 都要用。
     currentId,
@@ -229,5 +269,10 @@ export function useSessionState({
     openDetail,
     closeDetail,
     refreshSubagents,
+    // 分组动作：侧栏的多选建组、就地编辑、组菜单都走这四个。
+    createGroup,
+    updateGroup,
+    setGroupMembers,
+    deleteGroup,
   };
 }

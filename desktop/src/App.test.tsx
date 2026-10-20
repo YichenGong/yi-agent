@@ -59,6 +59,14 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // is what the pre-board tests assume. Board tests set the real project
     // paths, since the sidebar only offers a board row for a group it lists.
     groupWorkspaces: null as string[] | null,
+    // 会话分组：`thread/listAll` 把它们挂到同 workspace 的分组上。
+    workspaceGroups: [] as Array<{
+      workspace: string;
+      id: string;
+      name: string;
+      description: string;
+      threadIds: string[];
+    }>,
     // Rejections keyed by RPC method, or by the inner `plugin/query` method
     // ("switch.write", "list", …) so a test can fail exactly one board call.
     rpcError: {} as Record<string, unknown>,
@@ -209,6 +217,14 @@ vi.mock("./lib/rpc", () => ({
                     ...leadEntries(workspace),
                   ]
                 : leadEntries(workspace),
+            groups: state.workspaceGroups
+              .filter((g) => g.workspace === workspace)
+              .map((g) => ({
+                id: g.id,
+                name: g.name,
+                description: g.description,
+                threadIds: g.threadIds,
+              })),
           })),
           // 置顶项照旧留在分组里（服务端为向后兼容不摘除），顶层这里只是重排一份。
           pinned: state.pinnedIds.map((id) => ({
@@ -349,6 +365,7 @@ beforeEach(() => {
   state.boards = [];
   state.cards = [];
   state.groupWorkspaces = null;
+  state.workspaceGroups = [];
   state.rpcError = {};
   state.hostError = {};
   state.dataSources = {};
@@ -1684,6 +1701,25 @@ describe("App settings & theme wiring", () => {
     expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
       listCallsBefore,
     );
+  });
+
+  it("re-lists threads on a thread/groupsChanged notification", async () => {
+    render(<App />);
+    await settle();
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    const listCallsBefore = clients[0].requests.filter((r) => r.method === "thread/listAll").length;
+
+    // 组表只住服务端，通知里不带内容，客户端只能整份重拉。
+    state.workspaceGroups = [
+      { workspace: "/w", id: "g1", name: "登录模块", description: "三条线", threadIds: ["t1"] },
+    ];
+    notify("thread/groupsChanged", { workspace: "/w" });
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/listAll").length).toBe(
+        listCallsBefore + 1,
+      ),
+    );
+    await waitFor(() => expect(screen.getByText("登录模块")).toBeTruthy());
   });
 
   it("reflects a thread/tagChanged in the sidebar without re-listing", async () => {

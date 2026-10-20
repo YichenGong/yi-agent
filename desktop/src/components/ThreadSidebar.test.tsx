@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, fireEvent, cleanup, screen, act } from "@testing-library/react";
+import { render, fireEvent, cleanup, screen, act, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import { LONG_PRESS_MS } from "../lib/useLongPress";
@@ -16,6 +16,9 @@ import {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  // 兜底：个别用例（如"长按附属根小节头"）开了假定时器却没在本地复原，
+  // 会把后续所有 describe 一起带进假时间，`await` 永远等不到定时器。
+  vi.useRealTimers();
 });
 
 function thread(id: string, title: string, cwd: string, tag?: string): ThreadSummary {
@@ -66,6 +69,11 @@ function sidebarProps(overrides: Partial<ComponentProps<typeof ThreadSidebar>> =
     onUnlinkFolder: vi.fn(),
     tagNames: DEFAULT_TAG_NAMES,
     onSetTag: vi.fn(),
+    onCreateGroup: vi.fn().mockResolvedValue(true),
+    onUpdateGroup: vi.fn().mockResolvedValue(true),
+    onSetGroupMembers: vi.fn().mockResolvedValue(true),
+    onDeleteGroup: vi.fn().mockResolvedValue(true),
+    onError: vi.fn(),
     ...overrides,
   };
   return props;
@@ -1519,5 +1527,168 @@ describe("ThreadSidebar lead entry", () => {
   it("does not render a lead avatar on a normal thread row", () => {
     const { container } = renderSidebar();
     expect(container.querySelector("[data-lead-avatar]")).toBeNull();
+  });
+});
+
+describe("会话分组框", () => {
+  const boxThreads: ThreadSummary[] = [
+    { ...thread("a", "A", "/work/projA"), updated_at: 30 },
+    { ...thread("b", "B", "/work/projA"), updated_at: 20 },
+    { ...thread("c", "C", "/work/projA"), updated_at: 10 },
+  ];
+  const boxGroups: WorkspaceGroup[] = [
+    {
+      workspace: "/work/projA",
+      exists: true,
+      threads: boxThreads,
+      groups: [{ id: "grp-1", name: "登录模块", description: "三条线", threadIds: ["b", "c"] }],
+    },
+  ];
+
+  it("组名常显，描述只在展开时出现，成员不再单列", () => {
+    const { container, getByText, queryByText } = renderSidebar({ groups: boxGroups });
+    expect(getByText("登录模块")).toBeTruthy();
+    expect(queryByText("三条线")).toBeNull();
+    // 折叠态下成员不渲染（与目录折叠同一口径）。
+    expect(container.querySelectorAll('[data-thread-row="b"]').length).toBe(0);
+    expect(container.querySelectorAll("[data-group-box]").length).toBe(1);
+  });
+
+  it("展开后显示描述与成员，折叠后成员收起", () => {
+    const { container, getByLabelText, getByText, queryByText } = renderSidebar({
+      groups: boxGroups,
+    });
+    fireEvent.click(getByLabelText("展开分组 登录模块"));
+    expect(getByText("三条线")).toBeTruthy();
+    expect(container.querySelectorAll('[data-thread-row="b"]').length).toBe(1);
+    expect(container.querySelectorAll('[data-thread-row="c"]').length).toBe(1);
+    fireEvent.click(getByLabelText("折叠分组 登录模块"));
+    expect(queryByText("三条线")).toBeNull();
+  });
+
+  it("归组会话在目录里只出现一次（不再单列），未归组的仍单列", () => {
+    const { container, getByLabelText } = renderSidebar({ groups: boxGroups });
+    fireEvent.click(getByLabelText("展开分组 登录模块"));
+    expect(container.querySelectorAll('[data-thread-row="a"]').length).toBe(1);
+    expect(container.querySelectorAll('[data-thread-row="b"]').length).toBe(1);
+    expect(container.querySelectorAll('[data-thread-row="c"]').length).toBe(1);
+  });
+
+  it("多选两个会话后点「新建组」并回车，发出正确的 RPC 参数", async () => {
+    const onCreateGroup = vi.fn().mockResolvedValue(true);
+    renderSidebar({ groups: [{ workspace: "/work/projA", exists: true, threads: boxThreads }], onCreateGroup });
+    fireEvent.click(screen.getByText("A"), { ctrlKey: true });
+    fireEvent.click(screen.getByText("B"), { ctrlKey: true });
+    fireEvent.click(screen.getByText("新建组（2）"));
+    const input = document.querySelector<HTMLInputElement>("[data-new-group-name]")!;
+    fireEvent.change(input, { target: { value: "登录模块" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(onCreateGroup).toHaveBeenCalledWith("/work/projA", "登录模块", "", ["a", "b"]),
+    );
+  });
+
+  it("点击组名就地编辑，Enter 保存", async () => {
+    const onUpdateGroup = vi.fn().mockResolvedValue(true);
+    renderSidebar({ groups: boxGroups, onUpdateGroup });
+    fireEvent.click(screen.getByText("登录模块"));
+    const input = document.querySelector<HTMLInputElement>("[data-group-name-input]")!;
+    fireEvent.change(input, { target: { value: "扫码登录" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(onUpdateGroup).toHaveBeenCalledWith("/work/projA", "grp-1", { name: "扫码登录" }),
+    );
+  });
+
+  it("展开后点描述就地编辑，失焦保存", async () => {
+    const onUpdateGroup = vi.fn().mockResolvedValue(true);
+    renderSidebar({ groups: boxGroups, onUpdateGroup });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("三条线"));
+    const area = document.querySelector<HTMLTextAreaElement>("[data-group-description-input]")!;
+    fireEvent.change(area, { target: { value: "两条线" } });
+    fireEvent.blur(area);
+    await waitFor(() =>
+      expect(onUpdateGroup).toHaveBeenCalledWith("/work/projA", "grp-1", { description: "两条线" }),
+    );
+  });
+
+  it("组菜单里「删除组」调用 onDeleteGroup", async () => {
+    const onDeleteGroup = vi.fn().mockResolvedValue(true);
+    renderSidebar({ groups: boxGroups, onDeleteGroup });
+    fireEvent.contextMenu(screen.getByText("登录模块"));
+    fireEvent.click(screen.getByText("删除组"));
+    await waitFor(() => expect(onDeleteGroup).toHaveBeenCalledWith("/work/projA", "grp-1"));
+  });
+
+  it("会话菜单能在组件之间加组，也能移出当前组", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const withTwo: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: boxThreads,
+        groups: [
+          { id: "grp-1", name: "登录模块", description: "", threadIds: ["b"] },
+          { id: "grp-2", name: "本周重点", description: "", threadIds: [] },
+        ],
+      },
+    ];
+    renderSidebar({ groups: withTwo, onSetGroupMembers });
+
+    // 把未归组的 a 加进「本周重点」。
+    fireEvent.contextMenu(screen.getByText("A"));
+    fireEvent.click(screen.getByText("加入 本周重点"));
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "grp-2", ["a"]),
+    );
+
+    // b 已在「登录模块」，菜单给出的是"移出"，且移出后成员里不再有它。
+    // 组成员在框折叠时不渲染，先展开。
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.contextMenu(screen.getByText("B"));
+    fireEvent.click(screen.getByText("移出分组（登录模块）"));
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenLastCalledWith("/work/projA", "grp-1", []),
+    );
+  });
+
+  it("搜索时组框自动展开并只留命中成员", () => {
+    const { container, queryByText } = renderSidebar({ groups: boxGroups });
+    // 折叠态下 b/c 都不渲染。
+    expect(container.querySelectorAll('[data-thread-row="b"]').length).toBe(0);
+
+    fireEvent.change(screen.getByLabelText("搜索会话"), { target: { value: "C" } });
+    // 命中 c 的框自动展开：c 出现，未命中的 b 不出现。
+    expect(container.querySelectorAll('[data-thread-row="c"]').length).toBe(1);
+    expect(container.querySelectorAll('[data-thread-row="b"]').length).toBe(0);
+    // 框本身（组名）仍在，用户知道 c 属于哪个组。
+    expect(queryByText("登录模块")).toBeTruthy();
+  });
+
+  it("搜索组名时整框保留并展开", () => {
+    const { container } = renderSidebar({ groups: boxGroups });
+    fireEvent.change(screen.getByLabelText("搜索会话"), { target: { value: "登录模块" } });
+    expect(container.querySelectorAll('[data-thread-row="b"]').length).toBe(1);
+    expect(container.querySelectorAll('[data-thread-row="c"]').length).toBe(1);
+  });
+
+  it("置顶的组内会话仍留在框里（spec 刻意例外）", () => {
+    const pinnedInBox: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [{ ...thread("b", "B", "/work/projA"), pinned: true }],
+        groups: [{ id: "grp-1", name: "登录模块", description: "", threadIds: ["b"] }],
+      },
+    ];
+    const { container, getByLabelText } = renderSidebar({
+      groups: pinnedInBox,
+      pinned: [{ ...thread("b", "B", "/work/projA"), pinned: true }],
+    });
+    fireEvent.click(getByLabelText("展开分组 登录模块"));
+    // 顶部置顶区 1 条 + 框内 1 条。
+    expect(container.querySelectorAll('[data-thread-row="b"]').length).toBe(2);
+    expect(container.querySelectorAll('[data-pinned-row]').length).toBe(1);
   });
 });
