@@ -2057,6 +2057,9 @@ impl Harness {
         )
     }
 
+    // 8 个参数：cfg + 工厂 + 超时 + scope + 两个 watchman 闭包 + 记录表 + 组长
+    // 开关。再拆一个 builder 只会让"哪些组合真的存在"更难读。
+    #[allow(clippy::too_many_arguments)]
     fn with_config_and_scope_and_watchman<F>(
         cfg: RuntimeConfig,
         build: F,
