@@ -136,9 +136,12 @@ pub(crate) async fn handle(
             let hub = Arc::clone(state.hub);
             let client = state.client.clone();
             let workspaces = Arc::clone(state.workspaces);
+            // 关掉组长时**连懒惰种组长都不该发生**：那是磁盘副作用，不是显示
+            // 问题。开关是纯值，必须在搬进 `spawn_blocking` 之前拷好。
+            let seed_lead = state.lead_agent_enabled;
             tokio::spawn(async move {
                 let reply = tokio::task::spawn_blocking(move || {
-                    build_list_all_response(&dirs, &workspaces, &statuses)
+                    build_list_all_response(&dirs, &workspaces, &statuses, seed_lead)
                 })
                 .await;
                 let body = match reply {
@@ -2014,6 +2017,7 @@ pub(crate) async fn handle(
 /// 因此可以整体挪出 `select!`，避免一次长扫描把 `turn/interrupt` 一起堵住。
 fn scan_workspace_metas(
     dirs: &[String],
+    seed_lead: bool,
 ) -> Vec<(String, Option<Vec<crate::thread_store::ThreadMeta>>)> {
     let mut out = Vec::with_capacity(dirs.len());
     for dir in dirs {
@@ -2030,7 +2034,7 @@ fn scan_workspace_metas(
                 continue;
             }
         };
-        if metas.is_empty() && !crate::plugin_worktree::is_plugin_worktree(path) {
+        if seed_lead && metas.is_empty() && !crate::plugin_worktree::is_plugin_worktree(path) {
             if let Err(e) =
                 crate::lead::ensure_lead_meta(&crate::thread_store::ThreadStore::new(path), path)
             {
@@ -2047,6 +2051,18 @@ fn scan_workspace_metas(
     out
 }
 
+/// 测试入口：让 `rpc_tests` 能直接驱动扫描与"种组长"这条分支。
+///
+/// 索引在 `serve` 内部，测试没法注入一个空项目来触发它；而这个函数是纯阻塞
+/// 且只碰磁盘的，直接调它比经 RPC 更确定。
+#[cfg(test)]
+pub(crate) fn scan_workspace_metas_for_test(
+    dirs: &[String],
+    seed_lead: bool,
+) -> Vec<(String, Option<Vec<crate::thread_store::ThreadMeta>>)> {
+    scan_workspace_metas(dirs, seed_lead)
+}
+
 /// 构造 `thread/listAll` 的应答体（纯函数，可离开主循环执行）。
 ///
 /// 分组规则与臂内联版本逐字相同，唯一差别是状态来自 `statuses` 快照：
@@ -2055,6 +2071,7 @@ fn build_list_all_response(
     dirs: &[String],
     workspaces: &Arc<WorkspaceIndex>,
     statuses: &HashMap<String, ThreadStatus>,
+    seed_lead: bool,
 ) -> serde_json::Value {
     let summary = |m: &crate::thread_store::ThreadMeta| {
         thread_summary_json_with_status(
@@ -2072,7 +2089,7 @@ fn build_list_all_response(
     let mut plain: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     let mut cards: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
-    for (dir, metas) in scan_workspace_metas(dirs) {
+    for (dir, metas) in scan_workspace_metas(dirs, seed_lead) {
         if seen.insert(dir.clone()) {
             order.push(dir.clone());
             exists_of.insert(dir.clone(), Path::new(&dir).is_dir());

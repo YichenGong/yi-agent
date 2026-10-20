@@ -2275,6 +2275,35 @@ mod legacy_migration_tests {
         assert!(!board_dir.join("boards.json.migrated").exists());
     }
 
+    /// 组长 tick 臂必须受开关控制。
+    ///
+    /// 这一臂驱动的是"算 digest → 投递 → 起 turn"，全是组长的副作用；关掉开关
+    /// 后它必须整体空转。它没有可注入的观测点（`lead_ticker` 在 `serve` 内部），
+    /// 故只能按源码断言——与上面那条"生产入口有没有调迁移"同一手法。
+    #[test]
+    fn the_lead_tick_arm_is_gated_by_the_flag() {
+        // 不走 `production_source()`：它在**本测试模块之前**截断，而 tick 臂在
+        // `serve()` 里、位于本模块之后。改用完整源码，并取**最后一处**——本
+        // 测试自己的 `.split("...")` 字面量也是一次命中，只有生产代码那处才在
+        // 它后面还有 `if !lead_agent_enabled`。
+        let source = include_str!("server.rs");
+        let arm = source
+            .rsplit("_ = lead_ticker.tick() => {")
+            .next()
+            .expect("the ticker arm must still exist");
+        assert_ne!(arm.len(), source.len(), "the ticker arm must still exist");
+        let head: String = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            head.contains("if !lead_agent_enabled") && head.contains("continue"),
+            "the ticker arm must short-circuit when the flag is off, got:\n{head}"
+        );
+    }
+
     /// 生产源码:截到本测试模块之前,并去掉注释行。
     ///
     /// 两个理由:① 这些断言问的是「生产入口有没有调」,测试模块里的调用不算数;
@@ -3521,6 +3550,12 @@ where
                 .await;
             }
             _ = lead_ticker.tick() => {
+                // 关掉组长时这一臂整体空转:底下要算 digest、要投递、要起 turn,
+                // 全是为组长存在的。**continue 而不是 return**——主循环还得
+                // 继续服务其它 RPC。
+                if !lead_agent_enabled {
+                    continue;
+                }
                 // 组长后台循环的兜底轮,照看板 tick 内联跑:启动一轮要拿
                 // `&mut threads`(投递走 `deliver_to_lead`),而 `threads` 是主循环
                 // 独占的局部量,`tokio::spawn` 会拆掉这条前提(spec §6.1)。

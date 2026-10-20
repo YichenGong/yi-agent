@@ -9609,6 +9609,47 @@ async fn isolated_lead_harness() -> (Harness, tempfile::TempDir) {
     (Harness::with_cfg_and_lead(cfg, true).await, dir)
 }
 
+/// 开关关掉时，`thread/listAll` 绝不能**往磁盘上**种组长。
+///
+/// 这是最容易漏的一条：响应里不带组长条目很容易做到（过滤即可），但
+/// `scan_workspace_metas` 会在列举空项目时顺手 `ensure_lead_meta`。副作用一旦
+/// 落盘，关掉开关也删不掉，用户会看到一个个空的"组长"冒出来。故这里断言的是
+/// **磁盘**，不是响应。
+///
+/// 直接测纯函数而不走 `thread/listAll`：索引在 `serve` 内部，测试无法注入
+/// 一个"空项目"；而种不种组长恰好是这个函数唯一的分支。
+#[test]
+fn list_all_does_not_seed_a_lead_when_the_flag_is_off() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let dirs = vec![dir.path().display().to_string()];
+
+    let _ = crate::rpc::thread::scan_workspace_metas_for_test(&dirs, false);
+    assert!(
+        !has_lead_meta(dir.path()),
+        "a disabled flag must not write a lead meta to disk"
+    );
+
+    // 正向对照：同一个目录、同一个函数，只把开关打开就必须种出来。
+    // 没有这一半的话，上面那条在"函数根本不种组长"时也会通过。
+    let _ = crate::rpc::thread::scan_workspace_metas_for_test(&dirs, true);
+    assert!(
+        has_lead_meta(dir.path()),
+        "with the flag on, an empty project must still get its lead"
+    );
+}
+
+/// 磁盘上是否已有一份 `role: "lead"` 的 meta。
+fn has_lead_meta(project: &std::path::Path) -> bool {
+    crate::thread_store::ThreadStore::new(project)
+        .list()
+        .map(|metas| {
+            metas
+                .iter()
+                .any(|m| m.role.as_deref() == Some(crate::thread_store::LEAD_ROLE))
+        })
+        .unwrap_or(false)
+}
+
 /// 列表扫描必须离开主循环：扫描卡住时，其它 RPC 仍然能被处理。
 ///
 /// 判据是**确定性**的：`ThreadStore::list` 用 `read_to_string` 逐个读
