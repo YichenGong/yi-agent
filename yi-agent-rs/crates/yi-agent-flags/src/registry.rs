@@ -17,13 +17,30 @@ pub struct FlagDef {
 /// 组长（lead agent）的总开关。名字一旦发布就是 `flags.json` 的键，不能改。
 pub const LEAD_AGENT_FLAG: &str = "lead_agent";
 
-pub const REGISTRY: &[FlagDef] = &[FlagDef {
-    name: LEAD_AGENT_FLAG,
-    summary: "组长：项目级常驻会话，负责分派与回收子任务",
-    owner: "yichen",
-    expires_on: "2027-01-31",
-    default: false,
-}];
+/// Superpowers 看板的总开关。
+///
+/// 与 `preferences.json` 里的 `superpowers_kanban` 键**同名但不是同一个东西**：
+/// 那个按项目存、管"这个项目要不要干活"，由插件 daemon 自己写；这个是全局闸门，
+/// 管"插件进程起不起"，由设置页经 app-server 写。两者分工见
+/// `yi-agent-supervisors::supervisor::Supervisor::desired_on` 的注释。
+pub const SUPERPOWERS_KANBAN_FLAG: &str = "superpowers_kanban";
+
+pub const REGISTRY: &[FlagDef] = &[
+    FlagDef {
+        name: LEAD_AGENT_FLAG,
+        summary: "组长：项目级常驻会话，负责分派与回收子任务",
+        owner: "yichen",
+        expires_on: "2027-01-31",
+        default: false,
+    },
+    FlagDef {
+        name: SUPERPOWERS_KANBAN_FLAG,
+        summary: "Superpowers 看板：项目级看板、卡片会话与后台值守",
+        owner: "yichen",
+        expires_on: "2027-03-31",
+        default: false,
+    },
+];
 
 /// 按名字查注册表。
 pub fn find(name: &str) -> Option<&'static FlagDef> {
@@ -128,5 +145,16 @@ mod tests {
                 def.name
             );
         }
+    }
+
+    #[test]
+    fn the_superpowers_kanban_flag_is_registered() {
+        let def = find("superpowers_kanban").expect("superpowers_kanban must be in the registry");
+        assert!(!def.default, "the kanban must default to off");
+        assert!(
+            !def.summary.is_empty(),
+            "a summary is what the settings page shows"
+        );
+        assert_eq!(def.expires_on, "2027-03-31");
     }
 }
