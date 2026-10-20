@@ -40,7 +40,10 @@ describe("SettingsModelsTab effort capabilities", () => {
     );
     render(<SettingsModelsTab call={call} />);
 
-    expect(await screen.findByText("low · high")).toBeTruthy();
+    // 档位以胶囊逐个渲染（不是 `low · high` 一行文本——那行在窄列里会被折成
+    // 多行、把整行高度顶起来）。顺序与探测结果一致。
+    const chips = await screen.findAllByText(/^(low|high)$/);
+    expect(chips.map((c) => c.textContent)).toEqual(["low", "high"]);
     expect(screen.getByText("未探测")).toBeTruthy();
   });
 
@@ -114,7 +117,7 @@ describe("SettingsModelsTab effort capabilities", () => {
         : {},
     );
     render(<SettingsModelsTab call={call} />);
-    await screen.findByText("low · high");
+    await screen.findAllByText(/^(low|high)$/);
 
     fireEvent.click(screen.getByRole("button", { name: "编辑" }));
     const select = screen.getByLabelText("推理档位") as HTMLSelectElement;

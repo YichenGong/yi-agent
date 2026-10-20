@@ -50,18 +50,20 @@ describe("SettingsModelsTab", () => {
     expect(call).toHaveBeenCalledWith("model/list", {});
   });
 
-  it('labels the provider field as "API 格式" in both the table and the form', async () => {
+  it('labels the provider field as "API 格式" in the form and shows the value in the row', async () => {
     const call = vi.fn(async (method: string, _params: unknown) =>
       method === "model/list" ? payload() : { ok: true },
     );
     render(<SettingsModelsTab call={call} />);
     await screen.findByText("••••1234");
 
-    // 表头用「API 格式」，不再用旧措辞「提供方」。
-    expect(screen.getByText("API 格式")).toBeTruthy();
+    // 4 列版把 provider 并进「连接」格（值仍是 anthropic / openai），不再单列一栏；
+    // 旧措辞「提供方」一律不再出现。
+    expect(screen.getByRole("columnheader", { name: "连接" })).toBeTruthy();
     expect(screen.queryByText("提供方")).toBeNull();
+    expect(screen.queryByText("API 格式")).toBeNull();
 
-    // 新增/编辑表单的字段标签同样是「API 格式」。
+    // 新增/编辑表单的字段标签仍是「API 格式」——那里是**填值**的地方，标签要明确。
     fireEvent.click(screen.getByRole("button", { name: "编辑" }));
     expect(screen.getByLabelText("API 格式")).toBeTruthy();
   });
@@ -433,10 +435,15 @@ describe("SettingsModelsTab channel fields", () => {
     );
     render(<SettingsModelsTab call={call} />);
     // 模型名在两处渲染（表格单元格 + 默认/子代理的下拉选项），故限定在单元格里等。
-    await screen.findByText("suspect", { selector: "td" });
+    // 4 列版把名称包进 `<span>`（要 `truncate` 就必须有块级/行内块容器），
+    // 所以选择器落到 `td span`，仍然只命中表格、不命中下拉的 `<option>`。
+    await screen.findByText("suspect", { selector: "td span" });
 
     // 只有 suspect 该被标出；ok（含 /v1）与 anth（anthropic）不提示。
-    expect(await screen.findAllByText(/以 \/v1 结尾/)).toHaveLength(1);
+    const badges = await screen.findAllByText("缺 /v1?");
+    expect(badges).toHaveLength(1);
+    // 角标只是个短提示，完整句子放在 title 里（长句会把「连接」格撑成三行）。
+    expect(badges[0].getAttribute("title")).toContain("以 /v1 结尾");
   });
 });
 
@@ -451,6 +458,37 @@ describe("SettingsModelsTab phone layout", () => {
     // 5 列表格固有 463px，390pt 的面板只有 ~390px，窄屏必须换成纵向卡片。
     expect(container.querySelector("table")).toBeNull();
     expect(container.querySelector("[data-model-card]")).toBeTruthy();
+  });
+
+  it("keeps the desktop row compact — four columns, buttons on one line, no fixed content width", async () => {
+    // 真实 Chrome 实测过的回归形状：7 列时设置弹窗（内宽约 590px）「操作」列只剩
+    // 32px，三颗按钮折成三行、行高 153px；长模型名还会把 table-auto 撑到 822px，
+    // 横向溢出而面板不可横向滚动。这条用例钉住三件事：
+    //   ① 列数回到 4（合并同类字段）；
+    //   ② `table-fixed` + 百分比列宽（auto 布局下 max-content 会撑破容器）；
+    //   ③ 操作列的按钮容器 `whitespace-nowrap flex`（宁可别处换行也不竖排按钮）。
+    const call = vi.fn(async (method: string, _params: unknown) =>
+      method === "model/list" ? payload() : { ok: true },
+    );
+    const { container } = render(<SettingsModelsTab call={call} />);
+    await screen.findByText("••••1234");
+
+    const table = container.querySelector("table")!;
+    expect(table.className).toContain("table-fixed");
+    const headers = Array.from(table.querySelectorAll("thead th")).map((th) => th.textContent);
+    expect(headers).toEqual(["模型", "连接", "推理档位", "操作"]);
+
+    const nameCell = table.querySelector("tbody td")!;
+    expect(nameCell.className).toContain("w-[30%]");
+    // 名称必须可截断：不可截断时一条长名会把该格拆成五行。
+    const nameText = nameCell.querySelector("span")!;
+    expect(nameText.className).toContain("truncate");
+    expect(nameText.getAttribute("title")).toBe("A");
+
+    const opCell = table.querySelector("tbody tr td:last-child")!;
+    const ops = opCell.querySelector("div")!;
+    expect(ops.className).toContain("whitespace-nowrap");
+    expect(ops.className).toContain("flex");
   });
 
   it("keeps the table on the desktop", async () => {
@@ -474,8 +512,10 @@ describe("SettingsModelsTab phone layout", () => {
     // 让这条用例失去「卡片必须自己渲染字段标签」的效力）。
     const card = container.querySelector("[data-model-card]")!;
     expect(card).toBeTruthy();
-    expect(card.textContent).toContain("API 格式");
-    expect(card.textContent).toContain("模型标识");
+    expect(card.textContent).toContain("连接");
+    expect(card.textContent).toContain("推理档位");
+    // 模型标识随标题呈现（「模型」字段在卡片里已作标题，不再重复标签）。
+    expect(card.textContent).toContain("m");
     // 操作按钮语义不变（可点、有可访问名）；44px 触控目标由 `py-2` 实现。
     expect(screen.getByRole("button", { name: "编辑" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "删除 A" })).toBeTruthy();
@@ -499,6 +539,8 @@ describe("SettingsModelsTab phone layout", () => {
     // 下拉的 <option>，按文本找会命中多个（表格形态的既有用例正是靠 `selector: "td"`
     // 才避开这点；卡片形态没有 td）。
     await waitFor(() => expect(container.querySelector("[data-model-card]")).toBeTruthy());
-    expect(screen.getAllByText(/以 \/v1 结尾/)).toHaveLength(1);
+    const badges = screen.getAllByText("缺 /v1?");
+    expect(badges).toHaveLength(1);
+    expect(badges[0].getAttribute("title")).toContain("以 /v1 结尾");
   });
 });

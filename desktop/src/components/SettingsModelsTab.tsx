@@ -49,6 +49,23 @@ type Draft = {
   reasoning_effort: string;
 };
 
+/**
+ * 桌面表格的列宽。
+ *
+ * 必须配 `table-fixed`：auto 布局下列宽由内容 max-content 决定，一条长模型名
+ * 或长 URL 会把表格撑到 822px（真实 Chrome 实测，容器只有 590px），横向溢出
+ * 而面板不可横向滚动 = 右侧内容永久不可达。固定布局 + 百分比让长内容按列宽
+ * 截断（`truncate`），窗口多窄都不溢。
+ *
+ * 「操作」列给的是**内容宽**而非百分比：三个按钮必须并排一行，它不该参与
+ * 比例分配。
+ */
+const COLUMN_WIDTH: Record<string, string> = {
+  模型: "w-[30%]",
+  连接: "w-[38%]",
+  推理档位: "w-[20%]",
+};
+
 /** 「未设置」哨兵值：空串不可能是合法档位 / 通道，故安全。 */
 const UNSET = "";
 
@@ -90,12 +107,17 @@ function effectiveKeyLabel(effective: EffectiveModel): string {
 }
 
 /**
- * 清单行/卡片上的能力摘要。
+ * 清单行/卡片上的能力摘要：档位胶囊，或一句「未知/不支持」。
  *
  * 只显示**生效通道**上的结论（与下拉、运行期同源），不把三条通道都摊开：用户
  * 关心的是「这个模型现在能选哪几档」，而不是探测实现细节。
+ *
+ * 胶囊而非 `low · medium · high` 一行文本：档位名之间没有天然断点，长一点的
+ * 集合（如 `none · minimal · low · medium · high · xhigh · max`）会被表格挤到
+ * 折成三行，把整行高度顶起来。胶囊各自 `nowrap`、整体 `flex-wrap`，窄了只在
+ * **胶囊之间**换行，不会把一个词拆开。
  */
-function capabilitiesSummary(entry: ModelEntryView): string {
+function EffortSummary({ entry }: { entry: ModelEntryView }) {
   const supported = supportedEffortsOf(entry);
   if (supported === null) {
     // 有记录但出错 → 同样是「未知」，但要让人知道试过了。
@@ -103,10 +125,36 @@ function capabilitiesSummary(entry: ModelEntryView): string {
     const attempted = caps
       ? (["chat", "responses", "anthropic"] as const).some((ch) => caps[ch] != null)
       : false;
-    return attempted ? "未探测成功" : "未探测";
+    return (
+      <span className="text-xs text-fg-subtle">
+        {attempted ? "未探测成功" : "未探测"}
+      </span>
+    );
   }
-  if (supported.length === 0) return "不支持显式档位";
-  return supported.join(" · ");
+  if (supported.length === 0) {
+    return <span className="text-xs text-fg-subtle">不支持显式档位</span>;
+  }
+  // 最多三颗：档位全集有 7 个，全摆出来在设置页那一列要占四行，行高被撑到
+  // 名称那一列的两倍。其余折成 `+N`，悬停（title）能看到完整清单。
+  const visible = supported.slice(0, 3);
+  const hidden = supported.length - visible.length;
+  return (
+    <span className="flex flex-wrap gap-1" title={`支持：${supported.join(" · ")}`}>
+      {visible.map((tier) => (
+        <span
+          key={tier}
+          className="whitespace-nowrap rounded border border-line bg-raised px-1 py-0.5 font-mono text-[0.6875rem] leading-tight text-fg-muted"
+        >
+          {tier}
+        </span>
+      ))}
+      {hidden > 0 && (
+        <span className="whitespace-nowrap px-1 py-0.5 font-mono text-[0.6875rem] leading-tight text-fg-subtle">
+          +{hidden}
+        </span>
+      )}
+    </span>
+  );
 }
 
 /**
@@ -419,102 +467,132 @@ export function SettingsModelsTab({
    * 清单的一行/一张卡片要展示哪些字段。**只定义一次**，两种形态共用：
    * 表格把它映射成 `<td>`，卡片映射成 `<dt>/<dd>`。字段逻辑（`/v1` 启发式提示、
    * 密钥只显掩码）因此只有一份，不会出现「改了一处漏了另一处」。
+   *
+   * 分组而不是平铺：能力探测上线后平铺出 7 列，设置弹窗实际内宽约 630px 时
+   * 「操作」列只剩 32px——三个按钮被挤成三行、行高 153px（真实 Chrome 实测）。
+   * 4 列让每列都有可用宽度，且把天然同属一件事的字段并成一格：
+   * 「名称 + 模型标识」= 这一条模型是什么，「格式 + 地址 + 密钥」= 连去哪。
    */
   const catalogFields: Array<{
     label: string;
+    /** 该格的主值。 */
     value: (entry: ModelEntryView) => ReactNode;
+    /** 桌面表格里主值下方的次要行（更小、更暗）；卡片形态同样渲染。 */
+    detail?: (entry: ModelEntryView) => ReactNode;
   }> = [
-    { label: "名称", value: (entry) => entry.name },
-    { label: "API 格式", value: (entry) => entry.provider },
-    { label: "模型标识", value: (entry) => entry.model },
     {
-      label: "API 地址",
+      label: "模型",
+      // 名称与标识都单行截断（`title` 给全文）：不截断时窄窗口下一条长名会把
+      // 该格拆成五行，整行行高 179px，而旁边几列只有两三行——一列高、其余空，
+      // 比截断更难看，也让「同名不同长」的条目无法对齐阅读。
+      value: (entry) => (
+        <span className="block w-full min-w-0 max-w-[22rem] truncate" title={entry.name}>
+          {entry.name}
+        </span>
+      ),
+      detail: (entry) => (
+        <span className="block max-w-[22rem] truncate font-mono text-xs" title={entry.model}>
+          {entry.model}
+        </span>
+      ),
+    },
+    {
+      label: "连接",
       value: (entry) => (
         <>
-          {entry.api_url}
+          <span className="text-xs">{entry.provider}</span>
+          <span className="mt-0.5 block max-w-[26rem] truncate font-mono text-xs" title={entry.api_url}>
+            {entry.api_url}
+          </span>
+          {/* /v1 只是启发式提醒，压成一个角标：整句提示会把这一格撑成三行。 */}
           {suspectsMissingV1(entry) && (
-            <span className="ml-2 font-sans text-fg-muted">
-              （OpenAI 兼容接口地址通常以 /v1 结尾，请确认）
+            <span
+              className="mt-1 inline-block rounded border border-line px-1 py-0.5 text-[0.6875rem] leading-tight text-fg-subtle"
+              title="OpenAI 兼容接口地址通常以 /v1 结尾，请确认"
+            >
+              缺 /v1?
             </span>
           )}
         </>
       ),
-    },
-    {
-      label: "密钥",
-      // key 只以掩码示人：原始值从不经过桌面端。
-      value: (entry) => (entry.has_key ? entry.api_key_masked : "未设置"),
+      detail: (entry) => (
+        // key 只以掩码示人：原始值从不经过桌面端。
+        <span className="font-mono text-xs">{entry.has_key ? entry.api_key_masked : "未设置密钥"}</span>
+      ),
     },
     {
       label: "推理档位",
       // 只读摘要：完整档位清单在「编辑」表单的下拉里（那里才是选择的地方）。
       // 明确区分「未探测」与「探测过但一档都不支持」——前者该保持宽松，后者是
       // 一个真实的结论。
-      value: (entry) => capabilitiesSummary(entry),
+      value: (entry) => <EffortSummary entry={entry} />,
     },
   ];
 
   /**
-   * 清单的桌面形态：5 列表格。固有宽度约 463px，只在足够宽的窗口里成立。
+   * 清单的桌面形态：4 列表格。
+   *
+   * `align-top` 让多行格与单行格从同一基线起排；「操作」列 `whitespace-nowrap`
+   * 保证三个按钮永远并排一行——表格被压窄时宁可让别的列换行，也不把按钮拆成
+   * 竖排（那是「挤」最直观的来源）。
    */
   const renderCatalogTable = () => (
-    <table className="mt-3 w-full table-auto text-left text-sm">
+    <table className="mt-3 w-full table-fixed text-left text-sm">
       <thead>
         <tr className="text-xs text-fg-subtle">
           {catalogFields.map((field) => (
-            <th key={field.label} className="py-1 pr-2 font-normal">
+            <th key={field.label} className={`py-1 pr-3 font-normal ${COLUMN_WIDTH[field.label] ?? ""}`}>
               {field.label}
             </th>
           ))}
-          <th className="py-1 font-normal">操作</th>
+          <th className="w-[8.5rem] py-1 text-right font-normal">操作</th>
         </tr>
       </thead>
       <tbody>
         {catalog.models.map((entry) => (
           <tr key={entry.name} className="border-t border-line">
-            {/* 「名称」列比其他列亮一档；地址与密钥是标识符/凭证，用等宽小字。 */}
             {catalogFields.map((field) => (
-              <td
-                key={field.label}
-                className={
-                  field.label === "名称"
-                    ? "py-1.5 pr-2 text-fg"
-                    : field.label === "API 地址" || field.label === "密钥"
-                      ? "py-1.5 pr-2 font-mono text-xs text-fg-subtle"
-                      : "py-1.5 pr-2 text-fg-muted"
-                }
-              >
-                {field.value(entry)}
+              <td key={field.label} className={`py-2 pr-3 align-top ${COLUMN_WIDTH[field.label] ?? ""}`}>
+                <div className={field.label === "模型" ? "text-fg" : "text-fg-muted"}>
+                  {field.value(entry)}
+                </div>
+                {field.detail && (
+                  <div className="mt-0.5 text-fg-subtle">{field.detail(entry)}</div>
+                )}
               </td>
             ))}
-            <td className="py-1.5">
-              {/* 桌面这两颗按钮的类名与结构保持原样（`px-2 py-0.5 text-xs`、`ml-1`）：
+            <td className="w-[8.5rem] py-2 align-top">
+              {/* 桌面三颗按钮的类名与结构保持原样（`px-2 py-0.5 text-xs`、`ml-1`）：
                   桌面 5 列表格「JSX 与类名不变」。手机卡片另给 44px 触控尺寸——按钮
-                  是两种排布各自的呈现细节，不与字段逻辑共享。 */}
-              <button
-                type="button"
-                onClick={() => startEdit(entry)}
-                className="rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
-              >
-                编辑
-              </button>
-              <button
-                type="button"
-                aria-label={`重新探测 ${entry.name}`}
-                onClick={() => void reprobe(entry.name)}
-                disabled={probing.has(entry.name)}
-                className="ml-1 rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg disabled:opacity-50"
-              >
-                {probing.has(entry.name) ? "探测中…" : "重新探测"}
-              </button>
-              <button
-                type="button"
-                aria-label={`删除 ${entry.name}`}
-                onClick={() => void remove(entry.name)}
-                className="ml-1 rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
-              >
-                删除
-              </button>
+                  是两种排布各自的呈现细节，不与字段逻辑共享。
+                  可见文案缩短（`重新探测` → `重测`）是为了整行不被拆开；可访问名
+                  不变（`aria-label` 仍是 `重新探测 <名称>`）。 */}
+              <div className="flex items-center justify-end whitespace-nowrap">
+                <button
+                  type="button"
+                  onClick={() => startEdit(entry)}
+                  className="rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
+                >
+                  编辑
+                </button>
+                <button
+                  type="button"
+                  aria-label={`重新探测 ${entry.name}`}
+                  onClick={() => void reprobe(entry.name)}
+                  disabled={probing.has(entry.name)}
+                  className="ml-1 rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg disabled:opacity-50"
+                >
+                  {probing.has(entry.name) ? "探测中…" : "重测"}
+                </button>
+                <button
+                  type="button"
+                  aria-label={`删除 ${entry.name}`}
+                  onClick={() => void remove(entry.name)}
+                  className="ml-1 rounded px-2 py-0.5 text-xs text-fg-muted hover:text-fg"
+                >
+                  删除
+                </button>
+              </div>
             </td>
           </tr>
         ))}
@@ -535,21 +613,18 @@ export function SettingsModelsTab({
       {catalog.models.map((entry) => (
         <li key={entry.name} data-model-card className="rounded-md border border-line p-3">
           <h3 className="text-sm font-medium text-fg">{entry.name}</h3>
+          {/* 名称作标题时，模型标识随标题一起呈现（表格里它是「模型」格的次要行）。 */}
+          <div className="mt-0.5 break-all font-mono text-xs text-fg-subtle">{entry.model}</div>
           <dl className="mt-2 space-y-2 text-xs">
             {/* 名称已作标题，正文里不再重复。 */}
             {catalogFields
-              .filter((field) => field.label !== "名称")
+              .filter((field) => field.label !== "模型")
               .map((field) => (
                 <div key={field.label}>
                   <dt className="text-fg-subtle">{field.label}</dt>
-                  <dd
-                    className={
-                      field.label === "API 地址" || field.label === "密钥"
-                        ? "break-all font-mono text-fg-subtle"
-                        : "break-all text-fg-muted"
-                    }
-                  >
+                  <dd className="break-all text-fg-muted">
                     {field.value(entry)}
+                    {field.detail && <div className="mt-0.5 text-fg-subtle">{field.detail(entry)}</div>}
                   </dd>
                 </div>
               ))}
