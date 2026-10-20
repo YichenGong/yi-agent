@@ -33,7 +33,7 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check build-env-check
+ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check tag-gate-check build-env-check
     @echo "CI passed"
 
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
@@ -56,6 +56,11 @@ npm-version-check:
 # 三平台 target）：任一被破坏，tag 触发的发布会在构建第一步秒挂。
 release-env-check:
     bash scripts/test_release_workflow_env.sh
+
+# 发布门禁自测：tag 必须落在 main 可达的提交上。release.yml 只由 tag 触发、
+# 只打包不跑测试，所以打在未合并功能分支上的 tag 会被直接发出去。
+tag-gate-check:
+    bash scripts/test_check_tag_on_main.sh
 
 # 构建环境门禁自测：PATH 必须让 rustup 的 Rust 优先于 Homebrew 的 Rust，
 # 否则交叉编译会以 E0463 "can't find crate for core" 秒挂（实测 0.5~3 秒），

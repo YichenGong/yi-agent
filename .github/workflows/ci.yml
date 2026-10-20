@@ -3,8 +3,8 @@ name: CI
 # PR 触发,跑在云端 ubuntu runner(不进 Mac mini,安全考虑)
 on:
   pull_request:
-    # release/** 是发布分支：只允许修复与版本准备，同样要过 CI。
-    branches: [main, "release/**"]
+    # 只有一条长期分支。发版是 main 上的一次动作，不另开分支。
+    branches: [main]
 
 jobs:
   ci:

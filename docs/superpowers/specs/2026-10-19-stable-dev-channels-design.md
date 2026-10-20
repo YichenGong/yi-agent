@@ -67,18 +67,36 @@ dev-B    yi-agent-dev        ~/.yi-agent-instances/<id-B>/     ← worktree B
 
 ## 5. 决策
 
-### D1 分支模型：`main` + `release/X.Y`
+### D1 分支模型：单一长期分支 `main`，不设 `release/*`
 
-- `main` 是开发主干。`feat/*`、`fix/*`、`kanban/*` 在 worktree 里开发，`merge --no-ff`
-  回 `main`。
-- 发版：从 `main` 切 `release/X.Y`，版本 bump 与 tag 都落在这条分支上。
-- hotfix：从 `release/X.Y` 切 `fix/*`，合回该 release 分支后打 patch tag，再回灌 `main`。
-- tag 仍为 `vX.Y.Z`，`release.yml` 的 tag 校验逻辑不变。
-- 需要补的缺口：
-  - CI 触发增加 `release/**`（现状只有 `pull_request: branches: [main]`）；
-  - `main` 上禁止打 tag（分支保护或发布前检查）。
+> 修订（2026-10-20）：本节最初定的是 `main` + `release/X.Y`。实际跑过 `v0.1.8`
+> 之后发现 `release` 分支上只有一个提交，且它做的两件事（bump 版本号、修两处
+> clippy）都能直接在 `main` 上做，于是改为不设 release 分支。
+
+- `main` 是唯一的长期分支。`feat/*`、`fix/*`、`kanban/*` 在 worktree 里开发，
+  `merge --no-ff` 回 `main`，合入即删除。
+- **合进 `main` 的含义是「这段代码可以发布」**。不成熟的特性留在各自分支上，
+  它们可以随时 `git merge main` 吸收主干变化，但反过来不行。
+- 发版（正常路径）：在 `main` 上执行 `just ci` → bump `Cargo.toml` 版本 → 提交
+  → 推 → 打 annotated tag → 推 tag。tag 此时指向一个已验证过的提交。
+- 发版（旧版本补丁）：仅当 `main` 已堆了不成熟代码、而要给线上旧版本打补丁时，
+  才从 **tag**（不是从 `main`）切一条短命分支 `fix/X.Y.Z`，cherry-pick 具体修复，
+  打 patch tag 后把同一条修复合回 `main`。这是唯一的例外。
+- `release.yml` 只由 tag 触发、且只打包不跑测试——这个事实决定了「打 tag 前
+  代码必须已经过 CI」是硬要求，也决定了下面这道门禁必须存在。
+
+**发布门禁（`tag-gate-check`）**：`yi-agent-rs/scripts/check-tag-on-main.sh` 断言
+tag 指向的提交是 `main` 的祖先（`git merge-base --is-ancestor <tag^{}> main`）。
+`release.yml` 与 `.gitlab-ci.yml` 的发布 job 都在动编译器之前调用它。没有这道
+门禁时，在某个 agent 的功能分支上误打一个 tag 会被**直接发布出去**，线上版本
+从此脱离主干。判据：`cd yi-agent-rs && just tag-gate-check`（7 passed）。
 
 被否方案：`develop` + `main` 双长期分支。单人维护下每次发布多一次合并，收益接近零。
+
+被否方案：`main` + `release/X.Y`。并行开发下它看起来能隔离「发布内容」与「正在
+开发的内容」，但实测一版只用了它做一次版本 bump；真正需要隔离的场景（给旧版本
+发补丁）用「从 tag 切短命分支」就能精确表达，不需要一条常设分支所附带的三次
+合并动作与 `Cargo.toml` 冲突。
 
 ### D2 版本号：构建期注入，不入库
 
