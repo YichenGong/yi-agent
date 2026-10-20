@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   isModelNotFound,
   listModels,
@@ -101,6 +101,21 @@ export function ModelPicker({
   const [effortError, setEffortError] = useState<string | null>(null);
   const effortTriggerRef = useRef<HTMLButtonElement>(null);
 
+  // 组件存活标记：清单重读的结果只在组件还活着时落进 state。
+  //
+  // 刻意**不**用「这次展开的 effect 是否已清理」作为条件：用户在菜单刚打开时
+  // 立刻点了一条，菜单随即关闭，若把「关闭」当成「作废」，这一趟读回来的清单
+  // 会被丢掉——下一次展开又从头读。冷启动那次读失败时（宿主还没握手完），
+  // 控件就会永远停在空清单上，effort 菜单只能平铺七档，看起来就是「档位不跟着
+  // 模型变」。只在真正卸载时作废。
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
   // 读清单一次（接缝身份变化才重读）：下拉项要与设置页的清单保持一致。
   useEffect(() => {
     if (!rpc) {
@@ -122,46 +137,40 @@ export function ModelPicker({
     };
   }, [rpc]);
 
-  // 每次**展开**下拉再读一次清单。挂载时那份会过时：用户可能刚在设置页写入一条
-  // 模型，而 `rpc` 是稳定身份（宿主用 `useCallback` 只闭合 `clientRef`），上面那个
-  // effect 不会因此重跑——不重读的话，新模型要等组件重挂载才出现。读失败就保留现有
-  // 清单：打开下拉不该因一次读失败把选项清空。
+  /**
+   * 重读 `model/list`；失败保留现有清单。
+   *
+   * 展开模型菜单**和**展开 effort 菜单都要调它：决定可选档位的是模型条目上的
+   * 能力数据，这份数据同样会过时（另一处改了全局默认、设置页刚探测完、或本
+   * 会话刚换了模型）。只在展开模型菜单时重读的话，effort 菜单会一直拿着旧
+   * 档位——用户看到的就是「档位不跟着模型变」。
+   */
+  const refreshCatalog = useCallback(async () => {
+    if (!rpc) return;
+    try {
+      const next = await listModels(rpc);
+      if (alive.current) setCatalog(next);
+    } catch {
+      // 保留现状：一次读失败不该把选项清空。
+    }
+  }, [rpc]);
+
+  // 每次**展开**任一下拉再读一次清单。挂载时那份会过时：用户可能刚在设置页写入
+  // 一条模型，而 `rpc` 是稳定身份（宿主用 `useCallback` 只闭合 `clientRef`），上面
+  // 那个 effect 不会因此重跑——不重读的话，新模型要等组件重挂载才出现。
   useEffect(() => {
-    if (!open || !rpc) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const next = await listModels(rpc);
-        if (!cancelled) setCatalog(next);
-      } catch {
-        // 保留现状。
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [open, rpc]);
+    if (!open && !effortOpen) return;
+    void refreshCatalog();
+  }, [open, effortOpen, refreshCatalog]);
 
   // 宿主探测完成时重读清单：能力是**后台**异步得出的，挂载时那份多半还没有。
   // 不订阅的话，下拉会一直按「未知」平铺七档，即使设置页里刚显示过探测结果。
   useEffect(() => {
     if (!rpc) return;
-    let cancelled = false;
-    const off = onModelCapabilitiesChanged(() => {
-      void (async () => {
-        try {
-          const next = await listModels(rpc);
-          if (!cancelled) setCatalog(next);
-        } catch {
-          // 读失败就保留现状：能力刷新不该打断对话。
-        }
-      })();
+    return onModelCapabilitiesChanged(() => {
+      void refreshCatalog();
     });
-    return () => {
-      cancelled = true;
-      off();
-    };
-  }, [rpc]);
+  }, [rpc, refreshCatalog]);
 
   const options = buildModelOptions(catalog, currentRef, currentModel);
   const current = options.find((o) => o.selected) ?? options[0];
