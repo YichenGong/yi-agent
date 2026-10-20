@@ -1,3 +1,6 @@
 binaries/
 platforms/*/binaries/
+# 桌面 App 也是构建产物：由 desktop/scripts/package-npm-app.sh 生成，
+# 由 npm-pack-desktop 在发布前填充，不入版本控制。
+platforms/*/yi-agent.app/
 node_modules/
