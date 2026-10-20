@@ -1520,4 +1520,39 @@ describe("ThreadSidebar lead entry", () => {
     const { container } = renderSidebar();
     expect(container.querySelector("[data-lead-avatar]")).toBeNull();
   });
+
+  it("hides the lead row when the flag is off but keeps the thread selectable", () => {
+    const lead: ThreadSummary = { ...thread("lead-1", "组长", "/p"), role: "lead" };
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/p", exists: true, threads: [lead] }],
+      leadAgentEnabled: false,
+    });
+
+    // 组长行没了。
+    expect(container.querySelector("[data-lead-row]")).toBeNull();
+    // 但那条会话**不能**跟着消失：`leadId` 也用来从普通分组里剔除组长，
+    // 只藏不剔会让它在两处都不显示（用户视角是"会话丢了"）。
+    const row = container.querySelector('[data-thread-row="lead-1"]');
+    expect(row).not.toBeNull();
+    expect(row!.hasAttribute("data-lead-row")).toBe(false);
+  });
+
+  it("shows the lead row when the flag is on", () => {
+    const lead: ThreadSummary = { ...thread("lead-1", "组长", "/p"), role: "lead" };
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/p", exists: true, threads: [lead] }],
+      leadAgentEnabled: true,
+    });
+    expect(container.querySelector("[data-lead-row]")).not.toBeNull();
+  });
+
+  it("defaults to showing the lead row when the prop is omitted", () => {
+    // 缺省必须是 true：这个组件的其它调用点与既有测试都不传这个 prop，
+    // 缺省成 false 会让它们全部少一行。
+    const lead: ThreadSummary = { ...thread("lead-1", "组长", "/p"), role: "lead" };
+    const { container } = renderSidebar({
+      groups: [{ workspace: "/p", exists: true, threads: [lead] }],
+    });
+    expect(container.querySelector("[data-lead-row]")).not.toBeNull();
+  });
 });

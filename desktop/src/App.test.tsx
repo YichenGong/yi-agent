@@ -85,6 +85,10 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // 每次 `thread/lead` 调用都记一笔它请求的 cwd——即便失败也记，这样「失败
     // 路径确实被走到」可被断言，而不是靠「首屏照常」这种两边都成立的弱断言。
     leadAttempts: [] as string[],
+    // `flags/list` 里 `lead_agent` 的值。默认**开**：既有用例（补建组长、
+    // 首屏渲染组长条目）测的都是"开关打开时的行为"，缺省成关会让它们全部
+    // 变成在测另一条分支。
+    leadFlagEnabled: true,
   },
   // 捕获 `@tauri-apps/api/webview` 注册的拖放 handler，供用例驱动事件。
   dragDrop: { fn: null as null | ((event: unknown) => void) },
@@ -226,6 +230,19 @@ vi.mock("./lib/rpc", () => ({
         };
       }
       if (method === "workspace/list") return { workspaces: [] };
+      if (method === "flags/list") {
+        return {
+          flags: [
+            {
+              name: "lead_agent",
+              summary: "组长",
+              enabled: state.leadFlagEnabled,
+              expires_on: "2027-01-31",
+              source: state.leadFlagEnabled ? "file" : "default",
+            },
+          ],
+        };
+      }
       if (method === "thread/lead") {
         const cwd = (params as { cwd?: string } | undefined)?.cwd;
         if (typeof cwd === "string") state.leadAttempts.push(cwd);
@@ -357,6 +374,7 @@ beforeEach(() => {
   state.leadCwds = [];
   state.failLead = false;
   state.leadAttempts = [];
+  state.leadFlagEnabled = true;
   dragDrop.fn = null;
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
@@ -5067,6 +5085,16 @@ describe("App lead entry reachability", () => {
     // 失败不得挡住首屏：既有会话照旧渲染，且没有凭空冒出组长条目。
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
     expect(screen.queryByText("组长")).toBeNull();
+  });
+
+  it("never asks for a lead when the flag is off", async () => {
+    state.leadFlagEnabled = false;
+    render(<App />);
+    // 等首屏稳定：既有会话已渲染，说明握手（含 flags/list）已经跑完。
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    // 关掉时对 /w 发 thread/lead 是纯浪费——服务端只会回 -32601。
+    expect(state.leadAttempts).toEqual([]);
+    expect(clients[0].requests.map((r) => r.method)).not.toContain("thread/lead");
   });
 });
 
