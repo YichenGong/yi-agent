@@ -2106,13 +2106,45 @@ fn build_list_all_response(
             if let Some(mut folded) = cards.remove(ws) {
                 merged.append(&mut folded);
             }
+            // 先收集 id 再 `json!`：`merged` 在 `json!` 里被移动，之后就拿不到了。
+            let live_ids: Vec<String> = merged
+                .iter()
+                .filter_map(|t| t["thread_id"].as_str().map(str::to_string))
+                .collect();
             json!({
                 "workspace": ws,
                 "exists": exists_of.get(ws).copied().unwrap_or(false),
                 "threads": merged,
+                "groups": groups_json(ws, &live_ids),
             })
         })
         .collect();
     let pinned: Vec<serde_json::Value> = collect_pinned(workspaces).iter().map(summary).collect();
     json!({ "groups": groups, "pinned": pinned })
+}
+
+/// 某目录的分组表，供 `thread/listAll` 随目录一起下发。
+///
+/// **只读**：读路径不写盘。过滤掉的悬空成员要等到下一次写操作才真正从文件里
+/// 消失（见 spec「列表」一节）——列表请求是高频路径，不该因为它触发磁盘写。
+///
+/// `live_ids` 是本次扫描出的、属于该目录的全部 thread id：既保证「成员仍存在」，
+/// 也保证「成员仍属于这个目录」（跨目录的脏数据在这里被剔除）。
+fn groups_json(workspace: &str, live_ids: &[String]) -> serde_json::Value {
+    let live: HashSet<&str> = live_ids.iter().map(String::as_str).collect();
+    let mut groups = crate::group_store::load(Path::new(workspace));
+    crate::group_store::prune(&mut groups, |id| live.contains(id));
+    serde_json::Value::Array(
+        groups
+            .into_iter()
+            .map(|g| {
+                json!({
+                    "id": g.id,
+                    "name": g.name,
+                    "description": g.description,
+                    "threadIds": g.thread_ids,
+                })
+            })
+            .collect(),
+    )
 }

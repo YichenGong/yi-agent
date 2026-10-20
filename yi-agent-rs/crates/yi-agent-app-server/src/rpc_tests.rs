@@ -18139,3 +18139,76 @@ async fn an_interrupt_without_an_active_turn_is_an_error() {
     );
     h.shutdown().await;
 }
+
+/// `thread/listAll` 的每个目录分组都带 `groups`：真实成员下发给客户端，
+/// 悬空 id（会话已删/不属于本目录）在读取路径上被剔除。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_carries_groups_and_hides_stale_members() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    let cwd = dir.path().canonicalize().unwrap();
+
+    // 直接落盘：一个含真实成员 + 一个悬空 id 的组。
+    crate::group_store::save(
+        &cwd,
+        &[crate::group_store::Group {
+            id: "grp-a".into(),
+            name: "登录模块".into(),
+            description: String::new(),
+            thread_ids: vec![tid.clone(), "thread-gone".into()],
+        }],
+    )
+    .unwrap();
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/listAll","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    let group = v["result"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| {
+            g["workspace"].as_str().is_some_and(|w| {
+                std::path::Path::new(w).canonicalize().ok().as_deref() == Some(cwd.as_path())
+            })
+        })
+        .expect("workspace group present");
+    let groups = group["groups"]
+        .as_array()
+        .expect("groups key present on every workspace group");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["name"], "登录模块");
+    assert_eq!(groups[0]["threadIds"], serde_json::json!([tid]));
+    h.shutdown().await;
+}
+
+/// 无分组的目录也带 `groups: []`——客户端据此判断「这个键恒在」，
+/// 不必到处写 `?? []`（虽然仍要容忍旧服务端缺键）。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_always_includes_an_empty_groups_array() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let _ = read_thread_start_response(&mut h, 2).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/listAll","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    for group in v["result"]["groups"].as_array().unwrap() {
+        assert!(
+            group["groups"].is_array(),
+            "each workspace group must carry a groups array: {group}"
+        );
+    }
+    h.shutdown().await;
+}
