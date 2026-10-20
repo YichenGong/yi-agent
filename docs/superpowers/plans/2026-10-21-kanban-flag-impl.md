@@ -22,7 +22,19 @@
 
 ---
 
-## 实测结论（本次已在 worktree 里跑通 Task 1 + 2）
+## 实测状态
+
+| Task | 状态 | 依据 |
+|---|---|---|
+| 1 注册 flag | **已实测** | `cargo test -p yi-agent-flags` → 18 passed |
+| 2 supervisor 起停 | **已实测** | lib 52 + integration 19 passed；runtime 编译通过 |
+| 3 清单 | 未实测 | 只改一个布尔字段，风险低 |
+| 4 `plugin/query` | **未实测** | 设计已完整，但 `AppState` 的注入形状要在实现时按 `lead_gate` 的现状微调 |
+| 5 前端 | 未实测 | 依赖 `flags/list` 已有形状 |
+| 6 `plugin/list` | 未实测 | 与 Task 2 同一套 `status_at` 调用，风险低 |
+| 7 验收 | — | 汇总 |
+
+下面六条是实测时**真实踩到**的坑，按重要性排列：
 
 以下不是推测，是实际编译 + 跑测试得到的，按重要性排列：
 
