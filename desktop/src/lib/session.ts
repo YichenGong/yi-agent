@@ -336,6 +336,19 @@ export class Session {
     this.openReasoning = null;
   }
 
+  /**
+   * 用服务端持久化的**上一轮**用量垫底。
+   *
+   * 只在本地还没有 live 快照时写入：`thread/tokenUsage/updated` 代表当前这一轮，
+   * 比落盘的上一轮新，任何时候都不该被它覆盖。这条入口存在的唯一理由是
+   * 「运行中的会话只走只读 `thread/readItems`、绝不 resume」——那条路径上不会
+   * 有 live 通知，不垫底就永远显示「没有用量」。
+   */
+  adoptPersistedUsage(u: Usage | null): void {
+    if (u === null || this.usage !== null) return;
+    this.usage = u;
+  }
+
   /** Append a command-output line (never sent to the agent). */
   notice(text: string): void {
     this.breakReasoningRun();

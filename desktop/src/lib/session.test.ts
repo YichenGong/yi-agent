@@ -145,6 +145,34 @@ describe("Session", () => {
     });
   });
 
+  it("adopts persisted usage only when no live snapshot exists", () => {
+    const s = new Session();
+    s.adoptPersistedUsage({ model: "m", input: 10, output: 1, cacheRead: 0, cacheWrite: 0 });
+    expect(s.usage).toEqual({ model: "m", input: 10, output: 1, cacheRead: 0, cacheWrite: 0 });
+
+    // 持久化值只是一轮的落盘快照；live 通知代表「当前这一轮」，绝不能反过来
+    // 被上一轮的旧数据覆盖。
+    s.apply({
+      method: "thread/tokenUsage/updated",
+      params: {
+        thread_id: "t",
+        model: "m2",
+        input_tokens: 99,
+        output_tokens: 3,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+      },
+    });
+    s.adoptPersistedUsage({ model: "old", input: 1, output: 1, cacheRead: 0, cacheWrite: 0 });
+    expect(s.usage).toEqual({ model: "m2", input: 99, output: 3, cacheRead: 0, cacheWrite: 0 });
+  });
+
+  it("ignores a null persisted usage", () => {
+    const s = new Session();
+    s.adoptPersistedUsage(null);
+    expect(s.usage).toBeNull();
+  });
+
   it("defaults cache tokens to zero when absent", () => {
     // 服务端现在恒发这两个 cache 字段，生成出来的线类型因此把二者标为必需。
     // 本用例的**全部意义**就是「它们缺席时折叠层仍然容错」，所以这里刻意按
