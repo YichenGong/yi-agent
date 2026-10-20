@@ -144,13 +144,27 @@ fn layout_for(workdir: &Path) -> Layout {
     Layout::for_workdir(workdir)
 }
 
+/// 打开一个**全局 flag**：写 `flags.json`（不是项目层 `preferences.json`）。
+///
+/// 两者必须分清：项目层那个键由插件 daemon 自己写，用它决定进程起停会让
+/// "关"变成单向门（停掉 daemon 就没人能 `switch.write` 回来了）。
 fn enable(workdir: &Path, switch_key: &str) {
     std::fs::create_dir_all(workdir.join(".yi-agent")).unwrap();
     std::fs::write(
-        workdir.join(".yi-agent/preferences.json"),
-        format!(r#"{{"{switch_key}":true}}"#),
+        workdir.join(".yi-agent/flags.json"),
+        format!(r#"{{"flags":{{"{switch_key}":true}}}}"#),
     )
     .unwrap();
+}
+
+/// 把 supervisor 指向项目内的 `flags.json`。
+///
+/// 生产读 `$YI_AGENT_HOME/flags.json`；测试不碰真实 home，否则并行测试会
+/// 互相写同一份文件。
+fn supervisor_for(workdir: &Path, build_kind: &str) -> Supervisor {
+    let layout = layout_for(workdir);
+    Supervisor::new(layout, build_kind.to_string())
+        .with_flags_path(workdir.join(".yi-agent/flags.json"))
 }
 
 #[test]
@@ -161,11 +175,16 @@ fn a_switch_on_spawns_the_child() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
     // 打开项目层开关
-    enable(workdir, "demo_on");
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout);
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
     assert!(
         wait_for_pid_marker(&marker),
@@ -182,9 +201,14 @@ fn a_switch_off_keeps_the_child_stopped() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
 
-    let mut supervisor = Supervisor::new(layout);
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
     // Negative check: we are proving nothing starts, so there is no positive
     // condition to poll for. The wait only has to outlast a spawn that should
@@ -205,18 +229,23 @@ fn turning_the_switch_off_stops_a_running_child() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    let prefs = workdir.join(".yi-agent/preferences.json");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    let flags = workdir.join(".yi-agent/flags.json");
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout);
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
     assert!(
         wait_for_pid_marker(&marker),
         "child should start and write its pid"
     );
 
-    std::fs::write(&prefs, r#"{"demo_on":false}"#).unwrap();
+    std::fs::write(&flags, r#"{"flags":{"superpowers_kanban":false}}"#).unwrap();
     supervisor.reconcile();
     assert!(
         supervisor.running_count() == 0,
@@ -239,14 +268,14 @@ fn a_manifest_that_must_stay_reachable_runs_even_while_disabled() {
     std::fs::write(
         layout.manifests_dir().join("reachable.json"),
         format!(
-            r#"{{"name":"reachable","command":"{}","args":[],"switch_key":"demo_on","stop_when_disabled":false}}"#,
+            r#"{{"name":"reachable","command":"{}","args":[],"switch_key":"superpowers_kanban","stop_when_disabled":false}}"#,
             child.display()
         ),
     )
     .unwrap();
     // 开关缺省即关闭；没有 preferences.json。
 
-    let mut supervisor = Supervisor::new(layout);
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
     assert!(wait_for_pid_marker(&marker), "必须起，否则没法再把开关打开");
     supervisor.stop_all();
@@ -272,10 +301,15 @@ fn a_crashed_child_is_restarted_after_the_backoff() {
         std::fs::set_permissions(&child, perms).unwrap();
     }
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout);
+    let mut supervisor = supervisor_for(workdir, "dev");
     // Condition-based: poll until the child has crashed-and-restarted three
     // times, with the shared wide budget rather than a tight 3s cap that a
     // loaded machine can miss.
@@ -307,10 +341,15 @@ fn stop_all_reaps_every_child() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout);
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
     assert!(wait_for_pid_marker(&marker));
     supervisor.stop_all();
@@ -364,8 +403,8 @@ fn a_deep_workdir_publishes_the_path_the_plugin_actually_binds() {
     )
     .unwrap();
     std::fs::write(
-        workdir.join(".yi-agent/preferences.json"),
-        r#"{"superpowers_kanban":true}"#,
+        workdir.join(".yi-agent/flags.json"),
+        r#"{"flags":{"superpowers_kanban":true}}"#,
     )
     .unwrap();
 
@@ -377,7 +416,7 @@ fn a_deep_workdir_publishes_the_path_the_plugin_actually_binds() {
         direct.display()
     );
 
-    let mut supervisor = Supervisor::new(layout_for(&workdir));
+    let mut supervisor = supervisor_for(&workdir, "dev");
     supervisor.reconcile();
     if !wait_for_pid_marker(&marker) {
         supervisor.stop_all();
@@ -439,10 +478,10 @@ fn a_live_listener_on_the_query_socket_suppresses_the_spawn() {
         &layout.manifests_dir(),
         "demo",
         &child,
-        "demo_on",
+        "superpowers_kanban",
         "{workdir}/.yi-agent/query.sock",
     );
-    enable(workdir, "demo_on");
+    enable(workdir, "superpowers_kanban");
 
     // Bind exactly where the supervisor probes. Create the parent first: `bind`
     // does not create directories.
@@ -450,7 +489,7 @@ fn a_live_listener_on_the_query_socket_suppresses_the_spawn() {
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
 
-    let mut supervisor = Supervisor::new(layout_for(workdir));
+    let mut supervisor = supervisor_for(workdir, "dev");
     // Negative check, so no positive condition to poll for. Reconcile repeatedly
     // over a window far longer than a healthy `/bin/sh` child needs to write its
     // marker (well under 100ms): a spawn would have landed by now.
@@ -492,10 +531,15 @@ fn a_childs_stderr_lands_in_its_log_file() {
         std::fs::set_permissions(&child, perms).unwrap();
     }
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout.clone());
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
 
     let log = layout.logs_dir().join("demo.log");
@@ -525,10 +569,15 @@ fn the_supervisor_records_when_it_starts_a_child() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout.clone());
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
 
     let log = layout.logs_dir().join("demo.log");
@@ -552,10 +601,15 @@ fn removing_a_manifest_records_why_the_child_stopped() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout.clone());
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
     assert!(wait_for_pid_marker(&marker), "child should start");
 
@@ -583,15 +637,20 @@ fn switching_off_records_a_different_reason_than_removing_the_manifest() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    let prefs = workdir.join(".yi-agent/preferences.json");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    let flags = workdir.join(".yi-agent/flags.json");
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout.clone());
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
     assert!(wait_for_pid_marker(&marker), "child should start");
 
-    std::fs::write(&prefs, r#"{"demo_on":false}"#).unwrap();
+    std::fs::write(&flags, r#"{"flags":{"superpowers_kanban":false}}"#).unwrap();
     supervisor.reconcile();
 
     let log = layout.logs_dir().join("demo.log");
@@ -632,14 +691,14 @@ fn a_childs_exit_is_recorded_once_not_once_per_tick() {
     std::fs::write(
         layout.manifests_dir().join("demo.json"),
         format!(
-            r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":60000,"restart_backoff_max_ms":60000}}"#,
+            r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":60000,"restart_backoff_max_ms":60000}}"#,
             child.display()
         ),
     )
     .unwrap();
-    enable(workdir, "demo_on");
+    enable(workdir, "superpowers_kanban");
 
-    let mut supervisor = Supervisor::new(layout.clone());
+    let mut supervisor = supervisor_for(workdir, "dev");
     // 20 拍 x 50ms 约 1s，全程 < 60s 退避：同一退出事实被观察约 20 次。
     for _ in 0..20 {
         supervisor.reconcile();
@@ -664,14 +723,19 @@ fn an_unwritable_log_does_not_stop_the_child_from_starting() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
 
     // 让日志路径不可用：`logs` 处放一个**文件**而不是目录，`create_dir_all` 必失败。
     // 守护子进程是本职，记日志是附加——这条路径绝不能阻断 spawn。
     std::fs::write(layout.logs_dir(), "not a directory").unwrap();
 
-    let mut supervisor = Supervisor::new(layout);
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
 
     assert!(
@@ -700,17 +764,17 @@ fn a_live_orphan_that_answers_is_published_after_a_daemon_restart() {
         &layout.manifests_dir(),
         "demo",
         &child,
-        "demo_on",
+        "superpowers_kanban",
         "{workdir}/.yi-agent/query.sock",
     );
-    enable(workdir, "demo_on");
+    enable(workdir, "superpowers_kanban");
 
     // 模拟「上一代 daemon 已经把它拉起来过」：在探测位置真的 bind。
     let socket = probe_path(&manifest, &layout);
     std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
 
-    let mut supervisor = Supervisor::new(layout_for(workdir));
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
 
     assert_eq!(
@@ -750,11 +814,11 @@ fn a_declared_socket_with_no_listener_is_not_published() {
         &layout.manifests_dir(),
         "demo",
         &child,
-        "demo_on",
+        "superpowers_kanban",
         "{workdir}/.yi-agent/query.sock",
     );
 
-    let mut supervisor = Supervisor::new(layout_for(workdir));
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
 
     assert!(
@@ -776,15 +840,20 @@ fn a_manifest_without_a_query_socket_is_never_published() {
     let marker = workdir.join("child.pid");
     let child = write_fake_child(workdir, &marker);
     let layout = layout_for(workdir);
-    write_manifest(&layout.manifests_dir(), "demo", &child, "demo_on");
-    enable(workdir, "demo_on");
+    write_manifest(
+        &layout.manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
 
     // 在常见位置放一个真在监听的 socket。
     let stray = workdir.join(".yi-agent").join("query.sock");
     std::fs::create_dir_all(stray.parent().unwrap()).unwrap();
     let _listener = std::os::unix::net::UnixListener::bind(&stray).unwrap();
 
-    let mut supervisor = Supervisor::new(layout_for(workdir));
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
     assert!(wait_for_pid_marker(&marker), "the child should be running");
 
@@ -792,6 +861,105 @@ fn a_manifest_without_a_query_socket_is_never_published() {
         supervisor.query_sockets().is_empty(),
         "a manifest that declares no query channel must never be published: {:?}",
         supervisor.query_sockets()
+    );
+    supervisor.stop_all();
+}
+
+/// 全局 flag 关（`flags.json` 里没有这个键）→ 子进程绝不能被起。
+#[test]
+fn a_manifest_whose_global_flag_is_off_is_stopped() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    write_manifest(
+        &layout_for(workdir).manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+
+    let mut supervisor = supervisor_for(workdir, "dev");
+    supervisor.reconcile();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!marker.exists(), "flag off must never start the child");
+    supervisor.stop_all();
+}
+
+/// 全局 flag 开 → 起进程，**与项目层无关**。
+///
+/// 这是刻意的：项目开关归插件解析，supervisor 停掉它就断了恢复路径。
+#[test]
+fn a_manifest_whose_global_flag_is_on_is_started() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    write_manifest(
+        &layout_for(workdir).manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
+
+    let mut supervisor = supervisor_for(workdir, "dev");
+    supervisor.reconcile();
+    assert!(wait_for_pid_marker(&marker), "flag on must start the child");
+    supervisor.stop_all();
+}
+
+/// stable 构建里 flag 恒关，哪怕 flags.json 写着 true。
+#[test]
+fn a_release_build_never_starts_a_flagged_manifest() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    write_manifest(
+        &layout_for(workdir).manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
+
+    let mut supervisor = supervisor_for(workdir, "release");
+    supervisor.reconcile();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !marker.exists(),
+        "a stable build must ignore flags.json entirely"
+    );
+    supervisor.stop_all();
+}
+
+/// 只有注册表里的名字才能开：`read_at` 对未注册的键一律返回 `None`。
+/// supervisor 的测试因此不能自造 `demo_on`，只能用注册过的名字。
+#[test]
+fn an_unregistered_switch_key_stays_off_even_if_the_file_says_true() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    write_manifest(
+        &layout_for(workdir).manifests_dir(),
+        "demo",
+        &child,
+        "demo_on",
+    );
+    enable(workdir, "demo_on");
+
+    let mut supervisor = supervisor_for(workdir, "dev");
+    supervisor.reconcile();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !marker.exists(),
+        "a name that is not in the registry must never switch anything on"
     );
     supervisor.stop_all();
 }

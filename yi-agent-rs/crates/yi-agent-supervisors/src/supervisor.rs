@@ -5,7 +5,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::manifest::{SupervisorManifest, load_manifests};
-use crate::switch::{read_bool_key, resolve_bool};
 
 /// 监督运行所需的目录布局。目录名对外固定，方便清单的占位展开。
 ///
@@ -54,14 +53,6 @@ impl Layout {
     /// directory whose name is owned by one.
     pub fn logs_dir(&self) -> PathBuf {
         self.state_base.join("logs")
-    }
-
-    fn global_preferences_path(&self) -> Option<PathBuf> {
-        yi_agent_store::paths::home_join("preferences.json")
-    }
-
-    fn project_preferences_path(&self) -> PathBuf {
-        self.workdir.join(".yi-agent").join("preferences.json")
     }
 }
 
@@ -131,38 +122,64 @@ impl ChildLog {
 /// 按清单 + 开关键托管子进程。生命周期与 daemon 一致。
 pub struct Supervisor {
     layout: Layout,
+    /// 进程级构建类型，供 flag 的 stable 硬闸使用。
+    ///
+    /// **不能在这里调 `yi_agent_flags::build_kind()`**：那是进程级 `OnceLock`，
+    /// 只有 `yi-agent/src/main.rs` 注入过，测试里从未注入、恒为 `"release"`，
+    /// flag 永远读成关，测试就没法验"开"的那一半。与 `lead_gate` 是同一个坑。
+    build_kind: String,
     running: BTreeMap<String, RunningChild>,
     /// 一次 `spawn` 的暂存槽：先在无借用冲突处起进程，再搬进 `running`。
     spawned: Option<Child>,
     /// 与 `spawned` 配对：起进程时建好的日志，搬进 `running` 时一并带上。
     spawned_log: Option<ChildLog>,
+    /// `flags.json` 的位置。生产走 `flags_path()`，测试指向自己的临时目录。
+    ///
+    /// **刻意不是 `#[cfg(test)]`**：`tests/` 下的集成测试编译的是普通 lib，
+    /// `cfg(test)` 字段在那里根本不存在，注入也就无从谈起。
+    flags_path: Option<PathBuf>,
 }
 
 impl Supervisor {
-    pub fn new(layout: Layout) -> Self {
+    pub fn new(layout: Layout, build_kind: String) -> Self {
         Self {
             layout,
+            build_kind,
             running: BTreeMap::new(),
             spawned: None,
             spawned_log: None,
+            flags_path: None,
         }
+    }
+
+    /// 从指定的 `flags.json` 读开关。测试用；生产用 [`Supervisor::new`]。
+    pub fn with_flags_path(mut self, flags_path: PathBuf) -> Self {
+        self.flags_path = Some(flags_path);
+        self
     }
 
     pub fn running_count(&self) -> usize {
         self.running.len()
     }
 
-    /// 生效开关：项目层覆盖全局层，两层都缺省→关闭。
+    /// 生效开关：**只看全局 flag**。
+    ///
+    /// 项目层（`preferences.json`）故意不读：那个键由插件 daemon 自己写
+    /// （`switch.write`），停掉 daemon 就没人能把它打开，"关"会变成单向门。
+    /// 项目级的"这个项目干不干活"由插件自己解析。
     pub fn desired_on(&self, manifest: &SupervisorManifest) -> bool {
-        let global = self
-            .layout
-            .global_preferences_path()
-            .and_then(|path| read_bool_key(&path, &manifest.switch_key));
-        let project = read_bool_key(
-            &self.layout.project_preferences_path(),
-            &manifest.switch_key,
-        );
-        resolve_bool(global, project)
+        self.flag_on(&manifest.switch_key)
+    }
+
+    fn flag_on(&self, name: &str) -> bool {
+        let Some(path) = self
+            .flags_path
+            .clone()
+            .or_else(yi_agent_flags::store::flags_path)
+        else {
+            return false;
+        };
+        yi_agent_flags::store::status_at(&path, name, &self.build_kind, None).0
     }
 
     /// 一次对齐：重新扫描清单，起应起、停应停。
@@ -186,10 +203,15 @@ impl Supervisor {
 
         for manifest in manifests {
             if !self.desired_on(&manifest) {
-                // A process that must stay reachable to be turned back on is
-                // left running: "off" means "stop working", not "disappear".
-                // Stopping it would remove the query channel that reports and
-                // flips the switch, so off would never be recoverable in-app.
+                // 关着 = 停掉。声明了 query_socket 的进程在这里**本该**由
+                // `stop_when_disabled:false` 豁免，但看板场景下 daemon 必须退：
+                // 它在跑就会轮询看板，用户的"关掉"就不是真关掉。
+                //
+                // 恢复路径是安全的：重新打开走设置页的 `flags/set`，那条路是
+                // app-server 直接写 flags.json，不经过插件 daemon。原注释里
+                // "停掉就成了单向门"针对的是**项目层 preferences**——那时的
+                // 开关只能靠插件自己写。来源换了，单向门不成立了，注释必须
+                // 改掉，否则下一个人会照着旧结论把 daemon 又留下。
                 if !manifest.stop_when_disabled {
                     self.ensure_running(&manifest);
                     continue;
@@ -408,7 +430,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let workdir = dir.path();
         let manifest = write_manifest(workdir, "demo", "");
-        let mut supervisor = Supervisor::new(Layout::for_workdir(workdir));
+        let mut supervisor = Supervisor::new(Layout::for_workdir(workdir), "dev".to_string());
 
         // 第一次：初始退避 = restart_backoff_ms。
         let start = Instant::now();

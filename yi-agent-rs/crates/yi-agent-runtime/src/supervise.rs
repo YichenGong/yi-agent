@@ -105,7 +105,7 @@ pub fn serve(workdir: &Path, runtime_dir: &Path) -> SuperviseHandle {
         // 监督线程的 panic 不得拖垮宿主（TUI/桌面）——记录后结束，
         // `stop()` 仍能安全 join 到这个已结束的线程。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut supervisor = Supervisor::new(layout);
+            let mut supervisor = Supervisor::new(layout, yi_agent_flags::build_kind().to_string());
             while !flag.load(Ordering::SeqCst) {
                 supervisor.reconcile();
                 // 转发表只有运行中的、且声明了 query_socket 的插件才该出现；
