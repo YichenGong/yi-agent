@@ -146,6 +146,9 @@ fn a_git_project_gets_the_delegation_tools() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -230,6 +233,9 @@ fn a_git_project_gets_the_show_git_diff_tool() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling")
     .registry
@@ -286,6 +292,9 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling");
     let bash = tooling.registry.get("bash").expect("bash is registered");
@@ -351,6 +360,9 @@ fn the_assembly_hands_the_reply_registry_to_ask_lead() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling");
 
@@ -522,6 +534,9 @@ fn only_the_lead_sees_the_memory_tools() {
             crate::lead_control::LeadControlInbox::new(),
             crate::lead_control::LeadControlReplies::new(),
             None,
+            // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+            // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+            Some(true),
         )
         .expect("tooling")
     };
@@ -642,6 +657,9 @@ fn only_the_lead_sees_the_view_tools() {
             crate::lead_control::LeadControlInbox::new(),
             crate::lead_control::LeadControlReplies::new(),
             None,
+            // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+            // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+            Some(true),
         )
         .expect("tooling")
     };
@@ -716,6 +734,9 @@ fn only_the_lead_sees_the_control_tools() {
             crate::lead_control::LeadControlInbox::new(),
             crate::lead_control::LeadControlReplies::new(),
             None,
+            // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+            // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+            Some(true),
         )
         .expect("tooling")
     };
@@ -841,6 +862,9 @@ fn a_lead_in_a_repo_subdirectory_sees_the_memory_tools() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -919,6 +943,9 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling")
     .registry
@@ -1054,6 +1081,9 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         &crate::lead_control::LeadControlReplies::new(),
         // 这些测试直接调 attach_delegation，不起会话，故无起点。
         None,
+        // 组长开关：这些用例断言的是 root 复用，不涉组长工具，关着即可
+        // （也顺带钉住「关掉时装配不报错」）。
+        None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
     let second = attach_delegation(
@@ -1072,6 +1102,9 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         &crate::lead_control::LeadControlInbox::new(),
         &crate::lead_control::LeadControlReplies::new(),
         // 这些测试直接调 attach_delegation，不起会话，故无起点。
+        None,
+        // 组长开关：这些用例断言的是 root 复用，不涉组长工具，关着即可
+        // （也顺带钉住「关掉时装配不报错」）。
         None,
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
@@ -1869,6 +1902,96 @@ impl Harness {
         Self::with_config_and_scope(test_config(), build_test_agent, PERMISSION_TIMEOUT, scope)
     }
 
+    /// 指定组长开关的 harness（默认 cwd）。
+    ///
+    /// 默认（`new()` / `with_cfg`）一律是**关**——那是 stable 的行为，也是
+    /// fail-closed 的默认。需要组长能力的用例显式打开。
+    pub(crate) async fn with_lead_flag(enabled: bool) -> Self {
+        Self::with_config_lead_and_scope(
+            test_config(),
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            Scope::Admin,
+            enabled,
+        )
+    }
+
+    /// 自定义 config + 组长开关：需要指定 cwd 的用例用它。
+    pub(crate) async fn with_cfg_and_lead(cfg: RuntimeConfig, enabled: bool) -> Self {
+        Self::with_config_lead_and_scope(
+            cfg,
+            build_test_agent,
+            PERMISSION_TIMEOUT,
+            Scope::Admin,
+            enabled,
+        )
+    }
+
+    /// 自定义 config + agent 工厂 + 组长开关：`with_config` 的开关版。
+    pub(crate) async fn with_config_and_lead<F>(
+        cfg: RuntimeConfig,
+        build: F,
+        permission_timeout: Duration,
+        enabled: bool,
+    ) -> Self
+    where
+        F: Fn(
+                Option<yi_agent_core::Session>,
+                &std::path::Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::with_config_lead_and_scope(cfg, build, permission_timeout, Scope::Admin, enabled)
+    }
+
+    /// 带开关注入的完整构造：与 `with_config_and_scope` 同形，只多一个 bool。
+    fn with_config_lead_and_scope<F>(
+        cfg: RuntimeConfig,
+        build: F,
+        permission_timeout: Duration,
+        scope: Scope,
+        lead_agent_enabled: bool,
+    ) -> Self
+    where
+        F: Fn(
+                Option<yi_agent_core::Session>,
+                &std::path::Path,
+                crate::thread_store::ThreadMode,
+            ) -> anyhow::Result<BuiltAgent>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let calls: WatchmanCalls = Arc::new(StdMutex::new(Vec::new()));
+        let install_calls = Arc::clone(&calls);
+        let uninstall_calls = Arc::clone(&calls);
+        Self::with_config_and_scope_and_watchman(
+            cfg,
+            build,
+            permission_timeout,
+            scope,
+            Arc::new(move |_exe: &Path, home: &Path| {
+                install_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((true, home.to_path_buf()));
+                Ok(())
+            }),
+            Arc::new(move |home: &Path| {
+                uninstall_calls
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((false, home.to_path_buf()));
+                Ok(())
+            }),
+            calls,
+            lead_agent_enabled,
+        )
+    }
+
     /// 用注入的 watchman 安装/卸载行为搭建 harness。
     ///
     /// 默认 harness 的记录器只记账;要驱动「失败要回传 warning」这类分支,
@@ -1886,6 +2009,7 @@ impl Harness {
             install,
             uninstall,
             Arc::new(StdMutex::new(Vec::new())),
+            false,
         )
     }
 
@@ -1929,9 +2053,13 @@ impl Harness {
                 Ok(())
             }),
             calls,
+            false,
         )
     }
 
+    // 8 个参数：cfg + 工厂 + 超时 + scope + 两个 watchman 闭包 + 记录表 + 组长
+    // 开关。再拆一个 builder 只会让"哪些组合真的存在"更难读。
+    #[allow(clippy::too_many_arguments)]
     fn with_config_and_scope_and_watchman<F>(
         cfg: RuntimeConfig,
         build: F,
@@ -1940,6 +2068,10 @@ impl Harness {
         install: WatchmanInstall,
         uninstall: WatchmanUninstall,
         calls: WatchmanCalls,
+        // 组长开关。走这里注入而不是写 `flags.json`：后者要求 build_kind == "dev"
+        // 且共享进程级 `YI_AGENT_HOME`，并行测试必然互相污染；本 crate 的 lib
+        // 测试从不注入 build info，`build_kind()` 恒为 "release"，写文件也无效。
+        lead_agent_enabled: bool,
     ) -> Self
     where
         F: Fn(
@@ -2023,6 +2155,9 @@ impl Harness {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 models_path: models_dir.path().join("models.json"),
+                // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
+                // 那个构造器会把这个值换成 true。
+                lead_agent_enabled,
                 // 引导的 .env / preferences 也落在隔离目录里:onboarding/*
                 // 不得写开发者真实的 `~/.yi-agent`。
                 onboarding_env_path: index_dir.path().join(".env"),
@@ -3639,6 +3774,7 @@ async fn eof_exits_gracefully() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            lead_agent_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
@@ -3722,6 +3858,7 @@ async fn agent_factory_failure_returns_internal_error() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            lead_agent_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
@@ -3807,6 +3944,7 @@ async fn oversized_frame_returns_err() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            lead_agent_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
@@ -9242,6 +9380,279 @@ async fn isolated_harness() -> (Harness, tempfile::TempDir) {
     (Harness::with_cfg(cfg).await, dir)
 }
 
+/// 造一份已 attach 的 root，供「工具注册」断言复用。
+///
+/// 骨架照抄 `a_card_session_has_no_lead_to_ask`：真 git 仓库 +
+/// `attach_project_runtime` + `RuntimeBinding::managed`。工具集的唯一观测点是
+/// 装配产物的 `registry.names()`——本 crate 没有列举工具的 RPC。
+fn tooling_names_for(
+    repo: &std::path::Path,
+    runtime: &std::path::Path,
+    thread_id: &str,
+    project_key: String,
+    lead_agent_enabled: Option<bool>,
+) -> Vec<String> {
+    let mut cfg = test_config();
+    cfg.workdir = repo.to_path_buf();
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.to_path_buf(),
+            &isolated_models_path(runtime),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.to_path_buf(),
+        isolated_models_path(runtime),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+    build_runtime_tooling(
+        &cfg,
+        &root,
+        thread_id,
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        project_key,
+        crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
+        None,
+        lead_agent_enabled,
+    )
+    .expect("tooling")
+    .registry
+    .names()
+}
+
+/// 开关关掉时，**任何**会话都没有组长工具。
+///
+/// 这是「开关只能关不能开」的硬证据：普通会话拿不到 `ask_lead`，组长会话也
+/// 拿不到那 6 个工具。门禁加在装配期，所以这条断言直接覆盖
+/// `build_runtime_tooling` 的两个注册分支。
+#[test]
+fn no_lead_tools_exist_when_the_flag_is_off() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let project_key = repo.path().join(".yi-agent").display().to_string();
+
+    let plain = tooling_names_for(
+        repo.path(),
+        runtime.path(),
+        "thread-plain",
+        project_key.clone(),
+        Some(false),
+    );
+    assert!(
+        !plain.contains(&"ask_lead".to_string()),
+        "a plain session must have no ask_lead when the flag is off: {plain:?}"
+    );
+
+    // 组长会话：落一份真的 `role:"lead"` meta，让 `is_lead_thread` 为真。
+    let store = crate::thread_store::ThreadStore::new(repo.path());
+    let (lead_meta, _) = crate::lead::ensure_lead_meta(&store, repo.path()).expect("lead meta");
+    let lead = tooling_names_for(
+        repo.path(),
+        runtime.path(),
+        &lead_meta.thread_id,
+        project_key,
+        Some(false),
+    );
+    assert!(
+        !lead.iter().any(|n| n.contains("lead")),
+        "a lead must have no lead tools when the flag is off: {lead:?}"
+    );
+}
+
+/// 开关打开时，两类会话各拿各的工具，且互不越界。
+#[test]
+fn lead_tools_follow_the_flag() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let project_key = repo.path().join(".yi-agent").display().to_string();
+
+    let plain = tooling_names_for(
+        repo.path(),
+        runtime.path(),
+        "thread-plain",
+        project_key.clone(),
+        Some(true),
+    );
+    assert!(
+        plain.contains(&"ask_lead".to_string()),
+        "a plain session gets ask_lead when the flag is on: {plain:?}"
+    );
+    assert!(
+        !plain.contains(&"lead_remember".to_string()),
+        "the flag must not turn a plain session into a lead: {plain:?}"
+    );
+
+    let store = crate::thread_store::ThreadStore::new(repo.path());
+    let (lead_meta, _) = crate::lead::ensure_lead_meta(&store, repo.path()).expect("lead meta");
+    let lead = tooling_names_for(
+        repo.path(),
+        runtime.path(),
+        &lead_meta.thread_id,
+        project_key,
+        Some(true),
+    );
+    for name in [
+        "lead_remember",
+        "lead_recall",
+        "lead_list_threads",
+        "lead_read_thread",
+        "lead_interrupt_thread",
+        "lead_reject_thread",
+    ] {
+        assert!(
+            lead.contains(&name.to_string()),
+            "{name} must be registered for a lead when the flag is on: {lead:?}"
+        );
+    }
+    assert!(
+        !lead.contains(&"ask_lead".to_string()),
+        "a lead must not ask itself: {lead:?}"
+    );
+}
+
+/// `None`（装配方漏传）必须等价于关——失败关闭。
+#[test]
+fn a_missing_flag_value_registers_no_lead_tools() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let names = tooling_names_for(
+        repo.path(),
+        runtime.path(),
+        "thread-plain",
+        repo.path().join(".yi-agent").display().to_string(),
+        None,
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("lead")),
+        "a missing flag must fail closed: {names:?}"
+    );
+}
+
+/// 组长开关关掉时，`thread/lead` 必须是「方法不存在」，而不是「存在但拒绝」。
+///
+/// 前端据此只需看 `build/info` + `flags/list`，不必再判断权限；把错误码换成
+/// 「拒绝」会让前端多一条永远走不到的权限分支。
+#[tokio::test]
+async fn thread_lead_is_method_not_found_when_the_flag_is_off() {
+    let mut h = Harness::with_lead_flag(false).await;
+    initialize(&mut h).await;
+    let response = rpc(&mut h, 2, "thread/lead", json!({})).await;
+    assert_eq!(
+        response["error"]["code"],
+        json!(-32601),
+        "a disabled lead must look non-existent, not forbidden: {response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("thread/lead"),
+        "the error must name the method so the client can recognize it: {response}"
+    );
+    h.shutdown().await;
+}
+
+/// 开关关掉时**先判开关、后校参数**：传错参数也必须是 `-32601`。
+///
+/// 顺序反了的话，关掉开关时调用方会收到 `invalid_params`，看起来像自己写错了
+/// 参数，而不是「这个能力不存在」。
+#[tokio::test]
+async fn thread_lead_reports_not_found_before_validating_params_when_off() {
+    let mut h = Harness::with_lead_flag(false).await;
+    initialize(&mut h).await;
+    let response = rpc(&mut h, 2, "thread/lead", json!({ "cwd": 12345 })).await;
+    assert_eq!(
+        response["error"]["code"],
+        json!(-32601),
+        "the gate must run before param validation: {response}"
+    );
+    h.shutdown().await;
+}
+
+/// 开关打开时 `thread/lead` 仍然照常工作（门禁没有把它一起挡掉）。
+#[tokio::test]
+async fn thread_lead_still_works_when_the_flag_is_on() {
+    let (mut h, dir) = isolated_lead_harness().await;
+    initialize(&mut h).await;
+    let response = rpc(
+        &mut h,
+        2,
+        "thread/lead",
+        json!({ "cwd": dir.path().display().to_string() }),
+    )
+    .await;
+    assert!(
+        response["result"]["thread_id"].is_string(),
+        "with the flag on, thread/lead must answer as before: {response}"
+    );
+    h.shutdown().await;
+}
+
+/// 同 [`isolated_harness`]，但组长开关**打开**。
+///
+/// 组长相关用例必须用它：默认 harness 的开关是关的（= stable 行为），
+/// 关掉时 `thread/lead` 返回 `-32601`，那些用例测的东西根本不存在。
+async fn isolated_lead_harness() -> (Harness, tempfile::TempDir) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = crate::test_support::test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    (Harness::with_cfg_and_lead(cfg, true).await, dir)
+}
+
+/// 开关关掉时，`thread/listAll` 绝不能**往磁盘上**种组长。
+///
+/// 这是最容易漏的一条：响应里不带组长条目很容易做到（过滤即可），但
+/// `scan_workspace_metas` 会在列举空项目时顺手 `ensure_lead_meta`。副作用一旦
+/// 落盘，关掉开关也删不掉，用户会看到一个个空的"组长"冒出来。故这里断言的是
+/// **磁盘**，不是响应。
+///
+/// 直接测纯函数而不走 `thread/listAll`：索引在 `serve` 内部，测试无法注入
+/// 一个"空项目"；而种不种组长恰好是这个函数唯一的分支。
+#[test]
+fn list_all_does_not_seed_a_lead_when_the_flag_is_off() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let dirs = vec![dir.path().display().to_string()];
+
+    let _ = crate::rpc::thread::scan_workspace_metas_for_test(&dirs, false);
+    assert!(
+        !has_lead_meta(dir.path()),
+        "a disabled flag must not write a lead meta to disk"
+    );
+
+    // 正向对照：同一个目录、同一个函数，只把开关打开就必须种出来。
+    // 没有这一半的话，上面那条在"函数根本不种组长"时也会通过。
+    let _ = crate::rpc::thread::scan_workspace_metas_for_test(&dirs, true);
+    assert!(
+        has_lead_meta(dir.path()),
+        "with the flag on, an empty project must still get its lead"
+    );
+}
+
+/// 磁盘上是否已有一份 `role: "lead"` 的 meta。
+fn has_lead_meta(project: &std::path::Path) -> bool {
+    crate::thread_store::ThreadStore::new(project)
+        .list()
+        .map(|metas| {
+            metas
+                .iter()
+                .any(|m| m.role.as_deref() == Some(crate::thread_store::LEAD_ROLE))
+        })
+        .unwrap_or(false)
+}
+
 /// 列表扫描必须离开主循环：扫描卡住时，其它 RPC 仍然能被处理。
 ///
 /// 判据是**确定性**的：`ThreadStore::list` 用 `read_to_string` 逐个读
@@ -9302,7 +9713,7 @@ async fn list_all_scan_does_not_block_the_main_loop() {
 /// `thread/lead` 必须幂等:同一 cwd 反复调用只造一个组长,第二次 `created=false`。
 #[tokio::test(flavor = "multi_thread")]
 async fn thread_lead_is_idempotent_per_project() {
-    let (mut h, _dir) = isolated_harness().await;
+    let (mut h, _dir) = isolated_lead_harness().await;
     h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
     let _ = read_response(&mut h, 1).await;
@@ -9334,7 +9745,7 @@ async fn thread_lead_is_idempotent_per_project() {
 /// 组长必须出现在 `thread/listAll` 的目录分组里,否则侧栏点不进去。
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lead_appears_in_list_all() {
-    let (mut h, dir) = isolated_harness().await;
+    let (mut h, dir) = isolated_lead_harness().await;
     h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
     let _ = read_response(&mut h, 1).await;
@@ -9360,7 +9771,7 @@ async fn the_lead_appears_in_list_all() {
 /// 也必须能被拉起(driver 按需建)。
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delivered_message_reaches_the_lead_thread() {
-    let (mut h, _dir) = isolated_harness().await;
+    let (mut h, _dir) = isolated_lead_harness().await;
     h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
     let _ = read_response(&mut h, 1).await;
@@ -9830,13 +10241,16 @@ async fn echo_lead_harness() -> (
     let factory_provider: Arc<dyn yi_agent_core::Provider> = provider.clone();
     let mut cfg = test_config();
     cfg.workdir = dir.path().to_path_buf();
-    let mut h = Harness::with_config(
+    // 组长开关打开：这个 fixture 后面要 `thread/lead`，关着会拿到 -32601。
+    let mut h = Harness::with_config_and_lead(
         cfg,
         move |session, cwd, mode| {
             build_test_agent_with_provider(Arc::clone(&factory_provider), session, cwd, mode)
         },
         PERMISSION_TIMEOUT,
-    );
+        true,
+    )
+    .await;
     h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
     let _ = read_response(&mut h, 1).await;
@@ -10065,11 +10479,13 @@ async fn a_foreground_request_makes_the_background_turn_yield() {
     });
     let mut cfg = test_config();
     cfg.workdir = dir.path().to_path_buf();
-    let mut h = Harness::with_config(
+    let mut h = Harness::with_config_and_lead(
         cfg,
         gated_lead_factory(Arc::clone(&provider)),
         PERMISSION_TIMEOUT,
-    );
+        true,
+    )
+    .await;
     h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
     let _ = read_response(&mut h, 1).await;
@@ -10316,11 +10732,13 @@ async fn a_cold_lead_delivery_restores_the_persisted_history() {
     let mut h1 = {
         let mut cfg = test_config();
         cfg.workdir = workdir.clone();
-        Harness::with_config(
+        Harness::with_config_and_lead(
             cfg,
             recording_agent_factory(Arc::clone(&seen_1)),
             PERMISSION_TIMEOUT,
+            true,
         )
+        .await
     };
     h1.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
@@ -10345,11 +10763,13 @@ async fn a_cold_lead_delivery_restores_the_persisted_history() {
     let mut h2 = {
         let mut cfg = test_config();
         cfg.workdir = workdir.clone();
-        Harness::with_config(
+        Harness::with_config_and_lead(
             cfg,
             recording_agent_factory(Arc::clone(&seen_2)),
             PERMISSION_TIMEOUT,
+            true,
         )
+        .await
     };
     h2.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
@@ -12004,7 +12424,8 @@ async fn thread_rename_does_not_change_lead_title() {
     std::fs::create_dir_all(&project).unwrap();
     let mut cfg = test_config();
     cfg.workdir = project.clone();
-    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let mut h =
+        Harness::with_config_and_lead(cfg, build_test_agent, PERMISSION_TIMEOUT, true).await;
     initialize(&mut h).await;
 
     let lead = rpc(&mut h, 2, "thread/lead", json!({})).await;
@@ -15360,6 +15781,9 @@ fn delegation_tooling_carries_the_theme_tool() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling");
     assert!(
@@ -15867,6 +16291,9 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling");
     // Taken *before* the rebuild: a clone shares the caller slot the tools
@@ -16187,6 +16614,7 @@ impl MergedHarness {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 models_path: PathBuf::new(),
+                lead_agent_enabled: false,
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
@@ -17058,7 +17486,7 @@ async fn workspace_list_reports_linked_to() {
 /// `role` 必须在列表条目上暴露;普通会话不得带该 key(旧客户端字节兼容)。
 #[tokio::test(flavor = "multi_thread")]
 async fn list_all_exposes_the_lead_role_only_for_the_lead() {
-    let (mut h, _dir) = isolated_harness().await;
+    let (mut h, _dir) = isolated_lead_harness().await;
     h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
         .await;
     let _ = read_response(&mut h, 1).await;
@@ -17161,7 +17589,9 @@ async fn thread_lead_refuses_to_create_a_lead_in_a_card_worktree() {
     let project = git_project(&dir.path().join("proj"));
     let wt = git_kanban_worktree(&project, "card-1");
 
-    let mut h = Harness::new();
+    // 开关打开：这条用例钉的是「卡片 worktree 不种组长」，关掉开关时
+    // 它会被上一步的 -32601 提前挡掉，测不到目标逻辑。
+    let mut h = Harness::with_lead_flag(true).await;
     initialize(&mut h).await;
 
     let v = rpc(
@@ -17314,6 +17744,9 @@ fn a_card_session_does_not_get_ask_lead() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling")
     .registry
@@ -17338,6 +17771,9 @@ fn a_card_session_does_not_get_ask_lead() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling")
     .registry
@@ -17400,6 +17836,9 @@ fn a_merge_round_session_does_not_get_ask_lead() {
         crate::lead_control::LeadControlInbox::new(),
         crate::lead_control::LeadControlReplies::new(),
         None,
+        // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+        // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+        Some(true),
     )
     .expect("tooling")
     .registry
@@ -17471,6 +17910,9 @@ fn the_lead_does_not_get_ask_lead() {
             crate::lead_control::LeadControlInbox::new(),
             crate::lead_control::LeadControlReplies::new(),
             None,
+            // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
+            // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
+            Some(true),
         )
         .expect("tooling")
     };

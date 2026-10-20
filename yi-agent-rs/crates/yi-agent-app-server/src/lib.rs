@@ -11,6 +11,7 @@ pub mod lead;
 // 注册的两个组长工具与主循环的 `select!` 消费分支接线。
 pub mod flags_rpc;
 pub(crate) mod lead_control;
+pub mod lead_gate;
 pub(crate) mod lead_index;
 pub(crate) mod lead_loop;
 pub mod lead_memory;

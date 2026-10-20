@@ -241,6 +241,13 @@ pub(crate) struct RuntimeAttachments {
     /// is: `model/*` must be testable without writing the developer's real
     /// machine-level catalog (and its API keys).
     pub(crate) models_path: PathBuf,
+    /// 组长开关的**生效值**，装配时算一次。
+    ///
+    /// 只放结论、不放路径：若把 `flags.json` 路径传下来再让 `serve()` 解析，
+    /// 就会用到进程级 `build_kind()`（测试里恒为 `release`），注入永远失效。
+    /// 生产的构造点统一调 [`crate::lead_gate::from_process_environment`]，
+    /// 测试直接给 `true` / `false`。
+    pub(crate) lead_agent_enabled: bool,
     /// Where the global `.env` lives, for `onboarding/apply`. Injectable for the
     /// same reason `models_path` is: onboarding must never write the developer's
     /// real `~/.yi-agent/.env`.
@@ -537,6 +544,9 @@ pub(crate) fn attach_delegation(
     // 才知道自己在哪个分支——新建取 `session_anchor(cwd)`,resume 取已落盘 meta
     // 的 `anchor_sha`(旧会话没有该字段时传 `None`,表示「无起点」,不回填)。
     anchor_sha: Option<String>,
+    // 组长开关。逐调用传入，理由同 `anchor_sha`：装配期定值，会话存续期间不再变
+    // （开关变更靠 resume 生效）。
+    lead_agent_enabled: Option<bool>,
     built: BuiltAgent,
 ) -> Activation {
     let mut thread_cfg = cfg.clone();
@@ -601,6 +611,7 @@ pub(crate) fn attach_delegation(
         lead_control.clone(),
         lead_control_replies.clone(),
         anchor_sha,
+        lead_agent_enabled,
     ) {
         Ok(tooling) => Activation {
             built: wrap_for_delegation(built, tooling),
@@ -1139,6 +1150,9 @@ fn build_runtime_tooling(
     // 本会话的起点 sha：`show_git_diff` 默认按它算 diff，并在回执里如实报出。
     // 与 project_key 同理——模型看不到会话元数据，装配期注入是唯一来源。
     anchor_sha: Option<String>,
+    // 组长开关。`None` = 装配方漏传，按关处理（fail closed）。这里不读
+    // `yi_agent_flags::is_enabled`：那是进程级量，见 `lead_gate` 的模块文档。
+    lead_agent_enabled: Option<bool>,
 ) -> Result<RuntimeTooling, String> {
     // The tools get the root handle itself, not its snapshot: they re-resolve
     // the live socket and this conversation's own root on every call.
@@ -1214,9 +1228,12 @@ fn build_runtime_tooling(
     //   判定复用下面的 `is_lead_thread`(落盘 `ThreadMeta.role`,唯一权威),与
     //   lead_memory 的注册同源;组长要影响自己直接写即可,不需要这个工具。
     let is_lead = crate::lead_memory::is_lead_thread(&store, thread_id);
+    // 组长开关只做「与」运算：它能让组长能力消失，**不能**把一个普通会话变成
+    // 组长（那条链路的唯一权威仍是落盘 `ThreadMeta.role`）。
+    let lead_enabled = crate::lead_gate::is_lead_agent_enabled(lead_agent_enabled);
     let state_dir = Path::new(&project_key);
     let session_cwd = state_dir.parent().unwrap_or(state_dir);
-    if !is_lead && !crate::plugin_worktree::is_plugin_worktree(session_cwd) {
+    if lead_enabled && !is_lead && !crate::plugin_worktree::is_plugin_worktree(session_cwd) {
         registry.register(Arc::new(
             // `project_key` 克隆而非 move:下面的 `if is_lead` 分支也要用它,而借用
             // 检查器不做「两分支互斥」的路径分析,任何一侧 move 都会让另一侧报
@@ -1241,7 +1258,7 @@ fn build_runtime_tooling(
     // ③ 若留成 git toplevel,`<repo>` 与 `<repo>/sub` 两个不同 project_key(两个
     //    不同组长)会共用同一份 `<repo>/.yi-agent/lead_memory/memory.md`,跨项目
     //    账本串味。
-    if is_lead {
+    if lead_enabled && is_lead {
         let project_root = cfg.workdir.clone();
         registry.register(Arc::new(crate::lead_memory::LeadRememberTool::new(
             project_root.clone(),
@@ -1710,6 +1727,8 @@ where
             runtimes,
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
+            // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
+            lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
@@ -1796,6 +1815,8 @@ where
             runtimes,
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
+            // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
+            lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
@@ -2252,6 +2273,35 @@ mod legacy_migration_tests {
         migrate_legacy_registry_file(&board_dir.join("boards.json"), &resident_dir);
 
         assert!(!board_dir.join("boards.json.migrated").exists());
+    }
+
+    /// 组长 tick 臂必须受开关控制。
+    ///
+    /// 这一臂驱动的是"算 digest → 投递 → 起 turn"，全是组长的副作用；关掉开关
+    /// 后它必须整体空转。它没有可注入的观测点（`lead_ticker` 在 `serve` 内部），
+    /// 故只能按源码断言——与上面那条"生产入口有没有调迁移"同一手法。
+    #[test]
+    fn the_lead_tick_arm_is_gated_by_the_flag() {
+        // 不走 `production_source()`：它在**本测试模块之前**截断，而 tick 臂在
+        // `serve()` 里、位于本模块之后。改用完整源码，并取**最后一处**——本
+        // 测试自己的 `.split("...")` 字面量也是一次命中，只有生产代码那处才在
+        // 它后面还有 `if !lead_agent_enabled`。
+        let source = include_str!("server.rs");
+        let arm = source
+            .rsplit("_ = lead_ticker.tick() => {")
+            .next()
+            .expect("the ticker arm must still exist");
+        assert_ne!(arm.len(), source.len(), "the ticker arm must still exist");
+        let head: String = arm
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            head.contains("if !lead_agent_enabled") && head.contains("continue"),
+            "the ticker arm must short-circuit when the flag is off, got:\n{head}"
+        );
     }
 
     /// 生产源码:截到本测试模块之前,并去掉注释行。
@@ -2877,6 +2927,10 @@ where
         lead_replies,
         lead_control,
         lead_control_replies,
+        // 结论由装配方算好：生产走 `from_process_environment`，测试直接给值。
+        // `serve()` 不再解析——它看得到的 `build_kind()` 是进程级的，测试里恒为
+        // `release`，在那儿解析会让注入永远失效。
+        lead_agent_enabled,
     } = attachments;
     // 进程级探测去重表：整个主循环共用一份，`model/probe` 与 `model/upsert`
     // 的后台探测都从这里 `try_begin`。只活在内存里，重启即清空。
@@ -3184,6 +3238,7 @@ where
                             lead_replies: &lead_replies,
                             lead_control: &lead_control,
                             lead_control_replies: &lead_control_replies,
+                            lead_agent_enabled,
                             pending_lead_replies: &mut pending_lead_replies,
                         }
                     };
@@ -3490,10 +3545,17 @@ where
                     &lead_replies,
                     &lead_control,
                     &lead_control_replies,
+                    lead_agent_enabled,
                 )
                 .await;
             }
             _ = lead_ticker.tick() => {
+                // 关掉组长时这一臂整体空转:底下要算 digest、要投递、要起 turn,
+                // 全是为组长存在的。**continue 而不是 return**——主循环还得
+                // 继续服务其它 RPC。
+                if !lead_agent_enabled {
+                    continue;
+                }
                 // 组长后台循环的兜底轮,照看板 tick 内联跑:启动一轮要拿
                 // `&mut threads`(投递走 `deliver_to_lead`),而 `threads` 是主循环
                 // 独占的局部量,`tokio::spawn` 会拆掉这条前提(spec §6.1)。
@@ -3525,6 +3587,7 @@ where
                         runtimes: &runtimes,
                         thread_roots: &thread_roots,
                         models_path: &models_path,
+                        lead_agent_enabled,
                         cfg: &cfg,
                         hub: &hub,
                         turn_tx: &turn_tx,
@@ -3579,6 +3642,7 @@ where
                     runtimes: &runtimes,
                     thread_roots: &thread_roots,
                     models_path: &models_path,
+                    lead_agent_enabled,
                     cfg: &cfg,
                     hub: &hub,
                     turn_tx: &turn_tx,
@@ -3624,6 +3688,7 @@ where
                     runtimes: &runtimes,
                     thread_roots: &thread_roots,
                     models_path: &models_path,
+                    lead_agent_enabled,
                     cfg: &cfg,
                     hub: &hub,
                     turn_tx: &turn_tx,
@@ -5465,6 +5530,9 @@ async fn driver_tick<F>(
     lead_replies: &crate::lead::LeadReplies,
     lead_control: &crate::lead_control::LeadControlInbox,
     lead_control_replies: &crate::lead_control::LeadControlReplies,
+    // 组长开关：被驱动的会话与手工会话必须是同一个判定，否则「关掉开关」
+    // 只对用户手工开的会话生效，而看板/驱动会话仍会注册组长工具。
+    lead_agent_enabled: bool,
 ) where
     F: Fn(
         Option<yi_agent_core::Session>,
@@ -5512,6 +5580,7 @@ async fn driver_tick<F>(
                 runtimes,
                 thread_roots,
                 models_path,
+                lead_agent_enabled,
                 cfg,
                 hub,
                 turn_tx,
@@ -5671,6 +5740,9 @@ struct ServeLauncher<'a, F> {
     /// 写结果登记表：与 `lead_control` 成对转交（工具侧登记 `request_id`，主循环
     /// 执行完回填）。只传通道而不传登记表，组长那侧将永远等不到结果。
     lead_control_replies: &'a crate::lead_control::LeadControlReplies,
+    /// 组长开关的生效值。交给 `start_thread_core`，使被驱动的会话与手工会话
+    /// 用同一个判定。
+    lead_agent_enabled: bool,
 }
 
 /// 一次组长投递的目标:该项目当前应承载消息的组长 thread。
@@ -5821,6 +5893,7 @@ where
             self.lead_replies,
             self.lead_control,
             self.lead_control_replies,
+            Some(self.lead_agent_enabled),
         )
         .await?;
 
@@ -6160,6 +6233,7 @@ where
             self.lead_replies,
             self.lead_control,
             self.lead_control_replies,
+            Some(self.lead_agent_enabled),
         )
         .await?;
 
@@ -6428,6 +6502,9 @@ pub(crate) async fn start_thread_core(
     // 通道。
     lead_control: &crate::lead_control::LeadControlInbox,
     lead_control_replies: &crate::lead_control::LeadControlReplies,
+    // 组长开关。由调用方从实例状态取好后传入（见 `lead_gate` 的模块文档：
+    // 不在这里读全局量，那在并行测试里会互相污染）。
+    lead_agent_enabled: Option<bool>,
 ) -> anyhow::Result<()> {
     let thread_store = Arc::new(crate::thread_store::ThreadStore::new(Path::new(cwd)));
 
@@ -6460,6 +6537,7 @@ pub(crate) async fn start_thread_core(
         lead_control_replies,
         // 新建路径：起点就是刚刚取的 HEAD。
         anchor_sha.clone(),
+        lead_agent_enabled,
         built,
     );
     let BuiltAgent {
@@ -7945,6 +8023,8 @@ mod session_driver_tests {
         lead_control: crate::lead_control::LeadControlInbox,
         /// 该 launcher 的写结果登记表,同一理由:测试不投递,空表即可。
         lead_control_replies: crate::lead_control::LeadControlReplies,
+        /// 组长开关。默认关 = stable 行为；需要组长工具的用例显式置 true。
+        lead_agent_enabled: bool,
         _workdir_dir: tempfile::TempDir,
         _theme_dir: tempfile::TempDir,
         _workspace_dir: tempfile::TempDir,
@@ -7979,6 +8059,7 @@ mod session_driver_tests {
                 lead_replies: crate::lead::LeadReplies::new(),
                 lead_control: crate::lead_control::LeadControlInbox::new(),
                 lead_control_replies: crate::lead_control::LeadControlReplies::new(),
+                lead_agent_enabled: false,
                 _workdir_dir: workdir_dir,
                 _theme_dir: theme_dir,
                 _workspace_dir: workspace_dir,
@@ -7998,6 +8079,7 @@ mod session_driver_tests {
                 lead_replies: &self.lead_replies,
                 lead_control: &self.lead_control,
                 lead_control_replies: &self.lead_control_replies,
+                lead_agent_enabled: self.lead_agent_enabled,
                 lead_target: None,
                 threads: &mut self.threads,
                 pending_activation: &mut self.pending_activation,
@@ -8104,6 +8186,7 @@ mod session_driver_tests {
                 &self.lead_replies,
                 &self.lead_control,
                 &self.lead_control_replies,
+                self.lead_agent_enabled,
             )
             .await;
         }

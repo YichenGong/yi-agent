@@ -143,6 +143,7 @@ export function ThreadSidebar({
   onUnlinkFolder,
   isMobile = false,
   statusStale = false,
+  leadAgentEnabled = true,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -187,6 +188,13 @@ export function ThreadSidebar({
   /** 内容来自缓存、尚未与服务器对齐时置 true：徽标降透明并标注"可能过期"。
    * 仅手机端离线时为 true；桌面端恒为 false，渲染逐字节不变。 */
   statusStale?: boolean;
+  /**
+   * 组长功能是否开启（`flags/list` 里的 `lead_agent`）。
+   *
+   * 缺省 `true`：这个组件的既有用法（含测试）都不传它，缺省成 `false` 会让
+   * 所有既有侧栏渲染突然少一行组长。生产路径由 `App` 显式传入真实开关值。
+   */
+  leadAgentEnabled?: boolean;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -757,7 +765,10 @@ export function ThreadSidebar({
   // 会让人以为是两个入口。判定规则与服务端 `ThreadStore::find_lead` 一致
   // （`role === "lead"` 且 `created_at` 最小），未知 role 一律忽略。
   const lead = findLeadThread(groups.flatMap((g) => g.threads));
-  const leadId = lead?.thread_id ?? null;
+  // 开关关掉时把 `leadId` 一并置空，**不只是**不渲染那一行：`leadId` 还用于
+  // 从普通分组里剔除组长会话（同一条会话不能出现两次）。只藏不剔的话，组长
+  // 会话会从两处都消失——用户看到的是"我的会话不见了"。
+  const leadId = leadAgentEnabled ? (lead?.thread_id ?? null) : null;
 
   // 组长行：与普通会话行同构（同样的状态徽标、标题、相对时间、未读点、点击选
   // 中），只多一个 `data-lead-row` 标记并去掉图钉/删除按钮——组长是项目级的固
@@ -825,6 +836,7 @@ export function ThreadSidebar({
   // haystack：标题 + 目录名 + 完整路径），避免出现「搜到了组内会话、组长却
   // 凭空消失」或反之的分歧。无查询时 `filterThreadTree` 原样返回，恒可见。
   const leadVisible =
+    leadAgentEnabled &&
     lead !== null &&
     filterThreadTree(
       [{ workspace: lead.cwd, exists: true, threads: [lead] }],

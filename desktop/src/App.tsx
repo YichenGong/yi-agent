@@ -210,6 +210,17 @@ export default function App() {
    * 这个值在一次连接内不会变，故握手时读一次就够。
    */
   const [buildKind, setBuildKind] = useState<"dev" | "release" | "nogit" | null>(null);
+  /**
+   * 组长功能开关（`flags/list` 里的 `lead_agent`）。`null` = 还不知道。
+   *
+   * 与 `buildKind` 不同，这里读的是**开关值**而不是构建类型：stable 上这个
+   * flag 恒为关（服务端 `status_at` 的第一条就把它挡掉了），所以不需要再判
+   * `buildKind`。读失败按关处理——服务端关掉时会话里根本没有组长。
+   *
+   * 只有 `=== true` 才算开：`null` 时既不能补建组长（会对 stable 发一个必然
+   * 返回 -32601 的请求），也不能提前把侧栏的组长行藏起来。
+   */
+  const [leadAgentEnabled, setLeadAgentEnabled] = useState<boolean | null>(null);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
@@ -1401,6 +1412,21 @@ export default function App() {
         } catch {
           setBuildKind("release");
         }
+        // 组长开关：与 `build/info` 同一时机读一次。失败按关处理（fail-closed），
+        // 与 Rust 侧 `is_lead_agent_enabled(None)` 同一口径。
+        // 局部量而不是直接读 state：`setLeadAgentEnabled` 要下一次渲染才生效，
+        // 而本函数后面的补建循环就在**这一轮**里跑，读 state 拿到的还是 `null`。
+        let leadOn = false;
+        try {
+          const flags = await client.request<{
+            flags?: Array<{ name?: unknown; enabled?: unknown }>;
+          }>("flags/list", {});
+          const lead = (flags.flags ?? []).find((f) => f.name === "lead_agent");
+          leadOn = lead?.enabled === true;
+        } catch {
+          leadOn = false;
+        }
+        setLeadAgentEnabled(leadOn);
         const settings = await client.request<{
           theme?: unknown;
           resident_daemon_watchman_enabled?: unknown;
@@ -1460,7 +1486,7 @@ export default function App() {
         // 来。**不 await 在首屏关键路径上**——补组长是锦上添花，绝不能推迟首屏
         // 渲染或扣住后续的 selectThread；失败一律忽略。只在整个进程里补一次
         // （`leadEnsured`），服务端创建本身幂等。
-        if (!leadEnsured.current) {
+        if (!leadEnsured.current && leadOn) {
           const needsLead = list.groups.filter(
             (g) => g.exists && !g.threads.some((t) => t.role === "lead"),
           );
@@ -2159,6 +2185,7 @@ export default function App() {
           onOpenSettings={() => prefs.setSettingsOpen(true)}
           onLinkFolder={linkFolder}
           onUnlinkFolder={unlinkFolder}
+          leadAgentEnabled={leadAgentEnabled === true}
         />
         </div>
         <div className="app-main relative flex min-w-0 flex-1 flex-col">
