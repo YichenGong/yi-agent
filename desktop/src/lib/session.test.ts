@@ -358,24 +358,49 @@ describe("Session", () => {
 
     it("carries a structured config payload on a notice", () => {
       const s = new Session();
-      s.noticeConfig({ model: "m" });
+      s.noticeBody({ kind: "config", data: { model: "m" }, error: null });
       const item = s.items[0] as {
         type: string;
         text: string;
-        config?: { data?: unknown; error?: unknown };
+        body?: { kind: string; data?: unknown; error?: unknown };
       };
       expect(item.type).toBe("notice");
       expect(item.text).toBe("");
-      expect(item.config?.data).toEqual({ model: "m" });
-      expect(item.config?.error).toBeNull();
+      expect(item.body?.kind).toBe("config");
+      expect(item.body?.data).toEqual({ model: "m" });
+      expect(item.body?.error).toBeNull();
     });
 
     it("carries a config read error", () => {
       const s = new Session();
-      s.noticeConfig(null, "boom");
-      const item = s.items[0] as { config?: { data?: unknown; error?: unknown } };
-      expect(item.config?.data).toBeNull();
-      expect(item.config?.error).toBe("boom");
+      s.noticeBody({ kind: "config", data: null, error: "boom" });
+      const item = s.items[0] as {
+        body?: { kind: string; data?: unknown; error?: unknown };
+      };
+      expect(item.body?.kind).toBe("config");
+      expect(item.body?.data).toBeNull();
+      expect(item.body?.error).toBe("boom");
+    });
+
+    it("carries a help payload with no target", () => {
+      const s = new Session();
+      s.noticeBody({ kind: "help", target: null, error: null });
+      const item = s.items[0] as {
+        text: string;
+        body?: { kind: string; target?: unknown; error?: unknown };
+      };
+      // 卡片就是呈现：`text` 保持空串，没有别的消费者读它。
+      expect(item.text).toBe("");
+      expect(item.body?.kind).toBe("help");
+      expect(item.body?.target).toBeNull();
+      expect(item.body?.error).toBeNull();
+    });
+
+    it("carries a help error line", () => {
+      const s = new Session();
+      s.noticeBody({ kind: "help", target: null, error: "未知命令: /nope" });
+      const item = s.items[0] as { body?: { error?: unknown } };
+      expect(item.body?.error).toBe("未知命令: /nope");
     });
   });
 

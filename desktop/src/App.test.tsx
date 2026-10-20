@@ -1025,7 +1025,7 @@ describe("App send recovery from a status disagreement", () => {
 });
 
 describe("App slash commands", () => {
-  it("renders /help output as a notice without touching the agent", async () => {
+  it("renders /help as a grouped card without touching the agent", async () => {
     render(<App />);
     await waitFor(() =>
       expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
@@ -1035,10 +1035,47 @@ describe("App slash commands", () => {
     fireEvent.change(textarea, { target: { value: "/help" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    await screen.findByText(/可用命令:/);
+    await screen.findByTestId("help-card");
+    expect(screen.getByText("可用命令")).toBeTruthy();
+    // 分组骨架：三组标题都在，命令说明也在。
+    expect(screen.getByText("会话")).toBeTruthy();
+    expect(screen.getByText("状态")).toBeTruthy();
+    expect(screen.getByText("清空对话上下文")).toBeTruthy();
     expect(
       clients[0].requests.some((r) => r.method === "turn/start"),
     ).toBe(false);
+  });
+
+  it("renders /help <command> as that command's detail card", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/help cost" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByText("命令 /cost");
+    expect(screen.getByText("显示 token 使用量")).toBeTruthy();
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
+  });
+
+  it("renders an unknown slash command as the same help card with an error line", async () => {
+    // 打错一个字符不该掉回旧的纯文本形态：`/nope` 与 `/help nope` 同一张卡。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/nope" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    await screen.findByTestId("help-card");
+    expect(screen.getByText("未知命令: /nope")).toBeTruthy();
+    expect(screen.getByText("清空对话上下文")).toBeTruthy();
+    expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
   });
 
   it("renders /config as a card without touching the agent", async () => {

@@ -41,11 +41,23 @@ export interface NoticeItem {
    */
   level?: "Info" | "Warn";
   /**
-   * 结构化载荷。`/config` 用它携带 `config/read` 的原始结果（或读取错误），
-   * 由 `ChatView` 渲染成一张配置卡片。缺省即普通文本 notice。
+   * 结构化载荷：`ChatView` 按 `kind` 分派渲染成对应卡片，缺省即普通文本 notice。
+   *
+   * 判别联合而不是两个并列的可选字段（`config?` + `help?`）：一张卡片只有一种
+   * 载荷，并列字段会允许「两个都填」这种无意义状态。
    */
-  config?: { data?: Record<string, unknown> | null; error?: string | null };
+  body?: NoticeBody;
 }
+
+/**
+ * notice 携带的卡片载荷。
+ *
+ * - `config`：`/config` 的 `config/read` 原始结果（或读取错误）。
+ * - `help`：`/help` 的目录/详情；`error` 非空时先显示错误行（未知目标、未知命令）。
+ */
+export type NoticeBody =
+  | { kind: "config"; data: Record<string, unknown> | null; error: string | null }
+  | { kind: "help"; target: string | null; error: string | null };
 
 /**
  * 一段累积的思维链（CoT）。**本地展示条目，不是 wire `Item`**：服务端在实时期间
@@ -343,19 +355,13 @@ export class Session {
   }
 
   /**
-   * Append a command-output notice that carries structured data — `/config`
-   * hands over the raw `config/read` result (or its error) for `ChatView` to
-   * render as a card. `text` stays empty: the card is the presentation, and no
-   * other consumer reads it.
+   * Append a command-output notice that carries structured data for `ChatView`
+   * to render as a card (`/config`, `/help`). `text` stays empty: the card is
+   * the presentation, and no other consumer reads it.
    */
-  noticeConfig(data: Record<string, unknown> | null, error?: string | null): void {
+  noticeBody(body: NoticeBody): void {
     this.breakReasoningRun();
-    this.items.push({
-      type: "notice",
-      id: nextLocalId(),
-      text: "",
-      config: { data, error: error ?? null },
-    });
+    this.items.push({ type: "notice", id: nextLocalId(), text: "", body });
   }
 
   /**

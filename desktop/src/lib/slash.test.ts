@@ -3,7 +3,7 @@ import {
   SLASH_COMMANDS,
   filterCommands,
   parseSlashInput,
-  renderHelp,
+  HELP_GROUPS,
 } from "./slash";
 
 describe("slash command catalog", () => {
@@ -67,20 +67,16 @@ describe("parseSlashInput", () => {
   });
 });
 
-describe("renderHelp", () => {
-  it("lists every command with usage and description", () => {
-    const text = renderHelp();
-    for (const c of SLASH_COMMANDS) {
-      expect(text).toContain(`/${c.name}`);
-      expect(text).toContain(c.description);
-    }
+describe("help groups", () => {
+  it("flattens to exactly the command catalog, with no duplicates", () => {
+    // 分组是呈现层，允许按用途重排，但每条命令必须恰好出现一次：不漏、不重。
+    // 新增命令却忘了分组时，这条测试直接红。
+    const flat = HELP_GROUPS.flatMap((g) => g.commands);
+    expect(new Set(flat)).toEqual(new Set(SLASH_COMMANDS.map((c) => c.name)));
+    expect(flat).toHaveLength(SLASH_COMMANDS.length);
   });
 
-  it("describes one command when given a target", () => {
-    expect(renderHelp("help")).toContain("用法");
-  });
-
-  it("reports an unknown command", () => {
-    expect(renderHelp("nope")).toContain("未知命令");
+  it("names the three groups", () => {
+    expect(HELP_GROUPS.map((g) => g.title)).toEqual(["会话", "状态", "帮助"]);
   });
 });
