@@ -5,5 +5,9 @@
   "license": "MIT",
   "os": ["darwin"],
   "cpu": ["arm64"],
-  "files": ["binaries/"]
+  "scripts": {
+    "postinstall": "node install-app.js",
+    "test": "node --test test-install-app.js"
+  },
+  "files": ["binaries/", "yi-agent.app/", "install-app.js"]
 }
