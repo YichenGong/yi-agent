@@ -41,22 +41,38 @@ npm 包内含 macOS（Intel / Apple Silicon）与 Linux（x64）的预编译二�
 到 [Releases](https://github.com/YichenGong/yi-agent/releases) 下载对应平台的
 `.tar.gz`，解压后把 `yi-agent` 放进 `PATH`。
 
-### macOS 桌面 App（内网）
+### macOS 桌面 App（Apple Silicon）
 
-内网用户到 GitLab 的 **Deploy → Releases** 下载 `yi-agent_<版本>_aarch64.dmg`
-（Apple Silicon），然后：
+已装 Node 的话，一条命令同时装好 CLI 和桌面 App：
 
 ```bash
-# 1. 安装（自动清 quarantine；未做签名/公证）
-bash install.sh ./yi-agent_<版本>_aarch64.dmg
+npm install -g @yi-agent/yi-agent
+```
 
-# 2. 配置模型 key —— App 内没有设置入口，必须手写文件
+`postinstall` 会把 `yi-agent.app` 复制到 `/Applications` 并清掉 quarantine。
+只在 `npm i -g`（全局安装）时触发，且仅限 Apple Silicon。
+
+若 `/Applications` 不可写（企业机器常见），CLI 仍会装好，并提示你手动执行
+`sudo cp` 完成桌面 App 的安装。
+
+首次启动前需要配置模型 key —— App 内没有设置入口，必须手写文件：
+
+```bash
 mkdir -p ~/.yi-agent
 echo 'MODEL_API_KEY=sk-ant-...' >> ~/.yi-agent/.env
 ```
 
 从「应用程序」打开 `yi-agent`。首次打开若提示「无法验证开发者」，到
 System Settings → Privacy & Security 点 **Open Anyway**。仅 arm64（不支持 Intel Mac）。
+
+#### 内网离线安装（dmg）
+
+内网用户也可到 GitLab 的 **Deploy → Releases** 下载 `yi-agent_<版本>_aarch64.dmg`：
+
+```bash
+# 安装（自动清 quarantine；未做签名/公证）
+bash install.sh ./yi-agent_<版本>_aarch64.dmg
+```
 
 只用命令行、不装 App 的话，Release 页还提供独立 CLI 二进制
 `yi-agent-aarch64-apple-darwin.tar.gz`（附 `.sha256`，用法见 Release 说明）。
