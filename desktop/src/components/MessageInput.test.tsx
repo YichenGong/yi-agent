@@ -294,6 +294,55 @@ describe("MessageInput", () => {
     expect((textarea as HTMLTextAreaElement).value).toBe("doomed");
   });
 
+  describe("typing while a turn is running", () => {
+    // 回合进行中用户必须能敲字（否则只能先 Stop 再重打），但发送仍必须先 Stop。
+    it("keeps the textarea editable while the turn is running", () => {
+      const onDraftChange = vi.fn();
+      renderInput({ turnActive: true, onDraftChange, value: "" });
+
+      const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
+      expect(textarea.disabled).toBe(false);
+      fireEvent.change(textarea, { target: { value: "keep typing" } });
+      expect(onDraftChange).toHaveBeenCalledWith("keep typing");
+      expect(textarea.value).toBe("keep typing");
+    });
+
+    it("still interrupts on Enter instead of sending", () => {
+      const onSend = vi.fn(async () => true);
+      const onInterrupt = vi.fn();
+      renderInput({ turnActive: true, onSend, onInterrupt, value: "half a thought" });
+
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(onInterrupt).toHaveBeenCalledTimes(1);
+      expect(onSend).not.toHaveBeenCalled();
+    });
+
+    it("lets Shift+Enter insert a newline without interrupting", () => {
+      const onInterrupt = vi.fn();
+      renderInput({ turnActive: true, onInterrupt, value: "line one" });
+
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter", shiftKey: true });
+      expect(onInterrupt).not.toHaveBeenCalled();
+    });
+
+    it("never runs a slash command mid-turn", () => {
+      const onSlashCommand = vi.fn();
+      const onInterrupt = vi.fn();
+      renderInput({ turnActive: true, onSlashCommand, onInterrupt, value: "/clear" });
+
+      fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+      expect(onSlashCommand).not.toHaveBeenCalled();
+      expect(onInterrupt).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not open the slash popup mid-turn", () => {
+      renderInput({ turnActive: true, value: "" });
+
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "/" } });
+      expect(screen.queryByTestId("slash-popup")).toBeNull();
+    });
+  });
+
   describe("attachments", () => {
     const paperclip = () => screen.getByRole("button", { name: "附加文件" });
 

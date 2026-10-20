@@ -232,7 +232,9 @@ export function MessageInput({
               const next = e.target.value;
               onDraftChange(next);
               // Re-arm the popup whenever the text still looks like a command name.
-              setPopupOpen(/^\/[^\s/]*$/.test(next.trim()));
+              // 回合进行中不弹：那时 Enter 的唯一语义是「中断」，弹窗里的候选
+              // 选不中，徒增误导。
+              setPopupOpen(!turnActive && /^\/[^\s/]*$/.test(next.trim()));
             }}
             onCompositionStart={ime.onCompositionStart}
             onCompositionEnd={ime.onCompositionEnd}
@@ -297,6 +299,13 @@ export function MessageInput({
                 // Confirming a candidate with Enter is the IME's key, not the user's:
                 // let the composition land in the box and wait for the next Enter.
                 e.preventDefault();
+                // 回合进行中：输入框可编辑（草稿要留住、能准备下一句），但 Enter 仍然
+                // 只表示「中断」——发送必须先 Stop。这条必须在斜杠命令之前，否则
+                // `/clear` 之类会在半路把转录抹掉。
+                if (turnActive) {
+                  onInterrupt();
+                  return;
+                }
                 if (parsed.kind === "command") {
                   // This branch is reached when the popup matched nothing: unknown
                   // commands and matched commands alike belong to the command
@@ -306,14 +315,13 @@ export function MessageInput({
                 }
                 if (parsed.kind === "path") {
                   // Two-slash first token is a path (TUI parity) — falls through.
-                } else if (turnActive) {
-                  onInterrupt();
-                  return;
                 }
                 void handleSend();
               }
             }}
-            disabled={disabled || sending || turnActive}
+            // 回合进行中**不**置灰：用户要能先打好下一句，等 Stop 之后直接发。
+            // 发送能力仍被 Enter/Stop 的语义锁住，可见状态与可编辑状态解耦。
+            disabled={disabled || sending}
             rows={3}
             placeholder={
               isMobile
