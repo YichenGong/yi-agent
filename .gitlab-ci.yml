@@ -67,4 +67,7 @@ release:macos-dmg:
     # 构建期版本标识需要 tag 与历史；GitLab 默认浅克隆会把它判成 nogit。
     GIT_DEPTH: "0"
   script:
+    # 与 GitHub 侧同一道门禁：tag 必须落在 main 可达的提交上。
+    - git fetch --no-tags origin main || true
+    - bash yi-agent-rs/scripts/check-tag-on-main.sh "$CI_COMMIT_TAG" origin/main
     - bash desktop/scripts/release-dmg.sh

@@ -47,6 +47,14 @@ jobs:
           echo "CARGO_TARGET_DIR=$HOME/cargo-target/github"
           ls -ld "$HOME/cargo-target/github"
 
+      - name: Verify the tag is on main
+        run: |
+          # release.yml 只由 tag 触发，且只打包、不跑测试。一个打在未合并
+          # 功能分支上的 tag 会被直接发布出去，线上版本从此脱离主干。
+          # 这里在动编译器之前就把它拦下来。
+          git fetch --no-tags origin main || true
+          bash yi-agent-rs/scripts/check-tag-on-main.sh "${{ github.ref_name }}" origin/main
+
       - name: Verify tag matches Cargo.toml version
         id: version
         run: |
