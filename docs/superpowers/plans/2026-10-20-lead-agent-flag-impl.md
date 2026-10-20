@@ -636,8 +636,8 @@ fn lead_tools_follow_the_flag() {
         "lead_recall",
         "lead_list_threads",
         "lead_read_thread",
-        "lead_interrupt",
-        "lead_reject",
+        "lead_interrupt_thread",
+        "lead_reject_thread",
     ] {
         assert!(
             lead.contains(&name.to_string()),

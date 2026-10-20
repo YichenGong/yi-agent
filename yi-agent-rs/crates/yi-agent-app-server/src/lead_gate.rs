@@ -27,6 +27,17 @@ pub fn resolve_from_store(flags_path: &Path, build_kind: &str) -> bool {
     )
 }
 
+/// 生产入口：从真实环境解析一次，供 `RuntimeAttachments` 的三个构造点调用。
+///
+/// 生产构造点统一走这里，避免各写一份「怎么算」；测试不走它——它们直接给
+/// `true` / `false`。
+pub fn from_process_environment() -> bool {
+    match yi_agent_flags::store::flags_path() {
+        Some(path) => resolve_from_store(&path, yi_agent_flags::build_kind()),
+        None => false,
+    }
+}
+
 /// 判定入口。`None` = 装配方漏传，**失败关闭**。
 ///
 /// 失败关闭是刻意的：默认打开一个未验证的功能，代价远大于默认关闭。

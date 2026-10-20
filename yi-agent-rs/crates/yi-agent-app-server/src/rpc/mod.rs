@@ -452,4 +452,8 @@ pub(crate) struct AppState<'a> {
     /// [`AppState::lead_inbox`] 同一理由，按 `&` 借用。
     pub(crate) lead_control: &'a crate::lead_control::LeadControlInbox,
     pub(crate) lead_control_replies: &'a crate::lead_control::LeadControlReplies,
+    /// 组长开关的生效值。`thread/lead` 与 `thread/listAll` 用它决定「这个能力
+    /// 存在不存在」。按值拷贝（`bool`），与 `client_scope` 同类——都是每请求
+    /// 读一次的判定输入。
+    pub(crate) lead_agent_enabled: bool,
 }

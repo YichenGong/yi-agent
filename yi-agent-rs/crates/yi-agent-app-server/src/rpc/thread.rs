@@ -276,6 +276,7 @@ pub(crate) async fn handle(
                 state.lead_replies,
                 state.lead_control,
                 state.lead_control_replies,
+                Some(state.lead_agent_enabled),
             )
             .await?;
 
@@ -310,6 +311,20 @@ pub(crate) async fn handle(
             .await?;
         }
         "thread/lead" => {
+            // 关掉开关时这个方法**不存在**（-32601），而不是「存在但拒绝」：
+            // 前端只需看 `build/info` + `flags/list`，不必再判断权限。
+            //
+            // 放在参数校验之前：否则关掉时传错参数会得到 `invalid_params`，
+            // 让人以为是调用方的问题，而不是「这个能力没有」。
+            if !state.lead_agent_enabled {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::method_not_found("thread/lead")),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
             // 组长归属当前请求的项目根。与 `thread/start` 同源,保证
             // 「用户在哪个项目里问组长」与「组长管哪个项目」一致。
             let cwd = match resolve_thread_cwd(
@@ -513,6 +528,7 @@ pub(crate) async fn handle(
                 // resume 路径：meta 已在盘上，起点取已落盘的 `anchor_sha`。
                 // 旧会话没有该字段时是 `None`——那表示「无起点」，按方案 1 不回填。
                 loaded.meta.anchor_sha.clone(),
+                Some(state.lead_agent_enabled),
                 built,
             );
             let BuiltAgent {
