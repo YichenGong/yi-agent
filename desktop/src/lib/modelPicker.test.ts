@@ -124,20 +124,21 @@ describe("REASONING_EFFORTS", () => {
 });
 
 describe("buildEffortOptions", () => {
-  it("puts an unset option first and labels it with the entry default", () => {
+  it("puts the auto option first and names the tier it falls back to", () => {
     const opts = buildEffortOptions(null, "low");
     expect(opts[0]).toMatchObject({ value: null, selected: true });
-    expect(opts[0].label).toContain("未设置");
-    expect(opts[0].label).toContain("low");
+    // 「自动」而不是「未设置」：这一项是「交给条目默认决定」，不是「关闭推理」。
+    // 括号里是清掉覆盖后的实际落点，用户不用去别处查。
+    expect(opts[0].label).toBe("自动（low）");
   });
 
-  it("labels the unset option plainly when the entry declares no default", () => {
+  it("labels the auto option without parentheses when the entry declares no default", () => {
     const opts = buildEffortOptions(null, null);
     expect(opts[0].value).toBeNull();
-    expect(opts[0].label).toBe("未设置");
+    expect(opts[0].label).toBe("自动");
   });
 
-  it("lists the seven tiers after the unset option", () => {
+  it("lists the seven tiers after the auto option", () => {
     const opts = buildEffortOptions(null, "low");
     expect(opts.map((o) => o.value)).toEqual([
       null,
@@ -162,7 +163,7 @@ describe("buildEffortOptions", () => {
 describe("overrideFromEffective", () => {
   it("reports no override when the effective value is the entry default", () => {
     // resume 上报的是**生效值**（无覆盖时即条目默认）：与条目默认相同就是「没有
-    // 可区分的覆盖」，控件该显示「未设置（继承 low）」而不是把 low 打勾。
+    // 可区分的覆盖」，控件该显示「自动（low）」而不是把 low 打勾。
     expect(overrideFromEffective("low", "low")).toBeNull();
   });
 

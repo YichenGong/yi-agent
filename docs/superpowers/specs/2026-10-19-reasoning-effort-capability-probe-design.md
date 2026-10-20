@@ -337,7 +337,7 @@ OpenAI 侧的判别直接复用 `yi_agent_llm::openai::error::is_effort_rejectio
   - 无记录：`未探测`。
 - 编辑表单的档位下拉按 `provider + api_style` 选出的通道过滤：
   - 能力未知 → 平铺 7 档（今天的行为）；
-  - 能力可信 → 只列 `supported`（加「未设置」项）；
+  - 能力可信 → 只列 `supported`（加「自动」项，见 §8.2）；
   - 当前值不在 `supported` 内 → 下拉里显示为「不支持（high）」但允许保留，
     避免静默改用户配置。
 - 条目行/卡片新增「重新探测」按钮，调 `model/probe`，按钮进入「探测中…」状态。
@@ -346,9 +346,11 @@ OpenAI 侧的判别直接复用 `yi_agent_llm::openai::error::is_effort_rejectio
 
 - `buildEffortOptions` 签名扩展为
   `(currentOverride, entryDefault, supported: string[] | null)`：
-  - `supported === null` → 今天的行为（「未设置」+ 7 档）；
-  - `supported` 非空 → 「未设置」+ 仅 supported 档位；
-  - `supported === []` → 只显示「未设置」，并提示「该模型在此通道上不接受显式档位」。
+  - `supported === null` → 能力未知（「自动」+ 7 档）；
+  - `supported` 非空 → 「自动」+ 仅 supported 档位；
+  - `supported === []` → 只显示「自动」，并提示「该模型在此通道上不接受显式档位」。
+  - 首项标为「自动」（条目声明默认时作「自动（low）」）而非「未设置」：该项的
+    语义是「清除会话覆盖、交给条目默认/模型决定」，旧名会被读成「关闭推理」。
 - `entryEffortOf` 之外新增 `entrySupportedEfforts(list, ref, channel)`；
   通道由 `entry.api_style` 决定（`auto` 时取已探测的那条；两条都有则优先
   `responses`，与运行期 `resolve_channel` 的默认一致）。

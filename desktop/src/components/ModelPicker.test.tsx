@@ -310,7 +310,7 @@ describe("ModelPicker effort control", () => {
 
   it("shows the inherit label, not a checked tier, when the reported value is the entry default", async () => {
     // 冷启动：resume 报的**生效值** low 恰好等于条目默认 low ⇒ 没有可区分的覆盖，
-    // 菜单该把「未设置（继承 low）」打勾，而不是把 low 打勾成「已选覆盖」。
+    // 菜单该把「自动（low）」打勾，而不是把 low 打勾成「已选覆盖」。
     const withEffort: ModelList = { ...catalog, models: catalog.models.map((m) => ({ ...m })) };
     withEffort.models[0].reasoning_effort = "low";
     const { call } = seam({ catalog: withEffort });
@@ -325,9 +325,15 @@ describe("ModelPicker effort control", () => {
         onEffortChanged={vi.fn()}
       />,
     );
-    fireEvent.click(await screen.findByRole("button", { name: /推理档位/ }));
-    const unset = screen.getByRole("menuitemradio", { name: /未设置/ });
+    // 按钮自身也要显示这个标签（不是只在菜单里）：用户不开菜单就得知道现在
+    // 是「自动」，否则「未设置」那种含糊会从按钮上先漏出来。
+    const trigger = await screen.findByRole("button", { name: /推理档位/ });
+    expect(trigger.textContent).toBe("自动（low）");
+    fireEvent.click(trigger);
+    const unset = screen.getByRole("menuitemradio", { name: /自动/ });
     expect(unset.getAttribute("aria-checked")).toBe("true");
+    // 旧名不得再出现在 UI 上（「未设置」会被读成「关闭推理」）。
+    expect(screen.queryByRole("menuitemradio", { name: /未设置/ })).toBeNull();
     expect(screen.getByRole("menuitemradio", { name: "low" }).getAttribute("aria-checked")).toBe(
       "false",
     );

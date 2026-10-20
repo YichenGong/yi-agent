@@ -28,7 +28,7 @@ describe("buildEffortOptions with capabilities", () => {
   it("lists only the supported tiers", () => {
     const options = buildEffortOptions(null, "low", ["low", "high"]);
     expect(options.map((o) => o.value)).toEqual([null, "low", "high"]);
-    expect(options[0].label).toBe("未设置（继承 low）");
+    expect(options[0].label).toBe("自动（low）");
   });
 
   it("lists only the unset entry when the model supports no explicit tier", () => {
