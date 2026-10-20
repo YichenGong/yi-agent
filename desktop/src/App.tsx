@@ -1878,10 +1878,21 @@ export default function App() {
   const interrupt = () => {
     const id = store.currentId;
     if (!id) return;
-    clientRef.current?.request("turn/interrupt", { threadId: id }).catch((e) => {
-      store.view(id).session.lastError = formatError(e);
-      force((v) => v + 1);
-    });
+    clientRef.current
+      ?.request<{ alreadyIdle?: boolean }>("turn/interrupt", { threadId: id })
+      .then((resp) => {
+        // 服务端说「本来就没在跑」：本地那枚 Stop 是过期状态（`turn/completed`
+        // 在出站队列被灌满时丢了）。立刻纠正，否则按钮会一直显示 Stop，用户
+        // 以为没点到，反复点也只是空转。不清 items——历史内容本身没有错。
+        if (resp?.alreadyIdle) {
+          store.view(id).session.clearTurn();
+          force((v) => v + 1);
+        }
+      })
+      .catch((e) => {
+        store.view(id).session.lastError = formatError(e);
+        force((v) => v + 1);
+      });
   };
 
   /**

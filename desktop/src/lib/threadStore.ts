@@ -162,6 +162,10 @@ export class ThreadStore {
       const v = this.view(n.params.thread_id);
       v.status = n.params.status;
       this.statusSource.set(n.params.thread_id, "live");
+      // 状态推送是比「某条 turn/completed 有没有到」更强的证据：服务端说这条
+      // thread 已经不在跑了，那本地的 Stop 就是过期的。只认 `idle`——`running`
+      // 与 `awaiting_approval` 都仍是同一轮的延续，Stop 必须保持可用。
+      if (n.params.status === "idle") v.session.clearTurn();
       // 离开 awaiting_approval（决定 / 超时 / 中断）即清掉可能残留的审批框，
       // 否则超时后前端会留下一个点不掉的模态。
       if (n.params.status !== "awaiting_approval") v.approval = null;

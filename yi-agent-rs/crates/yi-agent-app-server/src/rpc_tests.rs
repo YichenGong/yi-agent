@@ -18017,6 +18017,43 @@ async fn a_reject_to_an_unknown_thread_is_an_error() {
     h.shutdown().await;
 }
 
+/// 回归（Stop 点不动）：对**没有活跃轮**的 thread 发 `turn/interrupt` 时，
+/// 响应必须如实告知「已经空闲」，而不是回一个空的 `ok {}`。
+///
+/// 前端 `turnActive` 只由 `turn/started` / `turn/completed` 翻转，没有任何对账
+/// 兜底。一旦 `turn/completed` 在出站队列被灌满时丢掉（见
+/// `a_critical_notification_survives_a_full_outbound_queue`），前端会永远显示
+/// Stop；此时点 Stop 会发来这条请求，而服务端因为 `active_turn_id` 已经是
+/// `None` 而什么都不做——旧实现仍然回 `ok {}`，前端无从知道自己该把状态改回
+/// Idle，按钮就此永久卡在 Stop。返回 `alreadyIdle: true` 让客户端能就地纠正。
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_on_an_idle_thread_reports_that_it_was_already_idle() {
+    let (mut h, _dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+    let tid = start_thread(&mut h).await;
+
+    // 这一轮从未启动过：thread 处于 Idle，没有 active_turn_id。
+    let resp = rpc(
+        &mut h,
+        2,
+        "turn/interrupt",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+    assert!(
+        resp.get("error").is_none(),
+        "interrupting an idle thread is not an error: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["alreadyIdle"],
+        serde_json::json!(true),
+        "the client must learn that nothing was running, so it can drop a stale Stop: {resp}"
+    );
+    h.shutdown().await;
+}
+
 /// 打断无活跃轮的目标：回错（不静默 no-op）。
 #[tokio::test(flavor = "multi_thread")]
 async fn an_interrupt_without_an_active_turn_is_an_error() {

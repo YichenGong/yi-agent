@@ -96,11 +96,25 @@ pub(crate) async fn handle(
                 .await?;
                 return Ok(Flow::Continue);
             };
-            if let Some(turn_id) = session.active_turn_id.clone() {
-                // 幂等 level 信号:用 try_send 避免主循环在满队列上阻塞。
-                let _ = session.interrupt_tx.try_send(turn_id);
-            }
-            write_response(state.hub, state.client, ok_response(id, json!({}))).await?;
+            let already_idle = match session.active_turn_id.clone() {
+                Some(turn_id) => {
+                    // 幂等 level 信号:用 try_send 避免主循环在满队列上阻塞。
+                    let _ = session.interrupt_tx.try_send(turn_id);
+                    false
+                }
+                // 没有活跃轮 = 这一轮已经结束了,本地的 Stop 是**过期状态**。
+                // 只回空 `ok {}` 的话,前端无从分辨「已取消」与「本来就没在跑」:
+                // `turnActive` 只由 `turn/started` / `turn/completed` 翻转,一旦
+                // 后者丢失(出站队列被逐字流灌满),那枚 Stop 就永久卡住,每次点击
+                // 都在这里空转。显式回一个标志,让客户端能就地清掉它。
+                None => true,
+            };
+            write_response(
+                state.hub,
+                state.client,
+                ok_response(id, json!({ "alreadyIdle": already_idle })),
+            )
+            .await?;
         }
         "turn/interject" => {
             let Some(thread_id) =

@@ -459,6 +459,102 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    /// 回归（Stop 点不动）：逐字流把 256 格出站队列灌满时，`turn/completed`
+    /// 这类**关键帧**不得被静默丢弃。
+    ///
+    /// 桌面端是 `Feed::All` 且从不 `thread/subscribe`，故逐字流不会被合并；一条
+    /// bash 命令每 4 KiB 输出就产生一帧，构建日志能瞬间填满队列。旧实现让关键帧
+    /// 与逐字流走同一条 `try_send` 路径，队列满即丢当前帧——`turn/completed` 一丢，
+    /// 前端 `turnActive` 就永远停在 true，Stop 从此点了没有任何效果（服务端
+    /// `active_turn_id` 已清），只能重启 App。
+    ///
+    /// 判据是**投递语义**而不是时序巧合：队列满且**无人读取**时，关键帧的写入
+    /// 必须停在背压上等空位，而不是立刻返回。旧实现的 `try_send` 会瞬间返回
+    /// （帧被丢掉），于是下面的 `is_finished()` 会立刻为真——测试变红。用"边发
+    /// 边收"去断言送达是不行的：读方一抽干就有空位，旧实现也能蒙混过关。
+    #[tokio::test]
+    async fn a_critical_notification_survives_a_full_outbound_queue() {
+        let hub = Arc::new(Broadcaster::new());
+        let mut rx = hub.register_reliable(ClientId::local());
+        // 灌满队列：模拟宿主读得慢时 bash 大量输出把 256 格填满。
+        for i in 0..CLIENT_QUEUE {
+            hub.broadcast(serde_json::json!({ "n": i }));
+        }
+        // 此刻**故意不读**：队列是满的。关键帧必须在这里等，而不是被丢掉。
+        let h = Arc::clone(&hub);
+        let sender = tokio::spawn(async move {
+            crate::server::write_notification(
+                &h,
+                &crate::protocol::Notification::TurnCompleted {
+                    thread_id: "t1".to_string(),
+                    turn_id: "u1".to_string(),
+                    status: crate::protocol::TurnStatus::Completed,
+                    error: None,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        // 给它充分的机会去跑完（旧实现会瞬间跑完并丢掉这一帧）。
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !sender.is_finished(),
+            "a load-bearing frame must wait for queue space instead of being dropped"
+        );
+
+        // 让读方抽一帧出来腾出空位：写入应当随即完成，且这一帧必须真的送到。
+        let _ = rx.recv().await;
+        tokio::time::timeout(Duration::from_secs(2), sender)
+            .await
+            .expect("the blocked write must resume once the queue drains")
+            .unwrap();
+
+        let mut saw_completed = false;
+        for _ in 0..(CLIENT_QUEUE + 16) {
+            match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                Ok(Some(v)) => {
+                    if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+                        saw_completed = true;
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            saw_completed,
+            "turn/completed must reach the client even when the queue is full"
+        );
+    }
+
+    /// 关键帧走背压，但**出口泵真死时不能永久挂住**。
+    ///
+    /// 这是把 List/Global 层从 `try_send` 改成 `broadcast_await` 的代价边界：
+    /// 队列满时等待是对的（等出口泵抽干），可一旦接收端没了（`pump_stdout` 写
+    /// 失败、进程被杀），等待必须立刻变成 `Err(Closed)`，否则 driver 会卡死在
+    /// 一条永远不会被读的帧上，turn 再也收不了尾。
+    #[tokio::test]
+    async fn broadcast_await_reports_closed_instead_of_hanging() {
+        let hub = Arc::new(Broadcaster::new());
+        let local = ClientId::local();
+        let rx = hub.register_reliable(local.clone());
+        // 灌满队列后再丢掉接收端：模拟出口泵已死、队列仍是满的。
+        for i in 0..CLIENT_QUEUE {
+            hub.broadcast(serde_json::json!({ "n": i }));
+        }
+        drop(rx);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            hub.broadcast_await(None, serde_json::json!({"method": "turn/completed"})),
+        )
+        .await
+        .expect("a dead pump must not block the driver forever");
+        assert_eq!(result, Err(Closed));
+    }
+
     #[tokio::test]
     async fn broadcast_await_does_not_drop_frames_for_a_reliable_client() {
         let hub = Broadcaster::new();
