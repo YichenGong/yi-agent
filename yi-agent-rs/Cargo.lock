@@ -4958,6 +4958,7 @@ dependencies = [
  "uuid",
  "yi-agent-app-server",
  "yi-agent-core",
+ "yi-agent-flags",
  "yi-agent-mcp",
  "yi-agent-relay",
  "yi-agent-runtime",
@@ -4994,6 +4995,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "yi-agent-core",
+ "yi-agent-flags",
  "yi-agent-mcp",
  "yi-agent-relay",
  "yi-agent-runtime",
@@ -5023,6 +5025,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "yi-agent-flags"
+version = "0.1.8"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "yi-agent-store",
 ]
 
 [[package]]

@@ -17,6 +17,7 @@ yi-agent-core = { workspace = true }
 yi-agent-tools = { workspace = true }
 yi-agent-mcp = { workspace = true }
 yi-agent-store = { workspace = true }
+yi-agent-flags = { workspace = true }
 yi-agent-web = { workspace = true }
 yi-agent-runtime = { workspace = true }
 yi-agent-app-server = { workspace = true }

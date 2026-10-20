@@ -11,6 +11,7 @@ import { SettingsMcpTab } from "./SettingsMcpTab";
 import type { McpCall } from "../lib/mcp";
 import type { SkillsCall } from "../lib/skills";
 import { SettingsTagsTab } from "./SettingsTagsTab";
+import { SettingsFlagsTab, type FlagsCall } from "./SettingsFlagsTab";
 import { DEFAULT_TAG_NAMES, type TagId } from "../lib/threadTags";
 
 /** 左侧 Tab 栏。加一个 Tab 只需往这张表里加项，再在下面渲染它的面板。 */
@@ -22,6 +23,8 @@ const TABS = [
   { id: "skills", label: "技能" },
   { id: "mcp", label: "MCP" },
   { id: "tags", label: "标签" },
+  // 只有 dev 构建可见；过滤在渲染期做（见 `visibleTabs`），常量表保持完整。
+  { id: "flags", label: "实验功能" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -51,6 +54,8 @@ export function SettingsDialog({
   saveRelayUrl,
   tagNames,
   saveTagName,
+  buildKind,
+  flagsCall,
 }: {
   open: boolean;
   /**
@@ -98,6 +103,13 @@ export function SettingsDialog({
   tagNames?: Record<TagId, string>;
   /** 「标签」Tab 保存单个颜色显示名的接缝（写 ui/settings/write）。 */
   saveTagName?: (tagId: TagId, name: string) => Promise<void> | void;
+  /**
+   * 宿主经 `build/info` 得到的构建类型。只有 `"dev"` 才渲染「实验功能」Tab：
+   * stable 上 `flags/*` 这些方法根本不存在（-32601），渲染出来的面板只会报错。
+   */
+  buildKind?: "dev" | "release" | "nogit";
+  /** 「实验功能」Tab 的 RPC 接缝（flags/list、flags/set）。 */
+  flagsCall?: FlagsCall;
 }) {
   /**
    * 手机端的两级导航位置。桌面端恒为 `"panel"`（从不渲染分类列表）。
@@ -105,6 +117,11 @@ export function SettingsDialog({
    * 手机上分类可能有 5 个以上，等宽横条在 320pt 上放不下（第 5 格只剩 64px，
    * 「远程访问」四字溢出）。列表 → 子页的结构把横向宽度从约束里摘掉。
    */
+  /**
+   * 实际渲染的 Tab 表。`flags` 依赖宿主告诉我们的构建类型——不能靠「请求失败就
+   * 隐藏」这种事后判断，那会让面板先闪一次错误。
+   */
+  const visibleTabs = TABS.filter((tab) => tab.id !== "flags" || buildKind === "dev");
   const [active, setActive] = useState<TabId>("general");
   const [phonePane, setPhonePane] = useState<"list" | "panel">("panel");
   /** 从子页返回后要重新落焦的分类。`null` = 无需落焦。 */
@@ -153,16 +170,18 @@ export function SettingsDialog({
 
   /** 表内箭头/Home/End 导航：移动选区并同步把焦点带过去。 */
   const onTablistKeyDown = (e: KeyboardEvent) => {
-    const i = TABS.findIndex((t) => t.id === active);
+    const i = visibleTabs.findIndex((t) => t.id === active);
+    if (i < 0) return;
     // aria-orientation="vertical"，但左右键同样惯例可用。
     let next = i;
-    if (e.key === "ArrowDown" || e.key === "ArrowRight") next = (i + 1) % TABS.length;
-    else if (e.key === "ArrowUp" || e.key === "ArrowLeft") next = (i - 1 + TABS.length) % TABS.length;
+    if (e.key === "ArrowDown" || e.key === "ArrowRight") next = (i + 1) % visibleTabs.length;
+    else if (e.key === "ArrowUp" || e.key === "ArrowLeft")
+      next = (i - 1 + visibleTabs.length) % visibleTabs.length;
     else if (e.key === "Home") next = 0;
-    else if (e.key === "End") next = TABS.length - 1;
+    else if (e.key === "End") next = visibleTabs.length - 1;
     else return;
     e.preventDefault();
-    const id = TABS[next].id;
+    const id = visibleTabs[next].id;
     setActive(id);
     tabRefs.current[id]?.focus();
   };
@@ -192,7 +211,7 @@ export function SettingsDialog({
           onKeyDown={onTablistKeyDown}
           className="settings-nav flex w-40 shrink-0 flex-col border-r border-line bg-surface p-2"
         >
-          {TABS.map((t) => (
+          {visibleTabs.map((t) => (
             <button
               key={t.id}
               id={tabId(t.id)}
@@ -255,7 +274,7 @@ export function SettingsDialog({
         {isMobile && phonePane === "list" ? (
           // 分类列表：每行一个分类，点进去才渲染面板。
           <nav className="settings-categories flex min-h-0 flex-1 flex-col">
-            {TABS.map((t) => (
+            {visibleTabs.map((t) => (
               <button
                 key={t.id}
                 ref={(el) => {
@@ -313,12 +332,14 @@ export function SettingsDialog({
                 projects={mcpProjects ?? []}
                 defaultProject={mcpDefaultProject}
               />
-            ) : (
+            ) : active === "tags" ? (
               <SettingsTagsTab
                 tagNames={tagNames ?? DEFAULT_TAG_NAMES}
                 onSave={saveTagName ?? (() => {})}
               />
-            )}
+            ) : active === "flags" && flagsCall ? (
+              <SettingsFlagsTab call={flagsCall} />
+            ) : null}
           </div>
         )}
       </div>

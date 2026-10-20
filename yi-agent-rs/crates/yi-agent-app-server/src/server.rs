@@ -3338,6 +3338,13 @@ where
                             crate::rpc::Flow::Unknown => {}
                         }
                     }
+                    crate::rpc::Domain::Flags => {
+                        let mut state = app_state!();
+                        match crate::rpc::flags::handle(&mut state, &req, id.clone()).await? {
+                            crate::rpc::Flow::Continue => continue,
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
                     crate::rpc::Domain::Mcp => {
                         let mut state = app_state!();
                         match crate::rpc::mcp::handle(&mut state, &req, id.clone()).await? {

@@ -185,6 +185,11 @@ pub enum Command {
         #[command(subcommand)]
         action: PairAction,
     },
+    /// 功能开关（仅 dev 构建可开；stable 构建一律读作关）。
+    Flags {
+        #[command(subcommand)]
+        action: FlagsAction,
+    },
     /// 常驻值守：保证登记在册的项目各自有一个活着的 daemon。
     ///
     /// 通用子命令：它只读通用常驻登记，不认识任何插件。
@@ -197,6 +202,20 @@ pub enum Command {
         #[command(subcommand)]
         action: ResidentAction,
     },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum FlagsAction {
+    /// 列出全部注册的开关及生效值。
+    List,
+    /// 打开或关闭一个开关。
+    Set {
+        name: String,
+        /// `on` 或 `off`
+        value: String,
+    },
+    /// 打印一个开关的最终生效值，以及它来自哪一层。
+    Status { name: String },
 }
 
 #[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]

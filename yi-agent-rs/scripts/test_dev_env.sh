@@ -33,9 +33,19 @@ pass "run exports an isolated environment"
 [ -d "$home" ] || fail "instance dir was not created"
 pass "run creates the instance dir"
 
-# 4. down --purge 删除目录
+# 3b. models.json 会被复制到新实例（否则实例开箱不可用）
+mkdir -p "$TMP/stable/.yi-agent"
+printf '{"version":1,"models":[],"default_model":null}' > "$TMP/stable/.yi-agent/models.json"
+rm -rf "$TMP/instances"
+YI_AGENT_INSTANCES_ROOT="$TMP/instances" HOME="$TMP/stable" \
+  "$SCRIPT" run true >/dev/null 2>&1 || true
+copied="$TMP/instances/$id1/.yi-agent/models.json"
+[ -f "$copied" ] || fail "models.json was not copied into the instance"
+pass "models.json is copied into the instance"
+
+# 4. down --purge 删除目录（连空壳父目录一起）
 YI_AGENT_INSTANCES_ROOT="$TMP/instances" "$SCRIPT" down --purge >/dev/null 2>&1
-[ ! -d "$home" ] || fail "down --purge did not remove $home"
+[ -d "$TMP/instances/$id1" ] && fail "down --purge left an empty $id1 dir behind"
 pass "down --purge removes the instance dir"
 
 # 5. 已存在的 .env 会被保留，不被父级覆盖

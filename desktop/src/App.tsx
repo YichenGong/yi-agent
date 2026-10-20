@@ -204,6 +204,12 @@ export default function App() {
   const initialListCache = useRef(isRemoteClient() ? readListCache() : null).current;
   /** 标签显示名（6 键齐全）。默认名来自 threadTags.ts，服务端只给覆盖项。 */
   const [tagNames, setTagNames] = useState<Record<TagId, string>>(DEFAULT_TAG_NAMES);
+  /**
+   * 宿主的构建类型（`build/info`）。`null` = 还不知道，此时**不**渲染「实验功能」
+   * Tab——宁可晚一帧出现，也不要在 stable 上闪一个必然报错的面板。
+   * 这个值在一次连接内不会变，故握手时读一次就够。
+   */
+  const [buildKind, setBuildKind] = useState<"dev" | "release" | "nogit" | null>(null);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
@@ -405,6 +411,19 @@ export default function App() {
       const c = clientRef.current;
       if (!c) return Promise.reject(new Error("not connected"));
       return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
+   * 「实验功能」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖
+   * 即稳定；换新身份会让面板的读取 effect 重跑。
+   */
+  const flagsCall = useCallback(
+    (method: string, params?: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params ?? {});
     },
     [],
   );
@@ -1373,6 +1392,15 @@ export default function App() {
           ...(isRemoteClient() ? { resumeHints: buildResumeHints() } : {}),
         });
         syncPlanRef.current = parseSyncPlan(initialized);
+        // 构建类型只在 dev 上开放「实验功能」；读失败按 release 处理（fail-closed，
+        // 与 Rust 侧的硬闸同一口径），不让面板因为一次网络抖动冒出来。
+        try {
+          const info = await client.request<{ build_kind?: unknown }>("build/info", {});
+          const kind = info.build_kind;
+          setBuildKind(kind === "dev" || kind === "nogit" ? kind : "release");
+        } catch {
+          setBuildKind("release");
+        }
         const settings = await client.request<{
           theme?: unknown;
           resident_daemon_watchman_enabled?: unknown;
@@ -2530,6 +2558,9 @@ export default function App() {
         saveRelayUrl={isRemoteClient() ? undefined : prefs.saveRelayUrl}
         tagNames={tagNames}
         saveTagName={saveTagName}
+        // `null`（尚未读到）按 undefined 传：Tab 不出现，读回来是 dev 才出现。
+        buildKind={buildKind ?? undefined}
+        flagsCall={flagsCall}
       />
     </>
   );
