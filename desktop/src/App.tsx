@@ -71,7 +71,7 @@ import {
 } from "./lib/threadPermissionMode";
 import { renderHelp } from "./lib/slash";
 import { configReadParams } from "./lib/configRequest";
-import { estimateCost, formatCost } from "./lib/pricing";
+import { formatUsage } from "./lib/usageCommand";
 import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
@@ -1627,21 +1627,26 @@ export default function App() {
       case "help":
         session.notice(renderHelp(args));
         break;
-      case "cost": {
+      case "usage": {
         const u = session.usage;
         if (!u) {
-          session.notice("暂无用量数据");
+          session.notice("本会话还没有用量记录");
           break;
         }
-        const cost = estimateCost(u);
-        session.notice(
-          [
-            `model: ${u.model}`,
-            `input: ${u.input}  output: ${u.output}`,
-            `cache read: ${u.cacheRead}  cache write: ${u.cacheWrite}`,
-            `估算成本: ${formatCost(cost)}`,
-          ].join("\n"),
-        );
+        // 上下文上限按**当前会话**取（与 `/config` 同一条路）：进程级快照的
+        // compact_threshold 来自 sidecar 启动配置，与这个会话实际生效的模型无关。
+        let threshold: number | null = null;
+        try {
+          const cfg = await c.request<Record<string, unknown>>(
+            "config/read",
+            configReadParams(id),
+          );
+          const v = cfg.compact_threshold;
+          threshold = typeof v === "number" && v > 0 ? v : null;
+        } catch {
+          // 读配置失败不该吞掉用量：分母未知就只显示 token 数。
+        }
+        session.notice(formatUsage(u, { compactThreshold: threshold }));
         break;
       }
       case "model":
