@@ -1,5 +1,13 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ThreadSummary, ThreadStatus, TurnStatus, Workspace, WorkspaceGroup } from "../lib/protocol";
+import type {
+  SessionGroup,
+  ThreadSummary,
+  ThreadStatus,
+  TurnStatus,
+  Workspace,
+  WorkspaceGroup,
+} from "../lib/protocol";
+import { layoutWorkspace } from "../lib/sessionGroups";
 import { basename, groupCount, nestLinkedGroups } from "../lib/workspaceGroups";
 import { kanbanItemFor } from "../lib/boardIndex";
 import { useSpinPhase } from "../lib/useSpinPhase";
@@ -15,6 +23,10 @@ import { Popover } from "../ui/Popover";
 import { findLeadThread } from "../lib/leadThread";
 import { LeadAvatar } from "./LeadAvatar";
 import { TAG_DOT_CLASS, TAG_IDS, isValidTagId, tagLabel, type TagId } from "../lib/threadTags";
+
+/** 与后端 `group_store::{NAME_MAX_CHARS, DESCRIPTION_MAX_CHARS}` 一致。 */
+const GROUP_NAME_MAX = 24;
+const GROUP_DESCRIPTION_MAX = 120;
 
 function unreadDotClass(status: TurnStatus): string {
   if (status === "failed") return "bg-red-400";
@@ -128,6 +140,11 @@ export function ThreadSidebar({
   onTogglePin,
   onReorderPinned,
   onSetTag,
+  onCreateGroup,
+  onUpdateGroup,
+  onSetGroupMembers,
+  onDeleteGroup,
+  onError,
   tagNames,
   onNew,
   onRemoveWorkspace,
@@ -162,6 +179,23 @@ export function ThreadSidebar({
   onReorderPinned: (orderedIds: string[]) => void;
   /** 给会话打 / 清颜色标签（`TagId` 或 null=清除）。 */
   onSetTag: (id: string, tag: TagId | null) => void;
+  /** 用选中的会话建组。返回 false 表示失败（保留编辑器）。 */
+  onCreateGroup: (
+    workspace: string,
+    name: string,
+    description: string,
+    threadIds: string[],
+  ) => Promise<boolean>;
+  /** 改组名 / 描述。`patch` 只带要改的字段。 */
+  onUpdateGroup: (
+    workspace: string,
+    groupId: string,
+    patch: { name?: string; description?: string },
+  ) => Promise<boolean>;
+  onSetGroupMembers: (workspace: string, groupId: string, threadIds: string[]) => Promise<boolean>;
+  onDeleteGroup: (workspace: string, groupId: string) => Promise<boolean>;
+  /** 侧栏自身的动作错误（如跨目录建组），落进会话错误区。 */
+  onError: (message: string) => void;
   /** 已解析的标签显示名（6 键齐全，由 App 经 `resolveTagNames` 得到）。 */
   tagNames: Record<TagId, string>;
   /** No cwd → App opens the picker; with cwd → create in that dir. */
@@ -227,8 +261,25 @@ export function ThreadSidebar({
     | { kind: "group"; ws: string }
     | { kind: "child"; ws: string }
     | { kind: "thread"; id: string }
+    | { kind: "groupBox"; ws: string; groupId: string }
     | null
   >(null);
+  // 组框的展开集合（键为 group id）：与 workspace 折叠分开，折叠目录不等于折叠组。
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  // 多选：会话行的选择集。Ctrl/Cmd+点击进出，Shift+点击按当前行序区间选择。
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
+  // 就地编辑：正在编辑的组字段与草稿。
+  const [editingGroup, setEditingGroup] = useState<
+    { workspace: string; groupId: string; field: "name" | "description" } | null
+  >(null);
+  const [groupDraft, setGroupDraft] = useState("");
+  // 新建组的输入态：框属于哪个 workspace、组名与描述草稿。
+  const [newGroup, setNewGroup] = useState<{
+    workspace: string;
+    name: string;
+    description: string;
+  } | null>(null);
   // 顶部 “+ New thread” 按钮的点击涟漪：按下时按指针位置生成一圈扩散，
   // `animationend` 后移除，避免节点堆积。键盘激活没有坐标，退化为居中涟漪。
   const [ripples, setRipples] = useState<{ id: number; x: number; y: number; size: number }[]>([]);
@@ -418,6 +469,209 @@ export function ThreadSidebar({
   // 拖动中的行下标：既用于指示线方向（向上/向下），也用于抑制"落在自己身上"的指示线。
   const dragFromIndex = dragId === null ? -1 : pinned.findIndex((t) => t.thread_id === dragId);
 
+  /**
+   * 多选区间的锚点顺序：与侧栏实际渲染顺序一致（组框成员摊平在框的位置上）。
+   *
+   * 只用于 Shift 区间选择，取的是**渲染序**而非服务端序——两者在框内相同，
+   * 但框让行序与 `threads` 不再一一对应，用户看到的是哪一个就该按哪一个选。
+   */
+  const visibleThreadIds = useMemo(
+    () =>
+      groups.flatMap((g) =>
+        layoutWorkspace(g).flatMap((row) =>
+          row.kind === "thread" ? [row.thread.thread_id] : row.members.map((t) => t.thread_id),
+        ),
+      ),
+    [groups],
+  );
+
+  /** thread_id → 它所在 workspace 的路径（用于建组时的同目录校验）。 */
+  const workspaceOfThread = useCallback(
+    (id: string): string | null => {
+      for (const g of groups) {
+        if (g.threads.some((t) => t.thread_id === id)) return g.workspace;
+      }
+      return null;
+    },
+    [groups],
+  );
+
+  /** 某个会话当前所在的全部组（多对多；"移出"取第一个，与 `groupByThread` 同序）。 */
+  const groupsForThread = useCallback(
+    (id: string) =>
+      groups.flatMap((g) =>
+        layoutWorkspace(g)
+          .filter((row): row is Extract<typeof row, { kind: "group" }> => row.kind === "group")
+          .filter((row) => row.members.some((t) => t.thread_id === id))
+          .map((row) => ({ workspace: g.workspace, group: row.group })),
+      ),
+    [groups],
+  );
+
+  /**
+   * 能把该会话加进去的组：同 workspace、且还不是它的成员。
+   *
+   * 渲染期一次性计算（不是 hook）：右键菜单一次只属于一条会话。
+   */
+  const joinableGroups = menu?.kind === "thread" ? joinableFor(menu.id) : [];
+
+  function joinableFor(id: string) {
+    const owner = workspaceOfThread(id);
+    if (!owner) return [];
+    const current = new Set(groupsForThread(id).map((g) => g.group.id));
+    const ws = groups.find((g) => g.workspace === owner);
+    return (ws?.groups ?? [])
+      .filter((group) => !current.has(group.id))
+      .map((group) => ({ workspace: owner, group }));
+  }
+
+  /**
+   * 一个分组框：标题常显、描述只在展开时显示、成员缩进一档。
+   *
+   * 框是**纯视图**：成员仍随服务端的 `updated_at` 排序，框本身没有自己的排序
+   * 状态（spec 明确不做手动排序），这样「记得住」靠的是位置稳定，而不是靠
+   * 用户维护顺序。
+   */
+  const renderGroupBox = (
+    workspace: string,
+    group: SessionGroup,
+    members: ThreadSummary[],
+    indentLevel: 0 | 2,
+  ) => {
+    // 搜索期间强制展开（与目录折叠同一口径）：命中成员被折叠挡住等于搜不到。
+    const expanded = searching || expandedGroups.has(group.id);
+    const editing =
+      editingGroup?.groupId === group.id && editingGroup.workspace === workspace
+        ? editingGroup.field
+        : null;
+    const menuOpen = menu?.kind === "groupBox" && menu.groupId === group.id;
+    const commitField = async (field: "name" | "description") => {
+      const patch = { [field]: groupDraft } as { name?: string; description?: string };
+      const ok = await onUpdateGroup(workspace, group.id, patch);
+      if (ok) {
+        setEditingGroup(null);
+        setGroupDraft("");
+      }
+    };
+    return (
+      <div
+        key={group.id}
+        data-group-box={group.id}
+        className="mx-2 my-1 rounded-md border border-line-strong"
+      >
+        <div className="flex items-center gap-1 px-2 py-1">
+          <button
+            type="button"
+            aria-label={`${expanded ? "折叠" : "展开"}分组 ${group.name}`}
+            title={expanded ? "Collapse" : "Expand"}
+            onClick={() =>
+              setExpandedGroups((prev) => {
+                const next = new Set(prev);
+                if (next.has(group.id)) next.delete(group.id);
+                else next.add(group.id);
+                return next;
+              })
+            }
+            className="shrink-0 px-0.5 text-fg-subtle hover:text-fg-muted"
+          >
+            {expanded ? "▾" : "▸"}
+          </button>
+          {editing === "name" ? (
+            <input
+              data-group-name-input=""
+              autoFocus
+              value={groupDraft}
+              maxLength={GROUP_NAME_MAX}
+              onChange={(e) => setGroupDraft(e.target.value)}
+              onCompositionStart={ime.onCompositionStart}
+              onCompositionEnd={ime.onCompositionEnd}
+              onBlur={() => {
+                ime.resetComposition();
+                void commitField("name");
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !isImeEnter(e, ime.composing.current))
+                  void commitField("name");
+                if (e.key === "Escape") setEditingGroup(null);
+              }}
+              className="min-w-0 flex-1 rounded bg-surface px-1 py-0.5 text-sm text-fg outline-none"
+            />
+          ) : (
+            <div
+              className="min-w-0 flex-1 truncate text-sm font-medium text-fg-muted"
+              title={group.name}
+              onClick={() => {
+                setEditingGroup({ workspace, groupId: group.id, field: "name" });
+                setGroupDraft(group.name);
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setNewMenuOpen(false);
+                setMenu({ kind: "groupBox", ws: workspace, groupId: group.id });
+              }}
+            >
+              {group.name}
+            </div>
+          )}
+          <span className="shrink-0 text-xs text-fg-faint">{members.length}</span>
+        </div>
+        {expanded && (
+          <div className="border-t border-line-strong/60 px-2 py-1">
+            {editing === "description" ? (
+              <textarea
+                data-group-description-input=""
+                autoFocus
+                value={groupDraft}
+                maxLength={GROUP_DESCRIPTION_MAX}
+                rows={2}
+                onChange={(e) => setGroupDraft(e.target.value)}
+                onBlur={() => void commitField("description")}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setEditingGroup(null);
+                }}
+                className="w-full rounded bg-surface px-1 py-0.5 text-xs text-fg-muted outline-none"
+              />
+            ) : (
+              <div
+                data-group-description=""
+                className="line-clamp-2 cursor-text text-xs text-fg-subtle"
+                onClick={() => {
+                  setEditingGroup({ workspace, groupId: group.id, field: "description" });
+                  setGroupDraft(group.description);
+                }}
+              >
+                {group.description || "（点击添加描述）"}
+              </div>
+            )}
+          </div>
+        )}
+        {expanded &&
+          members.map((t) =>
+            renderThread(t, { rowAttr: "group", indentLevel: indentLevel === 2 ? 2 : 1 }),
+          )}
+        <Popover open={menuOpen} onClose={closeMenus}>
+          <div
+            role="menu"
+            data-group-menu=""
+            className="absolute left-4 z-20 rounded-md border border-line-strong bg-raised py-1 shadow-xl"
+          >
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                closeMenus();
+                void onDeleteGroup(workspace, group.id);
+              }}
+              className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+            >
+              删除组
+            </button>
+          </div>
+        </Popover>
+      </div>
+    );
+  };
+
   const renderThread = (
     t: ThreadSummary,
     opts: {
@@ -481,6 +735,36 @@ export function ThreadSidebar({
           // 双击会先派发两次 click 再派发 dblclick;忽略第二次 click,
           // 避免对同一 thread 触发两次 onSelect(即两次 thread/resume)。
           if (e.detail > 1) return;
+          // 多选：Ctrl/Cmd 切换单选，Shift 按当前行序区间选择。没有修饰键时
+          // 照旧打开会话——选择态只是「临时搭建的动作上下文」，不该改变单击的含义。
+          if (e.metaKey || e.ctrlKey) {
+            e.preventDefault();
+            setSelected((prev) => {
+              const next = new Set(prev);
+              if (next.has(t.thread_id)) next.delete(t.thread_id);
+              else next.add(t.thread_id);
+              return next;
+            });
+            setSelectionAnchor(t.thread_id);
+            return;
+          }
+          if (e.shiftKey && selectionAnchor) {
+            e.preventDefault();
+            const from = visibleThreadIds.indexOf(selectionAnchor);
+            const to = visibleThreadIds.indexOf(t.thread_id);
+            if (from >= 0 && to >= 0) {
+              const [lo, hi] = from < to ? [from, to] : [to, from];
+              setSelected(new Set(visibleThreadIds.slice(lo, hi + 1)));
+            }
+            return;
+          }
+          if (selected.size > 0) {
+            // 有选择时点普通行 = 退出多选，而不是跳转——否则一次误点就把
+            // 辛苦攒起来的选择清空并切走了会话。
+            setSelected(new Set());
+            setSelectionAnchor(null);
+            return;
+          }
           onSelect(t.thread_id);
         }}
         onContextMenu={(e) => {
@@ -507,7 +791,9 @@ export function ThreadSidebar({
         }}
         className={`group relative flex items-center justify-between gap-1 ${indent} py-2 text-sm ${
           dragId === t.thread_id ? "opacity-50" : ""
-        } ${active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"} cursor-pointer`}
+        } ${selected.has(t.thread_id) ? "bg-raised ring-1 ring-line-strong ring-inset" : ""} ${
+          active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
+        } cursor-pointer`}
       >
         {editingId === t.thread_id ? (
           <input
@@ -665,6 +951,44 @@ export function ThreadSidebar({
                 无标签
               </button>
             </div>
+            {groupsForThread(t.thread_id).length > 0 && (
+              <button
+                type="button"
+                role="menuitem"
+                data-leave-group=""
+                onClick={() => {
+                  closeMenus();
+                  const current = groupsForThread(t.thread_id)[0];
+                  void onSetGroupMembers(
+                    current.workspace,
+                    current.group.id,
+                    current.group.threadIds.filter((id) => id !== t.thread_id),
+                  );
+                }}
+                className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+              >
+                移出分组（{groupsForThread(t.thread_id)[0].group.name}）
+              </button>
+            )}
+            {joinableGroups.length > 0 && (
+              <div role="group" aria-label="加入分组" className="border-b border-line pb-1">
+                {joinableGroups.map(({ workspace, group }) => (
+                  <button
+                    key={group.id}
+                    type="button"
+                    role="menuitem"
+                    data-join-group={group.id}
+                    onClick={() => {
+                      closeMenus();
+                      void onSetGroupMembers(workspace, group.id, [...group.threadIds, t.thread_id]);
+                    }}
+                    className="block w-full px-3 py-1.5 text-left text-xs whitespace-nowrap text-fg hover:bg-raised"
+                  >
+                    加入 {group.name}
+                  </button>
+                ))}
+              </div>
+            )}
             <button
               type="button"
               role="menuitem"
@@ -1001,14 +1325,118 @@ export function ThreadSidebar({
           renderBoardEntry(g.workspace)}
         {!isCollapsed && renderBoardThreads(g)}
         {!isCollapsed &&
-          g.threads
+          layoutWorkspace(g)
             // 组长行单独渲染在列表最顶部（见 renderLeadRow），组内不再重复一条。
-            .filter((t) => !t.pinned && !t.driver_ref && t.thread_id !== leadId)
-            .map((t) => renderThread(t, { rowAttr: "group", indentLevel: isChild ? 2 : 0 }))}
+            // `!pinned` 只作用于**框外**的行：置顶的组内会话仍留在框里（spec 刻意例外），
+            // 于是同一个会话可以在顶部 Pinned 区与框内各出现一次。
+            .filter((row) =>
+              row.kind === "thread"
+                ? !row.thread.pinned && !row.thread.driver_ref && row.thread.thread_id !== leadId
+                : true,
+            )
+            .map((row) =>
+              row.kind === "thread"
+                ? renderThread(row.thread, { rowAttr: "group", indentLevel: isChild ? 2 : 0 })
+                : renderGroupBox(g.workspace, row.group, row.members, isChild ? 2 : 0),
+            )}
         {children.map((child) => renderGroupNode(child, [], 1))}
       </div>
     );
   };
+
+  /** 提交新建组；失败时保留输入态，让用户改完再试。 */
+  const submitNewGroup = async () => {
+    if (!newGroup) return;
+    const ok = await onCreateGroup(
+      newGroup.workspace,
+      newGroup.name,
+      newGroup.description,
+      [...selected],
+    );
+    if (ok) {
+      setNewGroup(null);
+      setSelected(new Set());
+      setSelectionAnchor(null);
+    }
+  };
+
+  /**
+   * 多选操作条：只在有选择时出现。
+   *
+   * 建组要求所选会话同属一个 workspace——组不跨目录是硬约束（spec），在客户端
+   * 先拦一道能给出可读提示，而不是让服务端回一个 -32602。
+   */
+  const selectionBar = selected.size === 0 ? null : (
+    <div
+      data-selection-bar=""
+      className="sticky bottom-0 border-t border-line-strong bg-surface px-2 py-2"
+    >
+      {newGroup ? (
+        <div className="flex flex-col gap-1">
+          <input
+            data-new-group-name=""
+            autoFocus
+            placeholder="组名"
+            maxLength={GROUP_NAME_MAX}
+            value={newGroup.name}
+            onChange={(e) => setNewGroup({ ...newGroup, name: e.target.value })}
+            onCompositionStart={ime.onCompositionStart}
+            onCompositionEnd={ime.onCompositionEnd}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !isImeEnter(e, ime.composing.current)) {
+                void submitNewGroup();
+              }
+              if (e.key === "Escape") setNewGroup(null);
+            }}
+            className="rounded bg-raised px-1 py-0.5 text-sm text-fg outline-none"
+          />
+          <input
+            data-new-group-description=""
+            placeholder="描述（可选）"
+            maxLength={GROUP_DESCRIPTION_MAX}
+            value={newGroup.description}
+            onChange={(e) => setNewGroup({ ...newGroup, description: e.target.value })}
+            className="rounded bg-raised px-1 py-0.5 text-xs text-fg-muted outline-none"
+          />
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => void submitNewGroup()}
+              className="rounded bg-raised px-2 py-0.5 text-xs text-fg"
+            >
+              创建
+            </button>
+            <button
+              type="button"
+              onClick={() => setNewGroup(null)}
+              className="rounded px-2 py-0.5 text-xs text-fg-subtle"
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={() => {
+            const ids = [...selected];
+            const owner = workspaceOfThread(ids[0]);
+            if (!owner) return;
+            if (ids.some((id) => workspaceOfThread(id) !== owner)) {
+              onError("所选会话不在同一个 workspace，无法归于一组");
+              setSelected(new Set());
+              setSelectionAnchor(null);
+              return;
+            }
+            setNewGroup({ workspace: owner, name: "", description: "" });
+          }}
+          className="w-full rounded bg-raised px-2 py-1 text-xs text-fg"
+        >
+          新建组（{selected.size}）
+        </button>
+      )}
+    </div>
+  );
 
   const searchBar = (
     <div className="relative px-2 pb-2">
@@ -1149,6 +1577,7 @@ export function ThreadSidebar({
           </div>
         </div>
       </div>
+      {selectionBar}
       <div className="mt-auto flex items-center border-t border-line p-2">
         <button
           type="button"

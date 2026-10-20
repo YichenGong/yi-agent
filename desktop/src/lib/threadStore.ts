@@ -206,6 +206,11 @@ export class ThreadStore {
       // 该变体没有这个字段，落进兜底分支会往 `undefined` 这个假会话里写正文。
       return false;
     }
+    if (n.method === "thread/groupsChanged") {
+      // 目录级通知：它改的是侧栏的组表，不属于任何会话正文。App 另有分支
+      // 重拉 `thread/listAll`，这里只负责别把它漏到下面的兜底分支里。
+      return false;
+    }
     if (n.method === "error") {
       // 无 thread 归属的全局错误归当前 thread。
       return this.current()?.session.apply(n) ?? false;

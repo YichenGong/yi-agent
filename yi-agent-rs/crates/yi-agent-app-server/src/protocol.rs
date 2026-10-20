@@ -366,6 +366,14 @@ pub enum Notification {
         thread_id: String,
         tag: Option<String>,
     },
+    /// 某 workspace 的会话分组已变（`thread/group/*`）。
+    ///
+    /// 与 `thread/tagChanged` **不同族**：分组属于一个目录而不是某条会话，故
+    /// `thread_key()` 为 `None`。同时也不带分组正文——一个目录的组表可能很大，
+    /// 客户端收到后重拉 `thread/listAll` 更省事；而 `Delivery::List` 恒推，
+    /// 恰好匹配「列表要实时」。
+    #[serde(rename = "thread/groupsChanged")]
+    GroupsChanged { workspace: String },
     /// 非致命运行期告知（通道回退 / effort 降级），状态栏级一行提示。
     ///
     /// 与 `turn/retry` 同为**内容层**（按 thread 路由）：它描述的是某条会话这一次
@@ -552,6 +560,7 @@ impl Notification {
             | Notification::UiSettingsUpdated { .. }
             | Notification::TagNamesUpdated { .. }
             | Notification::ModelCapabilitiesChanged { .. }
+            | Notification::GroupsChanged { .. }
             | Notification::Error { .. } => None,
         }
     }
@@ -586,6 +595,7 @@ impl Notification {
             | Notification::PreserveThinkingChanged { .. }
             | Notification::TitleChanged { .. }
             | Notification::TagChanged { .. }
+            | Notification::GroupsChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::TagNamesUpdated { .. }
@@ -1129,6 +1139,22 @@ mod tests {
         assert_eq!(v["params"]["tag"], "red");
         assert_eq!(n.delivery(), Delivery::List);
         assert_eq!(n.thread_key(), Some("t1"));
+    }
+
+    /// 分组变更通知的 wire 形状：`thread/groupsChanged`，参数 snake_case。
+    ///
+    /// 它**不带** thread_id（分组属于目录不属于某条会话），故 `thread_key()` 为
+    /// `None`，但仍在列表层恒推——它只关一个目录，不关正文流。
+    #[test]
+    fn groups_changed_notification_carries_the_workspace() {
+        let n = Notification::GroupsChanged {
+            workspace: "/p".into(),
+        };
+        let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
+        assert_eq!(v["method"], "thread/groupsChanged");
+        assert_eq!(v["params"]["workspace"], "/p");
+        assert_eq!(n.delivery(), Delivery::List);
+        assert_eq!(n.thread_key(), None);
     }
 
     #[test]

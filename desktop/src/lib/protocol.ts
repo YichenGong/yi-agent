@@ -155,11 +155,26 @@ export interface Workspace {
   linked_to?: string | null;
 }
 
+/**
+ * 一个 workspace 内的会话分组（纯视图层：不改归属、不进模型上下文）。
+ *
+ * `threadIds` 是**成员表**而非归属声明——会话的权威归属仍是它自己的 `cwd`。
+ * 旧服务端不下发分组，故 `WorkspaceGroup.groups` 可缺省，读取时按 `[]` 处理。
+ */
+export interface SessionGroup {
+  id: string;
+  name: string;
+  description: string;
+  threadIds: string[];
+}
+
 /** `thread/listAll` 的一个目录分组。 */
 export interface WorkspaceGroup {
   workspace: string;
   exists: boolean;
   threads: ThreadSummary[];
+  /** 本目录的分组；旧服务端缺省视为无分组。 */
+  groups?: SessionGroup[];
 }
 
 /**

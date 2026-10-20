@@ -18581,3 +18581,260 @@ async fn an_interrupt_without_an_active_turn_is_an_error() {
     );
     h.shutdown().await;
 }
+
+/// `thread/listAll` 的每个目录分组都带 `groups`：真实成员下发给客户端，
+/// 悬空 id（会话已删/不属于本目录）在读取路径上被剔除。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_carries_groups_and_hides_stale_members() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    let cwd = dir.path().canonicalize().unwrap();
+
+    // 直接落盘：一个含真实成员 + 一个悬空 id 的组。
+    crate::group_store::save(
+        &cwd,
+        &[crate::group_store::Group {
+            id: "grp-a".into(),
+            name: "登录模块".into(),
+            description: String::new(),
+            thread_ids: vec![tid.clone(), "thread-gone".into()],
+        }],
+    )
+    .unwrap();
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/listAll","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    let group = v["result"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| {
+            g["workspace"].as_str().is_some_and(|w| {
+                std::path::Path::new(w).canonicalize().ok().as_deref() == Some(cwd.as_path())
+            })
+        })
+        .expect("workspace group present");
+    let groups = group["groups"]
+        .as_array()
+        .expect("groups key present on every workspace group");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["name"], "登录模块");
+    assert_eq!(groups[0]["threadIds"], serde_json::json!([tid]));
+    h.shutdown().await;
+}
+
+/// 无分组的目录也带 `groups: []`——客户端据此判断「这个键恒在」，
+/// 不必到处写 `?? []`（虽然仍要容忍旧服务端缺键）。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_always_includes_an_empty_groups_array() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let _ = read_thread_start_response(&mut h, 2).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/listAll","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    for group in v["result"]["groups"].as_array().unwrap() {
+        assert!(
+            group["groups"].is_array(),
+            "each workspace group must carry a groups array: {group}"
+        );
+    }
+    h.shutdown().await;
+}
+
+/// 建组：成功后应答带回新组，`thread/listAll` 能读到；跨目录成员、未索引目录、
+/// 空组名一律 `-32602`。
+#[tokio::test(flavor = "multi_thread")]
+async fn group_create_persists_and_validates_workspace() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    let ws = dir.path().canonicalize().unwrap();
+    let ws_text = ws.display().to_string();
+
+    let create = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/group/create",
+        "params":{"workspace": ws_text, "name": "登录模块", "description": "三条线",
+                  "threadIds":[tid]}});
+    h.send(&create.to_string()).await;
+    let v = read_response(&mut h, 3).await;
+    assert!(v.get("error").is_none(), "create must succeed: {v}");
+    assert_eq!(v["result"]["group"]["name"], "登录模块");
+    assert_eq!(v["result"]["group"]["description"], "三条线");
+    assert_eq!(v["result"]["group"]["threadIds"], serde_json::json!([tid]));
+    let gid = v["result"]["group"]["id"].as_str().unwrap().to_string();
+    assert!(gid.starts_with("grp-"), "id must be prefixed: {gid}");
+
+    // 陌生成员：伪造一个不在本目录的 id → invalid_params。
+    let stranger = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"thread/group/create",
+        "params":{"workspace": ws_text, "name": "x", "threadIds":["thread-from-elsewhere"]}});
+    h.send(&stranger.to_string()).await;
+    let v = read_response(&mut h, 4).await;
+    assert_eq!(v["error"]["code"], -32602, "跨目录成员必须被拒: {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not in this workspace"),
+        "{v}"
+    );
+
+    // 未索引目录：分组是目录级概念，未知目录一律拒绝。
+    let unindexed = serde_json::json!({"jsonrpc":"2.0","id":5,"method":"thread/group/create",
+        "params":{"workspace": "/nonexistent-dir-xyz", "name": "x", "threadIds":[tid]}});
+    h.send(&unindexed.to_string()).await;
+    let v = read_response(&mut h, 5).await;
+    assert_eq!(v["error"]["code"], -32602, "未索引目录必须被拒: {v}");
+
+    let empty_name = serde_json::json!({"jsonrpc":"2.0","id":6,"method":"thread/group/create",
+        "params":{"workspace": ws_text, "name": "   ", "threadIds":[tid]}});
+    h.send(&empty_name.to_string()).await;
+    let v = read_response(&mut h, 6).await;
+    assert_eq!(v["error"]["code"], -32602);
+    h.shutdown().await;
+}
+
+/// 更新名/描述、换成员、删除；删到空时组自动消失；未知 groupId → -32602。
+#[tokio::test(flavor = "multi_thread")]
+async fn group_update_set_members_and_delete() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    let ws = dir.path().canonicalize().unwrap().display().to_string();
+
+    let create = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/group/create",
+        "params":{"workspace": ws, "name": "a", "threadIds":[tid]}});
+    h.send(&create.to_string()).await;
+    let gid = read_response(&mut h, 3).await["result"]["group"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let update = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"thread/group/update",
+        "params":{"workspace": ws, "groupId": gid, "name": "b", "description": "d"}});
+    h.send(&update.to_string()).await;
+    assert!(read_response(&mut h, 4).await.get("error").is_none());
+
+    // 名字确实落盘了（读 listAll 而不是读应答，避免「应答正确但没写」）。
+    h.send(r#"{"jsonrpc":"2.0","id":5,"method":"thread/listAll","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 5).await;
+    let boxed: Vec<_> = v["result"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["groups"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert_eq!(boxed.len(), 1, "{boxed:?}");
+    assert_eq!(boxed[0]["name"], "b");
+    assert_eq!(boxed[0]["description"], "d");
+
+    // 空成员表 = 解散。
+    let clear = serde_json::json!({"jsonrpc":"2.0","id":6,"method":"thread/group/setMembers",
+        "params":{"workspace": ws, "groupId": gid, "threadIds":[]}});
+    h.send(&clear.to_string()).await;
+    assert!(read_response(&mut h, 6).await.get("error").is_none());
+
+    h.send(r#"{"jsonrpc":"2.0","id":7,"method":"thread/listAll","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 7).await;
+    let all: Vec<_> = v["result"]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["groups"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert!(all.is_empty(), "空组不下发: {all:?}");
+
+    // 未知 groupId → -32602。
+    let unknown = serde_json::json!({"jsonrpc":"2.0","id":8,"method":"thread/group/delete",
+        "params":{"workspace": ws, "groupId": "grp-nope"}});
+    h.send(&unknown.to_string()).await;
+    let v = read_response(&mut h, 8).await;
+    assert_eq!(v["error"]["code"], -32602);
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown group")
+    );
+    h.shutdown().await;
+}
+
+/// 删会话时成员表跟着清；成员删空后组消失。
+#[tokio::test(flavor = "multi_thread")]
+async fn deleting_a_thread_prunes_it_from_groups() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    let ws = dir.path().canonicalize().unwrap();
+    crate::group_store::save(
+        &ws,
+        &[crate::group_store::Group {
+            id: "grp-a".into(),
+            name: "a".into(),
+            description: String::new(),
+            thread_ids: vec![tid.clone()],
+        }],
+    )
+    .unwrap();
+
+    let del = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/delete",
+        "params":{"threadId": tid, "force": true}});
+    h.send(&del.to_string()).await;
+    let _ = read_response(&mut h, 3).await;
+
+    assert!(crate::group_store::load(&ws).is_empty(), "成员删空即解散");
+    h.shutdown().await;
+}
+
+/// 变更广播只带 workspace，不带分组正文。
+#[tokio::test(flavor = "multi_thread")]
+async fn group_mutations_broadcast_groups_changed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cfg = pin_test_config(dir.path());
+    let mut h = Harness::with_config(cfg, build_test_agent, Duration::from_secs(5));
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    let ws = dir.path().canonicalize().unwrap().display().to_string();
+
+    let create = serde_json::json!({"jsonrpc":"2.0","id":3,"method":"thread/group/create",
+        "params":{"workspace": ws, "name": "a", "threadIds":[tid]}});
+    h.send(&create.to_string()).await;
+    let _ = read_response(&mut h, 3).await;
+
+    let n = read_notification(&mut h, "thread/groupsChanged").await;
+    assert_eq!(n["params"]["workspace"], ws);
+    assert!(n["params"].get("groups").is_none(), "只带 workspace: {n}");
+    h.shutdown().await;
+}
