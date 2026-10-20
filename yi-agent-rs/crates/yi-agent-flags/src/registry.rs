@@ -21,6 +21,24 @@ pub fn find(name: &str) -> Option<&'static FlagDef> {
     REGISTRY.iter().find(|def| def.name == name)
 }
 
+/// 测试用的注册项。`cfg(test)` 之外的代码看不到它，也进不了 `REGISTRY`。
+#[cfg(test)]
+pub(crate) mod registry_test_support {
+    /// 测试里唯一被承认的 flag 名。
+    pub(crate) const KNOWN: &str = "known";
+}
+
+/// 测试里承认的名字。生产代码永远返回 `false`（`cfg(test)` 之外不存在）。
+#[cfg(test)]
+pub(crate) fn is_test_known(name: &str) -> bool {
+    name == registry_test_support::KNOWN
+}
+
+#[cfg(not(test))]
+pub(crate) fn is_test_known(_name: &str) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

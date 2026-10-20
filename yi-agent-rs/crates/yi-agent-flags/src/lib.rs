@@ -1,8 +1,17 @@
 //! 功能开关：让功能先合入、后开启。
 
+pub mod error;
 pub mod registry;
+pub mod store;
 
+pub use error::FlagError;
 pub use registry::{FlagDef, REGISTRY, find};
+pub use store::{FlagView, Source, all_at, is_enabled, status, status_at, write_at};
+
+/// 当前构建类型。由 `yi-agent` 的 `build.rs` 注入；测试里由 `YI_AGENT_BUILD_KIND` 决定。
+pub fn build_kind() -> &'static str {
+    option_env!("YI_AGENT_BUILD_KIND").unwrap_or("dev")
+}
 
 /// 今天的日期，`YYYY-MM-DD`。
 ///
