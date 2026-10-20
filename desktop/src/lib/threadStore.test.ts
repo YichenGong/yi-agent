@@ -67,6 +67,55 @@ describe("ThreadStore", () => {
     expect(s.view("b").unread).toBe(false);
   });
 
+  it("clears turnActive when an interrupt reports there was nothing running", () => {
+    const s = new ThreadStore();
+    s.applyNotification({
+      method: "turn/started",
+      params: { thread_id: "a", turn_id: "u1" },
+    });
+    expect(s.view("a").session.turnActive).toBe(true);
+    // 服务端明确回答「本来就没在跑」：本地的 Stop 是过期状态，就地纠正。
+    s.view("a").session.clearTurn();
+    expect(s.view("a").session.turnActive).toBe(false);
+  });
+
+  it("drops a stale turnActive when the server says the thread is idle", () => {
+    const s = new ThreadStore();
+    // 一轮开始：turn/started 把按钮切成 Stop。
+    s.applyNotification({
+      method: "turn/started",
+      params: { thread_id: "a", turn_id: "u1" },
+    });
+    expect(s.view("a").session.turnActive).toBe(true);
+    // 队列被逐字流灌满时 turn/completed 可能被丢弃；但状态推送仍然到达：
+    // 「thread 已 idle」是更权威的事实，必须能纠正卡住的 Stop。
+    s.applyNotification({
+      method: "thread/status/updated",
+      params: { thread_id: "a", status: "idle" },
+    });
+    expect(s.view("a").status).toBe("idle");
+    expect(s.view("a").session.turnActive).toBe(false);
+  });
+
+  it("keeps turnActive while the server still reports the thread as running", () => {
+    const s = new ThreadStore();
+    s.applyNotification({
+      method: "turn/started",
+      params: { thread_id: "a", turn_id: "u1" },
+    });
+    s.applyNotification({
+      method: "thread/status/updated",
+      params: { thread_id: "a", status: "running" },
+    });
+    expect(s.view("a").session.turnActive).toBe(true);
+    s.applyNotification({
+      method: "thread/status/updated",
+      params: { thread_id: "a", status: "awaiting_approval" },
+    });
+    // 等审批仍是同一轮的延续：Stop 必须保持可用（它正是取消审批轮的手段）。
+    expect(s.view("a").session.turnActive).toBe(true);
+  });
+
   it("applies thread/status/updated and clears approval once it leaves awaiting", () => {
     const s = new ThreadStore();
     s.setApproval(approval("perm-1", "a"));

@@ -3772,12 +3772,40 @@ pub(crate) async fn write_notification(
     let frame = serde_json::to_value(NotificationEnvelope::new(n))
         .map_err(|e| anyhow::anyhow!("failed to serialize notification: {e}"))?;
     // S2：列表层/全局帧恒推（无键）；内容层按 thread 过滤。无订阅者时等价于全广播。
-    let key = match n.delivery() {
+    let delivery = n.delivery();
+    let key = match delivery {
         crate::protocol::Delivery::Content => n.thread_key(),
         crate::protocol::Delivery::List | crate::protocol::Delivery::Global => None,
     };
-    hub.broadcast_for(key, frame);
+    if is_load_bearing(delivery) {
+        // 状态机帧**绝不丢**：`turn/completed` 是前端 `turnActive` 唯一的清除来源，
+        // 丢了就永久停在 Stop（服务端 `active_turn_id` 已清，之后每次点 Stop 都是
+        // 空转，只能重启 App）。逐字流（内容层）恰恰会把出站队列灌满——bash 每
+        // 4 KiB 输出一帧、桌面端又不订阅（见 `has_subscribed_clients`），所以这条
+        // 路径上的 `try_send` 在真实使用中一定会失败。改为背压投递：队列满时等
+        // 出口泵抽干，而不是丢掉这一帧。列表/全局层每个 turn 只有寥寥数帧，等待
+        // 成本可以忽略；内容层仍走非阻塞路径，否则 bash 大量输出会把 driver 堵死。
+        //
+        // `Err(Closed)` 表示可靠客户端的出口泵已真死（`pump_stdout` 写失败并注销）。
+        // 这不是本帧的问题：主循环随后的 `reply` 会拿到 `Closed` 并按既有致命语义
+        // 收尾，故此处忽略即可。
+        let _ = hub.broadcast_await(key, frame).await;
+    } else {
+        hub.broadcast_for(key, frame);
+    }
     Ok(())
+}
+
+/// 该投递层是否属于「丢了就修不回来」的状态机帧。
+///
+/// `List`：回合结束与 thread 状态，是前端 `turnActive` / 未读蓝点 / 审批框的
+/// 唯一驱动。`Global`：审批已处理、错误、主题等跨会话信号，丢一帧会留下关不掉
+/// 的弹窗。两者都只有少量帧，适合承担背压。
+fn is_load_bearing(delivery: crate::protocol::Delivery) -> bool {
+    matches!(
+        delivery,
+        crate::protocol::Delivery::List | crate::protocol::Delivery::Global
+    )
 }
 
 /// 与 [`write_notification`] 同款序列化与投递键，但走**带背压**的

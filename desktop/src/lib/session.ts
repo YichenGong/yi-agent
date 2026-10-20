@@ -212,6 +212,20 @@ export class Session {
    * Replaces `items` with a new array (rather than truncating in place) so
    * React's identity-based memoization notices the change.
    */
+  /**
+   * 丢掉一个**已经过期**的 Stop 状态。
+   *
+   * `turnActive` 只由 `turn/started` / `turn/completed` 翻转，而后者在出站队列
+   * 被逐字流灌满时可能丢失（桌面端不订阅、bash 每 4 KiB 一帧）。一旦丢失，界面
+   * 会永远显示 Stop，点击也只是对着一个已结束的 turn 空转。两个权威信号可以让
+   * 我们纠正它：`thread/status/updated: idle`，以及 `turn/interrupt` 回包里的
+   * `alreadyIdle`。这里不动 `items`——历史内容是好的，错的只是「还在跑」这个判断。
+   */
+  clearTurn(): void {
+    this.turnActive = false;
+    this.retrying = null;
+  }
+
   reset(): void {
     this.items = [];
     this.turnActive = false;

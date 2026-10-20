@@ -483,6 +483,53 @@ describe("App YOLO wiring", () => {
     );
   });
 
+  it("drops a stale Stop when a status push says the thread went idle", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({ method: "turn/started", params: { thread_id: "t1", turn_id: "u1" } });
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: /stop/i })).toBeTruthy());
+
+    // `turn/completed` 丢了，但状态推送到了：服务端说这条 thread 已 idle。
+    // 这是比「某条通知有没有到」更强的证据，界面必须回到 Send。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({ method: "thread/status/updated", params: { thread_id: "t1", status: "idle" } });
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^send$/i })).toBeTruthy(),
+    );
+  });
+
+  it("drops a stale Stop when the server answers that nothing was running", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 一轮开始 → 按钮变成 Stop。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({ method: "turn/started", params: { thread_id: "t1", turn_id: "u1" } });
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: /stop/i })).toBeTruthy());
+
+    // `turn/completed` 在出站队列被灌满时丢了；服务端其实已经空闲。
+    // 此时点 Stop，服务端回 `alreadyIdle: true` —— 界面必须就地回到 Send。
+    state.dataSources["turn/interrupt"] = () => ({ alreadyIdle: true });
+    fireEvent.click(screen.getByRole("button", { name: /stop/i }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^send$/i })).toBeTruthy(),
+    );
+  });
+
   it("does not falsely claim Normal when thread/listAll fails", async () => {
     state.failList = true;
     render(<App />);
