@@ -42,6 +42,11 @@ ensure_instance() {
     printf 'dev-env: 已从 ~/.yi-agent/.env 复制到 %s/.env\n' "$home" >&2
     printf 'dev-env: 这是**真实凭据的副本**；实验跑量会消耗同一份额度，需要隔离请改用它。\n' >&2
   fi
+  # 模型清单同样在实例外：不复制的话实例开箱就是「尚未配置模型」。
+  if [ ! -f "$home/models.json" ] && [ -f "$HOME/.yi-agent/models.json" ]; then
+    cp "$HOME/.yi-agent/models.json" "$home/models.json"
+    printf 'dev-env: 已复制 models.json 到 %s/models.json\n' "$home" >&2
+  fi
   printf '%s\n' "$home"
 }
 
@@ -95,8 +100,9 @@ case "$cmd" in
         "${HOME}/.local/bin/yi-agent-dev" daemon stop >/dev/null 2>&1 || true
     fi
     if [ "${1:-}" = "--purge" ]; then
-      rm -rf "$home"
-      printf 'dev-env: 已删除 %s\n' "$home" >&2
+      # 删整个 <id>/，否则 ~/.yi-agent-instances 会积一堆空壳目录。
+      rm -rf "$(dirname "$home")"
+      printf 'dev-env: 已删除 %s\n' "$(dirname "$home")" >&2
     fi
     ;;
   *)
