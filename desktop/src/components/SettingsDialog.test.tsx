@@ -166,6 +166,50 @@ describe("SettingsDialog", () => {
     const names = screen.getAllByRole("tab").map((t) => t.textContent);
     expect(names).toEqual(["通用", "远程访问", "插件", "模型", "技能", "MCP", "标签"]);
   });
+
+  it("hides the flags tab in a stable build", () => {
+    const call = vi.fn().mockResolvedValue({ flags: [] });
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        buildKind="release"
+        flagsCall={call}
+      />,
+    );
+    expect(screen.queryByRole("tab", { name: "实验功能" })).toBeNull();
+    // 稳定版里连请求都不该发：面板根本没挂载。
+    expect(call).not.toHaveBeenCalled();
+  });
+
+  it("shows the flags tab and lists flags in a dev build", async () => {
+    const call = vi.fn().mockResolvedValue({
+      flags: [
+        {
+          name: "a_flag",
+          summary: "实验 A",
+          enabled: false,
+          expires_on: "2026-12-31",
+          source: "default",
+        },
+      ],
+    });
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        buildKind="dev"
+        flagsCall={call}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "实验功能" }));
+    expect(await screen.findByText("a_flag")).toBeTruthy();
+    expect(call).toHaveBeenCalledWith("flags/list");
+  });
 });
 
 describe("SettingsDialog focus management & tab wiring", () => {
