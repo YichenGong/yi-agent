@@ -25,6 +25,40 @@ const approval = (id: string, threadId: string): ApprovalRequest => ({
   },
 });
 
+describe("applyNotification render signal", () => {
+  it("reports no visible change for tool-output deltas", () => {
+    // 调用方（App）只在 true 时 `force()`。bash 的流式输出每 4 KiB 一帧，
+    // 基线 UI 不渲染它；这条返回 false 就是「别为看不见的字节重绘整棵树」。
+    const s = new ThreadStore();
+    s.applyNotification({
+      method: "item/started",
+      params: {
+        thread_id: "t",
+        item: {
+          type: "toolCall",
+          id: "i1",
+          call_id: "c1",
+          name: "bash",
+          input: {},
+          status: "running",
+        },
+      },
+    });
+    expect(
+      s.applyNotification({
+        method: "item/delta",
+        params: { thread_id: "t", item_id: "i1", delta: "build log line" },
+      }),
+    ).toBe(false);
+    expect(
+      s.applyNotification({
+        method: "item/delta",
+        params: { thread_id: "t", item_id: "a1", delta: "answer" },
+      }),
+    ).toBe(true);
+  });
+});
+
 describe("ThreadStore", () => {
   it("routes notifications to the matching thread only", () => {
     const s = new ThreadStore();

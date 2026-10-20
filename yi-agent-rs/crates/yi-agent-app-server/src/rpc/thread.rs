@@ -20,20 +20,24 @@ use std::sync::Arc;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::protocol::{Notification, RequestEnvelope, RequestId, RpcError, Scope, TurnStatus};
+use crate::protocol::{
+    Notification, RequestEnvelope, RequestId, RpcError, Scope, ThreadStatus, TurnStatus,
+};
 use crate::rpc::{AppState, Flow};
 use crate::server::{
     BuiltAgent, ProcessWatch, ThreadCancelOutcome, attach_delegation, cancel_thread_children,
     chunk_items_for_replay, collect_pinned, detach_unused_runtimes, err_response,
     interrupt_and_wait_for_persist, item_id, linked_extra_roots, ok_response, require_known_thread,
     require_thread_id, resolve_thread_cwd, run_thread_driver, start_thread_core, store_lookup,
-    thread_summary_json, watch_processes, with_session_extra_roots, with_session_model_ref,
-    with_session_preserve_thinking, with_session_reasoning_effort, worktree_json,
-    write_notification, write_notification_await, write_response,
+    thread_summary_json, thread_summary_json_with_status, watch_processes,
+    with_session_extra_roots, with_session_model_ref, with_session_preserve_thinking,
+    with_session_reasoning_effort, worktree_json, write_notification, write_notification_await,
+    write_response,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
 };
+use crate::workspace_index::WorkspaceIndex;
 /// 模型未配置时返回可分支的错误；配置可用时返回 `None`。
 ///
 /// 判据只看「解析后的生效 model 是否为空」，不看清单是否为空：整包注入
@@ -108,131 +112,45 @@ pub(crate) async fn handle(
             //   索引里,则合成一组);只含看板会话的目录(卡片/合并 worktree)
             //   第一段被抑制,不再顶层成组。
             // **不动索引**:目录仍留在 workspaces 里,冷会话定位靠它。
+            //
+            // 整个应答搬到**独立 task** 里做,而不是在本臂内联等待。列表要扫
+            // 每个索引目录(逐条读 meta 文件),目录多、盘慢时这段 IO 会把这
+            // 一个主循环 task 整个占住:期间收到的 `turn/interrupt` 只能干等,
+            // 用户看到的就是「点了 Stop 没反应」。主 runtime 是多线程的,把
+            // 列表挪到别的 worker 后,主循环立刻回到 `select!`。
+            //
+            // 代价是扫目录期间不能借 `&mut threads`。故先把「每个 thread 此刻
+            // 的状态」快照成 `HashMap<String, ThreadStatus>`,任务按快照出 JSON
+            // ——除了状态来源,输出与内联版本逐字相同。
             let dirs = state.workspaces.list();
-            // 组顺序:先索引目录(保持最近在前),再追加索引外的新项目组。
-            let mut order: Vec<String> = Vec::new();
-            let mut seen: HashSet<String> = HashSet::new();
-            let mut exists_of: HashMap<String, bool> = HashMap::new();
-            let mut plain: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-            let mut cards: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
-            for dir in &dirs {
-                if seen.insert(dir.clone()) {
-                    order.push(dir.clone());
-                    exists_of.insert(dir.clone(), Path::new(dir).is_dir());
-                }
-                // 失效目录:不深扫,组照留(threads 空),与抽取前一致。
-                let path = Path::new(dir);
-                if !path.is_dir() {
-                    continue;
-                }
-                // 读取错误(如权限拒绝)不能静默等同于「无 thread」:
-                // 记 stderr 后再降级为空组,与 thread/list 的错误可见性一致。
-                let mut read_ok = true;
-                let mut metas = match crate::thread_store::ThreadStore::new(path).list() {
-                    Ok(metas) => metas,
-                    Err(e) => {
-                        eprintln!("[app-server] thread/listAll failed to list {dir}: {e}");
-                        read_ok = false;
-                        Vec::new()
-                    }
-                };
-                // 每个被列举的**空**项目目录都确保有组长,让侧栏里本就没有
-                // 任何条目的项目也有一个组长入口。失败只记日志——列表查询
-                // 不得因单个目录不可写而整体失败。
-                //
-                // 为什么限定「没有任何会话」:组长 meta 的 `driver_project`
-                // 是 `None`,一旦写进已有会话的目录,它就会被算作「该目录
-                // 自己的会话」,从而①把「每个目录组恰好一个会话」变成两个、
-                // ②让只含卡片会话的 worktree 不再被抑制成顶层组。两者都是
-                // `listAll` 既有行为的一部分,列表查询不得改写它。已有会话的
-                // 项目仍是懒创建的目标,只是触发点更准:用户点组长入口
-                // (`thread/lead`)或某个会话给组长留言(`resolve_lead_target`)。
-                //
-                // 读失败的目录(`read_ok == false`)不写:读不到就不该有副作用。
-                // 看板 worktree(`.worktrees/kanban/<slug>` 与 `.worktrees/kanban-merge/<slug>`)
-                // 不是项目:它没有组长,绝不能在这里被种一个——真机上 9 个幽灵组长
-                // 正是这条懒创建路径(经卡片会话 `ask_lead` → `resolve_lead_target`)
-                // 落下的。判定按整个 `.worktrees/kanban*` 领地,合并轮一并覆盖。
-                if read_ok && metas.is_empty() && !crate::plugin_worktree::is_plugin_worktree(path)
-                {
-                    if let Err(e) = crate::lead::ensure_lead_meta(
-                        &crate::thread_store::ThreadStore::new(path),
-                        path,
-                    ) {
-                        eprintln!(
-                            "[app-server] thread/listAll could not ensure a lead for {dir}: {e}"
-                        );
-                    }
-                    // 新落的组长 meta 并入本轮列举结果,否则「本目录的
-                    // 会话」是懒创建**之前**的快照,刚种下的组长在这一
-                    // 次响应里就不可见(要等下一次刷新才出现)。
-                    if let Ok(fresh) = crate::thread_store::ThreadStore::new(path).list() {
-                        metas = fresh;
-                    }
-                }
-                let own: Vec<_> = metas
-                    .iter()
-                    .filter(|m| m.driver_project.is_none())
-                    .collect();
-                // 看板 worktree(`.worktrees/kanban*`)不是项目:它永不顶层成组,也不贡献
-                // 「自己的会话」。真机上这类目录里还躺着一个误落盘的幽灵组长
-                // (`role:"lead"`,`driver_project: None`)——若照旧把它算进 `own`,该
-                // worktree 就会在侧栏里变成一个带「组长」行的顶层项目组(用户报的现象)。
-                let plugin_worktree = crate::plugin_worktree::is_plugin_worktree(path);
-                // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
-                // 否则它只是个看板 worktree,归拢后被抑制。
-                if !plugin_worktree && (!own.is_empty() || metas.is_empty()) {
-                    for m in own {
-                        plain
-                            .entry(dir.clone())
-                            .or_default()
-                            .push(thread_summary_json(m, state.threads));
-                    }
-                } else {
-                    // 只含看板会话(或误落盘的幽灵组长):抑制顶层空组(稍后不产出)。
-                    seen.remove(dir);
-                    order.retain(|d| d != dir);
-                }
-                // 驱动会话:归入 driver_project 指定的组(可为索引外的项目)。
-                for m in metas.iter().filter(|m| m.driver_project.is_some()) {
-                    let target = m.driver_project.clone().unwrap();
-                    if seen.insert(target.clone()) {
-                        order.push(target.clone());
-                        exists_of.insert(target.clone(), Path::new(&target).is_dir());
-                    }
-                    exists_of
-                        .entry(target.clone())
-                        .or_insert_with(|| Path::new(&target).is_dir());
-                    cards
-                        .entry(target)
-                        .or_default()
-                        .push(thread_summary_json(m, state.threads));
-                }
-            }
-            let groups: Vec<serde_json::Value> = order
+            let statuses: HashMap<String, ThreadStatus> = state
+                .threads
                 .iter()
-                .map(|ws| {
-                    let mut merged = plain.remove(ws).unwrap_or_default();
-                    if let Some(mut folded) = cards.remove(ws) {
-                        merged.append(&mut folded);
-                    }
-                    json!({
-                        "workspace": ws,
-                        "exists": exists_of.get(ws).copied().unwrap_or(false),
-                        "threads": merged,
-                    })
+                .map(|(tid, s)| {
+                    (
+                        tid.clone(),
+                        *s.status.lock().unwrap_or_else(|p| p.into_inner()),
+                    )
                 })
                 .collect();
-            let pinned: Vec<serde_json::Value> = collect_pinned(state.workspaces)
-                .iter()
-                .map(|m| thread_summary_json(m, state.threads))
-                .collect();
-            write_response(
-                state.hub,
-                state.client,
-                ok_response(id, json!({ "groups": groups, "pinned": pinned })),
-            )
-            .await?;
+            let hub = Arc::clone(state.hub);
+            let client = state.client.clone();
+            let workspaces = Arc::clone(state.workspaces);
+            tokio::spawn(async move {
+                let reply = tokio::task::spawn_blocking(move || {
+                    build_list_all_response(&dirs, &workspaces, &statuses)
+                })
+                .await;
+                let body = match reply {
+                    Ok(body) => body,
+                    Err(error) => {
+                        eprintln!("[app-server] thread/listAll task failed: {error}");
+                        json!({ "groups": [], "pinned": [] })
+                    }
+                };
+                let _ = write_response(&hub, &client, ok_response(id, body)).await;
+            });
+            return Ok(Flow::Continue);
         }
         "thread/start" => {
             let thread_id = format!("thread-{}", uuid::Uuid::new_v4());
@@ -2064,4 +1982,137 @@ pub(crate) async fn handle(
     // 臂体走完而**没有** `continue` 的路径,在搬移前同样落到本轮 dispatch 的
     // 末尾、回到主循环下一轮 —— 即与 `continue` 等价,故统一在此收束。
     Ok(Flow::Continue)
+}
+
+/// 扫描索引里的每个工作目录，产出 `(目录, metas)`。
+///
+/// `None` 表示「这个目录不该有内容」：路径不可用，或读取失败（权限、IO 抖动）。
+/// 调用方据此把该组留成空组——与改造前「读错误降级为空组」的可见性一致。
+///
+/// 每个**空**项目目录顺便确保有组长（`ensure_lead_meta`）：侧栏里本就没有任何
+/// 条目的项目也应有组长入口。限定「没有任何会话」的理由见 `thread/listAll` 臂内
+/// 注释；读失败的目录不写（读不到就不该有副作用）；看板 worktree 绝不种组长
+/// （真机上的 9 个幽灵组长正是从这里漏出去的）。
+///
+/// 这个是**纯阻塞函数**，由 `spawn_blocking` 调用：它只碰磁盘，不碰主循环状态，
+/// 因此可以整体挪出 `select!`，避免一次长扫描把 `turn/interrupt` 一起堵住。
+fn scan_workspace_metas(
+    dirs: &[String],
+) -> Vec<(String, Option<Vec<crate::thread_store::ThreadMeta>>)> {
+    let mut out = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let path = Path::new(dir);
+        if !path.is_dir() {
+            out.push((dir.clone(), None));
+            continue;
+        }
+        let mut metas = match crate::thread_store::ThreadStore::new(path).list() {
+            Ok(metas) => metas,
+            Err(e) => {
+                eprintln!("[app-server] thread/listAll failed to list {dir}: {e}");
+                out.push((dir.clone(), None));
+                continue;
+            }
+        };
+        if metas.is_empty() && !crate::plugin_worktree::is_plugin_worktree(path) {
+            if let Err(e) =
+                crate::lead::ensure_lead_meta(&crate::thread_store::ThreadStore::new(path), path)
+            {
+                eprintln!("[app-server] thread/listAll could not ensure a lead for {dir}: {e}");
+            }
+            // 新落的组长 meta 并入本轮列举结果，否则「本目录的会话」是懒创建
+            // **之前**的快照，刚种下的组长在这次响应里就不可见。
+            if let Ok(fresh) = crate::thread_store::ThreadStore::new(path).list() {
+                metas = fresh;
+            }
+        }
+        out.push((dir.clone(), Some(metas)));
+    }
+    out
+}
+
+/// 构造 `thread/listAll` 的应答体（纯函数，可离开主循环执行）。
+///
+/// 分组规则与臂内联版本逐字相同，唯一差别是状态来自 `statuses` 快照：
+/// 扫描在独立 task 里跑，拿不到 `&mut threads`。
+fn build_list_all_response(
+    dirs: &[String],
+    workspaces: &Arc<WorkspaceIndex>,
+    statuses: &HashMap<String, ThreadStatus>,
+) -> serde_json::Value {
+    let summary = |m: &crate::thread_store::ThreadMeta| {
+        thread_summary_json_with_status(
+            m,
+            statuses
+                .get(&m.thread_id)
+                .copied()
+                .unwrap_or(ThreadStatus::Idle),
+        )
+    };
+    // 组顺序:先索引目录(保持最近在前),再追加索引外的新项目组。
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut exists_of: HashMap<String, bool> = HashMap::new();
+    let mut plain: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut cards: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+
+    for (dir, metas) in scan_workspace_metas(dirs) {
+        if seen.insert(dir.clone()) {
+            order.push(dir.clone());
+            exists_of.insert(dir.clone(), Path::new(&dir).is_dir());
+        }
+        // `None` = 失效目录或读失败：组照留（threads 空），与抽取前一致。
+        let Some(metas) = metas else {
+            continue;
+        };
+        let own: Vec<_> = metas
+            .iter()
+            .filter(|m| m.driver_project.is_none())
+            .collect();
+        // 看板 worktree(`.worktrees/kanban*`)不是项目:它永不顶层成组,也不贡献
+        // 「自己的会话」。真机上这类目录里还躺着一个误落盘的幽灵组长
+        // (`role:"lead"`,`driver_project: None`)——若照旧把它算进 `own`,该
+        // worktree 就会在侧栏里变成一个带「组长」行的顶层项目组(用户报的现象)。
+        let plugin_worktree = crate::plugin_worktree::is_plugin_worktree(Path::new(&dir));
+        // 该目录有「自己的」普通会话(或本就为空)才作为顶层组保留;
+        // 否则它只是个看板 worktree,归拢后被抑制。
+        if !plugin_worktree && (!own.is_empty() || metas.is_empty()) {
+            for m in own {
+                plain.entry(dir.clone()).or_default().push(summary(m));
+            }
+        } else {
+            // 只含看板会话(或误落盘的幽灵组长):抑制顶层空组(稍后不产出)。
+            seen.remove(&dir);
+            order.retain(|d| d != &dir);
+        }
+        // 驱动会话:归入 driver_project 指定的组(可为索引外的项目)。
+        for m in metas.iter().filter(|m| m.driver_project.is_some()) {
+            let target = m.driver_project.clone().unwrap();
+            if seen.insert(target.clone()) {
+                order.push(target.clone());
+                exists_of.insert(target.clone(), Path::new(&target).is_dir());
+            }
+            exists_of
+                .entry(target.clone())
+                .or_insert_with(|| Path::new(&target).is_dir());
+            cards.entry(target).or_default().push(summary(m));
+        }
+    }
+
+    let groups: Vec<serde_json::Value> = order
+        .iter()
+        .map(|ws| {
+            let mut merged = plain.remove(ws).unwrap_or_default();
+            if let Some(mut folded) = cards.remove(ws) {
+                merged.append(&mut folded);
+            }
+            json!({
+                "workspace": ws,
+                "exists": exists_of.get(ws).copied().unwrap_or(false),
+                "threads": merged,
+            })
+        })
+        .collect();
+    let pinned: Vec<serde_json::Value> = collect_pinned(workspaces).iter().map(summary).collect();
+    json!({ "groups": groups, "pinned": pinned })
 }

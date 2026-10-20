@@ -953,7 +953,20 @@ async fn run_loop(
             return;
         }
 
-        if let Some(new_messages) = maybe_auto_compact(&tx, &provider, &config, &session).await {
+        let compacted = maybe_auto_compact(&tx, &provider, &config, &session, &cancel_token).await;
+        if matches!(compacted, AutoCompact::Cancelled) {
+            // A Stop pressed while the summary was in flight. The compaction
+            // future was dropped at its await, so nothing was replaced; keep the
+            // run's user prompt and completed round-trips (same policy as a
+            // cancel during the provider call).
+            info!(turn, "agent loop cancelled during auto-compact");
+            let keep = safe_cancel_truncate_len(&session.lock().unwrap());
+            session.lock().unwrap().truncate(keep);
+            flush_unconsumed(&tx, &inbox).await;
+            let _ = tx.send(AgentEvent::Cancelled).await;
+            return;
+        }
+        if let AutoCompact::Compacted(new_messages) = compacted {
             messages = new_messages;
             // Compaction replaced the history, so the incremental request-log
             // cursor no longer refers to this message vector.
@@ -1702,22 +1715,43 @@ async fn handle_confirmation(
     }
 }
 
+/// Outcome of the pre-THINK auto-compaction check.
+///
+/// `Cancelled` is distinct from `Skipped`: a Stop that lands while the summary
+/// request is in flight must end the run, not fall through to THINK.
+enum AutoCompact {
+    Compacted(Vec<Message>),
+    Skipped,
+    Cancelled,
+}
+
 async fn maybe_auto_compact(
     tx: &EventTx,
     provider: &Arc<dyn Provider>,
     config: &AgentConfig,
     session: &Arc<Mutex<Session>>,
-) -> Option<Vec<Message>> {
-    let threshold = config
-        .compact_threshold
-        .filter(|threshold| *threshold > 0)?;
+    cancel_token: &CancellationToken,
+) -> AutoCompact {
+    let Some(threshold) = config.compact_threshold.filter(|threshold| *threshold > 0) else {
+        return AutoCompact::Skipped;
+    };
     let snapshot = session.lock().unwrap().clone();
-    if snapshot.last_input_tokens()? < threshold {
-        return None;
+    match snapshot.last_input_tokens() {
+        Some(tokens) if tokens >= threshold => {}
+        _ => return AutoCompact::Skipped,
     }
 
     let old_count = snapshot.len();
-    match crate::compact::compact_session(provider, config, &snapshot).await {
+    // Race the summary request against Stop. Compaction used to await the
+    // provider unconditionally, so a Stop pressed here was swallowed until the
+    // request returned (up to the provider's timeout) — the user saw a dead
+    // Stop button while "the model was running". Winning the race by cancel
+    // drops the future at the await, so the session is still untouched.
+    let compacted = tokio::select! {
+        result = crate::compact::compact_session(provider, config, &snapshot) => result,
+        _ = cancel_token.cancelled() => return AutoCompact::Cancelled,
+    };
+    match compacted {
         Ok(Some(new_session)) if new_session.len() < old_count => {
             let new_messages = new_session.messages().to_vec();
             {
@@ -1731,12 +1765,12 @@ async fn maybe_auto_compact(
                     new_msg_count: new_messages.len(),
                 })
                 .await;
-            Some(new_messages)
+            AutoCompact::Compacted(new_messages)
         }
-        Ok(Some(_)) | Ok(None) => None,
+        Ok(Some(_)) | Ok(None) => AutoCompact::Skipped,
         Err(error) => {
             tracing::warn!(error = %error, "auto-compact failed, will retry next think");
-            None
+            AutoCompact::Skipped
         }
     }
 }
@@ -3487,6 +3521,32 @@ mod tests {
         assert!(token.is_cancelled());
     }
 
+    /// Provider whose `call()` (the non-streaming path auto-compact uses) blocks
+    /// for a long time — simulates awaiting the summary response from the network.
+    /// The flag lets a test cancel precisely while that call is in flight.
+    struct BlockingCallProviderNamed;
+
+    static COMPACT_CALL_ENTERED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[async_trait]
+    impl Provider for BlockingCallProviderNamed {
+        async fn call_stream(
+            &self,
+            _req: ProviderRequest,
+        ) -> Result<BoxStream<'static, ProviderEvent>, ProviderError> {
+            COMPACT_CALL_ENTERED.store(true, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let stream = futures::stream::iter(vec![
+                ProviderEvent::TextDelta("summary text".into()),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ]);
+            Ok(stream.boxed())
+        }
+    }
+
     /// Provider whose stream never produces events (simulates a long LLM call).
     struct HangingProvider;
 
@@ -3721,6 +3781,70 @@ mod tests {
         // No assistant reply exists yet, so the run's user prompt is kept.
         assert_eq!(agent.session().len(), 1);
         assert_eq!(agent.session().messages()[0].role, Role::User);
+    }
+
+    /// A cancel that lands while auto-compaction is awaiting its summary must be
+    /// observed promptly. `maybe_auto_compact` runs *before* THINK and used to
+    /// await `provider.call(..)` with no race against the cancel token, so a Stop
+    /// pressed during compaction was swallowed until the summary request
+    /// returned (up to the provider's timeout). Regression for "Stop does nothing
+    /// while the model is compacting".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_cancel_while_auto_compact_is_in_flight() {
+        COMPACT_CALL_ENTERED.store(false, std::sync::atomic::Ordering::SeqCst);
+        let provider = Arc::new(BlockingCallProviderNamed);
+        let tools = Arc::new(ToolRegistry::new());
+        let config = AgentConfig {
+            compact_threshold: Some(1),
+            ..Default::default()
+        };
+        let mut session = Session::new();
+        session.push(Message::user("old1"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply1".into(),
+        )]));
+        session.push(Message::user("old2"));
+        session.push(Message::assistant(vec![ContentBlock::Text(
+            "reply2".into(),
+        )]));
+        session.set_last_input_tokens(Some(999_999));
+        let mut agent = Agent::new(provider, tools, config).with_session(session);
+
+        let stream = agent.run("prompt".into()).await.unwrap();
+        let cancel_token = agent.cancel_token();
+
+        // Wait until compaction has actually entered the provider call.
+        for _ in 0..500 {
+            if COMPACT_CALL_ENTERED.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            COMPACT_CALL_ENTERED.load(std::sync::atomic::Ordering::SeqCst),
+            "compaction must have entered the summary request before we cancel"
+        );
+
+        let cancel_token_clone = cancel_token.clone();
+        tokio::spawn(async move {
+            cancel_token_clone.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let events = collect_events(stream);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "cancel during auto-compact must be observed promptly, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::Cancelled)),
+            "should have Cancelled event, got: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, AgentEvent::Done { .. })),
+            "should NOT have Done event, got: {events:?}"
+        );
     }
 
     /// When the provider stream emits a TextDelta then stalls (no Stop event),

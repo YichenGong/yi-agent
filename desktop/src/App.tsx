@@ -1302,8 +1302,14 @@ export default function App() {
           return;
         }
         // 按 thread_id 路由:后台 thread 的流式输出照常累积,切回去即最新。
-        store.applyNotification(n);
-        force((v) => v + 1);
+        //
+        // 只在这一帧**真的有可见变化**时重渲染。bash 每 4 KiB 输出就推一帧
+        // `item/delta`，而基线 UI 不渲染工具流式输出；照旧每帧 `force()` 会让长
+        // 命令（构建日志、`cat` 大文件）持续把整棵树重绘，主线程被占住时连 Stop
+        // 都点不下去。`turn/completed` 例外：它虽已把内容变化算进返回值，但还要
+        // 触发下面的列表刷新，所以单独保证重渲染。
+        const changed = store.applyNotification(n);
+        if (changed || n.method === "turn/completed") force((v) => v + 1);
         // `Notification` 是判别联合：只有带 `thread_id` 的通知才有会话内容可落盘
         // （`error` 无归属、由 store 归到当前会话，在此跳过）。其余 `agent/*`、
         // `ui/*` 通知已在上方分支提前返回。
@@ -2235,16 +2241,42 @@ export default function App() {
                     syncing={!offline && store.peek(sess.currentId)?.syncState === "syncing"}
                   />
                 )}
-              <ChatView
-                items={current?.session.items ?? []}
-                error={current?.session.lastError ?? null}
-                retrying={current?.session.retrying ?? null}
-                threadId={sess.currentId}
-                // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
-                // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
-                call={imageCall}
-                structuralVersion={current?.session.structuralVersion ?? 0}
-              />
+              {/*
+                转录区是审批弹窗的定位作用域：弹窗只盖住历史内容，不盖输入卡片。
+                它曾经挂在 `.app-main`（整个主列）下，`absolute inset-0` 于是连
+                Stop 一起涂黑——一个正在等审批的 turn 在用户眼里变成「点不动」，
+                只能先答审批才能打断。作用域收到这一层后，弹窗的 `inset-0` 只覆盖
+                `flex-1` 的转录列，输入区仍在它下面可用。
+              */}
+              <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                <ChatView
+                  items={current?.session.items ?? []}
+                  error={current?.session.lastError ?? null}
+                  retrying={current?.session.retrying ?? null}
+                  threadId={sess.currentId}
+                  // 稳定的 `imageCall`（见上），别在这里内联箭头：它会进
+                  // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
+                  call={imageCall}
+                  structuralVersion={current?.session.structuralVersion ?? 0}
+                />
+                {approval && (
+                  <ApprovalDialog
+                    key={approval.id}
+                    request={approval}
+                    onDecide={async (decision) => {
+                      try {
+                        await clientRef.current?.respond(approval.id, decision);
+                      } catch (e) {
+                        const s = store.peek(approval.params.thread_id)?.session;
+                        if (s) s.lastError = formatError(e);
+                      } finally {
+                        store.clearApproval(approval.params.thread_id);
+                        force((v) => v + 1);
+                      }
+                    }}
+                  />
+                )}
+              </div>
               <MessageInput
                 turnActive={current?.session.turnActive ?? false}
                 onSend={send}
@@ -2345,23 +2377,6 @@ export default function App() {
               ) : null
             }
           />
-          {approval && (
-            <ApprovalDialog
-              key={approval.id}
-              request={approval}
-              onDecide={async (decision) => {
-                try {
-                  await clientRef.current?.respond(approval.id, decision);
-                } catch (e) {
-                  const s = store.peek(approval.params.thread_id)?.session;
-                  if (s) s.lastError = formatError(e);
-                } finally {
-                  store.clearApproval(approval.params.thread_id);
-                  force((v) => v + 1);
-                }
-              }}
-            />
-          )}
         </div>
         {/*
           右侧详情栏：`[子 agent | Git Diff]`，与左侧会话侧栏同级的独立列。

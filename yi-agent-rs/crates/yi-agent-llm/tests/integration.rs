@@ -589,30 +589,63 @@ async fn stop_sequence_stop_reason_end_to_end() {
     }
 }
 
-/// Proves the request timeout is a **total deadline**, not an idle timeout.
+/// Read the request head plus its body, so the peer is never left with unread
+/// bytes. Closing a socket that still holds unread inbound data sends a RST,
+/// which truncates the response body — reqwest then reports it as a decode
+/// error even though every event was written.
+async fn drain_request<S>(socket: &mut S)
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match socket.read(&mut chunk).await {
+            Ok(0) => return,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+                let want: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                if buf.len() - (head_end + 4) >= want {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// A stream that keeps producing output must not be cut off by a total deadline.
 ///
-/// The mock server keeps sending valid SSE events every 300ms for 3s, so the
-/// connection is never idle. The provider's timeout is 1s. If `reqwest`'s
-/// `ClientBuilder::timeout` were an idle/read timeout, the stream would run to
-/// completion. Because it is a total deadline ("from when the request starts
-/// connecting until the response body has finished"), the stream must be cut
-/// off around 1s and surface as a terminal `Stop { Other("stream error: ...") }`.
+/// 这条测试是 bug-list「300 秒的输出时长 cutoff 不合理」的判据：服务器每 100ms
+/// 送一个合法 SSE 事件、连续送 1.2s，而 provider 的 timeout 只有 400ms。`reqwest`
+/// 的 `.timeout()` 是「从连接开始到响应体读完」的**总期限**，它会在 400ms 处把一条
+/// 仍在正常输出的流硬砍断；正确的语义是「没有输出才计时」（`read_timeout`）——
+/// 每次读到数据就重置，故 1.2s 的流必须完整跑完。
 #[tokio::test]
-async fn request_timeout_is_a_total_deadline_not_an_idle_timeout() {
+async fn a_stream_that_keeps_producing_output_is_not_cut_off_by_a_total_deadline() {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    // Server: accept one connection, reply with SSE headers, then trickle a
-    // valid event every 300ms for 3s (never idle for even one timeout window).
     tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
+        drain_request(&mut socket).await;
         let _ = socket
             .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
             .await;
-        for _ in 0..10 {
+        // 12 段 × 100ms = 1.2s，远长于 400ms 的 timeout，但每段间隔都远短于它。
+        for _ in 0..12 {
             let ev = "event: content_block_delta\n\
                       data: {\"type\":\"content_block_delta\",\"index\":0,\
                       \"delta\":{\"type\":\"text_delta\",\"text\":\"tick\"}}\n\n";
@@ -620,15 +653,18 @@ async fn request_timeout_is_a_total_deadline_not_an_idle_timeout() {
                 return;
             }
             let _ = socket.flush().await;
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        let _ = socket
+            .write_all(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            .await;
     });
 
     let provider = AnthropicProvider::new(AnthropicProviderOpts {
         base_url: Some(format!("http://{addr}")),
         api_key: Some("test-key".to_string()),
         api_version: None,
-        timeout: Some(Duration::from_secs(1)),
+        timeout: Some(Duration::from_millis(400)),
     })
     .expect("provider construction");
 
@@ -640,19 +676,71 @@ async fn request_timeout_is_a_total_deadline_not_an_idle_timeout() {
     let events = collect_events(stream).await;
     let elapsed = started.elapsed();
 
-    // Cut off well before the server's 3s of output.
     assert!(
-        elapsed < Duration::from_secs(2),
-        "stream should be cut off by the 1s total deadline, took {elapsed:?}"
+        elapsed > Duration::from_millis(900),
+        "the stream must run to completion instead of being cut at the 400ms \
+         total deadline, took {elapsed:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ProviderEvent::StreamError(_))),
+        "a busy stream must not fail: {events:?}"
+    );
+    let ticks = events
+        .iter()
+        .filter(|e| matches!(e, ProviderEvent::TextDelta(t) if t == "tick"))
+        .count();
+    assert_eq!(ticks, 12, "every chunk must be delivered: {events:?}");
+}
+
+/// Silence *is* still a timeout: `timeout` now measures "no output", so a server
+/// that sends headers and then goes quiet must fail instead of hanging forever.
+/// This is the other half of the contract above — without it, removing the total
+/// deadline would turn every dead connection into an infinite hang.
+#[tokio::test]
+async fn a_silent_stream_still_times_out() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        drain_request(&mut socket).await;
+        let _ = socket
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")
+            .await;
+        let _ = socket.flush().await;
+        // Headers only, then silence — hold the socket open so this is a stall,
+        // not an EOF.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    });
+
+    let provider = AnthropicProvider::new(AnthropicProviderOpts {
+        base_url: Some(format!("http://{addr}")),
+        api_key: Some("test-key".to_string()),
+        api_version: None,
+        timeout: Some(Duration::from_millis(400)),
+    })
+    .expect("provider construction");
+
+    let started = std::time::Instant::now();
+    let stream = provider
+        .call_stream(simple_request())
+        .await
+        .expect("stream ok");
+    let events = collect_events(stream).await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a silent stream must time out promptly, took {elapsed:?}"
     );
     let last = events.last().expect("at least one event");
-    match last {
-        // A transport deadline is now a typed failure, not a stringly stop
-        // reason, so the agent loop can classify it without string matching.
-        ProviderEvent::StreamError(ProviderError::Network(msg)) => assert!(
-            msg.contains("timed out"),
-            "a deadline must be classified as a timeout, got: {msg}"
-        ),
-        other => panic!("expected StreamError after timeout, got: {other:?}"),
-    }
+    assert!(
+        matches!(last, ProviderEvent::StreamError(ProviderError::Network(msg)) if msg.contains("timed out")),
+        "silence must surface as a timeout error, got: {last:?}"
+    );
 }

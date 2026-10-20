@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor, act } from "@testing-library/react";
 import type { ComponentProps, ReactNode } from "react";
 import { useState } from "react";
 import { MessageInput } from "./MessageInput";
@@ -340,6 +340,52 @@ describe("MessageInput", () => {
       expect(stop.disabled).toBe(false);
       fireEvent.click(stop);
       expect(onInterrupt).toHaveBeenCalled();
+    });
+
+    it("keeps Stop clickable while the send is still in flight", () => {
+      // 发送是一个 await：`onSend` 在 turn/start 回包前一直挂着。若把 `sending`
+      // 也算进 Stop 的 disabled，那么服务端可能已经在这段时间里开始跑了（甚至
+      // 已经在跑一个长 bash），用户却点不动 Stop——真机上「点了没反应」的常见
+      // 一种。打断的可用性只取决于 turn 是否活跃，与「这次发送还没回包」无关。
+      const onInterrupt = vi.fn();
+      let startTurn: (() => void) | null = null;
+      const onSend = vi.fn(
+        () =>
+          new Promise<boolean>(() => {
+            // Never resolves: the send stays in flight for the whole test.
+          }),
+      );
+      function Harness() {
+        const [turnActive, setTurnActive] = useState(false);
+        startTurn = () => setTurnActive(true);
+        return (
+          <MessageInput
+            turnActive={turnActive}
+            onSend={onSend}
+            onInterrupt={onInterrupt}
+            mode="normal"
+            onModeChange={vi.fn()}
+            onSlashCommand={vi.fn()}
+            value="hello"
+            onDraftChange={vi.fn()}
+            attachments={[]}
+            onPickAttachments={vi.fn()}
+            onRemoveAttachment={vi.fn()}
+            call={vi.fn(async () => ({}))}
+          />
+        );
+      }
+      render(<Harness />);
+
+      fireEvent.click(screen.getByRole("button", { name: /send/i }));
+      expect(onSend).toHaveBeenCalledTimes(1);
+      // 服务端已开始这一轮：父级把 turnActive 置真，而 `sending` 仍为 true。
+      act(() => startTurn!());
+
+      const stop = screen.getByRole("button", { name: /stop/i }) as HTMLButtonElement;
+      expect(stop.disabled).toBe(false);
+      fireEvent.click(stop);
+      expect(onInterrupt).toHaveBeenCalledTimes(1);
     });
 
     it("asks the parent to pick attachments from the single attach button", () => {

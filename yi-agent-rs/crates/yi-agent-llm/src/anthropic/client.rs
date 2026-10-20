@@ -85,8 +85,14 @@ impl AnthropicProvider {
             .timeout
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_TIMEOUT_SECS));
 
+        // 连接要有时限，但**响应体不能有总期限**：`.timeout()` 是「从开始连接
+        // 一直到响应体读完」的总期限，它会把一条正常输出的长回答在 300 秒处
+        // 硬砍断（真实表现：长回答/长思考到点被截断成 stream error）。
+        // 这里要的是「没有输出才计时」：`read_timeout` 按每次读操作计时，读到
+        // 数据就重置——服务器一直在流，流就一直跑；真的静默了才判超时。
         let client = reqwest::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
             .build()
             .map_err(|e| ProviderError::Network(format!("failed to build HTTP client: {e}")))?;
 
@@ -119,7 +125,6 @@ impl Provider for AnthropicProvider {
             .header("anthropic-version", &self.api_version)
             .header("content-type", "application/json")
             .json(&body)
-            .timeout(self.timeout)
             .send()
             .await
             .map_err(|e| {
