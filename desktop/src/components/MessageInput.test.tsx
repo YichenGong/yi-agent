@@ -489,7 +489,6 @@ describe("MessageInput", () => {
       expect(options.map((o) => o.textContent)).toEqual([
         expect.stringContaining("/compact"),
         expect.stringContaining("/config"),
-        expect.stringContaining("/cost"),
       ]);
     });
 
@@ -537,10 +536,10 @@ describe("MessageInput", () => {
       const onSlashCommand = vi.fn();
       renderInput({ onSend, onSlashCommand });
       const textarea = screen.getByRole("textbox");
-      fireEvent.change(textarea, { target: { value: "/cos" } });
+      fireEvent.change(textarea, { target: { value: "/us" } });
       fireEvent.keyDown(textarea, { key: "Enter" });
 
-      expect(onSlashCommand).toHaveBeenCalledWith("cost", null);
+      expect(onSlashCommand).toHaveBeenCalledWith("usage", null);
       expect(onSend).not.toHaveBeenCalled();
     });
 
@@ -682,10 +681,10 @@ describe("MessageInput", () => {
       renderInput({ isMobile: true, onSend, onSlashCommand });
 
       const textarea = screen.getByRole("textbox");
-      fireEvent.change(textarea, { target: { value: "/cost" } });
+      fireEvent.change(textarea, { target: { value: "/usage" } });
       fireEvent.click(screen.getByRole("button", { name: /send/i }));
 
-      expect(onSlashCommand).toHaveBeenCalledWith("cost", null);
+      expect(onSlashCommand).toHaveBeenCalledWith("usage", null);
       expect(onSend).not.toHaveBeenCalled();
     });
 
