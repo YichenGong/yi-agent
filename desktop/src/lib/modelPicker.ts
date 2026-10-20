@@ -89,7 +89,7 @@ export const REASONING_EFFORTS = [
   "max",
 ] as const;
 
-/** effort 下拉里的一项。`value === null` 即「未设置」（清除会话覆盖）。 */
+/** effort 下拉里的一项。`value === null` 即「自动」（清除会话覆盖）。 */
 export type EffortOption = {
   /** 选中后写进 `thread/setReasoningEffort` 的档位；`null` = 清除覆盖。 */
   value: string | null;
@@ -100,13 +100,17 @@ export type EffortOption = {
 /**
  * 由「会话当前覆盖」与「清单条目默认档」构造 effort 下拉项。
  *
- * 第一项恒为「未设置」：它落在 `thread/setReasoningEffort { effort: null }` 上，即
- * 清除会话覆盖、回落条目默认。条目默认非空时把继承值写进标签
- * （「未设置（继承 low）」），用户才知道清掉覆盖后会跑哪一档；条目没声明时只写
- * 「未设置」（请求不带该字段，由模型自行决定）。
+ * 第一项恒为「自动」：它落在 `thread/setReasoningEffort { effort: null }` 上，即
+ * 清除会话覆盖、回落条目默认。
+ *
+ * 为什么叫「自动」而不是「未设置」：这一项**不是**「关闭推理」，也不是「没有值」，
+ * 而是「把档位交给模型/条目默认去决定」。旧名「未设置」把三重含义压成一句
+ * ——用户会读成「别用 effort」。条目默认非空时补上括号里的实际落点
+ * （「自动（low）」），清掉覆盖前就知道会跑哪一档；条目没声明时只写「自动」
+ * （请求不带该字段，由模型自行决定）。
  *
  * `current` 是**会话覆盖**：非空时那一档标记 selected；为空时是无覆盖状态，故
- * 「未设置」项被标记（哪怕实际生效值来自条目默认——那正是「未设置」的语义）。
+ * 「自动」项被标记（哪怕实际生效值来自条目默认——那正是「自动」的语义）。
  */
 export function buildEffortOptions(
   current: string | null,
@@ -115,7 +119,7 @@ export function buildEffortOptions(
 ): EffortOption[] {
   const unset: EffortOption = {
     value: null,
-    label: entryDefault !== null ? `未设置（继承 ${entryDefault}）` : "未设置",
+    label: entryDefault !== null ? `自动（${entryDefault}）` : "自动",
     selected: current === null,
   };
   // `null` = 能力未知：平铺七档，与探测功能上线前的行为一致。
@@ -223,7 +227,7 @@ export function entryEffortOf(list: ModelList, ref: string | null): string | nul
  * 它等于条目默认（工厂回落的结果），有覆盖时等于覆盖档。线协议无法把这两种情形
  * 分开——同一个 `"low"` 既可能是「无覆盖、跑条目默认 low」，也可能是「显式覆盖成
  * low」。既然条目的默认档在本客户端的清单里读得到，就用它做判定：生效值与条目默认
- * 相同 ⇒ 记作**无覆盖**（控件显示「未设置（继承 low）」），不同 ⇒ 一定是覆盖。
+ * 相同 ⇒ 记作**无覆盖**（控件显示「自动（low）」），不同 ⇒ 一定是覆盖。
  *
  * 这样冷启动（resume 报 low、条目默认也是 low）不会把 low 打勾成「已选覆盖」，
  * 与用户看到的状态一致；而真正切过档的会话（生效 high ≠ 条目默认 low）仍能回显。

@@ -278,7 +278,7 @@ export function ModelPicker({
     </div>
 
     {/* 会话级 effort 覆盖（与模型下拉同风格的小控件）。改的是**当前会话**的档位，
-        显示生效值：会话覆盖 ?? 条目默认 ?? 未设置。 */}
+        显示生效值：会话覆盖 ?? 条目默认 ?? 自动。 */}
     <div className="relative inline-block">
       <button
         ref={effortTriggerRef}
