@@ -445,10 +445,22 @@ export class Session {
     }
   }
 
-  apply(notification: Notification): void {
+  /**
+   * Fold one notification into this session.
+   *
+   * Returns whether it changed anything the UI can show. Callers own the
+   * re-render (`force()`), so they must not re-render the world for frames with
+   * no visible effect: bash emits an `item/delta` per 4 KiB of output, and the
+   * baseline UI discards tool-output deltas. Those frames used to force a
+   * whole-tree re-render each — on a long build they are the difference between
+   * a responsive composer and an app that will not take a Stop click.
+   */
+  apply(notification: Notification): boolean {
+    let visible = false;
     switch (notification.method) {
       case "item/started":
       case "item/completed": {
+        visible = true;
         const incoming = notification.params.item;
         // A mid-turn interjection is normalised to a user bubble: the transcript
         // should read as a conversation, and the distinct protocol type exists
@@ -518,6 +530,7 @@ export class Session {
           for (const it of notification.params.items) this.replayIds.add(it.id);
         }
         this.upsertItems(notification.params.items);
+        if (notification.params.items.length > 0) visible = true;
         break;
       }
       case "item/delta": {
@@ -532,9 +545,11 @@ export class Session {
         const index = this.indexOfItem(item_id);
         if (index < 0) {
           this.insertAfterLastServerItem({ type: "agentMessage", id: item_id, text: delta });
+          visible = true;
         } else if (this.items[index].type === "agentMessage") {
           const item = this.items[index] as { type: "agentMessage"; id: string; text: string };
           item.text += delta;
+          visible = true;
           // The append is in place, so the frozen prefix cannot see it through
           // `items`. `ChatView` lifts the *tail* item's text out as a prop on
           // every render, so only a non-tail target needs the prefix rebuilt:
@@ -566,6 +581,7 @@ export class Session {
           this.openReasoning = block;
           this.items.push(block);
         }
+        visible = true;
         break;
       }
       case "thread/notice":
@@ -579,6 +595,7 @@ export class Session {
           text: notification.params.text,
           level: notification.params.level,
         });
+        visible = true;
         break;
       case "turn/started":
         // 新的一轮：上一轮的 CoT 到此为止，本轮 CoT 另起一块。这是「按轮分块」的
@@ -587,17 +604,20 @@ export class Session {
         this.breakReasoningRun();
         this.turnActive = true;
         this.lastError = null;
+        visible = true;
         break;
       case "turn/completed":
         this.turnActive = false;
         this.retrying = null;
         this.lastStatus = notification.params.status;
         this.lastError = notification.params.error ?? null;
+        visible = true;
         break;
       case "turn/interjectionsReturned":
         // Ordered ahead of `turn/completed` by the server, so the text is
         // restorable before the turn is marked finished.
         this.returnedInterjections = [...notification.params.items];
+        visible = true;
         break;
       case "turn/retry":
         this.retrying = {
@@ -606,6 +626,7 @@ export class Session {
           // 线形状是 `string`；这里收窄到 `RetryCause`（见 `toRetryCause` 的注释）。
           cause: toRetryCause(notification.params.cause),
         };
+        visible = true;
         break;
       case "thread/tokenUsage/updated":
         this.usage = {
@@ -615,12 +636,15 @@ export class Session {
           cacheWrite: notification.params.cache_creation_input_tokens ?? 0,
           cacheRead: notification.params.cache_read_input_tokens ?? 0,
         };
+        visible = true;
         break;
       case "error":
         this.lastError = notification.params.message;
+        visible = true;
         break;
       default:
         break;
     }
+    return visible;
   }
 }

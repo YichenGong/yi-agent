@@ -79,6 +79,30 @@ describe("Session", () => {
     expect(s.items[0]).toMatchObject({ type: "toolCall", status: "running" });
   });
 
+  it("reports that a tool-output delta changed nothing visible", () => {
+    // bash 每 4 KiB 输出就推一帧 `item/delta`（还伴随一次 `force()`）。基线 UI
+    // 不渲染工具流式输出，这些帧对转录没有任何可见影响，却曾逐帧触发整棵树
+    // 重渲染——长命令（构建日志、`cat` 大文件）会把主线程拖到点不动。
+    // `apply` 因此报告「有没有可见变化」，由调用方决定要不要重渲染。
+    const s = new Session();
+    expect(
+      s.apply({
+        method: "item/started",
+        params: {
+          thread_id: "t",
+          item: { type: "toolCall", id: "i1", call_id: "c1", name: "bash", input: {}, status: "running" },
+        },
+      }),
+    ).toBe(true);
+    expect(
+      s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "i1", delta: "stdout" } }),
+    ).toBe(false);
+    // 助手正文的 delta 是可见的，必须继续报告变化。
+    expect(
+      s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a1", delta: "hi" } }),
+    ).toBe(true);
+  });
+
   it("creates an agent message when a delta arrives with no prior item", () => {
     const s = new Session();
     s.apply({ method: "item/delta", params: { thread_id: "t", item_id: "a9", delta: "hi" } });

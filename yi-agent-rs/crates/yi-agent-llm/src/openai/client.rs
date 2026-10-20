@@ -133,8 +133,11 @@ impl OpenaiProvider {
             .map(ApiStyle::parse)
             .unwrap_or(ApiStyle::Auto);
 
+        // 同 anthropic：连接与「无输出」各有时限，但一条正在持续输出的流不设
+        // 总期限（`.timeout()` 会在 300 秒处把长回答硬砍断）。
         let client = reqwest::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(timeout)
+            .read_timeout(timeout)
             .build()
             .map_err(|e| ProviderError::Network(format!("failed to build HTTP client: {e}")))?;
 
@@ -199,7 +202,6 @@ impl OpenaiProvider {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("content-type", "application/json")
             .json(body)
-            .timeout(self.timeout)
             .send()
             .await
             .map_err(|e| {

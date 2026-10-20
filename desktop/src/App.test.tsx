@@ -578,6 +578,70 @@ describe("App YOLO wiring", () => {
   });
 });
 
+describe("App approval overlay scope", () => {
+  it("leaves the composer usable so Stop stays clickable behind an approval", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({ method: "turn/started", params: { thread_id: "t1", turn_id: "u1" } });
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: /stop/i })).toBeTruthy());
+
+    // A tool call in this turn needs approval. The dialog is modal for the
+    // transcript, but it must NOT own the composer: the overlay used to be
+    // `absolute inset-0` inside `.app-main`, which painted over the input card
+    // and its Stop button. The user then could not interrupt a turn that was
+    // blocked waiting for an approval (a deadlock the user could only escape by
+    // answering the prompt).
+    state.approvalHandlers[0]({
+      id: "perm-1",
+      params: {
+        thread_id: "t1",
+        turn_id: "u1",
+        request_id: 1,
+        tool_name: "bash",
+        tool_input: { command: "rm -rf /tmp/x" },
+        prefix_suggestion: null,
+        kind: "Normal",
+      },
+    });
+    await waitFor(() => expect(screen.getByRole("dialog")).toBeTruthy());
+
+    const overlay = screen.getByRole("dialog").parentElement as HTMLElement;
+    // `absolute inset-0` paints over the *containing block*, so what matters is
+    // which positioned ancestor the overlay resolves against. jsdom has no layout
+    // engine, so walk up to the nearest positioned ancestor and assert that the
+    // composer is outside it: that is the geometric guarantee, expressed in the
+    // DOM, that the overlay cannot cover the input card.
+    expect(overlay.className.split(/\s+/)).toContain("absolute");
+    expect(overlay.className.split(/\s+/)).toContain("inset-0");
+    const stop = screen.getByRole("button", { name: /stop/i });
+    let scope: HTMLElement | null = overlay.parentElement;
+    while (scope && !scope.className.split(/\s+/).includes("relative")) {
+      scope = scope.parentElement;
+    }
+    expect(scope, "the overlay must have a positioned ancestor").not.toBeNull();
+    expect(
+      scope!.contains(stop),
+      "an `inset-0` overlay inside this ancestor would paint over the composer's Stop",
+    ).toBe(false);
+    expect((stop as HTMLButtonElement).disabled).toBe(false);
+
+    // And it still works: interrupting while an approval is pending.
+    fireEvent.click(stop);
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "turn/interrupt",
+        params: { threadId: "t1" },
+      }),
+    );
+  });
+});
+
 describe("App approval focus", () => {
   it("does not steal focus from an in-progress thread rename", async () => {
     render(<App />);

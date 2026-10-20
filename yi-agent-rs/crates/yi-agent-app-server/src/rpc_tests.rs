@@ -9242,6 +9242,63 @@ async fn isolated_harness() -> (Harness, tempfile::TempDir) {
     (Harness::with_cfg(cfg).await, dir)
 }
 
+/// 列表扫描必须离开主循环：扫描卡住时，其它 RPC 仍然能被处理。
+///
+/// 判据是**确定性**的：`ThreadStore::list` 用 `read_to_string` 逐个读
+/// `*.meta.json`。把一个这样的文件名做成 FIFO（无写端），那次读取就会永远
+/// 阻塞。改造前 `thread/listAll` 在主循环 task 里内联扫描，这条请求会把
+/// `select!` 整个占住——紧接着的 `thread/lead`（一次与列表完全无关的请求）
+/// 永远读不到响应；用户在那段时间点 Stop 也是同一个结果。改造后扫描在独立
+/// 的阻塞任务里，主循环照常派发。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_scan_does_not_block_the_main_loop() {
+    let (mut h, dir) = isolated_harness().await;
+    h.send(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#)
+        .await;
+    let _ = read_response(&mut h, 1).await;
+
+    // 一个有会话状态目录的 workspace，其中放一个「读起来会卡住」的 meta。
+    let workspace = dir.path().join("workspace");
+    let threads = workspace.join(".yi-agent").join("threads");
+    std::fs::create_dir_all(&threads).unwrap();
+    let blocker = threads.join("blocker.meta.json");
+    let mkfifo = std::process::Command::new("mkfifo")
+        .arg(&blocker)
+        .status()
+        .expect("mkfifo");
+    assert!(mkfifo.success(), "mkfifo must succeed");
+
+    let add = serde_json::json!({"jsonrpc":"2.0","id":6,"method":"workspace/add",
+        "params":{"path": workspace.to_string_lossy()}});
+    h.send(&add.to_string()).await;
+    let _ = read_response(&mut h, 6).await;
+
+    // 这条请求会挂住（它的扫描永远等 FIFO）。故意不 await 它。
+    h.send(r#"{"jsonrpc":"2.0","id":7,"method":"thread/listAll","params":{}}"#)
+        .await;
+
+    // 主循环若被占住，这条请求的响应永远不会到（`read_response` 内部带
+    // EVENT_WAIT 超时）。它必须正常应答——这就是「那段时间里点 Stop 也能进来」
+    // 的同一条通道。
+    let started = std::time::Instant::now();
+    let answered = tokio::time::timeout(
+        EVENT_WAIT / 2,
+        rpc(&mut h, 8, "thread/lead", serde_json::json!({})),
+    )
+    .await;
+    assert!(
+        answered.is_ok(),
+        "a blocking workspace scan must not starve the main loop (waited {:?})",
+        started.elapsed()
+    );
+
+    // 放开 FIFO：给写端并立刻关闭，让挂住的读取收到 EOF，扫描才能收尾。
+    let _ = std::fs::OpenOptions::new().write(true).open(&blocker);
+    let _ = std::fs::remove_file(&blocker);
+    h.shutdown().await;
+}
+
 /// `thread/lead` 必须幂等:同一 cwd 反复调用只造一个组长,第二次 `created=false`。
 #[tokio::test(flavor = "multi_thread")]
 async fn thread_lead_is_idempotent_per_project() {

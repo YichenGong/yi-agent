@@ -184,10 +184,13 @@ export function MessageInput({
 
   // 「没什么可发」时按钮就该是灰的，而不是点了没反应：文字与附件都是空时才算空；
   // 附件已在路上时按钮要亮着，否则「只发文件」这条路径在 UI 上根本走不通。
-  // Stop 态不用额外分支：那时 `turnActive` 为真，本式已退化成 `disabled || sending`
-  // ——打断的意义与有没有内容无关。
   const sendDisabled =
     disabled || sending || (!turnActive && !text.trim() && attachments.length === 0);
+  // Stop 只受「这个输入区是否可用」约束：`sending` 表示**这次发送还没回包**，
+  // 与「服务端这一轮是否在跑」无关——turn/started 可能早已到达、bash 可能已经在
+  // 输出，而 Promise 仍挂着。把它算进来会让 Stop 在这段时间里点不动（真机上常见
+  // 的「点了没反应」）。同理内容为空也不该灰：打断与有没有内容无关。
+  const stopDisabled = disabled;
 
   return (
     <div className="relative border-t border-line bg-panel p-3">
@@ -361,7 +364,7 @@ export function MessageInput({
               <button
                 type="button"
                 onClick={turnActive ? onInterrupt : handleSendClick}
-                disabled={sendDisabled}
+                disabled={turnActive ? stopDisabled : sendDisabled}
                 className={
                   turnActive
                     ? "rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50 max-md:ml-auto"

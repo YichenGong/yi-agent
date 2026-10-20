@@ -4086,6 +4086,19 @@ pub(crate) fn thread_summary_json(
     m: &crate::thread_store::ThreadMeta,
     threads: &HashMap<String, ThreadSession>,
 ) -> serde_json::Value {
+    thread_summary_json_with_status(m, thread_status(threads, &m.thread_id))
+}
+
+/// 与 [`thread_summary_json`] 同形，但状态由调用方给。
+///
+/// `thread/listAll` 把目录扫描搬出了主循环（否则一次长扫描会把
+/// `turn/interrupt` 一起堵住）。扫描任务拿不到 `&mut threads`，所以主循环先
+/// 把「每个 thread 此刻的状态」快照下来，任务按快照构造 JSON——除此之外两者
+/// 逐字相同。
+pub(crate) fn thread_summary_json_with_status(
+    m: &crate::thread_store::ThreadMeta,
+    status: ThreadStatus,
+) -> serde_json::Value {
     let mut value = json!({
         "thread_id": m.thread_id,
         "cwd": m.cwd,
@@ -4099,7 +4112,7 @@ pub(crate) fn thread_summary_json(
         "driver_project": m.driver_project,
         "driver_ref": m.driver_ref,
         "tag": m.tag,
-        "status": thread_status(threads, &m.thread_id),
+        "status": status,
         "content_epoch": m.content_epoch,
         "last_item_id": m.last_item_id,
     });

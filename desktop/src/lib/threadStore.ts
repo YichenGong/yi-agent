@@ -134,8 +134,14 @@ export class ThreadStore {
     }
   }
 
-  /** 按 `thread_id` 路由一条通知。 */
-  applyNotification(n: Notification): void {
+  /**
+   * 按 `thread_id` 路由一条通知。
+   *
+   * 返回「是否有可见变化」：调用方据此决定要不要重渲染（见 `Session.apply`）。
+   * 只有会话内容本身的变化才算——路由到 `views` 之外的元数据（审批框、状态）
+   * 由各自的调用点负责刷新。
+   */
+  applyNotification(n: Notification): boolean {
     // agent/* notifications belong to a conversation's附属视图 (the subagent
     // rail), not to its transcript; `ui/*` is app chrome (theme, git-diff focus,
     // tag-name overrides) handled by App's own notification branch. None is folded
@@ -156,7 +162,7 @@ export class ThreadStore {
       // 显式忽略。
       n.method === "item/toolCall/approvalResolved"
     ) {
-      return;
+      return false;
     }
     if (n.method === "thread/status/updated") {
       const v = this.view(n.params.thread_id);
@@ -169,7 +175,7 @@ export class ThreadStore {
       // 离开 awaiting_approval（决定 / 超时 / 中断）即清掉可能残留的审批框，
       // 否则超时后前端会留下一个点不掉的模态。
       if (n.params.status !== "awaiting_approval") v.approval = null;
-      return;
+      return true;
     }
     if (n.method === "thread/modelChanged") {
       // 跨客户端同步通道：另一个客户端（如手机）改了某会话的生效模型，服务端广播
@@ -177,14 +183,14 @@ export class ThreadStore {
       // （`model_ref`）由本客户端的下拉写入成功后自行落笔，这里不能替它猜。
       const v = this.view(n.params.thread_id);
       if (v.info) v.info = { ...v.info, model: n.params.model };
-      return;
+      return true;
     }
     if (n.method === "thread/reasoningEffortChanged") {
       // 跨客户端同步通道：另一个客户端切了该会话的 effort，服务端广播到这里。
       // `null`（或缺失）= 已清除覆盖，回落条目默认——按「无覆盖」记录，别当作
       // 「未设置」：控件要显示的是本会话可能正跑着的条目默认档。
       this.view(n.params.thread_id).reasoningEffort = n.params.effort ?? null;
-      return;
+      return true;
     }
     if (n.method === "thread/permissionModeChanged") {
       // 跨客户端同步通道：另一个客户端（如桌面）切换了该会话的权限模式，服务端
@@ -192,25 +198,28 @@ export class ThreadStore {
       // 这条通道，手机上的 chip 只能靠打开会话那一刻的 listAll 快照，桌面之后改
       // 的 YOLO 就永远同步不过来。
       this.view(n.params.thread_id).mode = n.params.mode;
-      return;
+      return true;
     }
     if (n.method === "model/capabilitiesChanged") {
       // 机器级清单属性，不属于任何 thread（App 另有一条总线把它分发给模型相关
       // 组件）。在这里必须显式吞掉：下面那行按 `n.params.thread_id` 取会话，
       // 该变体没有这个字段，落进兜底分支会往 `undefined` 这个假会话里写正文。
-      return;
+      return false;
     }
     if (n.method === "error") {
       // 无 thread 归属的全局错误归当前 thread。
-      this.current()?.session.apply(n);
-      return;
+      return this.current()?.session.apply(n) ?? false;
     }
     const id = n.params.thread_id;
     const v = this.view(id);
-    v.session.apply(n);
-    if (n.method === "thread/started")
+    const visible = v.session.apply(n);
+    let changed = visible;
+    if (n.method === "thread/started") {
       v.info = { cwd: n.params.cwd, model: n.params.model, model_ref: n.params.model_ref ?? null };
+      changed = true;
+    }
     if (n.method === "turn/completed" && id !== this.currentId) v.unread = true;
+    return changed;
   }
 
   setApproval(r: ApprovalRequest): void {

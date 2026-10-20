@@ -22,6 +22,7 @@ yi-agent 的 LLM provider 实现层。基于 `yi-agent-core` 的 `Provider` trai
 
 ## Features
 
+- [x] 超时语义改为「无输出才计时」 — 两个 provider 原先用 `reqwest::Client::builder().timeout(300s)`，那是**总期限**（从开始连接一直到响应体读完），一条正常输出的长回答到点必被砍断（现象：长回答/长思考在 300 秒处变成 stream error）。现改为 `connect_timeout` + `read_timeout`：每次读到数据就重置，真静默了才判超时；「无输出」的判定继续由 agent 层的 `think_idle_timeout`(60s) 负责。验证：`cargo test -p yi-agent-llm --test integration a_stream_that_keeps_producing_output_is_not_cut_off_by_a_total_deadline a_silent_stream_still_times_out`（两条互为约束：前者保证忙流不被砍，后者保证静默不挂死）
 - [x] AnthropicProvider 设计 — `crates/yi-agent-llm/src/anthropic/` 目录存在 — [设计](../plans/2026-07-19-yi-agent-llm-design.md)
 - [x] AnthropicProvider 实现 — `anthropic/{types,stream,client}.rs` + wiremock 测试通过 — [实现](../plans/2026-07-19-yi-agent-llm-impl.md)
 - [x] OpenAI provider — `crates/yi-agent-llm/src/openai/` 目录存在 + wiremock 测试通过 — [实现](../plans/2026-07-24-openai-provider-impl.md)
