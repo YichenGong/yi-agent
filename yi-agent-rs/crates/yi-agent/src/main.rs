@@ -3,6 +3,7 @@
 mod build_info;
 mod config;
 mod control_commands;
+mod flags_cmd;
 mod llm_prefix;
 mod onboarding_prompt;
 mod schedule_intent;
@@ -24,7 +25,8 @@ use yi_agent_core::Provider;
 use yi_agent_runtime::bootstrap::ToolSetup as HeadlessSetup;
 
 use crate::config::{
-    AgentAction, Cli, Command, DaemonAction, PairAction, ResidentAction, ScheduleAction,
+    AgentAction, Cli, Command, DaemonAction, FlagsAction, PairAction, ResidentAction,
+    ScheduleAction,
 };
 
 fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<String>) -> String {
@@ -36,6 +38,10 @@ fn format_ipc_error(code: yi_agent_store::ipc::IpcErrorCode, message: Option<Str
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // 开关的构建类型硬闸读的是本 crate `build.rs` 注入的值；别的 crate 读不到
+    // `rustc-env`，所以必须在这里显式注入一次。
+    yi_agent_flags::set_build_kind(build_info::BUILD_KIND);
 
     // Completion scripts are pure stdout. Skip tracing for them so no log or
     // warning line can ever pollute the script a user redirects into their
@@ -79,6 +85,7 @@ fn main() -> Result<()> {
         Some(Command::AppServer { .. }) => run_app_server(cli),
         Some(Command::Completions { shell }) => print_completion(shell),
         Some(Command::Pair { ref action }) => run_pair(action),
+        Some(Command::Flags { ref action }) => run_flags(action),
         Some(Command::Resident { ref action }) => match action {
             // 死循环（或 HOME 缺失时 exit），正常控制流不会回到这里。
             ResidentAction::Watch { interval_secs } => {
@@ -231,6 +238,29 @@ fn run_pair(action: &PairAction) -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("failed to revoke device: {e:?}"))?;
             println!("{}", format_revoke_result(device_id, removed));
         }
+    }
+    Ok(())
+}
+
+/// 功能开关的 CLI 入口。写入失败（如未注册的名字）返回 exit 1。
+fn run_flags(action: &FlagsAction) -> Result<()> {
+    let code = match action {
+        FlagsAction::List => flags_cmd::run_list()?,
+        FlagsAction::Set { name, value } => {
+            let enabled = match value.as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                other => {
+                    eprintln!("error: expected on|off, got `{other}`");
+                    std::process::exit(1);
+                }
+            };
+            flags_cmd::run_set(name, enabled)?
+        }
+        FlagsAction::Status { name } => flags_cmd::run_status(name)?,
+    };
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }

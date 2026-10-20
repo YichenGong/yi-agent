@@ -8,9 +8,19 @@ pub use error::FlagError;
 pub use registry::{FlagDef, REGISTRY, find};
 pub use store::{FlagView, Source, all_at, is_enabled, status, status_at, write_at};
 
-/// 当前构建类型。由 `yi-agent` 的 `build.rs` 注入；测试里由 `YI_AGENT_BUILD_KIND` 决定。
+/// 当前构建类型：`release` / `dev` / `nogit`。
+///
+/// 必须由 binary 在 `main` 启动时用 [`set_build_kind`] 注入——`build.rs` 的
+/// `rustc-env` 只作用于 `yi-agent` 这个包，别的 crate 用 `option_env!` 读不到。
+/// 没注入就按 `release` 处理：宁可开关全部失效，也不让没验证的功能漏给用户。
+static BUILD_KIND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+pub fn set_build_kind(kind: &'static str) {
+    let _ = BUILD_KIND.set(kind);
+}
+
 pub fn build_kind() -> &'static str {
-    option_env!("YI_AGENT_BUILD_KIND").unwrap_or("dev")
+    BUILD_KIND.get().copied().unwrap_or("release")
 }
 
 /// 今天的日期，`YYYY-MM-DD`。
@@ -56,6 +66,12 @@ mod tests {
         assert_eq!(today.len(), 10);
         assert_eq!(&today[4..5], "-");
         assert_eq!(&today[7..8], "-");
+    }
+
+    #[test]
+    fn an_uninjected_build_kind_is_fail_closed() {
+        // 本 crate 的测试从不调用 `set_build_kind`，所以这里读到的就是缺省值。
+        assert_eq!(build_kind(), "release");
     }
 
     #[test]
