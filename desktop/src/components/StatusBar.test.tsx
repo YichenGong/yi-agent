@@ -71,4 +71,24 @@ describe("StatusBar", () => {
     fireEvent.click(screen.getByRole("button", { name: "Token usage details" }));
     expect(screen.getByRole("dialog")).toBeTruthy();
   });
+
+  it("opens the usage panel upward, since the bar is the window's last row", () => {
+    // 状态栏是 `h-screen` 外壳的最后一行，浮层若向下（`top-full`）展开就整个落到
+    // 视口之外：面板撑高文档，右侧因此出现滚动条/黑边（真实 Chrome 实测 800x600
+    // 时面板 bottom 超出视口 169px、文档溢出 169px）。必须向上（`bottom-full`）。
+    const { container } = render(
+      <StatusBar
+        cwd="/w"
+        status="connected"
+        usage={{ model: "m", input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }}
+        usageId="thread-1"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Token usage details" }));
+    const panel = container.querySelector("#usage-panel");
+    expect(panel).toBeTruthy();
+    const classes = panel?.className.split(/\s+/) ?? [];
+    expect(classes).toContain("bottom-full");
+    expect(classes).not.toContain("top-full");
+  });
 });
