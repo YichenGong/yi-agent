@@ -7,6 +7,7 @@ members = [
     "crates/yi-agent-tools",
     "crates/yi-agent-mcp",
     "crates/yi-agent-store",
+    "crates/yi-agent-flags",
     "crates/yi-agent-web",
     "crates/yi-agent-skills",
     "crates/yi-agent-runtime",
@@ -31,6 +32,7 @@ yi-agent-llm = { path = "crates/yi-agent-llm" }
 yi-agent-tools = { path = "crates/yi-agent-tools" }
 yi-agent-mcp = { path = "crates/yi-agent-mcp" }
 yi-agent-store = { path = "crates/yi-agent-store" }
+yi-agent-flags = { path = "crates/yi-agent-flags" }
 yi-agent-web = { path = "crates/yi-agent-web" }
 yi-agent-skills = { path = "crates/yi-agent-skills" }
 yi-agent-runtime = { path = "crates/yi-agent-runtime" }

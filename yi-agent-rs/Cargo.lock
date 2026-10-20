@@ -5026,6 +5026,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "yi-agent-flags"
+version = "0.1.8"
+dependencies = [
+ "serde_json",
+ "tempfile",
+ "yi-agent-store",
+]
+
+[[package]]
 name = "yi-agent-llm"
 version = "0.1.8"
 dependencies = [
