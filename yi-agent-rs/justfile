@@ -205,6 +205,14 @@ package-all: build-all-targets
         just package-target "$target"
     done
 
+# 构建 macOS 桌面 App 并放进 npm 的 darwin-arm64 子包。
+# 单独成 task 而不是塞进 npm-pack：Tauri 构建要十分钟，本地只发
+# CLI 时不该被迫等它；CI 在 publish 前显式调用。
+npm-pack-desktop:
+    #!/usr/bin/env bash
+    set -e
+    bash ../desktop/scripts/package-npm-app.sh
+
 # 组装 npm 包（填充子包二进制 + 同步版本号）
 npm-pack: package-all
     #!/usr/bin/env bash

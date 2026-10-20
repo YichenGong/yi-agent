@@ -135,6 +135,26 @@ jobs:
           bash scripts/check-release-version.sh "${{ steps.version.outputs.version }}" \
             "$("$BIN" --version | awk '{print $2}')"
 
+      - name: Build macOS desktop app for npm
+        # 只有 arm64 的 .app 会进 darwin-arm64 子包。Linux/Intel 用户
+        # 不会因此多下载——npm 按 os/cpu 只装匹配的子包。
+        run: |
+          source "$HOME/.cargo/env"
+          just npm-pack-desktop
+
+      - name: Verify the desktop app is in the npm package
+        # 构建「成功」但 .app 没进包的情况最难查（用户装完发现没有 App）。
+        # 这里在发布前直接验白名单产物。
+        run: |
+          cd yi-agent-rs/yi-agent-cli/platforms/darwin-arm64
+          test -d yi-agent.app || { echo "ERROR: yi-agent.app missing"; exit 1; }
+          codesign --verify --deep --strict yi-agent.app
+          V=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+              yi-agent.app/Contents/Info.plist)
+          echo "desktop app version: $V"
+          grep -q "^version = \"$V\"" ../../Cargo.toml || {
+            echo "ERROR: desktop app version $V != workspace version"; exit 1; }
+
       - name: Upload artifacts to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
