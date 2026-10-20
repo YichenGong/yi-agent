@@ -14,6 +14,7 @@
 
 // 域子模块:每个模块承载一个域,臂体逐字搬移自 `serve()` 的 dispatch。
 pub(crate) mod agent;
+pub(crate) mod flags;
 pub(crate) mod image;
 pub(crate) mod mcp;
 pub(crate) mod model;
@@ -259,6 +260,8 @@ pub(crate) enum Domain {
     Skill,
     /// `mcp/*`(设置页 MCP 面板:项目级 mcp.json + 工具 schema 缓存的只读视图)。
     Mcp,
+    /// `flags/*` 与 `build/*`（功能开关面板 + 构建类型查询）。
+    Flags,
     /// `thread/*`(会话生命周期:列表、建/恢复、改名、模型档、置顶、删除、订阅)。
     Thread,
     /// `agent/*`(子代理列表、轨迹读写、消息、两段式取消)。
@@ -288,6 +291,7 @@ pub(crate) fn domain_for(method: &str) -> Domain {
         Some("turn") => Domain::Turn,
         Some("skill") => Domain::Skill,
         Some("mcp") => Domain::Mcp,
+        Some("flags") | Some("build") => Domain::Flags,
         Some("thread") => Domain::Thread,
         Some("agent") => Domain::Agent,
         _ => Domain::Unknown,

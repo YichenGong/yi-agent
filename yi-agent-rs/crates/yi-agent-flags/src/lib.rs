@@ -14,13 +14,20 @@ pub use store::{FlagView, Source, all_at, is_enabled, status, status_at, write_a
 /// `rustc-env` 只作用于 `yi-agent` 这个包，别的 crate 用 `option_env!` 读不到。
 /// 没注入就按 `release` 处理：宁可开关全部失效，也不让没验证的功能漏给用户。
 static BUILD_KIND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+static VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
 
-pub fn set_build_kind(kind: &'static str) {
+pub fn set_build_info(kind: &'static str, version: &'static str) {
     let _ = BUILD_KIND.set(kind);
+    let _ = VERSION.set(version);
 }
 
 pub fn build_kind() -> &'static str {
     BUILD_KIND.get().copied().unwrap_or("release")
+}
+
+/// 完整版本号（dev 构建带 `-dev+<sha>`）。未注入时退回本 crate 的 `Cargo.toml` 版本。
+pub fn version() -> &'static str {
+    VERSION.get().copied().unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
 /// 今天的日期，`YYYY-MM-DD`。
@@ -70,8 +77,9 @@ mod tests {
 
     #[test]
     fn an_uninjected_build_kind_is_fail_closed() {
-        // 本 crate 的测试从不调用 `set_build_kind`，所以这里读到的就是缺省值。
+        // 本 crate 的测试从不注入构建信息，所以这里读到的就是缺省值。
         assert_eq!(build_kind(), "release");
+        assert!(!version().is_empty());
     }
 
     #[test]

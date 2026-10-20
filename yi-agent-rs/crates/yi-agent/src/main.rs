@@ -41,7 +41,7 @@ fn main() -> Result<()> {
 
     // 开关的构建类型硬闸读的是本 crate `build.rs` 注入的值；别的 crate 读不到
     // `rustc-env`，所以必须在这里显式注入一次。
-    yi_agent_flags::set_build_kind(build_info::BUILD_KIND);
+    yi_agent_flags::set_build_info(build_info::BUILD_KIND, build_info::VERSION);
 
     // Completion scripts are pure stdout. Skip tracing for them so no log or
     // warning line can ever pollute the script a user redirects into their

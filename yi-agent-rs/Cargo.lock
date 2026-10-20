@@ -4995,6 +4995,7 @@ dependencies = [
  "uuid",
  "wiremock",
  "yi-agent-core",
+ "yi-agent-flags",
  "yi-agent-mcp",
  "yi-agent-relay",
  "yi-agent-runtime",

@@ -18,6 +18,7 @@ path = "src/lib.rs"
 ts-rs = { version = "11", features = ["serde-compat"] }
 yi-agent-core = { workspace = true }
 yi-agent-runtime = { workspace = true }
+yi-agent-flags = { workspace = true }
 yi-agent-store = { workspace = true }
 yi-agent-subagent = { workspace = true }
 # `skill/list` / `skill/read` 枚举与读取三层 skill 根。
