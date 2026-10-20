@@ -2012,6 +2012,11 @@ pub(crate) async fn handle(
                     return Ok(Flow::Continue);
                 }
             };
+            // 该 thread **最后一轮**的用量快照，与 `thread/resume` 回放的是同一份
+            // （`ThreadStore::read_log` 只保留最后一条非空 usage）。回传它的理由：
+            // 运行中的会话按既有约束**绝不 resume**、只走这里，不回传就等于让客户端
+            // 在那条路径上永远拿不到这份已经读出来的数据。
+            let loaded_usage = loaded.usage;
             let items: Vec<crate::protocol::Item> = match after {
                 Some(aid) => match loaded
                     .items
@@ -2028,7 +2033,7 @@ pub(crate) async fn handle(
             write_response(
                 state.hub,
                 state.client,
-                ok_response(id, json!({ "items": items })),
+                ok_response(id, json!({ "items": items, "usage": loaded_usage })),
             )
             .await?;
         }

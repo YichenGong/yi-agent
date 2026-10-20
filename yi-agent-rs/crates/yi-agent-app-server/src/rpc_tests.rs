@@ -1312,6 +1312,39 @@ impl yi_agent_core::Provider for MockProvider {
     }
 }
 
+/// 回一段文本 + 一份用量后结束。
+///
+/// `thread/readItems` 的 `usage` 字段来自**落盘**的最后一轮快照，所以只有真收到
+/// `ProviderEvent::Usage` 的 provider 才会让测试文件里出现 `usage` 行；`MockProvider`
+/// 不报用量，拿它验证等于只断言了 `null`。
+struct UsageProvider;
+
+#[async_trait]
+impl yi_agent_core::Provider for UsageProvider {
+    async fn call_stream(
+        &self,
+        _req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        let events = vec![
+            yi_agent_core::provider::ProviderEvent::TextDelta("hi".into()),
+            yi_agent_core::provider::ProviderEvent::Usage(yi_agent_core::provider::TokenUsage {
+                input_tokens: 1_234,
+                output_tokens: 56,
+                cache_creation_input_tokens: Some(7),
+                cache_read_input_tokens: Some(890),
+                reasoning_tokens: None,
+            }),
+            yi_agent_core::provider::ProviderEvent::Stop {
+                reason: yi_agent_core::provider::StopReason::EndTurn,
+            },
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
 /// 记录每次调用收到的 message 数,并回显 `n=<count>` 作为 agent 文本。
 ///
 /// 标题生成（`system == TITLE_INSTRUCTIONS`）不是对话轮次，不算在内：否则
@@ -1690,6 +1723,15 @@ fn build_test_agent_with_provider(
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
     })
+}
+
+/// 用会报用量的 provider 构造 agent，其余与 `build_test_agent` 一致。
+fn build_usage_agent(
+    session: Option<yi_agent_core::Session>,
+    cwd: &std::path::Path,
+    mode: crate::thread_store::ThreadMode,
+) -> anyhow::Result<BuiltAgent> {
+    build_test_agent_with_provider(Arc::new(UsageProvider), session, cwd, mode)
 }
 
 pub(crate) fn build_slow_agent(
@@ -16141,7 +16183,8 @@ fn the_session_effort_override_does_not_leak_across_calls() {
 /// `thread/readItems` 返回已落盘的 items；`afterItemId` 只返回其后的部分。
 #[tokio::test(flavor = "multi_thread")]
 async fn read_items_returns_persisted_items_and_slices_after_id() {
-    let mut h = Harness::new();
+    // 要断言 `usage` 非空，provider 必须真的报一次用量（见 `UsageProvider`）。
+    let mut h = Harness::with_factory(build_usage_agent, PERMISSION_TIMEOUT);
     let tid = start_thread(&mut h).await;
     // 跑完一轮，产生至少一条已落盘的 item（user + agent 消息）。
     h.send(&format!(
@@ -16163,6 +16206,19 @@ async fn read_items_returns_persisted_items_and_slices_after_id() {
     let v = read_response(&mut h, 4).await;
     let items = v["result"]["items"].as_array().expect("items array");
     assert!(!items.is_empty(), "readItems 必须返回已落盘的 items: {v}");
+    // 同一份 `load` 已经读出了最后一轮用量：不回传等于把已付出的读盘丢掉，
+    // 而「运行中的会话只走只读补齐、绝不 resume」那条路径上，这是唯一的数据来源。
+    let usage = v["result"]["usage"]
+        .as_object()
+        .unwrap_or_else(|| panic!("readItems 必须回传持久化用量: {v}"));
+    assert!(
+        usage["input_tokens"].as_u64().unwrap_or(0) > 0,
+        "回传的用量应来自真实跑过的一轮: {v}"
+    );
+    assert!(
+        usage["model"].as_str().is_some_and(|m| !m.is_empty()),
+        "用量必须带模型名: {v}"
+    );
     let first_id = items[0]["id"].as_str().unwrap().to_string();
 
     // afterItemId = 第一条 → 不包含第一条。
