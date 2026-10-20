@@ -214,7 +214,11 @@ describe("ChatView notices", () => {
         type: "notice",
         id: "n1",
         text: "",
-        config: { data: { model: "claude-sonnet-4", sandbox: "WorkspaceWrite" } },
+        body: {
+          kind: "config",
+          data: { model: "claude-sonnet-4", sandbox: "WorkspaceWrite" },
+          error: null,
+        },
       },
     ] as unknown as (Item | NoticeItem)[];
     render(<ChatView items={list} />);
@@ -234,14 +238,48 @@ describe("ChatView notices", () => {
   });
 
   it("renders the card when the read failed and data is null", () => {
-    // 读取失败：data 为 null 但 error 非空——父分支必须只看 config 是否存在，
+    // 读取失败：data 为 null 但 error 非空——父分支必须只看载荷是否存在，
     // 不能把「data 为空」误判成普通 notice 的胶囊。
     const list = [
-      { type: "notice", id: "n3", text: "", config: { data: null, error: "boom" } },
+      {
+        type: "notice",
+        id: "n3",
+        text: "",
+        body: { kind: "config", data: null, error: "boom" },
+      },
     ] as unknown as (Item | NoticeItem)[];
     render(<ChatView items={list} />);
     expect(screen.getByTestId("config-card")).toBeTruthy();
     expect(screen.getByText("读取配置失败: boom")).toBeTruthy();
+  });
+
+  it("renders a help notice as the help card", () => {
+    const list = [
+      {
+        type: "notice",
+        id: "n4",
+        text: "",
+        body: { kind: "help", target: null, error: null },
+      },
+    ] as unknown as (Item | NoticeItem)[];
+    render(<ChatView items={list} />);
+    expect(screen.getByTestId("help-card")).toBeTruthy();
+    expect(screen.getByText("可用命令")).toBeTruthy();
+    expect(screen.getByText("清空对话上下文")).toBeTruthy();
+  });
+
+  it("renders a help notice for one command as its detail card", () => {
+    const list = [
+      {
+        type: "notice",
+        id: "n5",
+        text: "",
+        body: { kind: "help", target: "cost", error: null },
+      },
+    ] as unknown as (Item | NoticeItem)[];
+    render(<ChatView items={list} />);
+    expect(screen.getByText("命令 /cost")).toBeTruthy();
+    expect(screen.getByText("显示 token 使用量")).toBeTruthy();
   });
 });
 

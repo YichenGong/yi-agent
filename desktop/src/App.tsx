@@ -67,7 +67,6 @@ import {
   setPermissionModeParams,
   type ThreadMode,
 } from "./lib/threadPermissionMode";
-import { renderHelp } from "./lib/slash";
 import { configReadParams } from "./lib/configRequest";
 import { estimateCost, formatCost } from "./lib/pricing";
 import { parseTheme } from "./lib/theme";
@@ -1618,7 +1617,8 @@ export default function App() {
     const session = view.session;
     switch (name) {
       case "help":
-        session.notice(renderHelp(args));
+        // 目录/详情由 `HelpCard` 呈现；`text` 留空，卡片就是输出。
+        session.noticeBody({ kind: "help", target: args, error: null });
         break;
       case "cost": {
         const u = session.usage;
@@ -1647,9 +1647,9 @@ export default function App() {
             "config/read",
             configReadParams(id),
           );
-          session.noticeConfig(cfg);
+          session.noticeBody({ kind: "config", data: cfg, error: null });
         } catch (e) {
-          session.noticeConfig(null, formatError(e));
+          session.noticeBody({ kind: "config", data: null, error: formatError(e) });
         }
         break;
       case "clear":
@@ -1679,7 +1679,8 @@ export default function App() {
         }
         break;
       default:
-        session.notice(`未知命令: /${name}\n${renderHelp()}`);
+        // 与 `/help <unknown>` 同一张卡：错误行 + 完整目录。
+        session.noticeBody({ kind: "help", target: null, error: `未知命令: /${name}` });
         break;
     }
     force((v) => v + 1);

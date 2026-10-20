@@ -7,6 +7,7 @@ import { useStickToBottom } from "../lib/useStickToBottom";
 import { useThrottledText } from "../lib/useThrottledText";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
+import { HelpCard } from "./HelpCard";
 import { ToolCallCard } from "./ToolCallCard";
 
 /**
@@ -161,8 +162,11 @@ const ChatItem = memo(
   }) {
     switch (item.type) {
       case "notice":
-        return item.config ? (
-          <ConfigCard config={item.config.data} error={item.config.error} />
+        // 结构化载荷按 `kind` 分派；没有载荷的就是普通文本提示（胶囊）。
+        return item.body?.kind === "config" ? (
+          <ConfigCard config={item.body.data} error={item.body.error} />
+        ) : item.body?.kind === "help" ? (
+          <HelpCard target={item.body.target} error={item.body.error} />
         ) : (
           // 服务端 `thread/notice` 带 level：Warn（通道回退 / effort 降级）用琥珀色
           // 让人一眼看出「走了别的路」；本地 `/命令` 提示与 Info 保持既有中性胶囊。

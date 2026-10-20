@@ -24,6 +24,19 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
   { name: "model", description: "显示当前模型", usage: null, needsArg: false },
 ];
 
+/**
+ * `/help` 卡片的分组——纯呈现层，不改变 `SLASH_COMMANDS` 的顺序（Popup 的顺序
+ * 由它自己钉死）。
+ *
+ * 一致性由测试保证：拍平后必须恰好等于命令目录（不重、不漏、同序）。新增命令
+ * 却忘了分组时，`slash.test.ts` 直接红。
+ */
+export const HELP_GROUPS: { title: string; commands: string[] }[] = [
+  { title: "会话", commands: ["clear", "compact"] },
+  { title: "状态", commands: ["config", "cost", "model"] },
+  { title: "帮助", commands: ["help"] },
+];
+
 /** Prefix filter, matching the TUI's `CommandPopup::filter` (not fuzzy). */
 export function filterCommands(prefix: string): SlashCommandSpec[] {
   const p = prefix.trim();
@@ -55,20 +68,4 @@ export function parseSlashInput(text: string): ParsedSlashInput {
   if (name === "") return { kind: "none" };
   const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace).trim();
   return { kind: "command", name, args: rest === "" ? null : rest };
-}
-
-/** Render `/help` output from the same catalog the popup uses. */
-export function renderHelp(target?: string | null): string {
-  const name = target?.trim().replace(/^\//, "");
-  if (name) {
-    const command = SLASH_COMMANDS.find((c) => c.name === name);
-    if (!command) return `未知命令: /${name}`;
-    const usage = command.usage ? ` ${command.usage}` : "";
-    return `用法: /${command.name}${usage}\n${command.description}`;
-  }
-  const lines = SLASH_COMMANDS.map((c) => {
-    const usage = c.usage ? ` ${c.usage}` : "";
-    return `  /${c.name}${usage} ${c.description}`;
-  });
-  return ["可用命令:", ...lines].join("\n");
 }
