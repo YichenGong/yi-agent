@@ -22,6 +22,27 @@
 
 ---
 
+## 实测结论（本次已在 worktree 里跑通 Task 1 + 2）
+
+以下不是推测，是实际编译 + 跑测试得到的，按重要性排列：
+
+1. **`#[cfg(test)]` 对 `tests/` 下的集成测试无效。** 集成测试编译普通 lib，
+   `cfg(test)` 字段/方法在那里根本不存在。所以注入必须用**非 cfg** 的形式：
+   `Supervisor::with_flags_path(PathBuf)`（本计划采用的方案）。
+2. **`read_at` 拒绝未注册的 flag 名。** supervisor 测试不能自造 `demo_on`，
+   只能用注册表里真有的名字（`superpowers_kanban`）。这和"只有注册表里的才能开"
+   是同一条规则，测试踩到它说明这条规则真的在生效。
+3. **顺序很重要：Task 1 必须先做。** 先改 supervisor 再注册 flag，17 条测试
+   会全挂并各等 20 秒超时（看起来像"卡死"，其实是在等永远不会起来的子进程）。
+4. **`cargo test` 可能被工具超时截断而看起来像卡住。** 失败测试每条耗满
+   `CHILD_START_BUDGET`（20s），十几条就是几分钟。排查时直接跑测试二进制：
+   `./target/debug/deps/supervisor-<hash> --test-threads=4`，并盯 `ps` 确认没有
+   残留进程（`cargo test` 被中断会留下僵尸二进制持有 target 锁）。
+5. **`Supervisor::new` 改签名会波及 `yi-agent-runtime`**，而 runtime 的
+   `Cargo.toml` **原本没有** `yi-agent-flags` 依赖，必须同时加。
+6. `Layout` 上的 `global_preferences_path` / `project_preferences_path` 改完后
+   不再被使用，要删掉，否则 clippy `-D warnings` 失败。
+
 ### Task 1: 注册 `superpowers_kanban` flag
 
 **Files:**
@@ -105,13 +126,13 @@ git commit -m "feat(flags): 注册 superpowers_kanban 开关"
 
 **Files:**
 - Modify: `yi-agent-rs/crates/yi-agent-supervisors/Cargo.toml`
-- Modify: `yi-agent-rs/crates/yi-agent-supervisors/src/supervisor.rs:37-45,58-85,159-180`
-- Modify: `yi-agent-rs/crates/yi-agent-runtime/src/supervise.rs:105`
+- Modify: `yi-agent-rs/crates/yi-agent-supervisors/src/supervisor.rs`
+- Modify: `yi-agent-rs/crates/yi-agent-runtime/Cargo.toml`
+- Modify: `yi-agent-rs/crates/yi-agent-runtime/src/supervise.rs:108`
 - Test: `yi-agent-rs/crates/yi-agent-supervisors/tests/supervisor.rs`
 
-**Interfaces:**
-- Consumes: `yi_agent_flags::store::status_at(&Path, &str, &str, Option<&str>) -> (bool, Source)`。
-- Produces: `Supervisor::new(layout: Layout, build_kind: String)`。
+> 本节代码已在 worktree 里实际跑过：`cargo test -p yi-agent-supervisors`
+> → lib 52 passed + integration 19 passed。照抄即可，不要改回"更优雅"的写法。
 
 **这条为什么不能简单"叠加项目层"**（先读，再动手）：
 
@@ -125,106 +146,108 @@ git commit -m "feat(flags): 注册 superpowers_kanban 开关"
 | 全局 flag | `~/.yi-agent/flags.json` | **进程起不起** | 设置页 `flags/set` → app-server（不经插件） |
 | 项目开关 | `<项目>/.yi-agent/preferences.json` | **这个项目干不干活** | 看板 UI → 插件 `switch.write` |
 
-因此 `desired_on` **只读 global**。项目层仍由插件自己解析（已有的
-`switch.read` 就是两层复合），supervisor 不再碰它。
+因此 `desired_on` **只读 global**。项目层仍由插件自己解析（`switch.read` 本就
+是两层复合），supervisor 不再碰它。
 
 - [ ] **Step 1: 写失败测试**
 
-`tests/supervisor.rs` 追加：
+`tests/supervisor.rs` 追加（**用注册过的 `superpowers_kanban`，不要自造名字**）：
 
 ```rust
-/// 全局 flag 关 → 声明了 switch_key 的进程必须被停掉。
-///
-/// 这是本次的核心：过去全局层读 `$HOME/.yi-agent/preferences.json`，现在读
-/// `flags.json`。用户在设置页关掉开关后 500ms 内进程就该没了。
+/// 全局 flag 关（`flags.json` 里没有这个键）→ 子进程绝不能被起。
 #[test]
 fn a_manifest_whose_global_flag_is_off_is_stopped() {
+    let _guard = spawn_serial_guard();
     let dir = tempfile::tempdir().unwrap();
     let workdir = dir.path();
-    let marker = workdir.join("started");
-    let script = workdir.join("touch.sh");
-    std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nsleep 30\n", marker.display())).unwrap();
-    std::os::unix::fs::PermissionsExt::set_mode(
-        &mut std::fs::metadata(&script).unwrap().permissions(),
-        0o755,
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    write_manifest(
+        &layout_for(workdir).manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
     );
-    write_manifest(workdir, "demo", &script, "demo_on");
 
-    // flags.json 不存在 = flag 关。
-    let mut supervisor = Supervisor::new(layout_for(workdir), "dev".to_string());
+    let mut supervisor = supervisor_for(workdir, "dev");
     supervisor.reconcile();
-    assert_eq!(supervisor.running_count(), 0);
-    assert!(!marker.exists(), "the process must never have been started");
-}
-
-/// 全局 flag 开 → 起进程。**项目层不再参与判定**，这是有意为之：
-/// 项目开关由插件自己解析，supervisor 停掉它就断了恢复路径。
-#[test]
-fn a_manifest_whose_global_flag_is_on_is_started_even_if_the_project_layer_is_absent() {
-    let dir = tempfile::tempdir().unwrap();
-    let workdir = dir.path();
-    let marker = workdir.join("started");
-    let script = workdir.join("touch.sh");
-    std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nsleep 30\n", marker.display())).unwrap();
-    std::os::unix::fs::PermissionsExt::set_mode(
-        &mut std::fs::metadata(&script).unwrap().permissions(),
-        0o755,
-    );
-    write_manifest(workdir, "demo", &script, "demo_on");
-
-    let mut supervisor = Supervisor::new(layout_for(workdir), "dev".to_string());
-    supervisor.reconcile_with_flags(Some(std::collections::BTreeMap::from([(
-        "demo_on".to_string(),
-        true,
-    )])));
-    assert_eq!(supervisor.running_count(), 1);
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(!marker.exists(), "flag off must never start the child");
     supervisor.stop_all();
 }
 
-/// stable 构建里 flag 恒假，哪怕 flags.json 写着 true。
+/// 全局 flag 开 → 起进程，**与项目层无关**。
+///
+/// 这是刻意的：项目开关归插件解析，supervisor 停掉它就断了恢复路径。
 #[test]
-fn a_release_build_never_starts_a_flagged_manifest() {
+fn a_manifest_whose_global_flag_is_on_is_started() {
+    let _guard = spawn_serial_guard();
     let dir = tempfile::tempdir().unwrap();
     let workdir = dir.path();
-    let marker = workdir.join("started");
-    let script = workdir.join("touch.sh");
-    std::fs::write(&script, format!("#!/bin/sh\ntouch {}\nsleep 30\n", marker.display())).unwrap();
-    std::os::unix::fs::PermissionsExt::set_mode(
-        &mut std::fs::metadata(&script).unwrap().permissions(),
-        0o755,
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    write_manifest(
+        &layout_for(workdir).manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
     );
-    write_manifest(workdir, "demo", &script, "demo_on");
+    enable(workdir, "superpowers_kanban"); // 只写 flags.json
 
-    let mut supervisor = Supervisor::new(layout_for(workdir), "release".to_string());
-    supervisor.reconcile_with_flags(Some(std::collections::BTreeMap::from([(
-        "demo_on".to_string(),
-        true,
-    )])));
-    assert_eq!(supervisor.running_count(), 0);
+    let mut supervisor = supervisor_for(workdir, "dev");
+    supervisor.reconcile();
+    assert!(wait_for_pid_marker(&marker), "flag on must start the child");
+    supervisor.stop_all();
+}
+
+/// stable 构建里 flag 恒关，哪怕 flags.json 写着 true。
+#[test]
+fn a_release_build_never_starts_a_flagged_manifest() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    write_manifest(
+        &layout_for(workdir).manifests_dir(),
+        "demo",
+        &child,
+        "superpowers_kanban",
+    );
+    enable(workdir, "superpowers_kanban");
+
+    let mut supervisor = supervisor_for(workdir, "release");
+    supervisor.reconcile();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !marker.exists(),
+        "a stable build must ignore flags.json entirely"
+    );
+    supervisor.stop_all();
 }
 ```
-
-> `reconcile_with_flags` 是测试缝：真实 `reconcile()` 读 `flags.json`，测试里
-> 用注入值避免依赖 `$HOME`。若嫌多一个公开方法，可把 flag 读取抽成私有
-> `fn global_flags(&self) -> Option<BTreeMap<String, bool>>` 并给 `#[cfg(test)]`
-> 的可变覆盖字段；执行时按哪种更少噪音选哪种。
-
-`layout_for` 若文件里已有等价 helper，直接用现有的。
 
 - [ ] **Step 2: 跑测试确认失败**
 
 ```bash
-cd yi-agent-rs && cargo test -p yi-agent-supervisors a_manifest_whose_global_flag
+cd yi-agent-rs && cargo test -p yi-agent-supervisors --test supervisor --no-run
 ```
-Expected: 编译失败（`new` 只收 1 个参数、没有 `reconcile_with_flags`）。
+Expected: 编译失败（`Supervisor::new` 参数个数、`supervisor_for` / `enable` 不存在）。
 
 - [ ] **Step 3: 加依赖**
 
-`yi-agent-supervisors/Cargo.toml` 的 `[dependencies]`：
+`crates/yi-agent-supervisors/Cargo.toml`：
 
 ```toml
 # 全局开关来自 flags.json。supervisor 每 500ms 对账一次，必须自己读得到
 # 当前值：由上层传一次性结论会漏掉"进程跑着时用户改了开关"。
+yi-agent-flags = { workspace = true }
+```
+
+`crates/yi-agent-runtime/Cargo.toml`（**原本没有**，漏了编译失败）：
+
+```toml
+# `supervise::serve` 起 supervisor 时要告诉它构建类型。
 yi-agent-flags = { workspace = true }
 ```
 
@@ -236,15 +259,17 @@ pub struct Supervisor {
     /// 进程级构建类型，供 flag 的 stable 硬闸使用。
     ///
     /// **不能在这里调 `yi_agent_flags::build_kind()`**：那是进程级 `OnceLock`，
-    /// 测试里从未注入、恒为 `"release"`，flag 永远读成关，测试就没法验"开"的
-    /// 那一半。与 `lead_gate` 是同一个坑。
+    /// 只有 `yi-agent/src/main.rs` 注入过，测试里从未注入、恒为 `"release"`，
+    /// flag 永远读成关，测试就没法验"开"的那一半。与 `lead_gate` 是同一个坑。
     build_kind: String,
     running: BTreeMap<String, RunningChild>,
     spawned: Option<Child>,
     spawned_log: Option<ChildLog>,
-    /// 测试缝：非 `None` 时用它代替 `flags.json`，免得测试去碰 `$HOME`。
-    #[cfg(test)]
-    flags_override: Option<BTreeMap<String, bool>>,
+    /// `flags.json` 的位置。生产走 `flags_path()`，测试指向自己的临时目录。
+    ///
+    /// **刻意不是 `#[cfg(test)]`**：`tests/` 下的集成测试编译的是普通 lib，
+    /// `cfg(test)` 字段在那里根本不存在，注入也就无从谈起。
+    flags_path: Option<PathBuf>,
 }
 
 impl Supervisor {
@@ -255,59 +280,55 @@ impl Supervisor {
             running: BTreeMap::new(),
             spawned: None,
             spawned_log: None,
-            #[cfg(test)]
-            flags_override: None,
+            flags_path: None,
         }
+    }
+
+    /// 从指定的 `flags.json` 读开关。测试用；生产用 [`Supervisor::new`]。
+    pub fn with_flags_path(mut self, flags_path: PathBuf) -> Self {
+        self.flags_path = Some(flags_path);
+        self
     }
 
     /// 生效开关：**只看全局 flag**。
     ///
-    /// 项目层（`preferences.json`）故意不读：那个键由插件 daemon 自己写，
-    /// 停掉 daemon 就没人能把它打开（`switch.write` 走的就是这条通道）。
-    /// 项目级的"这个项目干不干活"由插件自己解析，见
-    /// `superpowers-kanban-core/src/switch.rs`。
+    /// 项目层（`preferences.json`）故意不读：那个键由插件 daemon 自己写
+    /// （`switch.write`），停掉 daemon 就没人能把它打开，"关"会变成单向门。
+    /// 项目级的"这个项目干不干活"由插件自己解析。
     pub fn desired_on(&self, manifest: &SupervisorManifest) -> bool {
         self.flag_on(&manifest.switch_key)
     }
 
     fn flag_on(&self, name: &str) -> bool {
-        #[cfg(test)]
-        if let Some(map) = &self.flags_override {
-            // 测试里仍要遵守 stable 硬闸，才能验 `a_release_build_...`。
-            return self.build_kind == "dev" && map.get(name).copied().unwrap_or(false);
-        }
-        let Some(path) = yi_agent_flags::store::flags_path() else {
+        let Some(path) = self
+            .flags_path
+            .clone()
+            .or_else(yi_agent_flags::store::flags_path)
+        else {
             return false;
         };
         yi_agent_flags::store::status_at(&path, name, &self.build_kind, None).0
     }
-
-    #[cfg(test)]
-    pub fn reconcile_with_flags(&mut self, flags: Option<BTreeMap<String, bool>>) {
-        self.flags_override = flags;
-        self.reconcile();
-    }
 }
 ```
 
-删掉不再使用的 `global_preferences_path`（`supervisor.rs:59`）和
-`switch::resolve_bool` 的调用；`project_preferences_path` 若别处不用也一并删。
+同时**删掉** `Layout` 上的 `global_preferences_path` / `project_preferences_path`
+（改完没人用，留着 clippy `-D warnings` 会失败），以及
+`use crate::switch::read_bool_key;`（若不再被引用）。
 
 - [ ] **Step 5: 改 reconcile 的注释（逻辑不动）**
 
 ```rust
-        for manifest in manifests {
             if !self.desired_on(&manifest) {
                 // 关着 = 停掉。声明了 query_socket 的进程在这里**本该**由
                 // `stop_when_disabled:false` 豁免，但看板场景下 daemon 必须退：
                 // 它在跑就会轮询看板，用户的"关掉"就不是真关掉。
                 //
                 // 恢复路径是安全的：重新打开走设置页的 `flags/set`，那条路是
-                // app-server 直接写 flags.json，不经过插件 daemon。这跟
-                // `supervisor.rs` 原来那句"停掉就成了单向门"针对的是**项目层
-                // preferences**——那时的开关只能靠插件自己写。现在全局层换了
-                // 来源，单向门不成立了，但注释必须改掉，否则下一个人会照着
-                // 旧结论把 daemon 又留下。
+                // app-server 直接写 flags.json，不经过插件 daemon。原注释里
+                // "停掉就成了单向门"针对的是**项目层 preferences**——那时的
+                // 开关只能靠插件自己写。来源换了，单向门不成立了，注释必须
+                // 改掉，否则下一个人会照着旧结论把 daemon 又留下。
                 if !manifest.stop_when_disabled {
                     self.ensure_running(&manifest);
                     continue;
@@ -315,38 +336,99 @@ impl Supervisor {
                 self.stop(&manifest.name, "switch off");
                 continue;
             }
-            self.ensure_running(&manifest);
-        }
 ```
 
-- [ ] **Step 6: 修调用点**
+- [ ] **Step 6: 改测试 helper**
 
-`crates/yi-agent-runtime/Cargo.toml` 加依赖（**当前没有**，漏了会编译失败）：
+在 `tests/supervisor.rs` 里把 `enable` 从写 `preferences.json` 改成写
+`flags.json`，并加 `supervisor_for`：
 
-```toml
-# `supervise::serve` 起 supervisor 时要告诉它构建类型。
-yi-agent-flags = { workspace = true }
+```rust
+/// 打开一个**全局 flag**：写 `flags.json`（不是项目层 `preferences.json`）。
+///
+/// 两者必须分清：项目层那个键由插件 daemon 自己写，用它决定进程起停会让
+/// "关"变成单向门（停掉 daemon 就没人能 `switch.write` 回来了）。
+fn enable(workdir: &Path, switch_key: &str) {
+    std::fs::create_dir_all(workdir.join(".yi-agent")).unwrap();
+    std::fs::write(
+        workdir.join(".yi-agent/flags.json"),
+        format!(r#"{{"flags":{{"{switch_key}":true}}}}"#),
+    )
+    .unwrap();
+}
+
+/// 把 supervisor 指向项目内的 `flags.json`。
+///
+/// 生产读 `$YI_AGENT_HOME/flags.json`；测试不碰真实 home，否则并行测试会
+/// 互相写同一份文件。
+fn supervisor_for(workdir: &Path, build_kind: &str) -> Supervisor {
+    let layout = layout_for(workdir);
+    Supervisor::new(layout, build_kind.to_string())
+        .with_flags_path(workdir.join(".yi-agent/flags.json"))
+}
 ```
 
-`crates/yi-agent-runtime/src/supervise.rs:105`：
+然后把文件里**所有** `Supervisor::new(...)` 换成 `supervisor_for(workdir, "dev")`
+（保留原有的 `"dev"` 语义）；把测试里所有 `"demo_on"` 换成
+`"superpowers_kanban"`；把"关掉开关"的两处 `std::fs::write(&prefs, ...)` 改成：
+
+```rust
+    std::fs::write(&flags, r#"{"flags":{"superpowers_kanban":false}}"#).unwrap();
+```
+
+（`let flags = workdir.join(".yi-agent/flags.json");`）
+
+再加一条钉住"未注册名字无效"的测试：
+
+```rust
+/// 只有注册表里的名字才能开：`read_at` 对未注册的键一律返回 `None`。
+/// supervisor 的测试因此不能自造 `demo_on`，只能用注册过的名字。
+#[test]
+fn an_unregistered_switch_key_stays_off_even_if_the_file_says_true() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    write_manifest(&layout_for(workdir).manifests_dir(), "demo", &child, "demo_on");
+    enable(workdir, "demo_on");
+
+    let mut supervisor = supervisor_for(workdir, "dev");
+    supervisor.reconcile();
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !marker.exists(),
+        "a name that is not in the registry must never switch anything on"
+    );
+    supervisor.stop_all();
+}
+```
+
+> 这条测试**故意**用未注册的 `demo_on`，它是唯一允许出现该名字的地方。
+
+- [ ] **Step 7: 改 runtime 调用点**
+
+`crates/yi-agent-runtime/src/supervise.rs:108`：
 
 ```rust
 let mut supervisor = Supervisor::new(layout, yi_agent_flags::build_kind().to_string());
 ```
 
-`tests/supervisor.rs` 里所有 `Supervisor::new(layout)` 补 `"dev".to_string()`。
-同时**删掉**既有的"全局 preferences 决定起停"类测试（`enable(workdir, ...)`
-写的是 `$HOME/.yi-agent/preferences.json`），改成写 `flags.json` 或直接用
-`reconcile_with_flags`。
-
-- [ ] **Step 7: 跑 supervisor 测试**
+- [ ] **Step 8: 跑测试**
 
 ```bash
-cargo test -p yi-agent-supervisors
+cargo test -p yi-agent-supervisors --lib
+cargo test -p yi-agent-supervisors --test supervisor -- --test-threads=4
+cargo build -p yi-agent-runtime
 ```
-Expected: 全绿。
+Expected: 52 + 19 passed；runtime 编译通过；无 warning。
 
-- [ ] **Step 8: Commit**
+> **若测试看起来"卡住"**：先看 `ps aux | grep supervisor-`。失败测试每条要等满
+> 20s（`CHILD_START_BUDGET`），十几条就是几分钟——不是死锁。确认 Task 1 真的
+> 做过了（`grep superpowers_kanban crates/yi-agent-flags/src/registry.rs`），
+> 这是最常见的根因。
+
+- [ ] **Step 9: Commit**
 
 ```bash
 cd .. && cargo fmt --manifest-path yi-agent-rs/Cargo.toml --all
