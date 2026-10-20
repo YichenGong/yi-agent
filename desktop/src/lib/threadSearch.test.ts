@@ -184,3 +184,48 @@ describe("filterThreadTree", () => {
     expect(filterThreadTree(withTag, [], "chartreuse").empty).toBe(true);
   });
 });
+
+describe("filterThreadTree 与分组框", () => {
+  const boxed = (): WorkspaceGroup[] => [
+    {
+      workspace: "/p",
+      exists: true,
+      threads: [thread("a", "登录页面", "/p"), thread("b", "扫码", "/p")],
+      groups: [{ id: "g", name: "登录模块", description: "", threadIds: ["a", "b"] }],
+    },
+  ];
+
+  it("搜索时组框按命中成员收窄，未命中的成员从框里消失", () => {
+    const r = filterThreadTree(boxed(), [], "扫码");
+    const box = (r.groups[0].groups ?? [])[0];
+    // 组名本身没命中、但成员 b 命中：框仍在，成员表只剩 b。
+    expect(box.threadIds).toEqual(["b"]);
+  });
+
+  it("组名命中时整组保留（组名也是可搜内容）", () => {
+    const r = filterThreadTree(boxed(), [], "登录模块");
+    const box = (r.groups[0].groups ?? [])[0];
+    expect(box.threadIds).toEqual(["a", "b"]);
+  });
+
+  it("描述命中时整组保留", () => {
+    const g = boxed();
+    g[0].groups![0].description = "扫码与账密两条线";
+    const r = filterThreadTree(g, [], "账密");
+    expect((r.groups[0].groups ?? [])[0].threadIds).toEqual(["a", "b"]);
+  });
+
+  it("框内成员全不命中且组名/描述也不命中，整框隐藏", () => {
+    const r = filterThreadTree(boxed(), [], "完全无关");
+    expect(r.groups).toEqual([]);
+    expect(r.empty).toBe(true);
+  });
+
+  it("框内成员全不命中、但组名命中：框与成员都保留（整组展示）", () => {
+    const r = filterThreadTree(boxed(), [], "登录模块");
+    expect(r.groups).toHaveLength(1);
+    expect((r.groups[0].groups ?? [])[0].threadIds).toEqual(["a", "b"]);
+    // 成员行也不能被查询筛空，否则展开是个空框。
+    expect(idsOf(r).sort()).toEqual(["a", "b"]);
+  });
+});

@@ -67,7 +67,7 @@
   - `pub fn remove_thread(workspace: &Path, thread_id: &str) -> io::Result<()>` — 从所有组移除该 id，删空的组整组移除
   - `pub fn prune(groups: &mut Vec<Group>, is_member: impl Fn(&str) -> bool)` — 剔除不满足谓词的成员，删除空组（`build_list_all_response` 与 `remove_thread` 共用）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `group_store.rs` 末尾加：
 
@@ -192,12 +192,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib group_store`
 Expected: 编译失败（`Group`、`load` 等未定义）。
 
-- [ ] **Step 3: 写最小实现**
+- [x] **Step 3: 写最小实现**
 
 ```rust
 //! 会话分组（session groups）的持久化。
@@ -374,12 +374,12 @@ pub fn remove_thread(workspace: &Path, thread_id: &str) -> io::Result<()> {
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib group_store`
 Expected: PASS（10 个测试）。
 
-- [ ] **Step 5: 注册模块**
+- [x] **Step 5: 注册模块**
 
 在 `yi-agent-rs/crates/yi-agent-app-server/src/lib.rs` 里，按现有 `pub mod` 的字母序
 插入一行：
@@ -391,7 +391,7 @@ pub mod group_store;
 （`lib.rs` 里若无 `pub mod` 列表而只有 `mod` + `pub use`，按该文件既有风格加对应的一行；
 模块必须对整个 crate 可见，`rpc/thread.rs` 与 `rpc_tests.rs` 都要用。）
 
-- [ ] **Step 6: 格式化并提交**
+- [x] **Step 6: 格式化并提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. \
@@ -415,7 +415,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. \
   - `Notification::GroupsChanged { workspace: String }`，线上 `thread/groupsChanged`，`thread_key()` 返回 `None`，`Delivery::List`
   - `thread/listAll` 每个 workspace 分组多一个 `"groups"` 数组，元素形如 `{"id","name","description","threadIds"}`（**注意 wire 上是 camelCase 的 `threadIds`**，与既有 `WorkspaceGroup.threads` 同一个 hand-built JSON 里 camelCase 约定一致）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `protocol.rs` 的 `mod tests` 里加：
 
@@ -483,12 +483,12 @@ async fn list_all_carries_groups_and_hides_stale_members() {
 }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib groups_changed && cargo test -p yi-agent-app-server --lib list_all_carries_groups`
 Expected: 编译失败（`Notification::GroupsChanged` 未定义）。
 
-- [ ] **Step 3: 加通知变体**
+- [x] **Step 3: 加通知变体**
 
 在 `protocol.rs` 的 `Notification` 枚举里，紧跟 `TagChanged` 之后加：
 
@@ -511,7 +511,7 @@ Expected: 编译失败（`Notification::GroupsChanged` 未定义）。
             Notification::GroupsChanged { .. } => Delivery::List,
 ```
 
-- [ ] **Step 4: `build_list_all_response` 带出 groups**
+- [x] **Step 4: `build_list_all_response` 带出 groups**
 
 在 `rpc/thread.rs` 里加一个辅助函数（放在 `build_list_all_response` 之后）：
 
@@ -568,12 +568,12 @@ fn groups_json(workspace: &str, live_ids: &[String]) -> serde_json::Value {
         .collect();
 ```
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib groups_changed && cargo test -p yi-agent-app-server --lib list_all_carries_groups`
 Expected: PASS。
 
-- [ ] **Step 6: 重新生成 ts-rs bindings 并一起提交**
+- [x] **Step 6: 重新生成 ts-rs bindings 并一起提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cargo test --all-features -p yi-agent-app-server export_bindings \
@@ -603,7 +603,7 @@ cd yi-agent-rs && cargo fmt --all && cargo test --all-features -p yi-agent-app-s
   - `thread/group/delete` params `{workspace, groupId}` → `{}`
   - 全部在成功后就地广播 `thread/groupsChanged {workspace}`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `rpc_tests.rs` 末尾加（四条，覆盖建/改/删/成员与错误路径）：
 
@@ -768,12 +768,12 @@ async fn group_mutations_broadcast_groups_changed() {
 
 > 注：`Harness` 若无 `expect_notification` 辅助方法，用该文件既有的「读帧直到 method 匹配」写法（参考 `set_tag_broadcasts_tag_changed` 附近的实现），照抄其结构。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib group_`
 Expected: 编译失败或 `method not found`。
 
-- [ ] **Step 3: 加四个 RPC 臂**
+- [x] **Step 3: 加四个 RPC 臂**
 
 在 `rpc/thread.rs` 的 `match` 里、`"thread/setTag"` 臂之后加：
 
@@ -1001,7 +1001,7 @@ fn require_group_id(params: &serde_json::Value) -> Result<String, RpcError> {
 import（该文件既有的 `scan_workspace_metas` 用了 `Path`，`build_list_all_response`
 用了 `HashSet`），无需新加。`scan_workspace_metas` 不需要提升可见性。
 
-- [ ] **Step 4: `thread/delete` 联动清理**
+- [x] **Step 4: `thread/delete` 联动清理**
 
 在 `thread/delete` 臂里 `thread_store.delete(&thread_id)` 之后（同一 `if let Some(cwd)` 块之前）加：
 
@@ -1015,12 +1015,12 @@ import（该文件既有的 `scan_workspace_metas` 用了 `Path`，`build_list_a
             }
 ```
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib group_ && cargo test -p yi-agent-app-server --lib deleting_a_thread_prunes`
 Expected: PASS。
 
-- [ ] **Step 6: 格式化并提交**
+- [x] **Step 6: 格式化并提交**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd .. \
@@ -1048,7 +1048,7 @@ cd yi-agent-rs && cargo fmt --all && cd .. \
   - `export function groupMembers(group: SessionGroup, threads: ThreadSummary[]): ThreadSummary[]`
   - `export function groupByThread(rows: SidebarRow[]): Map<string, SessionGroup>`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `desktop/src/lib/sessionGroups.test.ts`：
 
@@ -1168,12 +1168,12 @@ describe("groupByThread", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/sessionGroups.test.ts`
 Expected: 模块不存在，导入失败。
 
-- [ ] **Step 3: 加协议类型**
+- [x] **Step 3: 加协议类型**
 
 `desktop/src/lib/protocol.ts`，在 `WorkspaceGroup` 之前加：
 
@@ -1204,7 +1204,7 @@ export interface WorkspaceGroup {
 }
 ```
 
-- [ ] **Step 4: 写实现**
+- [x] **Step 4: 写实现**
 
 `desktop/src/lib/sessionGroups.ts`：
 
@@ -1280,12 +1280,12 @@ export function groupByThread(rows: SidebarRow[]): Map<string, SessionGroup> {
 }
 ```
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/sessionGroups.test.ts`
 Expected: PASS（9 个测试）。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add desktop/src/lib/protocol.ts desktop/src/lib/sessionGroups.ts desktop/src/lib/sessionGroups.test.ts \
@@ -1311,7 +1311,7 @@ git add desktop/src/lib/protocol.ts desktop/src/lib/sessionGroups.ts desktop/src
   - 四个都返回「是否成功」；失败时把错误写进 `setCurrentError` 并在返回前 `force()`
   - `App` 另把 `setCurrentError` 作为 `onError` 传给侧栏（跨目录建组的提示走这条）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `desktop/src/App.test.tsx` 里加一条（沿用该文件既有的 fake client harness，参考既有 `tagChanged` 用例的结构）：断言收到 `thread/groupsChanged` 后重拉了 `thread/listAll`：
 
@@ -1328,12 +1328,12 @@ it("thread/groupsChanged 触发列表重拉", async () => {
 
 > 若 `App.test.tsx` 的 harness 名称不同（`fakeRpc` / `TestClient` 等），按该文件既有约定改写；断言不变。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/App.test.tsx -t "groupsChanged"`
 Expected: FAIL（没有对应分支，`thread/listAll` 未被再次调用）。
 
-- [ ] **Step 3: 加四个动作**
+- [x] **Step 3: 加四个动作**
 
 在 `useSessionState.ts` 的 `return` 之前加（`rpc()` 为 null 时静默返回 `false`，与既有动作同款）：
 
@@ -1391,7 +1391,7 @@ Expected: FAIL（没有对应分支，`thread/listAll` 未被再次调用）。
     deleteGroup,
 ```
 
-- [ ] **Step 4: App 接线**
+- [x] **Step 4: App 接线**
 
 在 `App.tsx` 的通知处理链里，紧跟 `thread/tagChanged` 分支之后加：
 
@@ -1416,12 +1416,12 @@ Expected: FAIL（没有对应分支，`thread/listAll` 未被再次调用）。
 
 （`ThreadSidebar` 的 props 在 Task 6 里定义；本步只加传参，编译会红，属预期，Task 6 补齐。）
 
-- [ ] **Step 5: 跑测试确认通过**
+- [x] **Step 5: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/App.test.tsx`
 Expected: PASS。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add desktop/src/hooks/useSessionState.ts desktop/src/App.tsx desktop/src/App.test.tsx \
@@ -1444,7 +1444,7 @@ git add desktop/src/hooks/useSessionState.ts desktop/src/App.tsx desktop/src/App
   - `onSetGroupMembers: (workspace: string, groupId: string, threadIds: string[]) => Promise<boolean>`
   - `onDeleteGroup: (workspace: string, groupId: string) => Promise<boolean>`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `ThreadSidebar.test.tsx` 末尾加：
 
@@ -1531,12 +1531,12 @@ describe("会话分组框", () => {
 
 > `baseThread` / `defaultProps` 若该文件里没有同名 helper，用该文件既有的 `groups` 构造与 `renderSidebar(...)` 约定改写；断言不变。同时把 `fireEvent` / `vi` / `waitFor` 加进该文件的 import（已存在则复用）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx -t "会话分组框"`
 Expected: FAIL（无组框渲染）。
 
-- [ ] **Step 3: 加 props 与选择态**
+- [x] **Step 3: 加 props 与选择态**
 
 `ThreadSidebar.tsx` 的 props 类型里加：
 
@@ -1581,7 +1581,7 @@ Expected: FAIL（无组框渲染）。
     | { kind: "groupBox"; ws: string; groupId: string }
 ```
 
-- [ ] **Step 4: 会话行支持多选**
+- [x] **Step 4: 会话行支持多选**
 
 `renderThread` 的 `onClick` 里、`onSelect` 之前加：
 
@@ -1639,7 +1639,7 @@ Expected: FAIL（无组框渲染）。
         } ${selected.has(t.thread_id) ? "bg-raised ring-1 ring-line-strong" : ""} ${
 ```
 
-- [ ] **Step 5: 渲染组框**
+- [x] **Step 5: 渲染组框**
 
 在 `renderGroupNode` 里，把原来兜底的 `g.threads.filter(...).map(...)` 换成 `layoutWorkspace` 驱动：
 
@@ -1826,7 +1826,7 @@ const GROUP_NAME_MAX = 24;
 const GROUP_DESCRIPTION_MAX = 120;
 ```
 
-- [ ] **Step 6: 多选操作条与新建组输入**
+- [x] **Step 6: 多选操作条与新建组输入**
 
 在侧栏底部（列表之后、宽度拖柄之前）加：
 
@@ -1924,17 +1924,17 @@ const GROUP_DESCRIPTION_MAX = 120;
   };
 ```
 
-- [ ] **Step 7: 跑测试确认通过**
+- [x] **Step 7: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/components/ThreadSidebar.test.tsx`
 Expected: PASS（含原有测试与新增 5 条）。
 
-- [ ] **Step 8: 全量前端测试与类型检查**
+- [x] **Step 8: 全量前端测试与类型检查**
 
 Run: `cd desktop && npx vitest run && npx tsc --noEmit`
 Expected: 全绿。
 
-- [ ] **Step 9: 提交**
+- [x] **Step 9: 提交**
 
 ```bash
 cd desktop && npx prettier --write src/components/ThreadSidebar.tsx src/lib/sessionGroups.ts 2>/dev/null; cd .. \
@@ -1958,7 +1958,7 @@ cd desktop && npx prettier --write src/components/ThreadSidebar.tsx src/lib/sess
 - Consumes: 全部前面的产物
 - Produces: 搜索时「框内只剩命中成员、全不命中则整框隐藏」
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `threadSearch` 的测试文件里加：
 
@@ -1998,12 +1998,12 @@ it("组名命中时整组保留（名字本身也是可搜内容）", () => {
 });
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd desktop && npx vitest run src/lib/threadSearch.test.ts`
 Expected: FAIL（组表未收窄）。
 
-- [ ] **Step 3: 实现搜索收窄**
+- [x] **Step 3: 实现搜索收窄**
 
 在 `filterThreadTree` 的 `threads` 过滤之后加：
 
@@ -2030,12 +2030,12 @@ Expected: FAIL（组表未收窄）。
     }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [x] **Step 4: 跑测试确认通过**
 
 Run: `cd desktop && npx vitest run src/lib/threadSearch.test.ts`
 Expected: PASS。
 
-- [ ] **Step 5: 更新项目进度文档**
+- [x] **Step 5: 更新项目进度文档**
 
 在 `docs/project-management/` 下找到侧栏/会话模块文件（`rg -l "ThreadSidebar" docs/project-management/`），加一条：
 
@@ -2047,7 +2047,7 @@ Expected: PASS。
 
 并同步 `docs/project-management/README.md` 模块索引表的「完成 / 总计」计数。
 
-- [ ] **Step 6: 全量校验**
+- [x] **Step 6: 全量校验**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cargo test -p yi-agent-app-server --lib \
@@ -2058,7 +2058,7 @@ cd yi-agent-rs && cargo fmt --all && cargo test -p yi-agent-app-server --lib \
 
 Expected: 全绿，且 bindings 无未提交改动。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 git add desktop/src/lib/threadSearch.ts desktop/src/lib/threadSearch.test.ts docs/project-management \
