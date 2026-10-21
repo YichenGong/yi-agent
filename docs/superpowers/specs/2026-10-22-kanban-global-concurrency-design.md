@@ -122,7 +122,15 @@ pub fn global_settings_path() -> Option<PathBuf>
 | `instance_wait_secs` | 项目级 | 抢 `plugin.lock` 的等待预算 |
 
 即使项目级文件里还留着 `default_max_tasks` / `window`，也**忽略**（读路径容忍旧文件，
-不是报错）。`settings.write` 只写全局文件；写路径继续拒绝越界（`from_settings_json` 不变）。
+不是报错）。
+
+`settings.read` / `settings.write` 面对的是同一份完整载荷，但字段归属不同，故按字段拆分：
+
+- `settings.read` 返回**合并视图**：`default_max_tasks` / `windows` 取自全局文件，其余三者
+  取自项目文件。
+- `settings.write` 把载荷拆成两半分别落盘：并发字段 → 全局文件，其余 → 项目文件。
+  校验必须**先于任何一次写入**（沿用 `from_settings_json` 的“非法输入零落盘”契约）；
+  两半都校验通过才写，避免写出“全局更新了、项目没更新”的半套配置。
 
 ### 2.4 兼容与退化
 
