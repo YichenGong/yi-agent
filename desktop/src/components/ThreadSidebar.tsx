@@ -180,13 +180,13 @@ export function ThreadSidebar({
   onReorderPinned: (orderedIds: string[]) => void;
   /** 给会话打 / 清颜色标签（`TagId` 或 null=清除）。 */
   onSetTag: (id: string, tag: TagId | null) => void;
-  /** 用选中的会话建组。返回 false 表示失败（保留编辑器）。 */
+  /** 用选中的会话建组。成功返回新组 id，null 表示失败（保留编辑器）。 */
   onCreateGroup: (
     workspace: string,
     name: string,
     description: string,
     threadIds: string[],
-  ) => Promise<boolean>;
+  ) => Promise<string | null>;
   /** 改组名 / 描述。`patch` 只带要改的字段。 */
   onUpdateGroup: (
     workspace: string,
@@ -277,6 +277,8 @@ export function ThreadSidebar({
   >(null);
   // 组框的展开集合（键为 group id）：与 workspace 折叠分开，折叠目录不等于折叠组。
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  /** 正在为哪个组挑选「加入的会话」；null = 没有打开的挑选器。 */
+  const [addingTo, setAddingTo] = useState<string | null>(null);
   // 多选：会话行的选择集。Ctrl/Cmd+点击进出，Shift+点击按当前行序区间选择。
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
@@ -496,6 +498,19 @@ export function ThreadSidebar({
     [groups],
   );
 
+  /**
+   * 该组还能加进哪些会话：同 workspace、尚未在该组里。
+   *
+   * 与 `joinableFor` 同一口径（后者从会话视角、这里从组视角出发），但这里
+   * 不排除「已在别的组」——一条会话可以同属多个组（多对多，见 spec）。
+   */
+  function addableFor(workspace: string, group: SessionGroup): ThreadSummary[] {
+    const ws = groups.find((g) => g.workspace === workspace);
+    if (!ws) return [];
+    const existing = new Set(group.threadIds);
+    return ws.threads.filter((t) => !existing.has(t.thread_id) && t.thread_id !== leadId);
+  }
+
   /** thread_id → 它所在 workspace 的路径（用于建组时的同目录校验）。 */
   const workspaceOfThread = useCallback(
     (id: string): string | null => {
@@ -624,8 +639,51 @@ export function ThreadSidebar({
               {group.name}
             </div>
           )}
-          <span className="shrink-0 text-xs text-fg-faint">{members.length}</span>
+          <span className="shrink-0 text-xs text-fg-faint" data-group-count="">
+            {members.length}
+          </span>
+          {/*
+            「加入会话」入口挂在组框头上，而不是只留在会话右键菜单里：
+            用户想「往已有的组里塞一条会话」时，眼睛先落在组上，菜单里找
+            不到就会以为做不到。这里直接给出可选列表。
+          */}
+          <button
+            type="button"
+            data-group-add=""
+            aria-label={`向 ${group.name} 加入会话`}
+            title="加入会话"
+            onClick={() => setAddingTo(group.id)}
+            className="shrink-0 rounded px-1 text-fg-subtle hover:bg-raised hover:text-fg"
+          >
+            +
+          </button>
         </div>
+        {addingTo === group.id && (
+          <div data-group-add-picker="" className="border-t border-line-strong/60 px-2 py-1">
+            {addableFor(workspace, group).length === 0 ? (
+              <div className="text-xs text-fg-faint">没有可加入的会话</div>
+            ) : (
+              addableFor(workspace, group).map((t) => (
+                <button
+                  key={t.thread_id}
+                  type="button"
+                  data-add-candidate={t.thread_id}
+                  onClick={() => {
+                    setAddingTo(null);
+                    void onSetGroupMembers(workspace, group.id, [
+                      ...group.threadIds,
+                      t.thread_id,
+                    ]);
+                  }}
+                  className="block w-full truncate rounded px-1 py-1 text-left text-xs text-fg-muted hover:bg-raised hover:text-fg"
+                  title={t.title ?? t.thread_id}
+                >
+                  {t.title ?? "(untitled)"}
+                </button>
+              ))
+            )}
+          </div>
+        )}
         {expanded && (
           <div className="border-t border-line-strong/60 px-2 py-1">
             {editing === "description" ? (
@@ -743,11 +801,12 @@ export function ThreadSidebar({
         }
         onClick={(e) => {
           if (editingId) return;
-          // 双击会先派发两次 click 再派发 dblclick;忽略第二次 click,
-          // 避免对同一 thread 触发两次 onSelect(即两次 thread/resume)。
-          if (e.detail > 1) return;
           // 多选：Ctrl/Cmd 切换单选，Shift 按当前行序区间选择。没有修饰键时
           // 照旧打开会话——选择态只是「临时搭建的动作上下文」，不该改变单击的含义。
+          //
+          // 双击保护必须放在修饰键分支**之后**：macOS 上连续两次 Cmd+点击的
+          // 第二次 `detail` 是 2（浏览器按连击计数，修饰键不参与判定），放在前面
+          // 会把那次加选直接吞掉——多选两条、最后只进去一条。
           if (e.metaKey || e.ctrlKey) {
             e.preventDefault();
             setSelected((prev) => {
@@ -769,6 +828,10 @@ export function ThreadSidebar({
             }
             return;
           }
+          // 双击会先派发两次 click 再派发 dblclick;忽略第二次 click,
+          // 避免对同一 thread 触发两次 onSelect(即两次 thread/resume)。
+          // 只拦无修饰键的普通点击：多选/区间选择在上面的分支里已经 return。
+          if (e.detail > 1) return;
           if (selected.size > 0) {
             // 有选择时点普通行 = 退出多选，而不是跳转——否则一次误点就把
             // 辛苦攒起来的选择清空并切走了会话。
@@ -1368,13 +1431,16 @@ export function ThreadSidebar({
   /** 提交新建组；失败时保留输入态，让用户改完再试。 */
   const submitNewGroup = async () => {
     if (!newGroup) return;
-    const ok = await onCreateGroup(
+    const id = await onCreateGroup(
       newGroup.workspace,
       newGroup.name,
       newGroup.description,
       [...selected],
     );
-    if (ok) {
+    if (id) {
+      // 建完立刻展开新框：折叠态下只看得到「▸ 组名 2」，用户无从确认
+      // 选中的每一条都进去了。
+      setExpandedGroups((prev) => new Set(prev).add(id));
       setNewGroup(null);
       setSelected(new Set());
       setSelectionAnchor(null);
