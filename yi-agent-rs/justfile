@@ -33,7 +33,7 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check tag-gate-check build-env-check
+ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check
     @echo "CI passed"
 
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
@@ -52,10 +52,17 @@ secret-check:
 npm-version-check:
     bash scripts/test_sync_npm_versions.sh
 
-# release workflow 的环境假设（$HOME 推导 target 目录、rustup update、
+# 发布 workflow 的环境假设（$HOME 推导 target 目录、rustup update、
 # 三平台 target）：任一被破坏，tag 触发的发布会在构建第一步秒挂。
 release-env-check:
     bash scripts/test_release_workflow_env.sh
+
+# 面向用户的配置说明不得再教人往 `.env` 写模型 key，也不得声称 App 内没有设置入口。
+# 模型配置只认 `~/.yi-agent/models.json`；错误文案会把新用户挡在门外
+# （照做后 `run` 直接报「尚未配置模型」并 exit 1）。
+model-setup-docs-check:
+    bash scripts/test_model_setup_docs.sh
+    bash scripts/check-model-setup-docs.sh
 
 # 发布门禁自测：tag 必须落在 main 可达的提交上。release.yml 只由 tag 触发、
 # 只打包不跑测试，所以打在未合并功能分支上的 tag 会被直接发出去。

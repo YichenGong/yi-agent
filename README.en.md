@@ -69,11 +69,25 @@ yi-agent --version
 
 ## Quick start
 
-**1. Give it a model API key.**
+**1. Configure a model.** Just run it; the first launch walks you through
+API style, key and model identifier:
 
 ```bash
-export MODEL_API_KEY=sk-ant-...
+yi-agent
 ```
+
+The connection is tested before anything is written to
+`~/.yi-agent/models.json`. The desktop app and the CLI share that one catalog.
+
+To skip the prompt, pass the whole package in one shot (all three are required):
+
+```bash
+yi-agent --provider anthropic --api-key sk-ant-... --model claude-sonnet-4-5
+```
+
+> Note: `export MODEL_API_KEY=...` alone is not a substitute — model config is
+> read only from `models.json` or the whole-package flags, and a partial one is
+> rejected outright.
 
 Anthropic is the default. To use OpenAI or another compatible endpoint, see
 "Switching models" below.
@@ -230,7 +244,7 @@ manages only non-model settings.
 
 | Goal | Environment variable | CLI flag |
 | --- | --- | --- |
-| Switch model (whole package) | `YI_AGENT_PROVIDER` + `MODEL_API_KEY` | `--provider` + `--api-key` (`--model` / `--api-url` optional) |
+| Switch model (whole package; all three required) | `YI_AGENT_PROVIDER` + `MODEL_API_KEY` + `YI_AGENT_MODEL` | `--provider` + `--api-key` + `--model` (`--api-url` optional) |
 | API key | `MODEL_API_KEY` | `--api-key` |
 | Switch provider | `YI_AGENT_PROVIDER` (`anthropic` / `openai`) | `--provider` |
 | Model identifier | — (use the settings UI / `models.json`) | `--model` (needs `--provider` + `--api-key`) |
