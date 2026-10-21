@@ -3341,7 +3341,9 @@ mod tests {
         // 只有 `yi-agent` 启动时才被注入），而 `release` 下任何 flag 都不生效——
         // 不注入 dev 就永远看不到子进程被拉起，测试会变成在断言一条死路径。
         let runtime_dir = workdir.join(".yi-agent/runtime");
-        let handle = yi_agent_runtime::supervise::serve_with_environment(
+        // 不刷新清单：假子进程忽略 argv，被当成 `manifest` 调会立刻写出 marker
+        // （假阳性）并空等满超时。校准行为由 supervisors 的集成测试覆盖。
+        let handle = yi_agent_runtime::supervise::serve_without_manifest_refresh(
             workdir,
             &runtime_dir,
             Some(flags),

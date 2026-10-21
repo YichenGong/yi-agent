@@ -114,11 +114,39 @@ pub fn serve_with(
 }
 
 /// 最完整的那一层：开关文件位置与构建类型都可注入。
+///
+/// **默认会先校准清单**——生产语义，不给调用方"悄悄丢掉刷新"的机会。
 pub fn serve_with_environment(
     workdir: &Path,
     runtime_dir: &Path,
     flags_path: Option<std::path::PathBuf>,
     build_kind: Option<&str>,
+) -> SuperviseHandle {
+    serve_inner(workdir, runtime_dir, flags_path, build_kind, true)
+}
+
+/// 与 [`serve_with_environment`] 相同，但**跳过**启动时的清单校准。
+///
+/// 只给测试用，而且测试确实需要它：测试里的"插件"是个忽略 argv、写完 marker
+/// 就睡的假脚本。把它当 `<command> manifest` 调一次，会立刻写出 marker（制造
+/// 假阳性），再干等满 `DESCRIBE_TIMEOUT`（拖慢每条用例五秒）。真正要验证
+/// 校准行为的地方有它自己的用例（`refresh::tests` 与 supervisor 集成测试），
+/// 那里用的是会自述的脚本。
+pub fn serve_without_manifest_refresh(
+    workdir: &Path,
+    runtime_dir: &Path,
+    flags_path: Option<std::path::PathBuf>,
+    build_kind: Option<&str>,
+) -> SuperviseHandle {
+    serve_inner(workdir, runtime_dir, flags_path, build_kind, false)
+}
+
+fn serve_inner(
+    workdir: &Path,
+    runtime_dir: &Path,
+    flags_path: Option<std::path::PathBuf>,
+    build_kind: Option<&str>,
+    refresh_manifests: bool,
 ) -> SuperviseHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
@@ -131,6 +159,15 @@ pub fn serve_with_environment(
         .map(str::to_string)
         .unwrap_or_else(|| yi_agent_flags::build_kind().to_string());
     let join = std::thread::spawn(move || {
+        // 先校准清单再进循环。
+        //
+        // 清单是**安装那一刻**的快照，插件升级后没有任何东西会刷新它。旧快照
+        // 会让新逻辑读旧结论（`stop_when_disabled` 就是这样：用户关掉开关、进程
+        // 却还在跑，界面上也看不出原因）。放在循环外只做一次：自述要起子进程，
+        // 每 500ms 跑一遍是浪费；而"装完就改清单"的窗口由安装路径自己覆盖。
+        if refresh_manifests {
+            yi_agent_supervisors::refresh::refresh_and_log(&layout.manifests_dir());
+        }
         // 监督线程的 panic 不得拖垮宿主（TUI/桌面）——记录后结束，
         // `stop()` 仍能安全 join 到这个已结束的线程。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -236,7 +273,9 @@ mod tests {
     /// `release` 下任何 flag 都不生效；不注入 dev 就永远看不到子进程起来，
     /// 这些测试会静默变成"断言一条死路径"。
     fn serve_armed(workdir: &Path, flags: &Path) -> SuperviseHandle {
-        serve_with_environment(
+        // 不刷新清单：这里的"插件"是忽略 argv 的假脚本，把它当 `manifest`
+        // 调会写出 marker（假阳性）并空等满超时。校准行为另有专门用例。
+        serve_without_manifest_refresh(
             workdir,
             &scope_of(workdir),
             Some(flags.to_path_buf()),
