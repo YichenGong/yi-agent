@@ -4412,6 +4412,14 @@ pub(crate) async fn interrupt_and_wait_for_persist(
     }
 }
 
+/// `u64` 累计值落到既有 `TurnUsage`（`u32`）时的饱和转换。
+///
+/// 单个 turn 的累加值几乎不可能超过 `u32::MAX`（4.29e9），但溢出的后果是数字
+/// 突然变小，比封顶更难解释，所以封顶而不是截断。
+fn saturate_u32(value: u64) -> u32 {
+    value.min(u32::MAX as u64) as u32
+}
+
 /// 组装当前 turn 的 checkpoint：已 finalize 的 item（含开头的用户提问）+ 当前
 /// 上下文快照。进行中的流式文本不在 `completed_items` 里，故天然不入内。
 fn build_partial(
@@ -4422,6 +4430,7 @@ fn build_partial(
     completed_items: &[crate::protocol::Item],
     messages: Vec<yi_agent_core::Message>,
     usage: Option<crate::thread_store::TurnUsage>,
+    usage_total: Option<crate::thread_store::TurnUsage>,
 ) -> crate::thread_store::PartialTurn {
     let mut items = Vec::with_capacity(completed_items.len() + 1);
     items.push(opening_user_item(
@@ -4436,6 +4445,7 @@ fn build_partial(
         items,
         messages,
         usage,
+        usage_total,
     }
 }
 
@@ -4469,6 +4479,8 @@ async fn persist_and_finish_turn(
     agent: &yi_agent_core::Agent,
     completed_items: Vec<crate::protocol::Item>,
     last_usage: Option<crate::thread_store::TurnUsage>,
+    // 本轮所有 provider 调用的累加值（`last_usage` 只是最后一次调用的快照）。
+    usage_total: Option<crate::thread_store::TurnUsage>,
     store: &crate::thread_store::ThreadStore,
     hub: &crate::broadcast::Broadcaster,
     turn_tx: &mpsc::Sender<TurnEvent>,
@@ -4503,6 +4515,7 @@ async fn persist_and_finish_turn(
     let record = crate::thread_store::TurnLine::Turn {
         items,
         usage: last_usage,
+        usage_total,
         messages: persisted_messages,
     };
     // append 失败则跳过 meta 维护：避免出现"幽灵" thread。
@@ -4694,6 +4707,8 @@ async fn apply_session_command(
                 &agent,
                 Vec::new(),
                 None,
+                // 会话命令不产生 provider 调用：本轮累加值为空。
+                None,
                 store,
                 hub,
                 turn_tx,
@@ -4735,6 +4750,8 @@ async fn apply_session_command(
                 None,
                 &agent,
                 Vec::new(),
+                None,
+                // 会话命令不产生 provider 调用：本轮累加值为空。
                 None,
                 store,
                 hub,
@@ -4863,6 +4880,8 @@ async fn apply_session_command(
                 &agent,
                 Vec::new(),
                 None,
+                // 会话命令不产生 provider 调用：本轮累加值为空。
+                None,
                 store,
                 hub,
                 turn_tx,
@@ -4915,7 +4934,15 @@ pub(crate) async fn run_thread_driver(
 ) {
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
-    let mut translator = Translator::new(thread_id.clone());
+    // 累计基线：本 thread 已落盘轮次之和。读失败按 0 处理——最坏是首次打开时
+    // 累计偏小，绝不能让 driver 起不来。
+    let baseline = store
+        .load(&thread_id)
+        .ok()
+        .flatten()
+        .map(|loaded| loaded.totals)
+        .unwrap_or_default();
+    let mut translator = Translator::new(thread_id.clone(), baseline);
     // 只在首个 turn 尝试激活:objective 会被写进 root 任务,不能用占位串,也不能
     // 每轮重写。即使 `activate` 为 None 也置位,避免每轮重试。
     let mut activation_attempted = false;
@@ -4930,11 +4957,17 @@ pub(crate) async fn run_thread_driver(
         // 按值消费并返回 agent,若写进分支体就会与另一分支的 `prompt_rx` 借用冲突。
         let turn_prompt = tokio::select! {
             Some(command) = session_rx.recv() => {
+                let clearing = matches!(&command, SessionCommand::Clear { .. });
                 agent = apply_session_command(
                     agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx,
                     &status,
                 )
                 .await;
+                if clearing {
+                    for n in translator.reset_totals() {
+                        let _ = write_notification(&hub, &n).await;
+                    }
+                }
                 continue;
             }
             maybe_prompt = prompt_rx.recv() => maybe_prompt,
@@ -4983,6 +5016,8 @@ pub(crate) async fn run_thread_driver(
         // (input 来自 `message_start`、output 来自 `message_delta`,由 Translator 合并)。
         let mut completed_items: Vec<crate::protocol::Item> = Vec::new();
         let mut last_usage: Option<crate::thread_store::TurnUsage> = None;
+        // 本轮**所有** provider 调用的累加值，落盘供下次启动恢复累计基线。
+        let mut turn_usage_total: Option<crate::thread_store::TurnUsage> = None;
         // 气泡正文=用户原话(不含注入的清单);`prompt`(带清单)只送模型。
         let user_prompt = display_text;
         // 本轮附件暂存:落盘时写进开启的 userMessage item。
@@ -5020,6 +5055,7 @@ pub(crate) async fn run_thread_driver(
                 &user_image_refs,
                 &[],
                 agent.session().messages().to_vec(),
+                None,
                 None,
             ),
         );
@@ -5206,6 +5242,20 @@ pub(crate) async fn run_thread_driver(
                                         cache_creation_input_tokens: *cache_creation_input_tokens,
                                         cache_read_input_tokens: *cache_read_input_tokens,
                                     });
+                                    // 同一条通知里带着translator 算好的累计量：本轮值随时
+                                    // 刷新，turn 收尾时取最后一次（= 全部调用之和）。
+                                    let totals = translator.turn_totals();
+                                    turn_usage_total = Some(crate::thread_store::TurnUsage {
+                                        model: model.clone(),
+                                        input_tokens: saturate_u32(totals.input_tokens),
+                                        output_tokens: saturate_u32(totals.output_tokens),
+                                        cache_creation_input_tokens: saturate_u32(
+                                            totals.cache_creation_input_tokens,
+                                        ),
+                                        cache_read_input_tokens: saturate_u32(
+                                            totals.cache_read_input_tokens,
+                                        ),
+                                    });
                                 }
                                 // 逐字流：仅当存在订阅者时合并；否则走原来的直发。
                                 // **屏障**：任何**非 delta** 通知到达时，先刷它所属 thread
@@ -5304,6 +5354,7 @@ pub(crate) async fn run_thread_driver(
                             &completed_items,
                             agent.session().messages().to_vec(),
                             last_usage.clone(),
+                            turn_usage_total.clone(),
                         ),
                     );
                     checkpoint_dirty = false;
@@ -5377,10 +5428,16 @@ pub(crate) async fn run_thread_driver(
         // 先执行本轮暂存的会话命令（此刻 turn 已结束，改 agent 是安全的），
         // 再为刚结束的 turn 收尾。
         if let Some(command) = pending_session_command.take() {
+            let clearing = matches!(&command, SessionCommand::Clear { .. });
             agent = apply_session_command(
                 agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx, &status,
             )
             .await;
+            if clearing {
+                for n in translator.reset_totals() {
+                    let _ = write_notification(&hub, &n).await;
+                }
+            }
             // 命令路径已 append 过最终状态;这里只需为这个 turn 发 Finished 让主循环清
             // active_turn_id,且**不要**再 append 一次(否则会用 turn 前的 session 覆盖)。
             let _ = update_status(&hub, &status, &thread_id, ThreadStatus::Idle).await;
@@ -5415,6 +5472,7 @@ pub(crate) async fn run_thread_driver(
             &agent,
             std::mem::take(&mut completed_items),
             last_usage.take(),
+            turn_usage_total.take(),
             &store,
             &hub,
             &turn_tx,

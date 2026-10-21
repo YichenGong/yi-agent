@@ -27,10 +27,11 @@ import type {
   ThreadStatus,
   ThreadSummary,
   TurnStatus,
+  WireTotals,
   WireUsage,
   WorkspaceGroup,
 } from "./lib/protocol";
-import { wireUsageToUsage } from "./lib/protocol";
+import { wireTotalsToTotals, wireUsageToUsage } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
 import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
@@ -668,16 +669,19 @@ export default function App() {
           if (curView && !silentTopUp) curView.syncState = "syncing";
           void (async () => {
             try {
-              const r = await c0.request<{ items: Item[]; usage?: WireUsage | null }>(
-                "thread/readItems",
-                after ? { threadId: id, afterItemId: after } : { threadId: id },
-              );
+              const r = await c0.request<{
+                items: Item[];
+                usage?: WireUsage | null;
+                totals?: WireTotals | null;
+              }>("thread/readItems", after ? { threadId: id, afterItemId: after } : { threadId: id });
               const v = store.peek(id);
               if (v) {
                 v.session.upsertItems(r.items);
                 // 这条路径上不会有 live 用量通知（会话在跑、只读补齐、不 resume）：
                 // 不垫上服务端回传的上一轮快照，`/usage` 就永远显示「没有用量」。
                 v.session.adoptPersistedUsage(wireUsageToUsage(r.usage));
+                // 累计值同理：它是会话历史之和，只从服务端来，本地无从推导。
+                v.session.adoptPersistedTotals(wireTotalsToTotals(r.totals));
                 force((n) => n + 1);
               }
             } catch {
@@ -713,15 +717,17 @@ export default function App() {
         const after = store.peek(id)?.session.lastServerItemId ?? null;
         void (async () => {
           try {
-            const r = await c0.request<{ items: Item[]; usage?: WireUsage | null }>(
-              "thread/readItems",
-              after ? { threadId: id, afterItemId: after } : { threadId: id },
-            );
+            const r = await c0.request<{
+              items: Item[];
+              usage?: WireUsage | null;
+              totals?: WireTotals | null;
+            }>("thread/readItems", after ? { threadId: id, afterItemId: after } : { threadId: id });
             const v = store.peek(id);
             if (v) {
               v.session.upsertItems(r.items);
               // 同远端分支：这是运行中会话唯一的数据来源。
               v.session.adoptPersistedUsage(wireUsageToUsage(r.usage));
+              v.session.adoptPersistedTotals(wireTotalsToTotals(r.totals));
               force((n) => n + 1);
             }
           } catch {
@@ -1681,7 +1687,8 @@ export default function App() {
         } catch {
           // 读配置失败不该吞掉用量：分母未知就只显示 token 数。
         }
-        session.notice(formatUsage(u, { compactThreshold: threshold }));
+        // 累计值是 `/usage` 的主体；没有（老服务端）时函数内部退回快照。
+        session.notice(formatUsage(u, session.usageTotals, { compactThreshold: threshold }));
         break;
       }
       case "config":
@@ -2452,7 +2459,9 @@ export default function App() {
                   }
                 : undefined
             }
-            usage={current?.session.usage ?? null}
+            // 累计值是主体；`usage` 快照只作老服务端的兜底。
+            totals={current?.session.usageTotals ?? null}
+            fallbackUsage={current?.session.usage ?? null}
             // 切换会话时数字直接跳终值，不从上一个会话滚过来。
             usageId={sess.currentId}
             /*

@@ -445,9 +445,12 @@ pub enum Notification {
     },
     /// 用量更新通知。
     ///
-    /// 携带的是**本轮累积快照**,而非单条原始 provider 事件:Anthropic 把一次
-    /// 调用的用量拆成 `message_start`(input/cache)与 `message_delta`(output)
-    /// 两个事件,翻译层按字段合并后发出,故每条通知都是迄今完整的本轮用量。
+    /// `input_tokens` 等四个字段是**本轮最后一次 provider 调用**的快照（Anthropic
+    /// 把一次调用拆成 `message_start` 的 input/cache 与 `message_delta` 的 output，
+    /// 翻译层按字段合并），上下文占用据此计算。
+    ///
+    /// `total_*` 是该 thread 的**累计**用量（已落盘轮次 + 本轮已结束调用 + 当前调用），
+    /// 每收到一次 provider 用量事件都会重算并推送，故界面上的累计数字会随每次调用增长。
     #[serde(rename = "thread/tokenUsage/updated")]
     TokenUsage {
         thread_id: String,
@@ -456,6 +459,14 @@ pub enum Notification {
         output_tokens: u32,
         cache_creation_input_tokens: u32,
         cache_read_input_tokens: u32,
+        #[ts(type = "number")]
+        total_input_tokens: u64,
+        #[ts(type = "number")]
+        total_output_tokens: u64,
+        #[ts(type = "number")]
+        total_cache_creation_input_tokens: u64,
+        #[ts(type = "number")]
+        total_cache_read_input_tokens: u64,
     },
     /// 一条子 agent 轨迹行,推给订阅了该 thread 那个任务的客户端。
     #[serde(rename = "agent/trace/event", rename_all = "camelCase")]
@@ -1019,6 +1030,10 @@ mod tests {
             output_tokens: 3,
             cache_creation_input_tokens: 100,
             cache_read_input_tokens: 200,
+            total_input_tokens: 1_000,
+            total_output_tokens: 300,
+            total_cache_creation_input_tokens: 500,
+            total_cache_read_input_tokens: 700,
         };
         let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
         assert_eq!(v["method"], "thread/tokenUsage/updated");
@@ -1026,6 +1041,10 @@ mod tests {
         assert_eq!(v["params"]["output_tokens"], 3);
         assert_eq!(v["params"]["cache_creation_input_tokens"], 100);
         assert_eq!(v["params"]["cache_read_input_tokens"], 200);
+        assert_eq!(v["params"]["total_input_tokens"], 1_000);
+        assert_eq!(v["params"]["total_output_tokens"], 300);
+        assert_eq!(v["params"]["total_cache_creation_input_tokens"], 500);
+        assert_eq!(v["params"]["total_cache_read_input_tokens"], 700);
     }
 
     #[test]

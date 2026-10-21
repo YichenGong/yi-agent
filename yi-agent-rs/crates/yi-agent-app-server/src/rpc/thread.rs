@@ -643,7 +643,10 @@ pub(crate) async fn handle(
                     break;
                 }
             }
+            // 回放的既要有「最后一轮快照」（上下文占用），也要有该 thread 的累计值
+            // （`/usage` 与状态栏）——后者若不带，客户端 resume 后累计会从 0 重来。
             if let Some(u) = loaded.usage {
+                let totals = loaded.totals;
                 write_notification(
                     state.hub,
                     &Notification::TokenUsage {
@@ -653,6 +656,10 @@ pub(crate) async fn handle(
                         output_tokens: u.output_tokens,
                         cache_creation_input_tokens: u.cache_creation_input_tokens,
                         cache_read_input_tokens: u.cache_read_input_tokens,
+                        total_input_tokens: totals.input_tokens,
+                        total_output_tokens: totals.output_tokens,
+                        total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
+                        total_cache_read_input_tokens: totals.cache_read_input_tokens,
                     },
                 )
                 .await?;
@@ -2017,6 +2024,9 @@ pub(crate) async fn handle(
             // 运行中的会话按既有约束**绝不 resume**、只走这里，不回传就等于让客户端
             // 在那条路径上永远拿不到这份已经读出来的数据。
             let loaded_usage = loaded.usage;
+            // 同一份 `load` 已经算出的累计量：客户端拿到它才能显示「会话累计」，
+            // 而不是只能拿最后一轮快照近似。
+            let loaded_totals = loaded.totals;
             let items: Vec<crate::protocol::Item> = match after {
                 Some(aid) => match loaded
                     .items
@@ -2033,7 +2043,10 @@ pub(crate) async fn handle(
             write_response(
                 state.hub,
                 state.client,
-                ok_response(id, json!({ "items": items, "usage": loaded_usage })),
+                ok_response(
+                    id,
+                    json!({ "items": items, "usage": loaded_usage, "totals": loaded_totals }),
+                ),
             )
             .await?;
         }

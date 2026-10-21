@@ -1,4 +1,12 @@
-import type { Attachment, Item, Notification, RetryCause, TurnStatus, Usage } from "./protocol";
+import type {
+  Attachment,
+  Item,
+  Notification,
+  RetryCause,
+  TurnStatus,
+  Usage,
+  UsageTotals,
+} from "./protocol";
 
 /**
  * `Notification` 的 `turn/retry` 载荷里 `cause` 的类型是 `string`——那就是线形状
@@ -95,6 +103,15 @@ export class Session {
   lastStatus: TurnStatus | null = null;
   lastError: string | null = null;
   usage: Usage | null = null;
+
+  /**
+   * 会话累计用量（服务端算好的 `total_*`）。
+   *
+   * 与 `usage` 是两套数：`usage` 是「最后一次 provider 调用」的快照，用来算上下文
+   * 占用；这里是该 thread 所有调用之和，才是 `/usage` 与状态栏要展示的东西。
+   * 老服务端不回传时为 `null`，界面回退到快照。
+   */
+  usageTotals: UsageTotals | null = null;
   retrying: { attempt: number; max: number; cause: RetryCause } | null = null;
 
   /**
@@ -244,6 +261,7 @@ export class Session {
     this.lastStatus = null;
     this.lastError = null;
     this.usage = null;
+    this.usageTotals = null;
     this.returnedInterjections = [];
     this.lastServerItemId = null;
     this.openReasoning = null;
@@ -359,6 +377,17 @@ export class Session {
   adoptPersistedUsage(u: Usage | null): void {
     if (u === null || this.usage !== null) return;
     this.usage = u;
+  }
+
+  /**
+   * 用服务端持久化的**累计值**垫底。
+   *
+   * 与 `adoptPersistedUsage` 同一规则：只在本地还没有 live 值时才写。live 通知
+   * 代表此刻的真实累计，落盘值只是它落盘那一刻的副本，绝不能覆盖它。
+   */
+  adoptPersistedTotals(t: UsageTotals | null): void {
+    if (t === null || this.usageTotals !== null) return;
+    this.usageTotals = t;
   }
 
   /** Append a command-output line (never sent to the agent). */
@@ -655,6 +684,16 @@ export class Session {
           cacheWrite: notification.params.cache_creation_input_tokens ?? 0,
           cacheRead: notification.params.cache_read_input_tokens ?? 0,
         };
+        // 累计值缺省时保持 `null`（老服务端），界面回退到快照显示。
+        const totals = notification.params.total_input_tokens;
+        if (typeof totals === "number") {
+          this.usageTotals = {
+            input: totals,
+            output: notification.params.total_output_tokens,
+            cacheRead: notification.params.total_cache_read_input_tokens,
+            cacheWrite: notification.params.total_cache_creation_input_tokens,
+          };
+        }
         visible = true;
         break;
       case "error":

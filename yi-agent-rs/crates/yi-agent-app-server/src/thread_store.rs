@@ -146,6 +146,42 @@ pub struct TurnUsage {
     pub cache_read_input_tokens: u32,
 }
 
+/// 一个 thread 的累计用量。`u64`：长会话里 input 很容易超过 `u32` 上限。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageTotals {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+}
+
+impl UsageTotals {
+    pub fn add_turn_usage(&mut self, usage: &TurnUsage) {
+        self.input_tokens += usage.input_tokens as u64;
+        self.output_tokens += usage.output_tokens as u64;
+        self.cache_creation_input_tokens += usage.cache_creation_input_tokens as u64;
+        self.cache_read_input_tokens += usage.cache_read_input_tokens as u64;
+    }
+
+    pub fn add(&mut self, other: &UsageTotals) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_creation_input_tokens == 0
+            && self.cache_read_input_tokens == 0
+    }
+}
+
 /// `.jsonl` 里的一行。用带 tag 的枚举,便于日后扩展其它行类型。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -154,6 +190,9 @@ pub enum TurnLine {
         items: Vec<Item>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<TurnUsage>,
+        /// 本轮**所有** provider 调用的累加值；老日志缺失时由 `usage` 近似。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage_total: Option<TurnUsage>,
         #[serde(default)]
         messages: Vec<Message>,
     },
@@ -172,6 +211,8 @@ pub struct PartialTurn {
     pub messages: Vec<Message>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TurnUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_total: Option<TurnUsage>,
 }
 
 /// `load` 的结果:meta + 拼接后的 items + 最后一条记录的 messages/usage。
@@ -180,6 +221,8 @@ pub struct LoadedThread {
     pub items: Vec<Item>,
     pub messages: Vec<Message>,
     pub usage: Option<TurnUsage>,
+    /// 该 thread 所有已落盘轮次的累计用量（老轮次按最后一次快照近似）。
+    pub totals: UsageTotals,
     /// 末尾是否是一段崩溃残留的、未收尾的 turn（来自 `.partial.json`）。
     /// `true` 时调用方（`thread/resume`）应在回放后补发 interrupted 标记。
     pub pending_turn: bool,
@@ -240,12 +283,13 @@ impl ThreadStore {
         f.write_all(line.as_bytes())
     }
 
-    /// 读并拼接主 jsonl：返回 `(items, 最近一条 messages, 最近一条 usage)`。
+    /// 读并拼接主 jsonl：返回 `(items, 最近一条 messages, 最近一条 usage, 累计用量)`。
     /// 文件缺失视为空；损坏行跳过并记 stderr（绝不因此报错）。
-    fn read_log(&self, id: &str) -> (Vec<Item>, Vec<Message>, Option<TurnUsage>) {
+    fn read_log(&self, id: &str) -> (Vec<Item>, Vec<Message>, Option<TurnUsage>, UsageTotals) {
         let mut items: Vec<Item> = Vec::new();
         let mut messages: Vec<Message> = Vec::new();
         let mut usage: Option<TurnUsage> = None;
+        let mut totals = UsageTotals::default();
         match std::fs::read_to_string(self.log_path(id)) {
             Ok(text) => {
                 for line in text.lines() {
@@ -256,11 +300,18 @@ impl ThreadStore {
                         Ok(TurnLine::Turn {
                             items: turn_items,
                             usage: turn_usage,
+                            usage_total: turn_total,
                             messages: turn_messages,
                         }) => {
                             items.extend(turn_items);
                             if !turn_messages.is_empty() {
                                 messages = turn_messages;
+                            }
+                            // 累计优先取本轮累加值；老日志没有就退回该轮最后快照。
+                            if let Some(total) = &turn_total {
+                                totals.add_turn_usage(total);
+                            } else if let Some(last) = &turn_usage {
+                                totals.add_turn_usage(last);
                             }
                             if turn_usage.is_some() {
                                 usage = turn_usage;
@@ -275,7 +326,7 @@ impl ThreadStore {
             Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => eprintln!("[app-server] failed to read thread log ({id}): {e}"),
         }
-        (items, messages, usage)
+        (items, messages, usage, totals)
     }
 
     /// 已落盘 jsonl 的 items 里是否已含某 item id。`None` 视为不匹配。
@@ -308,7 +359,7 @@ impl ThreadStore {
             return Ok(None);
         }
 
-        let (mut items, mut messages, mut usage) = self.read_log(id);
+        let (mut items, mut messages, mut usage, mut totals) = self.read_log(id);
 
         let meta = std::fs::read_to_string(&meta_path)
             .ok()
@@ -333,6 +384,12 @@ impl ThreadStore {
                 if !partial.messages.is_empty() {
                     messages = partial.messages;
                 }
+                // 未收尾的轮次同样计入累计（它已经真实发生过）。
+                if let Some(total) = &partial.usage_total {
+                    totals.add_turn_usage(total);
+                } else if let Some(last) = &partial.usage {
+                    totals.add_turn_usage(last);
+                }
                 if partial.usage.is_some() {
                     usage = partial.usage;
                 }
@@ -345,6 +402,7 @@ impl ThreadStore {
             items,
             messages,
             usage,
+            totals,
             pending_turn,
         }))
     }
@@ -575,7 +633,7 @@ impl ThreadStore {
         if !valid_id(id) {
             return Err(invalid_id(id));
         }
-        let (items, _, _) = self.read_log(id);
+        let (items, _, _, _) = self.read_log(id);
         Ok(items
             .iter()
             .any(|it| crate::server::item_id(it) == Some(item_id)))
@@ -766,7 +824,7 @@ impl ThreadStore {
             self.clear_partial(id)?;
             return Ok(false);
         }
-        let (log_items, _, _) = self.read_log(id);
+        let (log_items, _, _, _) = self.read_log(id);
         if Self::partial_is_committed(&partial, &log_items) {
             self.clear_partial(id)?;
             return Ok(false);
@@ -776,6 +834,7 @@ impl ThreadStore {
             &TurnLine::Turn {
                 items: partial.items,
                 usage: partial.usage,
+                usage_total: partial.usage_total,
                 messages: partial.messages,
             },
         )?;
@@ -1011,6 +1070,7 @@ mod tests {
         TurnLine::Turn {
             items,
             usage: None,
+            usage_total: None,
             messages,
         }
     }
@@ -1584,6 +1644,73 @@ mod tests {
     }
 
     #[test]
+    fn totals_sum_usage_total_across_turns() {
+        let (_dir, s) = store();
+        s.create(&meta("t1")).unwrap();
+        let with_totals = |totals: u32, last: u32| TurnLine::Turn {
+            items: Vec::new(),
+            usage: Some(TurnUsage {
+                model: "m".into(),
+                input_tokens: last,
+                output_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            }),
+            usage_total: Some(TurnUsage {
+                model: "m".into(),
+                input_tokens: totals,
+                output_tokens: 2,
+                cache_creation_input_tokens: 3,
+                cache_read_input_tokens: 4,
+            }),
+            messages: Vec::new(),
+        };
+        s.append_turn("t1", &with_totals(100, 50)).unwrap();
+        s.append_turn("t1", &with_totals(200, 60)).unwrap();
+        let loaded = s.load("t1").unwrap().unwrap();
+        assert_eq!(loaded.totals.input_tokens, 300);
+        assert_eq!(loaded.totals.output_tokens, 4);
+        assert_eq!(loaded.totals.cache_creation_input_tokens, 6);
+        assert_eq!(loaded.totals.cache_read_input_tokens, 8);
+        // `usage` 语义不变：仍是最后一轮的最后一次快照。
+        assert_eq!(loaded.usage.unwrap().input_tokens, 60);
+    }
+
+    #[test]
+    fn totals_fall_back_to_last_snapshot_when_usage_total_missing() {
+        // 老日志没有 `usage_total`：只能拿该行的 `usage` 近似。
+        let (dir, s) = store();
+        s.create(&meta("t2")).unwrap();
+        let line = r#"{"type":"turn","items":[],"usage":{"model":"m","input_tokens":7,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"messages":[]}"#;
+        std::fs::write(
+            dir.path().join(".yi-agent/threads/t2.jsonl"),
+            format!("{line}\n"),
+        )
+        .unwrap();
+        let loaded = s.load("t2").unwrap().unwrap();
+        assert_eq!(loaded.totals.input_tokens, 7);
+        assert_eq!(loaded.totals.output_tokens, 2);
+    }
+
+    #[test]
+    fn totals_ignore_rows_without_usage() {
+        let (_dir, s) = store();
+        s.create(&meta("t3")).unwrap();
+        s.append_turn(
+            "t3",
+            &TurnLine::Turn {
+                items: Vec::new(),
+                usage: None,
+                usage_total: None,
+                messages: Vec::new(),
+            },
+        )
+        .unwrap();
+        let loaded = s.load("t3").unwrap().unwrap();
+        assert!(loaded.totals.is_empty());
+    }
+
+    #[test]
     fn turn_usage_round_trips_cache_fields() {
         let u = TurnUsage {
             model: "m".into(),
@@ -1869,6 +1996,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: vec![user_item("user-t1", "hi")],
                     usage: None,
+                    usage_total: None,
                     messages: vec![],
                 },
             )
@@ -1897,6 +2025,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: vec![user_item("user-t1", "hi"), thinking.clone()],
                     usage: None,
+                    usage_total: None,
                     messages: vec![],
                 },
             )
@@ -1930,6 +2059,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: vec![user_item("user-t1", "first")],
                     usage: None,
+                    usage_total: None,
                     messages: vec![],
                 },
             )
@@ -1949,6 +2079,7 @@ mod tests {
                     ],
                     messages: vec![],
                     usage: None,
+                    usage_total: None,
                 },
             )
             .unwrap();
@@ -1975,6 +2106,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: vec![user_item("user-turn-t2", "second")],
                     usage: None,
+                    usage_total: None,
                     messages: vec![],
                 },
             )
@@ -1987,6 +2119,7 @@ mod tests {
                     items: vec![user_item("user-turn-t2", "second")],
                     messages: vec![],
                     usage: None,
+                    usage_total: None,
                 },
             )
             .unwrap();
@@ -2011,6 +2144,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: vec![user_item("user-t1", "first")],
                     usage: None,
+                    usage_total: None,
                     messages: vec![],
                 },
             )
@@ -2029,6 +2163,7 @@ mod tests {
                     ],
                     messages: vec![yi_agent_core::Message::user("carried")],
                     usage: None,
+                    usage_total: None,
                 },
             )
             .unwrap();
@@ -2076,6 +2211,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: vec![user_item("user-turn-t2", "second")],
                     usage: None,
+                    usage_total: None,
                     messages: vec![],
                 },
             )
@@ -2088,6 +2224,7 @@ mod tests {
                     items: vec![user_item("user-turn-t2", "second")],
                     messages: vec![],
                     usage: None,
+                    usage_total: None,
                 },
             )
             .unwrap();
@@ -2125,6 +2262,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: vec![user_item("user-t1", "hi")],
                     usage: None,
+                    usage_total: None,
                     messages: vec![],
                 },
             )
@@ -2182,6 +2320,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: vec![user_item("user-t1", "hi")],
                     usage: None,
+                    usage_total: None,
                     messages: vec![],
                 },
             )
@@ -2484,6 +2623,7 @@ mod tests {
                 &TurnLine::Turn {
                     items: Vec::new(),
                     usage: None,
+                    usage_total: None,
                     messages: Vec::new(),
                 },
             )
@@ -2562,6 +2702,7 @@ mod tests {
                     &TurnLine::Turn {
                         items: Vec::new(),
                         usage: None,
+                        usage_total: None,
                         messages: Vec::new(),
                     },
                 )
@@ -2770,6 +2911,7 @@ mod tests {
                     items: items.clone(),
                     messages: Vec::new(),
                     usage: None,
+                    usage_total: None,
                 },
             )
             .unwrap();
@@ -2807,6 +2949,7 @@ mod tests {
                     items: vec![user_item("user-turn-e", "did you save me?")],
                     messages: Vec::new(),
                     usage: None,
+                    usage_total: None,
                 },
             )
             .unwrap();
