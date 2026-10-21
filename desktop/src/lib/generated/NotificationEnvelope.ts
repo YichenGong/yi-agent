@@ -20,7 +20,7 @@ model_ref?: string | null, } } | { "method": "turn/started", "params": { thread_
 /**
  * Why the turn is being retried: `"idle_stall"` or `"request_timeout"`.
  */
-cause: string, } } | { "method": "thread/tokenUsage/updated", "params": { thread_id: string, model: string, input_tokens: number, output_tokens: number, cache_creation_input_tokens: number, cache_read_input_tokens: number, } } | { "method": "agent/trace/event", "params": { threadId: string, taskId: string, row: AgentTraceRow, } } | { "method": "agent/children/updated", "params": { threadId: string, children: Array<AgentChild>, } } | { "method": "process/updated", "params": { thread_id: string, process_id: string, 
+cause: string, } } | { "method": "thread/tokenUsage/updated", "params": { thread_id: string, model: string, input_tokens: number, output_tokens: number, cache_creation_input_tokens: number, cache_read_input_tokens: number, total_input_tokens: number, total_output_tokens: number, total_cache_creation_input_tokens: number, total_cache_read_input_tokens: number, } } | { "method": "agent/trace/event", "params": { threadId: string, taskId: string, row: AgentTraceRow, } } | { "method": "agent/children/updated", "params": { threadId: string, children: Array<AgentChild>, } } | { "method": "process/updated", "params": { thread_id: string, process_id: string, 
 /**
  * `ProcessStatus` 的 serde 标签：starting / running / ready / exited /
  * killed / failed_to_start。
