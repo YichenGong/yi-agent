@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import {
   STRIP_BASE,
   type Direction,
@@ -21,8 +21,8 @@ function facePos(digit: number): number {
   return STRIP_BASE + digit;
 }
 
-function initialState(value: number): DigitState[] {
-  return splitDigits(value).map((digit) => ({ pos: facePos(digit), ms: 0, delay: 0 }));
+function initialState(digits: number[]): DigitState[] {
+  return digits.map((digit) => ({ pos: facePos(digit), ms: 0, delay: 0 }));
 }
 
 function prefersReducedMotion(): boolean {
@@ -42,14 +42,26 @@ function prefersReducedMotion(): boolean {
 export function RollingNumber({
   value,
   usageKey,
+  fractionDigits = 0,
+  unit = "",
 }: {
   value: number;
   usageKey?: string | null;
+  /** 末几位是小数；`0` 表示整数（默认，与改造前完全一致）。 */
+  fractionDigits?: number;
+  /** 数字后面的单位（`k` / `M` / …），不参与滚动。 */
+  unit?: string;
 }) {
   const prev = useRef({ value, usageKey });
-  const [states, setStates] = useState<DigitState[]>(() => initialState(value));
   // `digits` 进依赖数组，必须在值不变时保持同一身份，否则每次渲染都会空转一次 effect。
-  const digits = useMemo(() => splitDigits(value), [value]);
+  // 不足 `fractionDigits + 1` 位时补前导零：`0.05` 不能渲染成 `.05`。
+  const digits = useMemo(() => {
+    const raw = splitDigits(value);
+    const need = fractionDigits + 1;
+    return raw.length >= need ? raw : [...new Array(need - raw.length).fill(0), ...raw];
+  }, [value, fractionDigits]);
+  // 初始状态也用补零后的位数：否则首帧的位状态与 `digits` 错位（`0.05` 会显示成 `5.00`）。
+  const [states, setStates] = useState<DigitState[]>(() => initialState(digits));
 
   useEffect(() => {
     const previous = prev.current;
@@ -59,7 +71,12 @@ export function RollingNumber({
     const keyChanged = previous.usageKey !== usageKey;
     const direction: Direction = value > previous.value ? 1 : value < previous.value ? -1 : 0;
     const reduced = prefersReducedMotion();
-    const previousDigits = splitDigits(previous.value);
+    const rawPrevious = splitDigits(previous.value);
+    const need = fractionDigits + 1;
+    const previousDigits =
+      rawPrevious.length >= need
+        ? rawPrevious
+        : [...new Array(need - rawPrevious.length).fill(0), ...rawPrevious];
     const width = digits.length;
 
     setStates((old) =>
@@ -94,7 +111,7 @@ export function RollingNumber({
         };
       }),
     );
-  }, [value, usageKey, digits]);
+  }, [value, usageKey, digits, fractionDigits]);
 
   /**
    * 过渡结束后把位置归一回中段（同一字符，视觉零变化）。不做这一步，位置会在
@@ -111,28 +128,38 @@ export function RollingNumber({
     );
   }
 
+  // 小数点插在「整数位」与「小数位」之间。`fractionDigits === 0` 时不产生这个
+  // 节点，DOM 与改造前逐字节一致。
+  const pointBefore = digits.length - fractionDigits;
+
   return (
     <span className="rolling-number" aria-hidden="true">
       {digits.map((digit, index) => {
         const state = states[index] ?? { pos: facePos(digit), ms: 0, delay: 0 };
         return (
-          <span key={index} className="rolling-digit">
-            <span
-              className="rolling-strip"
-              onTransitionEnd={() => settle(index)}
-              style={{
-                transform: stripY(state.pos),
-                transition:
-                  state.ms > 0 ? `transform ${state.ms}ms ${EASING} ${state.delay}ms` : "none",
-              }}
-            >
-              {STRIP.split("").map((char, charIndex) => (
-                <span key={charIndex}>{char}</span>
-              ))}
+          <Fragment key={index}>
+            {fractionDigits > 0 && index === pointBefore && (
+              <span className="rolling-point">.</span>
+            )}
+            <span className="rolling-digit">
+              <span
+                className="rolling-strip"
+                onTransitionEnd={() => settle(index)}
+                style={{
+                  transform: stripY(state.pos),
+                  transition:
+                    state.ms > 0 ? `transform ${state.ms}ms ${EASING} ${state.delay}ms` : "none",
+                }}
+              >
+                {STRIP.split("").map((char, charIndex) => (
+                  <span key={charIndex}>{char}</span>
+                ))}
+              </span>
             </span>
-          </span>
+          </Fragment>
         );
       })}
+      {unit && <span className="rolling-unit">{unit}</span>}
     </span>
   );
 }

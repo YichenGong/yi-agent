@@ -492,3 +492,16 @@ html[data-mobile="true"] {
   line-height: inherit;
   text-align: center;
 }
+
+/* 小数点：与数字同高、不占滚动窗口，宽度按字符自然宽度。 */
+.rolling-point {
+  display: inline-block;
+  width: 0.5ch;
+  text-align: center;
+}
+
+/* 单位（k/M/G）：跟在数字后，左侧留一点空隙，避免与末位贴死。 */
+.rolling-unit {
+  display: inline-block;
+  margin-left: 0.1em;
+}

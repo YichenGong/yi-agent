@@ -127,3 +127,67 @@ describe("RollingNumber", () => {
     expect(after.style.transition).toBe(midTransition);
   });
 });
+
+describe("RollingNumber decimals and units", () => {
+  /** `.rolling-number` 的直接子节点序列，小数点/单位/数字位都以标签名或类名标出。 */
+  function layout(container: HTMLElement): string[] {
+    return Array.from(container.querySelector(".rolling-number")!.children).map((el) =>
+      el.classList.contains("rolling-point")
+        ? "."
+        : el.classList.contains("rolling-unit")
+          ? `[${el.textContent}]`
+          : "d",
+    );
+  }
+
+  it("renders exactly as before when there is no fraction or unit", () => {
+    const { container } = render(<RollingNumber value={1234} />);
+    // 默认参数下 DOM 必须与改造前一致：这是状态栏既有用例的前提。
+    expect(container.querySelector(".rolling-point")).toBeNull();
+    expect(container.querySelector(".rolling-unit")).toBeNull();
+    expect(strips(container)).toHaveLength(4);
+    expect(layout(container)).toEqual(["d", "d", "d", "d"]);
+  });
+
+  it("puts the point before the last fraction digits", () => {
+    const { container } = render(<RollingNumber value={1234} fractionDigits={2} />);
+    expect(layout(container)).toEqual(["d", "d", ".", "d", "d"]);
+    // 数字位仍然是逐位独立的滚动窗口。
+    expect(strips(container)).toHaveLength(4);
+  });
+
+  it("keeps a leading zero so 1.00 does not render as .00", () => {
+    const { container } = render(<RollingNumber value={100} fractionDigits={2} />);
+    // 100 只有三位，但要 1 位整数 + 2 位小数 = 3 位，无需补零；再少就补。
+    expect(layout(container)).toEqual(["d", ".", "d", "d"]);
+    const { container: small } = render(
+      <RollingNumber value={5} fractionDigits={2} />,
+    );
+    // 5 → 0.05：补两位前导零，绝不能出现 `.05`。
+    expect(layout(small)).toEqual(["d", ".", "d", "d"]);
+    expect(strips(small)).toHaveLength(3);
+    expect(
+      strips(small).map((el) => el.style.transform),
+    ).toEqual([stripY(STRIP_BASE + 0), stripY(STRIP_BASE + 0), stripY(STRIP_BASE + 5)]);
+  });
+
+  it("appends the unit outside the rolling digits", () => {
+    const { container } = render(
+      <RollingNumber value={1234} fractionDigits={1} unit="k" />,
+    );
+    expect(layout(container)).toEqual(["d", "d", "d", ".", "d", "[k]"]);
+    // 单位不是数字位，不能进滚动窗口。
+    const unit = container.querySelector(".rolling-unit")!;
+    expect(unit.classList.contains("rolling-digit")).toBe(false);
+  });
+
+  it("still animates only the digits whose face changed", () => {
+    const { container, rerender } = render(
+      <RollingNumber value={1234} fractionDigits={1} />,
+    );
+    rerender(<RollingNumber value={1235} fractionDigits={1} />);
+    const all = strips(container);
+    expect(all[all.length - 1].style.transition).toContain(`${BASE_MS}ms`);
+    expect(all[0].style.transition).toBe("none");
+  });
+});
