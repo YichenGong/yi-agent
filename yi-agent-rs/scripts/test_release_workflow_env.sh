@@ -131,6 +131,52 @@ for target in x86_64-apple-darwin aarch64-apple-darwin x86_64-unknown-linux-gnu;
   fi
 done
 
+# 9) 调用 `just` 的 step 必须有 working-directory 指向 yi-agent-rs。
+#    justfile 在 yi-agent-rs/ 下，仓库根没有。漏掉 working-directory 时
+#    just 会在 **0.03 秒**内以「no justfile found」退 1（v0.1.9 实测），
+#    看起来像环境问题，实际只是少了一行。这里逐个 step 检查。
+missing_wd=""
+cur_step=""
+while IFS= read -r line; do
+  case "$line" in
+    *"- name:"*)
+      cur_step="${line#*- name: }"
+      ;;
+    *"working-directory: yi-agent-rs"*)
+      cur_step=""
+      ;;
+    *"just "*)
+      # 只认「just <recipe>」形式的调用；`just --version` / `command -v just`
+      # 不读 justfile，不该要求 working-directory。
+      if printf '%s\n' "$line" | grep -qE '^[[:space:]]*just [a-zA-Z]'; then
+        if [ -n "$cur_step" ]; then
+          missing_wd="$missing_wd
+       step '$cur_step' calls just without working-directory: yi-agent-rs"
+        fi
+      fi
+      ;;
+  esac
+done <<EOF
+$(printf '%s\n' "$config")
+EOF
+if [ -z "$missing_wd" ]; then
+  ok "every step invoking 'just' sets working-directory: yi-agent-rs"
+else
+  bad "steps invoking 'just' must set working-directory: yi-agent-rs"
+  printf '%s\n' "$missing_wd"
+fi
+
+# 10) npm 子包产物校验必须能真的读到 workspace 的 Cargo.toml。
+#     从 yi-agent-rs/yi-agent-cli/platforms/darwin-arm64 出发，
+#     ../../ 只到 yi-agent-cli/（那里没有 Cargo.toml），必须用 ../../../
+#     ——否则版本不一致时门禁静默失效。
+VERIFY_DEPTH="$(printf '%s\n' "$config" | grep -c '\.\./\.\./\.\./Cargo\.toml')"
+if [ "$VERIFY_DEPTH" -ge 1 ]; then
+  ok "desktop verification reads Cargo.toml at the correct depth (../../../)"
+else
+  bad "desktop verification must use ../../../Cargo.toml (../../ lands in yi-agent-cli/)"
+fi
+
 echo
 if [ "$failn" -eq 0 ]; then
   echo "$pass passed"
