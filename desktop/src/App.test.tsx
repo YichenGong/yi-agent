@@ -1372,6 +1372,25 @@ describe("App 主区域看板", () => {
     expect(clients[0].requests.filter((r) => r.method === "plugin/query")).toEqual([]);
   });
 
+  it("看板开关关着时，workspace 右键菜单里也没有看板项", async () => {
+    // 现场回归：全局开关只藏了侧栏的看板入口与卡片会话，用户右键工作区文件夹
+    // 仍能看到「创建 Superpowers 看板」——点下去只会得到一个已停掉的 daemon。
+    state.boards = [];
+    state.groupWorkspaces = ["/proj"];
+    state.kanbanFlagEnabled = false;
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "flags/list")).toBe(true),
+    );
+    await waitFor(() => expect(screen.getByText("proj")).toBeTruthy());
+
+    const header = screen.getByText("proj").closest<HTMLElement>("div[tabindex]")!;
+    fireEvent.contextMenu(header);
+
+    expect(screen.queryByText("创建 Superpowers 看板")).toBeNull();
+    expect(screen.queryByText("移除看板")).toBeNull();
+  });
+
   it("看板开关关着时，已有的卡片会话也一并隐藏", async () => {
     state.kanbanFlagEnabled = false;
     state.threads = [
