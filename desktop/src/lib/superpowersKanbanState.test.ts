@@ -218,4 +218,28 @@ describe("normalizeCard", () => {
     const card = normalizeCard({ id: "idea", state: "pre_queued" });
     expect(card?.originThreadId).toBeNull();
   });
+
+  it("carries the stale flag and the last live timestamp", () => {
+    const [card] = parseBoard(
+      JSON.stringify({
+        cards: [
+          {
+            id: "a",
+            state: "running",
+            spec_path: "a.spec.md",
+            stale: true,
+            last_alive_at: "2026-10-22T10:00:00+08:00",
+          },
+        ],
+      }),
+    );
+    expect(card.stale).toBe(true);
+    expect(card.lastAliveAt).toBe("2026-10-22T10:00:00+08:00");
+  });
+
+  it("treats a missing stale flag as false", () => {
+    const [card] = parseBoard(JSON.stringify({ cards: [{ id: "a", state: "running" }] }));
+    expect(card.stale).toBe(false);
+    expect(card.lastAliveAt).toBeUndefined();
+  });
 });

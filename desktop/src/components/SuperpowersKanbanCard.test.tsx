@@ -27,6 +27,22 @@ describe("SuperpowersKanbanCard", () => {
     expect(screen.queryByText("/work/tree")).toBeNull();
   });
 
+  it("stale 卡显示角标与最后活动时间", () => {
+    // 会话没了但卡还写着 running：看板不改状态，只给人和模型一个可判读的信号。
+    render(
+      <SuperpowersKanbanCard
+        card={card({ state: "running", stale: true, lastAliveAt: "2026-10-22T10:00:00+08:00" })}
+      />,
+    );
+    expect(screen.getByLabelText("会话已不在")).toBeTruthy();
+    expect(screen.getByText(/最后活动/)).toBeTruthy();
+  });
+
+  it("活着的运行卡不显示 stale 角标", () => {
+    render(<SuperpowersKanbanCard card={card({ state: "running", stale: false })} />);
+    expect(screen.queryByLabelText("会话已不在")).toBeNull();
+  });
+
   it("合并卡没有会话时不渲染跳转按钮", () => {
     render(<SuperpowersKanbanCard card={card({ kind: "merge", detail: "kanban/a → main" })} />);
     expect(screen.queryByRole("button")).toBeNull();

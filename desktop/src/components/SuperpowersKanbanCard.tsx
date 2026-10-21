@@ -32,6 +32,15 @@ export function SuperpowersKanbanCard({
             !
           </span>
         )}
+        {card.stale && (
+          <span
+            aria-label="会话已不在"
+            className="shrink-0 text-amber-400"
+            title="卡片写着 running，但会话已经不在了"
+          >
+            ⚠
+          </span>
+        )}
       </div>
       <div className="mt-1 flex items-center gap-2 text-xs text-fg-subtle">
         <span className="font-mono" title={card.id}>
@@ -42,6 +51,15 @@ export function SuperpowersKanbanCard({
       {card.kind === "merge" && card.detail ? (
         <div className="mt-1 truncate font-mono text-xs text-fg-subtle" title={card.detail}>
           {card.detail}
+        </div>
+      ) : null}
+      {card.stale && card.lastAliveAt ? (
+        <div className="mt-1 text-xs text-fg-subtle">
+          最后活动{" "}
+          {new Date(card.lastAliveAt).toLocaleTimeString("zh-CN", {
+            hour: "2-digit",
+            minute: "2-digit",
+          })}
         </div>
       ) : null}
       {sessionId ? (
