@@ -161,6 +161,7 @@ export function ThreadSidebar({
   isMobile = false,
   statusStale = false,
   leadAgentEnabled = true,
+  kanbanEnabled = true,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -229,6 +230,16 @@ export function ThreadSidebar({
    * 所有既有侧栏渲染突然少一行组长。生产路径由 `App` 显式传入真实开关值。
    */
   leadAgentEnabled?: boolean;
+  /**
+   * 整个 Superpowers 看板是否开启（`flags/list` 里的 `superpowers_kanban`）。
+   *
+   * 关掉时这里**什么都不画**：看板入口、菜单里的「创建/移除看板」，以及所有
+   * `driver_ref` 非空的卡片会话（含置顶区）——包括已经存在的。理由是这个开关
+   * 停掉的是整个 daemon，留着入口只会点出 `plugin_disabled`。
+   *
+   * 缺省 `true`，与 `leadAgentEnabled` 同一理由：既有用法与测试不传它。
+   */
+  kanbanEnabled?: boolean;
 }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
@@ -1061,6 +1072,7 @@ export function ThreadSidebar({
    * 小节里可见，绝不能因为 `kanbanItemFor` 变 null 就整批消失。
    */
   const renderBoardThreads = (g: WorkspaceGroup) => {
+    if (!kanbanEnabled) return null;
     const cards = g.threads.filter((t) => !t.pinned && t.driver_ref && t.thread_id !== leadId);
     if (cards.length === 0) return null;
     // 搜索期间一律展开，且**关掉这一小节自身的折叠开关**：此时渲染忽略折叠态，
@@ -1141,6 +1153,12 @@ export function ThreadSidebar({
   // 渲染时过滤：不持有第二份列表副本，服务端刷新后自动跟随。
   const searching = query.trim() !== "";
   const filtered = filterThreadTree(groups, pinned, query, tagNames);
+  // 看板关着时，卡片会话（`driver_ref` 非空）在哪儿都不该出现——置顶区是一处
+  // 独立的分流，`filterThreadTree` 不会替我们滤掉它。组内那几处已有各自的
+  // `!row.thread.driver_ref` / `renderBoardThreads` 守卫。
+  const visiblePinned = kanbanEnabled
+    ? filtered.pinned
+    : filtered.pinned.filter((t) => !t.driver_ref);
   // 过滤之后再按 linked_to 归拢：搜索 / 置顶 / 看板会话三个既有分支都不受影响。
   // 搜索期间不复用归拢结果——`filterThreadTree` 只留下命中的组，附属根会临时回到
   // 顶层；渲染时用下面的 isLinkedChild 兜住"顶层但其实是附属根"这一情形。
@@ -1264,7 +1282,7 @@ export function ThreadSidebar({
                 New thread here
               </button>
             )}
-            {!isChild && (
+            {!isChild && kanbanEnabled && (
               <button
                 type="button"
                 role="menuitem"
@@ -1321,6 +1339,7 @@ export function ThreadSidebar({
         {!isCollapsed &&
           !isChild &&
           !searching &&
+          kanbanEnabled &&
           kanbanItemFor(g.workspace, boards) &&
           renderBoardEntry(g.workspace)}
         {!isCollapsed && renderBoardThreads(g)}
@@ -1331,7 +1350,9 @@ export function ThreadSidebar({
             // 于是同一个会话可以在顶部 Pinned 区与框内各出现一次。
             .filter((row) =>
               row.kind === "thread"
-                ? !row.thread.pinned && !row.thread.driver_ref && row.thread.thread_id !== leadId
+                ? !row.thread.pinned &&
+                  !row.thread.driver_ref &&
+                  row.thread.thread_id !== leadId
                 : true,
             )
             .map((row) =>
@@ -1544,7 +1565,7 @@ export function ThreadSidebar({
             <p className="px-3 py-2 text-xs text-fg-faint">无匹配会话</p>
           )}
           {leadVisible && lead && <div>{renderLeadRow(lead)}</div>}
-          {filtered.pinned.length > 0 && (
+          {visiblePinned.length > 0 && (
             <div>
               <div className="flex items-center gap-1 px-2 py-1.5 text-xs text-fg-subtle">
                 <button
@@ -1560,7 +1581,7 @@ export function ThreadSidebar({
                 <div className="min-w-0 flex-1 truncate text-fg-muted">Pinned</div>
               </div>
               {!pinnedCollapsedNow &&
-                filtered.pinned.map((t, i) => renderThread(t, { rowAttr: "pinned", dragIndex: i }))}
+                visiblePinned.map((t, i) => renderThread(t, { rowAttr: "pinned", dragIndex: i }))}
             </div>
           )}
           {/* 分组之间留一档空档：无间距时上一条会话与下一个文件夹头紧贴，多个文件夹

@@ -5103,6 +5103,7 @@ dependencies = [
  "tracing",
  "wiremock",
  "yi-agent-core",
+ "yi-agent-flags",
  "yi-agent-llm",
  "yi-agent-mcp",
  "yi-agent-skills",
@@ -5179,6 +5180,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tracing",
+ "yi-agent-flags",
  "yi-agent-store",
 ]
 

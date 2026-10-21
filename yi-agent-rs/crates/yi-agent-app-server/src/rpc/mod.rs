@@ -207,6 +207,11 @@ pub(crate) struct PluginChannelState {
     /// 字段,与安装句柄成对,保留以免日后加「卸载值守」方法时又要动本结构的形状。
     #[allow(dead_code)]
     pub(crate) watchman_uninstall: crate::server::WatchmanUninstall,
+    /// 供 `plugin/query` 判断"插件是否被自己的 flag 关着"。
+    ///
+    /// `None` = 不判定。测试装配就是 `None`；要用真判定时注入一个指向临时
+    /// `flags.json` 的 [`crate::plugin_gate::Gate`]，别去读开发者的 `$HOME`。
+    pub(crate) plugin_gate: Option<crate::plugin_gate::Gate>,
     /// detach 之后唯一需要回到主循环的信号：stdio `local` 写失败是致命的
     /// （`driver_reports_finished_when_writer_fails` 钉死），而 detached 任务
     /// 无法用 `?` 把它抛回去。

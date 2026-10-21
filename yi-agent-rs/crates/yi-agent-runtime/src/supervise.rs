@@ -94,6 +94,32 @@ pub fn idle() -> SuperviseHandle {
 ///
 /// `runtime_dir` 由调用方给出（daemon 建在哪儿就传哪儿），因为转发表按它分区。
 pub fn serve(workdir: &Path, runtime_dir: &Path) -> SuperviseHandle {
+    serve_with(workdir, runtime_dir, None)
+}
+
+/// [`serve`] 的可注入版本：`flags_path` 覆盖 `flags.json` 的位置。
+///
+/// 存在的理由只有测试，但与 `Supervisor::with_flags_path` 同一条规矩：**不要**
+/// 用 `#[cfg(test)]` 分支，集成测试编译的是普通 lib，那种分支在那里不存在。
+/// 判定的构建类型仍取自进程（`yi_agent_flags::build_kind()`）——测试二进制恒为
+/// `release`，而 `release` 下任何 flag 都不生效，所以调用方若要在测试里看到
+/// 子进程被拉起，还须自行注入 dev 构建类型（见
+/// [`serve_with_environment`]）。
+pub fn serve_with(
+    workdir: &Path,
+    runtime_dir: &Path,
+    flags_path: Option<std::path::PathBuf>,
+) -> SuperviseHandle {
+    serve_with_environment(workdir, runtime_dir, flags_path, None)
+}
+
+/// 最完整的那一层：开关文件位置与构建类型都可注入。
+pub fn serve_with_environment(
+    workdir: &Path,
+    runtime_dir: &Path,
+    flags_path: Option<std::path::PathBuf>,
+    build_kind: Option<&str>,
+) -> SuperviseHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let layout = Layout::for_workdir(workdir);
@@ -101,11 +127,17 @@ pub fn serve(workdir: &Path, runtime_dir: &Path) -> SuperviseHandle {
     // 同一个 key 下。同一个进程可能同时监督多个项目（桌面 app-server 就是如此），
     // 所以这里的数据结构不能再假定"一个进程只有一个 daemon"。
     let scope = runtime_dir.to_path_buf();
+    let kind = build_kind
+        .map(str::to_string)
+        .unwrap_or_else(|| yi_agent_flags::build_kind().to_string());
     let join = std::thread::spawn(move || {
         // 监督线程的 panic 不得拖垮宿主（TUI/桌面）——记录后结束，
         // `stop()` 仍能安全 join 到这个已结束的线程。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut supervisor = Supervisor::new(layout);
+            let mut supervisor = Supervisor::new(layout, kind);
+            if let Some(path) = flags_path {
+                supervisor = supervisor.with_flags_path(path);
+            }
             while !flag.load(Ordering::SeqCst) {
                 supervisor.reconcile();
                 // 转发表只有运行中的、且声明了 query_socket 的插件才该出现；
@@ -171,25 +203,45 @@ mod tests {
     }
 
     /// 就位一个"开关打开 + 清单指向假子进程"的项目目录。
-    fn armed_project(workdir: &Path, marker: &Path) -> PathBuf {
+    ///
+    /// 开关落在**全局** `flags.json`（`Supervisor::desired_on` 只看这一层）：
+    /// 项目层的 `preferences.json` 是插件自己写的，进程起停不再读它。
+    /// 键必须是注册表里的名字——未注册的一律读成关。
+    ///
+    /// 返回 `(child, flags_path)`，后者供 [`serve_armed`] 注入。
+    fn armed_project(workdir: &Path, marker: &Path) -> (PathBuf, PathBuf) {
         let child = write_fake_child(workdir, marker);
         let manifests = workdir.join(".yi-agent").join("supervisors");
         std::fs::create_dir_all(&manifests).unwrap();
         std::fs::write(
             manifests.join("demo.json"),
             format!(
-                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
+                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
                 child.display()
             ),
         )
         .unwrap();
-        std::fs::create_dir_all(workdir.join(".yi-agent")).unwrap();
+        let flags = workdir.join("flags.json");
         std::fs::write(
-            workdir.join(".yi-agent/preferences.json"),
-            r#"{"demo_on":true}"#,
+            &flags,
+            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
         )
         .unwrap();
-        child
+        (child, flags)
+    }
+
+    /// 起一个监督线程，注入测试自己的 `flags.json` 与 `dev` 构建类型。
+    ///
+    /// **两处注入都不可省**：测试二进制的 `build_kind()` 恒为 `release`，
+    /// `release` 下任何 flag 都不生效；不注入 dev 就永远看不到子进程起来，
+    /// 这些测试会静默变成"断言一条死路径"。
+    fn serve_armed(workdir: &Path, flags: &Path) -> SuperviseHandle {
+        serve_with_environment(
+            workdir,
+            &scope_of(workdir),
+            Some(flags.to_path_buf()),
+            Some("dev"),
+        )
     }
 
     fn wait_for(path: &Path, timeout: Duration) -> bool {
@@ -219,9 +271,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         clear_table(dir.path());
         let marker = dir.path().join("child.pid");
-        armed_project(dir.path(), &marker);
+        let (_child, flags) = armed_project(dir.path(), &marker);
 
-        let handle = serve(dir.path(), &scope_of(dir.path()));
+        let handle = serve_armed(dir.path(), &flags);
         assert!(handle.is_supervising());
         assert!(
             wait_for(&marker, Duration::from_secs(3)),
@@ -236,9 +288,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         clear_table(dir.path());
         let marker = dir.path().join("child.pid");
-        armed_project(dir.path(), &marker);
+        let (_child, flags) = armed_project(dir.path(), &marker);
 
-        let handle = serve(dir.path(), &scope_of(dir.path()));
+        let handle = serve_armed(dir.path(), &flags);
         assert!(wait_for(&marker, Duration::from_secs(3)));
         // 运行中：清单声明了 query_socket 且进程在跑，路由必须出现。
         // （先证明"表里本来有东西"，否则"停后被清空"是句空话。）
@@ -272,7 +324,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         clear_table(dir.path());
         let marker = dir.path().join("child.pid");
-        armed_project(dir.path(), &marker);
+        let (_child, _flags) = armed_project(dir.path(), &marker);
 
         let handle = idle();
         assert!(
@@ -293,10 +345,10 @@ mod tests {
         let owned_dir = tempfile::tempdir().unwrap();
         clear_table(owned_dir.path());
         let owned_marker = owned_dir.path().join("child.pid");
-        armed_project(owned_dir.path(), &owned_marker);
+        let (_owned_child, owned_flags) = armed_project(owned_dir.path(), &owned_marker);
 
         // 我起的 daemon → 我监督，子进程起来。
-        let owned = for_daemon_ownership(owned_dir.path(), &scope_of(owned_dir.path()), true);
+        let owned = serve_armed(owned_dir.path(), &owned_flags);
         assert!(owned.is_supervising());
         assert!(
             wait_for(&owned_marker, Duration::from_secs(3)),
@@ -307,7 +359,8 @@ mod tests {
         let borrowed_dir = tempfile::tempdir().unwrap();
         clear_table(borrowed_dir.path());
         let borrowed_marker = borrowed_dir.path().join("child.pid");
-        armed_project(borrowed_dir.path(), &borrowed_marker);
+        let (_borrowed_child, _borrowed_flags) =
+            armed_project(borrowed_dir.path(), &borrowed_marker);
 
         // 借用的 daemon → 不监督，什么也不起（监督者应是那个真正拥有 daemon 的进程）。
         let borrowed =
@@ -327,10 +380,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         clear_table(dir.path());
         let marker = dir.path().join("child.pid");
-        armed_project(dir.path(), &marker);
+        let (_child, flags) = armed_project(dir.path(), &marker);
 
         {
-            let handle = serve(dir.path(), &scope_of(dir.path()));
+            let handle = serve_armed(dir.path(), &flags);
             assert!(wait_for(&marker, Duration::from_secs(3)));
             // 路由在每轮对账末尾登记，与子进程写 marker 有竞态，所以轮询等它出现，
             // 而不是假定"子进程一起来路由就到"。
@@ -384,12 +437,12 @@ mod tests {
         clear_table(bare_project.path());
 
         let marker = plugin_project.path().join("child.pid");
-        armed_project(plugin_project.path(), &marker);
+        let (_child, flags) = armed_project(plugin_project.path(), &marker);
         // 没有 `.yi-agent/supervisors`：与桌面端那些从未装过插件的项目一致。
         std::fs::create_dir_all(bare_project.path().join(".yi-agent")).unwrap();
 
         let plugin_scope = scope_of(plugin_project.path());
-        let with_plugin = serve(plugin_project.path(), &plugin_scope);
+        let with_plugin = serve_armed(plugin_project.path(), &flags);
         let bare = serve(bare_project.path(), &scope_of(bare_project.path()));
 
         // 等到路由出现，然后跨过好几个对账周期持续观察：只要有任意一拍被

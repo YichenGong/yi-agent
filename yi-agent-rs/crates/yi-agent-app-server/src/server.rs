@@ -1467,11 +1467,26 @@ pub(crate) fn plugin_query(
     method: &str,
     plugin: &str,
     params: serde_json::Value,
+    gate: Option<&crate::plugin_gate::Gate>,
 ) -> Result<serde_json::Value, PluginQueryError> {
     if plugin.is_empty() {
         return Err(PluginQueryError::new(
             "invalid_params",
             "plugin/query needs a `plugin` name",
+        ));
+    }
+    // 先看这个插件是不是被自己的 flag 关掉了。daemon 停着时下面必然拿到
+    // "连接失败"，那句话会把用户引向"插件坏了"；这里给的是"去设置页打开"。
+    //
+    // 通用：只认清单的 `switch_key`，不认插件名。没有清单（未安装）时不判定，
+    // 交给后面的 `plugin_unavailable`——"没装"和"关着"是两件事。
+    //
+    // `plugin_query` 是自由函数、拿不到 `AppState`，故构建类型由调用方传：
+    // 测试传 `None`（不判定），生产传进程级真实值。
+    if let Some(switch_key) = gate.and_then(|gate| gate.disabled(project, plugin)) {
+        return Err(PluginQueryError::new(
+            "plugin_disabled",
+            format!("this feature is disabled; turn on `{switch_key}` in Settings > Experimental"),
         ));
     }
     // The daemon that runs the plugin lives at the project root, which is also
@@ -1540,7 +1555,7 @@ pub(crate) fn plugin_query_self(
             "plugin/settings needs a `plugin` name",
         ));
     }
-    let summary = list_installed_plugins(scope)
+    let summary = list_installed_plugins(scope, None)
         .into_iter()
         .find(|summary| summary.name == plugin);
     let Some(summary) = summary else {
@@ -1603,6 +1618,11 @@ pub(crate) struct PluginSummary {
     pub name: String,
     pub queryable: bool,
     pub switch_key: String,
+    /// 这个插件此刻是否被自己的 flag 关着（`false` = 关着）。
+    ///
+    /// 有 `Gate` 时按真实开关算；没有时（拿不到构建类型的调用方）恒为
+    /// `true`——"不知道"绝不能显示成"关着"，那会让设置页凭空报一片停用。
+    pub enabled: bool,
 }
 
 /// 列出 `<scope>/.yi-agent/supervisors/` 下的插件清单。
@@ -1615,14 +1635,26 @@ pub(crate) struct PluginSummary {
 /// home。若固定读 workdir，桌面端在 home 下一个插件也看不到——这正是看板跑着、
 /// 设置页却空着的根因。`plugins/list` 因此在调用方给了 `project` 时枚举该项目，
 /// 否则回落到宿主自身 workdir（TUI 与未带 project 的调用保持原语义）。
-pub(crate) fn list_installed_plugins(scope: &Path) -> Vec<PluginSummary> {
+pub(crate) fn list_installed_plugins(
+    scope: &Path,
+    gate: Option<&crate::plugin_gate::Gate>,
+) -> Vec<PluginSummary> {
     let dir = scope.join(".yi-agent").join("supervisors");
     yi_agent_supervisors::manifest::load_manifests(&dir)
         .into_iter()
-        .map(|manifest| PluginSummary {
-            name: manifest.name,
-            queryable: manifest.query_socket.is_some(),
-            switch_key: manifest.switch_key,
+        .map(|manifest| {
+            let switch_key = manifest.switch_key;
+            // 判定用的是**清单自己**的 switch_key，与 `plugin/query` 同一口径：
+            // 宿主不认识插件名，只认识它声明的开关。
+            let disabled = gate.is_some_and(|gate| {
+                !crate::plugin_gate::flag_is_on(&gate.flags_path, &switch_key, gate.build_kind)
+            });
+            PluginSummary {
+                name: manifest.name,
+                queryable: manifest.query_socket.is_some(),
+                switch_key,
+                enabled: !disabled,
+            }
         })
         .collect()
 }
@@ -3298,6 +3330,7 @@ where
                             watchman_uninstall: std::sync::Arc::clone(&watchman_uninstall),
                             resolve_plugin: std::sync::Arc::clone(&resolve_plugin),
                             ensure_daemon: std::sync::Arc::clone(&ensure_daemon),
+                            plugin_gate: crate::plugin_gate::Gate::from_process_environment(),
                             fatal_tx: fatal_tx.clone(),
                         });
                         let req = req.clone();
@@ -7322,7 +7355,8 @@ mod plugin_query_tests {
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         // 不放 boards.json，也不要 nonce：这个项目从未登记过。
-        let error = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap_err();
+        let error =
+            plugin_query(&project, "list", "superpowers-kanban", json!({}), None).unwrap_err();
         assert_eq!(error.code, "daemon_unavailable", "{error}");
         assert_ne!(error.code, "board_not_created", "{error}");
     }
@@ -7340,7 +7374,7 @@ mod plugin_query_tests {
             json!({ "type": "PluginResult", "value": { "cards": [] } }),
         );
 
-        let value = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap();
+        let value = plugin_query(&project, "list", "superpowers-kanban", json!({}), None).unwrap();
 
         assert_eq!(value["cards"], json!([]));
         let request = seen.lock().unwrap().clone();
@@ -7362,6 +7396,7 @@ mod plugin_query_tests {
             "list",
             "superpowers-kanban",
             json!({ "verbose": true }),
+            None,
         )
         .unwrap();
         handle.join().unwrap();
@@ -7373,11 +7408,119 @@ mod plugin_query_tests {
         assert_eq!(request["command"]["params"]["verbose"], true);
     }
 
+    /// 写一份只含指定插件的清单，返回它的 `switch_key`。
+    fn write_manifest(project: &Path, name: &str, switch_key: &str) {
+        let dir = project.join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            json!({
+                "name": name,
+                "command": "/bin/true",
+                "switch_key": switch_key,
+                "stop_when_disabled": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_switched_off_plugin_says_disabled_instead_of_broken() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_dir(dir.path());
+        write_manifest(&project, "superpowers-kanban", "superpowers_kanban");
+
+        let flags = dir.path().join("flags.json");
+        std::fs::write(&flags, r#"{"version":1,"flags":{}}"#).unwrap();
+        let gate = crate::plugin_gate::Gate {
+            build_kind: "dev",
+            flags_path: flags,
+        };
+
+        // 故意不起 daemon：若实现走到连 socket，返回的会是 `daemon_unavailable`。
+        let error = plugin_query(
+            &project,
+            "list",
+            "superpowers-kanban",
+            json!({}),
+            Some(&gate),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "plugin_disabled", "{error}");
+        assert!(
+            error.message.contains("superpowers_kanban"),
+            "the message must name the switch to flip: {error}"
+        );
+    }
+
+    #[test]
+    fn a_switched_on_plugin_still_reaches_the_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_dir(dir.path());
+        write_manifest(&project, "superpowers-kanban", "superpowers_kanban");
+
+        let flags = dir.path().join("flags.json");
+        std::fs::write(
+            &flags,
+            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+        )
+        .unwrap();
+        let gate = crate::plugin_gate::Gate {
+            build_kind: "dev",
+            flags_path: flags,
+        };
+
+        let (_socket, _seen, handle) = fake_daemon(
+            &project,
+            json!({ "type": "PluginResult", "value": { "cards": [] } }),
+        );
+        let value = plugin_query(
+            &project,
+            "list",
+            "superpowers-kanban",
+            json!({}),
+            Some(&gate),
+        )
+        .unwrap();
+        assert_eq!(value["cards"], json!([]));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_stable_build_never_lets_the_flag_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_dir(dir.path());
+        write_manifest(&project, "superpowers-kanban", "superpowers_kanban");
+
+        let flags = dir.path().join("flags.json");
+        std::fs::write(
+            &flags,
+            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+        )
+        .unwrap();
+        let gate = crate::plugin_gate::Gate {
+            build_kind: "release",
+            flags_path: flags,
+        };
+
+        let error = plugin_query(
+            &project,
+            "list",
+            "superpowers-kanban",
+            json!({}),
+            Some(&gate),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "plugin_disabled", "{error}");
+    }
+
     #[test]
     fn a_missing_plugin_name_is_refused_before_touching_the_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_dir(dir.path());
-        let error = plugin_query(&project, "list", "", json!({})).unwrap_err();
+        let error = plugin_query(&project, "list", "", json!({}), None).unwrap_err();
         assert!(error.message.contains("plugin"), "{error}");
         assert_eq!(
             error.code, "invalid_params",
@@ -7389,7 +7532,8 @@ mod plugin_query_tests {
     fn an_unreachable_daemon_reports_that_the_plugin_is_unavailable() {
         let dir = tempfile::tempdir().unwrap();
         let project = project_dir(dir.path());
-        let error = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap_err();
+        let error =
+            plugin_query(&project, "list", "superpowers-kanban", json!({}), None).unwrap_err();
         assert!(error.message.contains("daemon is unavailable"), "{error}");
         assert_eq!(error.code, "daemon_unavailable", "{error}");
     }
@@ -7407,7 +7551,8 @@ mod plugin_query_tests {
             }),
         );
 
-        let error = plugin_query(&project, "list", "superpowers-kanban", json!({})).unwrap_err();
+        let error =
+            plugin_query(&project, "list", "superpowers-kanban", json!({}), None).unwrap_err();
         handle.join().unwrap();
 
         assert_eq!(error.code, "plugin_unavailable", "{error}");
@@ -7512,7 +7657,7 @@ mod plugins_tests {
     #[test]
     fn an_absent_supervisors_directory_lists_no_plugins() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(list_installed_plugins(dir.path()).is_empty());
+        assert!(list_installed_plugins(dir.path(), None).is_empty());
     }
 
     /// 设置页「技能」面板的两个 RPC：三层分组、正文读取、越界拒绝，且都必须落在
@@ -7821,7 +7966,7 @@ mod plugins_tests {
             r#"{"name":"plain","command":"y","switch_key":"plain_on"}"#,
         )
         .unwrap();
-        let mut plugins = list_installed_plugins(dir.path());
+        let mut plugins = list_installed_plugins(dir.path(), None);
         plugins.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(plugins.len(), 2);
         assert_eq!(plugins[0].name, "plain");
@@ -7829,6 +7974,54 @@ mod plugins_tests {
         assert_eq!(plugins[1].name, "superpowers-kanban");
         assert!(plugins[1].queryable);
         assert_eq!(plugins[1].switch_key, "superpowers_kanban");
+    }
+
+    /// 开关关着时仍要列出这个插件——用户得能在设置页里看见它、把它打开——
+    /// 但必须标成停用，否则设置页会显示一个其实没在跑的插件是"正常"的。
+    #[test]
+    fn a_switched_off_plugin_is_still_listed_but_marked_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = dir.path().join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("superpowers-kanban.json"),
+            r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban"}"#,
+        )
+        .unwrap();
+
+        let flags = dir.path().join("flags.json");
+        std::fs::write(&flags, r#"{"version":1,"flags":{}}"#).unwrap();
+        let gate = crate::plugin_gate::Gate {
+            build_kind: "dev",
+            flags_path: flags.clone(),
+        };
+
+        let plugins = list_installed_plugins(dir.path(), Some(&gate));
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].name, "superpowers-kanban");
+        assert!(!plugins[0].enabled, "off must read as disabled");
+
+        std::fs::write(
+            &flags,
+            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
+        )
+        .unwrap();
+        let plugins = list_installed_plugins(dir.path(), Some(&gate));
+        assert!(plugins[0].enabled, "on must read as enabled");
+    }
+
+    /// 没有 `Gate` 时不判定：显示"关着"会让设置页凭空报一片停用。
+    #[test]
+    fn without_a_gate_a_plugin_is_not_reported_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let sup = dir.path().join(".yi-agent/supervisors");
+        std::fs::create_dir_all(&sup).unwrap();
+        std::fs::write(
+            sup.join("superpowers-kanban.json"),
+            r#"{"name":"superpowers-kanban","command":"x","switch_key":"superpowers_kanban"}"#,
+        )
+        .unwrap();
+        assert!(list_installed_plugins(dir.path(), None)[0].enabled);
     }
 
     #[test]

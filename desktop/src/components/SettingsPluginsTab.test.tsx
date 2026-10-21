@@ -73,6 +73,35 @@ describe("SettingsPluginsTab", () => {
     expect(calls[1]).toEqual({ project: "/p/second" });
   });
 
+  it("marks a switched-off plugin without hiding its panel", async () => {
+    const call = async (method: string) => {
+      if (method === "plugins/list") {
+        return {
+          plugins: [
+            { name: "superpowers-kanban", queryable: true, switch_key: "k", enabled: false },
+          ],
+        };
+      }
+      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
+    };
+    render(<SettingsPluginsTab call={call} projects={["/p/proj"]} />);
+    expect(await screen.findByText(/已停用/)).toBeTruthy();
+    // 面板仍在：用户得能从这一页看出它为什么没在跑，而不是整块消失。
+    expect(screen.getByLabelText("默认并发上限")).toBeTruthy();
+  });
+
+  it("treats an old host that omits enabled as running", async () => {
+    const call = async (method: string) => {
+      if (method === "plugins/list") {
+        return { plugins: [{ name: "superpowers-kanban", queryable: true, switch_key: "k" }] };
+      }
+      return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
+    };
+    render(<SettingsPluginsTab call={call} projects={["/p/proj"]} />);
+    await screen.findByLabelText("默认并发上限");
+    expect(screen.queryByText(/已停用/)).toBeNull();
+  });
+
   it("keeps the user's input and shows an inline error when saving fails", async () => {
     const call = async (method: string) => {
       if (method === "plugins/list") {

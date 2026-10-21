@@ -12,6 +12,8 @@ yi-agent-mcp = { workspace = true }
 yi-agent-skills = { workspace = true }
 yi-agent-store = { workspace = true }
 yi-agent-supervisors = { workspace = true }
+# `supervise::serve` 起 supervisor 时要告诉它构建类型。
+yi-agent-flags = { workspace = true }
 anyhow.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true

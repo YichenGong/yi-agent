@@ -38,10 +38,16 @@ pub struct SupervisorManifest {
     /// Whether turning the switch off should stop this process. Defaults to
     /// `true`.
     ///
-    /// A process that serves a query channel must set this `false`: stopping it
-    /// on switch-off removes the only channel that can report the switch and
-    /// turn it back on, so "off" would become a one-way door. Such a process
-    /// gates its own work on the switch instead of exiting.
+    /// This used to carry the opposite advice: a process serving a query
+    /// channel was told to set `false`, because stopping it would remove the
+    /// only channel able to turn the switch back on ("a one-way door"). That
+    /// assumed the host only ever flipped switches **through the plugin**.
+    ///
+    /// It no longer holds. The switch now lives in `~/.yi-agent/flags.json`
+    /// and is written by the host itself (`flags/set`), which needs no running
+    /// plugin. So a plugin may -- and, when its whole point is to stop, should
+    /// -- set `true`. Set `false` only when the process genuinely must outlive
+    /// its own switch, and say why in a comment.
     pub stop_when_disabled: bool,
     /// Socket this process can be queried on, if it serves one. Generic: the
     /// field names no plugin and the daemon attaches no meaning to the answers.

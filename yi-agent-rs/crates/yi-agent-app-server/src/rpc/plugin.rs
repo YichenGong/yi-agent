@@ -58,7 +58,7 @@ pub(crate) async fn handle_shared(
                 .get("params")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            match plugin_query(&project, method, plugin, params) {
+            match plugin_query(&project, method, plugin, params, state.plugin_gate.as_ref()) {
                 Ok(value) => write_or_fatal(state, id.clone(), ok_response(id, value)).await,
                 Err(error) => {
                     write_or_fatal(
@@ -405,16 +405,20 @@ pub(crate) async fn handle_shared(
             // 清单按项目安装，故作用域可由调用方的 `project` 指定；
             // 缺省回落到宿主 workdir（TUI 与旧客户端）。
             let scope = plugin_scope(workdir, &req.params);
-            let plugins: Vec<serde_json::Value> = list_installed_plugins(&scope)
-                .into_iter()
-                .map(|plugin| {
-                    json!({
-                        "name": plugin.name,
-                        "queryable": plugin.queryable,
-                        "switch_key": plugin.switch_key,
+            let plugins: Vec<serde_json::Value> =
+                list_installed_plugins(&scope, state.plugin_gate.as_ref())
+                    .into_iter()
+                    .map(|plugin| {
+                        json!({
+                            "name": plugin.name,
+                            "queryable": plugin.queryable,
+                            "switch_key": plugin.switch_key,
+                            // 关着时宿主仍列出来（用户要能在设置页看见它、把它打开），
+                            // 只是标成停用。
+                            "enabled": plugin.enabled,
+                        })
                     })
-                })
-                .collect();
+                    .collect();
             write_or_fatal(
                 state,
                 id.clone(),

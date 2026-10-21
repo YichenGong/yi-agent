@@ -38,10 +38,27 @@ import type { RpcClient } from "../lib/rpc";
  */
 export function useBoardState({
   clientRef,
+  kanbanEnabled = true,
 }: {
   /** App 的 RPC 客户端槽：`boardRpc` 从这里取客户端（只闭合它，故空依赖即稳定）。 */
   clientRef: RefObject<RpcClient | null>;
+  /**
+   * 整个看板功能是否开启（`flags/list` 里的 `superpowers_kanban`）。
+   *
+   * 关着时这里**一个请求都不发**：daemon 已被开关停掉，任何 `plugin/query`
+   * 都只会等超时再回来，徒增 2 秒一拍的噪声。缺省 `true` 保留既有用法语义。
+   */
+  kanbanEnabled?: boolean;
 }) {
+  // 守卫读的是**最新**开关值而不是闭包里的那一份。
+  //
+  // 握手是一条长 async 函数：它读到 `flags/list` 后 `setKanbanEnabled(true)`，
+  // 但那一轮闭包（含它末尾那句 `refreshBoards()`）仍然持有 `false`。用闭包值
+  // 守卫就会把握手末尾这次**唯一合法时机**的读也挡掉——那时 `initialize` 刚
+  // 成功，早于此的读会被服务端以 `not_initialized` 拒绝。
+  const kanbanEnabledRef = useRef(kanbanEnabled);
+  kanbanEnabledRef.current = kanbanEnabled;
+
   const [boardOn, setBoardOn] = useState(false);
   const [boardSource, setBoardSource] = useState<SwitchSource>("default");
   const [boardCards, setBoardCards] = useState<BoardCard[]>([]);
@@ -102,6 +119,12 @@ export function useBoardState({
    * （条目照画，摘要留空）。整张表读不到才当作没有看板——侧栏据此不画条目。
    */
   const refreshBoards = useCallback(async () => {
+    // 关着就清空并返回：留着旧条目会让侧栏画出点不动的看板。
+    if (!kanbanEnabledRef.current) {
+      setBoards([]);
+      setBoardSummaries({});
+      return;
+    }
     try {
       const list = await listBoards(boardRpc);
       setBoards(list);
@@ -131,6 +154,11 @@ export function useBoardState({
    * 真正需要用户知道的失败是**写入**失败。
    */
   const refreshSelectedBoard = useCallback(async () => {
+    if (!kanbanEnabledRef.current) {
+      setBoardCards([]);
+      setBoardPluginMissing(false);
+      return;
+    }
     if (selectedBoard === null) {
       setBoardCards([]);
       setBoardPluginMissing(false);
@@ -161,10 +189,17 @@ export function useBoardState({
     // 瞬间在途的那一拍。
     // 一拍要同时刷选中看板与侧栏摘要：摘要若只在握手时读一次，侧栏会一直
     // 停在旧值，看起来像「什么都没在跑」。
+    // 关着就不挂计时器：`makeBoardTick` 自己也会 2 秒一拍地叫醒这两个读法。
+    // 这里读 state 而不是 ref：开关翻转必须让本 effect 重跑，才能起停计时器。
+    if (!kanbanEnabled) return;
     boardTick.current = makeBoardTick(refreshSelectedBoard, refreshBoards);
     // 选中项目一落地就读一次，不等下一拍轮询：否则点开看板会有最多 2 秒的空面板。
     void refreshSelectedBoard();
-  }, [refreshSelectedBoard, refreshBoards]);
+    // 登记表也读一次。开关是握手时才读回来的，握手那一轮里 `kanbanEnabled` 还是
+    // `false`（`null` 按关处理），App 那一次 `refreshBoards()` 会被下面的守卫挡掉；
+    // 开关翻上来后本 effect 重跑，这一行才是真正把条目拉回来的那次。
+    void refreshBoards();
+  }, [refreshSelectedBoard, refreshBoards, kanbanEnabled]);
 
   return {
     // state：看板页与侧栏直接消费的十一项。

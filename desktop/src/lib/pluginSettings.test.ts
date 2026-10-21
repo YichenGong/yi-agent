@@ -19,7 +19,14 @@ describe("pluginSettings", () => {
       plugins: [{ name: "superpowers-kanban", queryable: true, switch_key: "superpowers_kanban" }],
     });
     expect(await listPlugins(rpc as unknown as Rpc)).toEqual([
-      { name: "superpowers-kanban", queryable: true, switchKey: "superpowers_kanban" },
+      {
+        name: "superpowers-kanban",
+        queryable: true,
+        switchKey: "superpowers_kanban",
+        // 旧宿主不回 `enabled`：不知道就按"在跑"，否则升级前的宿主上每个插件
+        // 都会显示成已停用。
+        enabled: true,
+      },
     ]);
   });
 
