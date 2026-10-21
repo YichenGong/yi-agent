@@ -1727,3 +1727,37 @@ describe("会话分组框", () => {
     expect(container.querySelectorAll('[data-pinned-row]').length).toBe(1);
   });
 });
+
+describe("多选操作条的视觉一致性", () => {
+  // 侧栏的块级控件（「+ New thread」、搜索框）统一 `rounded-md`（6px）。
+  // 新建组按钮是同一列的整宽按钮，用 `rounded`（4px）会显得比上下文更"锐"，
+  // 与相邻控件对不齐。这条静态门禁把「同一套圆角」钉住。
+  const selectionButton = (overrides: Partial<ComponentProps<typeof ThreadSidebar>> = {}) => {
+    const threads: ThreadSummary[] = [
+      thread("a", "A", "/work/projA"),
+      thread("b", "B", "/work/projA"),
+    ];
+    renderSidebar({ groups: [{ workspace: "/work/projA", exists: true, threads }], ...overrides });
+    fireEvent.click(screen.getByText("A"), { ctrlKey: true });
+    fireEvent.click(screen.getByText("B"), { ctrlKey: true });
+    return document.querySelector<HTMLButtonElement>("[data-selection-bar] button")!;
+  };
+
+  it("新建组按钮与侧栏其它块级控件同圆角（rounded-md）", () => {
+    const btn = selectionButton();
+    expect(btn.textContent).toContain("新建组（2）");
+    expect(btn.className).toContain("rounded-md");
+    // 不带裸 `rounded`（4px）——它会被 Tailwind 按类名顺序覆盖成更小的圆角。
+    expect(btn.className.split(/\s+/)).not.toContain("rounded");
+  });
+
+  it("输入态的两个输入框也是 rounded-md", () => {
+    selectionButton();
+    fireEvent.click(document.querySelector<HTMLButtonElement>("[data-selection-bar] button")!);
+    for (const sel of ["[data-new-group-name]", "[data-new-group-description]"]) {
+      const el = document.querySelector<HTMLInputElement>(sel)!;
+      expect(el.className).toContain("rounded-md");
+      expect(el.className.split(/\s+/)).not.toContain("rounded");
+    }
+  });
+});

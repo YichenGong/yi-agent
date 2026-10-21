@@ -1388,7 +1388,7 @@ export function ThreadSidebar({
               }
               if (e.key === "Escape") setNewGroup(null);
             }}
-            className="rounded bg-raised px-1 py-0.5 text-sm text-fg outline-none"
+            className="w-full rounded-md border border-line bg-surface px-2 py-1.5 text-sm text-fg placeholder:text-fg-faint outline-none focus:border-fg-subtle"
           />
           <input
             data-new-group-description=""
@@ -1396,20 +1396,20 @@ export function ThreadSidebar({
             maxLength={GROUP_DESCRIPTION_MAX}
             value={newGroup.description}
             onChange={(e) => setNewGroup({ ...newGroup, description: e.target.value })}
-            className="rounded bg-raised px-1 py-0.5 text-xs text-fg-muted outline-none"
+            className="w-full rounded-md border border-line bg-surface px-2 py-1.5 text-xs text-fg-muted placeholder:text-fg-faint outline-none focus:border-fg-subtle"
           />
           <div className="flex gap-2">
             <button
               type="button"
               onClick={() => void submitNewGroup()}
-              className="rounded bg-raised px-2 py-0.5 text-xs text-fg"
+              className="rounded-md bg-raised px-3 py-1 text-xs text-fg hover:bg-raised/80"
             >
               创建
             </button>
             <button
               type="button"
               onClick={() => setNewGroup(null)}
-              className="rounded px-2 py-0.5 text-xs text-fg-subtle"
+              className="rounded-md px-3 py-1 text-xs text-fg-subtle hover:text-fg"
             >
               取消
             </button>
@@ -1430,7 +1430,7 @@ export function ThreadSidebar({
             }
             setNewGroup({ workspace: owner, name: "", description: "" });
           }}
-          className="w-full rounded bg-raised px-2 py-1 text-xs text-fg"
+          className="w-full rounded-md bg-raised px-3 py-2 text-sm text-fg hover:bg-raised/80"
         >
           新建组（{selected.size}）
         </button>
