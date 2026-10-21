@@ -63,7 +63,10 @@ const LEAD_TICK: Duration = Duration::from_secs(30);
 /// 会话误认成「这条 digest 的来源会话」。
 const LEAD_LOOP_SENDER: &str = "lead-loop";
 
-/// 首轮 LLM 标题生成的超时:超时即回退兜底标题，绝不卡住 turn 收尾。
+/// 首轮 LLM 标题生成的后台任务超时:超时即回退兜底标题。
+///
+/// 这个上限保护的是**后台标题任务**本身（不让它无限期挂着一个 task），与 turn
+/// 收尾无关——标题生成已不在收尾路径上，超时与否都不影响 turn 完成。
 const TITLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 标签显示名的长度上限。必须与前端 `desktop/src/lib/threadTags.ts` 的
@@ -4575,8 +4578,13 @@ async fn persist_and_finish_turn(
 /// 助手回复」收敛成「只取用户输入」——此刻助手还没有任何输出。
 ///
 /// 触发条件是 `ThreadStore::touch` 返回 `true`（meta 的 title 由 `None` 变成兜底
-/// 截断值）。组长会话与插件驱动会话创建时标题已非空，因此天然不触发；手动改名
-/// 之后 title 也非空，同样不会重新生成。
+/// 截断值）。组长会话（`is_lead_meta`）被 `touch` 直接跳过；插件驱动会话创建时
+/// 标题已非空，因此天然不触发；手动改名之后 title 也非空，同样不会重新生成——
+/// 一旦标题非空，`touch` 永不再返回 `true`，这条路径对同一会话只会有一次。
+///
+/// 材料只有用户输入（`prompt`，即 `display_text` 原话，不含附件清单）。因此
+/// 纯图片 / 纯附件消息（`display_text` 为空）没有可用材料，不会生成标题，
+/// 会话保留兜底或空标题。
 ///
 /// **不得阻塞 driver**：调用方负责 `tokio::spawn`，本函数只做生成 → 清洗 → CAS
 /// → 广播，任何失败都静默保留兜底标题（标题是锦上添花，绝不能影响 turn）。

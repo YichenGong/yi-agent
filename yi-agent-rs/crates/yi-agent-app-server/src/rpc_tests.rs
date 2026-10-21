@@ -12704,15 +12704,20 @@ async fn failed_title_generation_broadcasts_no_title_change() {
 
 /// 标题必须在**用户输入落地时**生成，而不是等本轮结束。
 ///
-/// 用的 provider 让对话轮刻意慢 400ms、标题轮秒回：若实现仍把标题生成挂在
-/// `persist_and_finish_turn`（本轮收尾），`thread/titleChanged` 必然晚于
-/// `turn/completed`。断言它先到，就是在钉「不等 session 结束」这条要求本身。
+/// 顺序不靠 sleep 赌：对话轮的 provider 会卡在 `title_written` 上，测试只有读到
+/// `thread/titleChanged` 才放行它。于是「标题先到」是被构造出来的因果——
+/// 只要实现把标题挂在 turn 收尾之后，两边互等就会超时失败。
 #[tokio::test(flavor = "multi_thread")]
 async fn first_turn_broadcasts_llm_title_change() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut cfg = test_config();
     cfg.workdir = dir.path().to_path_buf();
-    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(SlowConversationTitleProvider);
+    let title_seen = Arc::new(tokio::sync::Notify::new());
+    let title_written = Arc::new(tokio::sync::Notify::new());
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(GatedByTitleProvider {
+        title_seen: Arc::clone(&title_seen),
+        title_written: Arc::clone(&title_written),
+    });
     let mut h = Harness::with_config(
         cfg,
         move |session, cwd, mode| {
@@ -12729,9 +12734,13 @@ async fn first_turn_broadcasts_llm_title_change() {
     ))
     .await;
 
-    // 标题生成发生在 turn **开始**时（用户输入一落地就发起），与 turn 并行，因此
-    // `thread/titleChanged` 必须先于 `turn/completed` 到达：这正是本次改动的
-    // 目的——用户不必等整轮跑完才在侧栏看到有意义的标题。
+    // 先握手：标题请求确实到达过，证明这条路径被走到（而不是压根没生成）。
+    tokio::time::timeout(EVENT_WAIT, title_seen.notified())
+        .await
+        .expect("a title request must reach the provider");
+
+    // 标题生成发生在 turn **开始**时（用户输入一落地就发起），与 turn 并行，
+    // 因此 `thread/titleChanged` 必须先于 `turn/completed` 到达。
     let mut saw_title_change = None;
     for _ in 0..40 {
         let v = h.read_value().await;
@@ -12746,6 +12755,8 @@ async fn first_turn_broadcasts_llm_title_change() {
             _ => {}
         }
     }
+    // 放行对话轮，避免后台任务长期悬挂。
+    title_written.notify_one();
     let ev = saw_title_change.expect("expected a thread/titleChanged notification");
     assert_eq!(ev["params"]["thread_id"], tid);
     assert_eq!(
@@ -12755,14 +12766,25 @@ async fn first_turn_broadcasts_llm_title_change() {
     h.shutdown().await;
 }
 
-/// 对话轮慢 400ms、标题轮立即返回的 provider。
+/// 「对话轮等标题落盘」的 provider：用信号量取代 sleep，让顺序断言确定。
 ///
-/// 用来证明标题生成本身不依赖 turn 收尾：只要实现仍把标题挂在收尾处，
-/// `thread/titleChanged` 就会排在 `turn/completed` 之后而被本用例抓住。
-struct SlowConversationTitleProvider;
+/// 旧的写法让对话轮 `sleep(400ms)` 来赌标题任务先跑完，宿主机负载高时
+/// spawn 出的标题任务可能被推迟，测试就会偶发失败。这里改为显式握手：
+/// 标题请求到达后置 `title_seen`；对话请求在返回前 `await` `title_written`
+/// （由测试在读到 `thread/titleChanged` 后放行）。
+///
+/// 这样「`titleChanged` 先于 `turn/completed`」不再是时序赌博，而是被构造出来的
+/// 因果：对话轮不返回，turn 就不可能收尾。若实现仍把标题挂在收尾之后，
+/// 两边互等会直接超时失败，同样能抓住回归。
+struct GatedByTitleProvider {
+    /// 标题请求已到达（测试据此判断手已经握上）。
+    title_seen: Arc<tokio::sync::Notify>,
+    /// 允许对话轮返回。
+    title_written: Arc<tokio::sync::Notify>,
+}
 
 #[async_trait]
-impl yi_agent_core::Provider for SlowConversationTitleProvider {
+impl yi_agent_core::Provider for GatedByTitleProvider {
     async fn call_stream(
         &self,
         req: yi_agent_core::provider::ProviderRequest,
@@ -12771,6 +12793,7 @@ impl yi_agent_core::Provider for SlowConversationTitleProvider {
         yi_agent_core::provider::ProviderError,
     > {
         if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            self.title_seen.notify_one();
             return Ok(Box::pin(futures::stream::iter(vec![
                 yi_agent_core::provider::ProviderEvent::TextDelta("修复登录报错".into()),
                 yi_agent_core::provider::ProviderEvent::Stop {
@@ -12778,7 +12801,8 @@ impl yi_agent_core::Provider for SlowConversationTitleProvider {
                 },
             ])));
         }
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        // 等到测试确认 `thread/titleChanged` 已到达才结束本轮。
+        self.title_written.notified().await;
         Ok(Box::pin(futures::stream::iter(vec![
             yi_agent_core::provider::ProviderEvent::TextDelta("ok".into()),
             yi_agent_core::provider::ProviderEvent::Stop {
@@ -12931,6 +12955,328 @@ async fn second_turn_does_not_regenerate_the_title() {
         title_calls.load(Ordering::SeqCst),
         1,
         "title must be generated exactly once"
+    );
+    h.shutdown().await;
+}
+
+/// 插件驱动会话（标题创建时已写入、且非组长）**不得**调用标题模型。
+///
+/// 这条钉的是 `ThreadStore::touch` 里的 `meta.title.is_none()` 判据：若该条件被
+/// 放宽，已命名的会话会在每轮首输入时被重新命名，覆盖用户自己起的名字。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_that_already_has_a_title_never_calls_the_title_model() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let tid = "thread-with-title";
+    // 非组长、标题已存在：插件驱动会话的真实形态。
+    write_meta(
+        dir.path(),
+        tid,
+        "my-app 组长",
+        Some("my-app"),
+        Some("refs/heads/main"),
+    );
+
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CountingTitleProvider {
+        title_calls: Arc::clone(&title_calls),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let resumed = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    assert!(
+        resumed.get("error").is_none(),
+        "resume must succeed: {resumed}"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+    ))
+    .await;
+    let _ = read_until_method(&mut h, "turn/completed").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        title_calls.load(Ordering::SeqCst),
+        0,
+        "a thread that already has a title must not be renamed"
+    );
+    let loaded = crate::thread_store::ThreadStore::new(dir.path())
+        .load(tid)
+        .ok()
+        .flatten()
+        .expect("meta must survive");
+    assert_eq!(loaded.meta.title.as_deref(), Some("my-app 组长"));
+    h.shutdown().await;
+}
+
+/// 组长会话即便标题为空也不生成标题（`is_lead_meta` 这条分支本身的判据）。
+///
+/// 真机出现过 9 例「幽灵组长」（`ask_lead` 懒创建、未命名）。若只用「标题已存在」
+/// 来挡，这类会话会被误当成首轮而改名；这条用例把 `role:"lead"` 单独钉住。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lead_thread_never_calls_the_title_model_even_without_a_title() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let tid = "thread-ghost-lead";
+    {
+        let store = crate::thread_store::ThreadStore::new(dir.path());
+        store
+            .create(&crate::thread_store::ThreadMeta {
+                thread_id: tid.into(),
+                cwd: dir.path().to_string_lossy().into(),
+                model: "m".into(),
+                created_at: 0,
+                updated_at: 0,
+                title: None,
+                permission_mode: crate::thread_store::ThreadMode::Normal,
+                pin_seq: None,
+                driver_project: None,
+                driver_ref: None,
+                model_ref: None,
+                reasoning_effort: None,
+                tag: None,
+                preserve_thinking: true,
+                content_epoch: 0,
+                last_item_id: None,
+                anchor_sha: None,
+                extra_roots: Vec::new(),
+                role: Some(crate::thread_store::LEAD_ROLE.into()),
+            })
+            .unwrap();
+    }
+
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CountingTitleProvider {
+        title_calls: Arc::clone(&title_calls),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"thread/resume","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let resumed = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(2)))
+        .await;
+    assert!(
+        resumed.get("error").is_none(),
+        "resume must succeed: {resumed}"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+    ))
+    .await;
+    let _ = read_until_method(&mut h, "turn/completed").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        title_calls.load(Ordering::SeqCst),
+        0,
+        "lead threads must never be auto-renamed"
+    );
+    // `touch` 对组长直接跳过，连兜底标题都不写。
+    let loaded = crate::thread_store::ThreadStore::new(dir.path())
+        .load(tid)
+        .ok()
+        .flatten()
+        .expect("meta must survive");
+    assert_eq!(loaded.meta.title, None, "lead meta must stay untitled");
+    h.shutdown().await;
+}
+
+/// 标题生成期间用户手动改名：CAS 必须让手写标题胜出。
+///
+/// 时间窗是真实构造的：标题 provider 停在 `release_title` 上，测试在窗口内发
+/// `thread/rename`。若 `generate_title_for_first_input` 把 CAS 退回无条件
+/// `rename`，手写标题会被覆盖成「自动标题」，本用例即失败。
+///
+/// 注意：不要在等 rename 响应时用 `read_matching`——它会丢弃通知帧，把随后
+/// 要等的 `turn/completed` 一起吞掉。这里用单循环同时处理两种帧。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_rename_during_generation_wins_over_the_generated_title() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let title_seen = Arc::new(tokio::sync::Notify::new());
+    let release_title = Arc::new(tokio::sync::Notify::new());
+    let title_returned = Arc::new(tokio::sync::Notify::new());
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(TitleBlockingProvider {
+        title_seen: Arc::clone(&title_seen),
+        release_title: Arc::clone(&release_title),
+        title_returned: Arc::clone(&title_returned),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+    ))
+    .await;
+
+    // 标题生成已经发起并卡住：此刻是用户手写改名的真实窗口。
+    tokio::time::timeout(EVENT_WAIT, title_seen.notified())
+        .await
+        .expect("title generation must start before the rename window");
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":4,"method":"thread/rename","params":{{"threadId":"{tid}","title":"我的登录排查"}}}}"#
+    ))
+    .await;
+
+    // 单循环同时收两条关键帧：rename 响应（id=4）与 turn 收尾。
+    // 注意 `read_matching` 会丢弃通知帧，用它等 rename 会把 `turn/completed`
+    // 一起吞掉，故这里不用它。
+    let mut rename_ok = false;
+    let mut turn_done = false;
+    for _ in 0..60 {
+        if rename_ok && turn_done {
+            break;
+        }
+        let v = h.read_value().await;
+        if v.get("id") == Some(&serde_json::json!(4)) {
+            assert!(v.get("error").is_none(), "rename must succeed: {v}");
+            rename_ok = true;
+            // 手写标题已落盘，放行自动标题：CAS 应让它放弃覆盖。
+            release_title.notify_one();
+        } else if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            turn_done = true;
+        }
+    }
+    assert!(rename_ok, "rename response never arrived");
+
+    // 等标题任务真的返回。CAS 紧跟在生成之后，用一个有界的轮询给它落地时间
+    // （不断言中间态，只断言最终值；若被覆盖，最终值就是「自动标题」）。
+    tokio::time::timeout(EVENT_WAIT, title_returned.notified())
+        .await
+        .expect("title generation must finish once released");
+    let mut loaded = None;
+    for _ in 0..100 {
+        let meta = crate::thread_store::ThreadStore::new(dir.path())
+            .read_meta(&tid)
+            .ok()
+            .flatten();
+        let title = meta.as_ref().and_then(|m| m.title.clone());
+        loaded = meta;
+        // 只在「被覆盖」时提前退出：手写标题本来就已是当前值，看到它不代表
+        // CAS 已经跑完，提前 break 会让断言在 CAS 之前下结论。
+        if title.as_deref() == Some("自动标题") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let loaded = loaded.expect("meta must exist");
+    assert_eq!(loaded.title.as_deref(), Some("我的登录排查"));
+    h.shutdown().await;
+}
+
+/// 标题请求会卡在 `release_title` 上、对话轮立刻返回的 provider。
+struct TitleBlockingProvider {
+    title_seen: Arc<tokio::sync::Notify>,
+    release_title: Arc<tokio::sync::Notify>,
+    /// 标题文本即将返回（CAS 紧随其后）。
+    title_returned: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for TitleBlockingProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::provider::ProviderEvent as E;
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            self.title_seen.notify_one();
+            self.release_title.notified().await;
+            self.title_returned.notify_one();
+            return Ok(Box::pin(futures::stream::iter(vec![
+                E::TextDelta("自动标题".into()),
+                E::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            E::TextDelta("ok".into()),
+            E::Stop {
+                reason: yi_agent_core::provider::StopReason::EndTurn,
+            },
+        ])))
+    }
+}
+
+/// 纯图片输入（`display_text` 为空）不生成标题：没有可喂给标题模型的文本。
+///
+/// 这是刻意的边界，spec §4 的错误处理表已列明。用 `assert_eq!(.., 0)` 而不是
+/// 「标题为空」——后者在兜底标题恰好也没写入时会误通过。
+#[tokio::test(flavor = "multi_thread")]
+async fn image_only_input_does_not_generate_a_title() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let png = dir.path().join("shot.png");
+    image::RgbImage::from_fn(8, 8, |_, _| image::Rgb([7, 7, 7]))
+        .save_with_format(&png, image::ImageFormat::Png)
+        .unwrap();
+
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CountingTitleProvider {
+        title_calls: Arc::clone(&title_calls),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"image","path":"{}"}}]}}}}"#,
+        png.display()
+    ))
+    .await;
+    let _ = read_until_method(&mut h, "turn/completed").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        title_calls.load(Ordering::SeqCst),
+        0,
+        "an image-only message has no text to title from"
     );
     h.shutdown().await;
 }
