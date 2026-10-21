@@ -1606,11 +1606,22 @@ struct CheckpointProvider {
 impl yi_agent_core::Provider for CheckpointProvider {
     async fn call_stream(
         &self,
-        _req: yi_agent_core::provider::ProviderRequest,
+        req: yi_agent_core::provider::ProviderRequest,
     ) -> Result<
         futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
         yi_agent_core::provider::ProviderError,
     > {
+        // 标题请求不是对话轮：不参与下方按次数脚本化的计数，否则首轮会把
+        // 「第 0 次」让给标题调用，脚本化序列整体错位。
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(futures::stream::iter(vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("t".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])
+            .boxed());
+        }
         use yi_agent_core::provider::ProviderEvent as E;
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
@@ -3097,11 +3108,22 @@ struct GitDiffToolProvider {
 impl yi_agent_core::Provider for GitDiffToolProvider {
     async fn call_stream(
         &self,
-        _req: yi_agent_core::provider::ProviderRequest,
+        req: yi_agent_core::provider::ProviderRequest,
     ) -> Result<
         futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
         yi_agent_core::provider::ProviderError,
     > {
+        // 标题请求不是对话轮：不参与下方按次数脚本化的计数，否则首轮会把
+        // 「第 0 次」让给标题调用，脚本化序列整体错位。
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(futures::stream::iter(vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("t".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])
+            .boxed());
+        }
         use yi_agent_core::provider::{ProviderEvent as E, StopReason};
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let events = if n == 0 {
@@ -7576,8 +7598,6 @@ async fn a_turn_while_off_persists_without_credentials() {
         &store,
         &hub,
         &turn_tx,
-        &provider,
-        &config,
         &ThreadSession::new_status(),
     )
     .await;
@@ -7677,8 +7697,6 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
         &store,
         &hub,
         &turn_tx,
-        &provider,
-        &config,
         &ThreadSession::new_status(),
     )
     .await;
@@ -7947,11 +7965,22 @@ struct PermissionMockProvider {
 impl yi_agent_core::Provider for PermissionMockProvider {
     async fn call_stream(
         &self,
-        _req: yi_agent_core::provider::ProviderRequest,
+        req: yi_agent_core::provider::ProviderRequest,
     ) -> Result<
         futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
         yi_agent_core::provider::ProviderError,
     > {
+        // 标题请求不是对话轮：不参与下方按次数脚本化的计数，否则首轮会把
+        // 「第 0 次」让给标题调用，脚本化序列整体错位。
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(futures::stream::iter(vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("t".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])
+            .boxed());
+        }
         use yi_agent_core::provider::{ProviderEvent, StopReason};
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let events = if n == 0 {
@@ -12672,18 +12701,17 @@ async fn failed_title_generation_broadcasts_no_title_change() {
     h.shutdown().await;
 }
 
-/// 首轮 LLM 标题落盘后必须**主动广播** `thread/titleChanged`，携带权威标题。
+/// 标题必须在**用户输入落地时**生成，而不是等本轮结束。
 ///
-/// 这是本条修复的核心：`turn/completed` 早于标题落盘发出，桌面端在该通知触发
-/// 的 `refreshThreads()` 只能读到兜底截断标题；没有这条广播，LLM 标题要等到一次
-/// 无关的列表刷新才可见。断言的是**通知真的发出**且**带的是 LLM 标题**（而非
-/// 兜底值 `title_from("登录页报错了")`）。
+/// 用的 provider 让对话轮刻意慢 400ms、标题轮秒回：若实现仍把标题生成挂在
+/// `persist_and_finish_turn`（本轮收尾），`thread/titleChanged` 必然晚于
+/// `turn/completed`。断言它先到，就是在钉「不等 session 结束」这条要求本身。
 #[tokio::test(flavor = "multi_thread")]
 async fn first_turn_broadcasts_llm_title_change() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut cfg = test_config();
     cfg.workdir = dir.path().to_path_buf();
-    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(TitleProvider);
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(SlowConversationTitleProvider);
     let mut h = Harness::with_config(
         cfg,
         move |session, cwd, mode| {
@@ -12700,14 +12728,238 @@ async fn first_turn_broadcasts_llm_title_change() {
     ))
     .await;
 
-    // 标题生成排在 turn 收尾广播之后，故要读到它可能跨若干帧（状态、正文、完成）。
-    let ev = read_until_method(&mut h, "thread/titleChanged").await;
+    // 标题生成发生在 turn **开始**时（用户输入一落地就发起），与 turn 并行，因此
+    // `thread/titleChanged` 必须先于 `turn/completed` 到达：这正是本次改动的
+    // 目的——用户不必等整轮跑完才在侧栏看到有意义的标题。
+    let mut saw_title_change = None;
+    for _ in 0..40 {
+        let v = h.read_value().await;
+        match v.get("method").and_then(|m| m.as_str()) {
+            Some("thread/titleChanged") => {
+                saw_title_change = Some(v);
+                break;
+            }
+            Some("turn/completed") => {
+                panic!("titleChanged must arrive before turn/completed; got completion first: {v}")
+            }
+            _ => {}
+        }
+    }
+    let ev = saw_title_change.expect("expected a thread/titleChanged notification");
     assert_eq!(ev["params"]["thread_id"], tid);
     assert_eq!(
         ev["params"]["title"], "修复登录报错",
         "通知必须携带 LLM 标题，而不是兜底截断值"
     );
     h.shutdown().await;
+}
+
+/// 对话轮慢 400ms、标题轮立即返回的 provider。
+///
+/// 用来证明标题生成本身不依赖 turn 收尾：只要实现仍把标题挂在收尾处，
+/// `thread/titleChanged` 就会排在 `turn/completed` 之后而被本用例抓住。
+struct SlowConversationTitleProvider;
+
+#[async_trait]
+impl yi_agent_core::Provider for SlowConversationTitleProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            return Ok(Box::pin(futures::stream::iter(vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("修复登录报错".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])));
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        Ok(Box::pin(futures::stream::iter(vec![
+            yi_agent_core::provider::ProviderEvent::TextDelta("ok".into()),
+            yi_agent_core::provider::ProviderEvent::Stop {
+                reason: yi_agent_core::provider::StopReason::EndTurn,
+            },
+        ])))
+    }
+}
+
+/// 标题材料必须只取用户输入，不含助手回复。
+///
+/// 这是「输入完立刻生成」的直接后果：此刻助手还没产出任何文本。用捕获 provider
+/// 断言材料里只有「用户提问：」，没有「助手回复：」——否则实现可能悄悄退回旧口径。
+struct MaterialCapturingProvider {
+    materials: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for MaterialCapturingProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        use yi_agent_core::message::{ContentBlock, Role};
+        if req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS) {
+            if let Some(user) = req.messages.iter().find(|m| m.role == Role::User) {
+                let text = user
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                self.materials.lock().unwrap().push(text);
+            }
+            return Ok(Box::pin(futures::stream::iter(vec![
+                yi_agent_core::provider::ProviderEvent::TextDelta("即时标题".into()),
+                yi_agent_core::provider::ProviderEvent::Stop {
+                    reason: yi_agent_core::provider::StopReason::EndTurn,
+                },
+            ])));
+        }
+        Ok(Box::pin(futures::stream::iter(vec![
+            yi_agent_core::provider::ProviderEvent::TextDelta("好的，我看下。".into()),
+            yi_agent_core::provider::ProviderEvent::Stop {
+                reason: yi_agent_core::provider::StopReason::EndTurn,
+            },
+        ])))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn title_material_uses_only_the_user_input() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let materials = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(MaterialCapturingProvider {
+        materials: materials.clone(),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"登录页报错了"}}]}}}}"#
+    ))
+    .await;
+
+    let mut materials_seen = None;
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(first) = materials.lock().unwrap().first().cloned() {
+            materials_seen = Some(first);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let material = materials_seen.expect("title request must carry material");
+    assert!(
+        material.starts_with("用户提问：登录页报错了"),
+        "material must start from the user input: {material:?}"
+    );
+    assert!(
+        !material.contains("助手回复"),
+        "assistant side must be absent when generating right after input: {material:?}"
+    );
+    h.shutdown().await;
+}
+
+/// 只有首轮生成标题：第二次 `turn/start` 不得再调标题模型。
+#[tokio::test(flavor = "multi_thread")]
+async fn second_turn_does_not_regenerate_the_title() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let title_calls = Arc::new(AtomicUsize::new(0));
+    let provider: Arc<dyn yi_agent_core::Provider> = Arc::new(CountingTitleProvider {
+        title_calls: title_calls.clone(),
+    });
+    let mut h = Harness::with_config(
+        cfg,
+        move |session, cwd, mode| {
+            build_test_agent_with_provider(provider.clone(), session, cwd, mode)
+        },
+        PERMISSION_TIMEOUT,
+    );
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
+        .await;
+    let tid = read_thread_start_response(&mut h, 2).await;
+    for (idx, (id, text)) in [(3, "登录页报错了"), (4, "再看看别的")]
+        .into_iter()
+        .enumerate()
+    {
+        // 第二次 turn/start 可能撞上上一轮尚未释放的 `active_turn_id`（`turn/completed`
+        // 先于收尾发出），这不是产品缺陷：按 `-32012` 重试即可。
+        loop {
+            h.send(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"{text}"}}]}}}}"#
+            ))
+            .await;
+            let v = h.read_value().await;
+            match v.get("error") {
+                None => break,
+                Some(_) if idx == 0 => panic!("first turn must start: {v}"),
+                Some(err) if err["code"] == -32012 => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Some(_) => panic!("unexpected turn/start error: {v}"),
+            }
+        }
+        let _ = read_until_method(&mut h, "turn/completed").await;
+    }
+    // 给可能迟到的第二次标题请求留一个短窗口：若实现按轮生成，这里会变 2。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        title_calls.load(Ordering::SeqCst),
+        1,
+        "title must be generated exactly once"
+    );
+    h.shutdown().await;
+}
+
+/// 计数的标题 provider：标题请求返回固定标题并 +1，正文返回 "ok"。
+struct CountingTitleProvider {
+    title_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl yi_agent_core::Provider for CountingTitleProvider {
+    async fn call_stream(
+        &self,
+        req: yi_agent_core::provider::ProviderRequest,
+    ) -> Result<
+        futures::stream::BoxStream<'static, yi_agent_core::provider::ProviderEvent>,
+        yi_agent_core::provider::ProviderError,
+    > {
+        let is_title = req.system.as_deref() == Some(yi_agent_core::title::TITLE_INSTRUCTIONS);
+        if is_title {
+            self.title_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        let text = if is_title { "即时标题" } else { "ok" };
+        Ok(Box::pin(futures::stream::iter(vec![
+            yi_agent_core::provider::ProviderEvent::TextDelta(text.into()),
+            yi_agent_core::provider::ProviderEvent::Stop {
+                reason: yi_agent_core::provider::StopReason::EndTurn,
+            },
+        ])))
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
