@@ -221,16 +221,16 @@ impl Board {
         self.cards.is_empty()
     }
 
+    /// 本看板内占着会话槽的卡片数。
+    ///
+    /// **不再参与配额判定**：限的是全机总流量，看板内的数只是全局数的一个子集，
+    /// 拿它去减峰值会把同一批会话扣两遍（见 `claim_next_launch`）。
+    /// 留着是因为对账、迁移与测试都要看「本看板有几个在跑」。
     pub fn running_count(&self) -> usize {
         self.cards
             .iter()
             .filter(|card| card.state.occupies_slot())
             .count()
-    }
-
-    /// 当前还有多少空槽位。`limit` 已由并发日历按时段算好。
-    pub fn free_slots(&self, limit: u16) -> usize {
-        (limit as usize).saturating_sub(self.running_count())
     }
 
     /// 记下某张卡片会话要跑在哪个 worktree。插件在启动前调用。
@@ -299,10 +299,16 @@ impl Board {
         Ok(())
     }
 
+    /// 认领下一张排队卡：`budget` 是**调用方已算好的可用额度**。
+    ///
+    /// `budget` 的含义是「全机还能再起几个会话」（全局峰值 − 全机运行数），
+    /// 由 `BoardService::next_launch` 从宿主上报的计数算出。这里**不得**再减一次
+    /// 看板内的 `running_count()`：那批会话已经算在全机运行数里了。
+    ///
     /// 只认领实现卡的会话通路：合并卡走的是合并轮（`driver_step` 的候选集，
     /// 见 `superpowers_kanban_runner`），绝不能经这里启动。
-    pub fn claim_next_launch(&mut self, limit: u16) -> Option<CardId> {
-        if self.free_slots(limit) == 0 {
+    pub fn claim_next_launch(&mut self, budget: usize) -> Option<CardId> {
+        if budget == 0 {
             return None;
         }
         let next = self.next_startable()?;
@@ -350,23 +356,6 @@ impl Board {
             .collect();
         queued.sort_by_key(|card| card.order);
         queued.into_iter().map(|card| card.id.clone()).collect()
-    }
-
-    /// 在 `limit` 之内启动尽可能多的排队卡片，返回本次启动的卡片（按启动顺序）。
-    pub fn start_due(&mut self, limit: u16) -> Vec<CardId> {
-        let mut started = Vec::new();
-        while self.free_slots(limit) > 0 {
-            let Some(next) = self.next_startable() else {
-                break;
-            };
-            if let Some(card) = self.cards.iter_mut().find(|card| card.id == next) {
-                card.state = CardState::Running;
-                started.push(next);
-            } else {
-                break;
-            }
-        }
-        started
     }
 
     /// 迁移一张卡片的状态，非法迁移一律拒绝且不改动队列。
@@ -586,6 +575,23 @@ mod tests {
         );
     }
 
+    /// 测试用的「按槽位批量启动」：`limit` 是**本看板**的槽位总数。
+    ///
+    /// 生产路径已不再这样判定（配额看全机余量，见 `claim_next_launch`），
+    /// 但状态机本身的语义——Running 占槽、离开 Running 立刻腾槽——仍然成立，
+    /// 这些既有测试要的正是那部分语义。
+    fn start_due(board: &mut Board, limit: usize) -> Vec<CardId> {
+        let mut started = Vec::new();
+        while board.running_count() < limit {
+            let Some(next) = board.next_startable() else {
+                break;
+            };
+            board.transition(&next, CardState::Running).unwrap();
+            started.push(next);
+        }
+        started
+    }
+
     fn at(day: u32, hour: u32) -> chrono::DateTime<Local> {
         Local
             .with_ymd_and_hms(2026, 10, day, hour, 0, 0)
@@ -609,7 +615,7 @@ mod tests {
     #[test]
     fn starts_the_oldest_queued_card_first() {
         let mut board = board_with(&["a", "b", "c"]);
-        let started = board.start_due(2);
+        let started = start_due(&mut board, 2);
         assert_eq!(
             started,
             vec![CardId::new("a"), CardId::new("b")],
@@ -620,9 +626,9 @@ mod tests {
     #[test]
     fn never_exceeds_the_slot_limit() {
         let mut board = board_with(&["a", "b", "c"]);
-        board.start_due(1);
+        start_due(&mut board, 1);
         assert_eq!(board.running_count(), 1);
-        board.start_due(1);
+        start_due(&mut board, 1);
         assert_eq!(
             board.running_count(),
             1,
@@ -633,23 +639,23 @@ mod tests {
     #[test]
     fn when_a_running_card_finishes_its_slot_is_reused_by_the_next() {
         let mut board = board_with(&["a", "b", "c"]);
-        board.start_due(1);
+        start_due(&mut board, 1);
         board
             .transition(&CardId::new("a"), CardState::AwaitingMerge)
             .unwrap();
-        assert_eq!(board.free_slots(1), 1);
-        assert_eq!(board.start_due(1), vec![CardId::new("b")]);
+        assert_eq!(board.running_count(), 0, "跑完的卡不再占槽");
+        assert_eq!(start_due(&mut board, 1), vec![CardId::new("b")]);
     }
 
     #[test]
     fn needs_you_does_not_hold_the_queue_back() {
         let mut board = board_with(&["a", "b"]);
-        board.start_due(1);
+        start_due(&mut board, 1);
         board
             .transition(&CardId::new("a"), CardState::NeedsYou)
             .unwrap();
         assert_eq!(
-            board.start_due(1),
+            start_due(&mut board, 1),
             vec![CardId::new("b")],
             "a blocked card frees its slot immediately"
         );
@@ -680,11 +686,11 @@ mod tests {
     #[test]
     fn a_terminal_card_is_never_started_again() {
         let mut board = board_with(&["a", "b"]);
-        board.start_due(1);
+        start_due(&mut board, 1);
         board
             .transition(&CardId::new("a"), CardState::Failed)
             .unwrap();
-        board.start_due(1);
+        start_due(&mut board, 1);
         assert_eq!(
             board.get(&CardId::new("a")).unwrap().state,
             CardState::Failed
@@ -698,7 +704,7 @@ mod tests {
     #[test]
     fn a_paused_card_returns_to_the_queue() {
         let mut board = board_with(&["a"]);
-        board.start_due(1);
+        start_due(&mut board, 1);
         board
             .transition(&CardId::new("a"), CardState::Paused)
             .unwrap();
@@ -706,14 +712,14 @@ mod tests {
         board
             .transition(&CardId::new("a"), CardState::Queued)
             .unwrap();
-        assert_eq!(board.start_due(1), vec![CardId::new("a")]);
+        assert_eq!(start_due(&mut board, 1), vec![CardId::new("a")]);
     }
 
     #[test]
     fn a_board_survives_a_serialization_round_trip() {
         // 控制面靠这个文件渲染看板：队列必须能完整地写出去再读回来。
         let mut board = board_with(&["a", "b"]);
-        board.start_due(1);
+        start_due(&mut board, 1);
         board
             .set_workdir(&CardId::new("a"), PathBuf::from("/w/a"))
             .unwrap();
@@ -932,7 +938,7 @@ mod tests {
         // 拿转移合法性当守卫，一次 id 搞错的提升就会覆写真卡的 spec/plan 并把它
         // 甩到队尾——静默数据丢失。这里把「拒绝且原封不动」钉死。
         let mut board = board_with(&["a", "b"]);
-        board.start_due(1); // a -> Running
+        start_due(&mut board, 1); // a -> Running
         board
             .transition(&CardId::new("a"), CardState::NeedsYou)
             .unwrap();
@@ -964,7 +970,7 @@ mod tests {
 
         // Paused 同样必须被拒（`(Paused, Queued)` 也是合法边）。
         let mut board = board_with(&["c"]);
-        board.start_due(1); // c -> Running
+        start_due(&mut board, 1); // c -> Running
         board
             .transition(&CardId::new("c"), CardState::Paused)
             .unwrap();

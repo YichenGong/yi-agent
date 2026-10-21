@@ -210,7 +210,7 @@ impl ConcurrencyCalendar {
     }
 
     /// 当前用户的 home。与 `layout` 的解析口径一致（空值等于没有）。
-    pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
+    pub fn home_dir() -> Option<std::path::PathBuf> {
         std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .map(std::path::PathBuf::from)
@@ -653,7 +653,7 @@ max_tasks = 10
         )
         .unwrap();
         assert_eq!(
-            ConcurrencyCalendar::load_preferring_new(dir.path()).default_max_tasks,
+            ConcurrencyCalendar::load_project(dir.path()).default_max_tasks,
             10
         );
     }
@@ -663,7 +663,7 @@ max_tasks = 10
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("kanban.toml"), "default_max_tasks = 3\n").unwrap();
         assert_eq!(
-            ConcurrencyCalendar::load_preferring_new(dir.path()).default_max_tasks,
+            ConcurrencyCalendar::load_project(dir.path()).default_max_tasks,
             3
         );
     }

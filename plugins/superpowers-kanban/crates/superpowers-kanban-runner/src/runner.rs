@@ -15,11 +15,17 @@ pub fn state_for_task_state(task_state: &str) -> Option<CardState> {
     }
 }
 
-/// How many cards to start now, in FIFO order, without mutating the board.
+/// Which cards to start now, in FIFO order, without mutating the board.
+///
+/// `budget` is the **machine-wide** free capacity (global peak minus the
+/// sessions already running anywhere in the host process), already computed by
+/// the caller. It is deliberately not reduced by this board's own
+/// `running_count`: those sessions are part of the machine-wide count, so
+/// subtracting them here would charge them twice.
+///
 /// Pure so the scheduling rule is testable without a daemon.
-pub fn plan_launches(board: &Board, limit: u16) -> Vec<CardId> {
-    let free = board.free_slots(limit);
-    board.queued_in_order().into_iter().take(free).collect()
+pub fn plan_launches(board: &Board, budget: usize) -> Vec<CardId> {
+    board.queued_in_order().into_iter().take(budget).collect()
 }
 
 #[cfg(test)]
@@ -68,14 +74,27 @@ mod tests {
     }
 
     #[test]
-    fn a_running_card_occupies_one_slot_so_two_more_launch_under_a_limit_of_three() {
+    fn a_running_card_does_not_shrink_the_budget_again() {
+        // `budget` 已经是全机余量：看板内那张 Running 卡也被宿主算进了全机运行
+        // 数里，所以 caller 给出 2 就是「还能起 2 个」，不能再减。
         let mut board = board_with(&["a", "b", "c"]);
-        board.start_due(1);
+        board
+            .transition(&CardId::new("a"), CardState::Running)
+            .unwrap();
         assert_eq!(board.running_count(), 1, "only 'a' is running");
         assert_eq!(
-            plan_launches(&board, 3),
+            plan_launches(&board, 2),
             vec![CardId::new("b"), CardId::new("c")],
-            "one slot is taken, so two of the three remain"
+            "余量由调用方算好，这里不重复扣减"
+        );
+    }
+
+    #[test]
+    fn a_zero_budget_plans_nothing_even_with_a_full_queue() {
+        let board = board_with(&["a", "b"]);
+        assert!(
+            plan_launches(&board, 0).is_empty(),
+            "全机没有余量时一个都不许起"
         );
     }
 

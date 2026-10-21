@@ -49,7 +49,7 @@ fn effective_interval(cli: Option<Duration>, state_dir: &std::path::Path) -> Dur
     if let Some(cli) = cli {
         return cli;
     }
-    let secs = ConcurrencyCalendar::load_preferring_new(state_dir).interval_secs;
+    let secs = ConcurrencyCalendar::load_merged(state_dir).interval_secs;
     Duration::from_secs(secs)
 }
 
@@ -989,7 +989,7 @@ fn start_query_server(service: Arc<BoardService>, state_dir: &std::path::Path) -
 /// 里认领队首卡并交出通用动作（起会话 / 追加一轮），宿主只负责执行。插件在这里
 /// 只消费 inbox 把卡排进队列、收敛已并入的分支、归档终点卡，并落盘。
 fn run_daemon(args: Args) {
-    let calendar = ConcurrencyCalendar::load_preferring_new(&args.state_dir);
+    let calendar = ConcurrencyCalendar::load_merged(&args.state_dir);
     // 单实例：同一项目同一时刻只有一个插件推进队列。拿不到锁就在有界预算内
     // 重试，超时即让位退出——旧的无限等待会留下永不推进也不退出的空转进程。
     // 锁必须在函数存活期间一直持有：`_lock` 绑在这里，函数结束才 drop。

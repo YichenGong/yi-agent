@@ -213,6 +213,11 @@ pub struct BoardService {
     /// 通用常驻登记目录（`$HOME/.yi-agent`）。`home` 注入时为 `<home>/.yi-agent`，
     /// 于是测试不必碰真实 `$HOME`（与 `leases_dir` 同一手法）。
     resident_dir: Option<PathBuf>,
+    /// 全局配置所在的 home：`<home>/.yi-agent/plugins/superpowers-kanban/`。
+    ///
+    /// 注入后**不读**真实 `$HOME`——否则测试会读到跑测试那台机器上的真实配额，
+    /// 结果随环境而变。`None` 时才回退到真实 `HOME`。
+    home: Option<PathBuf>,
     inner: Mutex<Inner>,
 }
 
@@ -238,6 +243,7 @@ impl BoardService {
             .map(|home| home.join(".yi-agent"))
             .or_else(resident::default_dir);
         let leases_dir = home
+            .as_ref()
             .map(|home| {
                 home.join(".yi-agent")
                     .join("superpowers-kanban")
@@ -248,6 +254,7 @@ impl BoardService {
             state_dir,
             project_root,
             resident_dir,
+            home,
             inner: Mutex::new(Inner {
                 leases: Default::default(),
                 leases_dir,
@@ -293,6 +300,7 @@ impl BoardService {
         &self,
         threads: &[(String, bool)],
         results: &[DriverResult],
+        sessions_running: Option<u32>,
     ) -> Result<Option<DriverAction>, String> {
         // 前置检查必须**早于**消费回报：拿不到全局租约目录时 `next_launch` 只会
         // 整拍报错，而错误会让宿主把这批回报当作「没送到」重发；可回报已经消费
@@ -473,11 +481,14 @@ impl BoardService {
 
         // 5) 启动：队首、有名额、日历放行 → 交出 `launch`。名额/租约/worktree
         //    的既有记账全在 `next_launch` 里，这里不重造（brief 规则 2）。
-        let limit = superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
-            &self.state_dir,
-        )
-        .limit_at(chrono::Local::now());
-        match self.next_launch(limit, chrono::Local::now()) {
+        //
+        // `budget` = 全机峰值 − 全机运行会话数。限的是**总流量**，所以扣减基准
+        // 必须是宿主的全机计数，而不是本看板自己的 `running_count`：看板内那几张
+        // 卡也在全机计数里，再减一次就是双重扣减（P=4、全机 4 个在跑时会误以为
+        // 还有余量）。
+        let board_running = cards.iter().filter(|c| c.state.occupies_slot()).count();
+        let budget = self.launch_budget(sessions_running, board_running);
+        match self.next_launch(budget, chrono::Local::now()) {
             Ok(Some(claim)) => {
                 let objective = cards
                     .iter()
@@ -605,6 +616,26 @@ impl BoardService {
         persist::read_board(&self.state_dir).cards().to_vec()
     }
 
+    /// 合并视图配置：并发字段来自注入的 home（`None` 时回退真实 `$HOME`）。
+    fn calendar(&self) -> superpowers_kanban_core::calendar::ConcurrencyCalendar {
+        use superpowers_kanban_core::calendar::ConcurrencyCalendar;
+        match self.home.as_deref() {
+            Some(home) => ConcurrencyCalendar::load_merged_in(&self.state_dir, home),
+            None => ConcurrencyCalendar::load_merged(&self.state_dir),
+        }
+    }
+
+    /// 本看板此刻占着会话槽的卡片数。
+    ///
+    /// 只给「没有宿主快照」的通路用（`board.next_launch` 的手工触发、旧宿主
+    /// 退化、测试）。自动化调度要用的是宿主下发的**全机**运行数。
+    pub fn board_running_count(&self) -> usize {
+        self.locked_cards()
+            .iter()
+            .filter(|card| card.state.occupies_slot())
+            .count()
+    }
+
     /// 是否已有卡在合并中——名额的持久载体（`merge.lock` 只在临界区活着）。
     fn any_merging(&self) -> bool {
         persist::read_board(&self.state_dir)
@@ -720,31 +751,59 @@ impl BoardService {
     /// 不缓存进 `Inner`——`Inner` 只放看板与租约，多一个字段要多一处同步。
     /// **永不**归档 `awaiting_merge`/`needs_you`/`running`/`queued`（`is_terminal` 已排除）。
     pub fn archive_due(&self, now: DateTime<Local>) -> Vec<CardId> {
-        let hours = superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
-            &self.state_dir,
-        )
-        .archive_grace_hours;
+        let hours = self.calendar().archive_grace_hours;
         let grace = chrono::Duration::hours(hours.min(24 * 30) as i64);
         persist::with_board(&self.state_dir, |board| Ok(board.archive_due(now, grace)))
             .unwrap_or_default()
     }
 
-    /// 认领下一张排队卡：先拿全局槽位租约，再判名额、建 worktree、置 `Launching`。
+    /// 本拍还能起几个会话：全机峰值 − 全机运行会话数。
     ///
-    /// 全程在同一把锁内，且认领与持租约是同一件事的两面，所以同一个
-    /// `BoardService` 连续调用不会认领超过 `limit` 张——租约被占住后
-    /// `acquire_in` 就再也拿不到新的槽位了。
+    /// `sessions_running` 由宿主在 `driver/next` 里下发，口径是「本 app-server
+    /// 进程里正在调模型或正在执行进程的会话数」（`AwaitingApproval` 与 `Idle`
+    /// 都不算）。它是**全机**事实，不区分会话由谁创建——手动会话也算。
+    ///
+    /// 旧宿主不带这个字段（`None`）时退化为看板内口径：至少不能因此拒绝调度。
+    /// 退化是**有损**的（看板外的会话看不见，可能超发），所以打一行 warn。
+    fn launch_budget(&self, sessions_running: Option<u32>, board_running: usize) -> usize {
+        let limit = self.calendar().limit_at(chrono::Local::now()) as usize;
+        match sessions_running {
+            Some(running) => limit.saturating_sub(running as usize),
+            None => {
+                eprintln!(
+                    "superpowers-kanban: host did not report running sessions; \
+                     falling back to this board's own count (sessions outside the \
+                     board are invisible to the quota)"
+                );
+                limit.saturating_sub(board_running)
+            }
+        }
+    }
+
+    /// 认领下一张排队卡：先拿全局槽位租约，再判额度、建 worktree、置 `Launching`。
+    ///
+    /// 两个判据各管一段，**不能合并**：
+    ///
+    /// - `budget`（参数）是「这一拍最多起几个」，= 全局峰值 − 全机运行会话数
+    ///   （见 `launch_budget`）。它已经扣掉全机在跑的会话，所以这里不能再减
+    ///   看板内的 `running_count`；
+    /// - `limit`（内部按当前时刻算）是**全局峰值**，决定租约池有几个槽。池子必须
+    ///   保持峰值大小：`acquire_in` 按 `0..limit` 编号复用槽位，若拿 `budget`
+    ///   去开池，`budget` 一变小编号就重叠，两批会话会抢同一个槽——而租约正是
+    ///   「`Launching` 但还没 `Running`」这段时间唯一的记账手段（`occupies_slot`
+    ///   只认 `Running`）。
     pub fn next_launch(
         &self,
-        limit: u16,
-        _now: DateTime<Local>,
+        budget: usize,
+        now: DateTime<Local>,
     ) -> Result<Option<LaunchClaim>, String> {
         let mut inner = self.lock();
         let Some(dir) = inner.leases_dir.clone() else {
             return Err("no lease directory".into());
         };
         // 先占槽：拿不到就说明名额已满（含本进程自己已持有的）。
-        let Some(lease) = lease::acquire_in(&dir, limit as usize) else {
+        let limit = self.calendar().limit_at(now) as usize;
+        let Some(lease) = lease::acquire_in(&dir, limit) else {
             return Ok(None);
         };
         let project_root = self.project_root.clone();
@@ -754,7 +813,7 @@ impl BoardService {
         let mut worktree_failure: Option<String> = None;
         // 再认领：队空或无名额时把刚拿到的租约原地丢掉（drop 即释放）。
         let claimed = persist::with_board(&self.state_dir, |board| {
-            let Some(card_id) = board.claim_next_launch(limit) else {
+            let Some(card_id) = board.claim_next_launch(budget) else {
                 return Ok(None);
             };
             let branch = format!("kanban/{}", slugify(&card_id));
@@ -1525,18 +1584,32 @@ mod tests {
     /// 一拍 `driver_step`，断言它交出了一个 launch 并把它交出来。
     fn launched(service: &BoardService) -> DriverAction {
         service
-            .driver_step(&[], &[])
+            .driver_step(&[], &[], None)
             .unwrap()
             .expect("a launch action")
     }
 
-    /// 把并发配额钉成 1（写进项目日历），用来验「名额限制」。
+    /// 把全机峰值钉成 `peak`（写进注入的 home，即全局层）。
+    fn peak_of(service: &BoardService, peak: u16) {
+        let calendar = superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: peak,
+            ..Default::default()
+        };
+        let home = service.home.as_deref().expect("tests inject a home");
+        calendar.save_global_in(home).unwrap();
+    }
+
+    /// 把并发配额钉成 1，用来验「名额限制」。
+    ///
+    /// 峰值**只认全局层**，所以写进注入的 home（`service_with_card` 给的
+    /// `<dir>/home`），不是项目目录——写项目目录现在读不到。
     fn one_slot_only(service: &BoardService) {
         let calendar = superpowers_kanban_core::calendar::ConcurrencyCalendar {
             default_max_tasks: 1,
             ..Default::default()
         };
-        calendar.save(&service.state_dir).unwrap();
+        let home = service.home.as_deref().expect("tests inject a home");
+        calendar.save_global_in(home).unwrap();
     }
 
     #[test]
@@ -1785,9 +1858,10 @@ mod tests {
             lease::acquire_in(&leases_dir, 1).is_none(),
             "the running card's slot is re-adopted"
         );
+        // 全机峰值 1、正在跑的那张已把它占满 → 这次可用额度是 0。
         assert!(
-            service.next_launch(1, at()).unwrap().is_none(),
-            "limit=1 and the running card already fills it"
+            service.next_launch(0, at()).unwrap().is_none(),
+            "peak=1 and the running card already fills it"
         );
         assert_eq!(
             service.list()["cards"][1]["state"],
@@ -2268,7 +2342,10 @@ mod tests {
         let service = service_with_card(&project);
         service.enqueue_card_for_test("card-2");
 
-        let action = service.driver_step(&[], &[]).unwrap().expect("a launch");
+        let action = service
+            .driver_step(&[], &[], None)
+            .unwrap()
+            .expect("a launch");
         match action {
             DriverAction::Launch {
                 card_id,
@@ -2300,7 +2377,10 @@ mod tests {
         let project = project_with_worktree(dir.path());
         let service = service_with_card(&project);
 
-        let action = service.driver_step(&[], &[]).unwrap().expect("a launch");
+        let action = service
+            .driver_step(&[], &[], None)
+            .unwrap()
+            .expect("a launch");
         let value = action.to_json();
         assert_eq!(value["kind"], "launch");
         assert_eq!(
@@ -2324,16 +2404,107 @@ mod tests {
         one_slot_only(&service);
 
         let action = service
-            .driver_step(&[], &[])
+            .driver_step(&[], &[], None)
             .unwrap()
             .expect("the head launches");
         assert!(matches!(action, DriverAction::Launch { ref card_id, .. } if card_id == "card-1"));
         // 第一张还持着名额（`Launching` 也占租约）→ 第二张不出。
         assert!(
-            service.driver_step(&[], &[]).unwrap().is_none(),
+            service.driver_step(&[], &[], None).unwrap().is_none(),
             "no slot -> no launch"
         );
         assert_eq!(state_of(&service, "card-2"), "queued");
+    }
+
+    /// 全机峰值 4、宿主说全机已有 4 个会话在跑、看板内 0 个 → 一个都不许起。
+    ///
+    /// 这是本改造最核心的回归锁：限的是**总流量**，看板只是调度工具。旧口径
+    /// （`free_slots(4)`）会看到「本看板 0 个在跑」，于是再起 4 个——全机变成 8。
+    #[test]
+    fn outside_sessions_consume_the_same_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_card_for_test("card-2");
+        peak_of(&service, 4);
+
+        let action = service.driver_step(&[], &[], Some(4)).unwrap();
+        assert!(
+            action.is_none(),
+            "全机 4 个在跑、峰值 4：看板再起就是超发，实际得到 {action:?}"
+        );
+        assert_eq!(state_of(&service, "card-1"), "queued");
+        assert_eq!(state_of(&service, "card-2"), "queued");
+    }
+
+    /// 同上但峰值 5：全机已有 4 个，余量 1 → 恰好起一张。
+    #[test]
+    fn a_launch_is_allowed_when_the_whole_machine_has_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_card_for_test("card-2");
+        peak_of(&service, 5);
+
+        let action = service.driver_step(&[], &[], Some(4)).unwrap();
+        assert!(
+            matches!(action, Some(DriverAction::Launch { ref card_id, .. }) if card_id == "card-1"),
+            "余量 1 → 队首那张走"
+        );
+        assert_eq!(state_of(&service, "card-2"), "queued", "一拍只走一张");
+    }
+
+    /// 看板内已有 1 张在跑、宿主报的全机数里**已经包含**它 → 不得再扣一次。
+    ///
+    /// 峰值 4、全机 4（含本看板那张）→ 余量 0。若实现仍在 `claim_next_launch` 里
+    /// 减一遍看板内的 `running_count`，就会算出「还有 3 个空位」而超发。
+    #[test]
+    fn a_running_card_is_not_subtracted_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        service.enqueue_card_for_test("card-2");
+        peak_of(&service, 4);
+        let claim = service.next_launch(4, at()).unwrap().unwrap();
+        service.mark_running(&claim.card_id, "thread-1").unwrap();
+        assert_eq!(service.board_running_count(), 1);
+
+        let action = service
+            .driver_step(&busy(&["thread-1"]), &[], Some(4))
+            .unwrap();
+        assert!(
+            action.is_none(),
+            "全机 4 已达峰值，本看板那张已在其中，不能再起：{action:?}"
+        );
+        assert_eq!(state_of(&service, "card-2"), "queued");
+    }
+
+    /// 旧宿主不带 `sessions` → 退化为看板内口径，且照常调度。
+    #[test]
+    fn a_host_that_does_not_report_sessions_falls_back_to_the_board_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        peak_of(&service, 4);
+
+        let action = service.driver_step(&[], &[], None).unwrap();
+        assert!(
+            matches!(action, Some(DriverAction::Launch { ref card_id, .. }) if card_id == "card-1"),
+            "缺字段不能拒绝调度，否则旧宿主上的看板彻底停摆"
+        );
+    }
+
+    /// 全机运行数超过峰值（例如别的进程先占了额度）：余量必须归零，不能下溢。
+    #[test]
+    fn a_running_count_above_the_peak_yields_zero_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let service = service_with_card(&project);
+        peak_of(&service, 2);
+
+        let action = service.driver_step(&[], &[], Some(7)).unwrap();
+        assert!(action.is_none(), "saturating_sub：多于峰值也只会是 0");
+        assert_eq!(state_of(&service, "card-1"), "queued");
     }
 
     /// 卡 `running` + 它的会话 `idle` → 状态变 `awaiting_merge`（对账本身不交动作）。
@@ -2349,7 +2520,9 @@ mod tests {
         git_run(&claim.workdir, &["add", "-A"]);
         git_run(&claim.workdir, &["commit", "-qm", "feat"]);
 
-        let action = service.driver_step(&idle(&["thread-1"]), &[]).unwrap();
+        let action = service
+            .driver_step(&idle(&["thread-1"]), &[], None)
+            .unwrap();
         assert!(action.is_none(), "对账不向宿主交动作：{:?}", action);
         assert_eq!(state_of(&service, "card-1"), "awaiting_merge");
     }
@@ -2364,7 +2537,9 @@ mod tests {
         service.mark_running(&claim.card_id, "thread-1").unwrap();
         // 不提交：worktree 仍停在启动基线。
 
-        let action = service.driver_step(&idle(&["thread-1"]), &[]).unwrap();
+        let action = service
+            .driver_step(&idle(&["thread-1"]), &[], None)
+            .unwrap();
         assert!(action.is_none(), "{action:?}");
         assert_eq!(state_of(&service, "card-1"), "needs_you");
     }
@@ -2381,7 +2556,7 @@ mod tests {
 
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), &[])
+                .driver_step(&busy(&["thread-1"]), &[], None)
                 .unwrap()
                 .is_none()
         );
@@ -2389,7 +2564,7 @@ mod tests {
         // 宿主**完全没报**这台会话（重启后它不记得任何 thread）：不再「不动它」，
         // 而是按恢复规则收成 `needs_you`（见
         // `driver_step_recovers_cards_whose_session_the_host_no_longer_reports`）。
-        assert!(service.driver_step(&[], &[]).unwrap().is_none());
+        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
         assert_eq!(
             state_of(&service, "card-1"),
             "needs_you",
@@ -2405,7 +2580,9 @@ mod tests {
         let project = project_with_worktree(dir.path());
         let (service, _source) = service_with_awaiting_card(&project);
 
-        let action = service.driver_step(&busy(&["thread-1"]), &[]).unwrap();
+        let action = service
+            .driver_step(&busy(&["thread-1"]), &[], None)
+            .unwrap();
         assert!(action.is_none(), "{action:?}");
         assert_eq!(state_of(&service, "card-1"), "running");
     }
@@ -2420,7 +2597,7 @@ mod tests {
         git_run(&project, &["branch", &source]);
 
         let action = service
-            .driver_step(&idle(&["thread-1"]), &[])
+            .driver_step(&idle(&["thread-1"]), &[], None)
             .unwrap()
             .expect("an append for the merge turn");
         match action {
@@ -2483,6 +2660,7 @@ mod tests {
                     ("thread-2".to_string(), true),
                 ],
                 &[],
+                None,
             )
             .unwrap();
         assert!(action.is_none(), "一次只跑一个合并：{action:?}");
@@ -2507,7 +2685,9 @@ mod tests {
             MergeRequest::Granted { .. }
         ));
 
-        let action = service.driver_step(&idle(&["thread-1"]), &[]).unwrap();
+        let action = service
+            .driver_step(&idle(&["thread-1"]), &[], None)
+            .unwrap();
         assert!(action.is_none(), "{action:?}");
         assert_eq!(state_of(&service, "card-1"), "done", "以 git 事实收尾");
     }
@@ -2522,7 +2702,7 @@ mod tests {
         git_run(&project, &["branch", &source]);
 
         let action = service
-            .driver_step(&idle(&["thread-1"]), &[])
+            .driver_step(&idle(&["thread-1"]), &[], None)
             .unwrap()
             .expect("an append");
         let DriverAction::Append { action_id, .. } = action else {
@@ -2531,7 +2711,7 @@ mod tests {
         // 下一拍：会话快照仍空闲（turn 尚未登记），但回报未到 → 不收尾。
         assert!(
             service
-                .driver_step(&idle(&["thread-1"]), &[])
+                .driver_step(&idle(&["thread-1"]), &[], None)
                 .unwrap()
                 .is_none()
         );
@@ -2549,7 +2729,7 @@ mod tests {
         };
         assert!(
             service
-                .driver_step(&idle(&["thread-1"]), &[result])
+                .driver_step(&idle(&["thread-1"]), &[result], None)
                 .unwrap()
                 .is_none()
         );
@@ -2573,7 +2753,7 @@ mod tests {
             MergeRequest::Granted { .. }
         ));
 
-        assert!(service.driver_step(&[], &[]).unwrap().is_none());
+        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
         assert_eq!(state_of(&service, "card-1"), "needs_you");
         let detail = detail_of(&service, "card-1").expect("判词必须可读");
         assert!(
@@ -2631,7 +2811,7 @@ mod tests {
         service.enqueue_merge_card_for_test("wait-1", "kanban/wait-source", "main", None);
 
         // 宿主重启后的第一拍：threads 是空的（它谁都不认识），results 也是空的。
-        let action = service.driver_step(&[], &[]).unwrap();
+        let action = service.driver_step(&[], &[], None).unwrap();
 
         for (id, thread) in [("run-1", "thread-run"), ("merge-1", "thread-merge")] {
             assert_eq!(
@@ -2674,7 +2854,7 @@ mod tests {
         let (service, source) = service_with_awaiting_card(&project);
         git_run(&project, &["branch", &source]);
         let action = service
-            .driver_step(&idle(&["thread-1"]), &[])
+            .driver_step(&idle(&["thread-1"]), &[], None)
             .unwrap()
             .expect("an append");
         let DriverAction::Append { action_id, .. } = action else {
@@ -2683,7 +2863,7 @@ mod tests {
         assert_eq!(state_of(&service, "card-1"), "merging");
 
         // 宿主重启后的第一拍：空 threads、空 results，可动作还在飞 → 不找回。
-        assert!(service.driver_step(&[], &[]).unwrap().is_none());
+        assert!(service.driver_step(&[], &[], None).unwrap().is_none());
         assert_eq!(
             state_of(&service, "card-1"),
             "merging",
@@ -2701,6 +2881,7 @@ mod tests {
                     thread_id: Some("thread-1".to_string()),
                     error: None,
                 }],
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -2729,7 +2910,7 @@ mod tests {
         };
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), &[result])
+                .driver_step(&busy(&["thread-1"]), &[result], None)
                 .unwrap()
                 .is_none()
         );
@@ -2761,7 +2942,7 @@ mod tests {
         };
         // 同一拍就把名额让出来给队里下一张：失败的启动不是死胡同。
         let next = service
-            .driver_step(&[], &[result])
+            .driver_step(&[], &[result], None)
             .unwrap()
             .expect("the freed slot goes to the next card");
         assert!(
@@ -2802,7 +2983,7 @@ mod tests {
             thread_id: None,
             error: None,
         };
-        service.driver_step(&[], &[result]).unwrap();
+        service.driver_step(&[], &[result], None).unwrap();
 
         assert_eq!(state_of(&service, "card-1"), "failed");
         assert_eq!(
@@ -2871,7 +3052,7 @@ mod tests {
         };
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result))
+                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result), None)
                 .unwrap()
                 .is_none()
         );
@@ -2879,7 +3060,7 @@ mod tests {
         // 重复投递：不报错、不改状态、不多占一个名额。
         assert!(
             service
-                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result))
+                .driver_step(&busy(&["thread-1"]), std::slice::from_ref(&result), None)
                 .unwrap()
                 .is_none()
         );
@@ -3034,7 +3215,10 @@ mod tests {
         // 不在首次 None 上就停（收尾那一拍本来就没有动作可交）。
         for _ in 0..30 {
             let results: Vec<DriverResult> = pending.take().into_iter().collect();
-            match service.driver_step(&idle(&["thread-1"]), &results).unwrap() {
+            match service
+                .driver_step(&idle(&["thread-1"]), &results, None)
+                .unwrap()
+            {
                 Some(DriverAction::Append { action_id, .. }) => {
                     appends += 1;
                     pending = Some(DriverResult {
@@ -3090,7 +3274,7 @@ mod tests {
             objective,
             ..
         } = service
-            .driver_step(&idle(&["thread-1"]), &[])
+            .driver_step(&idle(&["thread-1"]), &[], None)
             .unwrap()
             .expect("the merge round opens")
         else {
@@ -3109,7 +3293,7 @@ mod tests {
         };
         assert!(
             service
-                .driver_step(&idle(&["thread-1"]), &[result])
+                .driver_step(&idle(&["thread-1"]), &[result], None)
                 .unwrap()
                 .is_none(),
             "收尾那一拍只有判词、没有动作"
@@ -3125,7 +3309,7 @@ mod tests {
         let DriverAction::Append {
             card_id, objective, ..
         } = service
-            .driver_step(&idle(&["thread-1"]), &[])
+            .driver_step(&idle(&["thread-1"]), &[], None)
             .unwrap()
             .expect("a git-negative round is retried")
         else {
@@ -3172,7 +3356,7 @@ mod tests {
             objective,
             ..
         } = service
-            .driver_step(&[], &[])
+            .driver_step(&[], &[], None)
             .unwrap()
             .expect("无会话的独立合并卡必须开出一轮合并会话")
         else {
@@ -3209,7 +3393,7 @@ mod tests {
         };
         assert!(
             service
-                .driver_step(&busy(&["thread-merge-1"]), &[result])
+                .driver_step(&busy(&["thread-merge-1"]), &[result], None)
                 .unwrap()
                 .is_none()
         );
@@ -3226,7 +3410,7 @@ mod tests {
         // 拍 3：会话空闲 → 既有 git 复核（D10）收尾：git 判否 → `needs_you`。
         assert!(
             service
-                .driver_step(&idle(&["thread-merge-1"]), &[])
+                .driver_step(&idle(&["thread-merge-1"]), &[], None)
                 .unwrap()
                 .is_none(),
             "收尾那一拍只有判词、没有动作"
@@ -3245,7 +3429,7 @@ mod tests {
 
         // 拍 4：git 判否的合并轮可自动重试（D9）；会话已在，故这一轮是 `append`。
         let retry = service
-            .driver_step(&idle(&["thread-merge-1"]), &[])
+            .driver_step(&idle(&["thread-merge-1"]), &[], None)
             .unwrap()
             .expect("git 判否的合并轮要被自动重试");
         assert!(
@@ -3329,7 +3513,7 @@ mod tests {
         let DriverAction::Launch {
             action_id, card_id, ..
         } = service
-            .driver_step(&[], &[])
+            .driver_step(&[], &[], None)
             .unwrap()
             .expect("两张独立合并卡都在排队，总得开出一轮")
         else {
@@ -3357,6 +3541,7 @@ mod tests {
                         thread_id: Some("thread-merge-b".to_string()),
                         error: None,
                     }],
+                    None,
                 )
                 .unwrap()
                 .is_none(),
@@ -3373,7 +3558,7 @@ mod tests {
         // 快照（快照里 merge-b 还是 `merging`、不在候选池里），名额随即落到它手上。
         // 于是两张合格候选各拿到一次动作，先后仍是 merge-b → merge-a（order 序）。
         let action = service
-            .driver_step(&idle(&["thread-merge-b"]), &[])
+            .driver_step(&idle(&["thread-merge-b"]), &[], None)
             .unwrap();
         assert_eq!(
             state_of(&service, "merge-b"),
@@ -3425,7 +3610,7 @@ mod tests {
         service.enqueue_merge_card_for_test("merge-1", source, "main", None);
 
         let DriverAction::Launch { action_id, .. } = service
-            .driver_step(&[], &[])
+            .driver_step(&[], &[], None)
             .unwrap()
             .expect("the merge round opens with a launch")
         else {
@@ -3439,7 +3624,7 @@ mod tests {
             thread_id: None,
             error: Some("launcher down".to_string()),
         };
-        service.driver_step(&[], &[result]).unwrap();
+        service.driver_step(&[], &[result], None).unwrap();
 
         assert_ne!(
             state_of(&service, "merge-1"),
@@ -3466,7 +3651,7 @@ mod tests {
 
         assert!(
             service
-                .driver_step(&idle(&["thread-1"]), &[])
+                .driver_step(&idle(&["thread-1"]), &[], None)
                 .unwrap()
                 .is_none()
         );
@@ -3487,7 +3672,7 @@ mod tests {
 
         assert!(
             service
-                .driver_step(&idle(&["thread-1"]), &[])
+                .driver_step(&idle(&["thread-1"]), &[], None)
                 .unwrap()
                 .is_none()
         );
