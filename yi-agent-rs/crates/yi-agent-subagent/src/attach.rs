@@ -191,6 +191,23 @@ pub fn attach_project_runtime(
     runtime_dir: PathBuf,
     models_path: &Path,
 ) -> Result<AttachedProjectRuntime, AttachFailure> {
+    attach_project_runtime_with_environment(cfg, runtime_dir, models_path, None, None)
+}
+
+/// [`attach_project_runtime`] 的可注入版本：`flags_path` 覆盖 `flags.json` 的位置，
+/// `build_kind` 覆盖监督器读开关时用的构建类型。
+///
+/// 存在的理由与 `yi_agent_runtime::supervise::for_daemon_ownership_with_environment`
+/// 相同：集成测试编译的是普通 lib，没有 `#[cfg(test)]` 分支可用，而测试二进制的
+/// 构建类型恒为 `release`——`release` 下开关一律读成关，监督器便永远不起插件。
+/// 生产两条入口都传 `None`，语义与原来逐字一致。
+pub fn attach_project_runtime_with_environment(
+    cfg: &RuntimeConfig,
+    runtime_dir: PathBuf,
+    models_path: &Path,
+    flags_path: Option<PathBuf>,
+    build_kind: Option<&str>,
+) -> Result<AttachedProjectRuntime, AttachFailure> {
     let database = runtime_dir.join("runtime.sqlite");
     let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)
         .map_err(|error| AttachFailure::new("runtime directory", error))?;
@@ -256,10 +273,12 @@ pub fn attach_project_runtime(
             workspace,
         },
         embedded_daemon,
-        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+        supervisor: yi_agent_runtime::supervise::for_daemon_ownership_with_environment(
             &cfg.workdir,
             &runtime_dir,
             owns_daemon,
+            flags_path,
+            build_kind,
         ),
     })
 }

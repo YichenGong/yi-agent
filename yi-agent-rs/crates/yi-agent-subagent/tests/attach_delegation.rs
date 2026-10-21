@@ -471,11 +471,27 @@ fn delegation_tools_act_as_the_conversations_own_root() {
 /// 用假的而不是真插件二进制：这条测试要证明的是**接线**
 /// （谁拥有 daemon → 谁监督 → 子进程被拉起 → 路由被登记），
 /// 而不是插件本身能不能跑；用真二进制会把 cargo 构建顺序变成测试前提。
+///
+/// 但它**必须**能区分 `manifest` 自述调用：daemon 启动时会跑
+/// `<command> manifest` 校准清单（`refresh`），这个脚本过去忽略 argv，于是
+/// 刷新那一次也会写 marker——marker 存在就不能再证明"监督器拉起了它"。
+/// 现在自述只回一份与磁盘上等价的清单，绝不写 marker；只有真正的运行调用
+/// （无参数）才写。
 fn write_fake_child(dir: &Path, marker: &Path) -> std::path::PathBuf {
     let script = dir.join("plugin-child.sh");
     std::fs::write(
         &script,
-        format!("#!/bin/sh\necho $$ > {}\nsleep 30\n", marker.display()),
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"manifest\" ]; then\n\
+             \x20 echo '{}'\n\
+             \x20 exit 0\n\
+             fi\n\
+             echo $$ > {}\n\
+             sleep 30\n",
+            manifest_json(&script).replace('\'', r"'\''"),
+            marker.display()
+        ),
     )
     .unwrap();
     {
@@ -487,26 +503,34 @@ fn write_fake_child(dir: &Path, marker: &Path) -> std::path::PathBuf {
     script
 }
 
+/// 清单正文：磁盘上的 `demo.json` 与假脚本的自述必须是**同一份**。
+///
+/// 两边一致时刷新不会改写它（`RefreshOutcome::Current`），测试也就不会因为
+/// 一次"自述与磁盘不同"的重写而掩盖真正的接线问题。
+fn manifest_json(command: &Path) -> String {
+    format!(
+        r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
+        command.display()
+    )
+}
+
 /// 就位"清单 + 开关打开"，让监督者有事可做。
+///
+/// 开关落在**全局** `flags.json`：`Supervisor::desired_on` 只看这一层，
+/// 项目层的 `preferences.json` 由插件自己写，进程起停不再读它。键必须是
+/// 注册表里的名字——未注册的一律读成关。返回 flags 文件路径供注入。
 fn arm_plugin(repo: &Path, marker: &Path) -> std::path::PathBuf {
     let child = write_fake_child(repo, marker);
     let manifests = repo.join(".yi-agent/supervisors");
     std::fs::create_dir_all(&manifests).unwrap();
+    std::fs::write(manifests.join("demo.json"), manifest_json(&child)).unwrap();
+    let flags = repo.join("flags.json");
     std::fs::write(
-        manifests.join("demo.json"),
-        format!(
-            r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":50,"restart_backoff_max_ms":200,"query_socket":"{{state_dir}}/demo.sock"}}"#,
-            child.display()
-        ),
+        &flags,
+        r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
     )
     .unwrap();
-    std::fs::create_dir_all(repo.join(".yi-agent")).unwrap();
-    std::fs::write(
-        repo.join(".yi-agent/preferences.json"),
-        r#"{"demo_on":true}"#,
-    )
-    .unwrap();
-    child
+    flags
 }
 
 /// 拥有 daemon 的进程必须监督插件。
@@ -521,13 +545,18 @@ fn a_process_that_owns_the_daemon_supervises_its_plugins() {
     let runtime_dir = tempfile::TempDir::new().unwrap();
     init_git_repo(repo.path());
     let marker = repo.path().join("plugin.pid");
-    arm_plugin(repo.path(), &marker);
+    let flags = arm_plugin(repo.path(), &marker);
     let cfg = config_for(repo.path());
 
-    let attached = yi_agent_subagent::attach::attach_project_runtime(
+    // 两处注入都不可省：开关只读全局 `flags.json`（项目层 `preferences.json`
+    // 不再参与起停），且 `release` 构建下任何 flag 都读成关——测试二进制恒为
+    // `release`，不注入 dev 就永远看不到子进程。
+    let attached = yi_agent_subagent::attach::attach_project_runtime_with_environment(
         &cfg,
         runtime_dir.path().to_path_buf(),
         &isolated_models_path(repo.path()),
+        Some(flags),
+        Some("dev"),
     )
     .expect("a clean git project must attach");
     assert!(

@@ -68,8 +68,25 @@ pub fn for_daemon_ownership(
     runtime_dir: &Path,
     owns_daemon: bool,
 ) -> SuperviseHandle {
+    for_daemon_ownership_with_environment(workdir, runtime_dir, owns_daemon, None, None)
+}
+
+/// [`for_daemon_ownership`] 的可注入版本：`flags_path` 覆盖 `flags.json` 的位置，
+/// `build_kind` 覆盖进程的构建类型。
+///
+/// 存在的理由与 [`serve_with_environment`] 逐字相同：集成测试（这里是
+/// `yi-agent-subagent` 的 `attach_delegation`）编译的是普通 lib，`#[cfg(test)]`
+/// 分支在那里不存在；而测试二进制的构建类型恒为 `release`，`release` 下任何
+/// flag 都不生效，想看到子进程被拉起就必须能注入 `dev`。
+pub fn for_daemon_ownership_with_environment(
+    workdir: &Path,
+    runtime_dir: &Path,
+    owns_daemon: bool,
+    flags_path: Option<std::path::PathBuf>,
+    build_kind: Option<&str>,
+) -> SuperviseHandle {
     if owns_daemon {
-        serve(workdir, runtime_dir)
+        serve_with_environment(workdir, runtime_dir, flags_path, build_kind)
     } else {
         idle()
     }
