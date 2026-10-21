@@ -1,5 +1,7 @@
 #[cfg(desktop)]
 mod bridge;
+#[cfg(desktop)]
+mod window;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
