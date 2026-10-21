@@ -3145,6 +3145,13 @@ mod tests {
                 );
             }
         }
+        // `sessions.running`：插件靠它算全机余量。缺了会退化为看板内口径，
+        // 那是有损的（看板外的会话看不见），所以契约必须钉住这个字段。
+        let running = contract["request"]["sessions"]["running"]
+            .as_u64()
+            .expect("契约必须钉住 sessions.running：插件靠它算全机余量");
+        assert!(running > 0, "契约的样例值应能表达「有会话在跑」");
+
         // 契约的 results[] 条目就是插件 `DriverResult` 认的形状。
         let parsed: Vec<DriverResult> =
             serde_json::from_value(contract["request"]["results"].clone())

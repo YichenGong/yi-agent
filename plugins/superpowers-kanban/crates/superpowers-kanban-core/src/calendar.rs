@@ -970,9 +970,12 @@ max_tasks = 3
             "default_max_tasks = 9\ninterval_secs = 45\n",
         )
         .unwrap();
-        let mut global = ConcurrencyCalendar::default();
-        global.default_max_tasks = 2;
-        global.save_global_in(home.path()).unwrap();
+        ConcurrencyCalendar {
+            default_max_tasks: 2,
+            ..Default::default()
+        }
+        .save_global_in(home.path())
+        .unwrap();
 
         let merged = ConcurrencyCalendar::load_merged_in(state.path(), home.path());
         assert_eq!(merged.default_max_tasks, 2, "并发峰值只认全局层");
@@ -1007,10 +1010,13 @@ max_tasks = 3
             "interval_secs = 45\narchive_grace_hours = 12\ninstance_wait_secs = 7\n",
         )
         .unwrap();
-        let mut global = ConcurrencyCalendar::default();
-        global.default_max_tasks = 3;
-        global.interval_secs = 999;
-        global.save_global_in(home.path()).unwrap();
+        ConcurrencyCalendar {
+            default_max_tasks: 3,
+            interval_secs: 999,
+            ..Default::default()
+        }
+        .save_global_in(home.path())
+        .unwrap();
 
         let merged = ConcurrencyCalendar::load_merged_in(state.path(), home.path());
         assert_eq!(merged.interval_secs, 45);
@@ -1022,9 +1028,11 @@ max_tasks = 3
     #[test]
     fn saving_the_project_level_never_writes_the_concurrency_fields() {
         let state = tempfile::TempDir::new().unwrap();
-        let mut calendar = ConcurrencyCalendar::default();
-        calendar.default_max_tasks = 5;
-        calendar.interval_secs = 45;
+        let calendar = ConcurrencyCalendar {
+            default_max_tasks: 5,
+            interval_secs: 45,
+            ..Default::default()
+        };
         calendar.save_project(state.path()).unwrap();
 
         let text = std::fs::read_to_string(state.path().join("superpowers-kanban.toml")).unwrap();

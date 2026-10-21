@@ -890,6 +890,50 @@ mod tests {
         assert_eq!(value["action"], Value::Null, "{value}");
     }
 
+    /// 线协议里的 `sessions.running` 必须真的被读进来：全机已满时一个都不起。
+    ///
+    /// 这条走的是**完整的一拍**（`dispatch_with_service` → `driver_step`），而不是
+    /// 直接调服务，所以它同时钉住「参数名 `sessions.running` 没写错」——名字写错会
+    /// 静默退化为看板内口径，正则测试看不出来。
+    #[test]
+    fn driver_next_reads_the_machine_wide_running_count_from_the_wire() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        // 全机峰值 2，宿主说已经有 2 个在跑（其中没有本看板的）。
+        let home = project.join("home");
+        superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 2,
+            ..Default::default()
+        }
+        .save_global_in(&home)
+        .unwrap();
+
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [], "sessions": { "running": 2 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            value["action"],
+            Value::Null,
+            "全机已达峰值，不许再起：{value}"
+        );
+        // 卡仍是 queued（没被认领、没建 worktree）。
+        let board = crate::persist::read_board(&state);
+        assert_eq!(
+            board
+                .get(&superpowers_kanban_core::card::CardId::new("card-1"))
+                .unwrap()
+                .state,
+            superpowers_kanban_core::card::CardState::Queued
+        );
+    }
+
     /// 端到端跨进程契约：一张排队卡 → 恰好一个 `launch`，字段名逐字对齐宿主
     /// `session_driver::parse_action`（spec §4.3）。
     #[test]
