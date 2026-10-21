@@ -29,31 +29,26 @@ pub enum CardKind {
     Merge,
 }
 
-/// 卡片状态。`Running` 是唯一占用并发槽位的状态。
+/// 卡片状态。
+///
+/// 这里**不再**记录「谁在占并发槽位」——并发按宿主上报的活会话计（见
+/// `superpowers_kanban_runner::service`），与卡片状态解耦。一张卡被标了
+/// `Done` 但会话还开着，它仍然占名额，因为它确实还在烧 token。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardState {
-    /// 已决定要做，但 spec/plan 还没写出来；不占槽、不进会话。
+    /// 已决定要做，但 spec/plan 还没写出来；不进会话。
     PreQueued,
     Queued,
-    Launching,
     Running,
-    /// 合并卡执行合并时的状态；不占用会话槽位。
-    Merging,
     NeedsYou,
     AwaitingMerge,
     Failed,
     Done,
-    Paused,
     Cancelled,
 }
 
 impl CardState {
-    /// 只有 `Running` 占用并发槽位；其余状态一律让出槽位。
-    pub fn occupies_slot(self) -> bool {
-        matches!(self, CardState::Running)
-    }
-
     /// 终态：不再有任何自动推进。
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -62,54 +57,13 @@ impl CardState {
         )
     }
 
-    /// 状态迁移合法性。不在此表内的迁移一律拒绝。
+    /// 状态迁移合法性。
+    ///
+    /// 写状态的是**模型**（`superpowers-kanban state`），它有上下文；整张迁移表
+    /// 只会在正当场景上挡住它（历史上就有「卡还在 queued 但活儿已经做完」）。
+    /// 唯一保留的规则是**终态不可复活**：那是一条承诺，复活它等于让看板撒谎。
     pub fn can_transition_to(self, next: CardState) -> bool {
-        use CardState::*;
-        if self.is_terminal() {
-            return false;
-        }
-        if self == next {
-            return false;
-        }
-        // 取消：任何非终态都可以。
-        if next == Cancelled {
-            return true;
-        }
-        match (self, next) {
-            (PreQueued, Queued) => true,
-            (Queued, Running) => true,
-            (Queued, Merging) => true,
-            (Merging, Done) => true,
-            (Merging, NeedsYou) => true,
-            (Merging, Failed) => true,
-            (Queued, Launching) => true,
-            (Launching, Running) => true,
-            (Launching, Failed) => true,
-            (Launching, Cancelled) => true, // 由上面的 `next == Cancelled` 兜底也行，显式更清楚
-            (Running, AwaitingMerge) => true,
-            // 合并阶段：实现卡停在 awaiting_merge/needs_you，用户发话后进 merging。
-            // 合并轮由卡片原会话里的一轮 turn 执行，故这一步是「人已发话」的记录。
-            (AwaitingMerge, Merging) => true,
-            (NeedsYou, Merging) => true,
-            // 用户在一张**正在跑**的实现卡上发话要求合并：宿主对账可能已先
-            // 把 awaiting_merge 的卡翻回 running（见 2026-10-03 看板状态误判），
-            // 不放行这条边则合并名额永远申请不到。反向的 merging → running
-            // 仍不合法（见下方 `_ => false`）：合并阶段不回流会话通路。
-            (Running, Merging) => true,
-            (Running, NeedsYou) => true,
-            (Running, Failed) => true,
-            (Running, Paused) => true,
-            // 卡片会话被「追问」或自动继续：等待验收的卡重新跑起来。
-            // 调度器对账只能看到某一条空闲快照，会话稍后继续时，卡片必须先
-            // 从 `AwaitingMerge`/`NeedsYou` 回到 `Running`，否则看板会长期
-            // 停留在错误的终态（见 2026-10-03 看板状态误判）。
-            (AwaitingMerge, Running) => true,
-            (NeedsYou, Running) => true,
-            (Paused, Queued) => true,
-            (NeedsYou, Queued) => true,
-            (AwaitingMerge, Done) => true,
-            _ => false,
-        }
+        !self.is_terminal() && self != next
     }
 }
 
@@ -139,9 +93,6 @@ pub struct Card {
     /// 复用它会让溯源线在提升/开跑时断掉。旧 board.json 缺此字段 → `None`。
     #[serde(default)]
     pub origin_thread_id: Option<String>,
-    /// 启动时 worktree 的 HEAD，供对账判断「有无新提交」。
-    #[serde(default)]
-    pub base_commit: Option<String>,
     /// 卡片种类；旧状态文件没有此字段 → 实现卡。
     #[serde(default)]
     pub kind: CardKind,
@@ -196,18 +147,49 @@ mod tests {
     }
 
     #[test]
-    fn only_running_occupies_a_slot() {
-        assert!(CardState::Running.occupies_slot());
-        for state in [
-            CardState::Queued,
-            CardState::NeedsYou,
-            CardState::AwaitingMerge,
-            CardState::Failed,
-            CardState::Done,
-            CardState::Paused,
-            CardState::Cancelled,
-        ] {
-            assert!(!state.occupies_slot(), "{state:?} must not occupy a slot");
+    fn any_non_terminal_state_may_move_to_any_other() {
+        use CardState::*;
+        let live = [PreQueued, Queued, Running, NeedsYou, AwaitingMerge];
+        for from in live {
+            for to in live {
+                if from == to {
+                    assert!(
+                        !from.can_transition_to(to),
+                        "{from:?} -> {to:?} must be rejected"
+                    );
+                } else {
+                    assert!(
+                        from.can_transition_to(to),
+                        "{from:?} -> {to:?} must be allowed"
+                    );
+                }
+            }
+            assert!(from.can_transition_to(Done), "{from:?} -> Done");
+            assert!(from.can_transition_to(Failed), "{from:?} -> Failed");
+            assert!(from.can_transition_to(Cancelled), "{from:?} -> Cancelled");
+        }
+    }
+
+    /// 终态是给用户的承诺：复活一张 done 的卡等于让看板撒谎。
+    #[test]
+    fn a_terminal_state_never_revives() {
+        use CardState::*;
+        for from in [Done, Failed, Cancelled] {
+            for to in [
+                PreQueued,
+                Queued,
+                Running,
+                NeedsYou,
+                AwaitingMerge,
+                Done,
+                Failed,
+                Cancelled,
+            ] {
+                assert!(
+                    !from.can_transition_to(to),
+                    "{from:?} -> {to:?} must be rejected"
+                );
+            }
         }
     }
 
@@ -221,58 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn happy_path_transitions_are_allowed() {
-        use CardState::*;
-        assert!(Queued.can_transition_to(Running));
-        assert!(Running.can_transition_to(AwaitingMerge));
-        assert!(AwaitingMerge.can_transition_to(Done));
-        assert!(Running.can_transition_to(NeedsYou));
-        assert!(NeedsYou.can_transition_to(Queued));
-        assert!(Running.can_transition_to(Failed));
-    }
-
-    #[test]
-    fn needs_you_never_holds_a_slot_so_it_can_return_to_the_queue() {
-        assert!(!CardState::NeedsYou.occupies_slot());
-        assert!(CardState::NeedsYou.can_transition_to(CardState::Queued));
-    }
-
-    #[test]
-    fn a_reviewed_card_can_resume_running_so_follow_up_turns_stay_visible() {
-        use CardState::*;
-        // 对账在一条空闲快照上把卡判成 `AwaitingMerge`（或 `NeedsYou`）后，
-        // 会话继续（追问/自动续跑）必须能把卡翻回 `Running`，否则看板会显示
-        // 错误的终态。
-        assert!(AwaitingMerge.can_transition_to(Running));
-        assert!(NeedsYou.can_transition_to(Running));
-        // 终态仍然不能复活。
-        assert!(!Done.can_transition_to(Running));
-        assert!(!Failed.can_transition_to(Running));
-    }
-
-    #[test]
-    fn pause_and_resume_are_allowed_only_around_running() {
-        use CardState::*;
-        assert!(Running.can_transition_to(Paused));
-        assert!(Paused.can_transition_to(Queued));
-        assert!(!Paused.can_transition_to(AwaitingMerge));
-    }
-
-    #[test]
-    fn cancel_is_allowed_from_every_non_terminal_state() {
-        use CardState::*;
-        for state in [Queued, Running, NeedsYou, AwaitingMerge, Paused] {
-            assert!(
-                state.can_transition_to(Cancelled),
-                "{state:?} must be cancellable"
-            );
-        }
-        assert!(!Done.can_transition_to(Cancelled));
-        assert!(!Cancelled.can_transition_to(Queued));
-    }
-
-    #[test]
-    fn a_running_card_cannot_be_started_twice() {
+    fn a_card_cannot_move_to_its_own_state() {
         assert!(!CardState::Running.can_transition_to(CardState::Running));
     }
 
@@ -295,79 +226,9 @@ mod tests {
     }
 
     #[test]
-    fn launching_does_not_occupy_a_slot() {
-        assert!(!CardState::Launching.occupies_slot());
-    }
-
-    #[test]
-    fn queued_can_launch_and_launching_can_run_or_fail() {
-        use CardState::*;
-        assert!(Queued.can_transition_to(Launching));
-        assert!(Launching.can_transition_to(Running));
-        assert!(Launching.can_transition_to(Failed));
-        assert!(!Launching.can_transition_to(AwaitingMerge));
-    }
-
-    #[test]
-    fn merging_does_not_occupy_a_provider_slot() {
-        assert!(!CardState::Merging.occupies_slot());
-    }
-
-    #[test]
-    fn a_merging_card_can_finish_or_stop() {
-        use CardState::*;
-        assert!(Queued.can_transition_to(Merging));
-        assert!(Merging.can_transition_to(Done));
-        assert!(Merging.can_transition_to(NeedsYou));
-        assert!(Merging.can_transition_to(Failed));
-        assert!(Merging.can_transition_to(Cancelled));
-        // 合并卡绝不能回到会话通路。
-        assert!(!Merging.can_transition_to(Running));
-        assert!(!Merging.can_transition_to(Launching));
-    }
-
-    #[test]
-    fn a_card_may_enter_and_leave_the_merge_stage() {
-        use CardState::*;
-        // 实现卡停在 awaiting_merge，用户发话后进 merging；失败退回 needs_you 再来。
-        assert!(AwaitingMerge.can_transition_to(Merging));
-        assert!(NeedsYou.can_transition_to(Merging));
-        assert!(Merging.can_transition_to(Done));
-        assert!(Merging.can_transition_to(NeedsYou));
-        // 合并阶段不占会话槽位（口径不变）。
-        assert!(!Merging.occupies_slot());
-        // 未到「等待验收/等人决定/正在跑」的卡不得直接进 merging。
-        assert!(!Paused.can_transition_to(Merging));
-        // 正在跑的卡**可以**进 merging（用户发话触发合并轮，见
-        // `a_running_card_may_enter_the_merge_stage_when_the_user_asks`）。
-        assert!(Running.can_transition_to(Merging));
-    }
-
-    #[test]
-    fn a_running_card_may_enter_the_merge_stage_when_the_user_asks() {
-        use CardState::*;
-        // 用户在一张正在跑的实现卡上发话要求合并：宿主对账可能已先把
-        // awaiting_merge 的卡翻回 running，此时仍必须能进 merging，
-        // 否则合并名额永远申请不到（本 bug 的核心）。
-        assert!(Running.can_transition_to(Merging));
-        // 合并阶段绝不回流会话通路。
-        assert!(!Merging.can_transition_to(Running));
-    }
-
-    #[test]
-    fn a_pre_queued_card_neither_occupies_a_slot_nor_is_terminal() {
-        assert!(!CardState::PreQueued.occupies_slot());
-        assert!(!CardState::PreQueued.is_terminal());
-    }
-
-    #[test]
-    fn a_pre_queued_card_can_be_promoted_or_cancelled() {
+    fn a_pre_queued_card_can_be_promoted() {
         use CardState::*;
         assert!(PreQueued.can_transition_to(Queued));
-        assert!(PreQueued.can_transition_to(Cancelled));
-        // 不能越过排队直接跑，也不能直接进终态。
-        assert!(!PreQueued.can_transition_to(Running));
-        assert!(!PreQueued.can_transition_to(AwaitingMerge));
     }
 
     #[test]
