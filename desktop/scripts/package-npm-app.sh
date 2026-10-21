@@ -64,10 +64,18 @@ log "构建 sidecar（release 模式 CLI）"
 log "tauri build（只出 .app）"
 (cd "$HERE" && npm run tauri build -- --bundles app)
 
-APP_SRC="$HERE/src-tauri/target/release/bundle/macos/yi-agent.app"
+# target 目录不能假定是 src-tauri/target：CI 把 CARGO_TARGET_DIR 指到
+# $HOME/cargo-target/github，tauri 的产物会跟着走。cargo metadata 是唯一
+# 真源（同时认 CARGO_TARGET_DIR 与 .cargo/config 的 build.target-dir），
+# 写死路径会让「编译成功但找不到 .app」这种最难查的失败复活。
+TAURI_TARGET_DIR="$(cargo metadata --manifest-path "$HERE/src-tauri/Cargo.toml" \
+  --format-version 1 --no-deps 2>/dev/null \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+[ -n "$TAURI_TARGET_DIR" ] || TAURI_TARGET_DIR="$HERE/src-tauri/target"
+APP_SRC="$TAURI_TARGET_DIR/release/bundle/macos/yi-agent.app"
 if [ ! -d "$APP_SRC" ]; then
   echo "ERROR: 未找到 $APP_SRC" >&2
-  ls -l "$HERE/src-tauri/target/release/bundle/macos/" >&2 || true
+  ls -l "$TAURI_TARGET_DIR/release/bundle/macos/" >&2 || true
   exit 1
 fi
 
