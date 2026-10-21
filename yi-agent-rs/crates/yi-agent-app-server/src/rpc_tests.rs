@@ -42,6 +42,7 @@ async fn write_or_fatal_reports_a_local_write_failure_on_the_fatal_channel() {
         resolve_plugin: std::sync::Arc::new(|_name: &str| -> Option<PathBuf> { None }),
         ensure_daemon: std::sync::Arc::new(|_project: &Path| -> Result<bool, String> { Ok(true) }),
         watchman_uninstall: std::sync::Arc::new(|_home: &Path| -> Result<(), String> { Ok(()) }),
+        plugin_gate: None,
         fatal_tx,
     };
 

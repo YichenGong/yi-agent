@@ -154,7 +154,8 @@ impl RpcError {
     /// The numeric code is only a coarse fallback for clients that read nothing
     /// else; `data.code` carries the stable vocabulary
     /// (`daemon_unavailable` / `plugin_unavailable` /
-    /// `plugin_not_installed` / `plugin_rejected`) the UI branches on, so a new
+    /// `plugin_not_installed` / `plugin_rejected` / `plugin_disabled`) the UI
+    /// branches on, so a new
     /// reason can be added without renumbering.
     ///
     /// **Generic on purpose.** The family used to be named after boards
@@ -168,6 +169,9 @@ impl RpcError {
             "plugin_unavailable" => -32022,
             "plugin_not_installed" => -32023,
             "plugin_rejected" => -32024,
+            // 功能开关关着。与 `plugin_unavailable` 分开：那个让人去查安装，
+            // 这个让人去设置页打开。
+            "plugin_disabled" => -32025,
             _ => -32603,
         };
         Self {

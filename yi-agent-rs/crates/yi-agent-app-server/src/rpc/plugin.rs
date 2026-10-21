@@ -58,7 +58,7 @@ pub(crate) async fn handle_shared(
                 .get("params")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            match plugin_query(&project, method, plugin, params) {
+            match plugin_query(&project, method, plugin, params, state.plugin_gate.as_ref()) {
                 Ok(value) => write_or_fatal(state, id.clone(), ok_response(id, value)).await,
                 Err(error) => {
                     write_or_fatal(
