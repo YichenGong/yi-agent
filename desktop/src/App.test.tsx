@@ -249,6 +249,9 @@ vi.mock("./lib/rpc", () => ({
         };
       }
       if (method === "workspace/list") return { workspaces: [] };
+      // 缺省 dev：既有用例里「实验功能」Tab 与组长补建都依赖它。不 mock 会让
+      // 请求落空、前端回落到 release，于是 `flags/*` 根本不存在。
+      if (method === "build/info") return { build_kind: "dev", version: "test" };
       if (method === "flags/list") {
         return {
           flags: [
@@ -268,6 +271,14 @@ vi.mock("./lib/rpc", () => ({
             },
           ],
         };
+      }
+      if (method === "flags/set") {
+        // 真实宿主会落盘，下一次 `flags/list` 就能读到新值。mock 必须照做，
+        // 否则"设置页拨完开关，界面要跟着变"这条路径根本测不出来。
+        const { name, enabled } = params as { name: string; enabled: boolean };
+        if (name === "lead_agent") state.leadFlagEnabled = enabled;
+        if (name === "superpowers_kanban") state.kanbanFlagEnabled = enabled;
+        return { name, enabled };
       }
       if (method === "thread/lead") {
         const cwd = (params as { cwd?: string } | undefined)?.cwd;
@@ -1304,6 +1315,45 @@ describe("App 主区域看板", () => {
     expect(screen.queryByText("Superpowers 看板")).toBeNull();
     expect(screen.queryByLabelText("收起看板")).toBeNull();
     expect(screen.queryByLabelText("Superpowers 看板开关")).toBeNull();
+  });
+
+  it("在设置页打开看板开关后，侧栏入口立刻出现，不用重启", async () => {
+    // 现场回归：开关是在设置页拨的，而 `kanbanEnabled` 原先只在握手时读一次。
+    // 结果用户打开开关后界面上什么也不会发生——必须重启 app 才生效，
+    // 而用户无法从界面上得知这一点。
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.kanbanFlagEnabled = false;
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "flags/list")).toBe(true),
+    );
+    expect(screen.queryByLabelText("看板")).toBeNull();
+
+    // 走真实的设置页路径：设置 → 实验功能 → 勾上看板开关。
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "实验功能" }));
+    const box = (await screen.findByLabelText("superpowers_kanban 开关")) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    fireEvent.click(box);
+
+    // 不重启、不重新握手：侧栏必须自己长出来。
+    expect(await screen.findByLabelText("看板")).toBeTruthy();
+  });
+
+  it("在设置页关掉看板开关后，侧栏入口立刻消失", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    render(<App />);
+    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "实验功能" }));
+    const box = (await screen.findByLabelText("superpowers_kanban 开关")) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+
+    await waitFor(() => expect(screen.queryByLabelText("看板")).toBeNull());
   });
 
   it("看板开关关着时侧栏没有入口，且不朝插件发任何读", async () => {
