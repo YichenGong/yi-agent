@@ -281,6 +281,89 @@ fn a_manifest_that_must_stay_reachable_runs_even_while_disabled() {
     supervisor.stop_all();
 }
 
+/// 现场回归：清单是**安装那一刻**的快照。
+///
+/// 插件把 `stop_when_disabled` 从 false 改成 true 之后，磁盘上那份仍是旧结论，
+/// 监督器照旧走"开关关了也留着进程"的分支——用户关掉开关，进程还在跑，而且
+/// 界面上没有任何线索说明原因。
+///
+/// 校准必须发生在**读清单之前**，否则新逻辑永远读旧结论。
+#[test]
+fn refreshing_a_stale_manifest_makes_switch_off_actually_stop_the_child() {
+    let _guard = spawn_serial_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path();
+    let marker = workdir.join("child.pid");
+    let child = write_fake_child(workdir, &marker);
+    let layout = layout_for(workdir);
+    std::fs::create_dir_all(layout.manifests_dir()).unwrap();
+
+    // "插件"自述的是新结论：关掉就该停。
+    let fresh = format!(
+        r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","stop_when_disabled":true,"restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+        child.display()
+    );
+    let describer = workdir.join("describer.sh");
+    std::fs::write(
+        &describer,
+        format!(
+            "#!/bin/sh
+cat <<'JSON'
+{fresh}
+JSON
+"
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&describer).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&describer, perms).unwrap();
+    }
+    // 磁盘上是旧快照：同一个 command（所以能问它是谁），但结论是"关掉也别停"。
+    std::fs::write(
+        layout.manifests_dir().join("demo.json"),
+        format!(
+            r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","stop_when_disabled":false,"restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+            describer.display()
+        ),
+    )
+    .unwrap();
+    enable(workdir, "superpowers_kanban");
+
+    // 启动时的校准：用插件自述覆盖旧快照。
+    let refreshed = yi_agent_supervisors::refresh::refresh_from_plugins(&layout.manifests_dir());
+    assert_eq!(
+        refreshed,
+        vec![yi_agent_supervisors::refresh::RefreshOutcome::Refreshed(
+            "demo".into()
+        )],
+        "the stale manifest must be replaced by the plugin's own description"
+    );
+
+    // 新自述里的 command 是真子进程；旧快照里的 command 是 describer。
+    // 刷新之后 supervisor 读到的必须是刷新后的那份。
+    let mut supervisor = supervisor_for(workdir, "dev");
+    supervisor.reconcile();
+    assert!(
+        wait_for_pid_marker(&marker),
+        "the refreshed manifest's child must start"
+    );
+
+    std::fs::write(
+        workdir.join(".yi-agent/flags.json"),
+        r#"{"flags":{"superpowers_kanban":false}}"#,
+    )
+    .unwrap();
+    supervisor.reconcile();
+    assert_eq!(
+        supervisor.running_count(),
+        0,
+        "with the refreshed `stop_when_disabled:true`, switch-off must stop the child"
+    );
+}
+
 #[test]
 fn a_crashed_child_is_restarted_after_the_backoff() {
     let _guard = spawn_serial_guard();

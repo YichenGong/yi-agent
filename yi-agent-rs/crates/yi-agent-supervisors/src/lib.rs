@@ -6,6 +6,7 @@
 pub mod daemon;
 pub mod install;
 pub mod manifest;
+pub mod refresh;
 pub mod supervisor;
 pub mod switch;
 pub mod watch;
