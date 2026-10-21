@@ -5687,6 +5687,11 @@ async fn driver_tick<F>(
                 })
                 .collect();
             let idle = move |thread_id: &str| snapshot.get(thread_id).copied().unwrap_or(false);
+            // 全机运行会话数:必须在构造 launcher **之前**算——launcher 持有
+            // `&mut threads`,之后再借 `threads` 就是借用冲突。口径与上面的 idle
+            // 快照同源(同一份 `ThreadSession`),所有归属的会话都在内:手动开的、
+            // 别的插件起的、看板起的。插件靠它算「全机余量」,限的是总流量。
+            let sessions_running = crate::session_driver::running_sessions(threads);
             // 该 (项目, 插件) 的驱动记账跨 tick 存活:`results` 要在下一拍回报,
             // `threads` 要让插件看见自己起过的会话。
             let state = drivers
@@ -5765,6 +5770,7 @@ async fn driver_tick<F>(
                 &mut state.results,
                 &mut launcher,
                 &idle,
+                sessions_running,
             )
             .await;
             // 本拍的结果**不在此处收割**:插件靠 `results` 才知道动作成没成、

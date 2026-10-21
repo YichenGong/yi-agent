@@ -8,7 +8,11 @@
 //! （`driver_step`），由 `SessionLauncher` 的真实现执行动作。
 
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
+
+use crate::protocol::ThreadStatus;
+use crate::session::ThreadSession;
 
 /// 宿主能执行的通用动作。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +132,38 @@ pub(crate) trait SessionLauncher {
     async fn launch(&mut self, action: &DriverAction) -> anyhow::Result<String>;
 }
 
+/// 一个会话此刻算不算「运行中」。
+///
+/// 口径由用户定义：正在调模型或正在执行进程算运行；**等待人决策不算**
+/// （`AwaitingApproval`），闲置也不算。`status` 与 `active_turn_id` 取自宿主
+/// 同一份 `ThreadSession`，与 `driver_tick` 采 idle 快照的判据同源。
+///
+/// 两个「不一致」的窗口都朝保守方向取（宁可少起一个会话，也不超发）：
+/// 状态已 `Running` 但 turn id 尚未登记，或 turn id 还在、状态已先翻 `Idle`。
+pub(crate) fn is_a_running_session(status: ThreadStatus, active_turn: Option<&str>) -> bool {
+    if matches!(status, ThreadStatus::AwaitingApproval) {
+        return false;
+    }
+    active_turn.is_some() || matches!(status, ThreadStatus::Running)
+}
+
+/// 本进程此刻有几个会话在跑。
+///
+/// 宿主不认识看板：**所有归属**的会话都在内（手工开的、别的插件起的、看板起的）。
+/// 这正是「限的是总流量」所需的口径——插件只看看板自己的卡片，看不到这些会话。
+pub(crate) fn running_sessions(threads: &HashMap<String, ThreadSession>) -> u32 {
+    threads
+        .values()
+        .filter(|session| {
+            let status = *session
+                .status
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            is_a_running_session(status, session.active_turn_id.as_deref())
+        })
+        .count() as u32
+}
+
 /// 把宿主持有的会话事实编成 `driver/next` 的 `threads` 参数。
 pub(crate) fn threads_payload(
     threads: &[DriverThread],
@@ -160,6 +196,7 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
     results: &mut Vec<ActionResult>,
     launcher: &mut L,
     idle: &(dyn Fn(&str) -> bool + Sync),
+    sessions_running: u32,
 ) -> Option<ActionResult> {
     let results_payload = Value::Array(
         results
@@ -177,6 +214,9 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
     let params = serde_json::json!({
         "threads": threads_payload(threads, idle),
         "results": results_payload,
+        // 本进程此刻有几个会话在跑（口径见 `is_a_running_session`）。插件拿它
+        // 算「全机余量」：限的是总流量，看板外的会话与看板会话吃同一份额度。
+        "sessions": { "running": sessions_running },
     });
     let answer = match query(&params) {
         Ok(answer) => answer,
@@ -231,6 +271,37 @@ pub(crate) fn driver_plugins(scope: &Path) -> Vec<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_running_turn_counts_as_one_running_session() {
+        assert!(is_a_running_session(ThreadStatus::Running, Some("t1")));
+    }
+
+    #[test]
+    fn a_session_waiting_for_human_approval_does_not_count() {
+        assert!(
+            !is_a_running_session(ThreadStatus::AwaitingApproval, Some("t1")),
+            "等决策不是运行"
+        );
+    }
+
+    #[test]
+    fn an_idle_session_does_not_count() {
+        assert!(!is_a_running_session(ThreadStatus::Idle, None));
+    }
+
+    #[test]
+    fn a_status_of_running_without_a_live_turn_still_counts() {
+        // 状态已推进到 Running 但 turn id 尚未登记的窗口期：保守按在跑算，
+        // 宁可少起一个会话，也不超发。
+        assert!(is_a_running_session(ThreadStatus::Running, None));
+    }
+
+    #[test]
+    fn an_idle_status_with_a_leftover_turn_id_still_counts() {
+        // 对称的保守方向：turn 还在就不信「空闲」。
+        assert!(is_a_running_session(ThreadStatus::Idle, Some("t1")));
+    }
 
     #[test]
     fn a_null_answer_yields_no_action() {
@@ -378,6 +449,7 @@ mod tests {
             &mut results,
             &mut launcher,
             &nobody_idle(),
+            0,
         )
         .await;
 
@@ -406,6 +478,7 @@ mod tests {
             &mut results,
             &mut launcher,
             &nobody_idle(),
+            0,
         )
         .await
         .unwrap();
@@ -427,6 +500,7 @@ mod tests {
             &mut results,
             &mut launcher,
             &nobody_idle(),
+            0,
         )
         .await;
 
@@ -457,6 +531,7 @@ mod tests {
             &mut results,
             &mut launcher,
             &nobody_idle(),
+            0,
         )
         .await;
 
@@ -484,6 +559,7 @@ mod tests {
             &mut results,
             &mut launcher,
             &nobody_idle(),
+            0,
         )
         .await;
 
@@ -514,6 +590,7 @@ mod tests {
             &mut results,
             &mut launcher,
             &nobody_idle(),
+            0,
         )
         .await;
 
@@ -546,7 +623,7 @@ mod tests {
         let mut launcher = FakeLauncher::default();
         let idle = |thread_id: &str| thread_id == "done";
 
-        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle).await;
+        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle, 0).await;
 
         let sent = seen.lock().unwrap().clone();
         assert_eq!(
@@ -649,7 +726,7 @@ mod tests {
         let mut launcher = FakeLauncher::default();
         let idle = |thread_id: &str| thread_id == "thread-1";
 
-        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle).await;
+        driver_step(&query, &mut threads, &mut results, &mut launcher, &idle, 3).await;
 
         let sent = seen.lock().unwrap().clone();
         assert_eq!(
@@ -659,6 +736,41 @@ mod tests {
         assert_eq!(
             sent[0]["results"], contract["request"]["results"],
             "宿主回报的 results[] 与契约必须逐字一致"
+        );
+        assert_eq!(
+            sent[0]["sessions"], contract["request"]["sessions"],
+            "宿主上报的全机运行会话数与契约必须逐字一致"
+        );
+    }
+
+    /// 全机运行数必须真的编进线上 payload，而不是被丢掉。
+    ///
+    /// 与会话表的具体构造解耦：`running_sessions` 的口径已由上面五条单测钉住，
+    /// 这里只钉「数出来的值确实进了 `sessions.running`」。
+    #[tokio::test]
+    async fn the_wire_carries_the_counted_running_sessions() {
+        let seen = std::sync::Mutex::new(Vec::new());
+        let query = |params: &Value| {
+            seen.lock().unwrap().push(params.clone());
+            Ok(json!({ "action": null }))
+        };
+        let mut driver_threads = Vec::new();
+        let mut results = Vec::new();
+        let mut launcher = FakeLauncher::default();
+        driver_step(
+            &query,
+            &mut driver_threads,
+            &mut results,
+            &mut launcher,
+            &nobody_idle(),
+            2,
+        )
+        .await;
+
+        let sent = seen.lock().unwrap().clone();
+        assert_eq!(
+            sent[0]["sessions"]["running"], 2,
+            "计出来的在跑数必须原样上线"
         );
     }
 
