@@ -1773,3 +1773,113 @@ describe("多选操作条的视觉一致性", () => {
     }
   });
 });
+
+describe("多选：连击不能吞掉第二次 Cmd 点击", () => {
+  // macOS 上在同一行附近连点两次，第二次 click 的 `detail` 是 2（浏览器按连击
+  // 计数）。原先的双击保护写在修饰键分支**之前**，于是 Cmd+点 A、Cmd+点 B 时
+  // 第二次点击被当成双击返回，选择集只剩 A——用户看到「选了两条，只进去一条」。
+  const twoThreads: WorkspaceGroup[] = [
+    {
+      workspace: "/work/projA",
+      exists: true,
+      threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+    },
+  ];
+
+  it("第二次 Cmd 点击带 detail=2 时仍然加选", () => {
+    renderSidebar({ groups: twoThreads });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    expect(document.querySelector("[data-selection-bar]")?.textContent).toContain("新建组（2）");
+  });
+
+  it("无修饰键的双击仍然只打开一次会话", () => {
+    const onSelect = vi.fn();
+    renderSidebar({ groups: twoThreads, onSelect });
+    fireEvent.click(screen.getByText("A"), { detail: 1 });
+    fireEvent.click(screen.getByText("A"), { detail: 2 });
+    expect(onSelect).toHaveBeenCalledTimes(1);
+  });
+
+  it("Shift 连选也不被 detail 拦截", () => {
+    renderSidebar({ groups: twoThreads });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { shiftKey: true, detail: 2 });
+    expect(document.querySelector("[data-selection-bar]")?.textContent).toContain("新建组（2）");
+  });
+});
+
+describe("组框：加入会话入口", () => {
+  const base: WorkspaceGroup[] = [
+    {
+      workspace: "/work/projA",
+      exists: true,
+      threads: [
+        thread("a", "A", "/work/projA"),
+        thread("b", "B", "/work/projA"),
+        thread("c", "C", "/work/projA"),
+      ],
+      groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a", "b"] }],
+    },
+  ];
+
+  it("组框头列出未归组会话，点击即调用 setMembers 追加", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    renderSidebar({ groups: base, onSetGroupMembers });
+
+    fireEvent.click(screen.getByLabelText("向 登录模块 加入会话"));
+    expect(document.querySelector('[data-add-candidate="c"]')).toBeTruthy();
+    fireEvent.click(document.querySelector<HTMLElement>('[data-add-candidate="c"]')!);
+
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "b", "c"]),
+    );
+  });
+
+  it("已在组内的会话不出现在候选里", () => {
+    renderSidebar({ groups: base });
+    fireEvent.click(screen.getByLabelText("向 登录模块 加入会话"));
+    expect(document.querySelector('[data-add-candidate="a"]')).toBeNull();
+    expect(document.querySelector('[data-add-candidate="b"]')).toBeNull();
+  });
+
+  it("组框头显示成员数", () => {
+    renderSidebar({ groups: base });
+    expect(document.querySelector("[data-group-count]")?.textContent).toBe("2");
+  });
+
+  it("新建组成功后自动展开新框", async () => {
+    // 服务端返回新组 id，前端据此展开；否则框停在折叠态，看不出成员进去了。
+    const onCreateGroup = vi.fn().mockResolvedValue("g-new");
+    const { container, rerender } = renderSidebar({
+      groups: [{ workspace: "/work/projA", exists: true, threads: base[0].threads }],
+      onCreateGroup,
+    });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("新建组（2）"));
+    const input = document.querySelector<HTMLInputElement>("[data-new-group-name]")!;
+    fireEvent.change(input, { target: { value: "登录模块" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(onCreateGroup).toHaveBeenCalled());
+
+    rerender(
+      <ThreadSidebar
+        {...sidebarProps({
+          groups: [
+            {
+              workspace: "/work/projA",
+              exists: true,
+              threads: base[0].threads,
+              groups: [{ id: "g-new", name: "登录模块", description: "", threadIds: ["a", "b"] }],
+            },
+          ],
+          onCreateGroup,
+        })}
+      />,
+    );
+    // 展开后两条成员都渲染在框内（explicit：不是只靠总数，顺带确认折叠被打开）。
+    expect(container.querySelector('[data-thread-row="a"]')).toBeTruthy();
+    expect(container.querySelector('[data-thread-row="b"]')).toBeTruthy();
+  });
+});

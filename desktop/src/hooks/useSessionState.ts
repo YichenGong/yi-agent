@@ -213,12 +213,33 @@ export function useSessionState({
     }
   };
 
-  const createGroup = (
+  /**
+   * 建组。成功时返回新组的 id——侧栏据此把新框**立即展开**并进入改名态：
+   * 框默认折叠，建完不展开的话，用户只能看到一个「▸ 组名 2」，看不出
+   * 两条会话确实都进去了（这正是此前「一条在里一条在外」的观感来源）。
+   */
+  const createGroup = async (
     workspace: string,
     name: string,
     description: string,
     threadIds: string[],
-  ) => groupCall("thread/group/create", { workspace, name, description, threadIds });
+  ): Promise<string | null> => {
+    const c = rpc();
+    if (!c) return null;
+    try {
+      const r = await c.request<{ group: { id: string } }>("thread/group/create", {
+        workspace,
+        name,
+        description,
+        threadIds,
+      });
+      return r.group?.id ?? null;
+    } catch (e) {
+      setCurrentError(formatError(e));
+      force((v) => v + 1);
+      return null;
+    }
+  };
 
   const updateGroup = (
     workspace: string,
