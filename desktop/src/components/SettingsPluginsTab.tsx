@@ -126,7 +126,16 @@ export function SettingsPluginsTab({
             const Panel = REGISTRY[plugin.name];
             return (
               <section key={plugin.name} className="p-4">
-                <h2 className="text-sm font-medium text-fg">{plugin.name}</h2>
+                <h2 className="text-sm font-medium text-fg">
+                  {plugin.name}
+                  {plugin.enabled ? null : (
+                    // 仍列出来：用户要能看见它、去「实验功能」把它打开。这里只标状态，
+                    // 不藏面板——藏了就等于让人没法从这一页判断它为什么没在跑。
+                    <span className="ml-2 text-xs font-normal text-fg-subtle">
+                      （已停用：在「实验功能」里打开）
+                    </span>
+                  )}
+                </h2>
                 {Panel ? (
                   <Panel rpc={rpc as PluginRpc} project={selected || undefined} />
                 ) : (

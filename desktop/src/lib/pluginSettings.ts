@@ -122,6 +122,13 @@ export interface PluginSummary {
   name: string;
   queryable: boolean;
   switchKey: string;
+  /**
+   * 这个插件此刻是否有在跑（`flags/list` 里它自己那个开关的值）。
+   *
+   * 旧宿主不回这个字段。缺省按 `true`：把"不知道"画成"已停用"会让升级前的
+   * 宿主上每个插件都显示成关着。
+   */
+  enabled: boolean;
 }
 
 export interface KanbanWindow {
@@ -163,6 +170,7 @@ export async function listPlugins(rpc: PluginRpc, project?: string): Promise<Plu
       name: row.name as string,
       queryable: row.queryable === true,
       switchKey: typeof row.switch_key === "string" ? (row.switch_key as string) : "",
+      enabled: row.enabled !== false,
     }));
 }
 
