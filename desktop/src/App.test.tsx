@@ -1153,6 +1153,48 @@ describe("App slash commands", () => {
     expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
   });
 
+  it("reports cumulative usage while context occupancy stays on the snapshot", async () => {
+    state.dataSources["config/read"] = () => ({
+      provider: "anthropic",
+      model: "claude-sonnet-4",
+      compact_threshold: 160_000,
+    });
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 一次调用只占 12,345 输入，但整个会话累计已消耗 100 万——两套数必须分开：
+    // 累计值是 `/usage` 的主体，上下文占用只能用快照算。
+    act(() => {
+      state.notifHandlers[0]({
+        method: "thread/tokenUsage/updated",
+        params: {
+          thread_id: "t1",
+          model: "claude-sonnet-4",
+          input_tokens: 12_345,
+          output_tokens: 678,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 10_000,
+          total_input_tokens: 1_000_000,
+          total_output_tokens: 5_000,
+          total_cache_creation_input_tokens: 0,
+          total_cache_read_input_tokens: 800_000,
+        },
+      });
+    });
+
+    const textarea = screen.getByRole("textbox");
+    fireEvent.change(textarea, { target: { value: "/usage" } });
+    fireEvent.keyDown(textarea, { key: "Enter" });
+
+    // `getByText` 会把连续空白折叠成一个，故这里按单空格断言。
+    await screen.findByText(/累计 input: 1,000,000 output: 5,000/);
+    expect(screen.getByText(/累计 cache read: 800,000/)).toBeTruthy();
+    // 上下文仍是最后一次调用的 12,345，不是累计的 100 万。
+    expect(screen.getByText(/上下文: 12,345 \/ 160,000 \(7\.7%\)/)).toBeTruthy();
+  });
+
   it("renders /config as a card without touching the agent", async () => {
     state.dataSources["config/read"] = () => ({
       provider: "anthropic",

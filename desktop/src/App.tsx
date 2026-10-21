@@ -1687,7 +1687,8 @@ export default function App() {
         } catch {
           // 读配置失败不该吞掉用量：分母未知就只显示 token 数。
         }
-        session.notice(formatUsage(u, { compactThreshold: threshold }));
+        // 累计值是 `/usage` 的主体；没有（老服务端）时函数内部退回快照。
+        session.notice(formatUsage(u, session.usageTotals, { compactThreshold: threshold }));
         break;
       }
       case "config":
