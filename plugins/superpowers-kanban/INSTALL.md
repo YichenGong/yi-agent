@@ -271,6 +271,46 @@ superpowers-kanban add docs/nope.md docs/<plan>.md
 
 ---
 
+## 6.5 并发配额（整机一份）
+
+峰值是**整机**语义：限流限的是总流量，所以配额只有一个来源，放在插件自己的
+全局目录，而不是每个项目各配一份：
+
+```
+~/.yi-agent/plugins/superpowers-kanban/superpowers-kanban.toml
+```
+
+```toml
+default_max_tasks = 4          # 全机同时运行的会话上限
+
+[[window]]                     # 可选：按时段收放
+days = "Mon-Fri"
+start = "09:00"
+end = "24:00"
+max_tasks = 3
+```
+
+判定口径是「全机峰值 − **本进程**当前运行中的会话数」：
+
+- 「运行」= 正在调模型或正在执行进程。**等待人决策不算**，已结束的不算。
+- 计数覆盖**所有**会话：手开的、别的插件起的、看板起的都算。
+- 只在**桌面 app-server 这一个进程**内统计。TUI / `yi-agent run` 里的会话不计入。
+
+项目里的 `.yi-agent/superpowers-kanban/superpowers-kanban.toml` **不再**决定并发，
+即便还写着 `default_max_tasks` / `window` 也会被忽略；它只留三个与配额无关的字段：
+
+| 字段 | 归属 | 说明 |
+|---|---|---|
+| `default_max_tasks` / `window` | 全局 | 整机峰值 |
+| `interval_secs` | 项目 | 推进节拍 |
+| `archive_grace_hours` | 项目 | 归档宽限 |
+| `instance_wait_secs` | 项目 | 抢 `plugin.lock` 的等待预算 |
+
+文件缺失时用内置默认 3。`settings.write`（桌面设置页）会按字段拆开写：
+并发两半进全局文件，其余留项目文件。
+
+---
+
 ## 7. 卸载
 
 按相反顺序，**三块都删**，别留半装状态：

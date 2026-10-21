@@ -59,7 +59,28 @@ pub fn dispatch_with_global(
     method: &str,
     params: &Value,
 ) -> Result<Value, String> {
-    dispatch_with_service(&service_for(state_dir), state_dir, global, method, params)
+    dispatch_with_home(
+        state_dir,
+        superpowers_kanban_core::calendar::ConcurrencyCalendar::home_dir().as_deref(),
+        global,
+        method,
+        params,
+    )
+}
+
+/// 同 [`dispatch_with_global`]，但由调用方指定「全局层」的 home。
+///
+/// 生产入口从 `HOME` 取；测试用它注入 `TempDir`，否则 `settings.write` 会写到
+/// 跑测试的那个用户的真实配置里。
+pub fn dispatch_with_home(
+    state_dir: &Path,
+    home: Option<&Path>,
+    global: Option<SwitchValue>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    let service = service_for(state_dir);
+    dispatch_in(&service, state_dir, home, global, method, params)
 }
 
 /// 分派入口本体。`service` 必须是推进循环持有的那个实例——`list` 与 `board.*`
@@ -67,6 +88,19 @@ pub fn dispatch_with_global(
 pub fn dispatch_with_service(
     service: &BoardService,
     state_dir: &Path,
+    global: Option<SwitchValue>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    let home = superpowers_kanban_core::calendar::ConcurrencyCalendar::home_dir();
+    dispatch_in(service, state_dir, home.as_deref(), global, method, params)
+}
+
+/// 本体。`home` 决定全局配置文件落在哪（`None` = 没有全局层可写）。
+fn dispatch_in(
+    service: &BoardService,
+    state_dir: &Path,
+    home: Option<&Path>,
     global: Option<SwitchValue>,
     method: &str,
     params: &Value,
@@ -224,20 +258,29 @@ pub fn dispatch_with_service(
                 .transpose()?
                 .unwrap_or_default();
 
-            match service.driver_step(&snapshot, &results)? {
+            // 全机运行会话数：宿主每拍采一次，口径是「正在调模型或正在执行进程」。
+            // 缺这个字段说明宿主是旧版本——退化为看板内口径（`driver_step` 里
+            // 打 warn），绝不能让整拍因此失败：那会让宿主把已经消费过的 `results`
+            // 当成没送到而重发。
+            let sessions_running = params
+                .get("sessions")
+                .and_then(|sessions| sessions.get("running"))
+                .and_then(Value::as_u64)
+                .map(|running| running as u32);
+
+            match service.driver_step(&snapshot, &results, sessions_running)? {
                 Some(action) => Ok(action.to_json()),
                 // 一拍无事可做：契约形状是 `{"action": null}`。
                 None => Ok(json!({ "action": null })),
             }
         }
         "board.next_launch" => {
-            // 日历上限按当前时刻算；服务内不读时钟，交由这里注入。
-            let calendar =
-                superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
-                    state_dir,
-                );
-            let limit = calendar.limit_at(chrono::Local::now());
-            match service.next_launch(limit, chrono::Local::now()) {
+            // 手工触发的通路（CLI / IPC），手上没有宿主那一拍的快照，只能退化为
+            // 看板内口径。自动化调度一律走 `driver/next`：那里才有全机运行数。
+            let calendar = load_calendar(state_dir, home);
+            let limit = calendar.limit_at(chrono::Local::now()) as usize;
+            let budget = limit.saturating_sub(service.board_running_count());
+            match service.next_launch(budget, chrono::Local::now()) {
                 Ok(Some(claim)) => Ok(json!({
                     "card_id": claim.card_id,
                     "workdir": claim.workdir,
@@ -337,10 +380,9 @@ pub fn dispatch_with_service(
             Ok(json!({ "ok": true }))
         }
         "settings.read" => {
-            let calendar =
-                superpowers_kanban_core::calendar::ConcurrencyCalendar::load_preferring_new(
-                    state_dir,
-                );
+            // 合并视图：并发字段来自全局层，其余来自项目层。调用方拿到的是一份
+            // 完整载荷，不必知道字段归属。
+            let calendar = load_calendar(state_dir, home);
             Ok(json!({ "settings": calendar.settings_json() }))
         }
         "settings.write" => {
@@ -353,12 +395,41 @@ pub fn dispatch_with_service(
                     settings,
                 )
                 .map_err(|error| error.to_string())?;
+            // 校验已全部通过，现在才落盘。两半各写各的：并发字段进全局文件，
+            // 其余留在项目文件。写全局失败时项目层还没动，不会留下半套配置。
+            let home = home.ok_or_else(|| {
+                "could not save settings: HOME is unset, so the global quota file \
+                 has no home"
+                    .to_string()
+            })?;
             calendar
-                .save(state_dir)
-                .map_err(|error| format!("could not save settings: {error}"))?;
+                .save_global_in(home)
+                .map_err(|error| format!("could not save the global settings: {error}"))?;
+            calendar
+                .save_project(state_dir)
+                .map_err(|error| format!("could not save the project settings: {error}"))?;
             Ok(json!({ "ok": true }))
         }
         other => Err(format!("unknown method: {other}")),
+    }
+}
+
+/// 合并视图配置：`home` 决定并发字段从哪读（`None` 时回退内置默认）。
+fn load_calendar(
+    state_dir: &Path,
+    home: Option<&Path>,
+) -> superpowers_kanban_core::calendar::ConcurrencyCalendar {
+    use superpowers_kanban_core::calendar::ConcurrencyCalendar;
+    match home {
+        Some(home) => ConcurrencyCalendar::load_merged_in(state_dir, home),
+        None => {
+            let project = ConcurrencyCalendar::load_project(state_dir);
+            ConcurrencyCalendar {
+                default_max_tasks: superpowers_kanban_core::calendar::DEFAULT_MAX_TASKS,
+                windows: Vec::new(),
+                ..project
+            }
+        }
     }
 }
 
@@ -519,16 +590,20 @@ mod tests {
     fn settings_read_returns_the_calendar_settings() {
         let workdir = tempfile::tempdir().unwrap();
         let state = state_dir(workdir.path());
-        let value = dispatch_with_global(&state, None, "settings.read", &json!({})).unwrap();
+        let home = workdir.path().join("home");
+        let value =
+            dispatch_with_home(&state, Some(&home), None, "settings.read", &json!({})).unwrap();
         assert_eq!(value["settings"]["default_max_tasks"], 3);
         assert_eq!(value["settings"]["interval_secs"], 10);
         assert!(value["settings"]["windows"].as_array().unwrap().is_empty());
     }
 
+    /// 并发字段进全局文件、其余进项目文件；读回来是同一份合并视图。
     #[test]
     fn settings_write_then_read_round_trips() {
         let workdir = tempfile::tempdir().unwrap();
         let state = state_dir(workdir.path());
+        let home = workdir.path().join("home");
         let payload = json!({
             "default_max_tasks": 5,
             "interval_secs": 25,
@@ -536,16 +611,36 @@ mod tests {
                 { "days": "Mon-Fri", "start": "09:00", "end": "24:00", "max_tasks": 3 }
             ]
         });
-        dispatch_with_global(
+        dispatch_with_home(
             &state,
+            Some(&home),
             None,
             "settings.write",
             &json!({ "settings": payload }),
         )
         .unwrap();
-        // 文件确实落在新名下。
-        assert!(state.join("superpowers-kanban.toml").is_file());
-        let value = dispatch_with_global(&state, None, "settings.read", &json!({})).unwrap();
+
+        // 峰值落在插件全局目录，不在项目目录。
+        let global = home.join(".yi-agent/plugins/superpowers-kanban/superpowers-kanban.toml");
+        assert!(global.is_file(), "并发配置必须落到全局文件：{global:?}");
+        let global_text = std::fs::read_to_string(&global).unwrap();
+        assert!(
+            global_text.contains("default_max_tasks = 5"),
+            "{global_text}"
+        );
+        assert!(
+            !state.join("superpowers-kanban.toml").is_file()
+                || !std::fs::read_to_string(state.join("superpowers-kanban.toml"))
+                    .unwrap()
+                    .contains("default_max_tasks")
+        );
+
+        // 项目文件只留三个非并发字段。
+        let project = std::fs::read_to_string(state.join("superpowers-kanban.toml")).unwrap();
+        assert!(project.contains("interval_secs = 25"), "{project}");
+
+        let value =
+            dispatch_with_home(&state, Some(&home), None, "settings.read", &json!({})).unwrap();
         assert_eq!(value["settings"]["default_max_tasks"], 5);
         assert_eq!(value["settings"]["interval_secs"], 25);
         assert_eq!(value["settings"]["windows"].as_array().unwrap().len(), 1);
@@ -555,18 +650,28 @@ mod tests {
     fn an_invalid_settings_write_leaves_no_file() {
         let workdir = tempfile::tempdir().unwrap();
         let state = state_dir(workdir.path());
+        let home = workdir.path().join("home");
         let bad = json!({
             "default_max_tasks": 3,
             "interval_secs": 0,
             "windows": []
         });
-        let error =
-            dispatch_with_global(&state, None, "settings.write", &json!({ "settings": bad }))
-                .unwrap_err();
+        let error = dispatch_with_home(
+            &state,
+            Some(&home),
+            None,
+            "settings.write",
+            &json!({ "settings": bad }),
+        )
+        .unwrap_err();
         assert!(error.contains("interval_secs"), "{error}");
         assert!(
             !state.join("superpowers-kanban.toml").exists(),
             "a rejected write must not leave the settings file behind"
+        );
+        assert!(
+            !home.join(".yi-agent/plugins/superpowers-kanban").exists(),
+            "校验失败时全局文件也不许被创建"
         );
     }
 
@@ -783,6 +888,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["action"], Value::Null, "{value}");
+    }
+
+    /// 线协议里的 `sessions.running` 必须真的被读进来：全机已满时一个都不起。
+    ///
+    /// 这条走的是**完整的一拍**（`dispatch_with_service` → `driver_step`），而不是
+    /// 直接调服务，所以它同时钉住「参数名 `sessions.running` 没写错」——名字写错会
+    /// 静默退化为看板内口径，正则测试看不出来。
+    #[test]
+    fn driver_next_reads_the_machine_wide_running_count_from_the_wire() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let state = state_dir(&project);
+        let service = service_with_one_card(&project);
+        // 全机峰值 2，宿主说已经有 2 个在跑（其中没有本看板的）。
+        let home = project.join("home");
+        superpowers_kanban_core::calendar::ConcurrencyCalendar {
+            default_max_tasks: 2,
+            ..Default::default()
+        }
+        .save_global_in(&home)
+        .unwrap();
+
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [], "results": [], "sessions": { "running": 2 } }),
+        )
+        .unwrap();
+        assert_eq!(
+            value["action"],
+            Value::Null,
+            "全机已达峰值，不许再起：{value}"
+        );
+        // 卡仍是 queued（没被认领、没建 worktree）。
+        let board = crate::persist::read_board(&state);
+        assert_eq!(
+            board
+                .get(&superpowers_kanban_core::card::CardId::new("card-1"))
+                .unwrap()
+                .state,
+            superpowers_kanban_core::card::CardState::Queued
+        );
     }
 
     /// 端到端跨进程契约：一张排队卡 → 恰好一个 `launch`，字段名逐字对齐宿主

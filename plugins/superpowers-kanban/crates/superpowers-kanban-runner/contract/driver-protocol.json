@@ -1,7 +1,7 @@
 {
   "_comment": "宿主 `session_driver` 与插件 `driver/next` 共用的线协议契约。两侧的测试都用 include_str! 读它（编译期依赖，改名/删除也会红）——同一份文件、两端各自断言。任一侧改了字段名而没同步这里，那一侧的测试就红。",
   "request": {
-    "_comment": "宿主 → 插件：`driver/next` 的参数形状（宿主 `threads_payload` / `driver_step` 发出，插件 `dispatch.rs` 手工解析）。",
+    "_comment": "宿主 → 插件：`driver/next` 的参数形状（宿主 `threads_payload` / `driver_step` 发出，插件 `dispatch.rs` 手工解析）。`sessions.running` 是宿主**本进程**此刻的全机运行会话数（`AwaitingApproval` 与人闲都不计），供插件算全机余量；旧宿主不发时插件退化为看板内口径。",
     "threads": [
       {
         "thread_id": "thread-1",
@@ -15,7 +15,10 @@
         "thread_id": "thread-1",
         "error": null
       }
-    ]
+    ],
+    "sessions": {
+      "running": 3
+    }
   },
   "answers": {
     "_comment": "插件 → 宿主：`driver/next` 的三种应答形状。前两种由宿主 `parse_action` 解析成动作，最后一种表示这一拍无事可做。",

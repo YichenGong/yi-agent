@@ -142,12 +142,19 @@ impl ConcurrencyCalendar {
         })
     }
 
-    /// 读取配置；文件缺失、不可读或损坏一律回退默认，绝不 panic。
+    /// 读取项目层配置；文件缺失、不可读或损坏一律回退默认，绝不 panic。
     /// 新名优先、旧名回退、都无则默认。
     ///
     /// `superpowers-kanban.toml` 是迁移后的名字；`kanban.toml` 是旧名，
     /// 仅在旧文件存在且新文件不存在时读取。**从不修改或删除旧文件。**
+    ///
+    /// 读完要按 [`Self::load_merged_in`] 合并——并发字段只认全局层。
     pub fn load_preferring_new(state_dir: &std::path::Path) -> Self {
+        Self::load_project(state_dir)
+    }
+
+    /// 项目层：与配额无关的三个字段（节拍、归档宽限、抢锁等待）。
+    pub fn load_project(state_dir: &std::path::Path) -> Self {
         let new = state_dir.join("superpowers-kanban.toml");
         if new.is_file() {
             return Self::load_or_default(&new);
@@ -157,6 +164,56 @@ impl ConcurrencyCalendar {
             return Self::load_or_default(&legacy);
         }
         Self::default()
+    }
+
+    /// 全局层：并发字段（峰值与时段窗口）的**唯一**来源。
+    ///
+    /// 路径是插件自己的全局目录，不是项目里那份，也不是看板状态目录
+    /// （`<状态>/leases` 放的是运行时的槽位锁，清理它不该抹掉用户配置）。
+    pub fn load_global_in(home: &std::path::Path) -> Self {
+        crate::layout::global_settings_path_in(home)
+            .map(|path| Self::load_or_default(&path))
+            .unwrap_or_default()
+    }
+
+    /// 合并视图：并发字段取全局层，其余取项目层。
+    ///
+    /// 项目层即便还写着 `default_max_tasks` / `window` 也**不读**——限的是总
+    /// 流量，每项目各配一个峰值必然超发（A 配 4、B 配 10 → 全机能到 10）。
+    pub fn load_merged_in(state_dir: &std::path::Path, home: &std::path::Path) -> Self {
+        let global = Self::load_global_in(home);
+        let project = Self::load_project(state_dir);
+        Self {
+            default_max_tasks: global.default_max_tasks,
+            windows: global.windows,
+            interval_secs: project.interval_secs,
+            archive_grace_hours: project.archive_grace_hours,
+            instance_wait_secs: project.instance_wait_secs,
+        }
+    }
+
+    /// 合并视图的生产入口：`HOME` 决定全局层在哪。
+    ///
+    /// 没有 `HOME` 时没有全局层可读——并发回退内置默认，其余仍取项目层。
+    pub fn load_merged(state_dir: &std::path::Path) -> Self {
+        match Self::home_dir() {
+            Some(home) => Self::load_merged_in(state_dir, &home),
+            None => {
+                let project = Self::load_project(state_dir);
+                Self {
+                    default_max_tasks: DEFAULT_MAX_TASKS,
+                    windows: Vec::new(),
+                    ..project
+                }
+            }
+        }
+    }
+
+    /// 当前用户的 home。与 `layout` 的解析口径一致（空值等于没有）。
+    pub fn home_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(std::path::PathBuf::from)
     }
 
     pub fn load_or_default(path: &std::path::Path) -> Self {
@@ -278,15 +335,48 @@ impl ConcurrencyCalendar {
     }
 
     /// 原子写：临时文件 + rename。只写新名 `superpowers-kanban.toml`。
-    pub fn save(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
+    ///
+    /// 写的是**全局**那份（并发字段的唯一落点）。项目层用
+    /// [`Self::save_project`]，它刻意不写并发字段。
+    pub fn save_global_in(&self, home: &std::path::Path) -> std::io::Result<()> {
+        let dir = crate::layout::global_plugin_dir(home);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("superpowers-kanban.toml");
+        let tmp = dir.join(format!(
+            "superpowers-kanban.toml.{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, self.to_toml())?;
+        std::fs::rename(&tmp, &path)
+    }
+
+    /// 项目层只写与配额无关的三个字段。
+    ///
+    /// 刻意不写 `default_max_tasks` / `window`：写进去也读不到，只会让人以为
+    /// 「在这里配了峰值」，实际生效的是全局那份。
+    pub fn save_project(&self, state_dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(state_dir)?;
         let path = state_dir.join("superpowers-kanban.toml");
         let tmp = state_dir.join(format!(
             "superpowers-kanban.toml.{}.tmp",
             std::process::id()
         ));
-        std::fs::write(&tmp, self.to_toml())?;
+        let text = format!(
+            "interval_secs = {}\narchive_grace_hours = {}\ninstance_wait_secs = {}\n",
+            self.interval_secs, self.archive_grace_hours, self.instance_wait_secs
+        );
+        std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &path)
+    }
+
+    /// 旧名：写全局那份。留着只为不让既有调用点在这次改造里全部改签名。
+    pub fn save(&self, _state_dir: &std::path::Path) -> std::io::Result<()> {
+        match Self::home_dir() {
+            Some(home) => self.save_global_in(&home),
+            None => Err(std::io::Error::other(
+                "cannot save the global settings: HOME is unset",
+            )),
+        }
     }
 }
 
@@ -563,7 +653,7 @@ max_tasks = 10
         )
         .unwrap();
         assert_eq!(
-            ConcurrencyCalendar::load_preferring_new(dir.path()).default_max_tasks,
+            ConcurrencyCalendar::load_project(dir.path()).default_max_tasks,
             10
         );
     }
@@ -573,7 +663,7 @@ max_tasks = 10
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("kanban.toml"), "default_max_tasks = 3\n").unwrap();
         assert_eq!(
-            ConcurrencyCalendar::load_preferring_new(dir.path()).default_max_tasks,
+            ConcurrencyCalendar::load_project(dir.path()).default_max_tasks,
             3
         );
     }
@@ -841,13 +931,116 @@ max_tasks = 3
 
     #[test]
     fn save_then_load_prefers_the_new_file() {
+        let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let calendar =
             ConcurrencyCalendar::from_toml("interval_secs = 45\ndefault_max_tasks = 7").unwrap();
-        calendar.save(dir.path()).unwrap();
+        // 并发字段落全局层，其余落项目层；两处都写才是「保存」。
+        calendar.save_global_in(home.path()).unwrap();
+        calendar.save_project(dir.path()).unwrap();
+
         assert!(dir.path().join("superpowers-kanban.toml").is_file());
-        let loaded = ConcurrencyCalendar::load_preferring_new(dir.path());
+        let loaded = ConcurrencyCalendar::load_merged_in(dir.path(), home.path());
         assert_eq!(loaded.interval_secs, 45);
         assert_eq!(loaded.default_max_tasks, 7);
+    }
+
+    // --- 全局层 / 项目层的字段归属 ---------------------------------------
+
+    #[test]
+    fn the_global_settings_live_under_the_plugin_directory() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            crate::layout::global_settings_path_in(home),
+            Some(
+                Path::new("/home/someone")
+                    .join(".yi-agent/plugins/superpowers-kanban/superpowers-kanban.toml")
+            ),
+            "并发配置必须落在插件自己的全局目录，而不是看板状态目录"
+        );
+    }
+
+    #[test]
+    fn a_project_level_max_tasks_is_ignored_in_favour_of_the_global_one() {
+        let home = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        // 项目文件里写 9：老版本会照它起 9 个，现在必须被忽略。
+        std::fs::write(
+            state.path().join("superpowers-kanban.toml"),
+            "default_max_tasks = 9\ninterval_secs = 45\n",
+        )
+        .unwrap();
+        ConcurrencyCalendar {
+            default_max_tasks: 2,
+            ..Default::default()
+        }
+        .save_global_in(home.path())
+        .unwrap();
+
+        let merged = ConcurrencyCalendar::load_merged_in(state.path(), home.path());
+        assert_eq!(merged.default_max_tasks, 2, "并发峰值只认全局层");
+        assert_eq!(merged.interval_secs, 45, "节拍仍来自项目层");
+    }
+
+    #[test]
+    fn a_missing_global_file_falls_back_to_the_builtin_default() {
+        let home = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            state.path().join("superpowers-kanban.toml"),
+            "default_max_tasks = 9\n",
+        )
+        .unwrap();
+
+        let merged = ConcurrencyCalendar::load_merged_in(state.path(), home.path());
+        assert_eq!(
+            merged.default_max_tasks,
+            crate::calendar::DEFAULT_MAX_TASKS,
+            "没有全局文件时用内置默认，绝不退回项目层的 9"
+        );
+        assert!(merged.windows.is_empty());
+    }
+
+    #[test]
+    fn non_concurrency_fields_still_come_from_the_project_file() {
+        let home = tempfile::TempDir::new().unwrap();
+        let state = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            state.path().join("superpowers-kanban.toml"),
+            "interval_secs = 45\narchive_grace_hours = 12\ninstance_wait_secs = 7\n",
+        )
+        .unwrap();
+        ConcurrencyCalendar {
+            default_max_tasks: 3,
+            interval_secs: 999,
+            ..Default::default()
+        }
+        .save_global_in(home.path())
+        .unwrap();
+
+        let merged = ConcurrencyCalendar::load_merged_in(state.path(), home.path());
+        assert_eq!(merged.interval_secs, 45);
+        assert_eq!(merged.archive_grace_hours, 12);
+        assert_eq!(merged.instance_wait_secs, 7);
+        assert_eq!(merged.default_max_tasks, 3, "并发字段反过来不读项目层");
+    }
+
+    #[test]
+    fn saving_the_project_level_never_writes_the_concurrency_fields() {
+        let state = tempfile::TempDir::new().unwrap();
+        let calendar = ConcurrencyCalendar {
+            default_max_tasks: 5,
+            interval_secs: 45,
+            ..Default::default()
+        };
+        calendar.save_project(state.path()).unwrap();
+
+        let text = std::fs::read_to_string(state.path().join("superpowers-kanban.toml")).unwrap();
+        assert!(
+            !text.contains("default_max_tasks"),
+            "项目层不该写峰值：写了也读不到，只会误导：{text}"
+        );
+        assert!(!text.contains("window"));
+        assert!(text.contains("interval_secs = 45"));
     }
 }

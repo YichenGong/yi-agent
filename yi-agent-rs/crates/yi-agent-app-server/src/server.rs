@@ -5695,6 +5695,11 @@ async fn driver_tick<F>(
                 })
                 .collect();
             let idle = move |thread_id: &str| snapshot.get(thread_id).copied().unwrap_or(false);
+            // 全机运行会话数:必须在构造 launcher **之前**算——launcher 持有
+            // `&mut threads`,之后再借 `threads` 就是借用冲突。口径与上面的 idle
+            // 快照同源(同一份 `ThreadSession`),所有归属的会话都在内:手动开的、
+            // 别的插件起的、看板起的。插件靠它算「全机余量」,限的是总流量。
+            let sessions_running = crate::session_driver::running_sessions(threads);
             // 该 (项目, 插件) 的驱动记账跨 tick 存活:`results` 要在下一拍回报,
             // `threads` 要让插件看见自己起过的会话。
             let state = drivers
@@ -5773,6 +5778,7 @@ async fn driver_tick<F>(
                 &mut state.results,
                 &mut launcher,
                 &idle,
+                sessions_running,
             )
             .await;
             // 本拍的结果**不在此处收割**:插件靠 `results` 才知道动作成没成、
@@ -8702,6 +8708,10 @@ mod session_driver_tests {
         // 每拍请求里 `threads[0].idle` 的原样记录(缺省记 `null`)。
         let idle_seen: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
         let recorded_idle = Arc::clone(&idle_seen);
+        // 每拍请求里 `sessions.running` 的原样记录(缺省记 `null`)。
+        let running_seen: Arc<StdMutex<Vec<serde_json::Value>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let recorded_running = Arc::clone(&running_seen);
         let daemon = FakeDaemon::bind(move |_project, method, params| {
             if method != "driver/next" {
                 return Ok(json!({ "ok": true }));
@@ -8712,6 +8722,10 @@ mod session_driver_tests {
                 .lock()
                 .unwrap()
                 .push(params["threads"][0]["idle"].clone());
+            recorded_running
+                .lock()
+                .unwrap()
+                .push(params["sessions"]["running"].clone());
             match seen.fetch_add(1, Ordering::SeqCst) {
                 // 第一拍：起一个会话。
                 0 => Ok(json!({
@@ -8799,6 +8813,15 @@ mod session_driver_tests {
             idle_series,
             vec![serde_json::Value::Null, json!(true), json!(false)],
             "the tick must wire real idle, not a constant: {idle_series:?}"
+        );
+        // 同一份快照里的全机运行数也必须是真事实:三拍依次是「没有会话 → 0」
+        // 「首轮已收尾 → 0」「刚追加的一轮在飞 → 1」。看板靠这个数算全机余量,
+        // 填常量就等于把配额判定废掉。
+        let running_series: Vec<serde_json::Value> = running_seen.lock().unwrap().clone();
+        assert_eq!(
+            running_series,
+            vec![json!(0), json!(0), json!(1)],
+            "the tick must report the machine-wide running count: {running_series:?}"
         );
         assert!(
             host.settle_turn(&thread_id, Duration::from_secs(10)).await,
