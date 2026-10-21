@@ -439,12 +439,32 @@ export default function App() {
   /**
    * 「实验功能」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖
    * 即稳定；换新身份会让面板的读取 effect 重跑。
+   *
+   * **写入成功后必须把开关值回灌到这里**。这些值原本只在握手时读一次，而用户
+   * 恰恰是在运行中拨开关的：不回灌的话，拨完开关界面上什么都不会发生——既没有
+   * 入口长出来，也没有任何提示告诉用户"得重启"。
+   *
+   * 回灌的是**权威值**（重读 `flags/list`），不是把 `params.enabled` 直接塞进
+   * state：宿主可能拒绝或改写成别的值（到期、未注册、构建类型硬闸），拿请求里
+   * 的值当结论会显示一个并不存在的状态。
    */
   const flagsCall = useCallback(
     (method: string, params?: unknown): Promise<unknown> => {
       const c = clientRef.current;
       if (!c) return Promise.reject(new Error("not connected"));
-      return c.request(method, params ?? {});
+      const pending = c.request(method, params ?? {});
+      if (method !== "flags/set") return pending;
+      return pending.then(async (result) => {
+        const fresh = await c.request<{
+          flags?: Array<{ name?: unknown; enabled?: unknown }>;
+        }>("flags/list", {});
+        const rows = fresh.flags ?? [];
+        const read = (name: string) =>
+          rows.find((row) => row.name === name)?.enabled === true;
+        setLeadAgentEnabled(read("lead_agent"));
+        setKanbanEnabled(read("superpowers_kanban"));
+        return result;
+      });
     },
     [],
   );
