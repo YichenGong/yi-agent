@@ -2459,7 +2459,9 @@ export default function App() {
                   }
                 : undefined
             }
-            usage={current?.session.usage ?? null}
+            // 累计值是主体；`usage` 快照只作老服务端的兜底。
+            totals={current?.session.usageTotals ?? null}
+            fallbackUsage={current?.session.usage ?? null}
             // 切换会话时数字直接跳终值，不从上一个会话滚过来。
             usageId={sess.currentId}
             /*

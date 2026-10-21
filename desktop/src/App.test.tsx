@@ -1153,6 +1153,56 @@ describe("App slash commands", () => {
     expect(clients[0].requests.some((r) => r.method === "turn/start")).toBe(false);
   });
 
+  it("updates the status bar totals on every provider call", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    const push = (totals: { in: number; out: number; cache: number }) =>
+      act(() => {
+        state.notifHandlers[0]({
+          method: "thread/tokenUsage/updated",
+          params: {
+            thread_id: "t1",
+            model: "claude-sonnet-4",
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 900,
+            total_input_tokens: totals.in,
+            total_output_tokens: totals.out,
+            total_cache_creation_input_tokens: 0,
+            total_cache_read_input_tokens: totals.cache,
+          },
+        });
+      });
+
+    /** 折叠态三组数字的「位数 + 单位」快照，逐位滚动的 DOM 里只有这种稳定结构。 */
+    const layout = () => {
+      const bar = document.querySelector(".app-statusbar")!;
+      return Array.from(bar.querySelectorAll(".rolling-number")).map(
+        (n) =>
+          `${n.querySelectorAll(".rolling-digit").length}${
+            n.querySelector(".rolling-point") ? "." : ""
+          }${n.querySelector(".rolling-unit")?.textContent ?? ""}`,
+      );
+    };
+
+    // 每次调用推送一次累计值，右下角的数字必须跟着变（这正是用户要的实时感）。
+    push({ in: 1_000, out: 100, cache: 9_000 });
+    // 1.0k / 9.0k / 100
+    await waitFor(() => expect(layout()).toEqual(["2.k", "2.k", "3"]));
+
+    push({ in: 2_500, out: 300, cache: 20_000 });
+    // 2.5k / 20.0k / 300
+    await waitFor(() => expect(layout()).toEqual(["2.k", "3.k", "3"]));
+    // 精确句子也同步更新（读屏与文本查询走这一份）。
+    expect(
+      document.querySelector(".app-statusbar .sr-only")?.textContent,
+    ).toBe("2,500 cumulative input / 20,000 cumulative cache read / 300 cumulative output");
+  });
+
   it("reports cumulative usage while context occupancy stays on the snapshot", async () => {
     state.dataSources["config/read"] = () => ({
       provider: "anthropic",
