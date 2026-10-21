@@ -10,7 +10,17 @@ afterEach(() => {
 /** 这些用例只管「加入看板」那条路；预排队另有专门的用例。 */
 const noopPrequeue = async () => {};
 
-const clickEnqueue = () => fireEvent.click(screen.getByRole("button", { name: "加入看板" }));
+/**
+ * 入队入口现在收在「＋」菜单里：先开菜单，再点菜单项。
+ *
+ * 两步而不是一步，是因为卡片列表才是看板首屏的主要内容，一条常驻的入队按钮
+ * 不该占掉它。
+ */
+const openMenu = () => fireEvent.click(screen.getByRole("button", { name: "添加到看板" }));
+const clickEnqueue = () => {
+  openMenu();
+  fireEvent.click(screen.getByRole("menuitem", { name: "加入看板" }));
+};
 
 describe("SuperpowersKanbanEnqueue", () => {
   it("enqueues once with both picked paths", async () => {
@@ -110,11 +120,9 @@ describe("SuperpowersKanbanEnqueue", () => {
     await waitFor(() =>
       expect(screen.getByText("spec file does not exist: /p/a.spec.md")).toBeTruthy(),
     );
-    // The button must not be left disabled: a rejected pair is fixable.
-    expect(screen.getByRole("button", { name: "加入看板" })).toBeTruthy();
-    expect((screen.getByRole("button", { name: "加入看板" }) as HTMLButtonElement).disabled).toBe(
-      false,
-    );
+    // 失败不关菜单、也不禁用按钮：一对选错的路径是能改的。
+    const item = screen.getByRole("menuitem", { name: "加入看板" }) as HTMLButtonElement;
+    expect(item.disabled).toBe(false);
   });
 
   it("ignores a second click while the first is still in flight", async () => {
@@ -153,6 +161,7 @@ describe("SuperpowersKanbanEnqueue", () => {
         }}
       />,
     );
+    openMenu();
     fireEvent.change(screen.getByLabelText("预排队标题"), { target: { value: "my idea" } });
     fireEvent.click(screen.getByRole("button", { name: "预排队" }));
     expect(calls).toEqual(["my idea"]);
@@ -170,7 +179,35 @@ describe("SuperpowersKanbanEnqueue", () => {
         }}
       />,
     );
+    openMenu();
     fireEvent.click(screen.getByRole("button", { name: "预排队" }));
     expect(calls).toEqual([]);
+  });
+});
+
+describe("SuperpowersKanbanEnqueue menu", () => {
+  const props = {
+    pickFile: async () => null,
+    enqueue: async () => {},
+    prequeue: async () => {},
+  };
+
+  it("keeps both entries hidden until the plus is clicked", () => {
+    render(<SuperpowersKanbanEnqueue {...props} />);
+    // 平时只有一个「＋」：入队是低频动作，不该占掉看板首屏。
+    expect(screen.queryByRole("menuitem", { name: "加入看板" })).toBeNull();
+    expect(screen.queryByLabelText("预排队标题")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "添加到看板" }));
+    expect(screen.getByRole("menuitem", { name: "加入看板" })).toBeTruthy();
+    expect(screen.getByLabelText("预排队标题")).toBeTruthy();
+  });
+
+  it("closes on Escape and gives focus back to the plus", () => {
+    render(<SuperpowersKanbanEnqueue {...props} />);
+    const trigger = screen.getByRole("button", { name: "添加到看板" });
+    fireEvent.click(trigger);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.queryByRole("menuitem", { name: "加入看板" })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
   });
 });

@@ -1435,7 +1435,9 @@ describe("App 主区域看板", () => {
     expect(await screen.findByText("Superpowers 看板")).toBeTruthy();
     // 收起已删除：离开看板走「点会话」，不再有「收起看板」按钮。
     expect(screen.queryByLabelText("收起看板")).toBeNull();
-    expect(screen.getByRole("button", { name: "加入看板" })).toBeTruthy();
+    // 入队仍可达，但收在「＋」菜单里，不再占一整行。
+    expect(screen.getByRole("button", { name: "添加到看板" })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: "加入看板" })).toBeNull();
   });
 
   it("看板的所有读写都带上该项目的 project", async () => {
@@ -1458,72 +1460,53 @@ describe("App 主区域看板", () => {
     expect(queries.map((r) => (r.params as { method?: string }).method)).toContain("list");
   });
 
-  it("开关写入失败会显示错误，而不是静默", async () => {
+  it("看板面板里没有开关可拨：创建时已经决定过了", async () => {
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
-    // 宿主把语义码放在 data.code 里，message 只剩人话。
-    state.hostError["switch.write"] = {
-      code: -32603,
-      message: "看板读写失败",
-      data: { code: "some_other_failure" },
-    };
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
     await openBoardFor("/proj");
+    await screen.findByText("Superpowers 看板");
 
-    fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
-
-    expect(await screen.findByText(/看板读写失败/)).toBeTruthy();
+    // 一个看板存在 = 建它的时候插件已装、开关已开。再问一次是多余的问题。
+    expect(screen.queryByLabelText("Superpowers 看板开关")).toBeNull();
+    // 值守也不再在这里：它管的是宿主，已迁到设置页「通用」。
+    expect(screen.queryByLabelText("后台值守（开机自启）开关")).toBeNull();
+    // 状态本身必须留下：它是「这个看板为什么不动」的唯一线索。
+    expect(screen.getByText(/运行中|已停用/)).toBeTruthy();
+    expect(screen.getByText(/default|project|global/)).toBeTruthy();
   });
 
-  it("开关写入失败：daemon 不可达与插件没装各有各的说法", async () => {
+  it("移除看板会真的卸载插件，而不只是撤销登记", async () => {
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
-    state.hostError["switch.write"] = {
-      code: -32603,
-      message: "daemon is unavailable: connection refused",
-      data: { code: "daemon_unavailable" },
-    };
-    const first = render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
-
-    expect(await screen.findByText(/看板进程不可达/)).toBeTruthy();
-    // 「连不上」绝不能被说成「插件没装」：那会让用户去装一个已经装好的插件。
-    expect(screen.queryByText(/插件未安装/)).toBeNull();
-    first.unmount();
-
-    state.hostError["switch.write"] = {
-      code: -32603,
-      message: "plugin superpowers-kanban is not available",
-      data: { code: "plugin_unavailable" },
-    };
     render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
+    const header = await waitFor(() => {
+      const h = document.querySelector<HTMLElement>('[data-ws-header="/proj"]');
+      expect(h).not.toBeNull();
+      return h!;
+    });
+    fireEvent.contextMenu(header);
+    // 「移除看板会删除…且不可恢复」的二次确认。
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    fireEvent.click(screen.getByText("移除看板"));
+    confirm.mockRestore();
 
-    expect(await screen.findByText(/插件未安装/)).toBeTruthy();
-  });
-
-  it("旧 board_not_created 码不再给「创建看板」按钮（创建入口只在侧栏右键菜单）", async () => {
-    state.boards = [{ project: "/proj" }];
-    state.groupWorkspaces = ["/proj"];
-    state.hostError["switch.write"] = {
-      code: -32603,
-      message: "这个项目还没有看板",
-      data: { code: "board_not_created" },
-    };
-    render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
-    fireEvent.click(await screen.findByLabelText("Superpowers 看板开关"));
-
-    // 摘掉门控后宿主不再发这个码；即便收到，也只当一次说不清的失败，
-    // 面板不再提供那条专属出路（创建入口保留在侧栏项目右键菜单）。
-    await screen.findByText(/看板读写失败/);
-    expect(screen.queryByRole("button", { name: "创建看板" })).toBeNull();
+    // 只发 lifecycle/remove 的话，daemon 还在跑、清单还在——插件下一拍就把
+    // 状态目录重建出来，用户看到的是「删不掉」。
+    await waitFor(() =>
+      expect(clients[0].requests).toContainEqual({
+        method: "plugin/uninstall",
+        params: { project: "/proj", plugin: "superpowers-kanban" },
+      }),
+    );
+    const lifecycle = clients[0].requests.filter(
+      (r) =>
+        r.method === "plugin/uninstall" ||
+        (r.method === "plugin/query" &&
+          (r.params as { method?: string })?.method === "lifecycle/remove"),
+    );
+    expect(lifecycle[0].method).toBe("plugin/uninstall");
   });
 
   it("侧栏「创建」入口先装插件、再走通用 plugin/query 建盘", async () => {
@@ -1698,15 +1681,18 @@ describe("App Superpowers 看板 enqueue", () => {
     state.groupWorkspaces = ["/proj"];
   });
 
-  const clickEnqueue = () =>
-    fireEvent.click(screen.getByRole("button", { name: "加入看板" }));
+  /** 入队入口收在顶栏「＋」里：先开菜单，再点菜单项。 */
+  const clickEnqueue = () => {
+    fireEvent.click(screen.getByRole("button", { name: "添加到看板" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "加入看板" }));
+  };
 
   /** 选中 /proj 的看板，等主区域把面板画出来。 */
   const openBoard = async () => {
     render(<App />);
     await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
     await openBoardFor("/proj");
-    await screen.findByRole("button", { name: "加入看板" });
+    await screen.findByRole("button", { name: "添加到看板" });
   };
 
   it("sends one enqueue with both picked paths", async () => {
@@ -1760,9 +1746,9 @@ describe("App Superpowers 看板 enqueue", () => {
     clickEnqueue();
 
     await waitFor(() => expect(screen.getByText(/forced -32000/)).toBeTruthy());
-    // Still usable after the failure.
+    // Still usable after the failure: 菜单没关，菜单项也没被禁用。
     expect(
-      (screen.getByRole("button", { name: "加入看板" }) as HTMLButtonElement).disabled,
+      (screen.getByRole("menuitem", { name: "加入看板" }) as HTMLButtonElement).disabled,
     ).toBe(false);
   });
 });
@@ -2156,16 +2142,20 @@ describe("App settings & theme wiring", () => {
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
   });
 
-  it("reads resident_daemon_watchman_enabled and writes it back when the panel toggles it", async () => {
+  it("reads resident_daemon_watchman_enabled and writes it back from 设置 > 通用", async () => {
     // 值守是宿主级设置，与主题同走 ui/settings/*（而不是带 project 的
     // plugin/query）：这里只是把这趟 read 的值 stub 成 false；默认口径其实是开
     // （配置里没这个键也当开），点一下要写回 true。
+    //
+    // 它原先挂在看板面板里，但它装的是服务所有项目的通用登录项——放在看板页
+    // 等于让用户以为自己只对这个项目生效。
     state.boards = [{ project: "/proj" }];
     state.groupWorkspaces = ["/proj"];
     state.dataSources["ui/settings/read"] = () => ({ theme: "dark", resident_daemon_watchman_enabled: false });
     render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "通用" }));
 
     const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
     expect(box.checked).toBe(false);
@@ -2185,8 +2175,9 @@ describe("App settings & theme wiring", () => {
     state.groupWorkspaces = ["/proj"];
     state.dataSources["ui/settings/read"] = () => ({ theme: "dark", board_watchman_enabled: false });
     render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "通用" }));
 
     const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
     expect(box.checked).toBe(false);
@@ -2203,8 +2194,9 @@ describe("App settings & theme wiring", () => {
         ? { warning: "未能在登录项中安装值守" }
         : {};
     render(<App />);
-    await waitFor(() => expect(screen.getByLabelText("看板")).toBeTruthy());
-    await openBoardFor("/proj");
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "通用" }));
 
     const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
     expect(box.checked).toBe(true);
@@ -2228,7 +2220,8 @@ describe("App settings & theme wiring", () => {
     await settle();
     // 首屏 read 在途，面板还没法开——先把 handshake 放过去把面板拿到屏上。
     await resolveRead({ theme: "dark", resident_daemon_watchman_enabled: true });
-    await openBoardFor("/proj");
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "通用" }));
     const box = (await screen.findByLabelText("后台值守（开机自启）开关")) as HTMLInputElement;
     expect(box.checked).toBe(true);
 

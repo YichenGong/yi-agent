@@ -9,6 +9,7 @@ describe("RPC route table", () => {
   it("keeps every method name at its frozen wire value", () => {
     expect(RPC.pluginQuery).toBe("plugin/query");
     expect(RPC.pluginInstall).toBe("plugin/install");
+    expect(RPC.pluginUninstall).toBe("plugin/uninstall");
     expect(RPC.pluginsList).toBe("plugins/list");
     expect(RPC.residentList).toBe("resident/list");
     expect(RPC.onboardingStatus).toBe("onboarding/status");

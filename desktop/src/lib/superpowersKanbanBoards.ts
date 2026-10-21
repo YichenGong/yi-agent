@@ -41,14 +41,36 @@ export async function createBoard(rpc: BoardRpc, project: string): Promise<void>
   });
 }
 
-/** 删掉该项目的看板（撤销常驻登记 + 插件删自己的状态目录）。不可逆，调用方必须先二次确认。 */
+/**
+ * 彻底摘掉该项目的看板：卸载插件，而不只是撤销登记。
+ *
+ * 曾经的实现只发 `lifecycle/remove`（撤销常驻登记 + 插件删状态目录），于是
+ * 「移除」之后 daemon 仍在跑、清单还在、开关还开着——插件下一拍就把目录重建
+ * 出来，用户看到的是「删不掉」。
+ *
+ * 现在的顺序是「先卸载、后兜底」：
+ * 1. `plugin/uninstall`：宿主侧删清单/开关/日志、停掉该插件子进程，并请插件
+ *    自己撤登记。这一步之后 supervisor 不会再拉起它。
+ * 2. `lifecycle/remove`：幂等兜底。插件在第 1 步里可能已经不在了（没跑、没装），
+ *    那一拍的 `release` 就没做成；这里再补一次，且此时目录已清空，写不出东西。
+ *
+ * 兜底失败不改变结果：第 1 步成功后看板确实已经不在了，此时因为兜底调用失败
+ * 而把整次移除报成失败，只会让用户以为没删掉、再点一次。故它被显式忽略。
+ *
+ * 不可逆（队列状态会被删掉），调用方必须先二次确认。
+ */
 export async function removeBoard(rpc: BoardRpc, project: string): Promise<void> {
-  await rpc(RPC.pluginQuery, {
-    plugin: KANBAN_PLUGIN,
-    project,
-    method: "lifecycle/remove",
-    params: { project },
-  });
+  await rpc(RPC.pluginUninstall, { project, plugin: KANBAN_PLUGIN });
+  try {
+    await rpc(RPC.pluginQuery, {
+      plugin: KANBAN_PLUGIN,
+      project,
+      method: "lifecycle/remove",
+      params: { project },
+    });
+  } catch {
+    // 插件已随卸载消失：这正是预期。兜底只为覆盖「它还活着但没登记」的窄窗口。
+  }
 }
 
 /**

@@ -15,6 +15,12 @@
 //! 决定，而它默认是关的。只装清单等于「进程起来了但队列永不推进」——
 //! 用户看到的是一个死看板。因此安装 = 写清单 + 开开关，两件事不可分
 //! （spec §4.4.1）。
+//!
+//! # 卸载是对称的
+//!
+//! [`uninstall_manifest_for`] 是 [`install_manifest_for`] 的镜像：删清单、删
+//! 开关、删日志。装与卸必须成对，否则「移除」会留下一个装不回去也卸不干净的
+//! 半状态——见 `docs/superpowers/specs/2026-10-22-kanban-panel-simplify-design.md`。
 
 use std::path::{Path, PathBuf};
 
@@ -137,6 +143,125 @@ impl ManifestSnapshot {
     }
 }
 
+/// 把 `switch_key` 置为 `true`，保留 `preferences.json` 里的其它键。
+///
+/// read-modify-write + 同级 `tmp` + `rename`，与 `runtime_prefs::save` 同型：
+/// 这个文件是**多写者共享**的（运行时偏好、各插件的开关），整份覆盖会静默
+/// 抹掉别人的键。缺失或损坏的文件当作空对象——一个坏文件不该让安装失败，
+/// 也不该让别人的键陪葬。
+pub fn enable_switch(project: &Path, switch_key: &str) -> std::io::Result<()> {
+    if switch_key.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a manifest without a switch_key cannot be enabled",
+        ));
+    }
+    let dir = project.join(".yi-agent");
+    std::fs::create_dir_all(&dir)?;
+    let path = project_preferences_path(project);
+    let mut object = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        Err(_) => serde_json::Map::new(),
+    };
+    object.insert(switch_key.to_string(), serde_json::Value::Bool(true));
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .map_err(std::io::Error::other)?;
+    // 临时名逐次唯一：`preferences.json` 是多写者共享文件（运行时偏好、各插件
+    // 开关），固定名会让并发写者互相截断，最终文件可能整份坏掉。
+    write_atomic(&dir, "preferences.json", &text)?;
+    Ok(())
+}
+
+/// 静默地删掉清单文件（不存在也算成功），返回原本是否存在。
+///
+/// 与 [`install_manifest_for`] 严格对称：同一个名字校验、同一个落点。名字可能
+/// 来自请求参数，故校验不能只在写侧做——`remove_manifest("../x", ...)` 同样能
+/// 在项目外删文件。
+pub fn remove_manifest(project: &Path, plugin_name: &str) -> std::io::Result<bool> {
+    if !is_valid_plugin_name(plugin_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("`{plugin_name}` is not a usable plugin name"),
+        ));
+    }
+    let path = manifests_dir(project).join(format!("{plugin_name}.json"));
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// 把 `switch_key` 从 `preferences.json` 里删掉，保留其它键。
+///
+/// 是 [`enable_switch`] 的镜像，但删键而不是写 `false`：卸载要留下的是「这个
+/// 插件在这里从未存在过」，而不是一个仍会被读到的 `false`。写 `false` 的话，
+/// 下次重装再打开开关时，那个键的来历就没人说得清了。
+///
+/// 键本来就不在时**不写文件**：一次空操作的调用不该改动别人的键，哪怕只是
+/// 重新序列化一遍（缩进、键序都会变）。
+pub fn disable_switch(project: &Path, switch_key: &str) -> std::io::Result<()> {
+    if switch_key.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a manifest without a switch_key cannot be disabled",
+        ));
+    }
+    let path = project_preferences_path(project);
+    // 缺文件 / 损坏 / 不是对象：都当作「没有可删的键」。卸载不该因为一份坏文件
+    // 而失败，也不该顺手把坏内容重写成一个空对象——那会抹掉别人的键。
+    let Some(mut object) = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return Ok(());
+    };
+    if object.remove(switch_key).is_none() {
+        return Ok(());
+    }
+    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
+        .map_err(std::io::Error::other)?;
+    let dir = project.join(".yi-agent");
+    std::fs::create_dir_all(&dir)?;
+    write_atomic(&dir, "preferences.json", &text)?;
+    Ok(())
+}
+
+/// 卸掉一个插件在一个项目里的**文件层**痕迹：开关、日志、清单。
+///
+/// 只做文件收尾。停进程要 socket 句柄、撤常驻登记要宿主级别的登记目录，
+/// 它们都不在本模块的职责内（与安装对称：安装也只写清单与开关，拉起进程是
+/// 调用方的事）。
+///
+/// 每一步都尽力而为，最后返回所有失败原因而不是在第一个错误处停下：
+/// 一个半卸载的插件既不会被 supervisor 拉起、又还占着开关，最难排查。
+/// **清单最后删**——删掉它之后 supervisor 就再也拉不起这个插件，前面任何一步
+/// 失败都还想留一条「至少还能再装一次」的路。
+pub fn uninstall_manifest_for(project: &Path, plugin_name: &str, switch_key: &str) -> Vec<String> {
+    let mut failures = Vec::new();
+    if let Err(error) = disable_switch(project, switch_key) {
+        failures.push(format!(
+            "could not remove the `{switch_key}` preference: {error}"
+        ));
+    }
+    let log = crate::supervisor::Layout::for_workdir(project)
+        .logs_dir()
+        .join(format!("{plugin_name}.log"));
+    match std::fs::remove_file(&log) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => failures.push(format!("could not remove {}: {error}", log.display())),
+    }
+    if let Err(error) = remove_manifest(project, plugin_name) {
+        failures.push(format!("could not remove the supervisor manifest: {error}"));
+    }
+    failures
+}
+
 /// 本模块在临时文件名里留的写者标记。
 ///
 /// 不能只靠进程内计数器：`settings_store` 也写同一个 `preferences.json`，而它
@@ -192,38 +317,6 @@ fn write_atomic(dir: &Path, file: &str, contents: &str) -> std::io::Result<()> {
         }
         return Ok(());
     }
-}
-
-/// 把 `switch_key` 置为 `true`，保留 `preferences.json` 里的其它键。
-///
-/// read-modify-write + 同级 `tmp` + `rename`，与 `runtime_prefs::save` 同型：
-/// 这个文件是**多写者共享**的（运行时偏好、各插件的开关），整份覆盖会静默
-/// 抹掉别人的键。缺失或损坏的文件当作空对象——一个坏文件不该让安装失败，
-/// 也不该让别人的键陪葬。
-pub fn enable_switch(project: &Path, switch_key: &str) -> std::io::Result<()> {
-    if switch_key.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "a manifest without a switch_key cannot be enabled",
-        ));
-    }
-    let dir = project.join(".yi-agent");
-    std::fs::create_dir_all(&dir)?;
-    let path = project_preferences_path(project);
-    let mut object = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| value.as_object().cloned())
-            .unwrap_or_default(),
-        Err(_) => serde_json::Map::new(),
-    };
-    object.insert(switch_key.to_string(), serde_json::Value::Bool(true));
-    let text = serde_json::to_string_pretty(&serde_json::Value::Object(object))
-        .map_err(std::io::Error::other)?;
-    // 临时名逐次唯一：`preferences.json` 是多写者共享文件（运行时偏好、各插件
-    // 开关），固定名会让并发写者互相截断，最终文件可能整份坏掉。
-    write_atomic(&dir, "preferences.json", &text)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -318,6 +411,86 @@ mod tests {
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn disabling_the_switch_removes_only_that_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let preferences = project_preferences_path(dir.path());
+        std::fs::create_dir_all(preferences.parent().unwrap()).unwrap();
+        std::fs::write(&preferences, r#"{"subagent_runtime":"x","demo_on":true}"#).unwrap();
+
+        disable_switch(dir.path(), "demo_on").unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&preferences).unwrap()).unwrap();
+        assert_eq!(value["subagent_runtime"], "x");
+        assert!(
+            value.get("demo_on").is_none(),
+            "the key must be gone, not set to false: {value}"
+        );
+    }
+
+    /// 没有键可删时，文件必须**逐字**不变。
+    ///
+    /// 一个「没东西可删」的调用若也重新序列化一遍，就会顺手改掉用户的缩进与
+    /// 键序——卸载本该是无副作用的那一半。
+    #[test]
+    fn disabling_an_absent_switch_leaves_the_file_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let preferences = project_preferences_path(dir.path());
+        std::fs::create_dir_all(preferences.parent().unwrap()).unwrap();
+        std::fs::write(&preferences, "{ \"other\" : 1 }").unwrap();
+
+        disable_switch(dir.path(), "demo_on").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&preferences).unwrap(),
+            "{ \"other\" : 1 }"
+        );
+    }
+
+    #[test]
+    fn disabling_the_switch_tolerates_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        disable_switch(dir.path(), "demo_on").unwrap();
+        assert!(!project_preferences_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn removing_a_manifest_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
+        assert!(remove_manifest(dir.path(), "demo").unwrap());
+        assert!(!remove_manifest(dir.path(), "demo").unwrap());
+    }
+
+    #[test]
+    fn removing_a_manifest_rejects_a_traversing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = remove_manifest(dir.path(), "../escape").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn uninstalling_clears_the_switch_the_log_and_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        install_manifest_for(dir.path(), "demo", MANIFEST).unwrap();
+        enable_switch(dir.path(), "demo_on").unwrap();
+        let logs = crate::supervisor::Layout::for_workdir(dir.path()).logs_dir();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("demo.log"), "old").unwrap();
+
+        let failures = uninstall_manifest_for(dir.path(), "demo", "demo_on");
+
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(!manifests_dir(dir.path()).join("demo.json").exists());
+        assert!(!logs.join("demo.log").exists());
+        let value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(project_preferences_path(dir.path())).unwrap(),
+        )
+        .unwrap();
+        assert!(value.get("demo_on").is_none(), "{value}");
     }
 
     /// 临时名不得与 `settings_store` 的写法重合。

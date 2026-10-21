@@ -400,6 +400,143 @@ pub(crate) async fn handle_shared(
             )
             .await;
         }
+        "plugin/uninstall" => {
+            // `plugin/install` 的镜像：把一个插件从这个项目里摘干净。
+            //
+            // 顺序是有讲究的，且每一步都对应一个「不这么做就会留下什么」：
+            //
+            // 1. 先问插件自己 `lifecycle/remove`（它还活着，socket 通）。撤销
+            //    常驻登记是插件对自己的承诺，宿主不知道它登记过什么名字；
+            //    状态目录也归它自己删。失败不算致命——下面宿主自己再删一遍，
+            //    但那时已经拿不到「登记是谁写的」这个信息，故尽量在这里做成。
+            // 2. 删状态目录。第 1 步之后可能又被写进一拍（插件还没停）。
+            // 3. 删清单 + 开关 + 日志。
+            //
+            // **为什么不停 daemon**：daemon 是项目级的，同一个项目里跑着用户的
+            // 其它会话。为一个插件的卸载把它停掉，等于顺手掐断用户没让我碰的
+            // 东西。清单删掉后 supervisor 下一拍就会 `stop(&name, "manifest
+            // removed")`，只停这一个子进程——这正是我们要的那一半，而且不动
+            // 别人。插件自身的 `lifecycle/remove` 也已放弃常驻登记，值守不会
+            // 再把它拉起来。
+            let Some(project) = project_arg(&req.params) else {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(id, RpcError::invalid_params("missing or empty project")),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            };
+            let plugin = req
+                .params
+                .get("plugin")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !yi_agent_supervisors::install::is_valid_plugin_name(&plugin) {
+                write_or_fatal(
+                    state,
+                    id.clone(),
+                    err_response(
+                        id,
+                        RpcError::invalid_params("missing or unusable plugin name"),
+                    ),
+                )
+                .await;
+                return Ok(Flow::Continue);
+            }
+            // 开关名只从**已安装的清单**里读，不接受调用方传：卸载一个不存在
+            // 的开关名会把别人的键删掉。没有清单时开关名未知，就没什么可删的。
+            let manifest_path = yi_agent_supervisors::install::manifests_dir(&project)
+                .join(format!("{plugin}.json"));
+            let switch_key = std::fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|text| {
+                    yi_agent_supervisors::manifest::SupervisorManifest::parse(&text).ok()
+                })
+                .map(|manifest| manifest.switch_key);
+
+            let mut warnings: Vec<String> = Vec::new();
+            // 第 1 步：插件自己撤登记 + 删状态目录。best-effort：它没装、没跑、
+            // 或干脆不认这个方法，都不该让卸载失败——宿主下面照样能清干净
+            // 文件层的痕迹，而「进程还在跑」会由删清单后的监督一拍收掉。
+            //
+            // 先探 daemon 是否在应答：不在时**静默跳过**，不记警告。卸载一个
+            // 本来就没在跑的插件是常态（比如重启后），那不是「插件拒绝配合」，
+            // 把它写成警告只会让一次正常的卸载看起来有问题。
+            //
+            // 也**不走门禁**（`plugin_gate`）：门禁的语义是「这个功能关着，别
+            // 用了」，而这里要做的恰恰是把关着的东西收拾干净。用一个被关掉的
+            // 开关挡住卸载，会让用户永远清不掉它。
+            let retire = {
+                let project = project.clone();
+                let plugin = plugin.clone();
+                tokio::task::spawn_blocking(move || {
+                    if !yi_agent_supervisors::daemon::is_running(&project) {
+                        return Ok(());
+                    }
+                    plugin_query(
+                        &project,
+                        "lifecycle/remove",
+                        &plugin,
+                        json!({ "project": project.to_string_lossy() }),
+                        None,
+                    )
+                    .map(|_| ())
+                })
+                .await
+            };
+            match retire {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warnings.push(format!(
+                    "the plugin could not retire itself ({}); its state is being removed by the host",
+                    error.message
+                )),
+                Err(error) => {
+                    warnings.push(format!("the plugin-retire task failed: {error}"));
+                }
+            }
+            // 第 2 步：再删一次状态目录。落点与 supervisor 的约定一致
+            // （`<project>/.yi-agent/<manifest name>`），不写死任何插件名。
+            let state_dir =
+                yi_agent_supervisors::supervisor::Layout::for_workdir(&project).state_dir(&plugin);
+            match std::fs::remove_dir_all(&state_dir) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warnings.push(format!(
+                    "could not remove the plugin state dir {}: {error}",
+                    state_dir.display()
+                )),
+            }
+            // 第 3 步：清单 + 开关 + 日志。删清单就是「让 supervisor 停掉它」
+            // 的那一下，故放在最后：前面都成功之后，才允许它不再被拉起。
+            if let Some(switch_key) = switch_key {
+                warnings.extend(yi_agent_supervisors::install::uninstall_manifest_for(
+                    &project,
+                    &plugin,
+                    &switch_key,
+                ));
+            } else if let Err(error) =
+                yi_agent_supervisors::install::remove_manifest(&project, &plugin)
+            {
+                warnings.push(format!("could not remove the supervisor manifest: {error}"));
+            }
+            write_or_fatal(
+                state,
+                id.clone(),
+                ok_response(
+                    id,
+                    json!({
+                        // 「文件层已摘干净」——清单不在了，监督器不会再拉起它。
+                        // 进程本身可能还要几百毫秒才退出（下一拍 reconcile），
+                        // 故不谎称「已停」。
+                        "uninstalled": true,
+                        "warnings": warnings,
+                    }),
+                ),
+            )
+            .await;
+        }
         "plugins/list" => {
             let workdir = state.theme_handle.workdir();
             // 清单按项目安装，故作用域可由调用方的 `project` 指定；
