@@ -483,6 +483,49 @@ export function ThreadSidebar({
   const dragFromIndex = dragId === null ? -1 : pinned.findIndex((t) => t.thread_id === dragId);
 
   /**
+   * 正在被拖动的那条会话（进/出组用）。
+   *
+   * 与 `dragId`（置顶区重排）分开：那两个手势的落点语义完全不同——重排改的是
+   * 顺序，进组改的是成员表。共用一个状态会让「拖到组框上」被误判成一次重排。
+   */
+  const [dragThread, setDragThread] = useState<string | null>(null);
+  const [groupDropTarget, setGroupDropTarget] = useState<string | null>(null);
+
+  /** 该会话当前所在的组（多对多，取第一个；"拖出"只从它所在的框里移除）。 */
+  const groupOf = (id: string) => groupsForThread(id)[0] ?? null;
+
+  /**
+   * 拖到组框上：加入该组。
+   *
+   * 已在组里就什么都不做（`threadIds` 会去重，但重发一次仍是一次多余的写）。
+   */
+  const dropIntoGroup = (workspace: string, group: SessionGroup) => {
+    const id = dragThread;
+    setDragThread(null);
+    setGroupDropTarget(null);
+    if (!id || group.threadIds.includes(id)) return;
+    // 组不跨目录：跨 workspace 的落点直接忽略，不弹错（拖拽的失败反馈应当是
+    // "没反应"，而不是一条打断操作的红字）。
+    if (workspaceOfThread(id) !== workspace) return;
+    void onSetGroupMembers(workspace, group.id, [...group.threadIds, id]);
+  };
+
+  /** 拖到框外的项目组头上：从它当前所在的组里移出。 */
+  const dropOutOfGroup = (workspace: string) => {
+    const id = dragThread;
+    setDragThread(null);
+    setGroupDropTarget(null);
+    if (!id) return;
+    const current = groupOf(id);
+    if (!current || current.workspace !== workspace) return;
+    void onSetGroupMembers(
+      current.workspace,
+      current.group.id,
+      current.group.threadIds.filter((x) => x !== id),
+    );
+  };
+
+  /**
    * 多选区间的锚点顺序：与侧栏实际渲染顺序一致（组框成员摊平在框的位置上）。
    *
    * 只用于 Shift 区间选择，取的是**渲染序**而非服务端序——两者在框内相同，
@@ -583,7 +626,30 @@ export function ThreadSidebar({
       <div
         key={group.id}
         data-group-box={group.id}
-        className="mx-2 my-1 rounded-md border border-line-strong"
+        {...(groupDropTarget === group.id ? { "data-group-drop-active": "" } : {})}
+        onDragOver={(e) => {
+          if (dragThread === null) return;
+          // 必须 preventDefault，否则浏览器不认这是合法落点、drop 不会触发。
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+          setGroupDropTarget(group.id);
+        }}
+        onDragLeave={(e) => {
+          // 只在真正离开这个框时清高亮：从框头移到框内的成员行也会派发 dragleave，
+          // 那时 relatedTarget 仍在框内，不该熄灯。
+          if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+          setGroupDropTarget((cur) => (cur === group.id ? null : cur));
+        }}
+        onDrop={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          dropIntoGroup(workspace, group);
+        }}
+        className={`mx-2 my-1 rounded-md border ${
+          groupDropTarget === group.id
+            ? "border-fg-subtle bg-raised/40 ring-1 ring-fg-subtle"
+            : "border-line-strong"
+        }`}
       >
         <div className="flex items-center gap-1 px-2 py-1">
           <button
@@ -757,6 +823,8 @@ export function ThreadSidebar({
     const un = unread.get(t.thread_id);
     const isPinned = t.pinned ?? false;
     const dragging = opts.rowAttr === "pinned";
+    // 非置顶行也可拖，但只用于「进组 / 出组」：不参与置顶区排序。
+    const draggableRow = dragging || opts.rowAttr === "group";
     // 看板会话行多缩进一档（pl-7 vs pl-3）：折叠小节头是 ▸ 视觉起点，其下的
     // 会话若与直属行同一起点，就分不清谁属于谁。缩进让「小节头 → 卡片会话」的
     // 从属关系一眼可读。仅改左内边距，不影响拖拽/点击。
@@ -770,9 +838,15 @@ export function ThreadSidebar({
         key={t.thread_id}
         {...dataAttr}
         data-thread-row={t.thread_id}
-        // 只有置顶分区的行可拖拽；编辑标题态不可拖（否则拖动会打断输入）。
-        draggable={dragging && editingId !== t.thread_id}
-        onDragStart={dragging ? () => setDragId(t.thread_id) : undefined}
+        // 编辑标题态不可拖（否则拖动会打断输入）。
+        draggable={draggableRow && editingId !== t.thread_id}
+        onDragStart={() => {
+          if (dragging) {
+            setDragId(t.thread_id);
+            return;
+          }
+          setDragThread(t.thread_id);
+        }}
         onDragOver={
           dragging
             ? (e) => {
@@ -791,14 +865,12 @@ export function ThreadSidebar({
               }
             : undefined
         }
-        onDragEnd={
-          dragging
-            ? () => {
-                setDragId(null);
-                setDropIndex(null);
-              }
-            : undefined
-        }
+        onDragEnd={() => {
+          setDragId(null);
+          setDropIndex(null);
+          setDragThread(null);
+          setGroupDropTarget(null);
+        }}
         onClick={(e) => {
           if (editingId) return;
           // 多选：Ctrl/Cmd 切换单选，Shift 按当前行序区间选择。没有修饰键时
@@ -1283,6 +1355,20 @@ export function ThreadSidebar({
             e.preventDefault();
             setNewMenuOpen(false);
             setMenu({ kind: menuKind, ws: g.workspace });
+          }}
+          onDragOver={(e) => {
+            // 只在该会话确实属于本目录的某个组时才认这个落点，否则整片区域都会
+            // 变成"可以放"，而松手什么都不发生。
+            if (dragThread === null) return;
+            const cur = groupOf(dragThread);
+            if (!cur || cur.workspace !== g.workspace) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropOutOfGroup(g.workspace);
           }}
           onKeyDown={(e) => {
             // 键盘等价于右键:Enter/Space 打开(或关闭)该组的菜单。

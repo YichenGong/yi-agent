@@ -961,12 +961,25 @@ describe("ThreadSidebar pinned section", () => {
     expect(row.getAttribute("draggable")).not.toBe("true");
   });
 
-  it("does not make unpinned group rows draggable", () => {
-    const { container } = renderSidebar();
-    const notDraggable = Array.from(container.querySelectorAll<HTMLElement>("[data-group-row]")).every(
-      (r) => r.getAttribute("draggable") !== "true",
-    );
-    expect(notDraggable).toBe(true);
+  it("makes group rows draggable but never reorders them on drop", () => {
+    // 非置顶行现在可拖——但只为「拖进/拖出组」，不参与置顶区排序。
+    // 因此这里锁两件事：属性是 true，且落到另一行上不会调用 onReorderPinned。
+    const onReorderPinned = vi.fn();
+    const dragGroups: WorkspaceGroup[] = [
+      {
+        workspace: "/w",
+        exists: true,
+        threads: [thread("1", "a", "/w"), thread("2", "b", "/w")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: dragGroups, onReorderPinned });
+    const rows = container.querySelectorAll<HTMLElement>("[data-group-row]");
+    expect(rows.length).toBeGreaterThan(1);
+    expect(Array.from(rows).every((r) => r.getAttribute("draggable") === "true")).toBe(true);
+
+    fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn() } });
+    fireEvent.drop(rows[1], { dataTransfer: {} });
+    expect(onReorderPinned).not.toHaveBeenCalled();
   });
 
   it("offers a settings button in the footer", () => {
@@ -1881,5 +1894,69 @@ describe("组框：加入会话入口", () => {
     // 展开后两条成员都渲染在框内（explicit：不是只靠总数，顺带确认折叠被打开）。
     expect(container.querySelector('[data-thread-row="a"]')).toBeTruthy();
     expect(container.querySelector('[data-thread-row="b"]')).toBeTruthy();
+  });
+});
+
+describe("拖动会话进组", () => {
+  const dragBase: WorkspaceGroup[] = [
+    {
+      workspace: "/work/projA",
+      exists: true,
+      threads: [
+        thread("a", "A", "/work/projA"),
+        thread("b", "B", "/work/projA"),
+        thread("c", "C", "/work/projA"),
+      ],
+      groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a"] }],
+    },
+  ];
+
+  it("把框外会话拖到组框上即加入该组", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
+
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn(), effectAllowed: "" } });
+    fireEvent.dragOver(box, { dataTransfer: { dropEffect: "" } });
+    fireEvent.drop(box, { dataTransfer: { getData: () => "c" } });
+
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "c"]),
+    );
+  });
+
+  it("框内会员拖回框外空白处即移出该组", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const ws = container.querySelector<HTMLElement>('[data-ws-header="/work/projA"]')!;
+    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
+    fireEvent.drop(ws, { dataTransfer: { getData: () => "a" } });
+
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", []),
+    );
+  });
+
+  it("拖到组框上时高亮该框", () => {
+    const { container } = renderSidebar({ groups: dragBase });
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
+    fireEvent.dragOver(box, { dataTransfer: {} });
+    expect(container.querySelector("[data-group-drop-active]")).toBeTruthy();
+  });
+
+  it("置顶分区内的排序拖拽不受影响", () => {
+    const onReorderPinned = vi.fn();
+    const pinned = [pinnedThread("p1", "one"), pinnedThread("p2", "two")];
+    const { container } = renderSidebar({ groups: dragBase, pinned, onReorderPinned });
+    const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
+    fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn() } });
+    fireEvent.drop(rows[1], { dataTransfer: {} });
+    expect(onReorderPinned).toHaveBeenCalled();
   });
 });
