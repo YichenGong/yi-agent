@@ -118,4 +118,20 @@ mod tests {
             assert_fit(fit, 1280.0, 820.0, 900.0, 600.0);
         }
     }
+
+    /// Guards the one thing two sources of truth can silently disagree on: the
+    /// config opens the window, `fit_main_window` then resizes it. A mismatch
+    /// shows up as a visible jump at launch.
+    #[test]
+    fn config_matches_the_constants() {
+        let raw = include_str!("../tauri.conf.json");
+        let config: serde_json::Value = serde_json::from_str(raw).expect("valid tauri.conf.json");
+        let win = &config["app"]["windows"][0];
+
+        assert_eq!(win["width"].as_f64(), Some(DESIRED.0), "width");
+        assert_eq!(win["height"].as_f64(), Some(DESIRED.1), "height");
+        assert_eq!(win["minWidth"].as_f64(), Some(MIN.0), "minWidth");
+        assert_eq!(win["minHeight"].as_f64(), Some(MIN.1), "minHeight");
+        assert_eq!(win["center"].as_bool(), Some(true), "center");
+    }
 }
