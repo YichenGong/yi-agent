@@ -150,6 +150,7 @@ fn a_git_project_gets_the_delegation_tools() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -237,6 +238,7 @@ fn a_git_project_gets_the_show_git_diff_tool() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling")
     .registry
@@ -296,6 +298,7 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling");
     let bash = tooling.registry.get("bash").expect("bash is registered");
@@ -312,6 +315,76 @@ fn delegation_tooling_uses_the_threads_live_yolo_switch() {
         bash.sandbox_mode(),
         Some("danger-full-access"),
         "flipping the thread YOLO switch must escalate the root bash sandbox"
+    );
+}
+
+/// 驱动会话的 shell 必须看得见插件给的环境变量。
+///
+/// 这是 `state --self` 的**唯一**信息来源：模型看不到 thread id、更不知道自己在
+/// 哪张卡上，只能靠装配期注入。若这里断了，`--self` 会报「当前不在卡片会话里」，
+/// 而看板**不会**替它补状态——卡片就停在原处。
+///
+/// 断言打在**真跑起来的 bash** 上，而不是「参数传进去了」：从
+/// `build_runtime_tooling` 到 `ToolsContext` 再到子进程有三道手，只有跑一次
+/// 才发现哪一道把值丢了。
+#[tokio::test]
+async fn the_session_env_reaches_the_bash_child() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let mut cfg = test_config();
+    cfg.workdir = repo.path().to_path_buf();
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &isolated_models_path(runtime.path()),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let binding = RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        isolated_models_path(runtime.path()),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(binding, attached.attached_root.clone());
+
+    let tooling = build_runtime_tooling(
+        &cfg,
+        &root,
+        "thread-test",
+        yi_agent_core::autonomy::YoloSwitch::new(false),
+        test_theme(),
+        crate::git_diff_tool::GitDiffHandle::new(),
+        Vec::new(),
+        "proj-test".to_string(),
+        crate::lead::LeadInbox::new(),
+        crate::lead::LeadReplies::new(),
+        crate::lead_control::LeadControlInbox::new(),
+        crate::lead_control::LeadControlReplies::new(),
+        None,
+        Some(false),
+        vec![("SUPERPOWERS_KANBAN_CARD".to_string(), "card-1".to_string())],
+    )
+    .expect("tooling");
+
+    let bash = tooling.registry.get("bash").expect("bash is registered");
+    let result = bash
+        .call(serde_json::json!({
+            "command": "echo \"[$SUPERPOWERS_KANBAN_CARD]\"",
+            "timeout": 5,
+            "expected_timeout_sec": 3,
+        }))
+        .await;
+    assert!(!result.is_error, "the child must run: {result:?}");
+    let yi_agent_core::ContentBlock::Text(text) = &result.content[0] else {
+        panic!("expected a text block");
+    };
+    assert!(
+        text.contains("[card-1]"),
+        "the plugin's handle must reach the child: {text}"
     );
 }
 
@@ -364,6 +437,7 @@ fn the_assembly_hands_the_reply_registry_to_ask_lead() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling");
 
@@ -538,6 +612,7 @@ fn only_the_lead_sees_the_memory_tools() {
             // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
             // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
             Some(true),
+            Vec::new(),
         )
         .expect("tooling")
     };
@@ -661,6 +736,7 @@ fn only_the_lead_sees_the_view_tools() {
             // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
             // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
             Some(true),
+            Vec::new(),
         )
         .expect("tooling")
     };
@@ -738,6 +814,7 @@ fn only_the_lead_sees_the_control_tools() {
             // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
             // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
             Some(true),
+            Vec::new(),
         )
         .expect("tooling")
     };
@@ -866,6 +943,7 @@ fn a_lead_in_a_repo_subdirectory_sees_the_memory_tools() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling");
     let names = tooling.registry.names();
@@ -947,6 +1025,7 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling")
     .registry
@@ -1085,6 +1164,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         // 组长开关：这些用例断言的是 root 复用，不涉组长工具，关着即可
         // （也顺带钉住「关掉时装配不报错」）。
         None,
+        // 这些用例不涉注入：空集与 RPC 路径一致。
+        Vec::new(),
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
     let second = attach_delegation(
@@ -1107,6 +1188,8 @@ fn two_threads_in_one_cwd_share_the_daemon_but_not_the_root() {
         // 组长开关：这些用例断言的是 root 复用，不涉组长工具，关着即可
         // （也顺带钉住「关掉时装配不报错」）。
         None,
+        // 这些用例不涉注入：空集与 RPC 路径一致。
+        Vec::new(),
         build_test_agent(None, &cfg.workdir, crate::thread_store::ThreadMode::Normal).unwrap(),
     );
 
@@ -9499,6 +9582,7 @@ fn tooling_names_for(
         crate::lead_control::LeadControlReplies::new(),
         None,
         lead_agent_enabled,
+        Vec::new(),
     )
     .expect("tooling")
     .registry
@@ -16087,6 +16171,7 @@ fn delegation_tooling_carries_the_theme_tool() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling");
     assert!(
@@ -16678,6 +16763,7 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling");
     // Taken *before* the rebuild: a clone shares the caller slot the tools
@@ -18131,6 +18217,7 @@ fn a_card_session_does_not_get_ask_lead() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling")
     .registry
@@ -18158,6 +18245,7 @@ fn a_card_session_does_not_get_ask_lead() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling")
     .registry
@@ -18223,6 +18311,7 @@ fn a_merge_round_session_does_not_get_ask_lead() {
         // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
         // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
         Some(true),
+        Vec::new(),
     )
     .expect("tooling")
     .registry
@@ -18297,6 +18386,7 @@ fn the_lead_does_not_get_ask_lead() {
             // 组长开关：这些用例钉的是「组长之外的判定」（卡片会话、worktree、
             // 谁是谁的组长），开关必须开着它们才测得到目标逻辑。
             Some(true),
+            Vec::new(),
         )
         .expect("tooling")
     };

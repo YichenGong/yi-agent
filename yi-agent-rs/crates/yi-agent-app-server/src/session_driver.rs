@@ -30,6 +30,12 @@ pub(crate) enum DriverActionKind {
         objective: String,
         driver_project: Option<String>,
         driver_ref: Option<String>,
+        /// 插件要注入本会话 shell 的环境变量（键值由插件定义，宿主只透传）。
+        ///
+        /// 为什么让插件给而不是宿主写死：环境变量的键名（例如「这张卡是哪张」）
+        /// 是插件自己的概念。宿主一旦认识某个具体键名，就又变成「宿主懂看板」，
+        /// 而这条边界正是本次改造要守住的。旧插件不发时为无。
+        env: Vec<(String, String)>,
     },
     /// 向已有会话追加一轮。
     Append {
@@ -69,6 +75,17 @@ pub(crate) fn parse_action(value: &Value) -> Option<DriverAction> {
                 .get("driver_ref")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            env: action
+                .get("env")
+                .and_then(Value::as_object)
+                .map(|map| {
+                    map.iter()
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
         },
         "append" => DriverActionKind::Append {
             thread_id: action.get("thread_id")?.as_str()?.to_string(),
@@ -93,10 +110,15 @@ pub(crate) fn is_explicit_no_action(value: &Value) -> bool {
     matches!(value.get("action"), Some(Value::Null))
 }
 
-/// 宿主为本插件启动或追加过的会话（宿主自身的通用记账）。
+/// 宿主为本插件启动过、且插件还没见过「它已经死了」的会话。
+///
+/// `alive` 由主循环每拍按 `threads` 表刷新（成员即活着）。它必须与 `idle` 分开：
+/// `idle` 说「此刻没有 turn 在跑」，`alive` 说「这个会话还在」。插件用后者判
+/// 并发名额与 stale，用前者判「这一轮跑完了没有」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DriverThread {
     pub thread_id: String,
+    pub alive: bool,
 }
 
 /// 一次动作的结果，下一拍回传插件。
@@ -140,6 +162,7 @@ pub(crate) fn threads_payload(
                 serde_json::json!({
                     "thread_id": thread.thread_id,
                     "idle": idle(&thread.thread_id),
+                    "alive": thread.alive,
                 })
             })
             .collect(),
@@ -195,6 +218,8 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
             if let DriverActionKind::Launch { .. } = &action.kind {
                 threads.push(DriverThread {
                     thread_id: thread_id.clone(),
+                    // 刚起的会话当然活着；此后每拍由主循环按 `threads` 表刷新。
+                    alive: true,
                 });
             }
             Some(ActionResult {
@@ -251,12 +276,14 @@ mod tests {
                 objective,
                 driver_project,
                 driver_ref,
+                env,
             } => {
                 assert_eq!(workdir, "/w");
                 assert_eq!(title, "T");
                 assert_eq!(objective, "do it");
                 assert_eq!(driver_project.as_deref(), Some("/proj"));
                 assert_eq!(driver_ref.as_deref(), Some("card-1"));
+                assert!(env.is_empty(), "这条字面量没带 env");
             }
             other => panic!("expected launch, got {other:?}"),
         }
@@ -274,10 +301,12 @@ mod tests {
             DriverActionKind::Launch {
                 driver_project,
                 driver_ref,
+                env,
                 ..
             } => {
                 assert_eq!(driver_project, None);
                 assert_eq!(driver_ref, None);
+                assert!(env.is_empty(), "旧插件不发 env，按空集处理");
             }
             other => panic!("expected launch, got {other:?}"),
         }
@@ -524,6 +553,26 @@ mod tests {
         );
     }
 
+    /// `alive` 必须逐条进线：插件靠它计并发、判 stale。若宿主漏发或写死 `true`，
+    /// 死掉的会话会永久占着名额，卡片也永远不会显示 stale。
+    #[test]
+    fn the_payload_reports_which_sessions_are_still_alive() {
+        let threads = vec![
+            DriverThread {
+                thread_id: "t1".into(),
+                alive: true,
+            },
+            DriverThread {
+                thread_id: "t2".into(),
+                alive: false,
+            },
+        ];
+        let payload = threads_payload(&threads, &|_| true);
+        assert_eq!(payload[0]["alive"], true);
+        assert_eq!(payload[1]["alive"], false);
+        assert_eq!(payload[0]["idle"], true, "idle 语义不变");
+    }
+
     /// 空闲快照必须真的进到 `threads[]` 里：插件唯一的「这轮跑完了」信号就是它
     /// （spec §4.6）。接线时若把参数丢掉、退回写死的 `false`，插件就永远推进不了
     /// 卡片状态，故这里钉住快照与 thread_id 的对应关系。
@@ -532,9 +581,11 @@ mod tests {
         let mut threads = vec![
             DriverThread {
                 thread_id: "busy".into(),
+                alive: true,
             },
             DriverThread {
                 thread_id: "done".into(),
+                alive: true,
             },
         ];
         let mut results = Vec::new();
@@ -597,28 +648,26 @@ mod tests {
                 objective,
                 driver_project,
                 driver_ref,
+                env,
             } => {
                 assert_eq!(workdir, "/w/card-1");
                 assert_eq!(title, "看板 · a.spec");
                 assert_eq!(objective, "do the card");
                 assert_eq!(driver_project.as_deref(), Some("/proj"));
                 assert_eq!(driver_ref.as_deref(), Some("card-1"));
+                assert_eq!(
+                    env,
+                    vec![("SUPERPOWERS_KANBAN_CARD".to_string(), "card-1".to_string())],
+                    "插件的 env 必须原样透传，宿主不解释键名"
+                );
             }
             other => panic!("expected launch, got {other:?}"),
         }
 
-        let append = parse_action(&answers["append"]).expect("append 字面量必须解析得出");
-        assert_eq!(append.action_id, "act-3");
-        match append.kind {
-            DriverActionKind::Append {
-                thread_id,
-                objective,
-            } => {
-                assert_eq!(thread_id, "thread-1");
-                assert_eq!(objective, "merge it");
-            }
-            other => panic!("expected append, got {other:?}"),
-        }
+        assert!(
+            answers.get("append").is_none(),
+            "append 已从契约里退役：合并由用户在会话里发话触发，插件不再追加一轮"
+        );
 
         assert!(
             parse_action(&answers["nothing"]).is_none(),
@@ -634,6 +683,7 @@ mod tests {
         let contract = driver_contract();
         let mut threads = vec![DriverThread {
             thread_id: "thread-1".into(),
+            alive: true,
         }];
         let mut results = vec![ActionResult {
             action_id: "act-1".into(),

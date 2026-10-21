@@ -280,6 +280,8 @@ pub(crate) async fn handle(
                 state.lead_control,
                 state.lead_control_replies,
                 Some(state.lead_agent_enabled),
+                // RPC 起的会话没有驱动方句柄，不额外注入环境变量。
+                Vec::new(),
             )
             .await?;
 
@@ -532,6 +534,9 @@ pub(crate) async fn handle(
                 // 旧会话没有该字段时是 `None`——那表示「无起点」，按方案 1 不回填。
                 loaded.meta.anchor_sha.clone(),
                 Some(state.lead_agent_enabled),
+                // resume 不重注环境变量：`session_env` 在会话装配期定值，
+                // 重开时沿用同一口径（空集），与 `thread/start` 一致。
+                Vec::new(),
                 built,
             );
             let BuiltAgent {
