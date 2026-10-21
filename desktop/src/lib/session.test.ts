@@ -134,6 +134,10 @@ describe("Session", () => {
         output_tokens: 3,
         cache_creation_input_tokens: 100,
         cache_read_input_tokens: 200,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cache_creation_input_tokens: 0,
+        total_cache_read_input_tokens: 0,
       },
     });
     expect(s.usage).toEqual({
@@ -161,6 +165,10 @@ describe("Session", () => {
         output_tokens: 3,
         cache_creation_input_tokens: 0,
         cache_read_input_tokens: 0,
+        total_input_tokens: 0,
+        total_output_tokens: 0,
+        total_cache_creation_input_tokens: 0,
+        total_cache_read_input_tokens: 0,
       },
     });
     s.adoptPersistedUsage({ model: "old", input: 1, output: 1, cacheRead: 0, cacheWrite: 0 });
@@ -201,13 +209,65 @@ describe("Session", () => {
     const s = new Session();
     s.apply({
       method: "thread/tokenUsage/updated",
-      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 9 },
+      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 9, total_input_tokens: 100, total_output_tokens: 2, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 9 },
     });
     s.apply({
       method: "thread/tokenUsage/updated",
-      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 42, cache_creation_input_tokens: 0, cache_read_input_tokens: 9 },
+      params: { thread_id: "t", model: "m", input_tokens: 100, output_tokens: 42, cache_creation_input_tokens: 0, cache_read_input_tokens: 9, total_input_tokens: 100, total_output_tokens: 42, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 9 },
     });
     expect(s.usage).toEqual({ model: "m", input: 100, output: 42, cacheRead: 9, cacheWrite: 0 });
+  });
+
+  it("keeps cumulative totals from the usage notification", () => {
+    const s = new Session();
+    s.apply({
+      method: "thread/tokenUsage/updated",
+      params: {
+        thread_id: "t",
+        model: "m",
+        input_tokens: 10,
+        output_tokens: 2,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 5,
+        total_input_tokens: 100,
+        total_output_tokens: 20,
+        total_cache_creation_input_tokens: 1,
+        total_cache_read_input_tokens: 50,
+      },
+    });
+    // 快照与累计是两套数：前者算上下文占用，后者是 `/usage` 与状态栏的主体。
+    expect(s.usage).toEqual({ model: "m", input: 10, output: 2, cacheRead: 5, cacheWrite: 0 });
+    expect(s.usageTotals).toEqual({ input: 100, output: 20, cacheRead: 50, cacheWrite: 1 });
+  });
+
+  it("does not overwrite live totals with the persisted baseline", () => {
+    const s = new Session();
+    s.adoptPersistedTotals({ input: 7, output: 1, cacheRead: 0, cacheWrite: 0 });
+    expect(s.usageTotals?.input).toBe(7);
+    s.apply({
+      method: "thread/tokenUsage/updated",
+      params: {
+        thread_id: "t",
+        model: "m",
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        total_input_tokens: 8,
+        total_output_tokens: 2,
+        total_cache_creation_input_tokens: 0,
+        total_cache_read_input_tokens: 0,
+      },
+    });
+    // live 通知比落盘值新，绝不能被它覆盖回 7。
+    s.adoptPersistedTotals({ input: 7, output: 1, cacheRead: 0, cacheWrite: 0 });
+    expect(s.usageTotals).toEqual({ input: 8, output: 2, cacheRead: 0, cacheWrite: 0 });
+  });
+
+  it("ignores a null persisted totals", () => {
+    const s = new Session();
+    s.adoptPersistedTotals(null);
+    expect(s.usageTotals).toBeNull();
   });
 
   it("records an error notification", () => {
@@ -339,7 +399,7 @@ describe("Session", () => {
     s.apply({ method: "turn/started", params: { thread_id: "t", turn_id: "u1" } });
     s.apply({
       method: "thread/tokenUsage/updated",
-      params: { thread_id: "t", model: "m", input_tokens: 1, output_tokens: 2, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      params: { thread_id: "t", model: "m", input_tokens: 1, output_tokens: 2, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, total_input_tokens: 1, total_output_tokens: 2, total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0 },
     });
     s.apply({ method: "error", params: { message: "boom" } });
     s.apply({

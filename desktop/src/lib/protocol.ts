@@ -161,6 +161,33 @@ export interface WireUsage {
   cache_read_input_tokens?: number;
 }
 
+/** 会话累计用量（客户端形状）。`cacheWrite` 计入总量与成本，但不单独展示。 */
+export interface UsageTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+/** `thread/readItems` 回包里的累计用量（线形状）。 */
+export interface WireTotals {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+/** 线形状 → 客户端形状。缺失 cache 字段按 0 处理。 */
+export function wireTotalsToTotals(t: WireTotals | null | undefined): UsageTotals | null {
+  if (!t) return null;
+  return {
+    input: t.input_tokens,
+    output: t.output_tokens,
+    cacheRead: t.cache_read_input_tokens ?? 0,
+    cacheWrite: t.cache_creation_input_tokens ?? 0,
+  };
+}
+
 /** 线形状 → 客户端形状。缺失 cache 字段按 0 处理（与通知路径同一口径）。 */
 export function wireUsageToUsage(u: WireUsage | null | undefined): Usage | null {
   if (!u) return null;
