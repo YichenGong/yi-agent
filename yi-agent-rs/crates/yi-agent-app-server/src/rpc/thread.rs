@@ -2024,6 +2024,9 @@ pub(crate) async fn handle(
             // 运行中的会话按既有约束**绝不 resume**、只走这里，不回传就等于让客户端
             // 在那条路径上永远拿不到这份已经读出来的数据。
             let loaded_usage = loaded.usage;
+            // 同一份 `load` 已经算出的累计量：客户端拿到它才能显示「会话累计」，
+            // 而不是只能拿最后一轮快照近似。
+            let loaded_totals = loaded.totals;
             let items: Vec<crate::protocol::Item> = match after {
                 Some(aid) => match loaded
                     .items
@@ -2040,7 +2043,10 @@ pub(crate) async fn handle(
             write_response(
                 state.hub,
                 state.client,
-                ok_response(id, json!({ "items": items, "usage": loaded_usage })),
+                ok_response(
+                    id,
+                    json!({ "items": items, "usage": loaded_usage, "totals": loaded_totals }),
+                ),
             )
             .await?;
         }

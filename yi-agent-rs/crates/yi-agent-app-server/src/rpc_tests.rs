@@ -7572,6 +7572,7 @@ async fn a_turn_while_off_persists_without_credentials() {
         &agent,
         Vec::new(),
         None,
+        None,
         &store,
         &hub,
         &turn_tx,
@@ -7671,6 +7672,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
         None,
         &agent,
         Vec::new(),
+        None,
         None,
         &store,
         &hub,
@@ -16183,6 +16185,73 @@ fn the_session_effort_override_does_not_leak_across_calls() {
         built.agent.config().gen_params.reasoning_effort,
         None,
         "the override must not leak past with_session_reasoning_effort"
+    );
+}
+
+/// 累计 input 必须不小于最后一轮快照，且四类累计都要落盘、可读回。
+/// 证明 `/usage` 统计的是「所有 provider 调用之和」，不是最后一次请求的上下文长度。
+#[tokio::test(flavor = "multi_thread")]
+async fn read_items_returns_persisted_totals() {
+    let mut h = Harness::with_factory(build_usage_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":31,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+    ))
+    .await;
+    for _ in 0..16 {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            break;
+        }
+    }
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":32,"method":"thread/readItems","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 32).await;
+    let totals = v["result"]["totals"]
+        .as_object()
+        .unwrap_or_else(|| panic!("readItems 必须回传累计用量: {v}"));
+    let usage = v["result"]["usage"].as_object().expect("usage");
+    assert!(
+        totals["input_tokens"].as_u64().unwrap_or(0) >= usage["input_tokens"].as_u64().unwrap_or(0),
+        "累计值不得小于最后一轮快照: {v}"
+    );
+    assert!(totals["output_tokens"].as_u64().unwrap_or(0) > 0, "{v}");
+}
+
+/// `/clear` 截断日志后累计必须归零，否则重启前后数字会对不上。
+#[tokio::test(flavor = "multi_thread")]
+async fn clear_resets_persisted_totals() {
+    let mut h = Harness::with_factory(build_usage_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":41,"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"hi"}}]}}}}"#
+    ))
+    .await;
+    for _ in 0..16 {
+        let v = h.read_value().await;
+        if v.get("method").and_then(|m| m.as_str()) == Some("turn/completed") {
+            break;
+        }
+    }
+    // 刚跑完一轮立刻 clear 可能撞上 `active_turn_id` 尚未清空的窗口（既有约定），
+    // 用同一个重试 helper。
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":43,"method":"thread/readItems","params":{{"threadId":"{tid}"}}}}"#
+    ))
+    .await;
+    let v = read_response(&mut h, 43).await;
+    assert_eq!(
+        v["result"]["totals"]["input_tokens"].as_u64().unwrap_or(1),
+        0,
+        "{v}"
     );
 }
 
