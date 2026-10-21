@@ -61,6 +61,39 @@ pub fn fit_to_work_area(
     }
 }
 
+/// Resize and centre the main window once, at startup.
+///
+/// Configuration already gives the window its default size; this only corrects
+/// it for the monitor it landed on. Call it exactly once — re-running it after
+/// the user has dragged the window would fight them.
+///
+/// Every "cannot measure" path returns `Ok(())` on purpose: the configured
+/// size is a fine fallback, and a window that is merely smaller than ideal is
+/// not a reason to fail launch.
+pub fn fit_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::{LogicalSize, Manager};
+
+    let Some(window) = app.get_webview_window("main") else {
+        return Ok(());
+    };
+    let Some(monitor) = window.current_monitor()? else {
+        return Ok(());
+    };
+
+    let work = monitor.work_area().size;
+    let fit = fit_to_work_area(
+        DESIRED,
+        MIN,
+        (f64::from(work.width), f64::from(work.height)),
+        monitor.scale_factor(),
+    );
+
+    window.set_min_size(Some(LogicalSize::new(fit.min_width, fit.min_height)))?;
+    window.set_size(LogicalSize::new(fit.width, fit.height))?;
+    window.center()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

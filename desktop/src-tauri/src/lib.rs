@@ -24,6 +24,10 @@ pub fn run() {
         ])
         .setup(|app| {
             bridge::spawn(app.handle())?;
+            // Sizing is cosmetic: log and continue rather than fail launch.
+            if let Err(err) = window::fit_main_window(app.handle()) {
+                eprintln!("[window] fit failed: {err}");
+            }
             Ok(())
         });
 
