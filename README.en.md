@@ -14,20 +14,21 @@ to read code, change code, and run commands.
 
 ---
 
-## What it can do
-
-- Read and modify your codebase: read files, write files, apply exact edits,
-  search by pattern across the repo
-- Run shell commands; long jobs can be managed in the background, with live
-  output and one-command termination
-- Look things up on the web (WebFetch / WebSearch)
-- Connect external tools over MCP — GitHub, databases, internal systems
-- Load Skills, turning your own runbooks into procedures it can execute
-- Spawn subagents to work in parallel, watch their progress live, message them
-  or stop them
-- Auto-compact the conversation when it outgrows the context window
-
 ## Install
+
+One command installs the CLI; on Apple Silicon it also puts the desktop app into
+`/Applications`:
+
+```bash
+npm install -g @yi-agent/yi-agent
+```
+
+Requires Node.js 14 or newer. The package ships prebuilt binaries for macOS
+(Intel / Apple Silicon) and Linux (x64), so no compilation is needed.
+
+> Behind a slow or partial npm mirror, pass
+> `--registry=https://registry.npmjs.org` explicitly. Mirrors lag behind; a
+> missing platform subpackage shows up as `Platform package ... not installed`.
 
 ### Homebrew (macOS / Linux)
 
@@ -35,20 +36,23 @@ to read code, change code, and run commands.
 brew install YichenGong/yi-agent/yi-agent
 ```
 
-### npm
-
-```bash
-npm install -g @yi-agent/yi-agent
-```
-
-The npm package ships prebuilt binaries for macOS (Intel / Apple Silicon) and
-Linux (x64), so no compilation is needed.
-
 ### Direct download
 
 Grab the `.tar.gz` for your platform from
 [Releases](https://github.com/YichenGong/yi-agent/releases), unpack it, and put
 `yi-agent` on your `PATH`.
+
+### macOS desktop app (Apple Silicon)
+
+The `npm i -g` above runs a `postinstall` step that copies `yi-agent.app` into
+`/Applications` and clears the quarantine flag. It only runs on global installs,
+and only on Apple Silicon (Intel Macs are not supported).
+
+If `/Applications` is not writable (common on managed machines), the CLI still
+installs and you get a hint to finish the app install with `sudo cp`.
+
+Open `yi-agent` from Applications. If macOS says the developer cannot be
+verified, go to System Settings → Privacy & Security and click **Open Anyway**.
 
 ### From source
 
@@ -66,6 +70,19 @@ Verify the install:
 ```bash
 yi-agent --version
 ```
+
+## What it can do
+
+- Read and modify your codebase: read files, write files, apply exact edits,
+  search by pattern across the repo
+- Run shell commands; long jobs can be managed in the background, with live
+  output and one-command termination
+- Look things up on the web (WebFetch / WebSearch)
+- Connect external tools over MCP — GitHub, databases, internal systems
+- Load Skills, turning your own runbooks into procedures it can execute
+- Spawn subagents to work in parallel, watch their progress live, message them
+  or stop them
+- Auto-compact the conversation when it outgrows the context window
 
 ## Quick start
 
