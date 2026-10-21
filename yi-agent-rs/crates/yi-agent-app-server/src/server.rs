@@ -4919,7 +4919,15 @@ pub(crate) async fn run_thread_driver(
 ) {
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
-    let mut translator = Translator::new(thread_id.clone());
+    // 累计基线：本 thread 已落盘轮次之和。读失败按 0 处理——最坏是首次打开时
+    // 累计偏小，绝不能让 driver 起不来。
+    let baseline = store
+        .load(&thread_id)
+        .ok()
+        .flatten()
+        .map(|loaded| loaded.totals)
+        .unwrap_or_default();
+    let mut translator = Translator::new(thread_id.clone(), baseline);
     // 只在首个 turn 尝试激活:objective 会被写进 root 任务,不能用占位串,也不能
     // 每轮重写。即使 `activate` 为 None 也置位,避免每轮重试。
     let mut activation_attempted = false;

@@ -12,6 +12,7 @@ use yi_agent_core::message::{ContentBlock, ImageSource, ThinkingToken};
 use yi_agent_core::{AgentEvent, DoneReason, TokenUsage};
 
 use crate::protocol::{Item, Notification, ToolStatus, TurnStatus};
+use crate::thread_store::UsageTotals;
 
 /// 正在累积、尚未 finalize 的 agent 文本消息。
 struct ActiveAgentMsg {
@@ -49,6 +50,14 @@ impl UsageSnapshot {
     ///
     /// 假设一次新调用必带非零 `input_tokens`(Anthropic / OpenAI 均如此);若某网关
     /// 省略该字段,会被误判为同一调用的后续事件。
+    /// 四类计数全为 0 视为「没有待结算的调用」。
+    fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_creation_input_tokens == 0
+            && self.cache_read_input_tokens == 0
+    }
+
     fn merge(&mut self, model: &str, usage: &TokenUsage) {
         self.model = model.to_string();
         if usage.input_tokens > 0 {
@@ -95,11 +104,18 @@ pub struct Translator {
     active_agent_msg: Option<ActiveAgentMsg>,
     tool_items: HashMap<String, ToolItem>,
     usage: UsageSnapshot,
+    /// 本次 driver 启动前已落盘轮次的累计（只有 `/clear` 会清零）。
+    committed: UsageTotals,
+    /// 本轮**已结束**调用的累计；`set_turn` 时并入 `committed` 后清零。
+    turn: UsageTotals,
 }
 
 impl Translator {
     /// `thread_id` is stamped onto every emitted notification.
-    pub fn new(thread_id: String) -> Self {
+    ///
+    /// `baseline` 是该 thread 已落盘轮次的累计（新会话为全零）：重启后累计值
+    /// 从这里接着涨，而不是从 0 重新开始。
+    pub fn new(thread_id: String, baseline: UsageTotals) -> Self {
         Self {
             thread_id,
             turn_id: String::new(),
@@ -107,6 +123,68 @@ impl Translator {
             active_agent_msg: None,
             tool_items: HashMap::new(),
             usage: UsageSnapshot::default(),
+            committed: baseline,
+            turn: UsageTotals::default(),
+        }
+    }
+
+    /// 把当前调用快照结算进「本轮已结束调用」。
+    fn settle_snapshot(&mut self) {
+        if self.usage.is_empty() {
+            return;
+        }
+        self.turn.input_tokens += self.usage.input_tokens as u64;
+        self.turn.output_tokens += self.usage.output_tokens as u64;
+        self.turn.cache_creation_input_tokens += self.usage.cache_creation_input_tokens as u64;
+        self.turn.cache_read_input_tokens += self.usage.cache_read_input_tokens as u64;
+        self.usage = UsageSnapshot::default();
+    }
+
+    /// 累计用量 = 已落盘轮次 + 本轮已结束调用 + 当前调用。
+    ///
+    /// 每次 provider 用量事件都重算，故 `message_start` 一到累计 input 就涨，
+    /// `message_delta` 一到累计 output 再涨——界面因此能跟着每次调用增长。
+    fn totals(&self) -> UsageTotals {
+        let mut out = self.committed;
+        out.add(&self.turn);
+        out.input_tokens += self.usage.input_tokens as u64;
+        out.output_tokens += self.usage.output_tokens as u64;
+        out.cache_creation_input_tokens += self.usage.cache_creation_input_tokens as u64;
+        out.cache_read_input_tokens += self.usage.cache_read_input_tokens as u64;
+        out
+    }
+
+    /// 本轮所有调用的累加值，供落盘为 `usage_total`。
+    pub fn turn_totals(&self) -> UsageTotals {
+        let mut out = self.turn;
+        out.input_tokens += self.usage.input_tokens as u64;
+        out.output_tokens += self.usage.output_tokens as u64;
+        out.cache_creation_input_tokens += self.usage.cache_creation_input_tokens as u64;
+        out.cache_read_input_tokens += self.usage.cache_read_input_tokens as u64;
+        out
+    }
+
+    /// `/clear` 之后累计归零，并推一条全零通知，保证客户端不保留旧数字。
+    pub fn reset_totals(&mut self) -> Vec<Notification> {
+        self.committed = UsageTotals::default();
+        self.turn = UsageTotals::default();
+        self.usage = UsageSnapshot::default();
+        vec![self.usage_notification()]
+    }
+
+    fn usage_notification(&self) -> Notification {
+        let totals = self.totals();
+        Notification::TokenUsage {
+            thread_id: self.thread_id.clone(),
+            model: self.usage.model.clone(),
+            input_tokens: self.usage.input_tokens,
+            output_tokens: self.usage.output_tokens,
+            cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: self.usage.cache_read_input_tokens,
+            total_input_tokens: totals.input_tokens,
+            total_output_tokens: totals.output_tokens,
+            total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
+            total_cache_read_input_tokens: totals.cache_read_input_tokens,
         }
     }
 
@@ -114,8 +192,11 @@ impl Translator {
     ///
     /// Notifications that carry `turn_id` use this value. Emits nothing.
     pub fn set_turn(&mut self, turn_id: String) {
+        // 上一轮若以 Error / Cancelled 结束而没走到结算，在这里补上，累计不丢数。
+        self.settle_snapshot();
+        self.committed.add(&self.turn);
+        self.turn = UsageTotals::default();
         self.turn_id = turn_id;
-        self.usage = UsageSnapshot::default();
     }
 
     fn alloc_item_id(&mut self) -> String {
@@ -351,15 +432,13 @@ impl Translator {
                 });
             }
             AgentEvent::Usage { model, usage } => {
+                // `input_tokens > 0` 即新的一次 provider 调用（与 `merge` 的判据一致）：
+                // 先把上一次调用结算进本轮累计，再让 merge 整体替换快照。
+                if usage.input_tokens > 0 {
+                    self.settle_snapshot();
+                }
                 self.usage.merge(&model, &usage);
-                out.push(Notification::TokenUsage {
-                    thread_id: self.thread_id.clone(),
-                    model: self.usage.model.clone(),
-                    input_tokens: self.usage.input_tokens,
-                    output_tokens: self.usage.output_tokens,
-                    cache_creation_input_tokens: self.usage.cache_creation_input_tokens,
-                    cache_read_input_tokens: self.usage.cache_read_input_tokens,
-                });
+                out.push(self.usage_notification());
             }
             AgentEvent::Done { reason } => {
                 let (status, error) = match reason {
@@ -533,7 +612,7 @@ mod tests {
     use yi_agent_core::tool::ToolResult;
 
     fn translator() -> Translator {
-        let mut t = Translator::new("th1".into());
+        let mut t = Translator::new("th1".into(), UsageTotals::default());
         t.set_turn("turn1".into());
         t
     }
@@ -1257,6 +1336,136 @@ mod tests {
     }
 
     #[test]
+    fn totals_grow_on_message_start_before_output_arrives() {
+        let mut t = Translator::new("th".into(), UsageTotals::default());
+        t.set_turn("a".into());
+        let out = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(40),
+                reasoning_tokens: None,
+            },
+        });
+        match &out[0] {
+            Notification::TokenUsage {
+                input_tokens,
+                total_input_tokens,
+                total_cache_read_input_tokens,
+                ..
+            } => {
+                assert_eq!(*input_tokens, 100);
+                assert_eq!(*total_input_tokens, 100);
+                assert_eq!(*total_cache_read_input_tokens, 40);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn totals_accumulate_across_calls_within_a_turn() {
+        let mut t = Translator::new("th".into(), UsageTotals::default());
+        t.set_turn("a".into());
+        // 调用 1：input 100，随后补 output 10。
+        t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 0,
+                ..Default::default()
+            },
+        });
+        t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 0,
+                output_tokens: 10,
+                ..Default::default()
+            },
+        });
+        // 调用 2：input 200。
+        let out = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 200,
+                output_tokens: 0,
+                ..Default::default()
+            },
+        });
+        match &out[0] {
+            Notification::TokenUsage {
+                total_input_tokens,
+                total_output_tokens,
+                ..
+            } => {
+                assert_eq!(*total_input_tokens, 300);
+                assert_eq!(*total_output_tokens, 10);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn totals_keep_previous_turns_after_set_turn() {
+        let mut t = Translator::new("th".into(), UsageTotals::default());
+        t.set_turn("a".into());
+        t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        });
+        t.set_turn("b".into());
+        let out = t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 7,
+                output_tokens: 0,
+                ..Default::default()
+            },
+        });
+        match &out[0] {
+            Notification::TokenUsage {
+                total_input_tokens,
+                total_output_tokens,
+                ..
+            } => {
+                assert_eq!(*total_input_tokens, 107);
+                assert_eq!(*total_output_tokens, 5);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_totals_zeroes_everything_and_emits_a_zero_notice() {
+        let mut t = Translator::new("th".into(), UsageTotals::default());
+        t.set_turn("a".into());
+        t.on_event(AgentEvent::Usage {
+            model: "m".into(),
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 5,
+                ..Default::default()
+            },
+        });
+        let out = t.reset_totals();
+        assert!(out.iter().any(|n| matches!(
+            n,
+            Notification::TokenUsage {
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                ..
+            }
+        )));
+        assert!(t.totals().is_empty());
+    }
+
+    #[test]
     fn usage_carries_cache_tokens() {
         let mut t = translator();
         let usage = TokenUsage {
@@ -1578,7 +1787,7 @@ mod tests {
 
     #[test]
     fn set_turn_stamps_turn_id() {
-        let mut t = Translator::new("th1".into());
+        let mut t = Translator::new("th1".into(), UsageTotals::default());
         t.set_turn("u1".into());
         let out = t.on_event(AgentEvent::Done {
             reason: DoneReason::EndTurn,

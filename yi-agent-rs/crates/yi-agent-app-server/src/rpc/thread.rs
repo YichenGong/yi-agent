@@ -643,7 +643,10 @@ pub(crate) async fn handle(
                     break;
                 }
             }
+            // 回放的既要有「最后一轮快照」（上下文占用），也要有该 thread 的累计值
+            // （`/usage` 与状态栏）——后者若不带，客户端 resume 后累计会从 0 重来。
             if let Some(u) = loaded.usage {
+                let totals = loaded.totals;
                 write_notification(
                     state.hub,
                     &Notification::TokenUsage {
@@ -653,6 +656,10 @@ pub(crate) async fn handle(
                         output_tokens: u.output_tokens,
                         cache_creation_input_tokens: u.cache_creation_input_tokens,
                         cache_read_input_tokens: u.cache_read_input_tokens,
+                        total_input_tokens: totals.input_tokens,
+                        total_output_tokens: totals.output_tokens,
+                        total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
+                        total_cache_read_input_tokens: totals.cache_read_input_tokens,
                     },
                 )
                 .await?;
