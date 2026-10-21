@@ -33,7 +33,7 @@ build-release:
 # === CI 入口 ===
 
 # CI 流水线入口（push 用）
-ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check
+ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check
     @echo "CI passed"
 
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
@@ -56,6 +56,11 @@ npm-version-check:
 # 三平台 target）：任一被破坏，tag 触发的发布会在构建第一步秒挂。
 release-env-check:
     bash scripts/test_release_workflow_env.sh
+
+# 桌面脚本不得硬编码 target 目录：CI 把 CARGO_TARGET_DIR 指到别处时，
+# 写死的路径会变成「编译全绿、cp 找不到产物」这种最难查的失败。
+desktop-target-dir-check:
+    bash ../desktop/scripts/test_scripts_target_dir.sh
 
 # 面向用户的配置说明不得再教人往 `.env` 写模型 key，也不得声称 App 内没有设置入口。
 # 模型配置只认 `~/.yi-agent/models.json`；错误文案会把新用户挡在门外

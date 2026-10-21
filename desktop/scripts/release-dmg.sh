@@ -90,10 +90,18 @@ mkdir -p "$ROOT/dist"
 #     版本 dmg 被误发（旧的 `ls | head` 会按字典序选中它）。
 ART="yi-agent_${VERSION}_aarch64.dmg"
 export ART
-DMG_SRC="$HERE/src-tauri/target/release/bundle/dmg/$ART"
+# tauri 的产物目录跟着 CARGO_TARGET_DIR 走。GitLab 侧目前没设它，所以
+# 默认值还能用；但一旦有人为复用缓存加上（GitHub 侧就是这么干的），
+# 写死 src-tauri/target 会变成「构建全绿、发版找不到 dmg」。统一走
+# cargo metadata 解析，两个 runner 都成立。
+DMG_TARGET_DIR="$(cargo metadata --manifest-path "$HERE/src-tauri/Cargo.toml" \
+  --format-version 1 --no-deps 2>/dev/null \
+  | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')"
+[ -n "$DMG_TARGET_DIR" ] || DMG_TARGET_DIR="$HERE/src-tauri/target"
+DMG_SRC="$DMG_TARGET_DIR/release/bundle/dmg/$ART"
 if [ ! -f "$DMG_SRC" ]; then
   echo "ERROR: 未找到 tauri 产出的 ${ART}（目录内容如下）" >&2
-  ls -l "$HERE/src-tauri/target/release/bundle/dmg/" >&2 || true
+  ls -l "$DMG_TARGET_DIR/release/bundle/dmg/" >&2 || true
   exit 1
 fi
 cp "$DMG_SRC" "$ROOT/dist/$ART"
