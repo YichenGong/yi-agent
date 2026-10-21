@@ -138,6 +138,9 @@ jobs:
       - name: Build macOS desktop app for npm
         # 只有 arm64 的 .app 会进 darwin-arm64 子包。Linux/Intel 用户
         # 不会因此多下载——npm 按 os/cpu 只装匹配的子包。
+        # working-directory 不能省：justfile 在 yi-agent-rs/ 下，仓库根没有，
+        # 漏掉会让 just 在 0.03 秒内以「no justfile found」退 1。
+        working-directory: yi-agent-rs
         run: |
           source "$HOME/.cargo/env"
           just npm-pack-desktop
@@ -152,7 +155,9 @@ jobs:
           V=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
               yi-agent.app/Contents/Info.plist)
           echo "desktop app version: $V"
-          grep -q "^version = \"$V\"" ../../Cargo.toml || {
+          # 从 platforms/darwin-arm64 往上三级才是 yi-agent-rs/Cargo.toml。
+          # 两级只到 yi-agent-cli/，那里没有 Cargo.toml，门禁会假绿或假红。
+          grep -q "^version = \"$V\"" ../../../Cargo.toml || {
             echo "ERROR: desktop app version $V != workspace version"; exit 1; }
 
       - name: Upload artifacts to GitHub Release
