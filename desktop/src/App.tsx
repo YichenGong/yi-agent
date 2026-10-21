@@ -1649,9 +1649,6 @@ export default function App() {
         session.notice(formatUsage(u, { compactThreshold: threshold }));
         break;
       }
-      case "model":
-        session.notice(`当前模型: ${view.info?.model ?? "未知"}`);
-        break;
       case "config":
         try {
           // 传当前会话 id：进程级快照的 workdir/model/provider 与会话无关。

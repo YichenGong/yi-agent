@@ -7,14 +7,13 @@ import {
 } from "./slash";
 
 describe("slash command catalog", () => {
-  it("lists exactly the six supported commands, in popup order", () => {
+  it("lists exactly the five supported commands, in popup order", () => {
     expect(SLASH_COMMANDS.map((c) => c.name)).toEqual([
       "clear",
       "compact",
       "config",
       "usage",
       "help",
-      "model",
     ]);
   });
 

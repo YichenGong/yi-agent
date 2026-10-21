@@ -21,7 +21,6 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
   { name: "config", description: "显示当前配置", usage: null, needsArg: false },
   { name: "usage", description: "查看 token 用量与上下文占用", usage: null, needsArg: false },
   { name: "help", description: "显示帮助信息", usage: "[command]", needsArg: false },
-  { name: "model", description: "显示当前模型", usage: null, needsArg: false },
 ];
 
 /**
@@ -33,7 +32,7 @@ export const SLASH_COMMANDS: SlashCommandSpec[] = [
  */
 export const HELP_GROUPS: { title: string; commands: string[] }[] = [
   { title: "会话", commands: ["clear", "compact"] },
-  { title: "状态", commands: ["config", "usage", "model"] },
+  { title: "状态", commands: ["config", "usage"] },
   { title: "帮助", commands: ["help"] },
 ];
 
