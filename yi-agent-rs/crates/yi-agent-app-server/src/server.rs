@@ -4420,13 +4420,21 @@ fn saturate_u32(value: u64) -> u32 {
     value.min(u32::MAX as u64) as u32
 }
 
+/// `build_partial` 的入参分组：提问本身、已完成的 item、用量。
+///
+/// 拆成结构体是为了让 `build_partial` 的参数个数落在 clippy 的 7 个门槛内，
+/// 同时把「这三组各自是什么」写在类型上，比一串同类型的 `&[...]` 好读。
+struct PartialTurnInput<'a> {
+    turn_id: &'a str,
+    user_prompt: &'a str,
+    user_attachments: &'a [crate::protocol::Attachment],
+    user_image_refs: &'a [crate::protocol::ImageRef],
+}
+
 /// 组装当前 turn 的 checkpoint：已 finalize 的 item（含开头的用户提问）+ 当前
 /// 上下文快照。进行中的流式文本不在 `completed_items` 里，故天然不入内。
 fn build_partial(
-    turn_id: &str,
-    user_prompt: &str,
-    user_attachments: &[crate::protocol::Attachment],
-    user_image_refs: &[crate::protocol::ImageRef],
+    input: PartialTurnInput<'_>,
     completed_items: &[crate::protocol::Item],
     messages: Vec<yi_agent_core::Message>,
     usage: Option<crate::thread_store::TurnUsage>,
@@ -4434,14 +4442,14 @@ fn build_partial(
 ) -> crate::thread_store::PartialTurn {
     let mut items = Vec::with_capacity(completed_items.len() + 1);
     items.push(opening_user_item(
-        turn_id,
-        user_prompt,
-        user_attachments.to_vec(),
-        user_image_refs.to_vec(),
+        input.turn_id,
+        input.user_prompt,
+        input.user_attachments.to_vec(),
+        input.user_image_refs.to_vec(),
     ));
     items.extend(completed_items.iter().cloned());
     crate::thread_store::PartialTurn {
-        turn_id: turn_id.to_string(),
+        turn_id: input.turn_id.to_string(),
         items,
         messages,
         usage,
@@ -5049,10 +5057,12 @@ pub(crate) async fn run_thread_driver(
             &store,
             &thread_id,
             build_partial(
-                &turn_id,
-                &user_prompt,
-                &user_attachments,
-                &user_image_refs,
+                PartialTurnInput {
+                    turn_id: &turn_id,
+                    user_prompt: &user_prompt,
+                    user_attachments: &user_attachments,
+                    user_image_refs: &user_image_refs,
+                },
                 &[],
                 agent.session().messages().to_vec(),
                 None,
@@ -5347,10 +5357,12 @@ pub(crate) async fn run_thread_driver(
                         &store,
                         &thread_id,
                         build_partial(
-                            &turn_id,
-                            &user_prompt,
-                            &user_attachments,
-                            &user_image_refs,
+                            PartialTurnInput {
+                                turn_id: &turn_id,
+                                user_prompt: &user_prompt,
+                                user_attachments: &user_attachments,
+                                user_image_refs: &user_image_refs,
+                            },
                             &completed_items,
                             agent.session().messages().to_vec(),
                             last_usage.clone(),
