@@ -10961,6 +10961,7 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
                     images: Vec::new(),
                 }],
                 usage: None,
+                usage_total: None,
                 messages: vec![],
             },
         )
@@ -10984,6 +10985,7 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
                 ],
                 messages: vec![],
                 usage: None,
+                usage_total: None,
             },
         )
         .unwrap();
@@ -11074,6 +11076,7 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
                     images: Vec::new(),
                 }],
                 usage: None,
+                usage_total: None,
                 messages: vec![],
             },
         )
@@ -11098,6 +11101,7 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
                 ],
                 messages: vec![],
                 usage: None,
+                usage_total: None,
             },
         )
         .unwrap();
@@ -11430,6 +11434,7 @@ async fn resume_replays_every_item_for_long_threads() {
             &crate::thread_store::TurnLine::Turn {
                 items: items.clone(),
                 usage: None,
+                usage_total: None,
                 messages: Vec::new(),
             },
         )

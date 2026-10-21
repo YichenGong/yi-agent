@@ -4436,6 +4436,7 @@ fn build_partial(
         items,
         messages,
         usage,
+        usage_total: None,
     }
 }
 
@@ -4503,6 +4504,9 @@ async fn persist_and_finish_turn(
     let record = crate::thread_store::TurnLine::Turn {
         items,
         usage: last_usage,
+        // 本轮累加值由调用方在 Task 4 之后经 `persist_and_finish_turn` 传入；
+        // 这条中间态先置 `None`（读取侧会退回 `usage` 近似）。
+        usage_total: None,
         messages: persisted_messages,
     };
     // append 失败则跳过 meta 维护：避免出现"幽灵" thread。

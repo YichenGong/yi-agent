@@ -472,6 +472,7 @@ mod tests {
                         },
                     ],
                     usage: None,
+                    usage_total: None,
                     messages: Vec::new(),
                 },
             )
@@ -497,6 +498,7 @@ mod tests {
                             text: format!("第 {n} 条"),
                         }],
                         usage: None,
+                        usage_total: None,
                         messages: Vec::new(),
                     },
                 )
