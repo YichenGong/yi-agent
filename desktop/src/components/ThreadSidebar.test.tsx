@@ -682,6 +682,18 @@ describe("ThreadSidebar 看板", () => {
     expect(onCreateBoard).toHaveBeenCalledWith("/proj");
   });
 
+  it("全局开关关着时右键菜单不提供看板项", () => {
+    const { container } = renderSidebar({
+      groups: boardGroups,
+      boards: [],
+      kanbanEnabled: false,
+    });
+
+    openWorkspaceMenu(container, "/proj");
+    expect(screen.queryByText("创建 Superpowers 看板")).toBeNull();
+    expect(screen.queryByText("移除看板")).toBeNull();
+  });
+
   it("已登记的项目右键菜单改为移除看板，且不再提供创建", () => {
     const onRemoveBoard = vi.fn();
     const onCreateBoard = vi.fn();
