@@ -167,8 +167,9 @@ DESCRIPTION="$(cat <<EOF
 
 1. \`bash install.sh ./$ART\`（或双击 dmg 把 yi-agent.app 拖进「应用程序」后执行
    \`xattr -dr com.apple.quarantine /Applications/yi-agent.app\`）
-2. **配置模型 key（必需，App 内没有设置入口）**：
-   \`mkdir -p ~/.yi-agent && echo 'MODEL_API_KEY=sk-ant-...' >> ~/.yi-agent/.env\`
+2. **配置模型（必需）**：首次打开 yi-agent 会弹引导向导，填「API 密钥」与
+   「模型标识」后点测试连接，通过即写入 \`~/.yi-agent/models.json\`。
+   也可以之后在 App 的「设置 → 模型」里增删改。
 3. 从「应用程序」打开 yi-agent。
 
 未签名产物；首次打开如被拦，到 System Settings → Privacy & Security 点 "Open Anyway"。
@@ -181,8 +182,8 @@ App 内已内置同一份 CLI，安装脚本会自动建好入口，**不需要�
 /usr/local/bin/yi-agent -> /Applications/yi-agent.app/Contents/MacOS/yi-agent
 \`\`\`
 
-装完后 \`cd\` 到项目目录直接运行 \`yi-agent\`。配置与 App 共用
-\`~/.yi-agent/.env\`，只写一次。
+装完后 \`cd\` 到项目目录直接运行 \`yi-agent\`。App 与 TUI 共用同一份模型清单
+\`~/.yi-agent/models.json\`，配一次即可；首启也会给出同样的终端问答引导。
 
 若安装器提示 \`/usr/local/bin\` 不可写，它会退到 \`~/.local/bin\` 并打印需要添加的
 PATH 行；不会修改你的 shell 配置。

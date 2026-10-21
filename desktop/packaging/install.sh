@@ -254,10 +254,11 @@ EOF
 
   cat <<'EOF'
 
-配置：App 与 TUI 共用 ~/.yi-agent/.env，只需写一次。
+配置：App 与 TUI 共用同一份模型清单 ~/.yi-agent/models.json，只需配一次。
 
-  mkdir -p ~/.yi-agent
-  echo 'MODEL_API_KEY=sk-ant-...' >> ~/.yi-agent/.env
+  首次打开 App 会弹引导向导（填 API 密钥 + 模型标识，测试通过后落盘）；
+  也可以之后在 App 的「设置 → 模型」里增删改。
+  TUI 首启会给出同样的终端问答引导。
 
 GUI：从「启动台 / 应用程序」打开 yi-agent。
 TUI：cd 到项目目录后直接运行 yi-agent。

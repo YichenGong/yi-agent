@@ -55,15 +55,12 @@ npm install -g @yi-agent/yi-agent
 若 `/Applications` 不可写（企业机器常见），CLI 仍会装好，并提示你手动执行
 `sudo cp` 完成桌面 App 的安装。
 
-首次启动前需要配置模型 key —— App 内没有设置入口，必须手写文件：
-
-```bash
-mkdir -p ~/.yi-agent
-echo 'MODEL_API_KEY=sk-ant-...' >> ~/.yi-agent/.env
-```
-
 从「应用程序」打开 `yi-agent`。首次打开若提示「无法验证开发者」，到
 System Settings → Privacy & Security 点 **Open Anyway**。仅 arm64（不支持 Intel Mac）。
+
+首次启动会弹出**引导向导**，填「API 密钥」与「模型标识」（可选 API 地址）后点测试
+连接，通过即写入 `~/.yi-agent/models.json`。之后再改模型走 **设置 → 模型**（可新增、
+编辑、删除条目，也可「导入当前配置」）。App 与 TUI 共用这份清单，配一次即可。
 
 #### 内网离线安装（dmg）
 
@@ -96,11 +93,22 @@ yi-agent --version
 
 ## 快速开始
 
-**第一步，给它一个模型 API key。**
+**第一步，配一个模型。** 直接运行，首启会引导你填（API 格式、密钥、模型标识）：
 
 ```bash
-export MODEL_API_KEY=sk-ant-...
+yi-agent
 ```
+
+填完会先测连接，通过才写入 `~/.yi-agent/models.json`；桌面 App 与 CLI 共用这份清单。
+
+想跳过问答用一次性整包参数也行（`--provider` / `--api-key` / `--model` 三个都要给）：
+
+```bash
+yi-agent --provider anthropic --api-key sk-ant-... --model claude-sonnet-4-5
+```
+
+> 注意：单独 `export MODEL_API_KEY=...` 不能代替上面的步骤——模型配置只认
+> `models.json` 或「整包」参数，缺项会被直接拒绝。
 
 默认走 Anthropic。要用 OpenAI 或其他兼容服务，见下方的「换模型」。
 
@@ -232,7 +240,7 @@ yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
 
 | 想做什么 | 环境变量 | 命令行参数 |
 | --- | --- | --- |
-| 换模型（整包覆盖） | `YI_AGENT_PROVIDER` + `MODEL_API_KEY` | `--provider` + `--api-key`（`--model` / `--api-url` 可选） |
+| 换模型（整包覆盖，三项都要给） | `YI_AGENT_PROVIDER` + `MODEL_API_KEY` + `YI_AGENT_MODEL` | `--provider` + `--api-key` + `--model`（`--api-url` 可选） |
 | API key | `MODEL_API_KEY` | `--api-key` |
 | 换服务商 | `YI_AGENT_PROVIDER`（`anthropic` / `openai`） | `--provider` |
 | 换模型标识 | —— （用设置 UI / `models.json`） | `--model`（须配 `--provider` + `--api-key`） |
