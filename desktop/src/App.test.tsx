@@ -97,6 +97,9 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // 首屏渲染组长条目）测的都是"开关打开时的行为"，缺省成关会让它们全部
     // 变成在测另一条分支。
     leadFlagEnabled: true,
+    // `flags/list` 里 `superpowers_kanban` 的值。默认**开**：既有看板用例测的
+    // 都是"开关打开时的行为"。
+    kanbanFlagEnabled: true,
   },
   // 捕获 `@tauri-apps/api/webview` 注册的拖放 handler，供用例驱动事件。
   dragDrop: { fn: null as null | ((event: unknown) => void) },
@@ -256,6 +259,13 @@ vi.mock("./lib/rpc", () => ({
               expires_on: "2027-01-31",
               source: state.leadFlagEnabled ? "file" : "default",
             },
+            {
+              name: "superpowers_kanban",
+              summary: "Superpowers 看板",
+              enabled: state.kanbanFlagEnabled,
+              expires_on: "2027-03-31",
+              source: state.kanbanFlagEnabled ? "file" : "default",
+            },
           ],
         };
       }
@@ -392,6 +402,7 @@ beforeEach(() => {
   state.failLead = false;
   state.leadAttempts = [];
   state.leadFlagEnabled = true;
+  state.kanbanFlagEnabled = true;
   dragDrop.fn = null;
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
@@ -1293,6 +1304,44 @@ describe("App 主区域看板", () => {
     expect(screen.queryByText("Superpowers 看板")).toBeNull();
     expect(screen.queryByLabelText("收起看板")).toBeNull();
     expect(screen.queryByLabelText("Superpowers 看板开关")).toBeNull();
+  });
+
+  it("看板开关关着时侧栏没有入口，且不朝插件发任何读", async () => {
+    state.boards = [{ project: "/proj" }];
+    state.groupWorkspaces = ["/proj"];
+    state.kanbanFlagEnabled = false;
+    render(<App />);
+    // 先等首屏落定（会话已渲染），再断言"没有"——否则可能只是还没到那一步。
+    await waitFor(() => expect(state.statusHandlers.length).toBe(1));
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "flags/list")).toBe(true),
+    );
+
+    expect(screen.queryByLabelText("看板")).toBeNull();
+    // daemon 已被开关停掉，任何 `plugin/query` 都只会白等超时。
+    expect(clients[0].requests.filter((r) => r.method === "plugin/query")).toEqual([]);
+  });
+
+  it("看板开关关着时，已有的卡片会话也一并隐藏", async () => {
+    state.kanbanFlagEnabled = false;
+    state.threads = [
+      {
+        thread_id: "card-a",
+        title: "卡片会话",
+        permission_mode: "normal",
+        driver_project: "/proj",
+        driver_ref: "k1",
+      },
+    ];
+    state.groupWorkspaces = ["/proj"];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "flags/list")).toBe(true),
+    );
+    // 侧栏拿到会话列表的同一轮里，卡片会话必须仍被挡在外面。
+    await waitFor(() => expect(clients[0].requests.some((r) => r.method === "thread/listAll")).toBe(true));
+    expect(screen.queryByText("卡片会话")).toBeNull();
+    expect(screen.queryByText(/看板会话/)).toBeNull();
   });
 
   it("看板列表读不到时明说「无法读取」，而不是留空", async () => {

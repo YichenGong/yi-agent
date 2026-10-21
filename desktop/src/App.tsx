@@ -222,6 +222,13 @@ export default function App() {
    * 返回 -32601 的请求），也不能提前把侧栏的组长行藏起来。
    */
   const [leadAgentEnabled, setLeadAgentEnabled] = useState<boolean | null>(null);
+  /**
+   * Superpowers 看板开关（`flags/list` 里的 `superpowers_kanban`）。`null` = 还不知道。
+   *
+   * 与组长同一口径：stable 上服务端恒为关，不需要再判 `buildKind`；`null` 时按
+   * **关**处理，因为关掉会停掉整个 daemon，先藏一帧远好过画出一堆点不动的东西。
+   */
+  const [kanbanEnabled, setKanbanEnabled] = useState<boolean | null>(null);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
@@ -360,7 +367,9 @@ export default function App() {
   // `hooks/useBoardState.ts`。跨关注点的编排不在这里：`selectThread`/`newThread`
   // 的「离开看板」、`onCreateBoard` 等几个动作（要写会话错误位与 force）、以及
   // 握手后拉登记表与注册 2 秒计时器那两个现场，都留在 App，只把引用改成 `board.*`。
-  const board = useBoardState({ clientRef });
+  //  `kanbanEnabled` 传 `=== true`：`null`（还不知道）时按关处理，一个请求都不发。
+  //  开关值在握手后读取，读回来会让本 hook 的两个 callback 换新，从而重挂计时器。
+  const board = useBoardState({ clientRef, kanbanEnabled: kanbanEnabled === true });
 
   // 设置关注点（设置页/配对界面开合、首启引导、本机中继地址、主题、重配提示）
   // 整体搬进 hook，见 `hooks/useSettingsState.ts`。跨关注点的编排不在这里：
@@ -1429,16 +1438,22 @@ export default function App() {
         // 局部量而不是直接读 state：`setLeadAgentEnabled` 要下一次渲染才生效，
         // 而本函数后面的补建循环就在**这一轮**里跑，读 state 拿到的还是 `null`。
         let leadOn = false;
+        // 同一份 `flags/list` 里就有看板开关，不再多发一次请求。
+        let kanbanOn = false;
         try {
           const flags = await client.request<{
             flags?: Array<{ name?: unknown; enabled?: unknown }>;
           }>("flags/list", {});
           const lead = (flags.flags ?? []).find((f) => f.name === "lead_agent");
           leadOn = lead?.enabled === true;
+          const kanban = (flags.flags ?? []).find((f) => f.name === "superpowers_kanban");
+          kanbanOn = kanban?.enabled === true;
         } catch {
           leadOn = false;
+          kanbanOn = false;
         }
         setLeadAgentEnabled(leadOn);
+        setKanbanEnabled(kanbanOn);
         const settings = await client.request<{
           theme?: unknown;
           resident_daemon_watchman_enabled?: unknown;
@@ -2210,6 +2225,7 @@ export default function App() {
           onLinkFolder={linkFolder}
           onUnlinkFolder={unlinkFolder}
           leadAgentEnabled={leadAgentEnabled === true}
+          kanbanEnabled={kanbanEnabled === true}
         />
         </div>
         <div className="app-main relative flex min-w-0 flex-1 flex-col">
@@ -2233,7 +2249,7 @@ export default function App() {
           {/* 看板是主区域的一个平级页面：选中才出现，问的是被选中那个项目。
               离开看板走「点某条会话」（selectThread/newThread 清 selectedBoard）；
               没有选中时主区域就是原来的对话。 */}
-          {board.selectedBoard !== null ? (
+          {kanbanEnabled === true && board.selectedBoard !== null ? (
             <section
               aria-label="Superpowers 看板"
               className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-line bg-panel"
