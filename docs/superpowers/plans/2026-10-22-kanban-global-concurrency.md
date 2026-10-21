@@ -34,7 +34,7 @@
   - `driver_step(..., sessions: u32) -> Option<ActionResult>`（新增第 6 个参数）
   - `driver/next` 请求体新增 `"sessions": {"running": <u32>}`
 
-- [ ] **Step 1: 写失败测试（计数口径）**
+- [x] **Step 1: 写失败测试（计数口径）**
 
 直接测判定函数本身——真构造 `ThreadSession` 要带四个通道、`store` 与 `process_manager`，
 代价远超这个口径本身：
@@ -75,12 +75,12 @@
 `ThreadStatus` 需要 `use crate::protocol::ThreadStatus;`（当前 `session_driver.rs` 只 use 了
 `serde_json::Value` 与 `std::path::Path`）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib session_driver::tests::a_running_turn_counts -- --nocapture`
 Expected: 编译失败，`cannot find function is_a_running_session`。
 
-- [ ] **Step 3: 实现判定函数与 payload 字段**
+- [x] **Step 3: 实现判定函数与 payload 字段**
 
 在 `session_driver.rs`（`threads_payload` 之前）加：
 
@@ -131,7 +131,7 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
     });
 ```
 
-- [ ] **Step 4: 更新契约文件**
+- [x] **Step 4: 更新契约文件**
 
 `contract/driver-protocol.json` 的 `request` 里，在 `results` 之后加：
 
@@ -143,7 +143,7 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
 
 并在 `request._comment` 末尾补一句：`sessions.running 是宿主本进程此刻的**全机**运行会话数（不含等待决策的会话），供插件算全机余量。`
 
-- [ ] **Step 5: 契约测试与调用点**
+- [x] **Step 5: 契约测试与调用点**
 
 `server.rs:5762` 的调用改成：
 
@@ -176,12 +176,12 @@ pub(crate) async fn driver_step<L: SessionLauncher>(
     }
 ```
 
-- [ ] **Step 6: 跑测试**
+- [x] **Step 6: 跑测试**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib session_driver::tests`
 Expected: PASS（含新增 4 条与契约 1 条）。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all
@@ -208,7 +208,7 @@ git commit -m "feat(app-server): driver/next 上报全机运行会话数"
   - `ConcurrencyCalendar::save_global()` / `save_project(state_dir)`
   - `ConcurrencyCalendar::limit_at(now)` 语义改为「全机峰值」
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `layout.rs` 的 `mod tests`：
 
@@ -261,12 +261,12 @@ git commit -m "feat(app-server): driver/next 上报全机运行会话数"
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core global_settings live_under_the_plugin`
 Expected: 编译失败，`cannot find function global_settings_path`。
 
-- [ ] **Step 3: 实现布局与加载**
+- [x] **Step 3: 实现布局与加载**
 
 `layout.rs` 加：
 
@@ -367,12 +367,12 @@ pub fn global_settings_path() -> Option<PathBuf> {
 
 `save` 与 `load_preferring_new` 先保留为 `save_project` / `load_merged` 的别名，供本任务内的调用点继续编译；Task 3 再逐个改掉。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core calendar:: && cargo test -p superpowers-kanban-core layout::`
 Expected: PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd plugins/superpowers-kanban && cargo fmt --all
@@ -400,7 +400,7 @@ git commit -m "feat(kanban): 并发峰值配置迁到插件全局目录"
   - `BoardService::next_launch(&self, sessions_running: Option<u32>, now)`
   - `runner::plan_launches(board, budget: usize)`
 
-- [ ] **Step 1: 写失败测试（双重扣减回归锁）**
+- [x] **Step 1: 写失败测试（双重扣减回归锁）**
 
 `service.rs` 的 `mod tests` 加：
 
@@ -467,12 +467,12 @@ git commit -m "feat(kanban): 并发峰值配置迁到插件全局目录"
     }
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner outside_sessions_consume`
 Expected: 编译失败（`driver_step` 只收 2 个参数）。
 
-- [ ] **Step 3: 改 board 的认领判定**
+- [x] **Step 3: 改 board 的认领判定**
 
 `board.rs`：
 
@@ -495,7 +495,7 @@ Expected: 编译失败（`driver_step` 只收 2 个参数）。
 
 删掉 `free_slots`、`start_due`，`running_count` 仅保留给测试与 `list` 展示（若已无人调用则删除）。相应测试改成按新接口写；`board.rs:612-731` 里依赖 `start_due` 的用例，用 `claim_next_launch(1)` + 手动 `transition(Running)` 复刻。
 
-- [ ] **Step 4: 改 service 的判定**
+- [x] **Step 4: 改 service 的判定**
 
 `service.rs` 的 `next_launch`：
 
@@ -555,7 +555,7 @@ Expected: 编译失败（`driver_step` 只收 2 个参数）。
 
 在此基础上补一条**调用点批量更新**步骤（实测全仓 41 处 `driver_step(`、22 处 `.next_launch(`，逐个人工改必然漏）：
 
-- [ ] **Step 4b: 批量更新既有调用点**
+- [x] **Step 4b: 批量更新既有调用点**
 
 先跑 `grep -rn "driver_step(&\|\.driver_step(" yi-agent-rs/crates plugins/superpowers-kanban/crates --include=*.rs | wc -l`
 与新签名对账。既有用例里的 `limit` 参数**语义换成 `Some(limit)`**（等价于「宿主说全机只有看板这
@@ -575,7 +575,7 @@ perl -pi -e 's/\.driver_step\(&\[\], &\[\]\)/.driver_step(\&[], \&[], None)/g' \
 宿主侧 41 处 `driver_step(` 同理补第 6 个实参 `0`：`perl -pi -e 's/driver_step\(&query, &mut threads, &mut results, &mut launcher, &idle\)/driver_step(\&query, \&mut threads, \&mut results, \&mut launcher, \&idle, 0)/g'`。
 批量替换后**必须** `cargo test` 全绿才算改对；`grep` 复查残余（`grep -rn "next_launch([0-9]" crates` 应无输出）。
 
-- [ ] **Step 5: 改 dispatch 与 runner**
+- [x] **Step 5: 改 dispatch 与 runner**
 
 `dispatch.rs` 的 `driver/next` 分支，在解析 `results` 之后加：
 
@@ -634,12 +634,12 @@ pub fn plan_launches(board: &Board, budget: usize) -> Vec<CardId> {
     }
 ```
 
-- [ ] **Step 6: 跑测试**
+- [x] **Step 6: 跑测试**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-core && cargo test -p superpowers-kanban-runner --lib`
 Expected: PASS。
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 cd plugins/superpowers-kanban && cargo fmt --all
@@ -661,7 +661,7 @@ git commit -m "feat(kanban): 并发判定改为全机余量，避免看板内外
 - Consumes: `ConcurrencyCalendar::load_merged` / `save_global_in` / `save_project`（Task 2）。
 - Produces: `settings.read` 返回合并视图；`settings.write` 拆两半落盘。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```rust
     /// 并发字段写进全局文件，其余写进项目文件。
@@ -715,12 +715,12 @@ pub fn dispatch_with_home(
 
 `dispatch_with_global` 保留并转调它（`home` 取 `std::env::var_os("HOME")`）。
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner settings_write_splits`
 Expected: FAIL，全局文件不存在。
 
-- [ ] **Step 3: 实现拆分**
+- [x] **Step 3: 实现拆分**
 
 `settings.read`：
 
@@ -761,12 +761,12 @@ Expected: FAIL，全局文件不存在。
 
 其余读取点（`main.rs:52`、`main.rs:992`、`service.rs:476`、`service.rs:723`、`dispatch.rs:236`）一律 `load_preferring_new` → `load_merged`。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner`
 Expected: PASS。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd plugins/superpowers-kanban && cargo fmt --all
@@ -788,7 +788,7 @@ git commit -m "feat(kanban): settings 读写按全局/项目拆分字段"
 - Consumes: Task 1 的 `sessions` 字段、Task 3 的 `driver_step(..., Option<u32>)`。
 - Produces: 无新增 API。
 
-- [ ] **Step 1: 写失败测试（插件侧契约）**
+- [x] **Step 1: 写失败测试（插件侧契约）**
 
 `service.rs` 的 `mod tests`：
 
@@ -805,7 +805,7 @@ git commit -m "feat(kanban): settings 读写按全局/项目拆分字段"
     }
 ```
 
-- [ ] **Step 2: 端到端：宿主真把非零计数送出去**
+- [x] **Step 2: 端到端：宿主真把非零计数送出去**
 
 在 `server.rs` 的 driver tick 测试模块里，复用既有 `FakeDaemon` fixture，断言请求里 `sessions.running` 反映真实在跑的会话：
 
@@ -822,13 +822,13 @@ git commit -m "feat(kanban): settings 读写按全局/项目拆分字段"
 
 （沿用 `server.rs:8695` 那套 `idle_seen` 记录机制，改成同时记 `params["sessions"]["running"]`。）
 
-- [ ] **Step 3: 跑测试**
+- [x] **Step 3: 跑测试**
 
 Run: `cd yi-agent-rs && cargo test -p yi-agent-app-server --lib the_tick_reports_how_many`
 Run: `cd plugins/superpowers-kanban && cargo test -p superpowers-kanban-runner the_driver_contract_carries`
 Expected: 均 PASS。
 
-- [ ] **Step 4: 更新文档**
+- [x] **Step 4: 更新文档**
 
 `docs/project-management/superpowers-kanban.md` 的 Features 追加一条：
 
@@ -863,7 +863,7 @@ max_tasks = 2
 即便写了 `default_max_tasks` 也会被忽略。
 ````
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 cd yi-agent-rs && cargo fmt --all && cd ../plugins/superpowers-kanban && cargo fmt --all
