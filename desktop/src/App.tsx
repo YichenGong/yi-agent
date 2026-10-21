@@ -57,7 +57,6 @@ import {
   enqueueBoardCard,
   enqueuePrequeuedCard,
   promoteBoardCard,
-  setBoardSwitch,
   watchmanFromSettings,
   writeBoardWatchman,
 } from "./lib/superpowersKanbanSwitch";
@@ -903,24 +902,6 @@ export default function App() {
     board.setBoardCards([]);
     board.setDoneExpanded(false); // 换项目 → 新看板从折叠开始
     board.setSelectedBoard(path);
-  };
-
-  /**
-   * 写开关。失败不再吞掉：把失败翻译成三种可操作的说法摆出来。
-   *
-   * 成功才更新本地状态（服务端是权威），失败保持原状并报出原因——原来那句
-   * `.catch(() => {})` 正是「点了没反应」的来源。
-   */
-  const onToggleBoardSwitch = async (next: boolean) => {
-    if (board.selectedBoard === null) return;
-    board.setBoardError(null);
-    try {
-      await setBoardSwitch(board.boardRpc, board.selectedBoard, next);
-      board.setBoardOn(next);
-      board.setBoardSource("project");
-    } catch (error) {
-      board.setBoardError(boardErrorKind(error));
-    }
   };
 
   /** 打开原生文件夹选择器,返回选中的绝对路径(取消则 null)。 */
@@ -2278,39 +2259,38 @@ export default function App() {
               aria-label="Superpowers 看板"
               className="flex min-h-0 flex-1 flex-col overflow-hidden border-b border-line bg-panel"
             >
-              {/* 顶栏：项目路径 + 开关/值守 + 入队 + 错误行 */}
+              {/* 顶栏：项目路径 + 入队「＋」。入队是低频动作，收进菜单后
+                  卡片列表能直接从这一行开始。 */}
               <div className="flex items-center gap-3 px-4 pt-3">
                 <span className="truncate font-mono text-xs text-fg-muted" title={board.selectedBoard}>
                   {board.selectedBoard}
                 </span>
+                <div className="ml-auto shrink-0">
+                  <SuperpowersKanbanEnqueue
+                    pickFile={pickFile}
+                    enqueue={(spec, plan) =>
+                      enqueueBoardCard(board.boardRpc, board.selectedBoard!, spec, plan)
+                    }
+                    prequeue={(title) =>
+                      enqueuePrequeuedCard(
+                        board.boardRpc,
+                        board.selectedBoard!,
+                        title,
+                        sess.currentId,
+                      )
+                    }
+                  />
+                </div>
               </div>
               <SuperpowersKanbanSettings
                 switchOn={board.boardOn}
                 source={board.boardSource}
-                onToggle={(next) => void onToggleBoardSwitch(next)}
-                watchmanEnabled={board.watchmanEnabled}
-                onToggleWatchman={(next) => void onToggleWatchman(next)}
-                watchmanWarning={board.watchmanWarning}
               />
               {board.boardError !== null && (
                 <div className="flex items-center gap-3 px-4 pb-3 text-xs text-red-400">
                   <span>{BOARD_ERROR_TEXT[board.boardError]}</span>
                 </div>
               )}
-              <SuperpowersKanbanEnqueue
-                pickFile={pickFile}
-                enqueue={(spec, plan) =>
-                  enqueueBoardCard(board.boardRpc, board.selectedBoard!, spec, plan)
-                }
-                prequeue={(title) =>
-                  enqueuePrequeuedCard(
-                    board.boardRpc,
-                    board.selectedBoard!,
-                    title,
-                    sess.currentId,
-                  )
-                }
-              />
               <SuperpowersKanbanView
                 switchOn={board.boardOn}
                 source={board.boardSource}
@@ -2616,6 +2596,10 @@ export default function App() {
         isMobile={isMobile}
         theme={prefs.theme}
         onThemeChange={prefs.changeTheme}
+        // 值守从看板面板迁来：它装的是通用登录项，服务所有已登记的项目。
+        watchmanEnabled={board.watchmanEnabled}
+        onToggleWatchman={(next) => void onToggleWatchman(next)}
+        watchmanWarning={board.watchmanWarning}
         onClose={() => prefs.setSettingsOpen(false)}
         // 远程访问 Tab 走**当前 transport**（桌面 stdio = Admin），所以能调
         // pair/create、device/revoke；网络客户端会拿到 -32014，Tab 会提示权限。

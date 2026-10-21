@@ -3396,6 +3396,7 @@ async fn unknown_method_returns_method_not_found() {
         // ---- Plugin(`plugin/*` 与 `plugins/*`) ----
         ("plugin/query", Domain::Plugin),
         ("plugin/install", Domain::Plugin),
+        ("plugin/uninstall", Domain::Plugin),
         ("plugin/settings/read", Domain::Plugin),
         ("plugin/settings/write", Domain::Plugin),
         ("plugins/list", Domain::Plugin),
@@ -19219,5 +19220,158 @@ async fn group_mutations_broadcast_groups_changed() {
     let n = read_notification(&mut h, "thread/groupsChanged").await;
     assert_eq!(n["params"]["workspace"], ws);
     assert!(n["params"].get("groups").is_none(), "只带 workspace: {n}");
+    h.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// `plugin/uninstall`:`plugin/install` 的镜像。
+//
+// 用户右键「移除看板」原本只撤销常驻登记 + 删状态目录:daemon 还在跑、清单还
+// 在、开关还开着,于是插件下一拍就把目录重建出来——「移除」成了「重启」。这里
+// 钉死真正的卸载语义。
+// ---------------------------------------------------------------------------
+
+/// 发一条 `plugin/uninstall`。
+async fn send_uninstall(h: &mut Harness, id: u64, project: &std::path::Path, plugin: &str) {
+    let params = serde_json::json!({
+        "project": project.to_string_lossy(),
+        "plugin": plugin,
+    });
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "plugin/uninstall",
+            "params": params,
+        })
+        .to_string(),
+    )
+    .await;
+}
+
+/// 装一个插件并把它的运行痕迹铺满（状态目录 + 日志 + 无关的偏好键），
+/// 供卸载用例断言「该删的删了、不该动的没动」。
+fn install_and_seed_plugin(h: &Harness, project: &std::path::Path, plugin: &str, switch_key: &str) {
+    let manifest = serde_json::json!({
+        "name": plugin,
+        "command": "/bin/true",
+        "switch_key": switch_key,
+    });
+    fake_plugin_printing(h, plugin, &manifest.to_string());
+    let dir = project.join(".yi-agent");
+    std::fs::create_dir_all(dir.join(plugin)).unwrap();
+    std::fs::write(dir.join(plugin).join("board.json"), "{}").unwrap();
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    std::fs::write(dir.join("logs").join(format!("{plugin}.log")), "old").unwrap();
+    // 别人的键:卸载只该删自己那一个。
+    std::fs::write(
+        dir.join("preferences.json"),
+        r#"{"subagent_runtime":"always"}"#,
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_uninstall_removes_the_manifest_the_switch_and_the_state() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    install_and_seed_plugin(&h, project.path(), "demo-plugin", "demo_plugin_on");
+    send_install(&mut h, 9, project.path(), "demo-plugin").await;
+    let installed = h.read_value().await;
+    assert!(installed.get("error").is_none(), "{installed}");
+    let canonical = std::fs::canonicalize(project.path()).unwrap();
+
+    send_uninstall(&mut h, 10, project.path(), "demo-plugin").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_none(),
+        "uninstalling an installed plugin must succeed: {response}"
+    );
+    assert_eq!(response["result"]["uninstalled"], true);
+    assert_eq!(
+        response["result"]["warnings"],
+        serde_json::json!([]),
+        "nothing should have failed here: {response}"
+    );
+
+    // 清单没了 = supervisor 下一拍会停掉这个子进程，且不会再拉起。
+    assert!(
+        !canonical
+            .join(".yi-agent/supervisors/demo-plugin.json")
+            .exists(),
+        "the manifest must be gone, otherwise the supervisor keeps the plugin alive"
+    );
+    // 状态目录没了 = 插件即使还活着写一拍，也该由它自己重建（它已经没清单了）。
+    assert!(
+        !canonical.join(".yi-agent/demo-plugin").exists(),
+        "the plugin state dir must be gone"
+    );
+    // 日志没了。
+    assert!(!canonical.join(".yi-agent/logs/demo-plugin.log").exists());
+    // 开关键删掉，别人的键原样保留。
+    let preferences: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(canonical.join(".yi-agent/preferences.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        preferences.get("demo_plugin_on").is_none(),
+        "the switch key must be removed, not left behind: {preferences}"
+    );
+    assert_eq!(
+        preferences["subagent_runtime"], "always",
+        "uninstalling one plugin must not touch other keys: {preferences}"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_uninstall_is_safe_to_repeat_and_on_a_never_installed_plugin() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    // 从未装过:不该报错，也不该凭空造出 `.yi-agent`。
+    send_uninstall(&mut h, 9, project.path(), "never-installed").await;
+    let response = h.read_value().await;
+    assert!(
+        response.get("error").is_none(),
+        "uninstalling something absent is already the goal: {response}"
+    );
+    assert_eq!(response["result"]["uninstalled"], true);
+
+    let project2 = tempfile::TempDir::new().unwrap();
+    install_and_seed_plugin(&h, project2.path(), "demo-plugin", "demo_plugin_on");
+    send_install(&mut h, 10, project2.path(), "demo-plugin").await;
+    let _ = h.read_value().await;
+    send_uninstall(&mut h, 11, project2.path(), "demo-plugin").await;
+    let first = h.read_value().await;
+    assert!(first.get("error").is_none(), "{first}");
+    // 第二次：幂等。
+    send_uninstall(&mut h, 12, project2.path(), "demo-plugin").await;
+    let second = h.read_value().await;
+    assert!(
+        second.get("error").is_none(),
+        "a second uninstall must not fail: {second}"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plugin_uninstall_rejects_an_unusable_plugin_name() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    let project = tempfile::TempDir::new().unwrap();
+    send_uninstall(&mut h, 9, project.path(), "../escape").await;
+    let response = h.read_value().await;
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "a traversing name must be refused: {response}"
+    );
+
     h.shutdown().await;
 }

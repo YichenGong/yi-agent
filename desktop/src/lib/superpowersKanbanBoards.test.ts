@@ -36,15 +36,43 @@ describe("board lifecycle RPCs", () => {
     expect(inner).toHaveBeenCalledTimes(1);
   });
 
-  it("removeBoard 走通用 plugin/query", async () => {
-    const inner = vi.fn(async () => ({}));
+  it("removeBoard 先卸载插件、再用 plugin/query 兜底", async () => {
+    const calls: string[] = [];
+    const inner = vi.fn(async (method: string) => {
+      calls.push(method);
+      return {};
+    });
     await removeBoard(inner as unknown as Rpc, "/proj");
-    expect(inner).toHaveBeenCalledWith("plugin/query", {
+    // 顺序是契约：只发 lifecycle/remove 的话，daemon 还在跑、清单还在，
+    // 插件下一拍就把状态目录重建出来——「移除」等于「重启」。
+    expect(calls).toEqual(["plugin/uninstall", "plugin/query"]);
+    expect(inner).toHaveBeenNthCalledWith(1, "plugin/uninstall", {
+      project: "/proj",
+      plugin: "superpowers-kanban",
+    });
+    expect(inner).toHaveBeenNthCalledWith(2, "plugin/query", {
       plugin: "superpowers-kanban",
       project: "/proj",
       method: "lifecycle/remove",
       params: { project: "/proj" },
     });
+  });
+
+  it("卸载后插件已消失：兜底那一下失败不影响移除成功", async () => {
+    const inner = vi.fn(async (method: string) => {
+      if (method === "plugin/query") throw new Error("plugin_unavailable");
+      return {};
+    });
+    // 卸载成功即视为移除成功；兜底失败不能让用户以为没删掉、再点一次。
+    await expect(removeBoard(inner as unknown as Rpc, "/proj")).resolves.toBeUndefined();
+  });
+
+  it("卸载本身失败时把错误抛给调用方（不能假装删掉了）", async () => {
+    const inner = vi.fn(async (method: string) => {
+      if (method === "plugin/uninstall") throw new Error("boom");
+      return {};
+    });
+    await expect(removeBoard(inner as unknown as Rpc, "/proj")).rejects.toThrow("boom");
   });
 
   it("createBoard 把失败原样抛给调用方（不吞）", async () => {

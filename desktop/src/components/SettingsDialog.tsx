@@ -38,6 +38,9 @@ export function SettingsDialog({
   isMobile = false,
   theme,
   onThemeChange,
+  watchmanEnabled,
+  onToggleWatchman,
+  watchmanWarning,
   onClose,
   remoteCall,
   pluginCall,
@@ -69,6 +72,14 @@ export function SettingsDialog({
   isMobile?: boolean;
   theme: Theme;
   onThemeChange: (theme: Theme) => void;
+  /**
+   * 宿主级「后台值守」。从看板面板迁到「通用」：它装的是通用登录项，服务所有
+   * 已登记的项目，与当时选中的看板无关。
+   */
+  watchmanEnabled?: boolean;
+  onToggleWatchman?: (next: boolean) => void;
+  /** 值守安装/卸载失败的原因；空即无异常。 */
+  watchmanWarning?: string | null;
   onClose: () => void;
   /** 「远程访问」Tab 的 RPC 接缝，由宿主注入；缺省时该 Tab 只读。 */
   remoteCall?: RemoteCall;
@@ -305,7 +316,13 @@ export function SettingsDialog({
             className="settings-panel min-h-0 flex-1 overflow-y-auto"
           >
             {active === "general" ? (
-              <SettingsGeneralTab theme={theme} onThemeChange={onThemeChange} />
+              <SettingsGeneralTab
+                theme={theme}
+                onThemeChange={onThemeChange}
+                watchmanEnabled={watchmanEnabled}
+                onToggleWatchman={onToggleWatchman}
+                watchmanWarning={watchmanWarning}
+              />
             ) : active === "remote" ? (
               <SettingsRemoteTab
                 call={remoteCall}

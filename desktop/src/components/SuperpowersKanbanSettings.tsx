@@ -1,58 +1,36 @@
 import type { SwitchSource } from "../lib/superpowersKanbanSwitch";
 
+/**
+ * 看板页顶栏的一行只读状态。
+ *
+ * 这里**故意没有开关**：一个看板存在，意味着建它的时候插件已经被装好、开关
+ * 已经被打开（`createBoard` 的两步）。再给一个「开/关」只会问用户一件已经
+ * 决定过的事。要停掉这个看板，正确的动作是右键「移除看板」——那是真的卸载。
+ *
+ * 状态本身必须留下：`source` 是用户判断「这个看板为什么不动」的唯一线索
+ * （项目层关着 / 全局关着 / 从来没人开过）。
+ */
 export function SuperpowersKanbanSettings({
   switchOn,
   source,
-  onToggle,
-  watchmanEnabled,
-  onToggleWatchman,
-  watchmanWarning,
 }: {
   switchOn: boolean;
   source: SwitchSource;
-  onToggle: (next: boolean) => void;
-  /**
-   * 宿主级「后台值守」。默认开，且属于宿主本身而非某个项目，因此与上面的
-   * 项目开关分开一行：两者管的不是同一件事。
-   */
-  watchmanEnabled: boolean;
-  onToggleWatchman: (next: boolean) => void;
-  /** 宿主安装/卸载值守失败时的说明；空即无异常。 */
-  watchmanWarning?: string | null;
 }) {
   return (
-    <section className="p-4">
-      <div className="flex items-center justify-between">
-        <label className="flex items-center gap-3 text-sm">
-          <input
-            type="checkbox"
-            aria-label="Superpowers 看板开关"
-            checked={switchOn}
-            onChange={(event) => onToggle(event.target.checked)}
-          />
-          <span>Superpowers 看板</span>
-          <span className="text-fg-subtle">({source})</span>
-        </label>
-      </div>
-      <p className="mt-2 text-xs text-fg-subtle">
-        Off by default. Turning it off stops the plugin from advancing the queue; it
-        does not cancel sessions already running in the daemon.
-      </p>
-      <label className="mt-3 flex items-center gap-3 text-sm">
-        <input
-          type="checkbox"
-          aria-label="后台值守（开机自启）开关"
-          checked={watchmanEnabled}
-          onChange={(event) => onToggleWatchman(event.target.checked)}
+    <section className="px-4 pb-2 pt-3">
+      <p className="flex items-center gap-2 text-xs">
+        <span className="text-fg">Superpowers 看板</span>
+        <span
+          aria-hidden="true"
+          className={`size-1.5 rounded-full ${switchOn ? "bg-emerald-500" : "bg-fg-subtle"}`}
         />
-        <span>后台值守（开机自启）</span>
-      </label>
-      <p className="mt-1 text-xs text-fg-subtle">
-        开启后看板将在后台持续运行，电脑重启后自动恢复，无需打开本应用。
+        <span className="text-fg-muted">{switchOn ? "运行中" : "已停用"}</span>
+        <span className="text-fg-subtle">({source})</span>
       </p>
-      {watchmanWarning && (
-        <p role="alert" className="mt-1 text-xs text-amber-500">
-          {watchmanWarning}
+      {!switchOn && (
+        <p className="mt-1 text-xs text-fg-subtle">
+          移除后重新创建即可恢复；已排队的卡片不会被推进。
         </p>
       )}
     </section>
