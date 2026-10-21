@@ -465,9 +465,14 @@ fn manifest_json(command: &std::path::Path) -> serde_json::Value {
             "{workdir}"
         ],
         "switch_key": "superpowers_kanban",
-        // 关掉开关只该停止推进，不该让插件消失：查询通道就是通过它把开关拨回来的，
-        // 停掉进程等于把「怎么重新打开」一起删了。
-        "stop_when_disabled": false,
+        // 关掉 = 完全停掉，包括调度：留着进程只会让它空转轮询，而"关掉"
+        // 在用户眼里就不该还有东西在跑。
+        //
+        // 这不是单向门：重新打开走设置页的 `flags/set`，那条路是 app-server
+        // 直接写 `flags.json`，不经过本进程。旧注释担心"停掉就没人能拨回来"，
+        // 那时开关靠插件自己写 `preferences.json` 才成立；全局层换了来源之后
+        // 这个前提已经不存在。
+        "stop_when_disabled": true,
         // 宿主只通过这个通用字段发现「该问哪个插件下一步动作」。
         "session_driver": true,
         "restart_backoff_ms": 1000,
@@ -1933,8 +1938,8 @@ mod tests {
             described
                 .get("stop_when_disabled")
                 .and_then(|v| v.as_bool()),
-            Some(false),
-            "the query channel must survive switch-off, or `off` becomes a one-way door"
+            Some(true),
+            "switching off must actually stop the daemon, not leave it spinning"
         );
 
         assert_eq!(

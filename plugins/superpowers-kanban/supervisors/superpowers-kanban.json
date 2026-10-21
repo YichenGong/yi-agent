@@ -11,7 +11,7 @@
     "{workdir}"
   ],
   "switch_key": "superpowers_kanban",
-  "stop_when_disabled": false,
+  "stop_when_disabled": true,
   "session_driver": true,
   "restart_backoff_ms": 1000,
   "restart_backoff_max_ms": 30000,

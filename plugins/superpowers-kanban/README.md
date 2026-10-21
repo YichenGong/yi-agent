@@ -94,13 +94,23 @@ superpowers-kanban add-merge kanban/2026-10-03-a-feature --base develop
 `instance_wait_secs`（默认 10 秒）有界等待后退出，不再无限空转。启动时还会清掉
 本插件确定路径上连不上的死 socket。
 
-## 开关
-`superpowers-kanban on|off` 写**项目层**（`<项目>/.yi-agent/preferences.json`）。
-全局层在 `~/.yi-agent/preferences.json`，需自行设置。
+## 开关：两层，各管各的
 
-`off` 只**停止推进**（已在跑的会话不会被取消）。进程本身继续运行，因为它的查询
-通道是宿主与桌面端读取、改写开关的唯一入口——停掉它，`off` 就无法再被翻回来。
-清单里的 `stop_when_disabled: false` 正是在向监督器声明这一点。
+| 层 | 存哪 | 管什么 | 谁写 |
+|---|---|---|---|
+| **全局 flag** `superpowers_kanban` | `~/.yi-agent/flags.json` | daemon **进程起不起** | 设置页 → app-server（不经过本插件） |
+| **项目开关** `superpowers_kanban` | `<项目>/.yi-agent/preferences.json` | 这个项目**干不干活** | `superpowers-kanban on\|off`，或看板 UI |
+
+两层同名但**不是同一个东西**，读的是两个文件。
+
+- **全局关** = 完全停掉，包括调度。清单里 `stop_when_disabled: true` 就是为这个。
+  重开走设置页的 `flags/set`，那条路 app-server 直接写 `flags.json`，不经过本进程，
+  所以"关"不是单向门。
+- **项目关**（全局仍开）= daemon 还在，但**停止推进**：不认领新卡、不派发、
+  不合并。已在跑的会话不会被取消。这时查询通道仍在，所以随时能拨回来。
+
+`global_preferences_path`（`$HOME/.yi-agent/preferences.json`）已不再决定进程起停；
+它是历史遗留的全局层，仅作为项目开关的兜底读取。
 
 ## 后台值守（开机自启，仅 macOS）
 
