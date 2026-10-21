@@ -94,6 +94,32 @@ pub fn idle() -> SuperviseHandle {
 ///
 /// `runtime_dir` 由调用方给出（daemon 建在哪儿就传哪儿），因为转发表按它分区。
 pub fn serve(workdir: &Path, runtime_dir: &Path) -> SuperviseHandle {
+    serve_with(workdir, runtime_dir, None)
+}
+
+/// [`serve`] 的可注入版本：`flags_path` 覆盖 `flags.json` 的位置。
+///
+/// 存在的理由只有测试，但与 `Supervisor::with_flags_path` 同一条规矩：**不要**
+/// 用 `#[cfg(test)]` 分支，集成测试编译的是普通 lib，那种分支在那里不存在。
+/// 判定的构建类型仍取自进程（`yi_agent_flags::build_kind()`）——测试二进制恒为
+/// `release`，而 `release` 下任何 flag 都不生效，所以调用方若要在测试里看到
+/// 子进程被拉起，还须自行注入 dev 构建类型（见
+/// [`serve_with_environment`]）。
+pub fn serve_with(
+    workdir: &Path,
+    runtime_dir: &Path,
+    flags_path: Option<std::path::PathBuf>,
+) -> SuperviseHandle {
+    serve_with_environment(workdir, runtime_dir, flags_path, None)
+}
+
+/// 最完整的那一层：开关文件位置与构建类型都可注入。
+pub fn serve_with_environment(
+    workdir: &Path,
+    runtime_dir: &Path,
+    flags_path: Option<std::path::PathBuf>,
+    build_kind: Option<&str>,
+) -> SuperviseHandle {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let layout = Layout::for_workdir(workdir);
@@ -101,11 +127,17 @@ pub fn serve(workdir: &Path, runtime_dir: &Path) -> SuperviseHandle {
     // 同一个 key 下。同一个进程可能同时监督多个项目（桌面 app-server 就是如此），
     // 所以这里的数据结构不能再假定"一个进程只有一个 daemon"。
     let scope = runtime_dir.to_path_buf();
+    let kind = build_kind
+        .map(str::to_string)
+        .unwrap_or_else(|| yi_agent_flags::build_kind().to_string());
     let join = std::thread::spawn(move || {
         // 监督线程的 panic 不得拖垮宿主（TUI/桌面）——记录后结束，
         // `stop()` 仍能安全 join 到这个已结束的线程。
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut supervisor = Supervisor::new(layout, yi_agent_flags::build_kind().to_string());
+            let mut supervisor = Supervisor::new(layout, kind);
+            if let Some(path) = flags_path {
+                supervisor = supervisor.with_flags_path(path);
+            }
             while !flag.load(Ordering::SeqCst) {
                 supervisor.reconcile();
                 // 转发表只有运行中的、且声明了 query_socket 的插件才该出现；

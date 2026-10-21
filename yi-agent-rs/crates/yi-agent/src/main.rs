@@ -3318,22 +3318,35 @@ mod tests {
         std::fs::write(
             manifests.join("demo.json"),
             format!(
-                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"demo_on","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
+                // 键必须在注册表里：未注册的名字一律读成关（只有注册表里的
+                // 才能开），用一个自造的键会让这条测试永远等不到子进程。
+                r#"{{"name":"demo","command":"{}","args":[],"switch_key":"superpowers_kanban","restart_backoff_ms":50,"restart_backoff_max_ms":200}}"#,
                 child.display()
             ),
         )
         .unwrap();
-        std::fs::create_dir_all(workdir.join(".yi-agent")).unwrap();
+        // 开关在**全局层**（`flags.json`），项目层 `preferences.json` 不参与进程
+        // 起停——那个键由插件自己写，停掉进程就没人能拨回来。
+        let flags = workdir.join("flags.json");
         std::fs::write(
-            workdir.join(".yi-agent/preferences.json"),
-            r#"{"demo_on":true}"#,
+            &flags,
+            r#"{"version":1,"flags":{"superpowers_kanban":true}}"#,
         )
         .unwrap();
 
         // 转发表按 daemon 的 runtime 目录分区；这条测试不起 daemon，给一个
         // 项目内路径即可，与生产侧 `Layout::for_workdir` 的推导一致。
+        //
+        // 两处注入都是必须的：测试二进制的构建类型恒为 `release`（`build_kind()`
+        // 只有 `yi-agent` 启动时才被注入），而 `release` 下任何 flag 都不生效——
+        // 不注入 dev 就永远看不到子进程被拉起，测试会变成在断言一条死路径。
         let runtime_dir = workdir.join(".yi-agent/runtime");
-        let handle = yi_agent_runtime::supervise::serve(workdir, &runtime_dir);
+        let handle = yi_agent_runtime::supervise::serve_with_environment(
+            workdir,
+            &runtime_dir,
+            Some(flags),
+            Some("dev"),
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut started = false;
         while Instant::now() < deadline {
