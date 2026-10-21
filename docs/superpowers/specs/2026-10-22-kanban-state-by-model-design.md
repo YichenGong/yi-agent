@@ -127,13 +127,21 @@ pre_queued → queued → running → needs_you | awaiting_merge | done | failed
 
 ### 2.7 观测（只读派生）
 
-`list` 与桌面新增两列纯计算结果，**永不落成状态**：
+`list` 与桌面要显示「会话还在不在」，但它们直接读 `board.json`，拿不到宿主内存里的
+会话表。因此 daemon 每拍把观测结果写进一个**只读旁路文件**，与卡状态严格分开：
 
-- `live`：该卡 `thread_id` 是否在宿主活会话集合里。
-- `last_active`：该会话最后一次活动时间。
-- 派生标记 `stale`：卡是 `running` 但没有活会话（模型忘了写、或会话被直接杀掉）。
+```
+<state_dir>/observations.json
+{"threads": {"thread-1": {"alive": true, "last_seen_alive_at": "<rfc3339>"}}}
+```
 
-按用户选择呈现为：**角标 + 最后活动时间**。不做任何自动降级。
+- 只有 daemon 写，`list` / 桌面只读。
+- `alive` 取自宿主本拍 `threads[].alive`；`last_seen_alive_at` 是 daemon 自己记的
+  「最后一次看到它还活着」的时刻（宿主不提供时间）。
+- 派生标记 `stale` = 卡是 `running` 且其 `thread_id` 在观测里 `alive=false`。
+
+按用户选择呈现为：**角标 + 最后活动时间**。不做任何自动降级，观测文件**永不**写回
+卡片状态。
 
 ## 3. 接口
 
