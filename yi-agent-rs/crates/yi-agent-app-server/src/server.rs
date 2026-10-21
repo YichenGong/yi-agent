@@ -4472,8 +4472,6 @@ async fn persist_and_finish_turn(
     store: &crate::thread_store::ThreadStore,
     hub: &crate::broadcast::Broadcaster,
     turn_tx: &mpsc::Sender<TurnEvent>,
-    provider: &Arc<dyn yi_agent_core::Provider>,
-    config: &yi_agent_core::AgentConfig,
     status: &Arc<std::sync::Mutex<ThreadStatus>>,
 ) {
     let mut items = Vec::with_capacity(completed_items.len() + 1);
@@ -4506,7 +4504,6 @@ async fn persist_and_finish_turn(
         messages: persisted_messages,
     };
     // append 失败则跳过 meta 维护：避免出现"幽灵" thread。
-    let mut first_turn = false;
     if let Err(e) = store.append_turn(thread_id, &record) {
         eprintln!("[app-server] failed to persist turn {thread_id}: {e}");
     } else {
@@ -4523,18 +4520,17 @@ async fn persist_and_finish_turn(
             }
         }
         if let Some(prompt) = user_prompt {
-            match store.touch(thread_id, Some(prompt)) {
-                // 本次刚写入兜底截断标题 = 该 thread 的首轮。
-                Ok(true) => first_turn = true,
-                Ok(false) => {}
-                Err(e) => eprintln!("[app-server] failed to update meta for {thread_id}: {e}"),
+            // 标题已在 turn 开始时（`run_thread_driver` 收到输入后）由
+            // `title_on_first_input` 写入并尝试用 LLM 标题覆盖；这里只负责刷新
+            // `updated_at`，返回值不再有意义。
+            if let Err(e) = store.touch(thread_id, Some(prompt)) {
+                eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
             }
         }
     }
 
-    // 先广播「本轮已落盘」，再做标题生成：标题是锦上添花，绝不能拖住 turn 收尾。
-    // delete/interrupt 路径正是靠这枚 Finished 判定落盘完成，而标题生成最长可等
-    // TITLE_TIMEOUT——若排在它前面，会让收尾凭空多出 5 秒延迟。
+    // 广播「本轮已落盘」：delete/interrupt 路径靠这枚 Finished 判定落盘完成。
+    // 标题生成已前移到 turn 开始处，收尾路径不再有任何可等待的模型调用。
     let _ = update_status(hub, status, thread_id, ThreadStatus::Idle).await;
     if let Some(turn_id) = turn_id {
         // 回填给等待方的回复:与标题材料同一份文本,故这里复用它而不是再抽一次
@@ -4549,68 +4545,75 @@ async fn persist_and_finish_turn(
             ))
             .await;
     }
+}
 
-    // 仅首轮生成标题：拿 touch 写入的兜底截断值作 CAS 凭据，尝试用 LLM 标题覆盖。
-    // 任何失败/超时/空结果都静默保留兜底标题。clear / compact 传 `user_prompt = None`，
-    // 天然不会走到这里。
-    if first_turn {
-        if let Some(prompt) = user_prompt {
-            let fallback = crate::thread_store::title_from(prompt);
-            match tokio::time::timeout(
-                TITLE_TIMEOUT,
-                yi_agent_core::title::generate_title(
-                    provider,
-                    config,
-                    prompt,
-                    assistant_text.as_deref(),
-                ),
-            )
-            .await
-            {
-                Ok(Ok(Some(title))) => {
-                    // 仅在 CAS **确实替换**（`Ok(true)`）后广播：`Ok(false)` 表示标题
-                    // 已被手动改名抢占或 thread 不存在，磁盘上不是这个值，广播它会让
-                    // 客户端显示一个不存在的标题。广播失败只记 stderr——标题是锦上
-                    // 添花，绝不能拖住 turn 收尾。
-                    match store.set_title_if_unchanged(thread_id, &fallback, &title) {
-                        Ok(true) => {
-                            if let Err(e) = write_notification(
-                                hub,
-                                &Notification::TitleChanged {
-                                    thread_id: thread_id.to_string(),
-                                    title,
-                                },
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "[app-server] failed to broadcast title change {thread_id}: {e}"
-                                );
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            eprintln!("[app-server] failed to set LLM title {thread_id}: {e}")
-                        }
+/// 用户首次输入落地时立刻命名的入口。
+///
+/// 旧的实现把标题生成放在 `persist_and_finish_turn`：用户要等整轮跑完（可能数十
+/// 秒）才在侧栏看到有意义的标题。这里把它前移到 turn 开始处，材料也从「提问 +
+/// 助手回复」收敛成「只取用户输入」——此刻助手还没有任何输出。
+///
+/// 触发条件是 `ThreadStore::touch` 返回 `true`（meta 的 title 由 `None` 变成兜底
+/// 截断值）。组长会话与插件驱动会话创建时标题已非空，因此天然不触发；手动改名
+/// 之后 title 也非空，同样不会重新生成。
+///
+/// **不得阻塞 driver**：调用方负责 `tokio::spawn`，本函数只做生成 → 清洗 → CAS
+/// → 广播，任何失败都静默保留兜底标题（标题是锦上添花，绝不能影响 turn）。
+async fn generate_title_for_first_input(
+    thread_id: String,
+    prompt: String,
+    fallback: String,
+    provider: Arc<dyn yi_agent_core::Provider>,
+    config: yi_agent_core::AgentConfig,
+    store: Arc<crate::thread_store::ThreadStore>,
+    hub: Arc<crate::broadcast::Broadcaster>,
+) {
+    // 材料只有用户输入：`None` 让 `build_title_material` 省略「助手回复：」段。
+    let generated = tokio::time::timeout(
+        TITLE_TIMEOUT,
+        yi_agent_core::title::generate_title(&provider, &config, &prompt, None),
+    )
+    .await;
+    match generated {
+        Ok(Ok(Some(title))) => {
+            // 仅在 CAS **确实替换**（`Ok(true)`）后广播：`Ok(false)` 表示标题已被
+            // 手动改名抢占或 thread 不存在，磁盘上不是这个值，广播它会让客户端
+            // 显示一个不存在的标题。
+            match store.set_title_if_unchanged(&thread_id, &fallback, &title) {
+                Ok(true) => {
+                    if let Err(e) = write_notification(
+                        &hub,
+                        &Notification::TitleChanged {
+                            thread_id: thread_id.clone(),
+                            title,
+                        },
+                    )
+                    .await
+                    {
+                        eprintln!("[app-server] failed to broadcast title change {thread_id}: {e}");
                     }
                 }
-                // 模型产出无法作为标题：保留兜底标题。
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => {
-                    tracing::info!(%e, %thread_id, "title generation failed; keeping fallback");
-                }
-                Err(_) => {
-                    tracing::info!(%thread_id, "title generation timed out; keeping fallback");
-                }
+                Ok(false) => {}
+                Err(e) => eprintln!("[app-server] failed to set LLM title {thread_id}: {e}"),
             }
+        }
+        // 模型产出无法作为标题：保留兜底标题。
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => {
+            tracing::info!(%e, %thread_id, "title generation failed; keeping fallback");
+        }
+        Err(_) => {
+            tracing::info!(%thread_id, "title generation timed out; keeping fallback");
         }
     }
 }
 
-/// 从本轮 items 里取第一条助手文本：作为标题生成材料的"助手回复"侧。
+/// 从本轮 items 里取第一条助手文本：作为回填给组长等待方的回复。
 ///
-/// 空文本的 `AgentMessage` 视为不存在：`build_title_material` 对 `Some("")` 会渲染
-/// 一个悬空的"助手回复："标签，反而污染标题模型的输入。
+/// 空文本的 `AgentMessage` 视为不存在，避免把一段空回复当成组长真的说了话。
+///
+/// 标题生成已不再使用它：标题在用户输入落地时就生成，此刻助手还没有输出
+/// （见 [`generate_title_for_first_input`]）。
 fn completed_items_agent_text(items: &[crate::protocol::Item]) -> Option<String> {
     items.iter().find_map(|item| match item {
         crate::protocol::Item::AgentMessage { text, .. } if !text.trim().is_empty() => {
@@ -4697,8 +4700,6 @@ async fn apply_session_command(
                 store,
                 hub,
                 turn_tx,
-                provider,
-                config,
                 status,
             )
             .await;
@@ -4739,8 +4740,6 @@ async fn apply_session_command(
                 store,
                 hub,
                 turn_tx,
-                provider,
-                config,
                 status,
             )
             .await;
@@ -4866,8 +4865,6 @@ async fn apply_session_command(
                 store,
                 hub,
                 turn_tx,
-                provider,
-                config,
                 status,
             )
             .await;
@@ -5023,6 +5020,28 @@ pub(crate) async fn run_thread_driver(
                 None,
             ),
         );
+
+        // 用户输入一到就命名会话:不再等本轮跑完。`touch` 仍兼任「是否首次」的
+        // 判据——它返回 `true` 只可能是 meta 的 title 刚由 `None` 变成兜底截断值。
+        // 生成放到独立 task:driver 是本 thread 唯一的串行执行者,若在这里 await,
+        // 标题模型最慢会把用户首字延迟 TITLE_TIMEOUT（5 秒）。
+        if !user_prompt.trim().is_empty() {
+            match store.touch(&thread_id, Some(&user_prompt)) {
+                Ok(true) => {
+                    tokio::spawn(generate_title_for_first_input(
+                        thread_id.clone(),
+                        user_prompt.clone(),
+                        crate::thread_store::title_from(&user_prompt),
+                        Arc::clone(&provider),
+                        config.clone(),
+                        Arc::clone(&store),
+                        Arc::clone(&hub),
+                    ));
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("[app-server] failed to update meta for {thread_id}: {e}"),
+            }
+        }
 
         // 每轮开跑前刷新 skills catalog:skills 热重载,让本轮看到最新的
         // system prompt(catalog 未变时输出逐字节相同,不破坏 prompt cache)。
@@ -5418,8 +5437,6 @@ pub(crate) async fn run_thread_driver(
             &store,
             &hub,
             &turn_tx,
-            &provider,
-            &config,
             &status,
         )
         .await;
