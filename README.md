@@ -10,31 +10,25 @@
 
 ---
 
-## 它能做什么
-
-- 读懂并修改你的代码库：读文件、写文件、精确替换、按模式全局搜索
-- 执行 Shell 命令；长任务可放到后台托管，随时查看输出、随时终止
-- 联网查资料（WebFetch / WebSearch）
-- 通过 MCP 接入外部工具，把 GitHub、数据库、内部系统接进来
-- 加载 Skills，把你自己的操作手册变成它能照着执行的技能
-- 派出子 agent 并行干活，实时盯着它的进展，可以给它发消息或叫停
-- 对话超出上下文时自动压缩，长会话不会因为爆窗口中断
-
 ## 安装
+
+一条命令装好 CLI；在 Apple Silicon 上，同一条命令还会把桌面 App 放进 `/Applications`：
+
+```bash
+npm install -g @yi-agent/yi-agent
+```
+
+需要 Node.js 14 或更高。包内含 macOS（Intel / Apple Silicon）与 Linux（x64）的
+预编译二进制，装完无需编译。
+
+> 国内网络建议显式指定官方源 `--registry=https://registry.npmjs.org`。第三方镜像
+> 同步有延迟，缺平台子包时会报 `Platform package ... not installed`。
 
 ### Homebrew（macOS / Linux）
 
 ```bash
 brew install YichenGong/yi-agent/yi-agent
 ```
-
-### npm
-
-```bash
-npm install -g @yi-agent/yi-agent
-```
-
-npm 包内含 macOS（Intel / Apple Silicon）与 Linux（x64）的预编译二进制，安装后无需编译。
 
 ### 直接下载
 
@@ -43,14 +37,8 @@ npm 包内含 macOS（Intel / Apple Silicon）与 Linux（x64）的预编译二�
 
 ### macOS 桌面 App（Apple Silicon）
 
-已装 Node 的话，一条命令同时装好 CLI 和桌面 App：
-
-```bash
-npm install -g @yi-agent/yi-agent
-```
-
-`postinstall` 会把 `yi-agent.app` 复制到 `/Applications` 并清掉 quarantine。
-只在 `npm i -g`（全局安装）时触发，且仅限 Apple Silicon。
+上面的 `npm i -g` 会触发 `postinstall`，把 `yi-agent.app` 复制到 `/Applications`
+并清掉 quarantine。该步骤只在全局安装时触发，且仅限 Apple Silicon（不支持 Intel Mac）。
 
 若 `/Applications` 不可写（企业机器常见），CLI 仍会装好，并提示你手动执行
 `sudo cp` 完成桌面 App 的安装。
@@ -90,6 +78,16 @@ cargo build --release
 ```bash
 yi-agent --version
 ```
+
+## 它能做什么
+
+- 读懂并修改你的代码库：读文件、写文件、精确替换、按模式全局搜索
+- 执行 Shell 命令；长任务可放到后台托管，随时查看输出、随时终止
+- 联网查资料（WebFetch / WebSearch）
+- 通过 MCP 接入外部工具，把 GitHub、数据库、内部系统接进来
+- 加载 Skills，把你自己的操作手册变成它能照着执行的技能
+- 派出子 agent 并行干活，实时盯着它的进展，可以给它发消息或叫停
+- 对话超出上下文时自动压缩，长会话不会因为爆窗口中断
 
 ## 快速开始
 
