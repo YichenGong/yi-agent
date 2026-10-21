@@ -27,10 +27,11 @@ import type {
   ThreadStatus,
   ThreadSummary,
   TurnStatus,
+  WireTotals,
   WireUsage,
   WorkspaceGroup,
 } from "./lib/protocol";
-import { wireUsageToUsage } from "./lib/protocol";
+import { wireTotalsToTotals, wireUsageToUsage } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
 import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
@@ -668,16 +669,19 @@ export default function App() {
           if (curView && !silentTopUp) curView.syncState = "syncing";
           void (async () => {
             try {
-              const r = await c0.request<{ items: Item[]; usage?: WireUsage | null }>(
-                "thread/readItems",
-                after ? { threadId: id, afterItemId: after } : { threadId: id },
-              );
+              const r = await c0.request<{
+                items: Item[];
+                usage?: WireUsage | null;
+                totals?: WireTotals | null;
+              }>("thread/readItems", after ? { threadId: id, afterItemId: after } : { threadId: id });
               const v = store.peek(id);
               if (v) {
                 v.session.upsertItems(r.items);
                 // 这条路径上不会有 live 用量通知（会话在跑、只读补齐、不 resume）：
                 // 不垫上服务端回传的上一轮快照，`/usage` 就永远显示「没有用量」。
                 v.session.adoptPersistedUsage(wireUsageToUsage(r.usage));
+                // 累计值同理：它是会话历史之和，只从服务端来，本地无从推导。
+                v.session.adoptPersistedTotals(wireTotalsToTotals(r.totals));
                 force((n) => n + 1);
               }
             } catch {
@@ -713,15 +717,17 @@ export default function App() {
         const after = store.peek(id)?.session.lastServerItemId ?? null;
         void (async () => {
           try {
-            const r = await c0.request<{ items: Item[]; usage?: WireUsage | null }>(
-              "thread/readItems",
-              after ? { threadId: id, afterItemId: after } : { threadId: id },
-            );
+            const r = await c0.request<{
+              items: Item[];
+              usage?: WireUsage | null;
+              totals?: WireTotals | null;
+            }>("thread/readItems", after ? { threadId: id, afterItemId: after } : { threadId: id });
             const v = store.peek(id);
             if (v) {
               v.session.upsertItems(r.items);
               // 同远端分支：这是运行中会话唯一的数据来源。
               v.session.adoptPersistedUsage(wireUsageToUsage(r.usage));
+              v.session.adoptPersistedTotals(wireTotalsToTotals(r.totals));
               force((n) => n + 1);
             }
           } catch {
