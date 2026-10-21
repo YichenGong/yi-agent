@@ -87,7 +87,9 @@ describe("SettingsPluginsTab", () => {
     render(<SettingsPluginsTab call={call} projects={["/p/proj"]} />);
     expect(await screen.findByText(/已停用/)).toBeTruthy();
     // 面板仍在：用户得能从这一页看出它为什么没在跑，而不是整块消失。
-    expect(screen.getByLabelText("默认并发上限")).toBeTruthy();
+    // 必须 `findBy`：设置本身是异步读的，"已停用"那行先到、面板后到，
+    // 用同步 `getBy` 会变成一条随机失败的测试。
+    expect(await screen.findByLabelText("默认并发上限")).toBeTruthy();
   });
 
   it("treats an old host that omits enabled as running", async () => {
