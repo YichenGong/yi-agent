@@ -12932,12 +12932,19 @@ async fn second_turn_does_not_regenerate_the_title() {
     {
         // 第二次 turn/start 可能撞上上一轮尚未释放的 `active_turn_id`（`turn/completed`
         // 先于收尾发出），这不是产品缺陷：按 `-32012` 重试即可。
+        //
+        // **必须读到自己那条响应（id == {id}）为止**，不能只读一帧就下结论：流里
+        // 还夹着 `thread/titleChanged` / `thread/status/updated` 等通知，把通知当成
+        // 响应会漏掉真正的 `-32012`，于是第二轮从未启动、后面等 `turn/completed`
+        // 直接超时。标题生成前移到 turn 开始后，这类通知出现得更早，更要守住这条。
         loop {
             h.send(&format!(
                 r#"{{"jsonrpc":"2.0","id":{id},"method":"turn/start","params":{{"threadId":"{tid}","input":[{{"type":"text","text":"{text}"}}]}}}}"#
             ))
             .await;
-            let v = h.read_value().await;
+            let v = h
+                .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(id)))
+                .await;
             match v.get("error") {
                 None => break,
                 Some(_) if idx == 0 => panic!("first turn must start: {v}"),
