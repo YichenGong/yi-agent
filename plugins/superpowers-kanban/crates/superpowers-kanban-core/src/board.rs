@@ -279,11 +279,15 @@ impl Board {
         Some(next)
     }
 
-    /// 队首（`order` 最小）可启动的实现卡。合并卡不走会话通路，故排除。
+    /// 队首（`order` 最小）可启动的卡。
+    ///
+    /// 合并卡也走会话通路：会话照 §2b 的流程自己去 `merge-request` 取名额。
+    /// 名额是项目级锁，因此「同一时刻只有一个进程在合并」仍由 `merge.lock`
+    /// 保证——不靠「合并卡不启动」这种隐式串行。
     pub fn next_startable(&self) -> Option<CardId> {
         self.cards
             .iter()
-            .filter(|card| card.state == CardState::Queued && card.kind == CardKind::Implementation)
+            .filter(|card| card.state == CardState::Queued)
             .min_by_key(|card| card.order)
             .map(|card| card.id.clone())
     }
@@ -654,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn the_session_path_never_claims_a_merge_card() {
+    fn the_session_path_claims_a_merge_card_as_well() {
         let mut board = Board::new();
         board.enqueue_merge(
             CardId::new("m1"),
@@ -669,7 +673,10 @@ mod tests {
             "a.plan.md".into(),
             at(1, 1),
         );
-        // 即使合并卡 order 更小、名额充足，会话通路也只能拿到实现卡。
+        // 合并卡也走会话通路：它 order 更小，就先起它的会话，由会话自己去
+        // `merge-request` 取名额（项目级锁保证同一时刻只有一个进程在合并）。
+        // 队列里「先排的先跑」这条秩序不因卡片种类破例。
+        assert_eq!(board.claim_next_launch(), Some(CardId::new("m1")));
         assert_eq!(board.claim_next_launch(), Some(CardId::new("a")));
         assert_eq!(board.claim_next_launch(), None);
     }

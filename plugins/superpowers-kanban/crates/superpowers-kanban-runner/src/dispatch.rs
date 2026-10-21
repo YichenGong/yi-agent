@@ -204,16 +204,22 @@ pub fn dispatch_with_service(
                 .get("threads")
                 .and_then(Value::as_array)
                 .ok_or_else(|| "driver/next needs a `threads` array".to_string())?;
-            let mut snapshot: Vec<(String, bool)> = Vec::with_capacity(threads.len());
+            let mut snapshot: Vec<crate::service::ThreadFacts> = Vec::with_capacity(threads.len());
             for thread in threads {
                 let thread_id = thread
                     .get("thread_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| "driver/next threads need a `thread_id`".to_string())?;
-                // 缺 `idle` 当作「不闲」：唯一安全的默认——把忙当闲会让插件对
-                // 一台正在跑的会话下结论。
+                // 缺 `idle` 当作「不闲」：把忙当闲会让插件对一台正在跑的会话下结论。
                 let idle = thread.get("idle").and_then(Value::as_bool).unwrap_or(false);
-                snapshot.push((thread_id.to_string(), idle));
+                // 缺 `alive` 当作「还活着」：保守方向相反——宁可不判 stale，
+                // 也不凭一次缺字段就报废一张卡的观测（旧宿主不发这个键）。
+                let alive = thread.get("alive").and_then(Value::as_bool).unwrap_or(true);
+                snapshot.push(crate::service::ThreadFacts {
+                    thread_id: thread_id.to_string(),
+                    idle,
+                    alive,
+                });
             }
             let results: Vec<crate::service::DriverResult> = params
                 .get("results")
@@ -300,7 +306,9 @@ pub fn dispatch_with_service(
                     "source": source,
                     "base": base,
                 })),
-                crate::service::MergeRequest::Busy => Ok(json!({ "status": "busy" })),
+                crate::service::MergeRequest::Busy { card_id } => {
+                    Ok(json!({ "status": "busy", "card_id": card_id }))
+                }
                 crate::service::MergeRequest::Denied(reason) => {
                     Ok(json!({ "status": "denied", "reason": reason }))
                 }
@@ -312,11 +320,27 @@ pub fn dispatch_with_service(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "merge_finish needs a card_id".to_string())?;
             let status = match service.merge_finish(card_id)? {
-                crate::service::MergeFinish::Done => "done",
-                crate::service::MergeFinish::NeedsYou => "needs_you",
+                crate::service::MergeFinish::Released => "released",
                 crate::service::MergeFinish::Cleared => "cleared",
             };
             Ok(json!({ "status": status }))
+        }
+        // 模型声明一张卡现在处于什么状态。这是 daemon 之外**唯一**写状态的
+        // 入口——判断归模型，插件只落账。
+        "card.state" => {
+            let card_id = params
+                .get("card_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| "card.state needs a `card_id`".to_string())?;
+            let state = params
+                .get("state")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "card.state needs a `state`".to_string())?;
+            let parsed = parse_state(state)?;
+            let detail = params.get("detail").and_then(Value::as_str);
+            service.set_state(card_id, parsed, detail)?;
+            Ok(json!({ "ok": true }))
         }
         "lifecycle/create" => {
             let project = params
@@ -368,6 +392,25 @@ pub fn dispatch(state_dir: &Path, method: &str, params: &Value) -> Result<Value,
         .as_deref()
         .and_then(superpowers_kanban_core::switch::read_layer);
     dispatch_with_global(state_dir, global, method, params)
+}
+
+/// 解析 CLI / IPC 传来的状态名（大小写不敏感，接受下划线形式）。
+fn parse_state(value: &str) -> Result<superpowers_kanban_core::card::CardState, String> {
+    use superpowers_kanban_core::card::CardState;
+    match value.to_ascii_lowercase().as_str() {
+        "pre_queued" => Ok(CardState::PreQueued),
+        "queued" => Ok(CardState::Queued),
+        "running" => Ok(CardState::Running),
+        "needs_you" => Ok(CardState::NeedsYou),
+        "awaiting_merge" => Ok(CardState::AwaitingMerge),
+        "done" => Ok(CardState::Done),
+        "failed" => Ok(CardState::Failed),
+        "cancelled" => Ok(CardState::Cancelled),
+        other => Err(format!(
+            "unknown state: {other} (expected pre_queued|queued|running|needs_you|\
+             awaiting_merge|done|failed|cancelled)"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -684,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_finish_errors_on_an_unknown_card_and_reports_cleared_otherwise() {
+    fn merge_finish_reports_cleared_when_nothing_is_held() {
         let workdir = tempfile::tempdir().unwrap();
         let state = state_dir(workdir.path());
         // 先落盘一张排队卡：BoardService 是进程单例，构造时读一次 board.json，
@@ -708,11 +751,12 @@ mod tests {
         .unwrap();
         assert_eq!(value["status"], "cleared");
 
-        // 卡根本不存在 → 明确报错，而不是静默 cleared。
-        let error =
+        // 卡不存在、本进程也没持有名额 → 仍是 cleared（`merge_finish` 只回答
+        // 「名额还在不在我手上」，不查卡）。
+        let value =
             dispatch_with_global(&state, None, "merge_finish", &json!({ "card_id": "nope" }))
-                .unwrap_err();
-        assert!(error.contains("unknown card"), "{error}");
+                .unwrap();
+        assert_eq!(value["status"], "cleared");
     }
 
     /// 真实的最小 git 仓库（与 `service.rs` 的测试搭台同型）：driver/next 要
@@ -891,32 +935,19 @@ mod tests {
         let project = project_with_worktree(workdir.path());
         let service = service_with_one_card(&project);
         let state = state_dir(&project);
-
-        // 让 card-1 走到 `merging`（合并轮进行中）：先把它的 source 分支建出来，
-        // 否则 `merge_request` 会因分支缺失而拒绝。
-        let slug = crate::worktree::slugify(&superpowers_kanban_core::card::CardId::new("card-1"));
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&project)
-                .args(["branch", &format!("kanban/{slug}")])
-                .status()
-                .unwrap()
-                .success()
-        );
         service
             .mark_running("card-1", "thread-1")
             .expect("card-1 runs");
         service
-            .mark_terminal("card-1", "awaiting_merge", None)
+            .set_state(
+                "card-1",
+                superpowers_kanban_core::card::CardState::AwaitingMerge,
+                None,
+            )
             .unwrap();
-        assert!(matches!(
-            service.merge_request("card-1").unwrap(),
-            crate::service::MergeRequest::Granted { .. }
-        ));
-        assert_eq!(service.list()["cards"][0]["state"], "merging");
 
-        // 会话对象**没有** `idle` 字段：只能按「不闲」理解，卡原样留在 merging。
+        // 会话对象**没有** `idle` 字段：只能按「不闲」理解。卡的状态原样留着
+        // ——插件不按 idle 改任何状态。
         let value = dispatch_with_service(
             &service,
             &state,
@@ -928,9 +959,31 @@ mod tests {
         assert_eq!(value["action"], Value::Null, "{value}");
         assert_eq!(
             service.list()["cards"][0]["state"],
-            "merging",
+            "awaiting_merge",
             "缺 `idle` 不得被当成空闲（否则会误判一个还在跑的会话）"
         );
+    }
+
+    /// 缺 `alive` 当作「还活着」：旧宿主不发这个键时，不能把所有卡判 stale。
+    #[test]
+    fn driver_next_treats_a_thread_without_alive_as_live() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(workdir.path());
+        let service = service_with_one_card(&project);
+        let state = state_dir(&project);
+        service
+            .mark_running("card-1", "thread-1")
+            .expect("card-1 runs");
+        let value = dispatch_with_service(
+            &service,
+            &state,
+            None,
+            "driver/next",
+            &json!({ "threads": [{ "thread_id": "thread-1", "idle": false }], "results": [] }),
+        )
+        .unwrap();
+        assert_eq!(value["action"], Value::Null, "{value}");
+        assert_eq!(service.list()["cards"][0]["stale"], false);
     }
 
     /// 缺 `threads` 是调用方的错，必须明确报错而不是静默回一个空拍：
