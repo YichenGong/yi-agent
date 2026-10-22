@@ -184,8 +184,9 @@ read-only 在 **git** 目录下时 `git_root` 有值，`kind` 仍是 `worker_adm
 - 断言 `spawn_agent` 的 `ToolResult` 内容可解析，含 `code`、`remedy.commands`、`requires_initial_commit: true`、非空 `ask_user`。
 
 **T5 IPC 映射：Validation 而非 Internal**
-`cargo test -p yi-agent-store --test runtime_ipc coding_requires_git_is_a_validation_error`
+`cargo test -p yi-agent-store --lib coding_requires_git_mapping_tests`
 - 断言客户端收到的 code 是 `validation`，且 message 含前缀。防止退回今天"只看到 internal"的状态。
+- 必须是 `ipc.rs` 的内联 `mod`：`ipc_error_message` / `ipc_error_code` 都是私有 `fn`（`ipc.rs:2943` / `:2964`），`--test runtime_ipc` 这类集成测试访问不到。
 
 **T6 git 下行为不变**
 - `cargo test -p yi-agent-store --test runtime_coordinator`（含 `read_only_child_runs_in_place_without_a_workspace_row`）
@@ -197,7 +198,8 @@ read-only 在 **git** 目录下时 `git_root` 有值，`kind` 仍是 `worker_adm
 - `an_autonomous_session_refuses_a_workdir_that_is_not_a_git_worktree`：保留拒绝，断言错误含可照做指引。
 
 **T8 提示词不漂移**
-`cargo test -p yi-agent --bin yi-agent default_system_prompt_requires_parent_integration_of_deliveries` 同族新增断言：系统提示词必须提到 `coding_requires_git` 的询问义务。
+`cargo test -p yi-agent --bin yi-agent default_system_prompt_requires_a_workdir_for_isolation`（`main.rs:3586`）新增断言：系统提示词必须提到 `coding_requires_git` 的询问义务。
+工具文案的同族断言在 `yi-agent-subagent/src/lib.rs` 的 `spawn_agent_schema_pins_the_wire_contract`（`spawn_agent_description` 的精确相等要改成 `starts_with`，否则改文案即挂）。
 
 ## 风险
 
