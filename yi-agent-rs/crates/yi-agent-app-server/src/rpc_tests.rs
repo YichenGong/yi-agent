@@ -2000,6 +2000,10 @@ impl Harness {
     }
 
     /// 只打开会话分组开关：分组用例用它（组长保持关，两者互不相干）。
+    ///
+    /// 目前没有用例调用它（分组用例仍走 `with_config_and_flags` 的完整参数），
+    /// 但它是这个 harness 上唯一只翻分组开关的入口，保留以免下次再拼一遍参数。
+    #[allow(dead_code)]
     pub(crate) async fn with_groups() -> Self {
         Self::with_config_and_flags(
             test_config(),
