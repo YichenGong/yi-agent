@@ -251,6 +251,9 @@ pub(crate) struct RuntimeAttachments {
     /// 生产的构造点统一调 [`crate::lead_gate::from_process_environment`]，
     /// 测试直接给 `true` / `false`。
     pub(crate) lead_agent_enabled: bool,
+    /// 会话分组开关的**生效值**，与 [`Self::lead_agent_enabled`] 同一手法：
+    /// 装配时算一次、只传结论。关掉时列表不下发组表、写操作被拒。
+    pub(crate) session_groups_enabled: bool,
     /// Where the global `.env` lives, for `onboarding/apply`. Injectable for the
     /// same reason `models_path` is: onboarding must never write the developer's
     /// real `~/.yi-agent/.env`.
@@ -1764,6 +1767,7 @@ where
             models_path: yi_agent_runtime::models::models_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
+            session_groups_enabled: crate::groups_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
@@ -1852,6 +1856,7 @@ where
             models_path: yi_agent_runtime::models::models_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
+            session_groups_enabled: crate::groups_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
             onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
@@ -2966,6 +2971,7 @@ where
         // `serve()` 不再解析——它看得到的 `build_kind()` 是进程级的，测试里恒为
         // `release`，在那儿解析会让注入永远失效。
         lead_agent_enabled,
+        session_groups_enabled,
     } = attachments;
     // 进程级探测去重表：整个主循环共用一份，`model/probe` 与 `model/upsert`
     // 的后台探测都从这里 `try_begin`。只活在内存里，重启即清空。
@@ -3274,6 +3280,7 @@ where
                             lead_control: &lead_control,
                             lead_control_replies: &lead_control_replies,
                             lead_agent_enabled,
+                            session_groups_enabled,
                             pending_lead_replies: &mut pending_lead_replies,
                         }
                     };

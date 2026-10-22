@@ -100,6 +100,9 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // `flags/list` 里 `superpowers_kanban` 的值。默认**开**：既有看板用例测的
     // 都是"开关打开时的行为"。
     kanbanFlagEnabled: true,
+    // `flags/list` 里 `session_groups` 的值。默认**开**：既有分组用例测的都是
+    // "开关打开时的行为"，缺省成关会让它们全部在测另一条分支。
+    groupsFlagEnabled: true,
   },
   // 捕获 `@tauri-apps/api/webview` 注册的拖放 handler，供用例驱动事件。
   dragDrop: { fn: null as null | ((event: unknown) => void) },
@@ -224,7 +227,8 @@ vi.mock("./lib/rpc", () => ({
                     ...leadEntries(workspace),
                   ]
                 : leadEntries(workspace),
-            groups: state.workspaceGroups
+            // 与真实服务端同一闸门：关着时下发空表。
+            groups: (state.groupsFlagEnabled ? state.workspaceGroups : [])
               .filter((g) => g.workspace === workspace)
               .map((g) => ({
                 id: g.id,
@@ -269,6 +273,13 @@ vi.mock("./lib/rpc", () => ({
               expires_on: "2027-03-31",
               source: state.kanbanFlagEnabled ? "file" : "default",
             },
+            {
+              name: "session_groups",
+              summary: "会话分组",
+              enabled: state.groupsFlagEnabled,
+              expires_on: "2027-04-30",
+              source: state.groupsFlagEnabled ? "file" : "default",
+            },
           ],
         };
       }
@@ -278,6 +289,7 @@ vi.mock("./lib/rpc", () => ({
         const { name, enabled } = params as { name: string; enabled: boolean };
         if (name === "lead_agent") state.leadFlagEnabled = enabled;
         if (name === "superpowers_kanban") state.kanbanFlagEnabled = enabled;
+        if (name === "session_groups") state.groupsFlagEnabled = enabled;
         return { name, enabled };
       }
       if (method === "thread/lead") {
@@ -414,6 +426,7 @@ beforeEach(() => {
   state.leadAttempts = [];
   state.leadFlagEnabled = true;
   state.kanbanFlagEnabled = true;
+  state.groupsFlagEnabled = true;
   dragDrop.fn = null;
   contentStore.current = null;
   Element.prototype.scrollIntoView = vi.fn();
@@ -1431,6 +1444,68 @@ describe("App 主区域看板", () => {
 
     // 不重启、不重新握手：侧栏必须自己长出来。
     expect(await screen.findByLabelText("看板")).toBeTruthy();
+  });
+
+  it("会话分组默认关着：侧栏不出现组框，成员仍是普通会话", async () => {
+    // 注册表铁律是"默认关"，所以一个新功能在用户勾上之前必须完全不显形。
+    state.groupsFlagEnabled = false;
+    state.threads = [
+      { thread_id: "a", title: "A", permission_mode: "normal" },
+      { thread_id: "b", title: "B", permission_mode: "normal" },
+    ];
+    state.groupWorkspaces = ["/proj"];
+    state.workspaceGroups = [{ workspace: "/proj", id: "g1", name: "登录模块", description: "", threadIds: ["a"] }];
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("A")).toBeTruthy());
+
+    expect(container.querySelector("[data-group-box]")).toBeNull();
+    expect(container.querySelector('[data-thread-row="a"]')).toBeTruthy();
+    expect(container.querySelector('[data-thread-row="b"]')).toBeTruthy();
+  });
+
+  it("在设置页勾上会话分组后，组框立刻出现，不用重启", async () => {
+    // 与看板开关同一个坑：值原先只在握手时读一次，用户勾完什么也不会发生。
+    state.groupsFlagEnabled = false;
+    state.threads = [
+      { thread_id: "a", title: "A", permission_mode: "normal" },
+      { thread_id: "b", title: "B", permission_mode: "normal" },
+    ];
+    state.groupWorkspaces = ["/proj"];
+    state.workspaceGroups = [{ workspace: "/proj", id: "g1", name: "登录模块", description: "", threadIds: ["a"] }];
+    const { container } = render(<App />);
+    await waitFor(() => expect(screen.getByText("A")).toBeTruthy());
+    expect(container.querySelector("[data-group-box]")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "实验功能" }));
+    const box = (await screen.findByLabelText("session_groups 开关")) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+    fireEvent.click(box);
+
+    // 勾上之后��端会重拉列表；组框随新的 listAll 一起出现。
+    await waitFor(() => expect(container.querySelector('[data-group-box="g1"]')).toBeTruthy());
+  });
+
+  it("在设置页取消勾选会话分组后，组框立刻消失、会话不消失", async () => {
+    state.threads = [
+      { thread_id: "a", title: "A", permission_mode: "normal" },
+      { thread_id: "b", title: "B", permission_mode: "normal" },
+    ];
+    state.groupWorkspaces = ["/proj"];
+    state.workspaceGroups = [{ workspace: "/proj", id: "g1", name: "登录模块", description: "", threadIds: ["a"] }];
+    const { container } = render(<App />);
+    await waitFor(() => expect(container.querySelector('[data-group-box="g1"]')).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(screen.getByRole("tab", { name: "实验功能" }));
+    const box = (await screen.findByLabelText("session_groups 开关")) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+
+    await waitFor(() => expect(container.querySelector("[data-group-box]")).toBeNull());
+    // 关掉的是"框"，不是会话。
+    expect(screen.getByText("A")).toBeTruthy();
+    expect(screen.getByText("B")).toBeTruthy();
   });
 
   it("在设置页关掉看板开关后，侧栏入口立刻消失", async () => {

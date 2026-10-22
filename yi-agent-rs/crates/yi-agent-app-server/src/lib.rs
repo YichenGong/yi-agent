@@ -6,6 +6,7 @@ pub mod device_store;
 pub(crate) mod git_diff;
 pub mod git_diff_tool;
 pub mod group_store;
+pub mod groups_gate;
 pub mod image_upload;
 pub mod lead;
 // 组长的写通道（lead→thread 的「取消 / 打回」），完全由 `build_runtime_tooling`

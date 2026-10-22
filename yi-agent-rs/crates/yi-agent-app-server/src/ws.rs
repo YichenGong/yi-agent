@@ -147,6 +147,7 @@ where
                 models_path: yi_agent_runtime::models::models_path(),
                 // 与 stdio 路径同一来源：装配时算一次，不在 `serve()` 里解析。
                 lead_agent_enabled: crate::lead_gate::from_process_environment(),
+                session_groups_enabled: crate::groups_gate::from_process_environment(),
                 onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
                     .unwrap_or_default(),
                 onboarding_preferences_path: crate::server::instance_home_dir()

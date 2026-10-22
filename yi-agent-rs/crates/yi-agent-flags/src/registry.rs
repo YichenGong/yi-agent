@@ -17,6 +17,13 @@ pub struct FlagDef {
 /// 组长（lead agent）的总开关。名字一旦发布就是 `flags.json` 的键，不能改。
 pub const LEAD_AGENT_FLAG: &str = "lead_agent";
 
+/// 会话分组（group）的总开关。
+///
+/// 分组是纯视图能力：把几条会话临时框在一起看，不改变会话本身的归属。
+/// 关掉时服务端不下发组表、不接收写操作，前端也不渲染任何分组 UI——成员会话
+/// 仍是普通会话，只是不再被框起来。
+pub const SESSION_GROUPS_FLAG: &str = "session_groups";
+
 /// Superpowers 看板的总开关。
 ///
 /// 与 `preferences.json` 里的 `superpowers_kanban` 键**同名但不是同一个东西**：
@@ -31,6 +38,13 @@ pub const REGISTRY: &[FlagDef] = &[
         summary: "组长：项目级常驻会话，负责分派与回收子任务",
         owner: "yichen",
         expires_on: "2027-01-31",
+        default: false,
+    },
+    FlagDef {
+        name: SESSION_GROUPS_FLAG,
+        summary: "会话分组：把几条会话临时框在一起看，便于同时推进同一模块",
+        owner: "yichen",
+        expires_on: "2027-04-30",
         default: false,
     },
     FlagDef {

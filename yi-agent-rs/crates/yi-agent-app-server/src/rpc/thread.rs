@@ -139,9 +139,18 @@ pub(crate) async fn handle(
             // 关掉组长时**连懒惰种组长都不该发生**：那是磁盘副作用，不是显示
             // 问题。开关是纯值，必须在搬进 `spawn_blocking` 之前拷好。
             let seed_lead = state.lead_agent_enabled;
+            // 分组关着时**不下发组表**：前端于是退化成"每条会话都是普通会话"，
+            // 不需要自己再判一次开关。会话本身不受影响（见 `groups_json` 的注释）。
+            let groups_enabled = state.session_groups_enabled;
             tokio::spawn(async move {
                 let reply = tokio::task::spawn_blocking(move || {
-                    build_list_all_response(&dirs, &workspaces, &statuses, seed_lead)
+                    build_list_all_response(
+                        &dirs,
+                        &workspaces,
+                        &statuses,
+                        seed_lead,
+                        groups_enabled,
+                    )
                 })
                 .await;
                 let body = match reply {
@@ -1385,6 +1394,21 @@ pub(crate) async fn handle(
                 .await?;
                 return Ok(Flow::Continue);
             }
+            // 关着时拒绝写，而不是静默成功：客户端若还能发这些请求（旧版前端、
+            // 或用户在另一个窗口刚关掉开关），"成功了但下次列表里没有"是最难
+            // 排查的一种失败。
+            if !state.session_groups_enabled {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(
+                        id,
+                        RpcError::invalid_params("会话分组功能未开启（session_groups）"),
+                    ),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
             let dirs = state.workspaces.list();
             match apply_group_mutation(&req.method, &req.params, &dirs) {
                 Ok((workspace, result)) => {
@@ -2128,6 +2152,7 @@ fn build_list_all_response(
     workspaces: &Arc<WorkspaceIndex>,
     statuses: &HashMap<String, ThreadStatus>,
     seed_lead: bool,
+    groups_enabled: bool,
 ) -> serde_json::Value {
     let summary = |m: &crate::thread_store::ThreadMeta| {
         thread_summary_json_with_status(
@@ -2204,7 +2229,13 @@ fn build_list_all_response(
                 "workspace": ws,
                 "exists": exists_of.get(ws).copied().unwrap_or(false),
                 "threads": merged,
-                "groups": groups_json(ws, &live_ids),
+                // 关着时下发空表而不是省略字段：前端的类型不必区分「没这个键」
+                // 与「没有组」，两种状态都表现成"没有分组"。
+                "groups": if groups_enabled {
+                    groups_json(ws, &live_ids)
+                } else {
+                    serde_json::Value::Array(Vec::new())
+                },
             })
         })
         .collect();
