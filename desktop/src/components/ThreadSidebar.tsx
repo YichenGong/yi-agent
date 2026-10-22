@@ -162,6 +162,7 @@ export function ThreadSidebar({
   statusStale = false,
   leadAgentEnabled = true,
   kanbanEnabled = true,
+  groupsEnabled = true,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -230,6 +231,16 @@ export function ThreadSidebar({
    * 所有既有侧栏渲染突然少一行组长。生产路径由 `App` 显式传入真实开关值。
    */
   leadAgentEnabled?: boolean;
+  /**
+   * 会话分组是否开启（`flags/list` 里的 `session_groups`）。
+   *
+   * 关掉时**整块分组 UI 都不渲染**：没有组框、没有「加入分组」菜单项、不能
+   * 多选建组。但成员会话本身照常以普通行出现在原位——关掉的是"框"，不是会话。
+   *
+   * 缺省 `true`，与 `leadAgentEnabled` / `kanbanEnabled` 同一理由：既有用法与
+   * 测试不传它。宿主（`App`）显式传 `=== true`，缺省值到不了生产。
+   */
+  groupsEnabled?: boolean;
   /**
    * 整个 Superpowers 看板是否开启（`flags/list` 里的 `superpowers_kanban`）。
    *
@@ -1097,7 +1108,7 @@ export function ThreadSidebar({
                 无标签
               </button>
             </div>
-            {groupsForThread(t.thread_id).length > 0 && (
+            {groupsEnabled && groupsForThread(t.thread_id).length > 0 && (
               <button
                 type="button"
                 role="menuitem"
@@ -1116,7 +1127,7 @@ export function ThreadSidebar({
                 移出分组（{groupsForThread(t.thread_id)[0].group.name}）
               </button>
             )}
-            {joinableGroups.length > 0 && (
+            {groupsEnabled && joinableGroups.length > 0 && (
               <div role="group" aria-label="加入分组" className="border-b border-line pb-1">
                 {joinableGroups.map(({ workspace, group }) => (
                   <button
@@ -1493,7 +1504,8 @@ export function ThreadSidebar({
           renderBoardEntry(g.workspace)}
         {!isCollapsed && renderBoardThreads(g)}
         {!isCollapsed &&
-          layoutWorkspace(g)
+          // 分组关着时按"没有组"布局：成员回归普通行、按服务端顺序排列。
+          layoutWorkspace(groupsEnabled ? g : { ...g, groups: [] })
             // 组长行单独渲染在列表最顶部（见 renderLeadRow），组内不再重复一条。
             // `!pinned` 只作用于**框外**的行：置顶的组内会话仍留在框里（spec 刻意例外），
             // 于是同一个会话可以在顶部 Pinned 区与框内各出现一次。
@@ -1539,7 +1551,9 @@ export function ThreadSidebar({
    * 建组要求所选会话同属一个 workspace——组不跨目录是硬约束（spec），在客户端
    * 先拦一道能给出可读提示，而不是让服务端回一个 -32602。
    */
-  const selectionBar = selected.size === 0 ? null : (
+  // 分组关着时整条动作条都不出现：它此刻只有「新建组」一个动作，留着等于给
+  // 用户一个必然失败的按钮。
+  const selectionBar = !groupsEnabled || selected.size === 0 ? null : (
     <div
       data-selection-bar=""
       className="sticky bottom-0 border-t border-line-strong bg-surface px-2 py-2"

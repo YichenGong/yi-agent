@@ -229,6 +229,13 @@ export default function App() {
    * **关**处理，因为关掉会停掉整个 daemon，先藏一帧远好过画出一堆点不动的东西。
    */
   const [kanbanEnabled, setKanbanEnabled] = useState<boolean | null>(null);
+  /**
+   * 会话分组开关（`flags/list` 里的 `session_groups`）。`null` = 还不知道。
+   *
+   * 与另两个开关同一口径：`null` 按关处理。分组是纯视图能力，晚一帧出现远好过
+   * 先画出一堆点不动的框。
+   */
+  const [groupsEnabled, setGroupsEnabled] = useState<boolean | null>(null);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
@@ -463,6 +470,24 @@ export default function App() {
           rows.find((row) => row.name === name)?.enabled === true;
         setLeadAgentEnabled(read("lead_agent"));
         setKanbanEnabled(read("superpowers_kanban"));
+        const groupsWereOn = sess.groupsRef.current.some((g) => (g.groups ?? []).length > 0);
+        setGroupsEnabled(read("session_groups"));
+        // 分组从「关」拨到「开」时必须重拉列表：关着期间服务端不下发组表，
+        // 手上的数据里根本没有组，光把开关置 true 只会得到一片空框（什么也没有）。
+        // 反过来（开→关）不用重拉：关掉是纯前端隐藏，数据留着下次直接用。
+        if (!groupsWereOn && read("session_groups")) {
+          try {
+            const list = await c.request<{
+              groups: WorkspaceGroup[];
+              pinned?: ThreadSummary[];
+            }>("thread/listAll", {});
+            sess.setGroups(list.groups);
+            sess.setPinned(list.pinned ?? []);
+            store.seed(list.groups.flatMap((g) => g.threads));
+          } catch {
+            // 重拉失败就保持现状：开关值已更新，下次任何一次刷新都会补上。
+          }
+        }
         return result;
       });
     },
@@ -1445,8 +1470,9 @@ export default function App() {
         // 局部量而不是直接读 state：`setLeadAgentEnabled` 要下一次渲染才生效，
         // 而本函数后面的补建循环就在**这一轮**里跑，读 state 拿到的还是 `null`。
         let leadOn = false;
-        // 同一份 `flags/list` 里就有看板开关，不再多发一次请求。
+        // 同一份 `flags/list` 里就有看板与分组开关，不再多发请求。
         let kanbanOn = false;
+        let groupsOn = false;
         try {
           const flags = await client.request<{
             flags?: Array<{ name?: unknown; enabled?: unknown }>;
@@ -1455,12 +1481,16 @@ export default function App() {
           leadOn = lead?.enabled === true;
           const kanban = (flags.flags ?? []).find((f) => f.name === "superpowers_kanban");
           kanbanOn = kanban?.enabled === true;
+          const groups = (flags.flags ?? []).find((f) => f.name === "session_groups");
+          groupsOn = groups?.enabled === true;
         } catch {
           leadOn = false;
           kanbanOn = false;
+          groupsOn = false;
         }
         setLeadAgentEnabled(leadOn);
         setKanbanEnabled(kanbanOn);
+        setGroupsEnabled(groupsOn);
         const settings = await client.request<{
           theme?: unknown;
           resident_daemon_watchman_enabled?: unknown;
@@ -2231,6 +2261,7 @@ export default function App() {
           onUnlinkFolder={unlinkFolder}
           leadAgentEnabled={leadAgentEnabled === true}
           kanbanEnabled={kanbanEnabled === true}
+          groupsEnabled={groupsEnabled === true}
         />
         </div>
         <div className="app-main relative flex min-w-0 flex-1 flex-col">

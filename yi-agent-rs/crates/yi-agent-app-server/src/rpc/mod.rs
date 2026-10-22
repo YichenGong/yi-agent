@@ -461,4 +461,11 @@ pub(crate) struct AppState<'a> {
     /// 存在不存在」。按值拷贝（`bool`），与 `client_scope` 同类——都是每请求
     /// 读一次的判定输入。
     pub(crate) lead_agent_enabled: bool,
+    /// 会话分组开关的生效值。`thread/listAll` 据此决定要不要下发组表、
+    /// `thread/group/*` 据此拒绝写操作。与 [`AppState::lead_agent_enabled`]
+    /// 同类：装配时算一次，按值拷贝。
+    ///
+    /// 关掉时**只**停这两个面：会话本身照常列出（否则成员会在侧栏里凭空消失，
+    /// 用户看到的是"我的会话丢了"，而不是"分组这个功能没开"）。
+    pub(crate) session_groups_enabled: bool,
 }
