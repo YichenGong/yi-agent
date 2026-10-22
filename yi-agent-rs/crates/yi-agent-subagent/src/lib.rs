@@ -460,6 +460,31 @@ impl DaemonWorkspaceService {
         let canonical = workdir
             .canonicalize()
             .unwrap_or_else(|_| workdir.to_path_buf());
+        if !canonical.is_dir() {
+            return Err(WorkerError::Startup(format!(
+                "workdir does not exist: {} — create it with `git worktree add` first",
+                workdir.display()
+            )));
+        }
+        // A coding position must be a git worktree *with a HEAD*. `git init`
+        // alone passes `--show-toplevel` while `rev-parse HEAD` fails, so
+        // accepting it would defer the failure to delivery, after the child has
+        // already run its whole task. Checked before the cache lookup so a
+        // position can never be admitted once and then reused after it stopped
+        // qualifying.
+        let toplevel =
+            git_output(&canonical, &["rev-parse", "--show-toplevel"]).ok_or_else(|| {
+                WorkerError::Startup(format!(
+                    "coding_requires_git:not_a_repository at {}",
+                    workdir.display()
+                ))
+            })?;
+        let head = git_output(&canonical, &["rev-parse", "HEAD"]).ok_or_else(|| {
+            WorkerError::Startup(format!(
+                "coding_requires_git:no_initial_commit at {}",
+                workdir.display()
+            ))
+        })?;
         if let Some(existing) = self
             .prepared
             .lock()
@@ -469,26 +494,13 @@ impl DaemonWorkspaceService {
         {
             return Ok(existing);
         }
-        if !canonical.is_dir() {
-            return Err(WorkerError::Startup(format!(
-                "workdir does not exist: {} — create it with `git worktree add` first",
-                workdir.display()
-            )));
-        }
-        let toplevel =
-            git_output(&canonical, &["rev-parse", "--show-toplevel"]).ok_or_else(|| {
-                WorkerError::Startup(format!(
-                    "workdir is not inside a git worktree: {}",
-                    workdir.display()
-                ))
-            })?;
         let workspace = WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
             repository_root: PathBuf::from(toplevel),
             path: canonical.clone(),
             branch: current_git_branch(&canonical).unwrap_or_default(),
             parent_branch: String::new(),
-            base_commit: git_output(&canonical, &["rev-parse", "HEAD"]).unwrap_or_default(),
+            base_commit: head,
         };
         self.prepared
             .lock()
@@ -3818,6 +3830,49 @@ mod tests {
             *outsider_error,
             "the inherited root set must not widen the boundary: {results:?}"
         );
+    }
+
+    /// The tool layer keys off this prefix to rebuild a structured rejection, so
+    /// it must survive here even though this crate cannot import the store's
+    /// constant (that would be a dependency cycle). It is located rather than
+    /// anchored: `WorkerError::Startup` prepends `worker startup failed: `.
+    const CODING_REQUIRES_GIT_PREFIX: &str = "coding_requires_git:";
+
+    #[test]
+    fn register_workdir_reports_a_plain_directory_as_not_a_repository() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let plain = directory.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let error = service.register_workdir(&plain).unwrap_err().to_string();
+        assert!(error.contains(CODING_REQUIRES_GIT_PREFIX), "{error}");
+        assert!(error.contains("not_a_repository"), "{error}");
+    }
+
+    /// `git init` without a commit leaves `--show-toplevel` working while
+    /// `rev-parse HEAD` fails. Admitting it here would defer the failure to the
+    /// delivery step, after the child already did all its work.
+    #[test]
+    fn register_workdir_reports_an_empty_repository_as_missing_a_commit() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let empty = directory.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        // `-b main` matches this file's `initialize_git_repository` helper. No
+        // commit is made: that is exactly the state under test.
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&empty)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = service.register_workdir(&empty).unwrap_err().to_string();
+        assert!(error.contains(CODING_REQUIRES_GIT_PREFIX), "{error}");
+        assert!(error.contains("no_initial_commit"), "{error}");
     }
 
     #[test]
