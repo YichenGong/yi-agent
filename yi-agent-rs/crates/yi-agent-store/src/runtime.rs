@@ -1555,6 +1555,31 @@ impl RuntimeCoordinator {
         // (which is unrelated to any task). Resolving before the spawn means the
         // supervisor stores the absolute path worker start will look up.
         let workdir = workdir.map(|workdir| self.resolve_parent_workdir(parent, &workdir));
+        // A coding child needs a recoverable git position. Checked before the
+        // task row is written: a refusal must not leave a queued ghost task the
+        // caller can neither see nor clean up.
+        //
+        // Only an explicitly handed-over workdir is judged, and only once it
+        // exists. Without one the child inherits whatever position the worker
+        // factory derives at start time, which is not knowable here; a missing
+        // directory is the parent's earlier mistake and keeps its own, more
+        // precise error from `observe_workdir` rather than being reported as a
+        // git problem.
+        if workspace_mode == ChildWriteMode::Coding
+            && let Some(target) = workdir.as_deref().filter(|target| target.is_dir())
+        {
+            coding_git_precondition(target).map_err(|reason| {
+                // Canonicalized so the message names one path, not two spellings
+                // of the same directory (`/var` vs `/private/var` on macOS): the
+                // model quotes this back to the user and runs the remedy there.
+                RuntimeCoordinatorError::CodingRequiresGit {
+                    workdir: target
+                        .canonicalize()
+                        .unwrap_or_else(|_| target.to_path_buf()),
+                    reason,
+                }
+            })?;
+        }
         // Resolve the marker before the child row is written so the inherited
         // value lands in the same INSERT as the row: there is no intermediate
         // state in which the task exists but its marker does not.
@@ -4266,6 +4291,31 @@ impl RecoveryContext {
             tool_state_json: self.tool_state_json.clone(),
         }
     }
+}
+
+/// Whether `workdir` can host a coding child: it must be inside a git worktree
+/// *and* that worktree must already have a commit.
+///
+/// The second half is not redundant. `git init` alone makes `--show-toplevel`
+/// succeed while `rev-parse HEAD` still fails, so a check on the toplevel only
+/// would admit the child, let it run its whole task, and then fail it at
+/// delivery with an opaque `Git workspace error`. Checking HEAD here turns that
+/// into an immediate, actionable refusal.
+fn coding_git_precondition(workdir: &std::path::Path) -> Result<(), CodingRequiresGitReason> {
+    let run = |args: &[&str]| -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    };
+    if !run(&["rev-parse", "--show-toplevel"]) {
+        return Err(CodingRequiresGitReason::NotARepository);
+    }
+    if !run(&["rev-parse", "HEAD"]) {
+        return Err(CodingRequiresGitReason::NoInitialCommit);
+    }
+    Ok(())
 }
 
 /// Runs git and returns its stdout on success. `None` on any failure keeps the

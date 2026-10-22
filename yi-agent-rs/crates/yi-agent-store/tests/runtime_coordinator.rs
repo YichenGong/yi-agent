@@ -21,7 +21,9 @@ use yi_agent_core::subagent::worker::{
 use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
 };
-use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
+use yi_agent_store::runtime::{
+    CodingRequiresGitReason, RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions,
+};
 use yi_agent_store::schedule::{
     MissedRunPolicy, ScheduleDefinition, WatchdogLimits, WatchdogUsage,
 };
@@ -2939,8 +2941,13 @@ async fn a_coding_child_runs_in_the_workdir_its_parent_prepared() {
     let database = directory.path().join("runtime.sqlite");
     let project_root = directory.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
+    initialize_git_repository(&project_root);
     let prepared = directory.path().join("prepared-child");
     std::fs::create_dir_all(&prepared).unwrap();
+    // A real prepared workdir comes from `git worktree add`, so it is a git
+    // checkout with a HEAD. The fixture has to match that or it would model a
+    // state the runtime now refuses.
+    initialize_git_repository(&prepared);
     let workspace = WorkerWorkspace {
         lease_id: WorkspaceLeaseId::new(),
         repository_root: project_root.clone(),
@@ -3106,8 +3113,10 @@ async fn a_relative_workdir_resolves_against_the_parents_position() {
     let database = directory.path().join("runtime.sqlite");
     let project_root = directory.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
+    initialize_git_repository(&project_root);
     let child_dir = project_root.join("sub");
     std::fs::create_dir_all(&child_dir).unwrap();
+    initialize_git_repository(&child_dir);
     let service = Arc::new(StaticWorkspaceService {
         workspace: WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
@@ -4449,4 +4458,119 @@ async fn a_hydrated_attempt_is_terminated_even_beside_an_unhydrated_one() {
         ),
         "hydrated attempt must reach a watchdog terminal"
     );
+}
+
+/// A coding child in a plain directory must be refused before anything durable
+/// exists: a queued row the caller cannot see is a ghost task that never runs
+/// and never gets cleaned up.
+#[tokio::test]
+async fn non_git_coding_child_is_refused_without_a_queued_row() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let plain = directory.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let before = RuntimeRepository::open(&database)
+        .unwrap()
+        .queued_task_count()
+        .unwrap();
+    let error = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "change the plain directory".into(),
+            ChildWriteMode::Coding,
+            None,
+            Some(plain.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    let after = RuntimeRepository::open(&database)
+        .unwrap()
+        .queued_task_count()
+        .unwrap();
+
+    match error {
+        RuntimeCoordinatorError::CodingRequiresGit { workdir, reason } => {
+            assert_eq!(workdir, plain.canonicalize().unwrap_or(plain));
+            assert_eq!(reason, CodingRequiresGitReason::NotARepository);
+        }
+        other => panic!("expected a coding git rejection, got {other}"),
+    }
+    assert_eq!(after, before, "a refused spawn must not leave a queued row");
+    assert_eq!(
+        factory.starts.lock().unwrap().len(),
+        1,
+        "only the root may have started"
+    );
+}
+
+/// `git init` alone is not enough: `rev-parse --show-toplevel` succeeds while
+/// `rev-parse HEAD` fails, so the child would start and only fail later at
+/// delivery. Catch it at the spawn instead.
+#[tokio::test]
+async fn an_empty_repository_is_refused_for_missing_head() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let empty = directory.path().join("empty-repo");
+    std::fs::create_dir(&empty).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&empty)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let error = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "change the empty repository".into(),
+            ChildWriteMode::Coding,
+            None,
+            Some(empty),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    match error {
+        RuntimeCoordinatorError::CodingRequiresGit { reason, .. } => {
+            assert_eq!(reason, CodingRequiresGitReason::NoInitialCommit);
+        }
+        other => panic!("expected no_initial_commit, got {other}"),
+    }
 }
