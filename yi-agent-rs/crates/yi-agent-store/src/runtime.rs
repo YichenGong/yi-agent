@@ -95,6 +95,46 @@ pub enum RuntimeCoordinatorError {
     ForkTooLarge { total: u64, max: u64 },
     #[error("fork upload rejected: {0}")]
     ForkUpload(String),
+    #[error(
+        "{prefix}{reason} at {workdir}",
+        prefix = CODING_REQUIRES_GIT_PREFIX,
+        reason = reason.as_str(),
+        workdir = workdir.display()
+    )]
+    CodingRequiresGit {
+        workdir: PathBuf,
+        reason: CodingRequiresGitReason,
+    },
+}
+
+/// Stable wire prefix for "a coding child needs a git worktree with a HEAD".
+///
+/// The daemon cannot hand the model a JSON object through `IpcResponse::Error`
+/// without changing the protocol, so the rejection carries this prefix and the
+/// tool layer rebuilds the structured payload from it. One definition, one test.
+pub const CODING_REQUIRES_GIT_PREFIX: &str = "coding_requires_git:";
+
+/// Which git precondition a coding spawn failed.
+///
+/// Kept apart so the remedy can omit `git init` for a repository that exists but
+/// has no commit: telling a user to re-initialize would be both wrong and
+/// destructive-sounding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodingRequiresGitReason {
+    /// The directory is not inside any git repository.
+    NotARepository,
+    /// The repository exists but has no commit, so `rev-parse HEAD` fails and
+    /// there is no base the runtime could recover into.
+    NoInitialCommit,
+}
+
+impl CodingRequiresGitReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotARepository => "not_a_repository",
+            Self::NoInitialCommit => "no_initial_commit",
+        }
+    }
 }
 
 /// The `kind` column for a trace fact.
