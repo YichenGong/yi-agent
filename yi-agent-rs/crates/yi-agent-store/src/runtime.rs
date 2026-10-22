@@ -1559,14 +1559,23 @@ impl RuntimeCoordinator {
         // task row is written: a refusal must not leave a queued ghost task the
         // caller can neither see nor clean up.
         //
-        // Only an explicitly handed-over workdir is judged, and only once it
-        // exists. Without one the child inherits whatever position the worker
-        // factory derives at start time, which is not knowable here; a missing
-        // directory is the parent's earlier mistake and keeps its own, more
-        // precise error from `observe_workdir` rather than being reported as a
-        // git problem.
+        // Only directories that exist are judged. Without an explicit workdir the
+        // child inherits the parent's remembered position, which is the directory
+        // a coding child would actually write into; a position the factory
+        // synthesizes at start time is not knowable here. A missing directory is
+        // the parent's earlier mistake and keeps its own, more precise error from
+        // `observe_workdir` rather than being reported as a git problem.
+        let inherited_position = workdir.is_none().then(|| {
+            self.remembered_task_position(parent)
+                .map(|position| position.path)
+        });
+        let target = match (workdir.as_deref(), inherited_position) {
+            (Some(workdir), _) => Some(workdir.to_path_buf()),
+            (None, Some(position)) => position,
+            (None, None) => None,
+        };
         if workspace_mode == ChildWriteMode::Coding
-            && let Some(target) = workdir.as_deref().filter(|target| target.is_dir())
+            && let Some(target) = target.as_deref().filter(|target| target.is_dir())
         {
             coding_git_precondition(target).map_err(|reason| {
                 // Canonicalized so the message names one path, not two spellings

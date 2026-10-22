@@ -3644,7 +3644,10 @@ async fn an_autonomous_session_refuses_a_workdir_that_is_not_a_git_worktree() {
         .await
         .unwrap_err();
 
-    // The refusal comes from the git check, not from a silent in-place run.
+    // The refusal comes from the git check, not from a silent in-place run. This
+    // is the autonomous ROOT's worktree, refused by the worktree service before
+    // any child exists, so it keeps the git-level wording rather than the child
+    // precondition's `coding_requires_git` code.
     assert!(
         error.to_string().contains("not a git repository"),
         "unexpected error: {error}"
