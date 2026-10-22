@@ -3597,6 +3597,14 @@ mod tests {
             prompt.contains("git merge --no-ff"),
             "default prompt must still tell parents to integrate the delivered commit"
         );
+        assert!(
+            prompt.contains("coding_requires_git"),
+            "the system prompt must tell the model to ask the user when a coding child is refused"
+        );
+        assert!(
+            prompt.contains("read_only"),
+            "the fallback after a refusal is a read-only child, which must be discoverable here"
+        );
     }
 
     // --- drain_stream_human tests ---

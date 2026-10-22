@@ -2034,7 +2034,10 @@ struct DaemonWaitAgentTool {
 /// 普通 worker（`DaemonSpawnAgentTool`）与应用级子代理
 /// （`DaemonApplicationSpawnAgentTool`）共用这一份，避免文案漂移。
 pub(crate) fn spawn_agent_description() -> &'static str {
-    "Create an asynchronously scheduled direct child agent."
+    "Create an asynchronously scheduled direct child agent. A 'coding' child needs a git \
+     worktree with at least one commit; when the spawn is refused with 'coding_requires_git', \
+     ask the user whether to create one there, and do not retry a coding spawn in this session \
+     once they decline."
 }
 
 /// `spawn_agent` 的 JSON schema。
@@ -2053,7 +2056,7 @@ pub(crate) fn spawn_agent_schema() -> serde_json::Value {
             },
             "workdir": {
                 "type": "string",
-                "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
+                "description": "Directory the child works in. Required for 'coding': it must be inside a git worktree that already has a commit. Create it yourself with `git worktree add <path> -b <branch>` first, or after the user agrees to initialize the project with `git init` plus an initial commit. Omit it for 'read_only': a read-only child runs in your own position and works in non-git directories."
             },
             "fork": {
                 "type": "boolean",
@@ -2513,9 +2516,27 @@ mod tests {
             schema["properties"]["mode"]["enum"],
             serde_json::json!(["coding", "read_only"])
         );
-        assert_eq!(
-            spawn_agent_description(),
-            "Create an asynchronously scheduled direct child agent."
+        // The first sentence is the tool's identity and must survive any later
+        // elaboration; the rest of this test pins what that elaboration says.
+        let description = spawn_agent_description();
+        assert!(
+            description.starts_with("Create an asynchronously scheduled direct child agent."),
+            "{description}"
+        );
+        assert!(
+            description.contains("coding_requires_git"),
+            "the model knows this code only if the tool description names it: {description}"
+        );
+        let workdir = schema["properties"]["workdir"]["description"]
+            .as_str()
+            .expect("workdir description");
+        assert!(
+            workdir.contains("git worktree") || workdir.contains("git repository"),
+            "the model must know coding needs git: {workdir}"
+        );
+        assert!(
+            workdir.contains("commit"),
+            "a repository with no commit still fails, so the description must say so: {workdir}"
         );
     }
 
