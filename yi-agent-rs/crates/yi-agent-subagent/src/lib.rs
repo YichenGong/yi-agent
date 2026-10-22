@@ -1881,6 +1881,63 @@ fn abort_unconsumed_fork(socket: &Path, fork_token: &Option<String>) {
 /// response handling -- the queued payload, the abort of an unconsumed fork on
 /// rejection, and the daemon-unavailable error -- is identical. Keeping it in one
 /// place is what stops the `forked` contract from drifting between them.
+/// The stable prefix the daemon puts on a git-precondition refusal. Mirrors
+/// `yi_agent_store::runtime::CODING_REQUIRES_GIT_PREFIX`; this crate cannot
+/// import it without a dependency cycle, so `spawn_agent_schema_pins_the_wire_contract`
+/// and the tests below pin the spelling on both sides.
+const CODING_REQUIRES_GIT_PREFIX: &str = "coding_requires_git:";
+
+/// Rebuilds a structured rejection from the daemon's prefixed message.
+///
+/// The IPC protocol carries only `code` and `message`, so the model would
+/// otherwise see `validation: coding_requires_git:...` and have to parse a
+/// sentence. This turns it into the facts a model can act on: which directory,
+/// why, what to run, and what to ask the user.
+///
+/// The prefix is located rather than anchored: the daemon wraps its message in
+/// `daemon rejected spawn request: <code>: <message>`.
+fn coding_requires_git_payload(message: &str) -> Option<String> {
+    let start = message.find(CODING_REQUIRES_GIT_PREFIX)?;
+    let rest = &message[start + CODING_REQUIRES_GIT_PREFIX.len()..];
+    // Shape: "<reason> at <path>". Split from the right so a reason can never
+    // swallow part of the path; the path may itself contain " at ".
+    let (reason, workdir) = rest.rsplit_once(" at ")?;
+    let reason = match reason.trim() {
+        "not_a_repository" => "not_a_repository",
+        "no_initial_commit" => "no_initial_commit",
+        _ => return None,
+    };
+    let workdir = workdir.trim();
+    if workdir.is_empty() {
+        return None;
+    }
+    // `git init` only makes sense when there is no repository yet. Telling a
+    // user to re-initialize an existing repo is wrong and sounds destructive.
+    let commands: Vec<&str> = if reason == "not_a_repository" {
+        vec!["git init", "git add -A", "git commit -m \"initial commit\""]
+    } else {
+        vec!["git add -A", "git commit -m \"initial commit\""]
+    };
+    Some(
+        json!({
+            "code": "coding_requires_git",
+            "workdir": workdir,
+            "reason": reason,
+            "remedy": {
+                "commands": commands,
+                // Stated explicitly because `git init` alone still fails: with
+                // no commit, `rev-parse HEAD` has nothing to point at.
+                "requires_initial_commit": true,
+                "note": "a repository with no commits still fails: the runtime needs a HEAD to recover into",
+            },
+            "ask_user": format!(
+                "The coding subagent needs version control in {workdir}. I can create a git repository there and make an initial commit. Do you want me to?"
+            ),
+        })
+        .to_string(),
+    )
+}
+
 fn spawn_outcome(
     response: Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>,
     socket: &Path,
@@ -1899,11 +1956,13 @@ fn spawn_outcome(
         ),
         Ok(other) => {
             abort_unconsumed_fork(socket, fork_token);
-            ToolResult::error(format_ipc_rejection("spawn request", &other))
+            let message = format_ipc_rejection("spawn request", &other);
+            ToolResult::error(coding_requires_git_payload(&message).unwrap_or(message))
         }
         Err(error) => {
             abort_unconsumed_fork(socket, fork_token);
-            ToolResult::error(format!("daemon is unavailable: {error}"))
+            let message = format!("daemon is unavailable: {error}");
+            ToolResult::error(coding_requires_git_payload(&message).unwrap_or(message))
         }
     }
 }
@@ -3846,6 +3905,69 @@ mod tests {
             *outsider_error,
             "the inherited root set must not widen the boundary: {results:?}"
         );
+    }
+
+    /// The model must be able to act on a refusal: what is wrong, what to run,
+    /// and what to ask the user. A bare "validation error" makes it guess.
+    #[test]
+    fn a_coding_requires_git_rejection_becomes_an_actionable_payload() {
+        let payload =
+            coding_requires_git_payload("coding_requires_git:not_a_repository at /tmp/notes")
+                .expect("the prefix marks a rejectable refusal");
+
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["code"], "coding_requires_git");
+        assert_eq!(value["workdir"], "/tmp/notes");
+        assert_eq!(value["reason"], "not_a_repository");
+        assert_eq!(value["remedy"]["requires_initial_commit"], true);
+        let commands = value["remedy"]["commands"].as_array().unwrap();
+        assert!(commands.iter().any(|command| command == "git init"));
+        assert!(
+            value["ask_user"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "the model needs a sentence it can put to the user"
+        );
+    }
+
+    /// The daemon wraps the message in its own sentence, so the prefix is not at
+    /// the start. Locating it anywhere is what makes the tool layer work against
+    /// the real wire format rather than only against the unit-test spelling.
+    #[test]
+    fn a_prefixed_rejection_inside_a_daemon_sentence_is_still_recognized() {
+        let payload = coding_requires_git_payload(
+            "daemon rejected spawn request: validation: \
+             coding_requires_git:not_a_repository at /tmp/notes",
+        )
+        .expect("the prefix is found wherever the daemon put it");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["workdir"], "/tmp/notes");
+    }
+
+    /// A repository that exists but has no commit must not be told to
+    /// re-initialize: that would be wrong and sounds destructive.
+    #[test]
+    fn a_missing_commit_omits_git_init_from_the_remedy() {
+        let payload =
+            coding_requires_git_payload("coding_requires_git:no_initial_commit at /tmp/notes")
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["reason"], "no_initial_commit");
+        let commands = value["remedy"]["commands"].as_array().unwrap();
+        assert!(
+            !commands.iter().any(|command| command == "git init"),
+            "an existing repository must not be re-initialized: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "git commit -m \"initial commit\"")
+        );
+    }
+
+    #[test]
+    fn an_unrelated_rejection_is_left_alone() {
+        assert!(coding_requires_git_payload("daemon rejected spawn request: conflict").is_none());
     }
 
     /// The tool layer keys off this prefix to rebuild a structured rejection, so
