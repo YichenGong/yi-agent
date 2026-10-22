@@ -1689,7 +1689,14 @@ impl RuntimeCoordinator {
         // add`) and hands over its path; the daemon only records that position.
         // A bad path fails the spawn rather than deferring to worker start, so
         // the parent learns immediately that its workdir was not usable.
-        if let Some(workdir) = workdir.as_deref() {
+        //
+        // Read-only children are exempt: `prepare_task_workspace` ignores a
+        // read-only task's `workdir` entirely and inherits the nearest
+        // ancestor's position, so validating a directory that will never be used
+        // only manufactures a failure unrelated to what the task does.
+        if workspace_mode == ChildWriteMode::Coding
+            && let Some(workdir) = workdir.as_deref()
+        {
             let registry = self.factory.worker_workspace_registry().ok_or_else(|| {
                 RuntimeCoordinatorError::Supervisor(
                     "coding child requires a prepared-workspace registry".into(),

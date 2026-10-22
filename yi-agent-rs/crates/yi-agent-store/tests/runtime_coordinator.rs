@@ -3206,6 +3206,99 @@ async fn read_only_child_runs_in_place_without_a_workspace_row() {
     assert_eq!(starts[1].workspace_mode, ChildWriteMode::ReadOnly);
 }
 
+/// A read-only child in a plain directory must start and finish. It never
+/// writes, so there is nothing to recover or deliver, and the git requirement
+/// that gates a coding child does not apply to it.
+#[tokio::test]
+async fn non_git_read_only_child_starts_and_completes() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let plain = directory.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: plain.clone(),
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    // A non-git root has no worktree to provision, so it attaches in place as a
+    // read-only root; `create_session` would ask the factory for a worktree.
+    let attached = coordinator
+        .attach_application_root("non-git-read-only", &plain, &[])
+        .await
+        .unwrap();
+    let session = attached.session_id.clone();
+    let root = attached.root_task_id.clone();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator
+        .start_worker(&session, &child)
+        .await
+        .expect("a read-only child has no worktree to recover into");
+
+    // Reporting a plain text result is how a read-only worker finishes. The
+    // handle list is the file's established seam (see
+    // `one_supervisors_failure_does_not_discard_another_sessions_completion`),
+    // and the child is the second start because the root started first.
+    let handles = factory.handles.lock().unwrap().clone();
+    assert_eq!(handles.len(), 2, "root plus the read-only child");
+    handles[1].report_completed("the investigation finished");
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    let state = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_state(&child)
+        .unwrap();
+    assert_eq!(
+        state, "completed_no_changes",
+        "a read-only child must not fail"
+    );
+}
+
+/// A plain directory is not a git worktree, so the daemon has no repository
+/// root to fall back to. A read-only child still must not be gated on it: it
+/// never uses the workdir it was handed, and refusing it is exactly the poor
+/// experience this change removes.
+#[tokio::test]
+async fn non_git_read_only_child_accepts_an_explicit_workdir() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let plain = directory.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: plain.clone(),
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let attached = coordinator
+        .attach_application_root("non-git-read-only-workdir", &plain, &[])
+        .await
+        .unwrap();
+    let session = attached.session_id;
+    let root = attached.root_task_id;
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "read the plain directory".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            Some(plain),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a read-only child must not be gated on git");
+    coordinator.start_worker(&session, &child).await.unwrap();
+}
+
 #[tokio::test]
 async fn non_git_application_root_can_be_reattached() {
     let directory = TempDir::new().unwrap();
