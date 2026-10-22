@@ -3772,23 +3772,37 @@ fn validate_recovery_context(context: &WorkerRecoveryContext) -> Result<(), Repo
         .ok_or_else(|| RepositoryError::InvalidWorkerRecoveryContext {
             reason: "workspace lease is missing".into(),
         })?;
-    let worktree = context
-        .worktree_lease
-        .as_deref()
-        .filter(|lease| lease.starts_with("worktree:") && lease.len() > "worktree:".len())
-        .ok_or_else(|| RepositoryError::InvalidWorkerRecoveryContext {
-            reason: "worktree lease is missing".into(),
+    // A read-only worker runs in place, so there is no worktree to recover into.
+    // The checkpoint kind is the explicit permission: it is never inferred from
+    // an absent lease, because a coding worker that lost its lease would then be
+    // admitted as if it were read-only.
+    let checkpoint: serde_json::Value =
+        serde_json::from_str(&context.checkpoint_json).map_err(|error| {
+            RepositoryError::InvalidWorkerRecoveryContext {
+                reason: format!("checkpoint evidence is invalid JSON: {error}"),
+            }
         })?;
-    if workspace == "workspace:" || worktree == "worktree:" {
+    let is_read_only =
+        checkpoint.get("kind").and_then(serde_json::Value::as_str) == Some("read_only_checkpoint");
+    if !is_read_only {
+        let worktree = context
+            .worktree_lease
+            .as_deref()
+            .filter(|lease| lease.starts_with("worktree:") && lease.len() > "worktree:".len())
+            .ok_or_else(|| RepositoryError::InvalidWorkerRecoveryContext {
+                reason: "worktree lease is missing".into(),
+            })?;
+        if worktree == "worktree:" {
+            return Err(RepositoryError::InvalidWorkerRecoveryContext {
+                reason: "resource lease key is empty".into(),
+            });
+        }
+    }
+    if workspace == "workspace:" {
         return Err(RepositoryError::InvalidWorkerRecoveryContext {
             reason: "resource lease key is empty".into(),
         });
     }
-    serde_json::from_str::<serde_json::Value>(&context.checkpoint_json).map_err(|error| {
-        RepositoryError::InvalidWorkerRecoveryContext {
-            reason: format!("checkpoint evidence is invalid JSON: {error}"),
-        }
-    })?;
     serde_json::from_str::<serde_json::Value>(&context.tool_state_json).map_err(|error| {
         RepositoryError::InvalidWorkerRecoveryContext {
             reason: format!("tool-state evidence is invalid JSON: {error}"),
@@ -4710,6 +4724,40 @@ mod extra_roots_tests {
                 )
                 .unwrap(),
             "a v14 database must gain tasks.extra_roots"
+        );
+    }
+}
+
+#[cfg(test)]
+mod read_only_checkpoint_tests {
+    use super::*;
+
+    fn context(kind: &str) -> WorkerRecoveryContext {
+        WorkerRecoveryContext {
+            workspace_lease_id: Some("workspace:/tmp/plain".into()),
+            worktree_lease: None,
+            checkpoint_json: format!(r#"{{"kind":"{kind}"}}"#),
+            tool_state_json: r#"{"state":"available"}"#.into(),
+        }
+    }
+
+    /// A read-only worker runs in place, so it has no worktree to recover into.
+    /// The checkpoint kind is what says so; an absent lease alone must not be
+    /// read as permission, or a coding worker that forgot its lease would slip
+    /// through.
+    #[test]
+    fn a_read_only_checkpoint_admits_a_worker_without_a_worktree_lease() {
+        validate_recovery_context(&context("read_only_checkpoint"))
+            .expect("a read-only position is a legitimate place to run");
+    }
+
+    #[test]
+    fn an_unknown_checkpoint_kind_still_requires_a_worktree_lease() {
+        let error = validate_recovery_context(&context("worker_admission"))
+            .expect_err("an ordinary admission must still name a worktree");
+        assert!(
+            error.to_string().contains("worktree lease is missing"),
+            "{error}"
         );
     }
 }

@@ -406,16 +406,28 @@ impl DaemonAgentWorkerFactory {
             })
     }
 
-    fn recovery_context_for_workspace(&self, workspace: PathBuf) -> WorkerRecoveryContext {
+    fn recovery_context_for_workspace(
+        &self,
+        workspace: PathBuf,
+        workspace_mode: ChildWriteMode,
+    ) -> WorkerRecoveryContext {
         let git_root = git_output(&workspace, &["rev-parse", "--show-toplevel"]);
         let git_head = git_output(&workspace, &["rev-parse", "HEAD"]);
         let git_status = git_command_output(&workspace, &["status", "--porcelain"]).ok();
         let tool_names = self.worker_tool_names_for_workspace(workspace.clone());
+        // A read-only worker runs in place: when the position is not a git
+        // worktree there is nothing to recover into, and the checkpoint says so
+        // explicitly rather than leaving an empty lease to be misread.
+        let (worktree_lease, checkpoint_kind) = match (git_root, workspace_mode) {
+            (Some(directory), _) => (Some(format!("worktree:{directory}")), "worker_admission"),
+            (None, ChildWriteMode::ReadOnly) => (None, "read_only_checkpoint"),
+            (None, ChildWriteMode::Coding) => (None, "worker_admission"),
+        };
         WorkerRecoveryContext {
             workspace_lease_id: Some(format!("workspace:{}", workspace.display())),
-            worktree_lease: git_root.map(|directory| format!("worktree:{directory}")),
+            worktree_lease,
             checkpoint_json: json!({
-                "kind": "worker_admission",
+                "kind": checkpoint_kind,
                 "git_head": git_head,
                 "git_status": git_status,
             })
@@ -713,9 +725,11 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
     }
 
     fn recovery_context(&self) -> WorkerRecoveryContext {
+        // No request to read a mode from, so this stays exactly as it was: the
+        // configured recovery workspace is always judged as a coding position.
         self.recovery_workspace
             .clone()
-            .map(|workspace| self.recovery_context_for_workspace(workspace))
+            .map(|workspace| self.recovery_context_for_workspace(workspace, ChildWriteMode::Coding))
             .unwrap_or_default()
     }
 
@@ -723,7 +737,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         request
             .workspace
             .as_ref()
-            .map(|workspace| self.recovery_context_for_workspace(workspace.path.clone()))
+            .map(|workspace| {
+                self.recovery_context_for_workspace(workspace.path.clone(), request.workspace_mode)
+            })
             .unwrap_or_else(|| self.recovery_context())
     }
 
