@@ -24,7 +24,8 @@ use crate::lead_loop::{ThreadSnapshot, decide_wake, render_digest};
 use crate::pairing::PairingState;
 use crate::protocol::{
     ClientResponse, JSONRPC_VERSION, Notification, NotificationEnvelope, PROTOCOL_VERSION,
-    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, ThreadStatus,
+    RequestEnvelope, RequestId, ResponseEnvelope, ReverseRequest, RpcError, Scope, SubagentTotals,
+    ThreadStatus,
 };
 use crate::session::{
     CompactOutcome, InterjectionRequest, SessionCommand, ThreadSession, TurnPrompt,
@@ -980,8 +981,29 @@ pub(crate) fn children_for_thread(
             state: task.state.clone(),
             last_step: None,
             parent_task_id: task.parent_task_id.clone(),
+            // 用量随列表一起给：客户端因此不需要为每个子任务再问一次。
+            usage: crate::protocol::AgentChildUsage {
+                input_tokens: task.usage.input_tokens,
+                output_tokens: task.usage.output_tokens,
+                cache_read_tokens: task.usage.cache_read_tokens,
+            },
         })
         .collect()
+}
+
+/// 一个会话里所有子任务的用量之和。
+///
+/// 对**整份列表**求和而不是只算运行中的：已完成的子任务烧掉的 token 同样是这个
+/// 会话的真实开销，累计值必须包含它们。
+pub(crate) fn subagent_totals(children: &[crate::protocol::AgentChild]) -> SubagentTotals {
+    children
+        .iter()
+        .fold(SubagentTotals::default(), |mut acc, child| {
+            acc.input = acc.input.saturating_add(child.usage.input_tokens);
+            acc.output = acc.output.saturating_add(child.usage.output_tokens);
+            acc.cache_read = acc.cache_read.saturating_add(child.usage.cache_read_tokens);
+            acc
+        })
 }
 
 /// Whether a task state can still make progress.

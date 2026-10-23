@@ -108,6 +108,9 @@ pub struct Translator {
     committed: UsageTotals,
     /// 本轮**已结束**调用的累计；`set_turn` 时并入 `committed` 后清零。
     turn: UsageTotals,
+    /// 本会话所有 subagent 的累计。与 `committed`/`turn`/`usage` 平行但独立：
+    /// 它不来自本 thread 的 provider 流，而是从子任务列表汇总来的。
+    subagent: crate::protocol::SubagentTotals,
 }
 
 impl Translator {
@@ -125,6 +128,7 @@ impl Translator {
             usage: UsageSnapshot::default(),
             committed: baseline,
             turn: UsageTotals::default(),
+            subagent: crate::protocol::SubagentTotals::default(),
         }
     }
 
@@ -169,6 +173,9 @@ impl Translator {
         self.committed = UsageTotals::default();
         self.turn = UsageTotals::default();
         self.usage = UsageSnapshot::default();
+        // subagent 累计一并归零：`/clear` 之后整段对话的历史都不存在了，
+        // 留着旧子任务数字会让用户以为清空没生效。
+        self.subagent = crate::protocol::SubagentTotals::default();
         vec![self.usage_notification()]
     }
 
@@ -185,6 +192,10 @@ impl Translator {
             total_output_tokens: totals.output_tokens,
             total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
             total_cache_read_input_tokens: totals.cache_read_input_tokens,
+            // 由 `set_subagent_totals` 维护；Task 5 接上真实值。
+            subagent_input_tokens: self.subagent.input,
+            subagent_output_tokens: self.subagent.output,
+            subagent_cache_read_tokens: self.subagent.cache_read,
         }
     }
 

@@ -669,6 +669,12 @@ pub(crate) async fn handle(
                         total_output_tokens: totals.output_tokens,
                         total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
                         total_cache_read_input_tokens: totals.cache_read_input_tokens,
+                        // 回放不带 subagent 汇总：它由 children watch 在会话恢复后
+                        // 推送（Task 5）。这里给 0 而不是省略字段，客户端因此不必
+                        // 处理「缺失」这一种额外状态。
+                        subagent_input_tokens: 0,
+                        subagent_output_tokens: 0,
+                        subagent_cache_read_tokens: 0,
                     },
                 )
                 .await?;

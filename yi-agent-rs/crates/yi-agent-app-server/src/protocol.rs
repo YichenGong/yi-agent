@@ -467,6 +467,16 @@ pub enum Notification {
         total_cache_creation_input_tokens: u64,
         #[ts(type = "number")]
         total_cache_read_input_tokens: u64,
+        /// 本会话所有 subagent 的累计，**不并入** `total_*`。
+        ///
+        /// 与主会话是两组独立的数：`/usage` 与展开面板要分开呈现，合并会让
+        /// 「主 Agent 自己花了多少」无从得知。恒为具体数字，没有 subagent 时是 0。
+        #[ts(type = "number")]
+        subagent_input_tokens: u64,
+        #[ts(type = "number")]
+        subagent_output_tokens: u64,
+        #[ts(type = "number")]
+        subagent_cache_read_tokens: u64,
     },
     /// 一条子 agent 轨迹行,推给订阅了该 thread 那个任务的客户端。
     #[serde(rename = "agent/trace/event", rename_all = "camelCase")]
@@ -622,6 +632,48 @@ impl Notification {
     }
 }
 
+/// 一个子任务的累计用量。
+///
+/// 只带展示要用的三项：input / output / cache read。cache write 不在用户口径内，
+/// 故既不记账也不传输。恒为具体数字（不是 Optional）：没有用量的子任务就是三个 0，
+/// 客户端用 `> 0` 判断是否值得展示。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
+#[serde(rename_all = "camelCase")]
+pub struct AgentChildUsage {
+    #[ts(type = "number")]
+    pub input_tokens: u64,
+    #[ts(type = "number")]
+    pub output_tokens: u64,
+    #[ts(type = "number")]
+    pub cache_read_tokens: u64,
+}
+
+/// 一个会话里所有子任务的用量之和。
+///
+/// 与 [`AgentChildUsage`] 同形状但用途不同：后者是「一个子任务」的量，本类型是
+/// 「整个会话」的合计。不直接复用前者，是因为合计值还要参与 `/clear` 基线相减。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SubagentTotals {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+}
+
+impl SubagentTotals {
+    /// 逐项饱和相减，供 `/clear` 基线扣减用。
+    ///
+    /// 用饱和而非直接减：基线来自同一条数据流，理论上不会超过当前值，但 daemon
+    /// 重启 / 任务被清理都可能让它短暂倒挂——此时报 0 好过 panic 或回绕成天文数字。
+    pub(crate) fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_sub(other.input),
+            output: self.output.saturating_sub(other.output),
+            cache_read: self.cache_read.saturating_sub(other.cache_read),
+        }
+    }
+}
+
 /// 一条子 agent 的列表项。字段沿用 JSON-RPC 的 camelCase。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[ts(export, export_to = "../../../../desktop/src/lib/generated/")]
@@ -638,6 +690,9 @@ pub struct AgentChild {
     /// lists exactly the task's own children.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<String>,
+    /// 该子任务的累计用量。`serde(default)` 让老 daemon 不回该字段时读出全零。
+    #[serde(default)]
+    pub usage: AgentChildUsage,
 }
 
 /// 一条轨迹行,原样透传 daemon 的 `IpcTraceRow`。
@@ -1034,6 +1089,9 @@ mod tests {
             total_output_tokens: 300,
             total_cache_creation_input_tokens: 500,
             total_cache_read_input_tokens: 700,
+            subagent_input_tokens: 11,
+            subagent_output_tokens: 22,
+            subagent_cache_read_tokens: 33,
         };
         let v: Value = serde_json::to_value(NotificationEnvelope::new(&n)).unwrap();
         assert_eq!(v["method"], "thread/tokenUsage/updated");
@@ -1043,6 +1101,10 @@ mod tests {
         assert_eq!(v["params"]["cache_read_input_tokens"], 200);
         assert_eq!(v["params"]["total_input_tokens"], 1_000);
         assert_eq!(v["params"]["total_output_tokens"], 300);
+        // subagent 三个值走 snake_case（与其它用量字段同款），且不并入 total_*。
+        assert_eq!(v["params"]["subagent_input_tokens"], 11);
+        assert_eq!(v["params"]["subagent_output_tokens"], 22);
+        assert_eq!(v["params"]["subagent_cache_read_tokens"], 33);
         assert_eq!(v["params"]["total_cache_creation_input_tokens"], 500);
         assert_eq!(v["params"]["total_cache_read_input_tokens"], 700);
     }

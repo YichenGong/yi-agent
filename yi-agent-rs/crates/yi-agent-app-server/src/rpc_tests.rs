@@ -2685,6 +2685,7 @@ fn summary(
         is_root: false,
         parent_task_id: Some("root".into()),
         thread_id: thread_id.map(str::to_string),
+        usage: yi_agent_store::ipc::IpcTaskUsage::default(),
     }
 }
 
@@ -2716,6 +2717,55 @@ fn children_are_scoped_by_the_conversation_marker() {
         children_for_thread(&tasks, "thread-c").is_empty(),
         "a conversation with no children lists none"
     );
+}
+
+/// 子任务列表项携带它自己的累计用量。
+#[test]
+fn children_for_thread_carries_task_usage() {
+    let mut task = summary("child-1", "running", Some("thread-a"));
+    task.usage = yi_agent_store::ipc::IpcTaskUsage {
+        input_tokens: 1_200,
+        output_tokens: 34,
+        cache_read_tokens: 56_000,
+    };
+    let children = children_for_thread(&[task], "thread-a");
+    assert_eq!(children.len(), 1);
+    assert_eq!(
+        children[0].usage,
+        crate::protocol::AgentChildUsage {
+            input_tokens: 1_200,
+            output_tokens: 34,
+            cache_read_tokens: 56_000,
+        }
+    );
+}
+
+/// 汇总对整份列表求和：已完成的子任务烧掉的 token 同样是这个会话的开销。
+#[test]
+fn subagent_totals_sums_every_child() {
+    let child = |input, output, cache_read| crate::protocol::AgentChild {
+        task_id: "x".into(),
+        objective: None,
+        state: "completed".into(),
+        last_step: None,
+        parent_task_id: Some("root".into()),
+        usage: crate::protocol::AgentChildUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+        },
+    };
+    let children = vec![child(10, 1, 100), child(20, 2, 200)];
+    assert_eq!(
+        subagent_totals(&children),
+        SubagentTotals {
+            input: 30,
+            output: 3,
+            cache_read: 300,
+        }
+    );
+    // 空列表是零，不是错误。
+    assert_eq!(subagent_totals(&[]), SubagentTotals::default());
 }
 
 /// A root task is never a child, even when it carries the marker.
@@ -2758,6 +2808,11 @@ fn the_agent_notifications_use_their_documented_wire_shape() {
             state: "running".into(),
             last_step: Some("running tests".into()),
             parent_task_id: Some("root".into()),
+            usage: crate::protocol::AgentChildUsage {
+                input_tokens: 1_200,
+                output_tokens: 34,
+                cache_read_tokens: 56_000,
+            },
         }],
     };
     let json = serde_json::to_value(&children).unwrap();
@@ -2765,6 +2820,13 @@ fn the_agent_notifications_use_their_documented_wire_shape() {
     assert_eq!(json["params"]["threadId"], "thread-1");
     assert_eq!(json["params"]["children"][0]["taskId"], "task-1");
     assert_eq!(json["params"]["children"][0]["lastStep"], "running tests");
+    // 用量走 camelCase，与列表里其它字段一致。
+    assert_eq!(json["params"]["children"][0]["usage"]["inputTokens"], 1_200);
+    assert_eq!(json["params"]["children"][0]["usage"]["outputTokens"], 34);
+    assert_eq!(
+        json["params"]["children"][0]["usage"]["cacheReadTokens"],
+        56_000
+    );
 
     let event = Notification::AgentTraceEvent {
         thread_id: "thread-1".into(),
