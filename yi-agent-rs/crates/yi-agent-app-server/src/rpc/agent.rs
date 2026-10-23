@@ -56,11 +56,23 @@ pub(crate) async fn handle(
             // 客户端不必轮询。daemon 不可达时不建立(没有可观察的变化)。
             if !state.children_watches.contains_key(&thread_id) {
                 if let Some(socket) = socket_for_thread(state.runtimes, state.threads, &thread_id) {
+                    // sender 取自 session：它由 driver 创建并与之同生共死。
+                    // 取不到（session 已不在表里）时用一个孤儿 channel —— 汇总
+                    // 照旧发布，只是没有 driver 消费，等价于没有 subagent 用量。
+                    let subagent_tx = state
+                        .threads
+                        .get(&thread_id)
+                        .map(|session| session.subagent_tx.clone())
+                        .unwrap_or_else(|| {
+                            tokio::sync::watch::channel(crate::protocol::SubagentTotals::default())
+                                .0
+                        });
                     let task = tokio::spawn(watch_children(
                         Arc::clone(state.hub),
                         thread_id.clone(),
                         socket,
                         children.clone(),
+                        subagent_tx,
                     ));
                     state
                         .children_watches

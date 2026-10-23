@@ -835,6 +835,9 @@ pub(crate) async fn watch_children(
     thread_id: String,
     socket: PathBuf,
     initial: Vec<crate::protocol::AgentChild>,
+    // 用量汇总的去处。用 `watch` 而非 `mpsc`：这里只关心最新值，且写端是独立
+    // 任务，`mpsc` 满队列会让它卡住。
+    subagent_tx: tokio::sync::watch::Sender<SubagentTotals>,
 ) {
     let mut last = initial;
     loop {
@@ -856,6 +859,12 @@ pub(crate) async fn watch_children(
             continue;
         }
         last = current.clone();
+        // 用量与列表同源（都来自这次 ListTaskSummaries），故在同一次推送里一起更新，
+        // 客户端不会看到"列表已变、数字未变"的中间态。
+        //
+        // `send_replace` 永不失败、也不阻塞：没有 receiver（driver 已退出）时值仍
+        // 写进共享槽，下一个 driver 起来能立刻读到最新值。
+        subagent_tx.send_replace(subagent_totals(&current));
         let notification = Notification::AgentChildrenUpdated {
             thread_id: thread_id.clone(),
             children: current,
@@ -4973,6 +4982,8 @@ pub(crate) async fn run_thread_driver(
     // clear / compact 需要它们：compact 要调 provider 生成摘要，两者都要重建 agent。
     provider: Arc<dyn yi_agent_core::Provider>,
     config: yi_agent_core::AgentConfig,
+    // subagent 用量汇总。由 `watch_children` 写入，本 driver 读出来推给客户端。
+    mut subagent_rx: tokio::sync::watch::Receiver<SubagentTotals>,
 ) {
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
@@ -4985,6 +4996,11 @@ pub(crate) async fn run_thread_driver(
         .map(|loaded| loaded.totals)
         .unwrap_or_default();
     let mut translator = Translator::new(thread_id.clone(), baseline);
+    // `/clear` 之前已经烧掉的 subagent 用量。daemon 的 task 记录不会随 clear 删除，
+    // 故必须靠基线把旧量扣掉，否则清零后旧数字会被下一次推送带回来。
+    let mut subagent_baseline = SubagentTotals::default();
+    // 最近一次从 watch 收到的原始汇总（未减基线）。
+    let mut subagent_raw = SubagentTotals::default();
     // 只在首个 turn 尝试激活:objective 会被写进 root 任务,不能用占位串,也不能
     // 每轮重写。即使 `activate` 为 None 也置位,避免每轮重试。
     let mut activation_attempted = false;
@@ -5006,10 +5022,23 @@ pub(crate) async fn run_thread_driver(
                 )
                 .await;
                 if clearing {
+                    // 顺序要紧：先把当前原始汇总钉成基线，再归零 translator。
+                    // 不钉的话，下一次 children 推送仍带着 clear 前的量，数字会
+                    // 立刻弹回旧值。
+                    subagent_baseline = subagent_raw;
                     for n in translator.reset_totals() {
                         let _ = write_notification(&hub, &n).await;
                     }
                 }
+                continue;
+            }
+            // subagent 用量变化：`watch_children` 已把它算好送过来。空闲时也要
+            // 处理，否则子任务在 turn 之外收尾时报的量要等到下一轮才显示。
+            Ok(()) = subagent_rx.changed() => {
+                subagent_raw = *subagent_rx.borrow_and_update();
+                let totals = subagent_raw.saturating_sub(subagent_baseline);
+                let notification = translator.set_subagent_totals(totals);
+                let _ = write_notification(&hub, &notification).await;
                 continue;
             }
             maybe_prompt = prompt_rx.recv() => maybe_prompt,
@@ -5426,6 +5455,25 @@ pub(crate) async fn run_thread_driver(
                         ),
                     );
                     checkpoint_dirty = false;
+                }
+                // subagent 用量在 turn 进行中变了：立刻推一条，让数字随子任务
+                // 每次 provider 调用增长（这正是不落盘、走实时通道的理由）。
+                Ok(()) = subagent_rx.changed() => {
+                    subagent_raw = *subagent_rx.borrow_and_update();
+                    let totals = subagent_raw.saturating_sub(subagent_baseline);
+                    let notification = translator.set_subagent_totals(totals);
+                    if write_notification(&hub, &notification).await.is_err() {
+                        // 写帧失败即放弃本轮：与其它写失败站点同款。
+                        let _ = turn_tx
+                            .send(finished_event(&thread_id, &turn_id, None, None))
+                            .await;
+                        if let Err(e) = store.clear_partial(&thread_id) {
+                            eprintln!(
+                                "[app-server] failed to clear turn checkpoint ({thread_id}): {e}"
+                            );
+                        }
+                        return;
+                    }
                 }
                 Some(target) = interrupt_rx.recv(), if !cancel_sent => {
                     // 只接受针对当前 turn 的中断;忽略上一轮残留的信号。
@@ -6774,6 +6822,9 @@ pub(crate) async fn start_thread_core(
     // 先建句柄:同一 `Arc` 既存进 session 供 `thread/list` 读,
     // 也交给 driver 供其推送 `thread/status/updated`。
     let store_status = ThreadSession::new_status();
+    // driver 与 children watch 之间唯一的通道：watch 侧只送最新汇总，
+    // driver 侧据此生成完整的 TokenUsage（它才拿得到 total_*）。
+    let (subagent_tx, subagent_rx) = tokio::sync::watch::channel(SubagentTotals::default());
     threads.insert(
         thread_id.clone(),
         ThreadSession {
@@ -6789,6 +6840,7 @@ pub(crate) async fn start_thread_core(
             session_tx,
             store: Arc::clone(&thread_store),
             status: Arc::clone(&store_status),
+            subagent_tx,
         },
     );
 
@@ -6834,6 +6886,7 @@ pub(crate) async fn start_thread_core(
         Arc::clone(&store_status),
         provider,
         config,
+        subagent_rx,
     ));
 
     Ok(())

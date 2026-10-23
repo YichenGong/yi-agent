@@ -168,6 +168,18 @@ impl Translator {
         out
     }
 
+    /// 更新 subagent 累计并回一条通知。
+    ///
+    /// 只改 `subagent`，不动 `committed`/`turn`/`usage`——主会话与子 agent 是两组
+    /// 独立的数，合并会让 `/usage` 无法分开呈现。
+    ///
+    /// 由 driver 调用而非 children watch 任务自己发通知：那个任务拿不到
+    /// `total_*`，自行构造 `TokenUsage` 会把客户端已正确的主会话累计覆盖成零。
+    pub fn set_subagent_totals(&mut self, totals: crate::protocol::SubagentTotals) -> Notification {
+        self.subagent = totals;
+        self.usage_notification()
+    }
+
     /// `/clear` 之后累计归零，并推一条全零通知，保证客户端不保留旧数字。
     pub fn reset_totals(&mut self) -> Vec<Notification> {
         self.committed = UsageTotals::default();
@@ -613,7 +625,7 @@ fn render_content(blocks: &[ContentBlock]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Item, ToolStatus, TurnStatus};
+    use crate::protocol::{Item, SubagentTotals, ToolStatus, TurnStatus};
     use serde_json::json;
     use yi_agent_core::AgentEvent;
     use yi_agent_core::agent::{AgentError, DoneReason};
@@ -1447,6 +1459,55 @@ mod tests {
             } => {
                 assert_eq!(*total_input_tokens, 107);
                 assert_eq!(*total_output_tokens, 5);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subagent_totals_are_reported_separately_from_session_totals() {
+        let mut translator = Translator::new("t1".into(), UsageTotals::default());
+        let notification = translator.set_subagent_totals(SubagentTotals {
+            input: 500,
+            output: 60,
+            cache_read: 4000,
+        });
+        match notification {
+            Notification::TokenUsage {
+                total_input_tokens,
+                subagent_input_tokens,
+                subagent_output_tokens,
+                subagent_cache_read_tokens,
+                ..
+            } => {
+                // 主会话累计不受影响：两组数必须分开。
+                assert_eq!(total_input_tokens, 0);
+                assert_eq!(subagent_input_tokens, 500);
+                assert_eq!(subagent_output_tokens, 60);
+                assert_eq!(subagent_cache_read_tokens, 4000);
+            }
+            other => panic!("expected TokenUsage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reset_totals_clears_subagent_totals() {
+        let mut translator = Translator::new("t1".into(), UsageTotals::default());
+        translator.set_subagent_totals(SubagentTotals {
+            input: 9,
+            output: 1,
+            cache_read: 0,
+        });
+        let notifications = translator.reset_totals();
+        let last = notifications
+            .last()
+            .expect("reset must emit a notification");
+        match last {
+            Notification::TokenUsage {
+                subagent_input_tokens,
+                ..
+            } => {
+                assert_eq!(*subagent_input_tokens, 0);
             }
             other => panic!("expected TokenUsage, got {other:?}"),
         }
