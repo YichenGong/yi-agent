@@ -17,12 +17,26 @@ const row = (eventId: number, kind: string, payload: unknown): {
   payloadJson: string;
 } => ({ eventId, taskId: "t", kind, payloadJson: JSON.stringify(payload) });
 
-const child = (taskId: string, state: string, lastStep?: string): {
+/** 测试用的子任务。`usage` 恒为零：本文件测的是折叠逻辑，不关心用量。 */
+const ZERO_USAGE = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 };
+
+const child = (
+  taskId: string,
+  state: string,
+  lastStep?: string,
+): {
   taskId: string;
   state: string;
   objective?: string;
   lastStep?: string;
-} => ({ taskId, state, objective: `objective of ${taskId}`, lastStep });
+  usage: typeof ZERO_USAGE;
+} => ({
+  taskId,
+  state,
+  objective: `objective of ${taskId}`,
+  lastStep,
+  usage: ZERO_USAGE,
+});
 
 describe("subagents folding", () => {
   it("folds children/updated notifications into the rail list", () => {
@@ -139,12 +153,12 @@ describe("subagents folding", () => {
       "a",
     );
     expect(kids.map((c) => c.taskId)).toEqual(["b", "c"]);
-    expect(childrenOf([{ taskId: "a", parentTaskId: "root" }], "d")).toEqual([]);
+    expect(childrenOf([{ taskId: "a", parentTaskId: "root", usage: ZERO_USAGE }], "d")).toEqual([]);
   });
 
   it("computes a row's parent so the rail can be walked as a tree", () => {
-    expect(toRow({ taskId: "a", state: "running", parentTaskId: "root" }).parentTaskId).toBe("root");
-    expect(toRow({ taskId: "b", state: "running" }).parentTaskId).toBeNull();
+    expect(toRow({ taskId: "a", state: "running", parentTaskId: "root", usage: ZERO_USAGE }).parentTaskId).toBe("root");
+    expect(toRow({ taskId: "b", state: "running", usage: ZERO_USAGE }).parentTaskId).toBeNull();
   });
 
   it("falls back to the raw payload when a row does not parse", () => {

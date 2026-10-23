@@ -11,6 +11,7 @@ const child = (taskId: string, state: string, lastStep?: string) => ({
   state,
   objective: `objective of ${taskId}`,
   lastStep,
+  usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
 });
 
 describe("SubagentRail", () => {
@@ -65,7 +66,9 @@ describe("SubagentRail", () => {
   it("falls back to the task id when a child has no objective", () => {
     render(
       <SubagentRail
-        rows={applyChildrenUpdated([{ taskId: "task-9", state: "running" }])}
+        rows={applyChildrenUpdated([
+          { taskId: "task-9", state: "running", usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } },
+        ])}
         onOpen={vi.fn()}
       />,
     );
