@@ -975,7 +975,8 @@ describe("ThreadSidebar pinned section", () => {
     const { container } = renderSidebar({ groups: dragGroups, onReorderPinned });
     const rows = container.querySelectorAll<HTMLElement>("[data-group-row]");
     expect(rows.length).toBeGreaterThan(1);
-    expect(Array.from(rows).every((r) => r.getAttribute("draggable") === "true")).toBe(true);
+    // 拖拽源是行尾手柄，不是整行：整行 draggable 会吞掉 click。
+    expect(Array.from(rows).every((r) => r.getAttribute("draggable") !== "true")).toBe(true);
 
     fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn() } });
     fireEvent.drop(rows[1], { dataTransfer: {} });
@@ -1648,6 +1649,88 @@ describe("会话分组框", () => {
     );
   });
 
+  it("Cmd 连点三条会话后，按钮显示 3 且三条都进组", async () => {
+    // 现场回归：用户按住 Cmd 依次点三条，按钮却显示「新建组（2）」。
+    // 三次真实点击的 `detail` 依次是 1、2、3（浏览器按连击计数，修饰键不参与
+    // 判定），所以必须按真实序列驱动，而不是清一色 detail=1。
+    const onCreateGroup = vi.fn().mockResolvedValue("g-new");
+    renderSidebar({
+      groups: [{ workspace: "/work/projA", exists: true, threads: boxThreads }],
+      onCreateGroup,
+    });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+
+    expect(screen.getByText("新建组（3）")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("新建组（3）"));
+    const input = document.querySelector<HTMLInputElement>("[data-new-group-name]")!;
+    fireEvent.change(input, { target: { value: "登录模块" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(onCreateGroup).toHaveBeenCalled());
+    expect(onCreateGroup.mock.calls[0][3]).toEqual(["a", "b", "c"]);
+  });
+
+  it("Cmd 选中三条会话时，组长行也算一条（不再被点成跳转）", async () => {
+    // 现场回归：三条里有一条是组长行时，按钮只显示「新建组（2）」。
+    // 组长行的 onClick 没接修饰键分支，Cmd+点击直接走 onSelect——那一行既没进
+    // 选择集，还把用户的注意力跳走了。
+    const lead = { ...thread("lead", "组长", "/work/projA"), role: "lead" };
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [lead, thread("b", "B", "/work/projA"), thread("c", "C", "/work/projA")],
+      },
+    ];
+    const onSelect = vi.fn();
+    const { container } = renderSidebar({ groups: g, onSelect });
+    fireEvent.click(container.querySelector("[data-lead-row]")!, { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(screen.getByText("新建组（3）")).toBeTruthy();
+  });
+
+  it("普通会话行本身不可拖（原生拖拽会吞掉 click）", async () => {
+    // 整行 draggable 时，macOS 上按下后手指/触控板移动一两像素就会触发原生
+    // dragstart，浏览器随后不再派发 click——三次点击只记到两条正是这么来的。
+    // 拖拽改由行内手柄发起，行本身不再是拖拽源。
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: g });
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    expect(row.getAttribute("draggable")).not.toBe("true");
+  });
+
+  it("行内拖拽手柄仍可发起进组拖拽", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+        groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["b"] }],
+      },
+    ];
+    const { container } = renderSidebar({ groups: g, onSetGroupMembers });
+    const handle = container.querySelector<HTMLElement>('[data-drag-handle="a"]')!;
+    expect(handle.getAttribute("draggable")).toBe("true");
+    fireEvent.dragStart(handle, { dataTransfer: { setData: vi.fn(), setDragImage: vi.fn() } });
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    fireEvent.drop(box, { dataTransfer: { getData: () => "a" } });
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["b", "a"]),
+    );
+  });
+
   it("点击组名就地编辑，Enter 保存", async () => {
     const onUpdateGroup = vi.fn().mockResolvedValue(true);
     renderSidebar({ groups: boxGroups, onUpdateGroup });
@@ -1915,7 +1998,7 @@ describe("拖动会话进组", () => {
     const onSetGroupMembers = vi.fn().mockResolvedValue(true);
     const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
 
-    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const row = container.querySelector<HTMLElement>('[data-drag-handle="c"]')!;
     const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
     fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn(), effectAllowed: "" } });
     fireEvent.dragOver(box, { dataTransfer: { dropEffect: "" } });
@@ -1931,7 +2014,7 @@ describe("拖动会话进组", () => {
     const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
     fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
 
-    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const row = container.querySelector<HTMLElement>('[data-drag-handle="a"]')!;
     const ws = container.querySelector<HTMLElement>('[data-ws-header="/work/projA"]')!;
     fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
     fireEvent.drop(ws, { dataTransfer: { getData: () => "a" } });
@@ -1943,7 +2026,7 @@ describe("拖动会话进组", () => {
 
   it("拖到组框上时高亮该框", () => {
     const { container } = renderSidebar({ groups: dragBase });
-    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const row = container.querySelector<HTMLElement>('[data-drag-handle="c"]')!;
     const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
     fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
     fireEvent.dragOver(box, { dataTransfer: {} });
@@ -2004,3 +2087,4 @@ describe("分组功能的实验开关", () => {
     expect(ids).toEqual(["a", "b"]);
   });
 });
+
