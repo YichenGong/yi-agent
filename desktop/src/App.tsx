@@ -31,7 +31,7 @@ import type {
   WireUsage,
   WorkspaceGroup,
 } from "./lib/protocol";
-import { wireTotalsToTotals, wireUsageToUsage } from "./lib/protocol";
+import { NO_SUBAGENTS, wireTotalsToTotals, wireUsageToUsage } from "./lib/protocol";
 import { childrenOf, SubagentRailStore } from "./lib/subagents";
 import { applyTagChange, applyTitleChange } from "./lib/threadListUpdate";
 import { DEFAULT_TAG_NAMES, resolveTagNames, type TagId } from "./lib/threadTags";
@@ -2472,6 +2472,9 @@ export default function App() {
             }
             // 累计值是主体；`usage` 快照只作老服务端的兜底。
             totals={current?.session.usageTotals ?? null}
+            // subagent 累计：折叠态把它加进合计，展开面板分开显示。
+            subagentTotals={current?.session.subagentTotals ?? NO_SUBAGENTS}
+            subagentCount={sess.railRows.length}
             fallbackUsage={current?.session.usage ?? null}
             // 切换会话时数字直接跳终值，不从上一个会话滚过来。
             usageId={sess.currentId}

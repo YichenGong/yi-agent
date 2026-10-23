@@ -5,9 +5,28 @@ import { StatusBar } from "./StatusBar";
 
 afterEach(cleanup);
 
+/**
+ * 默认「没有 subagent」的 StatusBar。
+ *
+ * 几乎每个用例都只关心主会话那三个数字；把 subagent 两项收敛到这里，新增
+ * prop 时不必逐个调用点补。需要 subagent 的用例显式覆盖即可。
+ */
+function bar(
+  props: Omit<Parameters<typeof StatusBar>[0], "subagentTotals" | "subagentCount"> &
+    Partial<Pick<Parameters<typeof StatusBar>[0], "subagentTotals" | "subagentCount">>,
+) {
+  return (
+    <StatusBar
+      subagentTotals={{ input: 0, output: 0, cacheRead: 0 }}
+      subagentCount={0}
+      {...props}
+    />
+  );
+}
+
 describe("StatusBar", () => {
   it("renders the connection status and cwd", () => {
-    render(<StatusBar cwd="/w" status="connected" totals={null} fallbackUsage={null} />);
+    render(bar({ cwd: "/w", status: "connected", totals: null, fallbackUsage: null }));
     expect(screen.getByText("connected")).toBeTruthy();
     expect(screen.getByText("/w")).toBeTruthy();
   });
@@ -16,7 +35,7 @@ describe("StatusBar", () => {
     // 模型已从状态栏移出（改由会话输入区的下拉承担）。这里不再传任何 model，
     // 并钉死一段绝不会来自状态栏的模型字样。`toBeInTheDocument` 不可用
     // （本工作区没有 @testing-library/jest-dom），用等价的 `toBeNull`。
-    render(<StatusBar cwd="/w" status="connected" totals={null} fallbackUsage={null} />);
+    render(bar({ cwd: "/w", status: "connected", totals: null, fallbackUsage: null }));
     expect(screen.queryByText("claude-x")).toBeNull();
   });
 
@@ -24,34 +43,28 @@ describe("StatusBar", () => {
     // 手机端「状态栏单行」的 CSS 门禁（见 index.css 的
     // `[data-mobile="true"] .app-statusbar`）挂在根元素这个类名上：改名或漏加，
     // 用量文字就会在窄屏折行、把底栏再撑高。这里让 JS 侧与 CSS 侧的锚点对齐。
-    const { container } = render(<StatusBar cwd="/w" status="connected" totals={null} fallbackUsage={null} />);
+    const { container } = render(bar({ cwd: "/w", status: "connected", totals: null, fallbackUsage: null }));
     expect(container.firstElementChild?.className).toContain("app-statusbar");
   });
 
   it("offers a re-pair entry only when the host passes one", () => {
-    const { rerender } = render(<StatusBar cwd="/w" status="connecting" totals={null} fallbackUsage={null} />);
+    const { rerender } = render(bar({ cwd: "/w", status: "connecting", totals: null, fallbackUsage: null }));
     expect(screen.queryByRole("button", { name: "重新配对" })).toBeNull();
 
-    rerender(<StatusBar cwd="/w" status="connecting" totals={null} fallbackUsage={null} onRepair={() => {}} />);
+    rerender(bar({ cwd: "/w", status: "connecting", totals: null, fallbackUsage: null, onRepair: () => {} }));
     expect(screen.getByRole("button", { name: "重新配对" })).toBeTruthy();
   });
 
   it("invokes the re-pair callback when clicked", () => {
     const onRepair = vi.fn();
-    render(<StatusBar cwd="/w" status="connecting" totals={null} fallbackUsage={null} onRepair={onRepair} />);
+    render(bar({ cwd: "/w", status: "connecting", totals: null, fallbackUsage: null, onRepair: onRepair }));
     fireEvent.click(screen.getByRole("button", { name: "重新配对" }));
     expect(onRepair).toHaveBeenCalledTimes(1);
   });
 
   it("shows cumulative usage through rolling digits plus one screen-reader sentence", () => {
     const { container } = render(
-      <StatusBar
-        cwd="/w"
-        status="connected"
-        totals={{ input: 1_234_567, output: 8_900, cacheRead: 2_000_000, cacheWrite: 0 }}
-        fallbackUsage={null}
-        usageId="thread-1"
-      />,
+      bar({ cwd: "/w", status: "connected", totals: { input: 1_234_567, output: 8_900, cacheRead: 2_000_000, cacheWrite: 0 }, fallbackUsage: null, usageId: "thread-1" }),
     );
     // 折叠态是三组数字：累计 input / 累计 cache read / 累计 output。
     expect(container.querySelectorAll(".rolling-number")).toHaveLength(3);
@@ -72,15 +85,90 @@ describe("StatusBar", () => {
     expect(screen.getByRole("button", { name: "Token usage details" })).toBeTruthy();
   });
 
+  it("shows the sum of session and subagent usage when collapsed", () => {
+    const { container } = render(
+      bar({
+        cwd: "/w",
+        status: "connected",
+        totals: { input: 1_000, output: 100, cacheRead: 10_000, cacheWrite: 0 },
+        subagentTotals: { input: 500, output: 50, cacheRead: 5_000 },
+        subagentCount: 2,
+        fallbackUsage: null,
+        usageId: "thread-1",
+      }),
+    );
+    // 折叠态是合计：1000+500 / 10000+5000 / 100+50。
+    // 紧凑写法下 1.5k / 15.0k / 150 —— 直接读每个数字的完整文本更稳。
+    // 1.5k / 15.0k 有单位；150 是整数，单位为空因而没有对应节点。
+    const units = Array.from(container.querySelectorAll(".rolling-unit")).map((e) => e.textContent);
+    expect(units).toEqual(["k", "k"]);
+    // 读屏句子是精确值，用它钉死「合计」而不只是主会话：
+    // output 是 100+50=150（主会话单独的 100 会在这里露馅）。
+    const sentence = container.querySelector(".sr-only")?.textContent ?? "";
+    expect(sentence).toContain("1,500 cumulative input");
+    expect(sentence).toContain("15,000 cumulative cache read");
+    expect(sentence).toContain("150 cumulative output");
+    expect(sentence).toContain("including subagents, 2 subagents");
+  });
+
+  it("keeps the existing sentence when there are no subagents", () => {
+    const { container } = render(
+      bar({
+        cwd: "/w",
+        status: "connected",
+        totals: { input: 1_000, output: 100, cacheRead: 10_000, cacheWrite: 0 },
+        fallbackUsage: null,
+        usageId: "thread-1",
+      }),
+    );
+    expect(container.querySelector(".sr-only")?.textContent).toBe(
+      "1,000 cumulative input / 10,000 cumulative cache read / 100 cumulative output",
+    );
+  });
+
+  it("splits session and subagent usage in the expanded panel", () => {
+    render(
+      bar({
+        cwd: "/w",
+        status: "connected",
+        totals: { input: 1_000, output: 100, cacheRead: 10_000, cacheWrite: 0 },
+        subagentTotals: { input: 500, output: 50, cacheRead: 5_000 },
+        subagentCount: 2,
+        fallbackUsage: null,
+        usageId: "thread-1",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Token usage details" }));
+    // 两组标题都在，且各自的数字是分开的那一份。
+    expect(screen.getByText("Session")).toBeTruthy();
+    expect(screen.getByText("Subagents")).toBeTruthy();
+    expect(screen.getByText("1,000 tokens")).toBeTruthy();
+    expect(screen.getByText("500 tokens")).toBeTruthy();
+    expect(screen.getByText("5,000 tokens")).toBeTruthy();
+    // 成本只按主会话估：必须标注，否则会被读成合计。
+    expect(screen.getByText("（仅主会话）")).toBeTruthy();
+  });
+
+  it("hides the subagent section when there are no subagents", () => {
+    render(
+      bar({
+        cwd: "/w",
+        status: "connected",
+        totals: { input: 1_000, output: 100, cacheRead: 10_000, cacheWrite: 0 },
+        fallbackUsage: null,
+        usageId: "thread-1",
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Token usage details" }));
+    // 没有 subagent 就不留死行，也不出现成本限定语。
+    expect(screen.queryByText("Subagents")).toBeNull();
+    expect(screen.queryByText("Session")).toBeNull();
+    expect(screen.queryByText("（仅主会话）")).toBeNull();
+  });
+
   it("falls back to the last-call snapshot when the server sent no totals", () => {
     const { container } = render(
-      <StatusBar
-        cwd="/w"
-        status="connected"
-        totals={null}
-        fallbackUsage={{ model: "m", input: 1234, output: 5678, cacheRead: 10, cacheWrite: 0 }}
-        usageId="thread-1"
-      />,
+      bar({ cwd: "/w", status: "connected", totals: null, fallbackUsage: { model: "m", input: 1234, output: 5678, cacheRead: 10, cacheWrite: 0 }, usageId: "thread-1" }),
     );
     // 老服务端没有累计值：显示最后一轮的数，不是空白——但也不能冒充累计。
     expect(container.querySelectorAll(".rolling-number")).toHaveLength(3);
@@ -91,7 +179,7 @@ describe("StatusBar", () => {
 
   it("shows nothing when there is neither totals nor a snapshot", () => {
     const { container } = render(
-      <StatusBar cwd="/w" status="connected" totals={null} fallbackUsage={null} />,
+      bar({ cwd: "/w", status: "connected", totals: null, fallbackUsage: null }),
     );
     expect(container.querySelectorAll(".rolling-number")).toHaveLength(0);
     expect(screen.queryByRole("button", { name: "Token usage details" })).toBeNull();
@@ -99,13 +187,7 @@ describe("StatusBar", () => {
 
   it("opens the usage panel on click", () => {
     render(
-      <StatusBar
-        cwd="/w"
-        status="connected"
-        totals={{ input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }}
-        fallbackUsage={null}
-        usageId="thread-1"
-      />,
+      bar({ cwd: "/w", status: "connected", totals: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, fallbackUsage: null, usageId: "thread-1" }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Token usage details" }));
     expect(screen.getByRole("dialog")).toBeTruthy();
@@ -116,13 +198,7 @@ describe("StatusBar", () => {
     // 视口之外：面板撑高文档，右侧因此出现滚动条/黑边（真实 Chrome 实测 800x600
     // 时面板 bottom 超出视口 169px、文档溢出 169px）。必须向上（`bottom-full`）。
     const { container } = render(
-      <StatusBar
-        cwd="/w"
-        status="connected"
-        totals={{ input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }}
-        fallbackUsage={null}
-        usageId="thread-1"
-      />,
+      bar({ cwd: "/w", status: "connected", totals: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 }, fallbackUsage: null, usageId: "thread-1" }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Token usage details" }));
     const panel = container.querySelector("#usage-panel");
