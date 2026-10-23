@@ -657,6 +657,20 @@ pub struct IpcTask {
     pub state: String,
 }
 
+/// 一个 task 的累计用量（同一 task 的所有 attempt 求和）。
+///
+/// 只带展示要用的三项：input / output / cache read。cache write 不在用户口径内，
+/// 故既不记账也不传输。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IpcTaskUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IpcTaskSummary {
     pub task_id: String,
@@ -667,6 +681,10 @@ pub struct IpcTaskSummary {
     /// The conversation this task belongs to, when it was tagged with one.
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// 该 task 的累计用量。`serde(default)` 让不认识该字段的老客户端/老 daemon
+    /// 双向兼容：老 daemon 不回时读出全零，而不是解析失败。
+    #[serde(default)]
+    pub usage: IpcTaskUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3956,6 +3974,7 @@ fn respond(
                     is_root: task.is_root,
                     parent_task_id: task.parent_task_id,
                     thread_id: task.thread_id,
+                    usage: task.usage,
                 })
                 .collect();
             Ok(IpcResponse::TaskSummaries { tasks })
