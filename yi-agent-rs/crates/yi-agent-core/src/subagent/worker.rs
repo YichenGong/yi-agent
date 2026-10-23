@@ -376,6 +376,10 @@ pub enum WorkerWatchdogEvent {
     ProviderUsage {
         input_tokens: u64,
         output_tokens: u64,
+        /// 本次调用写进缓存的开销。目前**不落库**（用户口径只看 cache read），
+        /// 但随事件一起传，避免将来要记账时再动上报链路。
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
     },
     ProviderRetry,
     ToolRetry,
@@ -459,10 +463,21 @@ impl WorkerHandle {
 
     /// Records one completed provider turn. The runtime persists this as
     /// budget usage without treating generated model text as progress.
-    pub fn report_provider_usage(&self, input_tokens: u64, output_tokens: u64) {
+    ///
+    /// 四个分项都要传：`input + output` 仍折算成 watchdog 的 `tokens`，
+    /// `cache_read` 另立分项记账，`cache_creation` 目前只透传。
+    pub fn report_provider_usage(
+        &self,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_tokens: u64,
+        cache_read_tokens: u64,
+    ) {
         self.report_watchdog(WorkerWatchdogEvent::ProviderUsage {
             input_tokens,
             output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
         });
     }
 

@@ -2952,16 +2952,43 @@ impl RuntimeCoordinator {
                 .lock()
                 .expect("runtime repository mutex poisoned");
             let attempt = repository.active_attempt_id(&task_id)?;
-            let (turn_delta, token_delta, provider_retry_delta, tool_retry_delta, meaningful) =
-                match update {
-                    WorkerWatchdogEvent::ProviderUsage {
+            let (
+                turn_delta,
+                token_delta,
+                provider_retry_delta,
+                tool_retry_delta,
+                meaningful,
+                usage_delta,
+            ) = match update {
+                WorkerWatchdogEvent::ProviderUsage {
+                    input_tokens,
+                    output_tokens,
+                    // cache write 本次不统计（用户口径只关注 input/output/cache read）。
+                    // 保留在事件里是为了将来记账不需要再动上报链路。
+                    cache_creation_tokens: _,
+                    cache_read_tokens,
+                } => (
+                    1,
+                    input_tokens.saturating_add(output_tokens),
+                    0,
+                    0,
+                    false,
+                    WatchdogTokenDelta {
                         input_tokens,
                         output_tokens,
-                    } => (1, input_tokens.saturating_add(output_tokens), 0, 0, false),
-                    WorkerWatchdogEvent::ProviderRetry => (0, 0, 1, 0, false),
-                    WorkerWatchdogEvent::ToolRetry => (0, 0, 0, 1, false),
-                    WorkerWatchdogEvent::MeaningfulProgress => (0, 0, 0, 0, true),
-                };
+                        cache_read_tokens,
+                    },
+                ),
+                WorkerWatchdogEvent::ProviderRetry => {
+                    (0, 0, 1, 0, false, WatchdogTokenDelta::default())
+                }
+                WorkerWatchdogEvent::ToolRetry => {
+                    (0, 0, 0, 1, false, WatchdogTokenDelta::default())
+                }
+                WorkerWatchdogEvent::MeaningfulProgress => {
+                    (0, 0, 0, 0, true, WatchdogTokenDelta::default())
+                }
+            };
             repository.record_watchdog_progress(
                 &task_id,
                 &attempt,
@@ -2971,7 +2998,7 @@ impl RuntimeCoordinator {
                 tool_retry_delta,
                 meaningful,
                 Utc::now(),
-                WatchdogTokenDelta::default(),
+                usage_delta,
             )?;
         }
         for (task_id, message_id) in &consumed_overrides {

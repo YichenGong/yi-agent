@@ -2816,7 +2816,7 @@ async fn coordinator_persists_worker_usage_and_meaningful_progress() {
     let task = coordinator.root_task_id(&session).unwrap();
     coordinator.start_worker(&session, &task).await.unwrap();
 
-    factory.handles.lock().unwrap()[0].report_provider_usage(11, 5);
+    factory.handles.lock().unwrap()[0].report_provider_usage(11, 5, 3, 7);
     factory.handles.lock().unwrap()[0].report_provider_retry();
     factory.handles.lock().unwrap()[0].report_tool_retry();
     factory.handles.lock().unwrap()[0].report_meaningful_progress();
