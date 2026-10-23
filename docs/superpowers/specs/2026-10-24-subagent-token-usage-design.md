@@ -191,16 +191,27 @@ children 更新时重算，**不并入** `total_*`。
 ## 6. 会话级汇总
 
 `translator` 已有 `committed + turn + snapshot` 三段结构。subagent 的量不来自 provider 流，
-因此单独放一个字段，由 server 在 children 列表变化时调用：
+因此单独放一个字段，由 driver 在收到 children 汇总时调用：
 
 ```rust
-fn set_subagent_totals(&mut self, totals: UsageTotals) -> Notification
+fn set_subagent_totals(&mut self, totals: SubagentTotals) -> Notification
 ```
 
 它只更新 `self.subagent` 并回一条 `TokenUsage` 通知（`total_*` 不变，`subagent_*` 变化）。
 
-`/clear` 时 `reset_totals()` 必须同时把 `self.subagent` 归零，否则清空会话后旧 subagent
-数字会残留。归零后仍推一条通知，保证客户端不会显示陈旧值。
+**为什么必须经 driver 中转**：`watch_children` 是独立 task，拿不到 `translator` 里的
+`total_*`。若由它自己发 `TokenUsage`，会把客户端已正确的主会话累计覆盖成零。因此它只用
+`tokio::sync::watch::Sender<SubagentTotals>` 把汇总值送回 driver，由 driver 用自己那份
+translator 生成完整通知。选 `watch` 而非 `mpsc`：只保留最新值，`send_replace` 不阻塞、
+不积压。
+
+**`/clear` 的基线语义（重要）**：`/clear` 只截断会话日志（`thread_store.rs:862`），
+**不会删除 daemon 里的 task 记录**。所以清空后 children 列表仍带着旧 usage，若不处理，
+下一次 children 推送会把旧数字带回来。做法是：driver 维护一个基线，`/clear` 时把
+**当前收到的原始汇总**记为基线，此后上报 `原始 − 基线`（逐项饱和相减）。
+
+`reset_totals()` 仍必须把 `self.subagent` 归零并推一条通知，让客户端立刻清零，不必等
+下一次轮询；基线的存在保证那之后也不会被旧值污染。
 
 **空值语义（必须明确，避免两处实现分歧）**：`subagent_*` 恒为**具体数字**，不是
 `Optional`。没有 subagent 时就是三个 `0`。桌面端据此判断「是否展示 subagent 段」的条件
@@ -281,7 +292,8 @@ subagent cache read: 456,789
 | `usage_json` 缺新字段（老数据） | `serde(default)` 读出 0 |
 | children 轮询失败 | 沿用现有行为：跳过本轮，保留上次值 |
 | subagent 中途被杀 | 丢失最多一次调用的用量，可接受 |
-| `/clear` | subagent 累计一并归零（与主会话同一条通知） |
+| daemon 重启后任务被清理 | 当前汇总可能小于基线，饱和相减报 0，不回绕 |
+| `/clear` | subagent 累计一并归零；基线钉住 clear 前的量，旧值不会被下次推送带回 |
 | 会话切换 | 由 `usageId` 变化触发直接跳终值，不滚动 |
 
 **精度口径**（已确认）：subagent 在独立进程，经 500ms 轮询可见，因此累计值有最多约
