@@ -1970,18 +1970,6 @@ impl Harness {
         )
     }
 
-    /// 只打开会话分组开关：分组用例用它（组长保持关，两者互不相干）。
-    pub(crate) async fn with_groups() -> Self {
-        Self::with_config_and_flags(
-            test_config(),
-            build_test_agent,
-            PERMISSION_TIMEOUT,
-            Scope::Admin,
-            false,
-            true,
-        )
-    }
-
     /// 自定义 config + 分组开关：需要指定 cwd 的分组用例用它。
     pub(crate) async fn with_cfg_and_groups(cfg: RuntimeConfig) -> Self {
         Self::with_config_and_flags(
@@ -2114,7 +2102,7 @@ impl Harness {
             }),
             calls,
             lead_agent_enabled,
-            // 这个构造器只关心组长开关；分组开关的用例走 `with_groups`。
+            // 这个构造器只关心组长开关；分组开关的用例走 `with_cfg_and_groups`。
             false,
         )
     }
