@@ -163,6 +163,7 @@ export function ThreadSidebar({
   leadAgentEnabled = true,
   kanbanEnabled = true,
   groupsEnabled = true,
+  dragEnabled = true,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -241,6 +242,13 @@ export function ThreadSidebar({
    * 测试不传它。宿主（`App`）显式传 `=== true`，缺省值到不了生产。
    */
   groupsEnabled?: boolean;
+  /**
+   * 是否允许用行内手柄把会话拖进 / 拖出分组。
+   *
+   * 与 `groupsEnabled` 分开但同生同灭：分组关着时没有框可拖，宿主要把两者一起
+   * 传 `false`。缺省 `true`，与其它开关同一理由（既有用法不传它）。
+   */
+  dragEnabled?: boolean;
   /**
    * 整个 Superpowers 看板是否开启（`flags/list` 里的 `superpowers_kanban`）。
    *
@@ -542,6 +550,23 @@ export function ThreadSidebar({
    * 只用于 Shift 区间选择，取的是**渲染序**而非服务端序——两者在框内相同，
    * 但框让行序与 `threads` 不再一一对应，用户看到的是哪一个就该按哪一个选。
    */
+  /**
+   * Cmd/Ctrl + 点击：把一条会话加进 / 移出选择集。
+   *
+   * 抽成函数是因为**两种行**都要用它——普通行与组长行。组长行原先没接这个
+   * 分支，Cmd+点它会直接 `onSelect` 跳走：用户以为选中了三条，实际只记到
+   * 两条（现场报的「选了三个、按钮显示 2」）。
+   */
+  function toggleSelected(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+    setSelectionAnchor(id);
+  }
+
   const visibleThreadIds = useMemo(
     () =>
       groups.flatMap((g) =>
@@ -834,8 +859,10 @@ export function ThreadSidebar({
     const un = unread.get(t.thread_id);
     const isPinned = t.pinned ?? false;
     const dragging = opts.rowAttr === "pinned";
-    // 非置顶行也可拖，但只用于「进组 / 出组」：不参与置顶区排序。
-    const draggableRow = dragging || opts.rowAttr === "group";
+    // 进组/出组的拖拽**不能挂在整行上**：整行 `draggable` 后，macOS 上按下再
+    // 移动一两像素就触发原生 dragstart，浏览器随即不再派发 click——用户连点
+    // 三条只记到两条（现场反馈）。改由行尾的手柄发起，行本身保持可点。
+    const canDragIntoGroup = opts.rowAttr === "group" && dragEnabled;
     // 看板会话行多缩进一档（pl-7 vs pl-3）：折叠小节头是 ▸ 视觉起点，其下的
     // 会话若与直属行同一起点，就分不清谁属于谁。缩进让「小节头 → 卡片会话」的
     // 从属关系一眼可读。仅改左内边距，不影响拖拽/点击。
@@ -849,15 +876,9 @@ export function ThreadSidebar({
         key={t.thread_id}
         {...dataAttr}
         data-thread-row={t.thread_id}
-        // 编辑标题态不可拖（否则拖动会打断输入）。
-        draggable={draggableRow && editingId !== t.thread_id}
-        onDragStart={() => {
-          if (dragging) {
-            setDragId(t.thread_id);
-            return;
-          }
-          setDragThread(t.thread_id);
-        }}
+        // 只有置顶区的行整行可拖（那里拖拽就是重排）。进组拖拽走行内手柄。
+        draggable={dragging && editingId !== t.thread_id}
+        onDragStart={dragging ? () => setDragId(t.thread_id) : undefined}
         onDragOver={
           dragging
             ? (e) => {
@@ -892,13 +913,7 @@ export function ThreadSidebar({
           // 会把那次加选直接吞掉——多选两条、最后只进去一条。
           if (e.metaKey || e.ctrlKey) {
             e.preventDefault();
-            setSelected((prev) => {
-              const next = new Set(prev);
-              if (next.has(t.thread_id)) next.delete(t.thread_id);
-              else next.add(t.thread_id);
-              return next;
-            });
-            setSelectionAnchor(t.thread_id);
+            toggleSelected(t.thread_id);
             return;
           }
           if (e.shiftKey && selectionAnchor) {
@@ -1010,6 +1025,33 @@ export function ThreadSidebar({
                 title="Unread result"
                 className={`size-2 shrink-0 rounded-full ${unreadDotClass(un)}`}
               />
+            )}
+            {canDragIntoGroup && (
+              /*
+                拖拽手柄。挂在整行上会让原生拖拽吞掉 click（见 `canDragIntoGroup`
+                的注释），所以只在这一小块上开 `draggable`。`onDragStart` 里
+                `setDragThread` 与 `dataTransfer` 都设上：前者驱动落点高亮，
+                后者让 macOS 的拖拽会话有内容可带（否则某些 WebKit 版本直接取消）。
+              */
+              <span
+                data-drag-handle={t.thread_id}
+                draggable
+                aria-hidden="true"
+                title="拖到分组里"
+                onDragStart={(e) => {
+                  e.stopPropagation();
+                  e.dataTransfer.effectAllowed = "move";
+                  e.dataTransfer.setData("text/plain", t.thread_id);
+                  setDragThread(t.thread_id);
+                }}
+                onDragEnd={() => {
+                  setDragThread(null);
+                  setGroupDropTarget(null);
+                }}
+                className="shrink-0 cursor-grab rounded px-0.5 text-fg-faint opacity-0 group-hover:opacity-100 hover:text-fg-muted"
+              >
+                ⠿
+              </span>
             )}
             <button
               type="button"
@@ -1268,7 +1310,19 @@ export function ThreadSidebar({
         data-thread-row={t.thread_id}
         onClick={(e) => {
           if (editingId) return;
+          // 与普通会话行同一套多选语义：多选是"临时搭建的动作上下文"，
+          // 组长行没有理由例外——它也是一条会话。
+          if (e.metaKey || e.ctrlKey) {
+            e.preventDefault();
+            toggleSelected(t.thread_id);
+            return;
+          }
           if (e.detail > 1) return;
+          if (selected.size > 0) {
+            setSelected(new Set());
+            setSelectionAnchor(null);
+            return;
+          }
           onSelect(t.thread_id);
         }}
         className={`group relative flex items-center justify-between gap-1 pl-3 py-2 text-sm ${

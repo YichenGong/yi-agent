@@ -2262,6 +2262,8 @@ export default function App() {
           leadAgentEnabled={leadAgentEnabled === true}
           kanbanEnabled={kanbanEnabled === true}
           groupsEnabled={groupsEnabled === true}
+          // 拖拽只在分组开着时有意义（没有框可拖）。同源传，避免两处判断漂移。
+          dragEnabled={groupsEnabled === true}
         />
         </div>
         <div className="app-main relative flex min-w-0 flex-1 flex-col">
