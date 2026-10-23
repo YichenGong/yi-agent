@@ -10,7 +10,9 @@ use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionReq
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 
-use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
+use crate::schedule::{
+    ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogTokenDelta, WatchdogUsage,
+};
 use crate::terminal::text_completion_report;
 
 const LATEST_SCHEMA_VERSION: i64 = 15;
@@ -1263,6 +1265,7 @@ impl RuntimeRepository {
         tool_retry_delta: u16,
         meaningful: bool,
         now: DateTime<Utc>,
+        usage_delta: WatchdogTokenDelta,
     ) -> Result<(), RepositoryError> {
         let transaction = self
             .connection
@@ -1286,6 +1289,15 @@ impl RuntimeRepository {
         })?;
         usage.turns = usage.turns.saturating_add(turn_delta);
         usage.tokens = usage.tokens.saturating_add(token_delta);
+        // 分项记账。与上面的 `tokens` 是两回事：`tokens` 仍是 input+output 的合计
+        // （预算判断依赖它），这三项是给会话级展示按项拆开用的。
+        usage.input_tokens = usage.input_tokens.saturating_add(usage_delta.input_tokens);
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(usage_delta.output_tokens);
+        usage.cache_read_tokens = usage
+            .cache_read_tokens
+            .saturating_add(usage_delta.cache_read_tokens);
         usage.provider_retries = usage.provider_retries.saturating_add(provider_retry_delta);
         usage.tool_retries = usage.tool_retries.saturating_add(tool_retry_delta);
         let progress_event_id = meaningful
@@ -1308,6 +1320,23 @@ impl RuntimeRepository {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// 读取某次 attempt 的用量快照。上层聚合与测试共用。
+    pub fn watchdog_usage(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+    ) -> Result<WatchdogUsage, RepositoryError> {
+        let json: String = self.connection.query_row(
+            "SELECT usage_json FROM attempt_watchdogs WHERE task_id = ?1 AND attempt_id = ?2",
+            params![task.to_string(), attempt.to_string()],
+            |row| row.get(0),
+        )?;
+        serde_json::from_str(&json).map_err(|error| RepositoryError::InvalidWatchdogSnapshot {
+            attempt: attempt.to_string(),
+            reason: format!("invalid usage JSON: {error}"),
+        })
     }
 
     /// Returns watchdog facts only for the currently active attempt of a task
@@ -4342,6 +4371,72 @@ mod tests {
             .create_task_with_attempt(&task, &session, &attempt, 1, "running")
             .unwrap();
         (session, task, attempt)
+    }
+
+    /// `usage_json` 是自由格式 JSON 文本列，本次加字段不能要求迁移：本次改造前
+    /// 落盘的快照没有这三个键，读出来必须是 0 而不是反序列化失败。
+    #[test]
+    fn watchdog_usage_without_breakdown_fields_reads_as_zero() {
+        let legacy = r#"{"turns":2,"tokens":300,"cost_micros":5,"provider_retries":1,"tool_retries":0,"rework_cycles":0}"#;
+        let usage: WatchdogUsage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(usage.tokens, 300);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, 0);
+    }
+
+    /// `record_watchdog_progress` 累加三个分项，同时**不改变** `tokens` 语义：
+    /// 后者仍是 input+output 之和，watchdog 的预算判断依赖它。
+    #[test]
+    fn record_watchdog_progress_accumulates_token_breakdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let (_session, task, attempt) = seed_running_task(&mut repository);
+
+        // 第一次调用：input 40 / output 10 / cache read 900，tokens 记 50。
+        repository
+            .record_watchdog_progress(
+                &task,
+                &attempt,
+                1,
+                50,
+                0,
+                0,
+                false,
+                Utc::now(),
+                WatchdogTokenDelta {
+                    input_tokens: 40,
+                    output_tokens: 10,
+                    cache_read_tokens: 900,
+                },
+            )
+            .unwrap();
+        // 第二次：再累加一次，验证是"累加"而不是"覆盖"。
+        repository
+            .record_watchdog_progress(
+                &task,
+                &attempt,
+                1,
+                30,
+                0,
+                0,
+                false,
+                Utc::now(),
+                WatchdogTokenDelta {
+                    input_tokens: 25,
+                    output_tokens: 5,
+                    cache_read_tokens: 100,
+                },
+            )
+            .unwrap();
+
+        let usage = repository.watchdog_usage(&task, &attempt).unwrap();
+        assert_eq!(usage.input_tokens, 65);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.cache_read_tokens, 1000);
+        // 语义锁死：tokens 仍只跟 token_delta 走（input+output），不含 cache read。
+        assert_eq!(usage.tokens, 80);
     }
 
     #[test]

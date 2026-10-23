@@ -39,7 +39,7 @@ use crate::repository::{
     RepositoryError, RuntimeEvent, RuntimeRepository, ScheduleOccurrenceResult, WatchdogEvidence,
     WatchdogTerminal,
 };
-use crate::schedule::{MissedRunPolicy, WatchdogOutcome, evaluate_watchdog};
+use crate::schedule::{MissedRunPolicy, WatchdogOutcome, WatchdogTokenDelta, evaluate_watchdog};
 use crate::terminal::text_completion_report;
 
 /// The largest fork payload a daemon accepts when `YI_AGENT_FORK_MAX_BYTES` is
@@ -2971,6 +2971,7 @@ impl RuntimeCoordinator {
                 tool_retry_delta,
                 meaningful,
                 Utc::now(),
+                WatchdogTokenDelta::default(),
             )?;
         }
         for (task_id, message_id) in &consumed_overrides {
