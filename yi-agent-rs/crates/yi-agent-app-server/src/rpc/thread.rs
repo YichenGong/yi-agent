@@ -564,6 +564,10 @@ pub(crate) async fn handle(
             // 同一 `Arc` 句柄:session 存一份供 `thread/list` 读,
             // driver 拿一份用于推送 `thread/status/updated`。
             let store_status = ThreadSession::new_status();
+            // 与 driver 同处创建：resume 会重建 driver，跨 resume 复用 sender
+            // 会让新 driver 永远收不到（旧 sender 的接收端已随旧 driver 退出）。
+            let (subagent_tx, subagent_rx) =
+                tokio::sync::watch::channel(crate::protocol::SubagentTotals::default());
             state.threads.insert(
                 thread_id.clone(),
                 ThreadSession {
@@ -579,6 +583,7 @@ pub(crate) async fn handle(
                     session_tx,
                     store: Arc::clone(&thread_store),
                     status: Arc::clone(&store_status),
+                    subagent_tx,
                 },
             );
 
@@ -622,6 +627,7 @@ pub(crate) async fn handle(
                 Arc::clone(&store_status),
                 provider,
                 config,
+                subagent_rx,
             ));
 
             // 回放:thread/started → 若干批量 items/completed → 最近用量 → 响应。
@@ -669,6 +675,12 @@ pub(crate) async fn handle(
                         total_output_tokens: totals.output_tokens,
                         total_cache_creation_input_tokens: totals.cache_creation_input_tokens,
                         total_cache_read_input_tokens: totals.cache_read_input_tokens,
+                        // 回放不带 subagent 汇总：它由 children watch 在会话恢复后
+                        // 推送（Task 5）。这里给 0 而不是省略字段，客户端因此不必
+                        // 处理「缺失」这一种额外状态。
+                        subagent_input_tokens: 0,
+                        subagent_output_tokens: 0,
+                        subagent_cache_read_tokens: 0,
                     },
                 )
                 .await?;

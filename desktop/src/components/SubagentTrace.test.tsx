@@ -8,7 +8,14 @@ import type { AgentTraceRow } from "../lib/protocol";
 afterEach(cleanup);
 
 const child = (taskId: string, state: string, lastStep?: string) =>
-  toRow({ taskId, state, objective: `objective of ${taskId}`, lastStep, parentTaskId: "root" });
+  toRow({
+    taskId,
+    state,
+    objective: `objective of ${taskId}`,
+    lastStep,
+    parentTaskId: "root",
+    usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
+  });
 
 const textRow = (eventId: number, text: string): AgentTraceRow => ({
   eventId,

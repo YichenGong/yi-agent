@@ -2685,6 +2685,7 @@ fn summary(
         is_root: false,
         parent_task_id: Some("root".into()),
         thread_id: thread_id.map(str::to_string),
+        usage: yi_agent_store::ipc::IpcTaskUsage::default(),
     }
 }
 
@@ -2716,6 +2717,95 @@ fn children_are_scoped_by_the_conversation_marker() {
         children_for_thread(&tasks, "thread-c").is_empty(),
         "a conversation with no children lists none"
     );
+}
+
+/// 子任务列表项携带它自己的累计用量。
+#[test]
+fn children_for_thread_carries_task_usage() {
+    let mut task = summary("child-1", "running", Some("thread-a"));
+    task.usage = yi_agent_store::ipc::IpcTaskUsage {
+        input_tokens: 1_200,
+        output_tokens: 34,
+        cache_read_tokens: 56_000,
+    };
+    let children = children_for_thread(&[task], "thread-a");
+    assert_eq!(children.len(), 1);
+    assert_eq!(
+        children[0].usage,
+        crate::protocol::AgentChildUsage {
+            input_tokens: 1_200,
+            output_tokens: 34,
+            cache_read_tokens: 56_000,
+        }
+    );
+}
+
+/// 汇总对整份列表求和：已完成的子任务烧掉的 token 同样是这个会话的开销。
+#[test]
+fn subagent_totals_sums_every_child() {
+    let child = |input, output, cache_read| crate::protocol::AgentChild {
+        task_id: "x".into(),
+        objective: None,
+        state: "completed".into(),
+        last_step: None,
+        parent_task_id: Some("root".into()),
+        usage: crate::protocol::AgentChildUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+        },
+    };
+    let children = vec![child(10, 1, 100), child(20, 2, 200)];
+    assert_eq!(
+        subagent_totals(&children),
+        SubagentTotals {
+            input: 30,
+            output: 3,
+            cache_read: 300,
+        }
+    );
+    // 空列表是零，不是错误。
+    assert_eq!(subagent_totals(&[]), SubagentTotals::default());
+}
+
+/// `/clear` 之后要把 clear 之前的量扣掉：daemon 的 task 记录不会随 clear 删除，
+/// 不扣的话旧数字会被下一次 children 推送带回来。
+#[test]
+fn subagent_baseline_subtracts_cleared_usage() {
+    let raw = SubagentTotals {
+        input: 900,
+        output: 90,
+        cache_read: 8000,
+    };
+    let baseline = SubagentTotals {
+        input: 400,
+        output: 40,
+        cache_read: 3000,
+    };
+    assert_eq!(
+        raw.saturating_sub(baseline),
+        SubagentTotals {
+            input: 500,
+            output: 50,
+            cache_read: 5000,
+        }
+    );
+}
+
+/// daemon 重启 / 任务被清理都可能让当前值短暂小于基线：报 0，不许回绕。
+#[test]
+fn subagent_baseline_never_underflows() {
+    let raw = SubagentTotals {
+        input: 10,
+        output: 1,
+        cache_read: 5,
+    };
+    let baseline = SubagentTotals {
+        input: 900,
+        output: 90,
+        cache_read: 8000,
+    };
+    assert_eq!(raw.saturating_sub(baseline), SubagentTotals::default());
 }
 
 /// A root task is never a child, even when it carries the marker.
@@ -2758,6 +2848,11 @@ fn the_agent_notifications_use_their_documented_wire_shape() {
             state: "running".into(),
             last_step: Some("running tests".into()),
             parent_task_id: Some("root".into()),
+            usage: crate::protocol::AgentChildUsage {
+                input_tokens: 1_200,
+                output_tokens: 34,
+                cache_read_tokens: 56_000,
+            },
         }],
     };
     let json = serde_json::to_value(&children).unwrap();
@@ -2765,6 +2860,13 @@ fn the_agent_notifications_use_their_documented_wire_shape() {
     assert_eq!(json["params"]["threadId"], "thread-1");
     assert_eq!(json["params"]["children"][0]["taskId"], "task-1");
     assert_eq!(json["params"]["children"][0]["lastStep"], "running tests");
+    // 用量走 camelCase，与列表里其它字段一致。
+    assert_eq!(json["params"]["children"][0]["usage"]["inputTokens"], 1_200);
+    assert_eq!(json["params"]["children"][0]["usage"]["outputTokens"], 34);
+    assert_eq!(
+        json["params"]["children"][0]["usage"]["cacheReadTokens"],
+        56_000
+    );
 
     let event = Notification::AgentTraceEvent {
         thread_id: "thread-1".into(),
@@ -5981,6 +6083,7 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             session_tx,
             store: Arc::new(crate::thread_store::ThreadStore::new(warm.path())),
             status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
+            subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
         },
     );
 
@@ -6797,6 +6900,7 @@ async fn driver_ignores_interrupt_tagged_with_other_turn() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
     ));
 
     // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -6925,6 +7029,7 @@ async fn driver_reports_finished_when_writer_fails() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
     ));
 
     prompt_tx
@@ -7000,6 +7105,7 @@ async fn idle_driver_serves_a_session_command_without_a_new_turn() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
     ));
 
     // 没有任何 turn/start:直接投一条 compact,必须在有限时间内拿到回复。
@@ -7897,6 +8003,7 @@ async fn idle_driver_serves_a_set_model_command_without_a_new_turn() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
     ));
 
     let mut effective = crate::test_support::test_config();
@@ -7966,6 +8073,7 @@ async fn driver_uses_unique_item_ids_across_turns() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
     ));
 
     let mut client_r = BufReader::new(client_r);
@@ -8504,6 +8612,7 @@ async fn stale_interrupt_does_not_cancel_turn_during_approval() {
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
     ));
 
     prompt_tx
@@ -9996,6 +10105,7 @@ fn tick_test_session(project: &Path, thread_id: &str, status: ThreadStatus) -> T
         session_tx,
         store: Arc::new(crate::thread_store::ThreadStore::new(project)),
         status: Arc::new(StdMutex::new(status)),
+        subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
     }
 }
 
@@ -11352,6 +11462,7 @@ async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_appr
         ThreadSession::new_status(),
         built.provider,
         built.config,
+        tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
     ));
 
     prompt_tx

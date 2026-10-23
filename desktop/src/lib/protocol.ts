@@ -169,6 +169,28 @@ export interface UsageTotals {
   cacheWrite: number;
 }
 
+/**
+ * 本会话所有 subagent 的累计用量（客户端形状）。
+ *
+ * 与 {@link UsageTotals} 刻意分开：不含 `cacheWrite`（用户口径只看 cache read），
+ * 也**不**并入 `UsageTotals`——`/usage` 与展开面板要把主会话与子 agent 分开显示。
+ * 恒为具体数字，没有 subagent 时是三个 0（用 `> 0` 判断是否展示）。
+ */
+export interface SubagentTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+}
+
+/** 没有 subagent 时的零值。常量而非每次新建，便于 `===` 之外的浅比较稳定。 */
+export const NO_SUBAGENTS: SubagentTotals = { input: 0, output: 0, cacheRead: 0 };
+
+/** 三项之和是否为正——即「这个会话到底有没有 subagent 用量」。 */
+export function hasSubagentUsage(t: SubagentTotals | null | undefined): boolean {
+  if (!t) return false;
+  return t.input + t.output + t.cacheRead > 0;
+}
+
 /** `thread/readItems` 回包里的累计用量（线形状）。 */
 export interface WireTotals {
   input_tokens: number;

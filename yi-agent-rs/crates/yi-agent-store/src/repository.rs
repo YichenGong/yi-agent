@@ -10,7 +10,9 @@ use yi_agent_core::subagent::task::{MessageId, PermissionDecision, PermissionReq
 use yi_agent_core::subagent::worker::{WorkerRecoveryAttestation, WorkerRecoveryContext};
 use yi_agent_core::{AttemptId, ChildWriteMode, InheritedSandbox, RootSessionId, TaskId};
 
-use crate::schedule::{ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogUsage};
+use crate::schedule::{
+    ScheduleDefinition, WatchdogLimits, WatchdogObservation, WatchdogTokenDelta, WatchdogUsage,
+};
 use crate::terminal::text_completion_report;
 
 const LATEST_SCHEMA_VERSION: i64 = 15;
@@ -336,6 +338,10 @@ pub struct PersistedTaskSummary {
     /// The conversation this task belongs to, when it was tagged with one.
     /// Lets a reader scope tasks to a conversation without a second query.
     pub thread_id: Option<String>,
+    /// 该 task 所有 attempt 的累计用量。
+    ///
+    /// 按 task 聚合而非取最后一次：重试是真实消耗，只算最新一次会低估。
+    pub usage: crate::ipc::IpcTaskUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1263,6 +1269,7 @@ impl RuntimeRepository {
         tool_retry_delta: u16,
         meaningful: bool,
         now: DateTime<Utc>,
+        usage_delta: WatchdogTokenDelta,
     ) -> Result<(), RepositoryError> {
         let transaction = self
             .connection
@@ -1286,6 +1293,15 @@ impl RuntimeRepository {
         })?;
         usage.turns = usage.turns.saturating_add(turn_delta);
         usage.tokens = usage.tokens.saturating_add(token_delta);
+        // 分项记账。与上面的 `tokens` 是两回事：`tokens` 仍是 input+output 的合计
+        // （预算判断依赖它），这三项是给会话级展示按项拆开用的。
+        usage.input_tokens = usage.input_tokens.saturating_add(usage_delta.input_tokens);
+        usage.output_tokens = usage
+            .output_tokens
+            .saturating_add(usage_delta.output_tokens);
+        usage.cache_read_tokens = usage
+            .cache_read_tokens
+            .saturating_add(usage_delta.cache_read_tokens);
         usage.provider_retries = usage.provider_retries.saturating_add(provider_retry_delta);
         usage.tool_retries = usage.tool_retries.saturating_add(tool_retry_delta);
         let progress_event_id = meaningful
@@ -1308,6 +1324,23 @@ impl RuntimeRepository {
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// 读取某次 attempt 的用量快照。上层聚合与测试共用。
+    pub fn watchdog_usage(
+        &self,
+        task: &TaskId,
+        attempt: &AttemptId,
+    ) -> Result<WatchdogUsage, RepositoryError> {
+        let json: String = self.connection.query_row(
+            "SELECT usage_json FROM attempt_watchdogs WHERE task_id = ?1 AND attempt_id = ?2",
+            params![task.to_string(), attempt.to_string()],
+            |row| row.get(0),
+        )?;
+        serde_json::from_str(&json).map_err(|error| RepositoryError::InvalidWatchdogSnapshot {
+            attempt: attempt.to_string(),
+            reason: format!("invalid usage JSON: {error}"),
+        })
     }
 
     /// Returns watchdog facts only for the currently active attempt of a task
@@ -3416,7 +3449,7 @@ impl RuntimeRepository {
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
-        statement
+        let mut summaries = statement
             .query_map(rusqlite::params_from_iter(parameters), |row| {
                 Ok(PersistedTaskSummary {
                     task_id: row.get(0)?,
@@ -3424,10 +3457,67 @@ impl RuntimeRepository {
                     is_root: row.get(2)?,
                     parent_task_id: row.get(3)?,
                     thread_id: row.get(4)?,
+                    usage: crate::ipc::IpcTaskUsage::default(),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(RepositoryError::Sql)
+            .map_err(RepositoryError::Sql)?;
+
+        // 用量按 task 聚合后挂上。单开一次查询而不是写进上面的 SQL：分项存在
+        // `attempt_watchdogs.usage_json`（JSON 文本）里，SQL 求和不了，只能在
+        // Rust 侧解析；一次批量取回避免 N+1。
+        let ids: Vec<String> = summaries.iter().map(|s| s.task_id.clone()).collect();
+        let usages = self.attempt_usages_for_tasks(&ids)?;
+        for summary in &mut summaries {
+            if let Some(usage) = usages.get(&summary.task_id) {
+                summary.usage = *usage;
+            }
+        }
+        Ok(summaries)
+    }
+
+    /// 按 task 聚合其所有 attempt 的用量分项。
+    ///
+    /// 一个 task 可以有多次 attempt（重试），用量记在 attempt 上，所以必须 `SUM`
+    /// 而不是取最后一次——重试烧掉的 token 同样是真实开销。
+    fn attempt_usages_for_tasks(
+        &self,
+        task_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::ipc::IpcTaskUsage>, RepositoryError> {
+        let mut totals: std::collections::HashMap<String, crate::ipc::IpcTaskUsage> =
+            std::collections::HashMap::new();
+        if task_ids.is_empty() {
+            return Ok(totals);
+        }
+        // `IN (?1, ?2, ...)` 的占位符按需生成：sqlite 不支持用单个参数展开数组。
+        let placeholders = (1..=task_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT task_id, usage_json FROM attempt_watchdogs WHERE task_id IN ({placeholders})"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(task_ids.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RepositoryError::Sql)?;
+        for (task_id, usage_json) in rows {
+            // 解析失败的 attempt 跳过而不是整个查询失败：一行坏数据不该让整个
+            // 子任务列表消失（列表本身还有状态等其它信息要展示）。
+            let Ok(usage) = serde_json::from_str::<WatchdogUsage>(&usage_json) else {
+                continue;
+            };
+            let entry = totals.entry(task_id).or_default();
+            entry.input_tokens = entry.input_tokens.saturating_add(usage.input_tokens);
+            entry.output_tokens = entry.output_tokens.saturating_add(usage.output_tokens);
+            entry.cache_read_tokens = entry
+                .cache_read_tokens
+                .saturating_add(usage.cache_read_tokens);
+        }
+        Ok(totals)
     }
 
     /// Returns a task and, when requested, all descendants in stable tree order.
@@ -4342,6 +4432,158 @@ mod tests {
             .create_task_with_attempt(&task, &session, &attempt, 1, "running")
             .unwrap();
         (session, task, attempt)
+    }
+
+    /// 同一 task 的多次 attempt 用量必须**求和**：重试是真实消耗，只算最后一次
+    /// 会低估这个子任务真正烧掉的钱。
+    #[test]
+    fn task_summaries_sum_usage_across_attempts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let session = RootSessionId::new();
+        let task = TaskId::new();
+        // 第一次 attempt。
+        let attempt_one = AttemptId::new();
+        repository
+            .create_task_with_attempt(&task, &session, &attempt_one, 1, "running")
+            .unwrap();
+        repository
+            .record_watchdog_progress(
+                &task,
+                &attempt_one,
+                1,
+                50,
+                0,
+                0,
+                false,
+                Utc::now(),
+                WatchdogTokenDelta {
+                    input_tokens: 40,
+                    output_tokens: 10,
+                    cache_read_tokens: 900,
+                },
+            )
+            .unwrap();
+        // 重试：走生产的 successor 路径建第二个 attempt，带自己的记账。
+        let attempt_two = AttemptId::new();
+        repository
+            .activate_successor_attempt(
+                &task,
+                &attempt_two,
+                2,
+                "running",
+                RuntimeEvent::TaskStarted,
+            )
+            .unwrap();
+        repository
+            .record_watchdog_progress(
+                &task,
+                &attempt_two,
+                1,
+                30,
+                0,
+                0,
+                false,
+                Utc::now(),
+                WatchdogTokenDelta {
+                    input_tokens: 25,
+                    output_tokens: 5,
+                    cache_read_tokens: 100,
+                },
+            )
+            .unwrap();
+
+        let summaries = repository.task_summaries(Some(&session), false).unwrap();
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.task_id == task.to_string())
+            .expect("the task must be listed");
+
+        assert_eq!(summary.usage.input_tokens, 65);
+        assert_eq!(summary.usage.output_tokens, 15);
+        assert_eq!(summary.usage.cache_read_tokens, 1000);
+    }
+
+    /// 没有任何 attempt 记账的 task 读到全零，而不是缺行或报错。
+    #[test]
+    fn task_summaries_default_usage_to_zero_without_watchdog_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let session = RootSessionId::new();
+        let task = TaskId::new();
+        repository.create_task(&task, &session, "queued").unwrap();
+
+        let summaries = repository.task_summaries(Some(&session), false).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].usage, crate::ipc::IpcTaskUsage::default());
+    }
+
+    /// `usage_json` 是自由格式 JSON 文本列，本次加字段不能要求迁移：本次改造前
+    /// 落盘的快照没有这三个键，读出来必须是 0 而不是反序列化失败。
+    #[test]
+    fn watchdog_usage_without_breakdown_fields_reads_as_zero() {
+        let legacy = r#"{"turns":2,"tokens":300,"cost_micros":5,"provider_retries":1,"tool_retries":0,"rework_cycles":0}"#;
+        let usage: WatchdogUsage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(usage.tokens, 300);
+        assert_eq!(usage.input_tokens, 0);
+        assert_eq!(usage.output_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, 0);
+    }
+
+    /// `record_watchdog_progress` 累加三个分项，同时**不改变** `tokens` 语义：
+    /// 后者仍是 input+output 之和，watchdog 的预算判断依赖它。
+    #[test]
+    fn record_watchdog_progress_accumulates_token_breakdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut repository =
+            RuntimeRepository::open(directory.path().join("runtime.sqlite")).unwrap();
+        let (_session, task, attempt) = seed_running_task(&mut repository);
+
+        // 第一次调用：input 40 / output 10 / cache read 900，tokens 记 50。
+        repository
+            .record_watchdog_progress(
+                &task,
+                &attempt,
+                1,
+                50,
+                0,
+                0,
+                false,
+                Utc::now(),
+                WatchdogTokenDelta {
+                    input_tokens: 40,
+                    output_tokens: 10,
+                    cache_read_tokens: 900,
+                },
+            )
+            .unwrap();
+        // 第二次：再累加一次，验证是"累加"而不是"覆盖"。
+        repository
+            .record_watchdog_progress(
+                &task,
+                &attempt,
+                1,
+                30,
+                0,
+                0,
+                false,
+                Utc::now(),
+                WatchdogTokenDelta {
+                    input_tokens: 25,
+                    output_tokens: 5,
+                    cache_read_tokens: 100,
+                },
+            )
+            .unwrap();
+
+        let usage = repository.watchdog_usage(&task, &attempt).unwrap();
+        assert_eq!(usage.input_tokens, 65);
+        assert_eq!(usage.output_tokens, 15);
+        assert_eq!(usage.cache_read_tokens, 1000);
+        // 语义锁死：tokens 仍只跟 token_delta 走（input+output），不含 cache read。
+        assert_eq!(usage.tokens, 80);
     }
 
     #[test]

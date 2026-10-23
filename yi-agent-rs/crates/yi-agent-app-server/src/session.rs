@@ -146,6 +146,11 @@ pub struct ThreadSession {
     /// `thread/status/updated`，主循环在 `thread/list(:All)` 里读取。用共享句柄
     /// 而非 `TurnEvent`，避免扰动 `interrupt_and_wait_for_persist` 的收事件循环。
     pub status: Arc<Mutex<ThreadStatus>>,
+    /// 该会话 subagent 用量的最新汇总。`watch_children` 写，driver 读。
+    ///
+    /// 用 `watch` 而非 `mpsc`：只关心最新值，且写端在独立 task 里，
+    /// `send_replace` 既不阻塞也不积压。
+    pub(crate) subagent_tx: tokio::sync::watch::Sender<crate::protocol::SubagentTotals>,
 }
 
 impl ThreadSession {

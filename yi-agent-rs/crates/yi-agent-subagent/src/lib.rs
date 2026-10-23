@@ -960,9 +960,18 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
                                     },
                                     event = stream.next() => match event {
                                         Some(AgentEvent::Usage { usage, .. }) => {
+                                            // 四个分项全带上：worker 是子任务的用量源头，
+                                            // 只报 input+output 会让 cache read 在这一层就丢失。
+                                            // `cache_*` 是 Option：老 provider 不回该字段。
                                             reporter.report_provider_usage(
                                                 u64::from(usage.input_tokens),
                                                 u64::from(usage.output_tokens),
+                                                u64::from(
+                                                    usage.cache_creation_input_tokens.unwrap_or(0),
+                                                ),
+                                                u64::from(
+                                                    usage.cache_read_input_tokens.unwrap_or(0),
+                                                ),
                                             );
                                         }
                                         Some(AgentEvent::AssistantText(text)) => {
@@ -3146,6 +3155,10 @@ mod tests {
                 ProviderEvent::Usage(TokenUsage {
                     input_tokens: 11,
                     output_tokens: 5,
+                    // 非零的 cache 分项：断言它们真的被带到 watchdog 事件里，
+                    // 而不是在 worker 这一层被丢掉。
+                    cache_creation_input_tokens: Some(3),
+                    cache_read_input_tokens: Some(7),
                     ..TokenUsage::default()
                 }),
                 ProviderEvent::Stop {
@@ -4391,6 +4404,8 @@ mod tests {
             vec![WorkerWatchdogEvent::ProviderUsage {
                 input_tokens: 11,
                 output_tokens: 5,
+                cache_creation_tokens: 3,
+                cache_read_tokens: 7,
             }]
         );
     }
