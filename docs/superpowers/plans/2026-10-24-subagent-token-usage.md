@@ -59,7 +59,7 @@
   - `Repository::record_watchdog_progress(&mut self, task: &TaskId, attempt: &AttemptId, turn_delta: u32, token_delta: u64, provider_retry_delta: u16, tool_retry_delta: u16, meaningful: bool, now: DateTime<Utc>, usage_delta: WatchdogTokenDelta) -> Result<(), RepositoryError>`
   - `WatchdogTokenDelta { input_tokens: u64, output_tokens: u64, cache_read_tokens: u64 }`（定义在 `schedule.rs`）
 
-- [ ] **Step 1: 写失败测试 —— 老 JSON 缺新字段时读出 0**
+- [x] **Step 1: 写失败测试 —— 老 JSON 缺新字段时读出 0**
 
 在 `crates/yi-agent-store/src/schedule.rs` 末尾的测试模块加：
 
@@ -77,7 +77,7 @@ fn watchdog_usage_reads_legacy_json_without_token_breakdown() {
 }
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 cd .worktrees/subagent-usage/yi-agent-rs
@@ -86,7 +86,7 @@ cargo test -p yi-agent-store --lib watchdog_usage_reads_legacy
 ```
 Expected: 编译失败（`WatchdogUsage` 没有 `input_tokens` 字段）。
 
-- [ ] **Step 3: 给 `WatchdogUsage` 加三个字段**
+- [x] **Step 3: 给 `WatchdogUsage` 加三个字段**
 
 `crates/yi-agent-store/src/schedule.rs`：
 
@@ -120,14 +120,14 @@ pub struct WatchdogTokenDelta {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 ```bash
 cargo test -p yi-agent-store --lib watchdog_usage_reads_legacy
 ```
 Expected: PASS。
 
-- [ ] **Step 5: 写失败测试 —— 分项累加且 tokens 语义不变**
+- [x] **Step 5: 写失败测试 —— 分项累加且 tokens 语义不变**
 
 在 `repository.rs` 的测试模块加（沿用该文件既有的临时库 + insert_task/insert_attempt 辅助函数，参照同文件内 `record_watchdog_progress` 的既有测试）：
 
@@ -171,14 +171,14 @@ fn record_watchdog_progress_accumulates_token_breakdown() {
 }
 ```
 
-- [ ] **Step 6: 运行测试确认失败**
+- [x] **Step 6: 运行测试确认失败**
 
 ```bash
 cargo test -p yi-agent-store --lib record_watchdog_progress_accumulates_token_breakdown
 ```
 Expected: 编译失败（`record_watchdog_progress` 少一个参数）。
 
-- [ ] **Step 7: 扩展 `record_watchdog_progress`**
+- [x] **Step 7: 扩展 `record_watchdog_progress`**
 
 `repository.rs`，签名追加 `usage_delta: WatchdogTokenDelta`。函数体（现有
 `repository.rs:1287-1290`）已经是：
@@ -228,14 +228,14 @@ Expected: 编译失败（`record_watchdog_progress` 少一个参数）。
     }
 ```
 
-- [ ] **Step 8: 运行 store 全量测试**
+- [x] **Step 8: 运行 store 全量测试**
 
 ```bash
 cargo test -p yi-agent-store --lib
 ```
 Expected: 全绿。既有调用点会因签名变化报错，按 Step 9 修。
 
-- [ ] **Step 9: 修所有调用点**
+- [x] **Step 9: 修所有调用点**
 
 `grep -rn "record_watchdog_progress" crates/` 找出全部调用点。本阶段（Task 1）只改 `runtime.rs`，传全零分项，保持行为不变：
 
@@ -255,7 +255,7 @@ Expected: 全绿。既有调用点会因签名变化报错，按 Step 9 修。
 
 测试内的调用点同样补 `WatchdogTokenDelta::default()`。
 
-- [ ] **Step 10: 运行测试并提交**
+- [x] **Step 10: 运行测试并提交**
 
 ```bash
 cargo test -p yi-agent-store --lib
@@ -280,7 +280,7 @@ git commit -m "feat(store): 监督用量记账增加 token 分项"
   - `WorkerWatchdogEvent::ProviderUsage { input_tokens: u64, output_tokens: u64, cache_creation_tokens: u64, cache_read_tokens: u64 }`
   - `WorkerHandle::report_provider_usage(&self, input_tokens: u64, output_tokens: u64, cache_creation_tokens: u64, cache_read_tokens: u64)`
 
-- [ ] **Step 1: 更新既有测试的期望值（先写期望）**
+- [x] **Step 1: 更新既有测试的期望值（先写期望）**
 
 `crates/yi-agent-subagent/src/lib.rs` 的 `daemon_worker_reports_provider_usage_to_the_watchdog`：
 
@@ -298,14 +298,14 @@ git commit -m "feat(store): 监督用量记账增加 token 分项"
 
 同时确认测试用的 `UsageReportingProvider` 产生的 `TokenUsage` 里 `cache_creation_input_tokens: Some(3)`、`cache_read_input_tokens: Some(7)`；若原测试用 0，改成 3/7 以便断言分项被带上。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 cargo test -p yi-agent-subagent --lib daemon_worker_reports_provider_usage
 ```
 Expected: 编译失败（枚举变体字段不匹配）。
 
-- [ ] **Step 3: 扩展枚举与上报方法**
+- [x] **Step 3: 扩展枚举与上报方法**
 
 `crates/yi-agent-core/src/subagent/worker.rs`：
 
@@ -342,7 +342,7 @@ pub enum WorkerWatchdogEvent {
     }
 ```
 
-- [ ] **Step 4: 更新 subagent 上报点**
+- [x] **Step 4: 更新 subagent 上报点**
 
 `crates/yi-agent-subagent/src/lib.rs:962` 附近：
 
@@ -361,7 +361,7 @@ pub enum WorkerWatchdogEvent {
                                         }
 ```
 
-- [ ] **Step 5: 更新 runtime 的搬运逻辑**
+- [x] **Step 5: 更新 runtime 的搬运逻辑**
 
 `crates/yi-agent-store/src/runtime.rs:2955-2976`（`for (task_id, update) in watchdog_updates` 里的 match），把五元组换成六元组：
 
@@ -400,7 +400,7 @@ pub enum WorkerWatchdogEvent {
 
 随后把 `usage_delta` 传给 `record_watchdog_progress`。
 
-- [ ] **Step 6: 运行测试**
+- [x] **Step 6: 运行测试**
 
 ```bash
 cargo test -p yi-agent-subagent --lib daemon_worker_reports_provider_usage
@@ -409,7 +409,7 @@ cargo test -p yi-agent-core --lib subagent
 ```
 Expected: 全绿。
 
-- [ ] **Step 7: 提交**
+- [x] **Step 7: 提交**
 
 ```bash
 cargo fmt --all
@@ -434,7 +434,7 @@ git commit -m "feat(subagent): 上报 provider 用量的完整分项"
   - `IpcTaskUsage { input_tokens: u64, output_tokens: u64, cache_read_tokens: u64 }`（`ipc.rs`，`#[serde(default)]` 用在字段上）
   - `IpcTaskSummary { ..., usage: IpcTaskUsage }`
 
-- [ ] **Step 1: 写失败测试 —— 同一 task 多次 attempt 求和**
+- [x] **Step 1: 写失败测试 —— 同一 task 多次 attempt 求和**
 
 ```rust
 #[test]
@@ -475,14 +475,14 @@ fn task_summaries_report_zero_usage_without_attempts() {
 
 注：`insert_attempt` 的实际签名以 `repository.rs` 现有实现为准；若形状不同，按现有签名构造第二次 attempt。
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 cargo test -p yi-agent-store --lib task_summaries_sum_usage_across_attempts
 ```
 Expected: 编译失败（`PersistedTaskSummary` 没有 `usage`）。
 
-- [ ] **Step 3: 加类型与聚合**
+- [x] **Step 3: 加类型与聚合**
 
 `repository.rs`：
 
@@ -569,14 +569,14 @@ pub struct TaskUsageTotals {
     }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 ```bash
 cargo test -p yi-agent-store --lib task_summaries
 ```
 Expected: PASS（两条新测试 + 既有 task_summaries 测试）。
 
-- [ ] **Step 5: 写失败测试 —— IPC 序列化带 usage（老 daemon 缺字段为 0）**
+- [x] **Step 5: 写失败测试 —— IPC 序列化带 usage（老 daemon 缺字段为 0）**
 
 `ipc.rs` 测试模块：
 
@@ -590,14 +590,14 @@ fn ipc_task_summary_tolerates_missing_usage() {
 }
 ```
 
-- [ ] **Step 6: 运行确认失败**
+- [x] **Step 6: 运行确认失败**
 
 ```bash
 cargo test -p yi-agent-store --lib ipc_task_summary_tolerates_missing_usage
 ```
 Expected: 编译失败（`IpcTaskUsage` 不存在）。
 
-- [ ] **Step 7: 加 IPC 结构与映射**
+- [x] **Step 7: 加 IPC 结构与映射**
 
 `ipc.rs`：
 
@@ -636,7 +636,7 @@ handler 里映射（`ListTaskSummaries` 分支）：
                 })
 ```
 
-- [ ] **Step 8: 运行 IPC 全量测试并提交**
+- [x] **Step 8: 运行 IPC 全量测试并提交**
 
 ```bash
 cargo test -p yi-agent-store --lib ipc
@@ -664,7 +664,7 @@ git commit -m "feat(store): 任务摘要携带各 task 的分项用量"
   - `Notification::TokenUsage { ..., subagent_input_tokens: u64, subagent_output_tokens: u64, subagent_cache_read_tokens: u64 }`
   - `pub(crate) fn subagent_totals(children: &[AgentChild]) -> SubagentTotals`，`SubagentTotals { input: u64, output: u64, cache_read: u64 }`
 
-- [ ] **Step 1: 写失败测试 —— children 携带用量**
+- [x] **Step 1: 写失败测试 —— children 携带用量**
 
 `server.rs` 测试模块：
 
@@ -728,14 +728,14 @@ fn subagent_totals_sums_every_child() {
 }
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 ```bash
 cargo test -p yi-agent-app-server --lib children_for_thread_carries_task_usage
 ```
 Expected: 编译失败（`AgentChildUsage` 不存在）。
 
-- [ ] **Step 3: 加协议结构**
+- [x] **Step 3: 加协议结构**
 
 `protocol.rs`：
 
@@ -771,7 +771,7 @@ pub struct AgentChildUsage {
         subagent_cache_read_tokens: u64,
 ```
 
-- [ ] **Step 4: 实现 `children_for_thread` 映射与汇总**
+- [x] **Step 4: 实现 `children_for_thread` 映射与汇总**
 
 `server.rs`：
 
@@ -830,7 +830,7 @@ pub(crate) fn subagent_totals(children: &[crate::protocol::AgentChild]) -> Subag
 }
 ```
 
-- [ ] **Step 5: 运行测试**
+- [x] **Step 5: 运行测试**
 
 ```bash
 cargo test -p yi-agent-app-server --lib children_for_thread
@@ -838,13 +838,13 @@ cargo test -p yi-agent-app-server --lib subagent_totals
 ```
 Expected: PASS。
 
-- [ ] **Step 6: 修既有构造点**
+- [x] **Step 6: 修既有构造点**
 
 `grep -rn "AgentChild {" crates/yi-agent-app-server/src/` 与测试，全部补 `usage: AgentChildUsage::default()`（测试里需要具体值的按 Step 1 写）。
 
 `Notification::TokenUsage` 的构造点（`translate.rs` 的 `usage_notification`、`reset_totals`）暂时补三个 0，Task 5 再接上真实值。
 
-- [ ] **Step 7: 重新生成 ts-rs 绑定**
+- [x] **Step 7: 重新生成 ts-rs 绑定**
 
 ```bash
 cd .worktrees/subagent-usage/yi-agent-rs
@@ -853,7 +853,7 @@ cd .. && git status --porcelain desktop/src/lib/generated
 ```
 Expected: `AgentChild.ts` / `AgentChildUsage.ts` / `Notification*.ts` 有变化。
 
-- [ ] **Step 8: 提交（含生成物）**
+- [x] **Step 8: 提交（含生成物）**
 
 ```bash
 cd .worktrees/subagent-usage/yi-agent-rs && cargo fmt --all
@@ -905,7 +905,7 @@ driver，由 driver 用自己那份 translator 生成完整通知。
 通道用 `tokio::sync::watch` 而非 `mpsc`：它只保留最新值，`watch_children` 用
 `send_replace` 永不阻塞、也不积压（500ms 一份，mpsc 满队列会让 watch 任务卡住）。
 
-- [ ] **Step 1: 写失败测试 —— subagent 累计不进 total_***
+- [x] **Step 1: 写失败测试 —— subagent 累计不进 total_***
 
 `translate.rs` 的 `mod tests`：
 
@@ -951,14 +951,14 @@ fn reset_totals_clears_subagent_totals() {
 }
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 ```bash
 cargo test -p yi-agent-app-server --lib subagent_totals_are_reported_separately
 ```
 Expected: 编译失败（`set_subagent_totals` / `SubagentTotals` 不存在）。
 
-- [ ] **Step 3: 加字段与方法**
+- [x] **Step 3: 加字段与方法**
 
 `translate.rs`：
 
@@ -991,7 +991,7 @@ Expected: 编译失败（`set_subagent_totals` / `SubagentTotals` 不存在）�
 
 `reset_totals()` 里加 `self.subagent = SubagentTotals::default();`。
 
-- [ ] **Step 4: 运行测试**
+- [x] **Step 4: 运行测试**
 
 ```bash
 cargo test -p yi-agent-app-server --lib subagent_totals
@@ -999,7 +999,7 @@ cargo test -p yi-agent-app-server --lib reset_totals
 ```
 Expected: PASS。
 
-- [ ] **Step 5: `watch_children` 增加 sender 参数并推送汇总**
+- [x] **Step 5: `watch_children` 增加 sender 参数并推送汇总**
 
 `server.rs` 的签名改为（`initial` 之后加一个参数）：
 
@@ -1027,7 +1027,7 @@ pub(crate) async fn watch_children(
 注意：`current == last` 时函数 `continue` 了，所以只有列表/用量真的变了才推送，
 不会每 500ms 都发一条通知。
 
-- [ ] **Step 6: `ThreadSession` 持 sender**
+- [x] **Step 6: `ThreadSession` 持 sender**
 
 `session.rs` 的 `ThreadSession` 加：
 
@@ -1042,7 +1042,7 @@ pub(crate) async fn watch_children(
 `SubagentTotals` 定义在 `protocol.rs`（Task 4），需在 `session.rs` 顶部
 `use crate::protocol::SubagentTotals;`。
 
-- [ ] **Step 7: 三处构造点同步（编译驱动）**
+- [x] **Step 7: 三处构造点同步（编译驱动）**
 
 有三处构造 `ThreadSession`：`server.rs:6757`（`start_thread_core`）、
 `rpc/thread.rs:569`（`thread/resume`）、`rpc_tests.rs:5971` 与 `:9986`（测试）。
@@ -1078,7 +1078,7 @@ pub(crate) async fn watch_children(
 
 测试里的两处构造点用 `tokio::sync::watch::channel(SubagentTotals::default()).0`。
 
-- [ ] **Step 8: driver 消费并推送**
+- [x] **Step 8: driver 消费并推送**
 
 `run_thread_driver` 签名加 `mut subagent_rx: tokio::sync::watch::Receiver<SubagentTotals>`。
 `run_thread_driver` 与 `SubagentTotals` 分处 `server.rs` / `protocol.rs`，按既有风格在
@@ -1120,7 +1120,7 @@ drop 时它是 `Err`，模式不匹配会让该分支**永久禁用**（`select!
             }
 ```
 
-- [ ] **Step 9: `/clear` 后把基线钉住**
+- [x] **Step 9: `/clear` 后把基线钉住**
 
 `/clear` 只截断会话日志，daemon 的 task 记录还在，children 列表照样带着旧 usage。
 若不处理，clear 后下一次推送会把旧数字带回来（`translator.reset_totals()` 归零了，
@@ -1164,7 +1164,7 @@ drop 时它是 `Err`，模式不匹配会让该分支**永久禁用**（`select!
 这个基线只活在 driver 内，`/clear` 之外的一切都不动它——`/compact`、切换模型都不该
 重置 subagent 累计。
 
-- [ ] **Step 10: 补基线语义的单测**
+- [x] **Step 10: 补基线语义的单测**
 
 放在 `server.rs` 的 `mod tests`（纯函数层，不必拉起整个 driver）：
 
@@ -1188,7 +1188,7 @@ fn subagent_baseline_never_underflows() {
 }
 ```
 
-- [ ] **Step 11: 运行 app-server 全量并提交**
+- [x] **Step 11: 运行 app-server 全量并提交**
 
 ```bash
 cargo test -p yi-agent-app-server --lib
@@ -1215,7 +1215,7 @@ Expected: PASS。`children_for_thread` 的既有测试（`rpc_tests.rs:2704` 起
   - `Session.subagentTotals: SubagentTotals`（**初始为全零，不为 null**）
   - `Session.subagentCount: number`（该会话子任务数，供读屏句子用）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `session.test.ts`：
 
@@ -1251,7 +1251,7 @@ it("defaults subagent totals to zero when the server omits them", () => {
 });
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 ```bash
 export PATH="/opt/homebrew/bin:$PATH"
@@ -1260,7 +1260,7 @@ npx vitest run src/lib/session.test.ts
 ```
 Expected: FAIL（`subagentTotals` undefined）。
 
-- [ ] **Step 3: 加类型与字段**
+- [x] **Step 3: 加类型与字段**
 
 `protocol.ts`：
 
@@ -1300,7 +1300,7 @@ export interface SubagentTotals {
         }
 ```
 
-- [ ] **Step 4: 跑测试与类型检查**
+- [x] **Step 4: 跑测试与类型检查**
 
 ```bash
 npx vitest run src/lib/session.test.ts
@@ -1308,7 +1308,7 @@ npx tsc --noEmit
 ```
 Expected: PASS / 干净。既有测试若构造 `thread/tokenUsage/updated` 缺三个新字段，补 0（生成物把三者标为必填）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add desktop/src
@@ -1327,7 +1327,7 @@ git commit -m "feat(desktop): 会话保存 subagent 累计用量"
 - Consumes: `SubagentTotals`（Task 6）
 - Produces: `StatusBar` props 新增 `subagentTotals: SubagentTotals`、`subagentCount: number`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```typescript
 it("shows the sum of session and subagent usage when collapsed", () => {
@@ -1368,14 +1368,14 @@ it("keeps the existing sentence when there are no subagents", () => {
 });
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 ```bash
 npx vitest run src/components/StatusBar.test.tsx
 ```
 Expected: FAIL（缺 props）。
 
-- [ ] **Step 3: 实现合计**
+- [x] **Step 3: 实现合计**
 
 `StatusBar.tsx`：
 
@@ -1412,7 +1412,7 @@ Expected: FAIL（缺 props）。
 
 `UsagePanel` 传 `subagentTotals` 与 `hasSubagents`（Task 8 用）。
 
-- [ ] **Step 4: 跑测试**
+- [x] **Step 4: 跑测试**
 
 ```bash
 npx vitest run src/components/StatusBar.test.tsx
@@ -1420,7 +1420,7 @@ npx tsc --noEmit
 ```
 Expected: PASS。
 
-- [ ] **Step 5: 更新 App 调用点**
+- [x] **Step 5: 更新 App 调用点**
 
 `App.tsx` 的 `<StatusBar ...>` 补。两处数据源都已在 `useSessionState` 里备好，
 **不要**再给 `SubagentRailStore` 加计数方法（`railRows` 就是当前会话的行）：
@@ -1432,7 +1432,7 @@ Expected: PASS。
 
 （`sess.railRows` 由 `useSessionState.ts:268` 提供：`currentId ? railStore.get(currentId) : []`。）
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 npx vitest run src/App.test.tsx
@@ -1452,7 +1452,7 @@ git commit -m "feat(desktop): 状态栏折叠态显示含子 agent 的合计用�
 - Consumes: `SubagentTotals`、`hasSubagents`
 - Produces: `UsagePanel` props `{ totals, subagentTotals, hasSubagents, isFallback, model }`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```typescript
 it("splits session and subagent usage in the panel", () => {
@@ -1492,14 +1492,14 @@ it("hides the subagent group when there are none", () => {
 });
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 ```bash
 npx vitest run src/components/StatusBar.test.tsx
 ```
 Expected: FAIL（没有 `Session`/`Subagents` 行）。
 
-- [ ] **Step 3: 实现分组**
+- [x] **Step 3: 实现分组**
 
 `UsagePanel.tsx` 的 `dl` 改为两段（`hasSubagents` 为真才渲染第二段）：
 
@@ -1528,7 +1528,7 @@ Expected: FAIL（没有 `Session`/`Subagents` 行）。
         </dd>
 ```
 
-- [ ] **Step 4: 跑测试并提交**
+- [x] **Step 4: 跑测试并提交**
 
 ```bash
 npx vitest run src/components/StatusBar.test.tsx
@@ -1550,7 +1550,7 @@ git commit -m "feat(desktop): 用量面板分开显示主会话与子 agent"
 - Consumes: `Session.subagentTotals`
 - Produces: `formatUsage(snapshot: Usage, totals: UsageTotals | null, subagent: SubagentTotals | null, opts: { compactThreshold: number | null }): string`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```typescript
 describe("formatUsage with subagents", () => {
@@ -1586,14 +1586,14 @@ describe("formatUsage with subagents", () => {
 });
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 ```bash
 npx vitest run src/lib/usageCommand.test.ts
 ```
 Expected: FAIL（参数个数不匹配）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `usageCommand.ts` 签名改为四参，`null`/全零 = 无 subagent：
 
@@ -1614,7 +1614,7 @@ const hasSubagents =
 理由：「主会话」这个限定只有在**同时**显示 subagent 时才有区分意义；无 subagent 时
 它是个空指涉，只是无谓地改动用户已经熟悉的输出。
 
-- [ ] **Step 4: 接线 App**
+- [x] **Step 4: 接线 App**
 
 ```typescript
         session.notice(
@@ -1624,7 +1624,7 @@ const hasSubagents =
         );
 ```
 
-- [ ] **Step 5: 跑测试并提交**
+- [x] **Step 5: 跑测试并提交**
 
 ```bash
 npx vitest run src/lib/usageCommand.test.ts src/App.test.tsx
@@ -1641,15 +1641,15 @@ git commit -m "feat(desktop): /usage 分开显示主会话与 subagent 用量"
 - Modify: `docs/project-management/desktop.md`
 - Modify: `docs/project-management/README.md`（计数）
 
-- [ ] **Step 1: 登记验收项**
+- [x] **Step 1: 登记验收项**
 
 在 desktop.md 的 Features 里加一条 `[x]`，包含：口径（input/output/cache read）、三处展示、代码位置、验证命令。
 
-- [ ] **Step 2: 更新索引计数**
+- [x] **Step 2: 更新索引计数**
 
 按 `grep -c '^- \[x\]'` 实测值更新 `README.md` 的 desktop 行。
 
-- [ ] **Step 3: 全量校验**
+- [x] **Step 3: 全量校验**
 
 ```bash
 cd .worktrees/subagent-usage/yi-agent-rs
@@ -1669,7 +1669,7 @@ npx vitest run
 ```
 Expected: 全绿。
 
-- [ ] **Step 4: 绑定一致性**
+- [x] **Step 4: 绑定一致性**
 
 ```bash
 cd .worktrees/subagent-usage/yi-agent-rs
@@ -1678,7 +1678,7 @@ cd .. && git status --porcelain desktop/src/lib/generated
 ```
 Expected: 无输出（生成物与服务端一致）。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add docs
