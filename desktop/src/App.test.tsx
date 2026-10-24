@@ -5552,6 +5552,61 @@ describe("App mobile reopen keeps the selection", () => {
   });
 });
 
+describe("App cold start restores the last selected thread", () => {
+  beforeEach(() => {
+    localStorage.setItem("yi-agent.selectedThread", "t2");
+  });
+  afterEach(() => {
+    localStorage.removeItem("yi-agent.selectedThread");
+  });
+
+  it("resumes the thread that was selected before the app quit", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() =>
+      expect(
+        clients[0].requests
+          .filter((r) => r.method === "thread/resume")
+          .map((r) => (r.params as { threadId: string }).threadId),
+      ).toContain("t2"),
+    );
+    const resumed = clients[0].requests
+      .filter((r) => r.method === "thread/resume")
+      .map((r) => (r.params as { threadId: string }).threadId);
+    expect(resumed).not.toContain("t1");
+  });
+
+  it("falls back to the first thread when the remembered one is gone", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    render(<App />);
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) =>
+            r.method === "thread/resume" &&
+            (r.params as { threadId: string }).threadId === "t1",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("records the selection so the next cold start can use it", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("two")).toBeTruthy());
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() =>
+      expect(localStorage.getItem("yi-agent.selectedThread")).toBe("t2"),
+    );
+  });
+});
+
 describe("App reasoning effort wiring", () => {
   it("writes the session override and reflects the server-pushed effort", async () => {
     render(<App />);

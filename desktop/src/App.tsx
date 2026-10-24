@@ -51,6 +51,7 @@ import {
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
+import { readSelectedThread, writeSelectedThread } from "./lib/selectedThread";
 import { uploadImage, isHeic } from "./lib/imageUpload";
 import { pickImageFiles } from "./lib/imagePicker";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
@@ -681,6 +682,8 @@ export default function App() {
     // 幂等收敛，掉一次只会让蓝点多留一会儿，不该阻塞切会话。
     markThreadRead(id);
     sess.setCurrentId(id);
+    // 记到最后看的那条：下次冷启动据此复位（服务端列表仍是否存在的裁决者）。
+    writeSelectedThread(localStorage, id);
     // 冷会话先拿缓存内容垫上（有则显示、无则空），随后 resume/readItems 覆盖。
     // 判据是 warm 与在途 resume，与「是否有缓存」无关：预填**不**置 warm，所以
     // 这里不会因为命中缓存而跳过 resume。这里刻意放在下方的早退分支（running
@@ -967,6 +970,7 @@ export default function App() {
       store.view(t.thread_id).mode = permissionModeFromResponse(t) ?? "normal";
       store.select(t.thread_id);
       sess.setCurrentId(t.thread_id);
+      writeSelectedThread(localStorage, t.thread_id);
       // 新会话同样是「当前会话变了」：旧 diff 必须退场，否则会挂在新会话上。
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
@@ -1228,6 +1232,8 @@ export default function App() {
     cachedAt.current.delete(id);
     if (id === sess.currentId) {
       sess.setCurrentId(null);
+      // 记住值也一并清掉：否则下次冷启动会去找一个已经不存在的会话。
+      writeSelectedThread(localStorage, null);
       // 没有当前会话了，面板与它的 diff 也必须退场：留着就是一片无主的旧内容。
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
@@ -1722,7 +1728,9 @@ export default function App() {
         // 则补 readItems（不打断在途回合）、warm 则补 subscribe，否则视图留着而
         // 该会话的实时更新会静默停摆。仅当当前会话不在服务端新列表里（被删）或
         // 根本没有已选会话时，才回落第一条。
-        const keptId = sess.currentIdRef.current;
+        // 回落顺序：当前会话 → 上次选中的（冷启动没有当前会话）→ 列表第一条。
+        // 记住值同样要过服务端列表这一关：会话可能已被别的端删掉。
+        const keptId = sess.currentIdRef.current ?? readSelectedThread();
         const kept =
           keptId !== null &&
           list.groups.some((g) => g.threads.some((t) => t.thread_id === keptId));
