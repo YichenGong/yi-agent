@@ -165,8 +165,12 @@ const ChatItem = memo(
     /** 搜索关键词。空串表示未在搜索，不产生任何 mark。 */
     query: string;
   }) {
-    switch (item.type) {
-      case "notice":
+    // 消息根节点统一包一层 `contents` 包裹，只为挂 `data-item-id`：阅读位置靠它
+    // 定位。`display: contents` 不生成盒子，因此子元素仍是滚动容器的直接 flex
+    // item —— 用户气泡的 `self-end`、助手消息的 `self-start` 都不受影响。
+    const node = (() => {
+      switch (item.type) {
+        case "notice":
         // 结构化载荷按 `kind` 分派；没有载荷的就是普通文本提示（胶囊）。
         return item.body?.kind === "config" ? (
           <ConfigCard config={item.body.data} error={item.body.error} />
@@ -221,17 +225,23 @@ const ChatItem = memo(
         return <AgentMessage text={text} query={query} />;
       case "toolCall":
         return <ToolCallRow item={item} threadId={threadId} call={call} />;
-      default: {
-        // Defensive: the server sent an item type this build does not know
-        // about. Surface it rather than silently dropping the item.
-        const unknown = item as { type?: string };
-        return (
-          <div className="my-1 font-mono text-xs text-fg-subtle">
-            [unsupported item type: {unknown.type ?? "unknown"}]
-          </div>
-        );
+        default: {
+          // Defensive: the server sent an item type this build does not know
+          // about. Surface it rather than silently dropping the item.
+          const unknown = item as { type?: string };
+          return (
+            <div className="my-1 font-mono text-xs text-fg-subtle">
+              [unsupported item type: {unknown.type ?? "unknown"}]
+            </div>
+          );
+        }
       }
-    }
+    })();
+    return (
+      <div className="contents" data-item-id={item.id}>
+        {node}
+      </div>
+    );
   },
   // Compare the mutable primitive, never `item.text`.
   (prev, next) =>

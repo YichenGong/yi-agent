@@ -576,6 +576,25 @@ describe("ChatView tail handover", () => {
   });
 });
 
+describe("ChatView item ids", () => {
+  it("tags every message with its protocol id so a reading position can be anchored", () => {
+    const list = items();
+    const { container } = render(<ChatView items={list} threadId="t1" />);
+    const ids = Array.from(container.querySelectorAll("[data-item-id]")).map(
+      (el) => el.getAttribute("data-item-id"),
+    );
+    expect(ids).toEqual(list.map((it) => it.id));
+  });
+
+  it("keeps the message's own alignment when wrapping it for the id", () => {
+    // `display: contents` 让包裹层不生成盒子，子元素仍直接参与滚动容器的
+    // flex 布局；否则用户气泡的内缩/右对齐会被一层普通 div 破坏。
+    const { container } = render(<ChatView items={items()} threadId="t1" />);
+    const first = container.querySelector("[data-item-id]") as HTMLElement;
+    expect(first.className).toContain("contents");
+  });
+});
+
 describe("ChatView auto-scroll", () => {
   /** jsdom 没有布局引擎：给滚动容器装上可读写的滚动度量。 */
   function installMetrics(
