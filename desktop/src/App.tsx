@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { isIos, isRemoteClient } from "./lib/platform";
 import { type StorageLike, storedRemoteConfig } from "./lib/remoteConfig";
 import { useIsMobile } from "./lib/useIsMobile";
+import { SearchBar } from "./components/SearchBar";
+import { useTranscriptSearch, SEARCH_DEBOUNCE_MS } from "./hooks/useTranscriptSearch";
+import { useEscapeKey } from "./ui/useEscapeKey";
 import { useDiffState } from "./hooks/useDiffState";
 import { useProcessState } from "./hooks/useProcessState";
 import { useBoardState } from "./hooks/useBoardState";
@@ -236,6 +239,13 @@ export default function App() {
    * 先画出一堆点不动的框。
    */
   const [groupsEnabled, setGroupsEnabled] = useState<boolean | null>(null);
+  /**
+   * 会话内搜索开关（`flags/list` 里的 `session_search`）。`null` = 还不知道。
+   *
+   * 与另三个开关同一口径：`null` 按关处理。`=== true` 才注册 Cmd+F，否则
+   * Cmd+F 必须放行给 webview 的原生查找。
+   */
+  const [sessionSearchEnabled, setSessionSearchEnabled] = useState<boolean | null>(null);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
@@ -472,6 +482,7 @@ export default function App() {
         setKanbanEnabled(read("superpowers_kanban"));
         const groupsWereOn = sess.groupsRef.current.some((g) => (g.groups ?? []).length > 0);
         setGroupsEnabled(read("session_groups"));
+        setSessionSearchEnabled(read("session_search"));
         // 分组从「关」拨到「开」时必须重拉列表：关着期间服务端不下发组表，
         // 手上的数据里根本没有组，光把开关置 true 只会得到一片空框（什么也没有）。
         // 反过来（开→关）不用重拉：关掉是纯前端隐藏，数据留着下次直接用。
@@ -509,6 +520,83 @@ export default function App() {
   );
 
   const current = sess.currentId ? store.view(sess.currentId) : null;
+
+  /**
+   * 会话内搜索（Cmd+F）的三份状态。
+   *
+   * `searchInput` 是输入框原文，`searchQuery` 是**防抖后**真正喂给 `ChatView` 的
+   * 值——每次敲字都会让可见消息重解析 markdown，不防抖长会话会卡。
+   */
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchInput, setSearchInput] = useState("");
+  const [searchQuery, setSearchQuery] = useState("");
+  /**
+   * 转录**真正的滚动容器**句柄，由 `ChatView` 的 `scrollerRef` 回填。
+   *
+   * 不能用 App 自己那层 `relative` 容器：它不滚动，`scrollTop` 恒为 0，
+   * `initialActiveIndex` 的"视口"会退化成"内容最顶端"，每次打开都跳第一个命中。
+   */
+  const transcriptRef = useRef<HTMLDivElement>(null);
+
+  const search = useTranscriptSearch({
+    containerRef: transcriptRef,
+    open: searchOpen,
+    query: searchQuery,
+  });
+
+  // 输入防抖：只有停手 120ms 才让 ChatView 重新解析 markdown。
+  useEffect(() => {
+    if (!searchOpen) return;
+    const id = setTimeout(() => setSearchQuery(searchInput), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(id);
+  }, [searchInput, searchOpen]);
+
+  // mark 落地后按视口选当前命中。用 rAF 等一帧，确保 rehype 的输出已在 DOM。
+  useEffect(() => {
+    if (!searchOpen || searchQuery.trim() === "") return;
+    const id = requestAnimationFrame(() => search.reselect());
+    return () => cancelAnimationFrame(id);
+  }, [searchOpen, searchQuery, search.reselect]);
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false);
+    setSearchInput("");
+    setSearchQuery("");
+  }, []);
+
+  // 切换会话即关闭：旧 DOM 的命中序号没有意义。
+  useEffect(() => {
+    closeSearch();
+  }, [sess.currentId, closeSearch]);
+
+  /**
+   * Cmd/Ctrl+F 的进入条件，收敛进 ref。
+   *
+   * 监听器只装一次；直接闭包读 state 会读到**首次渲染**时的值（那时
+   * `sessionSearchEnabled` 还是 `null`），于是拨开开关后 Cmd+F 仍然没反应。
+   */
+  const canSearchRef = useRef(false);
+  canSearchRef.current =
+    sessionSearchEnabled === true &&
+    sess.currentId !== null &&
+    board.selectedBoard === null &&
+    !prefs.settingsOpen &&
+    current?.approval == null;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "f") return;
+      if (!canSearchRef.current) return;
+      // 拦掉 webview 自带的查找；flag 关时**必须**放行（见上方 canSearchRef）。
+      e.preventDefault();
+      setSearchOpen(true);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Esc 关闭并清空。
+  useEscapeKey(searchOpen, closeSearch);
 
   // 首屏：把缓存里的会话播种进 store（标题/cwd/model/状态徽标），并预填选中会话
   // 的内容。预填**不**置 warm：那会让连上后的 `thread/resume` 被跳过，服务端历史
@@ -1473,6 +1561,7 @@ export default function App() {
         // 同一份 `flags/list` 里就有看板与分组开关，不再多发请求。
         let kanbanOn = false;
         let groupsOn = false;
+        let searchOn = false;
         try {
           const flags = await client.request<{
             flags?: Array<{ name?: unknown; enabled?: unknown }>;
@@ -1483,14 +1572,18 @@ export default function App() {
           kanbanOn = kanban?.enabled === true;
           const groups = (flags.flags ?? []).find((f) => f.name === "session_groups");
           groupsOn = groups?.enabled === true;
+          const search = (flags.flags ?? []).find((f) => f.name === "session_search");
+          searchOn = search?.enabled === true;
         } catch {
           leadOn = false;
           kanbanOn = false;
           groupsOn = false;
+          searchOn = false;
         }
         setLeadAgentEnabled(leadOn);
         setKanbanEnabled(kanbanOn);
         setGroupsEnabled(groupsOn);
+        setSessionSearchEnabled(searchOn);
         const settings = await client.request<{
           theme?: unknown;
           resident_daemon_watchman_enabled?: unknown;
@@ -2395,7 +2488,20 @@ export default function App() {
                   // `useImageData` 的依赖数组，换身份即等于每次渲染重拉图片。
                   call={imageCall}
                   structuralVersion={current?.session.structuralVersion ?? 0}
+                  query={searchQuery}
+                  scrollerRef={transcriptRef}
                 />
+                {searchOpen && (
+                  <SearchBar
+                    value={searchInput}
+                    total={search.total}
+                    active={search.active}
+                    onChange={setSearchInput}
+                    onNext={search.next}
+                    onPrev={search.prev}
+                    onClose={closeSearch}
+                  />
+                )}
                 {approval && (
                   <ApprovalDialog
                     key={approval.id}
