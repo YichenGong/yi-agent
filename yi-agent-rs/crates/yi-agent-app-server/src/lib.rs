@@ -43,6 +43,7 @@ pub mod theme_tool;
 pub mod thread_store;
 pub mod translate;
 pub mod transport;
+pub mod websearch_rpc;
 pub mod workspace_index;
 pub(crate) mod worktree_reclaim;
 pub mod ws;

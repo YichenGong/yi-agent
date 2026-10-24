@@ -33,6 +33,10 @@ pub use sandbox::{SandboxController, SandboxMode, SandboxPolicy};
 pub use shell::BashTool;
 pub use shell::blocklist;
 pub use skill_tool::SkillTool;
+pub use web::config::{
+    EngineConfig, Freshness, WebSearchConfig, load_websearch_config, load_websearch_config_from,
+    websearch_path,
+};
 pub use web::{
     BochaSearchProvider, SearchResult, UnconfiguredProvider, WebFetchTool, WebSearchProvider,
     WebSearchTool,
@@ -136,7 +140,7 @@ pub fn register_builtin_tools_with_controller_and_env(
 
     // Web tools
     registry.register(Arc::new(WebFetchTool::new()));
-    register_web_search_from(registry, &web::config::websearch_path());
+    register_web_search_from(registry, &websearch_path());
 }
 
 /// 按配置注册网页搜索工具。
