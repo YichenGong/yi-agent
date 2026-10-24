@@ -4,7 +4,7 @@ import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
-import { isAtBottom, useStickToBottom } from "../lib/useStickToBottom";
+import { useStickToBottom } from "../lib/useStickToBottom";
 import { findAnchor, restoreScrollTop, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
 import { useThrottledText } from "../lib/useThrottledText";
 import { AgentMessage } from "./MarkdownText";
@@ -429,7 +429,7 @@ export function ChatView({
    */
   onRememberView?: (threadId: string, anchor: ViewAnchor | null) => void;
 }) {
-  const { ref: scrollRef, scrollToBottom, followIfAtBottom, releaseFollow } =
+  const { ref: scrollRef, scrollToBottom, followIfAtBottom, releaseFollow, isFollowing } =
     useStickToBottom();
   // 合并 ref：同一个 DOM 节点交给两方。依赖是两个 ref 本身（稳定引用），
   // 所以不会每次渲染都重设。
@@ -508,7 +508,10 @@ export function ChatView({
       const report = rememberRef.current;
       // 没有选中会话时没有可归属的位置（也不会有人读它）。
       if (!node || !report || owner === null) return;
-      if (isAtBottom(node)) {
+      // 用 hook 维护的**相对**意图判断贴底，而不是重算当下的绝对 gap：
+      // 采集帧在内容增长之后才跑，此刻 gap 早已超过阈值，重算会把「仍在底部」
+      // 误记成「在读历史」，切走再回来就被恢复到消息锚点并放弃跟随。
+      if (isFollowing()) {
         report(owner, null);
         return;
       }

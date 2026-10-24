@@ -868,3 +868,56 @@ describe("ChatView auto-scroll", () => {
     expect(state.scrollTop).toBe(900);
   });
 });
+
+describe("ChatView keeps reporting 'bottom' while the stream grows", () => {
+  beforeEach(() => {
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => setTimeout(() => cb(0), 0));
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => clearTimeout(id));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("does not remember an anchor just because content grew before the capture frame", async () => {
+    // 真实浏览器里 `scroll` 事件是异步派发的：我们贴底之后内容又长高了，采集那一帧
+    // 读到的绝对 gap 早就超过阈值。用当下 gap 判定就会把「仍在底部」记成「在读历史」，
+    // 切走再回来时被恢复到一个消息锚点，随后 releaseFollow 让跟随永久停掉。
+    const seen: Array<[string, unknown]> = [];
+    const list = items();
+    const { container } = render(
+      <ChatView items={list} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = { scrollTop: 0, scrollHeight: 3000 };
+    Object.defineProperty(scroller, "scrollHeight", {
+      configurable: true,
+      get: () => state.scrollHeight,
+    });
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, get: () => 600 });
+    Object.defineProperty(scroller, "scrollTop", {
+      configurable: true,
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        state.scrollTop = v;
+      },
+    });
+    const rect = (top: number, height = 0) =>
+      ({ top, left: 0, bottom: top + height, right: 0, width: 0, height, x: 0, y: top, toJSON() {} }) as DOMRect;
+    scroller.getBoundingClientRect = () => rect(0, 600);
+    Array.from(scroller.querySelectorAll<HTMLElement>("[data-item-id]")).forEach((node, i) => {
+      node.getBoundingClientRect = () => rect([0, 1000, 2000][i] - state.scrollTop);
+    });
+
+    // 用户仍在底部：scrollTop 是当前最大值 2400。
+    state.scrollTop = 2400;
+    fireEvent.scroll(scroller);
+    // 采集帧还没跑，内容先长高了 800px（流式 delta）。
+    state.scrollHeight = 3800;
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+
+    // 视口一行都没动，仍在底部 ⇒ 必须记成 null（贴底），而不是某条消息的锚点。
+    expect(seen[seen.length - 1]).toEqual(["t1", null]);
+  });
+});
