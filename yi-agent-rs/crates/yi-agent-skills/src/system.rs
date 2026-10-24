@@ -76,6 +76,8 @@ mod tests {
         install_system_skills(tmp.path()).unwrap();
         assert!(tmp.path().join("skill-creator/SKILL.md").is_file());
         assert!(tmp.path().join("skill-installer/SKILL.md").is_file());
+        // MCP 自助配置:用户在对话里说「帮我加一个 MCP」时靠它。
+        assert!(tmp.path().join("mcp-setup/SKILL.md").is_file());
     }
 
     #[test]
