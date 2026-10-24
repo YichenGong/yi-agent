@@ -6,8 +6,20 @@ import type { ThreadMode } from "./threadPermissionMode";
 export interface ThreadView {
   session: Session;
   status: ThreadStatus;
-  /** 未被查看时收到过 turn/completed → true；打开即清除。 */
+  /**
+   * 是否有未读的回合结束。**派生值**，不是独立状态：
+   * `unread = lastCompletedAt > lastReadAt`。
+   *
+   * 由服务端下发的两个水位算出，故任一端点开会话（服务端推进已读水位并广播
+   * `thread/readStateChanged`）都会让其余端的蓝点同时消失。旧实现把它当成
+   * 「收到 turn/completed 就置真」的本地布尔位，于是离线跑完的回合永远补不
+   * 回来、一端读过另一端仍亮。
+   */
   unread: boolean;
+  /** 服务端权威的已读水位（epoch 毫秒）；0 = 从未读过。 */
+  lastReadAt: number;
+  /** 服务端权威的完成水位（epoch 毫秒）；0 = 从未完成过回合。 */
+  lastCompletedAt: number;
   approval: ApprovalRequest | null;
   /** 会话身份信息；`model_ref` 为会话的模型引用（null = 跟随全局默认）。 */
   info: { cwd: string; model: string; model_ref: string | null } | null;
@@ -59,6 +71,8 @@ export class ThreadStore {
       session: new Session(),
       status: "idle",
       unread: false,
+      lastReadAt: 0,
+      lastCompletedAt: 0,
       approval: null,
       info: null,
       mode: null,
@@ -87,10 +101,14 @@ export class ThreadStore {
     return this.currentId ? this.view(this.currentId) : null;
   }
 
-  /** 切到某 thread 并清除其未读。 */
+  /** 切到某 thread 并立即清除其未读（服务端水位由调用方另行上报）。 */
   select(id: string): void {
     this.currentId = id;
-    this.view(id).unread = false;
+    const v = this.view(id);
+    // 本地立刻清点，保留「打开即清」的手感；App 随后发 `thread/markRead`
+    // 让服务端水位跟上——否则重连后 `seed` 会按旧水位把蓝点算回来。
+    v.unread = false;
+    v.lastReadAt = Math.max(v.lastReadAt, v.lastCompletedAt);
   }
 
   /** 返回当前 thread 的 id 列表（供侧栏派生状态用）。 */
@@ -127,11 +145,36 @@ export class ThreadStore {
         this.statusSource.set(t.thread_id, "snapshot");
       }
       v.info = { cwd: t.cwd, model: t.model, model_ref: t.model_ref ?? null };
+      // 已读/完成水位按 max 合入：快照是**点读**，可能比推送晚到（一次旧的
+      // listAll 回来时水位更小），按 max 合入才不会被回滚——与 `statusSource`
+      // 护住 live 状态同一个道理。缺字段（旧服务端）按 0 处理。
+      //
+      // 这一步是「离线期间跑完的回合」唯一的复活路径：那时没人在听推送，
+      // 只有落盘的 `last_completed_at` 记得它跑完了。
+      this.mergeWatermarks(t.thread_id, t.last_read_at ?? 0, t.last_completed_at ?? 0);
       // 权限模式同样从快照补：只补「未知」，绝不把已确定的值打回 null（`8ef49300`
       // 修的正是后者）。清单里缺该字段（旧服务端/该会话不在快照中）⇒ 保持未知，
       // 交给 resume 回包或 `thread/permissionModeChanged` 推送定案。
       if (t.permission_mode !== undefined) v.mode = t.permission_mode;
     }
+  }
+
+  /**
+   * 把服务端下发的两个水位按 `max` 合入视图，并重算 `unread`。
+   *
+   * 按 `max` 而非直接赋值：已读/完成都是**单调**的事实（时间只会往前走），
+   * 而到达顺序不保证——一次晚到的旧快照、一次重放的推送都不该把「已经读过」
+   * 打回未读，也不该让「已经跑完」消失。这也让多处来源（listAll / 推送 /
+   * markRead 回包）无需区分优先级，各自合入即收敛。
+   *
+   * 非当前会话才亮蓝点：用户正看着的那条不该有未读角标，这也与 `select()`
+   * 的「打开即清」保持一致。
+   */
+  private mergeWatermarks(id: string, read: number, completed: number): void {
+    const v = this.view(id);
+    v.lastReadAt = Math.max(v.lastReadAt, read);
+    v.lastCompletedAt = Math.max(v.lastCompletedAt, completed);
+    v.unread = id !== this.currentId && v.lastCompletedAt > v.lastReadAt;
   }
 
   /**
@@ -192,6 +235,18 @@ export class ThreadStore {
       this.view(n.params.thread_id).reasoningEffort = n.params.effort ?? null;
       return true;
     }
+    if (n.method === "thread/readStateChanged") {
+      // 跨端同步通道：另一个客户端（如手机）点开了这个会话，服务端推进已读
+      // 水位后广播到这里。**这就是「手机读过、桌面蓝点同时消失」的唯一入口。**
+      // 两个值一起按 max 合入——即便本次只推了已读，完成时间也可能是别的端
+      // 后来才看到的，合并后重算才不会漏掉「读完又跑完一轮」的情形。
+      this.mergeWatermarks(
+        n.params.thread_id,
+        n.params.last_read_at,
+        n.params.last_completed_at,
+      );
+      return true;
+    }
     if (n.method === "thread/permissionModeChanged") {
       // 跨客户端同步通道：另一个客户端（如桌面）切换了该会话的权限模式，服务端
       // 广播到这里（列表层恒推）。`mode` 是服务端权威值，直接采纳——修复前没有
@@ -223,7 +278,16 @@ export class ThreadStore {
       v.info = { cwd: n.params.cwd, model: n.params.model, model_ref: n.params.model_ref ?? null };
       changed = true;
     }
-    if (n.method === "turn/completed" && id !== this.currentId) v.unread = true;
+    if (n.method === "turn/completed") {
+      // 广播发生在服务端落盘**之前**，随后的 `thread/listAll` 可能还读到旧的
+      // `last_completed_at`。故通知自带 `completed_at`（旧服务端没有：退回本地
+      // 时钟），按 max 合入即可收敛，不必另造一套「哪个来源更权威」的机制。
+      const completedAt = n.params.completed_at ?? Date.now();
+      v.lastCompletedAt = Math.max(v.lastCompletedAt, completedAt);
+      // 用户正看着的那个会话不算未读；后台跑完的才算。
+      v.unread = id !== this.currentId && v.lastCompletedAt > v.lastReadAt;
+      return true;
+    }
     return changed;
   }
 

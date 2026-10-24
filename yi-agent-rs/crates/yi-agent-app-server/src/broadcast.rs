@@ -490,6 +490,7 @@ mod tests {
                     turn_id: "u1".to_string(),
                     status: crate::protocol::TurnStatus::Completed,
                     error: None,
+                    completed_at: None,
                 },
             )
             .await

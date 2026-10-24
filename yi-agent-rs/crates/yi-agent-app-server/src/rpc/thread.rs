@@ -704,6 +704,9 @@ pub(crate) async fn handle(
                         turn_id: "crashed".to_string(),
                         status: TurnStatus::Interrupted,
                         error: None,
+                        // 崩溃那轮从未走到收尾，meta 里没有它的完成时间；
+                        // 回放这一刻即客户端「得知它结束」的时刻。
+                        completed_at: Some(crate::thread_store::now_millis()),
                     },
                 )
                 .await?;
@@ -1373,6 +1376,68 @@ pub(crate) async fn handle(
                     .await;
                 }
                 Ok(false) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::unknown_thread(&thread_id)),
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, RpcError::internal(e.to_string())),
+                    )
+                    .await?;
+                }
+            }
+        }
+        // 推进某会话的**共享已读水位**（任一端读过 → 所有端的蓝点消失）。
+        //
+        // 与 `thread/setTag` 同档（Control 起）：`Observe` 是掩码级只读视图，
+        // 它不得推进共享水位——那会让一个只读客户端悄悄改变另一端的未读显示。
+        "thread/markRead" => {
+            if state.client_scope < Scope::Control {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(id, RpcError::insufficient_scope(Scope::Control)),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            let Some(thread_id) =
+                require_thread_id(state.hub, state.client, &req.params, id.clone()).await?
+            else {
+                return Ok(Flow::Continue);
+            };
+            let store = store_lookup(state.threads, state.workspaces, state.cfg, &thread_id);
+            match store.mark_read(&thread_id) {
+                Ok(Some((last_read_at, last_completed_at))) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        ok_response(id, json!({ "last_read_at": last_read_at })),
+                    )
+                    .await?;
+                    // 广播给所有客户端（含本端）：列表层恒推。这正是「手机点开、
+                    // 桌面蓝点同时消失」的通道——若归内容层，未订阅该会话的远程
+                    // 客户端就收不到，另一端会一直亮着。
+                    //
+                    // 即便水位没推进（重复点开同一会话）也照发：它是一次廉价的
+                    // 收敛信号，能让刚重连、还停在旧水位的另一端就地补齐。
+                    let _ = write_notification(
+                        state.hub,
+                        &Notification::ReadStateChanged {
+                            thread_id: thread_id.clone(),
+                            last_read_at,
+                            last_completed_at,
+                        },
+                    )
+                    .await;
+                }
+                Ok(None) => {
                     write_response(
                         state.hub,
                         state.client,

@@ -4261,6 +4261,10 @@ pub(crate) fn thread_summary_json_with_status(
         "status": status,
         "content_epoch": m.content_epoch,
         "last_item_id": m.last_item_id,
+        // 共享已读水位：客户端据此重算未读（`completed > read`）。断线重连后
+        // 这是唯一能补回「离线期间跑完的回合」的来源——推送当时没人在听。
+        "last_read_at": m.last_read_at,
+        "last_completed_at": m.last_completed_at,
     });
     // 只在**合法**组长时发送该 key:普通会话多一个 `"role": null` 会让旧客户端
     // 的字节比对与快照测试失效,而我们只需要一个新值。卡片 worktree 里的
@@ -4519,6 +4523,10 @@ fn checkpoint(
 async fn persist_and_finish_turn(
     thread_id: &str,
     turn_id: Option<&str>,
+    // 随 `turn/completed` 广播出去的那个完成时刻。落盘必须复用它而不是重新取一次
+    // 墙钟：广播发生在落盘之前，各取一次会让落盘值更晚，另一端的客户端收到广播
+    // 立刻 markRead 时写下的已读水位就盖不住它，重连后蓝点复活。
+    completed_at: i64,
     user_prompt: Option<&str>,
     user_attachments: &[crate::protocol::Attachment],
     user_image_refs: &[crate::protocol::ImageRef],
@@ -4588,6 +4596,23 @@ async fn persist_and_finish_turn(
             if let Err(e) = store.touch(thread_id, Some(prompt)) {
                 eprintln!("[app-server] failed to update meta for {thread_id}: {e}");
             }
+        }
+    }
+
+    // 记下**回合结束**时刻：未读由 `last_completed_at > last_read_at` 派生，而
+    // `updated_at` 在回合**开始**时也会被 `touch` 刷新，不能兼任这个职责（否则
+    // 另一端刚发问、还在跑的会话会立刻亮蓝点）。
+    //
+    // 刻意放在 append 成功/失败**之外**：两者是独立失败。日志写不进去只说明内容
+    // 没存下来，回合本身确确实实结束了、用户也在流里看到了输出。把这条记账绑在
+    // append 成功上，这一轮就会在未读口径里凭空消失——另一端重连后毫无「有新内容」
+    // 的提示，直到下一轮跑完。
+    //
+    // 只在 `turn_id.is_some()` 时写：`clear` / `compact` / `SetPreserveThinking`
+    // 收尾传 `None`，它们不是回合结束，记下去会让刚清空上下文的会话凭空亮蓝点。
+    if turn_id.is_some() {
+        if let Err(e) = store.mark_turn_completed(thread_id, completed_at) {
+            eprintln!("[app-server] failed to record turn completion for {thread_id}: {e}");
         }
     }
 
@@ -4757,6 +4782,8 @@ async fn apply_session_command(
             persist_and_finish_turn(
                 thread_id,
                 None,
+                // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
+                0,
                 None,
                 &[],
                 &[],
@@ -4799,6 +4826,8 @@ async fn apply_session_command(
             persist_and_finish_turn(
                 thread_id,
                 None,
+                // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
+                0,
                 None,
                 &[],
                 &[],
@@ -4926,6 +4955,8 @@ async fn apply_session_command(
             persist_and_finish_turn(
                 thread_id,
                 None,
+                // 不是回合结束（turn_id 为 None），完成时刻不写盘；传 0 明示。
+                0,
                 None,
                 &[],
                 &[],
@@ -5169,6 +5200,19 @@ pub(crate) async fn run_thread_driver(
                 // run() 本身失败:翻译成 Error → turn/completed(failed)。
                 for n in translator.on_event(yi_agent_core::AgentEvent::Error(e)) {
                     let _ = write_notification(&hub, &n).await;
+                }
+                // 这条路径不走 `persist_and_finish_turn`，但它**确实**是一次回合
+                // 结束（`turn/completed(failed)` 已发出）。不记完成时间的话，
+                // 「失败也是跑完了」这件事在另一端的未读判定里就查不到——重连后
+                // 蓝点不亮，用户以为还在跑。
+                // 复用刚广播出去的那个完成时刻，理由同常规收尾：落盘值若更晚，
+                // 另一端的 markRead 就盖不住它，蓝点会复活。
+                let failed_at = match translator.completed_at() {
+                    0 => crate::thread_store::now_millis(),
+                    at => at,
+                };
+                if let Err(e) = store.mark_turn_completed(&thread_id, failed_at) {
+                    eprintln!("[app-server] failed to record turn completion for {thread_id}: {e}");
                 }
                 // 中途失败没有「组长说了什么」可言:回复传 `None`,绝不伪造一条
                 // 空回复去糊弄等待方(那比拿不到回复更难排查)。
@@ -5578,9 +5622,17 @@ pub(crate) async fn run_thread_driver(
         }
 
         // 无暂存命令：常规收尾（把本轮结果落盘）。
+        // 与已广播的 `turn/completed.completed_at` 同源；若本轮没有走终结事件
+        // （流意外结束时 `translator` 没来得及定时刻），在这里补一个，以免这次
+        // 回合结束在未读口径里凭空消失。
+        let turn_completed_at = match translator.completed_at() {
+            0 => crate::thread_store::now_millis(),
+            at => at,
+        };
         persist_and_finish_turn(
             &thread_id,
             Some(&turn_id),
+            turn_completed_at,
             Some(&user_prompt),
             &user_attachments,
             &user_image_refs,
@@ -6796,6 +6848,9 @@ pub(crate) async fn start_thread_core(
         content_epoch: 0,
         last_item_id: None,
         anchor_sha,
+        // 新会话：从未被读过、也从未完成过回合 ⇒ 0/0，不亮蓝点。
+        last_read_at: 0,
+        last_completed_at: 0,
     };
     // 组长 meta 可能已由 `ensure_lead_meta` 落盘:此时**不得覆盖**,否则会把它
     // 的 `role: "lead"` 抹掉(本函数的 meta 不带 role),懒创建出来的组长就
@@ -9632,7 +9687,8 @@ mod theme_watcher_tests {
                 thread_id: "t2".into(),
                 turn_id: "u".into(),
                 status: crate::protocol::TurnStatus::Completed,
-                error: None
+                error: None,
+                completed_at: None
             }
             .delivery(),
             Delivery::List
@@ -9694,6 +9750,7 @@ mod theme_watcher_tests {
                 turn_id: "u1".into(),
                 status: crate::protocol::TurnStatus::Completed,
                 error: None,
+                completed_at: None,
             },
         )
         .await

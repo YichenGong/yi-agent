@@ -307,6 +307,26 @@ pub enum Notification {
         #[ts(type = "\"normal\" | \"yolo\"")]
         mode: crate::thread_store::ThreadMode,
     },
+    /// 某会话的**共享已读水位**已推进（任一端读过它）。
+    ///
+    /// 这是「手机点开、桌面蓝点同时消失」的唯一通道：未读由
+    /// `last_completed_at > last_read_at` 派生，一端标记已读后必须让其余端
+    /// 立刻合入新水位。与 `thread/modelChanged` / `thread/permissionModeChanged`
+    /// 同族——都是会话元数据，只带时间戳、不带正文。
+    ///
+    /// 两个值一起发：客户端只需按 `max` 合入，就能在没有额外请求的情况下重算
+    /// 「还该不该亮蓝点」，不必再拉一次 `thread/listAll`。
+    #[serde(rename = "thread/readStateChanged")]
+    ReadStateChanged {
+        thread_id: String,
+        // 线上是 JSON 数字（epoch 毫秒）。与 `RequestId::Num` / `RpcError::code`
+        // 同一口径：`i64` 在本项目一律显式标注为 `number`，否则 ts-rs 会生成
+        // `bigint`，而 wire 上来的、以及与 `Date.now()` 比较的都是普通 number。
+        #[ts(type = "number")]
+        last_read_at: i64,
+        #[ts(type = "number")]
+        last_completed_at: i64,
+    },
     /// 该会话的 reasoning effort 覆盖已切换（或清除）。
     ///
     /// 与 `thread/modelChanged` / `thread/permissionModeChanged` 并列：effort 是
@@ -424,6 +444,19 @@ pub enum Notification {
         #[serde(skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
         error: Option<String>,
+        /// 本轮完成时刻（epoch 毫秒），与落盘的 `last_completed_at` **同源**。
+        ///
+        /// 客户端收到本帧会立刻重拉 `thread/listAll`，而那一次落盘**排在广播
+        /// 之后**（广播在 driver 的流消费处，落盘在 `persist_and_finish_turn`），
+        /// 于是列表里的 `last_completed_at` 可能仍是旧值。自带权威时间戳让客户端
+        /// 按 `max` 合入即可收敛，无需再造一套「哪个来源更权威」的机制。
+        ///
+        /// 可选：旧服务端不发这个字段，客户端退回自己的墙钟（只会多亮一次蓝点，
+        /// 不会漏），故不必为一个「更好一点」的时间戳把线协议变成破坏性变更。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        #[ts(type = "number | null")]
+        completed_at: Option<i64>,
     },
     /// Mid-turn user messages the server could not consume, handed back so the
     /// client can restore them to the input box. Carries the `tag` ids, because
@@ -563,6 +596,7 @@ impl Notification {
             | Notification::ThreadStatusUpdated { thread_id, .. }
             | Notification::ModelChanged { thread_id, .. }
             | Notification::PermissionModeChanged { thread_id, .. }
+            | Notification::ReadStateChanged { thread_id, .. }
             | Notification::ReasoningEffortChanged { thread_id, .. }
             | Notification::PreserveThinkingChanged { thread_id, .. }
             | Notification::TitleChanged { thread_id, .. }
@@ -621,6 +655,7 @@ impl Notification {
             | Notification::TitleChanged { .. }
             | Notification::TagChanged { .. }
             | Notification::GroupsChanged { .. }
+            | Notification::ReadStateChanged { .. }
             | Notification::TurnCompleted { .. } => Delivery::List,
             Notification::UiSettingsUpdated { .. }
             | Notification::TagNamesUpdated { .. }
@@ -1070,6 +1105,7 @@ mod tests {
             turn_id: "u1".into(),
             status: TurnStatus::Completed,
             error: None,
+            completed_at: None,
         };
         let v: Value = serde_json::to_value(&n).unwrap();
         assert_eq!(v["params"]["status"], "completed");

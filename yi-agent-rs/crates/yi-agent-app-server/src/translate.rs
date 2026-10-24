@@ -111,6 +111,13 @@ pub struct Translator {
     /// 本会话所有 subagent 的累计。与 `committed`/`turn`/`usage` 平行但独立：
     /// 它不来自本 thread 的 provider 流，而是从子任务列表汇总来的。
     subagent: crate::protocol::SubagentTotals,
+    /// 本回合的完成时刻，在 [`Translator::finish_turn`] 里**一次性**定下。
+    ///
+    /// 它同时用于两处：随 `turn/completed` 广播出去，以及稍后落盘成
+    /// `last_completed_at`。两处必须同源——广播先于落盘，各取一次墙钟会让落盘
+    /// 值更晚，另一端收到广播就 markRead 时写下的已读水位便盖不住它，重连后
+    /// 蓝点复活。回合未结束时为 0。
+    completed_at: i64,
 }
 
 impl Translator {
@@ -129,6 +136,7 @@ impl Translator {
             committed: baseline,
             turn: UsageTotals::default(),
             subagent: crate::protocol::SubagentTotals::default(),
+            completed_at: 0,
         }
     }
 
@@ -214,6 +222,14 @@ impl Translator {
     /// Set the active turn id (called by the server when a turn starts).
     ///
     /// Notifications that carry `turn_id` use this value. Emits nothing.
+    /// 本回合的完成时刻（0 = 尚未结束）。
+    ///
+    /// 调用方在收尾时用它落盘 `last_completed_at`，从而与已经广播出去的
+    /// `turn/completed.completed_at` 严格同源。见字段文档。
+    pub fn completed_at(&self) -> i64 {
+        self.completed_at
+    }
+
     pub fn set_turn(&mut self, turn_id: String) {
         // 上一轮若以 Error / Cancelled 结束而没走到结算，在这里补上，累计不丢数。
         self.settle_snapshot();
@@ -321,11 +337,16 @@ impl Translator {
     ) {
         self.finalize_agent_msg(out);
         self.finalize_open_tools(ToolStatus::Failed, out);
+        // 先定下时刻，再发通知：落盘稍后会来取同一个值。
+        self.completed_at = crate::thread_store::now_millis();
         out.push(Notification::TurnCompleted {
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
             status,
             error,
+            // 由 `finish_turn` 刚刚定下，落盘复用**同一个**值（见
+            // `Translator::completed_at`）。这里绝不自取墙钟。
+            completed_at: Some(self.completed_at),
         });
     }
 
