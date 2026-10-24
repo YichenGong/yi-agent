@@ -513,3 +513,22 @@ html[data-mobile="true"] {
   display: inline-block;
   margin-left: 0.1em;
 }
+
+/*
+ * 会话内搜索命中。`mark` 自带浏览器默认底色（黄），在深色主题上刺眼且与
+ * 代码高亮的 token 色打架，所以两种状态都由我们接管：
+ * - `.search-hit`：全部命中，半透明琥珀，正文颜色继承原样；
+ * - `.search-hit[data-search-active="true"]`：当前命中，更实的底色 + 描边，
+ *   保证在代码块这类彩色背景上也一眼可辨。
+ */
+mark.search-hit {
+  background-color: rgb(245 158 11 / 0.35);
+  color: inherit;
+  border-radius: 2px;
+}
+
+mark.search-hit[data-search-active="true"] {
+  background-color: rgb(245 158 11 / 0.85);
+  color: #1c1917;
+  outline: 1px solid rgb(251 191 36);
+}
