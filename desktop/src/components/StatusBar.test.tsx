@@ -134,7 +134,9 @@ describe("StatusBar", () => {
         totals: { input: 1_000, output: 100, cacheRead: 10_000, cacheWrite: 0 },
         subagentTotals: { input: 500, output: 50, cacheRead: 5_000 },
         subagentCount: 2,
-        fallbackUsage: null,
+        // 给个能定价的模型：这样主会话成本是真数字，唯一的「—」必定来自
+        // subagent 那行，断言才有区分度。
+        fallbackUsage: { model: "claude-sonnet-4-20250514", input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         usageId: "thread-1",
       }),
     );
@@ -145,8 +147,19 @@ describe("StatusBar", () => {
     expect(screen.getByText("1,000 tokens")).toBeTruthy();
     expect(screen.getByText("500 tokens")).toBeTruthy();
     expect(screen.getByText("5,000 tokens")).toBeTruthy();
-    // 成本只按主会话估：必须标注，否则会被读成合计。
-    expect(screen.getByText("（仅主会话）")).toBeTruthy();
+    /*
+     * 成本按组归属，而不是给合计加一句「仅主会话」的脚注：
+     * 两组各有自己的 Cost 行，Subagents 那份是 —。
+     *
+     * 之所以是 —：subagent 的模型名没随用量上报（`AgentChildUsage` 只有三个
+     * token 字段），没有价目就无从估价。破折号说的是「算不出来」，比把成本
+     * 钉在合计旁边、再补一句排除说明更贴近事实，也让两组结构对称。
+     */
+    // 两组各有一行成本：主会话一行、subagent 一行（后者是 —）。
+    expect(screen.getAllByText("Cost")).toHaveLength(2);
+    expect(screen.getByText("—")).toBeTruthy();
+    // 旧的脚注式限定语必须消失，它与「成本归属到组」是两套表达，同时出现会打架。
+    expect(screen.queryByText("（仅主会话）")).toBeNull();
   });
 
   it("hides the subagent section when there are no subagents", () => {
@@ -163,6 +176,9 @@ describe("StatusBar", () => {
     // 没有 subagent 就不留死行，也不出现成本限定语。
     expect(screen.queryByText("Subagents")).toBeNull();
     expect(screen.queryByText("Session")).toBeNull();
+    // 没有 subagent 时只有一行成本（就是全部），不需要限定语，也没有第二组。
+    // 不给 model 时这一行的值本身是 —（未知模型），与 subagent 的缺失是两回事。
+    expect(screen.getAllByText("Cost")).toHaveLength(1);
     expect(screen.queryByText("（仅主会话）")).toBeNull();
   });
 
