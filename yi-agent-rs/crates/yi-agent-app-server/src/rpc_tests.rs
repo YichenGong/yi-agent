@@ -2312,6 +2312,7 @@ impl Harness {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 models_path: models_dir.path().join("models.json"),
+                websearch_path: models_dir.path().join("websearch.json"),
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
@@ -4048,6 +4049,7 @@ async fn eof_exits_gracefully() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
             session_groups_enabled: false,
             onboarding_env_path: PathBuf::new(),
@@ -4133,6 +4135,7 @@ async fn agent_factory_failure_returns_internal_error() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
             session_groups_enabled: false,
             onboarding_env_path: PathBuf::new(),
@@ -4220,6 +4223,7 @@ async fn oversized_frame_returns_err() {
             runtimes: Arc::new(StdMutex::new(HashMap::new())),
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
+            websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
             session_groups_enabled: false,
             onboarding_env_path: PathBuf::new(),
@@ -14909,6 +14913,38 @@ async fn an_observe_client_may_list_but_not_write_models() {
     h.shutdown().await;
 }
 
+/// `websearch/get` 只读盘且只回掩码,`Observe` 即可;`set` / `test` 触及密钥,
+/// 必须 `Control` —— 与 `model/*` 同一档位划分。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_observe_client_may_read_websearch_but_not_write_it() {
+    let mut h = (Harness::with_scope(Scope::Observe)).await;
+    initialize(&mut h).await;
+    h.send(r#"{"jsonrpc":"2.0","id":20,"method":"websearch/get","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 20).await;
+    assert!(
+        v["result"]["engines"]["bocha"].is_object(),
+        "Observe may read the masked config: {v}"
+    );
+
+    h.send(r#"{"jsonrpc":"2.0","id":21,"method":"websearch/set","params":{"enabled":false}}"#)
+        .await;
+    let v = read_response(&mut h, 21).await;
+    assert_eq!(
+        v["error"]["code"], -32014,
+        "writes require Control, Observe must be refused: {v}"
+    );
+
+    h.send(r#"{"jsonrpc":"2.0","id":22,"method":"websearch/test","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 22).await;
+    assert_eq!(
+        v["error"]["code"], -32014,
+        "connection tests touch the key, so they require Control: {v}"
+    );
+    h.shutdown().await;
+}
+
 /// `onboarding/status` 只读,`Observe` 即可:空白机器上「需要引导」且未 dismiss。
 #[tokio::test(flavor = "multi_thread")]
 async fn onboarding_status_is_readable_and_reports_needed() {
@@ -17665,6 +17701,7 @@ impl MergedHarness {
                 runtimes: Arc::new(StdMutex::new(HashMap::new())),
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 models_path: PathBuf::new(),
+                websearch_path: PathBuf::new(),
                 lead_agent_enabled: false,
                 session_groups_enabled: false,
                 onboarding_env_path: PathBuf::new(),

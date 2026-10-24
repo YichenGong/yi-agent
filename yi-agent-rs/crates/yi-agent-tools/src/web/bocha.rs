@@ -4,28 +4,27 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ToolsError;
+use crate::web::config::{DEFAULT_BOCHA_BASE_URL, Freshness};
 use crate::web::provider::{SearchResult, WebSearchProvider};
 
 pub struct BochaSearchProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    freshness: Freshness,
 }
 
 impl BochaSearchProvider {
     pub fn new(api_key: String) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("failed to build reqwest client");
-        Self {
-            client,
+        Self::with_options(
             api_key,
-            base_url: "https://api.bocha.cn/v1".to_string(),
-        }
+            DEFAULT_BOCHA_BASE_URL.to_string(),
+            Freshness::NoLimit,
+        )
     }
 
-    pub fn with_base_url(api_key: String, base_url: String) -> Self {
+    /// 带完整参数的构造：设置页可改端点与时效，这两个曾经是硬编码。
+    pub fn with_options(api_key: String, base_url: String, freshness: Freshness) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
@@ -34,7 +33,12 @@ impl BochaSearchProvider {
             client,
             api_key,
             base_url,
+            freshness,
         }
+    }
+
+    pub fn with_base_url(api_key: String, base_url: String) -> Self {
+        Self::with_options(api_key, base_url, Freshness::NoLimit)
     }
 
     #[cfg(test)]
@@ -48,6 +52,7 @@ impl BochaSearchProvider {
             client,
             api_key,
             base_url,
+            freshness: Freshness::NoLimit,
         }
     }
 
@@ -111,7 +116,7 @@ impl WebSearchProvider for BochaSearchProvider {
             query: query.to_string(),
             summary: true,
             count,
-            freshness: "noLimit".to_string(),
+            freshness: self.freshness.as_bocha_str().to_string(),
         };
 
         let resp = self
@@ -175,7 +180,7 @@ impl WebSearchProvider for BochaSearchProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_response() -> String {
@@ -205,6 +210,42 @@ mod tests {
             }
         }"#
         .to_string()
+    }
+
+    /// `freshness` 曾是硬编码 "noLimit"，用户改不了。现在必须随构造参数走，
+    /// 否则设置页里的时效下拉框就是个摆设。
+    #[tokio::test]
+    async fn freshness_reaches_the_request_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/web-search"))
+            .and(body_json(serde_json::json!({
+                "query": "q",
+                "summary": true,
+                "count": 3,
+                "freshness": "oneWeek",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 200,
+                "data": { "webPages": { "value": [] } }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = BochaSearchProvider::with_options(
+            "test-key".to_string(),
+            server.uri(),
+            Freshness::OneWeek,
+        );
+        // body_json 不匹配时 wiremock 回 404，这次 unwrap 就会炸。
+        provider.search("q", 3).await.unwrap();
+    }
+
+    /// 默认构造仍可用（`new` 的内部实现改成了转调 `with_options`）。
+    #[tokio::test]
+    async fn new_still_works() {
+        let provider = BochaSearchProvider::new("k".to_string());
+        assert_eq!(provider.name(), "bocha");
     }
 
     #[tokio::test]

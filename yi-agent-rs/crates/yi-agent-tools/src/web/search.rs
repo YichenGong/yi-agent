@@ -12,11 +12,20 @@ const DEFAULT_COUNT: usize = 25;
 
 pub struct WebSearchTool {
     engine: Arc<dyn WebSearchProvider>,
+    /// 调用方未显式给 `count` 时用它。来自 `websearch.json`，可被设置页改动。
+    default_count: usize,
 }
 
 impl WebSearchTool {
     pub fn new(engine: Arc<dyn WebSearchProvider>) -> Self {
-        Self { engine }
+        Self::with_default_count(engine, DEFAULT_COUNT)
+    }
+
+    pub fn with_default_count(engine: Arc<dyn WebSearchProvider>, default_count: usize) -> Self {
+        Self {
+            engine,
+            default_count: default_count.clamp(1, 50),
+        }
     }
 }
 
@@ -54,7 +63,7 @@ impl Tool for WebSearchTool {
             Err(e) => return ToolsError::ArgsParse(e).into(),
         };
 
-        let count = args.count.unwrap_or(DEFAULT_COUNT);
+        let count = args.count.unwrap_or(self.default_count);
         tracing::info!(tool = "web_search", query = %args.query, count, "search start");
 
         match self.engine.search(&args.query, count).await {
@@ -167,6 +176,29 @@ mod tests {
         } else {
             panic!("expected text block");
         }
+    }
+
+    #[tokio::test]
+    async fn a_configured_default_count_replaces_the_hardcoded_25() {
+        let provider = std::sync::Arc::new(MockProvider {
+            results: vec![],
+            last_count: std::sync::Mutex::new(None),
+        });
+        let tool = WebSearchTool::with_default_count(provider.clone(), 7);
+        tool.call(serde_json::json!({"query": "test"})).await;
+        assert_eq!(*provider.last_count.lock().unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_count_still_wins_over_the_default() {
+        let provider = std::sync::Arc::new(MockProvider {
+            results: vec![],
+            last_count: std::sync::Mutex::new(None),
+        });
+        let tool = WebSearchTool::with_default_count(provider.clone(), 7);
+        tool.call(serde_json::json!({"query": "test", "count": 3}))
+            .await;
+        assert_eq!(*provider.last_count.lock().unwrap(), Some(3));
     }
 
     #[tokio::test]

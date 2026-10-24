@@ -23,6 +23,39 @@ describe("SettingsDialog", () => {
     expect(screen.getByRole("button", { name: "浅色" }).getAttribute("aria-pressed")).toBe("false");
   });
 
+  it("renders the 网页搜索 tab and reads config through the injected seam", async () => {
+    const call = vi.fn(async (m: string) =>
+      m === "websearch/get"
+        ? {
+            enabled: true,
+            active_engine: "bocha",
+            path: "/p/websearch.json",
+            engines: {
+              bocha: {
+                api_key_masked: "••••1234",
+                has_key: true,
+                base_url: "https://api.bocha.cn/v1",
+                count: 25,
+                freshness: "noLimit",
+              },
+            },
+          }
+        : { ok: true },
+    );
+    render(
+      <SettingsDialog
+        open
+        theme="dark"
+        onThemeChange={() => {}}
+        onClose={() => {}}
+        websearchCall={call}
+      />,
+    );
+    fireEvent.click(screen.getByRole("tab", { name: "网页搜索" }));
+    expect(await screen.findByLabelText("API Key")).toBeTruthy();
+    expect(call).toHaveBeenCalledWith("websearch/get", {});
+  });
+
   it("reports the chosen theme", () => {
     const onThemeChange = vi.fn();
     render(
@@ -161,10 +194,19 @@ describe("SettingsDialog", () => {
     expect(saveTagName).toHaveBeenCalledWith("red", "紧急");
   });
 
-  it("lists all seven categories on the desktop", () => {
+  it("lists all eight categories on the desktop", () => {
     render(<SettingsDialog open theme="dark" onThemeChange={() => {}} onClose={() => {}} />);
     const names = screen.getAllByRole("tab").map((t) => t.textContent);
-    expect(names).toEqual(["通用", "远程访问", "插件", "模型", "技能", "MCP", "标签"]);
+    expect(names).toEqual([
+      "通用",
+      "远程访问",
+      "插件",
+      "模型",
+      "技能",
+      "MCP",
+      "网页搜索",
+      "标签",
+    ]);
   });
 
   it("hides the flags tab in a stable build", () => {
@@ -340,6 +382,7 @@ describe("SettingsDialog phone layout hooks", () => {
       "models",
       "skills",
       "mcp",
+      "websearch",
       "tags",
     ]);
   });

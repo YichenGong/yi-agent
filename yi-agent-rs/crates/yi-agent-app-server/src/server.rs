@@ -395,6 +395,10 @@ pub(crate) struct RuntimeAttachments {
     /// is: `model/*` must be testable without writing the developer's real
     /// machine-level catalog (and its API keys).
     pub(crate) models_path: PathBuf,
+    /// Where `websearch.json` lives. Injectable for the same reason
+    /// `models_path` is: the 网页搜索 panel must be testable without writing
+    /// the developer's real machine-level config.
+    pub(crate) websearch_path: PathBuf,
     /// 组长开关的**生效值**，装配时算一次。
     ///
     /// 只放结论、不放路径：若把 `flags.json` 路径传下来再让 `serve()` 解析，
@@ -1956,6 +1960,7 @@ where
             runtimes,
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
+            websearch_path: yi_agent_tools::websearch_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             session_groups_enabled: crate::groups_gate::from_process_environment(),
@@ -2045,6 +2050,7 @@ where
             runtimes,
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
+            websearch_path: yi_agent_tools::websearch_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             session_groups_enabled: crate::groups_gate::from_process_environment(),
@@ -3142,6 +3148,7 @@ where
         runtimes,
         thread_roots,
         models_path,
+        websearch_path,
         onboarding_env_path,
         onboarding_preferences_path,
         resident_dir,
@@ -3440,6 +3447,7 @@ where
                             cfg: &cfg,
                             theme_handle: &theme_handle,
                             models_path: &models_path,
+                            websearch_path: &websearch_path,
                             probes: &probes,
                             onboarding_env_path: &onboarding_env_path,
                             onboarding_preferences_path: &onboarding_preferences_path,
@@ -3641,6 +3649,13 @@ where
                             // `continue`)。
                             crate::rpc::Flow::Continue => continue,
                             // 域内 `_` 才可能到这里:交回下面的原始 dispatch。
+                            crate::rpc::Flow::Unknown => {}
+                        }
+                    }
+                    crate::rpc::Domain::WebSearch => {
+                        let mut state = app_state!();
+                        match crate::rpc::websearch::handle(&mut state, &req, id.clone()).await? {
+                            crate::rpc::Flow::Continue => continue,
                             crate::rpc::Flow::Unknown => {}
                         }
                     }

@@ -470,6 +470,20 @@ export default function App() {
   );
 
   /**
+   * 「网页搜索」Tab 的宿主接缝。理由同 `modelCall`：只闭合 `clientRef`，空依赖
+   * 即稳定；若每次渲染换新身份，面板的读取 effect 会跟着重跑，把用户没保存的
+   * 编辑冲掉。
+   */
+  const websearchCall = useCallback(
+    (method: string, params: unknown): Promise<unknown> => {
+      const c = clientRef.current;
+      if (!c) return Promise.reject(new Error("not connected"));
+      return c.request(method, params);
+    },
+    [],
+  );
+
+  /**
    * 「实验功能」Tab 的宿主接缝。理由同 `pluginCall`：只闭合 `clientRef`，空依赖
    * 即稳定；换新身份会让面板的读取 effect 重跑。
    *
@@ -2828,6 +2842,7 @@ export default function App() {
         // 复用插件/技能那份——三者指的都是「项目目录下的 .yi-agent」，来源分叉会让
         // 用户在三个面板里看到不同的项目列表。
         mcpCall={mcpCall}
+        websearchCall={websearchCall}
         mcpProjects={pluginProjectPaths(sess.workspaces, board.boards)}
         mcpDefaultProject={current?.info?.cwd}
         // 插件清单按项目安装，桌面侧车 app-server 的 workdir 却是 home，所以设置页

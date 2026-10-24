@@ -16,7 +16,7 @@ mod web;
 pub mod image_prep;
 pub mod worktree;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use yi_agent_core::ToolRegistry;
@@ -33,7 +33,14 @@ pub use sandbox::{SandboxController, SandboxMode, SandboxPolicy};
 pub use shell::BashTool;
 pub use shell::blocklist;
 pub use skill_tool::SkillTool;
-pub use web::{BochaSearchProvider, SearchResult, WebFetchTool, WebSearchProvider, WebSearchTool};
+pub use web::config::{
+    EngineConfig, Freshness, WebSearchConfig, load_websearch_config, load_websearch_config_from,
+    websearch_path,
+};
+pub use web::{
+    BochaSearchProvider, SearchResult, UnconfiguredProvider, WebFetchTool, WebSearchProvider,
+    WebSearchTool,
+};
 
 /// Register managed background process tools with a shared process manager.
 pub fn register_process_tools(registry: &mut ToolRegistry, manager: Arc<ProcessManager>) {
@@ -49,7 +56,8 @@ pub fn register_process_tools(registry: &mut ToolRegistry, manager: Arc<ProcessM
 ///
 /// Web tools:
 /// - WebFetchTool is always registered.
-/// - WebSearchTool is only registered if BOCHA_API_KEY env var is set.
+/// - WebSearchTool 按 `~/.yi-agent/websearch.json` 决定，详见
+///   [`register_web_search_from`]。
 pub fn register_builtin_tools(registry: &mut ToolRegistry, root: PathBuf) {
     register_builtin_tools_with_sandbox(
         registry,
@@ -132,10 +140,34 @@ pub fn register_builtin_tools_with_controller_and_env(
 
     // Web tools
     registry.register(Arc::new(WebFetchTool::new()));
-    if let Some(bocha) = BochaSearchProvider::from_env() {
-        registry.register(Arc::new(WebSearchTool::new(Arc::new(bocha))));
+    register_web_search_from(registry, &websearch_path());
+}
+
+/// 按配置注册网页搜索工具。
+///
+/// 三种情形，都刻意与「静默消失」不同：
+/// - `enabled == false`：用户明确关掉了，不注册。
+/// - `enabled == true` 且无 key：注册占位实现，调用时给出「未配置」原因。
+/// - `enabled == true` 且有 key：注册真实的 Bocha provider。
+pub fn register_web_search_from(registry: &mut ToolRegistry, path: &Path) {
+    let cfg = web::config::load_websearch_config_from(path);
+    if !cfg.enabled {
+        return;
     }
-    // BOCHA_API_KEY not set: WebSearchTool not registered
+    let engine = cfg.active().cloned().unwrap_or_default();
+    let default_count = engine.clamped_count();
+    let provider: Arc<dyn WebSearchProvider> = match engine.resolved_api_key() {
+        Some(key) => Arc::new(BochaSearchProvider::with_options(
+            key,
+            engine.resolved_base_url(),
+            engine.freshness,
+        )),
+        None => Arc::new(UnconfiguredProvider),
+    };
+    registry.register(Arc::new(WebSearchTool::with_default_count(
+        provider,
+        default_count,
+    )));
 }
 
 #[cfg(test)]
@@ -181,6 +213,67 @@ mod tests {
         assert!(!result.is_error, "bash failed: {:?}", result.content);
         if let yi_agent_core::ContentBlock::Text(s) = &result.content[0] {
             assert!(s.contains("thread-abc"), "env must reach the child: {s}");
+        } else {
+            panic!("expected text block");
+        }
+    }
+
+    /// 关掉开关就不该注册任何搜索工具。
+    #[test]
+    fn a_disabled_config_registers_no_search_tool() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = dir.path().join("websearch.json");
+        std::fs::write(&cfg, r#"{"enabled":false}"#).unwrap();
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        register_web_search_from(&mut registry, &cfg);
+        assert!(registry.get("web_search").is_none());
+    }
+
+    /// 开着但没有 key：仍注册，调用时回明确原因（而不是工具消失）。
+    #[tokio::test]
+    async fn enabled_without_a_key_registers_a_tool_that_explains_itself() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = dir.path().join("websearch.json");
+        std::fs::write(
+            &cfg,
+            r#"{"enabled":true,"engines":{"bocha":{"api_key":""}}}"#,
+        )
+        .unwrap();
+        // 保证测试不受本机真实环境变量影响。
+        unsafe { std::env::remove_var("BOCHA_API_KEY") };
+
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        register_web_search_from(&mut registry, &cfg);
+        let tool = registry
+            .get("web_search")
+            .expect("must still be registered");
+        let out = tool.call(serde_json::json!({"query": "x"})).await;
+        assert!(out.is_error);
+        if let yi_agent_core::ContentBlock::Text(s) = &out.content[0] {
+            assert!(s.contains("not configured"), "got: {s}");
+        } else {
+            panic!("expected text block");
+        }
+    }
+
+    /// 配了 key 就注册真实 provider（用不可达端点，断言错误来自 HTTP 而非
+    /// 「未配置」——证明走的是 Bocha 通道）。
+    #[tokio::test]
+    async fn a_configured_key_registers_the_bocha_provider() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cfg = dir.path().join("websearch.json");
+        std::fs::write(
+            &cfg,
+            r#"{"enabled":true,"engines":{"bocha":{"api_key":"k","base_url":"http://127.0.0.1:1","count":9}}}"#,
+        )
+        .unwrap();
+        let mut registry = yi_agent_core::ToolRegistry::new();
+        register_web_search_from(&mut registry, &cfg);
+        let tool = registry.get("web_search").expect("registered");
+        let out = tool.call(serde_json::json!({"query": "x"})).await;
+        assert!(out.is_error);
+        if let yi_agent_core::ContentBlock::Text(s) = &out.content[0] {
+            assert!(!s.contains("not configured"), "should have hit HTTP: {s}");
         } else {
             panic!("expected text block");
         }
