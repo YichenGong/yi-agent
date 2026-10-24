@@ -113,3 +113,31 @@ nongit.app (LSEnvironment YI_AGENT_HOME=/Users/x/.yi-agent-nongit)
 - 不引入新的 CLI 旗舰参数或配置文件；复用现成的 `YI_AGENT_HOME`。
 - 不改 sidecar 侧的 paths 语义。
 - 不做 app 内的"实例切换 UI"。
+
+## 实现与验收记录（2026-10-25）
+
+实现落在 `desktop/src-tauri/src/bridge.rs`：
+
+- `instance_home_from(override, home)`：归一化规则与 `yi_agent-store` 一致
+- `instance_home()`：读 `YI_AGENT_HOME` + `dirs::home_dir()`
+- `sidecar_cwd_from(override, home)`：取实例 home 的父目录给 sidecar 当 cwd
+- `configured_relay` / `set_relay_url` / `spawn_once` 三处改用上述函数
+
+测试：`desktop` crate 33 passed（新增 7 个：4 个 `instance_home_*`、
+`configured_relay_reads_the_instance_home_preferences`、
+`sidecar_cwd_prefers_the_instance_home`、`sidecar_cwd_falls_back_to_the_platform_home`）。
+
+手工验收（`/Applications/yi-agent-nongit.app`，`LSEnvironment.YI_AGENT_HOME=~/.yi-agent-nongit`）：
+
+| 项 | 结果 |
+| --- | --- |
+| 正式版 sidecar | `--relay ...session=fe42addb...`（读 `~/.yi-agent`） |
+| nongit sidecar | **无 `--relay` 参数**（读 `~/.yi-agent-nongit/.yi-agent`，尚未配置） |
+| nongit 独立目录 | `~/.yi-agent-nongit/.yi-agent/` 已创建，内含 `trace/` |
+| `YI_AGENT_HOME` 对 sidecar 生效 | `app-server` 直接读该变量，thread/start 走到 `model_not_configured`（新实例无模型配置，符合预期） |
+
+结论：两个 app 的 relay session 已彻底分开，daemon / runtime / threads 各自独立。
+
+**遗留观察**：Tauri 的 `setup` 里 `bridge::spawn` 在 `open -a` 启动时不总是立刻
+拉起 sidecar（本次验收里用命令行直接运行 desktop 二进制才稳定复现）。该现象
+与本次改动无关（改动前同样如此），另行跟踪。
