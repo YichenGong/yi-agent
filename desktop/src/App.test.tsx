@@ -3741,6 +3741,25 @@ describe("relay handshake recovery wiring", () => {
 //  - 子 agent 的卡片列表与轨迹详情都收在该栏的「子 agent」Tab 内（点卡片下钻、
 //    「返回子 agent 列表」退回），不再有单独的「收起子 agent」按钮。
 describe("App 会话详情栏的开合", () => {
+  it("keeps the detail panel open when the same thread is selected again", async () => {
+    // 重连与「点已选中的那一行」都会走 selectThread；会话没变就不该把右侧
+    // 面板、diff、进程详情当成"上一个会话的残留"清掉。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const toggle = await screen.findByLabelText("会话详情面板");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"));
+    // 再点一次同一会话：默认夹具里它叫 "one"（见 App.test.tsx 的 listAll 桩）。
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(1),
+    );
+    // 面板没有被当成"上一个会话的残留"收起。
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+
   it("状态栏图标开合详情栏，栏页眉可关闭", async () => {
     render(<App />);
     await screen.findByLabelText("会话详情面板");

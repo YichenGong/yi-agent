@@ -670,6 +670,9 @@ export default function App() {
     opts?: { leaveBoard?: boolean; forceResume?: boolean },
   ) => {
     const prevId = store.currentId;
+    // 只有**换了会话**才清附属视图：清空是为了「别把 A 的数据画在 B 上」，
+    // 会话没变时（重连重放、点已选中的那一行）不存在错配，清掉纯属打断用户。
+    const changed = prevId !== null && prevId !== id;
     store.select(id);
     // 把「已读」上报给服务端：`store.select` 只清了本地蓝点，服务端水位不知道。
     // 不上报的话，下一次 `thread/listAll`（或重连后的 `seed`）会按旧水位把蓝点
@@ -693,16 +696,20 @@ export default function App() {
     if (opts?.leaveBoard !== false) board.setSelectedBoard(null);
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) sess.setSidebarOpen(false);
-    sess.setPanelOpen(false);
-    diff.resetThreadDiff();
+    if (changed) {
+      sess.setPanelOpen(false);
+      diff.resetThreadDiff();
+    }
     force((v) => v + 1);
     // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
     void sess.refreshSubagents(id);
     // 该对话的后台进程:重进对话时重新拉取。
     void proc.refreshProcesses(id);
-    // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
-    proc.setOpenProcessId(null);
-    proc.setProcessOutput(null);
+    if (changed) {
+      // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
+      proc.setOpenProcessId(null);
+      proc.setProcessOutput(null);
+    }
     // 服务端对本次会话的裁决（spec §4.2）。注意 plan 以 threadId 为键直接查：
     // 被删除的会话不会出现在 listAll 里，靠 summary 反查必然查不到它的 `drop`。
     // `noneNeedsCatchUp`：裁决为 none 的缓存会话仍**可能落后于服务端尾部**——
