@@ -103,6 +103,8 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     // `flags/list` 里 `session_groups` 的值。默认**开**：既有分组用例测的都是
     // "开关打开时的行为"，缺省成关会让它们全部在测另一条分支。
     groupsFlagEnabled: true,
+    // `flags/list` 里 `session_search` 的值。默认**关**：本组用例显式打开。
+    searchFlagEnabled: false,
   },
   // 捕获 `@tauri-apps/api/webview` 注册的拖放 handler，供用例驱动事件。
   dragDrop: { fn: null as null | ((event: unknown) => void) },
@@ -280,6 +282,13 @@ vi.mock("./lib/rpc", () => ({
               expires_on: "2027-04-30",
               source: state.groupsFlagEnabled ? "file" : "default",
             },
+            {
+              name: "session_search",
+              summary: "会话内搜索",
+              enabled: state.searchFlagEnabled,
+              expires_on: "2027-04-30",
+              source: state.searchFlagEnabled ? "file" : "default",
+            },
           ],
         };
       }
@@ -290,6 +299,7 @@ vi.mock("./lib/rpc", () => ({
         if (name === "lead_agent") state.leadFlagEnabled = enabled;
         if (name === "superpowers_kanban") state.kanbanFlagEnabled = enabled;
         if (name === "session_groups") state.groupsFlagEnabled = enabled;
+        if (name === "session_search") state.searchFlagEnabled = enabled;
         return { name, enabled };
       }
       if (method === "thread/lead") {
@@ -5558,5 +5568,95 @@ describe("拖入路径", () => {
       dragDrop.fn?.({ payload: { type: "drop", paths: ["/a"], position: { x: 900, y: 900 } } });
     });
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
+  });
+});
+
+describe("session search (Cmd+F)", () => {
+  /** 推进到 initialize 之后（App 挂载即发 initialize）。 */
+  async function settle() {
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "initialize")).toBe(true),
+    );
+    // 会话列表就绪（默认线程标题是 "one"），主区域才有转录可搜。
+    await screen.findByText("one");
+  }
+
+  function pressCmdF() {
+    const event = new KeyboardEvent("keydown", {
+      key: "f",
+      metaKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.dispatchEvent(event);
+    return event;
+  }
+
+  /**
+   * 查找条。**不能**用 `getByRole("searchbox")`：侧栏本来就有一个
+   * `aria-label="搜索会话"` 的搜索框，两者角色相同会撞车。这里按查找条自己的
+   * 无障碍名收窄。
+   */
+  const findBar = () => screen.queryByRole("searchbox", { name: "查找文本" });
+
+  it("opens the search bar on Cmd+F when the flag is on", async () => {
+    state.searchFlagEnabled = true;
+    render(<App />);
+    await settle();
+    pressCmdF();
+    expect(await screen.findByRole("searchbox", { name: "查找文本" })).toBeTruthy();
+  });
+
+  it("does nothing on Cmd+F when the flag is off", async () => {
+    state.searchFlagEnabled = false;
+    render(<App />);
+    await settle();
+    const event = pressCmdF();
+    expect(findBar()).toBeNull();
+    // flag 关时必须放行给 webview 的原生查找，不能 preventDefault。
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("closes the search bar on Escape", async () => {
+    state.searchFlagEnabled = true;
+    render(<App />);
+    await settle();
+    pressCmdF();
+    await screen.findByRole("searchbox", { name: "查找文本" });
+    fireEvent.keyDown(document, { key: "Escape" });
+    await waitFor(() => expect(findBar()).toBeNull());
+  });
+
+  it("picks up a flag toggled through flags/set without a restart", async () => {
+    // 走真实通路：设置页拨开关 → flags/set → flagsCall 回灌权威值 → Cmd+F 生效。
+    // 直接改 mock state 是测不出回灌这一段接线的。
+    state.searchFlagEnabled = false;
+    render(<App />);
+    await settle();
+    expect(findBar()).toBeNull();
+
+    // 打开设置 → 实验功能 → 拨开 session_search 的复选框。
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    fireEvent.click(await screen.findByRole("tab", { name: "实验功能" }));
+    const toggle = await screen.findByRole("checkbox", { name: /session_search 开关/ });
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(state.searchFlagEnabled).toBe(true),
+    );
+    // 关掉设置页，回到对话。
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    pressCmdF();
+    expect(await screen.findByRole("searchbox", { name: "查找文本" })).toBeTruthy();
+  });
+
+  it("does not open the search bar while a modal is up", async () => {
+    state.searchFlagEnabled = true;
+    render(<App />);
+    await settle();
+    fireEvent.click(screen.getByRole("button", { name: "设置" }));
+    await screen.findByRole("tab", { name: "实验功能" });
+    pressCmdF();
+    expect(findBar()).toBeNull();
   });
 });
