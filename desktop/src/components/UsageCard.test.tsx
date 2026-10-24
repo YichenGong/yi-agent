@@ -63,18 +63,27 @@ describe("UsageCard", () => {
     expect(screen.getByText("4,000")).toBeTruthy();
   });
 
-  it("scopes the cost line to the main session when subagents exist", () => {
+  it("gives each group its own cost line when subagents exist", () => {
     render(
       <UsageCard report={report({ subagent: [{ label: "Input", value: 500 }] })} />,
     );
-    // 子任务跑在独立进程里、模型名没随用量上报，不标注就会被读成合计。
-    expect(screen.getByText("（仅主会话）")).toBeTruthy();
+    /*
+     * 成本按组归属：主会话一行（有价目 → 真数字），subagent 一行（—）。
+     * 这取代了原先给合计加「（仅主会话）」脚注的做法 —— 脚注要求读者把那句话
+     * 与被限定的数字对上，成本一多就说不清是哪一个。
+     */
+    expect(screen.getAllByText("成本")).toHaveLength(2);
+    expect(screen.getByText("$1.23")).toBeTruthy();
+    // subagent 的模型名没随用量上报，无从估价。
+    expect(screen.getByText("—")).toBeTruthy();
+    expect(screen.queryByText("仅主会话")).toBeNull();
   });
 
-  it("keeps the whole cost line when there are no subagents", () => {
+  it("has a single cost line when there are no subagents", () => {
     render(<UsageCard report={report()} />);
-    expect(screen.queryByText("（仅主会话）")).toBeNull();
+    expect(screen.getAllByText("成本")).toHaveLength(1);
     expect(screen.getByText("$1.23")).toBeTruthy();
+    expect(screen.queryByText("仅主会话")).toBeNull();
   });
 
   it("says the numbers are one turn when there are no cumulative totals", () => {

@@ -32,10 +32,26 @@ export function UsagePanel({
 }) {
   // 快照兜底（老服务端）时没有 subagent 数据可言：那种情况下 subagentTotals 恒为
   // 零，hasSubagents 自然为假，两处无需再特判。
-  const costOf = (input: number, output: number, cacheRead: number, cacheWrite: number) =>
-    model
-      ? formatCost(estimateCost({ model, input, output, cacheRead, cacheWrite }))
-      : "—";
+  const sessionCost = model
+    ? formatCost(
+        estimateCost({
+          model,
+          input: totals.input,
+          output: totals.output,
+          cacheRead: totals.cacheRead,
+          cacheWrite: totals.cacheWrite,
+        }),
+      )
+    : "—";
+  /*
+   * subagent 的成本恒为 `—`：它跑在独立 daemon 进程里，上报的只有三个 token
+   * 数（`AgentChildUsage` 没有模型名），没有价目就无从估价。
+   *
+   * 用破折号而不是把「不含 subagent」写成合计的脚注：成本按组归属时，两组
+   * 各有自己的 Cost 行，缺失本身就是信息；脚注则要求读者把那句话与被限定的
+   * 数字对上，还容易与浮层标题 "Usage (this session)" 里的 session 混淆。
+   */
+  const SUBAGENT_COST = "—";
   return (
     <div
       id="usage-panel"
@@ -66,6 +82,8 @@ export function UsagePanel({
             <dd className="text-right">{thousands(totals.cacheWrite)} tokens</dd>
           </>
         )}
+        <dt className="text-fg-muted">Cost</dt>
+        <dd className="text-right">{sessionCost}</dd>
         {hasSubagents && (
           <>
             <dt className="col-span-2 mt-2 text-fg">Subagents</dt>
@@ -75,6 +93,8 @@ export function UsagePanel({
             <dd className="text-right">{thousands(subagentTotals.output)} tokens</dd>
             <dt className="text-fg-muted">Cache read</dt>
             <dd className="text-right">{thousands(subagentTotals.cacheRead)} tokens</dd>
+            <dt className="text-fg-muted">Cost</dt>
+            <dd className="text-right">{SUBAGENT_COST}</dd>
           </>
         )}
         {model && (
@@ -85,17 +105,7 @@ export function UsagePanel({
             </dd>
           </>
         )}
-        <dt className="text-fg-muted">Est. cost</dt>
-        <dd className="text-right">
-          {costOf(totals.input, totals.output, totals.cacheRead, totals.cacheWrite)}
-        </dd>
-        {/*
-         * 成本只按主会话估：subagent 用的是哪个模型这次没有采集（子任务在独立
-         * daemon 进程里，模型名没随用量上报）。不加这行限定语，用户会以为是合计。
-         */}
-        {hasSubagents && (
-          <dd className="col-span-2 text-right text-fg-muted">（仅主会话）</dd>
-        )}
+
       </dl>
     </div>
   );

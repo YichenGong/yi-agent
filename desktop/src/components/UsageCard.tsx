@@ -34,6 +34,16 @@ function Rows({ rows }: { rows: UsageGroupRow[] }) {
   );
 }
 
+/** 一组内的一行成本。标签列与 `Rows` 对齐，值列同样右看齐到同一栏。 */
+function CostRow({ value }: { value: string }) {
+  return (
+    <div className="flex gap-3">
+      <span className="w-24 shrink-0 text-fg-muted">成本</span>
+      <span className="min-w-0 break-all text-fg">{value}</span>
+    </div>
+  );
+}
+
 export function UsageCard({ report }: { report: UsageReport }) {
   const grouped = report.subagent !== null;
   return (
@@ -57,26 +67,23 @@ export function UsageCard({ report }: { report: UsageReport }) {
         <div className="flex flex-col gap-0.5">
           {grouped && <div className="text-xs text-fg-subtle">主会话</div>}
           <Rows rows={report.session.rows} />
+          <CostRow value={report.cost} />
         </div>
 
         {report.subagent !== null && (
           <div className="flex flex-col gap-0.5">
             <div className="text-xs text-fg-subtle">Subagents</div>
             <Rows rows={report.subagent} />
+            {/*
+             * subagent 的成本恒为 —：它跑在独立 daemon 进程里，上报的只有三个
+             * token 数（`AgentChildUsage` 没有模型名），没有价目就无从估价。
+             * 用破折号而不是给合计加「（仅主会话）」脚注：成本按组归属时，缺失
+             * 本身就是信息，两组结构也对称。
+             */}
+            <CostRow value="—" />
           </div>
         )}
 
-        <div className="flex gap-3">
-          <span className="w-24 shrink-0 text-fg-muted">估算成本</span>
-          <span className="min-w-0 break-all text-fg">
-            {report.cost}
-            {/*
-             * 成本只按主会话估：subagent 用的是哪个模型这次没有采集（子任务在
-             * 独立 daemon 进程里，模型名没随用量上报）。不加限定语会被读成合计。
-             */}
-            {grouped && <span className="text-fg-muted">（仅主会话）</span>}
-          </span>
-        </div>
       </div>
     </div>
   );
