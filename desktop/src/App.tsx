@@ -330,6 +330,21 @@ export default function App() {
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  /**
+   * 把「这个会话已读到最新」上报给服务端（共享已读水位）。
+   *
+   * 未读由服务端两个水位派生（`last_completed_at > last_read_at`），所以「清本地
+   * 蓝点」和「让别的端也不再亮」是两件事：前者是 `store.select()`，后者必须走这个
+   * RPC。服务端推进水位后会向**所有**客户端广播 `thread/readStateChanged`，桌面与
+   * 手机的蓝点因此同时消失。
+   *
+   * 刻意 fire-and-forget：已读是幂等的收敛动作，失败最坏让蓝点多留一会儿，不该
+   * 阻塞切会话或让 UI 报错。
+   */
+  const markThreadRead = (id: string) => {
+    void clientRef.current?.request("thread/markRead", { threadId: id }).catch(() => {});
+  };
+
   /** 节流：内容变更后延迟落盘，避免逐字 delta 每次都写 IndexedDB。 */
   const CONTENT_PERSIST_DEBOUNCE_MS = 800;
   const schedulePersist = (id: string) => {
@@ -656,6 +671,12 @@ export default function App() {
   ) => {
     const prevId = store.currentId;
     store.select(id);
+    // 把「已读」上报给服务端：`store.select` 只清了本地蓝点，服务端水位不知道。
+    // 不上报的话，下一次 `thread/listAll`（或重连后的 `seed`）会按旧水位把蓝点
+    // 重新算回来；另一端也永远收不到 `thread/readStateChanged`，会一直亮着——
+    // 那正是用户报的「手机读过、电脑仍亮」。不 await、失败即忽略：已读是一次
+    // 幂等收敛，掉一次只会让蓝点多留一会儿，不该阻塞切会话。
+    markThreadRead(id);
     sess.setCurrentId(id);
     // 冷会话先拿缓存内容垫上（有则显示、无则空），随后 resume/readItems 覆盖。
     // 判据是 warm 与在途 resume，与「是否有缓存」无关：预填**不**置 warm，所以
@@ -1481,10 +1502,25 @@ export default function App() {
         // 触发下面的列表刷新，所以单独保证重渲染。
         const changed = store.applyNotification(n);
         if (changed || n.method === "turn/completed") force((v) => v + 1);
+        if (n.method === "turn/completed") {
+          // 用户正看着的这个会话里跑完了一轮：内容他就读在眼前，本地不会亮蓝点，
+          // 但**服务端水位还停在这一轮之前**。不上报的话，重连/刷新后
+          // `thread/listAll` 会按旧水位把蓝点算出来——即「读过的东西又变成未读」。
+          // 只对当前会话这么做：后台会话跑完理应保持未读，等信息被看到再清。
+          if (n.params.thread_id === sess.currentIdRef.current) {
+            markThreadRead(n.params.thread_id);
+          }
+        }
         // `Notification` 是判别联合：只有带 `thread_id` 的通知才有会话内容可落盘
         // （`error` 无归属、由 store 归到当前会话，在此跳过）。其余 `agent/*`、
         // `ui/*` 通知已在上方分支提前返回。
-        if ("thread_id" in n.params) schedulePersist(n.params.thread_id);
+        //
+        // `thread/readStateChanged` 是唯一能走到这里的纯元数据通知（标题/标签
+        // 都在上方提前返回）：它只带两个时间戳，没有会话内容可落。给它排一次
+        // 内容落盘纯属白写一次 IndexedDB。
+        if ("thread_id" in n.params && n.method !== "thread/readStateChanged") {
+          schedulePersist(n.params.thread_id);
+        }
         if (n.method === "turn/completed") void sess.refreshThreads();
       });
       client.onApproval((r) => {
@@ -2224,12 +2260,16 @@ export default function App() {
   // threads that finished a turn while the user was looking elsewhere.
   const statuses = new Map<string, ThreadStatus>();
   const unread = new Map<string, TurnStatus>();
+  // 离线时不画未读点（spec §3.2）：此时列表来自本地缓存，两个水位都是上次同步
+  // 的快照。缓存里「未读」可能早就被另一台设备读掉了，画出来是在误导用户；而
+  // 手机离线时的蓝点尤其容易与桌面矛盾——那正是要修的现象。宁可少画一个点。
+  const hideUnread = isMobile && offline;
   for (const g of sess.groups)
     for (const t of g.threads) {
       const v = store.peek(t.thread_id);
       if (!v) continue;
       statuses.set(t.thread_id, v.status);
-      if (v.unread && t.thread_id !== sess.currentId)
+      if (!hideUnread && v.unread && t.thread_id !== sess.currentId)
         unread.set(t.thread_id, v.session.lastStatus ?? "completed");
     }
 

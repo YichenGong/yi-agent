@@ -499,6 +499,8 @@ fn only_the_lead_sees_the_memory_tools() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             role: None,
             tag: None,
             extra_roots: Vec::new(),
@@ -630,6 +632,8 @@ fn only_the_lead_sees_the_view_tools() {
             tag: None,
             extra_roots: Vec::new(),
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
         })
         .expect("a plain meta must persist");
     // 正臂走生产的组长落盘路径,而不是手搓一个 role 字段。
@@ -3612,6 +3616,7 @@ async fn unknown_method_returns_method_not_found() {
         ("thread/lead", Domain::Thread),
         ("thread/list", Domain::Thread),
         ("thread/listAll", Domain::Thread),
+        ("thread/markRead", Domain::Thread),
         ("thread/readItems", Domain::Thread),
         ("thread/rename", Domain::Thread),
         ("thread/reorderPinned", Domain::Thread),
@@ -6117,6 +6122,8 @@ async fn thread_cwd_prefers_memory_then_the_index() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7651,6 +7658,8 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7764,6 +7773,8 @@ async fn a_turn_while_off_persists_without_credentials() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7789,6 +7800,7 @@ async fn a_turn_while_off_persists_without_credentials() {
     persist_and_finish_turn(
         tid,
         None,
+        0,
         None,
         &[],
         &[],
@@ -7863,6 +7875,8 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -7888,6 +7902,7 @@ async fn a_turn_with_default_retention_persists_the_session_verbatim() {
     persist_and_finish_turn(
         tid,
         None,
+        0,
         None,
         &[],
         &[],
@@ -9272,6 +9287,8 @@ fn write_meta(
         content_epoch: 0,
         last_item_id: None,
         anchor_sha: None,
+        last_read_at: 0,
+        last_completed_at: 0,
         extra_roots: Vec::new(),
         role: None,
     };
@@ -9302,6 +9319,8 @@ fn write_lead_meta(dir: &Path, id: &str) {
         extra_roots: Vec::new(),
         role: Some(crate::thread_store::LEAD_ROLE.to_string()),
         anchor_sha: None,
+        last_read_at: 0,
+        last_completed_at: 0,
     };
     crate::thread_store::ThreadStore::new(dir)
         .create(&meta)
@@ -11194,6 +11213,8 @@ async fn resume_flags_a_crashed_partial_turn_as_interrupted() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -11308,6 +11329,8 @@ async fn resume_promotes_the_crashed_turn_so_a_later_turn_cannot_drop_it() {
             content_epoch: 0,
             last_item_id: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             extra_roots: Vec::new(),
             role: None,
         })
@@ -13283,6 +13306,8 @@ async fn a_lead_thread_never_calls_the_title_model_even_without_a_title() {
                 content_epoch: 0,
                 last_item_id: None,
                 anchor_sha: None,
+                last_read_at: 0,
+                last_completed_at: 0,
                 extra_roots: Vec::new(),
                 role: Some(crate::thread_store::LEAD_ROLE.into()),
             })
@@ -18952,6 +18977,8 @@ fn the_lead_does_not_get_ask_lead() {
         content_epoch: 0,
         last_item_id: None,
         anchor_sha: None,
+        last_read_at: 0,
+        last_completed_at: 0,
     };
     store.create(&plain).expect("a plain meta must persist");
     let plain_names = build("thread-plain").registry.names();
@@ -20090,4 +20117,446 @@ async fn plugin_uninstall_rejects_an_unusable_plugin_name() {
     );
 
     h.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 跨端未读状态同步（设计见 docs/superpowers/specs/2026-10-25-unread-read-state-sync-design.md）
+// ---------------------------------------------------------------------------
+
+/// 从 `thread/listAll` 的条目里取某个水位（缺省 → 0）。
+fn watermark_of(list: &serde_json::Value, thread_id: &str, field: &str) -> u64 {
+    find_listed(list, thread_id)[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{field} must be present on {thread_id}: {list}"))
+}
+
+/// 已读水位必须经 `thread/listAll` 下发——这是断线重连后重建未读的唯一来源。
+///
+/// 若只把水位写在 meta 里而下不到线上，手机重连后永远算不出「离线期间跑完的
+/// 回合」，正是用户报的那个不一致。
+#[tokio::test(flavor = "multi_thread")]
+async fn list_all_reports_the_read_watermarks() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let listed = list_all(&mut h).await;
+    assert_eq!(
+        watermark_of(&listed, &tid, "last_read_at"),
+        0,
+        "a fresh thread has never been read: {listed}"
+    );
+    assert_eq!(
+        watermark_of(&listed, &tid, "last_completed_at"),
+        0,
+        "a fresh thread has never completed a turn: {listed}"
+    );
+
+    // 跑完一轮：完成时间推进，已读水位不动 ⇒ 该会话未读。
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+    let listed = list_all(&mut h).await;
+    let completed = watermark_of(&listed, &tid, "last_completed_at");
+    assert!(
+        completed > 0,
+        "a finished turn must stamp completion: {listed}"
+    );
+    assert_eq!(
+        watermark_of(&listed, &tid, "last_read_at"),
+        0,
+        "running a turn is not reading it: {listed}"
+    );
+
+    // 标记已读：水位追上完成时间，该会话不再未读。
+    let resp = rpc(
+        &mut h,
+        902,
+        "thread/markRead",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+    assert!(resp.get("error").is_none(), "markRead must succeed: {resp}");
+    let read = resp["result"]["last_read_at"]
+        .as_u64()
+        .expect("markRead must report the new watermark");
+    assert!(
+        read >= completed,
+        "reading must reach the completion: {resp}"
+    );
+
+    let listed = list_all(&mut h).await;
+    assert_eq!(
+        watermark_of(&listed, &tid, "last_read_at"),
+        read,
+        "the read watermark must survive the round trip: {listed}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 标记已读必须落盘并且单调：重复调用不倒退、不报错。
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_persists_and_is_idempotent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let first = rpc(
+        &mut h,
+        910,
+        "thread/markRead",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+    assert!(first.get("error").is_none(), "first markRead: {first}");
+    let a = first["result"]["last_read_at"].as_u64().expect("watermark");
+
+    let second = rpc(
+        &mut h,
+        911,
+        "thread/markRead",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+    assert!(second.get("error").is_none(), "second markRead: {second}");
+    let b = second["result"]["last_read_at"]
+        .as_u64()
+        .expect("watermark");
+    assert!(b >= a, "the watermark must never go backwards: {a} -> {b}");
+
+    // 直接读盘：水位必须真的写进 meta，而不只是活在响应里。
+    let meta_path = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.meta.json"));
+    let on_disk: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["last_read_at"].as_u64(),
+        Some(b),
+        "the watermark must be persisted: {on_disk}"
+    );
+
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_rejects_an_unknown_thread() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+    let resp = rpc(
+        &mut h,
+        912,
+        "thread/markRead",
+        serde_json::json!({ "threadId": "thread-nope" }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"], -32011,
+        "an unknown thread must be reported, not silently accepted: {resp}"
+    );
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_requires_control_scope() {
+    // Observe 是掩码级只读视图：它不得推进共享水位（那会让只读客户端
+    // 悄悄改变另一端的未读显示）。
+    let mut h = Harness::with_scope(Scope::Observe).await;
+    initialize(&mut h).await;
+    let resp = rpc(
+        &mut h,
+        913,
+        "thread/markRead",
+        serde_json::json!({ "threadId": "thread-any" }),
+    )
+    .await;
+    assert_eq!(
+        resp["error"]["code"], -32014,
+        "markRead must require Control: {resp}"
+    );
+    h.shutdown().await;
+}
+
+/// 跨端清除蓝点的通道：`markRead` 成功后广播，且属列表层（恒推）。
+///
+/// 若被归为内容层，远程客户端只为窗口内会话订阅 → 窗口外会话的「已读」
+/// 同步不过去，另一端会一直亮着蓝点。
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_broadcasts_a_list_level_read_state_update() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    rpc(
+        &mut h,
+        920,
+        "thread/markRead",
+        serde_json::json!({ "threadId": tid }),
+    )
+    .await;
+
+    let frame = await_notification(&mut h, "thread/readStateChanged", EVENT_WAIT)
+        .await
+        .expect("markRead must broadcast the new read state");
+    assert_eq!(frame["params"]["thread_id"], serde_json::json!(tid));
+    assert!(
+        frame["params"]["last_read_at"].as_u64().unwrap_or(0) > 0,
+        "the broadcast must carry the watermark: {frame}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 未订阅该会话的客户端也必须收到已读更新（钉住「恒推」这一层）。
+///
+/// 这是本设计的核心断言之一：远程客户端只为少数会话订阅内容。若把已读更新当
+/// 内容层过滤，订阅窗口**外**会话的「已读」就同步不到另一端——那正是用户报的
+/// 「手机读过、电脑仍亮」。故这里不只看 `delivery()` 的标签，而是真的经
+/// `write_notification` 往一个**只订阅了别的会话**的客户端投一帧。
+#[tokio::test(flavor = "multi_thread")]
+async fn read_state_reaches_an_unsubscribed_client() {
+    use crate::protocol::{Delivery, Notification};
+
+    let notification = Notification::ReadStateChanged {
+        thread_id: "t2".into(),
+        last_read_at: 5,
+        last_completed_at: 1,
+    };
+    assert_eq!(
+        notification.delivery(),
+        Delivery::List,
+        "read state is a list-level fact: filtering it by subscription would \
+         leave the other end's dot on forever"
+    );
+
+    let hub = crate::broadcast::Broadcaster::new();
+    let sub = crate::broadcast::ClientId::ws(uuid::Uuid::from_u128(7));
+    let mut rx = hub.register(sub.clone());
+    // 只订阅 t1：t2 的已读更新必须照样到达。
+    hub.subscribe(&sub, vec!["t1".to_string()]);
+
+    write_notification(&hub, &notification).await.unwrap();
+    let frame = rx
+        .try_recv()
+        .expect("an unsubscribed thread's read state must arrive");
+    assert_eq!(frame["method"], "thread/readStateChanged");
+    assert_eq!(frame["params"]["thread_id"], "t2");
+    assert_eq!(frame["params"]["last_completed_at"], 1);
+}
+
+/// 回合结束记 `last_completed_at`，且不动 `updated_at` 的既有语义。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_finished_turn_records_its_completion_time() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+    run_a_turn_and_wait_for_persist(&mut h, dir.path(), &tid, "hello").await;
+
+    let meta_path = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.meta.json"));
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert!(
+        meta["last_completed_at"].as_u64().unwrap_or(0) > 0,
+        "a finished turn must stamp last_completed_at: {meta}"
+    );
+
+    h.shutdown().await;
+}
+
+/// `clear` / `compact` 不是回合结束：不得记完成时间。
+///
+/// 若记了，刚清空上下文的会话会凭空亮起蓝点——另一端看到「有东西没读」，
+/// 点进去却什么都没有。
+#[tokio::test(flavor = "multi_thread")]
+async fn clear_does_not_record_a_completion() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let cleared = clear_thread_retrying(&mut h, &tid).await;
+    assert!(
+        cleared.get("error").is_none(),
+        "clear must succeed: {cleared}"
+    );
+
+    let meta_path = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.meta.json"));
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        meta["last_completed_at"].as_u64(),
+        Some(0),
+        "clearing is not a completion: {meta}"
+    );
+
+    h.shutdown().await;
+}
+
+/// `turn/completed` 必须自带完成时间。
+///
+/// 广播发生在落盘之前，客户端收到后立刻重拉列表会读到旧的 `last_completed_at`。
+/// 通知自带时间戳让客户端按 max 合并，那次竞态自然消失。
+#[tokio::test(flavor = "multi_thread")]
+async fn turn_completed_carries_its_completion_time() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 930, "method": "turn/start",
+            "params": { "threadId": tid, "input": [{ "type": "text", "text": "hi" }] },
+        })
+        .to_string(),
+    )
+    .await;
+
+    let frame = await_notification(&mut h, "turn/completed", EVENT_WAIT)
+        .await
+        .expect("the turn must report completion");
+    assert!(
+        frame["params"]["completed_at"].as_u64().unwrap_or(0) > 0,
+        "turn/completed must carry completed_at so the client can merge it \
+         without racing the persist: {frame}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 广播的完成时刻必须与落盘的是**同一个值**（而不是「广播一个、随后落盘另一个」）。
+///
+/// 这是一条容易漏掉、且只会在跨端场景暴露的顺序约束：`turn/completed` 在流循环
+/// 里就广播出去了，落盘发生在循环**之后**。若两处各取一次 `now_millis()`，落盘的
+/// 那个必然更晚。于是另一端收到通知立刻发 `thread/markRead` 时，写下的已读水位
+/// 会**低于**稍后才落盘的完成水位 ⇒ 服务端判为「读完之后又跑完了一轮」⇒ 重连
+/// 后蓝点复活。用户看到的现象就是「我明明在手机上读过了，电脑上又亮了」。
+///
+/// 断言取 `<=` 而非 `==`：要紧的是落盘值**不晚于**广播值（已读才能盖住它）。
+#[tokio::test(flavor = "multi_thread")]
+async fn the_persisted_completion_is_not_later_than_the_broadcast_one() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 933, "method": "turn/start",
+            "params": { "threadId": tid, "input": [{ "type": "text", "text": "hi" }] },
+        })
+        .to_string(),
+    )
+    .await;
+
+    let frame = await_notification(&mut h, "turn/completed", EVENT_WAIT)
+        .await
+        .expect("the turn must report completion");
+    let broadcast_at = frame["params"]["completed_at"]
+        .as_u64()
+        .expect("turn/completed must carry completed_at");
+
+    // 等到落盘真的发生（meta 里的完成水位出现），再比这一刻的两个值。
+    let deadline = tokio::time::Instant::now() + EVENT_WAIT;
+    let mut persisted_at = 0u64;
+    while tokio::time::Instant::now() < deadline {
+        let path = dir
+            .path()
+            .join(".yi-agent/threads")
+            .join(format!("{tid}.meta.json"));
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&raw) {
+                persisted_at = meta["last_completed_at"].as_u64().unwrap_or(0);
+                if persisted_at > 0 {
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(persisted_at > 0, "the turn's completion must reach disk");
+
+    assert!(
+        persisted_at <= broadcast_at,
+        "the persisted completion ({persisted_at}) must not be later than the \
+         broadcast one ({broadcast_at}): a client that marks the thread read on \
+         receiving turn/completed would otherwise write a read watermark that the \
+         server then considers older than the completion, and the dot comes back \
+         after reconnect"
+    );
+
+    h.shutdown().await;
+}
+
+/// 落盘失败（append 写不进去）**不得**连带丢掉「这一轮跑完了」这件事。
+///
+/// 两条失败是独立的：日志写失败只代表内容没存下来，回合本身确确实实结束了，用户
+/// 也在流里看到了输出。若把完成时刻的记账绑在 append 成功分支上，这一轮在未读
+/// 口径里就凭空消失——另一端重连后看不到任何「有新内容」的提示，直到下一轮跑完。
+///
+/// 失败注入：把 `<thread>.jsonl` 换成一个**目录**，`OpenOptions::append` 必然失败。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_append_still_records_the_completion() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_config(cfg, build_test_agent, PERMISSION_TIMEOUT);
+    let tid = start_thread(&mut h).await;
+
+    let log = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.jsonl"));
+    std::fs::create_dir_all(&log).expect("sabotage: the log path becomes a directory");
+
+    h.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 934, "method": "turn/start",
+            "params": { "threadId": tid, "input": [{ "type": "text", "text": "hi" }] },
+        })
+        .to_string(),
+    )
+    .await;
+    let frame = await_notification(&mut h, "turn/completed", EVENT_WAIT)
+        .await
+        .expect("the turn itself must still complete");
+    let broadcast_at = frame["params"]["completed_at"].as_u64().unwrap_or(0);
+    assert!(broadcast_at > 0);
+
+    let meta_path = dir
+        .path()
+        .join(".yi-agent/threads")
+        .join(format!("{tid}.meta.json"));
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    assert_eq!(
+        meta["last_completed_at"].as_u64().unwrap_or(0),
+        broadcast_at,
+        "a failed append must not swallow the completion stamp: {meta}"
+    );
+
+    h.shutdown().await;
+}
+
+/// 新 RPC 必须归到 thread 域，否则会被静默映射成 `method_not_found`。
+#[tokio::test(flavor = "multi_thread")]
+async fn mark_read_routes_to_the_thread_domain() {
+    assert_eq!(domain_for("thread/markRead"), Domain::Thread);
 }

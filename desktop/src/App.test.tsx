@@ -43,6 +43,10 @@ const { clients, state, dragDrop } = vi.hoisted(() => ({
     rejectCode: {} as Record<string, number>,
     // Status reported by `thread/listAll` for every seeded thread.
     listStatus: "idle" as "idle" | "running" | "awaiting_approval",
+    // 共享已读水位（`last_read_at` / `last_completed_at`），按 thread_id。
+    // 未读由 `last_completed_at > last_read_at` 派生，故列表要报这两个值才能
+    // 模拟「另一台设备读过 / 离线期间跑完一轮」这两种跨端状态。
+    watermarks: {} as Record<string, { read: number; completed: number }>,
     // 顶层 pinned 列表（thread_id 顺序即渲染顺序）。服务端把已置顶的会话
     // 同时留在它自己的分组内（带 pinned:true）并在这个顶层数组里重复一份。
     pinnedIds: [] as string[],
@@ -225,6 +229,8 @@ vi.mock("./lib/rpc", () => ({
                       pinned: state.pinnedIds.includes(t.thread_id),
                       driver_project: t.driver_project,
                       driver_ref: t.driver_ref,
+                      last_read_at: state.watermarks[t.thread_id]?.read ?? 0,
+                      last_completed_at: state.watermarks[t.thread_id]?.completed ?? 0,
                     })),
                     ...leadEntries(workspace),
                   ]
@@ -251,6 +257,8 @@ vi.mock("./lib/rpc", () => ({
             title: (seeds.find((s) => s.thread_id === id)?.title ?? null),
             permission_mode: seeds.find((s) => s.thread_id === id)?.permission_mode,
             pinned: true,
+            last_read_at: state.watermarks[id]?.read ?? 0,
+            last_completed_at: state.watermarks[id]?.completed ?? 0,
           })),
         };
       }
@@ -420,6 +428,7 @@ beforeEach(() => {
   state.statusHandlers.length = 0;
   state.rejectCode = {};
   state.listStatus = "idle";
+  state.watermarks = {};
   state.pinnedIds = [];
   state.picks = [];
   state.boards = [];
@@ -719,6 +728,217 @@ describe("App approval overlay scope", () => {
         params: { threadId: "t1" },
       }),
     );
+  });
+});
+
+/**
+ * 跨端未读同步（用户报的问题：「手机上的未读和电脑 App 不一致」）。
+ *
+ * 未读由**服务端**两个水位派生（`last_completed_at > last_read_at`），不再是每个
+ * 客户端进程内存里的布尔位。于是「一端读过」必须同时做到三件事：
+ *   1. 向服务端推进共享水位（`thread/markRead`）——否则重连/刷新后会被旧水位
+ *      重新算成未读；
+ *   2. 服务端向**所有**客户端广播 `thread/readStateChanged`；
+ *   3. 收到广播的端就地清掉蓝点，不依赖自己有没有订阅该会话的内容。
+ * 这三条缺任何一条，用户看到的就是「手机读过了、电脑还亮着」。
+ */
+describe("App cross-device unread sync", () => {
+  const unreadDot = () => document.querySelector('[aria-label="Unread"]');
+  const markReadCallsFor = (id: string) =>
+    clients[0].requests.filter(
+      (r) => r.method === "thread/markRead" && (r.params as { threadId: string }).threadId === id,
+    ).length;
+
+  it("reports the thread as read when the user opens it", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    fireEvent.click(screen.getByText("two"));
+
+    // 只清本地蓝点是不够的：服务端水位不动，重连后蓝点会「复活」。
+    await waitFor(() => expect(markReadCallsFor("t2")).toBe(1));
+  });
+
+  it("clears a background thread's dot when another device reads it", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    // t2 在**这台设备**没看着时跑完了一轮：服务端记下完成水位，未读派生为真。
+    state.watermarks = { t2: { read: 100, completed: 200 } };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+
+    // 另一端（手机）点开了 t2：服务端推进已读水位并广播到这台设备。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({
+          method: "thread/readStateChanged",
+          params: { thread_id: "t2", last_read_at: 200, last_completed_at: 200 },
+        });
+    });
+
+    await waitFor(() => expect(unreadDot()).toBeNull());
+  });
+
+  it("keeps a dot that appeared after the other device's read", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.watermarks = { t2: { read: 200, completed: 200 } };
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    expect(unreadDot()).toBeNull();
+
+    // 手机读过之后，t2 又跑完一轮：这是**新**的未读，必须再亮。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({
+          method: "thread/readStateChanged",
+          params: { thread_id: "t2", last_read_at: 200, last_completed_at: 300 },
+        });
+    });
+
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+  });
+
+  it("shows the dot for a turn that finished while this device was offline", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    // 断线期间跑完的回合：推送当时没人在听，只有落盘的完成水位记得它跑完了。
+    // 这是「重连后补回未读」的唯一来源。
+    state.watermarks = { t2: { read: 100, completed: 200 } };
+    render(<App />);
+
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+  });
+
+  it("marks the thread read when a turn completes in the thread being viewed", async () => {
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    // 用户正看着 t1，t1 里跑完一轮：他就在看，本地不亮蓝点；但服务端水位仍停在
+    // 这一轮之前，不上报的话重连后蓝点会「复活」。
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({
+          method: "turn/completed",
+          params: {
+            thread_id: "t1",
+            turn_id: "u1",
+            status: "completed",
+            completed_at: 500,
+          },
+        });
+    });
+
+    // 必须**真的**再来一次（而不只是切过去时那一次），否则服务端水位停在
+    // 这一轮之前，重连后蓝点复活。
+    await waitFor(() => expect(markReadCallsFor("t1")).toBeGreaterThanOrEqual(2));
+    expect(unreadDot()).toBeNull();
+  });
+
+  it("leaves a background thread's dot alone when its turn completes", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+
+    act(() => {
+      for (const cb of state.notifHandlers)
+        cb({
+          method: "turn/completed",
+          params: {
+            thread_id: "t2",
+            turn_id: "u2",
+            status: "completed",
+            completed_at: 500,
+          },
+        });
+    });
+
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+    // 后台会话跑完**不该**被自动标已读：那样用户永远看不到「有新内容」。
+    expect(
+      clients[0].requests.some(
+        (r) => r.method === "thread/markRead" && (r.params as { threadId: string }).threadId === "t2",
+      ),
+    ).toBe(false);
+  });
+});
+
+/**
+ * 离线时不画未读点（spec §3.2）。
+ *
+ * 手机离线时列表来自本地缓存，两个水位都是上次同步的快照。缓存里的「未读」可能
+ * 早被另一台设备读掉了——照画就是在误导用户，也正是「手机与电脑不一致」的一部分。
+ * 门控限定 `isMobile && offline`：桌面端不受影响。
+ */
+describe("App offline unread suppression", () => {
+  const asRemote = () =>
+    localStorage.setItem(
+      "yi-agent.remote",
+      JSON.stringify({ url: "wss://relay.test/ws", token: "yia_tok" }),
+    );
+  const unreadDot = () => document.querySelector('[aria-label="Unread"]');
+
+  it("hides the unread dot on the phone while disconnected", async () => {
+    asRemote();
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.watermarks = { t2: { read: 100, completed: 200 } };
+    render(<App />);
+    await waitFor(() => expect(state.statusHandlers.length).toBeGreaterThan(0));
+
+    // 连上时照常显示：这是服务端权威值，可信。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "connected" });
+    });
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
+
+    // 断线 → 列表变回缓存快照，未读不再可信。
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited" });
+    });
+    await waitFor(() => expect(unreadDot()).toBeNull());
+  });
+
+  it("still shows the dot on the desktop while disconnected", async () => {
+    // 桌面端恒为「在线」语义（不显示缓存相关 UI），故不受这条门控影响。
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    state.watermarks = { t2: { read: 100, completed: 200 } };
+    render(<App />);
+    await waitFor(() => expect(state.statusHandlers.length).toBeGreaterThan(0));
+
+    act(() => {
+      for (const cb of state.statusHandlers) cb({ state: "exited" });
+    });
+    await waitFor(() => expect(unreadDot()).not.toBeNull());
   });
 });
 

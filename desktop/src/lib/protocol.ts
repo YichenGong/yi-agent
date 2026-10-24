@@ -136,6 +136,16 @@ export interface ThreadSummary {
   content_epoch?: number | null;
   /** 服务端最后一条 item 的 id；`null` = 该会话从未有过 item。 */
   last_item_id?: string | null;
+  /**
+   * 共享已读水位（epoch 毫秒）：**所有客户端共用**的「读到哪了」。
+   *
+   * 未读由 `last_completed_at > last_read_at` 派生，故断线重连后靠这两个值就能
+   * 补回「离线期间跑完的回合」——推送当时没人在听。旧服务端不发送 ⇒ 按 0 处理
+   * （那时等于「没读过也没完成过」，不得凭空亮蓝点）。
+   */
+  last_read_at?: number | null;
+  /** 最近一次**回合结束**的时间（epoch 毫秒）。`0` = 从未完成过回合。 */
+  last_completed_at?: number | null;
 }
 
 /** Token 用量(前端归一化后)。`cacheWrite` = 写入 cache,`cacheRead` = 命中 cache。 */

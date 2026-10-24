@@ -421,6 +421,8 @@ mod tests {
             driver_project: None,
             driver_ref: None,
             anchor_sha: None,
+            last_read_at: 0,
+            last_completed_at: 0,
             model_ref: None,
             reasoning_effort: None,
             tag: None,
