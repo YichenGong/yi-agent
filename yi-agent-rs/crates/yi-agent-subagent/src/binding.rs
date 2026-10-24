@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use yi_agent_runtime::config::RuntimeConfig;
 use yi_agent_store::ipc::{IpcError, IpcRequest, IpcResponse, send_request};
@@ -60,6 +61,12 @@ pub struct RuntimeBinding {
     /// Serialises repair so one thread starts the daemon while the others wait
     /// and then adopt its result instead of racing into a second start.
     flight: Mutex<()>,
+    /// 本项目最近一次「有活干」的时刻。
+    ///
+    /// 由宿主在取句柄时刷新（`current` / `current_or_repair` / `send` 都经过
+    /// 这里），因此它记录的是真实的委派使用，而不是「进程还记着这个项目」。
+    /// 回收判定据此区分「这个项目还在被用」与「只是表里留了个条目」。
+    last_active: Mutex<Instant>,
 }
 
 impl RuntimeBinding {
@@ -81,6 +88,7 @@ impl RuntimeBinding {
                 models_path,
             }),
             flight: Mutex::new(()),
+            last_active: Mutex::new(Instant::now()),
         })
     }
 
@@ -93,6 +101,7 @@ impl RuntimeBinding {
             }),
             repair: None,
             flight: Mutex::new(()),
+            last_active: Mutex::new(Instant::now()),
         })
     }
 
@@ -114,7 +123,38 @@ impl RuntimeBinding {
 
     /// The current handle, without any repair attempt.
     pub fn current(&self) -> Result<RuntimeHandle, String> {
+        self.touch();
         Ok(self.lock_state().handle.clone())
+    }
+
+    /// 记一次「这个项目刚被用到」。
+    fn touch(&self) {
+        *self
+            .last_active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    /// 仅用于测试：把空闲时钟拨到 `idle` 之前。
+    ///
+    /// 回收阈值是十分钟，测试不可能真等；这个缝隙让「一个项目已经空闲很久」
+    /// 成为可构造的状态，而不是把阈值本身调小（那会让测试断言不到真实取值）。
+    #[doc(hidden)]
+    pub fn backdate_idle_clock(&self, idle: Duration) {
+        *self
+            .last_active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now()
+            .checked_sub(idle)
+            .unwrap_or_else(Instant::now);
+    }
+
+    /// 距上次活动过了多久。回收判定的输入之一。
+    pub fn idle_for(&self) -> Duration {
+        self.last_active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
     }
 
     /// The current handle and the generation that produced it, read from one
@@ -124,6 +164,10 @@ impl RuntimeBinding {
     /// keyed on the generation must be sure the handle it pairs it with came from
     /// that very generation.
     pub(crate) fn current_with_generation(&self) -> (RuntimeHandle, u64) {
+        // `send` / `send_with_generation` 走的是这条路径而不是 `current()`：
+        // 委派请求本身也算「这个项目在被用」，不刷新时钟会让一个一直在干活的
+        // 项目被误判为空闲而回收。
+        self.touch();
         let state = self.lock_state();
         (state.handle.clone(), state.generation)
     }
@@ -325,5 +369,53 @@ mod tests {
     #[test]
     fn a_frame_too_large_is_not_a_liveness_error() {
         assert!(!is_liveness_error(&IpcError::FrameTooLarge));
+    }
+}
+
+#[cfg(test)]
+mod idle_clock_tests {
+    use super::*;
+
+    fn fixed_binding() -> Arc<RuntimeBinding> {
+        RuntimeBinding::fixed(RuntimeHandle {
+            socket_path: "/tmp/frozen.sock".into(),
+            workspace_root: "/tmp/ws".into(),
+            session_id: "s".into(),
+            task_id: "t".into(),
+            capability: "c".into(),
+        })
+    }
+
+    /// 取句柄就是「用了一次」：空闲计时必须被刷新，否则一个一直在被委派的
+    /// 项目会被误判为空闲而回收。
+    #[test]
+    fn reading_the_handle_resets_the_idle_clock() {
+        let binding = fixed_binding();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            binding.idle_for() >= Duration::from_millis(100),
+            "the clock must advance while the binding is unused"
+        );
+
+        let _ = binding.current().expect("fixed bindings always resolve");
+        assert!(
+            binding.idle_for() < Duration::from_millis(100),
+            "reading the handle must reset the clock"
+        );
+    }
+
+    /// 委派请求走的不是 `current()`，而是 `current_with_generation()` 那条路。
+    /// 它同样必须刷新时钟，否则一个不停接活的项目会被判成空闲。
+    #[test]
+    fn sending_through_the_generation_path_resets_the_idle_clock() {
+        let binding = fixed_binding();
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(binding.idle_for() >= Duration::from_millis(100));
+
+        let _ = binding.send(|_handle| IpcRequest::Status);
+        assert!(
+            binding.idle_for() < Duration::from_millis(100),
+            "a delegation attempt counts as activity"
+        );
     }
 }

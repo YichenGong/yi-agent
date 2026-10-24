@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::json;
@@ -46,6 +46,152 @@ pub(crate) const PERMISSION_TIMEOUT: Duration = Duration::from_secs(300);
 /// `threads` 表是主循环的局部量,重构成可共享结构会把改动面扩散到全部 RPC 分支。
 /// 3s 足够跟上插件给出的动作,又远短于一个会话的生命周期。
 const DRIVER_TICK: Duration = Duration::from_secs(3);
+
+const EVICT_IDLE_AFTER: Duration = Duration::from_secs(600);
+
+/// 决定「这个项目的 runtime 现在能不能回收」所需的全部事实。
+///
+/// 采集与决策分离：调用方负责从 `threads` / 磁盘 / 常驻登记里取事实，本结构
+/// 只承载它们，因此 [`should_evict`] 是纯函数，可以不起任何进程就测到。
+pub(crate) struct IdleFacts {
+    /// 该项目最后一次「有活干」的时刻（attach、起 turn 都算）。
+    pub last_active: Instant,
+    /// 项目里存在插件清单（`.yi-agent/supervisors/*.json`）。
+    ///
+    /// 有清单就意味着这个项目的 daemon 正在给插件提供 socket；回收会连带把
+    /// 插件停掉，所以这类项目一律豁免。判据用「有没有清单」而不是写死某个
+    /// 插件名：宿主不认识具体插件。
+    pub has_plugin_manifest: bool,
+    /// 该项目在 `resident-daemons.json` 里被要求常驻。
+    pub is_resident: bool,
+    /// 还有回合在跑（含子任务）。判据是「有没有活干」，不是「多久没人碰」。
+    pub has_running_turn: bool,
+}
+
+/// 纯决策：现在能不能回收这个项目的 runtime。
+pub(crate) fn should_evict(facts: &IdleFacts, now: Instant, ttl: Duration) -> bool {
+    if facts.has_running_turn || facts.has_plugin_manifest || facts.is_resident {
+        return false;
+    }
+    now.duration_since(facts.last_active) >= ttl
+}
+
+/// 项目里是否有插件清单。
+///
+/// 只看「目录里有没有 .json」，不解析内容：损坏的清单仍然意味着有人往这个项目
+/// 装了插件，回收 daemon 一样会打断它。宁可多留一个项目，也不误停插件。
+pub(crate) fn project_has_plugin_manifest(project: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(yi_agent_supervisors::install::manifests_dir(project))
+    else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .path()
+            .extension()
+            .is_some_and(|extension| extension == "json")
+    })
+}
+
+/// 回收空闲项目的 runtime。
+///
+/// 每个「有活干」的事实都由调用方采好：`runtimes` 里的 binding 提供空闲时长，
+/// `threads` 提供是否有回合在跑，磁盘与常驻登记提供两条豁免。
+///
+/// 移除条目即完成回收：`Arc<RuntimeBinding>` 的最后一个引用落在
+/// `AttachedProjectRuntime` 上，它的 Drop 会停掉本进程起的 daemon 与监督线程，
+/// 路由分区也随之清空。之后该项目再有委派时，`attach_cwd_runtime` 会懒重建。
+///
+/// 返回被回收的项目（供调用方记日志、也供测试断言）。
+pub(crate) fn evict_idle_runtimes(
+    runtimes: &ProjectRuntimes,
+    thread_roots: &ThreadRoots,
+    threads: &HashMap<String, ThreadSession>,
+    resident_dir: &Path,
+    now: Instant,
+    ttl: Duration,
+) -> Vec<PathBuf> {
+    // 快照：只取「哪个项目」「空了多久」。持锁期间不做磁盘 IO，也不调用任何
+    // 需要再取这把锁的方法（`project_key` 会 canonicalize，是 IO）。
+    let snapshot: Vec<(PathBuf, Duration)> = runtimes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .filter_map(|(key, entry)| {
+            entry
+                .as_ref()
+                .ok()
+                .map(|binding| (key.clone(), binding.idle_for()))
+        })
+        .collect();
+    if snapshot.is_empty() {
+        return Vec::new();
+    }
+
+    // 哪些项目还有回合在跑。threads 的 `cwd` 先统一解析成项目键，避免对每个
+    // (项目, 会话) 组合都 canonicalize 一次。
+    let busy_projects: Vec<PathBuf> = threads
+        .values()
+        .filter(|session| {
+            session.active_turn_id.is_some()
+                || !matches!(
+                    *session
+                        .status
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    ThreadStatus::Idle
+                )
+        })
+        .map(|session| project_key(Path::new(&session.cwd)))
+        .collect();
+
+    let residents: Vec<PathBuf> = yi_agent_store::resident::list(resident_dir)
+        .iter()
+        .map(|resident| project_key(resident))
+        .collect();
+
+    let doomed: Vec<PathBuf> = snapshot
+        .into_iter()
+        .filter(|(key, idle_for)| {
+            let facts = IdleFacts {
+                last_active: now.checked_sub(*idle_for).unwrap_or(now),
+                has_plugin_manifest: project_has_plugin_manifest(key),
+                is_resident: residents.iter().any(|resident| resident == key),
+                has_running_turn: busy_projects.iter().any(|busy| busy == key),
+            };
+            should_evict(&facts, now, ttl)
+        })
+        .map(|(key, _)| key)
+        .collect();
+    if doomed.is_empty() {
+        return doomed;
+    }
+
+    // 先摘会话根，再摘项目条目。
+    //
+    // 顺序不是随意的：`ThreadRoot` 各持一份 `Arc<RuntimeBinding>`，只要还有一个
+    // 会话根活着，删掉 `runtimes` 里的条目也只是少了一份引用——daemon 与监督
+    // 线程继续跑，回收等于没发生。摘下会话根之后，最后一个 `Arc` 才真正落在
+    // `runtimes` 的条目上，停进程的 Drop 链才会被触发。
+    {
+        let mut roots = thread_roots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        roots.retain(|_, root| {
+            !doomed
+                .iter()
+                .any(|key| project_key(root.project_dir()) == *key)
+        });
+    }
+    let mut table = runtimes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for key in &doomed {
+        table.remove(key);
+    }
+    drop(table);
+    doomed
+}
 
 /// 组长后台循环的低频兜底 tick。
 ///
@@ -3636,6 +3782,26 @@ where
                     lead_agent_enabled,
                 )
                 .await;
+
+                // 回收空闲项目的 runtime。放在 tick 里跑而不是定时任务里：
+                // `threads` 是主循环独占的局部量，判「有没有回合在跑」必须读它，
+                // 另起任务就得把它改成共享结构，改动面会扩散到全部 RPC 分支。
+                // 回收只是从表里摘条目，真正的停机由 Drop 链完成，不阻塞主循环。
+                let evicted = evict_idle_runtimes(
+                    &runtimes,
+                    &thread_roots,
+                    &threads,
+                    &resident_dir,
+                    Instant::now(),
+                    EVICT_IDLE_AFTER,
+                );
+                for project in evicted {
+                    // 记一行就够：这是正常的生命周期事件，不是错误。
+                    eprintln!(
+                        "[app-server] reclaimed idle runtime for {}",
+                        project.display()
+                    );
+                }
             }
             _ = lead_ticker.tick() => {
                 // 关掉组长时这一臂整体空转:底下要算 digest、要投递、要起 turn,
@@ -10130,6 +10296,245 @@ mod plugin_ready_tests {
             started.elapsed() < Duration::from_secs(2),
             "the wait must be bounded, took {:?}",
             started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod evict_idle_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 判断所需的事实都由调用方采集，本函数只做决策，所以能直接单测。
+    fn facts(last_active: Instant) -> IdleFacts {
+        IdleFacts {
+            last_active,
+            has_plugin_manifest: false,
+            is_resident: false,
+            has_running_turn: false,
+        }
+    }
+
+    /// 空闲但还没到阈值：必须留着。回收太积极会让「切走再切回」反复冷启动。
+    #[test]
+    fn a_project_idle_for_less_than_the_ttl_is_kept() {
+        let now = Instant::now();
+        let last_active = now - Duration::from_secs(60);
+        assert!(!should_evict(&facts(last_active), now, EVICT_IDLE_AFTER));
+    }
+
+    /// 空闲超过阈值且没活干：可以回收。
+    #[test]
+    fn a_project_idle_past_the_ttl_with_nothing_running_is_evicted() {
+        let now = Instant::now();
+        let last_active = now - EVICT_IDLE_AFTER - Duration::from_secs(1);
+        assert!(should_evict(&facts(last_active), now, EVICT_IDLE_AFTER));
+    }
+
+    /// 装了插件（有清单）的项目豁免：它的 daemon 正给插件提供 socket，
+    /// 回收会把插件一起停掉。
+    #[test]
+    fn a_project_with_a_plugin_manifest_is_never_evicted() {
+        let now = Instant::now();
+        let mut f = facts(now - EVICT_IDLE_AFTER - Duration::from_secs(3600));
+        f.has_plugin_manifest = true;
+        assert!(!should_evict(&f, now, EVICT_IDLE_AFTER));
+    }
+
+    /// 登记为常驻的项目豁免：插件明确要求它一直活着。
+    #[test]
+    fn a_resident_project_is_never_evicted() {
+        let now = Instant::now();
+        let mut f = facts(now - EVICT_IDLE_AFTER - Duration::from_secs(3600));
+        f.is_resident = true;
+        assert!(!should_evict(&f, now, EVICT_IDLE_AFTER));
+    }
+
+    /// 有回合在跑就不回收，哪怕它已经空闲很久——判据是「有没有活干」，
+    /// 不是「多久没人碰」。
+    #[test]
+    fn a_project_with_a_running_turn_is_kept() {
+        let now = Instant::now();
+        let mut f = facts(now - EVICT_IDLE_AFTER - Duration::from_secs(3600));
+        f.has_running_turn = true;
+        assert!(!should_evict(&f, now, EVICT_IDLE_AFTER));
+    }
+
+    /// 造一个只够回收判定用的会话：`cwd` 决定归属项目，`active_turn_id`
+    /// 与 `status` 决定「是否在跑」。其余字段只为把 struct 填满。
+    fn test_session(project: &Path, thread_id: &str, turn: Option<&str>) -> ThreadSession {
+        let (prompt_tx, _prompt_rx) = mpsc::channel(1);
+        let (interrupt_tx, _interrupt_rx) = mpsc::channel(1);
+        let (interject_tx, _interject_rx) = mpsc::channel(1);
+        let (session_tx, _session_rx) = mpsc::channel(1);
+        ThreadSession {
+            thread_id: thread_id.to_string(),
+            cwd: project.display().to_string(),
+            model: "test".to_string(),
+            active_turn_id: turn.map(str::to_string),
+            yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
+            process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            prompt_tx,
+            interrupt_tx,
+            interject_tx,
+            session_tx,
+            store: Arc::new(crate::thread_store::ThreadStore::new(project)),
+            status: Arc::new(StdMutex::new(ThreadStatus::Idle)),
+            subagent_tx: tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).0,
+        }
+    }
+
+    /// 阈值是 10 分钟：这是与用户逐条确认过的值，别悄悄漂移。
+    #[test]
+    fn the_ttl_is_ten_minutes() {
+        assert_eq!(EVICT_IDLE_AFTER, Duration::from_secs(600));
+    }
+
+    /// 真表驱动：空闲够久的项目条目必须真的从表里消失，豁免项必须留着。
+    ///
+    /// 用 `fixed` binding 是因为回收判据只看「表里还有没有这个条目」，
+    /// 不需要真 daemon；条目被移除后 Drop 链才会去停进程，那是既有行为，
+    /// 已由 attach 侧测试覆盖。
+    #[test]
+    fn an_idle_entry_is_removed_from_the_table_and_an_exempt_one_is_not() {
+        let idle_project = tempfile::tempdir().unwrap();
+        let busy_project = tempfile::tempdir().unwrap();
+        let plugin_project = tempfile::tempdir().unwrap();
+        let resident_project = tempfile::tempdir().unwrap();
+
+        // plugin_project 装了一份清单（内容不重要，有 .json 就算装了插件）。
+        let manifests = yi_agent_supervisors::install::manifests_dir(plugin_project.path());
+        std::fs::create_dir_all(&manifests).unwrap();
+        std::fs::write(manifests.join("demo.json"), "{}").unwrap();
+
+        let resident_dir = tempfile::tempdir().unwrap();
+        yi_agent_store::resident::require(
+            resident_dir.path(),
+            resident_project.path(),
+            "some-plugin",
+        )
+        .unwrap();
+
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+        let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+        let handle = |project: &Path| {
+            let binding = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+                socket_path: project.join("s.sock"),
+                workspace_root: project.to_path_buf(),
+                session_id: "s".into(),
+                task_id: "t".into(),
+                capability: "c".into(),
+            });
+            binding.backdate_idle_clock(EVICT_IDLE_AFTER + Duration::from_secs(60));
+            runtimes
+                .lock()
+                .unwrap()
+                .insert(project_key(project), Ok(binding));
+        };
+        handle(idle_project.path());
+        handle(busy_project.path());
+        handle(plugin_project.path());
+        handle(resident_project.path());
+
+        // busy_project 有一个回合在跑。
+        let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+        threads.insert(
+            "thread-1".into(),
+            test_session(busy_project.path(), "thread-1", Some("turn-1")),
+        );
+
+        // 四个 binding 的时钟都已被拨到阈值之外：只剩豁免与「在跑」能留住。
+        let evicted = evict_idle_runtimes(
+            &runtimes,
+            &thread_roots,
+            &threads,
+            resident_dir.path(),
+            Instant::now(),
+            EVICT_IDLE_AFTER,
+        );
+
+        assert_eq!(
+            evicted,
+            vec![project_key(idle_project.path())],
+            "only the plainly idle project may be evicted"
+        );
+        let remaining: Vec<PathBuf> = runtimes.lock().unwrap().keys().cloned().collect();
+        assert!(!remaining.contains(&project_key(idle_project.path())));
+        assert!(remaining.contains(&project_key(busy_project.path())));
+        assert!(remaining.contains(&project_key(plugin_project.path())));
+        assert!(remaining.contains(&project_key(resident_project.path())));
+    }
+
+    /// 回收必须同时摘掉 `thread_roots`。
+    ///
+    /// `ThreadRoot` 自己握着 `Arc<RuntimeBinding>`：只删 `runtimes` 条目时，会话
+    /// 根还活着，daemon 与监督线程根本不停——「回收」就成了只骗过表的一张假象。
+    /// 这条断言盯的正是那个失效模式。
+    #[test]
+    fn eviction_also_drops_the_thread_roots_holding_the_binding() {
+        let idle_project = tempfile::tempdir().unwrap();
+        let busy_project = tempfile::tempdir().unwrap();
+
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+        let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
+        let handle = |project: &Path| {
+            let binding = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+                socket_path: project.join("s.sock"),
+                workspace_root: project.to_path_buf(),
+                session_id: "s".into(),
+                task_id: "t".into(),
+                capability: "c".into(),
+            });
+            binding.backdate_idle_clock(EVICT_IDLE_AFTER + Duration::from_secs(60));
+            runtimes
+                .lock()
+                .unwrap()
+                .insert(project_key(project), Ok(Arc::clone(&binding)));
+            binding
+        };
+        let idle_binding = handle(idle_project.path());
+        let busy_binding = handle(busy_project.path());
+
+        // 两个项目各挂一个会话根，模拟真实使用过的项目。
+        for (id, binding, project) in [
+            ("thread-idle", idle_binding, idle_project.path()),
+            ("thread-busy", busy_binding, busy_project.path()),
+        ] {
+            thread_roots.lock().unwrap().insert(
+                id.to_string(),
+                yi_agent_subagent::thread_root::ThreadRoot::new(
+                    binding,
+                    id,
+                    project.to_path_buf(),
+                    Vec::new(),
+                ),
+            );
+        }
+
+        let mut threads: HashMap<String, ThreadSession> = HashMap::new();
+        threads.insert(
+            "thread-busy".into(),
+            test_session(busy_project.path(), "thread-busy", Some("turn-1")),
+        );
+
+        let evicted = evict_idle_runtimes(
+            &runtimes,
+            &thread_roots,
+            &threads,
+            tempfile::tempdir().unwrap().path(),
+            Instant::now(),
+            EVICT_IDLE_AFTER,
+        );
+
+        assert_eq!(evicted, vec![project_key(idle_project.path())]);
+        let roots = thread_roots.lock().unwrap();
+        assert!(
+            !roots.contains_key("thread-idle"),
+            "the idle project's conversation root must be dropped with its runtime"
+        );
+        assert!(
+            roots.contains_key("thread-busy"),
+            "a running project keeps its conversation root"
         );
     }
 }
