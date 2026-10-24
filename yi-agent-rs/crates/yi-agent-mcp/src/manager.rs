@@ -55,6 +55,35 @@ struct ServerEntry {
     client: Mutex<Option<Arc<Client>>>,
 }
 
+/// 一次 reload 里单个 server 的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerOutcome {
+    pub name: String,
+    /// 本次 reload 前不存在、现在存在。
+    pub added: bool,
+    /// 之前存在、现在被删除。
+    pub removed: bool,
+    /// 本次是否真的连上去探测过。
+    pub probed: bool,
+    pub tool_count: usize,
+    pub read_only_count: usize,
+    /// 探测失败原因原文;`None` 表示成功(或未探测)。
+    pub error: Option<String>,
+}
+
+/// 一次 reload 的汇总。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReloadReport {
+    pub servers: Vec<ServerOutcome>,
+}
+
+impl ReloadReport {
+    /// 全部 server 都没有探测错误。写盘成功与探测成功是两件事,由调用方分别呈现。
+    pub fn all_ok(&self) -> bool {
+        self.servers.iter().all(|s| s.error.is_none())
+    }
+}
+
 /// Owns configured MCP servers and their connections.
 pub struct McpManager {
     /// 配置快照。读路径 clone 出 `Arc` 后立即释放锁,**绝不跨 `.await` 持锁**
@@ -161,6 +190,104 @@ impl McpManager {
                 .entry(server)
                 .map(|e| e.enabled.load(Ordering::Relaxed))
                 .unwrap_or(false)
+    }
+
+    /// 重读 `.yi-agent/mcp.json` 并同步内存快照。
+    ///
+    /// **只探测新增或配置变化过的 server**:配置没变的沿用旧工具清单,不重探
+    /// (探测会 spawn 子进程,首次 `npx` 拉包最坏要 55s)。
+    ///
+    /// 单个 server 的探测失败**不会**被吞掉:原因原文写进 `ServerOutcome::error`,
+    /// 由调用方回传给模型。写盘(cache)失败只 warn,不影响本次内存快照。
+    pub async fn reload(&self, workdir: &Path) -> ReloadReport {
+        let cfg = match McpConfig::load(workdir) {
+            Ok(Some(c)) => c,
+            Ok(None) => McpConfig::default(),
+            Err(e) => {
+                return ReloadReport {
+                    servers: vec![ServerOutcome {
+                        name: "<config>".into(),
+                        added: false,
+                        removed: false,
+                        probed: false,
+                        tool_count: 0,
+                        read_only_count: 0,
+                        error: Some(format!("{e:#}")),
+                    }],
+                };
+            }
+        };
+
+        let old = self.snapshot();
+        let mut cache = McpCache::load(workdir);
+        let mut next: HashMap<String, Arc<ServerEntry>> = HashMap::new();
+        let mut out = Vec::new();
+
+        for (name, sc) in &cfg.mcp_servers {
+            let previous = old.get(name);
+            // 旧快照里有同名条目且配置完全一致 ⇒ 沿用工具清单,不重探。
+            let reusable = previous.filter(|e| e.config == *sc);
+            let (tools, probed, error) = match reusable {
+                Some(e) => (e.tools.clone(), false, None),
+                None => match cache.get_for(name, sc) {
+                    Some(cached) => (cached.to_vec(), false, None),
+                    None => match probe_tools(sc).await {
+                        Ok(probed_tools) => {
+                            cache.put(name, sc, probed_tools.clone());
+                            (probed_tools, true, None)
+                        }
+                        Err(e) => (Vec::new(), true, Some(e.to_string())),
+                    },
+                },
+            };
+            let enabled = previous
+                .map(|e| e.enabled.load(Ordering::Relaxed))
+                .unwrap_or(sc.enabled);
+            let read_only_count = tools.iter().filter(|t| t.read_only).count();
+            out.push(ServerOutcome {
+                name: name.clone(),
+                added: previous.is_none(),
+                removed: false,
+                probed,
+                tool_count: tools.len(),
+                read_only_count,
+                error,
+            });
+            next.insert(
+                name.clone(),
+                Arc::new(ServerEntry {
+                    config: sc.clone(),
+                    enabled: AtomicBool::new(enabled),
+                    tools,
+                    client: Mutex::new(None),
+                }),
+            );
+        }
+
+        for name in old.keys() {
+            if !cfg.mcp_servers.contains_key(name) {
+                out.push(ServerOutcome {
+                    name: name.clone(),
+                    added: false,
+                    removed: true,
+                    probed: false,
+                    tool_count: 0,
+                    read_only_count: 0,
+                    error: None,
+                });
+            }
+        }
+
+        if let Err(e) = cache.save(workdir) {
+            warn!(error = %e, "failed to persist MCP cache after reload");
+        }
+        self.master_enabled.store(cfg.enabled, Ordering::Relaxed);
+        *self.servers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(next);
+        if let Some(fp) = self.config_fingerprint(workdir) {
+            *self.last_seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(fp);
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        ReloadReport { servers: out }
     }
 
     /// 当前磁盘配置的指纹;文件缺失或坏 JSON 时返回 `None`(调用方据此决定是否 reload)。
@@ -412,10 +539,11 @@ impl McpManager {
         *self.servers.get_mut().unwrap_or_else(|e| e.into_inner()) = Arc::new(map);
     }
 
-    /// 模拟一次 reload 之后的新快照(测试用)。
+    /// 模拟一次 reload 之后的新快照(测试用)。只暴露"清空"这一种动作,
+    /// 免得把私有的 `ServerEntry` 泄进公开签名。
     #[cfg(test)]
-    pub(crate) fn replace_servers_for_test(&self, servers: HashMap<String, Arc<ServerEntry>>) {
-        *self.servers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(servers);
+    pub(crate) fn clear_servers_for_test(&self) {
+        *self.servers.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(HashMap::new());
     }
 }
 
@@ -726,6 +854,127 @@ mod tests {
         assert!(res.is_error);
     }
 
+    /// 配置没变时 `reload` 不得重新探测——探测会 spawn 子进程并可能耗时 55s。
+    #[tokio::test]
+    async fn reload_does_not_reprobe_an_unchanged_server() {
+        let _serial = seam_guard();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx","args":["-y","pkg"]}}}"#,
+        )
+        .unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        *TEST_CONNECTOR.lock().unwrap() = Some(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(anyhow!("counting connector: no real server")) })
+        }));
+        let _seam = SeamGuard;
+
+        let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
+        let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+        let after_load = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after_load, 1, "startup must probe once (cache is cold)");
+
+        let report = mgr.reload(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            after_load,
+            "unchanged config must not re-probe"
+        );
+        assert!(
+            report.servers.iter().all(|s| !s.probed),
+            "report must say nothing was probed: {report:?}"
+        );
+    }
+
+    /// 改了配置就必须重新探测,并把失败原文带上(不静默)。
+    #[tokio::test]
+    async fn reload_reprobes_a_changed_server_and_reports_the_error() {
+        let _serial = seam_guard();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        *TEST_CONNECTOR.lock().unwrap() = Some(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Err(anyhow!("boom")) })
+        }));
+        let _seam = SeamGuard;
+
+        let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
+        let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 改 args ⇒ 指纹变化
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx","args":["--new"]}}}"#,
+        )
+        .unwrap();
+        let report = mgr.reload(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "must re-probe"
+        );
+        let fs = report.servers.iter().find(|s| s.name == "fs").unwrap();
+        assert!(fs.probed);
+        assert_eq!(fs.error.as_deref(), Some("boom"), "error must be surfaced");
+    }
+
+    /// 删除一个 server 后,它的工具名必须从 registry 消失。
+    #[tokio::test]
+    async fn reload_removes_a_deleted_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let mut cache = McpCache::default();
+        let sc = ServerConfig {
+            kind: crate::config::ServerKind::Stdio,
+            command: Some("npx".into()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            headers: Default::default(),
+            enabled: true,
+        };
+        cache.put("fs", &sc, vec![]);
+        cache.save(dir.path()).unwrap();
+
+        let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
+        let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+        let mut registry = ToolRegistry::new();
+        mgr.refresh_registry(&mut registry);
+
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp.json"),
+            r#"{"mcpServers":{}}"#,
+        )
+        .unwrap();
+        let report = mgr.reload(dir.path()).await;
+        assert!(report.servers.iter().any(|s| s.name == "fs" && s.removed));
+        mgr.refresh_registry(&mut registry);
+        assert!(
+            registry.names().iter().all(|n| !n.starts_with("mcp__fs__")),
+            "deleted server's tools must be gone; got {:?}",
+            registry.names()
+        );
+    }
+
     #[test]
     fn refresh_registry_registers_effective_tools() {
         let m = manager_with_fs_read();
@@ -746,7 +995,7 @@ mod tests {
         assert!(registry.get("mcp__fs__read").is_some());
 
         // 模拟 reload 把 fs 整条删掉:新快照里没有它。
-        m.replace_servers_for_test(HashMap::new());
+        m.clear_servers_for_test();
         m.refresh_registry(&mut registry);
 
         assert!(
@@ -890,6 +1139,14 @@ mod tests {
         *TEST_CONNECTOR.lock().unwrap() = Some(factory);
     }
 
+    /// `TEST_CONNECTOR` 是进程级全局量,并行测试会互相清空/覆盖。
+    /// 所有用到这个缝的测试都先拿这把锁,保证同一时刻只有一个在跑。
+    static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn seam_guard() -> std::sync::MutexGuard<'static, ()> {
+        SEAM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Clears the process-global `TEST_CONNECTOR` on drop, including on panic,
     /// so a failed assertion cannot leak the seam into other tests.
     struct SeamGuard;
@@ -901,6 +1158,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_then_call_over_duplex() {
+        let _serial = seam_guard();
         let _seam = SeamGuard;
         let calls = Arc::new(AtomicUsize::new(0));
         install_echo_connector(Arc::clone(&calls));
