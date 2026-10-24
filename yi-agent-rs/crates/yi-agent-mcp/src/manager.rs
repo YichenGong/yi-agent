@@ -305,6 +305,23 @@ impl McpManager {
             .clone()
     }
 
+    /// 磁盘上的配置是否与上次见到的不一样。
+    ///
+    /// 用在"每轮开始前"的检查:用户可能在别的窗口改了 `mcp.json`,也可能
+    /// 刚刚通过 `mcp_reload` 写过盘——后者会在 `reload` 里更新 `last_seen`,
+    /// 所以不会误判成"外部改动"而白跑一次。
+    ///
+    /// 文件缺失且从未见过配置时返回 `false`(没什么可重载的);文件从有到无
+    /// 返回 `true`(server 全删了,得把它清出 registry)。
+    pub fn config_changed_on_disk(&self, workdir: &Path) -> bool {
+        let current = self.config_fingerprint(workdir);
+        let last = self.last_seen_fingerprint();
+        match (current, last) {
+            (None, None) => false,
+            (a, b) => a != b,
+        }
+    }
+
     pub fn set_master(&self, on: bool) {
         self.master_enabled.store(on, Ordering::Relaxed);
     }
@@ -973,6 +990,68 @@ mod tests {
             "deleted server's tools must be gone; got {:?}",
             registry.names()
         );
+    }
+
+    /// 每轮检查:磁盘没变就不该说"变了",否则每轮都会白跑一次 reload。
+    #[tokio::test]
+    async fn config_changed_on_disk_is_false_when_nothing_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
+        let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+
+        assert!(
+            !mgr.config_changed_on_disk(dir.path()),
+            "load_and_probe must record what it saw"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_changed_on_disk_detects_an_external_edit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
+        let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+        assert!(!mgr.config_changed_on_disk(dir.path()));
+
+        std::fs::write(
+            dir.path().join(".yi-agent/mcp.json"),
+            r#"{"mcpServers":{"fs":{"command":"uvx"}}}"#,
+        )
+        .unwrap();
+        assert!(
+            mgr.config_changed_on_disk(dir.path()),
+            "edit must be noticed"
+        );
+
+        // reload 之后同一次改动不该反复触发。
+        mgr.reload(dir.path()).await;
+        assert!(!mgr.config_changed_on_disk(dir.path()));
+    }
+
+    /// 配置从有到无:server 全被删掉,必须触发一次收尾 reload。
+    #[tokio::test]
+    async fn config_changed_on_disk_is_true_when_the_file_disappears() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join(".yi-agent")).unwrap();
+        let path = dir.path().join(".yi-agent/mcp.json");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let cfg = McpConfig::load(dir.path()).unwrap().unwrap();
+        let mgr = McpManager::load_and_probe(cfg, dir.path()).await.unwrap();
+        assert!(!mgr.config_changed_on_disk(dir.path()));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(mgr.config_changed_on_disk(dir.path()));
     }
 
     #[test]

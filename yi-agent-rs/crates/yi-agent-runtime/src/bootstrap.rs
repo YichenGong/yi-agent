@@ -266,6 +266,23 @@ pub fn build_tool_setup_with_controller(
         }
     };
 
+    // `mcp_reload` 无条件注册:还没有 mcp.json 时必须也有入口,否则"第一次
+    // 加一个 MCP"就无从下手。它与上面探测用的 manager 共享同一份状态。
+    {
+        let manager = match &mcp {
+            Some(m) => Arc::clone(m),
+            None => yi_agent_mcp::McpManager::empty(),
+        };
+        let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+            Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(str::to_string));
+        yi_agent_mcp::register_mcp_reload_tool(
+            &mut registry,
+            manager,
+            &cfg.workdir,
+            Some(blocklist_fn),
+        );
+    }
+
     Ok(ToolSetup {
         tools: Arc::new(registry),
         catalog: prompt.catalog,
@@ -1314,8 +1331,19 @@ mod tests {
             setup.tools.names()
         );
 
+        // `mcp_reload` 是个例外:没有配置时它**仍然**要在,否则用户没法从
+        // 对话里添加第一个 server。
+        assert!(
+            setup.tools.names().iter().any(|n| n == "mcp_reload"),
+            "mcp_reload must be registered even without mcp.json; got {:?}",
+            setup.tools.names()
+        );
+
+        // naked(子 agent 精简集)刻意返回空工具集,`mcp_reload` 也不例外:
+        // 那个入口属于根 agent,子 agent 不该改写用户的 MCP 配置。
         let naked = build_tool_setup(&cfg, true).expect("build naked setup");
         assert!(naked.mcp.is_none(), "naked setup never has a manager");
+        assert!(naked.tools.is_empty());
     }
 
     /// 与上一条互补的正向用例:`.yi-agent/mcp.json` 存在时必须返回 `Some(manager)`。

@@ -2778,6 +2778,17 @@ fn execute_slash_command(
                     let text = render_mcp_status(mcp.master(), &mcp.status());
                     history.push(HistoryCell::Markdown { text }, width);
                 }
+                Ok(McpAction::Reload) => {
+                    // 真正的重读 + 探测由 driver 侧完成(那里才有 ToolRegistry
+                    // 与 tokio runtime);这里只发出请求并给一句即时反馈。
+                    let _ = control_tx.blocking_send(crate::DriverControl::McpReload);
+                    history.push(
+                        HistoryCell::Separator {
+                            label: Some("正在重新读取 MCP 配置…".into()),
+                        },
+                        width,
+                    );
+                }
                 Ok(McpAction::Master(on)) => {
                     mcp.set_master(on);
                     let _ = control_tx.blocking_send(crate::DriverControl::McpRefresh);
