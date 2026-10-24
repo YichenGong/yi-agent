@@ -903,9 +903,9 @@ describe("ChatView auto-scroll", () => {
       const { container, rerender } = render(<ChatView items={list} threadId="t2" />);
       scroller = container.firstElementChild as HTMLElement;
 
-      // 切到 t1，但内容还是空的。
-      rerender(<ChatView items={[]} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
-      // 内容到达：必须补上恢复（800 - (-100) = 900）。
+      // 切到 t1，内容还在补齐。
+      rerender(<ChatView items={[]} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} syncing />);
+      // 内容到达、补齐结束：必须补上恢复（800 - (-100) = 900）。
       rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
       expect(state.scrollTop).toBe(900);
     } finally {
@@ -914,6 +914,92 @@ describe("ChatView auto-scroll", () => {
         ["scrollHeight", saved.scrollHeight],
         ["clientHeight", saved.clientHeight],
         ["scrollTop", saved.scrollTop],
+      ] as const) {
+        if (desc) Object.defineProperty(HTMLElement.prototype, name, desc);
+      }
+    }
+  });
+
+  it("restores after a frame-by-frame replay even though the anchor prop is stable", () => {
+    // 生产环境的 `anchorFor()` 返回 Map 里同一个对象：引用恒定。冷会话回放是
+    // **分帧**到达的，`anchor` 不会换身份，所以恢复不能只依赖 `anchor` 变化——
+    // 必须由"内容到达"驱动，否则永远补不上（实测停在 2424 而非 1200）。
+    const tops: Record<string, number> = {};
+    const state = { scrollTop: 0, contentH: 0 };
+    let scroller: HTMLElement | null = null;
+    const ROW = 100;
+    const PAD = 12;
+    const VIEWPORT = 600;
+    const rect = (top: number) =>
+      ({ top, left: 0, bottom: top, right: 0, width: 0, height: 0, x: 0, y: top, toJSON() {} }) as DOMRect;
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    const saved = {
+      rect: proto.getBoundingClientRect,
+      sh: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight"),
+      ch: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight"),
+      st: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop"),
+    };
+    proto.getBoundingClientRect = function (this: HTMLElement) {
+      if (this === scroller) return rect(0);
+      return rect(PAD - state.scrollTop + (tops[this.dataset.itemId ?? ""] ?? 0));
+    };
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? state.contentH + PAD * 2 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? VIEWPORT : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? state.scrollTop : 0; },
+      set(this: HTMLElement, v: number) {
+        if (this !== scroller) return;
+        state.scrollTop = Math.max(0, Math.min(v, state.contentH + PAD * 2 - VIEWPORT));
+      },
+    });
+
+    try {
+      const many = (prefix: string, n: number): Item[] =>
+        Array.from({ length: n }, (_, i) => ({ type: "userMessage", id: `${prefix}${i}`, text: "" }));
+      const setContent = (list: Item[]) => {
+        for (const k of Object.keys(tops)) delete tops[k];
+        list.forEach((it, i) => { tops[it.id] = i * ROW; });
+        state.contentH = list.length * ROW;
+      };
+      const A = many("a", 30);
+      const B = many("b", 5);
+      // 与 `useSessionState` 一致：同一个对象存在 Map 里，读出来引用不变。
+      const anchorA = { itemId: "a12", offset: 0 };
+
+      setContent(B);
+      const { container, rerender } = render(
+        <ChatView items={B} threadId="B" anchor={null} />,
+      );
+      scroller = container.firstElementChild as HTMLElement;
+
+      // 切回 A：冷，内容还没到，正在补齐。
+      rerender(<ChatView items={[]} threadId="A" anchor={anchorA} syncing />);
+      // 回放分帧到达（引用始终是 anchorA）。中途某帧可能不含锚点那条。
+      for (const n of [10, 20, 30]) {
+        const partial = A.slice(0, n);
+        setContent(partial);
+        rerender(<ChatView items={partial} threadId="A" anchor={anchorA} syncing />);
+      }
+      // 回放完成。
+      setContent(A);
+      rerender(<ChatView items={A} threadId="A" anchor={anchorA} />);
+      // `offset: 0` = 这条消息顶边贴着视口顶。它的内容坐标是 `py-3`(12) + 1200，
+      // 所以恢复出的 scrollTop 是 1212 —— 采集与恢复用的是同一套坐标系，
+      // 往返后"顶边在视口顶"这一点必须保持不变。
+      expect(state.scrollTop).toBe(1212);
+    } finally {
+      proto.getBoundingClientRect = saved.rect;
+      for (const [name, desc] of [
+        ["scrollHeight", saved.sh],
+        ["clientHeight", saved.ch],
+        ["scrollTop", saved.st],
       ] as const) {
         if (desc) Object.defineProperty(HTMLElement.prototype, name, desc);
       }
