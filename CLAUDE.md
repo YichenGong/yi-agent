@@ -55,6 +55,83 @@
 - 唯一例外:紧急回滚 / hotfix 也走 worktree 流程,不允许在 `main` 上直接
   `git revert` 或改文件。
 
+## 打包独立 app(不与主环境冲突)
+
+想把改动打成第二个 `.app` 试用、又不污染正在用的正式版时,按下面做。这套
+流程来自 2026-10-25 打 `/Applications/yi-agent-nongit.app` 的实测踩坑。
+
+### 1. 隔离实例状态:必须设 `YI_AGENT_HOME`
+
+桌面壳与 sidecar 都按 `YI_AGENT_HOME` 解析实例根(`paths::instance_home`)。
+**不设就会共用 `~/.yi-agent`**:relay session、runtime sqlite、threads 全部
+撞车,两个 sidecar 连同一个 relay session,消息随机分流,表现为"daemon 时好
+时坏"。写入 `Info.plist`(注意 `LSEnvironment` 不展开 `~`,必须绝对路径):
+
+```bash
+P=/Applications/<新app>.app/Contents/Info.plist
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$P"
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment:YI_AGENT_HOME string $HOME/.yi-agent-<实例名>" "$P"
+```
+
+### 2. 改 bundle 标识,否则与正式版互踢
+
+```bash
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.gongyichen.desktop.<实例名>" "$P"
+/usr/libexec/PlistBuddy -c "Set :CFBundleName yi-agent-<实例名>" "$P"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName yi-agent-<实例名>" "$P"
+```
+
+### 3. worktree 里必须补 sidecar 二进制
+
+`tauri.conf.json` 的 `bundle.externalBin` 要求
+`desktop/src-tauri/binaries/yi-agent-aarch64-apple-darwin` 存在,否则 build
+script 直接报 `resource path doesn't exist`。worktree 里没有该文件,软链过来:
+
+```bash
+mkdir -p desktop/src-tauri/binaries
+ln -sf <主仓库>/desktop/src-tauri/binaries/yi-agent-aarch64-apple-darwin \
+       desktop/src-tauri/binaries/yi-agent-aarch64-apple-darwin
+```
+
+### 4. 必须先构建前端再 `tauri build`,否则白屏
+
+`dist/` 缺失时 `cargo build --release` 出的是 **dev 版**(连
+`http://localhost:1420`),装进 app 后 webview 报 `-1004` 白屏,且**前端不
+初始化 → `setup` 里的 sidecar 也不起**。正确顺序(注意 `node`/`cargo` 可能
+不在默认 PATH):
+
+```bash
+export PATH="/opt/homebrew/bin:$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$PATH"
+cd desktop && npm ci && npm run build          # 产出 dist/
+npx tauri build --bundles app                  # 产物在 target/release/bundle/macos/
+```
+
+用产出的 bundle 作为源,不要手拼 app 目录。
+
+### 5. 换二进制后三层重签
+
+`cp` 覆盖 `MacOS/` 下任何二进制都会破坏签名,按 sidecar → desktop → app
+的顺序重签:
+
+```bash
+codesign --force --sign - "$APP/Contents/MacOS/yi-agent"
+codesign --force --sign - "$APP/Contents/MacOS/desktop"
+codesign --force --sign - "$APP"
+codesign -v "$APP"   # 应 exit 0
+```
+
+### 6. 验收方式
+
+- 比对两个 sidecar 的 relay 参数,必须不同(新实例未配置 relay 时应**完全没有**
+  `--relay` 参数):
+  `ps axo command | grep "app-server --listen" | grep -o "session=[a-f0-9]*"`
+- 确认独立目录生成:`ls ~/.yi-agent-<实例名>/.yi-agent/`
+- **不要只用 `open -a` 验收 sidecar**:`setup` 里的 `bridge::spawn` 在 `open -a`
+  启动时不总拉起 sidecar(已有问题,与打包无关)。要可靠复现就在命令行直接跑
+  `Contents/MacOS/desktop`。
+- 清理时注意监督循环会重启 sidecar:必须先杀 desktop 父进程,否则只杀
+  sidecar 会被立刻拉起。
+
 ## Commit 规范
 
 - **不要**在 commit message 里写 `Co-Authored-By: Claude ...` 行

@@ -406,16 +406,28 @@ impl DaemonAgentWorkerFactory {
             })
     }
 
-    fn recovery_context_for_workspace(&self, workspace: PathBuf) -> WorkerRecoveryContext {
+    fn recovery_context_for_workspace(
+        &self,
+        workspace: PathBuf,
+        workspace_mode: ChildWriteMode,
+    ) -> WorkerRecoveryContext {
         let git_root = git_output(&workspace, &["rev-parse", "--show-toplevel"]);
         let git_head = git_output(&workspace, &["rev-parse", "HEAD"]);
         let git_status = git_command_output(&workspace, &["status", "--porcelain"]).ok();
         let tool_names = self.worker_tool_names_for_workspace(workspace.clone());
+        // A read-only worker runs in place: when the position is not a git
+        // worktree there is nothing to recover into, and the checkpoint says so
+        // explicitly rather than leaving an empty lease to be misread.
+        let (worktree_lease, checkpoint_kind) = match (git_root, workspace_mode) {
+            (Some(directory), _) => (Some(format!("worktree:{directory}")), "worker_admission"),
+            (None, ChildWriteMode::ReadOnly) => (None, "read_only_checkpoint"),
+            (None, ChildWriteMode::Coding) => (None, "worker_admission"),
+        };
         WorkerRecoveryContext {
             workspace_lease_id: Some(format!("workspace:{}", workspace.display())),
-            worktree_lease: git_root.map(|directory| format!("worktree:{directory}")),
+            worktree_lease,
             checkpoint_json: json!({
-                "kind": "worker_admission",
+                "kind": checkpoint_kind,
                 "git_head": git_head,
                 "git_status": git_status,
             })
@@ -460,6 +472,31 @@ impl DaemonWorkspaceService {
         let canonical = workdir
             .canonicalize()
             .unwrap_or_else(|_| workdir.to_path_buf());
+        if !canonical.is_dir() {
+            return Err(WorkerError::Startup(format!(
+                "workdir does not exist: {} — create it with `git worktree add` first",
+                workdir.display()
+            )));
+        }
+        // A coding position must be a git worktree *with a HEAD*. `git init`
+        // alone passes `--show-toplevel` while `rev-parse HEAD` fails, so
+        // accepting it would defer the failure to delivery, after the child has
+        // already run its whole task. Checked before the cache lookup so a
+        // position can never be admitted once and then reused after it stopped
+        // qualifying.
+        let toplevel =
+            git_output(&canonical, &["rev-parse", "--show-toplevel"]).ok_or_else(|| {
+                WorkerError::Startup(format!(
+                    "coding_requires_git:not_a_repository at {}",
+                    workdir.display()
+                ))
+            })?;
+        let head = git_output(&canonical, &["rev-parse", "HEAD"]).ok_or_else(|| {
+            WorkerError::Startup(format!(
+                "coding_requires_git:no_initial_commit at {}",
+                workdir.display()
+            ))
+        })?;
         if let Some(existing) = self
             .prepared
             .lock()
@@ -469,26 +506,13 @@ impl DaemonWorkspaceService {
         {
             return Ok(existing);
         }
-        if !canonical.is_dir() {
-            return Err(WorkerError::Startup(format!(
-                "workdir does not exist: {} — create it with `git worktree add` first",
-                workdir.display()
-            )));
-        }
-        let toplevel =
-            git_output(&canonical, &["rev-parse", "--show-toplevel"]).ok_or_else(|| {
-                WorkerError::Startup(format!(
-                    "workdir is not inside a git worktree: {}",
-                    workdir.display()
-                ))
-            })?;
         let workspace = WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
             repository_root: PathBuf::from(toplevel),
             path: canonical.clone(),
             branch: current_git_branch(&canonical).unwrap_or_default(),
             parent_branch: String::new(),
-            base_commit: git_output(&canonical, &["rev-parse", "HEAD"]).unwrap_or_default(),
+            base_commit: head,
         };
         self.prepared
             .lock()
@@ -701,9 +725,11 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
     }
 
     fn recovery_context(&self) -> WorkerRecoveryContext {
+        // No request to read a mode from, so this stays exactly as it was: the
+        // configured recovery workspace is always judged as a coding position.
         self.recovery_workspace
             .clone()
-            .map(|workspace| self.recovery_context_for_workspace(workspace))
+            .map(|workspace| self.recovery_context_for_workspace(workspace, ChildWriteMode::Coding))
             .unwrap_or_default()
     }
 
@@ -711,7 +737,9 @@ impl AgentWorkerFactory for DaemonAgentWorkerFactory {
         request
             .workspace
             .as_ref()
-            .map(|workspace| self.recovery_context_for_workspace(workspace.path.clone()))
+            .map(|workspace| {
+                self.recovery_context_for_workspace(workspace.path.clone(), request.workspace_mode)
+            })
             .unwrap_or_else(|| self.recovery_context())
     }
 
@@ -1862,6 +1890,63 @@ fn abort_unconsumed_fork(socket: &Path, fork_token: &Option<String>) {
 /// response handling -- the queued payload, the abort of an unconsumed fork on
 /// rejection, and the daemon-unavailable error -- is identical. Keeping it in one
 /// place is what stops the `forked` contract from drifting between them.
+/// The stable prefix the daemon puts on a git-precondition refusal. Mirrors
+/// `yi_agent_store::runtime::CODING_REQUIRES_GIT_PREFIX`; this crate cannot
+/// import it without a dependency cycle, so `spawn_agent_schema_pins_the_wire_contract`
+/// and the tests below pin the spelling on both sides.
+const CODING_REQUIRES_GIT_PREFIX: &str = "coding_requires_git:";
+
+/// Rebuilds a structured rejection from the daemon's prefixed message.
+///
+/// The IPC protocol carries only `code` and `message`, so the model would
+/// otherwise see `validation: coding_requires_git:...` and have to parse a
+/// sentence. This turns it into the facts a model can act on: which directory,
+/// why, what to run, and what to ask the user.
+///
+/// The prefix is located rather than anchored: the daemon wraps its message in
+/// `daemon rejected spawn request: <code>: <message>`.
+fn coding_requires_git_payload(message: &str) -> Option<String> {
+    let start = message.find(CODING_REQUIRES_GIT_PREFIX)?;
+    let rest = &message[start + CODING_REQUIRES_GIT_PREFIX.len()..];
+    // Shape: "<reason> at <path>". Split from the right so a reason can never
+    // swallow part of the path; the path may itself contain " at ".
+    let (reason, workdir) = rest.rsplit_once(" at ")?;
+    let reason = match reason.trim() {
+        "not_a_repository" => "not_a_repository",
+        "no_initial_commit" => "no_initial_commit",
+        _ => return None,
+    };
+    let workdir = workdir.trim();
+    if workdir.is_empty() {
+        return None;
+    }
+    // `git init` only makes sense when there is no repository yet. Telling a
+    // user to re-initialize an existing repo is wrong and sounds destructive.
+    let commands: Vec<&str> = if reason == "not_a_repository" {
+        vec!["git init", "git add -A", "git commit -m \"initial commit\""]
+    } else {
+        vec!["git add -A", "git commit -m \"initial commit\""]
+    };
+    Some(
+        json!({
+            "code": "coding_requires_git",
+            "workdir": workdir,
+            "reason": reason,
+            "remedy": {
+                "commands": commands,
+                // Stated explicitly because `git init` alone still fails: with
+                // no commit, `rev-parse HEAD` has nothing to point at.
+                "requires_initial_commit": true,
+                "note": "a repository with no commits still fails: the runtime needs a HEAD to recover into",
+            },
+            "ask_user": format!(
+                "The coding subagent needs version control in {workdir}. I can create a git repository there and make an initial commit. Do you want me to?"
+            ),
+        })
+        .to_string(),
+    )
+}
+
 fn spawn_outcome(
     response: Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>,
     socket: &Path,
@@ -1880,11 +1965,13 @@ fn spawn_outcome(
         ),
         Ok(other) => {
             abort_unconsumed_fork(socket, fork_token);
-            ToolResult::error(format_ipc_rejection("spawn request", &other))
+            let message = format_ipc_rejection("spawn request", &other);
+            ToolResult::error(coding_requires_git_payload(&message).unwrap_or(message))
         }
         Err(error) => {
             abort_unconsumed_fork(socket, fork_token);
-            ToolResult::error(format!("daemon is unavailable: {error}"))
+            let message = format!("daemon is unavailable: {error}");
+            ToolResult::error(coding_requires_git_payload(&message).unwrap_or(message))
         }
     }
 }
@@ -1956,7 +2043,10 @@ struct DaemonWaitAgentTool {
 /// 普通 worker（`DaemonSpawnAgentTool`）与应用级子代理
 /// （`DaemonApplicationSpawnAgentTool`）共用这一份，避免文案漂移。
 pub(crate) fn spawn_agent_description() -> &'static str {
-    "Create an asynchronously scheduled direct child agent."
+    "Create an asynchronously scheduled direct child agent. A 'coding' child needs a git \
+     worktree with at least one commit; when the spawn is refused with 'coding_requires_git', \
+     ask the user whether to create one there, and do not retry a coding spawn in this session \
+     once they decline."
 }
 
 /// `spawn_agent` 的 JSON schema。
@@ -1975,7 +2065,7 @@ pub(crate) fn spawn_agent_schema() -> serde_json::Value {
             },
             "workdir": {
                 "type": "string",
-                "description": "Directory the child works in. Required for 'coding': create it yourself with `git worktree add <path> -b <branch>` first."
+                "description": "Directory the child works in. Required for 'coding': it must be inside a git worktree that already has a commit. Create it yourself with `git worktree add <path> -b <branch>` first, or after the user agrees to initialize the project with `git init` plus an initial commit. Omit it for 'read_only': a read-only child runs in your own position and works in non-git directories."
             },
             "fork": {
                 "type": "boolean",
@@ -2435,9 +2525,27 @@ mod tests {
             schema["properties"]["mode"]["enum"],
             serde_json::json!(["coding", "read_only"])
         );
-        assert_eq!(
-            spawn_agent_description(),
-            "Create an asynchronously scheduled direct child agent."
+        // The first sentence is the tool's identity and must survive any later
+        // elaboration; the rest of this test pins what that elaboration says.
+        let description = spawn_agent_description();
+        assert!(
+            description.starts_with("Create an asynchronously scheduled direct child agent."),
+            "{description}"
+        );
+        assert!(
+            description.contains("coding_requires_git"),
+            "the model knows this code only if the tool description names it: {description}"
+        );
+        let workdir = schema["properties"]["workdir"]["description"]
+            .as_str()
+            .expect("workdir description");
+        assert!(
+            workdir.contains("git worktree") || workdir.contains("git repository"),
+            "the model must know coding needs git: {workdir}"
+        );
+        assert!(
+            workdir.contains("commit"),
+            "a repository with no commit still fails, so the description must say so: {workdir}"
         );
     }
 
@@ -3831,6 +3939,112 @@ mod tests {
             *outsider_error,
             "the inherited root set must not widen the boundary: {results:?}"
         );
+    }
+
+    /// The model must be able to act on a refusal: what is wrong, what to run,
+    /// and what to ask the user. A bare "validation error" makes it guess.
+    #[test]
+    fn a_coding_requires_git_rejection_becomes_an_actionable_payload() {
+        let payload =
+            coding_requires_git_payload("coding_requires_git:not_a_repository at /tmp/notes")
+                .expect("the prefix marks a rejectable refusal");
+
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["code"], "coding_requires_git");
+        assert_eq!(value["workdir"], "/tmp/notes");
+        assert_eq!(value["reason"], "not_a_repository");
+        assert_eq!(value["remedy"]["requires_initial_commit"], true);
+        let commands = value["remedy"]["commands"].as_array().unwrap();
+        assert!(commands.iter().any(|command| command == "git init"));
+        assert!(
+            value["ask_user"]
+                .as_str()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "the model needs a sentence it can put to the user"
+        );
+    }
+
+    /// The daemon wraps the message in its own sentence, so the prefix is not at
+    /// the start. Locating it anywhere is what makes the tool layer work against
+    /// the real wire format rather than only against the unit-test spelling.
+    #[test]
+    fn a_prefixed_rejection_inside_a_daemon_sentence_is_still_recognized() {
+        let payload = coding_requires_git_payload(
+            "daemon rejected spawn request: validation: \
+             coding_requires_git:not_a_repository at /tmp/notes",
+        )
+        .expect("the prefix is found wherever the daemon put it");
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["workdir"], "/tmp/notes");
+    }
+
+    /// A repository that exists but has no commit must not be told to
+    /// re-initialize: that would be wrong and sounds destructive.
+    #[test]
+    fn a_missing_commit_omits_git_init_from_the_remedy() {
+        let payload =
+            coding_requires_git_payload("coding_requires_git:no_initial_commit at /tmp/notes")
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(value["reason"], "no_initial_commit");
+        let commands = value["remedy"]["commands"].as_array().unwrap();
+        assert!(
+            !commands.iter().any(|command| command == "git init"),
+            "an existing repository must not be re-initialized: {commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "git commit -m \"initial commit\"")
+        );
+    }
+
+    #[test]
+    fn an_unrelated_rejection_is_left_alone() {
+        assert!(coding_requires_git_payload("daemon rejected spawn request: conflict").is_none());
+    }
+
+    /// The tool layer keys off this prefix to rebuild a structured rejection, so
+    /// it must survive here even though this crate cannot import the store's
+    /// constant (that would be a dependency cycle). It is located rather than
+    /// anchored: `WorkerError::Startup` prepends `worker startup failed: `.
+    const CODING_REQUIRES_GIT_PREFIX: &str = "coding_requires_git:";
+
+    #[test]
+    fn register_workdir_reports_a_plain_directory_as_not_a_repository() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let plain = directory.path().join("plain");
+        std::fs::create_dir(&plain).unwrap();
+
+        let error = service.register_workdir(&plain).unwrap_err().to_string();
+        assert!(error.contains(CODING_REQUIRES_GIT_PREFIX), "{error}");
+        assert!(error.contains("not_a_repository"), "{error}");
+    }
+
+    /// `git init` without a commit leaves `--show-toplevel` working while
+    /// `rev-parse HEAD` fails. Admitting it here would defer the failure to the
+    /// delivery step, after the child already did all its work.
+    #[test]
+    fn register_workdir_reports_an_empty_repository_as_missing_a_commit() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let service = DaemonWorkspaceService::new(directory.path().to_path_buf());
+        let empty = directory.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        // `-b main` matches this file's `initialize_git_repository` helper. No
+        // commit is made: that is exactly the state under test.
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(&empty)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let error = service.register_workdir(&empty).unwrap_err().to_string();
+        assert!(error.contains(CODING_REQUIRES_GIT_PREFIX), "{error}");
+        assert!(error.contains("no_initial_commit"), "{error}");
     }
 
     #[test]

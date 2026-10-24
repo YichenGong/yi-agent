@@ -2975,6 +2975,11 @@ fn ipc_error_message(error: &IpcError) -> Option<String> {
         IpcError::Runtime(RuntimeCoordinatorError::ForkTooLarge { total, max }) => Some(format!(
             "fork payload of {total} bytes exceeds the {max}-byte limit"
         )),
+        // Carries a stable prefix plus the reason and the path, so the tool layer
+        // can rebuild a structured rejection the model can act on.
+        IpcError::Runtime(error @ RuntimeCoordinatorError::CodingRequiresGit { .. }) => {
+            Some(error.to_string())
+        }
         _ => None,
     }
 }
@@ -3000,7 +3005,8 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
         }
         // A bad fork token or an oversized payload is the caller's error, not a
         // daemon fault: surface it as validation so the client can react.
-        IpcError::Runtime(RuntimeCoordinatorError::ForkTooLarge { .. })
+        IpcError::Runtime(RuntimeCoordinatorError::CodingRequiresGit { .. })
+        | IpcError::Runtime(RuntimeCoordinatorError::ForkTooLarge { .. })
         | IpcError::Runtime(RuntimeCoordinatorError::ForkUpload(_)) => IpcErrorCode::Validation,
         IpcError::Io(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
             IpcErrorCode::Validation
@@ -5265,6 +5271,47 @@ mod watchdog_tick_tests {
         assert!(
             !recorded_watchdog_terminal(&events, &unhydrated_task),
             "no watchdog terminal event may be recorded for an unhydrated session"
+        );
+    }
+}
+
+#[cfg(test)]
+mod coding_requires_git_mapping_tests {
+    use super::*;
+    use crate::runtime::{CodingRequiresGitReason, RuntimeCoordinatorError};
+
+    #[test]
+    fn coding_requires_git_is_a_validation_error_with_a_stable_prefix() {
+        let error = IpcError::Runtime(RuntimeCoordinatorError::CodingRequiresGit {
+            workdir: std::path::PathBuf::from("/tmp/notes"),
+            reason: CodingRequiresGitReason::NotARepository,
+        });
+
+        // The client must be able to tell "your environment is not ready" apart
+        // from "the daemon is broken": Internal would send users chasing a
+        // crashed daemon that is running fine.
+        assert_eq!(ipc_error_code(&error), IpcErrorCode::Validation);
+
+        let message = ipc_error_message(&error).expect("a validation rejection carries a message");
+        assert!(
+            message.starts_with(crate::runtime::CODING_REQUIRES_GIT_PREFIX),
+            "the tool layer keys off this prefix, got {message:?}"
+        );
+        assert!(message.contains("not_a_repository"), "{message}");
+        assert!(message.contains("/tmp/notes"), "{message}");
+    }
+
+    #[test]
+    fn the_missing_commit_reason_is_distinguishable_at_the_wire() {
+        let error = IpcError::Runtime(RuntimeCoordinatorError::CodingRequiresGit {
+            workdir: std::path::PathBuf::from("/tmp/notes"),
+            reason: CodingRequiresGitReason::NoInitialCommit,
+        });
+        let message = ipc_error_message(&error).expect("message");
+        assert!(message.contains("no_initial_commit"), "{message}");
+        assert!(
+            !message.contains("not_a_repository"),
+            "the two reasons must not be conflated: {message}"
         );
     }
 }

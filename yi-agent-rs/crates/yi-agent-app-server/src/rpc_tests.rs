@@ -975,11 +975,11 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
     )
     .expect("an in-place root must activate");
 
-    // Delegating is where a plain directory stops: the daemon refuses the
-    // worker because it cannot name a Git worktree lease to recover into.
-    // Pin it here so the boundary is a documented fact rather than a
-    // surprise in a chat window -- the desktop app's default cwd is $HOME.
-    let spawned = yi_agent_store::ipc::send_request(
+    // Read-only delegation works in a plain directory: it writes nothing, so
+    // there is no worktree to recover into and no delivery to validate. The
+    // desktop app's default cwd is $HOME, so this is the ordinary case, not an
+    // edge one.
+    let read_only = yi_agent_store::ipc::send_request(
         &attached.socket_path,
         yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
             session_id: attached.attached_root.session_id.clone(),
@@ -994,14 +994,43 @@ fn a_non_git_cwd_attaches_in_place_with_the_delegation_tools() {
             fork_token: None,
         },
     )
-    .expect("the runtime socket answers even when it refuses");
+    .expect("the runtime socket answers");
     assert!(
-        !matches!(
-            spawned,
+        matches!(
+            read_only,
             yi_agent_store::ipc::IpcResponse::TaskSpawned { .. }
         ),
-        "delegation needs a checkpoint to recover into, so a plain directory \
-         must be refused rather than half-admitted; got {spawned:?}"
+        "a plain directory must still admit a read-only child, got {read_only:?}"
+    );
+
+    // Coding is where it stops: a commit is the recovery boundary a coding
+    // child cannot work without. The refusal must be recognizable rather than a
+    // bare internal error, so the model can explain it and offer to initialize.
+    let coding = yi_agent_store::ipc::send_request(
+        &attached.socket_path,
+        yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+            session_id: attached.attached_root.session_id.clone(),
+            parent_task_id: attached.attached_root.task_id.clone(),
+            capability: attached.attached_root.capability.clone(),
+            objective: "change the plain directory".into(),
+            mode: Some("coding".into()),
+            model: None,
+            workdir: None,
+            thread_id: None,
+            sandbox: None,
+            fork_token: None,
+        },
+    )
+    .expect("the runtime socket answers even when it refuses");
+    let yi_agent_store::ipc::IpcResponse::Error { code, message } = coding else {
+        panic!("a plain directory must refuse a coding child, got {coding:?}");
+    };
+    assert_eq!(code, yi_agent_store::ipc::IpcErrorCode::Validation);
+    assert!(
+        message
+            .as_deref()
+            .is_some_and(|text| text.contains("coding_requires_git")),
+        "the refusal must be actionable, got {message:?}"
     );
 }
 

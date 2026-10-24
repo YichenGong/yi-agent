@@ -21,7 +21,9 @@ use yi_agent_core::subagent::worker::{
 use yi_agent_store::repository::{
     RuntimeEvent, RuntimeRepository, WatchdogEvidence, WatchdogResourceWait, WatchdogTerminal,
 };
-use yi_agent_store::runtime::{RuntimeCoordinator, RuntimeStopOptions};
+use yi_agent_store::runtime::{
+    CodingRequiresGitReason, RuntimeCoordinator, RuntimeCoordinatorError, RuntimeStopOptions,
+};
 use yi_agent_store::schedule::{
     MissedRunPolicy, ScheduleDefinition, WatchdogLimits, WatchdogUsage,
 };
@@ -2939,8 +2941,13 @@ async fn a_coding_child_runs_in_the_workdir_its_parent_prepared() {
     let database = directory.path().join("runtime.sqlite");
     let project_root = directory.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
+    initialize_git_repository(&project_root);
     let prepared = directory.path().join("prepared-child");
     std::fs::create_dir_all(&prepared).unwrap();
+    // A real prepared workdir comes from `git worktree add`, so it is a git
+    // checkout with a HEAD. The fixture has to match that or it would model a
+    // state the runtime now refuses.
+    initialize_git_repository(&prepared);
     let workspace = WorkerWorkspace {
         lease_id: WorkspaceLeaseId::new(),
         repository_root: project_root.clone(),
@@ -3106,8 +3113,10 @@ async fn a_relative_workdir_resolves_against_the_parents_position() {
     let database = directory.path().join("runtime.sqlite");
     let project_root = directory.path().join("project");
     std::fs::create_dir_all(&project_root).unwrap();
+    initialize_git_repository(&project_root);
     let child_dir = project_root.join("sub");
     std::fs::create_dir_all(&child_dir).unwrap();
+    initialize_git_repository(&child_dir);
     let service = Arc::new(StaticWorkspaceService {
         workspace: WorkerWorkspace {
             lease_id: WorkspaceLeaseId::new(),
@@ -3195,6 +3204,99 @@ async fn read_only_child_runs_in_place_without_a_workspace_row() {
     assert_eq!(child_workspace.path, root_workspace.path);
     assert!(child_workspace.branch.is_empty());
     assert_eq!(starts[1].workspace_mode, ChildWriteMode::ReadOnly);
+}
+
+/// A read-only child in a plain directory must start and finish. It never
+/// writes, so there is nothing to recover or deliver, and the git requirement
+/// that gates a coding child does not apply to it.
+#[tokio::test]
+async fn non_git_read_only_child_starts_and_completes() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let plain = directory.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: plain.clone(),
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    // A non-git root has no worktree to provision, so it attaches in place as a
+    // read-only root; `create_session` would ask the factory for a worktree.
+    let attached = coordinator
+        .attach_application_root("non-git-read-only", &plain, &[])
+        .await
+        .unwrap();
+    let session = attached.session_id.clone();
+    let root = attached.root_task_id.clone();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let child = coordinator.spawn_child(&session, &root).await.unwrap();
+    coordinator
+        .start_worker(&session, &child)
+        .await
+        .expect("a read-only child has no worktree to recover into");
+
+    // Reporting a plain text result is how a read-only worker finishes. The
+    // handle list is the file's established seam (see
+    // `one_supervisors_failure_does_not_discard_another_sessions_completion`),
+    // and the child is the second start because the root started first.
+    let handles = factory.handles.lock().unwrap().clone();
+    assert_eq!(handles.len(), 2, "root plus the read-only child");
+    handles[1].report_completed("the investigation finished");
+    coordinator.reconcile_worker_events().await.unwrap();
+
+    let state = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_state(&child)
+        .unwrap();
+    assert_eq!(
+        state, "completed_no_changes",
+        "a read-only child must not fail"
+    );
+}
+
+/// A plain directory is not a git worktree, so the daemon has no repository
+/// root to fall back to. A read-only child still must not be gated on it: it
+/// never uses the workdir it was handed, and refusing it is exactly the poor
+/// experience this change removes.
+#[tokio::test]
+async fn non_git_read_only_child_accepts_an_explicit_workdir() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let plain = directory.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(Arc::new(NonGitWorkspaceService {
+            repository_root: plain.clone(),
+        })),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let attached = coordinator
+        .attach_application_root("non-git-read-only-workdir", &plain, &[])
+        .await
+        .unwrap();
+    let session = attached.session_id;
+    let root = attached.root_task_id;
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let child = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "read the plain directory".into(),
+            ChildWriteMode::ReadOnly,
+            None,
+            Some(plain),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("a read-only child must not be gated on git");
+    coordinator.start_worker(&session, &child).await.unwrap();
 }
 
 #[tokio::test]
@@ -3542,7 +3644,10 @@ async fn an_autonomous_session_refuses_a_workdir_that_is_not_a_git_worktree() {
         .await
         .unwrap_err();
 
-    // The refusal comes from the git check, not from a silent in-place run.
+    // The refusal comes from the git check, not from a silent in-place run. This
+    // is the autonomous ROOT's worktree, refused by the worktree service before
+    // any child exists, so it keeps the git-level wording rather than the child
+    // precondition's `coding_requires_git` code.
     assert!(
         error.to_string().contains("not a git repository"),
         "unexpected error: {error}"
@@ -4449,4 +4554,119 @@ async fn a_hydrated_attempt_is_terminated_even_beside_an_unhydrated_one() {
         ),
         "hydrated attempt must reach a watchdog terminal"
     );
+}
+
+/// A coding child in a plain directory must be refused before anything durable
+/// exists: a queued row the caller cannot see is a ghost task that never runs
+/// and never gets cleaned up.
+#[tokio::test]
+async fn non_git_coding_child_is_refused_without_a_queued_row() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let plain = directory.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory.clone()).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let before = RuntimeRepository::open(&database)
+        .unwrap()
+        .queued_task_count()
+        .unwrap();
+    let error = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "change the plain directory".into(),
+            ChildWriteMode::Coding,
+            None,
+            Some(plain.clone()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    let after = RuntimeRepository::open(&database)
+        .unwrap()
+        .queued_task_count()
+        .unwrap();
+
+    match error {
+        RuntimeCoordinatorError::CodingRequiresGit { workdir, reason } => {
+            assert_eq!(workdir, plain.canonicalize().unwrap_or(plain));
+            assert_eq!(reason, CodingRequiresGitReason::NotARepository);
+        }
+        other => panic!("expected a coding git rejection, got {other}"),
+    }
+    assert_eq!(after, before, "a refused spawn must not leave a queued row");
+    assert_eq!(
+        factory.starts.lock().unwrap().len(),
+        1,
+        "only the root may have started"
+    );
+}
+
+/// `git init` alone is not enough: `rev-parse --show-toplevel` succeeds while
+/// `rev-parse HEAD` fails, so the child would start and only fail later at
+/// delivery. Catch it at the spawn instead.
+#[tokio::test]
+async fn an_empty_repository_is_refused_for_missing_head() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let repository_root = directory.path().join("repo");
+    std::fs::create_dir(&repository_root).unwrap();
+    initialize_git_repository(&repository_root);
+    let empty = directory.path().join("empty-repo");
+    std::fs::create_dir(&empty).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(&empty)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let service = Arc::new(GitWorkspaceService::new(repository_root.clone()));
+    let factory = Arc::new(MessageRecordingFactory {
+        workspace_service: Some(service.clone() as Arc<dyn WorkerWorkspaceProvider>),
+        workspace_registry: Some(service as Arc<dyn WorkerWorkspaceRegistry>),
+        ..Default::default()
+    });
+    let coordinator = RuntimeCoordinator::open(&database, factory).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+    coordinator.start_worker(&session, &root).await.unwrap();
+
+    let error = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "change the empty repository".into(),
+            ChildWriteMode::Coding,
+            None,
+            Some(empty),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+    match error {
+        RuntimeCoordinatorError::CodingRequiresGit { reason, .. } => {
+            assert_eq!(reason, CodingRequiresGitReason::NoInitialCommit);
+        }
+        other => panic!("expected no_initial_commit, got {other}"),
+    }
 }

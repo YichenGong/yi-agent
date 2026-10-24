@@ -95,10 +95,29 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
 - [x] worker 工厂按 `subagent_model` 解析 provider/model — `worker_factory`（`src/attach.rs:88`）从**调用方注入的**机器级清单路径（新增 `models_path: &Path` 形参，经 `load_catalog_from` 读取；不再自取 `$HOME`）取 `subagent_entry`（缺省回退全局默认、再无则回退进程 cfg），经 `resolve_effective`（`src/attach.rs:113`）得到该条目的 provider/api_url/api_key/model 去 `build_provider`；改完 `subagent_model` 下次项目 daemon 重启生效。该路径经 `attach_project_runtime` / `ensure_owned_runtime` / `RuntimeBinding::managed` 从 app-server 的 `RuntimeAttachments.models_path` 与 CLI 的 `yi_agent_runtime::models::models_path()` 一路传入，使委派链路可被隔离测试（见 `docs/bug-list.md`「委派 worker 工厂重读 $HOME」条）。验证 `cargo test -p yi-agent-subagent --lib the_worker_uses_the_subagent_model_entry`、`cargo test -p yi-agent-subagent --lib the_worker_falls_back_to_the_global_default`、`cargo test -p yi-agent-subagent --lib the_public_worker_factory_reads_the_injected_catalog the_public_worker_factory_never_falls_back_to_home`
 
 **边界（两端口一致，故记在这里）：** attach 与工具注册**不看**项目是不是 git 仓库（非
-git 目录原地成 root，`workspace_root == project_root`），真正需要仓库的是后续 `spawn_agent`
-——daemon 的 worker 准入要求可恢复的 `worktree:` lease。因此非 git 项目下「工具在、调用被拒」。
+git 目录原地成 root，`workspace_root == project_root`）。`spawn_agent` 之后按 mode 分流：
+
+- `mode: "read_only"`（默认）— 不写任何文件，因而**不需要** git：非 git 目录下可正常启动、
+  原地运行并在文本结果收口时进入终态。仓库层的准入凭据是 `checkpoint_json.kind ==
+  "read_only_checkpoint"`（`worktree_lease` 缺失是允许的，但**只**对该 kind 允许，不让
+  「丢了 lease 的 coding worker」蒙混过关）。
+- `mode: "coding"` — 必须落在**带 HEAD 的 git worktree**里。判据是两道：`git rev-parse
+  --show-toplevel` 成功 **且** `git rev-parse HEAD` 成功。只做 `git init` 不做提交会被拒
+  （实测：空仓库 `--show-toplevel` 成功、`rev-parse HEAD` 失败），因此提示词里的修复动作是
+  `git init` + `git add -A` + `git commit -m "initial commit"`。
+- 拒绝发生在**写任务行之前**（`RuntimeCoordinator::spawn_child_with_objective`），不留下
+  queued 僵尸行；错误为 `CodingRequiresGit { workdir, reason }`，IPC 上是 `Validation` 且
+  消息带 `coding_requires_git:` 前缀，`reason` 为 `not_a_repository` 或 `no_initial_commit`
+  （两者的 `remedy.commands` 不同：后者**不含** `git init`，避免提示去重建已有仓库）。
+- 工具层（`coding_requires_git_payload`）把该消息翻成结构化 JSON：`code`、`workdir`、
+  `reason`、`remedy.commands`、`remedy.requires_initial_commit`、`ask_user`。父 LLM 据此
+  征询用户；用户同意后自行用 `bash` 执行命令再重试一次，拒绝后本会话不再起 coding child
+  （纯提示词约束，无 daemon 侧状态）。
+
 app-server 侧的钉法是 `cargo test -p yi-agent-app-server
-a_non_git_cwd_attaches_in_place_with_the_delegation_tools`。
+a_non_git_cwd_attaches_in_place_with_the_delegation_tools`（同时断言 read-only 被接受、
+coding 被拒且带前缀），store 侧为 `cargo test -p yi-agent-store --test runtime_coordinator
+non_git_read_only_child` / `non_git_coding_child_is_refused_without_a_queued_row`。
 
 - [x] daemon 工厂按指纹跟随模型清单（运行期热重载）— `DaemonAgentWorkerFactory::with_catalog_watcher(cfg, watcher)`（`src/lib.rs:231`）装一个 `WorkerRefresh`（`:121`）；worker start 时先用 `EffectiveKey::of`（`:98`，`resolve_effective` 覆盖的 6 字段）比对缓存，命中则复用，未命中则 `WorkerParts::rebuild`（`:55`）按当前清单重建 provider/tools/config/sandbox（装配口径与 `attach::build_worker_factory` 一致：skills-only 注册表 + 同一组 `bootstrap` 构造函数）；重建失败保留上一次可用派生件。**`new()` 签名逐字节不变**，未装刷新器的 22 处既有构造点行为不变（零回归）；`worker_config_model` 仅在无刷新器时生效，有刷新器时模型名来自当前清单条目。生产装配在 `attach.rs:156`（`build_worker_factory` 新增 `models_path` 形参后 `.with_catalog_watcher(cfg.clone(), CatalogWatcher::new(models_path))`）。验证：`cargo test -p yi-agent-subagent`（65 lib + 5 e2e，含 `a_watcher_backed_factory_follows_a_changed_subagent_model`、`a_factory_without_a_watcher_keeps_its_static_config`、`the_attached_worker_factory_follows_a_changed_catalog`、`the_attached_worker_factory_survives_a_corrupt_catalog`）；真机三步判据见 `yi-agent/tests/model_catalog_live_reload_e2e.rs` — [设计](../superpowers/specs/2026-10-17-model-catalog-live-reload-design.md)
 
