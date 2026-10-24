@@ -393,6 +393,7 @@ export function ChatView({
   scrollerRef,
   anchor,
   onRememberView,
+  syncing = false,
 }: {
   items: (Item | NoticeItem | ReasoningItem)[];
   error?: string | null;
@@ -428,6 +429,14 @@ export function ChatView({
    * 到旧会话——切换之后 DOM 里已经是新内容，闭包再读当前 id 就错位了。
    */
   onRememberView?: (threadId: string, anchor: ViewAnchor | null) => void;
+  /**
+   * 这条会话的内容是否仍在从服务端补齐（`ThreadView.syncState === "syncing"`）。
+   *
+   * 恢复阅读位置必须能区分两种"找不到锚点"：内容**还没到**（回放分帧到达，
+   * 中途的帧可能不含锚点那条消息）与锚点**真的没了**（被删/历史被截断）。
+   * 前者要继续等，后者才回退到底部。只靠 DOM 猜不出来。
+   */
+  syncing?: boolean;
 }) {
   const { ref: scrollRef, scrollToBottom, followIfAtBottom, releaseFollow, isFollowing } =
     useStickToBottom();
@@ -487,11 +496,11 @@ export function ChatView({
       (node) => node.dataset.itemId === anchor.itemId,
     );
     if (!target) {
-      // 内容还没到：不锁定，等下一次渲染（内容到达）再试。真正"锚点已消失"
-      // 的判定交给下方内容非空之后。
-      if (el.querySelector("[data-item-id]") === null) return;
-      // 有内容但没有这条消息（被删/历史被截断）：回退到底部，别停在无意义的
-      // 像素上，并就此锁定——再等也不会出现。
+      // 内容还在补齐：回放分帧到达，此刻可能只收到了前几帧（不含锚点那条）。
+      // 不锁定，等内容继续到达再试。
+      if (syncing) return;
+      // 已有完整内容却没有这条消息（被删/历史被截断）：回退到底部，别停在
+      // 无意义的像素上，并就此锁定——再等也不会出现。
       restoredFor.current = threadId;
       scrollToBottom();
       return;
@@ -510,7 +519,10 @@ export function ChatView({
     restoredFor.current = threadId;
     // 恢复完立刻放弃跟随，否则下一条 delta 会把人拽回底部。
     releaseFollow();
-  }, [threadId, anchor, scrollToBottom, releaseFollow]);
+    // `items.length` 是"可恢复的时机"：冷会话回放是**分帧**到达的，而生产环境下
+    // `anchor` 是 Map 里的同一个对象（引用恒定）。只依赖 `anchor` 会让这个 effect
+    // 在内容真正出现时不再重跑，恢复永远补不上（实测停在 2424 而非 1200）。
+  }, [threadId, anchor, items.length, syncing, scrollToBottom, releaseFollow]);
 
   useEffect(() => {
     const el = elRef.current;
@@ -600,7 +612,7 @@ export function ChatView({
     else if (threadChanged) {
       if (!restoring) scrollToBottom();
     } else followIfAtBottom();
-  }, [items.length, lastText, error, threadId, anchor, scrollToBottom, followIfAtBottom]);
+  }, [items.length, lastText, error, threadId, anchor, syncing, scrollToBottom, followIfAtBottom]);
 
   return (
     <div

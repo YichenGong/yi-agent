@@ -2545,6 +2545,9 @@ export default function App() {
                   structuralVersion={current?.session.structuralVersion ?? 0}
                   query={searchQuery}
                   anchor={sess.currentId ? sess.anchorFor(sess.currentId) : undefined}
+                  // 内容是否仍在从服务端补齐：冷会话回放分帧到达，恢复要能分清
+                  // "还没到"（继续等）与"真的没了"（回退到底部）。
+                  syncing={sess.currentId ? store.peek(sess.currentId)?.syncState === "syncing" : false}
                   // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
                   // 注释），所以直接透传，不在闭包里另读 currentId。
                   onRememberView={sess.rememberView}
