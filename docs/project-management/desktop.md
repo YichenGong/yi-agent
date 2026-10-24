@@ -132,7 +132,10 @@
 **P3 路线图：**
 
 - [x] MCP 面板（只读查看）— 设置页新增「MCP」Tab，按项目列出 server 名字 / 传输（stdio 的 `command args`、http 的 `url`）/ 文件里的开关默认值 / 缓存中的工具清单（可展开，显示名字 + 一行描述 + 只读标记）；`env`/`headers` **只显示键名**，值不下发；缓存缺失或指纹不匹配时显示「工具清单尚未探测」而不是假装最新。后端 `mcp/list`（`Observe` 档，纯读盘、不起进程、不发网络）：`yi-agent-rs/crates/yi-agent-app-server/src/mcp_rpc.rs:32`（`handle_mcp_request_at`）、域 handler `yi-agent-rs/crates/yi-agent-app-server/src/rpc/mcp.rs:23`、缓存视图 `yi-agent-rs/crates/yi-agent-mcp/src/lib.rs:29`（`McpCacheEntry`）/`:40`（`cached_tools_for`）；前端 `desktop/src/components/SettingsMcpTab.tsx:28`、`desktop/src/lib/mcp.ts:101`。判据：`cd desktop && npx vitest run src/components/SettingsMcpTab.test.tsx src/lib/mcp.test.ts src/components/SettingsDialog.test.tsx && npx tsc --noEmit` + `cd yi-agent-rs && cargo test -p yi-agent-app-server mcp` — [设计](../superpowers/specs/2026-10-18-mcp-settings-panel-design.md)、[计划](../superpowers/plans/2026-10-18-mcp-settings-panel.md)
-- [ ] MCP 启停 — 在面板上启用/停用 server（需先让 app-server 留存 `McpManager` 并接通 `refresh_registry` + agent 重建，令改动对活着的会话生效）；判据：GUI 可启停 MCP server，且新开的 turn 里工具集随之变化
+- [x] MCP 启停 — 面板上的徽章换成开关（全局 + 每个 server），经 `mcp/set` 写盘；写盘后对指定 thread 发 `SessionCommand::ReloadMcp` 让它立刻重建工具集，新工具从下一条消息起可用。
+  后端：`yi-agent-rs/crates/yi-agent-app-server/src/mcp_rpc.rs:189`（`set`，原子写盘 + 回读）、`rpc/mcp.rs`（`mcp/set` 要求 `Scope::Control`，`Observe` 回 `insufficient_scope`）、`session.rs`（`SessionCommand::ReloadMcp`）、`server.rs`（`run_thread_driver` 持有 `mcp` + 每轮 `config_changed_on_disk` 检测）。
+  前端：`desktop/src/components/SettingsMcpTab.tsx`（`Switch` 组件，乐观更新 + 失败回滚）、`desktop/src/lib/mcp.ts` 的 `setMcpEnabled`。
+  判据：`cd desktop && npx vitest run src/components/SettingsMcpTab.test.tsx && npx tsc --noEmit`（10 个组件测试，含 `writes a server toggle through mcp/set and adopts the server reply`、`rolls back and reports when the write is rejected`、`toggles the master switch with scope=master`）+ `cargo test -p yi-agent-app-server --lib mcp_config`（scope 门禁两态）
 
 - [ ] WebSocket 传输（app-server 侧已支持 `--listen ws://`，见 [yi-agent-app-server](./yi-agent-app-server.md)；**iOS App 已经走 ws**，见上方 iOS target 条目；桌面端 GUI 仍走 stdio，尚未接入 ws）
 - [ ] 多窗口共享 daemon — 判据：多个 GUI 窗口连同一 daemon
