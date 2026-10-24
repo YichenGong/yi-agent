@@ -36,8 +36,13 @@
 
 **非目标（本期不做）**
 
-- 用户级 `~/.yi-agent/mcp.json`（第三层作用域）。当前配置只有项目级一层：
-  `config_path(workdir) = <workdir>/.yi-agent/mcp.json`（`config.rs:147`）。
+- 用户级 `~/.yi-agent/mcp.json`（第三层作用域），**已裁定推迟**。当前配置只有项目级
+  一层：`config_path(workdir) = <workdir>/.yi-agent/mcp.json`（`config.rs:147`）。
+  推迟理由不是合并逻辑贵——缓存按 server 名存、只存生效配置，同名覆盖后仍是一条，
+  `cache.rs` 结构无需改动——而是**面板语义**：`mcp/list` 必须能表达「这条来自用户层
+  还是项目层」，否则用户关不掉一个找不到出处的 server。层级展示与层级删除值得一份
+  独立 spec。代价：本期「帮我加个 GitHub MCP，以后所有项目都能用」做不到，skill 正文
+  必须写明「当前只支持项目级」，避免模型空口承诺。
 - SSE 传输（只支持 `stdio` / `http`，见 `ServerKind`，`config.rs:20`）。
 - 文件监听（`notify`）自动重载。
 - 同一轮内新增工具（见 §4.1 的硬约束）。
@@ -138,6 +143,12 @@ reap 5s，最坏 55s/server，且 `load_and_probe` 顺序探测）。
 | `enable` | 设 `mcpServers[name].enabled = true`；与 `disable` 对称，不重探（已有缓存或本轮曾探测过） | 否，秒回 |
 | `remove` | 从 `mcpServers` 删除该条 | 否 |
 
+**不提供全局开关（已裁定）**：`mcp_reload` 刻意**不**暴露 `disable_all` / `enable_all`
+（即改顶层 `"enabled"`）。理由：这一期做完后顶层开关在人机两个界面上都有入口——
+TUI `/mcp off`（`tui/slash.rs:412`）与桌面 `mcp/set`（§4.7，`scope: "master"`）——
+模型没有它也不会被卡住，答「请在设置里关」且用户一步可点。反过来，模型误判导致的
+跨会话全局关闭会表现为「整个 MCP 的工具全部消失」，排查成本远高于省下的那一次点击。
+
 **注册与配置解耦**：`register_mcp_tools` 当前在无 `mcp.json` 时返回 `Ok(None)` 且
 不注册任何工具（`lib.rs:87-91`）。而「首次添加」恰恰是文件不存在的状态，
 因此 `mcp_reload` 必须**无条件注册**，独立于 `mcp.json` 是否存在。
@@ -199,6 +210,19 @@ if tool_name == "mcp_reload" {
 
 `prefix_suggestion` 保持 `None`（`build_request` 只为 bash / process_start 生成，
 `permission.rs:248`），即**不支持 AlwaysAllowPrefix**——避免变成永久静默口子。
+
+**四个 action 全部确认（已裁定）**，不按 action 分支豁免。逐条危害如下：
+
+| action | 危害 | 是否确认 |
+| --- | --- | --- |
+| `add` | 写入下次启动**自动执行**的命令 | 确认 |
+| `enable` | 重新激活一个被有意关掉的 server（当初关掉可能有成本或故障原因），风险不低于 `add` | 确认 |
+| `remove` | 销毁用户手调的 `args` / `headers`，不可撤销 | 确认 |
+| `disable` | 只减能力、一条命令可逆 | 仍确认 |
+
+`disable` 是唯一在技术上可豁免的（`check()` 拿得到 `tool_input`，`permission.rs:130`，
+按 `action` 分支即可），但四个动作都很罕见，「三确认一豁免」会把权限规则从一行变成
+带例外的分支，测试与解释都更贵。日后若摩擦明显，从 `disable` 开豁免。
 
 确认界面渲染一行人类可读摘要即可，例如：
 `添加 MCP server "github"，将执行：npx -y @modelcontextprotocol/server-github`
@@ -292,7 +316,7 @@ fs      ✗ MCP connect timed out after 30s
 
 **后续（不在本期）**
 
-- 用户级配置 `~/.yi-agent/mcp.json` 与三层合并优先级
+- 用户级配置 `~/.yi-agent/mcp.json` 与三层合并优先级（见 §2 的裁定与理由）
 - 文件监听自动重载
 - 设置页图形化编辑 server 全字段
 - 同轮生效（需改 `ToolRegistry` 为 `RwLock`，属 core 公共 API 变更）
