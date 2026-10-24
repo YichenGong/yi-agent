@@ -1,5 +1,5 @@
 /** @vitest-environment jsdom */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { SettingsMcpTab } from "./SettingsMcpTab";
 
@@ -16,7 +16,7 @@ describe("SettingsMcpTab", () => {
     expect(screen.getByText(/\/p\/\.yi-agent\/mcp\.json/)).toBeTruthy();
   });
 
-  it("renders a stdio server with its command and a disabled badge", async () => {
+  it("renders a stdio server with its command and its switch state", async () => {
     const call = async () => ({
       configured: true,
       path: "/p/.yi-agent/mcp.json",
@@ -34,8 +34,107 @@ describe("SettingsMcpTab", () => {
     });
     render(<SettingsMcpTab call={call} projects={[]} />);
     expect(await screen.findByText("fs")).toBeTruthy();
-    expect(screen.getByText("已停用")).toBeTruthy();
+    // 徽章换成了开关：读屏语义是「关」。
+    const sw = screen.getByRole("switch", { name: "fs 开关" });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
     expect(screen.getByText(/npx -y pkg/)).toBeTruthy();
+  });
+
+  it("writes a server toggle through mcp/set and adopts the server reply", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) => {
+      if (method === "mcp/set") {
+        return {
+          configured: true,
+          path: "/p/.yi-agent/mcp.json",
+          enabled: true,
+          servers: [
+            { name: "fs", kind: "stdio", enabled: true, command: "npx", tools: null },
+          ],
+        };
+      }
+      return {
+        configured: true,
+        path: "/p/.yi-agent/mcp.json",
+        enabled: true,
+        servers: [
+          { name: "fs", kind: "stdio", enabled: false, command: "npx", tools: null },
+        ],
+      };
+    });
+    render(<SettingsMcpTab call={call} projects={[]} />);
+    const sw = await screen.findByRole("switch", { name: "fs 开关" });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+
+    fireEvent.click(sw);
+
+    // 请求参数必须是 scope=server + name + enabled=true。
+    const setCall = call.mock.calls.find(([m]) => m === "mcp/set");
+    expect(setCall?.[1]).toMatchObject({ scope: "server", name: "fs", enabled: true });
+    // 以服务端回读为准。
+    await vi.waitFor(() => {
+      expect(
+        screen.getByRole("switch", { name: "fs 开关" }).getAttribute("aria-checked"),
+      ).toBe("true");
+    });
+  });
+
+  it("rolls back and reports when the write is rejected", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) => {
+      if (method === "mcp/set") throw new Error("denied");
+      return {
+        configured: true,
+        path: "/p/.yi-agent/mcp.json",
+        enabled: true,
+        servers: [
+          { name: "fs", kind: "stdio", enabled: false, command: "npx", tools: null },
+        ],
+      };
+    });
+    render(<SettingsMcpTab call={call} projects={[]} />);
+    const sw = await screen.findByRole("switch", { name: "fs 开关" });
+    fireEvent.click(sw);
+
+    // 失败必须回滚到原值，并给出可见提示——不静默。
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    await vi.waitFor(() => {
+      expect(
+        screen.getByRole("switch", { name: "fs 开关" }).getAttribute("aria-checked"),
+      ).toBe("false");
+    });
+  });
+
+  it("toggles the master switch with scope=master", async () => {
+    const call = vi.fn(async (method: string, _params: unknown) => {
+      if (method === "mcp/set") {
+        return {
+          configured: true,
+          path: "/p/.yi-agent/mcp.json",
+          enabled: false,
+          servers: [
+            { name: "fs", kind: "stdio", enabled: true, command: "npx", tools: null },
+          ],
+        };
+      }
+      return {
+        configured: true,
+        path: "/p/.yi-agent/mcp.json",
+        enabled: true,
+        servers: [
+          { name: "fs", kind: "stdio", enabled: true, command: "npx", tools: null },
+        ],
+      };
+    });
+    render(<SettingsMcpTab call={call} projects={[]} />);
+    const master = await screen.findByRole("switch", { name: "全局 MCP 开关" });
+    fireEvent.click(master);
+
+    const setCall = call.mock.calls.find(([m]) => m === "mcp/set");
+    expect(setCall?.[1]).toMatchObject({ scope: "master", enabled: false });
+    await vi.waitFor(() => {
+      expect(
+        screen.getByRole("switch", { name: "全局 MCP 开关" }).getAttribute("aria-checked"),
+      ).toBe("false");
+    });
   });
 
   it("distinguishes unprobed from a probe that found no tools", async () => {

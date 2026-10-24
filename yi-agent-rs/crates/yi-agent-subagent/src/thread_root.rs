@@ -1,6 +1,6 @@
 //! One conversation's own application root on a shared project daemon.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use yi_agent_store::ipc::{IpcRequest, IpcResponse, send_request};
@@ -191,6 +191,15 @@ impl ThreadRoot {
             task_id: root.task_id,
             capability: root.capability,
         })
+    }
+
+    /// 这个会话根所属的项目目录。
+    ///
+    /// 回收空闲项目的 runtime 时要用它把挂在同一项目下的会话根按项目归类：
+    /// 只摘 `runtimes` 表条目是不够的——`ThreadRoot` 自己也握着
+    /// `Arc<RuntimeBinding>`，不摘掉这些引用，daemon 与监督线程根本不会停。
+    pub fn project_dir(&self) -> &Path {
+        &self.project_dir
     }
 
     /// This conversation's root task id, once attached.

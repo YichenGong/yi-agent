@@ -949,8 +949,20 @@ fn build_tui_root_tools(
     runtime_socket: std::path::PathBuf,
     attached_root: &crate::tui::subagents::AttachedRoot,
     caller: crate::tui::subagents::CallerContext,
+    mcp: &std::sync::Arc<yi_agent_mcp::McpManager>,
 ) -> yi_agent_core::ToolRegistry {
     let mut registry = base_registry.clone();
+    // `base_registry` 只有 skills,`mcp_reload` 是在主注册表上登记的;切根目录
+    // 重建时必须补回来,否则用户换根之后就再也改不了 MCP 配置了。
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn = std::sync::Arc::new(|cmd: &str| {
+        yi_agent_tools::blocklist::is_blocked(cmd).map(str::to_string)
+    });
+    yi_agent_mcp::register_mcp_reload_tool(
+        &mut registry,
+        std::sync::Arc::clone(mcp),
+        &attached_root.workspace.path,
+        Some(blocklist_fn),
+    );
     // 单根会话：FS 根集与 shell 沙箱可写根分别照原值传入。
     yi_agent_tools::register_builtin_tools_with_sandbox(
         &mut registry,
@@ -1300,6 +1312,18 @@ fn run_agent(cli: Cli) -> Result<()> {
             yi_agent_mcp::McpManager::empty()
         }
     };
+
+    // `mcp_reload` 必须**始终**存在,包括还没有 mcp.json 的时候——那正是用户
+    // 想说"帮我加一个 MCP"的场景。与上面的 `mcp` 共享同一个 manager,否则
+    // 它改完配置后本轮的工具集不会跟着变。
+    let blocklist_fn: yi_agent_core::permission::BlocklistFn =
+        Arc::new(|cmd: &str| yi_agent_tools::blocklist::is_blocked(cmd).map(str::to_string));
+    yi_agent_mcp::register_mcp_reload_tool(
+        &mut registry,
+        Arc::clone(&mcp),
+        &config.workdir,
+        Some(blocklist_fn),
+    );
 
     let tools = Arc::new(registry);
 
@@ -1973,6 +1997,7 @@ fn run_tui_agent(
             runtime_preference_path: crate::tui::runtime_prefs::preferences_path(&snapshot_workdir),
         };
 
+        let driver_workdir = snapshot_workdir.clone();
         let driver = tokio::spawn(async move {
             let mut root_activated = false;
             let mut current_runtime: Option<TuiRuntimeSession> = None;
@@ -1983,7 +2008,7 @@ fn run_tui_agent(
                 config_clone,
             )
             .with_permission(Arc::clone(&current_checker), Arc::clone(&decision_rx));
-            let _ = workdir; // workdir already passed to tools registration
+
 
             loop {
                 // Wait for user input, runtime startup choice, or a control command.
@@ -2071,6 +2096,45 @@ fn run_tui_agent(
                                         .await;
                                 }
                             }
+                        }
+                        DriverControl::McpReload => {
+                            // 重新读盘:用户可能自己改过 mcp.json,所以要按磁盘
+                            // 现状重建,而不是信任内存里的开关。只探测变化的 server。
+                            let report = mcp_for_driver.reload(&driver_workdir).await;
+                            for s in &report.servers {
+                                if let Some(err) = &s.error {
+                                    tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
+                                }
+                            }
+                            let label = if report.all_ok() {
+                                let probed = report.servers.iter().filter(|s| s.probed).count();
+                                format!("MCP 配置已重载（{} 个 server，重探 {probed} 个）", report.servers.len())
+                            } else {
+                                let failed: Vec<&str> = report
+                                    .servers
+                                    .iter()
+                                    .filter(|s| s.error.is_some())
+                                    .map(|s| s.name.as_str())
+                                    .collect();
+                                format!("MCP 配置已重载，但探测失败: {}", failed.join(", "))
+                            };
+                            let mut refreshed = (*current_tools).clone();
+                            mcp_for_driver.refresh_registry(&mut refreshed);
+                            current_tools = Arc::new(refreshed);
+                            let handle = agent.session_handle();
+                            agent = live.rebuild(
+                                Arc::clone(&current_tools),
+                                Arc::clone(&current_checker),
+                                Arc::clone(&rebuild_decision_rx),
+                                handle,
+                            );
+                            let _ = agent_tx
+                                .send(yi_agent_core::AgentEvent::Notice {
+                                    level: yi_agent_core::NoticeLevel::Info,
+                                    text: label,
+                                })
+                                .await;
+                            tracing::info!("MCP config reloaded from disk");
                         }
                         DriverControl::McpRefresh => {
                             let mut refreshed = (*current_tools).clone();
@@ -2243,6 +2307,7 @@ fn run_tui_agent(
                                         socket_path.clone(),
                                         &attached_root,
                                         caller_for_attach.clone(),
+                                        &mcp_for_driver,
                                     );
                                     mcp_for_driver.refresh_registry(&mut next_registry);
                                     let next_tools = Arc::new(next_registry);
@@ -2346,6 +2411,28 @@ fn run_tui_agent(
                         }
                     }
                     root_activated = true;
+                }
+
+                // 每轮开始前检查磁盘上的 MCP 配置是否被改过(用户手动编辑、
+                // 或上一个进程写盘)。只探变化的 server,缓存命中则秒过。
+                if mcp_for_driver.config_changed_on_disk(&driver_workdir) {
+                    let report = mcp_for_driver.reload(&driver_workdir).await;
+                    for s in &report.servers {
+                        if let Some(err) = &s.error {
+                            tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
+                        }
+                    }
+                    let mut refreshed = (*current_tools).clone();
+                    mcp_for_driver.refresh_registry(&mut refreshed);
+                    current_tools = Arc::new(refreshed);
+                    let handle = agent.session_handle();
+                    agent = live.rebuild(
+                        Arc::clone(&current_tools),
+                        Arc::clone(&current_checker),
+                        Arc::clone(&rebuild_decision_rx),
+                        handle,
+                    );
+                    tracing::info!("MCP config changed on disk; registry reloaded");
                 }
 
                 // Run agent
@@ -2531,6 +2618,10 @@ pub(crate) enum DriverControl {
     /// Rebuild the agent so its tool registry matches the MCP switches the TUI
     /// already applied directly to the shared `McpManager`.
     McpRefresh,
+    /// Re-read `.yi-agent/mcp.json` from disk (re-probing only what changed),
+    /// then rebuild the agent. Backs `/mcp reload`: the user may have edited the
+    /// file themselves, so this cannot rely on `mcp/set` having been called.
+    McpReload,
 }
 
 /// 把 `/compact` 的三种结果映射成 driver 回给 TUI 的事件。
@@ -3757,12 +3848,14 @@ mod tests {
     fn build_tui_root_tools_registers_subagent_tools_for_attached_runtime() {
         let config = test_config();
         let root = attached_root_for_main_tests();
+        let mcp = yi_agent_mcp::McpManager::empty();
         let registry = build_tui_root_tools(
             &yi_agent_core::ToolRegistry::new(),
             &config,
             "/tmp/runtime.sock".into(),
             &root,
             crate::tui::subagents::CallerContext::unbound(),
+            &mcp,
         );
         let names = registry
             .schemas()
@@ -3774,6 +3867,12 @@ mod tests {
         assert!(names.contains(&"send_message".to_string()));
         assert!(names.contains(&"wait_agent".to_string()));
         assert!(names.contains(&"bash".to_string()));
+        // 换根之后仍然要能改 MCP 配置:否则用户一旦 attach,就失去了
+        // "帮我加一个 MCP" 的入口。
+        assert!(
+            names.contains(&"mcp_reload".to_string()),
+            "mcp_reload must survive a root switch; got {names:?}"
+        );
     }
 
     /// A provider that is never called: the rebuild tests only exercise the

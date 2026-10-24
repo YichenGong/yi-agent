@@ -18,6 +18,18 @@ pub struct McpConfig {
     pub mcp_servers: BTreeMap<String, ServerConfig>,
 }
 
+// 手写而非 derive:derive 会让 `enabled` 变成 `false`,而新建配置文件时
+// 语义上应当是「总开关打开、还没有任何 server」。`save` 与 `mcp/set` 都依赖
+// 这一点,写坏会让用户新建的文件默认处于停用状态。
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mcp_servers: BTreeMap::new(),
+        }
+    }
+}
+
 /// 传输类型。缺省为 `Stdio`(向后兼容没有 `type` 的老配置)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -162,6 +174,29 @@ impl McpConfig {
             serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         Ok(Some(cfg))
     }
+
+    /// 原子写入 `workdir` 下的 `.yi-agent/mcp.json`。
+    ///
+    /// 先写同目录临时文件再 `rename`：避免另一轮 driver 读到半写状态。
+    /// 目标目录不存在时创建。
+    pub fn save(&self, workdir: &Path) -> Result<()> {
+        let path = config_path(workdir);
+        let dir = path
+            .parent()
+            .ok_or_else(|| anyhow!("mcp.json has no parent directory"))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        // 缩进 + 末尾换行:这份文件用户也会手改、会进 code review。
+        let mut body = serde_json::to_string_pretty(self)?;
+        body.push('\n');
+        let tmp = dir.join(format!(".mcp.json.tmp.{}", std::process::id()));
+        std::fs::write(&tmp, body).with_context(|| format!("write {}", tmp.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            // 别把临时文件留在用户项目里。
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("rename into {}", path.display()));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +213,50 @@ mod tests {
         assert_eq!(fs.args, vec!["-y", "pkg"]);
         assert!(fs.enabled, "per-server enabled defaults to true");
         assert!(fs.env.is_empty());
+    }
+
+    #[test]
+    fn save_creates_agent_dir_and_round_trips() {
+        let d = tempfile::TempDir::new().unwrap();
+        let cfg = McpConfig {
+            enabled: true,
+            mcp_servers: BTreeMap::from([(
+                "fs".to_string(),
+                ServerConfig {
+                    kind: ServerKind::Stdio,
+                    command: Some("npx".into()),
+                    args: vec!["-y".into(), "pkg".into()],
+                    env: Default::default(),
+                    url: None,
+                    headers: Default::default(),
+                    enabled: true,
+                },
+            )]),
+        };
+        cfg.save(d.path()).unwrap();
+        assert!(config_path(d.path()).is_file());
+        let back = McpConfig::load(d.path()).unwrap().unwrap();
+        assert_eq!(back.mcp_servers["fs"].args, vec!["-y", "pkg"]);
+        assert!(back.enabled, "top-level enabled must survive a round trip");
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_behind() {
+        let d = tempfile::TempDir::new().unwrap();
+        McpConfig::default().save(d.path()).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(d.path().join(".yi-agent"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn default_config_is_enabled() {
+        // 新建文件时总开关必须是开的;derive(Default) 会给 false,是错的。
+        assert!(McpConfig::default().enabled);
     }
 
     #[test]

@@ -393,6 +393,8 @@ pub fn parse_effort_args_with_caps(
 pub enum McpAction {
     /// List configured servers and their effective on/off state.
     Status,
+    /// Re-read `.yi-agent/mcp.json` from disk and refresh the tool set.
+    Reload,
     /// Toggle the session-wide master switch.
     Master(bool),
     /// Toggle one server.
@@ -403,6 +405,7 @@ pub enum McpAction {
 pub fn parse_mcp_args(args: &str) -> Result<McpAction, String> {
     match args.split_whitespace().collect::<Vec<_>>().as_slice() {
         [] | ["status"] => Ok(McpAction::Status),
+        ["reload"] => Ok(McpAction::Reload),
         ["on"] => Ok(McpAction::Master(true)),
         ["off"] => Ok(McpAction::Master(false)),
         ["enable", name] => Ok(McpAction::Server {
@@ -413,7 +416,7 @@ pub fn parse_mcp_args(args: &str) -> Result<McpAction, String> {
             name: (*name).into(),
             on: false,
         }),
-        _ => Err("用法: /mcp [on|off|enable <server>|disable <server>|status]".into()),
+        _ => Err("用法: /mcp [on|off|reload|enable <server>|disable <server>|status]".into()),
     }
 }
 
@@ -885,7 +888,7 @@ mod tests {
         assert_eq!(SlashCommand::from_name("mcp"), Some(SlashCommand::Mcp));
         assert_eq!(
             SlashCommand::Mcp.argument_usage(),
-            Some("[on|off|enable <server>|disable <server>|status]")
+            Some("[on|off|reload|enable <server>|disable <server>|status]")
         );
         assert!(SlashCommand::all().contains(&SlashCommand::Mcp));
     }
@@ -1030,6 +1033,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_mcp_args_reload_is_its_own_action() {
+        assert_eq!(parse_mcp_args("reload"), Ok(McpAction::Reload));
+        // 不能把 `reload` 误当成 server 名。
+        assert_eq!(
+            parse_mcp_args("enable reload"),
+            Ok(McpAction::Server {
+                name: "reload".into(),
+                on: true,
+            })
+        );
+    }
+
+    #[test]
     fn parse_mcp_args_on_and_off_toggle_master() {
         assert_eq!(parse_mcp_args("on"), Ok(McpAction::Master(true)));
         assert_eq!(parse_mcp_args("off"), Ok(McpAction::Master(false)));
@@ -1057,11 +1073,11 @@ mod tests {
     fn parse_mcp_args_rejects_bad_input_with_usage_message() {
         assert_eq!(
             parse_mcp_args("bogus"),
-            Err("用法: /mcp [on|off|enable <server>|disable <server>|status]".into())
+            Err("用法: /mcp [on|off|reload|enable <server>|disable <server>|status]".into())
         );
         assert_eq!(
             parse_mcp_args("enable"),
-            Err("用法: /mcp [on|off|enable <server>|disable <server>|status]".into())
+            Err("用法: /mcp [on|off|reload|enable <server>|disable <server>|status]".into())
         );
     }
 

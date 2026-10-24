@@ -234,6 +234,49 @@ yi-agent app-server --relay 'wss://relay.example.com/connect?session=<id>'
 > 破坏性变更：模型键不再从 `.env` 读取。升级后首次启动会把存量 `.env` 里的活跃
 > 模型键收边进 `models.json`，并把那几行注释掉（`# MIGRATED: ...`）。
 
+## 接入 MCP server
+
+MCP（Model Context Protocol）让你把外部工具接进来：GitHub、数据库、内部系统。
+
+**最简单的方式是直接说**：
+
+```
+帮我加一个 github MCP，用 npx -y @modelcontextprotocol/server-github
+```
+
+模型会调用 `mcp_reload` 工具写配置并当场探测。工具从**下一条消息**起可用。
+你也可以说「把 fs 那个 MCP 关掉」「删掉刚才加的」——四种动作（增/启用/停用/删）
+都会请你确认一次，即使开着 `--yolo` 也一样（它改的是持久配置）。
+
+**手动配置**：写在 `<项目>/.yi-agent/mcp.json`（Claude Desktop 兼容 schema）：
+
+```json
+{
+  "mcpServers": {
+    "fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+    },
+    "ws": {
+      "type": "http",
+      "url": "https://example.com/mcp",
+      "headers": { "Authorization": "Bearer ${MY_TOKEN}" }
+    }
+  }
+}
+```
+
+只有两种传输：`stdio`（本地子进程，默认）与 `http`（远端）。**没有 sse**。
+`env` / `headers` 里可以用 `${VAR}` 引用环境变量，未定义会在写盘前报错。
+
+改完不用重启：下一轮对话开始时自动检测到变更并重载（只重探变化的 server）。
+
+**位置**：配置是**项目级**的，只对该项目生效。用户级
+`~/.yi-agent/mcp.json` 目前不参与加载。
+
+**开关**：TUI 里 `/mcp`（`on|off|reload|enable <server>|disable <server>|status`）；
+桌面端「设置 → MCP」有全局与逐 server 的开关。
+
 ## 常用配置
 
 | 想做什么 | 环境变量 | 命令行参数 |

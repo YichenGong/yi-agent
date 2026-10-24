@@ -18,12 +18,13 @@ fn bundled_skills_install_and_discover_correctly() {
     assert!(system_root.join("skill-creator/SKILL.md").is_file());
     assert!(system_root.join("skill-installer/SKILL.md").is_file());
     assert!(system_root.join("git-diff-review/SKILL.md").is_file());
+    assert!(system_root.join("mcp-setup/SKILL.md").is_file());
 
     // Discover skills from the installed root
     let service = SkillsService::new(vec![(system_root.clone(), SkillScope::System)]);
 
     let skills = service.snapshot().unwrap();
-    assert_eq!(skills.len(), 3, "expected exactly 3 bundled skills");
+    assert_eq!(skills.len(), 4, "expected exactly 4 bundled skills");
 
     let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"skill-creator"), "missing skill-creator");
@@ -35,6 +36,7 @@ fn bundled_skills_install_and_discover_correctly() {
         names.contains(&"git-diff-review"),
         "missing git-diff-review"
     );
+    assert!(names.contains(&"mcp-setup"), "missing mcp-setup");
 
     // Verify descriptions are non-empty
     for skill in &skills {

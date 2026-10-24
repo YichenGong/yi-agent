@@ -128,6 +128,16 @@ impl PermissionChecker {
     }
 
     pub fn check(&self, tool_name: &str, tool_input: &serde_json::Value) -> CheckResult {
+        // `mcp_reload` 改的是用户的持久配置,且会 spawn 探测进程。它始终需要确认,
+        // **即使 yolo 开着**:一次"全自动"会话不该悄悄改写 MCP 配置。
+        if tool_name == "mcp_reload" {
+            return CheckResult::NeedConfirm(self.build_request(
+                tool_name,
+                tool_input,
+                PermissionKind::Normal,
+            ));
+        }
+
         // 只对会产生副作用的工具做权限检查,其他工具直接放行
         if !matches!(
             tool_name,
@@ -1090,6 +1100,27 @@ bash = true
     fn fallback_prefix_empty() {
         assert_eq!(fallback_prefix(""), None);
         assert_eq!(fallback_prefix("   "), None);
+    }
+
+    #[test]
+    /// `mcp_reload` 改的是持久配置并会 spawn 探测进程,任何模式下都必须确认。
+    /// 尤其不能被 yolo 豁免——否则一次"全自动"会话就能悄悄改掉用户的 MCP 配置。
+    fn mcp_reload_always_needs_confirmation_even_under_yolo() {
+        for yolo in [false, true] {
+            let checker = checker_with(PermissionsConfig::default(), yolo);
+            let input = serde_json::json!({"action": "add", "name": "gh", "command": "uvx"});
+            match checker.check("mcp_reload", &input) {
+                CheckResult::NeedConfirm(req) => {
+                    assert_eq!(req.tool_name, "mcp_reload");
+                    assert_eq!(req.tool_input, input);
+                    assert!(
+                        req.prefix_suggestion.is_none(),
+                        "prefix suggestions only apply to bash/process_start"
+                    );
+                }
+                other => panic!("yolo={yolo}: expected NeedConfirm, got {other:?}"),
+            }
+        }
     }
 
     #[test]

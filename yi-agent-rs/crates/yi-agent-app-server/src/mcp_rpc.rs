@@ -36,6 +36,7 @@ pub fn handle_mcp_request_at(
 ) -> Result<Value, RpcError> {
     match method {
         "mcp/list" => list(host_workdir, params),
+        "mcp/set" => set(host_workdir, params),
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -118,6 +119,76 @@ fn list(host_workdir: &Path, params: &Value) -> Result<Value, RpcError> {
     }))
 }
 
+/// 打开/关闭全局开关或某个 server，落盘后返回新的完整视图。
+///
+/// `scope: "master"` 改顶层 `enabled`；`scope: "server"` 改指定 server 的
+/// `enabled`，此时 `name` 必填。
+///
+/// 返回的是**写盘之后**重新读出来的视图：面板据它更新，避免乐观更新与真实
+/// 状态分叉。写盘失败直接报错，不做「内存里改了、磁盘没改」的假成功。
+fn set(host_workdir: &Path, params: &Value) -> Result<Value, RpcError> {
+    let project = crate::server::plugin_scope(host_workdir, params);
+    let enabled = params
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| RpcError::invalid_params("enabled must be a boolean"))?;
+    let scope = params
+        .get("scope")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::invalid_params("scope must be \"master\" or \"server\""))?;
+
+    let path = yi_agent_mcp::config_path(&project);
+    let mut cfg = match McpConfig::load(&project) {
+        Ok(Some(cfg)) => cfg,
+        // 没有配置文件时改开关没有意义：凭空建一个空配置只会让用户困惑
+        // （面板会从「未配置」变成「已配置但 0 个 server」）。
+        Ok(None) => {
+            return Err(RpcError::invalid_params(format!(
+                "no MCP config at {}",
+                path.display()
+            )));
+        }
+        Err(error) => {
+            return Err(RpcError::invalid_params(format!(
+                "cannot read {}: {error}",
+                path.display()
+            )));
+        }
+    };
+
+    match scope {
+        "master" => cfg.enabled = enabled,
+        "server" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| {
+                    RpcError::invalid_params("name is required when scope is \"server\"")
+                })?;
+            let entry = cfg
+                .mcp_servers
+                .get_mut(name)
+                .ok_or_else(|| RpcError::invalid_params(format!("no MCP server named {name:?}")))?;
+            entry.enabled = enabled;
+        }
+        other => {
+            return Err(RpcError::invalid_params(format!(
+                "unknown scope {other:?}; expected \"master\" or \"server\""
+            )));
+        }
+    }
+
+    cfg.save(&project).map_err(|error| {
+        RpcError::invalid_params(format!("cannot write {}: {error}", path.display()))
+    })?;
+
+    // 回读而非复用内存里的 cfg：save 走的是临时文件 + rename，回读能顺带
+    // 验证落盘内容可解析，也让面板拿到的一定是磁盘现状。
+    list(host_workdir, params)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +204,107 @@ mod tests {
 
     fn list(project: &Path) -> Value {
         handle_mcp_request_at(project, "mcp/list", &json!({})).unwrap()
+    }
+
+    #[test]
+    fn set_toggles_the_master_switch_and_persists_it() {
+        let dir = project_with_config(r#"{"enabled":true,"mcpServers":{}}"#);
+        let out = handle_mcp_request_at(
+            dir.path(),
+            "mcp/set",
+            &json!({"scope": "master", "enabled": false}),
+        )
+        .unwrap();
+        assert_eq!(out["enabled"], false, "response must reflect the new state");
+        // 回读磁盘，确认真的写了，而不是只改了返回值。
+        let on_disk = McpConfig::load(dir.path()).unwrap().unwrap();
+        assert!(!on_disk.enabled, "flag must be persisted");
+    }
+
+    #[test]
+    fn set_toggles_one_server_without_touching_others() {
+        let dir = project_with_config(
+            r#"{"enabled":true,"mcpServers":{"fs":{"command":"npx"},"ws":{"type":"http","url":"https://x/mcp"}}}"#,
+        );
+        let out = handle_mcp_request_at(
+            dir.path(),
+            "mcp/set",
+            &json!({"scope": "server", "name": "fs", "enabled": false}),
+        )
+        .unwrap();
+
+        let fs = out["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "fs")
+            .unwrap();
+        assert_eq!(fs["enabled"], false);
+        let ws = out["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "ws")
+            .unwrap();
+        assert_eq!(ws["enabled"], true, "other servers must be untouched");
+
+        let on_disk = McpConfig::load(dir.path()).unwrap().unwrap();
+        assert!(!on_disk.mcp_servers["fs"].enabled);
+        assert!(on_disk.mcp_servers["ws"].enabled);
+        // 其他字段不能被开关操作弄丢（曾出现过只写 enabled 把 args 清空的写法）。
+        assert_eq!(on_disk.mcp_servers["fs"].command.as_deref(), Some("npx"));
+    }
+
+    #[test]
+    fn set_rejects_a_server_scope_without_a_name() {
+        let dir = project_with_config(r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let err = handle_mcp_request_at(
+            dir.path(),
+            "mcp/set",
+            &json!({"scope": "server", "enabled": false}),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("name"), "got {}", err.message);
+    }
+
+    #[test]
+    fn set_rejects_an_unknown_server() {
+        let dir = project_with_config(r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        let err = handle_mcp_request_at(
+            dir.path(),
+            "mcp/set",
+            &json!({"scope": "server", "name": "nope", "enabled": false}),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("nope"), "got {}", err.message);
+    }
+
+    #[test]
+    fn set_refuses_when_there_is_no_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = handle_mcp_request_at(
+            dir.path(),
+            "mcp/set",
+            &json!({"scope": "master", "enabled": true}),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("no MCP config"), "got {}", err.message);
+        // 不能顺手创建文件。
+        assert!(!dir.path().join(".yi-agent/mcp.json").exists());
+    }
+
+    #[test]
+    fn set_rejects_a_bad_scope_and_a_non_boolean_enabled() {
+        let dir = project_with_config(r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+        assert!(
+            handle_mcp_request_at(
+                dir.path(),
+                "mcp/set",
+                &json!({"scope": "everything", "enabled": true})
+            )
+            .is_err()
+        );
+        assert!(handle_mcp_request_at(dir.path(), "mcp/set", &json!({"scope": "master"})).is_err());
     }
 
     #[test]
