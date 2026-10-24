@@ -240,13 +240,6 @@ export default function App() {
    * 先画出一堆点不动的框。
    */
   const [groupsEnabled, setGroupsEnabled] = useState<boolean | null>(null);
-  /**
-   * 会话内搜索开关（`flags/list` 里的 `session_search`）。`null` = 还不知道。
-   *
-   * 与另三个开关同一口径：`null` 按关处理。`=== true` 才注册 Cmd+F，否则
-   * Cmd+F 必须放行给 webview 的原生查找。
-   */
-  const [sessionSearchEnabled, setSessionSearchEnabled] = useState<boolean | null>(null);
   // 子 agent 暂留区:按对话隔离的折叠状态 + 用户是否收起了它。收起是纯 UI 选择,
   // 不进 store;数据本身仍随通知累积,展开即是当前值。
   const railStore = useRef(new SubagentRailStore()).current;
@@ -512,7 +505,6 @@ export default function App() {
         setKanbanEnabled(read("superpowers_kanban"));
         const groupsWereOn = sess.groupsRef.current.some((g) => (g.groups ?? []).length > 0);
         setGroupsEnabled(read("session_groups"));
-        setSessionSearchEnabled(read("session_search"));
         // 分组从「关」拨到「开」时必须重拉列表：关着期间服务端不下发组表，
         // 手上的数据里根本没有组，光把开关置 true 只会得到一片空框（什么也没有）。
         // 反过来（开→关）不用重拉：关掉是纯前端隐藏，数据留着下次直接用。
@@ -602,12 +594,11 @@ export default function App() {
   /**
    * Cmd/Ctrl+F 的进入条件，收敛进 ref。
    *
-   * 监听器只装一次；直接闭包读 state 会读到**首次渲染**时的值（那时
-   * `sessionSearchEnabled` 还是 `null`），于是拨开开关后 Cmd+F 仍然没反应。
+   * 监听器只装一次；直接闭包读 state 会读到**首次渲染**时的值（那时会话还
+   * 没选上），于是进了会话 Cmd+F 仍然没反应。
    */
   const canSearchRef = useRef(false);
   canSearchRef.current =
-    sessionSearchEnabled === true &&
     sess.currentId !== null &&
     board.selectedBoard === null &&
     !prefs.settingsOpen &&
@@ -617,7 +608,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "f") return;
       if (!canSearchRef.current) return;
-      // 拦掉 webview 自带的查找；flag 关时**必须**放行（见上方 canSearchRef）。
+      // 拦掉 webview 自带的查找：我们要的是会话内查找条，不是整页查找。
       e.preventDefault();
       setSearchOpen(true);
     };
@@ -1625,7 +1616,6 @@ export default function App() {
         // 同一份 `flags/list` 里就有看板与分组开关，不再多发请求。
         let kanbanOn = false;
         let groupsOn = false;
-        let searchOn = false;
         try {
           const flags = await client.request<{
             flags?: Array<{ name?: unknown; enabled?: unknown }>;
@@ -1636,18 +1626,14 @@ export default function App() {
           kanbanOn = kanban?.enabled === true;
           const groups = (flags.flags ?? []).find((f) => f.name === "session_groups");
           groupsOn = groups?.enabled === true;
-          const search = (flags.flags ?? []).find((f) => f.name === "session_search");
-          searchOn = search?.enabled === true;
         } catch {
           leadOn = false;
           kanbanOn = false;
           groupsOn = false;
-          searchOn = false;
         }
         setLeadAgentEnabled(leadOn);
         setKanbanEnabled(kanbanOn);
         setGroupsEnabled(groupsOn);
-        setSessionSearchEnabled(searchOn);
         const settings = await client.request<{
           theme?: unknown;
           resident_daemon_watchman_enabled?: unknown;
