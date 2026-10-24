@@ -7,6 +7,8 @@ mod cache;
 mod config;
 mod manager;
 mod naming;
+pub mod reload;
+mod reload_tool;
 mod tool;
 
 use std::future::Future;
@@ -19,6 +21,7 @@ use yi_agent_core::ToolRegistry;
 pub use cache::CachedTool;
 pub use config::{McpConfig, ServerConfig, ServerKind, Transport, config_path};
 pub use manager::McpManager;
+pub use reload_tool::{McpReloadTool, TOOL_NAME as MCP_RELOAD_TOOL_NAME};
 pub use tool::McpTool;
 
 /// 缓存里一个远端工具的**只读视图**，供设置页展示。
@@ -100,6 +103,23 @@ pub fn register_mcp_tools(
     Ok(Some(manager))
 }
 
+/// 注册 `mcp_reload` 工具。
+///
+/// **无条件注册**:没有 `.yi-agent/mcp.json` 时也必须存在,否则"第一次添加
+/// MCP server"就没有入口——那正是它最该起作用的场景。
+pub fn register_mcp_reload_tool(
+    registry: &mut ToolRegistry,
+    manager: Arc<McpManager>,
+    workdir: &Path,
+    blocklist: Option<yi_agent_core::permission::BlocklistFn>,
+) {
+    let mut tool = McpReloadTool::new(manager, workdir);
+    if let Some(b) = blocklist {
+        tool = tool.with_blocklist(b);
+    }
+    registry.register(Arc::new(tool));
+}
+
 /// Run an async operation to completion from a synchronous caller.
 ///
 /// Must never call `block_on` on an ambient runtime: that panics when invoked
@@ -139,6 +159,17 @@ mod tests {
     use crate::cache::{CachedTool, McpCache};
     use crate::config::ServerConfig;
     use std::collections::BTreeMap;
+
+    /// 没有任何 mcp.json 时也必须注册 `mcp_reload`:那是"第一次加 server"
+    /// 的唯一入口,漏掉它用户就无从下手。
+    #[test]
+    fn reload_tool_is_registered_even_without_a_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::new();
+        register_mcp_reload_tool(&mut registry, McpManager::empty(), dir.path(), None);
+        let tool = registry.get("mcp_reload").expect("must be registered");
+        assert!(tool.metadata().requires_confirmation);
+    }
 
     /// A cache hit must register the cached tools without spawning a process.
     /// The configured command does not exist, so any probe attempt would fail

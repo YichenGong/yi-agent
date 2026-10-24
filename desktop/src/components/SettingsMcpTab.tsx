@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   listMcpServers,
+  setMcpEnabled,
   type McpCall,
   type McpList,
   type McpRpc,
@@ -16,14 +17,54 @@ function commandSummary(s: McpServerView): string {
 }
 
 /**
+ * 一个开关。用 `role="switch"` 而不是 checkbox：语义上它立即生效、不是表单字段，
+ * 读屏软件据此读「开/关」而非「勾选」。
+ */
+function Switch({
+  label,
+  checked,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={() => onChange(!checked)}
+      className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50 ${
+        checked ? "bg-emerald-500" : "bg-raised"
+      }`}
+    >
+      <span
+        aria-hidden="true"
+        className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${
+          checked ? "left-[18px]" : "left-0.5"
+        }`}
+      />
+    </button>
+  );
+}
+
+/**
  * 「MCP」Tab。
  *
  * MCP 配置是**项目级文件**（`<项目>/.yi-agent/mcp.json`），而桌面侧车的 app-server
  * 以自己的 workdir（用户 home）为作用域，所以必须让用户明确「在看哪个项目」，并把它
  * 随每次 `mcp/list` 传下去——理由与「插件」「技能」两个 Tab 完全相同。
  *
- * **只读**：工具清单来自磁盘缓存（首次调用某个 server 时才探测），缓存缺失或指纹
- * 不匹配时显示「尚未探测」，而不是假装清单是最新的。不提供启停开关。
+ * 工具清单来自磁盘缓存（首次调用某个 server 时才探测），缓存缺失或指纹不匹配时
+ * 显示「尚未探测」，而不是假装清单是最新的。
+ *
+ * 开关（全局 + 每个 server）经 `mcp/set` 写盘，**下一轮对话生效**——写盘后正在
+ * 跑的会话手上还是旧工具集，所以服务端会顺手让该会话重载（见 `threadId`）。
  */
 export function SettingsMcpTab({
   call,
@@ -42,6 +83,10 @@ export function SettingsMcpTab({
   const [selected, setSelected] = useState<string>(() => defaultProject ?? projects[0] ?? "");
   /** server 名 → 是否展开工具清单。折叠状态不丢，避免反复展开时重复拉取。 */
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  /** 正在写盘的开关（键为 `master` 或 server 名）。同一时刻只允许一个在途。 */
+  const [pending, setPending] = useState<string | null>(null);
+  /** 写盘失败时的一句话，覆盖在列表上方。 */
+  const [writeError, setWriteError] = useState<string | null>(null);
 
   const rpc = call as McpRpc | undefined;
 
@@ -93,6 +138,43 @@ export function SettingsMcpTab({
     };
   }, [rpc, selected]);
 
+  /**
+   * 写一个开关。乐观更新后失败回滚：用户点完立刻看到状态变了，服务端拒绝时
+   * 再退回真实值，并把原因写在列表上方——不要静默失败。
+   */
+  const toggle = (target: { scope: "master" | "server"; name?: string }, next: boolean) => {
+    if (!rpc) return;
+    const key = target.scope === "master" ? "master" : (target.name ?? "");
+    const before = listed;
+    setWriteError(null);
+    setPending(key);
+    // 乐观更新：只动目标那一项。
+    setListed((current) => ({
+      ...current,
+      enabled: target.scope === "master" ? next : current.enabled,
+      servers: current.servers.map((s) =>
+        target.scope === "server" && s.name === target.name ? { ...s, enabled: next } : s,
+      ),
+    }));
+    void (async () => {
+      try {
+        const result = await setMcpEnabled(rpc, {
+          project: projectRef.current || undefined,
+          scope: target.scope,
+          name: target.name,
+          enabled: next,
+        });
+        // 用服务端回读的整份视图覆盖本地，避免乐观值与磁盘分叉。
+        setListed(result);
+      } catch {
+        setListed(before);
+        setWriteError("保存失败，已恢复原状态");
+      } finally {
+        setPending(null);
+      }
+    })();
+  };
+
   if (!call) {
     return <p className="p-4 text-xs text-fg-subtle">当前连接无法读取 MCP 配置</p>;
   }
@@ -123,9 +205,22 @@ export function SettingsMcpTab({
         </div>
       ) : (
         <>
-          <p className="border-b border-line p-4 text-xs text-fg-subtle">
-            MCP：{listed.enabled ? "已启用" : "已停用"}
-          </p>
+          <div className="flex items-center justify-between border-b border-line p-4">
+            <span className="text-xs text-fg-subtle">
+              全局 MCP {listed.enabled ? "已启用" : "已停用"}
+            </span>
+            <Switch
+              label="全局 MCP 开关"
+              checked={listed.enabled}
+              disabled={pending !== null}
+              onChange={(next) => toggle({ scope: "master" }, next)}
+            />
+          </div>
+          {writeError && (
+            <p role="alert" className="px-4 pt-2 text-xs text-amber-500">
+              {writeError}
+            </p>
+          )}
           <div className="divide-y divide-line">
             {visible.map((server) => {
               const open = expanded[server.name] === true;
@@ -133,9 +228,12 @@ export function SettingsMcpTab({
                 <section key={server.name} className="p-4">
                   <div className="flex items-center gap-2">
                     <h2 className="min-w-0 truncate text-sm font-medium text-fg">{server.name}</h2>
-                    <span className="shrink-0 rounded bg-raised px-1.5 py-0.5 text-[10px] text-fg-subtle">
-                      {server.enabled ? "已启用" : "已停用"}
-                    </span>
+                    <Switch
+                      label={`${server.name} 开关`}
+                      checked={server.enabled}
+                      disabled={pending !== null}
+                      onChange={(next) => toggle({ scope: "server", name: server.name }, next)}
+                    />
                   </div>
                   <p className="mt-1 truncate font-mono text-xs text-fg-subtle">
                     {server.kind === "http" ? (server.url ?? "") : commandSummary(server)}
@@ -202,7 +300,9 @@ function AddMcpHelp({ path }: { path: string }) {
     <section className="border-t border-line p-4">
       <h3 className="text-sm font-medium text-fg">如何添加 MCP server</h3>
       <p className="mt-2 text-xs text-fg-muted">
-        把 server 写进下面这个文件（Claude Desktop 兼容的 schema），重启侧车后生效：
+        直接对助手说「帮我加一个 xxx MCP」（它会调用 mcp_reload 工具写配置），
+        或者把 server 手动写进下面这个文件（Claude Desktop 兼容的 schema）。
+        <strong className="text-fg">改完下一轮对话生效</strong>，不需要重启：
       </p>
       {path !== "" && <p className="mt-1 break-all font-mono text-xs text-fg-subtle">{path}</p>}
       <pre className="mt-3 overflow-x-auto rounded border border-line bg-surface p-2 font-mono text-xs text-fg-muted">
@@ -214,7 +314,8 @@ function AddMcpHelp({ path }: { path: string }) {
 }`}
       </pre>
       <p className="mt-2 text-xs text-fg-subtle">
-        工具清单在首次调用该 server 时自动探测并缓存，本页的清单因此可能滞后于配置改动。
+        工具清单在首次调用该 server 时自动探测并缓存；上方的开关会立刻写盘并让当前
+        会话重载，但新工具从下一条消息起才会出现在工具集里。
       </p>
     </section>
   );

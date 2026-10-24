@@ -1702,6 +1702,7 @@ pub(crate) fn build_test_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -1734,6 +1735,7 @@ fn build_test_agent_with_provider(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -1768,6 +1770,7 @@ pub(crate) fn build_slow_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -1793,6 +1796,7 @@ fn build_delayed_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -1820,6 +1824,7 @@ fn build_checkpoint_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -4382,6 +4387,7 @@ async fn turn_start_prompt_reaching_the_model_contains_the_attachment_manifest()
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -4856,6 +4862,7 @@ async fn an_uploaded_image_reaches_the_model_as_a_content_block() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -4990,6 +4997,7 @@ async fn turn_start_drops_an_unknown_upload_id_and_still_runs_the_turn() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -5541,6 +5549,7 @@ async fn an_image_reaches_the_model_as_a_content_block() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -6901,6 +6910,8 @@ async fn driver_ignores_interrupt_tagged_with_other_turn() {
         built.provider,
         built.config,
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     // 上一轮残留的中断(属于 turn-0)必须被忽略。
@@ -7030,6 +7041,8 @@ async fn driver_reports_finished_when_writer_fails() {
         built.provider,
         built.config,
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     prompt_tx
@@ -7106,6 +7119,8 @@ async fn idle_driver_serves_a_session_command_without_a_new_turn() {
         built.provider,
         built.config,
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     // 没有任何 turn/start:直接投一条 compact,必须在有限时间内拿到回复。
@@ -7200,6 +7215,8 @@ async fn set_model_command_rebuilds_with_the_new_model() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer
@@ -7305,6 +7322,8 @@ async fn set_reasoning_effort_command_rebuilds_without_a_new_provider() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer
@@ -7420,6 +7439,8 @@ async fn set_preserve_thinking_false_strips_the_shared_session() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer
@@ -7527,6 +7548,8 @@ async fn set_preserve_thinking_true_leaves_the_shared_session_untouched() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer.await.unwrap().unwrap();
@@ -7667,6 +7690,8 @@ async fn toggling_preserve_off_persists_a_stripped_transcript() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     answer.await.unwrap().unwrap();
@@ -7932,6 +7957,8 @@ async fn set_model_command_keeps_the_agent_when_the_provider_fails() {
         &hub,
         &turn_tx,
         &ThreadSession::new_status(),
+        None,
+        &std::env::temp_dir(),
     )
     .await;
     let error = answer
@@ -8004,6 +8031,8 @@ async fn idle_driver_serves_a_set_model_command_without_a_new_turn() {
         built.provider,
         built.config,
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     let mut effective = crate::test_support::test_config();
@@ -8074,6 +8103,8 @@ async fn driver_uses_unique_item_ids_across_turns() {
         built.provider,
         built.config,
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     let mut client_r = BufReader::new(client_r);
@@ -8262,6 +8293,7 @@ fn build_slow_call_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -8333,6 +8365,7 @@ fn build_long_tool_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(true),
         process_manager: Arc::clone(&registry.process_manager),
+        mcp: None,
     })
 }
 
@@ -8368,6 +8401,7 @@ fn build_permission_agent(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -8613,6 +8647,8 @@ async fn stale_interrupt_does_not_cancel_turn_during_approval() {
         built.provider,
         built.config,
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     prompt_tx
@@ -11463,6 +11499,8 @@ async fn driver_clears_the_checkpoint_when_the_initiator_disconnects_during_appr
         built.provider,
         built.config,
         tokio::sync::watch::channel(crate::protocol::SubagentTotals::default()).1,
+        None,
+        std::env::temp_dir(),
     ));
 
     prompt_tx
@@ -11534,6 +11572,7 @@ async fn thread_resume_replays_history_and_restores_context() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -12045,6 +12084,7 @@ fn compactable_factory(
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     })
 }
 
@@ -12167,6 +12207,7 @@ async fn thread_compact_reports_failure_without_breaking_the_connection() {
             catalog: None,
             yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
             process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+            mcp: None,
         })
     };
     let mut h = Harness::with_config(cfg, build, PERMISSION_TIMEOUT);
@@ -14390,6 +14431,39 @@ async fn an_observe_client_cannot_delete_a_thread() {
     .await;
     let v = read_response(&mut h, 9).await;
     assert_eq!(v["error"]["code"], -32014, "Observe 客户端必须被拒: {v}");
+    h.shutdown().await;
+}
+
+/// `mcp/set` 改用户的持久配置,必须 Control;只读客户端只能看不能改。
+#[tokio::test(flavor = "multi_thread")]
+async fn an_observe_client_may_not_write_mcp_config() {
+    let mut h = (Harness::with_scope(Scope::Observe)).await;
+    initialize(&mut h).await;
+    h.send(
+        r#"{"jsonrpc":"2.0","id":9,"method":"mcp/set","params":{"scope":"master","enabled":false}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 9).await;
+    assert_eq!(v["error"]["code"], -32014, "Observe 客户端必须被拒: {v}");
+    h.shutdown().await;
+}
+
+/// 反例:Control 客户端(手机)能改——门禁只挡最低档,不是挡所有人。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_control_client_may_write_mcp_config() {
+    let mut h = Harness::with_scope(Scope::Control).await;
+    initialize(&mut h).await;
+    h.send(
+        r#"{"jsonrpc":"2.0","id":9,"method":"mcp/set","params":{"scope":"master","enabled":false}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 9).await;
+    // 该 harness 的 workdir 下没有 mcp.json,故这里是业务错误而非权限错误:
+    // 关键是它**没有**被判 -32014。
+    assert_ne!(
+        v["error"]["code"], -32014,
+        "Control 客户端不该被判权限不足: {v}"
+    );
     h.shutdown().await;
 }
 
@@ -17248,6 +17322,7 @@ fn rebuilding_a_thread_agent_keeps_one_session_handle() {
         catalog: None,
         yolo: yi_agent_core::autonomy::YoloSwitch::new(false),
         process_manager: yi_agent_tools::ProcessManager::new(std::env::temp_dir()),
+        mcp: None,
     };
     let rebuilt = wrap_for_delegation(built, tooling);
     assert!(
@@ -17425,6 +17500,8 @@ async fn session_commands_clear_the_stale_input_tokens_without_changing_the_hand
                 &hub,
                 &turn_tx,
                 &status,
+                None,
+                &std::env::temp_dir(),
             )
             .await;
             answer
@@ -17443,6 +17520,8 @@ async fn session_commands_clear_the_stale_input_tokens_without_changing_the_hand
                 &hub,
                 &turn_tx,
                 &status,
+                None,
+                &std::env::temp_dir(),
             )
             .await;
             assert_eq!(

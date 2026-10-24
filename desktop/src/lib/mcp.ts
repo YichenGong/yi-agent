@@ -22,7 +22,7 @@ export interface McpToolSummary {
 export interface McpServerView {
   name: string;
   kind: "stdio" | "http";
-  /** 文件里的该 server 开关默认值（只读展示，面板不写回）。 */
+  /** 该 server 的启用状态。面板通过 `setMcpEnabled` 写回。 */
   enabled: boolean;
   /** stdio：可执行文件；http 下为 null。 */
   command: string | null;
@@ -44,7 +44,7 @@ export interface McpList {
   configured: boolean;
   /** 配置文件的真实解析路径（供「如何添加」文案用，不硬编码）。 */
   path: string;
-  /** 文件里的顶层总开关默认值。 */
+  /** 顶层总开关。面板通过 `setMcpEnabled` 写回。 */
   enabled: boolean;
   servers: McpServerView[];
 }
@@ -111,6 +111,41 @@ export async function listMcpServers(rpc: McpRpc, project?: string): Promise<Mcp
     path: typeof result?.path === "string" ? result.path : "",
     enabled: result?.enabled === true,
     // 服务端按名字排序（BTreeMap）；这里不重排，保持与服务端一致。
+    servers: rows.map(asServer).filter((s): s is McpServerView => s !== undefined),
+  };
+}
+/**
+ * 打开 / 关闭全局开关或某个 server，返回写盘之后的最新视图。
+ *
+ * `threadId` 可选：给了就让该会话立刻重载工具集（否则要等下一轮对话或重启）。
+ * 返回值是服务端**回读磁盘**后的完整列表，调用方应直接用它替换本地状态，
+ * 不要自己拼乐观结果——否则服务端拒绝时两边会分叉。
+ */
+export async function setMcpEnabled(
+  rpc: McpRpc,
+  args: {
+    project?: string;
+    scope: "master" | "server";
+    name?: string;
+    enabled: boolean;
+    threadId?: string;
+  },
+): Promise<McpList> {
+  const params: Record<string, unknown> = { scope: args.scope, enabled: args.enabled };
+  if (args.project) params.project = args.project;
+  if (args.scope === "server" && args.name) params.name = args.name;
+  if (args.threadId) params.threadId = args.threadId;
+  const result = await rpc<{
+    configured?: unknown;
+    path?: unknown;
+    enabled?: unknown;
+    servers?: unknown;
+  }>("mcp/set", params);
+  const rows = Array.isArray(result?.servers) ? result.servers : [];
+  return {
+    configured: result?.configured === true,
+    path: typeof result?.path === "string" ? result.path : "",
+    enabled: result?.enabled === true,
     servers: rows.map(asServer).filter((s): s is McpServerView => s !== undefined),
   };
 }

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::ServerConfig;
+use crate::config::{McpConfig, ServerConfig};
 
 /// 一个被缓存的远端工具。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +60,31 @@ fn fingerprint(cfg: &ServerConfig) -> String {
     });
     // 序列化 `serde_json::Value` 不会失败;显式 panic 好过静默回退成空串
     // (空串会让所有配置都判定为命中,从而一直提供过期 schema)。
+    let json = serde_json::to_string(&key).expect("serializing a serde_json::Value is infallible");
+    let digest = Sha256::digest(json.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 整份配置的指纹(含顶层 `enabled`,按 server 名排序后再序列化)。
+///
+/// 与 [`fingerprint`] 的区别:那个只看单个 `ServerConfig`、用于缓存失效;
+/// 这个看**整个文件**,用于"磁盘上的配置是否变了"的廉价检测——顶层开关
+/// 从 on 改成 off 也必须被它感知到。
+pub(crate) fn fingerprint_for_manager(cfg: &McpConfig) -> String {
+    let mut parts = Vec::new();
+    for (name, sc) in &cfg.mcp_servers {
+        parts.push(serde_json::json!({
+            "name": name,
+            "kind": sc.kind,
+            "command": sc.command,
+            "args": sc.args,
+            "env": sc.env,
+            "url": sc.url,
+            "headers": sc.headers,
+            "enabled": sc.enabled,
+        }));
+    }
+    let key = serde_json::json!({ "enabled": cfg.enabled, "servers": parts });
     let json = serde_json::to_string(&key).expect("serializing a serde_json::Value is infallible");
     let digest = Sha256::digest(json.as_bytes());
     digest.iter().map(|b| format!("{b:02x}")).collect()

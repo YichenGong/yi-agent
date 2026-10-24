@@ -198,6 +198,8 @@ pub(crate) struct BuiltAgent {
     /// 支撑该 agent 工具集里的进程工具的 manager。**与生效的工具集同行**：
     /// `build_runtime_tooling` 换掉工具集时必须一并替换它。
     pub(crate) process_manager: Arc<yi_agent_tools::ProcessManager>,
+    /// MCP 管理器;配置缺失时为 `None`。`mcp/set` 与每轮配置变更检查用它。
+    pub(crate) mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
 
 /// 一个 cwd 的工具集与其权限检查器。
@@ -210,6 +212,8 @@ struct RuntimeTooling {
     /// `build_runtime_tooling` hands a clone to the tools and keeps this one, so
     /// binding it here (see [`wrap_for_delegation`]) is visible to those tools.
     caller: yi_agent_subagent::CallerContext,
+    /// MCP 管理器;与 `registry` 里的 `mcp_reload` 是同一份。
+    mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
 
 /// 每 cwd 的已 attach runtime。app-server 是长驻多 cwd 进程,而 runtime 是按项目
@@ -1334,6 +1338,9 @@ fn build_runtime_tooling(
         permission,
         process_manager,
         caller,
+        // `build_tool_setup_with_controller` 已经把 `mcp_reload` 注册进 registry，
+        // 这里把同一份 manager 带出去，换根之后仍指向同一份状态。
+        mcp: setup.mcp,
     })
 }
 
@@ -1384,6 +1391,7 @@ fn rebuild_thread_agent_with_theme(
         catalog,
         yolo,
         process_manager,
+        mcp,
         ..
     } = built;
     let mut config = agent.config().clone();
@@ -1414,6 +1422,7 @@ fn rebuild_thread_agent_with_theme(
         catalog,
         yolo,
         process_manager,
+        mcp,
     }
 }
 
@@ -1427,6 +1436,8 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
         decision_rx,
         catalog,
         yolo,
+        // 委派用的是新工具集自带的 manager,旧的随之丢弃。
+        mcp: _,
         ..
     } = built;
     // Reuse the live session `Arc` so the delegation tools' `CallerContext`,
@@ -1453,6 +1464,9 @@ fn wrap_for_delegation(built: BuiltAgent, tooling: RuntimeTooling) -> BuiltAgent
         yolo,
         // 注册表换了,manager 必须跟着换:否则面板查的是被丢弃的那一份。
         process_manager: tooling.process_manager,
+        // MCP 管理器跟着 registry 走:换根目录后 `mcp_reload` 要改的是**新根**
+        // 下的 `.yi-agent/mcp.json`。
+        mcp: tooling.mcp,
     }
 }
 
@@ -4720,6 +4734,8 @@ async fn apply_session_command(
     hub: &crate::broadcast::Broadcaster,
     turn_tx: &mpsc::Sender<TurnEvent>,
     status: &Arc<std::sync::Mutex<ThreadStatus>>,
+    mcp: Option<&Arc<yi_agent_mcp::McpManager>>,
+    mcp_workdir: &std::path::Path,
 ) -> yi_agent_core::Agent {
     match command {
         SessionCommand::Clear { reply } => {
@@ -4887,6 +4903,50 @@ async fn apply_session_command(
             let _ = reply.send(Ok(()));
             agent = rebuilt;
         }
+        SessionCommand::ReloadMcp { reply } => match mcp {
+            // 没有 manager 就没什么可重载的。这不该发生(mcp_reload 工具在
+            // 无配置时也会带一个空 manager),但如实回错好过假装成功。
+            None => {
+                let _ = reply.send(Err("本会话没有可用的 MCP 管理器".into()));
+            }
+            Some(mcp) => {
+                let report = mcp.reload(mcp_workdir).await;
+                let failures: Vec<String> = report
+                    .servers
+                    .iter()
+                    .filter_map(|s| s.error.as_ref().map(|e| format!("{}: {e}", s.name)))
+                    .collect();
+
+                // 用刷新后的工具集重建 agent:三样照旧保留(session `Arc`、
+                // 审批路径),与 `SetModel` / `SetReasoningEffort` 的重建语义一致。
+                let mut refreshed = (*agent.tools()).clone();
+                mcp.refresh_registry(&mut refreshed);
+                let next_config = agent.config().clone();
+                let session_handle = agent.session_handle();
+                let permission = agent.permission_checker();
+                let decision = agent.decision_rx();
+                let mut rebuilt = yi_agent_core::Agent::new(
+                    Arc::clone(provider),
+                    std::sync::Arc::new(refreshed),
+                    next_config,
+                )
+                .with_session_arc(session_handle);
+                if let (Some(checker), Some(rx)) = (permission, decision) {
+                    rebuilt = rebuilt.with_permission(checker, rx);
+                }
+                tracing::info!(
+                    servers = report.servers.len(),
+                    failed = failures.len(),
+                    "session MCP config reloaded"
+                );
+                agent = rebuilt;
+                let _ = reply.send(if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(format!("部分 server 探测失败: {}", failures.join("；")))
+                });
+            }
+        },
         SessionCommand::SetPreserveThinking { preserve, reply } => {
             // provider 不变（开关不烤进 URL/key），故复用当前 `provider`，只把
             // `AgentConfig.preserve_thinking` 换掉后重建 agent。
@@ -4984,6 +5044,12 @@ pub(crate) async fn run_thread_driver(
     config: yi_agent_core::AgentConfig,
     // subagent 用量汇总。由 `watch_children` 写入，本 driver 读出来推给客户端。
     mut subagent_rx: tokio::sync::watch::Receiver<SubagentTotals>,
+    // MCP 管理器。driver 每轮开跑前用它检查 `.yi-agent/mcp.json` 是否被改过，
+    // `SessionCommand::ReloadMcp` 也靠它重新读盘。配置缺失时是 `None`。
+    mcp: Option<Arc<yi_agent_mcp::McpManager>>,
+    // 该 thread 的 cwd：`config.workdir` 在 driver 里被 clone 过多次，但
+    // MCP 配置固定在 thread cwd 下的 `.yi-agent/mcp.json`，故显式传入更清楚。
+    mcp_workdir: std::path::PathBuf,
 ) {
     // 每个 thread 一个 translator:item id 带 turn_id 前缀(`item-<turn_id>-<n>`),
     // 故即便 resume 后计数器归 1,新 item 也不会与回放的历史 id 冲突。
@@ -5018,7 +5084,7 @@ pub(crate) async fn run_thread_driver(
                 let clearing = matches!(&command, SessionCommand::Clear { .. });
                 agent = apply_session_command(
                     agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx,
-                    &status,
+                    &status, mcp.as_ref(), &mcp_workdir,
                 )
                 .await;
                 if clearing {
@@ -5152,6 +5218,36 @@ pub(crate) async fn run_thread_driver(
                 }
                 Ok(false) => {}
                 Err(e) => eprintln!("[app-server] failed to update meta for {thread_id}: {e}"),
+            }
+        }
+
+        // 每轮开跑前检查 `.yi-agent/mcp.json` 是否被改过(用户在别的窗口编辑、
+        // 或 `mcp/set` 刚写过盘)。只探测变化的 server,缓存命中则秒过。
+        if let Some(mcp) = &mcp {
+            if mcp.config_changed_on_disk(&mcp_workdir) {
+                let report = mcp.reload(&mcp_workdir).await;
+                for s in &report.servers {
+                    if let Some(err) = &s.error {
+                        tracing::warn!(server = %s.name, error = %err, "MCP reload probe failed");
+                    }
+                }
+                let mut refreshed = (*agent.tools()).clone();
+                mcp.refresh_registry(&mut refreshed);
+                let next_config = agent.config().clone();
+                let session_handle = agent.session_handle();
+                let permission = agent.permission_checker();
+                let decision = agent.decision_rx();
+                let mut rebuilt = yi_agent_core::Agent::new(
+                    Arc::clone(&provider),
+                    Arc::new(refreshed),
+                    next_config,
+                )
+                .with_session_arc(session_handle);
+                if let (Some(checker), Some(rx)) = (permission, decision) {
+                    rebuilt = rebuilt.with_permission(checker, rx);
+                }
+                agent = rebuilt;
+                tracing::info!("MCP config changed on disk; thread registry reloaded");
             }
         }
 
@@ -5533,6 +5629,9 @@ pub(crate) async fn run_thread_driver(
                             SessionCommand::SetPreserveThinking { reply, .. } => {
                                 let _ = reply.send(Err("另有一个会话命令待执行".into()));
                             }
+                            SessionCommand::ReloadMcp { reply } => {
+                                let _ = reply.send(Err("另有一个会话命令待执行".into()));
+                            }
                         }
                     } else {
                         pending_session_command = Some(command);
@@ -5546,7 +5645,17 @@ pub(crate) async fn run_thread_driver(
         if let Some(command) = pending_session_command.take() {
             let clearing = matches!(&command, SessionCommand::Clear { .. });
             agent = apply_session_command(
-                agent, command, &provider, &config, &store, &thread_id, &hub, &turn_tx, &status,
+                agent,
+                command,
+                &provider,
+                &config,
+                &store,
+                &thread_id,
+                &hub,
+                &turn_tx,
+                &status,
+                mcp.as_ref(),
+                &mcp_workdir,
             )
             .await;
             if clearing {
@@ -6759,9 +6868,13 @@ pub(crate) async fn start_thread_core(
         catalog,
         yolo,
         process_manager,
+        mcp,
         ..
     } = activation.built;
     pending_activation.insert(thread_id.clone(), activation.runtime);
+    // MCP 配置固定在 thread cwd 下(不是 daemon 回传的 toplevel):与
+    // `build_runtime_tooling` 里 `ThreadStore::new(&cfg.workdir)` 同一口径。
+    let mcp_workdir = std::path::PathBuf::from(cwd);
 
     let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
     let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
@@ -6887,6 +7000,8 @@ pub(crate) async fn start_thread_core(
         provider,
         config,
         subagent_rx,
+        mcp,
+        mcp_workdir,
     ));
 
     Ok(())
