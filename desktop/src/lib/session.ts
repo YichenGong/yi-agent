@@ -9,6 +9,7 @@ import {
   type Usage,
   type UsageTotals,
 } from "./protocol";
+import type { UsageReport } from "./usageCommand";
 
 /**
  * `Notification` 的 `turn/retry` 载荷里 `cause` 的类型是 `string`——那就是线形状
@@ -64,10 +65,12 @@ export interface NoticeItem {
  *
  * - `config`：`/config` 的 `config/read` 原始结果（或读取错误）。
  * - `help`：`/help` 的目录/详情；`error` 非空时先显示错误行（未知目标、未知命令）。
+ * - `usage`：`/usage` 的用量报告。数据由 `buildUsageReport` 算好，卡片只摆版。
  */
 export type NoticeBody =
   | { kind: "config"; data: Record<string, unknown> | null; error: string | null }
-  | { kind: "help"; target: string | null; error: string | null };
+  | { kind: "help"; target: string | null; error: string | null }
+  | { kind: "usage"; report: UsageReport };
 
 /**
  * 一段累积的思维链（CoT）。**本地展示条目，不是 wire `Item`**：服务端在实时期间

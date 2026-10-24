@@ -10,6 +10,7 @@ import { useThrottledText } from "../lib/useThrottledText";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { HelpCard } from "./HelpCard";
+import { UsageCard } from "./UsageCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { HighlightText } from "./HighlightText";
 
@@ -177,6 +178,8 @@ const ChatItem = memo(
           <ConfigCard config={item.body.data} error={item.body.error} />
         ) : item.body?.kind === "help" ? (
           <HelpCard target={item.body.target} error={item.body.error} />
+        ) : item.body?.kind === "usage" ? (
+          <UsageCard report={item.body.report} />
         ) : (
           // 服务端 `thread/notice` 带 level：Warn（通道回退 / effort 降级）用琥珀色
           // 让人一眼看出「走了别的路」；本地 `/命令` 提示与 Info 保持既有中性胶囊。
