@@ -5500,7 +5500,7 @@ describe("App mobile reopen keeps the selection", () => {
     ).toBe(true);
   });
 
-  it("still selects the first thread on the desktop reconnect (unchanged)", async () => {
+  it("keeps the current thread across a foreground reconnect on the desktop too", async () => {
     state.threads = threads();
     render(<App />);
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
@@ -5512,10 +5512,24 @@ describe("App mobile reopen keeps the selection", () => {
     await waitFor(() =>
       expect(clients[clients.length - 1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
     );
-    // 桌面端重放保留历史行为：每次都回到第一条会话。
-    await waitFor(() =>
-      expect(resumedOn(clients[clients.length - 1])).toContain("t1"),
-    );
+    // 桌面端同样保持：切到别的 app 再回来，看到的还是离开时那条会话。
+    const last = clients[clients.length - 1];
+    await waitFor(() => expect(resumedOn(last)).toContain("t2"));
+    expect(resumedOn(last)).not.toContain("t1");
+  });
+
+  it("still falls back to the first thread when the current one is gone", async () => {
+    state.threads = threads();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(resumedOn(clients[0])).toContain("t2"));
+    // 服务端列表里已经没有 t2：必须回落第一条，而不是抱着一个不存在的会话。
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    clients[0].requests.length = 0;
+    foregroundAfterDeadSocket();
+    await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+    await waitFor(() => expect(resumedOn(clients[clients.length - 1])).toContain("t1"));
   });
 });
 
