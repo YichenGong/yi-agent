@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, cleanup, screen, fireEvent, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { render, cleanup, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { Session } from "../lib/session";
@@ -592,6 +592,92 @@ describe("ChatView item ids", () => {
     const { container } = render(<ChatView items={items()} threadId="t1" />);
     const first = container.querySelector("[data-item-id]") as HTMLElement;
     expect(first.className).toContain("contents");
+  });
+});
+
+describe("ChatView remembers the reading position", () => {
+  // 采集是 rAF 节流的；把它换成 setTimeout 让测试能确定地等到回调跑完。
+  beforeEach(() => {
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => setTimeout(() => cb(0), 0));
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => clearTimeout(id));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** jsdom 没有布局：给滚动容器与每条消息装上可读的位置度量。 */
+  function installLayout(scroller: HTMLElement, tops: number[], scrollHeight = 3000) {
+    const state = { scrollTop: 0 };
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => scrollHeight });
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, get: () => 600 });
+    Object.defineProperty(scroller, "scrollTop", {
+      configurable: true,
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        state.scrollTop = v;
+      },
+    });
+    const rect = (top: number, height = 0) =>
+      ({ top, left: 0, bottom: top + height, right: 0, width: 0, height, x: 0, y: top, toJSON() {} }) as DOMRect;
+    scroller.getBoundingClientRect = () => rect(0, 600);
+    const nodes = Array.from(scroller.querySelectorAll<HTMLElement>("[data-item-id]"));
+    nodes.forEach((node, i) => {
+      node.getBoundingClientRect = () => rect(tops[i] - state.scrollTop);
+    });
+    return state;
+  }
+
+  /** 等一拍：让 rAF 桩（setTimeout 0）的回调真正执行完。 */
+  const settle = async () => {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+  };
+
+  it("reports the top visible message while the user reads history", async () => {
+    const seen: Array<[string, unknown]> = [];
+    const list = items();
+    const { container } = render(
+      <ChatView items={list} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installLayout(scroller, [0, 1000, 2000]);
+    state.scrollTop = 1200;
+    fireEvent.scroll(scroller);
+    await settle();
+    const last = seen[seen.length - 1];
+    expect(last?.[0]).toBe("t1");
+    expect(last?.[1]).toEqual({ itemId: "tc1", offset: -200 });
+  });
+
+  it("reports null when the user is at the bottom", async () => {
+    const seen: Array<[string, unknown]> = [];
+    const { container } = render(
+      <ChatView items={items()} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installLayout(scroller, [0, 1000, 2000]);
+    state.scrollTop = 2400; // scrollHeight 3000 - clientHeight 600
+    fireEvent.scroll(scroller);
+    await settle();
+    expect(seen[seen.length - 1]).toEqual(["t1", null]);
+  });
+
+  it("attributes the last position to the thread that was on screen", async () => {
+    // 切换线程时旧内容已被替换，靠"离开前最后记住的那次"归属到旧 id。
+    const seen: Array<[string, unknown]> = [];
+    const list = items();
+    const { container, rerender } = render(
+      <ChatView items={list} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installLayout(scroller, [0, 1000, 2000]);
+    state.scrollTop = 1200;
+    fireEvent.scroll(scroller);
+    await settle();
+    rerender(<ChatView items={list} threadId="t2" onRememberView={(id, a) => seen.push([id, a])} />);
+    const forT1 = seen.filter(([id]) => id === "t1");
+    expect(forT1[forT1.length - 1][1]).toEqual({ itemId: "tc1", offset: -200 });
   });
 });
 

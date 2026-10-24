@@ -4,7 +4,8 @@ import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
-import { useStickToBottom } from "../lib/useStickToBottom";
+import { isAtBottom, useStickToBottom } from "../lib/useStickToBottom";
+import { findAnchor, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
 import { useThrottledText } from "../lib/useThrottledText";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
@@ -387,6 +388,7 @@ export function ChatView({
   structuralVersion = 0,
   query = "",
   scrollerRef,
+  onRememberView,
 }: {
   items: (Item | NoticeItem | ReasoningItem)[];
   error?: string | null;
@@ -412,12 +414,18 @@ export function ChatView({
    * "当前视口"），与内部 `useStickToBottom` 的 ref 指向同一个元素。
    */
   scrollerRef?: RefObject<HTMLDivElement | null>;
+  /**
+   * 滚动时上报当前位置。签名带 `threadId` 是为了让"切换前的最后一次采集"仍归属
+   * 到旧会话——切换之后 DOM 里已经是新内容，闭包再读当前 id 就错位了。
+   */
+  onRememberView?: (threadId: string, anchor: ViewAnchor | null) => void;
 }) {
   const { ref: scrollRef, scrollToBottom, followIfAtBottom } = useStickToBottom();
   // 合并 ref：同一个 DOM 节点交给两方。依赖是两个 ref 本身（稳定引用），
   // 所以不会每次渲染都重设。
   const setScroller = useCallback(
     (el: HTMLDivElement | null) => {
+      elRef.current = el;
       scrollRef.current = el;
       if (scrollerRef) scrollerRef.current = el;
     },
@@ -438,6 +446,56 @@ export function ChatView({
   // otherwise never see it move.
   const tail = items.length > 0 ? items[items.length - 1] : undefined;
   const effectiveCall = call ?? NO_CALL;
+
+  // 采集用的元素句柄：与 `useStickToBottom` 的 ref 指向同一个 DOM 节点。
+  const elRef = useRef<HTMLDivElement | null>(null);
+  // 回调每次渲染都可能换身份（宿主内联箭头），用 ref 读最新的，避免把采集
+  // effect 绑在它的身份上。
+  const rememberRef = useRef(onRememberView);
+  rememberRef.current = onRememberView;
+
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    // 采集闭包固定住本次 effect 对应的会话 id（见属性注释）。
+    const owner = threadId;
+    let frame: number | null = null;
+
+    const capture = () => {
+      frame = null;
+      const node = elRef.current;
+      const report = rememberRef.current;
+      // 没有选中会话时没有可归属的位置（也不会有人读它）。
+      if (!node || !report || owner === null) return;
+      if (isAtBottom(node)) {
+        report(owner, null);
+        return;
+      }
+      // `getBoundingClientRect().top` 是视口坐标；减去滚动偏移即"内容坐标"。
+      const base = node.getBoundingClientRect().top - node.scrollTop;
+      const boxes: ItemBox[] = [];
+      for (const child of node.querySelectorAll<HTMLElement>("[data-item-id]")) {
+        const id = child.dataset.itemId;
+        if (!id) continue;
+        boxes.push({ id, top: child.getBoundingClientRect().top - base });
+      }
+      report(owner, findAnchor(boxes, node.scrollTop));
+    };
+
+    const onScroll = () => {
+      // 一轮滚动只量一次：读 `getBoundingClientRect` 会强制布局，滚动期间每帧
+      // 量 N 条消息会把长会话的滚动拖慢。
+      if (frame !== null) return;
+      frame = requestAnimationFrame(capture);
+    };
+
+    el.addEventListener("scroll", onScroll, { passive: true });
+    capture();
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (frame !== null) cancelAnimationFrame(frame);
+    };
+  }, [threadId]);
 
   // 新内容 / 流式文本变化时跟随，但**只在用户仍贴底时**。用户上翻历史后，
   // 每个 delta 都强制贴底会让他在整个生成期间反复被拽回底部，根本读不到上面的内容。
