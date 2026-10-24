@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, cleanup, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
-import type { NoticeItem } from "../lib/session";
+import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { Session } from "../lib/session";
 
 // Count how often the settled tool card's component body runs. A streamed delta
@@ -116,6 +116,35 @@ describe("ChatView streaming", () => {
     expect(scroller.className).toContain("overflow-x-hidden");
     // 作为 flex 子项，缺 `min-w-0` 时它的最小宽度是内容宽度，同样会撑破布局。
     expect(scroller.className).toContain("min-w-0");
+  });
+});
+
+describe("ChatView search highlighting", () => {
+  function userItems(): (Item | NoticeItem | ReasoningItem)[] {
+    return [{ type: "userMessage", id: "u1", text: "alpha beta alpha" }];
+  }
+
+  it("marks hits inside user bubbles", () => {
+    const { container } = render(<ChatView items={userItems()} query="alpha" />);
+    expect(container.querySelectorAll("mark.search-hit").length).toBe(2);
+  });
+
+  it("renders no mark when the query is empty", () => {
+    const { container } = render(<ChatView items={userItems()} query="" />);
+    expect(container.querySelectorAll("mark.search-hit").length).toBe(0);
+  });
+
+  it("keeps user text intact around the mark", () => {
+    const { container } = render(<ChatView items={userItems()} query="beta" />);
+    expect(container.textContent).toContain("alpha beta alpha");
+  });
+
+  it("hands its scrolling element out through scrollerRef", () => {
+    // 搜索要读 scrollTop/clientHeight 判断"当前视口"，而真正滚动的是
+    // ChatView 内部这个节点，不是 App 外层容器。借不出去就只能永远选中第一个。
+    const ref: { current: HTMLDivElement | null } = { current: null };
+    const { container } = render(<ChatView items={userItems()} scrollerRef={ref} />);
+    expect(ref.current).toBe(container.firstElementChild);
   });
 });
 

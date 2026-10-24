@@ -1,4 +1,5 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import type { RefObject } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
@@ -9,6 +10,7 @@ import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
 import { HelpCard } from "./HelpCard";
 import { ToolCallCard } from "./ToolCallCard";
+import { HighlightText } from "./HighlightText";
 
 /**
  * 一张图片引用（path → 分片读取 → 对象 URL）。`refs` 由服务端下发、长度固定，
@@ -154,11 +156,14 @@ const ChatItem = memo(
     text,
     threadId,
     call,
+    query,
   }: {
     item: Item | NoticeItem | ReasoningItem;
     text: string;
     threadId: string | null;
     call: ImageReadCall;
+    /** 搜索关键词。空串表示未在搜索，不产生任何 mark。 */
+    query: string;
   }) {
     switch (item.type) {
       case "notice":
@@ -209,11 +214,11 @@ const ChatItem = memo(
                 ))}
               </div>
             )}
-            {item.text}
+            <HighlightText text={item.text} query={query} />
           </div>
         );
       case "agentMessage":
-        return <AgentMessage text={text} />;
+        return <AgentMessage text={text} query={query} />;
       case "toolCall":
         return <ToolCallRow item={item} threadId={threadId} call={call} />;
       default: {
@@ -229,7 +234,8 @@ const ChatItem = memo(
     }
   },
   // Compare the mutable primitive, never `item.text`.
-  (prev, next) => prev.item === next.item && prev.text === next.text,
+  (prev, next) =>
+    prev.item === next.item && prev.text === next.text && prev.query === next.query,
 );
 
 /**
@@ -261,10 +267,12 @@ function LiveTail({
   item,
   threadId,
   call,
+  query,
 }: {
   item: Item | NoticeItem | ReasoningItem;
   threadId: string | null;
   call: ImageReadCall;
+  query: string;
 }) {
   const streamingAgent = item.type === "agentMessage";
   const throttled = useThrottledText(streamingAgent ? item.text : "");
@@ -274,6 +282,7 @@ function LiveTail({
       text={streamingAgent ? throttled : itemText(item)}
       threadId={threadId}
       call={call}
+      query={query}
     />
   );
 }
@@ -308,6 +317,7 @@ const HistoryPrefix = memo(
     count,
     threadId,
     call,
+    query,
   }: {
     items: (Item | NoticeItem | ReasoningItem)[];
     count: number;
@@ -319,6 +329,8 @@ const HistoryPrefix = memo(
      * than a `key` for the reasons in the doc comment above.
      */
     structuralVersion: number;
+    /** 搜索关键词，透传给每条消息。 */
+    query: string;
   }) {
     const out = [];
     for (let i = 0; i < count; i += 1) {
@@ -330,6 +342,7 @@ const HistoryPrefix = memo(
           text={itemText(it)}
           threadId={threadId}
           call={call}
+          query={query}
         />,
       );
     }
@@ -341,7 +354,8 @@ const HistoryPrefix = memo(
     prev.count === next.count &&
     prev.structuralVersion === next.structuralVersion &&
     prev.threadId === next.threadId &&
-    prev.call === next.call,
+    prev.call === next.call &&
+    prev.query === next.query,
 );
 
 /// How each retry cause is worded in the amber retry banner. Kept as a lookup so
@@ -361,6 +375,8 @@ export function ChatView({
   threadId = null,
   call,
   structuralVersion = 0,
+  query = "",
+  scrollerRef,
 }: {
   items: (Item | NoticeItem | ReasoningItem)[];
   error?: string | null;
@@ -379,8 +395,24 @@ export function ChatView({
    * append skips it entirely; a `key` would remount it and wipe child state.
    */
   structuralVersion?: number;
+  /** 搜索关键词（已防抖）。空串表示未在搜索，不产生任何 mark。 */
+  query?: string;
+  /**
+   * 把内部的滚动容器**借给**宿主（搜索要读它的 scrollTop/clientHeight 判断
+   * "当前视口"），与内部 `useStickToBottom` 的 ref 指向同一个元素。
+   */
+  scrollerRef?: RefObject<HTMLDivElement | null>;
 }) {
   const { ref: scrollRef, scrollToBottom, followIfAtBottom } = useStickToBottom();
+  // 合并 ref：同一个 DOM 节点交给两方。依赖是两个 ref 本身（稳定引用），
+  // 所以不会每次渲染都重设。
+  const setScroller = useCallback(
+    (el: HTMLDivElement | null) => {
+      scrollRef.current = el;
+      if (scrollerRef) scrollerRef.current = el;
+    },
+    [scrollRef, scrollerRef],
+  );
 
   // `items` is `session.items` — the same array instance for the whole session,
   // mutated in place (push / items[i] = x). React compares deps with Object.is,
@@ -434,7 +466,7 @@ export function ChatView({
 
   return (
     <div
-      ref={scrollRef}
+      ref={setScroller}
       className="flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-3"
     >
       {/* `structuralVersion` travels as a **prop**, not a `key`. `items` is the
@@ -451,6 +483,7 @@ export function ChatView({
         structuralVersion={structuralVersion}
         threadId={threadId}
         call={effectiveCall}
+        query={query}
       />
       {tail && (
         <LiveTail
@@ -458,6 +491,7 @@ export function ChatView({
           item={tail}
           threadId={threadId}
           call={effectiveCall}
+          query={query}
         />
       )}
       {retrying && (
