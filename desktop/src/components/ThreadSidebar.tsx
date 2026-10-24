@@ -8,6 +8,7 @@ import type {
   WorkspaceGroup,
 } from "../lib/protocol";
 import { layoutWorkspace } from "../lib/sessionGroups";
+
 import { basename, groupCount, nestLinkedGroups } from "../lib/workspaceGroups";
 import { kanbanItemFor } from "../lib/boardIndex";
 import { useSpinPhase } from "../lib/useSpinPhase";
@@ -277,9 +278,29 @@ export function ThreadSidebar({
       return next;
     });
   };
+  /** 判定「这是拖拽而不是点击」的位移阈值（CSS 像素）。 */
+  const DRAG_THRESHOLD_PX = 4;
   // 置顶分区内的拖拽：拖动中的 thread_id + 当前悬停的行下标。
   const [dragId, setDragId] = useState<string | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
+  /**
+   * 指针拖拽的起手：按在哪一行、按下点在哪。
+   *
+   * 为什么整块不用 HTML5 拖放（`draggable` + `dragstart`）：Tauri v2 默认开启
+   * `dragDropEnabled`，在 macOS 上给 WKWebView 装了原生拖放处理器，它对任何拖拽
+   * 都返回「已消费」且不再调 super，于是 WebKit 自己永远收不到落点——`dragstart`
+   * 照常触发，但 `dragover` / `drop` 一个都不派发，表现成「能拿起来、放不下去」。
+   * 关掉它又会丢掉「从访达拖路径进输入框」，故改走指针事件：不经过原生拖放会话。
+   */
+  const [dragOrigin, setDragOrigin] = useState<{
+    id: string;
+    kind: "group" | "pinned";
+    x: number;
+    y: number;
+    pointerId: number;
+  } | null>(null);
+  /** 是否已越过阈值（越过之后才是拖拽，之前仍算点击）。 */
+  const [dragActive, setDragActive] = useState(false);
   // Self-drawn menus: the top "New thread" dropdown and the per-group context
   // menu. A fixed transparent backdrop (rendered with each menu) closes them on
   // an outside click; the two are mutually exclusive.
@@ -299,9 +320,9 @@ export function ThreadSidebar({
   /**
    * 是否有修饰键（Cmd/Ctrl/Shift）正被按住。
    *
-   * 会话行改成整行可拖之后，原生拖拽会把「按下 + 轻微移动」当成拖拽起点，随后
-   * 不再派发 click——多选靠点击，一旦被吞就「点了三条只记到两条」。按下修饰键
-   * 时整行摘掉 `draggable`，点击语义回到加手势之前。
+   * 多选靠点击攒起来。拖拽若在按着修饰键时也能起手，「按下 + 轻微移动」就会
+   * 被当成拖拽起点、click 随之消失——「点了三条只记到两条」正是这条路。按下
+   * 修饰键时不起手拖拽，点击语义回到加手势之前。
    *
    * 用 `e.key` 判定而不是 `e.metaKey`：`keyup` 时 `metaKey` 已经为 false，
    * 读不到「刚才松开的是谁」。
@@ -514,9 +535,8 @@ export function ThreadSidebar({
    * 这样「把第一行拖到第二行」得到交换，而不是原地不动；拖到自己身上是 no-op。
    */
   const commitPinDrop = (index: number) => {
-    const from = pinned.findIndex((t) => t.thread_id === dragId);
-    setDragId(null);
-    setDropIndex(null);
+    const from = pinned.findIndex((t) => t.thread_id === dragOrigin?.id);
+    clearDrag();
     if (from < 0) return;
     const ids = pinned.map((t) => t.thread_id);
     const [moved] = ids.splice(from, 1);
@@ -526,35 +546,123 @@ export function ThreadSidebar({
   };
 
   // 拖动中的行下标：既用于指示线方向（向上/向下），也用于抑制"落在自己身上"的指示线。
-  const dragFromIndex = dragId === null ? -1 : pinned.findIndex((t) => t.thread_id === dragId);
+  const dragFromIndex =
+    dragOrigin?.kind !== "pinned" ? -1 : pinned.findIndex((t) => t.thread_id === dragOrigin.id);
 
   /**
    * 正在被拖动的会话（进/出组用），一批。
    *
-   * 与 `dragId`（置顶区重排）分开：那两个手势的落点语义完全不同——重排改的是
-   * 顺序，进组改的是成员表。共用一个状态会让「拖到组框上」被误判成一次重排。
-   *
-   * 存数组而不是单条：多选时拖任意一条 = 整批操作。payload 在 `dragstart`
-   * 时快照一次，拖拽途中不再变（否则拖过界时选择集被改，落点会跟着漂）。
+   * 存数组而不是单条：多选时拖任意一条 = 整批操作。payload 在越过阈值那一刻
+   * 快照一次，拖拽途中不再变（否则拖过界时选择集被改，落点会跟着漂）。
    */
   const [dragPayload, setDragPayload] = useState<string[] | null>(null);
   const [groupDropTarget, setGroupDropTarget] = useState<string | null>(null);
   /** 框外会话行作为「移出」落点时的悬停 id（画描边）。 */
   const [dropOverThread, setDropOverThread] = useState<string | null>(null);
 
-  /** 拖拽起手：在选择集里就带上整批，否则只带这一条。 */
-  const onGroupDragStart = (t: ThreadSummary) => {
-    setDragPayload(isSelected(t.thread_id) ? [...selected] : [t.thread_id]);
-  };
-
-  const clearGroupDrag = () => {
+  /** 复位所有拖拽态。松手、取消、提交三处都走它，避免漏掉一个状态。 */
+  function clearDrag() {
+    setDragOrigin(null);
+    setDragActive(false);
     setDragPayload(null);
     setGroupDropTarget(null);
     setDropOverThread(null);
-  };
+  }
 
   /** 该会话当前所在的组（多对多，取第一个；"拖出"只从它所在的框里移除）。 */
   const groupOf = (id: string) => groupsForThread(id)[0] ?? null;
+
+  /**
+   * 越过阈值：此刻才确定「拖的是哪一批」。
+   *
+   * 在选择集里就带上整批，否则只带这一条——用户拖了一条没选中的行，意图显然
+   * 只是这一条。置顶区拖拽只带自己（它是重排，不参与成组）。
+   */
+  const beginDragPayload = () => {
+    if (!dragOrigin) return;
+    if (dragOrigin.kind === "pinned") {
+      setDragId(dragOrigin.id);
+      return;
+    }
+    setDragPayload(isSelected(dragOrigin.id) ? [...selected] : [dragOrigin.id]);
+  };
+
+  /** 指针按下：记下起手行与按下点。是否成拖由 window 上的位移判定。 */
+  const onRowPointerDown = (id: string, kind: "group" | "pinned", e: React.PointerEvent) => {
+    // 只认主键。
+    if (e.button !== 0) return;
+    if (editingId === id) return;
+    // 进组拖拽按着修饰键时不起手：那时用户在点选，不是在拖。
+    // 置顶区不设这道门——那里拖拽就是重排，与多选不争同一个动作。
+    if (kind === "group" && (!dragEnabled || modifierDown)) return;
+    setDragOrigin({ id, kind, x: e.clientX, y: e.clientY, pointerId: e.pointerId });
+    setDragActive(false);
+  };
+
+  /**
+   * 松手时用的最新落点。
+   *
+   * window 上的 listener 只在起手时装一次（deps 是起手态），读不到后续 setState 的
+   * 新值；而落点正是在拖拽过程中被 pointerenter 不断更新的。用 ref 镜像一份，
+   * 保证「松手那一刻」读到的是当前落点，而不是起手时的快照。
+   */
+  const dropTargetRef = useRef({
+    groupDropTarget: null as string | null,
+    dropOverThread: null as string | null,
+    dropIndex: null as number | null,
+    payload: null as string[] | null,
+  });
+  dropTargetRef.current = { groupDropTarget, dropOverThread, dropIndex, payload: dragPayload };
+
+  // 位移判定与松手提交都挂在 window 上：拖拽中指针会离开起手行，甚至离开窗口。
+  useEffect(() => {
+    if (!dragOrigin) return;
+    const { x, y, pointerId, kind } = dragOrigin;
+
+    const onMove = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId || dragActive) return;
+      // 阈值：手抖一两像素仍是点击。整行可拖之后，「拖拽抢走点击」就是这条路。
+      if (Math.abs(e.clientX - x) < DRAG_THRESHOLD_PX && Math.abs(e.clientY - y) < DRAG_THRESHOLD_PX)
+        return;
+      setDragActive(true);
+      beginDragPayload();
+    };
+    const onUp = (e: PointerEvent) => {
+      if (e.pointerId !== pointerId) return;
+      // 没越过阈值 = 一次普通点击，什么都不提交（点击本身已由 onClick 处理）。
+      if (!dragActive) {
+        clearDrag();
+        return;
+      }
+      const drop = dropTargetRef.current;
+      if (kind === "pinned") {
+        if (drop.dropIndex !== null) commitPinDrop(drop.dropIndex);
+        else clearDrag();
+        return;
+      }
+      if (drop.groupDropTarget !== null) {
+        const group = groups
+          .flatMap((g) => (g.groups ?? []).map((x) => ({ workspace: g.workspace, group: x })))
+          .find((entry) => entry.group.id === drop.groupDropTarget);
+        if (group) dropIntoGroup(group.workspace, group.group);
+        else clearDrag();
+        return;
+      }
+      if (drop.dropOverThread !== null) {
+        dropOutOfGroup();
+        return;
+      }
+      clearDrag();
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [dragOrigin, dragActive]);
 
   /**
    * 拖到组框上：批量加入该组。
@@ -565,7 +673,7 @@ export function ThreadSidebar({
    */
   const dropIntoGroup = (workspace: string, group: SessionGroup) => {
     const ids = dragPayload;
-    clearGroupDrag();
+    clearDrag();
     if (!ids || ids.length === 0) return;
     const add = ids.filter(
       (id) => workspaceOfThread(id) === workspace && !group.threadIds.includes(id),
@@ -577,19 +685,20 @@ export function ThreadSidebar({
   /**
    * 拖到框外**会话行**上：批量移出。
    *
-   * 目标组 = `dragstart` 那一行所在的第一个组：多选跨越两个组时，从 A 组拖出来
-   * 只解散 A 组那批，B 组的成员不动——"拖出这个框"就是它字面的意思。
+   * 目标组 = 起手那一行所在的第一个组：多选跨越两个组时，从 A 组拖出来只解散
+   * A 组那批，B 组的成员不动——"拖出这个框"就是它字面的意思。
    *
    * 落点只看会话行，目录标题与空白处都不认（它们不是会话，当落点等于让用户猜）。
    * 落点是哪一行也不影响结果：顺序仍由 `updated_at` 决定，本次不做排序。
    */
   const dropOutOfGroup = () => {
     const ids = dragPayload;
-    clearGroupDrag();
-    if (!ids || ids.length === 0) return;
-    const current = groupOf(ids[0]);
+    const originId = dragOrigin?.id;
+    clearDrag();
+    if (!originId) return;
+    const current = groupOf(originId);
     if (!current) return;
-    const drop = new Set(ids.filter((id) => current.group.threadIds.includes(id)));
+    const drop = new Set((ids ?? [originId]).filter((id) => current.group.threadIds.includes(id)));
     if (drop.size === 0) return;
     void onSetGroupMembers(
       current.workspace,
@@ -720,24 +829,13 @@ export function ThreadSidebar({
         key={group.id}
         data-group-box={group.id}
         {...(groupDropTarget === group.id ? { "data-group-drop-active": "" } : {})}
-        onDragOver={(e) => {
-          if (dragPayload === null) return;
-          // 必须 preventDefault，否则浏览器不认这是合法落点、drop 不会触发。
-          e.preventDefault();
-          e.dataTransfer.dropEffect = "move";
+        onPointerEnter={() => {
+          // 只认「正在拖一条没在组里的会话」：其余情况（置顶重排、拖的是组内成员）
+          // 框不是落点，亮起来等于骗人。
+          if (!dragActive || dragOrigin?.kind !== "group" || dragPayload === null) return;
           setGroupDropTarget(group.id);
         }}
-        onDragLeave={(e) => {
-          // 只在真正离开这个框时清高亮：从框头移到框内的成员行也会派发 dragleave，
-          // 那时 relatedTarget 仍在框内，不该熄灯。
-          if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
-          setGroupDropTarget((cur) => (cur === group.id ? null : cur));
-        }}
-        onDrop={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          dropIntoGroup(workspace, group);
-        }}
+        onPointerLeave={() => setGroupDropTarget((cur) => (cur === group.id ? null : cur))}
         className={`mx-2 my-1 rounded-md border ${
           groupDropTarget === group.id
             ? "border-fg-subtle bg-raised/40 ring-1 ring-fg-subtle"
@@ -877,8 +975,7 @@ export function ThreadSidebar({
     const dragging = opts.rowAttr === "pinned";
     // 整行可拖：手柄几乎没人发现，而拖拽是「把会话放进框」最直觉的表达。
     // 按着修饰键时不拖——那时用户点的是多选，不是拖拽（见 `modifierDown`）。
-    const canDragIntoGroup =
-      opts.rowAttr === "group" && dragEnabled && !modifierDown && editingId !== t.thread_id;
+    const canDragIntoGroup = opts.rowAttr === "group" && dragEnabled;
     // 看板会话行多缩进一档（pl-7 vs pl-3）：折叠小节头是 ▸ 视觉起点，其下的
     // 会话若与直属行同一起点，就分不清谁属于谁。缩进让「小节头 → 卡片会话」的
     // 从属关系一眼可读。仅改左内边距，不影响拖拽/点击。
@@ -895,64 +992,38 @@ export function ThreadSidebar({
         key={t.thread_id}
         {...dataAttr}
         data-thread-row={t.thread_id}
-        // 置顶行整行拖拽 = 重排；普通行整行拖拽 = 进出分组（按修饰键时让位）。
-        draggable={dragging ? editingId !== t.thread_id : canDragIntoGroup}
-        onDragStart={
+        // 指针拖拽：按下先只记起点，越过 4px 阈值才算拖（否则仍是点击）。
+        onPointerDown={
           dragging
-            ? () => setDragId(t.thread_id)
+            ? (e) => onRowPointerDown(t.thread_id, "pinned", e)
             : canDragIntoGroup
-              ? () => onGroupDragStart(t)
+              ? (e) => onRowPointerDown(t.thread_id, "group", e)
               : undefined
         }
         {...(canAcceptGroupDrop && dropOverThread === t.thread_id
           ? { "data-group-drop-target": t.thread_id }
           : {})}
-        onDragOver={
-          // 置顶行：重排落点。其它行：移出分组的落点。两者互斥
-          // （`dragging` 与 `canAcceptGroupDrop` 不会同时为真）。
+        onPointerEnter={
+          // 置顶行：重排落点。其它行：移出分组的落点。两者互斥。
           dragging
-            ? (e) => {
-                if (dragId === null) return;
-                // 必须 preventDefault，否则浏览器不认这个落点（也不发 drop）。
-                e.preventDefault();
+            ? () => {
+                if (!dragActive) return;
                 setDropIndex(opts.dragIndex ?? null);
               }
             : canAcceptGroupDrop
-              ? (e) => {
+              ? () => {
                   // 拖着的东西压根不在任何组里时，哪儿都不是「移出」落点，
                   // 否则整片侧栏都会亮起来而松手无事发生。
-                  const ids = dragPayload;
-                  if (!ids || !groupOf(ids[0])) return;
-                  e.preventDefault();
-                  e.dataTransfer.dropEffect = "move";
+                  if (!dragOrigin || !groupOf(dragOrigin.id)) return;
                   setDropOverThread(t.thread_id);
                 }
               : undefined
         }
-        onDragLeave={
+        onPointerLeave={
           canAcceptGroupDrop
             ? () => setDropOverThread((cur) => (cur === t.thread_id ? null : cur))
             : undefined
         }
-        onDrop={
-          dragging
-            ? (e) => {
-                e.preventDefault();
-                commitPinDrop(opts.dragIndex ?? 0);
-              }
-            : canAcceptGroupDrop
-              ? (e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  dropOutOfGroup();
-                }
-              : undefined
-        }
-        onDragEnd={() => {
-          setDragId(null);
-          setDropIndex(null);
-          clearGroupDrag();
-        }}
         onClick={(e) => {
           if (editingId) return;
           // 多选：Ctrl/Cmd 切换单选，Shift 按当前行序区间选择。没有修饰键时
