@@ -557,9 +557,25 @@ export function ThreadSidebar({
    * 分支，Cmd+点它会直接 `onSelect` 跳走：用户以为选中了三条，实际只记到
    * 两条（现场报的「选了三个、按钮显示 2」）。
    */
+  /**
+   * 选择集里是否包含这条会话。
+   *
+   * 空集时把**当前打开的那条**算作已选：用户眼里的"前面那条会话"就是它，
+   * 第一次 Cmd+点别的会话时，那条也该一并进组——否则前台一条 + Cmd 点两条
+   * 只会得到 2，与用户数出来的 3 对不上。
+   *
+   * 这个规则只影响**显示与首次成集**，不往 state 里写：一旦用户自己动过选择
+   * （哪怕只点了一条），就以 `selected` 为准，前台那条也能被单独取消。
+   */
+  const isSelected = (id: string) =>
+    selected.size === 0 ? id === currentId : selected.has(id);
+
   function toggleSelected(id: string) {
     setSelected((prev) => {
+      // 空集 + 点的不是前台那条 → 先把前台那条收进来，再切换点击的这条。
+      // 这样"前台一条 + Cmd 点两条" = 3，且用户不必先补点一次前台。
       const next = new Set(prev);
+      if (prev.size === 0 && currentId !== null && currentId !== id) next.add(currentId);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
@@ -963,7 +979,7 @@ export function ThreadSidebar({
         }}
         className={`group relative flex items-center justify-between gap-1 ${indent} py-2 text-sm ${
           dragId === t.thread_id ? "opacity-50" : ""
-        } ${selected.has(t.thread_id) ? "bg-raised ring-1 ring-line-strong ring-inset" : ""} ${
+        } ${isSelected(t.thread_id) ? "bg-raised ring-1 ring-line-strong ring-inset" : ""} ${
           active ? "bg-raised text-fg" : "text-fg-muted hover:bg-raised/50"
         } cursor-pointer`}
       >
