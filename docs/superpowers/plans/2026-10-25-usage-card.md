@@ -374,6 +374,7 @@ describe("UsageCard", () => {
         })}
       />,
     );
+    // `getByText` 默认精确匹配，「主会话」与成本行的「（仅主会话）」是两个节点，不会撞。
     expect(screen.getByText("主会话")).toBeTruthy();
     expect(screen.getByText("Subagents")).toBeTruthy();
     expect(screen.getByText("500")).toBeTruthy();
@@ -406,7 +407,8 @@ describe("UsageCard", () => {
   it("omits the denominator when the context limit is unknown", () => {
     render(<UsageCard report={report({ context: { used: 12_345, limit: null } })} />);
     expect(screen.getByText("12,345")).toBeTruthy();
-    expect(screen.queryByText(/%/)).toBeNull();
+    // 用函数匹配器：字符串参数是字面量，`/%/` 永远匹配不到任何节点。
+    expect(screen.queryByText((t) => t.includes("%"))).toBeNull();
   });
 
   it("renders a cache write row when the data carries one", () => {
