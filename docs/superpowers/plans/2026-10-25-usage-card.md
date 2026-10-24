@@ -80,11 +80,11 @@ describe("buildUsageReport", () => {
     // 老服务端没有累计值：标题必须主动说明这是「一轮」，不能让人当成会话总量。
     expect(r.title).toBe("本轮用量");
     expect(r.session.isSnapshot).toBe(true);
+    // cache write 为 0 时同样不出行：这条规则与口径无关，快照分支也要遵守。
     expect(r.session.rows).toEqual([
       { label: "Input", value: 12_345 },
       { label: "Output", value: 678 },
       { label: "Cache read", value: 10_000 },
-      { label: "Cache write", value: 0 },
     ]);
   });
 

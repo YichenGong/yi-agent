@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatUsage } from "./usageCommand";
+import { buildUsageReport } from "./usageCommand";
 
 const base = {
   model: "claude-sonnet-4-20250514",
@@ -9,102 +9,89 @@ const base = {
   cacheWrite: 0,
 };
 
-describe("formatUsage", () => {
-  it("shows tokens, context occupancy and the estimated cost", () => {
-    const out = formatUsage(base, null, null, { compactThreshold: 160_000 });
-    expect(out).toContain("模型: claude-sonnet-4-20250514");
-    expect(out).toContain("input: 12,345  output: 678");
-    expect(out).toContain("cache read: 10,000  cache write: 0");
-    expect(out).toContain("上下文: 12,345 / 160,000 (7.7%)");
-    expect(out).toMatch(/估算成本: \$0\.\d{4}|估算成本: < \$0\.01/);
+const totals = { input: 1_234_567, output: 8_900, cacheRead: 2_000_000, cacheWrite: 60 };
+
+describe("buildUsageReport", () => {
+  it("reports the session's cumulative counters and names itself as such", () => {
+    const r = buildUsageReport(base, totals, null, { compactThreshold: 160_000 });
+    expect(r.title).toBe("Token 用量");
+    expect(r.model).toBe("claude-sonnet-4-20250514");
+    expect(r.session.isSnapshot).toBe(false);
+    expect(r.session.rows).toEqual([
+      { label: "Input", value: 1_234_567 },
+      { label: "Output", value: 8_900 },
+      { label: "Cache read", value: 2_000_000 },
+      { label: "Cache write", value: 60 },
+    ]);
   });
 
-  it("omits the percentage when the threshold is unknown", () => {
-    const out = formatUsage(base, null, null, { compactThreshold: null });
-    expect(out).toContain("上下文: 12,345");
-    expect(out).not.toContain("%");
-    expect(out).not.toContain("/");
+  it("omits the cache write row when it is zero", () => {
+    const r = buildUsageReport(base, { ...totals, cacheWrite: 0 }, null, {
+      compactThreshold: null,
+    });
+    expect(r.session.rows.map((x) => x.label)).toEqual(["Input", "Output", "Cache read"]);
   });
 
-  it("omits the percentage for a zero threshold instead of dividing by zero", () => {
-    const out = formatUsage(base, null, null, { compactThreshold: 0 });
-    expect(out).toContain("上下文: 12,345");
-    expect(out).not.toContain("%");
+  it("falls back to the snapshot and says so in the title", () => {
+    const r = buildUsageReport(base, null, null, { compactThreshold: null });
+    // 老服务端没有累计值：标题必须主动说明这是「一轮」，不能让人当成会话总量。
+    expect(r.title).toBe("本轮用量");
+    expect(r.session.isSnapshot).toBe(true);
+    // cache write 为 0 时同样不出行：这条规则与口径无关，快照分支也要遵守。
+    expect(r.session.rows).toEqual([
+      { label: "Input", value: 12_345 },
+      { label: "Output", value: 678 },
+      { label: "Cache read", value: 10_000 },
+    ]);
+  });
+
+  it("carries the context limit when it is known", () => {
+    const r = buildUsageReport(base, totals, null, { compactThreshold: 160_000 });
+    // 分子必须是快照：累计输入量与「当前上下文还剩多少」无关。
+    expect(r.context).toEqual({ used: 12_345, limit: 160_000 });
+  });
+
+  it("reports a null context limit for an unknown or zero threshold", () => {
+    expect(buildUsageReport(base, totals, null, { compactThreshold: null }).context).toEqual({
+      used: 12_345,
+      limit: null,
+    });
+    // 0 会让每一轮都触发压缩，不是真实上限，不能当分母。
+    expect(buildUsageReport(base, totals, null, { compactThreshold: 0 }).context).toEqual({
+      used: 12_345,
+      limit: null,
+    });
+  });
+
+  it("has no subagent group when there are none", () => {
+    expect(buildUsageReport(base, totals, null, { compactThreshold: null }).subagent).toBeNull();
+    expect(
+      buildUsageReport(base, totals, { input: 0, output: 0, cacheRead: 0 }, {
+        compactThreshold: null,
+      }).subagent,
+    ).toBeNull();
+  });
+
+  it("lists the three subagent counters", () => {
+    const r = buildUsageReport(base, totals, { input: 500, output: 60, cacheRead: 4_000 }, {
+      compactThreshold: null,
+    });
+    expect(r.subagent).toEqual([
+      { label: "Input", value: 500 },
+      { label: "Output", value: 60 },
+      { label: "Cache read", value: 4_000 },
+    ]);
+  });
+
+  it("estimates the cost from the cumulative counters", () => {
+    const r = buildUsageReport(base, totals, null, { compactThreshold: null });
+    expect(r.cost).toMatch(/^\$|^< \$/);
   });
 
   it("prints an em dash for an unpriced model rather than a fake zero", () => {
-    const out = formatUsage({ ...base, model: "some-local-llm" }, null, null, { compactThreshold: 1000 });
-    expect(out).toContain("估算成本: —");
-  });
-});
-
-describe("formatUsage with cumulative totals", () => {
-  const totals = { input: 1_234_567, output: 8_900, cacheRead: 2_000_000, cacheWrite: 60 };
-
-  it("prints the session's cumulative counters next to the snapshot", () => {
-    const out = formatUsage(base, totals, null, { compactThreshold: 160_000 });
-    expect(out).toContain("累计 input: 1,234,567  output: 8,900");
-    expect(out).toContain("累计 cache read: 2,000,000  cache write: 60");
-    // 上下文占用仍用**最后一次调用**的快照，累计值不能拿去算比例。
-    expect(out).toContain("上下文: 12,345 / 160,000 (7.7%)");
-  });
-
-  it("hides a zero cumulative cache write instead of showing a dead row", () => {
-    const out = formatUsage(base, { ...totals, cacheWrite: 0 }, null, { compactThreshold: null });
-    expect(out).toContain("累计 cache read: 2,000,000");
-    expect(out).not.toContain("cache write");
-  });
-
-  it("estimates cost from the cumulative counters", () => {
-    const out = formatUsage(base, totals, null, { compactThreshold: null });
-    const snapshotCost = formatUsage(base, base, null, { compactThreshold: null });
-    expect(out).not.toEqual(snapshotCost);
-    expect(out).toMatch(/估算成本: \$/);
-  });
-
-  it("prints an em dash when a cumulative-only model is unpriced", () => {
-    const out = formatUsage(
-      { ...base, model: "mystery" },
-      totals, null, { compactThreshold: null },
-    );
-    expect(out).toContain("估算成本: —");
-  });
-
-  it("falls back to the snapshot when the server sent no totals", () => {
-    const out = formatUsage(base, null, null, { compactThreshold: 160_000 });
-    expect(out).toContain("input: 12,345  output: 678");
-    expect(out).not.toContain("累计");
-  });
-});
-
-describe("formatUsage with subagents", () => {
-  const totals = { input: 1_234, output: 56, cacheRead: 7_890, cacheWrite: 0 };
-  const subagent = { input: 500, output: 60, cacheRead: 4_000 };
-
-  it("prints a separate subagent section", () => {
-    const out = formatUsage(base, totals, subagent, { compactThreshold: null });
-    expect(out).toContain("主会话 input: 1,234  output: 56");
-    expect(out).toContain("主会话 cache read: 7,890");
-    expect(out).toContain("subagent input: 500  output: 60");
-    expect(out).toContain("subagent cache read: 4,000");
-    expect(out).toContain("（主会话，不含 subagent）");
-  });
-
-  it("keeps the single-section format when there are no subagents", () => {
-    const out = formatUsage(base, totals, { input: 0, output: 0, cacheRead: 0 }, {
+    const r = buildUsageReport({ ...base, model: "mystery" }, totals, null, {
       compactThreshold: null,
     });
-    // 无 subagent 时既有文案逐字不变（含"累计"字样、不含"主会话"）。
-    // 这不是遗漏：改文案会连带改掉既有测试，且没有信息增益。
-    expect(out).toContain("累计 input: 1,234  output: 56");
-    expect(out).toContain("累计 cache read: 7,890");
-    expect(out).not.toContain("主会话");
-    expect(out).not.toContain("subagent");
-  });
-
-  it("treats a missing subagent total as none", () => {
-    const out = formatUsage(base, totals, null, { compactThreshold: null });
-    expect(out).not.toContain("subagent");
-    expect(out).toContain("累计 input: 1,234  output: 56");
+    expect(r.cost).toBe("—");
   });
 });
