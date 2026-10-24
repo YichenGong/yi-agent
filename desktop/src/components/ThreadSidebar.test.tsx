@@ -1731,6 +1731,66 @@ describe("会话分组框", () => {
     );
   });
 
+  it("先打开一条会话，再 Cmd 点另外两条，三條都算进选择集", async () => {
+    // 现场回归：会话 A 在前台（currentId），按住 Cmd 点 B、C，按钮却只显示
+    // 「新建组（2）」——A 虽是用户眼里的「当前这条」，却从没进过选择集。
+    // 期望是「前面那条 + Cmd 点到的两条」= 3。
+    const onCreateGroup = vi.fn().mockResolvedValue("g-new");
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          thread("a", "A", "/work/projA"),
+          thread("b", "B", "/work/projA"),
+          thread("c", "C", "/work/projA"),
+        ],
+      },
+    ];
+    renderSidebar({ groups: g, currentId: "a", onCreateGroup });
+
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 2 });
+
+    expect(screen.getByText("新建组（3）")).toBeTruthy();
+
+    fireEvent.click(screen.getByText("新建组（3）"));
+    const input = document.querySelector<HTMLInputElement>("[data-new-group-name]")!;
+    fireEvent.change(input, { target: { value: "登录模块" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(onCreateGroup).toHaveBeenCalled());
+    expect(onCreateGroup.mock.calls[0][3]).toEqual(["a", "b", "c"]);
+  });
+
+  it("前台会话自己也带上选中样式", async () => {
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+      },
+    ];
+    const { container } = renderSidebar({ groups: g, currentId: "a" });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 1 });
+    // 前端会话必须显得"被选中"，否则用户无从知道它会进组。
+    expect(container.querySelector('[data-thread-row="a"]')!.className).toContain("ring-inset");
+  });
+
+  it("再点一次前台会话自身把它移出选择集", async () => {
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+      },
+    ];
+    renderSidebar({ groups: g, currentId: "a" });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 1 });
+    expect(screen.getByText("新建组（2）")).toBeTruthy();
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 2 });
+    expect(screen.getByText("新建组（1）")).toBeTruthy();
+  });
+
   it("点击组名就地编辑，Enter 保存", async () => {
     const onUpdateGroup = vi.fn().mockResolvedValue(true);
     renderSidebar({ groups: boxGroups, onUpdateGroup });
