@@ -7,6 +7,7 @@ mod cache;
 mod config;
 mod manager;
 mod naming;
+pub mod reload;
 mod tool;
 
 use std::future::Future;
