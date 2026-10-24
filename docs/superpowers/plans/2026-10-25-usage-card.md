@@ -36,7 +36,7 @@
   - `function buildUsageReport(snapshot: Usage, totals: UsageTotals | null, subagent: SubagentTotals | null, opts: { compactThreshold: number | null }): UsageReport`
   - `NoticeBody` 第三变体 `{ kind: "usage"; report: UsageReport }`
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 把 `desktop/src/lib/usageCommand.test.ts` 整体替换为：
 
@@ -140,7 +140,7 @@ describe("buildUsageReport", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 cd desktop
@@ -150,7 +150,7 @@ npx vitest run src/lib/usageCommand.test.ts
 
 Expected: FAIL —— `buildUsageReport` 未导出。
 
-- [ ] **Step 3: 实现 `usageCommand.ts`**
+- [x] **Step 3: 实现 `usageCommand.ts`**
 
 整体替换文件内容：
 
@@ -254,7 +254,7 @@ export function buildUsageReport(
 }
 ```
 
-- [ ] **Step 4: 给 `NoticeBody` 加 `usage` 变体**
+- [x] **Step 4: 给 `NoticeBody` 加 `usage` 变体**
 
 在 `desktop/src/lib/session.ts` 中，`NoticeBody` 的联合类型加一项，并补文档：
 
@@ -281,7 +281,7 @@ import type { UsageReport } from "./usageCommand";
 > 注意：`session.ts` 与 `usageCommand.ts` 之间是**类型**依赖，用 `import type`，
 > 不产生运行时环（`usageCommand` 只依赖 `pricing` 与 `protocol`）。
 
-- [ ] **Step 5: 运行测试确认通过**
+- [x] **Step 5: 运行测试确认通过**
 
 ```bash
 cd desktop
@@ -292,7 +292,7 @@ npx tsc --noEmit
 
 Expected: 9 passed；tsc 无错误。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add desktop/src/lib/usageCommand.ts desktop/src/lib/usageCommand.test.ts desktop/src/lib/session.ts
@@ -311,7 +311,7 @@ git commit -m "refactor(desktop): /usage 产出结构化报告而非多行文本
 - Consumes: `UsageReport`、`UsageGroupRow`（Task 1）。
 - Produces: `function UsageCard({ report }: { report: UsageReport })`，根节点带 `data-testid="usage-card"`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `desktop/src/components/UsageCard.test.tsx`：
 
@@ -428,7 +428,7 @@ describe("UsageCard", () => {
 });
 ```
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 cd desktop
@@ -438,7 +438,7 @@ npx vitest run src/components/UsageCard.test.tsx
 
 Expected: FAIL —— 模块不存在。
 
-- [ ] **Step 3: 实现 `UsageCard.tsx`**
+- [x] **Step 3: 实现 `UsageCard.tsx`**
 
 ```tsx
 /**
@@ -526,7 +526,7 @@ export function UsageCard({ report }: { report: UsageReport }) {
 }
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 ```bash
 cd desktop
@@ -537,7 +537,7 @@ npx tsc --noEmit
 
 Expected: 8 passed；tsc 无错误。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add desktop/src/components/UsageCard.tsx desktop/src/components/UsageCard.test.tsx
@@ -557,7 +557,7 @@ git commit -m "feat(desktop): /usage 输出改为卡片"
 - Consumes: `UsageCard`（Task 2）、`buildUsageReport`（Task 1）、`NoticeBody` 的 `usage` 变体（Task 1）。
 - Produces: 用户可见的 `/usage` 卡片；无新增导出。
 
-- [ ] **Step 1: 写失败测试（ChatView 分派）**
+- [x] **Step 1: 写失败测试（ChatView 分派）**
 
 在 `desktop/src/components/ChatView.test.tsx` 里补一条用例（放在既有 config/help 卡片用例旁边，沿用该文件已有的渲染辅助函数 —— 先读文件确认辅助函数名，例如 `renderChat(...)` 或直接 `render(<ChatView .../>)`，**照抄同文件里现有卡片用例的写法**）：
 
@@ -588,7 +588,7 @@ it("renders a usage card for a usage notice body", () => {
 > 若该文件没有 `renderNotice` 这类辅助，就用文件里现成的 items 注入方式
 > （构造 `ChatView` 所需的 `items` prop）。**以文件实际写法为准，不要新造辅助。**
 
-- [ ] **Step 2: 运行测试确认失败**
+- [x] **Step 2: 运行测试确认失败**
 
 ```bash
 cd desktop
@@ -598,7 +598,7 @@ npx vitest run src/components/ChatView.test.tsx
 
 Expected: FAIL —— `usage-card` 未渲染（落到普通胶囊分支）。
 
-- [ ] **Step 3: 在 `ChatView` 加分派**
+- [x] **Step 3: 在 `ChatView` 加分派**
 
 把 `desktop/src/components/ChatView.tsx` 里 notice 的三元链改成带 `usage` 的版本：
 
@@ -620,7 +620,7 @@ Expected: FAIL —— `usage-card` 未渲染（落到普通胶囊分支）。
 import { UsageCard } from "./UsageCard";
 ```
 
-- [ ] **Step 4: 运行测试确认通过**
+- [x] **Step 4: 运行测试确认通过**
 
 ```bash
 cd desktop
@@ -630,7 +630,7 @@ npx vitest run src/components/ChatView.test.tsx
 
 Expected: PASS（含新用例）。
 
-- [ ] **Step 5: 写失败测试（App 调用点）**
+- [x] **Step 5: 写失败测试（App 调用点）**
 
 在 `desktop/src/App.test.tsx` 找到既有断言 `/usage` 文本输出的用例（搜索 `累计 input` 或 `formatUsage` 或 `"模型: "`），把它改为断言卡片：
 
@@ -643,7 +643,7 @@ Expected: PASS（含新用例）。
 
 **先读该用例的原有断言再改**：只替换与「文本内容」相关的部分，保留它原有的 RPC mock 与等待逻辑。
 
-- [ ] **Step 6: 改 `App` 的 `/usage` 分支**
+- [x] **Step 6: 改 `App` 的 `/usage` 分支**
 
 `desktop/src/App.tsx` 里 `case "usage"` 的末尾：
 
@@ -667,7 +667,7 @@ import { buildUsageReport } from "./lib/usageCommand";
 
 （原来导入的是 `formatUsage`，**删掉它**，不要留未使用的导入。）
 
-- [ ] **Step 7: 运行测试确认通过**
+- [x] **Step 7: 运行测试确认通过**
 
 ```bash
 cd desktop
@@ -678,7 +678,7 @@ npx tsc --noEmit
 
 Expected: 全绿；tsc 无错误。
 
-- [ ] **Step 8: 提交**
+- [x] **Step 8: 提交**
 
 ```bash
 git add desktop/src/App.tsx desktop/src/App.test.tsx desktop/src/components/ChatView.tsx desktop/src/components/ChatView.test.tsx
@@ -693,7 +693,7 @@ git commit -m "feat(desktop): /usage 走 noticeBody 渲染卡片"
 - Modify: `docs/project-management/desktop.md`
 - Modify: `docs/project-management/README.md`（计数）
 
-- [ ] **Step 1: 全量测试**
+- [x] **Step 1: 全量测试**
 
 ```bash
 cd desktop
@@ -704,7 +704,7 @@ npx vitest run
 
 Expected: 全绿，无失败文件。
 
-- [ ] **Step 2: 确认没有残留的 `formatUsage`**
+- [x] **Step 2: 确认没有残留的 `formatUsage`**
 
 ```bash
 grep -rn "formatUsage" desktop/src || echo "NO_LEFTOVER"
@@ -712,7 +712,7 @@ grep -rn "formatUsage" desktop/src || echo "NO_LEFTOVER"
 
 Expected: `NO_LEFTOVER`（文本版本已随 Task 1 删除，调用点随 Task 3 迁移）。
 
-- [ ] **Step 3: 登记到 `desktop.md`**
+- [x] **Step 3: 登记到 `desktop.md`**
 
 在 `docs/project-management/desktop.md` 的 Features 列表里，"`/usage` 取代 `/cost`" 那条之后，追加一条 `[x]`：
 
@@ -720,7 +720,7 @@ Expected: `NO_LEFTOVER`（文本版本已随 Task 1 删除，调用点随 Task 3
 - [x] `/usage` 输出改为卡片格式 — 用户报「/usage 出来的内容实在是有点难看」。根因是**排版坏了而非审美问题**：`formatUsage` 产出用 `\n` 连接的 6–7 行文本，而 notice 胶囊容器（`desktop/src/components/ChatView.tsx` 的 `notice` 分支）只有 `my-1 self-center rounded-md bg-raised/60 px-3 py-1 text-xs text-fg-muted`、**没有 `whitespace-pre-wrap`**，HTML 折叠换行后六行压成一行居中灰字（行内双空格同样被折叠）；`/config` 与 `/help` 早已通过 `NoticeBody` 走结构化卡片，`/usage` 是三个多行命令里唯一漏掉的。修复沿用同一机制：`NoticeBody` 增加第三变体 `{ kind: "usage"; report: UsageReport }`（`desktop/src/lib/session.ts`）；`usageCommand.ts` 的 `formatUsage`（拼字符串）改为 `buildUsageReport`（产出结构：title / model / context / session.rows / subagent / cost，千分位与百分比交给渲染层，数据层不替渲染层拼句子）；新增 `desktop/src/components/UsageCard.tsx`（外壳与 `ConfigCard` 逐字节同款 `my-2 self-stretch rounded-lg border border-line-strong bg-surface px-3 py-2 text-sm`，标签列 `w-24` / 值列 `min-w-0 break-all`）；`ChatView` 按 `kind` 分派；`App` 的 `case "usage"` 改走 `session.noticeBody`。呈现规则：有累计值标题为 `Token 用量`、无累计值（老服务端）为 `本轮用量`（卡片有标题位正好主动说明是一轮而非总账）；`cacheWrite === 0` 不出该行；有 subagent 时出现 `主会话` / `Subagents` 两个分组标题且成本行追加「（仅主会话）」（子任务跑在独立 daemon 进程里、模型名没随用量上报，不标注会被读成合计），subagent 全零或缺失时两个标题都不出（无对照对象时「主会话」是空指涉）；`compactThreshold` 未知或为 0 时上下文只显示已用值，无分母无百分比。**不做进度条**：`/usage` 是按需查看而非常驻监控，项目里也还没有进度条组件。文本版本删除、只留结构化报告（唯一调用点是 App，留两套渲染必然漂移）。判据：`cd desktop && npx tsc --noEmit && npx vitest run`（全绿，含 `UsageCard.test.tsx` 8 例与 `buildUsageReport` 9 例）；`grep -rn formatUsage desktop/src` 无输出 — [设计](../superpowers/specs/2026-10-25-usage-card-design.md)、[计划](../superpowers/plans/2026-10-25-usage-card.md)
 ```
 
-- [ ] **Step 4: 更新 README 计数**
+- [x] **Step 4: 更新 README 计数**
 
 ```bash
 cd /Users/gongyichen/Documents/TechnicalStuff/projects/personalProjects/yi-agent/.worktrees/usage-card
@@ -730,7 +730,7 @@ grep -c '^- \[' docs/project-management/desktop.md
 
 用这两个实测值更新 `docs/project-management/README.md` 的 desktop 行（格式 `| desktop | <x> / <total> | [详情](./desktop.md) |`）。
 
-- [ ] **Step 5: 勾选本计划的复选框并提交**
+- [x] **Step 5: 勾选本计划的复选框并提交**
 
 ```bash
 sed -i '' 's/^- \[ \] \*\*Step/- [x] **Step/' docs/superpowers/plans/2026-10-25-usage-card.md
