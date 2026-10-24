@@ -4059,6 +4059,7 @@ mod tests {
                     is_root: true,
                     parent_task_id: None,
                     thread_id: None,
+                    usage: Default::default(),
                 },
                 yi_agent_store::ipc::IpcTaskSummary {
                     task_id: "child".into(),
@@ -4066,6 +4067,7 @@ mod tests {
                     is_root: false,
                     parent_task_id: Some("root".into()),
                     thread_id: None,
+                    usage: Default::default(),
                 },
             ],
             Some("root"),
@@ -4087,6 +4089,7 @@ mod tests {
                 is_root: true,
                 parent_task_id: None,
                 thread_id: None,
+                usage: Default::default(),
             }],
             None,
             "暂无任务",
