@@ -32,12 +32,6 @@ pub const SESSION_GROUPS_FLAG: &str = "session_groups";
 /// `yi-agent-supervisors::supervisor::Supervisor::desired_on` 的注释。
 pub const SUPERPOWERS_KANBAN_FLAG: &str = "superpowers_kanban";
 
-/// 会话内搜索（Cmd+F）的总开关。
-///
-/// 纯前端能力：服务端没有任何行为要拦，所以没有对应的 gate 模块。
-/// 关掉时前端不注册 Cmd+F 监听、实验页之外也看不到任何搜索 UI。
-pub const SESSION_SEARCH_FLAG: &str = "session_search";
-
 pub const REGISTRY: &[FlagDef] = &[
     FlagDef {
         name: LEAD_AGENT_FLAG,
@@ -58,13 +52,6 @@ pub const REGISTRY: &[FlagDef] = &[
         summary: "Superpowers 看板：项目级看板、卡片会话与后台值守",
         owner: "yichen",
         expires_on: "2027-03-31",
-        default: false,
-    },
-    FlagDef {
-        name: SESSION_SEARCH_FLAG,
-        summary: "会话内搜索：Cmd+F 在转录里查找文本",
-        owner: "yichen",
-        expires_on: "2027-04-30",
         default: false,
     },
 ];
@@ -175,20 +162,14 @@ mod tests {
     }
 
     #[test]
-    fn the_session_search_flag_is_registered() {
-        let def = find("session_search").expect("session_search must be in the registry");
-        assert!(!def.default, "session search must default to off");
+    fn session_search_is_not_a_flag() {
+        // 会话内搜索已转为常开功能，前端无条件注册 Cmd+F。这里守住"别再给它
+        // 加闸门"：若有人重新登记，前端不会读它，注册表反而会误导用户在实验
+        // 页拨一个无效开关。
         assert!(
-            !def.summary.is_empty(),
-            "a summary is what the settings page shows"
+            find("session_search").is_none(),
+            "session search is always on; do not register it as a flag"
         );
-        assert_eq!(def.expires_on, "2027-04-30");
-    }
-
-    #[test]
-    fn the_session_search_flag_name_matches_its_constant() {
-        assert_eq!(SESSION_SEARCH_FLAG, "session_search");
-        assert!(find(SESSION_SEARCH_FLAG).is_some());
     }
 
     #[test]

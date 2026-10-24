@@ -1,5 +1,11 @@
 # 会话内搜索（Cmd+F）实现计划
 
+> **后续变更（2026-10-25）**：本设计初稿把搜索放在 `session_search` flag 后面，
+> 现已按用户要求去掉该 flag，功能转为**常开**：`yi-agent-flags` 注册表不再有这一
+> 项，前端无条件注册 Cmd+F 并 `preventDefault()`。下文提到 flag 门控的段落仅作
+> 设计沿革保留，实际行为以本节为准。
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让桌面端用户在一个会话内按 Cmd+F 就地查找文本，并用 `session_search` flag 在开发版设置页的实验功能 Tab 里开关。
