@@ -675,6 +675,39 @@ describe("ChatView remembers the reading position", () => {
     expect(last?.[1]).toEqual({ itemId: "tc1", offset: -200 });
   });
 
+  it("does not overwrite a thread's position while its content is still loading", async () => {
+    // 切到一条还没加载的会话时 DOM 里没有任何消息；此时若上报 `null`，就等于把
+    // 它原来的阅读位置抹成「贴底」，用户再回来时永远落在底部。
+    const seen: Array<[string, unknown]> = [];
+    const list = items();
+    const { container, rerender } = render(
+      <ChatView items={list} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installLayout(scroller, [12, 112, 212]);
+    state.scrollTop = 1200;
+    fireEvent.scroll(scroller);
+    await settle();
+
+    rerender(<ChatView items={[]} threadId="t2" onRememberView={(id, a) => seen.push([id, a])} />);
+    await settle();
+    expect(seen.filter(([id]) => id === "t2")).toEqual([]);
+  });
+
+  it("anchors the first message when the user scrolls to the very top", async () => {
+    // 容器有 `py-3`：最顶时首条消息在 +12，旧逻辑返回 null（被当成贴底）。
+    const seen: Array<[string, unknown]> = [];
+    const { container } = render(
+      <ChatView items={items()} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installLayout(scroller, [12, 112, 212]);
+    state.scrollTop = 0;
+    fireEvent.scroll(scroller);
+    await settle();
+    expect(seen[seen.length - 1][1]).toEqual({ itemId: "u1", offset: 12 });
+  });
+
   it("reports null when the user is at the bottom", async () => {
     const seen: Array<[string, unknown]> = [];
     const { container } = render(
@@ -829,6 +862,62 @@ describe("ChatView auto-scroll", () => {
     rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
     // 800 - (-100) = 900
     expect(state.scrollTop).toBe(900);
+  });
+
+  it("waits for the transcript before restoring, then anchors the message", () => {
+    // 冷会话：切过去的瞬间内容还没到（resume 尚未回包）。此时不能把恢复"用掉"，
+    // 否则回包后永远不再对位，用户被留在底部。内容到达时节点是新建的，所以这里
+    // 用原型级布局桩，让后建的节点也能量到位置。
+    const tops: Record<string, number> = { u1: 0, tc1: 800, a1: 1600 };
+    const state = { scrollTop: 0 };
+    let scroller: HTMLElement | null = null;
+    const rect = (top: number) =>
+      ({ top, left: 0, bottom: top, right: 0, width: 0, height: 0, x: 0, y: top, toJSON() {} }) as DOMRect;
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    const saved = {
+      rect: proto.getBoundingClientRect,
+      scrollHeight: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight"),
+      clientHeight: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight"),
+      scrollTop: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop"),
+    };
+    proto.getBoundingClientRect = function (this: HTMLElement) {
+      if (this === scroller) return rect(0);
+      return rect((tops[this.dataset.itemId ?? ""] ?? 0) - state.scrollTop);
+    };
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? 3000 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? 400 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? state.scrollTop : 0; },
+      set(this: HTMLElement, v: number) { if (this === scroller) state.scrollTop = v; },
+    });
+
+    try {
+      const list = items();
+      const { container, rerender } = render(<ChatView items={list} threadId="t2" />);
+      scroller = container.firstElementChild as HTMLElement;
+
+      // 切到 t1，但内容还是空的。
+      rerender(<ChatView items={[]} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
+      // 内容到达：必须补上恢复（800 - (-100) = 900）。
+      rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
+      expect(state.scrollTop).toBe(900);
+    } finally {
+      proto.getBoundingClientRect = saved.rect;
+      for (const [name, desc] of [
+        ["scrollHeight", saved.scrollHeight],
+        ["clientHeight", saved.clientHeight],
+        ["scrollTop", saved.scrollTop],
+      ] as const) {
+        if (desc) Object.defineProperty(HTMLElement.prototype, name, desc);
+      }
+    }
   });
 
   it("falls back to the bottom when the anchored message is gone", () => {

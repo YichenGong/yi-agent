@@ -36,13 +36,20 @@ export function isAnchorableId(id: string | undefined): id is string {
  */
 export function findAnchor(boxes: ItemBox[], scrollTop: number): ViewAnchor | null {
   let best: ItemBox | null = null;
+  // 没有任何一条「顶边已在视口顶之上」时的退路：视口里最靠上的那条。
+  // 典型情形是滚到最顶——滚动容器带 `py-3`（12px）内边距，首条消息的内容坐标
+  // 是 +12，若此时返回 `null`，宿主会把它读成「贴底」，切回来就跳到底部，
+  // 与用户「正在读最老的那条」的意图正好相反。
+  let first: ItemBox | null = null;
   for (const box of boxes) {
     if (!isAnchorableId(box.id)) continue;
+    if (first === null || box.top < first.top) first = box;
     if (box.top > scrollTop + 1) continue;
     if (best === null || box.top >= best.top) best = box;
   }
-  if (best === null) return null;
-  return { itemId: best.id, offset: best.top - scrollTop };
+  const chosen = best ?? first;
+  if (chosen === null) return null;
+  return { itemId: chosen.id, offset: chosen.top - scrollTop };
 }
 
 /**

@@ -36,9 +36,19 @@ describe("findAnchor", () => {
     expect(got).toEqual({ itemId: "item-a", offset: -150 });
   });
 
-  it("returns null when nothing is above the viewport top", () => {
-    expect(findAnchor(boxes({ "item-a": 400 }), 100)).toBeNull();
+  it("anchors the first message when the user is at the very top", () => {
+    // 滚动容器有 `py-3`（12px）内边距：滚到最顶时首条消息的内容坐标是 +12，
+    // 没有任何一条「顶边在视口顶之上」。此时必须锚住首条（正偏移），
+    // 否则返回 null 会被宿主当成「贴底」，切回来直接跳到底部。
+    expect(findAnchor(boxes({ "item-a": 12, "item-b": 112, "item-c": 212 }), 0)).toEqual({
+      itemId: "item-a",
+      offset: 12,
+    });
+  });
+
+  it("returns null only when there is nothing anchorable to remember", () => {
     expect(findAnchor([], 0)).toBeNull();
+    expect(findAnchor(boxes({ "local-1": 0 }), 50)).toBeNull();
   });
 });
 
