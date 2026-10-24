@@ -975,8 +975,8 @@ describe("ThreadSidebar pinned section", () => {
     const { container } = renderSidebar({ groups: dragGroups, onReorderPinned });
     const rows = container.querySelectorAll<HTMLElement>("[data-group-row]");
     expect(rows.length).toBeGreaterThan(1);
-    // 拖拽源是行尾手柄，不是整行：整行 draggable 会吞掉 click。
-    expect(Array.from(rows).every((r) => r.getAttribute("draggable") !== "true")).toBe(true);
+    // 整行可拖（进/出组的手势），但落到另一行上不会触发置顶重排。
+    expect(Array.from(rows).every((r) => r.getAttribute("draggable") === "true")).toBe(true);
 
     fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn() } });
     fireEvent.drop(rows[1], { dataTransfer: {} });
@@ -1987,7 +1987,7 @@ describe("多选：连击不能吞掉第二次 Cmd 点击", () => {
   });
 });
 
-describe("组框：加入会话入口", () => {
+describe("组框：加入会话只走拖拽", () => {
   const base: WorkspaceGroup[] = [
     {
       workspace: "/work/projA",
@@ -2001,24 +2001,13 @@ describe("组框：加入会话入口", () => {
     },
   ];
 
-  it("组框头列出未归组会话，点击即调用 setMembers 追加", async () => {
-    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
-    renderSidebar({ groups: base, onSetGroupMembers });
-
-    fireEvent.click(screen.getByLabelText("向 登录模块 加入会话"));
-    expect(document.querySelector('[data-add-candidate="c"]')).toBeTruthy();
-    fireEvent.click(document.querySelector<HTMLElement>('[data-add-candidate="c"]')!);
-
-    await waitFor(() =>
-      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "b", "c"]),
-    );
-  });
-
-  it("已在组内的会话不出现在候选里", () => {
-    renderSidebar({ groups: base });
-    fireEvent.click(screen.getByLabelText("向 登录模块 加入会话"));
-    expect(document.querySelector('[data-add-candidate="a"]')).toBeNull();
-    expect(document.querySelector('[data-add-candidate="b"]')).toBeNull();
+  it("组框头不再有「+」按钮与候选列表", () => {
+    // 「+」把「把会话放进组」表达成一次菜单选择，实测不直观；拖拽才是用户
+    // 脑子里的那个动作。同一件事只留一个入口。
+    const { container } = renderSidebar({ groups: base });
+    expect(container.querySelector("[data-group-add]")).toBeNull();
+    expect(container.querySelector("[data-group-add-picker]")).toBeNull();
+    expect(container.querySelector("[data-add-candidate]")).toBeNull();
   });
 
   it("组框头显示成员数", () => {
@@ -2076,39 +2065,143 @@ describe("拖动会话进组", () => {
     },
   ];
 
-  it("把框外会话拖到组框上即加入该组", async () => {
+  it("拖动一条未选中的行到组框只加这一条", async () => {
     const onSetGroupMembers = vi.fn().mockResolvedValue(true);
     const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
-
-    const row = container.querySelector<HTMLElement>('[data-drag-handle="c"]')!;
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
     const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
     fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn(), effectAllowed: "" } });
     fireEvent.dragOver(box, { dataTransfer: { dropEffect: "" } });
     fireEvent.drop(box, { dataTransfer: { getData: () => "c" } });
-
     await waitFor(() =>
       expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "c"]),
     );
   });
 
-  it("框内会员拖回框外空白处即移出该组", async () => {
+  it("选中三条后拖其中一条进组，整批三条一起加，已在组内的跳过", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
+    // `dragBase` 里 a 已在 g1 内，折叠态下该行不渲染，先展开。
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+    fireEvent.keyUp(document, { key: "Meta" });
+
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
+    fireEvent.drop(box, { dataTransfer: { getData: () => "c" } });
+    // a 已在组里 → 跳过；b、c 追加，顺序 = 组内既有 + 新追加。
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "b", "c"]),
+    );
+  });
+
+  it("三条都在组内时拖其中一条到框外会话行，三条一起移出", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const three: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          thread("a", "A", "/work/projA"),
+          thread("b", "B", "/work/projA"),
+          thread("c", "C", "/work/projA"),
+          thread("d", "D", "/work/projA"),
+        ],
+        groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a", "b", "c"] }],
+      },
+    ];
+    const { container } = renderSidebar({ groups: three, onSetGroupMembers });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+    fireEvent.keyUp(document, { key: "Meta" });
+
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="d"]')!;
+    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
+    fireEvent.dragOver(outside, { dataTransfer: { dropEffect: "" } });
+    fireEvent.drop(outside, { dataTransfer: { getData: () => "a" } });
+    await waitFor(() => expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", []));
+  });
+
+  it("多选跨两个组时，从 A 组拖出只解散 A 组那批", async () => {
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const two: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          thread("a", "A", "/work/projA"),
+          thread("b", "B", "/work/projA"),
+          thread("c", "C", "/work/projA"),
+          thread("d", "D", "/work/projA"),
+          thread("e", "E", "/work/projA"),
+        ],
+        groups: [
+          { id: "g1", name: "登录模块", description: "", threadIds: ["a", "b"] },
+          { id: "g2", name: "支付模块", description: "", threadIds: ["c", "d"] },
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: two, onSetGroupMembers });
+    // 两个组的成员都折在框里，先展开才能点到那两行。
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByLabelText("展开分组 支付模块"));
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 2 });
+    fireEvent.keyUp(document, { key: "Meta" });
+
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="e"]')!;
+    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
+    fireEvent.drop(outside, { dataTransfer: { getData: () => "a" } });
+    // 只有 g1 被写；g2 一动不动。
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["b"]),
+    );
+    expect(onSetGroupMembers).toHaveBeenCalledTimes(1);
+  });
+
+  it("拖到目录标题上不触发移出（目录标题不是落点）", async () => {
     const onSetGroupMembers = vi.fn().mockResolvedValue(true);
     const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
     fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
-
-    const row = container.querySelector<HTMLElement>('[data-drag-handle="a"]')!;
-    const ws = container.querySelector<HTMLElement>('[data-ws-header="/work/projA"]')!;
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const header = container.querySelector<HTMLElement>('[data-ws-header="/work/projA"]')!;
     fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
-    fireEvent.drop(ws, { dataTransfer: { getData: () => "a" } });
+    fireEvent.dragOver(header, { dataTransfer: { dropEffect: "" } });
+    fireEvent.drop(header, { dataTransfer: { getData: () => "a" } });
+    expect(onSetGroupMembers).not.toHaveBeenCalled();
+  });
 
-    await waitFor(() =>
-      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", []),
-    );
+  it("拖到框外会话行上时该行高亮", () => {
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
+    fireEvent.dragOver(outside, { dataTransfer: { dropEffect: "" } });
+    expect(container.querySelector('[data-group-drop-target="c"]')).toBeTruthy();
+  });
+
+  it("离开落点后高亮熄灭", () => {
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
+    fireEvent.dragOver(outside, { dataTransfer: { dropEffect: "" } });
+    fireEvent.dragEnd(row, { dataTransfer: { setData: vi.fn() } });
+    expect(container.querySelector("[data-group-drop-target]")).toBeNull();
   });
 
   it("拖到组框上时高亮该框", () => {
     const { container } = renderSidebar({ groups: dragBase });
-    const row = container.querySelector<HTMLElement>('[data-drag-handle="c"]')!;
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
     const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
     fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
     fireEvent.dragOver(box, { dataTransfer: {} });
