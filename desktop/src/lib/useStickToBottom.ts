@@ -33,6 +33,13 @@ export interface StickToBottom {
    * 必须用这个：每个 delta 都强制贴底会让用户永远读不到上面的内容。
    */
   followIfAtBottom: () => void;
+  /**
+   * 放弃跟随，但**不动视口**。
+   *
+   * 用于"恢复阅读位置"：调用方刚把 `scrollTop` 设到锚点，此刻若仍保持贴底意图，
+   * 下一个 delta 就会把人拽回底部。与 `scrollToBottom` 的区别正是它不移动元素。
+   */
+  releaseFollow: () => void;
 }
 
 /**
@@ -81,6 +88,10 @@ export function useStickToBottom(): StickToBottom {
     const el = ref.current;
     if (!el || !atBottomRef.current) return;
     el.scrollTop = el.scrollHeight;
+  }, []);
+
+  const releaseFollow = useCallback(() => {
+    atBottomRef.current = false;
   }, []);
 
   useEffect(() => {
@@ -134,5 +145,5 @@ export function useStickToBottom(): StickToBottom {
     };
   }, []);
 
-  return { ref, scrollToBottom, followIfAtBottom };
+  return { ref, scrollToBottom, followIfAtBottom, releaseFollow };
 }

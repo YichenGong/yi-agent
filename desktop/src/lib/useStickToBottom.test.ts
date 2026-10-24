@@ -35,7 +35,11 @@ const flushRaf = () => {
   cbs.forEach((cb) => cb(0));
 };
 
-let api: { scrollToBottom: () => void; followIfAtBottom: () => void } | null = null;
+let api: {
+  scrollToBottom: () => void;
+  followIfAtBottom: () => void;
+  releaseFollow: () => void;
+} | null = null;
 
 beforeEach(() => {
   observers = [];
@@ -61,8 +65,12 @@ afterEach(() => {
 function Harness() {
   const stick = useStickToBottom();
   useEffect(() => {
-    api = { scrollToBottom: stick.scrollToBottom, followIfAtBottom: stick.followIfAtBottom };
-  }, [stick.scrollToBottom, stick.followIfAtBottom]);
+    api = {
+      scrollToBottom: stick.scrollToBottom,
+      followIfAtBottom: stick.followIfAtBottom,
+      releaseFollow: stick.releaseFollow,
+    };
+  }, [stick.scrollToBottom, stick.followIfAtBottom, stick.releaseFollow]);
   return createElement("div", { ref: stick.ref, "data-testid": "scroller" }, "x");
 }
 
@@ -239,6 +247,19 @@ describe("useStickToBottom", () => {
     fireResize(400); // same height again: not a change
     expect(rafCallbacks.size).toBe(0);
     expect(state.scrollTop).toBe(600);
+  });
+
+  it("releases follow without moving the viewport", () => {
+    // 恢复阅读位置后必须放弃跟随，否则下一个 delta 会把人拽回底部；
+    // 但它不能自己动视口——位置由调用方刚设好。
+    const { getByTestId } = render(createElement(Harness));
+    const el = getByTestId("scroller");
+    const state = installMetrics(el, { scrollHeight: 1000, clientHeight: 400, scrollTop: 500 });
+    fireEvent.scroll(el);
+    act(() => api!.releaseFollow());
+    state.scrollHeight = 2000;
+    act(() => api!.followIfAtBottom());
+    expect(state.scrollTop).toBe(500);
   });
 
   it("degrades gracefully when ResizeObserver is unavailable", () => {

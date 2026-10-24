@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, cleanup, screen, fireEvent, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import { render, cleanup, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import type { Item } from "../lib/protocol";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { Session } from "../lib/session";
@@ -576,6 +576,111 @@ describe("ChatView tail handover", () => {
   });
 });
 
+describe("ChatView item ids", () => {
+  it("tags every message with its protocol id so a reading position can be anchored", () => {
+    const list = items();
+    const { container } = render(<ChatView items={list} threadId="t1" />);
+    const ids = Array.from(container.querySelectorAll("[data-item-id]")).map(
+      (el) => el.getAttribute("data-item-id"),
+    );
+    expect(ids).toEqual(list.map((it) => it.id));
+  });
+
+  it("keeps the message's own alignment when wrapping it for the id", () => {
+    // `display: contents` 让包裹层不生成盒子，子元素仍直接参与滚动容器的
+    // flex 布局；否则用户气泡的内缩/右对齐会被一层普通 div 破坏。
+    const { container } = render(<ChatView items={items()} threadId="t1" />);
+    const first = container.querySelector("[data-item-id]") as HTMLElement;
+    expect(first.className).toContain("contents");
+  });
+});
+
+describe("ChatView remembers the reading position", () => {
+  // 采集是 rAF 节流的；把它换成 setTimeout 让测试能确定地等到回调跑完。
+  beforeEach(() => {
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => setTimeout(() => cb(0), 0));
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => clearTimeout(id));
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** jsdom 没有布局：给滚动容器与每条消息装上可读的位置度量。 */
+  function installLayout(scroller: HTMLElement, tops: number[], scrollHeight = 3000) {
+    const state = { scrollTop: 0 };
+    Object.defineProperty(scroller, "scrollHeight", { configurable: true, get: () => scrollHeight });
+    Object.defineProperty(scroller, "clientHeight", { configurable: true, get: () => 600 });
+    Object.defineProperty(scroller, "scrollTop", {
+      configurable: true,
+      get: () => state.scrollTop,
+      set: (v: number) => {
+        state.scrollTop = v;
+      },
+    });
+    const rect = (top: number, height = 0) =>
+      ({ top, left: 0, bottom: top + height, right: 0, width: 0, height, x: 0, y: top, toJSON() {} }) as DOMRect;
+    scroller.getBoundingClientRect = () => rect(0, 600);
+    const nodes = Array.from(scroller.querySelectorAll<HTMLElement>("[data-item-id]"));
+    nodes.forEach((node, i) => {
+      node.getBoundingClientRect = () => rect(tops[i] - state.scrollTop);
+    });
+    return state;
+  }
+
+  /** 等一拍：让 rAF 桩（setTimeout 0）的回调真正执行完。 */
+  const settle = async () => {
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 5));
+    });
+  };
+
+  it("reports the top visible message while the user reads history", async () => {
+    const seen: Array<[string, unknown]> = [];
+    const list = items();
+    const { container } = render(
+      <ChatView items={list} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installLayout(scroller, [0, 1000, 2000]);
+    state.scrollTop = 1200;
+    fireEvent.scroll(scroller);
+    await settle();
+    const last = seen[seen.length - 1];
+    expect(last?.[0]).toBe("t1");
+    expect(last?.[1]).toEqual({ itemId: "tc1", offset: -200 });
+  });
+
+  it("reports null when the user is at the bottom", async () => {
+    const seen: Array<[string, unknown]> = [];
+    const { container } = render(
+      <ChatView items={items()} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installLayout(scroller, [0, 1000, 2000]);
+    state.scrollTop = 2400; // scrollHeight 3000 - clientHeight 600
+    fireEvent.scroll(scroller);
+    await settle();
+    expect(seen[seen.length - 1]).toEqual(["t1", null]);
+  });
+
+  it("attributes the last position to the thread that was on screen", async () => {
+    // 切换线程时旧内容已被替换，靠"离开前最后记住的那次"归属到旧 id。
+    const seen: Array<[string, unknown]> = [];
+    const list = items();
+    const { container, rerender } = render(
+      <ChatView items={list} threadId="t1" onRememberView={(id, a) => seen.push([id, a])} />,
+    );
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installLayout(scroller, [0, 1000, 2000]);
+    state.scrollTop = 1200;
+    fireEvent.scroll(scroller);
+    await settle();
+    rerender(<ChatView items={list} threadId="t2" onRememberView={(id, a) => seen.push([id, a])} />);
+    const forT1 = seen.filter(([id]) => id === "t1");
+    expect(forT1[forT1.length - 1][1]).toEqual({ itemId: "tc1", offset: -200 });
+  });
+});
+
 describe("ChatView auto-scroll", () => {
   /** jsdom 没有布局引擎：给滚动容器装上可读写的滚动度量。 */
   function installMetrics(
@@ -670,11 +775,71 @@ describe("ChatView auto-scroll", () => {
     }
   });
 
-  it("jumps to the newest content when the thread changes", () => {
-    // 切会话是明确意图：要看到这个会话的最新内容，而不是沿用上一个会话
-    // 的阅读位置（更不能因为上一个会话上翻过就停在中途）。
+  it("jumps to the newest content when the target thread has no remembered position", () => {
+    // 首次进入一条没有记录的会话：仍然落在最新内容上。
     const { list, rerender, state } = setup({ scrollTop: 100 });
-    rerender(<ChatView items={list} threadId="t2" />);
+    rerender(<ChatView items={list} threadId="t2" anchor={undefined} />);
     expect(state.scrollTop).toBe(1000);
+  });
+
+  it("restores the remembered position instead of jumping to the newest content", () => {
+    // A → B → A：A 有记录，回来必须停在那条消息上，而不是被拽到底部。
+    const list = items();
+    const { container, rerender } = render(<ChatView items={list} threadId="t2" />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, {
+      scrollHeight: 3000,
+      clientHeight: 400,
+      scrollTop: 0,
+    });
+    const rect = (top: number, height = 0) =>
+      ({ top, left: 0, bottom: top + height, right: 0, width: 0, height, x: 0, y: top, toJSON() {} }) as DOMRect;
+    scroller.getBoundingClientRect = () => rect(0, 400);
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-item-id]"));
+    const tops = [0, 800, 1600];
+    rows.forEach((row, i) => {
+      row.getBoundingClientRect = () => rect(tops[i] - state.scrollTop);
+    });
+
+    rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
+    // 800 - (-100) = 900
+    expect(state.scrollTop).toBe(900);
+  });
+
+  it("falls back to the bottom when the anchored message is gone", () => {
+    const list = items();
+    const { container, rerender } = render(<ChatView items={list} threadId="t2" />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, { scrollHeight: 2000, clientHeight: 400, scrollTop: 0 });
+    rerender(
+      <ChatView
+        items={list}
+        threadId="t1"
+        anchor={{ itemId: "item-that-was-deleted", offset: 0 }}
+      />,
+    );
+    expect(state.scrollTop).toBe(2000);
+  });
+
+  it("does not follow new content once a restored position is on screen", () => {
+    // 恢复后必须放弃跟随；否则下一条 delta 就把人拽回底部。
+    const list = items();
+    const { container, rerender } = render(<ChatView items={list} threadId="t2" />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, { scrollHeight: 3000, clientHeight: 400, scrollTop: 0 });
+    const rect = (top: number, height = 0) =>
+      ({ top, left: 0, bottom: top + height, right: 0, width: 0, height, x: 0, y: top, toJSON() {} }) as DOMRect;
+    scroller.getBoundingClientRect = () => rect(0, 400);
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-item-id]"));
+    const tops = [0, 800, 1600];
+    rows.forEach((row, i) => {
+      row.getBoundingClientRect = () => rect(tops[i] - state.scrollTop);
+    });
+    rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
+    expect(state.scrollTop).toBe(900);
+    setText(list, "new delta");
+    state.scrollHeight = 3400;
+    rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
+    expect(state.scrollTop).toBe(900);
   });
 });

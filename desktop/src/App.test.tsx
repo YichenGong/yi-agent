@@ -3741,6 +3741,25 @@ describe("relay handshake recovery wiring", () => {
 //  - 子 agent 的卡片列表与轨迹详情都收在该栏的「子 agent」Tab 内（点卡片下钻、
 //    「返回子 agent 列表」退回），不再有单独的「收起子 agent」按钮。
 describe("App 会话详情栏的开合", () => {
+  it("keeps the detail panel open when the same thread is selected again", async () => {
+    // 重连与「点已选中的那一行」都会走 selectThread；会话没变就不该把右侧
+    // 面板、diff、进程详情当成"上一个会话的残留"清掉。
+    render(<App />);
+    await waitFor(() =>
+      expect(clients[0].requests.some((r) => r.method === "thread/resume")).toBe(true),
+    );
+    const toggle = await screen.findByLabelText("会话详情面板");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle.getAttribute("aria-expanded")).toBe("true"));
+    // 再点一次同一会话：默认夹具里它叫 "one"（见 App.test.tsx 的 listAll 桩）。
+    fireEvent.click(screen.getByText("one"));
+    await waitFor(() =>
+      expect(clients[0].requests.filter((r) => r.method === "thread/resume")).toHaveLength(1),
+    );
+    // 面板没有被当成"上一个会话的残留"收起。
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+
   it("状态栏图标开合详情栏，栏页眉可关闭", async () => {
     render(<App />);
     await screen.findByLabelText("会话详情面板");
@@ -5500,7 +5519,7 @@ describe("App mobile reopen keeps the selection", () => {
     ).toBe(true);
   });
 
-  it("still selects the first thread on the desktop reconnect (unchanged)", async () => {
+  it("keeps the current thread across a foreground reconnect on the desktop too", async () => {
     state.threads = threads();
     render(<App />);
     await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
@@ -5512,9 +5531,78 @@ describe("App mobile reopen keeps the selection", () => {
     await waitFor(() =>
       expect(clients[clients.length - 1].requests.some((r) => r.method === "thread/listAll")).toBe(true),
     );
-    // 桌面端重放保留历史行为：每次都回到第一条会话。
+    // 桌面端同样保持：切到别的 app 再回来，看到的还是离开时那条会话。
+    const last = clients[clients.length - 1];
+    await waitFor(() => expect(resumedOn(last)).toContain("t2"));
+    expect(resumedOn(last)).not.toContain("t1");
+  });
+
+  it("still falls back to the first thread when the current one is gone", async () => {
+    state.threads = threads();
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("one")).toBeTruthy());
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() => expect(resumedOn(clients[0])).toContain("t2"));
+    // 服务端列表里已经没有 t2：必须回落第一条，而不是抱着一个不存在的会话。
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    clients[0].requests.length = 0;
+    foregroundAfterDeadSocket();
+    await waitFor(() => expect(clients.length).toBeGreaterThan(1));
+    await waitFor(() => expect(resumedOn(clients[clients.length - 1])).toContain("t1"));
+  });
+});
+
+describe("App cold start restores the last selected thread", () => {
+  beforeEach(() => {
+    localStorage.setItem("yi-agent.selectedThread", "t2");
+  });
+  afterEach(() => {
+    localStorage.removeItem("yi-agent.selectedThread");
+  });
+
+  it("resumes the thread that was selected before the app quit", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
     await waitFor(() =>
-      expect(resumedOn(clients[clients.length - 1])).toContain("t1"),
+      expect(
+        clients[0].requests
+          .filter((r) => r.method === "thread/resume")
+          .map((r) => (r.params as { threadId: string }).threadId),
+      ).toContain("t2"),
+    );
+    const resumed = clients[0].requests
+      .filter((r) => r.method === "thread/resume")
+      .map((r) => (r.params as { threadId: string }).threadId);
+    expect(resumed).not.toContain("t1");
+  });
+
+  it("falls back to the first thread when the remembered one is gone", async () => {
+    state.threads = [{ thread_id: "t1", title: "one", permission_mode: "normal" }];
+    render(<App />);
+    await waitFor(() =>
+      expect(
+        clients[0].requests.some(
+          (r) =>
+            r.method === "thread/resume" &&
+            (r.params as { threadId: string }).threadId === "t1",
+        ),
+      ).toBe(true),
+    );
+  });
+
+  it("records the selection so the next cold start can use it", async () => {
+    state.threads = [
+      { thread_id: "t1", title: "one", permission_mode: "normal" },
+      { thread_id: "t2", title: "two", permission_mode: "normal" },
+    ];
+    render(<App />);
+    await waitFor(() => expect(screen.getByText("two")).toBeTruthy());
+    fireEvent.click(screen.getByText("two"));
+    await waitFor(() =>
+      expect(localStorage.getItem("yi-agent.selectedThread")).toBe("t2"),
     );
   });
 });

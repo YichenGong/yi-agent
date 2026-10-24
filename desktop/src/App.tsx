@@ -51,6 +51,7 @@ import {
   type PendingAttachment,
 } from "./lib/attachmentLimits";
 import { nextReconnectDelay } from "./lib/reconnect";
+import { readSelectedThread, writeSelectedThread } from "./lib/selectedThread";
 import { uploadImage, isHeic } from "./lib/imageUpload";
 import { pickImageFiles } from "./lib/imagePicker";
 import { SuperpowersKanbanView } from "./components/SuperpowersKanbanView";
@@ -670,6 +671,9 @@ export default function App() {
     opts?: { leaveBoard?: boolean; forceResume?: boolean },
   ) => {
     const prevId = store.currentId;
+    // 只有**换了会话**才清附属视图：清空是为了「别把 A 的数据画在 B 上」，
+    // 会话没变时（重连重放、点已选中的那一行）不存在错配，清掉纯属打断用户。
+    const changed = prevId !== null && prevId !== id;
     store.select(id);
     // 把「已读」上报给服务端：`store.select` 只清了本地蓝点，服务端水位不知道。
     // 不上报的话，下一次 `thread/listAll`（或重连后的 `seed`）会按旧水位把蓝点
@@ -678,6 +682,8 @@ export default function App() {
     // 幂等收敛，掉一次只会让蓝点多留一会儿，不该阻塞切会话。
     markThreadRead(id);
     sess.setCurrentId(id);
+    // 记到最后看的那条：下次冷启动据此复位（服务端列表仍是否存在的裁决者）。
+    writeSelectedThread(localStorage, id);
     // 冷会话先拿缓存内容垫上（有则显示、无则空），随后 resume/readItems 覆盖。
     // 判据是 warm 与在途 resume，与「是否有缓存」无关：预填**不**置 warm，所以
     // 这里不会因为命中缓存而跳过 resume。这里刻意放在下方的早退分支（running
@@ -693,16 +699,20 @@ export default function App() {
     if (opts?.leaveBoard !== false) board.setSelectedBoard(null);
     // 手机端选中会话即收起抽屉，把宽度让回聊天区。
     if (isMobile) sess.setSidebarOpen(false);
-    sess.setPanelOpen(false);
-    diff.resetThreadDiff();
+    if (changed) {
+      sess.setPanelOpen(false);
+      diff.resetThreadDiff();
+    }
     force((v) => v + 1);
     // 该对话的子 agent 列表:重进对话时重新拉取,免得依赖"通知一定到过"。
     void sess.refreshSubagents(id);
     // 该对话的后台进程:重进对话时重新拉取。
     void proc.refreshProcesses(id);
-    // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
-    proc.setOpenProcessId(null);
-    proc.setProcessOutput(null);
+    if (changed) {
+      // 切对话即关闭详情:详情属于特定进程,留着会指向别的对话的运行结果。
+      proc.setOpenProcessId(null);
+      proc.setProcessOutput(null);
+    }
     // 服务端对本次会话的裁决（spec §4.2）。注意 plan 以 threadId 为键直接查：
     // 被删除的会话不会出现在 listAll 里，靠 summary 反查必然查不到它的 `drop`。
     // `noneNeedsCatchUp`：裁决为 none 的缓存会话仍**可能落后于服务端尾部**——
@@ -960,6 +970,7 @@ export default function App() {
       store.view(t.thread_id).mode = permissionModeFromResponse(t) ?? "normal";
       store.select(t.thread_id);
       sess.setCurrentId(t.thread_id);
+      writeSelectedThread(localStorage, t.thread_id);
       // 新会话同样是「当前会话变了」：旧 diff 必须退场，否则会挂在新会话上。
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
@@ -1213,6 +1224,7 @@ export default function App() {
     if (v?.approval) dismissedApprovals.current.delete(v.approval.id);
     store.drop(id);
     warm.current.delete(id);
+    sess.forgetView(id);
     // 会话已删:内容缓存与在途的落盘/预填登记一并清掉,否则下次冷启会把一个
     // 服务端已经没有的会话画回侧栏里。
     deleteCachedContent(id);
@@ -1220,6 +1232,8 @@ export default function App() {
     cachedAt.current.delete(id);
     if (id === sess.currentId) {
       sess.setCurrentId(null);
+      // 记住值也一并清掉：否则下次冷启动会去找一个已经不存在的会话。
+      writeSelectedThread(localStorage, null);
       // 没有当前会话了，面板与它的 diff 也必须退场：留着就是一片无主的旧内容。
       sess.setPanelOpen(false);
       diff.resetThreadDiff();
@@ -1707,16 +1721,16 @@ export default function App() {
           }
         }
         // 置顶分区在最上方，服务端给的顺序就是首屏该选中的第一个。
-        // 手机端：握手（含重连/切回前台）不是「用户换了页面」，当前会话——冷启从
-        // 缓存恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看
-        // 的东西。并且重连后新进程记忆为空（warm 与订阅窗口在 exited 时已清），
-        // 必须对它再走一次 selectThread：冷则补 resume、running 则补 readItems
-        // （不打断在途回合）、warm 则补 subscribe，否则视图留着而该会话的实时更新
-        // 会静默停摆。仅当当前会话不在服务端新列表里（被删）或根本没有已选会话时，
-        // 才回落第一条。桌面端保留原行为（每次选第一条）。
-        // （副作用：selectThread 会 resetThreadDiff()，故重连时 diff 面板若开着会
-        // 收起——会话未变，属既有行为，且窄屏下 diff 面板本就不渲染。）
-        const keptId = isRemoteClient() ? sess.currentIdRef.current : null;
+        // 握手（含重连/切回前台）**不是**「用户换了页面」：当前会话——冷启从缓存
+        // 恢复的、或用户正看着的——必须保持，把它踢回第一条会让人丢掉正在看的
+        // 东西，桌面端与手机端一致。并且重连后新进程记忆为空（warm 与订阅窗口在
+        // exited 时已清），必须对它再走一次 selectThread：冷则补 resume、running
+        // 则补 readItems（不打断在途回合）、warm 则补 subscribe，否则视图留着而
+        // 该会话的实时更新会静默停摆。仅当当前会话不在服务端新列表里（被删）或
+        // 根本没有已选会话时，才回落第一条。
+        // 回落顺序：当前会话 → 上次选中的（冷启动没有当前会话）→ 列表第一条。
+        // 记住值同样要过服务端列表这一关：会话可能已被别的端删掉。
+        const keptId = sess.currentIdRef.current ?? readSelectedThread();
         const kept =
           keptId !== null &&
           list.groups.some((g) => g.threads.some((t) => t.thread_id === keptId));
@@ -2529,6 +2543,10 @@ export default function App() {
                   call={imageCall}
                   structuralVersion={current?.session.structuralVersion ?? 0}
                   query={searchQuery}
+                  anchor={sess.currentId ? sess.anchorFor(sess.currentId) : undefined}
+                  // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
+                  // 注释），所以直接透传，不在闭包里另读 currentId。
+                  onRememberView={sess.rememberView}
                   scrollerRef={transcriptRef}
                 />
                 {searchOpen && (
