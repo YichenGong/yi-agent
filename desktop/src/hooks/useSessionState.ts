@@ -12,6 +12,7 @@ import type {
 import type { RpcClient } from "../lib/rpc";
 import type { SubagentRailStore } from "../lib/subagents";
 import type { ThreadStore } from "../lib/threadStore";
+import type { ViewAnchor } from "../lib/viewAnchor";
 
 /**
  * 会话关注点：会话列表（分组 + 置顶）、最近目录、侧栏抽屉、子 agent 详情栈与
@@ -100,6 +101,15 @@ export function useSessionState({
   // `ui/gitDiff/focus`（切到 diff）。
   const [panelOpen, setPanelOpen] = useState(false);
   const [detailTab, setDetailTab] = useState<"subagents" | "diff" | "processes">("subagents");
+
+  /**
+   * 每条会话的阅读位置。`null` = 上次离开时贴底；没有键 = 从没记过。
+   *
+   * 放 **ref** 不放 state：`ChatView` 每轮滚动都会上报，若进 state 就是滚动期
+   * 一次重渲染。它只在切会话时被读一次（`ChatView` 的 `anchor` 属性），
+   * 天然不需要驱动渲染。
+   */
+  const viewAnchors = useRef(new Map<string, ViewAnchor | null>());
 
   const refreshThreads = async (): Promise<WorkspaceGroup[] | null> => {
     const c = rpc();
@@ -253,6 +263,23 @@ export function useSessionState({
   const deleteGroup = (workspace: string, groupId: string) =>
     groupCall("thread/group/delete", { workspace, groupId });
 
+  /** 记下某条会话此刻的阅读位置（`null` = 贴底）。 */
+  const rememberView = (threadId: string, anchor: ViewAnchor | null) => {
+    viewAnchors.current.set(threadId, anchor);
+  };
+
+  /**
+   * 某条会话的阅读位置。**没记过返回 `undefined`**——它与「记过且贴底」（`null`）
+   * 语义不同：前者走首次进入的默认（到底），后者明确表示「我看的是最新」。
+   */
+  const anchorFor = (threadId: string): ViewAnchor | null | undefined =>
+    viewAnchors.current.get(threadId);
+
+  /** 会话被删时丢弃它的位置，免得列表里再出现同名 id 时被旧锚点劫持。 */
+  const forgetView = (threadId: string) => {
+    viewAnchors.current.delete(threadId);
+  };
+
   return {
     // state：会话 JSX、`selectThread`/`newThread` 等编排者与生命周期 effect 都要用。
     currentId,
@@ -289,6 +316,9 @@ export function useSessionState({
     refreshWorkspaces,
     openDetail,
     closeDetail,
+    rememberView,
+    anchorFor,
+    forgetView,
     refreshSubagents,
     // 分组动作：侧栏的多选建组、就地编辑、组菜单都走这四个。
     createGroup,

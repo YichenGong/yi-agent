@@ -1213,6 +1213,7 @@ export default function App() {
     if (v?.approval) dismissedApprovals.current.delete(v.approval.id);
     store.drop(id);
     warm.current.delete(id);
+    sess.forgetView(id);
     // 会话已删:内容缓存与在途的落盘/预填登记一并清掉,否则下次冷启会把一个
     // 服务端已经没有的会话画回侧栏里。
     deleteCachedContent(id);
@@ -2529,6 +2530,10 @@ export default function App() {
                   call={imageCall}
                   structuralVersion={current?.session.structuralVersion ?? 0}
                   query={searchQuery}
+                  anchor={sess.currentId ? sess.anchorFor(sess.currentId) : undefined}
+                  // 每次采集都按**当时屏幕上那条**会话归属（见 ChatView 的属性
+                  // 注释），所以直接透传，不在闭包里另读 currentId。
+                  onRememberView={sess.rememberView}
                   scrollerRef={transcriptRef}
                 />
                 {searchOpen && (
