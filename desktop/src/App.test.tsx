@@ -2238,10 +2238,12 @@ describe("App session pinning", () => {
 
     const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
     expect(rows).toHaveLength(2);
-    // 把第一行拖到第二行位置。
-    fireEvent.dragStart(rows[0]);
-    fireEvent.dragOver(rows[1]);
-    fireEvent.drop(rows[1]);
+    // 把第一行拖到第二行位置（指针拖拽：HTML5 拖放在 Tauri 的 WKWebView 里
+    // 收不到 dragover/drop，见 `ThreadSidebar` 的 `dragOrigin` 注释）。
+    fireEvent.pointerDown(rows[0], { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 24, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(rows[1], { pointerId: 1 });
+    fireEvent.pointerUp(window, { pointerId: 1 });
 
     await waitFor(() =>
       expect(clients[0].requests).toContainEqual({

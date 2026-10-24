@@ -919,12 +919,13 @@ describe("ThreadSidebar pinned section", () => {
       onReorderPinned,
     });
     const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
-    // 把第一行拖到第二行位置。
-    fireEvent.dragStart(rows[0]);
-    fireEvent.dragOver(rows[1]);
+    // 把第一行拖到第二行位置（指针拖拽，见 `dragOrigin` 的注释）。
+    fireEvent.pointerDown(rows[0], { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 24, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(rows[1], { pointerId: 1 });
     // 悬停期间要有可见的落点指示线，否则用户看不到会落到哪儿。
     expect(container.querySelector("[data-pin-drop-indicator]")).not.toBeNull();
-    fireEvent.drop(rows[1]);
+    fireEvent.pointerUp(window, { pointerId: 1 });
     expect(onReorderPinned).toHaveBeenCalledWith(["8", "9"]);
   });
 
@@ -952,18 +953,21 @@ describe("ThreadSidebar pinned section", () => {
     expect(container.querySelectorAll("[data-pinned-row]")).toHaveLength(1);
   });
 
-  it("renders neither a pin button nor draggable on the row being renamed", () => {
+  it("renders neither a pin button nor a drag start on the row being renamed", () => {
     const { container } = renderSidebar({ pinned: [pinnedThread("9", "nine")] });
     fireEvent.doubleClick(screen.getByText("nine"));
     const row = container.querySelector<HTMLElement>("[data-pinned-row]")!;
     expect(row.querySelector("[aria-label=\"Unpin thread\"]")).toBeNull();
     expect(row.querySelector("[aria-label=\"Pin thread\"]")).toBeNull();
-    expect(row.getAttribute("draggable")).not.toBe("true");
+    // 重命名中的行不起手拖拽：按下后移动不会高亮任何落点。
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 40, clientY: 10, pointerId: 1 });
+    expect(document.querySelector("[data-pin-drop-indicator]")).toBeNull();
   });
 
-  it("makes group rows draggable but never reorders them on drop", () => {
-    // 非置顶行现在可拖——但只为「拖进/拖出组」，不参与置顶区排序。
-    // 因此这里锁两件事：属性是 true，且落到另一行上不会调用 onReorderPinned。
+  it("lets group rows start a drag but never reorders them on drop", () => {
+    // 非置顶行可起手拖拽——但只为「拖进/拖出组」，不参与置顶区排序。
+    // 因此这里锁两件事：能起手，且落到另一行上不会调用 onReorderPinned。
     const onReorderPinned = vi.fn();
     const dragGroups: WorkspaceGroup[] = [
       {
@@ -975,11 +979,11 @@ describe("ThreadSidebar pinned section", () => {
     const { container } = renderSidebar({ groups: dragGroups, onReorderPinned });
     const rows = container.querySelectorAll<HTMLElement>("[data-group-row]");
     expect(rows.length).toBeGreaterThan(1);
-    // 整行可拖（进/出组的手势），但落到另一行上不会触发置顶重排。
-    expect(Array.from(rows).every((r) => r.getAttribute("draggable") === "true")).toBe(true);
-
-    fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn() } });
-    fireEvent.drop(rows[1], { dataTransfer: {} });
+    // 整行可起手（进/出组的手势），但落到另一行上不会触发置顶重排。
+    fireEvent.pointerDown(rows[0], { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 24, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(rows[1], { pointerId: 1 });
+    fireEvent.pointerUp(window, { pointerId: 1 });
     expect(onReorderPinned).not.toHaveBeenCalled();
   });
 
@@ -1695,40 +1699,57 @@ describe("会话分组框", () => {
   });
 
   it("无修饰键时普通会话行整行可拖", () => {
-    const g: WorkspaceGroup[] = [
+    const grouped: WorkspaceGroup[] = [
       {
         workspace: "/work/projA",
         exists: true,
         threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+        groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a"] }],
       },
     ];
-    const { container } = renderSidebar({ groups: g });
+    const { container } = renderSidebar({ groups: grouped });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
     const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
-    expect(row.getAttribute("draggable")).toBe("true");
+    // 按下并越过阈值后进入拖拽态：悬停到框外的会话行上会亮出落点。
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 24, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(container.querySelector('[data-thread-row="b"]')!, { pointerId: 1 });
+    expect(container.querySelector("[data-group-drop-target]")).not.toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
     // 手柄已经删掉：整行可拖之后它是多余的第二入口。
     expect(container.querySelector("[data-drag-handle]")).toBeNull();
   });
 
-  it("按着 Cmd 时整行不可拖（否则原生拖拽会吞掉点击多选）", () => {
-    // 整行 draggable 后，按着再移动一两像素就触发原生 dragstart，浏览器随即
-    // 不再派发 click——「点了三条只记到两条」正是这条路。修饰键按下即摘掉
-    // draggable，点击语义逐字不变。
+  it("按着 Cmd 时按下不起手拖拽（点击多选不能被抢走）", () => {
+    // 多选靠点击攒起来。按着修饰键时行不该成为拖拽源，否则「按下 + 轻微移动」
+    // 会被当成拖拽起点，click 就没了——「点了三条只记到两条」正是这条路。
     const g: WorkspaceGroup[] = [
       {
         workspace: "/work/projA",
         exists: true,
         threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
+        groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["a"] }],
       },
     ];
     const { container } = renderSidebar({ groups: g });
-    const row = () => container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
-    expect(row().getAttribute("draggable")).toBe("true");
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const other = container.querySelector<HTMLElement>('[data-thread-row="b"]')!;
 
     fireEvent.keyDown(document, { key: "Meta" });
-    expect(row().getAttribute("draggable")).not.toBe("true");
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 40, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(other, { pointerId: 1 });
+    expect(container.querySelector("[data-group-drop-target]")).toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
 
+    // 松开修饰键后同一手势就能拖了。
     fireEvent.keyUp(document, { key: "Meta" });
-    expect(row().getAttribute("draggable")).toBe("true");
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 40, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(other, { pointerId: 1 });
+    expect(container.querySelector("[data-group-drop-target]")).not.toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
   });
 
   it("按着 Cmd 时点击三条仍然只选三条、不触发拖拽", () => {
@@ -2065,14 +2086,28 @@ describe("拖动会话进组", () => {
     },
   ];
 
+  /**
+   * 起手：按下并在同一行内移动一小段。
+   *
+   * 阈值是 4px——纯点击（含手抖一两像素）不该变成拖拽，那是「整行可拖会吞点击」
+   * 的老问题的现代版：拖拽不该抢走点击。
+   */
+  const startDrag = (row: Element, x = 10, y = 10) => {
+    fireEvent.pointerDown(row, { clientX: x, clientY: y, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: x + 12, clientY: y, pointerId: 1 });
+  };
+
+  const hover = (el: Element) => fireEvent.pointerEnter(el, { pointerId: 1 });
+  const release = () => fireEvent.pointerUp(window, { pointerId: 1 });
+
   it("拖动一条未选中的行到组框只加这一条", async () => {
     const onSetGroupMembers = vi.fn().mockResolvedValue(true);
     const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
     const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
     const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
-    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn(), effectAllowed: "" } });
-    fireEvent.dragOver(box, { dataTransfer: { dropEffect: "" } });
-    fireEvent.drop(box, { dataTransfer: { getData: () => "c" } });
+    startDrag(row);
+    hover(box);
+    release();
     await waitFor(() =>
       expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "c"]),
     );
@@ -2090,8 +2125,9 @@ describe("拖动会话进组", () => {
 
     const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
     const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
-    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
-    fireEvent.drop(box, { dataTransfer: { getData: () => "c" } });
+    startDrag(row);
+    hover(box);
+    release();
     // a 已在组里 → 跳过；b、c 追加，顺序 = 组内既有 + 新追加。
     await waitFor(() =>
       expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "b", "c"]),
@@ -2122,9 +2158,9 @@ describe("拖动会话进组", () => {
 
     const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
     const outside = container.querySelector<HTMLElement>('[data-thread-row="d"]')!;
-    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
-    fireEvent.dragOver(outside, { dataTransfer: { dropEffect: "" } });
-    fireEvent.drop(outside, { dataTransfer: { getData: () => "a" } });
+    startDrag(row);
+    hover(outside);
+    release();
     await waitFor(() => expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", []));
   });
 
@@ -2157,12 +2193,11 @@ describe("拖动会话进组", () => {
 
     const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
     const outside = container.querySelector<HTMLElement>('[data-thread-row="e"]')!;
-    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
-    fireEvent.drop(outside, { dataTransfer: { getData: () => "a" } });
+    startDrag(row);
+    hover(outside);
+    release();
     // 只有 g1 被写；g2 一动不动。
-    await waitFor(() =>
-      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["b"]),
-    );
+    await waitFor(() => expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["b"]));
     expect(onSetGroupMembers).toHaveBeenCalledTimes(1);
   });
 
@@ -2172,9 +2207,9 @@ describe("拖动会话进组", () => {
     fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
     const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
     const header = container.querySelector<HTMLElement>('[data-ws-header="/work/projA"]')!;
-    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
-    fireEvent.dragOver(header, { dataTransfer: { dropEffect: "" } });
-    fireEvent.drop(header, { dataTransfer: { getData: () => "a" } });
+    startDrag(row);
+    hover(header);
+    release();
     expect(onSetGroupMembers).not.toHaveBeenCalled();
   });
 
@@ -2183,19 +2218,19 @@ describe("拖动会话进组", () => {
     fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
     const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
     const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
-    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
-    fireEvent.dragOver(outside, { dataTransfer: { dropEffect: "" } });
+    startDrag(row);
+    hover(outside);
     expect(container.querySelector('[data-group-drop-target="c"]')).toBeTruthy();
   });
 
-  it("离开落点后高亮熄灭", () => {
+  it("松开后高亮熄灭", () => {
     const { container } = renderSidebar({ groups: dragBase });
     fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
     const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
     const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
-    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
-    fireEvent.dragOver(outside, { dataTransfer: { dropEffect: "" } });
-    fireEvent.dragEnd(row, { dataTransfer: { setData: vi.fn() } });
+    startDrag(row);
+    hover(outside);
+    release();
     expect(container.querySelector("[data-group-drop-target]")).toBeNull();
   });
 
@@ -2203,9 +2238,37 @@ describe("拖动会话进组", () => {
     const { container } = renderSidebar({ groups: dragBase });
     const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
     const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
-    fireEvent.dragStart(row, { dataTransfer: { setData: vi.fn() } });
-    fireEvent.dragOver(box, { dataTransfer: {} });
+    startDrag(row);
+    hover(box);
     expect(container.querySelector("[data-group-drop-active]")).toBeTruthy();
+  });
+
+  it("手抖一两像素仍是点击：不进入拖拽态", () => {
+    // 4px 阈值。这是「整行可拖会吞点击」那类问题的指针版：按下时的微小位移
+    // 不该把一次点击变成拖拽。断言的是**拖拽没被激活**，而不是"没调用 RPC"
+    // ——后者在没有落点时本来就恒真，钉不住阈值。
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 13, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(outside, { pointerId: 1 });
+    // 未越过阈值 → 落点不该亮。
+    expect(container.querySelector("[data-group-drop-target]")).toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
+  });
+
+  it("越过阈值后才进入拖拽态", () => {
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const outside = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    fireEvent.pointerDown(row, { clientX: 10, clientY: 10, button: 0, pointerId: 1 });
+    fireEvent.pointerMove(window, { clientX: 15, clientY: 10, pointerId: 1 });
+    fireEvent.pointerEnter(outside, { pointerId: 1 });
+    expect(container.querySelector("[data-group-drop-target]")).not.toBeNull();
+    fireEvent.pointerUp(window, { pointerId: 1 });
   });
 
   it("置顶分区内的排序拖拽不受影响", () => {
@@ -2213,8 +2276,9 @@ describe("拖动会话进组", () => {
     const pinned = [pinnedThread("p1", "one"), pinnedThread("p2", "two")];
     const { container } = renderSidebar({ groups: dragBase, pinned, onReorderPinned });
     const rows = container.querySelectorAll<HTMLElement>("[data-pinned-row]");
-    fireEvent.dragStart(rows[0], { dataTransfer: { setData: vi.fn() } });
-    fireEvent.drop(rows[1], { dataTransfer: {} });
+    startDrag(rows[0]);
+    hover(rows[1]);
+    release();
     expect(onReorderPinned).toHaveBeenCalled();
   });
 });
