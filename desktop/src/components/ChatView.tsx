@@ -1,11 +1,11 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { RefObject } from "react";
 import type { Item, RetryCause } from "../lib/protocol";
 import { fileNameOf } from "../lib/attachmentLimits";
 import type { NoticeItem, ReasoningItem } from "../lib/session";
 import { useImageData, type ImageReadCall } from "../lib/useImageData";
 import { isAtBottom, useStickToBottom } from "../lib/useStickToBottom";
-import { findAnchor, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
+import { findAnchor, restoreScrollTop, type ItemBox, type ViewAnchor } from "../lib/viewAnchor";
 import { useThrottledText } from "../lib/useThrottledText";
 import { AgentMessage } from "./MarkdownText";
 import { ConfigCard } from "./ConfigCard";
@@ -388,6 +388,7 @@ export function ChatView({
   structuralVersion = 0,
   query = "",
   scrollerRef,
+  anchor,
   onRememberView,
 }: {
   items: (Item | NoticeItem | ReasoningItem)[];
@@ -415,12 +416,18 @@ export function ChatView({
    */
   scrollerRef?: RefObject<HTMLDivElement | null>;
   /**
+   * 该会话上次离开时的阅读位置；`null` = 离开时贴底，`undefined` = 从没记过。
+   * 由宿主按 `threadId` 提供（见 `App` 的 `anchorFor`）。
+   */
+  anchor?: ViewAnchor | null;
+  /**
    * 滚动时上报当前位置。签名带 `threadId` 是为了让"切换前的最后一次采集"仍归属
    * 到旧会话——切换之后 DOM 里已经是新内容，闭包再读当前 id 就错位了。
    */
   onRememberView?: (threadId: string, anchor: ViewAnchor | null) => void;
 }) {
-  const { ref: scrollRef, scrollToBottom, followIfAtBottom } = useStickToBottom();
+  const { ref: scrollRef, scrollToBottom, followIfAtBottom, releaseFollow } =
+    useStickToBottom();
   // 合并 ref：同一个 DOM 节点交给两方。依赖是两个 ref 本身（稳定引用），
   // 所以不会每次渲染都重设。
   const setScroller = useCallback(
@@ -453,6 +460,37 @@ export function ChatView({
   // effect 绑在它的身份上。
   const rememberRef = useRef(onRememberView);
   rememberRef.current = onRememberView;
+
+  // 每条会话只恢复一次：`anchor` 之后可能因为采集而变化，重复对位会把用户
+  // 正在做的滚动不断拉回去。
+  const restoredFor = useRef<string | null | undefined>(undefined);
+  useLayoutEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    if (restoredFor.current === threadId) return;
+    restoredFor.current = threadId;
+    // `null` = 离开时贴底，`undefined` = 从没记过：两者都走既有的"到底"。
+    if (anchor == null) return;
+    // 不用 `[data-item-id="..."]` 选择器：id 来自服务端，逗号/引号都会破坏
+    // 选择器语法，且 `CSS.escape` 在 jsdom 下不存在。扫描一遍更稳。
+    const target = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
+      (node) => node.dataset.itemId === anchor.itemId,
+    );
+    const base = el.getBoundingClientRect().top - el.scrollTop;
+    const top = target ? target.getBoundingClientRect().top - base : undefined;
+    const next = restoreScrollTop(
+      top === undefined ? undefined : { id: anchor.itemId, top },
+      anchor,
+    );
+    if (next === null) {
+      // 锚点消失（消息被删、历史被截断）：回退到底部，别停在无意义的像素上。
+      scrollToBottom();
+      return;
+    }
+    el.scrollTop = next;
+    // 恢复完立刻放弃跟随，否则下一条 delta 会把人拽回底部。
+    releaseFollow();
+  }, [threadId, anchor, scrollToBottom, releaseFollow]);
 
   useEffect(() => {
     const el = elRef.current;
@@ -528,9 +566,14 @@ export function ChatView({
       typeof newest.id === "string" &&
       newest.id.startsWith("local-");
 
-    if (firstRun || threadChanged || sentByUser || newError) scrollToBottom();
-    else followIfAtBottom();
-  }, [items.length, lastText, error, threadId, scrollToBottom, followIfAtBottom]);
+    // 恢复锚点的会话不在这里动视口：`useLayoutEffect` 已经对好位，再调
+    // `scrollToBottom` 会把它顶掉。
+    const restoring = threadChanged && anchor != null;
+    if (firstRun || sentByUser || newError) scrollToBottom();
+    else if (threadChanged) {
+      if (!restoring) scrollToBottom();
+    } else followIfAtBottom();
+  }, [items.length, lastText, error, threadId, anchor, scrollToBottom, followIfAtBottom]);
 
   return (
     <div

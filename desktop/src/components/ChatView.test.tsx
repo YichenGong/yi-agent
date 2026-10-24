@@ -775,11 +775,71 @@ describe("ChatView auto-scroll", () => {
     }
   });
 
-  it("jumps to the newest content when the thread changes", () => {
-    // 切会话是明确意图：要看到这个会话的最新内容，而不是沿用上一个会话
-    // 的阅读位置（更不能因为上一个会话上翻过就停在中途）。
+  it("jumps to the newest content when the target thread has no remembered position", () => {
+    // 首次进入一条没有记录的会话：仍然落在最新内容上。
     const { list, rerender, state } = setup({ scrollTop: 100 });
-    rerender(<ChatView items={list} threadId="t2" />);
+    rerender(<ChatView items={list} threadId="t2" anchor={undefined} />);
     expect(state.scrollTop).toBe(1000);
+  });
+
+  it("restores the remembered position instead of jumping to the newest content", () => {
+    // A → B → A：A 有记录，回来必须停在那条消息上，而不是被拽到底部。
+    const list = items();
+    const { container, rerender } = render(<ChatView items={list} threadId="t2" />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, {
+      scrollHeight: 3000,
+      clientHeight: 400,
+      scrollTop: 0,
+    });
+    const rect = (top: number, height = 0) =>
+      ({ top, left: 0, bottom: top + height, right: 0, width: 0, height, x: 0, y: top, toJSON() {} }) as DOMRect;
+    scroller.getBoundingClientRect = () => rect(0, 400);
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-item-id]"));
+    const tops = [0, 800, 1600];
+    rows.forEach((row, i) => {
+      row.getBoundingClientRect = () => rect(tops[i] - state.scrollTop);
+    });
+
+    rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
+    // 800 - (-100) = 900
+    expect(state.scrollTop).toBe(900);
+  });
+
+  it("falls back to the bottom when the anchored message is gone", () => {
+    const list = items();
+    const { container, rerender } = render(<ChatView items={list} threadId="t2" />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, { scrollHeight: 2000, clientHeight: 400, scrollTop: 0 });
+    rerender(
+      <ChatView
+        items={list}
+        threadId="t1"
+        anchor={{ itemId: "item-that-was-deleted", offset: 0 }}
+      />,
+    );
+    expect(state.scrollTop).toBe(2000);
+  });
+
+  it("does not follow new content once a restored position is on screen", () => {
+    // 恢复后必须放弃跟随；否则下一条 delta 就把人拽回底部。
+    const list = items();
+    const { container, rerender } = render(<ChatView items={list} threadId="t2" />);
+    const scroller = container.firstElementChild as HTMLElement;
+    const state = installMetrics(scroller, { scrollHeight: 3000, clientHeight: 400, scrollTop: 0 });
+    const rect = (top: number, height = 0) =>
+      ({ top, left: 0, bottom: top + height, right: 0, width: 0, height, x: 0, y: top, toJSON() {} }) as DOMRect;
+    scroller.getBoundingClientRect = () => rect(0, 400);
+    const rows = Array.from(scroller.querySelectorAll<HTMLElement>("[data-item-id]"));
+    const tops = [0, 800, 1600];
+    rows.forEach((row, i) => {
+      row.getBoundingClientRect = () => rect(tops[i] - state.scrollTop);
+    });
+    rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
+    expect(state.scrollTop).toBe(900);
+    setText(list, "new delta");
+    state.scrollHeight = 3400;
+    rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
+    expect(state.scrollTop).toBe(900);
   });
 });
