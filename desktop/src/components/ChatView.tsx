@@ -466,31 +466,48 @@ export function ChatView({
 
   // 每条会话只恢复一次：`anchor` 之后可能因为采集而变化，重复对位会把用户
   // 正在做的滚动不断拉回去。
+  //
+  // **只在真的对好位之后才标记**。切到一条冷会话时，DOM 里还没有任何消息
+  // （resume/readItems 尚未回包），此刻若先把 threadId 记下来，等回包后内容
+  // 出现时已经"恢复过了"，于是再也补不上——表现为用户被永久留在底部。
   const restoredFor = useRef<string | null | undefined>(undefined);
   useLayoutEffect(() => {
     const el = elRef.current;
     if (!el) return;
     if (restoredFor.current === threadId) return;
-    restoredFor.current = threadId;
-    // `null` = 离开时贴底，`undefined` = 从没记过：两者都走既有的"到底"。
-    if (anchor == null) return;
+    // `null` = 离开时贴底，`undefined` = 从没记过：两者都走既有的"到底"，
+    // 由下面的跟随分支负责，这里不重复做。
+    if (anchor == null) {
+      restoredFor.current = threadId;
+      return;
+    }
     // 不用 `[data-item-id="..."]` 选择器：id 来自服务端，逗号/引号都会破坏
     // 选择器语法，且 `CSS.escape` 在 jsdom 下不存在。扫描一遍更稳。
     const target = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
       (node) => node.dataset.itemId === anchor.itemId,
     );
+    if (!target) {
+      // 内容还没到：不锁定，等下一次渲染（内容到达）再试。真正"锚点已消失"
+      // 的判定交给下方内容非空之后。
+      if (el.querySelector("[data-item-id]") === null) return;
+      // 有内容但没有这条消息（被删/历史被截断）：回退到底部，别停在无意义的
+      // 像素上，并就此锁定——再等也不会出现。
+      restoredFor.current = threadId;
+      scrollToBottom();
+      return;
+    }
     const base = el.getBoundingClientRect().top - el.scrollTop;
-    const top = target ? target.getBoundingClientRect().top - base : undefined;
     const next = restoreScrollTop(
-      top === undefined ? undefined : { id: anchor.itemId, top },
+      { id: anchor.itemId, top: target.getBoundingClientRect().top - base },
       anchor,
     );
     if (next === null) {
-      // 锚点消失（消息被删、历史被截断）：回退到底部，别停在无意义的像素上。
+      restoredFor.current = threadId;
       scrollToBottom();
       return;
     }
     el.scrollTop = next;
+    restoredFor.current = threadId;
     // 恢复完立刻放弃跟随，否则下一条 delta 会把人拽回底部。
     releaseFollow();
   }, [threadId, anchor, scrollToBottom, releaseFollow]);
@@ -523,6 +540,10 @@ export function ChatView({
         if (!id) continue;
         boxes.push({ id, top: child.getBoundingClientRect().top - base });
       }
+      // 一条消息都还没有（刚切过来、resume 尚未回包）：这里没有可归属的位置，
+      // 上报 `null` 会被读成「用户看的是最新」，把该会话原有的记录抹掉。
+      // 不报，等内容到了自然会再采集一次。
+      if (boxes.length === 0) return;
       report(owner, findAnchor(boxes, node.scrollTop));
     };
 
