@@ -84,10 +84,12 @@ export interface UsageReport {
   session: { rows: UsageGroupRow[]; isSnapshot: boolean };
   /** subagent 三项。`null` 表示没有 subagent 用量，卡片不渲染该组。 */
   subagent: UsageGroupRow[] | null;
-  /** 估算成本文案，含「（主会话，不含 subagent）」限定语（仅在 subagent 非空时）。 */
+  /**
+   * 估算成本，只含钱数本身（`"$1.23"`），模型未知时是 `"—"`。
+   * 「（主会话，不含 subagent）」这句限定语**不在这里**：它是呈现层对
+   * `subagent !== null` 的读法，数据层不该替渲染层拼句子。
+   */
   cost: string;
-  /** 成本是否为占位（模型未知 → `—`）。渲染层据此决定是否弱化。 */
-  costKnown: boolean;
 }
 ```
 
@@ -129,7 +131,7 @@ number**：千分位格式化属于呈现，放在渲染层，纯数据层不掺
 | 有 subagent | 出现 `主会话` 与 `Subagents` 两个分组标题；成本行追加上限定语 |
 | subagent 全零或 `null` | 不出现 `Subagents` 分组，也不出现 `主会话` 标题（无对照即无区分意义） |
 | `limit === null` 或 `<= 0` | 上下文只显示 `12,345`，无分母、无百分比 |
-| 模型未知（`estimateCost` 返回 null） | 成本显示 `—` |
+| 模型未知（`estimateCost` 返回 null） | `cost` 为 `—`，照常显示（不隐藏这一行） |
 
 键值行沿用 `ConfigCard` 的排法：标签列 `w-24 shrink-0 text-fg-muted`，
 值列 `min-w-0 break-all text-fg`；分组标题 `text-xs text-fg-subtle`。
@@ -178,7 +180,8 @@ session.noticeBody({ kind: "usage", report: buildUsageReport(u, session.usageTot
    Input/Output/Cache read、cacheWrite 为 0 时无该行。
 2. 无累计值：`isSnapshot === true`、title 为 `本轮用量`、rows 取快照值。
 3. 上下文：`limit` 已知时 `{used, limit}` 原样透出；`limit` 为 `null`/`0` 时为 null。
-4. subagent：`null` 与全零都给 `subagent: null`；非零时三行且成本文案含限定语。
+4. subagent：`null` 与全零都给 `subagent: null`；非零时三行。
+   （成本文案里的限定语属于渲染层，不在这一层断言。）
 
 百分比与千分位**不在这一层断言**（它们是渲染层的职责）。
 
