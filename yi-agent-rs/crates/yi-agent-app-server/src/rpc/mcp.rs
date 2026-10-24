@@ -34,6 +34,68 @@ pub(crate) async fn handle(
                 }
             }
         }
+        // 改配置与 `flags/set` / `model/upsert` 同档:需要 Control。
+        // 只读的 `mcp/list` 保持 `Observe`,手机上也能看。
+        "mcp/set" => {
+            if state.client_scope < crate::protocol::Scope::Control {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(
+                        id,
+                        crate::protocol::RpcError::insufficient_scope(
+                            crate::protocol::Scope::Control,
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            match crate::mcp_rpc::handle_mcp_request(
+                state.theme_handle.workdir(),
+                req.method.as_str(),
+                &req.params,
+            ) {
+                Ok(value) => {
+                    // 配置已落盘。若该请求点名了正在跑的 thread，立刻让它重载，
+                    // 否则用户要等到下一次进程重启才看到新工具集。
+                    //
+                    // 只对**指定的** thread 重载：`mcp.json` 是项目级文件，但
+                    // 同一项目下可能开着多个会话，逐个重载会重复探测。
+                    if let Some(thread_id) = req
+                        .params
+                        .get("threadId")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        if let Some(session) = state.threads.get(thread_id) {
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            let sent = session
+                                .session_tx
+                                .send(crate::session::SessionCommand::ReloadMcp { reply: reply_tx })
+                                .await
+                                .is_ok();
+                            if sent {
+                                // 探测失败不该让写盘回错——写盘已经成功了。
+                                // 把失败降级为日志，响应里如实带上。
+                                if let Ok(Err(cause)) = reply_rx.await {
+                                    tracing::warn!(
+                                        %thread_id,
+                                        %cause,
+                                        "MCP reload after mcp/set reported probe failures"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    write_response(state.hub, state.client, ok_response(id, value)).await?
+                }
+                Err(error) => {
+                    write_response(state.hub, state.client, err_response(id, error)).await?
+                }
+            }
+        }
         // 域内兜底:本模块只实现上面列出的方法。
         _ => return Ok(Flow::Unknown),
     }

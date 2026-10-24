@@ -110,6 +110,14 @@ pub enum SessionCommand {
         preserve: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// 重新从磁盘读取 `.yi-agent/mcp.json`，只探测新增或变化的 server，
+    /// 然后用刷新后的工具集重建 agent。
+    ///
+    /// 由 `mcp/set` 在写盘之后发出：配置已落盘，但正在跑的 thread 手上还是
+    /// 旧工具集，不重载就要等下一次进程重启才生效。
+    ReloadMcp {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// `/compact` 的三种结果。`NotReduced` 是"历史太短、无需压缩"，**不是错误**。
@@ -178,6 +186,7 @@ mod tests {
             SessionCommand::SetModel { .. } => panic!("expected Clear"),
             SessionCommand::SetReasoningEffort { .. } => panic!("expected Clear"),
             SessionCommand::SetPreserveThinking { .. } => panic!("expected Clear"),
+            SessionCommand::ReloadMcp { .. } => panic!("expected Clear"),
         }
         assert_eq!(answer.await.unwrap(), Ok(()));
     }

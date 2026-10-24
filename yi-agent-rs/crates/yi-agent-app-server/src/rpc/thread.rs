@@ -551,11 +551,14 @@ pub(crate) async fn handle(
                 catalog,
                 yolo,
                 process_manager,
+                mcp,
                 ..
             } = activation.built;
             state
                 .pending_activation
                 .insert(thread_id.clone(), activation.runtime);
+            // MCP 配置固定在 thread cwd 下,与 `build_runtime_tooling` 同源。
+            let mcp_workdir = std::path::PathBuf::from(cwd.as_str());
 
             let (prompt_tx, prompt_rx) = mpsc::channel::<TurnPrompt>(8);
             let (interrupt_tx, interrupt_rx) = mpsc::channel::<String>(8);
@@ -628,6 +631,8 @@ pub(crate) async fn handle(
                 provider,
                 config,
                 subagent_rx,
+                mcp,
+                mcp_workdir,
             ));
 
             // 回放:thread/started → 若干批量 items/completed → 最近用量 → 响应。

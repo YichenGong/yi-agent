@@ -330,6 +330,10 @@ pub struct AgentBootstrap {
     pub catalog: Option<SkillsCatalogHandle>,
     /// 本次装配的共享 yolo 开关(clone 自沙箱与权限共用的同一 `Arc`)。
     pub yolo: yi_agent_core::autonomy::YoloSwitch,
+    /// 本次装配的 MCP 管理器。`mcp_reload` 工具与每轮配置变更检查都靠它；
+    /// 配置缺失时是 `None`——此时工具仍在(挂在 `tools` 里),只是没有可重载的
+    /// server,`reload` 会把新建的配置读进来。
+    pub mcp: Option<Arc<yi_agent_mcp::McpManager>>,
 }
 
 /// 由运行时配置构造 [`yi_agent_core::AgentConfig`](集中一处,避免各调用点漂移)。
@@ -403,6 +407,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 decision_tx: Some(decision_tx),
                 decision_rx: Some(rx_arc),
                 yolo: switch.clone(),
+                mcp: setup.mcp,
             })
         }
         PermissionMode::AutoAllow => {
@@ -422,6 +427,7 @@ pub fn bootstrap_agent(cfg: &RuntimeConfig, mode: PermissionMode) -> Result<Agen
                 decision_tx: None,
                 decision_rx: None,
                 yolo: switch.clone(),
+                mcp: setup.mcp,
             })
         }
     }
