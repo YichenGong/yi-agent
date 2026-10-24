@@ -298,6 +298,35 @@ export function ThreadSidebar({
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   /** 正在为哪个组挑选「加入的会话」；null = 没有打开的挑选器。 */
   const [addingTo, setAddingTo] = useState<string | null>(null);
+  /**
+   * 是否有修饰键（Cmd/Ctrl/Shift）正被按住。
+   *
+   * 会话行改成整行可拖之后，原生拖拽会把「按下 + 轻微移动」当成拖拽起点，随后
+   * 不再派发 click——多选靠点击，一旦被吞就「点了三条只记到两条」。按下修饰键
+   * 时整行摘掉 `draggable`，点击语义回到加手势之前。
+   *
+   * 用 `e.key` 判定而不是 `e.metaKey`：`keyup` 时 `metaKey` 已经为 false，
+   * 读不到「刚才松开的是谁」。
+   */
+  const [modifierDown, setModifierDown] = useState(false);
+  useEffect(() => {
+    const onDown = (e: KeyboardEvent) => {
+      if (e.key === "Meta" || e.key === "Control" || e.key === "Shift") setModifierDown(true);
+    };
+    const onUp = (e: KeyboardEvent) => {
+      if (e.key === "Meta" || e.key === "Control" || e.key === "Shift") setModifierDown(false);
+    };
+    // 窗口失焦（Cmd+Tab 切走）后 keyup 不会到达，必须复位，否则侧栏永久不可拖。
+    const onBlur = () => setModifierDown(false);
+    document.addEventListener("keydown", onDown);
+    document.addEventListener("keyup", onUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      document.removeEventListener("keydown", onDown);
+      document.removeEventListener("keyup", onUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, []);
   // 多选：会话行的选择集。Ctrl/Cmd+点击进出，Shift+点击按当前行序区间选择。
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
@@ -875,10 +904,10 @@ export function ThreadSidebar({
     const un = unread.get(t.thread_id);
     const isPinned = t.pinned ?? false;
     const dragging = opts.rowAttr === "pinned";
-    // 进组/出组的拖拽**不能挂在整行上**：整行 `draggable` 后，macOS 上按下再
-    // 移动一两像素就触发原生 dragstart，浏览器随即不再派发 click——用户连点
-    // 三条只记到两条（现场反馈）。改由行尾的手柄发起，行本身保持可点。
-    const canDragIntoGroup = opts.rowAttr === "group" && dragEnabled;
+    // 整行可拖：手柄几乎没人发现，而拖拽是「把会话放进框」最直觉的表达。
+    // 按着修饰键时不拖——那时用户点的是多选，不是拖拽（见 `modifierDown`）。
+    const canDragIntoGroup =
+      opts.rowAttr === "group" && dragEnabled && !modifierDown && editingId !== t.thread_id;
     // 看板会话行多缩进一档（pl-7 vs pl-3）：折叠小节头是 ▸ 视觉起点，其下的
     // 会话若与直属行同一起点，就分不清谁属于谁。缩进让「小节头 → 卡片会话」的
     // 从属关系一眼可读。仅改左内边距，不影响拖拽/点击。
@@ -892,9 +921,15 @@ export function ThreadSidebar({
         key={t.thread_id}
         {...dataAttr}
         data-thread-row={t.thread_id}
-        // 只有置顶区的行整行可拖（那里拖拽就是重排）。进组拖拽走行内手柄。
-        draggable={dragging && editingId !== t.thread_id}
-        onDragStart={dragging ? () => setDragId(t.thread_id) : undefined}
+        // 置顶行整行拖拽 = 重排；普通行整行拖拽 = 进出分组（按修饰键时让位）。
+        draggable={dragging ? editingId !== t.thread_id : canDragIntoGroup}
+        onDragStart={
+          dragging
+            ? () => setDragId(t.thread_id)
+            : canDragIntoGroup
+              ? () => setDragThread(t.thread_id)
+              : undefined
+        }
         onDragOver={
           dragging
             ? (e) => {
@@ -1041,33 +1076,6 @@ export function ThreadSidebar({
                 title="Unread result"
                 className={`size-2 shrink-0 rounded-full ${unreadDotClass(un)}`}
               />
-            )}
-            {canDragIntoGroup && (
-              /*
-                拖拽手柄。挂在整行上会让原生拖拽吞掉 click（见 `canDragIntoGroup`
-                的注释），所以只在这一小块上开 `draggable`。`onDragStart` 里
-                `setDragThread` 与 `dataTransfer` 都设上：前者驱动落点高亮，
-                后者让 macOS 的拖拽会话有内容可带（否则某些 WebKit 版本直接取消）。
-              */
-              <span
-                data-drag-handle={t.thread_id}
-                draggable
-                aria-hidden="true"
-                title="拖到分组里"
-                onDragStart={(e) => {
-                  e.stopPropagation();
-                  e.dataTransfer.effectAllowed = "move";
-                  e.dataTransfer.setData("text/plain", t.thread_id);
-                  setDragThread(t.thread_id);
-                }}
-                onDragEnd={() => {
-                  setDragThread(null);
-                  setGroupDropTarget(null);
-                }}
-                className="shrink-0 cursor-grab rounded px-0.5 text-fg-faint opacity-0 group-hover:opacity-100 hover:text-fg-muted"
-              >
-                ⠿
-              </span>
             )}
             <button
               type="button"

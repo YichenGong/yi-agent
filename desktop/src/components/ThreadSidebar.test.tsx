@@ -1694,10 +1694,7 @@ describe("会话分组框", () => {
     expect(screen.getByText("新建组（3）")).toBeTruthy();
   });
 
-  it("普通会话行本身不可拖（原生拖拽会吞掉 click）", async () => {
-    // 整行 draggable 时，macOS 上按下后手指/触控板移动一两像素就会触发原生
-    // dragstart，浏览器随后不再派发 click——三次点击只记到两条正是这么来的。
-    // 拖拽改由行内手柄发起，行本身不再是拖拽源。
+  it("无修饰键时普通会话行整行可拖", () => {
     const g: WorkspaceGroup[] = [
       {
         workspace: "/work/projA",
@@ -1707,28 +1704,53 @@ describe("会话分组框", () => {
     ];
     const { container } = renderSidebar({ groups: g });
     const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
-    expect(row.getAttribute("draggable")).not.toBe("true");
+    expect(row.getAttribute("draggable")).toBe("true");
+    // 手柄已经删掉：整行可拖之后它是多余的第二入口。
+    expect(container.querySelector("[data-drag-handle]")).toBeNull();
   });
 
-  it("行内拖拽手柄仍可发起进组拖拽", async () => {
-    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+  it("按着 Cmd 时整行不可拖（否则原生拖拽会吞掉点击多选）", () => {
+    // 整行 draggable 后，按着再移动一两像素就触发原生 dragstart，浏览器随即
+    // 不再派发 click——「点了三条只记到两条」正是这条路。修饰键按下即摘掉
+    // draggable，点击语义逐字不变。
     const g: WorkspaceGroup[] = [
       {
         workspace: "/work/projA",
         exists: true,
         threads: [thread("a", "A", "/work/projA"), thread("b", "B", "/work/projA")],
-        groups: [{ id: "g1", name: "登录模块", description: "", threadIds: ["b"] }],
       },
     ];
-    const { container } = renderSidebar({ groups: g, onSetGroupMembers });
-    const handle = container.querySelector<HTMLElement>('[data-drag-handle="a"]')!;
-    expect(handle.getAttribute("draggable")).toBe("true");
-    fireEvent.dragStart(handle, { dataTransfer: { setData: vi.fn(), setDragImage: vi.fn() } });
-    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
-    fireEvent.drop(box, { dataTransfer: { getData: () => "a" } });
-    await waitFor(() =>
-      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["b", "a"]),
-    );
+    const { container } = renderSidebar({ groups: g });
+    const row = () => container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    expect(row().getAttribute("draggable")).toBe("true");
+
+    fireEvent.keyDown(document, { key: "Meta" });
+    expect(row().getAttribute("draggable")).not.toBe("true");
+
+    fireEvent.keyUp(document, { key: "Meta" });
+    expect(row().getAttribute("draggable")).toBe("true");
+  });
+
+  it("按着 Cmd 时点击三条仍然只选三条、不触发拖拽", () => {
+    const onSelect = vi.fn();
+    const g: WorkspaceGroup[] = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: [
+          thread("a", "A", "/work/projA"),
+          thread("b", "B", "/work/projA"),
+          thread("c", "C", "/work/projA"),
+        ],
+      },
+    ];
+    const { container } = renderSidebar({ groups: g, onSelect });
+    fireEvent.keyDown(document, { key: "Meta" });
+    fireEvent.click(screen.getByText("A"), { metaKey: true, detail: 1 });
+    fireEvent.click(screen.getByText("B"), { metaKey: true, detail: 2 });
+    fireEvent.click(screen.getByText("C"), { metaKey: true, detail: 3 });
+    expect(container.querySelector("[data-selection-bar]")?.textContent).toContain("新建组（3）");
+    expect(onSelect).not.toHaveBeenCalled();
   });
 
   it("先打开一条会话，再 Cmd 点另外两条，三條都算进选择集", async () => {
