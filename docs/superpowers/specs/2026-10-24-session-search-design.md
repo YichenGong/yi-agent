@@ -211,8 +211,17 @@ document 级 keydown，全部满足才拦截并 `preventDefault()`：
 1. `session_search` flag 为 true；
 2. 有打开的会话（`sess.currentId !== null`）；
 3. 不在看板视图（`board.selectedBoard === null`）——看板不是转录；
-4. 没有模态弹窗（`[aria-modal="true"]` 不在 DOM 里）——设置页开着时
-   Cmd+F 不该抢焦点。`Modal.tsx:61` 与 `ApprovalDialog.tsx` 都带这个属性。
+4. 没有模态弹窗：`!prefs.settingsOpen && !current?.approval`。
+
+条件 4 用 App 已有的 state，**不查 DOM**。原打算用 `[aria-modal="true"]` 作判据，
+但实测只有 `Modal.tsx:61`（设置页）与 `ProcessDetail.tsx:137` 带这个属性，
+`ApprovalDialog` 只有 `role="dialog"`（`ApprovalDialog.tsx:59`）——用它就会在
+"等审批"时把 Cmd+F 放进一个被遮罩盖住的转录区。state 判据既覆盖全部弹层，
+也不依赖某个组件有没有记得写 ARIA 属性。
+
+监听器要能读到**最新**的这几项，不能被首次渲染的闭包钉死。做法与
+`App.tsx:440` 的 `flagsCall` 同源：把判据收敛进一个 ref（或让 effect 依赖
+这几个值从而重装监听），不要图省事用空依赖数组 + 直接闭包读 state。
 
 焦点恢复：打开前记住 `document.activeElement`，Close/Esc 时还给它。
 Esc 复用 `ui/useEscapeKey.ts`（`active = searchOpen`）。
