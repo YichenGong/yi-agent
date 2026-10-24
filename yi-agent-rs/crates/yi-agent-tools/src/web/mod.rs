@@ -6,7 +6,6 @@ pub mod search;
 pub mod unconfigured;
 
 pub use bocha::BochaSearchProvider;
-pub use config::{EngineConfig, Freshness, WebSearchConfig};
 pub use fetch::WebFetchTool;
 pub use provider::{SearchResult, WebSearchProvider};
 pub use search::WebSearchTool;
