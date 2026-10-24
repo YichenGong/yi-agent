@@ -256,6 +256,31 @@ describe("ChatView notices", () => {
     expect(screen.getByText("workspace-write")).toBeTruthy();
   });
 
+  it("renders a usage notice as the usage card", () => {
+    const list = [
+      {
+        type: "notice",
+        id: "n5",
+        text: "",
+        body: {
+          kind: "usage",
+          report: {
+            title: "Token 用量",
+            model: "claude-sonnet-4-20250514",
+            context: { used: 100, limit: null },
+            session: { rows: [{ label: "Input", value: 100 }], isSnapshot: false },
+            subagent: null,
+            cost: "$0.01",
+          },
+        },
+      },
+    ] as unknown as (Item | NoticeItem)[];
+    render(<ChatView items={list} />);
+    // 结构化载荷才是 /usage 的呈现；落到普通胶囊会把卡片压成一行灰字。
+    expect(screen.getByTestId("usage-card")).toBeTruthy();
+    expect(screen.queryByTestId("notice")).toBeNull();
+  });
+
   it("renders a plain notice as the compact capsule", () => {
     const list = [{ type: "notice", id: "n2", text: "对话已清空" }] as unknown as (
       | Item

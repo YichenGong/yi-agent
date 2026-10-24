@@ -1386,9 +1386,13 @@ describe("App slash commands", () => {
     fireEvent.change(textarea, { target: { value: "/usage" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    await screen.findByText(/上下文: 12,345 \/ 160,000 \(7\.7%\)/);
-    // `getByText` 会把连续空白折叠成一个，故这里按单空格断言。
-    expect(screen.getByText(/input: 12,345 output: 678/)).toBeTruthy();
+    // /usage 的输出是卡片，不是一段灰字：notice 容器没有 pre-wrap，
+    // 多行文本会被折叠成一行。
+    await screen.findByTestId("usage-card");
+    expect(screen.getByText("本轮用量")).toBeTruthy();
+    expect(screen.getByText("12,345 / 160,000 (7.7%)")).toBeTruthy();
+    expect(screen.getByText("12,345")).toBeTruthy();
+    expect(screen.getByText("678")).toBeTruthy();
     // 读的是当前会话的阈值,不是进程级快照。
     expect(clients[0].requests.find((r) => r.method === "config/read")?.params).toEqual({
       threadId: "t1",
@@ -1481,11 +1485,14 @@ describe("App slash commands", () => {
     fireEvent.change(textarea, { target: { value: "/usage" } });
     fireEvent.keyDown(textarea, { key: "Enter" });
 
-    // `getByText` 会把连续空白折叠成一个，故这里按单空格断言。
-    await screen.findByText(/累计 input: 1,000,000 output: 5,000/);
-    expect(screen.getByText(/累计 cache read: 800,000/)).toBeTruthy();
+    await screen.findByTestId("usage-card");
+    // 有累计值时标题是 Token 用量（不是「本轮用量」）。
+    expect(screen.getByText("Token 用量")).toBeTruthy();
+    expect(screen.getByText("1,000,000")).toBeTruthy();
+    expect(screen.getByText("800,000")).toBeTruthy();
+    expect(screen.getByText("5,000")).toBeTruthy();
     // 上下文仍是最后一次调用的 12,345，不是累计的 100 万。
-    expect(screen.getByText(/上下文: 12,345 \/ 160,000 \(7\.7%\)/)).toBeTruthy();
+    expect(screen.getByText("12,345 / 160,000 (7.7%)")).toBeTruthy();
   });
 
   it("renders /config as a card without touching the agent", async () => {

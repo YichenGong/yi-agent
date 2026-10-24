@@ -74,7 +74,7 @@ import {
   type ThreadMode,
 } from "./lib/threadPermissionMode";
 import { configReadParams } from "./lib/configRequest";
-import { formatUsage } from "./lib/usageCommand";
+import { buildUsageReport } from "./lib/usageCommand";
 import { parseTheme } from "./lib/theme";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { PairingScreen, needsPairing } from "./components/PairingScreen";
@@ -1841,13 +1841,14 @@ export default function App() {
         } catch {
           // 读配置失败不该吞掉用量：分母未知就只显示 token 数。
         }
-        // 累计值是 `/usage` 的主体；没有（老服务端）时函数内部退回快照。
-        // subagent 用量单独成段：它与主会话是两笔账，合在一行看不出谁花得多。
-        session.notice(
-          formatUsage(u, session.usageTotals, session.subagentTotals, {
+        // 累计值是 `/usage` 的主体；没有（老服务端）时报告内部退回快照并改标题。
+        // subagent 用量单独成组：它与主会话是两笔账，混在一起看不出谁花得多。
+        session.noticeBody({
+          kind: "usage",
+          report: buildUsageReport(u, session.usageTotals, session.subagentTotals, {
             compactThreshold: threshold,
           }),
-        );
+        });
         break;
       }
       case "config":
