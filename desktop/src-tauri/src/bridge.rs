@@ -208,6 +208,37 @@ fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+/// 实例状态根：`YI_AGENT_HOME` 优先，否则 `<home>/.yi-agent`。
+///
+/// 与 `yi_agent_store::paths::instance_home_from` 同一套归一化：覆盖值若不以
+/// `.yi-agent` 结尾会自动补上，这样所有消费者都能安全地拼 `.yi-agent/...`，
+/// 不会出现 `<dir>/.yi-agent/.yi-agent/...` 的双重嵌套。桌面壳刻意不依赖
+/// app-server crate，故此处镜像同一规则（sidecar 侧读的是同一个环境变量，
+/// 两侧因此解析到同一个目录）。
+fn instance_home_from(
+    override_value: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(dir) = override_value.filter(|value| !value.is_empty()) {
+        let dir = PathBuf::from(dir);
+        // 纯空白不算有效覆盖：`YI_AGENT_HOME="   "` 多半是启动脚本写错了。
+        if dir.as_os_str().to_string_lossy().trim().is_empty() {
+            // fall through to the default
+        } else if dir.file_name() == Some(std::ffi::OsStr::new(".yi-agent")) {
+            return Some(dir);
+        } else {
+            return Some(dir.join(".yi-agent"));
+        }
+    }
+    home.map(|home| home.join(".yi-agent"))
+}
+
+/// 进程级的实例状态根：`YI_AGENT_HOME` 环境变量 + `dirs::home_dir()`。
+fn instance_home() -> Option<PathBuf> {
+    let override_value = std::env::var_os("YI_AGENT_HOME").filter(|value| !value.is_empty());
+    instance_home_from(override_value.as_deref(), home_dir().as_deref())
+}
+
 /// `<home>/.yi-agent/preferences.json` — the file the sidecar reads/writes when
 /// its workdir is the user home (`spawn_once` anchors the sidecar there).
 ///
@@ -655,5 +686,48 @@ mod tests {
         assert_eq!(next_restart_delay(5), Duration::from_millis(5_000));
         assert_eq!(next_restart_delay(50), Duration::from_millis(5_000));
         assert_eq!(next_restart_delay(u32::MAX), Duration::from_millis(5_000));
+    }
+
+    /// `YI_AGENT_HOME` 非空时赢，且不以 `.yi-agent` 结尾会自动补上。
+    #[test]
+    fn instance_home_prefers_a_non_blank_override() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let value = dir.path().as_os_str().to_owned();
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            instance_home_from(Some(&value), Some(home)),
+            Some(dir.path().join(".yi-agent"))
+        );
+    }
+
+    /// 覆盖值已经叫 `.yi-agent` 时不再嵌套。
+    #[test]
+    fn instance_home_does_not_double_nest() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let value = dir.path().join(".yi-agent");
+        assert_eq!(
+            instance_home_from(Some(value.as_os_str()), None),
+            Some(value)
+        );
+    }
+
+    /// 空白覆盖视同未设置，退化为 `<home>/.yi-agent`。
+    #[test]
+    fn instance_home_ignores_a_blank_override() {
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            instance_home_from(Some(std::ffi::OsStr::new("")), Some(home)),
+            Some(home.join(".yi-agent"))
+        );
+        assert_eq!(
+            instance_home_from(Some(std::ffi::OsStr::new("   ")), Some(home)),
+            Some(home.join(".yi-agent"))
+        );
+    }
+
+    /// 两侧都缺 → None。
+    #[test]
+    fn instance_home_is_none_without_any_home() {
+        assert_eq!(instance_home_from(None, None), None);
     }
 }
