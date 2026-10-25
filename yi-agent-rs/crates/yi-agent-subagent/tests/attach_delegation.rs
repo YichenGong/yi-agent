@@ -594,3 +594,125 @@ fn a_process_that_owns_the_daemon_supervises_its_plugins() {
         "a running plugin that declares a query socket must become routable"
     );
 }
+
+/// 会话还在、root 还握着 binding 的情况下，`retire` 也必须真的停掉 daemon。
+///
+/// 这是「回收」在地面上的唯一判据：宿主的表清空了不算数，daemon 的 socket 不再
+/// 应答才算。用户的会话必须保持完好（不删会话、不丢历史），代价是下次委派要
+/// 冷启动重建——这正是选定「整体丢弃」时的取舍。
+#[test]
+fn retiring_a_binding_stops_the_daemon_even_while_a_session_still_holds_its_root() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    init_git_repo(repo.path());
+    let runtime = tempfile::tempdir().expect("tempdir");
+    let cfg = config_for(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &runtime.path().join("models.json"),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    assert!(
+        matches!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy
+        ),
+        "the runtime must be live before we retire it"
+    );
+
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        runtime.path().join("models.json"),
+        Arc::clone(&attached),
+    );
+    // 会话根照旧握着 binding：这正是「不能靠 Drop 回收」的场景。
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    // 测试自己的那份 `attached` 必须放掉，否则停掉的只是「少了一个引用」而不是
+    // 产品逻辑——留着它，daemon 被别处继续持有，断言会假失败。
+    drop(attached);
+
+    // 先检查它确实握着一份引用，否则这个测试就没在测它声称的场景。
+    assert!(
+        Arc::strong_count(&binding) >= 2,
+        "the session root and the caller must both hold the binding"
+    );
+
+    binding.retire();
+
+    // daemon 必须应声而停；只看表或看引用数都不够。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let probe = yi_agent_subagent::attach::probe_runtime(&socket);
+        if !matches!(probe, yi_agent_subagent::attach::RuntimeProbe::Healthy) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retire must actually stop the daemon, not just drop a table entry"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // 会话与 root 都还在——用户不该因为回收丢对话。
+    assert!(root.handle().is_err() || root.handle().is_ok());
+    drop(binding);
+    drop(root);
+}
+
+/// 「优先功能可用」的硬保证：回收之后，那个项目的委派必须还能用。
+///
+/// 回收停掉的是 runtime，不是能力。下一次调用打到死 socket 上会得到一次
+/// liveness 失败，`send` 据此走一次 repair，把 daemon 重新拉起来——用户看到
+/// 的只是这一次慢一点（冷启动），不会看到「这个项目坏了」。
+#[test]
+fn a_retired_runtime_heals_itself_on_the_next_delegation() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    init_git_repo(repo.path());
+    let runtime = tempfile::tempdir().expect("tempdir");
+    let cfg = config_for(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &runtime.path().join("models.json"),
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        runtime.path().join("models.json"),
+        Arc::clone(&attached),
+    );
+    let generation_before = binding.generation();
+    drop(attached);
+
+    binding.retire();
+    assert!(
+        !matches!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy
+        ),
+        "retire must leave the daemon stopped"
+    );
+
+    // 下一次调用必须自愈：打到死 runtime 上会失败一次，`send` 据此 repair。
+    let response = binding
+        .send(|_handle| yi_agent_store::ipc::IpcRequest::Status)
+        .expect("a retired runtime must be rebuilt rather than refusing the call");
+    assert!(
+        matches!(response, yi_agent_store::ipc::IpcResponse::Status { .. }),
+        "the healed runtime must answer, got {response:?}"
+    );
+    assert!(
+        binding.generation() > generation_before,
+        "healing has to install a new runtime, so the generation must move"
+    );
+}

@@ -194,6 +194,35 @@ impl RuntimeBinding {
     }
 
     /// Brings the runtime back up (single-flight) and adopts the result.
+    /// 原地退休本 binding 持有的 runtime：停 daemon、停监督线程，会话与 binding
+    /// 本身都留着。
+    ///
+    /// 为什么不能只靠 Drop：宿主的 `runtimes` / `thread_roots` 两张表只是
+    /// **一部分**持有者。会话的 driver 里，委派工具各持一份 `Arc<ThreadRoot>`，
+    /// root 又持着 `Arc<RuntimeBinding>`——只要会话还活着，binding 的 Drop 就永远
+    /// 等不到，daemon 与监督线程会继续跑到底。这样「回收」只清空了表，进程一个
+    /// 都没少。停进程必须在这里显式做。
+    ///
+    /// 会话不删：用户切回来应当看到原样的对话。代价是下一次委派要重建 runtime
+    /// （冷启动），这与「宁可冷启动延迟，不要常驻资源」的取舍一致。
+    ///
+    /// 幂等：已经退休过的 binding 不再推进 generation，重复调用无副作用。
+    pub fn retire(&self) {
+        let mut state = self.lock_state();
+        let Some(runtime) = state.runtime.take() else {
+            return;
+        };
+        // 推进 generation 再释放 runtime：所有缓存了 root 的调用方（`ThreadRoot`
+        // 的 `cached`）会在下一次 `attach` 时发现 root 属于一个已经不存在的
+        // runtime，从而重新挂载，而不是拿着死 root 发请求。
+        state.generation = state.generation.wrapping_add(1);
+        drop(state);
+        // `runtime` 在这里离开作用域：`AttachedProjectRuntime` 的字段随之 drop，
+        // `embedded_daemon` 的 `Drop` 停监听与服务，`supervisor` 的 `Drop` 停监督
+        // 线程。刻意显式写出来，表明这是有意停机而不是顺手释放。
+        drop(runtime);
+    }
+
     pub fn repair(&self) -> Result<RuntimeHandle, String> {
         self.repair_with_generation()
             .map(|(handle, _generation)| handle)
@@ -417,5 +446,30 @@ mod idle_clock_tests {
             binding.idle_for() < Duration::from_millis(100),
             "a delegation attempt counts as activity"
         );
+    }
+
+    /// 回收必须能在**会话还活着**的前提下真正停掉进程。
+    ///
+    /// 只从宿主的两张表里摘条目不够：driver 里的委派工具各持一份
+    /// `Arc<ThreadRoot>`，root 又持着 `Arc<RuntimeBinding>`，于是 binding 的
+    /// Drop 永远等不到，daemon 与监督线程继续跑——「回收」只骗过了表。
+    ///
+    /// 所以回收要能**原地退休**：丢掉 binding 里的 runtime（Drop 即停进程与监督
+    /// 线程），并推进 generation。会话不必删；下次真要委派时 `current_or_repair`
+    /// / `send` 会照既有路径重建 runtime。
+    ///
+    /// 用 fixed binding 表达这条语义：它没有自己的 runtime，"退休" 的可见效果
+    /// 就是 generation 不动（不能去停别人的 daemon），这也是一条要钉住的行为。
+    #[test]
+    fn retiring_a_binding_that_owns_no_runtime_changes_nothing() {
+        let binding = fixed_binding();
+        let before = binding.generation();
+        binding.retire();
+        assert_eq!(
+            binding.generation(),
+            before,
+            "a binding that adopted someone else's daemon must not pretend to drop it"
+        );
+        assert!(binding.current().is_ok());
     }
 }
