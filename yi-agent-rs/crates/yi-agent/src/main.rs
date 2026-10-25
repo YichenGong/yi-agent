@@ -760,11 +760,23 @@ pub(crate) fn control_daemon(cli: &Cli, action: DaemonAction) -> Result<()> {
     }
 }
 
+/// Builds the worker factory that the daemon uses to spawn subagents.
+///
+/// Resolves its config exactly like the TUI's own turn does: leniently, then
+/// through the model catalog. The strict loader knows only about CLI overrides
+/// and real process environment variables, so on a catalog-only machine (the
+/// normal state after model keys were migrated out of `.env` into
+/// `models.json`) it bails with `API key required` -- and since this factory is
+/// built before the daemon starts, that aborted the whole runtime attach on
+/// launch. `worker_factory` then picks the subagent entry (or the catalog
+/// default) from the config it is handed.
 fn build_daemon_worker_factory(
     cli: &Cli,
     runtime_socket: std::path::PathBuf,
 ) -> Result<Arc<dyn yi_agent_core::subagent::worker::AgentWorkerFactory>> {
-    let config = config::load(cli)?;
+    let config = config::load_lenient(cli)?;
+    let catalog = yi_agent_runtime::models::load_catalog();
+    let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
     yi_agent_subagent::attach::worker_factory(
         &config,
         runtime_socket,
@@ -1020,6 +1032,15 @@ fn runtime_unavailable_reason(error: &yi_agent_store::ipc::IpcError) -> String {
     format!("subagent delegation unavailable: {error}")
 }
 
+/// The same actionable line for failures raised before the daemon exists.
+///
+/// Building the worker factory happens first (its config feeds the daemon), so
+/// its errors are plain `anyhow` ones rather than IPC codes. They still mean
+/// "delegation is unavailable", never "a turn failed".
+fn worker_factory_unavailable_reason(error: &anyhow::Error) -> String {
+    format!("subagent delegation unavailable: {error}")
+}
+
 /// Turns a rejected attach response into an actionable, human-readable reason.
 ///
 /// A raw `{response:?}` dump buries the real cause (for example a dirty
@@ -1122,19 +1143,29 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
     // in the project directory, so it would outlive any restart. Retire it so
     // the `start_with_factory` below replaces it with a working one.
     replace_wedged_daemon(&socket_path);
-    let embedded_daemon = match yi_agent_store::ipc::Daemon::start_with_factory(
-        &runtime_dir,
-        &database,
-        build_daemon_worker_factory(cli, socket_path.clone())?,
-    ) {
-        Ok(daemon) => Some(daemon),
-        Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+    // Build the factory before starting the daemon, but never let its failure
+    // escape: a bring-up failure is a delegation notice, not a failed turn. The
+    // strict loader used to bail here with `API key required`, and the escaping
+    // `?` turned that into `Error: provider turn admission failed: ...` on a
+    // launch where no turn had been attempted.
+    let factory = match build_daemon_worker_factory(cli, socket_path.clone()) {
+        Ok(factory) => factory,
         Err(error) => {
-            let reason = runtime_unavailable_reason(&error);
+            let reason = worker_factory_unavailable_reason(&error);
             tracing::warn!(error = %error, "{reason}");
             return Ok(Some(TuiRuntimeSession::unavailable(reason)));
         }
     };
+    let embedded_daemon =
+        match yi_agent_store::ipc::Daemon::start_with_factory(&runtime_dir, &database, factory) {
+            Ok(daemon) => Some(daemon),
+            Err(yi_agent_store::ipc::IpcError::AlreadyRunning { .. }) => None,
+            Err(error) => {
+                let reason = runtime_unavailable_reason(&error);
+                tracing::warn!(error = %error, "{reason}");
+                return Ok(Some(TuiRuntimeSession::unavailable(reason)));
+            }
+        };
     // 只有"我起的 daemon"才该由我监督：借用了别人的 daemon 还去监督，
     // 两边会互相拉/停同一批插件进程。
     let owns_daemon = embedded_daemon.is_some();
@@ -2721,6 +2752,84 @@ mod tests {
         assert!(
             source.contains(&needle),
             "run_app_server must use the lenient loader"
+        );
+    }
+
+    /// The subagent worker factory feeds the daemon that the TUI attaches to on
+    /// launch. It must resolve its config the same way the TUI's own turn does:
+    /// leniently, then through the model catalog.
+    ///
+    /// A catalog-only machine (settings UI configured, `models.json` holds the
+    /// key, no model env vars -- the normal state after model keys were migrated
+    /// out of `.env`) has no key for the strict loader, so the strict loader
+    /// bails with `API key required`. That error reached the driver's fallback
+    /// arm and rendered as `Error: provider turn admission failed: ...` before
+    /// the user typed anything.
+    ///
+    /// The guard is a source assertion because the regression is literally a
+    /// one-word loader swap in one function, and because driving the real path
+    /// needs a live daemon. `build_daemon_worker_factory` is isolated by slicing
+    /// to the next column-0 `\nfn ` so a longer function further down cannot
+    /// satisfy the needles.
+    #[test]
+    fn the_daemon_worker_factory_resolves_its_config_through_the_catalog() {
+        // Needles built from fragments so this test's own source cannot match.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn build_daemon_worker_factory(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("build_daemon_worker_factory must exist");
+        let strict = ["config::load(", "cli)"].concat();
+        let lenient = ["config::load_lenient", "(cli)"].concat();
+        let catalog = ["models::load_catalog", "()"].concat();
+        let resolve = ["models::resolve_effective", "(&config, &catalog"].concat();
+        assert!(
+            !body.contains(&strict),
+            "the worker factory must not use the strict loader: a catalog-only machine has no \
+             key until the catalog resolves, so the daemon would report `API key required`"
+        );
+        assert!(
+            body.contains(&lenient),
+            "the worker factory must load leniently, like run_agent and run_headless"
+        );
+        assert!(
+            body.contains(&catalog) && body.contains(&resolve),
+            "the worker factory must resolve the config through the model catalog"
+        );
+    }
+
+    /// A failure to build the worker factory is a runtime bring-up failure, not
+    /// a failed conversation turn.
+    ///
+    /// `attach_tui_runtime` returns `Result<Option<TuiRuntimeSession>>`; letting
+    /// the factory error escape with `?` skipped the `Unavailable` notice path
+    /// and landed in the driver's `Err` arm, which emitted
+    /// `AgentError::ProviderTurnAdmission`. Users then saw `Error: provider turn
+    /// admission failed: API key required: ...` -- an error about a turn, on a
+    /// launch where no turn had been attempted.
+    #[test]
+    fn attach_tui_runtime_reports_a_factory_failure_as_unavailable() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn attach_tui_runtime(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("attach_tui_runtime must exist");
+        let escaping = [
+            "build_daemon_worker_factory(cli, socket_path.clone())",
+            "?,",
+        ]
+        .concat();
+        assert!(
+            !body.contains(&escaping),
+            "a worker-factory failure must become a TuiRuntimeSession::Unavailable notice, \
+             not an escaping error that the driver renders as a failed turn"
+        );
+        let unavailable = ["TuiRuntimeSession::unavailable(", "reason)"].concat();
+        assert!(
+            body.contains(&unavailable),
+            "attach_tui_runtime must funnel bring-up failures through the Unavailable notice"
         );
     }
 
