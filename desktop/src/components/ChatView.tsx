@@ -480,6 +480,10 @@ export function ChatView({
   // （resume/readItems 尚未回包），此刻若先把 threadId 记下来，等回包后内容
   // 出现时已经"恢复过了"，于是再也补不上——表现为用户被永久留在底部。
   const restoredFor = useRef<string | null | undefined>(undefined);
+  /** 已恢复到的位置；漂移校正据此把这一行维持在它当初的偏移上。 */
+  const heldAnchor = useRef<ViewAnchor | null>(null);
+  /** 用户恢复后自己滚动过 → 位置归他，不再校正。 */
+  const userTookOver = useRef(false);
   useLayoutEffect(() => {
     const el = elRef.current;
     if (!el) return;
@@ -517,12 +521,84 @@ export function ChatView({
     }
     el.scrollTop = next;
     restoredFor.current = threadId;
+    // 记住"这一行应该在视口顶"，供下方的漂移校正使用。
+    heldAnchor.current = anchor;
     // 恢复完立刻放弃跟随，否则下一条 delta 会把人拽回底部。
     releaseFollow();
     // `items.length` 是"可恢复的时机"：冷会话回放是**分帧**到达的，而生产环境下
     // `anchor` 是 Map 里的同一个对象（引用恒定）。只依赖 `anchor` 会让这个 effect
     // 在内容真正出现时不再重跑，恢复永远补不上（实测停在 2424 而非 1200）。
   }, [threadId, anchor, items.length, syncing, scrollToBottom, releaseFollow]);
+
+  // 恢复之后，锚点**上方**的内容还可能改变高度：图片是异步读出来的
+  // （`BubbleImage` 在拿到 url 之前返回 null，高度 0），工具卡/推理块也可能
+  // 展开。它们一变高，锚点那一行就被整体推下去，用户看到的已经不是离开时的
+  // 那一屏——实测偏移 300px。
+  //
+  // 所以恢复不是"写一次 scrollTop 就完事"，而是：只要用户自己还没滚动，
+  // 就一直维持"锚点行顶边落在它当初的偏移上"。用户一滚动即接管，不再干预。
+  useEffect(() => {
+    const el = elRef.current;
+    if (!el) return;
+    const held = heldAnchor.current;
+    if (!held || restoredFor.current !== threadId) return;
+
+    let frame: number | null = null;
+    const realign = () => {
+      frame = null;
+      const node = elRef.current;
+      if (!node || heldAnchor.current !== held) return;
+      if (userTookOver.current) return;
+      const row = Array.from(node.querySelectorAll<HTMLElement>("[data-item-id]")).find(
+        (n) => n.dataset.itemId === held.itemId,
+      );
+      if (!row) return;
+      const base = node.getBoundingClientRect().top - node.scrollTop;
+      const next = restoreScrollTop(
+        { id: held.itemId, top: row.getBoundingClientRect().top - base },
+        held,
+      );
+      if (next === null) return;
+      // 亚像素与行内重排不算漂移，避免无意义地反复写 scrollTop。
+      if (Math.abs(node.scrollTop - next) < 1) return;
+      node.scrollTop = next;
+    };
+    const schedule = () => {
+      if (frame !== null) return;
+      frame = requestAnimationFrame(realign);
+    };
+    // 用户自己的滚动即交还控制权：此后位置归他。
+    const onUserScroll = () => {
+      userTookOver.current = true;
+    };
+    el.addEventListener("scroll", onUserScroll, { passive: true });
+
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(schedule);
+      // 观察整个内容流：任何一条消息变高（图片加载、卡片展开）都会回调。
+      for (const child of el.querySelectorAll("[data-item-id]")) observer.observe(child);
+    }
+    // 没有 `ResizeObserver` 的环境（旧 WebView、测试）退化为轮询：只比总高度，
+    // 便宜且足以覆盖"图片加载后内容变高"。有观察者时轮询不启动。
+    let poll: number | null = null;
+    if (!observer) {
+      let lastHeight = el.scrollHeight;
+      poll = window.setInterval(() => {
+        const h = el.scrollHeight;
+        if (h === lastHeight) return;
+        lastHeight = h;
+        schedule();
+      }, 100);
+    }
+    schedule();
+    return () => {
+      el.removeEventListener("scroll", onUserScroll);
+      if (frame !== null) cancelAnimationFrame(frame);
+      if (poll !== null) window.clearInterval(poll);
+      observer?.disconnect();
+    };
+  }, [threadId]);
 
   useEffect(() => {
     const el = elRef.current;
