@@ -484,6 +484,8 @@ export function ChatView({
   const heldAnchor = useRef<ViewAnchor | null>(null);
   /** 用户恢复后自己滚动过 → 位置归他，不再校正。 */
   const userTookOver = useRef(false);
+  /** 上一次由**我们**写入的 `scrollTop`；用于识别它自己触发的 scroll 事件。 */
+  const selfScrolling = useRef<number | null>(null);
   useLayoutEffect(() => {
     const el = elRef.current;
     if (!el) return;
@@ -519,7 +521,12 @@ export function ChatView({
       scrollToBottom();
       return;
     }
-    el.scrollTop = next;
+    // 与漂移校正共用同一套"这是我们自己写的"标记：恢复这次的写入同样会
+    // 触发一个 scroll 事件，不能被读成用户接管。
+    selfScrolling.current = el.scrollTop = next;
+    window.setTimeout(() => {
+      selfScrolling.current = null;
+    }, 0);
     restoredFor.current = threadId;
     // 记住"这一行应该在视口顶"，供下方的漂移校正使用。
     heldAnchor.current = anchor;
@@ -561,14 +568,30 @@ export function ChatView({
       if (next === null) return;
       // 亚像素与行内重排不算漂移，避免无意义地反复写 scrollTop。
       if (Math.abs(node.scrollTop - next) < 1) return;
-      node.scrollTop = next;
+      // 记下这次是**我们自己**写的：紧随其后的 `scroll` 事件不是用户意图。
+      selfScrolling.current = node.scrollTop = next;
+      // 回声事件在同一轮任务里就会到；超时兜底清掉标记，免得它长期残留、
+      // 之后恰好滚到同一位置时把用户的滚动误吞掉。
+      window.setTimeout(() => {
+        selfScrolling.current = null;
+      }, 0);
     };
     const schedule = () => {
       if (frame !== null) return;
       frame = requestAnimationFrame(realign);
     };
     // 用户自己的滚动即交还控制权：此后位置归他。
+    //
+    // **必须排除我们自己写入引起的事件**：真实浏览器在程序化设置 `scrollTop`
+    // 之后同样会派发 `scroll`（异步）。若一律当成用户接管，这个校正会在恢复的
+    // 那一刻就把自己关掉，锚点上方内容一变高就再也没人管——这正是"偏差有点大"
+    // 的直接原因（实测停在 1012，应为 1312）。jsdom 不派发该事件，所以单元测试
+    // 曾经全绿。
     const onUserScroll = () => {
+      const written = selfScrolling.current;
+      selfScrolling.current = null;
+      // 位置正是我们刚写下的值 ⇒ 这是自己的回声，不是用户。
+      if (written !== null && Math.abs(el.scrollTop - written) < 1) return;
       userTookOver.current = true;
     };
     el.addEventListener("scroll", onUserScroll, { passive: true });
