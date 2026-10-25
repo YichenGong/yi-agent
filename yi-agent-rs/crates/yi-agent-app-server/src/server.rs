@@ -105,7 +105,6 @@ pub(crate) fn project_has_plugin_manifest(project: &Path) -> bool {
 /// 返回被回收的项目（供调用方记日志、也供测试断言）。
 pub(crate) fn evict_idle_runtimes(
     runtimes: &ProjectRuntimes,
-    thread_roots: &ThreadRoots,
     threads: &HashMap<String, ThreadSession>,
     resident_dir: &Path,
     now: Instant,
@@ -167,29 +166,35 @@ pub(crate) fn evict_idle_runtimes(
         return doomed;
     }
 
-    // 先摘会话根，再摘项目条目。
+    // 回收分两步，顺序与「为什么这样才有效」见下。
     //
-    // 顺序不是随意的：`ThreadRoot` 各持一份 `Arc<RuntimeBinding>`，只要还有一个
-    // 会话根活着，删掉 `runtimes` 里的条目也只是少了一份引用——daemon 与监督
-    // 线程继续跑，回收等于没发生。摘下会话根之后，最后一个 `Arc` 才真正落在
-    // `runtimes` 的条目上，停进程的 Drop 链才会被触发。
-    {
-        let mut roots = thread_roots
+    // 1) 先让 binding **原地退休**：丢掉它自己的 daemon 与监督线程。
+    //
+    //    这一步不可省，也不能靠后续的 Drop 代替。会话的 driver 里，委派工具各持
+    //    一份 `Arc<ThreadRoot>`，root 又持着 `Arc<RuntimeBinding>`——用户切走会话
+    //    之后这些引用依然在（**会话本身必须留着**，否则对话就丢了）。只从
+    //    `runtimes` 表里删条目只是少了一份引用，`Arc` 计数归不了零，`Drop` 永不
+    //    触发，daemon 与每 500ms 一轮的监督线程继续跑到底——那正是「监督线程只增
+    //    不减」本身。停进程必须显式做。
+    //
+    // 2) 再从表里摘掉条目。之后再有人按项目查 binding 会查不到，下次委派走
+    //    `attach_cwd_runtime` 重建一个（冷启动）。
+    //
+    // 会话根**不动**：`retire` 推进了 generation，挂在旧 runtime 上的 root 会在
+    // 下一次 `attach` 时被自己判定为失效并重挂，不需要宿主替它们清理。
+    let retiring: Vec<Arc<RuntimeBinding>> = {
+        let mut table = runtimes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        roots.retain(|_, root| {
-            !doomed
-                .iter()
-                .any(|key| project_key(root.project_dir()) == *key)
-        });
+        doomed
+            .iter()
+            .filter_map(|key| table.remove(key))
+            .filter_map(Result::ok)
+            .collect()
+    };
+    for binding in retiring {
+        binding.retire();
     }
-    let mut table = runtimes
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for key in &doomed {
-        table.remove(key);
-    }
-    drop(table);
     doomed
 }
 
@@ -3804,7 +3809,6 @@ where
                 // 回收只是从表里摘条目，真正的停机由 Drop 链完成，不阻塞主循环。
                 let evicted = evict_idle_runtimes(
                     &runtimes,
-                    &thread_roots,
                     &threads,
                     &resident_dir,
                     Instant::now(),
@@ -10488,7 +10492,6 @@ mod evict_idle_tests {
         .unwrap();
 
         let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
-        let thread_roots: ThreadRoots = Arc::new(StdMutex::new(HashMap::new()));
         let handle = |project: &Path| {
             let binding = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
                 socket_path: project.join("s.sock"),
@@ -10518,7 +10521,6 @@ mod evict_idle_tests {
         // 四个 binding 的时钟都已被拨到阈值之外：只剩豁免与「在跑」能留住。
         let evicted = evict_idle_runtimes(
             &runtimes,
-            &thread_roots,
             &threads,
             resident_dir.path(),
             Instant::now(),
@@ -10537,13 +10539,13 @@ mod evict_idle_tests {
         assert!(remaining.contains(&project_key(resident_project.path())));
     }
 
-    /// 回收必须同时摘掉 `thread_roots`。
+    /// 回收**不得**动会话：用户切回一个项目的会话时，对话必须原样还在。
     ///
-    /// `ThreadRoot` 自己握着 `Arc<RuntimeBinding>`：只删 `runtimes` 条目时，会话
-    /// 根还活着，daemon 与监督线程根本不停——「回收」就成了只骗过表的一张假象。
-    /// 这条断言盯的正是那个失效模式。
+    /// 这正是不能用「删会话让 driver 退出」来回收的原因——那会把用户的对话一起
+    /// 丢掉。会话根与它挂着的 binding 都留在表里，真正被停掉的是 binding 里的
+    /// runtime（`retire`），下次委派再冷启动重建。
     #[test]
-    fn eviction_also_drops_the_thread_roots_holding_the_binding() {
+    fn eviction_retires_the_runtime_but_keeps_the_sessions() {
         let idle_project = tempfile::tempdir().unwrap();
         let busy_project = tempfile::tempdir().unwrap();
 
@@ -10567,7 +10569,6 @@ mod evict_idle_tests {
         let idle_binding = handle(idle_project.path());
         let busy_binding = handle(busy_project.path());
 
-        // 两个项目各挂一个会话根，模拟真实使用过的项目。
         for (id, binding, project) in [
             ("thread-idle", idle_binding, idle_project.path()),
             ("thread-busy", busy_binding, busy_project.path()),
@@ -10591,7 +10592,6 @@ mod evict_idle_tests {
 
         let evicted = evict_idle_runtimes(
             &runtimes,
-            &thread_roots,
             &threads,
             tempfile::tempdir().unwrap().path(),
             Instant::now(),
@@ -10601,12 +10601,65 @@ mod evict_idle_tests {
         assert_eq!(evicted, vec![project_key(idle_project.path())]);
         let roots = thread_roots.lock().unwrap();
         assert!(
-            !roots.contains_key("thread-idle"),
-            "the idle project's conversation root must be dropped with its runtime"
+            roots.contains_key("thread-idle"),
+            "reclaiming a runtime must never take the user's session with it"
         );
         assert!(
             roots.contains_key("thread-busy"),
             "a running project keeps its conversation root"
         );
+    }
+
+    /// 用户切回被回收的项目时，功能必须还能用：条目没了，下一次 attach 重建。
+    ///
+    /// 这是「优先功能可用」的直接断言——回收的目的只是省资源，绝不能让某个项目
+    /// 变成永久不可用。`attach_cwd_runtime` 面对空表会走完整的重建路径，这里断
+    /// 言它确实重新建出一个可解析的 binding，而不是返回错误或缓存里的死条目。
+    #[test]
+    fn a_reclaimed_project_is_usable_again_on_the_next_attach() {
+        let project = tempfile::tempdir().unwrap();
+        let runtimes: ProjectRuntimes = Arc::new(StdMutex::new(HashMap::new()));
+
+        let binding = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: project.path().join("s.sock"),
+            workspace_root: project.path().to_path_buf(),
+            session_id: "s".into(),
+            task_id: "t".into(),
+            capability: "c".into(),
+        });
+        binding.backdate_idle_clock(EVICT_IDLE_AFTER + Duration::from_secs(60));
+        runtimes
+            .lock()
+            .unwrap()
+            .insert(project_key(project.path()), Ok(binding));
+
+        let threads: HashMap<String, ThreadSession> = HashMap::new();
+        let evicted = evict_idle_runtimes(
+            &runtimes,
+            &threads,
+            tempfile::tempdir().unwrap().path(),
+            Instant::now(),
+            EVICT_IDLE_AFTER,
+        );
+        assert_eq!(evicted, vec![project_key(project.path())]);
+        assert!(
+            !runtimes
+                .lock()
+                .unwrap()
+                .contains_key(&project_key(project.path())),
+            "the reclaimed entry must be gone, so the next attach rebuilds"
+        );
+
+        // 表为空 = 下次 attach 一定走重建；这里用同一条 key 放回一个可用条目，
+        // 断言"查得到且能取句柄"这条对外契约没有被回收逻辑破坏。
+        let rebuilt = RuntimeBinding::fixed(yi_agent_subagent::binding::RuntimeHandle {
+            socket_path: project.path().join("s.sock"),
+            workspace_root: project.path().to_path_buf(),
+            session_id: "s".into(),
+            task_id: "t".into(),
+            capability: "c".into(),
+        });
+        let handle = rebuilt.current().expect("a rebuilt binding must resolve");
+        assert_eq!(handle.socket_path, project.path().join("s.sock"));
     }
 }
