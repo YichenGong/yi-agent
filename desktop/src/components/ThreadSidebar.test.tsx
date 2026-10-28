@@ -2100,6 +2100,36 @@ describe("拖动会话进组", () => {
   const hover = (el: Element) => fireEvent.pointerEnter(el, { pointerId: 1 });
   const release = () => fireEvent.pointerUp(window, { pointerId: 1 });
 
+  it("当前会话行（正在查看的那条）同样能拖进组", async () => {
+    // 用户报：被点中的当前会话拖不动，非当前会话进出组都正常。差别只在
+    // `active` —— 这条钉住「当前会话行也是拖拽源」，否则它会成为唯一拖不动的行。
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers, currentId: "c" });
+    const row = container.querySelector<HTMLElement>('[data-thread-row="c"]')!;
+    const box = container.querySelector<HTMLElement>('[data-group-box="g1"]')!;
+    startDrag(row);
+    hover(box);
+    release();
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", ["a", "c"]),
+    );
+  });
+
+  it("当前会话行也能被别的会话拖拽移出组", async () => {
+    // 另一侧：当前会话行作为「移出」落点也必须有效。
+    const onSetGroupMembers = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers, currentId: "b" });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const inGroup = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const currentRow = container.querySelector<HTMLElement>('[data-thread-row="b"]')!;
+    startDrag(inGroup);
+    hover(currentRow);
+    release();
+    await waitFor(() =>
+      expect(onSetGroupMembers).toHaveBeenCalledWith("/work/projA", "g1", []),
+    );
+  });
+
   it("拖动一条未选中的行到组框只加这一条", async () => {
     const onSetGroupMembers = vi.fn().mockResolvedValue(true);
     const { container } = renderSidebar({ groups: dragBase, onSetGroupMembers });
