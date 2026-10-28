@@ -2370,7 +2370,7 @@ describe("拖动会话进组", () => {
   });
 });
 
-describe("分组功能的实验开关", () => {
+describe("分组功能（常开）", () => {
   const grouped: WorkspaceGroup[] = [
     {
       workspace: "/work/projA",
@@ -2380,37 +2380,15 @@ describe("分组功能的实验开关", () => {
     },
   ];
 
-  it("开关关闭时不渲染任何分组框，成员照常作为普通会话出现", () => {
-    // 关掉时既不能留一个点不动的空框，也不能让成员消失——那正是「我的会话
-    // 不见了」。两者都只在这个用例里才能被抓住。
-    const { container } = renderSidebar({ groups: grouped, groupsEnabled: false });
-    expect(container.querySelector("[data-group-box]")).toBeNull();
-    expect(container.querySelector('[data-thread-row="a"]')).toBeTruthy();
-    expect(container.querySelector('[data-thread-row="b"]')).toBeTruthy();
-  });
-
-  it("开关关闭时没有「新建组」入口，也没有分组相关菜单项", () => {
-    const { container } = renderSidebar({ groups: grouped, groupsEnabled: false });
-    expect(screen.queryByText(/新建组/)).toBeNull();
-
-    fireEvent.contextMenu(container.querySelector('[data-thread-row="a"]')!);
-    expect(screen.queryByText(/加入分组/)).toBeNull();
-  });
-
-  it("开关打开时分组框与「新建组」入口都出现", () => {
-    const { container } = renderSidebar({ groups: grouped, groupsEnabled: true });
+  // 2026-10-29 转正：`session_groups` 开关删除后，原先三个「开关关闭时…」的
+  // 用例失去了被测对象（再没有"关闭"这个状态）。留下这条，钉住"分组是天生的
+  // 默认行为"：组框在、成员收在框内不重复。
+  it("分组框与成员收进框内，不需要任何开关", () => {
+    const { container } = renderSidebar({ groups: grouped });
     expect(container.querySelector('[data-group-box="g1"]')).toBeTruthy();
     // 成员收在框里，不再重复出现在框外（框默认折叠，先展开）。
     fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
     expect(container.querySelectorAll('[data-thread-row="a"]').length).toBe(1);
-  });
-
-  it("关掉开关后成员回到各自原来的位置顺序", () => {
-    const { container } = renderSidebar({ groups: grouped, groupsEnabled: false });
-    const ids = Array.from(container.querySelectorAll("[data-thread-row]")).map((r) =>
-      r.getAttribute("data-thread-row"),
-    );
-    expect(ids).toEqual(["a", "b"]);
   });
 });
 
