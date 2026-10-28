@@ -1,6 +1,6 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, fireEvent, cleanup, screen, act, waitFor } from "@testing-library/react";
+import { render, fireEvent, createEvent, cleanup, screen, act, waitFor } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { ThreadSidebar } from "./ThreadSidebar";
 import { LONG_PRESS_MS } from "../lib/useLongPress";
@@ -2241,6 +2241,20 @@ describe("拖动会话进组", () => {
     startDrag(row);
     hover(box);
     expect(container.querySelector("[data-group-drop-active]")).toBeTruthy();
+  });
+
+  it("按下会阻止原生文本拖拽（否则 WKWebView 会吞掉后续指针事件）", () => {
+    // 真实 WKWebView 实测：在可选中文本上按下并拖动，WebKit 会启动原生
+    // NSDragging 会话（伴随 `selectstart`），而 Tauri 装了原生拖放处理器，
+    // 于是后续 pointermove/pointerup 一个都不再派发——拖拽永远走不到阈值。
+    // jsdom 复现不了这条平台行为，所以这里钉住的是**我们必须做的那件事**：
+    // 按下时 preventDefault，别让 WebKit 把这次手势认成文本选择。
+    const { container } = renderSidebar({ groups: dragBase });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    const row = container.querySelector<HTMLElement>('[data-thread-row="a"]')!;
+    const ev = createEvent.pointerDown(row, { bubbles: true, cancelable: true, button: 0, pointerId: 1 });
+    fireEvent(row, ev);
+    expect(ev.defaultPrevented).toBe(true);
   });
 
   it("手抖一两像素仍是点击：不进入拖拽态", () => {

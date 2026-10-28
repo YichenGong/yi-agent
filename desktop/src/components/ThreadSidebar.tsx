@@ -595,6 +595,12 @@ export function ThreadSidebar({
     // 进组拖拽按着修饰键时不起手：那时用户在点选，不是在拖。
     // 置顶区不设这道门——那里拖拽就是重排，与多选不争同一个动作。
     if (kind === "group" && (!dragEnabled || modifierDown)) return;
+    // 必须挡住原生文本拖拽：会话行标题是可选中文本，WebKit 在「按下 + 拖动」
+    // 时会先启动原生 NSDragging 会话（jsdom 与普通浏览器里看不出来，因为那些
+    // 环境没有 Tauri 装的原生拖放处理器）。而 Tauri 的处理器会把这次原生拖拽
+    // 判为「已消费」，于是后续 pointermove/pointerup 一个都不再派发到页面——
+    // 拖拽永远走不到 4px 阈值。preventDefault 让 WebKit 放弃启动该会话。
+    e.preventDefault();
     setDragOrigin({ id, kind, x: e.clientX, y: e.clientY, pointerId: e.pointerId });
     setDragActive(false);
   };
