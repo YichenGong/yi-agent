@@ -584,7 +584,7 @@ export function ThreadSidebar({
       setDragId(dragOrigin.id);
       return;
     }
-    setDragPayload(isSelected(dragOrigin.id) ? [...selected] : [dragOrigin.id]);
+    setDragPayload(isSelected(dragOrigin.id) ? effectiveSelection() : [dragOrigin.id]);
   };
 
   /** 指针按下：记下起手行与按下点。是否成拖由 window 上的位移判定。 */
@@ -738,6 +738,16 @@ export function ThreadSidebar({
    */
   const isSelected = (id: string) =>
     selected.size === 0 ? id === currentId : selected.has(id);
+
+  /**
+   * 「当前有效选择集」：显式选择为空时，前台那条算一条。
+   *
+   * `isSelected` 的显示规则与它必须同源，否则会出现「看起来选中、拖起来却是空的一批」
+   * ——`beginDragPayload` 曾直接拿 `isSelected` 判定、却取 `selected` 的原值，
+   * 于是拖前台那条等于拖一个空数组，松手什么都不发生（用户报的「当前会话拖不动」）。
+   */
+  const effectiveSelection = (): string[] =>
+    selected.size === 0 ? (currentId === null ? [] : [currentId]) : [...selected];
 
   function toggleSelected(id: string) {
     setSelected((prev) => {
