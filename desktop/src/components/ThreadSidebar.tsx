@@ -163,8 +163,6 @@ export function ThreadSidebar({
   statusStale = false,
   leadAgentEnabled = true,
   kanbanEnabled = true,
-  groupsEnabled = true,
-  dragEnabled = true,
 }: {
   groups: WorkspaceGroup[];
   /** Recent dirs for the New-thread dropdown. */
@@ -233,23 +231,6 @@ export function ThreadSidebar({
    * 所有既有侧栏渲染突然少一行组长。生产路径由 `App` 显式传入真实开关值。
    */
   leadAgentEnabled?: boolean;
-  /**
-   * 会话分组是否开启（`flags/list` 里的 `session_groups`）。
-   *
-   * 关掉时**整块分组 UI 都不渲染**：没有组框、没有「加入分组」菜单项、不能
-   * 多选建组。但成员会话本身照常以普通行出现在原位——关掉的是"框"，不是会话。
-   *
-   * 缺省 `true`，与 `leadAgentEnabled` / `kanbanEnabled` 同一理由：既有用法与
-   * 测试不传它。宿主（`App`）显式传 `=== true`，缺省值到不了生产。
-   */
-  groupsEnabled?: boolean;
-  /**
-   * 是否允许用行内手柄把会话拖进 / 拖出分组。
-   *
-   * 与 `groupsEnabled` 分开但同生同灭：分组关着时没有框可拖，宿主要把两者一起
-   * 传 `false`。缺省 `true`，与其它开关同一理由（既有用法不传它）。
-   */
-  dragEnabled?: boolean;
   /**
    * 整个 Superpowers 看板是否开启（`flags/list` 里的 `superpowers_kanban`）。
    *
@@ -594,7 +575,7 @@ export function ThreadSidebar({
     if (editingId === id) return;
     // 进组拖拽按着修饰键时不起手：那时用户在点选，不是在拖。
     // 置顶区不设这道门——那里拖拽就是重排，与多选不争同一个动作。
-    if (kind === "group" && (!dragEnabled || modifierDown)) return;
+    if (kind === "group" && modifierDown) return;
     // 必须挡住原生文本拖拽：会话行标题是可选中文本，WebKit 在「按下 + 拖动」
     // 时会先启动原生 NSDragging 会话（jsdom 与普通浏览器里看不出来，因为那些
     // 环境没有 Tauri 装的原生拖放处理器）。而 Tauri 的处理器会把这次原生拖拽
@@ -998,7 +979,7 @@ export function ThreadSidebar({
     const dragging = opts.rowAttr === "pinned";
     // 整行可拖：手柄几乎没人发现，而拖拽是「把会话放进框」最直觉的表达。
     // 按着修饰键时不拖——那时用户点的是多选，不是拖拽（见 `modifierDown`）。
-    const canDragIntoGroup = opts.rowAttr === "group" && dragEnabled;
+    const canDragIntoGroup = opts.rowAttr === "group";
     // 看板会话行多缩进一档（pl-7 vs pl-3）：折叠小节头是 ▸ 视觉起点，其下的
     // 会话若与直属行同一起点，就分不清谁属于谁。缩进让「小节头 → 卡片会话」的
     // 从属关系一眼可读。仅改左内边距，不影响拖拽/点击。
@@ -1269,7 +1250,7 @@ export function ThreadSidebar({
                 无标签
               </button>
             </div>
-            {groupsEnabled && groupsForThread(t.thread_id).length > 0 && (
+            {groupsForThread(t.thread_id).length > 0 && (
               <button
                 type="button"
                 role="menuitem"
@@ -1288,7 +1269,7 @@ export function ThreadSidebar({
                 移出分组（{groupsForThread(t.thread_id)[0].group.name}）
               </button>
             )}
-            {groupsEnabled && joinableGroups.length > 0 && (
+            {joinableGroups.length > 0 && (
               <div role="group" aria-label="加入分组" className="border-b border-line pb-1">
                 {joinableGroups.map(({ workspace, group }) => (
                   <button
@@ -1667,8 +1648,7 @@ export function ThreadSidebar({
           renderBoardEntry(g.workspace)}
         {!isCollapsed && renderBoardThreads(g)}
         {!isCollapsed &&
-          // 分组关着时按"没有组"布局：成员回归普通行、按服务端顺序排列。
-          layoutWorkspace(groupsEnabled ? g : { ...g, groups: [] })
+          layoutWorkspace(g)
             // 组长行单独渲染在列表最顶部（见 renderLeadRow），组内不再重复一条。
             // `!pinned` 只作用于**框外**的行：置顶的组内会话仍留在框里（spec 刻意例外），
             // 于是同一个会话可以在顶部 Pinned 区与框内各出现一次。
@@ -1714,9 +1694,7 @@ export function ThreadSidebar({
    * 建组要求所选会话同属一个 workspace——组不跨目录是硬约束（spec），在客户端
    * 先拦一道能给出可读提示，而不是让服务端回一个 -32602。
    */
-  // 分组关着时整条动作条都不出现：它此刻只有「新建组」一个动作，留着等于给
-  // 用户一个必然失败的按钮。
-  const selectionBar = !groupsEnabled || selected.size === 0 ? null : (
+  const selectionBar = selected.size === 0 ? null : (
     <div
       data-selection-bar=""
       className="sticky bottom-0 border-t border-line-strong bg-surface px-2 py-2"

@@ -2008,26 +2008,13 @@ impl Harness {
         )
     }
 
-    /// 自定义 config + 分组开关：需要指定 cwd 的分组用例用它。
-    pub(crate) async fn with_cfg_and_groups(cfg: RuntimeConfig) -> Self {
-        Self::with_config_and_flags(
-            cfg,
-            build_test_agent,
-            PERMISSION_TIMEOUT,
-            Scope::Admin,
-            false,
-            true,
-        )
-    }
-
-    /// 两个开关都能显式给：`with_config_lead_and_scope` 的开关全集版。
+    /// 自定义 config + 组长开关：`with_config_lead_and_scope` 的 config 版。
     fn with_config_and_flags<F>(
         cfg: RuntimeConfig,
         build: F,
         permission_timeout: Duration,
         scope: Scope,
         lead_agent_enabled: bool,
-        session_groups_enabled: bool,
     ) -> Self
     where
         F: Fn(
@@ -2063,7 +2050,6 @@ impl Harness {
             }),
             calls,
             lead_agent_enabled,
-            session_groups_enabled,
         )
     }
 
@@ -2140,8 +2126,6 @@ impl Harness {
             }),
             calls,
             lead_agent_enabled,
-            // 这个构造器只关心组长开关；分组开关的用例走 `with_cfg_and_groups`。
-            false,
         )
     }
 
@@ -2162,7 +2146,6 @@ impl Harness {
             install,
             uninstall,
             Arc::new(StdMutex::new(Vec::new())),
-            false,
             false,
         )
     }
@@ -2208,7 +2191,6 @@ impl Harness {
             }),
             calls,
             false,
-            false,
         )
     }
 
@@ -2227,8 +2209,6 @@ impl Harness {
         // 且共享进程级 `YI_AGENT_HOME`，并行测试必然互相污染；本 crate 的 lib
         // 测试从不注入 build info，`build_kind()` 恒为 "release"，写文件也无效。
         lead_agent_enabled: bool,
-        // 会话分组开关。同一理由走注入：写 `flags.json` 在 lib 测试里无效。
-        session_groups_enabled: bool,
     ) -> Self
     where
         F: Fn(
@@ -2316,8 +2296,6 @@ impl Harness {
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
-                // 分组开关。用例按需经构造器注入；默认关（= stable 行为）。
-                session_groups_enabled,
                 // 引导的 .env / preferences 也落在隔离目录里:onboarding/*
                 // 不得写开发者真实的 `~/.yi-agent`。
                 onboarding_env_path: index_dir.path().join(".env"),
@@ -4051,7 +4029,6 @@ async fn eof_exits_gracefully() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
-            session_groups_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
@@ -4137,7 +4114,6 @@ async fn agent_factory_failure_returns_internal_error() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
-            session_groups_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
@@ -4225,7 +4201,6 @@ async fn oversized_frame_returns_err() {
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
             lead_agent_enabled: false,
-            session_groups_enabled: false,
             onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
@@ -17703,7 +17678,6 @@ impl MergedHarness {
                 models_path: PathBuf::new(),
                 websearch_path: PathBuf::new(),
                 lead_agent_enabled: false,
-                session_groups_enabled: false,
                 onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
@@ -19679,7 +19653,7 @@ async fn an_interrupt_without_an_active_turn_is_an_error() {
 async fn list_all_carries_groups_and_hides_stale_members() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_cfg_and_groups(cfg).await;
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
@@ -19746,78 +19720,15 @@ async fn list_all_always_includes_an_empty_groups_array() {
     h.shutdown().await;
 }
 
-/// 分组开关关着时：列表不下发组表、写操作被拒。
+/// 分组已是常开能力：建组照常成功，列表照常下发组表。
 ///
-/// 关掉是**纯闸门**，不是删数据：`session_groups.json` 里已有的组原样留着，
-/// 重新打开立刻回来。所以这里只断言"看不见、改不动"，不断言文件被清空。
+/// （2026-10-29 转正：`session_groups` 开关连同服务端闸门一起删除，所以这里不再
+/// 有"关掉时看不见、改不动"的另一半——那条断言随闸门一起去掉了。）
 #[tokio::test(flavor = "multi_thread")]
-async fn groups_flag_off_hides_groups_and_refuses_writes() {
+async fn groups_are_listed_and_writable() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    // 默认 harness：分组开关为 false。
-    let mut h =
-        Harness::with_config_and_scope(cfg, build_test_agent, PERMISSION_TIMEOUT, Scope::Admin);
-    initialize(&mut h).await;
-
-    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
-        .await;
-    let tid = read_thread_start_response(&mut h, 2).await;
-    let ws = dir.path().canonicalize().unwrap().display().to_string();
-
-    // 先落一份真实的组到磁盘：模拟"功能开着时建过组，后来关掉了"。
-    {
-        let mut groups = crate::group_store::load(dir.path());
-        groups.push(crate::group_store::Group {
-            id: "grp-existing".into(),
-            name: "登录模块".into(),
-            description: String::new(),
-            thread_ids: vec![tid.clone()],
-        });
-        crate::group_store::save(dir.path(), &groups).unwrap();
-    }
-
-    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"thread/listAll","params":{}}"#)
-        .await;
-    let v = read_response(&mut h, 3).await;
-    let groups = v["result"]["groups"].as_array().unwrap();
-    let ws_group = groups.iter().find(|g| g["workspace"] == ws.as_str());
-    let ws_group = ws_group.expect("the workspace must still be listed");
-    assert_eq!(
-        ws_group["groups"],
-        serde_json::json!([]),
-        "with the flag off no group table may be sent: {ws_group}"
-    );
-    assert!(
-        ws_group["threads"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|t| t["thread_id"] == tid.as_str()),
-        "the thread itself must still be listed — hiding groups must not hide sessions"
-    );
-
-    let create = serde_json::json!({"jsonrpc":"2.0","id":4,"method":"thread/group/create",
-        "params":{"workspace": ws, "name": "x", "description": "", "threadIds":[tid]}});
-    h.send(&create.to_string()).await;
-    let v = read_response(&mut h, 4).await;
-    assert!(
-        v.get("error").is_some(),
-        "writes must be refused while the flag is off: {v}"
-    );
-    assert_eq!(v["error"]["code"], -32602);
-
-    // 磁盘上的组没被动过：关开关不等于删数据。
-    let kept = crate::group_store::load(dir.path());
-    assert_eq!(kept.len(), 1, "the flag must not delete existing groups");
-    h.shutdown().await;
-}
-
-/// 分组开关打开时：列表下发组表，写操作照常。
-#[tokio::test(flavor = "multi_thread")]
-async fn groups_flag_on_exposes_groups() {
-    let dir = tempfile::TempDir::new().unwrap();
-    let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_cfg_and_groups(cfg).await;
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
@@ -19829,10 +19740,7 @@ async fn groups_flag_on_exposes_groups() {
         "params":{"workspace": ws, "name": "登录模块", "description": "", "threadIds":[tid]}});
     h.send(&create.to_string()).await;
     let v = read_response(&mut h, 3).await;
-    assert!(
-        v.get("error").is_none(),
-        "create must succeed with the flag on: {v}"
-    );
+    assert!(v.get("error").is_none(), "create must succeed: {v}");
 
     h.send(r#"{"jsonrpc":"2.0","id":4,"method":"thread/listAll","params":{}}"#)
         .await;
@@ -19854,7 +19762,7 @@ async fn groups_flag_on_exposes_groups() {
 async fn group_create_persists_and_validates_workspace() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_cfg_and_groups(cfg).await;
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
@@ -19909,7 +19817,7 @@ async fn group_create_persists_and_validates_workspace() {
 async fn group_update_set_members_and_delete() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_cfg_and_groups(cfg).await;
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
@@ -20013,7 +19921,7 @@ async fn deleting_a_thread_prunes_it_from_groups() {
 async fn group_mutations_broadcast_groups_changed() {
     let dir = tempfile::TempDir::new().unwrap();
     let cfg = pin_test_config(dir.path());
-    let mut h = Harness::with_cfg_and_groups(cfg).await;
+    let mut h = Harness::with_cfg(cfg).await;
     initialize(&mut h).await;
 
     h.send(r#"{"jsonrpc":"2.0","id":2,"method":"thread/start","params":{}}"#)
