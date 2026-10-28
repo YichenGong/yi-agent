@@ -1859,6 +1859,49 @@ describe("会话分组框", () => {
     );
   });
 
+  it("点描述进入编辑后，点击其它会话行即保存", async () => {
+    // 用户要的正是这个：点别处 = 保存。浏览器在点击他处时会先把焦点移走并触发
+    // blur，所以这条链本该自然成立——但会话行的 `pointerdown` 为了挡住 WebKit
+    // 的原生文本拖拽而调了 `preventDefault`，那恰好抑制了焦点转移，blur 不再来，
+    // 描述就一直停在编辑态。故这条用**会话行按下**（真正坏掉的那条路）来钉。
+    const onUpdateGroup = vi.fn().mockResolvedValue(true);
+    const { container } = renderSidebar({ groups: boxGroups, onUpdateGroup });
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("三条线"));
+    const area = container.querySelector<HTMLTextAreaElement>("[data-group-description-input]")!;
+    fireEvent.change(area, { target: { value: "两条线" } });
+    fireEvent.pointerDown(container.querySelector<HTMLElement>('[data-thread-row="b"]')!);
+    await waitFor(() =>
+      expect(onUpdateGroup).toHaveBeenCalledWith("/work/projA", "grp-1", { description: "两条线" }),
+    );
+  });
+
+  it("点组名进入编辑后，点击其它区域也保存", async () => {
+    // 同一条路：组名输入框一样会被「按下不转移焦点」卡住。
+    const onUpdateGroup = vi.fn().mockResolvedValue(true);
+    const two = [
+      {
+        workspace: "/work/projA",
+        exists: true,
+        threads: boxThreads,
+        groups: [
+          { id: "grp-1", name: "登录模块", description: "", threadIds: ["b"] },
+          { id: "grp-2", name: "支付模块", description: "", threadIds: ["c"] },
+        ],
+      },
+    ] as WorkspaceGroup[];
+    const { container } = renderSidebar({ groups: two, onUpdateGroup });
+    // 展开后才有成员行可点——而成员行正是那条会 preventDefault 的路径。
+    fireEvent.click(screen.getByLabelText("展开分组 登录模块"));
+    fireEvent.click(screen.getByText("登录模块"));
+    const input = container.querySelector<HTMLInputElement>("[data-group-name-input]")!;
+    fireEvent.change(input, { target: { value: "扫码登录" } });
+    fireEvent.pointerDown(container.querySelector<HTMLElement>('[data-thread-row="b"]')!);
+    await waitFor(() =>
+      expect(onUpdateGroup).toHaveBeenCalledWith("/work/projA", "grp-1", { name: "扫码登录" }),
+    );
+  });
+
   it("组菜单里「删除组」调用 onDeleteGroup", async () => {
     const onDeleteGroup = vi.fn().mockResolvedValue(true);
     renderSidebar({ groups: boxGroups, onDeleteGroup });

@@ -601,6 +601,13 @@ export function ThreadSidebar({
     // 判为「已消费」，于是后续 pointermove/pointerup 一个都不再派发到页面——
     // 拖拽永远走不到 4px 阈值。preventDefault 让 WebKit 放弃启动该会话。
     e.preventDefault();
+    // 但 preventDefault 也一并抑制了**焦点转移**，于是在组名/描述输入框里编辑
+    // 时点会话行不会触发 blur，那两处「点别处 = 保存」就永远不保存。这里补上
+    // 焦点语义：把焦点从正在编辑的控件上主动移走，让它的 onBlur 照常跑。
+    const focused = document.activeElement;
+    if (focused instanceof HTMLElement && focused !== e.currentTarget && !e.currentTarget.contains(focused)) {
+      focused.blur();
+    }
     setDragOrigin({ id, kind, x: e.clientX, y: e.clientY, pointerId: e.pointerId });
     setDragActive(false);
   };
