@@ -20585,3 +20585,73 @@ async fn thread_delete_drops_the_view_frame() {
     );
     h.shutdown().await;
 }
+
+/// `image/read` 只应触碰被请求的那一段，而不是把整个文件读进内存再切片。
+///
+/// 判据用**相对比较**：同一个 20 MiB 文件，取最后一页 1 字节的耗时不应显著
+/// 高于取首页 1 字节。全量读实现下两者都是「读满 20 MiB」，比值接近 1 但
+/// **绝对开销与文件大小成正比**;区间读实现下两者都只碰 16 字节头 + 1 字节。
+/// 故这里改用更锐利的判据：页内字节数相同,比较 20 MiB 与 1 KiB 两个文件。
+#[tokio::test(flavor = "multi_thread")]
+async fn image_read_does_not_scale_with_file_size() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+
+    // 两张「png」：魔数正确即可通过 guess_format，其余填充随机性无关。
+    let png_magic: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    let big_path = dir.path().join("big.png");
+    let mut big = png_magic.to_vec();
+    big.resize(20 * 1024 * 1024, 0x41);
+    std::fs::write(&big_path, &big).unwrap();
+
+    let small_path = dir.path().join("small.png");
+    let mut small = png_magic.to_vec();
+    small.resize(1024, 0x41);
+    std::fs::write(&small_path, &small).unwrap();
+
+    // 取各自**最后一页**的第一字节：两者读取量都是 1 字节。
+    let big_offset = big.len() as u64 - 1;
+    let small_offset = small.len() as u64 - 1;
+
+    // 自由函数而不是闭包：闭包捕获 &mut h 后无法在循环里连续 await 两次。
+    async fn time_one_read(
+        h: &mut Harness,
+        tid: &str,
+        path: &str,
+        offset: u64,
+        id: u64,
+    ) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        h.send(&format!(
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"image/read","params":{{"threadId":"{tid}","path":"{path}","offset":{offset},"maxBytes":1}}}}"#
+        ))
+        .await;
+        let v = h
+            .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(id)))
+            .await;
+        assert_eq!(v["result"]["nextOffset"], serde_json::Value::Null, "{v}");
+        started.elapsed()
+    }
+
+    // 各跑三次取最小值，压掉文件系统缓存冷启动的抖动。串行 await，
+    // 不能用 join!/select!——那会交错两次读取，测不出单次开销。
+    let mut big_best = std::time::Duration::MAX;
+    let mut small_best = std::time::Duration::MAX;
+    let mut id = 80u64;
+    for _ in 0..3 {
+        big_best = big_best.min(time_one_read(&mut h, &tid, "big.png", big_offset, id).await);
+        id += 1;
+        small_best =
+            small_best.min(time_one_read(&mut h, &tid, "small.png", small_offset, id).await);
+        id += 1;
+    }
+    assert!(
+        big_best < small_best * 4,
+        "one 1-byte read must not scale with file size: \
+         20MiB={big_best:?} 1KiB={small_best:?}"
+    );
+    h.shutdown().await;
+}

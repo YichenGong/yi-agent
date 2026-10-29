@@ -7,6 +7,8 @@
 //! 换成 `return Ok(Flow::Continue)`——后者的语义由 `serve()` 翻回 `continue`,
 //! 与搬移前逐字一致。
 
+use std::io::{Read, Seek, SeekFrom};
+
 use base64::Engine as _;
 use serde_json::json;
 
@@ -16,6 +18,40 @@ use crate::server::{
     IMAGE_READ_CHUNK_BYTES, IMAGE_READ_MAX_BYTES, err_response, image_media_type, ok_response,
     thread_cwd, write_response,
 };
+
+/// 判定图片格式所需的头部字节数。
+///
+/// `image::guess_format` 只对 `MAGIC_BYTES` 逐条 `starts_with`
+/// (`image-0.25.10/src/io/free_functions.rs:145-158`)。本 crate 启用的
+/// png/jpeg/gif/webp 四个 feature 的签名分别是 8/3/6/12 字节,16 覆盖最长者。
+const IMAGE_HEADER_BYTES: usize = 16;
+
+/// 只读文件的 `[offset, offset + max_bytes)` 区间。
+///
+/// 与「全量读再切片」的区别是本 RPC 的核心修复:`image/read` 由客户端逐页
+/// 拉取(`desktop/src/lib/useImageData.ts:137`),原实现每页都把整个文件读进
+/// 内存,读一张 20 MiB 的图等于读 40 次 20 MiB。
+fn read_range(path: &std::path::Path, offset: u64, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; max_bytes as usize];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    buf.truncate(filled);
+    Ok(buf)
+}
+
+/// 读文件头部 `IMAGE_HEADER_BYTES` 字节,供 `guess_format` 判格式。
+fn read_header(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    read_range(path, 0, IMAGE_HEADER_BYTES as u64)
+}
 
 /// 处理本域的一个 RPC 请求。
 ///
@@ -138,8 +174,9 @@ pub(crate) async fn handle(
                 .await?;
                 return Ok(Flow::Continue);
             }
-            let bytes = match std::fs::read(&canonical) {
-                Ok(b) => b,
+            // 头部足够判格式(见 `IMAGE_HEADER_BYTES` 的说明),不必读全文。
+            let header = match read_header(&canonical) {
+                Ok(h) => h,
                 Err(e) => {
                     write_response(
                         state.hub,
@@ -154,7 +191,7 @@ pub(crate) async fn handle(
                 }
             };
             // 只送可解码的图片:以魔数判定,不看扩展名。
-            let format = match image::guess_format(&bytes) {
+            let format = match image::guess_format(&header) {
                 Ok(f) => f,
                 Err(_) => {
                     write_response(
@@ -166,16 +203,6 @@ pub(crate) async fn handle(
                     return Ok(Flow::Continue);
                 }
             };
-            // 元数据长度与实际读到的长度理论上可能竞态,按**实际字节**复核。
-            if bytes.len() as u64 > IMAGE_READ_MAX_BYTES {
-                write_response(
-                    state.hub,
-                    state.client,
-                    err_response(id, RpcError::invalid_params("image too large")),
-                )
-                .await?;
-                return Ok(Flow::Continue);
-            }
             let offset = req
                 .params
                 .get("offset")
@@ -190,14 +217,28 @@ pub(crate) async fn handle(
                 .filter(|n| *n > 0)
                 .unwrap_or(IMAGE_READ_CHUNK_BYTES)
                 .min(IMAGE_READ_CHUNK_BYTES);
-            let start = (offset as usize).min(bytes.len());
-            let end = start.saturating_add(max_bytes as usize).min(bytes.len());
-            let next = if end < bytes.len() {
-                Some(end as u64)
-            } else {
-                None
+            // 越界 offset 落在文件尾之后:返回空块且 `nextOffset: null`,
+            // 与「全量读后 `start.min(len)`」的旧行为一致(客户端据此结束循环)。
+            let start = offset.min(declared_len);
+            let want = max_bytes.min(declared_len.saturating_sub(start));
+            let bytes = match read_range(&canonical, start, want) {
+                Ok(b) => b,
+                Err(e) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(
+                            id,
+                            RpcError::invalid_params(format!("cannot read image: {e}")),
+                        ),
+                    )
+                    .await?;
+                    return Ok(Flow::Continue);
+                }
             };
-            let data = base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]);
+            let end = start + bytes.len() as u64;
+            let next = if end < declared_len { Some(end) } else { None };
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
             write_response(
                 state.hub,
                 state.client,
@@ -207,7 +248,7 @@ pub(crate) async fn handle(
                         "data": data,
                         "nextOffset": next,
                         "mediaType": image_media_type(format),
-                        "size": bytes.len(),
+                        "size": declared_len,
                     }),
                 ),
             )
