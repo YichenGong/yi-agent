@@ -262,7 +262,7 @@ mod tests {
         }
 
         /// 某一层里某个 skill 是否在（按 scope 找组，不按下标——空组会被丢掉，
-        /// 下标不稳；系统组还总有内置的 3 个）。
+        /// 下标不稳；系统组还总有内置 skill，数量见 `yi-agent-skills/src/assets/`）。
         fn has_skill(&self, project: Option<&Path>, scope: &str, name: &str) -> bool {
             self.list(project)["groups"]
                 .as_array()
@@ -306,7 +306,7 @@ mod tests {
         assert_eq!(scopes, vec!["project", "user", "system"]);
         assert!(f.has_skill(Some(&f.project), "project", "proj-skill"));
         assert!(f.has_skill(Some(&f.project), "user", "user-skill"));
-        // 系统组里除自造的这一个，还有 list 路径幂等装上的内置 3 个，故只断言包含。
+        // 系统组里除自造的这一个，还有 list 路径幂等装上的内置 skill，故只断言包含。
         assert!(f.has_skill(Some(&f.project), "system", "sys-skill"));
     }
 
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn system_root_is_not_double_counted_by_the_user_scope() {
         // 依赖 `discover_skills` 跳过隐藏目录（`.system` 以点开头）：这条钉住该依赖，
-        // 一旦 discovery 的 `is_hidden` 行为变化，用户层会把系统内置的 3 个重复列一遍。
+        // 一旦 discovery 的 `is_hidden` 行为变化，用户层会把系统内置的 skill 重复列一遍。
         let f = Fixture::new();
         f.install_system();
         assert!(f.has_scope(Some(&f.project), "system"));
@@ -388,7 +388,7 @@ mod tests {
             .map(|g| g["scope"].as_str().unwrap())
             .collect();
         assert!(!scopes.contains(&"project"), "{scopes:?}");
-        // 只在用户层出现一次。（系统层仍有内置的 3 个——`skill/list` 会幂等安装它们，
+        // 只在用户层出现一次。（系统层仍有内置 skill——`skill/list` 会幂等安装它们，
         // 那是另一回事，与这里要钉的重合无关。）
         let names: Vec<&str> = listed["groups"]
             .as_array()
