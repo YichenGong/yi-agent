@@ -1080,3 +1080,118 @@ async fn a_replaced_daemon_invalidates_the_cached_root() {
         "the re-attached root must be usable, got {probe:?}"
     );
 }
+
+/// 不可重放的请求在陈旧 root 上**只能发一次**：重放会造出第二个子任务。
+/// 同时错误必须说清「已修好、再试一次」，而不是裸 `not_found`。
+///
+/// 这里用形态 B（daemon 被同伴替换）：第一次 `spawn` 已送达并被旧身份拒绝，
+/// 若实现重放，新 runtime 会真的建出一个子任务，于是「子任务数为 0」就失败。
+/// 形态 A 测不出这件事——那边重发是必要的，且恰好只产生一个子任务。
+#[tokio::test]
+async fn a_non_idempotent_call_reports_the_stale_root_instead_of_replaying() {
+    /// 当前缓存 root 名下的子任务数。
+    fn child_count(root: &ThreadRoot) -> usize {
+        // integration test 是外部 crate，只能走公开的 `handle()`；这里只是
+        // 只读计数，不需要自愈通道。
+        let handle = root.handle().expect("the root is attached");
+        let response = yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+                session_id: Some(handle.session_id.clone()),
+                active_only: false,
+            },
+        )
+        .expect("the socket answers");
+        match response {
+            yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } => tasks
+                .iter()
+                .filter(|task| task.parent_task_id.as_deref() == Some(handle.task_id.as_str()))
+                .count(),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let old_session = attached.attached_root.session_id.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models.clone(),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_application_subagent_tools(
+        &mut registry,
+        Arc::clone(&root),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        yi_agent_subagent::CallerContext::unbound(),
+    );
+    let spawn = registry
+        .get("spawn_agent")
+        .expect("spawn_agent is registered");
+
+    // 停掉本进程的 daemon，由同伴在同一 runtime 目录起一个新的 ⇒ 缓存 root 过期，
+    // 但 socket 全程健康（形态 B）。
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old daemon must stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let fresh = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &models,
+    )
+    .expect("a peer brings a fresh daemon up");
+    assert_ne!(fresh.attached_root.session_id, old_session);
+    let _fresh = Arc::new(fresh);
+
+    // 注意：这里**不要**先 `root.attach()`。那会把缓存刷成同伴的 root，形态 B
+    // 的前提就没了。直接调用即可。
+    let result = spawn
+        .call(serde_json::json!({ "task": "must not run twice", "fork": false }))
+        .await;
+
+    assert!(
+        result.is_error,
+        "a stale-root spawn must not silently succeed: {:?}",
+        result.content
+    );
+    let text = format!("{:?}", result.content);
+    assert!(
+        text.contains("Retry this call once"),
+        "the error must tell the model to retry once: {text}"
+    );
+    // 调用已经触发了 repair + 重挂，此时 `handle()` 拿到的是新 runtime 上的 root。
+    assert_eq!(
+        child_count(&root),
+        0,
+        "the spawn must NOT have been replayed: no child may exist under the new root"
+    );
+}
