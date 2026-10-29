@@ -1203,8 +1203,9 @@ cd yi-agent-rs && cargo test -p yi-agent-subagent --test attach_delegation a_non
 ```
 
 Expected: PASS（`SingleShot` 分支在 Task 1 已落地，本任务是给那条分支补上
-「不重放」的证据，不是新写实现）。若 FAIL 且缺 `Retry this call once`，说明
-Task 4 的 `spawn_outcome` 没透出 `stale_root_hint()`，回 Task 4 Step 3 修。
+「不重放」的证据，不是新写实现）。跑完整个文件应为 **e2e 14 passed**。
+若 FAIL 且缺 `Retry this call once`，说明 Task 4 的 `spawn_outcome` 没透出
+`stale_root_hint()`，回 Task 4 Step 3 修。
 
 - [ ] **Step 3: 反向验证（本任务的核心交付）**
 
@@ -1314,8 +1315,15 @@ git commit -m "docs(subagent): drop the dead current_or_repair path and record t
 
 ## 完成判据
 
-- `cargo test -p yi-agent-subagent`：lib 87 + e2e 16 全绿（84+3 / 9+7，按实际增量为准）。
+- `cargo test -p yi-agent-subagent`：lib **87** + e2e **14** 全绿
+  （lib 84+3 = `is_stale_root_response` 的 3 个单测；e2e 9+5 = Task 2/3/4/5/6
+  各新增 1 个）。以实际增量为准，但**五个 e2e 用例一个都不能少**：
+  `detaching_a_retired_root_does_not_start_a_daemon`、
+  `a_tool_repairs_a_daemon_that_died`、`a_spawn_tool_repairs_a_daemon_that_died`、
+  `a_replaced_daemon_invalidates_the_cached_root`、
+  `a_non_idempotent_call_reports_the_stale_root_instead_of_replaying`。
 - `cargo test -p yi-agent-app-server --lib`：全绿。
-- 四个新 e2e 用例逐条反向验证（Task 2 Step 2 的真红、Task 6 Step 3 的变异红）。
+- 五个新 e2e 用例逐条反向验证（Task 2 Step 2 的真红、Task 3/4/5 的回退红、
+  Task 6 Step 3 的变异红）。
 - `grep -rn "current_or_repair" yi-agent-rs/crates/` 无命中。
 - `cargo fmt --all` 干净。
