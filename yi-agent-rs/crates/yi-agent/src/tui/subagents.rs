@@ -60,9 +60,27 @@ pub fn root_binding(
 /// every failure kind clears the same way -- a fresh process.
 pub const RUNTIME_RESTART_NOTICE: &str = "子 Agent runtime 未能启用；重启 yi-agent 后即可用";
 
+/// The restart notice with the running build appended.
+///
+/// The version is the point: a stale binary and a genuinely broken one produce
+/// the same line, and "restart" does not help a user whose binary predates the
+/// fix. On 2026-10-29 exactly that happened -- the installed CLI was six days
+/// older than the fix, and nothing on screen said so, so the only way to find
+/// out was to hunt down `--version` by hand.
+///
+/// Deliberately offline: no update check, no registry lookup. Printing the
+/// version costs nothing and answers "which build am I on?" at the moment the
+/// question is actually being asked.
+pub fn runtime_restart_notice_text() -> String {
+    format!(
+        "{RUNTIME_RESTART_NOTICE}（当前版本 {}）",
+        crate::build_info::VERSION
+    )
+}
+
 pub fn runtime_restart_notice() -> crate::tui::cell::HistoryCell {
     crate::tui::cell::HistoryCell::Separator {
-        label: Some(RUNTIME_RESTART_NOTICE.to_string()),
+        label: Some(runtime_restart_notice_text()),
     }
 }
 
@@ -280,6 +298,18 @@ mod restart_notice_tests {
         assert!(
             label.contains("子 Agent"),
             "does not say what is off: {label}"
+        );
+    }
+
+    /// A stale binary and a broken one print the same notice, and "restart"
+    /// cannot fix the former. Carrying the version makes that diagnosable
+    /// on sight instead of requiring a separate `--version` hunt.
+    #[test]
+    fn the_notice_names_the_running_version() {
+        let label = label_of(runtime_restart_notice());
+        assert!(
+            label.contains(crate::build_info::VERSION),
+            "the version must be visible: {label}"
         );
     }
 

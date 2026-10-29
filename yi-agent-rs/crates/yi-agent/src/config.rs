@@ -369,11 +369,15 @@ pub fn resolve_workdir(cli: &Cli) -> Result<PathBuf> {
 /// 从 CLI 参数 + 环境变量加载配置。
 ///
 /// 优先级:CLI 参数 > 环境变量 > 默认值。实际语义由 runtime crate 实现。
-pub fn load(cli: &Cli) -> Result<Config> {
-    yi_agent_runtime::config::RuntimeConfig::load(&cli.into())
-}
-
-/// 与 [`load`] 相同，但允许 API key 缺失（桌面侧车首启场景）。
+///
+/// 这是**唯一**的加载入口，且允许 API key 缺失（键为空串）。缺 key 不是加载
+/// 错误：能否发起对话只由 `models::is_usable` 在 `resolve_effective` 之后回答。
+/// 详见 `yi_agent_runtime::config::RuntimeConfig::load_lenient` 的文档。
+///
+/// 曾有一个严格版 `load`（缺 key 即 bail）。它和本函数对同一台机器给出相反
+/// 结论，启动路径选错一个就把「模型只在 models.json」误报成启动失败。不要再
+/// 引入第二个入口——那正是 2026-10-29 `provider turn admission failed: API key
+/// required` 的成因。
 pub fn load_lenient(cli: &Cli) -> Result<Config> {
     yi_agent_runtime::config::RuntimeConfig::load_lenient(&cli.into())
 }

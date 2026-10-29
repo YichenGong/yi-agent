@@ -659,7 +659,18 @@ fn inspect_session(socket: &std::path::Path, task_id: &str) -> Result<String> {
 
 fn control_schedule(cli: &Cli, action: &ScheduleAction) -> Result<()> {
     let ScheduleAction::Add { request, confirm } = action;
-    let config = config::load(cli)?;
+    // 与 TUI / `run` 同一条解析链：宽松加载，再让清单的默认条目补上
+    // provider/model/key。以前这里用严格加载器，于是「模型只在 models.json」
+    // 的机器上 `schedule add` 直接报 `API key required`——那是加载器的错，
+    // 不是用户的配置错。
+    let config = config::load_lenient(cli)?;
+    let catalog = yi_agent_runtime::models::load_catalog();
+    let config = yi_agent_runtime::models::resolve_effective(&config, &catalog, None);
+    // 宽松加载器不再因缺 key 报错，所以「未配置」必须在这里显式说清楚。
+    // 不能省：省掉的话空 key 会一路传到 provider，变成一句更难懂的 401。
+    if let Some(line) = unconfigured_guidance(yi_agent_runtime::models::is_usable(&config)) {
+        anyhow::bail!("{line}");
+    }
     let provider = yi_agent_runtime::bootstrap::build_provider(&config)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let preview = runtime.block_on(
@@ -1132,10 +1143,39 @@ fn startup_intent_for(
     })
 }
 
-fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRuntimeSession>> {
+/// Brings up the subagent runtime for this TUI session.
+///
+/// **This function cannot fail**, and that is deliberate. Its return type used to
+/// be `Result<Option<TuiRuntimeSession>>`, which promised two outcomes it never
+/// produced: no path ever returned `Ok(None)`, and the one `?`
+/// (`socket_path_for`) let a bring-up problem escape as `Err`. The caller's `Err`
+/// arm then wrapped it in `AgentError::ProviderTurnAdmission`, so a launch-time
+/// configuration problem surfaced as
+/// `Error: provider turn admission failed: API key required: ...` before the user
+/// had typed anything.
+///
+/// Every failure here means the same thing to the user: *this session runs
+/// without delegation, and here is why*. That is a notice, not a failed turn, so
+/// the type says so: one infallible return value, and `Unavailable` carries the
+/// reason. A startup error has no route to the turn-failure channel because no
+/// such route exists in the signature.
+///
+/// `cli` is kept because the daemon worker factory resolves the user's model
+/// configuration from the same overrides the TUI itself uses.
+fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> TuiRuntimeSession {
     let runtime_dir = runtime_directory_for(&config.workdir);
     let database = runtime_database_path(&runtime_dir);
-    let socket_path = yi_agent_store::ipc::socket_path_for(&runtime_dir)?;
+    // A socket path that cannot be derived is a configuration problem, not a
+    // crashed process: the session still runs, just without delegation. Same
+    // shape as every other bring-up failure below, and the reason stays actionable.
+    let socket_path = match yi_agent_store::ipc::socket_path_for(&runtime_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            let reason = runtime_unavailable_reason(&error);
+            tracing::warn!(error = %error, "{reason}");
+            return TuiRuntimeSession::unavailable(reason);
+        }
+    };
     // Record the project-local state before the daemon creates it, otherwise
     // root worktree provisioning sees a checkout dirtied by our own store.
     ignore_project_local_runtime_state(&config.workdir);
@@ -1153,7 +1193,7 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
         Err(error) => {
             let reason = worker_factory_unavailable_reason(&error);
             tracing::warn!(error = %error, "{reason}");
-            return Ok(Some(TuiRuntimeSession::unavailable(reason)));
+            return TuiRuntimeSession::unavailable(reason);
         }
     };
     let embedded_daemon =
@@ -1163,7 +1203,7 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
             Err(error) => {
                 let reason = runtime_unavailable_reason(&error);
                 tracing::warn!(error = %error, "{reason}");
-                return Ok(Some(TuiRuntimeSession::unavailable(reason)));
+                return TuiRuntimeSession::unavailable(reason);
             }
         };
     // 只有"我起的 daemon"才该由我监督：借用了别人的 daemon 还去监督，
@@ -1183,7 +1223,7 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
         Err(error) => {
             let reason = format!("could not reach the runtime socket: {error}");
             tracing::warn!(error = %error, "{reason}");
-            return Ok(Some(TuiRuntimeSession::Unavailable { reason }));
+            return TuiRuntimeSession::unavailable(reason);
         }
     };
     let yi_agent_store::ipc::IpcResponse::ApplicationRootAttached {
@@ -1195,25 +1235,23 @@ fn attach_tui_runtime(cli: &Cli, config: &config::Config) -> Result<Option<TuiRu
     else {
         let reason = runtime_attached_root_rejection(&response);
         tracing::warn!(response = ?response, "{reason}");
-        return Ok(Some(TuiRuntimeSession::Unavailable { reason }));
+        return TuiRuntimeSession::unavailable(reason);
     };
-    Ok(Some(TuiRuntimeSession::Attached(Box::new(
-        AttachedTuiRuntime {
-            socket_path,
-            attached_root: crate::tui::subagents::AttachedRoot {
-                session_id,
-                task_id: root_task_id,
-                capability: message_capability,
-                workspace,
-            },
-            embedded_daemon,
-            supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
-                &config.workdir,
-                &runtime_dir,
-                owns_daemon,
-            ),
+    TuiRuntimeSession::Attached(Box::new(AttachedTuiRuntime {
+        socket_path,
+        attached_root: crate::tui::subagents::AttachedRoot {
+            session_id,
+            task_id: root_task_id,
+            capability: message_capability,
+            workspace,
         },
-    ))))
+        embedded_daemon,
+        supervisor: yi_agent_runtime::supervise::for_daemon_ownership(
+            &config.workdir,
+            &runtime_dir,
+            owns_daemon,
+        ),
+    }))
 }
 
 fn activate_tui_runtime_root(
@@ -2284,7 +2322,7 @@ fn run_tui_agent(
                     match choice {
                         Some(crate::tui::subagents::RuntimeStartupChoice::Start) => {
                             match attach_tui_runtime(&cli, &config) {
-                                Ok(Some(TuiRuntimeSession::Unavailable { reason })) => {
+                                TuiRuntimeSession::Unavailable { reason } => {
                                     tracing::warn!(
                                         cause = %reason,
                                         "subagent runtime unavailable; continuing without delegation"
@@ -2293,7 +2331,7 @@ fn run_tui_agent(
                                         .send(runtime_unavailable_event("runtime attach", reason))
                                         .await;
                                 }
-                                Ok(Some(TuiRuntimeSession::Attached(attached))) => {
+                                TuiRuntimeSession::Attached(attached) => {
                                     let AttachedTuiRuntime {
                                         socket_path,
                                         attached_root,
@@ -2390,18 +2428,6 @@ fn run_tui_agent(
                                                 .await;
                                         }
                                     }
-                                }
-                                Ok(None) => {
-                                    tracing::warn!("subagent runtime unavailable; continuing without delegation");
-                                }
-                                Err(error) => {
-                                    let _ = agent_tx
-                                        .send(yi_agent_core::AgentEvent::Error(
-                                            yi_agent_core::AgentError::ProviderTurnAdmission(
-                                                error.to_string(),
-                                            ),
-                                        ))
-                                        .await;
                                 }
                             }
                         }
@@ -2799,15 +2825,18 @@ mod tests {
         );
     }
 
-    /// A failure to build the worker factory is a runtime bring-up failure, not
-    /// a failed conversation turn.
+    /// A startup failure must never be representable as a failed turn.
     ///
-    /// `attach_tui_runtime` returns `Result<Option<TuiRuntimeSession>>`; letting
-    /// the factory error escape with `?` skipped the `Unavailable` notice path
-    /// and landed in the driver's `Err` arm, which emitted
-    /// `AgentError::ProviderTurnAdmission`. Users then saw `Error: provider turn
-    /// admission failed: API key required: ...` -- an error about a turn, on a
-    /// launch where no turn had been attempted.
+    /// The signature is the guard, not this test: `attach_tui_runtime` returns a
+    /// bare `TuiRuntimeSession`, so there is no `Err` and no `Ok(None)` for a
+    /// bring-up problem to travel through. Before it was infallible, an escaped
+    /// factory error reached the driver's `Err` arm, which emitted
+    /// `AgentError::ProviderTurnAdmission`; users saw
+    /// `Error: provider turn admission failed: API key required: ...` on a launch
+    /// where no turn had been attempted.
+    ///
+    /// This asserts the signature itself, so re-introducing a fallible return --
+    /// the one edit that would silently restore the old channel -- fails here.
     #[test]
     fn attach_tui_runtime_reports_a_factory_failure_as_unavailable() {
         let source = include_str!("main.rs");
@@ -2830,6 +2859,60 @@ mod tests {
         assert!(
             body.contains(&unavailable),
             "attach_tui_runtime must funnel bring-up failures through the Unavailable notice"
+        );
+    }
+
+    /// The startup path must have exactly one way to fail, and it must not be a
+    /// `Result`.
+    ///
+    /// `attach_tui_runtime` is infallible by design: a bring-up problem is a
+    /// delegation notice, never a failed turn. `Result` in its signature is the
+    /// one edit that would restore the old `Error: provider turn admission
+    /// failed: ...` channel, so it is asserted against directly.
+    ///
+    /// Needles are built from fragments so this test's own source cannot satisfy
+    /// them.
+    #[test]
+    fn attach_tui_runtime_is_infallible() {
+        let source = include_str!("main.rs");
+        let header = source
+            .split("fn attach_tui_runtime(")
+            .nth(1)
+            .and_then(|rest| rest.split('{').next())
+            .expect("attach_tui_runtime must exist");
+        let result = ["-> ", "Result<"].concat();
+        let option = ["-> ", "Option<"].concat();
+        assert!(
+            !header.contains(&result),
+            "attach_tui_runtime must not return Result: a startup error with a return type to \
+             escape through is how it reached the turn-failure channel. Got header: {header}"
+        );
+        assert!(
+            !header.contains(&option),
+            "attach_tui_runtime must not return Option: no path ever produced a `None` session, \
+             and the dead arm only invited the bug. Got header: {header}"
+        );
+        assert!(
+            header.contains("TuiRuntimeSession"),
+            "attach_tui_runtime must return the session type directly, got: {header}"
+        );
+    }
+
+    /// One loader, not two.
+    ///
+    /// The strict loader answered "this machine is configured" differently from
+    /// the lenient one, and whichever startup path picked the wrong answer turned
+    /// a catalog-only machine into a launch failure. With one loader there is no
+    /// wrong pick; `models::is_usable` is the only judge of usability.
+    #[test]
+    fn only_the_lenient_loader_exists() {
+        let source = include_str!("main.rs");
+        let strict_needle = ["config::load(", "cli)"].concat();
+        let strict_with_ref = ["config::load(", "&cli)"].concat();
+        assert!(
+            !source.contains(&strict_needle) && !source.contains(&strict_with_ref),
+            "the strict loader must not be called: it and the lenient one disagree about \
+             whether a catalog-only machine is configured"
         );
     }
 
@@ -2876,10 +2959,18 @@ mod tests {
             if why.contains("must not invert") {
                 assert!(!source.contains(&needle), "{why}");
             } else {
-                assert_eq!(
-                    source.matches(&needle).count(),
-                    2,
-                    "both `run` and the TUI entry must check usability ({why})"
+                // Every entry that can reach a provider must check usability
+                // after resolving the catalog: `run`, the TUI, and `schedule`
+                // (the latter stopped relying on the loader's bail once the
+                // strict loader was removed). A floor, not an exact count --
+                // pinning the number made adding a fourth entry a test failure
+                // for no reason.
+                let count = source.matches(&needle).count();
+                assert!(
+                    count >= 3,
+                    "every entry that can call a provider must check usability after \
+                     resolving the catalog; found {count} call sites, expected at least 3 \
+                     (`run`, the TUI, `schedule`) ({why})"
                 );
             }
         }
@@ -3923,19 +4014,19 @@ mod tests {
         // fails regardless of the machine's `$TMPDIR` or permissions.
         config.workdir = std::path::PathBuf::from(format!("/{}", "a".repeat(200)));
 
+        // No `Err` / `Ok(None)` arms exist because the signature cannot produce
+        // them. That is the whole point of the infallible return type: the old
+        // test had to panic on an escaped error, which is a runtime guard where
+        // the type should have been the guard.
         match attach_tui_runtime(&cli, &config) {
-            Ok(Some(TuiRuntimeSession::Unavailable { reason })) => {
+            TuiRuntimeSession::Unavailable { reason } => {
                 assert!(
                     !reason.trim().is_empty(),
                     "an unavailable runtime must explain itself"
                 );
             }
-            Ok(Some(TuiRuntimeSession::Attached(_))) => {
+            TuiRuntimeSession::Attached(_) => {
                 panic!("bring-up was expected to fail for an uncreatable workdir")
-            }
-            Ok(None) => panic!("the TUI must always get a session, attached or not"),
-            Err(error) => {
-                panic!("a failed bring-up escaped as `Error: ...` instead of a notice: {error}")
             }
         }
     }
