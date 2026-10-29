@@ -275,7 +275,7 @@ impl RuntimeConfig {
             );
         }
 
-        let provider = injected_provider.unwrap_or_else(|| "anthropic".to_string());
+        let provider = injected_provider.unwrap_or_else(|| "openai".to_string());
         let default_api_url = match provider.as_str() {
             "openai" => "https://api.openai.com/v1",
             _ => "https://api.anthropic.com",
@@ -973,16 +973,21 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// 真正覆盖「未注入 provider 时的回退」。
+    ///
+    /// 旧版本这个位置的测试名叫 `load_defaults_provider_to_anthropic`，却传了
+    /// `provider: Some("anthropic")` —— 断言的是显式配置，回退路径其实从未被测。
+    /// 这里全部覆盖项留空，走真正的默认分支。
     #[test]
-    fn load_defaults_provider_to_anthropic() {
+    fn defaults_provider_to_openai_when_nothing_is_configured() {
         let _lock = ENV_TEST_MUTEX
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env = isolated_config_env();
         let overrides = ConfigOverrides {
-            provider: Some("anthropic".into()),
+            provider: None,
             api_url: None,
-            api_key: Some("test-key".into()),
+            api_key: None,
             model: None,
             max_turns: None,
             workdir: Some(PathBuf::from(".")),
@@ -998,8 +1003,11 @@ mod tests {
             skip_permissions: false,
             skills_catalog_budget: None,
         };
-        let config = RuntimeConfig::load(&overrides).unwrap();
-        assert_eq!(config.provider, "anthropic");
+        // `load` 在缺 key 时会报错，回退路径要看过配置本身，故用宽松加载。
+        let config = RuntimeConfig::load_lenient(&overrides).unwrap();
+        assert_eq!(config.provider, "openai");
+        assert_eq!(config.api_url, "https://api.openai.com/v1");
+        assert_eq!(config.model, "", "no default model name may be invented");
     }
 
     #[test]
