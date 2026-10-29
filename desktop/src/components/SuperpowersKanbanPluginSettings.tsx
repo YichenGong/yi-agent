@@ -154,6 +154,15 @@ export function SuperpowersKanbanPluginSettings({
 
       <h3 className="mt-4 text-sm font-medium text-fg">全机时段并发窗口</h3>
       {/*
+       * 窗口的判定发生在插件进程里（`chrono::Local`），不是本设备的时区。
+       * 桌面可经 relay 连远端宿主，那时 UI 在本机、墙钟在远端，用户填的
+       * 09:00 与实际生效时间不同却毫无线索。前端拿不到宿主时区，判不出
+       * 是否真的跨时区，所以这里无条件陈述口径，不做条件渲染。
+       */}
+      <p data-testid="window-timezone-note" className="mt-1 text-xs text-fg-subtle">
+        以下时刻按运行插件的机器（本地时间）判定，不是本设备的时区；跨时区时两者会不一致。
+      </p>
+      {/*
        * 一行一个窗口，字段用 flex-wrap 排布。原先的 5 列表格在小窗口下总宽超过
        * 面板（固定 about:blank 的 70vw 弹窗里只有 ~300px），右侧的「上限」与
        * 「删除」两列被整列裁掉——面板只 `overflow-y-auto`，横向溢出既看不见也

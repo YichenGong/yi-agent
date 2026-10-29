@@ -273,4 +273,14 @@ describe("SuperpowersKanbanPluginSettings", () => {
     expect(screen.getByText("所有项目的看板会话与手动会话共用这个上限。")).toBeTruthy();
     expect(screen.getByText("全机时段并发窗口")).toBeTruthy();
   });
+
+  it("states which clock the window hours follow", async () => {
+    // 根因回归：窗口在插件进程里按 chrono::Local 判定，UI 却只写 09:00，
+    // 跨时区（桌面连远端宿主）时用户无从判断这是哪个 09:00。
+    render(<SuperpowersKanbanPluginSettings rpc={scriptedRpc([{ settings: EMPTY_SETTINGS }])} />);
+
+    const note = await screen.findByTestId("window-timezone-note");
+    expect(note.textContent ?? "").toContain("运行插件的机器");
+    expect(note.textContent ?? "").toContain("本地时间");
+  });
 });
