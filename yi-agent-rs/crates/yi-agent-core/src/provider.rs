@@ -42,6 +42,39 @@ pub struct TokenUsage {
     pub reasoning_tokens: Option<u32>,
 }
 
+impl TokenUsage {
+    /// 把一条后到的 usage 片段合进当前快照。
+    ///
+    /// provider 可能分多次报告同一次请求的用量：Anthropic 的 `message_start`
+    /// 带 `input_tokens` 与 cache 字段，末端的 `message_delta` 只带
+    /// `output_tokens`。若用「后到者整体覆盖」，先到的非零值会被抹成 0，
+    /// 而自动压缩正是靠 `input_tokens` 判定（见 `Session::last_input_tokens`）。
+    ///
+    /// 合并规则：
+    /// - `u32` 字段：后到的**非零**值覆盖；零值视为「本次未报告」，保留旧值。
+    /// - `Option<u32>` 字段：`Some` 覆盖，`None` 保留旧值。
+    ///
+    /// 已知局限：无法表达「真实值为 0 且需把此前的非零值清零」。对 token 计数
+    /// 该场景不存在（一次请求的 `input_tokens` 不会由非零变 0），故接受。
+    pub fn merge_snapshot(&mut self, next: &TokenUsage) {
+        if next.input_tokens != 0 {
+            self.input_tokens = next.input_tokens;
+        }
+        if next.output_tokens != 0 {
+            self.output_tokens = next.output_tokens;
+        }
+        if next.cache_creation_input_tokens.is_some() {
+            self.cache_creation_input_tokens = next.cache_creation_input_tokens;
+        }
+        if next.cache_read_input_tokens.is_some() {
+            self.cache_read_input_tokens = next.cache_read_input_tokens;
+        }
+        if next.reasoning_tokens.is_some() {
+            self.reasoning_tokens = next.reasoning_tokens;
+        }
+    }
+}
+
 /// Reasoning 增量的种类：完整思考正文 vs 结构化摘要。
 ///
 /// `Serialize` 是给线协议用的：`AgentEvent::ReasoningDelta` 的序列化必须带上
@@ -437,6 +470,57 @@ mod tests {
             let events = self.events.clone();
             Ok(futures::stream::iter(events).boxed())
         }
+    }
+
+    #[test]
+    fn merge_snapshot_keeps_earlier_input_when_later_reports_zero() {
+        let mut acc = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 0,
+            cache_read_input_tokens: Some(90_000),
+            ..Default::default()
+        };
+        let next = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 42,
+            ..Default::default()
+        };
+        acc.merge_snapshot(&next);
+        assert_eq!(
+            acc.input_tokens, 100_000,
+            "0 means 'not reported', keep old"
+        );
+        assert_eq!(acc.output_tokens, 42, "non-zero wins");
+        assert_eq!(acc.cache_read_input_tokens, Some(90_000), "None keeps old");
+    }
+
+    #[test]
+    fn merge_snapshot_lets_a_nonzero_later_value_win() {
+        let mut acc = TokenUsage {
+            input_tokens: 10,
+            ..Default::default()
+        };
+        acc.merge_snapshot(&TokenUsage {
+            input_tokens: 20,
+            ..Default::default()
+        });
+        assert_eq!(acc.input_tokens, 20);
+    }
+
+    #[test]
+    fn merge_snapshot_some_overrides_none_and_vice_versa() {
+        let mut acc = TokenUsage {
+            cache_creation_input_tokens: None,
+            reasoning_tokens: Some(7),
+            ..Default::default()
+        };
+        acc.merge_snapshot(&TokenUsage {
+            cache_creation_input_tokens: Some(5),
+            reasoning_tokens: None,
+            ..Default::default()
+        });
+        assert_eq!(acc.cache_creation_input_tokens, Some(5));
+        assert_eq!(acc.reasoning_tokens, Some(7));
     }
 
     fn text_event(s: &str) -> ProviderEvent {
