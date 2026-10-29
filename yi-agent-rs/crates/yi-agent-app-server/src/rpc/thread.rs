@@ -1707,6 +1707,10 @@ pub(crate) async fn handle(
             if let Some(watch) = state.process_watches.remove(&thread_id) {
                 watch.stop().await;
             }
+            // 视图帧与 thread 同生命周期:帧表按 thread_id 索引,不清理就永久驻留。
+            // `thread/view/read` 有 `require_known_thread` 前置检查,故此处不影响
+            // 正确性,只是不让已删会话的帧继续占内存。
+            state.view_frames.lock().await.remove(&thread_id);
             let live_cwds = state
                 .threads
                 .values()

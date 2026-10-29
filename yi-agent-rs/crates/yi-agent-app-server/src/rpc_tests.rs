@@ -20534,3 +20534,54 @@ async fn a_failed_append_still_records_the_completion() {
 async fn mark_read_routes_to_the_thread_domain() {
     assert_eq!(domain_for("thread/markRead"), Domain::Thread);
 }
+
+/// `thread/delete` 必须把该会话的视图帧一并收走。
+///
+/// 帧表以 `thread_id` 为键、进程生命周期内常驻，且全仓库只有插没有删。
+/// `thread/view/read` 有 `require_known_thread` 前挡，故残留不影响正确性,
+/// 但每删一个看过 diff 的会话就永久留一份(单条上限 256 KiB)。
+#[tokio::test(flavor = "multi_thread")]
+async fn thread_delete_drops_the_view_frame() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut cfg = test_config();
+    cfg.workdir = dir.path().to_path_buf();
+    let mut h = Harness::with_cfg(cfg).await;
+    let tid = start_thread(&mut h).await;
+    {
+        // 直接注入一帧，等价于 `pump_git_diff_notifications` 写帧。
+        let mut frames = h.view_frames.lock().await;
+        frames.insert(
+            tid.clone(),
+            crate::git_diff::ViewFrame {
+                command: Some("git log --oneline".to_string()),
+                as_kind: "text".to_string(),
+                exit_code: Some(0),
+                stdout: "x".repeat(1024),
+                stderr: String::new(),
+                truncated: false,
+                timed_out: false,
+                note: None,
+                base: None,
+                base_kind: String::new(),
+            },
+        );
+    }
+    assert!(
+        h.view_frames.lock().await.contains_key(&tid),
+        "precondition: the frame must be present before delete"
+    );
+
+    h.send(&format!(
+        r#"{{"jsonrpc":"2.0","id":30,"method":"thread/delete","params":{{"threadId":"{tid}","force":true}}}}"#
+    ))
+    .await;
+    let _ = h
+        .read_matching(64, |v| v.get("id") == Some(&serde_json::json!(30)))
+        .await;
+
+    assert!(
+        !h.view_frames.lock().await.contains_key(&tid),
+        "thread/delete must drop the view frame for {tid}"
+    );
+    h.shutdown().await;
+}
