@@ -965,3 +965,118 @@ async fn a_spawn_tool_repairs_a_daemon_that_died() {
         "a healed runtime must accept the spawn, got {text}"
     );
 }
+
+/// 形态 B：daemon 被**同伴**替换。socket 全程健康，所以不出现 liveness 错误，
+/// generation 也不动——缓存 root 会永久失效。实测 `inspect_agent` 返回 `not_found`
+/// 且之后每次调用都重复失败。
+///
+/// 修复后：身份层失败被识别为「root 过期」，重挂一次后成功。
+#[tokio::test]
+async fn a_replaced_daemon_invalidates_the_cached_root() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let old_session = attached.attached_root.session_id.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models.clone(),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_application_subagent_tools(
+        &mut registry,
+        Arc::clone(&root),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        yi_agent_subagent::CallerContext::unbound(),
+    );
+    let inspect = registry
+        .get("inspect_agent")
+        .expect("inspect_agent is registered");
+
+    // 本进程停掉 daemon，然后由「同伴」在同一 runtime 目录起一个新的。
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old daemon must stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let fresh = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &models,
+    )
+    .expect("a peer brings a fresh daemon up");
+    assert_ne!(
+        fresh.attached_root.session_id, old_session,
+        "the replacement minted a new session, so the old root is gone"
+    );
+    let _fresh = Arc::new(fresh);
+
+    // 前提：socket 全程健康，没有触发过任何 liveness 错误——这正是形态 B：
+    // 传输层看起来完美，只有身份层知道 root 已经不作数。
+    assert!(matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ));
+    let root_before = root.root_task_id().expect("the root is cached");
+
+    // 为什么不断言错误码：这里传的是随机 UUID，**即使**重挂成功，重试也会因
+    // 「没有这个 task」而返回 `not_found`——与「陈旧 root」的错误码完全一样。
+    // 想用真实 child 造更强的判据也不成立：陈旧 root 造不出 child（旧 daemon
+    // 已停），而用同伴的 root 造出来的 child 又不归本 root 管（会得到
+    // `authority_denied`）。所以形状 B 的可观测判据只能是「root 换过了、
+    // 且换过之后可用」，本用例就钉这两条。
+    let _ = inspect
+        .call(serde_json::json!({
+            "task_id": "11111111-1111-4111-8111-111111111111",
+        }))
+        .await;
+
+    let root_after = root.root_task_id().expect("the root is re-attached");
+    assert_ne!(
+        root_after, root_before,
+        "a stale root must be replaced by one minted against the new runtime"
+    );
+    let handle = root
+        .handle()
+        .expect("the re-attached root resolves a handle");
+    let probe = yi_agent_store::ipc::send_request(
+        &handle.socket_path,
+        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id: Some(handle.session_id.clone()),
+            active_only: false,
+        },
+    )
+    .expect("the socket answers");
+    assert!(
+        matches!(
+            probe,
+            yi_agent_store::ipc::IpcResponse::TaskSummaries { .. }
+        ),
+        "the re-attached root must be usable, got {probe:?}"
+    );
+}
