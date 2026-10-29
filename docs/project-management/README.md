@@ -24,7 +24,7 @@
 | yi-agent-store | 8 / 9 | [详情](./yi-agent-store.md) |
 | yi-agent-flags | 9 / 9 | [详情](./yi-agent-flags.md) |
 | yi-agent-runtime | 21 / 21 | [详情](./yi-agent-runtime.md) |
-| yi-agent-subagent | 9 / 9 | [详情](./yi-agent-subagent.md) |
+| yi-agent-subagent | 10 / 10 | [详情](./yi-agent-subagent.md) |
 | yi-agent-app-server | 73 / 73 | [详情](./yi-agent-app-server.md) |
 | subagent-runtime | 45 / 53 | [详情](./subagent-runtime.md) |
 | superpowers-kanban | 12 / 12 | [详情](./superpowers-kanban.md) |

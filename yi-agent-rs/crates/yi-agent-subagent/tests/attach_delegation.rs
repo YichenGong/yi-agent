@@ -716,3 +716,482 @@ fn a_retired_runtime_heals_itself_on_the_next_delegation() {
         "healing has to install a new runtime, so the generation must move"
     );
 }
+
+/// 删除会话时会调用 `ThreadRoot::detach()`。过去它会先 `handle()` → `attach()`
+/// → `binding.send`，于是**把已退休的 daemon 重新拉起来**，并幂等地重建那个
+/// 本该被删掉的 root——回收循环（`evict_idle_runtimes`）的努力被这一步直接抵消。
+///
+/// 实测（2026-10-29）：retire 后 detach，daemon 复活且 generation 跳到 2。
+#[test]
+fn detaching_a_retired_root_does_not_start_a_daemon() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models,
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    drop(attached);
+
+    binding.retire();
+    let generation_after_retire = binding.generation();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retire must stop the daemon"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // 这正是 `thread/delete` 做的事。
+    root.detach();
+
+    assert!(
+        !matches!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy
+        ),
+        "detaching a retired root must not start a daemon back up"
+    );
+    assert_eq!(
+        binding.generation(),
+        generation_after_retire,
+        "detach must not repair, so it must not install a new runtime"
+    );
+}
+
+/// 形态 A：daemon 死了，但 binding 不知道（没走 `retire`，没有 generation 变化）。
+/// 这是「承载 daemon 的终端被关掉」的真实形状。修复前实测返回
+/// `daemon is unavailable: No such file or directory (os error 2)`。
+///
+/// 断言只钉「自愈确实发生了」这四件事，不钉「调用成功」：`send_message` 是
+/// `SingleShot`，第一次请求已因 liveness 失败而作废，重挂之后重发的那一次才会
+/// 拿到真实业务结论——而本用例的 recipient 是随机 UUID，业务结论必然是拒绝。
+/// 把「重发」和「调用语义成功」混在一起断言，会让用例随 daemon 的消息校验规则
+/// 漂移。身份层陈旧导致的「不重放 + 提示」由 Task 6 的形态 B 用例负责。
+#[tokio::test]
+async fn a_tool_repairs_a_daemon_that_died() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models,
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_application_subagent_tools(
+        &mut registry,
+        Arc::clone(&root),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        yi_agent_subagent::CallerContext::unbound(),
+    );
+    let tool = registry
+        .get("send_message")
+        .expect("send_message is registered");
+    let generation_before = binding.generation();
+
+    // daemon 死了，binding 未被告知。
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(std::time::Instant::now() < deadline, "the daemon must stop");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        binding.generation(),
+        generation_before,
+        "premise: the binding did not notice"
+    );
+
+    let result = tool
+        .call(serde_json::json!({
+            "recipient": "11111111-1111-4111-8111-111111111111",
+            "message": "hi",
+        }))
+        .await;
+
+    let text = format!("{:?}", result.content);
+    assert!(
+        !text.contains("daemon is unavailable"),
+        "a dead runtime must be healed instead of surfacing a transport error: {text}"
+    );
+    assert!(
+        binding.generation() > generation_before,
+        "healing must install a new runtime, so the generation must move"
+    );
+    assert!(
+        matches!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy
+        ),
+        "the runtime must be up again after the call"
+    );
+
+    // 自愈后这个 root 必须真的可用：用它发一条只读请求，应当得到
+    // `TaskSummaries`（业务结论），而不是「会话不认识你」（身份失效）。
+    let handle = root.handle().expect("the healed root resolves a handle");
+    let probe = yi_agent_store::ipc::send_request(
+        &handle.socket_path,
+        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id: Some(handle.session_id.clone()),
+            active_only: false,
+        },
+    )
+    .expect("the socket answers");
+    assert!(
+        matches!(
+            probe,
+            yi_agent_store::ipc::IpcResponse::TaskSummaries { .. }
+        ),
+        "the healed root must be usable, got {probe:?}"
+    );
+}
+
+/// `spawn_agent` 同样必须自愈。fork 上传必须先于 spawn，所以句柄在
+/// `send_as_root` 之前就要拿到——这条测试同时钉住「自愈后 socket 换过，
+/// fork token 仍然有效」。
+#[tokio::test]
+async fn a_spawn_tool_repairs_a_daemon_that_died() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models,
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_application_subagent_tools(
+        &mut registry,
+        Arc::clone(&root),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        yi_agent_subagent::CallerContext::unbound(),
+    );
+    let tool = registry
+        .get("spawn_agent")
+        .expect("spawn_agent is registered");
+    let generation_before = binding.generation();
+
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(std::time::Instant::now() < deadline, "the daemon must stop");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let result = tool
+        .call(serde_json::json!({ "task": "say hello", "fork": false }))
+        .await;
+
+    let text = format!("{:?}", result.content);
+    assert!(
+        !text.contains("daemon is unavailable"),
+        "spawn must repair a dead runtime instead of surfacing a transport error: {text}"
+    );
+    assert!(binding.generation() > generation_before);
+    assert!(
+        matches!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy
+        ),
+        "the runtime must be up again after the call"
+    );
+    // 自愈后必须真的能 spawn：成功时载荷里带 `"status":"queued"`，
+    // 失败时是拒绝原因。这不依赖 recipient/task 的具体校验规则。
+    assert!(
+        text.contains("queued"),
+        "a healed runtime must accept the spawn, got {text}"
+    );
+}
+
+/// 形态 B：daemon 被**同伴**替换。socket 全程健康，所以不出现 liveness 错误，
+/// generation 也不动——缓存 root 会永久失效。实测 `inspect_agent` 返回 `not_found`
+/// 且之后每次调用都重复失败。
+///
+/// 修复后：身份层失败被识别为「root 过期」，重挂一次后成功。
+#[tokio::test]
+async fn a_replaced_daemon_invalidates_the_cached_root() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let old_session = attached.attached_root.session_id.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models.clone(),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_application_subagent_tools(
+        &mut registry,
+        Arc::clone(&root),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        yi_agent_subagent::CallerContext::unbound(),
+    );
+    let inspect = registry
+        .get("inspect_agent")
+        .expect("inspect_agent is registered");
+
+    // 本进程停掉 daemon，然后由「同伴」在同一 runtime 目录起一个新的。
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old daemon must stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let fresh = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &models,
+    )
+    .expect("a peer brings a fresh daemon up");
+    assert_ne!(
+        fresh.attached_root.session_id, old_session,
+        "the replacement minted a new session, so the old root is gone"
+    );
+    let _fresh = Arc::new(fresh);
+
+    // 前提：socket 全程健康，没有触发过任何 liveness 错误——这正是形态 B：
+    // 传输层看起来完美，只有身份层知道 root 已经不作数。
+    assert!(matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ));
+    let root_before = root.root_task_id().expect("the root is cached");
+
+    // 为什么不断言错误码：这里传的是随机 UUID，**即使**重挂成功，重试也会因
+    // 「没有这个 task」而返回 `not_found`——与「陈旧 root」的错误码完全一样。
+    // 想用真实 child 造更强的判据也不成立：陈旧 root 造不出 child（旧 daemon
+    // 已停），而用同伴的 root 造出来的 child 又不归本 root 管（会得到
+    // `authority_denied`）。所以形状 B 的可观测判据只能是「root 换过了、
+    // 且换过之后可用」，本用例就钉这两条。
+    let _ = inspect
+        .call(serde_json::json!({
+            "task_id": "11111111-1111-4111-8111-111111111111",
+        }))
+        .await;
+
+    let root_after = root.root_task_id().expect("the root is re-attached");
+    assert_ne!(
+        root_after, root_before,
+        "a stale root must be replaced by one minted against the new runtime"
+    );
+    let handle = root
+        .handle()
+        .expect("the re-attached root resolves a handle");
+    let probe = yi_agent_store::ipc::send_request(
+        &handle.socket_path,
+        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id: Some(handle.session_id.clone()),
+            active_only: false,
+        },
+    )
+    .expect("the socket answers");
+    assert!(
+        matches!(
+            probe,
+            yi_agent_store::ipc::IpcResponse::TaskSummaries { .. }
+        ),
+        "the re-attached root must be usable, got {probe:?}"
+    );
+}
+
+/// 不可重放的请求在陈旧 root 上**只能发一次**：重放会造出第二个子任务。
+/// 同时错误必须说清「已修好、再试一次」，而不是裸 `not_found`。
+///
+/// 这里用形态 B（daemon 被同伴替换）：第一次 `spawn` 已送达并被旧身份拒绝，
+/// 若实现重放，新 runtime 会真的建出一个子任务，于是「子任务数为 0」就失败。
+/// 形态 A 测不出这件事——那边重发是必要的，且恰好只产生一个子任务。
+#[tokio::test]
+async fn a_non_idempotent_call_reports_the_stale_root_instead_of_replaying() {
+    /// 当前缓存 root 名下的子任务数。
+    fn child_count(root: &ThreadRoot) -> usize {
+        // integration test 是外部 crate，只能走公开的 `handle()`；这里只是
+        // 只读计数，不需要自愈通道。
+        let handle = root.handle().expect("the root is attached");
+        let response = yi_agent_store::ipc::send_request(
+            &handle.socket_path,
+            yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+                session_id: Some(handle.session_id.clone()),
+                active_only: false,
+            },
+        )
+        .expect("the socket answers");
+        match response {
+            yi_agent_store::ipc::IpcResponse::TaskSummaries { tasks } => tasks
+                .iter()
+                .filter(|task| task.parent_task_id.as_deref() == Some(handle.task_id.as_str()))
+                .count(),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let old_session = attached.attached_root.session_id.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models.clone(),
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_application_subagent_tools(
+        &mut registry,
+        Arc::clone(&root),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        yi_agent_subagent::CallerContext::unbound(),
+    );
+    let spawn = registry
+        .get("spawn_agent")
+        .expect("spawn_agent is registered");
+
+    // 停掉本进程的 daemon，由同伴在同一 runtime 目录起一个新的 ⇒ 缓存 root 过期，
+    // 但 socket 全程健康（形态 B）。
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the old daemon must stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let fresh = yi_agent_subagent::attach::attach_project_runtime(
+        &cfg,
+        runtime.path().to_path_buf(),
+        &models,
+    )
+    .expect("a peer brings a fresh daemon up");
+    assert_ne!(fresh.attached_root.session_id, old_session);
+    let _fresh = Arc::new(fresh);
+
+    // 注意：这里**不要**先 `root.attach()`。那会把缓存刷成同伴的 root，形态 B
+    // 的前提就没了。直接调用即可。
+    let result = spawn
+        .call(serde_json::json!({ "task": "must not run twice", "fork": false }))
+        .await;
+
+    assert!(
+        result.is_error,
+        "a stale-root spawn must not silently succeed: {:?}",
+        result.content
+    );
+    let text = format!("{:?}", result.content);
+    assert!(
+        text.contains("Retry this call once"),
+        "the error must tell the model to retry once: {text}"
+    );
+    // 调用已经触发了 repair + 重挂，此时 `handle()` 拿到的是新 runtime 上的 root。
+    assert_eq!(
+        child_count(&root),
+        0,
+        "the spawn must NOT have been replayed: no child may exist under the new root"
+    );
+}

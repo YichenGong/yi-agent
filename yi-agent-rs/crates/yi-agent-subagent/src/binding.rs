@@ -63,7 +63,7 @@ pub struct RuntimeBinding {
     flight: Mutex<()>,
     /// 本项目最近一次「有活干」的时刻。
     ///
-    /// 由宿主在取句柄时刷新（`current` / `current_or_repair` / `send` 都经过
+    /// 由宿主在取句柄时刷新（`current` / `send` 都经过
     /// 这里），因此它记录的是真实的委派使用，而不是「进程还记着这个项目」。
     /// 回收判定据此区分「这个项目还在被用」与「只是表里留了个条目」。
     last_active: Mutex<Instant>,
@@ -258,14 +258,6 @@ impl RuntimeBinding {
         Ok((handle, state.generation))
     }
 
-    /// Current if usable, else repair.
-    pub fn current_or_repair(&self) -> Result<RuntimeHandle, String> {
-        match self.current() {
-            Ok(handle) => Ok(handle),
-            Err(_) => self.repair(),
-        }
-    }
-
     /// Sends one request, repairing and retrying once if the runtime turns out
     /// to be unreachable. `build` is called with whichever handle is current.
     pub fn send<F>(&self, build: F) -> Result<IpcResponse, String>
@@ -355,6 +347,27 @@ pub fn is_liveness_error(error: &IpcError) -> bool {
     }
 }
 
+/// 这个应答是否在说「你手里的 root 我不认识」。
+///
+/// 与 [`is_liveness_error`] 互补：那个判传输层（socket 没了），这个判身份层
+/// （socket 很好，但这个 session / root 不是我的）。替换后的 daemon 会为新
+/// root 重建 session 与 capability，旧 root 的三元组在它的
+/// `application_root_attachments` 里查不到，于是稳定返回 `NotFound`；权限
+/// 摘要不匹配则是 `AuthorityDenied`。两者对客户端是同一件事：手里的 root 过期了。
+///
+/// 业务拒绝（`Validation`、`RateLimited`、`InvalidState`、`Conflict`、`Internal`）
+/// **不**属于这一类：那些错误重发一次不会好，触发 repair 只是浪费一次 daemon 启动。
+pub fn is_stale_root_response(response: &IpcResponse) -> bool {
+    matches!(
+        response,
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::NotFound
+                | yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            ..
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +411,49 @@ mod tests {
     #[test]
     fn a_frame_too_large_is_not_a_liveness_error() {
         assert!(!is_liveness_error(&IpcError::FrameTooLarge));
+    }
+
+    /// 陈旧 root 的判据：daemon 明确说「这个 session / root 我不认识」。
+    /// 实测替换后的 daemon 对 send_message / spawn_agent / wait_agent / detach
+    /// 四条路径稳定返回 NotFound（见 spec §1.3）。
+    #[test]
+    fn a_not_found_response_marks_the_root_stale() {
+        let response = IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::NotFound,
+            message: None,
+        };
+        assert!(is_stale_root_response(&response));
+    }
+
+    #[test]
+    fn an_authority_denied_response_marks_the_root_stale() {
+        let response = IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            message: None,
+        };
+        assert!(is_stale_root_response(&response));
+    }
+
+    /// 业务拒绝绝不能被当成「root 过期」，否则一次参数错误就会触发 repair。
+    #[test]
+    fn a_business_rejection_is_not_a_stale_root() {
+        for code in [
+            yi_agent_store::ipc::IpcErrorCode::Validation,
+            yi_agent_store::ipc::IpcErrorCode::RateLimited,
+            yi_agent_store::ipc::IpcErrorCode::InvalidState,
+            yi_agent_store::ipc::IpcErrorCode::Conflict,
+            yi_agent_store::ipc::IpcErrorCode::Internal,
+        ] {
+            let response = IpcResponse::Error {
+                code,
+                message: Some("business".into()),
+            };
+            assert!(
+                !is_stale_root_response(&response),
+                "{code} is business-layer"
+            );
+        }
+        assert!(!is_stale_root_response(&IpcResponse::Stopping));
     }
 }
 
@@ -455,8 +511,8 @@ mod idle_clock_tests {
     /// Drop 永远等不到，daemon 与监督线程继续跑——「回收」只骗过了表。
     ///
     /// 所以回收要能**原地退休**：丢掉 binding 里的 runtime（Drop 即停进程与监督
-    /// 线程），并推进 generation。会话不必删；下次真要委派时 `current_or_repair`
-    /// / `send` 会照既有路径重建 runtime。
+    /// 线程），并推进 generation。会话不必删；下次真要委派时 `send` 会照既有
+    /// 路径重建 runtime。
     ///
     /// 用 fixed binding 表达这条语义：它没有自己的 runtime，"退休" 的可见效果
     /// 就是 generation 不动（不能去停别人的 daemon），这也是一条要钉住的行为。

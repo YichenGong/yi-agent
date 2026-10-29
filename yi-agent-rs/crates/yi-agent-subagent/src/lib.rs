@@ -1461,20 +1461,18 @@ impl Tool for DaemonApplicationSendMessageTool {
         }
         let recipient = recipient.to_owned();
         let message = message.to_owned();
-        let handle = match self.root.handle() {
-            Ok(handle) => handle,
-            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
-        };
-        match yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
-                session_id: handle.session_id.clone(),
-                sender_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
-                recipient_task_id: recipient.clone(),
-                message: message.clone(),
-            },
-        ) {
+        // 发消息会改变 daemon 状态：身份层失败不重放，只修好运行时并让模型重试。
+        match self
+            .root
+            .send_as_root(crate::thread_root::RetryPolicy::SingleShot, |handle| {
+                yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
+                    session_id: handle.session_id.clone(),
+                    sender_task_id: handle.task_id.clone(),
+                    capability: handle.capability.clone(),
+                    recipient_task_id: recipient.clone(),
+                    message: message.clone(),
+                }
+            }) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
                 ToolResult::text("message queued")
             }
@@ -1521,20 +1519,18 @@ impl Tool for DaemonSendMessageTool {
         }
         let recipient = recipient.to_owned();
         let message = message.to_owned();
-        let handle = match self.root.handle() {
-            Ok(handle) => handle,
-            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
-        };
-        match yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::SendMessage {
-                session_id: handle.session_id.clone(),
-                sender_task_id: handle.task_id.clone(),
-                worker_capability: handle.capability.clone(),
-                recipient_task_id: recipient.clone(),
-                message: message.clone(),
-            },
-        ) {
+        // 发消息会改变 daemon 状态：身份层失败不重放，只修好运行时并让模型重试。
+        match self
+            .root
+            .send_as_root(crate::thread_root::RetryPolicy::SingleShot, |handle| {
+                yi_agent_store::ipc::IpcRequest::SendMessage {
+                    session_id: handle.session_id.clone(),
+                    sender_task_id: handle.task_id.clone(),
+                    worker_capability: handle.capability.clone(),
+                    recipient_task_id: recipient.clone(),
+                    message: message.clone(),
+                }
+            }) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
                 ToolResult::text("message queued")
             }
@@ -1948,7 +1944,7 @@ fn coding_requires_git_payload(message: &str) -> Option<String> {
 }
 
 fn spawn_outcome(
-    response: Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>,
+    response: Result<yi_agent_store::ipc::IpcResponse, String>,
     socket: &Path,
     fork_token: &Option<String>,
     objective: &str,
@@ -1970,6 +1966,12 @@ fn spawn_outcome(
         }
         Err(error) => {
             abort_unconsumed_fork(socket, fork_token);
+            // `send_as_root` 在身份层失败且策略为 SingleShot 时返回的提示已经
+            // 说明「没有重发」；这里原样透出，不要包上 "daemon is unavailable"，
+            // 否则模型会以为运行时挂了而实际上它刚被修好。
+            if error.contains("was NOT re-sent") {
+                return ToolResult::error(error);
+            }
             let message = format!("daemon is unavailable: {error}");
             ToolResult::error(coding_requires_git_payload(&message).unwrap_or(message))
         }
@@ -2117,6 +2119,8 @@ impl Tool for DaemonApplicationSpawnAgentTool {
         };
         let mode = mode.as_str().to_string();
         let objective = task.to_string();
+        // fork 上传必须先于 spawn，且它自己也走 wire：先把句柄拿到，再上传
+        // （上传失败时 `spawn_fork_token` 已经按 fork 策略降级或报错）。
         let handle = match self.root.handle() {
             Ok(handle) => handle,
             Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
@@ -2126,21 +2130,23 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Err(error) => return error,
         };
         let thread_id = self.thread_id.clone();
-        let response = yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-                session_id: handle.session_id.clone(),
-                parent_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
-                objective: objective.clone(),
-                mode: Some(mode.clone()),
-                model: model.clone(),
-                workdir: workdir.clone(),
-                thread_id: thread_id.clone(),
-                sandbox: sandbox.clone(),
-                fork_token: fork_token.clone(),
-            },
-        );
+        // spawn 会创建子任务：身份层失败绝不重放，只修好运行时并让模型重试。
+        let response =
+            self.root
+                .send_as_root(crate::thread_root::RetryPolicy::SingleShot, |handle| {
+                    yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                        session_id: handle.session_id.clone(),
+                        parent_task_id: handle.task_id.clone(),
+                        capability: handle.capability.clone(),
+                        objective: objective.clone(),
+                        mode: Some(mode.clone()),
+                        model: model.clone(),
+                        workdir: workdir.clone(),
+                        sandbox: sandbox.clone(),
+                        fork_token: fork_token.clone(),
+                        thread_id: thread_id.clone(),
+                    }
+                });
         spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
     }
 }
@@ -2183,19 +2189,17 @@ impl Tool for DaemonInspectAgentTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let task_id = task_id.to_owned();
-        let handle = match self.root.handle() {
-            Ok(handle) => handle,
-            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
-        };
-        let response = yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::InspectChild {
-                session_id: handle.session_id.clone(),
-                caller_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
-                task_id: task_id.clone(),
-            },
-        );
+        // 只读查询：身份层失败（root 属于被换掉的 daemon）可以安全重放一次。
+        let response =
+            self.root
+                .send_as_root(crate::thread_root::RetryPolicy::Idempotent, |handle| {
+                    yi_agent_store::ipc::IpcRequest::InspectChild {
+                        session_id: handle.session_id.clone(),
+                        caller_task_id: handle.task_id.clone(),
+                        capability: handle.capability.clone(),
+                        task_id: task_id.clone(),
+                    }
+                });
         let detail = match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskDetail(detail)) => detail,
             Ok(other) => return ToolResult::error(format_ipc_rejection("inspect request", &other)),
@@ -2210,13 +2214,19 @@ impl Tool for DaemonInspectAgentTool {
             "report": report,
         });
         if include_diff {
-            let diff = yi_agent_store::ipc::send_request(
-                &handle.socket_path,
-                yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
-                    task_id: task_id.clone(),
-                },
-            );
-            if let Ok(yi_agent_store::ipc::IpcResponse::TaskDiff { diff, .. }) = diff {
+            // `send_as_root` 不返回句柄，而 diff 请求要打到当届 socket 上。此时
+            // inspect 已经走通（root 已被证明可用），重新取一次句柄即可；若取不
+            // 到就不附 diff，与过去「diff 请求失败就不附」的处理一致。
+            let hop = self.root.handle();
+            let diff = hop.map(|handle| {
+                yi_agent_store::ipc::send_request(
+                    &handle.socket_path,
+                    yi_agent_store::ipc::IpcRequest::ReadTaskDiff {
+                        task_id: task_id.clone(),
+                    },
+                )
+            });
+            if let Ok(Ok(yi_agent_store::ipc::IpcResponse::TaskDiff { diff, .. })) = diff {
                 payload["diff"] = json!(diff);
             }
         }
@@ -2262,20 +2272,19 @@ impl Tool for DaemonCancelAgentTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let task_id = task_id.to_owned();
-        let handle = match self.root.handle() {
-            Ok(handle) => handle,
-            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
-        };
-        let response = yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::CancelChild {
-                session_id: handle.session_id.clone(),
-                caller_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
-                task_id: task_id.clone(),
-                recursive,
-            },
-        );
+        // 取消在 daemon 侧按稳定 task id 幂等（第二次找不到可取消目标即返回），
+        // 所以身份层失败后可以安全重放一次。
+        let response =
+            self.root
+                .send_as_root(crate::thread_root::RetryPolicy::Idempotent, |handle| {
+                    yi_agent_store::ipc::IpcRequest::CancelChild {
+                        session_id: handle.session_id.clone(),
+                        caller_task_id: handle.task_id.clone(),
+                        capability: handle.capability.clone(),
+                        task_id: task_id.clone(),
+                        recursive,
+                    }
+                });
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::TaskCancelled) => {
                 ToolResult::text(json!({ "task_id": task_id, "status": "cancelled" }).to_string())
@@ -2313,20 +2322,18 @@ impl Tool for DaemonWaitAgentTool {
             return ToolResult::error("mode must be one, any, or all");
         }
         let mode = mode.to_owned();
-        let handle = match self.root.handle() {
-            Ok(handle) => handle,
-            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
-        };
-        let response = yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::WaitAgent {
-                session_id: handle.session_id.clone(),
-                caller_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
-                mode: mode.clone(),
-                timeout_ms: Some(TUI_WAIT_AGENT_TIMEOUT_MS),
-            },
-        );
+        // 等待是查询：重放一次只是多等一次，没有额外副作用。
+        let response =
+            self.root
+                .send_as_root(crate::thread_root::RetryPolicy::Idempotent, |handle| {
+                    yi_agent_store::ipc::IpcRequest::WaitAgent {
+                        session_id: handle.session_id.clone(),
+                        caller_task_id: handle.task_id.clone(),
+                        capability: handle.capability.clone(),
+                        mode: mode.clone(),
+                        timeout_ms: Some(TUI_WAIT_AGENT_TIMEOUT_MS),
+                    }
+                });
         match response {
             Ok(yi_agent_store::ipc::IpcResponse::WaitCompleted {
                 status,
@@ -2380,6 +2387,8 @@ impl Tool for DaemonSpawnAgentTool {
         };
         let mode = mode.as_str().to_string();
         let objective = task.to_string();
+        // fork 上传必须先于 spawn，且它自己也走 wire：先把句柄拿到，再上传
+        // （上传失败时 `spawn_fork_token` 已经按 fork 策略降级或报错）。
         let handle = match self.root.handle() {
             Ok(handle) => handle,
             Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
@@ -2388,19 +2397,21 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(fork_token) => fork_token,
             Err(error) => return error,
         };
-        let response = yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::SpawnChild {
-                session_id: handle.session_id.clone(),
-                parent_task_id: handle.task_id.clone(),
-                objective: objective.clone(),
-                mode: Some(mode.clone()),
-                model: model.clone(),
-                workdir: workdir.clone(),
-                sandbox: sandbox.clone(),
-                fork_token: fork_token.clone(),
-            },
-        );
+        // spawn 会创建子任务：身份层失败绝不重放，只修好运行时并让模型重试。
+        let response =
+            self.root
+                .send_as_root(crate::thread_root::RetryPolicy::SingleShot, |handle| {
+                    yi_agent_store::ipc::IpcRequest::SpawnChild {
+                        session_id: handle.session_id.clone(),
+                        parent_task_id: handle.task_id.clone(),
+                        objective: objective.clone(),
+                        mode: Some(mode.clone()),
+                        model: model.clone(),
+                        workdir: workdir.clone(),
+                        sandbox: sandbox.clone(),
+                        fork_token: fork_token.clone(),
+                    }
+                });
         spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
     }
 }
