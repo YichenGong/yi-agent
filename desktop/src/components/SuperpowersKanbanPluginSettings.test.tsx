@@ -38,7 +38,7 @@ describe("SuperpowersKanbanPluginSettings", () => {
     let reads = 0;
     const { rerender } = render(<SuperpowersKanbanPluginSettings rpc={makeRpc(() => reads++)} />);
 
-    const input = (await screen.findByLabelText("默认并发上限")) as HTMLInputElement;
+    const input = (await screen.findByLabelText("全机并发上限")) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "7" } });
     expect(input.value).toBe("7");
 
@@ -51,7 +51,7 @@ describe("SuperpowersKanbanPluginSettings", () => {
     // 挂载时读过一次；身份变化不得再读。
     expect(reads).toBe(1);
     // 用户没保存的输入必须还在。
-    expect((screen.getByLabelText("默认并发上限") as HTMLInputElement).value).toBe("7");
+    expect((screen.getByLabelText("全机并发上限") as HTMLInputElement).value).toBe("7");
   });
 
   it("re-reads after a successful save and renders the persisted values", async () => {
@@ -70,7 +70,7 @@ describe("SuperpowersKanbanPluginSettings", () => {
     const rpc = scriptedRpc(reads, () => writes++);
 
     render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
-    await screen.findByLabelText("默认并发上限");
+    await screen.findByLabelText("全机并发上限");
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     // 重读回来的窗口必须渲染出来：days="Mon" 只点亮「星期一」。
@@ -170,7 +170,7 @@ describe("SuperpowersKanbanPluginSettings", () => {
     }) as unknown as PluginRpc;
 
     render(<SuperpowersKanbanPluginSettings rpc={rpc} />);
-    await screen.findByLabelText("默认并发上限");
+    await screen.findByLabelText("全机并发上限");
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
 
     expect((await screen.findByRole("alert")).textContent).toBe("插件未运行，保存失败");
@@ -178,7 +178,7 @@ describe("SuperpowersKanbanPluginSettings", () => {
 
   it("does not turn an emptied numeric input into 0 or NaN", async () => {
     render(<SuperpowersKanbanPluginSettings rpc={scriptedRpc([{ settings: EMPTY_SETTINGS }])} />);
-    const maxTasks = (await screen.findByLabelText("默认并发上限")) as HTMLInputElement;
+    const maxTasks = (await screen.findByLabelText("全机并发上限")) as HTMLInputElement;
     const interval = screen.getByLabelText("推进间隔秒数") as HTMLInputElement;
 
     fireEvent.change(maxTasks, { target: { value: "" } });
@@ -260,5 +260,17 @@ describe("SuperpowersKanbanPluginSettings", () => {
     fireEvent.click(wed);
     expect(wed.getAttribute("aria-pressed")).toBe("true");
     expect(writes).toBe(0);
+  });
+
+  it("labels the concurrency cap as machine-wide, not board-wide", async () => {
+    // 口径回归锁：这个上限限的是**全机总流量**（看板外的会话也吃同一份额度），
+    // 看板只是调度工具。文案若写回「默认并发上限」，用户会以为自己填的是本看板
+    // 的并发数，从而在看重板内卡片数时误判超发。
+    render(<SuperpowersKanbanPluginSettings rpc={scriptedRpc([{ settings: EMPTY_SETTINGS }], () => {})} />);
+
+    await screen.findByLabelText("全机并发上限");
+    expect(screen.queryByLabelText("默认并发上限")).toBeNull();
+    expect(screen.getByText("所有项目的看板会话与手动会话共用这个上限。")).toBeTruthy();
+    expect(screen.getByText("全机时段并发窗口")).toBeTruthy();
   });
 });
