@@ -63,7 +63,7 @@ pub struct RuntimeBinding {
     flight: Mutex<()>,
     /// 本项目最近一次「有活干」的时刻。
     ///
-    /// 由宿主在取句柄时刷新（`current` / `current_or_repair` / `send` 都经过
+    /// 由宿主在取句柄时刷新（`current` / `send` 都经过
     /// 这里），因此它记录的是真实的委派使用，而不是「进程还记着这个项目」。
     /// 回收判定据此区分「这个项目还在被用」与「只是表里留了个条目」。
     last_active: Mutex<Instant>,
@@ -256,14 +256,6 @@ impl RuntimeBinding {
         // boundary so callers that cached a root can notice it is stale.
         state.generation = state.generation.wrapping_add(1);
         Ok((handle, state.generation))
-    }
-
-    /// Current if usable, else repair.
-    pub fn current_or_repair(&self) -> Result<RuntimeHandle, String> {
-        match self.current() {
-            Ok(handle) => Ok(handle),
-            Err(_) => self.repair(),
-        }
     }
 
     /// Sends one request, repairing and retrying once if the runtime turns out
@@ -519,8 +511,8 @@ mod idle_clock_tests {
     /// Drop 永远等不到，daemon 与监督线程继续跑——「回收」只骗过了表。
     ///
     /// 所以回收要能**原地退休**：丢掉 binding 里的 runtime（Drop 即停进程与监督
-    /// 线程），并推进 generation。会话不必删；下次真要委派时 `current_or_repair`
-    /// / `send` 会照既有路径重建 runtime。
+    /// 线程），并推进 generation。会话不必删；下次真要委派时 `send` 会照既有
+    /// 路径重建 runtime。
     ///
     /// 用 fixed binding 表达这条语义：它没有自己的 runtime，"退休" 的可见效果
     /// 就是 generation 不动（不能去停别人的 daemon），这也是一条要钉住的行为。
