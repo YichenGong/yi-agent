@@ -1276,6 +1276,73 @@ describe("ChatView auto-scroll", () => {
     rerender(<ChatView items={list} threadId="t1" anchor={{ itemId: "tc1", offset: -100 }} />);
     expect(state.scrollTop).toBe(900);
   });
+  it("resets user takeover when returning to the same thread", async () => {
+    const list: Item[] = Array.from({ length: 20 }, (_, i) => ({
+      type: "userMessage" as const,
+      id: `a${i}`,
+      text: `m${i}`,
+    }));
+    const tops: Record<string, number> = {};
+    const state = { scrollTop: 0, contentH: 2000 };
+    let scroller: HTMLElement | null = null;
+    const rect = (top: number) =>
+      ({ top, left: 0, bottom: top, right: 0, width: 0, height: 0, x: 0, y: top, toJSON() {} }) as DOMRect;
+    const proto = HTMLElement.prototype as unknown as Record<string, unknown>;
+    const saved = {
+      rect: proto.getBoundingClientRect,
+      sh: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight"),
+      ch: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "clientHeight"),
+      st: Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop"),
+    };
+    proto.getBoundingClientRect = function (this: HTMLElement) {
+      if (this === scroller) return rect(0);
+      return rect(12 + (tops[this.dataset.itemId ?? ""] ?? 0) - state.scrollTop);
+    };
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? state.contentH + 24 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? 600 : 0; },
+    });
+    Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+      configurable: true,
+      get(this: HTMLElement) { return this === scroller ? state.scrollTop : 0; },
+      set(this: HTMLElement, value: number) { if (this === scroller) state.scrollTop = value; },
+    });
+
+    try {
+      tops.a0 = 0;
+      for (let i = 1; i < list.length; i++) tops[`a${i}`] = i * 100;
+      const anchorA = { itemId: "a10", offset: 0 };
+      const { container, rerender } = render(
+        <ChatView items={list} threadId="A" anchor={anchorA} />,
+      );
+      scroller = container.firstElementChild as HTMLElement;
+      // A 已恢复，用户主动滚动，随后切 B 再返回 A。
+      state.scrollTop = 500;
+      fireEvent.scroll(scroller);
+      rerender(<ChatView items={list} threadId="B" anchor={null} />);
+      rerender(<ChatView items={list} threadId="A" anchor={anchorA} />);
+      expect(state.scrollTop).toBe(1012);
+
+      // A 中锚点上方的异步内容变高；用户回到 A 后应重新得到自动校正。
+      for (let i = 1; i < list.length; i++) tops[`a${i}`] = i * 100 + 400;
+      state.contentH += 400;
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 150)); });
+      expect(state.scrollTop).toBe(1412);
+    } finally {
+      proto.getBoundingClientRect = saved.rect;
+      for (const [name, descriptor] of [
+        ["scrollHeight", saved.sh],
+        ["clientHeight", saved.ch],
+        ["scrollTop", saved.st],
+      ] as const) {
+        if (descriptor) Object.defineProperty(HTMLElement.prototype, name, descriptor);
+      }
+    }
+  });
 });
 
 describe("ChatView keeps reporting 'bottom' while the stream grows", () => {

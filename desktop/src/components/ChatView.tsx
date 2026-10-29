@@ -523,6 +523,9 @@ export function ChatView({
     }
     // 与漂移校正共用同一套"这是我们自己写的"标记：恢复这次的写入同样会
     // 触发一个 scroll 事件，不能被读成用户接管。
+    // 这是一次新的恢复访问：上一轮停留时用户可能接管过滚动，但不能让该状态
+    // 跨会话切换残留，否则 A→B→A 后漂移校正会一直被禁用。
+    userTookOver.current = false;
     selfScrolling.current = el.scrollTop = next;
     window.setTimeout(() => {
       selfScrolling.current = null;
