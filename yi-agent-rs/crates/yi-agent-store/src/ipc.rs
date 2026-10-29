@@ -2968,6 +2968,11 @@ fn ipc_error_message(error: &IpcError) -> Option<String> {
         IpcError::Runtime(RuntimeCoordinatorError::Spawn(
             yi_agent_core::subagent::supervisor::SpawnError::DirectChildLimitReached { limit },
         )) => Some(format!("an agent may have at most {limit} direct children")),
+        // The error's own Display already names the settled state, which is what
+        // tells the model whether retrying could ever help.
+        IpcError::Runtime(error @ RuntimeCoordinatorError::ParentSettled { .. }) => {
+            Some(error.to_string())
+        }
         // A fork rejection is the caller's mistake (unknown, incomplete, or
         // mismatched token), so the reason is safe to hand back verbatim rather
         // than leaving the client with only a bare code.
@@ -2995,7 +3000,10 @@ fn ipc_error_code(error: &IpcError) -> IpcErrorCode {
             yi_agent_core::subagent::supervisor::SpawnError::ParentNotFound,
         )) => IpcErrorCode::NotFound,
         IpcError::Runtime(RuntimeCoordinatorError::Supervisor(_))
-        | IpcError::Runtime(RuntimeCoordinatorError::Spawn(_)) => IpcErrorCode::InvalidState,
+        | IpcError::Runtime(RuntimeCoordinatorError::Spawn(_))
+        | IpcError::Runtime(RuntimeCoordinatorError::ParentSettled { .. }) => {
+            IpcErrorCode::InvalidState
+        }
         IpcError::Runtime(RuntimeCoordinatorError::ResidentCapacityExhausted) => {
             IpcErrorCode::RateLimited
         }
@@ -5312,6 +5320,32 @@ mod coding_requires_git_mapping_tests {
         assert!(
             !message.contains("not_a_repository"),
             "the two reasons must not be conflated: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod settled_parent_wire_tests {
+    use super::*;
+    use crate::runtime::RuntimeCoordinatorError;
+
+    /// The tool layer renders `daemon rejected {action}: {code}: {message}` and
+    /// falls back to a bare code when there is no message. A settled-parent
+    /// refusal is the caller's mistake with an actionable cause, so it has to
+    /// reach the model as text, not as `invalid_state` alone.
+    #[test]
+    fn a_settled_parent_rejection_carries_a_readable_message() {
+        let error = IpcError::Runtime(RuntimeCoordinatorError::ParentSettled {
+            state: "completed".into(),
+        });
+        let message = ipc_error_message(&error)
+            .expect("a settled-parent rejection must not reach the model as a bare code");
+        assert!(message.contains("settled parent"), "{message}");
+        assert!(message.contains("completed"), "{message}");
+        assert_eq!(
+            ipc_error_code(&error),
+            IpcErrorCode::InvalidState,
+            "a settled parent is an invalid-state refusal, not internal: {message}"
         );
     }
 }
