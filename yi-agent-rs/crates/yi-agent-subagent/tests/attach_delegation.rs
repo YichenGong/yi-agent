@@ -887,3 +887,81 @@ async fn a_tool_repairs_a_daemon_that_died() {
         "the healed root must be usable, got {probe:?}"
     );
 }
+
+/// `spawn_agent` 同样必须自愈。fork 上传必须先于 spawn，所以句柄在
+/// `send_as_root` 之前就要拿到——这条测试同时钉住「自愈后 socket 换过，
+/// fork token 仍然有效」。
+#[tokio::test]
+async fn a_spawn_tool_repairs_a_daemon_that_died() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models,
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_application_subagent_tools(
+        &mut registry,
+        Arc::clone(&root),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        yi_agent_subagent::CallerContext::unbound(),
+    );
+    let tool = registry
+        .get("spawn_agent")
+        .expect("spawn_agent is registered");
+    let generation_before = binding.generation();
+
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(std::time::Instant::now() < deadline, "the daemon must stop");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let result = tool
+        .call(serde_json::json!({ "task": "say hello", "fork": false }))
+        .await;
+
+    let text = format!("{:?}", result.content);
+    assert!(
+        !text.contains("daemon is unavailable"),
+        "spawn must repair a dead runtime instead of surfacing a transport error: {text}"
+    );
+    assert!(binding.generation() > generation_before);
+    assert!(
+        matches!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy
+        ),
+        "the runtime must be up again after the call"
+    );
+    // 自愈后必须真的能 spawn：成功时载荷里带 `"status":"queued"`，
+    // 失败时是拒绝原因。这不依赖 recipient/task 的具体校验规则。
+    assert!(
+        text.contains("queued"),
+        "a healed runtime must accept the spawn, got {text}"
+    );
+}

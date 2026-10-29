@@ -1944,7 +1944,7 @@ fn coding_requires_git_payload(message: &str) -> Option<String> {
 }
 
 fn spawn_outcome(
-    response: Result<yi_agent_store::ipc::IpcResponse, yi_agent_store::ipc::IpcError>,
+    response: Result<yi_agent_store::ipc::IpcResponse, String>,
     socket: &Path,
     fork_token: &Option<String>,
     objective: &str,
@@ -1966,6 +1966,12 @@ fn spawn_outcome(
         }
         Err(error) => {
             abort_unconsumed_fork(socket, fork_token);
+            // `send_as_root` 在身份层失败且策略为 SingleShot 时返回的提示已经
+            // 说明「没有重发」；这里原样透出，不要包上 "daemon is unavailable"，
+            // 否则模型会以为运行时挂了而实际上它刚被修好。
+            if error.contains("was NOT re-sent") {
+                return ToolResult::error(error);
+            }
             let message = format!("daemon is unavailable: {error}");
             ToolResult::error(coding_requires_git_payload(&message).unwrap_or(message))
         }
@@ -2113,6 +2119,8 @@ impl Tool for DaemonApplicationSpawnAgentTool {
         };
         let mode = mode.as_str().to_string();
         let objective = task.to_string();
+        // fork 上传必须先于 spawn，且它自己也走 wire：先把句柄拿到，再上传
+        // （上传失败时 `spawn_fork_token` 已经按 fork 策略降级或报错）。
         let handle = match self.root.handle() {
             Ok(handle) => handle,
             Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
@@ -2122,21 +2130,23 @@ impl Tool for DaemonApplicationSpawnAgentTool {
             Err(error) => return error,
         };
         let thread_id = self.thread_id.clone();
-        let response = yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
-                session_id: handle.session_id.clone(),
-                parent_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
-                objective: objective.clone(),
-                mode: Some(mode.clone()),
-                model: model.clone(),
-                workdir: workdir.clone(),
-                thread_id: thread_id.clone(),
-                sandbox: sandbox.clone(),
-                fork_token: fork_token.clone(),
-            },
-        );
+        // spawn 会创建子任务：身份层失败绝不重放，只修好运行时并让模型重试。
+        let response =
+            self.root
+                .send_as_root(crate::thread_root::RetryPolicy::SingleShot, |handle| {
+                    yi_agent_store::ipc::IpcRequest::SpawnApplicationChild {
+                        session_id: handle.session_id.clone(),
+                        parent_task_id: handle.task_id.clone(),
+                        capability: handle.capability.clone(),
+                        objective: objective.clone(),
+                        mode: Some(mode.clone()),
+                        model: model.clone(),
+                        workdir: workdir.clone(),
+                        sandbox: sandbox.clone(),
+                        fork_token: fork_token.clone(),
+                        thread_id: thread_id.clone(),
+                    }
+                });
         spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
     }
 }
@@ -2376,6 +2386,8 @@ impl Tool for DaemonSpawnAgentTool {
         };
         let mode = mode.as_str().to_string();
         let objective = task.to_string();
+        // fork 上传必须先于 spawn，且它自己也走 wire：先把句柄拿到，再上传
+        // （上传失败时 `spawn_fork_token` 已经按 fork 策略降级或报错）。
         let handle = match self.root.handle() {
             Ok(handle) => handle,
             Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
@@ -2384,19 +2396,21 @@ impl Tool for DaemonSpawnAgentTool {
             Ok(fork_token) => fork_token,
             Err(error) => return error,
         };
-        let response = yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::SpawnChild {
-                session_id: handle.session_id.clone(),
-                parent_task_id: handle.task_id.clone(),
-                objective: objective.clone(),
-                mode: Some(mode.clone()),
-                model: model.clone(),
-                workdir: workdir.clone(),
-                sandbox: sandbox.clone(),
-                fork_token: fork_token.clone(),
-            },
-        );
+        // spawn 会创建子任务：身份层失败绝不重放，只修好运行时并让模型重试。
+        let response =
+            self.root
+                .send_as_root(crate::thread_root::RetryPolicy::SingleShot, |handle| {
+                    yi_agent_store::ipc::IpcRequest::SpawnChild {
+                        session_id: handle.session_id.clone(),
+                        parent_task_id: handle.task_id.clone(),
+                        objective: objective.clone(),
+                        mode: Some(mode.clone()),
+                        model: model.clone(),
+                        workdir: workdir.clone(),
+                        sandbox: sandbox.clone(),
+                        fork_token: fork_token.clone(),
+                    }
+                });
         spawn_outcome(response, &handle.socket_path, &fork_token, &objective)
     }
 }
