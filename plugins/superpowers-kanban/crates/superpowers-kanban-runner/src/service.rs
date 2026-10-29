@@ -391,10 +391,28 @@ impl BoardService {
             }
         }
 
+        // 本拍的**全机余量**：峰值 − 全机运行会话数。合并轮（下一步）与启动（下下步）
+        // 共用这一份——两者都是真实的模型回合，吃的是同一份额度。
+        //
+        // 扣减基准必须是宿主的全机计数，而不是本看板自己的 `running_count`：看板内
+        // 那几张卡也在全机计数里，再减一次就是双重扣减（P=4、全机 4 个在跑时会误以为
+        // 还有余量）。
+        let board_running = cards.iter().filter(|c| c.state.occupies_slot()).count();
+        let budget = self.launch_budget(sessions_running, board_running);
+
         // 4) 合并轮开局：一次只跑一个合并（spec D8）。已有卡在 `merging`——它是
         //    名额的**持久载体**（`merge.lock` 只在临界区里活着）——就不开局；
         //    第二张 `awaiting_merge` 卡原地等它释放。
-        if !self.any_merging() {
+        //
+        //    `budget > 0` 是**必需的**：合并轮在会话里跑一次真实的模型回合，一样
+        //    吃限流额度。不设这道闸，峰值 4 的机器会出现「4 个实现会话 + 1 个合并」
+        //    的超发，正是配额要挡的东西。余量为 0 时合并轮等下一拍——卡留在
+        //    `awaiting_merge`，不进 `merging`（进了就白占合并名额）。
+        //
+        //    先合并后启动的次序不变：合并优先，且合并轮开局即 `return`，所以本拍
+        //    不会再起新会话。`Append` 型合并（复用已有会话）同样受这道闸——会话从
+        //    空闲变忙也是占额度。
+        if budget > 0 && !self.any_merging() {
             let mut candidates: Vec<&Card> = cards
                 .iter()
                 .filter(|card| match card.state {
@@ -482,12 +500,7 @@ impl BoardService {
         // 5) 启动：队首、有名额、日历放行 → 交出 `launch`。名额/租约/worktree
         //    的既有记账全在 `next_launch` 里，这里不重造（brief 规则 2）。
         //
-        // `budget` = 全机峰值 − 全机运行会话数。限的是**总流量**，所以扣减基准
-        // 必须是宿主的全机计数，而不是本看板自己的 `running_count`：看板内那几张
-        // 卡也在全机计数里，再减一次就是双重扣减（P=4、全机 4 个在跑时会误以为
-        // 还有余量）。
-        let board_running = cards.iter().filter(|c| c.state.occupies_slot()).count();
-        let budget = self.launch_budget(sessions_running, board_running);
+        // `budget` 已在第 4 步之前算好（合并轮与启动共用同一份余量）。
         match self.next_launch(budget, chrono::Local::now()) {
             Ok(Some(claim)) => {
                 let objective = cards
@@ -2670,6 +2683,53 @@ mod tests {
             "awaiting_merge",
             "第二张原地等名额"
         );
+    }
+
+    /// 合并轮**计入配额**：全机正在跑的会话数已顶到峰值时，这一拍不开合并轮。
+    ///
+    /// 合并轮是一个真实的模型回合——它一样在调模型、一样吃限流额度。若把它排除在
+    /// 额度之外，峰值 4 的机器上会同时出现 4 个实现会话 + 1 个合并会话 = 5 个
+    /// 在跑，正是配额要挡的超发。
+    ///
+    /// 闸门放开（下一拍余量回来了）就照常开局，所以是「等」而不是「永不」。
+    #[test]
+    fn a_merge_round_waits_when_the_whole_machine_has_no_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        peak_of(&service, 4);
+
+        // 全机 4 个会话在跑（都是看板外的：这张卡的会话已空闲）→ 余量 0。
+        let action = service
+            .driver_step(&idle(&["thread-1"]), &[], Some(4))
+            .unwrap();
+        assert!(
+            action.is_none(),
+            "余量为 0 时不得开合并轮（合并轮也吃额度）：{action:?}"
+        );
+        assert_eq!(
+            state_of(&service, "card-1"),
+            "awaiting_merge",
+            "卡原地等，不许被改成 merging（那样会白占合并名额）"
+        );
+    }
+
+    /// 与上一条对称：峰值 5、全机 4 个在跑 → 还剩 1 个名额，合并轮照常开局。
+    #[test]
+    fn a_merge_round_opens_when_the_whole_machine_still_has_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_with_worktree(dir.path());
+        let (service, source) = service_with_awaiting_card(&project);
+        git_run(&project, &["branch", &source]);
+        peak_of(&service, 5);
+
+        let action = service
+            .driver_step(&idle(&["thread-1"]), &[], Some(4))
+            .unwrap()
+            .expect("余量 1 → 合并轮开局");
+        assert!(matches!(action, DriverAction::Append { .. }), "{action:?}");
+        assert_eq!(state_of(&service, "card-1"), "merging");
     }
 
     /// 合并轮收尾：`merging` 卡的会话再次空闲 → 插件代调 `merge_finish`，

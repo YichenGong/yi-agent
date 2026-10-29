@@ -29,7 +29,7 @@ describe("SettingsPluginsTab", () => {
       return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
     };
     render(<SettingsPluginsTab call={call} projects={[]} />);
-    expect(await screen.findByLabelText("默认并发上限")).toBeTruthy();
+    expect(await screen.findByLabelText("全机并发上限")).toBeTruthy();
     expect(await screen.findByLabelText("推进间隔秒数")).toBeTruthy();
   });
 
@@ -69,7 +69,7 @@ describe("SettingsPluginsTab", () => {
     });
 
     // 换项目 = 换作用域：重新枚举，且这次能看到该项目里的看板面板。
-    expect(await screen.findByLabelText("默认并发上限")).toBeTruthy();
+    expect(await screen.findByLabelText("全机并发上限")).toBeTruthy();
     expect(calls[1]).toEqual({ project: "/p/second" });
   });
 
@@ -89,7 +89,7 @@ describe("SettingsPluginsTab", () => {
     // 面板仍在：用户得能从这一页看出它为什么没在跑，而不是整块消失。
     // 必须 `findBy`：设置本身是异步读的，"已停用"那行先到、面板后到，
     // 用同步 `getBy` 会变成一条随机失败的测试。
-    expect(await screen.findByLabelText("默认并发上限")).toBeTruthy();
+    expect(await screen.findByLabelText("全机并发上限")).toBeTruthy();
   });
 
   it("treats an old host that omits enabled as running", async () => {
@@ -100,7 +100,7 @@ describe("SettingsPluginsTab", () => {
       return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
     };
     render(<SettingsPluginsTab call={call} projects={["/p/proj"]} />);
-    await screen.findByLabelText("默认并发上限");
+    await screen.findByLabelText("全机并发上限");
     expect(screen.queryByText(/已停用/)).toBeNull();
   });
 
@@ -116,14 +116,14 @@ describe("SettingsPluginsTab", () => {
       return { settings: { default_max_tasks: 3, interval_secs: 10, windows: [] } };
     };
     render(<SettingsPluginsTab call={call} projects={[]} />);
-    const input = (await screen.findByLabelText("默认并发上限")) as HTMLInputElement;
+    const input = (await screen.findByLabelText("全机并发上限")) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "7" } });
     expect(input.value).toBe("7");
 
     fireEvent.click(screen.getByRole("button", { name: "保存" }));
     expect(await screen.findByRole("alert")).toBeTruthy();
     // 失败绝不乐观更新：用户改的值必须还在，且显示的就是他的输入。
-    expect((screen.getByLabelText("默认并发上限") as HTMLInputElement).value).toBe("7");
+    expect((screen.getByLabelText("全机并发上限") as HTMLInputElement).value).toBe("7");
   });
 
   it("keeps unsaved edits when the call seam identity changes on re-render", async () => {
@@ -136,7 +136,7 @@ describe("SettingsPluginsTab", () => {
     const { rerender } = render(
       <SettingsPluginsTab call={makeCall()} projects={["/p/proj"]} />,
     );
-    const input = (await screen.findByLabelText("默认并发上限")) as HTMLInputElement;
+    const input = (await screen.findByLabelText("全机并发上限")) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "7" } });
     expect(input.value).toBe("7");
 
@@ -145,6 +145,6 @@ describe("SettingsPluginsTab", () => {
     await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
 
     // 未保存的编辑不得被重新读回来的服务端值冲掉。
-    expect((screen.getByLabelText("默认并发上限") as HTMLInputElement).value).toBe("7");
+    expect((screen.getByLabelText("全机并发上限") as HTMLInputElement).value).toBe("7");
   });
 });
