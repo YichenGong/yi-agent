@@ -1076,3 +1076,132 @@ fn a_configured_direct_child_limit_is_enforced_and_reported() {
         Err(SpawnError::DirectChildLimitReached { limit: 2 })
     ));
 }
+
+/// Drives a task to a settled terminal state through the public reducer.
+fn settle_task(supervisor: &mut AgentSupervisor, task: &TaskId, event: TaskEvent) {
+    supervisor
+        .reduce_task(task, event)
+        .unwrap_or_else(|error| panic!("reduce must succeed: {error}"));
+}
+
+fn attempt_of(
+    supervisor: &AgentSupervisor,
+    task: &TaskId,
+) -> yi_agent_core::subagent::task::AttemptId {
+    supervisor.task(task).unwrap().active_attempt_id().clone()
+}
+
+#[test]
+fn a_completed_parent_cannot_spawn() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let parent = supervisor.root_task_id().clone();
+    supervisor.start_task(&parent).unwrap();
+    let attempt = attempt_of(&supervisor, &parent);
+    settle_task(
+        &mut supervisor,
+        &parent,
+        TaskEvent::WorkerCompletedNoChanges {
+            attempt_id: attempt,
+        },
+    );
+    // WorkerCompletedNoChanges lands on CompletedNoChanges, NOT Completed —
+    // verified by running it. Both are Settled, so the label is the other one.
+    assert_eq!(
+        supervisor.task(&parent).unwrap().state(),
+        &TaskState::CompletedNoChanges
+    );
+
+    let before = supervisor.children_of(&parent).len();
+    let error = supervisor.spawn(parent.clone()).unwrap_err();
+    assert_eq!(
+        error,
+        SpawnError::ParentSettled {
+            state: "completed_no_changes"
+        }
+    );
+    assert_eq!(
+        supervisor.children_of(&parent).len(),
+        before,
+        "a refused spawn must not leave half a child behind"
+    );
+}
+
+#[test]
+fn a_failed_parent_cannot_spawn() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let parent = supervisor.root_task_id().clone();
+    supervisor.start_task(&parent).unwrap();
+    let attempt = attempt_of(&supervisor, &parent);
+    settle_task(
+        &mut supervisor,
+        &parent,
+        TaskEvent::WorkerFailed {
+            attempt_id: attempt,
+            failure: yi_agent_core::subagent::task::TaskFailure::new("boom"),
+        },
+    );
+    assert_eq!(
+        supervisor.spawn(parent.clone()).unwrap_err(),
+        SpawnError::ParentSettled { state: "failed" }
+    );
+}
+
+#[test]
+fn a_cancelled_parent_cannot_spawn() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let parent = supervisor.root_task_id().clone();
+    supervisor.start_task(&parent).unwrap();
+    let attempt = attempt_of(&supervisor, &parent);
+    settle_task(
+        &mut supervisor,
+        &parent,
+        TaskEvent::CancelRequested {
+            attempt_id: attempt,
+            reason: yi_agent_core::subagent::task::CancelReason("test".into()),
+        },
+    );
+    assert_eq!(
+        supervisor.spawn(parent.clone()).unwrap_err(),
+        SpawnError::ParentSettled { state: "cancelled" }
+    );
+}
+
+#[test]
+fn a_recovery_required_parent_can_still_spawn() {
+    // The whole reason the gate uses classify_terminal instead of is_terminal:
+    // recovery_required is terminal for bookkeeping but is a parked, resumable
+    // state, and a resumed parent still needs to spawn.
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let parent = supervisor.root_task_id().clone();
+    supervisor.start_task(&parent).unwrap();
+    let attempt = attempt_of(&supervisor, &parent);
+    settle_task(
+        &mut supervisor,
+        &parent,
+        TaskEvent::RuntimeInterrupted {
+            attempt_id: attempt,
+            evidence: RecoveryEvidence("interrupted".into()),
+        },
+    );
+    assert!(
+        matches!(
+            supervisor.task(&parent).unwrap().state(),
+            TaskState::RecoveryRequired(_)
+        ),
+        "precondition: parent must be recovery_required"
+    );
+    let child = supervisor
+        .spawn(parent.clone())
+        .expect("a recovery-required parent must still be able to spawn");
+    assert_eq!(supervisor.task(&child).unwrap().state(), &TaskState::Queued);
+}
+
+#[test]
+fn a_running_parent_can_still_spawn() {
+    let mut supervisor = AgentSupervisor::new(RootSessionId::new());
+    let parent = supervisor.root_task_id().clone();
+    supervisor.start_task(&parent).unwrap();
+    supervisor
+        .spawn(parent.clone())
+        .expect("a running parent must spawn normally");
+}

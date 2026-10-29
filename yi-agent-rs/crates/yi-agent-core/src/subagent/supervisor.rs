@@ -37,6 +37,8 @@ pub enum SpawnError {
     MaximumDepthReached,
     #[error("an agent may have at most {limit} direct children")]
     DirectChildLimitReached { limit: usize },
+    #[error("a settled parent task (state: {state}) cannot spawn descendants")]
+    ParentSettled { state: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -1279,6 +1281,19 @@ impl AgentSupervisor {
             .tasks
             .get(&parent_id)
             .ok_or(SpawnError::ParentNotFound)?;
+        // A settled parent is finished: any child spawned now falls outside the
+        // terminal cascade (which only fires on the transition itself) and its
+        // result has nowhere to go, because deliver_message refuses a terminal
+        // recipient. Refuse the spawn instead of building a dead subtree.
+        //
+        // classify_terminal, not is_terminal: recovery_required is terminal for
+        // bookkeeping but parked and resumable, and a resumed parent keeps
+        // spawning.
+        if let TerminalKind::Settled = classify_terminal(parent.state()) {
+            return Err(SpawnError::ParentSettled {
+                state: task_state_label(parent.state()),
+            });
+        }
         let child_depth = parent
             .depth
             .can_spawn_child()
