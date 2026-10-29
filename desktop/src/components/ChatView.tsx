@@ -167,9 +167,9 @@ const ChatItem = memo(
     /** 搜索关键词。空串表示未在搜索，不产生任何 mark。 */
     query: string;
   }) {
-    // 消息根节点统一包一层 `contents` 包裹，只为挂 `data-item-id`：阅读位置靠它
-    // 定位。`display: contents` 不生成盒子，因此子元素仍是滚动容器的直接 flex
-    // item —— 用户气泡的 `self-end`、助手消息的 `self-start` 都不受影响。
+    // 阅读锚点必须挂在实际生成布局盒的节点上：`display: contents` 的矩形恒为
+    // 零，采集会把所有消息视为同一位置并错误选中最后一条。用纵向 flex 容器
+    // 保留子消息 self-start/self-end 的对齐，禁止收缩以保持可滚动的自然高度。
     const node = (() => {
       switch (item.type) {
         case "notice":
@@ -242,7 +242,7 @@ const ChatItem = memo(
       }
     })();
     return (
-      <div className="contents" data-item-id={item.id}>
+      <div className="flex shrink-0 flex-col" data-item-id={item.id}>
         {node}
       </div>
     );
@@ -391,6 +391,7 @@ export function ChatView({
   structuralVersion = 0,
   query = "",
   scrollerRef,
+  captureViewRef,
   anchor,
   onRememberView,
   syncing = false,
@@ -419,6 +420,8 @@ export function ChatView({
    * "当前视口"），与内部 `useStickToBottom` 的 ref 指向同一个元素。
    */
   scrollerRef?: RefObject<HTMLDivElement | null>;
+  /** 切换前同步采集，避免最后一个滚动帧被新会话提交取消。 */
+  captureViewRef?: RefObject<(() => void) | null>;
   /**
    * 该会话上次离开时的阅读位置；`null` = 离开时贴底，`undefined` = 从没记过。
    * 由宿主按 `threadId` 提供（见 `App` 的 `anchorFor`）。
@@ -487,6 +490,14 @@ export function ChatView({
   /** 上一次由**我们**写入的 `scrollTop`；用于识别它自己触发的 scroll 事件。 */
   const selfScrolling = useRef<number | null>(null);
   useLayoutEffect(() => {
+    // 恢复状态属于本次访问，而不是上一次成功恢复的会话。
+    // A→尚未恢复的 B→A 同样必须重新对位，不能被旧 restoredFor 短路。
+    restoredFor.current = undefined;
+    heldAnchor.current = null;
+    userTookOver.current = false;
+    selfScrolling.current = null;
+  }, [threadId]);
+  useLayoutEffect(() => {
     const el = elRef.current;
     if (!el) return;
     if (restoredFor.current === threadId) return;
@@ -496,6 +507,7 @@ export function ChatView({
       restoredFor.current = threadId;
       return;
     }
+    releaseFollow();
     // 不用 `[data-item-id="..."]` 选择器：id 来自服务端，逗号/引号都会破坏
     // 选择器语法，且 `CSS.escape` 在 jsdom 下不存在。扫描一遍更稳。
     const target = Array.from(el.querySelectorAll<HTMLElement>("[data-item-id]")).find(
@@ -504,7 +516,7 @@ export function ChatView({
     if (!target) {
       // 内容还在补齐：回放分帧到达，此刻可能只收到了前几帧（不含锚点那条）。
       // 不锁定，等内容继续到达再试。
-      if (syncing) return;
+      if (syncing || items.length === 0) return;
       // 已有完整内容却没有这条消息（被删/历史被截断）：回退到底部，别停在
       // 无意义的像素上，并就此锁定——再等也不会出现。
       restoredFor.current = threadId;
@@ -521,15 +533,16 @@ export function ChatView({
       scrollToBottom();
       return;
     }
+    // 锚消息已到达，但其后的回放内容可能还不足以容纳原视口偏移。
+    // 此时写入会被夹到临时底部，scroll 采集再把旧锚点抹成 null。
+    if (syncing && next > el.scrollHeight - el.clientHeight + 1) return;
     // 与漂移校正共用同一套"这是我们自己写的"标记：恢复这次的写入同样会
     // 触发一个 scroll 事件，不能被读成用户接管。
     // 这是一次新的恢复访问：上一轮停留时用户可能接管过滚动，但不能让该状态
     // 跨会话切换残留，否则 A→B→A 后漂移校正会一直被禁用。
     userTookOver.current = false;
-    selfScrolling.current = el.scrollTop = next;
-    window.setTimeout(() => {
-      selfScrolling.current = null;
-    }, 0);
+    el.scrollTop = next;
+    selfScrolling.current = el.scrollTop;
     restoredFor.current = threadId;
     // 记住"这一行应该在视口顶"，供下方的漂移校正使用。
     heldAnchor.current = anchor;
@@ -572,12 +585,10 @@ export function ChatView({
       // 亚像素与行内重排不算漂移，避免无意义地反复写 scrollTop。
       if (Math.abs(node.scrollTop - next) < 1) return;
       // 记下这次是**我们自己**写的：紧随其后的 `scroll` 事件不是用户意图。
-      selfScrolling.current = node.scrollTop = next;
-      // 回声事件在同一轮任务里就会到；超时兜底清掉标记，免得它长期残留、
-      // 之后恰好滚到同一位置时把用户的滚动误吞掉。
-      window.setTimeout(() => {
-        selfScrolling.current = null;
-      }, 0);
+      node.scrollTop = next;
+      selfScrolling.current = node.scrollTop;
+      // scroll 在后续渲染步骤异步派发，不能用 0ms 定时器提前清标记。
+      // 由 onUserScroll 消费；用户真滚动到不同位置仍立即接管。
     };
     const schedule = () => {
       if (frame !== null) return;
@@ -624,7 +635,7 @@ export function ChatView({
       if (poll !== null) window.clearInterval(poll);
       observer?.disconnect();
     };
-  }, [threadId]);
+  }, [threadId, items.length, syncing]);
 
   useEffect(() => {
     const el = elRef.current;
@@ -639,6 +650,11 @@ export function ChatView({
       const report = rememberRef.current;
       // 没有选中会话时没有可归属的位置（也不会有人读它）。
       if (!node || !report || owner === null) return;
+      // scroll 的采集帧可能排在 React 已提交新会话 DOM、旧 effect 尚未清理
+      // 的窗口中。闭包 owner 只能标记请求归属，不能证明当前 DOM 仍属于它。
+      if (node.dataset.threadId !== owner) return;
+      // 空/部分回放不是用户离开时的位置，不能覆盖尚待恢复的锚点。
+      if (restoredFor.current !== owner || !node.querySelector("[data-item-id]")) return;
       // 用 hook 维护的**相对**意图判断贴底，而不是重算当下的绝对 gap：
       // 采集帧在内容增长之后才跑，此刻 gap 早已超过阈值，重算会把「仍在底部」
       // 误记成「在读历史」，切走再回来就被恢复到消息锚点并放弃跟随。
@@ -668,23 +684,29 @@ export function ChatView({
       frame = requestAnimationFrame(capture);
     };
 
+    const flushCapture = () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      capture();
+    };
+    if (captureViewRef) captureViewRef.current = flushCapture;
     el.addEventListener("scroll", onScroll, { passive: true });
     capture();
     return () => {
+      if (captureViewRef?.current === flushCapture) captureViewRef.current = null;
       el.removeEventListener("scroll", onScroll);
       if (frame !== null) cancelAnimationFrame(frame);
     };
-  }, [threadId]);
+  }, [threadId, captureViewRef]);
 
   // 新内容 / 流式文本变化时跟随，但**只在用户仍贴底时**。用户上翻历史后，
   // 每个 delta 都强制贴底会让他在整个生成期间反复被拽回底部，根本读不到上面的内容。
-  // 真正需要强制到底的只有两种**明确意图**：用户自己发出了消息、切换了会话。
+  // 仅无阅读记录的首次进入、用户新发消息或新错误横幅强制到底。
   const prevThreadRef = useRef(threadId);
   const prevCountRef = useRef(items.length);
   const prevErrorRef = useRef(error ?? null);
   const didMountRef = useRef(false);
   useEffect(() => {
-    // 首次挂载：打开一个已有历史的会话必须落在最新内容上。不能交给
+    // 首次挂载且无阅读记录：打开已有历史的会话落在最新内容上。不能交给
     // `followIfAtBottom`——hook 的 `scroll` 监听此时已把意图读成「不贴底」
     // （新挂载的元素 `scrollTop` 为 0）。
     const firstRun = !didMountRef.current;
@@ -693,7 +715,7 @@ export function ChatView({
     const threadChanged = prevThreadRef.current !== threadId;
     const grew = items.length > prevCountRef.current;
     // 错误横幅是一次性的「必须看到」事件，不是流式增长：保留原来的强制贴底。
-    const newError = error != null && error !== prevErrorRef.current;
+    const newError = !threadChanged && !firstRun && error != null && error !== prevErrorRef.current;
     prevThreadRef.current = threadId;
     prevCountRef.current = items.length;
     prevErrorRef.current = error ?? null;
@@ -702,6 +724,7 @@ export function ChatView({
     // 自己按了发送——这条新内容理应可见。
     const newest = items[items.length - 1];
     const sentByUser =
+      !threadChanged && !firstRun &&
       grew &&
       newest?.type === "userMessage" &&
       typeof newest.id === "string" &&
@@ -709,16 +732,17 @@ export function ChatView({
 
     // 恢复锚点的会话不在这里动视口：`useLayoutEffect` 已经对好位，再调
     // `scrollToBottom` 会把它顶掉。
-    const restoring = threadChanged && anchor != null;
+    const restoring = anchor != null && (firstRun || threadChanged || restoredFor.current !== threadId);
+    if (restoring) return;
     if (firstRun || sentByUser || newError) scrollToBottom();
-    else if (threadChanged) {
-      if (!restoring) scrollToBottom();
-    } else followIfAtBottom();
+    else if (threadChanged) scrollToBottom();
+    else followIfAtBottom();
   }, [items.length, lastText, error, threadId, anchor, syncing, scrollToBottom, followIfAtBottom]);
 
   return (
     <div
       ref={setScroller}
+      data-thread-id={threadId ?? undefined}
       className="flex min-w-0 flex-1 flex-col overflow-x-hidden overflow-y-auto px-4 py-3"
     >
       {/* `structuralVersion` travels as a **prop**, not a `key`. `items` is the

@@ -534,6 +534,7 @@ export default function App() {
    * `initialActiveIndex` 的"视口"会退化成"内容最顶端"，每次打开都跳第一个命中。
    */
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const captureTranscriptRef = useRef<(() => void) | null>(null);
 
   const search = useTranscriptSearch({
     containerRef: transcriptRef,
@@ -651,6 +652,7 @@ export default function App() {
     opts?: { leaveBoard?: boolean; forceResume?: boolean },
   ) => {
     const prevId = store.currentId;
+    if (prevId !== id) captureTranscriptRef.current?.();
     // 只有**换了会话**才清附属视图：清空是为了「别把 A 的数据画在 B 上」，
     // 会话没变时（重连重放、点已选中的那一行）不存在错配，清掉纯属打断用户。
     const changed = prevId !== null && prevId !== id;
@@ -948,6 +950,7 @@ export default function App() {
         typeof t.reasoning_effort === "string" ? t.reasoning_effort : null;
       // 新会话恒 normal，但以响应字段为准（服务端是权威），缺失时回退 normal。
       store.view(t.thread_id).mode = permissionModeFromResponse(t) ?? "normal";
+      captureTranscriptRef.current?.();
       store.select(t.thread_id);
       sess.setCurrentId(t.thread_id);
       writeSelectedThread(localStorage, t.thread_id);
@@ -1022,6 +1025,7 @@ export default function App() {
   const onOpenBoard = (path: string) => {
     // 已经在该看板页：纯 no-op，不重读、不清屏。
     if (path === board.selectedBoard) return;
+    captureTranscriptRef.current?.();
     // 换项目等于换问题：上一个项目的失败说法和卡片留在屏幕上只会误导。
     board.setBoardError(null);
     board.setBoardCards([]);
@@ -2519,6 +2523,7 @@ export default function App() {
                   // 注释），所以直接透传，不在闭包里另读 currentId。
                   onRememberView={sess.rememberView}
                   scrollerRef={transcriptRef}
+                  captureViewRef={captureTranscriptRef}
                 />
                 {searchOpen && (
                   <SearchBar

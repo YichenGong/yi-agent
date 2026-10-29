@@ -612,11 +612,12 @@ describe("ChatView item ids", () => {
   });
 
   it("keeps the message's own alignment when wrapping it for the id", () => {
-    // `display: contents` 让包裹层不生成盒子，子元素仍直接参与滚动容器的
-    // flex 布局；否则用户气泡的内缩/右对齐会被一层普通 div 破坏。
+    // 锚点节点必须有实际布局盒；内层纵向 flex 保留气泡的 self-end 对齐。
     const { container } = render(<ChatView items={items()} threadId="t1" />);
     const first = container.querySelector("[data-item-id]") as HTMLElement;
-    expect(first.className).toContain("contents");
+    expect(first.className.split(" ")).toEqual(expect.arrayContaining(["flex", "flex-col", "shrink-0"]));
+    expect(first.className.split(" ")).not.toContain("contents");
+    expect(first.firstElementChild?.className).toContain("self-end");
   });
 });
 
@@ -1122,8 +1123,8 @@ describe("ChatView auto-scroll", () => {
       set(this: HTMLElement, v: number) {
         if (this !== scroller) return;
         state.scrollTop = Math.max(0, Math.min(v, state.contentH + PAD * 2 - VIEWPORT));
-        // 真实浏览器语义：程序化写入同样会派发 scroll（异步）。
-        setTimeout(() => { scroller?.dispatchEvent(new Event("scroll")); }, 0);
+        // 浏览器在下一次渲染的 scroll steps 派发，不保证早于 0ms 定时器。
+        setTimeout(() => { scroller?.dispatchEvent(new Event("scroll")); }, 16);
       },
     });
 
