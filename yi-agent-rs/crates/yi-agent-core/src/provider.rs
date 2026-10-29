@@ -307,6 +307,15 @@ where
             }
             ProviderEvent::ToolUseEnd { id } => {
                 if let Some((name, json)) = tool_uses.remove(&id) {
+                    // 无参数工具可以完全不发参数增量：Anthropic 只发
+                    // `content_block_start` + `content_block_stop`，累积的 JSON
+                    // 就是空串。空串不是畸形数据，按空对象处理；非空但被截断的
+                    // JSON 仍然报错——那确实意味着数据损坏。
+                    let json = if json.trim().is_empty() {
+                        "{}".to_string()
+                    } else {
+                        json
+                    };
                     let input: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
                         ProviderError::Stream(format!("malformed tool use JSON for id {id}: {e}"))
                     })?;
@@ -331,7 +340,13 @@ where
                 break false;
             }
             ProviderEvent::Usage(u) => {
-                last_usage = Some(u.clone());
+                // 一次请求的 usage 可能分多次到达（Anthropic 的 message_start
+                // 给 input/cache，末尾 message_delta 只给 output_tokens）。整体
+                // 覆盖会把先到的 input_tokens 抹成 0，而自动压缩正是靠它判定。
+                match &mut last_usage {
+                    Some(acc) => acc.merge_snapshot(&u),
+                    None => last_usage = Some(u.clone()),
+                }
                 on_event(ProviderEvent::Usage(u));
             }
             ProviderEvent::ReasoningDelta { text, kind } => {
@@ -525,6 +540,75 @@ mod tests {
 
     fn text_event(s: &str) -> ProviderEvent {
         ProviderEvent::TextDelta(s.to_string())
+    }
+
+    fn empty_request() -> ProviderRequest {
+        ProviderRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            params: GenParams::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn accumulate_merges_split_usage_instead_of_overwriting() {
+        // Anthropic 真实形状：message_start 给 input/cache，message_delta 只给
+        // output_tokens。后到的整体覆盖会把 input_tokens 抹成 0，自动压缩永不触发。
+        let provider = MockProvider {
+            events: vec![
+                text_event("hi"),
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 100_000,
+                    output_tokens: 0,
+                    cache_read_input_tokens: Some(90_000),
+                    ..Default::default()
+                }),
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 42,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        };
+        let stream = provider.call_stream(empty_request()).await.unwrap();
+        let (_content, _end, usage) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+        let usage = usage.expect("usage must be reported");
+        assert_eq!(
+            usage.input_tokens, 100_000,
+            "input must survive the later output-only report"
+        );
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(usage.cache_read_input_tokens, Some(90_000));
+    }
+
+    #[tokio::test]
+    async fn a_zero_arg_tool_call_without_arguments_parses_as_empty_object() {
+        // Anthropic 对无参数工具可以完全不发 input_json_delta。
+        let provider = MockProvider {
+            events: vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "list_files".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        };
+        let stream = provider.call_stream(empty_request()).await.unwrap();
+        let (content, _end, _usage) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+        assert!(
+            content.iter().any(
+                |b| matches!(b, ContentBlock::ToolUse { input, .. } if input == &serde_json::json!({}))
+            ),
+            "empty arguments must become an empty object, got: {content:?}"
+        );
     }
 
     #[tokio::test]
