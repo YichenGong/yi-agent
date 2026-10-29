@@ -23,6 +23,7 @@ use yi_agent_core::subagent::scheduler::{
 use yi_agent_core::subagent::supervisor::{
     AgentSupervisor, CompletedChildReport, SpawnError, WaitMode, WaitOutcome, WorkerStartError,
 };
+use yi_agent_core::subagent::supervisor::{TerminalKind, classify_terminal};
 use yi_agent_core::subagent::task::{
     AgentTask, AttemptId, BlockReason, BudgetKind, CancelReason, ChildWriteMode, DeliveryReport,
     MessageId, PauseReason, PermissionDecision, PermissionRequestId, RecoveryEvidence,
@@ -85,6 +86,8 @@ pub enum RuntimeCoordinatorError {
     AuthorityDenied(String),
     #[error(transparent)]
     Spawn(#[from] SpawnError),
+    #[error("a settled parent task (state: {state}) cannot spawn descendants")]
+    ParentSettled { state: String },
     #[error("global resident subagent capacity is exhausted")]
     ResidentCapacityExhausted,
     #[error("global queued subagent capacity is exhausted")]
@@ -1550,6 +1553,30 @@ impl RuntimeCoordinator {
             return Err(RuntimeCoordinatorError::QueueCapacityExceeded);
         }
         let supervisor = self.supervisor(session)?;
+        // Refuse a settled parent here, before `take_fork_messages` consumes the
+        // upload: the supervisor enforces the same rule, but by then the token is
+        // already gone and the caller's retry would fail with an unhelpful
+        // "unknown token" instead of the real reason.
+        //
+        // An unparseable state falls through to the supervisor's authoritative
+        // check rather than refusing: the pre-check is a guard, not the verdict,
+        // and wrongly refusing a live parent is worse than one wasted upload.
+        // An unknown parent must keep reporting `ParentNotFound` (not a bare SQL
+        // "no rows" surfacing as `internal`), so a missing row simply falls
+        // through to the supervisor, which owns that verdict.
+        let parent_state = self
+            .repository
+            .lock()
+            .expect("runtime repository mutex poisoned")
+            .task_state(parent);
+        if let Ok(parent_state) = parent_state
+            && let Some(state) = TaskState::from_state_label(&parent_state)
+            && classify_terminal(&state) == TerminalKind::Settled
+        {
+            return Err(RuntimeCoordinatorError::ParentSettled {
+                state: parent_state,
+            });
+        }
         // A parent names the directory from its own position, so a relative
         // workdir resolves against the parent's workdir, not the daemon's cwd
         // (which is unrelated to any task). Resolving before the spawn means the

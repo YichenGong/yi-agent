@@ -1972,13 +1972,13 @@ impl AgentSupervisor {
 /// bookkeeping but is a *parked, resumable* state, so cascading on it would
 /// kill children the parent could still need after a resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TerminalKind {
+pub enum TerminalKind {
     NonTerminal,
     Settled,
     RecoveryRequired,
 }
 
-fn classify_terminal(state: &TaskState) -> TerminalKind {
+pub fn classify_terminal(state: &TaskState) -> TerminalKind {
     match state {
         TaskState::Completed
         | TaskState::CompletedNoChanges

@@ -156,6 +156,9 @@ fn watchdog_uses_persisted_progress_and_resource_queue_time() {
             provider_retries: 0,
             tool_retries: 0,
             rework_cycles: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
         },
     };
 
@@ -190,6 +193,9 @@ fn watchdog_classifies_turn_and_token_budgets_without_waiting_for_wall_clock() {
             provider_retries: 0,
             tool_retries: 0,
             rework_cycles: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
         },
     };
 
