@@ -2680,6 +2680,9 @@ fn attempt_watchdog_snapshot_survives_a_repository_reopen() {
         provider_retries: 1,
         tool_retries: 0,
         rework_cycles: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
     };
     let mut repository = RuntimeRepository::open(&database).unwrap();
     repository
@@ -4669,4 +4672,65 @@ async fn an_empty_repository_is_refused_for_missing_head() {
         }
         other => panic!("expected no_initial_commit, got {other}"),
     }
+}
+
+#[tokio::test]
+async fn a_settled_parent_cannot_spawn_and_the_gate_runs_before_the_fork_token() {
+    let directory = TempDir::new().unwrap();
+    let database = directory.path().join("runtime.sqlite");
+    let coordinator = RuntimeCoordinator::open(&database, Arc::new(RecordingFactory)).unwrap();
+    let session = coordinator.create_session().unwrap();
+    let root = coordinator.root_task_id(&session).unwrap();
+
+    // Settle the root: a cancelled root is one of the 8 settled terminal states.
+    coordinator
+        .cancel_task(&session, &root, false)
+        .await
+        .unwrap();
+    assert_eq!(coordinator.task_state(&root).unwrap(), "cancelled");
+
+    let rows_before = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_summaries(Some(&session), false)
+        .unwrap()
+        .len();
+
+    // A bogus fork token is the simplest possible ordering probe: the real
+    // upload machine is irrelevant here. If the fork path ran first it would
+    // report "fork upload token is unknown"; seeing ParentSettled proves the
+    // pre-check is ahead of take_fork_messages.
+    let error = coordinator
+        .spawn_child_with_objective(
+            &session,
+            &root,
+            "child".into(),
+            yi_agent_core::ChildWriteMode::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+            Some("definitely-not-a-real-fork-token".into()),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            RuntimeCoordinatorError::ParentSettled { state } if state == "cancelled"
+        ),
+        "expected ParentSettled(cancelled); a burned or first-checked fork token \
+         would surface as ForkUpload instead. got {error:?}"
+    );
+
+    // No ghost task row: the refusal happened before anything was persisted.
+    let rows_after = RuntimeRepository::open(&database)
+        .unwrap()
+        .task_summaries(Some(&session), false)
+        .unwrap()
+        .len();
+    assert_eq!(
+        rows_after, rows_before,
+        "a refused spawn must not leave a queued ghost child"
+    );
 }
