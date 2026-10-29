@@ -778,3 +778,112 @@ fn detaching_a_retired_root_does_not_start_a_daemon() {
         "detach must not repair, so it must not install a new runtime"
     );
 }
+
+/// 形态 A：daemon 死了，但 binding 不知道（没走 `retire`，没有 generation 变化）。
+/// 这是「承载 daemon 的终端被关掉」的真实形状。修复前实测返回
+/// `daemon is unavailable: No such file or directory (os error 2)`。
+///
+/// 断言只钉「自愈确实发生了」这四件事，不钉「调用成功」：`send_message` 是
+/// `SingleShot`，第一次请求已因 liveness 失败而作废，重挂之后重发的那一次才会
+/// 拿到真实业务结论——而本用例的 recipient 是随机 UUID，业务结论必然是拒绝。
+/// 把「重发」和「调用语义成功」混在一起断言，会让用例随 daemon 的消息校验规则
+/// 漂移。身份层陈旧导致的「不重放 + 提示」由 Task 6 的形态 B 用例负责。
+#[tokio::test]
+async fn a_tool_repairs_a_daemon_that_died() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models,
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    let mut registry = yi_agent_core::ToolRegistry::new();
+    yi_agent_subagent::register_application_subagent_tools(
+        &mut registry,
+        Arc::clone(&root),
+        yi_agent_tools::SandboxController::new(
+            yi_agent_core::autonomy::YoloSwitch::new(false),
+            yi_agent_tools::SandboxMode::WorkspaceWrite,
+            false,
+        ),
+        yi_agent_subagent::CallerContext::unbound(),
+    );
+    let tool = registry
+        .get("send_message")
+        .expect("send_message is registered");
+    let generation_before = binding.generation();
+
+    // daemon 死了，binding 未被告知。
+    let _ = yi_agent_store::ipc::send_request(&socket, yi_agent_store::ipc::IpcRequest::Stop);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(std::time::Instant::now() < deadline, "the daemon must stop");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(
+        binding.generation(),
+        generation_before,
+        "premise: the binding did not notice"
+    );
+
+    let result = tool
+        .call(serde_json::json!({
+            "recipient": "11111111-1111-4111-8111-111111111111",
+            "message": "hi",
+        }))
+        .await;
+
+    let text = format!("{:?}", result.content);
+    assert!(
+        !text.contains("daemon is unavailable"),
+        "a dead runtime must be healed instead of surfacing a transport error: {text}"
+    );
+    assert!(
+        binding.generation() > generation_before,
+        "healing must install a new runtime, so the generation must move"
+    );
+    assert!(
+        matches!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy
+        ),
+        "the runtime must be up again after the call"
+    );
+
+    // 自愈后这个 root 必须真的可用：用它发一条只读请求，应当得到
+    // `TaskSummaries`（业务结论），而不是「会话不认识你」（身份失效）。
+    let handle = root.handle().expect("the healed root resolves a handle");
+    let probe = yi_agent_store::ipc::send_request(
+        &handle.socket_path,
+        yi_agent_store::ipc::IpcRequest::ListTaskSummaries {
+            session_id: Some(handle.session_id.clone()),
+            active_only: false,
+        },
+    )
+    .expect("the socket answers");
+    assert!(
+        matches!(
+            probe,
+            yi_agent_store::ipc::IpcResponse::TaskSummaries { .. }
+        ),
+        "the healed root must be usable, got {probe:?}"
+    );
+}

@@ -1461,20 +1461,18 @@ impl Tool for DaemonApplicationSendMessageTool {
         }
         let recipient = recipient.to_owned();
         let message = message.to_owned();
-        let handle = match self.root.handle() {
-            Ok(handle) => handle,
-            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
-        };
-        match yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
-                session_id: handle.session_id.clone(),
-                sender_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
-                recipient_task_id: recipient.clone(),
-                message: message.clone(),
-            },
-        ) {
+        // 发消息会改变 daemon 状态：身份层失败不重放，只修好运行时并让模型重试。
+        match self
+            .root
+            .send_as_root(crate::thread_root::RetryPolicy::SingleShot, |handle| {
+                yi_agent_store::ipc::IpcRequest::SendApplicationMessage {
+                    session_id: handle.session_id.clone(),
+                    sender_task_id: handle.task_id.clone(),
+                    capability: handle.capability.clone(),
+                    recipient_task_id: recipient.clone(),
+                    message: message.clone(),
+                }
+            }) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
                 ToolResult::text("message queued")
             }
@@ -1521,20 +1519,18 @@ impl Tool for DaemonSendMessageTool {
         }
         let recipient = recipient.to_owned();
         let message = message.to_owned();
-        let handle = match self.root.handle() {
-            Ok(handle) => handle,
-            Err(error) => return ToolResult::error(format!("daemon is unavailable: {error}")),
-        };
-        match yi_agent_store::ipc::send_request(
-            &handle.socket_path,
-            yi_agent_store::ipc::IpcRequest::SendMessage {
-                session_id: handle.session_id.clone(),
-                sender_task_id: handle.task_id.clone(),
-                worker_capability: handle.capability.clone(),
-                recipient_task_id: recipient.clone(),
-                message: message.clone(),
-            },
-        ) {
+        // 发消息会改变 daemon 状态：身份层失败不重放，只修好运行时并让模型重试。
+        match self
+            .root
+            .send_as_root(crate::thread_root::RetryPolicy::SingleShot, |handle| {
+                yi_agent_store::ipc::IpcRequest::SendMessage {
+                    session_id: handle.session_id.clone(),
+                    sender_task_id: handle.task_id.clone(),
+                    worker_capability: handle.capability.clone(),
+                    recipient_task_id: recipient.clone(),
+                    message: message.clone(),
+                }
+            }) {
             Ok(yi_agent_store::ipc::IpcResponse::MessageQueued) => {
                 ToolResult::text("message queued")
             }
