@@ -309,17 +309,28 @@ impl ThreadRoot {
 
     /// Detaches this conversation's root. Best effort: a failure is a trace
     /// line, never an error that masks why the conversation is winding down.
+    ///
+    /// **不 attach、不 repair。** 过去的实现先 `handle()`（内部会 `attach()` →
+    /// `binding.send`，失效即 repair），于是在 runtime 已退休时会冷启动一个
+    /// daemon，并幂等地把本该删掉的 root 重建出来——「回收空闲项目」被这一步
+    /// 直接抵消（见 `docs/bug-list.md` 的「监督线程只增不减」）。
+    ///
+    /// 缓存里没有属于当届 runtime 的 root 时，daemon 侧要么不认识它、要么整个
+    /// runtime 都没了：这两种情况都没有东西可 detach。
     pub fn detach(&self) {
-        // No repair here: a detach against a dead daemon has nothing to undo.
-        let Ok(handle) = self.handle() else {
+        let Some(root) = self.live_cached_root(self.binding.generation()) else {
+            *self.lock_cached() = None;
+            return;
+        };
+        let Ok(handle) = self.binding.current() else {
             return;
         };
         if let Err(error) = send_request(
             &handle.socket_path,
             IpcRequest::DetachApplicationRoot {
-                session_id: handle.session_id.clone(),
-                root_task_id: handle.task_id.clone(),
-                capability: handle.capability.clone(),
+                session_id: root.session_id.clone(),
+                root_task_id: root.task_id.clone(),
+                capability: root.capability.clone(),
             },
         ) {
             tracing::warn!(%error, "could not detach the conversation root");

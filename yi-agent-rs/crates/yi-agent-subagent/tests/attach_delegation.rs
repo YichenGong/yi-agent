@@ -716,3 +716,65 @@ fn a_retired_runtime_heals_itself_on_the_next_delegation() {
         "healing has to install a new runtime, so the generation must move"
     );
 }
+
+/// 删除会话时会调用 `ThreadRoot::detach()`。过去它会先 `handle()` → `attach()`
+/// → `binding.send`，于是**把已退休的 daemon 重新拉起来**，并幂等地重建那个
+/// 本该被删掉的 root——回收循环（`evict_idle_runtimes`）的努力被这一步直接抵消。
+///
+/// 实测（2026-10-29）：retire 后 detach，daemon 复活且 generation 跳到 2。
+#[test]
+fn detaching_a_retired_root_does_not_start_a_daemon() {
+    let repo = tempfile::TempDir::new().unwrap();
+    let runtime = tempfile::TempDir::new().unwrap();
+    init_git_repo(repo.path());
+    let cfg = config_for(repo.path());
+    let models = isolated_models_path(repo.path());
+
+    let attached = Arc::new(
+        yi_agent_subagent::attach::attach_project_runtime(
+            &cfg,
+            runtime.path().to_path_buf(),
+            &models,
+        )
+        .expect("a clean git repo must attach"),
+    );
+    let socket = attached.socket_path.clone();
+    let binding = yi_agent_subagent::binding::RuntimeBinding::managed(
+        &cfg,
+        runtime.path().to_path_buf(),
+        models,
+        Arc::clone(&attached),
+    );
+    let root = ThreadRoot::from_handle(Arc::clone(&binding), attached.attached_root.clone());
+    drop(attached);
+
+    binding.retire();
+    let generation_after_retire = binding.generation();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while matches!(
+        yi_agent_subagent::attach::probe_runtime(&socket),
+        yi_agent_subagent::attach::RuntimeProbe::Healthy
+    ) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retire must stop the daemon"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // 这正是 `thread/delete` 做的事。
+    root.detach();
+
+    assert!(
+        !matches!(
+            yi_agent_subagent::attach::probe_runtime(&socket),
+            yi_agent_subagent::attach::RuntimeProbe::Healthy
+        ),
+        "detaching a retired root must not start a daemon back up"
+    );
+    assert_eq!(
+        binding.generation(),
+        generation_after_retire,
+        "detach must not repair, so it must not install a new runtime"
+    );
+}
