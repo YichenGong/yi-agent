@@ -355,6 +355,27 @@ pub fn is_liveness_error(error: &IpcError) -> bool {
     }
 }
 
+/// 这个应答是否在说「你手里的 root 我不认识」。
+///
+/// 与 [`is_liveness_error`] 互补：那个判传输层（socket 没了），这个判身份层
+/// （socket 很好，但这个 session / root 不是我的）。替换后的 daemon 会为新
+/// root 重建 session 与 capability，旧 root 的三元组在它的
+/// `application_root_attachments` 里查不到，于是稳定返回 `NotFound`；权限
+/// 摘要不匹配则是 `AuthorityDenied`。两者对客户端是同一件事：手里的 root 过期了。
+///
+/// 业务拒绝（`Validation`、`RateLimited`、`InvalidState`、`Conflict`、`Internal`）
+/// **不**属于这一类：那些错误重发一次不会好，触发 repair 只是浪费一次 daemon 启动。
+pub fn is_stale_root_response(response: &IpcResponse) -> bool {
+    matches!(
+        response,
+        IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::NotFound
+                | yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            ..
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +419,49 @@ mod tests {
     #[test]
     fn a_frame_too_large_is_not_a_liveness_error() {
         assert!(!is_liveness_error(&IpcError::FrameTooLarge));
+    }
+
+    /// 陈旧 root 的判据：daemon 明确说「这个 session / root 我不认识」。
+    /// 实测替换后的 daemon 对 send_message / spawn_agent / wait_agent / detach
+    /// 四条路径稳定返回 NotFound（见 spec §1.3）。
+    #[test]
+    fn a_not_found_response_marks_the_root_stale() {
+        let response = IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::NotFound,
+            message: None,
+        };
+        assert!(is_stale_root_response(&response));
+    }
+
+    #[test]
+    fn an_authority_denied_response_marks_the_root_stale() {
+        let response = IpcResponse::Error {
+            code: yi_agent_store::ipc::IpcErrorCode::AuthorityDenied,
+            message: None,
+        };
+        assert!(is_stale_root_response(&response));
+    }
+
+    /// 业务拒绝绝不能被当成「root 过期」，否则一次参数错误就会触发 repair。
+    #[test]
+    fn a_business_rejection_is_not_a_stale_root() {
+        for code in [
+            yi_agent_store::ipc::IpcErrorCode::Validation,
+            yi_agent_store::ipc::IpcErrorCode::RateLimited,
+            yi_agent_store::ipc::IpcErrorCode::InvalidState,
+            yi_agent_store::ipc::IpcErrorCode::Conflict,
+            yi_agent_store::ipc::IpcErrorCode::Internal,
+        ] {
+            let response = IpcResponse::Error {
+                code,
+                message: Some("business".into()),
+            };
+            assert!(
+                !is_stale_root_response(&response),
+                "{code} is business-layer"
+            );
+        }
+        assert!(!is_stale_root_response(&IpcResponse::Stopping));
     }
 }
 

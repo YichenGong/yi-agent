@@ -6,7 +6,28 @@ use std::sync::{Arc, Mutex};
 use yi_agent_store::ipc::{IpcRequest, IpcResponse, send_request};
 
 use crate::AttachedRoot;
-use crate::binding::{RuntimeBinding, RuntimeHandle, is_liveness_error};
+use crate::binding::{RuntimeBinding, RuntimeHandle, is_liveness_error, is_stale_root_response};
+
+/// 身份层失败时对模型说的话。
+///
+/// 不可重放的请求（发消息、spawn）遇到陈旧 root 时，重放会产生真实的第二次副作用，
+/// 所以只做「丢弃缓存 + 修好运行时」，然后把下一步交给调用方。这句话必须说清
+/// 「已经修好了、再来一次就行」，否则模型会以为这个能力坏了。
+pub(crate) fn stale_root_hint() -> &'static str {
+    "the conversation root was replaced by a restarted runtime and has been \
+     re-attached; the request was NOT re-sent because it changes daemon state. \
+     Retry this call once."
+}
+
+/// 一条请求能否在身份层失败后被重发。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryPolicy {
+    /// 请求本身幂等（只读查询，或在 daemon 侧按稳定键幂等）：可以安全重发。
+    Idempotent,
+    /// 请求会改变 daemon 状态（发消息、spawn、fork 上传）：绝不重发，
+    /// 只修好运行时并把决定权交回调用方。
+    SingleShot,
+}
 
 /// The stable attach key for one conversation's root.
 ///
@@ -208,20 +229,58 @@ impl ThreadRoot {
         self.live_cached_root(generation).map(|root| root.task_id)
     }
 
-    /// Sends one request as this conversation's root, re-attaching and retrying
-    /// once if the runtime turns out to be unreachable.
+    /// 以本会话 root 的身份发送一条请求；运行时失效时自愈一次并按 `policy` 决定
+    /// 是否重发。
     ///
-    /// The retry runs the whole `handle()` path again, so a replacement daemon
-    /// (whose sweep removed the old root) is re-attached rather than receiving a
-    /// request naming a task it never heard of.
-    fn send_as_root<F>(&self, build: F) -> Result<IpcResponse, String>
+    /// 这是委派工具通往 wire 的唯一入口。`handle()` 只解析句柄、不处理失效，
+    /// 七个工具过去各自 `handle()` + 裸 `send_request`，结果是**没人**处理失效。
+    ///
+    /// 三条分支：
+    /// 1. 传输层失败（`is_liveness_error`）：与过去一致，重取句柄后重发一次。
+    /// 2. 身份层失败（`is_stale_root_response`）：丢弃缓存 root、修好运行时；
+    ///    `Idempotent` 重发一次，`SingleShot` 返回 [`stale_root_hint`]。
+    /// 3. 其余：原样返回，绝不重试。
+    pub(crate) fn send_as_root<F>(
+        &self,
+        policy: RetryPolicy,
+        build: F,
+    ) -> Result<IpcResponse, String>
     where
         F: Fn(&RuntimeHandle) -> IpcRequest,
     {
         let handle = self.handle()?;
         match send_request(&handle.socket_path, build(&handle)) {
+            Ok(response) if is_stale_root_response(&response) => {
+                // 先丢弃归属旧 runtime 的 root：无论接下来能否修好运行时，
+                // 这个 root 都已经不能再用。
+                *self.lock_cached() = None;
+                // 修不好（fixed binding 没有 repair plan，或 repair 本身失败）时
+                // **不能**把内部错误抛给模型：关于这次调用的事实是原始业务应答。
+                if let Err(error) = self.binding.repair() {
+                    tracing::debug!(%error, "could not repair the runtime for a stale root");
+                    return Ok(response);
+                }
+                if policy == RetryPolicy::SingleShot {
+                    return Err(stale_root_hint().to_string());
+                }
+                // 缓存已被清空，`handle()` 会先 `attach()` 再取句柄：重挂到
+                // 修好后的 runtime 上。这里只重发一次，没有递归。
+                let handle = self.handle()?;
+                send_request(&handle.socket_path, build(&handle)).map_err(|e| e.to_string())
+            }
             Ok(response) => Ok(response),
             Err(error) if is_liveness_error(&error) => {
+                // 传输层失败说明请求根本没送达，重发一次是安全的。但**不能**直接
+                // `handle()`：缓存 root 仍属于当前 generation，`attach()` 会短路
+                // 返回 Ok，重发于是又打向同一个死 socket——这正是要修的那个 bug。
+                // 必须先 `repair()`（它推进 generation，使缓存失效），再重挂。
+                if let Err(repair_error) = self.binding.repair() {
+                    // fixed binding 无从 repair（TUI / daemon worker 的情形）。
+                    // 这里返回**原始传输错误**，不要把内部措辞泄漏给模型；
+                    // 跳过重发也不可能成功，发了只是多一次失败。
+                    tracing::debug!(%repair_error, "could not repair a dead runtime");
+                    return Err(error.to_string());
+                }
                 let handle = self.handle()?;
                 send_request(&handle.socket_path, build(&handle)).map_err(|e| e.to_string())
             }
@@ -232,11 +291,13 @@ impl ThreadRoot {
     /// Activates this conversation's root with its first objective. Idempotent
     /// at the daemon, so a re-run after a repair is safe.
     pub fn activate(&self, objective: &str) -> Result<(), String> {
-        match self.send_as_root(|handle| IpcRequest::ActivateApplicationRoot {
-            session_id: handle.session_id.clone(),
-            root_task_id: handle.task_id.clone(),
-            capability: handle.capability.clone(),
-            objective: objective.to_owned(),
+        match self.send_as_root(RetryPolicy::Idempotent, |handle| {
+            IpcRequest::ActivateApplicationRoot {
+                session_id: handle.session_id.clone(),
+                root_task_id: handle.task_id.clone(),
+                capability: handle.capability.clone(),
+                objective: objective.to_owned(),
+            }
         }) {
             Ok(IpcResponse::ApplicationRootActivated) => Ok(()),
             Ok(other) => Err(format!(
