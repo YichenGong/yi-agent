@@ -58,7 +58,7 @@ worker 工厂、daemon 客户端（attach / activate / detach）与六个委派�
   与 root；`send` 遇 liveness 失败时先 `repair`（单飞，避免并发起两个 daemon）再重试
   一次；`activate` 走同一条通道。判据：启动该 runtime 的进程退出后，下一次委派调用仍能
   自愈。`fixed` 绑定（TUI 整个会话自己持有 daemon）行为与过去完全一致。验证：
-  `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent-app-server --lib a_dead_runtime_is_repaired`
+  `cargo test -p yi-agent-subagent --lib`、`cargo test -p yi-agent-app-server --lib a_dead_runtime_is_repaired_on_the_next_tool_call`
 - [x] 端到端装配契约 — `tests/attach_delegation.rs`：干净 git 项目 attach → 激活两次
   （证明幂等）→ 注册的委派工具存在 → `SpawnApplicationChild` 被 daemon 接纳并返回
   child task id → detach；这是 TUI 与 app-server 共用的那条链路的可执行说明
@@ -123,7 +123,8 @@ non_git_read_only_child` / `non_git_coding_child_is_refused_without_a_queued_row
 
 - [x] worker 工具注册的根集参数 + 「FS 根集 ≠ 沙箱可写根」 — `DaemonAgentWorkerFactory::worker_tool_registry`（`src/lib.rs:306`）/ `worker_tool_registry_with_base`（`src/lib.rs:328`）新增第 4 个参数 `inherited_roots: Vec<PathBuf>`（父会话下发的关联根，主根除外；空集即今天的单根 worker），把它并进 **FS 根集** `fs_roots = [worktree] + inherited_roots`（`src/lib.rs:339`）。**两个根集刻意分开**：`fs_roots` 进 FS 工具（`read`/`write`/`edit`/`glob`/`grep` 的多根校验），而 `git_writable_roots_for_worktree`（`src/lib.rs:1239`）产出的 git 内部目录**只**并入 shell 沙箱的额外可写根 `writable_roots`（`src/lib.rs:345`），**绝不**进 FS 根集——否则 `write` 能直写 `.git`（该约束写在 `src/lib.rs:355` 的注释里）。接线：`WorkerStart.extra_roots`（`yi-agent-rs/crates/yi-agent-core/src/subagent/worker.rs:97`）在 `start_with_provider_turn_gate` 里被取出并下传给注册函数（`src/lib.rs:766`）。ReadOnly 子任务只扩读、不注册写工具。验证：`cargo test -p yi-agent-subagent --lib coding_worker_gets_fs_tools_over_the_inherited_roots`、`--lib read_only_worker_inherits_roots_without_write_tools`、`--lib coding_worker_shell_sandbox_covers_the_inherited_roots`、`--lib fs_roots_stay_clear_of_the_git_roots_the_shell_sandbox_needs`、`--lib worker_start_hands_the_inherited_roots_to_its_fs_tools`（分别钉住 FS 工具覆盖关联根、只读不扩写、沙箱覆盖关联根、两集不混、`WorkerStart` 真到达 FS 工具）— [设计](../superpowers/specs/2026-10-17-linked-workspace-roots-design.md)
 
-- [x] 陈旧 conversation root 的三分类自愈入口 `ThreadRoot::send_as_root` — 七个委派工具不再各自
+- [x] 陈旧 conversation root 的三分类自愈入口 `ThreadRoot::send_as_root` — 六个委派工具（七个 `send_as_root`
+  调用点：application 与 worker 两套各有 spawn/send_message）不再各自
   `handle()` + 裸 `send_request`（那条路径**没人**处理失效），统一走
   `ThreadRoot::send_as_root`（`src/thread_root.rs:243`），按失败层分类：传输层
   （`is_liveness_error`，`src/binding.rs:332`，即 socket 没了）先 `binding.repair()`
