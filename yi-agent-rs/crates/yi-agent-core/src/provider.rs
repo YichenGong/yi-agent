@@ -42,6 +42,39 @@ pub struct TokenUsage {
     pub reasoning_tokens: Option<u32>,
 }
 
+impl TokenUsage {
+    /// 把一条后到的 usage 片段合进当前快照。
+    ///
+    /// provider 可能分多次报告同一次请求的用量：Anthropic 的 `message_start`
+    /// 带 `input_tokens` 与 cache 字段，末端的 `message_delta` 只带
+    /// `output_tokens`。若用「后到者整体覆盖」，先到的非零值会被抹成 0，
+    /// 而自动压缩正是靠 `input_tokens` 判定（见 `Session::last_input_tokens`）。
+    ///
+    /// 合并规则：
+    /// - `u32` 字段：后到的**非零**值覆盖；零值视为「本次未报告」，保留旧值。
+    /// - `Option<u32>` 字段：`Some` 覆盖，`None` 保留旧值。
+    ///
+    /// 已知局限：无法表达「真实值为 0 且需把此前的非零值清零」。对 token 计数
+    /// 该场景不存在（一次请求的 `input_tokens` 不会由非零变 0），故接受。
+    pub fn merge_snapshot(&mut self, next: &TokenUsage) {
+        if next.input_tokens != 0 {
+            self.input_tokens = next.input_tokens;
+        }
+        if next.output_tokens != 0 {
+            self.output_tokens = next.output_tokens;
+        }
+        if next.cache_creation_input_tokens.is_some() {
+            self.cache_creation_input_tokens = next.cache_creation_input_tokens;
+        }
+        if next.cache_read_input_tokens.is_some() {
+            self.cache_read_input_tokens = next.cache_read_input_tokens;
+        }
+        if next.reasoning_tokens.is_some() {
+            self.reasoning_tokens = next.reasoning_tokens;
+        }
+    }
+}
+
 /// Reasoning 增量的种类：完整思考正文 vs 结构化摘要。
 ///
 /// `Serialize` 是给线协议用的：`AgentEvent::ReasoningDelta` 的序列化必须带上
@@ -274,6 +307,15 @@ where
             }
             ProviderEvent::ToolUseEnd { id } => {
                 if let Some((name, json)) = tool_uses.remove(&id) {
+                    // 无参数工具可以完全不发参数增量：Anthropic 只发
+                    // `content_block_start` + `content_block_stop`，累积的 JSON
+                    // 就是空串。空串不是畸形数据，按空对象处理；非空但被截断的
+                    // JSON 仍然报错——那确实意味着数据损坏。
+                    let json = if json.trim().is_empty() {
+                        "{}".to_string()
+                    } else {
+                        json
+                    };
                     let input: serde_json::Value = serde_json::from_str(&json).map_err(|e| {
                         ProviderError::Stream(format!("malformed tool use JSON for id {id}: {e}"))
                     })?;
@@ -298,7 +340,13 @@ where
                 break false;
             }
             ProviderEvent::Usage(u) => {
-                last_usage = Some(u.clone());
+                // 一次请求的 usage 可能分多次到达（Anthropic 的 message_start
+                // 给 input/cache，末尾 message_delta 只给 output_tokens）。整体
+                // 覆盖会把先到的 input_tokens 抹成 0，而自动压缩正是靠它判定。
+                match &mut last_usage {
+                    Some(acc) => acc.merge_snapshot(&u),
+                    None => last_usage = Some(u.clone()),
+                }
                 on_event(ProviderEvent::Usage(u));
             }
             ProviderEvent::ReasoningDelta { text, kind } => {
@@ -439,8 +487,128 @@ mod tests {
         }
     }
 
+    #[test]
+    fn merge_snapshot_keeps_earlier_input_when_later_reports_zero() {
+        let mut acc = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 0,
+            cache_read_input_tokens: Some(90_000),
+            ..Default::default()
+        };
+        let next = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 42,
+            ..Default::default()
+        };
+        acc.merge_snapshot(&next);
+        assert_eq!(
+            acc.input_tokens, 100_000,
+            "0 means 'not reported', keep old"
+        );
+        assert_eq!(acc.output_tokens, 42, "non-zero wins");
+        assert_eq!(acc.cache_read_input_tokens, Some(90_000), "None keeps old");
+    }
+
+    #[test]
+    fn merge_snapshot_lets_a_nonzero_later_value_win() {
+        let mut acc = TokenUsage {
+            input_tokens: 10,
+            ..Default::default()
+        };
+        acc.merge_snapshot(&TokenUsage {
+            input_tokens: 20,
+            ..Default::default()
+        });
+        assert_eq!(acc.input_tokens, 20);
+    }
+
+    #[test]
+    fn merge_snapshot_some_overrides_none_and_vice_versa() {
+        let mut acc = TokenUsage {
+            cache_creation_input_tokens: None,
+            reasoning_tokens: Some(7),
+            ..Default::default()
+        };
+        acc.merge_snapshot(&TokenUsage {
+            cache_creation_input_tokens: Some(5),
+            reasoning_tokens: None,
+            ..Default::default()
+        });
+        assert_eq!(acc.cache_creation_input_tokens, Some(5));
+        assert_eq!(acc.reasoning_tokens, Some(7));
+    }
+
     fn text_event(s: &str) -> ProviderEvent {
         ProviderEvent::TextDelta(s.to_string())
+    }
+
+    fn empty_request() -> ProviderRequest {
+        ProviderRequest {
+            model: "m".into(),
+            system: None,
+            messages: vec![],
+            tools: vec![],
+            params: GenParams::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn accumulate_merges_split_usage_instead_of_overwriting() {
+        // Anthropic 真实形状：message_start 给 input/cache，message_delta 只给
+        // output_tokens。后到的整体覆盖会把 input_tokens 抹成 0，自动压缩永不触发。
+        let provider = MockProvider {
+            events: vec![
+                text_event("hi"),
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 100_000,
+                    output_tokens: 0,
+                    cache_read_input_tokens: Some(90_000),
+                    ..Default::default()
+                }),
+                ProviderEvent::Usage(TokenUsage {
+                    input_tokens: 0,
+                    output_tokens: 42,
+                    ..Default::default()
+                }),
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        };
+        let stream = provider.call_stream(empty_request()).await.unwrap();
+        let (_content, _end, usage) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+        let usage = usage.expect("usage must be reported");
+        assert_eq!(
+            usage.input_tokens, 100_000,
+            "input must survive the later output-only report"
+        );
+        assert_eq!(usage.output_tokens, 42);
+        assert_eq!(usage.cache_read_input_tokens, Some(90_000));
+    }
+
+    #[tokio::test]
+    async fn a_zero_arg_tool_call_without_arguments_parses_as_empty_object() {
+        // Anthropic 对无参数工具可以完全不发 input_json_delta。
+        let provider = MockProvider {
+            events: vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "list_files".into(),
+                },
+                ProviderEvent::ToolUseEnd { id: "t1".into() },
+                ProviderEvent::Stop {
+                    reason: StopReason::EndTurn,
+                },
+            ],
+        };
+        let stream = provider.call_stream(empty_request()).await.unwrap();
+        let (content, _end, _usage) = accumulate_stream(stream, |_| {}, None).await.unwrap();
+        assert!(
+            content.iter().any(
+                |b| matches!(b, ContentBlock::ToolUse { input, .. } if input == &serde_json::json!({}))
+            ),
+            "empty arguments must become an empty object, got: {content:?}"
+        );
     }
 
     #[tokio::test]

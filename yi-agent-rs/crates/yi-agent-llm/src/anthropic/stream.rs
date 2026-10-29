@@ -200,6 +200,11 @@ where
                         .and_then(Value::as_str)
                         .map(|reason_str| match reason_str {
                             "end_turn" => StopReason::EndTurn,
+                            // `tool_use` 表示「模型要求执行工具」，属于「继续」
+                            // 而非「终止」：agent 循环靠内容里的 ToolUse 块决定是
+                            // 否执行，`Other` 会让它直接中断。与 OpenAI 的
+                            // finish_reason=tool_calls 归一为 EndTurn 同源。
+                            "tool_use" => StopReason::EndTurn,
                             "max_tokens" => StopReason::MaxTokens,
                             "stop_sequence" => StopReason::StopSequence,
                             other => StopReason::Other(other.to_string()),
@@ -443,7 +448,11 @@ mod tests {
             ("end_turn", StopReason::EndTurn),
             ("max_tokens", StopReason::MaxTokens),
             ("stop_sequence", StopReason::StopSequence),
-            ("tool_use", StopReason::Other("tool_use".to_string())),
+            // Anthropic 用 `tool_use` 表示「模型要求执行工具」。agent 循环靠内容里
+            // 的 ToolUse 块决定是否执行，而 `Other` 会被当成终止原因直接中断
+            // （agent.rs 的 StopReason::Other 分支），故必须归一为 EndTurn，与
+            // OpenAI 的 finish_reason=tool_calls 处理一致。
+            ("tool_use", StopReason::EndTurn),
         ] {
             let body = format!(
                 "event: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{}\"}}}}\n\n",
@@ -634,6 +643,43 @@ mod tests {
             .position(|e| matches!(e, ProviderEvent::ToolUseStart { .. }))
             .expect("tool use emitted");
         assert!(thinking_at < tool_at, "thinking must precede tool_use");
+    }
+
+    /// 回归护栏：重放 Anthropic 真实的 tool_use 报文。
+    ///
+    /// 修复前 `stop_reason: tool_use` 被映射成 `Other("tool_use")`，agent 循环
+    /// 对 `Other` 直接发 Interrupted 并 return，工具**从不执行**。这条测试钉住
+    /// 「tool_use 报文必须以 EndTurn 收尾」。
+    #[tokio::test]
+    async fn a_full_tool_use_response_ends_with_end_turn() {
+        let body = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100}}}\n\n\
+             event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+             event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Let me read.\"}}\n\n\
+             event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+             event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"read\",\"input\":{}}}\n\n\
+             event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"a.rs\\\"}\"}}\n\n\
+             event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n\
+             event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":50}}\n\n\
+             event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        let bytes = body.to_string().into_bytes();
+        let events: Vec<ProviderEvent> = collect_events(vec![bytes.as_slice()])
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let stop = events
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::Stop { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .expect("a Stop event must be emitted");
+        assert_eq!(
+            stop,
+            StopReason::EndTurn,
+            "tool_use must map to EndTurn or the agent loop never executes the tool"
+        );
     }
 
     #[tokio::test]
