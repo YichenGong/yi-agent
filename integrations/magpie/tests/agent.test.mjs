@@ -18,6 +18,25 @@ import { agent, connect, _internal } from "../yi-agent.agent.js";
 
 // ---- pure mapping ---------------------------------------------------------
 
+test("agent export carries the icon Magpie's Agents page draws", () => {
+  // Magpie renders the Agents row from `agent.icon` (agentplug Desc.Icon); it
+  // does not fall back to package.json's `magpie.icon`, which only feeds the
+  // Installed list. Without this field the row shows the generic placeholder.
+  assert.equal(typeof agent.icon, "string");
+  assert.match(agent.icon, /^data:image\/png;base64,/);
+
+  // Same picture as the one the Installed list uses, so both rows match.
+  const pkg = JSON.parse(
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"), "utf8"),
+  );
+  assert.equal(agent.icon, pkg.magpie.icon);
+
+  // Decodes to a real PNG (signature + IHDR), not a truncated string.
+  const png = Buffer.from(agent.icon.split(",")[1], "base64");
+  assert.deepEqual(png.subarray(0, 8), Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  assert.equal(png.subarray(12, 16).toString("latin1"), "IHDR");
+});
+
 test("agent declaration uses the models.json convention", () => {
   assert.equal(agent.id, "yi-agent");
   assert.equal(agent.config, "~/.yi-agent/models.json");

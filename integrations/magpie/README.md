@@ -35,6 +35,12 @@ talks to every Magpie model through one OpenAI-compatible endpoint.
 
 ## Things to know
 
+- **Two icons, two sources.** Magpie's *Installed* list draws a plugin's logo
+  from `package.json`'s `magpie.icon`; the *Agents* page draws each agent's row
+  icon from the agent module's own exported `icon` field and does not fall back
+  to `magpie.icon`. Both point at the same PNG here, so the two rows match — keep
+  them in sync if you ever change the artwork (the tests compare them).
+
 - **`models` is an array owned by Magpie while connected.** While the agent is
   connected, the `models` array holds only the Magpie models above; your
   original Yi Agent entries are temporarily out of it. Magpie backs them up and
