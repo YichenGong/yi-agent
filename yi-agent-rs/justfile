@@ -36,6 +36,12 @@ build-release:
 ci: fmt-check lint test build bindings-check secret-check npm-version-check release-env-check tag-gate-check build-env-check model-setup-docs-check desktop-target-dir-check
     @echo "CI passed"
 
+# Magpie agent 插件检查（需 Node）。刻意不进 `ci`：GitLab MR 的 `rust:latest`
+# 镜像没有 Node，塞进去会把整条流水线拖垮；由 `.github/workflows/magpie-agent.yml`
+# 按路径单独触发。本地可用 `just magpie-agent-check` 跑。
+magpie-agent-check:
+    bash ../scripts/test-magpie-agent.sh
+
 # 校验 ts-rs 生成物与提交物一致（改了 protocol.rs 必须重新生成）。
 # `export_bindings` 是 ts-rs 自动生成的测试名前缀，按前缀过滤即可覆盖全部类型。
 bindings-check:
