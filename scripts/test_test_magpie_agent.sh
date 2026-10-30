@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# 自测 scripts/test-magpie-agent.sh：把「检查自身会失败」的路径钉死，
-# 尤其缺 Node 时必须 exit 2（基础设施故障）而不是假绿。
+# Self-test for scripts/test-magpie-agent.sh: pins down the paths where the
+# check itself must fail, above all "no Node" having to exit 2 (an
+# infrastructure failure) rather than pass green.
+#
+# Run it with bash, by absolute path if you like — it does not depend on
+# being found through PATH:
+#
+#   bash scripts/test_test_magpie_agent.sh
+#
 set -uo pipefail
 
-SCRIPT="$(cd "$(dirname "$0")" && pwd)/test-magpie-agent.sh"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="$HERE/test-magpie-agent.sh"
 [ -x "$SCRIPT" ] || { echo "FAIL: $SCRIPT not executable"; exit 1; }
-
-# 临时隔离目录不放在 $TMPDIR（macOS 沙箱对 /var/folders/... 会 EPERM）。
-HERE="$(cd "$(dirname "$0")" && pwd)"
 
 pass=0
 failn=0
@@ -16,16 +21,40 @@ check() { # check <name> <expected_exit> <actual_exit>
   else echo "FAIL - $1 (expected exit $2, got $3)"; failn=$((failn+1)); fi
 }
 
-# 无 node 的 PATH：必须 exit 2。保留 /bin 与 /usr/bin（shebang 是
-# `#!/usr/bin/env bash`，`env` 要靠 PATH 找到 bash，dirname/pwd 也在这里），
-# 只把 node 所在的 `/opt/homebrew/bin` 拿掉——这才是「有 shell、没 node」的真实
-# 最小环境，而不是空 PATH（空 PATH 会让 `env bash` 自己 127）。
-{
-  PATH="/bin:/usr/bin" bash "$SCRIPT"
-} >/dev/null 2>&1
-check "missing node is an infra failure (exit 2)" 2 $?
+# The "no Node" case has to be built, not guessed at: PATH=/bin:/usr/bin is
+# not an environment without Node — Debian and Ubuntu package it at
+# /usr/bin/node, so the old test would report a false failure on exactly the
+# CI image it guards.
+#
+# A PATH holding only a symlink to bash does not work either, for the same
+# reason in reverse: on Linux bash is /usr/bin/bash, so putting bash's
+# directory on PATH brings node along. So the check is run by absolute path
+# with `env -i` instead of through its `#!/usr/bin/env bash` shebang, which
+# leaves PATH free to point at an empty directory — provably no node. The
+# script needs nothing but shell builtins before its node check (`command`
+# is a builtin), so an empty PATH is enough to reach the exit 2 it must
+# report.
+tmp="$(mktemp -d "${HERE}/.selftest.XXXXXX")" || { echo "FAIL: mktemp"; exit 1; }
+trap 'rm -rf "$tmp"' EXIT
+emptydir="$tmp/empty"
+mkdir -p "$emptydir"
 
-# 正常环境：必须 exit 0（真实跑语法 + 行为测试）。
+bashbin="$(command -v bash)"
+[ -x "$bashbin" ] || { echo "FAIL: bash not found"; exit 1; }
+
+# Prove the PATH really has no node before trusting the result: otherwise a
+# machine where that directory does hold node would turn this into a silent
+# "expected 2, got 0" mystery.
+if env -i PATH="$emptydir" "$bashbin" -c 'command -v node' >/dev/null 2>&1; then
+  echo "FAIL - the no-node PATH still finds node at $(env -i PATH="$emptydir" "$bashbin" -c 'command -v node')"
+  failn=$((failn+1))
+else
+  env -i PATH="$emptydir" "$bashbin" "$SCRIPT" >/dev/null 2>&1
+  check "missing node is an infra failure (exit 2)" 2 $?
+fi
+
+# A normal environment: exit 0 (the syntax check and the behavior tests
+# really ran). Called by absolute path, with the caller's PATH intact.
 {
   bash "$SCRIPT"
 } >/dev/null 2>&1

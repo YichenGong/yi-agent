@@ -16,7 +16,7 @@
 
 **不做什么：**
 - 不进 Magpie 社区市场收录（团队自行发布不自动收录，需另向 magpie-community/plugins 提 PR）
-- 不声称支持 `YI_AGENT_HOME` 自定义目录（Magpie 的 `$VAR` 展开行为未实测，默认只支持 `~/.yi-agent/models.json`）
+- 不支持 `YI_AGENT_HOME` 自定义目录：插件声明的是字面量 `~/.yi-agent/models.json`，而 Magpie 的 `pluggedPath` 用 `os.Expand` 展开（`internal/agent/plugged.go`），未设置的变量会展开成空串，因此也不能声明 `$YI_AGENT_HOME/models.json`（未设置时会写到 `/models.json`）
 
 ## Features
 

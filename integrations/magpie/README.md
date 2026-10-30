@@ -53,12 +53,15 @@ talks to every Magpie model through one OpenAI-compatible endpoint.
   the plugin points `subagent_model` at the current Magpie model instead. On
   disconnect Magpie restores your original value (or removes the key if it
   wasn't there).
-- **Path.** The default config path is `~/.yi-agent/models.json`. Yi Agent
-  also supports `YI_AGENT_HOME`, but the plugin intentionally does not declare
-  a custom directory: the config file Magpie edits must resolve correctly in
-  the environment Magpie launches Yi Agent from. If you run Yi Agent under a
-  custom `YI_AGENT_HOME`, keep Magpie and Yi Agent in the same environment, or
-  leave the default in place.
+- **Path: a custom `YI_AGENT_HOME` is not supported.** The config path is
+  fixed at `~/.yi-agent/models.json`. Yi Agent also reads `YI_AGENT_HOME`, but
+  this plugin does not: it declares the literal `~/.yi-agent/models.json`, so
+  setting `YI_AGENT_HOME` for both programs does not help — a Yi Agent started
+  with it reads `$YI_AGENT_HOME/models.json` and never sees what Magpie writes.
+  Declaring `$YI_AGENT_HOME/models.json` instead is not an option either:
+  Magpie expands a `$VAR` in a declared path, and an unset variable expands to
+  an empty string, which would leave Magpie writing `/models.json`. Use the
+  default location, or leave this plugin off.
 - **A running TUI does not hot-reload the model.** Yi Agent's TUI reads
   `models.json` at startup and re-reads it only when you switch the model with
   `/model`. After connecting, switching models, or disconnecting in Magpie, a
