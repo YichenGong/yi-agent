@@ -43,6 +43,9 @@ pub enum CardState {
     Running,
     NeedsYou,
     AwaitingMerge,
+    /// 用户已确认合并，等本项目的合并名额。只有 `merge-request` 能把卡置到这里，
+    /// 也只有它意味着「可以合」。daemon 在名额空时把它推进到 `Running` 并追一回合。
+    MergeQueued,
     Failed,
     Done,
     Cancelled,
@@ -121,6 +124,22 @@ pub struct Card {
     /// 展示标题。预排队卡在创建时定下；正式卡为 `None`（标题由 spec_path 派生）。
     #[serde(default)]
     pub title: Option<String>,
+    /// 进入合并队列的时刻。FIFO 的唯一依据；退出队列即清空。
+    /// 旧状态文件没有此字段 → `None`。
+    #[serde(default)]
+    pub merge_queued_at: Option<DateTime<Local>>,
+}
+
+impl Card {
+    /// 入队：记下时刻，FIFO 靠它排序。
+    pub fn mark_merge_queued(&mut self, at: DateTime<Local>) {
+        self.merge_queued_at = Some(at);
+    }
+
+    /// 退队：时刻一并清掉，免得退队后又被当成「排了很久」的候选。
+    pub fn clear_merge_queued(&mut self) {
+        self.merge_queued_at = None;
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +263,36 @@ mod tests {
         let json = r#"{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}"#;
         let card: Card = serde_json::from_str(json).unwrap();
         assert_eq!(card.origin_thread_id, None);
+    }
+
+    #[test]
+    fn a_card_without_a_merge_timestamp_reads_as_not_queued() {
+        let json = r#"{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"awaiting_merge","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}"#;
+        let card: Card = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            card.merge_queued_at, None,
+            "an old board.json has no merge queue field and must read as None"
+        );
+    }
+
+    #[test]
+    fn a_merge_queue_timestamp_survives_a_round_trip() {
+        use chrono::TimeZone;
+        let json = r#"{"id":"a","spec_path":"a.spec.md","plan_path":"a.plan.md","state":"merge_queued","enqueued_at":"2026-10-01T00:00:00+08:00","order":0}"#;
+        let mut card: Card = serde_json::from_str(json).unwrap();
+        card.mark_merge_queued(Local.with_ymd_and_hms(2026, 10, 31, 9, 0, 0).unwrap());
+        let back: Card = serde_json::from_str(&serde_json::to_string(&card).unwrap()).unwrap();
+        let mut back = back;
+        assert!(back.merge_queued_at.is_some());
+        back.clear_merge_queued();
+        assert_eq!(back.merge_queued_at, None);
+    }
+
+    #[test]
+    fn merge_queued_is_a_distinct_state_that_is_not_terminal() {
+        assert_ne!(CardState::MergeQueued, CardState::AwaitingMerge);
+        assert!(!CardState::MergeQueued.is_terminal());
+        assert!(CardState::AwaitingMerge.can_transition_to(CardState::MergeQueued));
+        assert!(CardState::MergeQueued.can_transition_to(CardState::AwaitingMerge));
     }
 }

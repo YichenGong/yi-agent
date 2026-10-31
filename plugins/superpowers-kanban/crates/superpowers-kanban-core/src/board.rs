@@ -69,6 +69,7 @@ impl Board {
             terminal_at: None,
             detail: None,
             title: None,
+            merge_queued_at: None,
         });
         &self.cards[index]
     }
@@ -104,6 +105,7 @@ impl Board {
             terminal_at: None,
             detail: None,
             title: None,
+            merge_queued_at: None,
         });
         &self.cards[index]
     }
@@ -139,6 +141,7 @@ impl Board {
             terminal_at: None,
             detail: None,
             title: Some(title),
+            merge_queued_at: None,
         });
         &self.cards[index]
     }
