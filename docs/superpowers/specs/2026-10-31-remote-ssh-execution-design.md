@@ -142,6 +142,35 @@ app-server、各自的工作目录、各自的会话状态、各自的重连退�
 `x86_64-unknown-linux-gnu`（ELF），跨架构直接不可执行。只在**同架构**场景
 （如 macOS 连 macOS）下才允许复用本机二进制。
 
+#### 2.4.5 支持矩阵：只有三个预编译 target，必须显式拒绝其余
+
+`.github/workflows/release.yml:84` 的发布矩阵**只有三个 target**：
+
+| target | 产物 |
+|---|---|
+| `aarch64-apple-darwin` | macOS Apple Silicon |
+| `x86_64-apple-darwin` | macOS Intel |
+| `x86_64-unknown-linux-gnu` | Linux x86_64 |
+
+命名规则由 `justfile:202-212` 的 `package-target` 钉死：
+`dist/yi-agent-<target>.tar.gz` + `dist/yi-agent-<target>.tar.gz.sha256`。
+
+**因此本设计只支持三类远端**：macOS ARM、macOS x86、Linux x86_64。
+
+必须明确拒绝并给出可读错误的是：
+
+- **`aarch64-unknown-linux-gnu`（ARM Linux）**：发布矩阵里**没有**这个产物。
+  很多云主机/Raspberry Pi 是 ARM Linux，会直接撞上。若不显式处理，用户看到的是
+  一个 404 或"下载失败"，误以为是网络问题
+- `armv7`、`musl`（Alpine）、Windows、FreeBSD 等：同样不在矩阵内
+
+**错误文案必须指出真实原因**：不是"网络不通"，而是"远端架构 `<arch>` 目前没有
+预编译产物"，并给出两条出路：改在 x86_64 上运行，或用路径 3（`--from <本机构建>`）
+自行交叉编译。这两条恰好是本设计已有的路径，不需要新机制。
+
+**这条约束要写进 `remote_arch` 的校验**（§4.9）：探测到的 arch 不在上表内时，
+在**连接前**就失败，而不是先 scp 再发现不对。
+
 ### 2.5 按版本分目录，不覆盖单文件
 
 安装路径 `~/.yi-agent/bin/<version>/yi-agent`。多台机器、多版本并存不打架；清理就是
@@ -335,11 +364,16 @@ app-server 在远端跑，而前端手上的 cwd 是**本机路径**（如
   的参数，`ssh -t` 需要终端也不适用。所以"让远端 app-server 的 cwd = 项目目录"
   只能靠远端 shell 的 `cd`。这是协议限制，不是设计选择。
 
-  因此形态固定为：
+  因此形态固定为（注意 `--listen stdio://` 与 `--relay` 的共存规则，见 §4.6 前提 0）：
 
   ```bash
-  ssh <host> "cd '<远端项目路径>' && exec '<bin>' app-server --listen stdio://"
+  ssh <host> "cd '<远端项目路径>' && exec '<bin>' app-server --listen stdio:// [--relay <url>?session=<id>]"
   ```
+
+  `--listen stdio://` 显式写出是**安全的**（`app_server_mode` 里 stdio + `--relay`
+  仍落 `StdioWithRelay`），但它**不能**换成 `ws://` 或 `relay://`——那会变成
+  `PureRelay`，桌面连不上。显式写 `stdio://` 而非省略，是为了让命令行自解释：
+  读代码的人一眼看到"这是 stdio 通道"，不会误以为 `--relay` 独立出现就是纯中继。
 
   - `<bin>` 是安装产生的固定路径（`~/.yi-agent/bin/<version>/yi-agent`），
     **不由用户输入**，无需转义
@@ -411,6 +445,22 @@ pub struct Sidecar {
 `RpcClient`。若为每个项目各建一个 `RpcClient`，两条连接都会送出 `id=1`，两个
 app-server 各回一个 `id=1` 的响应，**前端无法判断哪个是哪个**——响应会被错配到
 另一个项目的 pending 上，表现为"点 A 项目却拿到 B 项目的结果"。这类 bug 极难定位。
+
+#### 前端侧的单客户端假设（改造时最容易漏的一类）
+
+桥接层改成多槽位后，前端仍有一批"只考虑了一个 client"的代码。已核实的清单：
+
+| 位置 | 现状 | 多槽位下的问题 |
+|---|---|---|
+| `desktop/src/tauriTransport.ts:51-54` | 事件名是**硬编码字符串** `app-server://message` / `:request` / `:status` | 槽位改造后事件名带 slot（§4.6），这里必须改成参数化。**这是事件路由的唯一入口**，漏改等于所有远端项目的帧都进同一个 client |
+| `desktop/src/App.tsx:1375-1379` `onVisibilityChange` | 只 `reconnectNow()` 当前 client | 手机/iPad 切回前台时，**只有当前项目**重连；其他远端项目的连接已死却不重连，表现为"切回去那个项目的前几个请求失败"。必须遍历所有槽位各自重连 |
+| `desktop/src/App.tsx:1564` 附近 | 注释明确写着"`app-server://message` 是全局事件名，陈旧监听照样会收到新进程的帧" | 这条**正是**多槽位下最危险的点被放大 N 倍：任何一个槽位的陈旧监听都会收到所有槽位的帧，导致重复应用。每个槽位必须严格 dispose 自己的订阅 |
+| `desktop/src/App.tsx:164` `clientRef` | 单例 ref，**全文 50 处引用** | 改成 `Map<ProjectKey, RpcClient>` 后，这 50 处要逐条判断"该用当前活动的那个，还是该用指定槽位的"。这是前端改造工作量的真实来源，不能低估为"改个 ref" |
+
+**为什么单列这张表**：§4.6 的三个结构性障碍都是**桥接层/Rust 侧**的，容易被当成
+全部工作量。而前端这四处是"看起来能跑、实际只在单项目下正确"的隐性问题——单项目
+测试全绿，一开第二个远端项目才暴露。实现顺序里必须把"遍历所有槽位重连"和
+"事件名参数化"当成独立步骤，各配一条判据。
 
 #### 障碍三：事件通道是全局的，没有 project 维度
 
@@ -578,6 +628,31 @@ session id 由 `(本机实例, profile.id)` 派生，稳定可预测，例如
    `^[a-z0-9][a-z0-9-]{0,31}$`（§4.9），是 URL 安全的，可直接拼。若日后放宽这个
    正则，派生逻辑会立刻产生非法 URL——两者是耦合的，必须一起改。
 
+3. **中继不鉴权，`session` 就是唯一凭据**（`docs/relay-deploy.md` 第 207 行
+   明确写着"中继按 session 配对转发，**不鉴权**"；`relay/src/server.rs:64,74`
+   也证实 `session` 只是一个查询参数）。后果分两层，都要在设计里认下：
+
+   **a) 本方案放大了凭据的暴露面。** 原本只需要保护 1 个 session，现在要保护
+   N+1 个（本地 1 条 + 每个远端项目 1 条）。派生规则 `configured_session-profile.id`
+   是**可预测的**——知道本地 session 就能推出所有远端的 session。这不是新漏洞
+   （中继本来就不鉴权），但让"session 泄露"的代价从"一个项目被接管"变成"全部
+   项目被接管"。
+
+   **b) 派生规则可预测 = 可被顶掉。** 中继的注释里记着真实事故：一条误连
+   `/connect` 的探针就能顶掉真正的电脑连接，把它变成"僵尸"——socket 看着健康、
+   永不重连，手机从此长期收到 `no computer connected`（`relay/src/lib.rs`
+   的 `a_replaced_agent_is_closed_so_it_reconnects` 回归测试）。对多远端方案，
+   危险在于：**任何人猜到派生 session 就能顶掉某个远端项目的链路**。
+
+   缓解（必须做，不是可选）：
+   - `configured_session` 的熵必须足够。`openssl rand -hex 16`（128 bit）是下限；
+     **不得**为了"好记"用短串或语义化命名
+   - 派生结果**不能**比原 session 更弱：`configured_session` 是 hex 时，派生值
+     应为 `<hex>-<profile.id>`，长度与熵都不降低
+   - 中继仍应放在 TLS 反代后并用域名（`docs/relay-deploy.md` §2.3），派生规则
+     不改变这一点
+   - 在设置页明确提示：中继不鉴权，session 等同于密码，**不要**把 relay URL 分享出去
+
 **撞车的后果是静默的**（这条必须写进代码注释）：中继的规则是"每个 session 只保留
 一条最新的电脑连接"（`docs/relay-deploy.md` 端点表、`relay/src/lib.rs` 的
 `agents: HashMap<String, Slot>`）。两个远端项目若派生出同一个 session，
@@ -626,7 +701,14 @@ B 的具体形态：
   手机只能经中继访问 app-server，访问不到 Tauri 桥接层）
 - 返回：`[{ profileId, label, session, available }]`，其中 `available` 表示该远端
   当前是否真的连着（中继可能连不上，见上一节）
-- 该 RPC 需要 `Control` 及以上 scope；`Observe` 只读设备可以看清单但不能建会话
+- 该 RPC 的 scope：**`Control` 及以上才能拿到 `session` 字段**。
+  `Observe` 只能拿到 `{profileId, label, available}`，**`session` 必须置空**
+  （`protocol.rs:18-22` 定义了 `Observe < Control < Admin` 三档）
+
+  **为什么 `Observe` 不能看 session**：中继不鉴权（§4.6 前提 3），`session` 就是
+  凭据。任何拿到它的人/设备都能以"电脑"身份连 `/connect?session=<id>`，把真实
+  链路顶掉并接管。只读设备的语义是"能看不能动"，把凭据给它等于给了动的能力，
+  与 scope 的初衷矛盾。
 
 **为什么这个 RPC 必须放在 app-server**：手机 → 中继 → **本机 app-server**，
 链路上没有 Tauri 桥接层。而 `remote/*` 系列（§3.1）是 Tauri 命令，手机够不着。
@@ -639,10 +721,21 @@ B 的具体形态：
   配置分发，更重
 - 因此接受这**唯一一处** app-server 改动，并在 §7 明确列出
 
-#### 远端带 `--relay` 的三个前提（容易漏，逐条写清）
+#### 远端带 `--relay` 的四个前提（容易漏，逐条写清）
 
 `--relay` 加在**远端**的 app-server 上，所以中继连接是**从远端机器发起的出站连接**，
 不是从本机。这带来三个必须满足的前提：
+
+0. **`--listen` 只能是 `stdio://`（或缺省），绝不能是 `ws://` / `relay://`**
+   （已核实 `yi-agent/src/main.rs:157-190` 的 `app_server_mode`）：
+   - `--relay <url>` + `--listen` 缺省或 `stdio://` → `StdioWithRelay`
+     **这正是我们要的**：桌面经 ssh 走 stdio、手机经中继接入，两条通道并存
+   - `--relay <url>` + `--listen ws://…` 或 `relay://…` → **`PureRelay`**，
+     stdio 通道消失，桌面将完全连不上远端
+
+   实现上统一**显式**写 `--listen stdio://`（语义与省略等价，但命令行自解释，
+   见 §4.1 的形态）。这一条必须是纯函数 `remote_argv()` 的单元测试用例，
+   而不是靠实现时记得（§10 第 5 步）：断言 argv 里没有 `ws://` / `relay://`。
 
 1. **远端必须能出网访问中继**。中继 URL 通常在内网可达、外网不可达——如果用户的
    中继自建在内网，而远端在另一张网络上，这条连接建不起来。此时远端仍可正常用
@@ -764,7 +857,7 @@ C 的具体行为：
 | `remote_path` | 绝对路径，不含 shell 元字符（§6 第 3 条） | 拼进远端 `cd` |
 | `instance_root` | 绝对路径，**统一以 `.yi-agent` 结尾** | 由 App 派生为 `<远端 home>/.yi-agent-projects/<id>/.yi-agent`，**不由用户输入**；直接传给 `YI_AGENT_HOME`。注意：末尾不写 `.yi-agent` 也**不会**出错——`instance_home_from` 会自动补一层，两种写法隔离效果相同（§4.6 实测表）。这里要求写全，只是为了让"配置值、验收命令、实际路径"三者一致，避免排障时对不上 |
 | `binary_version` | semver 字符串 | 与 App 版本解耦：远端可以跑旧版 |
-| `remote_arch` | `uname -sm` 的归一化结果 | 缓存探测结果，避免每次重连都探测（§4.2） |
+| `remote_arch` | 必须是三个受支持 target 之一（§2.4.5） | `uname -sm` 的归一化结果，缓存以避免每次重连都探测（§4.2）。不在矩阵内时连接前即失败，**不得**先 scp 再报错 |
 | `relay_session` | 可为 `null` | 由 `(本地 session, profile.id)` 派生（§4.6）。`null` 仅在未配置中继时出现 |
 
 **存哪里**：本机 `<本机 instance_home>/remote.json`，即
@@ -1063,12 +1156,27 @@ flag 是闸门，不是数据清除。重新打开即恢复。
     "同 configured_session + 不同 profile.id ⇒ 不同 session"
 28. **不落 `default` session**：用户配置的 relay URL 里**不带** `session` 参数时，
     合成出的远端 URL 必须显式注入派生值，中继侧看到的不是 `default`（§4.6）
-29. **`remote/relayTargets` 契约**：手机 scope 调用返回
-    `[{profileId,label,session,available}]`；`Observe` scope 可读、不可建会话；
-    未开 flag 时该方法**不存在**（`method_not_found`，与 §5.1 一致）（§4.6）
+29. **`remote/relayTargets` 契约**：`Control` 及以上返回
+    `[{profileId,label,session,available}]`；**`Observe` 返回的条目里 `session`
+    必须为空**（凭据不外泄）；未开 flag 时该方法**不存在**
+    （`method_not_found`，与 §5.1 一致）（§4.6）
 30. **中继失败不拖垮主通道**：把 `relay_url` 指向不可达地址，远端项目仍然能正常
     对话（stdio 主通道不受影响），只是 `available=false`（§4.6）
-31. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
+31. **切回前台重连全部槽位**：开两个远端项目 + 本地，切到后台再切回，
+    三条连接**都**恢复到 `connected`（不能只有当前活动项目恢复）（§4.6）
+32. **事件名参数化后不串台**：`tauriTransport.ts` 按 slot 订阅后，B 项目的
+    `item/delta` 不出现在 A 项目的消息流里；两个项目的流式文本都完整、无重复
+33. **陈旧订阅被摘除**：反复切换项目 20 次后，每个槽位只有**一条**活跃订阅
+    （否则文本会逐字重复）（§4.6）
+34. **远端 argv 的 `--listen` 只能是 stdio**：对 `remote_argv()` 的单测断言
+    argv 含 `--relay`，且 `--listen` 的值（若有）为 `stdio://`、**不含**
+    `ws://`/`relay://`；真机验证远端进程的
+    `app_server_mode` 落在 `StdioWithRelay` 而非 `PureRelay`
+    （否则桌面完全连不上）（§4.6）
+35. **不支持的架构快速失败**：对一台 ARM Linux（`aarch64-unknown-linux-gnu`）
+    配置远端，连接必须在**下载前**失败，文案点明"该架构无预编译产物"而非"网络
+    错误"，并提示路径 3（§2.4.5）
+36. **远端无模型配置有指引**：清空远端 `models.json` 后建会话，出现说明页并给出
     远端配置路径，而不是一句 `no model configured`（§4.8）
 
 ## 10. 实施顺序
@@ -1096,15 +1204,21 @@ bug 分不清"的泥潭。
    每个远端 slot 的 ssh 命令行加上 `--relay <session>`，session 由
    `(本机 session, profile.id)` 派生
 7. **路径语义** — 落实 §4.4 方案 B：远端模式下前端不传 `cwd`
-8. **前端多 client 改造** — `Map<ProjectKey, RpcClient>`，按活动项目取用
+8. **前端多 client 改造** — `Map<ProjectKey, RpcClient>`，按活动项目取用。
+   这一步必须同时做完 §4.6「前端侧的单客户端假设」表里的四件事，且**各自单独
+   验证**，因为它们都只在开第二个项目时才暴露：
+   - `tauriTransport.ts:51-54` 事件名参数化（否则所有槽位的帧进同一个 client）
+   - `App.tsx:1375-1379` `onVisibilityChange` 改为遍历所有槽位重连
+   - 每槽位严格 dispose 自己的订阅（`App.tsx:1564` 附近已记录此风险）
+   - `clientRef` 的 50 处引用逐条判断用"当前活动"还是"指定槽位"
 9. **前端设置页 + 进度事件 + 断线状态** — 含 §4.3 的手动重连按钮
 10. **关开关时杀进程**（必须杀**全部**远端 slot）
 11. **`remote/relayTargets`** — app-server 侧唯一新增方法（只读）。先写契约测试
     （含 flag 关闭时 `method_not_found`、scope 校验），再接前端（§4.6）
 12. **手机端多连接** — iOS 端从单连接改为按 profile 多连接；列表按项目分组；
     消费 `remote/relayTargets` 拿清单。这是本设计唯一的非 Rust 客户端改动（§4.6）
-13. **端到端真机验证** — 走完 §9 的 **31 条**判据。并行相关的
-    15–19、23、27 必须**双项目同时开**才测得出来；25 需指向不可达地址；
+13. **端到端真机验证** — 走完 §9 的 **36 条**判据。并行相关的
+    15–19、23、27、31–33 必须**双项目同时开**才测得出来；25 需指向不可达地址；
     28 需把 `relay_url` 指向不可达地址
 14. 补齐路径 2（远端直下）与路径 3（`--from`）
 
