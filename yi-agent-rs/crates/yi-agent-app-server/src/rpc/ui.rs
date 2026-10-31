@@ -90,6 +90,42 @@ pub(crate) async fn handle(
             )
             .await?;
         }
+        "settings/read" => {
+            let value = crate::settings_rpc::read_value(state.settings_path);
+            write_response(state.hub, state.client, ok_response(id, value)).await?;
+        }
+        "settings/write" => {
+            if state.client_scope < crate::settings_rpc::write_scope() {
+                write_response(
+                    state.hub,
+                    state.client,
+                    err_response(
+                        id,
+                        RpcError::insufficient_scope(crate::settings_rpc::write_scope()),
+                    ),
+                )
+                .await?;
+                return Ok(Flow::Continue);
+            }
+            let patch = req
+                .params
+                .get("patch")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            match crate::settings_rpc::write_value(state.settings_path, &patch) {
+                Ok(value) => {
+                    write_response(state.hub, state.client, ok_response(id, value)).await?
+                }
+                Err(error) => {
+                    write_response(
+                        state.hub,
+                        state.client,
+                        err_response(id, crate::settings_rpc::write_error(error)),
+                    )
+                    .await?
+                }
+            }
+        }
         "ui/settings/write" => {
             // 新键优先，旧键兼容读：老客户端仍发旧键名，而一台机器上的桌面与
             // app-server 未必同批升级，故两条都要认。旧键名的字面量只留在

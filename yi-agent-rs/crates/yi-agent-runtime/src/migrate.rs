@@ -282,6 +282,292 @@ fn atomic_write(path: &Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// A 类键迁移的结果。与 [`MigrationOutcome`] 分开：模型键与运行参数是两条独立
+/// 的一次性迁移，混用一个枚举会让日志措辞打架。
+#[derive(Debug, PartialEq, Eq)]
+pub enum EnvMigrationOutcome {
+    /// `.env` 不存在，或里面没有任何 A 类键、也没有已废弃的 `YI_AGENT_WORKDIR` /
+    /// `YI_AGENT_YOLO`。
+    NothingToDo,
+    /// 已落盘并改名。
+    Migrated { fields: usize, bocha: bool },
+    /// `.env` 里只有已废弃的键（`YI_AGENT_WORKDIR` / `YI_AGENT_YOLO`），没有可迁移的
+    /// 值。文件已改名成 `.env.migrated`，`settings.json` 与 `websearch.json` 未创建。
+    ///
+    /// 为什么仍要改名：这两个键已经没有任何读取方，留着只会让每次启动都重复同一条
+    /// 告警，而文件本身永远不会消失。改名即「这件事已经处理完了」。
+    DroppedOnly,
+    /// `.env` 读不出来。`settings.json` 未动。
+    EnvUnreadable { reason: String },
+    /// `settings.json`（或 `websearch.json`）写不进去。`.env` 未改名，可重试。
+    SettingsNotWritable { reason: String },
+}
+
+/// 把 `.env` 里的 A 类键迁进 `settings.json`，`BOCHA_API_KEY` 迁进 `websearch.json`，
+/// 成功后把 `.env` 改名为 `.env.migrated`。
+///
+/// **必须与 [`migrate_model_keys`] 在同一处、且在 `RuntimeConfig::load_lenient`
+/// 之前调用。** 顺序错了会造出半迁移：`.env` 已被注入进程环境又被改名，配置看起来
+/// 迁了、重启后没了。
+///
+/// **幂等**：第二次调用时 `.env` 已改名，读不到，返回 `NothingToDo` 且不碰
+/// `settings.json`。
+pub fn migrate_env_settings(
+    env_path: &Path,
+    settings_path: &Path,
+    websearch_path: &Path,
+) -> EnvMigrationOutcome {
+    let text = match std::fs::read_to_string(env_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return EnvMigrationOutcome::NothingToDo;
+        }
+        Err(error) => {
+            return EnvMigrationOutcome::EnvUnreadable {
+                reason: error.to_string(),
+            };
+        }
+    };
+
+    let values = crate::settings::parse_env_text(&text);
+
+    // (点路径键, .env 键)。顺序即日志里 `fields` 的计数依据。
+    const A_CLASS: &[(&str, &str)] = &[
+        ("agent.max_turns", "YI_AGENT_MAX_TURNS"),
+        ("agent.max_direct_children", "YI_AGENT_MAX_DIRECT_CHILDREN"),
+        (
+            "agent.max_resident_subagents",
+            "YI_AGENT_MAX_RESIDENT_SUBAGENTS",
+        ),
+        ("agent.system_prompt", "YI_AGENT_SYSTEM_PROMPT"),
+        (
+            "agent.skills_catalog_budget",
+            "YI_AGENT_SKILLS_CATALOG_BUDGET",
+        ),
+        ("compact.ratio", "YI_AGENT_COMPACT_RATIO"),
+        (
+            "compact.user_budget_tokens",
+            "YI_AGENT_COMPACT_USER_BUDGET_TOKENS",
+        ),
+        (
+            "compact.tool_budget_tokens",
+            "YI_AGENT_COMPACT_TOOL_BUDGET_TOKENS",
+        ),
+        ("startup.sandbox", "YI_AGENT_SANDBOX"),
+    ];
+
+    // 只填「尚未设置」的字段：既有 `settings.json` 的值优先。
+    let existing = crate::settings::load_from(settings_path);
+    let mut patch = serde_json::Map::new();
+    for (path_key, env_key) in A_CLASS {
+        let Some(raw) = values.get(*env_key) else {
+            continue;
+        };
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if field_is_set(&existing, path_key) {
+            continue;
+        }
+        patch.insert(
+            (*path_key).to_string(),
+            serde_json::Value::from(raw.clone()),
+        );
+    }
+
+    let bocha_key = values
+        .get("BOCHA_API_KEY")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    let has_workdir = values.contains_key("YI_AGENT_WORKDIR");
+    let has_yolo = values.contains_key("YI_AGENT_YOLO");
+
+    if patch.is_empty() && bocha_key.is_none() {
+        if !has_workdir && !has_yolo {
+            // 既没有 A 类键也没有废弃键：这不是我们的文件，原样留着。
+            return EnvMigrationOutcome::NothingToDo;
+        }
+        // 只有废弃键。它们已无读取方，留着只会让每次启动重复同一条告警，
+        // 故把所有废弃键逐条 warn 一遍后改名，让 `.env` 彻底退场。
+        if has_workdir {
+            tracing::warn!(
+                path = %env_path.display(),
+                "YI_AGENT_WORKDIR is no longer read; workdir now comes from --workdir, \
+                 the launch directory, or the project picked in the desktop app"
+            );
+        }
+        if has_yolo {
+            tracing::warn!(
+                path = %env_path.display(),
+                "YI_AGENT_YOLO is no longer read; pass --yolo on every launch instead"
+            );
+        }
+        return match std::fs::rename(env_path, env_path.with_file_name(".env.migrated")) {
+            Ok(()) => EnvMigrationOutcome::DroppedOnly,
+            Err(error) => EnvMigrationOutcome::SettingsNotWritable {
+                reason: format!("could not rename .env to .env.migrated: {error}"),
+            },
+        };
+    }
+
+    // 1) 先落 settings.json：写不进去就绝不改名 `.env`（否则用户的值凭空丢失）。
+    let mut migrated_fields = 0usize;
+    if !patch.is_empty() {
+        // 逐个字段写入：单个字段的非法值只跳过它本身，不拖垮整次迁移。
+        for (key, value) in patch {
+            let single = serde_json::Value::Object([(key.clone(), value)].into_iter().collect());
+            match crate::settings::write_to(settings_path, &single) {
+                Ok(()) => migrated_fields += 1,
+                Err(error) => {
+                    // 键不认识 / 类型不对 / 越界：都是「这个值迁不了」，不是存储故障。
+                    // 存储故障（文件损坏 / IO）则必须中止。
+                    match error {
+                        crate::settings::SettingsError::InvalidSetting { .. } => {
+                            tracing::warn!(
+                                key = %key,
+                                %error,
+                                "skipping a .env value that settings.json cannot accept"
+                            );
+                        }
+                        other => {
+                            return EnvMigrationOutcome::SettingsNotWritable {
+                                reason: other.to_string(),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) 再落 websearch.json：只在文件里没有非空 key 时写。
+    let mut bocha_migrated = false;
+    if let Some(key) = bocha_key {
+        let config = yi_agent_tools::load_websearch_config_from(websearch_path);
+        let already = config
+            .engines
+            .get("bocha")
+            .map(|engine| !engine.api_key.trim().is_empty())
+            .unwrap_or(false);
+        if !already {
+            let mut config = config;
+            config
+                .engines
+                .entry("bocha".to_string())
+                .or_default()
+                .api_key = key;
+            match save_websearch_config(websearch_path, &config) {
+                Ok(()) => bocha_migrated = true,
+                Err(error) => {
+                    return EnvMigrationOutcome::SettingsNotWritable {
+                        reason: format!("websearch.json: {error}"),
+                    };
+                }
+            }
+        }
+    }
+
+    // 3) 最后改名 `.env`：保留唯一一份明文 key 供用户取回。
+    let renamed = env_path.with_file_name(".env.migrated");
+    if let Err(error) = std::fs::rename(env_path, &renamed) {
+        return EnvMigrationOutcome::EnvUnreadable {
+            reason: format!("could not rename .env to .env.migrated: {error}"),
+        };
+    }
+    tracing::info!(
+        from = %env_path.display(),
+        to = %renamed.display(),
+        "migrated .env runtime settings into settings.json; the old file was renamed for recovery"
+    );
+
+    if has_workdir || has_yolo {
+        tracing::warn!(
+            "YI_AGENT_WORKDIR / YI_AGENT_YOLO are no longer read; workdir now comes from \
+             --workdir or the launch directory, and yolo must be passed on every launch"
+        );
+    }
+
+    EnvMigrationOutcome::Migrated {
+        fields: migrated_fields,
+        bocha: bocha_migrated,
+    }
+}
+
+/// 某个点路径字段在既有 `Settings` 里是否已有值。
+fn field_is_set(settings: &crate::settings::Settings, key: &str) -> bool {
+    match key {
+        "agent.max_turns" => settings.agent.max_turns.is_some(),
+        "agent.max_direct_children" => settings.agent.max_direct_children.is_some(),
+        "agent.max_resident_subagents" => settings.agent.max_resident_subagents.is_some(),
+        "agent.system_prompt" => settings.agent.system_prompt.is_some(),
+        "agent.skills_catalog_budget" => settings.agent.skills_catalog_budget.is_some(),
+        "compact.ratio" => settings.compact.ratio.is_some(),
+        "compact.user_budget_tokens" => settings.compact.user_budget_tokens.is_some(),
+        "compact.tool_budget_tokens" => settings.compact.tool_budget_tokens.is_some(),
+        "startup.sandbox" => settings.startup.sandbox.is_some(),
+        _ => false,
+    }
+}
+
+/// `websearch.json` 的原子落盘。与 `websearch_rpc::save_config` 同一套语义
+/// （读-改-写保留未知键），但那一个是私有的且属于 app-server，故此处独立实现。
+fn save_websearch_config(
+    path: &Path,
+    config: &yi_agent_tools::WebSearchConfig,
+) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut object = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(ours) = serde_json::to_value(config)
+        .map_err(std::io::Error::other)?
+        .as_object()
+    {
+        for (key, value) in ours {
+            object.insert(key.clone(), value.clone());
+        }
+    }
+    let text = serde_json::to_vec_pretty(&serde_json::Value::Object(object))
+        .map_err(std::io::Error::other)?;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!("websearch.json.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// 把 A 类迁移结果记成日志。`NothingToDo` 是常态，静默。
+pub fn log_env_settings_outcome(outcome: &EnvMigrationOutcome, env_path: &Path) {
+    match outcome {
+        EnvMigrationOutcome::NothingToDo => {}
+        EnvMigrationOutcome::DroppedOnly => tracing::warn!(
+            path = %env_path.display(),
+            "the .env file held only retired keys (YI_AGENT_WORKDIR / YI_AGENT_YOLO); \
+             it was renamed to .env.migrated"
+        ),
+        EnvMigrationOutcome::Migrated { fields, bocha } => tracing::warn!(
+            path = %env_path.display(),
+            fields = *fields,
+            bocha = *bocha,
+            "migrated runtime settings from .env into settings.json; .env was renamed to .env.migrated"
+        ),
+        EnvMigrationOutcome::EnvUnreadable { reason } => tracing::warn!(
+            path = %env_path.display(),
+            %reason,
+            "could not migrate .env runtime settings; nothing was changed"
+        ),
+        EnvMigrationOutcome::SettingsNotWritable { reason } => tracing::warn!(
+            path = %env_path.display(),
+            %reason,
+            "could not migrate .env runtime settings; .env was left untouched, will retry next start"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +944,286 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
+    }
+
+    use crate::settings::{load_from, write_to};
+
+    struct MigrationFixture {
+        dir: tempfile::TempDir,
+    }
+
+    impl MigrationFixture {
+        fn new() -> Self {
+            Self {
+                dir: tempfile::TempDir::new().unwrap(),
+            }
+        }
+        fn env(&self) -> std::path::PathBuf {
+            self.dir.path().join(".env")
+        }
+        fn settings(&self) -> std::path::PathBuf {
+            self.dir.path().join("settings.json")
+        }
+        fn websearch(&self) -> std::path::PathBuf {
+            self.dir.path().join("websearch.json")
+        }
+        fn write_env(&self, text: &str) {
+            std::fs::write(self.env(), text).unwrap();
+        }
+        fn run(&self) -> EnvMigrationOutcome {
+            migrate_env_settings(&self.env(), &self.settings(), &self.websearch())
+        }
+    }
+
+    #[test]
+    fn missing_env_is_nothing_to_do() {
+        let fixture = MigrationFixture::new();
+        assert_eq!(fixture.run(), EnvMigrationOutcome::NothingToDo);
+        assert!(
+            !fixture.settings().exists(),
+            "no settings.json may be created"
+        );
+    }
+
+    #[test]
+    fn env_without_a_class_keys_is_nothing_to_do_and_leaves_the_file_alone() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env("SOME_OTHER_TOOL=1\n");
+
+        assert_eq!(fixture.run(), EnvMigrationOutcome::NothingToDo);
+        assert!(
+            fixture.env().exists(),
+            "no A-class key means nothing to migrate"
+        );
+        assert!(!fixture.settings().exists());
+    }
+
+    #[test]
+    fn a_class_keys_land_in_settings_json() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env(
+            "\
+# MIGRATED: YI_AGENT_PROVIDER=openai
+YI_AGENT_MAX_TURNS=500
+YI_AGENT_COMPACT_RATIO=75
+YI_AGENT_SANDBOX=read-only
+",
+        );
+
+        let outcome = fixture.run();
+        assert_eq!(
+            outcome,
+            EnvMigrationOutcome::Migrated {
+                fields: 3,
+                bocha: false
+            }
+        );
+
+        let settings = load_from(&fixture.settings());
+        assert_eq!(settings.agent.max_turns, Some(500));
+        assert_eq!(settings.compact.ratio, Some(75));
+        assert_eq!(settings.startup.sandbox.as_deref(), Some("read-only"));
+    }
+
+    #[test]
+    fn existing_settings_values_are_never_overwritten() {
+        let fixture = MigrationFixture::new();
+        write_to(
+            &fixture.settings(),
+            &serde_json::json!({"agent.max_turns": 42}),
+        )
+        .unwrap();
+        fixture.write_env("YI_AGENT_MAX_TURNS=500\nYI_AGENT_COMPACT_RATIO=75\n");
+
+        fixture.run();
+
+        let settings = load_from(&fixture.settings());
+        assert_eq!(
+            settings.agent.max_turns,
+            Some(42),
+            "existing value must win"
+        );
+        assert_eq!(
+            settings.compact.ratio,
+            Some(75),
+            "the unset field still gets migrated"
+        );
+    }
+
+    #[test]
+    fn env_is_renamed_to_migrated_after_a_successful_run() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env("YI_AGENT_MAX_TURNS=500\n");
+
+        fixture.run();
+
+        assert!(!fixture.env().exists(), ".env must be gone");
+        let renamed = fixture.dir.path().join(".env.migrated");
+        assert!(renamed.exists(), ".env.migrated must exist");
+        assert!(
+            std::fs::read_to_string(&renamed)
+                .unwrap()
+                .contains("YI_AGENT_MAX_TURNS=500"),
+            "the renamed file keeps its content for recovery"
+        );
+    }
+
+    #[test]
+    fn second_run_is_idempotent_and_does_not_touch_settings() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env("YI_AGENT_MAX_TURNS=500\n");
+        fixture.run();
+
+        let mtime_before = std::fs::metadata(fixture.settings())
+            .unwrap()
+            .modified()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let second = fixture.run();
+
+        assert_eq!(second, EnvMigrationOutcome::NothingToDo);
+        let mtime_after = std::fs::metadata(fixture.settings())
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "a second run must not rewrite settings.json"
+        );
+    }
+
+    #[test]
+    fn unusable_settings_json_blocks_the_rename() {
+        let fixture = MigrationFixture::new();
+        std::fs::write(fixture.settings(), "{ broken").unwrap();
+        fixture.write_env("YI_AGENT_MAX_TURNS=500\n");
+
+        let outcome = fixture.run();
+        assert!(
+            matches!(outcome, EnvMigrationOutcome::SettingsNotWritable { .. }),
+            "got {outcome:?}"
+        );
+        assert!(
+            fixture.env().exists(),
+            ".env must survive when the target is not writable"
+        );
+    }
+
+    #[test]
+    fn bocha_key_moves_into_websearch_json() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env("BOCHA_API_KEY=bocha-abc\nYI_AGENT_MAX_TURNS=500\n");
+
+        let outcome = fixture.run();
+        assert!(matches!(
+            outcome,
+            EnvMigrationOutcome::Migrated { bocha: true, .. }
+        ));
+
+        let config = yi_agent_tools::load_websearch_config_from(&fixture.websearch());
+        assert_eq!(config.engines["bocha"].api_key, "bocha-abc");
+    }
+
+    #[test]
+    fn an_existing_bocha_key_is_not_overwritten() {
+        let fixture = MigrationFixture::new();
+        let mut cfg = yi_agent_tools::WebSearchConfig::default();
+        cfg.engines.get_mut("bocha").unwrap().api_key = "keep-me".to_string();
+        let text = serde_json::to_string_pretty(&cfg).unwrap();
+        std::fs::write(fixture.websearch(), text).unwrap();
+
+        fixture.write_env("BOCHA_API_KEY=bocha-abc\n");
+
+        fixture.run();
+
+        let config = yi_agent_tools::load_websearch_config_from(&fixture.websearch());
+        assert_eq!(config.engines["bocha"].api_key, "keep-me");
+    }
+
+    /// `YI_AGENT_WORKDIR` 没有落点，丢弃即可；`YI_AGENT_YOLO` 是安全姿态，绝不能
+    /// 被持久化（否则 `sandbox_promotable` 恒为 false）。
+    #[test]
+    fn workdir_and_yolo_are_dropped() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env(
+            "\
+YI_AGENT_WORKDIR=/tmp/somewhere
+YI_AGENT_YOLO=true
+YI_AGENT_MAX_TURNS=500
+",
+        );
+
+        fixture.run();
+
+        let text = std::fs::read_to_string(fixture.settings()).unwrap();
+        assert!(!text.contains("workdir"), "workdir must not be persisted");
+        assert!(!text.contains("yolo"), "yolo must not be persisted");
+        assert!(text.contains("max_turns"));
+    }
+
+    /// 迁移必须用 Task 1 的解析口径：注释不能被并进值，`export` 前缀要剥掉。
+    #[test]
+    fn migration_uses_the_dotenvy_compatible_parser() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env(
+            "\
+export YI_AGENT_MAX_TURNS=500 # this is a comment
+YI_AGENT_SYSTEM_PROMPT='hello # world'
+",
+        );
+
+        fixture.run();
+
+        let settings = load_from(&fixture.settings());
+        assert_eq!(settings.agent.max_turns, Some(500));
+        assert_eq!(
+            settings.agent.system_prompt.as_deref(),
+            Some("hello # world"),
+            "a # inside quotes is literal, not a comment"
+        );
+    }
+
+    /// 一个非法值不能让整次迁移失败：该字段跳过，其余照常落盘。
+    #[test]
+    fn an_invalid_value_is_skipped_but_the_rest_still_migrates() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env("YI_AGENT_MAX_TURNS=not-a-number\nYI_AGENT_COMPACT_RATIO=75\n");
+
+        let outcome = fixture.run();
+        assert!(matches!(outcome, EnvMigrationOutcome::Migrated { .. }));
+
+        let settings = load_from(&fixture.settings());
+        assert_eq!(settings.agent.max_turns, None);
+        assert_eq!(settings.compact.ratio, Some(75));
+    }
+
+    /// 只剩已废弃键时也要改名：那两个键已无读取方，留着会让每次启动都重复
+    /// 同一条告警，而文件永远不消失。
+    #[test]
+    fn a_file_with_only_retired_keys_is_renamed_not_left_behind() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env("YI_AGENT_WORKDIR=/some/project\nYI_AGENT_YOLO=1\n");
+
+        assert_eq!(fixture.run(), EnvMigrationOutcome::DroppedOnly);
+
+        assert!(!fixture.env().exists(), "the .env must be renamed away");
+        assert!(
+            fixture.dir.path().join(".env.migrated").exists(),
+            "the old file is kept under .env.migrated for recovery"
+        );
+        assert!(
+            !fixture.settings().exists(),
+            "there was nothing to write, so settings.json must not appear"
+        );
+        assert!(!fixture.websearch().exists());
+    }
+
+    /// 第二次调用已无 `.env`，返回 `NothingToDo`——`DroppedOnly` 也是幂等的。
+    #[test]
+    fn dropped_only_is_idempotent() {
+        let fixture = MigrationFixture::new();
+        fixture.write_env("YI_AGENT_WORKDIR=/some/project\n");
+        assert_eq!(fixture.run(), EnvMigrationOutcome::DroppedOnly);
+        assert_eq!(fixture.run(), EnvMigrationOutcome::NothingToDo);
     }
 }

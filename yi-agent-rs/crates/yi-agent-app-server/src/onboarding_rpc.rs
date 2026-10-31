@@ -9,7 +9,6 @@ use yi_agent_runtime::config::RuntimeConfig;
 
 /// `onboarding/*` 的唯一入口。路径与兜底 cfg 均由调用方注入（测试不碰真实 HOME）。
 pub fn handle_onboarding_request_at(
-    env_path: &Path,
     preferences_path: &Path,
     models_path: &Path,
     method: &str,
@@ -18,13 +17,11 @@ pub fn handle_onboarding_request_at(
 ) -> Result<Value, RpcError> {
     match method {
         "onboarding/status" => {
-            let env = yi_agent_runtime::onboarding::read_env_fields(env_path)
-                .map_err(|e| RpcError::internal(e.to_string()))?;
             let catalog = yi_agent_runtime::models::load_catalog_from(models_path);
-            let assessment = yi_agent_runtime::onboarding::assess(&env, Some(&catalog));
+            let assessment = yi_agent_runtime::onboarding::assess(Some(&catalog));
             let dismissed = yi_agent_runtime::onboarding::load_dismissed(preferences_path);
             let (needed, reasons) = match assessment {
-                yi_agent_runtime::onboarding::Assessment::Ready { .. } => (false, Vec::new()),
+                yi_agent_runtime::onboarding::Assessment::Ready => (false, Vec::new()),
                 yi_agent_runtime::onboarding::Assessment::Needed { reasons } => (
                     true,
                     reasons
@@ -36,7 +33,7 @@ pub fn handle_onboarding_request_at(
             };
             Ok(json!({ "needed": needed, "dismissed": dismissed, "reasons": reasons }))
         }
-        "onboarding/apply" => apply(env_path, models_path, params, fallback),
+        "onboarding/apply" => apply(models_path, params, fallback),
         "onboarding/dismiss" => {
             yi_agent_runtime::onboarding::save_dismissed(preferences_path, true)
                 .map_err(|e| RpcError::internal(e.to_string()))?;
@@ -72,12 +69,7 @@ pub fn settings_from_params(
     Ok(settings)
 }
 
-fn apply(
-    _env_path: &Path,
-    models_path: &Path,
-    params: &Value,
-    _fallback: &RuntimeConfig,
-) -> Result<Value, RpcError> {
+fn apply(models_path: &Path, params: &Value, _fallback: &RuntimeConfig) -> Result<Value, RpcError> {
     // 注意:这里**只做校验 + 写盘**,不做连接探测。
     // 探测是 async 的,必须由 `rpc/onboarding.rs` 的 async 分支负责:
     // 同步函数里 `block_on` 会在 tokio worker 上 panic,而且会和 RPC 层
@@ -152,7 +144,7 @@ mod tests {
     }
 
     fn call(p: &Paths, method: &str, params: Value) -> Result<Value, RpcError> {
-        handle_onboarding_request_at(&p.env, &p.prefs, &p.models, method, &params, &fallback())
+        handle_onboarding_request_at(&p.prefs, &p.models, method, &params, &fallback())
     }
 
     #[test]

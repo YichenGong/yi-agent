@@ -404,6 +404,10 @@ pub(crate) struct RuntimeAttachments {
     /// `models_path` is: the 网页搜索 panel must be testable without writing
     /// the developer's real machine-level config.
     pub(crate) websearch_path: PathBuf,
+    /// Where `settings.json` lives. Injectable for the same reason
+    /// `models_path` is: the runtime settings panel must be testable without
+    /// writing the developer's real machine-level config.
+    pub(crate) settings_path: PathBuf,
     /// 组长开关的**生效值**，装配时算一次。
     ///
     /// 只放结论、不放路径：若把 `flags.json` 路径传下来再让 `serve()` 解析，
@@ -411,13 +415,9 @@ pub(crate) struct RuntimeAttachments {
     /// 生产的构造点统一调 [`crate::lead_gate::from_process_environment`]，
     /// 测试直接给 `true` / `false`。
     pub(crate) lead_agent_enabled: bool,
-    /// Where the global `.env` lives, for `onboarding/apply`. Injectable for the
-    /// same reason `models_path` is: onboarding must never write the developer's
-    /// real `~/.yi-agent/.env`.
-    pub(crate) onboarding_env_path: PathBuf,
     /// Where `preferences.json` lives, for the `onboarding_dismissed` marker.
-    /// Injectable for the same reason `onboarding_env_path` is: dismissing the
-    /// first-run guide must never touch the developer's real preferences file.
+    /// Injectable for the same reason `models_path` is: dismissing the first-run
+    /// guide must never touch the developer's real preferences file.
     pub(crate) onboarding_preferences_path: PathBuf,
     /// Where the generic resident-daemon registry lives (`$HOME/.yi-agent`).
     /// Injectable: `resident/*` must be testable without writing the
@@ -1972,12 +1972,11 @@ where
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
+            settings_path: yi_agent_runtime::settings::settings_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
-            onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
-                .unwrap_or_default(),
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
             skills_home: skills_home_dir(),
@@ -2061,12 +2060,11 @@ where
             thread_roots,
             models_path: yi_agent_runtime::models::models_path(),
             websearch_path: yi_agent_tools::websearch_path(),
+            settings_path: yi_agent_runtime::settings::settings_path(),
             // 开关的结论。生产构造点共用同一个解析函数，避免各写一份「怎么算」。
             lead_agent_enabled: crate::lead_gate::from_process_environment(),
             // 引导读写的全局文件。生产 = 真实的 `~/.yi-agent`;测试由 harness
             // 注入隔离 tempdir。HOME 缺失回退空路径,与 `resident_dir` 同一策略。
-            onboarding_env_path: yi_agent_runtime::config::resolve_global_env_path()
-                .unwrap_or_default(),
             onboarding_preferences_path: instance_home_dir().join("preferences.json"),
             resident_dir,
             skills_home: skills_home_dir(),
@@ -2338,21 +2336,35 @@ fn parse_relay_url(relay_url: &str) -> anyhow::Result<(String, String)> {
     yi_agent_relay::parse_relay_parts(relay_url)
 }
 
-/// 生产启动期的一次性 `.env` → 清单迁移，供两个生产入口（`run` 与
-/// `serve_stdio_with_relay`）共用。
+/// 生产启动期的一次性迁移，供所有生产入口共用。
+///
+/// **两条迁移，固定顺序，一次跑完**：
+/// 1. 模型键 `.env → models.json`（既有）；
+/// 2. 运行参数 `.env → settings.json`（本 spec 新增）。
+///
+/// 顺序不能反：两条之间没有数据依赖，但把它们放在同一个函数里，是为了让
+/// 「所有入口都迁移」成为结构性保证——四个调用点（`run`、`serve_stdio`、ws、
+/// CLI 两处）漏掉任何一个，都会表现为「某个客户端配置丢失」。
+///
+/// **函数名保留 `model_keys`**：它现在是历史名字，改名要动四个调用点且不增加
+/// 正确性。名字与实际职责的偏差写在这里，比散落四处更可控。
 ///
 /// 只在生产入口调用：测试用 `Harness` 注入隔离路径，绝不能在这里产生副作用。
-/// `HOME` 缺失时 `resolve_global_env_path` 为 `None`，此时不迁移（避免在一个
-/// 凭空拼出的路径上写文件）。清单路径与 `RuntimeAttachments` 用的是同一个
-/// `models_path()`，保证迁移落点与运行期读点是同一个文件。
+/// `HOME` 缺失时无从解析实例目录，直接跳过（避免在凭空拼出的路径上写文件）。
 pub(crate) fn migrate_legacy_model_keys_on_startup() {
-    if let Some(env_path) = yi_agent_runtime::config::resolve_global_env_path() {
-        let outcome = yi_agent_runtime::migrate::migrate_model_keys(
-            &env_path,
-            &yi_agent_runtime::models::models_path(),
-        );
-        yi_agent_runtime::migrate::log_outcome(&outcome, &env_path);
-    }
+    let Some(env_path) = yi_agent_runtime::config::resolve_global_env_path() else {
+        return;
+    };
+    let models_path = yi_agent_runtime::models::models_path();
+    let settings_path = yi_agent_runtime::settings::settings_path();
+    let websearch_path = yi_agent_tools::websearch_path();
+
+    let outcome = yi_agent_runtime::migrate::migrate_model_keys(&env_path, &models_path);
+    yi_agent_runtime::migrate::log_outcome(&outcome, &env_path);
+
+    let outcome =
+        yi_agent_runtime::migrate::migrate_env_settings(&env_path, &settings_path, &websearch_path);
+    yi_agent_runtime::migrate::log_env_settings_outcome(&outcome, &env_path);
 }
 
 /// 旧常驻登记表（看板时代）里登记的项目路径，按 `{"boards":[{"project":"<abs>"}]}` 解析。
@@ -2638,6 +2650,41 @@ mod legacy_migration_tests {
                 "`serve_ws_body` is the test seam; `{call}` belongs in the production entry"
             );
         }
+    }
+
+    /// 两条迁移都必须挂在同一个生产启动函数里。逐条断言，漏一条就会让某个
+    /// 入口（典型是 ws）静默不迁移。
+    #[test]
+    fn the_startup_migration_runs_both_model_and_settings_migrations() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("pub(crate) fn migrate_legacy_model_keys_on_startup()")
+            .expect("the startup migration function must exist");
+        let body = &source[start..];
+        let body = body
+            .split("\n}\n")
+            .next()
+            .expect("the function body must be terminated");
+        for call in [
+            "yi_agent_runtime::migrate::migrate_model_keys",
+            "yi_agent_runtime::migrate::migrate_env_settings",
+        ] {
+            assert!(
+                body.contains(call),
+                "`migrate_legacy_model_keys_on_startup` must call `{call}`"
+            );
+        }
+    }
+
+    /// ws 入口必须走同一个启动函数——手机配对的配置迁移全靠这一条。
+    #[test]
+    fn the_ws_entry_runs_the_startup_migration() {
+        let ws = include_str!("ws.rs");
+        let production = ws.split("#[cfg(test)]").next().expect("production part");
+        assert!(
+            production.contains("migrate_legacy_model_keys_on_startup"),
+            "ws.rs must run the shared startup migration"
+        );
     }
 
     /// 迁移代码**不得**依赖那个已删的看板 registry crate:否则它会随它
@@ -3158,7 +3205,7 @@ where
         thread_roots,
         models_path,
         websearch_path,
-        onboarding_env_path,
+        settings_path,
         onboarding_preferences_path,
         resident_dir,
         skills_home,
@@ -3445,9 +3492,9 @@ where
                 macro_rules! app_state {
                     () => {
                         // 字段名逐项写出(而非位置参数):`models_path` /
-                        // `onboarding_env_path` / `onboarding_preferences_path` /
-                        // `watchman_home` 四个相邻字段同为 `&Path`,位置一旦
-                        // 写错照样编译通过、却会静默把机器级路径接错。
+                        // `onboarding_preferences_path` / `watchman_home` 三个相邻
+                        // 字段同为 `&Path`,位置一旦写错照样编译通过、却会静默把
+                        // 机器级路径接错。
                         crate::rpc::AppState {
                             hub: &hub,
                             client: &client,
@@ -3456,8 +3503,8 @@ where
                             theme_handle: &theme_handle,
                             models_path: &models_path,
                             websearch_path: &websearch_path,
+                            settings_path: &settings_path,
                             probes: &probes,
-                            onboarding_env_path: &onboarding_env_path,
                             onboarding_preferences_path: &onboarding_preferences_path,
                             watchman_home: &watchman_home,
                             resident_dir: &resident_dir,

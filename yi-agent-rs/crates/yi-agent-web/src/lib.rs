@@ -1,48 +1,34 @@
-//! yi-agent WebUI：通过 Web 页面管理环境变量配置。
+//! yi-agent WebUI：编辑 `<instance_home>/settings.json`。
+//!
+//! 这是一层 HTTP 外壳，**不含任何配置元数据与校验规则**：字段类型、默认值、
+//! 取值范围、可选项都来自 `yi_agent_runtime::settings`，与桌面端同源。过去
+//! 这里有一份手抄的 `config_meta::ALL_VARS` 和一套 `env_file` 读写，默认值与
+//! `config.rs` 漂移过（`YI_AGENT_MAX_TURNS` 20 vs 200），写盘还会删掉不认识的键。
 
 pub mod api;
-pub mod config_meta;
-pub mod env_file;
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use axum::routing::{delete, get, post};
+use axum::routing::get;
 
-fn user_real_test_env_path() -> PathBuf {
-    yi_agent_store::paths::home_join(".env")
-        .unwrap_or_else(|| PathBuf::from(".yi-agent").join(".env"))
+/// 构造路由。抽出来让测试不必绑定端口。
+pub fn router(settings_path: PathBuf) -> axum::Router {
+    let state = api::AppState { settings_path };
+    axum::Router::new()
+        .route("/", get(api::index_html))
+        .route("/api/config", get(api::get_config).put(api::put_config))
+        .with_state(state)
 }
 
 /// 启动 Web 配置服务器。
-pub async fn serve(host: &str, port: u16, env_path: PathBuf) -> Result<()> {
-    // 打印启动信息
+pub async fn serve(host: &str, port: u16, settings_path: PathBuf) -> Result<()> {
     println!("yi-agent web 配置服务器已启动");
-    println!("  地址:    http://{host}:{port}");
-    println!("  配置文件: {}", env_path.display());
+    println!("  地址:     http://{host}:{port}");
+    println!("  配置文件: {}", settings_path.display());
     println!("按 Ctrl+C 停止");
 
-    let state = api::AppState {
-        env_path,
-        real_test_env_path: user_real_test_env_path(),
-    };
-    let app = axum::Router::new()
-        .route("/", get(api::index_html))
-        .route("/api/config", get(api::get_config).put(api::put_config))
-        .route(
-            "/api/real-llm-test-config",
-            get(api::get_real_llm_test_config).put(api::put_real_llm_test_config),
-        )
-        .route(
-            "/api/real-llm-test-config/validate",
-            post(api::validate_real_llm_test_config),
-        )
-        .route(
-            "/api/real-llm-test-config/api-key",
-            delete(api::clear_real_llm_test_key),
-        )
-        .with_state(state);
-
+    let app = router(settings_path);
     let addr = format!("{host}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;

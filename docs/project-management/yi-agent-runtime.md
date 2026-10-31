@@ -11,7 +11,8 @@
 ## 范围边界
 
 **做什么：**
-- 配置加载：显式 override > 真实 env > `workdir/.yi-agent/.env` > `~/.yi-agent/.env` > 默认值
+- 配置加载：显式 override > 真实进程环境变量 > `<instance_home>/settings.json` > 默认值
+  （**已无 `.env` 层**：产品不再读取任何 `.env`；存量文件由启动迁移改名作废）
 - provider 构造（anthropic / openai）
 - 工具集装配：内置工具 + 进程工具（`ProcessManager`）+ skills + 系统提示词（含当前日期与 skills catalog）
 - Agent 装配：provider + 工具 + 权限检查器 + 权限决定通道
@@ -53,4 +54,14 @@
 
 - [x] 加载器收敛为唯一入口：`RuntimeConfig::load_lenient` 独占 — 删除严格版 `RuntimeConfig::load`（缺 key 即 `bail!("API key required: ...")`）与 `load_inner` 的 `allow_missing_key` 形参；缺 key 一律返回空串（`src/config.rs:240` 起）。**不变量**：「能否发起一次对话」只由 `models::is_usable(&cfg)` 判定，且必须作用在 `resolve_effective` **之后**（否则清单里的 key 还没合入，会把「设置页配好、无环境变量」的机器误判成未配置）。加载器只负责把能读到的值读全，不负责判定可用性。**为什么删而不是留**：两个入口对同一台机器给出相反结论——模型键迁移进 `models.json` 后，进程环境里没有 key，严格版认为「未配置」，宽松版照常返回。启动路径只要选中严格版，就把「模型只在清单里」变成启动失败（2026-10-29 `provider turn admission failed: API key required` 的成因）。保留一个入口后，「选错入口」这类 bug 在结构上不再可能。`attach_headless_runtime`（`run --subagents`）保留 `Result`，因其失败语义是「命令失败」而非「降级」。验证：`cargo test -p yi-agent-runtime --lib`（187；删除 `load_requires_api_key` / `load_still_requires_a_key` 两例，其余 25 处调用点机械换为 `load_lenient`，行为不变——它们都显式传了 key）；`cargo test -p yi-agent --bin yi-agent only_the_lenient_loader_exists`（源码断言，把严格调用加回来即 `E0425` 编译失败）
 
-**验证命令：** `cargo test -p yi-agent-runtime`（187 个测试）
+
+- [x] 运行参数存于 `<instance_home>/settings.json`，默认值只在 `config.rs` 常量一处 — `src/settings.rs` 的 `Settings` / `FIELDS`（字段元数据与默认值同源）/ `load_from` / `write_to`（临时文件 + rename 原子替换、权限 0600、保留未知顶层键）；`RuntimeConfig::load_inner` 把它作为**第三层**读取（`src/config.rs`）
+  - 判据：`cargo test -p yi-agent-runtime --lib settings`
+  - 判据：`cargo test -p yi-agent-runtime --lib config::tests::real_env_beats_settings_json`
+- [x] `.env` 的存量运行参数一次性迁入 `settings.json`，原文件改名 `.env.migrated` — `src/migrate.rs` 的 `migrate_env_settings`（`src/migrate.rs:315`）：**先落 settings.json、后改名 `.env`**（顺序反向会造出「文件改名了、值没落」的丢失）；只有 `YI_AGENT_WORKDIR`/`YI_AGENT_YOLO` 这类不再有归属的键时返回 `DroppedOnly` 并照样改名，避免下次启动重复走迁移
+  - 判据：`cargo test -p yi-agent-runtime --lib migrate::tests::a_class_keys_land_in_settings_json`
+  - 判据：`cargo test -p yi-agent-runtime --lib migrate::tests::second_run_is_idempotent_and_does_not_touch_settings`
+- [x] `YI_AGENT_WORKDIR` 下线，工作目录只由 `--workdir` / 启动目录 / 桌面端选项目决定 — `resolve_workdir`（`src/config.rs`）：显式 override，否则 `current_dir()`
+  - 判据：`cargo test -p yi-agent-runtime --lib config::tests::workdir_env_var_no_longer_overrides`
+
+**验证命令：** `cargo test -p yi-agent-runtime`（226 个测试）

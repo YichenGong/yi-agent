@@ -2376,12 +2376,12 @@ impl Harness {
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 models_path: models_dir.path().join("models.json"),
                 websearch_path: models_dir.path().join("websearch.json"),
+                settings_path: models_dir.path().join("settings.json"),
                 // harness 默认关（= stable 行为）；`with_lead_flag(true)` 打开的
                 // 那个构造器会把这个值换成 true。
                 lead_agent_enabled,
                 // 引导的 .env / preferences 也落在隔离目录里:onboarding/*
                 // 不得写开发者真实的 `~/.yi-agent`。
-                onboarding_env_path: index_dir.path().join(".env"),
                 onboarding_preferences_path: index_dir.path().join("preferences.json"),
                 resident_dir: resident_dir.path().to_path_buf(),
                 skills_home: skills_home.path().to_path_buf(),
@@ -3646,6 +3646,8 @@ async fn unknown_method_returns_method_not_found() {
         // ---- Ui(`ui/*`,外加并入的 `config/read`) ----
         ("config/read", Domain::Ui),
         ("ui/settings/read", Domain::Ui),
+        ("settings/read", Domain::Ui),
+        ("settings/write", Domain::Ui),
         ("ui/settings/write", Domain::Ui),
         // ---- Model ----
         ("model/list", Domain::Model),
@@ -4111,8 +4113,8 @@ async fn eof_exits_gracefully() {
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
+            settings_path: PathBuf::new(),
             lead_agent_enabled: false,
-            onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
@@ -4196,8 +4198,8 @@ async fn agent_factory_failure_returns_internal_error() {
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
+            settings_path: PathBuf::new(),
             lead_agent_enabled: false,
-            onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
@@ -4283,8 +4285,8 @@ async fn oversized_frame_returns_err() {
             thread_roots: Arc::new(StdMutex::new(HashMap::new())),
             models_path: PathBuf::new(),
             websearch_path: PathBuf::new(),
+            settings_path: PathBuf::new(),
             lead_agent_enabled: false,
-            onboarding_env_path: PathBuf::new(),
             onboarding_preferences_path: PathBuf::new(),
             resident_dir: PathBuf::new(),
             // 空路径 = 不读真实 home；这些用例不查 skill。
@@ -16273,6 +16275,119 @@ async fn ws_client_for_device_resolves_through_the_installed_registry() {
     assert!(ws_client_for_device("dev-missing").is_none());
 }
 
+/// `settings/read` 经真实 dispatch 路径可达：每个字段都带 `value` 与 `default`，
+/// 未设置的字段 `value` 为 null（而不是默认值）。
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_read_over_rpc_reports_unset_fields_as_null() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    h.send(r#"{"jsonrpc":"2.0","id":2,"method":"settings/read","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 2).await;
+
+    let fields = v["result"]["fields"].as_array().expect("fields array");
+    assert!(!fields.is_empty(), "the field list must not be empty");
+
+    let max_turns = fields
+        .iter()
+        .find(|f| f["key"] == "agent.max_turns")
+        .expect("agent.max_turns must be listed");
+    assert_eq!(max_turns["default"], "200");
+    assert!(
+        max_turns["value"].is_null(),
+        "a fresh instance has nothing set: {max_turns}"
+    );
+
+    let ratio = fields
+        .iter()
+        .find(|f| f["key"] == "compact.ratio")
+        .expect("compact.ratio must be listed");
+    assert_eq!(ratio["default"], "80");
+
+    let sandbox = fields
+        .iter()
+        .find(|f| f["key"] == "startup.sandbox")
+        .expect("startup.sandbox must be listed");
+    assert_eq!(sandbox["type"], "select");
+    assert!(
+        sandbox["options"]
+            .as_array()
+            .is_some_and(|options| options.contains(&serde_json::json!("workspace-write"))),
+        "the select must carry its options: {sandbox}"
+    );
+
+    assert!(
+        v["result"]["path"]
+            .as_str()
+            .is_some_and(|p| p.ends_with("settings.json")),
+        "the response must report where the file lives: {v}"
+    );
+}
+
+/// `settings/write` 落盘后可被 `settings/read` 读回，且未设置的字段仍为 null。
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_write_then_read_round_trips() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    h.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"settings/write","params":{"patch":{"agent.max_turns":500,"startup.sandbox":"read-only"}}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 2).await;
+    assert_eq!(v["result"]["ok"], true, "{v}");
+
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"settings/read","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    let fields = v["result"]["fields"].as_array().expect("fields array");
+    let max_turns = fields
+        .iter()
+        .find(|f| f["key"] == "agent.max_turns")
+        .unwrap();
+    assert_eq!(max_turns["value"], 500);
+    let sandbox = fields
+        .iter()
+        .find(|f| f["key"] == "startup.sandbox")
+        .unwrap();
+    assert_eq!(sandbox["value"], "read-only");
+    let ratio = fields.iter().find(|f| f["key"] == "compact.ratio").unwrap();
+    assert!(
+        ratio["value"].is_null(),
+        "writing one field must not materialise the others: {ratio}"
+    );
+}
+
+/// 非法值必须报 `invalid_setting` 并带字段名，供 UI 内联提示；且零写入。
+#[tokio::test(flavor = "multi_thread")]
+async fn settings_write_rejects_an_invalid_value() {
+    let mut h = Harness::new();
+    initialize(&mut h).await;
+
+    h.send(
+        r#"{"jsonrpc":"2.0","id":2,"method":"settings/write","params":{"patch":{"agent.max_turns":0}}}"#,
+    )
+    .await;
+    let v = read_response(&mut h, 2).await;
+    assert_eq!(v["error"]["data"]["code"], "invalid_setting", "got: {v}");
+    assert_eq!(v["error"]["data"]["key"], "agent.max_turns", "got: {v}");
+
+    // 零写入：读回来仍是未设置。
+    h.send(r#"{"jsonrpc":"2.0","id":3,"method":"settings/read","params":{}}"#)
+        .await;
+    let v = read_response(&mut h, 3).await;
+    let fields = v["result"]["fields"].as_array().expect("fields array");
+    let max_turns = fields
+        .iter()
+        .find(|f| f["key"] == "agent.max_turns")
+        .unwrap();
+    assert!(
+        max_turns["value"].is_null(),
+        "a rejected write must not land"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ui_settings_read_and_write_round_trip() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -17763,8 +17878,8 @@ impl MergedHarness {
                 thread_roots: Arc::new(StdMutex::new(HashMap::new())),
                 models_path: PathBuf::new(),
                 websearch_path: PathBuf::new(),
+                settings_path: PathBuf::new(),
                 lead_agent_enabled: false,
-                onboarding_env_path: PathBuf::new(),
                 onboarding_preferences_path: PathBuf::new(),
                 resident_dir: PathBuf::new(),
                 // 空路径 = 不读真实 home；这些用例不查 skill。

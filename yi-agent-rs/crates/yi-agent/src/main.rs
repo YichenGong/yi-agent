@@ -65,7 +65,13 @@ fn main() -> Result<()> {
                     &yi_agent_runtime::models::models_path(),
                 );
                 yi_agent_runtime::migrate::log_outcome(&migration, &env_path);
-                yi_agent_web::serve(host, *port, env_path).await
+                let outcome = yi_agent_runtime::migrate::migrate_env_settings(
+                    &env_path,
+                    &yi_agent_runtime::settings::settings_path(),
+                    &yi_agent_tools::websearch_path(),
+                );
+                yi_agent_runtime::migrate::log_env_settings_outcome(&outcome, &env_path);
+                yi_agent_web::serve(host, *port, yi_agent_runtime::settings::settings_path()).await
             })
         }
         Some(Command::Run {
@@ -1303,10 +1309,18 @@ fn run_agent(cli: Cli) -> Result<()> {
         &yi_agent_runtime::models::models_path(),
     );
     yi_agent_runtime::migrate::log_outcome(&migration, &env_path);
+    // 运行参数迁移必须也在 `config::load_lenient` 之前：反过来会让 `.env` 先被
+    // 注入进程环境、随后又被改名——配置看起来迁了，重启后消失。
+    let outcome = yi_agent_runtime::migrate::migrate_env_settings(
+        &env_path,
+        &yi_agent_runtime::settings::settings_path(),
+        &yi_agent_tools::websearch_path(),
+    );
+    yi_agent_runtime::migrate::log_env_settings_outcome(&outcome, &env_path);
     // 引导写进清单（与 `onboarding/apply` 同一路径）。先算一次清单路径，
     // 让 should_offer / prompt 与运行期读点一致。
     let models_path = yi_agent_runtime::models::models_path();
-    if onboarding_prompt::should_offer(&env_path, &prefs_path) {
+    if onboarding_prompt::should_offer(&prefs_path) {
         if let Err(error) = onboarding_prompt::run_onboarding_prompt(&models_path, &prefs_path) {
             eprintln!("引导未完成：{error}");
         }
@@ -2721,7 +2735,7 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\nfn ").next())
             .expect("run_agent must exist");
-        let offer = ["onboarding_prompt::should_offer(", "&env_path"].concat();
+        let offer = ["onboarding_prompt::should_offer(", "&prefs_path"].concat();
         let global = ["config::resolve_global", "_env_path()"].concat();
         // 宽松加载器：清单里已经有模型（无任何注入）的机器，严格加载器会因为
         // 「没有 key」直接 bail，用户永远起不来。与 `run_headless` 同形——缺 key
@@ -2904,6 +2918,55 @@ mod tests {
     /// the lenient one, and whichever startup path picked the wrong answer turned
     /// a catalog-only machine into a launch failure. With one loader there is no
     /// wrong pick; `models::is_usable` is the only judge of usability.
+    /// `migrate_env_settings` 的调用点必须在 `config::load_lenient` 之前。
+    /// 反过来会让 `.env` 先被注入进程环境、随后又被改名——配置看起来迁了，
+    /// 重启后消失。与 `only_the_lenient_loader_exists` 同一手法：静态扫源码。
+    #[test]
+    fn the_env_migration_runs_before_config_loading() {
+        let source = include_str!("main.rs");
+        let run_agent_at = source.find("fn run_agent(").expect("run_agent must exist");
+        let body = &source[run_agent_at..];
+        let body = body.split("\nfn ").next().expect("body terminates");
+
+        let migration_at = body
+            .find("migrate::migrate_env_settings(")
+            .expect("run_agent must migrate .env before loading config");
+        let load_at = body
+            .find("config::load_lenient(")
+            .expect("run_agent must load config");
+        assert!(
+            migration_at < load_at,
+            "the .env migration must run before the config is loaded, otherwise values get \
+             injected into the process env and then lost on the next start"
+        );
+    }
+
+    /// `web` 入口也必须在 `yi_agent_web::serve` 之前迁移，否则 web 端读到的
+    /// 仍是 `.env` 里的旧口径。
+    #[test]
+    fn the_web_entry_migrates_before_serving() {
+        let source = include_str!("main.rs");
+        let web_at = source
+            .find("Some(Command::Web {")
+            .expect("the web branch must exist");
+        let body = &source[web_at..];
+        let body = body
+            .split("Some(Command::Run {")
+            .next()
+            .expect("branch ends");
+
+        let migration_at = body
+            .find("migrate::migrate_env_settings(")
+            .expect("the web branch must migrate .env settings");
+        let serve_at = body
+            .find("yi_agent_web::serve(")
+            .expect("the web branch must serve");
+        assert!(
+            migration_at < serve_at,
+            "the web branch must migrate before serving"
+        );
+    }
+
     #[test]
     fn only_the_lenient_loader_exists() {
         let source = include_str!("main.rs");

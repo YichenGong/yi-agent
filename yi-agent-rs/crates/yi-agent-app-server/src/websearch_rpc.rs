@@ -54,7 +54,7 @@ fn get(path: &Path) -> Result<Value, RpcError> {
 fn engine_view(e: &EngineConfig) -> Value {
     json!({
         "api_key_masked": mask_key(&e.api_key),
-        // `resolved_api_key` 才会看环境变量：面板据此决定要不要提示「未配置」。
+        // 只看文件：面板据此决定要不要提示「未配置」。
         "has_key": e.resolved_api_key().is_some(),
         "base_url": e.resolved_base_url(),
         "count": e.clamped_count(),

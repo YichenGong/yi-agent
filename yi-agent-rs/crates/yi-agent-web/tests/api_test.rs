@@ -1,423 +1,143 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use serde_json::json;
-use std::path::PathBuf;
-use tempfile::TempDir;
+use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use yi_agent_web::api::{
-    AppState, clear_real_llm_test_key, get_config, get_real_llm_test_config, index_html,
-    put_config, put_real_llm_test_config, validate_real_llm_test_config,
-};
+async fn body_json(response: axum::response::Response) -> serde_json::Value {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    serde_json::from_slice(&bytes).unwrap()
+}
 
-/// 构建 axum app 用于测试（单一 `.env` 路径）
-fn test_app(env_path: PathBuf) -> axum::Router {
-    use axum::routing::get;
-    let state = AppState {
-        real_test_env_path: env_path.clone(),
-        env_path,
-    };
-    axum::Router::new()
-        .route("/", get(index_html))
-        .route("/api/config", get(get_config).put(put_config))
-        .route(
-            "/api/real-llm-test-config",
-            get(get_real_llm_test_config).put(put_real_llm_test_config),
-        )
-        .route(
-            "/api/real-llm-test-config/validate",
-            axum::routing::post(validate_real_llm_test_config),
-        )
-        .route(
-            "/api/real-llm-test-config/api-key",
-            axum::routing::delete(clear_real_llm_test_key),
-        )
-        .with_state(state)
+fn app(settings_path: std::path::PathBuf) -> axum::Router {
+    yi_agent_web::router(settings_path)
 }
 
 #[tokio::test]
-async fn real_llm_save_does_not_append_a_second_form() {
-    let app = test_app(TempDir::new().unwrap().path().join("real-tests.env"));
-    let response = app
-        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+async fn get_config_reports_null_for_unset_and_default_source() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"agent":{"max_turns":500}}"#).unwrap();
+
+    let response = app(path)
+        .oneshot(Request::get("/api/config").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let html = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let html = String::from_utf8(html.to_vec()).unwrap();
+    let value = body_json(response).await;
 
-    let save_handler = html
-        .lines()
-        .find(|line| line.contains("save.onclick"))
-        .expect("real LLM save handler");
-    assert!(
-        !save_handler.contains("renderRealLlmTestsTab(main)"),
-        "Save must not append another form by rerendering into the existing main element"
-    );
+    let all: Vec<serde_json::Value> = value["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["vars"].as_array().unwrap().clone())
+        .collect();
+    let max_turns = all.iter().find(|v| v["key"] == "agent.max_turns").unwrap();
+    assert_eq!(max_turns["value"], 500);
+    assert_eq!(max_turns["source"], "local");
+
+    let ratio = all.iter().find(|v| v["key"] == "compact.ratio").unwrap();
+    assert!(ratio["value"].is_null());
+    assert_eq!(ratio["source"], "default");
+    assert_eq!(ratio["default"], "80");
 }
 
+/// 一号缺陷的回归网：保存一次不能删掉不认识的键。
 #[tokio::test]
-async fn real_llm_test_config_is_write_only_and_validates_without_network() {
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join("real-tests.env");
-    let sentinel = "real-test-secret-must-not-appear";
-    let app = test_app(env_path.clone());
-    let request = Request::builder()
-        .method("PUT")
-        .uri("/api/real-llm-test-config")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            json!({
-                "provider": "anthropic",
-                "api_url": "https://api.example.test",
-                "model": "test-model",
-                "api_key": sentinel,
-            })
-            .to_string(),
-        ))
-        .unwrap();
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+async fn put_config_preserves_unknown_keys() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+    std::fs::write(&path, r#"{"my_note":"keep me"}"#).unwrap();
 
-    let app = test_app(env_path.clone());
-    let response = app
+    let response = app(path.clone())
         .oneshot(
-            Request::builder()
-                .uri("/api/real-llm-test-config")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    assert!(!String::from_utf8_lossy(&body).contains(sentinel));
-    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["api_key_configured"], true);
-    assert!(value.get("api_key").is_none());
-
-    let app = test_app(env_path.clone());
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/api/real-llm-test-config/validate")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let app = test_app(env_path.clone());
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/api/real-llm-test-config/api-key")
-                .header("content-type", "application/json")
-                .body(Body::from(json!({"confirm": true}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert!(
-        !yi_agent_web::env_file::read(&env_path)
-            .unwrap()
-            .contains_key("YI_AGENT_REAL_LLM_API_KEY")
-    );
-}
-
-#[tokio::test]
-async fn real_llm_test_config_rejects_invalid_shape() {
-    let tmp = TempDir::new().unwrap();
-    let app = test_app(tmp.path().join("real-tests.env"));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/api/real-llm-test-config")
+            Request::put("/api/config")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({
-                        "provider": "invalid",
-                        "api_url": "ftp://example.test",
-                        "model": " ",
-                        "api_key": "",
-                    })
-                    .to_string(),
+                    r#"{"updates":[{"key":"agent.max_turns","value":"500"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(value["my_note"], "keep me");
+    assert_eq!(value["agent"]["max_turns"], 500);
+}
+
+/// 未设置的字段不得被写成空值行。
+#[tokio::test]
+async fn put_config_does_not_materialize_unset_fields() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+
+    app(path.clone())
+        .oneshot(
+            Request::put("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"updates":[{"key":"agent.max_turns","value":"500"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let agent = value["agent"].as_object().unwrap();
+    assert_eq!(agent.len(), 1);
+    assert!(value.get("compact").is_none());
+}
+
+#[tokio::test]
+async fn put_config_rejects_an_invalid_value_with_400() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("settings.json");
+
+    let response = app(path.clone())
+        .oneshot(
+            Request::put("/api/config")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"updates":[{"key":"compact.ratio","value":"0"}]}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(!path.exists(), "a rejected write must not create the file");
 }
 
+/// 「真实 LLM 测试」面板已删除：路由必须是 404。
 #[tokio::test]
-async fn get_config_returns_all_groups() {
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join(".env");
-    let app = test_app(env_path);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/config")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-    let groups = json["groups"].as_array().unwrap();
-    assert_eq!(groups.len(), 2); // Agent, Tools —— 模型键已迁到 models.json
-
-    let total_vars: usize = groups
-        .iter()
-        .map(|g| g["vars"].as_array().unwrap().len())
-        .sum();
-    assert_eq!(total_vars, 7);
-
-    // 9 个模型键绝不出现在 env 编辑器里（不再有绕过清单的写入口）。
-    for key in yi_agent_runtime::config::MODEL_ENV_KEYS {
-        for group in groups {
-            for var in group["vars"].as_array().unwrap() {
-                assert_ne!(
-                    var["key"].as_str(),
-                    Some(*key),
-                    "{key} must not be editable here"
-                );
-            }
+async fn the_real_llm_test_routes_are_gone() {
+    let dir = tempfile::TempDir::new().unwrap();
+    for (method, url) in [
+        ("GET", "/api/real-llm-test-config"),
+        ("PUT", "/api/real-llm-test-config"),
+        ("POST", "/api/real-llm-test-config/validate"),
+        ("DELETE", "/api/real-llm-test-config/api-key"),
+    ] {
+        let request = match method {
+            "GET" => Request::get(url),
+            "PUT" => Request::put(url),
+            "POST" => Request::post(url),
+            _ => Request::delete(url),
         }
+        .body(Body::empty())
+        .unwrap();
+        let response = app(dir.path().join("settings.json"))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {url} must be gone"
+        );
     }
-}
-
-#[tokio::test]
-async fn get_config_masks_secret_values() {
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join(".env");
-    std::fs::write(&env_path, "BOCHA_API_KEY=sk-ant-api03-xxxxxxxxxxxx\n").unwrap();
-    let app = test_app(env_path);
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/config")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-    // 找到 BOCHA_API_KEY（仍是 secret）
-    for group in json["groups"].as_array().unwrap() {
-        for var in group["vars"].as_array().unwrap() {
-            if var["key"] == "BOCHA_API_KEY" {
-                assert_eq!(var["masked"], true);
-                assert!(var["value"].as_str().unwrap().contains("***"));
-                return;
-            }
-        }
-    }
-    panic!("BOCHA_API_KEY not found in response");
-}
-
-#[tokio::test]
-async fn put_config_writes_updates() {
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join(".env");
-    let app = test_app(env_path.clone());
-
-    let body = json!({
-        "updates": [
-            { "key": "YI_AGENT_MAX_TURNS", "value": "123" }
-        ]
-    });
-    let request = Request::builder()
-        .method("PUT")
-        .uri("/api/config")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // 验证文件写入
-    let content = std::fs::read_to_string(&env_path).unwrap();
-    assert!(content.contains("YI_AGENT_MAX_TURNS=123"));
-}
-
-#[tokio::test]
-async fn put_config_skips_masked_secrets() {
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join(".env");
-    std::fs::write(&env_path, "BOCHA_API_KEY=sk-ant-real-key-12345\n").unwrap();
-    let app = test_app(env_path.clone());
-
-    // 发送掩码值（应被跳过）
-    let body = json!({
-        "updates": [
-            { "key": "BOCHA_API_KEY", "value": "sk-a***2345" }
-        ]
-    });
-    let request = Request::builder()
-        .method("PUT")
-        .uri("/api/config")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    // 验证原值未被覆盖
-    let map = yi_agent_web::env_file::read(&env_path).unwrap();
-    assert_eq!(map.get("BOCHA_API_KEY").unwrap(), "sk-ant-real-key-12345");
-}
-
-#[tokio::test]
-async fn index_html_returns_html() {
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join(".env");
-    let app = test_app(env_path);
-
-    let response = app
-        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-    assert!(html.contains("<html") || html.contains("<!DOCTYPE"));
-}
-
-#[tokio::test]
-async fn index_html_has_no_scope_toggle() {
-    // 单一 `.env` 后，全局/本地切换没有意义：页面不再渲染 scope 切换。
-    let tmp = TempDir::new().unwrap();
-    let app = test_app(tmp.path().join(".env"));
-
-    let response = app
-        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let html = String::from_utf8(body.to_vec()).unwrap();
-
-    assert!(!html.contains("scopeGlobal"));
-    assert!(!html.contains("scopeLocal"));
-    assert!(!html.contains("currentScope"));
-}
-
-#[tokio::test]
-async fn get_config_reads_the_single_file() {
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join(".env");
-    std::fs::write(&env_path, "YI_AGENT_MAX_TURNS=42\n").unwrap();
-    let app = test_app(env_path.clone());
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/api/config")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-        .await
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-    assert_eq!(json["envPath"], env_path.display().to_string());
-    assert!(json.get("globalEnvPath").is_none());
-
-    let mut found = false;
-    for group in json["groups"].as_array().unwrap() {
-        for var in group["vars"].as_array().unwrap() {
-            if var["key"] == "YI_AGENT_MAX_TURNS" {
-                assert_eq!(var["value"], "42");
-                assert_eq!(var["source"], "local");
-                found = true;
-            }
-        }
-    }
-    assert!(found, "YI_AGENT_MAX_TURNS should be in response");
-}
-
-#[tokio::test]
-async fn put_config_writes_the_single_file() {
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join(".env");
-    let app = test_app(env_path.clone());
-
-    let body = json!({
-        "updates": [
-            { "key": "YI_AGENT_MAX_TURNS", "value": "7" }
-        ]
-    });
-    let request = Request::builder()
-        .method("PUT")
-        .uri("/api/config")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let content = std::fs::read_to_string(&env_path).unwrap();
-    assert!(content.contains("YI_AGENT_MAX_TURNS=7"));
-}
-
-#[tokio::test]
-async fn put_config_ignores_a_stale_scope_field() {
-    // 老前端可能仍带 `scope`；单一 `.env` 后该字段被忽略，写入依然落到唯一路径。
-    let tmp = TempDir::new().unwrap();
-    let env_path = tmp.path().join(".env");
-    let app = test_app(env_path.clone());
-
-    let body = json!({
-        "scope": "global",
-        "updates": [
-            { "key": "YI_AGENT_MAX_TURNS", "value": "9" }
-        ]
-    });
-    let request = Request::builder()
-        .method("PUT")
-        .uri("/api/config")
-        .header("content-type", "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap();
-
-    let response = app.oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let content = std::fs::read_to_string(&env_path).unwrap();
-    assert!(content.contains("YI_AGENT_MAX_TURNS=9"));
 }
