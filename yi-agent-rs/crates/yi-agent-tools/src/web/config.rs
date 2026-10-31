@@ -335,8 +335,10 @@ mod tests {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut engine = EngineConfig::default();
-        engine.api_key = String::new();
+        let engine = EngineConfig {
+            api_key: String::new(),
+            ..EngineConfig::default()
+        };
         // env 里有值也不能被采用。
         unsafe { std::env::set_var("BOCHA_API_KEY", "from-env") };
         let resolved = engine.resolved_api_key();
