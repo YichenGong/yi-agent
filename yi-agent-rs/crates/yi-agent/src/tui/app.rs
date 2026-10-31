@@ -3581,8 +3581,8 @@ fn compute_layout(
 /// with `"  "` so the cursor column is visually aligned. Wrapping is
 /// character-based using unicode display width (so CJK / wide chars work).
 ///
-/// The character at `cursor` (byte offset) is rendered with reverse video
-/// (white background, black foreground) so the user can see the cursor.
+/// The character at `cursor` (byte offset) is rendered with reverse video so
+/// the user can see the cursor.
 fn wrap_input_buffer(
     buffer: &str,
     cursor: usize,
@@ -3591,7 +3591,11 @@ fn wrap_input_buffer(
 ) -> Vec<Line<'static>> {
     const PREFIX_LEN: usize = 2; // "> " or "  "
     let avail = (area_width as usize).saturating_sub(PREFIX_LEN).max(1);
-    let cursor_style = Style::new().fg(Color::Black).bg(Color::White);
+    // Reverse video instead of a hardcoded white block: REVERSED is resolved by
+    // the terminal against its own background, so the cursor stays visible on
+    // both light and dark themes. A fixed `bg(White)` is 1.00:1 on a white
+    // terminal — literally invisible.
+    let cursor_style = Style::new().add_modifier(Modifier::REVERSED);
 
     // Helper to build spans for a chunk of text, applying cursor_style to the
     // character at the cursor byte offset if it falls within this chunk.
@@ -7592,8 +7596,8 @@ mod tests {
         let is_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Type "abc" — cursor should be at position 3 (after 'c').
-        // With reverse video, at least one cell in the input row should have
-        // a white background.
+        // With reverse video, at least one cell in the input row should be
+        // rendered with the REVERSED modifier.
         let events = Rc::new(RefCell::new(vec![
             Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL)),
             Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
@@ -7617,22 +7621,19 @@ mod tests {
         )
         .unwrap();
 
-        // Check the input row for a cell with white background (reverse video cursor)
+        // The cursor is reverse video, not a hardcoded white block: a white
+        // block is invisible on a white terminal (contrast 1.00:1).
         let buffer = terminal.backend().buffer();
         let input_row = 23u16;
         let mut found_cursor = false;
         for x in 0..80u16 {
             let cell = &buffer[(x, input_row)];
-            // Look for a cell with white background (Color::White)
-            if cell.bg == ratatui::style::Color::White {
+            if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
                 found_cursor = true;
                 break;
             }
         }
-        assert!(
-            found_cursor,
-            "expected a cursor cell with white background in input row"
-        );
+        assert!(found_cursor, "expected a REVERSED cursor cell in input row");
     }
 
     /// When the buffer is empty, the cursor should still be visible (at position 0).
@@ -7676,7 +7677,7 @@ mod tests {
         let mut found_cursor = false;
         for x in 0..80u16 {
             let cell = &buffer[(x, input_row)];
-            if cell.bg == ratatui::style::Color::White {
+            if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
                 found_cursor = true;
                 break;
             }
@@ -7730,23 +7731,20 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let input_row = 23u16;
         let cursor_cell = &buffer[(4, input_row)];
-        assert_eq!(
-            cursor_cell.fg,
-            ratatui::style::Color::Black,
-            "cursor character 'c' should have black foreground"
-        );
-        assert_eq!(
-            cursor_cell.bg,
-            ratatui::style::Color::White,
-            "cursor character 'c' should have white background"
+        assert!(
+            cursor_cell
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "cursor character 'c' should be rendered reversed"
         );
 
         // The 'a' character (not at cursor) should NOT have reverse video
         let non_cursor_cell = &buffer[(2, input_row)];
-        assert_ne!(
-            non_cursor_cell.bg,
-            ratatui::style::Color::White,
-            "non-cursor character 'a' should not have white background"
+        assert!(
+            !non_cursor_cell
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "non-cursor character 'a' should not be reversed"
         );
     }
 
