@@ -153,8 +153,17 @@ impl McpManager {
 
         for (name, sc) in &cfg.mcp_servers {
             let now = now_unix();
+            // 存量条目(无 probed_at)一次性迁移到 now:否则升级后第一条
+            // needs_reload 会把它们全判成 Stale,同一轮集体重探(10 个 server
+            // 串行就是 30~40 秒),看起来像「升级把软件搞坏了」。
+            if cache.backfill_probed_at(name, now) {
+                cache_dirty = true;
+            }
+            // 启动路径刻意**不**校验 TTL:过期条目照样直接用(决策 1)。
+            // 但停用的 server 不该探——它根本不会注册成工具,探满 55s 纯浪费。
             let tools = match cache.cached_tools_ignoring_freshness(name, sc) {
                 Some(t) => t.to_vec(),
+                None if !cfg.enabled || !sc.enabled => Vec::new(),
                 None => match probe_tools(sc).await {
                     Ok(probed) => {
                         cache.put(name, sc, probed.clone(), now);
@@ -1540,6 +1549,22 @@ mod tests {
         *TEST_CONNECTOR.lock().unwrap() = Some(factory);
     }
 
+    /// 装一个「计数型」失败 connector：每次**连接尝试**都 +1 再失败。
+    ///
+    /// 与 `install_echo_connector` 的区别:那个只在 `tools/call` 时计数,而
+    /// **探测**走的是 `list_tools`。要断言「有没有去探测」必须数连接次数,
+    /// 数 `call_tool` 永远是 0(踩过这个坑:变异测试打不掉)。
+    fn install_counting_failing_connector(calls: Arc<AtomicUsize>) {
+        let factory: TestConnector = Arc::new(move || {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(anyhow!("counting connector: no real server"))
+            })
+        });
+        *TEST_CONNECTOR.lock().unwrap() = Some(factory);
+    }
+
     /// `TEST_CONNECTOR` 是进程级全局量,并行测试会互相清空/覆盖。
     /// 所有用到这个缝的测试都先拿这把锁,保证同一时刻只有一个在跑。
     static SEAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1894,7 +1919,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let _serial = seam_guard();
         let _seam = SeamGuard;
-        install_echo_connector(Arc::clone(&calls));
+        install_counting_failing_connector(Arc::clone(&calls));
         let mgr = manager_in_sync(dir.path()).await;
 
         let now = now_unix();
@@ -2004,6 +2029,159 @@ mod tests {
                 CacheLookup::Fresh(_)
             ),
             "成功后 probed_at 必须被写入"
+        );
+    }
+
+    // ---- 停用 server 的两条路径 ----
+
+    /// 停用的 server 即使缓存过期也不探测,工具沿用旧清单。
+    #[tokio::test]
+    async fn a_disabled_server_is_never_probed_even_after_the_ttl() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"mcpServers":{"fs":{"command":"npx","enabled":false}}}"#,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let mut sc = cfg("npx");
+        sc.enabled = false;
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "kept".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(!report.servers[0].probed, "停用 server 不应探测");
+        assert_eq!(report.servers[0].tool_count, 1, "旧清单必须保留");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before);
+
+        // failed_at 不该被写:没探测就没有失败
+        let after = McpCache::load(dir.path());
+        assert!(
+            !matches!(
+                after.lookup("fs", &sc, now, TTL_SECS, RETRY_AFTER_SECS),
+                CacheLookup::BackedOff
+            ),
+            "未探测时不得写 failed_at"
+        );
+    }
+
+    /// 启动路径刻意**不**校验 TTL:25h 前的缓存照样直接复用,不探测。
+    #[tokio::test]
+    async fn load_and_probe_does_not_probe_an_expired_entry() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(dir.path(), r#"{"mcpServers":{"fs":{"command":"npx"}}}"#);
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "old".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+
+        let mgr = manager_in_sync(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "启动路径不应因 TTL 过期而探测"
+        );
+        assert_eq!(mgr.enabled_tools().len(), 1, "旧清单必须沿用");
+    }
+
+    /// 启动路径同样不探测停用的 server(与 reload 保持一致)。
+    #[tokio::test]
+    async fn load_and_probe_does_not_probe_a_disabled_server() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"mcpServers":{"fs":{"command":"npx","enabled":false}}}"#,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+
+        let _mgr = manager_in_sync(dir.path()).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "启动路径不应为停用 server 探测"
+        );
+    }
+
+    /// 总开关关闭时,即使配置里有过期条目也不探测,且 failed_at 不被写。
+    #[tokio::test]
+    async fn master_off_probes_nothing_even_when_stale() {
+        let dir = tempfile::TempDir::new().unwrap();
+        write_mcp(
+            dir.path(),
+            r#"{"enabled":false,"mcpServers":{"fs":{"command":"npx"}}}"#,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let _serial = seam_guard();
+        let _seam = SeamGuard;
+        install_counting_failing_connector(Arc::clone(&calls));
+        let mgr = manager_in_sync(dir.path()).await;
+
+        let now = now_unix();
+        let sc = cfg("npx");
+        let mut cache = McpCache::load(dir.path());
+        cache.put(
+            "fs",
+            &sc,
+            vec![CachedTool {
+                name: "kept".into(),
+                description: None,
+                input_schema: serde_json::json!({"type":"object"}),
+                read_only: true,
+            }],
+            now - 25 * 3600,
+        );
+        cache.save(dir.path()).unwrap();
+
+        let before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let report = mgr.reload(dir.path(), now).await;
+        assert!(!report.servers[0].probed);
+        assert_eq!(report.servers[0].tool_count, 1, "旧清单必须保留");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), before);
+
+        let after = McpCache::load(dir.path());
+        assert!(
+            !matches!(
+                after.lookup("fs", &sc, now, TTL_SECS, RETRY_AFTER_SECS),
+                CacheLookup::BackedOff
+            ),
+            "未探测时不得写 failed_at"
         );
     }
 }
